@@ -96,29 +96,34 @@ read can never erase or silently overwrite valid remembered state. This is not a
 sandbox: another process running with the user's authority can read or modify these
 files and the recorded workspaces exactly as it can the native conversations themselves.
 
-### Producer-owned disposable generation caches
+### Producer-owned disposable cache cleanup
 
 The session-host launcher's `.pi-review-gate/build/`, `.pi-review-gate/node/`, and
 `.pi-review-gate/pi-runtime/` subtrees under the native agent directory are disposable
-caches, including failed and legacy descendants regardless of who created individual
-files. Path ownership is not proof of inactivity: admission protects live or uncertain
-lifetime holders, unsafe/replaced roots, and legacy entries without lifetime evidence.
-It never kills a consumer or infers a build dependency merely from an old checkpoint.
-Only actual source-linked consumers/helpers and retained lifetime holders protect a
-generation. Each type refuses creation at five protected generations instead of
-silently exceeding capacity. No real user cache is purged as part of verification.
+caches. Only these producers create those trees, so their contents are disposable by
+location: a descendant is reclaimable regardless of who wrote it and regardless of
+whether any legacy lifetime/metadata record exists. Capacity cleanup is best effort and
+never stops an application start: exceeding the per-type target of five generations, an
+unreadable or stale lock, missing/malformed legacy records, or a partial filesystem
+failure produces a bounded warning while the launch continues. No real user cache is
+purged as part of verification.
 
-Reclamation checks confinement, identities, links and entry types without following
-links outside a generation; hardlinked files and unsupported native cleanup remain
-protected. A partial failure leaves the generation counted. These are public path-API
-fences, not an atomic sandbox against malicious same-user replacement. See
-[Development](development.md#producer-owned-generation-admission) for the canonical
-lifetime record and positive settlement handoff. Native Windows direct-child closure
-is not descendant proof; its reclamation remains disabled. Pre-Node wrappers also
-refuse a sixth Node artifact before setup. POSIX fallback Node protection is removed
-only after a positive setup/native-consumer quiescence handoff AND exact CJS process
-exit; neither numeric zero nor a missing legacy record grants inactivity. Windows
-fallback outputs remain protected; no native rolling-reclamation claim is made.
+Active sessions are protected by the session host's existing exclusive agent-directory
+ownership record, not by cache receipts; cleanup neither kills a consumer nor implements
+a second lifetime gate. Reclamation is confined to one designated generation with
+no-follow link handling (links are unlinked, never traversed); a `.terraform` subtree
+inside a selected disposable generation is removed with it; partially removed entries
+stay counted for a later retry. Each in-flight generation carries one owner-pid
+`.producer-active` marker so concurrent cleanup cannot reclaim it; the generation root is
+fenced before marker inspection (a direct-child link is never followed), malformed marker
+shapes are not treated as liveness, and a dead owner's marker is reclaimed rather than
+retained forever. These are
+public path-API fences, not an atomic sandbox against malicious same-user replacement.
+See [Development](development.md#producer-owned-disposable-cache-cleanup). Native
+Windows cache cleanup is ordinary native deletion with reparse points unlinked rather
+than entered; it makes no descendant-settlement claim, and a failed deletion only warns
+while the fresh generation is created. Pre-Node wrappers apply the same best-effort
+rules before creating another Node artifact.
 
 ## Web egress hardening
 

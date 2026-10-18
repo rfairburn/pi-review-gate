@@ -115,8 +115,6 @@ export interface SessionHostOptions {
   toggleKey?: string;
   args: readonly string[];
   env: NodeJS.ProcessEnv;
-  /** Producer-only lifetime handoff; numeric status is not settlement evidence. */
-  onCacheConsumersSettled?: () => void;
 }
 
 type MainTerminal = Pick<ProcessTerminal,
@@ -191,7 +189,6 @@ interface HostSnapshot {
   readonly args: readonly string[];
   readonly env: NodeJS.ProcessEnv;
   readonly startupCwd: string;
-  readonly onCacheConsumersSettled?: () => void;
 }
 
 interface MainDependencies {
@@ -332,7 +329,6 @@ function snapshotOptions(options: SessionHostOptions): HostSnapshot {
     args,
     env,
     startupCwd: process.cwd(),
-    onCacheConsumersSettled: options?.onCacheConsumersSettled,
   };
 }
 
@@ -2817,12 +2813,6 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           ? `Session host shutdown: ${forcedCount} owned process(es) required forced termination; ${remainingCount} remain unconfirmed.`
           : GENERIC_FAILURE_MESSAGE;
         safeReport(dependencies, details);
-      }
-      // Reuse the host's positive complete ownership/cleanup witness, never
-      // infer lifetime from its numeric return. Native Windows PTY/direct-child
-      // closure alone is not descendant settlement proof, so retain its pins.
-      if (dependencies.platform !== "win32" && !failed && ownedStateSettled && remainingCount === 0) {
-        try { snapshot.onCacheConsumersSettled?.(); } catch { /* Retain producer pins on handoff failure. */ }
       }
       finishRun(failed ? 1 : 0);
     }).catch(() => {

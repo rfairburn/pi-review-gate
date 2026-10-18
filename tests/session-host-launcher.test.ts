@@ -20,7 +20,6 @@ interface HostOptions {
   toggleKey?: string;
   args: readonly string[];
   env: NodeJS.ProcessEnv;
-  onCacheConsumersSettled?: () => void;
 }
 
 interface PiRuntimeResult {
@@ -99,7 +98,6 @@ interface LauncherModule {
     runDdgsSetup(homeDir: string, env: NodeJS.ProcessEnv, packageRoot: string, processRunner?: (file: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult>): Promise<{ ok: boolean; python?: string; exitCode?: number; cleanupUnconfirmed?: boolean }>;
     stageSourcePackage(packageRoot: string, buildCacheRoot: string): OwnedStage;
     createOwnedStage(parent: string, prefix: string, randomBytes?: (size: number) => Buffer): OwnedStage;
-    removeOwnedStage(target: OwnedStage): boolean;
     findNpmCli(env: NodeJS.ProcessEnv): string | undefined;
     findPiOnPath(env: NodeJS.ProcessEnv): string | undefined;
     runBoundedProcess(file: string, args: string[], options: Record<string, unknown>): Promise<BoundedProcessResult>;
@@ -616,9 +614,7 @@ test("synthetic Windows source staging uses positive identities without treating
   } finally {
     Object.defineProperty(process, "platform", platform);
     if (assertionsComplete) {
-      assert.equal(launcher.__test.removeOwnedStage(stage!), false,
-        "root identity alone does not authorize recursive descendant cleanup");
-      assert.equal(existsSync(stage!.root), true, "the source stage is retained");
+      assert.equal(existsSync(stage!.root), true, "the source stage is retained until a later cleanup");
     }
   }
 });
@@ -870,9 +866,8 @@ test("source build, Pi runtime selection, and DDGS setup precede loading the syn
   assert.equal(captured.length, 1);
   // The explicit executable is honored by the stubbed resolver seam; the
   // resolved entry (not a bare name) always reaches the host.
-  assert.equal(typeof captured[0].onCacheConsumersSettled, "function");
-  const { onCacheConsumersSettled: _handoff, ...capturedOptions } = captured[0];
-  assert.deepEqual(capturedOptions, {
+  assert.equal("onCacheConsumersSettled" in captured[0], false, "no cache-lifetime handoff exists any more");
+  assert.deepEqual(captured[0], {
     packageRoot: fixture.packageRoot,
     piExecutable: "/synthetic/pi",
     stateRoot: "./state dir",
@@ -1014,7 +1009,7 @@ test("production source-build runs in an owned staging root and preserves the li
   assert.equal(captured[0].env.NODE_ENV, "production", "the native host environment remains unchanged");
   // A stub's bare zero result is not Main's positive lifecycle handoff.
   assert.match(diagnostics[0], /^pi-review-sessions: pi runtime: \/synthetic\/pi \(v1\.0\.4, npm-global\)\n$/);
-  assert.match(diagnostics[1], /retaining cache lifetime pins: native consumer settlement is unconfirmed/);
+  assert.doesNotMatch(diagnostics.join(""), /lifetime|cache pins|capacity exhausted/);
   // The live checkout dist is preserved byte-for-byte.
   assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
   assert.equal(invocation.bootstrap, null);
@@ -1029,7 +1024,7 @@ test("production source-build runs in an owned staging root and preserves the li
   assert.equal(env.PI_REVIEW_GATE_SETTLEMENT_SECRET, "settlement-secret", "the injected caller environment is not mutated");
   assert.equal(env.PI_REVIEW_GATE_QUIESCENCE_CHILD, "quiescence-secret");
   const setupRoot = dirname(invocation.home);
-  assert.equal(setupRoot, stagingRoot, "setup residue stays inside the same counted generation");
+  assert.equal(setupRoot, stagingRoot, "setup residue stays inside the same generation");
   for (const ownedPath of [invocation.home, invocation.cache, invocation.logs, invocation.temp]) {
     assert.ok(ownedPath.startsWith(`${setupRoot}/`), `npm resources must remain in the owned setup root: ${ownedPath}`);
   }
@@ -1080,14 +1075,14 @@ test("a failed staged build preserves the live dist and retains its stage", { sk
   assert.match(stderr, /TypeScript compile \(tsc -p tsconfig\.json\) stderr:\ncompile failed\n/);
   // The live checkout dist is preserved byte-for-byte.
   assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
-  // The failed build stage is honestly reported and retained: npm/build
-  // generation remains counted until a later capacity admission.
+  // The failed build stage is honestly reported and retained: the incomplete
+  // generation is disposable by location and is reclaimed by a later cleanup.
   const buildCacheRoot = join(fixture.root, ".pi", "agent", ".pi-review-gate", "build");
   const stages = existsSync(buildCacheRoot)
     ? readdirNames(buildCacheRoot).filter((entry) => /^pi-review-sessions-[a-f0-9]{32}$/u.test(entry))
     : [];
   assert.equal(stages.length, 1);
-  assert.match(stderr, /a counted source generation was retained/);
+  assert.match(stderr, /an incomplete source generation was retained; the next launch reclaims excess cache generations/);
 });
 
 test("synthetic stage cleanup retains source build stage after unconfirmed setup cleanup", async (t) => {
@@ -1183,19 +1178,13 @@ test("synthetic stage cleanup retains source stages across setup and host outcom
       writeError: (text) => { stderr += text; },
     });
     assert.equal(status, scenario.expectedStatus, scenario.name);
-    assert.equal(existsSync(owned.root), scenario.preserve, `${scenario.name}: stage retention policy`);
-    if (scenario.preserve) {
-      const current = lstatSync(owned.root, { bigint: true });
-      assert.equal(current.dev, owned.identity.dev);
-      assert.equal(current.ino, owned.identity.ino);
-      if (scenario.setupCleanupUnconfirmed) {
-        assert.match(stderr, /retaining cache lifetime pins: setup cleanup was not confirmed/);
-      } else if (scenario.preMainFailure) {
-        assert.doesNotMatch(stderr, /retaining cache lifetime pins/);
-      } else {
-        assert.match(stderr, /retaining cache lifetime pins: native consumer settlement is unconfirmed/);
-      }
-    }
+    // No cache-lifetime pin exists: the stage is never deleted by the launcher,
+    // and a later producer cleanup reclaims it when the cache is over target.
+    assert.equal(existsSync(owned.root), true, `${scenario.name}: stage retention policy`);
+    const current = lstatSync(owned.root, { bigint: true });
+    assert.equal(current.dev, owned.identity.dev);
+    assert.equal(current.ino, owned.identity.ino);
+    assert.doesNotMatch(stderr, /lifetime|cache pins|capacity exhausted/);
     if (scenario.preMainFailure) assert.deepEqual(events, ["build", "pi"]);
     else if (scenario.setupCleanupUnconfirmed) assert.deepEqual(events, ["build", "pi", "ddgs"]);
     else assert.ok(events.includes("main"), `${scenario.name}: Main was started`);
@@ -1245,8 +1234,7 @@ test("stageSourcePackage copies build and runtime inputs without touching the ch
     unlinkSync(join(dir, "sentinel"));
     rmdirSync(dir);
   }
-  assert.equal(launcher.__test.removeOwnedStage(ownedStage), false, "the legacy helper cannot establish a settled lifetime");
-  assert.equal(existsSync(stagingRoot), true, "the staged source is retained after assertions");
+  assert.equal(existsSync(stagingRoot), true, "the staged source is retained for reuse after assertions");
 });
 
 test("exclusive stage creation never adopts a preexisting random-name collision", (t) => {
@@ -1287,7 +1275,7 @@ test("source staging rejects symlink aliases and retains its partial stage", (t)
   assert.equal(stageError?.retainedStage, true, "the stage-retention outcome is reported honestly");
   assert.equal(readFileSync(outside, "utf8"), "not copied\n");
   assert.equal(lstatSync(alias).isSymbolicLink(), true, "the source alias is preserved");
-  const stages = readdirSync(cache);
+  const stages = readdirSync(cache).filter((name) => name !== ".admission.lock");
   assert.equal(stages.length, 1, "the failed run's partial stage is retained");
   assert.equal(lstatSync(join(cache, stages[0])).isDirectory(), true);
 });
@@ -1322,7 +1310,7 @@ test("source staging stops before opening a replaced source directory", (t) => {
   assert.equal(foreignFileOpened, false, "no foreign file path was opened through the replacement");
   assert.equal(lstatSync(sourceDirectory).isSymbolicLink(), true, "the source replacement remains intact");
   assert.equal(readFileSync(foreignFile, "utf8"), "foreign source must not be opened\n");
-  const [stageName] = readdirSync(cache);
+  const [stageName] = readdirSync(cache).filter((name) => name !== ".admission.lock");
   assert.ok(stageName, "the stage is retained as a witness after a directory-chain change");
   assert.equal(lstatSync(join(cache, stageName, "src")).isDirectory(), true);
 });
@@ -1342,7 +1330,7 @@ test("source staging stops before writing through a replaced destination directo
   withOpendirHook((openedPath) => {
     if (openedPath !== sourceDirectory || replaced) return;
     replaced = true;
-    const [stageName] = readdirSync(cache);
+    const [stageName] = readdirSync(cache).filter((name) => name !== ".admission.lock");
     assert.ok(stageName, "the stage exists before the source directory is read");
     stagedSource = join(cache, stageName, "src");
     renameSync(stagedSource, heldDestination);
@@ -1356,88 +1344,6 @@ test("source staging stops before writing through a replaced destination directo
   assert.equal(lstatSync(stagedSource).isSymbolicLink(), true, "the replacement symlink is preserved inside the retained stage");
   assert.equal(readFileSync(join(foreignDestination, "sentinel"), "utf8"), "foreign destination stays\n");
   assert.equal(existsSync(join(foreignDestination, "session-host")), false, "no staged file or directory was created in the foreign target");
-});
-
-test("synthetic stage cleanup retains replaced roots and symlinks without enumeration", (t) => {
-  const fixture = makePackageFixture(true);
-  cleanupFixture(t, fixture);
-  const owned = launcher.__test.createOwnedStage(fixture.root, "replace-");
-  writeFileSync(join(owned.root, "original.txt"), "original stage stays\n", "utf8");
-  const held = `${owned.root}-held`;
-  renameSync(owned.root, held);
-  mkdirSync(owned.root);
-  const replacement = join(owned.root, "foreign.txt");
-  writeFileSync(replacement, "replacement survives\n", "utf8");
-
-  let enumerations = 0;
-  const removed = withOpendirHook(() => { enumerations += 1; }, () => launcher.__test.removeOwnedStage(owned));
-  assert.equal(removed, false, "a replaced stage root is retained");
-  assert.equal(enumerations, 0, "cleanup does not enumerate descendants");
-  assert.equal(readFileSync(replacement, "utf8"), "replacement survives\n");
-  assert.equal(launcher.__test.removeOwnedStage({ ...owned, root: held }), false,
-    "a relocated stage remains untouched without identity-matched lifetime evidence");
-  assert.equal(readFileSync(join(held, "original.txt"), "utf8"), "original stage stays\n");
-  const heldIdentity = lstatSync(held, { bigint: true });
-  assert.equal(heldIdentity.dev, owned.identity.dev);
-  assert.equal(heldIdentity.ino, owned.identity.ino);
-
-  const victim = join(fixture.root, "symlink-victim");
-  mkdirSync(victim);
-  writeFileSync(join(victim, "sentinel"), "outside target stays\n", "utf8");
-  const symlinkStage = launcher.__test.createOwnedStage(fixture.root, "symlink-stage-");
-  symlinkSync(victim, join(symlinkStage.root, "alias"), "dir");
-  assert.equal(launcher.__test.removeOwnedStage(symlinkStage), false, "the stage containing a symlink is retained");
-  assert.equal(lstatSync(join(symlinkStage.root, "alias")).isSymbolicLink(), true, "the link itself is preserved");
-  assert.equal(readFileSync(join(victim, "sentinel"), "utf8"), "outside target stays\n", "the link target is untouched");
-  assert.equal(enumerations, 0, "neither cleanup call scans its stage");
-});
-
-test("synthetic stage cleanup retains original, replaced, unknown, symlink, and .terraform entries", (t) => {
-  const fixture = makePackageFixture(false);
-  cleanupFixture(t, fixture);
-  const owned = launcher.__test.createOwnedStage(fixture.root, "stage-");
-  const stage = owned.root;
-  const originalFile = join(stage, "original.txt");
-  const unknownFile = join(stage, "unknown-output.txt");
-  writeFileSync(originalFile, "original entry stays\n", "utf8");
-  writeFileSync(unknownFile, "unknown entry stays\n", "utf8");
-
-  const nested = join(stage, "nested");
-  const held = join(stage, "nested-original");
-  const victim = join(fixture.root, "victim");
-  mkdirSync(nested);
-  mkdirSync(victim);
-  writeFileSync(join(nested, "sentinel"), "replaced original stays\n", "utf8");
-  writeFileSync(join(victim, "sentinel"), "symlink target stays\n", "utf8");
-  renameSync(nested, held);
-  symlinkSync(victim, nested, "dir");
-  symlinkSync(victim, join(stage, "alias"), "dir");
-
-  const terraform = join(stage, "src", ".terraform");
-  mkdirSync(terraform, { recursive: true });
-  writeFileSync(join(terraform, "sentinel"), "terraform entry stays\n", "utf8");
-  writeFileSync(join(stage, "src", "main.ts"), "ordinary entry stays\n", "utf8");
-
-  let enumerations = 0;
-  const retained = withOpendirHook(() => { enumerations += 1; }, () => launcher.__test.removeOwnedStage(owned));
-  assert.equal(retained, false, "the stage is retained without settled lifetime evidence");
-  assert.equal(enumerations, 0, "unknown descendants are not scanned");
-  const currentRoot = lstatSync(stage, { bigint: true });
-  assert.equal(currentRoot.dev, owned.identity.dev);
-  assert.equal(currentRoot.ino, owned.identity.ino);
-  assert.equal(readFileSync(originalFile, "utf8"), "original entry stays\n");
-  assert.equal(readFileSync(unknownFile, "utf8"), "unknown entry stays\n");
-  assert.equal(readFileSync(join(held, "sentinel"), "utf8"), "replaced original stays\n");
-  assert.equal(lstatSync(nested).isSymbolicLink(), true, "the replacement link is preserved");
-  assert.equal(lstatSync(join(stage, "alias")).isSymbolicLink(), true, "the unknown symlink is preserved");
-  assert.equal(readFileSync(join(victim, "sentinel"), "utf8"), "symlink target stays\n");
-  assert.equal(readFileSync(join(terraform, "sentinel"), "utf8"), "terraform entry stays\n");
-  assert.equal(readFileSync(join(stage, "src", "main.ts"), "utf8"), "ordinary entry stays\n");
-
-  // Remove only the test-created .terraform sentinel so fixture cleanup can
-  // safely remove this fixture without traversing initialized Terraform data.
-  unlinkSync(join(terraform, "sentinel"));
-  rmdirSync(terraform);
 });
 
 test("a relative PI_CODING_AGENT_DIR anchors staging and host paths against the startup cwd", { skip: process.platform === "win32" }, async (t) => {
@@ -2485,7 +2391,7 @@ test("absent or unsupported Pi provisions the isolated cache with exact npm argu
   assert.ok(existsSync(result.file));
   assert.match(notice, /provisioning isolated Pi/);
   assert.match(notice, /installed isolated Pi/);
-  assert.doesNotMatch(notice, /retained counted Pi runtime generation/, "successful setup publishes the same reserved root");
+  assert.doesNotMatch(notice, /retained an incomplete Pi runtime generation/, "successful setup publishes the same generation");
 
   const invocations = readFileSync(fixture.npmLog, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { args: string[] });
   const installs = invocations.filter((invocation) => invocation.args[0] === "install");
@@ -2552,7 +2458,7 @@ test("a staged Pi runtime is retained when its version probe cleanup is unconfir
 
   assert.equal(stagingRoot, join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`, ".setup"));
   assert.ok(existsSync(join(stagingRoot, "node_modules", "@earendil-works", "pi-coding-agent", "package.json")), "the staged runtime remains available");
-  assert.match(diagnostic, /retained counted Pi runtime generation \(setup lifetime uncertain\)/);
+  assert.match(diagnostic, /retained an incomplete Pi runtime generation; the next launch reclaims excess cache generations/);
 });
 
 test("Pi provisioning retains its stage when the install group cleanup is unconfirmed", async (t) => {
@@ -2588,7 +2494,7 @@ test("Pi provisioning retains its stage when the install group cleanup is unconf
   assert.equal(validationAttempted, false, "an unconfirmed install is never validated or published");
   assert.equal(stagingRoot, join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`, ".setup"));
   assert.ok(existsSync(join(stagingRoot, ".npm-cache")), "the owned staging root is preserved");
-  assert.match(diagnostic, /retained counted Pi runtime generation \(setup lifetime uncertain\)/);
+  assert.match(diagnostic, /retained an incomplete Pi runtime generation; the next launch reclaims excess cache generations/);
 });
 
 function readdirNames(dir: string): string[] {
@@ -2634,28 +2540,40 @@ test("an invalid cached runtime is preserved and fails closed", async (t) => {
   assert.equal(readFileSync(marker, "utf8"), "preserve me\n", "unknown cache resources are preserved");
 });
 
-test("preexisting empty and partial version destinations are preserved rather than replaced", async (t) => {
-  for (const shape of ["empty", "unknown-node-modules"] as const) {
-    const fixture = makeRuntimeFixture(`.session-host-pi-runtime-partial-${shape}-`);
-    cleanupFixture(t, fixture);
-    writeFakeNpm(fixture, "global");
-    const versionRoot = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`);
-    mkdirSync(shape === "empty" ? versionRoot : join(versionRoot, "node_modules"), { recursive: true });
-    const marker = shape === "unknown-node-modules" ? join(versionRoot, "node_modules", "unknown.txt") : join(versionRoot, "unknown.txt");
-    if (shape === "unknown-node-modules") writeFileSync(marker, "preserve this node_modules tree\n", "utf8");
-    const identity = lstatSync(versionRoot, { bigint: true });
+test("a settled empty version destination is retried while a published node_modules tree is preserved", async (t) => {
+  const emptyFixture = makeRuntimeFixture(".session-host-pi-runtime-partial-empty-");
+  cleanupFixture(t, emptyFixture);
+  writeFakeNpm(emptyFixture, "global");
+  const emptyRoot = join(emptyFixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`);
+  mkdirSync(emptyRoot, { recursive: true });
+  writeFileSync(join(emptyRoot, "unknown.txt"), "settled failed setup residue\n", "utf8");
+  await assert.rejects(
+    () => launcher.__test.resolvePiRuntime({ env: runtimeEnv(emptyFixture), agentDir: emptyFixture.agentDir, cwd: emptyFixture.root, writeError: () => undefined }),
+    /provisioning failed/,
+  );
+  const emptyInvocations = readFileSync(emptyFixture.npmLog, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { args: string[] });
+  assert.ok(emptyInvocations.some(({ args }) => args[0] === "install"),
+    "a settled empty version root is reclaimed and retried instead of blocking startup");
+  assert.equal(existsSync(join(emptyRoot, "unknown.txt")), false, "the actual settled residue was reclaimed");
 
-    await assert.rejects(
-      () => launcher.__test.resolvePiRuntime({ env: runtimeEnv(fixture), agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined }),
-      /partial or unknown/,
-    );
-    const after = lstatSync(versionRoot, { bigint: true });
-    assert.equal(after.dev, identity.dev);
-    assert.equal(after.ino, identity.ino);
-    if (shape === "unknown-node-modules") assert.equal(readFileSync(marker, "utf8"), "preserve this node_modules tree\n");
-    const invocations = readFileSync(fixture.npmLog, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { args: string[] });
-    assert.ok(invocations.every(({ args }) => args[0] !== "install"), "a partial destination blocks installation and publication");
-  }
+  const publishedFixture = makeRuntimeFixture(".session-host-pi-runtime-partial-published-");
+  cleanupFixture(t, publishedFixture);
+  writeFakeNpm(publishedFixture, "global");
+  const versionRoot = join(publishedFixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`);
+  mkdirSync(join(versionRoot, "node_modules"), { recursive: true });
+  const marker = join(versionRoot, "node_modules", "unknown.txt");
+  writeFileSync(marker, "preserve this node_modules tree\n", "utf8");
+  const identity = lstatSync(versionRoot, { bigint: true });
+  await assert.rejects(
+    () => launcher.__test.resolvePiRuntime({ env: runtimeEnv(publishedFixture), agentDir: publishedFixture.agentDir, cwd: publishedFixture.root, writeError: () => undefined }),
+    /partial or unknown/,
+  );
+  const after = lstatSync(versionRoot, { bigint: true });
+  assert.equal(after.dev, identity.dev);
+  assert.equal(after.ino, identity.ino);
+  assert.equal(readFileSync(marker, "utf8"), "preserve this node_modules tree\n");
+  const invocations = readFileSync(publishedFixture.npmLog, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { args: string[] });
+  assert.ok(invocations.every(({ args }) => args[0] !== "install"), "a published tree is never replaced merely because validation failed");
 });
 
 test("a competing Pi publication inside the reserved generation is refused without replacing either tree", async (t) => {
@@ -2730,8 +2648,8 @@ test("failed provisioning preserves foreign staging, unknown resources, and its 
   assert.equal(readFileSync(marker, "utf8"), "preserve me\n", "unknown resources are preserved");
   assert.equal(readFileSync(join(foreignStage, "active-download"), "utf8"), "in progress\n", "foreign staging is preserved");
   const ownStages = readdirNames(runtimeRoot).filter((entry) => entry === `pi-${launcher.PI_PROVISION_VERSION}`);
-  assert.equal(ownStages.length, 1, "this run's failed generation remains counted");
-  assert.match(diagnostic, /retained counted Pi runtime generation/);
+  assert.equal(ownStages.length, 1, "this run's incomplete generation is retained for later cleanup");
+  assert.match(diagnostic, /retained an incomplete Pi runtime generation/);
 });
 
 test("a concurrent launch's staging survives a successful provision", async (t) => {

@@ -1,44 +1,62 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createRequire } from "node:module";
-import { join, dirname, relative } from "node:path";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, symlinkSync, linkSync, writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { join } from "node:path";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 
 const requireCjs = createRequire(join(process.cwd(), "tests", "managed-generations.test.ts"));
 // The CJS producer surface deliberately has no environment/CLI test bypasses.
 const producer = requireCjs("../scripts/pi-review-sessions.cjs").__test;
 const generations = requireCjs("../scripts/managed-generations.cjs");
+
+/**
+ * #385 startup-first contract: the designated `.pi-review-gate/{build,
+ * pi-runtime,node}` subtrees are disposable caches. Every test below uses a
+ * synthetic owned home under node_modules/ and drives the real producer paths:
+ * five (and more) legacy generations without receipts must never block startup,
+ * and excess generations must actually be deleted from the filesystem when
+ * cleanup works. No real user cache is read or purged.
+ */
 function fixture(prefix = ".generations-") {
   const root = mkdtempSync(join(process.cwd(), "node_modules", prefix));
   const agentDir = join(root, "agent");
   const packageRoot = join(root, "package");
   const bin = join(root, "bin");
-  for (const dir of [bin, ...["src/session-host", "scripts", "skills"].map((p) => join(packageRoot, p))]) mkdirSync(dir, { recursive: true, mode: 0o700 });
-  for (const name of ["package.json", "package-lock.json", "tsconfig.json"]) writeFileSync(join(packageRoot, name), "{}", { mode: 0o600 });
+  for (const dir of [bin, ...["src/session-host", "scripts", "skills"].map((p) => join(packageRoot, p))]) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+  for (const name of ["package.json", "package-lock.json", "tsconfig.json"]) {
+    writeFileSync(join(packageRoot, name), "{}", { mode: 0o600 });
+  }
   writeFileSync(join(packageRoot, "src/session-host/main.ts"), "// input 0");
   writeFileSync(join(bin, "package.json"), JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "npm" } }), { mode: 0o600 });
   writeFileSync(join(bin, "npm"), "#!/usr/bin/env node\n// inert npm", { mode: 0o700 });
-  return { root, agentDir, packageRoot, bin, env: { HOME: root, PATH: bin, NODE_OPTIONS: "--no-warnings", NODE_ENV: "development" }, npmCli: join(bin, "npm"), builds: join(agentDir, ".pi-review-gate/build"), runtimes: join(agentDir, ".pi-review-gate/pi-runtime") };
+  return {
+    root,
+    agentDir,
+    packageRoot,
+    bin,
+    env: { HOME: root, PATH: bin, NODE_OPTIONS: "--no-warnings", NODE_ENV: "development", PI_CODING_AGENT_DIR: agentDir },
+    npmCli: join(bin, "npm"),
+    builds: join(agentDir, ".pi-review-gate/build"),
+    runtimes: join(agentDir, ".pi-review-gate/pi-runtime"),
+  };
 }
-function ok(extra = {}) { return { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "", ...extra }; }
-function count(root: string) { return readdirSync(root).filter((name) => lstatSync(join(root, name)).isDirectory()).length; }
+type Fixture = ReturnType<typeof fixture>;
+function ok(extra = {}) {
+  return { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "", ...extra };
+}
+function directories(root: string): string[] {
+  return readdirSync(root).filter((name) => lstatSync(join(root, name)).isDirectory()).sort();
+}
+function count(root: string): number {
+  return directories(root).length;
+}
 function writeCompiler(root: string) {
   const pkg = join(root, "node_modules/typescript");
   mkdirSync(join(pkg, "bin"), { recursive: true, mode: 0o700 });
   writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "typescript", bin: { tsc: "./bin/tsc" } }));
   writeFileSync(join(pkg, "bin/tsc"), "// inert compiler");
-}
-async function build(f: ReturnType<typeof fixture>, extra = {}) {
-  return producer.buildSourceExtension({ packageRoot: f.packageRoot, agentDir: f.agentDir, env: f.env,
-    runNpm: async (_cli: string, _args: string[], o: { cwd: string; env: NodeJS.ProcessEnv }) => {
-      assert.ok(String(o.env.TMPDIR).startsWith(o.cwd + "/"), "setup cannot escape the counted root");
-      writeCompiler(o.cwd); return ok();
-    },
-    runCompile: async (_cli: string, _args: string[], o: { cwd: string }) => {
-      mkdirSync(join(o.cwd, "dist/src/session-host"), { recursive: true });
-      writeFileSync(join(o.cwd, "dist/src/session-host/main.js"), "// output"); return ok();
-    }, ...extra });
 }
 function writePi(root: string, version: string) {
   const pkg = join(root, "node_modules/@earendil-works/pi-coding-agent");
@@ -46,730 +64,597 @@ function writePi(root: string, version: string) {
   writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version, bin: { pi: "cli.js" } }));
   writeFileSync(join(pkg, "cli.js"), "#!/usr/bin/env node\n", { mode: 0o700 });
 }
-async function provision(f: ReturnType<typeof fixture>, version: string, extra = {}) {
-  return producer.provisionPiRuntime({ env: f.env, agentDir: f.agentDir, npmCli: f.npmCli, provisionVersion: version,
+async function build(f: Fixture, extra: Record<string, unknown> = {}) {
+  return producer.buildSourceExtension({
+    packageRoot: f.packageRoot,
+    agentDir: f.agentDir,
+    env: f.env,
+    writeError: () => undefined,
+    runNpm: async (_cli: string, _args: string[], o: { cwd: string; env: NodeJS.ProcessEnv }) => {
+      assert.ok(String(o.env.TMPDIR).startsWith(o.cwd + "/"), "setup stays inside the generation");
+      writeCompiler(o.cwd);
+      return ok();
+    },
+    runCompile: async (_cli: string, _args: string[], o: { cwd: string }) => {
+      mkdirSync(join(o.cwd, "dist/src/session-host"), { recursive: true });
+      writeFileSync(join(o.cwd, "dist/src/session-host/main.js"), "// output");
+      return ok();
+    },
+    ...extra,
+  });
+}
+async function provision(f: Fixture, version: string, extra: Record<string, unknown> = {}) {
+  return producer.provisionPiRuntime({
+    env: f.env,
+    agentDir: f.agentDir,
+    npmCli: f.npmCli,
+    provisionVersion: version,
     writeError: () => undefined,
     runNpm: async (_cli: string, args: string[], o: { cwd: string }) => {
       assert.equal(args[2], o.cwd);
-      assert.ok(count(f.runtimes) <= 5, "no sixth exists even during npm setup");
       writePi(o.cwd, version);
       return ok();
-    }, processRunner: async () => ok({ stdout: version }), ...extra });
+    },
+    processRunner: async () => ok({ stdout: version }),
+    ...extra,
+  });
+}
+function seedLegacy(root: string, names: string[]): string[] {
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const roots: string[] = [];
+  for (const name of names) {
+    const target = join(root, name);
+    mkdirSync(join(target, "nested"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(target, "nested", "legacy-output.txt"), "disposable by location");
+    roots.push(target);
+  }
+  return roots;
 }
 const posix = { skip: process.platform === "win32" };
+const liveHost = (f: Fixture) => {
+  mkdirSync(join(f.agentDir, "session-host"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(f.agentDir, "session-host", "host-ownership.json"), JSON.stringify({ version: 1, hostId: "seed" }));
+};
 
-// Query-boundary seam only: no env/CLI bypass, privileged mounts, or real cache.
-function withMountEvidence(platform: string, query: (call: number) => string | object, action: () => void) {
-  const childProcess = requireCjs("node:child_process") as typeof import("node:child_process");
-  const original = childProcess.spawnSync;
-  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
-  let calls = 0;
-  try {
-    Object.defineProperty(process, "platform", { ...descriptor, value: platform });
-    childProcess.spawnSync = ((command: string, args: string[], options: any) => {
-      assert.equal(command, platform === "linux" ? "/bin/cat" : "/sbin/mount");
-      assert.deepEqual(args, platform === "linux" ? ["/proc/self/mountinfo"] : []);
-      assert.deepEqual(options.env, { LC_ALL: "C" });
-      assert.ok(options.timeout > 0 && options.timeout <= 1000);
-      assert.equal(options.maxBuffer, 4 * 1024 * 1024);
-      assert.equal(options.killSignal, "SIGKILL");
-      const evidence = query(++calls);
-      return typeof evidence === "string" ? { status: 0, signal: null, stdout: evidence } : evidence;
-    }) as typeof original;
-    action();
-  } finally {
-    childProcess.spawnSync = original;
-    Object.defineProperty(process, "platform", descriptor);
-  }
-  return calls;
-}
-function mountEvidence(platform: string, mounted?: string) {
-  const escape = (value: string) => value.replace(/\\/gu, "\\134").replace(/ /gu, "\\040").replace(/\t/gu, "\\011").replace(/\n/gu, "\\012");
-  // Unrelated entries, including a lexical sibling, must not prevent cleanup.
-  const paths = ["/", "/unrelated", ...(mounted ? [mounted] : [])];
-  return paths.map((value, i) => platform === "linux"
-    ? `${i + 1} 0 8:1 / ${escape(value)} rw,relatime shared:1 - ext4 /dev/fixture rw\n`
-    : `/dev/fixture on ${value} (apfs, local)\n`).join("");
-}
-function reclamationFixture(prefix?: string) {
-  const f = fixture(prefix); mkdirSync(f.builds, { recursive: true });
-  const candidate = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "generation-")) }));
-  const subtree = join(candidate.root, "mounted space\\tab\tnewline\n"); mkdirSync(subtree);
-  const survivor = join(subtree, "survivor"); writeFileSync(survivor, "outside data stays intact");
-  const ordinary = join(candidate.root, "ordinary"); writeFileSync(ordinary, "ordinary descendant");
-  const outside = join(f.root, "outside"); writeFileSync(outside, "outside sentinel");
-  assert.equal(candidate.generation.release(), true);
-  for (let i = 0; i < 4; i++) generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "held-")) }));
-  const attempt = () => generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "admitted-")) }));
-  const retained = () => {
-    assert.equal(count(f.builds), 5);
-    assert.equal(readFileSync(survivor, "utf8"), "outside data stays intact");
-    assert.equal(readFileSync(ordinary, "utf8"), "ordinary descendant");
-    assert.equal(readFileSync(outside, "utf8"), "outside sentinel");
-    assert.ok(existsSync(join(candidate.root, generations.RECORD)));
-  };
-  return { ...f, candidate, subtree, survivor, ordinary, outside, attempt, retained };
-}
+test("legacy generations without receipts are pruned to five per type, not used to refuse startup", () => {
+  const f = fixture();
+  const legacyBuild = seedLegacy(f.builds, ["a-legacy", "b-malformed", "c-stale", "d-plain", "e-plain", "f-plain", "g-plain"]);
+  writeFileSync(join(legacyBuild[1]!, ".generation.json"), "{}", { mode: 0o600 });
+  writeFileSync(join(legacyBuild[2]!, ".node-lifetime"), "pi-review-gate-node-v1\n0:0\nbootstrap.x\nprotected\n", { mode: 0o600 });
+  const legacyRuntime = seedLegacy(f.runtimes, ["pi-1.2.0", "pi-1.2.1", "pi-1.2.2", "pi-1.2.3", "pi-1.2.4", "pi-1.2.5"]);
+  const warnings: string[] = [];
+  const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }), { warn: (m: string) => warnings.push(m) });
+  assert.ok(existsSync(stage.root));
+  assert.equal(stage.generation.release(), true);
+  assert.ok(count(f.builds) <= generations.LIMIT, `build cache stayed bounded: ${count(f.builds)}`);
+  assert.ok(count(f.runtimes) === 6, "the separate Pi cache type is not touched by build cleanup");
+  const removed = legacyBuild.filter((root) => !existsSync(root));
+  assert.ok(removed.length >= 3, "actual legacy directories were deleted, not merely counted");
+  assert.deepEqual(warnings, [], "successful cleanup reports no warning");
+  // The independent Pi type prunes its own excess with no receipts either.
+  const runtimeStage = generations.admit(f.runtimes, () => ({ root: mkdtempSync(join(f.runtimes, "pi-")) }));
+  assert.ok(existsSync(runtimeStage.root));
+  assert.equal(runtimeStage.generation.release(), true);
+  assert.ok(count(f.runtimes) <= generations.LIMIT);
+  assert.ok(legacyRuntime.filter((root) => !existsSync(root)).length >= 2);
+  assert.equal(generations.LIMIT, 5);
+});
 
-test("native same-device mounted roots and descendants refuse before opening any generation directory", posix, () => {
-  for (const platform of ["linux", "darwin"]) for (const mountedRoot of [false, true]) {
-    const f = reclamationFixture();
-    assert.equal(lstatSync(f.subtree, { bigint: true }).dev, lstatSync(f.candidate.root, { bigint: true }).dev);
-    const fs = requireCjs("node:fs") as typeof import("node:fs");
-    const original = fs.opendirSync;
-    let traversals = 0;
-    fs.opendirSync = ((file: any, ...args: any[]) => {
-      if (String(file) === f.candidate.root || String(file).startsWith(f.candidate.root + "/")) traversals += 1;
-      return Reflect.apply(original, fs, [file, ...args]);
-    }) as typeof original;
-    try {
-      withMountEvidence(platform, () => mountEvidence(platform, mountedRoot ? f.candidate.root : f.subtree), () => {
-        assert.throws(f.attempt, /capacity exhausted/);
-      });
-    } finally { fs.opendirSync = original; }
-    assert.equal(traversals, 0, `${platform}: mounted content must never be traversed`);
-    f.retained();
+test("cleanup is confined: outside sentinels survive while links and .terraform content are removed without following them", posix, () => {
+  const f = fixture();
+  const outside = join(f.root, "outside"); mkdirSync(outside); writeFileSync(join(outside, "sentinel"), "outside data");
+  const linked = seedLegacy(f.builds, ["a-link"]);
+  symlinkSync(outside, join(linked[0]!, "outside-link"));
+  const terraform = seedLegacy(f.builds, ["b-terraform"]);
+  mkdirSync(join(terraform[0]!, ".terraform"));
+  writeFileSync(join(terraform[0]!, ".terraform", "sentinel"), "never entered");
+  seedLegacy(f.builds, ["c", "d", "e", "f", "g"]);
+  const rootLink = join(f.builds, "a-root-link");
+  symlinkSync(outside, rootLink);
+  const warnings: string[] = [];
+  const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }), { warn: (m: string) => warnings.push(m) });
+  assert.ok(existsSync(stage.root), "startup is never refused by an unsafe or unreclaimable entry");
+  stage.generation.release();
+  assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "outside data");
+  assert.equal(existsSync(linked[0]!), false, "a generation holding an outside link is removed without following it");
+  assert.equal(existsSync(rootLink), false, "a direct-child link is unlinked, never entered");
+  assert.equal(existsSync(terraform[0]!), false,
+    "cleanup-specific traversal removes an initialized .terraform subtree inside a selected disposable generation");
+  assert.equal(existsSync(join(terraform[0]!, ".terraform", "sentinel")), false);
+  assert.deepEqual(warnings, [], "full removal reports no warning");
+});
+
+test("stale, empty and malformed admission locks never become permanent startup stops", posix, () => {
+  for (const content of ["999999999\n", "", "not-a-pid\n"]) {
+    const f = fixture();
+    seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
+    writeFileSync(join(f.builds, ".admission.lock"), content, { mode: 0o600 });
+    const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }));
+    assert.ok(existsSync(stage.root), `lock content ${JSON.stringify(content)} did not block creation`);
+    assert.equal(stage.generation.release(), true);
+    assert.ok(count(f.builds) <= generations.LIMIT + 1, "a reclaimed stale lock still allows cleanup");
+    assert.equal(existsSync(join(f.builds, ".admission.lock")), false);
   }
 });
 
-test("Darwin literal octal-looking cache ancestors cannot hide mounted roots or descendants", posix, () => {
-  for (const mountedRoot of [false, true]) {
-    const f = reclamationFixture(".generations-literal-\\040-");
-    // Raw Darwin output: no Linux-style escaping. Keep this descendant simple
-    // so refusal must detect its literal prefix, not reject a malformed line.
-    const mounted = mountedRoot ? f.candidate.root : join(f.candidate.root, "mounted");
-    if (!mountedRoot) {
-      mkdirSync(mounted);
-      writeFileSync(join(mounted, "survivor"), "mounted data");
-    }
-    const fs = requireCjs("node:fs") as typeof import("node:fs");
-    const original = fs.opendirSync;
-    let traversals = 0;
-    fs.opendirSync = ((file: any, ...args: any[]) => {
-      if (String(file).startsWith(f.candidate.root)) traversals += 1;
-      return Reflect.apply(original, fs, [file, ...args]);
-    }) as typeof original;
-    try {
-      withMountEvidence("darwin", () => `/dev/disk on / (apfs, local)\n/dev/fixture on ${mounted} (apfs, local)\n`, () => {
-        assert.throws(f.attempt, /capacity exhausted/);
-      });
-    } finally { fs.opendirSync = original; }
-    assert.equal(traversals, 0);
-    f.retained();
-    if (!mountedRoot) assert.equal(readFileSync(join(mounted, "survivor"), "utf8"), "mounted data");
-  }
+test("a live cleanup lock is left alone, warns, and still admits the new generation", posix, () => {
+  const f = fixture();
+  seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
+  writeFileSync(join(f.builds, ".admission.lock"), `${process.pid}\n`, { mode: 0o600 });
+  const warnings: string[] = [];
+  const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }), { warn: (m: string) => warnings.push(m) });
+  assert.ok(existsSync(stage.root));
+  assert.equal(stage.generation.release(), true);
+  assert.ok(warnings.some((warning) => warning.includes("cleanup lock was busy")));
+  // The foreign live lock was left untouched by that admission.
+  assert.ok(existsSync(join(f.builds, ".admission.lock")), "a lock owned by a live process is not stolen");
+  writeFileSync(join(f.builds, ".admission.lock"), "999999999\n");
+  const next = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }));
+  assert.ok(existsSync(next.root));
+  assert.equal(next.generation.release(), true);
+  assert.ok(count(f.builds) <= generations.LIMIT);
+  assert.equal(existsSync(join(f.builds, ".admission.lock")), false, "a dead owner's lock is reclaimed later");
 });
 
-test("Darwin ambiguous literal cache prefixes fail closed", posix, () => {
-  for (const prefix of [".generations-newline\n-", ".generations- on -", ".generations- (-"]) {
-    const f = reclamationFixture(prefix);
-    withMountEvidence("darwin", () => mountEvidence("darwin"), () => assert.throws(f.attempt, /capacity exhausted/));
-    f.retained();
-  }
+test("a real filesystem cleanup failure warns and startup still proceeds", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const f = fixture();
+  const blocked = seedLegacy(f.builds, ["a-blocked"]);
+  const locked = join(blocked[0]!, "nested");
+  chmodSync(locked, 0o500);
+  seedLegacy(f.builds, ["b", "c", "d", "e", "f"]);
+  const warnings: string[] = [];
+  const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }), { warn: (m: string) => warnings.push(m) });
+  assert.ok(existsSync(stage.root), "a cleanup failure never stops creation");
+  stage.generation.release();
+  assert.ok(warnings.some((warning) => warning.includes("could not reclaim")));
+  assert.equal(readFileSync(join(locked, "legacy-output.txt"), "utf8"), "disposable by location");
+  chmodSync(locked, 0o700);
+  const next = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }));
+  assert.ok(existsSync(next.root));
+  next.generation.release();
+  assert.equal(existsSync(blocked[0]!), false, "the retry reclaims the formerly blocked generation");
+  assert.ok(count(f.builds) <= generations.LIMIT);
 });
 
-test("relative cache spelling cannot bypass absolute native mount paths", posix, () => {
-  const f = reclamationFixture();
-  withMountEvidence("linux", () => mountEvidence("linux", f.subtree), () => {
-    assert.throws(() => generations.admit(relative(process.cwd(), f.builds), () => {
-      throw new Error("must not create a sixth");
-    }), /capacity exhausted/);
-  });
-  f.retained();
+test("an existing session-host ownership record skips cleanup without blocking creation", posix, () => {
+  const f = fixture();
+  const legacy = seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
+  liveHost(f);
+  const warnings: string[] = [];
+  const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }), { warn: (m: string) => warnings.push(m) });
+  assert.ok(existsSync(stage.root), "the active host or this launch still starts");
+  stage.generation.release();
+  assert.ok(legacy.every((root) => existsSync(root)), "a live host's cache generations are left untouched");
+  assert.ok(warnings.some((warning) => warning.includes("session host currently owns")));
 });
 
-test("different-device descendants refuse before traversal even without a corresponding mount-table entry", posix, () => {
-  const f = reclamationFixture();
-  const fs = requireCjs("node:fs") as typeof import("node:fs");
-  const originalStat = fs.lstatSync, originalOpen = fs.opendirSync;
-  let opened = false;
-  Object.defineProperty(fs, "lstatSync", { configurable: true, writable: true, value: (file: any, options: any) => {
-    const stat = originalStat(file, options);
-    if (String(file) !== f.subtree) return stat;
-    return Object.create(stat, { dev: { value: BigInt(stat.dev) + 1n } });
-  } });
-  fs.opendirSync = ((file: any, ...args: any[]) => {
-    if (String(file) === f.subtree) opened = true;
-    return Reflect.apply(originalOpen, fs, [file, ...args]);
-  }) as typeof originalOpen;
-  try {
-    withMountEvidence("linux", () => mountEvidence("linux"), () => assert.throws(f.attempt, /capacity exhausted/));
-  } finally { Object.defineProperty(fs, "lstatSync", { configurable: true, writable: true, value: originalStat }); fs.opendirSync = originalOpen; }
-  assert.equal(opened, false); f.retained();
-});
-
-test("unrelated native mount entries permit real ordinary path-owned reclamation and five-slot admission", posix, () => {
-  for (const platform of ["linux", "darwin"]) {
-    const f = reclamationFixture(".generations-literal-\\040-");
-    const calls = withMountEvidence(platform, () => mountEvidence(platform, f.candidate.root + "-sibling"), () => {
-      const admitted = f.attempt();
-      assert.ok(existsSync(admitted.root)); assert.equal(count(f.builds), 5);
-    });
-    assert.ok(calls > 2, "native evidence is revalidated, not just cached once");
-    assert.equal(existsSync(f.candidate.root), false);
-    assert.equal(readFileSync(f.outside, "utf8"), "outside sentinel");
-  }
-});
-
-test("missing, malformed, oversized, timed-out and unsupported mount evidence fails closed", posix, () => {
-  for (const evidence of ["", "malformed\n", "1 0 8:1 / /bad\\777 rw - ext4 fixture rw\n", "x".repeat(4 * 1024 * 1024) + "\n",
-    { status: null, signal: "SIGKILL", error: { code: "ETIMEDOUT" }, stdout: mountEvidence("linux") },
-    { status: 1, signal: null, stdout: mountEvidence("linux") }]) {
-    const f = reclamationFixture();
-    withMountEvidence("linux", () => evidence, () => assert.throws(f.attempt, /capacity exhausted/));
-    f.retained();
-  }
-  const f = reclamationFixture();
-  const calls = withMountEvidence("freebsd", () => { throw new Error("unsupported native query must not execute"); }, () => {
-    assert.throws(f.attempt, /capacity exhausted/);
-  });
-  assert.equal(calls, 0); f.retained();
-});
-
-test("mount evidence changes before traversal or the first deletion preserve every actual survivor", posix, () => {
-  for (const phase of ["traversal", "deletion"] as const) {
-    const f = reclamationFixture();
-    const fs = requireCjs("node:fs") as typeof import("node:fs");
-    const original = fs.opendirSync;
-    let changed = false;
-    // Closing the root finishes preflight traversal. Change only mount
-    // evidence then: inode/dev and all actual survivor files stay unchanged.
-    fs.opendirSync = ((file: any, ...args: any[]) => {
-      const dir = Reflect.apply(original, fs, [file, ...args]);
-      if (String(file) === f.candidate.root) {
-        const close = dir.closeSync.bind(dir);
-        dir.closeSync = () => { changed = true; close(); };
-      }
-      return dir;
-    }) as typeof original;
-    try {
-      withMountEvidence("linux", (call) => mountEvidence("linux", (phase === "traversal" ? call > 1 : changed) ? f.subtree : undefined), () => {
-        assert.throws(f.attempt, /capacity exhausted/);
-      });
-    } finally { fs.opendirSync = original; }
-    f.retained();
-  }
-});
-
-test("changed mount evidence stops partial deletion while retaining lifetime and remaining real files", posix, () => {
-  const f = reclamationFixture();
-  const fs = requireCjs("node:fs") as typeof import("node:fs");
-  const original = fs.unlinkSync;
-  const files = [f.survivor, f.ordinary];
-  let removed = "";
-  fs.unlinkSync = ((file: any) => {
-    original(file);
-    if (String(file).startsWith(f.candidate.root + "/")) {
-      assert.equal(removed, "", "a second deletion must revalidate native evidence");
-      removed = String(file);
-    }
-  }) as typeof original;
-  try {
-    withMountEvidence("linux", () => mountEvidence("linux", removed ? f.subtree : undefined), () => {
-      assert.throws(f.attempt, /capacity exhausted/);
-    });
-  } finally { fs.unlinkSync = original; }
-  assert.ok(files.includes(removed), "one ordinary leaf was deleted before the synthetic mount change");
-  for (const file of files.filter((file) => file !== removed)) assert.ok(existsSync(file));
-  assert.ok(existsSync(join(f.candidate.root, generations.RECORD)));
-  assert.equal(count(f.builds), 5);
-  assert.equal(readFileSync(f.outside, "utf8"), "outside sentinel");
-});
-
-test("a root identity replaced while querying native metadata is not traversed or deleted", posix, () => {
-  const f = reclamationFixture();
-  const parked = join(f.root, "parked");
-  withMountEvidence("linux", (call) => {
-    if (call === 2) {
-      renameSync(f.candidate.root, parked);
-      mkdirSync(f.candidate.root);
-      writeFileSync(join(f.candidate.root, "replacement-survivor"), "replacement");
-    }
-    return mountEvidence("linux");
-  }, () => assert.throws(f.attempt, /capacity exhausted/));
-  assert.equal(readFileSync(join(f.candidate.root, "replacement-survivor"), "utf8"), "replacement");
-  assert.equal(readFileSync(join(parked, "ordinary"), "utf8"), "ordinary descendant");
-  assert.equal(readFileSync(join(parked, generations.RECORD), "utf8").includes('"holders":[]'), true);
-  assert.equal(readFileSync(f.outside, "utf8"), "outside sentinel");
-  assert.equal(count(f.builds), 5);
-});
-
-test("dependency-sized isolated generation reclaims with real native metadata and admits the sixth", {
-  skip: process.platform !== "linux" && process.platform !== "darwin", timeout: 240_000,
-}, () => {
-  const f = reclamationFixture();
-  const packages = 250, leavesPerPackage = 40;
-  for (let i = 0; i < packages; i++) {
-    const lib = join(f.candidate.root, "node_modules", `package-${i}`, "lib");
-    mkdirSync(lib, { recursive: true });
-    for (let j = 0; j < leavesPerPackage; j++) writeFileSync(join(lib, `module-${j}.js`), "// disposable dependency output\n");
-  }
-  const childProcess = requireCjs("node:child_process") as typeof import("node:child_process");
-  const fs = requireCjs("node:fs") as typeof import("node:fs");
-  const originalQuery = childProcess.spawnSync, originalUnlink = fs.unlinkSync;
-  let queries = 0, firstDeletionQueries = 0;
-  // Observe real queries; do not supply synthetic metadata in this size proof.
-  childProcess.spawnSync = ((...args: any[]) => {
-    queries += 1;
-    return Reflect.apply(originalQuery, childProcess, args);
-  }) as typeof originalQuery;
-  fs.unlinkSync = ((file: any) => {
-    if (!firstDeletionQueries && String(file).startsWith(f.candidate.root + "/")) firstDeletionQueries = queries;
-    originalUnlink(file);
-  }) as typeof originalUnlink;
-  try {
-    const admitted = f.attempt();
-    assert.ok(existsSync(admitted.root));
-    assert.equal(existsSync(f.candidate.root), false, "the entire settled dependency tree was actually removed");
-    assert.equal(count(f.builds), 5);
-  } finally { childProcess.spawnSync = originalQuery; fs.unlinkSync = originalUnlink; }
-  assert.equal(firstDeletionQueries, 2 * packages + 5, "preflight queries directories, not the 10,000 ordinary leaves");
-  assert.ok(queries > packages * leavesPerPackage, "every deletion still revalidates native mount evidence");
-  assert.equal(readFileSync(f.outside, "utf8"), "outside sentinel");
-});
-
-test("real development producer reclaims path-owned settled generations, preserves pins, and reuses validated output", posix, async () => {
+test("real development producer reclaims excess legacy generations and reuses validated output", posix, async () => {
   const f = fixture();
   const outside = join(f.root, "outside"); writeFileSync(outside, "sentinel");
-  const held = await build(f); assert.equal(held.status, 0);
-  const selected = await build(f); assert.equal(selected.cacheHit, true);
-  assert.equal(selected.stagingRoot, held.stagingRoot);
-  assert.equal(selected.ownedStage.generation.release(), true);
-  const recovery = generations.pin(f.builds, () => ({ root: held.stagingRoot }));
-  assert.equal(held.ownedStage.generation.release(), true);
-  const roots: string[] = [];
-  for (let n = 1; n <= 8; n++) {
-    writeFileSync(join(f.packageRoot, "src/session-host/main.ts"), `// input ${n}`);
-    const result = await build(f); assert.equal(result.status, 0, result.diagnostics);
-    roots.push(result.stagingRoot);
-    // A descendant from another writer is still disposable by path policy.
-    writeFileSync(join(result.stagingRoot, "foreign-descendant"), "disposable");
-    assert.equal(result.ownedStage.generation.release(), true);
-    assert.ok(count(f.builds) <= 5);
-  }
-  assert.ok(roots.some((root) => !existsSync(root)), "actual filesystem reclamation, not mocked removals");
-  assert.ok(existsSync(held.stagingRoot), "held build survives pressure");
+  seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
+  const result = await build(f);
+  assert.equal(result.status, 0, result.diagnostics);
+  assert.ok(result.stagingRoot.startsWith(f.builds + "/"));
+  assert.ok(count(f.builds) <= generations.LIMIT, `actual build cache is bounded: ${count(f.builds)}`);
+  assert.ok(directories(f.builds).filter((name) => name.startsWith("a")).length === 0, "legacy generations were actually removed");
   assert.equal(readFileSync(outside, "utf8"), "sentinel");
-  assert.equal(recovery.generation.release(), true, "an actual source-linked recovery holder releases explicitly");
+  const reused = await build(f);
+  assert.equal(reused.cacheHit, true);
+  assert.equal(reused.stagingRoot, result.stagingRoot);
+  const changed = await build(f, { forceFresh: true });
+  assert.equal(changed.status, 0);
+  assert.notEqual(changed.stagingRoot, result.stagingRoot);
+  assert.ok(count(f.builds) <= generations.LIMIT);
+  assert.ok(existsSync(changed.stagingRoot));
 });
 
-test("Pi producer provisions more than five independent versions without a publication sixth", posix, async () => {
-  const f = fixture();
-  const held = await provision(f, "1.3.0");
-  const roots: string[] = [];
-  for (let n = 1; n <= 8; n++) {
-    const version = `1.3.${n}`;
-    const result = await provision(f, version);
-    assert.equal(result.version, version);
-    assert.equal(result.generation.root, join(f.runtimes, `pi-${version}`));
-    roots.push(result.generation.root);
-    assert.equal(result.generation.release(), true);
-    assert.ok(count(f.runtimes) <= 5);
-  }
-  assert.ok(roots.some((root) => !existsSync(root)));
-  assert.ok(existsSync(held.file));
-  assert.equal(held.generation.release(), true);
-  assert.equal(count(f.runtimes), 5);
-  // The two independent caches do not borrow one another's slots.
-  assert.equal((await build(f)).status, 0);
-});
-
-test("simultaneous real producers reserve before awaiting npm; full pinned capacity refuses without deletion", posix, async () => {
-  const f = fixture();
-  const stages: string[] = [];
-  const settle: Array<() => void> = [];
-  const pending = Array.from({ length: 5 }, () => build(f, { forceFresh: true,
-    runNpm: async (_c: string, _a: string[], o: { cwd: string }) => {
-      stages.push(o.cwd);
-      await new Promise<void>((resolve) => settle.push(resolve));
-      writeCompiler(o.cwd); return ok();
-    } }));
-  assert.equal(stages.length, 5);
-  assert.equal(count(f.builds), 5);
-  const refused = await build(f, { forceFresh: true });
-  assert.equal(refused.status, 1); assert.match(refused.diagnostics, /capacity exhausted/);
-  assert.ok(stages.every(existsSync));
-  settle.forEach((done) => done());
-  const results = await Promise.all(pending);
-  assert.ok(results.every((r) => r.status === 0));
-  assert.equal(count(f.builds), 5);
-  results.forEach((r) => assert.equal(r.ownedStage.generation.release(), true));
-});
-
-test("cross-process exclusive admission never creates a sixth and abandoned pins remain uncertain", posix, async () => {
-  const f = fixture(); mkdirSync(f.builds, { recursive: true });
-  const modulePath = join(process.cwd(), "scripts/managed-generations.cjs");
-  const source = `const fs=require('node:fs'),path=require('node:path');const g=require(${JSON.stringify(modulePath)});try{g.admit(process.argv[1],()=>{const root=fs.mkdtempSync(path.join(process.argv[1],'generation-'));return {root}});process.exitCode=0}catch(e){process.exitCode=2}`;
-  const codes = await Promise.all(Array.from({ length: 16 }, () => new Promise<number | null>((resolve, reject) => {
-    const child = spawn(process.execPath, ["-e", source, f.builds], { env: f.env, stdio: "ignore" });
-    child.on("error", reject); child.on("close", resolve);
-  })));
-  assert.ok(codes.every((code) => code === 0 || code === 2));
-  assert.ok(count(f.builds) <= 5);
-  assert.throws(() => { while (true) generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "fill-")) })); }, /capacity exhausted/);
-  assert.equal(count(f.builds), 5);
-});
-
-test("legacy, malformed, identity-replaced, hardlinked and out-of-root link generations remain counted", posix, async () => {
-  for (const kind of ["legacy", "malformed", "replacement", "hardlink", "symlink", "terraform"] as const) {
-    const f = fixture(); mkdirSync(f.builds, { recursive: true });
-    const outside = join(f.root, "sentinel"); writeFileSync(outside, "safe");
-    for (let i = 0; i < 5; i++) {
-      const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "generation-")) }));
-      assert.equal(stage.generation.release(), true);
-      if (kind === "legacy") renameSync(join(stage.root, generations.RECORD), join(stage.root, "legacy-record"));
-      if (kind === "malformed") writeFileSync(join(stage.root, generations.RECORD), "{}");
-      if (kind === "replacement") {
-        const record = readFileSync(join(stage.root, generations.RECORD));
-        renameSync(stage.root, join(f.root, `held-${i}`)); mkdirSync(stage.root);
-        writeFileSync(join(stage.root, generations.RECORD), record);
-      }
-      if (kind === "hardlink") linkSync(outside, join(stage.root, "link"));
-      if (kind === "symlink") symlinkSync(outside, join(stage.root, "link"));
-      if (kind === "terraform") mkdirSync(join(stage.root, ".terraform"));
-    }
-    const refused = await build(f, { forceFresh: true });
-    assert.equal(refused.status, 1, kind); assert.match(refused.diagnostics, /capacity exhausted/, kind);
-    assert.equal(count(f.builds), 5, kind); assert.equal(readFileSync(outside, "utf8"), "safe", kind);
-  }
-});
-
-test("settled failed/aborted setup residue is reclaimable; unsettled failures never release", posix, async () => {
-  const f = fixture();
-  for (let i = 0; i < 8; i++) {
-    const result = await build(f, { forceFresh: true, runNpm: async () => ok({ status: 1, timedOut: true }) });
-    assert.equal(result.status, 124, "settled timeout remains a timeout, not success"); assert.ok(count(f.builds) <= 5);
-  }
-  const uncertain = fixture();
-  for (let i = 0; i < 5; i++) {
-    const result = await build(uncertain, { forceFresh: true, runNpm: async () => ok({ status: 1, cleanupConfirmed: false }) });
-    assert.equal(result.status, 1);
-  }
-  assert.match((await build(uncertain, { forceFresh: true })).diagnostics, /capacity exhausted/);
-  const pi = fixture();
-  for (let i = 0; i < 8; i++) {
-    await assert.rejects(provision(pi, `1.4.${i}`, { runNpm: async () => ok({ status: 1 }) }), /provisioning failed/);
-    assert.ok(count(pi.runtimes) <= 5);
-  }
-});
-
-test("replaced cache ancestors and out-of-cache selections fail closed", posix, () => {
-  const f = fixture(); mkdirSync(f.builds, { recursive: true });
-  const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "generation-")) }));
-  renameSync(f.builds, join(dirname(f.builds), "held-builds")); mkdirSync(f.builds);
-  assert.equal(stage.generation.release(), false);
-  assert.throws(() => generations.pin(f.builds, () => ({ root: f.root })), /escaped cache/);
-  assert.equal(count(f.builds), 0);
-});
-
-test("Pi concurrent reservations, abandoned setup and protected legacy capacity cannot admit a sixth", posix, async () => {
-  const f = fixture();
-  const settle: Array<() => void> = [];
-  const pending = Array.from({ length: 5 }, (_, i) => provision(f, `1.5.${i}`, {
-    runNpm: async (_cli: string, _args: string[], o: { cwd: string }) => {
-      await new Promise<void>((resolve) => settle.push(resolve));
-      writePi(o.cwd, `1.5.${i}`); return ok();
-    },
-  }));
-  assert.equal(count(f.runtimes), 5);
-  await assert.rejects(provision(f, "1.5.5"), /capacity exhausted/);
-  settle.forEach((done) => done());
-  const results = await Promise.all(pending);
-  assert.equal(results.length, 5);
-  assert.ok(results.every((result) => existsSync(result.file)));
-  // These returned consumers still hold pins, even though npm has settled.
-  await assert.rejects(provision(f, "1.5.6"), /capacity exhausted/);
-  results.forEach((result) => assert.equal(result.generation.release(), true));
-
-  const legacy = fixture(); mkdirSync(legacy.runtimes, { recursive: true });
-  for (let i = 0; i < 5; i++) mkdirSync(join(legacy.runtimes, `legacy-${i}`));
-  await assert.rejects(provision(legacy, "1.6.0"), /capacity exhausted/);
-  assert.equal(count(legacy.runtimes), 5);
-
-  const uncertain = fixture();
-  for (let i = 0; i < 5; i++) await assert.rejects(provision(uncertain, `1.7.${i}`, {
-    runNpm: async () => ok({ status: 1, cleanupConfirmed: false }),
-  }), /cleanup was not confirmed/);
-  await assert.rejects(provision(uncertain, "1.7.5"), /capacity exhausted/);
-  assert.equal(count(uncertain.runtimes), 5);
-});
-
-test("compatible reuse at full capacity performs no generation inventory; eviction retires only its validated freshness pointer", posix, async () => {
+test("compatible reuse performs no cache inventory or cleanup", posix, async () => {
   const f = fixture();
   const original = await build(f);
-  const others = [];
-  for (let i = 0; i < 4; i++) others.push(await build(f, { forceFresh: true }));
   const fs = requireCjs("node:fs") as typeof import("node:fs");
   const opendir = fs.opendirSync;
   let inventories = 0;
-  Object.defineProperty(fs, "opendirSync", { configurable: true, writable: true, value: (...args: Parameters<typeof opendir>) => {
-    if (String(args[0]) === f.builds) { inventories += 1; throw new Error("reuse must not inventory generations"); }
-    return Reflect.apply(opendir, fs, args);
-  } });
+  Object.defineProperty(fs, "opendirSync", {
+    configurable: true,
+    writable: true,
+    value: (...args: Parameters<typeof opendir>) => {
+      if (String(args[0]) === f.builds) { inventories += 1; throw new Error("reuse must not inventory generations"); }
+      return Reflect.apply(opendir, fs, args);
+    },
+  });
   let reused;
   try { reused = await build(f); } finally { fs.opendirSync = opendir; }
-  assert.equal(reused.cacheHit, true); assert.equal(inventories, 0);
-  assert.equal(count(f.builds), 5);
-  assert.equal(reused.ownedStage.generation.release(), true);
-  assert.equal(original.ownedStage.generation.release(), true);
-  // Only the original is eligible, so its actual deletion is deterministic.
-  writeFileSync(join(f.packageRoot, "src/session-host/main.ts"), "// changed");
-  const changed = await build(f);
-  assert.equal(changed.status, 0); assert.equal(existsSync(original.stagingRoot), false);
-  assert.equal(existsSync(join(f.builds, `source-${original.cacheKey}.json`)), false);
-  assert.equal(changed.ownedStage.generation.release(), true);
-  writeFileSync(join(f.packageRoot, "src/session-host/main.ts"), "// input 0");
-  const rebuilt = await build(f);
-  assert.equal(rebuilt.cachePublished, true, "an evicted key can publish a new completed prepared build");
-  const same = await build(f);
-  assert.equal(same.cacheHit, true);
-  assert.equal(same.stagingRoot, rebuilt.stagingRoot);
+  assert.equal(reused.cacheHit, true);
+  assert.equal(reused.stagingRoot, original.stagingRoot);
+  assert.equal(inventories, 0);
+  assert.equal(count(f.builds), 1);
 });
 
-test("partial filesystem cleanup stays counted and retry reclaims only after the obstruction is settled", { skip: process.platform === "win32" || process.getuid?.() === 0 }, async () => {
-  const f = fixture(); mkdirSync(f.builds, { recursive: true });
-  const blocked = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "generation-")) }));
-  const locked = join(blocked.root, "locked"); mkdirSync(locked);
-  writeFileSync(join(locked, "file"), "retain on partial failure");
-  writeFileSync(join(blocked.root, "z-first"), "disposable");
-  chmodSync(locked, 0o500);
-  assert.equal(blocked.generation.release(), true);
-  for (let i = 0; i < 4; i++) generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "generation-")) }));
-  const refused = await build(f, { forceFresh: true });
-  assert.equal(refused.status, 1); assert.match(refused.diagnostics, /capacity exhausted/);
-  assert.equal(count(f.builds), 5);
-  assert.ok(existsSync(join(blocked.root, generations.RECORD)), "partial failure retains lifetime evidence");
-  assert.equal(readFileSync(join(locked, "file"), "utf8"), "retain on partial failure");
-  chmodSync(locked, 0o700);
-  const admitted = await build(f, { forceFresh: true });
-  assert.equal(admitted.status, 0); assert.equal(count(f.builds), 5);
-  assert.equal(existsSync(blocked.root), false);
-});
-
-test("legacy prepared-build reuse preserves freshness authority without inventing inactivity", posix, async () => {
+test("legacy prepared-build reuse keeps freshness authority without any receipt", posix, async () => {
   const f = fixture();
+  seedLegacy(f.builds, ["old-1", "old-2", "old-3", "old-4", "old-5", "old-6"]);
   const first = await build(f);
-  assert.equal(first.ownedStage.generation.release(), true);
-  requireCjs("node:fs").unlinkSync(join(first.stagingRoot, generations.RECORD));
-  const legacy = await build(f);
-  assert.equal(legacy.cacheHit, true);
-  assert.equal(legacy.stagingRoot, first.stagingRoot);
-  assert.equal(legacy.ownedStage.generation, undefined);
-  assert.ok(producer.validateSourceBuildArtifact(legacy.stagingRoot, {
-    cacheKey: legacy.cacheKey, sourceFingerprint: legacy.sourceFingerprint, toolchainFingerprint: legacy.toolchainFingerprint,
-  }, legacy.cacheParentChain));
-  for (let i = 0; i < 7; i++) {
-    const next = await build(f, { forceFresh: true });
-    assert.equal(next.status, 0); assert.equal(next.ownedStage.generation.release(), true);
-  }
-  assert.ok(existsSync(first.stagingRoot), "absence of metadata is protected uncertainty, never an idle proof");
-  assert.equal(count(f.builds), 5);
+  assert.equal(first.status, 0);
+  // Simulate a legacy generation that never had a lifetime receipt: reuse is
+  // decided by the producer's own manifest/record validation.
+  assert.equal(existsSync(join(first.stagingRoot, ".generation.json")), false);
+  const legacyReuse = await build(f);
+  assert.equal(legacyReuse.cacheHit, true);
+  assert.equal(legacyReuse.stagingRoot, first.stagingRoot);
+  assert.ok(producer.validateSourceBuildArtifact(legacyReuse.stagingRoot, {
+    cacheKey: legacyReuse.cacheKey,
+    sourceFingerprint: legacyReuse.sourceFingerprint,
+    toolchainFingerprint: legacyReuse.toolchainFingerprint,
+  }, legacyReuse.cacheParentChain));
 });
 
-test("synthetic native policy counts five even explicitly released roots and refuses unsupported reclamation", () => {
-  const f = fixture(); mkdirSync(f.builds, { recursive: true });
-  const roots = [];
-  for (let i = 0; i < 5; i++) {
-    const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "generation-")) }));
-    assert.equal(stage.generation.release(), true); roots.push(stage.root);
+test("Pi producer provisions more than five versions and reclaims actual directories", posix, async () => {
+  const f = fixture();
+  seedLegacy(f.runtimes, ["pi-1.0.0", "pi-1.0.1", "pi-1.0.2", "pi-1.0.3", "pi-1.0.4", "pi-1.0.5", "pi-1.0.6"]);
+  const roots: string[] = [];
+  for (let n = 0; n < 4; n++) {
+    const version = `1.3.${n}`;
+    const result = await provision(f, version);
+    assert.equal(result.version, version);
+    roots.push(join(f.runtimes, `pi-${version}`));
+    assert.ok(count(f.runtimes) <= generations.LIMIT, `Pi cache bounded after ${version}: ${count(f.runtimes)}`);
+    assert.ok(existsSync(result.file));
   }
+  assert.ok(roots.every((root) => existsSync(root)), "each newly provisioned version is published");
+  assert.ok(directories(f.runtimes).filter((name) => name.startsWith("pi-1.0.")).length < 7,
+    "actual legacy Pi directories were reclaimed");
+  assert.ok(directories(f.runtimes).includes("pi-1.3.3"));
+});
+
+test("settled failed/aborted setup is reclaimed instead of blocking the next launch", posix, async () => {
+  const f = fixture();
+  for (let i = 0; i < 7; i++) {
+    const result = await build(f, { forceFresh: true, runNpm: async () => ok({ status: 1, timedOut: true }) });
+    assert.equal(result.status, 124);
+    assert.ok(count(f.builds) <= generations.LIMIT, `failed build residue stays bounded: ${count(f.builds)}`);
+  }
+  const pi = fixture();
+  for (let i = 0; i < 7; i++) {
+    await assert.rejects(provision(pi, `1.4.${i}`, { runNpm: async () => ok({ status: 1 }) }), /provisioning failed/);
+    assert.ok(count(pi.runtimes) <= generations.LIMIT, `failed Pi residue stays bounded: ${count(pi.runtimes)}`);
+  }
+  // A settled failed same-version install retries after its residue is reclaimed.
+  const retry = fixture();
+  const versionRoot = join(retry.runtimes, "pi-1.3.0");
+  await assert.rejects(provision(retry, "1.3.0", {
+    runNpm: async (_cli: string, _args: string[], o: { cwd: string }) => {
+      writeFileSync(join(o.cwd, "failed-install"), "settled partial output");
+      return ok({ status: 1 });
+    },
+  }), /provisioning failed/);
+  const retried = await provision(retry, "1.3.0");
+  assert.equal(retried.version, "1.3.0");
+  assert.equal(existsSync(join(versionRoot, ".setup/failed-install")), false, "actual failed residue was reclaimed");
+  assert.ok(existsSync(retried.file));
+});
+
+test("simultaneous producers coordinate and are never refused for capacity", posix, async () => {
+  const f = fixture();
+  const stages: string[] = [];
+  const settle: Array<() => void> = [];
+  const pending = Array.from({ length: 6 }, () => build(f, {
+    forceFresh: true,
+    runNpm: async (_c: string, _a: string[], o: { cwd: string }) => {
+      stages.push(o.cwd);
+      await new Promise<void>((resolve) => settle.push(resolve));
+      writeCompiler(o.cwd);
+      return ok();
+    },
+  }));
+  assert.equal(stages.length, 6, "all six producers reached setup; none was refused at five");
+  const results = await Promise.all(pending.map((pendingBuild) => {
+    settle.forEach((done) => done());
+    return pendingBuild;
+  }));
+  assert.ok(results.every((result) => result.status === 0), results.map((result) => result.diagnostics).join("\n"));
+  // Concurrent creations may briefly exceed the target; the next admission
+  // (not a refusal) converges the cache back to five.
+  const converged = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }));
+  assert.ok(existsSync(converged.root));
+  converged.generation.release();
+  assert.ok(count(f.builds) <= generations.LIMIT, `the cache converges to its target: ${count(f.builds)}`);
+});
+
+test("native Windows simulation has no count-based refusal either", posix, () => {
+  const f = fixture();
+  seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
   const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
   try {
     Object.defineProperty(process, "platform", { ...descriptor, value: "win32" });
-    assert.throws(() => generations.admit(f.builds, () => { throw new Error("must not create a sixth"); }), /capacity exhausted/);
-  } finally { Object.defineProperty(process, "platform", descriptor); }
-  assert.ok(roots.every(existsSync)); assert.equal(count(f.builds), 5);
-});
-
-test("launcher releases actual source/Pi pins only on the explicit complete lifetime handoff; helper uncertainty stays artifact-specific", posix, async () => {
-  for (const mode of ["complete", "numeric-only", "ddgs-uncertain"] as const) {
-    const f = fixture();
-    let built: any;
-    let runtime: any;
-    const status = await producer.runSessionHostLauncher([], {
-      getEnv: () => f.env, processEnv: {}, packageRoot: f.packageRoot,
-      platform: "linux", nodeVersion: process.versions.node, stdinIsTTY: true, stdoutIsTTY: true,
-      build: async () => { built = await build(f); return built; },
-      resolvePiRuntime: async () => { runtime = await provision(f, "1.3.0"); return runtime; },
-      ensureDdgs: () => mode === "ddgs-uncertain" ? { ok: false, cleanupUnconfirmed: true } : { ok: true, python: join(f.root, "python") },
-      refreshShippedSkills: () => ({ ok: true }), writeOut: () => undefined, writeError: () => undefined,
-      loadMain: () => ({ runSessionHost: (options: { onCacheConsumersSettled: () => void }) => {
-        if (mode === "complete") options.onCacheConsumersSettled();
-        return 0;
-      } }),
-    });
-    assert.equal(status, mode === "ddgs-uncertain" ? 1 : 0);
-    const sourceLifetime = JSON.parse(readFileSync(join(built.stagingRoot, generations.RECORD), "utf8"));
-    const piLifetime = JSON.parse(readFileSync(join(runtime.generation.root, generations.RECORD), "utf8"));
-    assert.equal(sourceLifetime.holders.length, mode === "complete" ? 0 : 1, mode);
-    assert.equal(piLifetime.holders.length, mode === "numeric-only" ? 1 : 0, "uncertain source helper does not pin unrelated Pi");
+    const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }));
+    assert.ok(existsSync(stage.root), "count alone never refuses creation");
+    stage.generation.release();
+  } finally {
+    Object.defineProperty(process, "platform", descriptor);
   }
+  assert.ok(count(f.builds) <= generations.LIMIT + 1);
 });
 
-test("failed reservation publication and unsafe admission ownership stay counted and untouched", posix, () => {
-  const f = fixture(); mkdirSync(f.builds, { recursive: true });
-  let retained = "";
-  assert.throws(() => generations.admit(f.builds, () => {
-    retained = mkdtempSync(join(f.builds, "generation-"));
-    writeFileSync(join(retained, generations.RECORD), "preexisting collision", { mode: 0o600 });
-    return { root: retained };
-  }), (error: unknown) => {
-    assert.equal((error as { retainedStage?: boolean }).retainedStage, true); return true;
+test("pin only confirms a direct cache child; generation release is a truthful no-op", posix, () => {
+  const f = fixture();
+  seedLegacy(f.builds, ["a"]);
+  const pinned = generations.pin(f.builds, () => ({ root: join(f.builds, "a") }));
+  assert.equal(pinned.selected.root, join(f.builds, "a"));
+  assert.equal(pinned.generation.release(), true);
+  assert.ok(existsSync(join(f.builds, "a")), "release never deletes a reusable generation");
+  assert.throws(() => generations.pin(f.builds, () => ({ root: f.root })), /escaped cache/);
+});
+
+test("a cleanup never reclaims a generation another producer is still filling", posix, async () => {
+  const f = fixture();
+  seedLegacy(f.builds, ["legacy-1", "legacy-2", "legacy-3", "legacy-4"]);
+  const stages: Record<string, string> = {};
+  const settles: Array<{ name: string; resolve: () => void }> = [];
+  const start = (name: string) => build(f, {
+    forceFresh: true,
+    runNpm: async (_cli: string, _args: string[], o: { cwd: string }) => {
+      stages[name] = o.cwd;
+      await new Promise<void>((resolve) => settles.push({ name, resolve }));
+      writeCompiler(o.cwd);
+      return ok();
+    },
   });
-  assert.equal(count(f.builds), 1);
-  assert.equal(readFileSync(join(retained, generations.RECORD), "utf8"), "preexisting collision");
-  for (let i = 0; i < 4; i++) generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "generation-")) }));
-  assert.throws(() => generations.admit(f.builds, () => { throw new Error("must not admit"); }), /capacity exhausted/);
-  const other = fixture(); mkdirSync(other.builds, { recursive: true });
-  const sentinel = join(other.root, "sentinel"); writeFileSync(sentinel, "outside admission");
-  symlinkSync(sentinel, join(other.builds, ".admission.lock"));
-  assert.throws(() => generations.admit(other.builds, () => { throw new Error("must not create"); }), /admission is busy or uncertain/);
-  assert.equal(count(other.builds), 0);
-  assert.equal(readFileSync(sentinel, "utf8"), "outside admission");
+  const first = start("first");
+  const second = start("second");
+  assert.ok(stages.first && stages.second, "both producers reached setup");
+  settles.find((settle) => settle.name === "first")!.resolve();
+  assert.equal((await first).status, 0);
+  // The lock owner has settled; a third cleanup now runs while the second
+  // producer is still filling its generation.
+  const third = start("third");
+  assert.ok(stages.third, "the third producer was admitted");
+  assert.ok(existsSync(stages.second!), "cleanup skips the live producer's generation");
+  settles.find((settle) => settle.name === "second")!.resolve();
+  settles.find((settle) => settle.name === "third")!.resolve();
+  const results = await Promise.all([second, third]);
+  assert.ok(results.every((result) => result.status === 0), results.map((result) => result.diagnostics).join("\n"));
+  assert.ok(existsSync(stages.second!), "the staggered setup completed without losing its generation");
+  assert.ok(count(f.builds) <= generations.LIMIT);
 });
 
-test("settled failed Pi setup can retry the identical version below and at full capacity", posix, async () => {
-  for (const full of [false, true]) {
-    const f = fixture();
-    const versionRoot = join(f.runtimes, "pi-1.3.0");
-    await assert.rejects(provision(f, "1.3.0", {
-      runNpm: async (_cli: string, _args: string[], o: { cwd: string }) => {
-        writeFileSync(join(o.cwd, "failed-install"), "settled partial output");
-        return ok({ status: 1 });
+test("a direct-child cache link never exposes an outside marker for deletion", posix, () => {
+  const f = fixture();
+  const outside = join(f.root, "outside");
+  mkdirSync(outside);
+  const outsideMarker = join(outside, ".producer-active");
+  writeFileSync(outsideMarker, "999999999\n", { mode: 0o600 });
+  const before = readFileSync(outsideMarker);
+  seedLegacy(f.builds, ["b", "c", "d", "e", "f"]);
+  symlinkSync(outside, join(f.builds, "a-link"));
+  symlinkSync(outside, join(f.builds, "z-link"));
+  const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }));
+  stage.generation.release();
+  assert.equal(readFileSync(outsideMarker).equals(before), true,
+    "the outside marker behind a direct-child cache link is byte-identical");
+  assert.equal(existsSync(join(f.builds, "a-link")), false, "the link itself is unlinked, never traversed");
+  assert.ok(count(f.builds) <= generations.LIMIT);
+});
+
+test("malformed marker shapes are not permanent pins", posix, () => {
+  const f = fixture();
+  const outside = join(f.root, "outside");
+  mkdirSync(outside);
+  writeFileSync(join(outside, "sentinel"), "outside");
+  const roots = seedLegacy(f.builds, ["a-dir-marker", "b-link-marker", "c-oversized", "d", "e", "f"]);
+  mkdirSync(join(roots[0]!, ".producer-active"));
+  symlinkSync(outside, join(roots[1]!, ".producer-active"));
+  writeFileSync(join(roots[2]!, ".producer-active"), "x".repeat(200));
+  const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }));
+  stage.generation.release();
+  assert.equal(existsSync(roots[0]!), false, "a directory-shaped marker does not pin its generation");
+  assert.equal(existsSync(roots[1]!), false, "a linked marker is unlinked with its generation, never followed");
+  assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "outside");
+  assert.ok(count(f.builds) <= generations.LIMIT);
+});
+
+test("a staggered Pi producer never loses its in-progress setup to a replacement", posix, async () => {
+  const f = fixture();
+  let releaseFirst!: () => void;
+  const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let releaseSecond!: () => void;
+  const secondHeld = new Promise<void>((resolve) => { releaseSecond = resolve; });
+  const first = provision(f, "1.3.11", {
+    runNpm: async (_cli: string, _args: string[], o: { cwd: string }) => {
+      await firstHeld;
+      writePi(o.cwd, "1.3.11");
+      return ok();
+    },
+  });
+  // The second producer's version differs, so it starts while the first still
+  // owns the admission lock and its own installation remains paused.
+  const second = provision(f, "1.3.12", {
+    runNpm: async (_cli: string, _args: string[], o: { cwd: string }) => {
+      await secondHeld;
+      writePi(o.cwd, "1.3.12");
+      return ok();
+    },
+  });
+  const heldRoot = join(f.runtimes, "pi-1.3.12");
+  const heldIdentity = lstatSync(heldRoot, { bigint: true });
+  releaseFirst();
+  assert.equal((await first).version, "1.3.11");
+  // The first producer has settled; requesting the second producer's version
+  // must not reclaim its paused generation.
+  const warnings: string[] = [];
+  const competing = await provision(f, "1.3.12", {
+    writeError: (text: string) => warnings.push(text),
+    runNpm: async (_cli: string, _args: string[], o: { cwd: string }) => {
+      writePi(o.cwd, "1.3.12");
+      return ok();
+    },
+  });
+  const after = lstatSync(heldRoot, { bigint: true });
+  assert.equal(after.dev, heldIdentity.dev);
+  assert.equal(after.ino, heldIdentity.ino, "the paused producer's generation keeps its identity");
+  assert.ok(competing.file.startsWith(join(f.runtimes, "pi-1.3.12.1") + "/"), `the competing launch used a fallback: ${competing.file}`);
+  assert.ok(warnings.some((warning) => warning.includes("could not reclaim")));
+  releaseSecond();
+  const secondResult = await second;
+  assert.equal(secondResult.version, "1.3.12");
+  assert.ok(secondResult.file.startsWith(heldRoot + "/"), "the paused installation completed in its own generation");
+  assert.ok(existsSync(secondResult.file));
+  assert.ok(existsSync(competing.file));
+});
+
+test("full launcher provisions past eight occupied Pi candidates and reuses the fallback", posix, async () => {
+  const f = fixture();
+  for (let index = 0; index < 8; index += 1) {
+    mkdirSync(join(f.runtimes, index === 0 ? "pi-1.3.0" : `pi-1.3.0.${index}`), { recursive: true });
+  }
+  // A directory-shaped lock makes every admission skip cleanup.
+  mkdirSync(join(f.runtimes, ".admission.lock"));
+  const installs: string[] = [];
+  let resolved = "";
+  const runLaunch = async (diagnostics: string[]) => {
+    let hostStarted = 0;
+    const status = await producer.runSessionHostLauncher([], {
+      getEnv: () => f.env,
+      processEnv: {},
+      packageRoot: f.packageRoot,
+      platform: "linux",
+      cwd: f.root,
+      nodeVersion: process.versions.node,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      build: (options: Record<string, unknown>) => build(f, options),
+      resolvePiRuntime: async () => {
+        const result = await provision(f, "1.3.0", {
+          writeError: (text: string) => diagnostics.push(text),
+          runNpm: async (_cli: string, _args: string[], o: { cwd: string }) => {
+            installs.push(o.cwd);
+            writePi(o.cwd, "1.3.0");
+            return ok();
+          },
+        });
+        resolved = result.file;
+        return result;
       },
-    }), /provisioning failed/);
-    assert.equal(JSON.parse(readFileSync(join(versionRoot, generations.RECORD), "utf8")).holders.length, 0);
-    const survivors = [];
-    if (full) for (let i = 1; i <= 4; i++) survivors.push(await provision(f, `1.3.${i}`));
-    const result = await provision(f, "1.3.0");
-    assert.equal(result.version, "1.3.0");
-    assert.equal(result.generation.root, versionRoot);
-    assert.equal(existsSync(join(versionRoot, ".setup/failed-install")), false, "actual failed residue was reclaimed before replacement");
-    assert.ok(existsSync(result.file));
-    assert.ok(survivors.every((survivor) => existsSync(survivor.file)));
-    assert.equal(count(f.runtimes), full ? 5 : 1);
-    assert.equal(result.generation.release(), true);
-  }
+      ensureDdgs: () => ({ ok: true, python: join(f.root, "python") }),
+      refreshShippedSkills: () => ({ ok: true }),
+      writeOut: () => undefined,
+      writeError: (text: string) => diagnostics.push(text),
+      loadMain: () => ({ runSessionHost: async () => { hostStarted += 1; return 0; } }),
+    });
+    return { status, hostStarted };
+  };
+
+  const firstDiagnostics: string[] = [];
+  const first = await runLaunch(firstDiagnostics);
+  assert.equal(first.status, 0, firstDiagnostics.join(""));
+  assert.equal(first.hostStarted, 1);
+  assert.equal(installs.length, 1, "exactly one install was needed past all occupied candidates");
+  assert.ok(resolved.startsWith(join(f.runtimes, "pi-1.3.0.8") + "/"), `used the next confined candidate: ${resolved}`);
+  assert.ok(firstDiagnostics.some((line) => line.includes("cleanup lock was busy")));
+  assert.ok(firstDiagnostics.some((line) => line.includes("could not reclaim")));
+
+  const secondDiagnostics: string[] = [];
+  const second = await runLaunch(secondDiagnostics);
+  assert.equal(second.status, 0, secondDiagnostics.join(""));
+  assert.equal(second.hostStarted, 1);
+  assert.equal(installs.length, 1, "the next launch reuses the valid fallback without another install");
+  assert.equal(resolved.startsWith(join(f.runtimes, "pi-1.3.0.8") + "/"), true);
+  assert.doesNotMatch(secondDiagnostics.join(""), /cleanup lock was busy/);
 });
 
-test("same-version retry protects active, uncertain, legacy, malformed and unsafe incomplete Pi roots", posix, async () => {
-  for (const mode of ["active", "uncertain", "legacy", "malformed", "unsafe"] as const) {
+test("an unreclaimable incomplete Pi generation falls back to a fresh confined generation", { skip: process.platform === "win32" || process.getuid?.() === 0 }, async () => {
+  const f = fixture();
+  const blockedRoot = join(f.runtimes, "pi-1.3.0");
+  mkdirSync(join(blockedRoot, "nested"), { recursive: true });
+  writeFileSync(join(blockedRoot, "nested", "failed-install"), "settled residue");
+  chmodSync(join(blockedRoot, "nested"), 0o500);
+  const warnings: string[] = [];
+  const result = await provision(f, "1.3.0", { writeError: (text: string) => warnings.push(text) });
+  assert.equal(result.version, "1.3.0");
+  assert.ok(result.file.startsWith(join(f.runtimes, "pi-1.3.0.1") + "/"), `fell back to a confined generation: ${result.file}`);
+  assert.ok(existsSync(result.file));
+  assert.ok(warnings.some((warning) => warning.includes("could not reclaim")), "the failed reclamation is reported");
+  assert.ok(existsSync(join(blockedRoot, "nested", "failed-install")), "the unreclaimable generation is preserved");
+});
+
+test("a busy cleanup lock does not stop Pi provisioning into a fresh generation", posix, async () => {
+  const f = fixture();
+  mkdirSync(f.runtimes, { recursive: true });
+  mkdirSync(join(f.runtimes, "pi-1.3.0"), { recursive: true });
+  writeFileSync(join(f.runtimes, ".admission.lock"), `${process.pid}\n`, { mode: 0o600 });
+  const warnings: string[] = [];
+  const result = await provision(f, "1.3.0", { writeError: (text: string) => warnings.push(text) });
+  assert.ok(result.file.startsWith(join(f.runtimes, "pi-1.3.0.1") + "/"));
+  assert.ok(existsSync(result.file));
+  assert.ok(warnings.some((warning) => warning.includes("cleanup lock was busy")));
+});
+
+test("full launcher startup succeeds when an incomplete Pi generation cannot be reclaimed", posix, async () => {
+  const f = fixture();
+  mkdirSync(join(f.runtimes, "pi-1.3.0"), { recursive: true });
+  writeFileSync(join(f.runtimes, ".admission.lock"), `${process.pid}\n`, { mode: 0o600 });
+  let hostStarted = 0;
+  const diagnostics: string[] = [];
+  const status = await producer.runSessionHostLauncher([], {
+    getEnv: () => f.env,
+    processEnv: {},
+    packageRoot: f.packageRoot,
+    platform: "linux",
+    cwd: f.root,
+    nodeVersion: process.versions.node,
+    stdinIsTTY: true,
+    stdoutIsTTY: true,
+    build: (options: Record<string, unknown>) => build(f, options),
+    resolvePiRuntime: async () => provision(f, "1.3.0", { writeError: (text: string) => diagnostics.push(text) }),
+    ensureDdgs: () => ({ ok: true, python: join(f.root, "python") }),
+    refreshShippedSkills: () => ({ ok: true }),
+    writeOut: () => undefined,
+    writeError: (text: string) => diagnostics.push(text),
+    loadMain: () => ({ runSessionHost: async () => { hostStarted += 1; return 0; } }),
+  });
+  assert.equal(status, 0, diagnostics.join(""));
+  assert.equal(hostStarted, 1, "the host actually started despite the unreclaimable Pi generation");
+  assert.doesNotMatch(diagnostics.join(""), /capacity exhausted/);
+  assert.ok(diagnostics.some((line) => line.includes("cleanup lock was busy")), "the skipped cleanup is reported");
+});
+
+test("full launcher startup succeeds with five and more legacy build/Pi generations", posix, async () => {
+  for (const seeded of [5, 8]) {
     const f = fixture();
-    const root = join(f.runtimes, "pi-1.3.0");
-    const sentinel = join(f.root, "outside"); writeFileSync(sentinel, "outside retry");
-    await assert.rejects(provision(f, "1.3.0", {
-      runNpm: async () => ok({ status: 1, cleanupConfirmed: mode !== "uncertain" }),
-    }), /provisioning failed/);
-    let holder;
-    if (mode === "active") holder = generations.pin(f.runtimes, () => ({ root }));
-    if (mode === "legacy") requireCjs("node:fs").unlinkSync(join(root, generations.RECORD));
-    if (mode === "malformed") writeFileSync(join(root, generations.RECORD), "{}");
-    if (mode === "unsafe") symlinkSync(sentinel, join(root, ".setup/outside-link"));
-    const before = lstatSync(root, { bigint: true });
-    let installs = 0;
-    await assert.rejects(provision(f, "1.3.0", { runNpm: async () => { installs += 1; return ok(); } }));
-    assert.equal(installs, 0, mode);
-    assert.equal(lstatSync(root, { bigint: true }).ino, before.ino, mode);
-    assert.equal(count(f.runtimes), 1, mode);
-    assert.equal(readFileSync(sentinel, "utf8"), "outside retry", mode);
-    if (holder) {
-      assert.equal(holder.generation.release(), true);
-      const retried = await provision(f, "1.3.0");
-      assert.ok(existsSync(retried.file), "an active reservation can retry only once its consumer settles");
-    }
-  }
-});
-
-test("replacement rechecks identity and producer eligibility under the admission lock", posix, () => {
-  for (const mode of ["replaced", "published", "active"] as const) {
-    const f = fixture(); mkdirSync(f.runtimes, { recursive: true });
-    const root = join(f.runtimes, "pi-1.3.0");
-    const original = generations.admit(f.runtimes, () => { mkdirSync(root); return { root }; });
-    const id = lstatSync(root, { bigint: true });
-    assert.equal(original.generation.release(), true);
-    if (mode === "replaced") {
-      renameSync(root, join(f.root, "retained-original"));
-      generations.admit(f.runtimes, () => { mkdirSync(root); return { root }; });
-    }
-    if (mode === "active") generations.pin(f.runtimes, () => ({ root }));
-    if (mode === "published") mkdirSync(join(root, "node_modules"));
-    let creates = 0;
-    assert.throws(() => generations.admit(f.runtimes, () => { creates += 1; throw new Error("must not create"); }, undefined, {
-      root, identity: id, eligible: () => !existsSync(join(root, "node_modules")),
-    }), /replacement refused/);
-    assert.equal(creates, 0, mode);
-    assert.ok(existsSync(root), mode);
-    assert.equal(count(f.runtimes), 1, mode);
-  }
-});
-
-test("explicit, PATH and global managed selections pin before probing and survive capacity pressure until settlement", { ...posix, timeout: 30_000 }, async () => {
-  for (const route of ["explicit", "path", "npm-global"] as const) {
-    const f = fixture();
-    const original = await provision(f, "1.3.0");
-    assert.equal(original.generation.release(), true);
-    const sentinel = join(f.root, "outside"); writeFileSync(sentinel, "outside selection");
-    if (route === "path") symlinkSync(original.file, join(f.bin, "pi"));
-    if (route === "npm-global") {
-      const alias = join(f.root, "global-alias");
-      symlinkSync(join(original.generation.root, "node_modules"), alias, "dir");
-      writeFileSync(f.npmCli, `#!/usr/bin/env node\nif (process.argv[2] === "root") console.log(${JSON.stringify(alias)});\n`);
-    }
-    let entered!: () => void;
-    const probing = new Promise<void>((resolve) => { entered = resolve; });
-    let settle!: () => void;
-    const pendingProbe = new Promise<void>((resolve) => { settle = resolve; });
-    const selected = producer.resolvePiRuntime({
-      ...(route === "explicit" ? { explicit: original.file } : {}),
-      env: f.env, agentDir: join(f.root, "different-agent"), cwd: f.root, writeError: () => undefined,
-      processRunner: async (_cli: string, args: string[]) => {
-        assert.equal(args[0], original.file);
-        assert.equal(JSON.parse(readFileSync(join(original.generation.root, generations.RECORD), "utf8")).holders.length, 1,
-          "the canonical pin exists before any executable version probe");
-        entered(); await pendingProbe; return ok({ stdout: "1.3.0" });
+    const buildRoots = seedLegacy(f.builds, Array.from({ length: seeded }, (_, i) => `legacy-build-${i}`));
+    const runtimeRoots = seedLegacy(f.runtimes, Array.from({ length: seeded }, (_, i) => `pi-1.1.${i}`));
+    let loadedEntry = "";
+    let hostStarted = 0;
+    const diagnostics: string[] = [];
+    const status = await producer.runSessionHostLauncher([], {
+      getEnv: () => f.env,
+      processEnv: {},
+      packageRoot: f.packageRoot,
+      platform: "linux",
+      cwd: f.root,
+      nodeVersion: process.versions.node,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      build: (options: Record<string, unknown>) => build(f, options),
+      resolvePiRuntime: async () => provision(f, "1.3.0"),
+      ensureDdgs: () => ({ ok: true, python: join(f.root, "python") }),
+      refreshShippedSkills: () => ({ ok: true }),
+      writeOut: () => undefined,
+      writeError: (text: string) => diagnostics.push(text),
+      loadMain: (entry: string) => {
+        loadedEntry = entry;
+        return { runSessionHost: async () => { hostStarted += 1; return 0; } };
       },
     });
-    // Propagate a resolution failure instead of leaving this test waiting for
-    // a probe that was never admitted. The production probe itself is mocked,
-    // but admission and reclamation use the actual filesystem throughout.
-    await Promise.race([probing, selected.then(() => { throw new Error("probe was not held"); })]);
-    const survivors = [];
-    for (let i = 1; i <= 4; i++) survivors.push(await provision(f, `1.3.${i}`));
-    await assert.rejects(provision(f, "1.3.5"), /capacity exhausted/);
-    assert.ok(existsSync(original.file), route);
-    settle();
-    const result = await selected;
-    assert.equal(result.source, route);
-    assert.equal(result.file, original.file);
-    assert.equal(result.generation.root, original.generation.root);
-    await assert.rejects(provision(f, "1.3.5"), /capacity exhausted/, "successful probing does not settle the eventual native consumer");
-    assert.equal(result.generation.release(), true);
-    const admitted = await provision(f, "1.3.5");
-    assert.ok(existsSync(admitted.file));
-    assert.equal(existsSync(original.file), false, "only after explicit settlement is the selected runtime reclaimable");
-    assert.ok(survivors.every((survivor) => existsSync(survivor.file)));
-    assert.equal(readFileSync(sentinel, "utf8"), "outside selection");
-    assert.equal(count(f.runtimes), 5);
-  }
-});
-
-test("managed explicit selections release settled failed probes but retain uncertain probe cleanup", posix, async () => {
-  for (const uncertain of [false, true]) {
-    const f = fixture();
-    const original = await provision(f, "1.3.0");
-    assert.equal(original.generation.release(), true);
-    await assert.rejects(producer.resolvePiRuntime({
-      explicit: original.file, env: f.env, agentDir: f.agentDir, cwd: f.root, writeError: () => undefined,
-      processRunner: async () => ok({ status: 1, cleanupConfirmed: !uncertain }),
-    }), uncertain ? /cleanup was not confirmed/ : /exited with status 1/);
-    assert.equal(JSON.parse(readFileSync(join(original.generation.root, generations.RECORD), "utf8")).holders.length, uncertain ? 1 : 0);
-    for (let i = 1; i <= 4; i++) await provision(f, `1.3.${i}`);
-    if (uncertain) {
-      await assert.rejects(provision(f, "1.3.5"), /capacity exhausted/);
-      assert.ok(existsSync(original.file));
-    } else {
-      assert.ok(existsSync((await provision(f, "1.3.5")).file));
-      assert.equal(existsSync(original.file), false);
-    }
+    assert.equal(status, 0, diagnostics.join(""));
+    assert.equal(hostStarted, 1, "the host actually started");
+    assert.ok(loadedEntry.startsWith(f.builds + "/"), `the compiled host came from the owned build cache: ${loadedEntry}`);
+    assert.doesNotMatch(diagnostics.join(""), /capacity exhausted|unknown|cannot start/i);
+    const survivingBuilds = count(f.builds);
+    assert.ok(survivingBuilds <= generations.LIMIT, `${seeded} legacy builds bounded to ${survivingBuilds}`);
+    assert.ok(count(f.runtimes) <= generations.LIMIT, "legacy Pi generations bounded independently");
+    const removedBuilds = buildRoots.filter((root) => !existsSync(root)).length;
+    const removedRuntimes = runtimeRoots.filter((root) => !existsSync(root)).length;
+    assert.ok(removedBuilds >= seeded - 4, `actual build directories were reclaimed: ${removedBuilds}`);
+    assert.ok(removedRuntimes >= seeded - 4, `actual Pi directories were reclaimed: ${removedRuntimes}`);
   }
 });

@@ -169,7 +169,7 @@ function writeBootstrapNode(fixture: EntrypointFixture, exitCode = 0): string {
     "for arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$FAKE_NODE_LOG\"; done",
     "printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$PATH\" \"$PWD\" \"${NODE_OPTIONS:-}\" \"${PI_CODING_AGENT_DIR:-}\" \"$(umask)\" >> \"$FAKE_FALLBACK_ENV_LOG\"",
     `if [[ "\${FAKE_BOOTSTRAP_DISPATCH_CJS:-}" == 1 ]]; then exec "${process.execPath}" "$@"; fi`,
-    `if [[ "\${FAKE_BOOTSTRAP_HOLD:-}" == 1 ]]; then exec "${process.execPath}" -e 'require(process.env.FAKE_NODE_LIFETIME_MODULE).consume(process.env)(); process.stdout.write("QUIESCENT\\n"); process.stdin.once("data", () => process.exit(0));'; fi`,
+    `if [[ "\${FAKE_BOOTSTRAP_HOLD:-}" == 1 ]]; then exec "${process.execPath}" -e 'process.stdout.write("HOLDING\\n"); process.stdin.once("data", () => process.exit(0));'; fi`,
     `if [[ -n "\${FAKE_BOOTSTRAP_SIGNAL_CHILD:-}" ]]; then exec "${process.execPath}" "$FAKE_BOOTSTRAP_SIGNAL_CHILD" "$@"; fi`,
     `exit ${exitCode}`,
     "",
@@ -300,7 +300,6 @@ function entrypointEnv(fixture: EntrypointFixture, envOverrides: NodeJS.ProcessE
       FAKE_CURL_LOG: fixture.curlLog,
       FAKE_STAT_NATIVE: process.platform === "darwin" ? "Darwin" : "Linux",
       ...fixtureEnv,
-      FAKE_NODE_LIFETIME_MODULE: resolve("scripts/node-bootstrap-lifetime.cjs"),
       ...envOverrides,
   };
 }
@@ -557,24 +556,22 @@ test(".sh requires HTTP 200 and retains a failed-download witness without archiv
 });
 
 // ---------------------------------------------------------------------------
-// Node admission: actual POSIX producer fixtures, native Windows admission
+// Node cache cleanup: actual POSIX producer fixtures, native Windows checks
 // (Windows-only), then cross-platform source contracts. No native cleanup claim.
+// #385 startup-first contract: these designated caches are disposable by
+// location, so five or more legacy artifacts must never refuse a launch.
 // ---------------------------------------------------------------------------
 
 function nodeRoots(fixture: EntrypointFixture): string[] {
   const cache = join(fixture.agentDir, ".pi-review-gate", "node");
   return readdirSync(cache).filter((name) => name !== ".admission.lock").map((name) => join(cache, name));
 }
-function lifetime(root: string): string {
-  return readFileSync(join(root, ".node-lifetime"), "utf8");
-}
-function syntheticLifetime(root: string, state: string): void {
-  const s = lstatSync(root, { bigint: true });
-  writeFileSync(join(root, ".node-lifetime"), `pi-review-gate-node-v1\n${s.dev}:${s.ino}\n${root.split(/[\\/]/).at(-1)}\n${state}\n`, { mode: 0o600 });
+function nodeCache(fixture: EntrypointFixture): string {
+  return join(fixture.agentDir, ".pi-review-gate", "node");
 }
 
 for (const nativeOs of ["Linux", "Darwin"] as const) {
-test(`.sh actual ${nativeOs} fallback producer rolls past five settled extractions and deletes path-owned descendants without following outside links`, { skip: isWindows }, (t) => {
+test(`.sh actual ${nativeOs} fallback producer starts past five legacy extractions and deletes path-owned descendants without following outside links`, { skip: isWindows }, (t) => {
   const f = makeEntrypointFixture(`.node-cap-roll-${nativeOs}-`);
   cleanupFixture(t, f);
   writeBootstrapTools(f, { os: nativeOs, digest: POSIX_PINS[nativeOs === "Linux" ? "linux-x64" : "darwin-x64"] });
@@ -586,9 +583,10 @@ test(`.sh actual ${nativeOs} fallback producer rolls past five settled extractio
     const result = runSh(f, ["--help"], env);
     assert.equal(result.status, 0, result.stderr);
     const roots = nodeRoots(f);
-    assert.equal(roots.length, Math.min(i + 1, 5));
-    for (const root of roots) assert.match(lifetime(root), /\ninactive\n$/);
+    assert.equal(roots.length, Math.min(i + 1, 5), "the cache stays at its five-generation target");
     for (const root of roots) {
+      assert.equal(existsSync(join(root, ".node-lifetime")), false, "no lifetime receipt is written");
+      assert.doesNotMatch(result.stderr, /capacity exhausted/);
       if (produced.has(root)) continue;
       produced.add(root);
       mkdirSync(join(root, "arbitrary-existing-failed", "nested"), { recursive: true });
@@ -597,14 +595,14 @@ test(`.sh actual ${nativeOs} fallback producer rolls past five settled extractio
     }
   }
   assert.equal(produced.size, 8);
-  assert.equal([...produced].filter((root) => !existsSync(root)).length, 3, "actual disposable extractions and arbitrary descendants were removed; no oldest-first policy is assumed");
+  assert.equal([...produced].filter((root) => !existsSync(root)).length, 3, "actual disposable extractions and arbitrary descendants were removed");
   assert.equal(readFileSync(sentinel, "utf8"), "outside remains");
   assert.equal(recordedPhases(f).filter((p) => p === "curl").length, 8, "no mutable Node reuse");
   f.markAssertionsPassed();
 });
 }
 
-test(".sh settled checksum failures remain counted but reclaimable before the sixth download", { skip: isWindows }, (t) => {
+test(".sh settled checksum failures remain bounded and reclaimable before the sixth download", { skip: isWindows }, (t) => {
   const f = makeEntrypointFixture(".node-cap-failure-");
   cleanupFixture(t, f);
   writeBootstrapTools(f, { digest: "0".repeat(64) });
@@ -615,7 +613,6 @@ test(".sh settled checksum failures remain counted but reclaimable before the si
     assert.match(result.stderr, /checksum did not match/);
     const roots = nodeRoots(f);
     assert.equal(roots.length, Math.min(i + 1, 5));
-    for (const root of roots) assert.match(lifetime(root), /\ninactive\n$/);
     for (const root of roots) produced.add(root);
   }
   assert.equal(produced.size, 7);
@@ -624,174 +621,225 @@ test(".sh settled checksum failures remain counted but reclaimable before the si
   f.markAssertionsPassed();
 });
 
-test(".sh zero status without positive CJS handoff protects all five outputs and refuses before download", { skip: isWindows }, (t) => {
+test(".sh five existing artifacts never refuse the next launch and stale locks are reclaimed", { skip: isWindows }, (t) => {
   const f = makeEntrypointFixture(".node-cap-no-witness-");
   cleanupFixture(t, f);
   writeBootstrapTools(f);
   const env = { PI_CODING_AGENT_DIR: f.agentDir };
   for (let i = 0; i < 5; i++) assert.equal(runSh(f, ["--help"], env).status, 0);
-  const before = nodeRoots(f).map((root) => [root, lifetime(root)]);
-  const result = runSh(f, ["--help"], env);
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /capacity exhausted: maximum 5/);
-  assert.deepEqual(nodeRoots(f).map((root) => [root, lifetime(root)]), before);
-  assert.equal(recordedPhases(f).filter((p) => p === "curl").length, 5);
+  const before = nodeRoots(f);
+  assert.equal(before.length, 5);
+  // A dead owner's lock, and an empty one, are not permanent stop conditions.
+  writeFileSync(join(nodeCache(f), ".admission.lock"), "999999999\n", { mode: 0o600 });
+  const next = runSh(f, ["--help"], env);
+  assert.equal(next.status, 0, next.stderr);
+  assert.doesNotMatch(next.stderr, /capacity exhausted/);
+  assert.equal(nodeRoots(f).length, 5);
+  assert.ok(before.some((root) => !existsSync(root)), "an existing generation was actually reclaimed");
+  writeFileSync(join(nodeCache(f), ".admission.lock"), "", { mode: 0o600 });
+  assert.equal(runSh(f, ["--help"], env).status, 0);
+  assert.ok(recordedPhases(f).filter((p) => p === "curl").length >= 7);
   f.markAssertionsPassed();
 });
 
-test(".sh malformed, legacy, replaced, hardlinked and excluded roots all count and remain untouched", { skip: isWindows }, (t) => {
+test(".sh malformed, legacy, hardlinked and .terraform-bearing roots are reclaimed without escaping", { skip: isWindows }, (t) => {
   const f = makeEntrypointFixture(".node-cap-unsafe-");
   cleanupFixture(t, f);
   writeBootstrapTools(f);
-  const cache = join(f.agentDir, ".pi-review-gate", "node");
-  const names = ["bootstrap.malformed", "bootstrap.legacy", "bootstrap.replaced", "bootstrap.hardlink", "bootstrap.excluded"];
+  const cache = nodeCache(f);
+  const names = ["bootstrap.malformed", "bootstrap.legacy", "bootstrap.excluded", "bootstrap.hardlink", "bootstrap.plain"];
   for (const name of names) mkdirSync(join(cache, name), { recursive: true });
   writeFileSync(join(cache, names[0]!, ".node-lifetime"), "malformed");
-  syntheticLifetime(join(cache, names[2]!), "inactive");
-  const originalRecord = lifetime(join(cache, names[2]!));
-  writeFileSync(join(cache, names[2]!, ".node-lifetime"), originalRecord.replace(/\n\d+:\d+\n/, "\n0:0\n"));
+  writeFileSync(join(cache, names[1]!, ".node-lifetime"), "pi-review-gate-node-v1\n0:0\nbootstrap.legacy\ninactive\n");
   const sentinel = join(f.root, "outside");
   writeFileSync(sentinel, "hardlinked outside");
-  syntheticLifetime(join(cache, names[3]!), "inactive");
   linkSync(sentinel, join(cache, names[3]!, "hardlink"));
-  syntheticLifetime(join(cache, names[4]!), "inactive");
-  mkdirSync(join(cache, names[4]!, ".terraform"));
-  writeFileSync(join(cache, names[4]!, ".terraform", "sentinel"), "excluded");
+  mkdirSync(join(cache, names[2]!, ".terraform"));
+  writeFileSync(join(cache, names[2]!, ".terraform", "sentinel"), "disposable cleanup content");
   const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /capacity exhausted/);
-  assert.deepEqual(readdirSync(cache), names.sort());
-  assert.equal(readFileSync(sentinel, "utf8"), "hardlinked outside");
-  assert.equal(lifetime(join(cache, "bootstrap.malformed")), "malformed");
-  // The test deliberately never enters or removes the excluded subtree during
-  // fixture teardown either; it remains in the ignored synthetic fixture.
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /capacity exhausted/);
+  assert.equal(readFileSync(sentinel, "utf8"), "hardlinked outside", "a hardlink only loses its generation-internal name");
+  assert.equal(existsSync(join(cache, names[2]!)), false,
+    "cleanup-specific traversal removes an initialized .terraform subtree inside a disposable generation");
+  assert.ok(nodeRoots(f).length <= 5);
   f.markAssertionsPassed();
 });
 
-test(".sh CJS quiescence remains protected until the exact foreground process exits", { skip: isWindows, timeout: 30_000 }, async (t) => {
-  const f = makeEntrypointFixture(".node-cap-quiescent-");
+test(".sh reclaims five empty and five hidden-record legacy generations and starts", { skip: isWindows }, (t) => {
+  for (const shape of ["empty", "hidden-record"] as const) {
+    const f = makeEntrypointFixture(`.node-cap-${shape}-`);
+    cleanupFixture(t, f);
+    writeBootstrapTools(f);
+    const cache = nodeCache(f);
+    const roots: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const root = join(cache, `bootstrap.${shape}-${i}`);
+      mkdirSync(root, { recursive: true });
+      if (shape === "hidden-record") {
+        writeFileSync(join(root, ".node-lifetime"), "pi-review-gate-node-v1\n0:0\nbootstrap.old\ninactive\n");
+        writeFileSync(join(root, ".hidden-legacy"), "hidden legacy content");
+      }
+      roots.push(root);
+    }
+    const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stderr, /capacity exhausted/);
+    assert.equal(nodeRoots(f).length, 5, `${shape}: exactly five generations remain`);
+    assert.ok(roots.some((root) => !existsSync(root)), `${shape}: an actual legacy generation was removed`);
+    f.markAssertionsPassed();
+  }
+});
+
+test(".sh skips a generation whose producer marker names a live process", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-cap-in-progress-");
   cleanupFixture(t, f);
   writeBootstrapTools(f);
-  const child = spawn("/bin/bash", [shPath, "--help"], {
-    env: entrypointEnv(f, { PI_CODING_AGENT_DIR: f.agentDir, FAKE_BOOTSTRAP_HOLD: "1" }),
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  const closed = new Promise<number | null>((accept, reject) => { child.once("error", reject); child.once("close", accept); });
-  t.after(async () => { if (!child.stdin.writableEnded) child.stdin.end("exit\n"); await closed; });
-  await new Promise<void>((accept, reject) => {
-    const timer = setTimeout(() => reject(new Error("no quiescence witness")), 15_000);
-    child.stdout.on("data", (bytes: Buffer) => { if (bytes.toString().includes("QUIESCENT")) { clearTimeout(timer); accept(); } });
-    child.once("close", () => { clearTimeout(timer); reject(new Error("process closed before witness")); });
-  });
-  const first = nodeRoots(f)[0]!;
-  assert.match(lifetime(first), /\nquiescent\n$/);
-  for (let i = 0; i < 4; i++) assert.equal(runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir }).status, 0);
-  const refused = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
-  assert.equal(refused.status, 1, refused.stderr);
-  assert.match(lifetime(first), /\nquiescent\n$/);
-  child.stdin.end("exit\n");
-  assert.equal(await closed, 0);
-  assert.match(lifetime(first), /\ninactive\n$/);
+  const cache = nodeCache(f);
+  // Deterministic cleanup order: this name sorts before any random bootstrap
+  // generation name, so the live-marker skip (not name order) is what protects it.
+  const held = join(cache, "bootstrap.0-held");
+  mkdirSync(held, { recursive: true });
+  writeFileSync(join(held, ".producer-active"), `${process.pid}\n`);
+  for (let i = 0; i < 4; i++) mkdirSync(join(cache, `bootstrap.1-free-${i}`), { recursive: true });
+  const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(existsSync(held), "a live producer's generation is preserved");
+  assert.ok(nodeRoots(f).length <= 6, "startup proceeds without a capacity refusal");
+  // A dead owner's marker is reclaimed normally.
+  writeFileSync(join(held, ".producer-active"), "999999999\n");
   const next = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
   assert.equal(next.status, 0, next.stderr);
-  assert.equal(nodeRoots(f).length, 5);
-  assert.equal(existsSync(first), false);
+  assert.equal(existsSync(held), false, "a stale marker no longer pins the generation");
+  f.markAssertionsPassed();
+});
+
+test(".sh never touches an outside marker behind a direct-child cache link", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-outside-marker-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const cache = nodeCache(f);
+  const outside = join(f.root, "outside");
+  mkdirSync(outside);
+  mkdirSync(cache, { recursive: true });
+  const outsideMarker = join(outside, ".producer-active");
+  writeFileSync(outsideMarker, "999999999\n", { mode: 0o600 });
+  const before = readFileSync(outsideMarker);
+  symlinkSync(outside, join(cache, "bootstrap.0-link"));
+  for (let i = 0; i < 4; i++) mkdirSync(join(cache, `bootstrap.1-free-${i}`), { recursive: true });
+  const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFileSync(outsideMarker).equals(before), true,
+    "the outside marker is byte-identical after cleanup");
+  assert.equal(existsSync(join(cache, "bootstrap.0-link")), false, "the cache link itself is unlinked, never traversed");
+});
+
+test(".sh reclaims generations with directory and linked marker shapes", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-malformed-marker-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const cache = nodeCache(f);
+  const outside = join(f.root, "outside");
+  mkdirSync(outside);
+  writeFileSync(join(outside, "sentinel"), "outside stays");
+  const shapes = ["bootstrap.0-dir-marker", "bootstrap.1-link-marker", "bootstrap.2-oversized", "bootstrap.3", "bootstrap.4", "bootstrap.5"];
+  for (const name of shapes) mkdirSync(join(cache, name), { recursive: true });
+  mkdirSync(join(cache, shapes[0]!, ".producer-active"));
+  symlinkSync(outside, join(cache, shapes[1]!, ".producer-active"));
+  writeFileSync(join(cache, shapes[2]!, ".producer-active"), "x".repeat(200));
+  const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /capacity exhausted/);
+  assert.equal(existsSync(join(cache, shapes[0]!)), false, "a directory-shaped marker does not pin its generation");
+  assert.equal(existsSync(join(cache, shapes[1]!)), false, "a linked marker is unlinked with its generation");
+  assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "outside stays");
+  assert.ok(nodeRoots(f).length <= 5);
+});
+
+test(".sh skips cache cleanup while an existing session host owns the agent directory", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-cap-owned-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const cache = nodeCache(f);
+  const roots: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    const root = join(cache, `bootstrap.owner-${i}`);
+    mkdirSync(root, { recursive: true });
+    roots.push(root);
+  }
+  mkdirSync(join(f.agentDir, "session-host"), { recursive: true });
+  writeFileSync(join(f.agentDir, "session-host", "host-ownership.json"), JSON.stringify({ version: 1, hostId: "seed" }));
+  const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /capacity exhausted/);
+  assert.match(result.stderr, /session host currently owns the agent directory/);
+  for (const root of roots) assert.ok(existsSync(root), "a live host's generations are left alone");
   f.markAssertionsPassed();
 });
 
 for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"] as const) {
-  for (const settled of [true, false]) {
-    test(`.sh forwards wrapper-PID-only ${signal} and waits for exact child exit (${settled ? "settled" : "uncertain"})`, { skip: isWindows, timeout: 30_000 }, async (t) => {
-      const f = makeEntrypointFixture(".node-supervisor-signal-");
-      cleanupFixture(t, f);
-      writeBootstrapTools(f);
-      const script = join(f.root, "signal-child.cjs");
-      writeFileSync(script, [
-        "const publish = require(process.env.FAKE_NODE_LIFETIME_MODULE).consume(process.env);",
-        "const report = value => process.stdout.write(JSON.stringify(value) + '\\n');",
-        "let received;",
-        "for (const signal of ['SIGTERM','SIGHUP','SIGINT']) process.on(signal, () => { received = signal; report({state:'received', signal}); });",
-        "process.stdin.setEncoding('utf8');",
-        "process.stdin.on('data', data => {",
-        "  if (data.includes('ping')) report({state:'still-running'});",
-        `  if (data.includes('finish')) { if (received && ${settled}) { if (!publish()) process.exit(91); } report({state:'finished'}); process.exit(23); }`,
-        "});",
-        "report({state:'ready', pid:process.pid, args:process.argv.slice(2)});",
-      ].join("\n"));
-      const args = ["--", "signal argv π", 'quoted "argument"'];
-      const wrapper = spawn("/bin/bash", [shPath, ...args], {
-        env: entrypointEnv(f, { PI_CODING_AGENT_DIR: f.agentDir, FAKE_BOOTSTRAP_SIGNAL_CHILD: script }),
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-      const closed = new Promise<number | null>((accept, reject) => { wrapper.once("error", reject); wrapper.once("close", accept); });
-      const lines = createInterface({ input: wrapper.stdout });
-      const rows = lines[Symbol.asyncIterator]();
-      const readReport = async (): Promise<{ state: string; signal?: string; pid?: number; args?: string[] }> => {
-        let deadline: NodeJS.Timeout | undefined;
-        try {
-          const row = await Promise.race([
-            rows.next(),
-            new Promise<never>((_accept, reject) => { deadline = setTimeout(() => reject(new Error("no child signal/settlement witness")), 10_000); }),
-          ]);
-          assert.equal(row.done, false, "child closed before the expected witness");
-          return JSON.parse(row.value!);
-        } finally { clearTimeout(deadline); }
-      };
-      t.after(async () => {
-        if (!wrapper.stdin.writableEnded) wrapper.stdin.end("finish\n");
-        await closed;
-        lines.close();
-      });
-      const ready = await readReport();
-      assert.equal(ready.state, "ready");
-      assert.deepEqual(ready.args, [cjsPath, ...args]);
-      assert.notEqual(ready.pid, wrapper.pid);
-      const group = (pid: number) => spawnSync("/bin/ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim();
-      const wrapperGroup = group(wrapper.pid!);
-      assert.ok(wrapperGroup);
-      assert.equal(group(ready.pid!), wrapperGroup, "CJS retains the inherited terminal process group");
-      const root = nodeRoots(f)[0]!;
-      assert.match(lifetime(root), /\nprotected\n$/);
-      assert.equal(wrapper.kill(signal), true, "signal only the wrapper PID, NEVER its process group");
-      assert.deepEqual(await readReport(), { state: "received", signal });
-      wrapper.stdin.write("ping\n");
-      assert.equal((await readReport()).state, "still-running", "stdin remains inherited after the interrupted wait");
-      assert.equal(wrapper.exitCode, null, "the wrapper must not exit while the child is still settling");
-      assert.doesNotThrow(() => process.kill(wrapper.pid!, 0));
-      assert.match(lifetime(root), /\nprotected\n$/, "a signal/interrupted wait never releases lifetime protection");
-      wrapper.stdin.end("finish\n");
-      assert.equal((await readReport()).state, "finished");
-      assert.equal(await closed, 23, "return the child's eventual status, not the interrupted wait's signal status");
-      assert.equal(wrapper.signalCode, null);
-      assert.throws(() => process.kill(ready.pid!, 0), { code: "ESRCH" }, "the exact CJS process exited before the wrapper closed");
-      assert.match(lifetime(root), settled ? /\ninactive\n$/ : /\nprotected\n$/);
-      f.markAssertionsPassed();
+  test(`.sh forwards wrapper-PID-only ${signal} and waits for exact child exit`, { skip: isWindows, timeout: 30_000 }, async (t) => {
+    const f = makeEntrypointFixture(".node-supervisor-signal-");
+    cleanupFixture(t, f);
+    writeBootstrapTools(f);
+    const script = join(f.root, "signal-child.cjs");
+    writeFileSync(script, [
+      "const report = value => process.stdout.write(JSON.stringify(value) + '\\n');",
+      "let received;",
+      "for (const signal of ['SIGTERM','SIGHUP','SIGINT']) process.on(signal, () => { received = signal; report({state:'received', signal}); });",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', data => {",
+      "  if (data.includes('ping')) report({state:'still-running'});",
+      "  if (data.includes('finish')) { report({state:'finished'}); process.exit(23); }",
+      "});",
+      "report({state:'ready', pid:process.pid, args:process.argv.slice(2)});",
+    ].join("\n"));
+    const args = ["--", "signal argv π", 'quoted "argument"'];
+    const wrapper = spawn("/bin/bash", [shPath, ...args], {
+      env: entrypointEnv(f, { PI_CODING_AGENT_DIR: f.agentDir, FAKE_BOOTSTRAP_SIGNAL_CHILD: script }),
+      stdio: ["pipe", "pipe", "pipe"],
     });
-  }
+    const closed = new Promise<number | null>((accept, reject) => { wrapper.once("error", reject); wrapper.once("close", accept); });
+    const lines = createInterface({ input: wrapper.stdout });
+    const rows = lines[Symbol.asyncIterator]();
+    const readReport = async (): Promise<{ state: string; signal?: string; pid?: number; args?: string[] }> => {
+      let deadline: NodeJS.Timeout | undefined;
+      try {
+        const row = await Promise.race([
+          rows.next(),
+          new Promise<never>((_accept, reject) => { deadline = setTimeout(() => reject(new Error("no child signal witness")), 10_000); }),
+        ]);
+        assert.equal(row.done, false, "child closed before the expected witness");
+        return JSON.parse(row.value!);
+      } finally { clearTimeout(deadline); }
+    };
+    t.after(async () => {
+      if (!wrapper.stdin.writableEnded) wrapper.stdin.end("finish\n");
+      await closed;
+      lines.close();
+    });
+    const ready = await readReport();
+    assert.equal(ready.state, "ready");
+    assert.deepEqual(ready.args, [cjsPath, ...args]);
+    assert.notEqual(ready.pid, wrapper.pid);
+    const group = (pid: number) => spawnSync("/bin/ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim();
+    const wrapperGroup = group(wrapper.pid!);
+    assert.ok(wrapperGroup);
+    assert.equal(group(ready.pid!), wrapperGroup, "CJS retains the inherited terminal process group");
+    assert.equal(wrapper.kill(signal), true, "signal only the wrapper PID, NEVER its process group");
+    assert.deepEqual(await readReport(), { state: "received", signal });
+    wrapper.stdin.write("ping\n");
+    assert.equal((await readReport()).state, "still-running", "stdin remains inherited after the interrupted wait");
+    assert.equal(wrapper.exitCode, null, "the wrapper must not exit while the child is still settling");
+    assert.doesNotThrow(() => process.kill(wrapper.pid!, 0));
+    wrapper.stdin.end("finish\n");
+    assert.equal((await readReport()).state, "finished");
+    assert.equal(await closed, 23, "return the child's eventual status, not the interrupted wait's signal status");
+    assert.equal(wrapper.signalCode, null);
+    assert.throws(() => process.kill(ready.pid!, 0), { code: "ESRCH" }, "the exact CJS process exited before the wrapper closed");
+    f.markAssertionsPassed();
+  });
 }
-
-test(".sh same-device mounted descendants are refused before traversal (synthetic native mount inventory)", { skip: isWindows }, (t) => {
-  const f = makeEntrypointFixture(".node-cap-mounted-");
-  cleanupFixture(t, f);
-  writeBootstrapTools(f);
-  const cache = join(f.agentDir, ".pi-review-gate", "node");
-  const lines = ["fixture on / type fixture (rw)"];
-  for (let i = 0; i < 5; i++) {
-    const root = join(cache, `bootstrap.mounted-${i}`);
-    mkdirSync(join(root, "mounted"), { recursive: true });
-    syntheticLifetime(root, "inactive");
-    writeFileSync(join(root, "mounted", "sentinel"), "do not enter");
-    lines.push(`fixture on ${join(root, "mounted").replaceAll(" ", "\\040")} type fixture (rw,bind)`);
-  }
-  const table = join(f.root, "native-mount-inventory");
-  writeFileSync(table, lines.join("\n") + "\n");
-  const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir, FAKE_MOUNT_TABLE_FILE: table });
-  assert.equal(result.status, 1, result.stderr);
-  assert.match(result.stderr, /capacity exhausted/);
-  for (const root of nodeRoots(f)) assert.equal(readFileSync(join(root, "mounted", "sentinel"), "utf8"), "do not enter");
-  assert.ok(!recordedPhases(f).includes("curl"));
-  f.markAssertionsPassed();
-});
 
 test(".sh a replaced cache parent cannot hide behind matching descendant identities", { skip: isWindows }, (t) => {
   const f = makeEntrypointFixture(".node-cap-parent-replaced-");
@@ -806,11 +854,11 @@ test(".sh a replaced cache parent cannot hide behind matching descendant identit
   assert.equal(readFileSync(sentinel, "utf8"), "outside");
   const displaced = join(f.agentDir, ".pi-review-gate.displaced", "node");
   const root = join(displaced, readdirSync(displaced)[0]!);
-  assert.match(lifetime(root), /\nprotected\n$/, "uncertain parent replacement retains pin");
+  assert.ok(existsSync(root), "the displaced bootstrap witness is retained, not falsely reclaimed");
   f.markAssertionsPassed();
 });
 
-test(".sh concurrent download/extraction producers reserve capacity before staging and never create a sixth", { skip: isWindows, timeout: 60_000 }, async (t) => {
+test(".sh concurrent download/extraction producers both start; a held lock only skips cleanup", { skip: isWindows, timeout: 60_000 }, async (t) => {
   const f = makeEntrypointFixture(".node-cap-concurrent-");
   cleanupFixture(t, f);
   writeBootstrapTools(f);
@@ -829,23 +877,25 @@ test(".sh concurrent download/extraction producers reserve capacity before stagi
   });
   assert.equal(nodeRoots(f).length, 5);
   const result = runSh(f, ["--help"], env);
-  assert.equal(result.status, 1, result.stderr);
-  assert.match(result.stderr, /capacity exhausted/);
-  assert.equal(nodeRoots(f).length, 5);
-  assert.equal(recordedPhases(f).filter((p) => p === "curl").length, 5);
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /capacity exhausted/);
+  assert.match(result.stderr, /cleanup lock was busy|without reclaiming/);
+  assert.ok(nodeRoots(f).length <= 6, "concurrent creations may briefly exceed the target without refusing either launch");
   child.stdin!.end("release\n");
   assert.equal(await closed, 0);
-  assert.equal(nodeRoots(f).length, 5);
+  const converged = runSh(f, ["--help"], env);
+  assert.equal(converged.status, 0, converged.stderr);
+  assert.equal(nodeRoots(f).length, 5, "the next launch converges the cache back to five");
   f.markAssertionsPassed();
 });
 
-test("native Windows fallback admission precedes setup and refuses a sixth artifact without compiler scratch or reclamation", { skip: !isWindows, timeout: 60_000 }, (t) => {
+test("native Windows fallback bootstrap prunes legacy artifacts and never refuses a sixth", { skip: !isWindows, timeout: 60_000 }, (t) => {
   const f = makeEntrypointFixture(".node-cap-native-windows-");
   cleanupFixture(t, f);
   const helper = join(f.root, "bootstrap.ps1");
   const downloads = join(f.root, "download-witness");
-  // Network is the only substituted operation. Native path/identity/admission,
-  // exclusive generation creation and lifetime publication execute unchanged.
+  // Network is the only substituted operation. Native path/identity checks,
+  // exclusive generation creation and bounded no-follow cleanup execute unchanged.
   const source = readFileSync(psPath, "utf8").replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'");
   assert.notEqual(source, readFileSync(psPath, "utf8"));
   writeFileSync(helper, source);
@@ -858,11 +908,11 @@ test("native Windows fallback admission precedes setup and refuses a sixth artif
     });
     assert.equal(result.status, 1, result.stderr);
     assert.equal(nodeRoots(f).length, Math.min(i + 1, 5), result.stderr);
-    assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, Math.min(i + 1, 5));
+    assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, i + 1, "every launch reaches the download; capacity never refuses it");
+    assert.doesNotMatch(result.stderr, /capacity exhausted/);
   }
   for (const root of nodeRoots(f)) {
-    assert.deepEqual(readdirSync(root), [".node-lifetime", "extracted"], "no compiler scratch; extraction stays inside the counted generation");
-    assert.match(lifetime(root), /^pi-review-gate-node-v1\n[0-9a-f]{16}:[0-9a-f]{32}\nbootstrap-[0-9a-f]{32}\nprotected\n$/);
+    assert.deepEqual(readdirSync(root), ["extracted"], "no compiler scratch and no lifetime receipt; extraction stays inside the generation");
   }
   const outside = join(f.root, "outside");
   mkdirSync(outside);
@@ -877,7 +927,75 @@ test("native Windows fallback admission precedes setup and refuses a sixth artif
   assert.equal(refused.status, 1);
   assert.deepEqual(readdirSync(outside), ["sentinel"]);
   assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "outside");
-  assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 5);
+  assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 6);
+  f.markAssertionsPassed();
+});
+
+test("native Windows cleanup failures warn and still create a fresh generation", { skip: !isWindows, timeout: 60_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-cleanup-native-windows-");
+  cleanupFixture(t, f);
+  const cache = join(f.agentDir, ".pi-review-gate", "node");
+  mkdirSync(join(cache, ".admission.lock"), { recursive: true });
+  for (let i = 0; i < 5; i++) mkdirSync(join(cache, `bootstrap.legacy-${i}`), { recursive: true });
+  const downloads = join(f.root, "download-witness");
+  const helper = join(f.root, "bootstrap.ps1");
+  // Network and cache inventory are the only substituted operations; native
+  // lock handling and generation creation run unchanged.
+  const source = readFileSync(psPath, "utf8")
+    .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'")
+    .replace("          $entries = @([IO.Directory]::EnumerateFileSystemEntries($Root))", "          throw 'synthetic inventory failure'");
+  assert.notEqual(source, readFileSync(psPath, "utf8"));
+  writeFileSync(helper, source);
+  const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
+  const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
+    env, cwd: f.root, encoding: "utf8", timeout: 20_000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /cleanup lock was busy or unreadable|inventory was unavailable|cleanup could not complete/);
+  assert.doesNotMatch(result.stderr, /capacity exhausted/);
+  assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 1,
+    "startup reached the download despite the cleanup failures");
+  assert.equal(nodeRoots(f).length, 6, "the legacy entries were preserved and a fresh generation was still created");
+  f.markAssertionsPassed();
+});
+
+test("native Windows fences outside junction markers, prunes malformed markers, and keeps live owners", { skip: !isWindows, timeout: 90_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-outside-marker-windows-");
+  cleanupFixture(t, f);
+  const cache = join(f.agentDir, ".pi-review-gate", "node");
+  const outside = join(f.root, "outside");
+  mkdirSync(outside);
+  const outsideMarker = join(outside, ".producer-active");
+  writeFileSync(outsideMarker, "999999999\n", { mode: 0o600 });
+  const before = readFileSync(outsideMarker);
+  const link = join(cache, "bootstrap.0-link");
+  mkdirSync(cache, { recursive: true });
+  symlinkSync(outside, link, "junction");
+  const dirMarker = join(cache, "bootstrap.1-dir-marker");
+  mkdirSync(join(dirMarker, ".producer-active"), { recursive: true });
+  const liveOwner = join(cache, "bootstrap.2-live-owner");
+  mkdirSync(liveOwner, { recursive: true });
+  writeFileSync(join(liveOwner, ".producer-active"), `${process.pid}\n`);
+  for (let i = 0; i < 6; i++) mkdirSync(join(cache, `bootstrap.3-filler-${i}`), { recursive: true });
+  const downloads = join(f.root, "download-witness");
+  const helper = join(f.root, "bootstrap.ps1");
+  writeFileSync(helper, readFileSync(psPath, "utf8")
+    .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'"));
+  const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
+  const run = () => spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
+    env, cwd: f.root, encoding: "utf8", timeout: 20_000,
+  });
+  for (let attempt = 0; attempt < 8 && (existsSync(link) || existsSync(dirMarker)); attempt++) {
+    const result = run();
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(readFileSync(outsideMarker).equals(before), true, "the outside marker is byte-identical after cleanup");
+  }
+  assert.equal(existsSync(link), false, "the junction itself is removed, never traversed");
+  assert.equal(existsSync(dirMarker), false, "a directory-shaped marker does not pin its generation");
+  assert.ok(existsSync(liveOwner), "a valid live-owner marker continues to protect its generation");
+  assert.ok(nodeRoots(f).length <= 5, "the cache converged to the five-generation target");
   f.markAssertionsPassed();
 });
 
@@ -903,7 +1021,7 @@ test(".cmd delegates arguments to the PowerShell Node bootstrap after fail-close
   assert.match(helper, /CreateNew/);
   assert.match(helper, /Get-Sha256 \$archivePath[\s\S]*?if \(\$actualSha256 -cne \$NodeSha256\)[\s\S]*?Expand-VerifiedZip/);
   assert.match(helper, /^  \$FallbackNodeExecutable = \$nodeExe$/m);
-  assert.match(helper, /^Start-SessionCjs \$FallbackNodeExecutable \$FallbackNodeDirectory \$CjsArguments$/m);
+  assert.match(helper, /^\s*Start-SessionCjs \$FallbackNodeExecutable \$FallbackNodeDirectory \$CjsArguments$/m);
   assert.doesNotMatch(helper, /https?:\/\/(?!nodejs\.org)/);
 });
 

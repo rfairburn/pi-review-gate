@@ -1,330 +1,452 @@
 "use strict";
 
-// Producer-owned disposable caches, not a general application/process manager.
-// The directory entries ARE the inventory. Only this one in-generation record
-// describes lifetime; build freshness/version validation remains with producers.
+// Producer-owned disposable caches — not a general application/process manager.
+// The cache root's direct child entries ARE the inventory. These trees live only
+// under the designated `.pi-review-gate/{build,pi-runtime,node}` caches, so their
+// contents are disposable by location: a descendant is reclaimable regardless of
+// who created it and regardless of whether any lifetime/metadata record exists.
+//
+// Cleanup is deliberately best effort. Exceeding the per-type generation target
+// (five), an unreadable or stale lock, missing/malformed legacy records, or a
+// partial filesystem failure must never stop an application start; those cases
+// report a bounded warning and the producer continues. Active sessions are
+// guarded by the session host's own exclusive agent-directory ownership record,
+// not by cache receipts, so cleanup does not implement a second lifetime gate.
+//
+// Reuse/validation authority stays with the producers (source-build freshness
+// records and Pi package/version validation). This module keeps no registry and
+// writes no lifetime receipts. MARKER is a single owner-pid liveness file inside
+// a generation for exactly as long as that generation is being filled, so a
+// concurrent cleanup skips in-flight setup without retaining it forever: a dead
+// owner's marker is reclaimed like a stale lock. RECORD is the retired legacy
+// lifetime file name that artifact scans continue to ignore.
 const fs = require("node:fs");
 const path = require("node:path");
-const crypto = require("node:crypto");
-const childProcess = require("node:child_process");
 const { performance } = require("node:perf_hooks");
 const RECORD = ".generation.json";
+const MARKER = ".producer-active";
 const LOCK = ".admission.lock";
 const LIMIT = 5;
 const MAX_ENTRIES = 100_000;
-const MAX_RECORD = 16 * 1024;
+const MAX_DEPTH = 64;
+const CLEANUP_DEADLINE_MS = 120_000;
+const LOCK_WAIT_MS = 2_000;
+const MAX_LOCK_BYTES = 64;
 
 function identity(file) {
   const s = fs.lstatSync(file, { bigint: true });
   if (s.isSymbolicLink() || !s.isDirectory() || s.ino <= 0n) throw new Error("unsafe generation directory");
   return { dev: String(s.dev), ino: String(s.ino) };
 }
-function same(file, expected) {
-  try { const s = identity(file); return s.dev === expected.dev && s.ino === expected.ino; } catch { return false; }
+
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
-function snapshot(file) { return fs.lstatSync(file, { bigint: true }); }
-function equal(a, b) { return a.dev === b.dev && a.ino === b.ino && a.mode === b.mode && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs && a.nlink === b.nlink; }
-function regular(s) { return s.isFile() && !s.isSymbolicLink() && s.nlink === 1n && s.ino > 0n; }
-function fence(root) {
-  const resolved = path.resolve(root);
-  const chain = [];
-  let current = path.parse(resolved).root;
-  chain.push([current, identity(current)]);
-  for (const part of resolved.slice(current.length).split(path.sep).filter(Boolean)) {
-    current = path.join(current, part);
-    chain.push([current, identity(current)]);
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error && error.code === "EPERM";
   }
-  return () => chain.every(([file, id]) => same(file, id));
 }
-function read(root, expected) {
-  if (!same(root, expected)) throw new Error("generation identity changed");
-  const file = path.join(root, RECORD);
-  const before = snapshot(file);
-  if (!regular(before) || before.size > BigInt(MAX_RECORD)
-    || (process.platform !== "win32" && (before.mode & 0o077n) !== 0n)) throw new Error("unsafe generation lifetime record");
-  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
-  let value;
+
+/** Bounded read of a regular no-follow lock file; undefined when unreadable. */
+function readLockOwner(file) {
   try {
-    if (!equal(before, fs.fstatSync(fd, { bigint: true }))) throw new Error("generation lifetime record changed");
-    const bytes = Buffer.alloc(MAX_RECORD + 1);
-    let length = 0;
-    for (;;) {
-      const count = fs.readSync(fd, bytes, length, bytes.length - length, length);
-      if (count === 0) break;
-      length += count;
-      if (length > MAX_RECORD) throw new Error("oversized generation lifetime record");
+    const before = fs.lstatSync(file, { bigint: true });
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.size > BigInt(MAX_LOCK_BYTES)) {
+      return undefined;
     }
-    value = JSON.parse(bytes.subarray(0, length).toString("utf8"));
-    if (!equal(before, fs.fstatSync(fd, { bigint: true })) || !equal(before, snapshot(file))) throw new Error("generation lifetime record changed");
-  } finally { fs.closeSync(fd); }
-  if (!value || Object.keys(value).sort().join() !== "holders,root,schema" || value.schema !== 1
-    || !value.root || Object.keys(value.root).sort().join() !== "dev,ino"
-    || value.root.dev !== expected.dev || value.root.ino !== expected.ino
-    || !Array.isArray(value.holders) || value.holders.length > 128
-    || value.holders.some((h) => typeof h !== "string" || !/^[a-f0-9]{32}$/u.test(h))
-    || new Set(value.holders).size !== value.holders.length) throw new Error("uncertain generation lifetime");
-  return { value, stat: before };
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+    try {
+      const bytes = Buffer.alloc(MAX_LOCK_BYTES + 1);
+      const length = fs.readSync(fd, bytes, 0, bytes.length, 0);
+      return bytes.subarray(0, Math.min(length, MAX_LOCK_BYTES)).toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return undefined;
+  }
 }
-function write(root, expected, value, previous) {
-  if (!same(root, expected)) throw new Error("generation identity changed");
-  const file = path.join(root, RECORD);
-  if (previous && !equal(previous, snapshot(file))) throw new Error("generation lifetime changed");
-  const temp = path.join(root, `.lifetime-${crypto.randomBytes(16).toString("hex")}`);
-  const fd = fs.openSync(temp, "wx", 0o600);
-  try { fs.writeFileSync(fd, JSON.stringify(value)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  // A failed publication leaves residue INSIDE the counted generation.
-  if (!same(root, expected) || (previous && !equal(previous, snapshot(file)))) throw new Error("generation lifetime changed");
-  if (previous) fs.renameSync(temp, file);
-  else { fs.linkSync(temp, file); fs.unlinkSync(temp); }
-}
-function locked(root, action) {
-  const check = fence(root);
-  const file = path.join(root, LOCK);
-  let fd;
-  try { fd = fs.openSync(file, "wx", 0o600); }
-  catch { throw new Error("generation capacity admission is busy or uncertain; retry after the producer settles"); }
-  const id = fs.fstatSync(fd, { bigint: true });
+
+/**
+ * True while the recorded owner of a generation is still filling it. A marker
+ * that stays empty/malformed is observed briefly, then treated as a dead
+ * owner's residue and removed; a dead pid or unreadable marker is reclaimable.
+ */
+function generationIsInProgress(root) {
+  // Fence the generation root itself: a direct-child link is not a generation
+  // and must never expose an outside marker for inspection or deletion.
   try {
-    if (!check() || !equal(id, snapshot(file))) throw new Error("generation cache identity changed");
-    return action(check);
+    const rootStat = fs.lstatSync(root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return false;
+  } catch {
+    return false;
+  }
+  const file = path.join(root, MARKER);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let before;
+    try {
+      before = fs.lstatSync(file, { bigint: true });
+    } catch {
+      return false;
+    }
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.size > 64n) {
+      // Invalid metadata shapes (directory, link, oversized) are not liveness
+      // evidence. Confined no-follow cleanup removes them or reports a real
+      // filesystem failure; they never become a permanent pin.
+      return false;
+    }
+    const text = readLockOwner(file);
+    const owner = text === undefined ? undefined : /^(\d{1,10})\n?$/u.exec(text);
+    if (owner) {
+      const pid = Number(owner[1]);
+      if (pid === process.pid || processIsAlive(pid)) return true;
+      break;
+    }
+    sleep(25);
+  }
+  try {
+    const stat = fs.lstatSync(file, { bigint: true });
+    if (stat.isFile() && !stat.isSymbolicLink()) fs.unlinkSync(file);
+  } catch {
+    // A replaced or unreadable marker remains; the generation is still counted.
+  }
+  return false;
+}
+
+function writeMarker(root) {
+  const file = path.join(root, MARKER);
+  const fd = fs.openSync(file, "wx", 0o600);
+  try {
+    fs.writeFileSync(fd, `${process.pid}\n`);
+    fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
-    try { if (check() && equal(id, snapshot(file))) fs.unlinkSync(file); } catch { /* Retain uncertain admission ownership. */ }
   }
 }
-function control(root, name) {
-  // Existing #375 freshness records are NOT lifetime or capacity indexes.
-  if (!/^(?:source-[a-f0-9]{64}\.json|\.source-build-[a-f0-9]{64}\.lock)$/u.test(name)) return false;
-  return regular(snapshot(path.join(root, name)));
+
+function clearMarker(root) {
+  try {
+    const file = path.join(root, MARKER);
+    const stat = fs.lstatSync(file, { bigint: true });
+    if (stat.isFile() && !stat.isSymbolicLink()) fs.unlinkSync(file);
+  } catch {
+    // Already settled, replaced, or unreadable: nothing to remove.
+  }
 }
-function entries(root) {
-  const names = [];
-  const dir = fs.opendirSync(root);
+
+function acquire(cacheRoot) {
+  const file = path.join(cacheRoot, LOCK);
+  const deadline = performance.now() + LOCK_WAIT_MS;
+  // A just-created lock can be observed between creation and its pid write.
+  // Only a record that stays malformed across several observations is treated
+  // as a dead owner's lock.
+  let malformed = 0;
+  for (;;) {
+    try {
+      const fd = fs.openSync(file, "wx", 0o600);
+      let created;
+      try {
+        fs.writeFileSync(fd, `${process.pid}\n`);
+        const stat = fs.fstatSync(fd, { bigint: true });
+        created = { dev: stat.dev, ino: stat.ino };
+      } finally {
+        fs.closeSync(fd);
+      }
+      return {
+        release() {
+          try {
+            const stat = fs.lstatSync(file, { bigint: true });
+            if (stat.dev === created.dev && stat.ino === created.ino) fs.unlinkSync(file);
+          } catch {
+            // A replaced or already-removed lock is not ours to remove.
+          }
+        },
+      };
+    } catch (error) {
+      if (!error || error.code !== "EEXIST") return undefined;
+      const text = readLockOwner(file);
+      if (text === undefined) return undefined;
+      const owner = /^(\d{1,10})\n?$/u.exec(text);
+      if (owner) {
+        malformed = 0;
+        // Same-process concurrency cannot be waited out (the holder only
+        // settles on another turn of this event loop): skip cleanup at once.
+        if (Number(owner[1]) === process.pid) return undefined;
+        if (!processIsAlive(Number(owner[1]))) {
+          try {
+            fs.unlinkSync(file);
+          } catch {
+            return undefined;
+          }
+          continue;
+        }
+      } else {
+        malformed += 1;
+        // Empty/malformed: either a mid-publication lock or a dead owner's
+        // residue. Re-observe briefly before reclaiming it.
+        if (malformed >= 3) {
+          try {
+            fs.unlinkSync(file);
+          } catch {
+            return undefined;
+          }
+          malformed = 0;
+          continue;
+        }
+      }
+      if (performance.now() >= deadline) return undefined;
+      sleep(25);
+    }
+  }
+}
+
+/**
+ * An existing session-host ownership record means a host currently owns this
+ * agent directory. That existing guard keeps its authority: cleanup is skipped
+ * so a live host's cache generations are left alone, while creation still
+ * proceeds and cache capacity still never refuses a start. This is presence
+ * only; it does not read, steal, or reimplement the ownership record.
+ */
+function activeHostOwnsAgentDirectory(cacheRoot) {
+  const cache = path.resolve(cacheRoot);
+  if (path.basename(path.dirname(cache)) !== ".pi-review-gate") return false;
+  const ownership = path.join(path.dirname(path.dirname(cache)), "session-host", "host-ownership.json");
+  try {
+    fs.lstatSync(ownership);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Freshness pointers are not generations and never consume a slot. */
+function control(name) {
+  return /^(?:source-[a-f0-9]{64}\.json|\.source-build-[a-f0-9]{64}\.lock)$/u.test(name);
+}
+
+function inventory(cacheRoot) {
+  const entries = [];
+  const dir = fs.opendirSync(cacheRoot);
   try {
     let entry;
     while ((entry = dir.readSync())) {
-      if (entry.name === LOCK || control(root, entry.name)) continue;
-      names.push(entry.name);
-      if (names.length > MAX_ENTRIES) throw new Error("generation capacity inventory exceeded its bound");
+      if (entry.name === LOCK || control(entry.name)) continue;
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      entries.push({ name: entry.name, file: path.join(cacheRoot, entry.name) });
+      if (entries.length > MAX_ENTRIES) throw new Error("cache inventory exceeded its bound");
     }
-  } finally { dir.closeSync(); }
-  return names.sort();
-}
-// Fixed native metadata queries only: never consult PATH, cache files, or
-// caller-selected commands. A listing is not a recursive filesystem inventory.
-const MAX_MOUNTS = 4 * 1024 * 1024;
-function nativeMounts(deadline) {
-  const remaining = Math.floor(deadline - performance.now());
-  if (remaining <= 0) throw new Error("cleanup deadline exceeded");
-  let command, args;
-  if (process.platform === "linux") { command = "/bin/cat"; args = ["/proc/self/mountinfo"]; }
-  else if (process.platform === "darwin") { command = "/sbin/mount"; args = []; }
-  else throw new Error("native mount evidence unsupported");
-  const result = childProcess.spawnSync(command, args, {
-    encoding: "utf8", env: { LC_ALL: "C" }, stdio: ["ignore", "pipe", "pipe"],
-    timeout: Math.min(1000, remaining), killSignal: "SIGKILL", maxBuffer: MAX_MOUNTS,
-  });
-  if (result.error || result.status !== 0 || result.signal || typeof result.stdout !== "string"
-    || !result.stdout.endsWith("\n") || Buffer.byteLength(result.stdout) > MAX_MOUNTS
-    || performance.now() >= deadline) throw new Error("native mount evidence unavailable or exceeded its bound");
-  return result.stdout;
-}
-function linuxMountedPath(value) {
-  // Linux mountinfo escapes whitespace and backslashes.
-  if (/\\(?!040|011|012|134)/u.test(value) || /[\0\r]/u.test(value)) throw new Error("ambiguous mount path");
-  const decoded = value.replace(/\\(040|011|012|134)/gu, (_, code) => ({ "040": " ", "011": "\t", "012": "\n", "134": "\\" })[code]);
-  if (!decoded.startsWith("/") || path.posix.normalize(decoded) !== decoded) throw new Error("noncanonical mount path");
-  return decoded;
-}
-function mountFence(root, deadline) {
-  // Darwin's literal, line-oriented listing cannot disambiguate a cache prefix
-  // containing its own record/field delimiters. Do not interpret it as safe.
-  if (process.platform === "darwin" && (/[\0\r\n]/u.test(root) || root.includes(" on ") || root.includes(" ("))) throw new Error("ambiguous native cache path");
-  const evidence = nativeMounts(deadline);
-  const lines = evidence.slice(0, -1).split("\n");
-  if (lines.length > MAX_ENTRIES) throw new Error("mount metadata exceeded its bound");
-  for (const line of lines) {
-    let mounted;
-    if (process.platform === "linux") {
-      const fields = line.split(" ");
-      const separator = fields.indexOf("-", 6);
-      if (separator < 6 || fields.length !== separator + 4 || fields.some((field) => !field)
-        || !/^\d+$/u.test(fields[0]) || !/^\d+$/u.test(fields[1]) || !/^\d+:\d+$/u.test(fields[2])) throw new Error("ambiguous mountinfo");
-      linuxMountedPath(fields[3]);
-      mounted = linuxMountedPath(fields[4]);
-    } else {
-      const parts = line.split(" on ");
-      if (parts.length !== 2 || !parts[0]) throw new Error("ambiguous native mount listing");
-      const match = /^(\/.*?) \([^()\n]+\)$/u.exec(parts[1]);
-      if (!match || match[1].includes(" (")) throw new Error("ambiguous native mount listing");
-      // Darwin mount(8) prints paths literally, including sequences such as
-      // \\040. Linux octal decoding here can hide a mounted descendant.
-      mounted = match[1];
-      if (/[\0\r]/u.test(mounted) || path.posix.normalize(mounted) !== mounted) throw new Error("ambiguous native mount path");
-    }
-    if (mounted === root || mounted.startsWith(root + path.sep)) throw new Error("mounted generation subtree");
+  } finally {
+    dir.closeSync();
   }
-  // Even unrelated changes invalidate cached evidence. Requery before opening
-  // each directory and before EVERY deletion, then recheck path identities;
-  // non-following leaf metadata reads need no native subprocess.
-  return () => nativeMounts(deadline) === evidence;
+  // Deterministic directory-name order: no age, size, or lifetime policy is
+  // applied, and every excess generation is equally disposable.
+  return entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
 }
-function remove(root, expected, check) {
-  // Public Node cannot exclude every native reparse type or prove Windows
-  // descendants settled. Never translate direct-child close into reclamation.
-  if (process.platform === "win32") return false;
+
+/**
+ * Bounded, no-follow removal of one designated cache generation. Links are
+ * unlinked themselves and never traversed, so data outside the generation is
+ * untouched; a hardlinked file only loses this name. Returns true only when the
+ * whole entry (including its root directory) is gone.
+ */
+function remove(root) {
+  const deadline = performance.now() + CLEANUP_DEADLINE_MS;
+  let visited = 0;
   try {
-    root = path.resolve(root);
-    // Include native-query cost in a bounded dependency-sized cleanup budget.
-    const deadline = performance.now() + 180_000;
-    const mountsUnchanged = mountFence(root, deadline);
-    if (!check() || !same(root, expected) || read(root, expected).value.holders.length !== 0) return false;
-    const nodes = [];
-    function visit(file, depth, ancestors = []) {
-      if (performance.now() >= deadline || !check() || !same(root, expected) || depth > 64 || nodes.length >= MAX_ENTRIES) throw new Error("cleanup bound or identity changed");
-      const stat = snapshot(file);
-      const node = { file, stat, ancestors };
-      nodes.push(node);
-      if (stat.ino <= 0n || String(stat.dev) !== expected.dev) throw new Error("cleanup identity unavailable or crossed device");
+    const visit = (file, depth) => {
+      visited += 1;
+      if (visited > MAX_ENTRIES) throw new Error("removal entry bound exceeded");
+      if (depth > MAX_DEPTH) throw new Error("removal depth exceeded");
+      if (performance.now() >= deadline) throw new Error("removal deadline exceeded");
+      const stat = fs.lstatSync(file, { bigint: true });
       if (stat.isSymbolicLink()) {
-        if (stat.nlink !== 1n) throw new Error("hardlinked cleanup symlink");
-        const target = path.resolve(path.dirname(file), fs.readlinkSync(file));
-        if (!target.startsWith(root + path.sep)) throw new Error("out-of-generation link");
-        // Unlink only; never descend through a link (including .bin shims).
-      } else if (stat.isDirectory()) {
-        if (!mountsUnchanged() || !check() || !same(root, expected)
-          || !ancestors.every(([ancestor, id]) => same(ancestor, id))
-          || !equal(stat, snapshot(file))) throw new Error("cleanup mount or directory identity changed");
+        fs.unlinkSync(file);
+        return;
+      }
+      if (stat.isDirectory()) {
+        let names;
         const dir = fs.opendirSync(file);
         try {
-          let child;
-          while ((child = dir.readSync())) {
-            // No traversal or recursive ancestor deletion of Terraform trees.
-            if (child.name === ".terraform") throw new Error("excluded subtree");
-            visit(path.join(file, child.name), depth + 1, [...ancestors, [file, { dev: String(stat.dev), ino: String(stat.ino) }]]);
-          }
-        } finally { dir.closeSync(); }
-      } else if (!regular(stat)) throw new Error("unsafe cleanup entry");
-    }
-    visit(root, 0);
-    // Check the complete tree before the first deletion. No fs.rm on an
-    // unverified ancestor; partial failure keeps the root and counts it.
-    for (const node of nodes) if (!equal(node.stat, snapshot(node.file))) return false;
-    // Keep the lifetime record until last so partial cleanup remains accountable.
-    const record = nodes.find((n) => n.file === path.join(root, RECORD));
-    const deletion = nodes.filter((n) => n.file !== root && n !== record).reverse();
-    for (const node of [...deletion, record]) {
-      if (!node || !mountsUnchanged() || !check() || !same(root, expected) || !node.ancestors.every(([file, id]) => same(file, id))) return false;
-      // Directory timestamps change during our own child removal; identity
-      // and type still must match. Files/links require the full snapshot.
-      const now = snapshot(node.file);
-      if (node.stat.isDirectory()) {
-        if (!same(node.file, { dev: String(node.stat.dev), ino: String(node.stat.ino) })) return false;
-        fs.rmdirSync(node.file);
-      } else {
-        if (!equal(node.stat, now)) return false;
-        fs.unlinkSync(node.file);
+          names = [];
+          let entry;
+          while ((entry = dir.readSync())) names.push(entry.name);
+        } finally {
+          dir.closeSync();
+        }
+        for (const name of names) {
+          // Cleanup-specific traversal: this whole generation is a designated
+          // disposable cache, so even an initialized `.terraform` subtree inside
+          // it is removed (still no-follow and confined to this generation).
+          visit(path.join(file, name), depth + 1);
+        }
+        fs.rmdirSync(file);
+        return;
       }
-    }
-    if (!mountsUnchanged() || !check() || !same(root, expected)) return false;
-    fs.rmdirSync(root);
+      if (!stat.isFile()) throw new Error("unsupported entry");
+      fs.unlinkSync(file);
+    };
+    visit(path.resolve(root), 0);
     return true;
-  } catch { return false; }
+  } catch {
+    // A partial removal leaves the remaining entry counted; a later cleanup
+    // retries it. Report nothing as reclaimed.
+    return false;
+  }
 }
-function handle(cacheRoot, root, expected, token) {
-  let released = false;
-  const check = fence(root);
+
+/**
+ * Reclaim excess generations down to the per-type target. Runs under one short
+ * exclusive admission lock so concurrent producers do not duplicate work.
+ */
+function reclaim(cacheRoot, options, warnings) {
+  let entries;
+  try {
+    entries = inventory(cacheRoot);
+  } catch (error) {
+    warnings.push(`cache inventory was unavailable (${error.message}); continuing without reclamation`);
+    return;
+  }
+  let count = entries.length;
+  for (const entry of entries) {
+    if (count < LIMIT) break;
+    // A live producer's generation is off limits; its marker disappears when
+    // that producer settles (or is reclaimed once its owner is gone).
+    if (generationIsInProgress(entry.file)) continue;
+    let retire;
+    try {
+      // Producer pointer retirement only inspects an ordinary generation
+      // directory; a link is unlinked without ever being read through.
+      const stat = fs.lstatSync(entry.file, { bigint: true });
+      retire = !stat.isSymbolicLink() && typeof options.beforeReclaim === "function"
+        ? options.beforeReclaim(entry.file)
+        : undefined;
+    } catch {
+      retire = undefined;
+    }
+    if (!remove(entry.file)) {
+      warnings.push(`could not reclaim cache generation ${entry.name}; it remains and startup continues`);
+      continue;
+    }
+    count -= 1;
+    // Retire a producer's existing freshness pointer only AFTER its generation
+    // is gone. This is not another capacity or lifetime index.
+    try {
+      retire?.();
+    } catch {
+      // A stale pointer simply remains non-reusable.
+    }
+  }
+  if (count >= LIMIT) {
+    warnings.push(`cache retains ${count} generations (target ${LIMIT}); startup continues`);
+  }
+}
+
+/**
+ * The handle settles this producer's admission. Nothing is pinned any more: a
+ * generation is disposable by location and the next cleanup reclaims excess.
+ * `release()` only ends the setup mutual exclusion (idempotent, truthful).
+ */
+function handle(root, settle) {
+  let settled = false;
   return {
     root,
-    // Explicit positive settlement only; no PID-age, time, missing-pin, or
-    // checkpoint-existence heuristics. Crash/uncertainty leaves the pin durable.
     release() {
-      if (released) return true;
-      try {
-        return locked(cacheRoot, (parentCheck) => {
-          if (!parentCheck() || !check()) return false;
-          const { value, stat } = read(root, expected);
-          if (!value.holders.includes(token)) return false;
-          value.holders = value.holders.filter((h) => h !== token);
-          write(root, expected, value, stat);
-          released = true;
-          return true;
-        });
-      } catch { return false; }
+      if (settled) return true;
+      settled = true;
+      if (typeof settle === "function") settle();
+      return true;
     },
   };
 }
-function admit(cacheRoot, create, beforeReclaim = () => undefined, replacement) {
-  return locked(cacheRoot, (check) => {
-    let inventory = entries(cacheRoot);
-    if (replacement) {
-      // A producer may retry one incomplete generation without waiting for
-      // capacity pressure. Identity, zero holders, eligibility, removal and
-      // the replacement reservation all share this SAME admission lock.
-      const root = path.resolve(replacement.root);
-      const expected = { dev: String(replacement.identity.dev), ino: String(replacement.identity.ino) };
-      if (path.dirname(root) !== path.resolve(cacheRoot) || path.basename(root) === ".terraform"
-        || !inventory.includes(path.basename(root)) || !same(root, expected)
-        || read(root, expected).value.holders.length !== 0 || replacement.eligible() !== true
-        || !remove(root, expected, check)) {
-        throw new Error("generation replacement refused: active, uncertain, changed or unsafe generation retained");
-      }
-      inventory = inventory.filter((name) => name !== path.basename(root));
-    }
-    for (const name of inventory) {
-      if (inventory.length < LIMIT) break;
-      if (name === ".terraform") continue; // Count, but never enter the excluded subtree.
-      const root = path.join(cacheRoot, name);
-      try {
-        const id = identity(root);
-        if (read(root, id).value.holders.length !== 0) continue;
-        const retire = beforeReclaim(root);
-        if (remove(root, id, check)) {
-          inventory = inventory.filter((entry) => entry !== name);
-          // Retire a producer's existing freshness pointer only AFTER its
-          // generation is gone. This is not another capacity/lifetime index.
-          try { retire?.(); } catch { /* Stale pointer remains non-reusable. */ }
-        }
-      } catch { /* Legacy/malformed/replaced entries count and remain uncertain. */ }
-    }
-    if (inventory.length >= LIMIT) throw new Error(`generation capacity exhausted: maximum ${LIMIT}; active, uncertain or unsafe generations retained`);
-    if (!check()) throw new Error("generation cache identity changed");
-    // Creation + lifetime reservation are under the same exclusive admission.
-    const stage = create();
+
+/**
+ * Create one generation, reclaiming excess generations first. Capacity never
+ * refuses creation: when cleanup cannot complete, the caller is warned and the
+ * generation is created anyway.
+ *
+ * options.beforeReclaim(root) prepares a producer-specific pointer retirement
+ * for one candidate; options.replacement { root, identity, eligible } lets a Pi
+ * producer retry its own settled incomplete version root; options.warn receives
+ * bounded cleanup warnings.
+ */
+function admit(cacheRoot, create, options = {}) {
+  const cache = path.resolve(cacheRoot);
+  const warnings = [];
+  const lock = activeHostOwnsAgentDirectory(cache) ? undefined : acquire(cache);
+  if (activeHostOwnsAgentDirectory(cache)) {
+    warnings.push("a session host currently owns the agent directory; leaving cache generations untouched");
+  } else if (!lock) {
+    warnings.push("cache cleanup lock was busy or unreadable; continuing without reclaiming older generations");
+  } else {
     try {
-      if (path.dirname(stage.root) !== path.resolve(cacheRoot) || !check()) throw new Error("generation escaped cache");
-      const expected = identity(stage.root);
-      const token = crypto.randomBytes(16).toString("hex");
-      write(stage.root, expected, { schema: 1, root: expected, holders: [token] });
-      stage.generation = handle(cacheRoot, stage.root, expected, token);
-      return stage;
+      if (options.replacement) {
+        const target = path.resolve(options.replacement.root);
+        const eligible = typeof options.replacement.eligible === "function" && options.replacement.eligible() === true;
+        // The same live-owner protection as ordinary reclamation: a producer
+        // still filling this exact generation must never be deleted.
+        if (path.dirname(target) === cache && eligible && !generationIsInProgress(target)) {
+          if (!remove(target)) warnings.push(`could not reclaim the incomplete generation ${path.basename(target)}; continuing`);
+        }
+      }
+      reclaim(cache, options, warnings);
     } catch (error) {
-      error.retainedStage = true; // Failed metadata/setup remains a counted root.
+      // A preparation failure ends this admission; creation is never blocked by
+      // cleanup trouble, which `reclaim` itself reports as warnings.
+      lock.release();
       throw error;
     }
-  });
+  }
+  for (const warning of warnings) {
+    if (typeof options.warn === "function") options.warn(warning);
+  }
+  // Creation runs under the same admission, and the lock stays held until the
+  // producer settles its setup. Another producer therefore skips cleanup while
+  // a generation is still being filled instead of deleting it mid-setup.
+  let stage;
+  try {
+    stage = create();
+  } catch (error) {
+    lock?.release();
+    throw error;
+  }
+  if (path.dirname(path.resolve(stage.root)) !== cache) {
+    lock?.release();
+    throw new Error("generation escaped its cache");
+  }
+  try {
+    identity(stage.root);
+    writeMarker(stage.root);
+  } catch (error) {
+    lock?.release();
+    throw error;
+  }
+  return {
+    ...stage,
+    generation: handle(stage.root, () => {
+      clearMarker(stage.root);
+      lock?.release();
+    }),
+  };
 }
+
+/**
+ * Confirm that a reuse selection is a direct child of its managed cache. No
+ * record, receipt, or pin is read or written; producer validation remains the
+ * authority for compatibility and the generation stays disposable.
+ */
 function pin(cacheRoot, select) {
-  return locked(cacheRoot, (check) => {
-    const selected = select();
-    if (!selected) return undefined;
-    const root = selected.root;
-    if (path.dirname(root) !== path.resolve(cacheRoot) || !check()) throw new Error("generation escaped cache");
-    const expected = identity(root);
-    let lifetime;
-    try { lifetime = read(root, expected); }
-    catch (error) {
-      // Legacy selection stays protected forever; absence is NOT inactivity.
-      // Do not synthesize metadata or invalidate independently validated reuse.
-      if (error.code === "ENOENT") return { selected, generation: undefined };
-      throw error;
-    }
-    const { value, stat } = lifetime;
-    if (value.holders.length >= 128) throw new Error("generation consumer capacity exhausted");
-    const token = crypto.randomBytes(16).toString("hex");
-    value.holders.push(token);
-    write(root, expected, value, stat);
-    return { selected, generation: handle(cacheRoot, root, expected, token) };
-  });
+  const selected = select();
+  if (!selected) return undefined;
+  const root = path.resolve(selected.root);
+  if (path.dirname(root) !== path.resolve(cacheRoot)) throw new Error("generation escaped cache");
+  identity(root);
+  return { selected, generation: handle(root, undefined) };
 }
-module.exports = { RECORD, LIMIT, admit, pin };
+
+module.exports = { RECORD, MARKER, LIMIT, admit, pin };

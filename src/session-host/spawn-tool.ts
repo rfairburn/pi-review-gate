@@ -1,5 +1,4 @@
 import {
-  MAX_SESSION_SPAWN_PROMPT_BYTES,
   MAX_SESSION_SPAWN_TITLE_BYTES,
   MAX_SESSION_SPAWN_WORKSPACE_BYTES,
   isValidRenameName,
@@ -31,10 +30,8 @@ export function parseSessionSpawnInput(value: unknown): SessionSpawnInput {
   if (!isValidRenameName(title) || Buffer.byteLength(title, "utf8") > MAX_SESSION_SPAWN_TITLE_BYTES) {
     throw new Error("SessionSpawn title must be nonempty and within the transport safety bound.");
   }
-  if (typeof prompt !== "string" || prompt.length === 0
-    || Buffer.byteLength(prompt, "utf8") > MAX_SESSION_SPAWN_PROMPT_BYTES
-    || prompt.includes("\0")) {
-    throw new Error("SessionSpawn prompt must be nonempty and within the transport safety bound.");
+  if (typeof prompt !== "string" || prompt.length === 0 || prompt.includes("\0")) {
+    throw new Error("SessionSpawn prompt must be a nonempty string without NUL characters.");
   }
   return { workspace, title, prompt };
 }
@@ -60,8 +57,7 @@ export function sessionSpawnToolSchema(titleColumns: number): Record<string, unk
       prompt: {
         type: "string",
         minLength: 1,
-        maxLength: MAX_SESSION_SPAWN_PROMPT_BYTES,
-        description: "Exact initial user prompt sent to the new child. Flag-looking text is data, not a Pi startup option.",
+        description: "Exact initial user prompt sent to the new child. There is no fixed prompt-length limit; the exact text is staged through the host's private payload transport. Flag-looking text is data, not a Pi startup option.",
       },
     },
   };

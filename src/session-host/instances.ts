@@ -15,7 +15,6 @@ import { TerminalSurface } from "./terminal-surface";
 import type { TerminalDiagnosticEvent } from "./terminal-diagnostics";
 import {
 	hasCompleteSessionIdle,
-	MAX_SESSION_SPAWN_PROMPT_BYTES,
 	MAX_SESSION_SPAWN_TITLE_BYTES,
 	isValidNativeSessionId,
 	isValidNativeSessionFile,
@@ -31,7 +30,12 @@ import type {
 	StatusRenameResult,
 	StatusShutdownResult,
 } from "./broker";
-import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "./startup-request";
+import type { StagedSessionHostPayload } from "./payload";
+import {
+	SESSION_HOST_STARTUP_REQUEST_ENV,
+	SESSION_HOST_TITLE_COLUMNS_ENV,
+	stageSessionHostStartupRequest,
+} from "./startup-request";
 
 /**
  * Independent owned-PTY process lifecycle for the optional per-instance
@@ -216,6 +220,8 @@ export interface InstanceStatusBootstrap {
 	readonly token: string;
 	readonly instanceId: string;
 	readonly generation: string;
+	/** Private host-owned startup payload namespace; absent withholds long-prompt delivery. */
+	readonly payloadDir?: string;
 }
 
 export interface InstanceStatusRegistration {
@@ -401,6 +407,12 @@ interface ManagedInstance {
 	currentNativeSessionFile?: string;
 	registration?: InstanceStatusRegistration;
 	registrationReleased: boolean;
+	/**
+	 * Identity-checked ownership of the child's staged startup request. Retained
+	 * until this row's registration settles (confirmed exit or definite
+	 * pre-spawn failure), then discarded before the broker namespace release.
+	 */
+	startupPayload?: StagedSessionHostPayload;
 	/**
 	 * True only once this row's registration release positively returned (or
 	 * there was none to release). Distinct from registrationReleased, which is
@@ -660,9 +672,8 @@ function validateInitialRequest(value: unknown): { title: string; prompt: string
 	const keys = Object.keys(request);
 	if (keys.length !== 2 || !keys.includes("title") || !keys.includes("prompt")
 		|| !isValidRenameName(request.title) || Buffer.byteLength(request.title, "utf8") > MAX_SESSION_SPAWN_TITLE_BYTES
-		|| typeof request.prompt !== "string" || request.prompt.length === 0
-		|| Buffer.byteLength(request.prompt, "utf8") > MAX_SESSION_SPAWN_PROMPT_BYTES || request.prompt.includes("\0")) {
-		throw new Error("session-host: initial request title and prompt must be nonempty and within transport safety bounds");
+		|| typeof request.prompt !== "string" || request.prompt.length === 0 || request.prompt.includes("\0")) {
+		throw new Error("session-host: initial request title must be bounded and its prompt nonempty without NUL characters");
 	}
 	return { title: request.title, prompt: request.prompt };
 }
@@ -1326,6 +1337,7 @@ export class InstanceManager {
 			record: ManagedInstance,
 			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission; initialRequest?: { title: string; prompt: string } },
 		): Promise<void> {
+		let stagedStartup: ReturnType<typeof stageSessionHostStartupRequest> | undefined;
 		try {
 			// 1. Setup admission. Native mode shares the fixed Pi root; legacy
 			// mode is available only through explicit test injection. No tokens
@@ -1395,7 +1407,17 @@ export class InstanceManager {
 				const titleColumns = this.#sidebarTitleColumnsSnapshot();
 				if (titleColumns !== undefined) spawnEnv[SESSION_HOST_TITLE_COLUMNS_ENV] = String(titleColumns);
 				if (options.initialRequest !== undefined) {
-					spawnEnv[SESSION_HOST_STARTUP_REQUEST_ENV] = JSON.stringify(options.initialRequest);
+					const payloadDir = handle.bootstrap.payloadDir;
+					if (typeof payloadDir !== "string" || payloadDir.length === 0) {
+						// No host-owned namespace: fail closed before any child exists
+						// instead of falling back to an inline prompt handoff.
+						throw new Error("session-host: startup payload namespace unavailable");
+					}
+					// The exact JSON text lives only in the registration's private
+					// namespace; the one-shot env carries only its bounded reference.
+					stagedStartup = stageSessionHostStartupRequest(payloadDir, options.initialRequest);
+					record.startupPayload = stagedStartup;
+					spawnEnv[SESSION_HOST_STARTUP_REQUEST_ENV] = JSON.stringify(stagedStartup.descriptor);
 				}
 				spawnEnv[SESSION_HOST_BOOTSTRAP_ENV] = JSON.stringify(handle.bootstrap);
 				pty = this.#ptyFactory({
@@ -1481,6 +1503,7 @@ export class InstanceManager {
 				// including the saved-session reservation (no child ever existed).
 				record.error = publicInstanceError("ptySetup");
 				record.lifecycle = "error";
+				stagedStartup?.discard();
 				this.#releaseRegistration(record);
 				this.#releaseProfile(record);
 				record.savedReservation = undefined;
@@ -1496,6 +1519,7 @@ export class InstanceManager {
 			// saved-session reservation (if any) is released with it.
 			record.error = publicInstanceError("launchPreparation");
 			record.lifecycle = "error";
+			if (record.pty === undefined) stagedStartup?.discard();
 			this.#releaseRegistration(record);
 			this.#releaseProfile(record);
 			record.savedReservation = undefined;
@@ -1856,6 +1880,12 @@ export class InstanceManager {
 	}
 
 	#releaseRegistration(record: ManagedInstance): void {
+		// The child may have exited before consuming its initial request. Ownership
+		// is discarded through the exact staged inode before the broker removes
+		// its empty namespace; a foreign replacement is preserved.
+		const startupPayload = record.startupPayload;
+		record.startupPayload = undefined;
+		startupPayload?.discard();
 		if (record.registrationReleased) {
 			return;
 		}

@@ -20,14 +20,16 @@
  * source state, not a cached aggregate. Status frames
  * still carry no tool arguments, prompts, or transcripts. A hosted child may
  * explicitly submit one bounded authenticated SessionSpawn command containing
- * its supplied workspace, title, and prompt; the host replies only with a
- * bounded launch outcome.
+ * its supplied workspace/title and a reference to its private staged prompt;
+ * the host replies only with a bounded launch outcome.
  *
  * Privacy contract: status frames carry no tool arguments, question text,
  * transcripts, or credentials. Owned-work counts are opaque numbers only.
- * Spawn commands intentionally carry the supplied workspace/title/prompt, but
- * the prompt is not copied into status snapshots or status/sidebar diagnostics.
- * The requested title appears through ordinary native conversation-name and
+ * Spawn commands carry the supplied workspace/title plus only a bounded
+ * private-payload reference (basename, exact byte size, SHA-256 digest); the
+ * prompt text itself travels through the host-owned payload namespace and is
+ * never copied into status snapshots or status/sidebar diagnostics. The
+ * requested title appears through ordinary native conversation-name and
  * sidebar fields; the prompt is delivered to the new child's conversation.
  * The bootstrap token
  * appears in the hello and authenticated command frames only. Every
@@ -56,7 +58,10 @@ export const MAX_NATIVE_SESSION_FILE_BYTES = 4096;
 /** SessionSpawn fields have independent transport bounds; sidebar width is not a data limit. */
 export const MAX_SESSION_SPAWN_WORKSPACE_BYTES = 4096;
 export const MAX_SESSION_SPAWN_TITLE_BYTES = MAX_RENAME_NAME_BYTES;
-export const MAX_SESSION_SPAWN_PROMPT_BYTES = 8192;
+/** Private staged-payload basenames are bounded, strict, and single-segment. */
+export const MAX_SESSION_PAYLOAD_NAME_BYTES = 64;
+/** Canonical absolute host-owned payload namespace path bound. */
+export const MAX_SESSION_HOST_PAYLOAD_DIR_BYTES = 2048;
 
 /** Complete observed inactivity; unknown or absent work/input state can never authorize an idle-only stop. */
 export function hasCompleteSessionIdle(state: {
@@ -91,6 +96,13 @@ export interface SessionHostBootstrap {
   instanceId: string;
   /** Host generation marker (UUID-like, <=128 chars). */
   generation: string;
+  /**
+   * Private host-owned directory for automatically staged payload files.
+   * Absent on an older/foreign bootstrap: the reporter then withholds the
+   * long-prompt SessionSpawn capability instead of falling back to inline
+   * prompt transport.
+   */
+  payloadDir?: string;
 }
 
 /** First wire frame after connecting: authenticates the reporter to the host. */
@@ -268,6 +280,32 @@ export interface SessionHostShutdownAck {
   reason: "none" | "stale-session" | "unavailable" | "shutdown-failed" | "already-requested" | "not-idle";
 }
 
+/** Strict reference to one private staged payload file; never the payload text. */
+export interface SessionHostPayloadRef {
+  readonly name: string;
+  readonly size: number;
+  readonly sha256: string;
+}
+
+/**
+ * Admits only the helper's strict single-segment payload basename shape. The
+ * name contains no separators, traversal segment, or arbitrary extension, so
+ * a confined join can never escape the host-owned namespace.
+ */
+export function isValidSessionHostPayloadName(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length <= MAX_SESSION_PAYLOAD_NAME_BYTES
+    && /^p-[0-9a-f]{32}\.json$/.test(value);
+}
+
+/** Validates a bounded private-payload reference without reading any file. */
+export function parseSessionHostPayloadRef(value: unknown): SessionHostPayloadRef | undefined {
+  if (!isRecord(value) || !isValidSessionHostPayloadName(value.name)) return undefined;
+  if (!Number.isSafeInteger(value.size) || (value.size as number) < 1) return undefined;
+  if (typeof value.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.sha256)) return undefined;
+  return { name: value.name, size: value.size as number, sha256: value.sha256 };
+}
+
 /** Explicit child request; the token is checked by the broker and never passed to host/UI callbacks. */
 export interface SessionHostSpawnRequest {
   version: 1;
@@ -279,8 +317,8 @@ export interface SessionHostSpawnRequest {
   workspace: string;
   /** Complete persisted native title input; bounded only for transport safety, never clipped to sidebar width. */
   title: string;
-  /** Exact initial user prompt; bounded only for transport safety. */
-  prompt: string;
+  /** Private staged prompt reference; the exact text is read and verified by the broker. */
+  payload: SessionHostPayloadRef;
 }
 
 /** Host acknowledgement is about launch, never model completion or prompt processing. */
@@ -400,18 +438,29 @@ function parseOwnedCount(value: unknown): number | null {
  * Validates a parsed bootstrap value. Returns undefined (never throws) when
  * any field is missing, unbounded, or malformed.
  */
+/** Admits a canonical absolute private payload namespace, or absence. */
+function isValidPayloadDirectory(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && !value.includes("\0")
+    && Buffer.byteLength(value, "utf8") <= MAX_SESSION_HOST_PAYLOAD_DIR_BYTES
+    && isAbsolute(value);
+}
+
 export function parseBootstrap(value: unknown): SessionHostBootstrap | undefined {
   if (!isRecord(value) || value.version !== PROTOCOL_VERSION) return undefined;
   if (!isValidSocketPath(value.socketPath)) return undefined;
   if (!isValidToken(value.token)) return undefined;
   if (!isValidId(value.instanceId)) return undefined;
   if (!isValidId(value.generation)) return undefined;
+  if (value.payloadDir !== undefined && !isValidPayloadDirectory(value.payloadDir)) return undefined;
   return {
     version: 1,
     socketPath: value.socketPath,
     token: value.token,
     instanceId: value.instanceId,
     generation: value.generation,
+    ...(value.payloadDir === undefined ? {} : { payloadDir: value.payloadDir }),
   };
 }
 
@@ -680,9 +729,8 @@ export function parseSpawnRequest(value: unknown): SessionHostSpawnRequest | und
     || value.workspace.includes("\0")) return undefined;
   if (!isValidRenameName(value.title)
     || Buffer.byteLength(value.title, "utf8") > MAX_SESSION_SPAWN_TITLE_BYTES) return undefined;
-  if (typeof value.prompt !== "string" || value.prompt.length === 0
-    || Buffer.byteLength(value.prompt, "utf8") > MAX_SESSION_SPAWN_PROMPT_BYTES
-    || value.prompt.includes("\0")) return undefined;
+  const payload = parseSessionHostPayloadRef(value.payload);
+  if (!payload) return undefined;
   const parsed: SessionHostSpawnRequest = {
     version: 1,
     type: "spawn_request",
@@ -692,12 +740,10 @@ export function parseSpawnRequest(value: unknown): SessionHostSpawnRequest | und
     requestId: value.requestId,
     workspace: value.workspace,
     title: value.title,
-    prompt: value.prompt,
+    payload,
   };
-  // Individual fields are independently bounded, but JSON escaping (for
-  // example a prompt made of control characters) can expand them together.
-  // Reject any request that cannot fit the shared raw-frame limit before the
-  // reporter attempts a write or the broker receives user data.
+  // The prompt text is out-of-band; the bounded reference and title must still
+  // fit the shared raw-frame limit before the reporter attempts a write.
   if (Buffer.byteLength(`${JSON.stringify(parsed)}\n`, "utf8") > MAX_STATUS_FRAME_BYTES) return undefined;
   return parsed;
 }

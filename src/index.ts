@@ -859,25 +859,55 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
 
     // The hosted child's one-shot initial request is dispatched only after this
     // session's checkpoint scope, restored state, and deferred-tool boundary are
-    // initialized. Record it here because Pi marks sendUserMessage as extension
-    // input, which intentionally bypasses the ordinary user-input observer.
-    const startupRequest = consumeSessionHostStartupRequest();
+    // initialized. Dispatch and record it here because Pi marks sendUserMessage
+    // as extension input, which intentionally bypasses the ordinary user-input
+    // observer.
+    const startup = consumeSessionHostStartupRequest();
     const nativeApi = typeof pi === "object" && pi !== null ? pi as Record<string, unknown> : undefined;
     const sendUserMessage = nativeApi?.sendUserMessage;
-    if (startupRequest) {
+    if (startup.status === "failed") {
+      // Truthful, bounded, actionable child notice: a missing or tampered
+      // private payload never becomes a false success claim or an inline
+      // fallback. Paths, digests, and prompt text are never disclosed.
+      await sendNoticeUnlessItThrows(
+        context ?? pi,
+        startup.reason === "unauthorized"
+          ? "review gate: the hosted child was not authorized to receive its initial prompt, so no prompt was sent. Check the session-host launch before resending it."
+          : startup.reason === "request-invalid"
+            ? "review gate: the hosted child's initial prompt request was malformed or failed exact verification, so no prompt was sent. Resend the prompt from the parent session if needed."
+            : "review gate: the hosted child's initial prompt payload was unavailable or failed exact verification, so no prompt was sent. Resend the prompt from the parent session if needed.",
+      );
+    } else if (startup.status === "ready") {
+      const startupRequest = startup.request;
       try {
         const setSessionName = nativeApi?.setSessionName;
         if (typeof setSessionName === "function") setSessionName.call(pi, startupRequest.title);
       } catch {
         // Pi's native --name option remains in place if the public setter fails.
       }
-      rememberUserRequestVerbatim(state, startupRequest.prompt);
-      await sessionPersistence.persist();
-      if (typeof sendUserMessage === "function") {
+      if (typeof sendUserMessage !== "function") {
+        await sendNoticeUnlessItThrows(
+          context ?? pi,
+          "review gate: Pi exposes no sendUserMessage API, so the hosted child's initial prompt was not dispatched. Resend the prompt from the parent session if needed.",
+        );
+      } else {
+        let dispatched = false;
         try {
-          sendUserMessage.call(pi, startupRequest.prompt, { expandPromptTemplates: false });
+          await sendUserMessage.call(pi, startupRequest.prompt, { expandPromptTemplates: false });
+          dispatched = true;
         } catch {
-          // Startup stays owned and reportable even if Pi rejects its initial turn.
+          // Dispatch may have failed before or after Pi accepted anything. Do
+          // not claim delivery; the exact prompt was already staged/verified.
+          await sendNoticeUnlessItThrows(
+            context ?? pi,
+            "review gate: the hosted child's initial prompt could not be dispatched to Pi; delivery is unconfirmed. Resend the prompt from the parent session if needed.",
+          );
+        }
+        if (dispatched) {
+          // Record only a dispatch Pi accepted; a rejected send must not enter
+          // review request history as if the child had received it.
+          rememberUserRequestVerbatim(state, startupRequest.prompt);
+          await sessionPersistence.persist();
         }
       }
     }

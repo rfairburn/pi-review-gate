@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import net from "node:net";
 import { randomBytes, randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -25,8 +25,12 @@ import activate, {
 } from "../src/session-host/reporter";
 import { getSessionHostSpawnCapability, SESSION_HOST_SPAWN_CAPABILITY_KEY } from "../src/session-host/spawn-capability";
 import {
+  readSessionHostPayload,
+} from "../src/session-host/payload";
+import {
   SESSION_HOST_STARTUP_REQUEST_ENV,
   SESSION_HOST_TITLE_COLUMNS_ENV,
+  stageSessionHostStartupRequest,
   __test as startupRequestTest,
 } from "../src/session-host/startup-request";
 import {
@@ -298,8 +302,24 @@ function makeBootstrap(socketPath: string, overrides: Record<string, unknown> = 
     token: randomBytes(32).toString("hex"),
     instanceId: randomUUID(),
     generation: randomUUID(),
+    payloadDir: makeTestPayloadDir(),
     ...overrides,
   };
+}
+
+let payloadRoot: string | undefined;
+
+/** One fresh private namespace beneath this file's sole disposable test root. */
+function makeTestPayloadDir(): string {
+  if (payloadRoot === undefined) payloadRoot = mkdtempSync(join(tmpdir(), "prg-reporter-payload-"));
+  return mkdtempSync(join(payloadRoot, "pl-"));
+}
+
+function ensureTestPayloadDir(bootstrap: Record<string, unknown>): string {
+  if (typeof bootstrap.payloadDir === "string") return bootstrap.payloadDir;
+  const directory = makeTestPayloadDir();
+  bootstrap.payloadDir = directory;
+  return directory;
 }
 
 /** Validator-admitted address for memory sockets; never opened as a real pipe. */
@@ -381,6 +401,7 @@ beforeEach(() => {
   ownedActivityTest.resetOwnedActivityForTests();
   delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_SPAWN_CAPABILITY_KEY];
   startupRequestTest.clearProcessMetadata();
+  reporterTest.clearOutstandingSpawnPayloads();
 });
 
 afterEach(async () => {
@@ -396,8 +417,13 @@ afterEach(async () => {
   ownedActivityTest.resetOwnedActivityForTests();
   delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_SPAWN_CAPABILITY_KEY];
   startupRequestTest.clearProcessMetadata();
+  reporterTest.clearOutstandingSpawnPayloads();
   for (const server of servers.splice(0)) {
     await server.close().catch(() => undefined);
+  }
+  if (payloadRoot !== undefined) {
+    rmSync(payloadRoot, { recursive: true, force: true });
+    payloadRoot = undefined;
   }
 });
 
@@ -442,6 +468,11 @@ describe("session-host protocol", () => {
     assert.equal(parseBootstrap({ ...bootstrap, instanceId: "not-a-uuid-like id" }), undefined);
     assert.equal(parseBootstrap({ ...bootstrap, instanceId: `x${"y".repeat(128)}` }), undefined);
     assert.equal(parseBootstrap({ ...bootstrap, generation: "" }), undefined);
+    assert.equal(parseBootstrap({ ...bootstrap, payloadDir: "relative/payload" }), undefined,
+      "a non-absolute payload namespace is rejected");
+    assert.equal(parseBootstrap({ ...bootstrap, payloadDir: "/tmp/\0payload" }), undefined,
+      "NUL is never admitted in the payload namespace");
+    assert.ok(parseBootstrap({ ...bootstrap, payloadDir: undefined }), "absence is admitted for status-only legacy bootstraps");
   });
 
   it("parses status frames with strictly bounded fields", () => {
@@ -966,7 +997,11 @@ describe("session-host reporter status frames", () => {
     process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(bootstrap);
     process.env[SESSION_HOST_TITLE_COLUMNS_ENV] = String(options.titleColumns ?? 32);
     if (options.startupRequest !== undefined) {
-      process.env[SESSION_HOST_STARTUP_REQUEST_ENV] = JSON.stringify(options.startupRequest);
+      const payloadDir = ensureTestPayloadDir(bootstrap);
+      // The one-shot env carries only the private payload reference; the exact
+      // JSON request lives in the host-owned namespace.
+      const staged = stageSessionHostStartupRequest(payloadDir, options.startupRequest);
+      process.env[SESSION_HOST_STARTUP_REQUEST_ENV] = JSON.stringify(staged.descriptor);
     }
     const testPi = createPi();
     if (options.onStartupApi) {
@@ -994,8 +1029,16 @@ describe("session-host reporter status frames", () => {
     const input: SessionSpawnInput = {
       workspace: "/existing exact workspace",
       title: "A title beyond the sidebar recommendation ".repeat(7),
-      prompt: "--session is prompt content, not a native option\nPreserve this exactly.\n",
+      prompt: [
+        "BEGIN reporter long prompt",
+        "--session is prompt content, not a native option",
+        "Multibyte 日本語 and quotes \"exact\".",
+        "MIDDLE".repeat(1_400),
+        "END reporter long prompt",
+        "",
+      ].join("\n"),
     };
+    assert.ok(Buffer.byteLength(input.prompt, "utf8") > 8192);
     const pending = capability.spawn(input);
     const request = await server.waitForFrame((frame) => frame.message.type === "spawn_request");
     assert.equal(request.message.instanceId, bootstrap.instanceId);
@@ -1003,7 +1046,11 @@ describe("session-host reporter status frames", () => {
     assert.equal(request.message.token, bootstrap.token, "only the authenticated local protocol carries the capability token");
     assert.equal(request.message.workspace, input.workspace);
     assert.equal(request.message.title, input.title);
-    assert.equal(request.message.prompt, input.prompt);
+    assert.equal(Object.hasOwn(request.message, "prompt"), false, "the prompt text never enters the bounded wire frame");
+    const payload = request.message.payload as { name: string; size: number; sha256: string };
+    assert.match(payload.name, /^p-[0-9a-f]{32}\.json$/);
+    const stagedText = await readSessionHostPayload(bootstrap.payloadDir as string, payload);
+    assert.equal(JSON.parse(stagedText), input.prompt, "the wire reference retrieves the exact staged prompt");
     assert.equal(server.frames.filter((frame) => frame.message.type === "spawn_request").length, 1);
     assert.equal(statusFrames(server).some((frame) => JSON.stringify(frame.message).includes(input.prompt)), false,
       "the initial prompt never enters status frames");
@@ -1019,6 +1066,96 @@ describe("session-host reporter status frames", () => {
     assert.equal(await pending, "started");
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
   });
+
+  it("discards its exact staged payload on a definite host failure acknowledgement", async () => {
+    const server = await startTestServer();
+    const { testPi, bootstrap } = await startSession({ server });
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability);
+    const pending = capability.spawn({ workspace: "/existing", title: "Child", prompt: "Rejected prompt." });
+    const request = await server.waitForFrame((frame) => frame.message.type === "spawn_request");
+    const payload = request.message.payload as { name: string };
+    const payloadPath = join(bootstrap.payloadDir as string, payload.name);
+    assert.ok(lstatSync(payloadPath).isFile(), "the reporter staged the exact private payload");
+    server.sendToClients(encodeFrame({
+      version: 1,
+      type: "spawn_result",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      requestId: request.message.requestId,
+      outcome: "failed",
+    } as never));
+    assert.equal(await pending, "failed");
+    assert.equal(lstatSync(payloadPath, { throwIfNoEntry: false }), undefined,
+      "a definite failure means no host read/child, so the reporter discards its exact inode");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+
+  it("retains unknown-send payload ownership across reload and discards it only on terminal shutdown", async () => {
+    const server = await startTestServer();
+    const { ctx, bootstrap } = await startSession({ server, reporterOptions: { spawnTimeoutMs: 20 } });
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability);
+    const pending = capability.spawn({ workspace: "/existing", title: "Child", prompt: "Uncertain send prompt." });
+    const request = await server.waitForFrame((frame) => frame.message.type === "spawn_request");
+    const payload = request.message.payload as { name: string };
+    const payloadDir = bootstrap.payloadDir as string;
+    const payloadPath = join(payloadDir, payload.name);
+    assert.ok(lstatSync(payloadPath).isFile());
+    assert.equal(await pending, "unknown");
+    assert.ok(lstatSync(payloadPath).isFile(), "unknown settlement retains inode-checked ownership");
+
+    const reloaded = createPi();
+    await activate(reloaded.pi);
+    await reloaded.trigger("session_start", { type: "session_start", reason: "reload" }, ctx);
+    assert.ok(lstatSync(payloadPath).isFile(), "ownership survives a reporter reload without retrying");
+    assert.equal(server.frames.filter((frame) => frame.message.type === "spawn_request").length, 1,
+      "the uncertain request is never resent");
+
+    await reloaded.trigger("session_shutdown", { type: "session_shutdown" });
+    assert.equal(lstatSync(payloadPath, { throwIfNoEntry: false }), undefined,
+      "terminal shutdown discards the intact owned payload");
+    assert.deepEqual(readdirSync(payloadDir), [], "the host-owned namespace is left empty");
+  });
+
+  it("terminal unknown-send cleanup preserves a foreign replacement", async () => {
+    const server = await startTestServer();
+    const { ctx, bootstrap } = await startSession({ server, reporterOptions: { spawnTimeoutMs: 20 } });
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability);
+    const pending = capability.spawn({ workspace: "/existing", title: "Child", prompt: "Replace me after send." });
+    const request = await server.waitForFrame((frame) => frame.message.type === "spawn_request");
+    const payload = request.message.payload as { name: string };
+    const payloadPath = join(bootstrap.payloadDir as string, payload.name);
+    assert.equal(await pending, "unknown");
+    unlinkSync(payloadPath);
+    writeFileSync(payloadPath, "foreign replacement", { mode: 0o600 });
+
+    const reloaded = createPi();
+    await activate(reloaded.pi);
+    await reloaded.trigger("session_start", { type: "session_start", reason: "reload" }, ctx);
+    await reloaded.trigger("session_shutdown", { type: "session_shutdown" });
+    assert.equal(readFileSync(payloadPath, "utf8"), "foreign replacement",
+      "identity-checked cleanup never deletes a foreign replacement");
+  });
+
+  it("withholds SessionSpawn capability when the bootstrap has no private payload namespace", async () => {
+    const server = await startTestServer();
+    const bootstrap = makeBootstrap(server.socketPath);
+    delete bootstrap.payloadDir;
+    const { testPi } = await startSession({ server, bootstrap });
+    assert.ok(parseBootstrap(bootstrap), "a status-only legacy bootstrap remains valid");
+    assert.equal(getSessionHostSpawnCapability(), undefined,
+      "no long-prompt capability is published and no inline prompt fallback exists");
+    // Status reporting itself remains available for a legacy status-only bootstrap.
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
 
   it("does not dispatch the initial request from the reporter's early session_start hook", async () => {
     const server = await startTestServer();
@@ -4124,6 +4261,7 @@ describe("session-host bootstrap preload", () => {
         { relative: "src/session-host/owned-activity.js", source: join(__dirname, "..", "src/session-host/owned-activity.js") },
         { relative: "src/session-host/spawn-capability.js", source: join(__dirname, "..", "src/session-host/spawn-capability.js") },
         { relative: "src/session-host/startup-request.js", source: join(__dirname, "..", "src/session-host/startup-request.js") },
+        { relative: "src/session-host/payload.js", source: join(__dirname, "..", "src/session-host/payload.js") },
       ]);
       const spacedPreload = join(root, "src/session-host/bootstrap-preload.js");
       assert.ok(spacedPreload.includes(" "), "fixture preload path contains spaces");

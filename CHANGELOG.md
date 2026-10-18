@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.181]
+
+### Fixed
+
+- `SessionSpawn` no longer rejects thorough initial handoffs at a fixed 8,192-character
+  ceiling (#447). Exact prompt text is transferred automatically through owned private
+  temporary payloads, avoiding both bounded control-frame and native startup-environment
+  limits without requiring manual shortening or file loading. Payload validation refuses
+  missing, altered, or unsafe data instead of silently delivering partial context.
+  There is no new prompt-length setting; empty/NUL rejection, title/workspace bounds,
+  authorization, independent background launches, and launch-only success semantics
+  remain unchanged. Uncertain launches are never automatically retried.
+
 ## [0.1.0-dev.180]
 
 ### Fixed

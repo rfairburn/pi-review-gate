@@ -595,6 +595,8 @@ toggle chord is reserved there, including its repeat and release events. The def
 use the Host shortcuts editor or the legacy `--sidebar-key f8` override (or another
 supported key) if you need to keep that native chord.
 
+### Sidebar status and activity
+
 The sidebar is a bounded top-level summary: the observed native conversation name,
 busy/idle/unknown state, pending-input presence only when observed, and at most a couple
 of generic activity lines, with reporter-backed numeric background activity-task/shell
@@ -609,29 +611,63 @@ recovery artifacts reads zero (or unknown when the stop itself is unproven). The
 separate conservative **ownership** state still gates an idle-only stop or removal; it
 is deliberately not displayed. Missing, invalid, or pre-intent observations stay
 unknown, never inferred zero and never silently substituted with an ownership count.
-Loaded sessions automatically re-establish activity from fresh, complete observations
-of their exact owning sources at startup/restore and safe event-driven resynchronization
-points. Deliberately stale or unknown activity can recover to the actual idle/zero or
-running/nonzero state without a prompt, new task, or manual refresh. A Ready label is
-not proof of idleness: unavailable or incomplete source observations remain unknown,
-and stale source/session observations cannot replace a current incarnation's state.
-This refresh reconstructs ephemeral activity only; it does not clear cleanup ownership,
-delete recovery records, resume work, or weaken stop/remove safeguards. It adds no
-periodic polling.
-After a same-process extension reload, each existing authenticated `session_start` may
-make one bounded read-only pass over its snapshot of eligible retired execution
-controllers whose exact association inventories were sealed by completed detaches. Each
-eligible exact owner is read at most once in that pass; an in-flight read is not
-duplicated, and a retired source already proven complete and empty is skipped. Failed
+
+Loaded sessions establish activity from fresh, complete observations of their exact
+owning sources at startup/restore and safe event-driven resynchronization points. A
+freshly loaded saved conversation initializes a new owning runtime; it is never attached
+to the former process. When that initialization admits or resumes no work, the first
+successful loaded/Ready presentation reports known idle agent status and zero
+background-task and background-shell activity — at that first Ready, not eventually.
+Counts, busy state, and unknown or incomplete telemetry recorded by the same
+conversation's former runtime are historical records only: they are never replayed as
+the new runtime's activity and never substitute for current observations. Work that
+initialization actually starts or resumes is counted from its own current lifecycle
+observations. Loading a conversation still does not attach to or adopt a live process,
+and this adds no attachment support.
+
+Stale or unknown current activity recovers independently through a canonical live-source
+census. The host discards the affected stale ephemeral telemetry understanding and asks
+the actual owning client for its complete authoritative current state from that client's
+own live sources, rather than re-reading a cached aggregate or waiting for an unrelated
+prompt, task, or event. A healthy owning client therefore re-establishes the actual
+idle/zero or running/nonzero value, and repeated later unknown episodes recover the same
+way without a new prompt, task, manual refresh, or client restart. That census is
+separate from historical cleanup and recovery uncertainty: a current zero does not
+resolve an old owner's retained cleanup ownership, and older uncertainty cannot poison a
+current live zero. An explicit source refresh re-observes every source even when some are
+already cached known. Recovery remains event-driven over one bounded authenticated
+host-to-client request per attempt, fenced to the current
+session/generation/request/sequence, with no periodic polling or global polling loop.
+A stalled source-read lease expires without stopping work; a late reply cannot replace
+newer valid observations or prevent a subsequent fresh read.
+Genuinely unreachable, incomplete, stale, or unavailable live evidence stays unknown:
+it is never coerced to zero, no lost owner's retained records are erased, and no client
+restart or cache purge produces a status. This does not claim to reconstruct arbitrary
+destroyed source state.
+
+A Ready label is not proof of idleness: unavailable or incomplete source observations
+remain unknown, and stale source/session observations cannot replace a current
+incarnation's state. This refresh reconstructs ephemeral activity only; it does not
+clear cleanup ownership, delete recovery records, resume work, or weaken stop/remove
+safeguards.
+
+Separately from that live-source census, after a same-process extension reload each
+existing authenticated `session_start` may make one bounded read-only pass over its
+snapshot of eligible retired execution controllers whose exact association inventories
+were sealed by completed detaches. Each eligible exact owner is read at most once in
+that pass; an in-flight read is not duplicated, and a retired source already proven
+complete and empty is skipped. Failed
 or fresh incomplete/unavailable reads leave the affected channel unknown and may be
 retried on a later explicit `session_start`. A stale/discarded read leaves the exact
 incarnation's existing channels and tokens unchanged and may be retried on that later
 event; a source-list change discards that pass's snapshot and results without restarting
 it. Recovery is event-driven only, with no periodic polling or transport
-heartbeat trigger. Any later admission or local state/token mutation invalidates that
-owner's seal. Only validated, identity-matched manifests, task archives, and
-operation-owner evidence can resolve that old incarnation; known stopped work may clear
-activity intent while its recovery/cleanup token remains owned. The pass runs before
+heartbeat trigger. Later admissions or relevant local-state mutations invalidate the
+corresponding proof. A retired incarnation's intent census covers work actually admitted
+or resumed there, independently of its historical cleanup inventory. Historical-only
+references may keep ownership unknown but cannot poison its proven current zero. Only
+validated, identity-matched evidence resolves retained local work; known stopped work may
+clear activity intent while its recovery/cleanup token remains owned. The pass runs before
 ordinary association restoration and does not restore/adopt tasks, write state, send
 task/user notifications, or start/resume work. A missing, corrupt, unmatched, ambiguous, stale, or unavailable
 reference; uncertain operation/liveness; lost runtime/force-merge owner; or post-detach

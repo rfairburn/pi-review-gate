@@ -62,6 +62,7 @@ import {
 } from "./startup-request";
 import {
   HOST_BOOTSTRAP_ENV,
+  ACTIVITY_CENSUS_CAPABILITY,
   MAX_NATIVE_SESSION_NAME_LENGTH,
   MAX_STATUS_FRAME_BYTES,
   decodeFrame,
@@ -74,6 +75,8 @@ import {
   parseSpawnRequest,
   sanitizeActivityLine,
   type SessionHostBootstrap,
+  type SessionHostActivityRequest,
+  type SessionHostActivityResult,
   type SessionHostHello,
   type SessionHostMessage,
   type SessionHostNativeSession,
@@ -102,18 +105,112 @@ const PENDING_QUESTIONS_WIDGET_KEY = "review-gate-pending-questions";
  */
 export const SESSION_HOST_STICKY_STATE_KEY = Symbol.for("pi-review-gate.session-host.state.v1");
 
+/**
+ * Process-local coordination between the authenticated reporter and the review
+ * gate's own session_start restore. The reporter is loaded first, so its hook
+ * resolves before the gate starts restoring. The reporter therefore defers its
+ * FIRST loaded/Ready status until the gate reports that this exact session's
+ * restore boundary settled. A fresh runtime never replays a prior busy/unknown
+ * history; a restored conversation with no current admitted/resumed work then
+ * reaches its first Ready state as actual idle/zero. Genuine source
+ * unreadability still publishes unknown, never a fabricated zero.
+ */
+export const SESSION_HOST_RESTORE_STATE_KEY = Symbol.for(
+  "pi-review-gate.session-host.restore-coordination.v1",
+);
+
+interface RestoreCoordinationState {
+  epoch: number;
+  phase: "idle" | "in-progress" | "complete";
+  sessionId: string | undefined;
+  token: object | undefined;
+  listeners: Set<() => void>;
+}
+
+export interface SessionHostRestoreCompletion {
+  readonly epoch: number;
+  readonly token: object;
+}
+
+function restoreCoordinationState(create: boolean): RestoreCoordinationState | undefined {
+  try {
+    const storage = globalThis as Record<PropertyKey, unknown>;
+    const existing = storage[SESSION_HOST_RESTORE_STATE_KEY];
+    if (existing !== undefined) {
+      if (typeof existing !== "object" || existing === null) return undefined;
+      const candidate = existing as Partial<RestoreCoordinationState>;
+      if (typeof candidate.epoch !== "number" || !Number.isSafeInteger(candidate.epoch)
+        || (candidate.phase !== "idle" && candidate.phase !== "in-progress" && candidate.phase !== "complete")
+        || !(candidate.listeners instanceof Set)) return undefined;
+      return candidate as RestoreCoordinationState;
+    }
+    if (!create) return undefined;
+    const state: RestoreCoordinationState = {
+      epoch: 0,
+      phase: "idle",
+      sessionId: undefined,
+      token: undefined,
+      listeners: new Set(),
+    };
+    storage[SESSION_HOST_RESTORE_STATE_KEY] = state;
+    return state;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Begin one gate restore for an exact native session, superseding any stale in-flight marker. */
+export function beginSessionHostRestore(sessionId?: string): SessionHostRestoreCompletion {
+  const state = restoreCoordinationState(true);
+  if (!state) return { epoch: 0, token: Object.freeze({}) };
+  state.epoch += 1;
+  state.phase = "in-progress";
+  state.sessionId = sessionId;
+  const token = Object.freeze({ restoreEpoch: state.epoch });
+  state.token = token;
+  return { epoch: state.epoch, token };
+}
+
+/** Mark exactly that restore complete; a superseded token is ignored. */
+export function completeSessionHostRestore(completion: SessionHostRestoreCompletion): void {
+  const state = restoreCoordinationState(false);
+  if (!state || state.phase !== "in-progress" || state.token !== completion.token) return;
+  state.phase = "complete";
+  state.token = undefined;
+  for (const listener of [...state.listeners]) {
+    try {
+      listener();
+    } catch {
+      // A reader failure must never change the gate's native startup path.
+    }
+  }
+}
+
+function subscribeSessionHostRestore(listener: () => void): () => void {
+  const state = restoreCoordinationState(true);
+  if (!state) return () => undefined;
+  state.listeners.add(listener);
+  return () => {
+    state.listeners.delete(listener);
+  };
+}
+
 const EXIT_HANDLER_FLAG = Symbol.for("pi-review-gate.session-host.exit-handler");
 
 const DEFAULT_RECONNECT_DELAY_MS = 1_000;
 const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
 const CONNECT_TIMEOUT_MS = 3_000;
 const DEFAULT_SESSION_SPAWN_TIMEOUT_MS = 65_000;
+/** Single bounded fallback if a gate restore never reaches its completion boundary. */
+const STARTUP_RESTORE_DEADLINE_MS = 15_000;
 /** Encoded rename/shutdown replies waiting outside Node's bounded writable buffer. */
 const MAX_QUEUED_RENAME_ACKS = 4;
 const MAX_CONCURRENT_SHUTDOWN_REQUESTS = 1;
 const MAX_RECENT_SHUTDOWN_REQUEST_IDS = 64;
 const MAX_CONCURRENT_SPAWN_REQUESTS = 2;
 const MAX_RECENT_SPAWN_REQUEST_IDS = 64;
+const MAX_CONCURRENT_ACTIVITY_REQUESTS = 2;
+const MAX_RECENT_ACTIVITY_REQUEST_IDS = 64;
 
 export interface SessionHostReporterOptions {
   /** Test seam: reconnect delay. Production default is 1000ms. */
@@ -424,8 +521,11 @@ export default activate;
 module.exports = activate;
 Object.assign(module.exports as Record<string, unknown>, {
   activate,
+  beginSessionHostRestore,
+  completeSessionHostRestore,
   primeReporterBootstrap,
   SESSION_HOST_STICKY_STATE_KEY,
+  SESSION_HOST_RESTORE_STATE_KEY,
   __test,
 });
 
@@ -506,9 +606,26 @@ function createReporter(
   let shutdownInProgress = false;
   let currentContext: unknown;
   let lastSnapshot: SessionHostStatus | undefined;
+  /**
+   * True from installSession until the first authoritative loaded status is
+   * ready: the owning-source refresh has settled AND this exact session's gate
+   * restore boundary completed (or the single fallback deadline fired). No
+   * status frame is pushed before then, so a fresh runtime cannot show a stale
+   * Ready/unknown snapshot from before restoration.
+   */
+  let startupStatusPending = false;
+  /** True while the final post-restore authoritative read is in flight. */
+  let startupFinishing = false;
+  let startupWaiters: Array<() => void> = [];
+  let startupDeadline: NodeJS.Timeout | undefined;
+  let unsubscribeRestore: (() => void) | undefined;
+  let startupRestoreBaseline = 0;
+  let startupRestoreSessionId: string | undefined;
 
   let socket: net.Socket | undefined;
   let connecting = false;
+  /** False until this reporter incarnation's first successful connection. */
+  let connectedOnce = false;
   let drainPending = false;
   /** True when lastSnapshot is already queued in the socket buffer. */
   let snapshotQueued = false;
@@ -519,6 +636,8 @@ function createReporter(
   const pendingRenameRequestIds = new Set<string>();
   const recentRenameRequestIds = new Set<string>();
   const pendingShutdownRequestIds = new Set<string>();
+  const pendingActivityRequestIds = new Set<string>();
+  const recentActivityRequestIds = new Set<string>();
   const pendingSpawnCalls = new Map<string, PendingSpawnCall>();
   const recentSpawnRequestIds = new Set<string>();
   const recentShutdownRequests = new Map<string, {
@@ -920,12 +1039,8 @@ function createReporter(
     candidate.on("connect", () => {
       if (generation !== sessionGeneration || !active || candidate !== socket) return; // Stale callback.
       connecting = false;
-      // A safe reconnect re-establishes transport: request ONE coalesced
-      // authoritative activity refresh so a diverged or unknown loaded status
-      // recovers from each owning source's own state, instead of republishing
-      // only this reporter's possibly stale local snapshot. The pass is a no-op
-      // while every source is already complete and known.
-      void refreshOwnedActivityIntent();
+      const firstConnection = !connectedOnce;
+      connectedOnce = true;
       // The retry budget is NOT reset here: an accept-then-close broker must
       // not mint fresh attempts forever. installSession resets it instead.
       candidate.setTimeout(0);
@@ -935,10 +1050,39 @@ function createReporter(
         instanceId: bootstrap.instanceId,
         generation: bootstrap.generation,
         token: bootstrap.token,
+        capabilities: [ACTIVITY_CENSUS_CAPABILITY],
       };
-      if (tryWriteMessage(hello) && lastSnapshot && !drainPending) {
+      if (!tryWriteMessage(hello)) return;
+      if (firstConnection && lastSnapshot && !drainPending) {
+        // The first connection may be established after the authoritative
+        // first status was built while still connecting; deliver that exact
+        // snapshot once. A reconnect never replays it (the registration
+        // retains its sequence and would reject an unchanged duplicate).
         snapshotQueued = tryWriteMessage(lastSnapshot);
       }
+      // A safe reconnect never replays the pre-disconnect snapshot: the host's
+      // registration already retains its last sequence, and an unchanged replay
+      // would be rejected as non-monotonic. Instead, re-run the coalesced
+      // authoritative owning-source refresh and publish a genuinely fresh
+      // snapshot (or let the host's own reconnect request do so). The pass is a
+      // no-op while every source is already complete and known.
+      if (startupStatusPending || firstConnection) return; // Startup/initial delivery owns the first status.
+      void (async () => {
+        try {
+          await refreshOwnedActivityIntent();
+        } catch {
+          // A failed read stays truthful unknown; emit whatever is observable.
+        }
+        if (!active || shutdownRequested || generation !== sessionGeneration
+          || candidate !== socket || startupStatusPending) return;
+        syncOwnedActivity();
+        applyReadiness(probeReadiness(currentContext));
+        // Force one freshly sequenced frame even when the rebuilt values match
+        // the pre-disconnect cache: the host registration must observe a newer
+        // sequence than it already retained, and the frame is still built from
+        // the actual post-refresh readiness/owning-source state.
+        emit(true);
+      })();
     });
     candidate.on("drain", () => {
       if (!drainPending || generation !== sessionGeneration || !active || candidate !== socket) return;
@@ -972,9 +1116,160 @@ function createReporter(
   // State and emission
   // ------------------------------------------------------------------
 
-  const emit = (): void => {
+  const clearStartupCoordination = (): void => {
+    if (startupDeadline) {
+      clearTimeout(startupDeadline);
+      startupDeadline = undefined;
+    }
+    try {
+      unsubscribeRestore?.();
+    } catch {
+      // Listener detach is best effort; the coordination state is process-local.
+    }
+    unsubscribeRestore = undefined;
+    startupStatusPending = false;
+    startupFinishing = false;
+    const waiters = startupWaiters.splice(0);
+    for (const resolve of waiters) {
+      try {
+        resolve();
+      } catch {
+        // A request waiter's Promise machinery is outside the reporter contract.
+      }
+    }
+  };
+
+  /** Resolve after the first authoritative loaded status has been emitted. */
+  const waitForStartupAuthoritative = (): Promise<void> => {
+    if (!startupStatusPending) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      startupWaiters.push(resolve);
+    });
+  };
+
+  /**
+   * Emit the FIRST authoritative loaded status. Readiness is probed from the
+   * actual current context and the activity-intent counts are read only after
+   * the awaited authoritative refresh plus the gate's restore boundary, so a
+   * restored conversation with no current work publishes actual idle/zero.
+   */
+  const finishStartup = (): void => {
+    if (!startupStatusPending || startupFinishing) return;
+    startupFinishing = true;
+    const generation = sessionGeneration;
+    void (async () => {
+      // The pre-restore pass ran before the gate's association restore. Run
+      // ONE final explicit owning-source pass now, at the true restored
+      // boundary, so a restored idle/zero or restored current work is observed
+      // from the source's own post-restore state before the first Ready frame.
+      try {
+        await refreshOwnedActivityIntent();
+      } catch {
+        // A failed read stays truthful unknown; never infer zero.
+      }
+      if (!startupStatusPending || !active || shutdownRequested || generation !== sessionGeneration) {
+        startupFinishing = false;
+        return;
+      }
+      const waiters = startupWaiters;
+      startupWaiters = [];
+      clearStartupCoordination();
+      syncOwnedActivity();
+      // An explicit lifecycle/tool event observed while the authoritative
+      // startup pass was settling is real current work; never overwrite it
+      // with a possibly stale idle probe. With no such event, probe readiness.
+      const eventObserved = busy === true || activity.length > 0;
+      if (!eventObserved) applyReadiness(probeReadiness(currentContext));
+      emit();
+      // Request handlers waiting on startup now rebuild their own fresh
+      // correlated snapshot (including another explicit read).
+      for (const resolve of waiters) {
+        try {
+          resolve();
+        } catch {
+          // A request waiter's Promise machinery is outside this contract.
+        }
+      }
+    })();
+  };
+
+  const restoreMatchesStartup = (): boolean => {
+    const state = restoreCoordinationState(false);
+    if (!state || state.epoch <= startupRestoreBaseline) return false;
+    if (state.sessionId !== undefined && startupRestoreSessionId !== undefined
+      && state.sessionId !== startupRestoreSessionId) return false;
+    return true;
+  };
+
+  /** Build one complete status snapshot with a fresh monotonic sequence. */
+  const createSnapshot = (): SessionHostStatus => ({
+    version: 1,
+    type: "status",
+    instanceId: bootstrap.instanceId,
+    generation: bootstrap.generation,
+    sequence: nextSequence(),
+    busy,
+    pendingInput,
+    inputSurface,
+    backgroundTasks,
+    backgroundShells,
+    activeTasks,
+    activeShells,
+    activity: [...activity],
+    nativeSession: nativeSession ? { ...nativeSession } : null,
+  });
+
+  /**
+   * Wait for this exact session's gate restore to settle. The gate hook begins
+   * after this reporter's hook resolves; one macrotask of slack lets that
+   * synchronous begin marker land. The single fallback deadline prevents a
+   * permanently latched first status if the gate path is unavailable.
+   */
+  const awaitStartupRestore = (): void => {
+    const generation = sessionGeneration;
+    const waiting = (): boolean => startupStatusPending
+      && active && !shutdownRequested && generation === sessionGeneration;
+    const state = restoreCoordinationState(false);
+    if (state?.phase === "in-progress" && restoreMatchesStartup()) {
+      if (startupDeadline === undefined) {
+        startupDeadline = setTimeout(() => {
+          startupDeadline = undefined;
+          if (waiting()) finishStartup();
+        }, STARTUP_RESTORE_DEADLINE_MS);
+        startupDeadline.unref?.();
+      }
+      if (unsubscribeRestore === undefined) {
+        unsubscribeRestore = subscribeSessionHostRestore(() => {
+          const current = restoreCoordinationState(false);
+          if (current?.phase === "complete" && restoreMatchesStartup() && waiting()) finishStartup();
+        });
+      }
+      return;
+    }
+    if (state?.phase === "complete" && restoreMatchesStartup()) {
+      finishStartup();
+      return;
+    }
+    setImmediate(() => {
+      if (!waiting()) return;
+      const current = restoreCoordinationState(false);
+      if (current?.phase === "in-progress" && restoreMatchesStartup()) {
+        awaitStartupRestore();
+        return;
+      }
+      // No gate restore phase is present (for example a standalone reporter
+      // harness): the authoritative source refresh was the only boundary.
+      finishStartup();
+    });
+  };
+
+  const emit = (force = false): void => {
     if (!active || shutdownRequested) return;
-    if (lastSnapshot
+    // The first loaded status is emitted only by finishStartup after the
+    // authoritative refresh and this session's restore boundary; later events
+    // may update local state meanwhile without publishing a premature Ready.
+    if (startupStatusPending) return;
+    if (!force && lastSnapshot
       && lastSnapshot.busy === busy
       && lastSnapshot.pendingInput === pendingInput
       && lastSnapshot.inputSurface === inputSurface
@@ -986,22 +1281,7 @@ function createReporter(
       && JSON.stringify(lastSnapshot.nativeSession ?? null) === JSON.stringify(nativeSession)) {
       return; // Unchanged: no new frame.
     }
-    const snapshot: SessionHostStatus = {
-      version: 1,
-      type: "status",
-      instanceId: bootstrap.instanceId,
-      generation: bootstrap.generation,
-      sequence: nextSequence(),
-      busy,
-      pendingInput,
-      inputSurface,
-      backgroundTasks,
-      backgroundShells,
-      activeTasks,
-      activeShells,
-      activity: [...activity],
-      nativeSession: nativeSession ? { ...nativeSession } : null,
-    };
+    const snapshot = createSnapshot();
     lastSnapshot = snapshot;
     snapshotQueued = false;
     writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, nativePersistence: nativePersistenceTracker.snapshot(), shutdownRequested, teardown });
@@ -1176,6 +1456,164 @@ function createReporter(
       if (oldest) recentShutdownRequests.delete(oldest);
     }
     return true;
+  };
+
+  const rememberActivityRequest = (requestId: string): boolean => {
+    if (recentActivityRequestIds.has(requestId)) return false;
+    recentActivityRequestIds.add(requestId);
+    if (recentActivityRequestIds.size > MAX_RECENT_ACTIVITY_REQUEST_IDS) {
+      const oldest = recentActivityRequestIds.values().next().value as string | undefined;
+      if (oldest) recentActivityRequestIds.delete(oldest);
+    }
+    return true;
+  };
+
+  const sendActivityResult = (
+    candidate: net.Socket,
+    generation: number,
+    result: SessionHostActivityResult,
+  ): void => {
+    if (!active || shutdownRequested || candidate.destroyed
+      || generation !== sessionGeneration || candidate !== socket) return;
+    let frame: string;
+    try {
+      frame = encodeFrame(result);
+    } catch {
+      candidate.destroy();
+      return;
+    }
+    if (drainPending) {
+      if (renameAckQueue.length >= MAX_QUEUED_RENAME_ACKS) {
+        candidate.destroy(); // Never grow an unbounded reply queue.
+        return;
+      }
+      renameAckQueue.push(frame);
+      return;
+    }
+    if (!tryWriteFrame(frame)) candidate.destroy();
+  };
+
+  /**
+   * One authenticated request for a complete freshly observed status. The
+   * response is never built from `lastSnapshot` or the reporter's cached
+   * aggregate: after the startup authority fence and an awaited explicit
+   * owning-source refresh, readiness is probed from the actual current
+   * context and the activity counts are read from the owning-source registry
+   * at that moment. Work that starts or settles while this read is in flight
+   * is visible to the completed build; a session change replies stale-session
+   * instead of replacing the host's row with another conversation's state.
+   */
+  const processActivityRequest = (
+    candidate: net.Socket,
+    generation: number,
+    request: SessionHostActivityRequest,
+  ): void => {
+    if (!active || shutdownRequested || generation !== sessionGeneration || candidate !== socket) return;
+    if (request.instanceId !== bootstrap.instanceId
+      || request.generation !== bootstrap.generation
+      || !tokenMatches(request.token, bootstrap.token)) {
+      candidate.destroy(); // Wrong capability or identity is a protocol failure.
+      return;
+    }
+    if (renameAckQueue.length >= MAX_QUEUED_RENAME_ACKS) {
+      candidate.destroy(); // No bounded reply capacity: never silently drop.
+      return;
+    }
+    if (pendingActivityRequestIds.size >= MAX_CONCURRENT_ACTIVITY_REQUESTS) {
+      // A bounded read-only request may be ignored: the broker settles it as a
+      // truthful timeout without retiring the channel. Never grow unbounded
+      // work while an authoritative startup fence is still settling.
+      return;
+    }
+    if (!rememberActivityRequest(request.requestId)) return; // Replay: never re-run a read twice.
+    pendingActivityRequestIds.add(request.requestId);
+    void (async () => {
+      try {
+        await waitForStartupAuthoritative();
+        if (!active || shutdownRequested || generation !== sessionGeneration || candidate !== socket) return;
+        let refreshed = true;
+        try {
+          await refreshOwnedActivityIntent();
+        } catch {
+          refreshed = false; // A failed read is truthful unknown, never cached success.
+        }
+        if (!active || shutdownRequested || generation !== sessionGeneration || candidate !== socket) return;
+        const ctx = currentContext;
+        // Re-read the exact current native tuple from the live context. A
+        // session change during the awaited refresh makes this reply stale.
+        refreshNativeSession(ctx, false, false);
+        const observed = nativeTuple();
+        const expectedMatches = request.expectedSessionId === null
+          || (observed.sessionId === request.expectedSessionId
+            && observed.sessionEpoch === request.expectedSessionEpoch);
+        if (!refreshed || !expectedMatches) {
+          sendActivityResult(candidate, generation, {
+            version: 1,
+            type: "activity_result",
+            instanceId: bootstrap.instanceId,
+            generation: bootstrap.generation,
+            requestId: request.requestId,
+            outcome: expectedMatches ? "unavailable" : "stale-session",
+            observedSessionId: observed.sessionId,
+            observedSessionEpoch: observed.sessionEpoch,
+          });
+          return;
+        }
+        syncOwnedActivity();
+        // This is an authoritative census, not an ordinary lifecycle
+        // notification: a failed/unavailable readiness read must report
+        // unknown rather than certifying cached busy/activity. Ordinary
+        // agent_settled behavior keeps its existing cached-busy semantics.
+        const readiness = probeReadiness(ctx);
+        if (readiness === "unknown") {
+          busy = null;
+          activity = [];
+        } else {
+          applyReadiness(readiness);
+        }
+        const snapshot = createSnapshot();
+        if (snapshot.sequence <= request.afterSequence) {
+          // Defensive: the fresh build always advances the shared sequence.
+          sendActivityResult(candidate, generation, {
+            version: 1,
+            type: "activity_result",
+            instanceId: bootstrap.instanceId,
+            generation: bootstrap.generation,
+            requestId: request.requestId,
+            outcome: "unavailable",
+            observedSessionId: observed.sessionId,
+            observedSessionEpoch: observed.sessionEpoch,
+          });
+          return;
+        }
+        // Commit the fresh snapshot as the latest local/sticky state without
+        // also pushing it as an ordinary status: the correlated result is the
+        // one authoritative delivery, and the registration sequence stays
+        // monotonic for both paths.
+        lastSnapshot = snapshot;
+        // The correlated result carries this exact snapshot. Mark it queued so
+        // a later drain can never re-send lastSnapshot as an ordinary status
+        // with the same sequence (which the broker would reject as
+        // non-monotonic and close the authenticated connection). This holds
+        // whether sendActivityResult writes directly or queues behind existing
+        // backpressure. A genuinely newer emit() resets this flag itself.
+        snapshotQueued = true;
+        writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, nativePersistence: nativePersistenceTracker.snapshot(), shutdownRequested, teardown });
+        sendActivityResult(candidate, generation, {
+          version: 1,
+          type: "activity_result",
+          instanceId: bootstrap.instanceId,
+          generation: bootstrap.generation,
+          requestId: request.requestId,
+          outcome: "complete",
+          status: snapshot,
+          observedSessionId: observed.sessionId,
+          observedSessionEpoch: observed.sessionEpoch,
+        });
+      } finally {
+        pendingActivityRequestIds.delete(request.requestId);
+      }
+    })();
   };
 
   const processShutdownRequest = (
@@ -1590,12 +2028,14 @@ function createReporter(
       settleSpawnCall(message.requestId, pending, message.outcome);
       return !candidate.destroyed;
     }
-    if (message.type !== "rename_request" && message.type !== "shutdown_request") {
+    if (message.type !== "rename_request" && message.type !== "shutdown_request"
+      && message.type !== "activity_request") {
       candidate.destroy(); // No status or peer-originated control frame is accepted from the broker.
       return false;
     }
     if (message.type === "rename_request") processRenameRequest(candidate, generation, message);
-    else processShutdownRequest(candidate, generation, message);
+    else if (message.type === "shutdown_request") processShutdownRequest(candidate, generation, message);
+    else processActivityRequest(candidate, generation, message);
     return !candidate.destroyed;
   };
 
@@ -1677,6 +2117,7 @@ function createReporter(
       deactivate();
       return;
     }
+    clearStartupCoordination();
     restoreObserver(); // Every session gets a fresh observation generation.
     cancelPendingStoredUserRefresh();
     sessionGeneration += 1;
@@ -1700,14 +2141,25 @@ function createReporter(
     syncOwnedActivity();
     installObserver(ctx);
     refreshNativeSession(ctx, true, false);
+    // Defer the FIRST loaded status until the awaited authoritative refresh and
+    // this exact session's restore boundary. The baseline is captured before
+    // the gate's later session_start hook can begin its restore marker.
+    const initialRestoreState = restoreCoordinationState(false);
+    // A reload can replace the reporter while the same session's restore is
+    // still in flight. Treat that exact marker as the boundary to await rather
+    // than publishing a pre-restore first status.
+    startupRestoreBaseline = initialRestoreState?.phase === "in-progress"
+      ? Math.max(0, initialRestoreState.epoch - 1)
+      : (initialRestoreState?.epoch ?? 0);
+    startupRestoreSessionId = nativeSessionId;
+    startupStatusPending = true;
     connectSocket();
-    // Probe live readiness instead of assuming it: a session that starts
-    // mid-run reports busy, and an unavailable probe stays unknown (null).
-    applyReadiness(probeReadiness(ctx));
-    emit();
+    // Local readiness is probed when the authoritative first status is built;
+    // emitting here would publish Ready before index restoration.
   };
 
   const deactivate = (): void => {
+    clearStartupCoordination();
     sessionGeneration += 1;
     cancelPendingStoredUserRefresh();
     active = false;
@@ -1724,6 +2176,8 @@ function createReporter(
     backgroundShells = null;
     activeTasks = null;
     activeShells = null;
+    pendingActivityRequestIds.clear();
+    recentActivityRequestIds.clear();
     activity = [];
     lastSnapshot = undefined;
   };
@@ -1779,8 +2233,17 @@ function createReporter(
       // recovers to the actual idle/zero or running/nonzero value at startup
       // without polling, manual refresh, a new prompt, or a new task.
       await refreshOwnedActivityIntent();
+      // The public explicit refresh above is authoritative for owning-source
+      // activity. The FIRST loaded status still waits for the gate's own
+      // restore boundary (or the single fallback deadline), so a restored
+      // conversation with no current work is first shown as idle/zero rather
+      // than a pre-restore guess.
+      awaitStartupRestore();
     } catch {
       // Telemetry recovery/reporting never changes native session startup.
+      // A failed recovery must not latch the first status forever: publish the
+      // honestly unknown/observable state after the same restore boundary.
+      awaitStartupRestore();
     }
   });
 

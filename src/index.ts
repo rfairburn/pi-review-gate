@@ -65,6 +65,10 @@ import { getSessionHostSpawnCapability } from "./session-host/spawn-capability";
 import { registerSessionSpawnTool } from "./session-host/spawn-tool";
 import { consumeSessionHostStartupRequest } from "./session-host/startup-request";
 import {
+  beginSessionHostRestore,
+  completeSessionHostRestore,
+} from "./session-host/reporter";
+import {
   registerNotificationMessageRenderers,
   warmPiTuiHost,
 } from "./message-expansion";
@@ -651,6 +655,19 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   });
 
   registerHook(pi, "session_start", async (...args) => {
+    // Coordinate the authenticated session-host reporter's FIRST loaded status
+    // with this exact session's restore boundary. The reporter is loaded first
+    // and returns before this hook runs; it waits for this completion marker
+    // (or its single bounded fallback) before publishing Ready. A fresh runtime
+    // therefore never replays prior busy/unknown history as its first state.
+    let restoreSessionId: string | undefined;
+    try {
+      restoreSessionId = reviewCheckpointScopeFromContext(extractContext(args))?.sessionId;
+    } catch {
+      restoreSessionId = undefined;
+    }
+    const restoreCompletion = beginSessionHostRestore(restoreSessionId);
+    try {
     const restoreSessionEpoch = ++sessionEpoch;
     const context = extractContext(args);
     const notifyRestore = captureSessionNotice(pi, context, () =>
@@ -863,6 +880,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
           // Startup stays owned and reportable even if Pi rejects its initial turn.
         }
       }
+    }
+    } finally {
+      // Mark exactly this restore settled (or abandoned after an error) so the
+      // reporter can publish its first authoritative loaded status. A later
+      // session's begin supersedes this token; a stale completion is ignored.
+      completeSessionHostRestore(restoreCompletion);
     }
   });
 

@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { captureWaveBase, WaveCaptureResult } from "../src/execution/wave-repository";
 import {
   createWorkerWorktree,
   createIntegrationWorktree,
+  gitWorktreeCoordinator,
   isWorktreeClean,
   removeWorktree,
   pinCommit,
@@ -45,6 +46,11 @@ async function gitInRepo(args: string[], repoPath: string): Promise<string> {
 async function mkTmp(prefix: string): Promise<string> {
   const { mkdtemp, realpath } = await import("node:fs/promises");
   return realpath(await mkdtemp(join(tmpdir(), prefix)));
+}
+
+/** Resolve the next event-loop turn (a microtask-drain ordering barrier). */
+function nextTurn(): Promise<void> {
+  return new Promise((resolveTurn) => setImmediate(resolveTurn));
 }
 
 // Helper: create a committed source repo and capture it.
@@ -102,6 +108,364 @@ test("worktrees — two isolated worker filesystems from the same base", async (
     await removeWorktree(worker1.worktreeRoot, capture.repositoryPath);
     await removeWorktree(worker2.worktreeRoot, capture.repositoryPath);
   } finally {
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+});
+
+// ── Test: concurrent registrations for one captured repository ──────────────
+
+test("worktrees — concurrent worker registrations all land in shared administration", async () => {
+  const artifactDir = await mkTmp("pi-wt-concurrent-");
+  try {
+    const { capture } = await setupCapture(artifactDir);
+
+    // Start four preparations at once against one captured repository, as a
+    // refilling worker pool does. Every registration shares the repository's
+    // worktree administration, so a partially written entry must never be
+    // observed by another preparation.
+    const workers = await Promise.all(
+      ["task-0", "task-1", "task-2", "task-3"].map((taskId) =>
+        createWorkerWorktree(capture, taskId)
+      ),
+    );
+
+    const registrations = await gitInRepo(["worktree", "list", "--porcelain"], capture.repositoryPath);
+    const canonicalRepository = await realpath(capture.repositoryPath);
+    for (const worker of workers) {
+      // Each worktree is a working checkout at the captured base commit.
+      const head = await git(["rev-parse", "HEAD"], worker.worktreeRoot);
+      assert.equal(head, capture.baseCommit, `${worker.worktreeRoot} should be at the base commit`);
+      assert.ok(
+        registrations.includes(worker.worktreeRoot),
+        `${worker.worktreeRoot} should be registered in the shared administration`,
+      );
+      // The registration metadata another preparation reads while enumerating
+      // is complete: a readable, non-empty commondir that resolves to the
+      // capture repository. A partially published entry would instead let a
+      // concurrent enumeration see an empty or wrong common directory.
+      const gitDir = await git(["rev-parse", "--absolute-git-dir"], worker.worktreeRoot);
+      const commondir = await readFile(join(gitDir, "commondir"), "utf8");
+      assert.notEqual(
+        commondir.trim(),
+        "",
+        `${worker.worktreeRoot} should publish a non-empty commondir`,
+      );
+      const commonDir = await git(["rev-parse", "--git-common-dir"], worker.worktreeRoot);
+      assert.equal(
+        await realpath(resolve(worker.worktreeRoot, commonDir)),
+        canonicalRepository,
+        `${worker.worktreeRoot} should resolve to the captured repository`,
+      );
+    }
+
+    for (const worker of workers) {
+      await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+    }
+    const remaining = await gitInRepo(["worktree", "list", "--porcelain"], capture.repositoryPath);
+    for (const worker of workers) {
+      assert.ok(
+        !remaining.includes(worker.worktreeRoot),
+        `${worker.worktreeRoot} should be deregistered after removal`,
+      );
+    }
+  } finally {
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+});
+
+// ── Production administration boundary: same repository excludes ────────────
+
+test("worktrees — administration boundary excludes same-repository preparations", async () => {
+  const artifactDir = await mkTmp("pi-wt-boundary-exclude-");
+  const { capture } = await setupCapture(artifactDir);
+  const entries: string[] = [];
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolveGate) => {
+    releaseFirst = resolveGate;
+  });
+  let firstEntered!: () => void;
+  const firstInside = new Promise<void>((resolveInside) => {
+    firstEntered = resolveInside;
+  });
+
+  try {
+    // Barrier at the administration invocation boundary: the first preparation
+    // holds the lease while it is inside, before its Git command runs.
+    gitWorktreeCoordinator.beforeOperation = async (repoPath) => {
+      entries.push(repoPath);
+      if (entries.length === 1) {
+        firstEntered();
+        await firstGate;
+      }
+    };
+
+    const first = createWorkerWorktree(capture, "task-first");
+    await firstInside;
+
+    // A same-repository preparation cannot enter that boundary while it is held.
+    const follower = createIntegrationWorktree(capture);
+    await nextTurn();
+    assert.equal(entries.length, 1, "a queued same-repository preparation must not enter");
+    assert.equal(entries[0], capture.repositoryPath, "the boundary is per captured repository");
+    await assert.rejects(
+      stat(join(capture.waveRoot, "integration")),
+      "a queued preparation must not create its worktree directory",
+    );
+
+    releaseFirst();
+    const [worker, integration] = await Promise.all([first, follower]);
+    assert.equal(entries.length, 2, "the waiting preparation enters after the holder releases");
+
+    // Both preparations complete genuine registrations in the shared
+    // administration, with readable common-directory metadata.
+    for (const root of [worker.worktreeRoot, integration.worktreeRoot]) {
+      const head = await git(["rev-parse", "HEAD"], root);
+      assert.equal(head, capture.baseCommit, `${root} should be at the base commit`);
+      const gitDir = await git(["rev-parse", "--absolute-git-dir"], root);
+      const commondir = await readFile(join(gitDir, "commondir"), "utf8");
+      assert.notEqual(commondir.trim(), "", `${root} should publish a non-empty commondir`);
+    }
+    const registrations = await gitInRepo(["worktree", "list", "--porcelain"], capture.repositoryPath);
+    assert.ok(registrations.includes(worker.worktreeRoot));
+    assert.ok(registrations.includes(integration.worktreeRoot));
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+    await removeWorktree(integration.worktreeRoot, capture.repositoryPath);
+  } finally {
+    delete gitWorktreeCoordinator.beforeOperation;
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+});
+
+// ── Production administration boundary: queued cancellation ─────────────────
+
+test("worktrees — administration boundary never admits a cancelled queued preparation", async () => {
+  const artifactDir = await mkTmp("pi-wt-boundary-cancel-");
+  const { capture } = await setupCapture(artifactDir);
+  const entries: string[] = [];
+  let releaseHolder!: () => void;
+  const holderGate = new Promise<void>((resolveGate) => {
+    releaseHolder = resolveGate;
+  });
+  let holderEntered!: () => void;
+  const holderInside = new Promise<void>((resolveInside) => {
+    holderEntered = resolveInside;
+  });
+  const cancelledRoot = join(capture.waveRoot, "workers", "task-cancelled");
+
+  try {
+    gitWorktreeCoordinator.beforeOperation = async (repoPath) => {
+      entries.push(repoPath);
+      if (entries.length === 1) {
+        holderEntered();
+        await holderGate;
+      }
+    };
+
+    const holder = createWorkerWorktree(capture, "task-holder");
+    await holderInside;
+
+    const controller = new AbortController();
+    const cancelled = createWorkerWorktree(capture, "task-cancelled", controller.signal);
+    await nextTurn();
+    controller.abort();
+    await assert.rejects(cancelled, { name: "AbortError" });
+    assert.equal(entries.length, 1, "a cancelled queued preparation must not enter");
+    await assert.rejects(
+      stat(cancelledRoot),
+      "a cancelled queued preparation must not create its worktree directory",
+    );
+
+    // The cancelled waiter neither wedges the lease nor consumes it.
+    releaseHolder();
+    const held = await holder;
+    const after = await createWorkerWorktree(capture, "task-after");
+    assert.equal(entries.length, 2, "a later preparation is admitted after the holder releases");
+    const registrations = await gitInRepo(["worktree", "list", "--porcelain"], capture.repositoryPath);
+    assert.ok(registrations.includes(held.worktreeRoot));
+    assert.ok(registrations.includes(after.worktreeRoot));
+
+    await removeWorktree(held.worktreeRoot, capture.repositoryPath);
+    await removeWorktree(after.worktreeRoot, capture.repositoryPath);
+  } finally {
+    delete gitWorktreeCoordinator.beforeOperation;
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+});
+
+// ── Production boundary: failed-creation cleanup precedes the follower ──────
+
+test("worktrees — failed creation cleans up before the waiting preparation enters", async () => {
+  const artifactDir = await mkTmp("pi-wt-boundary-cleanup-");
+  const { capture } = await setupCapture(artifactDir);
+  const failedRoot = join(capture.waveRoot, "workers", "task-failing");
+  const entries: string[] = [];
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolveGate) => {
+    releaseFirst = resolveGate;
+  });
+  let firstEntered!: () => void;
+  const firstInside = new Promise<void>((resolveInside) => {
+    firstEntered = resolveInside;
+  });
+  let followerSawLeftovers: boolean | undefined;
+
+  try {
+    gitWorktreeCoordinator.beforeOperation = async (repoPath) => {
+      entries.push(repoPath);
+      if (entries.length === 1) {
+        firstEntered();
+        await firstGate;
+        return;
+      }
+      // The follower only reaches the boundary after the failed creation's
+      // cleanup has finished, so its registration and directory must be gone.
+      const directoryLeft = await stat(failedRoot).then(() => true, () => false);
+      const registrations = await gitInRepo(["worktree", "list", "--porcelain"], capture.repositoryPath);
+      followerSawLeftovers = directoryLeft || registrations.includes(failedRoot);
+    };
+
+    // A capture whose base commit is not a Git object makes `git worktree add`
+    // fail after the creation has acquired the lease.
+    const failingCapture: WaveCaptureResult = {
+      ...capture,
+      baseCommit: "0".repeat(capture.baseCommit.length),
+    };
+    const failing = createWorkerWorktree(failingCapture, "task-failing");
+    await firstInside;
+
+    const follower = createWorkerWorktree(capture, "task-follower");
+    await nextTurn();
+    assert.equal(entries.length, 1, "the follower must wait for the failing preparation");
+
+    releaseFirst();
+    await assert.rejects(failing, "creation at an invalid base commit must fail");
+    const followed = await follower;
+    assert.equal(entries.length, 2, "the follower enters only after cleanup and release");
+    assert.equal(
+      followerSawLeftovers,
+      false,
+      "failed-creation cleanup must finish before the follower enters",
+    );
+    await assert.rejects(stat(failedRoot), "the failed creation must not leave its directory");
+    assert.equal(
+      await git(["rev-parse", "HEAD"], followed.worktreeRoot),
+      capture.baseCommit,
+      "the follower registration is complete",
+    );
+
+    await removeWorktree(followed.worktreeRoot, capture.repositoryPath);
+  } finally {
+    delete gitWorktreeCoordinator.beforeOperation;
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+});
+
+// ── Production boundary: removal revalidates cleanliness after waiting ──────
+
+test("worktrees — removal revalidates cleanliness after waiting and preserves ignored data", async () => {
+  const artifactDir = await mkTmp("pi-wt-boundary-removal-");
+  const { capture } = await setupCapture(artifactDir, async (dir) => {
+    await writeFile(join(dir, ".gitignore"), "*.log\n", "utf8");
+    await git(["add", ".gitignore"], dir);
+    await git(["commit", "--quiet", "-m", "ignore logs"], dir);
+  });
+  const entries: string[] = [];
+  let releaseHolder!: () => void;
+  const holderGate = new Promise<void>((resolveGate) => {
+    releaseHolder = resolveGate;
+  });
+  let holderEntered!: () => void;
+  const holderInside = new Promise<void>((resolveInside) => {
+    holderEntered = resolveInside;
+  });
+
+  try {
+    const worker = await createWorkerWorktree(capture, "task-queued-removal");
+
+    // Hold the repository's administration boundary with a real preparation,
+    // then queue a removal behind it.
+    gitWorktreeCoordinator.beforeOperation = async (repoPath) => {
+      entries.push(repoPath);
+      if (entries.length === 1) {
+        holderEntered();
+        await holderGate;
+      }
+    };
+    const holder = createIntegrationWorktree(capture);
+    await holderInside;
+
+    const removal = removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+    await nextTurn();
+    assert.equal(
+      entries.length,
+      1,
+      "removal's cleanliness check must not run before the lease is granted",
+    );
+
+    // Recovery data in an ignored path appears while the removal waits. Git's
+    // own non-force removal would delete it; the revalidation must refuse.
+    await writeFile(join(worker.worktreeRoot, "recovery.log"), "retained\n", "utf8");
+    releaseHolder();
+    await assert.rejects(removal, /Refusing to remove dirty worktree/);
+    assert.equal(
+      await readFile(join(worker.worktreeRoot, "recovery.log"), "utf8"),
+      "retained\n",
+      "ignored recovery data must be preserved",
+    );
+    assert.ok(
+      (await gitInRepo(["worktree", "list", "--porcelain"], capture.repositoryPath))
+        .includes(worker.worktreeRoot),
+      "the preserved worktree stays registered",
+    );
+
+    const integration = await holder;
+    await rm(join(worker.worktreeRoot, "recovery.log"), { force: true });
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+    await removeWorktree(integration.worktreeRoot, capture.repositoryPath);
+  } finally {
+    delete gitWorktreeCoordinator.beforeOperation;
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+});
+
+test("worktrees — removal revalidates cleanliness inside the lease, not before it", async () => {
+  const artifactDir = await mkTmp("pi-wt-boundary-check-order-");
+  const { capture } = await setupCapture(artifactDir, async (dir) => {
+    await writeFile(join(dir, ".gitignore"), "*.log\n", "utf8");
+    await git(["add", ".gitignore"], dir);
+    await git(["commit", "--quiet", "-m", "ignore logs"], dir);
+  });
+  const worker = await createWorkerWorktree(capture, "task-check-order");
+  const recoveryPath = join(worker.worktreeRoot, "recovery.log");
+  let injected = false;
+
+  try {
+    // Recovery data appears while the removal holds the lease, at the boundary
+    // between the lease grant and the leased operation. A removal that
+    // revalidated cleanliness before waiting would already hold a stale clean
+    // result and delete the ignored data; revalidating inside the lease refuses.
+    gitWorktreeCoordinator.beforeOperation = async (repoPath) => {
+      if (injected || repoPath !== capture.repositoryPath) return;
+      injected = true;
+      await writeFile(recoveryPath, "retained\n", "utf8");
+    };
+
+    await assert.rejects(
+      removeWorktree(worker.worktreeRoot, capture.repositoryPath),
+      /Refusing to remove dirty worktree/,
+    );
+    assert.equal(await readFile(recoveryPath, "utf8"), "retained\n", "ignored data must survive");
+    assert.ok(
+      (await gitInRepo(["worktree", "list", "--porcelain"], capture.repositoryPath))
+        .includes(worker.worktreeRoot),
+      "the refused removal must keep the worktree registered",
+    );
+
+    await rm(recoveryPath, { force: true });
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    delete gitWorktreeCoordinator.beforeOperation;
     await rm(artifactDir, { recursive: true, force: true });
   }
 });

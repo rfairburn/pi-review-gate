@@ -12,7 +12,8 @@
  * is spawned.
  */
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -25,7 +26,12 @@ import {
 } from "../src/execution/background-controller";
 import { transitionTaskState } from "../src/execution/task-state";
 import { createState } from "../src/state";
-import { registerReviewActivitySource, __test as reviewActivityTest } from "../src/activation/review-activity";
+import {
+  beginOwnedReviewActivity,
+  endOwnedReviewActivity,
+  registerReviewActivitySource,
+  __test as reviewActivityTest,
+} from "../src/activation/review-activity";
 import {
   OWNED_ACTIVITY_STATE_KEY,
   activateOwnedActivity,
@@ -258,7 +264,7 @@ test("a rejected archive-only Continue publishes no activity and leaves ownershi
   }
 });
 
-test("a failed restore keeps activity genuinely unknown rather than zero", async () => {
+test("a failed restore keeps ownership unknown while a fresh runtime reports truthful idle activity", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-active-intent-restore-"));
   ownedActivityTest.resetOwnedActivityForTests();
   reviewActivityTest.resetReviewActivityForTests();
@@ -276,9 +282,15 @@ test("a failed restore keeps activity genuinely unknown rather than zero", async
     assert.equal(activeActivitySnapshot().activeTasks, null, "a restore invalidates activity completeness before its first await");
     await pending;
     assert.equal(activeActivitySnapshot().activeTasks, 0);
+    // A claimed root this restore cannot read attached no group: it is a
+    // retained cleanup-ownership obligation, not work the CURRENT runtime
+    // admitted or resumed. Activity therefore stays a truthful known zero while
+    // ownership stays separately fail-closed (unknown, never zero).
     await controller.restore({ waveRoots: [], bundles: [], groupRoots: [join(root, "missing-group-root")] });
-    assert.equal(activeActivitySnapshot().activeTasks, null, "an unreadable group leaves activity unknown, never zero");
-    assert.equal(ownedActivitySnapshot().backgroundTasks, null);
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "an unreadable historical root cannot manufacture current-runtime activity");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "the same unreadable root keeps cleanup ownership unknown, never zero");
     await controller.detach();
   } finally {
     ownedActivityTest.resetOwnedActivityForTests();
@@ -330,14 +342,27 @@ test("a stopped task with a failed cleanup-association recovery reports zero act
 });
 
 /** The live execution source entry in the global registry state (test corruption seam). */
-function currentExecutionEntry(): { intentTokens: Set<string>; refreshActivity?: () => Promise<OwnedActivityIntentRefresh> | OwnedActivityIntentRefresh } {
+function currentExecutionEntry(): {
+  intentTokens: Set<string>;
+  intentUncertain?: boolean;
+  refreshActivity?: () => Promise<OwnedActivityIntentRefresh> | OwnedActivityIntentRefresh;
+} {
   const registry = (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] as {
-    sources: Map<string, Map<string, Array<{ retired: boolean; intentTokens?: Set<string>; refreshActivity?: () => Promise<OwnedActivityIntentRefresh> | OwnedActivityIntentRefresh }>>>;
+    sources: Map<string, Map<string, Array<{
+      retired: boolean;
+      intentTokens?: Set<string>;
+      intentUncertain?: boolean;
+      refreshActivity?: () => Promise<OwnedActivityIntentRefresh> | OwnedActivityIntentRefresh;
+    }>>>;
   };
   const entry = registry.sources.get("backgroundTasks")!.get("execution")!
     .find((candidate) => !candidate.retired)!;
   assert.ok(entry.intentTokens, "the execution source carries intent data");
-  return entry as { intentTokens: Set<string>; refreshActivity?: () => Promise<OwnedActivityIntentRefresh> | OwnedActivityIntentRefresh };
+  return entry as {
+    intentTokens: Set<string>;
+    intentUncertain?: boolean;
+    refreshActivity?: () => Promise<OwnedActivityIntentRefresh> | OwnedActivityIntentRefresh;
+  };
 }
 
 test("a corrupted registry token set recovers to the exact census inventory", async () => {
@@ -629,7 +654,8 @@ test("a diverged registry recovers from the controller's own census without sour
     const internals = controller as unknown as {
       groups: Map<string, BackgroundExecutionGroup>;
       save: (group: BackgroundExecutionGroup) => Promise<unknown>;
-      activityIntentUncertain: boolean;
+      activityIntentTokens?: unknown;
+      activityIntentUncertain?: unknown;
     };
     const started = await controller.start([{
       title: "divergence target",
@@ -638,11 +664,14 @@ test("a diverged registry recovers from the controller's own census without sour
     }]);
     assert.equal(activeActivitySnapshot().activeTasks, 1, "queued work is positively known");
 
-    // The registry telemetry diverges from the source's own state: the
-    // controller's local uncertainty boolean is false (it knows its tokens),
-    // but the loaded registry entry is uncertain. Recovery must come from the
-    // source's authoritative census, not from the local boolean.
-    assert.equal(internals.activityIntentUncertain, false, "the source itself is not uncertain");
+    // The registry telemetry diverges from the source's own state: the loaded
+    // registry entry is uncertain, while the controller keeps NO source-side
+    // telemetry mirror to disagree with (or to "repair" the source from).
+    // Recovery must come from the source's authoritative read-only census.
+    assert.equal("activityIntentUncertain" in internals, false,
+      "the controller keeps no source-local intent-uncertainty mirror");
+    assert.equal("activityIntentTokens" in internals, false,
+      "the controller keeps no source-local intent-token mirror");
     assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution"),
       "the exact current incarnation is marked uncertain");
     assert.equal(activeActivitySnapshot().activeTasks, null, "the diverged registry publishes unknown");
@@ -666,6 +695,514 @@ test("a diverged registry recovers from the controller's own census without sour
 
     await controller.detach();
   } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a restored saved conversation without historical groupRoots stays truthfully idle, then counts real work repeatedly", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-restored-no-roots-"));
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  try {
+    await initGitRepo(root);
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => root,
+    });
+    const internals = controller as unknown as {
+      groups: Map<string, BackgroundExecutionGroup>;
+      save: (group: BackgroundExecutionGroup) => Promise<unknown>;
+    };
+    // Exactly the production shape of a restored session-state snapshot whose
+    // optional `groupRoots` field is absent: no historical roster is claimed.
+    // The prior runtime's idle/busy/unknown/unreadable history is NOT this
+    // runtime's activity — restoration attaches no old process and replays no
+    // prior busy/unknown value.
+    await controller.restore({ waveRoots: [], bundles: [] });
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "a runtime that admitted and resumed nothing starts as a known idle zero");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "an absent historical roster cannot prove an empty owned set: ownership stays fail-closed");
+
+    // The reporter's explicit startup/reconnect refresh is a forced fresh pass
+    // and must confirm (never manufacture) that truthful zero.
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "the forced fresh pass confirms the exact zero");
+
+    // First real work after the historical path counts immediately and settles
+    // back to the known zero.
+    const first = await controller.start([{ title: "first", instructions: "work", acceptanceCriteria: ["done"] }]);
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "the first admission after the historical path counts");
+    await settleOldestUnsettled(controller, first.executionId, "first settled");
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "settlement returns to the known zero");
+
+    // Repeated work: a second admission plus a prompt-driven automatic review
+    // both count, and each settles independently.
+    const second = await controller.start([{ title: "second", instructions: "work", acceptanceCriteria: ["done"] }]);
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "the second admission counts too");
+    const reviewRun = beginOwnedReviewActivity();
+    assert.equal(activeActivitySnapshot().activeTasks, 2, "a running automatic review counts alongside the task");
+    endOwnedReviewActivity(reviewRun);
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "the finished review releases only its own intent");
+    await settleOldestUnsettled(controller, second.executionId, "second settled");
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "the second settlement is a known zero again");
+
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "repeated forced passes keep the exact zero");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "activity recovery never fabricates an ownership resolution for historical absence");
+    void internals;
+    await controller.detach();
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an explicit refresh repeatedly recovers poisoned registry telemetry to the real value", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-active-intent-poison-"));
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  try {
+    await initGitRepo(root);
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => root,
+    });
+    const internals = controller as unknown as {
+      groups: Map<string, BackgroundExecutionGroup>;
+      activityIntentTokens?: unknown;
+      activityIntentUncertain?: unknown;
+      currentActivityCensusInFlight?: unknown;
+      currentActivityCensusDirty?: unknown;
+    };
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [] });
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+
+    // There is exactly ONE derived activity-telemetry representation: the
+    // registry's incarnation-scoped intent set. The controller keeps no token
+    // mirror, no uncertainty boolean, and no second census scheduler/publication
+    // queue that could diverge from it.
+    for (const removed of [
+      "activityIntentTokens",
+      "activityIntentUncertain",
+      "currentActivityCensusInFlight",
+      "currentActivityCensusDirty",
+    ]) {
+      assert.equal(removed in internals, false,
+        `the controller keeps no redundant source-side ${removed} telemetry/scheduler state`);
+    }
+
+    // Poison the canonical registry telemetry while the real work inventory is
+    // untouched: the entry claims a known (wrong) token set, so no automatic
+    // pass can be trusted to repair it — only a forced fresh source read can.
+    const poisonRegistry = (registryTokens: string[]): void => {
+      const entry = currentExecutionEntry();
+      entry.intentTokens.clear();
+      for (const token of registryTokens) entry.intentTokens.add(token);
+      entry.intentUncertain = false;
+    };
+
+    const started = await controller.start([{ title: "poison target", instructions: "work", acceptanceCriteria: ["done"] }]);
+    assert.equal(activeActivitySnapshot().activeTasks, 1);
+    const ownedAfterStart = ownedActivitySnapshot().backgroundTasks;
+    assert.equal(ownedAfterStart, 1, "the ownership channel independently counts the admitted work");
+
+    // Nonzero: a lost real token reads as a fabricated zero, an injected token
+    // set reads as a fabricated positive. Both recover to the actual 1.
+    poisonRegistry([]);
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "the poisoned registry under-reports the real work");
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "the forced fresh pass restores the real nonzero value");
+    poisonRegistry(["execution:ghost-1", "execution:ghost-2"]);
+    assert.equal(activeActivitySnapshot().activeTasks, 2, "the poisoned registry over-reports");
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "a repeated fresh pass restores the same real value");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, ownedAfterStart,
+      "intent recovery never rewrites the independent ownership channel");
+
+    // Zero: the same poisoning repeatedly recovers to the actual zero.
+    await settleOldestUnsettled(controller, started.executionId, "poison target settled");
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+    const ownedAfterSettlement = ownedActivitySnapshot().backgroundTasks;
+    for (const injected of [["execution:ghost-zero"], ["execution:ghost-a", "execution:ghost-b", "execution:ghost-c"]]) {
+      poisonRegistry(injected);
+      assert.ok((activeActivitySnapshot().activeTasks ?? 0) > 0, "the poisoned registry claims idle work");
+      await refreshOwnedActivityIntent();
+      assert.equal(activeActivitySnapshot().activeTasks, 0,
+        "every fresh pass independently recovers the exact zero, never a fabricated one");
+      assert.equal(ownedActivitySnapshot().backgroundTasks, ownedAfterSettlement,
+        "repeated intent recovery leaves ownership untouched");
+    }
+    // The same recovery holds regardless of what the telemetry claims: a stale
+    // known registry set is not trusted either. Only the source's canonical
+    // work inventory decides, so repeated fresh passes stay exact.
+    const staleEntry = currentExecutionEntry();
+    staleEntry.intentTokens.clear();
+    staleEntry.intentTokens.add("execution:ghost-stale");
+    staleEntry.intentUncertain = false;
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "the stale registry claims a known positive");
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "the fresh pass establishes the real zero regardless of the stale telemetry claim");
+    // The source itself carries no counter to poison: its bookkeeping is the
+    // canonical controller runtime state that the read-only census derives.
+    assert.equal(currentExecutionEntry().intentTokens.size, 0,
+      "the single canonical registry set now holds the exact zero");
+    void internals.groups;
+    await controller.detach();
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a fresh census that cannot read its own current record invalidates activity, then recovers repeatedly", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-active-intent-unreadable-"));
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  try {
+    await initGitRepo(root);
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => root,
+    });
+    const internals = controller as unknown as { groups: Map<string, BackgroundExecutionGroup> };
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [] });
+    const started = await controller.start([{ title: "unreadable target", instructions: "work", acceptanceCriteria: ["done"] }]);
+    assert.equal(activeActivitySnapshot().activeTasks, 1);
+    const ownedWhileLive = ownedActivitySnapshot().backgroundTasks;
+    assert.equal(ownedWhileLive, 1);
+
+    const manifest = join(started.root, "execution.json");
+    const heldManifest = join(started.root, `execution.json.held-${randomUUID()}`);
+    await rename(manifest, heldManifest);
+    // The registry still carries the previously known value, but the source's
+    // fresh census genuinely cannot read its own current authenticated record.
+    // A fresh explicit pass must NOT re-assert that cached value as freshly
+    // confirmed: the derived activity channel becomes truthfully unknown.
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "the cache still claims the known value");
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "a genuine fresh read failure invalidates activity instead of re-publishing the cache");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, ownedWhileLive,
+      "the positive ownership token is retained, never dropped by an activity failure");
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, null, "repeated fresh failures stay unknown");
+
+    await rename(heldManifest, manifest);
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "a reachable complete census recovers the exact nonzero value");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, ownedWhileLive,
+      "activity recovery never rewrites ownership");
+
+    // The same sequence for the known-zero case.
+    await settleOldestUnsettled(controller, started.executionId, "unreadable target settled");
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+    const ownedAfterSettlement = ownedActivitySnapshot().backgroundTasks;
+    await rename(manifest, heldManifest);
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "an unreadable settled record is unknown, never a cached zero passed off as fresh");
+    await rename(heldManifest, manifest);
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "the reachable census recovers the exact zero again");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, ownedAfterSettlement,
+      "repeated recoveries leave ownership untouched");
+    void internals.groups;
+    await controller.detach();
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("work starting or settling during a forced census is never overwritten by the stale read", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-active-intent-resync-race-"));
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  try {
+    await initGitRepo(root);
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    let gate: Promise<void> | undefined;
+    let entered: (() => void) | undefined;
+    let release: (() => void) | undefined;
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => root,
+      faults: {
+        currentActivityCensus: async () => {
+          entered?.();
+          await gate;
+        },
+      },
+    });
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [] });
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+
+    // A start lands while the forced census is already past its canonical read
+    // point. The read is now stale: it must preserve the newer exact token
+    // instead of overwriting it with the older zero.
+    let signalEntered!: () => void;
+    const enteredOnce = new Promise<void>((resolve) => { signalEntered = resolve; });
+    entered = signalEntered;
+    let releaseCensus!: () => void;
+    gate = new Promise<void>((resolve) => { releaseCensus = resolve; });
+    const duringStart = refreshOwnedActivityIntent();
+    await enteredOnce;
+    const started = await controller.start([{ title: "race target", instructions: "work", acceptanceCriteria: ["done"] }]);
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "the admission is published before the stale read returns");
+    releaseCensus();
+    await duringStart;
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the stale census read never overwrites the newer admitted token");
+
+    // A settlement races the same way: the newer zero survives.
+    let signalSettledRead!: () => void;
+    const settledReadEntered = new Promise<void>((resolve) => { signalSettledRead = resolve; });
+    entered = signalSettledRead;
+    let releaseSecond!: () => void;
+    gate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const duringSettle = refreshOwnedActivityIntent();
+    await settledReadEntered;
+    await settleOldestUnsettled(controller, started.executionId, "race target settled");
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "the settlement is published before the stale read returns");
+    releaseSecond();
+    await duringSettle;
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "the stale census read never resurrects the settled task");
+
+    // A later complete pass still establishes the exact current value.
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+    await controller.detach();
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a detached controller with an unsettled runtime never reports a false zero", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-active-intent-detached-runtime-"));
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  try {
+    await initGitRepo(root);
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => root,
+    });
+    const internals = controller as unknown as {
+      groups: Map<string, BackgroundExecutionGroup>;
+      runtimes: Map<string, { abort: AbortController; promise: Promise<void>; controlStatus: "pending" }>;
+      activityIntentTokens?: unknown;
+      activityIntentUncertain?: unknown;
+      currentActivityCensusInFlight?: unknown;
+      save: (group: BackgroundExecutionGroup) => Promise<unknown>;
+    };
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [] });
+    const started = await controller.start([{ title: "detached runtime", instructions: "work", acceptanceCriteria: ["done"] }]);
+    const group = internals.groups.get(started.executionId)!;
+    const task = group.tasks[0]!;
+    // A genuinely live owned runtime that never settles: the executor handle is
+    // registered exactly as launch() does, and the task record names it.
+    transitionTaskState(task, "running");
+    internals.runtimes.set(task.taskId, {
+      abort: new AbortController(),
+      promise: new Promise<void>(() => undefined),
+      controlStatus: "pending",
+    });
+    await internals.save(group);
+    assert.equal(internals.runtimes.has(task.taskId), true, "a live owned runtime is held unsettled");
+    assert.equal(activeActivitySnapshot().activeTasks, 1);
+
+    await controller.detach();
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "detaching with an unsettled runtime leaves activity unknown, never zero");
+    // The live maps are empty after detach but nobody observed that runtime
+    // settle: repeated forced fresh passes must not invent a zero from the
+    // cleared maps. Only that exact owner's settlement/reconciliation may.
+    for (let pass = 0; pass < 3; pass += 1) {
+      // A lost live-owner record cannot be discharged by telemetry. The only
+      // derived representation is the registry's incarnation-scoped set, and
+      // poisoning it with a ghost claim must not let the empty live maps read as
+      // zero while the retained unresolved runtime is still unproven.
+      const poisoned = currentExecutionEntry();
+      poisoned.intentTokens.clear();
+      poisoned.intentTokens.add("execution:ghost-detached");
+      poisoned.intentUncertain = false;
+      assert.ok((activeActivitySnapshot().activeTasks ?? 0) > 0,
+        "the poisoned registry claims a positive before the forced pass");
+      await refreshOwnedActivityIntent();
+      assert.equal(activeActivitySnapshot().activeTasks, null,
+        `forced pass ${pass + 1} cannot prove the detached runtime stopped`);
+    }
+    assert.equal("activityIntentTokens" in internals, false,
+      "there is no source-side token mirror to clear or poison");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "ownership stays independently unknown as well");
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("verified cleanup retires the retained root so a forced pass establishes zero", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-active-intent-cleanup-retire-"));
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  try {
+    await initGitRepo(root);
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => root,
+    });
+    const internals = controller as unknown as {
+      groups: Map<string, BackgroundExecutionGroup>;
+      retiredCensus?: { roots: Map<string, unknown> };
+      activityIntentTokens?: unknown;
+    };
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [] });
+    const started = await controller.start([{ title: "cleanup target", instructions: "work", acceptanceCriteria: ["done"] }]);
+    assert.equal(activeActivitySnapshot().activeTasks, 1);
+    // A restore/detach retains this controller's own established roots; the
+    // restored roster re-attaches the same group, so the retained root carries a
+    // verified execution identity rather than a historical reference.
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [started.root] });
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the re-attached retained root still counts its admitted queued work");
+    assert.equal(internals.retiredCensus?.roots.has(started.root), true,
+      "the attached group's root is retained with its own execution identity");
+
+    await settleOldestUnsettled(controller, started.executionId, "cleanup target settled");
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+    // The existing verified cleanup (all tasks settled, artifacts removed) both
+    // releases ownership and retires the retained root, so the lost-work fence
+    // can never misinterpret already-cleaned work.
+    await controller.cleanupSettledArtifacts();
+    assert.equal(internals.retiredCensus?.roots.has(started.root), false,
+      "verified cleanup retires only its own settled retained root");
+    assert.equal(currentExecutionEntry().intentTokens.size, 0,
+      "the single canonical registry set holds the settled zero");
+    assert.equal("activityIntentTokens" in internals, false,
+      "the controller keeps no source-side token mirror");
+
+    // Poison the sole canonical set: the fresh pass must still derive the real
+    // zero from the canonical controller runtime state.
+    const poisoned = currentExecutionEntry();
+    poisoned.intentTokens.add("execution:ghost-after-cleanup");
+    poisoned.intentUncertain = false;
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "after verified cleanup the forced pass establishes the real zero, not unknown");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 0,
+      "and the ownership channel is settled too");
+    await controller.detach();
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a poisoned registry ghost never blocks a retired owner's canonical retained proof", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-active-intent-retired-ghost-"));
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  const controllers: BackgroundExecutionController[] = [];
+  try {
+    await initGitRepo(root);
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    const old = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => root,
+    });
+    controllers.push(old);
+    const internals = old as unknown as {
+      groups: Map<string, BackgroundExecutionGroup>;
+      activityIntentTokens?: unknown;
+      activityIntentUncertain?: unknown;
+    };
+    await old.restore({ waveRoots: [], bundles: [], groupRoots: [] });
+    const started = await old.start([{ title: "retired ghost target", instructions: "work", acceptanceCriteria: ["done"] }]);
+    const taskId = started.tasks[0]!.taskId;
+    assert.equal(activeActivitySnapshot().activeTasks, 1);
+
+    // Poison the sole canonical set with a ghost. The controller keeps no
+    // source-side mirror, so the fresh current-source read is the only repair
+    // path, and it replaces the set with the real queued token.
+    const poisonedEntry = currentExecutionEntry();
+    poisonedEntry.intentTokens.add("execution:ghost");
+    poisonedEntry.intentUncertain = false;
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the current source replaces the poisoned registry set with the real queued token");
+    assert.deepEqual([...currentExecutionEntry().intentTokens], [taskId],
+      "the single canonical set holds exactly the real queued token, with no ghost anywhere");
+    assert.equal("activityIntentTokens" in internals, false,
+      "no source-side mirror can survive a refresh because none exists");
+    assert.equal("activityIntentUncertain" in internals, false,
+      "the source keeps no uncertainty mirror to diverge from the registry");
+
+    await old.detach();
+    const replacement = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => root,
+    });
+    controllers.push(replacement);
+    await replacement.restore({ waveRoots: [], bundles: [], groupRoots: [] });
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the retired owner's retained queued work remains counted after replacement restoration");
+
+    // Repeated forced passes must reach the retired owner's canonical retained
+    // inventory and report its real queued intent — never unknown because of a
+    // derived-telemetry ghost, and never a replacement source's emptiness.
+    for (let pass = 0; pass < 3; pass += 1) {
+      await refreshOwnedActivityIntent();
+      assert.equal(activeActivitySnapshot().activeTasks, 1,
+        `forced pass ${pass + 1} reconstructs the retired owner's actual queued intent`);
+    }
+    assert.equal(internals.groups.has(started.executionId), false, "the old live map is gone after detach");
+    assert.equal(taskId.length > 0, true);
+  } finally {
+    for (const controller of controllers) await controller.detach().catch(() => undefined);
     ownedActivityTest.resetOwnedActivityForTests();
     reviewActivityTest.resetReviewActivityForTests();
     await rm(root, { recursive: true, force: true });

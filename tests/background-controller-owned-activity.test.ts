@@ -24,13 +24,13 @@ import {
   activateOwnedActivity,
   activeActivitySnapshot,
   ownedActivitySnapshot,
+  refreshOwnedActivityIntent,
   registerOwnedActivitySource,
   __test as ownedActivityTest,
 } from "../src/session-host/owned-activity";
 import { boundedScalingConfig, controllerInternals, initGitRepo, settleOldestUnsettled } from "./helpers/background-controller-fixtures";
 
 type ActivityCensusProbe = {
-  currentActivityCensusInFlight?: Promise<void>;
   ownedActivity: { retired: boolean };
 };
 
@@ -38,16 +38,13 @@ function activityCensusProbe(controller: BackgroundExecutionController): Activit
   return controller as unknown as ActivityCensusProbe;
 }
 
-async function waitForCurrentActivityCensus(controller: BackgroundExecutionController): Promise<void> {
-  const probe = activityCensusProbe(controller);
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const inFlight = probe.currentActivityCensusInFlight;
-    if (inFlight) await inFlight;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    if (!probe.currentActivityCensusInFlight) return;
-  }
-  assert.fail("current-source activity census did not settle after bounded lifecycle-event turns");
+/**
+ * Await the registry's ONE canonical coalesced activity-refresh pass. The
+ * controller no longer owns a census scheduler, in-flight queue, or dirty flag,
+ * so lifecycle events only signal readiness to this registry scheduler.
+ */
+async function awaitActivityRefresh(): Promise<void> {
+  await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
 }
 
 test("task ownership predicate retains bundle-less started work until an archivable outcome", () => {
@@ -192,7 +189,7 @@ test("a restored group root and its matching sidecar bundle do not duplicate the
     });
     controllers.push(restored);
     await restored.restore(associations);
-    await waitForCurrentActivityCensus(restored);
+    await awaitActivityRefresh();
 
     const restoredGroups = [...controllerInternals(restored).groups.values()];
     assert.equal(restoredGroups.length, 1, "the matching bundle is not adopted into a second execution group");
@@ -212,7 +209,7 @@ test("a restored group root and its matching sidecar bundle do not duplicate the
   }
 });
 
-test("an empty non-authoritative restore fallback cannot invent activity zero", async () => {
+test("a non-authoritative restore fallback keeps ownership unknown while live activity stays truthful", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "pi-review-active-intent-fallback-"));
   const roots: string[] = [];
   ownedActivityTest.resetOwnedActivityForTests();
@@ -223,12 +220,24 @@ test("an empty non-authoritative restore fallback cannot invent activity zero", 
     const controller = new BackgroundExecutionController({
       pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => workspace,
     });
+    // Retained semantics: fallback association data can never prove cleanup
+    // ownership. It also attaches no current-runtime work, so the activity
+    // channel must not inherit that historical unknown: with nothing admitted
+    // or resumed this runtime is truthfully idle.
     await controller.restore({ waveRoots: [], bundles: [] }, { authoritative: false });
-    assert.equal(activeActivitySnapshot().activeTasks, null, "empty fallback data is not an authoritative inventory");
-    const started = await controller.start([{ title: "fallback cannot prove zero", instructions: "run", acceptanceCriteria: ["done"] }]);
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "no current-runtime work is a known zero even after a non-authoritative fallback restore");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "the same fallback keeps cleanup ownership unknown, never zero");
+
+    const started = await controller.start([{ title: "fallback admits real work", instructions: "run", acceptanceCriteria: ["done"] }]);
     roots.push(started.root);
-    await waitForCurrentActivityCensus(controller);
-    assert.equal(activeActivitySnapshot().activeTasks, null, "a known current task cannot make incomplete fallback data authoritative");
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "real admitted work after the historical fallback counts normally");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "real activity never resolves the independently uncertain ownership channel");
     await controller.detach();
   } finally {
     for (const root of roots) await rm(root, { recursive: true, force: true });
@@ -237,7 +246,7 @@ test("an empty non-authoritative restore fallback cannot invent activity zero", 
   }
 });
 
-test("a foreign-session root keeps current-source activity unknown", async () => {
+test("a foreign-session root never becomes current activity and never clears retained old intent", async () => {
   const sourceWorkspace = await mkdtemp(join(tmpdir(), "pi-review-active-intent-foreign-source-"));
   const currentWorkspace = await mkdtemp(join(tmpdir(), "pi-review-active-intent-foreign-current-"));
   const roots: string[] = [];
@@ -263,11 +272,18 @@ test("a foreign-session root keeps current-source activity unknown", async () =>
     });
     controllers.push(current);
     await current.restore(associations);
-    assert.equal(activeActivitySnapshot().activeTasks, null, "a root bound to another session cwd is not adopted as current authority");
+    // A root bound to another session cwd is not adopted by this controller, so
+    // it contributes no current-runtime activity. The retired incarnation's own
+    // admitted intent stays retained (a newer source's emptiness is not proof
+    // about the older owner) and only that exact owner can settle it.
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "only the retained old source's own admitted intent remains counted");
     const admitted = await current.start([{ title: "current queued task", instructions: "run", acceptanceCriteria: ["done"] }]);
     roots.push(admitted.root);
-    await waitForCurrentActivityCensus(current);
-    assert.equal(activeActivitySnapshot().activeTasks, null, "a current task cannot mask the foreign retained root");
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 2,
+      "the current source counts its own work without adopting the foreign root");
   } finally {
     for (const controller of controllers) await controller.detach().catch(() => undefined);
     for (const root of roots) await rm(root, { recursive: true, force: true });
@@ -381,11 +397,20 @@ test("a durability-only restore save failure keeps activity known and ownership 
 
     const missingRoot = join(tmpdir(), `pi-review-execution-missing-${randomUUID()}`);
     await restored.restore({ waveRoots: [], bundles: [], groupRoots: [missingRoot] });
-    assert.equal(activeActivitySnapshot().activeTasks, null, "an unreadable authoritative root remains unknown");
+    // The unreadable root attached no group to this runtime, so it cannot
+    // manufacture current activity: it is a retained ownership obligation only.
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "an unreadable historical root leaves the current runtime's activity known");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "the same unreadable root keeps cleanup ownership unknown, never zero");
     const afterUnreadableRoot = await restored.start([{ title: "one visible task is not a full census", instructions: "run", acceptanceCriteria: ["done"] }]);
     roots.push(afterUnreadableRoot.root);
-    await waitForCurrentActivityCensus(restored);
-    assert.equal(activeActivitySnapshot().activeTasks, null, "a known current task cannot mask the still-unreadable retained root");
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "real work admitted after the unreadable historical root counts normally");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "the historical ownership obligation remains independently unknown");
 
     const orphanedBundle = {
       version: 1 as const,
@@ -396,11 +421,21 @@ test("a durability-only restore save failure keeps activity known and ownership 
       expectedRevision: 0,
     };
     await restored.restore({ waveRoots: [], bundles: [orphanedBundle], groupRoots: [] });
-    assert.equal(activeActivitySnapshot().activeTasks, null, "an unadopted legacy bundle remains activity-unknown");
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "an unadopted legacy bundle adds no activity: only the still-queued real task remains counted");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "the unadopted bundle keeps cleanup ownership unknown");
     const taskWithOrphanedBundle = await restored.start([{ title: "orphaned legacy inventory", instructions: "run", acceptanceCriteria: ["done"] }]);
     roots.push(taskWithOrphanedBundle.root);
-    await waitForCurrentActivityCensus(restored);
-    assert.equal(activeActivitySnapshot().activeTasks, null, "a new known task cannot erase an unmatched retained legacy bundle");
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 2,
+      "a new admission after the unadopted legacy bundle counts normally");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "the unmatched legacy bundle still keeps ownership unknown");
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 2,
+      "the unmatched legacy bundle never changes the current runtime's real activity count");
   } finally {
     for (const controller of controllers) await controller.detach().catch(() => undefined);
     for (const root of roots) await rm(root, { recursive: true, force: true });
@@ -442,20 +477,24 @@ test("a later admitted-task update reauthenticates every root after a transient 
     });
     controllers.push(current);
     await current.restore(associations);
-    assert.equal(activeActivitySnapshot().activeTasks, null, "the initial authenticated inventory was not fully readable");
+    // The temporarily unreadable root attached no group to this runtime, so it
+    // cannot manufacture activity: it is a retained cleanup-ownership record.
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "a transient historical read failure leaves current-runtime activity known");
     assert.equal(ownedActivitySnapshot().backgroundTasks, null, "the unreadable record keeps ownership unknown");
 
     await rename(heldManifest, manifest);
     heldManifest = undefined;
     const admitted = await current.start([{ title: "current admitted task", instructions: "run", acceptanceCriteria: ["done"] }]);
     roots.push(admitted.root);
-    await waitForCurrentActivityCensus(current);
-    assert.equal(activeActivitySnapshot().activeTasks, 1, "the fresh census counts the one current task only after authenticating every retained root");
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "the fresh census counts the one current task");
     assert.equal(ownedActivitySnapshot().backgroundTasks, null, "the current-source activity census does not resolve cleanup ownership");
 
     await settleOldestUnsettled(current, admitted.executionId, "current task settled");
-    await waitForCurrentActivityCensus(current);
-    assert.equal(activeActivitySnapshot().activeTasks, 0, "the later settlement leaves a known zero after full inventory proof");
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "the later settlement leaves a known zero");
     assert.equal(ownedActivitySnapshot().backgroundTasks, null, "cleanup uncertainty remains independent after settlement");
   } finally {
     if (heldManifest) await rename(heldManifest, join(roots[2]!, "execution.json")).catch(() => undefined);
@@ -529,23 +568,28 @@ test("a repaired current census accepts authenticated archive-index overlap with
     });
     controllers.push(current);
     await current.restore(associations);
-    await waitForCurrentActivityCensus(current);
-    assert.equal(activeActivitySnapshot().activeTasks, null, "the unreadable authenticated root keeps activity unknown");
+    await awaitActivityRefresh();
+    // The held root attached no group to this runtime: it is a retained
+    // ownership record, so current-runtime activity stays truthfully known. The
+    // authenticated stale inline/index overlap is still valid membership and is
+    // never rehydrated (or allowed to block) by the activity path.
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "an unreadable historical root leaves current-runtime activity known");
     assert.equal(ownedActivitySnapshot().backgroundTasks, null, "the unreadable root keeps cleanup ownership unknown");
 
     await rename(heldManifest, manifest);
     heldManifest = undefined;
     const admitted = await current.start([{ title: "post-repair live task", instructions: "run", acceptanceCriteria: ["done"] }]);
     roots.push(admitted.root);
-    await waitForCurrentActivityCensus(current);
+    await awaitActivityRefresh();
     assert.equal(activeActivitySnapshot().activeTasks, 1,
-      "a real admission reauthenticates the repaired root despite its valid stale inline/index overlap");
+      "a real admission counts through the authenticated stale inline/index overlap");
     assert.equal(ownedActivitySnapshot().backgroundTasks, null,
       "the activity census does not resolve the independently uncertain cleanup-ownership channel");
 
     await settleOldestUnsettled(current, admitted.executionId, "post-repair task settled");
-    await waitForCurrentActivityCensus(current);
-    assert.equal(activeActivitySnapshot().activeTasks, 0, "settlement returns the complete authenticated census to known zero");
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "settlement returns to a known zero");
     assert.equal(ownedActivitySnapshot().backgroundTasks, null, "cleanup ownership remains uncertain after activity settles");
   } finally {
     for (const controller of controllers) await controller.detach().catch(() => undefined);
@@ -570,7 +614,7 @@ test("a new host session cannot drop queued intent from a hidden admitted root",
     await controller.restore({ waveRoots: [], bundles: [], groupRoots: [] }, { sessionOwner: "session-a" });
     const admittedA = await controller.start([{ title: "session A queued task", instructions: "run", acceptanceCriteria: ["done"] }]);
     roots.push(admittedA.root);
-    await waitForCurrentActivityCensus(controller);
+    await awaitActivityRefresh();
     assert.equal(activeActivitySnapshot().activeTasks, 1, "session A has one admitted queued task");
 
     const manifestA = join(admittedA.root, "execution.json");
@@ -579,22 +623,36 @@ test("a new host session cannot drop queued intent from a hidden admitted root",
     const sessionSwitch = controller.restore({ waveRoots: [], bundles: [], groupRoots: [] }, { sessionOwner: "session-b" });
     assert.equal(activeActivitySnapshot().activeTasks, null, "the new session invalidates the prior activity proof before its first await");
     await sessionSwitch;
-    await waitForCurrentActivityCensus(controller);
+    await awaitActivityRefresh();
+    // The session switch detached and rebuilt this controller's live maps, so
+    // session A's admitted queued work is no longer visible in the current
+    // runtime yet was never proven settled. Nobody may publish a false zero for
+    // it: not the census, and not a forced fresh pass.
+    await refreshOwnedActivityIntent();
     assert.equal(activeActivitySnapshot().activeTasks, null,
-      "session B remains unknown while session A's retained admitted manifest is unreadable");
+      "session A's unproven queued intent keeps activity unknown, never a false zero");
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, null, "repeated forced passes stay unknown");
 
     await rename(heldManifest, manifestA);
     heldManifest = undefined;
     const admittedB = await controller.start([{ title: "session B queued task", instructions: "run", acceptanceCriteria: ["done"] }]);
     roots.push(admittedB.root);
-    await waitForCurrentActivityCensus(controller);
-    assert.equal(activeActivitySnapshot().activeTasks, 2,
-      "a real session B admission reauthenticates the repaired session A root and counts both queued intents");
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "a new session B admission cannot clear session A's still-unproven retained intent");
 
+    // Only session A's exact owner can discharge that uncertainty: settling B
+    // (its own exact settlement) and re-attaching A's root.
     await settleOldestUnsettled(controller, admittedB.executionId, "session B task settled");
-    await waitForCurrentActivityCensus(controller);
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [admittedA.root] });
+    await refreshOwnedActivityIntent();
     assert.equal(activeActivitySnapshot().activeTasks, 1,
-      "settling session B releases only its intent while the retained session A task remains queued");
+      "re-attaching its exact root proves session A's queued intent");
+    await settleOldestUnsettled(controller, admittedA.executionId, "session A task settled");
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "the exact owner's own settlement establishes the truth");
     await controller.detach();
   } finally {
     if (heldManifest) await rename(heldManifest, join(roots[0]!, "execution.json")).catch(() => undefined);
@@ -640,16 +698,23 @@ test("a detached in-flight current-source census cannot resolve a rebound source
     });
     controllers.push(current);
     await current.restore(associations);
-    assert.equal(activeActivitySnapshot().activeTasks, null, "the initial source inventory is incomplete");
+    // The held historical root attached no group to this runtime, so the
+    // restoration boundary is truthfully idle; ownership stays unknown.
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "the initial retained history attaches no current-runtime work");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null, "the unreadable retained record keeps ownership unknown");
     await rename(heldManifest, manifest);
     heldManifest = undefined;
 
     const admitted = await current.start([{ title: "queued before rebind", instructions: "run", acceptanceCriteria: ["done"] }]);
     roots.push(admitted.root);
+    // Let the admission's save tail prune before the read-only census runs.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    // The registry's ONE canonical forced fresh pass reads this incarnation and
+    // is held at its read-only barrier. The controller owns no census queue.
+    const pass = refreshOwnedActivityIntent();
     await censusEntered;
     const oldHandle = activityCensusProbe(current).ownedActivity;
-    const pendingCensus = activityCensusProbe(current).currentActivityCensusInFlight;
-    assert.ok(pendingCensus, "the event-triggered census is held at its read-only barrier");
 
     await current.detach();
     const replacement = new BackgroundExecutionController({
@@ -660,9 +725,10 @@ test("a detached in-flight current-source census cannot resolve a rebound source
     assert.equal(oldHandle.retired, true, "the replacement owns a distinct source incarnation");
 
     releaseCensus();
-    await pendingCensus;
-    await waitForCurrentActivityCensus(current);
-    assert.equal(activeActivitySnapshot().activeTasks, null, "the stale census cannot clear the retired source or the replacement's unknown count");
+    await pass;
+    await awaitActivityRefresh();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the stale census publishes nothing: the retired source's retained intent survives the replacement's empty source");
   } finally {
     releaseCensus();
     if (heldManifest) await rename(heldManifest, join(roots[0]!, "execution.json")).catch(() => undefined);

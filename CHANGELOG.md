@@ -15,6 +15,51 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.180]
+
+### Fixed
+
+- Parallel worker startup no longer races on one repository's shared Git worktree
+  administration (#451). Preparing, removing, and cleaning up managed worktrees of the
+  same captured repository now run one at a time, so a preparation can no longer observe
+  another preparation's partially created or partially removed registration — previously
+  surfacing as `failed to read worktrees/<id>/commondir` during `git worktree add` and a
+  task that never reached execution. Only that short Git administration section is
+  serialized: executor and reviewer work stays concurrent, different repositories stay
+  independent, and the configured worker pool keeps its capacity. Cancelling a queued
+  preparation still admits no work and mutates no repository metadata, an active
+  preparation keeps its existing bounded failed-creation cleanup, and cancellation,
+  path/ownership validation, retained work, recovery records, and the conservative
+  dirty-worktree removal protections are unchanged — removal still refuses dirty sources
+  and no removal forces, purges, or broadens what it may delete, but its cleanliness
+  revalidation now runs under the same lease so ignored recovery data that appears while
+  a removal waits is preserved rather than deleted.
+- Session-host activity status (#412) now distinguishes a freshly loaded owning runtime
+  from historical conversation state. Loading a saved conversation creates a new owning
+  runtime rather than attaching to the former process, and a load that admits or resumes
+  no work reports known idle agent status and zero background-task/shell activity at its
+  first successful Ready presentation, not eventually. Former counts, busy state, and
+  unknown or incomplete telemetry are never replayed as that runtime's activity; work
+  that actually starts or resumes is counted from its own current lifecycle
+  observations. Stale or unknown activity also recovers independently: the host discards
+  the affected ephemeral telemetry understanding and requests the owning client's
+  complete authoritative current census from its live sources instead of re-reading a
+  cached aggregate or waiting for an unrelated prompt, task, or event. The canonical
+  live-source census stays separate from historical cleanup uncertainty, an explicit
+  source refresh re-observes all sources even when cached, and recovery is one bounded
+  authenticated host-to-client request per attempt, event-driven with no periodic or
+  global polling. Healthy clients re-establish their actual zero or nonzero value across
+  repeated episodes without a new prompt, task, manual refresh, or client restart, while
+  genuinely unreachable or incomplete live evidence remains unknown. Durable
+  task/group/recovery records, ownership/security identities, stop/remove safeguards, and
+  saved-conversation behavior are unchanged; recovery never coerces an unavailable
+  status to zero, erases a lost owner's retained state, or restarts a client or purges a
+  cache to obtain status.
+  Reporters that do not answer the census remain unknown, so this is a truthful
+  additive authenticated control request with no configuration or package-layout
+  change. The reported symptom's exact trigger and any native-platform certification
+  remain unestablished.
+
 ## [0.1.0-dev.179]
 
 ### Fixed

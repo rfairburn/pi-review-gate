@@ -1498,10 +1498,28 @@ test("scheduler refills slots immediately as workers settle", async () => {
       },
     });
 
-    assert.equal(result.taskResults.length, 4);
+    // Capture both observed counts synchronously, immediately after the wave
+    // settled and before any awaiting diagnostic I/O. Late scheduler progress
+    // delivered while diagnostics read operation records must never be able to
+    // turn an observed 3 into a passing 4.
+    const refillResultCount = result.taskResults.length;
+    const refillStartedCount = startedTasks.size;
+    const refillCountsHold = refillResultCount === 4 && refillStartedCount === 4;
+
+    // Only the failing path pays for diagnostics, and it reports against the
+    // counts captured above: the assertion still fails on the originally
+    // observed numbers even if more progress arrives during the reads. When all
+    // tasks settled to an eligible status the helper has nothing to add, so the
+    // captured counts are always included.
+    const refillFailures = refillCountsHold
+      ? ""
+      : ` (observed results=${refillResultCount}, started=${refillStartedCount})` +
+        (await describeTaskFailures(result));
+
+    assert.equal(refillResultCount, 4, `Expected 4 task results${refillFailures}`);
     // With maxWorkers: 2 and 4 tasks, the first 2 should start, then as they
     // settle the remaining 2 should start. The key is that all 4 complete.
-    assert.equal(startedTasks.size, 4, "All 4 tasks should have started executing");
+    assert.equal(refillStartedCount, 4, `All 4 tasks should have started executing${refillFailures}`);
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });

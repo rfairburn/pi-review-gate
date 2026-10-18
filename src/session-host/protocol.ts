@@ -13,7 +13,11 @@
  * identity/name metadata, and optional bounded owned background-work counts
  * (logical execution/review work and unconfirmed background shell jobs). The
  * host can also send narrowly scoped authenticated native rename and
- * graceful-shutdown requests and receive their observed results. Status frames
+ * graceful-shutdown requests and receive their observed results. A host that
+ * observed the reporter's advertised `activity-census` capability can request
+ * one complete freshly observed status from that exact live client; the
+ * correlated reply is a full snapshot built from current readiness and owning
+ * source state, not a cached aggregate. Status frames
  * still carry no tool arguments, prompts, or transcripts. A hosted child may
  * explicitly submit one bounded authenticated SessionSpawn command containing
  * its supplied workspace, title, and prompt; the host replies only with a
@@ -96,7 +100,17 @@ export interface SessionHostHello {
   instanceId: string;
   generation: string;
   token: string;
+  /**
+   * Optional bounded capability advertisement. Legacy reporters omit it; a host
+   * must never send an unknown request frame to a peer that did not advertise
+   * support, because the old reporter treats unknown frames as a protocol
+   * violation and closes the connection.
+   */
+  capabilities?: string[];
 }
+
+/** Capability name for the authenticated fresh activity-census request. */
+export const ACTIVITY_CENSUS_CAPABILITY = "activity-census";
 
 /**
  * Pushed status snapshot. `busy`/`pendingInput` are null when unknown:
@@ -140,6 +154,49 @@ export interface SessionHostStatus {
   activeTasks?: number | null;
   /** Started/running owned background shell work; a retained cleanup-only job reads zero. */
   activeShells?: number | null;
+}
+
+/**
+ * Host request for one complete, freshly observed activity census from the
+ * exact authenticated live client. The request is fenced by the registration
+ * token/generation, a unique request id, the host's last accepted status
+ * sequence, and (when known) the exact native session tuple. A complete reply
+ * must carry a strictly newer status sequence and a snapshot rebuilt from the
+ * client's actual current readiness and owning-source state.
+ */
+export interface SessionHostActivityRequest {
+  version: 1;
+  type: "activity_request";
+  instanceId: string;
+  generation: string;
+  token: string;
+  requestId: string;
+  /** Last status sequence accepted by the host; a complete reply must advance it. */
+  afterSequence: number;
+  /** Exact expected native session tuple, or null when the host has no observation. */
+  expectedSessionId: string | null;
+  expectedSessionEpoch: number | null;
+}
+
+export type SessionHostActivityOutcome = "complete" | "stale-session" | "unavailable";
+
+/**
+ * Correlated response to {@link SessionHostActivityRequest}. Only a complete
+ * result carries a full fresh status snapshot. Stale-session and unavailable
+ * results never carry a snapshot, so a host can never replace its row with an
+ * old or fabricated census.
+ */
+export interface SessionHostActivityResult {
+  version: 1;
+  type: "activity_result";
+  instanceId: string;
+  generation: string;
+  requestId: string;
+  outcome: SessionHostActivityOutcome;
+  /** Fresh complete snapshot; present only with outcome "complete". */
+  status?: SessionHostStatus;
+  observedSessionId: string | null;
+  observedSessionEpoch: number | null;
 }
 
 /** Bounded native conversation identity and canonical display title. */
@@ -246,7 +303,8 @@ export interface SessionSpawnInput {
 export type SessionSpawnOutcome = SessionHostSpawnAck["outcome"];
 
 export type SessionHostMessage = SessionHostHello | SessionHostStatus | SessionHostRenameRequest | SessionHostRenameAck
-  | SessionHostShutdownRequest | SessionHostShutdownAck | SessionHostSpawnRequest | SessionHostSpawnAck;
+  | SessionHostShutdownRequest | SessionHostShutdownAck | SessionHostSpawnRequest | SessionHostSpawnAck
+  | SessionHostActivityRequest | SessionHostActivityResult;
 
 function isValidId(value: unknown): value is string {
   return typeof value === "string" && value.length >= 1 && value.length <= MAX_ID_LENGTH && ID_PATTERN.test(value);
@@ -363,12 +421,22 @@ export function parseHello(value: unknown): SessionHostHello | undefined {
   if (!isValidId(value.instanceId)) return undefined;
   if (!isValidId(value.generation)) return undefined;
   if (!isValidToken(value.token)) return undefined;
+  let capabilities: string[] | undefined;
+  if (Object.prototype.hasOwnProperty.call(value, "capabilities")) {
+    if (!Array.isArray(value.capabilities) || value.capabilities.length > 8) return undefined;
+    for (const capability of value.capabilities) {
+      if (typeof capability !== "string" || capability.length === 0 || capability.length > 64
+        || !/^[a-z0-9][a-z0-9-]*$/.test(capability)) return undefined;
+    }
+    capabilities = [...(value.capabilities as string[])];
+  }
   return {
     version: 1,
     type: "hello",
     instanceId: value.instanceId,
     generation: value.generation,
     token: value.token,
+    ...(capabilities === undefined ? {} : { capabilities }),
   };
 }
 
@@ -427,6 +495,79 @@ export function parseStatus(value: unknown): SessionHostStatus | undefined {
     ...(activeTasks === undefined ? {} : { activeTasks }),
     ...(activeShells === undefined ? {} : { activeShells }),
     ...(nativeSession === undefined ? {} : { nativeSession }),
+  };
+}
+
+/** Validates a broker-to-reporter authoritative activity-census request. */
+export function parseActivityRequest(value: unknown): SessionHostActivityRequest | undefined {
+  if (!isRecord(value) || value.version !== PROTOCOL_VERSION || value.type !== "activity_request") return undefined;
+  if (!isValidId(value.instanceId) || !isValidId(value.generation) || !isValidToken(value.token)) return undefined;
+  if (!isValidId(value.requestId)) return undefined;
+  if (!Number.isSafeInteger(value.afterSequence) || (value.afterSequence as number) < 0) return undefined;
+  const expectedSessionId = value.expectedSessionId;
+  const expectedSessionEpoch = value.expectedSessionEpoch;
+  if (expectedSessionId !== null && !isValidNativeSessionId(expectedSessionId)) return undefined;
+  if (expectedSessionEpoch !== null
+    && (!Number.isSafeInteger(expectedSessionEpoch) || (expectedSessionEpoch as number) < 1)) return undefined;
+  if ((expectedSessionId === null) !== (expectedSessionEpoch === null)) return undefined;
+  return {
+    version: 1,
+    type: "activity_request",
+    instanceId: value.instanceId,
+    generation: value.generation,
+    token: value.token,
+    requestId: value.requestId,
+    afterSequence: value.afterSequence as number,
+    expectedSessionId: expectedSessionId as string | null,
+    expectedSessionEpoch: expectedSessionEpoch as number | null,
+  };
+}
+
+/**
+ * Validates a reporter activity-census result. A complete result must carry a
+ * full status snapshot whose identity and observed native tuple agree with the
+ * result envelope; non-complete results must not carry a snapshot at all.
+ */
+export function parseActivityResult(value: unknown): SessionHostActivityResult | undefined {
+  if (!isRecord(value) || value.version !== PROTOCOL_VERSION || value.type !== "activity_result") return undefined;
+  if (!isValidId(value.instanceId) || !isValidId(value.generation) || !isValidId(value.requestId)) return undefined;
+  if (value.outcome !== "complete" && value.outcome !== "stale-session" && value.outcome !== "unavailable") return undefined;
+  const observedSessionId = value.observedSessionId;
+  const observedSessionEpoch = value.observedSessionEpoch;
+  if (observedSessionId !== null && !isValidNativeSessionId(observedSessionId)) return undefined;
+  if (observedSessionEpoch !== null
+    && (!Number.isSafeInteger(observedSessionEpoch) || (observedSessionEpoch as number) < 1)) return undefined;
+  if ((observedSessionId === null) !== (observedSessionEpoch === null)) return undefined;
+  const hasStatus = Object.prototype.hasOwnProperty.call(value, "status");
+  if (value.outcome !== "complete") {
+    const parsed: SessionHostActivityResult = {
+      version: 1,
+      type: "activity_result",
+      instanceId: value.instanceId,
+      generation: value.generation,
+      requestId: value.requestId,
+      outcome: value.outcome,
+      observedSessionId: observedSessionId as string | null,
+      observedSessionEpoch: observedSessionEpoch as number | null,
+    };
+    return hasStatus ? undefined : parsed;
+  }
+  const status = parseStatus(value.status);
+  if (!status) return undefined;
+  if (status.instanceId !== value.instanceId || status.generation !== value.generation) return undefined;
+  const statusSessionId = status.nativeSession?.sessionId ?? null;
+  const statusSessionEpoch = status.nativeSession?.epoch ?? null;
+  if (statusSessionId !== observedSessionId || statusSessionEpoch !== observedSessionEpoch) return undefined;
+  return {
+    version: 1,
+    type: "activity_result",
+    instanceId: value.instanceId,
+    generation: value.generation,
+    requestId: value.requestId,
+    outcome: "complete",
+    status,
+    observedSessionId: observedSessionId as string | null,
+    observedSessionEpoch: observedSessionEpoch as number | null,
   };
 }
 
@@ -600,6 +741,8 @@ export function decodeFrame(line: string): SessionHostMessage | undefined {
     case "shutdown_result": return parseShutdownAck(parsed);
     case "spawn_request": return parseSpawnRequest(parsed);
     case "spawn_result": return parseSpawnAck(parsed);
+    case "activity_request": return parseActivityRequest(parsed);
+    case "activity_result": return parseActivityResult(parsed);
     default: return undefined;
   }
 }

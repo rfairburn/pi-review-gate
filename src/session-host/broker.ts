@@ -20,6 +20,10 @@
  * shutdown acknowledgement means only that public shutdown was requested;
  * the manager must still observe the owned PTY's actual onExit before treating
  * the process as exited.
+ * A registration whose reporter advertised `activity-census` can also request
+ * one complete freshly observed status; concurrent requests coalesce with one
+ * bounded follow-up, stale/reordered replies cannot replace a newer accepted
+ * snapshot, and a legacy reporter is never sent an unadvertised frame.
  *
  * Safety contract (fail closed):
  *
@@ -76,6 +80,9 @@ import { createServer, type Server, type Socket } from "node:net";
 import os from "node:os";
 import { isAbsolute, join } from "node:path";
 import {
+  ACTIVITY_CENSUS_CAPABILITY,
+  type SessionHostActivityRequest,
+  type SessionHostActivityResult,
   type SessionHostBootstrap,
   type SessionHostHello,
   type SessionHostNativeSession,
@@ -116,6 +123,13 @@ export interface StatusBrokerStatusHandlers {
   onStatus: (status: SessionHostStatus) => void;
   /** Fired only when a currently-owned authenticated connection actually disconnects. */
   onDisconnect: () => void;
+  /**
+   * Fired after a valid hello supersedes or reconnects an already-observed
+   * registration. The host may discard its cached ephemeral row understanding
+   * and request a fresh authoritative census; this is never fired for the
+   * first connection of a fresh registration.
+   */
+  onReconnect?: () => void;
   /** Optional host-side operation invoked only by a valid request on this registration's authenticated connection. */
   onSpawnRequest?: (request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 }
@@ -134,6 +148,21 @@ export interface StatusRegistration {
   shutdown: (options?: { readonly requireIdle?: boolean }) => Promise<StatusShutdownResult>;
   /** Releases the registration: closes its active connection silently, rejects later hellos. */
   release: () => void;
+  /**
+   * Requests one bounded, coalesced fresh activity census from this exact
+   * authenticated live client. A complete result is delivered through
+   * `onStatus` before the returned promise resolves; no token or wire request
+   * id is exposed to the caller.
+   */
+  requestActivity?: () => Promise<StatusActivityRefreshResult>;
+}
+
+export type StatusActivityRefreshStatus = "complete" | "unavailable" | "stale" | "unsupported" | "busy" | "timeout" | "disconnected";
+
+/** Observed outcome of one host-requested activity census; never a token or snapshot. */
+export interface StatusActivityRefreshResult {
+  requestId: string;
+  status: StatusActivityRefreshStatus;
 }
 
 /** Native session tuple expected before a persisted rename. */
@@ -193,6 +222,7 @@ const MAX_PENDING_UNAUTH_CONNECTIONS = 32;
 const AUTH_DEADLINE_MS = 2000;
 const RENAME_TIMEOUT_MS = 5000;
 const SHUTDOWN_TIMEOUT_MS = 5000;
+const ACTIVITY_TIMEOUT_MS = 5000;
 const SPAWN_TIMEOUT_MS = 60_000;
 const WINDOWS_PIPE_LISTEN_TIMEOUT_MS = 5000;
 const WINDOWS_PIPE_CLOSE_TIMEOUT_MS = 5000;
@@ -203,6 +233,7 @@ const MAX_PENDING_CONTROL_FRAMES = 4;
 const MAX_COMPLETED_RENAME_IDS = 64;
 const MAX_COMPLETED_SHUTDOWN_IDS = 64;
 const MAX_COMPLETED_SPAWN_IDS = 64;
+const MAX_COMPLETED_ACTIVITY_IDS = 64;
 
 /**
  * Conservative cap on a POSIX broker socket path in UTF-8 bytes. macOS
@@ -242,6 +273,13 @@ interface RegistrationRecord {
   completedShutdownIds: Set<string>;
   pendingSpawns: Map<string, PendingSpawn>;
   completedSpawns: Map<string, CompletedSpawn>;
+  pendingActivity: PendingActivity | undefined;
+  /** One bounded follow-up is admitted when a caller coalesces onto an in-flight request. */
+  activityFollowUp: boolean;
+  /** True only when the authenticated peer advertised the additive capability. */
+  activityCensusSupported: boolean;
+  /** Bounded completed requests retained only to validate a later complete reply. */
+  completedActivityRequests: Map<string, Pick<SessionHostActivityRequest, "afterSequence" | "expectedSessionId" | "expectedSessionEpoch">>;
   shutdownResult: Promise<StatusShutdownResult> | undefined;
   active: ConnectionState | undefined;
   handlers: StatusBrokerStatusHandlers;
@@ -266,6 +304,14 @@ interface PendingSpawn {
   readonly fingerprint: string;
   connection: ConnectionState;
   timer: NodeJS.Timeout;
+}
+
+interface PendingActivity {
+  connection: ConnectionState;
+  request: SessionHostActivityRequest;
+  timer: NodeJS.Timeout;
+  promise: Promise<StatusActivityRefreshResult>;
+  resolve: (result: StatusActivityRefreshResult) => void;
 }
 
 interface CompletedSpawn {
@@ -347,6 +393,45 @@ function classifyShutdownAck(
   return "matching";
 }
 
+type ActivityResultClassification = "complete" | "unavailable" | "stale" | "invalid";
+
+/**
+ * Shared production/test predicate for activity-result identity, request
+ * correlation, native tuple fencing, and monotonic sequence advancement.
+ */
+function classifyActivityResult(
+  result: SessionHostActivityResult,
+  expected: SessionHostActivityRequest,
+  instanceId: string,
+  generation: string,
+  lastSequence: number,
+): ActivityResultClassification {
+  if (!timingSafeTextEqual(result.instanceId, instanceId)
+    || !timingSafeTextEqual(result.generation, generation)
+    || result.requestId !== expected.requestId) return "invalid";
+  if (result.outcome === "unavailable") return "unavailable";
+  if (result.outcome === "stale-session") return "stale";
+  const status = result.status;
+  if (!status) return "invalid";
+  // A complete result must be a genuinely newer observation than both the
+  // sequence the request was issued at and anything already accepted. A valid
+  // concurrent status that already advanced the registration makes this reply
+  // stale rather than a protocol failure.
+  if (status.sequence <= expected.afterSequence || status.sequence <= lastSequence) return "stale";
+  // When the host had a known native tuple, a complete reply must still be
+  // about that exact session. A client that moved to another conversation
+  // returns stale-session/unavailable instead, never a replaceable snapshot.
+  if (expected.expectedSessionId !== null) {
+    if (result.observedSessionId !== expected.expectedSessionId
+      || result.observedSessionEpoch !== expected.expectedSessionEpoch) return "stale";
+    const statusSessionId = status.nativeSession?.sessionId ?? null;
+    const statusSessionEpoch = status.nativeSession?.epoch ?? null;
+    if (statusSessionId !== expected.expectedSessionId
+      || statusSessionEpoch !== expected.expectedSessionEpoch) return "stale";
+  }
+  return "complete";
+}
+
 /** Test-only override allows root-bound fixtures to express the same local path relatively. */
 let socketPathLimitForTests: number | undefined;
 let brokerPlatformForTests: NodeJS.Platform | undefined;
@@ -354,11 +439,13 @@ let createServerForTests: (() => Server) | undefined;
 let windowsPipeListenTimeoutForTests: number | undefined;
 let windowsPipeCloseTimeoutForTests: number | undefined;
 let spawnTimeoutMsForTests: number | undefined;
+let activityTimeoutMsForTests: number | undefined;
 
 /** Narrow seams for protocol policy tests and root-bound socket fixtures. */
 export const __test = Object.freeze({
   classifyRenameAck,
   classifyShutdownAck,
+  classifyActivityResult,
   setSocketPathLimitForTests(limit: number | undefined): void {
     socketPathLimitForTests = limit;
   },
@@ -374,6 +461,9 @@ export const __test = Object.freeze({
   },
   setSpawnTimeoutForTests(timeoutMs: number | undefined): void {
     spawnTimeoutMsForTests = timeoutMs;
+  },
+  setActivityTimeoutForTests(timeoutMs: number | undefined): void {
+    activityTimeoutMsForTests = timeoutMs;
   },
 });
 
@@ -635,6 +725,10 @@ class LocalStatusBroker implements StatusBroker {
       completedShutdownIds: new Set(),
       pendingSpawns: new Map(),
       completedSpawns: new Map(),
+      pendingActivity: undefined,
+      activityFollowUp: false,
+      activityCensusSupported: false,
+      completedActivityRequests: new Map(),
       shutdownResult: undefined,
       active: undefined,
       handlers,
@@ -652,6 +746,7 @@ class LocalStatusBroker implements StatusBroker {
       rename: (request) => this.#rename(record, request),
       shutdown: (options) => this.#shutdown(record, options),
       release: () => this.#releaseRegistration(record),
+      requestActivity: () => this.#requestActivity(record),
     };
   }
 
@@ -786,6 +881,121 @@ class LocalStatusBroker implements StatusBroker {
     return promise;
   }
 
+  /**
+   * One coalesced fresh-census request per registration. Concurrent callers
+   * share the in-flight promise; one additional bounded follow-up is allowed
+   * when that first reply is not complete, so a genuinely repeated unknown
+   * episode gets one fresh attempt without a polling loop or unbounded queue.
+   */
+  #requestActivity(record: RegistrationRecord): Promise<StatusActivityRefreshResult> {
+    const pending = record.pendingActivity;
+    if (pending) {
+      record.activityFollowUp = true;
+      return pending.promise;
+    }
+    const requestId = randomUUID();
+    const result = (status: StatusActivityRefreshStatus): StatusActivityRefreshResult => ({ requestId, status });
+    if (record.released || this.#disposed) return Promise.resolve(result("disconnected"));
+    if (!record.activityCensusSupported) {
+      // A legacy reporter treats unknown frames as a protocol violation. It
+      // stays a truthful unknown without reconnect churn or restart work; the
+      // host never sends a request it did not advertise support for.
+      return Promise.resolve(result("unsupported"));
+    }
+    const connection = record.active;
+    if (!connection || !connection.authed || connection.destroyed || connection.superseded) {
+      return Promise.resolve(result("disconnected"));
+    }
+    if (connection.renameWriteQueue.length >= MAX_PENDING_CONTROL_FRAMES) {
+      return Promise.resolve(result("busy"));
+    }
+    const session = record.latestNativeSession;
+    const command: SessionHostActivityRequest = {
+      version: PROTOCOL_VERSION,
+      type: "activity_request",
+      instanceId: record.instanceId,
+      generation: this.generation,
+      token: record.token,
+      requestId,
+      afterSequence: record.lastSequence,
+      expectedSessionId: session?.sessionId ?? null,
+      expectedSessionEpoch: session?.epoch ?? null,
+    };
+    let resolve!: (value: StatusActivityRefreshResult) => void;
+    const promise = new Promise<StatusActivityRefreshResult>((settle) => { resolve = settle; });
+    const timer = setTimeout(() => {
+      const current = record.pendingActivity;
+      if (current?.request.requestId !== requestId) return;
+      this.#settleActivity(record, current, result("timeout"));
+      // A read-only census timeout settles as truthfully unknown and keeps the
+      // authenticated channel. A later pushed status or complete reply is
+      // still accepted, so a slow reply never forces reconnect churn or
+      // clobbers a newer valid live observation.
+    }, activityTimeoutMsForTests ?? ACTIVITY_TIMEOUT_MS);
+    timer.unref?.();
+    const operation: PendingActivity = {
+      connection,
+      request: command,
+      timer,
+      promise,
+      resolve,
+    };
+    record.pendingActivity = operation;
+    try {
+      this.#queueRenameFrame(connection, encodeFrame(command));
+    } catch {
+      this.#settleActivity(record, operation, result("disconnected"));
+      this.#destroyConnection(connection);
+    }
+    return promise;
+  }
+
+  #rememberCompletedActivity(record: RegistrationRecord, requestId: string): void {
+    record.completedActivityRequests.delete(requestId);
+    if (record.completedActivityRequests.size >= MAX_COMPLETED_ACTIVITY_IDS) {
+      const oldest = record.completedActivityRequests.keys().next().value as string | undefined;
+      if (oldest) record.completedActivityRequests.delete(oldest);
+    }
+  }
+
+  #settleActivity(
+    record: RegistrationRecord,
+    pending: PendingActivity,
+    result: StatusActivityRefreshResult,
+  ): void {
+    if (record.pendingActivity !== pending) return;
+    record.pendingActivity = undefined;
+    clearTimeout(pending.timer);
+    this.#rememberCompletedActivity(record, pending.request.requestId);
+    record.completedActivityRequests.set(pending.request.requestId, {
+      afterSequence: pending.request.afterSequence,
+      expectedSessionId: pending.request.expectedSessionId,
+      expectedSessionEpoch: pending.request.expectedSessionEpoch,
+    });
+    try {
+      pending.resolve(result);
+    } catch {
+      // A consumer's Promise machinery is outside the transport contract.
+    }
+    const followUp = record.activityFollowUp;
+    record.activityFollowUp = false;
+    if (followUp && result.status !== "complete" && !record.released && !this.#disposed) {
+      // At most one additional read for a coalesced caller; its result is
+      // delivered through onStatus and never recursively fans out.
+      void this.#requestActivity(record).catch(() => undefined);
+    }
+  }
+
+  #failPendingActivity(record: RegistrationRecord, connection: ConnectionState): void {
+    const pending = record.pendingActivity;
+    if (pending?.connection === connection) {
+      this.#settleActivity(record, pending, {
+        requestId: pending.request.requestId,
+        status: "disconnected",
+      });
+    }
+  }
+
   #queueRenameFrame(connection: ConnectionState, frame: string): void {
     if (connection.destroyed || connection.superseded || connection.renameWriteQueue.length >= MAX_PENDING_CONTROL_FRAMES) {
       throw new Error("control transport unavailable");
@@ -852,6 +1062,7 @@ class LocalStatusBroker implements StatusBroker {
 
   #failPendingRenames(record: RegistrationRecord, connection: ConnectionState, status: "disconnected"): void {
     connection.renameWriteQueue.length = 0;
+    this.#failPendingActivity(record, connection);
     for (const pending of [...record.pendingRenames.values()]) {
       if (pending.connection === connection) {
         this.#settleRename(record, pending, {
@@ -885,6 +1096,12 @@ class LocalStatusBroker implements StatusBroker {
     for (const record of this.#registrations.values()) {
       record.released = true;
       if (record.active) this.#failPendingRenames(record, record.active, "disconnected");
+      if (record.pendingActivity) {
+        this.#settleActivity(record, record.pendingActivity, {
+          requestId: record.pendingActivity.request.requestId,
+          status: "disconnected",
+        });
+      }
       for (const pending of [...record.pendingSpawns.values()]) this.#settleSpawn(record, pending, "unknown");
       record.active = undefined;
     }
@@ -1208,6 +1425,8 @@ class LocalStatusBroker implements StatusBroker {
       this.#onRenameAck(conn, message);
     } else if (message.type === "shutdown_result") {
       this.#onShutdownAck(conn, message);
+    } else if (message.type === "activity_result") {
+      this.#onActivityResult(conn, message);
     } else if (message.type === "spawn_request") {
       this.#onSpawnRequest(conn, message);
     } else {
@@ -1238,6 +1457,7 @@ class LocalStatusBroker implements StatusBroker {
 
     // Authenticate and bind this connection to its registration.
     conn.authed = true;
+    record.activityCensusSupported = hello.capabilities?.includes(ACTIVITY_CENSUS_CAPABILITY) === true;
     if (conn.authTimer) {
       clearTimeout(conn.authTimer);
       conn.authTimer = undefined;
@@ -1257,6 +1477,17 @@ class LocalStatusBroker implements StatusBroker {
     }
     record.active = conn;
     conn.registration = record;
+    if ((previous !== undefined || record.lastSequence > 0)
+      && typeof record.handlers.onReconnect === "function") {
+      // The host may independently discard its cached ephemeral row
+      // understanding and request a fresh exact-owner census. A first
+      // connection for a fresh registration has no cached row to discard.
+      try {
+        record.handlers.onReconnect();
+      } catch {
+        // Contained: a host callback failure never breaks authentication.
+      }
+    }
   }
 
   #onStatus(conn: ConnectionState, status: SessionHostStatus): void {
@@ -1422,6 +1653,96 @@ class LocalStatusBroker implements StatusBroker {
     }
   }
 
+  #onActivityResult(conn: ConnectionState, result: SessionHostActivityResult): void {
+    const record = conn.registration;
+    if (!record || !conn.authed || conn.superseded || record.released || record.active !== conn) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    const pending = record.pendingActivity;
+    const completed = record.completedActivityRequests.get(result.requestId);
+    // A reply for a previously settled/timed-out request can arrive while the
+    // bounded follow-up is pending. It never satisfies or disturbs that newer
+    // request; a genuinely newer complete snapshot is still applied.
+    if (!pending || pending.request.requestId !== result.requestId) {
+      if (completed) {
+        // A timed-out request may still produce one late COMPLETE reply. It is
+        // applied only when it is a genuinely newer, exact-session snapshot;
+        // stale sessions/incarnations and non-complete outcomes are ignored.
+        const late: SessionHostActivityRequest = {
+          version: PROTOCOL_VERSION,
+          type: "activity_request",
+          instanceId: record.instanceId,
+          generation: this.generation,
+          token: record.token,
+          requestId: result.requestId,
+          afterSequence: completed.afterSequence,
+          expectedSessionId: completed.expectedSessionId,
+          expectedSessionEpoch: completed.expectedSessionEpoch,
+        };
+        if (classifyActivityResult(result, late, record.instanceId, this.generation, record.lastSequence) === "complete") {
+          const status = result.status!;
+          record.lastSequence = status.sequence;
+          record.latestNativeSession = status.nativeSession ?? null;
+          record.completedActivityRequests.delete(result.requestId);
+          try {
+            record.handlers.onStatus(status);
+          } catch {
+            // Contained: the broker keeps serving subsequent frames.
+          }
+        }
+        return;
+      }
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (pending.connection !== conn) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    const classification = classifyActivityResult(
+      result,
+      pending.request,
+      record.instanceId,
+      this.generation,
+      record.lastSequence,
+    );
+    if (classification === "invalid") {
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (classification === "stale") {
+      this.#settleActivity(record, pending, {
+        requestId: result.requestId,
+        status: "stale",
+      });
+      return;
+    }
+    if (classification === "unavailable") {
+      this.#settleActivity(record, pending, {
+        requestId: result.requestId,
+        status: "unavailable",
+      });
+      return;
+    }
+    const status = result.status!;
+    // Commit the fresh observation exactly as an ordinary status snapshot.
+    // The registration keeps one monotonic sequence fence for both pushed
+    // frames and requested replies, so neither path self-invalidates a valid
+    // current snapshot from the other.
+    record.lastSequence = status.sequence;
+    record.latestNativeSession = status.nativeSession ?? null;
+    try {
+      record.handlers.onStatus(status);
+    } catch {
+      // Contained: the broker keeps serving subsequent frames.
+    }
+    this.#settleActivity(record, pending, {
+      requestId: result.requestId,
+      status: "complete",
+    });
+  }
+
   #onRenameAck(conn: ConnectionState, ack: SessionHostRenameAck): void {
     const record = conn.registration;
     if (!record || !conn.authed || conn.superseded || record.released || record.active !== conn) {
@@ -1567,6 +1888,12 @@ class LocalStatusBroker implements StatusBroker {
       record.active.superseded = true;
       record.active.registration = undefined;
       this.#destroyConnection(record.active);
+    }
+    if (record.pendingActivity) {
+      this.#settleActivity(record, record.pendingActivity, {
+        requestId: record.pendingActivity.request.requestId,
+        status: "disconnected",
+      });
     }
     for (const pending of [...record.pendingRenames.values()]) {
       this.#settleRename(record, pending, {

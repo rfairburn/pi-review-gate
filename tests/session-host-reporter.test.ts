@@ -16,7 +16,13 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { NODE_OPTIONS_RESTORE_ENV, restoreNodeOptions } from "../src/session-host/bootstrap-preload";
-import activate, { __test as reporterTest, primeReporterBootstrap, SESSION_HOST_STICKY_STATE_KEY } from "../src/session-host/reporter";
+import activate, {
+  beginSessionHostRestore,
+  completeSessionHostRestore,
+  __test as reporterTest,
+  primeReporterBootstrap,
+  SESSION_HOST_STICKY_STATE_KEY,
+} from "../src/session-host/reporter";
 import { getSessionHostSpawnCapability, SESSION_HOST_SPAWN_CAPABILITY_KEY } from "../src/session-host/spawn-capability";
 import {
   SESSION_HOST_STARTUP_REQUEST_ENV,
@@ -38,6 +44,7 @@ import {
 } from "../src/activation/review-activity";
 import {
   HOST_BOOTSTRAP_ENV,
+  ACTIVITY_CENSUS_CAPABILITY,
   MAX_STATUS_FRAME_BYTES,
   MAX_NATIVE_SESSION_NAME_LENGTH,
   MAX_NATIVE_SESSION_FILE_BYTES,
@@ -315,6 +322,26 @@ function makeShutdownRequest(
     requestId: randomUUID(),
     expectedSessionId,
     expectedSessionEpoch,
+    ...overrides,
+  };
+}
+
+function makeActivityRequest(
+  bootstrap: Record<string, unknown>,
+  afterSequence: number,
+  expected: { sessionId: string | null; sessionEpoch: number | null },
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    version: 1,
+    type: "activity_request",
+    instanceId: bootstrap.instanceId,
+    generation: bootstrap.generation,
+    token: bootstrap.token,
+    requestId: randomUUID(),
+    afterSequence,
+    expectedSessionId: expected.sessionId,
+    expectedSessionEpoch: expected.sessionEpoch,
     ...overrides,
   };
 }
@@ -950,6 +977,10 @@ describe("session-host reporter status frames", () => {
     const ctx = makeCtx(ui.ui, options.mode ?? "tui", options.isIdle ?? (() => true));
     if (options.sessionManager) ctx.sessionManager = options.sessionManager;
     await testPi.trigger("session_start", { type: "session_start", reason: "startup" }, ctx);
+    // The reporter defers its first authoritative loaded status by one
+    // macrotask so a later gate session_start can mark its restore boundary.
+    // Let that fallback publish before callers inspect the first frame.
+    await new Promise((resolve) => setImmediate(resolve));
     return { testPi, ctx, bootstrap };
   }
 
@@ -1736,6 +1767,125 @@ describe("session-host reporter status frames", () => {
     await testPi.trigger("session_shutdown", { type: "session_shutdown" }, ctx);
   });
 
+  it("never re-sends a correlated activity snapshot as a duplicate status after write(false)", async () => {
+    const fakeServer = { socketPath: makeMemorySocketAddress() } as TestServer;
+    const memory = createMemoryReporterSocket();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "activity-backpressure-session",
+      getSessionName: () => "Activity backpressure",
+      getEntries: () => [],
+    };
+    const { testPi, ctx, bootstrap } = await startSession({
+      server: fakeServer,
+      sessionManager,
+      reporterOptions: { connectSocket: () => memory.socket },
+    });
+    try {
+      memory.socket.emit("connect");
+      const initial = memory.frames.find((frame) => frame.type === "status");
+      assert.ok(initial?.type === "status" && initial.nativeSession);
+
+      let blockActivityResult = true;
+      memory.setWritePolicy((frame) => frame.type !== "activity_result" || !blockActivityResult);
+      ctx.isIdle = () => false;
+      memory.socket.emit("data", Buffer.from(encodeFrame(makeActivityRequest(
+        bootstrap,
+        initial.sequence,
+        { sessionId: initial.nativeSession!.sessionId, sessionEpoch: initial.nativeSession!.epoch },
+      ) as never), "utf8"));
+      await sleep(30);
+      const result = memory.frames.find((frame) => frame.type === "activity_result");
+      assert.ok(result?.type === "activity_result" && result.status);
+      const resultSequence = result.status.sequence;
+      assert.equal(
+        memory.frames.filter((frame) => frame.type === "status" && frame.sequence === resultSequence).length,
+        0,
+        "the correlated snapshot was not also pushed before drain",
+      );
+
+      blockActivityResult = false;
+      memory.socket.emit("drain");
+      assert.equal(
+        memory.frames.filter((frame) => frame.type === "status" && frame.sequence === resultSequence).length,
+        0,
+        "drain never re-sends the correlated snapshot as an ordinary status",
+      );
+      assert.equal(
+        memory.frames.filter((frame) => frame.type === "activity_result").length,
+        1,
+        "the accepted correlated result remains exactly once",
+      );
+
+      // A genuinely newer observation is still delivered normally.
+      ctx.isIdle = () => true;
+      await testPi.trigger("agent_settled", { type: "agent_settled" }, ctx);
+      const newer = memory.frames.filter(
+        (frame): frame is SessionHostStatus => frame.type === "status" && frame.sequence > resultSequence,
+      );
+      assert.equal(newer.length, 1, "a genuinely newer snapshot is not suppressed by the queued flag");
+      assert.equal(newer[0]!.busy, false);
+    } finally {
+      await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+    }
+  });
+
+  it("flushes a correlated activity result queued behind existing backpressure without duplicating its sequence", async () => {
+    const fakeServer = { socketPath: makeMemorySocketAddress() } as TestServer;
+    const memory = createMemoryReporterSocket();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "activity-queued-session",
+      getSessionName: () => "Activity queued",
+      getEntries: () => [],
+    };
+    const { testPi, ctx, bootstrap } = await startSession({
+      server: fakeServer,
+      sessionManager,
+      reporterOptions: { connectSocket: () => memory.socket },
+    });
+    try {
+      memory.socket.emit("connect");
+      const initial = memory.frames.find((frame) => frame.type === "status");
+      assert.ok(initial?.type === "status" && initial.nativeSession);
+      // Put the transport into backpressure on a normal status first.
+      let blockStatus = true;
+      memory.setWritePolicy((frame) => frame.type !== "status" || !blockStatus);
+      await testPi.trigger("agent_start", { type: "agent_start" }, ctx);
+      const busy = memory.frames.filter((frame) => frame.type === "status" && frame.busy === true).at(-1);
+      assert.ok(busy?.type === "status");
+
+      // The correlated result must queue behind that backpressure, then flush
+      // once without its nested snapshot also becoming a duplicate status.
+      memory.socket.emit("data", Buffer.from(encodeFrame(makeActivityRequest(
+        bootstrap,
+        busy.sequence,
+        { sessionId: initial.nativeSession!.sessionId, sessionEpoch: initial.nativeSession!.epoch },
+      ) as never), "utf8"));
+      await sleep(30);
+      assert.equal(memory.frames.filter((frame) => frame.type === "activity_result").length, 0,
+        "the result waits in the bounded reply queue while the socket is backpressured");
+
+      blockStatus = false;
+      memory.socket.emit("drain");
+      const results = memory.frames.filter((frame) => frame.type === "activity_result");
+      assert.equal(results.length, 1, "the queued correlated result flushes exactly once");
+      const result = results[0]!;
+      assert.ok(result.type === "activity_result" && result.status);
+      assert.equal(
+        memory.frames.filter((frame) => frame.type === "status" && frame.sequence === result.status!.sequence).length,
+        0,
+        "no duplicate ordinary status with the correlated result's sequence",
+      );
+      const sequences = memory.frames.flatMap((frame) => {
+        if (frame.type === "status") return [frame.sequence];
+        if (frame.type === "activity_result" && frame.status) return [frame.status.sequence];
+        return [];
+      });
+      assert.equal(new Set(sequences).size, sequences.length, "every delivered sequence is unique");
+    } finally {
+      await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+    }
+  });
+
   it("fences old reporter commands and epochs immediately across /reload", async () => {
     const server = await startTestServer();
     const bootstrap = makeBootstrap(server.socketPath);
@@ -2029,7 +2179,7 @@ describe("session-host reporter status frames", () => {
     assert.equal(plainUi.ui.setWidget, plainUi.original);
   });
 
-  it("reconnects after socket loss and sends hello then the LATEST status", async () => {
+  it("reconnects after socket loss with hello then a freshly observed status, never a stale replay", async () => {
     const server = await startTestServer();
     let idle = true;
     const { testPi, ctx } = await startSession({ server, isIdle: () => idle, reporterOptions: { reconnectDelayMs: 20 } });
@@ -2044,15 +2194,25 @@ describe("session-host reporter status frames", () => {
     await testPi.trigger("agent_settled", { type: "agent_settled" }, ctx);
     await sleep(30); // let the (suppressed, disconnected) state settle
 
-    // Bounded reconnect delivers hello then the latest snapshot only.
+    // Bounded reconnect delivers hello, then re-runs the coalesced
+    // authoritative refresh and publishes one fresh snapshot. It must not
+    // replay the pre-disconnect snapshot (the host registration retains that
+    // sequence and rejects an unchanged duplicate).
     await server.waitForFrame(
       (f) => f.message.type === "hello" && server.frames.filter((g) => g.message.type === "hello").length >= 2,
     );
     assert.ok(server.connections >= 2);
     const helloIndexes = server.frames.map((f, i) => (f.message.type === "hello" ? i : -1)).filter((i) => i >= 0);
     assert.equal(helloIndexes.length, 2, "reconnect re-hellos exactly once");
-    const afterReconnect = server.frames.slice(helloIndexes[1]!).filter((f) => f.message.type === "status");
-    assert.equal(afterReconnect.length, 1, "reconnect sends exactly the latest snapshot");
+    const fresh = await server.waitForFrame(
+      (f) => f.message.type === "status" && f.message.busy === false,
+      3_000,
+      helloIndexes[1]!,
+    );
+    const afterReconnect = server.frames
+      .slice(helloIndexes[1]!, server.frames.indexOf(fresh) + 1)
+      .filter((f) => f.message.type === "status");
+    assert.equal(afterReconnect.length, 1, "reconnect publishes exactly one fresh snapshot");
     assert.equal(afterReconnect[0]!.message.busy, false);
     assert.deepEqual(afterReconnect[0]!.message.activity, ["Ready"]);
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
@@ -2816,6 +2976,239 @@ describe("session-host reporter status frames", () => {
     const last = statusFrames(server).at(-1)!;
     assert.equal(last.message.busy, null, "unknown readiness is published, idle claim dropped");
     assert.deepEqual(last.message.activity, []);
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("publishes no loaded status before the gate restore boundary, then actual restored idle/zero", async () => {
+    const server = await startTestServer();
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    registerOwnedActivitySource("backgroundTasks", "execution", {
+      intentUncertain: true,
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+    } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+    registerReviewActivitySource();
+    registerOwnedActivitySource("backgroundShells", "background-shell", {
+      intentUncertain: true,
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+    } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+    const bootstrap = makeBootstrap(server.socketPath);
+    process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(bootstrap);
+    const testPi = createPi();
+    await activate(testPi.pi);
+    const sessionId = "restored-idle-session";
+    let releaseRestore!: () => void;
+    const holdRestore = new Promise<void>((resolve) => { releaseRestore = resolve; });
+    (testPi.pi as { on(name: string, handler: (...args: unknown[]) => unknown): void }).on(
+      "session_start",
+      async () => {
+        const completion = beginSessionHostRestore(sessionId);
+        await holdRestore;
+        completeSessionHostRestore(completion);
+      },
+    );
+    const ctx = makeCtx(makeUi().ui, "tui", () => true);
+    ctx.sessionManager = { getSessionId: () => sessionId, getEntries: () => [] };
+    const started = testPi.trigger("session_start", { type: "session_start", reason: "startup" }, ctx);
+    await sleep(60);
+    assert.equal(statusFrames(server).length, 0,
+      "no pre-restore Ready/unknown frame is published before the gate restore boundary");
+    releaseRestore();
+    await started;
+    const first = await server.waitForFrame((frame) => frame.message.type === "status");
+    assert.equal(first.message.busy, false);
+    assert.deepEqual(first.message.activity, ["Ready"]);
+    assert.equal(first.message.activeTasks, 0, "fresh restored no-work history reaches actual idle/zero at first Ready");
+    assert.equal(first.message.activeShells, 0);
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("first restored Ready preserves admitted work and genuine unreadable source unknown", async () => {
+    const server = await startTestServer();
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    const run = beginOwnedReviewActivity();
+    registerReviewActivitySource();
+    registerOwnedActivitySource("backgroundTasks", "execution", {
+      intentUncertain: true,
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+    } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+    registerOwnedActivitySource("backgroundShells", "background-shell", {
+      intentUncertain: true,
+      refreshActivity: () => ({ status: "incomplete" }),
+    } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+    const bootstrap = makeBootstrap(server.socketPath);
+    process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(bootstrap);
+    const testPi = createPi();
+    await activate(testPi.pi);
+    const sessionId = "restored-run-session";
+    (testPi.pi as { on(name: string, handler: (...args: unknown[]) => unknown): void }).on(
+      "session_start",
+      async () => {
+        const completion = beginSessionHostRestore(sessionId);
+        completeSessionHostRestore(completion);
+      },
+    );
+    const ctx = makeCtx(makeUi().ui, "tui", () => false);
+    ctx.sessionManager = { getSessionId: () => sessionId, getEntries: () => [] };
+    try {
+      await testPi.trigger("session_start", { type: "session_start", reason: "startup" }, ctx);
+      const first = await server.waitForFrame((frame) => frame.message.type === "status");
+      assert.equal(first.message.busy, true, "actually running work is preserved, not hidden as idle");
+      assert.equal(first.message.activeTasks, 1, "the held review run is preserved as known nonzero");
+      assert.equal(first.message.activeShells, null, "genuinely unreadable shell source stays honest unknown, never zero");
+    } finally {
+      endOwnedReviewActivity(run);
+      await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+    }
+  });
+
+  it("answers a request from the actual current readiness and source state, not lastSnapshot", async () => {
+    const server = await startTestServer();
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    let tokens = new Set<string>();
+    registerReviewActivitySource();
+    registerOwnedActivitySource("backgroundTasks", "execution", {
+      intentUncertain: true,
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set(tokens) }),
+    } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+    registerOwnedActivitySource("backgroundShells", "background-shell", {
+      intentUncertain: true,
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+    } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+    const { testPi, ctx, bootstrap } = await startSession({ server });
+    const initial = await server.waitForFrame((frame) => frame.message.type === "status");
+    assert.equal(initial.message.busy, false);
+    assert.equal(initial.message.activeTasks, 0);
+    const tuple = initial.message.nativeSession as { sessionId: string; epoch: number } | null;
+    let sequence = initial.message.sequence as number;
+
+    // The context becomes busy with no lifecycle hook delivering a push frame.
+    ctx.isIdle = () => false;
+    tokens = new Set(["fresh-execution-token"]);
+    ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution");
+    server.sendToClients(encodeFrame(makeActivityRequest(bootstrap, sequence, {
+      sessionId: tuple?.sessionId ?? null,
+      sessionEpoch: tuple?.epoch ?? null,
+    }) as never));
+    const busy = await server.waitForFrame((frame) => frame.message.type === "activity_result");
+    assert.equal(busy.message.outcome, "complete");
+    const busyStatus = busy.message.status as SessionHostStatus;
+    assert.equal(busyStatus.busy, true, "actual current readiness is probed after the awaited refresh");
+    assert.equal(busyStatus.activeTasks, 1, "the fresh owning-source callback result replaces a cached zero");
+    assert.ok((busyStatus.sequence as number) > sequence);
+    sequence = busyStatus.sequence;
+
+    // Repeated episode, opposite direction: zero must recover just as freshly.
+    ctx.isIdle = () => true;
+    tokens = new Set();
+    ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution");
+    server.sendToClients(encodeFrame(makeActivityRequest(bootstrap, sequence, {
+      sessionId: tuple?.sessionId ?? null,
+      sessionEpoch: tuple?.epoch ?? null,
+    }) as never));
+    const idle = await server.waitForFrame(
+      (frame) => frame.message.type === "activity_result",
+      3_000,
+      server.frames.indexOf(busy),
+    );
+    assert.equal(idle.message.outcome, "complete");
+    const idleStatus = idle.message.status as SessionHostStatus;
+    assert.equal(idleStatus.busy, false);
+    assert.equal(idleStatus.activeTasks, 0);
+    assert.ok((idleStatus.sequence as number) > sequence);
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("rejects a stale session activity request and never returns another conversation's snapshot", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "old-restored-session",
+      getSessionName: () => "Old",
+      getEntries: () => [],
+    };
+    const { testPi, bootstrap } = await startSession({ server, sessionManager });
+    const oldStatus = await server.waitForFrame((frame) => frame.message.type === "status");
+    const oldTuple = oldStatus.message.nativeSession as { sessionId: string; epoch: number };
+    assert.ok(oldTuple);
+
+    const nextCtx = makeCtx(makeUi().ui, "tui", () => true);
+    nextCtx.sessionManager = { getSessionId: () => "new-restored-session", getSessionName: () => "New", getEntries: () => [] };
+    await testPi.trigger("session_start", { type: "session_start", reason: "synthetic-resume" }, nextCtx);
+    const nextStatus = await server.waitForFrame(
+      (frame) => frame.message.type === "status"
+        && (frame.message.nativeSession as { sessionId?: string } | null)?.sessionId === "new-restored-session",
+    );
+    server.sendToClients(encodeFrame(makeActivityRequest(
+      bootstrap,
+      nextStatus.message.sequence as number,
+      { sessionId: oldTuple.sessionId, sessionEpoch: oldTuple.epoch },
+    ) as never));
+    const stale = await server.waitForFrame((frame) => frame.message.type === "activity_result");
+    assert.equal(stale.message.outcome, "stale-session");
+    assert.equal(Object.hasOwn(stale.message, "status"), false);
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("an authoritative census reports failed readiness as unknown, not cached busy, and recovers on the next request", async () => {
+    const server = await startTestServer();
+    const { testPi, ctx, bootstrap } = await startSession({ server });
+    const initial = await server.waitForFrame((frame) => frame.message.type === "status");
+    const tuple = initial.message.nativeSession as { sessionId: string; epoch: number } | null;
+
+    // Establish a genuinely busy cached snapshot through the ordinary
+    // lifecycle path.
+    await testPi.trigger("agent_start", { type: "agent_start" }, ctx);
+    const busy = await server.waitForFrame((frame) => frame.message.type === "status" && frame.message.busy === true);
+    assert.deepEqual(busy.message.activity, ["Working"]);
+
+    // The authoritative request's current readiness read fails. It must not
+    // certify the cached busy/Working value.
+    ctx.isIdle = () => { throw new Error("readiness probe failed"); };
+    server.sendToClients(encodeFrame(makeActivityRequest(bootstrap, busy.message.sequence as number, {
+      sessionId: tuple?.sessionId ?? null,
+      sessionEpoch: tuple?.epoch ?? null,
+    }) as never));
+    const unknown = await server.waitForFrame((frame) => frame.message.type === "activity_result");
+    assert.equal(unknown.message.outcome, "complete");
+    const unknownStatus = unknown.message.status as SessionHostStatus;
+    assert.equal(unknownStatus.busy, null, "a failed authoritative readiness read is unknown, not cached busy");
+    assert.deepEqual(unknownStatus.activity, []);
+
+    // A later successful readiness read reports idle from the actual context.
+    ctx.isIdle = () => true;
+    server.sendToClients(encodeFrame(makeActivityRequest(bootstrap, unknownStatus.sequence, {
+      sessionId: tuple?.sessionId ?? null,
+      sessionEpoch: tuple?.epoch ?? null,
+    }) as never));
+    const idle = await server.waitForFrame(
+      (frame) => frame.message.type === "activity_result",
+      3_000,
+      server.frames.indexOf(unknown),
+    );
+    assert.equal(idle.message.outcome, "complete");
+    const idleStatus = idle.message.status as SessionHostStatus;
+    assert.equal(idleStatus.busy, false);
+    assert.deepEqual(idleStatus.activity, ["Ready"]);
+    assert.ok((idleStatus.sequence as number) > (unknownStatus.sequence as number));
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("rejects a wrong-token activity request without exposing or applying a census", async () => {
+    const server = await startTestServer();
+    const { testPi, bootstrap } = await startSession({ server, reporterOptions: { reconnectDelayMs: 20 } });
+    const status = await server.waitForFrame((frame) => frame.message.type === "status");
+    const helloCount = server.frames.filter((frame) => frame.message.type === "hello").length;
+    server.sendToClients(encodeFrame(makeActivityRequest(bootstrap, status.message.sequence as number, {
+      sessionId: null,
+      sessionEpoch: null,
+    }, { token: "0".repeat(64) }) as never));
+    await server.waitForFrame(
+      (frame) => frame.message.type === "hello"
+        && server.frames.filter((entry) => entry.message.type === "hello").length > helloCount,
+    );
+    assert.equal(server.frames.some((frame) => frame.message.type === "activity_result"), false);
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
   });
 });

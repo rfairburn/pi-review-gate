@@ -378,13 +378,19 @@ function statusFrame(bootstrap: SessionHostBootstrap, fields: {
   };
 }
 
-function helloFrame(bootstrap: SessionHostBootstrap, overrides?: { instanceId?: string; generation?: string; token?: string }) {
+function helloFrame(bootstrap: SessionHostBootstrap, overrides?: {
+  instanceId?: string;
+  generation?: string;
+  token?: string;
+  capabilities?: string[];
+}) {
   return {
     version: 1 as const,
     type: "hello" as const,
     instanceId: overrides?.instanceId ?? bootstrap.instanceId,
     generation: overrides?.generation ?? bootstrap.generation,
     token: overrides?.token ?? bootstrap.token,
+    ...(overrides?.capabilities === undefined ? {} : { capabilities: overrides.capabilities }),
   };
 }
 
@@ -1895,4 +1901,355 @@ test("SessionSpawn timeout is an unknown result and permanently deduplicates tha
   assert.equal(replies.length, 2);
   assert.equal(calls, 1);
   await disposeBroker(broker);
+});
+
+/** Read decoded broker-to-reporter frames from one tracked test client. */
+function watchFrames(socket: net.Socket): { frames: ReturnType<typeof decodeFrame>[] } {
+  const frames: ReturnType<typeof decodeFrame>[] = [];
+  let buffer = "";
+  socket.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let index: number;
+    while ((index = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, index + 1);
+      buffer = buffer.slice(index + 1);
+      const message = decodeFrame(line);
+      if (message) frames.push(message);
+    }
+  });
+  return { frames };
+}
+
+test("legacy reporters without the activity capability never receive a request and stay truthful unknown", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(broker.socketPath);
+  const outbound = watchFrames(client);
+  client.write(JSON.stringify(helloFrame(registration.bootstrap)) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, { sequence: 1 })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+
+  assert.equal(typeof registration.requestActivity, "function");
+  const result = await registration.requestActivity!();
+  assert.equal(result.status, "unsupported", "the host never frames an unadvertised additive request");
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(outbound.frames.some((frame) => frame?.type === "activity_request"), false);
+
+  // No reconnect churn: the same authenticated connection still accepts a
+  // later valid status.
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, { sequence: 2, busy: true })) + "\n");
+  await waitFor(() => recorded.statuses.length === 2);
+  assert.equal(recorded.disconnects, 0);
+});
+
+test("authenticated activity request delivers a complete fresh snapshot and advances the shared sequence fence", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(broker.socketPath);
+  const outbound = watchFrames(client);
+  const nativeSession = { sessionId: "activity-session", epoch: 3, name: "Activity" };
+  client.write(JSON.stringify(helloFrame(registration.bootstrap, { capabilities: ["activity-census"] })) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 1, busy: false, pendingInput: false, inputSurface: false, activity: ["Ready"], nativeSession,
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+
+  const pending = registration.requestActivity!();
+  await waitFor(() => outbound.frames.some((frame) => frame?.type === "activity_request"));
+  const request = outbound.frames.find((frame) => frame?.type === "activity_request");
+  assert.ok(request && request.type === "activity_request");
+  assert.equal(request.instanceId, INSTANCE_A);
+  assert.equal(request.generation, broker.generation);
+  assert.equal(request.token, registration.bootstrap.token, "the authenticated host request carries the exact capability token");
+  assert.equal(request.afterSequence, 1);
+  assert.equal(request.expectedSessionId, nativeSession.sessionId);
+  assert.equal(request.expectedSessionEpoch, nativeSession.epoch);
+
+  client.write(encodeFrame({
+    version: 1,
+    type: "activity_result",
+    instanceId: INSTANCE_A,
+    generation: broker.generation,
+    requestId: request.requestId,
+    outcome: "complete",
+    status: {
+      ...statusFrame(registration.bootstrap, {
+        sequence: 2, busy: true, pendingInput: false, inputSurface: false,
+        activity: ["Working"], nativeSession,
+      }),
+      backgroundTasks: 1,
+      backgroundShells: 0,
+      activeTasks: 3,
+      activeShells: 0,
+    },
+    observedSessionId: nativeSession.sessionId,
+    observedSessionEpoch: nativeSession.epoch,
+  }));
+  assert.equal((await pending).status, "complete");
+  await waitFor(() => recorded.statuses.length === 2);
+  assert.equal(recorded.statuses[1]?.sequence, 2);
+  assert.equal(recorded.statuses[1]?.activeTasks, 3);
+  assert.equal(recorded.statuses[1]?.activeShells, 0);
+
+  // A current pushed status after the requested snapshot is still accepted:
+  // the reply must not self-invalidate the registration's monotonic fence.
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 3, busy: true, pendingInput: false, inputSurface: false, activity: ["Working"], nativeSession,
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 3);
+  assert.equal(recorded.statuses[2]?.sequence, 3);
+  assert.equal(recorded.disconnects, 0);
+});
+
+test("concurrent activity requests coalesce and allow exactly one bounded follow-up", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(broker.socketPath);
+  const outbound = watchFrames(client);
+  const nativeSession = { sessionId: "coalesce-session", epoch: 1, name: "Coalesce" };
+  client.write(JSON.stringify(helloFrame(registration.bootstrap, { capabilities: ["activity-census"] })) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 1, busy: false, pendingInput: null, inputSurface: false, activity: [], nativeSession,
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+
+  const first = registration.requestActivity!();
+  const second = registration.requestActivity!();
+  await waitFor(() => outbound.frames.filter((frame) => frame?.type === "activity_request").length === 1);
+  const initial = outbound.frames.find((frame) => frame?.type === "activity_request");
+  assert.ok(initial && initial.type === "activity_request");
+  client.write(encodeFrame({
+    version: 1,
+    type: "activity_result",
+    instanceId: INSTANCE_A,
+    generation: broker.generation,
+    requestId: initial.requestId,
+    outcome: "unavailable",
+    observedSessionId: nativeSession.sessionId,
+    observedSessionEpoch: nativeSession.epoch,
+  }));
+  assert.equal((await first).status, "unavailable");
+  assert.equal((await second).status, "unavailable", "coalesced callers share the in-flight result");
+  // The coalesced caller earns one bounded follow-up after an incomplete read.
+  await waitFor(() => outbound.frames.filter((frame) => frame?.type === "activity_request").length === 2);
+  const followUp = outbound.frames.filter((frame) => frame?.type === "activity_request")[1];
+  assert.ok(followUp && followUp.type === "activity_request");
+  assert.notEqual(followUp.requestId, initial.requestId);
+  client.write(encodeFrame({
+    version: 1,
+    type: "activity_result",
+    instanceId: INSTANCE_A,
+    generation: broker.generation,
+    requestId: followUp.requestId,
+    outcome: "complete",
+    status: statusFrame(registration.bootstrap, {
+      sequence: 2, busy: false, pendingInput: false, inputSurface: false, activity: ["Ready"], nativeSession,
+    }),
+    observedSessionId: nativeSession.sessionId,
+    observedSessionEpoch: nativeSession.epoch,
+  }));
+  await waitFor(() => recorded.statuses.length === 2);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(outbound.frames.filter((frame) => frame?.type === "activity_request").length, 2,
+    "a complete follow-up never fans out another request");
+});
+
+test("a stale or reordered activity reply never replaces a newer valid live status", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(broker.socketPath);
+  const outbound = watchFrames(client);
+  const nativeSession = { sessionId: "stale-session", epoch: 2, name: "Stale" };
+  client.write(JSON.stringify(helloFrame(registration.bootstrap, { capabilities: ["activity-census"] })) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 1, busy: false, pendingInput: null, inputSurface: false, activity: [], nativeSession,
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+  const pending = registration.requestActivity!();
+  await waitFor(() => outbound.frames.some((frame) => frame?.type === "activity_request"));
+  const request = outbound.frames.find((frame) => frame?.type === "activity_request");
+  assert.ok(request && request.type === "activity_request");
+
+  // A newer valid live frame arrives while the read is in flight.
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 5, busy: true, pendingInput: null, inputSurface: false, activity: ["Working"], nativeSession,
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 2);
+  // The older complete reply must not clobber it.
+  client.write(encodeFrame({
+    version: 1,
+    type: "activity_result",
+    instanceId: INSTANCE_A,
+    generation: broker.generation,
+    requestId: request.requestId,
+    outcome: "complete",
+    status: statusFrame(registration.bootstrap, {
+      sequence: 4, busy: false, pendingInput: false, inputSurface: false, activity: ["Ready"], nativeSession,
+    }),
+    observedSessionId: nativeSession.sessionId,
+    observedSessionEpoch: nativeSession.epoch,
+  }));
+  assert.equal((await pending).status, "stale");
+  assert.equal(recorded.statuses.length, 2);
+  assert.equal(recorded.statuses[1]?.sequence, 5);
+
+  // The same authenticated owner still accepts a later current status.
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 6, busy: true, pendingInput: null, inputSurface: false, activity: ["Working"], nativeSession,
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 3);
+  assert.equal(recorded.disconnects, 0);
+});
+
+test("activity request timeout stays truthful without reconnect churn, and a later complete reply still recovers", async () => {
+  brokerTest.setActivityTimeoutForTests(40);
+  try {
+    const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+    const recorded = recording();
+    const registration = broker.register(INSTANCE_A, recorded.handlers);
+    const client = await connectClient(broker.socketPath);
+    const outbound = watchFrames(client);
+    const nativeSession = { sessionId: "timeout-session", epoch: 1, name: "Timeout" };
+    client.write(JSON.stringify(helloFrame(registration.bootstrap, { capabilities: ["activity-census"] })) + "\n");
+    client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+      sequence: 1, busy: false, pendingInput: null, inputSurface: false, activity: [], nativeSession,
+    })) + "\n");
+    await waitFor(() => recorded.statuses.length === 1);
+    const pending = registration.requestActivity!();
+    await waitFor(() => outbound.frames.some((frame) => frame?.type === "activity_request"));
+    const request = outbound.frames.find((frame) => frame?.type === "activity_request");
+    assert.ok(request && request.type === "activity_request");
+    assert.equal((await pending).status, "timeout");
+    assert.equal(recorded.disconnects, 0, "a read-only timeout never retires the authenticated channel");
+
+    // A newer pushed status is accepted after the timeout.
+    client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+      sequence: 2, busy: true, pendingInput: null, inputSurface: false, activity: ["Working"], nativeSession,
+    })) + "\n");
+    await waitFor(() => recorded.statuses.length === 2);
+
+    // The timed-out read may still complete later; a genuinely newer,
+    // exact-session snapshot is applied rather than discarded.
+    client.write(encodeFrame({
+      version: 1,
+      type: "activity_result",
+      instanceId: INSTANCE_A,
+      generation: broker.generation,
+      requestId: request.requestId,
+      outcome: "complete",
+      status: statusFrame(registration.bootstrap, {
+        sequence: 3, busy: false, pendingInput: false, inputSurface: false, activity: ["Ready"], nativeSession,
+      }),
+      observedSessionId: nativeSession.sessionId,
+      observedSessionEpoch: nativeSession.epoch,
+    }));
+    await waitFor(() => recorded.statuses.length === 3);
+    assert.equal(recorded.statuses[2]?.sequence, 3, "the late complete snapshot recovers without reconnect");
+    assert.equal(recorded.disconnects, 0);
+  } finally {
+    brokerTest.setActivityTimeoutForTests(undefined);
+  }
+});
+
+test("activity result identity and exact native tuple are fenced fail closed", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(broker.socketPath);
+  const outbound = watchFrames(client);
+  const nativeSession = { sessionId: "fenced-session", epoch: 4, name: "Fenced" };
+  client.write(JSON.stringify(helloFrame(registration.bootstrap, { capabilities: ["activity-census"] })) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 1, busy: false, pendingInput: null, inputSurface: false, activity: [], nativeSession,
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+  const pending = registration.requestActivity!();
+  await waitFor(() => outbound.frames.some((frame) => frame?.type === "activity_request"));
+  const request = outbound.frames.find((frame) => frame?.type === "activity_request");
+  assert.ok(request && request.type === "activity_request");
+  client.write(encodeFrame({
+    version: 1,
+    type: "activity_result",
+    instanceId: INSTANCE_B, // wrong exact owner
+    generation: broker.generation,
+    requestId: request.requestId,
+    outcome: "complete",
+    status: statusFrame(registration.bootstrap, {
+      sequence: 2, busy: false, pendingInput: false, inputSurface: false, activity: ["Ready"], nativeSession,
+    }),
+    observedSessionId: nativeSession.sessionId,
+    observedSessionEpoch: nativeSession.epoch,
+  }));
+  await expectClientClose(client);
+  assert.equal((await pending).status, "disconnected");
+  assert.equal(recorded.statuses.length, 1);
+});
+
+test("a late complete reply never disturbs the coalesced follow-up still in flight", async () => {
+  brokerTest.setActivityTimeoutForTests(40);
+  try {
+    const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+    const recorded = recording();
+    const registration = broker.register(INSTANCE_A, recorded.handlers);
+    const client = await connectClient(broker.socketPath);
+    const outbound = watchFrames(client);
+    const nativeSession = { sessionId: "late-follow-up", epoch: 1, name: "Late" };
+    client.write(JSON.stringify(helloFrame(registration.bootstrap, { capabilities: ["activity-census"] })) + "\n");
+    client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+      sequence: 1, busy: false, pendingInput: null, inputSurface: false, activity: [], nativeSession,
+    })) + "\n");
+    await waitFor(() => recorded.statuses.length === 1);
+    const first = registration.requestActivity!();
+    const second = registration.requestActivity!();
+    await waitFor(() => outbound.frames.some((value) => value?.type === "activity_request"));
+    const firstRequest = outbound.frames.find((value) => value?.type === "activity_request");
+    assert.ok(firstRequest && firstRequest.type === "activity_request");
+    assert.equal((await first).status, "timeout");
+    assert.equal((await second).status, "timeout");
+    await waitFor(() => outbound.frames.filter((value) => value?.type === "activity_request").length === 2);
+    const followUp = outbound.frames.filter((value) => value?.type === "activity_request")[1];
+    assert.ok(followUp && followUp.type === "activity_request");
+
+    // The first, timed-out request completes late while the follow-up is
+    // pending: apply it without satisfying or destroying the follow-up.
+    client.write(encodeFrame({
+      version: 1,
+      type: "activity_result",
+      instanceId: INSTANCE_A,
+      generation: broker.generation,
+      requestId: firstRequest.requestId,
+      outcome: "complete",
+      status: statusFrame(registration.bootstrap, {
+        sequence: 2, busy: false, pendingInput: false, inputSurface: false, activity: ["Ready"], nativeSession,
+      }),
+      observedSessionId: nativeSession.sessionId,
+      observedSessionEpoch: nativeSession.epoch,
+    }));
+    await waitFor(() => recorded.statuses.length === 2);
+    assert.equal(recorded.statuses[1]?.sequence, 2);
+    assert.equal(recorded.disconnects, 0);
+
+    client.write(encodeFrame({
+      version: 1,
+      type: "activity_result",
+      instanceId: INSTANCE_A,
+      generation: broker.generation,
+      requestId: followUp.requestId,
+      outcome: "complete",
+      status: statusFrame(registration.bootstrap, {
+        sequence: 3, busy: true, pendingInput: false, inputSurface: false, activity: ["Working"], nativeSession,
+      }),
+      observedSessionId: nativeSession.sessionId,
+      observedSessionEpoch: nativeSession.epoch,
+    }));
+    await waitFor(() => recorded.statuses.length === 3);
+    assert.equal(recorded.statuses[2]?.sequence, 3);
+    assert.equal(recorded.disconnects, 0);
+  } finally {
+    brokerTest.setActivityTimeoutForTests(undefined);
+  }
 });

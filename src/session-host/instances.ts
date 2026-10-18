@@ -25,7 +25,12 @@ import {
 	type SessionSpawnOutcome,
 } from "./protocol";
 import { isSavedSessionAdmission, type OwnedLiveSession, type SavedSessionAdmission } from "./saved-sessions";
-import type { StatusRenameRequest, StatusRenameResult, StatusShutdownResult } from "./broker";
+import type {
+	StatusActivityRefreshResult,
+	StatusRenameRequest,
+	StatusRenameResult,
+	StatusShutdownResult,
+} from "./broker";
 import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "./startup-request";
 
 /**
@@ -122,6 +127,12 @@ export const MAX_LABEL_CHARS = 80;
 /** Bounds for the copied activity snapshot: two lines, each at most 120 Unicode code points. */
 export const MAX_ACTIVITY_ENTRIES = 2;
 export const MAX_ACTIVITY_ENTRY_CHARS = 120;
+/**
+ * Bounded automatic fresh-census attempts per unknown activity episode. A
+ * known status or a reconnect starts a new episode; an exhausted episode
+ * stops requesting until one of those genuine events, never by polling.
+ */
+export const MAX_ACTIVITY_REFRESH_ATTEMPTS = 4;
 
 /** Upper bound for the bounded public error text of an errored row. */
 export const MAX_INSTANCE_ERROR_CHARS = 240;
@@ -193,6 +204,8 @@ export interface InstanceStatusUpdate {
 export interface InstanceStatusHandlers {
 	onStatus(update: InstanceStatusUpdate): void;
 	onDisconnect(): void;
+	/** A valid hello superseded/reconnected this live registration (never the first connection). */
+	onReconnect?(): void;
 	/** An authenticated model request routed through this exact child registration. */
 	onSpawnRequest?(request: SessionSpawnInput): Promise<SessionSpawnOutcome>;
 }
@@ -211,8 +224,13 @@ export interface InstanceStatusRegistration {
 	rename?(request: StatusRenameRequest): Promise<StatusRenameResult>;
 	/** Authenticated public native shutdown when supported; acceptance is not PTY exit. */
 	shutdown?(options?: { readonly requireIdle?: boolean }): Promise<StatusShutdownResult>;
+	/** Authenticated fresh activity census from this exact live client. */
+	requestActivity?(): Promise<StatusActivityRefreshResult>;
 	release(): void;
 }
+
+/** Host-visible outcome of an explicit fresh activity-census request. */
+export type InstanceActivityRefreshStatus = StatusActivityRefreshResult["status"] | "unsupported";
 
 /**
  * Structural status registrar contract. The broker owns all authentication,
@@ -349,6 +367,11 @@ interface ManagedInstance {
 	backgroundShells: number | null;
 	activeTasks: number | null;
 	activeShells: number | null;
+	/** Automatic fresh-census attempt budget for the CURRENT unknown episode. */
+	activityRefreshAttempts: number;
+	activityRefreshEpisodeOpen: boolean;
+	/** Bumped on every accepted status, fencing out-of-date refresh failures. */
+	statusRevision: number;
 	activity: string[];
 	exitCode?: number;
 	error?: string;
@@ -746,6 +769,34 @@ export class InstanceManager {
 	}
 
 	/**
+	 * Deliberately discard this row's cached ephemeral understanding and ask
+	 * the exact owning live client for a complete freshly observed status,
+	 * even when the cached values currently look known. Only the correlated
+	 * complete result reaches `onStatus`; failures leave the ephemeral state
+	 * truthfully unknown without inventing zero. This is an internal host
+	 * recovery action, not a user prompt/task/manual-refresh control.
+	 */
+	async refreshActivity(id: string): Promise<InstanceActivityRefreshStatus> {
+		const record = this.#records.get(id);
+		if (!record || this.#disposed || this.#stopping || record.ptyExited) return "disconnected";
+		const registration = record.registration;
+		if (!registration || record.registrationReleased) return "disconnected";
+		const requestActivity = registration.requestActivity;
+		if (typeof requestActivity !== "function") return "unsupported";
+		record.activityRefreshAttempts = 0;
+		record.activityRefreshEpisodeOpen = true;
+		const revision = record.statusRevision;
+		try {
+			const result = await requestActivity.call(registration);
+			this.#applyActivityRefreshFailure(record, { current: registration }, revision, result, false);
+			return result.status;
+		} catch {
+			this.#applyActivityRefreshFailure(record, { current: registration }, revision, undefined, false);
+			return "unavailable";
+		}
+	}
+
+	/**
 	 * The terminal surface of one instance (the retained last frame stays
 	 * readable after the child exited, until the manager is disposed) or
 	 * undefined for unknown ids and rows that never got a parse pipeline.
@@ -943,6 +994,9 @@ export class InstanceManager {
 			backgroundShells: null,
 			activeTasks: null,
 			activeShells: null,
+			activityRefreshAttempts: 0,
+			activityRefreshEpisodeOpen: false,
+			statusRevision: 0,
 			activity: [],
 			savedReservation: savedSession !== undefined
 				? { sessionId: savedSession.sessionId, file: savedSession.file }
@@ -1320,6 +1374,7 @@ export class InstanceManager {
 			const handle = this.#statusRegistrar.register(record.id, {
 				onStatus: (update) => this.#onStatus(record, registration, update),
 				onDisconnect: () => this.#onDisconnect(record, registration),
+				onReconnect: () => this.#onReconnect(record, registration),
 				onSpawnRequest: (request) => {
 					if (this.#records.get(record.id) !== record || record.ptyExited || record.stopAdmissionClosed || this.#stopping || this.#disposed) {
 						return Promise.resolve("failed");
@@ -1528,6 +1583,8 @@ export class InstanceManager {
 		record.backgroundShells = null;
 		record.activeTasks = null;
 		record.activeShells = null;
+		record.activityRefreshAttempts = 0;
+		record.activityRefreshEpisodeOpen = false;
 		record.activity = [];
 		if (typeof event?.exitCode === "number" && Number.isFinite(event.exitCode)) {
 			record.exitCode = event.exitCode;
@@ -1578,6 +1635,8 @@ export class InstanceManager {
 		if (!this.#currentRegistration(record, registration)) {
 			return; // stale/released/disposed status event, never cross-row
 		}
+		record.statusRevision += 1;
+		const previousKnownSessionId = record.knownNativeSessionId;
 		record.busy = update && typeof update.busy === "boolean" ? update.busy : null;
 		record.pendingInput = update && typeof update.pendingInput === "boolean" ? update.pendingInput : null;
 		record.inputSurface = update?.inputSurface === true;
@@ -1631,7 +1690,118 @@ export class InstanceManager {
 			// display/duplicate metadata, but revoke its path observation.
 			record.currentNativeSessionFile = undefined;
 		}
+		if (record.knownNativeSessionId !== previousKnownSessionId) {
+			// A native /new or /resume is a new observation episode, not a
+			// continuation of an exhausted unknown budget.
+			record.activityRefreshAttempts = 0;
+			record.activityRefreshEpisodeOpen = false;
+		}
+		this.#noteActivityObservation(record);
 		this.#safeChanged(record.id);
+		this.#maybeRequestFreshActivity(record, registration);
+	}
+
+	/**
+	 * Reset the bounded automatic refresh budget when the ephemeral row state
+	 * becomes fully known, and open a fresh episode on a new unknown state.
+	 */
+	#noteActivityObservation(record: ManagedInstance): void {
+		const known = record.busy !== null
+			&& record.activeTasks !== null && record.activeShells !== null;
+		if (known) {
+			record.activityRefreshAttempts = 0;
+			record.activityRefreshEpisodeOpen = false;
+		}
+	}
+
+	/**
+	 * Host-side independent recovery: a relevant unknown/lost ephemeral state
+	 * asks the exact owning live client for one complete freshly observed
+	 * status. Requests are coalesced by the registration/broker and bounded to
+	 * MAX_ACTIVITY_REFRESH_ATTEMPTS per unknown episode; there is no timer or
+	 * polling. A known observation or a reconnect starts a new episode.
+	 */
+	#maybeRequestFreshActivity(
+		record: ManagedInstance,
+		registration: { current?: InstanceStatusRegistration },
+	): void {
+		if (!this.#currentRegistration(record, registration) || record.ptyExited) return;
+		const unknown = record.busy === null
+			|| record.activeTasks === null || record.activeShells === null;
+		if (!unknown) return;
+		if (!record.activityRefreshEpisodeOpen) {
+			record.activityRefreshEpisodeOpen = true;
+			record.activityRefreshAttempts = 0;
+		}
+		if (record.activityRefreshAttempts >= MAX_ACTIVITY_REFRESH_ATTEMPTS) return;
+		const registrationHandle = record.registration;
+		const requestActivity = registrationHandle?.requestActivity;
+		if (typeof requestActivity !== "function") return;
+		record.activityRefreshAttempts += 1;
+		const revision = record.statusRevision;
+		void Promise.resolve().then(() => requestActivity.call(registrationHandle)).then(
+			(result) => this.#applyActivityRefreshFailure(record, registration, revision, result, true),
+			() => this.#applyActivityRefreshFailure(record, registration, revision, undefined, true),
+		);
+	}
+
+	/**
+	 * A read that could not produce a complete fresh snapshot leaves the
+	 * ephemeral row state truthfully unknown. It never preserves a stale known
+	 * value and never fabricates zero. A stale reply means a newer accepted
+	 * status already replaced it, so nothing is changed.
+	 */
+	#applyActivityRefreshFailure(
+		record: ManagedInstance,
+		registration: { current?: InstanceStatusRegistration },
+		revision: number,
+		result: StatusActivityRefreshResult | undefined,
+		retryEligible: boolean,
+	): void {
+		if (!this.#currentRegistration(record, registration)) return;
+		// A newer accepted status (including one that arrived while this
+		// read-only request was in flight or after it timed out) always wins
+		// over an older request's failure. Only the exact observation that
+		// motivated this request may be cleared to unknown.
+		if (record.statusRevision !== revision) return;
+		if (result?.status !== "unavailable" && result?.status !== "timeout" && result?.status !== "disconnected") return;
+		record.busy = null;
+		record.backgroundTasks = null;
+		record.backgroundShells = null;
+		record.activeTasks = null;
+		record.activeShells = null;
+		record.activity = [];
+		this.#safeChanged(record.id);
+		// A dropped/timed-out automatic reply is a bounded recovery event: retry
+		// within the same per-episode attempt budget instead of waiting for a
+		// lifecycle transition that may never come. Unsupported peers, stale
+		// replies, complete results, and disconnected transports are never
+		// retried through this path; a reconnect starts a fresh episode.
+		if (retryEligible && (result?.status === "unavailable" || result?.status === "timeout")) {
+			this.#maybeRequestFreshActivity(record, registration);
+		}
+	}
+
+	/** A valid reconnect is a new episode: discard the exhausted budget and request once. */
+	#onReconnect(record: ManagedInstance, registration: { current?: InstanceStatusRegistration }): void {
+		if (!this.#currentRegistration(record, registration) || record.ptyExited) return;
+		// Independently discard cached ephemeral row understanding on transport
+		// replacement: the live client is reachable but its prior observation
+		// may be stale. This is truthfully unknown, never a fabricated zero, and
+		// durable identities/ownership are untouched.
+		record.busy = null;
+		record.pendingInput = null;
+		record.inputSurface = false;
+		record.backgroundTasks = null;
+		record.backgroundShells = null;
+		record.activeTasks = null;
+		record.activeShells = null;
+		record.activity = [];
+		record.statusRevision += 1;
+		this.#safeChanged(record.id);
+		record.activityRefreshAttempts = 0;
+		record.activityRefreshEpisodeOpen = true;
+		this.#maybeRequestFreshActivity(record, registration);
 	}
 
 	#onDisconnect(record: ManagedInstance, registration: { current?: InstanceStatusRegistration }): void {
@@ -1648,6 +1818,8 @@ export class InstanceManager {
 		record.backgroundShells = null;
 		record.activeTasks = null;
 		record.activeShells = null;
+		record.activityRefreshAttempts = 0;
+		record.activityRefreshEpisodeOpen = false;
 		record.activity = [];
 		record.nativeSession = null;
 		record.currentNativeSessionFile = undefined;

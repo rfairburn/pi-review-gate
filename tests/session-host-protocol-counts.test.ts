@@ -11,9 +11,14 @@ import { describe, it } from "node:test";
 import { randomUUID } from "node:crypto";
 
 import {
+  ACTIVITY_CENSUS_CAPABILITY,
   decodeFrame,
   encodeFrame,
+  parseActivityRequest,
+  parseActivityResult,
+  parseHello,
   parseStatus,
+  type SessionHostActivityResult,
   type SessionHostStatus,
 } from "../src/session-host/protocol";
 
@@ -93,5 +98,119 @@ describe("session-host status owned-work counts", () => {
     const withExtra = decodeFrame(`${JSON.stringify({ ...message, transcript: "never exposed" })}\n`);
     assert.ok(withExtra && withExtra.type === "status");
     assert.equal(Object.hasOwn(withExtra, "transcript"), false);
+  });
+});
+
+describe("session-host authoritative activity census contract", () => {
+  function baseRequest(): Record<string, unknown> {
+    return {
+      version: 1,
+      type: "activity_request",
+      instanceId: randomUUID(),
+      generation: randomUUID(),
+      token: "a".repeat(64),
+      requestId: randomUUID(),
+      afterSequence: 7,
+      expectedSessionId: "native-session",
+      expectedSessionEpoch: 2,
+    };
+  }
+
+  it("round-trips an authenticated bounded request and accepts a null native tuple", () => {
+    const parsed = parseActivityRequest(baseRequest());
+    assert.ok(parsed);
+    const decoded = decodeFrame(encodeFrame(parsed));
+    assert.ok(decoded && decoded.type === "activity_request");
+    assert.equal(decoded.afterSequence, 7);
+    assert.equal(decoded.expectedSessionId, "native-session");
+    assert.equal(decoded.expectedSessionEpoch, 2);
+
+    const unknownTuple = parseActivityRequest({
+      ...baseRequest(),
+      expectedSessionId: null,
+      expectedSessionEpoch: null,
+    });
+    assert.ok(unknownTuple);
+    assert.equal(unknownTuple.expectedSessionId, null);
+    assert.equal(unknownTuple.expectedSessionEpoch, null);
+  });
+
+  it("rejects malformed identity, sequence, and partial native tuples", () => {
+    for (const override of [
+      { token: "short" },
+      { requestId: "bad id!" },
+      { afterSequence: -1 },
+      { afterSequence: 1.5 },
+      { expectedSessionId: "native-session", expectedSessionEpoch: null },
+      { expectedSessionId: null, expectedSessionEpoch: 2 },
+      { expectedSessionId: "bad/id", expectedSessionEpoch: 2 },
+    ]) {
+      assert.equal(parseActivityRequest({ ...baseRequest(), ...override }), undefined, JSON.stringify(override));
+    }
+  });
+
+  it("accepts only a complete result with a matching fresh status snapshot", () => {
+    const request = parseActivityRequest(baseRequest())!;
+    const snapshot = parseStatus({
+      ...baseStatus(),
+      instanceId: request.instanceId,
+      generation: request.generation,
+      sequence: 8,
+      nativeSession: { sessionId: "native-session", epoch: 2, name: "Activity" },
+      activeTasks: 0,
+      activeShells: 0,
+    })!;
+    const result: SessionHostActivityResult = {
+      version: 1,
+      type: "activity_result",
+      instanceId: request.instanceId,
+      generation: request.generation,
+      requestId: request.requestId,
+      outcome: "complete",
+      status: snapshot,
+      observedSessionId: "native-session",
+      observedSessionEpoch: 2,
+    };
+    const parsed = parseActivityResult(result);
+    assert.ok(parsed);
+    assert.equal(parsed.outcome, "complete");
+    assert.equal(parsed.status?.activeTasks, 0);
+    const decoded = decodeFrame(encodeFrame(parsed));
+    assert.ok(decoded && decoded.type === "activity_result");
+    assert.equal(decoded.status?.sequence, 8);
+
+    // A contradictory observed tuple, mismatched identity, and a non-complete
+    // result carrying a snapshot are all rejected.
+    assert.equal(parseActivityResult({ ...result, observedSessionId: "other-session" }), undefined);
+    assert.equal(parseActivityResult({ ...result, instanceId: randomUUID() }), undefined);
+    assert.equal(parseActivityResult({
+      version: 1,
+      type: "activity_result",
+      instanceId: request.instanceId,
+      generation: request.generation,
+      requestId: request.requestId,
+      outcome: "unavailable",
+      status: snapshot,
+      observedSessionId: "native-session",
+      observedSessionEpoch: 2,
+    }), undefined);
+  });
+
+  it("advertises the additive capability without changing legacy hello acceptance", () => {
+    const legacy = {
+      version: 1,
+      type: "hello",
+      instanceId: randomUUID(),
+      generation: randomUUID(),
+      token: "b".repeat(64),
+    };
+    const parsedLegacy = parseHello(legacy);
+    assert.ok(parsedLegacy);
+    assert.equal(Object.hasOwn(parsedLegacy, "capabilities"), false);
+    const parsed = parseHello({ ...legacy, capabilities: [ACTIVITY_CENSUS_CAPABILITY] });
+    assert.ok(parsed);
+    assert.deepEqual(parsed.capabilities, [ACTIVITY_CENSUS_CAPABILITY]);
+    assert.equal(parseHello({ ...legacy, capabilities: ["Bad Cap"] }), undefined);
+    assert.equal(parseHello({ ...legacy, capabilities: [1] }), undefined);
   });
 });

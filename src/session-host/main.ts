@@ -517,6 +517,7 @@ function statusRegistrar(broker: StatusBroker): StatusRegistrar {
           handlers.onStatus(update);
         },
         onDisconnect: handlers.onDisconnect,
+        ...(handlers.onReconnect ? { onReconnect: handlers.onReconnect } : {}),
         ...(handlers.onSpawnRequest ? { onSpawnRequest: handlers.onSpawnRequest } : {}),
       });
       // Keep the broker's exact registration closures and their auth/tuple fences.
@@ -3114,6 +3115,8 @@ export const __test = Object.freeze({
   savedDeletionOwnedSessions,
   /** Exact production deletion preflight, including owned binding data. */
   validateOwnedSavedSessionDeletion,
+  /** Exact production manager-view to sidebar-item mapping, for wiring regressions. */
+  toSidebarItem,
   /** Pure readiness decision exposed for source regressions (no runtime effect). */
   rowResumeReadiness: (
     view: NativeInstanceView | undefined,

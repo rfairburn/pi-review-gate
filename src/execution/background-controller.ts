@@ -44,6 +44,7 @@ import {
   registerOwnedActivitySource,
   type OwnedActivityIntentRefresh,
   type OwnedActivitySourceHandle,
+  type RetiredOwnedActivityChannel,
   type RetiredOwnedActivityReconciliation,
   type RetiredOwnedActivityTokens,
 } from "../session-host/owned-activity";
@@ -255,27 +256,6 @@ interface RetiredExecutionCensusInventory {
   detachComplete: boolean;
   /** Any post-detach admission/state/token mutation invalidates this revision. */
   detachedRevision: number | undefined;
-  revision: number;
-}
-
-interface CurrentActivityRoot {
-  root: string;
-  executionId?: string;
-  sessionOwner?: string;
-  sessionCwd: string;
-  invalid?: boolean;
-}
-
-/** Independent authenticated inventory for this still-live controller source. */
-interface CurrentActivityInventory {
-  authoritative: boolean;
-  ready: boolean;
-  invalid: boolean;
-  sessionOwner?: string;
-  sessionCwd: string;
-  roots: CurrentActivityRoot[];
-  bundles: ReattachmentBundle[];
-  waveRoots: string[];
   revision: number;
 }
 
@@ -606,14 +586,14 @@ export class BackgroundExecutionController {
   private retiredCensus?: RetiredExecutionCensusInventory;
   /** Async read fence for controller-local mutation during a retired census. */
   private censusRevision = 0;
-  /** Authenticated activity inventory is separate from cleanup-ownership completeness. */
-  private currentActivityInventory?: CurrentActivityInventory;
-  private currentActivityInventoryRevision = 0;
-  private activityIntentUncertain = true;
-  /** Mirror of the exact intent tokens this controller incarnation has published. */
-  private readonly activityIntentTokens = new Set<string>();
-  private currentActivityCensusInFlight?: Promise<void>;
-  private currentActivityCensusDirty = false;
+  /**
+   * Genuine activity lifecycle readiness: restores are the only event that can
+   * attach old work, so this is a direct in-flight count (never a flag that
+   * telemetry can leave stale). It is the single readiness gate the activity
+   * census honours; every other activity input is derived from the controller's
+   * own canonical runtime state.
+   */
+  private activityRestores = 0;
   private startAdmissions = 0;
   private recoveryAdmissions = 0;
   private readonly runtimes = new Map<string, RuntimeTaskHandle>();
@@ -704,8 +684,9 @@ export class BackgroundExecutionController {
       intentUncertain: true,
       reconcileRetired: (retained) => this.reconcileRetiredActivity(retained),
       // The registry's coalesced intent-refresh pass recovers a diverged or
-      // stale loaded status from this controller's own authoritative census —
-      // independent of the local uncertainty boolean.
+      // stale loaded status from this controller's own authoritative census.
+      // That fresh read is this source's ONLY activity-telemetry path: the
+      // controller keeps no token mirror and no second census engine.
       refreshActivity: () => this.refreshCurrentActivityIntent(),
     });
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(input.config));
@@ -1111,22 +1092,64 @@ export class BackgroundExecutionController {
    * Exact old-controller census. It only reads validated manifests, archives,
    * and operation ownership metadata; no restore/adoption/save/pump/notify or
    * task-state transition is reachable from this path.
+   *
+   * The two channels are INDEPENDENT. Ownership is the full historical census
+   * union and stays exactly as conservative as before: a historical roster that
+   * was never authoritative, an unreadable historical root, an unmatched bundle,
+   * or an unresolved admission keeps cleanup ownership unknown. The retired
+   * ACTIVITY-INTENT channel is a channel-specific view over the same sealed
+   * retained inventory (same validators, no second inventory and no stored
+   * mirror): it is computed from this exact owner's LOCALLY established runtime
+   * evidence and unresolved lifecycle guards only, so historical ownership
+   * incompleteness can neither poison nor block it. `mode: "intent"` is the
+   * forced current-source query: unavailable historical ownership IO cannot
+   * delay the actual current activity answer.
    */
   private async reconcileRetiredActivity(
     retained: RetiredOwnedActivityTokens,
+    mode: "both" | "intent" = "both",
   ): Promise<RetiredOwnedActivityReconciliation> {
     const inventory = this.retiredCensus;
-    if (!inventory || !inventory.initialized || !inventory.authoritative
-      || this.detaching > 0 || !inventory.detachComplete
+    if (!inventory || this.detaching > 0 || !inventory.detachComplete
       || inventory.detachedRevision !== this.censusRevision) return {};
+    // Snapshot the exact sealed generation BEFORE the first await. The intent
+    // census is asynchronous, so a late post-detach admission/state mutation
+    // (for example a start admission that bumped the controller revision but has
+    // not acquired its token yet) must invalidate this whole read — including
+    // the intent-only and non-authoritative early returns. A stale read can
+    // therefore never publish a false zero. The same original snapshot fences
+    // the ownership census below; it is never re-based after an await.
     const generation = this.censusRevision;
     const inventoryRevision = inventory.revision;
+    const sealed = (): boolean => this.censusRevision === generation
+      && this.detaching === 0
+      && inventory.detachComplete
+      && inventory.detachedRevision === generation
+      && inventory.revision === inventoryRevision
+      && this.retiredCensus === inventory;
+    // A legacy pre-intent incarnation has no activity history to prove; it stays
+    // unknown and only its ownership channel is censused.
+    const intent = retained.intent === undefined
+      ? undefined
+      : await this.runRetiredIntentCensus(inventory, retained.intent);
+    if (intent === RETIRED_ACTIVITY_CENSUS_DISCARDED || !sealed()) {
+      return RETIRED_ACTIVITY_CENSUS_DISCARDED;
+    }
+    if (mode === "intent" || !inventory.authoritative) {
+      // Missing historical completeness is an ownership-only failure. The
+      // independent intent channel still answers when the exact owner proves it.
+      return intent === undefined ? {} : {
+        // The registry may wait for other retired owners before consuming this
+        // result; revalidate the exact seal when the channel is read so a late
+        // post-detach admission can never turn this proof into a stale zero.
+        get intent() {
+          return sealed() ? intent : { complete: false as const };
+        },
+      };
+    }
     let ownershipComplete = inventory.ownershipComplete;
-    let intentComplete = inventory.intentComplete;
     const ownershipTokens = new Set(retained.ownership);
-    const intentTokens = new Set(retained.intent ?? []);
     const releasedOwnership = new Set<string>();
-    const releasedIntent = new Set<string>();
     const rowsByTaskId = new Map<string, CensusTaskOwner[]>();
     const associationRevisions = new Map<string, number>();
 
@@ -1156,7 +1179,6 @@ export class BackgroundExecutionController {
         }
       } catch {
         ownershipComplete = false;
-        intentComplete = false;
       }
     }
 
@@ -1165,7 +1187,6 @@ export class BackgroundExecutionController {
       // Task ids are source tokens; duplicate logical records cannot be
       // collapsed into a Set without losing an owned unit.
       ownershipComplete = false;
-      intentComplete = false;
     }
 
     const loadRow = async (taskId: string, row: CensusTaskOwner): Promise<BackgroundTaskRecord> => {
@@ -1197,7 +1218,6 @@ export class BackgroundExecutionController {
         }
       } catch {
         ownershipComplete = false;
-        intentComplete = false;
       }
     }
     for (const waveRoot of inventory.waveRoots) {
@@ -1210,17 +1230,16 @@ export class BackgroundExecutionController {
       }
       if (!matched) {
         ownershipComplete = false;
-        intentComplete = false;
       }
     }
 
-    // Each retained token must resolve to exactly one inline task or an
-    // authenticated archive; otherwise it remains positive and unknown.
-    for (const token of new Set([...retained.ownership, ...(retained.intent ?? [])])) {
+    // Each retained ownership token must resolve to exactly one inline task or
+    // an authenticated archive; otherwise it remains positive and unknown. The
+    // independent intent channel validates its own retained tokens.
+    for (const token of retained.ownership) {
       const rows = rowsByTaskId.get(token);
       if (!rows || rows.length !== 1) {
         ownershipComplete = false;
-        intentComplete = false;
         continue;
       }
       if (!rows[0]!.task) {
@@ -1228,7 +1247,6 @@ export class BackgroundExecutionController {
           await loadRow(token, rows[0]!);
         } catch {
           ownershipComplete = false;
-          intentComplete = false;
         }
       }
     }
@@ -1241,17 +1259,14 @@ export class BackgroundExecutionController {
         task = await loadRow(taskId, row);
       } catch {
         ownershipComplete = false;
-        intentComplete = false;
         continue;
       }
       if (task.taskId !== taskId) {
         ownershipComplete = false;
-        intentComplete = false;
         continue;
       }
       if (inventory.unresolvedAll || inventory.unresolvedTaskIds.has(taskId)) {
         ownershipComplete = false;
-        intentComplete = false;
         continue;
       }
       let operationStatus: CensusOperationEvidence["status"] | undefined;
@@ -1261,237 +1276,348 @@ export class BackgroundExecutionController {
           operationStatus = (await this.readCensusOperation(row.group, task, associationRevisions.get(taskId))).status;
         } catch {
           ownershipComplete = false;
-          intentComplete = false;
           continue;
         }
         if (operationStatus === "uncertain") {
           ownershipComplete = false;
-          intentComplete = false;
           continue;
         }
       }
       if (isArchivableTaskState(task.state)) {
         if (operationStatus === "live") {
           ownershipComplete = false;
-          intentComplete = false;
           continue;
         }
         if (ownershipTokens.delete(taskId)) releasedOwnership.add(taskId);
-        if (intentTokens.delete(taskId)) releasedIntent.add(taskId);
         continue;
       }
 
       if (taskOwnsUnsettledWork(task, false, false)) ownershipTokens.add(taskId);
       else if (ownershipTokens.delete(taskId)) releasedOwnership.add(taskId);
-
-      if (task.state === "queued" && operationStatus !== "live" && operationStatus !== "uncertain") {
-        intentTokens.add(taskId); // queued logical work is intent, not a resumed process
-      } else if (!isActiveTaskState(task.state)
-        && (!needsOperation || operationStatus === "released" || operationStatus === "dead")) {
-        if (intentTokens.delete(taskId)) releasedIntent.add(taskId);
-      } else {
-        // Durable active state alone is not runtime evidence. A retained live
-        // owner is positive ownership, but its current activity remains unknown.
-        intentComplete = false;
-        if (operationStatus === "live" && taskOwnsUnsettledWork(task, false, false)) ownershipTokens.add(taskId);
-      }
     }
 
     if (this.censusRevision !== generation || inventory.revision !== inventoryRevision
       || this.retiredCensus !== inventory) return RETIRED_ACTIVITY_CENSUS_DISCARDED;
 
-    const channel = (complete: boolean, tokens: Set<string>, released: Set<string>) => complete
-      ? { complete: true as const, tokens: [...tokens], released: [...released] }
+    const ownership = ownershipComplete
+      ? { complete: true as const, tokens: [...ownershipTokens], released: [...releasedOwnership] }
       : { complete: false as const };
     return {
-      ownership: channel(ownershipComplete, ownershipTokens, releasedOwnership),
-      ...(retained.intent !== undefined
-        ? { intent: channel(intentComplete, intentTokens, releasedIntent) }
-        : {}),
-    };
-  }
-
-  private createCurrentActivityInventory(
-    associations: ExecutionAssociationsSnapshot,
-    authoritative: boolean,
-    sessionOwner?: string,
-  ): CurrentActivityInventory {
-    const sessionCwd = resolve(this.input.cwd());
-    const hasRoots = Array.isArray(associations.groupRoots);
-    const hasBundles = Array.isArray(associations.bundles);
-    const hasWaveRoots = Array.isArray(associations.waveRoots);
-    const roots: CurrentActivityRoot[] = [];
-    const seenRoots = new Set<string>();
-    let invalid = false;
-    if (hasRoots) {
-      for (const value of associations.groupRoots as unknown[]) {
-        if (typeof value !== "string" || value.length === 0) {
-          invalid = true;
-          roots.push({ root: "", ...(sessionOwner ? { sessionOwner } : {}), sessionCwd, invalid: true });
-          continue;
-        }
-        const root = resolve(value);
-        if (seenRoots.has(root)) invalid = true;
-        seenRoots.add(root);
-        roots.push({ root, ...(sessionOwner ? { sessionOwner } : {}), sessionCwd });
-      }
-    }
-    const bundles: ReattachmentBundle[] = [];
-    if (hasBundles) {
-      for (const value of associations.bundles as unknown[]) {
-        if (!isRecord(value) || typeof value.taskId !== "string" || !/^task-[0-9a-zA-Z-]+$/.test(value.taskId)
-          || typeof value.operationId !== "string" || typeof value.waveId !== "string" || typeof value.waveRoot !== "string"
-          || !Number.isSafeInteger(value.expectedRevision) || Number(value.expectedRevision) < 0) {
-          invalid = true;
-          continue;
-        }
-        bundles.push({ ...value } as unknown as ReattachmentBundle);
-      }
-    }
-    const waveRoots: string[] = [];
-    if (hasWaveRoots) {
-      for (const value of associations.waveRoots as unknown[]) {
-        if (typeof value !== "string" || value.length === 0) {
-          invalid = true;
-          continue;
-        }
-        waveRoots.push(resolve(value));
-      }
-    }
-    return {
-      authoritative: authoritative && hasRoots && hasBundles && hasWaveRoots,
-      ready: false,
-      invalid,
-      ...(sessionOwner ? { sessionOwner } : {}),
-      sessionCwd,
-      roots,
-      bundles,
-      waveRoots,
-      revision: ++this.currentActivityInventoryRevision,
+      ownership,
+      // Normal retired reconciliation can stay pending on another owner's read
+      // after this census finished; the channel is revalidated against the
+      // exact seal when the registry consumes it (ownership is unchanged).
+      get intent() {
+        if (intent === undefined) return undefined;
+        return sealed() ? intent : { complete: false as const };
+      },
     };
   }
 
   /**
-   * Read-only re-establishment for this live source. Unlike the retired-source
-   * census, this uses the active controller's authoritative session inventory
-   * and fences the result against its live admissions, task/runtime maps,
-   * detach epoch, and exact source incarnation. It never changes cleanup
-   * ownership or performs restore/adoption/scheduling work.
+   * Channel-specific CURRENT-runtime intent view over the sealed retained
+   * inventory. Only this exact old owner's locally established evidence is
+   * consulted: roots it established an execution identity for (its own groups
+   * and active-task index), the unresolved runtime/force-merge/continuation/
+   * admission guards it sealed with, and the durable task/operation records of
+   * those local roots. Historical-only references (claimed roots without a
+   * local identity, foreign bundles/wave roots, settled archives) are cleanup
+   * ownership evidence and are never replayed as current activity, so a sealed
+   * owner with no actual work proves a truthful zero even when the historical
+   * roster was uninitialized, non-authoritative, or unreadable.
+   *
+   * A local root that cannot be authenticated, a local task whose operation
+   * liveness cannot be established, an unresolved runtime/force-merge owner, or
+   * an admission without stable identity keeps the channel incomplete
+   * (unknown, never zero). Retained positive tokens must be re-proved by this
+   * same local evidence or released by its own settled record; an unaccounted
+   * retained token also stays unknown. A recovery/adoption that is still in
+   * flight when the detach seals cannot add a new retained local root (its own
+   * detach/epoch guard refuses it), and one that completes after the seal
+   * invalidates this census through the retained generation fence; an admitted
+   * task is visible in the durable record of its already-retained local root.
    */
-  private async reconcileCurrentActivityIntent(): Promise<void> {
-    if (!this.activityIntentUncertain) return;
-    await this.runCurrentActivityCensus({ publish: true });
+  private async runRetiredIntentCensus(
+    inventory: RetiredExecutionCensusInventory,
+    retainedIntent: readonly string[],
+  ): Promise<RetiredOwnedActivityChannel | typeof RETIRED_ACTIVITY_CENSUS_DISCARDED> {
+    if (inventory.unresolvedAll || inventory.unresolvedTaskIds.size > 0) return { complete: false };
+    const generation = this.censusRevision;
+    const inventoryRevision = inventory.revision;
+    let complete = true;
+    const rowsByTaskId = new Map<string, CensusTaskOwner>();
+    const associationRevisions = new Map<string, number>();
+    const executionIds = new Set<string>();
+    for (const expected of inventory.roots.values()) {
+      // A root without a locally established execution identity is historical
+      // ownership evidence only: it can neither prove nor poison activity.
+      if (expected.executionId === undefined) continue;
+      try {
+        if (expected.invalid || expected.sessionCwd === undefined) {
+          throw new Error("Retained local execution root has ambiguous identity.");
+        }
+        const { group } = await readGroup(expected.root);
+        if (resolve(group.root) !== resolve(expected.root)
+          || group.executionId !== expected.executionId
+          || resolve(this.sessionCwdOf(group)) !== resolve(expected.sessionCwd)
+          || executionIds.has(group.executionId)) {
+          throw new Error("Retained local execution root identity changed.");
+        }
+        executionIds.add(group.executionId);
+        // Inline members only: evicted archives are settled handles and cannot
+        // be current activity.
+        for (const task of group.tasks) {
+          if (rowsByTaskId.has(task.taskId)) throw new Error("Retained local task identity is duplicated.");
+          rowsByTaskId.set(task.taskId, { group, task });
+        }
+      } catch {
+        complete = false;
+      }
+    }
+    // A locally owned recovery bundle is exact old-owner evidence for its
+    // task's operation revision; historical bundles are cleanup-only.
+    for (const bundle of inventory.bundles.values()) {
+      const row = rowsByTaskId.get(bundle.taskId);
+      if (!row?.task) continue;
+      try {
+        if (!Number.isSafeInteger(bundle.expectedRevision) || bundle.expectedRevision < 0) {
+          throw new Error("Recovery bundle revision is invalid.");
+        }
+        associationRevisions.set(bundle.taskId, Math.max(associationRevisions.get(bundle.taskId) ?? 0, bundle.expectedRevision));
+        if (!row.task.bundle
+          || row.task.bundle.taskId !== bundle.taskId
+          || row.task.bundle.operationId !== bundle.operationId
+          || row.task.bundle.waveId !== bundle.waveId
+          || resolve(row.task.bundle.waveRoot) !== resolve(bundle.waveRoot)) {
+          throw new Error("Recovery bundle does not match its exact retained task.");
+        }
+      } catch {
+        complete = false;
+      }
+    }
+    const tokens = new Set<string>();
+    for (const [taskId, row] of rowsByTaskId) {
+      const task = row.task;
+      if (!task || task.taskId !== taskId) {
+        complete = false;
+        continue;
+      }
+      let operationStatus: CensusOperationEvidence["status"] | undefined;
+      const needsOperation = Boolean(task.bundle || task.waveRoot || task.inplaceResult?.operationRecord || (task.generation ?? 0) > 0);
+      if (needsOperation) {
+        try {
+          operationStatus = (await this.readCensusOperation(row.group, task, associationRevisions.get(taskId))).status;
+        } catch {
+          complete = false;
+          continue;
+        }
+        if (operationStatus === "uncertain") {
+          complete = false;
+          continue;
+        }
+      }
+      if (isArchivableTaskState(task.state)) {
+        // A live writer on a settled record keeps activity unknown; a released
+        // or dead one is a proven stop.
+        if (operationStatus === "live") complete = false;
+        continue;
+      }
+      if (task.state === "queued" && operationStatus !== "live" && operationStatus !== "uncertain") {
+        tokens.add(taskId); // queued logical work is intent, not a resumed process
+        continue;
+      }
+      if (!isActiveTaskState(task.state)
+        && (!needsOperation || operationStatus === "released" || operationStatus === "dead")) continue;
+      // Durable active state alone is not runtime evidence, and a retained live
+      // owner is not proof of a stop: unknown, never zero.
+      complete = false;
+    }
+    const released = new Set<string>();
+    for (const prior of retainedIntent) {
+      if (tokens.has(prior)) continue;
+      if (!rowsByTaskId.has(prior)) {
+        // An unaccounted retained positive cannot be cleared by local emptiness.
+        complete = false;
+        continue;
+      }
+      // An inconsistent local row already made this channel incomplete above,
+      // so a released proof is only ever published for a proven local record.
+      released.add(prior);
+    }
+
+    if (this.censusRevision !== generation || inventory.revision !== inventoryRevision
+      || this.retiredCensus !== inventory) return RETIRED_ACTIVITY_CENSUS_DISCARDED;
+    return complete
+      ? { complete: true, tokens: [...tokens], released: [...released] }
+      : { complete: false };
   }
 
   /**
-   * Authoritative activity census for the current incarnation: validates the
-   * complete exact inventory against disk and returns it. With `publish`, the
-   * ordinary reconcile path applies the exact intent tokens itself, resolving
-   * the uncertainty only when every row is accounted for. Without `publish`
-   * (the registry refresh path) the census is strictly read-only: it returns
-   * the verified exact token set and the registry applies it atomically behind
-   * its own commit-time fences. Every skipped, failed, or stale path returns
-   * undefined — success is never inferred from the pre-existing local boolean.
+   * Authoritative activity census for the current incarnation.
+   *
+   * Current-runtime activity is derived from this controller's own canonical
+   * live state — its groups, active-task index, runtime owners, continuation
+   * reservations, and in-flight force-merges — and only the durable record of
+   * each CURRENT in-memory group is authenticated (identity and membership) as
+   * a divergence fence. Two very different kinds of retained reference are kept
+   * apart:
+   *
+   * - LOCALLY RETAINED WORK: a root this controller itself established an
+   *   execution identity for, or an unresolved runtime/force-merge/admission it
+   *   detached with. That is not historical — its settlement was never observed
+   *   — so this census refuses to speak (unknown) until the exact owner settles
+   *   it, reattaches it, or verified cleanup retires the root. This evidence is
+   *   canonical retained ownership state, not derived activity telemetry, so
+   *   clearing or poisoning registry intent data cannot turn genuinely lost
+   *   work into a false zero;
+   * - HISTORICAL REFERENCES: claimed roots with no locally established execution
+   *   identity, retained bundles/wave roots, settled archives, and operation
+   *   artifacts. They are ownership-only: they may keep cleanup unknown, but
+   *   they can neither hold activity unknown forever nor turn a fresh runtime's
+   *   truthful no-work state into a false unknown.
+   *
+   * Restoring a saved conversation into a new runtime is exactly that boundary:
+   * it attaches no old work, so with nothing admitted or resumed the source is a
+   * known zero regardless of its historical (idle/busy/unknown/unreadable)
+   * recovery history. Real newly admitted/resumed work counts normally.
+   *
+   * The census is strictly read-only: it returns the verified exact token set
+   * and its own freshness predicate, and the registry applies that result
+   * atomically behind its commit-time fences. Real lifecycle changes reach the
+   * registry's derived intent set directly through this source's incarnation
+   * handle, so this controller keeps no token mirror, no local uncertainty
+   * boolean, and no census queue of its own. Every skipped, failed, or stale
+   * path returns undefined — success is never inferred from previously
+   * published telemetry.
    */
-  private async runCurrentActivityCensus(options: { publish: boolean }): Promise<{
+  private async runCurrentActivityCensus(): Promise<{
     tokens: Set<string>;
     isCurrent: () => boolean;
   } | undefined> {
-    const inventory = this.currentActivityInventory;
-    if (!inventory || !inventory.authoritative || !inventory.ready || inventory.invalid
-      || this.ownedActivity.retired || !isOwnedActivityActive()
+    // Only GENUINE lifecycle facts gate this census: an attached source, an
+    // active registry, no detach/shutdown, no admission or continuation
+    // validation in flight, no pending durable write, and a stable session
+    // directory. Every activity input is derived from the controller's own
+    // canonical runtime state, so no historical association snapshot, retained
+    // telemetry flag, or stale readiness boolean can keep it permanently
+    // unknown. A census that cannot establish the exact set still returns
+    // undefined so the caller can truthfully invalidate (never fabricate).
+    if (this.ownedActivity.retired || !isOwnedActivityActive()
+      || this.activityRestores > 0
       || this.detaching > 0 || this.shuttingDown || this.startAdmissions > 0
       || this.recoveryAdmissions > 0 || this.continuationAdmissions.size > 0
-      || this.pendingForceMerges.size > 0 || this.saveTails.size > 0
-      || resolve(this.input.cwd()) !== inventory.sessionCwd) return;
+      || this.saveTails.size > 0) return;
+    let sessionCwd: string;
+    try {
+      sessionCwd = resolve(this.input.cwd());
+    } catch {
+      return;
+    }
 
     const generation = this.censusRevision;
     const detachEpoch = this.detachEpoch;
-    const inventoryRevision = inventory.revision;
-    const inventorySessionOwner = inventory.sessionOwner;
-    const inventorySessionCwd = inventory.sessionCwd;
-    const inventoryRoots = inventory.roots.map((root) => ({ ...root }));
-    const inventoryBundles = inventory.bundles.map((bundle) => ({ ...bundle }));
-    const inventoryWaveRoots = [...inventory.waveRoots];
+    const sessionRestores = this.activityRestores;
     const currentGroups = new Map([...this.groups].map(([executionId, group]) => [executionId, {
       live: group,
       snapshot: { ...group, tasks: group.tasks.map(cloneTask) } as BackgroundExecutionGroup,
     }] as const));
-    const archiveMemberships = [...this.archivedTasks].map(([key, value]) => [key, { ...value }] as const);
-    const legacyMemberships = new Map([...this.legacyArchiveHandles].map(([executionId, value]) =>
-      [executionId, new Set(value.entries.keys())] as const));
     const runtimeIds = new Set(this.runtimes.keys());
-    const isCurrent = () => this.censusRevision === generation
-      && this.detachEpoch === detachEpoch
-      && this.currentActivityInventory === inventory
-      && inventory.revision === inventoryRevision
-      && inventory.sessionOwner === inventorySessionOwner
-      && inventory.ready
-      && !this.ownedActivity.retired
-      && this.detaching === 0
-      && !this.shuttingDown
-      && this.startAdmissions === 0
-      && this.recoveryAdmissions === 0
-      && this.continuationAdmissions.size === 0
-      && this.pendingForceMerges.size === 0
-      && this.saveTails.size === 0
-      && resolve(this.input.cwd()) === inventorySessionCwd;
-
-    let complete = true;
-    const rootsByPath = new Map<string, CurrentActivityRoot>();
-    const addRoot = (candidate: CurrentActivityRoot): void => {
-      if (candidate.invalid || candidate.root.length === 0) {
-        complete = false;
-        return;
+    const isCurrent = () => {
+      if (this.censusRevision !== generation
+        || this.detachEpoch !== detachEpoch
+        || this.activityRestores !== sessionRestores
+        || this.ownedActivity.retired
+        || this.detaching !== 0
+        || this.shuttingDown
+        || this.startAdmissions !== 0
+        || this.recoveryAdmissions !== 0
+        || this.continuationAdmissions.size !== 0
+        || this.saveTails.size !== 0) return false;
+      try {
+        return resolve(this.input.cwd()) === sessionCwd;
+      } catch {
+        return false;
       }
-      const path = resolve(candidate.root);
-      const prior = rootsByPath.get(path);
-      if (prior) {
-        if (resolve(prior.sessionCwd) !== resolve(candidate.sessionCwd)
-          || (prior.sessionOwner !== undefined && candidate.sessionOwner !== undefined
-            && prior.sessionOwner !== candidate.sessionOwner)
-          || (prior.executionId !== undefined && candidate.executionId !== undefined
-            && prior.executionId !== candidate.executionId)) complete = false;
-        if (prior.executionId === undefined && candidate.executionId !== undefined) prior.executionId = candidate.executionId;
-        if (prior.sessionOwner === undefined && candidate.sessionOwner !== undefined) prior.sessionOwner = candidate.sessionOwner;
-        return;
-      }
-      rootsByPath.set(path, { ...candidate, root: path });
     };
 
-    for (const root of inventoryRoots) addRoot(root);
+    // Canonical current-runtime activity: this controller's own live groups,
+    // active-task index, runtime owners, and continuation reservations are the
+    // single authority. Historical ownership references (retained roots with no
+    // live group, retained bundles/wave roots, settled archives, and operation
+    // artifacts) are deliberately NOT consulted: they may keep cleanup
+    // ownership unknown, but a runtime that admitted/resumed nothing is a known
+    // zero no matter how unreadable or incomplete its historical recovery is.
+    const expectedIntentTokens = new Set<string>();
+    const expectedActiveKeys = new Set<string>();
+    const runtimeOwners = new Map<string, number>();
     for (const [executionId, entry] of currentGroups) {
       const group = entry.snapshot;
-      if (executionId !== group.executionId) complete = false;
-      addRoot({
-        root: group.root,
-        executionId: group.executionId,
-        ...(inventorySessionOwner ? { sessionOwner: inventorySessionOwner } : {}),
-        sessionCwd: resolve(this.sessionCwdOf(group)),
-      });
-    }
-    const associations = this.associations();
-    for (const root of associations.groupRoots ?? []) {
-      if (typeof root !== "string" || root.length === 0) complete = false;
-      else if (![...rootsByPath.keys()].includes(resolve(root))) complete = false;
-    }
-
-    const expectedActiveKeys = new Set<string>();
-    for (const entry of currentGroups.values()) {
-      const group = entry.snapshot;
+      if (executionId !== group.executionId || group.root.length === 0) return;
+      // The session generation each attached group belongs to must still be the
+      // live one: a moved session directory is a different generation, so this
+      // census refuses to speak for it (unknown, never a stale value).
+      if (resolve(this.sessionCwdOf(group)) !== sessionCwd) return;
       for (const task of group.tasks) {
-        if (isActiveTaskState(task.state)) expectedActiveKeys.add(this.activeTaskKey(group, task));
+        // A launched task may still be recorded as queued until its runner
+        // transitions it: a live runtime always belongs to exactly one current
+        // task, whatever its not-yet-updated state.
+        if (runtimeIds.has(task.taskId)) runtimeOwners.set(task.taskId, (runtimeOwners.get(task.taskId) ?? 0) + 1);
+        if (!isActiveTaskState(task.state)) continue;
+        expectedActiveKeys.add(this.activeTaskKey(group, task));
+        expectedIntentTokens.add(task.taskId);
+        // A non-queued active state without this runtime's own live handle is a
+        // lost liveness owner, not evidence of activity: stay unknown.
+        if (task.state !== "queued" && !runtimeIds.has(task.taskId)) return;
       }
     }
-    if (expectedActiveKeys.size !== this.activeTasks.size) complete = false;
+    if (expectedActiveKeys.size !== this.activeTasks.size) return;
     for (const [key, entry] of this.activeTasks) {
       if (!expectedActiveKeys.has(key)
         || currentGroups.get(entry.group.executionId)?.live !== entry.group
         || key !== this.activeTaskKey(entry.group, entry.task)
         || !entry.group.tasks.includes(entry.task)
-        || !isActiveTaskState(entry.task.state)) complete = false;
+        || !isActiveTaskState(entry.task.state)) return;
     }
-    if (!complete) return;
+    // Every live runtime must belong to exactly one current task.
+    if (runtimeOwners.size !== runtimeIds.size
+      || [...runtimeIds].some((taskId) => runtimeOwners.get(taskId) !== 1)) return;
+    // An in-flight force-merge is current-runtime activity (the same predicate
+    // that publishes its intent token), so it is counted rather than treated as
+    // an unknowable window; only its exact single owning group can carry it.
+    for (const taskId of this.pendingForceMerges.keys()) {
+      const owners = [...currentGroups.values()].filter((entry) =>
+        entry.snapshot.tasks.some((task) => task.taskId === taskId)).length;
+      if (owners !== 1) return;
+      expectedIntentTokens.add(taskId);
+    }
+    // Lost owning-runtime evidence survives telemetry loss. Canonical retained
+    // ownership evidence — never derived registry telemetry — decides whether
+    // the empty live maps can be trusted: a runtime/force-merge/admission that
+    // was never observed to settle keeps this census incomplete (unknown) even
+    // when the registry's derived intent set was cleared or poisoned.
+    // Historical roots without a locally established execution identity are
+    // ownership-only and never gate activity. Verified cleanup retires a root so
+    // its work can never be treated as lost again.
+    const retained = this.retiredCensus;
+    if (retained?.unresolvedAll || (retained?.unresolvedTaskIds.size ?? 0) > 0) return;
+    for (const expected of retained?.roots.values() ?? []) {
+      if (expected.executionId === undefined) continue;
+      const attached = currentGroups.get(expected.executionId);
+      if (attached !== undefined) {
+        if (resolve(attached.snapshot.root) !== resolve(expected.root)) return;
+        continue;
+      }
+      try {
+        if (expected.invalid || expected.sessionCwd === undefined) return;
+        const { group } = await readGroup(expected.root);
+        if (resolve(group.root) !== resolve(expected.root)
+          || group.executionId !== expected.executionId
+          || resolve(this.sessionCwdOf(group)) !== resolve(expected.sessionCwd)
+          || group.tasks.some((task) => isActiveTaskState(task.state))) return;
+      } catch {
+        return;
+      }
+    }
 
     const hookContext: BackgroundFaultContext = {
       taskStates: [...currentGroups.values()].flatMap((entry) => entry.snapshot.tasks.map((task) => task.state)),
@@ -1503,237 +1629,134 @@ export class BackgroundExecutionController {
     }
     if (!isCurrent()) return;
 
-    const executionIds = new Map<string, string>();
-    const rowsByTaskId = new Map<string, CensusTaskOwner[]>();
-    const verifiedRoots: CurrentActivityRoot[] = [];
+    // Authenticate the durable record behind every CURRENT in-memory group.
+    // Identity/membership divergence means the live projection cannot be
+    // vouched for, so activity stays unknown rather than becoming a fabricated
+    // value. Settled/evicted archives are compared by authenticated membership
+    // only: their contents and operation artifacts are ownership evidence, not
+    // current activity, and are never hydrated (or allowed to block) here.
     const groupsSeen = new Set<string>();
-    const addRow = (taskId: string, row: CensusTaskOwner): void => {
-      const rows = rowsByTaskId.get(taskId) ?? [];
-      rows.push(row);
-      rowsByTaskId.set(taskId, rows);
-    };
-
-    for (const expected of rootsByPath.values()) {
+    for (const [executionId, entry] of currentGroups) {
       try {
-        const restored = await readGroup(expected.root);
+        const group = entry.snapshot;
+        const restored = await readGroup(group.root);
         const diskGroup = restored.group;
         const actualRoot = resolve(diskGroup.root);
         const diskSessionCwd = resolve(this.sessionCwdOf(diskGroup));
-        if (actualRoot !== resolve(expected.root)
-          || diskSessionCwd !== resolve(expected.sessionCwd)
-          || (expected.executionId !== undefined && expected.executionId !== diskGroup.executionId)
-          || groupsSeen.has(diskGroup.executionId)) {
+        if (actualRoot !== resolve(group.root)
+          || diskSessionCwd !== resolve(this.sessionCwdOf(group))
+          || resolve(diskGroup.cwd) !== resolve(group.cwd)
+          || diskGroup.kind !== group.kind
+          || diskGroup.executionId !== executionId
+          || groupsSeen.has(executionId)) {
           throw new Error("Current activity group identity is incomplete or ambiguous.");
         }
-        groupsSeen.add(diskGroup.executionId);
-        const priorRoot = executionIds.get(diskGroup.executionId);
-        if (priorRoot !== undefined && priorRoot !== actualRoot) throw new Error("Execution identity is present at multiple roots.");
-        executionIds.set(diskGroup.executionId, actualRoot);
-        verifiedRoots.push({
-          root: actualRoot,
-          executionId: diskGroup.executionId,
-          ...(expected.sessionOwner ? { sessionOwner: expected.sessionOwner } : {}),
-          sessionCwd: diskSessionCwd,
-        });
-
-        const liveEntry = currentGroups.get(diskGroup.executionId);
-        const liveGroup = liveEntry?.live;
-        const liveSnapshot = liveEntry?.snapshot;
-        if (liveSnapshot && (resolve(liveSnapshot.root) !== actualRoot
-          || resolve(this.sessionCwdOf(liveSnapshot)) !== diskSessionCwd
-          || resolve(liveSnapshot.cwd) !== resolve(diskGroup.cwd)
-          || liveSnapshot.kind !== diskGroup.kind)) {
-          throw new Error("Current in-memory group no longer matches its authenticated root.");
-        }
-        const rowGroup = liveSnapshot ?? diskGroup;
+        groupsSeen.add(executionId);
+        // Exact membership: every live task is present in its authenticated
+        // manifest, and every authenticated manifest/archive member is
+        // accounted for by this live group (inline or an authenticated handle).
         const diskIds = new Set<string>();
-        const liveTasksById = new Map<string, BackgroundTaskRecord>();
-        for (const task of liveSnapshot?.tasks ?? []) {
-          if (!/^task-[0-9a-zA-Z-]+$/.test(task.taskId) || liveTasksById.has(task.taskId)) {
-            throw new Error("Current in-memory task identity is malformed or duplicated.");
-          }
-          liveTasksById.set(task.taskId, task);
-        }
-
         for (const task of diskGroup.tasks) {
           if (!/^task-[0-9a-zA-Z-]+$/.test(task.taskId) || diskIds.has(task.taskId)) {
             throw new Error("Authenticated task identity is malformed or duplicated.");
           }
           diskIds.add(task.taskId);
-          addRow(task.taskId, { group: rowGroup, task: liveTasksById.get(task.taskId) ?? task });
         }
-        for (const [taskId, archive] of restored.legacyArchives) {
+        for (const taskId of restored.legacyArchives.keys()) {
           if (!/^task-[0-9a-zA-Z-]+$/.test(taskId)) {
             throw new Error("Authenticated archive membership is malformed.");
           }
-          // A durable archive index may legitimately lag a manifest rewrite:
-          // its authenticated membership can overlap a task already hydrated
-          // inline. The inline record accounts for that task; only archive-only
-          // membership needs a separate archive read and row.
-          if (diskIds.has(taskId)) continue;
-          const task = await readOwnedTaskArchive(expected.root, taskId, {
-            executionId: diskGroup.executionId,
-            archiveIntegritySha256: archive.archiveIntegritySha256,
-          });
-          if (!task) throw new Error("Authenticated archive membership has no task record.");
           diskIds.add(taskId);
-          addRow(taskId, { group: rowGroup, task, archived: true, archiveIntegritySha256: archive.archiveIntegritySha256 });
         }
-
-        if (liveGroup) {
-          const memoryIds = new Set(liveTasksById.keys());
-          for (const [key, archive] of archiveMemberships) {
-            if (archive.executionId === diskGroup.executionId || key.startsWith(`${diskGroup.executionId}:`)) {
-              const taskId = key.slice(diskGroup.executionId.length + 1);
-              if (taskId.length === 0) throw new Error("Current archive handle is malformed.");
-              memoryIds.add(taskId);
-            }
+        const liveIds = new Set<string>();
+        for (const task of group.tasks) {
+          if (!/^task-[0-9a-zA-Z-]+$/.test(task.taskId) || liveIds.has(task.taskId)) {
+            throw new Error("Current in-memory task identity is malformed or duplicated.");
           }
-          for (const taskId of legacyMemberships.get(diskGroup.executionId) ?? []) memoryIds.add(taskId);
-          if (memoryIds.size !== diskIds.size || [...memoryIds].some((taskId) => !diskIds.has(taskId))) {
-            throw new Error("Current task/archive membership differs from the authenticated group.");
-          }
+          if (!diskIds.has(task.taskId)) throw new Error("Current task is absent from its authenticated group record.");
+          liveIds.add(task.taskId);
+        }
+        for (const [key, archive] of this.archivedTasks) {
+          if (archive.executionId !== executionId && !key.startsWith(`${executionId}:`)) continue;
+          const taskId = key.slice(executionId.length + 1);
+          if (taskId.length === 0) throw new Error("Current archive handle is malformed.");
+          liveIds.add(taskId);
+        }
+        for (const taskId of this.legacyArchiveHandles.get(executionId)?.entries.keys() ?? []) liveIds.add(taskId);
+        if (liveIds.size !== diskIds.size || [...diskIds].some((taskId) => !liveIds.has(taskId))) {
+          throw new Error("Current task/archive membership differs from the authenticated group.");
         }
       } catch {
-        complete = false;
-        break;
+        return;
       }
-    }
-    if (!complete || [...currentGroups.keys()].some((executionId) => !groupsSeen.has(executionId))) return;
-
-    if ([...rowsByTaskId.values()].some((rows) => rows.length !== 1)) return;
-    const associationRevisions = new Map<string, number>();
-    const bundleRefs: ReattachmentBundle[] = [];
-    const bundleKeys = new Set<string>();
-    for (const candidate of [...inventoryBundles, ...associations.bundles]) {
-      if (!candidate || typeof candidate.taskId !== "string" || typeof candidate.operationId !== "string"
-        || typeof candidate.waveId !== "string" || typeof candidate.waveRoot !== "string"
-        || !Number.isSafeInteger(candidate.expectedRevision) || candidate.expectedRevision < 0) return;
-      const key = JSON.stringify(candidate);
-      if (bundleKeys.has(key)) continue;
-      bundleKeys.add(key);
-      bundleRefs.push(candidate);
-    }
-    for (const bundle of bundleRefs) {
-      const rows = rowsByTaskId.get(bundle.taskId);
-      if (!rows || rows.length !== 1 || !rows[0]!.task) return;
-      const task = rows[0]!.task!;
-      if (!task.bundle || task.bundle.taskId !== bundle.taskId
-        || task.bundle.operationId !== bundle.operationId
-        || task.bundle.waveId !== bundle.waveId
-        || resolve(task.bundle.waveRoot) !== resolve(bundle.waveRoot)) return;
-      associationRevisions.set(bundle.taskId, Math.max(associationRevisions.get(bundle.taskId) ?? 0, bundle.expectedRevision));
-    }
-
-    const waveRootRefs = new Set<string>();
-    for (const candidate of [...inventoryWaveRoots, ...associations.waveRoots]) {
-      if (typeof candidate !== "string" || candidate.length === 0) return;
-      waveRootRefs.add(resolve(candidate));
-    }
-    for (const waveRoot of waveRootRefs) {
-      let matches = 0;
-      for (const rows of rowsByTaskId.values()) {
-        if (rows.length !== 1 || !rows[0]!.task) continue;
-        const task = rows[0]!.task!;
-        if ((task.waveRoot && resolve(task.waveRoot) === waveRoot)
-          || (task.bundle?.waveRoot && resolve(task.bundle.waveRoot) === waveRoot)) matches += 1;
-      }
-      if (matches !== 1) return;
-    }
-
-    const expectedIntentTokens = new Set<string>();
-    for (const [taskId, rows] of rowsByTaskId) {
-      if (rows.length !== 1) return;
-      const row = rows[0]!;
-      const task = row.task;
-      if (!task) return;
-      const group = row.group;
-      let operationStatus: CensusOperationEvidence["status"] | undefined;
-      const needsOperation = Boolean(task.bundle || task.waveRoot || task.inplaceResult?.operationRecord || (task.generation ?? 0) > 0);
-      if (needsOperation) {
-        try {
-          operationStatus = (await this.readCensusOperation(group, task, associationRevisions.get(taskId))).status;
-        } catch {
-          return;
-        }
-        if (operationStatus === "uncertain") return;
-      }
-      if (operationStatus === "live" && (isArchivableTaskState(task.state) || task.state === "queued" || !isActiveTaskState(task.state))) return;
-      if (isArchivableTaskState(task.state)) continue;
-      if (task.state === "queued") {
-        expectedIntentTokens.add(taskId);
-        continue;
-      }
-      if (isActiveTaskState(task.state)) {
-        if (!runtimeIds.has(taskId)) return;
-        expectedIntentTokens.add(taskId);
-        continue;
-      }
-      if (operationStatus === "live") return;
-    }
-    for (const taskId of runtimeIds) {
-      const rows = rowsByTaskId.get(taskId);
-      if (!rows || rows.length !== 1) return;
-      const task = rows[0]!.task;
-      if (!task || !currentGroups.has(rows[0]!.group.executionId) || !isActiveTaskState(task.state)) return;
     }
 
     if (!isCurrent()) return undefined;
-    // Publication is the caller's decision: the ordinary reconcile path applies
-    // the exact inventory to its registry channel, while the authoritative
-    // refresh path returns it read-only so the registry can replace tokens and
-    // clear uncertainty atomically behind its commit-time fences. A census that
-    // mutates the registry before returning would bump its own revision fence
-    // and get discarded — or worse, clear uncertainty under a diverged token set.
-    if (options.publish) {
-      for (const token of [...this.activityIntentTokens]) {
-        if (expectedIntentTokens.has(token)) continue;
-        this.ownedActivity.releaseIntent(token);
-        this.activityIntentTokens.delete(token);
-        if (!isCurrent()) return undefined;
-      }
-      for (const token of expectedIntentTokens) {
-        if (this.activityIntentTokens.has(token)) continue;
-        this.ownedActivity.acquireIntent(token);
-        this.activityIntentTokens.add(token);
-        if (!isCurrent()) return undefined;
-      }
-      if (!isCurrent()) return undefined;
-      this.activityIntentUncertain = false;
-      this.ownedActivity.resolveIntentUncertainty();
-    }
-    if (!isCurrent()) return undefined;
-    // The read-only refresh path must NOT rewrite the controller inventory:
-    // its isCurrent fence compares against the pre-census inventory identity,
-    // and a self-rewrite would silently retire the very evidence it vouches for.
-    if (!options.publish) return { tokens: expectedIntentTokens, isCurrent };
-    this.currentActivityInventory = {
-      authoritative: true,
-      ready: true,
-      invalid: false,
-      ...(inventorySessionOwner ? { sessionOwner: inventorySessionOwner } : {}),
-      sessionCwd: inventorySessionCwd,
-      roots: verifiedRoots,
-      bundles: [],
-      waveRoots: [],
-      revision: ++this.currentActivityInventoryRevision,
-    };
     return { tokens: expectedIntentTokens, isCurrent };
   }
 
   /**
-   * Authoritative activity refresher for the registry's coalesced intent-
-   * refresh pass: runs the current census READ-ONLY and reports its outcome.
-   * Complete carries this invocation's freshly verified exact token set — never
-   * a cached mirror, and never inferred from the pre-existing local boolean.
-   * Every skipped, failed, or stale census path (unreadable record, blocked
-   * save/admission tails, changed session generation, retired incarnation,
-   * inactive registry) is incomplete: the count stays unknown, never zero.
+   * Authoritative activity refresher for the registry's intent-refresh pass
+   * (automatic uncertainty-only passes and the forced fresh pass the reporter
+   * awaits on session_start/reconnect/reload alike): runs the current census
+   * READ-ONLY and reports its outcome. Complete carries this invocation's
+   * freshly verified exact token set — never a cached value, never inferred from
+   * previously published telemetry, so the same source recovers repeatedly from
+   * independently corrupted registry state. A genuine fresh
+   * failure (unreadable current group, security/identity mismatch, lost runtime
+   * owner, admission or durable write in flight, changed session generation,
+   * unprovable retained inventory for a retired incarnation, inactive registry)
+   * is incomplete, which truthfully invalidates the derived activity channel
+   * rather than passing a cached value off as freshly confirmed.
    */
   private async refreshCurrentActivityIntent(): Promise<OwnedActivityIntentRefresh> {
+    if (this.ownedActivity.retired) {
+      // A retired incarnation cannot speak for live runtime state; its exact
+      // owner proof is the retained census, which reads only validated
+      // manifests/operation evidence for the roots this controller sealed. That
+      // is the supported exact-owner path for retained positive activity: it
+      // lets a forced fresh pass establish the real zero (all retained work
+      // proven settled) or a real positive (still queued), and report
+      // incomplete — never a cached value — when the retained inventory cannot
+      // be established. Ownership tokens and records are untouched. The query
+      // asks for the INDEPENDENT intent view only, so a historical ownership
+      // roster that was never authoritative (or historical IO that is slow or
+      // unavailable) cannot delay or poison the actual current activity answer.
+      //
+      // The registry may hold this completed proof pending while another source
+      // is still being read. A late post-detach admission can therefore bump the
+      // controller generation AFTER this census finished but BEFORE the registry
+      // applies it, without any registry revision change (its token is not
+      // acquired yet). The exact-owner proof is only valid at COMMIT time, so it
+      // carries the same seal predicate the current-source branch returns; the
+      // registry re-evaluates it immediately before application and discards a
+      // stale zero instead of publishing it.
+      const inventory = this.retiredCensus;
+      const generation = this.censusRevision;
+      const inventoryRevision = inventory?.revision;
+      const isCurrent = (): boolean => inventory !== undefined
+        && this.retiredCensus === inventory
+        && this.censusRevision === generation
+        && inventory.revision === inventoryRevision
+        && this.detaching === 0
+        && inventory.detachComplete
+        && inventory.detachedRevision === generation;
+      let reconciled: RetiredOwnedActivityReconciliation;
+      try {
+        reconciled = await this.reconcileRetiredActivity({ ownership: [], intent: [] }, "intent");
+      } catch {
+        return { status: "incomplete" };
+      }
+      if (reconciled === RETIRED_ACTIVITY_CENSUS_DISCARDED) return { status: "incomplete" };
+      const intent = reconciled.intent;
+      if (intent?.complete !== true) return { status: "incomplete" };
+      const tokens = new Set<string>();
+      for (const token of intent.tokens) tokens.add(token);
+      return { status: "complete", intentTokens: tokens, isCurrent };
+    }
     let census: { tokens: Set<string>; isCurrent: () => boolean } | undefined;
     try {
-      census = await this.runCurrentActivityCensus({ publish: false });
+      census = await this.runCurrentActivityCensus();
     } catch {
       return { status: "incomplete" };
     }
@@ -1743,45 +1766,26 @@ export class BackgroundExecutionController {
     return { status: "complete", intentTokens: census.tokens, isCurrent: census.isCurrent };
   }
 
+  /**
+   * Mark this incarnation's activity channel unproven. The registry owns the
+   * ONLY completeness flag for the derived intent set; there is no local
+   * boolean to keep synchronized with it.
+   */
   private markCurrentIntentUncertain(): void {
-    this.activityIntentUncertain = true;
     this.ownedActivity.markIntentUncertain();
   }
 
-  private retireCurrentActivityRoot(group: BackgroundExecutionGroup): void {
-    const inventory = this.currentActivityInventory;
-    if (!inventory) return;
-    const root = resolve(group.root);
-    inventory.roots = inventory.roots.filter((candidate) =>
-      candidate.invalid === true || candidate.root.length === 0 || resolve(candidate.root) !== root);
-    inventory.revision = ++this.currentActivityInventoryRevision;
-    this.censusRevision += 1;
-  }
-
-  private scheduleCurrentActivityCensus(): void {
-    // A genuine lifecycle/readiness observation also retries diverged registry
-    // telemetry, even when this controller's local uncertainty is false: a
-    // blocked save that made an automatic refresh incomplete settles here, and
-    // the loaded counts must recover without polling or a manual refresh.
+  /**
+   * Signal a genuine lifecycle/readiness observation to the registry's own
+   * coalesced scheduler. This invalidates any in-flight derived read for this
+   * incarnation (revision fence) and lets the registry retry the one canonical
+   * uncertainty-only refresh pass when activity is still unproven — a blocked
+   * save that made an automatic refresh incomplete settles here, and the loaded
+   * counts recover without polling or a manual refresh. The controller keeps no
+   * census engine, dirty flag, or in-flight queue of its own.
+   */
+  private signalActivityReadiness(): void {
     this.ownedActivity.requestIntentRefresh();
-    if (this.currentActivityCensusInFlight) {
-      this.currentActivityCensusDirty = true;
-      return;
-    }
-    const inventory = this.currentActivityInventory;
-    if (!inventory?.authoritative || !inventory.ready || !this.activityIntentUncertain
-      || this.ownedActivity.retired || !isOwnedActivityActive() || this.detaching > 0 || this.shuttingDown
-      || this.startAdmissions > 0 || this.recoveryAdmissions > 0 || this.continuationAdmissions.size > 0
-      || this.pendingForceMerges.size > 0 || this.saveTails.size > 0) return;
-    const inFlight = this.reconcileCurrentActivityIntent();
-    this.currentActivityCensusInFlight = inFlight;
-    void inFlight.catch(() => undefined).finally(() => {
-      if (this.currentActivityCensusInFlight !== inFlight) return;
-      this.currentActivityCensusInFlight = undefined;
-      const dirty = this.currentActivityCensusDirty;
-      this.currentActivityCensusDirty = false;
-      if (dirty) this.scheduleCurrentActivityCensus();
-    });
   }
 
   async restore(
@@ -1789,79 +1793,40 @@ export class BackgroundExecutionController {
     options: BackgroundControllerRestoreOptions = {},
     notify: ((message: string) => void | Promise<void>) | undefined = this.input.notify,
   ): Promise<void> {
+    // A restore is the only event that attaches old work, so it is a genuine
+    // lifecycle fact the activity census honours directly: while one is in
+    // flight the current-runtime set is not yet settled. This is a counter, not
+    // a cached readiness/telemetry flag, so no stale value can keep activity
+    // unknown afterwards.
+    this.activityRestores += 1;
     this.censusRevision += 1;
-    const capturedActivityInventory = this.currentActivityInventory
-      ?? (this.groups.size > 0
-        ? this.createCurrentActivityInventory({ groupRoots: [], bundles: [], waveRoots: [] }, false)
-        : undefined);
-    const previousActivityInventory = capturedActivityInventory
-      ? {
-        ...capturedActivityInventory,
-        roots: [
-          ...capturedActivityInventory.roots,
-          ...[...this.groups.values()].map((group): CurrentActivityRoot => {
-            const root = resolve(group.root);
-            const retained = capturedActivityInventory.roots.find((candidate) =>
-              candidate.root.length > 0 && resolve(candidate.root) === root);
-            const sessionOwner = retained?.sessionOwner ?? capturedActivityInventory.sessionOwner;
-            return {
-              root,
-              executionId: group.executionId,
-              ...(sessionOwner ? { sessionOwner } : {}),
-              sessionCwd: resolve(this.sessionCwdOf(group)),
-            };
-          }),
-        ],
-      }
-      : undefined;
-    // A previously attached group listed by this restore is reauthenticated in
-    // the restore loop; only roots omitted from that roster must keep activity
-    // unknown pending a separate census. Cleanup recovery remains independent.
-    const restoreRootPaths = new Set((Array.isArray(associations.groupRoots) ? associations.groupRoots : [])
-      .filter((root): root is string => typeof root === "string" && root.length > 0)
-      .map((root) => resolve(root)));
-    const retainedPriorActivityEvidence = Boolean(previousActivityInventory
-      && (previousActivityInventory.roots.some((root) => root.invalid || root.root.length === 0
-        || !restoreRootPaths.has(resolve(root.root)))
-        || previousActivityInventory.bundles.length > 0 || previousActivityInventory.waveRoots.length > 0));
-    const activityInventory = this.createCurrentActivityInventory(associations, options.authoritative !== false, options.sessionOwner);
-    if (previousActivityInventory) {
-      // The controller source can outlive an individual host session. Retain
-      // every root/bundle reference already owned by this same source so a new
-      // session's empty or partial roster cannot silently release old tokens.
-      activityInventory.authoritative &&= previousActivityInventory.authoritative;
-      activityInventory.invalid ||= previousActivityInventory.invalid;
-      const mergedRoots = new Map<string, CurrentActivityRoot>();
-      for (const candidate of [...previousActivityInventory.roots, ...activityInventory.roots]) {
-        const path = candidate.root.length > 0 ? resolve(candidate.root) : "";
-        const prior = mergedRoots.get(path);
-        if (!prior) {
-          mergedRoots.set(path, { ...candidate, root: path });
-          continue;
-        }
-        if (prior.invalid || candidate.invalid || prior.sessionCwd !== candidate.sessionCwd
-          || (prior.sessionOwner !== undefined && candidate.sessionOwner !== undefined
-            && prior.sessionOwner !== candidate.sessionOwner)
-          || (prior.executionId !== undefined && candidate.executionId !== undefined
-            && prior.executionId !== candidate.executionId)) {
-          prior.invalid = true;
-          activityInventory.invalid = true;
-        }
-        if (prior.executionId === undefined && candidate.executionId !== undefined) prior.executionId = candidate.executionId;
-        if (prior.sessionOwner === undefined && candidate.sessionOwner !== undefined) prior.sessionOwner = candidate.sessionOwner;
-      }
-      activityInventory.roots = [...mergedRoots.values()];
-      const bundleKeys = new Set(activityInventory.bundles.map((bundle) => JSON.stringify(bundle)));
-      for (const bundle of previousActivityInventory.bundles) {
-        const key = JSON.stringify(bundle);
-        if (!bundleKeys.has(key)) {
-          bundleKeys.add(key);
-          activityInventory.bundles.push({ ...bundle });
-        }
-      }
-      activityInventory.waveRoots = [...new Set([...previousActivityInventory.waveRoots, ...activityInventory.waveRoots])];
+    try {
+      await this.restoreAdmitted(associations, options, notify);
+    } finally {
+      this.activityRestores -= 1;
+      // The restore itself invalidated completeness before its first await and
+      // can only be re-established now that no restore is in flight: signal the
+      // registry's scheduler so a still-unproven activity set is freshly
+      // re-established from the canonical runtime state.
+      // The census revision is deliberately NOT bumped here: a completed detach
+      // seals the retained exact-owner revision that the retired census reads.
+      this.signalActivityReadiness();
     }
-    this.currentActivityInventory = activityInventory;
+  }
+
+  private async restoreAdmitted(
+    associations: ExecutionAssociationsSnapshot,
+    options: BackgroundControllerRestoreOptions,
+    notify: ((message: string) => void | Promise<void>) | undefined,
+  ): Promise<void> {
+    this.censusRevision += 1;
+    // The restoration boundary is the ONLY activity authority: the association
+    // snapshot this call was handed is retained for cleanup-ownership recovery
+    // below, but it never decides current-runtime activity. Restoring a saved
+    // conversation into a new runtime attaches no old work, so a restore that
+    // resumes nothing is a known zero no matter what the prior runtime's
+    // idle/busy/unknown/unreadable history was. Real work this restore admits or
+    // resumes (an attached group's queued/active task) counts normally.
     this.retainRetiredCensus(associations, options.authoritative !== false, true, true);
     // Every restore invalidates prior completeness before its first await: the
     // owned set may be changing (or unresolved) until this restore authoritatively
@@ -1884,12 +1849,24 @@ export class BackgroundExecutionController {
     }
     this.censusRevision += 1;
     const roots = associations.groupRoots ?? [];
-    let restoreAccounted = true;
+    // A roster that is entirely ABSENT is not an authoritative empty owned set:
+    // such a snapshot cannot prove this session owned no execution groups, so
+    // cleanup ownership stays fail-closed. This is the ownership channel only —
+    // current-runtime activity is derived from work this runtime actually
+    // admitted or resumed, so the same snapshot remains a truthful idle zero
+    // there (see runCurrentActivityCensus).
+    const associationRosterAbsent = !Array.isArray(associations.groupRoots)
+      || !Array.isArray(associations.bundles)
+      || !Array.isArray(associations.waveRoots);
+    let restoreAccounted = !associationRosterAbsent;
     // Activity completeness is tracked SEPARATELY from ownership recovery: a
     // task record that was read has an observed state (so its activity is
     // known), even when its retained cleanup association could not be
-    // recovered and ownership must stay unknown.
-    let restoreActivityAccounted = activityInventory.authoritative && !activityInventory.invalid;
+    // recovered and ownership must stay unknown. Current-runtime work starts
+    // complete: nothing was admitted or resumed yet, so a restore that attaches
+    // no live group is a known zero. Only a still-live in-memory group whose
+    // durable record this restore could not reauthenticate keeps it unknown.
+    let restoreActivityAccounted = true;
     let durabilityNoticeFailed = false;
     let durabilityNoticeError: unknown;
     for (const root of roots) {
@@ -2045,7 +2022,19 @@ export class BackgroundExecutionController {
         }
       } catch (error) {
         restoreAccounted = false;
-        restoreActivityAccounted = false;
+        // A claimed root that could not be read attached no group, so it is not
+        // current-runtime work and cannot make the activity channel unknown: it
+        // remains a cleanup-ownership obligation only. A group still live in
+        // memory at that exact root, however, can no longer have its durable
+        // record vouched for, so activity stays unverified (never a fabricated
+        // zero) until a later readiness observation reauthenticates it.
+        if ([...this.groups.values()].some((group) => {
+          try {
+            return resolve(group.root) === resolve(root);
+          } catch {
+            return true;
+          }
+        })) restoreActivityAccounted = false;
         if (!restoreIsCurrent()) return;
         await notify?.(`review gate: background execution was not restored (${root}): ${messageOf(error)}`);
       }
@@ -2071,8 +2060,10 @@ export class BackgroundExecutionController {
         await this.resolveOrAdoptTask(undefined, undefined, bundle);
         restoredOperations.add(bundle.operationId);
       } catch (error) {
+        // An unadopted legacy bundle is a retained cleanup-ownership reference,
+        // not current-runtime activity: it attached no live task, so the
+        // activity channel stays exactly as its own live state determines.
         restoreAccounted = false;
-        restoreActivityAccounted = false;
         if (!restoreIsCurrent()) return;
         await notify?.(`review gate: legacy execution bundle was not adopted (${bundle.operationId}): ${messageOf(error)}`);
       }
@@ -2104,22 +2095,18 @@ export class BackgroundExecutionController {
     }
     if (restoreAccounted && options.authoritative !== false && !this.ownedActivity.retired) this.ownedActivity.resolveUncertainty();
     else this.ownedActivity.markUncertain();
-    if (restoreActivityAccounted && !retainedPriorActivityEvidence
-      && options.authoritative !== false && !this.ownedActivity.retired && isOwnedActivityActive()) {
+    // Activity is re-established from the current runtime's own state alone. No
+    // retained historical reference, prior runtime result, or non-authoritative
+    // association fallback may keep it unknown: a restoration that admitted or
+    // resumed nothing is a known zero, and real new work counts normally.
+    if (restoreActivityAccounted && !this.ownedActivity.retired && isOwnedActivityActive()) {
+      // The restore already reconciled this incarnation's exact intent tokens
+      // from the authenticated live state (every attached group is saved), so
+      // completeness is a genuine lifecycle fact here. Nothing is fabricated:
+      // the registry's derived set is the only activity representation.
       this.ownedActivity.resolveIntentUncertainty();
-      this.activityIntentUncertain = false;
     } else this.markCurrentIntentUncertain();
-    if (this.currentActivityInventory === activityInventory && restoreIsCurrent()) {
-      const liveAssociations = this.associations();
-      activityInventory.bundles = activityInventory.bundles.filter((bundle) => !liveAssociations.bundles.some((live) =>
-        live.taskId === bundle.taskId && live.operationId === bundle.operationId
-        && live.waveId === bundle.waveId && live.waveRoot === bundle.waveRoot));
-      const liveWaveRoots = new Set(liveAssociations.waveRoots);
-      activityInventory.waveRoots = activityInventory.waveRoots.filter((root) => !liveWaveRoots.has(root));
-      activityInventory.revision = ++this.currentActivityInventoryRevision;
-      activityInventory.ready = true;
-    }
-    this.scheduleCurrentActivityCensus();
+    this.signalActivityReadiness();
     void this.pump();
     if (durabilityNoticeFailed) throw durabilityNoticeError;
   }
@@ -2137,7 +2124,7 @@ export class BackgroundExecutionController {
     } finally {
       this.startAdmissions -= 1;
       this.censusRevision += 1;
-      this.scheduleCurrentActivityCensus();
+      this.signalActivityReadiness();
     }
   }
 
@@ -2769,7 +2756,7 @@ export class BackgroundExecutionController {
       this.censusRevision += 1;
       const task = observedTarget ?? this.taskById(taskId);
       if (task) this.syncActiveIntent(task);
-      this.scheduleCurrentActivityCensus();
+      this.signalActivityReadiness();
     }
   }
 
@@ -3124,7 +3111,7 @@ export class BackgroundExecutionController {
     } finally {
       this.recoveryAdmissions -= 1;
       this.censusRevision += 1;
-      this.scheduleCurrentActivityCensus();
+      this.signalActivityReadiness();
     }
   }
 
@@ -3493,7 +3480,7 @@ export class BackgroundExecutionController {
       this.censusRevision += 1;
       // The owned force-merge operation settled: reconcile this task's token.
       this.syncOwnedTask(task);
-      this.scheduleCurrentActivityCensus();
+      this.signalActivityReadiness();
       signalDone();
     }
   }
@@ -4051,8 +4038,16 @@ export class BackgroundExecutionController {
         // group bookkeeping is dropped so retirement cannot leave a stale
         // positive outstanding.
         this.reconcileOwnedActivity(group);
+        // The verified cleanup above is the one event that settles this
+        // execution's retained ownership evidence: retire its retained root so a
+        // later census can never treat already-cleaned work as lost again. Only
+        // this exact group's root is removed; every other retained reference and
+        // durable record is untouched.
+        if (this.retiredCensus?.roots.delete(resolve(group.root))) {
+          this.retiredCensus.revision += 1;
+          this.censusRevision += 1;
+        }
         this.groups.delete(executionId);
-        this.retireCurrentActivityRoot(group);
         this.dropActiveTasks(executionId);
         // Issue #222: the launch-notice gate retires with the group; every
         // notification that could be held behind it has already delivered.
@@ -4071,15 +4066,11 @@ export class BackgroundExecutionController {
       }
     }
     await this.publishAssociations();
-    this.scheduleCurrentActivityCensus();
+    this.signalActivityReadiness();
   }
 
   async detach(): Promise<void> {
     this.censusRevision += 1;
-    if (this.currentActivityInventory) {
-      this.currentActivityInventory.ready = false;
-      this.currentActivityInventory.revision += 1;
-    }
     this.retainRetiredCensus(this.associations(), false, true);
     if (!this.retiredCensus?.ownershipComplete) this.ownedActivity.markUncertain();
     if (!this.retiredCensus?.intentComplete) this.markCurrentIntentUncertain();
@@ -4319,7 +4310,7 @@ export class BackgroundExecutionController {
         this.syncOwnedTask(task);
         this.active = Math.max(0, this.active - 1);
         this.updateIndicator();
-        this.scheduleCurrentActivityCensus();
+        this.signalActivityReadiness();
         void this.pump();
       });
     this.runtimes.set(task.taskId, { abort, promise, controlStatus: "pending" });
@@ -4714,14 +4705,17 @@ export class BackgroundExecutionController {
     return taskHasActiveIntent(task, this.pendingForceMerges.has(task.taskId));
   }
 
-  /** Acquire/release one task's activity-intent token to match its admitted/running state. */
+  /**
+   * Acquire/release one task's activity-intent token to match its
+   * admitted/running state. The registry's incarnation-scoped derived set is the
+   * single canonical telemetry representation: this lifecycle event updates it
+   * directly and the controller keeps no mirror to stay synchronized with.
+   */
   private syncActiveIntent(task: BackgroundTaskRecord): void {
     this.censusRevision += 1;
     if (this.taskHasActiveIntent(task)) {
-      this.activityIntentTokens.add(task.taskId);
       this.ownedActivity.acquireIntent(task.taskId);
     } else {
-      this.activityIntentTokens.delete(task.taskId);
       this.ownedActivity.releaseIntent(task.taskId);
     }
   }
@@ -4940,7 +4934,7 @@ export class BackgroundExecutionController {
     // registered tail, preserving write ordering.
     void tail.then(() => {
       if (this.saveTails.get(group.executionId) === tail) this.saveTails.delete(group.executionId);
-      this.scheduleCurrentActivityCensus();
+      this.signalActivityReadiness();
     });
     await next;
     return {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import net from "node:net";
+import { tmpdir } from "node:os";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync as readBytesSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import test from "node:test";
@@ -46,9 +47,21 @@ import type {
   StatusRenameResult,
   StatusShutdownResult,
 } from "../src/session-host/broker";
-import activateReporter, { SESSION_HOST_STICKY_STATE_KEY } from "../src/session-host/reporter";
+import activateReporter, {
+  beginSessionHostRestore,
+  completeSessionHostRestore,
+  SESSION_HOST_STICKY_STATE_KEY,
+} from "../src/session-host/reporter";
+import { __test as brokerTest, createStatusBroker } from "../src/session-host/broker";
+import { SidebarController } from "../src/session-host/sidebar";
 import { __test as mainTest } from "../src/session-host/main";
-import { HOST_BOOTSTRAP_ENV, decodeFrame, type SessionHostStatus } from "../src/session-host/protocol";
+import {
+  ACTIVITY_CENSUS_CAPABILITY,
+  HOST_BOOTSTRAP_ENV,
+  decodeFrame,
+  encodeFrame,
+  type SessionHostStatus,
+} from "../src/session-host/protocol";
 import {
   registerOwnedActivitySource,
   __test as ownedActivityTest,
@@ -2994,6 +3007,7 @@ test("reporter protocol current file reaches the production manager and Main del
 
     await trigger("session_start", { type: "session_start" }, context());
     sockets.at(-1)?.emit("connect");
+    await new Promise((resolve) => setImmediate(resolve));
     assert.equal(manager.list()[0]?.nativeSession?.sessionId, currentId);
     assert.equal(manager.list()[0]?.nativeSession?.currentFile, undefined,
       "the manager's display view strips authenticated path data");
@@ -3009,6 +3023,7 @@ test("reporter protocol current file reaches the production manager and Main del
     currentFile = join(harness.root, "planned-new-unsaved.jsonl");
     await trigger("session_start", { type: "session_start", reason: "synthetic-resume" }, context());
     sockets.at(-1)?.emit("connect");
+    await new Promise((resolve) => setImmediate(resolve));
     const reboundSnapshot = mainTest.savedDeletionOwnedSessions(manager);
     assert.deepEqual(reboundSnapshot, [{ kind: "current", id: currentId, file: currentFile }],
       "the production reporter/protocol/manager path replaces the current loaded file on /new or /resume");
@@ -3151,6 +3166,7 @@ test("loaded activity telemetry recovers through the production reporter/protoco
     // stay unknown — never a fabricated zero.
     await trigger("session_start", { type: "session_start" }, context());
     sockets.at(-1)?.emit("connect");
+    await new Promise((resolve) => setImmediate(resolve));
     assert.equal(viewActivity(), null, "incomplete startup evidence stays unknown on the loaded host");
 
     // The execution source's readiness completes at a later genuine lifecycle
@@ -3158,6 +3174,7 @@ test("loaded activity telemetry recovers through the production reporter/protoco
     executionReady = true;
     await trigger("session_start", { type: "session_start", reason: "synthetic-readiness" }, context());
     sockets.at(-1)?.emit("connect");
+    await new Promise((resolve) => setImmediate(resolve));
     await waitForActivity(1, "the held review run to publish as known nonzero");
 
     // Deliberately stale loaded telemetry while the run is still held.
@@ -3190,6 +3207,253 @@ test("loaded activity telemetry recovers through the production reporter/protoco
       if (descriptor === undefined) delete globalScope[key];
       else Object.defineProperty(globalThis, key, descriptor);
     }
+    cleanup(harness);
+  }
+});
+
+test("real reporter/protocol/broker/manager rendered row recovers fresh zero and nonzero activity on request", { skip: process.platform === "win32" }, async () => {
+  const harness = makeHarness("reporter-broker-request");
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  let tokens = new Set<string>();
+  const execution = registerOwnedActivitySource("backgroundTasks", "execution", {
+    intentUncertain: true,
+    refreshActivity: () => ({ status: "complete", intentTokens: new Set(tokens) }),
+  } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+  registerReviewActivitySource();
+  registerOwnedActivitySource("backgroundShells", "background-shell", {
+    intentUncertain: true,
+    refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+  } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+
+  const socketRoot = realpathSync(mkdtempSync(join(tmpdir(), "prg-ar-")));
+  const broker = await createStatusBroker({ socketRoot });
+  const manager = new InstanceManager({
+    packageRoot: harness.packageRoot,
+    piExecutable: harness.piExecutable,
+    statusRegistrar: mainTest.statusRegistrar(broker),
+    nativeSetup: false,
+    profileRegistry: harness.profileRegistry,
+    env: cleanTestEnv(),
+    ptyFactory: harness.ptyFactory,
+  });
+  const envNames = [HOST_BOOTSTRAP_ENV, SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV, "PI_REVIEW_GATE_RUNTIME_ROLE"] as const;
+  const oldEnv = new Map(envNames.map((key) => [key, process.env[key]] as const));
+  const globalScope = globalThis as Record<PropertyKey, unknown>;
+  const privateGlobalKeys = [SESSION_HOST_STICKY_STATE_KEY, Symbol.for("pi-review-gate.session-host.restore-coordination.v1"), Symbol.for("pi-review-gate.session-host.startup-request.v1"), Symbol.for("pi-review-gate.session-host.title-columns.v1")] as const;
+  const oldGlobal = new Map(privateGlobalKeys.map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const));
+  for (const key of privateGlobalKeys) delete globalScope[key];
+  const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+  const pi = { on(name: string, callback: (...args: unknown[]) => unknown) { hooks.set(name, [...(hooks.get(name) ?? []), callback]); } };
+  const trigger = async (name: string, ...args: unknown[]): Promise<void> => { for (const callback of hooks.get(name) ?? []) await callback(...args); };
+  const sessionId = "restored-e2e-session";
+  const context = { mode: "tui", ui: { setWidget() {} }, isIdle: () => true, sessionManager: { getSessionId: () => sessionId, getSessionName: () => "Restored E2E", getEntries: () => [] } };
+  let instanceId: string | undefined;
+  let reporterStarted = false;
+  try {
+    for (const key of envNames) delete process.env[key];
+    instanceId = await manager.create({ workspace: harness.workspace });
+    const bootstrap = JSON.parse(String(harness.spawned[0]!.spawnDescriptor.env[SESSION_HOST_BOOTSTRAP_ENV])) as Record<string, unknown>;
+    process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(bootstrap);
+    await activateReporter(pi, { reconnectDelayMs: 40, maxReconnectAttempts: 2 });
+    reporterStarted = true;
+    // The gate's own restore hook runs after the reporter's hook. Its marker
+    // is what makes the first loaded status wait for the restored boundary.
+    pi.on("session_start", async () => {
+      const completion = beginSessionHostRestore(sessionId);
+      completeSessionHostRestore(completion);
+    });
+    await trigger("session_start", { type: "session_start", reason: "startup" }, context);
+    const waitForView = async (predicate: (view: NativeInstanceView) => boolean, what: string): Promise<NativeInstanceView> => {
+      const deadline = Date.now() + 4_000;
+      for (;;) {
+        const view = manager.list().find((row) => row.id === instanceId);
+        if (view && predicate(view)) return view;
+        if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}; view is ${JSON.stringify(view)}`);
+        await sleep(5);
+      }
+    };
+    const renderRow = (view: NativeInstanceView): string => {
+      const sidebar = new SidebarController({ onAction: () => undefined });
+      sidebar.updateItems([mainTest.toSidebarItem(view)]);
+      return sidebar.renderRoster(32, 20).lines.join("\n");
+    };
+
+    const first = await waitForView(
+      (view) => view.busy === false && view.activeTasks === 0 && view.activeShells === 0,
+      "first restored Ready to show actual idle/zero",
+    );
+    assert.equal(first.hasLiveProcess, true, "the restored row remains owned by a live child");
+    assert.match(renderRow(first), /bg tasks 0 \| shells 0/u,
+      "the complete rendered row shows actual restored idle/zero at first Ready");
+
+    // Durable ownership is independent of the ephemeral activity request.
+    // The synthetic execution source resolves its replayed ownership
+    // uncertainty exactly as the real controller's restore does.
+    execution.resolveUncertainty();
+    execution.acquire("e2e-durable-ownership");
+    await waitForView((view) => view.backgroundTasks === 1, "durable ownership to publish");
+
+    // Deliberately stale host/client understanding: the owning source actually
+    // holds one intent token, while the last displayed value was zero. The host
+    // asks the exact live client for a complete fresh census.
+    tokens = new Set(["e2e-fresh-intent"]);
+    ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution");
+    assert.equal(await manager.refreshActivity(instanceId), "complete");
+    const nonzero = await waitForView((view) => view.activeTasks === 1, "fresh nonzero intent");
+    assert.equal(nonzero.backgroundTasks, 1, "durable ownership is preserved across the activity request");
+    assert.match(renderRow(nonzero), /bg tasks 1 \| shells 0/u);
+
+    // The opposite direction is just as fresh: actual zero replaces a cached
+    // nonzero value without a prompt, task, restart, or manual refresh.
+    tokens = new Set();
+    ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution");
+    assert.equal(await manager.refreshActivity(instanceId), "complete");
+    const zero = await waitForView((view) => view.activeTasks === 0, "fresh idle zero intent");
+    assert.equal(zero.backgroundTasks, 1);
+    assert.match(renderRow(zero), /bg tasks 0 \| shells 0/u);
+
+    // A repeated unknown episode recovers again.
+    tokens = new Set(["e2e-second-intent"]);
+    ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution");
+    assert.equal(await manager.refreshActivity(instanceId), "complete");
+    await waitForView((view) => view.activeTasks === 1, "repeated fresh nonzero intent");
+  } finally {
+    if (reporterStarted) await trigger("session_shutdown", { type: "session_shutdown" }, context).catch(() => undefined);
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    if (instanceId !== undefined) {
+      harness.spawned.at(-1)?.emitExit(0);
+      manager.closeExited(instanceId);
+    }
+    await manager.dispose().catch(() => undefined);
+    await broker.dispose().catch(() => undefined);
+    for (const [key, value] of oldEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    for (const [key, descriptor] of oldGlobal) {
+      if (descriptor === undefined) delete globalScope[key];
+      else Object.defineProperty(globalThis, key, descriptor);
+    }
+    cleanup(harness);
+  }
+});
+
+test("a dropped first automatic activity reply retries within the bounded episode budget", { skip: process.platform === "win32" }, async () => {
+  const harness = makeHarness("activity-drop-retry");
+  const socketRoot = realpathSync(mkdtempSync(join(tmpdir(), "prg-ar-retry-")));
+  const broker = await createStatusBroker({ socketRoot });
+  brokerTest.setActivityTimeoutForTests(60);
+  const manager = new InstanceManager({
+    packageRoot: harness.packageRoot,
+    piExecutable: harness.piExecutable,
+    statusRegistrar: mainTest.statusRegistrar(broker),
+    nativeSetup: false,
+    profileRegistry: harness.profileRegistry,
+    env: cleanTestEnv(),
+    ptyFactory: harness.ptyFactory,
+  });
+  let instanceId: string | undefined;
+  let client: net.Socket | undefined;
+  try {
+    instanceId = await manager.create({ workspace: harness.workspace });
+    const bootstrap = JSON.parse(String(harness.spawned[0]!.spawnDescriptor.env[SESSION_HOST_BOOTSTRAP_ENV])) as {
+      instanceId: string;
+      generation: string;
+      token: string;
+    };
+    const nativeSession = { sessionId: "retry-native-session", epoch: 1, name: "Retry" };
+    const requests: Array<{ requestId: string; afterSequence: number }> = [];
+    client = net.connect(broker.socketPath);
+    await new Promise<void>((resolve, reject) => {
+      client!.once("connect", resolve);
+      client!.once("error", reject);
+    });
+    let buffered = "";
+    client.on("data", (chunk: Buffer) => {
+      buffered += chunk.toString("utf8");
+      let newline: number;
+      while ((newline = buffered.indexOf("\n")) >= 0) {
+        const line = buffered.slice(0, newline + 1);
+        buffered = buffered.slice(newline + 1);
+        const message = decodeFrame(line);
+        if (message?.type !== "activity_request") continue;
+        requests.push({ requestId: message.requestId, afterSequence: message.afterSequence });
+        if (requests.length === 1) continue; // Drop the first reply with no status push.
+        client!.write(encodeFrame({
+          version: 1,
+          type: "activity_result",
+          instanceId: bootstrap.instanceId,
+          generation: bootstrap.generation,
+          requestId: message.requestId,
+          outcome: "complete",
+          status: {
+            version: 1,
+            type: "status",
+            instanceId: bootstrap.instanceId,
+            generation: bootstrap.generation,
+            sequence: 2,
+            busy: false,
+            pendingInput: false,
+            inputSurface: false,
+            activity: ["Ready"],
+            backgroundTasks: 0,
+            backgroundShells: 0,
+            activeTasks: 3,
+            activeShells: 0,
+            nativeSession,
+          },
+          observedSessionId: nativeSession.sessionId,
+          observedSessionEpoch: nativeSession.epoch,
+        } as never));
+      }
+    });
+    client.write(encodeFrame({
+      version: 1,
+      type: "hello",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      token: bootstrap.token,
+      capabilities: [ACTIVITY_CENSUS_CAPABILITY],
+    } as never));
+    client.write(encodeFrame({
+      version: 1,
+      type: "status",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      sequence: 1,
+      busy: null,
+      pendingInput: null,
+      inputSurface: false,
+      activity: [],
+      backgroundTasks: null,
+      backgroundShells: null,
+      activeTasks: null,
+      activeShells: null,
+      nativeSession,
+    } as never));
+
+    await until(
+      () => manager.list().find((view) => view.id === instanceId)?.activeTasks === 3,
+      "automatic retry to recover the dropped reply without another lifecycle event",
+      5000,
+    );
+    assert.ok(requests.length >= 2, "the manager retried a timed-out automatic census");
+    assert.equal(requests[0]!.afterSequence, 1);
+    assert.equal(requests[1]!.afterSequence, 1, "the retry is fenced to the last accepted sequence");
+    const view = manager.list().find((candidate) => candidate.id === instanceId);
+    assert.equal(view?.busy, false);
+    assert.equal(view?.activeShells, 0);
+  } finally {
+    brokerTest.setActivityTimeoutForTests(undefined);
+    client?.destroy();
+    if (instanceId !== undefined) {
+      harness.spawned.at(-1)?.emitExit(0);
+      manager.closeExited(instanceId);
+    }
+    await manager.dispose().catch(() => undefined);
+    await broker.dispose().catch(() => undefined);
     cleanup(harness);
   }
 });

@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { join } from "node:path";
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 
 const requireCjs = createRequire(join(process.cwd(), "tests", "managed-generations.test.ts"));
 // The CJS producer surface deliberately has no environment/CLI test bypasses.
@@ -744,6 +745,609 @@ test("full launcher startup succeeds with five and more legacy build/Pi generati
   }
 });
 
+test("the launcher holds the per-agent coordination entry from selection to host ownership", posix, async () => {
+  const f = fixture();
+  seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
+  const coordination = join(f.agentDir, "session-host", generations.COORDINATION as string);
+  const ownership = join(f.agentDir, "session-host", "host-ownership.json");
+  let entryDuringLoad: string | undefined;
+  let entryAfterHost = "unset";
+  const diagnostics: string[] = [];
+  const status = await producer.runSessionHostLauncher([], {
+    getEnv: () => f.env,
+    processEnv: {},
+    packageRoot: f.packageRoot,
+    platform: "linux",
+    cwd: f.root,
+    nodeVersion: process.versions.node,
+    stdinIsTTY: true,
+    stdoutIsTTY: true,
+    build: (options: Record<string, unknown>) => build(f, options),
+    resolvePiRuntime: async () => provision(f, "1.3.0"),
+    ensureDdgs: () => ({ ok: true, python: join(f.root, "python") }),
+    refreshShippedSkills: () => ({ ok: true }),
+    writeOut: () => undefined,
+    writeError: (text: string) => diagnostics.push(text),
+    loadMain: () => {
+      // The hold already protects the prepared selection here, before the host
+      // claims ownership.
+      entryDuringLoad = existsSync(coordination)
+        ? readFileSync(coordination, "utf8").split("\n")[0]!.trim()
+        : undefined;
+      return {
+        runSessionHost: async () => {
+          // The host claims ownership inside that hold and hands the entry back.
+          writeFileSync(ownership, JSON.stringify({ version: 1, hostId: "launcher-handoff" }));
+          rmSync(coordination, { force: true });
+          entryAfterHost = existsSync(coordination) ? "present" : "handed-back";
+          rmSync(ownership, { force: true });
+          return 0;
+        },
+      };
+    },
+  });
+  assert.equal(status, 0, diagnostics.join(""));
+  assert.equal(entryDuringLoad, String(process.pid),
+    "the launcher holds the canonical per-agent coordination entry for the handoff");
+  assert.equal(entryAfterHost, "handed-back", "ownership acquisition ends the launcher hold");
+  assert.equal(existsSync(coordination), false, "no coordination entry is left behind");
+});
+
+/**
+ * The handoff re-validates a managed Pi selection by re-entering the launcher's
+ * own selection authority inside the hold. Both reclamation shapes are covered:
+ * a removed generation, and a partially reclaimed generation that keeps its root
+ * and CLI file while losing required runtime contents. In each case the existing
+ * validator rejects the selection and replacement preparation runs, so startup
+ * succeeds without a new refusal.
+ */
+async function runReclaimedPiSelectionTest(mode: "removed" | "partial"): Promise<void> {
+  const f = fixture();
+  const selections: string[] = [];
+  let preparedFile = "";
+  let handedOverFile = "";
+  let hostStarted = 0;
+  const diagnostics: string[] = [];
+  const status = await producer.runSessionHostLauncher([], {
+    getEnv: () => f.env,
+    processEnv: {},
+    packageRoot: f.packageRoot,
+    platform: "linux",
+    cwd: f.root,
+    nodeVersion: process.versions.node,
+    stdinIsTTY: true,
+    stdoutIsTTY: true,
+    build: (options: Record<string, unknown>) => build(f, options),
+    // The fixture producer runs the real provisionPiRuntime/validateCachedPiRuntime
+    // validation code with injected npm and version-probe seams.
+    resolvePiRuntime: async (options: { explicit?: string }) => {
+      selections.push(String(options.explicit));
+      if (selections.length === 1) {
+        const result = await provision(f, "1.3.0");
+        preparedFile = result.file;
+        if (mode === "removed") {
+          // A concurrent preparation reclaimed the whole selected generation.
+          rmSync(join(f.runtimes, "pi-1.3.0"), { recursive: true, force: true });
+        } else {
+          // Bounded partial reclamation: the generation root and the CLI file
+          // survive, required runtime contents do not.
+          rmSync(join(f.runtimes, "pi-1.3.0", "node_modules", "@earendil-works", "pi-coding-agent", "package.json"), { force: true });
+          rmSync(join(f.runtimes, "pi-1.3.0", "node_modules", "@earendil-works", "pi-coding-agent", "lib"), { recursive: true, force: true });
+        }
+        return result;
+      }
+      if (selections.length === 2) {
+        // The launcher re-enters its normal validated selection for the managed
+        // selection: run the REAL production resolver branch so its package
+        // validation (not a substitute provisioner) decides usability.
+        return producer.resolvePiRuntime({
+          explicit: options.explicit,
+          env: f.env,
+          agentDir: f.agentDir,
+          cwd: f.root,
+          writeError: (text: string) => diagnostics.push(text),
+          processRunner: async () => ok({ stdout: "1.3.0" }),
+        });
+      }
+      return provision(f, mode === "removed" ? "1.3.0" : "1.3.1");
+    },
+    ensureDdgs: () => ({ ok: true, python: join(f.root, "python") }),
+    refreshShippedSkills: () => ({ ok: true }),
+    writeOut: () => undefined,
+    writeError: (text: string) => diagnostics.push(text),
+    loadMain: () => ({
+      runSessionHost: async (options: { piExecutable: string }) => {
+        hostStarted += 1;
+        handedOverFile = options.piExecutable;
+        return 0;
+      },
+    }),
+  });
+  assert.equal(status, 0, diagnostics.join(""));
+  assert.equal(hostStarted, 1, `${mode}: the host actually started`);
+  assert.ok(selections.length >= 2, `${mode}: the hold re-entered validated selection: ${selections.join(" | ")}`);
+  assert.equal(selections[1], preparedFile, `${mode}: the managed selection is re-validated inside the hold`);
+  assert.ok(existsSync(handedOverFile), `${mode}: the runtime handed to the host exists: ${handedOverFile}`);
+  assert.match(diagnostics.join(""), /validating and preparing the Pi runtime again inside the ownership handoff/);
+  assert.doesNotMatch(diagnostics.join(""), /reclaimed by a concurrent cache cleanup|Session host refused/,
+    `${mode}: no new startup refusal is introduced for a cache this launcher pruned itself`);
+  if (mode === "removed") {
+    // Re-entering the normal selection path re-prepared the same version generation.
+    assert.equal(handedOverFile, preparedFile, "the re-prepared generation is handed to the host");
+    assert.ok(existsSync(join(f.runtimes, "pi-1.3.0", "node_modules", "@earendil-works", "pi-coding-agent", "cli.js")));
+  } else {
+    // A published-but-partial generation is preserved and a confined replacement
+    // generation is prepared instead.
+    assert.ok(handedOverFile.startsWith(join(f.runtimes, "pi-1.3.1") + "/"), `a replacement generation is used: ${handedOverFile}`);
+    assert.equal(existsSync(join(f.runtimes, "pi-1.3.0", "node_modules", "@earendil-works", "pi-coding-agent", "package.json")), false,
+      "the partially reclaimed generation is preserved as-is, never repaired in place");
+  }
+}
+
+test("a reclaimed prepared Pi selection is re-prepared inside the handoff instead of refusing startup", posix, async () => {
+  await runReclaimedPiSelectionTest("removed");
+});
+
+test("a partially reclaimed Pi generation is rejected by the existing validator and replaced", posix, async () => {
+  await runReclaimedPiSelectionTest("partial");
+});
+
+/**
+ * The handoff hold is released only by the ownership claim or the launcher's own
+ * exit — never by elapsed time. While a final rebuild/reprepare step is still
+ * pending, a real second process cannot reclaim the selected build, and the host
+ * still receives a live hold when it claims ownership.
+ */
+test("the handoff hold survives a pending preparation and cannot be pruned by a real competing producer", posix, async () => {
+  const f = fixture();
+  seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
+  const coordination = join(f.agentDir, "session-host", generations.COORDINATION as string);
+  const generationsPath = join(process.cwd(), "scripts", "managed-generations.cjs");
+  const barrierMarker = join(f.root, "preparation-pending");
+  const barrierRelease = join(f.root, "preparation-release");
+  const competingLog = join(f.root, "competing-admit.jsonl");
+  const childSource = join(f.root, "competing-admit.cjs");
+  writeFileSync(childSource, [
+    `const fs = require("node:fs");`,
+    `const path = require("node:path");`,
+    `const generations = require(${JSON.stringify(generationsPath)});`,
+    `const cache = process.argv[2];`,
+    `const marker = process.argv[3];`,
+    `const release = process.argv[4];`,
+    `const warnings = [];`,
+    `const stage = generations.admit(cache, () => ({ root: fs.mkdtempSync(path.join(cache, "competing-")) }), {`,
+    `  warn: (warning) => warnings.push(warning),`,
+    `});`,
+    `let preparedRootSeen = false;`,
+    `for (const name of fs.readdirSync(cache)) {`,
+    `  if (name === "pi-review-sessions-prepared") preparedRootSeen = fs.existsSync(path.join(cache, name, "dist", "main.js"));`,
+    `}`,
+    `fs.appendFileSync(release, JSON.stringify({ warnings, preparedRootSeen }) + "\\n");`,
+    `stage.generation.release();`,
+    ``,
+  ].join("\n"), "utf8");
+  // A deterministic prepared build generation this launch hands to the host.
+  const preparedRoot = join(f.builds, "pi-review-sessions-prepared");
+  mkdirSync(join(preparedRoot, "dist"), { recursive: true });
+  writeFileSync(join(preparedRoot, "dist", "main.js"), "// prepared host entry");
+  const preparedIdentity = lstatSync(preparedRoot, { bigint: true });
+  const timeouts: number[] = [];
+  const realSetTimeout = globalThis.setTimeout;
+  let holdPresentDuringPreparation = false;
+  let instrumented = false;
+  const diagnostics: string[] = [];
+  globalThis.setTimeout = ((handler: TimerHandler, delay?: number, ...rest: unknown[]) => {
+    if (typeof delay === "number") timeouts.push(delay);
+    return (realSetTimeout as (...args: unknown[]) => unknown)(handler, delay, ...rest);
+  }) as typeof globalThis.setTimeout;
+  instrumented = true;
+  const status = await producer.runSessionHostLauncher([], {
+    getEnv: () => f.env,
+    processEnv: {},
+    packageRoot: f.packageRoot,
+    platform: "linux",
+    cwd: f.root,
+    nodeVersion: process.versions.node,
+    stdinIsTTY: true,
+    stdoutIsTTY: true,
+    build: (options: Record<string, unknown>) => build(f, options),
+    resolvePiRuntime: async () => provision(f, "1.3.0"),
+    ensureDdgs: () => ({ ok: true, python: join(f.root, "python") }),
+    refreshShippedSkills: () => {
+      // Preparation is still pending here (skills publication runs inside the
+      // hold): another producer runs against the same agent directory while the
+      // handoff must keep the selection protected.
+      writeFileSync(barrierMarker, "pending");
+      const competing = spawnSync(process.execPath, [childSource, f.builds, barrierMarker, competingLog], { encoding: "utf8" });
+      assert.equal(competing.status, 0, competing.stderr);
+      holdPresentDuringPreparation = existsSync(coordination)
+        && readFileSync(coordination, "utf8").split("\n")[0]!.trim() === String(process.pid);
+      writeFileSync(barrierRelease, "done");
+      return { ok: true };
+    },
+    writeOut: () => undefined,
+    writeError: (text: string) => diagnostics.push(text),
+    loadMain: () => ({
+      runSessionHost: async () => {
+        // The host still receives a live hold at its ownership claim.
+        assert.equal(existsSync(coordination), true, "the hold is still held when the host claims ownership");
+        const held = readFileSync(coordination, "utf8").split("\n");
+        assert.equal(held[0]!.trim(), String(process.pid));
+        assert.ok((held[1] ?? "").trim().length > 0, "the published record already carries the owner identity");
+        writeFileSync(join(f.agentDir, "session-host", "host-ownership.json"), JSON.stringify({ version: 1, hostId: "delayed" }));
+        rmSync(coordination, { force: true });
+        return 0;
+      },
+    }),
+  });
+  globalThis.setTimeout = realSetTimeout;
+  assert.equal(instrumented, true);
+  assert.equal(status, 0, diagnostics.join(""));
+  assert.equal(holdPresentDuringPreparation, true, "the handoff is active while preparation is pending");
+  // The competing producer reached the cache but was told to leave it alone.
+  const release = readFileSync(competingLog, "utf8").trim().split("\n").filter(Boolean);
+  assert.ok(release.length >= 1, "the competing producer reported its admission");
+  const competing = JSON.parse(release[0]!) as { warnings: string[]; preparedRootSeen: boolean };
+  assert.equal(competing.preparedRootSeen, true, "the prepared build generation survived the competing producer");
+  assert.ok(competing.warnings.some((warning) => warning.includes("host ownership coordination")),
+    `the competing producer skipped reclamation through the live handoff: ${competing.warnings.join(" | ")}`);
+  const after = lstatSync(preparedRoot, { bigint: true });
+  assert.equal(`${after.dev}:${after.ino}`, `${preparedIdentity.dev}:${preparedIdentity.ino}`,
+    "the selected build keeps its filesystem identity through ownership acquisition");
+  assert.ok(timeouts.every((delay) => delay < 120_000),
+    `the handoff schedules no elapsed-time release valve: ${timeouts.join(", ")}`);
+  assert.equal(existsSync(coordination), false, "ownership acquisition ended the hold");
+});
+/**
+ * A handoff hold never inherits the producer admission busy deadline: after a
+ * live-holder wait longer than that deadline, the holder's own release (an
+ * EEXIST→ENOENT transition) or a freshly published empty record must still result
+ * in a held entry, never an uncoordinated continuation.
+ */
+test("the handoff still acquires the entry after a live-holder release past the admission deadline", posix, async () => {
+  for (const shape of ["release", "empty-record"] as const) {
+    const f = fixture();
+    const stateDir = join(f.agentDir, "session-host");
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const coordination = join(stateDir, generations.COORDINATION as string);
+    const handoffScript = join(f.root, "handoff.cjs");
+    const holderScript = join(f.root, "holder.cjs");
+    writeFileSync(handoffScript, [
+      `const fs = require("node:fs");`,
+      `const generations = require(${JSON.stringify(join(process.cwd(), "scripts", "managed-generations.cjs"))});`,
+      `const started = Date.now();`,
+      `const lease = generations.holdAgentDirectory(process.argv[2]);`,
+      `const elapsed = Date.now() - started;`,
+      `if (!lease) { process.stdout.write(JSON.stringify({ held: false, elapsed }) + "\\n"); process.exit(2); }`,
+      `const text = fs.readFileSync(process.argv[3], "utf8");`,
+      `const lines = text.split("\\n");`,
+      `process.stdout.write(JSON.stringify({ held: true, elapsed, owner: lines[0].trim(), identity: (lines[1] || "").trim(), pid: process.pid }) + "\\n");`,
+      `lease.release();`,
+      ``,
+    ].join("\n"), "utf8");
+    // A real live holder keeps the entry past the producer admission deadline and
+    // then settles it exactly as a completing producer does.
+    writeFileSync(holderScript, [
+      `const fs = require("node:fs");`,
+      `const path = require("node:path");`,
+      `const stateDir = process.argv[2];`,
+      `const lock = path.join(stateDir, ${JSON.stringify(generations.COORDINATION)});`,
+      `const shape = process.argv[3];`,
+      `const identity = require(${JSON.stringify(join(process.cwd(), "scripts", "managed-generations.cjs"))}).coordinationInternals.ownerStartIdentity(process.pid);`,
+      `fs.writeFileSync(lock, String(process.pid) + "\\n" + identity + "\\n", { mode: 0o600 });`,
+      `process.stdout.write("holding\\n");`,
+      // Longer than the 2s producer admission deadline, then settle the entry.
+      `const holdUntil = Date.now() + 2600;`,
+      `while (Date.now() < holdUntil) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);`,
+      `fs.unlinkSync(lock);`,
+      `if (shape === "empty-record") fs.writeFileSync(lock, "", { mode: 0o600 });`,
+      `process.stdout.write("settled\\n");`,
+      ``,
+    ].join("\n"), "utf8");
+    const holder = spawn(process.execPath, [holderScript, stateDir, shape], { stdio: ["ignore", "pipe", "inherit"] });
+    try {
+      await new Promise<void>((resolve) => holder.stdout!.once("data", () => resolve()));
+      const handoff = spawn(process.execPath, [handoffScript, f.agentDir, coordination], { stdio: ["ignore", "pipe", "inherit"] });
+      let output = "";
+      handoff.stdout!.setEncoding("utf8");
+      handoff.stdout!.on("data", (chunk: string) => { output += chunk; });
+      const result = await new Promise<{ held: boolean; elapsed: number; owner: string; identity: string; pid: number }>((resolve, reject) => {
+        handoff.once("exit", () => {
+          const line = output.trim().split("\n").filter((entry) => entry.startsWith("{"))[0];
+          if (!line) reject(new Error(`no handoff result: ${output}`));
+          else resolve(JSON.parse(line!) as { held: boolean; elapsed: number; owner: string; identity: string; pid: number });
+        });
+      });
+      assert.equal(result.held, true, `${shape}: the handoff holds the entry instead of continuing uncoordinated`);
+      assert.ok(result.elapsed >= 2000, `${shape}: the live-holder wait exceeded the producer admission deadline (${result.elapsed}ms)`);
+      assert.equal(result.owner, String(result.pid), `${shape}: the handoff owns the entry it published`);
+      if (process.platform !== "win32") {
+        assert.ok(result.identity.length > 0, `${shape}: the published record carries its owner identity`);
+      }
+      assert.equal(existsSync(coordination), false, `${shape}: the handoff released only its own entry`);
+    } finally {
+      holder.kill("SIGKILL");
+    }
+  }
+});
+
+/**
+ * Canonical-record publication is atomic: the complete record is written to a
+ * private candidate and published with a no-overwrite hard link. A publisher
+ * paused between those two steps therefore only loses the link race; it can never
+ * expose a half-written entry or resume believing it owns the mutex.
+ */
+test("a paused coordination publisher loses the link race and never owns the entry", posix, async () => {
+  const f = fixture();
+  const stateDir = join(f.agentDir, "session-host");
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const coordination = join(stateDir, generations.COORDINATION as string);
+  const releaseFile = join(f.root, "publisher-resume");
+  const publisherScript = join(f.root, "paused-publisher.cjs");
+  writeFileSync(publisherScript, [
+    `const fs = require("node:fs");`,
+    `const generations = require(${JSON.stringify(join(process.cwd(), "scripts", "managed-generations.cjs"))});`,
+    `const stateDir = process.argv[2];`,
+    `const releaseFile = process.argv[3];`,
+    `const candidate = generations.coordinationInternals.prepareCoordinationCandidate(stateDir);`,
+    `process.stdout.write((candidate ? "candidate-ready" : "candidate-failed") + "\\n");`,
+    `const deadline = Date.now() + 30000;`,
+    `while (!fs.existsSync(releaseFile) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);`,
+    `const entry = require("node:path").join(stateDir, generations.COORDINATION);`,
+    `const outcome = candidate.publish(entry);`,
+    `process.stdout.write("publish:" + outcome + "\\n");`,
+    ``,
+  ].join("\n"), "utf8");
+  const publisher = spawn(process.execPath, [publisherScript, stateDir, releaseFile], { stdio: ["ignore", "pipe", "inherit"] });
+  let output = "";
+  publisher.stdout!.setEncoding("utf8");
+  publisher.stdout!.on("data", (chunk: string) => { output += chunk; });
+  try {
+    const deadline = Date.now() + 15_000;
+    while (!output.includes("candidate-ready") && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(output.includes("candidate-ready"), "the publisher prepared its complete candidate");
+    assert.equal(existsSync(coordination), false,
+      "a paused publisher never exposes a half-written canonical record");
+    // Another actor publishes and holds the canonical entry while the first
+    // publisher is still paused.
+    const lease = generations.holdAgentDirectory(f.agentDir);
+    assert.ok(lease, "the second actor holds the entry");
+    const ownedBytes = readFileSync(coordination, "utf8");
+    assert.equal(ownedBytes.split("\n")[0]!.trim(), String(process.pid));
+    writeFileSync(releaseFile, "resume");
+    await new Promise<void>((resolve) => publisher.once("exit", () => resolve()));
+    assert.match(output, /publish:lost/, "the resumed publisher loses the link race instead of adopting the entry");
+    assert.equal(readFileSync(coordination, "utf8"), ownedBytes,
+      "the holder's record is byte-for-byte intact after the resumed publisher");
+    lease!.release();
+    assert.equal(existsSync(coordination), false, "the holder released only its own entry");
+  } finally {
+    writeFileSync(releaseFile, "resume");
+    publisher.kill("SIGKILL");
+  }
+});
+
+/**
+ * Owner-lifetime identity keeps a reused pid from becoming a permanent gate: a
+ * live pid with a mismatched start identity is stale metadata and is reclaimed,
+ * while a live pid with its recorded identity is a current holder and is honored.
+ */
+test("a live pid with a mismatched start identity is stale metadata, not a permanent holder", posix, async () => {
+  const f = fixture();
+  const stateDir = join(f.agentDir, "session-host");
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const coordination = join(stateDir, generations.COORDINATION as string);
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  try {
+    const identity = generations.coordinationInternals.ownerStartIdentity(holder.pid as number);
+    assert.ok(identity.length > 0, "the targeted single-pid start identity is available on this platform");
+    const seeded = seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
+    // A live but unrelated pid recorded with a start identity that is not its own:
+    // this is exactly the abandoned-record-with-reused-pid case.
+    writeFileSync(coordination, `${holder.pid}\nSat Jan  1 00:00:00 2000\n`, { mode: 0o600 });
+    const warnings: string[] = [];
+    const stage = admitStage(f, { warn: (warning: string) => warnings.push(warning) });
+    assert.ok(existsSync(stage.root), "startup proceeds");
+    stage.generation.release();
+    assert.ok(seeded.some((root) => !existsSync(root)), "the stale record was reclaimed and reclamation ran");
+    assert.ok(!warnings.some((warning) => warning.includes("coordination was busy")),
+      "a reused pid is not treated as a current holder");
+    assert.equal(existsSync(coordination), false, "the stale record itself is gone");
+
+    // The same live pid recorded with its real start identity is a current holder.
+    const second = fixture();
+    mkdirSync(join(second.agentDir, "session-host"), { recursive: true, mode: 0o700 });
+    const secondCoordination = join(second.agentDir, "session-host", generations.COORDINATION as string);
+    writeFileSync(secondCoordination, `${holder.pid}\n${identity}\n`, { mode: 0o600 });
+    const protectedRoots = seedLegacy(second.builds, ["a", "b", "c", "d", "e", "f"]);
+    const heldWarnings: string[] = [];
+    const heldStage = admitStage(second, { warn: (warning: string) => heldWarnings.push(warning) });
+    assert.ok(existsSync(heldStage.root), "startup proceeds while a current holder is honored");
+    heldStage.generation.release();
+    assert.ok(protectedRoots.every((root) => existsSync(root)), "a current holder's cache is left untouched");
+    assert.ok(heldWarnings.some((warning) => warning.includes("host ownership coordination")),
+      `the current holder was honored: ${heldWarnings.join(" | ")}`);
+  } finally {
+    holder.kill("SIGKILL");
+  }
+});
+
+/**
+ * Protocol consistency across the CJS, TypeScript host, POSIX, and PowerShell
+ * paths: the canonical coordination record is published already complete with an
+ * atomic no-overwrite hard link (never created empty and written in place), it
+ * carries a targeted single-pid owner identity, and readers accept the
+ * publisher's transient nlink 2.
+ */
+test("every coordination path publishes the complete record atomically with an owner identity", () => {
+  const read = (file: string) => readFileSync(join(process.cwd(), file), "utf8");
+  const cjs = read("scripts/managed-generations.cjs");
+  assert.match(cjs, /fs\.linkSync\(candidate, entryPath\)/, "CJS publishes with an atomic no-overwrite link");
+  assert.match(cjs, /ownerStartIdentity/, "CJS records a targeted single-pid owner identity");
+  assert.match(cjs, /`linux:\$\{boot\}:\$\{starttime\}`/, "CJS derives the Linux token from one pid's /proc stat fields");
+  assert.match(cjs, /`darwin:\$\{token\}`/, "CJS derives the macOS token from one targeted ps query");
+  assert.match(cjs, /`\/proc\/\$\{pid\}\/stat`/, "CJS reads a single pid's /proc stat (no procps required)");
+  assert.match(cjs, /\[Console\]::Out\.Write\('win32:' \+/, "CJS derives the Windows token from one targeted native query");
+  assert.match(cjs, /Get-Process -Id \$OwnerPid/, "the Windows query takes one known numeric pid through its script-block parameter");
+  assert.match(cjs, /& \{ param\(\[int\]\$OwnerPid\)/, "the Windows query is invoked as a parameterized script block");
+  assert.match(cjs, /if \(record\.identity === ""\) return false;/u, "CJS never honors a record without a birth identity");
+  assert.match(cjs, /record\.pid === process\.pid && record\.identity === OWN_OWNER_IDENTITY/u,
+    "CJS self-adoption also requires the recorded birth identity");
+  assert.match(cjs, /& \{ param\(\[int\]\$OwnerPid\)/u, "the Windows query is a parameterized script block");
+  assert.match(cjs, /OWN_OWNER_IDENTITY === ""/, "CJS publishes no record when the owner identity is unavailable");
+  assert.match(cjs, /before\.nlink !== 1n && before\.nlink !== 2n/,
+    "CJS accepts the publisher's transient hard-link pairing and rejects other link counts");
+  assert.doesNotMatch(cjs, /openSync\(entryPath, "wx"/, "CJS never creates the canonical entry empty and writes it in place");
+
+  const host = read("src/session-host/roster-store.ts");
+  assert.match(host, /linkSync\(candidate, entryPath\)/, "the host publishes with an atomic no-overwrite link");
+  assert.match(host, /ownerStartIdentity/, "the host records a targeted single-pid owner identity");
+  assert.match(host, /OWN_OWNER_IDENTITY === ""/, "the host publishes no record when the owner identity is unavailable");
+  assert.match(host, /& \{ param\(\[int\]\$OwnerPid\)/u, "the host query is a parameterized script block");
+  assert.match(host, /Get-Process -Id \$OwnerPid/u, "the host query takes one known numeric pid through its script-block parameter");
+  assert.match(host, /if \(record\.identity === ""\) return false;/u, "the host never honors a record without a birth identity");
+  assert.match(host, /record\.pid === process\.pid && record\.identity === OWN_OWNER_IDENTITY/u,
+    "host self-adoption also requires the recorded birth identity");
+  assert.match(host, /linux:\$\{boot\}|linux:/, "the host derives the Linux token from /proc");
+  assert.match(host, /before\.nlink !== 1n && before\.nlink !== 2n/,
+    "the host accepts the transient hard-link pairing");
+  assert.doesNotMatch(host, /openSync\(entryPath, "wx"/, "the host never creates the canonical entry empty");
+
+  const posix = read("scripts/node-generations.sh");
+  assert.match(posix, /"\$NODE_HARDLINK_BIN" "\$candidate" "\$NODE_COORDINATION_LOCK"/,
+    "the POSIX wrapper publishes with an atomic no-overwrite hard link");
+  assert.match(posix, /node_owner_identity/, "the POSIX wrapper records a targeted single-pid owner identity");
+  assert.match(posix, /printf '%s' "linux:\$boot:\$\{fields\[19\]\}"/, "the POSIX wrapper derives the Linux token from /proc");
+  assert.match(posix, /printf '%s' "darwin:\$\{words\[\*\]\}"/, "the POSIX wrapper derives the macOS token from one ps query");
+  assert.doesNotMatch(posix, /requires unlink, rmdir, and ln/, "coordination tooling is never a cache-cleanup prerequisite");
+  assert.match(posix, /\[\[ -n "\$owner" && -n "\$\{NODE_HARDLINK_BIN:-\}" \]\] \|\| return 1/u,
+    "the POSIX publisher refuses to publish without a birth identity");
+  assert.match(posix, /\[\[ -n "\$identity" \]\] \|\| return 1/u, "the POSIX reader never honors a record without a birth identity");
+  assert.match(posix, /"\$links" == 1 \|\| "\$links" == 2/, "the POSIX wrapper accepts the transient hard-link pairing");
+  assert.doesNotMatch(posix, /> "\$NODE_COORDINATION_LOCK"/, "the POSIX wrapper never writes the canonical entry in place");
+
+  const powershell = read("scripts/pi-review-sessions-node.ps1");
+  assert.match(powershell, /CreateHardLinkW\(\$entry, \$candidate/, "the PowerShell path publishes with an atomic no-overwrite hard link");
+  assert.match(powershell, /Get-NodeOwnerIdentity/, "the PowerShell path records a targeted single-pid owner identity");
+  assert.match(powershell, /return 'win32:' \+/, "the PowerShell path uses the same win32 token format as the CJS/TypeScript writers");
+  assert.match(powershell, /if \(\[string\]::IsNullOrEmpty\(\$identity\)\) \{ return 'failed' \}/,
+    "the PowerShell path publishes no record when the owner identity is unavailable");
+  assert.match(powershell, /if \(\[string\]::IsNullOrEmpty\(\$Record\.Identity\)\) \{ return \$false \}/,
+    "the PowerShell path never honors a record without a birth identity");
+  assert.doesNotMatch(powershell, /\[IO\.FileMode\]::CreateNew[^\n]*host-coordination\.lock/, "PowerShell never creates the canonical entry in place");
+});
+
+test("the canonical record carries a real per-platform birth identity that round-trips", posix, async () => {
+  const f = fixture();
+  const stateDir = join(f.agentDir, "session-host");
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const coordination = join(stateDir, generations.COORDINATION as string);
+  const internals = generations.coordinationInternals as {
+    ownerStartIdentity(pid: number): string;
+    ownOwnerIdentity(): string;
+  };
+  const own = internals.ownOwnerIdentity();
+  assert.match(own, /^(?:linux:[0-9a-zA-Z-]+:[0-9]+|darwin:\S.*|win32:\S.*)$/u,
+    `the owner birth identity uses one exact per-platform format: ${own}`);
+  assert.equal(internals.ownerStartIdentity(process.pid), own,
+    "the identity computed for this pid is the one recorded for this pid");
+  const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  try {
+    assert.ok(Number.isInteger(other.pid), "the foreign process is alive");
+    const foreign = internals.ownerStartIdentity(other.pid as number);
+    assert.match(foreign, /^(?:linux|darwin|win32):/u, "one targeted query yields the foreign pid's identity");
+    assert.equal(internals.ownerStartIdentity(other.pid as number), foreign,
+      "the same pid round-trips to the same birth identity");
+    assert.notEqual(foreign, "darwin:Sat Jan  1 00:00:00 2000", "an unrelated birth identity is distinguishable");
+  } finally {
+    other.kill("SIGKILL");
+  }
+  // A published record therefore always carries the identity, never a bare pid.
+  const lease = generations.holdAgentDirectory(f.agentDir);
+  assert.ok(lease, "the launcher handoff holds the canonical entry");
+  const published = readFileSync(coordination, "utf8").split("\n");
+  assert.equal(published[0]!.trim(), String(process.pid));
+  assert.equal(published[1]!.trim(), own, "the published record carries the owner birth identity");
+  lease!.release();
+  assert.equal(existsSync(coordination), false);
+});
+
+/**
+ * No record without a birth identity is ever honored, on the holder path or in
+ * self-adoption: empty-identity metadata naming an unrelated live pid, and a
+ * record naming this very pid with a wrong birth identity, are both stale.
+ */
+test("pid-only and same-pid-wrong-birth records are stale metadata, never holders", posix, async () => {
+  const f = fixture();
+  const stateDir = join(f.agentDir, "session-host");
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const coordination = join(stateDir, generations.COORDINATION as string);
+  const internals = generations.coordinationInternals as { ownOwnerIdentity(): string };
+  const own = internals.ownOwnerIdentity();
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  try {
+    // (a) A live foreign pid with an EMPTY birth identity is never honored.
+    const seeded = seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
+    writeFileSync(coordination, `${holder.pid}\n\n`, { mode: 0o600 });
+    const warnings: string[] = [];
+    const stage = admitStage(f, { warn: (warning: string) => warnings.push(warning) });
+    assert.ok(existsSync(stage.root), "startup proceeds");
+    stage.generation.release();
+    assert.ok(seeded.some((root) => !existsSync(root)), "an empty-identity record was reclaimed and reclamation ran");
+    assert.ok(!warnings.some((warning) => warning.includes("host ownership coordination")),
+      `a pid-only record is never honored as a current holder: ${warnings.join(" | ")}`);
+
+    // (b) A record naming THIS pid with a wrong birth identity is not self-adoption.
+    writeFileSync(coordination, `${process.pid}\nlinux:stale-birth:1\n`, { mode: 0o600 });
+    const lease = generations.holdAgentDirectory(f.agentDir);
+    assert.ok(lease, "the stale same-pid record did not block the handoff");
+    const published = readFileSync(coordination, "utf8").split("\n");
+    assert.equal(published[0]!.trim(), String(process.pid));
+    assert.equal(published[1]!.trim(), own, "a genuinely held record carries this process's real birth identity");
+    lease!.release();
+    assert.equal(existsSync(coordination), false);
+  } finally {
+    holder.kill("SIGKILL");
+  }
+});
+
+test("an unconfirmed Pi validation cleanup fails closed instead of re-preparing", posix, async () => {
+  const f = fixture();
+  const selections: string[] = [];
+  let hostStarted = 0;
+  const diagnostics: string[] = [];
+  const status = await producer.runSessionHostLauncher([], {
+    getEnv: () => f.env,
+    processEnv: {},
+    packageRoot: f.packageRoot,
+    platform: "linux",
+    cwd: f.root,
+    nodeVersion: process.versions.node,
+    stdinIsTTY: true,
+    stdoutIsTTY: true,
+    build: (options: Record<string, unknown>) => build(f, options),
+    resolvePiRuntime: async (options: { explicit?: string }) => {
+      selections.push(String(options.explicit));
+      if (selections.length === 1) return provision(f, "1.3.0");
+      // The in-hold validation probe's process termination was not confirmed.
+      const error = new Error("pi runtime validation probe cleanup was not confirmed") as Error & { cleanupUnconfirmed?: boolean };
+      error.cleanupUnconfirmed = true;
+      throw error;
+    },
+    ensureDdgs: () => ({ ok: true, python: join(f.root, "python") }),
+    refreshShippedSkills: () => ({ ok: true }),
+    writeOut: () => undefined,
+    writeError: (text: string) => diagnostics.push(text),
+    loadMain: () => ({ runSessionHost: async () => { hostStarted += 1; return 0; } }),
+  });
+  assert.equal(status, 1, "an unconfirmed cleanup fails the launch closed");
+  assert.equal(hostStarted, 0, "the host never starts over an unconfirmed validation cleanup");
+  assert.equal(selections.length, 2, `no fallback resolution or provisioning is attempted: ${selections.join(" | ")}`);
+  assert.match(diagnostics.join(""), /Pi runtime validation cleanup was not confirmed; preserving its runtime/u);
+});
+
 test("full startup reclaims a directory-shaped cache lock and prunes five legacy generations per type", posix, async () => {
   const f = fixture();
   const buildRoots = seedLegacy(f.builds, ["legacy-build-0", "legacy-build-1", "legacy-build-2", "legacy-build-3", "legacy-build-4"]);
@@ -785,4 +1389,315 @@ test("full startup reclaims a directory-shaped cache lock and prunes five legacy
   assert.doesNotMatch(diagnostics.join(""), /cleanup lock was busy|lock artifact could not be removed|could not reclaim/i);
   assert.ok(buildRoots.some((root) => !existsSync(root)), "an actual legacy build directory was reclaimed");
   assert.ok(runtimeRoots.some((root) => !existsSync(root)), "an actual legacy Pi directory was reclaimed");
+});
+
+// ---------------------------------------------------------------------------
+// #385 coordination boundary: host ownership acquisition and destructive cache
+// reclamation take one canonical per-agent entry
+// (`session-host/host-coordination.lock`). The scenarios below are the source
+// of the startup race: a producer authorized to reclaim while a host becomes the
+// owner of the same agent directory. Each one is driven through the real
+// producer path with a narrow deterministic hook or a real child process; no
+// outcome depends on timer luck.
+// ---------------------------------------------------------------------------
+const ownershipPath = (f: Fixture) => join(f.agentDir, "session-host", "host-ownership.json");
+const coordinationPath = (f: Fixture) => join(f.agentDir, "session-host", generations.COORDINATION as string);
+const admitStage = (f: Fixture, options: Record<string, unknown> = {}) =>
+  generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }), options);
+
+function liveHostRecord(f: Fixture): void {
+  mkdirSync(join(f.agentDir, "session-host"), { recursive: true, mode: 0o700 });
+  writeFileSync(ownershipPath(f), JSON.stringify({ version: 1, hostId: "live-owner" }), { mode: 0o600 });
+}
+
+test("host ownership appearing during a live producer lock wait leaves that host's generations untouched", posix, () => {
+  const f = fixture();
+  const legacy = seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f", "g"]);
+  const lock = join(f.builds, ".admission.lock");
+  // A genuinely live foreign producer holds the admission lock: this producer
+  // observes the real bounded wait instead of an immediate same-process skip.
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore" });
+  try {
+    const fs = requireCjs("node:fs") as typeof import("node:fs");
+    const lstat = fs.lstatSync;
+    let appeared = false;
+    writeFileSync(lock, `${holder.pid}\n`, { mode: 0o600 });
+    Object.defineProperty(fs, "lstatSync", {
+      configurable: true,
+      writable: true,
+      value: (...args: Parameters<typeof lstat>) => {
+        // The host becomes the owner while this producer waits for the lock.
+        if (!appeared && String(args[0]) === lock) {
+          appeared = true;
+          liveHostRecord(f);
+        }
+        return Reflect.apply(lstat, fs, args);
+      },
+    });
+    const warnings: string[] = [];
+    let stage;
+    try {
+      stage = admitStage(f, { warn: (warning: string) => warnings.push(warning) });
+    } finally {
+      Object.defineProperty(fs, "lstatSync", { configurable: true, writable: true, value: lstat });
+    }
+    assert.equal(appeared, true, "ownership appeared during the real lock wait");
+    assert.ok(existsSync(stage.root), "startup is never refused for cache capacity");
+    stage.generation.release();
+    assert.ok(legacy.every((root) => existsSync(root)), "the host's actual generations survive the wait");
+    assert.equal(count(f.builds), legacy.length + 1, "the competing launch still created its own generation");
+    assert.equal(readFileSync(lock, "utf8"), `${holder.pid}\n`, "the live foreign lock is never stolen");
+    assert.ok(warnings.some((warning) => warning.includes("session host currently owns")),
+      `the truthful skip is reported: ${warnings.join(" | ")}`);
+  } finally {
+    holder.kill("SIGKILL");
+  }
+});
+
+test("host ownership appearing during malformed-lock recovery stops reclamation after the wait", posix, () => {
+  const f = fixture();
+  const legacy = seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f", "g"]);
+  const lock = join(f.builds, ".admission.lock");
+  mkdirSync(lock);
+  const fs = requireCjs("node:fs") as typeof import("node:fs");
+  const lstat = fs.lstatSync;
+  let directoryObservations = 0;
+  let appeared = false;
+  Object.defineProperty(fs, "lstatSync", {
+    configurable: true,
+    writable: true,
+    value: (...args: Parameters<typeof lstat>) => {
+      const observed = Reflect.apply(lstat, fs, args);
+      if (String(args[0]) === lock && observed && observed.isDirectory()) {
+        directoryObservations += 1;
+        // The recovery needed for a malformed non-live artifact is exactly the
+        // window in which a host can become the owner.
+        if (directoryObservations === 3 && !appeared) {
+          appeared = true;
+          liveHostRecord(f);
+        }
+      }
+      return observed;
+    },
+  });
+  const warnings: string[] = [];
+  let stage;
+  try {
+    stage = admitStage(f, { warn: (warning: string) => warnings.push(warning) });
+  } finally {
+    Object.defineProperty(fs, "lstatSync", { configurable: true, writable: true, value: lstat });
+  }
+  assert.equal(appeared, true, "ownership appeared during stale/malformed lock recovery");
+  assert.ok(existsSync(stage.root), "startup is never refused for cache capacity");
+  stage.generation.release();
+  assert.equal(existsSync(lock), false, "the malformed artifact itself was still reclaimed");
+  assert.ok(legacy.every((root) => existsSync(root)), "no generation was pruned after the ownership recheck");
+  assert.ok(warnings.some((warning) => warning.includes("session host currently owns")),
+    `the post-wait recheck reports the skip: ${warnings.join(" | ")}`);
+  assert.ok(!warnings.some((warning) => warning.includes("could not reclaim")), "nothing is reported as failed");
+});
+
+test("a host that appears mid-cleanup stops removal at the next destructive boundary", posix, () => {
+  const f = fixture();
+  const legacy = seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f", "g"]);
+  const warnings: string[] = [];
+  let appeared = false;
+  const stage = admitStage(f, {
+    warn: (warning: string) => warnings.push(warning),
+    // Producer-path hook: it runs inside the destructive pass, after the
+    // per-generation ownership recheck and before that generation is removed.
+    beforeReclaim: () => {
+      if (!appeared) {
+        appeared = true;
+        liveHostRecord(f);
+      }
+      return undefined;
+    },
+  });
+  assert.equal(appeared, true, "ownership appeared after cleanup was already authorized");
+  assert.ok(existsSync(stage.root), "startup still proceeds");
+  stage.generation.release();
+  assert.equal(existsSync(legacy[0]!), false, "the generation already authorized was reclaimed");
+  assert.ok(legacy.slice(1).every((root) => existsSync(root)),
+    "the remaining generations survive: removal stops at the ownership boundary");
+  assert.ok(warnings.some((warning) => warning.includes("acquired the agent directory during cleanup")),
+    `the boundary stop is reported truthfully: ${warnings.join(" | ")}`);
+});
+
+test("a real cleanup pass and a real host ownership acquisition never interleave", posix, async () => {
+  const f = fixture();
+  seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f", "g"]);
+  const log = join(f.root, "order.log");
+  writeFileSync(log, "");
+  const releaseCleanup = join(f.root, "release-cleanup");
+  const releaseHost = join(f.root, "release-host");
+  const generationsPath = join(process.cwd(), "scripts", "managed-generations.cjs");
+  const rosterStorePath = join(process.cwd(), "dist-test", "src", "session-host", "roster-store.js");
+  const cleanupScript = join(f.root, "cleanup-race.cjs");
+  writeFileSync(cleanupScript, [
+    `const fs = require("node:fs");`,
+    `const path = require("node:path");`,
+    `const generations = require(${JSON.stringify(generationsPath)});`,
+    `const cache = process.argv[2];`,
+    `const log = process.argv[3];`,
+    `const releaseFile = process.argv[4];`,
+    `const append = (line) => fs.appendFileSync(log, line + "\\n");`,
+    `let paused = false;`,
+    `const stage = generations.admit(cache, () => ({ root: fs.mkdtempSync(path.join(cache, "pi-review-sessions-")) }), {`,
+    `  warn: (warning) => append("warn:" + warning),`,
+    `  beforeReclaim: (root) => {`,
+    `    if (!paused) {`,
+    `      paused = true;`,
+    `      process.stdout.write("PAUSED\\n");`,
+    // Hold the destructive critical section past the old short acquisition
+    // bypass, then record whether any host owned the directory during the hold.
+    `      const holdUntil = Date.now() + 3000;`,
+    `      while (Date.now() < holdUntil) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);`,
+    `      append("ownership-during-hold:" + fs.existsSync(path.join(process.argv[5], "session-host", "host-ownership.json")));`,
+    `      const deadline = Date.now() + 60000;`,
+    `      while (!fs.existsSync(releaseFile) && Date.now() < deadline) {`,
+    `        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);`,
+    `      }`,
+    `    }`,
+    `    append("reclaim:" + path.basename(root));`,
+    `  },`,
+    `});`,
+    `append("pass-complete");`,
+    `stage.generation.release();`,
+    `append("cleanup-settled");`,
+    ``,
+  ].join("\n"), "utf8");
+  const hostScript = join(f.root, "host-race.cjs");
+  writeFileSync(hostScript, [
+    `const fs = require("node:fs");`,
+    `const { openHostState } = require(${JSON.stringify(rosterStorePath)});`,
+    `const agentDir = process.argv[2];`,
+    `const log = process.argv[3];`,
+    `const releaseFile = process.argv[4];`,
+    `const append = (line) => fs.appendFileSync(log, line + "\\n");`,
+    `append("host-started");`,
+    `append("host-acquiring");`,
+    `const opened = openHostState({ agentDir, hostId: "race-host" });`,
+    `append("host-result:" + opened.status);`,
+    `if (opened.status !== "opened") process.exit(2);`,
+    `append("host-owning");`,
+    `const deadline = Date.now() + 60000;`,
+    `while (!fs.existsSync(releaseFile) && Date.now() < deadline) {`,
+    `  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);`,
+    `}`,
+    `append("host-release:" + opened.state.release());`,
+    ``,
+  ].join("\n"), "utf8");
+  const cleanupChild = spawn(process.execPath, [cleanupScript, f.builds, log, releaseCleanup, f.agentDir], { stdio: ["ignore", "pipe", "inherit"] });
+  const paused = new Promise<void>((resolve, reject) => {
+    let buffered = "";
+    cleanupChild.stdout!.setEncoding("utf8");
+    cleanupChild.stdout!.on("data", (chunk: string) => {
+      buffered += chunk;
+      if (buffered.includes("PAUSED")) resolve();
+    });
+    cleanupChild.once("exit", (code) => reject(new Error(`cleanup exited before its barrier (${code})`)));
+  });
+  await paused;
+  assert.equal(existsSync(ownershipPath(f)), false, "no host owns the agent directory while the pass is paused");
+  const hostChild = spawn(process.execPath, [hostScript, f.agentDir, log, releaseHost], { stdio: ["ignore", "ignore", "inherit"] });
+  const waitForLine = async (needle: string): Promise<void> => {
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      if (existsSync(log) && readFileSync(log, "utf8").includes(needle)) return;
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${needle}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+  try {
+    // The competing host reaches its ownership boundary but cannot claim the
+    // directory while the authorized destructive pass holds the coordination
+    // entry. The pass keeps running past the old short acquisition bypass and
+    // reports whether ownership appeared during that hold.
+    await waitForLine("host-acquiring");
+    await waitForLine("ownership-during-hold:");
+    const held = readFileSync(log, "utf8");
+    assert.match(held, /ownership-during-hold:false/,
+      `ownership is not claimed while a live destructive pass runs past the acquisition timeout: ${held}`);
+    assert.equal(existsSync(ownershipPath(f)), false, "ownership is not claimed mid-destructive-cleanup");
+    writeFileSync(releaseCleanup, "release");
+    await new Promise<void>((resolve, reject) => {
+      cleanupChild.once("exit", (code) => (code === 0 ? resolve() : reject(new Error(`cleanup exited ${code}`))));
+    });
+    await waitForLine("host-owning");
+    const ordered = readFileSync(log, "utf8").trim().split("\n");
+    const ownershipIndex = ordered.indexOf("host-result:opened");
+    assert.ok(ownershipIndex > 0, `the host actually acquired ownership: ${ordered.join(" | ")}`);
+    const reclaimIndexes = ordered.map((line, index) => (line.startsWith("reclaim:") ? index : -1)).filter((index) => index >= 0);
+    assert.ok(reclaimIndexes.length > 0, "the cleanup pass actually removed generations");
+    assert.ok(reclaimIndexes.every((index) => index < ownershipIndex),
+      `every removal precedes ownership acquisition: ${ordered.join(" | ")}`);
+    assert.ok(ordered.indexOf("pass-complete") < ownershipIndex, "ownership is taken only after the pass settles");
+    assert.equal(ordered.indexOf("cleanup-settled") < ownershipIndex, true);
+    // A competing launch during ownership is never refused for cache capacity,
+    // and every surviving generation keeps its exact filesystem identity.
+    const ownedSnapshot = readdirSync(f.builds)
+      .filter((name) => name !== ".admission.lock")
+      .map((name) => {
+        const stats = lstatSync(join(f.builds, name), { bigint: true });
+        return { name, id: `${stats.dev}:${stats.ino}` };
+      });
+    const warnings: string[] = [];
+    const competing = admitStage(f, { warn: (warning: string) => warnings.push(warning) });
+    assert.ok(existsSync(competing.root), "a competing launch still starts");
+    competing.generation.release();
+    for (const entry of ownedSnapshot) {
+      const stats = lstatSync(join(f.builds, entry.name), { bigint: true });
+      assert.equal(`${stats.dev}:${stats.ino}`, entry.id,
+        `the owned generation ${entry.name} keeps its identity while a session host owns the directory`);
+    }
+    assert.ok(warnings.some((warning) => warning.includes("session host currently owns")),
+      `the existing guard is what skips cleanup: ${warnings.join(" | ")}`);
+    // The host that owns the directory releases only its own record.
+    writeFileSync(releaseHost, "release");
+    await new Promise<void>((resolve, reject) => {
+      hostChild.once("exit", (code) => (code === 0 ? resolve() : reject(new Error(`host exited ${code}`))));
+    });
+    assert.equal(existsSync(ownershipPath(f)), false, "the owning host released its own record");
+    assert.equal(existsSync(coordinationPath(f)), false, "no coordination entry is left behind");
+  } finally {
+    writeFileSync(releaseCleanup, "release");
+    writeFileSync(releaseHost, "release");
+    cleanupChild.kill("SIGKILL");
+    hostChild.kill("SIGKILL");
+  }
+});
+
+test("a stale or special-leaf entry inside a designated disposable generation cannot pin it", posix, () => {
+  const f = fixture();
+  const outside = join(f.root, "outside-special");
+  writeFileSync(outside, "outside bytes");
+  const roots = seedLegacy(f.builds, ["a-special", "b", "c", "d", "e", "f"]);
+  const fifo = join(roots[0]!, "nested", "fifo");
+  const made = spawnSync("mkfifo", [fifo], { encoding: "utf8" });
+  if (made.status !== 0) return; // platforms without mkfifo are covered elsewhere
+  const stage = admitStage(f);
+  assert.ok(existsSync(stage.root), "startup is never refused for a special leaf");
+  stage.generation.release();
+  assert.equal(existsSync(roots[0]!), false,
+    "a special leaf is unlinked with its disposable generation instead of pinning it forever");
+  assert.equal(readFileSync(outside, "utf8"), "outside bytes");
+  assert.ok(count(f.builds) <= generations.LIMIT);
+});
+
+test("a direct-child .terraform entry in the Node cache is not exempt from reclamation", posix, () => {
+  const f = fixture();
+  const nodeCache = join(f.agentDir, ".pi-review-gate", "node");
+  mkdirSync(join(nodeCache, ".terraform"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(nodeCache, ".terraform", "sentinel"), "cleanup-specific disposable content");
+  const outside = join(f.root, "outside-terraform");
+  writeFileSync(outside, "outside stays");
+  for (let index = 0; index < 5; index += 1) {
+    mkdirSync(join(nodeCache, `bootstrap.legacy-${index}`), { recursive: true, mode: 0o700 });
+  }
+  // The wrapper script owns this exclusion, so the source contract is pinned
+  // here and the native behaviour is exercised by session-host-entrypoints.
+  const source = readFileSync(join(process.cwd(), "scripts", "node-generations.sh"), "utf8");
+  assert.doesNotMatch(source, /\.terraform" \] \] \|\| continue/, "a direct child named .terraform is ordinary disposable cache content");
+  assert.equal(readFileSync(outside, "utf8"), "outside stays");
 });

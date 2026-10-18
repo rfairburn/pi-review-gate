@@ -216,7 +216,9 @@ function writeBootstrapTools(
     "printf '%s\\n' \"$candidate\"",
     "",
   ].join("\n"));
-  for (const tool of ["unlink", "rmdir", "mv"]) {
+  // The canonical coordination record is published with an atomic hard link, and
+  // its owner identity is one targeted `ps` query for a single pid.
+  for (const tool of ["unlink", "rmdir", "mv", "ln", "ps"]) {
     const native = spawnSync("/bin/bash", ["-c", `type -P ${tool}`], { encoding: "utf8" }).stdout.trim();
     writeExecutable(join(fixture.bin, tool), `#!/bin/bash\nexec "${native}" "$@"\n`);
   }
@@ -234,10 +236,47 @@ function writeBootstrapTools(
     "    [[ -f \"${FAKE_LOCK_COUNTER:-}\" ]] && read -r count < \"${FAKE_LOCK_COUNTER:-}\"",
     "    count=$((count + 1))",
     "    printf '%s' \"$count\" > \"${FAKE_LOCK_COUNTER:-}\"",
-    "    if (( count == ${FAKE_LOCK_SWAP_AT:-0} )) && [[ -d \"$FAKE_LOCK_PATH\" && ! -L \"$FAKE_LOCK_PATH\" ]]; then",
+    "    if (( count == ${FAKE_LOCK_SWAP_AT:-0} )) && [[ \"$FAKE_LOCK_PATH\" == \"${FAKE_COORDINATION_LOCK:-}\" ]]; then",
+    "      # Replace the stale coordination record with a complete, valid live one.",
+    "      /bin/rm -f \"$FAKE_LOCK_PATH\"",
+    "      printf '%s\\n%s\\n' \"${FAKE_LOCK_OWNER:-}\" \"${FAKE_LOCK_IDENTITY:-}\" > \"$FAKE_LOCK_PATH\"",
+    "    elif (( count == ${FAKE_LOCK_SWAP_AT:-0} )) && [[ -d \"$FAKE_LOCK_PATH\" && ! -L \"$FAKE_LOCK_PATH\" ]]; then",
     "      rmdir \"$FAKE_LOCK_PATH\"",
     "      printf '%s\\n' \"${FAKE_LOCK_OWNER:-}\" > \"$FAKE_LOCK_PATH\"",
     "    fi",
+    "    if [[ -n \"${FAKE_OWNERSHIP_RECORD:-}\" && \"${FAKE_OWNERSHIP_AT:-}\" =~ ^[0-9]+$ ]] && (( count == FAKE_OWNERSHIP_AT )); then",
+    "      /bin/mkdir -p \"${FAKE_OWNERSHIP_RECORD%/*}\"",
+    "      printf '%s\\n' '{\"version\":1,\"hostId\":\"fixture-owner\"}' > \"$FAKE_OWNERSHIP_RECORD\"",
+    "    fi",
+    "  fi",
+    "fi",
+    "# A bounded barrier inside the real destructive pass: the producer holds the",
+    "# per-agent coordination entry while a host acquisition is attempted.",
+    "if [[ -n \"${FAKE_HOLD_TRIGGER:-}\" && \"${FAKE_HOLD_TRIGGER}\" != \"${FAKE_HOLD_DONE:-}\" && \"${2:-}\" == *%d:%i* ]]; then",
+    "  last=''",
+    "  for arg in \"$@\"; do last=\"$arg\"; done",
+    "  if [[ \"$last\" == \"$FAKE_HOLD_TRIGGER\" ]]; then",
+    "    printf '%s\\n' \"$FAKE_HOLD_TRIGGER\" > \"$FAKE_HOLD_DONE\"",
+    "    hold_started=$SECONDS",
+    "    while (( SECONDS - hold_started < 3 )); do /bin/sleep 0.05; done",
+    "    if [[ -n \"${FAKE_OWNERSHIP_RECORD:-}\" && -e \"$FAKE_OWNERSHIP_RECORD\" ]]; then",
+    "      printf 'ownership-during-hold:true\\n' >> \"$FAKE_HOLD_LOG\"",
+    "    else",
+    "      printf 'ownership-during-hold:false\\n' >> \"$FAKE_HOLD_LOG\"",
+    "    fi",
+    "    hold_deadline=$((SECONDS + 60))",
+    "    while [[ ! -e \"${FAKE_HOLD_RELEASE:-/nonexistent}\" ]] && (( SECONDS < hold_deadline )); do /bin/sleep 0.05; done",
+    "    printf 'hold-released\\n' >> \"$FAKE_HOLD_LOG\"",
+    "  fi",
+    "fi",
+    "# The same synthetic producer publishes a host ownership record just before a",
+    "# chosen generation identity is observed, so a host appears mid-cleanup.",
+    "if [[ -n \"${FAKE_OWNERSHIP_TRIGGER:-}\" && -n \"${FAKE_OWNERSHIP_RECORD:-}\" && \"${2:-}\" == *%d:%i* ]]; then",
+    "  last=''",
+    "  for arg in \"$@\"; do last=\"$arg\"; done",
+    "  if [[ \"$last\" == \"$FAKE_OWNERSHIP_TRIGGER\" ]]; then",
+    "    /bin/mkdir -p \"${FAKE_OWNERSHIP_RECORD%/*}\"",
+    "    printf '%s\\n' '{\"version\":1,\"hostId\":\"fixture-owner\"}' > \"$FAKE_OWNERSHIP_RECORD\"",
     "  fi",
     "fi",
     "if [[ \"$1\" == \"-f\" && \"${FAKE_STAT_NATIVE:-Linux}\" == Linux ]]; then format=\"$2\"; format=\"${format//%Lp/%a}\"; format=\"${format//%p/%f}\"; format=\"${format//%l/%h}\"; format=\"${format//%z/%s}\"; format=\"${format//%m/%Y}\"; format=\"${format//%c/%Z}\"; shift 2; exec /usr/bin/stat -c \"$format\" \"$@\"; fi",
@@ -887,6 +926,279 @@ test(".sh skips cache cleanup while an existing session host owns the agent dire
   f.markAssertionsPassed();
 });
 
+// #385 coordination boundary: ownership acquisition and destructive cache
+// reclamation take one canonical per-agent entry. These fixtures publish a host
+// ownership record at a deterministic point in the real producer path (during a
+// stale/malformed lock recovery, or mid-cleanup), never by timer luck.
+function seedNodeLegacy(f: EntrypointFixture, prefixName: string, total: number): string[] {
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  const roots: string[] = [];
+  for (let index = 0; index < total; index += 1) {
+    const root = join(cache, `bootstrap.${prefixName}-${index}`);
+    mkdirSync(root, { recursive: true });
+    roots.push(root);
+  }
+  return roots;
+}
+
+test(".sh publishes no coordination record when the targeted identity query fails", { skip: isWindows || existsSync("/proc/self/stat") }, (t) => {
+  // macOS-only: on Linux the identity comes from /proc and does not depend on ps.
+  const f = makeEntrypointFixture(".node-identity-unavailable-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  // A `ps` that cannot report anything stands in for a failed targeted query.
+  writeExecutable(join(f.bin, "ps"), "#!/bin/bash\nexit 1\n");
+  const roots = seedNodeLegacy(f, "legacy", 5);
+  const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /host ownership coordination was unavailable/u,
+    "a failed identity query is reported honestly instead of publishing a weak record");
+  assert.equal(existsSync(join(f.agentDir, "session-host", "host-coordination.lock")), false,
+    "no pid-only coordination record is published");
+  for (const root of roots) assert.ok(existsSync(root), "no reclamation ran without the mutex");
+  assert.equal(nodeRoots(f).length, 6, "startup still created its own generation");
+  f.markAssertionsPassed();
+});
+
+test(".sh stale recovery never reclaims a live replacement coordination record", { skip: isWindows, timeout: 120_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-coordination-replacement-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const roots = seedNodeLegacy(f, "legacy", 7);
+  const stateDir = join(f.agentDir, "session-host");
+  mkdirSync(stateDir, { recursive: true });
+  const coordination = join(stateDir, "host-coordination.lock");
+  // A stale record (dead pid) that recovery will judge stale.
+  writeFileSync(coordination, "999999999\nlinux:stale-birth:1\n", { mode: 0o600 });
+  // A valid live replacement: this process's pid and its real birth identity.
+  const liveIdentity = (require(join(process.cwd(), "scripts", "managed-generations.cjs")) as {
+    coordinationInternals: { ownerStartIdentity(pid: number): string };
+  }).coordinationInternals.ownerStartIdentity(process.pid);
+  assert.ok(liveIdentity.length > 0, "the replacement carries a real birth identity");
+  const counter = join(f.root, "coordination-identity-observations.txt");
+  const result = runSh(f, ["--help"], {
+    PI_CODING_AGENT_DIR: f.agentDir,
+    FAKE_LOCK_PATH: coordination,
+    FAKE_COORDINATION_LOCK: coordination,
+    FAKE_LOCK_COUNTER: counter,
+    // Replacement at the identity-capture observation distinguishes
+    // capture-before-verdict (the fix) from capture-after-verdict (the defect):
+    // with the fix the stale identity is already held when the live record appears,
+    // so reclamation is skipped; with the old order the recovering producer would
+    // capture the replacement's identity and delete it.
+    FAKE_LOCK_SWAP_AT: "1",
+    FAKE_LOCK_OWNER: String(process.pid),
+    FAKE_LOCK_IDENTITY: liveIdentity,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  // Artifact survival is the discriminating assertion: under the old ordering the
+  // recovering producer captures the replacement's identity and deletes it.
+  assert.equal(existsSync(coordination), true, "the live replacement record was not reclaimed");
+  assert.equal(readFileSync(coordination, "utf8"), `${process.pid}\n${liveIdentity}\n`,
+    "the live replacement record survives byte-for-byte");
+  assert.match(result.stderr, /host ownership coordination was unavailable|currently owns/u,
+    `reclamation was skipped for the live replacement: ${result.stderr}`);
+  assert.ok(!result.stderr.includes("Node cache still holds"), "no reclamation ran beside the live holder");
+  for (const root of roots) assert.ok(existsSync(root), "no generation was pruned beside the live replacement");
+  assert.equal(nodeRoots(f).length, 8, "startup still created its own generation");
+  f.markAssertionsPassed();
+});
+
+test(".sh skips pruning when a session host appears during stale-owner lock recovery", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-ownership-stale-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const roots = seedNodeLegacy(f, "legacy", 5);
+  const lock = join(nodeCache(f), ".admission.lock");
+  writeFileSync(lock, "999999999\n", { mode: 0o600 });
+  const ownership = join(f.agentDir, "session-host", "host-ownership.json");
+  const result = runSh(f, ["--help"], {
+    PI_CODING_AGENT_DIR: f.agentDir,
+    FAKE_LOCK_PATH: lock,
+    FAKE_LOCK_COUNTER: join(f.root, "lock-observations.txt"),
+    FAKE_OWNERSHIP_RECORD: ownership,
+    FAKE_OWNERSHIP_AT: "1",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /a session host currently owns the agent directory/);
+  assert.doesNotMatch(result.stderr, /capacity exhausted/);
+  for (const root of roots) assert.ok(existsSync(root), "no generation was pruned after the ownership recheck");
+  assert.equal(nodeRoots(f).length, 6, "the competing launch still created its own generation");
+  assert.equal(existsSync(lock), false, "the stale lock artifact itself was still reclaimed");
+  f.markAssertionsPassed();
+});
+
+test(".sh skips pruning when a session host appears during malformed-lock recovery", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-ownership-malformed-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const roots = seedNodeLegacy(f, "legacy", 5);
+  const lock = join(nodeCache(f), ".admission.lock");
+  mkdirSync(lock, { recursive: true });
+  const ownership = join(f.agentDir, "session-host", "host-ownership.json");
+  const result = runSh(f, ["--help"], {
+    PI_CODING_AGENT_DIR: f.agentDir,
+    FAKE_LOCK_PATH: lock,
+    FAKE_LOCK_COUNTER: join(f.root, "lock-observations.txt"),
+    FAKE_OWNERSHIP_RECORD: ownership,
+    FAKE_OWNERSHIP_AT: "3",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /a session host currently owns the agent directory/);
+  for (const root of roots) assert.ok(existsSync(root), "the recovery window did not cost a host generation");
+  assert.equal(existsSync(lock), false, "the malformed artifact itself was still reclaimed");
+  assert.equal(nodeRoots(f).length, 6, "the competing launch still created its own generation");
+  f.markAssertionsPassed();
+});
+
+test(".sh destructive contention with a real host acquisition is serialized past the old bypass", { skip: isWindows, timeout: 120_000 }, async (t) => {
+  const f = makeEntrypointFixture(".node-coordination-contention-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const cache = nodeCache(f);
+  const roots = seedNodeLegacy(f, "legacy", 7);
+  const outside = join(f.root, "outside-sentinel");
+  writeFileSync(outside, "outside remains");
+  // The host's own prepared artifact lives in a generation the pass keeps; its
+  // presence is what this host verifies before claiming ownership.
+  const selectedFile = join(roots[6]!, "nested", "legacy-output.txt");
+  mkdirSync(join(roots[6]!, "nested"), { recursive: true });
+  writeFileSync(selectedFile, "selected artifact");
+  const holdLog = join(f.root, "hold.log");
+  writeFileSync(holdLog, "");
+  const holdMarker = join(f.root, "hold.marker");
+  const holdRelease = join(f.root, "hold.release");
+  const orderLog = join(f.root, "order.log");
+  writeFileSync(orderLog, "");
+  const rosterStorePath = join(process.cwd(), "dist-test", "src", "session-host", "roster-store.js");
+  const hostScript = join(f.root, "host-acquire.cjs");
+  writeFileSync(hostScript, [
+    `const fs = require("node:fs");`,
+    `const { openHostState } = require(${JSON.stringify(rosterStorePath)});`,
+    `const append = (line) => fs.appendFileSync(process.argv[3], line + "\\n");`,
+    `append("ACQUIRE-START");`,
+    `const opened = openHostState({`,
+    `  agentDir: process.argv[2],`,
+    `  hostId: "wrapper-contention-host",`,
+    `  verify: () => fs.existsSync(process.argv[4]),`,
+    `});`,
+    `append("OWNED:" + opened.status);`,
+    `if (opened.status !== "opened") process.exit(2);`,
+    `const deadline = Date.now() + 60000;`,
+    `while (!fs.existsSync(process.argv[5]) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);`,
+    `append("RELEASE:" + opened.state.release());`,
+    ``,
+  ].join("\n"), "utf8");
+  const env = entrypointEnv(f, {
+    PI_CODING_AGENT_DIR: f.agentDir,
+    FAKE_HOLD_TRIGGER: roots[1]!,
+    FAKE_HOLD_DONE: holdMarker,
+    FAKE_HOLD_RELEASE: holdRelease,
+    FAKE_HOLD_LOG: holdLog,
+    FAKE_OWNERSHIP_RECORD: join(f.agentDir, "session-host", "host-ownership.json"),
+  });
+  const producer = spawn("/bin/bash", [shPath, "--help"], { cwd: process.cwd(), env, stdio: ["ignore", "ignore", "pipe"] });
+  let producerStderr = "";
+  producer.stderr!.setEncoding("utf8");
+  producer.stderr!.on("data", (chunk: string) => { producerStderr += chunk; });
+  const waitForFile = async (file: string): Promise<void> => {
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      if (existsSync(file)) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`timed out waiting for ${file}: ${producerStderr}`);
+  };
+  const waitForLine = async (file: string, needle: string): Promise<void> => {
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      if (existsSync(file) && readFileSync(file, "utf8").includes(needle)) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`timed out waiting for ${needle}`);
+  };
+  try {
+    await waitForFile(holdMarker);
+    const hostRelease = join(f.root, "host.release");
+    const host = spawn(process.execPath, [hostScript, f.agentDir, orderLog, selectedFile, hostRelease], { stdio: ["ignore", "ignore", "inherit"] });
+    try {
+      await waitForLine(orderLog, "ACQUIRE-START");
+      // The real .sh producer holds the coordination entry inside its destructive
+      // pass, for longer than the previous short acquisition bypass.
+      await waitForLine(holdLog, "ownership-during-hold:");
+      assert.match(readFileSync(holdLog, "utf8"), /ownership-during-hold:false/,
+        "ownership is not claimed while the native wrapper owns the destructive critical section");
+      assert.equal(existsSync(join(f.agentDir, "session-host", "host-ownership.json")), false);
+      writeFileSync(holdRelease, "release");
+      await waitForLine(holdLog, "hold-released");
+      await waitForLine(orderLog, "OWNED:opened");
+      if (producer.exitCode === null) {
+        await new Promise<void>((resolve) => producer.once("exit", () => resolve()));
+      }
+      assert.equal(producer.exitCode, 0, producerStderr);
+      assert.ok(existsSync(selectedFile), "the host's selected artifact survives the contended destructive pass");
+      await waitForLine(orderLog, "OWNED:opened");
+      const ordered = readFileSync(orderLog, "utf8").trim().split("\n");
+      assert.ok(ordered.indexOf("ACQUIRE-START") < ordered.indexOf("OWNED:opened"),
+        "the host reached acquisition before ownership was granted");
+      assert.equal(existsSync(join(f.agentDir, "session-host", "host-coordination.lock")), false,
+        "the wrapper released the coordination entry when its critical section ended");
+      // While this host owns the directory, a further producer pass never prunes.
+      const before = nodeRoots(f).map((root) => {
+        const stats = lstatSync(root);
+        return { root, id: `${stats.dev}:${stats.ino}` };
+      });
+      const second = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+      assert.equal(second.status, 0, second.stderr);
+      assert.match(second.stderr, /a session host currently owns the agent directory/);
+      assert.doesNotMatch(second.stderr, /capacity exhausted/);
+      for (const entry of before) {
+        const stats = lstatSync(entry.root);
+        assert.equal(`${stats.dev}:${stats.ino}`, entry.id,
+          `the owned generation ${entry.root} keeps its identity while a host owns the directory`);
+      }
+      assert.equal(readFileSync(outside, "utf8"), "outside remains", "outside sentinels stay intact");
+      writeFileSync(hostRelease, "release");
+      await waitForLine(orderLog, "RELEASE:");
+      assert.match(readFileSync(orderLog, "utf8"), /RELEASE:true/, "the host releases only its own record");
+      f.markAssertionsPassed();
+    } finally {
+      writeFileSync(hostRelease, "release");
+      producer.kill("SIGKILL");
+      host.kill("SIGKILL");
+    }
+  } finally {
+    writeFileSync(holdRelease, "release");
+  }
+});
+
+test(".sh stops reclamation at the boundary when a session host appears mid-cleanup", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-ownership-boundary-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const roots = seedNodeLegacy(f, "legacy", 7);
+  const ownership = join(f.agentDir, "session-host", "host-ownership.json");
+  const outside = join(f.root, "outside-sentinel");
+  writeFileSync(outside, "outside remains");
+  symlinkSync(outside, join(roots[0]!, "outside-link"));
+  const result = runSh(f, ["--help"], {
+    PI_CODING_AGENT_DIR: f.agentDir,
+    FAKE_OWNERSHIP_RECORD: ownership,
+    FAKE_OWNERSHIP_TRIGGER: roots[1]!,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /acquired the agent directory during cleanup/);
+  assert.equal(existsSync(roots[0]!), false, "the generation already authorized was reclaimed without following its link");
+  assert.equal(existsSync(roots[1]!), false, "the generation whose identity triggered ownership was reclaimed");
+  for (const root of roots.slice(2)) assert.ok(existsSync(root), "the remaining generations survive the boundary stop");
+  assert.equal(readFileSync(outside, "utf8"), "outside remains", "outside sentinels are untouched");
+  assert.equal(nodeRoots(f).length, 6, "startup still created its own generation");
+  assert.equal(existsSync(join(f.agentDir, "session-host", "host-coordination.lock")), false,
+    "the coordination entry is released, never left as a startup gate");
+  f.markAssertionsPassed();
+});
+
 for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"] as const) {
   test(`.sh forwards wrapper-PID-only ${signal} and waits for exact child exit`, { skip: isWindows, timeout: 30_000 }, async (t) => {
     const f = makeEntrypointFixture(".node-supervisor-signal-");
@@ -1053,7 +1365,7 @@ test("native Windows cleanup failures warn and still create a fresh generation",
   // lock handling and generation creation run unchanged.
   const source = readFileSync(psPath, "utf8")
     .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'")
-    .replace("          $entries = @([IO.Directory]::EnumerateFileSystemEntries($Root))", "          throw 'synthetic inventory failure'");
+    .replace("      $entries = @([IO.Directory]::EnumerateFileSystemEntries($Root))", "      throw 'synthetic inventory failure'");
   assert.notEqual(source, readFileSync(psPath, "utf8"));
   writeFileSync(helper, source);
   const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
@@ -1100,6 +1412,301 @@ test("native Windows reclaims a directory-shaped cache lock and prunes to five",
   assert.equal(existsSync(join(cache, ".admission.lock")), false, "the directory-shaped lock is gone");
   assert.equal(nodeRoots(f).length, 5, "exactly five generations remain: one legacy reclaimed, one fresh created");
   assert.ok(legacy.some((root) => !existsSync(root)), "an actual legacy generation was reclaimed");
+  assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 1, "startup reached the download");
+  f.markAssertionsPassed();
+});
+
+// #385 coordination boundary (native Windows): ownership acquisition and
+// destructive cache reclamation take one canonical per-agent entry. These cases
+// substitute a single source line so a host ownership record appears at a
+// deterministic point in the real producer path; they run only in the native
+// Windows CI job (session-host-entrypoints.test.js), never on a POSIX runner.
+const PS_OWNERSHIP_PUBLISH = 'if (-not [IO.File]::Exists($env:FAKE_OWNERSHIP_RECORD)) { [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($env:FAKE_OWNERSHIP_RECORD)) | Out-Null; [IO.File]::WriteAllText($env:FAKE_OWNERSHIP_RECORD, \'{"version":1,"hostId":"fixture-owner"}\') }';
+const PS_OWNERSHIP_TRIGGER = 'if (-not [IO.File]::Exists($env:FAKE_OWNERSHIP_TRIGGER) -and $name -ceq $env:FAKE_OWNERSHIP_NAME) { [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($env:FAKE_OWNERSHIP_TRIGGER)) | Out-Null; [IO.File]::WriteAllText($env:FAKE_OWNERSHIP_TRIGGER, \'{"version":1,"hostId":"fixture-owner"}\') }';
+
+function writeWindowsFixtureHelper(f: EntrypointFixture, extraReplacements: Array<[string, string]>): { helper: string; downloads: string; powershell: string; env: NodeJS.ProcessEnv } {
+  const downloads = join(f.root, "download-witness");
+  const helper = join(f.root, "bootstrap.ps1");
+  let source = readFileSync(psPath, "utf8")
+    .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'");
+  for (const [from, to] of extraReplacements) {
+    assert.ok(source.includes(from), `the substituted producer line is still present: ${from}`);
+    source = source.replace(from, to);
+  }
+  assert.notEqual(source, readFileSync(psPath, "utf8"));
+  writeFileSync(helper, source);
+  const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
+  return { helper, downloads, powershell, env };
+}
+
+test("native Windows skips pruning when a session host appears during admission-lock recovery", { skip: !isWindows, timeout: 60_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-ownership-windows-recovery-");
+  cleanupFixture(t, f);
+  const cache = nodeCache(f);
+  mkdirSync(join(cache, ".admission.lock"), { recursive: true });
+  const legacy: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    const root = join(cache, `bootstrap.legacy-${i}`);
+    mkdirSync(root, { recursive: true });
+    legacy.push(root);
+  }
+  const ownership = join(f.agentDir, "session-host", "host-ownership.json");
+  const { helper, downloads, powershell, env } = writeWindowsFixtureHelper(f, [[
+    "          $lockAttributes = Get-ExistingAttributes $lockPath",
+    `          ${PS_OWNERSHIP_PUBLISH}\n          $lockAttributes = Get-ExistingAttributes $lockPath`,
+  ]]);
+  const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
+    env: { ...env, FAKE_OWNERSHIP_RECORD: ownership }, cwd: f.root, encoding: "utf8", timeout: 20_000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /a session host currently owns the agent directory/);
+  assert.doesNotMatch(result.stderr, /capacity exhausted/);
+  for (const root of legacy) assert.ok(existsSync(root), "no generation was pruned after the ownership recheck");
+  assert.equal(nodeRoots(f).length, 6, "the competing launch still created its own generation");
+  assert.equal(existsSync(join(cache, ".admission.lock")), false, "the malformed lock artifact itself was still reclaimed");
+  assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 1, "startup reached the download");
+  f.markAssertionsPassed();
+});
+
+// #385 canonical mutex, native Windows: CJS/TypeScript records must carry a real
+// `win32:<StartTime>` birth identity (never a pid-only record), and a live pid with
+// a mismatched birth identity must not block startup. These run only in the native
+// Windows CI job.
+const CJS_GENERATIONS = resolve("scripts/managed-generations.cjs");
+const ROSTER_STORE = resolve("dist-test/src/session-host/roster-store.js");
+
+function runNode(script: string, args: string[], env: NodeJS.ProcessEnv = {}): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync(process.execPath, ["-e", script, ...args], {
+    encoding: "utf8",
+    timeout: 60_000,
+    env: { ...process.env, ...env },
+  });
+  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+test("native Windows identity queries use a parameterized script block for one known pid", { skip: !isWindows, timeout: 60_000 }, (t) => {
+  const cjs = readFileSync(CJS_GENERATIONS, "utf8");
+  const host = readFileSync(resolve("src/session-host/roster-store.ts"), "utf8");
+  for (const [label, source] of [["CJS", cjs], ["TypeScript host", host]] as const) {
+    assert.match(source, /& \{ param\(\[int\]\$OwnerPid\)/u,
+      `${label}: the query is invoked as a parameterized script block`);
+    assert.match(source, /Get-Process -Id \$OwnerPid/u,
+      `${label}: the query uses its script-block parameter, not -Command positional text`);
+    assert.doesNotMatch(source, /\[int\]\$args\[0\]/u,
+      `${label}: the appended pid is never interpreted as -Command text`);
+  }
+  // The current pid resolves through the real query and round-trips.
+  const script = [
+    `const generations = require(${JSON.stringify(CJS_GENERATIONS)});`,
+    `process.stdout.write(JSON.stringify({`,
+    `  own: generations.coordinationInternals.ownOwnerIdentity(),`,
+    `  again: generations.coordinationInternals.ownerStartIdentity(process.pid),`,
+    `}));`,
+    ``,
+  ].join("\n");
+  const result = runNode(script, []);
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout.trim()) as { own: string; again: string };
+  assert.match(parsed.own, /^win32:\d{4}-\d{2}-\d{2}T/u, "the current pid's identity resolves through the script block");
+  assert.equal(parsed.again, parsed.own, "the same pid round-trips through the query");
+  // A foreign live pid also resolves.
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  try {
+    const foreignScript = [
+      `const generations = require(${JSON.stringify(CJS_GENERATIONS)});`,
+      `process.stdout.write(generations.coordinationInternals.ownerStartIdentity(Number(process.argv[1])));`,
+      ``,
+    ].join("\n");
+    const foreign = runNode(foreignScript, [String(holder.pid)]).stdout.trim();
+    assert.match(foreign, /^win32:\d{4}-\d{2}-\d{2}T/u, `a foreign live pid resolves: ${JSON.stringify(foreign)}`);
+  } finally {
+    holder.kill("SIGKILL");
+  }
+});
+
+test("native Windows stale recovery never reclaims a live replacement coordination record", { skip: !isWindows, timeout: 90_000 }, (t) => {
+  const f = makeEntrypointFixture(".coord-replacement-windows-");
+  cleanupFixture(t, f);
+  const cache = nodeCache(f);
+  const stateDir = join(f.agentDir, "session-host");
+  mkdirSync(stateDir, { recursive: true });
+  const entry = join(stateDir, "host-coordination.lock");
+  // A stale record (dead pid) that recovery judges stale.
+  writeFileSync(entry, "999999999\nwin32:1999-01-01T00:00:00.0000000Z\n", "utf8");
+  const legacy: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    const root = join(cache, `bootstrap.legacy-${i}`);
+    mkdirSync(root, { recursive: true });
+    legacy.push(root);
+  }
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  try {
+    // The replacement appears exactly between the entry-identity capture and the
+    // owner read: the window the ordering fix closes.
+    const { helper, downloads, powershell, env } = writeWindowsFixtureHelper(f, [[
+      "    try { $current = Get-PathIdentity $path } catch { $current = $null }",
+      "    if (-not $script:CoordReplaced -and $env:FAKE_COORDINATION_REPLACEMENT) { $script:CoordReplaced = $true; $replacement = [int]$env:FAKE_COORDINATION_REPLACEMENT; [IO.File]::Delete($path); [IO.File]::WriteAllText($path, [string]$replacement + \"`n\" + (Get-NodeOwnerIdentity $replacement) + \"`n\") }\n    try { $current = Get-PathIdentity $path } catch { $current = $null }",
+    ]]);
+    const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
+      env: { ...env, FAKE_COORDINATION_REPLACEMENT: String(holder.pid) }, cwd: f.root, encoding: "utf8", timeout: 30_000,
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.doesNotMatch(result.stderr, /capacity exhausted/u);
+    const record = readFileSync(entry, "utf8").split(/\r?\n/u);
+    assert.equal(record[0]!.trim(), String(holder.pid), "the live replacement record survives, unclaimed");
+    assert.match((record[1] ?? "").trim(), /^win32:\d{4}-\d{2}-\d{2}T/u,
+      "the replacement keeps its own birth identity");
+    assert.match(result.stderr, /host ownership coordination was unavailable|currently owns/u,
+      `reclamation was skipped for the live replacement: ${result.stderr}`);
+    for (const root of legacy) assert.ok(existsSync(root), "no generation was pruned beside the live replacement");
+    assert.equal(nodeRoots(f).length, 6, "startup still created its own generation");
+    assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 1, "startup reached the download");
+  } finally {
+    holder.kill("SIGKILL");
+  }
+  f.markAssertionsPassed();
+});
+
+test("native Windows coordination records from the CJS producer carry a win32 birth identity", { skip: !isWindows, timeout: 60_000 }, (t) => {
+  const f = makeEntrypointFixture(".coord-identity-cjs-windows-");
+  cleanupFixture(t, f);
+  mkdirSync(join(f.agentDir, "session-host"), { recursive: true });
+  const script = [
+    `const fs = require("node:fs");`,
+    `const path = require("node:path");`,
+    `const generations = require(${JSON.stringify(CJS_GENERATIONS)});`,
+    `const lease = generations.holdAgentDirectory(process.argv[1]);`,
+    `if (!lease) { process.stdout.write("no-lease"); process.exit(2); }`,
+    `const entry = path.join(process.argv[1], "session-host", generations.COORDINATION);`,
+    `process.stdout.write(fs.readFileSync(entry, "utf8"));`,
+    `lease.release();`,
+    ``,
+  ].join("\n");
+  const result = runNode(script, [f.agentDir]);
+  assert.equal(result.status, 0, result.stderr);
+  const lines = result.stdout.trim().split(/\r?\n/u);
+  assert.match(result.stdout, /^[1-9][0-9]*\r?\n/u, "the record's first line is the owning pid");
+  assert.match(lines[1] ?? "", /^win32:\d{4}-\d{2}-\d{2}T/u,
+    `the CJS record carries a real win32 birth identity, never a bare pid: ${JSON.stringify(lines[1])}`);
+  assert.equal(existsSync(join(f.agentDir, "session-host", "host-coordination.lock")), false, "the lease released its own record");
+  f.markAssertionsPassed();
+});
+
+test("native Windows coordination records from the TypeScript host carry a win32 birth identity", { skip: !isWindows, timeout: 60_000 }, (t) => {
+  const f = makeEntrypointFixture(".coord-identity-host-windows-");
+  cleanupFixture(t, f);
+  const stateDir = join(f.agentDir, "session-host");
+  mkdirSync(stateDir, { recursive: true });
+  const script = [
+    `const fs = require("node:fs");`,
+    `const path = require("node:path");`,
+    `const store = require(${JSON.stringify(ROSTER_STORE)});`,
+    `const published = store.publishHostCoordinationRecord(process.argv[1]);`,
+    `const entry = path.join(process.argv[1], store.HOST_COORDINATION_FILENAME);`,
+    `process.stdout.write(String(published) + "\\n" + (fs.existsSync(entry) ? fs.readFileSync(entry, "utf8") : ""));`,
+    ``,
+  ].join("\n");
+  const result = runNode(script, [stateDir]);
+  assert.equal(result.status, 0, result.stderr);
+  const [publishedLine, pidLine, identityLine] = result.stdout.trim().split(/\r?\n/u);
+  assert.equal(publishedLine!.trim(), "true", "the host publishes the coordination record");
+  assert.match(pidLine ?? "", /^[1-9][0-9]*$/u, "the record's first line is the owning pid");
+  assert.match(identityLine ?? "", /^win32:\d{4}-\d{2}-\d{2}T/u,
+    `the TypeScript record carries a real win32 birth identity, never a bare pid: ${JSON.stringify(identityLine)}`);
+  f.markAssertionsPassed();
+});
+
+test("native Windows reused-pid coordination metadata never blocks startup", { skip: !isWindows, timeout: 90_000 }, (t) => {
+  const f = makeEntrypointFixture(".coord-reused-pid-windows-");
+  cleanupFixture(t, f);
+  const stateDir = join(f.agentDir, "session-host");
+  mkdirSync(stateDir, { recursive: true });
+  const entry = join(stateDir, "host-coordination.lock");
+  // A live process whose record names a birth identity that is not its own is the
+  // reused-pid case: it must be reclaimed promptly, not honored forever.
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  try {
+    const script = [
+      `const store = require(${JSON.stringify(ROSTER_STORE)});`,
+      `const started = Date.now();`,
+      `const opened = store.openHostState({ agentDir: process.argv[1], hostId: "reused-pid" });`,
+      `process.stdout.write(JSON.stringify({ status: opened.status, elapsed: Date.now() - started }) + "\\n");`,
+      `if (opened.status === "opened") opened.state.release();`,
+      ``,
+    ].join("\n");
+    // Correct-birth control: the same live pid with its real identity is honored.
+    const identityScript = [
+      `const generations = require(${JSON.stringify(CJS_GENERATIONS)});`,
+      `process.stdout.write(generations.coordinationInternals.ownerStartIdentity(Number(process.argv[1])));`,
+      ``,
+    ].join("\n");
+    const identity = runNode(identityScript, [String(holder.pid)]).stdout.trim();
+    assert.match(identity, /^win32:\d{4}-\d{2}-\d{2}T/u,
+      `the CJS query yields the live pid's real birth identity: ${JSON.stringify(identity)}`);
+    writeFileSync(entry, `${holder.pid}\nwin32:1999-01-01T00:00:00.0000000Z\n`, "utf8");
+    const mismatched = runNode(script, [f.agentDir]);
+    assert.equal(mismatched.status, 0, mismatched.stderr);
+    const mismatchedResult = JSON.parse(mismatched.stdout.trim()) as { status: string; elapsed: number };
+    assert.equal(mismatchedResult.status, "opened", "a reused pid with a wrong birth identity never gates ownership");
+    assert.ok(mismatchedResult.elapsed < 10_000, `the stale record was reclaimed promptly (${mismatchedResult.elapsed}ms)`);
+    assert.equal(existsSync(entry), false, "the stale record itself is gone");
+    // The same live pid with its real birth identity is a current holder: the
+    // producer admission then leaves the cache untouched instead of reclaiming.
+    writeFileSync(entry, `${holder.pid}\n${identity}\n`, "utf8");
+    const legacy = nodeRoots(f);
+    assert.ok(legacy.length >= 0);
+    const admitScript = [
+      `const fs = require("node:fs");`,
+      `const path = require("node:path");`,
+      `const generations = require(${JSON.stringify(CJS_GENERATIONS)});`,
+      `const warnings = [];`,
+      `const cache = path.join(process.argv[1], ".pi-review-gate", "node");`,
+      `fs.mkdirSync(cache, { recursive: true });`,
+      `const stage = generations.admit(cache, () => ({ root: fs.mkdtempSync(path.join(cache, "bootstrap.")) }), { warn: (warning) => warnings.push(warning) });`,
+      `stage.generation.release();`,
+      `process.stdout.write(JSON.stringify(warnings) + "\\n");`,
+      ``,
+    ].join("\n");
+    const honored = runNode(admitScript, [f.agentDir]);
+    assert.equal(honored.status, 0, honored.stderr);
+    const honoredWarnings = JSON.parse(honored.stdout.trim()) as string[];
+    assert.ok(honoredWarnings.some((warning) => warning.includes("host ownership coordination")),
+      `the current holder is honored on Windows too: ${honoredWarnings.join(" | ")}`);
+  } finally {
+    holder.kill("SIGKILL");
+  }
+  f.markAssertionsPassed();
+});
+
+test("native Windows stops reclamation at the boundary when a session host appears mid-cleanup", { skip: !isWindows, timeout: 60_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-ownership-windows-boundary-");
+  cleanupFixture(t, f);
+  const cache = nodeCache(f);
+  const legacy: string[] = [];
+  for (let i = 0; i < 7; i++) {
+    const root = join(cache, `bootstrap.legacy-${i}`);
+    mkdirSync(root, { recursive: true });
+    legacy.push(root);
+  }
+  const outside = join(f.root, "outside");
+  mkdirSync(outside);
+  writeFileSync(join(outside, "sentinel"), "outside");
+  symlinkSync(outside, join(legacy[0]!, "junction"), "junction");
+  const trigger = join(f.agentDir, "session-host", "host-ownership.json");
+  const { helper, downloads, powershell, env } = writeWindowsFixtureHelper(f, [[
+    "      if (Remove-NodeEntry $entry 0) { $count-- }",
+    `      ${PS_OWNERSHIP_TRIGGER}\n      if (Remove-NodeEntry $entry 0) { $count-- }`,
+  ]]);
+  const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
+    env: { ...env, FAKE_OWNERSHIP_TRIGGER: trigger, FAKE_OWNERSHIP_NAME: "bootstrap.legacy-1" }, cwd: f.root, encoding: "utf8", timeout: 20_000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /acquired the agent directory during cleanup/);
+  assert.equal(existsSync(legacy[0]!), false, "the generation already authorized was reclaimed without entering its junction");
+  assert.equal(existsSync(legacy[1]!), false, "the generation whose identity triggered ownership was reclaimed");
+  for (const root of legacy.slice(2)) assert.ok(existsSync(root), "the remaining generations survive the boundary stop");
+  assert.deepEqual(readdirSync(outside), ["sentinel"], "nothing outside the cache is touched");
   assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 1, "startup reached the download");
   f.markAssertionsPassed();
 });

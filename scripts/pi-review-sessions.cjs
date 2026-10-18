@@ -2910,6 +2910,19 @@ async function resolvePiRuntime(options) {
       if (!head || head.length < 2 || !isNodeEntryShebang(head)) {
         throw new PiRuntimeError(`the configured pi executable is not a positive Node entry (expected the standard npm-installed pi CLI entry file): ${canonical}`);
       }
+      // A selection inside a managed `pi-runtime` generation is validated by the
+      // same package authority used for installed packages: a partially reclaimed
+      // generation that still has a runnable CLI must not be accepted. Unmanaged
+      // explicit selections keep the CLI/version behavior unchanged.
+      const managed = managedPiGeneration(canonical);
+      if (managed) {
+        const pkgDir = path.join(managed.root, "node_modules", "@earendil-works", "pi-coding-agent");
+        assertDirectoryChain(managed.root, path.dirname(pkgDir));
+        return {
+          ...await validatePiPackage(pkgDir, env, { expectedFile: canonical, processRunner: runner }),
+          source: "explicit",
+        };
+      }
       const version = await probePiVersion(canonical, env, runner);
       return { file: canonical, version, source: "explicit" };
     });
@@ -3358,72 +3371,147 @@ async function runSessionHostLauncher(argv, overrides = {}) {
     return 1;
   }
 
-  // Recheck after DDGS and before require. A changed cache is rebuilt privately;
-  // DDGS is then revalidated against the replacement package root.
-  const afterDdgs = await refreshSourceBuildIfNeeded();
-  if (!afterDdgs.ok) return 1;
-  if (afterDdgs.changed) {
-    ddgsAttempt = await ensureDdgsForRoot(hostPackageRoot);
-    if (ddgsAttempt.error) {
-      deps.writeError("pi-review-sessions: DDGS setup failed.\n");
-      return 1;
-    }
-    ddgs = ddgsAttempt.result;
-    if (!ddgs || ddgs.cleanupUnconfirmed || ddgs.ok !== true || typeof ddgs.python !== "string") {
-      deps.writeError("pi-review-sessions: DDGS setup failed.\n");
-      return ddgs && Number.isInteger(ddgs.exitCode) ? ddgs.exitCode : 1;
-    }
-    python = ddgs.python;
-    if (python.length > MAX_PATH_LENGTH || !path.isAbsolute(python) || /[\u0000-\u001f\u007f]/u.test(python)) {
-      deps.writeError("pi-review-sessions: DDGS setup failed.\n");
-      return 1;
-    }
-    if (sourceBuildNeedsFresh()) {
-      deps.writeError("pi-review-sessions: source build changed during final startup validation.\n");
-      return 1;
-    }
+  // Coordinated selection/preparation handoff to host ownership (issue 385): take
+  // the canonical per-agent coordination entry BEFORE the final selection
+  // revalidation, the host-entry load, and the host's ownership claim, and hand it
+  // back once the host's exclusive ownership record exists (the host releases the
+  // entry it finds held by this same process). Another preparation therefore
+  // cannot reclaim the selection this launch is handing over. A live destructive
+  // holder is waited for, not bypassed; a genuine unremovable-artifact/IO failure
+  // proceeds truthfully, because the ownership record itself stops producer
+  // removals at every destructive boundary.
+  const handoff = generations.holdAgentDirectory(agentDir);
+  if (!handoff) {
+    deps.writeError("pi-review-sessions: per-agent cache coordination was unavailable; this launch continues and the host's ownership record still stops cache reclamation once it exists.\n");
   }
-
-  // Wrapper-equivalent shipped-skill provisioning (issue 378): the direct
-  // sidebar entry points prepare the discoverable skills themselves — no
-  // wrapper prerequisite. Runs after the final build/DDGS revalidation so it
-  // publishes from the exact package root the host will load.
-  const skills = deps.refreshShippedSkills(hostPackageRoot, homeDir);
-  if (!skills || skills.ok !== true) {
-    const detail = skills && typeof skills.error === "string" ? `: ${skills.error}` : "";
-    deps.writeError(`pi-review-sessions: shipped skill provisioning failed${detail}.\n`);
-    return 1;
-  }
-
-  const hostEnv = { ...setupEnv, PI_REVIEW_GATE_DDGS_PYTHON: python };
-  let hostModule;
+  // The handoff is released only by the ownership claim itself or by this
+  // launcher's own exit: an elapsed timer must never hand back the entry while
+  // preparation (final rebuild, DDGS setup, runtime reselection) is still active.
   try {
-    hostModule = deps.loadMain(compiledEntry);
-  } catch {
+    // Recheck after DDGS and before require. A changed cache is rebuilt privately;
+    // DDGS is then revalidated against the replacement package root.
+    const afterDdgs = await refreshSourceBuildIfNeeded();
+    if (!afterDdgs.ok) return 1;
+    if (afterDdgs.changed) {
+      ddgsAttempt = await ensureDdgsForRoot(hostPackageRoot);
+      if (ddgsAttempt.error) {
+        deps.writeError("pi-review-sessions: DDGS setup failed.\n");
+        return 1;
+      }
+      ddgs = ddgsAttempt.result;
+      if (!ddgs || ddgs.cleanupUnconfirmed || ddgs.ok !== true || typeof ddgs.python !== "string") {
+        deps.writeError("pi-review-sessions: DDGS setup failed.\n");
+        return ddgs && Number.isInteger(ddgs.exitCode) ? ddgs.exitCode : 1;
+      }
+      python = ddgs.python;
+      if (python.length > MAX_PATH_LENGTH || !path.isAbsolute(python) || /[\u0000-\u001f\u007f]/u.test(python)) {
+        deps.writeError("pi-review-sessions: DDGS setup failed.\n");
+        return 1;
+      }
+      if (sourceBuildNeedsFresh()) {
+        deps.writeError("pi-review-sessions: source build changed during final startup validation.\n");
+        return 1;
+      }
+    }
+
+    // Wrapper-equivalent shipped-skill provisioning (issue 378): the direct
+    // sidebar entry points prepare the discoverable skills themselves — no
+    // wrapper prerequisite. Runs after the final build/DDGS revalidation so it
+    // publishes from the exact package root the host will load.
+    const skills = deps.refreshShippedSkills(hostPackageRoot, homeDir);
+    if (!skills || skills.ok !== true) {
+      const detail = skills && typeof skills.error === "string" ? `: ${skills.error}` : "";
+      deps.writeError(`pi-review-sessions: shipped skill provisioning failed${detail}.\n`);
+      return 1;
+    }
+
+    // Re-enter the launcher's normal validated selection for a managed Pi runtime
+    // inside the same hold. The existing resolver/validator (managed generation
+    // confinement, package/version validation, and the pinned CLI's own version
+    // probe) rejects a partially reclaimed generation instead of trusting a
+    // surviving CLI name, and a replacement is prepared through the existing
+    // selection path. Installed, PATH, and user-explicit selections are unchanged,
+    // no build inventory is added, and no last-moment startup refusal is created.
+    // The running Node itself is already protected for this session by the
+    // bootstrap producer's transient live generation marker.
+    if (managedPiGeneration(piRuntime.file)) {
+      deps.writeError("pi-review-sessions: validating and preparing the Pi runtime again inside the ownership handoff\n");
+      let resolved;
+      try {
+        resolved = await deps.resolvePiRuntime({
+          explicit: piRuntime.file,
+          env: setupEnv,
+          agentDir,
+          cwd: deps.cwd,
+          writeError: (text) => deps.writeError(text),
+        });
+      } catch (error) {
+        if (error && error.cleanupUnconfirmed) {
+          // The probe's termination was not confirmed: fail closed instead of
+          // re-preparing (which could reclaim a still-running runtime).
+          deps.writeError("pi-review-sessions: Pi runtime validation cleanup was not confirmed; preserving its runtime.\n");
+          return 1;
+        }
+        resolved = undefined;
+      }
+      if (!resolved) {
+        try {
+          resolved = await deps.resolvePiRuntime({
+            explicit: parsed.piExecutable,
+            env: setupEnv,
+            agentDir,
+            cwd: deps.cwd,
+            writeError: (text) => deps.writeError(text),
+          });
+        } catch (error) {
+          const message = error instanceof PiRuntimeError ? error.message : "Pi runtime selection failed.";
+          deps.writeError(`pi-review-sessions: ${message}\n`);
+          return 1;
+        }
+      }
+      piRuntime = resolved;
+    }
+    if (!piRuntime || typeof piRuntime.file !== "string" || piRuntime.file.length > MAX_PATH_LENGTH
+      || !path.isAbsolute(piRuntime.file) || typeof piRuntime.version !== "string" || piRuntime.version.length > 64) {
+      deps.writeError("pi-review-sessions: Pi runtime selection failed.\n");
+      return 1;
+    }
+
+    const hostEnv = { ...setupEnv, PI_REVIEW_GATE_DDGS_PYTHON: python };
+    let hostModule;
+    try {
+      hostModule = deps.loadMain(compiledEntry);
+    } catch {
+      deps.writeError("pi-review-sessions: native session host startup failed.\n");
+      return 1;
+    }
+    if (!hostModule || typeof hostModule.runSessionHost !== "function") {
+      deps.writeError("pi-review-sessions: native session host startup failed.\n");
+      return 1;
+    }
+
+    const hostOptions = {
+      packageRoot: hostPackageRoot,
+      piExecutable: piRuntime.file,
+      ...(parsed.stateRoot !== undefined ? { stateRoot: parsed.stateRoot } : {}),
+      ...(parsed.toggleKey !== undefined ? { toggleKey: parsed.toggleKey } : {}),
+      args: Object.freeze(parsed.args.slice()),
+      env: hostEnv,
+    };
+    try {
+      const status = await hostModule.runSessionHost(hostOptions);
+      if (Number.isInteger(status)) return status;
+    } catch {
+      // Do not expose arbitrary errors, argv, or native credentials in startup output.
+    }
     deps.writeError("pi-review-sessions: native session host startup failed.\n");
     return 1;
+  } finally {
+    // Hand the entry back unless the host already took it over when it created its
+    // ownership record; release is identity-guarded, so a taken-over entry is a
+    // no-op here.
+    handoff?.release();
   }
-  if (!hostModule || typeof hostModule.runSessionHost !== "function") {
-    deps.writeError("pi-review-sessions: native session host startup failed.\n");
-    return 1;
-  }
-
-  const hostOptions = {
-    packageRoot: hostPackageRoot,
-    piExecutable: piRuntime.file,
-    ...(parsed.stateRoot !== undefined ? { stateRoot: parsed.stateRoot } : {}),
-    ...(parsed.toggleKey !== undefined ? { toggleKey: parsed.toggleKey } : {}),
-    args: Object.freeze(parsed.args.slice()),
-    env: hostEnv,
-  };
-  try {
-    const status = await hostModule.runSessionHost(hostOptions);
-    if (Number.isInteger(status)) return status;
-  } catch {
-    // Do not expose arbitrary errors, argv, or native credentials in startup output.
-  }
-  deps.writeError("pi-review-sessions: native session host startup failed.\n");
-  return 1;
 }
 
 if (require.main === module) {

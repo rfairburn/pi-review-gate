@@ -12,10 +12,21 @@
 # confined to that exact cache metadata entry, so it never becomes a permanent
 # cleanup skip.
 # Active sessions are guarded by the session host's own ownership record, not
-# by these cache entries.
+# by these cache entries. Because a starting host creates that record while a
+# producer may already be authorized to reclaim, ownership acquisition and this
+# script's destructive reclamation both take ONE canonical per-agent
+# coordination entry (session-host/host-coordination.lock). Reclamation releases
+# it as soon as the fresh generation exists, rechecks the ownership record after
+# any wait/stale recovery and at every destructive boundary, and skips
+# reclamation entirely when that boundary is unavailable. The entry is a lock,
+# not a registry: a stale or malformed one is reclaimed like a stale admission
+# lock and can never become a startup gate.
 NODE_LOCK="$NODE_CACHE_ROOT/.admission.lock"
 NODE_OWNERSHIP_RECORD="${AGENT_DIR:-}/session-host/host-ownership.json"
+NODE_COORDINATION_DIR="${AGENT_DIR:-}/session-host"
+NODE_COORDINATION_LOCK="$NODE_COORDINATION_DIR/host-coordination.lock"
 NODE_LOCK_ID=''
+NODE_COORDINATION_ID=''
 NODE_LIMIT=5
 NODE_LOCK_ATTEMPTS=40
 NODE_FENCE_PATHS=()
@@ -181,10 +192,231 @@ node_unlock() {
   if [[ -n "${WORK_ROOT:-}" ]]; then
     "$NODE_UNLINK_BIN" "$WORK_ROOT/.producer-active" 2>/dev/null || true
   fi
+  node_coordination_release || true
   if [[ -n "$NODE_LOCK_ID" ]] && node_check_fence && assert_path_identity "$NODE_LOCK" "$NODE_LOCK_ID"; then
     "$NODE_UNLINK_BIN" "$NODE_LOCK" || return 1
     NODE_LOCK_ID=''
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Per-agent host-ownership coordination
+# ---------------------------------------------------------------------------
+# The session host creates its exclusive ownership record while a producer may
+# already be authorized to reclaim. Both take this one canonical per-agent
+# coordination entry, so destructive reclamation and ownership acquisition are
+# mutually exclusive in both directions. It is a mutex, not a registry, and it
+# uses the same protocol as the CJS, TypeScript, and PowerShell paths: the record
+# (`<pid>` plus a targeted single-pid start identity) is written COMPLETE to a
+# private candidate and then published with an atomic no-overwrite hard link, so a
+# reader never sees a half-written entry and a paused publisher only loses the
+# link race. Stale, dead, or reused-pid metadata is reclaimed; a current holder
+# is honored.
+node_host_owns_agent_directory() {
+  [[ -n "${AGENT_DIR:-}" ]] || return 1
+  [[ -e "$NODE_OWNERSHIP_RECORD" || -L "$NODE_OWNERSHIP_RECORD" ]]
+}
+node_check_coordination_dir() {
+  [[ -n "${AGENT_DIR:-}" && -d "$NODE_COORDINATION_DIR" && ! -L "$NODE_COORDINATION_DIR" ]]
+}
+# The private host state directory may be created empty for the coordination
+# entry; a linked or non-directory state path is never written through, and
+# cleanup is then simply skipped.
+node_coordination_ready() {
+  [[ -n "${AGENT_DIR:-}" && -d "$AGENT_DIR" ]] || return 1
+  if [[ -e "$NODE_COORDINATION_DIR" || -L "$NODE_COORDINATION_DIR" ]]; then
+    node_check_coordination_dir
+    return
+  fi
+  mkdir -m 700 "$NODE_COORDINATION_DIR" 2>/dev/null || true
+  node_check_coordination_dir
+}
+# Targeted single-pid process-start token (never a census). Empty when ps is
+# unavailable, in which case the pid rule alone applies.
+# One exact per-platform token, matching the CJS and TypeScript writers byte for
+# byte: `linux:<boot identity>:<starttime ticks>` from this single pid's
+# /proc/<pid>/stat (no procps needed), or `darwin:<ps lstart token>` from one
+# targeted ps query. Exactly one pid, never a census. An empty result means the
+# identity genuinely cannot be established: no record is published, and a record
+# without a birth identity is never honored.
+node_owner_identity() {
+  local pid="$1" boot='' output='' line='' rest='' fields=() words=()
+  [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]] || return 0
+  if [[ -r "/proc/$pid/stat" ]]; then
+    IFS= read -r line < "/proc/$pid/stat" 2>/dev/null || true
+    rest="${line##*\)}"
+    # /proc/<pid>/stat is whitespace-separated after `comm`; starttime is the 20th
+    # token there (field 22 overall), so ordinary word splitting is intended.
+    # shellcheck disable=SC2206
+    fields=($rest)
+    if [[ ${#fields[@]} -ge 20 ]] && [[ "${fields[19]}" =~ ^[0-9]{1,20}$ ]]; then
+      if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+        IFS= read -r boot < /proc/sys/kernel/random/boot_id 2>/dev/null || boot=''
+        [[ "$boot" =~ ^[0-9a-f-]{8,64}$ ]] || boot=''
+      fi
+      if [[ -z "$boot" && -r /proc/stat ]]; then
+        while IFS= read -r line; do
+          case "$line" in
+            btime\ *) boot="btime-${line#btime }"; break;;
+          esac
+        done < /proc/stat
+        [[ "$boot" =~ ^btime-[0-9]{1,12}$ ]] || boot=''
+      fi
+      if [[ -n "$boot" ]]; then
+        printf '%s' "linux:$boot:${fields[19]}"
+        return 0
+      fi
+    fi
+  fi
+  [[ -n "${NODE_PS_BIN:-}" ]] || return 0
+  output="$("$NODE_PS_BIN" -p "$pid" -o lstart= 2>/dev/null)" || return 0
+  read -r -a words <<< "$output" 2>/dev/null || true
+  [[ ${#words[@]} -gt 0 ]] || return 0
+  printf '%s' "darwin:${words[*]}"
+}
+node_coordination_entry_identity() {
+  local output
+  [[ -e "$NODE_COORDINATION_LOCK" || -L "$NODE_COORDINATION_LOCK" ]] || return 1
+  if [[ "$HOST_OS" == Darwin ]]; then
+    output="$("$STAT_BIN" -f '%d:%i' "$NODE_COORDINATION_LOCK" 2>/dev/null)" || return 1
+  else
+    output="$("$STAT_BIN" -c '%d:%i' "$NODE_COORDINATION_LOCK" 2>/dev/null)" || return 1
+  fi
+  [[ "$output" =~ ^[0-9]+:[1-9][0-9]*$ ]] || return 1
+  printf '%s' "$output"
+}
+# Read the record: pid on the first line, owner identity on the rest. Returns 1
+# for a missing/non-record shape (the caller then observes and reclaims).
+node_coordination_read() {
+  local size pid='' identity=''
+  [[ -f "$NODE_COORDINATION_LOCK" && ! -L "$NODE_COORDINATION_LOCK" ]] || return 1
+  if [[ "$HOST_OS" == Darwin ]]; then
+    size="$("$STAT_BIN" -f '%z' "$NODE_COORDINATION_LOCK" 2>/dev/null)" || return 1
+  else
+    size="$("$STAT_BIN" -c '%s' "$NODE_COORDINATION_LOCK" 2>/dev/null)" || return 1
+  fi
+  [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size <= 192 )) || return 1
+  # A published record is transiently nlink 2 while its candidate name exists.
+  local links
+  if [[ "$HOST_OS" == Darwin ]]; then links="$("$STAT_BIN" -f '%l' "$NODE_COORDINATION_LOCK" 2>/dev/null)"; else links="$("$STAT_BIN" -c '%h' "$NODE_COORDINATION_LOCK" 2>/dev/null)"; fi
+  [[ "$links" == 1 || "$links" == 2 ]] || return 1
+  # Two bounded builtin reads (no external helper): the published record is
+  # exactly `<pid>` then `<owner identity>`, both newline-terminated.
+  { IFS= read -r pid; IFS= read -r identity; } 2>/dev/null < "$NODE_COORDINATION_LOCK" || true
+  [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  NODE_COORDINATION_RECORD_PID="$pid"
+  NODE_COORDINATION_RECORD_IDENTITY="$identity"
+  return 0
+}
+# True only while the record's pid is alive AND still reports its start identity.
+node_coordination_owner_current() {
+  local pid="$NODE_COORDINATION_RECORD_PID" identity="$NODE_COORDINATION_RECORD_IDENTITY" observed
+  kill -0 "$pid" 2>/dev/null || return 1
+  # A record without a birth identity is never honored on any platform: pid-only
+  # metadata could otherwise be pinned forever behind an unrelated live process.
+  [[ -n "$identity" ]] || return 1
+  observed="$(node_owner_identity "$pid")"
+  [[ -n "$observed" && "$observed" == "$identity" ]]
+}
+node_coordination_reclaim() {
+  local expected="$1" current=''
+  [[ -n "$expected" ]] || return 1
+  node_check_coordination_dir || return 1
+  current="$(node_coordination_entry_identity)" || return 1
+  [[ "$current" == "$expected" ]] || return 0
+  if [[ -L "$NODE_COORDINATION_LOCK" ]]; then
+    "$NODE_UNLINK_BIN" "$NODE_COORDINATION_LOCK" 2>/dev/null
+    return
+  fi
+  if [[ -d "$NODE_COORDINATION_LOCK" ]]; then
+    node_remove "$NODE_COORDINATION_LOCK" "$current"
+    return
+  fi
+  "$NODE_UNLINK_BIN" "$NODE_COORDINATION_LOCK" 2>/dev/null
+}
+# Publish this producer's already-complete record. `ln` is atomic and fails when
+# the entry exists, so an existing holder's record is never overwritten.
+node_coordination_publish() {
+  local owner=''
+  owner="$(node_owner_identity "$$")"
+  # No weak pid-only record is ever published: without a birth identity, or
+  # without the atomic link tool, coordination is reported unavailable instead.
+  [[ -n "$owner" && -n "${NODE_HARDLINK_BIN:-}" ]] || return 1
+  local candidate="$NODE_COORDINATION_DIR/host-coordination.lock.$$.$RANDOM$RANDOM"
+  (set -o noclobber; printf '%s\n%s\n' "$$" "$owner" > "$candidate") 2>/dev/null || return 1
+  if "$NODE_HARDLINK_BIN" "$candidate" "$NODE_COORDINATION_LOCK" 2>/dev/null; then
+    "$NODE_UNLINK_BIN" "$candidate" 2>/dev/null || true
+    return 0
+  fi
+  "$NODE_UNLINK_BIN" "$candidate" 2>/dev/null || true
+  return 1
+}
+node_coordination() {
+  local attempt=0 malformed=0 id='' observed='' unremovable_attempts=0
+  node_check_coordination_dir || return 1
+  while (( attempt < NODE_LOCK_ATTEMPTS )); do
+    attempt=$((attempt + 1))
+    if [[ ! -e "$NODE_COORDINATION_LOCK" && ! -L "$NODE_COORDINATION_LOCK" ]] && node_coordination_publish; then
+      NODE_COORDINATION_ID="$(node_coordination_entry_identity)" || return 1
+      node_check_coordination_dir || return 1
+      assert_path_identity "$NODE_COORDINATION_LOCK" "$NODE_COORDINATION_ID"
+      return
+    fi
+    if [[ ! -e "$NODE_COORDINATION_LOCK" && ! -L "$NODE_COORDINATION_LOCK" ]]; then
+      malformed=0
+      observed=''
+      continue
+    fi
+    # Capture the exact entry identity BEFORE reading/checking its owner: another
+    # contender may replace stale metadata with its own live record in between, and
+    # reclamation must stay bound to the entry that was actually judged stale.
+    id="$(node_coordination_entry_identity)" || id=''
+    if [[ -z "$id" ]]; then
+      sleep 0.05 2>/dev/null || sleep 1
+      continue
+    fi
+    if node_coordination_read && node_coordination_owner_current; then
+      # A current holder: wait, and skip reclamation for this launch.
+      malformed=0
+      observed=''
+      sleep 0.05 2>/dev/null || sleep 1
+      continue
+    fi
+    if node_coordination_read; then
+      malformed=0
+      observed=''
+    else
+      if [[ "$id" != "$observed" ]]; then
+        malformed=0
+        observed="$id"
+      fi
+      malformed=$((malformed + 1))
+      if (( malformed < 3 )); then
+        sleep 0.05 2>/dev/null || sleep 1
+        continue
+      fi
+      malformed=0
+      observed=''
+    fi
+    if ! node_coordination_reclaim "$id"; then
+      unremovable_attempts=$((unremovable_attempts + 1))
+      (( unremovable_attempts < NODE_LOCK_ATTEMPTS )) || return 1
+    fi
+    observed=''
+  done
+  return 1
+}
+node_coordination_release() {
+  local held="$NODE_COORDINATION_ID"
+  NODE_COORDINATION_ID=''
+  [[ -n "$held" ]] || return 0
+  node_check_coordination_dir || return 0
+  assert_path_identity "$NODE_COORDINATION_LOCK" "$held" || return 0
+  node_coordination_read || return 0
+  [[ "$NODE_COORDINATION_RECORD_PID" == "$$" ]] || return 0
+  [[ "$NODE_COORDINATION_RECORD_IDENTITY" == "$(node_owner_identity "$$")" ]] || return 0
+  "$NODE_UNLINK_BIN" "$NODE_COORDINATION_LOCK" 2>/dev/null || return 0
+  return 0
 }
 
 # True (0) while a live producer owns this generation's owner marker. A marker
@@ -249,9 +481,11 @@ node_visit() {
         node_visit "$child" "$((depth+1))" "$index" || return 1
       done
     fi
-  elif [[ -f "$file" && ! -L "$file" ]]; then
+  else
+    # Every non-directory, non-link entry inside this designated disposable
+    # generation is only a name here (ordinary file, FIFO, socket, or device):
+    # it is unlinked without being opened, so it leaves no disposable residue.
     NODE_REMOVE_DIR_IDS+=('')
-  else return 1
   fi
 }
 node_remove() {
@@ -274,9 +508,9 @@ node_remove() {
       # Unlink the link itself; its target is never visited.
       "$NODE_UNLINK_BIN" "${NODE_REMOVE_PATHS[i]}" || return 1
     else
-      # An ordinary leaf name is unlinked without following anything. A
-      # hardlink only loses this cache name; outside bytes and links stay.
-      [[ -f "${NODE_REMOVE_PATHS[i]}" && ! -L "${NODE_REMOVE_PATHS[i]}" ]] || return 1
+      # An ordinary or special leaf name is unlinked without following anything.
+      # A hardlink only loses this cache name; outside bytes and links stay.
+      [[ ! -d "${NODE_REMOVE_PATHS[i]}" && ! -L "${NODE_REMOVE_PATHS[i]}" ]] || return 1
       "$NODE_UNLINK_BIN" "${NODE_REMOVE_PATHS[i]}" || return 1
     fi
   done
@@ -289,46 +523,69 @@ node_remove() {
 # are reported as bounded warnings and the launch continues.
 node_admit() {
   local entries=() candidates=() entry id count=0
-  if [[ -n "${AGENT_DIR:-}" && -e "$NODE_OWNERSHIP_RECORD" ]]; then
+  # The canonical per-agent coordination entry is taken FIRST and released once
+  # this producer's fresh generation exists. Host ownership acquisition takes the
+  # same entry, so cleanup and acquiring ownership cannot interleave.
+  if ! node_coordination_ready || ! node_coordination; then
+    # No per-agent boundary: destructive reclamation is skipped rather than
+    # racing an ownership acquisition it cannot exclude. Startup continues.
+    echo 'pi-review-sessions: host ownership coordination was unavailable; leaving Node cache generations untouched.' >&2
+  elif node_host_owns_agent_directory; then
     # An existing session host owns this agent directory; its cache generations
     # are left alone. Startup still proceeds and cleanup never refuses it.
     echo 'pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.' >&2
   elif node_lock; then
-    shopt -s nullglob dotglob
-    entries=("$NODE_CACHE_ROOT"/*)
-    shopt -u nullglob dotglob
-    # Bash 3.2 treats an empty array expansion as unbound under set -u.
-    if (( ${#entries[@]} > 0 )); then
-      for entry in "${entries[@]}"; do
-        [[ "$entry" != "$NODE_LOCK" ]] || continue
-        [[ -L "$entry" || -d "$entry" ]] || continue
-        candidates+=("$entry")
-      done
-    fi
-    count=${#candidates[@]}
-    if (( count > 100000 )); then
-      echo 'pi-review-sessions: Node cache inventory exceeded its bound; continuing without reclamation.' >&2
+    if node_host_owns_agent_directory; then
+      # Rechecked after the admission wait/stale-lock recovery: a host may have
+      # acquired ownership while this producer waited.
+      echo 'pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.' >&2
     else
-      if (( ${#candidates[@]} > 0 )); then
-        for entry in "${candidates[@]}"; do
-          (( count >= NODE_LIMIT )) || break
-          [[ "${entry##*/}" != .terraform ]] || continue
-          node_generation_active "$entry" && continue
-          if [[ -L "$entry" ]]; then
-            if "$NODE_UNLINK_BIN" "$entry" 2>/dev/null; then count=$((count - 1)); fi
-            continue
-          fi
-          id="$(path_identity "$entry" 2>/dev/null)" || continue
-          if node_remove "$entry" "$id"; then count=$((count - 1)); fi
+      shopt -s nullglob dotglob
+      entries=("$NODE_CACHE_ROOT"/*)
+      shopt -u nullglob dotglob
+      # Bash 3.2 treats an empty array expansion as unbound under set -u.
+      if (( ${#entries[@]} > 0 )); then
+        for entry in "${entries[@]}"; do
+          [[ "$entry" != "$NODE_LOCK" ]] || continue
+          [[ -L "$entry" || -d "$entry" ]] || continue
+          candidates+=("$entry")
         done
       fi
-      if (( count >= NODE_LIMIT )); then
-        echo "pi-review-sessions: Node cache still holds ${count} generations (target ${NODE_LIMIT}); continuing startup." >&2
+      count=${#candidates[@]}
+      if (( count > 100000 )); then
+        echo 'pi-review-sessions: Node cache inventory exceeded its bound; continuing without reclamation.' >&2
+      else
+        if (( ${#candidates[@]} > 0 )); then
+          for entry in "${candidates[@]}"; do
+            (( count >= NODE_LIMIT )) || break
+            # Rechecked at every destructive boundary: even when the per-agent
+            # boundary could not be taken, a host's ownership record stops
+            # further removal instead of being raced by cleanup.
+            if node_host_owns_agent_directory; then
+              echo 'pi-review-sessions: a session host acquired the agent directory during cleanup; leaving the remaining Node cache generations untouched.' >&2
+              break
+            fi
+            node_generation_active "$entry" && continue
+            if [[ -L "$entry" ]]; then
+              if "$NODE_UNLINK_BIN" "$entry" 2>/dev/null; then count=$((count - 1)); fi
+              continue
+            fi
+            id="$(path_identity "$entry" 2>/dev/null)" || continue
+            if node_remove "$entry" "$id"; then count=$((count - 1)); fi
+          done
+        fi
+        if (( count >= NODE_LIMIT )); then
+          echo "pi-review-sessions: Node cache still holds ${count} generations (target ${NODE_LIMIT}); continuing startup." >&2
+        fi
       fi
+      # Keep the admission lock until this producer exits (released by the
+      # caller's EXIT trap). Another concurrent producer then skips cleanup
+      # instead of deleting a generation that is still being extracted.
     fi
-    # Keep the admission lock until this producer exits (released by the
-    # caller's EXIT trap). Another concurrent producer then skips cleanup
-    # instead of deleting a generation that is still being extracted.
+  elif node_host_owns_agent_directory; then
+    # Rechecked whichever way the admission attempt ended: a host that became the
+    # owner while this producer waited is the reason cleanup stays away.
+    echo 'pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.' >&2
   else
     if [[ "${NODE_LOCK_REPORT:-}" == lock-artifact ]]; then
       echo 'pi-review-sessions: Node cache cleanup lock artifact could not be removed; continuing without reclaiming older generations.' >&2
@@ -336,20 +593,24 @@ node_admit() {
       echo 'pi-review-sessions: Node cache cleanup lock was busy or unreadable; continuing without reclaiming older generations.' >&2
     fi
   fi
-  node_check_fence || return 1
-  WORK_ROOT="$(mktemp -d "$NODE_CACHE_ROOT/bootstrap.XXXXXXXX" 2>/dev/null)" || return 1
-  [[ "${WORK_ROOT%/*}" == "$NODE_CACHE_ROOT" && "${WORK_ROOT##*/}" == bootstrap.* ]] || return 1
+  if ! node_check_fence; then
+    node_coordination_release
+    return 1
+  fi
+  WORK_ROOT="$(mktemp -d "$NODE_CACHE_ROOT/bootstrap.XXXXXXXX" 2>/dev/null)" || { node_coordination_release; return 1; }
+  [[ "${WORK_ROOT%/*}" == "$NODE_CACHE_ROOT" && "${WORK_ROOT##*/}" == bootstrap.* ]] || { node_coordination_release; return 1; }
   # Consumed by the sourcing wrapper's workspace/archive ownership checks.
   # shellcheck disable=SC2034
-  WORK_ROOT_ID="$(path_identity "$WORK_ROOT")" || return 1
+  WORK_ROOT_ID="$(path_identity "$WORK_ROOT")" || { node_coordination_release; return 1; }
   local created=()
   # mktemp must be exclusive and empty (nullglob avoids literal patterns).
   shopt -s nullglob dotglob
   created=("$WORK_ROOT"/*)
   shopt -u nullglob dotglob
-  (( ${#created[@]} == 0 )) || return 1
+  (( ${#created[@]} == 0 )) || { node_coordination_release; return 1; }
   # A live owner marker keeps concurrent producers from pruning this generation
   # while its Node archive is still downloading/extracting. The EXIT trap clears
   # it when this producer settles.
-  (set -o noclobber; printf '%s\n' "$$" > "$WORK_ROOT/.producer-active") 2>/dev/null || return 1
+  (set -o noclobber; printf '%s\n' "$$" > "$WORK_ROOT/.producer-active") 2>/dev/null || { node_coordination_release; return 1; }
+  node_coordination_release
 }

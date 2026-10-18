@@ -141,7 +141,34 @@ message naming the agent directory and the ownership record. Ownership is taken 
 an exclusive create and is never stolen, verified around, or repaired, and no process is
 inspected or signalled to decide it. The record is removed only by the host that created
 it, and only after its owned children settled; an unsettled shutdown keeps it so a later
-host refuses instead of racing children that may still be running. Malformed, oversized,
+host refuses instead of racing children that may still be running. Taking that ownership
+and the launcher/producer's destructive cache reclamation share one short-lived
+per-agent coordination entry in the same private directory
+(`session-host/host-coordination.lock`). It is a mutex with a fixed protocol, never a second
+lifetime record: the record (`pid` plus a targeted single-pid process-start identity) is
+written complete in a private candidate and published with an atomic no-overwrite hard
+link, so no reader ever sees a half-written entry and a paused publisher only loses the
+link race. The identity is one exact per-platform token — `linux:<boot
+identity>:<starttime>` from that single pid's `/proc/<pid>/stat` (no procps needed),
+`darwin:<ps lstart>` from one targeted `ps` query, or `win32:<StartTime>` from one targeted
+native PowerShell query — and a record is honored only while its pid is alive *and* still
+reports the recorded token. Dead, malformed, or pid-reused metadata is therefore reclaimed
+and can never gate startup on any supported platform, while a current holder is honored.
+When that single-pid identity genuinely cannot be established, no record is published at
+all (the mutex is reported unavailable and the launch continues), so a weak pid-only
+record can never pin a later start. A live holder is a producer inside
+its own bounded destructive critical section, so this host waits for it instead of
+claiming ownership behind its back — with no elapsed-time release — and a genuine
+unremovable-entry failure is not turned into a verification gate (ownership still
+proceeds, and producers keep rechecking the record). The selection itself is protected by a coordinated handoff
+rather than by a last-moment proof: the launcher takes that same entry before its final
+selection revalidation, the host-entry load, and the host's ownership claim, revalidates
+the prepared build artifact and Pi runtime with the launcher's existing validation
+authority inside the hold, re-prepares or reselects them when a concurrent preparation
+reclaimed them, and hands the entry back once the host's exclusive ownership record
+exists. There is no new startup refusal for a cache this launcher pruned itself. The
+running Node is already protected for the session by the bootstrap producer's transient
+live generation marker. Malformed, oversized,
 unsafe, or unreadable roster state is reported truthfully and left untouched: nothing is
 restored from it, persistence stays disabled, and nothing overwrites it. Host shortcut
 settings and the defaults are described below. Put native Pi arguments after a literal
@@ -257,7 +284,16 @@ Cleanup never refuses creation. Stale or malformed non-live lock artifacts are
 reclaimed rather than permanently disabling pruning, and missing/malformed legacy
 lifetime records do not protect cache contents. A live producer lock or actual cleanup
 failure is reported as a bounded warning and the launch continues, so five or more legacy
-generations can never block startup. Active sessions stay protected by the host's own
+generations can never block startup. Destructive reclamation and the session host's
+ownership acquisition are mutually exclusive through the same per-agent coordination
+entry described above: cleanup holds it only while it removes excess generations and
+creates its own, rechecks the ownership record after any wait or stale-lock recovery,
+and rechecks it again at every destructive boundary, so a host that becomes the owner
+mid-pass keeps the remaining generations. When that entry is unavailable (a busy live
+holder or an unremovable artifact) cleanup is skipped with a truthful warning and the
+launch continues; a direct-child `.terraform` entry and a special leaf (FIFO, socket, or
+device name) inside the producer-owned cache are ordinary disposable content and are
+unlinked without being opened. Active sessions stay protected by the host's own
 exclusive agent-directory ownership record; cache entries are not a second lifetime
 gate, and no consumer is killed to obtain space. No age/size quotas, per-file creation
 receipts, mount censuses, or checkpoint/history cleanup are added; a live owner-pid

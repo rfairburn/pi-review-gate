@@ -15,6 +15,53 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.179]
+
+### Fixed
+
+- A starting session host and producer-owned cache reclamation no longer race for the
+  same agent directory (#385). Taking host ownership and destructive reclamation of the
+  `.pi-review-gate/{build,pi-runtime,node}` caches now share one canonical per-agent
+  coordination entry, `<agentDir>/session-host/host-coordination.lock`. Cleanup holds it
+  only while it removes excess generations and creates its own, rechecks the existing
+  ownership record after any admission-lock wait or stale/malformed lock recovery and
+  again at every destructive boundary, and skips reclamation entirely (with a truthful
+  bounded warning) when that entry is unavailable instead of racing an ownership
+  acquisition it cannot exclude. Host ownership is still taken only by the existing
+  exclusive create; a stale or malformed coordination entry is reclaimed like a stale
+  cache lock, so stale metadata never gates startup. A live holder is a producer inside
+  its own bounded destructive critical section, so the host waits for it instead of
+  claiming ownership beside an active deletion; a genuinely unremovable entry (a real
+  filesystem failure) is retried and then treated as an unavailable boundary rather than
+  a verification gate, and the ownership record still stops producer removals. Selection
+  protection is a coordinated handoff instead of a last-moment proof: the launcher takes
+  the same entry before its final build/Pi revalidation, the host-entry load, and the
+  ownership claim, revalidates the prepared build artifact and selected Pi runtime with
+  the existing validation authority inside that hold, re-prepares or reselects them
+  through the existing selection path when a concurrent preparation reclaimed them, and
+  hands the entry back once the host's exclusive ownership record exists. No new startup
+  refusal is added for a cache this launcher pruned itself, and the running Node stays
+  protected for the session by the bootstrap producer's live generation marker.
+  That entry is a mutex with one fixed protocol across the CJS, TypeScript host, POSIX,
+  and PowerShell paths: the complete record (`pid` plus one exact per-platform birth
+  identity — `linux:<boot>:<starttime>` from that single pid's `/proc` entry,
+  `darwin:<ps lstart>`, or `win32:<StartTime>` from one targeted native query) is written
+  in a private candidate and published with an atomic no-overwrite hard link, and readers
+  accept only that complete record. A record is honored only while its pid is alive and
+  still reports the recorded identity, so dead, malformed, pid-only, or pid-reused
+  metadata is reclaimed instead of becoming a permanent gate on any supported platform; no
+  weak pid-only record is published when the identity cannot be established. Coordination
+  helpers resolve from standard OS locations and are never a launch prerequisite. Inside
+  the handoff a managed explicit Pi selection is validated by the same package authority
+  used for installed packages, and an unconfirmed validation-probe cleanup fails the
+  launch closed instead of re-preparing over a possibly live runtime. A live host's generations stay untouched, a competing launch is
+  never refused for cache capacity, and startup-first pruning/reuse/validation behavior
+  from the previous build is unchanged. Cleanup-specific disposal is also less
+  artificial: a special leaf entry (FIFO, socket, or device name) inside a selected
+  disposable generation is unlinked without being opened instead of pinning that
+  generation, and a direct-child `.terraform` entry under the producer-owned Node cache
+  is no longer exempt from reclamation.
+
 ## [0.1.0-dev.178]
 
 ### Fixed

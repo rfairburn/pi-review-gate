@@ -182,7 +182,11 @@ function Initialize-IdentityType {
     @('CreateFileW', [IntPtr], [Type[]]@([string], [uint32], [uint32], [IntPtr], [uint32], [uint32], [IntPtr])),
     @('GetFileInformationByHandle', [bool], [Type[]]@([IntPtr], [IntPtr])),
     @('GetFileInformationByHandleEx', [bool], [Type[]]@([IntPtr], [uint32], [IntPtr], [uint32])),
-    @('CloseHandle', [bool], [Type[]]@([IntPtr]))
+    @('CloseHandle', [bool], [Type[]]@([IntPtr])),
+    # Atomic no-overwrite publication of the canonical coordination record: the
+    # complete record is written to a private candidate and hard-linked into
+    # place, which fails when another holder already published.
+    @('CreateHardLinkW', [bool], [Type[]]@([string], [string], [IntPtr]))
   )
   foreach ($definition in $methods) {
     $method = $builder.DefinePInvokeMethod($definition[0], 'kernel32.dll', $attributes, [Reflection.CallingConventions]::Standard, $definition[1], $definition[2], [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
@@ -507,6 +511,211 @@ function Get-NodeLockToken([string]$Path, $Attributes) {
   return $token
 }
 
+function Test-NodeHostOwnership([string]$AgentDirectory) {
+  # Presence only: the session host's existing exclusive ownership record keeps
+  # its authority. This never reads, steals, or repairs that record.
+  if ([string]::IsNullOrEmpty($AgentDirectory)) { return $false }
+  $ownership = Join-Path (Join-Path $AgentDirectory 'session-host') 'host-ownership.json'
+  return ($null -ne (Get-ExistingAttributes $ownership))
+}
+
+function Get-NodeOwnerIdentity([int]$ProcessId) {
+  # Targeted single-pid owner-lifetime identity (never a census): the process start
+  # time as an invariant round-trip token, in the same `win32:<token>` format the
+  # CJS and TypeScript writers query for one known pid. A reused pid reports a
+  # different start time, so an abandoned record is reclaimed instead of gating
+  # startup forever. An empty result means no record is published at all.
+  try {
+    $process = Get-Process -Id $ProcessId -ErrorAction Stop
+    return 'win32:' + $process.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+  } catch { return '' }
+}
+
+function Read-NodeCoordinationRecord([string]$Path) {
+  # Returns @{ Pid; Identity } for a complete published record, or $null.
+  $attributes = Get-ExistingAttributes $Path
+  if ($null -eq $attributes) { return $null }
+  if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) { return $null }
+  if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+  try { if (([IO.FileInfo]::new($Path)).Length -gt 192) { return $null } } catch { return $null }
+  $text = $null
+  try { $text = [IO.File]::ReadAllText($Path) } catch { return $null }
+  if ([string]::IsNullOrEmpty($text)) { return $null }
+  $newline = $text.IndexOf("`n")
+  if ($newline -lt 0) { return $null }
+  $pidText = $text.Substring(0, $newline).Trim()
+  if ($pidText -notmatch '^[1-9]([0-9]{0,9})$') { return $null }
+  $identity = $text.Substring($newline + 1).TrimEnd("`r", "`n")
+  if ($identity.Length -gt 160) { return $null }
+  return @{ Pid = [int]$pidText; Identity = $identity }
+}
+
+function Test-NodeCoordinationOwnerCurrent($Record) {
+  # A record is honored only while its pid is alive AND still reports the recorded
+  # start identity; a record without a birth identity is never honored.
+  if ($null -eq $Record) { return $false }
+  try { $null = Get-Process -Id $Record.Pid -ErrorAction Stop } catch { return $false }
+  # A record without a birth identity is never honored on any platform: pid-only
+  # metadata could otherwise be pinned forever behind an unrelated live process.
+  if ([string]::IsNullOrEmpty($Record.Identity)) { return $false }
+  return ((Get-NodeOwnerIdentity $Record.Pid) -ceq $Record.Identity)
+}
+
+function Publish-NodeCoordination([string]$StateDirectory) {
+  # Write the complete record to a private candidate, then publish it with an
+  # atomic no-overwrite hard link. A paused publisher therefore only loses the link
+  # race and never exposes or adopts a half-written canonical entry. The owner
+  # identity is required: a pid-only record would pin a later start behind a reused
+  # pid forever, so nothing is published when the identity is unavailable.
+  $identity = Get-NodeOwnerIdentity ([int]$PID)
+  if ([string]::IsNullOrEmpty($identity)) { return 'failed' }
+  $candidate = Join-Path $StateDirectory ('host-coordination.lock.' + [string]$PID + '.' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+  $body = [string]$PID + "`n" + $identity + "`n"
+  try {
+    $stream = [IO.File]::Open($candidate, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try {
+      $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+      $stream.Write($bytes, 0, $bytes.Length)
+      $stream.Flush($true)
+    } finally { $stream.Dispose() }
+  } catch { return 'failed' }
+  $entry = Join-Path $StateDirectory 'host-coordination.lock'
+  $linked = $false
+  try { $linked = $script:IdentityType::CreateHardLinkW($entry, $candidate, [IntPtr]::Zero) } catch { $linked = $false }
+  try { [IO.File]::Delete($candidate) } catch { }
+  if ($linked) { return 'published' }
+  if ($null -ne (Get-ExistingAttributes $entry)) { return 'lost' }
+  return 'failed'
+}
+
+function Remove-NodeCoordinationEntry([string]$Path, [string]$ExpectedIdentity) {
+  # Remove exactly the observed entry name; a junction/link is unlinked itself,
+  # never entered, and a directory shape is removed only when it is a metadata
+  # entry this producer could have created.
+  $current = $null
+  try { $current = Get-PathIdentity $Path } catch { return $true }
+  if ($null -ne $ExpectedIdentity -and $current -cne $ExpectedIdentity) { return $true }
+  $attributes = Get-ExistingAttributes $Path
+  if ($null -eq $attributes) { return $true }
+  try {
+    if (($attributes -band [IO.FileAttributes]::Directory) -ne 0 -and ($attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+      [IO.Directory]::Delete($Path, $false)
+    } else {
+      [IO.File]::Delete($Path)
+    }
+    return $true
+  } catch { return $false }
+}
+
+function Enter-NodeCoordination([string]$AgentDirectory) {
+  # The one canonical per-agent mutex that host ownership acquisition also takes,
+  # so destructive reclamation and a host becoming the owner are mutually
+  # exclusive. Returns an object (Path/Identity) or $null when the boundary is
+  # unavailable; that never refuses startup. A current holder is honored, and
+  # stale/dead/reused-pid/malformed metadata is reclaimed.
+  if ([string]::IsNullOrEmpty($AgentDirectory)) { return $null }
+  $stateDirectory = Join-Path $AgentDirectory 'session-host'
+  try { Ensure-DirectoryTree $stateDirectory | Out-Null } catch { return $null }
+  $path = Join-Path $stateDirectory 'host-coordination.lock'
+  $malformed = 0
+  $observedToken = $null
+  for ($attempt = 0; $attempt -lt 40; $attempt++) {
+    if ($null -eq (Get-ExistingAttributes $path)) {
+      $published = Publish-NodeCoordination $stateDirectory
+      if ($published -eq 'published') {
+        $identity = $null
+        try { $identity = Get-PathIdentity $path } catch { return $null }
+        return @{ Path = $path; Identity = $identity }
+      }
+      if ($published -eq 'failed') { return $null }
+      continue
+    }
+    # Capture the exact entry identity BEFORE reading/checking its owner: another
+    # contender may replace stale metadata with its own live record in between, and
+    # reclamation must stay bound to the entry that was actually judged stale.
+    $current = $null
+    try { $current = Get-PathIdentity $path } catch { $current = $null }
+    if ($null -eq $current) {
+      Start-Sleep -Milliseconds 25
+      continue
+    }
+    $record = Read-NodeCoordinationRecord $path
+    if ($null -ne $record -and (Test-NodeCoordinationOwnerCurrent $record)) {
+      # A current holder: wait briefly, then this producer skips reclamation.
+      $malformed = 0
+      $observedToken = $null
+      Start-Sleep -Milliseconds 50
+      continue
+    }
+    if ($null -eq $record) {
+      if ($current -cne $observedToken) { $malformed = 0; $observedToken = $current }
+      $malformed++
+      if ($malformed -lt 3) { Start-Sleep -Milliseconds 25; continue }
+      $malformed = 0
+      $observedToken = $null
+    }
+    if (-not (Remove-NodeCoordinationEntry $path $current)) { return $null }
+  }
+  return $null
+}
+
+function Exit-NodeCoordination($Coordination) {
+  if ($null -eq $Coordination) { return }
+  try {
+    $record = Read-NodeCoordinationRecord $Coordination.Path
+    if ($null -eq $record -or $record.Pid -ne $PID) { return }
+    if ($record.Identity -cne (Get-NodeOwnerIdentity ([int]$PID))) { return }
+    if ($null -ne $Coordination.Identity -and (Assert-PathIdentity $Coordination.Path $Coordination.Identity)) {
+      [IO.File]::Delete($Coordination.Path)
+    }
+  } catch { # Uncertain coordination ownership is retained for stale recovery.
+  }
+}
+
+function Invoke-NodeCacheCleanup([string]$Root, $Chain, $Lock, [string]$LockPath, [string]$AgentDirectory) {
+  # Best-effort cleanup only: every failure here warns and creation proceeds.
+  # Returns the admission lock identity captured before cleanup, or $null.
+  $identity = $null
+  try {
+    $lockBytes = [Text.Encoding]::UTF8.GetBytes([string]$PID)
+    $Lock.Write($lockBytes, 0, $lockBytes.Length)
+    $Lock.Flush($true)
+    $identity = Get-PathIdentity $LockPath
+    Assert-NodeFence $Chain
+    $entries = @()
+    try {
+      $entries = @([IO.Directory]::EnumerateFileSystemEntries($Root))
+    } catch {
+      [Console]::Error.WriteLine('pi-review-sessions: Node cache inventory was unavailable; continuing without reclamation.')
+    }
+    $count = 0
+    foreach ($entry in $entries) {
+      if ([IO.Path]::GetFileName($entry) -cne '.admission.lock') { $count++ }
+    }
+    foreach ($entry in $entries) {
+      if ($count -lt 5) { break }
+      $name = [IO.Path]::GetFileName($entry)
+      if ($name -ceq '.admission.lock') { continue }
+      # Rechecked at every destructive boundary: even when the per-agent boundary
+      # could not be taken, a host's ownership record stops further removal
+      # instead of being raced by cleanup.
+      if (Test-NodeHostOwnership $AgentDirectory) {
+        [Console]::Error.WriteLine('pi-review-sessions: a session host acquired the agent directory during cleanup; leaving the remaining Node cache generations untouched.')
+        break
+      }
+      if (Test-NodeGenerationActive $entry) { continue }
+      if (Remove-NodeEntry $entry 0) { $count-- }
+    }
+    if ($count -ge 5) {
+      [Console]::Error.WriteLine("pi-review-sessions: Node cache still holds $count generations (target 5); continuing startup.")
+    }
+    Assert-NodeFence $Chain
+  } catch {
+    [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup could not complete; continuing startup.')
+  }
+  return $identity
+}
+
 function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
   $chain = Get-NodeFence $Root
   $lockPath = Join-Path $Root '.admission.lock'
@@ -514,14 +723,18 @@ function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
   $lockIdentity = $null
   $lockReclaimFailed = $false
   $skipCleanup = $false
-  if (-not [string]::IsNullOrEmpty($AgentDirectory)) {
+  # The canonical per-agent coordination entry is taken FIRST and released once
+  # this producer's fresh generation exists. Host ownership acquisition takes the
+  # same entry, so cleanup and acquiring ownership cannot interleave.
+  $coordination = Enter-NodeCoordination $AgentDirectory
+  if ($null -eq $coordination) {
+    $skipCleanup = $true
+    [Console]::Error.WriteLine('pi-review-sessions: host ownership coordination was unavailable; leaving Node cache generations untouched.')
+  } elseif (Test-NodeHostOwnership $AgentDirectory) {
     # An existing session host owns this agent directory: its cache generations
     # are left alone, while startup still proceeds.
-    $ownership = Join-Path (Join-Path $AgentDirectory 'session-host') 'host-ownership.json'
-    if (Test-Path -LiteralPath $ownership) {
-      $skipCleanup = $true
-      [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
-    }
+    $skipCleanup = $true
+    [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
   }
   try {
     Assert-NodeFence $chain
@@ -592,42 +805,22 @@ function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
       }
     }
     if ($null -eq $lock -and -not $skipCleanup) {
-      if ($lockReclaimFailed) {
+      # Rechecked whichever way the admission attempt ended: a host that became
+      # the owner while this producer waited is the reason cleanup stays away.
+      if (Test-NodeHostOwnership $AgentDirectory) {
+        [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
+      } elseif ($lockReclaimFailed) {
         [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup lock artifact could not be removed; continuing without reclaiming older generations.')
       } else {
         [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup lock was busy or unreadable; continuing without reclaiming older generations.')
       }
     } elseif ($null -ne $lock) {
-      # Best-effort cleanup only: every failure here warns and creation proceeds.
-      try {
-        $lockBytes = [Text.Encoding]::UTF8.GetBytes([string]$PID)
-        $lock.Write($lockBytes, 0, $lockBytes.Length)
-        $lock.Flush($true)
-        $lockIdentity = Get-PathIdentity $lockPath
-        Assert-NodeFence $chain
-        $entries = @()
-        try {
-          $entries = @([IO.Directory]::EnumerateFileSystemEntries($Root))
-        } catch {
-          [Console]::Error.WriteLine('pi-review-sessions: Node cache inventory was unavailable; continuing without reclamation.')
-        }
-        $count = 0
-        foreach ($entry in $entries) {
-          if ([IO.Path]::GetFileName($entry) -cne '.admission.lock') { $count++ }
-        }
-        foreach ($entry in $entries) {
-          if ($count -lt 5) { break }
-          $name = [IO.Path]::GetFileName($entry)
-          if ($name -ceq '.admission.lock' -or $name -ceq '.terraform') { continue }
-          if (Test-NodeGenerationActive $entry) { continue }
-          if (Remove-NodeEntry $entry 0) { $count-- }
-        }
-        if ($count -ge 5) {
-          [Console]::Error.WriteLine("pi-review-sessions: Node cache still holds $count generations (target 5); continuing startup.")
-        }
-        Assert-NodeFence $chain
-      } catch {
-        [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup could not complete; continuing startup.')
+      if (Test-NodeHostOwnership $AgentDirectory) {
+        # Rechecked after the admission wait/stale-lock recovery: a host may have
+        # acquired ownership while this producer waited.
+        [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
+      } else {
+        $lockIdentity = Invoke-NodeCacheCleanup $Root $chain $lock $lockPath $AgentDirectory
       }
     }
     $candidate = Join-Path $Root ('bootstrap-' + [Guid]::NewGuid().ToString('N'))
@@ -645,6 +838,7 @@ function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
     } finally { $marker.Dispose() }
     return $candidate
   } finally {
+    Exit-NodeCoordination $coordination
     if ($null -ne $lock) {
       $lock.Dispose()
       try {

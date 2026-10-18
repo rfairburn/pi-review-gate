@@ -86,7 +86,28 @@ device, replaced, oversized, or malformed entry is refused instead of being open
 followed, or read; an unsafe entry is preserved untouched. That exclusive create is the whole
 arbitration: an existing or unreadable ownership record refuses startup before any
 child exists, and the record is never stolen, repaired, or bypassed by process
-inspection or signalling. It is removed only by the host that created it, and only after
+inspection or signalling. Ownership acquisition and producer cache reclamation also
+share one short-lived coordination entry in that private directory
+(`host-coordination.lock`, mode `0600`, owner pid) so an already-authorized destructive
+reclamation cannot delete this host's prepared runtime while it becomes the owner. That
+entry is a mutex with a fixed publication protocol, not a second lifetime record: the
+complete record (`pid` plus one exact per-platform start token — `linux:<boot>:<starttime>`
+from that single pid's `/proc/<pid>/stat`, `darwin:<ps lstart>` from one targeted `ps`
+query, or `win32:<StartTime>` from one targeted native query) is written in a private
+candidate and published with an atomic no-overwrite hard link, so a reader never observes a
+half-written entry. A record is honored only while its pid is alive and still reports that
+token, so dead, malformed, or pid-reused metadata is reclaimed confined to the entry and can
+never gate startup on any supported platform, and no weak pid-only record is published when
+the identity cannot be established. A live holder is a producer
+inside its bounded destructive critical section, so the host waits for it rather than
+claiming ownership beside an active deletion; stale/malformed metadata is always
+reclaimed, and a genuinely unremovable entry (a real filesystem failure) is never turned
+into a verification gate — ownership still proceeds, and producers keep rechecking the
+record at every destructive boundary. Selection protection is a coordinated handoff
+instead of a last-moment proof: the launcher holds the same entry from its final
+build/Pi revalidation through the host's ownership claim, re-prepares/reselects a
+reclaimed prepared artifact through the existing selection path, and hands the entry back
+when the ownership record exists. It is removed only by the host that created it, and only after
 every owned child's exit was positively confirmed with settlement evidence; an
 unconfirmed or unconfirmable child-exit state keeps it (a forced termination alone does
 not, once exit is confirmed). A malformed,
@@ -111,7 +132,10 @@ purged as part of verification.
 
 Active sessions are protected by the session host's existing exclusive agent-directory
 ownership record, not by cache receipts; cleanup neither kills a consumer nor implements
-a second lifetime gate. Reclamation is confined to one designated generation with
+a second lifetime gate. Cleanup rechecks that record after any wait or stale-lock recovery
+and at every destructive boundary, and it skips reclamation entirely when the per-agent
+coordination entry is unavailable instead of racing an ownership acquisition it cannot
+exclude. Reclamation is confined to one designated generation with
 no-follow link handling (links are unlinked, never traversed); a `.terraform` subtree
 inside a selected disposable generation is removed with it; partially removed entries
 stay counted for a later retry. Each in-flight generation carries one owner-pid

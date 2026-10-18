@@ -24,7 +24,6 @@ if [[ -n "${PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG:-}" ]]; then
   exit 1
 fi
 unset PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE
-unset PI_REVIEW_GATE_NODE_GENERATION PI_REVIEW_GATE_NODE_HOLDER
 
 # Pure-bash script directory resolution: do not depend on an external dirname
 # when the caller's PATH is minimal.
@@ -190,7 +189,8 @@ fi
 
 # Capture stable filesystem identities for the cache and exclusive work root.
 # These checks detect collisions/replaced paths; they are not a same-user race
-# sandbox. Native admission below uses bounded, identity-checked no-follow cleanup.
+# sandbox. Cache cleanup below is best effort: bounded, identity-checked and
+# no-follow, and it never refuses a launch for capacity.
 path_identity() {
   local path="$1" output
   [[ ! -L "$path" && ( -d "$path" || -f "$path" ) ]] || return 1
@@ -214,15 +214,14 @@ NODE_CACHE_ROOT_ID="$(path_identity "$NODE_CACHE_ROOT")" || {
   exit 1
 }
 
-# Admission happens BEFORE mktemp/download/extraction, including failed stages.
+# Excess-generation cleanup happens BEFORE mktemp/download/extraction; a
+# problem warns and the fresh generation is still created.
 # shellcheck source=scripts/node-generations.sh
 source "$SCRIPT_DIR/node-generations.sh"
 NODE_UNLINK_BIN="$(type -P unlink || true)"
 NODE_RMDIR_BIN="$(type -P rmdir || true)"
-NODE_MOVE_BIN="$(type -P mv || true)"
-NODE_MOUNT_BIN="$(type -P mount || true)"
-if [[ -z "$NODE_UNLINK_BIN" || -z "$NODE_RMDIR_BIN" || -z "$NODE_MOVE_BIN" ]]; then
-  echo 'pi-review-sessions: Node admission requires unlink, rmdir, and mv.' >&2
+if [[ -z "$NODE_UNLINK_BIN" || -z "$NODE_RMDIR_BIN" ]]; then
+  echo 'pi-review-sessions: Node cache cleanup requires unlink and rmdir.' >&2
   exit 1
 fi
 ORIGINAL_UMASK="$(umask)"
@@ -237,9 +236,6 @@ EXTRACT_ROOT="$WORK_ROOT/extracted"
 bootstrap_failure() {
   echo "pi-review-sessions: $1" >&2
   echo "pi-review-sessions: retained bootstrap witness: $WORK_ROOT" >&2
-  # Only explicit synchronous failures settle setup. Signals/unexpected exits
-  # leave the canonical pin protected, never a PID/status-based inference.
-  node_set_state protected inactive || true
   exit 1
 }
 
@@ -408,10 +404,6 @@ trap 'forward_cjs_signal INT' INT
 set +m
 (
   trap - TERM HUP INT QUIT EXIT
-  # Only this exact child receives the one-shot bootstrap context, never the
-  # supervisor's job-table helpers or later lifetime-publication commands.
-  export PI_REVIEW_GATE_NODE_GENERATION="$WORK_ROOT"
-  export PI_REVIEW_GATE_NODE_HOLDER="${WORK_ROOT##*/}"
   exec "$NODE_BIN" "$CJS_ENTRY" "$@"
 ) <&0 &
 CJS_PID=$!
@@ -429,7 +421,4 @@ while :; do
 done
 CJS_PID=''
 trap - TERM HUP INT
-unset PI_REVIEW_GATE_NODE_GENERATION PI_REVIEW_GATE_NODE_HOLDER
-umask 077
-node_set_state quiescent inactive || true
 exit "$CJS_STATUS"

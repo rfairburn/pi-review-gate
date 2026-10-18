@@ -86,11 +86,11 @@ is not a same-user sandbox. The broker retains its 32-connection unauthenticated
 backlog cap and 2-second authentication deadline, but those bounds do not prevent
 resource-exhaustion attempts or promise availability. Node source staging likewise
 relies on inherited OS ACLs: requested POSIX mode bits do not establish Windows
-privacy. Setup uses a fresh exclusive stage and public Node identity checks. Build, fallback-Node and Pi-runtime generation subtrees are path-owned disposable caches, including
-legacy or failed contents, regardless of individual descendant creator. Reclamation
-still requires positive lifetime settlement and confined, unchanged filesystem identities;
-no per-file creation receipts are required. A timed-out setup child that cannot be
-positively settled is not treated as clean. No custom Win32 pipe application, TLS/PSK layer, taskkill tree
+privacy. Setup uses a fresh exclusive stage and public Node identity checks. Build, fallback-Node
+and Pi-runtime generation subtrees are path-owned disposable caches, including legacy
+or failed contents, regardless of individual descendant creator. Excess generations are
+reclaimed best effort with confined, unchanged filesystem identities; a cleanup problem
+warns and the launch continues, because cache capacity never stops startup. No custom Win32 pipe application, TLS/PSK layer, taskkill tree
 scan, or private process helper
 is part of the design. These source paths do not make the host Windows-supported;
 that claim remains gated on the native evidence above.
@@ -245,26 +245,39 @@ Invalid, incomplete, unsafe, or raced cache entries are preserved; the launcher 
 privately instead of loading unverifiable output. Cache manifests are corruption/freshness
 checks, not protection against a same-user writer forging both artifacts and metadata;
 filesystem identity fences are not an atomic filesystem sandbox. Development-build,
-fallback-Node and isolated-Pi caches each admit at most **five generations**, counted independently
-before creating another artifact. A build's npm home/cache/temp residue stays inside its
-one generation; Pi stages and publishes inside its exclusively reserved version root,
-without an extra generation. Partial npm output stays in a contained `.setup` directory
-until validated `node_modules` publication, so another launcher cannot reuse a half-install. Only unused, positively settled generations are reclaimed
-when capacity is needed; compatible build reuse neither inventories nor prunes generations.
-Active, uncertain, malformed, replaced, unsafe, or legacy entries without lifetime evidence
-remain counted and protected. Full protected capacity refuses explicitly; no consumer is
-killed to obtain space. Existing over-limit legacy caches cannot admit new generations
-until safe space exists. No age/size quotas or checkpoint/history cleanup are added.
-Ordinary package scripts are unchanged. Public Node can terminate only the directly owned
-Windows setup child: direct-child or PTY closure is not descendant-tree proof, so native
-Windows reclamation is disabled and its uncertain pins remain held. The fallback Node
-wrappers count downloads, extraction stages and failures before creating another artifact;
-they still extract a fresh checksum-pinned official archive rather than reusing mutable
-Node. The supported PATH-Node route is unchanged. POSIX waits for the exact CJS process
-to exit after an explicit complete setup/native-consumer quiescence witness before making
-its Node artifact inactive; quiescence alone and numeric zero remain protected. Windows
-refuses a sixth Node artifact without reclamation. Protocol and native proof boundaries
-are described in [Development](development.md#producer-owned-generation-admission).
+fallback-Node and isolated-Pi caches each target **five generations**, counted
+independently, and excess generations are reclaimed best effort before another artifact
+is created. A build's npm home/cache/temp residue stays inside its one generation; Pi
+stages and publishes inside its own version root without an extra generation. Partial
+npm output stays in a contained `.setup` directory until validated `node_modules`
+publication, so another launcher cannot reuse a half-install. Compatible build reuse
+neither inventories nor prunes generations.
+
+Cleanup never refuses creation. Stale or malformed non-live lock artifacts are
+reclaimed rather than permanently disabling pruning, and missing/malformed legacy
+lifetime records do not protect cache contents. A live producer lock or actual cleanup
+failure is reported as a bounded warning and the launch continues, so five or more legacy
+generations can never block startup. Active sessions stay protected by the host's own
+exclusive agent-directory ownership record; cache entries are not a second lifetime
+gate, and no consumer is killed to obtain space. No age/size quotas, per-file creation
+receipts, mount censuses, or checkpoint/history cleanup are added; a live owner-pid
+marker only prevents pruning a generation another producer is still filling (the root is
+fenced before marker inspection, and malformed markers are not liveness). An incomplete
+fixed-name Pi version root that cannot be reclaimed falls through confined
+`pi-<version>.<n>` generations without a fixed candidate limit, and later launches reuse
+any valid generation for that exact version, so it also cannot stop startup. Settled failed or
+aborted setup is reclaimed by a later cleanup, and an incomplete Pi installation can
+retry the same version through identity-checked replacement. Ordinary package scripts
+are unchanged.
+
+The fallback Node wrappers reclaim excess direct-child artifacts before creating another
+one, using the same best-effort rules; a failed deletion warns and the launch proceeds.
+They still extract a fresh checksum-pinned official archive rather than reusing mutable
+Node, and the supported PATH-Node route is unchanged. POSIX and native PowerShell both
+recover a stale lock and never enter reparse points/links. Native Windows cache cleanup
+is ordinary native deletion without a descendant-settlement claim; remaining Windows
+host/ConPTY parity work is tracked separately. Protocol and native proof boundaries are
+described in [Development](development.md#producer-owned-disposable-cache-cleanup).
 Setup preserves trusted original `NODE_OPTIONS` and provider values while removing only
 stale host capabilities. Before starting the host, the launcher also refreshes the
 shipped skills under `~/.agents/skills/` from the same canonical publication manifest
@@ -272,19 +285,14 @@ as the review-gate wrapper — orchestrator (with its recovery runbook), executi
 research, and completion — followed by the ownership-safe pre-#151 generic-location
 migration, so a direct sidebar launch needs no wrapper prerequisite; byte-identical
 installed files are reused untouched on repeat launches. Setup failures stop startup
-rather than falling back to a shell wrapper. Settled failures remain counted and may be
-reclaimed at the next admission; incomplete Pi installation can retry the same version
-only through identity-checked replacement with zero holders under the admission lock.
-Unconfirmed setup leaves a durable lifetime pin. Explicit, npm-global and PATH selections
-inside a managed Pi generation acquire that generation's pin before the version probe
-and retain it through native consumption; selecting a managed path explicitly does not
-bypass eviction protection. Normal
-POSIX host shutdown releases consumer pins only through Main's explicit positive complete
-ownership/cleanup handoff, not its numeric exit status. Failed or unavailable handoffs
-retain pins. Cache metadata is coordination, not a same-user security sandbox; abandoned
-locks/pins are not stolen using PID or age guesses. Installed compiled-package startup
-does not inspect or clean the development-build cache. The normal review-gate launchers, their
-behavior, and user settings are unchanged.
+rather than falling back to a shell wrapper. Explicit, npm-global and PATH selections
+inside a managed Pi generation keep the existing package/version validation and
+alias-containment checks before the version probe; they do not acquire a lifetime pin.
+Normal POSIX host shutdown keeps the existing ownership/cleanup guards for the agent
+directory; cache cleanup is independent of the numeric exit status. Cache metadata is
+coordination, not a same-user security sandbox. Installed compiled-package startup
+does not inspect or clean the development-build cache. The normal review-gate launchers,
+their behavior, and user settings are unchanged.
 
 ## Starting and owning sessions
 

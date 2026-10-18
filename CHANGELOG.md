@@ -15,6 +15,36 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.178]
+
+### Fixed
+
+- Startup no longer stops because disposable cache capacity is full (#385). The
+  session-host launcher's `.pi-review-gate/build/`, `.pi-review-gate/pi-runtime/`,
+  and `.pi-review-gate/node/` trees are created only by these producers, so their
+  contents are disposable by location: five or more legacy, failed, or
+  receipt-less generations are reclaimed best effort down to the independent
+  per-type target of five and startup proceeds. Removable stale/malformed non-live
+  locks are reclaimed, including directory/link-shaped metadata. Cleanup warnings
+  (a live producer lock, unreclaimable entry, or real filesystem failure) are reported
+  truthfully without a cache-capacity startup refusal and without claiming a
+  deletion that did not happen. A live owner-pid marker prevents cleanup from
+  reclaiming a generation another producer is still filling; generation roots are
+  fenced before marker inspection so a direct-child link never exposes outside
+  data, and only a valid live-owner record protects an entry. An incomplete
+  isolated-Pi version root that cannot be reclaimed falls through confined
+  `pi-<version>.<n>` generations without a fixed limit (later launches reuse any
+  valid generation for that exact version), and the same-version replacement path
+  honors the live-owner marker, so a concurrently filling generation is never
+  deleted. Startup is not stopped by any of these cases. Initialized `.terraform`
+  content inside a selected disposable generation is removed with it. The
+  previous durable lifetime receipts, holder pins, mount census, and Windows
+  count-only admission gate are removed; active sessions remain guarded by the
+  session host's existing exclusive agent-directory ownership record, and
+  cleanup is skipped while that record exists. Prepared-build reuse/freshness validation, supported installed-Pi
+  preference, isolated-Pi package/version validation, and the checksum-pinned
+  fresh Node extraction/argv/environment behavior are unchanged.
+
 ## [0.1.0-dev.177]
 
 ### Added

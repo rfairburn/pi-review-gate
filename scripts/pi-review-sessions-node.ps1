@@ -435,32 +435,214 @@ function Assert-NodeFence($Chain) {
     if ((Get-PathIdentity $entry[0]) -cne $entry[1]) { throw 'Node cache ancestor identity changed.' }
   }
 }
-function New-NodeGeneration([string]$Root) {
+function Remove-NodeEntry([string]$Path, [int]$Depth) {
+  # Bounded, no-follow removal of one designated cache generation. Reparse
+  # points (symlinks/junctions) are unlinked themselves, never entered, so data
+  # outside the generation is untouched. Cleanup-specific: even an initialized
+  # `.terraform` subtree inside this disposable generation is removed.
+  if ($Depth -gt 64) { return $false }
+  $attributes = Get-ExistingAttributes $Path
+  if ($null -eq $attributes) { return $true }
+  if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    try {
+      if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) { [IO.Directory]::Delete($Path, $false) }
+      else { [IO.File]::Delete($Path) }
+      return $true
+    } catch { return $false }
+  }
+  if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+    try {
+      foreach ($child in [IO.Directory]::EnumerateFileSystemEntries($Path)) {
+        if (-not (Remove-NodeEntry $child ($Depth + 1))) { return $false }
+      }
+      [IO.Directory]::Delete($Path, $false)
+      return $true
+    } catch { return $false }
+  }
+  try { [IO.File]::Delete($Path); return $true } catch { return $false }
+}
+
+function Test-NodeGenerationActive([string]$Path) {
+  # True while a live producer owns this generation. Fence the generation root
+  # first: a direct-child link/junction is not a generation and its outside
+  # target must never be inspected. Invalid marker shapes are not liveness
+  # evidence, and confined no-follow cleanup handles them.
+  $rootAttributes = Get-ExistingAttributes $Path
+  if ($null -eq $rootAttributes) { return $false }
+  if (($rootAttributes -band [IO.FileAttributes]::Directory) -eq 0 -or ($rootAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+  $marker = Join-Path $Path '.producer-active'
+  $attributes = Get-ExistingAttributes $marker
+  if ($null -eq $attributes) { return $false }
+  if (($attributes -band [IO.FileAttributes]::Directory) -ne 0 -or ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+  try { $text = [IO.File]::ReadAllText($marker) } catch { return $false }
+  if (Test-NodeLockOwner $text) { return $true }
+  try { [IO.File]::Delete($marker) } catch { }
+  return $false
+}
+
+function Test-NodeLockOwner([string]$Text) {
+  if ($Text -match '^\s*(\d{1,10})\s*$') {
+    try { $null = Get-Process -Id ([int]$Matches[1]) -ErrorAction Stop; return $true } catch { return $false }
+  }
+  return $false
+}
+
+function Get-NodeLockToken([string]$Path, $Attributes) {
+  # Best-effort identity of the exact lock entry without following links. A live
+  # producer lock is always a freshly created regular file whose record metadata
+  # differs from the observed malformed artifact, so a replacement is never
+  # mistaken for the artifact that was observed.
+  if ($null -eq $Attributes) { return $null }
+  $token = 'attributes:' + [int]$Attributes
+  $notDirectory = ($Attributes -band [IO.FileAttributes]::Directory) -eq 0
+  $notReparse = ($Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0
+  # One-line conjunctions only: Windows PowerShell 5.1 rejects a line that starts
+  # with an operator (and the multiline form is not worth the parse risk).
+  if ($notDirectory -and $notReparse) {
+    try {
+      $info = [IO.FileInfo]::new($Path)
+      $token = $token + ':' + $info.Length + ':' + $info.LastWriteTimeUtc.Ticks
+    } catch { return $null }
+  }
+  return $token
+}
+
+function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
   $chain = Get-NodeFence $Root
   $lockPath = Join-Path $Root '.admission.lock'
   $lock = $null
   $lockIdentity = $null
+  $lockReclaimFailed = $false
+  $skipCleanup = $false
+  if (-not [string]::IsNullOrEmpty($AgentDirectory)) {
+    # An existing session host owns this agent directory: its cache generations
+    # are left alone, while startup still proceeds.
+    $ownership = Join-Path (Join-Path $AgentDirectory 'session-host') 'host-ownership.json'
+    if (Test-Path -LiteralPath $ownership) {
+      $skipCleanup = $true
+      [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
+    }
+  }
   try {
     Assert-NodeFence $chain
-    $lock = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-    $lockIdentity = Get-PathIdentity $lockPath
-    Assert-NodeFence $chain
-    # Windows reclamation is deliberately disabled. Every existing entry,
-    # including malformed/legacy/failed stages, counts without descending.
-    $count = 0
-    foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($Root)) {
-      if ([IO.Path]::GetFileName($entry) -cne '.admission.lock') { $count++ }
-      if ($count -ge 5) { throw 'Node generation capacity exhausted: maximum 5; native Windows reclamation is unavailable.' }
+    # One short exclusive admission lock coordinates cleanup and creation. A
+    # lock whose recorded owner is gone (or whose record is empty/malformed) is
+    # reclaimed; a live owner is left alone and this producer then skips
+    # cleanup. A stale/malformed NON-LIVE metadata shape (directory, junction,
+    # oversized or unreadable) is removed confined to this exact lock path: this
+    # producer only creates a fresh regular lock file, so such a shape is never
+    # live-producer evidence. Capacity never refuses creation.
+    $malformedLock = 0
+    $observedLockToken = $null
+    for ($attempt = 0; -not $skipCleanup -and $attempt -lt 40 -and $null -eq $lock; $attempt++) {
+      try {
+        $lock = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+      } catch {
+        try {
+          $lockAttributes = Get-ExistingAttributes $lockPath
+          if ($null -eq $lockAttributes) {
+            # Another producer settled between attempts; retry creation.
+            $malformedLock = 0
+            $observedLockToken = $null
+            Start-Sleep -Milliseconds 25
+            continue
+          }
+          $lockIsReparse = ($lockAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+          $lockIsDirectory = ($lockAttributes -band [IO.FileAttributes]::Directory) -ne 0
+          # Keep each expression on one line: Windows PowerShell 5.1 rejects a
+          # continuation line that begins with -or.
+          $lockShape = $lockIsReparse -or $lockIsDirectory
+          if (-not $lockShape) {
+            try { $lockShape = (([IO.FileInfo]::new($lockPath)).Length -gt 64) } catch { $lockShape = $true }
+          }
+          $lockText = $null
+          if (-not $lockShape) {
+            try { $lockText = [IO.File]::ReadAllText($lockPath) } catch { $lockText = $null }
+          }
+          $lockToken = Get-NodeLockToken $lockPath $lockAttributes
+          if ($null -ne $lockText -and $lockText -match '^\s*(\d{1,10})\s*$') {
+            $malformedLock = 0
+            # A live owner is left alone; this producer then skips cleanup.
+            if (Test-NodeLockOwner $lockText) { $observedLockToken = $null; Start-Sleep -Milliseconds 50; continue }
+            # A dead owner's record is reclaimed only if it is still that entry.
+            if ($null -eq $lockToken) { $observedLockToken = $null; Start-Sleep -Milliseconds 25; continue }
+            $observedLockToken = $lockToken
+          } else {
+            # A just-created lock can be read before its pid is written; only the
+            # SAME malformed artifact, observed across several inspections, is a
+            # dead owner's residue.
+            if ($null -eq $lockToken) { $observedLockToken = $null; Start-Sleep -Milliseconds 50; continue }
+            if ($lockToken -cne $observedLockToken) { $malformedLock = 0; $observedLockToken = $lockToken }
+            $malformedLock++
+            if ($malformedLock -lt 3) { Start-Sleep -Milliseconds 50; continue }
+            $malformedLock = 0
+          }
+          # Reclaim only the exact artifact that was observed: anything that now
+          # occupies the path is left in place and acquisition restarts.
+          $currentToken = Get-NodeLockToken $lockPath (Get-ExistingAttributes $lockPath)
+          if ($null -eq $currentToken -or $currentToken -cne $observedLockToken) {
+            $observedLockToken = $null
+            Start-Sleep -Milliseconds 25
+            continue
+          }
+          $observedLockToken = $null
+          if (-not (Remove-NodeEntry $lockPath 0)) { $lockReclaimFailed = $true; break }
+          continue
+        } catch { break }
+      }
     }
-    Assert-NodeFence $chain
+    if ($null -eq $lock -and -not $skipCleanup) {
+      if ($lockReclaimFailed) {
+        [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup lock artifact could not be removed; continuing without reclaiming older generations.')
+      } else {
+        [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup lock was busy or unreadable; continuing without reclaiming older generations.')
+      }
+    } elseif ($null -ne $lock) {
+      # Best-effort cleanup only: every failure here warns and creation proceeds.
+      try {
+        $lockBytes = [Text.Encoding]::UTF8.GetBytes([string]$PID)
+        $lock.Write($lockBytes, 0, $lockBytes.Length)
+        $lock.Flush($true)
+        $lockIdentity = Get-PathIdentity $lockPath
+        Assert-NodeFence $chain
+        $entries = @()
+        try {
+          $entries = @([IO.Directory]::EnumerateFileSystemEntries($Root))
+        } catch {
+          [Console]::Error.WriteLine('pi-review-sessions: Node cache inventory was unavailable; continuing without reclamation.')
+        }
+        $count = 0
+        foreach ($entry in $entries) {
+          if ([IO.Path]::GetFileName($entry) -cne '.admission.lock') { $count++ }
+        }
+        foreach ($entry in $entries) {
+          if ($count -lt 5) { break }
+          $name = [IO.Path]::GetFileName($entry)
+          if ($name -ceq '.admission.lock' -or $name -ceq '.terraform') { continue }
+          if (Test-NodeGenerationActive $entry) { continue }
+          if (Remove-NodeEntry $entry 0) { $count-- }
+        }
+        if ($count -ge 5) {
+          [Console]::Error.WriteLine("pi-review-sessions: Node cache still holds $count generations (target 5); continuing startup.")
+        }
+        Assert-NodeFence $chain
+      } catch {
+        [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup could not complete; continuing startup.')
+      }
+    }
     $candidate = Join-Path $Root ('bootstrap-' + [Guid]::NewGuid().ToString('N'))
     New-ExclusiveDirectory $candidate
-    $identity = Get-PathIdentity $candidate
     Assert-NodeFence $chain
-    $text = "pi-review-gate-node-v1`n$identity`n$([IO.Path]::GetFileName($candidate))`nprotected`n"
-    $record = Join-Path $candidate '.node-lifetime'
-    $stream = [IO.File]::Open($record, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try { $bytes = [Text.Encoding]::UTF8.GetBytes($text); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    # The generation is disposable by location; no lifetime record is written.
+    # A live owner marker keeps other producers from pruning it while the Node
+    # archive is still being downloaded/extracted.
+    $markerPath = Join-Path $candidate '.producer-active'
+    $marker = [IO.File]::Open($markerPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try {
+      $markerBytes = [Text.Encoding]::UTF8.GetBytes([string]$PID)
+      $marker.Write($markerBytes, 0, $markerBytes.Length)
+      $marker.Flush($true)
+    } finally { $marker.Dispose() }
     return $candidate
   } finally {
     if ($null -ne $lock) {
@@ -475,12 +657,14 @@ function New-NodeGeneration([string]$Root) {
 }
 
 $WorkRoot = $null
+$script:NodeGenerationMarker = $null
 try {
   $agentDirectory = Get-AgentDirectory
   $cacheRoot = Ensure-DirectoryTree (Join-Path (Join-Path $agentDirectory '.pi-review-gate') 'node')
   Initialize-IdentityType
   $script:BootstrapCacheFence = Get-NodeFence $cacheRoot
-  $WorkRoot = New-NodeGeneration $cacheRoot
+  $WorkRoot = New-NodeGeneration $cacheRoot $agentDirectory
+  $script:NodeGenerationMarker = Join-Path $WorkRoot '.producer-active'
   $cacheIdentity = Get-PathIdentity $cacheRoot
   $workIdentity = Get-PathIdentity $WorkRoot
   $archivePath = Join-Path $WorkRoot $NodeArchive
@@ -529,10 +713,21 @@ try {
   $FallbackNodeExecutable = $nodeExe
   $FallbackNodeDirectory = $nodeRoot
 } catch {
-  [Console]::Error.WriteLine('pi-review-sessions: isolated Node bootstrap failed: admission busy, capacity exhausted (maximum 5), unsafe path, or download/validation failure; native Windows reclamation is unavailable.')
+  [Console]::Error.WriteLine('pi-review-sessions: isolated Node bootstrap failed: unsafe path or download/validation failure.')
   if ($null -ne $WorkRoot) {
     [Console]::Error.WriteLine('pi-review-sessions: retained bootstrap witness: ' + $WorkRoot)
   }
+  if (-not [string]::IsNullOrEmpty($script:NodeGenerationMarker)) {
+    try { [IO.File]::Delete($script:NodeGenerationMarker) } catch { }
+  }
   exit 1
 }
-Start-SessionCjs $FallbackNodeExecutable $FallbackNodeDirectory $CjsArguments
+# Start-SessionCjs exits the process, so release the in-progress marker in a
+# finally block that still runs on `exit`.
+try {
+  Start-SessionCjs $FallbackNodeExecutable $FallbackNodeDirectory $CjsArguments
+} finally {
+  if (-not [string]::IsNullOrEmpty($script:NodeGenerationMarker)) {
+    try { [IO.File]::Delete($script:NodeGenerationMarker) } catch { }
+  }
+}

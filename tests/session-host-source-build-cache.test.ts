@@ -191,7 +191,9 @@ async function build(fixture: Fixture, counters: Counters, env = fixture.env, ho
   });
   // This helper inspects build output only; it never starts a consumer. Its
   // synchronous fixture runners have settled when the producer returns.
-  if (result.status === 0) assert.equal(result.ownedStage?.generation?.release(), true);
+  // A fresh stage carries the (already settled, idempotent) admission handle;
+  // a cache hit reads no generation at all.
+  if (result.status === 0 && result.ownedStage?.generation) assert.equal(result.ownedStage.generation.release(), true);
   return result;
 }
 
@@ -229,12 +231,7 @@ async function launch(fixture: Fixture, counters: Counters, buildResults: BuildR
       counters.load += 1;
       loaded.push(entry);
       assert.ok(existsSync(entry), "only an available compiled entry is handed to the module loader");
-      return { runSessionHost: (options: { onCacheConsumersSettled: () => void }) => {
-        // This fixture owns no real native child. Explicit settlement, not a
-        // bare numeric zero, models Main's positive lifecycle handoff.
-        options.onCacheConsumersSettled();
-        return 0;
-      } };
+      return { runSessionHost: () => 0 };
     },
     writeOut: () => undefined,
     writeError: (text: string) => diagnostics.push(text),

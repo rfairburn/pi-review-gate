@@ -19,9 +19,13 @@
  *   script is never run, so recursive `clean:build` cannot touch the stage or
  *   live checkout. DDGS provisioning uses the shared Node helper (ensureDdgs
  *   in scripts/pi-review-gate-launcher.cjs) in a bounded owned process.
- *   Producer admission bounds disposable build and Pi caches independently to
- *   five generations, including setup residue. Durable lifetime pins protect
- *   active/uncertain consumers; only explicitly settled generations are reclaimed.
+ *   Each disposable build and Pi cache independently targets five generations,
+ *   including setup residue. These designated cache trees are disposable by
+ *   location, so excess generations are reclaimed regardless of who created a
+ *   descendant or whether legacy lifetime metadata exists. Reclamation is best
+ *   effort: a busy lock or partial filesystem failure is reported and startup
+ *   continues, never stopped by cache capacity. Active sessions stay guarded by
+ *   the session host's own exclusive agent-directory ownership record.
  * - Runtime selection resolves the public @earendil-works/pi-coding-agent
  *   CLI without parsing or executing opaque shims: an explicit
  *   --pi-executable Node entry is honored when valid; otherwise the npm
@@ -32,8 +36,8 @@
  *   provisioned under the native Pi agent directory's cache
  *   (<agent-dir>/.pi-review-gate/pi-runtime) with npm --ignore-scripts and
  *   re-validated before publication. Global installs and existing user
- *   files are never modified; unknown lifetime resources remain counted and
- *   protected. Provisioning installs directly into one reserved generation.
+ *   files are never modified. Provisioning installs inside its own version
+ *   generation so a half-install is never reused.
  * - Shipped-skill provisioning (issue 378) gives the direct sidebar entry
  *   points wrapper-equivalent setup without a wrapper prerequisite: every file
  *   in the canonical SKILL_PUBLISH_PLAN (scripts/pi-review-gate-launcher.cjs)
@@ -376,12 +380,6 @@ function createOwnedStage(parent, prefix, randomBytes = crypto.randomBytes) {
 
 function directoryChainIsSame(chain) {
   return chain.every(({ target, identity }) => sameDirectoryIdentity(target, identity));
-}
-
-/** Legacy unreserved stage handles have no lifetime evidence. Never infer
- * inactivity from their root identity. Reclamation belongs to admission. */
-function removeOwnedStage() {
-  return false;
 }
 
 function closeDirectory(directory) {
@@ -763,11 +761,11 @@ function stagedSourceMatchesFingerprint(sourceFingerprint, stagedFingerprint) {
  * byte-for-byte, source .terraform directories are pruned before descent, and
  * the live checkout's node_modules/dist are never followed or copied.
  */
-function stageSourcePackage(packageRoot, buildCacheRoot, testHooks) {
+function stageSourcePackage(packageRoot, buildCacheRoot, testHooks, warn = () => undefined) {
   const parentChain = ensureDirectoryTree(buildCacheRoot);
   const ownedStage = generations.admit(buildCacheRoot,
     () => createOwnedStage(buildCacheRoot, "pi-review-sessions-"),
-    (root) => prepareSourceCacheRetirement(root, buildCacheRoot, parentChain));
+    { beforeReclaim: (root) => prepareSourceCacheRetirement(root, buildCacheRoot, parentChain), warn });
   try {
     const resolvedPackageRoot = path.resolve(packageRoot);
     const packageChain = process.platform === "win32"
@@ -790,11 +788,13 @@ function stageSourcePackage(packageRoot, buildCacheRoot, testHooks) {
       throw new Error("source or staging root changed during copy");
     }
   } catch (cause) {
-    const preserveStage = Boolean(cause && (cause.preserveStage || cause.retainedStage));
-    if (!preserveStage) ownedStage.generation.release();
-    const removed = false;
+    // End this producer's setup admission; the incomplete generation itself is
+    // disposable by location and is reclaimed by a later cleanup.
+    ownedStage.generation.release();
     const error = new Error("could not stage the source package for building");
-    error.retainedStage = !removed;
+    // The partial generation stays on disk (disposable by location) and is
+    // reclaimed by a later producer cleanup.
+    error.retainedStage = true;
     throw error;
   }
   return ownedStage;
@@ -1189,7 +1189,9 @@ async function buildSourceExtension(options) {
   let cacheLock;
   let mayPublish = false;
   let ownedStage;
-  let producerSettled = true;
+  const warn = (message) => {
+    if (typeof options.writeError === "function") options.writeError(`pi-review-sessions: ${message}.\n`);
+  };
   try {
     sourceFingerprint = fingerprintSourcePackage(packageRoot);
     npmCli = findNpmCli(env);
@@ -1218,12 +1220,11 @@ async function buildSourceExtension(options) {
       if (!verifyToolchainFence(toolchainFence)) return undefined;
       const recordPath = sourceBuildCacheRecordPath(buildCacheRoot, cacheMetadata.cacheKey);
       if (!pathExists(recordPath)) return undefined;
-      let pinned;
+      let candidate;
       try {
-        pinned = generations.pin(buildCacheRoot, () => readSourceBuildCacheRecord(recordPath, buildCacheRoot, cacheMetadata, cacheParentChain));
+        candidate = readSourceBuildCacheRecord(recordPath, buildCacheRoot, cacheMetadata, cacheParentChain);
       } catch { return undefined; }
-      if (!pinned) return undefined;
-      const candidate = pinned.selected;
+      if (!candidate) return undefined;
       const candidateRoot = candidate.root;
       const chain = [...cacheParentChain, { target: candidateRoot, identity: candidate.identity }];
       const cachedStage = {
@@ -1231,7 +1232,6 @@ async function buildSourceExtension(options) {
         identity: candidate.identity,
         parentChain: cacheParentChain,
         chain,
-        generation: pinned.generation,
       };
       return {
         status: 0,
@@ -1281,15 +1281,14 @@ async function buildSourceExtension(options) {
         : "could not fingerprint the source package for building"),
       diagnostics: formatStageErrorDiagnostics(error),
       retainedStage: false,
-      lifetimeSettled: true,
     };
   }
 
   try {
-    ownedStage = stageSourcePackage(packageRoot, buildCacheRoot, options.testHooks);
+    ownedStage = stageSourcePackage(packageRoot, buildCacheRoot, options.testHooks, warn);
   } catch (error) {
     if (cacheLock) cacheLock.release();
-    return { status: 1, stage: "stage", error, lifetimeSettled: true, diagnostics: formatStageErrorDiagnostics(error), retainedStage: Boolean(error && error.retainedStage) };
+    return { status: 1, stage: "stage", error, diagnostics: formatStageErrorDiagnostics(error), retainedStage: Boolean(error && error.retainedStage) };
   }
   const stagingRoot = ownedStage.root;
   try {
@@ -1305,7 +1304,6 @@ async function buildSourceExtension(options) {
     const stagedInputFingerprint = fingerprintSourcePackage(packageRoot);
     if (stagedInputFingerprint.digest !== sourceFingerprint.digest) throw new Error("source changed while preparing the staged build");
     if (toolchainFence && !verifyToolchainFence(toolchainFence)) throw new Error("toolchain identity changed before npm ci");
-    producerSettled = false;
     const install = await executeNpm(npmCli, ["ci", "--include=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--registry", "https://registry.npmjs.org"], {
       cwd: stagingRoot,
       env: buildEnv,
@@ -1314,9 +1312,7 @@ async function buildSourceExtension(options) {
       captureStderr: true,
       maxOutputBytes: SOURCE_BUILD_CAPTURE_MAX_BYTES,
     });
-    producerSettled = install.cleanupConfirmed === true;
     if (install.error || install.status !== 0 || install.signal || install.timedOut || install.outputExceeded || install.cleanupConfirmed === false) {
-      if (producerSettled) ownedStage.generation.release();
       const removed = false;
       return {
         status: statusCode(install),
@@ -1324,7 +1320,6 @@ async function buildSourceExtension(options) {
         childStatus: install.status,
         signal: install.signal,
         cleanupConfirmed: install.cleanupConfirmed,
-        lifetimeSettled: producerSettled,
         timedOut: install.timedOut,
         outputExceeded: install.outputExceeded,
         error: install.error,
@@ -1350,8 +1345,6 @@ async function buildSourceExtension(options) {
     if (toolchainFence && !verifyToolchainFence(toolchainFence)) {
       throw new Error("toolchain identity changed before the TypeScript compile");
     }
-    const installSettled = producerSettled;
-    producerSettled = false;
     const compile = await executeCompile(compiler.file, ["-p", compiler.tsconfig], {
       cwd: stagingRoot,
       env: buildEnv,
@@ -1360,9 +1353,7 @@ async function buildSourceExtension(options) {
       captureStderr: true,
       maxOutputBytes: SOURCE_BUILD_CAPTURE_MAX_BYTES,
     });
-    producerSettled = installSettled && compile.cleanupConfirmed === true;
     if (compile.error || compile.status !== 0 || compile.signal || compile.timedOut || compile.outputExceeded || compile.cleanupConfirmed === false) {
-      if (producerSettled) ownedStage.generation.release();
       const removed = false;
       return {
         status: statusCode(compile),
@@ -1370,7 +1361,6 @@ async function buildSourceExtension(options) {
         childStatus: compile.status,
         signal: compile.signal,
         cleanupConfirmed: compile.cleanupConfirmed,
-        lifetimeSettled: producerSettled,
         timedOut: compile.timedOut,
         outputExceeded: compile.outputExceeded,
         error: compile.error,
@@ -1438,7 +1428,6 @@ async function buildSourceExtension(options) {
         cacheParentChain,
       } : {}),
       cacheHit: false,
-      lifetimeSettled: producerSettled,
       cachePublished,
       ...(options.testHooks ? { testHooks: options.testHooks } : {}),
       ...(verificationEntries !== undefined ? { verificationEntries } : {}),
@@ -1447,19 +1436,20 @@ async function buildSourceExtension(options) {
     return result;
   } catch (error) {
     const cleanupUnconfirmed = Boolean(error && error.cleanupUnconfirmed);
-    if (!cleanupUnconfirmed && producerSettled) ownedStage.generation.release();
     const removed = false;
     return {
       status: 1,
       stage: "stage",
       error,
       cleanupConfirmed: cleanupUnconfirmed ? false : undefined,
-      lifetimeSettled: !cleanupUnconfirmed && producerSettled,
       diagnostics: formatStageErrorDiagnostics(error),
       retainedStage: !removed,
     };
   } finally {
     if (cacheLock) cacheLock.release();
+    // Setup admission settles here, on success or failure. The generation stays
+    // reusable/disposable; only the cache-cleanup mutual exclusion ends.
+    ownedStage.generation.release();
   }
 }
 
@@ -2172,7 +2162,8 @@ function scanBuildArtifact(root, rootIdentity, testHooks, expectedEntries) {
         const name = entry.name;
         // No initialized Terraform content participates in this cache; prune before lstat or descent.
         if (name === ".terraform") continue;
-        if (relativeDirectory === "" && (name === SOURCE_CACHE_MANIFEST || name === generations.RECORD)) continue;
+        if (relativeDirectory === ""
+          && (name === SOURCE_CACHE_MANIFEST || name === generations.RECORD || name === generations.MARKER)) continue;
         if (name.includes("\\")) throw new Error("cached build contains a non-portable path");
         const absolute = path.join(directoryPath, name);
         const relative = relativeDirectory ? `${relativeDirectory}/${name}` : name;
@@ -2669,9 +2660,6 @@ async function provisionPiRuntime(options) {
     { ...validationOptions, processRunner },
   ));
   const runtimeRoot = path.join(agentDir, RUNTIME_CACHE_DIRNAME, PI_RUNTIME_DIRNAME);
-  const versionRoot = path.join(runtimeRoot, `pi-${version}`);
-  const targetNodeModules = path.join(versionRoot, "node_modules");
-  const targetPkgDir = path.join(targetNodeModules, "@earendil-works", "pi-coding-agent");
 
   let runtimeChain;
   try {
@@ -2679,127 +2667,169 @@ async function provisionPiRuntime(options) {
   } catch {
     throw new PiRuntimeError(`could not access the isolated pi runtime cache under ${runtimeRoot}`);
   }
-  let replacement;
-  if (pathExists(versionRoot)) {
-    // Legacy caches remain protected/uncertain, not retroactively marked idle.
-    if (!pathExists(path.join(versionRoot, generations.RECORD))) {
-      return validateCachedPiRuntime(versionRoot, targetPkgDir, env, undefined, runtimeChain, processRunner, version);
-    }
-    const pinned = generations.pin(runtimeRoot, () => ({ root: versionRoot, identity: identityOfDirectory(versionRoot) }));
+  const warn = (message) => writeError(`pi-review-sessions: ${message}.\n`);
+  const fixedBase = `pi-${version}`;
+  const numberedIndex = (name) => (name === fixedBase ? -1 : Number(name.slice(fixedBase.length + 1)));
+  // Compatible reuse first: any existing valid generation for this exact
+  // version is reused (fixed name preferred, then numbered fallbacks). This is
+  // a read-only selection and never creates or removes anything.
+  let reusableNames = [];
+  try {
+    reusableNames = fs.readdirSync(runtimeRoot)
+      .filter((name) => name === fixedBase
+        || (name.startsWith(`${fixedBase}.`) && /^\d+$/u.test(name.slice(fixedBase.length + 1))))
+      .sort((left, right) => numberedIndex(left) - numberedIndex(right));
+  } catch {
+    // A best-effort reuse scan; provisioning below still runs.
+  }
+  for (const name of reusableNames) {
+    const versionRoot = path.join(runtimeRoot, name);
+    let existing;
     try {
-      const cached = await validateCachedPiRuntime(versionRoot, targetPkgDir, env, pinned.selected.identity, runtimeChain, processRunner, version);
-      return { ...cached, generation: pinned.generation };
+      existing = identityOfDirectory(versionRoot);
+    } catch {
+      continue;
+    }
+    try {
+      return await validateCachedPiRuntime(
+        versionRoot,
+        path.join(versionRoot, "node_modules", "@earendil-works", "pi-coding-agent"),
+        env,
+        existing,
+        runtimeChain,
+        processRunner,
+        version,
+      );
     } catch (error) {
       if (error.cleanupUnconfirmed) throw error;
-      const released = pinned.generation?.release() === true;
-      // Failed installs leave only contained .setup output. Retry that exact
-      // version only after positive settlement; never replace a published,
-      // legacy, active, uncertain or unsafe cache merely because validation failed.
-      if (!released || !npmCli || pathExists(targetNodeModules)) throw error;
-      replacement = {
-        root: versionRoot,
-        identity: pinned.selected.identity,
-        eligible: () => {
-          try { fs.lstatSync(targetNodeModules); return false; }
-          catch (cause) { return cause.code === "ENOENT"; }
-        },
-      };
     }
   }
-  if (!npmCli) throw new PiRuntimeError("the public npm Node CLI is not available on PATH; cannot provision Pi");
+  // Provisioning: the fixed root is preferred, then confined numbered
+  // generations without a fixed candidate limit. Cache residue and cleanup
+  // uncertainty therefore cannot stop startup.
+  for (let index = 0; ; index += 1) {
+    const candidateName = index === 0 ? fixedBase : `${fixedBase}.${index}`;
+    const versionRoot = path.join(runtimeRoot, candidateName);
+    const targetNodeModules = path.join(versionRoot, "node_modules");
+    const targetPkgDir = path.join(targetNodeModules, "@earendil-works", "pi-coding-agent");
+    let replacement;
+    if (pathExists(versionRoot)) {
+      let existing;
+      try {
+        existing = identityOfDirectory(versionRoot);
+      } catch {
+        // An unsafe/foreign version root is preserved and fails closed rather
+        // than being silently replaced by another generation.
+        throw new PiRuntimeError(`the cached pi runtime at ${versionRoot} is partial or unsafe; preserving it`);
+      }
+      try {
+        return await validateCachedPiRuntime(versionRoot, targetPkgDir, env, existing, runtimeChain, processRunner, version);
+      } catch (error) {
+        if (error.cleanupUnconfirmed) throw error;
+        // A published runtime (or one that cannot be retried without npm) is
+        // preserved with its truthful validation error. Only a settled
+        // incomplete setup root is retried, and possibly replaced by a fallback.
+        if (!npmCli || pathExists(targetNodeModules)) throw error;
+        replacement = {
+          root: versionRoot,
+          identity: existing,
+          eligible: () => {
+            try { fs.lstatSync(targetNodeModules); return false; }
+            catch (cause) { return cause.code === "ENOENT"; }
+          },
+        };
+      }
+    }
+    if (!npmCli) throw new PiRuntimeError("the public npm Node CLI is not available on PATH; cannot provision Pi");
 
-  let ownedStage;
-  let preserveStage = false;
-  let settled = true;
-  let published = false;
-  try {
-    // The final version root contains both setup residue and publication.
-    // Reserving it first prevents an unaccounted (potentially sixth) tree.
-    ownedStage = generations.admit(runtimeRoot, () => {
-      if (!directoryChainIsSame(runtimeChain)) throw new Error("runtime parent changed");
-      if (typeof beforeVersionRootMkdir === "function") beforeVersionRootMkdir(versionRoot);
-      fs.mkdirSync(versionRoot, { mode: 0o700 });
-      const identity = identityOfDirectory(versionRoot);
-      return { root: versionRoot, identity, parentChain: runtimeChain, chain: [...runtimeChain, { target: versionRoot, identity }] };
-    }, undefined, replacement);
-    if (!directoryChainIsSame(runtimeChain) || !directoryChainIsSame(ownedStage.parentChain)) {
-      const error = new PiRuntimeError(`the pi runtime cache parent changed during staging under ${runtimeRoot}`);
-      error.cleanupUnconfirmed = true;
-      throw error;
+    let ownedStage;
+    let published = false;
+    try {
+      ownedStage = generations.admit(runtimeRoot, () => {
+        if (!directoryChainIsSame(runtimeChain)) throw new Error("runtime parent changed");
+        if (typeof beforeVersionRootMkdir === "function") beforeVersionRootMkdir(versionRoot);
+        fs.mkdirSync(versionRoot, { mode: 0o700 });
+        const identity = identityOfDirectory(versionRoot);
+        return { root: versionRoot, identity, parentChain: runtimeChain, chain: [...runtimeChain, { target: versionRoot, identity }] };
+      }, { replacement, warn });
+      if (!directoryChainIsSame(runtimeChain) || !directoryChainIsSame(ownedStage.parentChain)) {
+        const error = new PiRuntimeError(`the pi runtime cache parent changed during staging under ${runtimeRoot}`);
+        error.cleanupUnconfirmed = true;
+        throw error;
+      }
+    } catch (error) {
+      if (error && error.cleanupUnconfirmed) throw error;
+      if (error && error.code === "EEXIST") {
+        // The destination still exists because cleanup could not reclaim it;
+        // try the next confined generation rather than stopping startup.
+        warn(`could not reclaim ${versionRoot}; provisioning a fresh confined Pi generation`);
+        continue;
+      }
+      if (error && error.retainedStage) {
+        const retained = new PiRuntimeError("the Pi runtime staging directory identity could not be confirmed; preserving the stage");
+        retained.cleanupUnconfirmed = true;
+        throw retained;
+      }
+      throw new PiRuntimeError(`could not reserve pi runtime generation: ${error.message}`);
     }
-  } catch (error) {
-    if (error && error.cleanupUnconfirmed) throw error;
-    if (error && error.retainedStage) {
-      const retained = new PiRuntimeError("the Pi runtime staging directory identity could not be confirmed; preserving the stage");
-      retained.cleanupUnconfirmed = true;
-      throw retained;
-    }
-    throw new PiRuntimeError(`could not reserve pi runtime generation: ${error.message}`);
-  }
-  try {
-    // Keep npm's partial node_modules invisible to cache-hit selection until
-    // validation and atomic in-generation publication. This is NOT another
-    // capacity root; all residue stays within the single reserved generation.
-    const stagingRoot = path.join(ownedStage.root, ".setup");
-    fs.mkdirSync(stagingRoot, { mode: 0o700 });
-    const setupIdentity = identityOfDirectory(stagingRoot);
-    const setupStage = { root: stagingRoot, chain: [...ownedStage.chain, { target: stagingRoot, identity: setupIdentity }] };
-    const installEnv = stageNpmEnvironment(env, setupStage);
-    settled = false;
-    const install = await executeNpm(npmCli, [
-      "install",
-      "--prefix", stagingRoot,
-      "--ignore-scripts",
-      "--no-audit",
-      "--no-fund",
-      "--registry", "https://registry.npmjs.org",
-      `${PI_PACKAGE_NAME}@${version}`,
-    ], {
-      env: installEnv,
-      cwd: stagingRoot,
-      timeoutMs: NPM_INSTALL_TIMEOUT_MS,
-    });
-    settled = install.cleanupConfirmed === true;
-    preserveStage = install.cleanupConfirmed === false;
-    if (install.error || install.status !== 0 || install.signal || install.timedOut || install.outputExceeded || preserveStage) {
-      let result = "could not start";
-      if (preserveStage) result = "cleanup was not confirmed";
-      else if (install.timedOut) result = "timed out";
-      else if (install.signal) result = `was terminated by ${install.signal}`;
-      else if (Number.isInteger(install.status)) result = `exited with status ${install.status}`;
-      throw new PiRuntimeError(`pi runtime provisioning failed (npm install ${result}); re-run the launcher`);
-    }
-    if (!directoryChainIsSame(setupStage.chain)) {
-      preserveStage = true;
-      throw new PiRuntimeError("the pi runtime staging directory chain changed during installation");
-    }
-    const stagedPkgDir = path.join(stagingRoot, "node_modules", "@earendil-works", "pi-coding-agent");
-    const stagedPackageChain = assertDirectoryChain(stagingRoot, stagedPkgDir);
-    const stagedNodeModulesPath = path.join(stagingRoot, "node_modules");
-    const stagedNodeModulesEntry = stagedPackageChain.find(({ target }) => target === stagedNodeModulesPath);
-    if (!stagedNodeModulesEntry) throw new PiRuntimeError("the staged pi package has no positively identified node_modules root");
-    await validatePackage(stagedPkgDir, env, { exactVersion: version });
-    if (!directoryChainIsSame(setupStage.chain) || !directoryChainIsSame(stagedPackageChain) || pathExists(targetNodeModules)) {
-      preserveStage = true; // A competing/replaced producer's lifetime is unknown.
-      throw new PiRuntimeError("the pi runtime staging identity changed during validation");
-    }
-    fs.renameSync(stagedNodeModulesPath, targetNodeModules);
-    if (!directoryChainIsSame(ownedStage.chain) || !sameDirectoryIdentity(targetNodeModules, stagedNodeModulesEntry.identity)) {
-      preserveStage = true;
-      throw new PiRuntimeError("the pi runtime publication identity changed");
-    }
+    try {
+      // Keep npm's partial node_modules invisible to cache-hit selection until
+      // validation and atomic in-generation publication. This is NOT another
+      // capacity root; all residue stays within the single reserved generation.
+      const stagingRoot = path.join(ownedStage.root, ".setup");
+      fs.mkdirSync(stagingRoot, { mode: 0o700 });
+      const setupIdentity = identityOfDirectory(stagingRoot);
+      const setupStage = { root: stagingRoot, chain: [...ownedStage.chain, { target: stagingRoot, identity: setupIdentity }] };
+      const installEnv = stageNpmEnvironment(env, setupStage);
+      const install = await executeNpm(npmCli, [
+        "install",
+        "--prefix", stagingRoot,
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--registry", "https://registry.npmjs.org",
+        `${PI_PACKAGE_NAME}@${version}`,
+      ], {
+        env: installEnv,
+        cwd: stagingRoot,
+        timeoutMs: NPM_INSTALL_TIMEOUT_MS,
+      });
+      if (install.error || install.status !== 0 || install.signal || install.timedOut || install.outputExceeded || install.cleanupConfirmed === false) {
+        let result = "could not start";
+        if (install.cleanupConfirmed === false) result = "cleanup was not confirmed";
+        else if (install.timedOut) result = "timed out";
+        else if (install.signal) result = `was terminated by ${install.signal}`;
+        else if (Number.isInteger(install.status)) result = `exited with status ${install.status}`;
+        throw new PiRuntimeError(`pi runtime provisioning failed (npm install ${result}); re-run the launcher`);
+      }
+      if (!directoryChainIsSame(setupStage.chain)) {
+        throw new PiRuntimeError("the pi runtime staging directory chain changed during installation");
+      }
+      const stagedPkgDir = path.join(stagingRoot, "node_modules", "@earendil-works", "pi-coding-agent");
+      const stagedPackageChain = assertDirectoryChain(stagingRoot, stagedPkgDir);
+      const stagedNodeModulesPath = path.join(stagingRoot, "node_modules");
+      const stagedNodeModulesEntry = stagedPackageChain.find(({ target }) => target === stagedNodeModulesPath);
+      if (!stagedNodeModulesEntry) throw new PiRuntimeError("the staged pi package has no positively identified node_modules root");
+      await validatePackage(stagedPkgDir, env, { exactVersion: version });
+      if (!directoryChainIsSame(setupStage.chain) || !directoryChainIsSame(stagedPackageChain) || pathExists(targetNodeModules)) {
+        throw new PiRuntimeError("the pi runtime staging identity changed during validation");
+      }
+      fs.renameSync(stagedNodeModulesPath, targetNodeModules);
+      if (!directoryChainIsSame(ownedStage.chain) || !sameDirectoryIdentity(targetNodeModules, stagedNodeModulesEntry.identity)) {
+        throw new PiRuntimeError("the pi runtime publication identity changed");
+      }
 
-    const result = await validateCachedPiRuntime(versionRoot, targetPkgDir, env, ownedStage.identity, runtimeChain, processRunner, version);
-    writeError(`pi-review-sessions: installed isolated Pi ${version} runtime at ${runtimeRoot}\n`);
-    published = true;
-    return { ...result, source: "isolated-cache", generation: ownedStage.generation, lifetimeSettled: settled };
-  } catch (error) {
-    if (error && error.cleanupUnconfirmed) preserveStage = true;
-    throw error;
-  } finally {
-    if (!published) {
-      const released = !preserveStage && settled && ownedStage.generation.release() === true;
-      writeError(`pi-review-sessions: retained counted Pi runtime generation (${released ? "settled setup; reclaimable at admission" : "setup lifetime uncertain"}).\n`);
+      const result = await validateCachedPiRuntime(versionRoot, targetPkgDir, env, ownedStage.identity, runtimeChain, processRunner, version);
+      writeError(`pi-review-sessions: installed isolated Pi ${version} runtime at ${runtimeRoot}\n`);
+      published = true;
+      return { ...result, source: "isolated-cache" };
+    } finally {
+      if (!published) {
+        // Retained incomplete setup is disposable by location and is reclaimed by
+        // the next producer cleanup; nothing here can block a later start.
+        writeError("pi-review-sessions: retained an incomplete Pi runtime generation; the next launch reclaims excess cache generations.\n");
+      }
+      ownedStage.generation.release();
     }
   }
 }
@@ -2827,37 +2857,30 @@ async function withManagedPiSelection(candidate, processRunner, validate) {
   catch { canonical = path.resolve(candidate); } // Missing paths still fail the existing validator.
   const managed = managedPiGeneration(canonical);
   if (!managed) return validate(processRunner);
-  let pinned;
+  let selected;
   try {
-    pinned = generations.pin(managed.cacheRoot, () => ({
+    selected = generations.pin(managed.cacheRoot, () => ({
       root: managed.root,
       identity: identityOfDirectory(managed.root),
       chain: assertDirectoryChain(path.parse(managed.root).root, managed.root),
     }));
   } catch {
-    throw new PiRuntimeError("the selected managed Pi runtime lifetime could not be protected; preserving it");
+    throw new PiRuntimeError("the selected managed Pi runtime is unavailable or outside its cache; preserving it");
   }
-  try {
-    const guardedRunner = (file, args, options) => {
-      // Validate aliases against the pinned root again at the actual execution
-      // boundary. A retargeted global/package alias cannot probe an unpinned
-      // sibling generation. Existing package/version validation stays authoritative.
-      const cli = fs.realpathSync(args[0]);
-      const relative = path.relative(managed.root, cli);
-      if (!sameDirectoryIdentity(managed.root, pinned.selected.identity)
-        || !directoryChainIsSame(pinned.selected.chain)
-        || relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-        throw new PiRuntimeError("the selected managed Pi runtime changed before its version probe; preserving it");
-      }
-      return processRunner(file, args, options);
-    };
-    const result = await validate(guardedRunner);
-    return pinned.generation ? { ...result, generation: pinned.generation } : result;
-  } catch (error) {
-    // An unconfirmed probe may still depend on these exact runtime files.
-    if (!error.cleanupUnconfirmed) pinned.generation?.release();
-    throw error;
-  }
+  const guardedRunner = (file, args, options) => {
+    // Validate aliases against the selected root again at the actual execution
+    // boundary. A retargeted global/package alias cannot probe a sibling
+    // generation. Existing package/version validation stays authoritative.
+    const cli = fs.realpathSync(args[0]);
+    const relative = path.relative(managed.root, cli);
+    if (!sameDirectoryIdentity(managed.root, selected.selected.identity)
+      || !directoryChainIsSame(selected.selected.chain)
+      || relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new PiRuntimeError("the selected managed Pi runtime changed before its version probe; preserving it");
+    }
+    return processRunner(file, args, options);
+  };
+  return validate(guardedRunner);
 }
 
 /**
@@ -3049,19 +3072,18 @@ async function runSessionHostLauncher(argv, overrides = {}) {
   const deps = { ...defaultDependencies(), ...overrides };
   // Positive handoff only; the native wrapper still holds its Node pin until
   // the exact CJS process exits. Never expose this one-shot context to children.
-  const preflightFinished = (status) => { deps.onNodeConsumersQuiescent?.(); return status; };
   let parsed;
   try {
     parsed = parseSessionHostArguments(argv);
   } catch (error) {
     const message = error instanceof SessionHostArgumentError ? error.message : "Invalid pi-review-sessions arguments.";
     deps.writeError(`pi-review-sessions: ${message}\n`);
-    return preflightFinished(2);
+    return 2;
   }
 
   if (parsed.help) {
     deps.writeOut(`${USAGE}\n`);
-    return preflightFinished(0);
+    return 0;
   }
 
   const rawInheritedEnv = deps.getEnv();
@@ -3074,7 +3096,7 @@ async function runSessionHostLauncher(argv, overrides = {}) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Invalid session host environment.";
     deps.writeError(`pi-review-sessions: ${message}\n`);
-    return preflightFinished(1);
+    return 1;
   }
 
   // Reject parent startup session overrides before any setup (build, Pi
@@ -3086,26 +3108,26 @@ async function runSessionHostLauncher(argv, overrides = {}) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Invalid pi-review-sessions startup options.";
     deps.writeError(`pi-review-sessions: ${message}\n`);
-    return preflightFinished(2);
+    return 2;
   }
 
   for (const name of ROLE_ENV_NAMES) {
     if (isNonempty(inheritedEnv[name])) {
       deps.writeError(`pi-review-sessions: unsupported role context (${name}).\n`);
-      return preflightFinished(1);
+      return 1;
     }
   }
   if (deps.platform !== "darwin" && deps.platform !== "linux" && deps.platform !== "win32") {
     deps.writeError("pi-review-sessions: the alpha session host supports macOS/Linux and Windows source admission only.\n");
-    return preflightFinished(1);
+    return 1;
   }
   if (!meetsNodeFloor(deps.nodeVersion)) {
     deps.writeError("pi-review-sessions: Node >=22.19.0 is required.\n");
-    return preflightFinished(1);
+    return 1;
   }
   if (!deps.stdinIsTTY || !deps.stdoutIsTTY) {
     deps.writeError("pi-review-sessions: an interactive stdin and stdout are required.\n");
-    return preflightFinished(1);
+    return 1;
   }
 
   // Scrub inherited host bootstrap/restore/settlement values before build, Pi runtime
@@ -3141,43 +3163,18 @@ async function runSessionHostLauncher(argv, overrides = {}) {
   const packageRoot = path.resolve(deps.packageRoot);
   if ([homeDir, agentDir, packageRoot].some((value) => value.length > MAX_PATH_LENGTH || /[\u0000-\u001f\u007f]/u.test(value))) {
     deps.writeError("pi-review-sessions: a required setup path is invalid or too long.\n");
-    return preflightFinished(1);
+    return 1;
   }
   // The host's runtime file lookups (extension entry, reporter, preload,
   // native skill sources) resolve against this root; a staged source build
   // redirects it to the owned stage so nothing is read from the live dist.
   let hostPackageRoot = packageRoot;
-  let ownedSourceStage;
   let sourceBuildResult;
-  let sourceStageHostStarted = false;
-  let consumerSettlementConfirmed = false;
-  let sourceStageSetupUnconfirmed = false;
-  let nodeSetupUnconfirmed = false;
   let piRuntime;
-  const finish = (status) => {
-    // A numeric Main result (even zero) is NOT descendant settlement proof.
-    // Only Main's explicit positive ownership/cleanup handoff releases native
-    // consumers; an absent/failed handoff keeps pins, even with status zero.
-    const nativeSettled = !sourceStageHostStarted || consumerSettlementConfirmed;
-    const release = (generation, type) => {
-      if (generation && generation.release() !== true) deps.writeError(`pi-review-sessions: retaining counted ${type} generation: lifetime release was not confirmed.\n`);
-    };
-    if (nativeSettled) {
-      if (!sourceStageSetupUnconfirmed && sourceBuildResult?.lifetimeSettled !== false) release(ownedSourceStage?.generation, "source");
-      // DDGS consumes the source helper, not Pi. An uncertain DDGS child must
-      // not manufacture a dependency on an otherwise unused Pi generation.
-      if (piRuntime?.lifetimeSettled !== false) release(piRuntime?.generation, "Pi runtime");
-    }
-    if ((!nativeSettled && (ownedSourceStage || piRuntime?.generation)) || (sourceStageSetupUnconfirmed && ownedSourceStage)) {
-      deps.writeError(`pi-review-sessions: retaining cache lifetime pins: ${sourceStageSetupUnconfirmed ? "setup cleanup was not confirmed" : "native consumer settlement is unconfirmed"}.\n`);
-    }
-    if (nativeSettled && !nodeSetupUnconfirmed && !sourceStageSetupUnconfirmed
-      && sourceBuildResult?.lifetimeSettled !== false && piRuntime?.lifetimeSettled !== false) {
-      deps.onNodeConsumersQuiescent?.();
-    }
-    ownedSourceStage = undefined;
-    return status;
-  };
+  // Cache generations are disposable by location and are never pinned by this
+  // launcher; the host's own exclusive agent-directory ownership guards active
+  // sessions. No cache-lifetime handoff exists here any more.
+  const finish = (status) => status;
   const sourceEntry = path.join(packageRoot, "src", "session-host", "main.ts");
   let compiledEntry = path.join(packageRoot, "dist", "src", "session-host", "main.js");
   let sourceCheckout = false;
@@ -3193,7 +3190,7 @@ async function runSessionHostLauncher(argv, overrides = {}) {
     // compiled host from that stage.
     let build;
     try {
-      build = await deps.build({ packageRoot, agentDir, env: setupEnv });
+      build = await deps.build({ packageRoot, agentDir, env: setupEnv, writeError: (text) => deps.writeError(text) });
     } catch {
       deps.writeError("pi-review-sessions: extension build failed.\n");
       return 1;
@@ -3217,22 +3214,20 @@ async function runSessionHostLauncher(argv, overrides = {}) {
       // Bounded, sanitized stderr/stdout from the owned stage child's own
       // streams only; it never carries credentials or the caller's environment.
       if (build && typeof build.diagnostics === "string" && build.diagnostics.length > 0) deps.writeError(build.diagnostics);
-      if (build && build.retainedStage) deps.writeError("pi-review-sessions: a counted source generation was retained; active or uncertain lifetimes remain protected.\n");
-      if (build?.lifetimeSettled === true) deps.onNodeConsumersQuiescent?.();
+      if (build && build.retainedStage) deps.writeError("pi-review-sessions: an incomplete source generation was retained; the next launch reclaims excess cache generations.\n");
       return statusCode(build);
     }
     sourceBuildResult = build;
     if (typeof build.stagingRoot === "string" && build.stagingRoot.length > 0) {
       hostPackageRoot = build.stagingRoot;
       compiledEntry = path.join(build.stagingRoot, "dist", "src", "session-host", "main.js");
-      if (build.ownedStage && build.ownedStage.root === build.stagingRoot) ownedSourceStage = build.ownedStage;
     }
   }
 
   if (!deps.isRegularFile(compiledEntry)
     && !(sourceBuildResult && (sourceBuildResult.cacheHit || sourceBuildResult.cachePublished))) {
     deps.writeError("pi-review-sessions: compiled native session host is unavailable.\n");
-    return finish(2);
+    return 2;
   }
 
   // Resolve or provision the Pi runtime BEFORE any host capability exists:
@@ -3248,16 +3243,15 @@ async function runSessionHostLauncher(argv, overrides = {}) {
       writeError: (text) => deps.writeError(text),
     });
   } catch (error) {
-    // The unresolved Pi producer/probe owns its own runtime pin. It has not
-    // consumed this prepared source build and cannot pin that unrelated type.
-    nodeSetupUnconfirmed = true; // An unresolved probe/setup may consume Node.
+    // The unresolved Pi producer/probe owns its own runtime state. It has not
+    // consumed this prepared source build.
     const message = error instanceof PiRuntimeError ? error.message : "Pi runtime selection failed.";
     deps.writeError(`pi-review-sessions: ${message}\n`);
-    return finish(1);
+    return 1;
   }
   if (!piRuntime || typeof piRuntime.file !== "string" || piRuntime.file.length > MAX_PATH_LENGTH || !path.isAbsolute(piRuntime.file) || typeof piRuntime.version !== "string" || piRuntime.version.length > 64) {
     deps.writeError("pi-review-sessions: Pi runtime selection failed.\n");
-    return finish(1);
+    return 1;
   }
   deps.writeError(`pi-review-sessions: pi runtime: ${piRuntime.file} (v${piRuntime.version}, ${piRuntime.source})\n`);
 
@@ -3288,9 +3282,8 @@ async function runSessionHostLauncher(argv, overrides = {}) {
     const previousRoot = hostPackageRoot;
     let freshBuild;
     try {
-      freshBuild = await deps.build({ packageRoot, agentDir, env: setupEnv, forceFresh: true });
+      freshBuild = await deps.build({ packageRoot, agentDir, env: setupEnv, forceFresh: true, writeError: (text) => deps.writeError(text) });
     } catch {
-      nodeSetupUnconfirmed = true;
       deps.writeError("pi-review-sessions: extension build failed.\n");
       return { ok: false, changed: false };
     }
@@ -3298,18 +3291,13 @@ async function runSessionHostLauncher(argv, overrides = {}) {
       || freshBuild.timedOut || freshBuild.outputExceeded || freshBuild.cleanupConfirmed === false
       || typeof freshBuild.stagingRoot !== "string" || freshBuild.stagingRoot.length === 0
       || freshBuild.stagingRoot === previousRoot || freshBuild.cacheHit === true) {
-      if (freshBuild?.lifetimeSettled !== true) nodeSetupUnconfirmed = true;
       deps.writeError("pi-review-sessions: extension build failed while replacing an invalid cached source build.\n");
       if (freshBuild && typeof freshBuild.diagnostics === "string" && freshBuild.diagnostics.length > 0) deps.writeError(freshBuild.diagnostics);
       return { ok: false, changed: false };
     }
-    if (!sourceStageSetupUnconfirmed && sourceBuildResult?.lifetimeSettled !== false && ownedSourceStage?.generation?.release() === false) {
-      deps.writeError("pi-review-sessions: retaining counted source generation: lifetime release was not confirmed.\n");
-    }
     sourceBuildResult = freshBuild;
     hostPackageRoot = freshBuild.stagingRoot;
     compiledEntry = path.join(hostPackageRoot, "dist", "src", "session-host", "main.js");
-    ownedSourceStage = freshBuild.ownedStage && freshBuild.ownedStage.root === hostPackageRoot ? freshBuild.ownedStage : undefined;
     if (!deps.isRegularFile(compiledEntry)) {
       deps.writeError("pi-review-sessions: compiled native session host is unavailable.\n");
       return { ok: false, changed: false };
@@ -3331,7 +3319,7 @@ async function runSessionHostLauncher(argv, overrides = {}) {
   // No source-cached script is invoked before its complete artifact tree is
   // verified. If the candidate is unsafe or raced, use a separate fresh stage.
   const beforeDdgs = await refreshSourceBuildIfNeeded();
-  if (!beforeDdgs.ok) return finish(1);
+  if (!beforeDdgs.ok) return 1;
 
   // The shared DDGS helper runs in a bounded owned Node process (a POSIX
   // group, but only the direct Windows child). setupEnv is already scrubbed.
@@ -3348,54 +3336,51 @@ async function runSessionHostLauncher(argv, overrides = {}) {
     try {
       result = await deps.ensureDdgs(homeDir, setupEnv, runtimePackageRoot);
     } catch (caught) {
-      nodeSetupUnconfirmed = true;
       error = caught;
     } finally {
       for (const [name, value] of Object.entries(savedTokens)) process.env[name] = value;
     }
-    sourceStageSetupUnconfirmed = Boolean(error && error.cleanupUnconfirmed)
-      || Boolean(result && result.cleanupUnconfirmed);
     return { result, error };
   };
   let ddgsAttempt = await ensureDdgsForRoot(hostPackageRoot);
   if (ddgsAttempt.error) {
     deps.writeError("pi-review-sessions: DDGS setup failed.\n");
-    return finish(1);
+    return 1;
   }
   let ddgs = ddgsAttempt.result;
   if (!ddgs || ddgs.cleanupUnconfirmed || ddgs.ok !== true || typeof ddgs.python !== "string") {
     deps.writeError("pi-review-sessions: DDGS setup failed.\n");
-    return finish(ddgs && Number.isInteger(ddgs.exitCode) ? ddgs.exitCode : 1);
+    return ddgs && Number.isInteger(ddgs.exitCode) ? ddgs.exitCode : 1;
   }
   let python = ddgs.python;
   if (python.length > MAX_PATH_LENGTH || !path.isAbsolute(python) || /[\u0000-\u001f\u007f]/u.test(python)) {
     deps.writeError("pi-review-sessions: DDGS setup failed.\n");
-    return finish(1);
+    return 1;
   }
 
   // Recheck after DDGS and before require. A changed cache is rebuilt privately;
   // DDGS is then revalidated against the replacement package root.
   const afterDdgs = await refreshSourceBuildIfNeeded();
-  if (!afterDdgs.ok) return finish(1);
+  if (!afterDdgs.ok) return 1;
   if (afterDdgs.changed) {
     ddgsAttempt = await ensureDdgsForRoot(hostPackageRoot);
     if (ddgsAttempt.error) {
       deps.writeError("pi-review-sessions: DDGS setup failed.\n");
-      return finish(1);
+      return 1;
     }
     ddgs = ddgsAttempt.result;
     if (!ddgs || ddgs.cleanupUnconfirmed || ddgs.ok !== true || typeof ddgs.python !== "string") {
       deps.writeError("pi-review-sessions: DDGS setup failed.\n");
-      return finish(ddgs && Number.isInteger(ddgs.exitCode) ? ddgs.exitCode : 1);
+      return ddgs && Number.isInteger(ddgs.exitCode) ? ddgs.exitCode : 1;
     }
     python = ddgs.python;
     if (python.length > MAX_PATH_LENGTH || !path.isAbsolute(python) || /[\u0000-\u001f\u007f]/u.test(python)) {
       deps.writeError("pi-review-sessions: DDGS setup failed.\n");
-      return finish(1);
+      return 1;
     }
     if (sourceBuildNeedsFresh()) {
       deps.writeError("pi-review-sessions: source build changed during final startup validation.\n");
-      return finish(1);
+      return 1;
     }
   }
 
@@ -3407,7 +3392,7 @@ async function runSessionHostLauncher(argv, overrides = {}) {
   if (!skills || skills.ok !== true) {
     const detail = skills && typeof skills.error === "string" ? `: ${skills.error}` : "";
     deps.writeError(`pi-review-sessions: shipped skill provisioning failed${detail}.\n`);
-    return finish(1);
+    return 1;
   }
 
   const hostEnv = { ...setupEnv, PI_REVIEW_GATE_DDGS_PYTHON: python };
@@ -3416,11 +3401,11 @@ async function runSessionHostLauncher(argv, overrides = {}) {
     hostModule = deps.loadMain(compiledEntry);
   } catch {
     deps.writeError("pi-review-sessions: native session host startup failed.\n");
-    return finish(1);
+    return 1;
   }
   if (!hostModule || typeof hostModule.runSessionHost !== "function") {
     deps.writeError("pi-review-sessions: native session host startup failed.\n");
-    return finish(1);
+    return 1;
   }
 
   const hostOptions = {
@@ -3430,22 +3415,19 @@ async function runSessionHostLauncher(argv, overrides = {}) {
     ...(parsed.toggleKey !== undefined ? { toggleKey: parsed.toggleKey } : {}),
     args: Object.freeze(parsed.args.slice()),
     env: hostEnv,
-    onCacheConsumersSettled: () => { consumerSettlementConfirmed = true; },
   };
   try {
-    sourceStageHostStarted = true;
     const status = await hostModule.runSessionHost(hostOptions);
-    if (Number.isInteger(status)) return finish(status);
+    if (Number.isInteger(status)) return status;
   } catch {
     // Do not expose arbitrary errors, argv, or native credentials in startup output.
   }
   deps.writeError("pi-review-sessions: native session host startup failed.\n");
-  return finish(1);
+  return 1;
 }
 
 if (require.main === module) {
-  const publishNodeQuiescence = require("./node-bootstrap-lifetime.cjs").consume(process.env);
-  runSessionHostLauncher(process.argv.slice(2), { onNodeConsumersQuiescent: publishNodeQuiescence }).then((status) => {
+  runSessionHostLauncher(process.argv.slice(2)).then((status) => {
     process.exitCode = status;
   }).catch(() => {
     process.stderr.write("pi-review-sessions: native session host startup failed.\n");
@@ -3478,7 +3460,6 @@ module.exports = {
     validateSourceBuildArtifact,
     scanBuildArtifact,
     createOwnedStage,
-    removeOwnedStage,
     findNpmCli,
     findPiOnPath,
     runBoundedProcess,

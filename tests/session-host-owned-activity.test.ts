@@ -53,6 +53,78 @@ function rawTaskEntry(source: string, index = 0): RawRegistryEntry {
   return rawSourceEntry(TASKS, source, index);
 }
 
+/**
+ * Mandatory regression shape for a callback-bearing record whose DERIVED intent
+ * cache was lost while its uncertainty flag still claimed a known value: the
+ * first fresh read is incomplete, so the channel must become refreshably
+ * uncertain WITHOUT fabricating a token set, coercing a zero, or touching
+ * ownership. A source readiness observation ALONE must then let that exact
+ * incarnation's own authoritative callback rebuild the fresh actual inventory
+ * (zero or nonzero), with no second explicit refresh, new work, new source, or
+ * restart.
+ */
+async function assertLostCacheIncompleteReadRecoversFromReadiness(
+  expectedInventory: readonly string[],
+): Promise<void> {
+  activateOwnedActivity();
+  registerReviewActivitySource();
+  let healthy = false;
+  let calls = 0;
+  const execution = registerOwnedActivitySource(TASKS, "execution", {
+    refreshActivity: () => {
+      calls += 1;
+      if (!healthy) return { status: "incomplete" };
+      return { status: "complete", intentTokens: new Set(expectedInventory) };
+    },
+  });
+  // A real ownership obligation that must survive every step untouched.
+  execution.acquire("cleanup-owner");
+  const entry = rawTaskEntry("execution");
+  const incarnation = entry.id;
+  // Lose ONLY the derived ephemeral cache: identity, ownership, the uncertainty
+  // flag (still claiming a known value), and the refresher all stay intact.
+  delete (entry as unknown as { intentTokens?: Set<string> }).intentTokens;
+  assert.equal(entry.intentUncertain, false, "the record still claims a known activity value");
+  assert.equal(activeActivitySnapshot().activeTasks, null, "a lost derived cache is unknown, never zero");
+  assert.equal(ownedActivitySnapshot().backgroundTasks, 1, "the protected ownership token is present");
+
+  // The initial fresh (forced) query happens to be temporarily incomplete.
+  await refreshOwnedActivityIntent();
+  assert.equal(entry.intentUncertain, true,
+    "a callback-bearing record with a missing derived cache becomes refreshably uncertain");
+  assert.equal(entry.intentTokens, undefined, "the invalidation never fabricates a derived set");
+  assert.equal(rawTaskEntry("execution").id, incarnation, "the exact incarnation identity is preserved");
+  assert.equal(activeActivitySnapshot().activeTasks, null, "incomplete stays unknown, never a fabricated zero");
+  assert.equal(ownedActivitySnapshot().backgroundTasks, 1, "ownership is untouched by the uncertainty mark");
+
+  // No self-retry loop: the one follow-up is the already-coalesced pass for the
+  // new uncertainty cause, and a still-incomplete refresher schedules nothing more.
+  await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+  const passes = ownedActivityTest.ownedActivityIntentRefreshPassCount();
+  const callsAfterIncomplete = calls;
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(ownedActivityTest.ownedActivityIntentRefreshPassCount(), passes,
+    "an incomplete refresher never starts another pass on its own");
+  assert.equal(calls, callsAfterIncomplete, "the same owner is not re-read without a real event");
+  assert.equal(activeActivitySnapshot().activeTasks, null, "still truthfully unknown");
+  assert.equal(entry.intentTokens, undefined, "and still without a fabricated set");
+
+  // From here ONLY a source readiness observation: the registry coalesces one
+  // automatic pass that asks this exact owner's authoritative callback.
+  healthy = true;
+  execution.requestIntentRefresh();
+  await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+
+  assert.ok(calls > callsAfterIncomplete, "the readiness event reached the owner's own authoritative callback");
+  assert.equal(activeActivitySnapshot().activeTasks, expectedInventory.length,
+    "the fresh actual inventory is observed without a second explicit refresh");
+  assert.deepEqual([...rawTaskEntry("execution").intentTokens!], [...expectedInventory]);
+  assert.equal(rawTaskEntry("execution").intentUncertain, false, "the rebuilt inventory is authoritatively known");
+  assert.equal(rawTaskEntry("execution").id, incarnation, "no recovery replaces the incarnation");
+  assert.equal(ownedActivitySnapshot().backgroundTasks, 1, "the protected ownership token is untouched");
+}
+
 /** Shape of a reload-durable record written by an earlier module copy. */
 interface LegacyRegistryRecord {
   id: string;
@@ -1622,6 +1694,151 @@ describe("owned-activity authoritative intent refresh", () => {
     assert.equal(rawTaskEntry("execution").id, incarnation, "no rebuild replaces the incarnation");
   });
 
+  for (const scenario of [
+    { label: "an actual zero inventory", inventory: [] as readonly string[], expected: 0 },
+    { label: "an actual nonzero inventory", inventory: ["task-real"] as readonly string[], expected: 1 },
+  ]) {
+    it(`recovers a lost-cache incomplete read from readiness alone (${scenario.label})`, async () => {
+      await assertLostCacheIncompleteReadRecoversFromReadiness(scenario.inventory);
+      assert.equal(activeActivitySnapshot().activeTasks, scenario.expected);
+    });
+  }
+
+  it("marks a lost-cache timed-out read uncertain so the same owner can still prove its inventory", async () => {
+    // The finite deadline releases only the ephemeral read lease. A
+    // callback-bearing record whose derived cache is lost must then be
+    // refreshably uncertain (never a fabricated set or a cached value), so its
+    // own later authoritative read can establish the real inventory.
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    ownedActivityTest.setIntentRefreshReadDeadlineForTests(25);
+    let healthy = false;
+    let calls = 0;
+    const execution = registerOwnedActivitySource(TASKS, "execution", {
+      refreshActivity: () => {
+        calls += 1;
+        if (!healthy) return new Promise<never>(() => undefined); // never answers
+        return { status: "complete" as const, intentTokens: new Set(["task-real"]) };
+      },
+    });
+    execution.acquire("cleanup-owner");
+    const entry = rawTaskEntry("execution");
+    delete (entry as unknown as { intentTokens?: Set<string> }).intentTokens;
+    assert.equal(activeActivitySnapshot().activeTasks, null);
+
+    await refreshOwnedActivityIntent();
+    assert.ok(calls >= 2, `the finite deadline allows one bounded re-read (calls=${calls})`);
+    assert.equal(entry.intentUncertain, true, "the expired read marks the missing-cache channel uncertain");
+    assert.equal(entry.intentTokens, undefined, "the expiry never fabricates a derived set");
+    assert.equal(activeActivitySnapshot().activeTasks, null, "never a cached or fabricated count");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 1, "ownership is untouched by the expired read");
+
+    healthy = true;
+    execution.requestIntentRefresh();
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "readiness alone lets the owner establish its real inventory");
+    assert.deepEqual([...rawTaskEntry("execution").intentTokens!], ["task-real"]);
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 1);
+  });
+
+  it("marks a lost-cache readiness-fenced read unproven and rebuilds it from the owner", async () => {
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    let signalEntered!: () => void;
+    const readEntered = new Promise<void>((resolve) => { signalEntered = resolve; });
+    let reads = 0;
+    const execution = registerOwnedActivitySource(TASKS, "execution", {
+      refreshActivity: async () => {
+        reads += 1;
+        if (reads === 1) { signalEntered(); await readGate; }
+        return { status: "complete" as const, intentTokens: new Set(["task-real"]) };
+      },
+    });
+    execution.acquire("cleanup-owner");
+    const entry = rawTaskEntry("execution");
+    delete (entry as unknown as { intentTokens?: Set<string> }).intentTokens;
+    assert.equal(activeActivitySnapshot().activeTasks, null);
+
+    const pass = refreshOwnedActivityIntent();
+    await readEntered;
+    // A readiness/lifecycle generation change is not an authoritative intent
+    // observation: the fenced read is discarded. For a missing-cache record that
+    // discard IS an unproven activity channel, not a silent no-op.
+    execution.requestIntentRefresh();
+    releaseRead();
+    await pass;
+    assert.equal(reads, 2,
+      "the readiness-fenced lost-cache read is unproven, so the initiator re-reads the owner once");
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the bounded fresh pass rebuilds the real inventory from the owner");
+    assert.deepEqual([...rawTaskEntry("execution").intentTokens!], ["task-real"]);
+    assert.equal(rawTaskEntry("execution").intentUncertain, false, "the rebuilt inventory is known");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 1, "ownership is unchanged throughout");
+
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "later coalesced passes keep the recovered value");
+  });
+
+  it("marks a lost-cache legacy-fence discard unproven so its fresh pass can rebuild it", async () => {
+    // A record written by an earlier code incarnation keeps the common-revision
+    // fence. When its missing derived cache makes a read ambiguous (an older
+    // copy's ownership-only closure advanced the fence), the channel must fall
+    // back to truthful unknown — with the refresher still able to rebuild it —
+    // instead of silently staying an unproven legacy unknown.
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    let signalEntered!: () => void;
+    const readEntered = new Promise<void>((resolve) => { signalEntered = resolve; });
+    const legacyEntry = (id: string): Record<string, unknown> => ({
+      id,
+      tokens: new Set<string>(),
+      uncertain: false,
+      retired: false,
+      intentTokens: new Set<string>(),
+      intentUncertain: false,
+      revision: 0,
+    });
+    const legacyExecution: Record<string, unknown> = legacyEntry("exec-legacy-lost-cache");
+    // Only the derived cache is missing; the refresher is authoritative.
+    delete legacyExecution.intentTokens;
+    (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] = {
+      active: true,
+      sources: new Map([
+        [TASKS, new Map([
+          ["execution", [legacyExecution]],
+          ["review", [legacyEntry("rev-legacy-lost-cache")]],
+        ])],
+        [SHELLS, new Map([["background-shell", [legacyEntry("sh-legacy-lost-cache")]]])],
+      ]),
+      listeners: new Set<() => void>(),
+    };
+    let reads = 0;
+    legacyExecution.refreshActivity = async () => {
+      reads += 1;
+      if (reads === 1) { signalEntered(); await readGate; }
+      return { status: "complete" as const, intentTokens: new Set(["task-real"]) };
+    };
+    assert.equal(activeActivitySnapshot().activeTasks, null, "the missing cache is unknown");
+
+    const pass = refreshOwnedActivityIntent();
+    await readEntered;
+    // The older module copy's ownership-only closure advances only `revision`.
+    legacyExecution.revision = (legacyExecution.revision as number) + 1;
+    releaseRead();
+    await pass;
+    assert.equal(reads, 2,
+      "the ambiguous lost-cache read is discarded and one bounded fresh pass re-reads the owner");
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the stable fence then rebuilds the real authoritative inventory");
+    assert.deepEqual([...(legacyExecution.intentTokens as Set<string>)], ["task-real"]);
+    assert.equal(legacyExecution.intentUncertain, false, "the rebuilt inventory is authoritatively known");
+    assert.deepEqual([...(legacyExecution.tokens as Set<string>)], [],
+      "the ownership channel is untouched by activity recovery");
+  });
+
   it("keeps a no-callback legacy record intent-unknown without fabricating history", async () => {
     // A pre-intent reload record carries no authoritative refresher, so no
     // current inventory can ever prove it: it stays unknown, its ownership is
@@ -1669,6 +1886,8 @@ describe("owned-activity authoritative intent refresh", () => {
       assert.equal(ownedActivitySnapshot().backgroundTasks, 1, "ownership is never cleared by activity refresh");
       assert.equal("intentTokens" in legacyExecution, false, "no derived history is fabricated for the legacy record");
     }
+    assert.equal("intentUncertain" in legacyExecution, false,
+      "a record that can never prove its own inventory is left entirely untouched");
   });
 
   it("still coalesces fresh requests onto a still-current in-flight read", async () => {

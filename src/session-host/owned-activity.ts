@@ -827,9 +827,20 @@ function noteRefreshableUncertainty(entry: SourceIncarnation): void {
  * Mark one exact incarnation's activity-intent channel unproven. Both fences
  * advance: the invalidation is itself an intent-generational event, and the
  * common revision keeps ownership/retired reconciliation conservative.
+ *
+ * A record with neither an intent cache nor an authoritative refresher is a
+ * pre-intent legacy record: its activity set was never observed, so it stays
+ * UNKNOWN and untouched (never marked, never given a derived set). A
+ * CALLBACK-bearing record whose DERIVED cache is missing (`intentTokens`
+ * deleted) is different: the invalidation says nothing about the work, so its
+ * channel must become refreshably uncertain — exactly like an invalidated cached
+ * set — so its own authoritative refresher can rebuild it later from the real
+ * inventory. No token is allocated, no zero is coerced, and ownership is never
+ * touched by this uncertainty mark.
  */
 function markIntentUnproven(entry: SourceIncarnation): boolean {
-  if (entry.intentTokens === undefined) return false;
+  // Only a record that can never prove its own inventory stays untouched.
+  if (entry.intentTokens === undefined && entry.refreshActivity === undefined) return false;
   if (!markEntryIntentUncertain(entry)) return false;
   entry.revision = (entry.revision ?? 0) + 1;
   bumpIntentGeneration(entry);
@@ -856,7 +867,9 @@ function markLegacyDiscardUnproven(
   const liveState = registryState(false);
   if (liveState !== state || !liveState.active) return false;
   const liveEntry = findIncarnation(liveState, candidate.category, candidate.source, candidate.entry.id);
-  if (liveEntry === undefined || liveEntry.intentTokens === undefined) return false;
+  // A missing DERIVED cache is not disqualifying here either; only a record with
+  // no authoritative refresher stays unknown, and `markIntentUnproven` decides.
+  if (liveEntry === undefined) return false;
   if (intentGenerationFence(liveEntry) === candidate.fence) return false; // nothing superseded it
   return markIntentUnproven(liveEntry);
 }
@@ -877,7 +890,10 @@ function markNewIntentDiscardUnproven(
   entry: SourceIncarnation,
 ): boolean {
   if (entry.retired) return false;
-  if (entry.intentTokens === undefined) return false;
+  // A missing DERIVED cache does not disqualify the invalidation: a
+  // callback-bearing record must still become refreshably uncertain, while a
+  // record with no authoritative refresher stays unknown (see
+  // {@link markIntentUnproven}).
   if (entry.intentUncertain === true) return false;
   if (entry.intentAuthorityRevision !== candidate.authority) return false;
   return markIntentUnproven(entry);

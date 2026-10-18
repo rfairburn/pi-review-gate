@@ -11,6 +11,7 @@ import {
   isOwnedActivityActive,
   ownedActivitySnapshot,
   reconcileRetiredExecutionActivity,
+  refreshOwnedActivityIntent,
   registerOwnedActivitySource,
   OWNED_ACTIVITY_STATE_KEY,
   type OwnedActivitySourceHandle,
@@ -31,7 +32,7 @@ import {
   releaseOperationOwner,
   writeOperationRecord,
 } from "../src/execution/operation-record";
-import { boundedScalingConfig, initGitRepo } from "./helpers/background-controller-fixtures";
+import { boundedScalingConfig, initGitRepo, settleOldestUnsettled } from "./helpers/background-controller-fixtures";
 
 const EMPTY_ASSOCIATIONS = { waveRoots: [], bundles: [], groupRoots: [] };
 
@@ -1201,5 +1202,489 @@ test("lost runtime and force-merge owners remain unknown instead of being suppre
       ownedActivityTest.resetOwnedActivityForTests();
       await rm(root, { recursive: true, force: true });
     }
+  }
+});
+
+test("historical ownership failure cannot latch a sealed fresh owner's retired intent unknown", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-retired-intent-empty-"));
+  try {
+    completeExpectedSources();
+    const old = controller(() => root);
+    // Non-authoritative historical fallback: cleanup ownership can never be
+    // proven from this roster, and this runtime admitted nothing.
+    await old.restore({ waveRoots: [], bundles: [] }, { authoritative: false });
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "a runtime that admitted nothing is a known zero even from a fallback restore");
+
+    await old.detach();
+    const nextCwd = join(root, "replacement-session");
+    await mkdir(nextCwd);
+    const replacement = controller(() => nextCwd);
+    await replacement.restore(EMPTY_ASSOCIATIONS);
+
+    for (const pass of [1, 2]) {
+      await refreshOwnedActivityIntent();
+      assert.equal(activeActivitySnapshot().activeTasks, 0,
+        `forced pass ${pass} proves the exact old owner's real zero instead of a sticky unknown`);
+      assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+        `forced pass ${pass} leaves the independently unknown historical ownership untouched`);
+    }
+    const registry = (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] as {
+      sources: Map<string, Map<string, Array<{
+        retired: boolean;
+        intentTokens: Set<string>;
+        intentUncertain: boolean;
+      }>>>;
+    };
+    const retired = registry.sources.get("backgroundTasks")!.get("execution")!.find((entry) => entry.retired)!;
+    assert.deepEqual([...retired.intentTokens], [], "no activity token is invented for the sealed empty owner");
+    assert.equal(retired.intentUncertain, false, "the independent exact-owner intent proof resolves its own channel");
+    await replacement.detach();
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a real locally queued task stays counted across replacement from the same historical fallback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-retired-intent-queued-"));
+  let executionRoot: string | undefined;
+  try {
+    await initGitRepo(root);
+    completeExpectedSources();
+    const old = controller(() => root);
+    await old.restore({ waveRoots: [], bundles: [] }, { authoritative: false });
+    const started = await old.start([{
+      title: "queued across replacement",
+      instructions: "run",
+      acceptanceCriteria: ["done"],
+    }]);
+    executionRoot = started.root;
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "the admission is immediate intent");
+    const manifest = join(started.root, "execution.json");
+    const durableBefore = await readFile(manifest);
+    await old.detach();
+
+    const nextCwd = join(root, "next-session");
+    await mkdir(nextCwd);
+    const replacement = controller(() => nextCwd);
+    await replacement.restore(EMPTY_ASSOCIATIONS);
+    for (const pass of [1, 2]) {
+      await refreshOwnedActivityIntent();
+      assert.equal(activeActivitySnapshot().activeTasks, 1,
+        `forced pass ${pass} re-proves the exact old owner's queued work across replacement`);
+    }
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "the queued intent does not fabricate historical cleanup ownership");
+    assert.deepEqual(await readFile(manifest), durableBefore,
+      "the read-only retired intent census performs no durable write");
+    await replacement.detach();
+  } finally {
+    if (executionRoot) await rm(executionRoot, { recursive: true, force: true });
+    ownedActivityTest.resetOwnedActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("settled local work retires to a proven zero while its historical ownership stays unknown", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-retired-intent-settled-"));
+  let executionRoot: string | undefined;
+  try {
+    await initGitRepo(root);
+    completeExpectedSources();
+    const old = controller(() => root);
+    await old.restore({ waveRoots: [], bundles: [] }, { authoritative: false });
+    const started = await old.start([{
+      title: "settled before replacement",
+      instructions: "run",
+      acceptanceCriteria: ["done"],
+    }]);
+    executionRoot = started.root;
+    await settleOldestUnsettled(old, started.executionId, "retired intent settled");
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "the settled task is no longer activity");
+    await old.detach();
+
+    const nextCwd = join(root, "next-session");
+    await mkdir(nextCwd);
+    const replacement = controller(() => nextCwd);
+    await replacement.restore(EMPTY_ASSOCIATIONS);
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "the exact old owner's own settled record proves the retired zero");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "a settled intent record does not clear unknown historical ownership");
+    await replacement.detach();
+  } finally {
+    if (executionRoot) await rm(executionRoot, { recursive: true, force: true });
+    ownedActivityTest.resetOwnedActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an unreadable locally owned record keeps retired intent unknown instead of inventing zero", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-retired-intent-unreadable-"));
+  let executionRoot: string | undefined;
+  try {
+    await initGitRepo(root);
+    completeExpectedSources();
+    const old = controller(() => root);
+    await old.restore({ waveRoots: [], bundles: [] }, { authoritative: false });
+    const started = await old.start([{
+      title: "unreadable local record",
+      instructions: "run",
+      acceptanceCriteria: ["done"],
+    }]);
+    executionRoot = started.root;
+    await old.detach();
+    await writeFile(join(started.root, "execution.json"), "{}\n");
+
+    const nextCwd = join(root, "next-session");
+    await mkdir(nextCwd);
+    const replacement = controller(() => nextCwd);
+    await replacement.restore(EMPTY_ASSOCIATIONS);
+    await refreshOwnedActivityIntent();
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "only a readable authentic local record may prove the retired activity value");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null,
+      "the unreadable local record keeps ownership unknown as before");
+    await replacement.detach();
+  } finally {
+    if (executionRoot) await rm(executionRoot, { recursive: true, force: true });
+    ownedActivityTest.resetOwnedActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a retired intent census racing a late admission is discarded instead of publishing zero", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-retired-intent-admission-race-"));
+  let executionRoot: string | undefined;
+  let lateRoot: string | undefined;
+  try {
+    await initGitRepo(root);
+    completeExpectedSources();
+    const old = controller(() => root);
+    await old.restore(EMPTY_ASSOCIATIONS);
+    const started = await old.start([{
+      title: "settled local record",
+      instructions: "run",
+      acceptanceCriteria: ["done"],
+    }]);
+    executionRoot = started.root;
+    const internals = old as unknown as {
+      groups: Map<string, BackgroundExecutionGroup>;
+      save(group: BackgroundExecutionGroup): Promise<unknown>;
+      ownedActivity: OwnedActivitySourceHandle;
+      readCensusOperation(
+        group: BackgroundExecutionGroup,
+        task: BackgroundTaskRecord,
+        associationRevision?: number,
+      ): Promise<{ status: string }>;
+      resolveExecutionTarget(workspace?: string): Promise<string>;
+    };
+    const group = internals.groups.get(started.executionId)!;
+    const task = group.tasks[0]!;
+    const artifactDir = join(group.root, "artifacts", task.taskId);
+    await mkdir(artifactDir, { recursive: true });
+    const operation = createOperationRecord({
+      waveId: "wave-retired-admission-race",
+      taskId: task.taskId,
+      title: task.definition.title,
+      worktreeRoot: group.cwd,
+      effectiveCwd: group.cwd,
+      artifactDir,
+      retryBudget: 0,
+    });
+    acquireOperationOwner(operation);
+    releaseOperationOwner(operation);
+    await writeOperationRecord(operation);
+    task.waveRoot = group.root;
+    task.generation = 1;
+    task.bundle = createReattachmentBundle(operation, group.root);
+    transitionTaskState(task, "failed");
+    await internals.save(group);
+    // Make the retired source a candidate for the forced fresh pass.
+    internals.ownedActivity.markIntentUncertain();
+    await old.detach();
+
+    const nextCwd = join(root, "replacement-session");
+    await mkdir(nextCwd);
+    const replacement = controller(() => nextCwd);
+    await replacement.restore(EMPTY_ASSOCIATIONS);
+
+    // Hold the retired intent census inside its read-only operation evidence.
+    const originalRead = internals.readCensusOperation.bind(old);
+    let releaseCensus!: () => void;
+    const censusBarrier = new Promise<void>((resolve) => { releaseCensus = resolve; });
+    let signalCensus!: () => void;
+    const censusEntered = new Promise<void>((resolve) => { signalCensus = resolve; });
+    let gateCensus = true;
+    internals.readCensusOperation = async (readGroup, readTask, associationRevision) => {
+      if (gateCensus) {
+        gateCensus = false;
+        signalCensus();
+        await censusBarrier;
+      }
+      return originalRead(readGroup, readTask, associationRevision);
+    };
+    // Hold a late start admission after its synchronous revision bump but
+    // before any activity token is acquired.
+    const originalTarget = internals.resolveExecutionTarget.bind(old);
+    let releaseAdmission!: () => void;
+    const admissionBarrier = new Promise<void>((resolve) => { releaseAdmission = resolve; });
+    let signalAdmission!: () => void;
+    const admissionEntered = new Promise<void>((resolve) => { signalAdmission = resolve; });
+    internals.resolveExecutionTarget = async (workspace?: string) => {
+      signalAdmission();
+      await admissionBarrier;
+      return originalTarget(workspace);
+    };
+
+    const pass = refreshOwnedActivityIntent();
+    await censusEntered;
+    const lateAdmission = old.start([{
+      title: "late post-detach admission",
+      instructions: "run",
+      acceptanceCriteria: ["done"],
+    }]).catch((error: unknown) => error as Error);
+    await admissionEntered;
+    releaseCensus();
+    await pass;
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "the stale pre-admission read is discarded, never a false zero during an unresolved admission");
+
+    releaseAdmission();
+    const lateResult = await lateAdmission;
+    if (lateResult instanceof Error) throw lateResult;
+    lateRoot = lateResult.root;
+    await settleOldestUnsettled(old, lateResult.executionId, "late post-detach admission settled");
+    await old.detach();
+    await replacement.detach();
+  } finally {
+    if (lateRoot) await rm(lateRoot, { recursive: true, force: true });
+    if (executionRoot) await rm(executionRoot, { recursive: true, force: true });
+    ownedActivityTest.resetOwnedActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a completed retired zero is discarded when a late admission starts before registry application", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-retired-intent-apply-race-"));
+  let lateRoot: string | undefined;
+  try {
+    activateOwnedActivity();
+    // Another owning source keeps the registry's pass pending AFTER the retired
+    // zero callback has already completed.
+    let releaseReview!: () => void;
+    const reviewBarrier = new Promise<void>((resolve) => { releaseReview = resolve; });
+    let signalReview!: () => void;
+    const reviewEntered = new Promise<void>((resolve) => { signalReview = resolve; });
+    registerOwnedActivitySource("backgroundTasks", "review", {
+      refreshActivity: async () => {
+        signalReview();
+        await reviewBarrier;
+        return { status: "complete", intentTokens: new Set() };
+      },
+    });
+    registerOwnedActivitySource("backgroundShells", "background-shell", {
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set() }),
+    });
+
+    const old = controller(() => root);
+    await old.restore(EMPTY_ASSOCIATIONS);
+    await old.detach();
+    const nextCwd = join(root, "replacement-session");
+    await mkdir(nextCwd);
+    const replacement = controller(() => nextCwd);
+    await replacement.restore(EMPTY_ASSOCIATIONS);
+
+    const internals = old as unknown as {
+      ownedActivity: OwnedActivitySourceHandle;
+      refreshCurrentActivityIntent(): Promise<unknown>;
+      resolveExecutionTarget(workspace?: string): Promise<string>;
+    };
+    let signalRetiredDone!: () => void;
+    const retiredDone = new Promise<void>((resolve) => { signalRetiredDone = resolve; });
+    const originalRefresh = internals.refreshCurrentActivityIntent.bind(old);
+    internals.refreshCurrentActivityIntent = async () => {
+      const result = await originalRefresh();
+      signalRetiredDone();
+      return result;
+    };
+    // Hold a late start admission after its synchronous revision bump but before
+    // any activity token is acquired, so the registry revision stays unchanged.
+    let releaseAdmission!: () => void;
+    const admissionBarrier = new Promise<void>((resolve) => { releaseAdmission = resolve; });
+    let signalAdmission!: () => void;
+    const admissionEntered = new Promise<void>((resolve) => { signalAdmission = resolve; });
+    const originalTarget = internals.resolveExecutionTarget.bind(old);
+    internals.resolveExecutionTarget = async (workspace?: string) => {
+      signalAdmission();
+      await admissionBarrier;
+      return originalTarget(workspace);
+    };
+
+    // Let any coalesced pass settle so the retired zero proof below belongs to
+    // the forced pass this test drives.
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    internals.ownedActivity.markIntentUncertain();
+    const pass = refreshOwnedActivityIntent();
+    await retiredDone;
+    await reviewEntered;
+
+    const lateAdmission = old.start([{
+      title: "late post-detach admission",
+      instructions: "run",
+      acceptanceCriteria: ["done"],
+    }]).catch((error: unknown) => error as Error);
+    await admissionEntered;
+    releaseReview();
+    await pass;
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "the completed zero is not applied after a late admission invalidated the exact owner's seal");
+    const registry = (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] as {
+      sources: Map<string, Map<string, Array<{
+        retired: boolean;
+        intentTokens: Set<string>;
+        intentUncertain: boolean;
+      }>>>;
+    };
+    const retired = registry.sources.get("backgroundTasks")!.get("execution")!.find((entry) => entry.retired)!;
+    assert.equal(retired.intentUncertain, true,
+      "the stale proof cannot resolve the exact owner's uncertainty at application time");
+    assert.deepEqual([...retired.intentTokens], [], "no token is fabricated from the discarded proof");
+
+    releaseAdmission();
+    const lateResult = await lateAdmission;
+    if (lateResult instanceof Error) throw lateResult;
+    lateRoot = lateResult.root;
+    await settleOldestUnsettled(old, lateResult.executionId, "apply-race admission settled");
+    await old.detach();
+    await replacement.detach();
+  } finally {
+    if (lateRoot) await rm(lateRoot, { recursive: true, force: true });
+    ownedActivityTest.resetOwnedActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a completed retired zero is discarded when a sibling owner delays normal reconciliation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-retired-intent-reconcile-race-"));
+  let lateRoot: string | undefined;
+  try {
+    activateOwnedActivity();
+    // Gate every intent-refresh pass on a held review refresher so the separate
+    // forced path cannot resolve the controller's uncertainty first.
+    let releaseReview!: () => void;
+    const reviewBarrier = new Promise<void>((resolve) => { releaseReview = resolve; });
+    let signalReview!: () => void;
+    const reviewEntered = new Promise<void>((resolve) => { signalReview = resolve; });
+    registerOwnedActivitySource("backgroundTasks", "review", {
+      intentUncertain: true,
+      refreshActivity: async () => {
+        signalReview();
+        await reviewBarrier;
+        return { status: "complete", intentTokens: new Set() };
+      },
+    });
+    registerOwnedActivitySource("backgroundShells", "background-shell", {
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set() }),
+    });
+    await reviewEntered; // the coalesced intent pass is in flight and held
+
+    const old = controller(() => root);
+    await old.restore(EMPTY_ASSOCIATIONS);
+    await old.detach();
+
+    // A sibling retired execution owner whose reconciliation stays pending, so
+    // the controller's completed zero is not consumed until after the race.
+    let releaseSibling!: () => void;
+    const siblingBarrier = new Promise<void>((resolve) => { releaseSibling = resolve; });
+    let signalSibling!: () => void;
+    const siblingEntered = new Promise<void>((resolve) => { signalSibling = resolve; });
+    registerOwnedActivitySource("backgroundTasks", "execution", {
+      uncertain: true,
+      reconcileRetired: async () => {
+        signalSibling();
+        await siblingBarrier;
+        return {
+          ownership: { complete: true as const, tokens: [], released: [] },
+          intent: { complete: true as const, tokens: [], released: [] },
+        };
+      },
+    });
+
+    const nextCwd = join(root, "replacement-session");
+    await mkdir(nextCwd);
+    const replacement = controller(() => nextCwd);
+    await replacement.restore(EMPTY_ASSOCIATIONS);
+
+    const internals = old as unknown as {
+      ownedActivity: OwnedActivitySourceHandle;
+      reconcileRetiredActivity(retained: unknown, mode?: unknown): Promise<unknown>;
+      resolveExecutionTarget(workspace?: string): Promise<string>;
+    };
+    let signalCensusDone!: () => void;
+    const censusDone = new Promise<void>((resolve) => { signalCensusDone = resolve; });
+    const originalReconcile = internals.reconcileRetiredActivity.bind(old);
+    internals.reconcileRetiredActivity = async (retained: unknown, mode?: unknown) => {
+      const result = await originalReconcile(retained, mode);
+      signalCensusDone();
+      return result;
+    };
+    // Hold a late admission after its synchronous revision bump but before any
+    // activity token is acquired, so the registry revision stays unchanged.
+    let releaseAdmission!: () => void;
+    const admissionBarrier = new Promise<void>((resolve) => { releaseAdmission = resolve; });
+    let signalAdmission!: () => void;
+    const admissionEntered = new Promise<void>((resolve) => { signalAdmission = resolve; });
+    const originalTarget = internals.resolveExecutionTarget.bind(old);
+    internals.resolveExecutionTarget = async (workspace?: string) => {
+      signalAdmission();
+      await admissionBarrier;
+      return originalTarget(workspace);
+    };
+
+    internals.ownedActivity.markIntentUncertain();
+    const reconcile = reconcileRetiredExecutionActivity();
+    await censusDone;
+    await siblingEntered;
+
+    const lateAdmission = old.start([{
+      title: "late post-detach admission",
+      instructions: "run",
+      acceptanceCriteria: ["done"],
+    }]).catch((error: unknown) => error as Error);
+    await admissionEntered;
+    releaseSibling();
+    await reconcile;
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "the completed zero is not consumed after the exact owner's seal changed");
+    const registry = (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] as {
+      sources: Map<string, Map<string, Array<{
+        retired: boolean;
+        intentTokens: Set<string>;
+        intentUncertain: boolean;
+      }>>>;
+    };
+    const retired = registry.sources.get("backgroundTasks")!.get("execution")!
+      .find((entry) => entry.retired && entry.intentUncertain === true)!;
+    assert.ok(retired, "the controller incarnation keeps its own unknown intent channel");
+    assert.deepEqual([...retired.intentTokens], [], "the stale proof releases no retained token");
+
+    releaseReview();
+    releaseAdmission();
+    const lateResult = await lateAdmission;
+    if (lateResult instanceof Error) throw lateResult;
+    lateRoot = lateResult.root;
+    await settleOldestUnsettled(old, lateResult.executionId, "reconcile-race admission settled");
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    await old.detach();
+    await replacement.detach();
+  } finally {
+    if (lateRoot) await rm(lateRoot, { recursive: true, force: true });
+    ownedActivityTest.resetOwnedActivityForTests();
+    await rm(root, { recursive: true, force: true });
   }
 });

@@ -27,6 +27,29 @@ or unreadable roster state is reported and preserved untouched, so a damaged rea
 erases a valid roster; a symlinked, FIFO, or otherwise unsafe roster or ownership entry is
 refused without ever being opened or read.
 
+### Session-host activity status recovery
+
+Sidebar activity counts are live-runtime telemetry, never saved-conversation or roster
+state. Loading a saved conversation creates a new owning runtime rather than attaching to
+the former process; when that load admits or resumes no work, its first successful
+loaded/Ready presentation reports known idle agent status and zero background activity,
+and former counts, busy state, or unknown telemetry are not replayed. Work that actually
+starts or resumes is tracked from current lifecycle observations.
+
+Independent recovery discards only the affected stale ephemeral telemetry understanding
+and asks the owning client for its complete authoritative current census from live
+sources. A healthy client re-establishes its actual zero or nonzero value, including
+after repeated later episodes and without a new prompt, task, manual refresh, or client
+restart. That live-source census is separate from historical cleanup uncertainty, and an
+explicit source refresh re-observes every source even when some are cached. Recovery is
+event-driven over one bounded authenticated host-to-client request per attempt; it adds
+no periodic or global polling. Durable task/group/review/recovery records,
+ownership/security identities, and stop/remove safeguards are preserved, unreachable or
+incomplete live evidence stays unknown, and recovery never coerces a status to zero,
+erases a lost owner's retained state, restarts a client, purges a cache, or reconstructs
+arbitrary destroyed source state. See
+[Session host — Sidebar status and activity](session-host-alpha.md#sidebar-status-and-activity).
+
 ## Session-scoped restart recovery
 
 The extension does not globally scan the filesystem for arbitrary landing manifests at

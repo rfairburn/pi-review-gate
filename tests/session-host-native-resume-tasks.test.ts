@@ -9,10 +9,20 @@
  * Evidence is retained under the private owned scratch root. The metadata-only
  * activity log contains counts and booleans only; the existing public observer
  * remains scoped to synthetic session identities/paths and process lifecycle.
- * Unknown counts remain unknown: this case requires them for the unreadable
- * record and exact numeric values for the held/settled lifecycle. Shell values
- * are retained only as nullable observations;
- * this case makes no shell-count acceptance claim.
+ * #412 separation of channels: a fresh owning runtime that admits or resumes no
+ * work reports known idle/zero CURRENT activity on its restored row before any
+ * input even while both retained historical records are held unreadable, and
+ * repair or ordinary row activation need not create work to keep that zero.
+ * (Exact first-publication ordering at loaded Ready is proven by the #412
+ * restore/recovery regressions, not by this native screen observation.) Those former
+ * runtime counts are historical records, never current activity. The same held
+ * records still keep the separate conservative cleanup-ownership channel
+ * unknown, so a live row still requires the actual native stop confirmation.
+ * Genuine unreadable CURRENT-source negatives keep failing closed to unknown in
+ * their own regressions; this case never substitutes a false zero for them.
+ * Exact numeric values are required for the actually observed held/settled
+ * lifecycle. Shell values are retained only as nullable observations; this case
+ * makes no direct shell-count acceptance claim.
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -89,6 +99,7 @@ const RECOVERY_REQUIRED_RESPONSE = "synthetic-stopped-recoverable-association-se
 const RECOVERABLE_FAILURE_WAKE_RESPONSE = "synthetic-controlled-executor-failure-wake-ack";
 const RECOVERY_PROMPT = "synthetic-repaired-record-activity-recovery-user";
 const RECOVERY_RESPONSE = "synthetic-repaired-record-recovery-returned";
+const RECOVERY_COMPLETION_WAKE_RESPONSE = "synthetic-recovery-completion-wake-ack";
 const ROW_COUNTS = /^bg tasks (unknown|\d+) \| shells (unknown|\d+)$/u;
 const FIXTURE_TIMEOUT_MS = 240_000;
 const EXCLUDED_BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
@@ -584,7 +595,7 @@ async function finishHostNormally(
     "this native Main incarnation shut down through ordinary lifecycle without exact-child force fallback");
 }
 
-test("real native Main restores a saved conversation and reauthenticates activity after repair of its retained stopped recovery-required execution record", {
+test("real native Main restores a saved conversation with known-zero current activity beside held historical stopped records, then reauthenticates activity after their repair", {
   timeout: TEST_TIMEOUT_MS,
 }, async (t) => {
   rejectExecutorRoleBeforeWork();
@@ -1144,7 +1155,14 @@ test("real native Main restores a saved conversation and reauthenticates activit
   // A fresh pinned native Main resumes the same saved conversation. Both the
   // stopped group manifest and its exact operation.json are held, preventing the
   // retained sidecar bundle from being legacy-adopted while its root is unreadable.
-  // Unknown activity must persist until an ordinary registered lifecycle event.
+  // #412 separates the channels: this new runtime admits or resumes no work, so
+  // its restored row reports known idle/zero current activity before any input
+  // even while both historical records are held. Loaded-Ready publication
+  // ordering itself is covered by the #412 restore/recovery regressions.
+  // Those former-runtime records are never
+  // replayed as current activity, and the held files keep the separate
+  // conservative cleanup-ownership channel unknown, so the native stop
+  // confirmation still gates a live row.
   writeReviewConfig(recoveryState, "recovery-task-proof.txt");
   writeFileSync(recoveryTurnScript, `${JSON.stringify({ steps: [
     {
@@ -1155,6 +1173,10 @@ test("real native Main restores a saved conversation and reauthenticates activit
       }] } }],
     },
     { text: RECOVERY_RESPONSE },
+    // The recovered task is actual current work, so its completion produces a
+    // real authenticated wake turn; give that turn its own explicit step rather
+    // than letting the script end with an exhausted-step marker.
+    { text: RECOVERY_COMPLETION_WAKE_RESPONSE },
   ] })}\n`, { flag: "wx", mode: 0o600 });
   const observerRecovery = join(scratch, "observer", "resume-recovery.jsonl");
   const recoveryDriver = await SavedMainDriver.start({
@@ -1179,20 +1201,107 @@ test("real native Main restores a saved conversation and reauthenticates activit
   await recoveryDriver.waitFrame((text) => {
     const parsed = parseRosterFrame(text, SIDEBAR_COLUMNS);
     const counts = activityCounts(text, sessionName);
-    return parsed.complete && parsed.count === 1 && counts?.tasks === null
+    return parsed.complete && parsed.count === 1 && counts?.tasks === 0
+      && /^agent idle \|/u.test(counts.status)
       && frameHeader(text) === sessionName;
-  }, "the actual native sidebar reports unknown activity while the stopped group and operation records are unreadable");
-  const unreadableCounts = activityCounts(recoveryDriver.currentText(), sessionName);
-  assert.ok(unreadableCounts);
-  assert.equal(unreadableCounts!.tasks, null,
-    "an unreadable stopped recoverable association fails closed to unknown, never a false zero");
-  recordActivityEvidence(recoveryEvidenceFile, "unreadable-stopped-recoverable-association", unreadableCounts!, {
+  }, "the fresh owning runtime's restored row reports known idle/zero current activity before any input while the stopped group and operation records are held unreadable");
+  const preInputCounts = activityCounts(recoveryDriver.currentText(), sessionName);
+  assert.ok(preInputCounts);
+  assert.equal(preInputCounts!.tasks, 0,
+    "the held pure-historical records are not current activity: the fresh runtime reports its own known zero before any input instead of an inherited unknown");
+  assert.match(preInputCounts!.status, /^agent idle \|/u,
+    "the fresh runtime observes actual idle readiness rather than replaying its former runtime's busy or unknown state");
+  // Both fault-held historical files are still exactly where the owned fixture
+  // moved them, byte- and inode-identical, when the current zero is observed.
+  assert.equal(existsSync(closedStoppedAssociation.operationPath), false,
+    "the current zero is observed while the exact operation record is still unreadable at its current-source path");
+  assert.equal(existsSync(heldOperationPath), true,
+    "the held historical operation record remains in the owned fixture location at the pre-input zero");
+  assert.equal(readFileSync(heldOperationPath).equals(originalStoppedOperation), true,
+    "the held operation record remains byte-exact through the fresh runtime's pre-input zero");
+  assert.equal(lstatSync(heldOperationPath).ino, stoppedOperationStats.ino,
+    "the held operation record keeps its exact inode through the fresh runtime's pre-input zero");
+  assert.equal(existsSync(closedStoppedAssociation.manifestPath), false,
+    "the current zero is observed while the exact stopped recovery manifest is still unreadable at its current-source path");
+  assert.equal(existsSync(heldManifestPath), true,
+    "the held historical stopped manifest remains in the owned fixture location at the pre-input zero");
+  assert.equal(readFileSync(heldManifestPath).equals(originalStoppedManifest), true,
+    "the held stopped manifest remains byte-exact through the fresh runtime's pre-input zero");
+  assert.equal(lstatSync(heldManifestPath).ino, stoppedManifestStats.ino,
+    "the held stopped manifest keeps its exact inode through the fresh runtime's pre-input zero");
+  const preInputOwnerRecords = recoveryDriver.records().filter((record) => record.pid === recoveryProcess.pid
+    && record.sessionId === recoveryBinding.sessionId);
+  assert.equal(preInputOwnerRecords.filter((record) => record.type === "agent_start").length, 0,
+    "the pre-input zero belongs to a runtime that admitted or resumed no work, not to a completed turn");
+  assert.equal(preInputOwnerRecords.filter((record) => record.type === "tool_call").length, 0,
+    "no task was dispatched before the current known zero was observed");
+  assert.equal(recoveryDriver.ptyRecords().filter((record) => record.type === "pty_spawn").length, 1,
+    "no manual saved-session action or second child spawn preceded the current known zero");
+  recordActivityEvidence(recoveryEvidenceFile, "held-historical-records-current-zero", preInputCounts!, {
     exactSavedConversationRestored: true,
     exactStoppedRecoverableManifestHeldByOwnedFixture: true,
     exactStoppedOperationHeldByOwnedFixture: true,
+    heldFaultRecordsByteAndInodeExactAtPreInputZero: true,
     legacyBundleAdoptionPreventedByOwnedFault: true,
-    unknownShownByActualNativeSidebar: true,
+    currentActivityKnownZeroWhileHistoricalRecordsUnreadable: true,
+    historicalRecordsAreNotCurrentActivity: true,
+    noAdmittedOrResumedWorkBeforeInput: true,
+    noNewPromptTaskOrRestartRequired: true,
   });
+
+  // Current activity is a known zero, but the held historical records keep the
+  // separate conservative cleanup-ownership channel unknown. A live row must
+  // still require the real native stop confirmation, and cancelling it must stop
+  // nothing and leave both held records untouched.
+  await ensureSidebarFocus(recoveryDriver);
+  await moveRosterTo(recoveryDriver,
+    (entry) => entry.kind === "native" && renderedTitleMatches(entry.title, sessionName),
+    "the exact unreadable-history current-zero session row");
+  const beforeHeldStop = recoveryDriver.snapshot();
+  recoveryDriver.pty.write("d");
+  await recoveryDriver.waitFrame((text) => text.includes("Stop session?") && text.includes("enter/y = stop"),
+    "unknown cleanup ownership retains the actual native stop confirmation before repair even though current activity is a known zero",
+    beforeHeldStop.frameRevision);
+  assert.equal(recoveryProcess.exitWatcher.observedExit, false,
+    "the pre-repair conservative stop warning does not stop or replace the exact resumed child");
+  assert.equal(processIsAlive(recoveryProcess.pid), true,
+    "the exact current child PID stays live through the pre-repair stop warning");
+  recoveryDriver.pty.write(KEYS.escape);
+  await recoveryDriver.waitFrame((text) => parseRosterFrame(text, SIDEBAR_COLUMNS).complete
+    && rosterCards(text, SIDEBAR_COLUMNS).some((card) => renderedTitleMatches(card.title, sessionName)),
+  "Escape cancels the pre-repair stop warning without sending input to the child or removing its row");
+  assert.equal(ptyJournalHasForceAttempt(recoveryDriver.ptyRecords()), false,
+    "the cancelled pre-repair stop warning produced no exact-child force attempt");
+  assert.equal(activityCounts(recoveryDriver.currentText(), sessionName)?.tasks, 0,
+    "cancelling the conservative stop warning leaves the current known zero unchanged");
+  assert.equal(existsSync(heldOperationPath), true,
+    "the cancelled stop warning leaves the held historical operation record in place");
+  assert.equal(readFileSync(heldOperationPath).equals(originalStoppedOperation), true,
+    "the cancelled stop warning leaves the held operation record byte-exact");
+  assert.equal(lstatSync(heldOperationPath).ino, stoppedOperationStats.ino,
+    "the cancelled stop warning leaves the held operation record inode intact");
+  assert.equal(existsSync(closedStoppedAssociation.operationPath), false,
+    "the cancelled stop warning does not restore or rewrite the unreadable operation record path");
+  assert.equal(existsSync(heldManifestPath), true,
+    "the cancelled stop warning leaves the held historical stopped manifest in place");
+  assert.equal(readFileSync(heldManifestPath).equals(originalStoppedManifest), true,
+    "the cancelled stop warning leaves the held stopped manifest byte-exact");
+  assert.equal(lstatSync(heldManifestPath).ino, stoppedManifestStats.ino,
+    "the cancelled stop warning leaves the held stopped manifest inode intact");
+  assert.equal(existsSync(closedStoppedAssociation.manifestPath), false,
+    "the cancelled stop warning does not restore or rewrite the unreadable manifest path");
+  assert.equal(processIsAlive(recoveryProcess.pid), true,
+    "the exact current child remains live after cancelling the conservative stop warning");
+  appendFileSync(recoveryEvidenceFile, `${JSON.stringify({
+    stage: "held-historical-records-stop-confirmation",
+    stopConfirmationShownBeforeRepair: true,
+    currentActivityStillKnownZero: true,
+    exactCurrentChildStillLive: true,
+    forcedStopAttemptAbsent: true,
+    historicalOperationStillHeldByteAndInodeExact: true,
+    historicalManifestStillHeldByteAndInodeExact: true,
+    rowPreservedAfterCancel: true,
+  })}\n`, { encoding: "utf8", mode: 0o600 });
 
   renameSync(heldOperationPath, closedStoppedAssociation.operationPath);
   assert.equal(lstatSync(closedStoppedAssociation.operationPath).ino, stoppedOperationStats.ino,
@@ -1211,11 +1320,11 @@ test("real native Main restores a saved conversation and reauthenticates activit
     "repair authenticates the same task generation");
   assert.deepEqual(repairedAssociation.bundle, stoppedRecoverableAssociation.bundle,
     "repair authenticates the same checkpoint bundle and expected revision");
-  assert.equal(activityCounts(recoveryDriver.currentText(), sessionName)?.tasks, null,
-    "repair alone does not clear uncertainty in the event-driven census");
+  assert.equal(activityCounts(recoveryDriver.currentText(), sessionName)?.tasks, 0,
+    "repairing the pure-historical records leaves the current runtime's established zero unchanged");
   await activateNativeRow(recoveryDriver, sessionName);
-  assert.equal(activityCounts(recoveryDriver.currentText(), sessionName)?.tasks, null,
-    "ordinary row activation is not treated as a background lifecycle update");
+  assert.equal(activityCounts(recoveryDriver.currentText(), sessionName)?.tasks, 0,
+    "ordinary row activation is not treated as a background lifecycle update and does not resurrect historical activity");
   const recoveryStartRecord = recoveryDriver.records().find((record) => record.type === "session_start"
     && record.pid === recoveryProcess.pid && record.sessionId === recoveryBinding.sessionId);
   assert.ok(recoveryStartRecord?.activeTools?.includes("SubtasksStart"),
@@ -1251,9 +1360,24 @@ test("real native Main restores a saved conversation and reauthenticates activit
     cleanupOwnershipNotUsedAsActivityEvidence: true,
   });
 
+  const recoveryReleaseSnapshot = recoveryDriver.snapshot();
   writeFileSync(recoveryWorkerRelease, '{"release":true}\n', { flag: "wx", mode: 0o600 });
   assert.equal((await waitForFixtureJson(recoveryWorkerCompleted,
     "the recovery worker completes through its ordinary release and executor lifecycle")).completed, true);
+  // The recovered task is real current work, so its completion delivers one
+  // authenticated same-owner wake turn before the landed proof is inspected.
+  await waitForSameOwnerTurns(recoveryDriver, recoveryProcess, recoveryBinding, recoveryReleaseSnapshot.observerOffset, 1,
+    "the recovered task's actual completion produces one authenticated same-owner wake turn");
+  const recoveryWakeProvider = await waitForJsonl<ProviderRecord>(recoveryProviderJournal,
+    (records) => records.some((record) => record.event === "model_request" && record.requestIndex === 2),
+    EVENT_TIMEOUT_MS,
+    "the recovery completion wake consumes its explicit provider request-index 2 acknowledgement");
+  assert.equal(recoveryWakeProvider.find((record) => record.event === "model_request" && record.requestIndex === 2)?.stepsAvailable, 3,
+    "the recovery completion wake sees its own three-step script instead of an exhausted-step marker");
+  const recoveryWakeEvents = recoveryDriver.records().slice(recoveryReleaseSnapshot.observerOffset)
+    .filter((record) => record.pid === recoveryProcess.pid && record.sessionId === recoveryBinding.sessionId);
+  assert.equal(recoveryWakeEvents.filter((record) => record.type === "tool_call").length, 0,
+    "the scripted recovery completion-wake acknowledgement performs no extra task dispatch");
   const recoveryProof = join(workspace, "recovery-task-proof.txt");
   await waitForOwnedFile(recoveryProof,
     "the recovered registered task lands its separate fixture-only proof in the authorized synthetic workspace");

@@ -487,11 +487,32 @@ function Test-NodeLockOwner([string]$Text) {
   return $false
 }
 
+function Get-NodeLockToken([string]$Path, $Attributes) {
+  # Best-effort identity of the exact lock entry without following links. A live
+  # producer lock is always a freshly created regular file whose record metadata
+  # differs from the observed malformed artifact, so a replacement is never
+  # mistaken for the artifact that was observed.
+  if ($null -eq $Attributes) { return $null }
+  $token = 'attributes:' + [int]$Attributes
+  $notDirectory = ($Attributes -band [IO.FileAttributes]::Directory) -eq 0
+  $notReparse = ($Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0
+  # One-line conjunctions only: Windows PowerShell 5.1 rejects a line that starts
+  # with an operator (and the multiline form is not worth the parse risk).
+  if ($notDirectory -and $notReparse) {
+    try {
+      $info = [IO.FileInfo]::new($Path)
+      $token = $token + ':' + $info.Length + ':' + $info.LastWriteTimeUtc.Ticks
+    } catch { return $null }
+  }
+  return $token
+}
+
 function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
   $chain = Get-NodeFence $Root
   $lockPath = Join-Path $Root '.admission.lock'
   $lock = $null
   $lockIdentity = $null
+  $lockReclaimFailed = $false
   $skipCleanup = $false
   if (-not [string]::IsNullOrEmpty($AgentDirectory)) {
     # An existing session host owns this agent directory: its cache generations
@@ -507,36 +528,75 @@ function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
     # One short exclusive admission lock coordinates cleanup and creation. A
     # lock whose recorded owner is gone (or whose record is empty/malformed) is
     # reclaimed; a live owner is left alone and this producer then skips
-    # cleanup. Capacity never refuses creation.
+    # cleanup. A stale/malformed NON-LIVE metadata shape (directory, junction,
+    # oversized or unreadable) is removed confined to this exact lock path: this
+    # producer only creates a fresh regular lock file, so such a shape is never
+    # live-producer evidence. Capacity never refuses creation.
     $malformedLock = 0
+    $observedLockToken = $null
     for ($attempt = 0; -not $skipCleanup -and $attempt -lt 40 -and $null -eq $lock; $attempt++) {
       try {
         $lock = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
       } catch {
         try {
           $lockAttributes = Get-ExistingAttributes $lockPath
-          if ($null -eq $lockAttributes
-            -or ($lockAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
-            -or ($lockAttributes -band [IO.FileAttributes]::Directory) -ne 0) { break }
-          $lockText = [IO.File]::ReadAllText($lockPath)
-          if ($lockText -match '^\s*(\d{1,10})\s*$') {
+          if ($null -eq $lockAttributes) {
+            # Another producer settled between attempts; retry creation.
+            $malformedLock = 0
+            $observedLockToken = $null
+            Start-Sleep -Milliseconds 25
+            continue
+          }
+          $lockIsReparse = ($lockAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+          $lockIsDirectory = ($lockAttributes -band [IO.FileAttributes]::Directory) -ne 0
+          # Keep each expression on one line: Windows PowerShell 5.1 rejects a
+          # continuation line that begins with -or.
+          $lockShape = $lockIsReparse -or $lockIsDirectory
+          if (-not $lockShape) {
+            try { $lockShape = (([IO.FileInfo]::new($lockPath)).Length -gt 64) } catch { $lockShape = $true }
+          }
+          $lockText = $null
+          if (-not $lockShape) {
+            try { $lockText = [IO.File]::ReadAllText($lockPath) } catch { $lockText = $null }
+          }
+          $lockToken = Get-NodeLockToken $lockPath $lockAttributes
+          if ($null -ne $lockText -and $lockText -match '^\s*(\d{1,10})\s*$') {
             $malformedLock = 0
             # A live owner is left alone; this producer then skips cleanup.
-            if (Test-NodeLockOwner $lockText) { Start-Sleep -Milliseconds 50; continue }
+            if (Test-NodeLockOwner $lockText) { $observedLockToken = $null; Start-Sleep -Milliseconds 50; continue }
+            # A dead owner's record is reclaimed only if it is still that entry.
+            if ($null -eq $lockToken) { $observedLockToken = $null; Start-Sleep -Milliseconds 25; continue }
+            $observedLockToken = $lockToken
           } else {
-            # A just-created lock can be read before its pid is written; only a
-            # record that stays empty/malformed is a dead owner's residue.
+            # A just-created lock can be read before its pid is written; only the
+            # SAME malformed artifact, observed across several inspections, is a
+            # dead owner's residue.
+            if ($null -eq $lockToken) { $observedLockToken = $null; Start-Sleep -Milliseconds 50; continue }
+            if ($lockToken -cne $observedLockToken) { $malformedLock = 0; $observedLockToken = $lockToken }
             $malformedLock++
             if ($malformedLock -lt 3) { Start-Sleep -Milliseconds 50; continue }
             $malformedLock = 0
           }
-          [IO.File]::Delete($lockPath)
+          # Reclaim only the exact artifact that was observed: anything that now
+          # occupies the path is left in place and acquisition restarts.
+          $currentToken = Get-NodeLockToken $lockPath (Get-ExistingAttributes $lockPath)
+          if ($null -eq $currentToken -or $currentToken -cne $observedLockToken) {
+            $observedLockToken = $null
+            Start-Sleep -Milliseconds 25
+            continue
+          }
+          $observedLockToken = $null
+          if (-not (Remove-NodeEntry $lockPath 0)) { $lockReclaimFailed = $true; break }
           continue
         } catch { break }
       }
     }
     if ($null -eq $lock -and -not $skipCleanup) {
-      [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup lock was busy or unreadable; continuing without reclaiming older generations.')
+      if ($lockReclaimFailed) {
+        [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup lock artifact could not be removed; continuing without reclaiming older generations.')
+      } else {
+        [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup lock was busy or unreadable; continuing without reclaiming older generations.')
+      }
     } elseif ($null -ne $lock) {
       # Best-effort cleanup only: every failure here warns and creation proceeds.
       try {

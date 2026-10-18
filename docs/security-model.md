@@ -103,9 +103,10 @@ The session-host launcher's `.pi-review-gate/build/`, `.pi-review-gate/node/`, a
 caches. Only these producers create those trees, so their contents are disposable by
 location: a descendant is reclaimable regardless of who wrote it and regardless of
 whether any legacy lifetime/metadata record exists. Capacity cleanup is best effort and
-never stops an application start: exceeding the per-type target of five generations, an
-unreadable or stale lock, missing/malformed legacy records, or a partial filesystem
-failure produces a bounded warning while the launch continues. No real user cache is
+never stops an application start. Stale or malformed non-live lock artifacts are
+reclaimed, and legacy lifetime records are not deletion prerequisites. A live producer
+lock or actual cleanup failure produces a bounded warning while the launch continues;
+cleanup never claims success for generations it could not remove. No real user cache is
 purged as part of verification.
 
 Active sessions are protected by the session host's existing exclusive agent-directory

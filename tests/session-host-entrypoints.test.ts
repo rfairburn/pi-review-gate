@@ -224,6 +224,22 @@ function writeBootstrapTools(
   writeExecutable(join(fixture.bin, "readlink"), "#!/bin/bash\nexec /usr/bin/readlink \"$@\"\n");
   writeExecutable(join(fixture.bin, "stat"), [
     "#!/bin/bash",
+    "# Synthetic concurrency: another producer may publish its own live lock while a",
+    "# recovering producer is between malformed observation and reclamation.",
+    "if [[ -n \"${FAKE_LOCK_PATH:-}\" && \"${2:-}\" == *%d:%i* ]]; then",
+    "  last=''",
+    "  for arg in \"$@\"; do last=\"$arg\"; done",
+    "  if [[ \"$last\" == \"$FAKE_LOCK_PATH\" ]]; then",
+    "    count=0",
+    "    [[ -f \"${FAKE_LOCK_COUNTER:-}\" ]] && read -r count < \"${FAKE_LOCK_COUNTER:-}\"",
+    "    count=$((count + 1))",
+    "    printf '%s' \"$count\" > \"${FAKE_LOCK_COUNTER:-}\"",
+    "    if (( count == ${FAKE_LOCK_SWAP_AT:-0} )) && [[ -d \"$FAKE_LOCK_PATH\" && ! -L \"$FAKE_LOCK_PATH\" ]]; then",
+    "      rmdir \"$FAKE_LOCK_PATH\"",
+    "      printf '%s\\n' \"${FAKE_LOCK_OWNER:-}\" > \"$FAKE_LOCK_PATH\"",
+    "    fi",
+    "  fi",
+    "fi",
     "if [[ \"$1\" == \"-f\" && \"${FAKE_STAT_NATIVE:-Linux}\" == Linux ]]; then format=\"$2\"; format=\"${format//%Lp/%a}\"; format=\"${format//%p/%f}\"; format=\"${format//%l/%h}\"; format=\"${format//%z/%s}\"; format=\"${format//%m/%Y}\"; format=\"${format//%c/%Z}\"; shift 2; exec /usr/bin/stat -c \"$format\" \"$@\"; fi",
     "if [[ \"$1\" == \"-c\" && \"${FAKE_STAT_NATIVE:-Linux}\" == Darwin ]]; then format=\"$2\"; format=\"${format//%a/%Lp}\"; format=\"${format//%f/%p}\"; format=\"${format//%h/%l}\"; format=\"${format//%s/%z}\"; format=\"${format//%Y/%m}\"; format=\"${format//%Z/%c}\"; shift 2; exec /usr/bin/stat -f \"$format\" \"$@\"; fi",
     "exec /usr/bin/stat \"$@\"",
@@ -642,6 +658,75 @@ test(".sh five existing artifacts never refuse the next launch and stale locks a
   f.markAssertionsPassed();
 });
 
+test(".sh reclaims directory, linked (including device and FIFO targets), oversized and unreadable admission locks instead of skipping pruning", { skip: isWindows }, (t) => {
+  for (const shape of ["directory", "symlink", "device-symlink", "fifo-symlink", "oversized", "unreadable"] as const) {
+    const f = makeEntrypointFixture(`.node-lock-${shape}-`);
+    cleanupFixture(t, f);
+    writeBootstrapTools(f);
+    const env = { PI_CODING_AGENT_DIR: f.agentDir };
+    for (let i = 0; i < 5; i++) assert.equal(runSh(f, ["--help"], env).status, 0);
+    const before = nodeRoots(f);
+    assert.equal(before.length, 5);
+    const outside = join(f.root, "outside-lock-target");
+    writeFileSync(outside, "outside lock target");
+    const lock = join(nodeCache(f), ".admission.lock");
+    if (shape === "directory") mkdirSync(lock);
+    else if (shape === "symlink") symlinkSync(outside, lock);
+    // A lock link to a device accepts a write-through and a FIFO target would
+    // block an opening producer: both must be unlinked, never opened.
+    else if (shape === "device-symlink") symlinkSync("/dev/null", lock);
+    else if (shape === "fifo-symlink") {
+      const fifo = join(f.root, "outside-fifo");
+      const made = spawnSync("mkfifo", [fifo], { encoding: "utf8" });
+      assert.equal(made.status, 0, `mkfifo fixture: ${made.stderr}`);
+      symlinkSync(fifo, lock);
+    }
+    // A parseable pid prefix does not make oversized metadata liveness evidence.
+    else if (shape === "oversized") writeFileSync(lock, `999999999\n${"x".repeat(200)}`);
+    else { writeFileSync(lock, ""); chmodSync(lock, 0o000); }
+    const result = runSh(f, ["--help"], env);
+    assert.equal(result.status, 0, `${shape}: ${result.stderr}`);
+    assert.doesNotMatch(result.stderr, /capacity exhausted/);
+    assert.doesNotMatch(result.stderr, /cleanup lock was busy|lock artifact could not be removed/,
+      `${shape}: removable malformed metadata is not reported as a permanent skip`);
+    assert.equal(existsSync(lock), false, `${shape}: the malformed lock artifact itself is gone`);
+    assert.equal(nodeRoots(f).length, 5, `${shape}: the cache actually pruned to the target`);
+    assert.ok(before.some((root) => !existsSync(root)), `${shape}: an existing generation was actually reclaimed`);
+    assert.equal(readFileSync(outside, "utf8"), "outside lock target", `${shape}: nothing outside the lock entry is touched`);
+    f.markAssertionsPassed();
+  }
+});
+
+test(".sh never deletes another producer's live lock that replaced malformed metadata", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-lock-replaced-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const env = { PI_CODING_AGENT_DIR: f.agentDir };
+  for (let i = 0; i < 5; i++) assert.equal(runSh(f, ["--help"], env).status, 0);
+  const before = nodeRoots(f);
+  assert.equal(before.length, 5);
+  const lock = join(nodeCache(f), ".admission.lock");
+  mkdirSync(lock);
+  const counter = join(f.root, "lock-identity-observations.txt");
+  // The synthetic stat wrapper publishes another producer's valid live lock just
+  // before the recovering producer would reclaim the artifact it observed.
+  const result = runSh(f, ["--help"], {
+    ...env,
+    FAKE_LOCK_PATH: lock,
+    FAKE_LOCK_COUNTER: counter,
+    FAKE_LOCK_SWAP_AT: "4",
+    FAKE_LOCK_OWNER: String(process.pid),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(Number(readFileSync(counter, "utf8")) >= 4, "the replacement was published before reclamation");
+  assert.equal(existsSync(lock), true, "the replacement live producer lock survives");
+  assert.equal(readFileSync(lock, "utf8"), `${process.pid}\n`, "the replacement lock is byte-for-byte intact");
+  assert.match(result.stderr, /cleanup lock was busy|without reclaiming/);
+  assert.ok(before.every((root) => existsSync(root)), "no generation was pruned while a live producer owns the lock");
+  assert.equal(nodeRoots(f).length, 6, "startup still creates the fresh generation");
+  f.markAssertionsPassed();
+});
+
 test(".sh malformed, legacy, hardlinked and .terraform-bearing roots are reclaimed without escaping", { skip: isWindows }, (t) => {
   const f = makeEntrypointFixture(".node-cap-unsafe-");
   cleanupFixture(t, f);
@@ -689,6 +774,31 @@ test(".sh reclaims five empty and five hidden-record legacy generations and star
     assert.ok(roots.some((root) => !existsSync(root)), `${shape}: an actual legacy generation was removed`);
     f.markAssertionsPassed();
   }
+});
+
+test(".sh reclaims generations with hardlinked descendants and preserves outside bytes", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-hardlink-descendant-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  const outside = join(f.root, "outside-hardlink");
+  writeFileSync(outside, "hardlinked outside bytes");
+  const root = join(cache, "bootstrap.0-hardlink");
+  mkdirSync(join(root, "nested"), { recursive: true });
+  writeFileSync(join(root, "nested", "ordinary"), "disposable by location");
+  linkSync(outside, join(root, "nested", "hardlink"));
+  for (let i = 0; i < 5; i++) mkdirSync(join(cache, `bootstrap.1-free-${i}`), { recursive: true });
+  const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /capacity exhausted/);
+  assert.doesNotMatch(result.stderr, /could not|without reclaiming/,
+    "a hardlinked descendant name is not a cleanup exclusion");
+  assert.equal(existsSync(root), false, "the generation holding a hardlinked descendant was reclaimed");
+  assert.equal(nodeRoots(f).length, 5, "the cache pruned to the target");
+  assert.equal(readFileSync(outside, "utf8"), "hardlinked outside bytes", "outside bytes are untouched");
+  assert.equal(lstatSync(outside).nlink, 1, "only the cache name was removed");
+  f.markAssertionsPassed();
 });
 
 test(".sh skips a generation whose producer marker names a live process", { skip: isWindows }, (t) => {
@@ -954,9 +1064,43 @@ test("native Windows cleanup failures warn and still create a fresh generation",
   assert.equal(result.status, 1, result.stderr);
   assert.match(result.stderr, /cleanup lock was busy or unreadable|inventory was unavailable|cleanup could not complete/);
   assert.doesNotMatch(result.stderr, /capacity exhausted/);
+  assert.equal(existsSync(join(cache, ".admission.lock")), false,
+    "the malformed directory-shaped lock itself was reclaimed before the genuine inventory failure");
   assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 1,
     "startup reached the download despite the cleanup failures");
   assert.equal(nodeRoots(f).length, 6, "the legacy entries were preserved and a fresh generation was still created");
+  f.markAssertionsPassed();
+});
+
+test("native Windows reclaims a directory-shaped cache lock and prunes to five", { skip: !isWindows, timeout: 60_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-lock-windows-");
+  cleanupFixture(t, f);
+  const cache = join(f.agentDir, ".pi-review-gate", "node");
+  mkdirSync(join(cache, ".admission.lock"), { recursive: true });
+  const legacy: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    const root = join(cache, `bootstrap.legacy-${i}`);
+    mkdirSync(root, { recursive: true });
+    legacy.push(root);
+  }
+  const downloads = join(f.root, "download-witness");
+  const helper = join(f.root, "bootstrap.ps1");
+  // Network is the only substituted operation; native lock handling, inventory
+  // and bounded no-follow cleanup execute unchanged.
+  writeFileSync(helper, readFileSync(psPath, "utf8")
+    .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'"));
+  const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
+  const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
+    env, cwd: f.root, encoding: "utf8", timeout: 20_000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.doesNotMatch(result.stderr, /cleanup lock was busy|lock artifact could not be removed|capacity exhausted/,
+    "removable malformed lock metadata is not reported as a permanent cleanup skip");
+  assert.equal(existsSync(join(cache, ".admission.lock")), false, "the directory-shaped lock is gone");
+  assert.equal(nodeRoots(f).length, 5, "exactly five generations remain: one legacy reclaimed, one fresh created");
+  assert.ok(legacy.some((root) => !existsSync(root)), "an actual legacy generation was reclaimed");
+  assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 1, "startup reached the download");
   f.markAssertionsPassed();
 });
 

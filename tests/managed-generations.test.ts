@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createRequire } from "node:module";
 import { join } from "node:path";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 
 const requireCjs = createRequire(join(process.cwd(), "tests", "managed-generations.test.ts"));
 // The CJS producer surface deliberately has no environment/CLI test bypasses.
@@ -148,6 +148,10 @@ test("cleanup is confined: outside sentinels survive while links and .terraform 
   const terraform = seedLegacy(f.builds, ["b-terraform"]);
   mkdirSync(join(terraform[0]!, ".terraform"));
   writeFileSync(join(terraform[0]!, ".terraform", "sentinel"), "never entered");
+  const hardlinked = seedLegacy(f.builds, ["0-hardlink"]);
+  const hardlinkTarget = join(f.root, "hardlink-target");
+  writeFileSync(hardlinkTarget, "hardlinked outside bytes");
+  linkSync(hardlinkTarget, join(hardlinked[0]!, "nested", "hardlink"));
   seedLegacy(f.builds, ["c", "d", "e", "f", "g"]);
   const rootLink = join(f.builds, "a-root-link");
   symlinkSync(outside, rootLink);
@@ -161,6 +165,9 @@ test("cleanup is confined: outside sentinels survive while links and .terraform 
   assert.equal(existsSync(terraform[0]!), false,
     "cleanup-specific traversal removes an initialized .terraform subtree inside a selected disposable generation");
   assert.equal(existsSync(join(terraform[0]!, ".terraform", "sentinel")), false);
+  assert.equal(existsSync(hardlinked[0]!), false, "a hardlinked descendant name is unlinked with its generation");
+  assert.equal(readFileSync(hardlinkTarget, "utf8"), "hardlinked outside bytes", "outside bytes survive the hardlink removal");
+  assert.equal(lstatSync(hardlinkTarget).nlink, 1, "only the cache name is removed");
   assert.deepEqual(warnings, [], "full removal reports no warning");
 });
 
@@ -175,6 +182,81 @@ test("stale, empty and malformed admission locks never become permanent startup 
     assert.ok(count(f.builds) <= generations.LIMIT + 1, "a reclaimed stale lock still allows cleanup");
     assert.equal(existsSync(join(f.builds, ".admission.lock")), false);
   }
+});
+
+test("malformed non-live admission lock shapes are reclaimed and actually prune", posix, () => {
+  for (const shape of ["directory", "symlink", "oversized", "unreadable"] as const) {
+    const f = fixture();
+    const outside = join(f.root, "outside-lock-target");
+    writeFileSync(outside, "outside lock target", { mode: 0o600 });
+    seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
+    const lock = join(f.builds, ".admission.lock");
+    if (shape === "directory") mkdirSync(lock);
+    else if (shape === "symlink") symlinkSync(outside, lock);
+    // A parseable pid prefix does not make oversized metadata liveness evidence.
+    else if (shape === "oversized") writeFileSync(lock, `999999999\n${"x".repeat(200)}`, { mode: 0o600 });
+    else { writeFileSync(lock, "", { mode: 0o600 }); chmodSync(lock, 0o000); }
+    const warnings: string[] = [];
+    const stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }), { warn: (m: string) => warnings.push(m) });
+    assert.ok(existsSync(stage.root), `${shape}: creation is never refused`);
+    assert.equal(stage.generation.release(), true);
+    assert.equal(count(f.builds), generations.LIMIT, `${shape}: removable malformed metadata prunes to the target`);
+    assert.deepEqual(warnings, [], `${shape}: successful reclamation is not reported as a permanent skip`);
+    assert.equal(existsSync(lock), false, `${shape}: the malformed lock artifact itself is gone`);
+    assert.equal(readFileSync(outside, "utf8"), "outside lock target", `${shape}: outside the cache lock entry is untouched`);
+  }
+});
+
+test("a live producer lock replacing malformed metadata during recovery is never deleted", posix, () => {
+  const f = fixture();
+  const legacy = seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
+  const lock = join(f.builds, ".admission.lock");
+  mkdirSync(lock);
+  const fs = requireCjs("node:fs") as typeof import("node:fs");
+  const lstat = fs.lstatSync;
+  const live = `${process.pid}\n`;
+  let directoryObservations = 0;
+  let swapPending = false;
+  let swapped = false;
+  Object.defineProperty(fs, "lstatSync", {
+    configurable: true,
+    writable: true,
+    value: (...args: Parameters<typeof lstat>) => {
+      if (!swapped && String(args[0]) === lock) {
+        if (swapPending) {
+          // The malformed directory has been observed the required number of
+          // times; another producer now publishes its own valid live lock just
+          // before the recovering producer's next (revalidating) inspection.
+          swapped = true;
+          swapPending = false;
+          fs.rmdirSync(lock);
+          fs.writeFileSync(lock, live, { mode: 0o600 });
+          return Reflect.apply(lstat, fs, args);
+        }
+        const observed = Reflect.apply(lstat, fs, args);
+        if (observed && observed.isDirectory()) {
+          directoryObservations += 1;
+          if (directoryObservations === 3) swapPending = true;
+        }
+        return observed;
+      }
+      return Reflect.apply(lstat, fs, args);
+    },
+  });
+  const warnings: string[] = [];
+  let stage;
+  try {
+    stage = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }), { warn: (m: string) => warnings.push(m) });
+  } finally {
+    Object.defineProperty(fs, "lstatSync", { configurable: true, writable: true, value: lstat });
+  }
+  assert.equal(swapped, true, "the replacement was published before reclamation");
+  assert.equal(readFileSync(lock, "utf8"), live, "the replacement live producer lock survives byte-for-byte");
+  assert.ok(warnings.some((warning) => warning.includes("cleanup lock was busy")), "cleanup is skipped for the live replacement");
+  assert.ok(legacy.every((root) => existsSync(root)), "no generation was pruned while a live producer owns the lock");
+  assert.equal(count(f.builds), legacy.length + 1, "startup still creates the fresh generation");
+  stage.generation.release();
+  assert.equal(readFileSync(lock, "utf8"), live, "releasing this admission never removes a foreign lock");
 });
 
 test("a live cleanup lock is left alone, warns, and still admits the new generation", posix, () => {
@@ -504,10 +586,12 @@ test("a staggered Pi producer never loses its in-progress setup to a replacement
 test("full launcher provisions past eight occupied Pi candidates and reuses the fallback", posix, async () => {
   const f = fixture();
   for (let index = 0; index < 8; index += 1) {
-    mkdirSync(join(f.runtimes, index === 0 ? "pi-1.3.0" : `pi-1.3.0.${index}`), { recursive: true });
+    const root = join(f.runtimes, index === 0 ? "pi-1.3.0" : `pi-1.3.0.${index}`);
+    mkdirSync(root, { recursive: true });
+    // These candidates are genuinely occupied by live producers, so cleanup
+    // must keep skipping them and startup must keep falling back.
+    writeFileSync(join(root, ".producer-active"), `${process.pid}\n`, { mode: 0o600 });
   }
-  // A directory-shaped lock makes every admission skip cleanup.
-  mkdirSync(join(f.runtimes, ".admission.lock"));
   const installs: string[] = [];
   let resolved = "";
   const runLaunch = async (diagnostics: string[]) => {
@@ -549,7 +633,8 @@ test("full launcher provisions past eight occupied Pi candidates and reuses the 
   assert.equal(first.hostStarted, 1);
   assert.equal(installs.length, 1, "exactly one install was needed past all occupied candidates");
   assert.ok(resolved.startsWith(join(f.runtimes, "pi-1.3.0.8") + "/"), `used the next confined candidate: ${resolved}`);
-  assert.ok(firstDiagnostics.some((line) => line.includes("cleanup lock was busy")));
+  assert.ok(firstDiagnostics.some((line) => line.includes("cache retains 8 generations")),
+    "the live-owned candidates are reported, not falsely counted as pruned");
   assert.ok(firstDiagnostics.some((line) => line.includes("could not reclaim")));
 
   const secondDiagnostics: string[] = [];
@@ -657,4 +742,47 @@ test("full launcher startup succeeds with five and more legacy build/Pi generati
     assert.ok(removedBuilds >= seeded - 4, `actual build directories were reclaimed: ${removedBuilds}`);
     assert.ok(removedRuntimes >= seeded - 4, `actual Pi directories were reclaimed: ${removedRuntimes}`);
   }
+});
+
+test("full startup reclaims a directory-shaped cache lock and prunes five legacy generations per type", posix, async () => {
+  const f = fixture();
+  const buildRoots = seedLegacy(f.builds, ["legacy-build-0", "legacy-build-1", "legacy-build-2", "legacy-build-3", "legacy-build-4"]);
+  const runtimeRoots = seedLegacy(f.runtimes, ["pi-1.1.0", "pi-1.1.1", "pi-1.1.2", "pi-1.1.3", "pi-1.1.4"]);
+  // Malformed non-live lock metadata at the exact cache entry: an empty
+  // directory, a shape this producer never creates and no live owner can hold.
+  mkdirSync(join(f.builds, ".admission.lock"));
+  mkdirSync(join(f.runtimes, ".admission.lock"));
+  let loadedEntry = "";
+  let hostStarted = 0;
+  const diagnostics: string[] = [];
+  const status = await producer.runSessionHostLauncher([], {
+    getEnv: () => f.env,
+    processEnv: {},
+    packageRoot: f.packageRoot,
+    platform: "linux",
+    cwd: f.root,
+    nodeVersion: process.versions.node,
+    stdinIsTTY: true,
+    stdoutIsTTY: true,
+    build: (options: Record<string, unknown>) => build(f, options),
+    resolvePiRuntime: async () => provision(f, "1.3.0"),
+    ensureDdgs: () => ({ ok: true, python: join(f.root, "python") }),
+    refreshShippedSkills: () => ({ ok: true }),
+    writeOut: () => undefined,
+    writeError: (text: string) => diagnostics.push(text),
+    loadMain: (entry: string) => {
+      loadedEntry = entry;
+      return { runSessionHost: async () => { hostStarted += 1; return 0; } };
+    },
+  });
+  assert.equal(status, 0, diagnostics.join(""));
+  assert.equal(hostStarted, 1, "the host actually started");
+  assert.ok(loadedEntry.startsWith(f.builds + "/"), `the compiled host came from the owned build cache: ${loadedEntry}`);
+  assert.equal(count(f.builds), generations.LIMIT, `build cache pruned to the target: ${count(f.builds)}`);
+  assert.equal(count(f.runtimes), generations.LIMIT, `Pi cache pruned to the target: ${count(f.runtimes)}`);
+  assert.equal(existsSync(join(f.builds, ".admission.lock")), false, "the malformed build lock directory is gone");
+  assert.equal(existsSync(join(f.runtimes, ".admission.lock")), false, "the malformed Pi lock directory is gone");
+  assert.doesNotMatch(diagnostics.join(""), /cleanup lock was busy|lock artifact could not be removed|could not reclaim/i);
+  assert.ok(buildRoots.some((root) => !existsSync(root)), "an actual legacy build directory was reclaimed");
+  assert.ok(runtimeRoots.some((root) => !existsSync(root)), "an actual legacy Pi directory was reclaimed");
 });

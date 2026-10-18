@@ -24,8 +24,9 @@ dates.
   and `.pi-review-gate/node/` trees are created only by these producers, so their
   contents are disposable by location: five or more legacy, failed, or
   receipt-less generations are reclaimed best effort down to the independent
-  per-type target of five and startup proceeds. Cleanup warnings (busy or stale
-  lock, unreclaimable or unsafe entry, real filesystem failure) are reported
+  per-type target of five and startup proceeds. Removable stale/malformed non-live
+  locks are reclaimed, including directory/link-shaped metadata. Cleanup warnings
+  (a live producer lock, unreclaimable entry, or real filesystem failure) are reported
   truthfully without a cache-capacity startup refusal and without claiming a
   deletion that did not happen. A live owner-pid marker prevents cleanup from
   reclaiming a generation another producer is still filling; generation roots are

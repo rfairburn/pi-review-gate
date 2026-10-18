@@ -7,9 +7,12 @@
 // who created it and regardless of whether any lifetime/metadata record exists.
 //
 // Cleanup is deliberately best effort. Exceeding the per-type generation target
-// (five), an unreadable or stale lock, missing/malformed legacy records, or a
-// partial filesystem failure must never stop an application start; those cases
-// report a bounded warning and the producer continues. Active sessions are
+// (five), a busy live lock, an unreclaimable lock artifact, missing/malformed
+// legacy records, or a partial filesystem failure must never stop an
+// application start; those cases report a bounded warning and the producer
+// continues. A stale or malformed non-live lock artifact (directory, link,
+// oversized or unreadable) is reclaimed first, confined to that cache metadata
+// entry, so it can never become a permanent cleanup skip. Active sessions are
 // guarded by the session host's own exclusive agent-directory ownership record,
 // not by cache receipts, so cleanup does not implement a second lifetime gate.
 //
@@ -140,13 +143,56 @@ function clearMarker(root) {
   }
 }
 
-function acquire(cacheRoot) {
+const LOCK_OWNER = /^(\d{1,10})\n?$/u;
+
+/** A lock record is only ever a fresh single-linked small regular file. */
+function lockRecordCandidate(stat) {
+  return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n && stat.size <= BigInt(MAX_LOCK_BYTES);
+}
+
+/**
+ * Reclaim only the exact lock artifact that was observed. The entry is
+ * re-identified first: when another producer replaced it, or the record now
+ * names a live owner, it is left in place and acquisition restarts, so a
+ * replacement live lock is never deleted. Returns "reclaimed" once the path is
+ * gone, "kept" when it is not ours to remove, and "failed" for a real
+ * filesystem error. Links are unlinked themselves (never read through),
+ * directory content is removed bounded and no-follow, and nothing outside this
+ * cache metadata entry is touched.
+ */
+function reclaimLockArtifact(file, identity) {
+  let stat;
+  try {
+    stat = fs.lstatSync(file, { bigint: true });
+  } catch (error) {
+    return error && error.code === "ENOENT" ? "reclaimed" : "failed";
+  }
+  if (`${stat.dev}:${stat.ino}` !== identity) return "kept";
+  if (lockRecordCandidate(stat)) {
+    const owner = LOCK_OWNER.exec(readLockOwner(file) ?? "");
+    if (owner && (Number(owner[1]) === process.pid || processIsAlive(Number(owner[1])))) return "kept";
+  }
+  try {
+    if (!stat.isDirectory()) {
+      fs.unlinkSync(file);
+      return "reclaimed";
+    }
+    return remove(file) ? "reclaimed" : "failed";
+  } catch (error) {
+    return error && error.code === "ENOENT" ? "reclaimed" : "failed";
+  }
+}
+
+function acquire(cacheRoot, warnings) {
   const file = path.join(cacheRoot, LOCK);
   const deadline = performance.now() + LOCK_WAIT_MS;
   // A just-created lock can be observed between creation and its pid write.
-  // Only a record that stays malformed across several observations is treated
-  // as a dead owner's lock.
+  // Only the SAME malformed artifact, observed across several inspections, is
+  // treated as a dead owner's residue: a different identity restarts the
+  // observation, and reclamation is conditional on that identity still being
+  // the one present.
   let malformed = 0;
+  let malformedIdentity;
   for (;;) {
     try {
       const fd = fs.openSync(file, "wx", 0o600);
@@ -169,38 +215,76 @@ function acquire(cacheRoot) {
         },
       };
     } catch (error) {
-      if (!error || error.code !== "EEXIST") return undefined;
-      const text = readLockOwner(file);
-      if (text === undefined) return undefined;
-      const owner = /^(\d{1,10})\n?$/u.exec(text);
-      if (owner) {
-        malformed = 0;
-        // Same-process concurrency cannot be waited out (the holder only
-        // settles on another turn of this event loop): skip cleanup at once.
-        if (Number(owner[1]) === process.pid) return undefined;
-        if (!processIsAlive(Number(owner[1]))) {
-          try {
-            fs.unlinkSync(file);
-          } catch {
+      if (!error || error.code !== "EEXIST") {
+        warnings.push(`cache cleanup lock could not be created (${error && error.code}); continuing without reclaiming older generations`);
+        return undefined;
+      }
+      let observed;
+      try {
+        observed = fs.lstatSync(file, { bigint: true });
+      } catch (cause) {
+        if (cause && cause.code === "ENOENT") {
+          // Another producer settled it between attempts; retry creation.
+          malformed = 0;
+          malformedIdentity = undefined;
+          if (performance.now() >= deadline) {
+            warnings.push("cache cleanup lock was busy or unreadable; continuing without reclaiming older generations");
             return undefined;
           }
+          sleep(25);
           continue;
         }
+        warnings.push("cache cleanup lock was busy or unreadable; continuing without reclaiming older generations");
+        return undefined;
+      }
+      const identity = `${observed.dev}:${observed.ino}`;
+      const owner = LOCK_OWNER.exec((lockRecordCandidate(observed) ? readLockOwner(file) : undefined) ?? "");
+      if (owner && Number(owner[1]) === process.pid) {
+        // Same-process concurrency cannot be waited out (the holder only
+        // settles on another turn of this event loop): skip cleanup at once.
+        warnings.push("cache cleanup lock was busy or unreadable; continuing without reclaiming older generations");
+        return undefined;
+      }
+      if (owner && processIsAlive(Number(owner[1]))) {
+        // A live owner is never ours: wait, then skip cleanup.
+        malformed = 0;
+        malformedIdentity = undefined;
+      } else if (owner) {
+        // A dead owner's record is reclaimed only if it is still that record.
+        malformed = 0;
+        malformedIdentity = undefined;
+        const outcome = reclaimLockArtifact(file, identity);
+        if (outcome === "failed") {
+          warnings.push("cache cleanup lock artifact could not be removed; continuing without reclaiming older generations");
+          return undefined;
+        }
+        continue;
       } else {
+        // Empty/invalid record or a non-live metadata shape (directory, link,
+        // oversized, unreadable): either a mid-publication lock or a dead
+        // owner's residue. Re-observe this exact identity, then reclaim it
+        // confined to this cache metadata entry so it never becomes a
+        // permanent skip.
+        if (identity !== malformedIdentity) {
+          malformed = 0;
+          malformedIdentity = identity;
+        }
         malformed += 1;
-        // Empty/malformed: either a mid-publication lock or a dead owner's
-        // residue. Re-observe briefly before reclaiming it.
         if (malformed >= 3) {
-          try {
-            fs.unlinkSync(file);
-          } catch {
+          malformed = 0;
+          malformedIdentity = undefined;
+          const outcome = reclaimLockArtifact(file, identity);
+          if (outcome === "failed") {
+            warnings.push("cache cleanup lock artifact could not be removed; continuing without reclaiming older generations");
             return undefined;
           }
-          malformed = 0;
           continue;
         }
       }
-      if (performance.now() >= deadline) return undefined;
+      if (performance.now() >= deadline) {
+        warnings.push("cache cleanup lock was busy or unreadable; continuing without reclaiming older generations");
+        return undefined;
+      }
       sleep(25);
     }
   }
@@ -378,28 +462,31 @@ function handle(root, settle) {
 function admit(cacheRoot, create, options = {}) {
   const cache = path.resolve(cacheRoot);
   const warnings = [];
-  const lock = activeHostOwnsAgentDirectory(cache) ? undefined : acquire(cache);
+  let lock;
   if (activeHostOwnsAgentDirectory(cache)) {
     warnings.push("a session host currently owns the agent directory; leaving cache generations untouched");
-  } else if (!lock) {
-    warnings.push("cache cleanup lock was busy or unreadable; continuing without reclaiming older generations");
   } else {
-    try {
-      if (options.replacement) {
-        const target = path.resolve(options.replacement.root);
-        const eligible = typeof options.replacement.eligible === "function" && options.replacement.eligible() === true;
-        // The same live-owner protection as ordinary reclamation: a producer
-        // still filling this exact generation must never be deleted.
-        if (path.dirname(target) === cache && eligible && !generationIsInProgress(target)) {
-          if (!remove(target)) warnings.push(`could not reclaim the incomplete generation ${path.basename(target)}; continuing`);
+    // A held or genuinely unremovable lock reports its own truthful warning;
+    // creation always proceeds and cleanup trouble never stops a start.
+    lock = acquire(cache, warnings);
+    if (lock) {
+      try {
+        if (options.replacement) {
+          const target = path.resolve(options.replacement.root);
+          const eligible = typeof options.replacement.eligible === "function" && options.replacement.eligible() === true;
+          // The same live-owner protection as ordinary reclamation: a producer
+          // still filling this exact generation must never be deleted.
+          if (path.dirname(target) === cache && eligible && !generationIsInProgress(target)) {
+            if (!remove(target)) warnings.push(`could not reclaim the incomplete generation ${path.basename(target)}; continuing`);
+          }
         }
+        reclaim(cache, options, warnings);
+      } catch (error) {
+        // A preparation failure ends this admission; creation is never blocked
+        // by cleanup trouble, which `reclaim` itself reports as warnings.
+        lock.release();
+        throw error;
       }
-      reclaim(cache, options, warnings);
-    } catch (error) {
-      // A preparation failure ends this admission; creation is never blocked by
-      // cleanup trouble, which `reclaim` itself reports as warnings.
-      lock.release();
-      throw error;
     }
   }
   for (const warning of warnings) {

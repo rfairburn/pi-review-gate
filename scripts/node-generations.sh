@@ -4,9 +4,13 @@
 # The cache's direct child entries ARE the inventory. These trees exist only
 # under the designated `.pi-review-gate/node` cache, so their contents are
 # disposable by location: there are no lifetime receipts, no mount census, and
-# no capacity refusal. Cleanup is best effort — a busy/stale lock, an unsafe
-# entry, or a real filesystem failure is reported and the fresh generation is
-# still created, because cache capacity must never stop an application start.
+# no capacity refusal. Cleanup is best effort — a busy live lock, an
+# unremovable malformed lock artifact, an unsafe entry, or a real filesystem
+# failure is reported and the fresh generation is still created, because cache
+# capacity must never stop an application start. A stale or malformed NON-LIVE
+# lock artifact (directory, link, oversized or unreadable) is reclaimed first,
+# confined to that exact cache metadata entry, so it never becomes a permanent
+# cleanup skip.
 # Active sessions are guarded by the session host's own ownership record, not
 # by these cache entries.
 NODE_LOCK="$NODE_CACHE_ROOT/.admission.lock"
@@ -53,42 +57,121 @@ node_check_fence() {
 # creation. A lock whose recorded owner is gone (or whose record is empty or
 # malformed) is reclaimed instead of becoming a permanent stop condition; a
 # live owner is left alone, and this producer then skips cleanup and continues.
+# A stale/malformed NON-LIVE metadata shape (directory, link, oversized or
+# unreadable) is likewise removed confined to this exact lock path: this
+# producer only ever creates a fresh single-linked regular lock file, so such a
+# shape is never a live producer's evidence. Reclamation is conditional on the
+# exact entry that was observed still being present, so another producer's
+# replacement live lock is never deleted. A real removal failure warns and
+# startup still continues.
+node_lock_shape_is_record() {
+  node_single_file "$1" || return 1
+  local size
+  if [[ "$HOST_OS" == Darwin ]]; then size="$("$STAT_BIN" -f '%z' "$1" 2>/dev/null)"; else size="$("$STAT_BIN" -c '%s' "$1" 2>/dev/null)"; fi
+  [[ "$size" =~ ^[0-9]+$ ]] && (( size <= 64 ))
+}
+# No-follow identity of the exact lock entry (links included by design: GNU and
+# BSD stat default to lstat semantics without -L). Used only to confirm that the
+# artifact being reclaimed is the one that was observed.
+node_lock_entry_identity() {
+  local path="$NODE_LOCK" output
+  [[ -e "$path" || -L "$path" ]] || return 1
+  if [[ "$HOST_OS" == Darwin ]]; then
+    output="$("$STAT_BIN" -f '%d:%i' "$path" 2>/dev/null)" || return 1
+  else
+    output="$("$STAT_BIN" -c '%d:%i' "$path" 2>/dev/null)" || return 1
+  fi
+  [[ "$output" =~ ^[0-9]+:[1-9][0-9]*$ ]] || return 1
+  printf '%s' "$output"
+}
+# Reclaim only the lock artifact identified by the caller. Anything else that now
+# occupies the path, and any record that names a live owner, is left in place and
+# acquisition restarts; only a real filesystem failure returns 1.
+node_lock_reclaim() {
+  local expected="$1" current='' text=''
+  [[ -n "$expected" ]] || return 1
+  node_check_fence || return 1
+  current="$(node_lock_entry_identity)" || return 1
+  [[ "$current" == "$expected" ]] || return 0
+  if [[ -L "$NODE_LOCK" ]]; then
+    # Unlink the malformed link itself; its target is never read or modified.
+    "$NODE_UNLINK_BIN" "$NODE_LOCK" 2>/dev/null
+    return
+  fi
+  if [[ -d "$NODE_LOCK" ]]; then
+    node_remove "$NODE_LOCK" "$current"
+    return
+  fi
+  if node_lock_shape_is_record "$NODE_LOCK"; then
+    { IFS= read -r -n 32 text < "$NODE_LOCK"; } 2>/dev/null || true
+    if [[ "$text" =~ ^([0-9]{1,10})$ ]] && kill -0 "${BASH_REMATCH[1]}" 2>/dev/null; then return 0; fi
+  fi
+  "$NODE_UNLINK_BIN" "$NODE_LOCK" 2>/dev/null
+}
 node_lock() {
-  local attempt=0 malformed=0 owner='' pid=''
+  local attempt=0 malformed=0 owner='' pid='' id='' observed='' record=1
   node_check_fence || return 1
   while (( attempt < NODE_LOCK_ATTEMPTS )); do
-    if (set -o noclobber; printf '%s\n' "$$" > "$NODE_LOCK") 2>/dev/null; then
+    attempt=$((attempt + 1))
+    # noclobber alone can open an existing non-regular target, including through
+    # a symlink (/dev/null would accept the write, a FIFO target would block).
+    # Every existing entry, including a dangling link, goes through no-follow
+    # inspection and guarded reclamation instead of being opened for writing.
+    if [[ ! -e "$NODE_LOCK" && ! -L "$NODE_LOCK" ]] &&
+      (set -o noclobber; printf '%s\n' "$$" > "$NODE_LOCK") 2>/dev/null; then
       NODE_LOCK_ID="$(path_identity "$NODE_LOCK")" || return 1
       node_check_fence && assert_path_identity "$NODE_LOCK" "$NODE_LOCK_ID"
       return
     fi
-    if [[ -L "$NODE_LOCK" || ! -e "$NODE_LOCK" ]] || ! node_single_file "$NODE_LOCK"; then
-      # A replaced, linked, or unreadable lock is not ours to remove.
-      return 1
-    fi
-    owner=''
-    { IFS= read -r -n 32 owner < "$NODE_LOCK"; } 2>/dev/null || true
-    if [[ "$owner" =~ ^([0-9]{1,10})$ ]]; then
+    if [[ ! -e "$NODE_LOCK" && ! -L "$NODE_LOCK" ]]; then
+      # Another producer settled between attempts; retry creating the lock.
       malformed=0
+      observed=''
+      continue
+    fi
+    record=0
+    if [[ ! -L "$NODE_LOCK" ]] && node_lock_shape_is_record "$NODE_LOCK"; then record=1; fi
+    owner=''
+    if (( record == 1 )); then
+      { IFS= read -r -n 32 owner < "$NODE_LOCK"; } 2>/dev/null || true
+    fi
+    if (( record == 1 )) && [[ "$owner" =~ ^([0-9]{1,10})$ ]]; then
+      # A valid record is never a malformed observation.
+      malformed=0
+      observed=''
       pid="${BASH_REMATCH[1]}"
       if kill -0 "$pid" 2>/dev/null; then
-        attempt=$((attempt + 1))
         sleep 0.05 2>/dev/null || sleep 1
         continue
       fi
-    else
-      # A just-created lock can be observed before its pid is written. Only a
-      # record that stays empty/malformed across several observations is a dead
-      # owner's residue, never a permanent stop condition either way.
-      malformed=$((malformed + 1))
-      if (( malformed < 3 )); then
-        attempt=$((attempt + 1))
-        sleep 0.05 2>/dev/null || sleep 1
-        continue
+      id="$(node_lock_entry_identity)" || id=''
+      if [[ -n "$id" ]]; then
+        node_lock_reclaim "$id" || { NODE_LOCK_REPORT=lock-artifact; return 1; }
       fi
-      malformed=0
+      continue
     fi
-    "$NODE_UNLINK_BIN" "$NODE_LOCK" 2>/dev/null || return 1
+    # Empty/invalid record or a non-live metadata shape (directory, link,
+    # oversized, unreadable): either a mid-publication lock or a dead owner's
+    # residue. Re-observe the SAME entry identity, then reclaim it confined to
+    # this lock path so it never becomes a permanent skip.
+    id="$(node_lock_entry_identity)" || id=''
+    if [[ -z "$id" ]]; then
+      # An entry that cannot be identified is never reclaimed blind.
+      sleep 0.05 2>/dev/null || sleep 1
+      continue
+    fi
+    if [[ "$id" != "$observed" ]]; then
+      malformed=0
+      observed="$id"
+    fi
+    malformed=$((malformed + 1))
+    if (( malformed < 3 )); then
+      sleep 0.05 2>/dev/null || sleep 1
+      continue
+    fi
+    malformed=0
+    node_lock_reclaim "$observed" || { NODE_LOCK_REPORT=lock-artifact; return 1; }
+    observed=''
   done
   return 1
 }
@@ -142,9 +225,11 @@ node_list_children() {
   (( restore_dotglob == 0 )) || shopt -u dotglob
 }
 
-# Bounded preflight then no-follow postorder. No recursive rm, find, or deletion
-# of an ancestor containing an excluded .terraform directory. Arbitrary creators'
-# ordinary descendants are disposable BY PATH, not by file creation receipts.
+# Bounded preflight then no-follow postorder. No recursive rm or find, and no
+# deletion of an ancestor of the selected generation. Arbitrary creators'
+# ordinary descendants — including hardlinked names and initialized .terraform
+# subtrees inside the selected disposable generation — are disposable BY PATH,
+# not by file creation receipts or link counts.
 node_visit() {
   local file="$1" depth="$2" parentIndex="${3:--1}" child id index="${#NODE_REMOVE_PATHS[@]}"
   node_check_fence && assert_path_identity "$NODE_REMOVE_ROOT" "$NODE_REMOVE_ID" || return 1
@@ -164,7 +249,7 @@ node_visit() {
         node_visit "$child" "$((depth+1))" "$index" || return 1
       done
     fi
-  elif node_single_file "$file"; then
+  elif [[ -f "$file" && ! -L "$file" ]]; then
     NODE_REMOVE_DIR_IDS+=('')
   else return 1
   fi
@@ -189,7 +274,9 @@ node_remove() {
       # Unlink the link itself; its target is never visited.
       "$NODE_UNLINK_BIN" "${NODE_REMOVE_PATHS[i]}" || return 1
     else
-      node_single_file "${NODE_REMOVE_PATHS[i]}" || return 1
+      # An ordinary leaf name is unlinked without following anything. A
+      # hardlink only loses this cache name; outside bytes and links stay.
+      [[ -f "${NODE_REMOVE_PATHS[i]}" && ! -L "${NODE_REMOVE_PATHS[i]}" ]] || return 1
       "$NODE_UNLINK_BIN" "${NODE_REMOVE_PATHS[i]}" || return 1
     fi
   done
@@ -243,7 +330,11 @@ node_admit() {
     # caller's EXIT trap). Another concurrent producer then skips cleanup
     # instead of deleting a generation that is still being extracted.
   else
-    echo 'pi-review-sessions: Node cache cleanup lock was busy or unreadable; continuing without reclaiming older generations.' >&2
+    if [[ "${NODE_LOCK_REPORT:-}" == lock-artifact ]]; then
+      echo 'pi-review-sessions: Node cache cleanup lock artifact could not be removed; continuing without reclaiming older generations.' >&2
+    else
+      echo 'pi-review-sessions: Node cache cleanup lock was busy or unreadable; continuing without reclaiming older generations.' >&2
+    fi
   fi
   node_check_fence || return 1
   WORK_ROOT="$(mktemp -d "$NODE_CACHE_ROOT/bootstrap.XXXXXXXX" 2>/dev/null)" || return 1

@@ -253,8 +253,9 @@ npm output stays in a contained `.setup` directory until validated `node_modules
 publication, so another launcher cannot reuse a half-install. Compatible build reuse
 neither inventories nor prunes generations.
 
-Cleanup never refuses creation: a busy or unreadable lock, a stale lock whose recorded
-owner is gone, missing/malformed legacy records, an unsafe entry, or a real filesystem
+Cleanup never refuses creation. Stale or malformed non-live lock artifacts are
+reclaimed rather than permanently disabling pruning, and missing/malformed legacy
+lifetime records do not protect cache contents. A live producer lock or actual cleanup
 failure is reported as a bounded warning and the launch continues, so five or more legacy
 generations can never block startup. Active sessions stay protected by the host's own
 exclusive agent-directory ownership record; cache entries are not a second lifetime

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import test, { type TestContext } from "node:test";
 
@@ -1797,6 +1797,166 @@ test(".sh concurrent download/extraction producers both start; a held lock only 
   f.markAssertionsPassed();
 });
 
+// ---------------------------------------------------------------------------
+// Native Windows fixture source patching
+//
+// The native cases below substitute ONE real producer line so that a host
+// ownership record, an inventory failure, or a coordination replacement appears
+// at a deterministic point inside the unchanged producer path. An anchor names a
+// whole producer line by its trimmed text: a fixture never encodes production
+// indentation, exactly one line must match, and a stale or ambiguous anchor is a
+// hard setup failure instead of a silently unpatched helper. All of this patching
+// is pure, and the guard test below proves every anchor still matches the real
+// source on every platform — the native-only cases cannot catch their own stale
+// anchors before the Windows CI job runs them.
+// ---------------------------------------------------------------------------
+
+interface WindowsFixturePatch {
+  /** What the substitution injects; used in failure messages. */
+  readonly label: string;
+  /** The whole producer line to substitute, written without leading indentation. */
+  readonly anchor: string;
+  /** Replacement lines, written without leading indentation. */
+  readonly replacement: readonly string[];
+}
+
+function patchPowerShellLine(source: string, patch: WindowsFixturePatch): string {
+  const anchor = patch.anchor.trim();
+  assert.ok(anchor.length > 0, `${patch.label}: a fixture anchor is required`);
+  assert.ok(patch.replacement.length > 0, `${patch.label}: a fixture replacement is required`);
+  const lines = source.split("\n");
+  const matched = lines.filter((line) => line.trim() === anchor).length;
+  assert.equal(matched, 1,
+    `${patch.label}: the fixture anchor matches exactly one producer line (found ${matched} for ${JSON.stringify(anchor)})`);
+  const index = lines.findIndex((line) => line.trim() === anchor);
+  // Reuse the producer's own indentation so the substitution stays inside the
+  // real block and no fixture depends on (or drifts with) a specific column.
+  const indent = /^[ \t]*/u.exec(lines[index]!)![0];
+  lines.splice(index, 1, ...patch.replacement.map((line) => `${indent}${line}`));
+  return lines.join("\n");
+}
+
+/** Apply fixture substitutions to the real producer source without writing files. */
+function buildWindowsFixtureSource(source: string, patches: readonly WindowsFixturePatch[]): string {
+  let patched = source;
+  for (const patch of patches) patched = patchPowerShellLine(patched, patch);
+  assert.notEqual(patched, source, "the fixture helper differs from the real producer");
+  return patched;
+}
+
+function windowsFixtureHelperSource(patches: readonly WindowsFixturePatch[]): string {
+  return buildWindowsFixtureSource(readFileSync(psPath, "utf8"), patches);
+}
+
+const PS_OWNERSHIP_PUBLISH = 'if (-not [IO.File]::Exists($env:FAKE_OWNERSHIP_RECORD)) { [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($env:FAKE_OWNERSHIP_RECORD)) | Out-Null; [IO.File]::WriteAllText($env:FAKE_OWNERSHIP_RECORD, \'{"version":1,"hostId":"fixture-owner"}\') }';
+const PS_OWNERSHIP_TRIGGER = 'if (-not [IO.File]::Exists($env:FAKE_OWNERSHIP_TRIGGER) -and $name -ceq $env:FAKE_OWNERSHIP_NAME) { [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($env:FAKE_OWNERSHIP_TRIGGER)) | Out-Null; [IO.File]::WriteAllText($env:FAKE_OWNERSHIP_TRIGGER, \'{"version":1,"hostId":"fixture-owner"}\') }';
+
+/** Network is the only substituted operation: no native case opens a connection. */
+const PS_DOWNLOAD_STUB: WindowsFixturePatch = {
+  label: "synthetic download failure",
+  anchor: "Receive-OfficialArchive $url $archivePath",
+  replacement: ["[IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'"],
+};
+
+/** The same substitution, releasing a live admission-lock holder on the way out. */
+const PS_DOWNLOAD_STUB_RELEASING_HOLDER: WindowsFixturePatch = {
+  label: "synthetic download failure releasing the admission-lock holder",
+  anchor: PS_DOWNLOAD_STUB.anchor,
+  replacement: ["[IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); Stop-Process -Id ([int]$env:FAKE_LOCK_HOLDER) -ErrorAction SilentlyContinue; throw 'synthetic download failure'"],
+};
+
+/** A real inventory failure raised from the producer's own inventory call. */
+const PS_INVENTORY_FAILURE_STUB: WindowsFixturePatch = {
+  label: "synthetic cache inventory failure",
+  anchor: "$entries = @([IO.Directory]::EnumerateFileSystemEntries($Root))",
+  replacement: ["throw 'synthetic inventory failure'"],
+};
+
+/** A host ownership record published while admission-lock recovery observes an
+ *  unopenable lock entry. */
+const PS_OWNERSHIP_RECORD_DURING_LOCK_RECOVERY: WindowsFixturePatch = {
+  label: "host ownership record during admission-lock recovery",
+  anchor: "$lockAttributes = Get-ExistingAttributes $lockPath",
+  replacement: [PS_OWNERSHIP_PUBLISH, "$lockAttributes = Get-ExistingAttributes $lockPath"],
+};
+
+/** A live coordination replacement published exactly between the entry-identity
+ *  capture and the owner read: the window the ordering fix closes. */
+const PS_COORDINATION_REPLACEMENT: WindowsFixturePatch = {
+  label: "live coordination replacement",
+  anchor: "try { $current = Get-PathIdentity $path } catch { $current = $null }",
+  replacement: [
+    'if (-not $script:CoordReplaced -and $env:FAKE_COORDINATION_REPLACEMENT) { $script:CoordReplaced = $true; $replacement = [int]$env:FAKE_COORDINATION_REPLACEMENT; [IO.File]::Delete($path); [IO.File]::WriteAllText($path, [string]$replacement + "`n" + (Get-NodeOwnerIdentity $replacement) + "`n") }',
+    "try { $current = Get-PathIdentity $path } catch { $current = $null }",
+  ],
+};
+
+/** A host ownership record at the real per-candidate removal boundary of the
+ *  cleanup loop: the first destructive step of one authorized candidate. */
+const PS_OWNERSHIP_RECORD_AT_REMOVAL: WindowsFixturePatch = {
+  label: "host ownership record at the candidate removal boundary",
+  anchor: "if (Remove-NodeEntry $entry) {",
+  replacement: [PS_OWNERSHIP_TRIGGER, "if (Remove-NodeEntry $entry) {"],
+};
+
+/** Every producer anchor the native Windows fixtures depend on. */
+const WINDOWS_FIXTURE_PATCHES: readonly WindowsFixturePatch[] = [
+  PS_DOWNLOAD_STUB,
+  PS_DOWNLOAD_STUB_RELEASING_HOLDER,
+  PS_INVENTORY_FAILURE_STUB,
+  PS_OWNERSHIP_RECORD_DURING_LOCK_RECOVERY,
+  PS_COORDINATION_REPLACEMENT,
+  PS_OWNERSHIP_RECORD_AT_REMOVAL,
+];
+
+function writeWindowsFixtureHelper(f: EntrypointFixture, patches: readonly WindowsFixturePatch[]): { helper: string; downloads: string; powershell: string; env: NodeJS.ProcessEnv } {
+  const downloads = join(f.root, "download-witness");
+  const helper = join(f.root, "bootstrap.ps1");
+  writeFileSync(helper, windowsFixtureHelperSource(patches), "utf8");
+  const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
+  return { helper, downloads, powershell, env };
+}
+
+test("Windows fixture anchors still match the real producer source on every platform", () => {
+  // Executed on macOS, Linux, and Windows alike: the native cases below are
+  // Windows-only, so this is the only pre-CI proof that their substitutions still
+  // land on real producer lines instead of drifting into an unpatched helper.
+  const source = readFileSync(psPath, "utf8");
+  const sourceLines = source.split("\n");
+  for (const patch of WINDOWS_FIXTURE_PATCHES) {
+    const patched = buildWindowsFixtureSource(source, [patch]);
+    assert.equal(patched.split("\n").length, sourceLines.length + patch.replacement.length - 1,
+      `${patch.label}: exactly one producer line is substituted`);
+    const indent = /^[ \t]*/u.exec(sourceLines.find((line) => line.trim() === patch.anchor.trim())!)![0];
+    for (const line of patch.replacement) {
+      assert.ok(patched.includes(`${indent}${line}`),
+        `${patch.label}: the substitution keeps the producer's own indentation`);
+    }
+  }
+  // Negative controls, on the same pure helper: a boundary that no longer exists
+  // (the pre-refactor removal statement) and one line that appears twice must both
+  // fail the fixture setup instead of quietly patching nothing.
+  assert.throws(
+    () => buildWindowsFixtureSource(source, [{ label: "stale anchor", anchor: "if (Remove-NodeEntry $entry 0) { $count-- }", replacement: ["Write-Output 'unreachable'"] }]),
+    /matches exactly one producer line \(found 0 /u,
+    "a stale anchor fails the fixture setup");
+  const duplicated = `${source}\n${PS_OWNERSHIP_RECORD_AT_REMOVAL.anchor}\n`;
+  assert.throws(
+    () => buildWindowsFixtureSource(duplicated, [PS_OWNERSHIP_RECORD_AT_REMOVAL]),
+    /matches exactly one producer line \(found 2 /u,
+    "an ambiguous anchor fails the fixture setup");
+  // The candidate-removal anchor must stay a real destructive boundary: inside the
+  // cleanup loop, after the ownership recheck that has to precede a removal.
+  const boundary = buildWindowsFixtureSource(source, [PS_OWNERSHIP_RECORD_AT_REMOVAL]);
+  const loopStart = boundary.indexOf("$candidateTarget = $Target");
+  const ownershipRecheck = boundary.indexOf("Test-NodeHostOwnership $AgentDirectory", loopStart);
+  const removal = boundary.indexOf(PS_OWNERSHIP_RECORD_AT_REMOVAL.anchor);
+  const loopEnd = boundary.indexOf("$held = $count");
+  assert.ok(loopStart >= 0 && ownershipRecheck > loopStart && removal > ownershipRecheck && loopEnd > removal,
+    "the injected record sits at the real per-candidate removal boundary after the ownership recheck");
+});
+
 test("native Windows fallback bootstrap prunes legacy artifacts and never refuses a sixth", { skip: !isWindows, timeout: 60_000 }, (t) => {
   const f = makeEntrypointFixture(".node-cap-native-windows-");
   cleanupFixture(t, f);
@@ -1804,9 +1964,7 @@ test("native Windows fallback bootstrap prunes legacy artifacts and never refuse
   const downloads = join(f.root, "download-witness");
   // Network is the only substituted operation. Native path/identity checks,
   // exclusive generation creation and bounded no-follow cleanup execute unchanged.
-  const source = readFileSync(psPath, "utf8").replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'");
-  assert.notEqual(source, readFileSync(psPath, "utf8"));
-  writeFileSync(helper, source);
+  writeFileSync(helper, windowsFixtureHelperSource([PS_DOWNLOAD_STUB]), "utf8");
   const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
   for (let i = 0; i < 6; i++) {
@@ -1849,11 +2007,7 @@ test("native Windows cleanup failures warn and still create a fresh generation",
   const helper = join(f.root, "bootstrap.ps1");
   // Network and cache inventory are the only substituted operations; native
   // lock handling and generation creation run unchanged.
-  const source = readFileSync(psPath, "utf8")
-    .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'")
-    .replace("      $entries = @([IO.Directory]::EnumerateFileSystemEntries($Root))", "      throw 'synthetic inventory failure'");
-  assert.notEqual(source, readFileSync(psPath, "utf8"));
-  writeFileSync(helper, source);
+  writeFileSync(helper, windowsFixtureHelperSource([PS_DOWNLOAD_STUB, PS_INVENTORY_FAILURE_STUB]), "utf8");
   const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
   const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
@@ -1885,8 +2039,7 @@ test("native Windows reclaims a directory-shaped cache lock and prunes to five",
   const helper = join(f.root, "bootstrap.ps1");
   // Network is the only substituted operation; native lock handling, inventory
   // and bounded no-follow cleanup execute unchanged.
-  writeFileSync(helper, readFileSync(psPath, "utf8")
-    .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'"));
+  writeFileSync(helper, windowsFixtureHelperSource([PS_DOWNLOAD_STUB]), "utf8");
   const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
   const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
@@ -1924,10 +2077,7 @@ test("native Windows settlement retries cleanup deferred by contention", { skip:
   try {
     const downloads = join(f.root, "download-witness");
     const helper = join(f.root, "bootstrap.ps1");
-    writeFileSync(helper, readFileSync(psPath, "utf8").replace(
-      "  Receive-OfficialArchive $url $archivePath",
-      "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); Stop-Process -Id ([int]$env:FAKE_LOCK_HOLDER) -ErrorAction SilentlyContinue; throw 'synthetic download failure'",
-    ));
+    writeFileSync(helper, windowsFixtureHelperSource([PS_DOWNLOAD_STUB_RELEASING_HOLDER]), "utf8");
     const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
     const env = {
       ...process.env,
@@ -1978,13 +2128,21 @@ test("native Windows deletes a populated Node generation and recovers a reused-p
   writeFileSync(marker, `${process.pid}\r\n`, { mode: 0o600 });
   const longAgo = new Date(Date.now() - 3_600_000);
   utimesSync(marker, longAgo, longAgo);
-  // Names that sort after the seeded excess so removal order stays deterministic
-  // next to the random `bootstrap.<hex>` generation names this producer creates.
-  for (const name of ["bootstrap.9-small-1", "bootstrap.9-small-2", "bootstrap.9-small-3"]) mkdirSync(join(cache, name));
+  // The cache is already OVERFULL before this launch creates anything: six
+  // removable generations, so a single admission pass must reclaim the two
+  // front-of-order candidates (the populated generation and the reused-pid one)
+  // and only then create its own. The excess names sort after both of them, in
+  // the same deterministic name order the producer uses, and each one carries real
+  // content so a removal is genuine. Rotation of the random `bootstrap-<guid>`
+  // generations that are already within the limit is deliberately NOT expected:
+  // production applies no age or size policy, so eviction order alone decides.
+  for (const name of ["bootstrap.9-small-1", "bootstrap.9-small-2", "bootstrap.9-small-3", "bootstrap.9-small-4"]) {
+    mkdirSync(join(cache, name, "extracted"), { recursive: true });
+    writeFileSync(join(cache, name, "extracted", "artifact.txt"), "disposable by location");
+  }
   const downloads = join(f.root, "download-witness");
   const helper = join(f.root, "bootstrap.ps1");
-  writeFileSync(helper, readFileSync(psPath, "utf8")
-    .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'"));
+  writeFileSync(helper, windowsFixtureHelperSource([PS_DOWNLOAD_STUB]), "utf8");
   const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
   let launches = 0;
@@ -2002,6 +2160,8 @@ test("native Windows deletes a populated Node generation and recovers a reused-p
   assert.equal(existsSync(reused), false, "a reused-pid marker never keeps its generation forever");
   assert.equal(existsSync(big), false, "the populated generation was actually deleted, not just counted");
   assert.equal(nodeRoots(f).length, 5, "the cache converges to its five-generation target");
+  assert.equal(readdirSync(cache).filter((name) => name.startsWith("bootstrap-")).length, 1,
+    "this launch still created its own fresh generation beside the four under-limit ones");
   assert.equal(readFileSync(outside, "utf8"), "outside remains", "outside bytes are never deleted");
   f.markAssertionsPassed();
 });
@@ -2023,11 +2183,17 @@ test("native Windows deletes directory-heavy generations progressively and conve
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "artifact.txt"), "disposable by location");
   }
-  for (const name of ["bootstrap.9-small-1", "bootstrap.9-small-2", "bootstrap.9-small-3"]) mkdirSync(join(cache, name));
+  // Overfull before creation exactly like the populated case: the pass has to
+  // reclaim the directory-only and directory-heavy generations, then create its
+  // own; later launches keep reclaiming populated fresh generations as they are
+  // evicted in deterministic name order.
+  for (const name of ["bootstrap.9-small-1", "bootstrap.9-small-2", "bootstrap.9-small-3", "bootstrap.9-small-4"]) {
+    mkdirSync(join(cache, name, "extracted"), { recursive: true });
+    writeFileSync(join(cache, name, "extracted", "artifact.txt"), "disposable by location");
+  }
   const downloads = join(f.root, "download-witness");
   const helper = join(f.root, "bootstrap.ps1");
-  writeFileSync(helper, readFileSync(psPath, "utf8")
-    .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'"));
+  writeFileSync(helper, windowsFixtureHelperSource([PS_DOWNLOAD_STUB]), "utf8");
   const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
   const populated: string[] = [];
@@ -2056,28 +2222,11 @@ test("native Windows deletes directory-heavy generations progressively and conve
 
 // #385 coordination boundary (native Windows): ownership acquisition and
 // destructive cache reclamation take one canonical per-agent entry. These cases
-// substitute a single source line so a host ownership record appears at a
-// deterministic point in the real producer path; they run only in the native
-// Windows CI job (session-host-entrypoints.test.js), never on a POSIX runner.
-const PS_OWNERSHIP_PUBLISH = 'if (-not [IO.File]::Exists($env:FAKE_OWNERSHIP_RECORD)) { [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($env:FAKE_OWNERSHIP_RECORD)) | Out-Null; [IO.File]::WriteAllText($env:FAKE_OWNERSHIP_RECORD, \'{"version":1,"hostId":"fixture-owner"}\') }';
-const PS_OWNERSHIP_TRIGGER = 'if (-not [IO.File]::Exists($env:FAKE_OWNERSHIP_TRIGGER) -and $name -ceq $env:FAKE_OWNERSHIP_NAME) { [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($env:FAKE_OWNERSHIP_TRIGGER)) | Out-Null; [IO.File]::WriteAllText($env:FAKE_OWNERSHIP_TRIGGER, \'{"version":1,"hostId":"fixture-owner"}\') }';
-
-function writeWindowsFixtureHelper(f: EntrypointFixture, extraReplacements: Array<[string, string]>): { helper: string; downloads: string; powershell: string; env: NodeJS.ProcessEnv } {
-  const downloads = join(f.root, "download-witness");
-  const helper = join(f.root, "bootstrap.ps1");
-  let source = readFileSync(psPath, "utf8")
-    .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'");
-  for (const [from, to] of extraReplacements) {
-    assert.ok(source.includes(from), `the substituted producer line is still present: ${from}`);
-    source = source.replace(from, to);
-  }
-  assert.notEqual(source, readFileSync(psPath, "utf8"));
-  writeFileSync(helper, source);
-  const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
-  return { helper, downloads, powershell, env };
-}
-
+// substitute one real producer line (see the patching helpers above) so a host
+// ownership record appears at a deterministic point in the real producer path.
+// The substitutions themselves are guarded by the all-platform anchor test above;
+// the executable cases run only in the native Windows CI job
+// (session-host-entrypoints.test.js), never on a POSIX runner.
 test("native Windows skips pruning when a session host appears during admission-lock recovery", { skip: !isWindows, timeout: 60_000 }, (t) => {
   const f = makeEntrypointFixture(".node-ownership-windows-recovery-");
   cleanupFixture(t, f);
@@ -2090,10 +2239,7 @@ test("native Windows skips pruning when a session host appears during admission-
     legacy.push(root);
   }
   const ownership = join(f.agentDir, "session-host", "host-ownership.json");
-  const { helper, downloads, powershell, env } = writeWindowsFixtureHelper(f, [[
-    "          $lockAttributes = Get-ExistingAttributes $lockPath",
-    `          ${PS_OWNERSHIP_PUBLISH}\n          $lockAttributes = Get-ExistingAttributes $lockPath`,
-  ]]);
+  const { helper, downloads, powershell, env } = writeWindowsFixtureHelper(f, [PS_DOWNLOAD_STUB, PS_OWNERSHIP_RECORD_DURING_LOCK_RECOVERY]);
   const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
     env: { ...env, FAKE_OWNERSHIP_RECORD: ownership }, cwd: f.root, encoding: "utf8", timeout: 20_000,
   });
@@ -2182,10 +2328,7 @@ test("native Windows stale recovery never reclaims a live replacement coordinati
   try {
     // The replacement appears exactly between the entry-identity capture and the
     // owner read: the window the ordering fix closes.
-    const { helper, downloads, powershell, env } = writeWindowsFixtureHelper(f, [[
-      "    try { $current = Get-PathIdentity $path } catch { $current = $null }",
-      "    if (-not $script:CoordReplaced -and $env:FAKE_COORDINATION_REPLACEMENT) { $script:CoordReplaced = $true; $replacement = [int]$env:FAKE_COORDINATION_REPLACEMENT; [IO.File]::Delete($path); [IO.File]::WriteAllText($path, [string]$replacement + \"`n\" + (Get-NodeOwnerIdentity $replacement) + \"`n\") }\n    try { $current = Get-PathIdentity $path } catch { $current = $null }",
-    ]]);
+    const { helper, downloads, powershell, env } = writeWindowsFixtureHelper(f, [PS_DOWNLOAD_STUB, PS_COORDINATION_REPLACEMENT]);
     const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
       env: { ...env, FAKE_COORDINATION_REPLACEMENT: String(holder.pid) }, cwd: f.root, encoding: "utf8", timeout: 30_000,
     });
@@ -2290,27 +2433,48 @@ test("native Windows reused-pid coordination metadata never blocks startup", { s
     assert.ok(mismatchedResult.elapsed < 10_000, `the stale record was reclaimed promptly (${mismatchedResult.elapsed}ms)`);
     assert.equal(existsSync(entry), false, "the stale record itself is gone");
     // The same live pid with its real birth identity is a current holder: the
-    // producer admission then leaves the cache untouched instead of reclaiming.
+    // producer admission then leaves the cache untouched instead of reclaiming,
+    // while still creating its own generation. Real excess generations with real
+    // bytes and entry counts make that proof non-vacuous: a skipped cleanup has
+    // something real to leave alone.
     writeFileSync(entry, `${holder.pid}\n${identity}\n`, "utf8");
-    const legacy = nodeRoots(f);
-    assert.ok(legacy.length >= 0);
+    const cache = nodeCache(f);
+    mkdirSync(cache, { recursive: true });
+    const survivors: Array<{ root: string; artifact: string; entries: number; bytes: string }> = [];
+    for (let index = 0; index < 6; index += 1) {
+      const root = join(cache, `bootstrap.0-survivor-${index}`);
+      mkdirSync(join(root, "extracted"), { recursive: true });
+      const artifact = join(root, "extracted", "artifact.txt");
+      const bytes = `survivor generation ${index} payload`;
+      writeFileSync(artifact, bytes, "utf8");
+      survivors.push({ root, artifact, entries: countTreeEntries(root), bytes });
+    }
     const admitScript = [
       `const fs = require("node:fs");`,
       `const path = require("node:path");`,
       `const generations = require(${JSON.stringify(CJS_GENERATIONS)});`,
       `const warnings = [];`,
       `const cache = path.join(process.argv[1], ".pi-review-gate", "node");`,
-      `fs.mkdirSync(cache, { recursive: true });`,
       `const stage = generations.admit(cache, () => ({ root: fs.mkdtempSync(path.join(cache, "bootstrap.")) }), { warn: (warning) => warnings.push(warning) });`,
+      `const created = stage.root;`,
       `stage.generation.release();`,
-      `process.stdout.write(JSON.stringify(warnings) + "\\n");`,
+      `process.stdout.write(JSON.stringify({ warnings, created }) + "\\n");`,
       ``,
     ].join("\n");
     const honored = runNode(admitScript, [f.agentDir]);
     assert.equal(honored.status, 0, honored.stderr);
-    const honoredWarnings = JSON.parse(honored.stdout.trim()) as string[];
-    assert.ok(honoredWarnings.some((warning) => warning.includes("host ownership coordination")),
-      `the current holder is honored on Windows too: ${honoredWarnings.join(" | ")}`);
+    const honoredResult = JSON.parse(honored.stdout.trim()) as { warnings: string[]; created: string };
+    assert.ok(honoredResult.warnings.some((warning) => warning.includes("host ownership coordination")),
+      `the current holder is honored on Windows too: ${honoredResult.warnings.join(" | ")}`);
+    for (const survivor of survivors) {
+      assert.ok(existsSync(survivor.root), `a generation of the honored holder survives cleanup: ${survivor.root}`);
+      assert.equal(readFileSync(survivor.artifact, "utf8"), survivor.bytes, "survivor bytes are untouched");
+      assert.equal(countTreeEntries(survivor.root), survivor.entries, "no entry inside a survivor generation was deleted");
+    }
+    assert.equal(dirname(resolve(honoredResult.created)), resolve(cache),
+      "the fresh generation is created inside the cache while cleanup stays away");
+    assert.ok(existsSync(honoredResult.created), "startup still created its own generation");
+    assert.equal(nodeRoots(f).length, 7, "six untouched generations plus this launch's own");
   } finally {
     holder.kill("SIGKILL");
   }
@@ -2332,10 +2496,7 @@ test("native Windows stops reclamation at the boundary when a session host appea
   writeFileSync(join(outside, "sentinel"), "outside");
   symlinkSync(outside, join(legacy[0]!, "junction"), "junction");
   const trigger = join(f.agentDir, "session-host", "host-ownership.json");
-  const { helper, downloads, powershell, env } = writeWindowsFixtureHelper(f, [[
-    "      if (Remove-NodeEntry $entry 0) { $count-- }",
-    `      ${PS_OWNERSHIP_TRIGGER}\n      if (Remove-NodeEntry $entry 0) { $count-- }`,
-  ]]);
+  const { helper, downloads, powershell, env } = writeWindowsFixtureHelper(f, [PS_DOWNLOAD_STUB, PS_OWNERSHIP_RECORD_AT_REMOVAL]);
   const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
     env: { ...env, FAKE_OWNERSHIP_TRIGGER: trigger, FAKE_OWNERSHIP_NAME: "bootstrap.legacy-1" }, cwd: f.root, encoding: "utf8", timeout: 20_000,
   });
@@ -2369,8 +2530,7 @@ test("native Windows fences outside junction markers, prunes malformed markers, 
   for (let i = 0; i < 6; i++) mkdirSync(join(cache, `bootstrap.3-filler-${i}`), { recursive: true });
   const downloads = join(f.root, "download-witness");
   const helper = join(f.root, "bootstrap.ps1");
-  writeFileSync(helper, readFileSync(psPath, "utf8")
-    .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'"));
+  writeFileSync(helper, windowsFixtureHelperSource([PS_DOWNLOAD_STUB]), "utf8");
   const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
   const run = () => spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {

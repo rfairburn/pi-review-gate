@@ -4,18 +4,24 @@ import {
   constants as fsConstants,
   fsyncSync,
   fstatSync,
+  readFileSync,
+  statSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
   type BigIntStats,
   type Stats,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { isAbsolute, join } from "node:path";
+import { performance } from "node:perf_hooks";
 
 import { MAX_NATIVE_SESSION_NAME_LENGTH, isValidNativeSessionId } from "./protocol";
 
@@ -64,6 +70,27 @@ export const ROSTER_FILENAME = "roster.json";
 
 /** Exclusive ownership record file name inside the private state directory. */
 export const HOST_OWNERSHIP_FILENAME = "host-ownership.json";
+
+/**
+ * Per-agent coordination entry shared with producer-owned cache reclamation.
+ * It is a short-lived lock, never a second lifetime registry: it makes taking
+ * host ownership mutually exclusive with destructive cache cleanup, and a stale
+ * or malformed one is reclaimed rather than treated as state.
+ */
+export const HOST_COORDINATION_FILENAME = "host-coordination.lock";
+
+/** Bounded wait for a busy coordination entry before continuing uncoordinated. */
+const COORDINATION_POLL_MS = 25;
+/**
+ * A current holder is waited for without any elapsed-time bypass: while it is
+ * alive it may be inside the destructive critical section that would delete this
+ * host's prepared runtime, so ownership is never claimed behind its back. Only a
+ * genuinely unremovable artifact (a real filesystem failure, not stale metadata)
+ * ends the wait.
+ */
+const COORDINATION_UNREMOVABLE_DEADLINE_MS = 120_000;
+/** Bounded canonical record: `<pid>\n<owner identity>\n`. */
+const MAX_COORDINATION_BYTES = 192;
 
 /** Upper bound for remembered roster entries; larger rosters are never published. */
 export const MAX_ROSTER_ENTRIES = 64;
@@ -488,11 +515,444 @@ export type HostStateOpenResult =
   | { status: "opened"; state: HostStateHandle }
   | { status: "refused"; message: string };
 
+function sleepSync(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function ownerIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+type CoordinationAcquisition =
+  /** This host now holds the entry and must release it when ownership exists. */
+  | { status: "held"; release(): void }
+  /**
+   * This process already holds the entry (the launcher's coordinated
+   * selection/preparation handoff). A single-threaded process cannot be running a
+   * destructive pass at the same time, so ownership is claimed inside that hold
+   * and the hold is handed back once the record exists.
+   */
+  | { status: "self" }
+  /**
+   * A genuine unremovable-artifact or IO failure ended the wait. Ownership still
+   * proceeds: the exclusive record plus producer-side boundary rechecks remain
+   * authoritative, and this is never reported as a verification gate.
+   */
+  | { status: "unavailable" };
+
+/** First existing standard OS location for one required helper binary. */
+function standardBinary(candidates: readonly string[]): string | undefined {
+  for (const candidate of candidates) {
+    try {
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {
+      // Try the next standard location.
+    }
+  }
+  return undefined;
+}
+
+/** Boot identity for Linux starttime tokens (a reboot invalidates starttimes). */
+function linuxBootIdentity(): string {
+  try {
+    const id = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    if (/^[0-9a-f-]{8,64}$/u.test(id)) return id;
+  } catch {
+    // Fall through to the kernel boot time.
+  }
+  try {
+    const match = /^btime\s+(\d{1,12})$/mu.exec(readFileSync("/proc/stat", "utf8"));
+    if (match) return `btime-${match[1]}`;
+  } catch {
+    // No boot identity is available.
+  }
+  return "";
+}
+
+/**
+ * Target single-pid process-start token in one exact per-platform format so a
+ * writer and a reader agree byte for byte: `linux:<boot>:<starttime ticks>` from
+ * this single pid's `/proc/<pid>/stat` (no procps `ps` needed), `darwin:<ps lstart
+ * token>` from one targeted `ps` query pinned to UTC and the C locale (the
+ * rendering carries no zone of its own, so a caller-local one would let the same
+ * live process look like a different owner after a timezone or DST change), or
+ * `win32:<StartTime round-trip>` from one targeted native PowerShell query (the
+ * same facility and format the PowerShell producer uses, with its explicit UTC
+ * offset). Exactly one pid, never a census, and no third-party package; an
+ * empty result means the identity genuinely cannot be established.
+ */
+function ownerStartIdentity(pid: number): string {
+  if (!Number.isInteger(pid) || pid <= 0) return "";
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const close = stat.lastIndexOf(")");
+      if (close < 0) return "";
+      const starttime = stat.slice(close + 1).trim().split(/\s+/u)[19];
+      if (!starttime || !/^[0-9]{1,20}$/u.test(starttime)) return "";
+      const boot = linuxBootIdentity();
+      if (!boot) return "";
+      return `linux:${boot}:${starttime}`;
+    } catch {
+      return "";
+    }
+  }
+  if (process.platform === "darwin") {
+    const ps = standardBinary(["/bin/ps", "/usr/bin/ps"]);
+    if (!ps) return "";
+    try {
+      const output = execFileSync(ps, ["-p", String(pid), "-o", "lstart="], {
+        encoding: "utf8",
+        timeout: 5_000,
+        stdio: ["ignore", "pipe", "ignore"],
+        // Pinned so the token is byte-identical to the CJS and POSIX writers on
+        // every host, independent of the caller's timezone or locale.
+        env: { ...process.env, TZ: "UTC0", LC_ALL: "C", LANG: "C" },
+      });
+      const token = String(output).replace(/\s+/gu, " ").trim();
+      return token.length > 0 && token.length <= MAX_COORDINATION_BYTES - 48 ? `darwin:${token}` : "";
+    } catch {
+      return "";
+    }
+  }
+  if (process.platform === "win32") {
+    const powershell = standardBinary([
+      `${process.env.SystemRoot || "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+      `${process.env.SystemRoot || "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\pwsh.exe`,
+    ]);
+    if (!powershell) return "";
+    // Exactly one known numeric pid, passed as a fixed argv entry (never composed
+    // into a shell string), bounded and non-interactive.
+    const script = "& { param([int]$OwnerPid) try { $p = Get-Process -Id $OwnerPid -ErrorAction Stop; "
+      + "[Console]::Out.Write('win32:' + $p.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)) } "
+      + "catch { exit 2 } }";
+    try {
+      const output = execFileSync(powershell, [
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-Command", script, String(pid),
+      ], {
+        encoding: "utf8",
+        timeout: 10_000,
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+      });
+      const token = String(output).trim();
+      return /^win32:.{4,}$/u.test(token) && token.length <= MAX_COORDINATION_BYTES - 48 ? token : "";
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+// This process's own owner identity. The token is immutable once established, so
+// a positive result is cached forever; a failed query is never cached, because a
+// transient `ps`/`/proc` failure at load would otherwise permanently prevent this
+// host from publishing or recognizing its own coordination hold (and would leave
+// it waiting forever on a hold that is its own).
+let OWN_OWNER_IDENTITY_CACHE = "";
+function ownOwnerIdentity(): string {
+  if (OWN_OWNER_IDENTITY_CACHE === "") {
+    // Retried on every call until it succeeds: a transient failure must never
+    // disable publishing or self-adoption for the rest of the host's life.
+    const observed = ownerStartIdentity(process.pid);
+    if (observed !== "") OWN_OWNER_IDENTITY_CACHE = observed;
+  }
+  return OWN_OWNER_IDENTITY_CACHE;
+}
+// Learn this host's identity once at load; a failure here is retried above.
+OWN_OWNER_IDENTITY_CACHE = ownerStartIdentity(process.pid);
+
+interface CoordinationRecord {
+  readonly pid: number;
+  /** Empty when the platform (or a Windows writer) records no start identity. */
+  readonly identity: string;
+}
+
+function parseCoordinationRecord(text: string): CoordinationRecord | undefined {
+  const newline = text.indexOf("\n");
+  if (newline < 0) return undefined;
+  const pidText = text.slice(0, newline).trim();
+  if (!/^[1-9][0-9]{0,9}$/u.test(pidText)) return undefined;
+  const identity = text.slice(newline + 1).replace(/\n+$/u, "");
+  if (identity.length > MAX_COORDINATION_BYTES - 32) return undefined;
+  return { pid: Number(pidText), identity };
+}
+
+/**
+ * True only while the record's pid is alive AND still reports the recorded start
+ * identity, so an abandoned record whose pid was reused by an unrelated live
+ * process is never honored forever. A record without a birth identity is never
+ * honored on any platform. A birth query that temporarily fails is NOT a proven
+ * mismatch: the pid is alive, so the record may still be a live holder and is
+ * honored rather than stolen (stealing it mid-destructive-pass would let a second
+ * actor claim ownership beside an active deletion).
+ */
+function coordinationOwnerIsCurrent(record: CoordinationRecord | undefined): boolean {
+  if (!record || !ownerIsAlive(record.pid)) return false;
+  // A record without a birth identity is never honored: pid-only metadata could
+  // otherwise be pinned forever behind an unrelated live process.
+  if (record.identity === "") return false;
+  const observed = ownerStartIdentity(record.pid);
+  if (observed === "") return true;
+  return observed === record.identity;
+}
+
+/** Bounded no-follow read; a valid record is accepted at nlink 1 or 2. */
+function readCoordinationRecord(entryPath: string): CoordinationRecord | undefined {
+  let before: BigIntStats;
+  try {
+    before = lstatSync(entryPath, { bigint: true });
+  } catch {
+    return undefined;
+  }
+  if (before.isSymbolicLink() || !before.isFile()) return undefined;
+  if (before.nlink !== 1n && before.nlink !== 2n) return undefined;
+  if (before.size > BigInt(MAX_COORDINATION_BYTES)) return undefined;
+  let fd: number;
+  try {
+    fd = openSync(entryPath, fsConstants.O_RDONLY
+      | (fsConstants.O_NONBLOCK ?? 0)
+      | (fsConstants.O_NOFOLLOW ?? 0));
+  } catch {
+    return undefined;
+  }
+  try {
+    const bytes = Buffer.alloc(MAX_COORDINATION_BYTES + 1);
+    const length = readSync(fd, bytes, 0, bytes.length, 0);
+    return parseCoordinationRecord(bytes.subarray(0, Math.min(length, MAX_COORDINATION_BYTES)).toString("utf8"));
+  } catch {
+    return undefined;
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // The parsed record stands; only the descriptor is lost.
+    }
+  }
+}
+
+/**
+ * Prepare this process's coordination record as a private, already-complete
+ * candidate. Publication is a separate atomic step, so a paused publisher can
+ * never expose a half-written canonical entry.
+ */
+function prepareCoordinationCandidate(stateDir: string): { candidate: string; publish(entryPath: string): "published" | "lost" | "failed" } | undefined {
+  const candidate = join(stateDir, `${HOST_COORDINATION_FILENAME}.${process.pid}.${randomUUID().slice(0, 8)}`);
+  let fd: number | undefined;
+  try {
+    fd = openSync(candidate, "wx", 0o600);
+    try {
+      writeFileSync(fd, `${process.pid}\n${ownOwnerIdentity()}\n`, "utf8");
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    try {
+      if (fd !== undefined) closeSync(fd);
+    } catch {
+      // Preserve the failure.
+    }
+    return undefined;
+  }
+  return {
+    candidate,
+    /**
+     * Atomic no-overwrite publish: `link` fails with EEXIST when another holder
+     * already published, so an existing entry is never overwritten and this
+     * publisher never adopts it.
+     */
+    publish(entryPath: string): "published" | "lost" | "failed" {
+      try {
+        linkSync(candidate, entryPath);
+        return "published";
+      } catch (error) {
+        return (error as NodeJS.ErrnoException)?.code === "EEXIST" ? "lost" : "failed";
+      } finally {
+        try {
+          unlinkSync(candidate);
+        } catch {
+          // A leftover candidate is private residue, never a gate.
+        }
+      }
+    },
+  };
+}
+
+/**
+ * Remove exactly the observed coordination entry name; a link is unlinked itself
+ * (never followed, and one hard link's removal never touches another name's
+ * bytes), and a directory shape is removed only when empty.
+ */
+function reclaimCoordinationEntry(entryPath: string, observedIdentity: string): "reclaimed" | "kept" | "failed" {
+  let stat: BigIntStats;
+  try {
+    stat = lstatSync(entryPath, { bigint: true });
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === "ENOENT" ? "reclaimed" : "failed";
+  }
+  if (`${stat.dev}:${stat.ino}` !== observedIdentity) return "kept";
+  try {
+    if (stat.isDirectory() && !stat.isSymbolicLink()) rmdirSync(entryPath);
+    else unlinkSync(entryPath);
+    return "reclaimed";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === "ENOENT" ? "reclaimed" : "failed";
+  }
+}
+
+/**
+ * Publish this process's coordination record for diagnostics and deterministic
+ * regressions (the same complete candidate plus atomic no-overwrite link the
+ * ownership acquisition uses). Returns false when the record could not be
+ * published, including when the owner identity is genuinely unavailable.
+ */
+export function publishHostCoordinationRecord(stateDir: string): boolean {
+  if (ownOwnerIdentity() === "") return false;
+  const candidate = prepareCoordinationCandidate(stateDir);
+  if (!candidate) return false;
+  return candidate.publish(join(stateDir, HOST_COORDINATION_FILENAME)) === "published";
+}
+
+/**
+ * Hand back a coordination entry this same process holds, once ownership exists.
+ * Only this process's own published record is removed.
+ */
+function releaseSelfCoordination(stateDir: string): void {
+  const entryPath = join(stateDir, HOST_COORDINATION_FILENAME);
+  const record = readCoordinationRecord(entryPath);
+  if (!record || record.pid !== process.pid || record.identity !== ownOwnerIdentity()) return;
+  try {
+    unlinkSync(entryPath);
+  } catch {
+    // A replaced or already-removed entry is not ours to remove.
+  }
+}
+
+/**
+ * Take the canonical per-agent coordination mutex that producer cache
+ * reclamation also takes. A current holder is honored (this host waits for the
+ * whole bounded destructive pass), stale/reused-pid/malformed metadata is
+ * reclaimed confined to the entry, and only a genuine unremovable artifact ends
+ * the wait.
+ */
+function acquireHostCoordination(stateDir: string): CoordinationAcquisition {
+  const entryPath = join(stateDir, HOST_COORDINATION_FILENAME);
+  let malformed = 0;
+  let malformedIdentity: string | undefined;
+  let unremovableSince: number | undefined;
+  for (;;) {
+    const ownIdentity = ownOwnerIdentity();
+    if (ownIdentity === "") {
+      // Honest failure: a pid-only record would pin a later start behind a reused
+      // pid forever, so no record is published at all.
+      return { status: "unavailable" };
+    }
+    const candidate = prepareCoordinationCandidate(stateDir);
+    if (!candidate) return { status: "unavailable" };
+    const outcome = candidate.publish(entryPath);
+    if (outcome === "published") {
+      let created: BigIntStats;
+      try {
+        created = lstatSync(entryPath, { bigint: true });
+      } catch {
+        return { status: "unavailable" };
+      }
+      const createdIdentity = `${created.dev}:${created.ino}`;
+      return {
+        status: "held",
+        release(): void {
+          const record = readCoordinationRecord(entryPath);
+          if (!record || record.pid !== process.pid) return;
+          let observed: BigIntStats;
+          try {
+            observed = lstatSync(entryPath, { bigint: true });
+          } catch {
+            return;
+          }
+          if (`${observed.dev}:${observed.ino}` !== createdIdentity) return;
+          try {
+            unlinkSync(entryPath);
+          } catch {
+            // A replaced or already-removed entry is not ours to remove.
+          }
+        },
+      };
+    }
+    if (outcome === "failed") return { status: "unavailable" };
+    let observed: BigIntStats;
+    try {
+      observed = lstatSync(entryPath, { bigint: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        // Another holder settled it between attempts; retry publication.
+        malformed = 0;
+        malformedIdentity = undefined;
+        continue;
+      }
+      return { status: "unavailable" };
+    }
+    const observedIdentity = `${observed.dev}:${observed.ino}`;
+    const record = readCoordinationRecord(entryPath);
+    if (record && record.pid === process.pid) {
+      // A record naming this very pid can only be this process's own hold or a
+      // predecessor's residue with a reused number; no other live process can
+      // hold it. Self-adoption requires a matching birth identity so a pid-only or
+      // unverifiable record is never adopted, and it is never waited on either —
+      // waiting on ourselves would deadlock the launcher/host handoff forever.
+      if (record.identity === ownIdentity) return { status: "self" };
+    } else if (coordinationOwnerIsCurrent(record)) {
+      malformed = 0;
+      malformedIdentity = undefined;
+      unremovableSince = undefined;
+      sleepSync(COORDINATION_POLL_MS);
+      continue;
+    }
+    if (record === undefined) {
+      if (observedIdentity !== malformedIdentity) {
+        malformed = 0;
+        malformedIdentity = observedIdentity;
+      }
+      malformed += 1;
+      if (malformed < 3) {
+        sleepSync(COORDINATION_POLL_MS);
+        continue;
+      }
+      malformed = 0;
+      malformedIdentity = undefined;
+    }
+    const reclaimed = reclaimCoordinationEntry(entryPath, observedIdentity);
+    if (reclaimed === "failed") {
+      if (unremovableSince === undefined) unremovableSince = performance.now();
+      if (performance.now() - unremovableSince >= COORDINATION_UNREMOVABLE_DEADLINE_MS) {
+        return { status: "unavailable" };
+      }
+      sleepSync(COORDINATION_POLL_MS);
+      continue;
+    }
+    unremovableSince = undefined;
+  }
+}
+
 /**
  * Acquire exclusive ownership of one canonical Pi agent directory and read its
  * persisted roster. Ownership is established before any roster entry or child
- * exists, and an existing or uncertain ownership record refuses instead of
- * being stolen or verified around.
+ * exists, and an existing or uncertain ownership record refuses instead of being
+ * stolen or verified around. Ownership acquisition takes the per-agent
+ * coordination boundary that destructive cache reclamation also takes, so an
+ * already-authorized cleanup can never delete this host's prepared runtime while
+ * it becomes the owner. When this process already holds that boundary — the
+ * launcher's coordinated selection/preparation handoff — ownership is claimed
+ * inside the existing hold and the boundary is handed back once the ownership
+ * record exists, so no last-moment artifact proof or new startup refusal is
+ * needed.
  */
 export function openHostState(options: { agentDir: string; hostId: string }): HostStateOpenResult {
   const hostId = options?.hostId;
@@ -513,6 +973,17 @@ export function openHostState(options: { agentDir: string; hostId: string }): Ho
     };
   }
   const ownershipPath = join(stateDir, HOST_OWNERSHIP_FILENAME);
+  // Take the per-agent coordination boundary for the exclusive create only, and
+  // release it as soon as this host's record exists: a producer waiting on it
+  // then sees the ownership record and leaves this host's cache alone. A live
+  // holder is waited for, because it may be inside the destructive pass that
+  // would delete the prepared runtime; only a genuinely unremovable artifact
+  // ends that wait, and then ownership is not claimed at all.
+  const coordination = acquireHostCoordination(stateDir);
+  // A genuine unremovable-artifact/IO failure is not a verification gate: this
+  // host still takes its existing exclusive ownership record, and producer
+  // cleanup rechecks that record at every destructive boundary. Stale or
+  // malformed metadata has already been reclaimed above.
   try {
     const fd = openSync(ownershipPath, "wx", 0o600);
     try {
@@ -538,6 +1009,11 @@ export function openHostState(options: { agentDir: string; hostId: string }): Ho
       message: boundedMessage(`Session host refused: exclusive ownership of the Pi agent directory could not be `
         + `established (${typeof code === "string" ? code : "unknown error"}).`),
     };
+  } finally {
+    if (coordination.status === "held") coordination.release();
+    // The launcher's coordinated handoff: this process already held the entry,
+    // and ownership now exists, so the hold ends exactly here.
+    else if (coordination.status === "self") releaseSelfCoordination(stateDir);
   }
 
   const read = readRosterStore(canonicalAgentDir);

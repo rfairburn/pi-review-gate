@@ -224,6 +224,42 @@ if [[ -z "$NODE_UNLINK_BIN" || -z "$NODE_RMDIR_BIN" ]]; then
   echo 'pi-review-sessions: Node cache cleanup requires unlink and rmdir.' >&2
   exit 1
 fi
+# Per-agent coordination publication is an atomic no-overwrite hard link, and the
+# owner-lifetime identity is one targeted single-pid query (Linux reads
+# /proc/<pid>/stat, so procps is not required). These are resolved from the
+# standard OS locations when PATH is limited and are never a launch prerequisite:
+# if they are genuinely unavailable the mutex is reported unavailable and the
+# launch continues without publishing a weak record.
+NODE_HARDLINK_BIN="$(type -P ln || true)"
+if [[ -z "$NODE_HARDLINK_BIN" ]]; then
+  for candidate in /bin/ln /usr/bin/ln; do
+    if [[ -f "$candidate" ]]; then NODE_HARDLINK_BIN="$candidate"; break; fi
+  done
+fi
+NODE_PS_BIN="$(type -P ps || true)"
+if [[ -z "$NODE_PS_BIN" ]]; then
+  for candidate in /bin/ps /usr/bin/ps; do
+    if [[ -f "$candidate" ]]; then NODE_PS_BIN="$candidate"; break; fi
+  done
+fi
+# Owner-birth comparison for a legacy pid-only record needs the standard date
+# tool; when it is genuinely unavailable such a record is honored conservatively
+# and cleanup still proceeds for every other case, so this is never a launch
+# prerequisite.
+NODE_DATE_BIN="$(type -P date || true)"
+if [[ -z "$NODE_DATE_BIN" ]]; then
+  for candidate in /bin/date /usr/bin/date; do
+    if [[ -f "$candidate" ]]; then NODE_DATE_BIN="$candidate"; break; fi
+  done
+fi
+# Batched native leaf removal is an efficiency detail, never a prerequisite: when
+# `rm` is unavailable the walker falls back to one no-follow `unlink` per name.
+NODE_RM_BIN="$(type -P rm || true)"
+if [[ -z "$NODE_RM_BIN" ]]; then
+  for candidate in /bin/rm /usr/bin/rm; do
+    if [[ -f "$candidate" ]]; then NODE_RM_BIN="$candidate"; break; fi
+  done
+fi
 ORIGINAL_UMASK="$(umask)"
 umask 077
 node_capture_fence || exit 1

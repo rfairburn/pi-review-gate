@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.179]
+## [0.1.0-dev.180]
 
 ### Fixed
 
@@ -44,6 +44,48 @@ dates.
   additive authenticated control request with no configuration or package-layout
   change. The reported symptom's exact trigger and any native-platform certification
   remain unestablished.
+
+## [0.1.0-dev.179]
+
+### Fixed
+
+- Disposable producer caches now clean up progressively instead of stopping at startup or
+  reporting work they did not do (#385). The launcher's `.pi-review-gate/{build,
+  pi-runtime,node}` caches keep their independent per-type target of five, but one cleanup
+  pass now shares a single runtime budget and deletes one entry at a time, so a large or
+  deep generation is actually reduced by every pass and finished by later ones; the budget
+  is checked as the walk deletes, never only between whole generations, and reaching it
+  never leaves a pass with zero progress. Compatible source-build and Pi runtime reuse, and
+  each settled preparation, run the same bounded pass and never treat the generation the
+  launch is using as a candidate, so a warm startup converges older generations without
+  installing, compiling, or recreating anything. The CJS, POSIX, and native PowerShell
+  producers share those rules, and no count, inventory, or cleanup outcome refuses a start.
+  `.producer-active` markers and `.admission.lock` records now name their owner as a pid
+  plus a targeted birth identity, so an abandoned record whose pid was reused is reclaimed
+  instead of pinning a generation, while a legacy pid-only record is still honored for its
+  genuine owner; missing or malformed metadata protects nothing and no real in-flight
+  producer is deleted.
+- A starting session host and producer-owned cache reclamation no longer race for the same
+  agent directory (#385). Taking host ownership and destructive reclamation of those caches
+  share one canonical per-agent coordination entry,
+  `<agentDir>/session-host/host-coordination.lock`, published already complete (`pid` plus
+  one per-platform birth identity) through an atomic no-overwrite hard link. Cleanup holds it
+  only while it removes excess generations and creates its own, rechecks the existing
+  ownership record after any wait or stale/malformed recovery and at every destructive
+  boundary, and skips reclamation (with a truthful bounded warning) when the entry is
+  unavailable instead of racing an ownership acquisition it cannot exclude. The launcher
+  takes the same entry before its final build/Pi revalidation, the host-entry load, and the
+  ownership claim, revalidates the prepared build and selected runtime with the existing
+  validation authority inside that hold, re-prepares or reselects through the existing
+  selection path when a concurrent preparation reclaimed them, and hands the entry back once
+  the host's ownership record exists. Dead, malformed, pid-only, or pid-reused coordination
+  metadata is reclaimed rather than gating startup, while a birth query that temporarily
+  fails is never treated as a proven mismatch: a live holder's entry stays honored, so no
+  actor can steal a live destructive holder's mutex mid-deletion. A live host's generations
+  stay untouched. Cleanup-specific disposal is also less artificial: a special leaf entry
+  (FIFO, socket, or device name) inside a selected disposable generation is unlinked without
+  being opened, and a direct-child `.terraform` entry under the producer-owned Node cache is
+  no longer exempt from reclamation.
 
 ## [0.1.0-dev.178]
 

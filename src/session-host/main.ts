@@ -2921,7 +2921,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // ownership of the canonical Pi agent directory and read the persisted
     // roster BEFORE any roster entry, manager row, or child exists. A host that
     // shares the same agent directory refuses here with an actionable message
-    // and starts nothing.
+    // and starts nothing. Ownership is claimed inside the same per-agent
+    // coordination entry that destructive cache cleanup takes (and, for the
+    // launcher's coordinated handoff, inside the hold that already protected the
+    // prepared selection), so no reclamation can delete this host's runtime while
+    // it becomes the owner.
     if (sessionSetup.nativeSetup === true
       && typeof sessionSetup.nativeAgentDir === "string" && sessionSetup.nativeAgentDir !== "") {
       const opened = dependencies.openHostState({ agentDir: sessionSetup.nativeAgentDir, hostId: randomUUID() });

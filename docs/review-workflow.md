@@ -168,10 +168,13 @@ passed. A fresh baseline cannot retroactively certify those earlier edits.
 
 ## Review evidence methods
 
-Snapshot evidence remains the default. The independent, default-Off
-`review.evidence.primaryToolOnly`, `worktreeToolOnly`, and `inplaceToolOnly` choices
-select retained observed-tool evidence for Primary / top-level, isolated worktree,
-and InPlace review respectively. They do not disable review, change operating mode,
+**Tools + workspace changes** remains the default for the independent **Primary /
+top-level**, **Isolated worktree**, and **InPlace** rows. Enter cycles to **Tools only**.
+The canonical `review.evidence.primaryToolOnly`, `worktreeToolOnly`, and `inplaceToolOnly`
+booleans remain `false` by default (`true` selects **Tools only**).
+“Workspace changes” means whole-workspace snapshot/diff review evidence. Both methods
+retain bounded tool calls/results, observed file content and per-file tool-observation
+diffs, task/assistant context, and reviewer read access. They do not disable review, change operating mode,
 select reviewers, or remove construction, checkpoint, and landing requirements.
 Tool-only omits only filesystem/Git review snapshotting, which can include outside-writer
 changes; bounded tool/path/content observations, targeted candidate capture, and reviewer
@@ -199,8 +202,9 @@ explicit, and a tool-only pass does not attest that unseen
 files, network/API effects, or concurrent writers were reviewed. InPlace review stays
 post-hoc: it cannot prevent or roll back writes or external effects.
 
-Applying Primary Off → On resets the current Primary evidence window with a prominent
-warning; the reset is not approval of earlier edits. On → Off retains accumulated
+Applying Primary **Tools + workspace changes → Tools only** resets the current Primary
+evidence window with a prominent warning; the reset is not approval of earlier edits.
+**Tools only → Tools + workspace changes** retains accumulated
 evidence and takes a new snapshot baseline, so it does not reconstruct earlier
 snapshot coverage. Unchanged settings, other-scope edits, navigation, and Cancel do
 not reset Primary evidence. Workers capture the applicable evidence and fallback policy
@@ -216,14 +220,14 @@ routes or reviewer selections.
 `review.evidence.snapshotFailureFallback` is an independent opt-in, default **Off**.
 Off leaves snapshot capture failure blocking. On allows an eligible
 **review-evidence-only** snapshot capture failure to use retained current tool evidence
-instead, with a durable, truthfully labelled tool-only basis. It is allowed even on
+instead, with a durable, truthfully labelled **Tools only (snapshot-failure fallback)** basis. It is allowed even on
 the **first Primary or InPlace review-baseline capture before work**: an absent initial
 snapshot is disclosed, not fabricated, and actual fallback records its tool-only basis
 durably. This is different from losing or corrupting a previously persisted basis.
 
 Every actual fallback emits a prominent warning identifying the originating context
 (Primary, isolated worktree, or InPlace) to the user and implementing model, and labels
-the reviewer input with the actual tool-only basis and failed snapshot coverage.
+the reviewer input with the actual **Tools only (snapshot-failure fallback)** basis and failed snapshot coverage.
 Evidence and user/model provenance stay truthful; a worker fallback is not presented
 as Primary activity. A settings description, log entry, or optional notice is not a
 substitute for this actual-use warning. Fallback neither approves the work nor creates
@@ -267,16 +271,17 @@ resources intended for this exercise. Do not copy credentials or production sess
 state into it. Execution/review steps require the selected harness to be available
 and authenticated; menu-only checks need no model call.
 
-1. Open **Reviewers → Evidence methods** and verify all four defaults are Off.
+1. Open **Reviewers → Evidence methods** and verify the three scope rows default to
+   **Tools + workspace changes**, with the separate **Snapshot-failure fallback** row **Off**.
    Stage a change, navigate Back/Escape, and verify it has not applied yet. Root
    Escape applies only for this session; reopen and Cancel a different draft to
    confirm the earlier session-only choices survive. Save or nested Ctrl+S persists
    them to the disposable config.
-2. Accumulate Primary evidence, then apply Primary Off → On and verify the actual
+2. Accumulate Primary evidence, then apply Primary **Tools + workspace changes → Tools only** and verify the actual
    reset warning. Reapply unchanged values, change only another scope, and cancel a
-   staged Primary change: none resets it. Apply On → Off and verify evidence remains
+   staged Primary change: none resets it. Apply **Tools only → Tools + workspace changes** and verify evidence remains
    with a new snapshot baseline rather than claimed retroactive coverage.
-3. With Primary tool-only On, have the agent make a small supported tool edit to
+3. With Primary **Tools only**, have the agent make a small supported tool edit to
    `SCRIPT`, while an independent generator outside the agent's observed tools adds
    to `REPORT`. Inspect the reviewer input for retained `SCRIPT` content/tool evidence
    and honest provenance. After a pass, let only the generator add more to `REPORT`:

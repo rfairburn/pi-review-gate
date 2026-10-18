@@ -248,18 +248,23 @@ checkpoint instead of attaching an incompatible conversation.
 
 Open `/review-settings` → **Reviewers** → **Evidence methods**. The four rows are:
 
-- **Primary / top-level tool-only**
-- **Isolated worktree tool-only**
-- **InPlace tool-only**
+- **Primary / top-level**
+- **Isolated worktree**
+- **InPlace**
 - **Snapshot-failure fallback**
 
-All default to **Off**. Each tool-only row selects evidence for that context, not the
-operating mode, whether review runs, or who reviews. The fallback row is a separate
-opt-in for qualifying review-evidence capture failures, not a fourth execution context.
+Each scope row defaults to **Tools + workspace changes**; Enter cycles between that
+and **Tools only**. “Workspace changes” means whole-workspace snapshot/diff **review
+evidence**. Both methods retain bounded tool calls/results, observed file content and
+per-file tool-observation diffs, task/assistant context, and reviewer read access.
+Mandatory construction, checkpoint, and landing verification is unchanged.
+These rows select evidence for that context, not the operating mode, whether review
+runs, or who reviews. **Snapshot-failure fallback** remains a separate **Off** / **On**
+opt-in (default **Off**) for qualifying review-evidence capture failures, not a fourth execution context.
 The stored fields are documented in
 [Configuration](configuration.md#review-evidence-methods).
 
-Enter stages a toggle. Back and nested Escape only navigate; they neither apply the
+Enter stages a choice. Back and nested Escape only navigate; they neither apply the
 policy nor reset evidence. Root Escape applies the final draft to the running session
 without writing the config. **Save changes** or Ctrl+S applies and persists it; Ctrl+S
 also works in this nested menu. Explicit root **Cancel** discards this visit's draft
@@ -271,11 +276,11 @@ many times a row was visited or toggled:
 
 | Effective Primary transition | Effect |
 | --- | --- |
-| Off → On | Clears accumulated Primary review evidence and starts a new tool-only evidence window. A prominent warning identifies the actual reset; earlier work is not certified by resetting. |
-| On → Off | Retains accumulated evidence and establishes a new snapshot baseline for subsequent capture, without inventing earlier snapshot coverage. |
+| Tools + workspace changes → Tools only | Clears accumulated Primary review evidence and starts a new Tools only evidence window. A prominent warning identifies the actual reset; earlier work is not certified by resetting. |
+| Tools only → Tools + workspace changes | Retains accumulated evidence and establishes a new snapshot baseline for subsequent capture, without inventing earlier snapshot coverage. |
 | Unchanged | No evidence reset. |
 
-Turning Primary on in the draft warns about the pending reset, but navigation or
+Selecting **Tools only** for Primary in the draft warns about the pending reset, but navigation or
 Cancel never performs it. Changing only worktree, InPlace, or fallback settings does
 not reset Primary evidence. A draft toggled back to its original value has no effective
 transition, so applying it does not reset evidence either.
@@ -291,7 +296,7 @@ is specific to evidence policy; it does not freeze all routing or reviewer setti
 Fallback Off leaves capture failure blocking. When On actually substitutes current
 retained tool evidence for an eligible failed snapshot, the user and implementing model
 receive a prominent warning on each actual fallback identifying the originating review
-context, and the reviewer receives the truthful tool-only basis. Fallback is not sticky:
+context, and the reviewer receives the truthful **Tools only (snapshot-failure fallback)** basis. Fallback is not sticky:
 snapshot-preferring policy retries capture on later cycles/continuations without
 inventing earlier coverage or discarding retained current-work tool evidence. The menu
 description or an optional notice alone is not that warning. Missing structured

@@ -298,7 +298,7 @@ test("lifecycle passes the captured worktree evidence policy to Primary review",
     };
     assert.equal(reviewOutput.evidenceMethod, "tool-only");
     assert.match(reviewOutput.evidenceCoverageNotice ?? "", /No structured tool observations/);
-    assert.ok(updates.some((update) => update.phase === "reviewing" && /Review evidence method: tool-only/.test(update.message)));
+    assert.ok(updates.some((update) => update.phase === "reviewing" && /Review evidence method: Tools only/.test(update.message)));
     await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
   } finally {
     await rm(root, { recursive: true, force: true });

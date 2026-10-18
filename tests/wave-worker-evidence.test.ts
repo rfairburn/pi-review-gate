@@ -161,7 +161,7 @@ for (const later of ["report", "same-path", "unknown-scope"] as const) {
         assert.match(input.prompt, /SCRIPT-1/); assert.match(input.md, /SCRIPT-1|SCRIPT-2/);
         assert.equal(input.evidence.candidates.some(c => c.path === "REPORT"), false);
         assert.doesNotMatch(input.patch, /INDEPENDENT-REPORT/);
-        assert.match(input.request, /tool-only/);
+        assert.match(input.request, /Tools only/);
       }
       assert.match(adapter.feedback[1]!, /NOT certification of an exact workspace snapshot/);
       assert.notEqual(result.acceptedCommitSha, result.reviewCycles.at(-1)!.candidateCommit, "REPORT confirmation changes landing identity without pretending that tree was reviewed");
@@ -262,9 +262,9 @@ for (const fallback of [false, true]) {
       } else {
         assert.equal(result.status, "accepted_with_warnings"); assert.equal(result.reviewCycles[0]!.reviewOutput.evidenceMethod, "tool-only-fallback");
         assert.equal(warnings.length, 1); assert.match(warnings[0]!, /^WARNING: Isolated worktree/);
-        assert.match(result.summary, /WARNING: Isolated worktree.*tool-only-fallback/);
-        const input = (await proof(f.root))[0]!; assert.match(input.prompt, /CURRENT-SCRIPT/); assert.match(input.md, /CURRENT-SCRIPT/); assert.match(input.request, /tool-only-fallback/);
-        assert.match(adapter.feedback[1]!, /tool-only-fallback/);
+        assert.match(result.summary, /WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/);
+        const input = (await proof(f.root))[0]!; assert.match(input.prompt, /CURRENT-SCRIPT/); assert.match(input.md, /CURRENT-SCRIPT/); assert.match(input.request, /Tools only \(snapshot-failure fallback\)/);
+        assert.match(adapter.feedback[1]!, /Tools only \(snapshot-failure fallback\)/);
         const durable = JSON.parse(await readFile(join(f.artifactDir, "result.json"), "utf8"));
         assert.equal(durable.evidenceMethod, "tool-only-fallback"); assert.match(durable.summary, /WARNING: Isolated worktree/);
       }
@@ -284,7 +284,7 @@ test(`snapshot-preferring worker ${restoreCapture ? "recovers snapshot" : "warns
     const result = await runWaveWorkerLifecycle({ ...f, sourceRoot: f.source, taskId: "observed", task: { ...task, reviewEvidencePolicy: { scope: "worktree", toolOnly: false, snapshotFailureFallback: true } }, config: config(f.root) });
     assert.equal(result.status, restoreCapture ? "accepted" : "accepted_with_warnings");
     assert.deepEqual(result.reviewCycles.map(c => c.reviewOutput.evidenceMethod), ["tool-only-fallback", restoreCapture ? "snapshot" : "tool-only-fallback"]);
-    assert.equal(result.summary.split("\n").filter(line => /^WARNING: Isolated worktree.*tool-only-fallback/.test(line)).length, restoreCapture ? 1 : 2);
+    assert.equal(result.summary.split("\n").filter(line => /^WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/.test(line)).length, restoreCapture ? 1 : 2);
     if (restoreCapture) assert.match((await proof(f.root))[1]!.patch, /CURRENT-2/);
   } finally { process.env.PATH = oldPath; mock.restoreAll(); await rm(f.root, { recursive: true, force: true }); }
 });
@@ -353,9 +353,9 @@ test(`actual fallback is always-on UI and final ${landing} model outcome in Quie
     }
     const final = controller.inspect(started.executionId, id).tasks[0]!;
     await controller.shutdown();
-    assert.equal(ui.filter(w => /^WARNING: Isolated worktree.*tool-only-fallback/.test(w)).length, 1);
-    assert.ok(model.some(message => typeof message.content === "string" && /WARNING: Isolated worktree.*tool-only-fallback/.test(message.content)), "actual completion sent to model carries fallback independent of optional notices");
-    assert.match(final.summary ?? "", /WARNING: Isolated worktree.*tool-only-fallback/);
+    assert.equal(ui.filter(w => /^WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/.test(w)).length, 1);
+    assert.ok(model.some(message => typeof message.content === "string" && /WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/.test(message.content)), "actual completion sent to model carries fallback independent of optional notices");
+    assert.match(final.summary ?? "", /WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/);
     if (landing === "conflicted") assert.match(await readFile(join(f.source, "SCRIPT"), "utf8"), /CONCURRENT-SOURCE/);
   } finally { await controller?.shutdown(); process.env.PATH = oldPath; mock.restoreAll(); await rm(f.root, { recursive: true, force: true }); }
 });
@@ -399,13 +399,13 @@ test("real continuation completion snapshot includes fallback in Quiet model del
     }
     await wait(() => model.some(message => typeof message.content === "string" && message.content.startsWith(`Task ${id} continuation landed.`)), "continuation completion delivery");
     const delivered = model.find(message => typeof message.content === "string" && message.content.startsWith(`Task ${id} continuation landed.`))!;
-    assert.match(delivered.content as string, /WARNING: Isolated worktree.*tool-only-fallback/);
-    assert.equal(ui.filter(message => /^WARNING: Isolated worktree.*tool-only-fallback/.test(message)).length, 1);
+    assert.match(delivered.content as string, /WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/);
+    assert.equal(ui.filter(message => /^WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/.test(message)).length, 1);
     setPiTuiHost({ wrapTextWithAnsi: (text: string) => text.split("\n") });
     const card = renderSubtaskEventCollapsed(delivered, {}, { bold: (text: string) => text, fg: (_color: string, text: string) => text }) as { render(width: number): string[] };
-    assert.match(card.render(1000).join("\n"), /WARNING: Isolated worktree.*tool-only-fallback/);
+    assert.match(card.render(1000).join("\n"), /WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/);
     assert.match(await readFile(join(f.source, "SCRIPT"), "utf8"), /CONTINUED-SCRIPT/);
-    assert.match(controller.inspect(started.executionId, id).tasks[0]!.summary ?? "", /WARNING: Isolated worktree.*tool-only-fallback/);
+    assert.match(controller.inspect(started.executionId, id).tasks[0]!.summary ?? "", /WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/);
     assert.match((await proof(f.root)).at(-1)!.prompt, /CONTINUED-SCRIPT/);
   } finally { await controller?.shutdown(); process.env.PATH = oldPath; mock.restoreAll(); await rm(f.root, { recursive: true, force: true }); }
 });
@@ -450,7 +450,7 @@ for (const negative of ["reviewer", "candidate", "normalized-candidate", "checkp
       assert.ok(thrown || result, "must produce a blocking outcome");
       assert.equal(result?.acceptedRef, undefined);
       assert.ok(thrown || ["review_error", "executor_error", "cancelled"].includes(result!.status), result?.status);
-      if (["reviewer", "candidate", "normalized-candidate"].includes(negative)) assert.match(result!.summary, /WARNING: Isolated worktree.*tool-only-fallback/);
+      if (["reviewer", "candidate", "normalized-candidate"].includes(negative)) assert.match(result!.summary, /WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/);
     } finally { process.env.PATH = oldPath; mock.restoreAll(); await rm(f.root, { recursive: true, force: true }); }
   });
 }

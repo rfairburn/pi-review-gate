@@ -1,6 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { redactSensitiveText } from "../../redaction";
+import { TOOLS_ONLY_LABEL } from "../../review-evidence";
 import { buildReviewReportFromOutputs } from "../../review-report";
 import { buildOperationDiagnostics, readOperationRecord, writeOperationRecord } from "../operation-record";
 import { computeInPlaceAttribution } from "./basis";
@@ -91,7 +92,7 @@ export async function settleInPlace(input: InPlaceLifecycleInput, result: InPlac
     const notes = result.toolObservabilityNotes ?? [];
     const snapshotLimits = ` Snapshot policy excludes ignored directories (including .git, node_modules, and dist) and may omit content for oversized or unreadable files; ${result.baseline.snapshot?.omissions.length ?? 0} omission(s) were recorded${result.baseline.snapshot?.omissionsTruncated ? " and the omission list was truncated" : ""}.`;
     const interval = result.baseline.mode === "tool" || result.baseline.toolOnlyHistory
-      ? "No subsequent-work snapshot delta was recorded. Earlier tool-only work is not certified as unchanged since launch."
+      ? `No subsequent-work snapshot delta was recorded. Earlier ${TOOLS_ONLY_LABEL} work is not certified as unchanged since launch.`
       : "No workspace paths changed within the recorded bounded snapshot since launch.";
     result.summary = `${interval} This does not establish that no external side effects occurred.${snapshotLimits}${notes.length > 0 ? ` Tool-event observability limits: ${notes.join("; ")}` : ""}${result.toolObservationsTruncated ? " The bounded tool-event evidence limit was reached; additional observations were omitted." : ""}`;
   }
@@ -120,7 +121,7 @@ export async function settleInPlace(input: InPlaceLifecycleInput, result: InPlac
   if (toolBasis) {
     // No whole-root capture, even during failure/cancellation settlement.
     result.changedSinceLaunch = [];
-    result.attributionError = "not captured under tool-only evidence; absence of observed paths is not proof of no effects";
+    result.attributionError = `not captured under ${TOOLS_ONLY_LABEL}; absence of observed paths is not proof of no effects`;
   } else if (!["reviewed", "unreviewed", "no_changes"].includes(result.status)) {
     try {
       // Pass 3 (finding 1): the turn may have been cancelled, and its abort

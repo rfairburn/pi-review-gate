@@ -9,8 +9,9 @@ continuation, and notifications remain owned by
 
 ## Evidence method and provenance
 
-Worker review evidence defaults to snapshots. Optional tool-only selection and
-snapshot-failure fallback are configured separately under
+Worker review evidence defaults to **Tools + workspace changes** (whole-workspace
+snapshot/diff review evidence). Optional **Tools only** and separate snapshot-failure
+fallback (default **Off**) are configured under
 [`review.evidence`](configuration.md#review-evidence-methods); the **Evidence methods**
 menu does not change the `SubtasksInspect` navigation API or turn worker claims into
 observations. Workers pin applicable evidence/fallback policy at firing/queue admission:
@@ -32,7 +33,7 @@ only filesystem/Git review snapshots subject to outside-writer contamination, ne
 bounded tool/path/content observations or read-only reviewer inspection.
 
 Every actual snapshot-failure fallback must disclose the originating context and retained
-tool-only basis to the reviewer, user, and implementing model, with a prominent warning
+**Tools only (snapshot-failure fallback)** basis to the reviewer, user, and implementing model, with a prominent warning
 rather than a fabricated snapshot or approval. Fallback is not sticky: snapshot-preferring
 captured policy retries capture on later cycles/continuations. Later success cannot
 fabricate earlier coverage or discard retained current-work tool evidence. A first InPlace

@@ -3,6 +3,7 @@ import test from "node:test";
 import { effectiveReviewEvidenceSettings, normalizeConfig } from "../src/config";
 import { rewriteTaskPaths, type WaveWorkerTask } from "../src/execution/wave-worker";
 import { newTask } from "../src/execution/task-state";
+import { evidenceMethodLabel, evidenceMethodNotice, TOOL_ONLY_HISTORY_NOTICE } from "../src/review-evidence";
 import {
   captureWorkerReviewEvidencePolicy,
   normalizeWorkerReviewEvidencePolicy,
@@ -13,6 +14,24 @@ const legacyTask: WaveWorkerTask = {
   instructions: "edit files",
   acceptanceCriteria: ["tests pass"],
 };
+
+test("human evidence method names are distinct from unchanged machine IDs and preserve coverage warnings", () => {
+  assert.equal(evidenceMethodLabel(false), "Tools + workspace changes");
+  assert.equal(evidenceMethodLabel(true), "Tools only");
+  assert.equal(evidenceMethodNotice("snapshot"), "Review evidence method: Tools + workspace changes.");
+  for (const method of ["tool-only", "tool-only-fallback"] as const) {
+    const notice = evidenceMethodNotice(method);
+    assert.ok(notice.startsWith(`WARNING: Review evidence method: Tools only${method === "tool-only-fallback" ? " (snapshot-failure fallback)" : ""}.`));
+    assert.match(notice, /missing observations are not proof of no effects/);
+    assert.match(notice, /NOT certification of an exact workspace snapshot/);
+    assert.match(notice, /Unobserved external edits are outside this review/);
+    assert.equal(notice.includes("CURRENT tool evidence was preserved, not reset"), method === "tool-only-fallback");
+    assert.doesNotMatch(notice, /tool-only|Review evidence method: (On|Off|snapshot)/);
+  }
+  assert.match(TOOL_ONLY_HISTORY_NOTICE, /Earlier work used Tools only: no pre-work snapshot covers that interval/);
+  assert.match(TOOL_ONLY_HISTORY_NOTICE, /Tools \+ workspace changes snapshot baseline covers subsequent work only/);
+  assert.match(TOOL_ONLY_HISTORY_NOTICE, /earlier actions and claims are not exact-snapshot certification/);
+});
 
 test("worker evidence policy uses canonical settings and remains scoped to its task kind", () => {
   const defaults = effectiveReviewEvidenceSettings(normalizeConfig({}));

@@ -13,14 +13,20 @@ export interface ReviewEvidencePolicy {
   scope: "primary" | "worktree" | "inplace";
 }
 export type ReviewEvidenceMethod = "snapshot" | "tool-only" | "tool-only-fallback";
-export const TOOL_ONLY_HISTORY_NOTICE = "Earlier work has tool-only evidence: no pre-work snapshot covers that interval. A new snapshot baseline covers subsequent work only; earlier actions and claims are not exact-snapshot certification.";
+export const TOOLS_ONLY_LABEL = "Tools only";
+export const WORKSPACE_CHANGES_LABEL = "Tools + workspace changes";
+/** Human method names only; configuration booleans and machine method IDs stay canonical. */
+export function evidenceMethodLabel(toolOnly: boolean): string {
+  return toolOnly ? TOOLS_ONLY_LABEL : WORKSPACE_CHANGES_LABEL;
+}
+export const TOOL_ONLY_HISTORY_NOTICE = `Earlier work used ${TOOLS_ONLY_LABEL}: no pre-work snapshot covers that interval. A new ${WORKSPACE_CHANGES_LABEL} snapshot baseline covers subsequent work only; earlier actions and claims are not exact-snapshot certification.`;
 export function primaryEvidencePolicy(config: ReviewGateConfig): ReviewEvidencePolicy {
   const settings = effectiveReviewEvidenceSettings(config);
   return { toolOnly: settings.primaryToolOnly, snapshotFailureFallback: settings.snapshotFailureFallback, scope: "primary" };
 }
 export function evidenceMethodNotice(method: ReviewEvidenceMethod): string {
-  return method === "snapshot" ? "Review evidence method: snapshot."
-    : `WARNING: Review evidence method: ${method}. ${method === "tool-only-fallback" ? "Automatic snapshot capture failed; CURRENT tool evidence was preserved, not reset. " : ""}Available observed tool evidence and supplied claims/context are assessed with their disclosed limits; missing observations are not proof of no effects. This is NOT certification of an exact workspace snapshot. Unobserved external edits are outside this review.`;
+  return method === "snapshot" ? `Review evidence method: ${WORKSPACE_CHANGES_LABEL}.`
+    : `WARNING: Review evidence method: ${TOOLS_ONLY_LABEL}${method === "tool-only-fallback" ? " (snapshot-failure fallback)" : ""}. ${method === "tool-only-fallback" ? "Automatic snapshot capture failed; CURRENT tool evidence was preserved, not reset. " : ""}Available observed tool evidence and supplied claims/context are assessed with their disclosed limits; missing observations are not proof of no effects. This is NOT certification of an exact workspace snapshot. Unobserved external edits are outside this review.`;
 }
 
 /** Raised only by acquisition stages, never baseline verification/comparison/cleanup. */

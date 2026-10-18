@@ -1,4 +1,5 @@
 import { buildEvidenceBundle, type EvidenceState } from "../../evidence";
+import { TOOLS_ONLY_LABEL, WORKSPACE_CHANGES_LABEL } from "../../review-evidence";
 import type { WaveWorkerTask } from "../wave-worker";
 import type { InPlaceAttribution } from "./basis";
 
@@ -36,7 +37,7 @@ export function buildInPlaceReviewRequest(task: WaveWorkerTask, attribution: InP
   const baselineSummary = baseline.mode === "tool"
     ? "No pre-work workspace snapshot exists. This task has a durable tool-evidence basis, not an empty workspace snapshot."
     : baseline.toolOnlyHistory
-      ? "Snapshot baseline recovered after earlier tool-only work; it covers subsequent work only, not the full launch interval."
+      ? `${WORKSPACE_CHANGES_LABEL} snapshot baseline recovered after earlier ${TOOLS_ONLY_LABEL} work; it covers subsequent work only, not the full launch interval.`
       : baseline.mode === "git"
     ? `Git: the workspace was inside a repository at HEAD ${baseline.gitHead ?? "(unborn HEAD)"} when the task launched.`
     : "The workspace was not inside a Git repository when the task launched; content snapshots are the only attribution basis.";
@@ -54,7 +55,7 @@ export function buildInPlaceReviewRequest(task: WaveWorkerTask, attribution: InP
     `The worker ran and wrote directly in the launch-selected workspace ${baseline.workspaceRoot}. No candidate commit, wave capture, or landing exists for this task, and review is not a gate over those writes: they already happened where performed.`,
     baselineSummary,
     ...(toolOnly
-      ? ["Workspace delta not captured under the selected tool-only method; an empty observed set is NOT proof of no changes or no effects."]
+      ? [`Workspace delta not captured under the selected ${TOOLS_ONLY_LABEL} method; an empty observed set is NOT proof of no changes or no effects.`]
       : [`Recorded workspace delta ${baseline.mode !== "tool" && baseline.toolOnlyHistory ? "since recovery baseline (subsequent work only)" : "since launch"} (${changedEntries.length} path(s) changed):`, ...(changedEntries.length === 0 ? ["- (none)"] : clipped.lines)]),
     ...(attribution.evidenceCoverageNotice ? [attribution.evidenceCoverageNotice] : []),
     ...(attribution.baseline.snapshot?.omissionsTruncated

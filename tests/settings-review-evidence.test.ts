@@ -24,7 +24,14 @@ const OFF: EffectiveReviewEvidenceSettings = {
   snapshotFailureFallback: false,
 };
 const FIELDS = Object.keys(OFF) as Array<keyof EffectiveReviewEvidenceSettings>;
-const LABELS = ["Primary / top-level tool-only", "Isolated worktree tool-only", "InPlace tool-only", "Snapshot-failure fallback"];
+const LABELS = ["Primary / top-level", "Isolated worktree", "InPlace", "Snapshot-failure fallback"];
+function assertEvidenceOptions(options: string[], evidence: EffectiveReviewEvidenceSettings): void {
+  FIELDS.forEach((field, index) => {
+    const value = field === "snapshotFailureFallback" ? evidence[field] ? "On" : "Off"
+      : evidence[field] ? "Tools only" : "Tools + workspace changes";
+    assert.equal(options[index]!.replace(/\s{2,}/g, " "), `${LABELS[index]} ${value}`);
+  });
+}
 const pick = (prefix: string) => (_title: string, options: string[]) => {
   const option = options.find((item) => item.startsWith(prefix));
   assert.ok(option, `Missing ${prefix}: ${options.join(" | ")}`);
@@ -91,7 +98,7 @@ async function fixture(body: Record<string, unknown> = {}) {
 const enterEvidence: Step[] = [pick("Reviewers"), pick("Evidence methods")];
 const backToRoot: Step[] = [escape, escape];
 
-test("review evidence is optional, defaults Off, and does not change effectiveReviewSettings", () => {
+test("review evidence config is optional, defaults false, and does not change effectiveReviewSettings", () => {
   const config = normalizeConfig({});
   const review = effectiveReviewSettings(config);
   assert.equal(config.review, undefined);
@@ -161,10 +168,16 @@ test("all independent scope/fallback combinations persist through the real stage
     const h = await fixture();
     try {
       const selected = FIELDS.filter((_field, index) => mask & (1 << index));
+      const draft = { ...OFF };
       await h.run([
         ...enterEvidence,
-        ...selected.map((field) => pick(LABELS[FIELDS.indexOf(field)]!)),
-        ...backToRoot, pick("Save changes"),
+        ...selected.map((field): Step => (title, options) => {
+          assertEvidenceOptions(options, draft);
+          draft[field] = true;
+          return pick(LABELS[FIELDS.indexOf(field)]!)(title, options);
+        }),
+        (_title, options) => { assertEvidenceOptions(options, draft); return undefined; },
+        escape, pick("Save changes"),
       ]);
       const expected = Object.fromEntries(FIELDS.map((field, index) => [field, Boolean(mask & (1 << index))]));
       assert.deepEqual(effectiveReviewEvidenceSettings(h.config), expected);
@@ -190,7 +203,13 @@ test("root Escape applies once; explicit Cancel preserves prior session-only cho
     assert.deepEqual(effectiveReviewEvidenceSettings(h.config), sessionOnly);
     assert.equal(await readFile(h.configPath, "utf8"), h.original);
     assert.deepEqual(h.applied, [sessionOnly]);
-    assert.ok(h.notices.some((notice) => notice.kind === "warning" && /Applying.*Off → On.*clears/.test(notice.message)));
+    assert.ok(h.notices.some((notice) => notice.kind === "warning"
+      && notice.message.includes("Applying Primary / top-level Tools + workspace changes → Tools only clears")
+      && notice.message.includes("Tools only → Tools + workspace changes retains evidence and establishes a new snapshot baseline")
+      && notice.message.includes("Cancel discards it")));
+    assert.ok(h.notices.some(({ message }) => message.includes("whole-workspace snapshot/diff review evidence")
+      && message.includes("Both retain bounded tool calls/results, observed file content and per-file tool-observation diffs, task/assistant context, and reviewer read access")
+      && message.includes("Mandatory construction, checkpoint, and landing verification is unchanged")));
 
     await h.run([...enterEvidence, pick(LABELS[0]!), pick(LABELS[1]!), pick(LABELS[3]!), ...backToRoot, pick("Cancel")]);
     assert.deepEqual(effectiveReviewEvidenceSettings(h.config), sessionOnly);
@@ -200,9 +219,7 @@ test("root Escape applies once; explicit Cancel preserves prior session-only cho
     // Reopening displays the session-only state; navigation/Cancel does not apply.
     await h.run([...enterEvidence, (title, options) => {
       assert.equal(title, "Review evidence methods");
-      assert.match(options[0]!, /On$/);
-      assert.match(options[1]!, /Off$/);
-      assert.match(options[2]!, /On$/);
+      assertEvidenceOptions(options, sessionOnly);
       return undefined;
     }, escape, pick("Cancel")]);
     assert.deepEqual(h.applied, [sessionOnly]);
@@ -228,7 +245,7 @@ test("Cancel from a fresh transaction leaves live config and file byte-identical
   } finally { await h.cleanup(); }
 });
 
-test("Primary On to Off applies independently without changing other evidence scopes", async () => {
+test("Primary Tools only to Tools + workspace changes applies independently without changing other evidence scopes", async () => {
   const h = await fixture({ review: { evidence: { primaryToolOnly: true, worktreeToolOnly: true, inplaceToolOnly: true, snapshotFailureFallback: true } } });
   try {
     await h.run([...enterEvidence, pick(LABELS[0]!), ...backToRoot, escape]);
@@ -245,8 +262,8 @@ test("Ctrl+S inside evidence selector unwinds and persists the same draft via th
     const harness = await h.tui([
       [...down(6), KEY_ENTER], // root Reviewers
       [...down(5), KEY_ENTER], // Review → Evidence methods
-      [KEY_ENTER], // Primary Off → On
-      [...down(1), KEY_ENTER], // worktree Off → On; retained Primary row
+      [KEY_ENTER], // Primary Tools + workspace changes → Tools only
+      [...down(1), KEY_ENTER], // worktree Tools + workspace changes → Tools only; retained Primary row
       [...down(2), KEY_ENTER], // fallback Off → On; retained worktree row
       ["\x13"], // save from nested evidence selector, not root Escape
     ]);

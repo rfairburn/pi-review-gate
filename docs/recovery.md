@@ -131,8 +131,8 @@ and fallback policy at firing/queue admission: each Start/Add task independently
 tasks at actual firing, not schedule creation. Live changes do not switch already queued
 or running tasks through corrections, retries, or continuations; later Add tasks capture
 the then-current live choice. This does not freeze all routes or reviewer selections.
-For Primary, applying Off → On deliberately resets the current evidence with a
-prominent warning; On → Off
+For Primary, applying **Tools + workspace changes → Tools only** deliberately resets
+the current evidence with a prominent warning; **Tools only → Tools + workspace changes**
 keeps evidence and establishes a new snapshot baseline, not retroactive coverage.
 This is distinct from reviewer-selection reconciliation above. See
 [Settings](settings.md#evidence-methods) for apply/save/cancel behavior.

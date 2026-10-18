@@ -62,7 +62,7 @@ import {
   type EvidenceState,
 } from "../evidence";
 import type { ReviewWindow, ReviewBaseline } from "../state";
-import { ReviewEvidenceCaptureFailure, evidenceMethodNotice } from "../review-evidence";
+import { ReviewEvidenceCaptureFailure, evidenceMethodNotice, TOOLS_ONLY_LABEL, WORKSPACE_CHANGES_LABEL } from "../review-evidence";
 import {
   createState,
   setReviewWindowBaseline,
@@ -355,7 +355,7 @@ function buildReviewRequest(task: WaveWorkerTask, toolOnly: boolean): string {
     "Durability invariant: a task without a verified candidate cannot be reviewed or landed; this is separate from the review evidence method.",
     toolOnly
       ? "Assess the retained observed-tool content/results and supplied claims/context, plus read-only worktree inspection as needed, for concrete merge/readiness defects. No exact candidate patch is supplied under this evidence method. In particular inspect evidence of:"
-      : "When the disclosed method is snapshot, read-only inspect the supplied exact candidate patch plus available worktree evidence. If acquisition instead selects tool-only-fallback, assess retained tool observations and claims/context, not an unavailable exact patch. Look for concrete merge/readiness defects, including:",
+      : `When the disclosed method is ${WORKSPACE_CHANGES_LABEL}, read-only inspect the supplied exact candidate patch plus available worktree evidence. If acquisition instead selects ${TOOLS_ONLY_LABEL} (snapshot-failure fallback), assess retained tool observations and claims/context, not an unavailable exact patch. Look for concrete merge/readiness defects, including:`,
     "- Unwanted task-generated files inside the candidate (build output, logs, scratch or diagnostic files, session/auth fixtures, editor droppings).",
     "- Gitlinks (submodule entries), which the landing process does not support.",
     "- Secrets, credentials, or unrelated files introduced by the task.",
@@ -364,7 +364,7 @@ function buildReviewRequest(task: WaveWorkerTask, toolOnly: boolean): string {
     "Do not reject the candidate for a harmless temp-like name that is part of the requested deliverable, for pre-existing untracked files outside the candidate, or for the absence of a full test-suite run alone.",
     toolOnly
       ? "The candidate commit is verified for durability/landing identity only. This assessment is NOT exact-snapshot certification of that candidate or any later candidate; missing observations are not proof of no effects."
-      : "The candidate commit is verified independently for durability/landing. When the selected method is snapshot, assess its exact patch. If the method disclosure says tool-only-fallback, assess retained observations/claims instead: no exact-snapshot certification is possible under fallback.",
+      : `The candidate commit is verified independently for durability/landing. When the selected method is ${WORKSPACE_CHANGES_LABEL}, assess its exact patch. If the method disclosure says ${TOOLS_ONLY_LABEL} (snapshot-failure fallback), assess retained observations/claims instead: no exact-snapshot certification is possible under fallback.`,
   );
   return lines.join("\n");
 }

@@ -330,7 +330,8 @@ allowlist remains authoritative.
 
 ## Review evidence is not a durability bypass
 
-All `review.evidence` controls default Off. Selecting tool-only evidence for Primary,
+The three scope rows default to **Tools + workspace changes** (`review.evidence`
+tool-only booleans remain `false`). Selecting **Tools only** for Primary,
 isolated worktree, or InPlace review changes the evidence basis only, not operating
 mode, tool authority, reviewer selection, automatic-review enablement, or acceptance
 rules. Tool-only omits only filesystem/Git review snapshots subject to outside-writer
@@ -344,7 +345,8 @@ An eligible fallback uses retained current tool evidence with a durable, truthfu
 basis. This includes an enabled fallback on the first Primary or InPlace review-baseline
 capture before work; it does not permit replacing missing/corrupt persisted evidence.
 Every actual fallback requires a prominent origin-correct warning to the user and
-implementing model and a truthful tool-only label for the reviewer, not just a settings description,
+implementing model and a truthful **Tools only (snapshot-failure fallback)** label for
+the reviewer, not just a settings description,
 log entry, or optional notice. It never claims approval or full snapshot coverage.
 Fallback is not sticky: snapshot-preferring configured/captured policy retries capture
 on later cycles/continuations. Later success cannot invent earlier coverage or discard

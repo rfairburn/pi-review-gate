@@ -11,6 +11,7 @@ import {
   type ActiveReviewerSelection,
   type ExternalAgentConfig,
 } from "../config";
+import { evidenceMethodLabel, TOOLS_ONLY_LABEL, WORKSPACE_CHANGES_LABEL } from "../review-evidence";
 import type { ScopedModelChoice } from "./models";
 import { alignedSettingsRows, notify, type UiContext } from "./ui";
 import { effectiveThinkingLevel, selectThinkingLevel, thinkingLevelLabel } from "./thinking";
@@ -125,17 +126,19 @@ async function selectReviewEvidence(
 ): Promise<EffectiveReviewEvidenceSettings> {
   const evidence = { ...initial };
   await notify(ui,
-    "Evidence methods only — these controls do not disable review, change operating mode, or select reviewers. Each scope is independent: Off uses snapshot evidence; On uses observed-tool evidence. Snapshot-failure fallback is an independent opt-in to tool evidence when snapshot capture fails; Off keeps failure fail-closed. Navigation only stages choices; root Escape applies for the session, Save/Ctrl+S persists, and Cancel discards.",
+    `Evidence methods only — these controls do not disable review, change operating mode, or select reviewers. Each scope is independent. ${WORKSPACE_CHANGES_LABEL} adds whole-workspace snapshot/diff review evidence; ${TOOLS_ONLY_LABEL} omits that whole-workspace evidence. Both retain bounded tool calls/results, observed file content and per-file tool-observation diffs, task/assistant context, and reviewer read access. Mandatory construction, checkpoint, and landing verification is unchanged. Enter cycles the method. Snapshot-failure fallback is a separate opt-in to ${TOOLS_ONLY_LABEL} when snapshot capture fails; Off keeps failure fail-closed. Navigation only stages choices; root Escape applies for the session, Save/Ctrl+S persists, and Cancel discards.`,
     "info");
   let lastKey: string | undefined;
   while (true) {
     const fields = [
-      ["primaryToolOnly", "Primary / top-level tool-only"],
-      ["worktreeToolOnly", "Isolated worktree tool-only"],
-      ["inplaceToolOnly", "InPlace tool-only"],
+      ["primaryToolOnly", "Primary / top-level"],
+      ["worktreeToolOnly", "Isolated worktree"],
+      ["inplaceToolOnly", "InPlace"],
       ["snapshotFailureFallback", "Snapshot-failure fallback"],
     ] as const;
-    const labels = alignedSettingsRows(fields.map(([field, label]) => [label, evidence[field] ? "On" : "Off"] as const));
+    const labels = alignedSettingsRows(fields.map(([field, label]) => [label,
+      field === "snapshotFailureFallback" ? evidence[field] ? "On" : "Off" : evidenceMethodLabel(evidence[field]),
+    ] as const));
     const choice = await retainedSelect(ui, {
       title: "Review evidence methods",
       rows: [...fields.map(([key], index) => ({ key, label: labels[index]! })), { key: "back", label: "Back" }],
@@ -148,7 +151,7 @@ async function selectReviewEvidence(
     evidence[field] = !evidence[field];
     if (field === "primaryToolOnly" && evidence.primaryToolOnly) {
       await notify(ui,
-        "WARNING: Applying Primary / top-level tool-only Off → On clears accumulated primary review evidence and starts a new evidence window. This is staged only until root Escape or Save/Ctrl+S; Cancel discards it. On → Off retains evidence and establishes a new snapshot baseline.",
+        `WARNING: Applying Primary / top-level ${WORKSPACE_CHANGES_LABEL} → ${TOOLS_ONLY_LABEL} clears accumulated primary review evidence and starts a new evidence window. This is staged only until root Escape or Save/Ctrl+S; Cancel discards it. ${TOOLS_ONLY_LABEL} → ${WORKSPACE_CHANGES_LABEL} retains evidence and establishes a new snapshot baseline.`,
         "warning");
     }
   }

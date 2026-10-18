@@ -38,7 +38,7 @@ const KEY_CTRL_S = "\x13";
 const KEY_CTRL_C = "\x03";
 const PTY_OVERALL_TIMEOUT_MS = 8 * 60_000;
 const PTY_OUTPUT_LIMIT = 8 * 1024 * 1024;
-const LIVE_WARNING = "WARNING: Applying Primary / top-level tool-only Off → On clears accumulated primary review evidence";
+const LIVE_WARNING = "WARNING: Applying Primary / top-level Tools + workspace changes → Tools only";
 
 interface PtyExit {
   exitCode: number;
@@ -75,9 +75,9 @@ interface EvidenceValues {
 }
 
 const EVIDENCE_ROWS: ReadonlyArray<[keyof EvidenceValues, string]> = [
-  ["primaryToolOnly", "Primary / top-level tool-only"],
-  ["worktreeToolOnly", "Isolated worktree tool-only"],
-  ["inplaceToolOnly", "InPlace tool-only"],
+  ["primaryToolOnly", "Primary / top-level"],
+  ["worktreeToolOnly", "Isolated worktree"],
+  ["inplaceToolOnly", "InPlace"],
   ["snapshotFailureFallback", "Snapshot-failure fallback"],
 ];
 
@@ -306,12 +306,15 @@ class LivePiPty {
 function assertEvidenceRows(frame: string, actual: EvidenceValues, context: string): void {
   assert.ok(frame.includes("Review evidence methods"), `${context}: real evidence submenu heading missing`);
   for (const [field, label] of EVIDENCE_ROWS) {
-    const state = actual[field] ? "On" : "Off";
+    const state = field === "snapshotFailureFallback" ? actual[field] ? "On" : "Off"
+      : actual[field] ? "Tools only" : "Tools + workspace changes";
     const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedState = state.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const position = frame.lastIndexOf(label);
     assert.notEqual(position, -1, `${context}: visible ${label} row missing`);
-    const rowWindow = frame.slice(position, position + label.length + 24);
-    assert.match(rowWindow, new RegExp(`^${escapedLabel}\\s{1,14}${state}(?:\\b|\\s|$)`),
+    const gap = Math.max(...EVIDENCE_ROWS.map(([, rowLabel]) => rowLabel.length)) - label.length + 2;
+    const rowWindow = frame.slice(position, position + label.length + gap + state.length + 1);
+    assert.match(rowWindow, new RegExp(`^${escapedLabel}\\s{${gap}}${escapedState}(?:\\b|\\s|$)`),
       `${context}: the visible ${label} row must show ${state}`);
   }
 }
@@ -529,23 +532,23 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
   assert.equal(session.claimOwnedProcessGroup(), true, "node-pty must provide a dedicated, positively owned POSIX process group");
   await session.waitForText("operating mode:", 30_000);
 
-  // Initial config omits review.evidence (default Off). The host-rendered
-  // production selector, not a fake menu API, must show every independent Off.
+  // Initial config omits review.evidence. The real selector must show each
+  // scope's default Tools + workspace changes and the separate fallback Off.
   let evidenceFrame = await openEvidenceMenu(session);
   assertEvidenceRows(evidenceFrame, OFF, "fresh config defaults");
   assert.equal(await readDiskEvidence(configPath), undefined, "opening the real menu must not materialize defaults on disk");
 
   // A non-Primary scope is staged and applied alone. Its real screen and its
   // disk state establish independent flags and a no-Primary-reset path.
-  await selectVisibleRow(session, "InPlace tool-only");
-  let frame = await session.sendAndWait(KEY_ENTER, "InPlace tool-only");
-  assert.match(frame, /InPlace tool-only\s+On/, "the actual host screen must show the staged InPlace choice");
-  assert.doesNotMatch(frame, /WARNING: Applying Primary \/ top-level tool-only Off → On/,
+  await selectVisibleRow(session, "InPlace");
+  let frame = await session.sendAndWait(KEY_ENTER, "InPlace");
+  assert.match(frame, /InPlace\s+Tools only/, "the actual host screen must show the staged InPlace choice");
+  assert.ok(!frame.includes(LIVE_WARNING),
     "changing only InPlace must not display the Primary-reset warning");
   await backToRoot(session);
   assert.equal(await readFile(configPath, "utf8"), initialBytes, "nested Back/Escape must not apply or persist the staged InPlace change");
   frame = await applySessionOnly(session);
-  assert.doesNotMatch(frame, /WARNING: Applying Primary \/ top-level tool-only Off → On/,
+  assert.ok(!frame.includes(LIVE_WARNING),
     "applying only another scope must not display the Primary-reset warning");
   assert.equal(await readFile(configPath, "utf8"), initialBytes, "root Escape must keep the non-Primary change off disk");
 
@@ -555,19 +558,22 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
   assertEvidenceRows(evidenceFrame, { ...OFF, inplaceToolOnly: true }, "reopened after session-only apply");
   await backToRoot(session);
   frame = await applySessionOnly(session);
-  assert.doesNotMatch(frame, /WARNING: Applying Primary \/ top-level tool-only Off → On/,
+  assert.ok(!frame.includes(LIVE_WARNING),
     "an unchanged Primary value must not emit a reset warning");
   assert.equal(await readFile(configPath, "utf8"), initialBytes, "unchanged root Escape must not persist anything");
 
-  // A real Primary Off → On toggle must display the production prominent
+  // A real Primary Tools + workspace changes → Tools only cycle must display the production prominent
   // warning. Root Escape applies it to this session only, not the config file.
   // No evidence has accumulated in this no-model smoke, so the underlying
   // evidence-window reset effect itself is intentionally not claimed here.
   evidenceFrame = await openEvidenceMenu(session);
   assertEvidenceRows(evidenceFrame, { ...OFF, inplaceToolOnly: true }, "before Primary transition");
-  await selectVisibleRow(session, "Primary / top-level tool-only", 24, evidenceFrame);
+  await selectVisibleRow(session, "Primary / top-level", 24, evidenceFrame);
   frame = await session.sendAndWait(KEY_ENTER, LIVE_WARNING, 10_000);
-  assert.ok(frame.includes("Cancel discards it"), "the observed warning must disclose that the reset remains staged until apply");
+  const warningText = frame.replace(/\s+/g, " "); // native notification text may wrap at the real terminal width
+  assert.ok(warningText.includes(`${LIVE_WARNING} clears accumulated primary review evidence`), "the visible warning must name the methods and pending reset");
+  assert.ok(warningText.includes("Tools only → Tools + workspace changes retains evidence"), "the visible warning must name the inverse method and retention");
+  assert.ok(warningText.includes("Cancel discards it"), "the observed warning must disclose that the reset remains staged until apply");
   await backToRoot(session);
   assert.equal(await readFile(configPath, "utf8"), initialBytes, "nested navigation must not apply or persist the warned Primary draft");
   await applySessionOnly(session);
@@ -579,17 +585,17 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
   const sessionOnly = { ...OFF, primaryToolOnly: true, inplaceToolOnly: true };
   assertEvidenceRows(evidenceFrame, sessionOnly, "reopened Primary session-only state");
 
-  // Stage a Primary On → Off change plus independent Worktree/Fallback edits,
+  // Stage a Primary Tools only → Tools + workspace changes change plus Worktree/Fallback edits,
   // then Cancel. Pi keeps the earlier ui.notify warning in its visible
   // transcript and redraws it with subsequent rows, so after this point a
   // fresh-frame absence check cannot distinguish an old warning from a new
   // one. The staged row and post-Cancel live state remain directly observable.
-  await selectVisibleRow(session, "Primary / top-level tool-only", 24, evidenceFrame);
-  frame = await session.sendAndWait(KEY_ENTER, "Primary / top-level tool-only");
-  assert.match(frame, /Primary \/ top-level tool-only\s+Off/, "the staged Primary cancellation draft must visibly be Off");
-  await selectVisibleRow(session, "Isolated worktree tool-only");
-  frame = await session.sendAndWait(KEY_ENTER, "Isolated worktree tool-only");
-  assert.match(frame, /Isolated worktree tool-only\s+On/, "the Cancel draft must visibly include an independent Worktree edit");
+  await selectVisibleRow(session, "Primary / top-level", 24, evidenceFrame);
+  frame = await session.sendAndWait(KEY_ENTER, "Primary / top-level");
+  assert.match(frame, /Primary \/ top-level\s+Tools \+ workspace changes/, "the staged Primary cancellation draft must visibly use Tools + workspace changes");
+  await selectVisibleRow(session, "Isolated worktree");
+  frame = await session.sendAndWait(KEY_ENTER, "Isolated worktree");
+  assert.match(frame, /Isolated worktree\s+Tools only/, "the Cancel draft must visibly include an independent Worktree edit");
   await selectVisibleRow(session, "Snapshot-failure fallback");
   frame = await session.sendAndWait(KEY_ENTER, "Snapshot-failure fallback");
   assert.match(frame, /Snapshot-failure fallback\s+On/, "the Cancel draft must visibly include an independent fallback edit");
@@ -619,9 +625,9 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
   // edit and the full independent flag set from inside Evidence methods.
   evidenceFrame = await openEvidenceMenu(session);
   assertEvidenceRows(evidenceFrame, afterExplicitSave, "reopened after explicit Save");
-  await selectVisibleRow(session, "Isolated worktree tool-only");
-  frame = await session.sendAndWait(KEY_ENTER, "Isolated worktree tool-only");
-  assert.match(frame, /Isolated worktree tool-only\s+On/, "the nested Ctrl+S draft must visibly enable Worktree");
+  await selectVisibleRow(session, "Isolated worktree");
+  frame = await session.sendAndWait(KEY_ENTER, "Isolated worktree");
+  assert.match(frame, /Isolated worktree\s+Tools only/, "the nested Ctrl+S draft must visibly select Tools only for Worktree");
   await session.sendAndWait(KEY_CTRL_S, "Review settings saved.");
   const allOn: EvidenceValues = {
     primaryToolOnly: true,

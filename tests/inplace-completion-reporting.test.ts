@@ -154,6 +154,13 @@ test("recorded snapshot omissions and omission-list truncation stay short actual
   }));
   assert.deepEqual(inPlaceLimitLines({ baseline }), ["Snapshot omissions recorded: 3 (omission list truncated)"]);
   assert.deepEqual(inPlaceLimitLines({}), []);
+  assert.deepEqual(inPlaceLimitLines({ evidenceMethod: "snapshot" }), []);
+  assert.deepEqual(inPlaceLimitLines({ evidenceMethod: "tool-only" }), [
+    "InPlace review evidence: Tools only; no exact workspace snapshot certification.",
+  ]);
+  assert.deepEqual(inPlaceLimitLines({ evidenceMethod: "tool-only-fallback" }), [
+    "InPlace review evidence: Tools only (snapshot-failure fallback); no exact workspace snapshot certification.",
+  ]);
 });
 
 test("stopped-task error retains both the lifecycle failure reason and the undelivered-steering count", () => {

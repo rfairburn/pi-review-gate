@@ -280,7 +280,7 @@ test("production tool-only retains concrete SCRIPT before/after; post-pass exter
   } finally { await f.dispose(); }
 });
 
-test("real settings apply resets/warns only Primary Off->On; disable retains evidence and establishes new snapshot baseline", async () => {
+test("real settings apply warns Tools + workspace changes → Tools only reset; inverse retains evidence and establishes baseline", async () => {
   const f = await fixture({}, false);
   try {
     await f.start();
@@ -303,6 +303,9 @@ test("real settings apply resets/warns only Primary Off->On; disable retains evi
     assert.equal(reset.baseline?.kind, "tool");
     assert.equal(reset.evidence.events.length, 0);
     assert.equal(f.warnings.length, 1);
+    assert.match(f.warnings[0]!, /Primary evidence method changed: Tools \+ workspace changes → Tools only\./);
+    assert.match(f.warnings[0]!, /outstanding reviewer findings, correction requirements and pending deliveries remain in force/);
+    assert.doesNotMatch(f.warnings[0]!, /Off|On|enabled|disabled/);
     assert.match(f.warnings[0]!, /CURRENT.*RESET/);
     assert.match(f.rt.notices.join("\n"), /CURRENT.*RESET/);
     await f.settings(["Save changes"]);
@@ -317,6 +320,10 @@ test("real settings apply resets/warns only Primary Off->On; disable retains evi
     const disabled = (await f.restored())!.state.reviewWindow!;
     assert.equal(disabled.baseline?.kind, "checkpoint");
     assert.equal(disabled.evidence.events.length, retainedCount);
+    assert.match(f.warnings.at(-1)!, /Primary evidence method changed: Tools only → Tools \+ workspace changes\./);
+    assert.match(f.warnings.at(-1)!, /Existing tool evidence was retained and a NEW snapshot baseline established/);
+    assert.match(f.warnings.at(-1)!, /Earlier Tools only reviews do not certify that baseline/);
+    assert.doesNotMatch(f.warnings.at(-1)!, /Off|On|enabled|disabled/);
     await f.start("snapshot edit after disable");
     await writeFile(join(f.cwd, "REPORT"), "SNAPSHOT_AFTER_DISABLE\n");
     await f.end();
@@ -481,7 +488,7 @@ for (const initial of [true, false]) {
           const baseline = (await f.restored())!.state.reviewWindow!.baseline;
           assert.equal(baseline?.kind, "tool");
           assert.ok(baseline?.kind === "tool" && baseline.fallback);
-          assert.match(f.warnings.join("\n"), /tool-only-fallback/);
+          assert.match(f.warnings.join("\n"), /Tools only \(snapshot-failure fallback\)/);
           await f.writeScript("CURRENT_WORK_SURVIVES\n");
         }
         if (enabled) await f.end();
@@ -489,12 +496,12 @@ for (const initial of [true, false]) {
         failure.mock.restore();
         if (!enabled) {
           await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/);
-          assert.doesNotMatch(f.rt.notices.join("\n"), /tool-only-fallback/);
+          assert.doesNotMatch(f.rt.notices.join("\n"), /Tools only \(snapshot-failure fallback\)/);
           assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "checkpoint");
           return;
         }
         assert.equal(await readFile(f.calls, "utf8"), "1");
-        assert.match(f.rt.sent[0]!.message, /tool-only-fallback/);
+        assert.match(f.rt.sent[0]!.message, /Tools only \(snapshot-failure fallback\)/);
         assert.match(f.rt.sent[0]!.message, /CURRENT tool evidence was preserved, not reset/);
         const bundle = extractBundleDir(f.rt.sent[0]!.message, 1);
         assert.match(await readFile(join(bundle, "reviews/0001/side-effect.patch.diff"), "utf8"), /CURRENT_WORK_SURVIVES/);
@@ -519,7 +526,7 @@ for (const reason of ["aborted", "checkpoint_digest_mismatch", "capture_inconsis
       mock.method(checkpoints, "captureReviewCheckpoint", async () => ({ status: "failed" as const, reason }));
       await assert.rejects(f.end(), /capturing after-checkpoint failed/);
       await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/);
-      assert.doesNotMatch(f.rt.notices.join("\n"), /tool-only-fallback/);
+      assert.doesNotMatch(f.rt.notices.join("\n"), /Tools only \(snapshot-failure fallback\)/);
       assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "checkpoint");
     } finally { await f.dispose(); }
   });
@@ -550,13 +557,13 @@ test("actual raw content-open failure qualifies; raw storage and record-publicat
         continue;
       }
       await f.start();
-      assert.ok(f.warnings.some((warning) => warning.includes("tool-only-fallback")));
+      assert.ok(f.warnings.some((warning) => warning.includes("Tools only (snapshot-failure fallback)")));
       mock.restoreAll();
       await f.writeScript("REAL_CAPTURE_FALLBACK_WORK\n");
       await f.end();
       assert.equal(await readFile(f.calls, "utf8"), "1");
-      assert.match(f.rt.sent[0]!.message, /Review evidence method: tool-only\./);
-      assert.match(f.rt.sent[0]!.message, /new snapshot baseline covers subsequent work only/);
+      assert.match(f.rt.sent[0]!.message, /Review evidence method: Tools only\./);
+      assert.match(f.rt.sent[0]!.message, /new Tools \+ workspace changes snapshot baseline covers subsequent work only/);
       const recovered = (await f.restored())!.state.reviewWindow!.baseline;
       assert.ok(recovered?.kind === "checkpoint" && recovered.toolOnlyHistory);
       assert.match(f.warnings.join("\n"), /Snapshot capture recovered/);
@@ -571,12 +578,12 @@ test("fallback cannot rescue a damaged existing baseline or a reviewer error", a
     await f.writeScript("PENDING\n");
     const loaded = mock.method(checkpoints, "loadReviewCheckpoint", async () => ({ status: "failed" as const, reason: "checkpoint_digest_mismatch" as const }));
     await assert.rejects(f.end(), /verifying baseline/);
-    assert.doesNotMatch(f.rt.notices.join("\n"), /tool-only-fallback/);
+    assert.doesNotMatch(f.rt.notices.join("\n"), /Tools only \(snapshot-failure fallback\)/);
     loaded.mock.restore();
     mock.method(GenericCliAdapter.prototype, "run", async (request: ModelAdapterRequest): Promise<ReviewResult> => ({ reviewerId: request.id, verdict: "error", summary: "injected reviewer failure", findings: [], error: "invalid_output" }));
     await f.commands.get("review-now")!("", f.rt.ctx);
     assert.match(f.rt.sent[0]!.message, /injected reviewer failure/);
-    assert.doesNotMatch(f.rt.sent[0]!.message, /tool-only-fallback/);
+    assert.doesNotMatch(f.rt.sent[0]!.message, /Tools only \(snapshot-failure fallback\)/);
     assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "checkpoint");
   } finally { await f.dispose(); }
 });
@@ -602,7 +609,7 @@ test("Primary policy apply during an active reviewer defers reset until settleme
     assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "checkpoint");
     finish!();
     await ending;
-    assert.match(f.rt.sent[0]!.message, /Review evidence method: snapshot/);
+    assert.match(f.rt.sent[0]!.message, /Review evidence method: Tools \+ workspace changes/);
     await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
     assert.match(f.warnings.join("\n"), /CURRENT Primary collected evidence.*RESET/);
     assert.equal((await f.restored())!.state.reviewWindow!.evidence.events.length, 0);
@@ -632,7 +639,7 @@ test("tool-only correction inverse is reviewed and manual reviewer questions nee
     mock.method(checkpoints, "captureReviewCheckpoint", async () => { throw new Error("tool-only question must not capture workspace"); });
     await f.commands.get("ask-reviewer")!("Does the inverse meet the request?", f.rt.ctx);
     assert.equal(reviews, 3);
-    assert.match(f.rt.sent.at(-1)!.message, /Review evidence method: tool-only/);
+    assert.match(f.rt.sent.at(-1)!.message, /Review evidence method: Tools only/);
   } finally { await f.dispose(); }
 });
 
@@ -662,18 +669,18 @@ test("snapshot preference retries each review: repeated failures warn each time;
     await f.writeScript("FALLBACK_TWO\n");
     await f.end();
     assert.equal(capture.mock.callCount(), 2);
-    assert.equal(f.warnings.filter((warning) => warning.includes("Review evidence method: tool-only-fallback")).length, 2);
+    assert.equal(f.warnings.filter((warning) => warning.includes("Review evidence method: Tools only (snapshot-failure fallback)")).length, 2);
     assert.equal(await readFile(f.calls, "utf8"), "2");
     capture.mock.restore();
     await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
     await writeFile(join(f.cwd, "REPORT"), "SNAPSHOT_RECOVERED_REPORT\n");
     await f.end();
     assert.equal(await readFile(f.calls, "utf8"), "3");
-    assert.match(f.rt.sent[2]!.message, /Review evidence method: snapshot/);
-    assert.doesNotMatch(f.rt.sent[2]!.message, /tool-only-fallback/);
+    assert.match(f.rt.sent[2]!.message, /Review evidence method: Tools \+ workspace changes/);
+    assert.doesNotMatch(f.rt.sent[2]!.message, /Tools only \(snapshot-failure fallback\)/);
     const bundle = extractBundleDir(f.rt.sent[2]!.message, 3);
     assert.match(await readFile(join(bundle, "reviews/0003/patch.diff"), "utf8"), /SNAPSHOT_RECOVERED_REPORT/);
-    assert.equal(f.warnings.filter((warning) => warning.includes("Review evidence method: tool-only-fallback")).length, 2);
+    assert.equal(f.warnings.filter((warning) => warning.includes("Review evidence method: Tools only (snapshot-failure fallback)")).length, 2);
   } finally { await f.dispose(); }
 });
 
@@ -806,7 +813,30 @@ test("worker acquisition handoff cannot bypass fallback Off, cancellation, or a 
   } finally { await f.dispose(); }
 });
 
-test("disabling tool-only honors opted-in acquisition fallback without resetting retained work or latching preference", async () => {
+test("Primary Tools only → Tools + workspace changes capture failure names methods and retains evidence fail-closed", async () => {
+  const f = await fixture({ primaryToolOnly: true }, false);
+  try {
+    await f.start();
+    await f.writeScript("RETAIN_WHEN_SNAPSHOT_FAILS\n");
+    await f.end();
+    const before = (await f.restored())!.state.reviewWindow!;
+    const warningsBefore = [...f.warnings];
+    mock.method(checkpoints, "captureReviewCheckpoint", async () => ({ status: "failed" as const, reason: "patch_too_large" as const, evidenceCaptureFailure: true as const }));
+    await assert.rejects(f.settings(["Reviewers", "Evidence methods", "Primary /", "Back", "Back", undefined]), (error: Error) => {
+      assert.match(error.message, /Primary Tools only → Tools \+ workspace changes could not establish a new snapshot baseline/);
+      assert.match(error.message, /prior evidence retained; repair and retry before further work/);
+      assert.doesNotMatch(error.message, /disabling|disabled|Off|On/);
+      return true;
+    });
+    const after = (await f.restored())!.state.reviewWindow!;
+    assert.deepEqual(after.baseline, before.baseline);
+    assert.deepEqual(after.evidence, before.evidence);
+    await assert.rejects(trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx), /Tools only → Tools \+ workspace changes could not establish/);
+    assert.deepEqual(f.warnings, warningsBefore, "failed transition must not disclose fallback or a successful method change");
+  } finally { await f.dispose(); }
+});
+
+test("Tools only → Tools + workspace changes honors opted-in acquisition fallback without resetting retained work or latching preference", async () => {
   const f = await fixture({ primaryToolOnly: true, snapshotFailureFallback: true }, false);
   try {
     await f.start();
@@ -818,8 +848,8 @@ test("disabling tool-only honors opted-in acquisition fallback without resetting
     const fallback = (await f.restored())!.state.reviewWindow!;
     assert.equal(fallback.evidence.events.length, count);
     assert.ok(fallback.baseline?.kind === "tool" && fallback.baseline.fallback);
-    assert.match(f.warnings.at(-1)!, /preference disabled.*will be retried/);
-    assert.match(f.warnings.at(-1)!, /tool-only-fallback/);
+    assert.match(f.warnings.at(-1)!, /preference changed: Tools only → Tools \+ workspace changes.*will be retried/);
+    assert.match(f.warnings.at(-1)!, /Tools only \(snapshot-failure fallback\)/);
     assert.doesNotMatch(f.warnings.at(-1)!, /RESET/);
     failed.mock.restore();
     await f.start("continued work with snapshot preference");
@@ -1000,8 +1030,8 @@ for (const scenario of [
         assert.equal(afterWindow.correctionCycles, 0);
         assert.equal(afterWindow.activeExchange!.reviewResponseMode, "correction");
         assert.equal(afterWindow.reviewHistory.at(-1)!.disposition, "held_then_sent");
-        assert.match(f.warnings.at(-1)!, /\/review-continue: WARNING: Review evidence method: tool-only-fallback/);
-        assert.match(f.rt.sent.at(-1)!.message, /tool-only-fallback/);
+        assert.match(f.warnings.at(-1)!, /\/review-continue: WARNING: Review evidence method: Tools only \(snapshot-failure fallback\)/);
+        assert.match(f.rt.sent.at(-1)!.message, /Tools only \(snapshot-failure fallback\)/);
         assert.equal(after.pendingModelDeliveries.at(-1)!.kind, "review_authorization");
         assert.equal(after.pendingModelDeliveries.at(-1)!.status, "delivered");
       } else {
@@ -1009,7 +1039,7 @@ for (const scenario of [
         assert.equal(afterWindow.correctionCycles, beforeWindow.correctionCycles);
         assert.deepEqual(afterWindow.reviewHistory, beforeWindow.reviewHistory);
         assert.equal(after.pendingModelDeliveries.length, before.pendingModelDeliveries.length);
-        assert.doesNotMatch(f.warnings.join("\n"), /tool-only-fallback/);
+        assert.doesNotMatch(f.warnings.join("\n"), /Tools only \(snapshot-failure fallback\)/);
       }
       assert.equal(reviews, 2, "continuation authorization must not invoke a reviewer itself");
     } finally { await f.dispose(); }
@@ -1110,9 +1140,9 @@ test("disabling releases an unused capture when automatic review acquires owners
     const metadata = JSON.parse(await readFile(join(bundle, "reviews/0001/metadata.json"), "utf8"));
     assert.equal(metadata.evidenceMethod, "tool-only");
     assert.match(f.warnings.join("\n"), /pending until the running review settles/);
-    assert.doesNotMatch(f.warnings.join("\n"), /Primary tool-only evidence disabled\./);
+    assert.doesNotMatch(f.warnings.join("\n"), /Primary evidence method changed: Tools only → Tools \+ workspace changes\./);
     await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
-    assert.match(f.warnings.at(-1)!, /Primary tool-only evidence disabled\./);
+    assert.match(f.warnings.at(-1)!, /Primary evidence method changed: Tools only → Tools \+ workspace changes\./);
     assert.equal((await f.restored())!.state.reviewWindow!.evidence.events.length, 2);
   } finally {
     releaseCapture.resolve();
@@ -1134,7 +1164,7 @@ test("initial fallback notification failure leaves initialization unarmed and re
     const host = f.rt.pi as typeof f.rt.pi & { sendMessage: (message: { content: string }) => unknown };
     const sendMessage = host.sendMessage;
     mock.method(host, "sendMessage", (message: { content: string }) => {
-      if (message.content.includes("Review evidence method: tool-only-fallback")) {
+      if (message.content.includes("Review evidence method: Tools only (snapshot-failure fallback)")) {
         warningAttempts++;
         if (failWarning) throw new Error("injected initial fallback sendMessage failure");
       }
@@ -1161,7 +1191,7 @@ test("initial fallback notification failure leaves initialization unarmed and re
     assert.match(armed.evidence.events[0]!.detail!, /RETAINED_WHILE_INITIALIZATION_FAILED/);
     assert.equal(captureAttempts, 2, "retry must not reuse an undisclosed armed basis");
     assert.equal(warningAttempts, 2);
-    assert.match(f.warnings.at(-1)!, /tool-only-fallback/);
+    assert.match(f.warnings.at(-1)!, /Tools only \(snapshot-failure fallback\)/);
     await f.writeScript("WORK_AFTER_MANDATORY_WARNING\n");
     await f.end();
     assert.equal(await readFile(f.calls, "utf8"), "1");

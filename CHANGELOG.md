@@ -20,11 +20,15 @@ dates.
 ### Added
 
 - Review evidence controls (#303): **Reviewers → Evidence methods** independently
-  selects Primary / top-level, isolated worktree, and InPlace tool-only evidence,
-  plus snapshot-failure fallback, all default Off under `review.evidence`. Root
+  selects **Tools + workspace changes** (default) or **Tools only** for the scope-only
+  **Primary / top-level**, **Isolated worktree**, and **InPlace** rows. Workspace changes
+  means whole-workspace snapshot/diff review evidence; both methods retain bounded tool
+  observations, task/assistant context, and reviewer read access. Separate snapshot-failure
+  fallback defaults **Off**; canonical `review.evidence` booleans are unchanged. Root
   Escape applies for the session, Save/Ctrl+S persists (including nested Ctrl+S),
   and Cancel preserves the live choices from before the visit. Effective Primary
-  Off → On resets current evidence with a prominent warning; On → Off retains it
+  **Tools + workspace changes → Tools only** resets current evidence with a prominent
+  warning; **Tools only → Tools + workspace changes** retains it
   and starts a new snapshot baseline. Workers pin evidence/fallback policy at firing/queue
   admission: each Start/Add task independently, scheduled tasks at actual firing, not
   schedule creation. Already queued/running tasks retain it through corrections, retries,
@@ -38,7 +42,7 @@ dates.
   fabricates earlier coverage nor discards retained current-work tool evidence. Missing
   observations do not block degraded review: collected evidence, adapter/capture limits,
   and provenance-labelled claims/context remain visible, never proof of clean work or no
-  effects. Tool-only omits only filesystem/Git review snapshots subject to outside-writer
+  effects. **Tools only** omits only filesystem/Git review snapshots subject to outside-writer
   contamination, not bounded tool/path/content observations or read-only inspection.
   It never implies approval or full snapshot coverage.
   Missing/corrupt persisted evidence, cancellation, review errors,

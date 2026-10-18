@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { type ReviewGateConfig } from "../config";
 import { createEvidenceState } from "../evidence";
 import { captureReviewCheckpoint, releaseReviewCheckpoint } from "../review-checkpoint";
-import { primaryEvidencePolicy, evidenceMethodNotice, isEligibleReviewCaptureFailure } from "../review-evidence";
+import { primaryEvidencePolicy, evidenceMethodNotice, evidenceMethodLabel, TOOLS_ONLY_LABEL, WORKSPACE_CHANGES_LABEL, isEligibleReviewCaptureFailure } from "../review-evidence";
 import type { ReviewBaseline, ReviewGateState } from "../state";
 import { sendNotice } from "../pi";
 
@@ -25,7 +25,7 @@ export function createPrimaryEvidenceSettings(input: {
   let pendingCompletion: { persisted: boolean; warning: string } | undefined;
   let applyTail: Promise<void> = Promise.resolve();
   const deferForReview = async (): Promise<void> => {
-    if (!deferredNotice) await input.warn("WARNING: Primary evidence policy change is pending until the running review settles. Its captured policy and evidence remain unchanged; the transition will apply before the next Primary run or manual review.");
+    if (!deferredNotice) await input.warn(`WARNING: Primary evidence method change ${evidenceMethodLabel(applied)} → ${evidenceMethodLabel(primaryEvidencePolicy(input.config).toolOnly)} is pending until the running review settles. Its captured policy and evidence remain unchanged; the transition will apply before the next Primary run or manual review.`);
     deferredNotice = true;
   };
   const completeTransition = async (): Promise<void> => {
@@ -68,7 +68,7 @@ export function createPrimaryEvidenceSettings(input: {
         return;
       }
       if (captured.status !== "ok") {
-        if (!policy.snapshotFailureFallback || !isEligibleReviewCaptureFailure(captured)) throw new Error(`review gate: disabling Primary tool-only evidence could not establish a new snapshot baseline (${captured.reason}); prior evidence retained; repair and retry before further work`);
+        if (!policy.snapshotFailureFallback || !isEligibleReviewCaptureFailure(captured)) throw new Error(`review gate: Primary ${TOOLS_ONLY_LABEL} → ${WORKSPACE_CHANGES_LABEL} could not establish a new snapshot baseline (${captured.reason}); prior evidence retained; repair and retry before further work`);
         // Apply the snapshot preference without inventing a pre-work snapshot.
         // A later review retries capture; this is actual fallback, never reset.
         baseline = { kind: "tool", cwd: captureCwd, capturedAt: new Date().toISOString(), fallback: true };
@@ -106,10 +106,10 @@ export function createPrimaryEvidenceSettings(input: {
     applied = next;
     deferredNotice = false;
     pendingCompletion = { persisted: false, warning: next
-      ? `WARNING: Primary tool-only evidence enabled. CURRENT Primary collected evidence was RESET; outstanding reviewer findings, correction requirements and pending deliveries remain in force. Existing files are not retrospectively reviewed. ${evidenceMethodNotice("tool-only")}`
+      ? `WARNING: Primary evidence method changed: ${WORKSPACE_CHANGES_LABEL} → ${TOOLS_ONLY_LABEL}. CURRENT Primary collected evidence was RESET; outstanding reviewer findings, correction requirements and pending deliveries remain in force. Existing files are not retrospectively reviewed. ${evidenceMethodNotice("tool-only")}`
       : disableFellBack
-        ? `Primary tool-only preference disabled, but a new snapshot baseline could not be acquired; snapshot capture will be retried. ${evidenceMethodNotice("tool-only-fallback")}`
-        : "Primary tool-only evidence disabled. Existing tool evidence was retained and a NEW snapshot baseline established; subsequent workspace changes will be reviewed with snapshots. Earlier tool-only reviews do not certify that baseline." };
+        ? `Primary evidence preference changed: ${TOOLS_ONLY_LABEL} → ${WORKSPACE_CHANGES_LABEL}, but a new snapshot baseline could not be acquired; snapshot capture will be retried. ${evidenceMethodNotice("tool-only-fallback")}`
+        : `Primary evidence method changed: ${TOOLS_ONLY_LABEL} → ${WORKSPACE_CHANGES_LABEL}. Existing tool evidence was retained and a NEW snapshot baseline established; subsequent workspace changes will be reviewed with snapshots. Earlier ${TOOLS_ONLY_LABEL} reviews do not certify that baseline.` };
     await completeTransition();
   };
   const enqueue = (action: () => Promise<void>): Promise<void> => {

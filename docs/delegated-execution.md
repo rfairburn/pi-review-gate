@@ -174,8 +174,9 @@ single-line input behind it) is used unchanged.
 
 ## Worker review evidence selection
 
-The default-Off **Isolated worktree tool-only** and **InPlace tool-only** controls
-under `/review-settings` → **Reviewers** → **Evidence methods** select review evidence
+The **Isolated worktree** and **InPlace** rows under `/review-settings` → **Reviewers** →
+**Evidence methods** default to **Tools + workspace changes**; Enter cycles to
+**Tools only**. They select review evidence
 independently of the worker kind, reviewer set, and automatic-review toggles. They
 are stored as `review.evidence.worktreeToolOnly` and `inplaceToolOnly`; the independent
 `snapshotFailureFallback` opt-in also defaults Off. See

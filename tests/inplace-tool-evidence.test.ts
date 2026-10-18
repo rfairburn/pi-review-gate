@@ -319,7 +319,7 @@ test("enabled initial/later repeated fallback warns on each actual use, preserve
   for (const prompt of await f.captured()) assert.match(prompt, /WARNING: InPlace snapshot-failure fallback/);
   assert.ok(f.requests.slice(1).every((p) => p.includes("WARNING: InPlace")), "implementing model sees fallback, not just telemetry");
   const durable = await readFile(join(f.artifactDir, "result.json"), "utf8");
-  assert.match(durable, /tool-only-fallback/); assert.match(durable, /WARNING: InPlace/);
+  assert.match(durable, /Tools only \(snapshot-failure fallback\)/); assert.match(durable, /WARNING: InPlace/);
   assert.match(buildInPlaceCompletionLines(result).join("\n"), /WARNING: InPlace/);
 });
 
@@ -429,7 +429,7 @@ test("preferred snapshot recovery starts a subsequent-work baseline and retains 
   assert.equal(result.reviewCycles[2]!.reviewOutput.evidenceMethod, "snapshot");
   assert.match(result.reviewCycles[2]!.reviewOutput.evidenceCoverageNotice!, /subsequent work only/);
   const last = (await f.captured()).at(-1)!;
-  assert.ok(last.includes("actual retained SCRIPT body 303")); assert.match(last, /Earlier work has tool-only evidence/);
+  assert.ok(last.includes("actual retained SCRIPT body 303")); assert.match(last, /Earlier work used Tools only/);
   const recovery = JSON.parse(await readFile(join(f.artifactDir, "snapshot-recovery", "baseline.json"), "utf8"));
   assert.equal(recovery.toolOnlyHistory, true);
   const recoveryPath = join(f.artifactDir, "snapshot-recovery", "baseline.json");
@@ -486,7 +486,7 @@ test("tool-only cancellation settlement retains bounded observations without any
   f.setAction(async (request) => { await f.edit(request, scriptContent); abort.abort(); });
   const result = await runInplaceLifecycle({ ...f.input, signal: abort.signal });
   assert.equal(result.status, "cancelled"); assert.equal(result.reviewCycles.length, 0);
-  assert.match(result.attributionError!, /not captured under tool-only/);
+  assert.match(result.attributionError!, /not captured under Tools only/);
   assert.match(await readFile(join(f.artifactDir, "observed-tool-evidence.json"), "utf8"), /actual retained SCRIPT body 303/);
 });
 

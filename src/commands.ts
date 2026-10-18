@@ -2,7 +2,7 @@ import { automaticReviewEnabled, resolveReviewers, reviewerDisplayLabel, type Re
 import { join } from "node:path";
 import { removeTransientWindowBundle } from "./bundle";
 import { randomUUID } from "node:crypto";
-import { captureReviewCheckpoint, releaseReviewCheckpoint } from "./review-checkpoint";
+import { captureReviewCheckpoint, loadReviewCheckpoint, releaseReviewCheckpoint } from "./review-checkpoint";
 import {
   buildRequestContext,
   armReviewResponseExchange,
@@ -14,8 +14,11 @@ import {
   recordAcceptedReviewerQuestion,
   recordReviewerFeedbackAndArmExchange,
   type ReviewGateState,
+  type ReviewBaseline,
 } from "./state";
 import { runAskReviewer, runReview } from "./review";
+import { primaryEvidencePolicy, evidenceMethodNotice, isEligibleReviewCaptureFailure, TOOL_ONLY_HISTORY_NOTICE } from "./review-evidence";
+import { sendPrimaryEvidenceWarning } from "./activation/primary-evidence";
 import { extractSignal, isEscapeTerminalInput, onTerminalInput, sendNotice, sendFollowUp, sendSteeringPrompt, createStatusTracker } from "./pi";
 import { reviewCancellationMessage, type ActiveReviewCancellation, type ReviewCancellationCoordinator } from "./review-cancellation";
 import { formatTokenUsage } from "./usage";
@@ -193,6 +196,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       const reviewSignal = combineAbortSignals(extractSignal([ctx]), reviewAbort.signal);
       try {
         output = await runReview({
+          evidencePolicy: primaryEvidencePolicy(input.config),
           cwd: input.cwd(),
           checkpointScope: input.state.checkpointScope,
           request: buildRequestContext(input.state) || "Manual /review-now request",
@@ -202,7 +206,8 @@ export function registerCommands(input: RegisterCommandsInput): void {
           correctionAttemptCount: getCorrectionAttemptCount(window),
           window,
           signal: reviewSignal,
-          notify: (message) => sendCommandNotice(ctx, message),
+          notify: (message) => message.startsWith("WARNING: Review evidence method:") && isSessionActive()
+            ? sendPrimaryEvidenceWarning(input.pi, ctx, message) : sendCommandNotice(ctx, message),
           onUpdate: (message) => statusTracker.update(message),
           onInvocationPrepared: () => input.onStateChanged?.(),
         });
@@ -252,7 +257,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         });
         await sendCommandNotice(
           ctx,
-          `review gate: ${output.result.error === "partial_reviewer_error" ? "passed with reviewer warnings" : "passed"} (${formatTokenUsage(output.result.usage)})`,
+          `review gate: ${output.result.error === "partial_reviewer_error" ? "passed with reviewer warnings" : "passed"} (${formatTokenUsage(output.result.usage)})${output.evidenceMethod && output.evidenceMethod !== "snapshot" ? ` — ${evidenceMethodNotice(output.evidenceMethod)}` : ""}`,
         );
         await deliverCommandTransmission(input, output, "passed", transmission, isSessionActive);
       } else if (output.result?.verdict === "needs_changes") {
@@ -304,10 +309,63 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const followUp = window.lastCappedFollowUp;
       const reviewConfig = window.reviewConfig ?? currentConfig();
+      const policy = primaryEvidencePolicy(input.config);
+      const reviewCwd = input.cwd();
+      const signal = combineAbortSignals(extractSignal([ctx]), input.sessionSignal);
       const scope = { scope: input.state.checkpointScope };
-      const captured = await captureReviewCheckpoint(input.cwd(), randomUUID(), scope);
-      if (captured.status !== "ok") throw new Error(`review gate: response checkpoint failed (${captured.reason}): ${captured.detail}`);
-      const responseBaseline = { kind: "checkpoint" as const, descriptor: captured.value, cwd: input.cwd(), capturedAt: new Date().toISOString() };
+      const before = window.baseline;
+      const exchangeBefore = window.activeExchange?.baseline;
+      if (!before) throw new Error("review gate: no preserved response basis; continuation remains capped");
+      for (const basis of [before, exchangeBefore]) {
+        if (!basis) continue;
+        if (basis.kind !== before.kind) throw new Error("review gate: mixed continuation baseline kinds");
+        if (basis.kind !== "snapshot" && basis.cwd !== reviewCwd) throw new Error("review gate: continuation basis root mismatch");
+      }
+      signal?.throwIfAborted();
+      const captured = policy.toolOnly ? undefined : await captureReviewCheckpoint(reviewCwd, randomUUID(), { ...scope, signal });
+      let responseBaseline: ReviewBaseline;
+      let evidenceNotice: string | undefined;
+      if (captured && captured.status !== "ok") {
+        if (!policy.snapshotFailureFallback || signal?.aborted || !isEligibleReviewCaptureFailure(captured)) throw new Error(`review gate: response checkpoint failed (${captured.reason}): ${captured.detail}`);
+        // A failed acquisition never substitutes for fresh verification of the
+        // historical bases retained for the correction. No evidence is reset.
+        for (const basis of [before, exchangeBefore]) {
+          if (!basis) continue;
+          signal?.throwIfAborted();
+          if (basis.kind === "checkpoint" || basis.kind === "git") {
+            const descriptor = basis.kind === "checkpoint" ? basis.descriptor : { kind: "git" as const, checkpoint: basis.descriptor };
+            const verified = await loadReviewCheckpoint(reviewCwd, descriptor, { ...scope, signal });
+            if (verified.status !== "ok") throw new Error(`review gate: verifying continuation basis failed (${verified.reason}): ${verified.detail}`);
+          }
+        }
+        responseBaseline = exchangeBefore ?? before;
+        evidenceNotice = `Primary /review-continue: ${evidenceMethodNotice("tool-only-fallback")}`;
+      } else if (captured?.status === "ok") {
+        const toolOnlyHistory = before.kind === "tool" || (before.kind === "checkpoint" && before.toolOnlyHistory);
+        responseBaseline = { kind: "checkpoint", descriptor: captured.value, cwd: reviewCwd, capturedAt: new Date().toISOString(), ...(toolOnlyHistory ? { toolOnlyHistory: true } : {}) };
+        if (before.kind === "tool") evidenceNotice = `Primary /review-continue: snapshot capture recovered; a NEW baseline covers subsequent work only. ${TOOL_ONLY_HISTORY_NOTICE}`;
+      } else responseBaseline = exchangeBefore ?? before;
+      const assertContinuationCurrent = () => {
+        signal?.throwIfAborted();
+        if (!isSessionActive() || input.cwd() !== reviewCwd || input.state.reviewWindow !== window || window.lastCappedFollowUp !== followUp || window.baseline !== before || window.activeExchange?.baseline !== exchangeBefore) throw new Error("review gate: continuation window changed during capture; retry against its current basis");
+      };
+      try {
+        assertContinuationCurrent();
+        if (evidenceNotice) await sendPrimaryEvidenceWarning(input.pi, ctx, evidenceNotice);
+        assertContinuationCurrent();
+      } catch (error) {
+        if (captured?.status === "ok") {
+          const released = await releaseReviewCheckpoint(reviewCwd, captured.value, scope);
+          if (released.status !== "ok") throw new Error(`${error instanceof Error ? error.message : "review gate: response setup failed"}; orphan release failed (${released.reason}): ${released.detail}`);
+        }
+        throw error;
+      }
+      // Recovery from an earlier tool-only basis changes both kinds together;
+      // the retained tool evidence and outstanding correction remain intact.
+      if (before.kind === "tool" && responseBaseline.kind === "checkpoint") {
+        window.baseline = responseBaseline;
+        if (window.activeExchange) window.activeExchange.baseline = responseBaseline;
+      }
       const oldCycles = window.correctionCycles;
       const feedback = markCappedFeedbackSent(input.state);
       window.lastCappedFollowUp = undefined;
@@ -325,7 +383,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           if (feedback) feedback.disposition = "sent_at_cap";
           window.lastCappedFollowUp = followUp;
           window.correctionCycles = oldCycles;
-          const released = await releaseReviewCheckpoint(input.cwd(), captured.value, scope);
+          const released = captured?.status === "ok" ? await releaseReviewCheckpoint(reviewCwd, captured.value, scope) : { status: "ok" as const };
           if (released.status !== "ok") throw new Error(`review gate: response arming failed; orphan release failed (${released.reason}): ${released.detail}`);
         }
         throw error;
@@ -334,13 +392,13 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await input.onStateChanged?.();
       } catch (error) {
         if (window.activeExchange?.baseline !== responseBaseline) {
-          const unused = await releaseReviewCheckpoint(input.cwd(), captured.value, scope);
+          const unused = captured?.status === "ok" ? await releaseReviewCheckpoint(reviewCwd, captured.value, scope) : { status: "ok" as const };
           if (unused.status !== "ok") throw new Error(`review gate: unused response checkpoint cleanup failed (${unused.reason}): ${unused.detail}`);
         }
         throw error;
       }
       if (window.activeExchange?.baseline !== responseBaseline) {
-        const unused = await releaseReviewCheckpoint(input.cwd(), captured.value, scope);
+        const unused = captured?.status === "ok" ? await releaseReviewCheckpoint(reviewCwd, captured.value, scope) : { status: "ok" as const };
         if (unused.status !== "ok") throw new Error(`review gate: unused response checkpoint release failed (${unused.reason}): ${unused.detail}`);
       }
       await sendCommandNotice(ctx, `review gate: continuing review; correction budget reset to ${reviewConfig.maxCorrectionCycles}`);
@@ -351,7 +409,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           invocationDir: join(window.bundleDir, "reviews", String(feedback.sequence).padStart(4, "0")),
           action: "correction_required" as const,
         } : {}),
-        message: followUp,
+        message: evidenceNotice ? `${evidenceNotice}\n\n${followUp}` : followUp,
       }, isSessionActive);
     },
   });
@@ -400,6 +458,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       const reviewSignal = combineAbortSignals(extractSignal([ctx]), reviewAbort.signal);
       try {
         output = await runAskReviewer({
+          evidencePolicy: primaryEvidencePolicy(input.config),
           cwd: input.cwd(),
           checkpointScope: input.state.checkpointScope,
           question,
@@ -413,7 +472,8 @@ export function registerCommands(input: RegisterCommandsInput): void {
           correctionAttemptCount: getCorrectionAttemptCount(contextWindow),
           window: contextWindow,
           signal: reviewSignal,
-          notify: (message) => sendCommandNotice(ctx, message),
+          notify: (message) => message.startsWith("WARNING: Review evidence method:") && isSessionActive()
+            ? sendPrimaryEvidenceWarning(input.pi, ctx, message) : sendCommandNotice(ctx, message),
           onUpdate: (message) => statusTracker.update(message),
           onInvocationPrepared: () => input.onStateChanged?.(),
         });
@@ -441,11 +501,11 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
 
-      const payload = formatReviewerAnswer(
+      const payload = `${output.evidenceMethod && output.evidenceMethod !== "snapshot" ? `${evidenceMethodNotice(output.evidenceMethod)}\n\n` : ""}${output.evidenceCoverageNotice ? `${output.evidenceCoverageNotice}\n\n` : ""}${formatReviewerAnswer(
         question,
         output.reviewerResults ?? [],
         output.bundleRetained ? output.bundleDir : undefined,
-      );
+      )}`;
       const submittedPayload = autoSubmit ? payload : await showPrivateReviewerAnswer(ctx, payload);
       if (!isSessionActive()) {
         return;
@@ -487,6 +547,8 @@ async function createCommandTransmission(
     throw new Error("review gate: cannot transmit an incomplete review pass");
   }
   return createReviewTransmissionMessage({
+    evidenceMethod: output.evidenceMethod,
+    evidenceCoverageNotice: output.evidenceCoverageNotice,
     invocationDir: output.invocationDir,
     reviewSequence: output.reviewSequence,
     gateVerdict: output.result.verdict,

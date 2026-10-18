@@ -357,6 +357,49 @@ uses optional `reasoningEffort` fields on each
 argument-based settings remain compatible; arbitrary binary adapters may still use
 their own arguments or environment variables.
 
+### Review evidence methods
+
+The optional `review.evidence` object selects evidence independently for three review
+contexts. All four fields are JSON booleans and default to **false**, including
+when the object is absent in an older config. For each of the three tool-only fields,
+`false` displays **Tools + workspace changes** (whole-workspace snapshot/diff review
+evidence); `true` displays **Tools only** (without that whole-workspace evidence).
+Both methods retain bounded tool calls/results, observed file content and per-file
+tool-observation diffs, task/assistant context, and reviewer read access.
+The fourth field independently controls fallback, displayed as **Off** / **On**
+(default **Off**). These are not operating
+modes, automatic-review switches, or reviewer selections.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `review.evidence.primaryToolOnly` | `false` | `true` selects Tools only for Primary / top-level review, shared by Execute and Orchestrate. |
+| `review.evidence.worktreeToolOnly` | `false` | `true` selects Tools only for isolated worktree review; construction capture, checkpoints, and landing still require their normal verified inputs. |
+| `review.evidence.inplaceToolOnly` | `false` | `true` selects Tools only for InPlace review; direct writes and external effects remain post-hoc and are never rolled back. |
+| `review.evidence.snapshotFailureFallback` | `false` | Opt in to warning-bearing Tools only (snapshot-failure fallback) review when a qualifying review-evidence snapshot capture fails; not a durability or review-error bypass. |
+
+Present invalid fields recover independently to `false` with startup warnings; explicit
+configuration writes validate strictly. Evidence settings have one canonical stored
+representation, `review.evidence`, resolved separately from reviewer selection by
+`effectiveReviewEvidenceSettings(config)`; there is no mirrored compatibility state.
+
+Use `/review-settings` → **Reviewers** → **Evidence methods**. Root Escape applies
+for the session; Save/Ctrl+S persists; Cancel discards this visit's edits, preserving
+any earlier session-only choices. Only an effective Primary **Tools + workspace changes →
+Tools only** transition resets its current evidence, with a prominent warning.
+**Tools only → Tools + workspace changes** retains evidence and starts a
+new snapshot baseline; unchanged values, other-scope changes, and navigation do not
+reset Primary evidence. Workers pin applicable evidence and fallback policy at firing/queue
+admission, including already queued tasks through corrections, retries, and continuations.
+Each new Start/Add task captures independently; scheduled tasks capture at actual firing,
+not schedule creation. Later Add tasks use the then-current live choice, without changing
+in-flight tasks or freezing all routing/reviewer selections. Snapshot-preferring policy
+retries capture on later cycles/continuations; fallback warns on every occurrence and is
+not sticky. Missing structured observations do not block degraded review with disclosed
+limits and retained evidence. See
+[Settings](settings.md#evidence-methods) for the transaction and
+[Review workflow](review-workflow.md#review-evidence-methods) for evidence limits,
+first-baseline fallback, warnings, and blocking failures.
+
 ### The `externalAgents` catalog
 
 `externalAgents` is one configured catalog shared by both menus: an object keyed by

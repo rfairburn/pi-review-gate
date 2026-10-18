@@ -190,6 +190,8 @@ export interface SubtaskProgressUpdate {
   executorTurn?: number;
   reviewCycle?: number;
   reviewers?: string[];
+  /** Actual isolated review fallback, routed outside optional/noisy notices. */
+  reviewEvidenceWarning?: { scope: "worktree"; method: "tool-only-fallback"; message: string };
   /** Pool entry actually serving this update (tracks failovers). */
   executorEntryId?: string;
   /** Authoritative selection of the executor actually serving this update. */

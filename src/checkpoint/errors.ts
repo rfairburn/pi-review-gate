@@ -73,6 +73,8 @@ export class GitCheckpointError extends Error {
   constructor(
     message: string,
     readonly reason: GitCheckpointReason,
+    /** Acquisition only; never an identity/revalidation/publication failure. */
+    readonly evidenceCaptureFailure?: true,
   ) {
     super(message);
     this.name = "GitCheckpointError";
@@ -83,7 +85,7 @@ export class GitCheckpointError extends Error {
 export type GitCheckpointResult<T> =
   | { status: "ok"; value: T }
   | { status: "unsupported"; reason: GitCheckpointUnsupportedReason; detail?: string }
-  | { status: "failed"; reason: GitCheckpointFailureReason; detail?: string };
+  | { status: "failed"; reason: GitCheckpointFailureReason; detail?: string; evidenceCaptureFailure?: true };
 
 export function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw abortError(signal);
@@ -110,7 +112,9 @@ export function resultFromError(error: unknown): GitCheckpointResult<never> {
     if (UNSUPPORTED_REASONS.has(error.reason)) {
       return { status: "unsupported", reason: error.reason as GitCheckpointUnsupportedReason, detail };
     }
-    return { status: "failed", reason: error.reason as GitCheckpointFailureReason, detail };
+    return { status: "failed", reason: error.reason as GitCheckpointFailureReason, detail,
+      ...(error.evidenceCaptureFailure ? { evidenceCaptureFailure: true as const } : {}),
+    };
   }
   return { status: "failed", reason: "git_failed", detail: truncateDetail(messageOf(error)) };
 }

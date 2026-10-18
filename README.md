@@ -17,7 +17,14 @@ receipts of exactly what the model was told.
 - **Post-turn review gate** — automatic review of the primary orchestrator with a
   classified transmission, bounded correction cycles, deferred-at-cap semantics, and
   command-driven reruns, pauses, cancellations, and ad hoc reviewer questions
-  ([Review workflow](docs/review-workflow.md)).
+  ([Review workflow](docs/review-workflow.md)). Optional
+  [evidence controls](docs/configuration.md#review-evidence-methods) independently
+  select **Tools + workspace changes** (default) or **Tools only** for Primary,
+  isolated worktree, and InPlace review. Separate snapshot-failure fallback defaults
+  **Off**, with per-occurrence warnings and later snapshot retries when used.
+  Workers pin evidence policy at firing/queue admission; missing observations permit
+  degraded review with disclosed limits, never proof of no effects. These controls
+  preserve bounded tool observations and read-only inspection, never replacing durability gates.
 - **Multiple reviewers** — parallel reviewers over one evidence bundle with a simple
   gate: any `needs_changes` verdict requires changes; a completed pass survives another
   reviewer's infrastructure error; mixed results are `pass_with_warnings`. Built-in
@@ -243,7 +250,8 @@ ownership contract is in [Background shell tools](docs/delegated-execution.md#ba
 With automatic primary review enabled and usable reviewers selected:
 
 1. An agent turn completes and is appended to the review window's evidence bundle as a
-   numbered exchange (workspace diff, side effects, tool evidence, summary, usage).
+   numbered exchange (by default, workspace diff, side effects, tool evidence,
+   summary, usage; **Tools only** selections disclose their narrower basis).
 2. The configured reviewer or reviewers run read-only against the bundle — Codex in its
    read-only sandbox, Claude and Pi with explicit read-only tool allowlists, a fresh CLI
    session per pass.

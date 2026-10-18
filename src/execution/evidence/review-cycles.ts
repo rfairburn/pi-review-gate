@@ -190,6 +190,7 @@ export async function indexReviewCycleSource(
     aggregate: record.aggregate,
     summary: record.summary,
     completedAt: at,
+    ...(isPlaceRecord ? { evidenceMethod: record.evidenceMethod ?? "snapshot", evidenceCoverageNotice: record.evidenceCoverageNotice } : {}),
     ...(candidateRef !== undefined ? { candidateRef } : {}),
     ...(candidateCommit !== undefined ? { candidateCommit } : {}),
     ...(attribution !== undefined ? {
@@ -220,6 +221,7 @@ export async function indexReviewCycleSource(
         attribution: attribution.workspaceRoot,
       } : {}),
       aggregate: record.aggregate,
+      ...(isPlaceRecord ? { evidenceMethod: record.evidenceMethod ?? "snapshot", evidenceCoverageNotice: record.evidenceCoverageNotice } : {}),
       reviewer: {
         id: reviewer.reviewerId,
         ...(typeof reviewer.displayLabel === "string" ? { label: reviewer.displayLabel } : {}),

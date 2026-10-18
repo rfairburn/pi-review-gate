@@ -35,12 +35,15 @@ export type ReviewFeedbackDisposition =
  * Typed review baseline. A window (and its active exchange) is reviewed
  * against one unified durable checkpoint. Snapshot and legacy Git variants
  * remain typed only while the primary adapter is being replaced; new parent
- * review windows use `checkpoint`. A window never mixes baseline kinds.
+ * snapshot-backed review windows use `checkpoint`. Tool-only windows use an
+ * explicit `tool` basis, never a fabricated empty snapshot. A window never
+ * mixes baseline kinds; a recovery replaces both window/exchange bases together.
  */
 export type ReviewBaseline =
+  | { kind: "tool"; cwd: string; capturedAt: string; fallback?: true }
   | { kind: "snapshot"; snapshot: WorkspaceSnapshot }
   | { kind: "git"; descriptor: GitCheckpointDescriptor; cwd: string; capturedAt: string }
-  | { kind: "checkpoint"; descriptor: ReviewCheckpointDescriptor; cwd: string; capturedAt: string };
+  | { kind: "checkpoint"; descriptor: ReviewCheckpointDescriptor; cwd: string; capturedAt: string; toolOnlyHistory?: true };
 
 /** The Git checkpoint variant of a typed review baseline. */
 export type GitCheckpointBaseline = Extract<ReviewBaseline, { kind: "git" }>;
@@ -54,12 +57,12 @@ export function snapshotReviewBaseline(snapshot: WorkspaceSnapshot): ReviewBasel
 /**
  * Discriminate a typed review baseline from a raw workspace snapshot at the
  * value level (review inputs accept both). A snapshot never carries a `kind`
- * discriminator, so only the two typed variants match.
+ * discriminator, so only the explicit typed variants match.
  */
 export function isReviewBaseline(value: unknown): value is ReviewBaseline {
   if (typeof value !== "object" || value === null) return false;
   const kind = (value as { kind?: unknown }).kind;
-  return kind === "snapshot" || kind === "git" || kind === "checkpoint";
+  return kind === "snapshot" || kind === "git" || kind === "checkpoint" || kind === "tool";
 }
 
 /**
@@ -73,7 +76,7 @@ export function snapshotOfReviewBaseline(baseline: ReviewBaseline | undefined): 
   if (baseline === undefined) return undefined;
   if (baseline.kind !== "snapshot") {
     throw new Error(
-      `review gate: this consumer requires a workspace-snapshot baseline but the review window holds a ${baseline.kind === "git" ? "Git checkpoint" : "unified checkpoint"} baseline; refusing to fall back to a synthetic snapshot`,
+      `review gate: this consumer requires a workspace-snapshot baseline but the review window holds a ${baseline.kind === "tool" ? "tool-only evidence" : baseline.kind === "git" ? "Git checkpoint" : "unified checkpoint"} baseline; refusing to fall back to a synthetic snapshot`,
     );
   }
   return baseline.snapshot;
@@ -272,7 +275,7 @@ function assertNoMixedBaselineKind(window: ReviewWindow, incoming: ReviewBaselin
   }
 }
 
-export function setReviewWindowCheckpointBaseline(state: ReviewGateState, baseline: UnifiedReviewBaseline): void {
+export function setReviewWindowCheckpointBaseline(state: ReviewGateState, baseline: UnifiedReviewBaseline | Extract<ReviewBaseline, { kind: "tool" }>): void {
   const window = state.reviewWindow ?? openReviewWindow(state);
   assertNoMixedBaselineKind(window, baseline, "setReviewWindowCheckpointBaseline");
   window.baseline ??= baseline;

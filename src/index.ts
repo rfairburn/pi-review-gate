@@ -50,6 +50,8 @@ import { deferredToolPromptInjection, executionPromptInjection, extractSystemPro
 import { buildCompletionGuidancePrompt, resolveCompletionSkillPath } from "./activation/completion-guidance";
 import { recoverPendingModelDeliveries, releaseQueuedUserInputs } from "./activation/pending-delivery";
 import { createReviewTurnCoordinator, isToolError } from "./activation/review-turn";
+import { createPrimaryEvidenceSettings, sendPrimaryEvidenceWarning } from "./activation/primary-evidence";
+import { primaryEvidencePolicy, retainPrimaryToolAfter } from "./review-evidence";
 import { registerApplyPatchTool } from "./apply-patch/tool";
 import { registerGitReadTool, type GitReadHost } from "./git-read/tool";
 import { WebToolManager, type PiWebHost } from "./web/tools";
@@ -496,6 +498,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // background-completion monitor/deferral state, and the triggering-message
   // failure flag. It returns handler bodies and narrow operations; every hook
   // registration stays in this root's manifest.
+  let primaryEvidenceNoticeTarget: unknown = pi;
+  const warnPrimaryEvidence = (message: string): Promise<void> => sendPrimaryEvidenceWarning(pi, primaryEvidenceNoticeTarget, message);
+  const applyPrimaryEvidenceSettings = createPrimaryEvidenceSettings({
+    config, state, cwd: () => currentCwd, persist: () => sessionPersistence.persist(), warn: warnPrimaryEvidence,
+    reviewActive: () => reviewCancellation.current() !== undefined,
+  });
   const reviewTurn = createReviewTurnCoordinator({
     pi,
     state,
@@ -505,12 +513,15 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     observeCwd: (args) => { currentCwd = extractCwd(args, currentCwd); },
     cwd: () => currentCwd,
     syncExecutionContext: (args) => {
+      primaryEvidenceNoticeTarget = extractContext(args) ?? pi;
       updateScopedModels(args);
       executionTools.setScopedModels(currentScopedModels);
       executionTools.setUiContext(extractContext(args) ?? pi);
     },
     checkpointRestartBlocked: () => checkpointRestartBlocked,
     effectiveReviewConfig: () => effectiveReviewConfig(),
+    applyPendingEvidenceSettings: applyPrimaryEvidenceSettings,
+    warnEvidenceMethod: warnPrimaryEvidence,
     persist: () => sessionPersistence.persist(),
     persistAutomaticDelivery: () => sessionPersistence.persistAutomaticDelivery(),
     backgroundShell: () => backgroundShellController,
@@ -983,6 +994,8 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   });
 
   toolCallObserver = async (...args) => {
+    const pendingPolicyCompletion = applyPrimaryEvidenceSettings.completePending();
+    if (pendingPolicyCompletion) await pendingPolicyCompletion;
     const triggeringFailure = reviewTurn.triggeringFailure();
     if (triggeringFailure) {
       return {
@@ -1030,6 +1043,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     if (!window || !shouldRecordToolResultEvidence(name, toolError)) {
       return;
     }
+    const evidencePolicy = primaryEvidencePolicy(config);
+    if (evidencePolicy.toolOnly || evidencePolicy.snapshotFailureFallback || window.baseline?.kind === "tool") {
+      await reviewTurn.trackEvidenceCapture(retainPrimaryToolAfter({
+        state: window.evidence, cwd: currentCwd, toolName: name, toolInput: toolArgs, config,
+      }));
+    }
     recordToolResultEvidence({
       state: window.evidence,
       toolName: name,
@@ -1067,6 +1086,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
                     `review gate: /${name} blocked (${checkpointRestartBlocked}); repair and restart before review`);
                   return;
                 }
+                if (reviewCommandNames.has(name)) await applyPrimaryEvidenceSettings();
                 return options.handler(args, ctx);
               },
             });
@@ -1106,6 +1126,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // setEnabled, which stops or starts the timers immediately.
     schedulerRuntime: schedulerSwitch,
     onSaved: async (_saved, previousMode, context) => {
+      primaryEvidenceNoticeTarget = context ?? pi;
+      await reviewTurn.drainEvidenceCaptures();
+      await applyPrimaryEvidenceSettings();
       executionTools.sync();
       // Issue #26: Save replans same-process timers immediately — future-only
       // sampling restarts from the next minute boundary against the saved

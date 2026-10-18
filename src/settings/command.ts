@@ -8,6 +8,7 @@ import {
   cloneScheduledTaskCatalog,
   cloneExternalAgentCatalog,
   effectiveReviewSettings,
+  effectiveReviewEvidenceSettings,
   externalAgentCatalog,
   externalAgentSupportsReview,
   resolvedWorkerCatalog,
@@ -189,6 +190,7 @@ async function runSettingsMenu(
   let primaryEnabled = effectiveReview.primaryEnabled;
   let subtaskEnabled = effectiveReview.subtaskEnabled;
   let reviewLandedChanges = effectiveReview.reviewLandedChanges;
+  let evidence = effectiveReviewEvidenceSettings(input.config);
   let reviewerTimeoutMs = input.config.reviewerTimeoutMs;
   let executorTimeoutMs = input.config.executorTimeoutMs;
   let maxCorrectionCycles = input.config.maxCorrectionCycles;
@@ -382,6 +384,7 @@ async function runSettingsMenu(
     primaryEnabled,
     subtaskEnabled,
     reviewLandedChanges,
+    evidence,
     reviewerTimeoutMs,
     executorTimeoutMs,
     maxCorrectionCycles,
@@ -415,7 +418,7 @@ async function runSettingsMenu(
   let rootLastKey: string | undefined = initialSection === "scheduled" ? "scheduled" : undefined;
   while (true) {
     draftConfig.execution = { ...draftConfig.execution, workerResources, routes: { execute: executeRoute, research: researchRoute } };
-    draftConfig.review = { ...draftConfig.review, primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges };
+    draftConfig.review = { ...draftConfig.review, primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges, evidence };
     draftConfig.scheduledTasks = scheduledTasks;
     const agents = externalAgentCatalog(draftConfig);
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
@@ -559,8 +562,9 @@ async function runSettingsMenu(
       continue;
     }
     if (choice === "reviewers") {
-      ({ primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges } =
-        await selectReviewSection(input.ui, { primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges }, agents, input.scoped));
+      const review = await selectReviewSection(input.ui, { primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges, evidence }, agents, input.scoped);
+      ({ primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges } = review);
+      evidence = review.evidence ?? evidence;
       continue;
     }
     if (choice === "timeouts") {

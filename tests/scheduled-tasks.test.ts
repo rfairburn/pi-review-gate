@@ -809,48 +809,83 @@ test("/review-settings toggles one-shot mode and the already-run state with expl
   assert.equal(saved.scheduledTasks["task-abcdef12"].oneShot, undefined);
 });
 
-test("/review-settings persists a task-local review Off without touching global review state", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-review-scheduled-menu-review-"));
-  const configPath = join(dir, "review-gate.json");
-  const review = { primaryReviewers: [], subtaskReviewers: [], primaryEnabled: true, subtaskEnabled: true, reviewLandedChanges: false };
-  await writeFile(configPath, JSON.stringify({
-    enabled: true,
-    review,
-    scheduledTasks: {
-      "task-abcdef12": {
-        name: "Unreviewed sync",
-        cron: "0 3 * * *",
+for (const evidenceCase of ["omitted defaults", "nondefault choices"] as const) {
+  test(`/review-settings persists a task-local review Off without touching global review state (${evidenceCase})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-review-scheduled-menu-review-"));
+    try {
+      const configPath = join(dir, "review-gate.json");
+      const evidence = evidenceCase === "omitted defaults" ? undefined : {
+        primaryToolOnly: true,
+        worktreeToolOnly: false,
+        inplaceToolOnly: true,
+        snapshotFailureFallback: true,
+      };
+      const review = {
+        primaryReviewers: [{ source: "external", id: "review-primary" }],
+        subtaskReviewers: [{ source: "external", id: "review-subtask" }],
+        primaryEnabled: true,
+        subtaskEnabled: true,
+        reviewLandedChanges: true,
+        ...(evidence ? { evidence } : {}),
+      };
+      await writeFile(configPath, JSON.stringify({
         enabled: true,
-        kind: "execute",
-        instructions: "Sync",
-        workspace: dir,
-      },
-    },
-  }), "utf8");
-  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
-  const registered = commandHarness();
-  registerReviewSettings({ pi: registered.pi, config, configPath });
+        review,
+        externalAgents: {
+          "review-primary": { adapter: "generic-cli", command: process.execPath, review: {} },
+          "review-subtask": { adapter: "generic-cli", command: process.execPath, review: {} },
+        },
+        scheduledTasks: {
+          "task-abcdef12": {
+            name: "Unreviewed sync",
+            cron: "0 3 * * *",
+            enabled: true,
+            kind: "execute",
+            instructions: "Sync",
+            workspace: dir,
+          },
+        },
+      }), "utf8");
+      const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+      assert.deepEqual(config.review?.evidence, evidence, "loading alone does not materialize omitted defaults");
+      const registered = commandHarness();
+      registerReviewSettings({ pi: registered.pi, config, configPath });
 
-  await registered.handler("", contextWithSelections([
-    rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
-    "1. Unreviewed sync — 0 3 * * * — execute — enabled",
-    scheduledEditorRow("Review", "Inherit global subtask review"),
-    "Off — run this task's subtasks without review",
-    "Back",
-    "Back",
-    "Save changes",
-  ]));
+      const context = contextWithSelections([
+        rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
+        "1. Unreviewed sync — 0 3 * * * — execute — enabled",
+        scheduledEditorRow("Review", "Inherit global subtask review"),
+        "Off — run this task's subtasks without review",
+        "Back",
+        "Back",
+        "Save changes",
+      ]) as { ui: { notify(message: string, kind: string): void } };
+      // Surface an unexpected validation failure rather than silently looping
+      // on the synthetic selector's exhausted input queue.
+      context.ui.notify = (message, kind) => { if (kind === "error") assert.fail(message); };
+      await registered.handler("", context);
 
-  const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.scheduledTasks["task-abcdef12"].review, { mode: "off" });
-  // Global/parent review state is byte-for-byte unchanged.
-  assert.deepEqual(saved.review, review);
-  // The in-memory config replacement carried the same task-local choice.
-  assert.equal(config.scheduledTasks!["task-abcdef12"]!.review!.mode, "off");
-  // normalizeConfig keeps the legacy import key as an explicit undefined slot
-  // on the in-memory record; the persisted file omits it entirely.
-  assert.deepEqual((config as unknown as { review: unknown }).review, { ...review, activeReviewers: undefined });
-});
+      const saved = JSON.parse(await readFile(configPath, "utf8"));
+      assert.deepEqual(saved.scheduledTasks["task-abcdef12"].review, { mode: "off" });
+      // Root Save materializes the four known evidence defaults in one canonical
+      // object. With explicit choices, the entire global review record is unchanged.
+      const expectedReview = { ...review, evidence: evidence ?? {
+        primaryToolOnly: false,
+        worktreeToolOnly: false,
+        inplaceToolOnly: false,
+        snapshotFailureFallback: false,
+      } };
+      assert.deepEqual(saved.review, expectedReview);
+      assert.equal(JSON.stringify(saved.review), JSON.stringify(expectedReview));
+      // The in-memory replacement carries the same task-local choice without
+      // coupling it to global reviewers, enablement, methods, or fallback.
+      assert.equal(config.scheduledTasks!["task-abcdef12"]!.review!.mode, "off");
+      // normalizeConfig keeps the legacy import key as an explicit undefined slot
+      // on the in-memory record; the persisted file omits it entirely.
+      assert.deepEqual(config.review, { ...expectedReview, activeReviewers: undefined });
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+}
 
 test("/review-settings rejects an incomplete scheduled task at Save and keeps editing", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-scheduled-menu-invalid-"));

@@ -5,6 +5,7 @@ import { promises as fs } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { WaveCaptureResult } from "./wave-repository";
+import { ReviewEvidenceCaptureFailure } from "../review-evidence";
 import { GIT_NO_LOCKS_ENV as GIT_ENV, validateSafeId } from "./wave-validation";
 
 // ── review patch types ───────────────────────────────────────────────────────
@@ -944,7 +945,17 @@ export async function buildCandidateReviewPatch(
   const rawPaths = await gitOutBuffer(
     ["diff", "--name-only", "-z", "--no-renames", baseCommit, candidateCommit],
     repoPath,
-  );
+  ).catch((error: unknown) => {
+    // Only the diff acquisition is eligible, never the parent validation
+    // above (or candidate/alias verification at the caller). Signals and
+    // unknown programming errors retain their ordinary blocking semantics.
+    if (error instanceof Error && "code" in error
+      && ["ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "ENOBUFS"].includes(String(error.code))
+      && !("signal" in error && error.signal)) {
+      throw new ReviewEvidenceCaptureFailure("Isolated worktree review-evidence path acquisition failed.");
+    }
+    throw error;
+  });
   const changedPaths = rawPaths
     .split("\0")
     .filter(Boolean)
@@ -1063,6 +1074,9 @@ export async function collectGitDiffBounded(
       if (settled) return;
       settled = true;
       if (code !== 0 || signal) {
+        // A nonzero Git exit alone cannot distinguish an acquisition problem
+        // from missing/corrupt candidate objects. Keep unknown/integrity and
+        // signal failures blocking rather than guessing fallback eligibility.
         reject(new Error(`git ${args.join(" ")} exited with code ${code} signal ${signal}`));
       } else {
         const patch = chunks.length > 0 ? Buffer.concat(chunks).toString("utf8") : "";

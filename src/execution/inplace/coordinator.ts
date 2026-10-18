@@ -4,7 +4,9 @@ import { join, resolve } from "node:path";
 import { executorAgentFingerprint, executorSelectionKey, resolveReviewers, type ReviewGateConfig } from "../../config";
 import { runReview, type ReviewRunOutput } from "../../review";
 import { hasPartialReviewerFailure } from "../../review-report";
-import { rememberFinalAssistantSummaryText } from "../../evidence";
+import { rememberFinalAssistantSummaryText, recordReviewEvidenceNote } from "../../evidence";
+import { ReviewEvidenceCaptureFailure, evidenceMethodNotice, TOOL_ONLY_HISTORY_NOTICE, type ReviewEvidenceMethod } from "../../review-evidence";
+import { normalizeWorkerReviewEvidencePolicy } from "../review-evidence-policy";
 import type { ExecutorPoolAssignment } from "../executor-pool";
 import { readOperationRecord } from "../operation-record";
 import type { ExecutorSession, SubtaskProgressUpdate } from "../types";
@@ -18,17 +20,21 @@ import {
 import {
   computeInPlaceAttribution,
   createInPlaceBaseline,
+  createInPlaceToolBasis,
+  inPlaceToolIdentity,
   inPlaceDeltaIdentity,
+  type InPlaceBaseline,
+  type InPlaceBasis,
   type InPlaceAttribution,
 } from "./basis";
-import { INPLACE_BASELINE_FILE, loadInPlaceBaseline, persistInPlaceBaseline } from "./baseline-store";
+import { INPLACE_BASELINE_FILE, loadInPlaceBasis, persistInPlaceBasis, loadInPlaceBaseline, persistInPlaceBaseline } from "./baseline-store";
 import type { InPlaceLifecycleInput, InPlaceLifecycleResult, InPlaceLifecycleStatus, InPlaceReviewCycle, InPlaceWorkerResult } from "./contracts";
 import { ensureArtifactDir } from "./containment";
 import { runInplaceTurnWorker } from "./adapter-workflow";
-import { persistInPlaceObservedEvidence, restoreInPlaceObservedEvidence } from "./observed-evidence";
+import { OBSERVED_TOOL_EVIDENCE_FILE, persistObservedToolEvidence, restoreObservedToolEvidence } from "../observed-evidence";
 import { buildInPlaceReviewRequest } from "./prompts";
 import { buildInPlaceReviewCycleRecord, nextInPlaceReviewCycle, persistInPlaceReviewCycleRecord } from "./review-records";
-import { settleInPlace } from "./settlement";
+import { settleInPlace as settleResult } from "./settlement";
 
 function reportLifecycleProgress(input: InPlaceLifecycleInput, update: Omit<SubtaskProgressUpdate, "subtaskId">): void {
   input.onUpdate?.({ subtaskId: input.taskId, ...update });
@@ -125,14 +131,46 @@ async function recoverInPlaceContinuationContext(input: {
  */
 export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise<InPlaceLifecycleResult> {
   const { taskId, task, workspaceRoot, config, scopedModels, signal } = input;
+  signal?.throwIfAborted();
+  if (!(await stat(workspaceRoot)).isDirectory()) throw new Error("InPlace workspace root is not a directory.");
   const resolvedArtifactDir = await ensureArtifactDir(input.artifactDir, workspaceRoot);
+  const evidencePolicy = { ...normalizeWorkerReviewEvidencePolicy(task.reviewEvidencePolicy, "inplace") };
+  const { window } = createWorkerReviewState();
+  let method: ReviewEvidenceMethod = evidencePolicy.toolOnly ? "tool-only" : "snapshot";
+  let coverageNotice: string | undefined;
+  let launchFallback = false;
+  let capturedFreshBasis = false;
+  const warnFallback = async () => {
+    const warning = `WARNING: InPlace snapshot-failure fallback. ${evidenceMethodNotice("tool-only-fallback")}`;
+    recordReviewEvidenceNote(window.evidence, warning);
+    await persistObservedToolEvidence(window.evidence, resolvedArtifactDir);
+    reportLifecycleProgress(input, { phase: "reviewing", message: warning, artifactDir: resolvedArtifactDir });
+    await input.onEvidenceWarning?.(warning);
+  };
+  const captureBasis = async (): Promise<InPlaceBasis> => {
+    signal?.throwIfAborted();
+    capturedFreshBasis = true;
+    if (evidencePolicy.toolOnly) return createInPlaceToolBasis(workspaceRoot);
+    try { return await createInPlaceBaseline(workspaceRoot, config, signal); }
+    catch (error) {
+      if (!(error instanceof ReviewEvidenceCaptureFailure) || !evidencePolicy.snapshotFailureFallback || signal?.aborted) throw error;
+      method = "tool-only-fallback";
+      launchFallback = true;
+      return createInPlaceToolBasis(workspaceRoot, true);
+    }
+  };
+  const settleInPlace = async (settleInput: InPlaceLifecycleInput, result: InPlaceLifecycleResult) => settleResult(settleInput, {
+    ...result, evidenceMethod: method, evidenceCoverageNotice: coverageNotice,
+  });
 
   // Fail fast on an invalid subtask selection before any baseline is captured.
   try {
     freezeReviewers(config, scopedModels ?? []);
   } catch (error) {
-    const blockedBaseline = await createInPlaceBaseline(workspaceRoot, config, signal);
-    await persistInPlaceBaseline(blockedBaseline, taskId, resolvedArtifactDir);
+    const blockedBaseline = await captureBasis();
+    await persistInPlaceBasis(blockedBaseline, taskId, resolvedArtifactDir);
+    if (launchFallback) await warnFallback();
+    else if (blockedBaseline.mode === "tool") await persistObservedToolEvidence(window.evidence, resolvedArtifactDir);
     return await settleInPlace(input, {
       status: "reviewer_blocked",
       taskId,
@@ -176,10 +214,10 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
       assignment: input.executorAssignment,
     });
   }
-  const restoredBaseline = input.baseline ?? (
+  const restoredBaseline = (!input.continuation ? input.baseline : undefined) ?? (
     input.continuation
       ? (input.initialResult || recoveredContinuation?.hadPriorExecution
-        ? await loadInPlaceBaseline(taskId, resolvedArtifactDir, workspaceRoot)
+        ? await loadInPlaceBasis(taskId, resolvedArtifactDir, workspaceRoot)
         : await (async () => {
           let retained: "absent" | "present";
           try {
@@ -190,22 +228,57 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
             retained = "absent";
           }
-          if (retained === "present") return await loadInPlaceBaseline(taskId, resolvedArtifactDir, workspaceRoot);
-          const captured = await createInPlaceBaseline(workspaceRoot, config, signal);
-          await persistInPlaceBaseline(captured, taskId, resolvedArtifactDir);
+          if (retained === "present") return await loadInPlaceBasis(taskId, resolvedArtifactDir, workspaceRoot);
+          // Retained evidence is not a substitute for its missing launch basis,
+          // even when no operation/result context survived to prove prior turns.
+          let retainedEvidence = false;
+          try { await stat(join(resolvedArtifactDir, OBSERVED_TOOL_EVIDENCE_FILE)); retainedEvidence = true; }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+          if (retainedEvidence) throw new Error("In-place continuation refused: persisted launch basis is missing while task evidence remains.");
+          const captured = await captureBasis();
+          await persistInPlaceBasis(captured, taskId, resolvedArtifactDir);
           return captured;
         })())
       : await (async () => {
-        const captured = await createInPlaceBaseline(workspaceRoot, config, signal);
-        await persistInPlaceBaseline(captured, taskId, resolvedArtifactDir);
+        const captured = await captureBasis();
+        await persistInPlaceBasis(captured, taskId, resolvedArtifactDir);
         return captured;
       })()
   );
   const baseline = restoredBaseline;
   // The review window exists from the very first turn so corrections, steering
   // evidence, and pass observation share one serial state like execute runs.
-  const { window } = createWorkerReviewState();
-  await restoreInPlaceObservedEvidence(window.evidence, resolvedArtifactDir, workspaceRoot);
+  const retainedEvidenceExpected = input.initialResult !== undefined || recoveredContinuation?.hadPriorExecution === true
+    || Boolean(input.continuation && !capturedFreshBasis);
+  await restoreObservedToolEvidence(window.evidence, resolvedArtifactDir, workspaceRoot, {
+    required: retainedEvidenceExpected && (
+      evidencePolicy.toolOnly || evidencePolicy.snapshotFailureFallback || baseline.mode === "tool"
+    ),
+  });
+  if (resolve(baseline.workspaceRoot) !== resolve(workspaceRoot)) throw new Error("InPlace evidence basis root mismatch.");
+  if (launchFallback) await warnFallback();
+  if (evidencePolicy.toolOnly || baseline.mode === "tool") {
+    recordReviewEvidenceNote(window.evidence, `InPlace: ${evidenceMethodNotice(method)}`);
+    await persistObservedToolEvidence(window.evidence, resolvedArtifactDir);
+  }
+  let snapshotBasis: InPlaceBaseline | undefined = baseline.mode === "tool" ? undefined : baseline;
+  if (baseline.mode === "tool" && !evidencePolicy.toolOnly) {
+    try {
+      await stat(join(resolvedArtifactDir, "snapshot-recovery", INPLACE_BASELINE_FILE));
+      snapshotBasis = await loadInPlaceBaseline(taskId, join(resolvedArtifactDir, "snapshot-recovery"), workspaceRoot);
+      if (!snapshotBasis.toolOnlyHistory) throw new Error("InPlace recovery basis lacks earlier tool-history disclosure.");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (window.evidence.reviewEvidenceNotes?.includes(TOOL_ONLY_HISTORY_NOTICE)) {
+        throw new Error("InPlace recovery snapshot basis is missing; refusing to re-baseline prior work.");
+      }
+    }
+  }
+  if (snapshotBasis?.toolOnlyHistory) {
+    // A subsequent-work snapshot cannot close the earlier tool-only interval,
+    // including an interval whose adapter supplied no structured observations.
+    window.evidence.requiresReview = true;
+  }
   let effectiveAssignment = input.executorAssignment;
   type InPlaceTurnInput = Omit<Parameters<typeof runInplaceTurnWorker>[0], "executorAssignment" | "evidence" | "baseline">;
   const runTurn = async (turnInput: InPlaceTurnInput): Promise<InPlaceWorkerResult> => {
@@ -232,7 +305,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
       }
       return result;
     } finally {
-      await persistInPlaceObservedEvidence(window.evidence, resolvedArtifactDir);
+      await persistObservedToolEvidence(window.evidence, resolvedArtifactDir);
     }
   };
 
@@ -496,7 +569,41 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
   const reviewCycles: InPlaceReviewCycle[] = [];
   let nextReviewCycle = await nextInPlaceReviewCycle(resolvedArtifactDir);
   let correctionCount = 0;
-  const baselineFor = async (): Promise<InPlaceAttribution> => await computeInPlaceAttribution(baseline, config, signal);
+  let acquisitionFailure: ReviewEvidenceCaptureFailure | undefined;
+  const toolAttribution = (): InPlaceAttribution => ({ baseline, changes: [], evidenceMethod: method,
+    evidenceCoverageNotice: coverageNotice, toolIdentity: inPlaceToolIdentity(window.evidence) });
+  const baselineFor = async (): Promise<InPlaceAttribution> => {
+    acquisitionFailure = undefined;
+    signal?.throwIfAborted();
+    if (evidencePolicy.toolOnly) { method = "tool-only"; return toolAttribution(); }
+    try {
+      if (!snapshotBasis) {
+        const recovered = await createInPlaceBaseline(workspaceRoot, config, signal);
+        recovered.toolOnlyHistory = true;
+        // Required publication is outside the acquisition-only fallback boundary below.
+        snapshotBasis = recovered;
+      } else {
+        const captured = await computeInPlaceAttribution(snapshotBasis, config, signal);
+        method = "snapshot";
+        coverageNotice = snapshotBasis.toolOnlyHistory ? TOOL_ONLY_HISTORY_NOTICE : undefined;
+        return { ...captured, evidenceMethod: method, evidenceCoverageNotice: coverageNotice };
+      }
+    } catch (error) {
+      if (!(error instanceof ReviewEvidenceCaptureFailure) || !evidencePolicy.snapshotFailureFallback || signal?.aborted) throw error;
+      acquisitionFailure = error;
+      method = "tool-only-fallback";
+      coverageNotice = baseline.mode === "tool" ? TOOL_ONLY_HISTORY_NOTICE : undefined;
+      await warnFallback();
+      return toolAttribution();
+    }
+    await persistInPlaceBaseline(snapshotBasis!, taskId, join(resolvedArtifactDir, "snapshot-recovery"));
+    coverageNotice = TOOL_ONLY_HISTORY_NOTICE;
+    window.evidence.requiresReview = true;
+    recordReviewEvidenceNote(window.evidence, coverageNotice);
+    await persistObservedToolEvidence(window.evidence, resolvedArtifactDir);
+    method = "tool-only"; // The just-captured state is only the NEXT interval's baseline.
+    return toolAttribution();
+  };
 
   // Attribution so far; refreshed after every executor turn.
   let attribution = await baselineFor();
@@ -556,7 +663,8 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
 
     const changedPaths = attribution.changes.map((change) => ({ status: change.status, path: change.path }));
     const currentDeltaIdentity = inPlaceDeltaIdentity(attribution);
-    if (changedPaths.length === 0 && !window.evidence.requiresReview) {
+    if (method === "snapshot" && correctionCount === 0 && changedPaths.length === 0 && !window.evidence.requiresReview
+      && !snapshotBasis?.toolOnlyHistory && baseline.mode !== "tool") {
       return await settleInPlace(input, {
         status: "no_changes",
         taskId,
@@ -645,7 +753,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
     const reviewerLabels = resolveReviewers(frozen.frozenConfig).reviewers.map(reviewerProgressLabel);
     reportLifecycleProgress(input, {
       phase: "reviewing",
-      message: `review cycle ${reviewCycle} over the recorded workspace delta`,
+      message: `review cycle ${reviewCycle} over ${method === "snapshot" ? "the recorded workspace delta" : "retained observed-tool evidence"}`,
       artifactDir: resolvedArtifactDir,
       reviewCycle,
       reviewers: reviewerLabels,
@@ -676,13 +784,27 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
       }),
     });
 
+    // The worker owns method selection/acquisition; the shared reviewer must
+    // consume that exact basis, never a stale kind from an earlier fallback.
+    window.baseline = attribution.snapshotAfter && attribution.baseline.snapshot
+      ? { kind: "snapshot", snapshot: attribution.baseline.snapshot }
+      : baseline.snapshot ? { kind: "snapshot", snapshot: baseline.snapshot }
+        : { kind: "tool", cwd: workspaceRoot, capturedAt: baseline.capturedAt };
     let reviewOutput: ReviewRunOutput;
     try {
       reviewOutput = await runCandidateReviewWithRecovery(
         () => runReview({
           cwd: workspaceRoot,
           request: buildInPlaceReviewRequest(task, attribution, window.evidence),
-          before: baseline.snapshot,
+          before: attribution.snapshotAfter && attribution.baseline.snapshot
+            ? attribution.baseline.snapshot
+            : baseline.snapshot ?? { kind: "tool", cwd: workspaceRoot, capturedAt: baseline.capturedAt },
+          evidencePolicy: method === "tool-only" ? { ...evidencePolicy, toolOnly: true } : evidencePolicy,
+          evidenceCaptureFailure: acquisitionFailure,
+          ...(attribution.snapshotAfter && attribution.baseline.snapshot ? { preparedSnapshots: {
+            before: attribution.baseline.snapshot, after: attribution.snapshotAfter,
+            toolOnlyHistory: attribution.baseline.toolOnlyHistory,
+          } } : {}),
           config: frozen.frozenConfig,
           evidence: window.evidence,
           window,
@@ -704,6 +826,9 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         config,
         reviewSignal,
       );
+      if (coverageNotice && !reviewOutput.evidenceCoverageNotice?.includes(coverageNotice)) {
+        reviewOutput.evidenceCoverageNotice = [reviewOutput.evidenceCoverageNotice, coverageNotice].filter(Boolean).join(" ");
+      }
     } catch (error) {
       if (reviewSteering.length > 0 && !signal?.aborted) {
         reviewOutput = {
@@ -824,6 +949,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
     const cycle: InPlaceReviewCycle = {
       cycle: reviewCycle,
       externalObservationRevision: window.evidence.externalObservationRevision ?? 0,
+      toolObservationRevision: window.evidence.toolObservationRevision ?? 0,
       verdict,
       reviewOutput,
       changedSinceLaunch: attribution.changes,
@@ -838,6 +964,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         reviewSequence: reviewOutput.reviewSequence ?? reviewCycle,
         attribution,
         deltaIdentitySha256: createHash("sha256").update(currentDeltaIdentity).digest("hex"),
+        toolObservationRevision: window.evidence.toolObservationRevision ?? 0,
         reviewOutput,
       }));
     } catch (error) {
@@ -904,12 +1031,15 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
       }
       const priorCycle = reviewCycles[reviewCycles.length - 2];
       if (priorCycle?.identity === currentDeltaIdentity
-        && (priorCycle.externalObservationRevision ?? 0) === (window.evidence.externalObservationRevision ?? 0)) {
+        && (priorCycle.externalObservationRevision ?? 0) === (window.evidence.externalObservationRevision ?? 0)
+        && (priorCycle.toolObservationRevision ?? 0) === (window.evidence.toolObservationRevision ?? 0)) {
         return await settleInPlace(input, {
           status: "correction_cap",
           taskId,
           title: task.title,
-          summary: "No progress: the recorded workspace delta is unchanged after correction.",
+          summary: method === "snapshot"
+            ? "No progress: the recorded workspace delta is unchanged after correction."
+            : "No progress: retained tool evidence has no new observed scope after correction.",
           adapter: currentResult.adapter,
           model: currentResult.model,
           error: "No progress detected.",
@@ -995,7 +1125,9 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
     // ── pass: transmit for observation, resume once (mirrors execute) ──
     reportLifecycleProgress(input, {
       phase: "confirming",
-      message: "review passed — confirming the workspace delta is unchanged",
+      message: method === "snapshot"
+        ? "review passed — confirming the workspace delta is unchanged"
+        : "review passed — confirming no new observed evidence",
       artifactDir: resolvedArtifactDir,
     });
     if (signal?.aborted) {
@@ -1019,6 +1151,8 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
     }
     const passedDeltaIdentity = currentDeltaIdentity;
     const passedExternalRevision = window.evidence.externalObservationRevision ?? 0;
+    const passedToolRevision = window.evidence.toolObservationRevision ?? 0;
+    const passedMethod = method;
     const passedObservationsTruncated = window.evidence.toolObservationsTruncated === true;
     const passFeedback = await buildReviewTransmission(
       reviewOutput,
@@ -1075,9 +1209,12 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         session: confirmed.session,
       });
     }
-    const confirmAttribution = await baselineFor();
+    // Confirm against the actual reviewed method; unrelated filesystem writers
+    // cannot turn a tool-only pass response into another snapshot review.
+    const confirmAttribution = passedMethod === "snapshot" ? await baselineFor() : toolAttribution();
     if (inPlaceDeltaIdentity(confirmAttribution) === passedDeltaIdentity
       && (window.evidence.externalObservationRevision ?? 0) === passedExternalRevision
+      && (passedMethod === "snapshot" || (window.evidence.toolObservationRevision ?? 0) === passedToolRevision)
       && (window.evidence.toolObservationsTruncated === true) === passedObservationsTruncated) {
       // The pass is tied to the exact reviewed workspace delta and the same
       // bounded external-observation state; neither new root changes nor new
@@ -1107,9 +1244,11 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         status: "reviewed",
         taskId,
         title: task.title,
-        summary: withWarnings
-          ? `${confirmed.summary}\n\nReview passed with reviewer infrastructure warnings. The reviewed workspace delta is unchanged since the passed review; the changes remain in place.`
-          : `${confirmed.summary}\n\nReview passed and the reviewed workspace delta is unchanged since the passed review; the changes remain in place.`,
+        summary: passedMethod === "snapshot"
+          ? withWarnings
+            ? `${confirmed.summary}\n\nReview passed with reviewer infrastructure warnings. The reviewed workspace delta is unchanged since the passed review; the changes remain in place.`
+            : `${confirmed.summary}\n\nReview passed and the reviewed workspace delta is unchanged since the passed review; the changes remain in place.`
+          : `${confirmed.summary}\n\nInPlace review passed${withWarnings ? " with reviewer infrastructure warnings" : ""} on retained tool evidence; no new observed mutation or unknown scope was recorded during confirmation. This is not exact-snapshot certification; writes remain in place.`,
         adapter: confirmed.adapter,
         model: confirmed.model,
         usage: confirmed.usage,
@@ -1127,7 +1266,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
     // new delta must be reviewed (the review verdict is post-hoc; the writes
     // that produced this new delta were already performed either way).
     currentResult = confirmed;
-    attribution = confirmAttribution;
+    attribution = passedMethod === "snapshot" ? confirmAttribution : await baselineFor();
     continue;
   }
 }

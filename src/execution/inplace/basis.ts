@@ -4,12 +4,13 @@ import { promisify } from "node:util";
 import { resolve } from "node:path";
 import {
   compareSnapshots,
-  createWorkspaceSnapshot,
   type ChangedFile,
   type FileSnapshot,
   type WorkspaceSnapshot,
 } from "../../capture";
 import type { ReviewGateConfig } from "../../config";
+import type { EvidenceState } from "../../evidence";
+import { acquireReviewWorkspaceSnapshot, type ReviewEvidenceMethod } from "../../review-evidence";
 
 // ── launch-time baseline and attribution ─────────────────────────────────────
 
@@ -28,6 +29,43 @@ export interface InPlaceBaseline {
   /** Git only: repository top level, which may contain the workspace root as a subdirectory. */
   gitRepositoryRoot?: string;
   snapshot: WorkspaceSnapshot;
+  /** A recovery snapshot covers subsequent work only. */
+  toolOnlyHistory?: boolean;
+}
+
+/** A genuine durable method basis: no workspace enumeration or synthetic snapshot. */
+export interface InPlaceToolBasis {
+  workspaceRoot: string;
+  mode: "tool";
+  capturedAt: string;
+  fallback?: boolean;
+  snapshot?: never;
+  gitHead?: never;
+  gitRepositoryRoot?: never;
+}
+export type InPlaceBasis = InPlaceBaseline | InPlaceToolBasis;
+
+export function createInPlaceToolBasis(workspaceRoot: string, fallback = false): InPlaceToolBasis {
+  return { workspaceRoot: resolve(workspaceRoot), mode: "tool", capturedAt: new Date().toISOString(), ...(fallback ? { fallback: true } : {}) };
+}
+
+/** Retained calls with possible effects/unknown scope matter even without lexical paths.
+ * Known read-only observations alone do not create a new work identity. */
+export function inPlaceObservedWorkIdentity(evidence: EvidenceState): string {
+  const readOnly = new Set(["read", "Read", "ls", "find", "grep", "Grep", "Glob", "WebSearch", "WebFetch", "GitRead"]);
+  const events = evidence.events.filter((event) => !readOnly.has(event.toolName)
+    || event.candidatePaths.length > 0 || event.riskSignals.length > 0);
+  return createHash("sha256").update(JSON.stringify(events)).digest("hex");
+}
+
+export function inPlaceToolIdentity(evidence: EvidenceState): string {
+  // Revisions advance before the bounded event ledger fills, including unknown scope.
+  return JSON.stringify([evidence.toolObservationRevision ?? 0, evidence.externalObservationRevision ?? 0,
+    evidence.toolObservationsTruncated === true, inPlaceObservedWorkIdentity(evidence),
+    [...evidence.candidates.values()].map((candidate) => [candidate.absolutePath,
+      snapshotEntryId(candidate.afterSnapshot), candidate.afterContentTruncated === true, candidate.afterError ?? "",
+    ]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+  ]);
 }
 
 async function inPlaceGit(root: string, args: string[]): Promise<string | undefined> {
@@ -53,11 +91,7 @@ export async function createInPlaceBaseline(
 ): Promise<InPlaceBaseline> {
   const root = resolve(workspaceRoot);
   const gitTop = await inPlaceGit(root, ["rev-parse", "--show-toplevel"]);
-  const snapshot = await createWorkspaceSnapshot(root, {
-    maxFileBytes: config.maxFileBytes,
-    maxSnapshotBytes: config.maxSnapshotBytes,
-    signal,
-  });
+  const snapshot = await acquireReviewWorkspaceSnapshot(root, config, signal);
   if (gitTop === undefined) {
     return { workspaceRoot: root, mode: "non_git", capturedAt: new Date().toISOString(), snapshot };
   }
@@ -73,13 +107,16 @@ export async function createInPlaceBaseline(
 }
 
 export interface InPlaceAttribution {
-  baseline: InPlaceBaseline;
+  baseline: InPlaceBasis;
+  evidenceMethod?: ReviewEvidenceMethod;
+  evidenceCoverageNotice?: string;
+  toolIdentity?: string;
   /** Content delta between the launch snapshot and the current workspace. */
   changes: ChangedFile[];
   /** Git only: true when HEAD moved after launch (for example the worker created a commit). */
   gitHeadMoved?: boolean;
   gitCurrentHead?: string;
-  snapshotAfter: WorkspaceSnapshot;
+  snapshotAfter?: WorkspaceSnapshot;
 }
 
 /**
@@ -92,12 +129,7 @@ export async function computeInPlaceAttribution(
   config: ReviewGateConfig,
   signal?: AbortSignal,
 ): Promise<InPlaceAttribution> {
-  const snapshotAfter = await createWorkspaceSnapshot(baseline.workspaceRoot, {
-    maxFileBytes: config.maxFileBytes,
-    maxSnapshotBytes: config.maxSnapshotBytes,
-    reuseUnchangedFrom: baseline.snapshot,
-    signal,
-  });
+  const snapshotAfter = await acquireReviewWorkspaceSnapshot(baseline.workspaceRoot, config, signal, baseline.snapshot);
   const changes = compareSnapshots(baseline.snapshot, snapshotAfter);
   if (baseline.mode !== "git" || baseline.gitHead === undefined) {
     return { baseline, changes, snapshotAfter };
@@ -140,9 +172,12 @@ function snapshotEntryId(entry: FileSnapshot | undefined): string {
  * changes what was reviewed must never settle the task as reviewed.
  */
 export function inPlaceDeltaIdentity(attribution: InPlaceAttribution): string {
+  const before = attribution.baseline.snapshot;
+  const after = attribution.snapshotAfter;
+  if (!before || !after) return attribution.toolIdentity ?? "tool-unknown";
   const identity = attribution.changes.map((change) => {
-    const beforeId = snapshotEntryId(attribution.baseline.snapshot.files.get(change.path));
-    const afterId = snapshotEntryId(attribution.snapshotAfter.files.get(change.path));
+    const beforeId = snapshotEntryId(before.files.get(change.path));
+    const afterId = snapshotEntryId(after.files.get(change.path));
     return `${change.status}:${change.path}:${beforeId}=>${afterId}`;
   }).sort();
   return identity.join("|");

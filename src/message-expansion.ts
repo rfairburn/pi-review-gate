@@ -125,6 +125,7 @@ import { visibleTerminalText } from "./tool-result-text";
 import { BACKGROUND_TASK_STATES, type BackgroundTaskKind } from "./execution/task-state";
 import { TRUNCATION_MARKER, subtaskSuccessVerb } from "./execution/subtask-notifications";
 import { isRecord } from "./record-guard";
+import { isWorkerReviewEvidenceWarning } from "./execution/review-evidence-warning";
 
 // ── Structural host types ────────────────────────────────────────────────────
 
@@ -968,6 +969,12 @@ export function renderSubtaskEventCollapsed(
     if (reportLine) lines.push(rendererTheme.fg("customMessageText", visibleTerminalText(reportLine.trim())));
     else if (landedLine) lines.push(rendererTheme.fg("customMessageText", visibleTerminalText(landedLine.trim())));
 
+    // Actual-use worker evidence warnings must remain prominent in the
+    // collapsed success card too, not disappear behind expansion.
+    for (const warning of content.split(/\r?\n/).filter(isWorkerReviewEvidenceWarning)) {
+      lines.push(rendererTheme.fg("warning", visibleTerminalText(warning)));
+    }
+
     // Immediate actionable failure/conflict/recovery detail, from the curated
     // diagnostic when present (bounded by construction upstream). The notice and
     // EVERY recovery instruction stay visible alongside the error — the producer
@@ -975,6 +982,8 @@ export function renderSubtaskEventCollapsed(
     if (isFailure && diagnostic) {
       const error = typeof diagnostic.error === "string" ? diagnostic.error : undefined;
       const notice = typeof diagnostic.message === "string" ? diagnostic.message : undefined;
+      const summary = typeof diagnostic.summary === "string" ? diagnostic.summary : undefined;
+      if (summary && isWorkerReviewEvidenceWarning(summary)) lines.push(rendererTheme.fg("warning", visibleTerminalText(summary)));
       const recovery = isRecord(diagnostic.recovery) ? diagnostic.recovery : undefined;
       const conflictGate = recovery && isRecord(recovery.conflictGate) ? recovery.conflictGate : undefined;
       if (error) lines.push(rendererTheme.fg("error", `Error: ${visibleTerminalText(error)}`));

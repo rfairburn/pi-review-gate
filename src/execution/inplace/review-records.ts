@@ -13,13 +13,15 @@ export interface InPlaceReviewCycleRecord {
   waveId: "inplace";
   cycle: number;
   reviewSequence: number;
+  /** Tool-observation identity, independent of the exact workspace delta identity. */
+  toolObservationRevision: number;
   completedAt: string;
   /** Identity marker: distinguishes in-place records from wave candidate records. */
   inPlace: true;
   attribution: {
     workspaceRoot: string;
     baseline: {
-      mode: "git" | "non_git";
+      mode: "git" | "non_git" | "tool";
       gitHead?: string;
       capturedAt: string;
     };
@@ -27,6 +29,8 @@ export interface InPlaceReviewCycleRecord {
     /** SHA-256 of the content-anchored delta identity that was under review. */
     deltaIdentitySha256: string;
   };
+  evidenceMethod?: import("../../review-evidence").ReviewEvidenceMethod;
+  evidenceCoverageNotice?: string;
   aggregate: import("../../review-report").ReviewAggregateDisposition;
   summary: string;
   reviewers: import("../../review-report").ReviewCycleRecord["reviewers"];
@@ -38,6 +42,7 @@ export function buildInPlaceReviewCycleRecord(input: {
   reviewSequence: number;
   attribution: InPlaceAttribution;
   deltaIdentitySha256: string;
+  toolObservationRevision: number;
   reviewOutput: ReviewRunOutput;
 }): InPlaceReviewCycleRecord {
   const gate = input.reviewOutput.result;
@@ -62,8 +67,11 @@ export function buildInPlaceReviewCycleRecord(input: {
     waveId: "inplace",
     cycle: input.cycle,
     reviewSequence: input.reviewSequence ?? input.cycle,
+    toolObservationRevision: input.toolObservationRevision,
     completedAt: new Date().toISOString(),
     inPlace: true,
+    evidenceMethod: input.reviewOutput.evidenceMethod ?? input.attribution.evidenceMethod ?? "snapshot",
+    evidenceCoverageNotice: input.reviewOutput.evidenceCoverageNotice ?? input.attribution.evidenceCoverageNotice,
     attribution: {
       workspaceRoot: input.attribution.baseline.workspaceRoot,
       baseline: {

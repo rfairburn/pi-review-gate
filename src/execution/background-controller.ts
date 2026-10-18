@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ExecutorPoolEntry, ReviewGateConfig, ScheduledTaskReviewOverride } from "../config";
 import {
+  effectiveReviewEvidenceSettings,
   resolvedWorkerResource,
   resolvedWorkerResources,
   resolvedWorkerRoute,
@@ -30,6 +31,7 @@ import {
   type PriorArchiveRecord,
 } from "./background-group-store";
 import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
+import { captureWorkerReviewEvidencePolicy } from "./review-evidence-policy";
 import { inspectOperation, readVerifiedAcceptedResult, verifyInPlaceContinuation, verifyRecoveryCheckpoint } from "./operation-actions";
 import type { OperationRecord, ReattachmentBundle } from "./operation-record";
 import { createReattachmentBundle, operationOwnershipStatus, operationRecordPath, readOperationRecord } from "./operation-record";
@@ -2145,6 +2147,7 @@ export class BackgroundExecutionController {
     workspace: string | undefined,
     options: ScheduledStartOptions | undefined,
   ): Promise<BackgroundInspection> {
+    const evidencePolicy = captureWorkerReviewEvidencePolicy(effectiveReviewEvidenceSettings(this.input.config), kind);
     const detachEpoch = this.detachEpoch;
     if (this.shuttingDown || this.detaching > 0) throw new Error("Application shutdown or controller detach is in progress.");
     // #25: resolve the execution target exactly once, before any durable
@@ -2214,7 +2217,7 @@ export class BackgroundExecutionController {
       createdAt: now,
       updatedAt: now,
       peakConcurrency: 0,
-      tasks: tasks.map((definition) => newTask(definition)),
+      tasks: tasks.map((definition) => newTask({ ...definition, reviewEvidencePolicy: { ...evidencePolicy } })),
       // Finding 15: truthful lifetime aggregates start here and grow with
       // admissions, independent of the bounded inline task window.
       totalTaskCount: tasks.length,
@@ -2369,11 +2372,12 @@ export class BackgroundExecutionController {
     options?: { launchNoticeGate?: Promise<void> },
   ): Promise<BackgroundInspection> {
     const group = this.resolveGroup(executionId);
+    const evidencePolicy = captureWorkerReviewEvidencePolicy(effectiveReviewEvidenceSettings(this.input.config), group.kind);
     // #25: SubtasksAdd inherits the group's selected target; only the parent
     // session identity is checked here.
     if (resolve(this.sessionCwdOf(group)) !== resolve(this.input.cwd())) throw new Error("Execution group belongs to a different workspace.");
     this.assertUnsettledAdmissionCapacity(group, tasks.length);
-    const created = tasks.map((definition) => newTask(definition));
+    const created = tasks.map((definition) => newTask({ ...definition, reviewEvidencePolicy: { ...evidencePolicy } }));
     group.tasks.push(...created);
     group.totalTaskCount = (group.totalTaskCount ?? group.tasks.length - created.length) + created.length;
     group.updatedAt = new Date().toISOString();

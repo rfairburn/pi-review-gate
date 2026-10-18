@@ -7,10 +7,12 @@ layout. Field defaults are owned by [Configuration](configuration.md).
 ## Review windows and evidence
 
 Each review window uses one stable temporary evidence bundle. Every completed agent run
-is appended as a numbered exchange containing its workspace diff, captured side-effect
-diff, tool calls and results, assistant summary, usage, and before/after artifacts.
-The bundle also maintains the cumulative baseline-to-current patch and numbered
-reviewer invocations.
+is appended as a numbered exchange with the evidence available under the selected
+method. By default this includes its workspace diff, captured side-effect diff, tool
+calls and results, assistant summary, usage, and before/after artifacts. The bundle
+also maintains the cumulative baseline-to-current patch where available and numbered
+reviewer invocations. Optional [tool-only evidence](#review-evidence-methods) changes
+the evidence basis, never reviewer selection or the requirement for a real verdict.
 
 If initialization of a newly allocated temporary bundle fails, all started setup
 operations (including nested artifact writes) settle before cleanup. The ownership
@@ -43,8 +45,8 @@ Custom runs receive no user-turn prompt-guidance injection. This extension's
 scheduled and wake messages retain their authoritative `message_start` attribution
 and fallback review arming on older hosts; their settlement semantics are unchanged.
 
-Parent review uses one durable checkpoint mechanism for Git and non-Git workspaces.
-Each settlement freezes one after-checkpoint. In a Git checkout, even when Pi starts in a
+Snapshot-based parent review uses one durable checkpoint mechanism for Git and non-Git
+workspaces. Each settlement freezes one after-checkpoint. In a Git checkout, even when Pi starts in a
 subdirectory, the parent checkpoint covers the enclosing repository: tracked changes
 and non-ignored untracked entries in sibling directories are included, and review
 changes and evidence paths within that repository are repository-relative. Pi and
@@ -139,21 +141,23 @@ checkpoint record files are also flushed, but a directory-handle fsync rejected
 with `EPERM` is best-effort: a power loss may lose a newly created directory entry.
 Restart verifies the surviving checkpoint rather than assuming it survived.
 
-Exact `write` / `edit` paths and easy shell targets are pre-captured before execution,
-including absolute paths outside the current worktree. Repository baselines,
+In snapshot mode, exact `write` / `edit` paths and easy shell targets are pre-captured
+before execution, including absolute paths outside the current worktree. Repository baselines,
 per-exchange snapshots, pre-captured outside-file baselines, user guidance, tool
 evidence, assistant summaries, and reviewer feedback belong to one review window.
 
-A requested correction keeps that window open. Even when a correction exactly restores
-the original baseline, the next reviewer sees the inverse exchange diff and validates
-the correction. A passing review is transmitted to the implementing model as a final
-review turn with every reviewer's official notes. The pass certifies the exact reviewed
-workspace snapshot. A response that does not change the workspace or create a meaningful
-persistent side effect checkpoints and closes the window while retaining it for an
-immediate `/ask-reviewer` follow-up. If the implementing model makes another change
-after seeing the passing observations, that response becomes a new exchange in the same
-window and triggers another review. Later ordinary work starts a fresh window from
-current file contents and does not re-review changes that already passed.
+A requested correction keeps that window open. In snapshot mode, even when a correction
+exactly restores the original baseline, the next reviewer sees the inverse exchange
+diff and validates the correction. A passing review is transmitted to the implementing
+model as a final review turn with every reviewer's official notes. The pass applies to
+the reviewed evidence basis: in snapshot mode, the exact reviewed workspace snapshot;
+tool-only review never claims full snapshot coverage. A response that does not introduce
+new changes under the selected evidence method closes the window at settlement while
+retaining it for an immediate `/ask-reviewer` follow-up. If the implementing model makes
+another reviewable change after seeing the passing observations, that response becomes
+a new exchange in the same window and triggers another review. Later ordinary work
+starts a fresh window under the selected method and does not re-review changes that
+already passed.
 
 At cutover, an active pre-checkpoint review window starts fresh with the existing
 workspace edits as its new baseline; no earlier verdict is migrated or represented as
@@ -161,6 +165,145 @@ a pass on the new window. If a new checkpoint is damaged or cannot be verified, 
 evidence is preserved and the user is notified. Review starts fresh from the current
 workspace as baseline rather than claiming that edits under the damaged checkpoint
 passed. A fresh baseline cannot retroactively certify those earlier edits.
+
+## Review evidence methods
+
+**Tools + workspace changes** remains the default for the independent **Primary /
+top-level**, **Isolated worktree**, and **InPlace** rows. Enter cycles to **Tools only**.
+The canonical `review.evidence.primaryToolOnly`, `worktreeToolOnly`, and `inplaceToolOnly`
+booleans remain `false` by default (`true` selects **Tools only**).
+“Workspace changes” means whole-workspace snapshot/diff review evidence. Both methods
+retain bounded tool calls/results, observed file content and per-file tool-observation
+diffs, task/assistant context, and reviewer read access. They do not disable review, change operating mode,
+select reviewers, or remove construction, checkpoint, and landing requirements.
+Tool-only omits only filesystem/Git review snapshotting, which can include outside-writer
+changes; bounded tool/path/content observations, targeted candidate capture, and reviewer
+read-only inspection remain available. It is not a sandbox or a prohibition on reading
+files. The [Evidence methods menu](settings.md#evidence-methods) owns staging and apply timing.
+
+Tool-only review follows supported observed calls, their retained content/results, and
+associated task context rather than treating every filesystem difference as an agent
+edit. For example, a supported tool edit to `SCRIPT` remains review evidence while an
+independent generator updates `REPORT`. The reviewer receives the retained `SCRIPT`
+content/tool evidence, not a claim that the worker authored every changed file. After
+a pass, independent `REPORT` additions alone do not retrigger tool-only review without
+new observed changes. A new observed edit still requires review; a summary alone is
+not proof of a change or a passing verdict.
+
+This is a narrower evidence basis, not perfect authorship or universal side-effect
+coverage. Adapter events can be missing, unsupported, bounded, or truncated;
+`run-as-binary` supplies no structured tool events. Missing or unavailable observations
+must not block review: present as much retained evidence as collected, disclose adapter
+and capture limits, and let the reviewer assess clearly provenance-labelled claims and
+context without promoting them to observations. Missing observations are not proof of
+clean work or no effects. Shell commands and observations are not a verified diff of
+every effect they may cause. Snapshot omissions and tool observation limits remain
+explicit, and a tool-only pass does not attest that unseen
+files, network/API effects, or concurrent writers were reviewed. InPlace review stays
+post-hoc: it cannot prevent or roll back writes or external effects.
+
+Applying Primary **Tools + workspace changes → Tools only** resets the current Primary
+evidence window with a prominent warning; the reset is not approval of earlier edits.
+**Tools only → Tools + workspace changes** retains accumulated
+evidence and takes a new snapshot baseline, so it does not reconstruct earlier
+snapshot coverage. Unchanged settings, other-scope edits, navigation, and Cancel do
+not reset Primary evidence. Workers capture the applicable evidence and fallback policy
+at firing/queue admission: each new task in `SubtasksStart` or `SubtasksAdd` captures the
+current live choice independently; scheduled tasks capture it at actual firing/admission,
+not schedule creation. Already queued and running tasks retain that policy through
+corrections, retries, and continuations. Later Add tasks capture the then-current live
+choice without reconfiguring in-flight tasks. This pins evidence policy only, not all
+routes or reviewer selections.
+
+### Snapshot-failure fallback
+
+`review.evidence.snapshotFailureFallback` is an independent opt-in, default **Off**.
+Off leaves snapshot capture failure blocking. On allows an eligible
+**review-evidence-only** snapshot capture failure to use retained current tool evidence
+instead, with a durable, truthfully labelled **Tools only (snapshot-failure fallback)** basis. It is allowed even on
+the **first Primary or InPlace review-baseline capture before work**: an absent initial
+snapshot is disclosed, not fabricated, and actual fallback records its tool-only basis
+durably. This is different from losing or corrupting a previously persisted basis.
+
+Every actual fallback emits a prominent warning identifying the originating context
+(Primary, isolated worktree, or InPlace) to the user and implementing model, and labels
+the reviewer input with the actual **Tools only (snapshot-failure fallback)** basis and failed snapshot coverage.
+Evidence and user/model provenance stay truthful; a worker fallback is not presented
+as Primary activity. A settings description, log entry, or optional notice is not a
+substitute for this actual-use warning. Fallback neither approves the work nor creates
+a snapshot-equivalent verdict: the configured reviewer still has to run and return a
+usable result under the ordinary gate.
+
+Fallback is not sticky: when the configured Primary or captured worker policy prefers
+snapshots, retry snapshot capture on later review cycles and continuations, warning
+prominently on each actual fallback. A later successful baseline cannot fabricate
+coverage before it existed or discard retained current-work tool evidence, including
+when the first baseline was unavailable. Missing structured observations do not block
+degraded review; the evidence and limitations must remain explicit as above.
+
+Fallback cannot substitute tool history for durability. Missing or corrupt persisted
+evidence, cancellation, reviewer execution errors, isolated construction input capture,
+checkpoint staging/verification, and landing failures remain blocking under their
+normal rules. An isolated stage shared with checkpoint or landing may still have to
+block even when its output would also have supplied review evidence. Not every error
+containing the word “snapshot” is eligible. See
+[Recovery](recovery.md#review-evidence-failure-and-fallback) and
+[Security model](security-model.md#review-evidence-is-not-a-durability-bypass).
+
+### Manual exercise in an inactive candidate
+
+Use a disposable synthetic workspace and an inactive candidate build, never the
+extension, config, or sessions serving an active conversation. Prepare a separate
+candidate tree with its dependencies and shipped scripts available as described in
+[Development](development.md#build-and-test-commands). Launch Pi directly from the
+synthetic workspace with an explicit candidate entry and disposable settings, rather
+than using the persistent launcher:
+
+```bash
+HOME="$sandbox/home" PI_CODING_AGENT_DIR="$sandbox/agent" \
+  PI_REVIEW_GATE_CONFIG="$sandbox/review-gate.json" \
+  pi --no-extensions --extension "$candidate/dist/src/index.js" --no-session
+```
+
+Here `$sandbox` and `$candidate` are your own disposable absolute directories. Create
+the sandbox directories and a test config first; configure only the worker/reviewer
+resources intended for this exercise. Do not copy credentials or production session
+state into it. Execution/review steps require the selected harness to be available
+and authenticated; menu-only checks need no model call.
+
+1. Open **Reviewers → Evidence methods** and verify the three scope rows default to
+   **Tools + workspace changes**, with the separate **Snapshot-failure fallback** row **Off**.
+   Stage a change, navigate Back/Escape, and verify it has not applied yet. Root
+   Escape applies only for this session; reopen and Cancel a different draft to
+   confirm the earlier session-only choices survive. Save or nested Ctrl+S persists
+   them to the disposable config.
+2. Accumulate Primary evidence, then apply Primary **Tools + workspace changes → Tools only** and verify the actual
+   reset warning. Reapply unchanged values, change only another scope, and cancel a
+   staged Primary change: none resets it. Apply **Tools only → Tools + workspace changes** and verify evidence remains
+   with a new snapshot baseline rather than claimed retroactive coverage.
+3. With Primary **Tools only**, have the agent make a small supported tool edit to
+   `SCRIPT`, while an independent generator outside the agent's observed tools adds
+   to `REPORT`. Inspect the reviewer input for retained `SCRIPT` content/tool evidence
+   and honest provenance. After a pass, let only the generator add more to `REPORT`:
+   a no-change agent response must not cause another review solely for that addition.
+   Then make a new observed edit and verify review runs again.
+4. Repeat the `SCRIPT`/`REPORT` exercise with a new isolated execute worker and a new
+   InPlace worker, selecting only the corresponding evidence row each time. Use only
+   the synthetic workspace for InPlace: its writes happen immediately, with no rollback.
+   Change the live setting while a task is queued or running and verify corrections,
+   retries, and continuations retain its admission policy. A later Add captures the new
+   choice independently; a scheduled task captures at actual firing/admission. Verify
+   missing structured observations permit review with retained evidence and disclosed
+   limits, without claiming clean work or no effects.
+5. In a controlled test setup that induces only a review-evidence capture failure,
+   compare fallback Off (blocked) with On (tool-only review plus the actual origin-correct
+   warning and reviewer disclosure). Include a first Primary and first InPlace baseline
+   failure before work. Restore capture and verify later cycles/continuations retry
+   snapshots without losing retained tool evidence or inventing earlier coverage;
+   each repeated actual fallback must warn again. Do not simulate an eligible failure
+   by deleting saved evidence or breaking construction/checkpoint/landing: those must
+   still block. A capture fault
+   that cannot be isolated from durability is not a successful fallback exercise.
 
 ## Tool-derived file evidence: coverage and limits
 
@@ -173,9 +316,9 @@ a capture-time window proves that the session authored every retained byte.
 
 | Execution path | File evidence delivered to review |
 | --- | --- |
-| Primary Pi session | The native `tool_call` hook pre-captures recognized mutation candidates; `tool_result` retains outcomes, including errors. Candidate baseline-to-later-state changes supplement the frozen workspace checkpoint. |
-| Isolated execution worker | Review uses the verified candidate-tree diff. Adapter transcripts remain available as executor artifacts, but the ordinary worker request does not connect structured tool observations to the review window's candidate collector. Transcript indexing is not equivalent to file capture. |
-| In-place worker | Review uses the launch-to-current workspace snapshot. Pi RPC, Claude Agent SDK, and Codex app-server observations contribute bounded events and recognized outside-root candidates with unverified pre-state and bounded after-turn observations—not exact diffs. In-root content comes from the workspace snapshot, not an author-filtered candidate diff. |
+| Primary Pi session | The native `tool_call` hook pre-captures recognized mutation candidates; `tool_result` retains outcomes, including errors, and bounded post-tool content for tool-only or fallback review. Snapshot mode also uses the frozen workspace checkpoint; tool-only uses retained observations instead of a whole-root comparison. |
+| Isolated execution worker | Construction, candidate checkpoints, and landing remain verified independently. Snapshot review uses the candidate-tree diff; tool-only review consumes supported structured observations and bounded candidate content. Adapter transcripts remain inspectable artifacts, not a substitute file-evidence producer. |
+| In-place worker | Snapshot review uses the launch-to-current workspace delta. Tool-only review uses supported Pi RPC, Claude Agent SDK, and Codex app-server observations, including bounded in-root and outside-root candidate content. Adapter pre-state is unverified: after-turn observations are not exact diffs or authorship proof. |
 
 The common producer is `src/evidence.ts`; primary hooks live in `src/index.ts`,
 isolated candidate review in `src/execution/wave-worker-lifecycle.ts`, and in-place

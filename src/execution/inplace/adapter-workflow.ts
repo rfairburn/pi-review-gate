@@ -7,7 +7,7 @@ import { normalizeExecutorToolCatalog } from "../tool-catalog";
 import type { ExecutorSession } from "../types";
 import type { WaveWorkerTask } from "../wave-worker";
 import { ensureArtifactDir } from "./containment";
-import type { InPlaceBaseline } from "./basis";
+import { inPlaceObservedWorkIdentity, type InPlaceBasis } from "./basis";
 import type { InPlaceRunInput, InPlaceWorkerResult } from "./contracts";
 import { buildInPlaceContinuationDisclosure, buildInPlacePrompt } from "./prompts";
 import { beginInPlaceAssignment, inPlaceChildSettlementIsVerified, runInplaceTurnLoop, type RecoveredInPlaceRun } from "./turn-loop";
@@ -58,7 +58,7 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
   feedback?: string;
   priorSession?: ExecutorSession;
   evidence: EvidenceState;
-  baseline: InPlaceBaseline;
+  baseline: InPlaceBasis;
 }): Promise<InPlaceWorkerResult> {
   const { taskId, task, config } = input;
   normalizeExecutorToolCatalog(task);
@@ -189,6 +189,8 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
       executorSelection: { ...assignment.entry.selection },
     });
 
+    const observedBefore = [input.evidence.toolObservationRevision ?? 0, input.evidence.externalObservationRevision ?? 0];
+    const observedWorkBefore = inPlaceObservedWorkIdentity(input.evidence);
     let run: RecoveredInPlaceRun;
     try {
       run = await runInplaceTurnLoop({
@@ -216,10 +218,14 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
         : "failed";
       await writeOperationRecord(operation);
     }
-    await captureObservedToolPathAfterStates(input.evidence, input.workspaceRoot, {
-      maxFileBytes: config.maxFileBytes,
-      maxSnapshotBytes: config.maxSnapshotBytes,
-    });
+    if ((input.evidence.toolObservationRevision ?? 0) !== observedBefore[0]
+      || (input.evidence.externalObservationRevision ?? 0) !== observedBefore[1]
+      || inPlaceObservedWorkIdentity(input.evidence) !== observedWorkBefore) {
+      await captureObservedToolPathAfterStates(input.evidence, input.workspaceRoot, {
+        maxFileBytes: config.maxFileBytes,
+        maxSnapshotBytes: config.maxSnapshotBytes,
+      });
+    }
 
     if (run.status === "failed" && !input.signal?.aborted && run.incidents.at(-1)?.retryable === true) {
       if (!inPlaceChildSettlementIsVerified(run.childProcesses, run.unmatchedChildExit)) {

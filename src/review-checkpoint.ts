@@ -27,6 +27,7 @@ import {
   type GitCheckpointResult, type GitCheckpointRecord, type GitCheckpointUntrackedEntry,
 } from "./git-checkpoint";
 import { piAgentDir, type ConfigPathResolution } from "./config-path";
+import { ReviewEvidenceCaptureFailure } from "./review-evidence";
 
 const exec = promisify(execFile);
 const FORMAT = "prg-parent-raw/v2";
@@ -57,7 +58,7 @@ export type ReviewCheckpointOptions = GitCheckpointOptions & { scope?: ReviewChe
 export type ReviewCheckpointDescriptor =
   | { kind: "git"; checkpoint: GitCheckpointDescriptor }
   | { kind: "raw"; format: typeof FORMAT; sessionId: string; root: string; windowId: string; owner: string; digest: string };
-export type ReviewCheckpointResult<T> = GitCheckpointResult<T> | { status: "failed"; reason: "raw_checkpoint_failed"; detail: string };
+export type ReviewCheckpointResult<T> = GitCheckpointResult<T> | { status: "failed"; reason: "raw_checkpoint_failed"; detail: string; evidenceCaptureFailure?: true };
 export interface ReviewCheckpointState { kind: "file" | "symlink"; mode: number; bytes?: Buffer; target?: string }
 export interface ReviewCheckpointChange { path: string; old?: ReviewCheckpointState; new?: ReviewCheckpointState }
 export interface ReviewCheckpointComparison { changes: ReviewCheckpointChange[] }
@@ -358,12 +359,24 @@ export async function reviewCheckpointWorkspaceRoot(root: string, descriptor: Re
   return descriptor.kind === "git" ? gitCheckpointRoot(root) : ensureRoot(root);
 }
 
+class RawReviewAcquisitionError extends Error {}
+async function acquireRawEvidence<T>(operation: () => Promise<T>): Promise<T> {
+  try { return await operation(); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (["EACCES", "EPERM", "EIO", "EMFILE", "ENFILE", "EFBIG"].includes(code ?? "")) {
+      throw new RawReviewAcquisitionError("raw review-evidence acquisition unavailable");
+    }
+    throw error;
+  }
+}
+
 async function walk(root: string, path: string, files: string[], ignores: string[], options: GitCheckpointOptions): Promise<void> {
   checkAbort(options);
   const dir = join(root, path);
   const before = await lstat(dir);
   if (!before.isDirectory() || before.isSymbolicLink()) throw new Error(`directory changed: ${path}`);
-  for (const name of (await readdir(dir)).sort()) {
+  for (const name of (await acquireRawEvidence(() => readdir(dir))).sort()) {
     // Ordinary project content named .pi-review-gate stays eligible: raw
     // records never live inside the workspace (#301).
     if (path === "" && name === ".git") continue;
@@ -449,17 +462,17 @@ async function rawEntry(root: string, path: string, options: GitCheckpointOption
   const absolute = join(root, path);
   const pre = await lstat(absolute);
   if (!pre.isFile() && !pre.isSymbolicLink()) throw new Error(`unsupported entry ${path}`);
-  if (pre.size > MAX_BYTES) throw new Error(`entry too large: ${path}`);
+  if (pre.size > MAX_BYTES) throw new RawReviewAcquisitionError("raw review-evidence entry exceeds capture cap");
   let contentB64: string | undefined;
   let target: string | undefined;
   if (pre.isFile()) {
-    const handle = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const handle = await acquireRawEvidence(() => open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW));
     try {
       if (!fileHandleIdentity(pre, await handle.stat())) throw new Error(`file raced: ${path}`);
       const bytes = Buffer.alloc(pre.size);
       let offset = 0;
       while (offset < bytes.length) {
-        const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+        const { bytesRead } = await acquireRawEvidence(() => handle.read(bytes, offset, bytes.length - offset, offset));
         if (!bytesRead) throw new Error(`short read: ${path}`);
         offset += bytesRead;
       }
@@ -515,18 +528,23 @@ export async function captureReviewCheckpoint(root: string, windowId: string, op
       // for it before publishing a descriptor, as the Git arm syncs its chain.
       await syncChain(location, owned);
       const files: string[] = [], ignores: string[] = [];
+      let acquisitionStage: "enumeration" | "ignore-policy" | "content" | "integrity" = "enumeration";
+      try {
       await walk(dir, "", files, ignores, options);
+      acquisitionStage = "ignore-policy";
       const ignoreEntries = await Promise.all(ignores.map((path) => rawEntry(dir, path, options)));
       const excluded = await ignoredPaths(dir, files, ignores.length > 0);
       const entries: GitCheckpointUntrackedEntry[] = [];
       let bytes = 0;
+      acquisitionStage = "content";
       for (const path of files) {
         if (excluded.has(path)) continue;
         const entry = await rawEntry(dir, path, options);
         bytes += entry.size;
-        if (bytes > MAX_BYTES) throw new Error("raw checkpoint exceeds byte cap");
+        if (bytes > MAX_BYTES) throw new RawReviewAcquisitionError("raw review-evidence exceeds capture cap");
         entries.push(entry);
       }
+      acquisitionStage = "integrity";
       // Fail closed when ignore rules, included entries, or the enumerated
       // path set shifted while the capture was in flight. No second content
       // read is performed at comparison time; these checks are capture-only.
@@ -546,8 +564,17 @@ export async function captureReviewCheckpoint(root: string, windowId: string, op
       await publishRecord(owned, payload);
       published = true;
       return { status: "ok", value: { kind: "raw", format: FORMAT, sessionId: scope.sessionId, root: dir, windowId, owner, digest: sha(payload) } };
+      } catch (error) {
+        // Only unambiguous acquisition failures qualify. Race/identity errors,
+        // publication, verification and cleanup failures are never fallback.
+        if ((acquisitionStage === "enumeration" || acquisitionStage === "content")
+          && !options.signal?.aborted && error instanceof RawReviewAcquisitionError) {
+          throw new ReviewEvidenceCaptureFailure("raw review-evidence acquisition failed");
+        }
+        throw error;
+      }
     } finally { if (!published) await rm(owned, { recursive: true, force: true }); }
-  } catch (error) { return fail(errorOf(error)); }
+  } catch (error) { return { ...fail(errorOf(error)), ...(error instanceof ReviewEvidenceCaptureFailure ? { evidenceCaptureFailure: true as const } : {}) }; }
 }
 
 /** Compose verified old raw entries with a frozen capture of selected live paths.

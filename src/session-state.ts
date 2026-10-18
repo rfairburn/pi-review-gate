@@ -321,9 +321,11 @@ interface PersistedCheckpointBaseline {
   descriptor: ReviewCheckpointDescriptor;
   cwd: string;
   capturedAt: string;
+  toolOnlyHistory?: true;
 }
 
-type PersistedBaseline = PersistedWorkspaceSnapshot | PersistedGitBaseline | PersistedCheckpointBaseline;
+type PersistedToolBaseline = Extract<ReviewBaseline, { kind: "tool" }>;
+type PersistedBaseline = PersistedWorkspaceSnapshot | PersistedGitBaseline | PersistedCheckpointBaseline | PersistedToolBaseline;
 
 interface PersistedWorkspaceSnapshotReference {
   $snapshotRef: {
@@ -864,17 +866,19 @@ function serializeSnapshot(snapshot: WorkspaceSnapshot): PersistedWorkspaceSnaps
 }
 
 function serializeBaseline(baseline: ReviewBaseline): PersistedBaseline {
+  if (baseline.kind === "tool") return { ...baseline };
   if (baseline.kind === "snapshot") return serializeSnapshot(baseline.snapshot);
   // Compact by contract: descriptor plus capture root/timestamp only.
   if (baseline.kind === "checkpoint") {
-    return { kind: "checkpoint", descriptor: { ...baseline.descriptor }, cwd: baseline.cwd, capturedAt: baseline.capturedAt };
+    return { kind: "checkpoint", descriptor: { ...baseline.descriptor }, cwd: baseline.cwd, capturedAt: baseline.capturedAt, ...(baseline.toolOnlyHistory ? { toolOnlyHistory: true } : {}) };
   }
   return { kind: "git", descriptor: { ...baseline.descriptor }, cwd: baseline.cwd, capturedAt: baseline.capturedAt };
 }
 
 function deserializeBaseline(baseline: PersistedBaseline): ReviewBaseline {
+  if (isPersistedToolBaseline(baseline)) return { ...baseline };
   if (isPersistedCheckpointBaseline(baseline)) {
-    return { kind: "checkpoint", descriptor: { ...baseline.descriptor }, cwd: baseline.cwd, capturedAt: baseline.capturedAt };
+    return { kind: "checkpoint", descriptor: { ...baseline.descriptor }, cwd: baseline.cwd, capturedAt: baseline.capturedAt, ...(baseline.toolOnlyHistory ? { toolOnlyHistory: true } : {}) };
   }
   if (isPersistedGitBaseline(baseline)) {
     return {
@@ -1113,7 +1117,13 @@ function isValidPersistedReviewWindow(value: unknown, version: 1 | 2 | 3 | 4): b
   return persistedBaselineKind(value.baseline) === persistedBaselineKind(exchangeBaseline);
 }
 
+function isPersistedToolBaseline(value: unknown): value is PersistedToolBaseline {
+  return isRecord(value) && value.kind === "tool" && typeof value.cwd === "string"
+    && typeof value.capturedAt === "string" && (value.fallback === undefined || value.fallback === true);
+}
+
 function isPersistedBaseline(value: unknown, version: 1 | 2 | 3 | 4): value is PersistedBaseline {
+  if (isRecord(value) && value.kind === "tool") return version === SESSION_STATE_VERSION && isPersistedToolBaseline(value);
   if (isRecord(value) && value.kind === "checkpoint") {
     return version === SESSION_STATE_VERSION && isPersistedCheckpointBaseline(value);
   }
@@ -1124,8 +1134,8 @@ function isPersistedBaseline(value: unknown, version: 1 | 2 | 3 | 4): value is P
   return isPersistedWorkspaceSnapshot(value);
 }
 
-function persistedBaselineKind(baseline: PersistedBaseline): "snapshot" | "git" | "checkpoint" {
-  return isPersistedCheckpointBaseline(baseline) ? "checkpoint" : isPersistedGitBaseline(baseline) ? "git" : "snapshot";
+function persistedBaselineKind(baseline: PersistedBaseline): "snapshot" | "git" | "checkpoint" | "tool" {
+  return isPersistedToolBaseline(baseline) ? "tool" : isPersistedCheckpointBaseline(baseline) ? "checkpoint" : isPersistedGitBaseline(baseline) ? "git" : "snapshot";
 }
 
 /**
@@ -1136,7 +1146,8 @@ function persistedBaselineKind(baseline: PersistedBaseline): "snapshot" | "git" 
  */
 function isPersistedCheckpointBaseline(value: unknown): value is PersistedCheckpointBaseline {
   if (!isRecord(value) || value.kind !== "checkpoint"
-    || typeof value.cwd !== "string" || typeof value.capturedAt !== "string" || !isRecord(value.descriptor)) return false;
+    || typeof value.cwd !== "string" || typeof value.capturedAt !== "string" || !isRecord(value.descriptor)
+    || (value.toolOnlyHistory !== undefined && value.toolOnlyHistory !== true)) return false;
   const d = value.descriptor;
   // Deeper descriptor validity, record digest and pin are verified by the
   // backend. Reject absent/wrong-shaped descriptors before materialization.

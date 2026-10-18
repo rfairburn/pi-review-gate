@@ -36,6 +36,7 @@ import {
   type BackgroundTaskState,
 } from "./task-state";
 import { executorDisplayLabel } from "./subtask-widget";
+import { isWorkerReviewEvidenceWarning } from "./review-evidence-warning";
 
 // ── Wake policy types ────────────────────────────────────────────────────────
 
@@ -346,6 +347,12 @@ export function formatExecutionEvent(
     "",
     `Task: ${task.taskId} · ${title} · ${task.state}`,
   ];
+  // Method/fallback warnings are durable outcome content, not optional
+  // notices or passive activity. Preserve every retained actual-use warning
+  // for both UI and model delivery, even in quiet mode.
+  for (const line of (task.summary ?? "").split(/\r?\n/)) {
+    if (isWorkerReviewEvidenceWarning(line) && !content.includes(line)) lines.push(line);
+  }
   if (archivedSettled > 0) {
     lines.push(`${archivedSettled} earlier task(s) ${successVerb} and are archived; use SubtasksInspect with their taskId for exact history.`);
   }
@@ -614,7 +621,12 @@ export function buildWakeFailureDiagnostic(input: WakeFailureDiagnosticInput): W
       suggestedActions: suggestedActions.map((action) => boundDiagnosticText(action, WAKE_FAILURE_MAX_ACTION) ?? ""),
     },
     title: boundDiagnosticText(task.definition.title, WAKE_FAILURE_MAX_TITLE) ?? "",
-    summary: boundDiagnosticText(live.summary, WAKE_FAILURE_MAX_SUMMARY),
+    // Put actual-use evidence warnings ahead of verbose summaries so the
+    // existing explicit diagnostic bound cannot hide fallback on failure.
+    summary: boundDiagnosticText([
+      ...(live.summary ?? "").split(/\r?\n/).filter(isWorkerReviewEvidenceWarning),
+      live.summary,
+    ].filter(Boolean).join(" ") || undefined, WAKE_FAILURE_MAX_SUMMARY),
     error: boundDiagnosticText(live.error, WAKE_FAILURE_MAX_ERROR),
     activity: live.activity
       .slice(-WAKE_FAILURE_MAX_ACTIVITY_EVENTS)

@@ -26,8 +26,15 @@ import type { ModelAdapter, ReviewerSession } from "./adapters/types";
 import type { TokenUsage } from "./usage";
 import { completeActiveExchange, hasUnresolvedReview, isReviewBaseline, snapshotOfReviewBaseline, type GitCheckpointBaseline, type UnifiedReviewBaseline, type ReviewBaseline, type ReviewWindow } from "./state";
 import { aggregateReviewDisposition } from "./review-report";
+import { acquireReviewWorkspaceSnapshot, primaryEvidencePolicy, evidenceMethodNotice, retainedToolChanges, isEligibleReviewCaptureFailure, ReviewEvidenceCaptureFailure, TOOL_ONLY_HISTORY_NOTICE, type ReviewEvidencePolicy, type ReviewEvidenceMethod } from "./review-evidence";
 
 export interface ReviewRunInput {
+  evidencePolicy?: ReviewEvidencePolicy;
+  /** Trusted acquisition-only handoff when a worker captures review evidence before this call.
+   * Never pass construction, checkpoint, integrity, cleanup, cancellation or reviewer failures. */
+  evidenceCaptureFailure?: ReviewEvidenceCaptureFailure;
+  /** Internal trusted handoff: attribution and review consume this same acquired pair. */
+  preparedSnapshots?: { before: WorkspaceSnapshot; after: WorkspaceSnapshot; toolOnlyHistory?: boolean };
   cwd: string;
   request: string;
   /**
@@ -65,6 +72,8 @@ export interface ExactChangeInput {
 }
 
 export interface ReviewRunOutput {
+  evidenceMethod?: ReviewEvidenceMethod;
+  evidenceCoverageNotice?: string;
   changed: boolean;
   changes: ChangedFile[];
   noReviewReason?: "no_initial_changes" | "unchanged_review_response" | "unchanged_deferred_response";
@@ -74,7 +83,8 @@ export interface ReviewRunOutput {
   bundleDir?: string;
   invocationDir?: string;
   reviewSequence?: number;
-  /** The frozen after-baseline the review settled against; recorded on the window state when a completed pass transfers ownership. */
+  /** Response comparison basis. For snapshot review this is the frozen after-state;
+   * tool-only fallback may retain a historical basis, never a new snapshot certificate. */
   reviewedBaseline?: ReviewBaseline;
   /** Release a handed-off after descriptor if the caller cannot record it. */
   releaseReviewedBaseline?: () => Promise<void>;
@@ -83,6 +93,8 @@ export interface ReviewRunOutput {
 }
 
 export interface PausedExchangeInput {
+  notify?: (message: string) => void | Promise<void>;
+  evidencePolicy?: ReviewEvidencePolicy;
   cwd: string;
   /** Trusted live-session scope that locates raw (non-Git) checkpoint records. */
   checkpointScope?: ReviewCheckpointScope;
@@ -93,6 +105,8 @@ export interface PausedExchangeInput {
 }
 
 export interface AskReviewerInput {
+  evidencePolicy?: ReviewEvidencePolicy;
+  evidenceCaptureFailure?: ReviewEvidenceCaptureFailure;
   cwd: string;
   question: string;
   request: string;
@@ -112,6 +126,8 @@ export interface AskReviewerInput {
 }
 
 export interface AskReviewerOutput {
+  evidenceMethod?: ReviewEvidenceMethod;
+  evidenceCoverageNotice?: string;
   changes: ChangedFile[];
   result?: ReviewResult;
   reviewerResults?: ReviewResult[];
@@ -182,21 +198,9 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   }
   // Unified Git and raw baselines settle against one frozen after-checkpoint.
   // Legacy baselines retain their original fail-closed settlement paths.
-  const checkpointBefore = typedCheckpointBaselineOf(input.before);
-  const gitBefore = typedGitBaselineOf(input.before);
-  const settled = checkpointBefore
-    ? await settleCheckpointReview({ cwd: input.cwd, before: checkpointBefore, exchangeBefore: input.window?.activeExchange?.baseline, config: input.config, signal: input.signal, evidence: input.evidence, scope: input.checkpointScope })
-    : gitBefore
-    ? await settleGitReview({
-        cwd: input.cwd,
-        before: gitBefore,
-        exchangeBefore: input.window?.activeExchange?.baseline,
-        config: input.config,
-        signal: input.signal,
-      })
-    : await settleSnapshotReview(input);
+  const settled = await settleReviewEvidence(input);
   try {
-    return await runReviewSettled(input, settled);
+    return { ...await runReviewSettled(input, settled), evidenceMethod: settled.evidenceMethod, evidenceCoverageNotice: settled.evidenceCoverageNotice };
   } finally {
     // No completed pass owns the frozen after-checkpoint on any earlier exit
     // (no-change, abort, error): release the ephemeral pin. A failed release
@@ -211,21 +215,25 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
   const correctionAttemptCount = input.correctionAttemptCount ?? 0;
   const guidanceEscalation = buildGuidanceEscalation(input.config, correctionAttemptCount);
   const workspaceChanges = settled.workspaceChanges;
-  const evidenceChanges = input.evidence
-    ? await collectSettledEvidence(input.evidence, input.cwd, input.config, workspaceChanges, undefined, Boolean(settled.reviewedBaseline && settled.reviewedBaseline.kind !== "snapshot"), settled.frozenCandidateAfter, settled.evidenceRoot)
-    : [];
+  const evidenceChanges = settled.evidenceMethod !== "snapshot"
+    ? retainedToolChanges(input.evidence)
+    : input.evidence
+      ? await collectSettledEvidence(input.evidence, input.cwd, input.config, workspaceChanges, undefined, Boolean(settled.reviewedBaseline && settled.reviewedBaseline.kind !== "snapshot"), settled.frozenCandidateAfter, settled.evidenceRoot)
+      : [];
   const split = splitReviewChanges(workspaceChanges, evidenceChanges);
   const { changes, sideEffectChanges } = split;
 
   // When exactChange is present with nonempty changedPaths, treat as reviewable
   // even if workspace snapshots show no content hash changes (e.g., mode-only or binary changes).
-  const hasExactChanges = input.exactChange !== undefined && input.exactChange.changedPaths.length > 0;
+  const hasExactChanges = settled.evidenceMethod === "snapshot" && input.exactChange !== undefined && input.exactChange.changedPaths.length > 0;
   const exchangeSequence = input.window?.activeExchange?.sequence;
   const reviewResponseMode = input.window?.activeExchange?.reviewResponseMode;
   const exchangeWorkspaceChanges = settled.exchangeWorkspaceChanges;
-  const exchangeEvidenceChanges = input.evidence && exchangeSequence !== undefined
-    ? await collectSettledEvidence(input.evidence, input.cwd, input.config, exchangeWorkspaceChanges, exchangeSequence, Boolean(settled.reviewedBaseline && settled.reviewedBaseline.kind !== "snapshot"), settled.frozenCandidateAfter, settled.evidenceRoot)
-    : evidenceChanges;
+  const exchangeEvidenceChanges = settled.evidenceMethod !== "snapshot"
+    ? retainedToolChanges(input.evidence, exchangeSequence)
+    : input.evidence && exchangeSequence !== undefined
+      ? await collectSettledEvidence(input.evidence, input.cwd, input.config, exchangeWorkspaceChanges, exchangeSequence, Boolean(settled.reviewedBaseline && settled.reviewedBaseline.kind !== "snapshot"), settled.frozenCandidateAfter, settled.evidenceRoot)
+      : evidenceChanges;
   const exchangeSplit = splitReviewChanges(exchangeWorkspaceChanges, exchangeEvidenceChanges);
   const exchangeWorkspacePatch = exchangeWorkspaceChanges.length > 0
     ? (settled.exchangePatch ?? buildUnifiedPatch(exchangeWorkspaceChanges, input.config.maxPatchBytes)).patch
@@ -242,7 +250,10 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
       actingUsage: input.actingUsage,
     })
     : undefined;
-  const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0 || hasExactChanges || input.evidence?.requiresReview === true;
+  const retainedObservationNeedsReview = input.evidence?.requiresReview === true
+    && (settled.evidenceMethod === "snapshot" || (completedExchange?.evidenceEvents.length ?? input.evidence.events.length) > 0);
+  const observedToolWork = settled.evidenceMethod !== "snapshot" && (completedExchange?.evidenceEvents.length ?? input.evidence?.events.length ?? 0) > 0;
+  const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0 || hasExactChanges || retainedObservationNeedsReview || observedToolWork;
   if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges) {
     if (input.window?.bundleDir) {
       await syncReviewWindowArtifacts({
@@ -262,12 +273,12 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     };
   }
   const isCorrectionValidation = hasUnresolvedReview(input.window) || correctionAttemptCount > 0;
-  if (changes.length === 0 && !isCorrectionValidation && !hasExactChanges && input.evidence?.requiresReview !== true) {
+  if (settled.evidenceMethod === "snapshot" && changes.length === 0 && !isCorrectionValidation && !hasExactChanges && input.evidence?.requiresReview !== true) {
     return { changed: false, changes, noReviewReason: "no_initial_changes" };
   }
 
   // When exactChange is present, use the exact Git commit patch as authoritative.
-  const patchResult = input.exactChange !== undefined
+  const patchResult = settled.evidenceMethod === "snapshot" && input.exactChange !== undefined
     ? {
         patch: input.exactChange.patch,
         truncated: input.exactChange.truncated,
@@ -297,12 +308,13 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
 
   const reviewSequence = input.window?.nextReviewSequence ?? 1;
   const bundle = await createReviewBundle({
+    evidenceMethod: settled.evidenceMethod,
     dir: input.window?.bundleDir,
     reviewSequence,
     exchanges: input.window?.exchanges,
     cwd: input.cwd,
     workspaceRoot: settled.evidenceRoot,
-    request: input.request,
+    request: `${evidenceMethodNotice(settled.evidenceMethod)}${settled.evidenceCoverageNotice ? `\n${settled.evidenceCoverageNotice}` : ""}\n\n${input.request}`,
     submittedChanges: split.workspaceChanges,
     sideEffectChanges,
     patch: patchResult.patch,
@@ -346,6 +358,10 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
       changeIdentity: input.changeIdentity,
       snapshotOmissions: settled.snapshotOmissions,
       snapshotOmissionsTruncated: settled.snapshotOmissionsTruncated,
+      evidenceMethod: settled.evidenceMethod,
+      evidenceScope: (input.evidencePolicy ?? primaryEvidencePolicy(input.config)).scope,
+      exactSnapshotReviewed: settled.evidenceMethod === "snapshot" && !settled.evidenceCoverageNotice,
+      evidenceCoverageNotice: settled.evidenceCoverageNotice,
       ...(input.exactChange !== undefined ? {
         exactChangedPaths: input.exactChange.changedPaths,
         exactPatchTruncated: input.exactChange.truncated,
@@ -381,6 +397,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     // ephemeral pin above.
     settled.ownershipTransferred = true;
   return {
+    evidenceMethod: settled.evidenceMethod,
     changed: true,
     changes,
     result: invocation.result,
@@ -404,14 +421,15 @@ export async function collectPausedReviewExchange(input: PausedExchangeInput): P
   // this paused path always releases the after descriptor after artifacts.
   const checkpointBaseline = typedCheckpointBaselineOf(active.baseline);
   const gitBaseline = typedGitBaselineOf(active.baseline);
-  if (checkpointBaseline || gitBaseline) {
-    const settled = checkpointBaseline
-      ? await settleCheckpointReview({ cwd: input.cwd, before: checkpointBaseline, config: input.config, evidence: input.evidence, scope: input.checkpointScope })
-      : await settleGitReview({ cwd: input.cwd, before: gitBaseline!, config: input.config });
+  if (checkpointBaseline || gitBaseline || active.baseline?.kind === "tool" || (input.evidencePolicy ?? primaryEvidencePolicy(input.config)).toolOnly) {
+    if (!active.baseline) throw new Error("review gate: paused exchange has no evidence basis");
+    const settled = await settleReviewEvidence({ ...input, before: active.baseline, request: "" });
     try {
-      const evidenceChanges = input.evidence
-        ? await collectSettledEvidence(input.evidence, input.cwd, input.config, settled.workspaceChanges, active.sequence, true, settled.frozenCandidateAfter, settled.evidenceRoot)
-        : [];
+      const evidenceChanges = settled.evidenceMethod !== "snapshot"
+        ? retainedToolChanges(input.evidence, active.sequence)
+        : input.evidence
+          ? await collectSettledEvidence(input.evidence, input.cwd, input.config, settled.workspaceChanges, active.sequence, true, settled.frozenCandidateAfter, settled.evidenceRoot)
+          : [];
       const split = splitReviewChanges(settled.workspaceChanges, evidenceChanges);
       completeActiveExchange(input.window, {
         workspaceChanges: settled.workspaceChanges,
@@ -494,9 +512,14 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     before: input.before,
     config: input.config,
     evidence: input.evidence,
+    evidencePolicy: input.evidencePolicy,
+    evidenceCaptureFailure: input.evidenceCaptureFailure,
+    signal: input.signal,
+    notify: input.notify,
+    window: input.window,
   });
   try {
-    return await runAskReviewerSettled(input, collected);
+    return { ...await runAskReviewerSettled(input, collected), evidenceMethod: collected.evidenceMethod, evidenceCoverageNotice: collected.evidenceCoverageNotice };
   } finally {
     if (collected.releaseOrphan) {
       await collected.releaseOrphan();
@@ -525,13 +548,14 @@ async function runAskReviewerSettled(input: AskReviewerInput, collected: Current
 
   const reviewSequence = input.window?.nextReviewSequence ?? 1;
   const bundle = await createReviewerQuestionBundle({
+    evidenceMethod: collected.evidenceMethod,
     dir: input.window?.bundleDir,
     reviewSequence,
     exchanges: input.window?.exchanges,
     cwd: input.cwd,
     workspaceRoot: collected.evidenceRoot,
     question: input.question,
-    request: input.request,
+    request: `${evidenceMethodNotice(collected.evidenceMethod)}${collected.evidenceCoverageNotice ? `\n${collected.evidenceCoverageNotice}` : ""}\n\n${input.request}`,
     submittedChanges: workspaceChanges,
     sideEffectChanges,
     patch: patchResult.patch,
@@ -556,6 +580,10 @@ async function runAskReviewerSettled(input: AskReviewerInput, collected: Current
       changeIdentity: input.changeIdentity,
       snapshotOmissions,
       snapshotOmissionsTruncated,
+      evidenceMethod: collected.evidenceMethod,
+      evidenceScope: (input.evidencePolicy ?? primaryEvidencePolicy(input.config)).scope,
+      exactSnapshotReviewed: collected.evidenceMethod === "snapshot" && !collected.evidenceCoverageNotice,
+      evidenceCoverageNotice: collected.evidenceCoverageNotice,
     },
   });
   registerBundleWithWindow(input.window, bundle.dir);
@@ -584,6 +612,7 @@ async function runAskReviewerSettled(input: AskReviewerInput, collected: Current
   }
 
   return {
+    evidenceMethod: collected.evidenceMethod,
     changes,
     result: invocation.result,
     reviewerResults: invocation.reviewerResults,
@@ -1155,7 +1184,106 @@ function createAdapter(decider: DeciderConfig): ModelAdapter {
 // error instead of falling back to a synthetic snapshot. Legacy snapshot
 // inputs keep the existing settle semantics unchanged.
 
+/** The policy is copied at invocation entry. It never follows a live settings toggle. */
+async function settleReviewEvidence(input: ReviewRunInput): Promise<SettledBaseline> {
+  input.signal?.throwIfAborted();
+  const policy = { ...(input.evidencePolicy ?? primaryEvidencePolicy(input.config)) };
+  const beforeKind = isReviewBaseline(input.before) ? input.before.kind : "snapshot";
+  for (const baseline of [input.window?.baseline, input.window?.activeExchange?.baseline]) {
+    if (!baseline) continue;
+    if (baseline.kind !== beforeKind) throw new Error("review gate: mixed evidence baseline kinds");
+    if (baseline.kind !== "snapshot" && baseline.cwd !== input.cwd) throw new Error("review gate: evidence baseline root mismatch");
+  }
+  if (input.preparedSnapshots) {
+    const pair = input.preparedSnapshots;
+    if (beforeKind !== "snapshot" || pair.before !== legacySnapshotOf(input.before) || pair.before === pair.after
+      || resolve(pair.before.cwd) !== resolve(input.cwd) || resolve(pair.after.cwd) !== resolve(input.cwd)
+      || !(pair.before.files instanceof Map) || !(pair.after.files instanceof Map)
+      || ![input.config.maxFileBytes, input.config.maxSnapshotBytes].every((n) => Number.isSafeInteger(n) && n >= 0)) {
+      throw new Error("review gate: invalid prepared snapshot roots or basis");
+    }
+  }
+  const toolBaseline = isReviewBaseline(input.before) && input.before.kind === "tool" ? input.before : undefined;
+  if (toolBaseline && toolBaseline.cwd !== input.cwd) throw new Error("review gate: tool evidence basis root mismatch");
+  const tools = async (fallback: boolean, basis?: ReviewBaseline, coverageNotice?: string): Promise<SettledBaseline> => {
+    input.signal?.throwIfAborted();
+    const method: ReviewEvidenceMethod = fallback ? "tool-only-fallback" : "tool-only";
+    if (!coverageNotice && basis?.kind === "checkpoint" && basis.toolOnlyHistory) coverageNotice = TOOL_ONLY_HISTORY_NOTICE;
+    if (!input.evidence?.events.length) coverageNotice = [coverageNotice, "No structured tool observations were collected for this assessment; supplied summaries and context are claims, not verified actions or evidence of no effects."].filter(Boolean).join(" ");
+    const baseline: ReviewBaseline = basis ?? { kind: "tool", cwd: input.cwd, capturedAt: new Date().toISOString(), ...(fallback ? { fallback: true } : {}) };
+    // Preserve a valid historical snapshot basis on fallback so the next
+    // operation can retry it. Never reset current work or latch config here.
+    if (input.window) {
+      input.window.baseline = baseline;
+      if (input.window.activeExchange && input.window.activeExchange.baseline?.kind !== baseline.kind) input.window.activeExchange.baseline = baseline;
+    }
+    await input.notify?.(`${evidenceMethodNotice(method)}${coverageNotice ? ` ${coverageNotice}` : ""}`);
+    return { evidenceMethod: method, evidenceCoverageNotice: coverageNotice, workspaceChanges: [], exchangeWorkspaceChanges: [],
+      snapshotOmissions: [], snapshotOmissionsTruncated: false, ownershipTransferred: false,
+      reviewedBaseline: input.window?.activeExchange?.baseline ?? baseline };
+  };
+  if (input.evidenceCaptureFailure !== undefined) {
+    if (!(input.evidenceCaptureFailure instanceof ReviewEvidenceCaptureFailure)) throw new Error("review gate: invalid evidence acquisition failure handoff");
+    input.signal?.throwIfAborted();
+    if (!policy.snapshotFailureFallback || policy.toolOnly) throw input.evidenceCaptureFailure;
+    // An external acquisition failure never substitutes for baseline identity
+    // verification. Worker candidate/construction/landing checks remain separate.
+    const checkpoint = typedCheckpointBaselineOf(input.before);
+    const git = typedGitBaselineOf(input.before);
+    if (checkpoint) {
+      if (checkpoint.cwd !== input.cwd) throw new Error("review gate: checkpoint baseline root mismatch");
+      for (const baseline of [checkpoint, input.window?.activeExchange?.baseline]) {
+        if (!baseline) continue;
+        if (baseline.kind !== "checkpoint" || baseline.cwd !== input.cwd) throw new Error("review gate: mixed or wrong-root exchange baseline");
+        const loaded = await loadReviewCheckpoint(input.cwd, baseline.descriptor, { signal: input.signal, scope: input.checkpointScope });
+        if (loaded.status !== "ok") throw checkpointFailure("verifying baseline", loaded);
+      }
+    } else if (git) {
+      for (const baseline of [git, input.window?.activeExchange?.baseline]) {
+        if (!baseline) continue;
+        if (baseline.kind !== "git" || baseline.cwd !== input.cwd) throw new Error("review gate: mixed or wrong-root exchange baseline");
+        const loaded = await loadGitCheckpoint(input.cwd, baseline.descriptor, { signal: input.signal });
+        if (loaded.status !== "ok") throw gitReviewFailure("verifying the Git review baseline", loaded);
+      }
+    }
+    return tools(true, isReviewBaseline(input.before) ? input.before : { kind: "snapshot", snapshot: input.before });
+  }
+  if (policy.toolOnly) return tools(false);
+  if (toolBaseline) {
+    // No pre-work snapshot exists. A recovered capture becomes a new basis
+    // for subsequent work only; the current earlier interval stays tool-only.
+    const captured = await captureReviewCheckpoint(input.cwd, randomUUID(), { scope: input.checkpointScope, signal: input.signal });
+    if (captured.status !== "ok") {
+      if (policy.snapshotFailureFallback && !input.signal?.aborted && isEligibleReviewCaptureFailure(captured)) return tools(true, toolBaseline);
+      throw checkpointFailure("retrying snapshot evidence", captured);
+    }
+    const baseline: UnifiedReviewBaseline = { kind: "checkpoint", descriptor: captured.value, cwd: input.cwd, capturedAt: new Date().toISOString(), toolOnlyHistory: true };
+    const release = () => releaseCheckpoint(input.cwd, captured.value, input.checkpointScope);
+    try {
+      const settled = await tools(false, baseline, `Snapshot capture recovered; a NEW baseline was established for subsequent captures. ${TOOL_ONLY_HISTORY_NOTICE}`);
+      return { ...settled, reviewedBaseline: baseline, releaseOrphan: input.window ? undefined : release, ownershipTransferred: Boolean(input.window) };
+    } catch (error) {
+      if (!input.window) return rethrowAfterRelease(error, release);
+      throw error;
+    }
+  }
+  try {
+    const checkpoint = typedCheckpointBaselineOf(input.before);
+    const git = typedGitBaselineOf(input.before);
+    return checkpoint
+      ? await settleCheckpointReview({ cwd: input.cwd, before: checkpoint, exchangeBefore: input.window?.activeExchange?.baseline, config: input.config, signal: input.signal, evidence: input.evidence, scope: input.checkpointScope })
+      : git
+        ? await settleGitReview({ cwd: input.cwd, before: git, exchangeBefore: input.window?.activeExchange?.baseline, config: input.config, signal: input.signal })
+        : await settleSnapshotReview(input);
+  } catch (error) {
+    if (!policy.snapshotFailureFallback || input.signal?.aborted || !(error instanceof ReviewEvidenceCaptureFailure)) throw error;
+    return tools(true, isReviewBaseline(input.before) ? input.before : { kind: "snapshot", snapshot: input.before });
+  }
+}
+
 interface SettledBaseline {
+  evidenceMethod: ReviewEvidenceMethod;
+  evidenceCoverageNotice?: string;
   /** Root used by the checkpoint and its repository-relative change paths. */
   evidenceRoot?: string;
   /** Candidate values captured once before arming the frozen after-checkpoint. */
@@ -1172,7 +1300,7 @@ interface SettledBaseline {
   snapshotOmissionsTruncated: boolean;
   /** True once a completed pass owns the after-baseline (ownership transferred to the window state). */
   ownershipTransferred: boolean;
-  /** The frozen after-baseline; recorded on the window state when a completed pass transfers ownership. */
+  /** Response comparison basis; tool-only may retain a historical basis, not a newly reviewed snapshot. */
   reviewedBaseline?: ReviewBaseline;
   /** Releases the ephemeral after-checkpoint pin (Git only). Throws on failure — never hides an orphaned pin. */
   releaseOrphan?: () => Promise<void>;
@@ -1273,7 +1401,12 @@ async function settleCheckpointReview(input: {
     }
   }
   const captured = await captureReviewCheckpoint(cwd, randomUUID(), options);
-  if (captured.status !== "ok") throw checkpointFailure("capturing after-checkpoint", captured);
+  if (captured.status !== "ok") {
+    if (isEligibleReviewCaptureFailure(captured) && !input.signal?.aborted) {
+      throw new ReviewEvidenceCaptureFailure("review-evidence after-checkpoint acquisition failed");
+    }
+    throw checkpointFailure("capturing after-checkpoint", captured);
+  }
   const descriptor = captured.value;
   const releaseOrphan = () => releaseCheckpoint(cwd, descriptor, input.scope);
   try {
@@ -1287,10 +1420,12 @@ async function settleCheckpointReview(input: {
       exchangeDelta = checkpointDelta(result.value.changes, config);
     }
     return {
+      evidenceMethod: "snapshot",
+      ...(before.toolOnlyHistory ? { evidenceCoverageNotice: TOOL_ONLY_HISTORY_NOTICE } : {}),
       workspaceChanges: windowDelta.changes, exchangeWorkspaceChanges: exchangeDelta.changes,
       windowPatch: windowDelta.patch, exchangePatch: exchangeDelta.patch,
       snapshotOmissions: [], snapshotOmissionsTruncated: false, ownershipTransferred: false,
-      reviewedBaseline: { kind: "checkpoint", descriptor, cwd, capturedAt: new Date().toISOString() },
+      reviewedBaseline: { kind: "checkpoint", descriptor, cwd, capturedAt: new Date().toISOString(), ...(before.toolOnlyHistory ? { toolOnlyHistory: true } : {}) },
       evidenceRoot,
       frozenCandidateAfter,
       releaseOrphan,
@@ -1378,6 +1513,7 @@ async function settleGitReview(input: {
   const windowId = randomUUID();
   const armed = await armGitCheckpoint(cwd, windowId, options ?? {});
   if (armed.status !== "ok") {
+    if (isEligibleReviewCaptureFailure(armed) && !signal?.aborted) throw new ReviewEvidenceCaptureFailure("Git review-evidence acquisition failed");
     throw gitReviewFailure("arming the Git after-checkpoint", armed);
   }
   const afterDescriptor = armed.value.descriptor;
@@ -1422,6 +1558,7 @@ async function settleGitReview(input: {
       capturedAt: new Date().toISOString(),
     };
     return {
+      evidenceMethod: "snapshot",
       workspaceChanges: windowDelta.changes,
       exchangeWorkspaceChanges,
       windowPatch: windowDelta.patch,
@@ -1463,14 +1600,16 @@ async function settleSnapshotReview(input: ReviewRunInput): Promise<SettledBasel
   const exchangeBefore = exchangeBaseline && isReviewBaseline(exchangeBaseline)
     ? (exchangeBaseline.kind === "snapshot" ? exchangeBaseline.snapshot : undefined)
     : undefined;
-  const after = await createWorkspaceSnapshot(input.cwd, {
-    maxFileBytes: input.config.maxFileBytes,
-    maxSnapshotBytes: input.config.maxSnapshotBytes,
-    reuseUnchangedFrom: exchangeBefore ?? before,
-  });
+  if (resolve(before.cwd) !== resolve(input.cwd)
+    || (exchangeBefore && resolve(exchangeBefore.cwd) !== resolve(input.cwd))) {
+    throw new Error("review gate: snapshot baseline root mismatch");
+  }
+  const after = input.preparedSnapshots?.after ?? await acquireReviewWorkspaceSnapshot(input.cwd, input.config, input.signal, exchangeBefore ?? before);
   const workspaceChanges = compareSnapshots(before, after);
   const exchangeWorkspaceChanges = exchangeBefore ? compareSnapshots(exchangeBefore, after) : workspaceChanges;
   return {
+    evidenceMethod: "snapshot",
+    ...(input.preparedSnapshots?.toolOnlyHistory ? { evidenceCoverageNotice: TOOL_ONLY_HISTORY_NOTICE } : {}),
     workspaceChanges,
     exchangeWorkspaceChanges,
     snapshotOmissions: after.omissions,
@@ -1481,6 +1620,8 @@ async function settleSnapshotReview(input: ReviewRunInput): Promise<SettledBasel
 }
 
 interface CurrentChanges {
+  evidenceMethod: ReviewEvidenceMethod;
+  evidenceCoverageNotice?: string;
   evidenceRoot?: string;
   changes: ChangedFile[];
   workspaceChanges: ChangedFile[];
@@ -1492,66 +1633,30 @@ interface CurrentChanges {
   releaseOrphan?: () => Promise<void>;
 }
 
-async function collectCurrentChanges(input: {
-  cwd: string;
-  checkpointScope?: ReviewCheckpointScope;
-  before?: WorkspaceSnapshot | ReviewBaseline;
-  config: ReviewGateConfig;
-  evidence?: EvidenceState;
-}): Promise<CurrentChanges> {
+async function collectCurrentChanges(input: Omit<AskReviewerInput, "question" | "request">): Promise<CurrentChanges> {
+  if (!input.before && input.evidenceCaptureFailure !== undefined) {
+    return collectCurrentChanges({ ...input, before: { kind: "tool", cwd: input.cwd, capturedAt: new Date().toISOString(), fallback: true } });
+  }
   if (!input.before) {
-    return { changes: [], workspaceChanges: [], evidenceChanges: [], sideEffectChanges: [], snapshotOmissions: [], snapshotOmissionsTruncated: false };
+    // Reviewer questions without a window have always been context-only;
+    // never label that answer as a captured or certified snapshot.
+    const evidenceCoverageNotice = "No workspace review baseline is available; answering from supplied context and retained tool evidence, without exact-snapshot certification.";
+    return { evidenceMethod: "tool-only", evidenceCoverageNotice, ...splitReviewChanges([], retainedToolChanges(input.evidence)), snapshotOmissions: [], snapshotOmissionsTruncated: false };
   }
-  // #193 slice D: a Git baseline settles through one frozen ephemeral
-  // after-checkpoint; the caller releases the pin (fail closed) once every
-  // artifact is written.
-  const checkpointBefore = typedCheckpointBaselineOf(input.before);
-  const gitBefore = typedGitBaselineOf(input.before);
-  if (checkpointBefore || gitBefore) {
-    const settled = checkpointBefore
-      ? await settleCheckpointReview({ cwd: input.cwd, before: checkpointBefore, config: input.config, evidence: input.evidence, scope: input.checkpointScope })
-      : await settleGitReview({ cwd: input.cwd, before: gitBefore!, config: input.config });
-    try {
-      const evidenceChanges = input.evidence
-        ? await collectSettledEvidence(input.evidence, input.cwd, input.config, settled.workspaceChanges, undefined, true, settled.frozenCandidateAfter, settled.evidenceRoot)
+  const settled = await settleReviewEvidence({ ...input, before: input.before, request: "" });
+  try {
+    const evidenceChanges = settled.evidenceMethod !== "snapshot"
+      ? retainedToolChanges(input.evidence)
+      : input.evidence
+        ? await collectSettledEvidence(input.evidence, input.cwd, input.config, settled.workspaceChanges, undefined,
+          Boolean(settled.reviewedBaseline && settled.reviewedBaseline.kind !== "snapshot"), settled.frozenCandidateAfter, settled.evidenceRoot)
         : [];
-      return {
-        ...splitReviewChanges(settled.workspaceChanges, evidenceChanges),
-        windowPatch: settled.windowPatch,
-        snapshotOmissions: [],
-        snapshotOmissionsTruncated: false,
-        evidenceRoot: settled.evidenceRoot,
-        releaseOrphan: settled.releaseOrphan,
-      };
-    } catch (error) {
-      // Evidence collection after settling must not orphan the ephemeral pin
-      // either; a failed release is reported alongside the original error.
-      return rethrowAfterRelease(error, settled.releaseOrphan);
-    }
+    return { evidenceMethod: settled.evidenceMethod, evidenceCoverageNotice: settled.evidenceCoverageNotice, ...splitReviewChanges(settled.workspaceChanges, evidenceChanges),
+      windowPatch: settled.windowPatch, snapshotOmissions: settled.snapshotOmissions,
+      snapshotOmissionsTruncated: settled.snapshotOmissionsTruncated, evidenceRoot: settled.evidenceRoot, releaseOrphan: settled.releaseOrphan };
+  } catch (error) {
+    return rethrowAfterRelease(error, settled.releaseOrphan);
   }
-  // #193: the reviewer-question settle capture reuses verified facts from
-  // the provided completed `before` baseline; unchanged entries are
-  // re-verified against the live entry and every retain/omit decision is
-  // recomputed, so changes made after the baseline are fully inspected
-  // exactly as a fresh capture would inspect them.
-  const legacyBefore = legacySnapshotOf(input.before);
-  const after = await createWorkspaceSnapshot(input.cwd, {
-    maxFileBytes: input.config.maxFileBytes,
-    maxSnapshotBytes: input.config.maxSnapshotBytes,
-    reuseUnchangedFrom: legacyBefore,
-  });
-  const workspaceChanges = compareSnapshots(legacyBefore, after);
-  const evidenceChanges = input.evidence
-    ? await collectEvidenceChanges(input.evidence, input.cwd, {
-      maxFileBytes: input.config.maxFileBytes,
-      maxSnapshotBytes: input.config.maxSnapshotBytes,
-    })
-    : [];
-  return {
-    ...splitReviewChanges(workspaceChanges, evidenceChanges),
-    snapshotOmissions: after.omissions,
-    snapshotOmissionsTruncated: after.omissionsTruncated,
-  };
 }
 
 /** Typed checkpoints supply included in-root after-values. Excluded evidence

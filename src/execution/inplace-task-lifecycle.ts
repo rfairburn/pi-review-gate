@@ -16,6 +16,7 @@
  * with its exact persistence-failure disclosure.
  */
 import type { ExecutorPoolAssignment, ExecutorPoolLease } from "./executor-pool";
+import { TOOLS_ONLY_LABEL } from "../review-evidence";
 import type { BackgroundExecutionGroup } from "./background-group-store";
 import {
   isStoppedForExit,
@@ -171,6 +172,8 @@ async function runInPlaceTaskWorker(
       },
       takeDeferredSteering: () => deps.steering.claimDeferred(group, task),
       onUpdate: (update) => inPlaceProgress(group, task, update, deps),
+      // Always-on originating UI channel, independent of noisy activity/notices.
+      onEvidenceWarning: async (message) => { await deps.notify(message); },
       ...(continuation ? {
         initialResult: task.inplaceResult,
         continuation: { instructions: feedback ?? "" },
@@ -290,7 +293,10 @@ export async function finishInPlaceTask(
       ...(externalLine ? [externalLine] : []),
       ...inPlaceLimitLines(result),
     ].join("\n");
-    await deps.wake.wake(task, "failure", `In-place task ${task.taskId} stopped before settlement (${result.status}).`);
+    await deps.wake.wake(task, "failure", [
+      `In-place task ${task.taskId} stopped before settlement (${result.status}).`,
+      ...inPlaceLimitLines(result),
+    ].join("\n"));
   }
   task.updatedAt = new Date().toISOString();
   await deps.persistence.save(group);
@@ -389,9 +395,17 @@ export function inPlaceReviewDisposition(result: {
 export function inPlaceLimitLines(result: {
   toolObservationsTruncated?: boolean;
   baseline?: InPlaceLifecycleResult["baseline"];
+  evidenceMethod?: InPlaceLifecycleResult["evidenceMethod"];
+  evidenceCoverageNotice?: string;
+  reviewEvidenceNotes?: string[];
 }): string[] {
   const lines: string[] = [];
   if (result.toolObservationsTruncated === true) lines.push("Tool-event observations truncated.");
+  if (result.evidenceMethod && result.evidenceMethod !== "snapshot") lines.push(`InPlace review evidence: ${TOOLS_ONLY_LABEL}${result.evidenceMethod === "tool-only-fallback" ? " (snapshot-failure fallback)" : ""}; no exact workspace snapshot certification.`);
+  if (result.evidenceCoverageNotice) lines.push(result.evidenceCoverageNotice);
+  for (const note of result.reviewEvidenceNotes ?? []) {
+    if (note.startsWith("WARNING: InPlace")) lines.push(note);
+  }
   const snapshot = result.baseline?.snapshot;
   const omissions = snapshot?.omissions.length ?? 0;
   if (omissions > 0) {
@@ -420,7 +434,9 @@ export function inPlaceFailureError(undeliveredCount: number, result: {
 export function inPlaceChangedLine(result: {
   attributionError?: string;
   changedSinceLaunch: Array<{ status: string; path: string }>;
+  baseline?: InPlaceLifecycleResult["baseline"];
 }): string {
+  if (result.baseline?.mode === "tool") return "Workspace changes since launch: not snapshot-captured; tool evidence does not certify no changes.";
   return `Workspace changes since launch: ${result.attributionError
     ? `could not be verified (${result.attributionError})`
     : formatInPlaceChangedPaths(result.changedSinceLaunch)}`;

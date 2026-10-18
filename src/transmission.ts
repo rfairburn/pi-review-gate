@@ -4,6 +4,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { syncDirectoryBestEffort } from "./file-publication";
 import { redactSensitiveText } from "./redaction";
 import type { ReviewFinding, ReviewResult } from "./schema";
+import { evidenceMethodNotice, type ReviewEvidenceMethod } from "./review-evidence";
 
 export type ReviewTransmissionAction = "correction_required" | "passed" | "deferred" | "review_error";
 
@@ -15,6 +16,8 @@ export interface ReviewTransmission {
 }
 
 export interface ReviewTransmissionEnvelope {
+  evidenceMethod?: ReviewEvidenceMethod;
+  evidenceCoverageNotice?: string;
   version: 1;
   reviewSequence: number;
   intendedRecipient: "implementing_model";
@@ -47,6 +50,8 @@ export function __testOnly_getReviewDeliveryReceiptTailCount(): number {
 }
 
 export function buildReviewTransmission(input: {
+  evidenceMethod?: ReviewEvidenceMethod;
+  evidenceCoverageNotice?: string;
   reviewSequence: number;
   gateVerdict: ReviewResult["verdict"];
   reviewerResults: ReviewResult[];
@@ -72,13 +77,15 @@ export function buildReviewTransmission(input: {
     action: input.action,
     gateVerdict: input.gateVerdict,
     reviewerResults,
+    ...(input.evidenceMethod ? { evidenceMethod: input.evidenceMethod } : {}),
+    ...(input.evidenceCoverageNotice ? { evidenceCoverageNotice: input.evidenceCoverageNotice } : {}),
   };
 
   return {
     reviewSequence: input.reviewSequence,
     action: input.action,
     envelope,
-    message: renderTransmission(envelope, input.bundleDir),
+    message: `${input.evidenceMethod ? `${evidenceMethodNotice(input.evidenceMethod)}\n\n` : ""}${input.evidenceCoverageNotice ? `${input.evidenceCoverageNotice}\n\n` : ""}${renderTransmission(envelope, input.bundleDir)}`,
   };
 }
 
@@ -94,6 +101,8 @@ export async function writeReviewTransmission(
 }
 
 export async function createReviewTransmissionMessage(input: {
+  evidenceMethod?: ReviewEvidenceMethod;
+  evidenceCoverageNotice?: string;
   invocationDir: string;
   reviewSequence: number;
   gateVerdict: ReviewResult["verdict"];

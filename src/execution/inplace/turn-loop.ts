@@ -19,7 +19,7 @@ import {
   type OperationRecord,
 } from "../operation-record";
 import { resolveExecutorToolCatalog } from "../tool-catalog";
-import type { InPlaceBaseline } from "./basis";
+import type { InPlaceBasis } from "./basis";
 import { computeRetryDelay } from "../retry-delay";
 
 // ── executor turn loop (no checkpoints, fail closed) ─────────────────────────
@@ -185,7 +185,7 @@ async function inPlaceRetryDelay(
 export async function runInplaceTurnLoop(input: {
   adapter: ExecutorAdapter;
   evidence: EvidenceState;
-  baseline: InPlaceBaseline;
+  baseline: InPlaceBasis;
   workspaceRoot: string;
   artifactDir: string;
   config: ReviewGateConfig;
@@ -244,6 +244,8 @@ export async function runInplaceTurnLoop(input: {
 
       let turn: ExecutorTurn | undefined;
       let thrown: unknown;
+      const warning = input.evidence.reviewEvidenceNotes?.filter((note) => note.startsWith("WARNING: InPlace")).at(-1);
+      if (warning && !prompt.includes(warning)) prompt = `${warning}\n\n${prompt}`;
       try {
         turn = await input.adapter.run({
           cwd: input.workspaceRoot,

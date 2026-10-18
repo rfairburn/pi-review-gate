@@ -76,6 +76,7 @@ export function buildReviewerInstructions(escalation?: ImplementationGuidanceEsc
 }
 
 export interface ReviewerPromptContext {
+  evidenceMethod?: import("./review-evidence").ReviewEvidenceMethod;
   request: string;
   submittedChanges: ChangedFile[];
   sideEffectChanges?: ChangedFile[];
@@ -181,7 +182,9 @@ base: ${input.changeIdentity.baseCommit}
 candidate: ${input.changeIdentity.candidateCommit}
 range: ${input.changeIdentity.baseCommit}..${input.changeIdentity.candidateCommit}
 </change_identity>
-This review verdict applies specifically to candidate commit ${input.changeIdentity.candidateCommit}.`
+${input.evidenceMethod && input.evidenceMethod !== "snapshot"
+  ? "This candidate identity is retained for checkpoint/landing association only. The tool-evidence assessment does NOT certify this exact candidate snapshot."
+  : `This review verdict applies specifically to candidate commit ${input.changeIdentity.candidateCommit}.`}`
   : ""}
 
 Use "file": "session" and "line": null for findings about missing commands, process evidence, or other issues that do not belong to a specific file.

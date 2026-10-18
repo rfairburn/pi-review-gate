@@ -292,7 +292,7 @@ export async function captureUntrackedEntry(
   await assertUntrackedParents(root, path, parents);
   let bytes: Buffer;
   const handle = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW).catch((error): never => {
-    throw untrackedCaptureError(path, error, "could not open");
+    throw untrackedEvidenceAcquisitionError(path, error, "could not open");
   });
   try {
     const stat = await handle.stat();
@@ -315,7 +315,9 @@ export async function captureUntrackedEntry(
     bytes = Buffer.alloc(stat.size);
     let offset = 0;
     while (offset < stat.size) {
-      const { bytesRead } = await handle.read(bytes, offset, stat.size - offset, offset);
+      const { bytesRead } = await handle.read(bytes, offset, stat.size - offset, offset).catch((error): never => {
+        throw untrackedEvidenceAcquisitionError(path, error, "could not read");
+      });
       if (bytesRead === 0) break;
       offset += bytesRead;
     }
@@ -323,7 +325,10 @@ export async function captureUntrackedEntry(
       throw new GitCheckpointError(`untracked path ${path} changed while being captured`, "untracked_capture_race");
     }
   } finally {
-    await handle.close().catch(() => undefined);
+    await handle.close().catch((error): never => {
+      // Never preserve an acquisition marker across unconfirmed cleanup.
+      throw new GitCheckpointError(`could not close untracked capture: ${messageOf(error)}`, "git_failed");
+    });
   }
   let post;
   try {
@@ -336,6 +341,12 @@ export async function captureUntrackedEntry(
     throw new GitCheckpointError(`untracked path ${path} changed while being captured`, "untracked_capture_race");
   }
   return { path, kind: "file", mode: pre.mode, dev: pre.dev, ino: pre.ino, size: pre.size, mtimeMs: pre.mtimeMs, ctimeMs: pre.ctimeMs, contentB64: bytes.toString("base64") };
+}
+
+function untrackedEvidenceAcquisitionError(path: string, error: unknown, verb: string): GitCheckpointError {
+  const mapped = untrackedCaptureError(path, error, verb);
+  return ["EACCES", "EPERM", "EIO", "EMFILE", "ENFILE", "EFBIG"].includes(fsCodeOf(error) ?? "")
+    ? new GitCheckpointError(mapped.message, mapped.reason, true) : mapped;
 }
 
 export function untrackedCaptureError(path: string, error: unknown, verb: string): GitCheckpointError {

@@ -190,6 +190,7 @@ export async function runWaveTaskFresh(
   task.error = worker?.error;
   if (isStoppedForExit(task) && result.landing?.status !== "landed") {
     task.summary = "Executor stopped for application shutdown; the durable checkpoint must be verified before resume.";
+    preserveWorkerEvidenceWarnings(task);
     task.updatedAt = new Date().toISOString();
     await deps.persistence.save(group);
     await deps.persistence.publishAssociations();
@@ -246,6 +247,7 @@ export async function runWaveTaskFresh(
     transitionTaskState(task, worker?.bundle ? "paused_recoverable" : "failed");
     await deps.wake.wake(task, "failure", `Task ${task.taskId} failed: ${task.error ?? task.summary ?? "unknown failure"}`);
   }
+  preserveWorkerEvidenceWarnings(task);
   task.updatedAt = new Date().toISOString();
   if (task.state === "landed") {
     await deps.bookkeeping.tolerate(task, "durable save", async () => {
@@ -370,6 +372,9 @@ export async function runWaveTaskContinuation(
     }
     if (result.landing?.status === "landed") {
       task.summary = "Continued task landed independently in the main workspace.";
+      // Completion delivery owns a copied task snapshot. Preserve actual-use
+      // warnings before that snapshot/save/wake, not only in final bookkeeping.
+      preserveWorkerEvidenceWarnings(task);
       const paths = [...(result.landing.appliedPaths ?? []), ...(result.landing.alreadyAppliedPaths ?? [])];
       // The source workspace was mutated successfully (finding 2): run the
       // parent checkpoint as tolerated bookkeeping (preserving the success-path
@@ -418,6 +423,7 @@ export async function runWaveTaskContinuation(
     command.error = messageOf(error);
     throw error;
   } finally {
+    preserveWorkerEvidenceWarnings(task);
     task.updatedAt = new Date().toISOString();
     if (task.state === "landed") {
       await deps.bookkeeping.tolerate(task, "durable save", async () => {
@@ -429,6 +435,14 @@ export async function runWaveTaskContinuation(
       await deps.persistence.publishAssociations();
     }
     deps.indicator.update();
+  }
+}
+
+function preserveWorkerEvidenceWarnings(task: BackgroundTaskRecord): void {
+  for (const line of (task.result?.taskResults[0]?.summary ?? "").split(/\r?\n/)) {
+    if (line.startsWith("WARNING: Isolated worktree") && !task.summary?.includes(line)) {
+      task.summary = `${task.summary ?? ""}\n\n${line}`;
+    }
   }
 }
 
@@ -474,6 +488,12 @@ function waveProgress(group: BackgroundExecutionGroup, task: BackgroundTaskRecor
   const next = isDispatchCapture ? undefined : stateFromWaveProgress(update);
   const previous = next ? transitionTaskState(task, next) : task.state;
   if (!next) task.updatedAt = new Date().toISOString();
+  const warning = update.subtask?.reviewEvidenceWarning;
+  if (warning?.scope === "worktree" && warning.method === "tool-only-fallback") {
+    // Actual-use UI delivery is independent of Quiet/Noisy and optional
+    // notices. Durable result notes carry the same warning to the model.
+    void deps.notify(warning.message);
+  }
   updateReviewStatus(task, update, next);
   for (const message of update.activity ?? [update.message]) deps.activity.add(task, update.phase, message);
   if (update.subtask) applyExecutorIdentity(task, update.subtask);
@@ -501,6 +521,8 @@ function waveContinuationProgress(group: BackgroundExecutionGroup, task: Backgro
   );
   const next = isDispatchCapture ? undefined : stateFromContinuationProgress(update);
   const previous = next ? transitionTaskState(task, next) : task.state;
+  const warning = update.reviewEvidenceWarning;
+  if (warning?.scope === "worktree" && warning.method === "tool-only-fallback") void deps.notify(warning.message);
   deps.activity.add(task, update.phase, update.message);
   applyExecutorIdentity(task, update);
   // #93: dispatch captures flow through continuations identically.

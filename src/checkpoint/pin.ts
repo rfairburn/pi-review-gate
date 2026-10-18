@@ -132,7 +132,7 @@ export async function cleanupAfterFailedArm(
   armId: string,
   armScratchDir: string,
   spec: GitRunSpec,
-): Promise<void> {
+): Promise<boolean> {
   // Cleanup must run even when the caller's signal is already aborted,
   // otherwise a canceled arm leaks the owned pin ref (and its objects).
   const cleanupSpec: GitRunSpec = { ...spec, signal: undefined };
@@ -143,6 +143,8 @@ export async function cleanupAfterFailedArm(
   // lock. If the lock cannot be obtained, leave the pin in place: no proof
   // can authorize deleting it later outside this critical section.
   let unlockPin: (() => Promise<void>) | undefined;
+  let pinRemoved = false;
+  let scratchRemoved = false;
   try {
     unlockPin = await acquireWindowPinLock(repo.gitDir, windowId, cleanupSpec);
     let genOut: GitRunOutput | undefined;
@@ -151,22 +153,25 @@ export async function cleanupAfterFailedArm(
     } catch { /* best effort — no proof, so no delete */ }
     if (genOut !== undefined && genOut.code === 0 && genOut.stdout.toString("utf8").trim() === pinGenerationMessage(armId)) {
       try {
-        await runGit(
+        const removed = await runGit(
           gitPath,
           repo.root,
           ["update-ref", "--no-deref", "-m", "prg-git-checkpoint cleanup", "-d", checkpointRefForWindow(windowId), base],
           cleanupSpec,
         );
+        pinRemoved = removed.code === 0 && removed.stderr.trim() === "";
       } catch { /* best effort */ }
     }
 
     try {
       await rm(armScratchDir, { recursive: true, force: true });
-    } catch { /* best effort */ }
+      scratchRemoved = true;
+    } catch { /* best effort, explicitly unconfirmed to evidence consumers */ }
     // Drop the shared window dir only if empty; never delete other arms.
     try { await rmdir(dirname(armScratchDir)); } catch { /* non-empty */ }
   } catch { /* no lock/proof: leave the pin for bounded manual recovery */ }
   finally { await unlockPin?.(); }
+  return pinRemoved && scratchRemoved;
 }
 
 // ── Pin verification ─────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { effectiveReviewSettings, type ReviewGateConfig } from "../config";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "../correction-feedback";
 import { rememberFinalAssistantSummary } from "../evidence";
+import { primaryEvidencePolicy, evidenceMethodNotice, isEligibleReviewCaptureFailure } from "../review-evidence";
 import { BackgroundProcessReadiness } from "../background-process-readiness";
 import { type BackgroundShellController, type BackgroundShellLifecycleEvent } from "../background-shell";
 import {
@@ -82,6 +83,8 @@ export interface ReviewTurnDependencies {
   syncExecutionContext: (args: unknown[]) => void;
   checkpointRestartBlocked: () => string | undefined;
   effectiveReviewConfig: () => ReviewGateConfig;
+  applyPendingEvidenceSettings?: () => Promise<void>;
+  warnEvidenceMethod?: (message: string) => Promise<void>;
   /** Ordinary save (may resolve without writing). */
   persist: () => Promise<void>;
   /** Durable-boolean save for the automatic-delivery uncertainty gate. */
@@ -291,9 +294,17 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
     agentRunActive = true;
     deps.observeCwd(args);
     deps.syncExecutionContext(args);
+    await deps.applyPendingEvidenceSettings?.();
     beginAgentRun(deps.state);
     if (activeExchangeHasBaseline(deps.state)) return "armed";
     const existing = deps.state.reviewWindow?.baseline;
+    const policy = primaryEvidencePolicy(deps.config);
+    if (!existing && policy.toolOnly) {
+      setReviewWindowCheckpointBaseline(deps.state, { kind: "tool", cwd: deps.cwd(), capturedAt: new Date().toISOString() });
+      freezeReviewWindowConfig(deps.state, deps.config, deps.scopedModels());
+      await deps.persist();
+      return "armed";
+    }
     if (existing && existing.kind !== "checkpoint") {
       // Restored legacy windows retain their own typed baseline and settle
       // through their existing fail-closed path until that window closes.
@@ -302,8 +313,22 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       await deps.persist();
       return "armed";
     }
-    const captured = existing ? undefined : await captureReviewCheckpoint(deps.cwd(), `window-${deps.state.reviewWindow?.id ?? 0}-${randomUUID()}`, { scope: deps.state.checkpointScope });
-    if (captured && captured.status !== "ok") throw new Error(`review gate: baseline capture failed (${captured.reason}): ${captured.detail}`);
+    const signal = extractSignal(args);
+    signal?.throwIfAborted();
+    const captured = existing ? undefined : await captureReviewCheckpoint(deps.cwd(), `window-${deps.state.reviewWindow?.id ?? 0}-${randomUUID()}`, { scope: deps.state.checkpointScope, signal });
+    if (captured && captured.status !== "ok") {
+      if (policy.snapshotFailureFallback && !signal?.aborted && isEligibleReviewCaptureFailure(captured)) {
+        // Failed mandatory notification leaves initialization unarmed, so a
+        // later start retries it instead of reusing an undisclosed fallback.
+        await deps.warnEvidenceMethod?.(evidenceMethodNotice("tool-only-fallback"));
+        signal?.throwIfAborted();
+        setReviewWindowCheckpointBaseline(deps.state, { kind: "tool", cwd: deps.cwd(), capturedAt: new Date().toISOString(), fallback: true });
+        freezeReviewWindowConfig(deps.state, deps.config, deps.scopedModels());
+        await deps.persist();
+        return "armed";
+      }
+      throw new Error(`review gate: baseline capture failed (${captured.reason}): ${captured.detail}`);
+    }
     const baseline = existing ?? (captured?.status === "ok"
       ? { kind: "checkpoint" as const, descriptor: captured.value, cwd: deps.cwd(), capturedAt: new Date().toISOString() }
       : undefined);
@@ -454,6 +479,8 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
         try {
           if (window?.baseline && !runAborted) {
             await collectPausedReviewExchange({
+              notify: deps.warnEvidenceMethod,
+              evidencePolicy: primaryEvidencePolicy(deps.config),
               cwd: deps.cwd(),
               checkpointScope: deps.state.checkpointScope,
               config: window.reviewConfig ?? deps.config,
@@ -505,6 +532,8 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
           return;
         }
         await collectPausedReviewExchange({
+          notify: deps.warnEvidenceMethod,
+          evidencePolicy: primaryEvidencePolicy(deps.config),
           cwd: deps.cwd(),
           checkpointScope: deps.state.checkpointScope,
           config: window.reviewConfig ?? freezeReviewWindowConfig(deps.state, deps.config, deps.scopedModels()),
@@ -582,6 +611,8 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       }
       if (deps.state.reviewsPaused) {
         await collectPausedReviewExchange({
+          notify: deps.warnEvidenceMethod,
+          evidencePolicy: primaryEvidencePolicy(deps.config),
           cwd: deps.cwd(),
           checkpointScope: deps.state.checkpointScope,
           config: reviewConfig,
@@ -592,6 +623,9 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
         return;
       }
 
+      // Capture alongside ownership, before evidence draining or persistence
+      // can yield to a settings apply. A deferred choice belongs to a later review.
+      const reviewEvidencePolicy = primaryEvidencePolicy(deps.config);
       deps.state.reviewInProgress = true;
       ownedReviewToken = beginOwnedReviewActivity();
       deps.state.reviewActivityToken = ownedReviewToken;
@@ -616,6 +650,9 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       });
       activeReviewAbort = reviewAbort;
       try {
+        // Finish any already-mutated transition whose persistence/warning failed.
+        // New policy mutations are deferred while this review owns the window.
+        await deps.applyPendingEvidenceSettings?.();
         await drainEvidenceCaptures();
         await deps.persist();
       } catch (error) {
@@ -644,6 +681,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       activeStatusTracker = statusTracker;
       try {
         output = await runReview({
+          evidencePolicy: reviewEvidencePolicy,
           cwd: deps.cwd(),
           checkpointScope: deps.state.checkpointScope,
           request: buildRequestContext(deps.state, deps.state.reviewWindow, { priorFeedback: "latest" }),
@@ -654,7 +692,9 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
           actingUsage,
           window,
           signal: reviewAbort.signal,
-          notify: (message) => sendNoticeWhileSessionActive(noticeTarget, message, () => deps.isSessionActive()),
+          notify: (message) => message.startsWith("WARNING: Review evidence method:") && deps.warnEvidenceMethod && deps.isSessionActive()
+            ? deps.warnEvidenceMethod(message)
+            : sendNoticeWhileSessionActive(noticeTarget, message, () => deps.isSessionActive()),
           onUpdate: (message) => statusTracker.update(message),
           onInvocationPrepared: () => deps.persist(),
         });
@@ -772,7 +812,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
         });
         await sendNoticeWhileSessionActive(
           noticeTarget,
-          `review gate: ${output.result.error === "partial_reviewer_error" ? "passed with reviewer warnings" : "passed"} (${formatTokenUsage(output.result.usage)})`,
+          `review gate: ${output.result.error === "partial_reviewer_error" ? "passed with reviewer warnings" : "passed"} (${formatTokenUsage(output.result.usage)})${output.evidenceMethod && output.evidenceMethod !== "snapshot" ? ` — ${evidenceMethodNotice(output.evidenceMethod)}` : ""}`,
           () => deps.isSessionActive(),
         );
         await deliverAutomaticTransmission(deps.pi, noticeTarget, deps.state, output, "passed", transmission, () => deps.isSessionActive(), deps.persistAutomaticDelivery);
@@ -975,6 +1015,8 @@ async function transmitReviewPass(input: {
   action: ReviewTransmissionAction;
 }): Promise<string> {
   const message = await createReviewTransmissionMessage({
+    evidenceMethod: input.output.evidenceMethod,
+    evidenceCoverageNotice: input.output.evidenceCoverageNotice,
     invocationDir: input.output.invocationDir!,
     reviewSequence: input.output.reviewSequence!,
     gateVerdict: input.output.result!.verdict,

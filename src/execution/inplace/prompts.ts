@@ -1,4 +1,5 @@
 import { buildEvidenceBundle, type EvidenceState } from "../../evidence";
+import { TOOLS_ONLY_LABEL, WORKSPACE_CHANGES_LABEL } from "../../review-evidence";
 import type { WaveWorkerTask } from "../wave-worker";
 import type { InPlaceAttribution } from "./basis";
 
@@ -32,37 +33,48 @@ export function buildInPlaceReviewRequest(task: WaveWorkerTask, attribution: InP
     );
   }
   const baseline = attribution.baseline;
-  const baselineSummary = baseline.mode === "git"
+  const toolOnly = attribution.evidenceMethod !== undefined && attribution.evidenceMethod !== "snapshot";
+  const baselineSummary = baseline.mode === "tool"
+    ? "No pre-work workspace snapshot exists. This task has a durable tool-evidence basis, not an empty workspace snapshot."
+    : baseline.toolOnlyHistory
+      ? `${WORKSPACE_CHANGES_LABEL} snapshot baseline recovered after earlier ${TOOLS_ONLY_LABEL} work; it covers subsequent work only, not the full launch interval.`
+      : baseline.mode === "git"
     ? `Git: the workspace was inside a repository at HEAD ${baseline.gitHead ?? "(unborn HEAD)"} when the task launched.`
     : "The workspace was not inside a Git repository when the task launched; content snapshots are the only attribution basis.";
   const changedEntries = attribution.changes.map((change) => `${change.status}: ${change.path}`);
   const clipped = clipPaths(changedEntries, 200);
-  const gitNote = attribution.gitHeadMoved === true
-    ? `Git HEAD moved after launch${attribution.gitCurrentHead ? ` to ${attribution.gitCurrentHead}` : ""}; the file delta above describes workspace content, not Git history. Never present commits as the reviewed candidate; review the recorded workspace delta.`
+  const baselineInterval = baseline.mode !== "tool" && baseline.toolOnlyHistory ? "the recovery baseline" : "launch";
+  const gitNote = toolOnly ? undefined : attribution.gitHeadMoved === true
+    ? `Git HEAD moved after ${baselineInterval}${attribution.gitCurrentHead ? ` to ${attribution.gitCurrentHead}` : ""}; the file delta above describes workspace content, not Git history. Never present commits as the reviewed candidate; review the recorded workspace delta.`
     : baseline.mode === "git"
-      ? "Git HEAD has not moved since launch; the recorded delta is the workspace content change since launch."
+      ? `Git HEAD has not moved since ${baselineInterval}; the recorded delta is the workspace content change since that baseline.`
       : undefined;
   lines.push(
     "",
     "In-place workspace disclosure (authoritative):",
     `The worker ran and wrote directly in the launch-selected workspace ${baseline.workspaceRoot}. No candidate commit, wave capture, or landing exists for this task, and review is not a gate over those writes: they already happened where performed.`,
     baselineSummary,
-    `Recorded workspace delta since launch (${changedEntries.length} path(s) changed):`,
-    ...(changedEntries.length === 0 ? ["- (none)"] : clipped.lines),
-    ...(attribution.baseline.snapshot.omissionsTruncated
+    ...(toolOnly
+      ? [`Workspace delta not captured under the selected ${TOOLS_ONLY_LABEL} method; an empty observed set is NOT proof of no changes or no effects.`]
+      : [`Recorded workspace delta ${baseline.mode !== "tool" && baseline.toolOnlyHistory ? "since recovery baseline (subsequent work only)" : "since launch"} (${changedEntries.length} path(s) changed):`, ...(changedEntries.length === 0 ? ["- (none)"] : clipped.lines)]),
+    ...(attribution.evidenceCoverageNotice ? [attribution.evidenceCoverageNotice] : []),
+    ...(attribution.baseline.snapshot?.omissionsTruncated
       ? ["- The launch baseline snapshot was incomplete (its omission ledger overflowed): some pre-launch entries may be missing from the delta in either direction."]
       : []),
-    ...(attribution.baseline.snapshot.omissions.length > 0 || attribution.snapshotAfter.omissions.length > 0
+    ...((attribution.baseline.snapshot?.omissions.length ?? 0) > 0 || (attribution.snapshotAfter?.omissions.length ?? 0) > 0
       ? ["- Entries the snapshot policy skips (ignored directories, oversized files) are excluded from this delta; their content is not evidence here."]
       : []),
     ...(gitNote ? [gitNote] : []),
     "",
     "Attribution boundary (authoritative):",
-    "The delta above is the recorded workspace change since launch. It may contain this worker's changes and — when other writers acted concurrently — those writers' changes as well; the harness cannot prove which post-launch changes the worker made. Do not credit changes to the worker that you cannot attribute to the task's recorded instructions, and do not silently present unrelated concurrent changes as reviewed worker output. When attribution is uncertain, say so in findings and in your summary instead of guessing either way.",
-    "A review verdict here is a post-hoc evaluation only: it never represents a pre-write gate, a rollback, or an undo of external side effects (network or API actions, processes, writes outside the workspace). Your review scope is exactly what direct orchestrator work in this workspace would receive.",
+    toolOnly
+      ? "Assess retained supported tool observations and after-content plus labelled worker claims/context with their limits. No whole-root diff is supplied. Observations are not proof of authorship or universal effects; unrelated concurrent REPORT edits are not worker evidence. Missing observations must not block assessment and are never proof of clean work."
+      : "The delta above is the recorded workspace change since its baseline. It may contain this worker's changes and — when other writers acted concurrently — those writers' changes as well; the harness cannot prove which post-launch changes the worker made. Do not credit changes to the worker that you cannot attribute to the task's recorded instructions, and do not silently present unrelated concurrent changes as reviewed worker output. When attribution is uncertain, say so in findings and in your summary instead of guessing either way.",
+    "A review verdict here is a post-hoc evaluation only: it never represents a pre-write gate, a rollback, or an undo of external side effects (network or API actions, processes, writes outside the workspace). Your review scope is the evidence supplied for this InPlace task under its captured policy, independently of the Primary evidence setting.",
     "",
     "Workspace snapshot disclosure:",
-    "The recorded baseline is a bounded content snapshot of the launch workspace; files the snapshot policy skips (ignored directories, oversized files) are excluded from the delta.",
+    toolOnly ? "Filesystem/Git review snapshotting was omitted. Retained bounded candidate after-content is an observation, not a verified before/after diff."
+      : "The recorded baseline is a bounded content snapshot; files the snapshot policy skips (ignored directories, oversized files) are excluded from the delta.",
   );
   // #266: the evidence bundle — including the worker's completed final
   // summaries — belongs in the request whenever review was admitted with
@@ -124,10 +136,12 @@ export function buildInPlacePrompt(task: WaveWorkerTask, workspaceRoot: string):
     "Everything you write stays exactly where you write it. There is no wave capture, no candidate commit, no review gate before your writes, and no rollback: your writes and any external side effects (network or API actions, installs, processes, writes outside this workspace) happen where performed, immediately.",
     "Never launch child subtasks and never delegate this work: no subtask tools are available here, and simulating or working around that absence is forbidden.",
     "If the workspace is a Git repository, keep your output as ordinary working-tree files and leave history management to the orchestrator: do not commit, push, or alter branch or worktree ownership metadata. Creating a new repository here (git init, or a fresh clone the task genuinely requires) is allowed.",
-    "An own reviewer runs after your turn settles: it compares this workspace against a snapshot recorded at launch and reports on the recorded delta. That review is post-hoc — it cannot gate your writes or undo anything you or others did.",
+    "An own reviewer runs after your turn settles using the task's captured evidence method. That review is post-hoc — it cannot gate your writes or undo anything you or others did.",
     "",
     "Workspace snapshot disclosure:",
-    "Your reviewer compares this workspace against a bounded content snapshot recorded at launch (plus the observed Git HEAD when the root is inside a repository). Files its snapshot policy skips (ignored directories, oversized files) are excluded from that comparison.",
+    task.reviewEvidencePolicy?.toolOnly
+      ? "Review uses retained observed-tool evidence and bounded candidate after-content, not a whole-workspace/Git snapshot. Missing observations are disclosed; summaries remain claims, never proof of no effects."
+      : "Snapshot review normally compares against a bounded baseline (plus observed Git HEAD where applicable). Snapshot omissions and any actual warning-bearing fallback to tool evidence are disclosed; a later recovery baseline never certifies earlier work.",
     "",
     renderInPlaceTask(task),
     "",

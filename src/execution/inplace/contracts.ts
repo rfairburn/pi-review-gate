@@ -6,7 +6,7 @@ import type { ExecutionIncident, OperationDiagnostics } from "../operation-recor
 import type { WaveWorkerTask } from "../wave-worker";
 import type { ReviewRunOutput } from "../../review";
 import type { SubtaskReviewReport } from "../../review-report";
-import type { InPlaceBaseline } from "./basis";
+import type { InPlaceBasis } from "./basis";
 
 export interface InPlaceRunInput {
   taskId: string;
@@ -26,6 +26,8 @@ export interface InPlaceRunInput {
   executorAssignment?: ExecutorPoolAssignment;
   /** Acquire the next eligible configured executor after retry recovery is exhausted. */
   acquireFailover?: (current: ExecutorPoolAssignment) => Promise<ExecutorPoolAssignment | undefined>;
+  /** Prominent origin-scoped evidence warning, delivered independent of noisy telemetry. */
+  onEvidenceWarning?: (message: string) => void | Promise<void>;
   /** Optional adapter factory for embedding/tests; normal dispatch uses the configured factory. */
   adapterFactory?: (config: ReviewGateConfig, selection: ExecutorSelection) => ExecutorAdapter;
 }
@@ -69,6 +71,8 @@ export interface InPlaceReviewCycle {
   cycle: number;
   /** External-path evidence revision reviewed in this cycle; not a content identity. */
   externalObservationRevision?: number;
+  /** Structured mutation-path observation revision reviewed in this cycle; distinct from workspace delta identity. */
+  toolObservationRevision?: number;
   verdict: import("../../schema").ReviewResult["verdict"];
   reviewOutput: ReviewRunOutput;
   /** Workspace delta that was under review in this cycle. */
@@ -93,7 +97,9 @@ export interface InPlaceLifecycleResult {
   /** The workspace the worker ran and wrote in. */
   workspaceRoot: string;
   /** Launch-time attribution basis, retained for inspection and continuation flows. */
-  baseline: InPlaceBaseline;
+  baseline: InPlaceBasis;
+  evidenceMethod?: import("../../review-evidence").ReviewEvidenceMethod;
+  evidenceCoverageNotice?: string;
   /** Final recorded delta at lifecycle settlement. */
   changedSinceLaunch: Array<{ status: ChangedFile["status"]; path: string }>;
   /** Absolute tool-observed external path candidates, separate from the selected-root delta. */
@@ -101,6 +107,8 @@ export interface InPlaceLifecycleResult {
   /** Adapter/stream limitations; absence of an event is not evidence of no external action. */
   toolObservabilityNotes?: string[];
   toolObservationsTruncated?: boolean;
+  reviewEvidenceNotes?: string[];
+  reviewEvidenceNotesTruncated?: boolean;
   /**
    * Set when the stop-time attribution could not be inspected against the
    * launch baseline: the workspace delta is then UNKNOWN, never zero, and
@@ -134,7 +142,7 @@ export interface InPlaceLifecycleInput extends InPlaceRunInput {
    * the restored original basis; an omitted value means the lifecycle captures
    * and persists one (fresh dispatch or direct lifecycle use).
    */
-  baseline?: InPlaceBaseline;
+  baseline?: InPlaceBasis;
   /**
    * Authoritative continuation instructions for this dispatch (an admitted
    * in-place continuation, or a restored auto-resume). With a prior durable

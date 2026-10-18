@@ -19,6 +19,21 @@ dates.
 
 ### Fixed
 
+- Parallel worker startup no longer races on one repository's shared Git worktree
+  administration (#451). Preparing, removing, and cleaning up managed worktrees of the
+  same captured repository now run one at a time, so a preparation can no longer observe
+  another preparation's partially created or partially removed registration — previously
+  surfacing as `failed to read worktrees/<id>/commondir` during `git worktree add` and a
+  task that never reached execution. Only that short Git administration section is
+  serialized: executor and reviewer work stays concurrent, different repositories stay
+  independent, and the configured worker pool keeps its capacity. Cancelling a queued
+  preparation still admits no work and mutates no repository metadata, an active
+  preparation keeps its existing bounded failed-creation cleanup, and cancellation,
+  path/ownership validation, retained work, recovery records, and the conservative
+  dirty-worktree removal protections are unchanged — removal still refuses dirty sources
+  and no removal forces, purges, or broadens what it may delete, but its cleanliness
+  revalidation now runs under the same lease so ignored recovery data that appears while
+  a removal waits is preserved rather than deleted.
 - Session-host activity status (#412) now distinguishes a freshly loaded owning runtime
   from historical conversation state. Loading a saved conversation creates a new owning
   runtime rather than attaching to the former process, and a load that admits or resumes

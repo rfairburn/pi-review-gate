@@ -466,9 +466,63 @@ whether any legacy lifetime/metadata record still exists. Existing source-build
 freshness manifests/records remain the sole build-reuse authority and are not
 repurposed as capacity evidence.
 
-`admit(cacheRoot, create, options)` takes one exclusive `.admission.lock`, reclaims
-excess generations down to four (so creation lands at or below five), creates the
-requested generation, and holds that lock until the producer settles its own setup.
+`admit(cacheRoot, create, options)` first takes the canonical per-agent coordination
+entry (`<agentDir>/session-host/host-coordination.lock`) that the session host's
+ownership acquisition also takes, then one exclusive `.admission.lock`, reclaims excess
+generations down to four (so creation lands at or below five), creates the requested
+generation, and holds the admission lock until the producer settles its own setup. The
+admission entry's own identity is captured as part of that acquisition, and that exact
+entry is released even when a host-ownership recheck skips reclamation, so a producer
+never strands its own fresh metadata; release compares that identity, so a replacement
+entry at the path is never removed. The coordination entry is released as soon as the
+fresh generation exists, so a starting host is never held behind a long build or install.
+It is a lock, not a registry: a stale or
+malformed entry is reclaimed like a stale admission lock, and a busy live holder only
+makes cleanup skip (with a bounded warning). Destructive reclamation rechecks the
+ownership record after any admission-lock wait or stale/malformed recovery, and again at
+every destructive boundary, so a host that becomes the owner mid-pass keeps the remaining
+generations; when the coordination entry is unavailable, cleanup is skipped instead of
+racing an ownership acquisition it cannot exclude. Host ownership acquisition likewise
+claims the record inside a coordinated selection/preparation handoff: the launcher takes
+that same entry before its final build/Pi revalidation, the host-entry load, and the
+ownership claim, and hands it back once the ownership record exists. Inside the hold the
+launcher revalidates the prepared build artifact (`validateSourceBuildArtifact` freshness
+authority) and the selected Pi runtime (ordinary positive Node entry plus managed
+generation confinement/identity through `pin`), and re-prepares or reselects them through
+the existing selection path when a concurrent preparation reclaimed them — so a cache this
+launcher pruned itself never becomes a new startup refusal. The native fallback-Node
+producers run the same cleanup-only pass once at preparation settlement (joined, under the
+same canonical entry and admission lock, targeting five while preserving the generation they
+launched), so reclamation deferred by contention is retried instead of waiting for another
+fresh generation. The canonical entry is published already complete (`pid` plus a targeted single-pid
+process-start identity) through a private candidate and an atomic no-overwrite hard link,
+so no half-written canonical record is ever observable and a paused publisher only loses
+the link race; readers accept the publisher's transient hard-link pairing. The identity is one exact per-platform token: `linux:<boot identity>:<starttime>` read
+from that single pid's `/proc/<pid>/stat` (no procps `ps` required, so minimal/BusyBox
+images work), `darwin:<ps lstart>` from one targeted `ps` query, or `win32:<StartTime>`
+from one targeted native PowerShell query for that one numeric pid (fixed argv, bounded,
+no shell string). A record is honored only while its pid is alive *and* still reports the
+recorded token, so a reused pid is reclaimed rather than becoming a permanent gate on any
+supported platform; when the identity genuinely cannot be established no record is
+published (the mutex is unavailable and the launch continues), never a weak pid-only
+record. A birth query that *temporarily* fails is not a proven mismatch: a live pid with
+a non-empty recorded identity is honored, so producer cleanup skips and an ownership
+claim keeps waiting instead of stealing a live destructive holder's mutex mid-deletion,
+while a real, different identity still proves reuse. This process's own identity is
+re-queried until it succeeds and only a positive token is cached, so a transient failure
+at load can never prevent publishing or recognizing its own hold. Stale recovery captures
+the exact entry identity *before* it reads or judges the
+owner in every wrapper, so a contender that publishes its own live record in that window is
+never reclaimed: reclamation stays bound to the entry that was actually judged stale. Coordination helpers are resolved from the standard OS locations when `PATH` is
+limited and are never a cache-cleanup or launch prerequisite. A managed explicit Pi
+selection is validated through the same package authority used for installed packages
+(`validatePiPackage` with the directory-chain check), so a partially reclaimed generation
+that still has a runnable CLI is rejected; an unconfirmed validation-probe cleanup fails
+the launch closed instead of re-preparing over a possibly live runtime. A live coordination holder
+is waited for with no elapsed-time release, since it may be inside the destructive pass
+that would delete this host's prepared generation; a genuine unremovable-entry failure is
+retried and then treated as an unavailable (not refusing) boundary, with the ownership
+record still stopping producer removals.
 Capacity never refuses creation. A stale lock — one whose recorded pid is gone, or
 whose record stays empty/malformed across several observations — is reclaimed instead
 of becoming a permanent stop condition; a live owner is left alone and the producer
@@ -488,12 +542,50 @@ that a reuse selection is a direct child of its managed cache; it writes no reco
 and `generation.release()` settles only the setup admission because the next producer
 cleanup reclaims excess generations.
 
-Removal is a bounded, no-follow postorder walk of one designated generation: links are
-unlinked themselves and never traversed, and a hardlinked file only loses this name.
+Cleanup is progressive and bounded by the pass. One bounded pass inventories the type and
+then removes generations one entry at a time, with deletion as progress: entries are
+unlinked (or removed as empty directories) as they are visited, so a pass that reaches its
+runtime budget keeps everything it removed and the next preparation continues from what
+remains. One pass shares a single runtime budget (120 seconds by default) and a single
+progress allowance instead of resetting either per generation: the budget is checked per
+entry, and once the pass has deleted something it also stops before starting another
+candidate, so a long run of empty directories or direct-child links cannot be processed
+past the budget while the canonical mutex is held. There is no whole-tree preflight, entry-count quota, or depth quota
+that could make a large or deep generation permanently undeletable, and a budget stop is
+never a no-op: a pass that stops has already deleted something. A budget stop is reported
+truthfully (`cache cleanup stopped at its runtime budget … the next preparation reclaims
+more`) and startup continues. Reuse is not idle either: a compatible source-build or Pi
+runtime reuse, and a settled preparation, run the same bounded pass with a per-type
+target of five and never treat the generation this launch selected, created, or is
+returning as a candidate (`keep`). A warm startup therefore converges older generations
+without installing, compiling, or recreating anything.
+
+Removal is a bounded, no-follow walk of one designated generation: links are
+unlinked themselves and never traversed, a hardlinked file only loses this name, and a
+special leaf (FIFO, socket, or device name) is unlinked without being opened, so it
+cannot pin a disposable generation. Leaf names and completed directories are removed in
+native batches (`rm`/`unlink`, then an identity-checked `rmdir` per batch) and directory
+identities are captured in argv-bounded native `stat` batches, so a file-heavy,
+directory-heavy, or long-path generation keeps pace with the budget instead of paying one
+process per descendant or exceeding the platform argument limit; any identity-query
+failure aborts that pass with a truthful warning instead of walking on with missing
+data, and when the bulk tool is unavailable the same walk falls back to one no-follow
+`unlink` per name. A direct-child entry named `.terraform` under the
+producer-owned cache is ordinary disposable content, not an exemption.
 `.terraform` content inside a selected disposable generation is cleanup-specific and is
 removed with it (ordinary source discovery still prunes it before traversal). Partial
 removal leaves the entry counted for a later retry. These are public path-API fences, not an atomic sandbox
 against a malicious same-user writer. No real user cache is used by the focused tests.
+
+Every in-flight generation carries one `.producer-active` marker, and the per-cache
+`.admission.lock` names its owner the same way: `<pid>` plus the owner's targeted birth
+identity, written already complete. A marker or lock that names an identity is honored
+only while that exact identity still holds, so an abandoned record whose pid was reused by
+an unrelated process is reclaimed instead of pinning a generation. A record written by an
+older producer is pid-only and remains readable: it is honored while the live pid's OS
+birth is *not* clearly after the record's own mtime (an earlier birth is legitimate
+in-flight work, a later birth means the number was reused). Missing or malformed metadata
+is never protection, and no real in-flight producer is deleted by cleanup.
 
 Active sessions are protected by the session host's existing exclusive
 agent-directory ownership record ([Recovery](recovery.md) and
@@ -503,12 +595,17 @@ source-build/Pi producer keeps its package/version validation, supported install
 preference, and checksum-pinned fresh Node extraction semantics unchanged.
 
 The fallback Node wrappers reclaim excess direct-child artifacts under
-`.pi-review-gate/node/` before creating another one, using the same best-effort rules.
+`.pi-review-gate/node/` before creating another one, using the same best-effort rules and
+the same per-agent coordination entry, ownership rechecks, and destructive-boundary stop.
+Neither wrapper exempts a direct child named `.terraform`.
 The supported PATH-Node fast route is unchanged, and no mutable extracted Node is
 reused. POSIX uses `scripts/node-generations.sh`; native PowerShell uses an
-in-memory Reflection.Emit handle identity plus a bounded no-follow deletion, live
-`.producer-active` skips, and the same stale-lock recovery; every lock/inventory/removal
-failure is caught as a bounded warning before the fresh generation is created. Windows
+in-memory Reflection.Emit handle identity plus the same bounded no-follow deletion, live
+`.producer-active` skips, and stale-lock recovery; every lock/inventory/removal failure is
+caught as a bounded warning before the fresh generation is created. Both natives share
+the CJS semantics: one runtime budget for the whole pass, deletion as progress, owner
+records carrying a pid plus birth identity, and the same birth/mtime rule for a legacy
+pid-only marker or lock. Windows
 cleanup is native path deletion with reparse points unlinked rather than entered; it
 does not claim descendant-settlement proof beyond that.
 `tests/session-host-entrypoints.test.ts` includes native Windows tests selected by the

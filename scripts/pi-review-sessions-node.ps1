@@ -20,6 +20,18 @@ $env:PI_REVIEW_GATE_NODE_HOLDER = $null
 $CjsEntry = Join-Path $PSScriptRoot 'pi-review-sessions.cjs'
 $MinimumNode = [version]'22.19.0'
 
+# One cleanup pass (inventory plus every removal it attempts) shares this elapsed
+# budget, so a large or deep generation cannot reset the clock per generation.
+$script:NodeCleanupBudgetSeconds = 120
+$script:NodeCleanupStopwatch = $null
+$script:NodeCleanupStopped = $false
+# Deletions performed by the current pass (pass-scope progress allowance).
+$script:NodeCleanupProgress = 0
+# Bounded owner record: `<pid>` plus an optional targeted birth identity.
+$script:NodeOwnerBytes = 192
+# A reused pid's birth is only "after" a record when clearly later than it.
+$script:NodeOwnerBirthMarginSeconds = 2
+
 function Test-NodeFloor([string]$VersionText) {
   if ($VersionText -cnotmatch '^v(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$') {
     return $false
@@ -182,7 +194,11 @@ function Initialize-IdentityType {
     @('CreateFileW', [IntPtr], [Type[]]@([string], [uint32], [uint32], [IntPtr], [uint32], [uint32], [IntPtr])),
     @('GetFileInformationByHandle', [bool], [Type[]]@([IntPtr], [IntPtr])),
     @('GetFileInformationByHandleEx', [bool], [Type[]]@([IntPtr], [uint32], [IntPtr], [uint32])),
-    @('CloseHandle', [bool], [Type[]]@([IntPtr]))
+    @('CloseHandle', [bool], [Type[]]@([IntPtr])),
+    # Atomic no-overwrite publication of the canonical coordination record: the
+    # complete record is written to a private candidate and hard-linked into
+    # place, which fails when another holder already published.
+    @('CreateHardLinkW', [bool], [Type[]]@([string], [string], [IntPtr]))
   )
   foreach ($definition in $methods) {
     $method = $builder.DefinePInvokeMethod($definition[0], 'kernel32.dll', $attributes, [Reflection.CallingConventions]::Standard, $definition[1], $definition[2], [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
@@ -435,31 +451,82 @@ function Assert-NodeFence($Chain) {
     if ((Get-PathIdentity $entry[0]) -cne $entry[1]) { throw 'Node cache ancestor identity changed.' }
   }
 }
-function Remove-NodeEntry([string]$Path, [int]$Depth) {
-  # Bounded, no-follow removal of one designated cache generation. Reparse
-  # points (symlinks/junctions) are unlinked themselves, never entered, so data
-  # outside the generation is untouched. Cleanup-specific: even an initialized
-  # `.terraform` subtree inside this disposable generation is removed.
-  if ($Depth -gt 64) { return $false }
-  $attributes = Get-ExistingAttributes $Path
-  if ($null -eq $attributes) { return $true }
-  if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-    try {
-      if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) { [IO.Directory]::Delete($Path, $false) }
-      else { [IO.File]::Delete($Path) }
-      return $true
-    } catch { return $false }
-  }
-  if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
-    try {
-      foreach ($child in [IO.Directory]::EnumerateFileSystemEntries($Path)) {
-        if (-not (Remove-NodeEntry $child ($Depth + 1))) { return $false }
+function Remove-NodeEntry([string]$Path) {
+  # Bounded incremental native deletion of one designated cache generation, in
+  # immediate postorder: every entry is deleted as it is visited and each
+  # directory is removed as soon as its own subtree is empty. A pass that reaches
+  # its runtime budget therefore always already deleted real content — including
+  # whole directories — so a directory-only generation cannot spend every pass
+  # merely collecting candidates. There is no whole-tree preflight and no depth or
+  # entry quota. Reparse points (symlinks/junctions) are unlinked themselves, never
+  # entered, so data outside the generation is untouched. Cleanup-specific: even an
+  # initialized `.terraform` subtree inside this disposable generation is removed.
+  $stack = New-Object 'System.Collections.Generic.Stack[object]'
+  $stack.Push(@{ Path = $Path; Entries = $null; Index = 0 })
+  try {
+    while ($stack.Count -gt 0) {
+      if (-not (Test-NodeCleanupAllowsWork)) { $script:NodeCleanupStopped = $true; return $false }
+      $frame = $stack.Peek()
+      if ($null -eq $frame.Entries) {
+        $attributes = Get-ExistingAttributes $frame.Path
+        if ($null -eq $attributes) { [void]$stack.Pop(); continue }
+        $isDirectory = ($attributes -band [IO.FileAttributes]::Directory) -ne 0
+        $isReparse = ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        if ($isReparse) {
+          if ($isDirectory) { [IO.Directory]::Delete($frame.Path, $false) } else { [IO.File]::Delete($frame.Path) }
+          $script:NodeCleanupProgress++
+          [void]$stack.Pop()
+          continue
+        }
+        if (-not $isDirectory) {
+          [IO.File]::Delete($frame.Path)
+          $script:NodeCleanupProgress++
+          [void]$stack.Pop()
+          continue
+        }
+        $frame.Entries = @([IO.Directory]::EnumerateFileSystemEntries($frame.Path))
+        $frame.Index = 0
       }
-      [IO.Directory]::Delete($Path, $false)
-      return $true
-    } catch { return $false }
-  }
-  try { [IO.File]::Delete($Path); return $true } catch { return $false }
+      if ($frame.Index -lt $frame.Entries.Count) {
+        $child = $frame.Entries[$frame.Index]
+        $frame.Index = $frame.Index + 1
+        $childAttributes = Get-ExistingAttributes $child
+        if ($null -eq $childAttributes) { continue }
+        $childIsDirectory = ($childAttributes -band [IO.FileAttributes]::Directory) -ne 0
+        $childIsReparse = ($childAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        if ($childIsReparse) {
+          if ($childIsDirectory) { [IO.Directory]::Delete($child, $false) } else { [IO.File]::Delete($child) }
+          $script:NodeCleanupProgress++
+          continue
+        }
+        if ($childIsDirectory) {
+          $stack.Push(@{ Path = $child; Entries = $null; Index = 0 })
+          continue
+        }
+        [IO.File]::Delete($child)
+        $script:NodeCleanupProgress++
+        continue
+      }
+      [IO.Directory]::Delete($frame.Path, $false)
+      $script:NodeCleanupProgress++
+      [void]$stack.Pop()
+    }
+    return $true
+  } catch { return $false }
+}
+
+function Test-NodeCleanupRunning {
+  if ($null -eq $script:NodeCleanupStopwatch) { return $true }
+  return ($script:NodeCleanupStopwatch.Elapsed.TotalSeconds -lt $script:NodeCleanupBudgetSeconds)
+}
+
+function Test-NodeCleanupAllowsWork {
+  # The pass-level budget grants exactly one initial allowance: until the pass has
+  # deleted real content it may run its next bounded unit, and after that every
+  # unit is deadline checked. A pass therefore cannot be a zero-progress no-op,
+  # and it cannot keep deleting past its budget once it has started.
+  if ($script:NodeCleanupProgress -gt 0) { return (Test-NodeCleanupRunning) }
+  return $true
 }
 
 function Test-NodeGenerationActive([string]$Path) {
@@ -474,17 +541,58 @@ function Test-NodeGenerationActive([string]$Path) {
   $attributes = Get-ExistingAttributes $marker
   if ($null -eq $attributes) { return $false }
   if (($attributes -band [IO.FileAttributes]::Directory) -ne 0 -or ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
-  try { $text = [IO.File]::ReadAllText($marker) } catch { return $false }
-  if (Test-NodeLockOwner $text) { return $true }
+  if (Test-NodeOwnerRecord $marker) { return $true }
   try { [IO.File]::Delete($marker) } catch { }
   return $false
 }
 
-function Test-NodeLockOwner([string]$Text) {
-  if ($Text -match '^\s*(\d{1,10})\s*$') {
-    try { $null = Get-Process -Id ([int]$Matches[1]) -ErrorAction Stop; return $true } catch { return $false }
+function Read-NodeOwnerRecord([string]$Text) {
+  # Parse one per-cache owner record: `<pid>` plus, for current producers, the
+  # owner's targeted birth identity. A legacy pid-only record stays readable with
+  # an empty identity.
+  if ([string]::IsNullOrEmpty($Text)) { return $null }
+  $newline = $Text.IndexOf("`n")
+  $pidText = if ($newline -lt 0) { $Text.Trim() } else { $Text.Substring(0, $newline).Trim() }
+  if ($pidText -notmatch '^[1-9]([0-9]{0,9})$') { return $null }
+  $identity = if ($newline -lt 0) { '' } else { $Text.Substring($newline + 1).TrimEnd("`r", "`n") }
+  return @{ Pid = [int]$pidText; Identity = $identity }
+}
+
+function Read-NodeOwnerRecordFile([string]$Path) {
+  $info = $null
+  $attributes = Get-ExistingAttributes $Path
+  if ($null -eq $attributes) { return $null }
+  if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) { return $null }
+  if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+  try { $info = [IO.FileInfo]::new($Path) } catch { return $null }
+  if ($info.Length -gt $script:NodeOwnerBytes) { return $null }
+  $text = $null
+  try { $text = [IO.File]::ReadAllText($Path) } catch { return $null }
+  return (Read-NodeOwnerRecord $text)
+}
+
+function Test-NodeOwnerRecord([string]$Path) {
+  # True only while a record's owner is genuinely current: a record carrying its
+  # owner's birth identity is honored only while that exact identity still holds,
+  # and a legacy pid-only record is honored while the live pid's OS birth is not
+  # clearly AFTER the record's own mtime (a later birth means the number was
+  # reused, while an earlier birth is legitimate in-flight work).
+  $record = Read-NodeOwnerRecordFile $Path
+  if ($null -eq $record) { return $false }
+  $process = $null
+  try { $process = Get-Process -Id $record.Pid -ErrorAction Stop } catch { return $false }
+  if (-not [string]::IsNullOrEmpty($record.Identity)) {
+    $observed = Get-NodeOwnerIdentity $record.Pid
+    # A temporarily unavailable birth query is not a proven mismatch: the pid is
+    # alive, so this may still be an in-flight producer and is honored.
+    if ([string]::IsNullOrEmpty($observed)) { return $true }
+    return ($observed -ceq $record.Identity)
   }
-  return $false
+  $birth = $null
+  try { $birth = $process.StartTime.ToUniversalTime() } catch { return $true }
+  $written = $null
+  try { $written = [IO.File]::GetLastWriteTimeUtc($Path) } catch { return $true }
+  return ($birth -le $written.AddSeconds($script:NodeOwnerBirthMarginSeconds))
 }
 
 function Get-NodeLockToken([string]$Path, $Attributes) {
@@ -507,127 +615,448 @@ function Get-NodeLockToken([string]$Path, $Attributes) {
   return $token
 }
 
-function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
-  $chain = Get-NodeFence $Root
+function Test-NodeHostOwnership([string]$AgentDirectory) {
+  # Presence only: the session host's existing exclusive ownership record keeps
+  # its authority. This never reads, steals, or repairs that record.
+  if ([string]::IsNullOrEmpty($AgentDirectory)) { return $false }
+  $ownership = Join-Path (Join-Path $AgentDirectory 'session-host') 'host-ownership.json'
+  return ($null -ne (Get-ExistingAttributes $ownership))
+}
+
+function Get-NodeOwnerIdentity([int]$ProcessId) {
+  # Targeted single-pid owner-lifetime identity (never a census): the process start
+  # time as an invariant round-trip token, in the same `win32:<token>` format the
+  # CJS and TypeScript writers query for one known pid. A reused pid reports a
+  # different start time, so an abandoned record is reclaimed instead of gating
+  # startup forever. An empty result means no record is published at all.
+  try {
+    $process = Get-Process -Id $ProcessId -ErrorAction Stop
+    return 'win32:' + $process.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+  } catch { return '' }
+}
+
+function Read-NodeCoordinationRecord([string]$Path) {
+  # Returns @{ Pid; Identity } for a complete published record, or $null.
+  $attributes = Get-ExistingAttributes $Path
+  if ($null -eq $attributes) { return $null }
+  if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) { return $null }
+  if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+  try { if (([IO.FileInfo]::new($Path)).Length -gt 192) { return $null } } catch { return $null }
+  $text = $null
+  try { $text = [IO.File]::ReadAllText($Path) } catch { return $null }
+  if ([string]::IsNullOrEmpty($text)) { return $null }
+  $newline = $text.IndexOf("`n")
+  if ($newline -lt 0) { return $null }
+  $pidText = $text.Substring(0, $newline).Trim()
+  if ($pidText -notmatch '^[1-9]([0-9]{0,9})$') { return $null }
+  $identity = $text.Substring($newline + 1).TrimEnd("`r", "`n")
+  if ($identity.Length -gt 160) { return $null }
+  return @{ Pid = [int]$pidText; Identity = $identity }
+}
+
+function Test-NodeCoordinationOwnerCurrent($Record) {
+  # A record is honored only while its pid is alive AND still reports the recorded
+  # start identity; a record without a birth identity is never honored.
+  if ($null -eq $Record) { return $false }
+  try { $null = Get-Process -Id $Record.Pid -ErrorAction Stop } catch { return $false }
+  # A record without a birth identity is never honored on any platform: pid-only
+  # metadata could otherwise be pinned forever behind an unrelated live process.
+  if ([string]::IsNullOrEmpty($Record.Identity)) { return $false }
+  $observed = Get-NodeOwnerIdentity $Record.Pid
+  # A temporarily unavailable birth query is not a proven mismatch: the pid is
+  # alive, so this may still be a live destructive holder and is honored rather
+  # than stolen mid-deletion.
+  if ([string]::IsNullOrEmpty($observed)) { return $true }
+  return ($observed -ceq $Record.Identity)
+}
+
+function Publish-NodeCoordination([string]$StateDirectory) {
+  # Write the complete record to a private candidate, then publish it with an
+  # atomic no-overwrite hard link. A paused publisher therefore only loses the link
+  # race and never exposes or adopts a half-written canonical entry. The owner
+  # identity is required: a pid-only record would pin a later start behind a reused
+  # pid forever, so nothing is published when the identity is unavailable.
+  $identity = Get-NodeOwnerIdentity ([int]$PID)
+  if ([string]::IsNullOrEmpty($identity)) { return 'failed' }
+  $candidate = Join-Path $StateDirectory ('host-coordination.lock.' + [string]$PID + '.' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+  $body = [string]$PID + "`n" + $identity + "`n"
+  try {
+    $stream = [IO.File]::Open($candidate, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try {
+      $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+      $stream.Write($bytes, 0, $bytes.Length)
+      $stream.Flush($true)
+    } finally { $stream.Dispose() }
+  } catch { return 'failed' }
+  $entry = Join-Path $StateDirectory 'host-coordination.lock'
+  $linked = $false
+  try { $linked = $script:IdentityType::CreateHardLinkW($entry, $candidate, [IntPtr]::Zero) } catch { $linked = $false }
+  try { [IO.File]::Delete($candidate) } catch { }
+  if ($linked) { return 'published' }
+  if ($null -ne (Get-ExistingAttributes $entry)) { return 'lost' }
+  return 'failed'
+}
+
+function Remove-NodeCoordinationEntry([string]$Path, [string]$ExpectedIdentity) {
+  # Remove exactly the observed entry name; a junction/link is unlinked itself,
+  # never entered, and a directory shape is removed only when it is a metadata
+  # entry this producer could have created.
+  $current = $null
+  try { $current = Get-PathIdentity $Path } catch { return $true }
+  if ($null -ne $ExpectedIdentity -and $current -cne $ExpectedIdentity) { return $true }
+  $attributes = Get-ExistingAttributes $Path
+  if ($null -eq $attributes) { return $true }
+  try {
+    if (($attributes -band [IO.FileAttributes]::Directory) -ne 0 -and ($attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+      [IO.Directory]::Delete($Path, $false)
+    } else {
+      [IO.File]::Delete($Path)
+    }
+    return $true
+  } catch { return $false }
+}
+
+function Enter-NodeCoordination([string]$AgentDirectory) {
+  # The one canonical per-agent mutex that host ownership acquisition also takes,
+  # so destructive reclamation and a host becoming the owner are mutually
+  # exclusive. Returns an object (Path/Identity) or $null when the boundary is
+  # unavailable; that never refuses startup. A current holder is honored, and
+  # stale/dead/reused-pid/malformed metadata is reclaimed.
+  if ([string]::IsNullOrEmpty($AgentDirectory)) { return $null }
+  $stateDirectory = Join-Path $AgentDirectory 'session-host'
+  try { Ensure-DirectoryTree $stateDirectory | Out-Null } catch { return $null }
+  $path = Join-Path $stateDirectory 'host-coordination.lock'
+  $malformed = 0
+  $observedToken = $null
+  for ($attempt = 0; $attempt -lt 40; $attempt++) {
+    if ($null -eq (Get-ExistingAttributes $path)) {
+      $published = Publish-NodeCoordination $stateDirectory
+      if ($published -eq 'published') {
+        $identity = $null
+        try { $identity = Get-PathIdentity $path } catch { return $null }
+        return @{ Path = $path; Identity = $identity }
+      }
+      if ($published -eq 'failed') { return $null }
+      continue
+    }
+    # Capture the exact entry identity BEFORE reading/checking its owner: another
+    # contender may replace stale metadata with its own live record in between, and
+    # reclamation must stay bound to the entry that was actually judged stale.
+    $current = $null
+    try { $current = Get-PathIdentity $path } catch { $current = $null }
+    if ($null -eq $current) {
+      Start-Sleep -Milliseconds 25
+      continue
+    }
+    $record = Read-NodeCoordinationRecord $path
+    if ($null -ne $record -and (Test-NodeCoordinationOwnerCurrent $record)) {
+      # A current holder: wait briefly, then this producer skips reclamation.
+      $malformed = 0
+      $observedToken = $null
+      Start-Sleep -Milliseconds 50
+      continue
+    }
+    if ($null -eq $record) {
+      if ($current -cne $observedToken) { $malformed = 0; $observedToken = $current }
+      $malformed++
+      if ($malformed -lt 3) { Start-Sleep -Milliseconds 25; continue }
+      $malformed = 0
+      $observedToken = $null
+    }
+    if (-not (Remove-NodeCoordinationEntry $path $current)) { return $null }
+  }
+  return $null
+}
+
+function Exit-NodeCoordination($Coordination) {
+  if ($null -eq $Coordination) { return }
+  try {
+    $record = Read-NodeCoordinationRecord $Coordination.Path
+    if ($null -eq $record -or $record.Pid -ne $PID) { return }
+    if ($record.Identity -cne (Get-NodeOwnerIdentity ([int]$PID))) { return }
+    if ($null -ne $Coordination.Identity -and (Assert-PathIdentity $Coordination.Path $Coordination.Identity)) {
+      [IO.File]::Delete($Coordination.Path)
+    }
+  } catch { # Uncertain coordination ownership is retained for stale recovery.
+  }
+}
+
+function Invoke-NodeCacheCleanup([string]$Root, $Chain, $Lock, [string]$AgentDirectory, [int]$Target = 5, [string]$Keep = '') {
+  # Best-effort cleanup only: every failure here warns and creation proceeds.
+  # Ownership of the admission entry is not this pass's business: the identity
+  # captured when acquisition succeeded is what release is bound to, so skipping
+  # or failing reclamation never strands the producer's own metadata entry.
+  try {
+    # The record is written already complete: this producer's pid plus its
+    # targeted birth identity, so liveness never depends on a pid number alone.
+    $recordBody = [string]$PID + "`n" + (Get-NodeOwnerIdentity ([int]$PID)) + "`n"
+    $lockBytes = [Text.Encoding]::UTF8.GetBytes($recordBody)
+    $Lock.Write($lockBytes, 0, $lockBytes.Length)
+    $Lock.Flush($true)
+    Assert-NodeFence $Chain
+    $entries = @()
+    try {
+      $entries = @([IO.Directory]::EnumerateFileSystemEntries($Root))
+    } catch {
+      [Console]::Error.WriteLine('pi-review-sessions: Node cache inventory was unavailable; continuing without reclamation.')
+    }
+    $count = 0
+    foreach ($entry in $entries) {
+      $entryName = [IO.Path]::GetFileName($entry)
+      if ($entryName -ceq '.admission.lock') { continue }
+      if (-not [string]::IsNullOrEmpty($Keep) -and $entry -ceq $Keep) { continue }
+      $count++
+    }
+    # The pass shares this one elapsed budget (admission wait plus every removal
+    # it attempts) and one progress allowance, so neither a large generation nor a
+    # long run of tiny ones can reset the clock or continue past it.
+    $script:NodeCleanupStopped = $false
+    $script:NodeCleanupProgress = 0
+    $reclaimed = 0
+    # $Target is the total number of generations this pass may leave. The kept
+    # generation is excluded from $count, so the removable-candidate target is one
+    # lower when a keep root is supplied, and the stopping condition is inclusive.
+    $candidateTarget = $Target
+    if (-not [string]::IsNullOrEmpty($Keep)) { $candidateTarget-- }
+    foreach ($entry in $entries) {
+      if ($count -le $candidateTarget) { break }
+      $name = [IO.Path]::GetFileName($entry)
+      if ($name -ceq '.admission.lock') { continue }
+      if (-not [string]::IsNullOrEmpty($Keep) -and $entry -ceq $Keep) { continue }
+      if (($script:NodeCleanupProgress -gt 0) -and -not (Test-NodeCleanupRunning)) {
+        # This pass already deleted something and has reached its budget: never
+        # start another candidate while the canonical entry is still held.
+        break
+      }
+      # Rechecked at every destructive boundary: even when the per-agent boundary
+      # could not be taken, a host's ownership record stops further removal
+      # instead of being raced by cleanup.
+      if (Test-NodeHostOwnership $AgentDirectory) {
+        [Console]::Error.WriteLine('pi-review-sessions: a session host acquired the agent directory during cleanup; leaving the remaining Node cache generations untouched.')
+        break
+      }
+      if (Test-NodeGenerationActive $entry) { continue }
+      if (Remove-NodeEntry $entry) {
+        $count--
+        $reclaimed++
+      } elseif ($script:NodeCleanupStopped) {
+        # Real content was already deleted; the next launch continues from what
+        # remains instead of repeating a no-op preflight forever.
+        $script:NodeCleanupStopped = $false
+        [Console]::Error.WriteLine("pi-review-sessions: Node cache cleanup stopped at its runtime budget after reclaiming $reclaimed generations; $count remain and the next launch reclaims more. Continuing startup.")
+        break
+      }
+    }
+    $held = $count
+    if (-not [string]::IsNullOrEmpty($Keep)) { $held = $count + 1 }
+    if ($held -gt $Target) {
+      [Console]::Error.WriteLine("pi-review-sessions: Node cache still holds $held generations (target $Target); continuing startup.")
+    }
+    Assert-NodeFence $Chain
+  } catch {
+    [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup could not complete; continuing startup.')
+  }
+}
+
+function Enter-NodeAdmissionLock([string]$Root, $Chain, [string]$AgentDirectory) {
+  # Bounded exclusive acquisition of the per-cache admission lock entry. A live
+  # owner is waited for briefly and then left alone, a dead/malformed/non-live
+  # artifact is reclaimed confined to that exact entry, and nothing here can become
+  # a permanent stop condition. Returns @{ Stream; Path; Identity } or $null, and
+  # records why in $script:NodeLockReport ('busy' or 'artifact').
   $lockPath = Join-Path $Root '.admission.lock'
   $lock = $null
-  $lockIdentity = $null
   $lockReclaimFailed = $false
+  $script:NodeLockReport = 'busy'
+  try { Assert-NodeFence $Chain } catch { return $null }
+  $malformedLock = 0
+  $observedLockToken = $null
+  for ($attempt = 0; $attempt -lt 40 -and $null -eq $lock; $attempt++) {
+    try {
+      $lock = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    } catch {
+      try {
+        $lockAttributes = Get-ExistingAttributes $lockPath
+        if ($null -eq $lockAttributes) {
+          # Another producer settled between attempts; retry creation.
+          $malformedLock = 0
+          $observedLockToken = $null
+          Start-Sleep -Milliseconds 25
+          continue
+        }
+        $lockIsReparse = ($lockAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        $lockIsDirectory = ($lockAttributes -band [IO.FileAttributes]::Directory) -ne 0
+        # Keep each expression on one line: Windows PowerShell 5.1 rejects a
+        # continuation line that begins with -or.
+        $lockShape = $lockIsReparse -or $lockIsDirectory
+        if (-not $lockShape) {
+          try { $lockShape = (([IO.FileInfo]::new($lockPath)).Length -gt $script:NodeOwnerBytes) } catch { $lockShape = $true }
+        }
+        $lockRecord = $null
+        if (-not $lockShape) { $lockRecord = Read-NodeOwnerRecordFile $lockPath }
+        $lockToken = Get-NodeLockToken $lockPath $lockAttributes
+        if ($null -ne $lockRecord) {
+          $malformedLock = 0
+          # A genuinely current owner is waited for; this producer then skips
+          # cleanup. A dead, pid-reused, or pid-only-stale record is not a
+          # current owner and is reclaimed below.
+          if (Test-NodeOwnerRecord $lockPath) { $observedLockToken = $null; Start-Sleep -Milliseconds 50; continue }
+          # A dead or reused owner's record is reclaimed only if it is still
+          # that entry.
+          if ($null -eq $lockToken) { $observedLockToken = $null; Start-Sleep -Milliseconds 25; continue }
+          $observedLockToken = $lockToken
+        } else {
+          # A just-created lock can be read before its pid is written; only the
+          # SAME malformed artifact, observed across several inspections, is a
+          # dead owner's residue.
+          if ($null -eq $lockToken) { $observedLockToken = $null; Start-Sleep -Milliseconds 50; continue }
+          if ($lockToken -cne $observedLockToken) { $malformedLock = 0; $observedLockToken = $lockToken }
+          $malformedLock++
+          if ($malformedLock -lt 3) { Start-Sleep -Milliseconds 50; continue }
+          $malformedLock = 0
+        }
+        # Reclaim only the exact artifact that was observed: anything that now
+        # occupies the path is left in place and acquisition restarts.
+        $currentToken = Get-NodeLockToken $lockPath (Get-ExistingAttributes $lockPath)
+        if ($null -eq $currentToken -or $currentToken -cne $observedLockToken) {
+          $observedLockToken = $null
+          Start-Sleep -Milliseconds 25
+          continue
+        }
+        $observedLockToken = $null
+        if (-not (Remove-NodeEntry $lockPath)) { $lockReclaimFailed = $true; break }
+        continue
+      } catch { break }
+    }
+  }
+  if ($null -eq $lock) {
+    if ($lockReclaimFailed) { $script:NodeLockReport = 'artifact' }
+    return $null
+  }
+  # Capture the exact identity of the entry this producer just created, as part
+  # of the successful acquisition itself. Release is bound to that entry whether
+  # or not reclamation runs and whether or not a complete owner record is ever
+  # written, so a fresh empty entry of this producer's own is never stranded; an
+  # entry that later occupies the path has a different identity and is kept.
+  $identity = $null
+  try { $identity = Get-PathIdentity $lockPath } catch { $identity = $null }
+  return @{ Stream = $lock; Path = $lockPath; Identity = $identity }
+}
+
+function Exit-NodeAdmissionLock($Admission, $Chain) {
+  # Release only this producer's own admission entry: the exact entry identity
+  # captured when that acquisition succeeded. Nothing is inferred from a written
+  # owner record or from whether reclamation ran, so a skipped cleanup (host
+  # ownership, contention) still releases this producer's own fresh metadata, and
+  # a replacement now occupying the path has a different identity and is kept.
+  if ($null -eq $Admission) { return }
+  try { $Admission.Stream.Dispose() } catch { }
+  try {
+    if ($null -eq $Admission.Identity) { return }
+    Assert-NodeFence $Chain
+    if (Assert-PathIdentity $Admission.Path $Admission.Identity) { [IO.File]::Delete($Admission.Path) }
+  } catch { # Uncertain lock ownership is retained.
+  }
+}
+
+function Invoke-NodeSettlementCleanup([string]$Root, [string]$AgentDirectory, [string]$Keep) {
+  # Producer-owned cleanup-only settlement retry: reclamation that contention
+  # deferred while this producer was preparing is retried exactly once here, joined
+  # (never backgrounded), under the same canonical per-agent coordination entry and
+  # admission lock, targeting five and preserving the generation this launch
+  # selected or created. Nothing is created, and capacity never refuses anything.
+  $admission = $null
+  try {
+    $chain = Get-NodeFence $Root
+    $coordination = Enter-NodeCoordination $AgentDirectory
+    if ($null -eq $coordination) {
+      [Console]::Error.WriteLine('pi-review-sessions: host ownership coordination was unavailable; leaving Node cache generations untouched.')
+      return
+    }
+    try {
+      if (Test-NodeHostOwnership $AgentDirectory) {
+        [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
+        return
+      }
+      $script:NodeCleanupStopwatch = [Diagnostics.Stopwatch]::StartNew()
+      $admission = Enter-NodeAdmissionLock $Root $chain $AgentDirectory
+      if ($null -eq $admission) {
+        if ($script:NodeLockReport -eq 'artifact') {
+          [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup lock artifact could not be removed; continuing without reclaiming older generations.')
+        } else {
+          [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup lock was busy or unreadable; continuing without reclaiming older generations.')
+        }
+        return
+      }
+      if (Test-NodeHostOwnership $AgentDirectory) {
+        [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
+        return
+      }
+      $null = Invoke-NodeCacheCleanup $Root $chain $admission.Stream $AgentDirectory 5 $Keep
+    } finally {
+      Exit-NodeAdmissionLock $admission $chain
+      Exit-NodeCoordination $coordination
+      $script:NodeCleanupStopwatch = $null
+      $script:NodeCleanupStopped = $false
+      $script:NodeCleanupProgress = 0
+    }
+  } catch {
+    [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup could not complete; continuing startup.')
+  }
+}
+
+function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
+  $chain = Get-NodeFence $Root
+  $admission = $null
   $skipCleanup = $false
-  if (-not [string]::IsNullOrEmpty($AgentDirectory)) {
+  # The canonical per-agent coordination entry is taken FIRST and released once
+  # this producer's fresh generation exists. Host ownership acquisition takes the
+  # same entry, so cleanup and acquiring ownership cannot interleave.
+  $coordination = Enter-NodeCoordination $AgentDirectory
+  if ($null -eq $coordination) {
+    $skipCleanup = $true
+    [Console]::Error.WriteLine('pi-review-sessions: host ownership coordination was unavailable; leaving Node cache generations untouched.')
+  } elseif (Test-NodeHostOwnership $AgentDirectory) {
     # An existing session host owns this agent directory: its cache generations
     # are left alone, while startup still proceeds.
-    $ownership = Join-Path (Join-Path $AgentDirectory 'session-host') 'host-ownership.json'
-    if (Test-Path -LiteralPath $ownership) {
-      $skipCleanup = $true
-      [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
-    }
+    $skipCleanup = $true
+    [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
   }
   try {
     Assert-NodeFence $chain
+    # One elapsed budget for this whole admission pass: lock recovery and
+    # reclamation both check it as they delete, and reaching it never refuses
+    # creation.
+    $script:NodeCleanupStopwatch = [Diagnostics.Stopwatch]::StartNew()
     # One short exclusive admission lock coordinates cleanup and creation. A
     # lock whose recorded owner is gone (or whose record is empty/malformed) is
-    # reclaimed; a live owner is left alone and this producer then skips
-    # cleanup. A stale/malformed NON-LIVE metadata shape (directory, junction,
-    # oversized or unreadable) is removed confined to this exact lock path: this
-    # producer only creates a fresh regular lock file, so such a shape is never
-    # live-producer evidence. Capacity never refuses creation.
-    $malformedLock = 0
-    $observedLockToken = $null
-    for ($attempt = 0; -not $skipCleanup -and $attempt -lt 40 -and $null -eq $lock; $attempt++) {
-      try {
-        $lock = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-      } catch {
-        try {
-          $lockAttributes = Get-ExistingAttributes $lockPath
-          if ($null -eq $lockAttributes) {
-            # Another producer settled between attempts; retry creation.
-            $malformedLock = 0
-            $observedLockToken = $null
-            Start-Sleep -Milliseconds 25
-            continue
-          }
-          $lockIsReparse = ($lockAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
-          $lockIsDirectory = ($lockAttributes -band [IO.FileAttributes]::Directory) -ne 0
-          # Keep each expression on one line: Windows PowerShell 5.1 rejects a
-          # continuation line that begins with -or.
-          $lockShape = $lockIsReparse -or $lockIsDirectory
-          if (-not $lockShape) {
-            try { $lockShape = (([IO.FileInfo]::new($lockPath)).Length -gt 64) } catch { $lockShape = $true }
-          }
-          $lockText = $null
-          if (-not $lockShape) {
-            try { $lockText = [IO.File]::ReadAllText($lockPath) } catch { $lockText = $null }
-          }
-          $lockToken = Get-NodeLockToken $lockPath $lockAttributes
-          if ($null -ne $lockText -and $lockText -match '^\s*(\d{1,10})\s*$') {
-            $malformedLock = 0
-            # A live owner is left alone; this producer then skips cleanup.
-            if (Test-NodeLockOwner $lockText) { $observedLockToken = $null; Start-Sleep -Milliseconds 50; continue }
-            # A dead owner's record is reclaimed only if it is still that entry.
-            if ($null -eq $lockToken) { $observedLockToken = $null; Start-Sleep -Milliseconds 25; continue }
-            $observedLockToken = $lockToken
-          } else {
-            # A just-created lock can be read before its pid is written; only the
-            # SAME malformed artifact, observed across several inspections, is a
-            # dead owner's residue.
-            if ($null -eq $lockToken) { $observedLockToken = $null; Start-Sleep -Milliseconds 50; continue }
-            if ($lockToken -cne $observedLockToken) { $malformedLock = 0; $observedLockToken = $lockToken }
-            $malformedLock++
-            if ($malformedLock -lt 3) { Start-Sleep -Milliseconds 50; continue }
-            $malformedLock = 0
-          }
-          # Reclaim only the exact artifact that was observed: anything that now
-          # occupies the path is left in place and acquisition restarts.
-          $currentToken = Get-NodeLockToken $lockPath (Get-ExistingAttributes $lockPath)
-          if ($null -eq $currentToken -or $currentToken -cne $observedLockToken) {
-            $observedLockToken = $null
-            Start-Sleep -Milliseconds 25
-            continue
-          }
-          $observedLockToken = $null
-          if (-not (Remove-NodeEntry $lockPath 0)) { $lockReclaimFailed = $true; break }
-          continue
-        } catch { break }
-      }
+    # reclaimed; a live owner is left alone and this producer then skips cleanup.
+    # A stale/malformed NON-LIVE metadata shape (directory, junction, oversized or
+    # unreadable) is removed confined to this exact lock path: this producer only
+    # creates a fresh regular lock file, so such a shape is never live-producer
+    # evidence. Capacity never refuses creation.
+    if (-not $skipCleanup) {
+      $admission = Enter-NodeAdmissionLock $Root $chain $AgentDirectory
     }
-    if ($null -eq $lock -and -not $skipCleanup) {
-      if ($lockReclaimFailed) {
+    if ($null -eq $admission -and -not $skipCleanup) {
+      # Rechecked whichever way the admission attempt ended: a host that became
+      # the owner while this producer waited is the reason cleanup stays away.
+      if (Test-NodeHostOwnership $AgentDirectory) {
+        [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
+      } elseif ($script:NodeLockReport -eq 'artifact') {
         [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup lock artifact could not be removed; continuing without reclaiming older generations.')
       } else {
         [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup lock was busy or unreadable; continuing without reclaiming older generations.')
       }
-    } elseif ($null -ne $lock) {
-      # Best-effort cleanup only: every failure here warns and creation proceeds.
-      try {
-        $lockBytes = [Text.Encoding]::UTF8.GetBytes([string]$PID)
-        $lock.Write($lockBytes, 0, $lockBytes.Length)
-        $lock.Flush($true)
-        $lockIdentity = Get-PathIdentity $lockPath
-        Assert-NodeFence $chain
-        $entries = @()
-        try {
-          $entries = @([IO.Directory]::EnumerateFileSystemEntries($Root))
-        } catch {
-          [Console]::Error.WriteLine('pi-review-sessions: Node cache inventory was unavailable; continuing without reclamation.')
-        }
-        $count = 0
-        foreach ($entry in $entries) {
-          if ([IO.Path]::GetFileName($entry) -cne '.admission.lock') { $count++ }
-        }
-        foreach ($entry in $entries) {
-          if ($count -lt 5) { break }
-          $name = [IO.Path]::GetFileName($entry)
-          if ($name -ceq '.admission.lock' -or $name -ceq '.terraform') { continue }
-          if (Test-NodeGenerationActive $entry) { continue }
-          if (Remove-NodeEntry $entry 0) { $count-- }
-        }
-        if ($count -ge 5) {
-          [Console]::Error.WriteLine("pi-review-sessions: Node cache still holds $count generations (target 5); continuing startup.")
-        }
-        Assert-NodeFence $chain
-      } catch {
-        [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup could not complete; continuing startup.')
+    } elseif ($null -ne $admission) {
+      if (Test-NodeHostOwnership $AgentDirectory) {
+        # Rechecked after the admission wait/stale-lock recovery: a host may have
+        # acquired ownership while this producer waited. Reclamation is skipped,
+        # while the entry this producer already acquired is still its own to
+        # release (see the finally block).
+        [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
+      } else {
+        $null = Invoke-NodeCacheCleanup $Root $chain $admission.Stream $AgentDirectory 4
       }
     }
     $candidate = Join-Path $Root ('bootstrap-' + [Guid]::NewGuid().ToString('N'))
@@ -635,24 +1064,25 @@ function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
     Assert-NodeFence $chain
     # The generation is disposable by location; no lifetime record is written.
     # A live owner marker keeps other producers from pruning it while the Node
-    # archive is still being downloaded/extracted.
+    # archive is still being downloaded/extracted. The record carries this
+    # producer's pid and targeted birth identity so a reused pid can never pin it.
     $markerPath = Join-Path $candidate '.producer-active'
     $marker = [IO.File]::Open($markerPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
     try {
-      $markerBytes = [Text.Encoding]::UTF8.GetBytes([string]$PID)
+      $markerBody = [string]$PID + "`n" + (Get-NodeOwnerIdentity ([int]$PID)) + "`n"
+      $markerBytes = [Text.Encoding]::UTF8.GetBytes($markerBody)
       $marker.Write($markerBytes, 0, $markerBytes.Length)
       $marker.Flush($true)
     } finally { $marker.Dispose() }
     return $candidate
   } finally {
-    if ($null -ne $lock) {
-      $lock.Dispose()
-      try {
-        Assert-NodeFence $chain
-        if ($null -ne $lockIdentity -and (Assert-PathIdentity $lockPath $lockIdentity)) { [IO.File]::Delete($lockPath) }
-      } catch { # Uncertain lock ownership is retained.
-      }
-    }
+    $script:NodeCleanupStopwatch = $null
+    $script:NodeCleanupStopped = $false
+    # Release in reverse acquisition order: the per-cache admission entry first,
+    # then the canonical per-agent entry. This producer's fresh generation already
+    # carries its own liveness marker, so nothing it needs pruning is exposed.
+    Exit-NodeAdmissionLock $admission $chain
+    Exit-NodeCoordination $coordination
   }
 }
 
@@ -720,6 +1150,10 @@ try {
   if (-not [string]::IsNullOrEmpty($script:NodeGenerationMarker)) {
     try { [IO.File]::Delete($script:NodeGenerationMarker) } catch { }
   }
+  # Settlement retry after a failed preparation, joined before exiting.
+  if (-not [string]::IsNullOrEmpty($agentDirectory) -and -not [string]::IsNullOrEmpty($cacheRoot)) {
+    Invoke-NodeSettlementCleanup $cacheRoot $agentDirectory $WorkRoot
+  }
   exit 1
 }
 # Start-SessionCjs exits the process, so release the in-progress marker in a
@@ -729,5 +1163,10 @@ try {
 } finally {
   if (-not [string]::IsNullOrEmpty($script:NodeGenerationMarker)) {
     try { [IO.File]::Delete($script:NodeGenerationMarker) } catch { }
+  }
+  # Settlement retry: cleanup that contention deferred during preparation is
+  # retried once here, joined, preserving this launch's own generation.
+  if (-not [string]::IsNullOrEmpty($agentDirectory) -and -not [string]::IsNullOrEmpty($cacheRoot)) {
+    Invoke-NodeSettlementCleanup $cacheRoot $agentDirectory $WorkRoot
   }
 }

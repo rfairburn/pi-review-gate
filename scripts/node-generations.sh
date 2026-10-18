@@ -29,6 +29,30 @@ NODE_LOCK_ID=''
 NODE_COORDINATION_ID=''
 NODE_LIMIT=5
 NODE_LOCK_ATTEMPTS=40
+# One cleanup pass (inventory plus every removal it attempts) shares this elapsed
+# budget, so a deep or large generation cannot reset the clock per generation.
+NODE_CLEANUP_BUDGET=120
+NODE_CLEANUP_STARTED=$SECONDS
+NODE_CLEANUP_STOPPED=0
+# Bounded owner record: `<pid>` plus an optional targeted birth identity.
+NODE_OWNER_BYTES=192
+# A reused pid's birth is only "after" a record when clearly later than it.
+NODE_OWNER_BIRTH_MARGIN=2
+# Leaves per native bulk-unlink call, and how often the ancestor fence is
+# rechecked while walking directories of one disposable generation.
+NODE_CLEANUP_BATCH=256
+NODE_CLEANUP_FENCE_EVERY=32
+NODE_CLEANUP_DIRS=0
+# The generation this launch selected/created, preserved by the settlement pass.
+NODE_KEEP_ROOT=''
+# Deletions performed by the current pass (pass-scope progress allowance).
+NODE_CLEANUP_PROGRESS=0
+# Empty sibling directories awaiting one batched identity-checked removal.
+NODE_PENDING_DIRS=()
+NODE_PENDING_IDS=()
+NODE_IDENTITIES=()
+NODE_OWNER_PID=''
+NODE_OWNER_IDENTITY=''
 NODE_FENCE_PATHS=()
 NODE_FENCE_IDS=()
 
@@ -79,7 +103,89 @@ node_lock_shape_is_record() {
   node_single_file "$1" || return 1
   local size
   if [[ "$HOST_OS" == Darwin ]]; then size="$("$STAT_BIN" -f '%z' "$1" 2>/dev/null)"; else size="$("$STAT_BIN" -c '%s' "$1" 2>/dev/null)"; fi
-  [[ "$size" =~ ^[0-9]+$ ]] && (( size <= 64 ))
+  [[ "$size" =~ ^[0-9]+$ ]] && (( size <= NODE_OWNER_BYTES ))
+}
+# One per-cache owner record: `<pid>` plus, for current producers, the owner's
+# targeted birth identity. A record written by an older producer is pid-only and
+# stays readable. Sets NODE_OWNER_PID / NODE_OWNER_IDENTITY.
+node_owner_read() {
+  local file="$1" size='' pid='' identity=''
+  node_single_file "$file" || return 1
+  if [[ "$HOST_OS" == Darwin ]]; then size="$("$STAT_BIN" -f '%z' "$file" 2>/dev/null)"; else size="$("$STAT_BIN" -c '%s' "$file" 2>/dev/null)"; fi
+  [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size <= NODE_OWNER_BYTES )) || return 1
+  { IFS= read -r pid; IFS= read -r identity; } 2>/dev/null < "$file" || true
+  [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  NODE_OWNER_PID="$pid"
+  NODE_OWNER_IDENTITY="${identity:-}"
+}
+# Targeted single-pid OS owner birth time in whole epoch seconds. It exists only
+# to tell a legacy pid-only record written by its actual owner from one left
+# behind by a pid an unrelated process has since reused (exactly one pid, never a
+# census). An empty result simply means the record is honored conservatively.
+node_owner_birth_epoch() {
+  local pid="$1" line='' rest='' boot='' etime='' now='' days=0 a='' b='' c='' part='' fields=()
+  [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  if [[ -r "/proc/$pid/stat" && -r /proc/stat ]]; then
+    IFS= read -r line < "/proc/$pid/stat" 2>/dev/null || return 1
+    rest="${line##*\)}"
+    # /proc/<pid>/stat is whitespace-separated after `comm`; starttime is the
+    # 20th token there, so ordinary word splitting is intended.
+    # shellcheck disable=SC2206
+    fields=($rest)
+    [[ ${#fields[@]} -ge 20 && "${fields[19]}" =~ ^[0-9]{1,20}$ ]] || return 1
+    while IFS= read -r line; do
+      case "$line" in
+        btime\ *) boot="${line#btime }"; break;;
+      esac
+    done < /proc/stat
+    [[ "$boot" =~ ^[0-9]{1,12}$ ]] || return 1
+    # USER_HZ is 100 on Linux by ABI definition, so ticks convert exactly.
+    printf '%s' "$(( boot + fields[19] / 100 ))"
+    return 0
+  fi
+  [[ -n "${NODE_PS_BIN:-}" && -n "${NODE_DATE_BIN:-}" ]] || return 1
+  etime="$("$NODE_PS_BIN" -p "$pid" -o etime= 2>/dev/null)" || return 1
+  etime="${etime//[[:space:]]/}"
+  [[ -n "$etime" ]] || return 1
+  case "$etime" in
+    *-*)
+      days="${etime%%-*}"
+      etime="${etime#*-}"
+      [[ "$days" =~ ^[0-9]{1,6}$ ]] || return 1
+      ;;
+  esac
+  IFS=: read -r a b c <<< "$etime"
+  if [[ -z "$c" ]]; then
+    if [[ -n "$b" ]]; then c="$b"; b="$a"; a=0
+    else return 1
+    fi
+  fi
+  for part in "$a" "$b" "$c"; do [[ "$part" =~ ^[0-9]{1,6}$ ]] || return 1; done
+  now="$(TZ=UTC0 "$NODE_DATE_BIN" +%s 2>/dev/null)" || return 1
+  [[ "$now" =~ ^[0-9]{1,12}$ ]] || return 1
+  printf '%s' "$(( now - days * 86400 - 10#$a * 3600 - 10#$b * 60 - 10#$c ))"
+}
+# True only while a record's owner is genuinely current: a record carrying its
+# owner's birth identity is honored only while that exact identity still holds,
+# and a legacy pid-only record is honored while the live pid's OS birth is not
+# clearly AFTER the record's own mtime (a later birth means the number was
+# reused, while an earlier birth is legitimate in-flight work).
+node_owner_current() {
+  local file="$1" pid="$NODE_OWNER_PID" identity="$NODE_OWNER_IDENTITY" observed='' birth='' mtime=''
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [[ -n "$identity" ]]; then
+    observed="$(node_owner_identity "$pid")"
+    # A temporarily unavailable birth query is not a proven mismatch: the pid is
+    # alive, so this may still be an in-flight producer and is honored.
+    [[ -n "$observed" ]] || return 0
+    [[ "$observed" == "$identity" ]]
+    return
+  fi
+  birth="$(node_owner_birth_epoch "$pid")" || return 0
+  [[ "$birth" =~ ^[0-9]{1,14}$ ]] || return 0
+  if [[ "$HOST_OS" == Darwin ]]; then mtime="$("$STAT_BIN" -f '%m' "$file" 2>/dev/null)"; else mtime="$("$STAT_BIN" -c '%Y' "$file" 2>/dev/null)"; fi
+  [[ "$mtime" =~ ^[0-9]{1,14}$ ]] || return 0
+  (( birth <= mtime + NODE_OWNER_BIRTH_MARGIN ))
 }
 # No-follow identity of the exact lock entry (links included by design: GNU and
 # BSD stat default to lstat semantics without -L). Used only to confirm that the
@@ -96,10 +202,10 @@ node_lock_entry_identity() {
   printf '%s' "$output"
 }
 # Reclaim only the lock artifact identified by the caller. Anything else that now
-# occupies the path, and any record that names a live owner, is left in place and
-# acquisition restarts; only a real filesystem failure returns 1.
+# occupies the path, and any record whose owner is genuinely current, is left in
+# place and acquisition restarts; only a real filesystem failure returns 1.
 node_lock_reclaim() {
-  local expected="$1" current='' text=''
+  local expected="$1" current=''
   [[ -n "$expected" ]] || return 1
   node_check_fence || return 1
   current="$(node_lock_entry_identity)" || return 1
@@ -113,23 +219,23 @@ node_lock_reclaim() {
     node_remove "$NODE_LOCK" "$current"
     return
   fi
-  if node_lock_shape_is_record "$NODE_LOCK"; then
-    { IFS= read -r -n 32 text < "$NODE_LOCK"; } 2>/dev/null || true
-    if [[ "$text" =~ ^([0-9]{1,10})$ ]] && kill -0 "${BASH_REMATCH[1]}" 2>/dev/null; then return 0; fi
-  fi
+  if node_owner_read "$NODE_LOCK" && node_owner_current "$NODE_LOCK"; then return 0; fi
   "$NODE_UNLINK_BIN" "$NODE_LOCK" 2>/dev/null
 }
 node_lock() {
-  local attempt=0 malformed=0 owner='' pid='' id='' observed='' record=1
+  local attempt=0 malformed=0 owner='' id='' observed=''
   node_check_fence || return 1
+  owner="$(node_owner_identity "$$")"
   while (( attempt < NODE_LOCK_ATTEMPTS )); do
     attempt=$((attempt + 1))
     # noclobber alone can open an existing non-regular target, including through
     # a symlink (/dev/null would accept the write, a FIFO target would block).
     # Every existing entry, including a dangling link, goes through no-follow
     # inspection and guarded reclamation instead of being opened for writing.
+    # The record is written already complete: this producer's pid plus its
+    # targeted birth identity, so liveness never depends on a pid number alone.
     if [[ ! -e "$NODE_LOCK" && ! -L "$NODE_LOCK" ]] &&
-      (set -o noclobber; printf '%s\n' "$$" > "$NODE_LOCK") 2>/dev/null; then
+      (set -o noclobber; printf '%s\n%s\n' "$$" "$owner" > "$NODE_LOCK") 2>/dev/null; then
       NODE_LOCK_ID="$(path_identity "$NODE_LOCK")" || return 1
       node_check_fence && assert_path_identity "$NODE_LOCK" "$NODE_LOCK_ID"
       return
@@ -140,18 +246,13 @@ node_lock() {
       observed=''
       continue
     fi
-    record=0
-    if [[ ! -L "$NODE_LOCK" ]] && node_lock_shape_is_record "$NODE_LOCK"; then record=1; fi
-    owner=''
-    if (( record == 1 )); then
-      { IFS= read -r -n 32 owner < "$NODE_LOCK"; } 2>/dev/null || true
-    fi
-    if (( record == 1 )) && [[ "$owner" =~ ^([0-9]{1,10})$ ]]; then
+    if node_owner_read "$NODE_LOCK"; then
       # A valid record is never a malformed observation.
       malformed=0
       observed=''
-      pid="${BASH_REMATCH[1]}"
-      if kill -0 "$pid" 2>/dev/null; then
+      if node_owner_current "$NODE_LOCK"; then
+        # A live owner is waited for; if it never settles this launch skips
+        # cleanup and continues. A pid-reused record is never a live owner.
         sleep 0.05 2>/dev/null || sleep 1
         continue
       fi
@@ -193,10 +294,13 @@ node_unlock() {
     "$NODE_UNLINK_BIN" "$WORK_ROOT/.producer-active" 2>/dev/null || true
   fi
   node_coordination_release || true
-  if [[ -n "$NODE_LOCK_ID" ]] && node_check_fence && assert_path_identity "$NODE_LOCK" "$NODE_LOCK_ID"; then
-    "$NODE_UNLINK_BIN" "$NODE_LOCK" || return 1
-    NODE_LOCK_ID=''
-  fi
+  node_release_admission_lock || true
+  # Settlement retry: reclamation that contention deferred while this producer
+  # was preparing is retried once here, joined, instead of being abandoned until
+  # another fresh generation happens to run. This launch's own generation is
+  # preserved, and cleanup still runs under the canonical entry and admission lock.
+  NODE_KEEP_ROOT="${WORK_ROOT:-}"
+  node_cleanup_only || true
 }
 
 # ---------------------------------------------------------------------------
@@ -233,12 +337,16 @@ node_coordination_ready() {
 }
 # Targeted single-pid process-start token (never a census). Empty when ps is
 # unavailable, in which case the pid rule alone applies.
-# One exact per-platform token, matching the CJS and TypeScript writers byte for
-# byte: `linux:<boot identity>:<starttime ticks>` from this single pid's
-# /proc/<pid>/stat (no procps needed), or `darwin:<ps lstart token>` from one
-# targeted ps query. Exactly one pid, never a census. An empty result means the
-# identity genuinely cannot be established: no record is published, and a record
-# without a birth identity is never honored.
+# One exact per-platform token, matching the CJS, TypeScript host, and PowerShell
+# writers byte for byte: `linux:<boot identity>:<starttime ticks>` from this single
+# pid's /proc/<pid>/stat (no procps needed), or `darwin:<ps lstart token>` from one
+# targeted ps query. `ps lstart` renders in the caller's timezone and locale and
+# carries no zone of its own, so that one query is pinned to UTC and the C locale:
+# otherwise the same live process would look like a different owner after a
+# timezone/DST change, and its birth would be misparsed on non-UTC hosts. Exactly
+# one pid, never a census. An empty result means the identity genuinely cannot be
+# established: no record is published, and a record without a birth identity is
+# never honored.
 node_owner_identity() {
   local pid="$1" boot='' output='' line='' rest='' fields=() words=()
   [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]] || return 0
@@ -269,7 +377,7 @@ node_owner_identity() {
     fi
   fi
   [[ -n "${NODE_PS_BIN:-}" ]] || return 0
-  output="$("$NODE_PS_BIN" -p "$pid" -o lstart= 2>/dev/null)" || return 0
+  output="$(TZ=UTC0 LC_ALL=C LANG=C "$NODE_PS_BIN" -p "$pid" -o lstart= 2>/dev/null)" || return 0
   read -r -a words <<< "$output" 2>/dev/null || true
   [[ ${#words[@]} -gt 0 ]] || return 0
   printf '%s' "darwin:${words[*]}"
@@ -316,7 +424,12 @@ node_coordination_owner_current() {
   # metadata could otherwise be pinned forever behind an unrelated live process.
   [[ -n "$identity" ]] || return 1
   observed="$(node_owner_identity "$pid")"
-  [[ -n "$observed" && "$observed" == "$identity" ]]
+  # A temporarily unavailable birth query is not a proven mismatch: the pid is
+  # alive, so this may still be a live destructive holder and is honored (the
+  # wait stays bounded for a producer, and the ownership claim waits for the
+  # holder rather than stealing its mutex mid-deletion).
+  [[ -n "$observed" ]] || return 0
+  [[ "$observed" == "$identity" ]]
 }
 node_coordination_reclaim() {
   local expected="$1" current=''
@@ -420,9 +533,9 @@ node_coordination_release() {
 }
 
 # True (0) while a live producer owns this generation's owner marker. A marker
-# whose pid is gone, or that stays empty/malformed, is reclaimed.
+# whose owner is gone, reused, or that stays empty/malformed is reclaimed.
 node_generation_active() {
-  local marker="$1/.producer-active" owner='' attempt
+  local marker="$1/.producer-active" attempt
   # Fence the generation root: a direct-child link is not a generation and its
   # outside target must never be inspected or modified.
   [[ -d "$1" && ! -L "$1" ]] || return 1
@@ -431,10 +544,8 @@ node_generation_active() {
   # no-follow removal handles it.
   [[ -f "$marker" && ! -L "$marker" ]] || return 1
   for attempt in 1 2 3; do
-    owner=''
-    { IFS= read -r -n 32 owner < "$marker"; } 2>/dev/null || true
-    if [[ "$owner" =~ ^([0-9]{1,10})$ ]]; then
-      kill -0 "${BASH_REMATCH[1]}" 2>/dev/null && return 0
+    if node_owner_read "$marker"; then
+      node_owner_current "$marker" && return 0
       "$NODE_UNLINK_BIN" "$marker" 2>/dev/null || true
       return 1
     fi
@@ -444,9 +555,10 @@ node_generation_active() {
   return 1
 }
 
-# List recursive cleanup children with the caller's glob options preserved.
-# Cleanup-specific: hidden legacy records and initialized .terraform subtrees
-# inside a selected disposable generation are ordinary removable content.
+# Append the direct children of one directory to NODE_CHILDREN with the caller's
+# glob options preserved. Cleanup-specific: hidden legacy records and initialized
+# .terraform subtrees inside a selected disposable generation are ordinary
+# removable content.
 node_list_children() {
   local file="$1" restore_nullglob restore_dotglob
   shopt -q nullglob; restore_nullglob=$?
@@ -457,72 +569,371 @@ node_list_children() {
   (( restore_dotglob == 0 )) || shopt -u dotglob
 }
 
-# Bounded preflight then no-follow postorder. No recursive rm or find, and no
-# deletion of an ancestor of the selected generation. Arbitrary creators'
-# ordinary descendants — including hardlinked names and initialized .terraform
-# subtrees inside the selected disposable generation — are disposable BY PATH,
-# not by file creation receipts or link counts.
-node_visit() {
-  local file="$1" depth="$2" parentIndex="${3:--1}" child id index="${#NODE_REMOVE_PATHS[@]}"
-  node_check_fence && assert_path_identity "$NODE_REMOVE_ROOT" "$NODE_REMOVE_ID" || return 1
-  (( depth <= 64 && ${#NODE_REMOVE_PATHS[@]} < 100000 && SECONDS - NODE_REMOVE_STARTED <= 120 )) || return 1
-  NODE_REMOVE_PATHS+=("$file")
-  NODE_REMOVE_PARENTS+=("$parentIndex")
-  if [[ -L "$file" ]]; then
-    # Links themselves may be unlinked; their target is never read or visited.
-    NODE_REMOVE_DIR_IDS+=('')
-  elif [[ -d "$file" ]]; then
-    id="$(path_identity "$file")" || return 1
-    NODE_REMOVE_DIR_IDS+=("$id")
-    local NODE_CHILDREN=()
-    node_list_children "$file"
-    if (( ${#NODE_CHILDREN[@]} > 0 )); then
-      for child in "${NODE_CHILDREN[@]}"; do
-        node_visit "$child" "$((depth+1))" "$index" || return 1
-      done
-    fi
+# True while this cleanup pass may still delete something. The pass-level budget
+# grants exactly one initial allowance: until the pass has deleted real content it
+# may run its next bounded unit, and after that every unit is deadline checked. A
+# pass can therefore never end as a zero-progress no-op, and it cannot keep
+# deleting past its budget once it has started.
+node_cleanup_running() {
+  (( NODE_CLEANUP_BUDGET > 0 )) || return 0
+  (( SECONDS - NODE_CLEANUP_STARTED < NODE_CLEANUP_BUDGET ))
+}
+
+node_cleanup_allows_work() {
+  (( NODE_CLEANUP_PROGRESS > 0 )) || return 0
+  node_cleanup_running
+}
+
+# Unlink a batch of ordinary or special leaf names with one native call when the
+# platform's remove tool is available, and fall back to one no-follow `unlink` per
+# name otherwise. Batching is what keeps a file-heavy generation ahead of the
+# runtime budget; a hardlinked name only loses this cache-name link.
+node_unlink_batch() {
+  local count=$# start=0 name
+  local -a names=("$@") chunk=()
+  (( count > 0 )) || return 0
+  if [[ -n "${NODE_RM_BIN:-}" ]]; then
+    while (( start < count )); do
+      if ! node_cleanup_allows_work; then NODE_CLEANUP_STOPPED=1; return 1; fi
+      chunk=("${names[@]:start:NODE_CLEANUP_BATCH}")
+      (( ${#chunk[@]} > 0 )) || break
+      "$NODE_RM_BIN" -f -- "${chunk[@]}" || return 1
+      NODE_CLEANUP_PROGRESS=$((NODE_CLEANUP_PROGRESS + ${#chunk[@]}))
+      start=$((start + ${#chunk[@]}))
+    done
+    return 0
+  fi
+  for name in "${names[@]}"; do
+    if ! node_cleanup_allows_work; then NODE_CLEANUP_STOPPED=1; return 1; fi
+    "$NODE_UNLINK_BIN" "$name" || return 1
+    NODE_CLEANUP_PROGRESS=$((NODE_CLEANUP_PROGRESS + 1))
+  done
+}
+
+# Bounded incremental deletion of one designated generation's content, in
+# immediate postorder: leaf names are unlinked as they are visited and every
+# directory is removed as soon as its own subtree is empty. Sibling directories are
+# processed in bounded batches whose identities are captured for that batch only,
+# so no pass can spend its whole budget classifying or identifying directories
+# before deleting anything. There is no whole-tree preflight, no entry-count or
+# depth quota, and never a deletion of an ancestor of the selected generation.
+# Arbitrary creators' ordinary descendants — including hardlinked names and
+# initialized .terraform subtrees inside the selected disposable generation — are
+# disposable BY PATH, not by file creation receipts or link counts. Links are
+# unlinked themselves and never entered, and ordinary or special leaves (FIFO,
+# socket, device) are unlinked without being opened.
+#
+# Batching keeps a directory-heavy generation ahead of the budget: completed
+# sibling directories accumulate into one native `rmdir` call whose identities are
+# verified first with one native `stat` call, and leaf names accumulate into one
+# native remove call.
+node_flush_dirs() {
+  local force="${1:-}" count=${#NODE_PENDING_DIRS[@]} output='' line='' i=0
+  local -a observed=() keep=()
+  (( count > 0 )) || return 0
+  if [[ "$force" != force ]] && ! node_cleanup_running; then
+    # The budget expired with completed empty directories still pending: remove
+    # them best-effort so this pass cannot end with zero deletion progress.
+    NODE_CLEANUP_STOPPED=1
+    node_flush_dirs force || true
+    return 1
+  fi
+  # One native stat call for the whole batch; nothing is removed unless its exact
+  # directory identity is unchanged.
+  if [[ "$HOST_OS" == Darwin ]]; then
+    output="$("$STAT_BIN" -f '%d:%i' "${NODE_PENDING_DIRS[@]}" 2>/dev/null)" || output=''
   else
-    # Every non-directory, non-link entry inside this designated disposable
-    # generation is only a name here (ordinary file, FIFO, socket, or device):
-    # it is unlinked without being opened, so it leaves no disposable residue.
-    NODE_REMOVE_DIR_IDS+=('')
+    output="$("$STAT_BIN" -c '%d:%i' "${NODE_PENDING_DIRS[@]}" 2>/dev/null)" || output=''
+  fi
+  while IFS= read -r line; do observed+=("$line"); done <<< "$output"
+  if (( ${#observed[@]} == count )); then
+    for (( i=0; i<count; i++ )); do
+      [[ "${observed[i]}" == "${NODE_PENDING_IDS[i]}" ]] && keep+=("${NODE_PENDING_DIRS[i]}")
+    done
+  fi
+  NODE_PENDING_DIRS=()
+  NODE_PENDING_IDS=()
+  (( ${#keep[@]} > 0 )) || return 1
+  "$NODE_RMDIR_BIN" "${keep[@]}" || return 1
+  NODE_CLEANUP_PROGRESS=$((NODE_CLEANUP_PROGRESS + ${#keep[@]}))
+}
+
+node_queue_dir() {
+  local dir="$1" id="$2"
+  NODE_PENDING_DIRS+=("$dir")
+  NODE_PENDING_IDS+=("$id")
+  # Flush when the batch is full, and as soon as the raw budget has expired: the
+  # already-empty directories must be removed before this pass stops, so a
+  # directory-only generation always makes real progress.
+  if (( ${#NODE_PENDING_DIRS[@]} >= NODE_CLEANUP_BATCH )) || ! node_cleanup_running; then
+    node_flush_dirs
   fi
 }
-node_remove() {
-  local NODE_REMOVE_ROOT="$1" NODE_REMOVE_ID="$2" NODE_REMOVE_STARTED=$SECONDS i j
-  local NODE_REMOVE_PATHS=() NODE_REMOVE_DIR_IDS=() NODE_REMOVE_PARENTS=()
-  assert_path_identity "$1" "$2" || return 1
-  node_visit "$1" 0 || return 1
-  for ((i=${#NODE_REMOVE_PATHS[@]}-1; i>0; i--)); do
-    node_check_fence && assert_path_identity "$1" "$2" || return 1
-    (( SECONDS - NODE_REMOVE_STARTED <= 120 )) || return 1
-    j="${NODE_REMOVE_PARENTS[i]}"
-    while (( j >= 0 )); do
-      [[ -z "${NODE_REMOVE_DIR_IDS[j]}" ]] || assert_path_identity "${NODE_REMOVE_PATHS[j]}" "${NODE_REMOVE_DIR_IDS[j]}" || return 1
-      j="${NODE_REMOVE_PARENTS[j]}"
-    done
-    if [[ -n "${NODE_REMOVE_DIR_IDS[i]}" ]]; then
-      assert_path_identity "${NODE_REMOVE_PATHS[i]}" "${NODE_REMOVE_DIR_IDS[i]}" || return 1
-      "$NODE_RMDIR_BIN" "${NODE_REMOVE_PATHS[i]}" || return 1
-    elif [[ -L "${NODE_REMOVE_PATHS[i]}" ]]; then
-      # Unlink the link itself; its target is never visited.
-      "$NODE_UNLINK_BIN" "${NODE_REMOVE_PATHS[i]}" || return 1
+
+# Capture the identities of a batch of directories with native stat calls, at
+# most NODE_CLEANUP_BATCH paths per call so a high-fanout directory with long
+# path prefixes can never exceed the platform argv limit. Sets the NODE_IDENTITIES
+# global (one identity per input path, same order) and returns nonzero on any real
+# query failure, so the caller must abort the pass instead of walking an empty or
+# short identity list.
+node_batch_identities() {
+  local count=$# start=0 chunk=() output='' line
+  local -a paths=("$@") lines=()
+  # Never leave a previous directory's identities behind for a caller that might
+  # ignore the failure: an empty list is the only safe state on error.
+  NODE_IDENTITIES=()
+  (( count > 0 )) || return 1
+  while (( start < count )); do
+    if ! node_cleanup_allows_work; then NODE_CLEANUP_STOPPED=1; return 1; fi
+    chunk=("${paths[@]:start:NODE_CLEANUP_BATCH}")
+    (( ${#chunk[@]} > 0 )) || break
+    if [[ "$HOST_OS" == Darwin ]]; then
+      output="$("$STAT_BIN" -f '%d:%i' "${chunk[@]}" 2>/dev/null)" || return 1
     else
-      # An ordinary or special leaf name is unlinked without following anything.
-      # A hardlink only loses this cache name; outside bytes and links stay.
-      [[ ! -d "${NODE_REMOVE_PATHS[i]}" && ! -L "${NODE_REMOVE_PATHS[i]}" ]] || return 1
-      "$NODE_UNLINK_BIN" "${NODE_REMOVE_PATHS[i]}" || return 1
+      output="$("$STAT_BIN" -c '%d:%i' "${chunk[@]}" 2>/dev/null)" || return 1
     fi
+    local -a chunkLines=()
+    while IFS= read -r line; do chunkLines+=("$line"); done <<< "$output"
+    (( ${#chunkLines[@]} == ${#chunk[@]} )) || return 1
+    lines+=("${chunkLines[@]}")
+    start=$((start + ${#chunk[@]}))
   done
-  node_check_fence && assert_path_identity "$1" "$2" || return 1
-  "$NODE_RMDIR_BIN" "$1"
+  (( ${#lines[@]} == count )) || return 1
+  NODE_IDENTITIES=("${lines[@]}")
+}
+
+# Stop this pass truthfully after making whatever removal progress is already
+# available: pending empty directories are removed best-effort, then failure is
+# reported so the caller does not count the generation as reclaimed.
+node_remove_abort() {
+  node_flush_dirs force || true
+  return 1
+}
+
+node_remove_dir() {
+  local dir="$1" child='' id='' index=0 start=0
+  local -a NODE_CHILDREN=() leaves=() subdirs=() ids=() chunk=()
+  NODE_CLEANUP_DIRS=$((NODE_CLEANUP_DIRS + 1))
+  if (( NODE_CLEANUP_DIRS % NODE_CLEANUP_FENCE_EVERY == 1 )); then
+    # The cache ancestor fence is rechecked periodically rather than once per
+    # descendant, and every directory removal below is identity-checked.
+    node_check_fence || return 1
+  fi
+  if ! node_cleanup_allows_work; then
+    node_flush_dirs force || true
+    NODE_CLEANUP_STOPPED=1
+    return 1
+  fi
+  node_list_children "$dir"
+  if (( ${#NODE_CHILDREN[@]} > 0 )); then
+    for child in "${NODE_CHILDREN[@]}"; do
+      if [[ -L "$child" ]]; then
+        leaves+=("$child")
+      elif [[ -d "$child" ]]; then
+        subdirs+=("$child")
+      else
+        leaves+=("$child")
+      fi
+    done
+  fi
+  if (( ${#leaves[@]} > 0 )); then
+    node_unlink_batch "${leaves[@]}" || { node_remove_abort; return 1; }
+  fi
+  if (( ${#subdirs[@]} > 0 )); then
+    # Bounded sibling batches: identify one batch, delete through its subtrees, then
+    # move to the next. The budget can therefore never be consumed by identifying
+    # every sibling before the first one is removed.
+    while (( start < ${#subdirs[@]} )); do
+      if ! node_cleanup_allows_work; then
+        node_flush_dirs force || true
+        NODE_CLEANUP_STOPPED=1
+        return 1
+      fi
+      chunk=("${subdirs[@]:start:NODE_CLEANUP_BATCH}")
+      (( ${#chunk[@]} > 0 )) || break
+      node_batch_identities "${chunk[@]}" || { node_remove_abort; return 1; }
+      ids=("${NODE_IDENTITIES[@]}")
+      index=0
+      for child in "${chunk[@]}"; do
+        if ! node_cleanup_allows_work; then
+          node_flush_dirs force || true
+          NODE_CLEANUP_STOPPED=1
+          return 1
+        fi
+        id="${ids[index]}"
+        index=$((index + 1))
+        node_remove_dir "$child" || { node_remove_abort; return 1; }
+        # The child's own content is gone; its empty directory is removed with the
+        # next batch (or immediately when the batch is full or the budget is spent).
+        node_queue_dir "$child" "$id" || { node_remove_abort; return 1; }
+      done
+      start=$((start + ${#chunk[@]}))
+    done
+  fi
+}
+
+node_remove() {
+  local root="$1" expected="$2"
+  assert_path_identity "$root" "$expected" || return 1
+  if [[ -L "$root" ]]; then
+    # Unlink the link itself; its target is never visited.
+    "$NODE_UNLINK_BIN" "$root" || return 1
+    NODE_CLEANUP_PROGRESS=$((NODE_CLEANUP_PROGRESS + 1))
+    return 0
+  fi
+  NODE_PENDING_DIRS=()
+  NODE_PENDING_IDS=()
+  node_remove_dir "$root" || return 1
+  # The root's directory is only removed once its whole subtree is gone. This is
+  # also a progress boundary: an empty generation deletes nothing inside
+  # node_remove_dir, so it uses the same pass-scope allowance instead of the raw
+  # deadline. Otherwise a pass whose budget expired during inventory or identity
+  # checks would refuse the root removal forever with zero physical progress;
+  # once anything has been deleted the deadline applies again.
+  if ! node_cleanup_allows_work; then
+    node_flush_dirs force || true
+    NODE_CLEANUP_STOPPED=1
+    return 1
+  fi
+  node_flush_dirs force || return 1
+  assert_path_identity "$root" "$expected" || return 1
+  "$NODE_RMDIR_BIN" "$root" || return 1
+  NODE_CLEANUP_PROGRESS=$((NODE_CLEANUP_PROGRESS + 1))
+}
+
+# Reclaim excess generations until at most <leave> remain, never touching
+# <keep_path>, and report the product target <report_target>. One elapsed budget
+# bounds the whole pass, progress is tracked at pass scope (so the initial
+# allowance is granted once, not per generation), and capacity never refuses
+# anything: every failure warns and the caller continues.
+node_reclaim_excess() {
+  local leave="$1" keep_path="${2:-}" report_target="${3:-$1}" entries=() candidates=() entry id count=0 reclaimed=0
+  # ONE elapsed budget for the whole pass (inventory plus every removal it
+  # attempts), not a fresh deadline per generation.
+  NODE_CLEANUP_STARTED=$SECONDS
+  NODE_CLEANUP_STOPPED=0
+  NODE_CLEANUP_PROGRESS=0
+  NODE_CLEANUP_DIRS=0
+  NODE_PENDING_DIRS=()
+  NODE_PENDING_IDS=()
+  shopt -s nullglob dotglob
+  entries=("$NODE_CACHE_ROOT"/*)
+  shopt -u nullglob dotglob
+  # Bash 3.2 treats an empty array expansion as unbound under set -u.
+  if (( ${#entries[@]} > 0 )); then
+    for entry in "${entries[@]}"; do
+      [[ "$entry" != "$NODE_LOCK" ]] || continue
+      [[ -z "$keep_path" || "$entry" != "$keep_path" ]] || continue
+      [[ -L "$entry" || -d "$entry" ]] || continue
+      candidates+=("$entry")
+    done
+  fi
+  count=${#candidates[@]}
+  if (( count > leave )); then
+    for entry in "${candidates[@]}"; do
+      (( count > leave )) || break
+      # Stop before starting another candidate once this pass has deleted
+      # something and reached its budget: each empty directory or link would
+      # otherwise be processed past the budget while the mutex is held.
+      if (( NODE_CLEANUP_PROGRESS > 0 )) && ! node_cleanup_running; then
+        NODE_CLEANUP_STOPPED=1
+        break
+      fi
+      # Rechecked at every destructive boundary: even when the per-agent
+      # boundary could not be taken, a host's ownership record stops further
+      # removal instead of being raced by cleanup.
+      if node_host_owns_agent_directory; then
+        echo 'pi-review-sessions: a session host acquired the agent directory during cleanup; leaving the remaining Node cache generations untouched.' >&2
+        break
+      fi
+      node_generation_active "$entry" && continue
+      if [[ -L "$entry" ]]; then
+        if "$NODE_UNLINK_BIN" "$entry" 2>/dev/null; then
+          count=$((count - 1))
+          reclaimed=$((reclaimed + 1))
+          NODE_CLEANUP_PROGRESS=$((NODE_CLEANUP_PROGRESS + 1))
+        else
+          echo "pi-review-sessions: could not remove Node cache entry ${entry##*/}; it remains and startup continues." >&2
+        fi
+        continue
+      fi
+      id="$(path_identity "$entry" 2>/dev/null)" || continue
+      if node_remove "$entry" "$id"; then
+        count=$((count - 1))
+        reclaimed=$((reclaimed + 1))
+      elif (( NODE_CLEANUP_STOPPED == 1 )); then
+        # Real content was already removed; the next launch continues from
+        # what remains instead of starting a no-op preflight again.
+        NODE_CLEANUP_STOPPED=0
+        echo "pi-review-sessions: Node cache cleanup stopped at its runtime budget after reclaiming ${reclaimed} generations; ${count} remain and the next launch reclaims more. Continuing startup." >&2
+        break
+      else
+        # A real filesystem/identity-query failure is reported honestly; the
+        # generation stays counted and startup continues.
+        echo "pi-review-sessions: could not reclaim cache generation ${entry##*/}; it remains and startup continues." >&2
+      fi
+    done
+  fi
+  local held=$count
+  if [[ -n "$keep_path" ]]; then held=$((count + 1)); fi
+  if (( held > report_target )); then
+    echo "pi-review-sessions: Node cache still holds ${held} generations (target ${report_target}); continuing startup." >&2
+  fi
+  return 0
+}
+
+# Release this producer's admission lock entry, and only while that exact entry
+# is still the one it published.
+node_release_admission_lock() {
+  if [[ -n "$NODE_LOCK_ID" ]] && node_check_fence && assert_path_identity "$NODE_LOCK" "$NODE_LOCK_ID"; then
+    "$NODE_UNLINK_BIN" "$NODE_LOCK" || return 1
+    NODE_LOCK_ID=''
+  fi
+  return 0
+}
+
+# Producer-owned cleanup-only pass: reclaim excess generations toward the per-type
+# target without creating anything, under the same canonical per-agent
+# coordination entry and the same admission lock, preserving the generation this
+# launch selected or just created. Used at preparation settlement so reclamation
+# that contention deferred while this producer was preparing is retried once
+# (joined, never backgrounded) instead of waiting for another fresh generation.
+node_cleanup_only() {
+  if ! node_check_fence; then
+    return 1
+  fi
+  if ! node_coordination_ready || ! node_coordination; then
+    echo 'pi-review-sessions: host ownership coordination was unavailable; leaving Node cache generations untouched.' >&2
+    return 0
+  fi
+  if node_host_owns_agent_directory; then
+    echo 'pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.' >&2
+    node_coordination_release
+    return 0
+  fi
+  if ! node_lock; then
+    if [[ "${NODE_LOCK_REPORT:-}" == lock-artifact ]]; then
+      echo 'pi-review-sessions: Node cache cleanup lock artifact could not be removed; continuing without reclaiming older generations.' >&2
+    else
+      echo 'pi-review-sessions: Node cache cleanup lock was busy or unreadable; continuing without reclaiming older generations.' >&2
+    fi
+    node_coordination_release
+    return 0
+  fi
+  if node_host_owns_agent_directory; then
+    echo 'pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.' >&2
+  else
+    node_reclaim_excess $((NODE_LIMIT - 1)) "${NODE_KEEP_ROOT:-}" "$NODE_LIMIT"
+  fi
+  node_coordination_release
+  node_release_admission_lock || true
+  return 0
 }
 
 # Reclaim excess generations down to the per-type target, then create this
 # launch's fresh generation. Capacity never refuses creation: cleanup problems
 # are reported as bounded warnings and the launch continues.
 node_admit() {
-  local entries=() candidates=() entry id count=0
   # The canonical per-agent coordination entry is taken FIRST and released once
   # this producer's fresh generation exists. Host ownership acquisition takes the
   # same entry, so cleanup and acquiring ownership cannot interleave.
@@ -540,48 +951,13 @@ node_admit() {
       # acquired ownership while this producer waited.
       echo 'pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.' >&2
     else
-      shopt -s nullglob dotglob
-      entries=("$NODE_CACHE_ROOT"/*)
-      shopt -u nullglob dotglob
-      # Bash 3.2 treats an empty array expansion as unbound under set -u.
-      if (( ${#entries[@]} > 0 )); then
-        for entry in "${entries[@]}"; do
-          [[ "$entry" != "$NODE_LOCK" ]] || continue
-          [[ -L "$entry" || -d "$entry" ]] || continue
-          candidates+=("$entry")
-        done
-      fi
-      count=${#candidates[@]}
-      if (( count > 100000 )); then
-        echo 'pi-review-sessions: Node cache inventory exceeded its bound; continuing without reclamation.' >&2
-      else
-        if (( ${#candidates[@]} > 0 )); then
-          for entry in "${candidates[@]}"; do
-            (( count >= NODE_LIMIT )) || break
-            # Rechecked at every destructive boundary: even when the per-agent
-            # boundary could not be taken, a host's ownership record stops
-            # further removal instead of being raced by cleanup.
-            if node_host_owns_agent_directory; then
-              echo 'pi-review-sessions: a session host acquired the agent directory during cleanup; leaving the remaining Node cache generations untouched.' >&2
-              break
-            fi
-            node_generation_active "$entry" && continue
-            if [[ -L "$entry" ]]; then
-              if "$NODE_UNLINK_BIN" "$entry" 2>/dev/null; then count=$((count - 1)); fi
-              continue
-            fi
-            id="$(path_identity "$entry" 2>/dev/null)" || continue
-            if node_remove "$entry" "$id"; then count=$((count - 1)); fi
-          done
-        fi
-        if (( count >= NODE_LIMIT )); then
-          echo "pi-review-sessions: Node cache still holds ${count} generations (target ${NODE_LIMIT}); continuing startup." >&2
-        fi
-      fi
-      # Keep the admission lock until this producer exits (released by the
-      # caller's EXIT trap). Another concurrent producer then skips cleanup
-      # instead of deleting a generation that is still being extracted.
+      # Trim to four so creating this launch's ONE new generation lands at or
+      # below the per-type target of five whenever that is possible.
+      node_reclaim_excess $((NODE_LIMIT - 1)) '' "$NODE_LIMIT"
     fi
+    # Keep the admission lock until this producer exits (released by the
+    # caller's EXIT trap). Another concurrent producer then skips cleanup
+    # instead of deleting a generation that is still being extracted.
   elif node_host_owns_agent_directory; then
     # Rechecked whichever way the admission attempt ended: a host that became the
     # owner while this producer waited is the reason cleanup stays away.
@@ -609,8 +985,9 @@ node_admit() {
   shopt -u nullglob dotglob
   (( ${#created[@]} == 0 )) || { node_coordination_release; return 1; }
   # A live owner marker keeps concurrent producers from pruning this generation
-  # while its Node archive is still downloading/extracting. The EXIT trap clears
-  # it when this producer settles.
-  (set -o noclobber; printf '%s\n' "$$" > "$WORK_ROOT/.producer-active") 2>/dev/null || { node_coordination_release; return 1; }
+  # while its Node archive is still downloading/extracting. The record carries
+  # this producer's pid and targeted birth identity so a reused pid can never
+  # pin the generation. The EXIT trap clears it when this producer settles.
+  (set -o noclobber; printf '%s\n%s\n' "$$" "$(node_owner_identity "$$")" > "$WORK_ROOT/.producer-active") 2>/dev/null || { node_coordination_release; return 1; }
   node_coordination_release
 }

@@ -44,11 +44,32 @@
 //
 // Reuse/validation authority stays with the producers (source-build freshness
 // records and Pi package/version validation). This module keeps no registry and
-// writes no lifetime receipts. MARKER is a single owner-pid liveness file inside
-// a generation for exactly as long as that generation is being filled, so a
+// writes no lifetime receipts. MARKER is a single owner liveness file inside a
+// generation for exactly as long as that generation is being filled, so a
 // concurrent cleanup skips in-flight setup without retaining it forever: a dead
 // owner's marker is reclaimed like a stale lock. RECORD is the retired legacy
 // lifetime file name that artifact scans continue to ignore.
+//
+// Cleanup is progressive and bounded by the pass, not by a preflight. One
+// bounded pass inventories the type, then removes generations one entry at a
+// time with deletion as progress: a pass that reaches its runtime budget keeps
+// every entry it already removed and the next preparation continues from what
+// remains. There is no entry-count or depth quota that could refuse to delete
+// anything, and the budget is shared by the whole pass instead of being reset
+// for each generation. Producers that reuse an existing generation run the same
+// bounded pass with a target of five and always protect the generation this
+// launch selected, so a warm startup advances pending cleanup without creating
+// anything new.
+//
+// Reclamation may stop at its budget but must never be a no-op forever. Only a
+// genuinely in-flight producer (its own record names its live owner) or an
+// existing session-host ownership record defers a removal. Those per-cache
+// records are written already complete as `<pid>` plus the owner's targeted
+// single-pid birth token, the same token the coordination entry uses; a legacy
+// pid-only record is still honored while its owner is genuinely current, which
+// is decided by comparing that pid's OS birth time with the record's own mtime.
+// A live pid whose birth is clearly after the record was written cannot be the
+// process that wrote it (the number was reused), so it never pins a generation.
 const fs = require("node:fs");
 const path = require("node:path");
 const { performance } = require("node:perf_hooks");
@@ -58,11 +79,13 @@ const LOCK = ".admission.lock";
 /** Per-agent coordination entry shared with the session host's ownership guard. */
 const COORDINATION = "host-coordination.lock";
 const LIMIT = 5;
-const MAX_ENTRIES = 100_000;
-const MAX_DEPTH = 64;
-const CLEANUP_DEADLINE_MS = 120_000;
+/** One cleanup pass — inventory plus every removal it attempts — shares this. */
+const CLEANUP_BUDGET_MS = 120_000;
 const LOCK_WAIT_MS = 2_000;
-const MAX_LOCK_BYTES = 64;
+/** Bounded owner record: `<pid>` plus an optional targeted birth identity. */
+const MAX_OWNER_BYTES = 192;
+/** A reused pid's birth is only "after" a record when clearly later than it. */
+const OWNER_BIRTH_MARGIN_MS = 2_000;
 /** Bounded canonical coordination record: `<pid>\n<owner identity>\n`. */
 const MAX_COORDINATION_BYTES = 192;
 const COORDINATION_CANDIDATE = /^host-coordination\.lock\.[1-9][0-9]*\.[0-9a-f]{8}$/u;
@@ -91,14 +114,14 @@ function processIsAlive(pid) {
 function readLockOwner(file) {
   try {
     const before = fs.lstatSync(file, { bigint: true });
-    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.size > BigInt(MAX_LOCK_BYTES)) {
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.size > BigInt(MAX_OWNER_BYTES)) {
       return undefined;
     }
     const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
     try {
-      const bytes = Buffer.alloc(MAX_LOCK_BYTES + 1);
+      const bytes = Buffer.alloc(MAX_OWNER_BYTES + 1);
       const length = fs.readSync(fd, bytes, 0, bytes.length, 0);
-      return bytes.subarray(0, Math.min(length, MAX_LOCK_BYTES)).toString("utf8");
+      return bytes.subarray(0, Math.min(length, MAX_OWNER_BYTES)).toString("utf8");
     } finally {
       fs.closeSync(fd);
     }
@@ -107,10 +130,151 @@ function readLockOwner(file) {
   }
 }
 
+/** A per-cache owner record is only ever a fresh single-linked small regular file. */
+function lockRecordCandidate(stat) {
+  return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n && stat.size <= BigInt(MAX_OWNER_BYTES);
+}
+
+function recordMtimeMs(stat) {
+  return typeof stat.mtimeNs === "bigint" ? Number(stat.mtimeNs / 1_000_000n) : Number(stat.mtimeMs);
+}
+
+const PS_LSTART_MONTHS = {
+  Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
+  Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
+};
+
+/**
+ * Parse one `ps lstart` token as UTC. The token ("Sun Oct 18 01:29:07 2026")
+ * carries no zone of its own, so interpreting it as caller-local time would
+ * misplace a legitimate owner's birth by the local offset (and would flip a
+ * genuinely live legacy producer to "stale" on any non-UTC host). The query is
+ * pinned to UTC, and the parse is explicit UTC to match.
+ */
+function utcPsLstartMs(token) {
+  const match = /^(?:[A-Za-z]{3}\s+)?([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})$/u.exec(String(token).trim());
+  if (!match) return undefined;
+  const month = PS_LSTART_MONTHS[match[1]];
+  if (month === undefined) return undefined;
+  const value = Date.UTC(Number(match[6]), month, Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]));
+  return Number.isFinite(value) ? value : undefined;
+}
+
+/** Kernel boot time in whole seconds, used for Linux owner-birth arithmetic. */
+function linuxBootSeconds() {
+  try {
+    const stat = fs.readFileSync(LINUX_STAT, "utf8");
+    const match = /^btime\s+(\d{1,12})$/mu.exec(stat);
+    if (match) return Number(match[1]);
+  } catch {
+    // No boot time is available.
+  }
+  return undefined;
+}
+
+/**
+ * Targeted single-pid OS owner birth time in epoch milliseconds. It exists only
+ * to tell a legacy pid-only record written by its actual owner from one left
+ * behind by a pid that an unrelated process has since reused. Exactly one pid is
+ * queried (never a census, never a registry), and an empty result simply means
+ * the record is honored conservatively.
+ */
+function ownerBirthMs(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const close = stat.lastIndexOf(")");
+      if (close < 0) return undefined;
+      const starttime = stat.slice(close + 1).trim().split(/\s+/u)[19];
+      if (!starttime || !/^[0-9]{1,20}$/u.test(starttime)) return undefined;
+      const boot = linuxBootSeconds();
+      if (boot === undefined) return undefined;
+      // USER_HZ is 100 on Linux by ABI definition, so ticks convert exactly.
+      return boot * 1000 + Number(starttime) * 10;
+    } catch {
+      return undefined;
+    }
+  }
+  if (process.platform === "darwin") {
+    const token = queryOwnerIdentity(pid);
+    if (!token) return undefined;
+    return utcPsLstartMs(token.slice("darwin:".length));
+  }
+  if (process.platform === "win32") {
+    const token = queryOwnerIdentity(pid);
+    if (!token) return undefined;
+    // The Windows token is an ISO round-trip that carries its own zone.
+    const value = Date.parse(token.slice("win32:".length));
+    return Number.isFinite(value) ? value : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Parse one per-cache owner record. A current producer publishes
+ * `<pid>\n<owner identity>\n` — the same targeted pid plus birth token the
+ * canonical coordination entry carries — so liveness never depends on a pid
+ * number alone. Records written by an older producer are pid-only and remain
+ * readable.
+ */
+function parseOwnerRecord(text) {
+  if (typeof text !== "string") return undefined;
+  const newline = text.indexOf("\n");
+  const pidText = (newline < 0 ? text : text.slice(0, newline)).trim();
+  if (!/^[1-9][0-9]{0,9}$/u.test(pidText)) return undefined;
+  const identity = newline < 0 ? "" : text.slice(newline + 1).replace(/\n+$/u, "");
+  if (identity.length > MAX_OWNER_BYTES - 32) return undefined;
+  return { pid: Number(pidText), identity };
+}
+
+/** Ephemeral per-cache owner record: `<pid>` plus its targeted birth token. */
+function ownerRecordBody(pid, ownerIdentity) {
+  return `${pid}\n${ownerIdentity}\n`;
+}
+
+/**
+ * True only while a record's owner is genuinely current. A record that names its
+ * owner's birth identity is honored only while that exact identity still holds.
+ * A legacy pid-only record falls back to one targeted birth-time comparison: a
+ * live pid whose OS birth is clearly AFTER the record's own mtime cannot be the
+ * process that wrote it (its number was reused), while an earlier birth is
+ * legitimate in-flight work and stays protected.
+ */
+function ownerRecordIsCurrent(record, stat) {
+  if (!record || !processIsAlive(record.pid)) return false;
+  if (record.identity !== "") {
+    const observed = queryOwnerIdentity(record.pid);
+    // An unverifiable birth is not a proven mismatch: the pid is alive, so this
+    // may still be an in-flight producer and is honored. Only a real, different
+    // birth identity proves the number was reused.
+    if (observed === "") return true;
+    return observed === record.identity;
+  }
+  const birth = ownerBirthMs(record.pid);
+  if (birth === undefined) return true;
+  return birth <= recordMtimeMs(stat) + OWNER_BIRTH_MARGIN_MS;
+}
+
+/**
+ * True only while the record's owner is genuinely current, with an unverifiable
+ * birth treated as a possible live holder rather than as staleness. Used by the
+ * canonical coordination mutex: stealing a live destructive holder's entry would
+ * let a second actor claim the agent directory beside an active deletion.
+ */
+function coordinationRecordIsCurrent(record) {
+  if (!record || !processIsAlive(record.pid)) return false;
+  if (record.identity === "") return false;
+  const observed = queryOwnerIdentity(record.pid);
+  if (observed === "") return true;
+  return observed === record.identity;
+}
+
 /**
  * True while the recorded owner of a generation is still filling it. A marker
  * that stays empty/malformed is observed briefly, then treated as a dead
- * owner's residue and removed; a dead pid or unreadable marker is reclaimable.
+ * owner's residue and removed; a dead, reused-pid, or unreadable marker is
+ * reclaimable.
  */
 function generationIsInProgress(root) {
   // Fence the generation root itself: a direct-child link is not a generation
@@ -129,17 +293,16 @@ function generationIsInProgress(root) {
     } catch {
       return false;
     }
-    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.size > 64n) {
+    if (!lockRecordCandidate(before)) {
       // Invalid metadata shapes (directory, link, oversized) are not liveness
       // evidence. Confined no-follow cleanup removes them or reports a real
       // filesystem failure; they never become a permanent pin.
       return false;
     }
-    const text = readLockOwner(file);
-    const owner = text === undefined ? undefined : /^(\d{1,10})\n?$/u.exec(text);
-    if (owner) {
-      const pid = Number(owner[1]);
-      if (pid === process.pid || processIsAlive(pid)) return true;
+    const record = parseOwnerRecord(readLockOwner(file));
+    if (record) {
+      const pid = record.pid;
+      if (ownerRecordIsCurrent(record, before)) return true;
       break;
     }
     sleep(25);
@@ -157,7 +320,7 @@ function writeMarker(root) {
   const file = path.join(root, MARKER);
   const fd = fs.openSync(file, "wx", 0o600);
   try {
-    fs.writeFileSync(fd, `${process.pid}\n`);
+    fs.writeFileSync(fd, ownerRecordBody(process.pid, ownOwnerIdentity()));
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
@@ -172,13 +335,6 @@ function clearMarker(root) {
   } catch {
     // Already settled, replaced, or unreadable: nothing to remove.
   }
-}
-
-const LOCK_OWNER = /^(\d{1,10})\n?$/u;
-
-/** A lock record is only ever a fresh single-linked small regular file. */
-function lockRecordCandidate(stat) {
-  return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n && stat.size <= BigInt(MAX_LOCK_BYTES);
 }
 
 /**
@@ -200,15 +356,18 @@ function reclaimLockArtifact(file, identity) {
   }
   if (`${stat.dev}:${stat.ino}` !== identity) return "kept";
   if (lockRecordCandidate(stat)) {
-    const owner = LOCK_OWNER.exec(readLockOwner(file) ?? "");
-    if (owner && (Number(owner[1]) === process.pid || processIsAlive(Number(owner[1])))) return "kept";
+    const record = parseOwnerRecord(readLockOwner(file));
+    if (record && record.pid === process.pid
+      && (record.identity === "" || record.identity === ownOwnerIdentity())
+      && ownerRecordIsCurrent(record, stat)) return "kept";
+    if (record && ownerRecordIsCurrent(record, stat)) return "kept";
   }
   try {
     if (!stat.isDirectory()) {
       fs.unlinkSync(file);
       return "reclaimed";
     }
-    return remove(file) ? "reclaimed" : "failed";
+    return remove(file, performance.now() + CLEANUP_BUDGET_MS, { removed: 0 }) === "removed" ? "reclaimed" : "failed";
   } catch (error) {
     return error && error.code === "ENOENT" ? "reclaimed" : "failed";
   }
@@ -235,7 +394,7 @@ function acquireLock(file, warnings, messages, options = {}) {
       const fd = fs.openSync(file, "wx", 0o600);
       let created;
       try {
-        fs.writeFileSync(fd, `${process.pid}\n`);
+        fs.writeFileSync(fd, ownerRecordBody(process.pid, ownOwnerIdentity()));
         const stat = fs.fstatSync(fd, { bigint: true });
         created = { dev: stat.dev, ino: stat.ino };
       } finally {
@@ -278,14 +437,17 @@ function acquireLock(file, warnings, messages, options = {}) {
         return undefined;
       }
       const identity = `${observed.dev}:${observed.ino}`;
-      const owner = LOCK_OWNER.exec((lockRecordCandidate(observed) ? readLockOwner(file) : undefined) ?? "");
-      if (owner && Number(owner[1]) === process.pid) {
+      const record = lockRecordCandidate(observed) ? parseOwnerRecord(readLockOwner(file)) : undefined;
+      if (record && record.pid === process.pid
+        && (record.identity === "" || record.identity === ownOwnerIdentity())
+        && ownerRecordIsCurrent(record, observed)) {
         // Same-process concurrency cannot be waited out (the holder only
-        // settles on another turn of this event loop): skip cleanup at once.
+        // settles on another turn of this event loop): skip cleanup at once. A
+        // stale pid-only record that happens to name this pid is not a hold.
         warnings.push(messages.busy);
         return undefined;
       }
-      if (owner && processIsAlive(Number(owner[1]))) {
+      if (record && ownerRecordIsCurrent(record, observed)) {
         // A live owner is never ours: wait, then skip cleanup. A selection
         // handoff waits for the whole bounded destructive pass instead.
         malformed = 0;
@@ -294,8 +456,9 @@ function acquireLock(file, warnings, messages, options = {}) {
           sleep(25);
           continue;
         }
-      } else if (owner) {
-        // A dead owner's record is reclaimed only if it is still that record.
+      } else if (record) {
+        // A dead or pid-reused owner's record is reclaimed only if it is still
+        // that record.
         malformed = 0;
         malformedIdentity = undefined;
         const outcome = reclaimLockArtifact(file, identity);
@@ -431,6 +594,10 @@ function coordinate(cacheRoot, warnings) {
     return undefined;
   }
   const acquired = acquireCoordinationEntry(paths.stateDir);
+  // "self" means this process already holds the canonical boundary (the
+  // launcher's ownership handoff): its own bounded destructive pass still runs
+  // inside that mutex, and the ownership claim itself still waits for it.
+  if (acquired.status === "self") return { release() {} };
   if (acquired.status !== "held") {
     warnings.push(COORDINATION_MESSAGES.busy);
     return undefined;
@@ -505,9 +672,13 @@ function linuxBootIdentity() {
  * - `linux:<boot identity>:<starttime ticks>` from this single pid's
  *   `/proc/<pid>/stat` (no procps `ps` needed, so minimal/BusyBox distributions
  *   work);
- * - `darwin:<ps lstart token>` from one targeted `ps -p <pid>` query;
+ * - `darwin:<ps lstart token>` from one targeted `ps -p <pid>` query that is
+ *   pinned to UTC and the C locale, because `ps lstart` carries no zone of its
+ *   own: a caller-local rendering would make the same live process look like a
+ *   different owner after a timezone/DST change, and would misplace its birth;
  * - `win32:<StartTime round-trip>` from one targeted native PowerShell query
- *   (the same facility and format the PowerShell producer uses).
+ *   (the same facility and format the PowerShell producer uses), which keeps
+ *   its explicit UTC offset.
  * Always exactly one pid, never a process census, and no third-party package.
  * An empty result means the identity genuinely cannot be established.
  */
@@ -544,6 +715,11 @@ function ownerStartIdentity(pid) {
         encoding: "utf8",
         timeout: 5_000,
         stdio: ["ignore", "pipe", "ignore"],
+        // `ps lstart` renders in the caller's timezone and locale. The token is
+        // compared byte for byte across the CJS, TypeScript host, and POSIX
+        // paths and is also the owner-birth evidence, so the query itself is
+        // pinned to UTC and the C locale instead of relying on the caller's.
+        env: { ...process.env, TZ: "UTC0", LC_ALL: "C", LANG: "C" },
       });
       const token = String(output).replace(/\s+/gu, " ").trim();
       return token.length > 0 && token.length <= MAX_COORDINATION_BYTES - 48 ? `darwin:${token}` : "";
@@ -582,7 +758,27 @@ function ownerStartIdentity(pid) {
   return "";
 }
 
-const OWN_OWNER_IDENTITY = ownerStartIdentity(process.pid);
+// This process's own owner identity. The token is immutable once established, so
+// a positive result is cached forever; a failed query is never cached, because a
+// transient `ps`/`/proc` failure at load would otherwise permanently prevent this
+// process from publishing or recognizing its own coordination hold.
+let ownerIdentityQuery = ownerStartIdentity;
+function queryOwnerIdentity(pid) {
+  return ownerIdentityQuery(pid);
+}
+let OWN_OWNER_IDENTITY_CACHE = "";
+function ownOwnerIdentity() {
+  if (OWN_OWNER_IDENTITY_CACHE === "") {
+    // Through the same query the liveness checks use, and retried on every call
+    // until it succeeds: a transient failure must never disable publishing or
+    // self-adoption for the rest of the process's life.
+    const observed = queryOwnerIdentity(process.pid);
+    if (observed !== "") OWN_OWNER_IDENTITY_CACHE = observed;
+  }
+  return OWN_OWNER_IDENTITY_CACHE;
+}
+// Learn this process's identity once at load; a failure here is retried above.
+OWN_OWNER_IDENTITY_CACHE = ownerStartIdentity(process.pid);
 
 function coordinationRecordBody(pid, identity) {
   return `${pid}\n${identity}\n`;
@@ -604,14 +800,11 @@ function parseCoordinationRecord(text) {
  * True only while the record's own pid is alive AND still reports the recorded
  * start identity. A reused pid therefore fails this check (its start token
  * differs), which keeps an abandoned record from becoming a permanent gate, and a
- * record without a birth identity is never honored on any platform.
+ * record without a birth identity is never honored on any platform. A birth query
+ * that temporarily fails is treated as a possible live holder, never as staleness.
  */
 function coordinationOwnerIsCurrent(record) {
-  if (!record || !processIsAlive(record.pid)) return false;
-  // A record without a birth identity is never honored: pid-only metadata could
-  // otherwise be pinned forever behind an unrelated live process.
-  if (record.identity === "") return false;
-  return ownerStartIdentity(record.pid) === record.identity;
+  return coordinationRecordIsCurrent(record);
 }
 
 /** Bounded no-follow read of a coordination record (nlink 1 or 2 while publishing). */
@@ -657,7 +850,9 @@ function readCoordinationRecord(entryPath) {
  */
 function prepareCoordinationCandidate(stateDir) {
   const candidate = path.join(stateDir, `${COORDINATION}.${process.pid}.${crypto.randomBytes(4).toString("hex")}`);
-  const body = coordinationRecordBody(process.pid, OWN_OWNER_IDENTITY);
+  // Retried on every preparation: an initially failed own-birth query is never
+  // cached, so a transient failure cannot permanently prevent publishing.
+  const body = coordinationRecordBody(process.pid, ownOwnerIdentity());
   let fd;
   try {
     fd = fs.openSync(candidate, "wx", 0o600);
@@ -745,7 +940,8 @@ function acquireCoordinationEntry(stateDir, options = {}) {
   let malformed = 0;
   let unremovableSince;
   for (;;) {
-    if (OWN_OWNER_IDENTITY === "") {
+    const ownIdentity = ownOwnerIdentity();
+    if (ownIdentity === "") {
       // Honest failure: a pid-only record would pin a later start behind a reused
       // pid forever, so no record is published at all.
       return { status: "unavailable" };
@@ -763,7 +959,7 @@ function acquireCoordinationEntry(stateDir, options = {}) {
       const createdIdentity = `${created.dev}:${created.ino}`;
       return {
         status: "held",
-        identity: OWN_OWNER_IDENTITY,
+        identity: ownIdentity,
         /**
          * Remove only this process's own record, and only while that exact entry
          * is still the one this acquisition published.
@@ -804,13 +1000,18 @@ function acquireCoordinationEntry(stateDir, options = {}) {
     }
     const observedIdentity = `${observed.dev}:${observed.ino}`;
     const record = readCoordinationRecord(entryPath);
-    if (record && record.pid === process.pid && record.identity === OWN_OWNER_IDENTITY) {
-      // This process already holds it (launcher handoff); single-threaded
-      // execution means no destructive pass runs beside it. A record naming this
-      // pid with a different birth identity is stale metadata, not this hold.
-      return { status: "self", identity: record.identity };
-    }
-    if (record && coordinationOwnerIsCurrent(record)) {
+    if (record && record.pid === process.pid) {
+      // A record naming this very pid can only be this process's own hold or a
+      // predecessor's residue with a reused number; no other live process can
+      // hold it. Self-adoption requires a matching birth identity so a pid-only or
+      // unverifiable record is never adopted, but it is never waited on either —
+      // waiting on ourselves would deadlock the launcher/host handoff forever.
+      if (ownIdentity !== "" && record.identity === ownIdentity) {
+        // This process already holds it (launcher handoff); single-threaded
+        // execution means no destructive pass runs beside it.
+        return { status: "self", identity: record.identity };
+      }
+    } else if (record && coordinationOwnerIsCurrent(record)) {
       malformed = 0;
       malformedIdentity = undefined;
       unremovableSince = undefined;
@@ -839,7 +1040,7 @@ function acquireCoordinationEntry(stateDir, options = {}) {
     const reclaimed = reclaimCoordinationEntry(entryPath, observedIdentity);
     if (reclaimed === "failed") {
       if (unremovableSince === undefined) unremovableSince = performance.now();
-      if (performance.now() - unremovableSince >= CLEANUP_DEADLINE_MS) return { status: "unavailable" };
+      if (performance.now() - unremovableSince >= CLEANUP_BUDGET_MS) return { status: "unavailable" };
       sleep(25);
       continue;
     }
@@ -861,7 +1062,6 @@ function inventory(cacheRoot) {
       if (entry.name === LOCK || control(entry.name)) continue;
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
       entries.push({ name: entry.name, file: path.join(cacheRoot, entry.name) });
-      if (entries.length > MAX_ENTRIES) throw new Error("cache inventory exceeded its bound");
     }
   } finally {
     dir.closeSync();
@@ -872,78 +1072,117 @@ function inventory(cacheRoot) {
 }
 
 /**
- * Bounded, no-follow removal of one designated cache generation. Links are
- * unlinked themselves and never traversed, so data outside the generation is
- * untouched; a hardlinked file only loses this name. Returns true only when the
- * whole entry (including its root directory) is gone.
+ * Bounded, no-follow removal of one designated cache generation, with deletion
+ * as progress: each visited entry is unlinked immediately, so a pass that stops
+ * at the shared runtime budget keeps everything it already removed and the next
+ * pass continues from whatever remains. There is no whole-tree preflight and no
+ * entry-count or depth quota, so a large or deep generation can never be
+ * permanently undeletable. Links are unlinked themselves and never traversed, so
+ * data outside the generation is untouched; a hardlinked file only loses this
+ * name. Returns "removed" only when the whole entry (including its root
+ * directory) is gone, "partial" when the shared budget stopped a pass that had
+ * already deleted real content, and "failed" for a real filesystem error.
  */
-function remove(root) {
-  const deadline = performance.now() + CLEANUP_DEADLINE_MS;
-  let visited = 0;
+function remove(root, deadline, pass) {
+  // Explicit depth-first stack (no recursion): an arbitrarily deep generation
+  // cannot exhaust the call stack. Progress is tracked at PASS scope, so the
+  // budget's single initial allowance belongs to the whole pass: after the first
+  // deletion anywhere, every later entry and every later candidate is deadline
+  // checked. A bound hit that deleted nothing can therefore never repeat forever,
+  // and a long run of tiny generations cannot continue past the budget while the
+  // canonical mutex is still held.
+  const state = pass && typeof pass === "object" ? pass : { removed: 0 };
+  const stack = [{ file: path.resolve(root), entries: undefined, index: 0 }];
+  const progress = () => { state.removed = (Number.isFinite(state.removed) ? state.removed : 0) + 1; };
   try {
-    const visit = (file, depth) => {
-      visited += 1;
-      if (visited > MAX_ENTRIES) throw new Error("removal entry bound exceeded");
-      if (depth > MAX_DEPTH) throw new Error("removal depth exceeded");
-      if (performance.now() >= deadline) throw new Error("removal deadline exceeded");
-      const stat = fs.lstatSync(file, { bigint: true });
-      if (stat.isSymbolicLink()) {
-        fs.unlinkSync(file);
-        return;
-      }
-      if (stat.isDirectory()) {
-        let names;
-        const dir = fs.opendirSync(file);
-        try {
-          names = [];
-          let entry;
-          while ((entry = dir.readSync())) names.push(entry.name);
-        } finally {
-          dir.closeSync();
+    while (stack.length > 0) {
+      if (state.removed > 0 && performance.now() >= deadline) return "partial";
+      const frame = stack[stack.length - 1];
+      if (frame.entries === undefined) {
+        const stat = fs.lstatSync(frame.file, { bigint: true });
+        if (stat.isSymbolicLink()) {
+          fs.unlinkSync(frame.file);
+          progress();
+          stack.pop();
+          continue;
         }
-        for (const name of names) {
+        if (!stat.isDirectory()) {
+          // Every non-directory entry inside this designated disposable
+          // generation is only a name here (ordinary file, FIFO, socket, or
+          // device): unlinking it never opens or follows it.
+          fs.unlinkSync(frame.file);
+          progress();
+          stack.pop();
+          continue;
+        }
+        frame.entries = fs.readdirSync(frame.file, { withFileTypes: true });
+        frame.index = 0;
+      }
+      if (frame.index < frame.entries.length) {
+        if (state.removed > 0 && performance.now() >= deadline) return "partial";
+        const entry = frame.entries[frame.index];
+        frame.index += 1;
+        const child = path.join(frame.file, entry.name);
+        if (entry.isSymbolicLink()) {
+          fs.unlinkSync(child);
+          progress();
+          continue;
+        }
+        if (entry.isDirectory()) {
           // Cleanup-specific traversal: this whole generation is a designated
           // disposable cache, so even an initialized `.terraform` subtree inside
           // it is removed (still no-follow and confined to this generation).
-          visit(path.join(file, name), depth + 1);
+          stack.push({ file: child, entries: undefined, index: 0 });
+          continue;
         }
-        fs.rmdirSync(file);
-        return;
+        fs.unlinkSync(child);
+        progress();
+        continue;
       }
-      // Every non-directory, non-link entry inside this designated disposable
-      // generation is only a name here (ordinary file, FIFO, socket, or device):
-      // unlinking it never opens or follows it, and it leaves no disposable
-      // residue that a later cleanup could still have to reclaim.
-      fs.unlinkSync(file);
-    };
-    visit(path.resolve(root), 0);
-    return true;
+      fs.rmdirSync(frame.file);
+      progress();
+      stack.pop();
+    }
+    return "removed";
   } catch {
     // A partial removal leaves the remaining entry counted; a later cleanup
     // retries it. Report nothing as reclaimed.
-    return false;
+    return "failed";
   }
 }
 
 /**
- * Reclaim excess generations down to the per-type target. Runs under one short
- * exclusive admission lock while this producer also holds the per-agent
- * coordination boundary, so a host becoming the owner cannot interleave.
- * `hostOwned` is rechecked at every destructive boundary: even when that
- * boundary could not be taken, a host's ownership record stops further removal
- * instead of being raced by cleanup.
+ * Reclaim excess generations down to the per-type target within one shared
+ * cleanup budget. Runs under one short exclusive admission lock while this
+ * producer also holds the per-agent coordination boundary, so a host becoming
+ * the owner cannot interleave. `hostOwned` is rechecked at every destructive
+ * boundary: even when that boundary could not be taken, a host's ownership
+ * record stops further removal instead of being raced by cleanup. `keep` names
+ * the generation(s) this launch selected/created, which are never candidates.
  */
-function reclaim(cacheRoot, options, warnings, hostOwned) {
+function reclaim(cacheRoot, options, warnings, hostOwned, pass) {
+  const keep = new Set((Array.isArray(options.keep) ? options.keep : []).map((root) => path.resolve(root)));
+  const target = Number.isInteger(options.target) ? options.target : LIMIT - 1;
   let entries;
   try {
     entries = inventory(cacheRoot);
   } catch (error) {
     warnings.push(`cache inventory was unavailable (${error.message}); continuing without reclamation`);
-    return;
+    return { reclaimed: 0, remaining: undefined, stopped: false };
   }
   let count = entries.length;
+  let reclaimed = 0;
+  let stopped = false;
   for (const entry of entries) {
-    if (count < LIMIT) break;
+    if (count <= target) break;
+    if (pass.removed > 0 && performance.now() >= pass.deadline) {
+      // The pass already deleted something and has now reached its budget: do
+      // not start another candidate (each empty directory or link would
+      // otherwise be processed past the budget while the mutex is held).
+      stopped = true;
+      break;
+    }
+    if (keep.has(path.resolve(entry.file))) continue;
     if (typeof hostOwned === "function" && hostOwned()) {
       warnings.push(HOST_OWNED_DURING_CLEANUP_WARNING);
       break;
@@ -962,11 +1201,20 @@ function reclaim(cacheRoot, options, warnings, hostOwned) {
     } catch {
       retire = undefined;
     }
-    if (!remove(entry.file)) {
+    const outcome = remove(entry.file, pass.deadline, pass);
+    if (outcome !== "removed") {
+      // A budget stop is not a failure: real content was already deleted and the
+      // next pass continues. Only a removal that failed is reported as a failure
+      // for this generation.
+      if (outcome === "partial") {
+        stopped = true;
+        break;
+      }
       warnings.push(`could not reclaim cache generation ${entry.name}; it remains and startup continues`);
       continue;
     }
     count -= 1;
+    reclaimed += 1;
     // Retire a producer's existing freshness pointer only AFTER its generation
     // is gone. This is not another capacity or lifetime index.
     try {
@@ -975,9 +1223,14 @@ function reclaim(cacheRoot, options, warnings, hostOwned) {
       // A stale pointer simply remains non-reusable.
     }
   }
-  if (count >= LIMIT) {
-    warnings.push(`cache retains ${count} generations (target ${LIMIT}); startup continues`);
+  if (count > target) {
+    if (stopped) {
+      warnings.push(`cache cleanup stopped at its runtime budget after reclaiming ${reclaimed} generations; ${count} remain (target ${target}) and the next preparation reclaims more`);
+    } else {
+      warnings.push(`cache retains ${count} generations (target ${target}); startup continues`);
+    }
   }
+  return { reclaimed, remaining: count, stopped };
 }
 
 /**
@@ -1006,12 +1259,18 @@ function handle(root, settle) {
  * options.beforeReclaim(root) prepares a producer-specific pointer retirement
  * for one candidate; options.replacement { root, identity, eligible } lets a Pi
  * producer retry its own settled incomplete version root; options.warn receives
- * bounded cleanup warnings.
+ * bounded cleanup warnings; options.cleanupBudgetMs replaces the default
+ * one-pass runtime budget (a narrow seam for deterministic regressions, not a
+ * public setting).
  */
 function admit(cacheRoot, create, options = {}) {
   const cache = path.resolve(cacheRoot);
   const warnings = [];
   const hostOwned = () => activeHostOwnsAgentDirectory(cache);
+  const budgetMs = Number.isFinite(options.cleanupBudgetMs) ? options.cleanupBudgetMs : CLEANUP_BUDGET_MS;
+  // ONE budget for the whole pass (inventory plus every removal it attempts),
+  // not a fresh deadline per generation.
+  const pass = { deadline: performance.now() + budgetMs, removed: 0 };
   let lock;
   // The canonical per-agent coordination boundary is taken FIRST and released
   // only after this producer has created (and marked) its own generation. Host
@@ -1041,10 +1300,13 @@ function admit(cacheRoot, create, options = {}) {
           // still filling this exact generation must never be deleted, and a
           // host that appeared meanwhile keeps its generations.
           if (path.dirname(target) === cache && eligible && !hostOwned() && !generationIsInProgress(target)) {
-            if (!remove(target)) warnings.push(`could not reclaim the incomplete generation ${path.basename(target)}; continuing`);
+            const outcome = remove(target, pass.deadline, pass);
+            if (outcome === "failed") warnings.push(`could not reclaim the incomplete generation ${path.basename(target)}; continuing`);
           }
         }
-        reclaim(cache, options, warnings, hostOwned);
+        // Trim to four so creating this launch's ONE new generation lands at or
+        // below the per-type target of five whenever that is possible.
+        reclaim(cache, { ...options, target: LIMIT - 1 }, warnings, hostOwned, pass);
       } catch (error) {
         // A preparation failure ends this admission; creation is never blocked
         // by cleanup trouble, which `reclaim` itself reports as warnings.
@@ -1094,6 +1356,52 @@ function admit(cacheRoot, create, options = {}) {
 }
 
 /**
+ * Cleanup-only pass for producers that reuse or settle an existing generation.
+ * It reclaims excess generations toward the per-type target of five, never
+ * creates anything, and never touches the root(s) this launch selected or just
+ * created (`options.keep`). A warm startup therefore advances pending cleanup
+ * instead of abandoning it until the next fresh build, without a rebuild merely
+ * to trigger cleanup. Every lock/host/failure case is reported exactly as an
+ * admission reports it; the reuse itself still proceeds.
+ */
+function cleanup(cacheRoot, options = {}) {
+  const cache = path.resolve(cacheRoot);
+  const warnings = [];
+  const hostOwned = () => activeHostOwnsAgentDirectory(cache);
+  const budgetMs = Number.isFinite(options.cleanupBudgetMs) ? options.cleanupBudgetMs : CLEANUP_BUDGET_MS;
+  const pass = { deadline: performance.now() + budgetMs, removed: 0 };
+  let result = { reclaimed: 0, remaining: undefined, stopped: false, skipped: false };
+  const coordination = coordinate(cache, warnings);
+  if (coordination) {
+    try {
+      if (hostOwned()) {
+        warnings.push(HOST_OWNED_WARNING);
+      } else {
+        const lock = acquire(cache, warnings);
+        if (lock) {
+          try {
+            if (hostOwned()) warnings.push(HOST_OWNED_WARNING);
+            else result = { ...reclaim(cache, { ...options, target: LIMIT }, warnings, hostOwned, pass), skipped: false };
+          } finally {
+            lock.release();
+          }
+        } else {
+          result = { ...result, skipped: true };
+        }
+      }
+    } finally {
+      coordination.release();
+    }
+  } else {
+    result = { ...result, skipped: true };
+  }
+  for (const warning of warnings) {
+    if (typeof options.warn === "function") options.warn(warning);
+  }
+  return result;
+}
+
+/**
  * Confirm that a reuse selection is a direct child of its managed cache. No
  * record, receipt, or pin is read or written; producer validation remains the
  * authority for compatibility and the generation stays disposable.
@@ -1113,7 +1421,9 @@ module.exports = {
   LOCK,
   COORDINATION,
   LIMIT,
+  CLEANUP_BUDGET_MS,
   admit,
+  cleanup,
   pin,
   holdAgentDirectory,
   /**
@@ -1125,6 +1435,19 @@ module.exports = {
     prepareCoordinationCandidate,
     readCoordinationRecord,
     ownerStartIdentity,
-    ownOwnerIdentity: () => OWN_OWNER_IDENTITY,
+    ownOwnerIdentity: () => ownOwnerIdentity(),
+    /**
+     * Narrow seam for the deterministic mutex error-handling regression: replace
+     * the birth query, returning a restore function. Never consulted by the CLI.
+     */
+    setOwnerIdentityQuery: (query) => {
+      const previous = ownerIdentityQuery;
+      const previousOwn = OWN_OWNER_IDENTITY_CACHE;
+      ownerIdentityQuery = typeof query === "function" ? query : previous;
+      // Re-learn this process's own identity under the replacement query, so an
+      // initially failed own-birth lookup is exercised exactly as at load.
+      OWN_OWNER_IDENTITY_CACHE = "";
+      return () => { ownerIdentityQuery = previous; OWN_OWNER_IDENTITY_CACHE = previousOwn; };
+    },
   },
 };

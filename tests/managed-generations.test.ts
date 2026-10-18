@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { join } from "node:path";
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 
 const requireCjs = createRequire(join(process.cwd(), "tests", "managed-generations.test.ts"));
 // The CJS producer surface deliberately has no environment/CLI test bypasses.
@@ -52,6 +52,30 @@ function directories(root: string): string[] {
 }
 function count(root: string): number {
   return directories(root).length;
+}
+
+
+/** Direct cache candidates: directories plus direct-child links. */
+function countCandidates(root: string): number {
+  return readdirSync(root).filter((name) => {
+    if (name === ".admission.lock") return false;
+    const stat = lstatSync(join(root, name));
+    return stat.isDirectory() || stat.isSymbolicLink();
+  }).length;
+}
+
+/** Physical remaining entries (files, dirs, links) inside one disposable tree. */
+function countEntries(root: string): number {
+  let total = 0;
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      total += 1;
+      if (entry.isDirectory() && !entry.isSymbolicLink()) stack.push(join(current, entry.name));
+    }
+  }
+  return total;
 }
 function writeCompiler(root: string) {
   const pkg = join(root, "node_modules/typescript");
@@ -331,26 +355,160 @@ test("real development producer reclaims excess legacy generations and reuses va
   assert.ok(existsSync(changed.stagingRoot));
 });
 
-test("compatible reuse performs no cache inventory or cleanup", posix, async () => {
+test("compatible reuse preserves the selected generation and converges older ones without new build output", posix, async () => {
   const f = fixture();
   const original = await build(f);
-  const fs = requireCjs("node:fs") as typeof import("node:fs");
-  const opendir = fs.opendirSync;
-  let inventories = 0;
-  Object.defineProperty(fs, "opendirSync", {
-    configurable: true,
-    writable: true,
-    value: (...args: Parameters<typeof opendir>) => {
-      if (String(args[0]) === f.builds) { inventories += 1; throw new Error("reuse must not inventory generations"); }
-      return Reflect.apply(opendir, fs, args);
-    },
+  const selectedIdentity = lstatSync(original.stagingRoot, { bigint: true });
+  const selectedEntry = join(original.stagingRoot, "dist/src/session-host/main.js");
+  const selectedBytes = readFileSync(selectedEntry, "utf8");
+  // Older generations appear after this build (a legacy cache that was never
+  // pruned, or concurrent producers that skipped cleanup while it was busy).
+  const extra = seedLegacy(f.builds, Array.from({ length: 7 }, (_, index) => `a-legacy-${index}`));
+  let npmCalls = 0;
+  let compileCalls = 0;
+  const reused = await build(f, {
+    runNpm: async () => { npmCalls += 1; return ok(); },
+    runCompile: async () => { compileCalls += 1; return ok(); },
   });
-  let reused;
-  try { reused = await build(f); } finally { fs.opendirSync = opendir; }
-  assert.equal(reused.cacheHit, true);
+  assert.equal(reused.cacheHit, true, "the validated build was reused");
   assert.equal(reused.stagingRoot, original.stagingRoot);
-  assert.equal(inventories, 0);
-  assert.equal(count(f.builds), 1);
+  assert.equal(npmCalls, 0, "warm reuse runs no dependency installation (no new output)");
+  assert.equal(compileCalls, 0, "warm reuse compiles nothing (no new output)");
+  const afterIdentity = lstatSync(original.stagingRoot, { bigint: true });
+  assert.equal(`${afterIdentity.dev}:${afterIdentity.ino}`, `${selectedIdentity.dev}:${selectedIdentity.ino}`,
+    "the reused generation keeps its filesystem identity");
+  assert.equal(readFileSync(selectedEntry, "utf8"), selectedBytes, "the reused artifact bytes are untouched");
+  assert.ok(count(f.builds) <= generations.LIMIT, `warm reuse converges the cache: ${count(f.builds)}`);
+  assert.ok(extra.some((root) => !existsSync(root)), "warm reuse actually removed older generations");
+  assert.ok(existsSync(original.stagingRoot), "the selected generation was never a removal candidate");
+});
+
+test("a large and deep generation is deleted progressively instead of hitting a zero-deletion preflight", posix, () => {
+  const f = fixture();
+  // One over-full generation with >10k real entries, a chain far deeper than any
+  // former recursion quota, an initialized .terraform subtree, and outside
+  // hardlink/symlink sentinels.
+  const big = join(f.builds, "a-large");
+  let deepest = big;
+  for (let depth = 0; depth < 90; depth += 1) {
+    deepest = join(deepest, `d${depth}`);
+    mkdirSync(deepest, { recursive: true, mode: 0o700 });
+  }
+  writeFileSync(join(deepest, "deep.txt"), "deep");
+  for (let bucket = 0; bucket < 40; bucket += 1) mkdirSync(join(big, `files-${bucket}`), { recursive: true, mode: 0o700 });
+  for (let index = 0; index < 12_000; index += 1) {
+    writeFileSync(join(big, `files-${index % 40}`, `f-${index}.txt`), "disposable");
+  }
+  mkdirSync(join(big, ".terraform"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(big, ".terraform", "sentinel"), "cleanup-specific");
+  const outside = join(f.root, "outside");
+  writeFileSync(outside, "outside bytes");
+  linkSync(outside, join(big, "outside-hardlink"));
+  symlinkSync(outside, join(big, "outside-symlink"));
+  seedLegacy(f.builds, ["b", "c", "d", "e", "f"]);
+  const before = countEntries(big);
+  assert.ok(before > 12_000, `the fixture is really populated: ${before} entries`);
+  // A deliberately tiny pass budget proves the bound is real and that reaching it
+  // still deletes content instead of returning an untouched generation.
+  const bounded = admitStage(f, { cleanupBudgetMs: 25 });
+  assert.ok(existsSync(bounded.root));
+  bounded.generation.release();
+  assert.ok(existsSync(big), "the bounded pass stopped before the whole generation was gone");
+  const afterBounded = countEntries(big);
+  assert.ok(afterBounded < before, `the bounded pass deleted real content: ${before} -> ${afterBounded}`);
+  assert.equal(readFileSync(outside, "utf8"), "outside bytes", "outside bytes survive the partial pass");
+  // The next same-producer passes continue from what remains and finish it.
+  for (let pass = 0; pass < 6 && existsSync(big); pass += 1) generations.cleanup(f.builds, {});
+  assert.equal(existsSync(big), false, "subsequent passes complete the generation");
+  assert.equal(readFileSync(outside, "utf8"), "outside bytes", "the outside sentinel is never followed");
+  assert.equal(lstatSync(outside).nlink, 1, "only the cache name of the hardlink was removed");
+  assert.ok(count(f.builds) <= generations.LIMIT, `the cache converges: ${count(f.builds)}`);
+});
+
+test("a cleanup-only pass never deletes the generation the launch selected", posix, () => {
+  const f = fixture();
+  // The selected root sorts first, so it is the first removal candidate unless
+  // the producer-owned keep set protects it.
+  seedLegacy(f.builds, ["a-selected", "b", "c", "d", "e", "f", "g"]);
+  const selected = join(f.builds, "a-selected");
+  const identity = lstatSync(selected, { bigint: true });
+  const result = generations.cleanup(f.builds, { keep: [selected] });
+  assert.ok(result.reclaimed >= 1, "the pass actually reclaimed excess generations");
+  const after = lstatSync(selected, { bigint: true });
+  assert.equal(`${after.dev}:${after.ino}`, `${identity.dev}:${identity.ino}`, "the selected generation is untouched");
+  assert.ok(count(f.builds) <= generations.LIMIT, `the cache converges to five: ${count(f.builds)}`);
+  assert.ok(!existsSync(join(f.builds, "b")), "another generation was actually removed");
+});
+
+test("compatible Pi reuse keeps its validated runtime and converges older version roots", posix, async () => {
+  const f = fixture();
+  const first = await provision(f, "1.3.0");
+  const runtimeRoot = join(f.runtimes, "pi-1.3.0");
+  const identity = lstatSync(runtimeRoot, { bigint: true });
+  const extra = seedLegacy(f.runtimes, Array.from({ length: 6 }, (_, index) => `pi-1.0.${index}`));
+  let installs = 0;
+  const reused = await provision(f, "1.3.0", {
+    runNpm: async () => { installs += 1; return ok(); },
+  });
+  assert.equal(installs, 0, "warm Pi reuse installs nothing");
+  assert.equal(reused.file, first.file);
+  const after = lstatSync(runtimeRoot, { bigint: true });
+  assert.equal(`${after.dev}:${after.ino}`, `${identity.dev}:${identity.ino}`, "the reused runtime keeps its identity");
+  assert.ok(count(f.runtimes) <= generations.LIMIT, `warm Pi reuse converges the cache: ${count(f.runtimes)}`);
+  assert.ok(extra.some((root) => !existsSync(root)), "older Pi version roots were actually reclaimed");
+  assert.ok(existsSync(reused.file));
+});
+
+test("an abandoned pid-only marker or lock whose pid was reused never pins a generation", posix, () => {
+  const longAgo = new Date(Date.now() - 3_600_000);
+  // (a) A marker naming a live (reused) pid, written before that process started.
+  const staleMarker = fixture();
+  const staleRoots = seedLegacy(staleMarker.builds, ["a-marker", "b", "c", "d", "e", "f"]);
+  const staleMarkerPath = join(staleRoots[0]!, ".producer-active");
+  writeFileSync(staleMarkerPath, `${process.pid}\n`, { mode: 0o600 });
+  utimesSync(staleMarkerPath, longAgo, longAgo);
+  const staleStage = admitStage(staleMarker);
+  staleStage.generation.release();
+  assert.equal(existsSync(staleRoots[0]!), false, "a reused-pid marker does not pin its generation");
+
+  // (b) A fresh pid-only marker is legitimate in-flight work from an older
+  // producer and is still honored.
+  const liveMarker = fixture();
+  const liveRoots = seedLegacy(liveMarker.builds, ["a-marker", "b", "c", "d", "e", "f"]);
+  writeFileSync(join(liveRoots[0]!, ".producer-active"), `${process.pid}\n`, { mode: 0o600 });
+  const liveStage = admitStage(liveMarker);
+  liveStage.generation.release();
+  assert.equal(existsSync(liveRoots[0]!), true, "a genuinely in-flight legacy marker still protects its generation");
+
+  // (c) A marker that names a birth identity which no longer holds is stale even
+  // though its file is fresh.
+  const wrongBirth = fixture();
+  const wrongRoots = seedLegacy(wrongBirth.builds, ["a-marker", "b", "c", "d", "e", "f"]);
+  writeFileSync(join(wrongRoots[0]!, ".producer-active"), `${process.pid}\nlinux:stale-birth:1\n`, { mode: 0o600 });
+  const wrongStage = admitStage(wrongBirth);
+  wrongStage.generation.release();
+  assert.equal(existsSync(wrongRoots[0]!), false, "a mismatched birth identity is not liveness evidence");
+
+  // (d) The same distinction applies to the per-cache admission lock.
+  const staleLock = fixture();
+  const staleLockRoots = seedLegacy(staleLock.builds, ["a", "b", "c", "d", "e", "f"]);
+  const lockPath = join(staleLock.builds, ".admission.lock");
+  writeFileSync(lockPath, `${process.pid}\n`, { mode: 0o600 });
+  utimesSync(lockPath, longAgo, longAgo);
+  const staleLockStage = admitStage(staleLock);
+  staleLockStage.generation.release();
+  assert.equal(existsSync(lockPath), false, "the reused-pid lock is reclaimed");
+  assert.ok(staleLockRoots.some((root) => !existsSync(root)), "and reclamation actually ran");
+
+  const liveLock = fixture();
+  const liveLockRoots = seedLegacy(liveLock.builds, ["a", "b", "c", "d", "e", "f"]);
+  const liveLockPath = join(liveLock.builds, ".admission.lock");
+  writeFileSync(liveLockPath, `${process.pid}\n`, { mode: 0o600 });
+  const liveLockWarnings: string[] = [];
+  const liveLockStage = admitStage(liveLock, { warn: (warning: string) => liveLockWarnings.push(warning) });
+  liveLockStage.generation.release();
+  assert.ok(liveLockRoots.every((root) => existsSync(root)), "a genuinely current legacy lock still defers cleanup");
+  assert.ok(liveLockWarnings.some((warning) => warning.includes("cleanup lock was busy")));
 });
 
 test("legacy prepared-build reuse keeps freshness authority without any receipt", posix, async () => {
@@ -1193,10 +1351,13 @@ test("every coordination path publishes the complete record atomically with an o
   assert.match(cjs, /Get-Process -Id \$OwnerPid/, "the Windows query takes one known numeric pid through its script-block parameter");
   assert.match(cjs, /& \{ param\(\[int\]\$OwnerPid\)/, "the Windows query is invoked as a parameterized script block");
   assert.match(cjs, /if \(record\.identity === ""\) return false;/u, "CJS never honors a record without a birth identity");
-  assert.match(cjs, /record\.pid === process\.pid && record\.identity === OWN_OWNER_IDENTITY/u,
+  assert.match(cjs, /record\.pid === process\.pid/u,
+    "CJS self-adoption is scoped to this process's own pid");
+  assert.match(cjs, /if \(ownIdentity !== "" && record\.identity === ownIdentity\)/u,
     "CJS self-adoption also requires the recorded birth identity");
   assert.match(cjs, /& \{ param\(\[int\]\$OwnerPid\)/u, "the Windows query is a parameterized script block");
-  assert.match(cjs, /OWN_OWNER_IDENTITY === ""/, "CJS publishes no record when the owner identity is unavailable");
+  assert.match(cjs, /let OWN_OWNER_IDENTITY_CACHE = "";/,
+    "CJS publishes no record when the owner identity is unavailable");
   assert.match(cjs, /before\.nlink !== 1n && before\.nlink !== 2n/,
     "CJS accepts the publisher's transient hard-link pairing and rejects other link counts");
   assert.doesNotMatch(cjs, /openSync\(entryPath, "wx"/, "CJS never creates the canonical entry empty and writes it in place");
@@ -1204,11 +1365,12 @@ test("every coordination path publishes the complete record atomically with an o
   const host = read("src/session-host/roster-store.ts");
   assert.match(host, /linkSync\(candidate, entryPath\)/, "the host publishes with an atomic no-overwrite link");
   assert.match(host, /ownerStartIdentity/, "the host records a targeted single-pid owner identity");
-  assert.match(host, /OWN_OWNER_IDENTITY === ""/, "the host publishes no record when the owner identity is unavailable");
+  assert.match(host, /let OWN_OWNER_IDENTITY_CACHE = "";/,
+    "the host publishes no record when the owner identity is unavailable");
   assert.match(host, /& \{ param\(\[int\]\$OwnerPid\)/u, "the host query is a parameterized script block");
   assert.match(host, /Get-Process -Id \$OwnerPid/u, "the host query takes one known numeric pid through its script-block parameter");
   assert.match(host, /if \(record\.identity === ""\) return false;/u, "the host never honors a record without a birth identity");
-  assert.match(host, /record\.pid === process\.pid && record\.identity === OWN_OWNER_IDENTITY/u,
+  assert.match(host, /if \(record\.identity === ownIdentity\) return \{ status: "self" \}/u,
     "host self-adoption also requires the recorded birth identity");
   assert.match(host, /linux:\$\{boot\}|linux:/, "the host derives the Linux token from /proc");
   assert.match(host, /before\.nlink !== 1n && before\.nlink !== 2n/,
@@ -1700,4 +1862,517 @@ test("a direct-child .terraform entry in the Node cache is not exempt from recla
   const source = readFileSync(join(process.cwd(), "scripts", "node-generations.sh"), "utf8");
   assert.doesNotMatch(source, /\.terraform" \] \] \|\| continue/, "a direct child named .terraform is ordinary disposable cache content");
   assert.equal(readFileSync(outside, "utf8"), "outside stays");
+});
+
+/**
+ * Progressive cleanup is one protocol across the four native producer paths: one
+ * pass-level runtime budget, deletion as progress (never a whole-tree preflight
+ * or an entry/depth quota that could refuse to delete anything), and owner
+ * records that carry a pid plus a targeted birth identity so a reused pid can
+ * never pin a generation. Native behaviour is exercised by the POSIX wrapper and
+ * native Windows suites; this pins the shared source contract.
+ */
+test("every native cleanup path deletes progressively and disambiguates a reused pid", () => {
+  const read = (file: string) => readFileSync(join(process.cwd(), file), "utf8");
+
+  const cjs = read("scripts/managed-generations.cjs");
+  assert.match(cjs, /const CLEANUP_BUDGET_MS = 120_000;/u, "one pass-level runtime budget");
+  assert.match(cjs, /removed > 0 && performance\.now\(\) >= deadline/u,
+    "the budget only stops a pass after it deleted something");
+  assert.doesNotMatch(cjs, /MAX_ENTRIES|MAX_DEPTH/u, "no entry/depth quota can make a generation permanently undeletable");
+  assert.match(cjs, /function ownerBirthMs\(pid\)/u, "a legacy pid-only record is judged by one targeted owner birth");
+  assert.match(cjs, /return birth <= recordMtimeMs\(stat\) \+ OWNER_BIRTH_MARGIN_MS;/u,
+    "a birth after the record was written is a reused pid, not a holder");
+  assert.match(cjs, /function cleanup\(cacheRoot, options = \{\}\)/u, "a cleanup-only pass exists for reuse/settlement");
+  assert.match(cjs, /keep\.has\(path\.resolve\(entry\.file\)\)/u, "the selected generation is never a removal candidate");
+
+  const posix = read("scripts/node-generations.sh");
+  assert.doesNotMatch(posix, /node_visit/u, "the whole-tree preflight walker is gone");
+  assert.doesNotMatch(posix, /\$\{#NODE_REMOVE_PATHS\[@\]\} < 100000|depth <= 64/u, "no entry/depth quota remains");
+  assert.match(posix, /NODE_CLEANUP_BUDGET=120/u, "the POSIX pass shares one runtime budget");
+  assert.match(posix, /node_cleanup_running/u, "the POSIX walker is budget-checked as it deletes");
+  assert.match(posix, /node_owner_birth_epoch/u, "the POSIX path judges a legacy pid-only record by owner birth");
+  assert.ok(posix.includes('printf \'%s\\n%s\\n\' "$$" "$(node_owner_identity "$$")" > "$WORK_ROOT/.producer-active"'),
+    "the POSIX marker carries the owner birth identity");
+  assert.ok(posix.includes('printf \'%s\\n%s\\n\' "$$" "$owner" > "$NODE_LOCK"'),
+    "the POSIX admission lock carries the owner birth identity");
+
+  const powershell = read("scripts/pi-review-sessions-node.ps1");
+  assert.doesNotMatch(powershell, /Depth -gt 64/u, "no depth quota remains on the native Windows walker");
+  assert.match(powershell, /\$script:NodeCleanupBudgetSeconds = 120/u, "the PowerShell pass shares one runtime budget");
+  assert.match(powershell, /function Test-NodeCleanupRunning/u, "the PowerShell walker is budget-checked as it deletes");
+  assert.match(powershell, /function Test-NodeOwnerRecord/u, "the PowerShell path parses pid plus birth identity");
+  assert.match(powershell, /NodeOwnerBirthMarginSeconds/u, "the PowerShell path applies the same birth/mtime distinction");
+  assert.match(powershell, /\(Get-NodeOwnerIdentity \(\[int\]\$PID\)\) \+ "`n"/u, "the PowerShell marker carries the owner birth identity");
+});
+
+/**
+ * Progressive cleanup must be measured on the shapes a real extraction produces.
+ * A broad directory-only tree is the case a "collect then delete" walker can
+ * spend forever on: it queues every directory, hits the budget, deletes nothing,
+ * and repeats. A short budget must still delete real content here, and later
+ * passes must finish it.
+ */
+test("a broad directory-only generation is deleted progressively instead of collecting forever", posix, () => {
+  const f = fixture();
+  const broad = join(f.builds, "a-dirs-only");
+  for (let a = 0; a < 12; a += 1) {
+    for (let b = 0; b < 12; b += 1) {
+      for (let c = 0; c < 10; c += 1) mkdirSync(join(broad, `a${a}`, `b${b}`, `c${c}`), { recursive: true, mode: 0o700 });
+    }
+  }
+  seedLegacy(f.builds, ["b", "c", "d", "e", "f"]);
+  const before = countEntries(broad);
+  assert.ok(before > 1400, `the fixture is really broad: ${before} entries`);
+  const bounded = admitStage(f, { cleanupBudgetMs: 25 });
+  assert.ok(existsSync(bounded.root));
+  bounded.generation.release();
+  assert.ok(existsSync(broad), "a short bounded pass stops part-way");
+  assert.ok(countEntries(broad) < before, `the bounded pass already deleted whole directories: ${before} -> ${countEntries(broad)}`);
+  for (let pass = 0; pass < 40 && existsSync(broad); pass += 1) generations.cleanup(f.builds, {});
+  assert.equal(existsSync(broad), false, "later passes finish the directory-only generation");
+  assert.ok(count(f.builds) <= generations.LIMIT);
+});
+
+/**
+ * Owner birth must be read in one timezone-independent frame of reference. The
+ * macOS `ps lstart` token carries no zone, so a caller-local interpretation would
+ * place a genuinely live legacy producer's birth hours in the future on a non-UTC
+ * host and reclaim the generation it is still filling. The child process below
+ * runs with a deliberately non-UTC TZ; only its own environment is changed.
+ */
+test("a non-UTC child still honors a live legacy producer and still reclaims a reused pid", posix, async () => {
+  const generationsPath = join(process.cwd(), "scripts", "managed-generations.cjs");
+  const runChild = async (cache: string, mode: string): Promise<{ warnings: string[]; liveSurvives: boolean; tz: string }> => {
+    const script = join(process.cwd(), "node_modules", `.tz-admit-${mode}-${Date.now()}.cjs`);
+    writeFileSync(script, [
+      `const fs = require("node:fs");`,
+      `const path = require("node:path");`,
+      `const { spawn } = require("node:child_process");`,
+      `const generations = require(${JSON.stringify(generationsPath)});`,
+      `const cache = process.argv[2];`,
+      `const mode = process.argv[3];`,
+      // A live process born in this same non-UTC child environment.
+      `const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });`,
+      `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);`,
+      `const marker = path.join(cache, "a-live", ".producer-active");`,
+      `if (mode === "identity") {`,
+      `  fs.writeFileSync(marker, holder.pid + "\\n" + generations.coordinationInternals.ownerStartIdentity(holder.pid) + "\\n", { mode: 0o600 });`,
+      `} else {`,
+      `  fs.writeFileSync(marker, holder.pid + "\\n", { mode: 0o600 });`,
+      `  if (mode === "stale") { const old = new Date(Date.now() - 3600000); fs.utimesSync(marker, old, old); }`,
+      `}`,
+      `const warnings = [];`,
+      `const stage = generations.admit(cache, () => ({ root: fs.mkdtempSync(path.join(cache, "new-")) }), { warn: (w) => warnings.push(w) });`,
+      `stage.generation.release();`,
+      `process.stdout.write(JSON.stringify({ warnings, tz: String(process.env.TZ), liveSurvives: fs.existsSync(path.join(cache, "a-live")) }) + "\\n");`,
+      `holder.kill("SIGKILL");`,
+    ].join("\n"), "utf8");
+    return await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [script, cache, mode], {
+        env: { ...process.env, TZ: "Pacific/Honolulu" },
+        stdio: ["ignore", "pipe", "inherit"],
+      });
+      let output = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => { output += chunk; });
+      child.once("exit", (code) => {
+        if (code !== 0) { reject(new Error(`tz child exited ${code}`)); return; }
+        try { resolve(JSON.parse(output.trim().split("\n").filter(Boolean).pop()!)); }
+        catch (error) { reject(error instanceof Error ? error : new Error("bad tz child output")); }
+      });
+    });
+  };
+  for (const mode of ["fresh", "identity"] as const) {
+    const f = fixture();
+    seedLegacy(f.builds, ["a-live", "b", "c", "d", "e", "f"]);
+    const result = await runChild(f.builds, mode);
+    assert.equal(result.tz, "Pacific/Honolulu", "the child really ran in a non-UTC timezone");
+    assert.equal(result.liveSurvives, true, `${mode}: a genuinely live legacy producer's generation is preserved`);
+    assert.ok(directories(f.builds).filter((name) => ["b", "c", "d", "e", "f"].includes(name)).length <= 4,
+      `${mode}: cleanup still reclaimed the excess it was allowed to reclaim`);
+  }
+  // The same live pid recorded before it existed is a reused pid: stale.
+  const stale = fixture();
+  seedLegacy(stale.builds, ["a-live", "b", "c", "d", "e", "f"]);
+  const staleResult = await runChild(stale.builds, "stale");
+  assert.equal(staleResult.liveSurvives, false, "a reused pid stays stale in any timezone");
+});
+
+test("owner birth is read in UTC for the macOS ps token and keeps the Windows zone", () => {
+  const source = readFileSync(join(process.cwd(), "scripts", "managed-generations.cjs"), "utf8");
+  assert.match(source, /env: \{ \.\.\.process\.env, TZ: "UTC0", LC_ALL: "C", LANG: "C" \}/u,
+    "the targeted ps query is pinned to UTC and the C locale");
+  assert.match(source, /function utcPsLstartMs\(token\)/u, "the darwin token is parsed explicitly as UTC");
+  assert.match(source, /Date\.UTC\(Number\(match\[6\]\), month/u, "the parse builds a UTC instant, not a local one");
+  assert.match(source, /Date\.parse\(token\.slice\("win32:"\.length\)\)/u, "the Windows token keeps its own zone");
+  const host = readFileSync(join(process.cwd(), "src", "session-host", "roster-store.ts"), "utf8");
+  assert.match(host, /env: \{ \.\.\.process\.env, TZ: "UTC0", LC_ALL: "C", LANG: "C" \}/u,
+    "the TypeScript host publishes the same timezone-independent token");
+  const posix = readFileSync(join(process.cwd(), "scripts", "node-generations.sh"), "utf8");
+  assert.ok(posix.includes('output="$(TZ=UTC0 LC_ALL=C LANG=C "$NODE_PS_BIN" -p "$pid" -o lstart= 2>/dev/null)"'),
+    "the POSIX wrapper publishes the same timezone-independent token");
+  assert.ok(posix.includes('now="$(TZ=UTC0 "$NODE_DATE_BIN" +%s 2>/dev/null)"'),
+    "the POSIX owner-birth conversion is explicitly UTC");
+});
+
+/**
+ * A birth query that temporarily fails is NOT a proven mismatch. If it were
+ * treated as staleness, another actor could steal a live destructive holder's
+ * canonical mutex and claim ownership beside an active deletion. The contender
+ * below runs with a failing birth query; it must not claim the entry, must not
+ * delete the holder's selected files, and must recover once the holder settles
+ * (and a real, different birth still proves a reused pid).
+ */
+test("a failing birth query never steals a live destructive holder's mutex mid-cleanup", posix, async () => {
+  const f = fixture();
+  const generationsPath = join(process.cwd(), "scripts", "managed-generations.cjs");
+  const log = join(f.root, "order.log");
+  writeFileSync(log, "");
+  const releaseCleanup = join(f.root, "release-cleanup");
+  const selected = seedLegacy(f.builds, ["a-selected"]);
+  seedLegacy(f.builds, ["b", "c", "d", "e", "f", "g"]);
+  const selectedBytes = readFileSync(join(selected[0]!, "nested", "legacy-output.txt"), "utf8");
+  // The destructive holder pauses inside its pass (still holding the canonical
+  // entry) until the parent releases it.
+  const holderScript = join(f.root, "holder-cleanup.cjs");
+  writeFileSync(holderScript, [
+    `const fs = require("node:fs");`,
+    `const path = require("node:path");`,
+    `const generations = require(${JSON.stringify(generationsPath)});`,
+    `const cache = process.argv[2];`,
+    `const log = process.argv[3];`,
+    `const releaseFile = process.argv[4];`,
+    `const append = (line) => fs.appendFileSync(log, line + "\\n");`,
+    `let paused = false;`,
+    `const stage = generations.admit(cache, () => ({ root: fs.mkdtempSync(path.join(cache, "pi-review-sessions-")) }), {`,
+    `  warn: (warning) => append("warn:" + warning),`,
+    `  beforeReclaim: (root) => {`,
+    `    if (paused) return undefined;`,
+    `    paused = true;`,
+    `    process.stdout.write("PAUSED\\n");`,
+    `    const deadline = Date.now() + 60000;`,
+    `    while (!fs.existsSync(releaseFile) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);`,
+    `    append("reclaim:" + path.basename(root));`,
+    `    return undefined;`,
+    `  },`,
+    `});`,
+    `append("pass-complete");`,
+    `stage.generation.release();`,
+  ].join("\n"), "utf8");
+  // The contender's birth query always fails while it tries to take the entry.
+  const contenderScript = join(f.root, "contender.cjs");
+  writeFileSync(contenderScript, [
+    `const fs = require("node:fs");`,
+    `const generations = require(${JSON.stringify(generationsPath)});`,
+    `const agentDir = process.argv[2];`,
+    `const cache = process.argv[3];`,
+    `const log = process.argv[4];`,
+    `const mode = process.argv[5];`,
+    `const append = (line) => fs.appendFileSync(log, line + "\\n");`,
+    `if (mode === "failing") generations.coordinationInternals.setOwnerIdentityQuery(() => "");`,
+    `const warnings = [];`,
+    `generations.cleanup(cache, { warn: (warning) => warnings.push(warning) });`,
+    `append("skip-warnings:" + (warnings.some((w) => w.includes("host ownership coordination was busy or unreadable")) ? "honest" : warnings.join("|")));`,
+    `const lease = generations.holdAgentDirectory(agentDir);`,
+    `append("held:" + (lease ? "yes" : "no"));`,
+    `if (lease) lease.release();`,
+  ].join("\n"), "utf8");
+  const holder = spawn(process.execPath, [holderScript, f.builds, log, releaseCleanup], { stdio: ["ignore", "pipe", "inherit"] });
+  const paused = await new Promise<void>((resolve, reject) => {
+    let buffered = "";
+    holder.stdout!.setEncoding("utf8");
+    holder.stdout!.on("data", (chunk: string) => { buffered += chunk; if (buffered.includes("PAUSED")) resolve(); });
+    holder.once("exit", (code) => reject(new Error(`the holder exited before its barrier (${code})`)));
+  });
+  void paused;
+  const contender = spawn(process.execPath, [contenderScript, f.agentDir, f.builds, log, "failing"], { stdio: ["ignore", "pipe", "inherit"] });
+  try {
+    const exited = new Promise<number | null>((resolve) => contender.once("exit", (code) => resolve(code)));
+    // The contender may only proceed after the holder settles; a stealing
+    // implementation republishes the entry immediately, so a bounded wait is
+    // decisive without being any part of the product behaviour.
+    const outcome = await Promise.race([exited, new Promise<"running">((resolve) => setTimeout(() => resolve("running"), 1_500))]);
+    if (outcome === "running") contender.kill("SIGKILL");
+    await exited;
+    const duringHold = readFileSync(log, "utf8");
+    assert.match(duringHold, /skip-warnings:honest/,
+      `an unverifiable holder is reported honestly instead of claimed stale: ${duringHold}`);
+    assert.doesNotMatch(duringHold, /held:yes/,
+      "the contender never claims the canonical entry while the destructive holder is running");
+    assert.ok(existsSync(selected[0]!), "the holder's selected generation was never deleted mid-pass");
+    assert.equal(readFileSync(join(selected[0]!, "nested", "legacy-output.txt"), "utf8"), selectedBytes);
+    const entryPath = join(f.agentDir, "session-host", generations.COORDINATION as string);
+    assert.equal(readFileSync(entryPath, "utf8").split("\n")[0]!.trim(), String(holder.pid),
+      "the canonical entry still names the live destructive holder");
+    // Release the holder: it finishes its pass, and only then can a contender
+    // take the entry (recovery once the owner is really gone, never a timer).
+    writeFileSync(releaseCleanup, "release");
+    await new Promise<void>((resolve, reject) => {
+      holder.once("exit", (code) => (code === 0 ? resolve() : reject(new Error(`holder exited ${code}`))));
+    });
+    // A contender whose own identity query works again now acquires the settled
+    // entry; the earlier skip was about a live holder, not a permanent lock.
+    const after = spawn(process.execPath, [contenderScript, f.agentDir, f.builds, log, "real"], { stdio: ["ignore", "pipe", "inherit"] });
+    await new Promise<void>((resolve, reject) => {
+      after.once("exit", (code) => (code === 0 ? resolve() : reject(new Error(`recovered contender exited ${code}`))));
+    });
+    const ordered = readFileSync(log, "utf8").trim().split("\n");
+    assert.ok(ordered.indexOf("pass-complete") < ordered.indexOf("held:yes"),
+      `the entry is claimed only after the pass settled: ${ordered.join(" | ")}`);
+    assert.equal(ordered[ordered.length - 1], "held:yes", `the settled entry is claimed: ${ordered.join(" | ")}`);
+  } finally {
+    writeFileSync(releaseCleanup, "release");
+    holder.kill("SIGKILL");
+    contender.kill("SIGKILL");
+  }
+
+  // A real, different birth identity is still proven stale: a live pid with a
+  // mismatched token never blocks a new holder.
+  const live = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  try {
+    const stateDir = join(f.agentDir, "session-host");
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const entry = join(stateDir, generations.COORDINATION as string);
+    rmSync(entry, { force: true });
+    writeFileSync(entry, `${live.pid}\nlinux:definitely-not-this-process:1\n`, { mode: 0o600 });
+    const lease = generations.holdAgentDirectory(f.agentDir);
+    assert.ok(lease, "a genuinely different birth identity is reclaimed as a reused pid");
+    const published = readFileSync(entry, "utf8").split("\n");
+    assert.equal(published[0]!.trim(), String(process.pid));
+    assert.ok((published[1] ?? "").trim().length > 0, "the new record carries this process's birth identity");
+    lease!.release();
+    assert.equal(existsSync(entry), false);
+  } finally {
+    live.kill("SIGKILL");
+  }
+});
+
+/**
+ * An initially failed own-birth query must not be cached forever: with the CJS
+ * launcher owning a handoff, a host whose own identity query failed at load would
+ * otherwise never recognize its own record, adopt it, or publish its own — it
+ * would wait on itself forever. Retrying keeps a genuine outage honest (no
+ * pid-only adoption) while recovering as soon as the query works again.
+ */
+test("an initially failed own-birth query is retried instead of deadlocking the handoff", posix, async () => {
+  const f = fixture();
+  const generationsPath = join(process.cwd(), "scripts", "managed-generations.cjs");
+  const script = join(f.root, "own-identity-recovery.cjs");
+  writeFileSync(script, [
+    `const fs = require("node:fs");`,
+    `const path = require("node:path");`,
+    `const generations = require(${JSON.stringify(generationsPath)});`,
+    `const agentDir = process.argv[2];`,
+    `const internals = generations.coordinationInternals;`,
+    `const restore = internals.setOwnerIdentityQuery(() => "");`,
+    `const result = {};`,
+    // With the identity query failing, this process must report the boundary as
+    // unavailable instead of waiting on (or adopting) its own record.
+    `result.duringOutage = Boolean(generations.holdAgentDirectory(agentDir));`,
+    `const real = internals.ownerStartIdentity(process.pid);`,
+    `fs.mkdirSync(path.join(agentDir, "session-host"), { recursive: true, mode: 0o700 });`,
+    `fs.writeFileSync(path.join(agentDir, "session-host", generations.COORDINATION), process.pid + "\\n" + real + "\\n", { mode: 0o600 });`,
+    `result.stillDuringOutage = Boolean(generations.holdAgentDirectory(agentDir));`,
+    // The real query works again: the positive identity is learned then, never cached as empty.
+    `restore();`,
+    `const lease = generations.holdAgentDirectory(agentDir);`,
+    `result.recovered = Boolean(lease);`,
+    `const text = fs.readFileSync(path.join(agentDir, "session-host", generations.COORDINATION), "utf8");`,
+    `const lines = text.split("\\n");`,
+    `result.owner = lines[0].trim();`,
+    `result.identity = (lines[1] || "").trim();`,
+    `result.ownIdentity = internals.ownOwnerIdentity();`,
+    `result.pid = process.pid;`,
+    `result.entryAfterSelf = fs.readFileSync(path.join(agentDir, "session-host", generations.COORDINATION), "utf8").split("\\n")[0].trim();`,
+    `if (lease) lease.release();`,
+    `result.entryAfterRelease = fs.existsSync(path.join(agentDir, "session-host", generations.COORDINATION));`,
+    `process.stdout.write(JSON.stringify(result) + "\\n");`,
+  ].join("\n"), "utf8");
+  const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
+    const child = spawn(process.execPath, [script, f.agentDir], { stdio: ["ignore", "pipe", "inherit"] });
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { output += chunk; });
+    child.once("exit", (code) => {
+      if (code !== 0) { reject(new Error(`own-identity child exited ${code}`)); return; }
+      try { resolve(JSON.parse(output.trim().split("\n").filter(Boolean).pop()!) as Record<string, unknown>); }
+      catch (error) { reject(error instanceof Error ? error : new Error("bad child output")); }
+    });
+  });
+  assert.equal(result.duringOutage, false, "an unavailable own identity reports the boundary as unavailable");
+  assert.equal(result.stillDuringOutage, false,
+    "a record naming this live pid is never adopted pid-only and never waited on during the outage");
+  assert.equal(result.recovered, true, "the handoff succeeds as soon as the birth query works again");
+  assert.equal(result.owner, String(result.pid));
+  assert.ok(String(result.identity).length > 0, "the published record carries a real birth identity");
+  assert.equal(result.identity, result.ownIdentity, "self-adoption uses the recovered identity, not a placeholder");
+  assert.equal(result.entryAfterSelf, String(result.pid),
+    "the recovered hold recognizes this process's own record instead of waiting on it");
+  assert.equal(result.entryAfterRelease, true,
+    "the launcher's own hold is handed to the ownership claim, never silently deleted here");
+});
+
+/**
+ * One mutex error-handling rule in every native path: an unverifiable birth is not
+ * a proven mismatch (a live holder is honored), a real different birth is stale,
+ * pid-only canonical records stay reclaimable, and a process's own identity query
+ * is retried until it succeeds instead of caching the failure.
+ */
+test("every path treats an unverifiable birth as a possible live holder, never as staleness", () => {
+  const read = (file: string) => readFileSync(join(process.cwd(), file), "utf8");
+
+  const cjs = read("scripts/managed-generations.cjs");
+  assert.match(cjs, /if \(observed === ""\) return true;/u,
+    "CJS honors a live pid whose birth query failed instead of treating it as stale");
+  assert.match(cjs, /function coordinationRecordIsCurrent\(record\)/u, "CJS has one shared owner-current authority");
+  assert.match(cjs, /let OWN_OWNER_IDENTITY_CACHE = "";/u, "CJS caches this process's identity separately");
+  assert.match(cjs, /if \(observed !== ""\) OWN_OWNER_IDENTITY_CACHE = observed;/u,
+    "CJS caches only a positive own identity, never a failed query");
+  assert.match(cjs, /if \(ownIdentity !== "" && record\.identity === ownIdentity\)/u,
+    "CJS self-adoption requires a real matching identity, and never waits on its own pid");
+
+  const host = read("src/session-host/roster-store.ts");
+  assert.match(host, /if \(observed === ""\) return true;/u,
+    "the TypeScript host honors a live pid whose birth query failed");
+  assert.match(host, /let OWN_OWNER_IDENTITY_CACHE = "";/u, "the host caches its identity separately");
+  assert.match(host, /if \(observed !== ""\) OWN_OWNER_IDENTITY_CACHE = observed;/u,
+    "the host caches only a positive own identity");
+  assert.match(host, /if \(record\.identity === ownIdentity\) return \{ status: "self" \}/u,
+    "host self-adoption requires a real matching identity");
+
+  const posix = read("scripts/node-generations.sh");
+  assert.match(posix, /\[\[ -n "\$observed" \]\] \|\| return 0/u,
+    "the POSIX path honors a live pid whose birth query failed");
+  assert.doesNotMatch(posix, /\[\[ -n "\$observed" && "\$observed" == "\$identity" \]\]/u,
+    "no POSIX path claims an unverified owner is stale");
+
+  const powershell = read("scripts/pi-review-sessions-node.ps1");
+  assert.match(powershell, /if \(\[string\]::IsNullOrEmpty\(\$observed\)\) \{ return \$true \}/u,
+    "the PowerShell path honors a live pid whose birth query failed");
+});
+
+/**
+ * Progressive deletion must be immediate postorder in every walker, and the
+ * budget must be enforced at pass scope: no walker may spend its whole budget
+ * classifying or identifying candidates before deleting anything, and no pass may
+ * keep starting new candidates after it has deleted something and reached the
+ * budget while the canonical mutex is still held.
+ */
+test("no native walker defers deletion behind a collection pass or past its budget", () => {
+  const read = (file: string) => readFileSync(join(process.cwd(), file), "utf8");
+  const cjs = read("scripts/managed-generations.cjs");
+  assert.match(cjs, /fs\.rmdirSync\(frame\.file\);\n\s+progress\(\);/u,
+    "the CJS walker removes a directory as soon as its own entries are exhausted");
+  assert.match(cjs, /const state = pass && typeof pass === "object" \? pass : \{ removed: 0 \};/u,
+    "CJS deletion progress is tracked at pass scope, not per remove() call");
+  assert.match(cjs, /if \(pass\.removed > 0 && performance\.now\(\) >= pass\.deadline\) \{\n\s+\/\/ The pass already deleted something/u,
+    "CJS stops before starting another candidate once the pass budget is spent");
+
+  const posix = read("scripts/node-generations.sh");
+  assert.match(posix, /^node_remove_dir\(\) \{$/mu, "the POSIX walker recurses in place");
+  assert.match(posix, /chunk=\("\$\{subdirs\[@\]:start:NODE_CLEANUP_BATCH\}"\)/u,
+    "POSIX identifies and deletes one bounded sibling batch before the next");
+  assert.match(posix, /node_batch_identities "\$\{chunk\[@\]\}"/u,
+    "POSIX captures identities for that batch only");
+  assert.match(posix, /node_cleanup_allows_work/u,
+    "POSIX grants one pass-scope progress allowance before the deadline applies");
+  assert.match(posix, /NODE_CLEANUP_PROGRESS=\$\(\(NODE_CLEANUP_PROGRESS \+ 1\)\)/u,
+    "POSIX records deletions at pass scope");
+  assert.match(posix, /node_unlink_batch/u, "POSIX batches leaf removal instead of one process per file");
+  assert.doesNotMatch(posix, /NODE_DIRS=\(\)/u, "no deferred directory queue remains");
+  assert.match(posix, /node_cleanup_only\(\) \{/u, "POSIX has a producer-owned cleanup-only pass");
+  assert.match(posix, /node_remove_dir "\$root" \|\| return 1\n(?:.*\n)*?  if ! node_cleanup_allows_work; then/u,
+    "POSIX applies the pass-scope allowance to root removal, so an empty generation still progresses");
+  assert.match(posix, /node_cleanup_only \|\| true/u,
+    "POSIX retries deferred cleanup, joined, when preparation settles");
+  assert.match(posix, /node_reclaim_excess \$\(\(NODE_LIMIT - 1\)\) "\$\{NODE_KEEP_ROOT:-\}" "\$NODE_LIMIT"/u,
+    "the settlement pass preserves this launch's generation and targets five");
+
+  const powershell = read("scripts/pi-review-sessions-node.ps1");
+  assert.match(powershell, /immediate postorder/u, "the PowerShell walker documents immediate postorder");
+  assert.match(powershell, /\$stack\.Push\(@\{ Path = \$child; Entries = \$null; Index = 0 \}\)/u,
+    "PowerShell descends with an explicit frame stack, never collecting every directory first");
+  assert.match(powershell, /\[IO\.Directory\]::Delete\(\$frame\.Path, \$false\)/u,
+    "PowerShell removes each directory as soon as its subtree is empty");
+  assert.match(powershell, /function Test-NodeCleanupAllowsWork/u,
+    "PowerShell grants the same pass-scope progress allowance");
+  assert.match(powershell, /\$candidateTarget = \$Target\n\s+if \(-not \[string\]::IsNullOrEmpty\(\$Keep\)\) \{ \$candidateTarget-- \}/u,
+    "PowerShell subtracts the kept generation from the removable-candidate target");
+  assert.match(powershell, /if \(\$count -le \$candidateTarget\) \{ break \}/u,
+    "PowerShell uses an inclusive stopping condition so creation still lands at five");
+  assert.match(powershell, /if \(\$held -gt \$Target\) \{/u,
+    "PowerShell warns only above the total target");
+  assert.match(powershell, /function Invoke-NodeSettlementCleanup/u,
+    "PowerShell has a producer-owned cleanup-only settlement pass");
+  assert.match(powershell, /Invoke-NodeSettlementCleanup \$cacheRoot \$agentDirectory \$WorkRoot/u,
+    "PowerShell retries deferred cleanup, joined, when preparation settles");
+  assert.match(powershell, /if \(\(\$script:NodeCleanupProgress -gt 0\) -and -not \(Test-NodeCleanupRunning\)\) \{/u,
+    "PowerShell stops before another candidate once the pass budget is spent");
+  assert.doesNotMatch(powershell, /\$directories\.Add/u, "no deferred directory list remains");
+});
+
+/**
+ * One mutex error-handling rule in every native path: an unverifiable birth is not
+ * a proven mismatch (a live holder is honored), a real different birth is stale,
+ * pid-only canonical records stay reclaimable, and a process's own identity query
+ * is retried until it succeeds instead of caching the failure.
+ */
+test("every path treats an unverifiable birth as a possible live holder, never as staleness", () => {
+  const read = (file: string) => readFileSync(join(process.cwd(), file), "utf8");
+
+  const cjs = read("scripts/managed-generations.cjs");
+  assert.match(cjs, /if \(observed === ""\) return true;/u,
+    "CJS honors a live pid whose birth query failed instead of treating it as stale");
+  assert.match(cjs, /function coordinationRecordIsCurrent\(record\)/u, "CJS has one shared owner-current authority");
+  assert.match(cjs, /let OWN_OWNER_IDENTITY_CACHE = "";/u, "CJS caches this process's identity separately");
+  assert.match(cjs, /if \(observed !== ""\) OWN_OWNER_IDENTITY_CACHE = observed;/u,
+    "CJS caches only a positive own identity, never a failed query");
+  assert.match(cjs, /if \(ownIdentity !== "" && record\.identity === ownIdentity\)/u,
+    "CJS self-adoption requires a real matching identity, and never waits on its own pid");
+
+  const host = read("src/session-host/roster-store.ts");
+  assert.match(host, /if \(observed === ""\) return true;/u,
+    "the TypeScript host honors a live pid whose birth query failed");
+  assert.match(host, /let OWN_OWNER_IDENTITY_CACHE = "";/u, "the host caches its identity separately");
+  assert.match(host, /if \(observed !== ""\) OWN_OWNER_IDENTITY_CACHE = observed;/u,
+    "the host caches only a positive own identity");
+  assert.match(host, /if \(record\.identity === ownIdentity\) return \{ status: "self" \}/u,
+    "host self-adoption requires a real matching identity");
+
+  const posix = read("scripts/node-generations.sh");
+  assert.match(posix, /\[\[ -n "\$observed" \]\] \|\| return 0/u,
+    "the POSIX path honors a live pid whose birth query failed");
+  assert.doesNotMatch(posix, /\[\[ -n "\$observed" && "\$observed" == "\$identity" \]\]/u,
+    "no POSIX path claims an unverified owner is stale");
+
+  const powershell = read("scripts/pi-review-sessions-node.ps1");
+  assert.match(powershell, /if \(\[string\]::IsNullOrEmpty\(\$observed\)\) \{ return \$true \}/u,
+    "the PowerShell path honors a live pid whose birth query failed");
+});
+
+/**
+ * The pass budget must bound the whole pass, not each generation: a long run of
+ * tiny candidates (empty roots, links) must stop once the pass has deleted
+ * something and spent its budget, and later passes must finish the job.
+ */
+test("a short pass budget stops a long run of tiny generations and later passes finish", posix, () => {
+  const f = fixture();
+  const outside = join(f.root, "outside");
+  writeFileSync(outside, "outside bytes");
+  mkdirSync(f.builds, { recursive: true, mode: 0o700 });
+  for (let index = 0; index < 60; index += 1) mkdirSync(join(f.builds, `a-${String(index).padStart(3, "0")}`), { mode: 0o700 });
+  for (let index = 0; index < 20; index += 1) symlinkSync(outside, join(f.builds, `b-${String(index).padStart(3, "0")}`));
+  const total = 80;
+  assert.equal(countCandidates(f.builds), total);
+  const first = generations.cleanup(f.builds, { cleanupBudgetMs: 1 });
+  assert.equal(first.stopped, true, "the pass reports that its runtime budget stopped it");
+  assert.ok(first.reclaimed >= 1, `the pass still deleted real entries: ${first.reclaimed}`);
+  assert.ok(countCandidates(f.builds) > generations.LIMIT, `the pass stopped before reaching the target: ${countCandidates(f.builds)}`);
+  assert.ok(countCandidates(f.builds) < total, "the pass did not process the whole run after its budget");
+  for (let pass = 0; pass < total && countCandidates(f.builds) > generations.LIMIT; pass += 1) {
+    generations.cleanup(f.builds, { cleanupBudgetMs: 1 });
+  }
+  assert.ok(countCandidates(f.builds) <= generations.LIMIT, `successive passes finish it: ${countCandidates(f.builds)}`);
+  assert.equal(readFileSync(outside, "utf8"), "outside bytes", "link candidates never touch their target");
 });

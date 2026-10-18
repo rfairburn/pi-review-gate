@@ -242,6 +242,24 @@ if [[ -z "$NODE_PS_BIN" ]]; then
     if [[ -f "$candidate" ]]; then NODE_PS_BIN="$candidate"; break; fi
   done
 fi
+# Owner-birth comparison for a legacy pid-only record needs the standard date
+# tool; when it is genuinely unavailable such a record is honored conservatively
+# and cleanup still proceeds for every other case, so this is never a launch
+# prerequisite.
+NODE_DATE_BIN="$(type -P date || true)"
+if [[ -z "$NODE_DATE_BIN" ]]; then
+  for candidate in /bin/date /usr/bin/date; do
+    if [[ -f "$candidate" ]]; then NODE_DATE_BIN="$candidate"; break; fi
+  done
+fi
+# Batched native leaf removal is an efficiency detail, never a prerequisite: when
+# `rm` is unavailable the walker falls back to one no-follow `unlink` per name.
+NODE_RM_BIN="$(type -P rm || true)"
+if [[ -z "$NODE_RM_BIN" ]]; then
+  for candidate in /bin/rm /usr/bin/rm; do
+    if [[ -f "$candidate" ]]; then NODE_RM_BIN="$candidate"; break; fi
+  done
+fi
 ORIGINAL_UMASK="$(umask)"
 umask 077
 node_capture_fence || exit 1

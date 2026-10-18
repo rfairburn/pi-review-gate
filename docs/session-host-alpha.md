@@ -284,7 +284,13 @@ Cleanup never refuses creation. Stale or malformed non-live lock artifacts are
 reclaimed rather than permanently disabling pruning, and missing/malformed legacy
 lifetime records do not protect cache contents. A live producer lock or actual cleanup
 failure is reported as a bounded warning and the launch continues, so five or more legacy
-generations can never block startup. Destructive reclamation and the session host's
+generations can never block startup. One cleanup pass shares a single runtime budget and
+deletes as it walks, so a large or deep generation makes real progress instead of being
+refused forever by a whole-tree bound; the next preparation continues from what remains.
+Compatible source-build and Pi runtime reuse, and each settled preparation, run the same
+bounded pass toward five and never treat the generation the launch is using as a
+candidate, so a warm startup converges older generations without rebuilding anything.
+Destructive reclamation and the session host's
 ownership acquisition are mutually exclusive through the same per-agent coordination
 entry described above: cleanup holds it only while it removes excess generations and
 creates its own, rechecks the ownership record after any wait or stale-lock recovery,
@@ -296,9 +302,14 @@ device name) inside the producer-owned cache are ordinary disposable content and
 unlinked without being opened. Active sessions stay protected by the host's own
 exclusive agent-directory ownership record; cache entries are not a second lifetime
 gate, and no consumer is killed to obtain space. No age/size quotas, per-file creation
-receipts, mount censuses, or checkpoint/history cleanup are added; a live owner-pid
-marker only prevents pruning a generation another producer is still filling (the root is
-fenced before marker inspection, and malformed markers are not liveness). An incomplete
+receipts, mount censuses, or checkpoint/history cleanup are added; the `.producer-active`
+marker and the per-cache admission lock name their owner as `<pid>` plus a targeted birth
+identity, so a reused pid never pins a generation, while a legacy pid-only record is still
+honored for its genuine owner (a pid whose birth is not clearly after the record's mtime).
+A birth query that temporarily fails is not a proven mismatch: a live destructive holder's
+entry is honored (cleanup skips, ownership acquisition keeps waiting) instead of being
+reclaimed as stale mid-deletion, and only a real different identity proves reuse.
+An incomplete
 fixed-name Pi version root that cannot be reclaimed falls through confined
 `pi-<version>.<n>` generations without a fixed candidate limit, and later launches reuse
 any valid generation for that exact version, so it also cannot stop startup. Settled failed or

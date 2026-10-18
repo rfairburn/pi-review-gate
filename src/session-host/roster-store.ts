@@ -579,9 +579,12 @@ function linuxBootIdentity(): string {
  * Target single-pid process-start token in one exact per-platform format so a
  * writer and a reader agree byte for byte: `linux:<boot>:<starttime ticks>` from
  * this single pid's `/proc/<pid>/stat` (no procps `ps` needed), `darwin:<ps lstart
- * token>` from one targeted `ps` query, or `win32:<StartTime round-trip>` from one
- * targeted native PowerShell query (the same facility and format the PowerShell
- * producer uses). Exactly one pid, never a census, and no third-party package; an
+ * token>` from one targeted `ps` query pinned to UTC and the C locale (the
+ * rendering carries no zone of its own, so a caller-local one would let the same
+ * live process look like a different owner after a timezone or DST change), or
+ * `win32:<StartTime round-trip>` from one targeted native PowerShell query (the
+ * same facility and format the PowerShell producer uses, with its explicit UTC
+ * offset). Exactly one pid, never a census, and no third-party package; an
  * empty result means the identity genuinely cannot be established.
  */
 function ownerStartIdentity(pid: number): string {
@@ -608,6 +611,9 @@ function ownerStartIdentity(pid: number): string {
         encoding: "utf8",
         timeout: 5_000,
         stdio: ["ignore", "pipe", "ignore"],
+        // Pinned so the token is byte-identical to the CJS and POSIX writers on
+        // every host, independent of the caller's timezone or locale.
+        env: { ...process.env, TZ: "UTC0", LC_ALL: "C", LANG: "C" },
       });
       const token = String(output).replace(/\s+/gu, " ").trim();
       return token.length > 0 && token.length <= MAX_COORDINATION_BYTES - 48 ? `darwin:${token}` : "";
@@ -645,7 +651,23 @@ function ownerStartIdentity(pid: number): string {
   return "";
 }
 
-const OWN_OWNER_IDENTITY = ownerStartIdentity(process.pid);
+// This process's own owner identity. The token is immutable once established, so
+// a positive result is cached forever; a failed query is never cached, because a
+// transient `ps`/`/proc` failure at load would otherwise permanently prevent this
+// host from publishing or recognizing its own coordination hold (and would leave
+// it waiting forever on a hold that is its own).
+let OWN_OWNER_IDENTITY_CACHE = "";
+function ownOwnerIdentity(): string {
+  if (OWN_OWNER_IDENTITY_CACHE === "") {
+    // Retried on every call until it succeeds: a transient failure must never
+    // disable publishing or self-adoption for the rest of the host's life.
+    const observed = ownerStartIdentity(process.pid);
+    if (observed !== "") OWN_OWNER_IDENTITY_CACHE = observed;
+  }
+  return OWN_OWNER_IDENTITY_CACHE;
+}
+// Learn this host's identity once at load; a failure here is retried above.
+OWN_OWNER_IDENTITY_CACHE = ownerStartIdentity(process.pid);
 
 interface CoordinationRecord {
   readonly pid: number;
@@ -667,14 +689,19 @@ function parseCoordinationRecord(text: string): CoordinationRecord | undefined {
  * True only while the record's pid is alive AND still reports the recorded start
  * identity, so an abandoned record whose pid was reused by an unrelated live
  * process is never honored forever. A record without a birth identity is never
- * honored on any platform.
+ * honored on any platform. A birth query that temporarily fails is NOT a proven
+ * mismatch: the pid is alive, so the record may still be a live holder and is
+ * honored rather than stolen (stealing it mid-destructive-pass would let a second
+ * actor claim ownership beside an active deletion).
  */
 function coordinationOwnerIsCurrent(record: CoordinationRecord | undefined): boolean {
   if (!record || !ownerIsAlive(record.pid)) return false;
   // A record without a birth identity is never honored: pid-only metadata could
   // otherwise be pinned forever behind an unrelated live process.
   if (record.identity === "") return false;
-  return ownerStartIdentity(record.pid) === record.identity;
+  const observed = ownerStartIdentity(record.pid);
+  if (observed === "") return true;
+  return observed === record.identity;
 }
 
 /** Bounded no-follow read; a valid record is accepted at nlink 1 or 2. */
@@ -722,7 +749,7 @@ function prepareCoordinationCandidate(stateDir: string): { candidate: string; pu
   try {
     fd = openSync(candidate, "wx", 0o600);
     try {
-      writeFileSync(fd, `${process.pid}\n${OWN_OWNER_IDENTITY}\n`, "utf8");
+      writeFileSync(fd, `${process.pid}\n${ownOwnerIdentity()}\n`, "utf8");
       fsyncSync(fd);
     } finally {
       closeSync(fd);
@@ -788,7 +815,7 @@ function reclaimCoordinationEntry(entryPath: string, observedIdentity: string): 
  * published, including when the owner identity is genuinely unavailable.
  */
 export function publishHostCoordinationRecord(stateDir: string): boolean {
-  if (OWN_OWNER_IDENTITY === "") return false;
+  if (ownOwnerIdentity() === "") return false;
   const candidate = prepareCoordinationCandidate(stateDir);
   if (!candidate) return false;
   return candidate.publish(join(stateDir, HOST_COORDINATION_FILENAME)) === "published";
@@ -801,7 +828,7 @@ export function publishHostCoordinationRecord(stateDir: string): boolean {
 function releaseSelfCoordination(stateDir: string): void {
   const entryPath = join(stateDir, HOST_COORDINATION_FILENAME);
   const record = readCoordinationRecord(entryPath);
-  if (!record || record.pid !== process.pid || record.identity !== OWN_OWNER_IDENTITY) return;
+  if (!record || record.pid !== process.pid || record.identity !== ownOwnerIdentity()) return;
   try {
     unlinkSync(entryPath);
   } catch {
@@ -822,7 +849,8 @@ function acquireHostCoordination(stateDir: string): CoordinationAcquisition {
   let malformedIdentity: string | undefined;
   let unremovableSince: number | undefined;
   for (;;) {
-    if (OWN_OWNER_IDENTITY === "") {
+    const ownIdentity = ownOwnerIdentity();
+    if (ownIdentity === "") {
       // Honest failure: a pid-only record would pin a later start behind a reused
       // pid forever, so no record is published at all.
       return { status: "unavailable" };
@@ -873,12 +901,14 @@ function acquireHostCoordination(stateDir: string): CoordinationAcquisition {
     }
     const observedIdentity = `${observed.dev}:${observed.ino}`;
     const record = readCoordinationRecord(entryPath);
-    if (record && record.pid === process.pid && record.identity === OWN_OWNER_IDENTITY) {
-      // This process already holds the entry (the launcher handoff). A record
-      // naming this pid with a different birth identity is stale metadata.
-      return { status: "self" };
-    }
-    if (coordinationOwnerIsCurrent(record)) {
+    if (record && record.pid === process.pid) {
+      // A record naming this very pid can only be this process's own hold or a
+      // predecessor's residue with a reused number; no other live process can
+      // hold it. Self-adoption requires a matching birth identity so a pid-only or
+      // unverifiable record is never adopted, and it is never waited on either —
+      // waiting on ourselves would deadlock the launcher/host handoff forever.
+      if (record.identity === ownIdentity) return { status: "self" };
+    } else if (coordinationOwnerIsCurrent(record)) {
       malformed = 0;
       malformedIdentity = undefined;
       unremovableSince = undefined;

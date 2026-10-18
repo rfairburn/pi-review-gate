@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import test, { type TestContext } from "node:test";
@@ -281,8 +281,7 @@ function writeBootstrapTools(
     "fi",
     "if [[ \"$1\" == \"-f\" && \"${FAKE_STAT_NATIVE:-Linux}\" == Linux ]]; then format=\"$2\"; format=\"${format//%Lp/%a}\"; format=\"${format//%p/%f}\"; format=\"${format//%l/%h}\"; format=\"${format//%z/%s}\"; format=\"${format//%m/%Y}\"; format=\"${format//%c/%Z}\"; shift 2; exec /usr/bin/stat -c \"$format\" \"$@\"; fi",
     "if [[ \"$1\" == \"-c\" && \"${FAKE_STAT_NATIVE:-Linux}\" == Darwin ]]; then format=\"$2\"; format=\"${format//%a/%Lp}\"; format=\"${format//%f/%p}\"; format=\"${format//%h/%l}\"; format=\"${format//%s/%z}\"; format=\"${format//%Y/%m}\"; format=\"${format//%Z/%c}\"; shift 2; exec /usr/bin/stat -f \"$format\" \"$@\"; fi",
-    "exec /usr/bin/stat \"$@\"",
-    "",
+    "exec /usr/bin/stat \"$@\"",    "",
   ].join("\n"));
   writeExecutable(join(fixture.bin, "curl"), [
     ...commonHeader,
@@ -327,6 +326,20 @@ function writeBootstrapTools(
     "/bin/cp \"$FAKE_BOOTSTRAP_NODE\" \"$destination/$root/bin/node\"",
     "printf '%s\\n' '#!/bin/sh' > \"$destination/$root/lib/node_modules/npm/bin/npm-cli.js\"",
     "/bin/ln -s ../lib/node_modules/npm/bin/npm-cli.js \"$destination/$root/bin/npm\"",
+    "# Controlled representative payload: a real extraction produces thousands of",
+    "# files and directories inside the generation, so post-extract cleanup acts on",
+    "# populated fresh roots rather than empty placeholders.",
+    "populate_files=${FAKE_TAR_FILES:-0}",
+    "populate_dirs=${FAKE_TAR_DIRS:-0}",
+    "if (( populate_dirs > 0 )); then",
+    "  for (( i=0; i<populate_dirs; i++ )); do",
+    "    /bin/mkdir -p \"$destination/$root/lib/payload/d$((i % 40))/e$i\"",
+    "  done",
+    "fi",
+    "if (( populate_files > 0 )); then",
+    "  for (( k=0; k<40; k++ )); do /bin/mkdir -p \"$destination/$root/lib/payload/f$k\"; done",
+    "  for (( i=0; i<populate_files; i++ )); do printf 'artifact\\n' > \"$destination/$root/lib/payload/f$((i % 40))/file-$i.txt\"; done",
+    "fi",
     "",
   ].join("\n"));
 
@@ -625,6 +638,90 @@ function nodeCache(fixture: EntrypointFixture): string {
   return join(fixture.agentDir, ".pi-review-gate", "node");
 }
 
+/** Physical remaining entries (files, dirs, links) inside one disposable tree. */
+function countTreeEntries(root: string): number {
+  let total = 0;
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      total += 1;
+      if (entry.isDirectory() && !entry.isSymbolicLink()) stack.push(join(current, entry.name));
+    }
+  }
+  return total;
+}
+
+/**
+ * A controlled harness that sources the real POSIX producer functions
+ * (`node_capture_fence`, `node_admit`, `node_remove`) with the host's own native
+ * `stat`/`unlink`/`rmdir`/`rm`, so a runtime budget can be shortened without any
+ * product knob. Nothing is downloaded or extracted here; the wrapper's own
+ * end-to-end path is covered by the `.sh` tests.
+ */
+function runProducerHarness(f: EntrypointFixture, body: string, extraEnv: NodeJS.ProcessEnv = {}): { status: number | null; stdout: string; stderr: string } {
+  const script = join(f.root, `producer-harness-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`);
+  writeFileSync(script, [
+    "set -u",
+    `HOST_OS="$(uname -s)"`,
+    `STAT_BIN="$(command -v stat)"`,
+    `NODE_UNLINK_BIN="$(command -v unlink)"`,
+    `NODE_RMDIR_BIN="$(command -v rmdir)"`,
+    `NODE_PS_BIN="$(command -v ps)"`,
+    `NODE_DATE_BIN="$(command -v date)"`,
+    `NODE_HARDLINK_BIN="$(command -v ln)"`,
+    `NODE_RM_BIN="$(command -v rm)"`,
+    `AGENT_DIR=${JSON.stringify(f.agentDir)}`,
+    `NODE_CACHE_ROOT="\${AGENT_DIR}/.pi-review-gate/node"`,
+    `path_identity() { local output; if [[ "$HOST_OS" == Darwin ]]; then output="$("$STAT_BIN" -f '%d:%i' "$1" 2>/dev/null)" || return 1; else output="$("$STAT_BIN" -c '%d:%i' "$1" 2>/dev/null)" || return 1; fi; printf '%s' "$output"; }`,
+    `assert_path_identity() { local current; current="$(path_identity "$1")" || return 1; [[ "$current" == "$2" ]]; }`,
+    `source ${JSON.stringify(resolve("scripts/node-generations.sh"))}`,
+    "node_capture_fence || { echo 'fence failed' >&2; exit 3; }",
+    body,
+    "",
+  ].join("\n"), "utf8");
+  const result = spawnSync("/bin/bash", [script], {
+    encoding: "utf8",
+    timeout: 180_000,
+    env: { HOME: f.home, PATH: process.env.PATH ?? "", ...extraEnv },
+  });
+  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+/** Populate one already-created generation with real files and directories. */
+function fillNodeGeneration(root: string, files: number, directories: number): void {
+  for (let bucket = 0; bucket < 40; bucket += 1) mkdirSync(join(root, `d${bucket}`), { recursive: true });
+  for (let index = 0; index < directories; index += 1) mkdirSync(join(root, `d${index % 40}`, `e${index}`), { recursive: true });
+  for (let index = 0; index < files; index += 1) {
+    writeFileSync(join(root, `d${index % 40}`, `file-${index}.txt`), "representative extracted content");
+  }
+}
+
+/**
+ * A representative populated fallback-Node generation: thousands of real files,
+ * a chain deeper than any former recursion quota, cleanup-specific `.terraform`
+ * content, and an outside hardlink/symlink that must never be followed. The
+ * native producers (not a substitute pruner) are what delete it.
+ */
+function seedPopulatedNodeGeneration(cache: string, name: string, outside: string): { root: string; entries: number } {
+  const root = join(cache, name);
+  let deepest = root;
+  for (let depth = 0; depth < 70; depth += 1) {
+    deepest = join(deepest, `d${depth}`);
+    mkdirSync(deepest, { recursive: true });
+  }
+  writeFileSync(join(deepest, "deep.txt"), "deep");
+  for (let bucket = 0; bucket < 25; bucket += 1) mkdirSync(join(root, `files-${bucket}`), { recursive: true });
+  for (let index = 0; index < 2000; index += 1) {
+    writeFileSync(join(root, `files-${index % 25}`, `f-${index}.txt`), "disposable by location");
+  }
+  mkdirSync(join(root, ".terraform"), { recursive: true });
+  writeFileSync(join(root, ".terraform", "sentinel"), "cleanup-specific");
+  linkSync(outside, join(root, "outside-hardlink"));
+  symlinkSync(outside, join(root, "outside-symlink"));
+  return { root, entries: countTreeEntries(root) };
+}
+
 for (const nativeOs of ["Linux", "Darwin"] as const) {
 test(`.sh actual ${nativeOs} fallback producer starts past five legacy extractions and deletes path-owned descendants without following outside links`, { skip: isWindows }, (t) => {
   const f = makeEntrypointFixture(`.node-cap-roll-${nativeOs}-`);
@@ -656,6 +753,395 @@ test(`.sh actual ${nativeOs} fallback producer starts past five legacy extractio
   f.markAssertionsPassed();
 });
 }
+
+test(".sh deletes a large populated Node generation content-first and converges to five", { skip: isWindows, timeout: 120_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-large-generation-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const env = { PI_CODING_AGENT_DIR: f.agentDir, FAKE_BOOTSTRAP_DISPATCH_CJS: "1" };
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  const outside = join(f.root, "outside-sentinel");
+  writeFileSync(outside, "outside remains");
+  const big = seedPopulatedNodeGeneration(cache, "bootstrap.0-large", outside);
+  assert.ok(big.entries > 2000, `the fixture is really populated: ${big.entries} entries`);
+  // A marker naming a LIVE pid whose OS birth is clearly after the record was
+  // written: exactly the pid-reuse residue an older producer can leave behind.
+  const reused = join(cache, "bootstrap.1-reused");
+  mkdirSync(reused, { recursive: true });
+  writeFileSync(join(reused, "content.txt"), "reclaimable");
+  const marker = join(reused, ".producer-active");
+  writeFileSync(marker, `${process.pid}\n`, { mode: 0o600 });
+  const longAgo = new Date(Date.now() - 3_600_000);
+  utimesSync(marker, longAgo, longAgo);
+  // Names that sort after the seeded excess so removal order stays deterministic
+  // next to the random `bootstrap.<hex>` generation names this producer creates.
+  for (const name of ["bootstrap.9-small-1", "bootstrap.9-small-2", "bootstrap.9-small-3"]) mkdirSync(join(cache, name));
+  const results: string[] = [];
+  for (let launch = 0; launch < 4; launch += 1) {
+    const result = runSh(f, ["--help"], env);
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stderr, /capacity exhausted/);
+    results.push(result.stderr);
+    if (!existsSync(big.root) && !existsSync(reused)) break;
+  }
+  assert.equal(existsSync(reused), false, "a reused-pid marker never keeps its generation forever");
+  assert.equal(existsSync(big.root), false, "the populated generation was actually deleted, not just counted");
+  assert.equal(nodeRoots(f).length, 5, "the cache converges to its five-generation target");
+  assert.equal(readFileSync(outside, "utf8"), "outside remains", "outside bytes are never deleted");
+  assert.equal(lstatSync(outside).nlink, 1, "only the cache name of the hardlink was removed");
+  assert.equal(recordedPhases(f).filter((phase) => phase === "curl").length, results.length,
+    "every launch still reached the download: cleanup never refuses a launch");
+  f.markAssertionsPassed();
+});
+
+/**
+ * A representative ~10k-entry generation, driven through the REAL POSIX producer
+ * functions with the host's own native tools. A budget that cannot finish the
+ * generation must still delete real content (never a zero-progress no-op), repeated
+ * short passes must keep advancing, and the default budget must finish it.
+ */
+test(".sh real producer makes bounded partial progress on a ~10k-entry generation, then finishes it", { skip: isWindows, timeout: 180_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-ten-thousand-");
+  cleanupFixture(t, f);
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  const outside = join(f.root, "outside-sentinel");
+  writeFileSync(outside, "outside remains");
+  const large = join(cache, "bootstrap.0-large");
+  mkdirSync(large, { recursive: true });
+  fillNodeGeneration(large, 10_000, 400);
+  linkSync(outside, join(large, "outside-hardlink"));
+  symlinkSync(outside, join(large, "outside-symlink"));
+  for (const name of ["bootstrap.8-a", "bootstrap.8-b", "bootstrap.8-c", "bootstrap.8-d"]) mkdirSync(join(cache, name));
+  const before = countTreeEntries(large);
+  assert.ok(before > 10_000, `the fixture holds a representative volume: ${before} entries`);
+  // A one-second budget with one name per native remove call cannot finish this
+  // generation; it must still delete real content and keep the root counted.
+  const shortPass = (pass: number) => runProducerHarness(f, [
+    "export NODE_CLEANUP_BATCH=1",
+    "NODE_CLEANUP_BUDGET=1",
+    `node_admit || exit 2`,
+    "echo admit-ok",
+  ].join("\n"), { HARNESS_PASS: String(pass) });
+  const first = shortPass(1);
+  assert.equal(first.status, 0, first.stderr);
+  assert.match(first.stdout, /admit-ok/);
+  const afterFirst = existsSync(large) ? countTreeEntries(large) : 0;
+  assert.ok(afterFirst < before, `the bounded pass deleted real content: ${before} -> ${afterFirst}`);
+  assert.ok(existsSync(large), "a one-second budget stops part-way instead of claiming the generation");
+  assert.equal(readFileSync(outside, "utf8"), "outside remains", "outside bytes survive the partial pass");
+  const second = shortPass(2);
+  assert.equal(second.status, 0, second.stderr);
+  const afterSecond = existsSync(large) ? countTreeEntries(large) : 0;
+  assert.ok(afterSecond < afterFirst, `the next short pass keeps advancing: ${afterFirst} -> ${afterSecond}`);
+  // The normal default budget finishes the same generation.
+  const finish = runProducerHarness(f, [
+    "node_admit || exit 2",
+    "echo admit-ok",
+  ].join("\n"));
+  assert.equal(finish.status, 0, finish.stderr);
+  assert.equal(existsSync(large), false, "the default-budget pass finishes the ~10k generation");
+  assert.equal(readFileSync(outside, "utf8"), "outside remains", "the outside sentinel is never followed");
+  assert.equal(lstatSync(outside).nlink, 1, "only the cache name of the hardlink was removed");
+  assert.ok(nodeRoots(f).length <= 5, `the cache converges: ${nodeRoots(f).length}`);
+  f.markAssertionsPassed();
+});
+
+/**
+ * Every fresh fallback generation is populated with thousands of real entries by
+ * the controlled extraction, so the post-extract trim acts on populated roots and
+ * convergence cannot come from deleting empty placeholders.
+ */
+test(".sh converges to five with thousands of extracted entries in every fresh generation", { skip: isWindows, timeout: 180_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-fresh-volume-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const env = { PI_CODING_AGENT_DIR: f.agentDir, FAKE_TAR_FILES: "2000", FAKE_TAR_DIRS: "200" };
+  const outside = join(f.root, "outside-sentinel");
+  writeFileSync(outside, "outside remains");
+  const before = join(nodeCache(f), "bootstrap.9-before");
+  const roots: string[] = [];
+  for (let launch = 0; launch < 8; launch += 1) {
+    const result = runSh(f, ["--help"], env);
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stderr, /capacity exhausted|unbound variable/);
+    const current = nodeRoots(f);
+    for (const root of current) if (!roots.includes(root)) roots.push(root);
+    assert.ok(current.length <= 5, `post-fresh generation count stays at the target: ${current.length}`);
+    const populated = current.filter((root) => existsSync(join(root, "extracted")) ? readdirSync(join(root, "extracted")).length > 0 : false);
+    assert.ok(populated.length > 0, "the fresh generation really contains controlled extraction output");
+    for (const root of populated) {
+      assert.ok(countTreeEntries(root) > 2_000, `a populated fresh root holds thousands of entries: ${countTreeEntries(root)}`);
+    }
+  }
+  assert.equal(nodeRoots(f).length, 5, "the cache converges to its five-generation target");
+  assert.ok(roots.filter((root) => !existsSync(root)).length >= 3,
+    "populated fresh generations were actually reclaimed, not just counted");
+  assert.equal(readFileSync(outside, "utf8"), "outside remains");
+  assert.ok(recordedPhases(f).filter((phase) => phase === "tar-extract").length === 8,
+    "every launch performed its own fresh extraction (no mutable Node reuse)");
+  void before;
+  f.markAssertionsPassed();
+});
+
+/**
+ * A real identity-query failure must abort the pass truthfully instead of
+ * continuing to walk with an empty or short identity list (which previously left
+ * unbound array values that crashed the launcher under `set -u`). The producer
+ * still creates its generation, and a later healthy pass reclaims the residue.
+ */
+test(".sh identity-query failure aborts the pass without crashing and stays confined", { skip: isWindows, timeout: 120_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-identity-fault-");
+  cleanupFixture(t, f);
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  const outside = join(f.root, "outside-sentinel");
+  writeFileSync(outside, "outside remains");
+  const faulted = join(cache, "bootstrap.0-faulted");
+  mkdirSync(faulted, { recursive: true });
+  fillNodeGeneration(faulted, 400, 40);
+  // The fault hits the generation root's own first identity batch, which is the
+  // exact window where continuing with an empty identity list used to crash.
+  mkdirSync(join(faulted, "d0", "fault-inside"), { recursive: true });
+  writeFileSync(join(faulted, "d0", "fault-inside", "kept.txt"), "kept");
+  linkSync(outside, join(faulted, "outside-hardlink"));
+  symlinkSync(outside, join(faulted, "outside-symlink"));
+  for (const name of ["bootstrap.8-a", "bootstrap.8-b", "bootstrap.8-c", "bootstrap.8-d"]) mkdirSync(join(cache, name));
+  const entriesBefore = countTreeEntries(faulted);
+  // A real, targeted native identity-query failure for one subtree: the walker must
+  // abort this pass (warn truthfully) instead of continuing with no identities.
+  const faultStat = join(f.root, "fault-stat");
+  writeFileSync(faultStat, [
+    "#!/bin/bash",
+    `for arg in \"$@\"; do case \"$arg\" in ${JSON.stringify(join(faulted, "d1"))}*) exit 1;; esac; done`,
+    "exec /usr/bin/stat \"$@\"",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(faultStat, 0o755);
+  const faultedRun = runProducerHarness(f, [
+    `STAT_BIN=${JSON.stringify(faultStat)}`,
+    "node_admit || exit 2",
+    "echo admit-ok",
+  ].join("\n"));
+  assert.equal(faultedRun.status, 0, faultedRun.stderr);
+  assert.match(faultedRun.stdout, /admit-ok/, "the producer still settles its own generation");
+  assert.match(faultedRun.stderr, /could not reclaim cache generation/,
+    `the identity-query failure is reported as a reclamation failure: ${faultedRun.stderr}`);
+  assert.doesNotMatch(faultedRun.stderr, /unbound variable|NODE_IDENTITIES|integer expression/u,
+    "the abort never falls through with empty identity values");
+  assert.equal(readFileSync(outside, "utf8"), "outside remains", "outside bytes are untouched by the failed pass");
+  assert.equal(lstatSync(outside).nlink, 1, "the outside hardlink target keeps its only real name");
+  const afterFault = existsSync(faulted) ? countTreeEntries(faulted) : 0;
+  assert.ok(afterFault <= entriesBefore, "the aborted pass deleted nothing outside the faulted subtree");
+  assert.ok(existsSync(join(faulted, "d0", "fault-inside", "kept.txt")),
+    "the subtree whose identity query failed is left in place, not half-removed");
+  // A healthy pass reclaims the same generation without any leftover crash state.
+  let reclaimed = !existsSync(faulted);
+  for (let pass = 0; pass < 4 && !reclaimed; pass += 1) {
+    const healthy = runProducerHarness(f, ["node_admit || exit 2", "echo admit-ok"].join("\n"));
+    assert.equal(healthy.status, 0, healthy.stderr);
+    reclaimed = !existsSync(faulted);
+  }
+  assert.equal(reclaimed, true, "a later healthy pass reclaims the formerly faulted generation");
+  assert.equal(readFileSync(outside, "utf8"), "outside remains");
+  assert.ok(nodeRoots(f).length <= 5, `the cache converges: ${nodeRoots(f).length}`);
+  f.markAssertionsPassed();
+});
+
+/**
+ * An empty generation deletes nothing inside the walk, so its ROOT removal is the
+ * progress boundary. With an already-exhausted deadline, every cleanup-only pass
+ * must still remove exactly one excess root (the pass-scope allowance), must never
+ * remove the preserved selected root, and must never create a generation.
+ */
+test(".sh cleanup-only pass removes one empty root per exhausted-budget call", { skip: isWindows, timeout: 120_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-empty-roots-");
+  cleanupFixture(t, f);
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  const selected = join(cache, "bootstrap.0-selected");
+  mkdirSync(selected, { recursive: true });
+  const empties: string[] = [];
+  for (let index = 0; index < 8; index += 1) {
+    const root = join(cache, `bootstrap.5-empty-${index}`);
+    mkdirSync(root, { recursive: true });
+    empties.push(root);
+  }
+  const outside = join(f.root, "outside-sentinel");
+  writeFileSync(outside, "outside remains");
+  assert.equal(nodeRoots(f).length, 9);
+  // Production functions with an already-exhausted deadline and a kept root.
+  const cleanupPass = () => runProducerHarness(f, [
+    "node_cleanup_running() { return 1; }",
+    `NODE_KEEP_ROOT=${JSON.stringify(selected)}`,
+    "node_cleanup_only || exit 2",
+    "echo cleanup-ok",
+  ].join("\n"));
+  const removedPerPass: number[] = [];
+  for (let pass = 0; pass < 8 && nodeRoots(f).length > 5; pass += 1) {
+    const before = nodeRoots(f).length;
+    const result = cleanupPass();
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /cleanup-ok/);
+    const after = nodeRoots(f).length;
+    assert.equal(after, before - 1,
+      `pass ${pass + 1} removed exactly one empty root under an exhausted budget: ${before} -> ${after}`);
+    assert.ok(existsSync(selected), "the preserved selected root is never a removal candidate");
+    removedPerPass.push(before - after);
+  }
+  assert.deepEqual(removedPerPass, [1, 1, 1, 1], "each pass removed one root until five remained");
+  assert.equal(nodeRoots(f).length, 5, "the cache reaches the five-generation target");
+  assert.ok(existsSync(selected), "the selected root survives convergence");
+  assert.equal(empties.filter((root) => existsSync(root)).length, 4, "four excess empty roots remain");
+  assert.equal(readFileSync(outside, "utf8"), "outside remains", "outside bytes are untouched");
+});
+
+test(".sh high-fanout directory-only generation advances on every short pass", { skip: isWindows, timeout: 180_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-wide-fanout-");
+  cleanupFixture(t, f);
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  const wide = join(cache, "bootstrap.0-wide");
+  mkdirSync(wide, { recursive: true });
+  for (let index = 0; index < 3_000; index += 1) mkdirSync(join(wide, `s-${String(index).padStart(4, "0")}`), { recursive: true });
+  for (const name of ["bootstrap.8-a", "bootstrap.8-b", "bootstrap.8-c", "bootstrap.8-d"]) mkdirSync(join(cache, name));
+  const before = countTreeEntries(wide);
+  assert.ok(before >= 3_000, `the fixture really is high-fanout: ${before}`);
+  const pass = () => runProducerHarness(f, [
+    "export NODE_CLEANUP_BATCH=50",
+    "NODE_CLEANUP_BUDGET=1",
+    "node_admit || exit 2",
+    "echo admit-ok",
+  ].join("\n"));
+  let previous = before;
+  let advanced = 0;
+  for (let attempt = 0; attempt < 2 && existsSync(wide); attempt += 1) {
+    const result = pass();
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /admit-ok/);
+    const remaining = existsSync(wide) ? countTreeEntries(wide) : 0;
+    assert.ok(remaining < previous,
+      `pass ${attempt + 1} deleted real entries instead of only re-identifying them: ${previous} -> ${remaining}`);
+    previous = remaining;
+    advanced += 1;
+  }
+  assert.ok(advanced >= 2, "several bounded short passes ran");
+  // The normal default budget finishes the same populated generation.
+  const finish = runProducerHarness(f, ["node_admit || exit 2", "echo admit-ok"].join("\n"));
+  assert.equal(finish.status, 0, finish.stderr);
+  assert.equal(existsSync(wide), false, "the directory-only generation is eventually fully deleted");
+  assert.ok(nodeRoots(f).length <= 5, `the cache converges: ${nodeRoots(f).length}`);
+  f.markAssertionsPassed();
+});
+
+/**
+ * Native cleanup deferred by contention must be retried once preparation settles:
+ * the producer that ends last runs a joined cleanup-only pass, so the cache
+ * converges without another fresh generation being created.
+ */
+test(".sh settlement retries cleanup deferred by contention without another launch", { skip: isWindows, timeout: 120_000 }, async (t) => {
+  const f = makeEntrypointFixture(".node-settlement-retry-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  const legacy: string[] = [];
+  for (let index = 0; index < 5; index += 1) {
+    const root = join(cache, `bootstrap.0-legacy-${index}`);
+    mkdirSync(join(root, "extracted"), { recursive: true });
+    writeFileSync(join(root, "extracted", "artifact.txt"), "disposable");
+    legacy.push(root);
+  }
+  const env = { PI_CODING_AGENT_DIR: f.agentDir, FAKE_BOOTSTRAP_DISPATCH_CJS: "1" };
+  // Producer A holds the admission lock for its whole preparation.
+  const holder = spawn("/bin/bash", [shPath, "--help"], {
+    env: entrypointEnv(f, { ...env, FAKE_CURL_HOLD: "1" }),
+    stdio: ["pipe", "pipe", "pipe", "pipe"],
+  });
+  const closed = new Promise<number | null>((accept, reject) => { holder.once("error", reject); holder.once("close", accept); });
+  t.after(async () => { if (!holder.stdin!.writableEnded) holder.stdin!.end("release\n"); await closed; });
+  await new Promise<void>((accept, reject) => {
+    const timer = setTimeout(() => reject(new Error("no download witness")), 15_000);
+    holder.stdio[3]!.on("data", (bytes: Buffer) => {
+      if (bytes.toString().includes("DOWNLOAD_READY")) { clearTimeout(timer); accept(); }
+    });
+    holder.once("close", () => { clearTimeout(timer); reject(new Error("holder exited before its download witness")); });
+  });
+  const rootsWhileHeld = nodeRoots(f).length;
+  // Producer B runs entirely inside A's critical section: it skips cleanup, and so
+  // does its own settlement retry, because A still holds the admission entry.
+  const competing = runSh(f, ["--help"], env);
+  assert.equal(competing.status, 0, competing.stderr);
+  assert.match(competing.stderr, /cleanup lock was busy|without reclaiming/);
+  const afterCompeting = nodeRoots(f).map((root) => root.split("/").pop());
+  assert.ok(afterCompeting.length > generations_LIMIT(),
+    `contention left the cache over its target: ${afterCompeting.length} (${afterCompeting.join(",")})`);
+  const launchesBefore = recordedPhases(f).filter((phase) => phase === "curl").length;
+  holder.stdin!.end("release\n");
+  assert.equal(await closed, 0);
+  // A's settlement pass is the retry: no third launch happened, yet the cache
+  // converges and the seeded generations were actually reclaimed.
+  const launchesAfter = recordedPhases(f).filter((phase) => phase === "curl").length;
+  assert.equal(launchesAfter, launchesBefore, "no additional fresh launch was needed");
+  assert.equal(nodeRoots(f).length, generations_LIMIT(), `settlement retry converged the cache: ${nodeRoots(f).length}`);
+  assert.ok(legacy.some((root) => !existsSync(root)), "the seeded generations were actually reclaimed");
+  assert.ok(rootsWhileHeld > 0);
+  f.markAssertionsPassed();
+});
+
+function generations_LIMIT(): number { return 5; }
+
+test(".sh directory-heavy generations make real progress and converge to five", { skip: isWindows, timeout: 180_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-dir-heavy-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const env = { PI_CODING_AGENT_DIR: f.agentDir, FAKE_BOOTSTRAP_DISPATCH_CJS: "1" };
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  // A broad directory-only generation: a "collect candidates then delete" walker
+  // could spend every pass here and delete nothing.
+  const dirsOnly = join(cache, "bootstrap.0-dirs-only");
+  for (let a = 0; a < 10; a += 1) {
+    for (let b = 0; b < 10; b += 1) {
+      for (let c = 0; c < 6; c += 1) mkdirSync(join(dirsOnly, `a${a}`, `b${b}`, `c${c}`), { recursive: true });
+    }
+  }
+  // A directory-heavy generation: one real file in each of many directories.
+  const heavy = join(cache, "bootstrap.1-heavy");
+  for (let index = 0; index < 400; index += 1) {
+    const dir = join(heavy, `d${index % 20}`, `e${index}`);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "artifact.txt"), "disposable by location");
+  }
+  for (const name of ["bootstrap.9-small-1", "bootstrap.9-small-2", "bootstrap.9-small-3"]) mkdirSync(join(cache, name));
+  // Every fresh generation carries the same representative volume, so
+  // convergence cannot come from deleting trivial placeholders.
+  const populated: string[] = [];
+  for (let launch = 0; launch < 9; launch += 1) {
+    const before = new Set(nodeRoots(f));
+    const result = runSh(f, ["--help"], env);
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stderr, /capacity exhausted/);
+    for (const root of nodeRoots(f)) {
+      if (before.has(root) || populated.includes(root)) continue;
+      // Thousands of entries in every fresh generation, so convergence cannot
+      // come from deleting empty or trivial placeholders.
+      fillNodeGeneration(root, 2_000, 300);
+      populated.push(root);
+    }
+  }
+  assert.equal(existsSync(dirsOnly), false, "the directory-only generation is fully deleted, not collected forever");
+  assert.equal(existsSync(heavy), false, "the directory-heavy generation is fully deleted");
+  assert.equal(nodeRoots(f).length, 5, "the cache converges to its five-generation target");
+  assert.ok(populated.some((root) => !existsSync(root)), "a populated fresh generation was actually reclaimed");
+  const surviving = nodeRoots(f).filter((root) => existsSync(join(root, "d0")));
+  assert.ok(surviving.length >= 2, `fresh generations keep their real content: ${surviving.length}`);
+  for (const root of surviving) {
+    assert.ok(countTreeEntries(root) > 1_000, `a surviving fresh generation still holds thousands of entries: ${countTreeEntries(root)}`);
+  }
+  f.markAssertionsPassed();
+});
 
 test(".sh settled checksum failures remain bounded and reclaimable before the sixth download", { skip: isWindows }, (t) => {
   const f = makeEntrypointFixture(".node-cap-failure-");
@@ -1413,6 +1899,158 @@ test("native Windows reclaims a directory-shaped cache lock and prunes to five",
   assert.equal(nodeRoots(f).length, 5, "exactly five generations remain: one legacy reclaimed, one fresh created");
   assert.ok(legacy.some((root) => !existsSync(root)), "an actual legacy generation was reclaimed");
   assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 1, "startup reached the download");
+  f.markAssertionsPassed();
+});
+
+test("native Windows settlement retries cleanup deferred by contention", { skip: !isWindows, timeout: 120_000 }, (t) => {
+  // Native Windows proof that contention-deferred reclamation is retried, joined,
+  // when preparation settles. Unexecuted on POSIX hosts; run by the Windows CI job.
+  const f = makeEntrypointFixture(".node-settlement-windows-");
+  cleanupFixture(t, f);
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  const legacy: string[] = [];
+  for (let index = 0; index < 6; index += 1) {
+    const root = join(cache, `bootstrap.0-legacy-${index}`);
+    mkdirSync(join(root, "extracted"), { recursive: true });
+    writeFileSync(join(root, "extracted", "artifact.txt"), "disposable by location");
+    legacy.push(root);
+  }
+  // A real live owner holds the admission entry for the whole preparation and is
+  // killed exactly when the synthetic download is reached, so only the settlement
+  // pass can reclaim the excess.
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  writeFileSync(join(cache, ".admission.lock"), `${holder.pid}\r\n`, "utf8");
+  try {
+    const downloads = join(f.root, "download-witness");
+    const helper = join(f.root, "bootstrap.ps1");
+    writeFileSync(helper, readFileSync(psPath, "utf8").replace(
+      "  Receive-OfficialArchive $url $archivePath",
+      "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); Stop-Process -Id ([int]$env:FAKE_LOCK_HOLDER) -ErrorAction SilentlyContinue; throw 'synthetic download failure'",
+    ));
+    const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const env = {
+      ...process.env,
+      PATH: f.bin,
+      PI_CODING_AGENT_DIR: f.agentDir,
+      DOWNLOAD_WITNESS: downloads,
+      TEMP: f.root,
+      TMP: f.root,
+      FAKE_LOCK_HOLDER: String(holder.pid),
+    };
+    const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
+      env, cwd: f.root, encoding: "utf8", timeout: 60_000,
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr ?? "", /cleanup lock was busy or unreadable|without reclaiming/,
+      "admission-time cleanup was deferred by the live holder");
+    assert.equal(existsSync(join(cache, ".admission.lock")), false,
+      "the settlement pass reclaimed the dead admission entry");
+    assert.equal(nodeRoots(f).length, 5, `settlement retry converged the cache: ${nodeRoots(f).length}`);
+    assert.ok(legacy.some((root) => !existsSync(root)), "seeded generations were reclaimed by the settlement pass");
+    assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 1, "startup still reached the download");
+  } finally {
+    holder.kill("SIGKILL");
+  }
+  f.markAssertionsPassed();
+});
+
+test("native Windows deletes a populated Node generation and recovers a reused-pid marker", { skip: !isWindows, timeout: 120_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-large-generation-windows-");
+  cleanupFixture(t, f);
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  const outside = join(f.root, "outside-sentinel");
+  writeFileSync(outside, "outside remains");
+  // Native Windows has no hardlinks in this fixture; the populated generation and
+  // the reused-pid marker are the substance of this case.
+  const big = join(cache, "bootstrap.0-large");
+  mkdirSync(big, { recursive: true });
+  // One representative ~10k-entry generation for the native Windows walker.
+  fillNodeGeneration(big, 10_000, 400);
+  mkdirSync(join(big, ".terraform"), { recursive: true });
+  writeFileSync(join(big, ".terraform", "sentinel"), "cleanup-specific");
+  assert.ok(countTreeEntries(big) > 10_000, `the fixture holds a representative volume: ${countTreeEntries(big)}`);
+  const reused = join(cache, "bootstrap.1-reused");
+  mkdirSync(reused, { recursive: true });
+  writeFileSync(join(reused, "content.txt"), "reclaimable");
+  const marker = join(reused, ".producer-active");
+  writeFileSync(marker, `${process.pid}\r\n`, { mode: 0o600 });
+  const longAgo = new Date(Date.now() - 3_600_000);
+  utimesSync(marker, longAgo, longAgo);
+  // Names that sort after the seeded excess so removal order stays deterministic
+  // next to the random `bootstrap.<hex>` generation names this producer creates.
+  for (const name of ["bootstrap.9-small-1", "bootstrap.9-small-2", "bootstrap.9-small-3"]) mkdirSync(join(cache, name));
+  const downloads = join(f.root, "download-witness");
+  const helper = join(f.root, "bootstrap.ps1");
+  writeFileSync(helper, readFileSync(psPath, "utf8")
+    .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'"));
+  const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
+  let launches = 0;
+  for (let launch = 0; launch < 4; launch += 1) {
+    const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
+      env, cwd: f.root, encoding: "utf8", timeout: 60_000,
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.doesNotMatch(result.stderr ?? "", /capacity exhausted/);
+    launches += 1;
+    if (!existsSync(big) && !existsSync(reused)) break;
+  }
+  assert.equal(launches, readFileSync(downloads, "utf8").split("download").length - 1,
+    "every launch still reached the download: cleanup never refuses a launch");
+  assert.equal(existsSync(reused), false, "a reused-pid marker never keeps its generation forever");
+  assert.equal(existsSync(big), false, "the populated generation was actually deleted, not just counted");
+  assert.equal(nodeRoots(f).length, 5, "the cache converges to its five-generation target");
+  assert.equal(readFileSync(outside, "utf8"), "outside remains", "outside bytes are never deleted");
+  f.markAssertionsPassed();
+});
+
+test("native Windows deletes directory-heavy generations progressively and converges to five", { skip: !isWindows, timeout: 180_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-dir-heavy-windows-");
+  cleanupFixture(t, f);
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  const dirsOnly = join(cache, "bootstrap.0-dirs-only");
+  for (let a = 0; a < 8; a += 1) {
+    for (let b = 0; b < 8; b += 1) {
+      for (let c = 0; c < 6; c += 1) mkdirSync(join(dirsOnly, `a${a}`, `b${b}`, `c${c}`), { recursive: true });
+    }
+  }
+  const heavy = join(cache, "bootstrap.1-heavy");
+  for (let index = 0; index < 400; index += 1) {
+    const dir = join(heavy, `d${index % 20}`, `e${index}`);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "artifact.txt"), "disposable by location");
+  }
+  for (const name of ["bootstrap.9-small-1", "bootstrap.9-small-2", "bootstrap.9-small-3"]) mkdirSync(join(cache, name));
+  const downloads = join(f.root, "download-witness");
+  const helper = join(f.root, "bootstrap.ps1");
+  writeFileSync(helper, readFileSync(psPath, "utf8")
+    .replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'"));
+  const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
+  const populated: string[] = [];
+  for (let launch = 0; launch < 9; launch += 1) {
+    const before = new Set(nodeRoots(f));
+    const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
+      env, cwd: f.root, encoding: "utf8", timeout: 120_000,
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.doesNotMatch(result.stderr ?? "", /capacity exhausted/);
+    for (const root of nodeRoots(f)) {
+      if (before.has(root) || populated.includes(root)) continue;
+      // Thousands of entries in every fresh generation on native Windows too, so
+      // convergence cannot come from deleting empty or trivial placeholders.
+      fillNodeGeneration(root, 2_000, 300);
+      populated.push(root);
+    }
+  }
+  assert.equal(existsSync(dirsOnly), false, "the directory-only generation is fully deleted, not collected forever");
+  assert.equal(existsSync(heavy), false, "the directory-heavy generation is fully deleted");
+  assert.equal(nodeRoots(f).length, 5, "the cache converges to its five-generation target");
+  assert.ok(populated.some((root) => !existsSync(root)), "a populated fresh generation was actually reclaimed");
+  assert.ok(readFileSync(downloads, "utf8").split("download").length - 1 >= 5, "every launch still reached the download");
   f.markAssertionsPassed();
 });
 

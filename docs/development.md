@@ -486,7 +486,11 @@ launcher revalidates the prepared build artifact (`validateSourceBuildArtifact` 
 authority) and the selected Pi runtime (ordinary positive Node entry plus managed
 generation confinement/identity through `pin`), and re-prepares or reselects them through
 the existing selection path when a concurrent preparation reclaimed them — so a cache this
-launcher pruned itself never becomes a new startup refusal. The canonical entry is published already complete (`pid` plus a targeted single-pid
+launcher pruned itself never becomes a new startup refusal. The native fallback-Node
+producers run the same cleanup-only pass once at preparation settlement (joined, under the
+same canonical entry and admission lock, targeting five while preserving the generation they
+launched), so reclamation deferred by contention is retried instead of waiting for another
+fresh generation. The canonical entry is published already complete (`pid` plus a targeted single-pid
 process-start identity) through a private candidate and an atomic no-overwrite hard link,
 so no half-written canonical record is ever observable and a paused publisher only loses
 the link race; readers accept the publisher's transient hard-link pairing. The identity is one exact per-platform token: `linux:<boot identity>:<starttime>` read
@@ -497,7 +501,13 @@ no shell string). A record is honored only while its pid is alive *and* still re
 recorded token, so a reused pid is reclaimed rather than becoming a permanent gate on any
 supported platform; when the identity genuinely cannot be established no record is
 published (the mutex is unavailable and the launch continues), never a weak pid-only
-record. Stale recovery captures the exact entry identity *before* it reads or judges the
+record. A birth query that *temporarily* fails is not a proven mismatch: a live pid with
+a non-empty recorded identity is honored, so producer cleanup skips and an ownership
+claim keeps waiting instead of stealing a live destructive holder's mutex mid-deletion,
+while a real, different identity still proves reuse. This process's own identity is
+re-queried until it succeeds and only a positive token is cached, so a transient failure
+at load can never prevent publishing or recognizing its own hold. Stale recovery captures
+the exact entry identity *before* it reads or judges the
 owner in every wrapper, so a contender that publishes its own live record in that window is
 never reclaimed: reclamation stays bound to the entry that was actually judged stale. Coordination helpers are resolved from the standard OS locations when `PATH` is
 limited and are never a cache-cleanup or launch prerequisite. A managed explicit Pi
@@ -528,15 +538,50 @@ that a reuse selection is a direct child of its managed cache; it writes no reco
 and `generation.release()` settles only the setup admission because the next producer
 cleanup reclaims excess generations.
 
-Removal is a bounded, no-follow postorder walk of one designated generation: links are
+Cleanup is progressive and bounded by the pass. One bounded pass inventories the type and
+then removes generations one entry at a time, with deletion as progress: entries are
+unlinked (or removed as empty directories) as they are visited, so a pass that reaches its
+runtime budget keeps everything it removed and the next preparation continues from what
+remains. One pass shares a single runtime budget (120 seconds by default) and a single
+progress allowance instead of resetting either per generation: the budget is checked per
+entry, and once the pass has deleted something it also stops before starting another
+candidate, so a long run of empty directories or direct-child links cannot be processed
+past the budget while the canonical mutex is held. There is no whole-tree preflight, entry-count quota, or depth quota
+that could make a large or deep generation permanently undeletable, and a budget stop is
+never a no-op: a pass that stops has already deleted something. A budget stop is reported
+truthfully (`cache cleanup stopped at its runtime budget … the next preparation reclaims
+more`) and startup continues. Reuse is not idle either: a compatible source-build or Pi
+runtime reuse, and a settled preparation, run the same bounded pass with a per-type
+target of five and never treat the generation this launch selected, created, or is
+returning as a candidate (`keep`). A warm startup therefore converges older generations
+without installing, compiling, or recreating anything.
+
+Removal is a bounded, no-follow walk of one designated generation: links are
 unlinked themselves and never traversed, a hardlinked file only loses this name, and a
 special leaf (FIFO, socket, or device name) is unlinked without being opened, so it
-cannot pin a disposable generation. A direct-child entry named `.terraform` under the
+cannot pin a disposable generation. Leaf names and completed directories are removed in
+native batches (`rm`/`unlink`, then an identity-checked `rmdir` per batch) and directory
+identities are captured in argv-bounded native `stat` batches, so a file-heavy,
+directory-heavy, or long-path generation keeps pace with the budget instead of paying one
+process per descendant or exceeding the platform argument limit; any identity-query
+failure aborts that pass with a truthful warning instead of walking on with missing
+data, and when the bulk tool is unavailable the same walk falls back to one no-follow
+`unlink` per name. A direct-child entry named `.terraform` under the
 producer-owned cache is ordinary disposable content, not an exemption.
 `.terraform` content inside a selected disposable generation is cleanup-specific and is
 removed with it (ordinary source discovery still prunes it before traversal). Partial
 removal leaves the entry counted for a later retry. These are public path-API fences, not an atomic sandbox
 against a malicious same-user writer. No real user cache is used by the focused tests.
+
+Every in-flight generation carries one `.producer-active` marker, and the per-cache
+`.admission.lock` names its owner the same way: `<pid>` plus the owner's targeted birth
+identity, written already complete. A marker or lock that names an identity is honored
+only while that exact identity still holds, so an abandoned record whose pid was reused by
+an unrelated process is reclaimed instead of pinning a generation. A record written by an
+older producer is pid-only and remains readable: it is honored while the live pid's OS
+birth is *not* clearly after the record's own mtime (an earlier birth is legitimate
+in-flight work, a later birth means the number was reused). Missing or malformed metadata
+is never protection, and no real in-flight producer is deleted by cleanup.
 
 Active sessions are protected by the session host's existing exclusive
 agent-directory ownership record ([Recovery](recovery.md) and
@@ -551,9 +596,12 @@ the same per-agent coordination entry, ownership rechecks, and destructive-bound
 Neither wrapper exempts a direct child named `.terraform`.
 The supported PATH-Node fast route is unchanged, and no mutable extracted Node is
 reused. POSIX uses `scripts/node-generations.sh`; native PowerShell uses an
-in-memory Reflection.Emit handle identity plus a bounded no-follow deletion, live
-`.producer-active` skips, and the same stale-lock recovery; every lock/inventory/removal
-failure is caught as a bounded warning before the fresh generation is created. Windows
+in-memory Reflection.Emit handle identity plus the same bounded no-follow deletion, live
+`.producer-active` skips, and stale-lock recovery; every lock/inventory/removal failure is
+caught as a bounded warning before the fresh generation is created. Both natives share
+the CJS semantics: one runtime budget for the whole pass, deletion as progress, owner
+records carrying a pid plus birth identity, and the same birth/mtime rule for a legacy
+pid-only marker or lock. Windows
 cleanup is native path deletion with reparse points unlinked rather than entered; it
 does not claim descendant-settlement proof beyond that.
 `tests/session-host-entrypoints.test.ts` includes native Windows tests selected by the

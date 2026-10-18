@@ -138,11 +138,23 @@ coordination entry is unavailable instead of racing an ownership acquisition it 
 exclude. Reclamation is confined to one designated generation with
 no-follow link handling (links are unlinked, never traversed); a `.terraform` subtree
 inside a selected disposable generation is removed with it; partially removed entries
-stay counted for a later retry. Each in-flight generation carries one owner-pid
-`.producer-active` marker so concurrent cleanup cannot reclaim it; the generation root is
-fenced before marker inspection (a direct-child link is never followed), malformed marker
-shapes are not treated as liveness, and a dead owner's marker is reclaimed rather than
-retained forever. These are
+stay counted for a later retry. One pass shares a single runtime budget and one progress
+allowance and deletes as it walks, so a large or deep generation makes real progress and is
+finished by later passes rather than being refused forever by a whole-tree bound, while a
+pass that has already deleted something stops before starting another candidate instead of
+running past its budget with the canonical mutex held; reuse, and native preparation
+settlement, run the same bounded pass with a target of five and never treat the generation
+this launch is using as a candidate. Each in-flight generation carries one `.producer-active` marker, and
+the per-cache admission lock names its owner the same way: `<pid>` plus the owner's
+targeted birth identity. A record is honored only while that exact identity holds, and a
+legacy pid-only record is honored only while the live pid's OS birth is not clearly after
+the record's own mtime, so a reused pid never pins a generation; the generation root is
+fenced before marker inspection (a direct-child link is never followed), and malformed
+marker shapes are not treated as liveness. A birth query that temporarily fails is not a
+proven mismatch: a live pid's record is honored (cleanup skips, or an ownership claim keeps
+waiting) rather than treating an unverifiable owner as stale, so a live destructive
+holder's mutex is never stolen mid-deletion; a real, different identity still proves reuse,
+and a process's own identity is re-queried until it succeeds. These are
 public path-API fences, not an atomic sandbox against malicious same-user replacement.
 See [Development](development.md#producer-owned-disposable-cache-cleanup). Native
 Windows cache cleanup is ordinary native deletion with reparse points unlinked rather

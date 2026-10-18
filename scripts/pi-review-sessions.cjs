@@ -1215,7 +1215,7 @@ async function buildSourceExtension(options) {
       }
     }
 
-    const returnCached = () => {
+    const returnCached = (cleanupReuse = true) => {
       if (!cacheMetadata || !cacheParentChain) return undefined;
       if (!verifyToolchainFence(toolchainFence)) return undefined;
       const recordPath = sourceBuildCacheRecordPath(buildCacheRoot, cacheMetadata.cacheKey);
@@ -1233,6 +1233,21 @@ async function buildSourceExtension(options) {
         parentChain: cacheParentChain,
         chain,
       };
+      // A compatible reuse advances pending cleanup instead of waiting for the
+      // next fresh build: the same bounded pass runs only on cache metadata, with
+      // a per-type target of five, and this launch's selected generation is never
+      // a candidate. Nothing is built, installed, or recreated to trigger it.
+      if (cleanupReuse) {
+        try {
+          generations.cleanup(buildCacheRoot, {
+            keep: [candidateRoot],
+            beforeReclaim: (root) => prepareSourceCacheRetirement(root, buildCacheRoot, cacheParentChain),
+            warn,
+          });
+        } catch (error) {
+          warn(`cache cleanup could not complete (${error && error.message}); the reused build is unaffected`);
+        }
+      }
       return {
         status: 0,
         stagingRoot: candidateRoot,
@@ -1256,7 +1271,9 @@ async function buildSourceExtension(options) {
       if (!pathExists(recordPath)) {
         cacheLock = acquireSourceCacheLock(buildCacheRoot, cacheMetadata.cacheKey, cacheParentChain);
         if (cacheLock) {
-          cached = returnCached();
+          // The publication lock is held here, so the cleanup-only pass (which
+          // takes the cache admission lock) must not run from under it.
+          cached = returnCached(false);
           if (cached) {
             cacheLock.release();
             cacheLock = undefined;
@@ -1266,7 +1283,7 @@ async function buildSourceExtension(options) {
         } else {
           // Another launcher owns publication. Never join its partial stage;
           // a one-time completed-cache check is safe, otherwise build privately.
-          cached = returnCached();
+          cached = returnCached(false);
           if (cached) return cached;
         }
       }
@@ -1448,8 +1465,20 @@ async function buildSourceExtension(options) {
   } finally {
     if (cacheLock) cacheLock.release();
     // Setup admission settles here, on success or failure. The generation stays
-    // reusable/disposable; only the cache-cleanup mutual exclusion ends.
+    // reusable/disposable; only the cache-cleanup mutual exclusion ends. A
+    // settlement pass then retries any cleanup that contention deferred while
+    // this producer was still staging, without deleting the generation it just
+    // produced or is returning to this launch.
     ownedStage.generation.release();
+    try {
+      generations.cleanup(buildCacheRoot, {
+        keep: [stagingRoot],
+        beforeReclaim: (root) => prepareSourceCacheRetirement(root, buildCacheRoot, cacheParentChain),
+        warn,
+      });
+    } catch (error) {
+      warn(`cache cleanup could not complete (${error && error.message}); the prepared build is unaffected`);
+    }
   }
 }
 
@@ -2668,6 +2697,16 @@ async function provisionPiRuntime(options) {
     throw new PiRuntimeError(`could not access the isolated pi runtime cache under ${runtimeRoot}`);
   }
   const warn = (message) => writeError(`pi-review-sessions: ${message}.\n`);
+  // A compatible reuse or a settled provisioning pass runs the same bounded
+  // cleanup-only pass: target five, and the generation this launch is using is
+  // never a candidate. Nothing is installed or recreated to trigger it.
+  const cleanupAround = (selectedRoot) => {
+    try {
+      generations.cleanup(runtimeRoot, { keep: [selectedRoot], warn });
+    } catch (error) {
+      warn(`cache cleanup could not complete (${error && error.message}); the runtime is unaffected`);
+    }
+  };
   const fixedBase = `pi-${version}`;
   const numberedIndex = (name) => (name === fixedBase ? -1 : Number(name.slice(fixedBase.length + 1)));
   // Compatible reuse first: any existing valid generation for this exact
@@ -2691,7 +2730,7 @@ async function provisionPiRuntime(options) {
       continue;
     }
     try {
-      return await validateCachedPiRuntime(
+      const validated = await validateCachedPiRuntime(
         versionRoot,
         path.join(versionRoot, "node_modules", "@earendil-works", "pi-coding-agent"),
         env,
@@ -2700,6 +2739,8 @@ async function provisionPiRuntime(options) {
         processRunner,
         version,
       );
+      cleanupAround(versionRoot);
+      return validated;
     } catch (error) {
       if (error.cleanupUnconfirmed) throw error;
     }
@@ -2723,7 +2764,9 @@ async function provisionPiRuntime(options) {
         throw new PiRuntimeError(`the cached pi runtime at ${versionRoot} is partial or unsafe; preserving it`);
       }
       try {
-        return await validateCachedPiRuntime(versionRoot, targetPkgDir, env, existing, runtimeChain, processRunner, version);
+        const validated = await validateCachedPiRuntime(versionRoot, targetPkgDir, env, existing, runtimeChain, processRunner, version);
+        cleanupAround(versionRoot);
+        return validated;
       } catch (error) {
         if (error.cleanupUnconfirmed) throw error;
         // A published runtime (or one that cannot be retried without npm) is
@@ -2830,6 +2873,9 @@ async function provisionPiRuntime(options) {
         writeError("pi-review-sessions: retained an incomplete Pi runtime generation; the next launch reclaims excess cache generations.\n");
       }
       ownedStage.generation.release();
+      // Settlement retries cleanup that contention deferred while this producer
+      // was still installing, keeping the generation it just produced.
+      cleanupAround(versionRoot);
     }
   }
 }
@@ -2851,7 +2897,7 @@ function managedPiGeneration(candidate) {
   return undefined;
 }
 
-async function withManagedPiSelection(candidate, processRunner, validate) {
+async function withManagedPiSelection(candidate, processRunner, validate, options = {}) {
   let canonical;
   try { canonical = fs.realpathSync(candidate); }
   catch { canonical = path.resolve(candidate); } // Missing paths still fail the existing validator.
@@ -2880,7 +2926,21 @@ async function withManagedPiSelection(candidate, processRunner, validate) {
     }
     return processRunner(file, args, options);
   };
-  return validate(guardedRunner);
+  const validated = await validate(guardedRunner);
+  // A validated reuse advances pending cleanup toward the per-type target without
+  // creating anything, and the generation this launch selected is never a
+  // candidate. Cleanup trouble never changes the selection result.
+  try {
+    generations.cleanup(managed.cacheRoot, {
+      keep: [managed.root],
+      warn: typeof options.warn === "function" ? options.warn : undefined,
+    });
+  } catch (error) {
+    if (typeof options.warn === "function") {
+      options.warn(`cache cleanup could not complete (${error && error.message}); the selected runtime is unaffected`);
+    }
+  }
+  return validated;
 }
 
 /**
@@ -2892,6 +2952,7 @@ async function withManagedPiSelection(candidate, processRunner, validate) {
 async function resolvePiRuntime(options) {
   const { explicit, env, agentDir, cwd, writeError } = options;
   const processRunner = options.processRunner || runBoundedProcess;
+  const warnCache = (message) => writeError(`pi-review-sessions: ${message}.\n`);
 
   if (explicit !== undefined) {
     const candidate = path.isAbsolute(explicit) ? explicit : path.resolve(cwd, explicit);
@@ -2925,7 +2986,7 @@ async function resolvePiRuntime(options) {
       }
       const version = await probePiVersion(canonical, env, runner);
       return { file: canonical, version, source: "explicit" };
-    });
+    }, { warn: warnCache });
   }
 
   const npmCli = findNpmCli(env);
@@ -2936,7 +2997,7 @@ async function resolvePiRuntime(options) {
       try {
         return await withManagedPiSelection(pkgDir, processRunner, async (runner) => ({
           ...await validatePiPackage(pkgDir, env, { processRunner: runner }), source: "npm-global",
-        }));
+        }), { warn: warnCache });
       } catch (error) {
         if (error && error.cleanupUnconfirmed) throw error;
         // An unsupported or corrupt global install falls through to PATH and
@@ -2952,7 +3013,7 @@ async function resolvePiRuntime(options) {
       try {
         return await withManagedPiSelection(onPath, processRunner, async (runner) => ({
           ...await validatePiPackage(pkgDir, env, { expectedFile: onPath, processRunner: runner }), source: "path",
-        }));
+        }), { warn: warnCache });
       } catch (error) {
         if (error && error.cleanupUnconfirmed) throw error;
         // Not positively identified as the public package: fall through.

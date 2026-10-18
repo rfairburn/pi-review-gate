@@ -781,10 +781,11 @@ function Exit-NodeCoordination($Coordination) {
   }
 }
 
-function Invoke-NodeCacheCleanup([string]$Root, $Chain, $Lock, [string]$LockPath, [string]$AgentDirectory, [int]$Target = 5, [string]$Keep = '') {
+function Invoke-NodeCacheCleanup([string]$Root, $Chain, $Lock, [string]$AgentDirectory, [int]$Target = 5, [string]$Keep = '') {
   # Best-effort cleanup only: every failure here warns and creation proceeds.
-  # Returns the admission lock identity captured before cleanup, or $null.
-  $identity = $null
+  # Ownership of the admission entry is not this pass's business: the identity
+  # captured when acquisition succeeded is what release is bound to, so skipping
+  # or failing reclamation never strands the producer's own metadata entry.
   try {
     # The record is written already complete: this producer's pid plus its
     # targeted birth identity, so liveness never depends on a pid number alone.
@@ -792,7 +793,6 @@ function Invoke-NodeCacheCleanup([string]$Root, $Chain, $Lock, [string]$LockPath
     $lockBytes = [Text.Encoding]::UTF8.GetBytes($recordBody)
     $Lock.Write($lockBytes, 0, $lockBytes.Length)
     $Lock.Flush($true)
-    $identity = Get-PathIdentity $LockPath
     Assert-NodeFence $Chain
     $entries = @()
     try {
@@ -856,15 +856,14 @@ function Invoke-NodeCacheCleanup([string]$Root, $Chain, $Lock, [string]$LockPath
   } catch {
     [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup could not complete; continuing startup.')
   }
-  return $identity
 }
 
 function Enter-NodeAdmissionLock([string]$Root, $Chain, [string]$AgentDirectory) {
   # Bounded exclusive acquisition of the per-cache admission lock entry. A live
   # owner is waited for briefly and then left alone, a dead/malformed/non-live
   # artifact is reclaimed confined to that exact entry, and nothing here can become
-  # a permanent stop condition. Returns @{ Stream; Path } or $null, and records why
-  # in $script:NodeLockReport ('busy' or 'artifact').
+  # a permanent stop condition. Returns @{ Stream; Path; Identity } or $null, and
+  # records why in $script:NodeLockReport ('busy' or 'artifact').
   $lockPath = Join-Path $Root '.admission.lock'
   $lock = $null
   $lockReclaimFailed = $false
@@ -934,21 +933,28 @@ function Enter-NodeAdmissionLock([string]$Root, $Chain, [string]$AgentDirectory)
     if ($lockReclaimFailed) { $script:NodeLockReport = 'artifact' }
     return $null
   }
-  return @{ Stream = $lock; Path = $lockPath }
+  # Capture the exact identity of the entry this producer just created, as part
+  # of the successful acquisition itself. Release is bound to that entry whether
+  # or not reclamation runs and whether or not a complete owner record is ever
+  # written, so a fresh empty entry of this producer's own is never stranded; an
+  # entry that later occupies the path has a different identity and is kept.
+  $identity = $null
+  try { $identity = Get-PathIdentity $lockPath } catch { $identity = $null }
+  return @{ Stream = $lock; Path = $lockPath; Identity = $identity }
 }
 
 function Exit-NodeAdmissionLock($Admission, $Chain) {
-  # Release only this producer's own admission entry, and only while that exact
-  # entry is still the one it published.
+  # Release only this producer's own admission entry: the exact entry identity
+  # captured when that acquisition succeeded. Nothing is inferred from a written
+  # owner record or from whether reclamation ran, so a skipped cleanup (host
+  # ownership, contention) still releases this producer's own fresh metadata, and
+  # a replacement now occupying the path has a different identity and is kept.
   if ($null -eq $Admission) { return }
   try { $Admission.Stream.Dispose() } catch { }
   try {
+    if ($null -eq $Admission.Identity) { return }
     Assert-NodeFence $Chain
-    $record = Read-NodeOwnerRecordFile $Admission.Path
-    if ($null -ne $record -and $record.Pid -eq $PID) {
-      $identity = Get-PathIdentity $Admission.Path
-      if ($null -ne $identity) { [IO.File]::Delete($Admission.Path) }
-    }
+    if (Assert-PathIdentity $Admission.Path $Admission.Identity) { [IO.File]::Delete($Admission.Path) }
   } catch { # Uncertain lock ownership is retained.
   }
 }
@@ -986,7 +992,7 @@ function Invoke-NodeSettlementCleanup([string]$Root, [string]$AgentDirectory, [s
         [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
         return
       }
-      $null = Invoke-NodeCacheCleanup $Root $chain $admission.Stream $admission.Path $AgentDirectory 5 $Keep
+      $null = Invoke-NodeCacheCleanup $Root $chain $admission.Stream $AgentDirectory 5 $Keep
     } finally {
       Exit-NodeAdmissionLock $admission $chain
       Exit-NodeCoordination $coordination
@@ -1001,9 +1007,7 @@ function Invoke-NodeSettlementCleanup([string]$Root, [string]$AgentDirectory, [s
 
 function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
   $chain = Get-NodeFence $Root
-  $lockPath = Join-Path $Root '.admission.lock'
-  $lock = $null
-  $lockIdentity = $null
+  $admission = $null
   $skipCleanup = $false
   # The canonical per-agent coordination entry is taken FIRST and released once
   # this producer's fresh generation exists. Host ownership acquisition takes the
@@ -1033,12 +1037,8 @@ function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
     # evidence. Capacity never refuses creation.
     if (-not $skipCleanup) {
       $admission = Enter-NodeAdmissionLock $Root $chain $AgentDirectory
-      if ($null -ne $admission) {
-        $lock = $admission.Stream
-        $lockPath = $admission.Path
-      }
     }
-    if ($null -eq $lock -and -not $skipCleanup) {
+    if ($null -eq $admission -and -not $skipCleanup) {
       # Rechecked whichever way the admission attempt ended: a host that became
       # the owner while this producer waited is the reason cleanup stays away.
       if (Test-NodeHostOwnership $AgentDirectory) {
@@ -1048,13 +1048,15 @@ function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
       } else {
         [Console]::Error.WriteLine('pi-review-sessions: Node cache cleanup lock was busy or unreadable; continuing without reclaiming older generations.')
       }
-    } elseif ($null -ne $lock) {
+    } elseif ($null -ne $admission) {
       if (Test-NodeHostOwnership $AgentDirectory) {
         # Rechecked after the admission wait/stale-lock recovery: a host may have
-        # acquired ownership while this producer waited.
+        # acquired ownership while this producer waited. Reclamation is skipped,
+        # while the entry this producer already acquired is still its own to
+        # release (see the finally block).
         [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
       } else {
-        $lockIdentity = Invoke-NodeCacheCleanup $Root $chain $lock $lockPath $AgentDirectory 4
+        $null = Invoke-NodeCacheCleanup $Root $chain $admission.Stream $AgentDirectory 4
       }
     }
     $candidate = Join-Path $Root ('bootstrap-' + [Guid]::NewGuid().ToString('N'))
@@ -1076,15 +1078,11 @@ function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
   } finally {
     $script:NodeCleanupStopwatch = $null
     $script:NodeCleanupStopped = $false
+    # Release in reverse acquisition order: the per-cache admission entry first,
+    # then the canonical per-agent entry. This producer's fresh generation already
+    # carries its own liveness marker, so nothing it needs pruning is exposed.
+    Exit-NodeAdmissionLock $admission $chain
     Exit-NodeCoordination $coordination
-    if ($null -ne $lock) {
-      $lock.Dispose()
-      try {
-        Assert-NodeFence $chain
-        if ($null -ne $lockIdentity -and (Assert-PathIdentity $lockPath $lockIdentity)) { [IO.File]::Delete($lockPath) }
-      } catch { # Uncertain lock ownership is retained.
-      }
-    }
   }
 }
 

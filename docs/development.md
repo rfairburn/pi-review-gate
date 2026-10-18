@@ -471,8 +471,12 @@ entry (`<agentDir>/session-host/host-coordination.lock`) that the session host's
 ownership acquisition also takes, then one exclusive `.admission.lock`, reclaims excess
 generations down to four (so creation lands at or below five), creates the requested
 generation, and holds the admission lock until the producer settles its own setup. The
-coordination entry is released as soon as the fresh generation exists, so a starting host
-is never held behind a long build or install. It is a lock, not a registry: a stale or
+admission entry's own identity is captured as part of that acquisition, and that exact
+entry is released even when a host-ownership recheck skips reclamation, so a producer
+never strands its own fresh metadata; release compares that identity, so a replacement
+entry at the path is never removed. The coordination entry is released as soon as the
+fresh generation exists, so a starting host is never held behind a long build or install.
+It is a lock, not a registry: a stale or
 malformed entry is reclaimed like a stale admission lock, and a busy live holder only
 makes cleanup skip (with a bounded warning). Destructive reclamation rechecks the
 ownership record after any admission-lock wait or stale/malformed recovery, and again at

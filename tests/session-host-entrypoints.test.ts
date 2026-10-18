@@ -1891,6 +1891,20 @@ const PS_COORDINATION_REPLACEMENT: WindowsFixturePatch = {
   ],
 };
 
+/** Witness for a fresh admission entry: emitted at the entry-identity capture that
+ *  is part of a successful acquisition, before any cleanup decision. A surviving
+ *  malformed directory shape can never reach this line, so the witness
+ *  distinguishes "the old malformed directory was reclaimed" from "this producer
+ *  acquired and then released its own fresh entry". */
+const PS_LOCK_ACQUISITION_WITNESS: WindowsFixturePatch = {
+  label: "fresh admission entry acquisition witness",
+  anchor: "try { $identity = Get-PathIdentity $lockPath } catch { $identity = $null }",
+  replacement: [
+    '[IO.File]::AppendAllText($env:LOCK_WITNESS, "lock-acquired`n")',
+    "try { $identity = Get-PathIdentity $lockPath } catch { $identity = $null }",
+  ],
+};
+
 /** A host ownership record at the real per-candidate removal boundary of the
  *  cleanup loop: the first destructive step of one authorized candidate. */
 const PS_OWNERSHIP_RECORD_AT_REMOVAL: WindowsFixturePatch = {
@@ -1905,6 +1919,7 @@ const WINDOWS_FIXTURE_PATCHES: readonly WindowsFixturePatch[] = [
   PS_DOWNLOAD_STUB_RELEASING_HOLDER,
   PS_INVENTORY_FAILURE_STUB,
   PS_OWNERSHIP_RECORD_DURING_LOCK_RECOVERY,
+  PS_LOCK_ACQUISITION_WITNESS,
   PS_COORDINATION_REPLACEMENT,
   PS_OWNERSHIP_RECORD_AT_REMOVAL,
 ];
@@ -1955,6 +1970,60 @@ test("Windows fixture anchors still match the real producer source on every plat
   const loopEnd = boundary.indexOf("$held = $count");
   assert.ok(loopStart >= 0 && ownershipRecheck > loopStart && removal > ownershipRecheck && loopEnd > removal,
     "the injected record sits at the real per-candidate removal boundary after the ownership recheck");
+});
+
+test("producer captures admission entry identity at acquisition and releases exactly that entry", () => {
+  // All-platform supplement to the native Windows case below. The executable case
+  // cannot run on a POSIX host, so this structure guard keeps the defect from
+  // returning unnoticed: the admission entry identity must be captured as part of
+  // a successful acquisition (independent of whether reclamation runs or an owner
+  // record is written), and release must be bound to that exact entry.
+  const source = readFileSync(psPath, "utf8");
+  const cleanupStart = source.indexOf("function Invoke-NodeCacheCleanup");
+  const acquireStart = source.indexOf("function Enter-NodeAdmissionLock");
+  const releaseStart = source.indexOf("function Exit-NodeAdmissionLock");
+  const settlementStart = source.indexOf("function Invoke-NodeSettlementCleanup");
+  const generationStart = source.indexOf("function New-NodeGeneration");
+  assert.ok(cleanupStart >= 0 && acquireStart > cleanupStart && releaseStart > acquireStart
+    && settlementStart > releaseStart && generationStart > settlementStart,
+  "the producer keeps its cleanup, acquisition, release, settlement and creation seams");
+  const cleanupPass = source.slice(cleanupStart, acquireStart);
+  const acquire = source.slice(acquireStart, releaseStart);
+  const release = source.slice(releaseStart, settlementStart);
+  const generation = source.slice(generationStart);
+  // Acquisition itself captures the entry it just created and hands it back.
+  const create = acquire.indexOf("[IO.File]::Open($lockPath, [IO.FileMode]::CreateNew");
+  const capture = acquire.indexOf("$identity = Get-PathIdentity $lockPath");
+  assert.ok(create >= 0 && capture > create,
+    "the identity is captured at acquisition, after the exclusive CreateNew of that entry");
+  assert.match(acquire, /return @\{ Stream = \$lock; Path = \$lockPath; Identity = \$identity \}/u,
+    "the acquired handle carries the entry identity to its caller");
+  // Reclamation no longer supplies the identity release depends on, so a skipped
+  // or failed cleanup pass cannot leave the producer without its own entry identity.
+  assert.doesNotMatch(cleanupPass, /Get-PathIdentity|LockPath/u,
+    "reclamation neither captures nor receives the admission entry identity");
+  // Release is bound to the captured identity alone, and fails closed when it is
+  // unavailable instead of guessing from a written owner record.
+  assert.match(release, /if \(Assert-PathIdentity \$Admission\.Path \$Admission\.Identity\)/u,
+    "release compares the exact entry identity captured at acquisition");
+  assert.match(release, /if \(\$null -eq \$Admission\.Identity\) \{ return \}/u,
+    "an unavailable identity retains the entry instead of unlinking blind");
+  assert.doesNotMatch(release, /Read-NodeOwnerRecordFile/u,
+    "release does not require a complete owner record to have been written");
+  // The creation producer keeps the acquired handle and releases it before the
+  // canonical per-agent entry, in reverse acquisition order.
+  assert.doesNotMatch(generation, /\$lockIdentity/u,
+    "a cleanup-derived identity can no longer overwrite the acquisition identity");
+  assert.match(generation, /\$admission = Enter-NodeAdmissionLock/u);
+  const releaseAt = generation.indexOf("Exit-NodeAdmissionLock $admission $chain");
+  const coordinationAt = generation.indexOf("Exit-NodeCoordination $coordination");
+  assert.ok(releaseAt >= 0 && coordinationAt > releaseAt,
+    "the admission entry is released before the canonical per-agent entry");
+  // The generation this pass created already carries its own liveness marker, so
+  // releasing the admission entry first exposes nothing to another pruner.
+  const markerAt = generation.indexOf("New-ExclusiveDirectory $candidate");
+  assert.ok(markerAt >= 0 && markerAt < releaseAt,
+    "the fresh generation exists before either entry is released");
 });
 
 test("native Windows fallback bootstrap prunes legacy artifacts and never refuses a sixth", { skip: !isWindows, timeout: 60_000 }, (t) => {
@@ -2239,16 +2308,34 @@ test("native Windows skips pruning when a session host appears during admission-
     legacy.push(root);
   }
   const ownership = join(f.agentDir, "session-host", "host-ownership.json");
-  const { helper, downloads, powershell, env } = writeWindowsFixtureHelper(f, [PS_DOWNLOAD_STUB, PS_OWNERSHIP_RECORD_DURING_LOCK_RECOVERY]);
+  const lockWitness = join(f.root, "lock-witness");
+  const { helper, downloads, powershell, env } = writeWindowsFixtureHelper(f, [PS_DOWNLOAD_STUB, PS_OWNERSHIP_RECORD_DURING_LOCK_RECOVERY, PS_LOCK_ACQUISITION_WITNESS]);
   const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
-    env: { ...env, FAKE_OWNERSHIP_RECORD: ownership }, cwd: f.root, encoding: "utf8", timeout: 20_000,
+    env: { ...env, FAKE_OWNERSHIP_RECORD: ownership, LOCK_WITNESS: lockWitness }, cwd: f.root, encoding: "utf8", timeout: 20_000,
   });
   assert.equal(result.status, 1, result.stderr);
   assert.match(result.stderr, /a session host currently owns the agent directory/);
   assert.doesNotMatch(result.stderr, /capacity exhausted/);
+  assert.doesNotMatch(result.stderr, /lock artifact could not be removed/,
+    "the malformed directory shape was reclaimed instead of becoming a cleanup skip");
+  assert.equal(readFileSync(ownership, "utf8").includes("fixture-owner"), true,
+    "the ownership record appeared during recovery, so the recheck saw a real host");
+  // These two assertions are what distinguish the OLD malformed directory from the
+  // NEW fresh entry this producer creates after reclaiming it. A surviving directory
+  // could never be opened with CreateNew, so the acquisition witness proves a fresh
+  // regular entry was acquired; the entry's absence then proves this producer
+  // released that exact fresh entry even though the ownership recheck skipped
+  // pruning. Accepting only "absent" would also pass if the fresh entry had never
+  // been acquired at all.
+  assert.ok(existsSync(lockWitness), "the producer reached the admission entry-identity capture");
+  assert.equal(readFileSync(lockWitness, "utf8"), "lock-acquired\n",
+    "the producer acquired its own fresh admission entry exactly once, after the directory was reclaimed");
+  assert.equal(existsSync(join(cache, ".admission.lock")), false,
+    "the fresh entry this producer acquired is released even though pruning was skipped");
   for (const root of legacy) assert.ok(existsSync(root), "no generation was pruned after the ownership recheck");
   assert.equal(nodeRoots(f).length, 6, "the competing launch still created its own generation");
-  assert.equal(existsSync(join(cache, ".admission.lock")), false, "the malformed lock artifact itself was still reclaimed");
+  assert.equal(readdirSync(cache).filter((name) => name.startsWith("bootstrap-")).length, 1,
+    "exactly one fresh generation exists beside the five preserved legacy generations");
   assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 1, "startup reached the download");
   f.markAssertionsPassed();
 });

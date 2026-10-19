@@ -225,7 +225,7 @@ async function startRunning(h: Harness, title: string, kind: "execute" | "inplac
 
 function assertUserFeedback(entry: Sent | undefined, expect: { taskId: string; executionId: string; kind: string; mode: string }): string {
   assert.ok(entry, "a feedback note was queued");
-  assert.deepEqual(entry.options, { triggerTurn: false }, "feedback never triggers a turn");
+  assert.deepEqual(entry.options, { deliverAs: "steer", triggerTurn: true }, "feedback steers and triggers a turn when the session is idle");
   assert.equal(entry.message.display, true);
   const text = entry.message.content;
   assert.ok(text.includes(INTENT), "carries both exact phrases in the qualified intent line");

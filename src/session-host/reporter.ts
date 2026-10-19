@@ -61,6 +61,10 @@ import {
   primeSessionHostStartupMetadata,
 } from "./startup-request";
 import {
+  stageSessionHostPayload,
+  type StagedSessionHostPayload,
+} from "./payload";
+import {
   HOST_BOOTSTRAP_ENV,
   ACTIVITY_CENSUS_CAPABILITY,
   MAX_NATIVE_SESSION_NAME_LENGTH,
@@ -196,6 +200,34 @@ function subscribeSessionHostRestore(listener: () => void): () => void {
 }
 
 const EXIT_HANDLER_FLAG = Symbol.for("pi-review-gate.session-host.exit-handler");
+const SPAWN_PAYLOAD_OWNERSHIP_KEY = Symbol.for("pi-review-gate.session-host.spawn-payload-ownership.v1");
+
+/**
+ * Process-global ownership of staged prompts whose send outcome is still
+ * unknown. The broker may or may not have received the descriptor, so these
+ * handles survive reconnect and /reload and are discarded only on terminal
+ * reporter shutdown or process exit — never as a retry or early deletion.
+ */
+function outstandingSpawnPayloads(): Map<string, () => void> {
+  const scope = globalThis as Record<PropertyKey, unknown>;
+  const existing = scope[SPAWN_PAYLOAD_OWNERSHIP_KEY];
+  if (existing instanceof Map) return existing as Map<string, () => void>;
+  const owned = new Map<string, () => void>();
+  scope[SPAWN_PAYLOAD_OWNERSHIP_KEY] = owned;
+  return owned;
+}
+
+function discardOutstandingSpawnPayloads(): void {
+  const owned = outstandingSpawnPayloads();
+  for (const discard of owned.values()) {
+    try {
+      discard();
+    } catch {
+      // Identity checks preserve replaced/unknown entries fail closed.
+    }
+  }
+  owned.clear();
+}
 
 const DEFAULT_RECONNECT_DELAY_MS = 1_000;
 const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
@@ -363,7 +395,14 @@ function nativeSessionMatches(
     && current.epoch === expectedSessionEpoch;
 }
 
-export const __test = Object.freeze({ nativeSessionMatches, readNativeSession, MAX_QUEUED_RENAME_ACKS });
+export const __test = Object.freeze({
+  nativeSessionMatches,
+  readNativeSession,
+  MAX_QUEUED_RENAME_ACKS,
+  clearOutstandingSpawnPayloads(): void {
+    outstandingSpawnPayloads().clear();
+  },
+});
 
 function readStickyState(): StickyState | undefined {
   const raw = (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_STICKY_STATE_KEY];
@@ -460,7 +499,8 @@ export function primeReporterBootstrap(): SessionHostBootstrap | undefined {
     && (sticky.bootstrap.instanceId !== explicit.instanceId
       || sticky.bootstrap.generation !== explicit.generation
       || sticky.bootstrap.token !== explicit.token
-      || sticky.bootstrap.socketPath !== explicit.socketPath)) {
+      || sticky.bootstrap.socketPath !== explicit.socketPath
+      || sticky.bootstrap.payloadDir !== explicit.payloadDir)) {
     // The known sticky instance stays authoritative: a reappearing env with
     // any changed identity field is consumed and ignored, never attached.
     return undefined;
@@ -490,7 +530,11 @@ export async function activate(pi: unknown, options: SessionHostReporterOptions 
   // The companion is a top-level CLI-child surface; executor runtimes
   // (orchestrated workers) never report session status.
   const isExecutor = process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor";
-  primeSessionHostStartupMetadata(!isExecutor && (primedBootstrap !== undefined || readStickyState() !== undefined));
+  const stickyAtPrime = readStickyState();
+  primeSessionHostStartupMetadata(
+    !isExecutor && (primedBootstrap !== undefined || stickyAtPrime !== undefined),
+    (primedBootstrap ?? stickyAtPrime?.bootstrap)?.payloadDir,
+  );
   if (isExecutor) return;
 
   const sticky = readStickyState();
@@ -513,7 +557,7 @@ export async function activate(pi: unknown, options: SessionHostReporterOptions 
     shutdownRequested: reporter.shutdownRequested,
     teardown: reporter.teardown,
   });
-  publishSessionHostSpawnCapability(reporter.spawnCapability);
+  if (reporter.spawnCapability) publishSessionHostSpawnCapability(reporter.spawnCapability);
 }
 
 export default activate;
@@ -538,6 +582,8 @@ function installExitCleanup(): void {
       readStickyState()?.teardown?.();
     } catch {
       // Best-effort cleanup at process exit.
+    } finally {
+      discardOutstandingSpawnPayloads();
     }
   });
 }
@@ -550,7 +596,8 @@ interface ReporterHandle {
   nativePersistence?: NativePersistenceReceipt;
   teardown: () => void;
   shutdownRequested: boolean;
-  spawnCapability: SessionHostSpawnCapability;
+  /** Absent when the bootstrap advertised no private payload namespace. */
+  spawnCapability?: SessionHostSpawnCapability;
 }
 
 interface PendingSpawnCall {
@@ -558,6 +605,8 @@ interface PendingSpawnCall {
   readonly generation: number;
   readonly resolve: (outcome: SessionSpawnOutcome) => void;
   readonly timer: NodeJS.Timeout;
+  /** Identity-checked ownership of the staged prompt until the host consumes it. */
+  readonly discard: () => void;
   readonly signal?: AbortSignal;
   readonly abortListener?: () => void;
 }
@@ -875,6 +924,14 @@ function createReporter(
     if (pending.signal && pending.abortListener) {
       pending.signal.removeEventListener("abort", pending.abortListener);
     }
+    // A definite acknowledgement settles payload transfer: failed/started
+    // removes the ownership handle (a started host already consumed the file).
+    // Unknown sends retain inode-checked ownership through reconnect/reload
+    // until terminal shutdown or process exit.
+    if (outcome !== "unknown") {
+      pending.discard();
+      outstandingSpawnPayloads().delete(requestId);
+    }
     rememberSpawnRequestId(requestId);
     try {
       pending.resolve(outcome);
@@ -901,6 +958,12 @@ function createReporter(
       return Promise.resolve("failed"); // Definitely not sent: no child was requested.
     }
     if (pendingSpawnCalls.size >= MAX_CONCURRENT_SPAWN_REQUESTS) return Promise.resolve("failed");
+    const payloadDir = bootstrap.payloadDir;
+    if (typeof payloadDir !== "string" || payloadDir.length === 0) {
+      // No host-owned payload namespace: withhold long-prompt delivery rather
+      // than falling back to an inline (bounded) prompt frame.
+      return Promise.resolve("failed");
+    }
 
     let fields: { workspace: unknown; title: unknown; prompt: unknown };
     try {
@@ -908,6 +971,17 @@ function createReporter(
       fields = { workspace: raw.workspace, title: raw.title, prompt: raw.prompt };
     } catch {
       return Promise.resolve("failed");
+    }
+    if (typeof fields.prompt !== "string" || fields.prompt.length === 0 || fields.prompt.includes("\0")) {
+      return Promise.resolve("failed");
+    }
+    let staged: StagedSessionHostPayload;
+    try {
+      // JSON preserves the exact JavaScript text (including lone surrogates)
+      // that a raw UTF-8 encoding would replace.
+      staged = stageSessionHostPayload(payloadDir, JSON.stringify(fields.prompt));
+    } catch {
+      return Promise.resolve("failed"); // Nothing reached the wire.
     }
     const requestId = randomUUID();
     const requestCandidate: unknown = {
@@ -917,15 +991,21 @@ function createReporter(
       generation: bootstrap.generation,
       token: bootstrap.token,
       requestId,
-      ...fields,
+      workspace: fields.workspace,
+      title: fields.title,
+      payload: staged.descriptor,
     };
     const validated = parseSpawnRequest(requestCandidate);
-    if (!validated) return Promise.resolve("failed");
+    if (!validated) {
+      staged.discard(); // Definitely not sent.
+      return Promise.resolve("failed");
+    }
     let frame: string;
     try {
       frame = encodeFrame(validated);
     } catch {
-      return Promise.resolve("failed"); // Transport bounds reject before sending.
+      staged.discard(); // Transport bounds reject before sending.
+      return Promise.resolve("failed");
     }
 
     const candidate = socket;
@@ -943,22 +1023,33 @@ function createReporter(
         generation,
         resolve,
         timer,
+        discard: staged.discard,
         ...(signal ? { signal } : {}),
         ...(abortListener ? { abortListener } : {}),
       };
       pendingSpawnCalls.set(requestId, pending);
+      outstandingSpawnPayloads().set(requestId, staged.discard);
       if (signal && abortListener) signal.addEventListener("abort", abortListener, { once: true });
       if (signal?.aborted) {
         settleSpawnCall(requestId, pending, "failed"); // Still before the synchronous write.
         return;
       }
       if (!active || shutdownRequested || generation !== sessionGeneration || candidate !== socket || candidate.destroyed) {
+        // Still before the write: the broker cannot have seen it.
         settleSpawnCall(requestId, pending, "failed");
         return;
       }
-      // Once socket.write is attempted, cancellation/disconnect is unknown:
-      // the host may already be creating the child. Requests are never replayed.
-      if (!tryWriteFrame(frame)) settleSpawnCall(requestId, pending, "unknown");
+      // Once socket.write is accepted, cancellation/disconnect is unknown:
+      // the host may already be reading or have created the child. Requests are
+      // never replayed. The broker owns successful payload consumption; an
+      // unread staged file stays until that host-owned namespace is released.
+      // A synchronous write refusal accepted nothing, so its still-owned file
+      // is discarded while the launch outcome stays conservatively unknown.
+      if (!tryWriteFrame(frame)) {
+        staged.discard();
+        outstandingSpawnPayloads().delete(requestId);
+        settleSpawnCall(requestId, pending, "unknown");
+      }
     });
   };
 
@@ -2182,12 +2273,14 @@ function createReporter(
     lastSnapshot = undefined;
   };
 
-  const spawnCapability: SessionHostSpawnCapability = Object.freeze({
-    spawn: requestSessionSpawn,
-    // 0 is deliberately invalid: without a host-issued visible-layout budget
-    // the model-visible tool must not invent a constant width recommendation.
-    titleColumns: titleColumns ?? 0,
-  });
+  const spawnCapability: SessionHostSpawnCapability | undefined = bootstrap.payloadDir === undefined
+    ? undefined
+    : Object.freeze({
+      spawn: requestSessionSpawn,
+      // 0 is deliberately invalid: without a host-issued visible-layout budget
+      // the model-visible tool must not invent a constant width recommendation.
+      titleColumns: titleColumns ?? 0,
+    });
 
   const teardown = (): void => {
     try {
@@ -2196,7 +2289,7 @@ function createReporter(
       // Best-effort reader detach; the registry contains listener failures.
     }
     deactivate();
-    revokeSessionHostSpawnCapability(spawnCapability);
+    if (spawnCapability) revokeSessionHostSpawnCapability(spawnCapability);
   };
 
   // ------------------------------------------------------------------
@@ -2249,6 +2342,8 @@ function createReporter(
 
   registerHook(pi, "session_shutdown", safe(() => {
     deactivate();
+    // Terminal shutdown: no later reader can consume an uncertain payload.
+    discardOutstandingSpawnPayloads();
   }));
 
   // Public Pi notification emitted by native /name and setSessionName.

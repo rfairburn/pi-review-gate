@@ -7,9 +7,9 @@
  *   transitions passive while completion, failure, conflict, and
  *   recovery-required events stay actionable in both modes; noisy mode
  *   additionally wakes for the interactive transitions;
- * - delivery lanes and trigger-turn behavior (completion is a follow-up,
- *   failures and state wakes are immediate, and no event is a passive
- *   next-turn insert);
+ * - delivery lanes and trigger-turn behavior (#452: every eligible lane steers
+ *   at the next supported boundary and triggers a turn, and no event is a
+ *   passive next-turn insert);
  * - the model-facing lifecycle contract prose shared by tool guidance and
  *   start/add result summaries, derived from the same state tables as the
  *   wake policy so the prose cannot drift from behavior;
@@ -107,16 +107,14 @@ export function notificationLane(kind: SubtaskWakeKind): SubtaskNotificationLane
   return kind === "completion" ? "soon" : "now";
 }
 
-/** Delivery shape for a lane. State and failure wakes steer now; completions follow up. */
-export function deliveryForLane(lane: SubtaskNotificationLane): SubtaskWakeDelivery {
-  return lane === "now"
-    ? { deliverAs: "steer", triggerTurn: true }
-    : { deliverAs: "followUp", triggerTurn: true };
+/** Delivery shape for a lane (#452): every eligible lane steers. */
+export function deliveryForLane(_lane: SubtaskNotificationLane): SubtaskWakeDelivery {
+  return { deliverAs: "steer", triggerTurn: true };
 }
 
 /**
- * One-shot watch checkpoints are deliberate follow-ups: they trigger a turn
- * but never steer, exactly like a completion lane delivery.
+ * One-shot watch checkpoints ride that same steering lane: they trigger a turn
+ * exactly like a completion delivery.
  */
 export function watchCheckpointDelivery(): SubtaskWakeDelivery {
   return deliveryForLane("soon");

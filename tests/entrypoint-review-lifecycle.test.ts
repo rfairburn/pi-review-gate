@@ -306,7 +306,9 @@ review: { activeReviewers: [
     assert.match(followUps[0]?.message ?? "", /Review found blocking issues/);
     assert.match(followUps[0]?.message ?? "", /missing guard/);
     assert.equal(followUps[1]?.message, "also keep the API name stable");
-    assert.deepEqual(followUps.map((item) => item.options), [{ deliverAs: "followUp" }, { deliverAs: "followUp" }]);
+    // The review notification steered; the held user input keeps its
+    // follow-up release.
+    assert.deepEqual(followUps.map((item) => item.options), [{ deliverAs: "steer" }, { deliverAs: "followUp" }]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

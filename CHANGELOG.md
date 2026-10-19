@@ -62,6 +62,40 @@ dates.
   before startup continues. Provisioning failures still stop startup, and dependency
   pins, installation flags, and cache locations are unchanged.
 
+## [0.1.0-dev.182]
+
+### Fixed
+
+- Eligible background-shell, subtask, and review notifications now steer at Pi's next
+  supported boundary instead of waiting for the current turn's natural stop (#452).
+  Routine match, milestone, and stall wakes, subtask completion notices, launch
+  notices, review transmissions, and background-completion resumes reach the
+  still-running turn while a foreground command keeps running normally, and an idle
+  session still resumes through the same triggered delivery. Stored delivery records,
+  delivery ids, receipt keys, and message bytes are unchanged. Exit notices retain
+  their bounded recovery after an abort: transcript insertion alone does not
+  acknowledge delivery before a normal model response consumes the notice. Genuine
+  user input held during a review keeps its follow-up release, scheduler new-work admission is
+  unchanged, and an unrecognized persisted delivery kind is preserved with a
+  diagnostic instead of being sent or acknowledged. The busy-only routine-wake hold
+  (with its settlement-time coalescing) is
+  removed along with the pre-send deferral; duplicate suppression still comes from the
+  existing wake interval and exit coalescing. Background wake freshness remains a
+  separate, unresolved concern.
+
+## [0.1.0-dev.181]
+
+### Fixed
+
+- `SessionSpawn` no longer rejects thorough initial handoffs at a fixed 8,192-character
+  ceiling (#447). Exact prompt text is transferred automatically through owned private
+  temporary payloads, avoiding both bounded control-frame and native startup-environment
+  limits without requiring manual shortening or file loading. Payload validation refuses
+  missing, altered, or unsafe data instead of silently delivering partial context.
+  There is no new prompt-length setting; empty/NUL rejection, title/workspace bounds,
+  authorization, independent background launches, and launch-only success semantics
+  remain unchanged. Uncertain launches are never automatically retried.
+
 ## [0.1.0-dev.180]
 
 ### Fixed

@@ -24,7 +24,7 @@ import { reviewCancellationMessage, type ActiveReviewCancellation, type ReviewCa
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
 import { createReviewTransmissionMessage, deliverReviewTransmission, type ReviewTransmissionAction } from "./transmission";
-import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
+import { dispatchModelDelivery, isNotificationDeliveryKind, queueModelDelivery } from "./durable-delivery";
 import { editNativeTextField, type NativeTextFieldUi } from "./native-text-field";
 import { routeForegroundEscape } from "./foreground-escape";
 
@@ -585,6 +585,16 @@ async function deliverDurableCommandMessage(
   const delivery = queueModelDelivery(input.state, pending);
   await input.onStateChanged?.();
   if (!isSessionActive()) return;
+  // #452: command and review notifications steer at Pi's next supported
+  // boundary instead of waiting for the natural stop. `channel` remains the
+  // durable identity axis (modelDeliveryId) and is never rewritten; only
+  // genuine review-held user input takes the follow-up lane. An unrecognized
+  // kind is never sent (fail closed) even if a caller reuses a restored record.
+  const send = () => {
+    if (delivery.kind === "queued_user_input") return sendFollowUp(input.pi, delivery.message);
+    if (isNotificationDeliveryKind(delivery.kind)) return sendSteeringPrompt(input.pi, delivery.message);
+    throw new Error(`review gate: delivery ${delivery.deliveryId} has an unrecognized kind and was not sent`);
+  };
   await dispatchModelDelivery({
     delivery,
     persist: () => input.onStateChanged?.(),
@@ -594,13 +604,9 @@ async function deliverDurableCommandMessage(
           action: delivery.action,
           message: delivery.message,
           idempotencyKey: delivery.deliveryId,
-          deliver: () => delivery.channel === "steer"
-            ? sendSteeringPrompt(input.pi, delivery.message)
-            : sendFollowUp(input.pi, delivery.message),
+          deliver: send,
         })
-      : delivery.channel === "steer"
-        ? sendSteeringPrompt(input.pi, delivery.message)
-        : sendFollowUp(input.pi, delivery.message),
+      : send(),
   });
 }
 

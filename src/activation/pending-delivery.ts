@@ -1,4 +1,4 @@
-import { dispatchModelDelivery, queueModelDelivery } from "../durable-delivery";
+import { dispatchModelDelivery, isNotificationDeliveryKind, queueModelDelivery } from "../durable-delivery";
 import { sendFollowUp, sendNotice, sendSteeringPrompt } from "../pi";
 import { type ReviewRunOutput } from "../review";
 import { deliverReviewTransmission, hasReviewDeliveryReceipt, type ReviewTransmissionAction } from "../transmission";
@@ -45,7 +45,10 @@ export async function deliverAutomaticTransmission(
         action,
         message,
         idempotencyKey: delivery.deliveryId,
-        deliver: () => isSessionActive() ? sendFollowUp(pi, message) : Promise.resolve(false),
+        // #452: the automatic review transmission steers at Pi's next supported
+        // boundary. The stored `channel` stays "follow_up" as the durable
+        // identity axis (modelDeliveryId/receipt key) and is never rewritten.
+        deliver: () => isSessionActive() ? sendSteeringPrompt(pi, message) : Promise.resolve(false),
       }),
     });
   } catch (error) {
@@ -70,6 +73,15 @@ export async function recoverPendingModelDeliveries(input: {
   for (const delivery of input.state.pendingModelDeliveries) {
     if (delivery.status === "delivered" || delivery.status === "cancelled") continue;
     if (delivery.kind === "queued_user_input") continue;
+    // Fail closed: only a recognized notification kind may be dispatched. A
+    // restored record is member-unvalidated, so an unknown kind is preserved
+    // (status and identity untouched) and diagnosed instead of being injected.
+    if (!isNotificationDeliveryKind(delivery.kind)) {
+      delivery.diagnostic ??= "The persisted delivery kind is unrecognized; it was not sent automatically.";
+      await input.persist();
+      await input.notify(`review gate: pending delivery ${delivery.deliveryId} has an unrecognized kind and was not sent automatically; inspect ${delivery.invocationDir ?? "the resumed session"}`);
+      continue;
+    }
     if (delivery.invocationDir && await hasReviewDeliveryReceipt(delivery.invocationDir, delivery.deliveryId)) {
       delivery.status = "delivered";
       delivery.deliveredAt ??= new Date().toISOString();
@@ -85,6 +97,11 @@ export async function recoverPendingModelDeliveries(input: {
       continue;
     }
     if (!input.isSessionActive()) return;
+    // #452: a recovered recognized notification steers at Pi's next supported
+    // boundary; its recorded `channel` and delivery id are preserved exactly
+    // as stored. The allowlist above already rejected unknown kinds, and
+    // genuine review-held user input is skipped and released separately.
+    const sendPending = () => sendSteeringPrompt(input.pi, delivery.message);
     try {
       await dispatchModelDelivery({
         delivery,
@@ -95,13 +112,9 @@ export async function recoverPendingModelDeliveries(input: {
               action: delivery.action,
               message: delivery.message,
               idempotencyKey: delivery.deliveryId,
-              deliver: () => delivery.channel === "steer"
-                ? sendSteeringPrompt(input.pi, delivery.message)
-                : sendFollowUp(input.pi, delivery.message),
+              deliver: sendPending,
             })
-          : delivery.channel === "steer"
-            ? sendSteeringPrompt(input.pi, delivery.message)
-            : sendFollowUp(input.pi, delivery.message),
+          : sendPending(),
       });
     } catch (error) {
       await input.notify(`review gate: pending delivery ${delivery.deliveryId} could not be recovered: ${error instanceof Error ? error.message : String(error)}`);

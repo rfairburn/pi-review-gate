@@ -47,9 +47,12 @@ describe("SessionSpawn tool registration and contract", () => {
     assert.equal(tool.executionMode, "sequential");
     assert.deepEqual(sessionSpawnToolSchema(32).required, ["workspace", "title", "prompt"]);
     assert.equal(sessionSpawnToolSchema(32).additionalProperties, false);
-    const parameters = tool.parameters as { properties: Record<string, { description: string }> };
+    const parameters = tool.parameters as { properties: Record<string, { description: string; maxLength?: number }> };
     assert.match(parameters.properties.title!.description, /32 terminal columns.*optimal\/soft target, not a maximum/);
     assert.match(parameters.properties.title!.description, /Pi 1\.1\.0 trims it.*No host-side width-based clipping or shortening/);
+    assert.equal(parameters.properties.prompt!.maxLength, undefined, "the advertised prompt schema has no fixed length ceiling");
+    assert.equal(parameters.properties.workspace!.maxLength !== undefined, true, "workspace keeps its independent transport bound");
+    assert.equal(parameters.properties.title!.maxLength !== undefined, true, "title keeps its independent transport bound");
 
     const input = {
       workspace: "/existing workspace",
@@ -69,7 +72,7 @@ describe("SessionSpawn tool registration and contract", () => {
     assert.equal(getSessionHostSpawnCapability(), undefined);
   });
 
-  it("rejects extra, empty, unsafe, and over-bound model arguments without invoking a host", () => {
+  it("rejects extra, empty, unsafe, and over-bound workspace/title arguments without invoking a host", () => {
     const valid = { workspace: "/existing", title: "Title", prompt: "Start." };
     assert.deepEqual(parseSessionSpawnInput(valid), valid);
     assert.throws(() => parseSessionSpawnInput({ ...valid, other: "field" }), /exactly workspace, title, and prompt/);
@@ -79,6 +82,25 @@ describe("SessionSpawn tool registration and contract", () => {
     assert.throws(() => parseSessionSpawnInput({ ...valid, title: "bad\ntitle" }), /title/);
     assert.throws(() => parseSessionSpawnInput({ ...valid, prompt: "" }), /prompt/);
     assert.throws(() => parseSessionSpawnInput({ ...valid, prompt: "bad\0prompt" }), /prompt/);
+  });
+
+  it("accepts and preserves an exact prompt far beyond the former 8 KiB ceiling", () => {
+    const structured = [
+      "BEGIN exact long prompt",
+      "ASCII line with quotes \"double\" and 'single'.",
+      "Multibyte: 日本語 — café — 🚀",
+      "Flag-looking: --session /tmp/not-a-session @literal.md /prompt-template literal",
+      "MIDDLE".repeat(1_500),
+      "Surrogate pair kept exactly: \u{1F642}",
+      "Trailing newline remains data.\n",
+      "END exact long prompt",
+    ].join("\n");
+    assert.ok(Buffer.byteLength(structured, "utf8") > 8192);
+    assert.deepEqual(parseSessionSpawnInput({ workspace: "/existing", title: "Long exact prompt", prompt: structured }), {
+      workspace: "/existing",
+      title: "Long exact prompt",
+      prompt: structured,
+    });
   });
 
   it("a replaced reporter capability cannot be revoked by a stale incarnation", () => {

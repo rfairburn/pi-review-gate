@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync as readBytesSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync as readBytesSync, realpathSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import test from "node:test";
 
@@ -37,6 +37,7 @@ import {
 } from "../src/session-host/saved-sessions";
 import { SESSION_HOST_BOOTSTRAP_ENV, composeFreshSessionSpawnArgs, prepareNativeLaunch } from "../src/session-host/launch";
 import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "../src/session-host/startup-request";
+import { readSessionHostPayloadSync } from "../src/session-host/payload";
 import { TerminalSurface } from "../src/session-host/terminal-surface";
 import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "../src/session-host/kitty-graphics";
 import type {
@@ -400,9 +401,22 @@ class FakeRegistrar implements StatusRegistrar {
   renameHandler?: (entry: RegistrarEntry, request: StatusRenameRequest) => Promise<StatusRenameResult>;
   shutdownHandler?: (entry: RegistrarEntry, options?: { readonly requireIdle?: boolean }) => Promise<StatusShutdownResult>;
   nextToken?: string;
+  readonly #payloadRoot?: string;
+
+  constructor(payloadRoot?: string) {
+    this.#payloadRoot = payloadRoot;
+  }
 
   register(instanceId: string, handlers: RegistrarEntry["handlers"]): InstanceStatusRegistration {
     this.order.push(`register ${instanceId}`);
+    let payloadDir: string | undefined;
+    let payloadIdentity: { dev: number; ino: number } | undefined;
+    if (this.#payloadRoot !== undefined) {
+      payloadDir = mkdtempSync(join(realpathSync(this.#payloadRoot), "pl-"));
+      chmodSync(payloadDir, 0o700);
+      const stats = lstatSync(payloadDir);
+      payloadIdentity = { dev: stats.dev, ino: stats.ino };
+    }
     const entry: RegistrarEntry = {
       instanceId,
       handlers,
@@ -414,6 +428,7 @@ class FakeRegistrar implements StatusRegistrar {
         token: this.nextToken ?? `tok-${randomUUID()}`,
         instanceId,
         generation: randomUUID(),
+        ...(payloadDir === undefined ? {} : { payloadDir }),
       },
     };
     this.nextToken = undefined;
@@ -422,6 +437,17 @@ class FakeRegistrar implements StatusRegistrar {
       bootstrap: entry.bootstrap,
       release: () => {
         entry.released = true;
+        // The fake broker removes only its own unchanged, empty namespace.
+        if (payloadDir !== undefined && payloadIdentity !== undefined) {
+          try {
+            const stats = lstatSync(payloadDir);
+            if (stats.isDirectory() && stats.dev === payloadIdentity.dev && stats.ino === payloadIdentity.ino) {
+              rmdirSync(payloadDir);
+            }
+          } catch {
+            // Non-empty/unknown fixtures stay preserved, exactly like the broker.
+          }
+        }
       },
     };
     if (this.renameHandler) {
@@ -490,7 +516,10 @@ function makeHarness(label: string, options: HarnessOptions = {}): Harness {
   const workspace2 = join(root, "workspace-beta");
   mkdirSync(workspace, { recursive: true });
   mkdirSync(workspace2, { recursive: true });
-  const registrar = new FakeRegistrar();
+  const payloadRoot = join(root, "payloads");
+  mkdirSync(payloadRoot, { recursive: true, mode: 0o700 });
+  chmodSync(payloadRoot, 0o700);
+  const registrar = new FakeRegistrar(payloadRoot);
   registrar.shutdownHandler = options.shutdownHandler;
   const spawned: FakePty[] = [];
   const profileRegistry = new ProfileRegistry({ stateRoot });
@@ -831,7 +860,17 @@ test("fresh SessionSpawn launch removes inherited messages and stores exact star
     assert.equal(JSON.parse(ordinary.env[SESSION_HOST_BOOTSTRAP_ENV] as string).instanceId, ordinaryId);
 
     const title = " Exact child title ";
-    const prompt = "@/literal-not-a-file\n--session /tmp/not-a-session-option\n/prompt-template literal\n";
+    const prompt = [
+      "BEGIN startup long prompt",
+      "@/literal-not-a-file",
+      "--session /tmp/not-a-session-option",
+      "/prompt-template literal",
+      "Multibyte 日本語 — quotes \"exact\" — lone surrogate \uD800.",
+      "MIDDLE".repeat(2_000),
+      "END startup long prompt",
+      "",
+    ].join("\n");
+    assert.ok(Buffer.byteLength(prompt, "utf8") > 8192);
     const childId = await manager.create({
       workspace: harness.workspace2,
       initialRequest: { title, prompt },
@@ -842,11 +881,88 @@ test("fresh SessionSpawn launch removes inherited messages and stores exact star
     assert.deepEqual(child.args.slice(-composed.length), composed,
       "only inherited native settings survive, with the per-child name appended in option position");
     assert.equal(child.args.includes(prompt), false, "the prompt is not sent through CLI positional/@file parsing");
-    assert.deepEqual(JSON.parse(child.env[SESSION_HOST_STARTUP_REQUEST_ENV] as string), { title, prompt },
-      "the exact title and initial prompt travel only in the one-shot startup handoff");
+    const startupReference = JSON.parse(child.env[SESSION_HOST_STARTUP_REQUEST_ENV] as string) as {
+      name: string; size: number; sha256: string;
+    };
+    assert.match(startupReference.name, /^p-[0-9a-f]{32}\.json$/,
+      "the one-shot env carries only a strict private payload reference");
+    assert.equal(Object.hasOwn(startupReference, "prompt"), false);
+    assert.equal(Object.hasOwn(startupReference, "title"), false);
+    const payloadDir = harness.registrar.entryFor(childId).bootstrap.payloadDir;
+    assert.equal(typeof payloadDir, "string");
+    const startupText = readSessionHostPayloadSync(payloadDir as string, startupReference);
+    assert.deepEqual(JSON.parse(startupText), { title, prompt },
+      "the exact title and initial prompt round-trip from the private namespace");
     assert.equal(child.env[SESSION_HOST_TITLE_COLUMNS_ENV], "47");
     assert.equal(JSON.parse(child.env[SESSION_HOST_BOOTSTRAP_ENV] as string).instanceId, childId);
     assert.deepEqual(managerEnv, originalEnv, "per-child startup metadata never mutates the caller environment");
+    await manager.dispose();
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("an initial request without a host payload namespace fails before any child exists", async () => {
+  const harness = makeHarness("spawn-payload-required");
+  try {
+    const registrar = new FakeRegistrar(); // Explicitly no payload namespace.
+    const manager = new InstanceManager({
+      packageRoot: harness.packageRoot,
+      piExecutable: harness.piExecutable,
+      statusRegistrar: registrar,
+      nativeSetup: false,
+      profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
+      args: [],
+      env: cleanTestEnv(),
+      ptyFactory: harness.ptyFactory,
+    });
+    const id = await manager.create({
+      workspace: harness.workspace,
+      initialRequest: { title: "Child", prompt: "Exact prompt without an inline fallback." },
+    });
+    assert.equal(viewFor(manager, id).lifecycle, "error");
+    assert.equal(harness.spawned.length, 0, "no child is spawned and no inline prompt fallback exists");
+    assert.equal(registrar.entries.length, 1, "the registration existed only for the refused launch");
+    assert.equal(registrar.entries[0]!.released, true, "the refused registration is released");
+    await manager.dispose();
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("child exit before startup consumption discards the owned startup payload", async () => {
+  const harness = makeHarness("startup-payload-exit");
+  try {
+    const manager = new InstanceManager({
+      packageRoot: harness.packageRoot,
+      piExecutable: harness.piExecutable,
+      statusRegistrar: harness.registrar,
+      nativeSetup: false,
+      profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
+      args: [],
+      env: cleanTestEnv(),
+      ptyFactory: harness.ptyFactory,
+    });
+    const prompt = "BEGIN unconsumed startup prompt\n" + "x".repeat(9_000) + "\nEND unconsumed startup prompt";
+    const id = await manager.create({
+      workspace: harness.workspace,
+      initialRequest: { title: "Exiting child", prompt },
+    });
+    const child = harness.spawned[0]!;
+    const descriptor = JSON.parse(child.spawnDescriptor.env[SESSION_HOST_STARTUP_REQUEST_ENV] as string) as {
+      name: string; size: number; sha256: string;
+    };
+    const payloadDir = harness.registrar.entryFor(id).bootstrap.payloadDir as string;
+    const payloadPath = join(payloadDir, descriptor.name);
+    assert.ok(lstatSync(payloadPath).isFile(), "the exact startup payload exists before the child settles");
+    assert.deepEqual(JSON.parse(readBytesSync(payloadPath, "utf8")), { title: "Exiting child", prompt });
+
+    child.emitExit(0);
+    await until(() => viewFor(manager, id).lifecycle === "exited", "child exit before startup consumption");
+    assert.equal(lstatSync(payloadPath, { throwIfNoEntry: false }), undefined,
+      "the manager discards its exact unconsumed payload at confirmed child settlement");
+    assert.equal(lstatSync(payloadDir, { throwIfNoEntry: false }), undefined,
+      "the now-empty private namespace is released");
     await manager.dispose();
   } finally {
     cleanup(harness);

@@ -505,7 +505,8 @@ export function evaluateSilence(
 export function laneDelivery(lane: Lane): { deliverAs: string; triggerTurn?: boolean } {
   switch (lane) {
     case "now": return { deliverAs: "steer", triggerTurn: true };
-    case "soon": return { deliverAs: "followUp", triggerTurn: true };
+    // #452: the routine triggered lane steers at the next supported boundary.
+    case "soon": return { deliverAs: "steer", triggerTurn: true };
     case "idle": return { deliverAs: "nextTurn" };
   }
 }

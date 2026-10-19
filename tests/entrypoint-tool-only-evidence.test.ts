@@ -89,7 +89,8 @@ async function fixture(evidence: Record<string, boolean> = {}, primaryEnabled = 
     const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
     rt.pi.registerCommand = (name, options) => { commands.set(name, options.handler); };
     const warnings: string[] = [];
-    Object.assign(rt.pi, { sendMessage(message: { content: string }) { warnings.push(message.content); } });
+    const warningDeliveries: unknown[] = [];
+    Object.assign(rt.pi, { sendMessage(message: { content: string }, delivery: unknown) { warnings.push(message.content); warningDeliveries.push(delivery); } });
     await setupProbe?.("beforeActivation", { root, rt });
     activationStarted = true;
     await activate(rt.pi);
@@ -124,7 +125,7 @@ async function fixture(evidence: Record<string, boolean> = {}, primaryEnabled = 
       } });
       assert.equal(i, steps.length);
     };
-    return { root, cwd, configPath, calls, prompt, rt, commands, warnings, restored, start, writeScript, end, settings, dispose };
+    return { root, cwd, configPath, calls, prompt, rt, commands, warnings, warningDeliveries, restored, start, writeScript, end, settings, dispose };
   } catch (setupError) {
     try { await dispose(); }
     catch (cleanupError) {
@@ -303,6 +304,7 @@ test("real settings apply warns Tools + workspace changes → Tools only reset; 
     assert.equal(reset.baseline?.kind, "tool");
     assert.equal(reset.evidence.events.length, 0);
     assert.equal(f.warnings.length, 1);
+    assert.deepEqual(f.warningDeliveries.at(-1), { deliverAs: "steer", triggerTurn: true }, "the model-visible evidence warning steers and triggers a turn");
     assert.match(f.warnings[0]!, /Primary evidence method changed: Tools \+ workspace changes → Tools only\./);
     assert.match(f.warnings[0]!, /outstanding reviewer findings, correction requirements and pending deliveries remain in force/);
     assert.doesNotMatch(f.warnings[0]!, /Off|On|enabled|disabled/);

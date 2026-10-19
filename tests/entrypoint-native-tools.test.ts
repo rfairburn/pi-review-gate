@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
@@ -19,6 +19,7 @@ import { getSessionHostSpawnCapability, SESSION_HOST_SPAWN_CAPABILITY_KEY, publi
 import {
   primeSessionHostStartupMetadata,
   SESSION_HOST_STARTUP_REQUEST_ENV,
+  stageSessionHostStartupRequest,
   __test as startupRequestTest,
 } from "../src/session-host/startup-request";
 
@@ -381,7 +382,7 @@ test("SessionSpawn is reporter-capability-gated for top-level hosted children an
   }
 });
 
-test("the initial hosted request waits for review initialization and is persisted before dispatch", async () => {
+test("the initial hosted request waits for review initialization and is recorded after dispatch", async () => {
   // The raw checkpoint store lives under the agent-data directory, so the
   // workspace and agent-data must be siblings: an agent-data inside the
   // capture workspace is a refused non-Git overlap configuration.
@@ -394,9 +395,22 @@ test("the initial hosted request waits for review initialization and is persiste
     await writeConfig(cwd);
     process.env.PI_CODING_AGENT_DIR = agentDir;
     const title = "-- exact initial title --";
-    const prompt = "  @literal-request.md\n--offline is prompt text, not a Pi option.\n  ";
-    process.env[SESSION_HOST_STARTUP_REQUEST_ENV] = JSON.stringify({ title, prompt });
-    primeSessionHostStartupMetadata(true);
+    const prompt = [
+      "  BEGIN startup-gate long prompt",
+      "@literal-request.md",
+      "--offline is prompt text, not a Pi option.",
+      "Multibyte 日本語 — quotes \"exact\" — \u{1F642}.",
+      "MIDDLE".repeat(1_500),
+      "END startup-gate long prompt  ",
+      "",
+    ].join("\n");
+    assert.ok(Buffer.byteLength(prompt, "utf8") > 8192);
+    const payloadRoot = join(root, "startup-payload");
+    await mkdir(payloadRoot, { mode: 0o700 });
+    await chmod(payloadRoot, 0o700);
+    const staged = stageSessionHostStartupRequest(payloadRoot, { title, prompt });
+    process.env[SESSION_HOST_STARTUP_REQUEST_ENV] = JSON.stringify(staged.descriptor);
+    primeSessionHostStartupMetadata(true, payloadRoot);
 
     const runtime = new NativeToolRuntime(cwd, nativeDefinitions(), ["read"]);
     // The session file (and its persisted state sidecar) stay outside the
@@ -461,6 +475,123 @@ test("the initial hosted request waits for review initialization and is persiste
     };
     assert.equal(armed.state.reviewWindow?.baseline?.kind, "checkpoint",
       "the initialized live-session checkpoint scope arms the actual first turn");
+    await runtime.fire("session_shutdown", runtime.context);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a missing or tampered startup payload is reported truthfully and never dispatched", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-spawn-payload-failure-"));
+  const cwd = join(root, "workspace");
+  const agentDir = join(root, "agent-data");
+  try {
+    await mkdir(cwd);
+    await mkdir(agentDir);
+    await writeConfig(cwd);
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const payloadRoot = join(root, "payloads");
+    await mkdir(payloadRoot, { mode: 0o700 });
+    await chmod(payloadRoot, 0o700);
+    const missing = stageSessionHostStartupRequest(payloadRoot, { title: "Missing payload child", prompt: "Never staged." });
+    await rm(join(payloadRoot, missing.descriptor.name));
+    process.env[SESSION_HOST_STARTUP_REQUEST_ENV] = JSON.stringify(missing.descriptor);
+    primeSessionHostStartupMetadata(true, payloadRoot);
+
+    const runtime = new NativeToolRuntime(cwd, nativeDefinitions(), ["read"]);
+    const notices: string[] = [];
+    (runtime.context.ui as { notify?: (message: string) => void }).notify = (message) => { notices.push(message); };
+    const submitted: string[] = [];
+    runtime.pi.sendUserMessage = (message: string) => { submitted.push(message); };
+    await activate(runtime.pi);
+    await startSession(runtime);
+
+    assert.deepEqual(submitted, [], "a missing verified payload is never replaced with inline content");
+    assert.equal(process.env[SESSION_HOST_STARTUP_REQUEST_ENV], undefined, "the one-shot reference env is consumed");
+    assert.match(notices.join("\n"),
+      /initial prompt payload was unavailable or failed exact verification, so no prompt was sent/);
+    assert.equal(notices.join("\n").includes(payloadRoot), false, "the notice never discloses the private path");
+    assert.equal(notices.join("\n").includes("a".repeat(32)), false, "the notice never discloses the payload reference");
+    await runtime.fire("session_shutdown", runtime.context);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a startup namespace replaced before consumption is rejected without dispatch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-spawn-payload-replaced-"));
+  const cwd = join(root, "workspace");
+  const agentDir = join(root, "agent-data");
+  try {
+    await mkdir(cwd);
+    await mkdir(agentDir);
+    await writeConfig(cwd);
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const payloadRoot = join(root, "payloads");
+    await mkdir(payloadRoot, { mode: 0o700 });
+    await chmod(payloadRoot, 0o700);
+    const title = "Replaced startup namespace child";
+    const prompt = "Exact startup prompt whose namespace is replaced before consumption.";
+    const staged = stageSessionHostStartupRequest(payloadRoot, { title, prompt });
+    const moved = join(root, "payloads-moved");
+    await rename(payloadRoot, moved);
+    await mkdir(payloadRoot, { mode: 0o700 });
+    await chmod(payloadRoot, 0o700);
+    const replacementPath = join(payloadRoot, staged.descriptor.name);
+    await copyFile(join(moved, staged.descriptor.name), replacementPath);
+    await chmod(replacementPath, 0o600);
+    process.env[SESSION_HOST_STARTUP_REQUEST_ENV] = JSON.stringify(staged.descriptor);
+    primeSessionHostStartupMetadata(true, payloadRoot);
+
+    const runtime = new NativeToolRuntime(cwd, nativeDefinitions(), ["read"]);
+    const notices: string[] = [];
+    (runtime.context.ui as { notify?: (message: string) => void }).notify = (message) => { notices.push(message); };
+    const submitted: string[] = [];
+    runtime.pi.sendUserMessage = (message: string) => { submitted.push(message); };
+    await activate(runtime.pi);
+    await startSession(runtime);
+
+    assert.deepEqual(submitted, [], "a replaced startup namespace is never consumed or dispatched");
+    assert.match(notices.join("\n"), /failed exact verification, so no prompt was sent/);
+    assert.equal(notices.join("\n").includes(prompt), false, "the notice never echoes prompt text");
+    assert.ok(await readFile(replacementPath), "the replacement entry is preserved");
+    assert.ok(await readFile(join(moved, staged.descriptor.name)), "the original payload is preserved");
+    await runtime.fire("session_shutdown", runtime.context);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a rejected initial sendUserMessage dispatch is reported as unconfirmed, not successful", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-spawn-dispatch-failure-"));
+  const cwd = join(root, "workspace");
+  const agentDir = join(root, "agent-data");
+  try {
+    await mkdir(cwd);
+    await mkdir(agentDir);
+    await writeConfig(cwd);
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const payloadRoot = join(root, "payloads");
+    await mkdir(payloadRoot, { mode: 0o700 });
+    await chmod(payloadRoot, 0o700);
+    const title = "Dispatch failure child";
+    const prompt = "Exact prompt whose dispatch fails after verified payload delivery.";
+    const staged = stageSessionHostStartupRequest(payloadRoot, { title, prompt });
+    process.env[SESSION_HOST_STARTUP_REQUEST_ENV] = JSON.stringify(staged.descriptor);
+    primeSessionHostStartupMetadata(true, payloadRoot);
+
+    const runtime = new NativeToolRuntime(cwd, nativeDefinitions(), ["read"]);
+    const notices: string[] = [];
+    (runtime.context.ui as { notify?: (message: string) => void }).notify = (message) => { notices.push(message); };
+    const names: string[] = [];
+    runtime.pi.setSessionName = (name: string) => { names.push(name); };
+    runtime.pi.sendUserMessage = async () => { throw new Error("synthetic dispatch rejection"); };
+    await activate(runtime.pi);
+    await startSession(runtime);
+
+    assert.deepEqual(names, [title], "the native title is still applied after exact payload verification");
+    assert.match(notices.join("\n"), /could not be dispatched to Pi; delivery is unconfirmed/);
+    assert.equal(notices.join("\n").includes(prompt), false, "the bounded notice never echoes the prompt");
     await runtime.fire("session_shutdown", runtime.context);
   } finally {
     await rm(root, { recursive: true, force: true });

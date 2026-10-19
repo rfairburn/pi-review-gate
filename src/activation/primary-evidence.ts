@@ -10,7 +10,7 @@ import { sendNotice } from "../pi";
 export async function sendPrimaryEvidenceWarning(pi: unknown, target: unknown, message: string): Promise<void> {
   await sendNotice(target, message);
   if (typeof pi === "object" && pi !== null && "sendMessage" in pi && typeof pi.sendMessage === "function") {
-    await pi.sendMessage({ customType: "pi-review-evidence-policy", content: message, display: true }, { triggerTurn: false });
+    await pi.sendMessage({ customType: "pi-review-evidence-policy", content: message, display: true }, { deliverAs: "steer", triggerTurn: true });
   }
 }
 

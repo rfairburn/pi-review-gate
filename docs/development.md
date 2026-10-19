@@ -182,6 +182,33 @@ standalone example configs and the runnable JSON blocks in the documentation thr
 production strict validator and check intended reviewer selections/resolution and worker
 routes using hermetic fixtures, without invoking providers or reviewer/executor commands.
 
+### SessionSpawn long-prompt acceptance (#447)
+
+The focused cases in `tests/session-host-spawn-tool.test.ts` and
+`tests/session-host-spawn-protocol.test.ts`, together with the reporter, broker,
+manager, and startup-request tests, cover the registered schema, authenticated
+payload transfer, exact text preservation, rejection, and no-retry behavior.
+Controlled IPC or mocked PTYs are not native launch evidence.
+
+With the installed-Pi and scratch candidate environment described above, run:
+
+```sh
+npm run build:test
+node --test --test-name-pattern='real registered SessionSpawn delivers' dist-test/tests/session-host-native-backend.test.js
+```
+
+That POSIX-only case uses real installed Pi processes and the production manager's
+native launch path, with a scripted local faux provider (no credentials or external
+provider requests). Its parent calls the candidate's actual registered `SessionSpawn`
+tool with a synthetic structured handoff larger than both 8,192 characters and
+128 KiB, a short prompt, and an invalid empty prompt. It checks exact JSON-string
+digests and lengths in the native children's first model contexts, separate native
+conversation identities, exactly one child per valid request, no child for the invalid
+request, and small startup environments. Fixtures use owned synthetic homes,
+workspaces, agent state and IPC, and teardown requires positive owned-process exits
+before removal. This is headless native process/TUI evidence, not physical-terminal
+focus observation, native Windows certification, or a live-provider context-limit test.
+
 ### Fullscreen popup pointer-input verification (#431, #436)
 
 `tests/user-question-mouse-host.test.ts` drives the production shared-popup

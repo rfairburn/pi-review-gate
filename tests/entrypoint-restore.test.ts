@@ -125,7 +125,7 @@ test("review state restores only when the same persisted conversation resumes", 
     assert.match(resumed.notices.join("\n"), /restored conversation state revision/);
     assert.deepEqual(resumed.sent, [{
       message: "durable pending message for resumed conversation",
-      options: { deliverAs: "followUp" },
+      options: { deliverAs: "steer" },
     }]);
     const resumedState = await readFile(`${sessionFile}.pi-review-gate-state.json`, "utf8");
     assert.match(resumedState, /preserve this request/);

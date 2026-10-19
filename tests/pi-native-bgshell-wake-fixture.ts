@@ -104,6 +104,8 @@ interface JournalEntry extends Record<string, unknown> {
 	transcriptTail?: Array<{ role: string; customType?: string; preview?: string }>;
 	preview?: string;
 	customType?: string;
+	role?: string;
+	stopReason?: string;
 }
 
 /**

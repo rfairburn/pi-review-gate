@@ -6,19 +6,28 @@
  * job state was complete.
  *
  * Exercised failure boundary (Pi 1.x, real extension API): an exit wake sent
- * while a run is active is queued as a Pi follow-up. The agent loop may settle
- * without draining that queue after an abort, leaving the exit wake retained
- * while the session is idle; pi.sendMessage (void on the real API) gives the
- * gate no delivery result, so it observes injection instead (message_start
- * with customType "pi-review-bg-shell", details.id = job id, and
- * details.kind === "exit" — only the exit completion acknowledges its own
- * outstanding marker). Because Pi retains the aborted run's queued follow-up,
- * the gate must NOT re-submit the completion — that would inject one copy
- * immediately and drain the original again when recovery ends naturally.
- * Instead, at agent_settled a still-unobserved exit wake triggers one bounded
- * hidden control message (customType "pi-review-bg-shell-resume", display:false)
- * that resumes Pi's queue drainage. This regression establishes the aborted-run
- * path; it does not establish that this was the cause of the original report.
+ * while a run is active is queued in Pi's STEERING lane (#452; before that
+ * change it was a follow-up). Pi polls steering at a run's first boundary and
+ * after each tool batch, so an abort can drain the queued wake into the
+ * aborting run's own transcript AFTER the abort signal — and then end the run
+ * with a non-completing (aborted/error) assistant message and no further
+ * provider request. That injection is not consumption. pi.sendMessage (void
+ * on the real API) gives the gate no delivery result, so it observes
+ * transcript events instead: the
+ * custom message (message_start with customType "pi-review-bg-shell",
+ * details.id = job id, details.kind === "exit") proves injection, and only a
+ * later normal assistant response proves the owning session's model consumed
+ * it. A receipt cleared on injection alone therefore strands this aborted case
+ * with the session idle (no automatic model delivery) even though the payload
+ * is durable. Because Pi retains the aborted run's queued messages, the gate
+ * must NOT re-submit the completion — that would inject one copy immediately
+ * and drain the original again when recovery ends naturally. Instead, at
+ * agent_settled an outstanding receipt (queued, or injected but not yet
+ * consumed) triggers one bounded hidden control message (customType
+ * "pi-review-bg-shell-resume", display:false) that starts the turn which
+ * consumes the retained completion exactly once. This regression establishes
+ * the aborted-run path; it does not establish that this was the cause of the
+ * original report.
  *
  * These tests drive a REAL `pi --mode rpc` session with the compiled gate
  * extension (same real-host tier as the native MCP lifecycle tests) and a
@@ -33,11 +42,15 @@
  *   `pi-review-bg-shell` message, so the notification is part of the session,
  *   not an ephemeral side channel.
  *
- * The abort scenario verifies recovery of this queued-follow-up path and
- * asserts exactly ONE completion injection after the recovery turn settles.
- * The two non-aborted scenarios cover ordinary delivery paths (immediate exit
- * and short-lived exit). Neither scenario establishes the original report's
- * cause.
+ * The abort scenario forces the injected-but-unconsumed window: a slow
+ * foreground tool call keeps the run busy past the 0.5 s job's exit, so the
+ * wake is still queued before the abort; Pi then drains it into the aborting
+ * run's teardown, which ends with a non-completing assistant message. The test
+ * asserts that injection happened, that the aborting run never completed a
+ * response consuming it, and that the recovery turn's request carries the
+ * completion — exactly ONE injection overall. The two non-aborted scenarios
+ * cover ordinary delivery paths (immediate exit and short-lived exit). Neither
+ * scenario establishes the original report's cause.
  *
  * Skips when no installed Pi 1.x host or compiled candidate is available
  * (hard-fails under PI_REVIEW_GATE_REQUIRE_PI_HOST=1), matching the existing
@@ -154,12 +167,29 @@ async function assertWakeDelivered(fixture: BgShellWakeFixture, label: string): 
 	);
 }
 
+/** Count the injected exit completions in the probe journal. The custom
+ *  message is only emitted when Pi injects it into the transcript, so this is
+ *  the delivery/duplication witness — never a count of the extension's sends. */
+function exitCompletionInjections(fixture: BgShellWakeFixture): number {
+	return fixture.journal().filter((entry) =>
+		entry.event === "message_end"
+		&& entry.customType === "pi-review-bg-shell"
+		&& /—\s*exited 0/.test(String(entry.preview ?? ""))).length;
+}
+
 /**
- * A targeted regression path: a short-lived job exits while a run is active
- * (its exit wake is queued as a Pi follow-up), then that run is aborted. The
- * test verifies that settlement recovery resumes drainage of the retained
- * completion, which is injected exactly once. No ShellLog/ShellList anywhere
- * in the script; this does not establish the original report's cause.
+ * A targeted regression path: a short-lived job exits while a run is active,
+ * so its exit wake is queued in Pi's steering lane. A slow foreground tool
+ * call keeps the run busy past that exit; the run is then aborted, and Pi
+ * drains the retained steering wake into the aborting run while tearing it
+ * down — after the tool result, before the run ends. That injection is NOT
+ * consumption: the abort ends the run with a non-completing (aborted/error)
+ * assistant message and no further provider request. The test verifies that
+ * settlement recovery starts the turn that actually consumes the retained
+ * completion, which is injected exactly once overall (never re-submitted as a
+ * second copy). No
+ * ShellLog/ShellList anywhere in the script; this does not establish the
+ * original report's cause.
  */
 async function runAbortedRunScenario(fixture: BgShellWakeFixture): Promise<void> {
 	const label = "probe-abort";
@@ -191,6 +221,14 @@ async function runAbortedRunScenario(fixture: BgShellWakeFixture): Promise<void>
 		WAKE_WAIT_MS,
 	);
 	assert.equal(shellStartDone, true, `ShellStart result never observed; journal:\n${JSON.stringify(fixture.journal())}`);
+	// The wake is still queued at this point: steering has nothing to poll while
+	// the slow tool call is in flight, so this is not a vacuously pre-delivered
+	// wake.
+	assert.equal(
+		exitCompletionInjections(fixture),
+		0,
+		`the queued exit completion was already injected before the abort; journal:\n${JSON.stringify(fixture.journal())}`,
+	);
 
 	// Abort the active run. From here on the script cannot produce any model
 	// activity of its own: if a wake-carrying request appears, it came through
@@ -236,8 +274,41 @@ async function runAbortedRunScenario(fixture: BgShellWakeFixture): Promise<void>
 		"custom pi-review-bg-shell wake message missing from the session transcript after aborted-run recovery",
 	);
 
+	// The receipt gap this regression pins: Pi drained the retained steering
+	// wake into the ABORTING run's teardown (after the aborted tool result), so
+	// the completion was injected — and persisted — before settlement. That
+	// injection was not consumption: the run ended with a non-completing
+	// assistant message and no provider request, so the outstanding receipt must
+	// survive and start the recovery run that actually delivers it. Clearing the
+	// receipt on injection alone (the pre-#452-follow-up assumption) silently
+	// stranded exactly this case with agent_start=1 / agent_settled=1.
+	const injectionIndex = journal.findIndex((entry) =>
+		entry.event === "message_end"
+		&& entry.customType === "pi-review-bg-shell"
+		&& /—\s*exited 0/.test(String(entry.preview ?? "")));
+	assert.ok(injectionIndex >= 0, "the exit completion was never injected");
+	const recoveryStartIndex = journal.findIndex(
+		(entry, index) => index > injectionIndex && entry.event === "agent_start",
+	);
+	assert.ok(
+		recoveryStartIndex > injectionIndex,
+		`the completion was injected after/without a recovery run starting; journal:\n${JSON.stringify(journal)}`,
+	);
+	const teardownAssistant = journal
+		.slice(injectionIndex + 1, recoveryStartIndex)
+		.find((entry) => entry.event === "message_end" && entry.role === "assistant");
+	// The host ends the aborted run with a non-completing response (Pi 1.3
+	// reports "error" on this teardown path; "aborted" is the other). Neither
+	// proves a provider request consumed the injected context; only
+	// stop/toolUse/length do. Any unknown reason is treated the same way.
+	assert.ok(
+		teardownAssistant && !["stop", "toolUse", "length"].includes(String(teardownAssistant.stopReason)),
+		`the aborting run must not end with a completed assistant response (that would consume the injected wake); `
+			+ `journal:\n${JSON.stringify(journal)}`,
+	);
+
 	// The recovery turn must complete, and the completion must have been
-	// injected EXACTLY ONCE: Pi retains the aborted run's queued follow-up,
+	// injected EXACTLY ONCE: Pi retains the aborted run's queued completion,
 	// so the recovery trigger resumes that drainage rather than re-submitting
 	// a second copy. Stopping at the first wake-carrying request would miss a
 	// duplicate injected when the recovery turn drains the original.
@@ -250,20 +321,20 @@ async function runAbortedRunScenario(fixture: BgShellWakeFixture): Promise<void>
 		"recovery run never settled",
 	);
 	assert.equal(
-		fixture.journal().filter((entry) =>
-			entry.event === "message_end"
-			&& entry.customType === "pi-review-bg-shell"
-			&& /—\s*exited 0/.test(String(entry.preview ?? ""))
-		).length,
+		exitCompletionInjections(fixture),
 		1,
 		"exit completion was injected more than once",
 	);
 }
 
 /**
- * Cancel the one recovery turn while it is still busy, before Pi drains the
- * retained exit follow-up. The marker is consumed before the control send, so
- * settlement of this canceled turn must not start a third run for that exit.
+ * Cancel the one recovery turn while it is still busy. The aborting run's
+ * teardown already injected the retained completion (unconsumed), so the
+ * recovery turn consumes it from the transcript; the receipt is cleared before
+ * the bounded control send. The meaningful guarantees are the ones this test
+ * keeps: the completion was injected exactly once overall, and settlement of
+ * the canceled recovery turn must not start a third run or a second copy for
+ * that same exit.
  */
 async function runCanceledRecoveryScenario(fixture: BgShellWakeFixture): Promise<void> {
 	const label = "probe-recovery-abort";
@@ -291,11 +362,18 @@ async function runCanceledRecoveryScenario(fixture: BgShellWakeFixture): Promise
 		WAKE_WAIT_MS,
 	);
 	assert.equal(shellStartDone, true, `ShellStart result never observed; journal:\n${JSON.stringify(fixture.journal())}`);
+	// The completion is still queued at this point; steering cannot poll while
+	// the slow tool call is in flight.
+	assert.equal(
+		exitCompletionInjections(fixture),
+		0,
+		`the queued exit completion was already injected before the abort; journal:\n${JSON.stringify(fixture.journal())}`,
+	);
 
 	// The initial run has produced tool-call messages, but the retained
 	// transcript can make the recovery request index vary. Fill possible
 	// indices with long-running tool calls so recovery cannot stop naturally
-	// and drain the exit before we abort it.
+	// and consume the exit before we cancel it.
 	await fixture.setTurnScript(Array.from({ length: 32 }, () => ({
 		toolCalls: [{ toolName: "bash", arguments: { command: "sleep 30" } }],
 	})));
@@ -326,11 +404,13 @@ async function runCanceledRecoveryScenario(fixture: BgShellWakeFixture): Promise
 	const beforeRecoveryAbort = fixture.journal();
 	assert.equal(beforeRecoveryAbort.filter((entry) => entry.event === "agent_start").length, 2,
 		"expected the initial run and exactly one recovery run before canceling recovery");
-	assert.equal(beforeRecoveryAbort.filter((entry) =>
-		entry.event === "message_end"
-		&& entry.customType === "pi-review-bg-shell"
-		&& /—\s*exited 0/.test(String(entry.preview ?? ""))).length, 0,
-		"the exit follow-up drained before the recovery turn was aborted");
+	// #452: Pi drained the retained steering wake into the aborting run's
+	// teardown, so the completion is already injected exactly once before this
+	// recovery run started. The receipt survives that unconsumed injection and
+	// is cleared before the bounded control send, which is what prevents the
+	// canceled recovery turn from starting a third run for the same exit.
+	assert.equal(exitCompletionInjections(fixture), 1,
+		"the aborting run must have injected the retained exit completion exactly once before recovery");
 	// Let the host dispatch the blocking tool call before canceling the run.
 	await new Promise<void>((resolve) => setTimeout(resolve, 500));
 
@@ -350,11 +430,8 @@ async function runCanceledRecoveryScenario(fixture: BgShellWakeFixture): Promise
 	assert.equal(restarted, false, "canceling recovery automatically started another run for the same exit");
 	assert.equal(finalJournal.filter((entry) => entry.event === "agent_start").length, 2,
 		"unexpected additional agent run after canceling the one recovery attempt");
-	assert.equal(finalJournal.filter((entry) =>
-		entry.event === "message_end"
-		&& entry.customType === "pi-review-bg-shell"
-		&& /—\s*exited 0/.test(String(entry.preview ?? ""))).length, 0,
-		"the retained exit was drained despite aborting recovery before drainage");
+	assert.equal(exitCompletionInjections(fixture), 1,
+		"the retained exit completion must stay injected exactly once after canceling recovery");
 }
 
 test("aborted run recovers its queued exit wake (#281)", { timeout: 180_000 }, async (t) => {

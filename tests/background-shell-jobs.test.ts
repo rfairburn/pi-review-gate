@@ -347,7 +347,7 @@ describe("evaluateSilence", () => {
 describe("laneDelivery", () => {
   it("maps lanes onto pi's delivery modes", () => {
     expect(laneDelivery("now")).toEqual({ deliverAs: "steer", triggerTurn: true });
-    expect(laneDelivery("soon")).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(laneDelivery("soon")).toEqual({ deliverAs: "steer", triggerTurn: true });
     expect(laneDelivery("idle")).toEqual({ deliverAs: "nextTurn" });
   });
 });

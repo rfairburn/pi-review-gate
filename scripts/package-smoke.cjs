@@ -375,15 +375,12 @@ function smokeInstalledWebLauncher(installed) {
       '[[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" && "$4" == "check" ]] && exit 0',
       "exit 97",
       "",
-    ].join("\n"));
-    fs.chmodSync(python, 0o755);
+    ].join("\n"), { flag: "wx", mode: 0o755 });
 
     const npm = path.join(bin, "npm");
-    fs.writeFileSync(npm, "#!/bin/bash\nprintf called > \"$CAPTURE_DIR/npm-called\"\nexit 98\n");
-    fs.chmodSync(npm, 0o755);
+    fs.writeFileSync(npm, "#!/bin/bash\nprintf called > \"$CAPTURE_DIR/npm-called\"\nexit 98\n", { flag: "wx", mode: 0o755 });
     const python3 = path.join(bin, "python3");
-    fs.writeFileSync(python3, "#!/bin/bash\nprintf called > \"$CAPTURE_DIR/python3-called\"\nexit 99\n");
-    fs.chmodSync(python3, 0o755);
+    fs.writeFileSync(python3, "#!/bin/bash\nprintf called > \"$CAPTURE_DIR/python3-called\"\nexit 99\n", { flag: "wx", mode: 0o755 });
 
     const node = path.join(bin, "node");
     fs.writeFileSync(node, [
@@ -406,8 +403,7 @@ function smokeInstalledWebLauncher(installed) {
       '}));',
       'process.exit(23);',
       "",
-    ].join("\n"));
-    fs.chmodSync(node, 0o755);
+    ].join("\n"), { flag: "wx", mode: 0o755 });
 
     const args = ["--package-smoke", "two words", "", "semi;colon", "--", "-x"];
     const result = spawnSync(path.join(installed, "scripts", "pi-review-web.sh"), args, {
@@ -430,7 +426,10 @@ function smokeInstalledWebLauncher(installed) {
     assert.equal(result.signal, null, `installed web launcher was signaled: ${result.stderr}`);
     assert.equal(result.status, 23, `installed web launcher must preserve the CLI status: ${result.stderr}`);
     const invocation = JSON.parse(fs.readFileSync(path.join(capture, "node.json"), "utf8"));
-    assert.deepEqual(invocation.args, [path.join(installed, "dist", "src", "web", "cli.js"), ...args]);
+    // Shared preparation selects the physical package root (for example,
+    // macOS /var and /private/var name the same installed tree).
+    const installedCli = fs.realpathSync(path.join(installed, "dist", "src", "web", "cli.js"));
+    assert.deepEqual(invocation.args, [installedCli, ...args]);
     assert.equal(invocation.cliExists, true, "the installed CLI must be the actual Node entry path");
     assert.equal(invocation.ddgsPython, python, "the installed helper must export its validated interpreter");
     assert.ok(!fs.existsSync(path.join(capture, "npm-called")), "the source-less installed package must not build");

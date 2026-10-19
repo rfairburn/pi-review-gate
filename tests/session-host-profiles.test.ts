@@ -518,10 +518,13 @@ test("prepare creates a private profile with the byte-exact zero-model default c
 
 test("created default config bytes match the standalone launcher's documented defaults", () => {
   // dist-test/tests/session-host-profiles.test.js -> repository root.
-  const launcher = readFileSync(join(__dirname, "..", "..", "scripts", "pi-review-gate.sh"), "utf8");
-  assert.ok(
-    launcher.includes(DEFAULT_REVIEW_GATE_CONFIG_JSON),
-    "session-host default config must stay identical to scripts/pi-review-gate.sh zero-model defaults",
+  const launcher = require(join(__dirname, "..", "..", "scripts", "pi-review-gate-launcher.cjs")) as {
+    DEFAULT_CONFIG_CONTENT: string;
+  };
+  assert.equal(
+    launcher.DEFAULT_CONFIG_CONTENT,
+    DEFAULT_REVIEW_GATE_CONFIG_JSON,
+    "session-host default config must stay identical to the shared standalone launcher zero-model defaults",
   );
 });
 

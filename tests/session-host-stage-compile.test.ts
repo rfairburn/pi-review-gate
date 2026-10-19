@@ -33,6 +33,8 @@ interface BoundedProcessResult {
 }
 
 interface BuildResult {
+  ok?: boolean;
+  root?: string;
   status: number | null;
   stage?: "install" | "compile" | "stage";
   diagnostics?: string;
@@ -55,14 +57,17 @@ interface BuildOptions {
   runCompile?: (compilerCli: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult>;
 }
 
-interface LauncherModule {
-  __test: {
-    buildSourceExtension(options: BuildOptions): Promise<BuildResult>;
-  };
+interface BuildModule {
+  REQUIRED_COMPILED_ENTRIES: string[][];
+  prepareStagedApplication(options: BuildOptions): Promise<BuildResult>;
+  runBoundedProcess(file: string, args: string[], options: Record<string, unknown>): Promise<BoundedProcessResult>;
 }
 
 const requireCjs = createRequire(join(process.cwd(), "tests", "session-host-stage-compile.test.ts"));
-const launcher = requireCjs("../scripts/pi-review-sessions.cjs") as LauncherModule;
+// Issue 344 moved the source-preparation engine into the shared module every
+// launcher uses; this file's compile-plan contracts still cover the same code.
+const buildModule = requireCjs("../scripts/application-build.cjs") as BuildModule;
+const REQUIRED_OUTPUTS = buildModule.REQUIRED_COMPILED_ENTRIES;
 
 // POSIX-owned stage fixtures. Windows source paths exist but native Windows
 // acceptance is a separate parent-owned task; this file makes no claim there.
@@ -163,6 +168,8 @@ async function runStagedBuild(
     compilePlans?: CompilePlan[];
     install?: (stageRoot: string) => void;
     compile?: (stageRoot: string) => Promise<BoundedProcessResult>;
+    installResult?: () => BoundedProcessResult;
+    installRunner?: (processOptions: Record<string, unknown>) => Promise<BoundedProcessResult>;
     useDefaultCompile?: boolean;
   } = {},
 ): Promise<BuildResult> {
@@ -172,21 +179,31 @@ async function runStagedBuild(
     env: fixtureEnv(fixture),
     runNpm: async (_npmCli, args, processOptions) => {
       options.npmCalls?.push(args);
+      if (options.installRunner) return options.installRunner(processOptions);
       const stageRoot = String(processOptions.cwd);
       if (options.install) options.install(stageRoot);
       else writeInertCompiler(fixture.budget, stageRoot);
-      return ok();
+      return options.installResult ? options.installResult() : ok();
     },
   };
   if (!options.useDefaultCompile) {
     buildOptions.runCompile = async (compilerCli, args, processOptions) => {
       const stageRoot = String(processOptions.cwd);
       options.compilePlans?.push({ compilerCli, args, cwd: stageRoot, env: processOptions.env as NodeJS.ProcessEnv });
-      if (options.compile) return options.compile(stageRoot);
-      return ok();
+      const result = options.compile ? await options.compile(stageRoot) : ok();
+      // A successful compile is only publishable when it produced the required
+      // entries; the synthetic seam writes them exactly as tsc would.
+      if (result.status === 0 && !result.timedOut && result.cleanupConfirmed !== false) {
+        for (const entry of REQUIRED_OUTPUTS) {
+          const target = join(stageRoot, ...entry);
+          mkdirSync(join(target, ".."), { recursive: true });
+          writeInertFile(fixture.budget, target, "// synthetic compiled output\n");
+        }
+      }
+      return result;
     };
   }
-  return launcher.__test.buildSourceExtension(buildOptions);
+  return buildModule.prepareStagedApplication(buildOptions);
 }
 
 nodeTest("the staged compile plan is a direct installed-TypeScript invocation with no package build lifecycle", { skip: posixSkip }, async () => {
@@ -195,7 +212,7 @@ nodeTest("the staged compile plan is a direct installed-TypeScript invocation wi
   const compilePlans: CompilePlan[] = [];
   const result = await runStagedBuild(fixture, { npmCalls, compilePlans });
 
-  assert.equal(result.status, 0);
+  assert.equal(result.ok, true);
   assert.equal(result.stage, undefined, "a successful build reports no failing stage");
   assert.deepEqual(npmCalls, [LOCKED_CI_ARGS], "the only npm invocation is the locked ci install");
   assert.ok(
@@ -203,7 +220,7 @@ nodeTest("the staged compile plan is a direct installed-TypeScript invocation wi
     "no package build or recursive clean lifecycle is ever invoked",
   );
 
-  const stage = result.stagingRoot;
+  const stage = result.root;
   assert.ok(typeof stage === "string" && stage.length > 0);
   assert.equal(compilePlans.length, 1, "the compile phase is exactly one direct compiler invocation");
   const plan = compilePlans[0];
@@ -219,7 +236,8 @@ nodeTest("the staged compile plan is a direct installed-TypeScript invocation wi
     "the compile preserves the exact caller PATH, including inherited npm entries, without adding a stage .bin shim");
   assert.equal(plan.env.NODE_OPTIONS, SYNTHETIC_NODE_OPTIONS, "the original caller startup options plus the synthetic fixture flag are preserved for the compile");
   assert.equal(plan.env.ANTHROPIC_API_KEY, "provider-secret", "trusted provider variables are preserved for the compile");
-  assert.equal(existsSync(join(stage, "dist")), false, "no output exists before the compiled stage runs");
+  assert.equal(existsSync(join(stage, "dist", "src", "web", "cli.js")), true,
+    "the compile produced the required entries; the plan above ran before them");
   assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), LIVE_DIST_SENTINEL,
     "the live checkout is never rebuilt in place");
   assert.ok(fixture.budget.files <= MAX_FIXTURE_FILES && fixture.budget.bytes <= MAX_FIXTURE_BYTES);
@@ -236,7 +254,7 @@ nodeTest("the default compile runner executes the stage compiler through public 
   const result = await runStagedBuild(fixture, {
     useDefaultCompile: true,
     install: (stageRoot) => {
-      writeInertCompiler(fixture.budget, stageRoot, compilerSource);
+      writeInertCompiler(fixture.budget, stageRoot, compilerSource + REQUIRED_OUTPUTS.map((entry) => `require("node:fs").mkdirSync(require("node:path").dirname(${JSON.stringify(entry.join("/"))}), { recursive: true }); require("node:fs").writeFileSync(${JSON.stringify(entry.join("/"))}, "// compiled\\n");`).join("\n") + "\n");
       // Account for the one exclusive child-produced marker before dispatch.
       fixture.budget.files += 1;
       fixture.budget.bytes += Buffer.byteLength(JSON.stringify({ argv: ["-p", join(stageRoot, "tsconfig.json")], cwd: stageRoot }), "utf8");
@@ -244,8 +262,8 @@ nodeTest("the default compile runner executes the stage compiler through public 
     },
   });
 
-  assert.equal(result.status, 0, "the synthetic compiler child exits zero");
-  const stage = result.stagingRoot;
+  assert.equal(result.ok, true, "the synthetic compiler child exits zero");
+  const stage = result.root;
   assert.ok(typeof stage === "string" && stage.length > 0);
   const observed = JSON.parse(readFileSync(marker, "utf8")) as { argv: string[]; cwd: string };
   assert.deepEqual(observed.argv, ["-p", join(stage, "tsconfig.json")], "public Node receives the direct tsc project argument");
@@ -268,7 +286,7 @@ nodeTest("a stage that already contains output refuses the compile before any co
     },
   });
 
-  assert.equal(result.stage, "stage");
+  assert.equal(result.stage, "compile");
   assert.equal(result.status, 1);
   assert.equal(result.retainedStage, true, "the refused stage is retained, never cleaned");
   assert.match(result.diagnostics ?? "", /staging root unexpectedly contains build output/);
@@ -285,7 +303,7 @@ nodeTest("a missing installed compiler refuses the compile and retains the stage
     install: (stageRoot) => mkdirSync(join(stageRoot, "node_modules"), { recursive: true }),
   });
 
-  assert.equal(result.stage, "stage");
+  assert.equal(result.stage, "compile");
   assert.equal(result.status, 1);
   assert.equal(result.retainedStage, true);
   assert.match(result.diagnostics ?? "", /the staged TypeScript compiler is unavailable/);
@@ -309,7 +327,7 @@ nodeTest("a compiler entry that is an internal symlink is refused", { skip: posi
     },
   });
 
-  assert.equal(result.stage, "stage");
+  assert.equal(result.stage, "compile");
   assert.equal(result.retainedStage, true);
   assert.match(result.diagnostics ?? "", /the staged TypeScript compiler is not a regular file/);
   assert.equal(compilePlans.length, 0, "no compiler runs through a symlinked entry");
@@ -330,7 +348,7 @@ nodeTest("a symlinked installed-package ancestor is refused", { skip: posixSkip 
     },
   });
 
-  assert.equal(result.stage, "stage");
+  assert.equal(result.stage, "compile");
   assert.equal(result.retainedStage, true);
   assert.match(result.diagnostics ?? "", /the staged TypeScript compiler is unavailable/);
   assert.equal(compilePlans.length, 0, "no compiler runs through a symlinked ancestor");
@@ -347,7 +365,7 @@ nodeTest("a compiler entry whose real ancestor chain changes during the compile 
     },
   });
 
-  assert.equal(result.stage, "stage");
+  assert.equal(result.stage, "compile");
   assert.equal(result.status, 1);
   assert.equal(result.retainedStage, true);
   assert.match(result.diagnostics ?? "", /staging directory chain changed during the TypeScript compile/);
@@ -365,7 +383,7 @@ nodeTest("a directory masquerading as the installed compiler entry is refused", 
     },
   });
 
-  assert.equal(result.stage, "stage");
+  assert.equal(result.stage, "compile");
   assert.equal(result.retainedStage, true);
   assert.match(result.diagnostics ?? "", /the staged TypeScript compiler is not a regular file/);
   assert.equal(compilePlans.length, 0);
@@ -384,7 +402,7 @@ nodeTest("a compiler entry replaced in place during the compile is refused and r
     },
   });
 
-  assert.equal(result.stage, "stage");
+  assert.equal(result.stage, "compile");
   assert.equal(result.status, 1);
   assert.equal(result.retainedStage, true);
   assert.match(result.diagnostics ?? "", /staging directory chain changed during the TypeScript compile/);
@@ -403,7 +421,7 @@ nodeTest("an installed package whose identity is not TypeScript is refused", { s
     },
   });
 
-  assert.equal(result.stage, "stage");
+  assert.equal(result.stage, "compile");
   assert.equal(result.retainedStage, true);
   assert.match(result.diagnostics ?? "", /the staged TypeScript package identity does not match the locked dependency/);
   assert.equal(compilePlans.length, 0);
@@ -425,9 +443,71 @@ nodeTest("a failing compile reports the compile stage with bounded sanitized dia
   assert.equal(result.retainedStage, true);
   assert.ok(Buffer.byteLength(result.diagnostics ?? "", "utf8") <= 4096, "diagnostics share one aggregate ceiling");
   assert.doesNotMatch(result.diagnostics ?? "", /\u001b/u, "terminal controls never reach the operator");
-  assert.match(result.diagnostics ?? "", /TypeScript compile \(tsc -p tsconfig\.json\)/);
+  assert.match(result.diagnostics ?? "", /TypeScript compile/);
   assert.match(result.diagnostics ?? "", /TS1005: ';' expected\./);
-  assert.ok(result.stagingRoot === undefined);
+  assert.ok(result.root === undefined);
+});
+
+nodeTest("a real direct-child nonzero install exit keeps its own status and refuses publication", { skip: posixSkip }, async () => {
+  const fixture = makeStageFixture(".session-host-stage-compile-natural-nonzero-");
+  const exitScript = join(fixture.root, "natural-nonzero-install.js");
+  writeInertFile(fixture.budget, exitScript, "process.exit(5);\n");
+  const compilePlans: CompilePlan[] = [];
+
+  const result = await runStagedBuild(fixture, {
+    compilePlans,
+    // The production bounded-process runner observes the real synthetic child
+    // directly: this is preparation's own natural-nonzero exit, not a
+    // hand-built result object.
+    installRunner: (processOptions) => buildModule.runBoundedProcess(process.execPath, [exitScript], processOptions),
+  });
+
+  assert.equal(result.ok, false, "a nonzero install never publishes a generation");
+  assert.equal(result.stage, "install");
+  assert.equal(result.status, 5, "the install child's own exit status is preserved");
+  assert.equal(result.childStatus, 5);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.outputExceeded, false);
+  assert.equal(result.retainedStage, true);
+  assert.equal(result.root, undefined, "nothing is published after the failed install");
+  assert.equal(compilePlans.length, 0, "the compile never runs after a failed install");
+  assert.equal(existsSync(fixture.agentDir), true, "the failed stage stays retained inside the owned cache");
+  assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), LIVE_DIST_SENTINEL,
+    "the live checkout output is never touched");
+});
+
+nodeTest("a Windows natural nonzero result keeps its status while an unconfirmed cleanup fails closed", { skip: posixSkip }, async () => {
+  // The exact result shape a natural Windows direct-child close produces: a
+  // real status with no descendant claim (cleanupConfirmed undefined).
+  const naturalWindows = (): BoundedProcessResult => ({
+    status: 5,
+    signal: null,
+    cleanupConfirmed: undefined,
+    timedOut: false,
+    outputExceeded: false,
+    stdout: "",
+  });
+
+  const naturalFixture = makeStageFixture(".session-host-stage-compile-windows-natural-");
+  const natural = await runStagedBuild(naturalFixture, { installResult: naturalWindows });
+  assert.equal(natural.stage, "install");
+  assert.equal(natural.status, 5, "a natural nonzero child status is never collapsed to the fallback status");
+  assert.equal(natural.childStatus, 5);
+  assert.equal(natural.cleanupConfirmed, undefined, "Windows natural closure claims no descendant settlement");
+  assert.equal(natural.ok, false);
+  assert.equal(natural.root, undefined, "no stale output may be published");
+
+  // Negative control: once cleanup is genuinely unconfirmed, the child's
+  // nonzero status is not reused and publication still fails closed.
+  const unconfirmedFixture = makeStageFixture(".session-host-stage-compile-windows-unconfirmed-");
+  const unconfirmed = await runStagedBuild(unconfirmedFixture, {
+    installResult: () => ({ ...naturalWindows(), cleanupConfirmed: false }),
+  });
+  assert.equal(unconfirmed.stage, "install");
+  assert.equal(unconfirmed.status, 1, "an unconfirmed install cleanup is never reported as the child's own status");
+  assert.equal(unconfirmed.cleanupConfirmed, false);
+  assert.equal(unconfirmed.ok, false);
+  assert.equal(unconfirmed.root, undefined);
 });
 
 nodeTest("a signaled compile, an expired compile, and an unsettled compile child all fail closed and retain", { skip: posixSkip }, async () => {

@@ -351,6 +351,27 @@ function runSessionHostHelp(binPath) {
 }
 
 /**
+ * Resolve the npm-created POSIX bin shim for one installed entry point. The
+ * shim must be the symlink npm creates (not a copy of the packaged script) and
+ * must resolve to the packed target, so the smoke exercises the same entry
+ * point a standard prebuilt consumer runs.
+ */
+function installedBinShim(installed, bin, target) {
+  const shim = path.join(path.dirname(installed), ".bin", bin);
+  assert.equal(
+    fs.lstatSync(shim).isSymbolicLink(),
+    true,
+    `npm must link the POSIX bin as a symlink: node_modules/.bin/${bin}`,
+  );
+  assert.equal(
+    fs.realpathSync(shim),
+    fs.realpathSync(path.join(installed, ...target.split("/"))),
+    `node_modules/.bin/${bin} must resolve to the packed ${target} entry point`,
+  );
+  return shim;
+}
+
+/**
  * Exercise the installed package's actual POSIX web-bin target with a
  * hermetic DDGS environment and recording npm/node/python commands. The
  * wrappers themselves are the packed production files; no launcher logic is
@@ -375,15 +396,12 @@ function smokeInstalledWebLauncher(installed) {
       '[[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" && "$4" == "check" ]] && exit 0',
       "exit 97",
       "",
-    ].join("\n"));
-    fs.chmodSync(python, 0o755);
+    ].join("\n"), { flag: "wx", mode: 0o755 });
 
     const npm = path.join(bin, "npm");
-    fs.writeFileSync(npm, "#!/bin/bash\nprintf called > \"$CAPTURE_DIR/npm-called\"\nexit 98\n");
-    fs.chmodSync(npm, 0o755);
+    fs.writeFileSync(npm, "#!/bin/bash\nprintf called > \"$CAPTURE_DIR/npm-called\"\nexit 98\n", { flag: "wx", mode: 0o755 });
     const python3 = path.join(bin, "python3");
-    fs.writeFileSync(python3, "#!/bin/bash\nprintf called > \"$CAPTURE_DIR/python3-called\"\nexit 99\n");
-    fs.chmodSync(python3, 0o755);
+    fs.writeFileSync(python3, "#!/bin/bash\nprintf called > \"$CAPTURE_DIR/python3-called\"\nexit 99\n", { flag: "wx", mode: 0o755 });
 
     const node = path.join(bin, "node");
     fs.writeFileSync(node, [
@@ -392,6 +410,13 @@ function smokeInstalledWebLauncher(installed) {
       'const fs = require("node:fs");',
       'const path = require("node:path");',
       'const args = process.argv.slice(2);',
+      // The wrapper runs the shared preparation authority through `node` first;
+      // that step must execute for real (packaged mode installs/compiles nothing).
+      'if (args[0] && args[0].endsWith("prepare-application.cjs")) {',
+      '  const { spawnSync } = require("node:child_process");',
+      `  const prepared = spawnSync(${JSON.stringify(process.execPath)}, [args[0], ...args.slice(1)], { cwd: process.cwd(), env: process.env, stdio: "inherit" });`,
+      '  process.exit(prepared.status ?? 1);',
+      '}',
       'fs.writeFileSync(path.join(process.env.CAPTURE_DIR, "node.json"), JSON.stringify({',
       '  args,',
       '  cliExists: fs.existsSync(args[0]),',
@@ -399,11 +424,14 @@ function smokeInstalledWebLauncher(installed) {
       '}));',
       'process.exit(23);',
       "",
-    ].join("\n"));
-    fs.chmodSync(node, 0o755);
+    ].join("\n"), { flag: "wx", mode: 0o755 });
 
     const args = ["--package-smoke", "two words", "", "semi;colon", "--", "-x"];
-    const result = spawnSync(path.join(installed, "scripts", "pi-review-web.sh"), args, {
+    // Drive npm's actual consumer bin for pi-review-web. Before the physical
+    // root fix this resolved the helper below node_modules/ and failed with
+    // MODULE_NOT_FOUND; a direct scripts/ invocation would not cover that.
+    const webBin = installedBinShim(installed, "pi-review-web", "scripts/pi-review-web.sh");
+    const result = spawnSync(webBin, args, {
       cwd: fixture,
       env: {
         HOME: fixture,
@@ -423,7 +451,10 @@ function smokeInstalledWebLauncher(installed) {
     assert.equal(result.signal, null, `installed web launcher was signaled: ${result.stderr}`);
     assert.equal(result.status, 23, `installed web launcher must preserve the CLI status: ${result.stderr}`);
     const invocation = JSON.parse(fs.readFileSync(path.join(capture, "node.json"), "utf8"));
-    assert.deepEqual(invocation.args, [path.join(installed, "dist", "src", "web", "cli.js"), ...args]);
+    // Shared preparation selects the physical package root (for example,
+    // macOS /var and /private/var name the same installed tree).
+    const installedCli = fs.realpathSync(path.join(installed, "dist", "src", "web", "cli.js"));
+    assert.deepEqual(invocation.args, [installedCli, ...args]);
     assert.equal(invocation.cliExists, true, "the installed CLI must be the actual Node entry path");
     assert.equal(invocation.ddgsPython, python, "the installed helper must export its validated interpreter");
     assert.ok(!fs.existsSync(path.join(capture, "npm-called")), "the source-less installed package must not build");
@@ -433,10 +464,130 @@ function smokeInstalledWebLauncher(installed) {
       .split(/\r?\n/)
       .filter(Boolean)
       .map((line) => line.split("\t"));
-    assert.equal(pythonCalls.length, 4, "the actual helper must run both validation passes and their pip checks");
+    // One completed environment is validated once, then gated by its marker
+    // (issue 344): a revalidation pair is not run again on the same launch.
+    assert.equal(pythonCalls.length, 2, "the actual helper runs one validation pass and its pip check");
     assert.ok(pythonCalls.every((call) => call[0] === "-I"), "all packaged helper invocations must use isolated mode");
-    assert.equal(pythonCalls.filter((call) => call[1] === "-c" && call[3] === "9.16.0").length, 2, "both DDGS validation passes must retain the version pin");
-    assert.equal(pythonCalls.filter((call) => call[1] === "-m" && call[2] === "pip" && call[3] === "check").length, 2);
+    assert.equal(pythonCalls.filter((call) => call[1] === "-c" && call[3] === "9.16.0").length, 1, "the DDGS validation retains the version pin");
+    assert.equal(pythonCalls.filter((call) => call[1] === "-m" && call[2] === "pip" && call[3] === "check").length, 1);
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Exercise the installed package's ACTUAL npm-created POSIX gate bin
+ * (consumer/node_modules/.bin/pi-review-gate). The shared config resolver and
+ * preparation authority run for real against the packed install, and only pi
+ * and the DDGS interpreter are recording stand-ins: this proves the public .bin
+ * entry point roots itself at the physical package, completes preparation, and
+ * preserves the argument vector and exit status. No model or provider is
+ * invoked and no source build is possible from the packaged tree.
+ */
+function smokeInstalledGateLauncher(installed) {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "pi-review-gate-package-bin-"));
+  try {
+    const bin = path.join(fixture, "bin");
+    const capture = path.join(fixture, "capture");
+    const home = path.join(fixture, "home");
+    const venv = path.join(fixture, "ddgs-venv");
+    fs.mkdirSync(bin, { recursive: true });
+    fs.mkdirSync(capture, { recursive: true });
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(path.join(venv, "bin"), { recursive: true });
+
+    const python = path.join(venv, "bin", "python");
+    fs.writeFileSync(python, [
+      "#!/bin/bash",
+      "{ printf '%s\\t' \"$@\"; printf '\\n'; } >> \"$CAPTURE_DIR/python-calls\"",
+      'if [[ "$1" == "-I" && "$2" == "-c" && "$4" == "9.16.0" ]]; then exit 0; fi',
+      'if [[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" && "$4" == "check" ]]; then exit 0; fi',
+      "exit 97",
+      "",
+    ].join("\n"), { flag: "wx", mode: 0o755 });
+
+    // Decoys: a packaged launch must never install (npm) or create a venv.
+    fs.writeFileSync(path.join(bin, "npm"),
+      "#!/bin/bash\nprintf called > \"$CAPTURE_DIR/npm-called\"\nexit 98\n", { flag: "wx", mode: 0o755 });
+    fs.writeFileSync(path.join(bin, "python3"),
+      "#!/bin/bash\nprintf called > \"$CAPTURE_DIR/python3-called\"\nexit 99\n", { flag: "wx", mode: 0o755 });
+
+    const pi = path.join(bin, "pi");
+    fs.writeFileSync(pi, [
+      "#!/bin/bash",
+      ': > "$CAPTURE_DIR/args"',
+      'for arg in "$@"; do printf "%s\\0" "$arg" >> "$CAPTURE_DIR/args"; done',
+      'printf "%s" "${PI_REVIEW_GATE_CONFIG:-unset}" > "$CAPTURE_DIR/config-env"',
+      'printf "%s" "${PI_REVIEW_GATE_DDGS_PYTHON:-unset}" > "$CAPTURE_DIR/ddgs-env"',
+      'printf "%s" "${PI_REVIEW_GATE_SCHEDULER:-unset}" > "$CAPTURE_DIR/scheduler-env"',
+      'printf "%s" "${PI_REVIEW_GATE_CODEMODE_DEFAULT:-unset}" > "$CAPTURE_DIR/codemode-env"',
+      "exit 37",
+      "",
+    ].join("\n"), { flag: "wx", mode: 0o755 });
+
+    // The real Node runs the shipped config resolver and preparation authority;
+    // any other Node invocation would contradict the packaged contract.
+    const node = path.join(bin, "node");
+    fs.writeFileSync(node, [
+      `#!${process.execPath}`,
+      '"use strict";',
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      'const args = process.argv.slice(2);',
+      'if (args[0] && (args[0].endsWith("pi-review-gate-launcher.cjs") || args[0].endsWith("prepare-application.cjs"))) {',
+      '  const { spawnSync } = require("node:child_process");',
+      `  const prepared = spawnSync(${JSON.stringify(process.execPath)}, [args[0], ...args.slice(1)], { cwd: process.cwd(), env: process.env, stdio: "inherit" });`,
+      '  process.exit(prepared.status ?? 1);',
+      '}',
+      'fs.writeFileSync(path.join(process.env.CAPTURE_DIR, "unexpected-node.json"), JSON.stringify({ args }));',
+      'process.exit(24);',
+      "",
+    ].join("\n"), { flag: "wx", mode: 0o755 });
+
+    const args = ["--model", "two words", "", "--scheduler", "--", "-x"];
+    const gateBin = installedBinShim(installed, "pi-review-gate", "scripts/pi-review-gate.sh");
+    const result = spawnSync(gateBin, args, {
+      cwd: fixture,
+      env: {
+        HOME: home,
+        TMPDIR: fixture,
+        XDG_CACHE_HOME: path.join(fixture, "cache"),
+        PATH: `${bin}${path.delimiter}/usr/bin:/bin`,
+        CAPTURE_DIR: capture,
+        PI_REVIEW_GATE_DDGS_VENV: venv,
+        PI_REVIEW_GATE_CONFIG: "/inherited/incorrect/config.json",
+      },
+      encoding: "utf8",
+      timeout: 30_000,
+      maxBuffer: 256 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    assert.ifError(result.error);
+    assert.equal(result.signal, null, `installed gate launcher was signaled: ${result.stderr}`);
+    assert.equal(result.status, 37, `installed gate launcher must preserve pi's status: ${result.stderr}`);
+    assert.doesNotMatch(result.stderr, /MODULE_NOT_FOUND|Cannot find module/u,
+      `the .bin launch must resolve the packed package root: ${result.stderr}`);
+
+    const extension = fs.realpathSync(path.join(installed, "dist", "src", "index.js"));
+    assert.ok(result.stdout.includes(`pi-review-gate extension: ${extension}`),
+      `the reported extension must come from the installed package: ${result.stdout}`);
+    const launched = fs.readFileSync(path.join(capture, "args"), "utf8").split("\0").slice(0, -1);
+    assert.deepEqual(launched, ["--extension", extension, "--model", "two words", "", "--", "-x"],
+      "the .bin launcher must preserve the full argument vector");
+    assert.equal(fs.readFileSync(path.join(capture, "config-env"), "utf8"),
+      path.join(home, ".pi", "agent", "review-gate.json"),
+      "config resolution must ignore the inherited value and use the native agent directory");
+    assert.equal(fs.readFileSync(path.join(capture, "ddgs-env"), "utf8"), python);
+    assert.equal(fs.readFileSync(path.join(capture, "scheduler-env"), "utf8"), "1");
+    assert.equal(fs.readFileSync(path.join(capture, "codemode-env"), "utf8"), "1");
+    assert.ok(
+      fs.statSync(path.join(home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md")).isFile(),
+      "the .bin launcher must complete preparation before launch",
+    );
+    assert.ok(!fs.existsSync(path.join(capture, "npm-called")), "a packaged .bin launch must not install");
+    assert.ok(!fs.existsSync(path.join(capture, "python3-called")), "an existing valid venv must not be recreated");
+    assert.ok(!fs.existsSync(path.join(capture, "unexpected-node.json")),
+      "the launcher must run only the shipped config and preparation helpers through Node");
   } finally {
     fs.rmSync(fixture, { recursive: true, force: true });
   }
@@ -590,6 +741,7 @@ function runPackageSmoke(scratch) {
   const installedManifest = JSON.parse(fs.readFileSync(path.join(installed, "package.json"), "utf8"));
   assert.equal(installedManifest.bin && installedManifest.bin["pi-review-web"], "scripts/pi-review-web.sh");
   smokeInstalledWebLauncher(installed);
+  smokeInstalledGateLauncher(installed);
   // Optional session host (#323): exact bin metadata, executable consumer
   // shim, side-effect-free --help, derived compiled-module shipment, and
   // fresh-consumer runtime loads with a lazy optional PTY. No normal host

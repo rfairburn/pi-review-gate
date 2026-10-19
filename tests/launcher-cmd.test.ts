@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { after, before, test } from "node:test";
+import { extensionFromArgs, isCompiledExtension, writeFakeNpm, writeRequiredOutputs } from "./launcher-prepare-fixtures";
 import { piAgentConfigPath, reviewGateConfigCandidates } from "../src/config-path";
 
 const execFileAsync = promisify(execFile);
@@ -29,7 +30,6 @@ const helperModule = require(helperPath) as {
   SKILL_MIGRATION_PLAN: Array<{ installed: string[]; source: string[]; historicalSha256: string }>;
   SKILL_PUBLISH_RETRY_ATTEMPTS: number;
   SKILL_PUBLISH_RETRY_DELAY_MS: number;
-  buildExtension: (root: string) => { status: number | null; error?: Error };
   cmdQuote: (arg: string) => string;
   compatibilityFallbackConfigPath: (resolution: { homeDir: string; platform: string }) => string;
   ddgsPythonPath: (venv: string, platform: string) => string;
@@ -47,7 +47,6 @@ const helperModule = require(helperPath) as {
       isDirectory?: () => boolean;
     },
   ) => { published: boolean; attempts: number; lastError: (Error & { code?: string }) | null };
-  resolveCmdShimTarget: (shimPath: string) => string | null;
   resolvePiAgentDir: (env: NodeJS.ProcessEnv, resolution: { homeDir: string; platform: string }) => string;
   resolveLauncherPiInvocation: (env: NodeJS.ProcessEnv, platform: string) =>
     { kind: string; file?: string };
@@ -56,97 +55,6 @@ const helperModule = require(helperPath) as {
     | { ok: false; kind: string; error: string };
   selectReviewGateConfig: (candidates: string[]) => { status: number; path?: string };
 };
-
-test("Windows development-build CMD fallback uses the trusted parent system path or fails closed", () => {
-  const trustedRoot = "Z:\\Trusted Windows Root";
-  const trustedCmd = `${trustedRoot}\\System32\\cmd.exe`;
-  const buildRoot = "D:\\Gate Source (build)";
-  const source = `
-    const fs = require("node:fs");
-    const cp = require("node:child_process");
-    Object.defineProperty(process, "platform", { value: "win32" });
-    process.env.PATH = "";
-    process.env.ComSpec = "C:\\\\untrusted\\\\cmd.exe";
-    const trustedCmd = ${JSON.stringify(trustedCmd)};
-    let regular = false;
-    let calls = [];
-    fs.statSync = (candidate) => {
-      if (candidate === trustedCmd && regular) return { isFile: () => true };
-      throw new Error("fixture file unavailable");
-    };
-    cp.spawnSync = (file, args, options) => {
-      calls.push({ file, args, options });
-      return { status: 0 };
-    };
-    const helper = require(${JSON.stringify(helperPath)});
-    const scenarios = [
-      { root: ${JSON.stringify(trustedRoot)}, regular: true },
-      { regular: true },
-      { root: "relative-root", regular: true },
-      { root: ${JSON.stringify(trustedRoot)}, regular: false },
-    ];
-    const results = scenarios.map((scenario) => {
-      for (const key of Object.keys(process.env)) {
-        if (key.toLowerCase() === "systemroot") delete process.env[key];
-      }
-      if (scenario.root) process.env.sYsTeMrOoT = scenario.root;
-      regular = scenario.regular;
-      calls = [];
-      const result = helper.buildExtension(${JSON.stringify(buildRoot)});
-      return { status: result.status, error: result.error?.message, calls };
-    });
-    process.stdout.write(JSON.stringify(results));
-  `;
-  const isolated = spawnSync(process.execPath, ["-e", source], { encoding: "utf8" });
-  assert.equal(isolated.status, 0, isolated.stderr);
-  const results = JSON.parse(isolated.stdout) as Array<{
-    status: number | null;
-    error?: string;
-    calls: Array<{ file: string; args: string[]; options: { windowsVerbatimArguments?: boolean } }>;
-  }>;
-  assert.equal(results[0].status, 0);
-  assert.deepEqual(results[0].calls.map((call) => call.file), [trustedCmd]);
-  assert.deepEqual(results[0].calls[0].args, [
-    "/d", "/s", "/c", `npm --prefix ${helperModule.cmdQuote(buildRoot)} run build`,
-  ]);
-  assert.equal(results[0].calls[0].options.windowsVerbatimArguments, true);
-  for (const result of results.slice(1)) {
-    assert.equal(result.status, null);
-    assert.match(result.error ?? "", /refusing an unqualified development-build fallback/);
-    assert.deepEqual(result.calls, [], "an unavailable trusted CMD must never spawn a fallback");
-  }
-});
-
-test("native Windows development-build fallback ignores CMD copies in CWD and PATH", { skip: !isWindows, timeout: 30_000 }, async () => {
-  const scratch = await mkdtemp(join(tmpdir(), "prg-build-cmd-root-"));
-  try {
-    const bin = join(scratch, "npm bin");
-    const buildRoot = join(scratch, "source root (build)");
-    const capture = join(scratch, "npm-argv.json");
-    const stub = join(bin, "npm-stub.cjs");
-    await mkdir(bin, { recursive: true });
-    await mkdir(buildRoot, { recursive: true });
-    await copyFile(process.execPath, join(scratch, "cmd.exe"));
-    await copyFile(process.execPath, join(bin, "cmd.exe"));
-    await writeFile(stub, `require('node:fs').writeFileSync(${JSON.stringify(capture)}, JSON.stringify(process.argv.slice(2)));`, "utf8");
-    // Deliberately not npm's parseable %dp0% shape: exercise the CMD fallback.
-    await writeFile(join(bin, "npm.cmd"), `@ECHO off\r\n"${process.execPath}" "${stub}" %*\r\n`, "utf8");
-    const env = { ...process.env };
-    for (const key of Object.keys(env)) {
-      if (key.toLowerCase() === "path") delete env[key];
-    }
-    env.PATH = bin;
-    env.ComSpec = join(bin, "cmd.exe");
-    const source = `const result=require(${JSON.stringify(helperPath)}).buildExtension(${JSON.stringify(buildRoot)}); if(result.error) console.error(result.error.message); process.exitCode=result.error?1:(result.status??1);`;
-    const result = spawnSync(process.execPath, ["-e", source], {
-      cwd: scratch, env, encoding: "utf8", timeout: 20_000,
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(JSON.parse(await readFile(capture, "utf8")), ["--prefix", buildRoot, "run", "build"]);
-  } finally {
-    await rm(scratch, { recursive: true, force: true });
-  }
-});
 
 interface SimulatedWindowsSpawnCase {
   args: string[];
@@ -272,23 +180,15 @@ async function makeFixture(prefix: string, options: { skipNpmShim?: boolean; emp
   }
 
   if (!options.skipNpmShim) {
-    // Fake npm: records its arguments and exits with NPM_EXIT_CODE. The
-    // helper's development-launch branch resolves npm through the platform
-    // loader (POSIX execvp; Windows: the npm.cmd shim's JavaScript entry
-    // point through this Node binary) with a fixed argument array — never a
-    // shell.
-    const npmCapture = join(bin, "npm-capture.cjs");
-    await writeFile(npmCapture, [
-      "const fs = require('node:fs');",
-      "fs.writeFileSync(process.env.CAPTURE_DIR + '/npm-args', JSON.stringify(process.argv.slice(2)));",
-      "process.exit(Number(process.env.NPM_EXIT_CODE ?? '0'));",
-    ].join("\n"), "utf8");
+    // Fake npm the shared preparation engine resolves exactly like a real
+    // installation: PATH's npm entry resolves into an npm package whose
+    // manifest declares the public JS CLI. The CLI records its arguments,
+    // stages a synthetic TypeScript compiler, and propagates NPM_EXIT_CODE.
+    await writeFakeNpm(bin, { recordFile: join(capture, "npm-args") });
     if (isWindows) {
-      await writeFile(join(bin, "npm.cmd"), npmCmdShim("npm-capture.cjs"), "utf8");
-    } else {
-      const npmPath = join(bin, "npm");
-      await writeFile(npmPath, `#!/usr/bin/env bash\nexec node "${npmCapture}" "$@"\n`, "utf8");
-      await chmod(npmPath, 0o755);
+      // The Windows resolver looks for npm/npm.cmd first; the sibling package
+      // CLI beside them is the validated entry used directly.
+      await writeFile(join(bin, "npm.cmd"), "@ECHO off\r\nrem resolved through the sibling npm package CLI\r\n", "utf8");
     }
   }
 
@@ -425,6 +325,31 @@ function runStagedHelperExpectingFailure(helper: string, args: string[], env: No
     );
 }
 
+/**
+ * Copy the launcher and every shared module it requires into a staged package
+ * tree. The preparation authority and build engine are ordinary shipped scripts,
+ * so a staged package (exactly like a real npm install) contains all of them.
+ */
+async function stageLauncherScripts(stage: string): Promise<void> {
+  await mkdir(join(stage, "scripts"), { recursive: true });
+  for (const name of [
+    "pi-review-gate-launcher.cjs",
+    "prepare-application.cjs",
+    "application-build.cjs",
+    "managed-generations.cjs",
+  ]) {
+    await copyFile(resolve("scripts", name), join(stage, "scripts", name));
+  }
+}
+
+/** Copy the real shipped skills into a staged package tree. */
+async function stageShippedSkills(stage: string): Promise<void> {
+  await cp(resolve("skills"), join(stage, "skills"), {
+    recursive: true,
+    filter: (source) => basename(source) !== ".terraform",
+  });
+}
+
 interface LaunchCapture {
   args: string[];
   configEnv: string | null;
@@ -436,6 +361,17 @@ interface LaunchCapture {
 
 function capturedLaunch(fixture: Fixture): Promise<LaunchCapture> {
   return readFile(join(fixture.capture, "pi.json"), "utf8").then(JSON.parse) as Promise<LaunchCapture>;
+}
+
+/**
+ * Assert that a launch forwarded the prepared extension (a compiled entry whose
+ * root is the automatically prepared generation or the installed package) plus
+ * exactly the caller's arguments.
+ */
+function assertExtensionLaunch(args: string[], forwarded: string[], message?: string): void {
+  assert.equal(args[0], "--extension", message);
+  assert.equal(isCompiledExtension(args[1] ?? ""), true, message ?? `unexpected extension: ${args[1]}`);
+  assert.deepEqual(args.slice(2), forwarded, message);
 }
 
 async function launchStarted(fixture: Fixture): Promise<boolean> {
@@ -525,7 +461,7 @@ test("launcher helper first launch creates a private zero-model default config i
   assert.match(result.stderr, /no persistent config found; created default zero-model config at/);
   assert.match(result.stderr, /no reviewers or workers are selected yet; configure them with \/review-settings/);
   assert.match(result.stdout, new RegExp(escapeRegExp(fixture.defaultConfigPath)));
-  assert.match(result.stdout, new RegExp(escapeRegExp(resolve("dist/src/index.js"))));
+  assert.match(result.stdout, /pi-review-gate extension: .*dist[\\/]src[\\/]index\.js/);
 
   const generated = JSON.parse(await readFile(fixture.defaultConfigPath, "utf8")) as unknown;
   assert.deepEqual(generated, zeroModelDefaultConfig);
@@ -558,8 +494,7 @@ test("launcher helper resolves, exports and forwards on a normal launch", async 
   }));
 
   const launch = await capturedLaunch(fixture);
-  const extensionPath = resolve("dist/src/index.js");
-  assert.deepEqual(launch.args, ["--extension", extensionPath, "--model", "example", "--tools", "read,bash"]);
+  assertExtensionLaunch(launch.args, ["--model", "example", "--tools", "read,bash"]);
   assert.equal(launch.configEnv, fixture.defaultConfigPath,
     "the helper must export the resolved persistent config for pi");
   assert.equal(launch.disabledEnv, null);
@@ -570,7 +505,7 @@ test("launcher helper resolves, exports and forwards on a normal launch", async 
   assert.equal(launch.ddgsEnv, helperModule.ddgsPythonPath(fixtureDdgsVenv(fixture), process.platform),
     "the exported interpreter must come from the venv the environment requested");
   assert.match(result.stdout, new RegExp(`pi-review-gate config: ${escapeRegExp(fixture.defaultConfigPath)}`));
-  assert.match(result.stdout, new RegExp(`pi-review-gate extension: ${escapeRegExp(extensionPath)}`));
+  assert.match(result.stdout, /pi-review-gate extension: .*dist[\\/]src[\\/]index\.js/);
   assert.match(result.stdout,
     new RegExp(`pi-review-gate orchestrator skill: ${escapeRegExp(join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md"))}`));
   assert.match(result.stdout,
@@ -606,7 +541,7 @@ test("launcher helper keeps the compatibility fallback and never initializes bes
   assert.equal(await readFile(fixture.fallbackConfigPath, "utf8"), prior,
     "an existing fallback config must be preserved unchanged");
   assert.doesNotMatch(result.stderr, /created default zero-model config/);
-  assert.equal(await pathExists(fixture.agentDir), false,
+  assert.equal(await pathExists(fixture.defaultConfigPath), false,
     "a present fallback config must not trigger default initialization");
 });
 
@@ -709,23 +644,33 @@ test("launcher helper fails closed over an invalid fallback and never initialize
   assert.equal(await launchStarted(fixture), false);
 });
 
-test("launcher helper development launch rebuilds dist and forwards the fresh extension", async () => {
-  const fixture = await makeFixture("pi-review-cmd-rebuild-");
+test("launcher helper prepares once for a source checkout and is current on the next launch", async () => {
+  const fixture = await makeFixture("pi-review-cmd-prepare-");
   await mkdir(fixture.agentDir, { recursive: true });
   await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
 
   const result = await runHelper(["--model", "example"], fixtureEnv(fixture));
 
+  // The shared preparation engine ran one locked install in an isolated staged
+  // generation; it never ran the package build lifecycle in the checkout.
   const npmArgs = JSON.parse(await readFile(join(fixture.capture, "npm-args"), "utf8")) as string[];
-  assert.deepEqual(npmArgs, ["--prefix", resolve(""), "run", "build"],
-    "a source checkout must rebuild dist through npm --prefix before launching");
+  assert.deepEqual(npmArgs.slice(0, 1), ["ci"], "the only install is the locked ci install");
+  assert.ok(!npmArgs.includes("run") && !npmArgs.includes("build"),
+    "no package build lifecycle is ever invoked");
   const launch = await capturedLaunch(fixture);
-  assert.deepEqual(launch.args.slice(0, 2), ["--extension", resolve("dist/src/index.js")]);
-  assert.match(result.stdout, new RegExp(escapeRegExp(resolve("dist/src/index.js"))));
+  assertExtensionLaunch(launch.args, ["--model", "example"]);
+  assert.match(result.stdout, /pi-review-gate extension: .*dist[\\/]src[\\/]index\.js/);
+
+  // The next launch is current: no install, no compiler, no staging.
+  await rm(join(fixture.capture, "npm-args"), { force: true });
+  await runHelper(["--model", "example"], fixtureEnv(fixture));
+  assert.equal(await pathExists(join(fixture.capture, "npm-args")), false,
+    "a current launch performs no install");
+  assertExtensionLaunch((await capturedLaunch(fixture)).args, ["--model", "example"]);
 });
 
-test("launcher helper fails closed on a build failure and never launches a stale extension", async () => {
-  const fixture = await makeFixture("pi-review-cmd-buildfail-");
+test("launcher helper fails closed on a preparation failure and never launches a stale extension", async () => {
+  const fixture = await makeFixture("pi-review-cmd-prepare-fail-");
   await mkdir(fixture.agentDir, { recursive: true });
   await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
 
@@ -745,21 +690,9 @@ test("launcher helper packaged mode uses the packaged artifact and fails closed 
   const scratch = await mkdtemp(join(tmpdir(), "pi-review-cmd-package-"));
   try {
     const stage = join(scratch, "package dir with spaces");
-    await mkdir(join(stage, "scripts"), { recursive: true });
-    await mkdir(join(stage, "skills", "pi-review-gate-orchestrator", "references"), { recursive: true });
-    await mkdir(join(stage, "skills", "pi-review-gate-execution"), { recursive: true });
-    await mkdir(join(stage, "skills", "pi-review-gate-research"), { recursive: true });
-    await mkdir(join(stage, "skills", "pi-review-gate-completion"), { recursive: true });
-    await copyFile(helperPath, join(stage, "scripts", "pi-review-gate-launcher.cjs"));
+    await stageLauncherScripts(stage);
     if (isWindows) await copyFile(cmdPath, join(stage, "scripts", "pi-review-gate.cmd"));
-    await copyFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), join(stage, "skills/pi-review-gate-orchestrator/SKILL.md"));
-    await copyFile(
-      resolve("skills/pi-review-gate-orchestrator/references/recovery.md"),
-      join(stage, "skills/pi-review-gate-orchestrator/references/recovery.md"),
-    );
-    await copyFile(resolve("skills/pi-review-gate-execution/SKILL.md"), join(stage, "skills/pi-review-gate-execution/SKILL.md"));
-    await copyFile(resolve("skills/pi-review-gate-research/SKILL.md"), join(stage, "skills/pi-review-gate-research/SKILL.md"));
-    await copyFile(resolve("skills/pi-review-gate-completion/SKILL.md"), join(stage, "skills/pi-review-gate-completion/SKILL.md"));
+    await stageShippedSkills(stage);
 
     const missingFixture = await makeFixture("pi-review-cmd-packmiss-");
     // The staged tree has no src and no dist: packaged failure, exit 2.
@@ -769,12 +702,11 @@ test("launcher helper packaged mode uses the packaged artifact and fails closed 
     // of the stage (e.g. /private/var vs /var symlinks on macOS).
     const realStage = await realpath(stage);
     assert.equal(missing.status, 2);
-    assert.match(missing.stderr, /packaged extension is missing/);
+    assert.match(missing.stderr, /packaged extension output is missing/);
     assert.equal(await launchStarted(missingFixture), false);
 
     // With the packaged artifact present the helper uses it and never builds.
-    await mkdir(join(stage, "dist", "src"), { recursive: true });
-    await writeFile(join(stage, "dist", "src", "index.js"), "module.exports = { activate() {} };\n", "utf8");
+    writeRequiredOutputs(stage);
     const fixture = await makeFixture("pi-review-cmd-package-");
     const result = await runStagedHelperExpectingFailure(join(stage, "scripts", "pi-review-gate-launcher.cjs"), ["--model", "example"], fixtureEnv(fixture), scratch).then((outcome) => {
       assert.equal(outcome.status, 0, `stderr: ${outcome.stderr}`);
@@ -833,7 +765,7 @@ test("launcher helper quotes spaces, empty arguments and metacharacters for pi",
   await runHelper(forwarded, fixtureEnv(fixture));
 
   const launch = await capturedLaunch(fixture);
-  assert.deepEqual(launch.args, ["--extension", resolve("dist/src/index.js"), ...forwarded]);
+  assertExtensionLaunch(launch.args, forwarded);
 });
 
 test("launcher helper propagates the launched pi exit status", async () => {
@@ -901,9 +833,9 @@ test("launcher helper clears an inherited scheduler flag and honors --scheduler"
   await runHelper(["--scheduler", "--model", "example"], envFor({ PI_REVIEW_GATE_SCHEDULER: "1" }));
   let capture = await capturedScheduler();
   assert.equal(capture.schedulerEnv, "1", "--scheduler exports the flag for this launch (inherited value present)");
-  assert.deepEqual(
+  assertExtensionLaunch(
     capture.args,
-    ["--extension", resolve("dist/src/index.js"), "--model", "example"],
+    ["--model", "example"],
     "--scheduler is consumed by the helper and never forwarded to pi",
   );
 
@@ -1469,80 +1401,277 @@ test("concurrent first launches never clobber or expose partial JSON", async () 
 const posixDdgsSkipReason =
   "POSIX bash-stub coverage; the native Windows equivalents below drive the real helper, .cmd entry point and Python";
 
-const venvPythonStub = (behavior: "valid" | "fail-first" | "refuse") => [
-  "#!/usr/bin/env bash",
-  "{ printf 'CALL\\t'; printf '%s\\t' \"$@\"; printf '\\n'; } >> \"$CAPTURE_DIR/python-calls\"",
-  'if [[ "$1" == "-I" && "$2" == "-c" ]]; then',
-  ...(behavior === "valid" ? [] : [
-    '  count=$(cat "$CAPTURE_DIR/check-count" 2>/dev/null || echo 0)',
-    '  count=$((count + 1))',
-    "  printf '%s\\n' \"$count\" > \"$CAPTURE_DIR/check-count\"",
-    ...(behavior === "refuse" ? [] : ['  [[ "$count" -ge 2 ]] && exit 0']),
-    "  exit 1",
-  ]),
-  "fi",
-  "exit 0",
-  "",
-].join("\n");
+/**
+ * Scenario for the POSIX stub venv interpreter used by the helper's DDGS
+ * provisioning tests. Each scenario records every invocation and applies only
+ * the provisioning behavior it names, so the recorded sequence proves exactly
+ * which validations and repairs ran (issue 344: one warm validation pair).
+ */
+type DdgsStubScenario =
+  | "valid"
+  | "version-fail-first"
+  | "pip-fail-first"
+  | "version-always-invalid"
+  | "post-repair-pip-invalid"
+  | "install-fails";
 
-test("helper uses a valid cached DDGS venv without provisioning", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
+/**
+ * A POSIX stub venv python. "invalid until repaired" scenarios become valid
+ * only after the stub itself served the pinned pip install, so a launch that
+ * continues proves the helper revalidated the repaired environment from
+ * scratch instead of trusting the install that just ran.
+ */
+function venvPythonStub(scenario: DdgsStubScenario): string {
+  const repaired = '[[ -f "$CAPTURE_DIR/ddgs-installed" ]]';
+  const versionCheck: Record<DdgsStubScenario, string[]> = {
+    valid: ["exit 0"],
+    "version-fail-first": [`${repaired} && exit 0`, "exit 1"],
+    "pip-fail-first": ["exit 0"],
+    "version-always-invalid": ["exit 1"],
+    "post-repair-pip-invalid": [`${repaired} && exit 0`, "exit 1"],
+    "install-fails": ["exit 1"],
+  };
+  const pipCheck: Record<DdgsStubScenario, string[]> = {
+    valid: ["exit 0"],
+    "version-fail-first": ["exit 0"],
+    "pip-fail-first": [`${repaired} && exit 0`, "exit 1"],
+    "version-always-invalid": ["exit 0"],
+    "post-repair-pip-invalid": ["exit 1"],
+    "install-fails": ["exit 0"],
+  };
+  return [
+    "#!/usr/bin/env bash",
+    "{ printf 'CALL\\t'; printf '%s\\t' \"$@\"; printf '\\n'; } >> \"$CAPTURE_DIR/python-calls\"",
+    'if [[ "$1" == "-I" && "$2" == "-c" ]]; then',
+    ...versionCheck[scenario].map((line) => `  ${line}`),
+    'elif [[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" && "$4" == "install" ]]; then',
+    '  : > "$CAPTURE_DIR/ddgs-installed"',
+    `  exit ${scenario === "install-fails" ? 7 : 0}`,
+    'elif [[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" && "$4" == "check" ]]; then',
+    ...pipCheck[scenario].map((line) => `  ${line}`),
+    "fi",
+    "exit 0",
+    "",
+  ].join("\n");
+}
+
+/** Classify one recorded python invocation by the DDGS step it represents. */
+function ddgsCallKind(args: string[]): "version" | "pip-check" | "install" | "venv" | "probe" | "other" {
+  if (args[0] !== "-I") return "other";
+  if (args[1] === "-c" && args[2]?.includes("import ddgs")) return "version";
+  if (args[1] === "-c" && args[2] === "import sys") return "probe";
+  if (args[1] === "-m" && args[2] === "pip" && args[3] === "check") return "pip-check";
+  if (args[1] === "-m" && args[2] === "pip" && args[3] === "install") return "install";
+  if (args[1] === "-m" && args[2] === "venv") return "venv";
+  return "other";
+}
+
+/** One recorded stub invocation, classified by the DDGS step it represents. */
+interface DdgsPythonCall {
+  args: string[];
+  kind: ReturnType<typeof ddgsCallKind>;
+}
+
+function classifyDdgsCalls(calls: Array<{ args: string[] }>): DdgsPythonCall[] {
+  return calls.map((call) => ({ args: call.args, kind: ddgsCallKind(call.args) }));
+}
+
+function ddgsPythonCalls(raw: string): DdgsPythonCall[] {
+  const lines = raw.split("\n").filter(Boolean);
+  return classifyDdgsCalls(lines.map((line) => ({ args: line.split("\t").slice(1) })));
+}
+
+async function recordedDdgsCalls(fixture: Fixture): Promise<DdgsPythonCall[]> {
+  return ddgsPythonCalls(await readFile(join(fixture.capture, "python-calls"), "utf8"));
+}
+
+function callKinds(calls: DdgsPythonCall[]): string[] {
+  return calls.map((call) => call.kind);
+}
+
+function assertIsolatedPythonCalls(calls: DdgsPythonCall[]): void {
+  for (const call of calls) {
+    assert.equal(call.args[0], "-I", `Python invocation not in isolated mode: ${call.args.join(" ")}`);
+  }
+}
+
+async function stageDdgsStubScenario(fixture: Fixture, scenario: DdgsStubScenario): Promise<void> {
+  const venvPythonPath = join(fixture.ddgsVenv, "bin", "python");
+  await writeFile(venvPythonPath, venvPythonStub(scenario), "utf8");
+  await chmod(venvPythonPath, 0o755);
+}
+
+test("helper validates a valid cached DDGS venv exactly once without provisioning", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
   const fixture = await makeFixture("pi-review-cmd-ddgs-cached-");
   await mkdir(fixture.agentDir, { recursive: true });
   await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
+  await stageDdgsStubScenario(fixture, "valid");
 
   const result = await runHelperExpectingFailure([], fixtureEnv(fixture));
 
   assert.equal(result.status, 0);
   assert.doesNotMatch(result.stderr, /creating DDGS|installing DDGS/,
     "a valid cached venv must be neither created nor reinstalled");
-  const calls = (await readFile(join(fixture.capture, "python-calls"), "utf8")).split("\n").filter(Boolean);
-  assert.ok(calls.some((call) => call.includes("-c")), "expected a version validation invocation");
-  assert.ok(calls.some((call) => call.includes("check")), "expected a pip check invocation");
-  assert.ok(!calls.some((call) => call.includes("venv")), "no venv creation for a cached venv");
-  assert.ok(!calls.some((call) => call.includes("install")), "no reinstall for a cached valid venv");
-  for (const call of calls) assert.equal(call.split("\t")[1], "-I", `not isolated: ${call}`);
+  const calls = await recordedDdgsCalls(fixture);
+  // A warm launch runs the full isolated validation once: the pinned version
+  // import followed by the dependency check. The former duplicate second
+  // validation pair (four python invocations) is deliberately gone, and this
+  // count is the issue-344 contract rather than incidental output.
+  assert.deepEqual(callKinds(calls), ["version", "pip-check"],
+    "a warm launch must run exactly one version import and one pip check");
+  assertIsolatedPythonCalls(calls);
+  assert.equal(await launchStarted(fixture), true, "a validated cached venv must let the launch continue");
 });
 
-test("helper repairs an invalid cached venv and continues", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
+test("helper validation counts are observable through the spawn recorder", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
+  // Exercises the exact spawn-recording seam the win32-only real-Python count
+  // tests rely on, so a recorder defect surfaces on every platform instead of
+  // only on native Windows CI.
+  const fixture = await makeFixture("pi-review-cmd-ddgs-recorder-");
+  await mkdir(fixture.agentDir, { recursive: true });
+  await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
+  await stageDdgsStubScenario(fixture, "valid");
+  const recorder = await writeSpawnRecorder(fixture);
+  const venvPython = join(fixture.ddgsVenv, "bin", "python");
+
+  const result = await execFileAsync(process.execPath, ["--require", recorder, helperPath], { env: fixtureEnv(fixture) });
+
+  assert.equal(await launchStarted(fixture), true, `stderr: ${result.stderr}`);
+  const calls = await recordedPythonSpawns(fixture, venvPython);
+  assert.deepEqual(callKinds(calls), ["version", "pip-check"],
+    `the helper must spawn exactly one validation pair: ${JSON.stringify(callKinds(calls))}`);
+  assertIsolatedPythonCalls(calls);
+});
+
+test("helper keeps DDGS validation isolated when the working directory shadows modules", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
+  const fixture = await makeFixture("pi-review-cmd-ddgs-shadow-");
+  await mkdir(fixture.agentDir, { recursive: true });
+  await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
+  await stageDdgsStubScenario(fixture, "valid");
+  // An untrusted reviewed repository as the helper's working directory: every
+  // validation still has to run in isolated mode (-I). The real-Python
+  // counterpart of this guard (a shadow module that would actually execute)
+  // lives in tests/launcher.test.ts for scripts/ensure-ddgs.sh.
+  const untrusted = join(fixture.root, "untrusted reviewed checkout");
+  await mkdir(untrusted, { recursive: true });
+  for (const name of ["ddgs.py", "pip.py", "venv.py"]) {
+    await writeFile(join(untrusted, name), "raise SystemExit('a reviewed repository shadow module must never run')\n", "utf8");
+  }
+
+  const result = await runHelperExpectingFailure([], fixtureEnv(fixture), untrusted);
+
+  assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+  const calls = await recordedDdgsCalls(fixture);
+  assert.deepEqual(callKinds(calls), ["version", "pip-check"]);
+  assertIsolatedPythonCalls(calls);
+  assert.equal(await launchStarted(fixture), true);
+});
+
+test("helper repairs an invalid cached venv and revalidates the full contract", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
   const fixture = await makeFixture("pi-review-cmd-ddgs-repair-");
   await mkdir(fixture.agentDir, { recursive: true });
   await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
-  const venvPythonPath = join(fixture.ddgsVenv, "bin", "python");
-  await writeFile(venvPythonPath, venvPythonStub("fail-first"), "utf8");
-  await chmod(venvPythonPath, 0o755);
+  await stageDdgsStubScenario(fixture, "version-fail-first");
 
   const result = await runHelperExpectingFailure([], fixtureEnv(fixture));
 
   assert.equal(result.status, 0, `repair must let the launch continue: ${result.stderr}`);
   assert.match(result.stderr, /installing DDGS/);
-  const calls = (await readFile(join(fixture.capture, "python-calls"), "utf8")).split("\n").filter(Boolean);
-  assert.ok(calls.some((call) => call.includes("install")), "expected a pip install invocation");
-  assert.ok(calls.some((call) => call.includes("check")), "expected a pip check invocation");
-  assert.ok(calls.some((call) => call.includes("-c")), "expected a version validation invocation");
-  for (const call of calls) assert.equal(call.split("\t")[1], "-I", `not isolated: ${call}`);
+  const calls = await recordedDdgsCalls(fixture);
+  // One failed initial validation, one pinned install, then the complete
+  // post-repair contract: version import and dependency check.
+  assert.deepEqual(callKinds(calls), ["version", "install", "version", "pip-check"],
+    `repair must revalidate the full contract once: ${JSON.stringify(callKinds(calls))}`);
+  const install = calls.find((call) => call.kind === "install");
+  assert.ok(install, "expected a pip install invocation");
+  assert.ok(install.args.includes(`ddgs==${helperModule.DDGS_VERSION}`),
+    "the pinned ddgs version must be installed");
+  for (const flag of ["--only-binary=:all:", "--no-cache-dir", "--no-input", "--disable-pip-version-check"]) {
+    assert.ok(install.args.includes(flag), `the pinned resolver flags must be unchanged: missing ${flag}`);
+  }
+  assertIsolatedPythonCalls(calls);
   assert.equal(await launchStarted(fixture), true, "a repaired venv must let the launch continue");
+  assert.equal((await capturedLaunch(fixture)).ddgsEnv, join(fixture.ddgsVenv, "bin", "python"));
+});
+
+test("helper repairs an inconsistent dependency graph and revalidates the full contract", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
+  const fixture = await makeFixture("pi-review-cmd-ddgs-repair-graph-");
+  await mkdir(fixture.agentDir, { recursive: true });
+  await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
+  await stageDdgsStubScenario(fixture, "pip-fail-first");
+
+  const result = await runHelperExpectingFailure([], fixtureEnv(fixture));
+
+  assert.equal(result.status, 0, `a repaired dependency graph must let the launch continue: ${result.stderr}`);
+  assert.match(result.stderr, /installing DDGS/);
+  const calls = await recordedDdgsCalls(fixture);
+  // The version import passes but the dependency graph is inconsistent, so the
+  // repair still runs and is followed by both post-repair checks.
+  assert.deepEqual(callKinds(calls), ["version", "pip-check", "install", "version", "pip-check"],
+    `a pip-graph repair must revalidate fully: ${JSON.stringify(callKinds(calls))}`);
+  assertIsolatedPythonCalls(calls);
+  assert.equal(await launchStarted(fixture), true,
+    "a repaired dependency graph must let the launch continue");
   assert.equal((await capturedLaunch(fixture)).ddgsEnv, join(fixture.ddgsVenv, "bin", "python"));
 });
 
 test("helper refuses to continue when the DDGS venv stays broken", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
   const fixture = await makeFixture("pi-review-cmd-ddgs-refuse-");
-  const venvPythonPath = join(fixture.ddgsVenv, "bin", "python");
-  await writeFile(venvPythonPath, venvPythonStub("refuse"), "utf8");
-  await chmod(venvPythonPath, 0o755);
+  await stageDdgsStubScenario(fixture, "version-always-invalid");
 
   const result = await runHelperExpectingFailure([], fixtureEnv(fixture));
 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /is unavailable or has inconsistent dependencies; refusing to continue/);
+  const calls = await recordedDdgsCalls(fixture);
+  // The failed version import short-circuits the dependency check, and the
+  // post-repair validation fails the same way: no acceptance, no launch.
+  assert.deepEqual(callKinds(calls), ["version", "install", "version"],
+    `a failed post-repair version import must refuse: ${JSON.stringify(callKinds(calls))}`);
+  assertIsolatedPythonCalls(calls);
   assert.equal(await launchStarted(fixture), false, "a broken venv must stop the launch");
 });
 
-test("helper provisions a fresh DDGS venv without Bash", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
-  const fixture = await makeFixture("pi-review-cmd-ddgs-fresh-", { emptyDdgsVenv: true });
-  // The venv starts empty: the helper must find an interpreter (python3 first,
-  // then python), create the venv, install, validate, and export the python.
-  // The shim passes the probe (`-c "import sys"`), fails the first ddgs
-  // validation (forcing the install path), then succeeds.
+test("helper refuses when a repair leaves the dependency graph inconsistent", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
+  const fixture = await makeFixture("pi-review-cmd-ddgs-refuse-graph-");
+  await stageDdgsStubScenario(fixture, "post-repair-pip-invalid");
+
+  const result = await runHelperExpectingFailure([], fixtureEnv(fixture));
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /is unavailable or has inconsistent dependencies; refusing to continue/);
+  const calls = await recordedDdgsCalls(fixture);
+  // A successful install is never acceptance on its own: the post-repair pip
+  // check still fails, so the helper must refuse.
+  assert.deepEqual(callKinds(calls), ["version", "install", "version", "pip-check"],
+    `a failed post-repair pip check must refuse: ${JSON.stringify(callKinds(calls))}`);
+  assertIsolatedPythonCalls(calls);
+  assert.equal(await launchStarted(fixture), false, "an inconsistently repaired venv must stop the launch");
+});
+
+test("helper propagates a failing pinned install without accepting the venv", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
+  const fixture = await makeFixture("pi-review-cmd-ddgs-install-fail-");
+  await stageDdgsStubScenario(fixture, "install-fails");
+
+  const result = await runHelperExpectingFailure([], fixtureEnv(fixture));
+
+  assert.equal(result.status, 7, "the install's own exit status must propagate");
+  assert.match(result.stderr, /installing DDGS/);
+  assert.doesNotMatch(result.stderr, /refusing to continue/,
+    "a failing install exits with its own status instead of the post-repair refusal");
+  const calls = await recordedDdgsCalls(fixture);
+  assert.deepEqual(callKinds(calls), ["version", "install"],
+    `a failed install must never be accepted: ${JSON.stringify(callKinds(calls))}`);
+  assertIsolatedPythonCalls(calls);
+  assert.equal(await launchStarted(fixture), false, "a failed install must stop the launch");
+});
+
+/**
+ * A python3 stub at the creation seam: it answers the helper's isolated-mode
+ * probe, and `-m venv` creates the requested environment with a venv python
+ * that applies the given DDGS scenario.
+ */
+async function stagePosixPython3Creator(fixture: Fixture, scenario: DdgsStubScenario): Promise<void> {
   const python3Shim = join(fixture.bin, "python3");
   await writeFile(python3Shim, [
     "#!/usr/bin/env bash",
@@ -1550,7 +1679,9 @@ test("helper provisions a fresh DDGS venv without Bash", { skip: isWindows ? pos
     'if [[ "$3" == "import sys" ]]; then exit 0; fi',
     'if [[ "$3" == "venv" ]]; then',
     '  mkdir -p "$4/bin"',
-    '  cat > "$4/bin/python" <<\'STUB\'\n#!/usr/bin/env bash\n{ printf \'CALL\\t\'; printf \'%s\\t\' "$@"; printf \'\\n\'; } >> "$CAPTURE_DIR/python-calls"\nif [[ "$1" == "-I" && "$2" == "-c" ]]; then\n  count=$(cat "$CAPTURE_DIR/check-count" 2>/dev/null || echo 0)\n  count=$((count + 1))\n  printf \'%s\\n\' "$count" > "$CAPTURE_DIR/check-count"\n  [[ "$count" -ge 2 ]] && exit 0\n  exit 1\nfi\nexit 0\nSTUB',
+    `  cat > "$4/bin/python" <<'STUB'`,
+    venvPythonStub(scenario),
+    "STUB",
     '  chmod +x "$4/bin/python"',
     "  exit 0",
     "fi",
@@ -1558,6 +1689,16 @@ test("helper provisions a fresh DDGS venv without Bash", { skip: isWindows ? pos
     "",
   ].join("\n"), "utf8");
   await chmod(python3Shim, 0o755);
+}
+
+test("helper provisions a fresh DDGS venv without Bash", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
+  const fixture = await makeFixture("pi-review-cmd-ddgs-fresh-", { emptyDdgsVenv: true });
+  // The venv starts empty: the helper must find an interpreter (python3 first,
+  // then python), create the venv, install, and export the python. The created
+  // venv python fails the first ddgs validation (forcing the install path) and
+  // only becomes valid after the install, so the recorded sequence proves the
+  // full post-repair validation ran.
+  await stagePosixPython3Creator(fixture, "version-fail-first");
 
   const result = await runHelperExpectingFailure([], fixtureEnv(fixture));
 
@@ -1565,14 +1706,29 @@ test("helper provisions a fresh DDGS venv without Bash", { skip: isWindows ? pos
   assert.match(result.stderr, /creating DDGS/);
   assert.match(result.stderr, /installing DDGS/);
   assert.equal((await capturedLaunch(fixture)).ddgsEnv, join(fixture.ddgsVenv, "bin", "python"));
-  const calls = (await readFile(join(fixture.capture, "python-calls"), "utf8")).split("\n").filter(Boolean);
-  assert.ok(calls.some((call) => call.includes("venv")), "expected a venv creation invocation");
-  assert.ok(calls.some((call) => call.includes("install")), "expected a pinned ddgs install invocation");
-  assert.ok(
-    calls.some((call) => call.includes(`ddgs==${helperModule.DDGS_VERSION}`)),
-    "the pinned ddgs version must be installed",
-  );
-  for (const call of calls) assert.equal(call.split("\t")[1], "-I", `not isolated: ${call}`);
+  const calls = await recordedDdgsCalls(fixture);
+  assert.deepEqual(callKinds(calls), ["probe", "venv", "version", "install", "version", "pip-check"],
+    `creation must end in one full validation pair: ${JSON.stringify(callKinds(calls))}`);
+  assert.ok(calls.some((call) => call.kind === "install" && call.args.includes(`ddgs==${helperModule.DDGS_VERSION}`)),
+    "the pinned ddgs version must be installed");
+  assertIsolatedPythonCalls(calls);
+});
+
+test("helper accepts a freshly created venv that is already valid without installing", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
+  const fixture = await makeFixture("pi-review-cmd-ddgs-fresh-valid-", { emptyDdgsVenv: true });
+  await stagePosixPython3Creator(fixture, "valid");
+
+  const result = await runHelperExpectingFailure([], fixtureEnv(fixture));
+
+  assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+  assert.match(result.stderr, /creating DDGS/);
+  assert.doesNotMatch(result.stderr, /installing DDGS/,
+    "a created venv that already validates must not be reinstalled");
+  const calls = await recordedDdgsCalls(fixture);
+  assert.deepEqual(callKinds(calls), ["probe", "venv", "version", "pip-check"],
+    `a created valid venv needs exactly one validation pair: ${JSON.stringify(callKinds(calls))}`);
+  assertIsolatedPythonCalls(calls);
+  assert.equal((await capturedLaunch(fixture)).ddgsEnv, join(fixture.ddgsVenv, "bin", "python"));
 });
 
 test("helper fails closed when no isolated-mode Python interpreter is available", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
@@ -1761,36 +1917,6 @@ test("helper cmd quoting survives cmd.exe's quote toggling without metachar inje
   assert.equal(helperModule.cmdQuote("read,bash"), "read,bash");
 });
 
-test("helper resolves npm cmd-shim JavaScript entry points without a shell", async () => {
-  const scratch = await mkdtemp(join(tmpdir(), "pi-review-cmd-shim-"));
-  try {
-    // An exact npm cmd-shim shape pointing at an existing target resolves.
-    // The shim lives in a .bin directory and references its target through
-    // "%dp0%", mirroring the real node_modules/.bin layout.
-    const targetDir = join(scratch, "pkg", "bin");
-    await mkdir(targetDir, { recursive: true });
-    const binDir = join(scratch, ".bin");
-    await mkdir(binDir, { recursive: true });
-    const target = join(targetDir, "entry.cjs");
-    await writeFile(target, "process.exit(0);\n", "utf8");
-    const shim = join(binDir, "npm.cmd");
-    await writeFile(shim, npmCmdShim("..\\pkg\\bin\\entry.cjs"), "utf8");
-    assert.equal(helperModule.resolveCmdShimTarget(shim), target);
-
-    // A shim whose target does not exist resolves to null (fail closed).
-    const danglingShim = join(binDir, "dangling.cmd");
-    await writeFile(danglingShim, npmCmdShim("..\\pkg\\bin\\missing.cjs"), "utf8");
-    assert.equal(helperModule.resolveCmdShimTarget(danglingShim), null);
-
-    // A shim with no .js/.cjs target resolves to null.
-    const opaqueShim = join(scratch, "opaque.cmd");
-    await writeFile(opaqueShim, "@echo off\r\nsome-tool %*\r\n", "utf8");
-    assert.equal(helperModule.resolveCmdShimTarget(opaqueShim), null);
-  } finally {
-    await rm(scratch, { recursive: true, force: true });
-  }
-});
-
 test("helper resolves the full pi.cmd path without inspecting shim contents", async () => {
   const scratch = await mkdtemp(join(tmpdir(), "pi-review-cmd-piresolve-"));
   try {
@@ -1965,6 +2091,68 @@ function runCmd(command: string, env: NodeJS.ProcessEnv, cwd = resolve("")) {
   return spawnSync("cmd.exe", ["/d", "/c", command], { env, cwd, encoding: "utf8", windowsVerbatimArguments: true });
 }
 
+/**
+ * A NODE_OPTIONS preload for the helper process that records every
+ * child_process.spawnSync it makes (file plus argument array), so the native
+ * tests can count the real Python validations a launch runs instead of only
+ * observing its output.
+ */
+async function writeSpawnRecorder(fixture: Fixture): Promise<string> {
+  const recorder = join(fixture.root, "spawn-recorder.cjs");
+  await writeFile(recorder, [
+    'const cp = require("node:child_process");',
+    'const fs = require("node:fs");',
+    "const spawnSync = cp.spawnSync;",
+    "cp.spawnSync = function (file, args, options) {",
+    "  try {",
+    '    fs.appendFileSync(process.env.CAPTURE_DIR + "/spawn-calls", JSON.stringify({ file: String(file), args: Array.isArray(args) ? args.map(String) : [] }) + "\\n");',
+    "  } catch {}",
+    "  return spawnSync.apply(this, arguments);",
+    "};",
+    "",
+  ].join("\n"), "utf8");
+  return recorder;
+}
+
+/**
+ * Serialize a recorder path as a NODE_OPTIONS preload token.
+ *
+ * Node parses NODE_OPTIONS with its own shell-like quoting rules, where a bare
+ * backslash is an escape character: a native Windows path such as
+ * `C:\Users\runner\AppData\Local\Temp\spawn-recorder.cjs` would otherwise be
+ * reduced to `C:UsersrunnerAppData...` and the preload would never load (the
+ * reported native CI failure: "Cannot find module 'C:Users...spawn-recorder.cjs'").
+ * JSON.stringify emits the doubled backslashes Node's parser unescapes back to
+ * the exact native path, and keeps the one quoted token's spaces intact.
+ */
+function nodeOptionsPreload(recorder: string): string {
+  return `--require ${JSON.stringify(recorder)}`;
+}
+
+test("the recorder preload encoding keeps native separators and spaces through NODE_OPTIONS", { skip: isWindows ? posixDdgsSkipReason : false }, () => {
+  // A synthetic native-Windows spelling: the literal backslashes are exactly
+  // what NODE_OPTIONS parsing would consume as escapes. Requiring the missing
+  // module makes Node report the path it actually parsed, so this asserts the
+  // encoding round-trips instead of only observing a passed-through string.
+  const windowsStyle = "C:\\Users\\run ner\\AppData\\Local\\Temp\\spawn-recorder.cjs";
+  const result = spawnSync(process.execPath, ["-e", "0"], {
+    env: { ...process.env, NODE_OPTIONS: nodeOptionsPreload(windowsStyle) },
+    encoding: "utf8",
+  });
+  assert.notEqual(result.status, 0, "the synthetic preload does not exist, so Node must fail to load it");
+  assert.match(String(result.stderr), /Cannot find module/,
+    "the preload must actually be attempted, not silently dropped");
+  assert.ok(String(result.stderr).includes(windowsStyle),
+    `the preload path must survive NODE_OPTIONS parsing intact: ${String(result.stderr)}`);
+});
+
+/** Classify the recorded spawns that invoked exactly this Python interpreter. */
+async function recordedPythonSpawns(fixture: Fixture, python: string): Promise<DdgsPythonCall[]> {
+  const raw = await readFile(join(fixture.capture, "spawn-calls"), "utf8");
+  const spawns = raw.split("\n").filter(Boolean).map((line) => JSON.parse(line) as { file: string; args: string[] });
+  return classifyDdgsCalls(spawns.filter((spawn) => spawn.file === python));
+}
+
 if (isWindows) {
   test("native launcher invokes both simple and npm pi.cmd implementations", async () => {
     const fixture = await makeFixture("pi-review-cmd-native-shapes-");
@@ -1978,8 +2166,7 @@ if (isWindows) {
       const result = runCmd('scripts\\pi-review-gate.cmd --model "example model"',
         fixtureEnv(fixture, { PI_EXIT_CODE: "7" }));
       assert.equal(result.status, 7, `stderr: ${result.stderr}`);
-      assert.deepEqual((await capturedLaunch(fixture)).args,
-        ["--extension", resolve("dist/src/index.js"), "--model", "example model"]);
+      assertExtensionLaunch((await capturedLaunch(fixture)).args, ["--model", "example model"]);
     }
   });
 
@@ -1989,7 +2176,7 @@ if (isWindows) {
 
     assert.equal(result.status, 0, `stderr: ${result.stderr}`);
     const launch = JSON.parse(await readFile(join(fixture.capture, "pi.json"), "utf8"));
-    assert.deepEqual(launch.args, ["--extension", resolve("dist/src/index.js"), "--model", "example"]);
+    assertExtensionLaunch(launch.args, ["--model", "example"]);
     assert.equal(launch.configEnv, fixture.defaultConfigPath);
     assert.equal(launch.codemodeEnv, "1", "the native launch must export the codemode default");
     assert.equal(launch.ddgsEnv, join(sharedWindowsVenv ?? "", "Scripts", "python.exe"),
@@ -2013,12 +2200,7 @@ if (isWindows) {
 
     assert.equal(result.status, 0, `stderr: ${result.stderr}`);
     const launch = JSON.parse(await readFile(join(fixture.capture, "pi.json"), "utf8"));
-    assert.deepEqual(launch.args, [
-      "--extension", resolve("dist/src/index.js"),
-      "--tools", "read,bash",
-      "--label", "a&b",
-      "--quote", 'say "hi"',
-    ]);
+    assertExtensionLaunch(launch.args, ["--tools", "read,bash", "--label", "a&b", "--quote", 'say "hi"']);
     assert.equal(launch.configEnv, fixture.defaultConfigPath);
     assert.equal(await readFile(fixture.defaultConfigPath, "utf8"), prior,
       "existing config must not be rewritten on a repeat launch");
@@ -2101,7 +2283,7 @@ if (isWindows) {
 
     assert.equal(result.status, 0, `stderr: ${result.stderr}`);
     const launch = JSON.parse(await readFile(join(fixture.capture, "pi.json"), "utf8"));
-    assert.deepEqual(launch.args, ["--extension", resolve("dist/src/index.js"), "--model", "example model"]);
+    assertExtensionLaunch(launch.args, ["--model", "example model"]);
     assert.equal(launch.configEnv, fixture.defaultConfigPath);
   });
 
@@ -2123,13 +2305,7 @@ if (isWindows) {
     assert.doesNotMatch(String(result.stderr), /is not recognized|is not an internal|not found/,
       "no injected command may execute");
     const launch = JSON.parse(await readFile(join(fixture.capture, "pi.json"), "utf8"));
-    assert.deepEqual(launch.args, [
-      "--extension", resolve("dist/src/index.js"),
-      "--label", "a&b|c^d",
-      "--quote", 'say "&hi"',
-      "--paren", "(x)",
-      "--empty", "",
-    ]);
+    assertExtensionLaunch(launch.args, ["--label", "a&b|c^d", "--quote", 'say "&hi"', "--paren", "(x)", "--empty", ""]);
   });
 
   test("native .cmd preserves literal percent text received from PowerShell", async () => {
@@ -2153,11 +2329,34 @@ if (isWindows) {
 
     assert.equal(result.status, 0, `stderr: ${result.stderr}`);
     const launch = JSON.parse(await readFile(join(fixture.capture, "pi.json"), "utf8"));
-    assert.deepEqual(launch.args, [
-      "--extension", resolve("dist/src/index.js"),
-      "--pct", "100%PI%",
-      "--label", "a&b|c^d",
-    ]);
+    assertExtensionLaunch(launch.args, ["--pct", "100%PI%", "--label", "a&b|c^d"]);
+  });
+
+  test("native helper validates a real cached DDGS venv exactly once without provisioning", async () => {
+    const fixture = await makeFixture("pi-review-cmd-native-ddgs-warm-");
+    await mkdir(fixture.agentDir, { recursive: true });
+    await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
+    // The shared venv really contains the pinned wheel, so this is a warm
+    // launch driven natively through the .cmd entry point and real Python. The
+    // recorder preload counts the helper's own spawns, which is what the
+    // one-validation-pair contract is about (no network work is possible for a
+    // valid environment: no install is spawned).
+    const recorder = await writeSpawnRecorder(fixture);
+    const venvPython = join(fixtureDdgsVenv(fixture), "Scripts", "python.exe");
+
+    const result = runCmd(
+      "scripts\\pi-review-gate.cmd --model example",
+      fixtureEnv(fixture, { NODE_OPTIONS: nodeOptionsPreload(recorder) }),
+    );
+
+    assert.equal(result.status, 0, `stderr: ${String(result.stderr)}`);
+    assert.doesNotMatch(String(result.stderr), /creating DDGS|installing DDGS/,
+      "a valid shared venv must be neither created nor reinstalled");
+    const calls = await recordedPythonSpawns(fixture, venvPython);
+    assert.deepEqual(callKinds(calls), ["version", "pip-check"],
+      `a warm native launch must run exactly one validation pair: ${JSON.stringify(callKinds(calls))}`);
+    assertIsolatedPythonCalls(calls);
+    assert.equal(await launchStarted(fixture), true, "a validated cached venv must let the launch continue");
   });
 
   test("native helper provisions DDGS from scratch without Bash", async () => {
@@ -2185,21 +2384,9 @@ if (isWindows) {
     const scratch = await mkdtemp(join(tmpdir(), "pi-review-cmd-native-package-"));
     try {
       const stage = join(scratch, "package dir with spaces");
-      await mkdir(join(stage, "scripts"), { recursive: true });
-      await mkdir(join(stage, "skills", "pi-review-gate-orchestrator", "references"), { recursive: true });
-      await mkdir(join(stage, "skills", "pi-review-gate-execution"), { recursive: true });
-      await mkdir(join(stage, "skills", "pi-review-gate-research"), { recursive: true });
-      await mkdir(join(stage, "skills", "pi-review-gate-completion"), { recursive: true });
-      await copyFile(helperPath, join(stage, "scripts", "pi-review-gate-launcher.cjs"));
+      await stageLauncherScripts(stage);
       await copyFile(cmdPath, join(stage, "scripts", "pi-review-gate.cmd"));
-      await copyFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), join(stage, "skills/pi-review-gate-orchestrator/SKILL.md"));
-      await copyFile(
-        resolve("skills/pi-review-gate-orchestrator/references/recovery.md"),
-        join(stage, "skills/pi-review-gate-orchestrator/references/recovery.md"),
-      );
-      await copyFile(resolve("skills/pi-review-gate-execution/SKILL.md"), join(stage, "skills/pi-review-gate-execution/SKILL.md"));
-      await copyFile(resolve("skills/pi-review-gate-research/SKILL.md"), join(stage, "skills/pi-review-gate-research/SKILL.md"));
-      await copyFile(resolve("skills/pi-review-gate-completion/SKILL.md"), join(stage, "skills/pi-review-gate-completion/SKILL.md"));
+      await stageShippedSkills(stage);
 
       const missingFixture = await makeFixture("pi-review-cmd-native-packmiss-");
       const missing = runCmd(
@@ -2207,11 +2394,10 @@ if (isWindows) {
         fixtureEnv(missingFixture),
       );
       assert.equal(missing.status, 2, `stderr: ${missing.stderr}`);
-      assert.match(String(missing.stderr), /packaged extension is missing/);
+      assert.match(String(missing.stderr), /packaged extension output is missing/);
       assert.equal(await launchStarted(missingFixture), false);
 
-      await mkdir(join(stage, "dist", "src"), { recursive: true });
-      await writeFile(join(stage, "dist", "src", "index.js"), "module.exports = { activate() {} };\n", "utf8");
+      writeRequiredOutputs(stage);
       const fixture = await makeFixture("pi-review-cmd-native-packaged-");
       const result = runCmd(`"${join(stage, "scripts", "pi-review-gate.cmd")}" --model example`, fixtureEnv(fixture));
       assert.equal(result.status, 0, `stderr: ${result.stderr}`);
@@ -2244,18 +2430,26 @@ if (isWindows) {
     const brokenVenv = fixture.ddgsVenv;
     const create = spawnSync(`python -I -m venv "${brokenVenv}"`, { shell: true, stdio: "pipe" });
     assert.equal(create.status, 0, `python -m venv must work natively: ${String(create.stderr)}`);
+    const recorder = await writeSpawnRecorder(fixture);
+    const venvPython = join(brokenVenv, "Scripts", "python.exe");
 
     const result = runCmd(
       "scripts\\pi-review-gate.cmd --model example",
-      fixtureEnv(fixture, { PI_REVIEW_GATE_DDGS_VENV: brokenVenv }),
+      fixtureEnv(fixture, { PI_REVIEW_GATE_DDGS_VENV: brokenVenv, NODE_OPTIONS: nodeOptionsPreload(recorder) }),
     );
 
-    assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+    assert.equal(result.status, 0, `stderr: ${String(result.stderr)}`);
     assert.match(String(result.stderr), /installing DDGS/);
     assert.doesNotMatch(String(result.stderr), /creating DDGS/,
       "an existing venv python must never trigger venv re-creation");
+    // One failed initial validation, the pinned install, then the complete
+    // post-repair validation pair against the real installed distribution.
+    const calls = await recordedPythonSpawns(fixture, venvPython);
+    assert.deepEqual(callKinds(calls), ["version", "install", "version", "pip-check"],
+      `native repair must revalidate the full contract: ${JSON.stringify(callKinds(calls))}`);
+    assertIsolatedPythonCalls(calls);
     const launch = JSON.parse(await readFile(join(fixture.capture, "pi.json"), "utf8"));
-    assert.equal(launch.ddgsEnv, join(brokenVenv, "Scripts", "python.exe"));
+    assert.equal(launch.ddgsEnv, venvPython);
   });
 
   test("native helper fails closed when the broken venv cannot be repaired", async () => {
@@ -2285,28 +2479,32 @@ if (isWindows) {
     const scratch = await mkdtemp(join(tmpdir(), "pi-review-cmd-native-nopy-"));
     try {
       const stage = join(scratch, "package dir with spaces");
-      await mkdir(join(stage, "scripts"), { recursive: true });
-      await mkdir(join(stage, "skills", "pi-review-gate-orchestrator", "references"), { recursive: true });
-      await mkdir(join(stage, "skills", "pi-review-gate-execution"), { recursive: true });
-      await mkdir(join(stage, "skills", "pi-review-gate-research"), { recursive: true });
-      await mkdir(join(stage, "skills", "pi-review-gate-completion"), { recursive: true });
-      await copyFile(helperPath, join(stage, "scripts", "pi-review-gate-launcher.cjs"));
+      await stageLauncherScripts(stage);
       await copyFile(cmdPath, join(stage, "scripts", "pi-review-gate.cmd"));
-      await copyFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), join(stage, "skills/pi-review-gate-orchestrator/SKILL.md"));
-      await copyFile(
-        resolve("skills/pi-review-gate-orchestrator/references/recovery.md"),
-        join(stage, "skills/pi-review-gate-orchestrator/references/recovery.md"),
-      );
-      await copyFile(resolve("skills/pi-review-gate-execution/SKILL.md"), join(stage, "skills/pi-review-gate-execution/SKILL.md"));
-      await copyFile(resolve("skills/pi-review-gate-research/SKILL.md"), join(stage, "skills/pi-review-gate-research/SKILL.md"));
-      await copyFile(resolve("skills/pi-review-gate-completion/SKILL.md"), join(stage, "skills/pi-review-gate-completion/SKILL.md"));
-      await mkdir(join(stage, "dist", "src"), { recursive: true });
-      await writeFile(join(stage, "dist", "src", "index.js"), "module.exports = { activate() {} };\n", "utf8");
+      await stageShippedSkills(stage);
+      await copyFile(resolve("package.json"), join(stage, "package.json"));
+      writeRequiredOutputs(stage);
 
       const fixture = await makeFixture("pi-review-cmd-native-nopy-fix-");
       const env = fixtureEnv(fixture);
-      // Only the fake pi shim is on PATH: no python3, no python, no npm.
-      env.PATH = fixture.bin;
+      // PATH alone cannot hide a system-installed py.exe. Refuse only Python
+      // probes in this child, preserving real Node/OS ownership helpers.
+      const noPython = join(fixture.home, "no-python-probes.cjs");
+      await writeFile(noPython, [
+        'const cp = require("node:child_process");',
+        'const path = require("node:path");',
+        'const fs = require("node:fs");',
+        'const original = cp.spawnSync;',
+        'cp.spawnSync = function (file, args, options) {',
+        '  const name = path.basename(String(file)).toLowerCase();',
+        '  if (/^(python3?|py)(\\.exe)?$/.test(name)) {',
+        '    fs.appendFileSync(path.join(process.env.CAPTURE_DIR, "refused-python"), name + "\\n");',
+        '    return { status: 1, signal: null, stdout: "", stderr: "fixture: no isolated Python" };',
+        '  }',
+        '  return original.apply(this, arguments);',
+        '};',
+      ].join("\n"), { encoding: "utf8", flag: "wx", mode: 0o600 });
+      env.NODE_OPTIONS = nodeOptionsPreload(noPython);
       delete env.XDG_CACHE_HOME;
       env.PI_REVIEW_GATE_DDGS_VENV = join(fixture.root, "missing ddgs venv");
 
@@ -2316,6 +2514,8 @@ if (isWindows) {
 
       assert.equal(outcome.status, 1);
       assert.match(outcome.stderr, /Python 3 is required to provision the DDGS web-search dependency/);
+      assert.deepEqual((await readFile(join(fixture.capture, "refused-python"), "utf8")).trim().split("\n"),
+        ["python3", "python", "py"], "every supported Windows Python probe was refused");
       assert.equal(await launchStarted(fixture), false, "a missing interpreter must stop the launch");
     } finally {
       await rm(scratch, { recursive: true, force: true });

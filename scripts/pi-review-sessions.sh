@@ -262,6 +262,181 @@ if [[ -z "$NODE_RM_BIN" ]]; then
 fi
 ORIGINAL_UMASK="$(umask)"
 umask 077
+
+# --- Issue 344: reuse a completed fallback runtime ---------------------------
+# The pinned archive digest, member validation, and fresh extraction above stay
+# exactly where they belong: on ACTUAL installation or update. A previously
+# completed runtime is reused when it is still current — the recorded pinned
+# identity, a direct-child generation path, a regular non-symlink Node binary
+# whose filesystem identity is unchanged, its npm CLI, and one cheap version
+# probe — instead of downloading, re-verifying, re-extracting, or scanning a
+# tree on every fallback launch.
+NODE_RUNTIME_MARKER="$NODE_CACHE_ROOT/current-node.txt"
+CURRENT_RUNTIME_GENERATION=''
+CURRENT_RUNTIME_NODE=''
+
+runtime_marker_value() {
+  local marker="$1" wanted="$2" key value
+  while IFS='=' read -r key value; do
+    if [[ "$key" == "$wanted" ]]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done < "$marker"
+  return 1
+}
+
+# The record names this platform and the source-pinned artifact only.
+runtime_record_matches_pin() {
+  local marker="$1" version platform archive sha
+  version="$(runtime_marker_value "$marker" version)" || return 1
+  platform="$(runtime_marker_value "$marker" platform)" || return 1
+  archive="$(runtime_marker_value "$marker" archive)" || return 1
+  sha="$(runtime_marker_value "$marker" sha256)" || return 1
+  [[ "$version" == "$NODE_VERSION_PIN" && "$platform" == "$NODE_PLATFORM" && "$archive" == "$NODE_ARCHIVE" && "$sha" == "$NODE_SHA256" ]]
+}
+
+# The generation is a direct child with a bootstrap-shaped name (the marker can
+# never redirect execution to an arbitrary path), and its Node/npm entries still
+# have the recorded identity.
+runtime_generation_present() {
+  local marker="$1" generation="$2" recorded node_bin generation_dir node_root ancestor npm_cli
+  recorded="$(runtime_marker_value "$marker" node_identity)" || return 1
+  [[ -n "$recorded" ]] || return 1
+  [[ "$generation" =~ ^bootstrap[-.][A-Za-z0-9-]+$ ]] || return 1
+  generation_dir="$NODE_CACHE_ROOT/$generation"
+  [[ -d "$generation_dir" && ! -L "$generation_dir" ]] || return 1
+  node_root="$generation_dir/extracted/node-v$NODE_VERSION_PIN-$NODE_PLATFORM"
+  # Every fixed ancestor of the Node and npm entries must be a real directory: a
+  # replaced `extracted` (or a deeper alias) would otherwise redirect execution
+  # outside the managed generation while the recorded leaf inode still matches.
+  for ancestor in "$generation_dir/extracted" "$node_root" "$node_root/bin" \
+    "$node_root/lib" "$node_root/lib/node_modules" \
+    "$node_root/lib/node_modules/npm" "$node_root/lib/node_modules/npm/bin"; do
+    [[ -d "$ancestor" && ! -L "$ancestor" ]] || return 1
+  done
+  node_bin="$node_root/bin/node"
+  [[ -f "$node_bin" && ! -L "$node_bin" && -x "$node_bin" ]] || return 1
+  [[ "$(path_identity "$node_bin")" == "$recorded" ]] || return 1
+  npm_cli="$node_root/lib/node_modules/npm/bin/npm-cli.js"
+  [[ -f "$npm_cli" && ! -L "$npm_cli" ]] || return 1
+  CURRENT_RUNTIME_GENERATION="$generation"
+  CURRENT_RUNTIME_NODE="$node_bin"
+}
+
+current_runtime_generation() {
+  local marker="$NODE_RUNTIME_MARKER" generation
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  runtime_record_matches_pin "$marker" || return 1
+  generation="$(runtime_marker_value "$marker" generation)" || return 1
+  runtime_generation_present "$marker" "$generation" || return 1
+  probe_node_version "$CURRENT_RUNTIME_NODE" || return 1
+  return 0
+}
+
+# Publish this launch's completed runtime. A valid competing completed record is
+# left untouched; a stale one (malformed, wrong pin, deleted generation, changed
+# Node identity) is replaced, so a stale marker can never force a download on
+# every later fallback launch. Publication is whole-file and atomic.
+publish_runtime_marker() {
+  local generation="${WORK_ROOT##*/}" tmp identity existing
+  identity="$(path_identity "$NODE_BIN")" || return 0
+  if [[ -f "$NODE_RUNTIME_MARKER" && ! -L "$NODE_RUNTIME_MARKER" ]] \
+    && runtime_record_matches_pin "$NODE_RUNTIME_MARKER" \
+    && existing="$(runtime_marker_value "$NODE_RUNTIME_MARKER" generation)" \
+    && [[ "$existing" == "$generation" ]]; then
+    # A competing producer already published exactly this completed runtime.
+    return 0
+  fi
+  tmp="$NODE_CACHE_ROOT/.current-node.$$.$RANDOM"
+  {
+    printf 'schema=1\n'
+    printf 'version=%s\n' "$NODE_VERSION_PIN"
+    printf 'platform=%s\n' "$NODE_PLATFORM"
+    printf 'archive=%s\n' "$NODE_ARCHIVE"
+    printf 'sha256=%s\n' "$NODE_SHA256"
+    printf 'generation=%s\n' "$generation"
+    printf 'node_identity=%s\n' "$identity"
+  } > "$tmp" 2>/dev/null || { "$NODE_UNLINK_BIN" "$tmp" 2>/dev/null || true; return 0; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  # Replace a stale record first; a valid competing publication is re-checked
+  # under the producer's held admission entry and preserved above.
+  if [[ -e "$NODE_RUNTIME_MARKER" || -L "$NODE_RUNTIME_MARKER" ]]; then
+    if [[ -f "$NODE_RUNTIME_MARKER" && ! -L "$NODE_RUNTIME_MARKER" ]] \
+      && runtime_record_matches_pin "$NODE_RUNTIME_MARKER" \
+      && existing="$(runtime_marker_value "$NODE_RUNTIME_MARKER" generation 2>/dev/null || true)" \
+      && runtime_generation_present "$NODE_RUNTIME_MARKER" "$existing" 2>/dev/null; then
+      "$NODE_UNLINK_BIN" "$tmp" 2>/dev/null || true
+      return 0
+    fi
+    "$NODE_UNLINK_BIN" "$NODE_RUNTIME_MARKER" 2>/dev/null || true
+  fi
+  "$NODE_HARDLINK_BIN" "$tmp" "$NODE_RUNTIME_MARKER" 2>/dev/null || true
+  "$NODE_UNLINK_BIN" "$tmp" 2>/dev/null || true
+  return 0
+}
+
+# Protect a cached runtime this launch is about to execute: publish a
+# per-consumer pid+birth liveness record inside the generation (the same record
+# every native reclamation route honors), under a best-effort admission lock, and
+# re-verify the generation and Node identity afterwards. A record whose owner is
+# gone is reclaimed by a later pass, so this never permanently preserves one
+# generation.
+protect_cached_runtime() {
+  local generation_dir="$NODE_CACHE_ROOT/$CURRENT_RUNTIME_GENERATION"
+  local recorded ok=1 consumer_marker
+  recorded="$(runtime_marker_value "$NODE_RUNTIME_MARKER" node_identity 2>/dev/null || true)"
+  [[ -n "$recorded" ]] || return 1
+  node_capture_fence || return 1
+  # The canonical per-agent coordination entry is REQUIRED: every destructive
+  # Node reclamation route holds it across deletion, so a busy entry is never
+  # replaced by a best-effort publication and a post-check. On failure this
+  # launch stops safely instead of using unprotected code or reinstalling.
+  node_coordination_ready && node_coordination || return 1
+  if ! runtime_generation_present "$NODE_RUNTIME_MARKER" "$CURRENT_RUNTIME_GENERATION"; then
+    node_coordination_release || true
+    return 1
+  fi
+  # One record per consumer: several concurrent consumers of the same cached
+  # runtime each keep their own record, and a later pass removes only the ones
+  # whose owner is gone.
+  consumer_marker="$generation_dir/.consumer-$$-$RANDOM"
+  (set -o noclobber; printf '%s\n%s\n' "$$" "$(node_owner_identity "$$")" > "$consumer_marker") 2>/dev/null || true
+  if [[ -d "$generation_dir" && ! -L "$generation_dir" && -f "$consumer_marker" && ! -L "$consumer_marker" ]] \
+    && [[ "$(path_identity "$CURRENT_RUNTIME_NODE" 2>/dev/null || true)" == "$recorded" ]]; then
+    ok=0
+  fi
+  node_coordination_release || true
+  return $ok
+}
+
+if current_runtime_generation; then
+  if ! protect_cached_runtime; then
+    echo 'pi-review-sessions: cached Node coordination was unavailable; try again.' >&2
+    exit 1
+  fi
+  if [[ -n "${PATH+x}" ]]; then
+    export PATH="${CURRENT_RUNTIME_NODE%/*}:$PATH"
+  else
+    export PATH="${CURRENT_RUNTIME_NODE%/*}"
+  fi
+  umask "$ORIGINAL_UMASK"
+  exec "$CURRENT_RUNTIME_NODE" "$CJS_ENTRY" "$@"
+fi
+
+# A structurally trusted earlier generation stays protected while this launch
+# installs its replacement, so a currently reusable runtime is never reclaimed
+# before the new one is complete.
+if [[ -z "$CURRENT_RUNTIME_GENERATION" && -f "$NODE_RUNTIME_MARKER" && ! -L "$NODE_RUNTIME_MARKER" ]]; then
+  if kept_generation="$(runtime_marker_value "$NODE_RUNTIME_MARKER" generation)" \
+    && [[ "$kept_generation" =~ ^bootstrap[-.][A-Za-z0-9-]+$ ]] \
+    && [[ -d "$NODE_CACHE_ROOT/$kept_generation" && ! -L "$NODE_CACHE_ROOT/$kept_generation" ]]; then
+    # Consumed by the sourced node-generations.sh admission path.
+    # shellcheck disable=SC2034
+    NODE_KEEP_ROOT="$NODE_CACHE_ROOT/$kept_generation"
+  fi
+fi
+
 node_capture_fence || exit 1
 trap 'node_unlock || true' EXIT
 node_admit || exit 1
@@ -405,6 +580,9 @@ if ! probe_node_version "$NODE_BIN"; then
   bootstrap_failure "verified Node executable did not report a supported version."
 fi
 if ! assert_node_ownership; then bootstrap_failure "fresh Node executable identity changed after its version probe."; fi
+# Publish this completed runtime so later fallback launches reuse it instead of
+# downloading and extracting the pinned archive again.
+publish_runtime_marker
 if [[ ${PATH+x} ]]; then
   export PATH="$NODE_DIST_ROOT/bin:$PATH"
 else

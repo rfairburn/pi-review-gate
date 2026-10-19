@@ -1183,6 +1183,10 @@ function reclaim(cacheRoot, options, warnings, hostOwned, pass) {
       break;
     }
     if (keep.has(path.resolve(entry.file))) continue;
+    // A consumer that is running code from this generation keeps it: the
+    // preserve predicate is the consumer-lease boundary, separate from this
+    // launch's own selection.
+    if (typeof options.preserve === "function" && options.preserve(entry.file)) continue;
     if (typeof hostOwned === "function" && hostOwned()) {
       warnings.push(HOST_OWNED_DURING_CLEANUP_WARNING);
       break;
@@ -1305,8 +1309,14 @@ function admit(cacheRoot, create, options = {}) {
           }
         }
         // Trim to four so creating this launch's ONE new generation lands at or
-        // below the per-type target of five whenever that is possible.
-        reclaim(cache, { ...options, target: LIMIT - 1 }, warnings, hostOwned, pass);
+        // below the per-type target of five whenever that is possible. A producer
+        // that cannot take its destructive boundary at all (for example because
+        // its consumer leases are only observable under a separate coordination
+        // lock) passes `reclaim: false` and runs its coordinated, lease-aware
+        // pass after publication instead.
+        if (options.reclaim !== false) {
+          reclaim(cache, { ...options, target: LIMIT - 1 }, warnings, hostOwned, pass);
+        }
       } catch (error) {
         // A preparation failure ends this admission; creation is never blocked
         // by cleanup trouble, which `reclaim` itself reports as warnings.

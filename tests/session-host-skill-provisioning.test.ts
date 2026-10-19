@@ -1,89 +1,59 @@
 /**
- * Direct sidebar skill provisioning parity (issue 378).
+ * Direct sidebar component provisioning parity (issues 344/378, replaced
+ * contract).
  *
- * The direct sidebar entry points (scripts/pi-review-sessions.sh /
- * scripts/pi-review-sessions.cmd → scripts/pi-review-sessions.cjs) provision
- * the shipped skills themselves before host startup — wrapper-equivalent
- * destinations under ~/.agents/skills/ in the pi-review-gate- namespace,
- * atomic per-file
- * publication, and the ownership-safe pre-#151 generic-location migration, all
- * derived from the canonical SKILL_PUBLISH_PLAN in
- * scripts/pi-review-gate-launcher.cjs. A direct sidebar launch therefore needs
- * no wrapper prerequisite, a repeat launch refreshes stale skills while
- * reusing byte-identical files, and any provisioning failure stops the launch
- * with an actionable error before the host loads.
+ * The direct sidebar entry points no longer own a skill-provisioning copy: the
+ * sidebars and the Pi/web wrappers all go through ONE shared authority
+ * (scripts/prepare-application.cjs), which gates the shipped skills and the DDGS
+ * environment behind completed markers. This file therefore exercises:
+ * - the shared component gate natively (real filesystem publication, refresh
+ *   reuse, ownership-safe migration, and fail-closed behavior);
+ * - the sidebar launcher flow through that shared authority, proving the host
+ *   loads only after provisioning succeeds and that a skill failure stops the
+ *   launch with an actionable error.
  *
- * Evidence split:
- * - NATIVE (real filesystem, runs on POSIX and Windows): refreshShippedSkills
- *   against fixture homes using process.platform — real directory creation,
- *   atomic rename publication, byte comparison, and migration on this
- *   platform's filesystem. The same compiled file is the native-Windows setup
- *   evidence in the CI windows-launcher job; it proves entrypoint setup only,
- *   never real Windows ConPTY or sidebar UI readiness. On native Windows the
- *   discovery home is USERPROFILE via os.homedir() (the wrapper's semantics),
- *   which can differ from HOME; a dedicated regression pins distinct HOME and
- *   USERPROFILE fixture directories and asserts publication lands in the
- *   USERPROFILE tree with the HOME tree untouched.
- * - MOCKED (synthetic seams): launcher flow ordering and failure semantics
- *   with injected build/Pi/DDGS/loadMain dependencies, plus the win32 path
- *   seam fail-closed check, which runs everywhere without claiming native
- *   Windows behavior.
+ * The former per-launcher `refreshShippedSkills` copy, its synthetic win32 path
+ * seam, and its duplicate skill-manifest tests were retired with the pre-#344
+ * build/provisioning pipeline. Atomic publication, symlink refusal, directory
+ * destinations, and provenance-based migration remain covered natively here and
+ * in the Pi/web launcher suites.
  */
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join, win32 } from "node:path";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
 
 const requireCjs = createRequire(join(process.cwd(), "tests", "session-host-skill-provisioning.test.ts"));
 const sessionsLauncher = requireCjs("../scripts/pi-review-sessions.cjs") as {
   __test: {
     runSessionHostLauncher(argv: readonly string[], overrides?: Record<string, unknown>): Promise<number>;
-    refreshShippedSkills(packageRoot: string, homeDir: string, platform: string): { ok: true } | { ok: false; error: string };
   };
 };
-const gateLauncher = requireCjs("../scripts/pi-review-gate-launcher.cjs") as {
+const prepare = requireCjs("../scripts/prepare-application.cjs") as {
   SKILL_PUBLISH_PLAN: Array<{ name: string; label: string; files: Array<{ source: string[]; destination: string[] }> }>;
+  ensureShippedSkills(options: Record<string, unknown>): { ok: boolean; published?: boolean; error?: string };
+  applicationStateRoot(agentDir: string): string;
 };
 
 const repoRoot = process.cwd();
 const isWindows = process.platform === "win32";
 
 /** All fixture data stays under the ignored worker node_modules directory. */
-function makeFixture(prefix: string): { root: string; home: string; packageRoot: string } {
+function makeFixture(prefix: string): { root: string; home: string; packageRoot: string; agentDir: string; stateRoot: string } {
   const nodeModules = join(repoRoot, "node_modules");
   mkdirSync(nodeModules, { recursive: true });
   const root = mkdtempSync(join(nodeModules, prefix));
   const home = join(root, "home");
   const packageRoot = join(root, "package");
+  const agentDir = join(root, "agent");
   mkdirSync(home, { recursive: true });
   mkdirSync(packageRoot, { recursive: true });
-  return { root, home, packageRoot };
+  return { root, home, packageRoot, agentDir, stateRoot: prepare.applicationStateRoot(agentDir) };
 }
 
 function cleanup(t: test.TestContext, root: string): void {
   t.after(() => rmSync(root, { recursive: true, force: true }));
-}
-
-/**
- * Pin the native discovery-home source for in-process os.homedir() (issue
- * 378): on win32 Node reads USERPROFILE from the live process environment,
- * which is where the wrapper publishes — and it can differ from the flow's
- * getEnv HOME. On POSIX this is a no-op: the discovery home is the setup
- * HOME itself.
- */
-function pinNativeDiscoveryHome(t: test.TestContext, userProfile: string): void {
-  const previous = process.env.USERPROFILE;
-  if (isWindows) process.env.USERPROFILE = userProfile;
-  t.after(() => {
-    if (previous === undefined) delete process.env.USERPROFILE;
-    else process.env.USERPROFILE = previous;
-  });
-}
-
-/** The wrapper-equivalent discovery home for the native platform. */
-function nativeDiscoveryHome(home: string, userProfile: string): string {
-  return isWindows ? userProfile : home;
 }
 
 /** Copy the real shipped skills tree into a fixture package root. */
@@ -94,13 +64,25 @@ function withShippedSkills(packageRoot: string, missing?: readonly string[]): vo
 
 /** The fixture package root is a packaged (non-source) checkout. */
 function withCompiledEntry(packageRoot: string): void {
-  const entry = join(packageRoot, "dist", "src", "session-host", "main.js");
-  mkdirSync(join(packageRoot, "dist", "src", "session-host"), { recursive: true });
-  writeFileSync(entry, "// synthetic compiled native host\n", "utf8");
+  for (const entry of ["dist/src/session-host/main.js", "dist/src/index.js", "dist/src/web/cli.js"]) {
+    const file = join(packageRoot, ...entry.split("/"));
+    mkdirSync(join(file, ".."), { recursive: true });
+    writeFileSync(file, "// synthetic compiled entry\n", "utf8");
+  }
 }
 
-function assertPublished(home: string, packageRoot = repoRoot): void {
-  for (const skill of gateLauncher.SKILL_PUBLISH_PLAN) {
+function publish(fixture: { packageRoot: string; home: string; agentDir: string; stateRoot: string }, identity = "source:fixture") {
+  return prepare.ensureShippedSkills({
+    stateRoot: fixture.stateRoot,
+    agentDir: fixture.agentDir,
+    packageRoot: fixture.packageRoot,
+    homeDir: fixture.home,
+    applicationIdentity: identity,
+  });
+}
+
+function assertPublished(home: string, packageRoot: string): void {
+  for (const skill of prepare.SKILL_PUBLISH_PLAN) {
     for (const file of skill.files) {
       const source = join(packageRoot, ...file.source);
       const destination = join(home, ".agents", "skills", skill.name, ...file.destination);
@@ -128,27 +110,29 @@ test("direct sidebar provisioning publishes every canonical manifest file (nativ
   cleanup(t, fixture.root);
   withShippedSkills(fixture.packageRoot);
 
-  const result = sessionsLauncher.__test.refreshShippedSkills(fixture.packageRoot, fixture.home, process.platform);
-  assert.deepEqual(result, { ok: true });
+  const result = publish(fixture);
+  assert.equal(result.ok, true);
   assertPublished(fixture.home, fixture.packageRoot);
   assertNoPublishLitter(fixture.home);
 });
 
-test("repeat launch refreshes stale skills and reuses byte-identical files (native fs)", (t) => {
+test("repeat launch reuses a current component marker and refreshes stale files (native fs)", (t) => {
   const fixture = makeFixture(".session-host-skill-provisioning-repeat-");
   cleanup(t, fixture.root);
   withShippedSkills(fixture.packageRoot);
-  assert.deepEqual(sessionsLauncher.__test.refreshShippedSkills(fixture.packageRoot, fixture.home, process.platform), { ok: true });
+  assert.equal(publish(fixture).ok, true);
+  assert.equal(publish(fixture).published, false, "a current component performs no copy or comparison");
 
   const stale = join(fixture.home, ".agents", "skills", "pi-review-gate-execution", "SKILL.md");
   const untouched = join(fixture.home, ".agents", "skills", "pi-review-gate-research", "SKILL.md");
   writeFileSync(stale, readFileSync(stale, "utf8") + "\n<!-- stale local edit -->\n", "utf8");
   const untouchedBefore = statSync(untouched, { bigint: true }).mtimeNs;
 
-  assert.deepEqual(sessionsLauncher.__test.refreshShippedSkills(fixture.packageRoot, fixture.home, process.platform), { ok: true });
-
+  const repaired = publish(fixture);
+  assert.equal(repaired.ok, true);
+  assert.equal(repaired.published, true, "modified installed content forces a republish");
   assert.equal(readFileSync(stale, "utf8"),
-    readFileSync(join(repoRoot, "skills", "pi-review-gate-execution", "SKILL.md"), "utf8"),
+    readFileSync(join(fixture.packageRoot, "skills", "pi-review-gate-execution", "SKILL.md"), "utf8"),
     "the stale installed skill is refreshed to the packaged bytes");
   assert.equal(statSync(untouched, { bigint: true }).mtimeNs, untouchedBefore,
     "a byte-identical installed skill is reused, not rewritten");
@@ -160,62 +144,11 @@ test("a missing packaged skill source fails closed before any publication", (t) 
   cleanup(t, fixture.root);
   withShippedSkills(fixture.packageRoot, ["pi-review-gate-completion/SKILL.md"]);
 
-  const result = sessionsLauncher.__test.refreshShippedSkills(fixture.packageRoot, fixture.home, process.platform);
+  const result = publish(fixture);
   assert.equal(result.ok, false, "the launch must be stopped");
-  if (!result.ok) {
-    assert.match(result.error, /packaged skill file is missing/);
-  }
+  assert.match(String(result.error), /packaged skill file is missing/);
   assert.equal(existsSync(join(fixture.home, ".agents")), false,
     "no skill directory is created when a packaged source is missing");
-});
-
-test("a blocked skill directory stops startup without modifying the blocking file", async (t) => {
-  const fixture = makeFixture(".session-host-skill-provisioning-directory-failure-");
-  cleanup(t, fixture.root);
-  withShippedSkills(fixture.packageRoot);
-  withCompiledEntry(fixture.packageRoot);
-  const userProfile = join(fixture.root, "userprofile");
-  mkdirSync(userProfile, { recursive: true });
-  pinNativeDiscoveryHome(t, userProfile);
-  const home = nativeDiscoveryHome(fixture.home, userProfile);
-  mkdirSync(join(home, ".agents"), { recursive: true });
-  const blocker = join(home, ".agents", "skills");
-  writeFileSync(blocker, "user-owned blocking file\n");
-
-  const events: string[] = [];
-  const stderr: string[] = [];
-  const status = await sessionsLauncher.__test.runSessionHostLauncher([], flowOverrides(fixture, events, stderr));
-
-  assert.equal(status, 1);
-  assert.deepEqual(events, [], "the host never loads after directory preparation fails");
-  assert.match(stderr.join(""), /shipped skill provisioning failed: could not create the skill directory/);
-  assert.equal(readFileSync(blocker, "utf8"), "user-owned blocking file\n");
-});
-
-test("a blocked publication destination stops startup and preserves existing content", async (t) => {
-  const fixture = makeFixture(".session-host-skill-provisioning-publication-failure-");
-  cleanup(t, fixture.root);
-  withShippedSkills(fixture.packageRoot);
-  withCompiledEntry(fixture.packageRoot);
-  const userProfile = join(fixture.root, "userprofile");
-  mkdirSync(userProfile, { recursive: true });
-  pinNativeDiscoveryHome(t, userProfile);
-  const home = nativeDiscoveryHome(fixture.home, userProfile);
-  const skill = gateLauncher.SKILL_PUBLISH_PLAN[0]!;
-  const destination = join(home, ".agents", "skills", skill.name, ...skill.files[0]!.destination);
-  mkdirSync(destination, { recursive: true });
-  const marker = join(destination, "user-owned-marker");
-  writeFileSync(marker, "preserve me\n");
-
-  const events: string[] = [];
-  const stderr: string[] = [];
-  const status = await sessionsLauncher.__test.runSessionHostLauncher([], flowOverrides(fixture, events, stderr));
-
-  assert.equal(status, 1);
-  assert.deepEqual(events, [], "the host never loads after publication fails");
-  assert.match(stderr.join(""), /shipped skill provisioning failed: could not refresh the shipped skill file/);
-  assert.equal(readFileSync(marker, "utf8"), "preserve me\n");
-  assertNoPublishLitter(home);
 });
 
 test("provisioning migrates proven generic copies and preserves user-owned files (native fs)", (t) => {
@@ -224,13 +157,11 @@ test("provisioning migrates proven generic copies and preserves user-owned files
   withShippedSkills(fixture.packageRoot);
 
   const skillsRoot = join(fixture.home, ".agents", "skills");
-  // Proven pre-#151 package-owned generic copies (digest-anchored fixtures).
   const priorOrchestrator = join(skillsRoot, "orchestrator", "SKILL.md");
   const priorRecovery = join(skillsRoot, "orchestrator", "references", "recovery.md");
   mkdirSync(join(skillsRoot, "orchestrator", "references"), { recursive: true });
   writeFileSync(priorOrchestrator, readFileSync(join(repoRoot, "tests", "fixtures", "skill-migration", "orchestrator", "SKILL.md"), "utf8"), "utf8");
   writeFileSync(priorRecovery, readFileSync(join(repoRoot, "tests", "fixtures", "skill-migration", "orchestrator", "references", "recovery.md"), "utf8"), "utf8");
-  // User-owned content: a customized generic copy and an unrelated skill.
   const userResearch = join(skillsRoot, "research", "SKILL.md");
   mkdirSync(join(skillsRoot, "research"), { recursive: true });
   writeFileSync(userResearch, "# user-owned research skill\n", "utf8");
@@ -238,7 +169,7 @@ test("provisioning migrates proven generic copies and preserves user-owned files
   mkdirSync(join(skillsRoot, "my-user-skill"), { recursive: true });
   writeFileSync(userSkill, "# unrelated user skill\n", "utf8");
 
-  assert.deepEqual(sessionsLauncher.__test.refreshShippedSkills(fixture.packageRoot, fixture.home, process.platform), { ok: true });
+  assert.equal(publish(fixture).ok, true);
 
   assert.equal(existsSync(priorOrchestrator), false, "the proven generic orchestrator copy is migrated away");
   assert.equal(existsSync(priorRecovery), false, "the paired proven generic recovery.md is removed with it");
@@ -249,40 +180,35 @@ test("provisioning migrates proven generic copies and preserves user-owned files
   assertPublished(fixture.home, fixture.packageRoot);
 });
 
-test("the win32 path seam fails closed on a missing source without native Windows", (t) => {
-  const fixture = makeFixture(".session-host-skill-provisioning-win32-seam-");
-  cleanup(t, fixture.root);
-  withShippedSkills(fixture.packageRoot, ["pi-review-gate-completion/SKILL.md"]);
+function fixturePython(fixture: { root: string }, env: NodeJS.ProcessEnv): { venv: string; python: string } {
+  const venv = join(fixture.root, "ddgs-venv");
+  mkdirSync(join(venv, "bin"), { recursive: true });
+  const python = join(venv, "bin", "python");
+  writeFileSync(python, "#!/bin/sh\nexit 0\n", "utf8");
+  chmodSync(python, 0o755);
+  env.PI_REVIEW_GATE_DDGS_VENV = venv;
+  return { venv, python };
+}
 
-  const result = sessionsLauncher.__test.refreshShippedSkills(fixture.packageRoot, fixture.home, "win32");
-  assert.equal(result.ok, false, "the win32 seam must fail closed on a missing source");
-  if (!result.ok) {
-    // The diagnostic carries the win32-joined path regardless of host platform.
-    // On POSIX the backslash-joined sources never resolve, so the first plan
-    // file is reported; on native Windows only the deleted source is missing.
-    const named = gateLauncher.SKILL_PUBLISH_PLAN
-      .flatMap((skill) => skill.files)
-      .map((file) => win32.join(fixture.packageRoot, ...file.source))
-      .find((sourcePath) => result.error.includes(sourcePath));
-    assert.ok(named, `the error names a win32-joined manifest source path: ${result.error}`);
-  }
-  assert.equal(existsSync(join(fixture.home, ".agents")), false, "no publication happens before the fail-closed check");
-});
-
-function flowOverrides(fixture: { home: string; packageRoot: string }, events: string[], stderr: string[]): Record<string, unknown> {
+function flowOverrides(
+  fixture: { root: string; home: string; packageRoot: string; agentDir: string },
+  events: string[],
+  stderr: string[],
+): Record<string, unknown> {
+  const environment: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: fixture.home };
+  const { python } = fixturePython(fixture, environment);
   return {
-    getEnv: () => ({ PATH: process.env.PATH, HOME: fixture.home }),
+    getEnv: () => environment,
     processEnv: {},
     platform: process.platform,
     nodeVersion: "22.19.0",
     stdinIsTTY: true,
     stdoutIsTTY: true,
     packageRoot: fixture.packageRoot,
-    // Packaged (non-source) fixture: the real build must never run.
-    build: () => { throw new Error("the packaged fixture must not trigger a source build"); },
+    // The shared authority is the only preparation path; DDGS provisioning is
+    // synthetic here so the flow test stays offline and deterministic.
+    prepareApplication: (options: Record<string, unknown>) => prepareLaunchForTest(options, python),
     resolvePiRuntime: () => ({ file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }),
-    ensureDdgs: () => ({ ok: true, python: "/synthetic/python" }),
-    // No refreshShippedSkills override: the real provisioning runs.
     loadMain: (entry: string) => {
       events.push("load");
       assert.ok(existsSync(entry), "only an available compiled entry is handed to the module loader");
@@ -293,76 +219,118 @@ function flowOverrides(fixture: { home: string; packageRoot: string }, events: s
   };
 }
 
-test("the launcher provisions skills before host load (mocked setup, real provisioning)", async (t) => {
+const prepareLaunch = (requireCjs("../scripts/prepare-application.cjs") as {
+  prepareLaunch(options: Record<string, unknown>): Promise<Record<string, unknown>>;
+}).prepareLaunch;
+
+function prepareLaunchForTest(options: Record<string, unknown>, python: string): Promise<Record<string, unknown>> {
+  return prepareLaunch({ ...options, provisionDdgs: () => ({ ok: true, python }) });
+}
+
+test("the launcher provisions components before host load (mocked setup, real provisioning)", async (t) => {
   const fixture = makeFixture(".session-host-skill-provisioning-flow-");
   cleanup(t, fixture.root);
   withShippedSkills(fixture.packageRoot);
   withCompiledEntry(fixture.packageRoot);
-  const userProfile = join(fixture.root, "userprofile");
-  mkdirSync(userProfile, { recursive: true });
-  pinNativeDiscoveryHome(t, userProfile);
 
   const events: string[] = [];
   const stderr: string[] = [];
   const status = await sessionsLauncher.__test.runSessionHostLauncher([], flowOverrides(fixture, events, stderr));
 
-  assert.equal(status, 0);
+  assert.equal(status, 0, stderr.join(""));
   assert.deepEqual(events, ["load", "run"], "the host loads only after setup succeeds");
-  const discoveryHome = nativeDiscoveryHome(fixture.home, userProfile);
-  assertPublished(discoveryHome, fixture.packageRoot);
-  assertNoPublishLitter(discoveryHome);
+  assertPublished(fixture.home, fixture.packageRoot);
+  assertNoPublishLitter(fixture.home);
 });
 
-test("skill provisioning failure prevents host load with an actionable error (mocked flow)", async (t) => {
+test("a blocked skill directory stops startup and preserves existing content", async (t) => {
+  const fixture = makeFixture(".session-host-skill-provisioning-directory-failure-");
+  cleanup(t, fixture.root);
+  withShippedSkills(fixture.packageRoot);
+  withCompiledEntry(fixture.packageRoot);
+  mkdirSync(join(fixture.home, ".agents"), { recursive: true });
+  const blocker = join(fixture.home, ".agents", "skills");
+  writeFileSync(blocker, "user-owned blocking file\n");
+
+  const events: string[] = [];
+  const stderr: string[] = [];
+  const status = await sessionsLauncher.__test.runSessionHostLauncher([], flowOverrides(fixture, events, stderr));
+
+  assert.equal(status, 2);
+  assert.deepEqual(events, [], "the host never loads after directory preparation fails");
+  assert.match(stderr.join(""), /shipped skill provisioning failed: could not create the skill directory/);
+  assert.equal(readFileSync(blocker, "utf8"), "user-owned blocking file\n");
+});
+
+test("a blocked publication destination stops startup and preserves existing content", async (t) => {
+  const fixture = makeFixture(".session-host-skill-provisioning-publication-failure-");
+  cleanup(t, fixture.root);
+  withShippedSkills(fixture.packageRoot);
+  withCompiledEntry(fixture.packageRoot);
+  const skill = prepare.SKILL_PUBLISH_PLAN[0]!;
+  const destination = join(fixture.home, ".agents", "skills", skill.name, ...skill.files[0]!.destination);
+  mkdirSync(destination, { recursive: true });
+  const marker = join(destination, "user-owned-marker");
+  writeFileSync(marker, "preserve me\n");
+
+  const events: string[] = [];
+  const stderr: string[] = [];
+  const status = await sessionsLauncher.__test.runSessionHostLauncher([], flowOverrides(fixture, events, stderr));
+
+  assert.equal(status, 2);
+  assert.deepEqual(events, [], "the host never loads after publication fails");
+  assert.match(stderr.join(""), /shipped skill provisioning failed: could not refresh the shipped skill file/);
+  assert.equal(readFileSync(marker, "utf8"), "preserve me\n");
+  assertNoPublishLitter(fixture.home);
+});
+
+test("a missing packaged skill source stops host load before any publication", async (t) => {
   const fixture = makeFixture(".session-host-skill-provisioning-flow-failure-");
   cleanup(t, fixture.root);
   withShippedSkills(fixture.packageRoot, ["pi-review-gate-research/SKILL.md"]);
   withCompiledEntry(fixture.packageRoot);
-  const userProfile = join(fixture.root, "userprofile");
-  mkdirSync(userProfile, { recursive: true });
-  pinNativeDiscoveryHome(t, userProfile);
 
   const events: string[] = [];
   const stderr: string[] = [];
   const status = await sessionsLauncher.__test.runSessionHostLauncher([], flowOverrides(fixture, events, stderr));
 
-  assert.equal(status, 1, "the launch is stopped");
+  assert.equal(status, 2, "the launch is stopped");
   assert.deepEqual(events, [], "the host module is never loaded");
   assert.match(stderr.join(""), /shipped skill provisioning failed: packaged skill file is missing/);
-  assert.equal(existsSync(join(nativeDiscoveryHome(fixture.home, userProfile), ".agents")), false,
+  assert.equal(existsSync(join(fixture.home, ".agents")), false,
     "no partial publication precedes the failure");
 });
 
-test("native Windows: skills publish to the USERPROFILE discovery home, not HOME", {
+test("native Windows: the launcher publishes into the native discovery home", {
   skip: isWindows ? false : "the HOME/USERPROFILE divergence regression is native-Windows evidence",
 }, async (t) => {
   const fixture = makeFixture(".session-host-skill-provisioning-win-home-");
   cleanup(t, fixture.root);
   withShippedSkills(fixture.packageRoot);
   withCompiledEntry(fixture.packageRoot);
-
-  // HOME and USERPROFILE deliberately differ: node's os.homedir() uses
-  // USERPROFILE on win32 — the wrapper's exact semantics — so the sidebar
-  // launcher must publish into the USERPROFILE tree and leave the HOME tree
-  // untouched.
+  // On native Windows the shared component home is os.homedir() (USERPROFILE),
+  // which can differ from the flow's HOME; publication must land there.
   const userProfile = join(fixture.root, "userprofile");
   mkdirSync(userProfile, { recursive: true });
-  pinNativeDiscoveryHome(t, userProfile);
+  const previous = process.env.USERPROFILE;
+  process.env.USERPROFILE = userProfile;
+  t.after(() => {
+    if (previous === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previous;
+  });
 
   const events: string[] = [];
   const stderr: string[] = [];
-  const status = await sessionsLauncher.__test.runSessionHostLauncher([], flowOverrides(fixture, events, stderr));
+  const overrides = flowOverrides(fixture, events, stderr);
+  // Keep the production Windows home resolver. Replacing the whole preparer
+  // bypasses that resolver and silently publishes into the synthetic HOME.
+  delete overrides.prepareApplication;
+  overrides.ensureDdgs = () => ({ ok: true, python: join(fixture.root, "ddgs-venv", "bin", "python") });
+  const status = await sessionsLauncher.__test.runSessionHostLauncher([], overrides);
 
-  assert.equal(status, 0);
-  assert.deepEqual(events, ["load", "run"], "the host loads only after provisioning succeeds");
-  for (const skill of gateLauncher.SKILL_PUBLISH_PLAN) {
-    for (const file of skill.files) {
-      const destination = join(userProfile, ".agents", "skills", skill.name, ...file.destination);
-      assert.ok(existsSync(destination), `published in the USERPROFILE discovery home: ${skill.name}/${file.destination.join("/")}`);
-      assert.equal(readFileSync(destination, "utf8"), readFileSync(join(fixture.packageRoot, ...file.source), "utf8"),
-        `content parity: ${skill.name}/${file.destination.join("/")}`);
-    }
-  }
+  assert.equal(status, 0, stderr.join(""));
+  assert.deepEqual(events, ["load", "run"]);
+  assertPublished(userProfile, fixture.packageRoot);
   assert.equal(existsSync(join(fixture.home, ".agents")), false,
     "the alternate HOME skill tree must remain untouched");
 });

@@ -300,6 +300,153 @@ function Assert-OrdinaryFile([string]$Path) {
   }
 }
 
+# Issue 344: reuse a completed fallback runtime instead of downloading,
+# re-verifying, and re-extracting the pinned archive on every fallback launch.
+# Pinned-digest verification and fresh extraction remain on ACTUAL installation
+# or update. A current completed runtime is recognized by the recorded pinned
+# identity, a direct-child generation path, an ordinary node.exe whose native
+# identity is unchanged, its npm CLI, and one cheap version probe.
+function Read-RuntimeMarker([string]$Path) {
+  if (-not [IO.File]::Exists($Path)) { return $null }
+  $attributes = Get-ExistingAttributes $Path
+  if ($null -eq $attributes -or ($attributes -band [IO.FileAttributes]::Directory) -ne 0 -or ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+  $record = @{}
+  try {
+    foreach ($line in [IO.File]::ReadAllLines($Path)) {
+      $separator = $line.IndexOf('=')
+      if ($separator -le 0) { continue }
+      $record[$line.Substring(0, $separator)] = $line.Substring($separator + 1)
+    }
+  } catch {
+    return $null
+  }
+  return $record
+}
+
+function Test-CurrentFallbackRuntime([string]$CacheRoot) {
+  $record = Read-RuntimeMarker (Join-Path $CacheRoot 'current-node.txt')
+  if ($null -eq $record) { return $null }
+  if ($record['version'] -cne '22.19.0' -or $record['platform'] -cne $NodePlatform -or $record['archive'] -cne $NodeArchive -or $record['sha256'] -cne $NodeSha256) { return $null }
+  $generation = [string]$record['generation']
+  if ($generation -notmatch '^(?:bootstrap[-.])[A-Za-z0-9-]+$') { return $null }
+  $generationDirectory = Join-Path $CacheRoot $generation
+  try { Assert-OrdinaryDirectory $generationDirectory } catch { return $null }
+  $nodeRoot = Join-Path (Join-Path $generationDirectory 'extracted') ('node-v22.19.0-' + $NodePlatform)
+  $nodeExe = Join-Path $nodeRoot 'node.exe'
+  $npmCommand = Join-Path $nodeRoot 'npm.cmd'
+  $npmCli = Join-Path $nodeRoot 'node_modules\npm\bin\npm-cli.js'
+  try {
+    # Every fixed ancestor must be a real directory; a replaced `extracted` (or a
+    # deeper junction) would otherwise redirect execution outside the generation
+    # while the recorded leaf identity still matches. No inventory is needed.
+    foreach ($directory in @(
+      (Join-Path $generationDirectory 'extracted'),
+      $nodeRoot,
+      (Join-Path $nodeRoot 'node_modules'),
+      (Join-Path $nodeRoot 'node_modules\npm'),
+      (Join-Path $nodeRoot 'node_modules\npm\bin')
+    )) {
+      Assert-OrdinaryDirectory $directory
+    }
+    Assert-OrdinaryFile $nodeExe
+    Assert-OrdinaryFile $npmCommand
+    Assert-OrdinaryFile $npmCli
+    if ((Get-PathIdentity $nodeExe) -cne [string]$record['node_identity']) { return $null }
+  } catch {
+    return $null
+  }
+  $version = Get-NodeVersion $nodeExe
+  if ($null -eq $version -or -not (Test-NodeFloor $version)) { return $null }
+  return @{ NodeExe = $nodeExe; NodeRoot = $nodeRoot; Generation = $generation }
+}
+
+function Publish-RuntimeMarker([string]$CacheRoot, [string]$GenerationRoot) {
+  # A valid competing completed record naming exactly this runtime is preserved.
+  $markerPath = Join-Path $CacheRoot 'current-node.txt'
+  $generation = [IO.Path]::GetFileName($GenerationRoot)
+  $existing = Read-RuntimeMarker $markerPath
+  if ($null -ne $existing -and $existing['version'] -ceq '22.19.0' -and $existing['platform'] -ceq $NodePlatform -and $existing['archive'] -ceq $NodeArchive -and $existing['sha256'] -ceq $NodeSha256 -and $existing['generation'] -ceq $generation) {
+    return
+  }
+  $nodeExe = Join-Path (Join-Path (Join-Path $GenerationRoot 'extracted') ('node-v22.19.0-' + $NodePlatform)) 'node.exe'
+  $identity = $null
+  try { $identity = Get-PathIdentity $nodeExe } catch { return }
+  $temporary = Join-Path $CacheRoot ('.current-node.' + [string]$PID + '.' + [Guid]::NewGuid().ToString('N'))
+  $body = @(
+    'schema=1',
+    'version=22.19.0',
+    ('platform=' + $NodePlatform),
+    ('archive=' + $NodeArchive),
+    ('sha256=' + $NodeSha256),
+    ('generation=' + $generation),
+    ('node_identity=' + $identity)
+  ) -join "`n"
+  try {
+    $bytes = [Text.Encoding]::UTF8.GetBytes($body + "`n")
+    $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try {
+      $stream.Write($bytes, 0, $bytes.Length)
+      $stream.Flush($true)
+    } finally { $stream.Dispose() }
+    # A stale record (malformed, wrong pin, deleted generation, changed Node
+    # identity) is replaced, so a stale marker can never force a download on
+    # every later fallback launch. A valid record for another completed runtime
+    # is a competing publication and is preserved.
+    if ($null -ne $existing) {
+      if ($null -ne (Test-CurrentFallbackRuntime $CacheRoot)) { return }
+      try { [IO.File]::Delete($markerPath) } catch { }
+    }
+    try { [IO.File]::Move($temporary, $markerPath) } catch { }
+  } catch {
+  } finally {
+    try { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } } catch { }
+  }
+}
+
+function Protect-CachedFallbackRuntime([string]$CacheRoot, [string]$GenerationRoot, [string]$AgentDirectory) {
+  # Publish this consumer's pid + targeted birth identity inside the GENERATION
+  # (the direct child every reclamation route inspects), under the canonical
+  # per-agent coordination entry that every destructive Node pass holds across
+  # deletion. A busy entry is never bypassed by a best-effort publication: the
+  # launch fails safely instead of using unprotected code. A record whose owner
+  # is gone is reclaimed later, so no generation is permanently preserved.
+  $chain = $null
+  $coordination = $null
+  try {
+    $chain = Get-NodeFence $CacheRoot
+    $script:NodeCleanupStopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $coordination = Enter-NodeCoordination $AgentDirectory
+    if ($null -eq $coordination) { return $false }
+    Assert-NodeFence $chain
+    $selected = Test-CurrentFallbackRuntime $CacheRoot
+    if ($null -eq $selected -or (Join-Path $CacheRoot $selected.Generation) -cne $GenerationRoot) { return $false }
+    $nodeExe = Join-Path (Join-Path (Join-Path $GenerationRoot 'extracted') ('node-v22.19.0-' + $NodePlatform)) 'node.exe'
+    try {
+      Assert-OrdinaryDirectory $GenerationRoot
+      Assert-OrdinaryFile $nodeExe
+    } catch { return $false }
+    $markerPath = Join-Path $GenerationRoot ('.consumer-' + [string]$PID + '-' + [Guid]::NewGuid().ToString('N'))
+    $marker = $null
+    try {
+      $marker = [IO.File]::Open($markerPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    } catch { $marker = $null }
+    if ($null -eq $marker) { return $false }
+    try {
+      $markerBody = [string]$PID + "`n" + (Get-NodeOwnerIdentity ([int]$PID)) + "`n"
+      $markerBytes = [Text.Encoding]::UTF8.GetBytes($markerBody)
+      $marker.Write($markerBytes, 0, $markerBytes.Length)
+      $marker.Flush($true)
+    } finally { $marker.Dispose() }
+    return $true
+  } catch {
+    return $false
+  } finally {
+    Exit-NodeCoordination $coordination
+    $script:NodeCleanupStopwatch = $null
+    $script:NodeCleanupStopped = $false
+  }
+}
+
 function Receive-OfficialArchive([string]$Url, [string]$Destination) {
   $request = [Net.HttpWebRequest]([Net.WebRequest]::Create($Url))
   $request.Method = 'GET'
@@ -530,20 +677,35 @@ function Test-NodeCleanupAllowsWork {
 }
 
 function Test-NodeGenerationActive([string]$Path) {
-  # True while a live producer owns this generation. Fence the generation root
-  # first: a direct-child link/junction is not a generation and its outside
-  # target must never be inspected. Invalid marker shapes are not liveness
-  # evidence, and confined no-follow cleanup handles them.
+  # True while a live producer or a live cached-runtime consumer owns this
+  # generation. Fence the generation root first: a direct-child link/junction is
+  # not a generation and its outside target must never be inspected. Invalid
+  # marker shapes are not liveness evidence, and confined no-follow cleanup
+  # handles them. Per-consumer `.consumer-<pid>-<guid>` records are evaluated
+  # individually, so several consumers never clobber each other's protection.
   $rootAttributes = Get-ExistingAttributes $Path
   if ($null -eq $rootAttributes) { return $false }
   if (($rootAttributes -band [IO.FileAttributes]::Directory) -eq 0 -or ($rootAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
   $marker = Join-Path $Path '.producer-active'
   $attributes = Get-ExistingAttributes $marker
-  if ($null -eq $attributes) { return $false }
-  if (($attributes -band [IO.FileAttributes]::Directory) -ne 0 -or ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
-  if (Test-NodeOwnerRecord $marker) { return $true }
-  try { [IO.File]::Delete($marker) } catch { }
-  return $false
+  if ($null -ne $attributes -and ($attributes -band [IO.FileAttributes]::Directory) -eq 0 -and ($attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+    if (Test-NodeOwnerRecord $marker) { return $true }
+    try { [IO.File]::Delete($marker) } catch { }
+  }
+  $active = $false
+  try {
+    foreach ($consumer in [IO.Directory]::EnumerateFiles($Path, '.consumer-*')) {
+      $consumerAttributes = Get-ExistingAttributes $consumer
+      if ($null -eq $consumerAttributes -or ($consumerAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+      if (Test-NodeOwnerRecord $consumer) {
+        $active = $true
+      } else {
+        try { [IO.File]::Delete($consumer) } catch { }
+      }
+    }
+  } catch {
+  }
+  return $active
 }
 
 function Read-NodeOwnerRecord([string]$Text) {
@@ -803,7 +965,7 @@ function Invoke-NodeCacheCleanup([string]$Root, $Chain, $Lock, [string]$AgentDir
     $count = 0
     foreach ($entry in $entries) {
       $entryName = [IO.Path]::GetFileName($entry)
-      if ($entryName -ceq '.admission.lock') { continue }
+      if ($entryName -ceq '.admission.lock' -or $entryName -ceq 'current-node.txt') { continue }
       if (-not [string]::IsNullOrEmpty($Keep) -and $entry -ceq $Keep) { continue }
       $count++
     }
@@ -821,7 +983,7 @@ function Invoke-NodeCacheCleanup([string]$Root, $Chain, $Lock, [string]$AgentDir
     foreach ($entry in $entries) {
       if ($count -le $candidateTarget) { break }
       $name = [IO.Path]::GetFileName($entry)
-      if ($name -ceq '.admission.lock') { continue }
+      if ($name -ceq '.admission.lock' -or $name -ceq 'current-node.txt') { continue }
       if (-not [string]::IsNullOrEmpty($Keep) -and $entry -ceq $Keep) { continue }
       if (($script:NodeCleanupProgress -gt 0) -and -not (Test-NodeCleanupRunning)) {
         # This pass already deleted something and has reached its budget: never
@@ -1005,7 +1167,7 @@ function Invoke-NodeSettlementCleanup([string]$Root, [string]$AgentDirectory, [s
   }
 }
 
-function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
+function New-NodeGeneration([string]$Root, [string]$AgentDirectory, [string]$Keep = '') {
   $chain = Get-NodeFence $Root
   $admission = $null
   $skipCleanup = $false
@@ -1056,7 +1218,7 @@ function New-NodeGeneration([string]$Root, [string]$AgentDirectory) {
         # release (see the finally block).
         [Console]::Error.WriteLine('pi-review-sessions: a session host currently owns the agent directory; leaving Node cache generations untouched.')
       } else {
-        $null = Invoke-NodeCacheCleanup $Root $chain $admission.Stream $AgentDirectory 4
+        $null = Invoke-NodeCacheCleanup $Root $chain $admission.Stream $AgentDirectory 4 $Keep
       }
     }
     $candidate = Join-Path $Root ('bootstrap-' + [Guid]::NewGuid().ToString('N'))
@@ -1093,7 +1255,28 @@ try {
   $cacheRoot = Ensure-DirectoryTree (Join-Path (Join-Path $agentDirectory '.pi-review-gate') 'node')
   Initialize-IdentityType
   $script:BootstrapCacheFence = Get-NodeFence $cacheRoot
-  $WorkRoot = New-NodeGeneration $cacheRoot $agentDirectory
+  # A previously completed runtime is reused when it is still current: no
+  # download, no re-verification, no extraction, and no tree scan.
+  $currentRuntime = Test-CurrentFallbackRuntime $cacheRoot
+  if ($null -ne $currentRuntime) {
+    if (-not (Protect-CachedFallbackRuntime $cacheRoot (Join-Path $cacheRoot $currentRuntime.Generation) $agentDirectory)) {
+      throw 'Cached Node coordination was unavailable.'
+    }
+    Start-SessionCjs $currentRuntime.NodeExe $currentRuntime.NodeRoot $CjsArguments
+  }
+  # Keep the currently marked generation protected while this launch installs
+  # its replacement, so a reusable runtime is never reclaimed before the new one
+  # is complete.
+  $keepPath = ''
+  $keepRecord = Read-RuntimeMarker (Join-Path $cacheRoot 'current-node.txt')
+  if ($null -ne $keepRecord) {
+    $keepGeneration = [string]$keepRecord['generation']
+    if ($keepGeneration -match '^(?:bootstrap[-.])[A-Za-z0-9-]+$') {
+      $keepCandidate = Join-Path $cacheRoot $keepGeneration
+      try { Assert-OrdinaryDirectory $keepCandidate; $keepPath = $keepCandidate } catch { }
+    }
+  }
+  $WorkRoot = New-NodeGeneration $cacheRoot $agentDirectory $keepPath
   $script:NodeGenerationMarker = Join-Path $WorkRoot '.producer-active'
   $cacheIdentity = Get-PathIdentity $cacheRoot
   $workIdentity = Get-PathIdentity $WorkRoot
@@ -1140,19 +1323,31 @@ try {
     throw 'Verified Node executable did not report a supported version.'
   }
   if (-not (Assert-PathIdentity $cacheRoot $cacheIdentity) -or -not (Assert-PathIdentity $WorkRoot $workIdentity) -or -not (Assert-PathIdentity $extractRoot $extractIdentity) -or -not (Assert-PathIdentity $nodeExe $nodeIdentity)) { throw 'Node executable identity changed after its version probe.' }
+  Publish-RuntimeMarker $cacheRoot $WorkRoot
   $FallbackNodeExecutable = $nodeExe
   $FallbackNodeDirectory = $nodeRoot
 } catch {
   [Console]::Error.WriteLine('pi-review-sessions: isolated Node bootstrap failed: unsafe path or download/validation failure.')
-  if ($null -ne $WorkRoot) {
-    [Console]::Error.WriteLine('pi-review-sessions: retained bootstrap witness: ' + $WorkRoot)
-  }
   if (-not [string]::IsNullOrEmpty($script:NodeGenerationMarker)) {
     try { [IO.File]::Delete($script:NodeGenerationMarker) } catch { }
   }
+  # A failed preparation keeps this launch's own incomplete witness, exactly like
+  # the POSIX producer: its in-progress marker is already gone, so it is an
+  # ordinary disposable generation that a later pass reclaims. Reclaiming it here
+  # instead would make every failed preparation silently shrink the cache, so a
+  # cache still within its per-type target would lose real capacity on each
+  # transient failure. The witness never becomes the kept generation: the runtime
+  # the pointer still names stays reusable, and settlement preserves the marked
+  # generation instead of preferring the failed one -- otherwise reclamation could
+  # delete the code the pointer names and force an unnecessary reinstall after a
+  # transient failure.
+  $settleKeep = $keepPath
+  if ($null -ne $WorkRoot -and -not [string]::IsNullOrEmpty($WorkRoot)) {
+    [Console]::Error.WriteLine('pi-review-sessions: retained bootstrap witness: ' + $WorkRoot)
+  }
   # Settlement retry after a failed preparation, joined before exiting.
   if (-not [string]::IsNullOrEmpty($agentDirectory) -and -not [string]::IsNullOrEmpty($cacheRoot)) {
-    Invoke-NodeSettlementCleanup $cacheRoot $agentDirectory $WorkRoot
+    Invoke-NodeSettlementCleanup $cacheRoot $agentDirectory $settleKeep
   }
   exit 1
 }

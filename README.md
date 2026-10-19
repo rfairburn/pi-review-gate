@@ -121,9 +121,10 @@ receipts of exactly what the model was told.
   [Security model](docs/security-model.md#secrets-and-authentication).
 
 Two web-tool dependencies sit outside the npm tree: `WebSearch` needs a user-installed
-Python 3 interpreter (`python3`, or also `python` on Windows), and the launcher creates and validates the pinned
-DDGS venv for it at launch (creating or repairing that venv needs package-index access;
-a valid cached environment starts offline). `npm install` downloads Playwright's
+Python 3 interpreter (`python3`, or also `python`/`py -3` on Windows). Launchers set up
+and validate the pinned DDGS venv when its readiness state is missing or outdated;
+current launches reuse it without Python setup checks. Creating or repairing that venv
+needs package-index access; a current cached environment starts offline. `npm install` downloads Playwright's
 Chromium for `BrowserExtract` and the interactive browser tools unless skipped.
 `WebFetch` needs neither. The full inventory, including what is user-installed versus
 automatic, lives in [Getting started](docs/getting-started.md#prerequisites), along
@@ -131,46 +132,59 @@ with the current Bash/Unix requirements of the shell launcher and `ShellStart`.
 
 ## Installation
 
-From a source checkout:
+Use a numbered, prebuilt tarball from
+[GitHub releases](https://github.com/rfairburn/pi-review-gate/releases). It includes
+compiled code and the full prerelease version; no npm-registry publication or source
+build is required. Choose a fresh installation prefix that no running session uses:
 
 ```bash
-npm install
+npm install --prefix ./new-inactive-install ./pi-review-gate-0.1.0-dev.N.tgz
 ```
 
 By default, installation also verifies and downloads Playwright's Chromium build for
 `BrowserExtract`. Server/CI installs that do not need browser extraction can skip it:
 
 ```bash
-PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM=1 npm install
+PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM=1 npm install --prefix ./new-inactive-install ./pi-review-gate-0.1.0-dev.N.tgz
 ```
 
 `WebSearch` and `WebFetch` remain available either way. See
 [Getting started](docs/getting-started.md#installation) for the recovery path when
 Chromium is missing.
 
+For development dependencies and tests in a source checkout, run `npm install` there.
+Source launchers remain supported and prepare an inactive build automatically only
+when relevant inputs have changed.
+
 ## Minimal configuration and launch
 
-Launch from the checkout on macOS/Linux:
+Launch the installed entry point on macOS/Linux:
 
 ```bash
-./scripts/pi-review-gate.sh
+./new-inactive-install/node_modules/.bin/pi-review-gate
 ```
 
 On Windows, use the native cmd.exe/PowerShell entry point (no Bash or WSL required):
 
 ```bat
-scripts\pi-review-gate.cmd
+new-inactive-install\node_modules\.bin\pi-review-gate-cmd.cmd
 ```
+
+Source-checkout equivalents are `./scripts/pi-review-gate.sh` and
+`scripts\pi-review-gate.cmd`; both use the same shared current/preparation state as
+the sidebar and web launchers.
 
 An optional, separate session-host alpha can run multiple independent native Pi sessions
 in one terminal on macOS/Linux. It does not replace either launcher; see the
 [session-host alpha guide](docs/session-host-alpha.md) for requirements, limitations,
 and the host-only shortcut configuration/editor.
 Launch it with the one-command entry points. They retain a supported Node on PATH or
-bootstrap the source-pinned official Node.js 22.19.0 archive into a fresh extraction
-under an isolated per-agent cache when Node is missing or too old (macOS/Linux x64 or
-arm64; Windows x64, arm64, or x86). Each fallback launch re-extracts rather than
-reusing an existing cache runtime; this does not replace a global Node install or
+bootstrap the source-pinned official Node.js 22.19.0 archive under an isolated per-agent
+cache when Node is missing or too old (macOS/Linux x64 or
+arm64; Windows x64, arm64, or x86). The pinned archive digest is verified and freshly
+extracted on installation/update; a previously completed fallback runtime is reused when
+it is still current, so later fallback launches do not download or extract again. This
+does not replace a global Node install or
 change normal user configuration. The launcher also resolves (or provisions) the public
 Pi runtime automatically — no manual Pi CLI path is needed. The `.cmd` entry point
 performs the Node bootstrap. Experimental same-machine Windows source paths for the

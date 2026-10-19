@@ -33,14 +33,17 @@ design. These interpreter, environment, and cache controls are trusted-user boun
 not safe inputs to accept from an untrusted repository, task, or process environment —
 see [Security model](security-model.md#trust-boundaries).
 
-DDGS setup fails closed: `scripts/ensure-ddgs.sh` provisions exactly `ddgs==9.16.0`,
-resolves all of its dependencies through pip, requires binary distributions, avoids
-pip's reusable download cache, runs every Python invocation (venv creation, pip, version
-validation) in isolated mode (`-I`) so a reviewed repository's local modules cannot
-shadow the interpreter or pip, and verifies both the installed DDGS distribution version
-and `pip check` before continuing. The version constraint and these checks are defense
-in depth, not cryptographic integrity: transitive dependencies and artifacts are not
-fully hash-pinned. The configured PyPI/index source and local pip configuration
+DDGS setup fails closed: the shared launcher preparer provisions exactly
+`ddgs==9.16.0`, resolves its dependencies through pip, requires binary distributions,
+avoids pip's reusable download cache, and runs every Python invocation in isolated
+mode (`-I`) so a reviewed repository's local modules cannot shadow the interpreter or
+pip. Setup verifies the installed DDGS distribution version and runs `pip check`;
+any installation or repair is followed by a fresh full validation before readiness is
+recorded. Current launches check that readiness state and the expected installed paths
+without spawning Python or repeating `pip check`. Explicitly invoking
+`scripts/ensure-ddgs.sh` still performs setup validation. The version constraint and
+these checks are defense in depth, not cryptographic integrity: transitive dependencies
+and artifacts are not fully hash-pinned. The configured PyPI/index source and local pip configuration
 therefore remain part of the trusted setup boundary.
 
 ## WebFetch

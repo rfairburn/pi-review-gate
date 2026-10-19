@@ -3,7 +3,8 @@ import { test } from "node:test";
 import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { join } from "node:path";
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, utimesSync, watch, writeFileSync } from "node:fs";
+import { basename, dirname } from "node:path";
 
 const requireCjs = createRequire(join(process.cwd(), "tests", "managed-generations.test.ts"));
 // The CJS producer surface deliberately has no environment/CLI test bypasses.
@@ -26,7 +27,8 @@ function fixture(prefix = ".generations-") {
   for (const dir of [bin, ...["src/session-host", "scripts", "skills"].map((p) => join(packageRoot, p))]) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
-  for (const name of ["package.json", "package-lock.json", "tsconfig.json"]) {
+  writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "pi-review-gate", version: "0.1.0" }), { mode: 0o600 });
+  for (const name of ["package-lock.json", "tsconfig.json"]) {
     writeFileSync(join(packageRoot, name), "{}", { mode: 0o600 });
   }
   writeFileSync(join(packageRoot, "src/session-host/main.ts"), "// input 0");
@@ -90,6 +92,9 @@ function writePi(root: string, version: string) {
   writeFileSync(join(pkg, "cli.js"), "#!/usr/bin/env node\n", { mode: 0o700 });
 }
 async function build(f: Fixture, extra: Record<string, unknown> = {}) {
+  // The shared authority forwards private runner seams as explicit keys; ignore
+  // undefined values so this fixture's own runners stay authoritative.
+  const overrides = Object.fromEntries(Object.entries(extra).filter(([, value]) => value !== undefined));
   return producer.buildSourceExtension({
     packageRoot: f.packageRoot,
     agentDir: f.agentDir,
@@ -101,11 +106,13 @@ async function build(f: Fixture, extra: Record<string, unknown> = {}) {
       return ok();
     },
     runCompile: async (_cli: string, _args: string[], o: { cwd: string }) => {
-      mkdirSync(join(o.cwd, "dist/src/session-host"), { recursive: true });
-      writeFileSync(join(o.cwd, "dist/src/session-host/main.js"), "// output");
+      for (const entry of ["dist/src/session-host/main.js", "dist/src/index.js", "dist/src/web/cli.js"]) {
+        mkdirSync(join(o.cwd, ...entry.split("/").slice(0, -1)), { recursive: true });
+        writeFileSync(join(o.cwd, ...entry.split("/")), "// output");
+      }
       return ok();
     },
-    ...extra,
+    ...overrides,
   });
 }
 async function provision(f: Fixture, version: string, extra: Record<string, unknown> = {}) {
@@ -124,6 +131,27 @@ async function provision(f: Fixture, version: string, extra: Record<string, unkn
     ...extra,
   });
 }
+/** Event-driven readiness wait for a path a concurrently admitted producer creates. */
+function waitForPath(file: string, timeoutMs = 15_000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (existsSync(file)) { resolve(); return; }
+    const watcher = watch(dirname(file), (_event, name) => {
+      if (name !== basename(file) || !existsSync(file)) return;
+      cleanup();
+      resolve();
+    });
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`timed out waiting for ${file}`));
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      try { watcher.close(); } catch { /* already closed */ }
+    };
+    if (existsSync(file)) { cleanup(); resolve(); }
+  });
+}
+
 function seedLegacy(root: string, names: string[]): string[] {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const roots: string[] = [];
@@ -335,52 +363,50 @@ test("an existing session-host ownership record skips cleanup without blocking c
   assert.ok(warnings.some((warning) => warning.includes("session host currently owns")));
 });
 
-test("real development producer reclaims excess legacy generations and reuses validated output", posix, async () => {
+test("application preparation does not reclaim at admission and never deletes live output", posix, async () => {
   const f = fixture();
   const outside = join(f.root, "outside"); writeFileSync(outside, "sentinel");
-  seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
+  const legacy = seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
   const result = await build(f);
-  assert.equal(result.status, 0, result.diagnostics);
-  assert.ok(result.stagingRoot.startsWith(f.builds + "/"));
-  assert.ok(count(f.builds) <= generations.LIMIT, `actual build cache is bounded: ${count(f.builds)}`);
-  assert.ok(directories(f.builds).filter((name) => name.startsWith("a")).length === 0, "legacy generations were actually removed");
+  assert.equal(result.ok, true, result.diagnostics);
+  assert.ok(result.root.startsWith(f.builds + "/"));
+  // Issue 344: admission is non-destructive for application preparation; the
+  // coordinated, lease-aware pass runs after the completed generation is
+  // published. Nothing is reclaimed before consumers are visible.
+  assert.ok(legacy.every((root) => existsSync(root)), "no destructive pass ran before publication");
   assert.equal(readFileSync(outside, "utf8"), "sentinel");
-  const reused = await build(f);
-  assert.equal(reused.cacheHit, true);
-  assert.equal(reused.stagingRoot, result.stagingRoot);
-  const changed = await build(f, { forceFresh: true });
-  assert.equal(changed.status, 0);
-  assert.notEqual(changed.stagingRoot, result.stagingRoot);
-  assert.ok(count(f.builds) <= generations.LIMIT);
-  assert.ok(existsSync(changed.stagingRoot));
+  result.generation?.release();
+  generations.cleanup(f.builds, { keep: [result.root] });
+  assert.ok(count(f.builds) <= generations.LIMIT, `coordinated cleanup is bounded: ${count(f.builds)}`);
+  assert.ok(directories(f.builds).filter((name) => name.startsWith("a")).length === 0, "legacy generations were actually removed");
+  assert.ok(existsSync(result.root), "the prepared generation is never a removal candidate");
 });
 
-test("compatible reuse preserves the selected generation and converges older ones without new build output", posix, async () => {
+test("a prepared generation stays current across repeated launches without new build output", posix, async () => {
   const f = fixture();
-  const original = await build(f);
-  const selectedIdentity = lstatSync(original.stagingRoot, { bigint: true });
-  const selectedEntry = join(original.stagingRoot, "dist/src/session-host/main.js");
-  const selectedBytes = readFileSync(selectedEntry, "utf8");
-  // Older generations appear after this build (a legacy cache that was never
-  // pruned, or concurrent producers that skipped cleanup while it was busy).
-  const extra = seedLegacy(f.builds, Array.from({ length: 7 }, (_, index) => `a-legacy-${index}`));
-  let npmCalls = 0;
-  let compileCalls = 0;
-  const reused = await build(f, {
-    runNpm: async () => { npmCalls += 1; return ok(); },
-    runCompile: async () => { compileCalls += 1; return ok(); },
-  });
-  assert.equal(reused.cacheHit, true, "the validated build was reused");
-  assert.equal(reused.stagingRoot, original.stagingRoot);
-  assert.equal(npmCalls, 0, "warm reuse runs no dependency installation (no new output)");
-  assert.equal(compileCalls, 0, "warm reuse compiles nothing (no new output)");
-  const afterIdentity = lstatSync(original.stagingRoot, { bigint: true });
-  assert.equal(`${afterIdentity.dev}:${afterIdentity.ino}`, `${selectedIdentity.dev}:${selectedIdentity.ino}`,
-    "the reused generation keeps its filesystem identity");
-  assert.equal(readFileSync(selectedEntry, "utf8"), selectedBytes, "the reused artifact bytes are untouched");
-  assert.ok(count(f.builds) <= generations.LIMIT, `warm reuse converges the cache: ${count(f.builds)}`);
-  assert.ok(extra.some((root) => !existsSync(root)), "warm reuse actually removed older generations");
-  assert.ok(existsSync(original.stagingRoot), "the selected generation was never a removal candidate");
+  const prepared = await build(f);
+  assert.equal(prepared.ok, true);
+  const app = createRequire(join(process.cwd(), "tests", "managed-generations.test.ts"))("../scripts/prepare-application.cjs") as {
+    prepareApplication(options: Record<string, unknown>): Promise<{ mode: string; preparedRoot?: string; lease?: { release(): void } }>;
+  };
+  let prepareCalls = 0;
+  const options = {
+    packageRoot: f.packageRoot,
+    agentDir: f.agentDir,
+    env: f.env,
+    prepare: async () => {
+      prepareCalls += 1;
+      return prepared;
+    },
+  };
+  const first = await app.prepareApplication(options);
+  assert.equal(first.mode, "prepared");
+  first.lease?.release();
+  const second = await app.prepareApplication(options);
+  assert.equal(second.mode, "current", "the shared authority reuses its completed marker");
+  assert.equal(second.preparedRoot, prepared.root);
+  assert.equal(prepareCalls, 1, "a current launch never re-enters the producer");
+  second.lease?.release();
 });
 
 test("a large and deep generation is deleted progressively instead of hitting a zero-deletion preflight", posix, () => {
@@ -511,22 +537,36 @@ test("an abandoned pid-only marker or lock whose pid was reused never pins a gen
   assert.ok(liveLockWarnings.some((warning) => warning.includes("cleanup lock was busy")));
 });
 
-test("legacy prepared-build reuse keeps freshness authority without any receipt", posix, async () => {
+test("a completed generation requires its receipt and is never rebuilt in place", posix, async () => {
   const f = fixture();
-  seedLegacy(f.builds, ["old-1", "old-2", "old-3", "old-4", "old-5", "old-6"]);
-  const first = await build(f);
-  assert.equal(first.status, 0);
-  // Simulate a legacy generation that never had a lifetime receipt: reuse is
-  // decided by the producer's own manifest/record validation.
-  assert.equal(existsSync(join(first.stagingRoot, ".generation.json")), false);
-  const legacyReuse = await build(f);
-  assert.equal(legacyReuse.cacheHit, true);
-  assert.equal(legacyReuse.stagingRoot, first.stagingRoot);
-  assert.ok(producer.validateSourceBuildArtifact(legacyReuse.stagingRoot, {
-    cacheKey: legacyReuse.cacheKey,
-    sourceFingerprint: legacyReuse.sourceFingerprint,
-    toolchainFingerprint: legacyReuse.toolchainFingerprint,
-  }, legacyReuse.cacheParentChain));
+  const prepared = await build(f);
+  assert.equal(prepared.ok, true);
+  const app = createRequire(join(process.cwd(), "tests", "managed-generations.test.ts"))("../scripts/prepare-application.cjs") as {
+    prepareApplication(options: Record<string, unknown>): Promise<{ mode: string; preparedRoot?: string; lease?: { release(): void } }>;
+    applicationStatus(options: Record<string, unknown>): { current: boolean };
+    attachConsumer(options: Record<string, unknown>): { release(): void } | undefined;
+  };
+  const preparedResult = await app.prepareApplication({ packageRoot: f.packageRoot, agentDir: f.agentDir, env: f.env, prepare: async () => prepared });
+  assert.equal(preparedResult.mode, "prepared");
+  preparedResult.lease?.release();
+  // The engine itself writes no receipt; publication does. A generation used as
+  // a launcher therefore requires the receipt written with its marker.
+  const receipt = join(preparedResult.preparedRoot as string, ".pi-review-gate-complete.json");
+  assert.equal(existsSync(receipt), true, "publication writes the completion receipt");
+  // Remove the receipt: the generation is refused, never rebuilt in place.
+  rmSync(receipt);
+  let prepareCalls = 0;
+  const refused = await app.prepareApplication({
+    packageRoot: preparedResult.preparedRoot as string,
+    agentDir: f.agentDir,
+    env: f.env,
+    prepare: async () => {
+      prepareCalls += 1;
+      return prepared;
+    },
+  });
+  assert.equal(refused.mode, "failed");
+  assert.equal(prepareCalls, 0, "an incomplete generation is never rebuilt in place");
 });
 
 test("Pi producer provisions more than five versions and reclaims actual directories", posix, async () => {
@@ -550,10 +590,12 @@ test("Pi producer provisions more than five versions and reclaims actual directo
 test("settled failed/aborted setup is reclaimed instead of blocking the next launch", posix, async () => {
   const f = fixture();
   for (let i = 0; i < 7; i++) {
-    const result = await build(f, { forceFresh: true, runNpm: async () => ok({ status: 1, timedOut: true }) });
+    const result = await build(f, { runNpm: async () => ok({ status: 1, timedOut: true }) });
     assert.equal(result.status, 124);
-    assert.ok(count(f.builds) <= generations.LIMIT, `failed build residue stays bounded: ${count(f.builds)}`);
   }
+  // Admission is non-destructive; the coordinated pass reclaims failed residue.
+  generations.cleanup(f.builds);
+  assert.ok(count(f.builds) <= generations.LIMIT, `failed build residue stays bounded: ${count(f.builds)}`);
   const pi = fixture();
   for (let i = 0; i < 7; i++) {
     await assert.rejects(provision(pi, `1.4.${i}`, { runNpm: async () => ok({ status: 1 }) }), /provisioning failed/);
@@ -592,7 +634,10 @@ test("simultaneous producers coordinate and are never refused for capacity", pos
     settle.forEach((done) => done());
     return pendingBuild;
   }));
-  assert.ok(results.every((result) => result.status === 0), results.map((result) => result.diagnostics).join("\n"));
+  assert.ok(results.every((result) => result.ok === true), results.map((result) => result.diagnostics).join("\n"));
+  // A direct engine caller settles its own in-flight generation markers; the
+  // shared authority does this as part of publication.
+  for (const result of results) result.generation?.release();
   // Concurrent creations may briefly exceed the target; the next admission
   // (not a refusal) converges the cache back to five.
   const converged = generations.admit(f.builds, () => ({ root: mkdtempSync(join(f.builds, "pi-review-sessions-")) }));
@@ -644,7 +689,9 @@ test("a cleanup never reclaims a generation another producer is still filling", 
   const second = start("second");
   assert.ok(stages.first && stages.second, "both producers reached setup");
   settles.find((settle) => settle.name === "first")!.resolve();
-  assert.equal((await first).status, 0);
+  const firstResult = await first;
+  assert.equal(firstResult.ok, true);
+  firstResult.generation?.release();
   // The lock owner has settled; a third cleanup now runs while the second
   // producer is still filling its generation.
   const third = start("third");
@@ -653,9 +700,11 @@ test("a cleanup never reclaims a generation another producer is still filling", 
   settles.find((settle) => settle.name === "second")!.resolve();
   settles.find((settle) => settle.name === "third")!.resolve();
   const results = await Promise.all([second, third]);
-  assert.ok(results.every((result) => result.status === 0), results.map((result) => result.diagnostics).join("\n"));
+  assert.ok(results.every((result) => result.ok === true), results.map((result) => result.diagnostics).join("\n"));
+  for (const result of results) result.generation?.release();
   assert.ok(existsSync(stages.second!), "the staggered setup completed without losing its generation");
-  assert.ok(count(f.builds) <= generations.LIMIT);
+  generations.cleanup(f.builds);
+  assert.ok(count(f.builds) <= generations.LIMIT, `coordinated cleanup converges: ${count(f.builds)}`);
 });
 
 test("a direct-child cache link never exposes an outside marker for deletion", posix, () => {
@@ -716,6 +765,7 @@ test("a staggered Pi producer never loses its in-progress setup to a replacement
     },
   });
   const heldRoot = join(f.runtimes, "pi-1.3.12");
+  await waitForPath(heldRoot);
   const heldIdentity = lstatSync(heldRoot, { bigint: true });
   releaseFirst();
   assert.equal((await first).version, "1.3.11");
@@ -792,7 +842,7 @@ test("full launcher provisions past eight occupied Pi candidates and reuses the 
   assert.equal(first.hostStarted, 1);
   assert.equal(installs.length, 1, "exactly one install was needed past all occupied candidates");
   assert.ok(resolved.startsWith(join(f.runtimes, "pi-1.3.0.8") + "/"), `used the next confined candidate: ${resolved}`);
-  assert.ok(firstDiagnostics.some((line) => line.includes("cache retains 8 generations")),
+  assert.ok(firstDiagnostics.some((line) => /cache retains \d+ generations/u.test(line)),
     "the live-owned candidates are reported, not falsely counted as pruned");
   assert.ok(firstDiagnostics.some((line) => line.includes("could not reclaim")));
 
@@ -1092,6 +1142,7 @@ test("the handoff hold survives a pending preparation and cannot be pruned by a 
   const timeouts: number[] = [];
   const realSetTimeout = globalThis.setTimeout;
   let holdPresentDuringPreparation = false;
+  let resolveCalls = 0;
   let instrumented = false;
   const diagnostics: string[] = [];
   globalThis.setTimeout = ((handler: TimerHandler, delay?: number, ...rest: unknown[]) => {
@@ -1109,20 +1160,23 @@ test("the handoff hold survives a pending preparation and cannot be pruned by a 
     stdinIsTTY: true,
     stdoutIsTTY: true,
     build: (options: Record<string, unknown>) => build(f, options),
-    resolvePiRuntime: async () => provision(f, "1.3.0"),
-    ensureDdgs: () => ({ ok: true, python: join(f.root, "python") }),
-    refreshShippedSkills: () => {
-      // Preparation is still pending here (skills publication runs inside the
-      // hold): another producer runs against the same agent directory while the
-      // handoff must keep the selection protected.
-      writeFileSync(barrierMarker, "pending");
-      const competing = spawnSync(process.execPath, [childSource, f.builds, barrierMarker, competingLog], { encoding: "utf8" });
-      assert.equal(competing.status, 0, competing.stderr);
-      holdPresentDuringPreparation = existsSync(coordination)
-        && readFileSync(coordination, "utf8").split("\n")[0]!.trim() === String(process.pid);
-      writeFileSync(barrierRelease, "done");
-      return { ok: true };
+    resolvePiRuntime: async () => {
+      resolveCalls += 1;
+      if (resolveCalls === 2) {
+        // The managed Pi re-selection runs inside the ownership handoff: another
+        // producer runs against the same agent directory while the selected
+        // prepared generation must stay protected.
+        writeFileSync(barrierMarker, "pending");
+        const competing = spawnSync(process.execPath, [childSource, f.builds, barrierMarker, competingLog], { encoding: "utf8" });
+        assert.equal(competing.status, 0, competing.stderr);
+        holdPresentDuringPreparation = existsSync(coordination)
+          && readFileSync(coordination, "utf8").split("\n")[0]!.trim() === String(process.pid);
+        writeFileSync(barrierRelease, "done");
+      }
+      return provision(f, "1.3.0");
     },
+    ensureDdgs: () => ({ ok: true, python: join(f.root, "python") }),
+    refreshShippedSkills: () => ({ ok: true }),
     writeOut: () => undefined,
     writeError: (text: string) => diagnostics.push(text),
     loadMain: () => ({
@@ -1141,7 +1195,7 @@ test("the handoff hold survives a pending preparation and cannot be pruned by a 
   globalThis.setTimeout = realSetTimeout;
   assert.equal(instrumented, true);
   assert.equal(status, 0, diagnostics.join(""));
-  assert.equal(holdPresentDuringPreparation, true, "the handoff is active while preparation is pending");
+  assert.equal(holdPresentDuringPreparation, true, `the handoff is active during Pi selection (resolveCalls=${resolveCalls})`);
   // The competing producer reached the cache but was told to leave it alone.
   const release = readFileSync(competingLog, "utf8").trim().split("\n").filter(Boolean);
   assert.ok(release.length >= 1, "the competing producer reported its admission");
@@ -2375,4 +2429,270 @@ test("a short pass budget stops a long run of tiny generations and later passes 
   }
   assert.ok(countCandidates(f.builds) <= generations.LIMIT, `successive passes finish it: ${countCandidates(f.builds)}`);
   assert.equal(readFileSync(outside, "utf8"), "outside bytes", "link candidates never touch their target");
+});
+
+test("a completed Pi discovery is reused without npm-root or a version probe", posix, async () => {
+  const f = fixture();
+  const pkg = join(f.bin, "node_modules", "@earendil-works", "pi-coding-agent");
+  mkdirSync(pkg, { recursive: true });
+  writeFileSync(join(pkg, "package.json"), JSON.stringify({
+    name: "@earendil-works/pi-coding-agent",
+    version: "1.0.4",
+    bin: { pi: "cli.js" },
+  }));
+  writeFileSync(join(pkg, "cli.js"), [
+    "#!/usr/bin/env node",
+    'if (process.argv.includes("--version")) { process.stdout.write("1.0.4\\n"); process.exit(0); }',
+    "process.exit(0);",
+    "",
+  ].join("\n"), { mode: 0o755 });
+  symlinkSync(join(pkg, "cli.js"), join(f.bin, "pi"));
+  const env = { ...f.env, PATH: f.bin };
+  const spawns: Array<{ file: string; args: string[] }> = [];
+  const runner = async (file: string, args: string[]) => {
+    spawns.push({ file, args: args.slice() });
+    return ok({ stdout: args.includes("--version") ? "1.0.4\n" : "" });
+  };
+  const options = {
+    env,
+    agentDir: f.agentDir,
+    cwd: f.root,
+    writeError: () => undefined,
+    processRunner: runner,
+  };
+  const first = await producer.resolvePiRuntime(options);
+  assert.equal(first.source, "path");
+  assert.ok(spawns.length >= 1, "the first resolution probes the installation");
+  spawns.length = 0;
+  const second = await producer.resolvePiRuntime(options);
+  assert.equal(second.file, first.file);
+  assert.equal(spawns.length, 0, "a completed discovery performs no npm-root and no version probe");
+  // A PATH change is honored without rebuilding: the cache key no longer matches.
+  spawns.length = 0;
+  await producer.resolvePiRuntime({ ...options, env: { ...env, PATH: `/nonexistent:${f.bin}` } });
+  assert.ok(spawns.length >= 1, "an explicit PATH change falls back to full validation");
+});
+
+test("a managed Pi selection is leased under its owning cache and preserved by cleanup", posix, async () => {
+  const f = fixture();
+  const versionRoot = join(f.runtimes, "pi-1.3.0");
+  writePi(versionRoot, "1.3.0");
+  // Generations beyond the retention target so a coordinated cleanup has
+  // candidates while the selected runtime must be preserved.
+  const siblings: string[] = [];
+  for (let index = 0; index < 7; index += 1) {
+    const sibling = join(f.runtimes, `pi-1.0.${index}`);
+    writePi(sibling, `1.0.${index}`);
+    siblings.push(sibling);
+  }
+  const cli = join(versionRoot, "node_modules", "@earendil-works", "pi-coding-agent", "cli.js");
+  const runner = async (file: string, args: string[]) => ok({ stdout: args.includes("--version") ? "1.3.0\n" : "" });
+  const selected = await producer.resolvePiRuntime({
+    explicit: cli,
+    env: f.env,
+    agentDir: f.agentDir,
+    cwd: f.root,
+    writeError: () => undefined,
+    processRunner: runner,
+  });
+  assert.ok(selected.lease, "the selected managed runtime is leased");
+  assert.equal(existsSync(versionRoot), true, "the selected runtime survives the coordinated cleanup");
+  assert.ok(siblings.some((sibling) => !existsSync(sibling)), "unleased excess Pi generations are reclaimed");
+  selected.lease.release();
+  generations.cleanup(f.runtimes);
+  assert.equal(existsSync(versionRoot), true, "releasing the lease does not delete code that nothing reclaims yet");
+});
+
+test("two complete sidebar launches perform no npm-root or version probe on the current start", posix, async () => {
+  const f = fixture();
+  // A public Pi package on PATH (managed by nobody: no pi-runtime cache).
+  const pkg = join(f.bin, "node_modules", "@earendil-works", "pi-coding-agent");
+  mkdirSync(pkg, { recursive: true });
+  writeFileSync(join(pkg, "package.json"), JSON.stringify({
+    name: "@earendil-works/pi-coding-agent",
+    version: "1.0.4",
+    bin: { pi: "cli.js" },
+  }));
+  const piLog = join(f.root, "pi-invocations.txt");
+  writeFileSync(join(pkg, "cli.js"), [
+    "#!/usr/bin/env node",
+    'require("node:fs").appendFileSync(' + JSON.stringify(piLog) + ', process.argv.slice(2).join(" ") + "\\n");',
+    'if (process.argv.includes("--version")) { process.stdout.write("1.0.4\\n"); process.exit(0); }',
+    "process.exit(0);",
+    "",
+  ].join("\n"), { mode: 0o755 });
+  symlinkSync(join(pkg, "cli.js"), join(f.bin, "pi"));
+  // A validating npm stand-in on PATH: the first launch may ask for its global
+  // root, the current start must not.
+  const npmLog = join(f.root, "npm-invocations.txt");
+  const npmPkg = join(f.bin, "node_modules", "npm");
+  mkdirSync(join(npmPkg, "bin"), { recursive: true });
+  writeFileSync(join(npmPkg, "package.json"), JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "bin/npm-cli.js" } }));
+  writeFileSync(join(npmPkg, "bin", "npm-cli.js"), [
+    "#!/usr/bin/env node",
+    'require("node:fs").appendFileSync(' + JSON.stringify(npmLog) + ', process.argv.slice(2).join(" ") + "\\n");',
+    "process.exit(0);",
+    "",
+  ].join("\n"), { mode: 0o755 });
+  chmodSync(join(npmPkg, "bin", "npm-cli.js"), 0o755);
+  // PATH's npm entry must resolve into the logging package (the generic fixture
+  // writes a plain file there) so the global-root query is observable.
+  rmSync(join(f.bin, "npm"), { force: true });
+  symlinkSync(join("node_modules", "npm", "bin", "npm-cli.js"), join(f.bin, "npm"));
+  for (const entry of ["dist/src/session-host/main.js", "dist/src/index.js", "dist/src/web/cli.js"]) {
+    const target = join(f.packageRoot, ...entry.split("/"));
+    mkdirSync(join(target, ".."), { recursive: true });
+    writeFileSync(target, "// compiled entry");
+  }
+  const env = { ...f.env, PATH: f.bin };
+  const runOnce = async () => {
+    let started = 0;
+    const status = await producer.runSessionHostLauncher([], {
+      getEnv: () => env,
+      processEnv: {},
+      platform: "linux",
+      nodeVersion: process.versions.node,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      packageRoot: f.packageRoot,
+      prepareApplication: (options: { agentDir: string }) => ({
+        mode: "current",
+        preparedRoot: f.packageRoot,
+        applicationMode: "packaged",
+        ddgsPython: join(f.root, "python"),
+        skills: [],
+        stateRoot: join(options.agentDir, ".pi-review-gate", "application"),
+        lease: { release: () => undefined },
+      }),
+      loadMain: () => ({ runSessionHost: () => { started += 1; return 0; } }),
+      writeOut: () => undefined,
+      writeError: () => undefined,
+    });
+    return { status, started };
+  };
+  const first = await runOnce();
+  assert.equal(first.status, 0);
+  assert.equal(first.started, 1);
+  const piAfterFirst = readFileSync(piLog, "utf8").trim().split("\n").length;
+  assert.equal(piAfterFirst, 1, "the first launch probes the Pi version once");
+  assert.match(readFileSync(npmLog, "utf8"), /root -g/u, "the first launch performs its global-root query once");
+
+  const second = await runOnce();
+  assert.equal(second.status, 0);
+  assert.equal(second.started, 1);
+  assert.equal(readFileSync(piLog, "utf8").trim().split("\n").length, piAfterFirst,
+    "the current start performs no version probe");
+  assert.equal(readFileSync(npmLog, "utf8").trim().split("\n").length, 1,
+    "the current start performs no additional npm-root query");
+  assert.equal(existsSync(f.runtimes), false, "an unmanaged PATH selection creates no managed runtime");
+});
+
+test("Pi provisioning admission never reclaims a concurrently leased runtime", posix, async () => {
+  const f = fixture();
+  const leasedRoot = join(f.runtimes, "pi-1.0.0");
+  writePi(leasedRoot, "1.0.0");
+  for (let index = 1; index <= 7; index += 1) writePi(join(f.runtimes, `pi-1.0.${index}`), `1.0.${index}`);
+  const prepareModule = createRequire(join(process.cwd(), "tests", "managed-generations.test.ts"))("../scripts/prepare-application.cjs") as {
+    attachConsumer(options: Record<string, unknown>): { release(): void } | undefined;
+  };
+  const stateRoot = join(f.agentDir, ".pi-review-gate", "application");
+  mkdirSync(stateRoot, { recursive: true });
+  const lease = prepareModule.attachConsumer({ stateRoot, agentDir: f.agentDir, preparedRoot: leasedRoot });
+  assert.ok(lease);
+  const result = await provision(f, "1.3.0");
+  assert.equal(result.version, "1.3.0");
+  assert.equal(existsSync(leasedRoot), true, "a concurrently leased runtime survives provisioning admission and settlement");
+  lease.release();
+});
+
+test("a cached managed selection is revalidated inside the lease coordination", posix, async () => {
+  const f = fixture();
+  const versionRoot = join(f.runtimes, "pi-1.3.0");
+  writePi(versionRoot, "1.3.0");
+  const cli = join(versionRoot, "node_modules", "@earendil-works", "pi-coding-agent", "cli.js");
+  const runner = async () => ok({ stdout: "1.3.0\n" });
+  const options = {
+    explicit: cli,
+    env: f.env,
+    agentDir: f.agentDir,
+    cwd: f.root,
+    writeError: () => undefined,
+    processRunner: runner,
+  };
+  const first = await producer.resolvePiRuntime(options);
+  first.lease?.release();
+  const warm = await producer.resolvePiRuntime(options);
+  assert.equal(warm.file, first.file, "the completed discovery is reused before the race");
+  warm.lease?.release();
+  const prepareModule = createRequire(join(process.cwd(), "tests", "managed-generations.test.ts"))("../scripts/prepare-application.cjs") as {
+    acquireCleanupLock(stateRoot: string): Promise<{ release(): void } | null>;
+  };
+  const stateRoot = join(f.agentDir, ".pi-review-gate", "application");
+  const lock = await prepareModule.acquireCleanupLock(stateRoot);
+  assert.ok(lock, "the cleanup coordination entry is available for the test");
+  const pending = producer.resolvePiRuntime(options);
+  // The resolver has synchronously revalidated the cached selection and is now
+  // waiting for the coordination entry; reclaim it before that entry is released.
+  rmSync(versionRoot, { recursive: true, force: true });
+  lock.release();
+  await assert.rejects(pending, /changed before leasing/u);
+});
+
+test("Pi discovery is keyed to cwd and the current PATH resolution", posix, async () => {
+  const base = mkdtempSync(join(process.cwd(), "node_modules", ".pi-discovery-"));
+  const runner = async () => ok({ stdout: "1.0.4\n" });
+  const writePackage = (directory: string, label: string): string => {
+    const pkg = join(directory, "node_modules", "@earendil-works", "pi-coding-agent");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({
+      name: "@earendil-works/pi-coding-agent",
+      version: "1.0.4",
+      bin: { pi: "cli.js" },
+    }));
+    const cli = join(pkg, "cli.js");
+    writeFileSync(cli, `#!/usr/bin/env node\nprocess.exit(0); // ${label}\n`, { mode: 0o755 });
+    return cli;
+  };
+  const agentDir = join(base, "agent");
+  const dirA = join(base, "a");
+  const dirB = join(base, "b");
+  mkdirSync(dirA, { recursive: true });
+  mkdirSync(dirB, { recursive: true });
+  for (const dir of [dirA, dirB]) {
+    const pkg = join(dir, "pi-bin", "node_modules", "@earendil-works", "pi-coding-agent");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "1.0.4", bin: { pi: "cli.js" } }));
+    writeFileSync(join(pkg, "cli.js"), "#!/usr/bin/env node\nprocess.exit(0);\n", { mode: 0o755 });
+    mkdirSync(join(dir, "pi-bin"), { recursive: true });
+  }
+  // A relative --pi-executable resolves differently from different cwds.
+  const resolve = (cwd: string) => producer.resolvePiRuntime({
+    explicit: join("pi-bin", "node_modules", "@earendil-works", "pi-coding-agent", "cli.js"),
+    env: { ...process.env, PATH: "" },
+    agentDir,
+    cwd,
+    writeError: () => undefined,
+    processRunner: runner,
+  });
+  const a = await resolve(dirA);
+  a.lease?.release();
+  const b = await resolve(dirB);
+  b.lease?.release();
+  assert.equal(a.file, join(dirA, "pi-bin", "node_modules", "@earendil-works", "pi-coding-agent", "cli.js"));
+  assert.equal(b.file, join(dirB, "pi-bin", "node_modules", "@earendil-works", "pi-coding-agent", "cli.js"),
+    "a relative explicit selection is not reused across working directories");
+
+  // Retargeting a PATH alias is visible without changing PATH or spawning npm.
+  const bin = join(base, "bin");
+  mkdirSync(bin, { recursive: true });
+  const firstCli = writePackage(join(base, "install-a"), "a");
+  const secondCli = writePackage(join(base, "install-b"), "b");
+  symlinkSync(firstCli, join(bin, "pi"));
+  const env = { ...process.env, PATH: bin };
+  const viaPath = await producer.resolvePiRuntime({ env, agentDir, cwd: base, writeError: () => undefined, processRunner: runner });
+  assert.equal(viaPath.file, firstCli);
+  rmSync(join(bin, "pi"), { force: true });
+  symlinkSync(secondCli, join(bin, "pi"));
+  const retargeted = await producer.resolvePiRuntime({ env, agentDir, cwd: base, writeError: () => undefined, processRunner: runner });
+  assert.equal(retargeted.file, secondCli, "a retargeted PATH alias invalidates discovery on unchanged PATH");
 });

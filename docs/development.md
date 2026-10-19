@@ -328,8 +328,9 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
   the extension supplies its prompt only when both guidance settings are On and live
   authorized discovery exposes `YouShouldKnow`.
 
-`scripts/pi-review-web.sh` similarly provisions DDGS, builds when sources are present,
-and executes `dist/src/web/cli.js`.
+`scripts/pi-review-web.sh` uses the same shared preparation authority: it runs the
+prepared root's `dist/src/web/cli.js` with the ready DDGS interpreter, and performs no
+build, staging, Python probe, or cleanup when the prepared state is current.
 
 `scripts/pi-review-gate.cmd` + `scripts/pi-review-gate-launcher.cjs` (issue 108) are the
 native Windows counterparts of the persistent launcher: the thin `.cmd` passes its raw
@@ -338,23 +339,26 @@ inherited environment and no setup) and runs everything else natively — deleti
 inherited `PI_REVIEW_GATE_CONFIG`, resolving
 `PI_CODING_AGENT_DIR` with Pi's native semantics (a deliberate mirror of
 `src/config-path.ts`; keep the two in sync), initializing the zero-model default config
-with exact-destination link publication, rebuilding dist or requiring the packaged
-artifact, provisioning the pinned DDGS dependency in a `Scripts\python.exe` venv
-(`python3`, then `python`, probed for isolated-mode usability; the POSIX
-`scripts/ensure-ddgs.sh` stays the macOS/Linux mechanism), publishing the orchestrator
-skill through an atomic rename, exporting `PI_REVIEW_GATE_DDGS_PYTHON`, and executing
-`pi` with the forwarded arguments and exit status. On Windows it resolves `pi.cmd`
+with exact-destination link publication, and then asking the shared preparation
+authority (`scripts/prepare-application.cjs`) for a current-or-prepared root plus the
+ready DDGS interpreter and shipped-skill paths. Neither wrapper family carries its own
+freshness, build, DDGS, or skill algorithm any more. A current start reads bounded
+markers and stats the recorded application inputs only; a genuine miss installs and
+compiles automatically in an isolated inactive generation, publishes readiness with a
+marker plus a completion receipt only after everything succeeded, and holds a consumer
+lease while the launched code runs. `PI_REVIEW_GATE_DDGS_PYTHON` is exported and `pi` is
+executed with the forwarded arguments and exit status. On Windows the helper resolves
+`pi.cmd`
 on `PATH` and invokes that full path through the parent's validated absolute
 `SystemRoot\System32\cmd.exe`, without reading the shim or resolving Pi's underlying
 installation; an installed `pi.exe` continues to run directly. The interpreter must
 exist as a regular file at the parent's fully qualified `SystemRoot\System32\cmd.exe`;
 child `SystemRoot`, `ComSpec`, `PATH`, and the working directory cannot override it, and an
 invalid or missing interpreter fails closed. Normal Windows batch parsing, including
-`%VAR%` expansion, applies. Publication runs in-process (`fs.linkSync`/`fs.renameSync`),
-and Python is spawned with argument arrays. npm's development build still uses its
-resolved JavaScript entry point with a fixed-token fallback through the same
-validated system command processor; that fallback also fails closed when the
-interpreter is unavailable. POSIX uses plain
+`%VAR%` expansion, applies. Publication runs in-process
+(`fs.linkSync`/`fs.renameSync`), Python is spawned with argument arrays, and the
+lockfile install plus staged TypeScript compiler are invoked through the public npm
+JavaScript entry and public Node (never a batch shim or a shell). POSIX uses plain
 `execvp`. Invoking a `.cmd` file from PowerShell still crosses cmd.exe parsing:
 PowerShell string delimiters alone do not protect batch metacharacters. For example, pass `--label '\"a&b|c^d\"'` from
 PowerShell so literal double quotes protect the value through batch forwarding.
@@ -381,8 +385,8 @@ absolute `SystemRoot\System32\cmd.exe` with `/d /s /c`, `cmdQuote`, and
 managed shims and npm-generated shims use the same path. The interpreter is checked
 as an existing regular file and never selected from the child environment, `ComSpec`,
 `PATH`, or working directory; invalid or missing parent `SystemRoot` fails closed.
-The launcher's npm-only parser remains separate for its development build;
-its batch fallback uses the same validated absolute system command processor.
+The launcher no longer invokes a package build at all; preparation uses the shared
+lockfile-install and staged-compiler engine described above.
 POSIX default launches and configured custom commands retain their
 existing spawn semantics, and a missing default CLI fails closed.
 
@@ -483,15 +487,20 @@ to limit the orchestrator, pass Pi's native allowlist through the wrapper, for e
 
 ### Producer-owned disposable cache cleanup
 
-`scripts/managed-generations.cjs` provides the CJS producer seam used by the optional
-session host's development build and isolated Pi installer. Each type's direct child
-entries are its complete inventory (target five); there is no parallel lifetime index
-and no receipt written into a generation. These trees exist only under the designated
-`.pi-review-gate/{build,pi-runtime,node}` caches, so their contents are disposable by
-location: a descendant is reclaimable regardless of who created it and regardless of
-whether any legacy lifetime/metadata record still exists. Existing source-build
-freshness manifests/records remain the sole build-reuse authority and are not
-repurposed as capacity evidence.
+`scripts/managed-generations.cjs` provides the CJS producer seam used by the shared
+application preparation (source generations) and the isolated Pi installer. Each type's
+direct child entries are its complete inventory (target five); there is no parallel
+lifetime index and no receipt written into a generation. These trees exist only under
+the designated `.pi-review-gate/{build,pi-runtime,node}` caches, so their contents are
+disposable by location: a descendant is reclaimable regardless of who created it and
+regardless of whether any legacy lifetime/metadata record still exists. Freshness is
+decided by the shared preparation marker plus each generation's completion receipt, not
+by cache capacity. Live consumers (application generations and managed Pi runtimes)
+hold pid+birth leases in the application state directory; reclamation preserves leased
+roots, and an incomplete or unreadable lease inventory skips reclamation instead of
+ignoring consumers it could not see. Application preparation opts out of admission-time
+reclamation and runs one coordinated, lease-aware pass after publishing its completed
+generation, so no destructive pass can run before consumers are visible.
 
 `admit(cacheRoot, create, options)` first takes the canonical per-agent coordination
 entry (`<agentDir>/session-host/host-coordination.lock`) that the session host's

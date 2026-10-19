@@ -255,30 +255,65 @@ conversation selection happens only through the sidebar's deliberate Saved conve
 picker (below); parent startup arguments still cannot select a session.
 
 The launcher rejects unsupported platform, Node version, non-interactive use, and
-runtime-role contexts before starting a host. Installed packages use their compiled
-output. Source launches can reuse a previously completed private stage when the exact
-build/runtime input contents and modes, Node/npm implementation, platform, and build
-configuration still match. Cache hits skip dependency installation and TypeScript
-compilation, not Pi identity/version checks or DDGS validation. Cached artifact contents
-and filesystem identities are checked before any cached setup helper or host is loaded.
-Uncommitted source, script, skill, lockfile, manifest, or tsconfig changes invalidate reuse.
+runtime-role contexts before starting a host. A completed Pi discovery (the validated CLI
+entry, its package version, and its filesystem identity, keyed to the explicit/PATH
+context) is reused on later launches, so a current sidebar start performs no global
+npm-root query, no `pi --version` probe, and no managed-runtime cleanup; an explicit or
+PATH change is honored by falling back to full validation without rebuilding the
+application. Every launcher — Pi (`.sh`/`.cmd`), the
+web wrapper, and the sidebar (`.sh`/`.cmd`/`.ps1`) — then asks ONE shared authority
+(`scripts/prepare-application.cjs`) whether the prepared application is current. That
+decision is a fraction of a second: it reads a small bounded marker plus a completion
+receipt, and stats only the paths those records name. A current start runs no install,
+compiler, staging step, artifact inventory, runtime fingerprint, Python probe, skill
+copy, or cache cleanup.
 
-First or changed source builds still use fresh bounded staging and locked
-`npm ci --include=dev --ignore-scripts`, followed by the stage-installed TypeScript
-compiler directly through trusted Node, without the package build script's recursive
-clean step. Unknown external Node preload/loader, dependency, or environment modes
-(including proxy overrides) bypass reuse rather than assuming unchanged build inputs.
-Invalid, incomplete, unsafe, or raced cache entries are preserved; the launcher builds
-privately instead of loading unverifiable output. Cache manifests are corruption/freshness
-checks, not protection against a same-user writer forging both artifacts and metadata;
-filesystem identity fences are not an atomic filesystem sandbox. Development-build,
-fallback-Node and isolated-Pi caches each target **five generations**, counted
-independently, and excess generations are reclaimed best effort before another artifact
-is created. A build's npm home/cache/temp residue stays inside its one generation; Pi
-stages and publishes inside its own version root without an extra generation. Partial
-npm output stays in a contained `.setup` directory until validated `node_modules`
-publication, so another launcher cannot reuse a half-install. Compatible build reuse
-neither inventories nor prunes generations.
+Installed packages are identified by their full exact version (for example
+`0.1.0-dev.180`), so a prebuilt consumer never compiles. Source checkouts are identified
+by a bounded index of the application inputs — `package.json`, `package-lock.json`,
+`tsconfig.json`, `src/`, `scripts/`, and `skills/` — captured during preparation. A
+recorded file's size, inode, device, mode, and modification/change times decide whether
+anything moved; only a metadata change triggers the small input checksum, which
+distinguishes a real edit from a touch-only change. `node_modules`, `dist`, `.git`,
+`docs`, `tests`, caches, private notes, and `.terraform` trees are never scanned or
+hashed. Added, edited, or deleted inputs invalidate; irrelevant or touch-only changes do
+not. A prepared generation is immutable installed code and keeps the same source
+identity as the checkout it came from, so starting a launcher from a prepared root never
+rebuilds recursively and never overwrites the checkout's freshness state.
+
+A genuine miss is updated automatically — no confirmation — under one preparation lock,
+so concurrent launchers never duplicate the same update. Staging and locked
+`npm ci --include=dev --ignore-scripts` plus the stage-installed TypeScript compiler run
+in a fresh inactive generation, never in the live checkout's `dist/` or dependencies,
+and never through the package build script's recursive clean step. Readiness is
+published only after installation, compilation, required entries, and input coherence
+all succeed: a marker names the prepared root and its filesystem identity, and a
+completion receipt inside the generation records its own identity and the exact inputs
+it was built from. A failed, cancelled, or raced preparation publishes nothing and
+preserves everything it did not own. Markers and receipts are freshness/coordination
+state, not protection against a same-user writer forging both artifacts and metadata;
+filesystem identity fences are not an atomic filesystem sandbox.
+
+Every consumer publishes a small pid+birth lease before it uses a prepared root (a
+generation, an installed package never needs one, and a managed Pi runtime is leased for
+the same lifetime), and every destructive pass preserves leased roots. A lease names the
+native process that will actually run the code: a POSIX wrapper execs the launched
+application, so the shared CLI binds its invoking parent's native pid rather than a
+shell-provided number. Managed-runtime selection and lease publication are one
+coordinated step, so an update cannot delete a runtime between selection and leasing; a
+lease that cannot be published stops that selection instead of using unprotected code. The lease and the
+selection decision are taken under one short coordination entry, so an update cannot
+reclaim the code a live Pi, web, or sidebar process selected. Consumer inventories are
+bounded: an incomplete or unreadable lease view skips reclamation rather than ignoring
+consumers it could not see, and unknown entries are never deleted as stale leases.
+Development-build, fallback-Node, and isolated-Pi caches each target **five
+generations**, counted independently. Application preparation does not reclaim at
+admission; one coordinated, lease-aware pass runs after the completed generation is
+published, and a current start performs no cleanup at all. A build's npm
+home/cache/temp residue stays inside its one generation; Pi stages and publishes inside
+its own version root without an extra generation. Partial npm output stays in a
+contained `.setup` directory until validated `node_modules` publication, so another
+launcher cannot reuse a half-install.
 
 Cleanup never refuses creation. Stale or malformed non-live lock artifacts are
 reclaimed rather than permanently disabling pruning, and missing/malformed legacy
@@ -287,9 +322,9 @@ failure is reported as a bounded warning and the launch continues, so five or mo
 generations can never block startup. One cleanup pass shares a single runtime budget and
 deletes as it walks, so a large or deep generation makes real progress instead of being
 refused forever by a whole-tree bound; the next preparation continues from what remains.
-Compatible source-build and Pi runtime reuse, and each settled preparation, run the same
-bounded pass toward five and never treat the generation the launch is using as a
-candidate, so a warm startup converges older generations without rebuilding anything.
+Each settled preparation (and each managed-Pi reuse) runs the same bounded pass toward
+five and never treats the generation the launch is using, or any generation leased by a
+live consumer, as a candidate.
 Destructive reclamation and the session host's
 ownership acquisition are mutually exclusive through the same per-agent coordination
 entry described above: cleanup holds it only while it removes excess generations and
@@ -319,8 +354,15 @@ are unchanged.
 
 The fallback Node wrappers reclaim excess direct-child artifacts before creating another
 one, using the same best-effort rules; a failed deletion warns and the launch proceeds.
-They still extract a fresh checksum-pinned official archive rather than reusing mutable
-Node, and the supported PATH-Node route is unchanged. POSIX and native PowerShell both
+Pinned-digest verification, member validation, and fresh extraction stay on ACTUAL Node
+installation or update; a previously completed fallback runtime is reused when its
+recorded pinned identity, direct-child generation path, Node/npm entries, filesystem
+identity, and cheap version probe all still match, so a warm fallback launch performs no
+download, extraction, or tree scan. A reused runtime is protected by a per-consumer
+pid+birth liveness record that every native reclamation route honors and that is
+reclaimed once that consumer exits; a stale completed-runtime record is replaced by the
+next successful installation instead of forcing a download on every later launch. The
+currently marked generation is protected while a replacement installs. The supported PATH-Node route is unchanged. POSIX and native PowerShell both
 recover a stale lock and never enter reparse points/links. Native Windows cache cleanup
 is ordinary native deletion without a descendant-settlement claim; remaining Windows
 host/ConPTY parity work is tracked separately. Protocol and native proof boundaries are
@@ -334,12 +376,13 @@ migration, so a direct sidebar launch needs no wrapper prerequisite; byte-identi
 installed files are reused untouched on repeat launches. Setup failures stop startup
 rather than falling back to a shell wrapper. Explicit, npm-global and PATH selections
 inside a managed Pi generation keep the existing package/version validation and
-alias-containment checks before the version probe; they do not acquire a lifetime pin.
+alias-containment checks before the version probe, and the selected generation is
+leased for the launcher's lifetime so cache cleanup preserves it.
 Normal POSIX host shutdown keeps the existing ownership/cleanup guards for the agent
 directory; cache cleanup is independent of the numeric exit status. Cache metadata is
 coordination, not a same-user security sandbox. Installed compiled-package startup
-does not inspect or clean the development-build cache. The normal review-gate launchers,
-their behavior, and user settings are unchanged.
+does not inspect or clean the application build cache. The Pi and web launchers use the
+same shared current/update decision and component markers.
 
 ## Starting and owning sessions
 

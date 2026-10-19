@@ -40,9 +40,9 @@ underlying behavior.
   file; move or rename it.
   Then re-run, or create a config manually at either persistent path. See
   [Getting started](getting-started.md#launching).
-- **`pi-review-gate: packaged extension is missing`.** The launcher could not find
-  `dist/src/index.js` and no `src/index.ts` was present to build from. Run
-  `npm run build` in the checkout, or reinstall the package.
+- **`pi-review-gate: the packaged extension output is missing`.** The launcher is running
+  from an installed package whose compiled output is incomplete or absent. Reinstall the
+  package; a source checkout prepares automatically and needs no manual build.
 
 ## Reviews
 

@@ -244,9 +244,10 @@ jobs:
         # entrypoint setup evidence only, never real Windows ConPTY or sidebar
         # UI readiness.
         run: node --test dist-test/tests/session-host-skill-provisioning.test.js
-      - name: Launcher development-build seam on native Windows
-        # The same npm script the launcher's development branch executes
-        # (npm --prefix <root> run build), validating the toolchain natively.
+      - name: Package build toolchain on native Windows
+        # Native toolchain evidence only: this is the package's own prepack build
+        # script. Since issue 344 the launchers never run a package build; they
+        # use the shared preparation engine's staged install and compiler.
         run: npm run build
       - name: Install fresh locked Pi runtime (native Windows)
         # This is a test-only npm ci into an empty runner-temp directory, not a

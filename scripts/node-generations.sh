@@ -532,27 +532,52 @@ node_coordination_release() {
   return 0
 }
 
-# True (0) while a live producer owns this generation's owner marker. A marker
-# whose owner is gone, reused, or that stays empty/malformed is reclaimed.
+# True (0) while a live producer or a live cached-runtime consumer owns this
+# generation's liveness record. Producer markers are reclaimed when their owner
+# is gone, reused, or when the record stays empty/malformed; per-consumer
+# `.consumer-<pid>-<random>` records are removed individually once that consumer
+# is gone, so several consumers of one cached runtime never clobber each other's
+# protection.
 node_generation_active() {
-  local marker="$1/.producer-active" attempt
+  local marker="$1/.producer-active" attempt consumer active=0 restore_nullglob restore_dotglob
   # Fence the generation root: a direct-child link is not a generation and its
   # outside target must never be inspected or modified.
   [[ -d "$1" && ! -L "$1" ]] || return 1
-  [[ -e "$marker" || -L "$marker" ]] || return 1
-  # A directory/linked/oversized marker is not liveness evidence; confined
-  # no-follow removal handles it.
-  [[ -f "$marker" && ! -L "$marker" ]] || return 1
-  for attempt in 1 2 3; do
-    if node_owner_read "$marker"; then
-      node_owner_current "$marker" && return 0
-      "$NODE_UNLINK_BIN" "$marker" 2>/dev/null || true
-      return 1
+  if [[ -e "$marker" || -L "$marker" ]]; then
+    # A directory/linked/oversized marker is not liveness evidence; confined
+    # no-follow removal handles it.
+    if [[ -f "$marker" && ! -L "$marker" ]]; then
+      for attempt in 1 2 3; do
+        if node_owner_read "$marker"; then
+          node_owner_current "$marker" && return 0
+          "$NODE_UNLINK_BIN" "$marker" 2>/dev/null || true
+          break
+        fi
+        sleep 0.05 2>/dev/null || sleep 1
+      done
+      if [[ -f "$marker" && ! -L "$marker" ]] && node_owner_read "$marker"; then
+        node_owner_current "$marker" && return 0
+      fi
     fi
-    sleep 0.05 2>/dev/null || sleep 1
+  fi
+  shopt -q nullglob; restore_nullglob=$?
+  shopt -q dotglob; restore_dotglob=$?
+  shopt -s nullglob dotglob
+  for consumer in "$1"/.consumer-*; do
+    if [[ -L "$consumer" || ! -f "$consumer" ]]; then
+      [[ -L "$consumer" ]] && "$NODE_UNLINK_BIN" "$consumer" 2>/dev/null || true
+      continue
+    fi
+    if node_owner_read "$consumer" && node_owner_current "$consumer"; then
+      active=1
+    else
+      "$NODE_UNLINK_BIN" "$consumer" 2>/dev/null || true
+    fi
   done
-  "$NODE_UNLINK_BIN" "$marker" 2>/dev/null || true
-  return 1
+  (( restore_nullglob == 0 )) || shopt -u nullglob
+  (( restore_dotglob == 0 )) || shopt -u dotglob
+  (( active == 0 )) && return 1
+  return 0
 }
 
 # Append the direct children of one directory to NODE_CHILDREN with the caller's
@@ -953,7 +978,7 @@ node_admit() {
     else
       # Trim to four so creating this launch's ONE new generation lands at or
       # below the per-type target of five whenever that is possible.
-      node_reclaim_excess $((NODE_LIMIT - 1)) '' "$NODE_LIMIT"
+      node_reclaim_excess $((NODE_LIMIT - 1)) "${NODE_KEEP_ROOT:-}" "$NODE_LIMIT"
     fi
     # Keep the admission lock until this producer exits (released by the
     # caller's EXIT trap). Another concurrent producer then skips cleanup

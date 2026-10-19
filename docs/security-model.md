@@ -32,6 +32,23 @@ The legacy `PI_REVIEW_GATE_DDGS_HELPER` variable is ignored, so an inherited val
 cannot substitute an arbitrary helper; production always resolves the packaged
 `scripts/ddgs-search.py` relative to the loaded extension ([Web tools](web-tools.md)).
 
+### Launcher freshness and installed-code trust
+
+The Pi, sidebar, and web launchers share a quick current-state check. Packaged
+installations use their full exact package version; development preparation records a
+bounded application-input index and checksum. A current launch uses recorded state and
+cheap path/identity/readiness checks, not a recursive integrity scan of installed
+code, Node/npm implementations, or dependencies. DDGS imports and `pip check` run
+when setup or repair is needed, not on every current launch.
+
+These records describe completed local preparation, not cryptographic attestation of
+every installed byte or a sandbox against another process of the same user. Necessary
+installation/provisioning validation runs during updates. Updates use inactive managed
+outputs, and consumer ownership protects code still in use; malformed or incomplete
+state never authorizes loading an unsafe path or publishing an incomplete installation.
+See [Launcher behavior](development.md#launcher-behavior) and
+[WebSearch setup](web-tools.md#websearch).
+
 ### Session-host status IPC
 
 The session-host broker and its child reporter share one authenticated, bounded

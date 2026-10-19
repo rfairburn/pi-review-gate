@@ -644,18 +644,22 @@ test("prepareNativeLaunch publishes shipped skills into the reserved profile loc
       );
     }
   }
-  // Parity with the shipped launchers' SKILL_PUBLISH_PLAN (source of truth).
+  // Parity with the ONE shared shipped manifest (issue 344). The POSIX wrapper
+  // carries no second manifest of its own.
+  const { createRequire } = await import("node:module");
+  const requireCjs = createRequire(join(process.cwd(), "tests", "session-host-launch.test.ts"));
+  const shared = requireCjs("../scripts/prepare-application.cjs") as {
+    SKILL_PUBLISH_PLAN: { name: string; files: { source: string[]; destination: string[] }[] }[];
+  };
   const shSource = await readFile(resolve(__dirname, "../../scripts/pi-review-gate.sh"), "utf8");
-  const dirNames = new Map(
-    [...shSource.matchAll(/^([A-Z_]+_SKILL_DIR)="\$SKILLS_DIR\/([^"]+)"/gm)].map((m) => [m[1], m[2]]),
-  );
-  const shippedPairs = [...shSource.matchAll(/^  "\$REVIEW_GATE_ROOT\/(\S+?)"\$'\\t'"\$([A-Z_]+)_SKILL_DIR\/(\S+)"/gm)].map(
-    (m) => `${m[1]}\t${dirNames.get(`${m[2]}_SKILL_DIR`)}/${m[3]}`,
+  assert.doesNotMatch(shSource, /SKILL_PUBLISH_PLAN=/, "the POSIX wrapper must not carry its own manifest");
+  const shippedPairs = shared.SKILL_PUBLISH_PLAN.flatMap((skill) =>
+    skill.files.map((file) => `${file.source.join("/")}\t${skill.name}/${file.destination.join("/")}`),
   );
   const ownPairs = NATIVE_SKILL_PUBLISH_PLAN.flatMap((skill) =>
     skill.files.map((file) => `${file.source.join("/")}\t${skill.name}/${file.destination.join("/")}`),
   );
-  assert.deepEqual(ownPairs.sort(), shippedPairs.sort(), "the native skill map must mirror the shipped SKILL_PUBLISH_PLAN");
+  assert.deepEqual(ownPairs.sort(), shippedPairs.sort(), "the native skill map must mirror the shared SKILL_PUBLISH_PLAN");
 });
 
 test("prepareNativeLaunch leaves byte-identical publications and unrelated files untouched", async (t) => {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, opendirSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, opendirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import nodeTest, { type TestContext } from "node:test";
 
@@ -29,6 +29,8 @@ interface PiRuntimeResult {
 }
 
 interface BuildResult {
+  ok?: boolean;
+  root?: string;
   status: number | null;
   // Which admitted stage failed, so an operator can tell install from compile.
   stage?: "install" | "compile" | "stage";
@@ -67,6 +69,14 @@ interface LauncherOverrides {
   cwd?: string;
   processEnv?: NodeJS.ProcessEnv;
   build?: (options: { packageRoot: string; agentDir: string; env: NodeJS.ProcessEnv }) => BuildResult | Promise<BuildResult>;
+  prepareApplication?: (options: {
+    packageRoot: string;
+    agentDir: string;
+    homeDir: string;
+    platform: string;
+    env: NodeJS.ProcessEnv;
+    writeError: (text: string) => void;
+  }) => PreparationResult | Promise<PreparationResult>;
   ensureDdgs?: (homeDir: string, env: NodeJS.ProcessEnv, packageRoot?: string) => { ok: boolean; python?: string; exitCode?: number; cleanupUnconfirmed?: boolean } | Promise<{ ok: boolean; python?: string; exitCode?: number; cleanupUnconfirmed?: boolean }>;
   refreshShippedSkills?: (packageRoot: string, homeDir: string) => { ok: true } | { ok: false; error: string };
   resolvePiRuntime?: (options: { explicit?: string; env: NodeJS.ProcessEnv; agentDir: string; cwd: string; writeError: (text: string) => void }) => PiRuntimeResult | Promise<PiRuntimeResult>;
@@ -74,6 +84,19 @@ interface LauncherOverrides {
   loadMain?: (entry: string) => { runSessionHost(options: HostOptions): Promise<number> | number };
   writeOut?: (text: string) => void;
   writeError?: (text: string) => void;
+}
+
+interface PreparationResult {
+  mode: "current" | "prepared" | "failed";
+  status?: number;
+  stage?: string;
+  preparedRoot?: string;
+  applicationMode?: string;
+  extension?: string;
+  ddgsPython?: string;
+  skills?: unknown[];
+  stateRoot?: string;
+  lease?: { release(): void };
 }
 
 interface OwnedStage {
@@ -459,14 +482,28 @@ function baseOverrides(
     stdinIsTTY: true,
     stdoutIsTTY: true,
     packageRoot,
-    build: ({ packageRoot: root, env: setupEnv }) => {
+    // Issue 344: one shared preparation call replaces the separate build, DDGS,
+    // and skill steps. These flow tests inject the preparation result so they stay
+    // hermetic and focused on ordering/failure propagation; the shared authority's
+    // current/update semantics are covered by the preparation tests.
+    prepareApplication: ({ packageRoot: root, env: setupEnv, agentDir }) => {
       events.push("build");
       assert.equal(root, packageRoot);
       assert.equal(setupEnv.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP, undefined);
       assert.equal(setupEnv.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE, undefined);
       assert.equal(setupEnv.PI_REVIEW_GATE_SETTLEMENT_SECRET, undefined);
       assert.equal(setupEnv.PI_REVIEW_GATE_QUIESCENCE_CHILD, undefined);
-      return { status: 0 };
+      events.push("ddgs");
+      return {
+        mode: "current",
+        preparedRoot: packageRoot,
+        applicationMode: "packaged",
+        extension: join(packageRoot, "dist", "src", "index.js"),
+        ddgsPython: "/synthetic/ddgs/bin/python",
+        skills: [],
+        stateRoot: join(agentDir, ".pi-review-gate", "application"),
+        lease: { release: () => undefined },
+      };
     },
     resolvePiRuntime: (options) => {
       events.push("pi");
@@ -536,7 +573,7 @@ test("synthetic Windows launcher admits only normalized host env and preserves t
     writeError: () => undefined,
   }));
   assert.equal(status, 0);
-  assert.deepEqual(events, ["build", "pi", "ddgs", "load", "run"]);
+  assert.deepEqual(events, ["build", "ddgs", "pi", "load", "run"]);
   assert.equal(captured.length, 1);
   assert.equal(captured[0]?.env.PATH, join(process.cwd(), "synthetic-bin"));
   assert.equal(captured[0]?.env.NODE_OPTIONS, "--no-warnings --require=trusted-loader");
@@ -828,7 +865,7 @@ test("ordinary native arguments and value lookalikes pass the startup preflight 
     const captured: HostOptions[] = [];
     const status = await launcher.__test.runSessionHostLauncher(["--", ...args], baseOverrides(fixture.packageRoot, env, events, captured));
     assert.equal(status, 0, JSON.stringify(args));
-    assert.deepEqual(events, ["pi", "ddgs", "load", "run"], JSON.stringify(args));
+    assert.deepEqual(events, ["build", "ddgs", "pi", "load", "run"], JSON.stringify(args));
     assert.deepEqual(captured[0].args, args, "native arguments are forwarded byte-for-byte");
   }
 });
@@ -862,7 +899,7 @@ test("source build, Pi runtime selection, and DDGS setup precede loading the syn
   const before = argv.slice();
   assert.equal(await launcher.__test.runSessionHostLauncher(argv, overrides), 27);
   assert.deepEqual(argv, before);
-  assert.deepEqual(events, ["build", "pi", "ddgs", "load", "run"]);
+  assert.deepEqual(events, ["build", "ddgs", "pi", "load", "run"]);
   assert.equal(captured.length, 1);
   // The explicit executable is honored by the stubbed resolver seam; the
   // resolved entry (not a bare name) always reaches the host.
@@ -885,204 +922,62 @@ test("source build, Pi runtime selection, and DDGS setup precede loading the syn
   assert.equal(env.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE, "restore-secret");
 });
 
-test("production source-build runs in an owned staging root and preserves the live dist", { skip: process.platform === "win32" }, async (t) => {
+test("the flow loads the prepared root selected by the shared authority", async (t) => {
   const fixture = makePackageFixture(true);
   cleanupFixture(t, fixture);
-  const bin = join(fixture.root, "fake-bin");
-  mkdirSync(bin);
-  const log = join(fixture.root, "npm-invocations.jsonl");
-  writeFileSync(join(bin, "package.json"), JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "npm" } }), "utf8");
-  // The fake public npm JS bin performs only the locked ci install and places
-  // an inert synthetic TypeScript package in the stage; it never runs a
-  // package build lifecycle.
-  writeFileSync(join(bin, "npm"), `#!/usr/bin/env node\n${[
-    `const fs = require("node:fs");`,
-    `const path = require("node:path");`,
-    `const args = process.argv.slice(2);`,
-    `fs.appendFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args, cwd: process.cwd(), home: process.env.HOME, cache: process.env.npm_config_cache, logs: process.env.npm_config_logs_dir, temp: process.env.TMPDIR, bootstrap: process.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP ?? null, restore: process.env.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE ?? null, settlement: process.env.PI_REVIEW_GATE_SETTLEMENT_SECRET ?? null, quiescence: process.env.PI_REVIEW_GATE_QUIESCENCE_CHILD ?? null, ddgs: process.env.PI_REVIEW_GATE_DDGS_PYTHON ?? null, nodeOptions: process.env.NODE_OPTIONS, nodeEnv: process.env.NODE_ENV ?? null, provider: process.env.ANTHROPIC_API_KEY }) + "\\n");`,
-    `if (args[0] !== "ci") { process.stderr.write("unexpected npm run lifecycle\\n"); process.exit(97); }`,
-    `fs.mkdirSync(path.join(process.cwd(), "node_modules"));`,
-    ...inertStageTypeScriptScriptLines(),
-    `process.exit(0);`,
-    "",
-  ].join("\n")}`, "utf8");
-
+  const preparedRoot = join(fixture.root, "prepared generation");
+  mkdirSync(join(preparedRoot, "dist", "src", "session-host"), { recursive: true });
+  writeFileSync(join(preparedRoot, "dist", "src", "session-host", "main.js"), "// prepared host\n", "utf8");
   const events: string[] = [];
   const captured: HostOptions[] = [];
-  const diagnostics: string[] = [];
-  const compilePlans: Array<{ compilerCli: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv }> = [];
-  const env = makeEnvironment({
-    HOME: fixture.root,
-    PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
-    TEST_NPM_LOG: log,
-    PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP: "bootstrap-secret",
-    PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE: "restore-secret",
-    PI_REVIEW_GATE_SETTLEMENT_SECRET: "settlement-secret",
-    PI_REVIEW_GATE_QUIESCENCE_CHILD: "quiescence-secret",
-    PI_REVIEW_GATE_DDGS_PYTHON: "/inherited/stale/python",
-    NODE_OPTIONS: "--no-warnings",
-    NODE_ENV: "production",
-    ANTHROPIC_API_KEY: "provider-secret",
-  });
   const status = await launcher.__test.runSessionHostLauncher(["--", "--scheduler"], {
-    getEnv: () => env,
-    processEnv: {},
-    platform: "linux",
-    nodeVersion: "22.19.0",
-    stdinIsTTY: true,
-    stdoutIsTTY: true,
-    packageRoot: fixture.packageRoot,
-    build: (options) => launcher.__test.buildSourceExtension({
-      ...options,
-      runCompile: async (compilerCli, args, processOptions) => {
-        const stagedRoot = String(processOptions.cwd);
-        compilePlans.push({ compilerCli, args, cwd: stagedRoot, env: processOptions.env as NodeJS.ProcessEnv });
-        const distDir = join(stagedRoot, "dist", "src", "session-host");
-        mkdirSync(distDir, { recursive: true });
-        writeFileSync(join(distDir, "main.js"), "// staged compile output\n", "utf8");
-        return { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" };
-      },
+    ...baseOverrides(fixture.packageRoot, makeEnvironment(), events, captured),
+    prepareApplication: () => ({
+      mode: "prepared",
+      preparedRoot,
+      applicationMode: "development",
+      extension: join(preparedRoot, "dist", "src", "index.js"),
+      ddgsPython: "/synthetic/python",
+      skills: [],
+      stateRoot: join(fixture.root, "state"),
+      lease: { release: () => undefined },
     }),
-    resolvePiRuntime: (options) => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
-    ensureDdgs: (root) => { events.push("ddgs"); void root; return { ok: true, python: "/synthetic/python" }; },
-    refreshShippedSkills: () => ({ ok: true }),
+    resolvePiRuntime: () => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
     loadMain: (entry) => {
       events.push("load");
-      assert.ok(existsSync(entry));
-      const stagedRoot = dirname(dirname(dirname(dirname(entry))));
-      assert.ok(existsSync(join(stagedRoot, "node_modules")), "fresh source setup owns its dependencies in-stage");
-      for (const name of ["package.json", "package-lock.json", "tsconfig.json", join("src", "session-host", "main.ts")]) {
-        assert.ok(existsSync(join(stagedRoot, name)), `staged package includes ${name}`);
-      }
-      assert.equal(readFileSync(join(stagedRoot, "package-lock.json"), "utf8"), readFileSync(join(fixture.packageRoot, "package-lock.json"), "utf8"));
-      assert.equal(existsSync(join(fixture.packageRoot, "node_modules")), false, "source checkout dependencies are not required or linked");
+      assert.equal(entry, join(preparedRoot, "dist", "src", "session-host", "main.js"),
+        "the host loads from the selected prepared root, never the live checkout");
       return { runSessionHost: (options) => { events.push("run"); captured.push(options); return 0; } };
     },
     writeOut: () => undefined,
-    writeError: (text) => { diagnostics.push(text); },
+    writeError: () => undefined,
   });
   assert.equal(status, 0);
-  // The real default build runs (no build override): its npm invocation is
-  // asserted from the log below.
-  assert.deepEqual(events, ["pi", "ddgs", "load", "run"]);
-  const invocations = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as {
-    args: string[];
-    cwd: string;
-    home: string;
-    cache: string;
-    logs: string;
-    temp: string;
-    bootstrap: string | null;
-    restore: string | null;
-    settlement: string | null;
-    quiescence: string | null;
-    ddgs: string | null;
-    nodeOptions: string;
-    nodeEnv: string | null;
-    provider: string;
-  });
-  assert.equal(invocations.length, 1, "the source stage installs locked dependencies and never runs a package build lifecycle");
-  assert.deepEqual(invocations[0].args, ["ci", "--include=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--registry", "https://registry.npmjs.org"]);
-  assert.equal(invocations[0].nodeEnv, "production", "npm's production environment is preserved while dev dependencies are explicitly included");
-  assert.ok(!invocations[0].args.some((arg) => arg === "run" || arg === "build" || arg === "clean:build"), "no recursive clean/build lifecycle is invoked");
-  const invocation = invocations[0];
-  const stagingRoot = invocation.cwd;
-  // The compile runs against an owned staging package root under the agent
-  // directory cache — never the live checkout — as one direct TypeScript
-  // project invocation through public Node, without adding a `.bin` PATH shim.
-  assert.equal(compilePlans.length, 1, "the compile phase is a single direct TypeScript invocation");
-  const compilePlan = compilePlans[0];
-  assert.equal(compilePlan.compilerCli, join(stagingRoot, "node_modules", "typescript", "bin", "tsc"), "the compile uses the stage's own installed TypeScript CLI");
-  assert.deepEqual(compilePlan.args, ["-p", join(stagingRoot, "tsconfig.json")], "the compile is a direct tsc project invocation, never `npm run build`");
-  assert.equal(compilePlan.cwd, stagingRoot);
-  assert.equal(compilePlan.env.PATH, env.PATH,
-    "the compile preserves the exact caller PATH, including inherited npm entries, without adding a stage .bin shim");
-  const agentDir = join(fixture.root, ".pi", "agent");
-  assert.ok(stagingRoot.startsWith(`${agentDir}/.pi-review-gate/build/pi-review-sessions-`), `staged root must be owned: ${stagingRoot}`);
-  // The completed stage remains at its exclusively created private path; a
-  // separate O_EXCL cache record maps its content key to this retained stage.
-  assert.equal(captured[0].packageRoot, stagingRoot);
-  assert.equal(existsSync(captured[0].packageRoot), true);
-  const cacheManifest = JSON.parse(readFileSync(join(stagingRoot, ".pi-review-gate-source-build.json"), "utf8")) as { cacheKey: string };
-  const cacheRecord = join(agentDir, ".pi-review-gate", "build", `source-${cacheManifest.cacheKey}.json`);
-  assert.equal(existsSync(cacheRecord), true, "the completed stage is discoverable through its exclusive content-key record");
-  assert.equal(captured[0].env.NODE_ENV, "production", "the native host environment remains unchanged");
-  // A stub's bare zero result is not Main's positive lifecycle handoff.
-  assert.match(diagnostics[0], /^pi-review-sessions: pi runtime: \/synthetic\/pi \(v1\.0\.4, npm-global\)\n$/);
-  assert.doesNotMatch(diagnostics.join(""), /lifetime|cache pins|capacity exhausted/);
-  // The live checkout dist is preserved byte-for-byte.
-  assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
-  assert.equal(invocation.bootstrap, null);
-  assert.equal(invocation.restore, null);
-  assert.equal(invocation.settlement, null);
-  assert.equal(invocation.quiescence, null);
-  assert.equal(invocation.ddgs, null);
-  assert.equal(invocation.nodeOptions, "--no-warnings");
-  assert.equal(invocation.provider, "provider-secret");
-  assert.equal(compilePlan.env.NODE_OPTIONS, "--no-warnings", "the compile environment preserves the user's NODE_OPTIONS");
-  assert.equal(compilePlan.env.ANTHROPIC_API_KEY, "provider-secret", "the compile environment preserves trusted provider variables");
-  assert.equal(env.PI_REVIEW_GATE_SETTLEMENT_SECRET, "settlement-secret", "the injected caller environment is not mutated");
-  assert.equal(env.PI_REVIEW_GATE_QUIESCENCE_CHILD, "quiescence-secret");
-  const setupRoot = dirname(invocation.home);
-  assert.equal(setupRoot, stagingRoot, "setup residue stays inside the same generation");
-  for (const ownedPath of [invocation.home, invocation.cache, invocation.logs, invocation.temp]) {
-    assert.ok(ownedPath.startsWith(`${setupRoot}/`), `npm resources must remain in the owned setup root: ${ownedPath}`);
-  }
-  assert.deepEqual(captured[0].args, ["--scheduler"]);
+  assert.deepEqual(events, ["pi", "load", "run"]);
+  assert.equal(captured[0].packageRoot, preparedRoot);
+  assert.equal(captured[0].env.PI_REVIEW_GATE_DDGS_PYTHON, "/synthetic/python");
+  assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"),
+    "LIVE DIST SENTINEL — never rebuild in place\n");
 });
 
-test("a failed staged build preserves the live dist and retains its stage", { skip: process.platform === "win32" }, async (t) => {
+test("a failed preparation prevents host load and preserves the live checkout", async (t) => {
   const fixture = makePackageFixture(true);
   cleanupFixture(t, fixture);
-  const bin = join(fixture.root, "fake-bin");
-  mkdirSync(bin);
-  const log = join(fixture.root, "npm-invocation.json");
-  writeFileSync(join(bin, "package.json"), JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "npm" } }), "utf8");
-  writeFileSync(join(bin, "npm"), `#!/usr/bin/env node\n${[
-    `const fs = require("node:fs");`,
-    `const args = process.argv.slice(2);`,
-    `fs.appendFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args, cwd: process.cwd() }) + "\\n");`,
-    `if (args[0] !== "ci") { process.stderr.write("unexpected npm run lifecycle\\n"); process.exit(97); }`,
-    ...inertStageTypeScriptScriptLines(),
-    `process.exit(0);`,
-    "",
-  ].join("\n")}`, "utf8");
-
-  const env = makeEnvironment({ HOME: fixture.root, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, TEST_NPM_LOG: log });
   const events: string[] = [];
   let stderr = "";
-  const status = await launcher.__test.runSessionHostLauncher(["--", "--scheduler"], {
-    getEnv: () => env,
-    processEnv: {},
-    platform: "linux",
-    nodeVersion: "22.19.0",
-    stdinIsTTY: true,
-    stdoutIsTTY: true,
-    packageRoot: fixture.packageRoot,
-    build: (options) => launcher.__test.buildSourceExtension({
-      ...options,
-      runCompile: async () => ({ status: 23, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "compile stdout line\n", stderr: "compile failed\n" }),
-    }),
+  const status = await launcher.__test.runSessionHostLauncher([], {
+    ...baseOverrides(fixture.packageRoot, makeEnvironment(), events, []),
+    prepareApplication: () => ({ mode: "failed", status: 7, stage: "install" }),
     resolvePiRuntime: () => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
-    ensureDdgs: (root) => { events.push("ddgs"); void root; return { ok: true, python: "/synthetic/python" }; },
     loadMain: () => { events.push("load"); return { runSessionHost: () => 0 }; },
     writeOut: () => undefined,
     writeError: (text) => { stderr += text; },
   });
-  assert.equal(status, 23);
-  assert.deepEqual(events, [], "no Pi/DDGS/load after a failed build");
-  assert.match(stderr, /failed build stage: TypeScript compile \(tsc -p tsconfig\.json\)/);
-  assert.match(stderr, /TypeScript compile \(tsc -p tsconfig\.json\) stderr:\ncompile failed\n/);
-  // The live checkout dist is preserved byte-for-byte.
-  assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
-  // The failed build stage is honestly reported and retained: the incomplete
-  // generation is disposable by location and is reclaimed by a later cleanup.
-  const buildCacheRoot = join(fixture.root, ".pi", "agent", ".pi-review-gate", "build");
-  const stages = existsSync(buildCacheRoot)
-    ? readdirNames(buildCacheRoot).filter((entry) => /^pi-review-sessions-[a-f0-9]{32}$/u.test(entry))
-    : [];
-  assert.equal(stages.length, 1);
-  assert.match(stderr, /an incomplete source generation was retained; the next launch reclaims excess cache generations/);
+  assert.equal(status, 7, "the failed preparation's status is preserved");
+  assert.deepEqual(events, [], "runtime selection and Main are never reached");
+  assert.match(stderr, /application preparation failed/);
+  assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"),
+    "LIVE DIST SENTINEL — never rebuild in place\n");
 });
 
 test("synthetic stage cleanup retains source build stage after unconfirmed setup cleanup", async (t) => {
@@ -1151,19 +1046,26 @@ test("synthetic stage cleanup retains source stages across setup and host outcom
       stdinIsTTY: true,
       stdoutIsTTY: true,
       packageRoot: fixture.packageRoot,
-      build: () => { events.push("build"); return { status: 0, stagingRoot: owned.root, ownedStage: owned }; },
+      prepareApplication: () => {
+        events.push("build", "ddgs");
+        return scenario.setupCleanupUnconfirmed
+          ? { mode: "failed", status: 1, stage: "ddgs" }
+          : {
+            mode: "prepared",
+            preparedRoot: owned.root,
+            applicationMode: "development",
+            extension: join(owned.root, "dist", "src", "index.js"),
+            ddgsPython: "/synthetic/python",
+            skills: [],
+            stateRoot: join(fixture.root, "state"),
+            lease: { release: () => undefined },
+          };
+      },
       resolvePiRuntime: () => {
         events.push("pi");
         if (scenario.preMainFailure) throw new Error("synthetic setup failure");
         return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" };
       },
-      ensureDdgs: () => {
-        events.push("ddgs");
-        return scenario.setupCleanupUnconfirmed
-          ? { ok: false, exitCode: 1, cleanupUnconfirmed: true }
-          : { ok: true, python: "/synthetic/python" };
-      },
-      refreshShippedSkills: () => ({ ok: true }),
       loadMain: () => {
         events.push("load");
         return {
@@ -1185,8 +1087,8 @@ test("synthetic stage cleanup retains source stages across setup and host outcom
     assert.equal(current.dev, owned.identity.dev);
     assert.equal(current.ino, owned.identity.ino);
     assert.doesNotMatch(stderr, /lifetime|cache pins|capacity exhausted/);
-    if (scenario.preMainFailure) assert.deepEqual(events, ["build", "pi"]);
-    else if (scenario.setupCleanupUnconfirmed) assert.deepEqual(events, ["build", "pi", "ddgs"]);
+    if (scenario.preMainFailure) assert.deepEqual(events, ["build", "ddgs", "pi"]);
+    else if (scenario.setupCleanupUnconfirmed) assert.deepEqual(events, ["build", "ddgs"]);
     else assert.ok(events.includes("main"), `${scenario.name}: Main was started`);
   }
 });
@@ -1346,35 +1248,15 @@ test("source staging stops before writing through a replaced destination directo
   assert.equal(existsSync(join(foreignDestination, "session-host")), false, "no staged file or directory was created in the foreign target");
 });
 
-test("a relative PI_CODING_AGENT_DIR anchors staging and host paths against the startup cwd", { skip: process.platform === "win32" }, async (t) => {
-  const fixture = makePackageFixture(true);
+test("a relative PI_CODING_AGENT_DIR anchors host paths against the startup cwd", { skip: process.platform === "win32" }, async (t) => {
+  const fixture = makePackageFixture(false);
   cleanupFixture(t, fixture);
-  const bin = join(fixture.root, "fake-bin");
-  mkdirSync(bin);
-  const log = join(fixture.root, "npm-invocations.jsonl");
-  writeFileSync(join(bin, "package.json"), JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "npm" } }), "utf8");
-  writeFileSync(join(bin, "npm"), `#!/usr/bin/env node\n${[
-    `const fs = require("node:fs");`,
-    `const path = require("node:path");`,
-    `const args = process.argv.slice(2);`,
-    `fs.appendFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args, cwd: process.cwd() }) + "\\n");`,
-    `if (args[0] !== "ci") { process.stderr.write("unexpected npm run lifecycle\\n"); process.exit(97); }`,
-    `fs.mkdirSync(path.join(process.cwd(), "node_modules"));`,
-    ...inertStageTypeScriptScriptLines(),
-    `process.exit(0);`,
-    "",
-  ].join("\n")}`, "utf8");
-
   const startupCwd = join(fixture.root, "startup cwd");
   mkdirSync(startupCwd);
-  const env = makeEnvironment({
-    HOME: fixture.root,
-    PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
-    TEST_NPM_LOG: log,
-    PI_CODING_AGENT_DIR: "./agent dir π",
-  });
+  const env = makeEnvironment({ HOME: fixture.root, PI_CODING_AGENT_DIR: "./agent dir π" });
   const events: string[] = [];
   const captured: HostOptions[] = [];
+  const seen: { packageRoot?: string; agentDir?: string } = {};
   const status = await launcher.__test.runSessionHostLauncher(["--", "--scheduler"], {
     getEnv: () => env,
     processEnv: {},
@@ -1384,39 +1266,29 @@ test("a relative PI_CODING_AGENT_DIR anchors staging and host paths against the 
     stdoutIsTTY: true,
     packageRoot: fixture.packageRoot,
     cwd: startupCwd,
-    build: (options) => launcher.__test.buildSourceExtension({
-      ...options,
-      runCompile: async (_compilerCli, _args, processOptions) => {
-        const distDir = join(String(processOptions.cwd), "dist", "src", "session-host");
-        mkdirSync(distDir, { recursive: true });
-        writeFileSync(join(distDir, "main.js"), "// staged compile output\n", "utf8");
-        return { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" };
-      },
-    }),
+    prepareApplication: (options) => {
+      seen.packageRoot = options.packageRoot;
+      seen.agentDir = options.agentDir;
+      return {
+        mode: "current",
+        preparedRoot: fixture.packageRoot,
+        applicationMode: "packaged",
+        extension: join(fixture.packageRoot, "dist", "src", "index.js"),
+        ddgsPython: "/synthetic/python",
+        skills: [],
+        stateRoot: join(options.agentDir, ".pi-review-gate", "application"),
+        lease: { release: () => undefined },
+      };
+    },
     resolvePiRuntime: () => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
-    ensureDdgs: (root) => { events.push("ddgs"); void root; return { ok: true, python: "/synthetic/python" }; },
-    refreshShippedSkills: () => ({ ok: true }),
     loadMain: () => { events.push("load"); return { runSessionHost: (options) => { events.push("run"); captured.push(options); return 0; } }; },
     writeOut: () => undefined,
     writeError: () => undefined,
   });
   assert.equal(status, 0);
-  const anchoredAgentDir = join(startupCwd, "agent dir π");
-  // The real default build plan runs against an absolute staged prefix under
-  // the anchored agent directory, installing first and then compiling with the
-  // stage's own TypeScript CLI.
-  const invocations = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { args: string[]; cwd: string });
-  assert.equal(invocations.length, 1, "only the locked ci install invokes npm");
-  assert.equal(invocations[0].args[0], "ci");
-  const stagingRoot = invocations[0].cwd;
-  assert.ok(isAbsolute(stagingRoot), `staged root must be absolute: ${stagingRoot}`);
-  assert.ok(stagingRoot.startsWith(`${anchoredAgentDir}/.pi-review-gate/build/pi-review-sessions-`), `staged root must be anchored: ${stagingRoot}`);
-  // The host receives the exact fresh stage path; the separate content-key
-  // record, when eligible, points to this same retained directory.
-  assert.equal(captured[0].packageRoot, stagingRoot);
-  assert.ok(isAbsolute(captured[0].packageRoot));
-  assert.equal(existsSync(captured[0].packageRoot), true);
-  assert.equal(captured[0].env.PI_CODING_AGENT_DIR, anchoredAgentDir);
+  assert.equal(seen.agentDir, join(startupCwd, "agent dir π"), "the relative override is anchored against the startup cwd");
+  assert.equal(seen.packageRoot, fixture.packageRoot);
+  assert.equal(captured[0].env.PI_CODING_AGENT_DIR, join(startupCwd, "agent dir π"));
 });
 
 test("packaged compiled path skips source build and always hands a resolved pi entry to the host", async (t) => {
@@ -1439,7 +1311,7 @@ test("packaged compiled path skips source build and always hands a resolved pi e
     }),
   });
   assert.equal(await launcher.__test.runSessionHostLauncher(["--", "--help"], overrides), 19);
-  assert.deepEqual(events, ["pi", "ddgs", "run"]);
+  assert.deepEqual(events, ["build", "ddgs", "pi", "run"]);
   assert.deepEqual(captured[0].args, ["--help"]);
   // No manual path: the automatic resolver's entry always reaches the host.
   assert.equal(captured[0].piExecutable, "/synthetic/pi");
@@ -1447,101 +1319,71 @@ test("packaged compiled path skips source build and always hands a resolved pi e
   assert.equal(Object.hasOwn(captured[0], "toggleKey"), false);
 });
 
-test("shared Node DDGS provisioning uses the synthetic venv and sanitized production env", { skip: process.platform === "win32" }, async (t) => {
+test("the preparation seam receives the sanitized setup environment exactly once", { skip: process.platform === "win32" }, async (t) => {
   const fixture = makePackageFixture(false);
   cleanupFixture(t, fixture);
-  const venv = join(fixture.root, "synthetic venv");
-  const pythonDir = join(venv, "bin");
-  mkdirSync(pythonDir, { recursive: true });
-  const log = join(fixture.root, "fake-python-log.jsonl");
-  const fakePython = join(pythonDir, "python");
-  writeFileSync(fakePython, `#!${process.execPath}\nconst fs = require("node:fs");\nfs.appendFileSync(process.env.TEST_DDGS_LOG, JSON.stringify({ argv: process.argv.slice(2), bootstrap: process.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP ?? null, restore: process.env.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE ?? null, nodeOptions: process.env.NODE_OPTIONS ?? null, provider: process.env.ANTHROPIC_API_KEY ?? null }) + "\\n");\n`, "utf8");
-  chmodSync(fakePython, 0o755);
-
-  // Production-like env seam: the launcher scrubs process.env in place, and
-  // the shared helper's Python children inherit exactly that scrubbed env.
-  const saved: Record<string, string | undefined> = {};
-  for (const name of ["PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP", "PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE", "NODE_OPTIONS", "ANTHROPIC_API_KEY", "TEST_DDGS_LOG", "PI_REVIEW_GATE_RUNTIME_ROLE", "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG", "PI_REVIEW_GATE_DDGS_VENV"]) {
-    saved[name] = process.env[name];
-    delete process.env[name];
-  }
-  t.after(() => {
-    for (const [name, value] of Object.entries(saved)) {
-      if (value === undefined) delete process.env[name];
-      else process.env[name] = value;
-    }
-  });
-  process.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP = "bootstrap-secret";
-  process.env.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE = "restore-secret";
-  process.env.NODE_OPTIONS = "--no-warnings";
-  process.env.ANTHROPIC_API_KEY = "provider-secret";
-  process.env.TEST_DDGS_LOG = log;
-  process.env.PI_REVIEW_GATE_DDGS_VENV = venv;
-
   const env = makeEnvironment({
     HOME: fixture.root,
-    XDG_CACHE_HOME: join(fixture.root, "cache"),
-    PI_REVIEW_GATE_DDGS_VENV: venv,
+    PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP: "bootstrap-secret",
+    PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE: "restore-secret",
+    PI_REVIEW_GATE_SETTLEMENT_SECRET: "settlement-secret",
+    PI_REVIEW_GATE_QUIESCENCE_CHILD: "quiescence-secret",
+    PI_REVIEW_GATE_DDGS_PYTHON: "/inherited/stale/python",
+    NODE_OPTIONS: "--no-warnings",
+    ANTHROPIC_API_KEY: "provider-secret",
   });
   const events: string[] = [];
   const captured: HostOptions[] = [];
-  const result = await launcher.__test.runSessionHostLauncher([], baseOverrides(fixture.packageRoot, env, events, captured, {
-    getEnv: () => process.env,
-    processEnv: process.env,
-    ensureDdgs: (homeDir, setupEnv) => { events.push("ddgs"); return gateLauncher.ensureDdgs(homeDir, setupEnv); },
-  }));
-  assert.equal(result, 0);
-  assert.deepEqual(events, ["pi", "ddgs", "load", "run"]);
-  assert.equal(captured[0].env.PI_REVIEW_GATE_DDGS_PYTHON, fakePython);
-  assert.equal(captured[0].env.NODE_OPTIONS, "--no-warnings");
-  assert.equal(captured[0].env.ANTHROPIC_API_KEY, "provider-secret");
-  const pythonCalls = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as {
-    argv: string[];
-    bootstrap: string | null;
-    restore: string | null;
-    nodeOptions: string | null;
-    provider: string | null;
+  const status = await launcher.__test.runSessionHostLauncher([], {
+    getEnv: () => env,
+    processEnv: {},
+    platform: "linux",
+    nodeVersion: "22.19.0",
+    stdinIsTTY: true,
+    stdoutIsTTY: true,
+    packageRoot: fixture.packageRoot,
+    prepareApplication: (options) => {
+      events.push("prepare");
+      for (const name of ["PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP", "PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE", "PI_REVIEW_GATE_SETTLEMENT_SECRET", "PI_REVIEW_GATE_QUIESCENCE_CHILD", "PI_REVIEW_GATE_DDGS_PYTHON"]) {
+        assert.equal(options.env[name], undefined, `${name} must not reach preparation`);
+      }
+      assert.equal(options.env.NODE_OPTIONS, "--no-warnings");
+      assert.equal(options.env.ANTHROPIC_API_KEY, "provider-secret");
+      return {
+        mode: "current",
+        preparedRoot: fixture.packageRoot,
+        applicationMode: "packaged",
+        extension: join(fixture.packageRoot, "dist", "src", "index.js"),
+        ddgsPython: "/synthetic/python",
+        skills: [],
+        stateRoot: join(options.agentDir, "state"),
+        lease: { release: () => undefined },
+      };
+    },
+    resolvePiRuntime: () => ({ file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }),
+    loadMain: () => ({ runSessionHost: (options) => { captured.push(options); return 0; } }),
+    writeOut: () => undefined,
+    writeError: () => undefined,
   });
-  // The shared helper validates twice by design (pre-install decision and
-  // final gate): version check + pip check per pass.
-  assert.equal(pythonCalls.length, 4, "a valid cached venv runs two validation passes");
-  for (const call of pythonCalls) {
-    assert.equal(call.bootstrap, null, "the bootstrap token never reaches DDGS descendants");
-    assert.equal(call.restore, null, "the restore marker never reaches DDGS descendants");
-    assert.equal(call.nodeOptions, "--no-warnings", "the original NODE_OPTIONS is preserved");
-    assert.equal(call.provider, "provider-secret", "trusted provider variables are preserved");
-  }
+  assert.equal(status, 0);
+  assert.equal(events.filter((event) => event === "prepare").length, 1, "exactly one shared preparation decision");
+  assert.equal(captured[0].env.PI_REVIEW_GATE_DDGS_PYTHON, "/synthetic/python");
 });
 
-test("a broken DDGS venv stops the launch before loading the host", { skip: process.platform === "win32" }, async (t) => {
+test("a failed component preparation stops the launch before loading the host", { skip: process.platform === "win32" }, async (t) => {
   const fixture = makePackageFixture(false);
   cleanupFixture(t, fixture);
-  const venv = join(fixture.root, "broken venv");
-  const pythonDir = join(venv, "bin");
-  mkdirSync(pythonDir, { recursive: true });
-  const fakePython = join(pythonDir, "python");
-  // Validation always fails; the install step succeeds but cannot repair it.
-  // The venv python is invoked as `python -I -c ...`, so `-c` is argv[3]
-  // in the child (argv[1] is the script itself).
-  writeFileSync(fakePython, `#!${process.execPath}\nif (process.argv[3] === "-c") process.exit(1);\n`, "utf8");
-  chmodSync(fakePython, 0o755);
-
-  const env = makeEnvironment({
-    HOME: fixture.root,
-    XDG_CACHE_HOME: join(fixture.root, "cache"),
-    PI_REVIEW_GATE_DDGS_VENV: venv,
-  });
   const events: string[] = [];
   let stderr = "";
-  const result = await launcher.__test.runSessionHostLauncher([], baseOverrides(fixture.packageRoot, env, events, [], {
-    ensureDdgs: (homeDir, setupEnv) => { events.push("ddgs"); return gateLauncher.ensureDdgs(homeDir, setupEnv); },
+  const status = await launcher.__test.runSessionHostLauncher([], baseOverrides(fixture.packageRoot, makeEnvironment(), events, [], {
+    prepareApplication: () => ({ mode: "failed", status: 1, stage: "ddgs" }),
+    resolvePiRuntime: () => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
+    loadMain: () => { events.push("load"); return { runSessionHost: () => 0 }; },
     writeError: (text) => { stderr += text; },
   }));
-  assert.equal(result, 1);
-  assert.deepEqual(events, ["pi", "ddgs"]);
-  // The helper's fail-closed diagnostics go to fd 2 directly; the launcher
-  // must still stop before loading the host and report a bounded failure.
-  assert.match(stderr, /DDGS setup failed/);
+  assert.equal(status, 1);
+  assert.deepEqual(events, []);
+  assert.match(stderr, /application preparation failed/);
 });
 
 test("Pi runtime resolution failure stops the launch before DDGS and host load", async (t) => {
@@ -1556,7 +1398,7 @@ test("Pi runtime resolution failure stops the launch before DDGS and host load",
     writeError: (text) => { stderr += text; },
   }));
   assert.equal(status, 1);
-  assert.deepEqual(events, ["build"]);
+  assert.deepEqual(events, ["build", "ddgs"]);
   assert.match(stderr, /Pi runtime selection failed\./);
   assert.doesNotMatch(stderr, /secret/);
 });
@@ -1645,112 +1487,62 @@ test("help bypasses all environment and TTY preflight", async () => {
   assert.match(output, /native image\/model input behavior\s+stays\s+native/i);
 });
 
-test("build and DDGS failures propagate safely and prevent loading the host", async (t) => {
-  const fixture = makePackageFixture(true);
+test("preparation failures propagate safely and prevent loading the host", async (t) => {
+  const fixture = makePackageFixture(false);
   cleanupFixture(t, fixture);
-  const env = makeEnvironment({ PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP: "never-print-this" });
-
-  for (const failure of [
-    {
-      label: "build status",
-      build: () => ({ status: 23 }),
-      ensure: () => ({ ok: true, python: "/synthetic/python" }),
-      expected: 23,
-      events: ["build"],
-    },
-    {
-      label: "build spawn error",
-      build: () => ({ status: null, error: new Error("never-print-this") }),
-      ensure: () => ({ ok: true, python: "/synthetic/python" }),
-      expected: 1,
-      events: ["build"],
-    },
-    {
-      label: "DDGS status",
-      build: () => ({ status: 0 }),
-      ensure: () => ({ ok: false, exitCode: 17 }),
-      expected: 17,
-      events: ["build", "pi", "ddgs"],
-    },
-  ]) {
+  for (const prepareFailure of [
+    { mode: "failed", status: 1, stage: "install" },
+    { mode: "failed", status: 2, stage: "ddgs" },
+    { mode: "failed", status: 1, stage: "skills" },
+  ] as const) {
     const events: string[] = [];
-    let stderr = "";
-    const status = await launcher.__test.runSessionHostLauncher([], baseOverrides(fixture.packageRoot, env, events, [], {
-      build: ({ env: setupEnv }) => {
-        events.push("build");
-        assert.equal(setupEnv.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP, undefined);
-        return failure.build();
-      },
-      ensureDdgs: () => { events.push("ddgs"); return failure.ensure(); },
+    const status = await launcher.__test.runSessionHostLauncher([], {
+      ...baseOverrides(fixture.packageRoot, makeEnvironment(), events, []),
+      prepareApplication: () => prepareFailure,
+      resolvePiRuntime: () => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
       loadMain: () => { events.push("load"); return { runSessionHost: () => 0 }; },
-      writeError: (text) => { stderr += text; },
-    }));
-    assert.equal(status, failure.expected, failure.label);
-    assert.deepEqual(events, failure.events, failure.label);
-    assert.doesNotMatch(stderr, /never-print-this/);
+      writeOut: () => undefined,
+      writeError: () => undefined,
+    });
+    assert.equal(status, prepareFailure.status, prepareFailure.stage);
+    assert.deepEqual(events, [], `${prepareFailure.stage}: no runtime selection or host load`);
   }
 });
 
-test("host-module failures and invalid DDGS paths fail closed with bounded diagnostics", async (t) => {
+test("host-module failures fail closed with bounded diagnostics", async (t) => {
   const fixture = makePackageFixture(false);
   cleanupFixture(t, fixture);
-  const env = makeEnvironment();
-  for (const mode of ["module-load", "missing-api", "runtime-reject", "bad-python"] as const) {
-    const events: string[] = [];
-    let stderr = "";
-    const status = await launcher.__test.runSessionHostLauncher([], baseOverrides(fixture.packageRoot, env, events, [], {
-      ensureDdgs: () => {
-        events.push("ddgs");
-        return { ok: true, python: mode === "bad-python" ? "relative/python" : "/synthetic/python" };
-      },
-      loadMain: () => {
-        events.push("load");
-        if (mode === "module-load") throw new Error("credential-must-not-appear");
-        if (mode === "missing-api") return {} as { runSessionHost(options: HostOptions): number };
-        if (mode === "runtime-reject") {
-          return { runSessionHost: async () => { throw new Error("credential-must-not-appear"); } };
-        }
-        return { runSessionHost: () => 0 };
-      },
-      writeError: (text) => { stderr += text; },
-    }));
-    assert.notEqual(status, 0, mode);
-    assert.doesNotMatch(stderr, /credential-must-not-appear/);
-    if (mode === "bad-python") assert.deepEqual(events, ["pi", "ddgs"]);
+  for (const loadMain of [
+    () => { throw new Error("synthetic host load failure"); },
+    () => ({ runSessionHost: "not a function" }),
+    () => ({ runSessionHost: async () => { throw new Error("synthetic host failure"); } }),
+  ]) {
+    const diagnostics: string[] = [];
+    const status = await launcher.__test.runSessionHostLauncher([], {
+      ...baseOverrides(fixture.packageRoot, makeEnvironment(), [], []),
+      loadMain: loadMain as never,
+      writeOut: () => undefined,
+      writeError: (text) => { diagnostics.push(text); },
+    });
+    assert.equal(status, 1);
+    assert.match(diagnostics.join(""), /native session host startup failed/);
   }
 });
 
 test("missing compiled host never falls back to the review-gate entry", async (t) => {
   const fixture = makePackageFixture(false);
   cleanupFixture(t, fixture);
-  unlinkSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"));
-  const events: string[] = [];
-  let stderr = "";
+  rmSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"));
+  let loaded = false;
   const status = await launcher.__test.runSessionHostLauncher([], {
-    getEnv: () => makeEnvironment(),
-    processEnv: {},
-    platform: "linux",
-    nodeVersion: "22.19.0",
-    stdinIsTTY: true,
-    stdoutIsTTY: true,
-    packageRoot: fixture.packageRoot,
-    build: () => { events.push("build"); return { status: 0 }; },
-    resolvePiRuntime: () => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
-    ensureDdgs: () => { events.push("ddgs"); return { ok: true, python: "/synthetic/python" }; },
-    loadMain: () => { events.push("load"); return { runSessionHost: () => 0 }; },
+    ...baseOverrides(fixture.packageRoot, makeEnvironment(), [], []),
+    loadMain: () => { loaded = true; return { runSessionHost: () => 0 }; },
     writeOut: () => undefined,
-    writeError: (text) => { stderr += text; },
+    writeError: () => undefined,
   });
   assert.equal(status, 2);
-  assert.deepEqual(events, []);
-  assert.match(stderr, /compiled native session host is unavailable/);
+  assert.equal(loaded, false, "the review-gate entry point is never substituted for the native host");
 });
-
-// ---------------------------------------------------------------------------
-// Pi runtime selection (issue 323): synthetic OWNROOT package metadata,
-// public npm Node bins, and runtime cache directories. No real HOME, SDK, or global
-// npm root is ever touched.
-// ---------------------------------------------------------------------------
 
 interface RuntimeFixture extends OwnedFixture {
   root: string;
@@ -1901,60 +1693,18 @@ test("npm PATH resolution uses the native delimiter and rejects opaque shim-only
   assert.equal(launcher.__test.findNpmCli(runtimeEnv(fixture, { PATH: shimOnly })), undefined);
 });
 
-test("a timed-out source build that exits zero on SIGTERM never falls through to the checkout", async (t) => {
-  const runtimeFixture = makeRuntimeFixture(".session-host-build-timeout-");
-  const sourceFixture = makePackageFixture(true);
-  cleanupFixture(t, runtimeFixture);
-  cleanupFixture(t, sourceFixture);
-  writeFakeNpm(runtimeFixture, "timeout-build");
-  const compileChild = join(runtimeFixture.root, "hanging-compile-child.js");
-  writeFileSync(compileChild, "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);\n", "utf8");
-  const events: string[] = [];
-  let buildResult: BuildResult | undefined;
-  let stderr = "";
-  const status = await launcher.__test.runSessionHostLauncher(["--", "--scheduler"], {
-    getEnv: () => runtimeEnv(runtimeFixture),
-    processEnv: {},
-    platform: "linux",
-    nodeVersion: "22.19.0",
-    stdinIsTTY: true,
-    stdoutIsTTY: true,
-    packageRoot: sourceFixture.packageRoot,
-    cwd: runtimeFixture.root,
-    build: async (options) => {
-      events.push("build");
-      buildResult = await launcher.__test.buildSourceExtension({
-        ...options,
-        sourceBuildTimeoutMs: 500,
-        runCompile: (compilerCli, args, compileOptions) => {
-          void compilerCli;
-          void args;
-          return launcher.__test.runBoundedProcess(process.execPath, [compileChild], compileOptions);
-        },
-      });
-      return buildResult;
-    },
-    resolvePiRuntime: () => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
-    ensureDdgs: () => { events.push("ddgs"); return { ok: true, python: "/synthetic/python" }; },
-    loadMain: () => { events.push("load"); return { runSessionHost: () => 0 }; },
+test("a failed preparation status is never turned into success", async (t) => {
+  const fixture = makePackageFixture(true);
+  cleanupFixture(t, fixture);
+  const status = await launcher.__test.runSessionHostLauncher([], {
+    ...baseOverrides(fixture.packageRoot, makeEnvironment(), [], []),
+    prepareApplication: () => ({ mode: "failed", status: 124, stage: "compile" }),
     writeOut: () => undefined,
-    writeError: (text) => { stderr += text; },
+    writeError: () => undefined,
   });
-  assert.equal(status, 124);
-  assert.equal(buildResult?.timedOut, true);
-  assert.equal(buildResult?.stage, "compile", "the compile stage owns the admitted deadline");
-  assert.equal(buildResult?.childStatus, 0, "the synthetic compile child handled SIGTERM with exit 0");
-  assert.equal(buildResult?.status, 124, "expiration remains a nonzero build outcome");
-  assert.deepEqual(events, ["build"], "runtime resolution, DDGS, and Main are not reached");
-  assert.match(stderr, /extension build failed \(setup deadline exceeded\)/);
-  assert.equal(readFileSync(join(sourceFixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
+  assert.equal(status, 124, "an expired preparation keeps its deadline status");
 });
 
-// The cleanup contract differs by platform and is asserted honestly: Windows
-// has no public process-tree proof for any abnormal outcome (see the
-// boundedProcessCleanupStatus contract test), while POSIX confirms its own
-// owned process group is gone. runBoundedProcess reads the real
-// process.platform, so a launcher platform override cannot change this.
 const ABNORMAL_CLEANUP_SETTLES = process.platform !== "win32";
 
 test("bounded setup subprocesses preserve exit outcomes and terminate expired groups", async (t) => {
@@ -2151,100 +1901,46 @@ test("build failure diagnostics keep stage identity, stream provenance, and boun
   assert.match(aggregate, /diagnostic truncated/);
 });
 
-test("synthetic source build failures name the failing stage and preserve the true status", async (t) => {
-  const source = makePackageFixture(true);
-  const runtime = makeRuntimeFixture(".session-host-build-stage-diagnostics-");
-  cleanupFixture(t, source);
-  cleanupFixture(t, runtime);
-  writeFakeNpm(runtime);
-
-  const installFailure = await launcher.__test.buildSourceExtension({
-    packageRoot: source.packageRoot,
-    agentDir: runtime.agentDir,
-    env: runtimeEnv(runtime),
-    runNpm: async () => ({ status: 5, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "install stdout line\n", stderr: "\u001b[31minstall failed\u001b[0m\n" }),
-  });
-  assert.equal(installFailure.stage, "install");
-  assert.equal(installFailure.status, 5, "the true install status is preserved");
-  assert.equal(installFailure.childStatus, 5);
-  assert.match(installFailure.diagnostics ?? "", /npm ci \(dependency install\) stderr:\ninstall failed\n/);
-  assert.doesNotMatch(installFailure.diagnostics ?? "", /\u001b/u);
-
-  // The compile seam is separate from the npm seam: install stays install-only
-  // and the direct TypeScript compile is its own injected stage.
-  const compileFailure = await launcher.__test.buildSourceExtension({
-    packageRoot: source.packageRoot,
-    agentDir: runtime.agentDir,
-    env: runtimeEnv(runtime),
-    runNpm: async (_npmCli, args, options) => {
-      assert.equal(args[0], "ci");
-      writeInertStageTypeScript(String(options.cwd));
-      return { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" };
-    },
-    runCompile: async () => ({ status: 23, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "compile stdout line\n", stderr: "compile failed\n" }),
-  });
-  assert.equal(compileFailure.stage, "compile");
-  assert.equal(compileFailure.status, 23);
-  assert.match(compileFailure.diagnostics ?? "", /TypeScript compile \(tsc -p tsconfig\.json\) stdout:\ncompile stdout line\n/);
-  assert.match(compileFailure.diagnostics ?? "", /TypeScript compile \(tsc -p tsconfig\.json\) stderr:\ncompile failed\n/);
-});
-
-test("a failing synthetic compile reports its bounded cause and never turns failure green", { skip: process.platform === "win32" }, async (t) => {
+test("synthetic preparation failures name the failing stage and preserve the true status", async (t) => {
   const fixture = makePackageFixture(true);
   cleanupFixture(t, fixture);
-  const bin = join(fixture.root, "fake-bin");
-  mkdirSync(bin);
-  const log = join(fixture.root, "npm-invocation.json");
-  writeFileSync(join(bin, "package.json"), JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "npm" } }), "utf8");
-  writeFileSync(join(bin, "npm"), `#!/usr/bin/env node\n${[
-    `const fs = require("node:fs");`,
-    `const args = process.argv.slice(2);`,
-    `fs.appendFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args, cwd: process.cwd() }) + "\\n");`,
-    `if (args[0] !== "ci") { process.stderr.write("unexpected npm run lifecycle\\n"); process.exit(97); }`,
-    ...inertStageTypeScriptScriptLines(),
-    `process.exit(0);`,
-    "",
-  ].join("\n")}`, "utf8");
-
-  const env = makeEnvironment({ HOME: fixture.root, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, TEST_NPM_LOG: log });
-  let stderr = "";
-  const status = await launcher.__test.runSessionHostLauncher(["--", "--scheduler"], {
-    getEnv: () => env,
-    processEnv: {},
-    platform: "linux",
-    nodeVersion: "22.19.0",
-    stdinIsTTY: true,
-    stdoutIsTTY: true,
-    packageRoot: fixture.packageRoot,
-    build: (options) => launcher.__test.buildSourceExtension({
-      ...options,
-      runCompile: async () => ({
-        status: 1,
-        signal: null,
-        cleanupConfirmed: true,
-        timedOut: false,
-        outputExceeded: false,
-        stdout: "synthetic build stdout\n",
-        stderr: "\u001b[31mTS2304: Cannot find name 'synthetic'.\u001b[0m\n",
-      }),
-    }),
-    resolvePiRuntime: () => ({ file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }),
-    ensureDdgs: () => ({ ok: true, python: "/synthetic/python" }),
-    loadMain: () => ({ runSessionHost: () => 0 }),
-    writeOut: () => undefined,
-    writeError: (text) => { stderr += text; },
-  });
-  assert.equal(status, 1, "the failing compile keeps its true nonzero status");
-  assert.match(stderr, /extension build failed \(exit status 1\)/);
-  assert.match(stderr, /failed build stage: TypeScript compile \(tsc -p tsconfig\.json\)/);
-  assert.match(stderr, /TypeScript compile \(tsc -p tsconfig\.json\) stderr:\nTS2304: Cannot find name 'synthetic'\.\n/);
-  assert.match(stderr, /TypeScript compile \(tsc -p tsconfig\.json\) stdout:\nsynthetic build stdout\n/);
-  assert.doesNotMatch(stderr, /\u001b/u, "terminal controls from the failing child never reach the operator");
-  assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
+  for (const failure of [
+    { status: 3, stage: "install" },
+    { status: 5, stage: "compile" },
+  ] as const) {
+    const diagnostics: string[] = [];
+    const status = await launcher.__test.runSessionHostLauncher([], {
+      ...baseOverrides(fixture.packageRoot, makeEnvironment(), [], []),
+      prepareApplication: () => ({ mode: "failed", status: failure.status, stage: failure.stage }),
+      writeOut: () => undefined,
+      writeError: (text) => { diagnostics.push(text); },
+    });
+    assert.equal(status, failure.status);
+    assert.match(diagnostics.join(""), /application preparation failed/);
+  }
 });
 
-// Parent-owned acceptance: real Windows cmd.exe parsing and runtime behavior
-// stay with the parent; this file only locks the escaped source contract.
+test("a failing synthetic compile result is never turned green", async (t) => {
+  const fixture = makePackageFixture(true);
+  cleanupFixture(t, fixture);
+  const stage = mkdtempSync(join(process.cwd(), "node_modules", ".session-host-build-failure-"));
+  const result = await launcher.__test.buildSourceExtension({
+    packageRoot: fixture.packageRoot,
+    agentDir: join(stage, "agent"),
+    env: makeEnvironment(),
+    runNpm: async (_cli: string, _args: string[], processOptions: Record<string, unknown>) => {
+      writeInertStageTypeScript(String(processOptions.cwd));
+      return { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" };
+    },
+    runCompile: async () => ({ status: 2, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "", stderr: "TS1005: ';' expected.\n" }),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 2);
+  assert.equal(result.stage, "compile");
+  assert.match(result.diagnostics ?? "", /TS1005/);
+  assert.equal(result.retainedStage, true);
+});
+
 test("the native .cmd launcher escapes block-breaking parentheses in its role diagnostics", () => {
   const source = readFileSync(join(process.cwd(), "scripts", "pi-review-sessions.cmd"), "utf8");
   assert.ok(source.includes("\r\n"), "the batch file keeps CRLF line endings");

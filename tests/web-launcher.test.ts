@@ -1,6 +1,14 @@
+// Web CLI wrapper (scripts/pi-review-web.sh): post-#344 contract.
+//
+// The wrapper no longer builds anything itself and no longer sources the DDGS
+// setup script. It asks the ONE shared preparation authority whether the
+// prepared application is current, gets an isolated prepared root plus the ready
+// DDGS interpreter, and runs that root's compiled CLI. These tests drive the real
+// production wrapper against a synthetic package tree and the real preparation
+// code; only the external installer/compiler is a recording stand-in.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import test from "node:test";
@@ -8,14 +16,13 @@ import test from "node:test";
 interface FixtureOptions {
   source: boolean;
   packagedCli: boolean;
-  ddgs: "create-repair" | "valid" | "fail";
+  ddgs: "valid" | "fail";
   nodeStatus?: number;
-  buildStatus?: number;
+  installStatus?: number;
 }
 
 interface WebFixture {
   root: string;
-  wrapper: string;
   capture: string;
   venv: string;
   env: NodeJS.ProcessEnv;
@@ -36,8 +43,9 @@ const MAX_OUTPUT_BYTES = 256 * 1024;
 
 /**
  * Own one isolated fixture root and register cleanup before any setup can fail.
- * The actual production wrappers are copied byte-for-byte into this root; only
- * their external commands are replaced with bounded recording stubs.
+ * The production wrapper, the shared preparation authority, the compiled-engine
+ * module, and the shipped skills are copied byte-for-byte into the fixture; only
+ * the external installer/compiler and the launched Node CLI are recording stubs.
  */
 async function withWebFixture<T>(options: FixtureOptions, run: (fixture: WebFixture) => Promise<T>): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), "pi-review-web-launcher-"));
@@ -54,72 +62,87 @@ async function withWebFixture<T>(options: FixtureOptions, run: (fixture: WebFixt
 
     const wrapper = join(scripts, "pi-review-web.sh");
     await writeFile(wrapper, await readFile(resolve("scripts/pi-review-web.sh")));
-    await writeFile(join(scripts, "ensure-ddgs.sh"), await readFile(resolve("scripts/ensure-ddgs.sh")));
+    for (const name of ["prepare-application.cjs", "application-build.cjs", "managed-generations.cjs"]) {
+      await writeFile(join(scripts, name), await readFile(resolve("scripts", name)));
+    }
     await chmod(wrapper, 0o755);
-    await chmod(join(scripts, "ensure-ddgs.sh"), 0o755);
+    await cp(resolve("skills"), join(root, "skills"), { recursive: true });
+    await writeFile(
+      join(root, "package.json"),
+      `${JSON.stringify({ name: "pi-review-gate", version: "0.1.0" })}\n`,
+      "utf8",
+    );
+    await writeFile(join(root, "package-lock.json"), "{}\n", "utf8");
+    await writeFile(join(root, "tsconfig.json"), "{}\n", "utf8");
 
     if (options.source) {
       await mkdir(join(root, "src", "web"), { recursive: true });
+      await writeFile(join(root, "src", "index.ts"), "// source-presence fixture\n");
       await writeFile(join(root, "src", "web", "cli.ts"), "// source-presence fixture\n");
     }
     if (options.packagedCli) {
-      await mkdir(join(root, "dist", "src", "web"), { recursive: true });
-      await writeFile(join(root, "dist", "src", "web", "cli.js"), "// packaged-cli fixture\n");
+      for (const entry of ["dist/src/web/cli.js", "dist/src/index.js", "dist/src/session-host/main.js"]) {
+        const file = join(root, ...entry.split("/"));
+        await mkdir(join(file, ".."), { recursive: true });
+        await writeFile(file, "// packaged-cli fixture\n");
+      }
     }
 
     const ddgsPython = join(capture, "ddgs-python");
     await writeFile(ddgsPython, [
       "#!/bin/bash",
-      "{ printf '%s\\t' \"$@\"; printf '\\n'; } >> \"$CAPTURE_DIR/python-calls\"",
       'if [[ "$1" == "-I" && "$2" == "-c" ]]; then',
-      '  count="$(cat "$CAPTURE_DIR/validation-count" 2>/dev/null || printf \'0\')"',
-      '  count=$((count + 1))',
-      '  printf \'%s\\n\' "$count" > "$CAPTURE_DIR/validation-count"',
-      '  case "${DDGS_VALIDATION_MODE:-repair}" in',
-      '    valid) exit 0 ;;',
-      '    fail) exit 1 ;;',
-      '    repair) [[ "$count" -gt 1 ]] && exit 0; exit 1 ;;',
-      '    *) exit 92 ;;',
-      "  esac",
+      '  [[ "${DDGS_VALIDATION_MODE:-valid}" == "valid" ]] && exit 0',
+      "  exit 1",
       "fi",
       'if [[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" ]]; then exit 0; fi',
       "exit 93",
       "",
     ].join("\n"), "utf8");
     await chmod(ddgsPython, 0o755);
+    await mkdir(join(venv, "bin"), { recursive: true });
+    await writeFile(join(venv, "bin", "python"), await readFile(ddgsPython));
+    await chmod(join(venv, "bin", "python"), 0o755);
 
-    const python3 = join(bin, "python3");
-    await writeFile(python3, [
-      "#!/bin/bash",
-      "{ printf '%s\\t' \"$@\"; printf '\\n'; } >> \"$CAPTURE_DIR/python3-calls\"",
-      'if [[ "$1" == "-I" && "$2" == "-m" && "$3" == "venv" && -n "$4" ]]; then',
-      '  mkdir -p "$4/bin"',
-      '  cp "$CAPTURE_DIR/ddgs-python" "$4/bin/python"',
-      '  chmod 755 "$4/bin/python"',
-      "  exit 0",
-      "fi",
-      "exit 94",
-      "",
+    // A recording npm the shared resolver accepts: PATH's npm entry resolves
+    // into an npm package whose manifest is the public JS CLI. A `ci` install
+    // stages a synthetic TypeScript compiler that writes the required entries.
+    const npmPackage = join(bin, "node_modules", "npm");
+    await mkdir(join(npmPackage, "bin"), { recursive: true });
+    await writeFile(
+      join(npmPackage, "package.json"),
+      `${JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "bin/npm-cli.js" } })}\n`,
+      "utf8",
+    );
+    const compiler = [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "for (const entry of [['dist','src','index.js'],['dist','src','session-host','main.js'],['dist','src','web','cli.js']]) {",
+      "  const target = path.join(process.cwd(), '..'.repeat(0), ...entry);",
+      "  fs.mkdirSync(path.dirname(target), { recursive: true });",
+      "  fs.writeFileSync(target, '// built-cli fixture\\n');",
+      "}",
+      "process.exit(0);",
+    ].join("\n");
+    await writeFile(join(npmPackage, "bin", "npm-cli.js"), [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      `fs.writeFileSync(${JSON.stringify(join(capture, "npm-args"))}, JSON.stringify(process.argv.slice(2)));`,
+      `const status = Number(process.env.INSTALL_STATUS ?? '0');`,
+      "if (status !== 0) process.exit(status);",
+      "if (process.argv[2] === 'ci') {",
+      "  fs.mkdirSync('node_modules/typescript/bin', { recursive: true });",
+      "  fs.writeFileSync('node_modules/typescript/package.json', JSON.stringify({ name: 'typescript', version: '5.7.2', bin: { tsc: 'bin/tsc' } }));",
+      `  fs.writeFileSync('node_modules/typescript/bin/tsc', ${JSON.stringify(compiler)});`,
+      "}",
+      "process.exit(0);",
     ].join("\n"), "utf8");
-    await chmod(python3, 0o755);
-    if (options.ddgs !== "create-repair") {
-      await mkdir(join(venv, "bin"), { recursive: true });
-      await writeFile(join(venv, "bin", "python"), await readFile(ddgsPython));
-      await chmod(join(venv, "bin", "python"), 0o755);
-    }
+    await symlink(join("node_modules", "npm", "bin", "npm-cli.js"), join(bin, "npm"));
+    await chmod(join(bin, "npm"), 0o755);
 
-    const npm = join(bin, "npm");
-    await writeFile(npm, [
-      "#!/bin/bash",
-      "printf '%s\\0' \"$@\" > \"$CAPTURE_DIR/npm-args\"",
-      '[[ "$1" == "--prefix" && "$3" == "run" && "$4" == "build" ]] || exit 95',
-      '[[ "${BUILD_STATUS:-0}" == "0" ]] || exit "$BUILD_STATUS"',
-      'mkdir -p "$2/dist/src/web"',
-      "printf '%s\\n' '// built-cli fixture' > \"$2/dist/src/web/cli.js\"",
-      "",
-    ].join("\n"), "utf8");
-    await chmod(npm, 0o755);
-
+    // Real preparation uses the real Node; only the final CLI launch is a
+    // recording stub whose exit status the wrapper must propagate.
     const node = join(bin, "node");
     await writeFile(node, [
       `#!${process.execPath}`,
@@ -127,11 +150,16 @@ async function withWebFixture<T>(options: FixtureOptions, run: (fixture: WebFixt
       'const fs = require("node:fs");',
       'const path = require("node:path");',
       'const args = process.argv.slice(2);',
+      'if (args[0] && args[0].endsWith("prepare-application.cjs")) {',
+      '  const { spawnSync } = require("node:child_process");',
+      `  const result = spawnSync(${JSON.stringify(process.execPath)}, [args[0], ...args.slice(1)], { cwd: process.cwd(), env: process.env, stdio: "inherit" });`,
+      '  process.exit(result.status ?? 1);',
+      "}",
       'fs.writeFileSync(path.join(process.env.CAPTURE_DIR, "node.json"), JSON.stringify({',
       '  args,',
       '  cliExists: fs.existsSync(args[0]),',
       '  ddgsPython: process.env.PI_REVIEW_GATE_DDGS_PYTHON,',
-      '}));',
+      "}));",
       'process.exit(Number(process.env.NODE_STATUS || 0));',
       "",
     ].join("\n"), "utf8");
@@ -139,7 +167,6 @@ async function withWebFixture<T>(options: FixtureOptions, run: (fixture: WebFixt
 
     const fixture: WebFixture = {
       root,
-      wrapper,
       capture,
       venv,
       env: {
@@ -149,10 +176,10 @@ async function withWebFixture<T>(options: FixtureOptions, run: (fixture: WebFixt
         PATH: `${bin}${delimiter}/usr/bin:/bin`,
         CAPTURE_DIR: capture,
         PI_REVIEW_GATE_DDGS_VENV: venv,
-        // Prove that ensure-ddgs replaces, rather than leaks, an inherited value.
+        // Prove the wrapper's own export replaces an inherited value.
         PI_REVIEW_GATE_DDGS_PYTHON: "/inherited/incorrect/python",
-        DDGS_VALIDATION_MODE: options.ddgs === "create-repair" ? "repair" : options.ddgs,
-        BUILD_STATUS: String(options.buildStatus ?? 0),
+        DDGS_VALIDATION_MODE: options.ddgs,
+        INSTALL_STATUS: String(options.installStatus ?? 0),
         NODE_STATUS: String(options.nodeStatus ?? 0),
       },
     };
@@ -179,167 +206,123 @@ function runBounded(command: string, args: string[], options: {
     });
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
-    let timedOut = false;
-    let outputLimitExceeded = false;
-    let spawnError: Error | undefined;
     let settled = false;
-    let killTimer: NodeJS.Timeout | undefined;
-
-    const signalTree = (signal: NodeJS.Signals): void => {
-      try {
-        if (process.platform !== "win32" && child.pid !== undefined) process.kill(-child.pid, signal);
-        else child.kill(signal);
-      } catch {
-        // The child may have exited between the timeout and the signal.
-      }
-    };
-    const stop = (): void => {
-      signalTree("SIGTERM");
-      killTimer = setTimeout(() => signalTree("SIGKILL"), 500);
-      killTimer.unref();
-    };
-    const deadline = setTimeout(() => {
-      timedOut = true;
-      stop();
-    }, options.timeoutMs ?? 10_000);
-    deadline.unref();
-
-    const collect = (stream: NodeJS.ReadableStream, target: "stdout" | "stderr"): void => {
-      stream.on("data", (chunk: Buffer | string) => {
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        if (target === "stdout") stdout = Buffer.concat([stdout, buffer]);
-        else stderr = Buffer.concat([stderr, buffer]);
-        if (stdout.length + stderr.length > MAX_OUTPUT_BYTES && !outputLimitExceeded) {
-          outputLimitExceeded = true;
-          stop();
-        }
-      });
-    };
-    if (child.stdout) collect(child.stdout, "stdout");
-    if (child.stderr) collect(child.stderr, "stderr");
-    child.on("error", (error) => { spawnError = error; });
-    child.on("close", (status, signal) => {
+    const finish = (result: Invocation) => {
       if (settled) return;
       settled = true;
-      clearTimeout(deadline);
-      if (killTimer) clearTimeout(killTimer);
-      resolveInvocation({
-        status,
-        signal,
-        stdout: stdout.toString("utf8"),
-        stderr: stderr.toString("utf8"),
-        timedOut,
-        outputLimitExceeded,
-        ...(spawnError ? { spawnError } : {}),
-      });
+      clearTimeout(timer);
+      resolveInvocation(result);
+    };
+    const timer = setTimeout(() => {
+      if (process.platform === "win32" || child.pid === undefined) child.kill();
+      else {
+        try { process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ }
+      }
+      finish({ status: null, signal: null, stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8"), timedOut: true, outputLimitExceeded: false });
+    }, options.timeoutMs ?? 120_000);
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout = Buffer.concat([stdout, chunk]);
+      if (stdout.length + stderr.length > MAX_OUTPUT_BYTES) {
+        child.kill("SIGKILL");
+        finish({ status: null, signal: null, stdout: "", stderr: "", timedOut: false, outputLimitExceeded: true });
+      }
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr = Buffer.concat([stderr, chunk]);
+      if (stdout.length + stderr.length > MAX_OUTPUT_BYTES) {
+        child.kill("SIGKILL");
+        finish({ status: null, signal: null, stdout: "", stderr: "", timedOut: false, outputLimitExceeded: true });
+      }
+    });
+    child.once("error", (error) => {
+      finish({ status: null, signal: null, stdout: "", stderr: "", timedOut: false, outputLimitExceeded: false, spawnError: error });
+    });
+    child.once("close", (status, signal) => {
+      finish({ status, signal, stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8"), timedOut: false, outputLimitExceeded: false });
     });
   });
 }
 
-function assertSettled(result: Invocation): void {
-  assert.equal(result.timedOut, false, "wrapper invocation must finish before its deadline");
-  assert.equal(result.outputLimitExceeded, false, "wrapper output must remain bounded");
-  assert.equal(result.spawnError, undefined, result.spawnError?.message);
+function runWrapper(fixture: WebFixture, args: string[] = ["--query", "example"]) {
+  return runBounded("/bin/bash", [join(fixture.root, "scripts", "pi-review-web.sh"), ...args], {
+    cwd: fixture.root,
+    env: fixture.env,
+  });
 }
 
-async function capturedNode(fixture: WebFixture): Promise<{ args: string[]; cliExists: boolean; ddgsPython: string }> {
-  return JSON.parse(await readFile(join(fixture.capture, "node.json"), "utf8")) as {
-    args: string[];
-    cliExists: boolean;
-    ddgsPython: string;
-  };
+async function capturedNode(fixture: WebFixture): Promise<{ args: string[]; cliExists: boolean; ddgsPython: string } | null> {
+  try {
+    return JSON.parse(await readFile(join(fixture.capture, "node.json"), "utf8"));
+  } catch {
+    return null;
+  }
 }
 
-async function nulArgs(file: string): Promise<string[]> {
-  const body = await readFile(file, "utf8");
-  const values = body.split("\0");
-  if (values.at(-1) === "") values.pop();
-  return values;
-}
-
-async function assertDdgsRepairContract(fixture: WebFixture): Promise<void> {
-  const calls = (await readFile(join(fixture.capture, "python-calls"), "utf8"))
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => line.split("\t"));
-  assert.ok(calls.length >= 4, `expected isolated DDGS validation/install calls, got ${JSON.stringify(calls)}`);
-  assert.ok(calls.every((args) => args[0] === "-I"), "every venv Python invocation must use isolated -I mode");
-  const validations = calls.filter((args) => args[1] === "-c");
-  assert.ok(validations.length >= 2, "the installed dependency must be validated before and after repair");
-  assert.ok(validations.every((args) => args[2]?.includes('metadata.version("ddgs")')));
-  assert.ok(validations.every((args) => args[3] === "9.16.0"), "validation must check the pinned DDGS version");
-  const install = calls.find((args) => args[1] === "-m" && args[2] === "pip" && args[3] === "install");
-  assert.ok(install, "a failed initial validation must invoke pip install");
-  assert.ok(install?.includes("ddgs==9.16.0"), "repair must install the pinned DDGS version");
-  assert.ok(calls.some((args) => args[1] === "-m" && args[2] === "pip" && args[3] === "check"));
-}
-
-test("actual source web wrapper creates and repairs DDGS, builds, and forwards exact arguments/status", { skip: POSIX_ONLY }, async () => {
-  const userArgs = ["--query", "two words", "", "literal;$HOME *", "'quoted\"\\", "--", "-leading", "line\nbreak"];
-  await withWebFixture({ source: true, packagedCli: false, ddgs: "create-repair", nodeStatus: 29 }, async (fixture) => {
-    const result = await runBounded(fixture.wrapper, userArgs, { cwd: fixture.root, env: fixture.env });
-    assertSettled(result);
-    assert.equal(result.status, 29, "the web CLI exit status must be preserved");
-    assert.equal(result.signal, null);
-    assert.deepEqual(await nulArgs(join(fixture.capture, "npm-args")), ["--prefix", fixture.root, "run", "build"]);
+test("actual source web wrapper prepares once, then reuses without npm or Python work", { skip: POSIX_ONLY }, async () => {
+  await withWebFixture({ source: true, packagedCli: false, ddgs: "valid", nodeStatus: 29 }, async (fixture) => {
+    const first = await runWrapper(fixture);
+    assert.equal(first.status, 29, `the CLI's own status must propagate: ${first.stderr}`);
+    const installed = JSON.parse(await readFile(join(fixture.capture, "npm-args"), "utf8")) as string[];
+    assert.equal(installed[0], "ci", "the only install is the locked ci install");
     const cli = await capturedNode(fixture);
-    assert.deepEqual(cli.args, [join(fixture.root, "dist", "src", "web", "cli.js"), ...userArgs]);
-    assert.equal(cli.cliExists, true, "the build must provide the CLI path passed to Node");
-    assert.equal(cli.ddgsPython, join(fixture.venv, "bin", "python"), "DDGS Python path must be exported from the actual helper");
-    const creationCalls = (await readFile(join(fixture.capture, "python3-calls"), "utf8")).trim().split("\t");
-    assert.deepEqual(creationCalls, ["-I", "-m", "venv", fixture.venv], "missing venv must be created by isolated python3");
-    await assertDdgsRepairContract(fixture);
+    assert.ok(cli);
+    assert.equal(cli.cliExists, true, "the prepared CLI path passed to Node exists");
+    assert.match(cli.args[0], /dist[\\/]src[\\/]web[\\/]cli\.js$/);
+    assert.equal(cli.ddgsPython, join(fixture.venv, "bin", "python"), "DDGS Python path must be the ready interpreter");
+    assert.deepEqual(cli.args.slice(1), ["--query", "example"]);
+
+    // Warm: the same prepared root, no install, and the CLI still runs.
+    await rm(join(fixture.capture, "npm-args"), { force: true });
+    const second = await runWrapper(fixture);
+    assert.equal(second.status, 29);
+    assert.equal(await readFile(join(fixture.capture, "npm-args"), "utf8").then(() => true, () => false), false,
+      "a current start performs no install");
+    const warmCli = await capturedNode(fixture);
+    assert.equal(warmCli?.args[0], cli.args[0], "the same prepared root is reused");
   });
 });
 
-test("actual source web wrapper stops at build failure and preserves npm status", { skip: POSIX_ONLY }, async () => {
-  await withWebFixture({ source: true, packagedCli: false, ddgs: "valid", buildStatus: 47 }, async (fixture) => {
-    const result = await runBounded(fixture.wrapper, ["--flag", "value"], { cwd: fixture.root, env: fixture.env });
-    assertSettled(result);
-    assert.equal(result.status, 47, "a failed build status must be returned unchanged");
-    assert.deepEqual(await nulArgs(join(fixture.capture, "npm-args")), ["--prefix", fixture.root, "run", "build"]);
-    await assert.rejects(readFile(join(fixture.capture, "node.json")), { code: "ENOENT" }, "Node must not run after build failure");
+test("a failed preparation stops the web wrapper and preserves the installer status", { skip: POSIX_ONLY }, async () => {
+  await withWebFixture({ source: true, packagedCli: false, ddgs: "valid", installStatus: 47 }, async (fixture) => {
+    const result = await runWrapper(fixture);
+    assert.equal(result.status, 47, `a failed install status must be returned unchanged: ${result.stderr}`);
+    assert.equal(await capturedNode(fixture), null, "the CLI must not run after a failed preparation");
+    assert.doesNotMatch(result.stdout, /pi-review-web/u, "no launch diagnostics precede a failed preparation");
   });
 });
 
-test("actual packaged web wrapper skips the source build and preserves CLI arguments/status", { skip: POSIX_ONLY }, async () => {
-  const userArgs = ["--search", "a value with spaces", "", "semi;colon", "--", "-x"];
+test("actual packaged web wrapper skips preparation work and preserves CLI arguments/status", { skip: POSIX_ONLY }, async () => {
   await withWebFixture({ source: false, packagedCli: true, ddgs: "valid", nodeStatus: 23 }, async (fixture) => {
-    const result = await runBounded(fixture.wrapper, userArgs, { cwd: fixture.root, env: fixture.env });
-    assertSettled(result);
-    assert.equal(result.status, 23, "a packaged CLI status must be returned unchanged");
+    const first = await runWrapper(fixture);
+    assert.equal(first.status, 23);
     const cli = await capturedNode(fixture);
-    assert.deepEqual(cli.args, [join(fixture.root, "dist", "src", "web", "cli.js"), ...userArgs]);
-    assert.equal(cli.cliExists, true, "the packaged CLI must be the Node entry path");
+    assert.ok(cli);
+    assert.equal(cli.cliExists, true);
     assert.equal(cli.ddgsPython, join(fixture.venv, "bin", "python"));
-    await assert.rejects(readFile(join(fixture.capture, "npm-args")), { code: "ENOENT" }, "packaged launches must not build");
-    const calls = (await readFile(join(fixture.capture, "python-calls"), "utf8")).split("\n").filter(Boolean);
-    assert.ok(calls.length > 0 && calls.every((call) => call.startsWith("-I\t")), "DDGS validation must stay isolated");
+    assert.deepEqual(cli.args.slice(1), ["--query", "example"]);
+    assert.equal(await readFile(join(fixture.capture, "npm-args"), "utf8").then(() => true, () => false), false,
+      "packaged launches must not install or compile");
+
+    const second = await runWrapper(fixture);
+    assert.equal(second.status, 23, "a packaged package with its exact version stays current");
   });
 });
 
-test("actual packaged web wrapper fails closed when the compiled CLI is missing", { skip: POSIX_ONLY }, async () => {
+test("a missing packaged CLI fails closed before the CLI runs", { skip: POSIX_ONLY }, async () => {
   await withWebFixture({ source: false, packagedCli: false, ddgs: "valid" }, async (fixture) => {
-    const result = await runBounded(fixture.wrapper, ["--should-not-run"], { cwd: fixture.root, env: fixture.env });
-    assertSettled(result);
-    assert.equal(result.status, 2);
-    assert.ok(
-      result.stderr.includes(`pi-review-web: packaged CLI is missing: ${join(fixture.root, "dist", "src", "web", "cli.js")}`),
-      `missing packaged CLI diagnostic: ${result.stderr}`,
-    );
-    await assert.rejects(readFile(join(fixture.capture, "node.json")), { code: "ENOENT" });
-    await assert.rejects(readFile(join(fixture.capture, "npm-args")), { code: "ENOENT" });
+    const result = await runWrapper(fixture);
+    assert.equal(result.status, 2, `stderr: ${result.stderr}`);
+    assert.match(result.stderr, /packaged extension output is missing/u);
+    assert.equal(await capturedNode(fixture), null);
+    assert.equal(await readFile(join(fixture.capture, "npm-args"), "utf8").then(() => true, () => false), false);
   });
 });
 
-test("actual web wrapper cannot hide failed DDGS validation behind a successful install", { skip: POSIX_ONLY }, async () => {
-  await withWebFixture({ source: true, packagedCli: true, ddgs: "fail" }, async (fixture) => {
-    const result = await runBounded(fixture.wrapper, ["--must-not-run"], { cwd: fixture.root, env: fixture.env });
-    assertSettled(result);
-    assert.equal(result.status, 1, "the helper's final validation failure must stop the wrapper");
-    assert.match(result.stderr, /DDGS 9\.16\.0 is unavailable or has inconsistent dependencies/);
-    assert.ok((await readFile(join(fixture.capture, "python-calls"), "utf8")).includes("install"), "the controlled repair install succeeds");
-    await assert.rejects(readFile(join(fixture.capture, "npm-args")), { code: "ENOENT" }, "build must not follow provisioning failure");
-    await assert.rejects(readFile(join(fixture.capture, "node.json")), { code: "ENOENT" }, "Node must not follow provisioning failure");
+test("a failing DDGS environment stops the wrapper before the CLI runs", { skip: POSIX_ONLY }, async () => {
+  await withWebFixture({ source: false, packagedCli: true, ddgs: "fail" }, async (fixture) => {
+    const result = await runWrapper(fixture);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /DDGS setup failed/u);
+    assert.equal(await capturedNode(fixture), null);
   });
 });

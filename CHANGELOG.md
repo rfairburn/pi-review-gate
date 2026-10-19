@@ -15,6 +15,53 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.183]
+
+### Changed
+
+- Launcher startup is now one shared current check instead of an exhaustive
+  per-launch pipeline (#344). The Pi, web, and sidebar entry points on macOS, Linux, and
+  Windows ask a single preparation authority (`scripts/prepare-application.cjs`) whether
+  the prepared application is current, and launch immediately when it is. A current
+  start reads a bounded marker plus a completion receipt and stats only the recorded
+  application inputs: no `npm ci`, no TypeScript compile, no staging or artifact
+  inventory, no runtime/toolchain fingerprint, no Python validation, no skill copy, and
+  no cache cleanup. Installed packages are identified by their full exact version (for
+  example `0.1.0-dev.180`), so prebuilt consumers never compile; source checkouts are
+  identified by that bounded input index, so real edits, additions, or deletions
+  invalidate while touch-only or irrelevant changes do not. A genuine miss updates
+  automatically — no confirmation — in a fresh inactive generation under one producer,
+  publishes readiness only after install, compile, required entries, and input
+  coherence all succeed, and never builds into the live checkout's `dist/`. Live
+  consumers (including a launcher started from an older prepared generation, and a
+  managed Pi runtime) hold leases, so cleanup preserves code that is still running; an
+  unreadable or incomplete consumer view skips reclamation. Fallback managed Node also
+  reuses a completed cached runtime instead of downloading and re-extracting it on every
+  fallback launch (pinned digest verification remains on actual installation).
+  A completed Pi discovery is reused from cheap package/path metadata, so a current
+  sidebar start performs no global npm-root query, no live `pi --version` probe, and no
+  managed-runtime cleanup; explicit or PATH changes are honored without rebuilding.
+  Managed Pi selection and lease publication are one coordinated step, and a lease names
+  the native process that will actually run the code (a POSIX wrapper's invoked parent,
+  not a shell-supplied number). A reused fallback Node runtime carries a per-consumer
+  liveness record that all native reclamation routes honor, stale completed-runtime
+  records are replaced on the next successful installation, and the managed state
+  directory chain is revalidated on every current selection. The retired
+  whole-artifact parallel re-hashing, npm-implementation/toolchain content
+  fingerprints, and per-startup cache-record scans are gone, along with the old-contract
+  tests that asserted them; the shared-command, ownership, role, cancellation,
+  source-copy, atomic-publication, and per-type retention guards are unchanged.
+
+### Fixed
+
+- When DDGS provisioning is needed, validate an already-valid cached environment once
+  instead of twice on macOS, Linux, and Windows (#344, #379). Current launches skip
+  provisioning altogether through the shared readiness state.
+  Validation still checks the pinned distribution version in Python's isolated mode
+  and runs `pip check`; any installation or repair receives a fresh full validation
+  before startup continues. Provisioning failures still stop startup, and dependency
+  pins, installation flags, and cache locations are unchanged.
+
 ## [0.1.0-dev.180]
 
 ### Fixed

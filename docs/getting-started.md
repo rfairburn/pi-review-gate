@@ -39,13 +39,14 @@ Behavioral detail lives in the linked pages.
     excluded from capture by Git's own enumeration.
 
 - **Python 3, for `WebSearch`** — user-installed with the standard `venv`/`pip`
-  tooling (`python3` on macOS/Linux; the Windows launcher probes `python3`, then
-  `python`); the pinned DDGS environment it fills is created and managed
+  tooling (`python3` on macOS/Linux; Windows also supports `python` and the
+  existing `py -3` launcher); the pinned DDGS environment is created and managed
   automatically below. No other runtime feature uses Python.
 - **Bash and standard Unix command-line utilities, for the current `.sh` launchers.**
   These scripts use tools such as `dirname`, `mkdir`, `mktemp`, `chmod`, `cp`, and
-  `rm`; Bash alone is not the entire launcher environment. Normal launch provisions
-  or validates DDGS even if the session will not use `WebSearch`.
+  `rm`; Bash alone is not the entire launcher environment. Launchers prepare DDGS
+  when its recorded installation is missing or outdated, even if the session will
+  not use `WebSearch`; current launches do not run Python setup checks.
 - **Platform shell, for `ShellStart`.** macOS/Linux use `/bin/bash`, POSIX process
   groups and utilities such as `sleep` and `kill`. Windows uses `pwsh.exe` first,
   then `powershell.exe`, on `PATH`; neither available means no job can start.
@@ -70,9 +71,10 @@ engine declaration; do not interpret that absence as verification of every versi
   with a `Scripts\\python.exe` venv; the `.sh` helpers use `bin/python`). The cache is
   `~/.cache/pi-review-gate` by default, relocatable via
   `PI_REVIEW_GATE_DDGS_VENV` and `XDG_CACHE_HOME`. Creating or repairing that venv
-  needs package-index access; a valid cached environment is only validated, so
-  launches can succeed offline. Management fails closed when the environment cannot
-  be established. Each `WebSearch` call then runs Python at search time: the wrappers
+  needs package-index access. A current readiness marker and the expected installed
+  paths let subsequent launches reuse it offline without running a version import
+  or `pip check` again. Those full checks run during setup or repair before readiness
+  is recorded. Management fails closed when the environment cannot be established. Each `WebSearch` call then runs Python at search time: the wrappers
   export `PI_REVIEW_GATE_DDGS_PYTHON` pointing at the managed venv, and a direct
   `pi -e` load without the wrappers falls back to `python3`, which must itself have
   DDGS installed, or use an explicitly configured `PI_REVIEW_GATE_DDGS_PYTHON`
@@ -91,7 +93,19 @@ stays in each harness's own login/configuration.
 
 ## Installation
 
-From a checkout of this repository:
+For a prebuilt release, download the numbered prerelease tarball from
+[GitHub releases](https://github.com/rfairburn/pi-review-gate/releases). It already
+contains compiled code and its full version, such as `0.1.0-dev.180`. Install it into
+a new prefix that is not used by a running session:
+
+```bash
+npm install --prefix /path/to/new-inactive-install /path/to/pi-review-gate-0.1.0-dev.N.tgz
+```
+
+Use the installed entry points under that prefix's `node_modules/.bin/` (the native
+Windows entry is `pi-review-gate-cmd`). No npm-registry publication is required.
+
+For development dependencies and tests in a source checkout:
 
 ```bash
 npm install
@@ -241,16 +255,20 @@ config — `review-gate.json` in the Pi agent directory (`~/.pi/agent/review-gat
 following Pi's `PI_CODING_AGENT_DIR` override) or the compatibility fallback
 `~/.config/pi-review-gate/config.json` — creating a private zero-model default config
 at the default location when neither exists. A config that exists only at the fallback
-location remains selected unchanged. It builds the extension when sources are present,
-creates and validates the pinned `WebSearch` environment with `scripts/ensure-ddgs.sh`
-on macOS/Linux or the native Node helper on Windows (see
-[Prerequisites](#prerequisites)), then
-refreshes the four shipped skills under
+location remains selected unchanged. Pi, sidebar, and web launchers share the same
+quick current-state decision on every supported OS. A current installation launches
+without dependency installation, compilation, another staging copy, or exhaustive
+validation. Relevant development-input changes or missing/outdated preparation trigger
+an automatic update in an inactive managed generation, not the live checkout's `dist/`.
+The pinned `WebSearch` environment and the shipped skills are prepared only when their
+own readiness state is missing or outdated (see [Prerequisites](#prerequisites)).
+The four shipped skills live under
 `~/.agents/skills/` (pi-review-gate-orchestrator — including its recovery runbook —
-pi-review-gate-execution, pi-review-gate-research, and pi-review-gate-completion), and
-then executes the installed `pi` with the extension. The session-host sidebar launchers
-(`scripts/pi-review-sessions.sh` on macOS/Linux, `scripts\pi-review-sessions.cmd`
-on Windows) refresh the same skills before starting the host, so a direct sidebar
+pi-review-gate-execution, pi-review-gate-research, and pi-review-gate-completion).
+The launcher then executes the installed `pi` with the prepared extension. The
+session-host sidebar launchers (`scripts/pi-review-sessions.sh` on macOS/Linux,
+`scripts\pi-review-sessions.cmd` on Windows) use the same preparation and skill
+readiness state before starting the host, so a direct sidebar
 launch needs no wrapper prerequisite. The completion-guidance setting
 controls only whether the extension supplies its automatic pointer; manual skill
 discovery depends on the skill being installed in Pi's active skill path. Loading the

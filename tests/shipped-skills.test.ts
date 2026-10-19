@@ -412,13 +412,14 @@ test("research skill distinguishes content search, path discovery, and directory
   assert.match(skill, /not arbitrary shell/);
 });
 
-test("startup cue skill paths match the launcher provisioning destinations", async () => {
-  // Both launchers provision each skill to <home>/.agents/skills/<name>/SKILL.md;
-  // the system-prompt cues must not promise a path the launchers never write.
+test("startup cue skill paths match the shared provisioning destination", async () => {
+  // One shared authority provisions each skill to <home>/.agents/skills/<name>/SKILL.md;
+  // the system-prompt cues must not promise a path it never writes, and no
+  // wrapper may carry a second destination.
+  const sharedSource = await readFile(path.join(repoRoot, "scripts", "prepare-application.cjs"), "utf8");
   const shSource = await readFile(path.join(repoRoot, "scripts", "pi-review-gate.sh"), "utf8");
-  const cjsSource = await readFile(path.join(repoRoot, "scripts", "pi-review-gate-launcher.cjs"), "utf8");
-  assert.match(shSource, /SKILLS_DIR="\$HOME\/\.agents\/skills"/);
-  assert.match(cjsSource, /"\.agents", "skills", skill\.name/);
+  assert.match(sharedSource, /"\.agents", "skills", skill\.name/);
+  assert.doesNotMatch(shSource, /SKILLS_DIR=/, "the POSIX wrapper must not carry its own skill destination");
   for (const [, file, role, skillName] of [
     ["execute", "execution-system-prompt.md", "execution", "pi-review-gate-execution"],
     ["orchestrate", "orchestrator-system-prompt.md", "orchestrator", "pi-review-gate-orchestrator"],
@@ -462,29 +463,25 @@ test("static mode segments never duplicate the dynamic tool inventory", async ()
   }
 });
 
-test("the two launcher skill manifests agree on every shipped skill file in order", async () => {
-  // The POSIX launcher (scripts/pi-review-gate.sh) and the native Windows
-  // helper (scripts/pi-review-gate-launcher.cjs) each hand-maintain a
-  // SKILL_PUBLISH_PLAN; drift between them would silently skip provisioning
-  // on one platform. Compare the packaged source paths, order-sensitive.
+test("one shared skill manifest is the only shipped copy", async () => {
+  // Issue 344: the POSIX wrapper, the Windows helper, the web wrapper, and the
+  // sidebar all use the same SKILL_PUBLISH_PLAN in the shared authority. A second
+  // hand-maintained manifest could silently skip provisioning on one platform.
   const shSource = await readFile(path.join(repoRoot, "scripts", "pi-review-gate.sh"), "utf8");
   const cjsSource = await readFile(path.join(repoRoot, "scripts", "pi-review-gate-launcher.cjs"), "utf8");
+  const sharedSource = await readFile(path.join(repoRoot, "scripts", "prepare-application.cjs"), "utf8");
 
-  const shPlan = shSource.match(/SKILL_PUBLISH_PLAN=\(\n([\s\S]*?)\n\)/);
-  assert.ok(shPlan, "pi-review-gate.sh must declare SKILL_PUBLISH_PLAN");
-  const shSources = [...shPlan[1].matchAll(/"\$REVIEW_GATE_ROOT\/([^"]+)"/g)].map((m) => m[1]);
+  assert.doesNotMatch(shSource, /SKILL_PUBLISH_PLAN=/, "the POSIX wrapper must not carry its own manifest");
+  assert.doesNotMatch(cjsSource, /const SKILL_PUBLISH_PLAN = \[/, "the helper must not declare a second manifest");
+  assert.match(cjsSource, /SKILL_PUBLISH_PLAN: prepare\.SKILL_PUBLISH_PLAN/, "the helper re-exports the shared manifest");
 
-  const cjsPlan = cjsSource.match(/const SKILL_PUBLISH_PLAN = \[([\s\S]*?)\n\];/);
-  assert.ok(cjsPlan, "pi-review-gate-launcher.cjs must declare SKILL_PUBLISH_PLAN");
-  const cjsSources = [...cjsPlan[1].matchAll(/source: \[([^\]]+)\]/g)].map((m) =>
+  const sharedPlan = sharedSource.match(/const SKILL_PUBLISH_PLAN = \[([\s\S]*?)\n\];/);
+  assert.ok(sharedPlan, "prepare-application.cjs must declare SKILL_PUBLISH_PLAN");
+  const sharedSources = [...sharedPlan[1].matchAll(/source: \[([^\]]+)\]/g)].map((m) =>
     m[1].split(",").map((part) => part.trim().replace(/^"|"$/g, "")).join("/"),
   );
-
-  assert.ok(shSources.length > 0, "the POSIX manifest must list skill files");
-  assert.deepEqual(cjsSources, shSources, "both launcher manifests must agree on sources and order");
-  // Every manifest source must exist so the fail-closed checks never fire in a
-  // healthy tree.
-  for (const source of shSources) {
+  assert.equal(sharedSources.length, 5, "the shipped manifest lists the orchestrator pair plus three skills");
+  for (const source of sharedSources) {
     const exists = await stat(path.join(repoRoot, source)).then(() => true, () => false);
     assert.ok(exists, `manifest source must exist: ${source}`);
   }
@@ -498,22 +495,18 @@ test("the pre-#151 migration has one canonical shipped implementation (#154)", a
   // platforms, so pi-review-gate.sh must only invoke the helper's dedicated
   // --migrate-prior-skill-files mode.
   const shSource = await readFile(path.join(repoRoot, "scripts", "pi-review-gate.sh"), "utf8");
-  const cjsSource = await readFile(path.join(repoRoot, "scripts", "pi-review-gate-launcher.cjs"), "utf8");
+  const sharedSource = await readFile(path.join(repoRoot, "scripts", "prepare-application.cjs"), "utf8");
   // Strip comment lines: the shell may document where the canonical
   // implementation lives without carrying any of its data or code.
   const shCode = shSource.split("\n").filter((line) => !/^\s*#/.test(line)).join("\n");
 
   assert.doesNotMatch(shCode, /SKILL_MIGRATION_PLAN/, "pi-review-gate.sh must not carry a second migration manifest");
   assert.doesNotMatch(shCode, /migrate_generic_skill_file/, "pi-review-gate.sh must not carry a second migration algorithm");
-  assert.match(
-    shCode,
-    /node "\$REVIEW_GATE_ROOT\/scripts\/pi-review-gate-launcher\.cjs" --migrate-prior-skill-files/,
-    "pi-review-gate.sh must delegate the migration to the canonical helper implementation",
-  );
-  assert.match(cjsSource, /--migrate-prior-skill-files/, "the helper must expose the --migrate-prior-skill-files mode");
+  assert.match(shCode, /prepare-application\.cjs" --prepare/, "pi-review-gate.sh delegates all preparation, including migration, to the shared authority");
+  assert.match(sharedSource, /migrateGenericSkillFiles/, "the shared authority owns the migration implementation");
 
-  const cjsPlan = cjsSource.match(/const SKILL_MIGRATION_PLAN = \[([\s\S]*?)\n\];/);
-  assert.ok(cjsPlan, "pi-review-gate-launcher.cjs must declare SKILL_MIGRATION_PLAN");
+  const cjsPlan = sharedSource.match(/const SKILL_MIGRATION_PLAN = \[([\s\S]*?)\n\];/);
+  assert.ok(cjsPlan, "prepare-application.cjs must declare SKILL_MIGRATION_PLAN");
   const entryBlocks = cjsPlan[1].split("  {\n").slice(1);
   const cjsEntries = entryBlocks.map((block) => ({
     installed: block.match(/installed: \[([^\]]+)\]/)![1]

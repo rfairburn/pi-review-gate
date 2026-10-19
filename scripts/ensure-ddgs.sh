@@ -23,11 +23,16 @@ if [[ ! -x "$PI_REVIEW_GATE_DDGS_PYTHON" ]]; then
   python3 -I -m venv "$PI_REVIEW_GATE_DDGS_VENV"
 fi
 
+# A valid cached environment is validated exactly once per launch (one
+# isolated pinned-version import plus one pip check); the duplicate warm
+# validation is deliberately gone. Repair still revalidates the whole
+# contract from scratch below before the environment is accepted.
 if ! ddgs_environment_is_valid; then
   echo "pi-review-gate: installing DDGS $DDGS_VERSION" >&2
   # These resolver options apply to DDGS and its full transitive dependency
-  # graph. If a compatible binary is unavailable, pip fails and the final
-  # validation below keeps the launcher from continuing with a bad venv.
+  # graph. If a compatible binary is unavailable, pip fails (set -e) and the
+  # freshly revalidated environment below keeps the launcher from continuing
+  # with a bad venv.
   "$PI_REVIEW_GATE_DDGS_PYTHON" -I -m pip install \
     --disable-pip-version-check \
     --no-cache-dir \
@@ -37,11 +42,13 @@ if ! ddgs_environment_is_valid; then
     --upgrade \
     --upgrade-strategy eager \
     "ddgs==$DDGS_VERSION"
-fi
 
-if ! ddgs_environment_is_valid; then
-  echo "pi-review-gate: DDGS $DDGS_VERSION is unavailable or has inconsistent dependencies; refusing to continue" >&2
-  exit 1
+  # Post-repair validation is the full contract (version import and pip
+  # check), never a partial or previously cached result.
+  if ! ddgs_environment_is_valid; then
+    echo "pi-review-gate: DDGS $DDGS_VERSION is unavailable or has inconsistent dependencies; refusing to continue" >&2
+    exit 1
+  fi
 fi
 
 export PI_REVIEW_GATE_DDGS_PYTHON

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import test, { type TestContext } from "node:test";
@@ -371,7 +371,18 @@ function entrypointEnv(fixture: EntrypointFixture, envOverrides: NodeJS.ProcessE
       ...envOverrides,
   };
 }
-function runSh(fixture: EntrypointFixture, args: string[], envOverrides: NodeJS.ProcessEnv = {}): { status: number | null; stdout: string; stderr: string } {
+function runSh(
+  fixture: EntrypointFixture,
+  args: string[],
+  envOverrides: NodeJS.ProcessEnv = {},
+  options: { reuseCompletedRuntime?: boolean } = {},
+): { status: number | null; stdout: string; stderr: string } {
+  // Nearly every fallback test asserts genuine install/cleanup behavior, so a
+  // previously completed runtime marker is cleared unless the test is
+  // specifically about reuse (issue 344).
+  if (options.reuseCompletedRuntime !== true) {
+    rmSync(join(nodeCache(fixture), "current-node.txt"), { force: true });
+  }
   const result = spawnSync("/bin/bash", [shPath, ...args], {
     cwd: process.cwd(), encoding: "utf8", timeout: 30_000,
     env: entrypointEnv(fixture, envOverrides),
@@ -485,6 +496,36 @@ test(".sh automatically bootstraps a missing PATH Node from the fixed pinned arc
   assert.equal(workRoots.length, 1);
   assert.equal(statSync(join(nodeCacheRoot, workRoots[0]!)).mode & 0o777, 0o700, "fresh POSIX witness is mode 0700");
   assert.ok(lstatSync(join(nodeCacheRoot, workRoots[0]!, "extracted", "node-v22.19.0-linux-x64", "bin", "node")).isFile());
+  fixture.markAssertionsPassed();
+});
+
+test(".sh reuses a completed fallback runtime and performs no download or extraction", { skip: isWindows ? "POSIX entry point" : false }, async (t) => {
+  const fixture = makeEntrypointFixture(".session-host-entry-sh-reuse-");
+  cleanupFixture(t, fixture);
+  writeBootstrapTools(fixture);
+  writeFakeNode(fixture.bin, "v20.0.0", fixture.nodeLog);
+
+  const env = { PI_CODING_AGENT_DIR: fixture.agentDir };
+  const first = runSh(fixture, ["--help"], env, { reuseCompletedRuntime: true });
+  assert.equal(first.status, 0, first.stderr);
+  assert.ok(existsSync(join(nodeCache(fixture), "current-node.txt")), "a completed runtime publishes its marker");
+  const extracted = recordedPhases(fixture).filter((phase) => phase === "tar-extract").length;
+  assert.equal(extracted, 1);
+
+
+  const second = runSh(fixture, ["--help"], env, { reuseCompletedRuntime: true });
+  assert.equal(second.status, 0, second.stderr);
+  const dispatch = recordedDispatch(fixture);
+  assert.deepEqual(dispatch.slice(-2), [cjsPath, "--help"],
+    "the reused runtime still dispatches the shared CJS with the original arguments");
+  assert.equal(dispatch.filter((line) => line === cjsPath).length, 2, "both launches dispatched the CJS exactly once");
+  const phases = recordedPhases(fixture);
+  assert.equal(phases.filter((phase) => phase === "tar-extract").length, extracted,
+    "a current fallback runtime is never re-extracted");
+  assert.equal(phases.filter((phase) => phase === "curl").length, 1, "a current fallback runtime is never re-downloaded");
+  assert.equal(phases.filter((phase) => phase === "shasum").length, 1);
+  assert.equal(nodeRoots(fixture).filter((root) => root.startsWith(join(nodeCache(fixture), "bootstrap."))).length, 1,
+    "reuse creates no extra generation");
   fixture.markAssertionsPassed();
 });
 
@@ -632,7 +673,10 @@ test(".sh requires HTTP 200 and retains a failed-download witness without archiv
 
 function nodeRoots(fixture: EntrypointFixture): string[] {
   const cache = join(fixture.agentDir, ".pi-review-gate", "node");
-  return readdirSync(cache).filter((name) => name !== ".admission.lock").map((name) => join(cache, name));
+  // Completed-runtime markers are control files, not generations.
+  return readdirSync(cache, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+    .map((entry) => join(cache, entry.name));
 }
 function nodeCache(fixture: EntrypointFixture): string {
   return join(fixture.agentDir, ".pi-review-gate", "node");
@@ -779,6 +823,9 @@ test(".sh deletes a large populated Node generation content-first and converges 
   for (const name of ["bootstrap.9-small-1", "bootstrap.9-small-2", "bootstrap.9-small-3"]) mkdirSync(join(cache, name));
   const results: string[] = [];
   for (let launch = 0; launch < 4; launch += 1) {
+    // Convergence is about genuine installations: remove the completed-runtime
+    // marker so this iteration really installs (reuse is covered separately).
+    rmSync(join(cache, "current-node.txt"), { force: true });
     const result = runSh(f, ["--help"], env);
     assert.equal(result.status, 0, result.stderr);
     assert.doesNotMatch(result.stderr, /capacity exhausted/);
@@ -863,6 +910,8 @@ test(".sh converges to five with thousands of extracted entries in every fresh g
   const before = join(nodeCache(f), "bootstrap.9-before");
   const roots: string[] = [];
   for (let launch = 0; launch < 8; launch += 1) {
+    // Each iteration is a genuine installation (reuse is covered separately).
+    rmSync(join(nodeCache(f), "current-node.txt"), { force: true });
     const result = runSh(f, ["--help"], env);
     assert.equal(result.status, 0, result.stderr);
     assert.doesNotMatch(result.stderr, /capacity exhausted|unbound variable/);
@@ -880,7 +929,7 @@ test(".sh converges to five with thousands of extracted entries in every fresh g
     "populated fresh generations were actually reclaimed, not just counted");
   assert.equal(readFileSync(outside, "utf8"), "outside remains");
   assert.ok(recordedPhases(f).filter((phase) => phase === "tar-extract").length === 8,
-    "every launch performed its own fresh extraction (no mutable Node reuse)");
+    "each forced installation performed its own fresh extraction");
   void before;
   f.markAssertionsPassed();
 });
@@ -1772,6 +1821,9 @@ test(".sh concurrent download/extraction producers both start; a held lock only 
   writeBootstrapTools(f);
   const env = { PI_CODING_AGENT_DIR: f.agentDir };
   for (let i = 0; i < 4; i++) assert.equal(runSh(f, ["--help"], env).status, 0);
+  // This producer is spawned directly (not through runSh), so clear the completed
+  // runtime marker explicitly: it must genuinely install and reach the download.
+  rmSync(join(nodeCache(f), "current-node.txt"), { force: true });
   const child = spawn("/bin/bash", [shPath, "--help"], {
     env: entrypointEnv(f, { ...env, FAKE_CURL_HOLD: "1" }),
     stdio: ["pipe", "pipe", "pipe", "pipe"],
@@ -2708,4 +2760,190 @@ test("bootstrap source pins every official platform artifact and bounds download
   assert.match(windows, /1073741824/);
   assert.doesNotMatch(posix, /PI_REVIEW_GATE_.*(?:FORCE|SKIP|UNVERIFIED)/);
   assert.doesNotMatch(windows, /PI_REVIEW_GATE_.*(?:FORCE|SKIP|UNVERIFIED)/);
+});
+
+if (isWindows) {
+  // The native cached-runtime branch must publish its consumer record inside the
+  // DIRECT-CHILD generation under the canonical per-agent coordination entry,
+  // and must never fall back to admission-lock best effort.
+  test("native Windows cached bootstrap wires consumer protection to the generation and coordination entry", () => {
+    const source = readFileSync(psPath, "utf8");
+    const start = source.indexOf("function Protect-CachedFallbackRuntime");
+    assert.ok(start >= 0);
+    const end = source.indexOf("\nfunction ", start + 10);
+    const protection = source.slice(start, end > 0 ? end : undefined);
+    assert.match(protection, /\$coordination = Enter-NodeCoordination \$AgentDirectory/u);
+    assert.doesNotMatch(protection, /Enter-NodeAdmissionLock/u,
+      "consumer publication requires the coordination entry, not admission-lock best effort");
+    assert.match(protection, /Join-Path \(Join-Path \(Join-Path \$GenerationRoot 'extracted'\) \('node-v22\.19\.0-' \+ \$NodePlatform\)\) 'node\.exe'/u,
+      "the executable is checked at its nested location inside the generation");
+    assert.match(source, /Protect-CachedFallbackRuntime \$cacheRoot \(Join-Path \$cacheRoot \$currentRuntime\.Generation\) \$agentDirectory/u,
+      "the direct-child generation, not the extracted distribution, receives the record");
+    assert.match(source, /Cached Node coordination was unavailable/u,
+      "contention stops the launch safely instead of using unprotected code");
+    // Ancestor fencing and pointer exclusion (review pass 4).
+    const cachedStart = source.indexOf("function Test-CurrentFallbackRuntime");
+    const cachedEnd = source.indexOf("\nfunction ", cachedStart + 10);
+    const cached = source.slice(cachedStart, cachedEnd > 0 ? cachedEnd : undefined);
+    assert.match(cached, /foreach \(\$directory in @\(/u, "the cached validator fences fixed ancestors");
+    assert.match(cached, /NodeGeneration|node_modules.*npm.*bin/su);
+    assert.match(source, /\$entryName -ceq '\.admission\.lock' -or \$entryName -ceq 'current-node\.txt'/u,
+      "the readiness pointer is excluded from cleanup counting");
+    assert.match(source, /\$name -ceq '\.admission\.lock' -or \$name -ceq 'current-node\.txt'/u,
+      "the readiness pointer is excluded from cleanup deletion");
+    assert.match(source, /\$settleKeep = \$keepPath/u,
+      "a failed preparation preserves the marked generation during settlement");
+  });
+}
+
+test(".consumer-* records protect one generation per live cached-runtime consumer", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-consumer-leases-");
+  cleanupFixture(t, f);
+  const cache = nodeCache(f);
+  const generation = join(cache, "bootstrap.0-shared");
+  mkdirSync(generation, { recursive: true });
+  writeFileSync(join(generation, "extracted.bin"), "runtime");
+  // One live consumer (the harness process) and one dead owner record.
+  // `node_owner_current` compares the recorded birth with the real birth, so the
+  // live record uses the harness's own targeted identity.
+  const deadPid = 2 ** 22 + 11;
+  const result = runProducerHarness(f, [
+    `printf '%s\\n%s\\n' "$$" "$(node_owner_identity "$$")" > "$NODE_CACHE_ROOT/bootstrap.0-shared/.consumer-$$-c"`,
+    `printf '%s\\n%s\\n' ${deadPid} "dead-birth" > "$NODE_CACHE_ROOT/bootstrap.0-shared/.consumer-${deadPid}-b"`,
+    `if node_generation_active "$NODE_CACHE_ROOT/bootstrap.0-shared"; then echo ACTIVE; else echo INACTIVE; fi`,
+    `rm -f "$NODE_CACHE_ROOT/bootstrap.0-shared/.consumer-$$-c" "$NODE_CACHE_ROOT/bootstrap.0-shared/.consumer-${deadPid}-b"`,
+    `if node_generation_active "$NODE_CACHE_ROOT/bootstrap.0-shared"; then echo STILL_ACTIVE; else echo INACTIVE; fi`,
+    `ls -a "$NODE_CACHE_ROOT/bootstrap.0-shared" | sort`,
+    "",
+  ].join("\n"));
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.split("\n")[0], "ACTIVE", "a live per-consumer record protects the generation");
+  assert.equal(result.stdout.split("\n")[1], "INACTIVE", "the stale consumer record is removed once its owner is gone");
+  assert.equal(existsSync(generation), true, "the generation itself is only reclaimed by a cleanup pass");
+});
+
+test(".sh replaces a stale completed-runtime marker after one installation", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-stale-marker-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  const env = { PI_CODING_AGENT_DIR: f.agentDir };
+  const marker = join(cache, "current-node.txt");
+  for (const stale of [
+    "not a record at all\n",
+    "schema=1\nversion=22.19.0\nplatform=linux-x64\narchive=node-v22.19.0-linux-x64.tar.gz\nsha256=deadbeef\ngeneration=bootstrap.gone\nnode_identity=1:1\n",
+    "schema=1\nversion=99.0.0\nplatform=linux-x64\narchive=node-v22.19.0-linux-x64.tar.gz\nsha256=d36e56998220085782c0ca965f9d51b7726335aed2f5fc7321c6c0ad233aa96d\ngeneration=bootstrap.gone\nnode_identity=1:1\n",
+  ]) {
+    const extractionsBefore = recordedPhases(f).filter((phase) => phase === "tar-extract").length;
+    writeFileSync(marker, stale, "utf8");
+    const first = runSh(f, ["--help"], env);
+    assert.equal(first.status, 0, first.stderr);
+    assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, extractionsBefore + 1,
+      "the stale record forces exactly one installation");
+    assert.match(readFileSync(marker, "utf8"), /^version=22\.19\.0$/mu, "the completed record is published");
+    const second = runSh(f, ["--help"], env, { reuseCompletedRuntime: true });
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, extractionsBefore + 1,
+      "the replaced record is reused on the next launch");
+    // Reset for the next stale shape.
+    rmSync(marker, { force: true });
+    rmSync(join(cache), { recursive: true, force: true });
+    mkdirSync(cache, { recursive: true });
+  }
+});
+
+test(".sh cached Node start requires the coordination entry and never installs redundantly", { skip: isWindows }, async (t) => {
+  const f = makeEntrypointFixture(".node-cached-coordination-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const env = { PI_CODING_AGENT_DIR: f.agentDir };
+  const installed = runSh(f, ["--help"], env);
+  assert.equal(installed.status, 0, installed.stderr);
+  const extractions = recordedPhases(f).filter((phase) => phase === "tar-extract").length;
+  assert.equal(extractions, 1);
+  // A live holder of the canonical per-agent coordination entry (the same entry
+  // every destructive Node pass holds across deletion).
+  const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+  await new Promise<void>((resolve, reject) => {
+    holder.once("spawn", () => resolve());
+    holder.once("error", reject);
+  });
+  mkdirSync(join(f.agentDir, "session-host"), { recursive: true });
+  const write = runProducerHarness(
+    f,
+    `printf '%s\\n%s\\n' ${holder.pid} "$(node_owner_identity ${holder.pid})" > "$AGENT_DIR/session-host/host-coordination.lock"`,
+  );
+  assert.equal(write.status, 0, write.stderr);
+  const blocked = runSh(f, ["--help"], env, { reuseCompletedRuntime: true });
+  assert.equal(blocked.status, 1, blocked.stderr);
+  assert.match(blocked.stderr, /cached Node coordination was unavailable/u,
+    "the cached start fails safely instead of using unprotected code");
+  assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, extractions,
+    "it never performs a redundant installation");
+  holder.kill("SIGKILL");
+  await new Promise<void>((resolve) => holder.once("close", () => resolve()));
+  const reused = runSh(f, ["--help"], env, { reuseCompletedRuntime: true });
+  assert.equal(reused.status, 0, reused.stderr);
+  assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, extractions,
+    "after the holder is gone the completed runtime is reused without extraction");
+});
+
+test(".sh replaces a wrong-pin marker that still references an existing runtime", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-wrong-pin-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const env = { PI_CODING_AGENT_DIR: f.agentDir };
+  const installed = runSh(f, ["--help"], env);
+  assert.equal(installed.status, 0, installed.stderr);
+  const marker = join(nodeCache(f), "current-node.txt");
+  const original = readFileSync(marker, "utf8");
+  writeFileSync(marker, original.replace(/^sha256=.*$/mu, `sha256=${"0".repeat(64)}`), "utf8");
+  const replaced = runSh(f, ["--help"], env, { reuseCompletedRuntime: true });
+  assert.equal(replaced.status, 0, replaced.stderr);
+  assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, 2,
+    "a wrong-pin record forces exactly one installation even though its runtime exists");
+  assert.doesNotMatch(readFileSync(marker, "utf8"), /^sha256=0{64}$/mu, "the stale pin is replaced");
+  const reused = runSh(f, ["--help"], env, { reuseCompletedRuntime: true });
+  assert.equal(reused.status, 0, reused.stderr);
+  assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, 2,
+    "the replaced record is reused on the next launch");
+});
+
+test(".sh rejects a cached runtime whose extracted or npm ancestor is an alias", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-ancestor-alias-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const env = { PI_CODING_AGENT_DIR: f.agentDir };
+  const first = runSh(f, ["--help"], env);
+  assert.equal(first.status, 0, first.stderr);
+  const cache = nodeCache(f);
+  const generation = readdirSync(cache).find((name) => name.startsWith("bootstrap."));
+  assert.ok(generation);
+  const generationDir = join(cache, generation);
+  const nodeRoot = join(generationDir, "extracted", "node-v22.19.0-linux-x64");
+  // Move the whole distribution outside the generation and alias `extracted`:
+  // the Node leaf (and its inode) stay identical, but the ancestor is now a link.
+  const outside = join(f.root, "outside-extracted");
+  renameSync(join(generationDir, "extracted"), outside);
+  symlinkSync(outside, join(generationDir, "extracted"), "dir");
+  const aliasedExtracted = runSh(f, ["--help"], env, { reuseCompletedRuntime: true });
+  assert.equal(aliasedExtracted.status, 0, aliasedExtracted.stderr);
+  assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, 2,
+    "the alias is rejected before probing or executing the outside Node");
+
+  // Aliased deeper npm ancestor inside the (fresh) installed generation.
+  const current = readdirSync(cache).filter((name) => name.startsWith("bootstrap.")).sort();
+  const fresh = join(cache, current[current.length - 1]!);
+  const freshNodeRoot = join(fresh, "extracted", "node-v22.19.0-linux-x64");
+  const outsideLib = join(f.root, "outside-lib");
+  renameSync(join(freshNodeRoot, "lib"), outsideLib);
+  symlinkSync(outsideLib, join(freshNodeRoot, "lib"), "dir");
+  const aliasedLib = runSh(f, ["--help"], env, { reuseCompletedRuntime: true });
+  assert.equal(aliasedLib.status, 0, aliasedLib.stderr);
+  assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, 3,
+    "an aliased npm ancestor is rejected before reuse");
+  assert.equal(existsSync(join(outside, "node-v22.19.0-linux-x64", "bin", "node")), true,
+    "the outside distribution is left in place (never moved or deleted through the alias)");
+  void nodeRoot;
 });

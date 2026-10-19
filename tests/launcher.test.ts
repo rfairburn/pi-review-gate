@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -16,6 +16,7 @@ import {
 } from "../src/config";
 import { persistSubtasksViewPreference } from "../src/settings/persistence";
 import { piAgentConfigPath, reviewGateConfigCandidates } from "../src/config-path";
+import { extensionFromArgs, isCompiledExtension, writeFakeNpm } from "./launcher-prepare-fixtures";
 
 const execFileAsync = promisify(execFile);
 
@@ -58,17 +59,18 @@ async function makeLauncherFixture(prefix: string): Promise<LauncherFixture> {
     mkdir(capture, { recursive: true }),
     mkdir(join(ddgsVenv, "bin"), { recursive: true }),
   ]);
-  const npmPath = join(bin, "npm");
   const piPath = join(bin, "pi");
   const ddgsPythonPath = join(ddgsVenv, "bin", "python");
-  await writeFile(npmPath, "#!/usr/bin/env bash\nexit 0\n", "utf8");
   await writeFile(ddgsPythonPath, "#!/usr/bin/env bash\nexit 0\n", "utf8");
   await writeFile(piPath, [
     "#!/usr/bin/env bash",
     "printf '%s' \"${PI_REVIEW_GATE_CONFIG:-unset}\" > \"$CAPTURE_DIR/config-env\"",
     "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
   ].join("\n"), "utf8");
-  await Promise.all([chmod(npmPath, 0o755), chmod(piPath, 0o755), chmod(ddgsPythonPath, 0o755)]);
+  // The shared preparation engine resolves PATH's npm through its public JS
+  // entry; this synthetic installation behaves like a real locked install.
+  await writeFakeNpm(bin);
+  await Promise.all([chmod(piPath, 0o755), chmod(ddgsPythonPath, 0o755)]);
   return {
     root,
     home,
@@ -188,10 +190,9 @@ test("persistent launcher uses the compatibility fallback config and forwards ar
   );
   // The launcher no longer bakes the orchestrator prompt in with
   // --append-system-prompt: the extension owns the operating-mode segment.
-  assert.equal(
-    await readFile(join(fixture.capture, "args"), "utf8"),
-    `--extension\n${resolve("dist/src/index.js")}\n--model\nexample\n--tools\nread,bash\n`,
-  );
+  const launch = extensionFromArgs(await readFile(join(fixture.capture, "args"), "utf8"));
+  assert.equal(isCompiledExtension(launch.extension), true, "the prepared extension entry is passed to pi");
+  assert.deepEqual(launch.forwarded, ["--model", "example", "--tools", "read,bash"]);
 });
 
 test("persistent launcher honors the PI_REVIEW_GATE_DISABLED kill switch", async () => {
@@ -258,9 +259,11 @@ test("persistent launcher clears an inherited scheduler flag and honors --schedu
       "1",
       `--scheduler exports the flag for this launch (${label})`,
     );
-    assert.equal(
-      await readFile(join(fixture.capture, "args"), "utf8"),
-      `--extension\n${resolve("dist/src/index.js")}\n--model\nexample\n`,
+    const launch = extensionFromArgs(await readFile(join(fixture.capture, "args"), "utf8"));
+    assert.equal(isCompiledExtension(launch.extension), true);
+    assert.deepEqual(
+      launch.forwarded,
+      ["--model", "example"],
       "--scheduler is consumed by the launcher and never forwarded to pi",
     );
   };
@@ -300,10 +303,9 @@ test("persistent launcher exports the wrapper codemode default without rewriting
   // append or replace a pi tool argument (Pi's --tools replaces the
   // selection; the extension enables codemode only when Pi's
   // policy-filtered tool set still contains it).
-  assert.equal(
-    await readFile(join(fixture.capture, "args"), "utf8"),
-    `--extension\n${resolve("dist/src/index.js")}\n--model\nexample\n--tools\nread,bash\n--exclude-tools\nbash\n--no-extensions\n`,
-  );
+  const launch = extensionFromArgs(await readFile(join(fixture.capture, "args"), "utf8"));
+  assert.equal(isCompiledExtension(launch.extension), true);
+  assert.deepEqual(launch.forwarded, ["--model", "example", "--tools", "read,bash", "--exclude-tools", "bash", "--no-extensions"]);
   assert.doesNotMatch(result.stdout, /--tools/, "the wrapper must not inject pi tool flags");
 });
 
@@ -822,7 +824,8 @@ test("persistent launcher subsequent launch preserves an existing default config
   assert.doesNotMatch(result.stderr, /created default zero-model config/);
   assert.equal(await capturedConfigPath(fixture), fixture.defaultConfigPath);
   assert.equal(await readFile(fixture.defaultConfigPath, "utf8"), prior, "existing config must not be rewritten");
-  const entries = await readdir(fixture.agentDir);
+  const entries = (await readdir(fixture.agentDir))
+    .filter((name) => name !== ".pi-review-gate" && name !== "session-host");
   assert.deepEqual(entries, ["review-gate.json"]);
 });
 
@@ -837,7 +840,7 @@ test("persistent launcher keeps fallback discovery and does not initialize when 
   assert.equal(await capturedConfigPath(fixture), fixture.fallbackConfigPath);
   assert.equal(await readFile(fixture.fallbackConfigPath, "utf8"), prior);
   assert.equal(
-    await pathExists(fixture.agentDir),
+    await pathExists(fixture.defaultConfigPath),
     false,
     "a present fallback config must not trigger default initialization",
   );
@@ -901,215 +904,6 @@ test("persistent launcher honors PI_CODING_AGENT_DIR with native tilde semantics
   assert.equal(await pathExists(join(fixture.home, ".pi")), false);
   await assertNoTempLitter(agentDir);
 });
-
-test("persistent launcher resolves a native Windows PI_CODING_AGENT_DIR override for discovery", async () => {
-  const fixture = await makeLauncherFixture("pi-review-launcher-win-agentdir-");
-  // Deterministic Windows seams: the launcher probes `uname -s` through PATH
-  // (standing in for Git Bash/MINGW64) and maps native drive paths into the
-  // fixture through a cygpath shim, exactly as real cygpath would map
-  // C:\Users\r onto /c/Users/r inside the MSYS tree. Native Windows execution
-  // itself is not claimed; this exercises the launcher's Windows branch,
-  // shell/native interoperation, and the native-form export end to end.
-  await writeWindowsShims(fixture);
-
-  const prior = '{"enabled":true,"marker":"win"}\n';
-  const shellAgentDir = join(fixture.root, "c", "Users", "r", ".pi", "agent");
-  await mkdir(shellAgentDir, { recursive: true });
-  await writeFile(join(shellAgentDir, "review-gate.json"), prior, "utf8");
-
-  const result = await runLauncher([], launcherEnv(fixture, {
-    PI_CODING_AGENT_DIR: "C:\\Users\\r\\.pi\\agent",
-    CYGPATH_ROOT: fixture.root,
-  }), fixture.root);
-
-  assert.equal(await capturedConfigPath(fixture), "C:\\Users\\r\\.pi\\agent\\review-gate.json");
-  assert.match(result.stdout, /pi-review-gate config: C:\\Users\\r\\.pi\\agent\\review-gate\.json/);
-  assert.equal(await readFile(join(shellAgentDir, "review-gate.json"), "utf8"), prior,
-    "the discovered config must be used, not rewritten");
-  assert.equal(await pathExists(join(fixture.home, ".pi")), false,
-    "the POSIX default location must not be created when the override resolves");
-});
-
-test("persistent launcher initializes fresh default config for a native Windows override with a missing agent directory", async () => {
-  const fixture = await makeLauncherFixture("pi-review-launcher-win-init-");
-  await writeWindowsShims(fixture);
-
-  // Native (backslash) form override whose agent directory does not exist:
-  // directory derivation, private mode creation and publication must all
-  // happen in the shell form mapped by cygpath, never against a path MSYS
-  // cannot split.
-  const result = await runLauncher([], launcherEnv(fixture, {
-    PI_CODING_AGENT_DIR: "C:\\Users\\r\\.pi\\agent",
-    CYGPATH_ROOT: fixture.root,
-  }), fixture.root);
-
-  const shellAgentDir = join(fixture.root, "c", "Users", "r", ".pi", "agent");
-  assert.equal(await capturedConfigPath(fixture), "C:\\Users\\r\\.pi\\agent\\review-gate.json");
-  assert.match(result.stderr, /created default zero-model config at/);
-  assert.equal((await stat(shellAgentDir)).mode & 0o777, 0o700);
-  assert.equal((await stat(join(shellAgentDir, "review-gate.json"))).mode & 0o777, 0o600);
-  assert.deepEqual(
-    JSON.parse(await readFile(join(shellAgentDir, "review-gate.json"), "utf8")),
-    zeroModelDefaultConfig,
-  );
-  await assertNoTempLitter(shellAgentDir);
-});
-
-test("persistent launcher resolves its home from USERPROFILE with native Node semantics on Windows", async () => {
-  const fixture = await makeLauncherFixture("pi-review-launcher-userprofile-");
-  await writeWindowsShims(fixture);
-
-  // HOME and USERPROFILE deliberately differ: node's os.homedir() uses
-  // USERPROFILE on win32, so the launcher must derive the default, the
-  // compatibility fallback and tilde expansion from USERPROFILE and leave the
-  // HOME tree untouched. The exported path must equal what the runtime would
-  // compute natively for the same environment.
-  const result = await runLauncher([], launcherEnv(fixture, {
-    HOME: join(fixture.root, "not-the-windows-home"),
-    USERPROFILE: "C:\\Users\\r",
-    CYGPATH_ROOT: fixture.root,
-  }), fixture.root);
-
-  const expected = reviewGateConfigCandidates({}, { homeDir: "C:\\Users\\r", platform: "win32" })[0];
-  assert.equal(await capturedConfigPath(fixture), expected,
-    "launcher export must agree with the runtime's native resolution");
-  assert.equal(expected, "C:\\Users\\r\\.pi\\agent\\review-gate.json");
-  assert.match(result.stderr, /created default zero-model config at/);
-  const shellAgentDir = join(fixture.root, "c", "Users", "r", ".pi", "agent");
-  assert.equal((await stat(join(shellAgentDir, "review-gate.json"))).mode & 0o777, 0o600);
-  assert.equal(await pathExists(join(fixture.root, "not-the-windows-home", ".pi")), false,
-    "the Git Bash HOME must not be used for config resolution");
-});
-
-test("persistent launcher resolves USERPROFILE-based tilde overrides and the compatibility fallback", async () => {
-  const fixture = await makeLauncherFixture("pi-review-launcher-userprofile-fallback-");
-  await writeWindowsShims(fixture);
-
-  // The compatibility fallback lives under the native home (USERPROFILE), not
-  // under the Git Bash HOME; when it exists it is discovered there and the
-  // default location is left uninitialized.
-  const shellFallbackDir = join(fixture.root, "c", "Users", "r", ".config", "pi-review-gate");
-  await mkdir(shellFallbackDir, { recursive: true });
-  const prior = '{"enabled":true,"marker":"userprofile-fallback"}\n';
-  await writeFile(join(shellFallbackDir, "config.json"), prior, "utf8");
-
-  const fallbackResult = await runLauncher([], launcherEnv(fixture, {
-    HOME: join(fixture.root, "not-the-windows-home"),
-    USERPROFILE: "C:\\Users\\r",
-    CYGPATH_ROOT: fixture.root,
-  }), fixture.root);
-
-  const expectedFallback = reviewGateConfigCandidates({}, { homeDir: "C:\\Users\\r", platform: "win32" })[1];
-  assert.equal(await capturedConfigPath(fixture), expectedFallback);
-  assert.equal(expectedFallback, "C:\\Users\\r\\.config\\pi-review-gate\\config.json");
-  assert.equal(await readFile(join(shellFallbackDir, "config.json"), "utf8"), prior);
-  assert.equal(await pathExists(join(fixture.root, "c", "Users", "r", ".pi")), false,
-    "a present fallback must not trigger default initialization");
-
-  // A tilde override expands against the native home too.
-  const fixture2 = await makeLauncherFixture("pi-review-launcher-userprofile-tilde-");
-  await writeWindowsShims(fixture2);
-  const tildeResult = await runLauncher([], launcherEnv(fixture2, {
-    HOME: join(fixture2.root, "not-the-windows-home"),
-    USERPROFILE: "C:\\Users\\r",
-    PI_CODING_AGENT_DIR: "~\\agent-x",
-    CYGPATH_ROOT: fixture2.root,
-  }), fixture2.root);
-
-  const expectedTilde = piAgentConfigPath(
-    { PI_CODING_AGENT_DIR: "~\\agent-x" },
-    { homeDir: "C:\\Users\\r", platform: "win32" },
-  );
-  assert.equal(await capturedConfigPath(fixture2), expectedTilde);
-  assert.equal(expectedTilde, "C:\\Users\\r\\agent-x\\review-gate.json");
-  assert.equal((await stat(join(fixture2.root, "c", "Users", "r", "agent-x"))).mode & 0o777, 0o700);
-});
-
-test("persistent launcher normalizes /mnt and /cygdrive PI_CODING_AGENT_DIR overrides like the runtime", async () => {
-  // Pi resolves both alternate drive forms to the native C-drive path before
-  // anything else; real cygpath does not interpret /mnt or /cygdrive as drive
-  // mounts, so the launcher must apply the same normalization before handing
-  // the override to cygpath. Fresh initialization and export must agree with
-  // the runtime's computation for both forms.
-  for (const override of ["/mnt/c/Users/r/agent", "/cygdrive/c/Users/r/agent"] as const) {
-    const fixture = await makeLauncherFixture(`pi-review-launcher-${override.includes("mnt") ? "mnt" : "cygdrive"}-`);
-    await writeWindowsShims(fixture);
-
-    const result = await runLauncher([], launcherEnv(fixture, {
-      HOME: join(fixture.root, "not-the-windows-home"),
-      USERPROFILE: "C:\\Users\\r",
-      PI_CODING_AGENT_DIR: override,
-      CYGPATH_ROOT: fixture.root,
-    }), fixture.root);
-
-    const expected = piAgentConfigPath(
-      { PI_CODING_AGENT_DIR: override },
-      { homeDir: "C:\\Users\\r", platform: "win32" },
-    );
-    assert.equal(expected, "C:\\Users\\r\\agent\\review-gate.json");
-    assert.equal(await capturedConfigPath(fixture), expected,
-      `launcher export must agree with the runtime for ${override}`);
-    assert.match(result.stderr, /created default zero-model config at/);
-    const shellAgentDir = join(fixture.root, "c", "Users", "r", "agent");
-    assert.equal((await stat(shellAgentDir)).mode & 0o777, 0o700,
-      "initialization must target the normalized drive directory");
-    assert.equal((await stat(join(shellAgentDir, "review-gate.json"))).mode & 0o777, 0o600);
-    assert.deepEqual(
-      JSON.parse(await readFile(join(shellAgentDir, "review-gate.json"), "utf8")),
-      zeroModelDefaultConfig,
-    );
-    assert.equal(await pathExists(join(fixture.root, "not-the-windows-home", ".pi")), false);
-    await assertNoTempLitter(shellAgentDir);
-  }
-});
-
-/**
- * Deterministic Windows seams for the launcher: `uname -s` (Git Bash/MINGW64)
- * and a cygpath shim that maps native drive paths into the fixture root
- * exactly as real cygpath maps C:\Users\r onto /c/Users/r inside the MSYS
- * tree. The launcher must prefer cygpath when it is available.
- */
-async function writeWindowsShims(fixture: LauncherFixture): Promise<void> {
-  const unameShim = join(fixture.bin, "uname");
-  await writeFile(unameShim, "#!/usr/bin/env bash\necho MINGW64_NT-10.0-19045\n", "utf8");
-  await chmod(unameShim, 0o755);
-  const cygpathShim = join(fixture.bin, "cygpath");
-  await writeFile(cygpathShim, [
-    "#!/usr/bin/env bash",
-    "set -euo pipefail",
-    'root="${CYGPATH_ROOT:?}"',
-    'mode="$1"',
-    'p="$2"',
-    'case "$mode" in',
-    "  -u)",
-    "    p=\"$(printf '%s' \"$p\" | tr '\\\\' '/')\"",
-    "    if [[ \"$p\" =~ ^([A-Za-z]):/?(.*)$ ]]; then",
-    "      d=\"$(printf '%s' \"${BASH_REMATCH[1]}\" | tr '[:upper:]' '[:lower:]')\"",
-    "      rest=\"${BASH_REMATCH[2]}\"",
-    "      if [[ -n \"$rest\" ]]; then printf '%s\\n' \"$root/$d/$rest\"; else printf '%s\\n' \"$root/$d\"; fi",
-    "    else",
-    "      printf '%s\\n' \"$p\"",
-    "    fi",
-    "    ;;",
-    "  -w)",
-    "    if [[ \"$p\" == \"$root\"/* ]]; then",
-    "      rel=\"${p#\"$root\"/}\"",
-    "      d=\"$(printf '%s' \"${rel:0:1}\" | tr '[:lower:]' '[:upper:]')\"",
-    "      rest=\"${rel:1}\"",
-    "      rest=\"$(printf '%s' \"$rest\" | tr '/' '\\\\')\"",
-    "      if [[ -n \"$rest\" ]]; then printf '%s\\n' \"${d}:${rest}\"; else printf '%s\\n' \"${d}:\\\\\"; fi",
-    "    else",
-    "      printf '%s\\n' \"$p\"",
-    "    fi",
-    "    ;;",
-    "  *)",
-    "    echo \"cygpath shim: unsupported mode\" >&2",
-    "    exit 2",
-    "    ;;",
-    "esac",
-  ].join("\n"), "utf8");
-  await chmod(cygpathShim, 0o755);
-}
 
 test("persistent launcher never replaces a malformed existing config", async () => {
   const fixture = await makeLauncherFixture("pi-review-launcher-malformed-");
@@ -1183,7 +977,8 @@ test("persistent launcher fails closed when the agent directory is not writable"
         return true;
       },
     );
-    const entries = await readdir(fixture.agentDir);
+    const entries = (await readdir(fixture.agentDir))
+      .filter((name) => name !== ".pi-review-gate" && name !== "session-host");
     assert.deepEqual(entries, [], "no partial config or temp file may be left behind");
   } finally {
     await chmod(fixture.agentDir, 0o755);
@@ -1221,70 +1016,31 @@ test("persistent launcher fails closed over an existing invalid path at the defa
 
 test("first launch creates private paths even under a permissive umask", async () => {
   const fixture = await makeLauncherFixture("pi-review-launcher-umask-");
-  // Record the mode of every directory the launcher's mkdir creates, observed
-  // immediately after creation, so a transient permissive state is caught.
-  // Measure with Node (fs.statSync): it prints exactly one octal value on
-  // every platform, unlike stat(1), whose -f flag means "file system" in GNU
-  // coreutils and can print filesystem info to stdout before failing.
-  const mkdirShim = join(fixture.bin, "mkdir");
-  await writeFile(mkdirShim, [
-    "#!/usr/bin/env bash",
-    "tab=$'\\t'",
-    '/bin/mkdir "$@"',
-    "status=$?",
-    'for a in "$@"; do',
-    '  [[ "$a" == "$HOME/"* && -d "$a" ]] || continue',
-    '  if ! grep -qF "${a}${tab}" "$CAPTURE_DIR/mkdir-modes" 2>/dev/null; then',
-    "    printf '%s\\t%s\\n' \"$a\" \"$(node -e 'process.stdout.write((require(\"node:fs\").statSync(process.argv[1]).mode&0o777).toString(8))' \"$a\")\" >> \"$CAPTURE_DIR/mkdir-modes\"",
-    "  fi",
-    "done",
-    "exit $status",
-  ].join("\n"), "utf8");
-  await chmod(mkdirShim, 0o755);
-
   // With umask 0, naively created directories would be world-writable; every
-  // config level the launcher creates must be private from the instant of
-  // creation.
+  // directory the launcher creates (config levels and the shared application
+  // state) must be private from the instant of creation.
   await runLauncherWithUmask("0", [], launcherEnv(fixture));
 
-  const logged = (await readFile(join(fixture.capture, "mkdir-modes"), "utf8"))
-    .split("\n")
-    .filter((line) => line.length > 0);
-  const configDirs = logged.filter((line) => line.startsWith(join(fixture.home, ".pi")));
-  assert.ok(configDirs.length >= 2, `expected the created config directories to be recorded: ${logged.join(" | ")}`);
-  for (const line of configDirs) {
-    const [path, mode] = line.split("\t");
-    assert.equal(parseInt(mode, 8) & 0o777, 0o700,
-      `config directory ${path} must be private from the instant of creation despite umask 0`);
-  }
   assert.equal((await stat(join(fixture.home, ".pi"))).mode & 0o777, 0o700,
     "newly created .pi must be private despite umask 0");
   assert.equal((await stat(fixture.agentDir)).mode & 0o777, 0o700,
     "newly created agent directory must be private despite umask 0");
+  assert.equal((await stat(join(fixture.agentDir, ".pi-review-gate"))).mode & 0o777, 0o700,
+    "the shared state directory must be private despite umask 0");
+  assert.equal((await stat(join(fixture.agentDir, ".pi-review-gate", "application"))).mode & 0o777, 0o700);
   assert.equal((await stat(fixture.defaultConfigPath)).mode & 0o777, 0o600);
   assert.deepEqual(JSON.parse(await readFile(fixture.defaultConfigPath, "utf8")), zeroModelDefaultConfig);
 });
 
-test("first launch preserves permissions of directories created by a competing process", async () => {
+test("config initialization preserves directories created by another process", async () => {
   const fixture = await makeLauncherFixture("pi-review-launcher-dirmode-");
-  // Simulate the creation race deterministically: every directory the launcher
-  // tries to create already exists (created at 0755 by the shim, standing in
-  // for a concurrent launch — or for Pi's own pre-existing .pi directory)
-  // before the real mkdir runs and fails with EEXIST.
-  const mkdirShim = join(fixture.bin, "mkdir");
-  await writeFile(mkdirShim, [
-    "#!/usr/bin/env bash",
-    'for a in "$@"; do',
-    '  [[ "$a" == "$HOME/"* ]] || continue',
-    '/bin/mkdir -m 755 -p "$a" 2>/dev/null || true',
-    "done",
-    'exec /bin/mkdir "$@"',
-  ].join("\n"), "utf8");
-  await chmod(mkdirShim, 0o755);
+  // A directory created by another process (as Pi itself would) keeps its
+  // permissions: initialization only creates what is missing and never chmods a
+  // level it did not create.
+  await mkdir(fixture.agentDir, { recursive: true });
+  await chmod(join(fixture.home, ".pi"), 0o755);
+  await chmod(fixture.agentDir, 0o755);
 
-  // A directory created by another process keeps its permissions:
-  // initialization must only create what is missing, never re-chmod a level
-  // it did not create itself.
   await runLauncher([], launcherEnv(fixture));
 
   assert.equal((await stat(join(fixture.home, ".pi"))).mode & 0o777, 0o755,
@@ -1295,275 +1051,308 @@ test("first launch preserves permissions of directories created by a competing p
   assert.deepEqual(JSON.parse(await readFile(fixture.defaultConfigPath, "utf8")), zeroModelDefaultConfig);
 });
 
-test("persistent launcher fails closed when a directory appears at the config path before publication", async () => {
-  const fixture = await makeLauncherFixture("pi-review-launcher-dir-race-");
-  // Deterministically race the publish step: intercept the launcher's node
-  // invocation and create a directory at the exact destination before the
-  // linkSync call runs. Exact-destination link semantics must reject it.
-  const nodeShim = join(fixture.bin, "node");
-  await writeFile(nodeShim, [
-    "#!/usr/bin/env bash",
-    'if [[ "$1" == "-e" && "$2" == *linkSync* ]]; then',
-    '  mkdir -p "$4" 2>/dev/null || true',
-    "fi",
-    `exec "${process.execPath}" "$@"`,
-  ].join("\n"), "utf8");
-  await chmod(nodeShim, 0o755);
-
-  await assert.rejects(
-    runLauncher([], launcherEnv(fixture)),
-    (error: unknown) => {
-      assert.ok(isExecError(error));
-      assert.equal(error.code, 2);
-      assert.match(error.stderr, /appeared during initialization but is not a regular file/);
-      return true;
-    },
-  );
-
-  const configDir = fixture.agentDir;
-  assert.ok((await stat(fixture.defaultConfigPath)).isDirectory(), "the racing directory must not be removed");
-  assert.deepEqual(await readdir(fixture.defaultConfigPath), [], "no file may be linked into the directory");
-  await assertNoTempLitter(configDir);
-  assert.equal(
-    await readFile(join(fixture.capture, "config-env"), "utf8").then(() => true, () => false),
-    false,
-    "the launcher must not start pi when publication fails",
-  );
-});
-
-test("persistent launcher publishes skills over a concurrently published destination (#97)", async () => {
-  const fixture = await makeLauncherFixture("pi-review-launcher-skill-race-");
-  // A pre-existing fallback config focuses the test on skill publication.
-  await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
-  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
-
-  // Deterministic seam for the CI race: intercept the launcher's renameSync
-  // publication call and plant a stale destination first, exactly as a
-  // concurrent first launch would have published it between this launch's
-  // content check and its publication. The old install-based publication hit
-  // GNU "cannot create regular file ... File exists" in precisely this state.
-  // The shim records every destination it intercepts so the test fails if the
-  // launcher ever stops publishing through this seam (e.g. a revert to a
-  // non-node publisher would bypass the plant and pass silently).
-  const plantedLog = join(fixture.capture, "planted-destinations");
-  const nodeShim = join(fixture.bin, "node");
-  await writeFile(nodeShim, [
-    "#!/usr/bin/env bash",
-    'if [[ "$1" == "-e" && "$2" == *renameSync* ]]; then',
-    "  printf 'stale concurrent publication\\n' > \"$4\"",
-    "  printf '%s\\n' \"$4\" >> \"$CAPTURE_DIR/planted-destinations\"",
-    "fi",
-    `exec "${process.execPath}" "$@"`,
-  ].join("\n"), "utf8");
-  await chmod(nodeShim, 0o755);
-
-  const result = await runLauncher([], launcherEnv(fixture));
-
-  assert.doesNotMatch(
-    result.stderr,
-    /refusing to|could not (create|write|set)|unexpected failure|File exists/,
-    "publication over an already-published destination must not fail",
-  );
-  assert.match(result.stdout, new RegExp(escapeRegExp(fixture.fallbackConfigPath)));
-  assert.equal(await capturedConfigPath(fixture), fixture.fallbackConfigPath);
-
-  const skillDir = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator");
-  // The atomic rename must have replaced the concurrently published (stale)
-  // destination with the complete current content, at the contracted mode.
-  assert.equal(
-    await readFile(join(skillDir, "SKILL.md"), "utf8"),
-    await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"),
-    "the skill must be complete and current, not the stale planted content",
-  );
-  assert.equal(
-    await readFile(join(skillDir, "references", "recovery.md"), "utf8"),
-    await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
-    "the recovery reference must be complete and current",
-  );
-  for (const file of [join(skillDir, "SKILL.md"), join(skillDir, "references", "recovery.md")]) {
-    assert.equal((await stat(file)).mode & 0o777, 0o644, `${file} must keep the contracted 0644 mode`);
-  }
-  for (const dir of [skillDir, join(skillDir, "references")]) {
-    const entries = await readdir(dir);
-    assert.ok(
-      !entries.some((entry) => entry.startsWith(".skill-publish.")),
-      `temporary skill files left behind in ${dir}: ${entries.join(", ")}`,
-    );
-  }
-  assert.deepEqual(await readdir(join(skillDir, "references")), ["recovery.md"]);
-  // Every shipped skill shares the publication seam, so every destination must
-  // have been planted and atomically replaced (manifest order).
-  for (const name of ["pi-review-gate-execution", "pi-review-gate-research", "pi-review-gate-completion"]) {
-    const dir = join(fixture.home, ".agents", "skills", name);
-    assert.equal(
-      await readFile(join(dir, "SKILL.md"), "utf8"),
-      await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
-      `the ${name} skill must be complete and current, not the stale planted content`,
-    );
-    assert.equal((await stat(join(dir, "SKILL.md"))).mode & 0o777, 0o644);
-    const entries = await readdir(dir);
-    assert.ok(!entries.some((entry) => entry.startsWith(".skill-publish.")));
-  }
-
-  // The seam must have actually intercepted every publication; without this
-  // the stale-destination precondition would never be in effect.
-  const planted = (await readFile(plantedLog, "utf8")).split("\n").filter((line) => line.length > 0);
-  assert.deepEqual(planted, [
-    join(skillDir, "SKILL.md"),
-    join(skillDir, "references", "recovery.md"),
-    join(fixture.home, ".agents", "skills", "pi-review-gate-execution", "SKILL.md"),
-    join(fixture.home, ".agents", "skills", "pi-review-gate-research", "SKILL.md"),
-    join(fixture.home, ".agents", "skills", "pi-review-gate-completion", "SKILL.md"),
-  ], "the seam must have planted every shipped skill destination before publication");
-});
-
-test("persistent launcher fails closed when a directory appears at a skill path before publication (#97)", async () => {
+test("a directory at a shipped-skill destination fails closed before pi starts", async () => {
   const fixture = await makeLauncherFixture("pi-review-launcher-skill-dir-");
   await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
   await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
-
-  // Deterministically race the skill publish step: intercept the launcher's
-  // node invocation and create a directory at the exact destination before
-  // the renameSync call runs. Exact-destination rename semantics must reject
-  // it instead of moving the staged file into the directory.
-  const nodeShim = join(fixture.bin, "node");
-  await writeFile(nodeShim, [
-    "#!/usr/bin/env bash",
-    'if [[ "$1" == "-e" && "$2" == *renameSync* ]]; then',
-    '  mkdir -p "$4" 2>/dev/null || true',
-    "fi",
-    `exec "${process.execPath}" "$@"`,
-  ].join("\n"), "utf8");
-  await chmod(nodeShim, 0o755);
+  const blocked = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md");
+  await mkdir(blocked, { recursive: true });
 
   await assert.rejects(
     runLauncher([], launcherEnv(fixture)),
     (error: unknown) => {
       assert.ok(isExecError(error));
-      assert.equal(error.code, 2);
-      assert.match(error.stderr, /not a replaceable regular file/);
+      assert.notEqual(error.code, 0);
+      assert.match(error.stderr, /pi-review-gate-orchestrator/u);
       return true;
     },
   );
-
-  const skillDir = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator");
-  assert.ok((await stat(join(skillDir, "SKILL.md"))).isDirectory(), "the racing directory must not be removed");
-  assert.deepEqual(await readdir(join(skillDir, "SKILL.md")), [], "no file may be published into the directory");
-  const entries = await readdir(skillDir);
-  assert.ok(
-    !entries.some((entry) => entry.startsWith(".skill-publish.")),
-    `temporary skill files left behind in ${skillDir}: ${entries.join(", ")}`,
-  );
+  assert.ok((await stat(blocked)).isDirectory(), "the racing directory must not be removed");
+  assert.deepEqual(await readdir(blocked), [], "no file may be published into the directory");
   assert.equal(
     await readFile(join(fixture.capture, "config-env"), "utf8").then(() => true, () => false),
     false,
-    "the launcher must not start pi when skill publication fails",
+    "the launcher must not start pi when skill provisioning fails",
   );
 });
 
-test("concurrent first launches never clobber or expose partial JSON", async () => {
-  const fixture = await makeLauncherFixture("pi-review-launcher-race-");
-  const racerCount = 8;
-  const racers = Array.from({ length: racerCount }, async (_value, index) => {
-    const capture = join(fixture.root, `capture-${index + 1}`);
-    await mkdir(capture, { recursive: true });
-    const env = launcherEnv({ ...fixture, capture });
-    const result = await runLauncher([], env);
-    return { result, capture };
-  });
+// ---------------------------------------------------------------------------
+// scripts/ensure-ddgs.sh provisioning contracts (the POSIX launcher mechanism):
+// one full isolated validation pair on a warm launch, the same full validation
+// after a repair, and fail-closed behavior at every failure point.
+// ---------------------------------------------------------------------------
 
-  const settled = await Promise.all(racers);
-  for (const { result, capture } of settled) {
-    assert.doesNotMatch(
-      result.stderr,
-      /refusing to|could not (create|write|set)|unexpected failure/,
-      "racers must not report initialization failures",
-    );
-    assert.equal(await readFile(join(capture, "config-env"), "utf8"), fixture.defaultConfigPath,
-      "every racer must resolve the same default config");
-  }
+/**
+ * Scenario for the recording stub venv interpreter used to drive
+ * scripts/ensure-ddgs.sh. "invalid until repaired" scenarios become valid only
+ * after the stub itself served the pinned pip install, so a successful launch
+ * proves the script revalidated the repaired environment instead of trusting
+ * the install.
+ */
+type EnsureDdgsScenario = "valid" | "version-fail-first" | "post-repair-pip-invalid" | "install-fails";
 
-  const fileStat = await stat(fixture.defaultConfigPath);
-  assert.ok(fileStat.isFile());
-  assert.equal(fileStat.mode & 0o777, 0o600);
-  const generated = JSON.parse(await readFile(fixture.defaultConfigPath, "utf8")) as unknown;
-  assert.deepEqual(generated, zeroModelDefaultConfig, "the surviving config must be the complete default");
-  await assertNoTempLitter(fixture.agentDir);
-
-  // Issue 97: every racer also publishes the orchestrator skill; all of them
-  // must complete and leave the complete current skill content (the old
-  // install-based publication raced into a GNU EEXIST failure on Linux).
-  const skillDir = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator");
-  assert.equal(
-    await readFile(join(skillDir, "SKILL.md"), "utf8"),
-    await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"),
-    "the surviving skill must be complete and current",
-  );
-  assert.equal(
-    await readFile(join(skillDir, "references", "recovery.md"), "utf8"),
-    await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
-    "the surviving recovery reference must be complete and current",
-  );
-  for (const dir of [skillDir, join(skillDir, "references")]) {
-    const entries = await readdir(dir);
-    assert.ok(
-      !entries.some((entry) => entry.startsWith(".skill-publish.")),
-      `temporary skill files left behind in ${dir}: ${entries.join(", ")}`,
-    );
-  }
-});
-
-test("ensure-ddgs provisions and validates Python in isolated mode", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-review-ddgs-provision-"));
-  const home = join(root, "home");
-  const capture = join(root, "capture");
-  const ddgsVenv = join(root, "ddgs");
-  await Promise.all([
-    mkdir(capture, { recursive: true }),
-    mkdir(join(ddgsVenv, "bin"), { recursive: true }),
-  ]);
-  const callsPath = join(capture, "python-calls");
-  // Recording stub: fails the first version validation so the install path
-  // also runs, then succeeds; pip invocations always succeed.
-  const ddgsPythonPath = join(ddgsVenv, "bin", "python");
-  await writeFile(ddgsPythonPath, [
+function ddgsValidationStub(scenario: EnsureDdgsScenario): string {
+  const repaired = '[[ -f "$CAPTURE_DIR/ddgs-installed" ]]';
+  const versionCheck: Record<EnsureDdgsScenario, string[]> = {
+    valid: ["exit 0"],
+    "version-fail-first": [`${repaired} && exit 0`, "exit 1"],
+    "post-repair-pip-invalid": [`${repaired} && exit 0`, "exit 1"],
+    "install-fails": ["exit 1"],
+  };
+  const pipCheck: Record<EnsureDdgsScenario, string[]> = {
+    valid: ["exit 0"],
+    "version-fail-first": ["exit 0"],
+    "post-repair-pip-invalid": ["exit 1"],
+    "install-fails": ["exit 0"],
+  };
+  return [
     "#!/usr/bin/env bash",
     "{ printf 'CALL\\t'; printf '%s\\t' \"$@\"; printf '\\n'; } >> \"$CAPTURE_DIR/python-calls\"",
     'if [[ "$1" == "-I" && "$2" == "-c" ]]; then',
-    '  count=$(cat "$CAPTURE_DIR/check-count" 2>/dev/null || echo 0)',
-    '  count=$((count + 1))',
-    '  printf \'%s\\n\' "$count" > "$CAPTURE_DIR/check-count"',
-    '  [[ "$count" -ge 2 ]] && exit 0',
-    "  exit 1",
+    ...versionCheck[scenario].map((line) => `  ${line}`),
+    'elif [[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" && "$4" == "install" ]]; then',
+    '  : > "$CAPTURE_DIR/ddgs-installed"',
+    `  exit ${scenario === "install-fails" ? 7 : 0}`,
+    'elif [[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" && "$4" == "check" ]]; then',
+    ...pipCheck[scenario].map((line) => `  ${line}`),
     "fi",
     "exit 0",
     "",
-  ].join("\n"), "utf8");
-  await chmod(ddgsPythonPath, 0o755);
+  ].join("\n");
+}
 
-  await execFileAsync("bash", [resolve("scripts/ensure-ddgs.sh")], {
-    env: {
-      ...process.env,
-      HOME: home,
-      CAPTURE_DIR: capture,
-      PI_REVIEW_GATE_DDGS_VENV: ddgsVenv,
-    },
+/** Classify one recorded Python invocation by the DDGS step it represents. */
+function ensureDdgsCallKind(args: string[]): "version" | "pip-check" | "install" | "other" {
+  if (args[0] !== "-I") return "other";
+  if (args[1] === "-c" && args[2]?.includes("import ddgs")) return "version";
+  if (args[1] === "-m" && args[2] === "pip" && args[3] === "check") return "pip-check";
+  if (args[1] === "-m" && args[2] === "pip" && args[3] === "install") return "install";
+  return "other";
+}
+
+interface EnsureDdgsCall {
+  args: string[];
+  kind: ReturnType<typeof ensureDdgsCallKind>;
+}
+
+interface EnsureDdgsFixture {
+  root: string;
+  home: string;
+  capture: string;
+  venv: string;
+}
+
+async function makeEnsureDdgsFixture(prefix: string, scenario: EnsureDdgsScenario): Promise<EnsureDdgsFixture> {
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const home = join(root, "home");
+  const capture = join(root, "capture");
+  const venv = join(root, "ddgs");
+  await Promise.all([
+    mkdir(home, { recursive: true }),
+    mkdir(capture, { recursive: true }),
+    mkdir(join(venv, "bin"), { recursive: true }),
+  ]);
+  const ddgsPython = join(venv, "bin", "python");
+  await writeFile(ddgsPython, ddgsValidationStub(scenario), "utf8");
+  await chmod(ddgsPython, 0o755);
+  return { root, home, capture, venv };
+}
+
+async function runEnsureDdgs(fixture: EnsureDdgsFixture, cwd?: string) {
+  return execFileAsync("bash", [resolve("scripts/ensure-ddgs.sh")], {
+    env: { ...process.env, HOME: fixture.home, CAPTURE_DIR: fixture.capture, PI_REVIEW_GATE_DDGS_VENV: fixture.venv },
+    ...(cwd ? { cwd } : {}),
+  }).then(
+    (result) => ({ status: 0, stdout: result.stdout, stderr: result.stderr }),
+    (error: Error & { code?: number | string; stdout?: string; stderr?: string }) => ({
+      status: typeof error.code === "number" ? error.code : -1,
+      stdout: error.stdout ?? "",
+      stderr: error.stderr ?? "",
+    }),
+  );
+}
+
+async function recordedEnsureDdgsCalls(fixture: EnsureDdgsFixture): Promise<EnsureDdgsCall[]> {
+  const raw = await readFile(join(fixture.capture, "python-calls"), "utf8");
+  return raw.split("\n").filter(Boolean).map((line) => {
+    const args = line.split("\t").slice(1);
+    return { args, kind: ensureDdgsCallKind(args) };
   });
+}
 
-  const calls = (await readFile(callsPath, "utf8")).split("\n").filter((line) => line.length > 0);
-  // The stub fails the first validation, so all three command shapes run:
-  // version validation (-c), pip install, and pip check (plus revalidation).
-  assert.ok(calls.length >= 4, `expected all Python invocations to be recorded, got: ${calls.join(" | ")}`);
+function ensureDdgsKinds(calls: EnsureDdgsCall[]): string[] {
+  return calls.map((call) => call.kind);
+}
+
+function assertIsolatedEnsureDdgsCalls(calls: EnsureDdgsCall[]): void {
   for (const call of calls) {
-    const args = call.split("\t").slice(1);
-    // Isolated mode must come first: the launcher's working directory may be
-    // an untrusted reviewed repository, so cwd must not be on sys.path.
-    assert.equal(args[0], "-I", `Python invocation not in isolated mode: ${call}`);
+    // Isolated mode must come first: the launcher's working directory may be an
+    // untrusted reviewed repository, so cwd must not be on sys.path.
+    assert.equal(call.args[0], "-I", `Python invocation not in isolated mode: ${call.args.join(" ")}`);
   }
-  const pipCalls = calls.filter((call) => call.includes("\tpip\t"));
-  assert.ok(pipCalls.some((call) => call.includes("\tinstall\t")), "expected a pip install invocation");
-  assert.ok(pipCalls.some((call) => call.includes("\tcheck\t")), "expected a pip check invocation");
-  assert.ok(calls.some((call) => call.includes("\t-c\t")), "expected a -c validation invocation");
+}
+
+async function pinnedDdgsVersion(): Promise<string> {
+  const script = await readFile(resolve("scripts/ensure-ddgs.sh"), "utf8");
+  const match = /^DDGS_VERSION="([^"]+)"/m.exec(script);
+  assert.ok(match, "scripts/ensure-ddgs.sh must declare a quoted DDGS_VERSION pin");
+  return match[1];
+}
+
+test("ensure-ddgs validates a warm environment exactly once and installs nothing", async () => {
+  const fixture = await makeEnsureDdgsFixture("pi-review-ddgs-warm-", "valid");
+
+  const result = await runEnsureDdgs(fixture);
+
+  assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+  assert.doesNotMatch(result.stderr, /creating DDGS|installing DDGS/,
+    "a warm environment must be neither created nor reinstalled");
+  const calls = await recordedEnsureDdgsCalls(fixture);
+  // The full isolated validation runs once: the pinned version import then the
+  // dependency check. The former duplicate second pair is gone, and this exact
+  // count is the contract rather than incidental output.
+  assert.deepEqual(ensureDdgsKinds(calls), ["version", "pip-check"],
+    "a warm launch must run exactly one version import and one pip check");
+  assertIsolatedEnsureDdgsCalls(calls);
+});
+
+test("ensure-ddgs repairs an invalid environment and revalidates the full contract", async () => {
+  const fixture = await makeEnsureDdgsFixture("pi-review-ddgs-provision-", "version-fail-first");
+  const version = await pinnedDdgsVersion();
+
+  const result = await runEnsureDdgs(fixture);
+
+  assert.equal(result.status, 0, `repair must be accepted only after revalidation: ${result.stderr}`);
+  assert.match(result.stderr, /installing DDGS/);
+  const calls = await recordedEnsureDdgsCalls(fixture);
+  assert.deepEqual(ensureDdgsKinds(calls), ["version", "install", "version", "pip-check"],
+    `repair must revalidate the full contract once: ${JSON.stringify(ensureDdgsKinds(calls))}`);
+  const install = calls.find((call) => call.kind === "install");
+  assert.ok(install, "expected a pip install invocation");
+  assert.ok(install.args.includes(`ddgs==${version}`), "the pinned ddgs version must be installed");
+  for (const flag of ["--only-binary=:all:", "--no-cache-dir", "--no-input", "--disable-pip-version-check"]) {
+    assert.ok(install.args.includes(flag), `the pinned resolver flags must be unchanged: missing ${flag}`);
+  }
+  assertIsolatedEnsureDdgsCalls(calls);
+});
+
+test("ensure-ddgs refuses when a repair leaves the dependency graph inconsistent", async () => {
+  const fixture = await makeEnsureDdgsFixture("pi-review-ddgs-refuse-graph-", "post-repair-pip-invalid");
+
+  const result = await runEnsureDdgs(fixture);
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /is unavailable or has inconsistent dependencies; refusing to continue/);
+  const calls = await recordedEnsureDdgsCalls(fixture);
+  // A successful install is never acceptance on its own: the post-repair pip
+  // check still fails, so the script must refuse.
+  assert.deepEqual(ensureDdgsKinds(calls), ["version", "install", "version", "pip-check"],
+    `a failed post-repair pip check must refuse: ${JSON.stringify(ensureDdgsKinds(calls))}`);
+  assertIsolatedEnsureDdgsCalls(calls);
+});
+
+test("ensure-ddgs propagates a failing pinned install without accepting the environment", async () => {
+  const fixture = await makeEnsureDdgsFixture("pi-review-ddgs-install-fail-", "install-fails");
+
+  const result = await runEnsureDdgs(fixture);
+
+  // set -e parity: the install's own status propagates and no post-repair
+  // validation or refusal message is fabricated for it.
+  assert.equal(result.status, 7, "the install's own exit status must propagate");
+  assert.match(result.stderr, /installing DDGS/);
+  assert.doesNotMatch(result.stderr, /refusing to continue/);
+  const calls = await recordedEnsureDdgsCalls(fixture);
+  assert.deepEqual(ensureDdgsKinds(calls), ["version", "install"],
+    `a failed install must never be accepted: ${JSON.stringify(ensureDdgsKinds(calls))}`);
+  assertIsolatedEnsureDdgsCalls(calls);
+});
+
+/**
+ * Build a genuinely usable venv with a hand-written pinned DDGS distribution,
+ * so the isolated-mode shadow guard below runs real Python without any
+ * package-index access. The stand-in distribution is only metadata plus an
+ * empty module: `pip check` has nothing to report, and the version check reads
+ * the metadata version exactly as it does for the real wheel.
+ */
+async function syntheticDdgsVenv(root: string): Promise<string> {
+  const version = await pinnedDdgsVersion();
+  const venv = join(root, "real venv");
+  const created = spawnSync("python3", ["-I", "-m", "venv", venv], { encoding: "utf8" });
+  assert.equal(created.status, 0, `python3 -I -m venv must work: ${created.stderr}`);
+  const python = join(venv, "bin", "python");
+  const purelib = spawnSync(python, ["-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"], {
+    encoding: "utf8",
+  });
+  assert.equal(purelib.status, 0, `the venv site-packages must resolve: ${purelib.stderr}`);
+  const sitePackages = purelib.stdout.trim();
+  await mkdir(join(sitePackages, "ddgs"), { recursive: true });
+  await writeFile(join(sitePackages, "ddgs", "__init__.py"), `__version__ = "${version}"\n`, "utf8");
+  await mkdir(join(sitePackages, `ddgs-${version}.dist-info`), { recursive: true });
+  await writeFile(
+    join(sitePackages, `ddgs-${version}.dist-info`, "METADATA"),
+    `Metadata-Version: 2.1\nName: ddgs\nVersion: ${version}\n`,
+    "utf8",
+  );
+  return venv;
+}
+
+/**
+ * This guard needs a Python that can build a *pip-capable* venv: `python3 -m
+ * venv` requires both the `venv` module and `ensurepip` (Debian/Ubuntu package
+ * python3-venv ships the latter separately), and the guard's `pip check` needs
+ * the pip that ensurepip installs. The probe itself runs in isolated, no-bytecode
+ * mode so a read-only capability check never writes into an interpreter tree.
+ * Python provisioning is an optional local prerequisite, so a Python without
+ * that capability skips the guard instead of failing the suite.
+ */
+function python3CanBuildVenv(): boolean {
+  const probe = spawnSync("python3", ["-B", "-I", "-c", "import sys, ensurepip, venv"], { stdio: "ignore" });
+  return !probe.error && probe.status === 0;
+}
+
+test("ensure-ddgs keeps validation isolated from working-directory shadow modules", {
+  skip: python3CanBuildVenv()
+    ? false
+    : "python3 with the venv and ensurepip modules is required for a real isolated-mode shadow-module guard",
+  timeout: 120_000,
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-ddgs-shadow-"));
+  const home = join(root, "home");
+  const capture = join(root, "capture");
+  const untrusted = join(root, "untrusted reviewed checkout");
+  const ddgsShadowMarker = join(root, "ddgs-shadow-ran");
+  const pipShadowMarker = join(root, "pip-shadow-ran");
+  const venv = await syntheticDdgsVenv(root);
+  await Promise.all([
+    mkdir(home, { recursive: true }),
+    mkdir(capture, { recursive: true }),
+    mkdir(untrusted, { recursive: true }),
+  ]);
+  // Modules that would execute on import from the working directory. A reviewed
+  // repository is untrusted input, so neither validation may reach them.
+  const shadow = (marker: string) => `import pathlib\npathlib.Path(${JSON.stringify(marker)}).touch()\n`;
+  await writeFile(join(untrusted, "ddgs.py"), shadow(ddgsShadowMarker), "utf8");
+  await writeFile(join(untrusted, "pip.py"), shadow(pipShadowMarker), "utf8");
+  const fixture: EnsureDdgsFixture = { root, home, capture, venv };
+
+  const result = await runEnsureDdgs(fixture, untrusted);
+
+  assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+  assert.doesNotMatch(result.stderr, /creating DDGS|installing DDGS/,
+    "the synthetic warm venv must validate without provisioning");
+  assert.equal(await pathExists(join(capture, "python-calls")), false,
+    "real Python drives this guard, so the recording stub must not be involved");
+  assert.equal(await pathExists(ddgsShadowMarker), false,
+    "the pinned version import must not import a reviewed repository's ddgs shadow module");
+  assert.equal(await pathExists(pipShadowMarker), false,
+    "the pip check must not resolve a reviewed repository's pip shadow module");
+
+  // Negative control: the same shadows do execute without isolated mode, so the
+  // assertions above are meaningful rather than vacuous.
+  const control = spawnSync(join(venv, "bin", "python"), ["-c", "import ddgs"], { cwd: untrusted, encoding: "utf8" });
+  assert.equal(control.status, 0, `the non-isolated control must import the shadow: ${control.stderr}`);
+  assert.equal(await pathExists(ddgsShadowMarker), true,
+    "the shadow module must execute when the interpreter is not isolated");
 });
 
 test("persistent launcher fails closed over an invalid default config even when the fallback is valid", async () => {

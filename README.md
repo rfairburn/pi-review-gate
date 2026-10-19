@@ -121,9 +121,10 @@ receipts of exactly what the model was told.
   [Security model](docs/security-model.md#secrets-and-authentication).
 
 Two web-tool dependencies sit outside the npm tree: `WebSearch` needs a user-installed
-Python 3 interpreter (`python3`, or also `python` on Windows), and the launcher creates and validates the pinned
-DDGS venv for it at launch (creating or repairing that venv needs package-index access;
-a valid cached environment starts offline). `npm install` downloads Playwright's
+Python 3 interpreter (`python3`, or also `python`/`py -3` on Windows). Launchers set up
+and validate the pinned DDGS venv when its readiness state is missing or outdated;
+current launches reuse it without Python setup checks. Creating or repairing that venv
+needs package-index access; a current cached environment starts offline. `npm install` downloads Playwright's
 Chromium for `BrowserExtract` and the interactive browser tools unless skipped.
 `WebFetch` needs neither. The full inventory, including what is user-installed versus
 automatic, lives in [Getting started](docs/getting-started.md#prerequisites), along
@@ -167,10 +168,12 @@ in one terminal on macOS/Linux. It does not replace either launcher; see the
 [session-host alpha guide](docs/session-host-alpha.md) for requirements, limitations,
 and the host-only shortcut configuration/editor.
 Launch it with the one-command entry points. They retain a supported Node on PATH or
-bootstrap the source-pinned official Node.js 22.19.0 archive into a fresh extraction
-under an isolated per-agent cache when Node is missing or too old (macOS/Linux x64 or
-arm64; Windows x64, arm64, or x86). Each fallback launch re-extracts rather than
-reusing an existing cache runtime; this does not replace a global Node install or
+bootstrap the source-pinned official Node.js 22.19.0 archive under an isolated per-agent
+cache when Node is missing or too old (macOS/Linux x64 or
+arm64; Windows x64, arm64, or x86). The pinned archive digest is verified and freshly
+extracted on installation/update; a previously completed fallback runtime is reused when
+it is still current, so later fallback launches do not download or extract again. This
+does not replace a global Node install or
 change normal user configuration. The launcher also resolves (or provisions) the public
 Pi runtime automatically — no manual Pi CLI path is needed. The `.cmd` entry point
 performs the Node bootstrap. Experimental same-machine Windows source paths for the

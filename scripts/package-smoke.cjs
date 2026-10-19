@@ -392,6 +392,13 @@ function smokeInstalledWebLauncher(installed) {
       'const fs = require("node:fs");',
       'const path = require("node:path");',
       'const args = process.argv.slice(2);',
+      // The wrapper runs the shared preparation authority through `node` first;
+      // that step must execute for real (packaged mode installs/compiles nothing).
+      'if (args[0] && args[0].endsWith("prepare-application.cjs")) {',
+      '  const { spawnSync } = require("node:child_process");',
+      `  const prepared = spawnSync(${JSON.stringify(process.execPath)}, [args[0], ...args.slice(1)], { cwd: process.cwd(), env: process.env, stdio: "inherit" });`,
+      '  process.exit(prepared.status ?? 1);',
+      '}',
       'fs.writeFileSync(path.join(process.env.CAPTURE_DIR, "node.json"), JSON.stringify({',
       '  args,',
       '  cliExists: fs.existsSync(args[0]),',
@@ -433,10 +440,12 @@ function smokeInstalledWebLauncher(installed) {
       .split(/\r?\n/)
       .filter(Boolean)
       .map((line) => line.split("\t"));
-    assert.equal(pythonCalls.length, 4, "the actual helper must run both validation passes and their pip checks");
+    // One completed environment is validated once, then gated by its marker
+    // (issue 344): a revalidation pair is not run again on the same launch.
+    assert.equal(pythonCalls.length, 2, "the actual helper runs one validation pass and its pip check");
     assert.ok(pythonCalls.every((call) => call[0] === "-I"), "all packaged helper invocations must use isolated mode");
-    assert.equal(pythonCalls.filter((call) => call[1] === "-c" && call[3] === "9.16.0").length, 2, "both DDGS validation passes must retain the version pin");
-    assert.equal(pythonCalls.filter((call) => call[1] === "-m" && call[2] === "pip" && call[3] === "check").length, 2);
+    assert.equal(pythonCalls.filter((call) => call[1] === "-c" && call[3] === "9.16.0").length, 1, "the DDGS validation retains the version pin");
+    assert.equal(pythonCalls.filter((call) => call[1] === "-m" && call[2] === "pip" && call[3] === "check").length, 1);
   } finally {
     fs.rmSync(fixture, { recursive: true, force: true });
   }

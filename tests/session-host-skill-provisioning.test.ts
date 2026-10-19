@@ -321,9 +321,15 @@ test("native Windows: the launcher publishes into the native discovery home", {
 
   const events: string[] = [];
   const stderr: string[] = [];
-  const status = await sessionsLauncher.__test.runSessionHostLauncher([], flowOverrides(fixture, events, stderr));
+  const overrides = flowOverrides(fixture, events, stderr);
+  // Keep the production Windows home resolver. Replacing the whole preparer
+  // bypasses that resolver and silently publishes into the synthetic HOME.
+  delete overrides.prepareApplication;
+  overrides.ensureDdgs = () => ({ ok: true, python: join(fixture.root, "ddgs-venv", "bin", "python") });
+  const status = await sessionsLauncher.__test.runSessionHostLauncher([], overrides);
 
   assert.equal(status, 0, stderr.join(""));
+  assert.deepEqual(events, ["load", "run"]);
   assertPublished(userProfile, fixture.packageRoot);
   assert.equal(existsSync(join(fixture.home, ".agents")), false,
     "the alternate HOME skill tree must remain untouched");

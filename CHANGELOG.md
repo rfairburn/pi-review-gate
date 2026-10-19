@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.183]
+## [0.1.0-dev.184]
 
 ### Changed
 
@@ -61,6 +61,39 @@ dates.
   and runs `pip check`; any installation or repair receives a fresh full validation
   before startup continues. Provisioning failures still stop startup, and dependency
   pins, installation flags, and cache locations are unchanged.
+
+## [0.1.0-dev.183]
+
+### Changed
+
+- The Linux full-suite CI job now keeps bounded headroom for the complete suite it
+  already ran (#458): the job deadline is 20 minutes and its `Full test suite` step
+  deadline is 15 minutes, up from 15 and 10. The same source tree's all-green suite
+  needed roughly ten minutes of runner time, so the previous step cap cut a passing
+  run off before publication. Test selection, assertions, prerequisites, permissions,
+  release gates, and every other job or step deadline are unchanged; the suite
+  command keeps the same `dist-test/tests/*.test.js` glob, four-file concurrency,
+  300-second per-test bound, and spec plus progress reporters. No test is skipped,
+  filtered, or removed, and no retry was added.
+
+### Fixed
+
+- This build is the first published successor of `0.1.0-dev.182`, whose publisher run
+  did not complete: `b182` was never released, so its steering and abort-recovery
+  changes ship for the first time here (#452). Eligible background-shell, subtask, and
+  review notifications now steer at Pi's next supported boundary instead of waiting
+  for the current turn to stop, covering routine match, milestone, and stall wakes,
+  subtask completion and launch notices, review transmissions, and
+  background-completion resumes; an idle session still resumes through the same
+  triggered delivery, and a foreground command runs normally. Exit notices keep their
+  bounded recovery after an abort, where transcript insertion alone does not
+  acknowledge delivery before a normal model response consumes the notice. Delivery
+  records, ids, receipt keys, and message bytes are unchanged, genuine user input held
+  during a review keeps its follow-up release, scheduler new-work admission is
+  unchanged, and an unrecognized persisted delivery kind is preserved with a
+  diagnostic instead of being sent or acknowledged. The busy-only routine-wake hold
+  and the pre-send deferral are gone; duplicate suppression still comes from the
+  existing wake interval and exit coalescing.
 
 ## [0.1.0-dev.182]
 

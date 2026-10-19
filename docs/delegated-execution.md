@@ -705,8 +705,10 @@ state is `landed`.
 
 **Interrupt feedback for the model** (#191): `/subtask-interrupt` still reports its
 result in the UI. It also queues one context note in the session that ran the command,
-which the next model request sees outside any tool result. The note never starts a
-turn. It includes the line `User intent: interrupted by user; do not restart without
+which the next model request sees outside any tool result. The note steers instead of
+waiting for a natural stop: a streaming session delivers it at that turn's next
+supported boundary, and an idle session starts a turn. It includes the line
+`User intent: interrupted by user; do not restart without
 authorization.` That line states what the user asked for, not that anything stopped.
 The note reports the actual settlement separately, read from the request's own
 command records:
@@ -1023,9 +1025,9 @@ starts for the occurrence.
 The same top-level review-readiness gate covers background shell jobs and execution and
 research subtasks: automatic review of the primary orchestrator is deferred while any
 job is alive or any task is queued, capturing, running, reviewing, accepted, waiting to
-land, or landing. Normal task completion is delivered as a follow-up and failure is
-delivered immediately; only after no background task remains active may that turn enter
-automatic review.
+land, or landing. Normal task completion and failure notifications steer at Pi's next
+supported boundary rather than waiting for the current turn's natural stop; only after
+no background task remains active may that turn enter automatic review.
 
 ## Background shell tools
 

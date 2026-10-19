@@ -193,6 +193,10 @@ module.exports = async function (pi) {
 			journal(name, {
 				role: message?.role,
 				customType: message?.customType,
+				// Assistant stop reason, when present: proves whether a request
+				// that follows an injected wake completed (consumed it) or was
+				// torn down (aborted/error).
+				stopReason: message?.stopReason,
 				preview: previewMessage(message)?.preview,
 			});
 		});

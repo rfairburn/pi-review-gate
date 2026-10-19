@@ -158,7 +158,7 @@ dispatch the top-level model is additionally woken with a model-facing
 launch notice carrying the schedule identity (entry id, name, exact due
 minute, cron expression) and the execution/task handles. It uses the same
 shared, non-model-initiated subtask-launch mechanism as a human
-`/subtask-add`: the same non-interrupting follow-up delivery lane, the same
+`/subtask-add`: the same non-interrupting steering delivery lane, the same
 redaction and character bounds, the same origin metadata, and the same
 causal ordering that keeps a fast-settling outcome behind the notice — only
 the origin-specific context differs. The notice never dispatches a duplicate

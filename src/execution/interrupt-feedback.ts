@@ -5,8 +5,10 @@
  * so the next model turn could not tell that the user had stopped the work.
  * This module renders that feedback from the durable command records of the
  * exact interrupt request (never from the requested mode or the task state
- * alone) and queues it through the host's ordinary non-triggering custom
- * message lane. It adds no queue, state machine, lock, or turn of its own.
+ * alone) and queues it through the host's ordinary custom-message lane as
+ * steering, so it is delivered at the next supported boundary and triggers a
+ * turn when the session is idle. It adds no queue, state machine, or lock of
+ * its own.
  *
  * The user-intent line is always qualified as intent: it states what the user
  * asked for, while the stop and merge settlement are reported separately and
@@ -264,12 +266,12 @@ export function formatInterruptSettlementForTool(settlement: InterruptSettlement
 }
 
 /**
- * Queue one feedback note through the host's ordinary custom-message lane
- * without triggering a turn: an idle session appends it to the transcript for
- * the next model request; a streaming session appends it after the current
- * turn. Returns false when the host has no channel or rejected the send
- * synchronously (for example a stale extension context after session
- * replacement), so it is never delivered to another session.
+ * Queue one feedback note through the host's ordinary custom-message lane as
+ * steering, so it is never left waiting for a turn that may not come: a
+ * streaming session delivers it at that turn's next supported boundary, and an
+ * idle session starts a turn. Returns false when the host has no channel or
+ * rejected the send synchronously (for example a stale extension context after
+ * session replacement), so it is never delivered to another session.
  */
 export function deliverInterruptFeedback(pi: unknown, message: InterruptFeedbackMessage): boolean {
   if (typeof pi !== "object" || pi === null) return false;
@@ -281,7 +283,7 @@ export function deliverInterruptFeedback(pi: unknown, message: InterruptFeedback
       content: message.content,
       display: true,
       details: message.details,
-    }, { triggerTurn: false });
+    }, { deliverAs: "steer", triggerTurn: true });
     if (typeof (sent as PromiseLike<unknown> | undefined)?.then === "function") {
       Promise.resolve(sent).catch(() => undefined);
     }

@@ -52,10 +52,18 @@ const textOf = (r: any) => r.content[0].text as string;
 /** Fire the observed-injection event exactly as Pi emits it when an injected
  *  custom wake message enters the transcript (role "custom", customType
  *  "pi-review-bg-shell", details.id = job id, details.kind = event kind).
- *  A run that drains its follow-up queue before ending always produces this
- *  event; an aborted run does not. */
+ *  A run that drains its steering wake before ending always produces this
+ *  event; an aborted run can produce it while tearing down, without consuming
+ *  it. */
 const injectionEvent = (jobId: string, kind = "exit") => ({
   message: { role: "custom", customType: "pi-review-bg-shell", content: "x", display: true, details: { id: jobId, kind } },
+});
+
+/** A completed assistant response — the only transcript evidence that a
+ *  provider request consumed an injected exit wake. `aborted` and `error`
+ *  prove the opposite and must never acknowledge one. */
+const assistantResponseEvent = (stopReason = "stop") => ({
+  message: { role: "assistant", content: [], stopReason },
 });
 
 /** Poll until `fn()` is true or the deadline passes. `fn` may be async — the
@@ -114,8 +122,9 @@ describe("bg-shell against real processes", () => {
     const wake = sent[0];
     expect(wake.content).toContain("exited 0");
     expect(wake.content).toContain("second");
-    // A clean exit is worth delivering, not worth interrupting a tool call for.
-    expect(wake.delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    // A clean exit is delivered at the next supported boundary; steering never
+    // interrupts the tool call that is already running.
+    expect(wake.delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
     expect(await until(() => readiness.snapshot().running.length === 0, T)).toBe(true);
   });
 
@@ -539,33 +548,36 @@ describe("wake coalescing", () => {
     expect(sent[0].content).toContain("still running");
   });
 
-  // The observed production ordering: several nonurgent matches while the
-  // agent is busy, a failed exit in between, then stale "still running" match
-  // messages delivered after the exit steer. Nonurgent wakes must now be held
-  // internally and superseded by the exit.
-  it("a failed exit supersedes nonurgent matches that fired while the agent was busy", async () => {
+  // #452: a routine match wake is not held for the busy run's benefit. It
+  // steers immediately at the next supported boundary, and a later failed exit
+  // steers too; settlement adds nothing and no wake is lost or duplicated.
+  it("delivers routine matches immediately while the agent is busy; a later failed exit still steers", async () => {
     const { sent, call, handlers } = wire();
     handlers.agent_start?.(); // the agent stays busy for the whole window
     const started = await call("ShellStart", {
       command:
         "echo checkpoint one; sleep 1.7; echo checkpoint two; sleep 1.7; " +
         "echo checkpoint three; sleep 0.6; exit 7",
-      label: "stale-matches",
+      label: "busy-matches",
       wake_on: { match: ["checkpoint"] },
     });
-    // Each match survives its 1.5s exit-coalesce window while the agent is
-    // busy, so each one lands in the internal hold instead of Pi's queue.
-    expect(await until(() => sent.length === 1 && sent[0].content.includes("exited 7"), 8000)).toBe(true);
+    // The first match survives its 1.5s exit-coalesce window while the agent is
+    // still busy, so it reaches Pi at once (steer) instead of waiting for
+    // settlement; the throttled later matches produce no further wake.
+    expect(await until(() => sent.length === 2 && sent[1].content.includes("exited 7"), 8000)).toBe(true);
+    expect(sent[0].content).toContain("matched");
+    expect(sent[0].content).toContain("checkpoint one");
     expect(sent[0].delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
-    // The run drains its follow-up queue before settling (natural end): the
-    // exit wake's injection is observed, so settlement re-sends nothing.
-    handlers.message_start?.(injectionEvent(textOf(started).match(/as (job\d+)/)![1]!));
-    // Settlement must not resurrect the stale matches.
+    expect(sent[1].content).toContain("exited 7");
+    expect(sent[1].delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
+    // The run drains its queued exit wake before settling (natural end): its
+    // injection is observed and a completed assistant response consumes it, so
+    // settlement re-sends nothing.
+    const busyMatchesId = textOf(started).match(/as (job\d+)/)![1]!;
+    handlers.message_start?.(injectionEvent(busyMatchesId));
+    handlers.message_end?.(assistantResponseEvent("toolUse"));
     handlers.agent_settled?.();
-    expect(sent.length).toBe(1);
-    for (const message of sent) {
-      expect(message.content).not.toContain("still running");
-    }
+    expect(sent.length).toBe(2);
   });
 
   it("sends a clean exit before settlement so Pi can drain its continuation first", async () => {
@@ -578,72 +590,78 @@ describe("wake coalescing", () => {
 
     expect(await until(() => sent.length === 1)).toBe(true);
     expect(sent[0].content).toContain("exited 0");
-    expect(sent[0].delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(sent[0].delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
 
-    // The exit was queued while Pi was still processing the active run. It is
-    // not held until agent_settled, where triggerTurn would start a competing
-    // turn alongside the gate's automatic review. The run drains it before
-    // settling (injection observed), so settlement adds nothing.
-    handlers.message_start?.(injectionEvent(textOf(started).match(/as (job\d+)/)![1]!));
+    // The exit was submitted while Pi was still processing the active run. It
+    // steers into that run at its next supported boundary (never held until
+    // agent_settled, where triggerTurn would start a competing turn alongside
+    // the gate's automatic review). The run drains it and completes a response
+    // that consumes it, so settlement adds nothing.
+    const cleanExitId = textOf(started).match(/as (job\d+)/)![1]!;
+    handlers.message_start?.(injectionEvent(cleanExitId));
+    handlers.message_end?.(assistantResponseEvent("stop"));
     handlers.agent_settled?.();
     expect(sent.length).toBe(1);
   });
 
-  it("delivers exactly one coalesced match wake at settlement while the job stays alive", async () => {
+  it("delivers the first routine match immediately while the agent is busy (no settlement hold)", async () => {
     const { sent, call, handlers } = wire();
     handlers.agent_start?.();
     const started = await call("ShellStart", {
       command: "for i in 1 2 3 4; do echo \"checkpoint $i\"; sleep 0.7; done",
-      label: "live-coalesce",
+      label: "live-match",
       wake_on: { exit: false, match: ["checkpoint"] },
     });
     const id = textOf(started).match(/as (job\d+)/)![1];
-    // Wait until several matches have fired while the agent is busy; none may
-    // reach Pi yet.
-    expect(await until(async () => textOf(await call("ShellLog", { id })).includes("checkpoint 3"))).toBe(true);
-    expect(sent).toEqual([]);
-    handlers.agent_settled?.();
-    expect(sent.length).toBe(1);
+    // The first match reaches Pi while the agent is still busy; it is not
+    // accumulated for a settlement-time flush.
+    expect(await until(() => sent.length === 1, 8000)).toBe(true);
     expect(sent[0].content).toContain("matched");
-    expect(sent[0].content).toContain("coalesced");
-    // The wake is current, not a replay of the first held match: it carries
-    // the newest matching line still in the buffer.
-    expect(sent[0].content).toContain("checkpoint 3");
+    expect(sent[0].content).toContain("checkpoint 1");
     expect(sent[0].content).toContain("still running");
-    expect(sent[0].delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
-    // The job keeps running after settlement; nothing stale or duplicated may
-    // follow the single coalesced wake.
+    expect(sent[0].delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
+    // Later matches are throttled and the job keeps running: nothing stale or
+    // duplicated may follow, including at settlement.
+    expect(await until(async () => textOf(await call("ShellLog", { id })).includes("checkpoint 4"), 8000)).toBe(true);
+    expect(sent.length).toBe(1);
+    handlers.agent_settled?.();
     await new Promise((r) => setTimeout(r, 1200));
     expect(sent.length).toBe(1);
-    await call("ShellStop", { id: "live-coalesce" });
+    await call("ShellStop", { id });
   });
 
-  it("keeps errorish matches urgent and lets them supersede held routine wakes", async () => {
+  it("steers errorish matches immediately while the agent is busy", async () => {
     const { sent, call, handlers } = wire();
     handlers.agent_start?.();
     await call("ShellStart", {
-      command: "echo checkpoint; sleep 0.2; echo 'Traceback (most recent call last)'; sleep 1.5",
+      command: "echo 'Traceback (most recent call last)'; sleep 0.2; echo checkpoint; sleep 1.5",
       label: "busy-errorish",
       wake_on: { exit: false, match: ["checkpoint", "Traceback"] },
     });
     expect(await until(() => sent.length > 0)).toBe(true);
+    expect(sent[0].content).toContain("Traceback");
     expect(sent[0].delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
-    handlers.agent_settled?.(); // the older routine wake must not follow it
+    // The throttled routine match adds nothing, and settlement is not a second
+    // delivery boundary.
+    handlers.agent_settled?.();
     expect(sent.length).toBe(1);
   });
 });
 
 // #281: ShellStart promises "You will be notified automatically; do not poll".
 // These tests model an exit wake queued into an active run that settles without
-// draining its follow-up queue (including the aborted-run path). They do not
+// draining its steering queue (including the aborted-run path). They do not
 // establish that this was the cause of the original report. pi.sendMessage
-// returns void on the real extension API, so delivery is proven by observation:
-// the injected custom message fires message_start with customType
-// "pi-review-bg-shell", details.id = job id, and details.kind = event kind.
-// Each exit wake stays outstanding until its own injection is observed
-// (kind === "exit" — an earlier urgent match from the same job never
-// acknowledges it). One bounded hidden recovery turn resumes Pi's drainage of
-// the retained completion; routine status wakes remain best-effort.
+// returns void on the real extension API, so the receipt is tracked from
+// transcript events: message_start with customType "pi-review-bg-shell",
+// details.id = job id, and details.kind = event kind proves the completion was
+// INJECTED (kind === "exit" only — an earlier urgent match from the same job
+// never acknowledges it), and a later normal assistant response
+// (stop/toolUse/length) proves the owning session's model CONSUMED it. An
+// aborted/error response never acknowledges an injected completion (#452:
+// steering can inject while tearing an aborted run down). One bounded hidden
+// recovery turn serves a queued or unconfirmed-injected completion and is
+// cleared before its control send; routine status wakes remain best-effort.
 describe("exit-wake delivery failure (#281)", () => {
   /** Like wire(), but the host's sendMessage behaviour is caller-supplied.
    *  Models the real extension API: void return, no delivery promise. */
@@ -717,7 +735,7 @@ describe("exit-wake delivery failure (#281)", () => {
     const id = textOf(started).match(/as (job\d+)/)![1]!;
     expect(await until(() => sent.length === 2, 8000)).toBe(true);
     expect(sent[0].delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
-    expect(sent[1].delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(sent[1].delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
     handlers.message_start?.(injectionEvent(id, "match"));
     // Abort before the exit follow-up is injected.
     handlers.agent_settled?.();
@@ -725,17 +743,37 @@ describe("exit-wake delivery failure (#281)", () => {
     expect(sent[2].customType).toBe("pi-review-bg-shell-resume");
   });
 
-  it("does not re-send an exit wake whose injection was observed", async () => {
+  it("does not re-send an exit wake whose injected completion a completed response consumed", async () => {
     const { sent, handlers, call } = wireHost(() => undefined);
     handlers.agent_start?.();
     const started = await call("ShellStart", { command: "echo done; exit 0", label: "observed-drain" });
     const id = textOf(started).match(/as (job\d+)/)![1]!;
     expect(await until(() => sent.length === 1)).toBe(true);
-    // The run drains its follow-up queue before ending: Pi injects the custom
-    // message and emits it — delivery observed, marker cleared.
+    // The run drains its steering wake before ending: Pi injects the custom
+    // message and then completes a response that consumes it.
     handlers.message_start?.(injectionEvent(id));
+    handlers.message_end?.(assistantResponseEvent("toolUse"));
     handlers.agent_settled?.();
-    expect(sent.length).toBe(1); // no duplicate wake
+    expect(sent.length).toBe(1); // no duplicate wake, no recovery turn
+  });
+
+  it("recovers an injected exit wake that no completed response consumed", async () => {
+    const { sent, handlers, call } = wireHost(() => undefined);
+    handlers.agent_start?.();
+    const started = await call("ShellStart", { command: "echo done; exit 0", label: "injected-unconsumed" });
+    const id = textOf(started).match(/as (job\d+)/)![1]!;
+    expect(await until(() => sent.length === 1)).toBe(true);
+    // Pi can drain a queued steering wake while tearing an aborted run down and
+    // end that run with an aborted assistant message and no further request. The
+    // injected-but-unconsumed completion must still start the bounded recovery
+    // turn — never a second copy of the completion payload.
+    handlers.message_start?.(injectionEvent(id));
+    handlers.message_end?.(assistantResponseEvent("aborted"));
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(2);
+    expect(sent[1].customType).toBe("pi-review-bg-shell-resume");
+    expect(sent[1].content).not.toBe(sent[0].content); // recovery turn, not a re-send
+    expect(sent.filter((message) => message.customType === "pi-review-bg-shell").length).toBe(1);
   });
 
   it("resumes an unobserved exit wake sent while idle at the next settlement", async () => {
@@ -791,11 +829,11 @@ describe("exit-wake delivery failure (#281)", () => {
     expect(sent.length).toBe(0); // the throw happened before anything was accepted
   });
 
-  it("acknowledges an exit wake observed synchronously inside sendMessage without redundant recovery", async () => {
+  it("acknowledges a synchronously observed exit injection once its response completes", async () => {
     const { sent, handlers, call, controller } = wireHost((msg) => {
       // The host injects the custom message and dispatches its matching
       // message_start from inside the void sendMessage call, before it
-      // returns. Observation only clears an existing marker, so the marker
+      // returns. Observation only advances an existing receipt, so the receipt
       // must already be set when this fires.
       handlers.message_start?.(injectionEvent(String(msg.details.id)));
     });
@@ -806,9 +844,11 @@ describe("exit-wake delivery failure (#281)", () => {
     handlers.agent_start?.(); // a run is active; the wake would otherwise queue
     await call("ShellStart", { command: "echo done; exit 0", label: "sync-observe" });
     expect(await until(() => settled.length === 1)).toBe(true);
-    // The synchronous observation proved delivery: the send reports accepted,
-    // and nothing is left outstanding for settlement to recover.
+    // The synchronous observation proved injection: the send reports accepted.
+    // A completed response then proves consumption, so settlement recovers
+    // nothing — and no second copy is ever sent.
     expect(settled[0]!.exitWakeScheduled).toBe(true);
+    handlers.message_end?.(assistantResponseEvent("stop"));
     handlers.agent_settled?.();
     expect(sent.length).toBe(1); // no recovery trigger, no second copy
     expect(sent[0].customType).toBe("pi-review-bg-shell");
@@ -831,12 +871,14 @@ describe("exit-wake delivery failure (#281)", () => {
     handlers.agent_start?.();
     await call("ShellStart", { command: "echo done; exit 0", label: "observe-then-throw" });
     expect(await until(() => settled.length === 1)).toBe(true);
-    // Observed delivery is not misreported as non-delivery: the lifecycle
+    // Observed injection is not misreported as non-delivery: the lifecycle
     // event reports the wake scheduled, so the review gate stays off its own
-    // completion follow-up — and nothing is left outstanding to recover.
+    // completion follow-up. Once a completed response consumes it, nothing is
+    // left outstanding to recover.
     expect(settled[0]!.exitWakeScheduled).toBe(true);
+    handlers.message_end?.(assistantResponseEvent("stop"));
     handlers.agent_settled?.();
-    expect(attempts).toBe(1); // no redundant recovery re-send for an observed wake
+    expect(attempts).toBe(1); // no redundant recovery re-send for a consumed wake
     expect(sent.length).toBe(0); // the wrapper threw, so nothing is recorded and nothing was re-sent
   });
 });

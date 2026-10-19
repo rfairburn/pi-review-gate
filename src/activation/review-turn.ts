@@ -228,7 +228,9 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
         || confirmed.revision !== idleRevision
         || confirmed.running.length > 0
         || confirmed.unverifiable.length > 0
-        || agentRunActive
+        // #452: a resume notification is not held for the primary model's own
+        // active run. It steers at that run's next supported boundary, so only
+        // real readiness, review-window, and transaction eligibility gate it.
         || deps.state.reviewInProgress
         || !deps.state.reviewWindow
         || deps.reviewReadiness().length > 0

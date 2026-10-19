@@ -112,13 +112,13 @@ test("notification mode resolution falls back to quiet and honors explicit confi
 
 // ── Delivery lanes and trigger-turn behavior ─────────────────────────────────
 
-test("state and failure wakes deliver immediately; completion follows up; every wake triggers a turn", () => {
+test("every eligible wake steers at the next supported boundary and triggers a turn", () => {
   assert.equal(notificationLane("state"), "now");
   assert.equal(notificationLane("failure"), "now");
   assert.equal(notificationLane("completion"), "soon");
   assert.deepEqual(deliveryForLane("now"), { deliverAs: "steer", triggerTurn: true });
-  assert.deepEqual(deliveryForLane("soon"), { deliverAs: "followUp", triggerTurn: true });
-  assert.deepEqual(watchCheckpointDelivery(), { deliverAs: "followUp", triggerTurn: true }, "watch checkpoints follow up with a turn and never steer");
+  assert.deepEqual(deliveryForLane("soon"), { deliverAs: "steer", triggerTurn: true });
+  assert.deepEqual(watchCheckpointDelivery(), { deliverAs: "steer", triggerTurn: true }, "watch checkpoints steer with a turn");
 });
 
 // ── Model-facing lifecycle contract prose ────────────────────────────────────

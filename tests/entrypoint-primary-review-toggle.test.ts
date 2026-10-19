@@ -448,7 +448,7 @@ test("toggling primary off mid-deferral keeps the completion wake and resumes wi
     // unfinished original request even though automatic review is now off.
     await waitForCondition(() => rt.followUps.length === 1);
     assert.match(rt.followUps[0]?.message ?? "", /previously blocked review reached an idle transition/);
-    assert.deepEqual(rt.followUps[0]?.options, { deliverAs: "followUp", triggerTurn: true });
+    assert.deepEqual(rt.followUps[0]?.options, { deliverAs: "steer", triggerTurn: true });
 
     // The resumed turn settles through the off path: no reviewer runs.
     await trigger(rt.hooks, "before_agent_start", { cwd: dir });
@@ -618,8 +618,11 @@ test("primary off in execute mode: the shared primary reviewer set still gates m
     // stays off.
     await rt.commands.get("ask-reviewer")?.("is this correct?", { isIdle: () => true, ui: { notify: (m: string) => rt.notices.push(m) } });
     assert.equal(await readFile(invocationPath, "utf8"), "2");
-    const steer = rt.followUps.find((entry) => entry.options && (entry.options as { deliverAs?: string }).deliverAs === "steer");
-    assert.ok(steer, "the reviewer answer is steered into the turn");
+    // Manual review transmissions now steer too; identify the reviewer answer
+    // by its payload before asserting its delivery lane.
+    const steer = rt.followUps.find((entry) => /Reviewer note from \/ask-reviewer:/.test(entry.message));
+    assert.ok(steer, "the reviewer answer is delivered into the turn");
+    assert.equal((steer.options as { deliverAs?: string }).deliverAs, "steer");
     assert.match(steer.message, /Reviewer note from \/ask-reviewer:/);
     await trigger(rt.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, rt.ctx);
   } finally {

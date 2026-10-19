@@ -8,10 +8,11 @@
  * context differs; no scheduler-only or command-only model-notification path
  * exists beside it.
  *
- * Delivery shape: a followUp that still triggers a turn (the orchestrator
- * learns about the launch on its next turn; an already-active turn is never
- * interrupted by the notice). Ordering: the controller holds every result
- * notification for the launched execution behind a launch-notice gate
+ * Delivery shape (#452): a steer that still triggers a turn (the orchestrator
+ * learns about the launch at the next supported boundary; an already-active
+ * turn is never interrupted by the notice). Ordering: the controller holds
+ * every result notification for the launched execution behind a launch-notice
+ * gate
  * (see launchNoticeGate), so a subtask that settles in milliseconds can never
  * deliver a completion or failure event before the launch notice that names
  * it. The notice itself never dispatches a duplicate task and never implies
@@ -170,7 +171,7 @@ export interface SubtaskLaunchMessage {
 
 /**
  * Deliver one launch notice through the shared lane: a non-interrupting
- * followUp that still triggers a turn. Returns "unavailable" when the host
+ * steer that still triggers a turn. Returns "unavailable" when the host
  * has no sendMessage channel or definitively rejected the send, and
  * "uncertain" when the host's send promise did not settle within the bounded
  * delivery window (the send may still enqueue or resolve later) — the caller
@@ -196,7 +197,7 @@ export async function deliverSubtaskLaunchNotice(
         display: true,
         details,
       } satisfies SubtaskLaunchMessage,
-      { deliverAs: "followUp", triggerTurn: true },
+      { deliverAs: "steer", triggerTurn: true },
     );
     // A synchronous void send is accepted immediately; a host that returns a
     // promise for the send participates in the bounded delivery attempt, so

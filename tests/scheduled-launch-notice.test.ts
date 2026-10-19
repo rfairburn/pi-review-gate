@@ -164,12 +164,12 @@ test("the shared launch notice bounds a hostile task title and the whole content
   assert.ok(title.endsWith("…[truncated]"), "the bounded title carries the truncation marker");
 });
 
-test("the shared launch notice is delivered on the non-interrupting triggered-turn lane", async () => {
+test("the shared launch notice is delivered on the non-interrupting steering lane", async () => {
   const { pi, messages } = recordingPi();
   assert.equal(await deliverSubtaskLaunchNotice(pi, scheduledNotice), "delivered");
   assert.equal(messages.length, 1);
   assert.equal(messages[0]!.customType, "pi-review-subtask-launch");
-  assert.deepEqual(messages[0]!.delivery, { deliverAs: "followUp", triggerTurn: true });
+  assert.deepEqual(messages[0]!.delivery, { deliverAs: "steer", triggerTurn: true });
   assert.equal(messages[0]!.details?.origin, "scheduled");
 
   // A host without a model message channel is honestly "unavailable" — the

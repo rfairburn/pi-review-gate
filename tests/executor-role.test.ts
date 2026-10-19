@@ -168,13 +168,13 @@ test("executor role registers web tools and background shell without orchestrati
     // deferred-manager turn/MCP reconciliation hooks, plus background-shell
     // and #84 diagnostic lifecycle hooks. message_start is the background
     // shell's observed-injection listener (#281: exit wakes are tracked until
-    // their custom message enters the transcript). Orchestrator
+    // their custom message enters the transcript). Background shell no longer
+    // registers agent_start just to hold routine wakes until settlement. Orchestrator
     // review machinery (before_agent_start, input) and its command surface
     // must stay out of executor children.
     assert.deepEqual([...captured.hooks.keys()].sort(), [
       "agent_end",
       "agent_settled",
-      "agent_start",
       "context",
       "mcp_servers_change",
       "message_end",

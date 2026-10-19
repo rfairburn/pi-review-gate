@@ -137,7 +137,7 @@ review: { activeReviewers: [
     await waitForCondition(() => followUps.length === 1);
     assert.match(followUps[0]?.message ?? "", /previously blocked review reached an idle transition/);
     assert.match(followUps[0]?.message ?? "", /Re-check ShellList because a newer job may have started/);
-    assert.deepEqual(followUps[0]?.options, { deliverAs: "followUp", triggerTurn: true });
+    assert.deepEqual(followUps[0]?.options, { deliverAs: "steer", triggerTurn: true });
 
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "verified background output" }] });
@@ -354,15 +354,19 @@ review: { activeReviewers: [
     assert.equal(messages.filter((message) => message.customType === "pi-review-bg-shell").length, 1);
     await assert.rejects(access(reviewerStarted), /ENOENT/);
 
-    // The run ends naturally, so Pi drains its follow-up queue before
+    // The run ends naturally, so Pi drains its steering wake before
     // settling: the queued exit wake is injected into the transcript and
-    // emitted (message_start) — the observed-injection event that clears the
-    // gate's outstanding-exit-wake marker (#281), keeping settlement from
+    // emitted (message_start), and the completed assistant response
+    // (message_end with a normal stop reason) proves the model consumed it
+    // (#281). Together those keep settlement from starting a recovery turn or
     // re-sending an already-delivered wake.
     const jobId = String((started.content as Array<{ text?: string }>)[0]?.text ?? "").match(/as (job\d+)/)?.[1];
     assert.ok(jobId, `ShellStart result must name the job: ${JSON.stringify(started)}`);
     await trigger(hooks, "message_start", {
       message: { role: "custom", customType: "pi-review-bg-shell", content: "exit wake", display: true, details: { id: jobId, kind: "exit" } },
+    });
+    await trigger(hooks, "message_end", {
+      message: { role: "assistant", content: "build completed", stopReason: "stop" },
     });
 
     await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "build completed" }] });

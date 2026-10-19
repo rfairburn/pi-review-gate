@@ -1331,27 +1331,17 @@ try {
   if (-not [string]::IsNullOrEmpty($script:NodeGenerationMarker)) {
     try { [IO.File]::Delete($script:NodeGenerationMarker) } catch { }
   }
-  # A failed preparation never becomes the kept generation: the runtime the
-  # pointer still names stays reusable. This launch's incomplete witness is
-  # removed first (it is ours, and its in-progress marker is gone), then
-  # settlement preserves the marked generation instead of preferring the
-  # failed one -- otherwise reclamation could delete the code the pointer
-  # names and force an unnecessary reinstall after a transient failure.
+  # A failed preparation keeps this launch's own incomplete witness, exactly like
+  # the POSIX producer: its in-progress marker is already gone, so it is an
+  # ordinary disposable generation that a later pass reclaims. Reclaiming it here
+  # instead would make every failed preparation silently shrink the cache, so a
+  # cache still within its per-type target would lose real capacity on each
+  # transient failure. The witness never becomes the kept generation: the runtime
+  # the pointer still names stays reusable, and settlement preserves the marked
+  # generation instead of preferring the failed one -- otherwise reclamation could
+  # delete the code the pointer names and force an unnecessary reinstall after a
+  # transient failure.
   $settleKeep = $keepPath
-  if ($null -ne $WorkRoot -and $WorkRoot -cne $keepPath) {
-    # Bounded like every other destructive pass: one fresh elapsed budget.
-    $script:NodeCleanupStopwatch = [Diagnostics.Stopwatch]::StartNew()
-    $script:NodeCleanupStopped = $false
-    $script:NodeCleanupProgress = 0
-    try {
-      if (Remove-NodeEntry $WorkRoot) { $WorkRoot = '' }
-    } catch {
-    } finally {
-      $script:NodeCleanupStopwatch = $null
-      $script:NodeCleanupStopped = $false
-      $script:NodeCleanupProgress = 0
-    }
-  }
   if ($null -ne $WorkRoot -and -not [string]::IsNullOrEmpty($WorkRoot)) {
     [Console]::Error.WriteLine('pi-review-sessions: retained bootstrap witness: ' + $WorkRoot)
   }

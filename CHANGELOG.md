@@ -54,6 +54,9 @@ dates.
 
 ### Fixed
 
+- Installed POSIX npm bins now resolve their physical package directory through a
+  bounded, read-only symlink chain, so the standard Pi and web commands find their
+  shipped helpers without requiring direct script paths (#386).
 - When DDGS provisioning is needed, validate an already-valid cached environment once
   instead of twice on macOS, Linux, and Windows (#344, #379). Current launches skip
   provisioning altogether through the shared readiness state.

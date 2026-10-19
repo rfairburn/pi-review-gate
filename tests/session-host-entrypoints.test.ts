@@ -2078,6 +2078,30 @@ test("producer captures admission entry identity at acquisition and releases exa
     "the fresh generation exists before either entry is released");
 });
 
+test("a failed node preparation retains its witness and protects the marked runtime", () => {
+  // All-platform control for the native failure-path cases below. Reclaiming this
+  // launch's own incomplete witness inside the failure handler would silently shrink
+  // a cache that is still within its per-type target on every transient failure (the
+  // POSIX producer retains its witness too), which is exactly one generation fewer
+  // than those cases expect; settlement must instead preserve the runtime the
+  // readiness pointer still names.
+  const source = readFileSync(psPath, "utf8");
+  const failureAt = source.indexOf("isolated Node bootstrap failed");
+  const successAt = source.indexOf("Start-SessionCjs exits the process");
+  assert.ok(failureAt >= 0 && successAt > failureAt, "both preparation settlements exist");
+  const failure = source.slice(failureAt, successAt);
+  assert.doesNotMatch(failure, /Remove-NodeEntry \$WorkRoot|\$WorkRoot = ''/u,
+    "a failed preparation never reclaims the generation it just created");
+  assert.match(failure, /retained bootstrap witness: ' \+ \$WorkRoot/u,
+    "the failed generation is reported as a retained witness");
+  assert.match(failure, /\$settleKeep = \$keepPath/u,
+    "settlement preserves the runtime the readiness pointer still names");
+  assert.match(failure, /Invoke-NodeSettlementCleanup \$cacheRoot \$agentDirectory \$settleKeep/u,
+    "a failed preparation still retries deferred reclamation, joined");
+  assert.match(source.slice(successAt), /Invoke-NodeSettlementCleanup \$cacheRoot \$agentDirectory \$WorkRoot/u,
+    "a completed preparation preserves the generation it launched");
+});
+
 test("native Windows fallback bootstrap prunes legacy artifacts and never refuses a sixth", { skip: !isWindows, timeout: 60_000 }, (t) => {
   const f = makeEntrypointFixture(".node-cap-native-windows-");
   cleanupFixture(t, f);

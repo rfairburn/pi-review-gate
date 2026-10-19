@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -1442,6 +1442,367 @@ test("persistent launcher fails closed over an invalid fallback and never initia
       false,
       "the launcher must not start pi over an invalid fallback",
     );
+  }
+});
+
+const POSIX_BIN_ONLY = process.platform === "win32"
+  ? "npm creates POSIX bin symlinks only on macOS/Linux."
+  : false;
+
+type BinLinkKind = "relative" | "absolute" | "chain";
+
+interface InstalledBinFixture {
+  root: string;
+  consumer: string;
+  packageRoot: string;
+  binPath: string;
+  linkDir: string;
+  wrapperPath: string;
+  home: string;
+  capture: string;
+  pathBin: string;
+  ddgsVenv: string;
+  ddgsPython: string;
+}
+
+interface InstalledBinOptions {
+  /** Make `node_modules/.bin` itself a symlink to a real bin directory. */
+  symlinkedBinDir?: boolean;
+}
+
+/**
+ * A genuine installed consumer layout: `consumer/node_modules/pi-review-gate`
+ * holds the packaged tree (compiled `dist`, shipped scripts and skills, no
+ * TypeScript sources) and `consumer/node_modules/.bin/pi-review-gate` is the
+ * symlink npm creates for a public POSIX bin. The wrapper and every shared
+ * helper are byte-for-byte production files; only `pi` and the DDGS interpreter
+ * are recording stand-ins. Decoy helpers sit exactly where a logical
+ * `dirname`/`..` root lookup would find them, so an ancestor fallback is visible.
+ *
+ * With `symlinkedBinDir`, the shim directory is a symlink and the package lives
+ * under a `lib/` tree, so `bin/..` has two different meanings: physical (the
+ * real package) and logically normalized (the decoy tree).
+ */
+async function makeInstalledBinFixture(
+  prefix: string,
+  link: BinLinkKind,
+  options: InstalledBinOptions = {},
+): Promise<InstalledBinFixture> {
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const consumer = join(root, "consumer");
+  const packageParent = options.symlinkedBinDir
+    ? join(consumer, "lib", "node_modules")
+    : join(consumer, "node_modules");
+  const packageRoot = join(packageParent, "pi-review-gate");
+  const scripts = join(packageRoot, "scripts");
+  // The public entry point is always consumer/node_modules/.bin/<bin>; only
+  // the directory that physically holds the link changes.
+  const shimDir = join(consumer, "node_modules", ".bin");
+  const linkDir = options.symlinkedBinDir ? join(consumer, "real-bin") : shimDir;
+  const home = join(root, "home");
+  const capture = join(root, "capture");
+  const pathBin = join(root, "path-bin");
+  const ddgsVenv = join(root, "ddgs");
+  // Decoys exactly at the root a LOGICAL `dirname`/`..` lookup would select.
+  const decoyScripts = options.symlinkedBinDir
+    ? join(consumer, "node_modules", "lib", "node_modules", "pi-review-gate", "scripts")
+    : join(consumer, "node_modules", "scripts");
+  await Promise.all([
+    mkdir(scripts, { recursive: true }),
+    mkdir(join(consumer, "node_modules"), { recursive: true }),
+    mkdir(home, { recursive: true }),
+    mkdir(capture, { recursive: true }),
+    mkdir(pathBin, { recursive: true }),
+    mkdir(join(ddgsVenv, "bin"), { recursive: true }),
+    mkdir(decoyScripts, { recursive: true }),
+  ]);
+  if (options.symlinkedBinDir) {
+    await mkdir(linkDir, { recursive: true });
+    await symlink(join("..", "real-bin"), shimDir);
+  } else {
+    await mkdir(linkDir, { recursive: true });
+  }
+  for (const name of [
+    "pi-review-gate.sh",
+    "pi-review-gate-launcher.cjs",
+    "prepare-application.cjs",
+    "application-build.cjs",
+    "managed-generations.cjs",
+  ]) {
+    await writeFile(join(scripts, name), await readFile(resolve("scripts", name)));
+  }
+  await chmod(join(scripts, "pi-review-gate.sh"), 0o755);
+  await cp(resolve("skills"), join(packageRoot, "skills"), { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    `${JSON.stringify({ name: "pi-review-gate", version: "0.1.0" })}\n`,
+    "utf8",
+  );
+  for (const entry of ["dist/src/index.js", "dist/src/session-host/main.js", "dist/src/web/cli.js"]) {
+    const segments = entry.split("/");
+    await mkdir(join(packageRoot, ...segments.slice(0, -1)), { recursive: true });
+    await writeFile(join(packageRoot, ...segments), "module.exports = {};\n", "utf8");
+  }
+
+  const ddgsPython = join(ddgsVenv, "bin", "python");
+  await writeFile(ddgsPython, [
+    "#!/bin/bash",
+    'if [[ "$1" == "-I" && "$2" == "-c" && "$4" == "9.16.0" ]]; then exit 0; fi',
+    'if [[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" && "$4" == "check" ]]; then exit 0; fi',
+    "exit 93",
+    "",
+  ].join("\n"), "utf8");
+  await chmod(ddgsPython, 0o755);
+
+  const piPath = join(pathBin, "pi");
+  await writeFile(piPath, [
+    "#!/usr/bin/env bash",
+    ': > "$CAPTURE_DIR/args"',
+    'for arg in "$@"; do printf "%s\\0" "$arg" >> "$CAPTURE_DIR/args"; done',
+    'printf "%s" "${PI_REVIEW_GATE_CONFIG:-unset}" > "$CAPTURE_DIR/config-env"',
+    'printf "%s" "${PI_REVIEW_GATE_DDGS_PYTHON:-unset}" > "$CAPTURE_DIR/ddgs-env"',
+    'printf "%s" "${PI_REVIEW_GATE_SCHEDULER:-unset}" > "$CAPTURE_DIR/scheduler-env"',
+    'printf "%s" "${PI_REVIEW_GATE_CODEMODE_DEFAULT:-unset}" > "$CAPTURE_DIR/codemode-env"',
+    "exit 42",
+    "",
+  ].join("\n"), "utf8");
+  await chmod(piPath, 0o755);
+
+  // Decoys at the logical shim root: the pre-fix lookup.
+  await writeFile(
+    join(decoyScripts, "pi-review-gate-launcher.cjs"),
+    `require("node:fs").writeFileSync(${JSON.stringify(join(capture, "ancestor-launcher-called"))}, "called");\n`,
+    "utf8",
+  );
+  await writeFile(
+    join(decoyScripts, "prepare-application.cjs"),
+    `require("node:fs").writeFileSync(${JSON.stringify(join(capture, "ancestor-prepare-called"))}, "called");\nprocess.exit(0);\n`,
+    "utf8",
+  );
+
+  const wrapperPath = join(scripts, "pi-review-gate.sh");
+  const relativeTarget = options.symlinkedBinDir
+    ? join("..", "lib", "node_modules", "pi-review-gate", "scripts", "pi-review-gate.sh")
+    : join("..", "pi-review-gate", "scripts", "pi-review-gate.sh");
+  const binPath = join(shimDir, "pi-review-gate");
+  if (link === "absolute") {
+    await symlink(wrapperPath, join(linkDir, "pi-review-gate"));
+  } else if (link === "relative") {
+    await symlink(relativeTarget, join(linkDir, "pi-review-gate"));
+  } else {
+    await symlink("./pi-review-gate-alias", join(linkDir, "pi-review-gate"));
+    await symlink(relativeTarget, join(linkDir, "pi-review-gate-alias"));
+  }
+  return { root, consumer, packageRoot, binPath, linkDir, wrapperPath, home, capture, pathBin, ddgsVenv, ddgsPython };
+}
+
+function installedBinEnv(fixture: InstalledBinFixture, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of [
+    "PI_REVIEW_GATE_CONFIG",
+    "PI_CODING_AGENT_DIR",
+    "PI_REVIEW_GATE_RUNTIME_ROLE",
+    "PI_REVIEW_GATE_DISABLED",
+    "PI_REVIEW_GATE_DDGS_PYTHON",
+    "PI_REVIEW_GATE_SCHEDULER",
+    "PI_REVIEW_GATE_CODEMODE_DEFAULT",
+  ]) {
+    delete env[name];
+  }
+  return {
+    ...env,
+    HOME: fixture.home,
+    PATH: `${fixture.pathBin}:${process.env.PATH ?? ""}`,
+    CAPTURE_DIR: fixture.capture,
+    PI_REVIEW_GATE_DDGS_VENV: fixture.ddgsVenv,
+    // An inherited value must never win over the launcher's own resolution.
+    PI_REVIEW_GATE_CONFIG: "/inherited/wrong/config.json",
+    ...overrides,
+  };
+}
+
+function runInstalledEntryPoint(
+  fixture: InstalledBinFixture,
+  command: string,
+  args: string[],
+  overrides: NodeJS.ProcessEnv = {},
+) {
+  return spawnSync(command, args, {
+    cwd: fixture.consumer,
+    env: installedBinEnv(fixture, overrides),
+    encoding: "utf8",
+    timeout: 60_000,
+    maxBuffer: 256 * 1024,
+  });
+}
+
+async function capturedPiArgs(fixture: InstalledBinFixture): Promise<string[]> {
+  const raw = await readFile(join(fixture.capture, "args"), "utf8");
+  // The fake pi writes one NUL-terminated argument per entry, so spaces and
+  // empty arguments round-trip exactly.
+  return raw.split("\0").slice(0, -1);
+}
+
+test("a genuine npm-style POSIX bin resolves the physical installed package root and preserves argv/exit", { skip: POSIX_BIN_ONLY }, async () => {
+  for (const link of ["relative", "absolute", "chain"] as const) {
+    const fixture = await makeInstalledBinFixture(`pi-review-gate-bin-${link}-`, link);
+    try {
+      // The public entry point is npm's symlink, never a copy of the wrapper.
+      assert.equal((await lstat(fixture.binPath)).isSymbolicLink(), true, "the public bin must be a symlink");
+      const args = ["--model", "two words", "", "--scheduler", "--", "-x"];
+      const result = runInstalledEntryPoint(fixture, fixture.binPath, args);
+      assert.ifError(result.error);
+      assert.equal(result.signal, null, `the launcher must exit normally: ${result.stderr}`);
+      assert.equal(result.status, 42, `the launch must preserve pi's exit status: ${result.stderr}`);
+      assert.doesNotMatch(result.stderr, /MODULE_NOT_FOUND|Cannot find module/u,
+        "the .bin launch must not fall back to the shim parent's missing helpers");
+
+      const physicalExtension = join(await realpath(fixture.packageRoot), "dist", "src", "index.js");
+      assert.match(
+        result.stdout,
+        new RegExp(`pi-review-gate extension: ${escapeRegExp(physicalExtension)}`),
+        "the reported extension must come from the physical installed package",
+      );
+      assert.deepEqual(
+        await capturedPiArgs(fixture),
+        ["--extension", physicalExtension, "--model", "two words", "", "--", "-x"],
+        "the wrapper must consume --scheduler and forward every other argument unchanged",
+      );
+      assert.equal(await readFile(join(fixture.capture, "config-env"), "utf8"),
+        join(fixture.home, ".pi", "agent", "review-gate.json"),
+        "config resolution must ignore the inherited value and use the native agent directory");
+      assert.equal(await readFile(join(fixture.capture, "ddgs-env"), "utf8"), fixture.ddgsPython,
+        "the prepared DDGS interpreter must be exported");
+      assert.equal(await readFile(join(fixture.capture, "scheduler-env"), "utf8"), "1");
+      assert.equal(await readFile(join(fixture.capture, "codemode-env"), "utf8"), "1");
+      // Complete preparation ran before pi: shipped skills were published to
+      // the fixture home, and no ancestor helper was executed.
+      assert.equal(
+        await pathExists(join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md")),
+        true,
+        "preparation must publish the shipped skills before the launch",
+      );
+      assert.equal(await pathExists(join(fixture.capture, "ancestor-launcher-called")), false);
+      assert.equal(await pathExists(join(fixture.capture, "ancestor-prepare-called")), false);
+
+      // The direct source-style entry point of the same package launches
+      // identically: both forms share one physical root and one argv/exit path.
+      const direct = runInstalledEntryPoint(fixture, fixture.wrapperPath, args);
+      assert.ifError(direct.error);
+      assert.equal(direct.status, 42, `the direct entry point must keep working: ${direct.stderr}`);
+      assert.deepEqual(await capturedPiArgs(fixture),
+        ["--extension", physicalExtension, "--model", "two words", "", "--", "-x"],
+        "the direct and .bin entry points must launch the same physical package");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a symlinked consumer bin directory resolves the physical package, never a logically normalized decoy", { skip: POSIX_BIN_ONLY }, async () => {
+  // `node_modules/.bin` is itself a symlink and the package lives under `lib/`,
+  // so the npm link's `../lib/...` target is physical-correct but logically
+  // normalizes to a different tree. Decoy helpers exist at that logical root.
+  const fixture = await makeInstalledBinFixture("pi-review-gate-bin-symlinked-dir-", "relative", { symlinkedBinDir: true });
+  try {
+    assert.equal((await lstat(fixture.binPath)).isSymbolicLink(), true, "the public bin must be a symlink");
+    const args = ["--model", "two words", "", "--scheduler", "--", "-x"];
+    const result = runInstalledEntryPoint(fixture, fixture.binPath, args);
+    assert.ifError(result.error);
+    assert.equal(result.signal, null, `the launcher must exit normally: ${result.stderr}`);
+    assert.equal(result.status, 42, `the launch must preserve pi's exit status: ${result.stderr}`);
+    assert.doesNotMatch(result.stderr, /MODULE_NOT_FOUND|Cannot find module/u);
+    const physicalExtension = join(await realpath(fixture.packageRoot), "dist", "src", "index.js");
+    assert.match(
+      result.stdout,
+      new RegExp(`pi-review-gate extension: ${escapeRegExp(physicalExtension)}`),
+      "the reported extension must come from the physical package, not a logical sibling",
+    );
+    assert.deepEqual(
+      await capturedPiArgs(fixture),
+      ["--extension", physicalExtension, "--model", "two words", "", "--", "-x"],
+    );
+    // The uniquely logical `bin/..` root must never supply a helper.
+    assert.equal(await pathExists(join(fixture.capture, "ancestor-launcher-called")), false,
+      "the logically normalized decoy launcher must not execute");
+    assert.equal(await pathExists(join(fixture.capture, "ancestor-prepare-called")), false,
+      "the logically normalized decoy preparation helper must not execute");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a dangling or cyclic launcher bin link fails closed at exec without starting anything", { skip: POSIX_BIN_ONLY }, async () => {
+  for (const kind of ["dangling", "cycle"] as const) {
+    const fixture = await makeInstalledBinFixture(`pi-review-gate-bin-${kind}-`, "relative");
+    try {
+      await rm(fixture.binPath, { force: true });
+      if (kind === "dangling") {
+        await symlink(join("..", "pi-review-gate", "scripts", "missing-launcher.sh"), fixture.binPath);
+      } else {
+        await symlink("pi-review-gate", fixture.binPath);
+      }
+      // The host refuses to open this entry point at all (ENOENT for a dangling
+      // chain, ELOOP for a cycle), so the wrapper body never runs: no ancestor
+      // helper can be reached and nothing may start or hang.
+      const result = runInstalledEntryPoint(fixture, fixture.binPath, []);
+      assert.ok(result.error, `a ${kind} entry point must fail closed`);
+      assert.equal((result.error as NodeJS.ErrnoException).code, kind === "cycle" ? "ELOOP" : "ENOENT");
+      assert.equal(result.status, null);
+      assert.equal(await pathExists(join(fixture.capture, "ancestor-launcher-called")), false);
+      assert.equal(await pathExists(join(fixture.capture, "ancestor-prepare-called")), false);
+      assert.equal(await pathExists(join(fixture.capture, "args")), false, "pi must not start");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a launcher bin chain longer than the resolution bound fails closed with a diagnostic", { skip: POSIX_BIN_ONLY }, async () => {
+  const fixture = await makeInstalledBinFixture("pi-review-gate-bin-chain-", "relative");
+  try {
+    const binDir = fixture.linkDir;
+    await rm(fixture.binPath, { force: true });
+    // Seventeen links: the host itself still opens the entry point (its limit is
+    // higher), so the wrapper runs and must refuse the chain itself, bounded,
+    // before locating any helper.
+    const names = ["pi-review-gate", ...Array.from({ length: 16 }, (_, index) => `pi-review-gate-chain-${index + 1}`)];
+    for (let index = 0; index < names.length; index += 1) {
+      const target = index === names.length - 1
+        ? join("..", "pi-review-gate", "scripts", "pi-review-gate.sh")
+        : `./${names[index + 1]}`;
+      await symlink(target, join(binDir, names[index]));
+    }
+    const result = runInstalledEntryPoint(fixture, join(binDir, "pi-review-gate"), []);
+    assert.ifError(result.error);
+    assert.equal(result.signal, null, "resolution must not hang");
+    assert.equal(result.status, 1, `an over-long chain must fail closed: ${result.stderr}`);
+    assert.match(result.stderr, /^pi-review-gate: cannot resolve the launcher entry point \(too many symlink levels\)/mu);
+    assert.equal(await pathExists(join(fixture.capture, "ancestor-launcher-called")), false);
+    assert.equal(await pathExists(join(fixture.capture, "ancestor-prepare-called")), false);
+    assert.equal(await pathExists(join(fixture.capture, "args")), false, "pi must not start");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a launcher environment without readlink fails closed instead of guessing a package root", { skip: POSIX_BIN_ONLY }, async () => {
+  const fixture = await makeInstalledBinFixture("pi-review-gate-bin-no-readlink-", "relative");
+  const emptyPath = join(fixture.root, "empty-path");
+  try {
+    await mkdir(emptyPath, { recursive: true });
+    // Invoke through bash so the wrapper body runs with a PATH that has no
+    // readlink: an unresolved npm bin link must not be guessed or skipped.
+    const result = runInstalledEntryPoint(fixture, "/bin/bash", [fixture.binPath], { PATH: emptyPath });
+    assert.ifError(result.error);
+    assert.equal(result.signal, null, "resolution must not hang");
+    assert.equal(result.status, 1, `an unresolvable link must fail closed: ${result.stderr}`);
+    assert.match(result.stderr, /^pi-review-gate: cannot resolve the launcher symlink \(readlink failed\)/mu);
+    assert.equal(await pathExists(join(fixture.capture, "ancestor-launcher-called")), false);
+    assert.equal(await pathExists(join(fixture.capture, "ancestor-prepare-called")), false);
+    assert.equal(await pathExists(join(fixture.capture, "args")), false, "pi must not start");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
   }
 });
 

@@ -8,7 +8,7 @@
 // code; only the external installer/compiler is a recording stand-in.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import test from "node:test";
@@ -19,12 +19,16 @@ interface FixtureOptions {
   ddgs: "valid" | "fail";
   nodeStatus?: number;
   installStatus?: number;
+  /** Invoke through the npm-style consumer bin symlink instead of the script path. */
+  binLink?: "relative" | "absolute" | "chain" | "symlinked-dir";
 }
 
 interface WebFixture {
   root: string;
+  home: string;
   capture: string;
   venv: string;
+  binPath: string;
   env: NodeJS.ProcessEnv;
 }
 
@@ -66,6 +70,45 @@ async function withWebFixture<T>(options: FixtureOptions, run: (fixture: WebFixt
       await writeFile(join(scripts, name), await readFile(resolve("scripts", name)));
     }
     await chmod(wrapper, 0o755);
+    // A genuine npm-style consumer bin: the public entry point is the symlink
+    // npm creates under node_modules/.bin, not a copy of the wrapper. With
+    // `symlinked-dir` that directory is itself a symlink, so `bin/..` has a
+    // different physical and logically normalized meaning.
+    let binPath = wrapper;
+    if (options.binLink) {
+      const binDir = join(root, "node_modules", ".bin");
+      await mkdir(join(root, "node_modules"), { recursive: true });
+      let linkDir = binDir;
+      let relativeTarget = join("..", "..", "scripts", "pi-review-web.sh");
+      if (options.binLink === "symlinked-dir") {
+        linkDir = join(root, "real-bin");
+        await mkdir(linkDir, { recursive: true });
+        await symlink(join("..", "real-bin"), binDir);
+        relativeTarget = join("..", "scripts", "pi-review-web.sh");
+      } else {
+        await mkdir(binDir, { recursive: true });
+      }
+      binPath = join(binDir, "pi-review-web");
+      const linkPath = join(linkDir, "pi-review-web");
+      if (options.binLink === "absolute") {
+        await symlink(wrapper, linkPath);
+      } else if (options.binLink === "relative" || options.binLink === "symlinked-dir") {
+        await symlink(relativeTarget, linkPath);
+      } else {
+        await symlink("./pi-review-web-alias", linkPath);
+        await symlink(relativeTarget, join(linkDir, "pi-review-web-alias"));
+      }
+      if (options.binLink === "symlinked-dir") {
+        // Decoy at the root a logical `bin/..` normalization would select.
+        const decoyScripts = join(root, "node_modules", "scripts");
+        await mkdir(decoyScripts, { recursive: true });
+        await writeFile(
+          join(decoyScripts, "prepare-application.cjs"),
+          `require("node:fs").writeFileSync(${JSON.stringify(join(root, "decoy-called"))}, "called");\nprocess.exit(0);\n`,
+          "utf8",
+        );
+      }
+    }
     await cp(resolve("skills"), join(root, "skills"), { recursive: true });
     await writeFile(
       join(root, "package.json"),
@@ -167,8 +210,10 @@ async function withWebFixture<T>(options: FixtureOptions, run: (fixture: WebFixt
 
     const fixture: WebFixture = {
       root,
+      home,
       capture,
       venv,
+      binPath,
       env: {
         HOME: home,
         TMPDIR: root,
@@ -244,7 +289,7 @@ function runBounded(command: string, args: string[], options: {
 }
 
 function runWrapper(fixture: WebFixture, args: string[] = ["--query", "example"]) {
-  return runBounded("/bin/bash", [join(fixture.root, "scripts", "pi-review-web.sh"), ...args], {
+  return runBounded("/bin/bash", [fixture.binPath, ...args], {
     cwd: fixture.root,
     env: fixture.env,
   });
@@ -305,6 +350,57 @@ test("actual packaged web wrapper skips preparation work and preserves CLI argum
 
     const second = await runWrapper(fixture);
     assert.equal(second.status, 23, "a packaged package with its exact version stays current");
+  });
+});
+
+test("a genuine npm-style packaged web bin resolves the physical package root and preserves CLI arguments/status", { skip: POSIX_ONLY }, async () => {
+  for (const binLink of ["relative", "absolute", "chain"] as const) {
+    await withWebFixture({ source: false, packagedCli: true, ddgs: "valid", nodeStatus: 23, binLink }, async (fixture) => {
+      assert.equal((await lstat(fixture.binPath)).isSymbolicLink(), true, "the public bin must be npm's symlink");
+      const args = ["--query", "two words", "", "--flag"];
+      const result = await runWrapper(fixture, args);
+      assert.equal(result.timedOut, false, "bin resolution must not hang");
+      assert.equal(result.status, 23, `the CLI's own status must propagate: ${result.stderr}`);
+      assert.doesNotMatch(result.stderr, /MODULE_NOT_FOUND|Cannot find module/u,
+        "the .bin launch must not fall back to the shim parent's missing helpers");
+      const cli = await capturedNode(fixture);
+      assert.ok(cli);
+      const physicalCli = await realpath(join(fixture.root, "dist", "src", "web", "cli.js"));
+      assert.deepEqual(cli.args, [physicalCli, ...args], "the physical packaged CLI and every argument must be preserved");
+      assert.equal(cli.cliExists, true, "the installed CLI must be the actual Node entry path");
+      assert.equal(cli.ddgsPython, join(fixture.venv, "bin", "python"));
+      assert.equal(await readFile(join(fixture.capture, "npm-args"), "utf8").then(() => true, () => false), false,
+        "a packaged .bin launch must not install or compile");
+      // Complete preparation ran before the CLI: shipped skills were published.
+      assert.equal(
+        await readFile(join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md"), "utf8").then(() => true, () => false),
+        true,
+        "the launcher must complete preparation before launching the CLI",
+      );
+    });
+  }
+});
+
+test("a symlinked consumer web bin directory resolves the physical package, never a logically normalized decoy", { skip: POSIX_ONLY }, async () => {
+  await withWebFixture({ source: false, packagedCli: true, ddgs: "valid", nodeStatus: 23, binLink: "symlinked-dir" }, async (fixture) => {
+    assert.equal((await lstat(fixture.binPath)).isSymbolicLink(), true, "the public bin must be npm's symlink");
+    const args = ["--query", "two words", "", "--flag"];
+    const result = await runWrapper(fixture, args);
+    assert.equal(result.timedOut, false, "bin resolution must not hang");
+    assert.equal(result.status, 23, `the CLI's own status must propagate: ${result.stderr}`);
+    assert.doesNotMatch(result.stderr, /MODULE_NOT_FOUND|Cannot find module/u);
+    const cli = await capturedNode(fixture);
+    assert.ok(cli);
+    const physicalCli = await realpath(join(fixture.root, "dist", "src", "web", "cli.js"));
+    assert.deepEqual(cli.args, [physicalCli, ...args], "the physical packaged CLI and every argument must be preserved");
+    assert.equal(cli.cliExists, true);
+    assert.equal(await readFile(join(fixture.root, "decoy-called"), "utf8").then(() => true, () => false), false,
+      "the logically normalized decoy preparation helper must not execute");
+    assert.equal(
+      await readFile(join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md"), "utf8").then(() => true, () => false),
+      true,
+      "the launcher must complete preparation from the physical package before launching the CLI",
+    );
   });
 });
 

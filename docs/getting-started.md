@@ -43,8 +43,8 @@ Behavioral detail lives in the linked pages.
   existing `py -3` launcher); the pinned DDGS environment is created and managed
   automatically below. No other runtime feature uses Python.
 - **Bash and standard Unix command-line utilities, for the current `.sh` launchers.**
-  These scripts use tools such as `dirname`, `mkdir`, `mktemp`, `chmod`, `cp`, and
-  `rm`; Bash alone is not the entire launcher environment. Launchers prepare DDGS
+  These scripts use tools such as `dirname`, `readlink`, `mkdir`, `mktemp`, `chmod`, `cp`,
+  and `rm`; Bash alone is not the entire launcher environment. Launchers prepare DDGS
   when its recorded installation is missing or outdated, even if the session will
   not use `WebSearch`; current launches do not run Python setup checks.
 - **Platform shell, for `ShellStart`.** macOS/Linux use `/bin/bash`, POSIX process

@@ -15,6 +15,25 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.182]
+
+### Fixed
+
+- Eligible background-shell, subtask, and review notifications now steer at Pi's next
+  supported boundary instead of waiting for the current turn's natural stop (#452).
+  Routine match, milestone, and stall wakes, subtask completion notices, launch
+  notices, review transmissions, and background-completion resumes reach the
+  still-running turn while a foreground command keeps running normally, and an idle
+  session still resumes through the same triggered delivery. Stored delivery records,
+  delivery ids, receipt keys, and message bytes are unchanged. Genuine user input held
+  during a review keeps its follow-up release, scheduler new-work admission is
+  unchanged, and an unrecognized persisted delivery kind is preserved with a
+  diagnostic instead of being sent or acknowledged. The busy-only routine-wake hold
+  (with its settlement-time coalescing) is
+  removed along with the pre-send deferral; duplicate suppression still comes from the
+  existing wake interval and exit coalescing. Background wake freshness remains a
+  separate, unresolved concern.
+
 ## [0.1.0-dev.181]
 
 ### Fixed

@@ -283,21 +283,22 @@ if ("reason" in resolved) {
     return (request ?? []).filter((message) => message.text.includes(INTENT));
   }
 
-  test("#191 real host: idle /subtask-interrupt failure reaches the next model request outside tool calls, only in its own session", () => withOwnedScope(async (scope) => {
+  test("#191 real host: idle /subtask-interrupt failure steers into its own turn and later requests, only in its own session", () => withOwnedScope(async (scope) => {
     const paths = await scratchRepo(scope, "idle");
     const owner = await hostSession(scope, "idle-a", paths);
     const other = await hostSession(scope, "idle-b", paths);
     const { executionId, taskId } = await startRunning(owner.controller, "interrupt me");
     await owner.session.prompt(`/subtask-interrupt ${executionId} ${taskId} failure`);
-    assert.equal(owner.requests.length, 0, "the interrupt feedback triggered no model turn by itself");
+    // The note steers with a triggered turn, so an idle session no longer
+    // leaves it waiting for a request that may never come.
+    await waitFor(() => owner.requests.length >= 1, 30_000);
+    await owner.session.waitForIdle();
     assert.equal(owner.controller.inspect(executionId, taskId).tasks[0]?.state, "interrupted");
     const stored = owner.session.messages.filter((message: any) => message.customType === SUBTASK_INTERRUPT_FEEDBACK_CUSTOM_TYPE);
     assert.equal(stored.length, 1, "exactly one feedback note was queued (failure mode has no separate intent note)");
-
-    await owner.session.prompt("What is the state of my subtasks?");
-    assert.equal(owner.requests.length, 1);
+    assert.equal(owner.requests.length, 1, "the feedback triggered exactly one turn of its own");
     const seen = feedbackIn(owner.requests[0]);
-    assert.equal(seen.length, 1, "the next model request carries the feedback once");
+    assert.equal(seen.length, 1, "the triggered model request carries the feedback once");
     assert.notEqual(seen[0]!.role, "toolResult", "the feedback is context, not a tool result");
     assert.match(seen[0]!.text, /interrupted by user/);
     assert.match(seen[0]!.text, /do not restart without authorization/);
@@ -306,13 +307,17 @@ if ("reason" in resolved) {
     assert.match(seen[0]!.text, /Stop: acknowledged\./);
     assert.doesNotMatch(seen[0]!.text, /Merge:/);
 
+    await owner.session.prompt("What is the state of my subtasks?");
+    assert.equal(owner.requests.length, 2);
+    assert.equal(feedbackIn(owner.requests[1]).length, 1, "the next model request still carries the feedback once");
+
     await other.session.prompt("Anything new?");
     assert.equal(other.requests.length, 1);
     assert.equal(feedbackIn(other.requests[0]).length, 0, "another live session never receives the note");
     assert.ok(other.requests[0]!.every((message) => !message.text.includes(taskId)));
   }));
 
-  test("#191 real host: interrupt-with-merge intent precedes the completion wake turn it triggers", () => withOwnedScope(async (scope) => {
+  test("#191 real host: interrupt-with-merge intent steers first and the landing wake follows it in the same run", () => withOwnedScope(async (scope) => {
     const paths = await scratchRepo(scope, "merge");
     const owner = await hostSession(scope, "merge", paths);
     const { executionId, taskId } = await startRunning(owner.controller, "merge me");
@@ -320,11 +325,15 @@ if ("reason" in resolved) {
     await waitFor(() => owner.requests.length >= 1, 30_000);
     await owner.session.waitForIdle();
     assert.equal(owner.controller.inspect(executionId, taskId).tasks[0]?.state, "landed");
-    const wakeTurn = owner.requests[0]!;
-    assert.ok(wakeTurn.some((message) => message.text.includes("force-merged and landed mechanically")), "the first triggered request is the completion wake");
-    const intent = feedbackIn(wakeTurn);
-    assert.equal(intent.length, 1, "the wake-triggered request already carries the user's intent");
+    const intentTurn = owner.requests[0]!;
+    const intent = feedbackIn(intentTurn);
+    assert.equal(intent.length, 1, "the intent note steers and its own triggered turn carries it");
     assert.match(intent[0]!.text, /Settlement is pending: this note does not claim that the task stopped or that anything landed/);
+    const landed = owner.requests.find((request) => request.some((message) => message.text.includes("force-merged and landed mechanically")));
+    assert.ok(landed, "the completion wake reached the model");
+    const intentIndex = landed.findIndex((message) => message.text.includes(INTENT));
+    const wakeIndex = landed.findIndex((message) => message.text.includes("force-merged and landed mechanically"));
+    assert.ok(intentIndex !== -1 && intentIndex < wakeIndex, "the user's intent precedes the completion wake it triggers");
 
     await owner.session.prompt("Status?");
     const next = owner.requests.at(-1)!;

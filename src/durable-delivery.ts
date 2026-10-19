@@ -5,6 +5,13 @@ export type NewModelDelivery = Omit<PendingModelDelivery, "deliveryId" | "status
   deliveryId?: string;
 };
 
+/** Kinds that are model-facing notifications eligible for the steering send
+ *  lane. Restore validates the delivery array, not each member, so an
+ *  unrecognized persisted kind must never be sent or marked delivered (#452). */
+export function isNotificationDeliveryKind(kind: unknown): boolean {
+  return kind === "review_transmission" || kind === "review_authorization" || kind === "reviewer_answer";
+}
+
 export function modelDeliveryId(delivery: Pick<PendingModelDelivery, "kind" | "channel" | "message" | "invocationDir" | "action">): string {
   return createHash("sha256").update(JSON.stringify([
     delivery.kind,

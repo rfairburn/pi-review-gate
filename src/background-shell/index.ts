@@ -183,13 +183,6 @@ interface Job {
   /** A match wake held back to see whether the job exits first. */
   pendingWake?: ReturnType<typeof setTimeout>;
   /**
-   * At most one nonurgent (match/milestone/silence) wake held internally
-   * while the agent is active, instead of accumulating as queued Pi
-   * followUps that would be delivered stale after a later exit. Delivered at
-   * agent_settled only while the job is still running; an exit supersedes it.
-   */
-  heldWake?: { event: WakeEvent; count: number };
-  /**
    * Set when this job's exit wake was submitted but its injection into the
    * transcript has not yet been observed as a custom message event
    * (message_start with customType "pi-review-bg-shell", details.id ===
@@ -590,13 +583,6 @@ function resolveJob(target: string): { job?: Job; error?: ReturnType<typeof text
   return { error: errorResult(`Error: no such job id or label ${JSON.stringify(target)}. Use ShellList to see available job IDs.`) };
 }
 
-/** True while Pi reports an active agent run (agent_start … agent_settled).
- *  Nonurgent wakes arriving in this window are held internally instead of
- *  being queued into Pi, where they would pile up behind the busy agent and —
- *  if the job exits meanwhile — be delivered after the exit wake claiming the
- *  job is "still running". */
-let agentRunActive = false;
-
 /** Send a wake event to the agent through the lane its urgency earns.
  *
  *  The real extension API's pi.sendMessage returns void (the loader forwards
@@ -610,32 +596,29 @@ let agentRunActive = false;
  *  fires before the call returns), and observation only clears an existing
  *  marker. If that host then throws, the observed wake still reports
  *  accepted; a throw with no observation leaves nothing scheduled and
- *  nothing to recover. A run that ends without draining its follow-up queue
- *  (an aborted run) leaves the wake stuck in Pi's internal queue; at
+ *  nothing to recover. A run that ends without draining its queued wake (an
+ *  aborted run) leaves the wake stuck in Pi's internal queue; at
  *  agent_settled a still-outstanding marker triggers one bounded recovery
  *  turn that resumes Pi's own drainage of the retained completion — never a
  *  second copy of it. Routine status wakes stay best-effort: losing one is
  *  survivable by design, and they are never tracked or resumed. */
-function sendWake(pi: BackgroundShellHost, job: Job, event: WakeEvent, now: number, coalescedCount: number): boolean {
+function sendWake(pi: BackgroundShellHost, job: Job, event: WakeEvent, now: number): boolean {
   job.wake.lastWakeAt = now;
   const delivery = laneDelivery(event.lane);
-  const reported = coalescedCount > 1
-    ? { ...event, reason: `${event.reason} (coalesced ${coalescedCount} wake(s) while the agent was busy)` }
-    : event;
   const payload = formatWakePayload({
     id: job.id,
     label: job.label,
     command: job.command,
-    event: reported,
+    event,
     elapsedMs: (job.endedAt ?? now) - job.startedAt,
     exitCode: event.kind === "exit" ? job.exitCode : undefined,
     lines: job.buffer.around(WAKE_CONTEXT_LINES),
     totalLines: job.buffer.total,
   });
   // Tag the notification with its event kind so observation can acknowledge
-  // only exit completions: an earlier urgent match (steer lane) can be
-  // injected while this job's exit completion is still queued in the
-  // follow-up lane, and must not clear the outstanding-exit marker.
+  // only exit completions: an earlier match wake can be injected while this
+  // job's exit completion is still queued in Pi, and must not clear the
+  // outstanding-exit marker.
   const message = { customType: "pi-review-bg-shell", content: payload, display: true, details: { id: job.id, kind: event.kind } };
   // Mark the exit wake outstanding before sending so a synchronous
   // observation from inside sendMessage (message_start before the void call
@@ -672,10 +655,10 @@ function sendWake(pi: BackgroundShellHost, job: Job, event: WakeEvent, now: numb
  *  details.id = job id, details.kind = event kind) — both when it is queued
  *  and drained mid-run and when it starts a fresh run — so observation proves
  *  delivery to the owning session's model. Only an exit injection (kind ===
- *  "exit") acknowledges the marker: urgent matches travel the steering lane
- *  and can be injected while the same job's exit completion is still queued
- *  in the follow-up lane; acknowledging on a match would strand that
- *  completion after an abort with no recovery marker left. */
+ *  "exit") acknowledges the marker: an earlier match wake can be injected
+ *  while the same job's exit completion is still queued; acknowledging on a
+ *  match would strand that completion after an abort with no recovery marker
+ *  left. */
 function observeWakeDelivery(event: unknown): void {
   const message = (event as { message?: Record<string, unknown> } | undefined)?.message;
   if (!message || message.role !== "custom" || message.customType !== "pi-review-bg-shell") return;
@@ -687,7 +670,7 @@ function observeWakeDelivery(event: unknown): void {
 
 /** Resume drainage of exit wakes that were never observed in the transcript.
  *  Called at agent_settled: a run that just settled may have ended without
- *  draining its follow-up queue (an aborted run). Pi retains the queued
+ *  draining its queued wake (an aborted run). Pi retains the queued
  *  completion — Agent.abort() does not clear the queues, and neither does a
  *  new prompt — so re-submitting it would inject one copy immediately and
  *  drain the original again when the recovery turn stops: a duplicate. One
@@ -721,42 +704,12 @@ function resendUnobservedExitWakes(pi: BackgroundShellHost): void {
   }
 }
 
-/** Deliver a wake event, coalescing routine non-exit ones internally while the
- *  agent is active so they cannot accumulate in Pi and go stale. Exit wakes
- *  always supersede held status and go through while Pi is still streaming;
- *  Pi can then drain the exit follow-up before agent_settled. Urgent ("now")
- *  matches likewise go through immediately. */
+/** Deliver a wake event through its lane. #452: eligible routine and exit
+ *  wakes steer, so they reach the owning turn at Pi's next supported boundary
+ *  instead of waiting for the natural stop (settlement). Delivery is therefore
+ *  never held by this code merely because an agent run is already active. */
 function deliverWake(pi: BackgroundShellHost, job: Job, event: WakeEvent, now: number): boolean {
-  const supersedesHeldWake = event.kind === "exit" || event.lane === "now";
-  if (!supersedesHeldWake && agentRunActive) {
-    const held = job.heldWake;
-    if (held) {
-      // Latest event wins: it describes the newest state of the job.
-      held.event = event;
-      held.count += 1;
-    } else {
-      job.heldWake = { event, count: 1 };
-    }
-    return true;
-  }
-  if (supersedesHeldWake) {
-    // A completed job or newer urgent event makes routine status obsolete.
-    job.heldWake = undefined;
-  }
-  return sendWake(pi, job, event, now, 1);
-}
-
-/** Release held routine wakes once Pi settles. Exit handling clears these
- *  synchronously, so an exited job can never emit a stale "still running"
- *  notification here. */
-function flushHeldWakes(pi: BackgroundShellHost): void {
-  for (const job of jobs.values()) {
-    const held = job.heldWake;
-    if (!held) continue;
-    job.heldWake = undefined;
-    if (job.exited) continue;
-    sendWake(pi, job, held.event, Date.now(), held.count);
-  }
+  return sendWake(pi, job, event, now);
 }
 
 /** How long a match wake waits to see whether the job is about to exit anyway.
@@ -841,14 +794,11 @@ function settleJob(pi: BackgroundShellHost, job: Job, code: number): void {
     handleLine(pi, job, remaining);
   }
   // Drop any held match wake: the exit wake below says everything it would
-  // have, and the exit code besides. A nonurgent wake held for the agent's
-  // benefit is stale the instant the job exits — "still running" would be a
-  // lie — so it goes too; if an exit notice is due it replaces it.
+  // have, and the exit code besides.
   if (job.pendingWake) {
     clearTimeout(job.pendingWake);
     job.pendingWake = undefined;
   }
-  job.heldWake = undefined;
   setIndicator();
   const event = evaluateExit(code, job.rules);
   const exitWakeScheduled = event ? deliverWake(pi, job, event, Date.now()) : false;
@@ -1022,10 +972,8 @@ function killJob(job: Job): void {
 
 /** Reap everything. A background job may outlive a turn, never the session. */
 export function reapAll(): void {
-  agentRunActive = false;
   for (const job of jobs.values()) {
     if (job.pendingWake) clearTimeout(job.pendingWake);
-    job.heldWake = undefined;
     if (!job.exited) {
       // On Windows the host may re-raise its signal and exit right after this:
       // the stop-file request is synchronous, and the watchdog's parent-death
@@ -1504,25 +1452,16 @@ export function registerBackgroundShell(
     renderResult: expandableResult(shellStopCollapsedView, renderShellStopResult),
   });
 
-  // Track the agent's own lifecycle so nonurgent wakes can be held while the
-  // model is busy and released exactly once it settles. Runtimes that never
-  // emit these events keep today's immediate-delivery behaviour, because
-  // agentRunActive simply stays false.
-  pi.on("agent_start", () => {
-    agentRunActive = true;
-  });
   // The injected custom wake message is the delivery signal for outstanding
-  // exit wakes (see observeWakeDelivery).
+  // exit wakes (see observeWakeDelivery). Wakes are not held for an active
+  // run (#452): steering delivers them at Pi's next supported boundary.
   pi.on("message_start", (event) => observeWakeDelivery(event));
   pi.on("agent_settled", () => {
-    agentRunActive = false;
-    flushHeldWakes(pi);
     resendUnobservedExitWakes(pi);
   });
 
   // A job may outlive a turn; it must never outlive the session.
   pi.on("session_shutdown", async () => {
-    agentRunActive = false;
     reapAll();
     setIndicator();
   });

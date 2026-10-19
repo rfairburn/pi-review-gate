@@ -57,6 +57,8 @@ export function extractContext(args: unknown[]): unknown {
   return args.find((arg) => isRecord(arg) && isRecord(arg.ui)) ?? undefined;
 }
 
+/** Genuine queued user input (input held while the gate reviews) keeps its
+ *  follow-up release; #452 moved notifications to steering instead. */
 export async function sendFollowUp(pi: unknown, message: string): Promise<boolean> {
   if (isRecord(pi) && typeof pi.sendUserMessage === "function") {
     await pi.sendUserMessage(message, { deliverAs: "followUp" });
@@ -65,16 +67,17 @@ export async function sendFollowUp(pi: unknown, message: string): Promise<boolea
   return false;
 }
 
+/** #452: the triggered background/review wake steers at the next supported boundary. */
 export async function sendTriggeredFollowUp(pi: unknown, message: string): Promise<boolean> {
   if (isRecord(pi) && typeof pi.sendMessage === "function") {
     await pi.sendMessage(
       { customType: "pi-review-background-ready", content: message, display: true },
-      { deliverAs: "followUp", triggerTurn: true },
+      { deliverAs: "steer", triggerTurn: true },
     );
     return true;
   }
   if (isRecord(pi) && typeof pi.sendUserMessage === "function") {
-    await pi.sendUserMessage(message, { deliverAs: "followUp", triggerTurn: true });
+    await pi.sendUserMessage(message, { deliverAs: "steer", triggerTurn: true });
     return true;
   }
   return false;

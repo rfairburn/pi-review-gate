@@ -137,7 +137,7 @@ review: { activeReviewers: [
     await waitForCondition(() => followUps.length === 1);
     assert.match(followUps[0]?.message ?? "", /previously blocked review reached an idle transition/);
     assert.match(followUps[0]?.message ?? "", /Re-check ShellList because a newer job may have started/);
-    assert.deepEqual(followUps[0]?.options, { deliverAs: "followUp", triggerTurn: true });
+    assert.deepEqual(followUps[0]?.options, { deliverAs: "steer", triggerTurn: true });
 
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "verified background output" }] });

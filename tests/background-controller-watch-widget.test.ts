@@ -359,8 +359,8 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     controller.watch(started.executionId, 25);
     await waitFor(() => contents.some((content) => content.startsWith("[pi-review-subtask-watch]")));
     const watchIndex = contents.findIndex((content) => content.startsWith("[pi-review-subtask-watch]"));
-    assert.deepEqual(deliveries[watchIndex], { deliverAs: "followUp", triggerTurn: true },
-      "watch checkpoints follow up with a turn and never steer, matching watchCheckpointDelivery()");
+    assert.deepEqual(deliveries[watchIndex], { deliverAs: "steer", triggerTurn: true },
+      "watch checkpoints steer with a turn, matching watchCheckpointDelivery()");
     await controller.shutdown();
   } finally {
     await rm(root, { recursive: true, force: true });

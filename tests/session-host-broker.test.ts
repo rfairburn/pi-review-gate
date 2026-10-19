@@ -28,6 +28,7 @@ import {
   type SessionSpawnInput,
   type SessionSpawnOutcome,
 } from "../src/session-host/protocol";
+import { __test as payloadTest, stageSessionHostPayload, type StagedSessionHostPayload } from "../src/session-host/payload";
 
 const INSTANCE_A = "11111111-1111-4111-8111-111111111111";
 const INSTANCE_B = "22222222-2222-4222-8222-222222222222";
@@ -229,20 +230,25 @@ async function createStatusBroker(options?: StatusBrokerOptions): Promise<Status
   return broker;
 }
 
-async function withFilesystemCallSpy<T>(run: (calls: string[]) => Promise<T>): Promise<T> {
+interface FilesystemCall {
+  name: string;
+  args: unknown[];
+}
+
+async function withFilesystemCallSpy<T>(run: (calls: FilesystemCall[]) => Promise<T>): Promise<T> {
   const fsModule = require("node:fs") as Record<string, unknown>;
   const names = [
     "chmodSync", "linkSync", "lstatSync", "mkdirSync", "renameSync", "rmdirSync",
     "statSync", "unlinkSync", "mkdtempSync", "realpathSync",
   ];
-  const calls: string[] = [];
+  const calls: FilesystemCall[] = [];
   const originals = new Map<string, unknown>();
   for (const name of names) {
     const original = fsModule[name];
     if (typeof original !== "function") throw new Error(`test setup: node:fs.${name} is unavailable`);
     originals.set(name, original);
     fsModule[name] = (...args: unknown[]) => {
-      calls.push(name);
+      calls.push({ name, args });
       return Reflect.apply(original, fsModule, args);
     };
   }
@@ -268,6 +274,13 @@ async function withDeadline<T>(promise: Promise<T>, label: string, timeoutMs = S
 }
 
 afterEach(async () => {
+  for (const handle of stagedPayloadOwnership.splice(0)) {
+    try {
+      handle.discard(); // Releases the continuity pin; preserved/replaced entries stay put.
+    } catch {
+      // Teardown releases ownership only; it never asserts on payload state.
+    }
+  }
   brokerTest.setSpawnTimeoutForTests(undefined);
   brokerTest.setSocketPathLimitForTests(undefined);
   brokerTest.setPlatformForTests(undefined);
@@ -392,6 +405,17 @@ function helloFrame(bootstrap: SessionHostBootstrap, overrides?: {
     token: overrides?.token ?? bootstrap.token,
     ...(overrides?.capabilities === undefined ? {} : { capabilities: overrides.capabilities }),
   };
+}
+
+/** Ownership handles staged by this test, released in teardown so no pin outlives its test. */
+const stagedPayloadOwnership: StagedSessionHostPayload[] = [];
+
+/** Stages one exact prompt in the registration's private namespace and returns only its wire reference. */
+function spawnPayload(bootstrap: SessionHostBootstrap, prompt: string): { name: string; size: number; sha256: string } {
+  assert.equal(typeof bootstrap.payloadDir, "string", "the production broker advertises a payload namespace");
+  const staged = stageSessionHostPayload(bootstrap.payloadDir as string, JSON.stringify(prompt));
+  stagedPayloadOwnership.push(staged);
+  return staged.descriptor;
 }
 
 interface Recorded {
@@ -557,7 +581,20 @@ test("Windows transport uses a fresh local pipe and disposes only its own listen
 
     await disposeBroker(broker);
     assert.equal(closeCalls, 1, "the broker closes its own successful listen handle exactly once");
-    assert.deepEqual(filesystemCalls, [], "named-pipe bind and disposal never call filesystem permission or cleanup APIs");
+    assert.deepEqual(
+      filesystemCalls.filter((call) => call.args.some((arg) => typeof arg === "string" && arg.includes("pipe"))),
+      [],
+      "named-pipe bind and disposal never inspect, unlink, or rename the pipe address as a filesystem path",
+    );
+    assert.deepEqual(
+      filesystemCalls.filter((call) => ["linkSync", "renameSync", "statSync", "unlinkSync"].includes(call.name)),
+      [],
+      "the named-pipe transport performs no filesystem endpoint observation or cleanup",
+    );
+    assert.ok(
+      filesystemCalls.every((call) => ["chmodSync", "lstatSync", "mkdtempSync", "realpathSync", "rmdirSync"].includes(call.name)),
+      "only the private payload namespace uses temp-directory lifecycle APIs on Windows",
+    );
   });
 });
 
@@ -1041,6 +1078,8 @@ test("pending Stop fences new SessionSpawn requests until an idle-only rejection
   const stopping = registration.shutdown({ requireIdle: true });
   await waitFor(() => outbound.some((frame) => frame.type === "shutdown_request"));
   const shutdown = outbound.find((frame) => frame.type === "shutdown_request")!;
+  const blockedSpawnPrompt = "This must not launch during Stop.";
+  const blockedPayload = spawnPayload(registration.bootstrap, blockedSpawnPrompt);
   const blockedSpawn = {
     version: 1,
     type: "spawn_request",
@@ -1050,13 +1089,18 @@ test("pending Stop fences new SessionSpawn requests until an idle-only rejection
     requestId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     workspace: "/existing workspace",
     title: "Blocked while stopping",
-    prompt: "This must not launch during Stop.",
+    payload: blockedPayload,
   };
   client.write(encodeFrame(blockedSpawn as never));
   await waitFor(() => outbound.some((frame) => frame.type === "spawn_result" && frame.requestId === blockedSpawn.requestId));
   assert.equal(outbound.find((frame) => frame.type === "spawn_result" && frame.requestId === blockedSpawn.requestId)?.outcome,
     "failed", "the broker refuses the request without invoking the host while shutdown is pending");
   assert.equal(spawnCalls, 0);
+  await waitFor(() => !fs.existsSync(path.join(registration.bootstrap.payloadDir as string, blockedPayload.name)));
+  assert.equal(fs.existsSync(path.join(registration.bootstrap.payloadDir as string, blockedPayload.name)), false,
+    "a definitely rejected request discards only its exact verified staged payload");
+  assert.equal(fs.existsSync(registration.bootstrap.payloadDir as string), true,
+    "the active registration keeps its namespace for later requests");
 
   client.write(encodeFrame({
     version: 1,
@@ -1071,7 +1115,12 @@ test("pending Stop fences new SessionSpawn requests until an idle-only rejection
   } as never));
   assert.equal((await stopping).status, "not-idle");
 
-  const retry = { ...blockedSpawn, requestId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" };
+  const retryPrompt = "Retry after the idle-only rejection.";
+  const retry = {
+    ...blockedSpawn,
+    requestId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    payload: spawnPayload(registration.bootstrap, retryPrompt),
+  };
   client.write(encodeFrame(retry as never));
   await waitFor(() => outbound.some((frame) => frame.type === "spawn_result" && frame.requestId === retry.requestId));
   assert.equal(outbound.find((frame) => frame.type === "spawn_result" && frame.requestId === retry.requestId)?.outcome,
@@ -1769,6 +1818,15 @@ test("authenticated SessionSpawn is routed once and returns only a correlated la
       if (message) replies.push(message as unknown as Record<string, unknown>);
     }
   });
+  const requestPrompt = [
+    "BEGIN broker long prompt",
+    "--session must remain prompt text",
+    "Multibyte 日本語 — quotes \"exact\" — newlines preserved.",
+    "MIDDLE".repeat(1_500),
+    "END broker long prompt",
+    "",
+  ].join("\n");
+  assert.ok(Buffer.byteLength(requestPrompt, "utf8") > 8192);
   const request = {
     version: 1 as const,
     type: "spawn_request" as const,
@@ -1778,12 +1836,12 @@ test("authenticated SessionSpawn is routed once and returns only a correlated la
     requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     workspace: "/existing workspace",
     title: "A long friendly title " + "x".repeat(280),
-    prompt: "--session must remain prompt text\nKeep this exact.\n",
+    payload: spawnPayload(registration.bootstrap, requestPrompt),
   };
   const encoded = encodeFrame(request as never);
   client.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encoded + encoded);
   await waitFor(() => calls === 1);
-  assert.deepEqual(received, [{ workspace: request.workspace, title: request.title, prompt: request.prompt }]);
+  assert.deepEqual(received, [{ workspace: request.workspace, title: request.title, prompt: requestPrompt }]);
   assert.equal(Object.hasOwn(received[0]!, "token"), false, "the credential never reaches the host callback");
   assert.equal(replies.length, 0, "the broker waits for the host's actual launch decision");
 
@@ -1797,7 +1855,8 @@ test("authenticated SessionSpawn is routed once and returns only a correlated la
     requestId: request.requestId,
     outcome: "started",
   });
-  assert.equal(JSON.stringify(replies).includes(request.prompt), false, "the reply never echoes prompt content");
+  assert.equal(JSON.stringify(replies).includes(requestPrompt), false, "the reply never echoes prompt content");
+  assert.equal(JSON.stringify(replies).includes(request.payload.name), false, "the reply never echoes the private payload reference");
   client.write(encoded); // A completed exact replay is acknowledged without launching twice.
   await waitFor(() => replies.length === 2);
   assert.equal(calls, 1);
@@ -1814,6 +1873,7 @@ test("SessionSpawn rejects a spoofed token and deduplicates across connection su
     onDisconnect: () => undefined,
     onSpawnRequest: () => { calls += 1; return hostOperation; },
   });
+  const spoofPrompt = "Start.";
   const request = {
     version: 1 as const,
     type: "spawn_request" as const,
@@ -1823,7 +1883,7 @@ test("SessionSpawn rejects a spoofed token and deduplicates across connection su
     requestId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
     workspace: "/existing workspace",
     title: "Hosted child",
-    prompt: "Start.",
+    payload: spawnPayload(registration.bootstrap, spoofPrompt),
   };
   const spoofed = await connectClient(broker.socketPath);
   spoofed.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame({ ...request, token: "0".repeat(64) } as never));
@@ -1878,6 +1938,7 @@ test("SessionSpawn timeout is an unknown result and permanently deduplicates tha
       if (message) replies.push(message as unknown as Record<string, unknown>);
     }
   });
+  const timeoutPrompt = "Start.";
   const request = {
     version: 1,
     type: "spawn_request",
@@ -1887,7 +1948,7 @@ test("SessionSpawn timeout is an unknown result and permanently deduplicates tha
     requestId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
     workspace: "/existing workspace",
     title: "Hosted child",
-    prompt: "Start.",
+    payload: spawnPayload(registration.bootstrap, timeoutPrompt),
   };
   const frame = encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame(request as never);
   client.write(frame);
@@ -1900,6 +1961,143 @@ test("SessionSpawn timeout is an unknown result and permanently deduplicates tha
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(replies.length, 2);
   assert.equal(calls, 1);
+  await disposeBroker(broker);
+});
+
+test("missing, tampered, or NUL payloads fail without invoking the host and replay without re-reading", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  let calls = 0;
+  const registration = broker.register(INSTANCE_A, {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    onSpawnRequest: () => { calls += 1; return Promise.resolve("started"); },
+  });
+  const client = await connectClient(broker.socketPath);
+  const replies: Record<string, unknown>[] = [];
+  let buffer = "";
+  client.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const message = decodeFrame(buffer.slice(0, newline + 1));
+      buffer = buffer.slice(newline + 1);
+      if (message) replies.push(message as unknown as Record<string, unknown>);
+    }
+  });
+  client.write(encodeFrame(helloFrame(registration.bootstrap) as never));
+  const base = {
+    version: 1,
+    type: "spawn_request",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    token: registration.bootstrap.token,
+    workspace: "/existing workspace",
+    title: "Hosted child",
+  };
+
+  const missing = {
+    ...base,
+    requestId: "99999999-9999-4999-8999-999999999999",
+    payload: { name: `p-${"9".repeat(32)}.json`, size: 12, sha256: "8".repeat(64) },
+  };
+  client.write(encodeFrame(missing as never));
+  await waitFor(() => replies.some((frame) => frame.requestId === missing.requestId));
+  assert.equal(replies.find((frame) => frame.requestId === missing.requestId)?.outcome, "failed");
+  assert.equal(calls, 0, "a missing private payload never reaches the host callback");
+
+  const tamperedPrompt = "This exact staged prompt will be tampered.";
+  const tamperedPayload = spawnPayload(registration.bootstrap, tamperedPrompt);
+  const tamperedPath = path.join(registration.bootstrap.payloadDir as string, tamperedPayload.name);
+  const original = fs.readFileSync(tamperedPath);
+  fs.writeFileSync(tamperedPath, Buffer.from("X".repeat(original.length)));
+  const tampered = { ...base, requestId: "88888888-8888-4888-8888-888888888888", payload: tamperedPayload };
+  client.write(encodeFrame(tampered as never));
+  await waitFor(() => replies.some((frame) => frame.requestId === tampered.requestId));
+  assert.equal(replies.find((frame) => frame.requestId === tampered.requestId)?.outcome, "failed");
+  assert.equal(calls, 0, "a size/digest mismatch never reaches the host callback");
+  assert.equal(fs.existsSync(tamperedPath), true, "a rejected payload entry is preserved, never deleted");
+
+  // An exact replay must coalesce on the completed fingerprint before reading:
+  // the consumed-or-preserved payload is never re-read and no child is created.
+  client.write(encodeFrame(tampered as never));
+  await waitFor(() => replies.filter((frame) => frame.requestId === tampered.requestId).length === 2);
+  assert.equal(calls, 0);
+  assert.equal(fs.existsSync(tamperedPath), true);
+
+  const nulPayload = spawnPayload(registration.bootstrap, "a\0b");
+  const nulPath = path.join(registration.bootstrap.payloadDir as string, nulPayload.name);
+  const nul = { ...base, requestId: "77777777-7777-4777-8777-777777777777", payload: nulPayload };
+  client.write(encodeFrame(nul as never));
+  await waitFor(() => replies.some((frame) => frame.requestId === nul.requestId));
+  assert.equal(replies.find((frame) => frame.requestId === nul.requestId)?.outcome, "failed");
+  assert.equal(calls, 0, "the unchanged NUL policy rejects staged prompt text");
+  assert.equal(fs.existsSync(nulPath), false, "a verified payload that decodes to invalid prompt text was still consumed");
+
+  fs.unlinkSync(tamperedPath); // Test-owned retained fixture.
+  await disposeBroker(broker);
+});
+
+test("a registered payload namespace replaced before read is rejected without invoking the host", async (t) => {
+  // Exercise Windows-style linked ownership on every platform, including teardown.
+  payloadTest.setOwnershipPinForTests(false);
+  t.after(() => payloadTest.setOwnershipPinForTests(undefined));
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  let calls = 0;
+  const registration = broker.register(INSTANCE_A, {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    onSpawnRequest: () => { calls += 1; return Promise.resolve("started"); },
+  });
+  const originalDir = registration.bootstrap.payloadDir as string;
+  const staged = stageSessionHostPayload(originalDir, JSON.stringify("original owned namespace prompt"));
+  stagedPayloadOwnership.push(staged);
+  const payload = staged.descriptor;
+  const movedDir = `${originalDir}-moved`;
+  fs.renameSync(originalDir, movedDir);
+  fs.mkdirSync(originalDir, { mode: 0o700 });
+  fs.chmodSync(originalDir, 0o700);
+  const replacementPath = path.join(originalDir, payload.name);
+  fs.copyFileSync(path.join(movedDir, payload.name), replacementPath);
+  fs.chmodSync(replacementPath, 0o600);
+
+  const client = await connectClient(broker.socketPath);
+  const replies: Record<string, unknown>[] = [];
+  let buffer = "";
+  client.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const message = decodeFrame(buffer.slice(0, newline + 1));
+      buffer = buffer.slice(newline + 1);
+      if (message) replies.push(message as unknown as Record<string, unknown>);
+    }
+  });
+  const request = {
+    version: 1,
+    type: "spawn_request",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    token: registration.bootstrap.token,
+    requestId: "66666666-6666-4666-8666-666666666666",
+    workspace: "/existing workspace",
+    title: "Replaced namespace child",
+    payload,
+  };
+  client.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame(request as never));
+  await waitFor(() => replies.some((frame) => frame.requestId === request.requestId));
+  assert.equal(replies.find((frame) => frame.requestId === request.requestId)?.outcome, "failed");
+  assert.equal(calls, 0, "the broker never reads or dispatches a payload from a replaced namespace");
+  assert.ok(fs.existsSync(replacementPath), "the replacement entry is preserved, never consumed or deleted");
+  assert.ok(fs.existsSync(path.join(movedDir, payload.name)), "the original owned payload is preserved under its moved namespace");
+
+  // Remove only the test-created replacement, then restore the observed namespace
+  // so its ownership handle can release both the payload and any continuity pin.
+  // Production cleanup must not follow a moved namespace to guess at ownership.
+  fs.unlinkSync(replacementPath);
+  fs.rmdirSync(originalDir);
+  fs.renameSync(movedDir, originalDir);
+  staged.discard();
+  assert.deepEqual(fs.readdirSync(originalDir), [], "restored ownership releases the linked pin as well as the payload");
   await disposeBroker(broker);
 });
 

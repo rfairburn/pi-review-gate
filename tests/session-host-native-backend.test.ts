@@ -27,10 +27,11 @@ import {
   prepareNativeLaunch,
   resolveNativePi,
 } from "../src/session-host/launch";
-import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "../src/session-host/startup-request";
+import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV, stageSessionHostStartupRequest } from "../src/session-host/startup-request";
 import { createStatusBroker, type StatusBroker, type StatusRegistration } from "../src/session-host/broker";
 import { HOST_BOOTSTRAP_ENV, type SessionHostStatus } from "../src/session-host/protocol";
-import { ProfileRegistry, type PreparedProfile } from "../src/session-host/profiles";
+import { NativeAgentRegistry, ProfileRegistry, type PreparedProfile } from "../src/session-host/profiles";
+import { InstanceManager, type InstancePty, type InstanceSpawnDescriptor } from "../src/session-host/instances";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import { skipOrFail } from "./bridge-fakes";
 
@@ -1403,9 +1404,16 @@ test("real Pi receives literal SessionSpawn prompts and preserves long native ti
   const profiles: PreparedProfile[] = [];
   const registrations: StatusRegistration[] = [];
   const watchers: Array<{ close(): void }> = [];
+  const stagedPayloads: Array<{ discard(): void }> = [];
   let broker: StatusBroker | undefined;
   t.after(async () => {
     for (const watcher of watchers) watcher.close();
+    let settled = true;
+    for (const owner of owners) {
+      try { await stopOwnedPty(owner); } catch { settled = false; }
+      if (owner.pty && (!owner.exit || processIsAlive(owner.pty.pid))) settled = false;
+    }
+    if (settled) for (const staged of stagedPayloads) staged.discard();
     await disposeBackendResources({ root, owners, profiles, registrations, broker });
   });
 
@@ -1509,6 +1517,9 @@ test("real Pi receives literal SessionSpawn prompts and preserves long native ti
       onDisconnect: () => undefined,
     });
     registrations.push(registration);
+    assert.ok(registration.bootstrap.payloadDir, "the real broker publishes its owned payload namespace");
+    const staged = stageSessionHostStartupRequest(registration.bootstrap.payloadDir, { title: entry.title, prompt: entry.prompt });
+    stagedPayloads.push(staged);
     const owner = await createNativeOwner(ptyModule, surfaceModule, (created) => owners.push(created), {
       id: entry.id,
       profile: entry.profile,
@@ -1517,7 +1528,7 @@ test("real Pi receives literal SessionSpawn prompts and preserves long native ti
       registration,
       statuses: entry.statuses,
       bootstrapEnv: {
-        [SESSION_HOST_STARTUP_REQUEST_ENV]: JSON.stringify({ title: entry.title, prompt: entry.prompt }),
+        [SESSION_HOST_STARTUP_REQUEST_ENV]: JSON.stringify(staged.descriptor),
         [SESSION_HOST_TITLE_COLUMNS_ENV]: "47",
         PRG_FIXTURE_AGENT_DIR: fixtureAgentDir,
         PRG_FIXTURE_STATE_DIR: entry.providerState,
@@ -1555,4 +1566,179 @@ test("real Pi receives literal SessionSpawn prompts and preserves long native ti
   }
 
   for (const owner of owners) await assertGracefulSigterm(owner);
+});
+
+test("real registered SessionSpawn delivers one exact long handoff and one short prompt through native manager children", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const prerequisites = staticPrerequisites(t, true);
+  if (!prerequisites) return;
+  const ptyModule = require("@lydell/node-pty") as NativePtyModule;
+  const root = makeSyntheticRoot();
+  const owned: Array<{ handle: InstancePty; descriptor: InstanceSpawnDescriptor; exited: boolean; subscription?: Disposable }> = [];
+  const signal = new ChangeSignal();
+  let manager: InstanceManager | undefined;
+  let broker: StatusBroker | undefined;
+  let watcher: ReturnType<typeof watch> | undefined;
+  t.after(async () => {
+    let cleanupError: unknown;
+    try {
+      if (manager) {
+        const stopped = await manager.shutdown({ graceMs: CHILD_EXIT_TIMEOUT_MS, killMs: 5_000 });
+        assert.deepEqual(stopped.remainingIds, [], "every owned native manager child must positively exit");
+      }
+    } catch (error) { cleanupError = error; }
+    // Partial setup is owned too: use only handles recorded synchronously at
+    // spawn, then require actual exit evidence before removing any fixture.
+    for (const entry of owned) {
+      if (!entry.exited) {
+        try { entry.handle.kill("SIGKILL"); } catch { /* this exact owned handle only */ }
+        try {
+          await signal.waitFor(() => entry.exited, 5_000, "partial native proof child exit");
+        } catch (error) { cleanupError ??= error; }
+      }
+      if (!entry.exited || processIsAlive(entry.handle.pid)) cleanupError ??= new Error("native proof child settlement unconfirmed; retain fixture");
+    }
+    watcher?.close();
+    if (owned.every((entry) => entry.exited && !processIsAlive(entry.handle.pid))) {
+      try { await manager?.dispose(); } catch (error) { cleanupError ??= error; }
+      try { await broker?.dispose(); } catch (error) { cleanupError ??= error; }
+    }
+    for (const entry of owned) entry.subscription?.dispose();
+    if (!cleanupError && !removeOwnedTreePruningTerraform(root)) cleanupError = new Error("native proof cleanup preserved an unexpected entry");
+    if (cleanupError) throw cleanupError;
+  });
+  initializeSyntheticDirectories(root);
+  assertBrokerSocketPathBudget(root);
+  const pi = resolvePiExecutable(prerequisites, root, t);
+  if (!pi) return;
+  const candidate = stageCandidate(root, prerequisites);
+  const parentWorkspace = createWorkspace(root, "spawn-parent");
+  const longWorkspace = createWorkspace(root, "spawn-long");
+  const shortWorkspace = createWorkspace(root, "spawn-short");
+  const agentDir = join(root, "agent");
+  const providerState = join(root, "provider-state");
+  mkdirSync(agentDir, { mode: 0o700 });
+  mkdirSync(providerState, { mode: 0o700 });
+  writeFileSync(join(agentDir, "review-gate.json"), JSON.stringify({
+    enabled: true, review: { activeReviewers: [] },
+    execution: { deferredPiTools: false, workerResources: {}, routes: { execute: [], research: [] } },
+    externalAgents: {},
+  }), { mode: 0o600 });
+  const beginning = "--session is literal DATA, not an option. BEGIN_SESSION_SPAWN_447\n";
+  const middle = "\nMIDDLE_SESSION_SPAWN_447\n";
+  const ending = "\nEND_SESSION_SPAWN_447: preserve every requirement and this trailing newline.\n";
+  const longPrompt = beginning
+    + Array.from({ length: 1000 }, (_, index) => `Acceptance ${index}: preserve complete context, exact input, independent ownership, and no automatic retry.\n`).join("")
+    + middle
+    + Array.from({ length: 900 }, (_, index) => `Invariant ${index}: 漢字 🧪 e\u0301; quoted \"requirements\" and 'boundaries'; --no-tools remains data.\n`).join("")
+    + ending;
+  const shortPrompt = "@literal-file-is-not-expanded\nKeep 'quotes', \"double quotes\", and the final newline.\n";
+  assert.ok(longPrompt.length > 8192);
+  assert.ok(Buffer.byteLength(JSON.stringify(longPrompt), "utf8") > 128 * 1024,
+    "the real proof also exceeds a single Linux environment-string limit");
+  const trigger = "SYNTHETIC_SESSION_SPAWN_447_PARENT";
+  const requests = [
+    { workspace: longWorkspace, title: "Rejected empty prompt", prompt: "" },
+    { workspace: longWorkspace, title: "Long exact native handoff", prompt: longPrompt },
+    { workspace: shortWorkspace, title: "Short exact native handoff", prompt: shortPrompt },
+  ];
+  writeFileSync(join(providerState, "turn-script.json"), JSON.stringify({ steps: [
+    { whenLastUser: trigger, toolCalls: requests.map((input) => ({ toolName: "SessionSpawn", arguments: input })) },
+    { text: "synthetic-parent-complete" },
+  ] }), { mode: 0o600 });
+  const observerLog = join(root, "observer", "spawn-proof.jsonl");
+  const observerExtension = join(root, "observer", "spawn-proof.cjs");
+  writeFileSync(observerExtension, String.raw`'use strict';
+const fs = require('node:fs');
+const append = (value) => fs.appendFileSync(process.env.PRG_SPAWN_PROOF_LOG, JSON.stringify(value) + '\n');
+module.exports = (pi) => {
+  pi.on('session_start', (_event, ctx) => {
+    const tool = pi.getAllTools().find((entry) => entry.name === 'SessionSpawn');
+    const promptSchema = tool && tool.parameters && tool.parameters.properties && tool.parameters.properties.prompt;
+    append({ type: 'schema', pid: process.pid, registered: !!tool, promptSchema,
+      sessionId: ctx.sessionManager.getSessionId() });
+  });
+  pi.on('message_end', (event) => {
+    const message = event.message;
+    if (message && message.role === 'toolResult' && message.toolName === 'SessionSpawn') {
+      append({ type: 'result', pid: process.pid, isError: message.isError,
+        outcome: message.details && message.details.outcome });
+    }
+  });
+};
+`, { mode: 0o600 });
+  const providerJournal = join(providerState, "provider-journal.jsonl");
+  const records = (path: string): Array<Record<string, unknown>> => existsSync(path)
+    ? readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>) : [];
+  watcher = watch(providerState, () => signal.notify());
+  const env = {
+    ...makeSyntheticEnvironment(root, candidate.nodePath),
+    PI_CODING_AGENT_DIR: agentDir,
+    PRG_FIXTURE_AGENT_DIR: realpathSync(resolve(process.env.PI_REVIEW_GATE_INSTALLED_AGENT!)),
+    PRG_FIXTURE_STATE_DIR: providerState,
+    PRG_FIXTURE_JOURNAL_PROMPT_DIGEST: "1",
+    PRG_SPAWN_PROOF_LOG: observerLog,
+  };
+  broker = await createStatusBroker({ socketRoot: join(root, "broker") });
+  const hostRequests: Array<{ workspace: string; title: string; prompt: string }> = [];
+  manager = new InstanceManager({
+    packageRoot: candidate.packageRoot, piExecutable: pi.file,
+    statusRegistrar: broker, profileRegistry: new NativeAgentRegistry({ env }),
+    nativeSetup: false, env, cols: PTY_COLS, rows: PTY_ROWS,
+    getSidebarTitleColumns: () => 47,
+    args: ["--offline", "--no-context-files", "--no-skills", "--no-themes", "--no-extensions",
+      "--extension", join(repositoryRoot(), "tests", "fixtures", "session-host-native-provider.cjs"),
+      "--extension", observerExtension, "--provider", "prg-native-question", "--model", "driven"],
+    onSpawnRequest: async (_parentId, input) => {
+      hostRequests.push(input);
+      const id = await manager!.create({ workspace: input.workspace, initialRequest: { title: input.title, prompt: input.prompt } });
+      return manager!.list().some((row) => row.id === id && row.lifecycle === "alive") ? "started" : "failed";
+    },
+    ptyFactory: (descriptor) => {
+      const handle = ptyModule.spawn(descriptor.file, descriptor.args, {
+        name: "xterm-256color", cols: descriptor.cols, rows: descriptor.rows,
+        cwd: descriptor.cwd, env: descriptor.env, encoding: "utf8",
+      }) as unknown as InstancePty;
+      const entry = { handle, descriptor, exited: false, subscription: undefined as Disposable | undefined };
+      owned.push(entry); // ownership precedes every callback/await
+      entry.subscription = handle.onExit(() => { entry.exited = true; signal.notify(); });
+      return handle;
+    },
+  });
+  await manager.create({ workspace: parentWorkspace, initialRequest: { title: "Synthetic spawn parent", prompt: trigger } });
+  const expectedDigest = (prompt: string): string => createHash("sha256").update(JSON.stringify(prompt), "utf8").digest("hex");
+  await signal.waitFor(() => [longPrompt, shortPrompt].every((prompt) => records(providerJournal)
+    .some((record) => record.event === "model_request" && record.lastUserSha256 === expectedDigest(prompt))),
+  90_000, "real native children receive exact long and short first-user text");
+  // A parent follow-up model request happens only after all three native
+  // tool results, so its journal event is also an event-driven barrier.
+  await signal.waitFor(() => records(providerJournal).some((record) => record.requestIndex === 1),
+    EVENT_TIMEOUT_MS, "parent observes all native tool results");
+  assert.deepEqual(hostRequests, requests.slice(1), "schema rejection creates no child; each valid request reaches the production broker exactly once");
+  assert.equal(owned.length, 3, "one parent plus exactly one long-prompt and one short-prompt child, with no automatic retry/grandchild");
+  const schemaRows = records(observerLog).filter((record) => record.type === "schema");
+  assert.equal(schemaRows.length, 3);
+  assert.equal(new Set(schemaRows.map((record) => record.sessionId)).size, 3, "all three native conversations are independent");
+  for (const record of schemaRows) {
+    assert.equal(record.registered, true);
+    const schema = record.promptSchema as Record<string, unknown>;
+    assert.equal(schema.type, "string");
+    assert.equal(schema.minLength, 1);
+    assert.equal(Object.hasOwn(schema, "maxLength"), false, "actual installed-Pi candidate registration advertises no fixed ceiling");
+  }
+  const results = records(observerLog).filter((record) => record.type === "result");
+  assert.equal(results.length, 3);
+  assert.equal(results.filter((record) => record.isError === true).length, 1, "the empty prompt is rejected by the actual native schema");
+  assert.equal(results.filter((record) => record.outcome === "started").length, 2, "valid requests confirm launch only");
+  for (const [workspace, prompt] of [[longWorkspace, longPrompt], [shortWorkspace, shortPrompt]] as const) {
+    const child = owned.find((entry) => entry.descriptor.cwd === workspace)!;
+    assert.ok(child);
+    assert.equal(child.descriptor.args.includes(prompt), false);
+    assert.ok(Buffer.byteLength(JSON.stringify(child.descriptor.env)) < 32_767,
+      "startup environment is small even for the long native handoff");
+    const turns = records(providerJournal).filter((record) => record.event === "model_request" && record.pid === Number(child.handle.pid));
+    assert.equal(turns.length, 1, "exactly one initial user turn reaches this independent child");
+    assert.equal(turns[0]!.lastUserLength, prompt.length);
+    assert.equal(turns[0]!.lastUserSha256, expectedDigest(prompt));
+    assert.equal(turns[0]!.userMessageCount, 1, "no parent history or startup context is inherited");
+  }
 });

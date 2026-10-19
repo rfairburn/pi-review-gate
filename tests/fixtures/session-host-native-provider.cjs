@@ -50,6 +50,12 @@
  * label/command/output). The default (unset) behavior of every existing
  * consumer, including its request preview, is unchanged.
  *
+ * Opt-in long-prompt proof: PRG_FIXTURE_JOURNAL_PROMPT_DIGEST=1 omits the
+ * preview and records only the exact JSON-string SHA-256, string length,
+ * user-message count and process id. A step with `whenLastUser` runs only
+ * for that exact synthetic trigger; other inputs receive the stop marker,
+ * preventing a spawned child from repeating its parent's launch step.
+ *
  * Pure test seams: `module.exports.startedShellResults` / `.shellResultHandle`
  * / `.selectStopHandle` expose the same selection used by the step so
  * tests/session-host-native-background-counts.test.ts can prove the negative
@@ -60,6 +66,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
 
 const PROVIDER_ID = 'prg-native-question';
 const MODEL_ID = 'driven';
@@ -273,7 +280,9 @@ module.exports = async function (pi) {
 	// --- Scripted model: complete faux Provider, responses from the turn script ---
 	const provider = faux.fauxProvider({
 		provider: PROVIDER_ID,
-		tokenSize: { min: 4, max: 4 }, // deterministic chunking (no random token sizes)
+		tokenSize: process.env.PRG_FIXTURE_JOURNAL_PROMPT_DIGEST === '1'
+			? { min: 4096, max: 4096 } // large synthetic tool arguments, still deterministic
+			: { min: 4, max: 4 }, // existing fixture chunking remains unchanged
 		models: [{
 			id: MODEL_ID,
 			name: 'PRG Native Question Fixture Model',
@@ -316,6 +325,9 @@ module.exports = async function (pi) {
 	let contextMessages = [];
 
 	function stepToMessage(step, requestIndex) {
+		if (typeof step?.whenLastUser === 'string' && lastUserText(contextMessages) !== step.whenLastUser) {
+			return faux.fauxAssistantMessage(STOP_TEXT, { stopReason: 'stop', timestamp: FIXED_TIMESTAMP });
+		}
 		if (step?.stopStartedShell === true) {
 			const selection = selectStopHandle(contextMessages);
 			if (selection.error !== undefined) {
@@ -358,13 +370,20 @@ module.exports = async function (pi) {
 		contextMessages = context?.messages ?? [];
 		const requestIndex = provider.state.callCount - 1; // callCount was incremented for this request
 		const metadataOnly = process.env.PRG_FIXTURE_JOURNAL_SHELL_STATUS === '1';
-		// Opted-in background-count mode journals bounded metadata ONLY: the
-		// request preview is omitted entirely, so no prompt/user text is ever
-		// written. Every other consumer keeps its existing request preview.
+		const promptDigest = process.env.PRG_FIXTURE_JOURNAL_PROMPT_DIGEST === '1';
+		// Both opt-in modes omit prompt/user previews entirely. JSON-string
+		// hashing also preserves lone-surrogate distinctions in the proof.
+		const userText = lastUserText(contextMessages);
 		journal('model_request', {
 			requestIndex,
 			stepsAvailable: readTurnScript().length,
-			...(metadataOnly ? {} : { lastUserPreview: lastUserText(contextMessages).slice(0, 400) }),
+			...(metadataOnly || promptDigest ? {} : { lastUserPreview: userText.slice(0, 400) }),
+			...(promptDigest ? {
+				lastUserLength: userText.length,
+				lastUserSha256: createHash('sha256').update(JSON.stringify(userText), 'utf8').digest('hex'),
+				userMessageCount: contextMessages.filter((message) => message.role === 'user').length,
+				pid: process.pid,
+			} : {}),
 		});
 		if (metadataOnly) {
 			const shellStatuses = shellListStatuses(contextMessages);

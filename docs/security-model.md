@@ -57,12 +57,32 @@ Status snapshots still exclude tool arguments, prompts, question text, transcrip
 credentials. The bounded native current-file path is authenticated deletion-guard
 metadata; it is not copied into sidebar display, diagnostics, or persisted roster state.
 The separate authenticated `spawn_request` command intentionally carries
-its explicit workspace, title, and prompt to the host; its bounded launch reply contains
-only an outcome. The prompt is not copied into status snapshots or status/sidebar
-diagnostics. It is delivered to the new child's ordinary native Pi conversation, while
-the supplied title appears through that conversation's normal native name/sidebar
-display. This distinction does not add encryption, confidentiality in transit, or any
-new Windows ACL guarantee.
+its explicit workspace and title plus a bounded reference to staged prompt data; its
+bounded launch reply contains only an outcome. There is no fixed prompt-length ceiling.
+The complete prompt travels automatically in private temporary payload files rather than
+inside a status frame, command-line argument, or environment value. The host owns the
+fresh temporary namespace (requested mode `0700`); payloads are created exclusively
+(requested mode `0600`) and consumed through confined, no-follow regular-file reads with
+exact size, identity, and digest checks. Native device/inode identities remain exact
+big integers; the private JSON handoff encodes them as canonical decimal strings,
+including NTFS identifiers beyond JavaScript's safe-integer range. Missing, changed,
+unsafe, or unreadable data is refused, never replaced with a partial prompt. Cleanup is
+ownership-checked against the staged object's exact identity, which stays pinned for the transfer lifetime (an open
+descriptor on POSIX, a private hard-link continuity pin where a retained handle would
+leave a removed name unreplaceable), plus its unchanged declared size and digest:
+unknown, replaced, or modified entries are preserved rather than deleted. A pin that can
+neither be created nor verified refuses or preserves rather than guessing. A crash or
+uncertain cleanup can leave temporary data for inspection; this is not secure erasure.
+On Windows requested
+POSIX modes do not establish privacy beyond inherited OS ACLs; no custom ACL is installed.
+
+The prompt is not copied into status snapshots or status/sidebar diagnostics. It is
+delivered to the new child's ordinary native Pi conversation, while the supplied title
+appears through that conversation's normal native name/sidebar display. Temporary
+payloads contain plaintext and are not a same-user sandbox: other processes with the
+user's authority can access them. This distinction adds no encryption, confidentiality
+in transit, or new Windows ACL guarantee. Launch confirmation is not a receipt for
+prompt execution or task completion; uncertain outcomes are never retried automatically.
 
 This describes only the IPC transport. Windows native-host preflight, manager/PTY
 integration, ConPTY behavior, and restoration remain incomplete and require separate

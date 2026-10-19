@@ -178,7 +178,10 @@ export function restoreNodeOptions(): void {
 // the extension factory reads at load time. Both are inert without their env.
 restoreNodeOptions();
 const primed = primeReporterBootstrap();
-primeSessionHostStartupMetadata(primed !== undefined && process.env.PI_REVIEW_GATE_RUNTIME_ROLE !== "executor");
+primeSessionHostStartupMetadata(
+  primed !== undefined && process.env.PI_REVIEW_GATE_RUNTIME_ROLE !== "executor",
+  primed?.payloadDir,
+);
 // A valid consumed bootstrap — and the reporter's exact executor role ceiling,
 // not an alias or a stripped marker — opts this process into pure owned-activity
 // observation BEFORE native main and every extension module evaluates. That

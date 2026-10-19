@@ -373,7 +373,24 @@ dispatched only after review-gate session initialization has established checkpo
 and deferred-tool authorization, and is recorded in the review request context before the
 turn starts. The child is added in the background: its row appears without changing the
 selected row, focus, active Main owner, or sidebar visibility. A successful result
-confirms process launch only, not prompt processing or completion. The tool's title-width
+confirms process launch only, not prompt processing or completion.
+
+There is no fixed initial-prompt character or byte ceiling and no prompt-length setting.
+Long handoffs use the same tool arguments as short prompts; callers do not need to
+shorten the text or ask the child to load a file. The host transfers the complete exact
+text automatically through private temporary payload files, keeping both authenticated
+control frames and the child's startup environment small. Payloads are checked for exact
+size, integrity, and file identity before consumption; nothing is truncated, summarized,
+or substituted. Empty or NUL-containing prompts remain invalid. Existing title and
+workspace safety bounds are unchanged. This is not an unlimited-resource guarantee:
+filesystem, memory, native Pi, and model-context limits still apply. A transfer or initial
+delivery failure is reported rather than treated as complete delivery. An uncertain
+launch may already have created a child: inspect the sidebar before retrying; the tool
+never automatically retries. Longer context grants no additional tool or role authority.
+See [Security model](security-model.md#session-host-status-ipc) for temporary-payload
+privacy and ownership boundaries.
+
+The tool's title-width
 suggestion is a host-computed snapshot of the sidebar title area in the visible layout
 when that reporter child was launched; it is advisory and may become stale after a
 resize. Ordinary launch, New-session, and saved-conversation behavior is unchanged.

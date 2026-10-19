@@ -25,6 +25,16 @@
  * bounded follow-up, stale/reordered replies cannot replace a newer accepted
  * snapshot, and a legacy reporter is never sent an unadvertised frame.
  *
+ * SessionSpawn prompts do not travel in bounded control frames. Each
+ * registration advertises one freshly-created private (0700) payload
+ * namespace in its bootstrap; the reporter stages the exact prompt there and
+ * the broker verifies the declared basename, size, digest, no-follow file
+ * identity, and UTF-8 JSON value before invoking the host callback. Dedupe
+ * happens before any read, so an exact replay of an already-consumed payload
+ * still coalesces and always gets the same bounded launch outcome. A successful
+ * read consumes only that verified file inode; the namespace is removed only
+ * when its own identity still matches and it is empty.
+ *
  * Safety contract (fail closed):
  *
  * - Hello frames are authenticated FIRST, timing-safe on instance id, host
@@ -92,6 +102,7 @@ import {
   type SessionHostShutdownRequest,
   type SessionHostSpawnAck,
   type SessionHostSpawnRequest,
+  type SessionHostPayloadRef,
   type SessionSpawnInput,
   type SessionSpawnOutcome,
   type SessionHostStatus,
@@ -103,6 +114,13 @@ import {
   isValidRenameName,
   parseBootstrap,
 } from "./protocol";
+import {
+  discardSessionHostPayload,
+  decodeSessionHostPayloadJsonString,
+  encodeSessionHostPayloadDirectoryIdentity,
+  readSessionHostPayload,
+  type SessionHostPayloadDirectoryIdentity,
+} from "./payload";
 
 /** Options accepted by {@link createStatusBroker}. */
 export interface StatusBrokerOptions {
@@ -250,6 +268,9 @@ const TRANSPORT_DIR_PREFIX = "prg-st-";
 /** Own socket filename inside the private transport directory (short: macOS sun_path is tiny). */
 const SOCKET_FILENAME = "s.sock";
 
+/** Per-registration private payload namespace beneath the broker's private parent. */
+const PAYLOAD_DIR_PREFIX = "pl-";
+
 /** Cryptorandom namespace for one public-Node Windows local named pipe. */
 const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\prg-st-";
 
@@ -283,6 +304,9 @@ interface RegistrationRecord {
   shutdownResult: Promise<StatusShutdownResult> | undefined;
   active: ConnectionState | undefined;
   handlers: StatusBrokerStatusHandlers;
+  /** Private namespace created by this broker for exactly this registration. */
+  payloadDir: string;
+  payloadDirIdentity: SessionHostPayloadDirectoryIdentity;
 }
 
 interface PendingRename {
@@ -302,8 +326,11 @@ interface PendingShutdown {
 interface PendingSpawn {
   readonly requestId: string;
   readonly fingerprint: string;
+  readonly payload: SessionHostPayloadRef;
   connection: ConnectionState;
   timer: NodeJS.Timeout;
+  /** True once the exact payload was verified and consumed by a successful read. */
+  consumed: boolean;
 }
 
 interface PendingActivity {
@@ -541,6 +568,45 @@ function removeOwnEmptyDirectory(dir: string, identity: OwnedPathIdentity): void
   }
 }
 
+interface OwnedPayloadNamespace {
+  readonly path: string;
+  readonly identity: SessionHostPayloadDirectoryIdentity;
+}
+
+/** Payload namespace cleanup uses the same exact identities as reads and startup handoff. */
+function removeOwnEmptyPayloadDirectory(dir: string, identity: SessionHostPayloadDirectoryIdentity): void {
+  try {
+    const stats = lstatSync(dir, { bigint: true });
+    if (stats.isDirectory() && !stats.isSymbolicLink()
+      && stats.dev.toString() === identity.dev && stats.ino.toString() === identity.ino) {
+      rmdirSync(dir);
+    }
+  } catch {
+    // A changed, nonempty, unsafe, or missing namespace is never removed.
+  }
+}
+
+/**
+ * Creates one fresh private payload namespace beneath a canonical private
+ * parent. POSIX re-asserts mode 0700; Windows uses the OS temp directory and
+ * the existing default-ACL caveat (no custom ACL claim).
+ */
+function createOwnedPayloadNamespace(parent: string): OwnedPayloadNamespace {
+  let created: string | undefined;
+  let identity: SessionHostPayloadDirectoryIdentity | undefined;
+  try {
+    created = mkdtempSync(join(realpathSync(parent), PAYLOAD_DIR_PREFIX));
+    const stats = lstatSync(created, { bigint: true });
+    if (!stats.isDirectory()) throw new Error("payload namespace is not a directory");
+    identity = encodeSessionHostPayloadDirectoryIdentity(stats);
+    chmodSync(created, 0o700);
+    return { path: created, identity };
+  } catch (error) {
+    if (created !== undefined && identity !== undefined) removeOwnEmptyPayloadDirectory(created, identity);
+    throw error;
+  }
+}
+
 class LocalStatusBroker implements StatusBroker {
 
   readonly socketPath: string;
@@ -554,6 +620,7 @@ class LocalStatusBroker implements StatusBroker {
   #latePipeCloseStarted = false;
   #registrations = new Map<string, RegistrationRecord>();
   #connections = new Set<ConnectionState>();
+  #payloadCleanups = new Set<Promise<void>>();
   #unauthCount = 0;
   #disposed = false;
   #disposal: Promise<void> | undefined;
@@ -713,6 +780,9 @@ class LocalStatusBroker implements StatusBroker {
     }
 
     const token = randomBytes(32).toString("hex");
+    const payloadNamespace = createOwnedPayloadNamespace(
+      this.#transport.kind === "unix" ? this.#transport.transportDir : os.tmpdir(),
+    );
     const record: RegistrationRecord = {
       instanceId,
       token,
@@ -732,6 +802,8 @@ class LocalStatusBroker implements StatusBroker {
       shutdownResult: undefined,
       active: undefined,
       handlers,
+      payloadDir: payloadNamespace.path,
+      payloadDirIdentity: payloadNamespace.identity,
     };
     this.#registrations.set(instanceId, record);
     const bootstrap: SessionHostBootstrap = {
@@ -740,6 +812,7 @@ class LocalStatusBroker implements StatusBroker {
       token,
       instanceId,
       generation: this.generation,
+      payloadDir: payloadNamespace.path,
     };
     return {
       bootstrap,
@@ -1093,7 +1166,8 @@ class LocalStatusBroker implements StatusBroker {
 
   async #performDispose(): Promise<void> {
     this.#disposed = true;
-    for (const record of this.#registrations.values()) {
+    const records = [...this.#registrations.values()];
+    for (const record of records) {
       record.released = true;
       if (record.active) this.#failPendingRenames(record, record.active, "disconnected");
       if (record.pendingActivity) {
@@ -1103,8 +1177,15 @@ class LocalStatusBroker implements StatusBroker {
         });
       }
       for (const pending of [...record.pendingSpawns.values()]) this.#settleSpawn(record, pending, "unknown");
+      this.#removePayloadNamespace(record);
       record.active = undefined;
     }
+    // Settle every verified payload discard scheduled by release/rejection or
+    // this disposal before removing the owned transport directories.
+    if (this.#payloadCleanups.size > 0) {
+      await Promise.allSettled([...this.#payloadCleanups]);
+    }
+    for (const record of records) this.#removePayloadNamespace(record);
     this.#registrations.clear();
     for (const conn of [...this.#connections]) {
       // Mark everything superseded so late close callbacks stay silent: an
@@ -1538,10 +1619,17 @@ class LocalStatusBroker implements StatusBroker {
     }
 
     // The digest lets the broker deduplicate exact replays without retaining
-    // prompt/title/workspace after a completed launch. Never include it in any
-    // result or diagnostic.
+    // prompt text after a completed launch. It covers only the bounded
+    // reference, never payload contents. Never include it in any result or
+    // diagnostic.
     const fingerprint = createHash("sha256")
-      .update(JSON.stringify([request.workspace, request.title, request.prompt]), "utf8")
+      .update(JSON.stringify([
+        request.workspace,
+        request.title,
+        request.payload.name,
+        request.payload.size,
+        request.payload.sha256,
+      ]), "utf8")
       .digest("hex");
     const completed = record.completedSpawns.get(request.requestId);
     if (completed) {
@@ -1568,12 +1656,12 @@ class LocalStatusBroker implements StatusBroker {
       // A shutdown preflight/accepted Stop closes this parent's spawn authority.
       // Only the positive idle-only `not-idle` rejection clears that fence in
       // #shutdown; uncertain or accepted shutdowns remain fail closed.
-      this.#rememberSpawnResult(record, request.requestId, fingerprint, "failed");
+      this.#rejectSpawn(record, request, fingerprint);
       this.#sendSpawnAck(record, conn, request.requestId, "failed");
       return;
     }
     if (record.pendingSpawns.size >= MAX_PENDING_SPAWNS) {
-      this.#rememberSpawnResult(record, request.requestId, fingerprint, "failed");
+      this.#rejectSpawn(record, request, fingerprint);
       this.#sendSpawnAck(record, conn, request.requestId, "failed");
       return;
     }
@@ -1586,8 +1674,10 @@ class LocalStatusBroker implements StatusBroker {
     const operation: PendingSpawn = {
       requestId: request.requestId,
       fingerprint,
+      payload: request.payload,
       connection: conn,
       timer,
+      consumed: false,
     };
     record.pendingSpawns.set(request.requestId, operation);
 
@@ -1596,15 +1686,60 @@ class LocalStatusBroker implements StatusBroker {
       this.#settleSpawn(record, operation, "failed");
       return;
     }
-    const input: SessionSpawnInput = {
-      workspace: request.workspace,
-      title: request.title,
-      prompt: request.prompt,
-    };
-    void Promise.resolve().then(() => onSpawnRequest(input)).then(
-      (outcome) => this.#settleSpawn(record, operation, isSpawnOutcome(outcome) ? outcome : "unknown"),
-      () => this.#settleSpawn(record, operation, "unknown"),
-    );
+    // Dedupe and admission checks above ran before any read: an exact replay
+    // of a completed or still-pending request never re-reads (or re-consumes)
+    // the staged payload and never invokes the host callback twice.
+    const payloadDir = record.payloadDir;
+    void (async () => {
+      let prompt: string;
+      try {
+        if (typeof payloadDir !== "string" || payloadDir.length === 0) {
+          throw new Error("payload namespace unavailable");
+        }
+        const text = await readSessionHostPayload(payloadDir, request.payload, record.payloadDirIdentity);
+        // The helper consumed the exact verified file even if the staged JSON
+        // value later proves invalid; teardown must not try to re-discard it.
+        operation.consumed = true;
+        const decoded = decodeSessionHostPayloadJsonString(text);
+        if (decoded === undefined) throw new Error("payload is not an exact prompt value");
+        prompt = decoded;
+      } catch {
+        // Missing, tampered, replaced, or undecodable payload: no child is
+        // requested and the caller receives a truthful failed launch outcome.
+        this.#settleSpawn(record, operation, "failed");
+        if (record.released || this.#disposed) this.#removePayloadNamespace(record);
+        return;
+      }
+      if (record.pendingSpawns.get(request.requestId) !== operation
+        || record.released || this.#disposed) {
+        // Timed out/released while reading. A successful read consumed the
+        // verified file; if this namespace is already released, retry its
+        // empty-only cleanup now that the file is gone.
+        if (record.released || this.#disposed) this.#removePayloadNamespace(record);
+        return;
+      }
+      const input: SessionSpawnInput = {
+        workspace: request.workspace,
+        title: request.title,
+        prompt,
+      };
+      // Re-check immediately before invoking the host callback: a release or
+      // timeout may have settled this operation after the read completed.
+      void Promise.resolve().then(async () => {
+        if (record.pendingSpawns.get(request.requestId) !== operation
+          || record.released || this.#disposed) {
+          if (record.released || this.#disposed) this.#removePayloadNamespace(record);
+          return;
+        }
+        let outcome: SessionSpawnOutcome;
+        try {
+          outcome = await onSpawnRequest(input);
+        } catch {
+          outcome = "unknown";
+        }
+        this.#settleSpawn(record, operation, isSpawnOutcome(outcome) ? outcome : "unknown");
+      });
+    })();
   }
 
   #rememberSpawnResult(
@@ -1626,8 +1761,38 @@ class LocalStatusBroker implements StatusBroker {
     if (record.pendingSpawns.get(pending.requestId) !== pending) return;
     record.pendingSpawns.delete(pending.requestId);
     clearTimeout(pending.timer);
+    // A settled request that never successfully consumed its exact private
+    // payload (definite rejection, timeout, or release) is cleaned through a
+    // verified discard. Tampered/replaced entries fail verification and stay
+    // preserved. A successful read already consumed the file.
+    if (!pending.consumed) this.#discardPayload(record, pending.payload);
     this.#rememberSpawnResult(record, pending.requestId, pending.fingerprint, outcome);
     this.#sendSpawnAck(record, pending.connection, pending.requestId, outcome);
+  }
+
+  /** Definite pre-read rejection: acknowledge and discard only a verified payload. */
+  #rejectSpawn(
+    record: RegistrationRecord,
+    request: SessionHostSpawnRequest,
+    fingerprint: string,
+  ): void {
+    this.#rememberSpawnResult(record, request.requestId, fingerprint, "failed");
+    this.#discardPayload(record, request.payload);
+  }
+
+  /**
+   * Best-effort verified discard scheduled outside the frame path. Namespace
+   * removal is retried only once the registration is released or the broker is
+   * disposing, so an active registration keeps its capability.
+   */
+  #discardPayload(record: RegistrationRecord, payload: SessionHostPayloadRef): void {
+    const task = discardSessionHostPayload(record.payloadDir, payload, record.payloadDirIdentity)
+      .catch(() => undefined)
+      .finally(() => {
+        this.#payloadCleanups.delete(task);
+        if (record.released || this.#disposed) this.#removePayloadNamespace(record);
+      });
+    this.#payloadCleanups.add(task);
   }
 
   #sendSpawnAck(
@@ -1911,8 +2076,14 @@ class LocalStatusBroker implements StatusBroker {
       });
     }
     for (const pending of [...record.pendingSpawns.values()]) this.#settleSpawn(record, pending, "unknown");
+    this.#removePayloadNamespace(record);
     record.active = undefined;
     this.#registrations.delete(record.instanceId);
+  }
+
+  /** Removes only this broker-created namespace, and only while it is empty and unchanged. */
+  #removePayloadNamespace(record: RegistrationRecord): void {
+    removeOwnEmptyPayloadDirectory(record.payloadDir, record.payloadDirIdentity);
   }
 }
 

@@ -132,36 +132,47 @@ with the current Bash/Unix requirements of the shell launcher and `ShellStart`.
 
 ## Installation
 
-From a source checkout:
+Use a numbered, prebuilt tarball from
+[GitHub releases](https://github.com/rfairburn/pi-review-gate/releases). It includes
+compiled code and the full prerelease version; no npm-registry publication or source
+build is required. Choose a fresh installation prefix that no running session uses:
 
 ```bash
-npm install
+npm install --prefix ./new-inactive-install ./pi-review-gate-0.1.0-dev.N.tgz
 ```
 
 By default, installation also verifies and downloads Playwright's Chromium build for
 `BrowserExtract`. Server/CI installs that do not need browser extraction can skip it:
 
 ```bash
-PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM=1 npm install
+PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM=1 npm install --prefix ./new-inactive-install ./pi-review-gate-0.1.0-dev.N.tgz
 ```
 
 `WebSearch` and `WebFetch` remain available either way. See
 [Getting started](docs/getting-started.md#installation) for the recovery path when
 Chromium is missing.
 
+For development dependencies and tests in a source checkout, run `npm install` there.
+Source launchers remain supported and prepare an inactive build automatically only
+when relevant inputs have changed.
+
 ## Minimal configuration and launch
 
-Launch from the checkout on macOS/Linux:
+Launch the installed entry point on macOS/Linux:
 
 ```bash
-./scripts/pi-review-gate.sh
+./new-inactive-install/node_modules/.bin/pi-review-gate
 ```
 
 On Windows, use the native cmd.exe/PowerShell entry point (no Bash or WSL required):
 
 ```bat
-scripts\pi-review-gate.cmd
+new-inactive-install\node_modules\.bin\pi-review-gate-cmd.cmd
 ```
+
+Source-checkout equivalents are `./scripts/pi-review-gate.sh` and
+`scripts\pi-review-gate.cmd`; both use the same shared current/preparation state as
+the sidebar and web launchers.
 
 An optional, separate session-host alpha can run multiple independent native Pi sessions
 in one terminal on macOS/Linux. It does not replace either launcher; see the

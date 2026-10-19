@@ -209,8 +209,8 @@ test("full-tests job runs for pull requests, default-branch pushes, and manual d
     "the condition must run the suite on every enforced trigger path with no hidden push-only skip",
   );
   assert.match(full, /name: Full suite \(Node 24\)/);
-  assert.match(full, /^    timeout-minutes: 15\s*$/m,
-    "the Linux full-suite job must keep an active, job-scoped 15-minute runtime cap (a commented-out value or a 15 on a prerequisite step must not pass)");
+  assert.match(full, /^    timeout-minutes: 20\s*$/m,
+    "the Linux full-suite job must keep an active, job-scoped 20-minute runtime cap (a commented-out value or a 20 on a prerequisite step must not pass)");
   assert.match(full, /node-version: 24\.x/);
 });
 
@@ -283,20 +283,20 @@ test("full-suite runtime is bounded by independent job and step timeouts", () =>
   const full = blockOf(source, "full-tests", 2);
 
   // Job-level cap: the exact active job property line at the 4-space YAML
-  // mapping indent. Commented-out caps and a 15 scoped to a prerequisite
+  // mapping indent. Commented-out caps and a 20 scoped to a prerequisite
   // step's own timeout property must not satisfy the job guard.
-  assert.match(full, /^    timeout-minutes: 15\s*$/m,
-    "the Linux full-suite job must carry an active, job-scoped 15-minute cap");
+  assert.match(full, /^    timeout-minutes: 20\s*$/m,
+    "the Linux full-suite job must carry an active, job-scoped 20-minute cap");
   assert.doesNotMatch(full, /^ *timeout-minutes: 45\s*$/m,
     "the over-generous 45-minute cap must not return at job or step level");
 
-  // Step-level cap scoped to the named suite step itself: a hang stops at 10
+  // Step-level cap scoped to the named suite step itself: a hang stops at 15
   // minutes without waiting on the job-level budget, while the other steps of
   // this job keep their own provisioning budget. The step body extends to the
   // next step entry of any kind (named or uses), not just another named step.
   const suiteStep = suiteStepOf(full);
-  assert.match(suiteStep, /^        timeout-minutes: 10\s*$/m,
-    "the Full test suite step must carry its own active 10-minute cap, scoped to that step only");
+  assert.match(suiteStep, /^        timeout-minutes: 15\s*$/m,
+    "the Full test suite step must carry its own active 15-minute cap, scoped to that step only");
   // The timeouts bound runtime, not coverage: the bounded step must keep the
   // exact documented command line (same glob/concurrency as the local suite,
   // plus only the two CI-only diagnostics).

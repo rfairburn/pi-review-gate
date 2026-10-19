@@ -565,7 +565,9 @@ node_generation_active() {
   shopt -s nullglob dotglob
   for consumer in "$1"/.consumer-*; do
     if [[ -L "$consumer" || ! -f "$consumer" ]]; then
-      [[ -L "$consumer" ]] && "$NODE_UNLINK_BIN" "$consumer" 2>/dev/null || true
+      if [[ -L "$consumer" ]]; then
+        "$NODE_UNLINK_BIN" "$consumer" 2>/dev/null || true
+      fi
       continue
     fi
     if node_owner_read "$consumer" && node_owner_current "$consumer"; then

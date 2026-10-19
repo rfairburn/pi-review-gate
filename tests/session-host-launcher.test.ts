@@ -134,7 +134,8 @@ interface LauncherModule {
       platform: string;
       timedOut: boolean;
       outputExceeded: boolean;
-      normalExit: boolean;
+      /** A direct child close with an integer status, no signal, no spawn error. */
+      naturalExit: boolean;
       groupStillExists(): boolean;
     }): boolean | undefined;
   };
@@ -143,6 +144,14 @@ interface LauncherModule {
 const requireCjs = createRequire(join(process.cwd(), "tests", "session-host-launcher.test.ts"));
 const fsNative = requireCjs("node:fs") as typeof import("node:fs");
 const launcher = requireCjs("../scripts/pi-review-sessions.cjs") as LauncherModule;
+// The shared preparation engine owns the natural-exit predicate itself; the
+// launcher re-exports only the cleanup classifier.
+const applicationBuild = requireCjs("../scripts/application-build.cjs") as {
+  naturalDirectExit(
+    closeResult: { code: number | null; signal: string | null } | undefined,
+    spawnError: Error | undefined,
+  ): boolean;
+};
 const gateLauncher = requireCjs("../scripts/pi-review-gate-launcher.cjs") as { ensureDdgs(homeDir: string, env: NodeJS.ProcessEnv): { ok: boolean; python?: string; exitCode?: number } };
 const SCRIPT = join(process.cwd(), "scripts", "pi-review-sessions.cjs");
 
@@ -618,18 +627,70 @@ test("Windows setup timeout cleanup never treats direct child close as descendan
     platform: "win32",
     timedOut: true,
     outputExceeded: false,
-    normalExit: true,
+    naturalExit: true,
     groupStillExists: () => false,
   };
   assert.equal(classify(base), false, "even a closed direct child cannot prove timed-out Windows descendants settled");
   assert.equal(classify({ ...base, timedOut: false, outputExceeded: true }), false,
     "an output-limit termination has no Windows process-tree proof");
-  assert.equal(classify({ ...base, timedOut: false, normalExit: false }), false,
-    "a nonzero Windows child exit has no process-tree proof");
+  assert.equal(classify({ ...base, timedOut: false, naturalExit: false }), false,
+    "a signal, spawn error, or unknown close has no Windows process-tree proof");
   assert.equal(classify({ ...base, timedOut: false }), undefined,
-    "a normal Windows close is not represented as process-tree proof");
-  assert.equal(classify({ ...base, platform: "linux", timedOut: false }), true);
+    "a natural Windows close — zero or nonzero status alike — makes no descendant claim");
+  assert.equal(classify({ ...base, platform: "linux", timedOut: false }), true,
+    "POSIX proves its own group gone after a natural exit, zero or nonzero alike");
   assert.equal(classify({ ...base, platform: "linux", timedOut: false, groupStillExists: () => true }), false);
+});
+
+test("a natural direct exit is any integer status, never a forced, errored, or unknown close", () => {
+  const natural = applicationBuild.naturalDirectExit;
+  assert.equal(natural({ code: 0, signal: null }, undefined), true);
+  assert.equal(natural({ code: 5, signal: null }, undefined), true,
+    "a legitimate nonzero child status is still a natural exit, not an unconfirmed cleanup");
+  assert.equal(natural({ code: 5, signal: null }, new Error("spawn failed")), false,
+    "a spawn error is never a natural exit");
+  assert.equal(natural({ code: null, signal: "SIGTERM" }, undefined), false,
+    "a signaled close is never a natural exit");
+  assert.equal(natural({ code: null, signal: null }, undefined), false,
+    "a close with no integer status is never a natural exit");
+  assert.equal(natural(undefined, undefined), false, "no close evidence is never a natural exit");
+});
+
+test("a natural nonzero Windows direct-child exit keeps its status while a forced closure stays fail-closed", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-windows-natural-nonzero-");
+  cleanupFixture(t, fixture);
+  const exitScript = join(fixture.root, "exit-nonzero.js");
+  const stuckScript = join(fixture.root, "ignore-term.js");
+  // Exclusive fixture writes inside the owned fixture directory: an existing
+  // target (or a preexisting symlink) is refused rather than overwritten.
+  writeFileSync(exitScript, "process.exit(5);\n", { encoding: "utf8", flag: "wx", mode: 0o600 });
+  writeFileSync(stuckScript, "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);\n", { encoding: "utf8", flag: "wx", mode: 0o600 });
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  assert.ok(platform);
+  // Synthetic Windows classification on every host: the production close path
+  // decides natural-vs-forced from the real child's close evidence, so this is
+  // the exact wiring that the native `NPM_EXIT_CODE=5` launch exercises.
+  try {
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const natural = await launcher.__test.runBoundedProcess(process.execPath, [exitScript], {
+      cwd: fixture.root, env: runtimeEnv(fixture), timeoutMs: 5000, maxOutputBytes: 1024, captureStdout: true,
+    });
+    assert.equal(natural.status, 5, "a natural Windows direct-child nonzero exit keeps its own status");
+    assert.equal(natural.signal, null);
+    assert.equal(natural.error, undefined, "no cleanup failure is invented for a natural exit");
+    assert.equal(natural.cleanupConfirmed, undefined, "a natural Windows close claims no descendant settlement");
+
+    // Negative control: a forced, ignored-then-killed closure under the same
+    // Windows classification still reports no settlement proof and an error.
+    const forced = await launcher.__test.runBoundedProcess(process.execPath, [stuckScript], {
+      cwd: fixture.root, env: runtimeEnv(fixture), timeoutMs: 50,
+    });
+    assert.equal(forced.timedOut, true);
+    assert.equal(forced.cleanupConfirmed, false, "a forced Windows closure has no descendant proof");
+    assert.ok(forced.error instanceof Error, "an unconfirmed Windows closure is an explicit error");
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+  }
 });
 
 test("synthetic Windows source staging uses positive identities without treating POSIX modes as ACL privacy", (t) => {
@@ -1705,6 +1766,13 @@ test("a failed preparation status is never turned into success", async (t) => {
   assert.equal(status, 124, "an expired preparation keeps its deadline status");
 });
 
+/**
+ * A natural direct-child close, whatever its status: POSIX observes its own
+ * process group gone, while Windows deliberately makes no descendant claim
+ * (the same `undefined` for a natural zero and a natural nonzero exit).
+ */
+const NATURAL_CLEANUP_STATUS = process.platform === "win32" ? undefined : true;
+/** A forced/erroneous closure: POSIX observes its group gone; Windows has no tree proof. */
 const ABNORMAL_CLEANUP_SETTLES = process.platform !== "win32";
 
 test("bounded setup subprocesses preserve exit outcomes and terminate expired groups", async (t) => {
@@ -1723,7 +1791,9 @@ test("bounded setup subprocesses preserve exit outcomes and terminate expired gr
   });
   assert.equal(exited.status, 19);
   assert.equal(exited.timedOut, false);
-  assert.equal(exited.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES);
+  assert.equal(exited.error, undefined, "a natural nonzero exit is neither a cleanup nor a spawn error");
+  assert.equal(exited.cleanupConfirmed, NATURAL_CLEANUP_STATUS,
+    "a natural nonzero exit keeps its own status without claiming descendant settlement");
   const expired = await launcher.__test.runBoundedProcess(process.execPath, [timeoutScript], {
     cwd: fixture.root, env, timeoutMs: 25,
   });
@@ -1761,7 +1831,7 @@ test("bounded process diagnostics separate stdout from stderr under one shared c
   assert.equal(captured.signal, null);
   assert.equal(captured.timedOut, false);
   assert.equal(captured.outputExceeded, false);
-  assert.equal(captured.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES);
+  assert.equal(captured.cleanupConfirmed, NATURAL_CLEANUP_STATUS);
   assert.match(captured.stdout, /OUT-MARKER/);
   assert.doesNotMatch(captured.stdout, /ERR-MARKER/);
   assert.match(captured.stderr ?? "", /ERR-MARKER/);
@@ -1774,7 +1844,7 @@ test("bounded process diagnostics separate stdout from stderr under one shared c
   assert.equal("stderr" in probeOnly, false, "a stream that is not admitted is not reported");
   assert.equal(probeOnly.status, 7);
   assert.match(probeOnly.stdout, /OUT-MARKER/);
-  assert.equal(probeOnly.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES);
+  assert.equal(probeOnly.cleanupConfirmed, NATURAL_CLEANUP_STATUS);
 
   // Both streams count against the same hard ceiling, and flooding it is a
   // failure report, never silent success or unbounded retention.

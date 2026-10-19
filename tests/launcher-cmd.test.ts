@@ -3,7 +3,7 @@ import { execFile, spawnSync } from "node:child_process";
 import { chmod, copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { after, before, test } from "node:test";
 import { extensionFromArgs, isCompiledExtension, writeFakeNpm, writeRequiredOutputs } from "./launcher-prepare-fixtures";
@@ -344,7 +344,10 @@ async function stageLauncherScripts(stage: string): Promise<void> {
 
 /** Copy the real shipped skills into a staged package tree. */
 async function stageShippedSkills(stage: string): Promise<void> {
-  await cp(resolve("skills"), join(stage, "skills"), { recursive: true });
+  await cp(resolve("skills"), join(stage, "skills"), {
+    recursive: true,
+    filter: (source) => basename(source) !== ".terraform",
+  });
 }
 
 interface LaunchCapture {
@@ -2111,6 +2114,38 @@ async function writeSpawnRecorder(fixture: Fixture): Promise<string> {
   return recorder;
 }
 
+/**
+ * Serialize a recorder path as a NODE_OPTIONS preload token.
+ *
+ * Node parses NODE_OPTIONS with its own shell-like quoting rules, where a bare
+ * backslash is an escape character: a native Windows path such as
+ * `C:\Users\runner\AppData\Local\Temp\spawn-recorder.cjs` would otherwise be
+ * reduced to `C:UsersrunnerAppData...` and the preload would never load (the
+ * reported native CI failure: "Cannot find module 'C:Users...spawn-recorder.cjs'").
+ * JSON.stringify emits the doubled backslashes Node's parser unescapes back to
+ * the exact native path, and keeps the one quoted token's spaces intact.
+ */
+function nodeOptionsPreload(recorder: string): string {
+  return `--require ${JSON.stringify(recorder)}`;
+}
+
+test("the recorder preload encoding keeps native separators and spaces through NODE_OPTIONS", { skip: isWindows ? posixDdgsSkipReason : false }, () => {
+  // A synthetic native-Windows spelling: the literal backslashes are exactly
+  // what NODE_OPTIONS parsing would consume as escapes. Requiring the missing
+  // module makes Node report the path it actually parsed, so this asserts the
+  // encoding round-trips instead of only observing a passed-through string.
+  const windowsStyle = "C:\\Users\\run ner\\AppData\\Local\\Temp\\spawn-recorder.cjs";
+  const result = spawnSync(process.execPath, ["-e", "0"], {
+    env: { ...process.env, NODE_OPTIONS: nodeOptionsPreload(windowsStyle) },
+    encoding: "utf8",
+  });
+  assert.notEqual(result.status, 0, "the synthetic preload does not exist, so Node must fail to load it");
+  assert.match(String(result.stderr), /Cannot find module/,
+    "the preload must actually be attempted, not silently dropped");
+  assert.ok(String(result.stderr).includes(windowsStyle),
+    `the preload path must survive NODE_OPTIONS parsing intact: ${String(result.stderr)}`);
+});
+
 /** Classify the recorded spawns that invoked exactly this Python interpreter. */
 async function recordedPythonSpawns(fixture: Fixture, python: string): Promise<DdgsPythonCall[]> {
   const raw = await readFile(join(fixture.capture, "spawn-calls"), "utf8");
@@ -2311,7 +2346,7 @@ if (isWindows) {
 
     const result = runCmd(
       "scripts\\pi-review-gate.cmd --model example",
-      fixtureEnv(fixture, { NODE_OPTIONS: `--require "${recorder}"` }),
+      fixtureEnv(fixture, { NODE_OPTIONS: nodeOptionsPreload(recorder) }),
     );
 
     assert.equal(result.status, 0, `stderr: ${String(result.stderr)}`);
@@ -2400,7 +2435,7 @@ if (isWindows) {
 
     const result = runCmd(
       "scripts\\pi-review-gate.cmd --model example",
-      fixtureEnv(fixture, { PI_REVIEW_GATE_DDGS_VENV: brokenVenv, NODE_OPTIONS: `--require "${recorder}"` }),
+      fixtureEnv(fixture, { PI_REVIEW_GATE_DDGS_VENV: brokenVenv, NODE_OPTIONS: nodeOptionsPreload(recorder) }),
     );
 
     assert.equal(result.status, 0, `stderr: ${String(result.stderr)}`);
@@ -2444,28 +2479,32 @@ if (isWindows) {
     const scratch = await mkdtemp(join(tmpdir(), "pi-review-cmd-native-nopy-"));
     try {
       const stage = join(scratch, "package dir with spaces");
-      await mkdir(join(stage, "scripts"), { recursive: true });
-      await mkdir(join(stage, "skills", "pi-review-gate-orchestrator", "references"), { recursive: true });
-      await mkdir(join(stage, "skills", "pi-review-gate-execution"), { recursive: true });
-      await mkdir(join(stage, "skills", "pi-review-gate-research"), { recursive: true });
-      await mkdir(join(stage, "skills", "pi-review-gate-completion"), { recursive: true });
-      await copyFile(helperPath, join(stage, "scripts", "pi-review-gate-launcher.cjs"));
+      await stageLauncherScripts(stage);
       await copyFile(cmdPath, join(stage, "scripts", "pi-review-gate.cmd"));
-      await copyFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), join(stage, "skills/pi-review-gate-orchestrator/SKILL.md"));
-      await copyFile(
-        resolve("skills/pi-review-gate-orchestrator/references/recovery.md"),
-        join(stage, "skills/pi-review-gate-orchestrator/references/recovery.md"),
-      );
-      await copyFile(resolve("skills/pi-review-gate-execution/SKILL.md"), join(stage, "skills/pi-review-gate-execution/SKILL.md"));
-      await copyFile(resolve("skills/pi-review-gate-research/SKILL.md"), join(stage, "skills/pi-review-gate-research/SKILL.md"));
-      await copyFile(resolve("skills/pi-review-gate-completion/SKILL.md"), join(stage, "skills/pi-review-gate-completion/SKILL.md"));
-      await mkdir(join(stage, "dist", "src"), { recursive: true });
-      await writeFile(join(stage, "dist", "src", "index.js"), "module.exports = { activate() {} };\n", "utf8");
+      await stageShippedSkills(stage);
+      await copyFile(resolve("package.json"), join(stage, "package.json"));
+      writeRequiredOutputs(stage);
 
       const fixture = await makeFixture("pi-review-cmd-native-nopy-fix-");
       const env = fixtureEnv(fixture);
-      // Only the fake pi shim is on PATH: no python3, no python, no npm.
-      env.PATH = fixture.bin;
+      // PATH alone cannot hide a system-installed py.exe. Refuse only Python
+      // probes in this child, preserving real Node/OS ownership helpers.
+      const noPython = join(fixture.home, "no-python-probes.cjs");
+      await writeFile(noPython, [
+        'const cp = require("node:child_process");',
+        'const path = require("node:path");',
+        'const fs = require("node:fs");',
+        'const original = cp.spawnSync;',
+        'cp.spawnSync = function (file, args, options) {',
+        '  const name = path.basename(String(file)).toLowerCase();',
+        '  if (/^(python3?|py)(\\.exe)?$/.test(name)) {',
+        '    fs.appendFileSync(path.join(process.env.CAPTURE_DIR, "refused-python"), name + "\\n");',
+        '    return { status: 1, signal: null, stdout: "", stderr: "fixture: no isolated Python" };',
+        '  }',
+        '  return original.apply(this, arguments);',
+        '};',
+      ].join("\n"), { encoding: "utf8", flag: "wx", mode: 0o600 });
+      env.NODE_OPTIONS = nodeOptionsPreload(noPython);
       delete env.XDG_CACHE_HOME;
       env.PI_REVIEW_GATE_DDGS_VENV = join(fixture.root, "missing ddgs venv");
 
@@ -2475,6 +2514,8 @@ if (isWindows) {
 
       assert.equal(outcome.status, 1);
       assert.match(outcome.stderr, /Python 3 is required to provision the DDGS web-search dependency/);
+      assert.deepEqual((await readFile(join(fixture.capture, "refused-python"), "utf8")).trim().split("\n"),
+        ["python3", "python", "py"], "every supported Windows Python probe was refused");
       assert.equal(await launchStarted(fixture), false, "a missing interpreter must stop the launch");
     } finally {
       await rm(scratch, { recursive: true, force: true });

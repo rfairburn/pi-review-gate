@@ -451,14 +451,26 @@ function stageNpmEnvironment(env, ownedStage, setupRoot = ownedStage.root) {
   return ownEnv;
 }
 
-function boundedProcessCleanupStatus({ closed, pid, platform, timedOut, outputExceeded, normalExit, groupStillExists }) {
+/**
+ * A natural direct exit is a close with an integer exit status, no signal, and
+ * no spawn error. The status may be zero or nonzero: a setup child's own
+ * failure is still a natural exit, and must not be confused with a cleanup or
+ * spawn failure that only has the generic fallback status.
+ */
+function naturalDirectExit(closeResult, spawnError) {
+  return !spawnError && closeResult?.signal === null && Number.isInteger(closeResult?.code);
+}
+
+function boundedProcessCleanupStatus({ closed, pid, platform, timedOut, outputExceeded, naturalExit, groupStillExists }) {
   if (!closed) return false;
   if (pid === undefined) return true;
   if (platform === "win32") {
-    // Public Node owns only the direct ChildProcess on Windows. A normal
-    // successful close needs no escalation and makes no descendant claim;
-    // after timeout/output termination there is no public process-tree proof.
-    return timedOut || outputExceeded || !normalExit ? false : undefined;
+    // Public Node owns only the direct ChildProcess on Windows. A natural
+    // direct close — any integer exit status, success or failure — needs no
+    // escalation and makes no descendant claim, so it is never evidence of
+    // settlement. After a forced timeout/output termination, a signal, a
+    // spawn error, or an unknown close there is no public process-tree proof.
+    return timedOut || outputExceeded || !naturalExit ? false : undefined;
   }
   return !groupStillExists();
 }
@@ -509,18 +521,21 @@ function runBoundedProcess(file, args, options = {}) {
       if (finished || (!closed && !cleanupDeadlineReached) || (terminating && killTimer !== undefined)) return;
       finished = true;
       clearTimeout(deadlineTimer);
-      const normalExit = closeResult?.code === 0 && closeResult?.signal === null && !spawnError;
+      // A natural direct exit is distinct from success: a setup child's
+      // legitimate nonzero status must reach preparation instead of collapsing
+      // to the generic unconfirmed-cleanup failure status.
+      const naturalExit = naturalDirectExit(closeResult, spawnError);
       const cleanupConfirmed = boundedProcessCleanupStatus({
         closed,
         pid: child.pid,
         platform: process.platform,
         timedOut,
         outputExceeded,
-        normalExit,
+        naturalExit,
         groupStillExists,
       });
       const naturallySettledWindowsChild = process.platform === "win32"
-        && closed && !timedOut && !outputExceeded && normalExit;
+        && closed && !timedOut && !outputExceeded && naturalExit;
       if (cleanupConfirmed === true || naturallySettledWindowsChild) {
         activeBoundedProcessCount -= 1;
       } else {
@@ -1103,6 +1118,7 @@ module.exports = {
   formatStageErrorDiagnostics,
   identityOfDirectory,
   lstatRegularFile,
+  naturalDirectExit,
   pathExists,
   pathIsWithin,
   prepareStagedApplication,

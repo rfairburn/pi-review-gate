@@ -28,7 +28,7 @@ import {
   type SessionSpawnInput,
   type SessionSpawnOutcome,
 } from "../src/session-host/protocol";
-import { stageSessionHostPayload, type StagedSessionHostPayload } from "../src/session-host/payload";
+import { __test as payloadTest, stageSessionHostPayload, type StagedSessionHostPayload } from "../src/session-host/payload";
 
 const INSTANCE_A = "11111111-1111-4111-8111-111111111111";
 const INSTANCE_B = "22222222-2222-4222-8222-222222222222";
@@ -2037,7 +2037,10 @@ test("missing, tampered, or NUL payloads fail without invoking the host and repl
   await disposeBroker(broker);
 });
 
-test("a registered payload namespace replaced before read is rejected without invoking the host", async () => {
+test("a registered payload namespace replaced before read is rejected without invoking the host", async (t) => {
+  // Exercise Windows-style linked ownership on every platform, including teardown.
+  payloadTest.setOwnershipPinForTests(false);
+  t.after(() => payloadTest.setOwnershipPinForTests(undefined));
   const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
   let calls = 0;
   const registration = broker.register(INSTANCE_A, {
@@ -2046,7 +2049,9 @@ test("a registered payload namespace replaced before read is rejected without in
     onSpawnRequest: () => { calls += 1; return Promise.resolve("started"); },
   });
   const originalDir = registration.bootstrap.payloadDir as string;
-  const payload = spawnPayload(registration.bootstrap, "original owned namespace prompt");
+  const staged = stageSessionHostPayload(originalDir, JSON.stringify("original owned namespace prompt"));
+  stagedPayloadOwnership.push(staged);
+  const payload = staged.descriptor;
   const movedDir = `${originalDir}-moved`;
   fs.renameSync(originalDir, movedDir);
   fs.mkdirSync(originalDir, { mode: 0o700 });
@@ -2085,12 +2090,14 @@ test("a registered payload namespace replaced before read is rejected without in
   assert.ok(fs.existsSync(replacementPath), "the replacement entry is preserved, never consumed or deleted");
   assert.ok(fs.existsSync(path.join(movedDir, payload.name)), "the original owned payload is preserved under its moved namespace");
 
-  // Test-owned replacement/moved fixtures are removed before broker dispose so
-  // the broker's own transport cleanup remains exact and unblocked.
+  // Remove only the test-created replacement, then restore the observed namespace
+  // so its ownership handle can release both the payload and any continuity pin.
+  // Production cleanup must not follow a moved namespace to guess at ownership.
   fs.unlinkSync(replacementPath);
   fs.rmdirSync(originalDir);
-  fs.unlinkSync(path.join(movedDir, payload.name));
-  fs.rmdirSync(movedDir);
+  fs.renameSync(movedDir, originalDir);
+  staged.discard();
+  assert.deepEqual(fs.readdirSync(originalDir), [], "restored ownership releases the linked pin as well as the payload");
   await disposeBroker(broker);
 });
 

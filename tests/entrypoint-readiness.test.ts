@@ -354,15 +354,19 @@ review: { activeReviewers: [
     assert.equal(messages.filter((message) => message.customType === "pi-review-bg-shell").length, 1);
     await assert.rejects(access(reviewerStarted), /ENOENT/);
 
-    // The run ends naturally, so Pi drains its follow-up queue before
+    // The run ends naturally, so Pi drains its steering wake before
     // settling: the queued exit wake is injected into the transcript and
-    // emitted (message_start) — the observed-injection event that clears the
-    // gate's outstanding-exit-wake marker (#281), keeping settlement from
+    // emitted (message_start), and the completed assistant response
+    // (message_end with a normal stop reason) proves the model consumed it
+    // (#281). Together those keep settlement from starting a recovery turn or
     // re-sending an already-delivered wake.
     const jobId = String((started.content as Array<{ text?: string }>)[0]?.text ?? "").match(/as (job\d+)/)?.[1];
     assert.ok(jobId, `ShellStart result must name the job: ${JSON.stringify(started)}`);
     await trigger(hooks, "message_start", {
       message: { role: "custom", customType: "pi-review-bg-shell", content: "exit wake", display: true, details: { id: jobId, kind: "exit" } },
+    });
+    await trigger(hooks, "message_end", {
+      message: { role: "assistant", content: "build completed", stopReason: "stop" },
     });
 
     await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "build completed" }] });

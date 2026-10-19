@@ -25,8 +25,10 @@ dates.
   notices, review transmissions, and background-completion resumes reach the
   still-running turn while a foreground command keeps running normally, and an idle
   session still resumes through the same triggered delivery. Stored delivery records,
-  delivery ids, receipt keys, and message bytes are unchanged. Genuine user input held
-  during a review keeps its follow-up release, scheduler new-work admission is
+  delivery ids, receipt keys, and message bytes are unchanged. Exit notices retain
+  their bounded recovery after an abort: transcript insertion alone does not
+  acknowledge delivery before a normal model response consumes the notice. Genuine
+  user input held during a review keeps its follow-up release, scheduler new-work admission is
   unchanged, and an unrecognized persisted delivery kind is preserved with a
   diagnostic instead of being sent or acknowledged. The busy-only routine-wake hold
   (with its settlement-time coalescing) is

@@ -63,9 +63,11 @@ The complete prompt travels automatically in private temporary payload files rat
 inside a status frame, command-line argument, or environment value. The host owns the
 fresh temporary namespace (requested mode `0700`); payloads are created exclusively
 (requested mode `0600`) and consumed through confined, no-follow regular-file reads with
-exact size, identity, and digest checks. Missing, changed, unsafe, or unreadable data is
-refused, never replaced with a partial prompt. Cleanup is ownership-checked against the
-staged object's exact identity, which stays pinned for the transfer lifetime (an open
+exact size, identity, and digest checks. Native device/inode identities remain exact
+big integers; the private JSON handoff encodes them as canonical decimal strings,
+including NTFS identifiers beyond JavaScript's safe-integer range. Missing, changed,
+unsafe, or unreadable data is refused, never replaced with a partial prompt. Cleanup is
+ownership-checked against the staged object's exact identity, which stays pinned for the transfer lifetime (an open
 descriptor on POSIX, a private hard-link continuity pin where a retained handle would
 leave a removed name unreplaceable), plus its unchanged declared size and digest:
 unknown, replaced, or modified entries are preserved rather than deleted. A pin that can

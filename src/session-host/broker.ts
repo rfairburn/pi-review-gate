@@ -114,7 +114,13 @@ import {
   isValidRenameName,
   parseBootstrap,
 } from "./protocol";
-import { discardSessionHostPayload, decodeSessionHostPayloadJsonString, readSessionHostPayload } from "./payload";
+import {
+  discardSessionHostPayload,
+  decodeSessionHostPayloadJsonString,
+  encodeSessionHostPayloadDirectoryIdentity,
+  readSessionHostPayload,
+  type SessionHostPayloadDirectoryIdentity,
+} from "./payload";
 
 /** Options accepted by {@link createStatusBroker}. */
 export interface StatusBrokerOptions {
@@ -300,7 +306,7 @@ interface RegistrationRecord {
   handlers: StatusBrokerStatusHandlers;
   /** Private namespace created by this broker for exactly this registration. */
   payloadDir: string;
-  payloadDirIdentity: OwnedPathIdentity;
+  payloadDirIdentity: SessionHostPayloadDirectoryIdentity;
 }
 
 interface PendingRename {
@@ -564,7 +570,20 @@ function removeOwnEmptyDirectory(dir: string, identity: OwnedPathIdentity): void
 
 interface OwnedPayloadNamespace {
   readonly path: string;
-  readonly identity: OwnedPathIdentity;
+  readonly identity: SessionHostPayloadDirectoryIdentity;
+}
+
+/** Payload namespace cleanup uses the same exact identities as reads and startup handoff. */
+function removeOwnEmptyPayloadDirectory(dir: string, identity: SessionHostPayloadDirectoryIdentity): void {
+  try {
+    const stats = lstatSync(dir, { bigint: true });
+    if (stats.isDirectory() && !stats.isSymbolicLink()
+      && stats.dev.toString() === identity.dev && stats.ino.toString() === identity.ino) {
+      rmdirSync(dir);
+    }
+  } catch {
+    // A changed, nonempty, unsafe, or missing namespace is never removed.
+  }
 }
 
 /**
@@ -574,16 +593,16 @@ interface OwnedPayloadNamespace {
  */
 function createOwnedPayloadNamespace(parent: string): OwnedPayloadNamespace {
   let created: string | undefined;
-  let identity: OwnedPathIdentity | undefined;
+  let identity: SessionHostPayloadDirectoryIdentity | undefined;
   try {
     created = mkdtempSync(join(realpathSync(parent), PAYLOAD_DIR_PREFIX));
-    const stats = lstatSync(created);
+    const stats = lstatSync(created, { bigint: true });
     if (!stats.isDirectory()) throw new Error("payload namespace is not a directory");
-    identity = { dev: stats.dev, ino: stats.ino };
+    identity = encodeSessionHostPayloadDirectoryIdentity(stats);
     chmodSync(created, 0o700);
     return { path: created, identity };
   } catch (error) {
-    if (created !== undefined && identity !== undefined) removeOwnEmptyDirectory(created, identity);
+    if (created !== undefined && identity !== undefined) removeOwnEmptyPayloadDirectory(created, identity);
     throw error;
   }
 }
@@ -2064,7 +2083,7 @@ class LocalStatusBroker implements StatusBroker {
 
   /** Removes only this broker-created namespace, and only while it is empty and unchanged. */
   #removePayloadNamespace(record: RegistrationRecord): void {
-    removeOwnEmptyDirectory(record.payloadDir, record.payloadDirIdentity);
+    removeOwnEmptyPayloadDirectory(record.payloadDir, record.payloadDirIdentity);
   }
 }
 

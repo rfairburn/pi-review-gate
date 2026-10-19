@@ -6,6 +6,7 @@ import {
 } from "./protocol";
 import {
   SessionHostPayloadError,
+  parseSessionHostPayloadDirectoryIdentity as parseDirectoryIdentity,
   readSessionHostPayloadSync,
   stageSessionHostPayload,
   type SessionHostPayloadDirectoryIdentity,
@@ -36,14 +37,6 @@ interface StagedStartupRequest extends StagedSessionHostPayload {
   readonly descriptor: SessionHostPayloadRef & {
     readonly directoryIdentity: SessionHostPayloadDirectoryIdentity;
   };
-}
-
-function parseDirectoryIdentity(value: unknown): SessionHostPayloadDirectoryIdentity | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const { dev, ino } = value as Record<string, unknown>;
-  if (typeof dev !== "number" || !Number.isSafeInteger(dev) || dev < 0
-    || typeof ino !== "number" || !Number.isSafeInteger(ino) || ino < 0) return undefined;
-  return { dev, ino };
 }
 
 /** Test-only process-global hygiene for independent synthetic native children. */

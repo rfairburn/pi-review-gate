@@ -93,10 +93,10 @@ export interface StagedSessionHostPayload {
   discard(): void;
 }
 
-/** Stable directory inode identity captured when a namespace is created. */
+/** Exact decimal directory identity, safe to carry through JSON on every platform. */
 export interface SessionHostPayloadDirectoryIdentity {
-  readonly dev: number;
-  readonly ino: number;
+  readonly dev: string;
+  readonly ino: string;
 }
 
 /**
@@ -170,33 +170,37 @@ function assertPrivateDirectory(stats: { isDirectory(): boolean; isSymbolicLink(
   }
 }
 
-/**
- * Exact comparison of an observed directory identity with the bounded numeric
- * identity carried through the startup descriptor. Only safe integers can be
- * carried, and their bigint conversion is exact; anything else is a mismatch.
- */
+/** Validate one canonical nonnegative decimal identifier without Number conversion. */
+function isCanonicalIdentifier(value: unknown): value is string {
+  if (typeof value !== "string" || !/^[0-9]+$/.test(value)) return false;
+  try {
+    return BigInt(value).toString() === value;
+  } catch {
+    return false;
+  }
+}
+
+/** Shared decoder for the private JSON handoff; numeric or lossy aliases are refused. */
+export function parseSessionHostPayloadDirectoryIdentity(value: unknown): SessionHostPayloadDirectoryIdentity | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const { dev, ino } = value as Record<string, unknown>;
+  return isCanonicalIdentifier(dev) && isCanonicalIdentifier(ino) ? { dev, ino } : undefined;
+}
+
+/** Encode native bigint identities exactly, including large NTFS file identifiers. */
+export function encodeSessionHostPayloadDirectoryIdentity(identity: FileIdentity): SessionHostPayloadDirectoryIdentity {
+  if (identity.dev < 0n || identity.ino < 0n) throw new SessionHostPayloadError("unsafe-directory");
+  return { dev: identity.dev.toString(), ino: identity.ino.toString() };
+}
+
+/** Exact comparison with the canonical decimal identity carried through JSON. */
 function matchesDirectoryIdentity(
   actual: FileIdentity,
   expected: SessionHostPayloadDirectoryIdentity | undefined,
 ): boolean {
   if (expected === undefined) return true;
-  if (!Number.isSafeInteger(expected.dev) || !Number.isSafeInteger(expected.ino)) return false;
-  return actual.dev === BigInt(expected.dev) && actual.ino === BigInt(expected.ino);
-}
-
-/**
- * Carries an observed namespace identity into the bounded descriptor JSON only
- * when it round-trips exactly; a larger inode refuses staging fail-closed
- * instead of advertising an approximated identity.
- */
-function toProtocolIdentity(identity: FileIdentity): SessionHostPayloadDirectoryIdentity {
-  const dev = Number(identity.dev);
-  const ino = Number(identity.ino);
-  if (!Number.isSafeInteger(dev) || !Number.isSafeInteger(ino)
-    || BigInt(dev) !== identity.dev || BigInt(ino) !== identity.ino) {
-    throw new SessionHostPayloadError("unavailable");
-  }
-  return { dev, ino };
+  const parsed = parseSessionHostPayloadDirectoryIdentity(expected);
+  return parsed !== undefined && actual.dev === BigInt(parsed.dev) && actual.ino === BigInt(parsed.ino);
 }
 
 /**
@@ -438,7 +442,7 @@ export function stageSessionHostPayload(
     throw new SessionHostPayloadError("invalid-descriptor");
   }
   const root = canonicalPayloadDirectory(directory, expectedIdentity);
-  const directoryIdentity = toProtocolIdentity(root.identity);
+  const directoryIdentity = encodeSessionHostPayloadDirectoryIdentity(root.identity);
   const bytes = Buffer.from(jsonText, "utf8");
   const sha256 = createHash("sha256").update(bytes).digest("hex");
   const name = `${PAYLOAD_FILE_PREFIX}${randomBytes(16).toString("hex")}${PAYLOAD_FILE_SUFFIX}`;

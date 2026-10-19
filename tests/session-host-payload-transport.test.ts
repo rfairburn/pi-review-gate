@@ -33,6 +33,8 @@ import {
   SessionHostPayloadError,
   __test as payloadTest,
   decodeSessionHostPayloadJsonString,
+  encodeSessionHostPayloadDirectoryIdentity,
+  parseSessionHostPayloadDirectoryIdentity,
   readSessionHostPayload,
   readSessionHostPayloadSync,
   stageSessionHostPayload,
@@ -488,8 +490,8 @@ test("expected directory identity rejects a namespace replaced before any read",
   const namespace = join(payloadDir(), "identity-namespace");
   mkdirSync(namespace, { mode: 0o700 });
   chmodSync(namespace, 0o700);
-  const stats = lstatSync(namespace);
-  const expected = { dev: stats.dev, ino: stats.ino };
+  const stats = lstatSync(namespace, { bigint: true });
+  const expected = encodeSessionHostPayloadDirectoryIdentity(stats);
   const staged = stage(JSON.stringify("identity-bound value"), namespace);
   const moved = join(payloadDir(), "identity-moved");
   renameSync(namespace, moved);
@@ -504,6 +506,18 @@ test("expected directory identity rejects a namespace replaced before any read",
   );
   assert.ok(lstatSync(replacementPath).isFile(), "the replacement entry is preserved");
   assert.ok(lstatSync(join(moved, staged.descriptor.name)).isFile(), "the original payload is preserved");
+});
+
+test("directory identities preserve large NTFS identifiers exactly through JSON", () => {
+  const first = encodeSessionHostPayloadDirectoryIdentity({ dev: 18446744073709551615n, ino: 9007199254740992n });
+  const second = encodeSessionHostPayloadDirectoryIdentity({ dev: 18446744073709551615n, ino: 9007199254740993n });
+  assert.notDeepEqual(first, second, "adjacent native identifiers must never collapse through Number rounding");
+  assert.deepEqual(parseSessionHostPayloadDirectoryIdentity(JSON.parse(JSON.stringify(second))), {
+    dev: "18446744073709551615", ino: "9007199254740993",
+  });
+  for (const value of [1, -1, "-1", "+1", "01", "1.0", "1e3", "1\n", "", null]) {
+    assert.equal(parseSessionHostPayloadDirectoryIdentity({ ...second, ino: value }), undefined);
+  }
 });
 
 test("descriptor parsing rejects unsafe or unbounded references before any filesystem access", async () => {

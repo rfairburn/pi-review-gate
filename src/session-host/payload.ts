@@ -20,11 +20,21 @@
  *   path is joined without that validation.
  * - Files are opened with `O_NOFOLLOW | O_NONBLOCK` and must be regular files
  *   whose path identity matches the opened descriptor. Short reads, extra
- *   bytes, a replaced inode, and wrong digests are rejected.
+ *   bytes, a replaced inode, and wrong digests are rejected. Identity
+ *   comparisons use exact `bigint` device/inode values, so a rounded `number`
+ *   can never masquerade as the same object.
+ * - A staged file keeps a positively owned kernel continuity pin (the creation
+ *   descriptor on POSIX, a private hard link where a retained handle would make
+ *   the name unreplaceable) for its whole ownership lifetime, so a filesystem
+ *   can never hand that inode number to a replacement entry while the producer
+ *   still owns the original. Ownership release additionally re-verifies the
+ *   unchanged declared size and digest, so a foreign entry that only shares
+ *   device/inode metadata is preserved rather than deleted. A pin that can
+ *   neither be created nor verified refuses or preserves, never guesses.
  * - Successful reads consume only the exact file inode they verified. A
- *   replaced or foreign entry is preserved. Directory removal belongs to the
- *   broker that created the namespace, and only when its identity still
- *   matches and it is empty.
+ *   replaced, foreign, or modified entry is preserved. Directory removal
+ *   belongs to the broker that created the namespace, and only when its
+ *   identity still matches and it is empty.
  * - JSON-encoding the value preserves exact JavaScript text, including lone
  *   surrogates that UTF-8 alone would replace. NUL content policy is unchanged
  *   and enforced by the prompt/startup validators, never waived here.
@@ -35,6 +45,7 @@ import {
   closeSync,
   constants as fsConstants,
   fstatSync,
+  linkSync,
   lstatSync,
   openSync,
   readSync,
@@ -74,8 +85,10 @@ export interface StagedSessionHostPayload {
   /** Namespace inode identity observed by the producer at staging time. */
   readonly directoryIdentity: SessionHostPayloadDirectoryIdentity;
   /**
-   * Removes exactly the file this staging call created, only while its path
-   * identity still matches. Idempotent; a replaced entry is preserved.
+   * Releases this staging call's ownership exactly once: removes the file only
+   * while its pinned identity and its unchanged declared size and digest still
+   * match, then releases the retained continuity pin. Idempotent; a consumed,
+   * missing, replaced, foreign, or modified entry is preserved.
    */
   discard(): void;
 }
@@ -86,7 +99,15 @@ export interface SessionHostPayloadDirectoryIdentity {
   readonly ino: number;
 }
 
-interface FileIdentity extends SessionHostPayloadDirectoryIdentity {}
+/**
+ * Exact kernel file identity. `bigint` stats keep device/inode equality exact
+ * on filesystems whose numbers exceed `Number.MAX_SAFE_INTEGER`, so float
+ * rounding can never masquerade as the same object.
+ */
+interface FileIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
 
 interface PayloadDirectory {
   readonly path: string;
@@ -95,12 +116,39 @@ interface PayloadDirectory {
 
 const PAYLOAD_FILE_PREFIX = "p-";
 const PAYLOAD_FILE_SUFFIX = ".json";
+/** Continuity-pin names are deliberately not parseable payload references. */
+const PAYLOAD_PIN_PREFIX = "pin-";
+const PAYLOAD_PIN_SUFFIX = ".pin";
 const PAYLOAD_FLAGS_READ = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
-const PAYLOAD_FLAGS_WRITE = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL
+/** Exclusive creation also reads back its own bytes for the ownership pin. */
+const PAYLOAD_FLAGS_WRITE = fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL
   | (fsConstants.O_NOFOLLOW ?? 0);
+
+/**
+ * Which kernel continuity proof pins the staged object for its ownership
+ * lifetime. Both keep the owned inode allocated, so a just-unlinked number can
+ * never be handed to an unlinked-and-recreated entry:
+ *
+ * - POSIX: the retained creation descriptor (no extra namespace entry).
+ * - Windows: a private hard link, because Node opens files with
+ *   `FILE_SHARE_DELETE` and a retained handle leaves a removed name
+ *   delete-pending. An independent owner could then no longer replace the entry
+ *   while the producer still holds its stale handle — replacement behavior the
+ *   transport must keep tolerating on that platform. A hard link pins the inode
+ *   without holding it open, so the staged name stays removable/recreatable
+ *   while no replacement can reuse the owned identity.
+ */
+const PAYLOAD_OWNERSHIP_PIN_SUPPORTED = process.platform !== "win32";
 
 /** Narrow seam for deterministic replaced-namespace regressions; absent in production. */
 let directoryObservationHookForTests: ((phase: "canonical" | "before-commit") => void) | undefined;
+/** Narrow seam for deterministic unpinned-ownership regressions; absent in production. */
+let ownershipPinOverrideForTests: boolean | undefined;
+
+/** The platform pin decision, overridable only by the bounded test seam above. */
+function ownershipPinSupported(): boolean {
+  return ownershipPinOverrideForTests ?? PAYLOAD_OWNERSHIP_PIN_SUPPORTED;
+}
 
 export const __test = Object.freeze({
   setDirectoryObservationHookForTests(
@@ -108,15 +156,47 @@ export const __test = Object.freeze({
   ): void {
     directoryObservationHookForTests = hook;
   },
+  setOwnershipPinForTests(enabled: boolean | undefined): void {
+    ownershipPinOverrideForTests = enabled;
+  },
 });
 
-function assertPrivateDirectory(stats: { isDirectory(): boolean; isSymbolicLink(): boolean; mode: number; uid: number }): void {
+function assertPrivateDirectory(stats: { isDirectory(): boolean; isSymbolicLink(): boolean; mode: bigint; uid: bigint }): void {
   if (!stats.isDirectory() || stats.isSymbolicLink()) throw new SessionHostPayloadError("unsafe-directory");
   if (process.platform !== "win32") {
-    if ((stats.mode & 0o777) !== 0o700) throw new SessionHostPayloadError("unsafe-directory");
-    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-    if (typeof uid === "number" && stats.uid !== uid) throw new SessionHostPayloadError("unsafe-directory");
+    if ((stats.mode & 0o777n) !== 0o700n) throw new SessionHostPayloadError("unsafe-directory");
+    const uid = typeof process.getuid === "function" ? BigInt(process.getuid()) : undefined;
+    if (uid !== undefined && stats.uid !== uid) throw new SessionHostPayloadError("unsafe-directory");
   }
+}
+
+/**
+ * Exact comparison of an observed directory identity with the bounded numeric
+ * identity carried through the startup descriptor. Only safe integers can be
+ * carried, and their bigint conversion is exact; anything else is a mismatch.
+ */
+function matchesDirectoryIdentity(
+  actual: FileIdentity,
+  expected: SessionHostPayloadDirectoryIdentity | undefined,
+): boolean {
+  if (expected === undefined) return true;
+  if (!Number.isSafeInteger(expected.dev) || !Number.isSafeInteger(expected.ino)) return false;
+  return actual.dev === BigInt(expected.dev) && actual.ino === BigInt(expected.ino);
+}
+
+/**
+ * Carries an observed namespace identity into the bounded descriptor JSON only
+ * when it round-trips exactly; a larger inode refuses staging fail-closed
+ * instead of advertising an approximated identity.
+ */
+function toProtocolIdentity(identity: FileIdentity): SessionHostPayloadDirectoryIdentity {
+  const dev = Number(identity.dev);
+  const ino = Number(identity.ino);
+  if (!Number.isSafeInteger(dev) || !Number.isSafeInteger(ino)
+    || BigInt(dev) !== identity.dev || BigInt(ino) !== identity.ino) {
+    throw new SessionHostPayloadError("unavailable");
+  }
+  return { dev, ino };
 }
 
 /**
@@ -137,13 +217,12 @@ function canonicalPayloadDirectory(
   }
   let initial;
   try {
-    initial = lstatSync(dir);
+    initial = lstatSync(dir, { bigint: true });
   } catch {
     throw new SessionHostPayloadError("unavailable");
   }
   assertPrivateDirectory(initial);
-  if (expectedIdentity !== undefined
-    && (initial.dev !== expectedIdentity.dev || initial.ino !== expectedIdentity.ino)) {
+  if (!matchesDirectoryIdentity(initial, expectedIdentity)) {
     throw new SessionHostPayloadError("replaced");
   }
   directoryObservationHookForTests?.("canonical");
@@ -151,14 +230,13 @@ function canonicalPayloadDirectory(
   let final;
   try {
     canonical = realpathSync(dir);
-    final = lstatSync(canonical);
+    final = lstatSync(canonical, { bigint: true });
   } catch {
     throw new SessionHostPayloadError("unavailable");
   }
   assertPrivateDirectory(final);
   if (final.dev !== initial.dev || final.ino !== initial.ino
-    || (expectedIdentity !== undefined
-      && (final.dev !== expectedIdentity.dev || final.ino !== expectedIdentity.ino))) {
+    || !matchesDirectoryIdentity(final, expectedIdentity)) {
     throw new SessionHostPayloadError("replaced");
   }
   return { path: canonical, identity: { dev: final.dev, ino: final.ino } };
@@ -169,7 +247,7 @@ function assertPayloadDirectoryUnchanged(directory: PayloadDirectory): void {
   directoryObservationHookForTests?.("before-commit");
   let current;
   try {
-    current = lstatSync(directory.path);
+    current = lstatSync(directory.path, { bigint: true });
   } catch {
     throw new SessionHostPayloadError("unavailable");
   }
@@ -185,10 +263,125 @@ function payloadFilePath(directory: string, descriptor: SessionHostPayloadRef): 
   return join(directory, parsed.name);
 }
 
+/** True while the opened descriptor still holds exactly the staged bytes. */
+function descriptorHoldsStagedBytes(
+  fd: number,
+  identity: FileIdentity,
+  descriptor: SessionHostPayloadRef,
+): boolean {
+  let stats;
+  try {
+    stats = fstatSync(fd, { bigint: true });
+  } catch {
+    return false;
+  }
+  if (!stats.isFile() || stats.dev !== identity.dev || stats.ino !== identity.ino) return false;
+  if (stats.size !== BigInt(descriptor.size)) return false;
+  const hash = createHash("sha256");
+  const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(descriptor.size, 1)));
+  let offset = 0;
+  while (offset < descriptor.size) {
+    const wanted = Math.min(chunk.length, descriptor.size - offset);
+    let read: number;
+    try {
+      read = readSync(fd, chunk, 0, wanted, offset);
+    } catch {
+      return false;
+    }
+    if (read <= 0) return false;
+    hash.update(chunk.subarray(0, read));
+    offset += read;
+  }
+  return hash.digest("hex") === descriptor.sha256;
+}
+
+/**
+ * The kernel continuity proof held for one staged object: a retained
+ * descriptor, or a private hard link to the same inode. Both are created by the
+ * staged call itself and prove afterwards that the owned inode is still the one
+ * allocated for that identity.
+ */
+type StagedOwnershipPin =
+  | { readonly kind: "descriptor"; readonly fd: number }
+  | { readonly kind: "link"; readonly path: string };
+
+/**
+ * Releases one staged ownership handle. Removal happens only while the pinned
+ * identity and the unchanged declared size and digest all still match, and the
+ * pin is released exactly once on every path — including an entry a consumer
+ * already consumed. An unverifiable pin preserves the entry (fail closed).
+ */
+function releaseOwnedPayloadFile(
+  path: string,
+  identity: FileIdentity,
+  descriptor: SessionHostPayloadRef,
+  pin: StagedOwnershipPin,
+): void {
+  if (pin.kind === "descriptor") {
+    // The retained descriptor keeps this inode allocated, so the entry is
+    // either this exact object or gone. Unlink while still pinned, then close.
+    try {
+      if (descriptorHoldsStagedBytes(pin.fd, identity, descriptor)) removeOwnedPayloadFile(path, identity);
+    } finally {
+      try {
+        closeSync(pin.fd);
+      } catch {
+        // The discard decision remains authoritative.
+      }
+    }
+    return;
+  }
+  releaseLinkedPayloadFile(path, pin.path, identity, descriptor);
+}
+
+/**
+ * Releases an ownership handle pinned by a private hard link. The link keeps
+ * the owned inode allocated, so an entry at the payload path that reports the
+ * same exact identity is provably the same original object — never a recycled
+ * one — even when its bytes would otherwise match. The payload entry is removed
+ * first, while the pin link still holds the inode, then the pin link itself.
+ */
+function releaseLinkedPayloadFile(
+  path: string,
+  pinPath: string,
+  identity: FileIdentity,
+  descriptor: SessionHostPayloadRef,
+): void {
+  let fd: number | undefined;
+  let pinIsOwned = false;
+  try {
+    try {
+      fd = openSync(pinPath, PAYLOAD_FLAGS_READ);
+    } catch {
+      // The pin entry is gone or unreadable: ownership is unproven, so the
+      // payload entry stays preserved and no foreign entry is touched.
+      return;
+    }
+    // The pin link is ours only while it still reports the staged identity; a
+    // replaced pin proves nothing and both entries stay preserved.
+    const pinned = fstatSync(fd, { bigint: true });
+    if (!pinned.isFile() || pinned.dev !== identity.dev || pinned.ino !== identity.ino) return;
+    pinIsOwned = true;
+    // Unchanged declared size and digest authorize removing the payload entry.
+    if (descriptorHoldsStagedBytes(fd, identity, descriptor)) removeOwnedPayloadFile(path, identity);
+  } catch {
+    // Fail closed: an unverifiable pin never authorizes a deletion.
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // The discard decision remains authoritative.
+      }
+    }
+    if (pinIsOwned) removeOwnedPayloadFile(pinPath, identity);
+  }
+}
+
 /** Removes only the exact regular-file inode this process verified or created. */
 function removeOwnedPayloadFile(path: string, identity: FileIdentity): void {
   try {
-    const stats = lstatSync(path);
+    const stats = lstatSync(path, { bigint: true });
     if (stats.isFile() && !stats.isSymbolicLink() && stats.dev === identity.dev && stats.ino === identity.ino) {
       unlinkSync(path);
     }
@@ -197,7 +390,7 @@ function removeOwnedPayloadFile(path: string, identity: FileIdentity): void {
   }
 }
 
-function toIdentity(stats: { dev: number; ino: number }): FileIdentity {
+function toIdentity(stats: { dev: bigint; ino: bigint }): FileIdentity {
   return { dev: stats.dev, ino: stats.ino };
 }
 
@@ -212,15 +405,15 @@ function decodePayloadBytes(bytes: Buffer, descriptor: SessionHostPayloadRef): s
 }
 
 function verifyOpenedPayload(
-  opened: { isFile(): boolean; size: number; dev: number; ino: number; isSymbolicLink(): boolean },
+  opened: { isFile(): boolean; size: bigint; dev: bigint; ino: bigint; isSymbolicLink(): boolean },
   descriptor: SessionHostPayloadRef,
   path: string,
 ): FileIdentity {
   if (!opened.isFile() || opened.isSymbolicLink()) throw new SessionHostPayloadError("not-regular-file");
-  if (opened.size !== descriptor.size) throw new SessionHostPayloadError("size-mismatch");
+  if (opened.size !== BigInt(descriptor.size)) throw new SessionHostPayloadError("size-mismatch");
   let entry;
   try {
-    entry = lstatSync(path);
+    entry = lstatSync(path, { bigint: true });
   } catch {
     throw new SessionHostPayloadError("unavailable");
   }
@@ -233,8 +426,8 @@ function verifyOpenedPayload(
 
 /**
  * Writes the exact JSON text into a fresh exclusive `0600` file in the
- * host-owned private namespace. A partial write, short file, or replaced
- * inode fails and removes only this call's exact file.
+ * host-owned private namespace and retains its ownership pin. A partial write,
+ * short file, or replaced inode fails and releases only this call's exact file.
  */
 export function stageSessionHostPayload(
   directory: string,
@@ -245,53 +438,85 @@ export function stageSessionHostPayload(
     throw new SessionHostPayloadError("invalid-descriptor");
   }
   const root = canonicalPayloadDirectory(directory, expectedIdentity);
+  const directoryIdentity = toProtocolIdentity(root.identity);
   const bytes = Buffer.from(jsonText, "utf8");
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
   const name = `${PAYLOAD_FILE_PREFIX}${randomBytes(16).toString("hex")}${PAYLOAD_FILE_SUFFIX}`;
   const path = join(root.path, name);
   let fd: number | undefined;
+  let pin: StagedOwnershipPin | undefined;
+  let pinPath: string | undefined;
   let identity: FileIdentity | undefined;
   try {
-    fd = openSync(path, PAYLOAD_FLAGS_WRITE, 0o600);
-    const opened = fstatSync(fd);
+    const creation = openSync(path, PAYLOAD_FLAGS_WRITE, 0o600);
+    fd = creation;
+    const opened = fstatSync(creation, { bigint: true });
     if (!opened.isFile()) throw new SessionHostPayloadError("not-regular-file");
     identity = toIdentity(opened);
     let offset = 0;
     while (offset < bytes.length) {
-      const written = writeSync(fd, bytes, offset, bytes.length - offset);
+      const written = writeSync(creation, bytes, offset, bytes.length - offset);
       if (!(written > 0)) throw new SessionHostPayloadError("unavailable");
       offset += written;
     }
-    const finished = fstatSync(fd);
-    if (!finished.isFile() || finished.size !== bytes.length) throw new SessionHostPayloadError("size-mismatch");
+    const finished = fstatSync(creation, { bigint: true });
+    if (!finished.isFile() || finished.size !== BigInt(bytes.length)) throw new SessionHostPayloadError("size-mismatch");
     if (finished.dev !== identity.dev || finished.ino !== identity.ino) throw new SessionHostPayloadError("replaced");
-    closeSync(fd);
-    fd = undefined;
-    const entry = lstatSync(path);
+    const entry = lstatSync(path, { bigint: true });
     if (!entry.isFile() || entry.isSymbolicLink()
       || entry.dev !== identity.dev || entry.ino !== identity.ino) {
       throw new SessionHostPayloadError("replaced");
     }
     assertPayloadDirectoryUnchanged(root);
-    const descriptor: SessionHostPayloadRef = {
-      name,
-      size: bytes.length,
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-    };
+    // Establish the kernel continuity pin only after every staging check
+    // succeeded. Both forms keep the owned inode allocated for the ownership
+    // lifetime, so a replacement entry can never alias it.
+    if (ownershipPinSupported()) {
+      pin = { kind: "descriptor", fd: creation };
+      fd = undefined;
+    } else {
+      pinPath = join(root.path, `${PAYLOAD_PIN_PREFIX}${randomBytes(16).toString("hex")}${PAYLOAD_PIN_SUFFIX}`);
+      linkSync(path, pinPath);
+      const linked = lstatSync(pinPath, { bigint: true });
+      if (!linked.isFile() || linked.dev !== identity.dev || linked.ino !== identity.ino) {
+        throw new SessionHostPayloadError("replaced");
+      }
+      closeSync(creation);
+      fd = undefined;
+      pin = { kind: "link", path: pinPath };
+    }
+    const descriptor: SessionHostPayloadRef = { name, size: bytes.length, sha256 };
     const owned = identity;
+    const ownedPin = pin;
+    let released = false;
     return {
       descriptor,
-      directoryIdentity: root.identity,
-      discard: () => removeOwnedPayloadFile(path, owned),
+      directoryIdentity,
+      discard: () => {
+        if (released) return;
+        released = true;
+        releaseOwnedPayloadFile(path, owned, descriptor, ownedPin);
+      },
     };
   } catch (error) {
+    // Remove the staged name and any continuity pin while this call's
+    // descriptor or link still references the exact inode, then close.
+    if (identity !== undefined) removeOwnedPayloadFile(path, identity);
+    if (pinPath !== undefined && identity !== undefined) removeOwnedPayloadFile(pinPath, identity);
+    if (pin?.kind === "descriptor") {
+      try {
+        closeSync(pin.fd);
+      } catch {
+        // The staging failure remains authoritative.
+      }
+    }
     if (fd !== undefined) {
       try {
         closeSync(fd);
       } catch {
-        // The write failure remains authoritative.
+        // The staging failure remains authoritative.
       }
     }
-    if (identity !== undefined) removeOwnedPayloadFile(path, identity);
     if (error instanceof SessionHostPayloadError) throw error;
     throw new SessionHostPayloadError("unavailable");
   }
@@ -319,7 +544,7 @@ export async function readSessionHostPayload(
   let text: string | undefined;
   let identity: FileIdentity | undefined;
   try {
-    const opened = await handle.stat();
+    const opened = await handle.stat({ bigint: true });
     identity = verifyOpenedPayload(opened, parsed, path);
     const bytes = Buffer.alloc(parsed.size);
     let offset = 0;
@@ -331,8 +556,8 @@ export async function readSessionHostPayload(
     const extra = Buffer.alloc(1);
     const { bytesRead: extraBytes } = await handle.read(extra, 0, 1, bytes.length);
     if (extraBytes !== 0) throw new SessionHostPayloadError("size-mismatch");
-    const finished = await handle.stat();
-    if (finished.size !== parsed.size || finished.dev !== identity.dev || finished.ino !== identity.ino) {
+    const finished = await handle.stat({ bigint: true });
+    if (finished.size !== BigInt(parsed.size) || finished.dev !== identity.dev || finished.ino !== identity.ino) {
       throw new SessionHostPayloadError("replaced");
     }
     text = decodePayloadBytes(bytes, parsed);
@@ -385,7 +610,7 @@ export function readSessionHostPayloadSync(
     } catch {
       throw new SessionHostPayloadError("unavailable");
     }
-    const opened = fstatSync(fd);
+    const opened = fstatSync(fd, { bigint: true });
     const identity = verifyOpenedPayload(opened, parsed, path);
     const bytes = Buffer.alloc(parsed.size);
     let offset = 0;
@@ -397,8 +622,8 @@ export function readSessionHostPayloadSync(
     const extra = Buffer.alloc(1);
     const extraBytes = readSync(fd, extra, 0, 1, bytes.length);
     if (extraBytes !== 0) throw new SessionHostPayloadError("size-mismatch");
-    const finished = fstatSync(fd);
-    if (finished.size !== parsed.size || finished.dev !== identity.dev || finished.ino !== identity.ino) {
+    const finished = fstatSync(fd, { bigint: true });
+    if (finished.size !== BigInt(parsed.size) || finished.dev !== identity.dev || finished.ino !== identity.ino) {
       throw new SessionHostPayloadError("replaced");
     }
     closeSync(fd);

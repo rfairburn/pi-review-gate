@@ -64,9 +64,14 @@ inside a status frame, command-line argument, or environment value. The host own
 fresh temporary namespace (requested mode `0700`); payloads are created exclusively
 (requested mode `0600`) and consumed through confined, no-follow regular-file reads with
 exact size, identity, and digest checks. Missing, changed, unsafe, or unreadable data is
-refused, never replaced with a partial prompt. Cleanup is ownership-checked: unknown or
-replaced entries are preserved rather than deleted. A crash or uncertain cleanup can
-leave temporary data for inspection; this is not secure erasure. On Windows requested
+refused, never replaced with a partial prompt. Cleanup is ownership-checked against the
+staged object's exact identity, which stays pinned for the transfer lifetime (an open
+descriptor on POSIX, a private hard-link continuity pin where a retained handle would
+leave a removed name unreplaceable), plus its unchanged declared size and digest:
+unknown, replaced, or modified entries are preserved rather than deleted. A pin that can
+neither be created nor verified refuses or preserves rather than guessing. A crash or
+uncertain cleanup can leave temporary data for inspection; this is not secure erasure.
+On Windows requested
 POSIX modes do not establish privacy beyond inherited OS ACLs; no custom ACL is installed.
 
 The prompt is not copied into status snapshots or status/sidebar diagnostics. It is

@@ -28,7 +28,7 @@ import {
   type SessionSpawnInput,
   type SessionSpawnOutcome,
 } from "../src/session-host/protocol";
-import { stageSessionHostPayload } from "../src/session-host/payload";
+import { stageSessionHostPayload, type StagedSessionHostPayload } from "../src/session-host/payload";
 
 const INSTANCE_A = "11111111-1111-4111-8111-111111111111";
 const INSTANCE_B = "22222222-2222-4222-8222-222222222222";
@@ -274,6 +274,13 @@ async function withDeadline<T>(promise: Promise<T>, label: string, timeoutMs = S
 }
 
 afterEach(async () => {
+  for (const handle of stagedPayloadOwnership.splice(0)) {
+    try {
+      handle.discard(); // Releases the continuity pin; preserved/replaced entries stay put.
+    } catch {
+      // Teardown releases ownership only; it never asserts on payload state.
+    }
+  }
   brokerTest.setSpawnTimeoutForTests(undefined);
   brokerTest.setSocketPathLimitForTests(undefined);
   brokerTest.setPlatformForTests(undefined);
@@ -400,10 +407,15 @@ function helloFrame(bootstrap: SessionHostBootstrap, overrides?: {
   };
 }
 
+/** Ownership handles staged by this test, released in teardown so no pin outlives its test. */
+const stagedPayloadOwnership: StagedSessionHostPayload[] = [];
+
 /** Stages one exact prompt in the registration's private namespace and returns only its wire reference. */
 function spawnPayload(bootstrap: SessionHostBootstrap, prompt: string): { name: string; size: number; sha256: string } {
   assert.equal(typeof bootstrap.payloadDir, "string", "the production broker advertises a payload namespace");
-  return stageSessionHostPayload(bootstrap.payloadDir as string, JSON.stringify(prompt)).descriptor;
+  const staged = stageSessionHostPayload(bootstrap.payloadDir as string, JSON.stringify(prompt));
+  stagedPayloadOwnership.push(staged);
+  return staged.descriptor;
 }
 
 interface Recorded {

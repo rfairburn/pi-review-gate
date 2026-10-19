@@ -20,6 +20,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -35,17 +36,28 @@ import {
   readSessionHostPayload,
   readSessionHostPayloadSync,
   stageSessionHostPayload,
+  type StagedSessionHostPayload,
 } from "../src/session-host/payload";
 import { parseSessionHostPayloadRef, type SessionHostPayloadRef } from "../src/session-host/protocol";
 
 let root: string | undefined;
+/** Every handle this test staged, so teardown releases pins before removing the tree. */
+let stagedHandles: StagedSessionHostPayload[] = [];
 
 beforeEach(() => {
   root = mkdtempSync(join(realpathSync(tmpdir()), "prg-payload-test-"));
   chmodSync(root, 0o700);
+  stagedHandles = [];
 });
 
 afterEach(() => {
+  for (const handle of stagedHandles.splice(0)) {
+    try {
+      handle.discard(); // Releases the continuity pin even when the entry is preserved.
+    } catch {
+      // A preserved/replaced entry is expected; teardown never asserts here.
+    }
+  }
   if (root !== undefined) rmSync(root, { recursive: true, force: true });
   root = undefined;
 });
@@ -53,6 +65,13 @@ afterEach(() => {
 function payloadDir(): string {
   assert.ok(root);
   return root;
+}
+
+/** Stages through the production helper and tracks the handle for teardown. */
+function stage(jsonText: string, directory: string = payloadDir()): StagedSessionHostPayload {
+  const staged = stageSessionHostPayload(directory, jsonText);
+  stagedHandles.push(staged);
+  return staged;
 }
 
 function fileFor(descriptor: SessionHostPayloadRef): string {
@@ -99,7 +118,7 @@ test("stages and consumes one exact >8 KiB structured prompt through async and s
   ].join("\n");
   assert.ok(Buffer.byteLength(prompt, "utf8") > 8192);
 
-  const first = stageSessionHostPayload(payloadDir(), JSON.stringify(prompt));
+  const first = stage(JSON.stringify(prompt));
   const firstPath = fileFor(first.descriptor);
   if (process.platform !== "win32") {
     assert.equal(lstatSync(payloadDir()).mode & 0o777, 0o700, "the namespace is private");
@@ -109,7 +128,7 @@ test("stages and consumes one exact >8 KiB structured prompt through async and s
   assert.equal(decodeSessionHostPayloadJsonString(firstText), prompt, "the exact prompt round-trips with no truncation");
   assert.equal(lstatSync(firstPath, { throwIfNoEntry: false }), undefined, "a verified successful read consumes its exact file");
 
-  const second = stageSessionHostPayload(payloadDir(), JSON.stringify(prompt));
+  const second = stage(JSON.stringify(prompt));
   const secondText = readSessionHostPayloadSync(payloadDir(), second.descriptor);
   assert.equal(decodeSessionHostPayloadJsonString(secondText), prompt, "the synchronous startup reader preserves the same exact text");
   assert.equal(lstatSync(fileFor(second.descriptor), { throwIfNoEntry: false }), undefined);
@@ -117,7 +136,7 @@ test("stages and consumes one exact >8 KiB structured prompt through async and s
 
 test("JSON staging preserves lone surrogates, newlines, quotes, and flag-like strings exactly", async () => {
   const exact = ` lone:\uD800:mid:\uDFFF:\n--session "quoted"\n--flag=value\n`;
-  const staged = stageSessionHostPayload(payloadDir(), JSON.stringify(exact));
+  const staged = stage(JSON.stringify(exact));
   const text = await readSessionHostPayload(payloadDir(), staged.descriptor);
   const decoded = decodeSessionHostPayloadJsonString(text);
   assert.equal(decoded, exact);
@@ -136,12 +155,12 @@ test("rejects missing, truncated, suffixed, tampered, and replaced payload files
   );
   assert.equal(lstatSync(join(payloadDir(), missingName), { throwIfNoEntry: false }), undefined);
 
-  const truncated = stageSessionHostPayload(payloadDir(), JSON.stringify("exact prompt"));
+  const truncated = stage(JSON.stringify("exact prompt"));
   writeFileSync(fileFor(truncated.descriptor), "exact", "utf8");
   await expectPayloadFailure(readSessionHostPayload(payloadDir(), truncated.descriptor), "size-mismatch");
   assert.ok(lstatSync(fileFor(truncated.descriptor)).isFile(), "a rejected size mismatch is preserved");
 
-  const suffixed = stageSessionHostPayload(payloadDir(), JSON.stringify("exact prompt"));
+  const suffixed = stage(JSON.stringify("exact prompt"));
   appendFileSync(fileFor(suffixed.descriptor), "suffix");
   await expectPayloadFailure(readSessionHostPayload(payloadDir(), suffixed.descriptor), "size-mismatch");
   expectSyncPayloadFailure(
@@ -149,7 +168,7 @@ test("rejects missing, truncated, suffixed, tampered, and replaced payload files
     "size-mismatch",
   );
 
-  const tampered = stageSessionHostPayload(payloadDir(), JSON.stringify("original prompt"));
+  const tampered = stage(JSON.stringify("original prompt"));
   const tamperedPath = fileFor(tampered.descriptor);
   const originalBytes = readFileSync(tamperedPath);
   const replacementBytes = Buffer.from(originalBytes);
@@ -158,7 +177,7 @@ test("rejects missing, truncated, suffixed, tampered, and replaced payload files
   await expectPayloadFailure(readSessionHostPayload(payloadDir(), tampered.descriptor), "digest-mismatch");
   assert.deepEqual(readFileSync(tamperedPath), replacementBytes, "tampered content is preserved for its owner");
 
-  const replaced = stageSessionHostPayload(payloadDir(), JSON.stringify("owned original"));
+  const replaced = stage(JSON.stringify("owned original"));
   const replacedBytes = readFileSync(fileFor(replaced.descriptor));
   const foreign = Buffer.from("F".repeat(replacedBytes.length));
   unlinkSync(fileFor(replaced.descriptor));
@@ -167,15 +186,171 @@ test("rejects missing, truncated, suffixed, tampered, and replaced payload files
   replaced.discard();
   assert.deepEqual(readFileSync(fileFor(replaced.descriptor)), foreign, "a replaced/unknown entry is never deleted");
 
-  const discarded = stageSessionHostPayload(payloadDir(), JSON.stringify("discard me"));
+  const discarded = stage(JSON.stringify("discard me"));
   assert.ok(lstatSync(fileFor(discarded.descriptor)).isFile());
   discarded.discard();
   assert.equal(lstatSync(fileFor(discarded.descriptor), { throwIfNoEntry: false }), undefined);
   discarded.discard(); // Idempotent, and never touches a later replacement.
 });
 
+test("pins the owned inode so a recreated entry can never alias it", {
+  skip: process.platform === "win32"
+    ? "Windows keeps a removed name replaceable while a producer handle exists; ownership there is proven by unchanged content"
+    : false,
+}, () => {
+  const pinned = stage(JSON.stringify("pinned original"));
+  const pinnedPath = fileFor(pinned.descriptor);
+  const original = statSync(pinnedPath, { bigint: true });
+  const pinnedBytes = readFileSync(pinnedPath);
+
+  // The Linux failure this pins: remove the staged name, then create the entry
+  // a filesystem with immediate inode reuse would hand the just-freed number.
+  unlinkSync(pinnedPath);
+  const foreign = Buffer.from("F".repeat(pinnedBytes.length));
+  writeFileSync(pinnedPath, foreign);
+  const foreignStats = statSync(pinnedPath, { bigint: true });
+  assert.equal(foreignStats.dev, original.dev);
+  assert.notEqual(foreignStats.ino, original.ino,
+    "the retained ownership descriptor keeps the owned inode allocated for its staging lifetime");
+  pinned.discard();
+  assert.deepEqual(readFileSync(pinnedPath), foreign,
+    "a different-object replacement survives ownership release");
+
+  // Identical bytes are still a different object: only the pinned identity can
+  // prove ownership, so metadata/content alone must never authorize deletion.
+  const identical = stage(JSON.stringify("identical replacement"));
+  const identicalPath = fileFor(identical.descriptor);
+  const identicalBytes = readFileSync(identicalPath);
+  const identicalOriginal = statSync(identicalPath, { bigint: true });
+  unlinkSync(identicalPath);
+  writeFileSync(identicalPath, identicalBytes);
+  const identicalReplacement = statSync(identicalPath, { bigint: true });
+  assert.notEqual(identicalReplacement.ino, identicalOriginal.ino,
+    "a recreated entry is a different inode even when its bytes are identical");
+  identical.discard();
+  assert.deepEqual(readFileSync(identicalPath), identicalBytes,
+    "an identical-content replacement is preserved rather than deleted by metadata alone");
+});
+
+test("preserves in-place-modified owned content instead of deleting it", () => {
+  const modified = stage(JSON.stringify("mutate me in place"));
+  const modifiedPath = fileFor(modified.descriptor);
+  const before = statSync(modifiedPath, { bigint: true });
+  const mutated = Buffer.from(readFileSync(modifiedPath));
+  mutated[mutated.length - 3] = mutated[mutated.length - 3]! ^ 0x01;
+  writeFileSync(modifiedPath, mutated);
+  const after = statSync(modifiedPath, { bigint: true });
+  assert.equal(after.ino, before.ino, "the mutation rewrote the same object in place");
+  modified.discard();
+  assert.deepEqual(readFileSync(modifiedPath), mutated,
+    "ownership release never deletes content that no longer matches its declared size and digest");
+});
+
+test("releases staged ownership exactly once, including after a consumer consumed the file", async () => {
+  const consumed = stage(JSON.stringify("consumed before release"));
+  const consumedPath = fileFor(consumed.descriptor);
+  const text = await readSessionHostPayload(payloadDir(), consumed.descriptor);
+  assert.equal(decodeSessionHostPayloadJsonString(text), "consumed before release");
+  assert.equal(lstatSync(consumedPath, { throwIfNoEntry: false }), undefined,
+    "the consumer removed the verified file before the producer released ownership");
+  consumed.discard();
+  consumed.discard();
+
+  const retired = stage(JSON.stringify("retired ownership"));
+  const retiredPath = fileFor(retired.descriptor);
+  retired.discard();
+  assert.equal(lstatSync(retiredPath, { throwIfNoEntry: false }), undefined);
+  writeFileSync(retiredPath, "later owner");
+  retired.discard();
+  assert.equal(readFileSync(retiredPath, "utf8"), "later owner",
+    "a repeated discard after release never deletes a later entry at the same path");
+});
+
+test("closes every pinned ownership descriptor exactly once", {
+  skip: process.platform === "linux"
+    ? false
+    : "/proc/self/fd enumeration is Linux-only; no equivalent public descriptor list exists on this platform",
+}, () => {
+  const openDescriptors = (): number => readdirSync("/proc/self/fd").length;
+  const baseline = openDescriptors();
+  const staged = Array.from({ length: 16 }, (_, index) =>
+    stage(JSON.stringify(`pinned ${index}`)));
+  assert.equal(openDescriptors(), baseline + staged.length,
+    "each staged handle pins exactly one owned descriptor");
+  for (const handle of staged.slice(0, -1)) handle.discard();
+  assert.equal(openDescriptors(), baseline + 1, "each release closes only its own pinned descriptor");
+  const last = staged[staged.length - 1]!;
+  unlinkSync(fileFor(last.descriptor));
+  last.discard();
+  assert.equal(openDescriptors(), baseline,
+    "an already-consumed entry still releases its pinned descriptor exactly once");
+});
+
+test("linked continuity pin preserves an identical-content replacement with a recycled path", () => {
+  // Exercises the Windows continuity mechanism (a private hard link instead of
+  // a retained descriptor) through a bounded seam. This is not native Windows
+  // evidence, but it is deterministic on any POSIX filesystem.
+  payloadTest.setOwnershipPinForTests(false);
+  try {
+    const owned = stage(JSON.stringify("linked owned"));
+    assert.ok(lstatSync(fileFor(owned.descriptor)).isFile());
+    const ownedStats = statSync(fileFor(owned.descriptor), { bigint: true });
+    const entries = readdirSync(payloadDir()).sort();
+    assert.equal(entries.length, 2, "the continuity pin is the only extra namespace entry");
+    const pinName = entries.find((entry) => entry !== owned.descriptor.name);
+    assert.match(String(pinName), /^pin-[0-9a-f]{32}\.pin$/,
+      "the continuity pin is never a parseable payload reference");
+    assert.equal(parseSessionHostPayloadRef({ name: pinName, size: 1, sha256: "a".repeat(64) }), undefined);
+    const pinStats = statSync(join(payloadDir(), String(pinName)), { bigint: true });
+    assert.equal(pinStats.ino, ownedStats.ino, "the pin link references the staged inode");
+    owned.discard();
+    assert.equal(lstatSync(fileFor(owned.descriptor), { throwIfNoEntry: false }), undefined,
+      "unchanged owned content is discarded");
+    assert.deepEqual(readdirSync(payloadDir()), [], "releasing the handle removes the pin entry too");
+
+    // The finding this pins: a recycled identity plus identical content must not
+    // authorize deletion. The link keeps the inode allocated, so the recreated
+    // entry necessarily gets a different identity.
+    const identical = stage(JSON.stringify("linked identical"));
+    const identicalPath = fileFor(identical.descriptor);
+    const identicalStats = statSync(identicalPath, { bigint: true });
+    const identicalBytes = readFileSync(identicalPath);
+    unlinkSync(identicalPath);
+    writeFileSync(identicalPath, identicalBytes);
+    const recreated = statSync(identicalPath, { bigint: true });
+    assert.equal(recreated.dev, identicalStats.dev);
+    assert.notEqual(recreated.ino, identicalStats.ino,
+      "the continuity pin keeps the owned inode allocated, so a recreated entry cannot alias it");
+    identical.discard();
+    assert.deepEqual(readFileSync(identicalPath), identicalBytes,
+      "an identical-content replacement is a different object and is preserved");
+    assert.ok(lstatSync(identicalPath).isFile(), "the preserved replacement still exists");
+
+    const modified = stage(JSON.stringify("linked modified"));
+    const modifiedPath = fileFor(modified.descriptor);
+    const mutated = Buffer.from(readFileSync(modifiedPath));
+    mutated[mutated.length - 3] = mutated[mutated.length - 3]! ^ 0x01;
+    writeFileSync(modifiedPath, mutated);
+    modified.discard();
+    assert.deepEqual(readFileSync(modifiedPath), mutated,
+      "the linked pin still re-verifies the declared size and digest before any unlink");
+
+    const replaced = stage(JSON.stringify("linked replaced"));
+    const replacedPath = fileFor(replaced.descriptor);
+    unlinkSync(replacedPath);
+    writeFileSync(replacedPath, "foreign replacement");
+    replaced.discard();
+    assert.equal(readFileSync(replacedPath, "utf8"), "foreign replacement",
+      "a replaced entry is preserved under the linked pin");
+    assert.deepEqual(readdirSync(payloadDir()).filter((entry) => entry.endsWith(".pin")), [],
+      "released or foreign paths never leave an owned pin entry behind");
+  } finally {
+    payloadTest.setOwnershipPinForTests(undefined);
+  }
+});
+
 test("rejects unsafe namespaces and non-regular replacements before reading", async () => {
-  const staged = stageSessionHostPayload(payloadDir(), JSON.stringify("confined value"));
+  const staged = stage(JSON.stringify("confined value"));
   const stagedPath = fileFor(staged.descriptor);
 
   expectSyncPayloadFailure(
@@ -251,7 +426,7 @@ test("rejects a supplied symlinked namespace without reading or writing its targ
   );
   assert.deepEqual(readdirSync(target), [], "a symlinked namespace never receives a staged file");
 
-  const staged = stageSessionHostPayload(target, JSON.stringify("owned value"));
+  const staged = stage(JSON.stringify("owned value"), target);
   await expectPayloadFailure(readSessionHostPayload(link, staged.descriptor), "unsafe-directory");
   assert.ok(lstatSync(join(target, staged.descriptor.name)).isFile(), "the target payload is preserved");
   expectSyncPayloadFailure(
@@ -264,7 +439,7 @@ test("rejects a namespace replaced after the pre-canonical observation", async (
   const namespace = join(payloadDir(), "observed-namespace");
   mkdirSync(namespace, { mode: 0o700 });
   chmodSync(namespace, 0o700);
-  const staged = stageSessionHostPayload(namespace, JSON.stringify("preserve across replacement"));
+  const staged = stage(JSON.stringify("preserve across replacement"), namespace);
   const moved = join(payloadDir(), "moved-original");
   let replaced = false;
   payloadTest.setDirectoryObservationHookForTests((phase) => {
@@ -289,7 +464,7 @@ test("rejects a namespace replaced after payload verification and preserves its 
   const namespace = join(payloadDir(), "verified-namespace");
   mkdirSync(namespace, { mode: 0o700 });
   chmodSync(namespace, 0o700);
-  const staged = stageSessionHostPayload(namespace, JSON.stringify("verify then replace"));
+  const staged = stage(JSON.stringify("verify then replace"), namespace);
   const moved = join(payloadDir(), "moved-after-verify");
   let replaced = false;
   payloadTest.setDirectoryObservationHookForTests((phase) => {
@@ -315,7 +490,7 @@ test("expected directory identity rejects a namespace replaced before any read",
   chmodSync(namespace, 0o700);
   const stats = lstatSync(namespace);
   const expected = { dev: stats.dev, ino: stats.ino };
-  const staged = stageSessionHostPayload(namespace, JSON.stringify("identity-bound value"));
+  const staged = stage(JSON.stringify("identity-bound value"), namespace);
   const moved = join(payloadDir(), "identity-moved");
   renameSync(namespace, moved);
   mkdirSync(namespace, { mode: 0o700 });

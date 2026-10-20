@@ -105,3 +105,57 @@ test("legacy task policies default off and persisted choices survive task-path r
   assert.throws(() => normalizeWorkerReviewEvidencePolicy({ toolOnly: "yes", snapshotFailureFallback: true }), /invalid/);
   assert.throws(() => normalizeWorkerReviewEvidencePolicy({ toolOnly: true, snapshotFailureFallback: false, scope: "inplace" }, "worktree"), /invalid/);
 });
+
+test("#465 evidence warnings use only the local warning-level UI notice, never model-facing transports", async () => {
+  const { sendPrimaryEvidenceWarning } = await import("../src/activation/primary-evidence");
+  const calls: unknown[][] = [];
+  const modelFacing = {
+    sendMessage: (...args: unknown[]) => calls.push(["sendMessage", ...args]),
+    sendSystemMessage: (...args: unknown[]) => calls.push(["sendSystemMessage", ...args]),
+    sendUserMessage: (...args: unknown[]) => calls.push(["sendUserMessage", ...args]),
+  };
+  await sendPrimaryEvidenceWarning({ ...modelFacing, ui: { notify: (...args: unknown[]) => calls.push(["ui.notify", ...args]) } }, "WARNING: local");
+  assert.deepEqual(calls, [["ui.notify", "WARNING: local", "warning"]]);
+  calls.length = 0;
+  // Without a UI target there is no system-message fallback into model context.
+  await sendPrimaryEvidenceWarning(modelFacing, "WARNING: headless");
+  assert.deepEqual(calls, []);
+});
+
+test("#465 known read-only observations are not reviewable Primary tool work; mutation-capable ones are", async () => {
+  const { isReviewableToolObservation } = await import("../src/review-evidence");
+  const event = (toolName: string, extra: Partial<{ candidatePaths: string[]; riskSignals: string[] }> = {}) => ({
+    sequence: 1, phase: "tool_result" as const, toolName, summary: "", candidatePaths: [], riskSignals: [], ...extra,
+  });
+  for (const name of ["read", "Grep", "find", "ls", "GitRead", "WebFetch"]) {
+    assert.equal(isReviewableToolObservation(event(name)), false, name);
+    assert.equal(isReviewableToolObservation(event(name, { riskSignals: ["tool_result_error"] })), false, `${name} error`);
+  }
+  for (const name of ["bash", "write", "edit", "ApplyPatch", "custom_extension_tool"]) {
+    assert.equal(isReviewableToolObservation(event(name)), true, name);
+  }
+  assert.equal(isReviewableToolObservation(event("read", { candidatePaths: ["x"] })), true);
+  assert.equal(isReviewableToolObservation(event("read", { riskSignals: ["apply_patch_mutation"] })), true);
+});
+
+test("#465 session fallback acts as Tools only only while fallback is On and never alters configuration", async () => {
+  const { primaryEvidencePolicy } = await import("../src/review-evidence");
+  const on = normalizeConfig({ review: { evidence: { snapshotFailureFallback: true } } });
+  const off = normalizeConfig({ review: { evidence: { snapshotFailureFallback: false } } });
+  const session = { primarySnapshotFallback: true };
+  assert.equal(primaryEvidencePolicy(on).toolOnly, false);
+  assert.equal(primaryEvidencePolicy(on, {}).toolOnly, false);
+  const latched = primaryEvidencePolicy(on, session);
+  assert.equal(latched.toolOnly, true);
+  assert.equal(latched.sessionFallback, true);
+  assert.equal(effectiveReviewEvidenceSettings(on).primaryToolOnly, false, "configuration is unchanged");
+  assert.equal(primaryEvidencePolicy(off, session).toolOnly, false, "fallback Off keeps blocking");
+});
+
+test("#465 a disabled scheduled entry may keep an unresolvable worker pin; an enabled one still fails config load", () => {
+  const entry = { name: "Nightly", cron: "* * * * *", kind: "execute", instructions: "run", workspace: "/tmp", workerResourceId: "gone" };
+  const disabled = normalizeConfig({ scheduledTasks: { nightly: { ...entry, enabled: false } } });
+  assert.equal(disabled.scheduledTasks?.nightly?.workerResourceId, "gone");
+  assert.equal(disabled.scheduledTasks?.nightly?.enabled, false);
+  assert.throws(() => normalizeConfig({ scheduledTasks: { nightly: { ...entry, enabled: true } } }), /references unknown worker resource gone/);
+});

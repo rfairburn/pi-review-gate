@@ -178,6 +178,14 @@ export interface BackgroundTaskTimingAccumulator {
   terminalAt?: string;
 }
 
+/** #467: durable record of a typed pre-start source capture rejection. */
+export interface BackgroundCaptureRejection {
+  code: "source_entry_rejected";
+  reason: import("./wave-repository").WaveCaptureEntryRejectionReason;
+  path: string;
+  captureRoot: string;
+}
+
 export interface BackgroundTaskRecord {
   taskId: string;
   definition: BackgroundTaskDefinition;
@@ -225,6 +233,13 @@ export interface BackgroundTaskRecord {
   reportPath?: string;
   summary?: string;
   error?: string;
+  /**
+   * #467: isolated source capture rejected one source entry before any
+   * executor started. Recorded from the typed capture error (never parsed from
+   * text) so failure recovery can name the triggering path; no worker,
+   * checkpoint, or continuation exists for this task.
+   */
+  captureRejection?: BackgroundCaptureRejection;
   activity: BackgroundActivityEvent[];
   nextActivitySequence: number;
   stateHistory?: BackgroundStateTransition[];

@@ -832,6 +832,9 @@ function validateScheduledTaskReferences(config: ReviewGateConfig): void {
   for (const [id, entry] of Object.entries(scheduledTasks)) {
     if (entry.workerResourceId === undefined) continue;
     if ((entry.destination ?? "subtask") !== "subtask") continue;
+    // #465: a disabled entry never dispatches, so it may keep a pin that a
+    // settings change made unrunnable; enabling it requires a valid worker.
+    if (entry.enabled === false) continue;
     const resource = resolvedWorkerResource(config, entry.workerResourceId);
     if (!resource) {
       throw new Error(`scheduledTasks.${id} references unknown worker resource ${entry.workerResourceId}`);

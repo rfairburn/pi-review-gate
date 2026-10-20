@@ -392,10 +392,14 @@ reset Primary evidence. Workers pin applicable evidence and fallback policy at f
 admission, including already queued tasks through corrections, retries, and continuations.
 Each new Start/Add task captures independently; scheduled tasks capture at actual firing,
 not schedule creation. Later Add tasks use the then-current live choice, without changing
-in-flight tasks or freezing all routing/reviewer selections. Snapshot-preferring policy
-retries capture on later cycles/continuations; fallback warns on every occurrence and is
-not sticky. Missing structured observations do not block degraded review with disclosed
-limits and retained evidence. See
+in-flight tasks or freezing all routing/reviewer selections. An eligible Primary fallback
+shows one local user-only warning and makes Primary act as Tools only for the rest of
+the session, without capture retries or any change to this configuration;
+`/review-clear` or a new session lets the next prompt try snapshots again. Automatic
+Primary tool-only review runs only for reviewable change evidence, not for no-change or
+read-only turns. Snapshot-preferring captured worker policy retries capture on later
+cycles/continuations and warns on every worker fallback. Missing structured observations
+do not block degraded worker review with disclosed limits and retained evidence. See
 [Settings](settings.md#evidence-methods) for the transaction and
 [Review workflow](review-workflow.md#review-evidence-methods) for evidence limits,
 first-baseline fallback, warnings, and blocking failures.

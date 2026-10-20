@@ -26,6 +26,10 @@ supplies the live switch (the ordinary extension entry point always does):
   `externalAgents`, each with one physical maximum concurrency shared by every
   background-task kind. The catalog displays alphabetically and edits by stable key —
   it has no reorder controls, because row order never defines identity or scheduling.
+  Removing a resource that an enabled scheduled subtask pins (or making it unable to
+  serve that entry) disables the entry when the change is applied: Save persists the
+  disable, root Escape applies it for the session, and Cancel changes nothing. A local
+  warning names each disabled entry; the pin is kept and no other worker is chosen.
 - **External workers** sits immediately below **Worker resources** and lists every
   external-agent definition. Create and edit Claude Code/Codex CLI IDs, adapters,
   enabled roles, timeouts, and human-readable **Model**/**Reasoning** choices. The
@@ -294,10 +298,15 @@ Applying settings does not intercept or reconfigure in-flight tasks. This guaran
 is specific to evidence policy; it does not freeze all routing or reviewer settings.
 
 Fallback Off leaves capture failure blocking. When On actually substitutes current
-retained tool evidence for an eligible failed snapshot, the user and implementing model
-receive a prominent warning on each actual fallback identifying the originating review
-context, and the reviewer receives the truthful **Tools only (snapshot-failure fallback)** basis. Fallback is not sticky:
-snapshot-preferring policy retries capture on later cycles/continuations without
+retained tool evidence for an eligible failed snapshot, a prominent warning identifies
+the originating review context, and the reviewer receives the truthful
+**Tools only (snapshot-failure fallback)** basis. For Primary the warning is a local
+user-only notice, never a model message or turn, and the fallback makes Primary act as
+**Tools only** for the rest of the session without capture retries. That session state
+is not a menu value and is never saved; `/review-clear` or a new session lets the next
+prompt try the configured snapshot preference again. Worker fallback is not sticky:
+captured snapshot-preferring worker policy retries capture on later
+cycles/continuations, warning to the worker's implementing model each time, without
 inventing earlier coverage or discarding retained current-work tool evidence. The menu
 description or an optional notice alone is not that warning. Missing structured
 observations do not block degraded review; retained evidence and capture limits remain

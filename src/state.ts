@@ -156,6 +156,13 @@ export interface ReviewGateState {
    * live session context at session_start; never persisted or restored.
    */
   checkpointScope?: ReviewCheckpointScope;
+  /**
+   * Runtime-only (#465): an eligible Primary snapshot capture failed with
+   * fallback On, so Primary acts as Tools only for the rest of this session.
+   * Never persisted, restored, or written to configuration; reset at session
+   * boundaries with the rest of the session state.
+   */
+  primarySnapshotFallback?: boolean;
 }
 
 export interface PendingModelDelivery {
@@ -509,6 +516,9 @@ export function clearReviewState(state: ReviewGateState): void {
   state.lastQuestionWindow = undefined;
   state.pendingAcceptedReviewerQuestions.splice(0);
   state.queuedUserInputsDuringReview.splice(0);
+  // #465: /review-clear is a user reset boundary for the session fallback; the
+  // next prompt's ordinary capture follows the configured preference again.
+  state.primarySnapshotFallback = undefined;
 }
 
 export function getReviewerQuestionWindow(state: ReviewGateState): ReviewWindow | undefined {

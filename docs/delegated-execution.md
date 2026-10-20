@@ -610,6 +610,22 @@ covers the whole repository. Starting a same-workspace execute subtask verifies
 that top-level checkpoint before private capture; this does not change the
 session or worker cwd, or the delegated capture and landing target.
 
+When capture rejects one source entry before any worker starts — a non-ignored
+untracked file that pushes the total over `maxSnapshotBytes`, an unsupported entry
+type, or a symlink with an absolute or escaping target — the task fails with a
+typed capture rejection whose summary begins "Capture rejected before worker
+started" and names the triggering path and actual capture root. This failed task
+outcome arrives asynchronously after `SubtasksStart` admission, not as a crash or a
+generic controller failure. Its recovery diagnostic offers exactly two explicit
+choices, each naming that path: start a new task whose workspace has an actual
+capture root that excludes the path, or explicitly start an `inplace` task in the
+same workspace, reviewed under the existing InPlace evidence setting. A Git
+workspace is captured from its repository top level, so a subdirectory of the same
+repository still captures the path. Nothing is launched, converted, or retried
+automatically, and no resume or interrupt advice is given for the worker that
+never started. Other capture failures and cancellation keep their existing
+handling.
+
 ## Landing and source preservation
 
 **Independent landing**: As soon as one task is accepted, it acquires the short

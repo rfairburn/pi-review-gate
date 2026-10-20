@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { effectiveReviewSettings, type ReviewGateConfig } from "../config";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "../correction-feedback";
 import { rememberFinalAssistantSummary } from "../evidence";
-import { primaryEvidencePolicy, evidenceMethodNotice, isEligibleReviewCaptureFailure } from "../review-evidence";
+import { primaryEvidencePolicy, evidenceMethodNotice, isEligibleReviewCaptureFailure, latchPrimarySnapshotFallback, primaryFallbackUserWarning } from "../review-evidence";
 import { BackgroundProcessReadiness } from "../background-process-readiness";
 import { type BackgroundShellController, type BackgroundShellLifecycleEvent } from "../background-shell";
 import {
@@ -300,9 +300,10 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
     beginAgentRun(deps.state);
     if (activeExchangeHasBaseline(deps.state)) return "armed";
     const existing = deps.state.reviewWindow?.baseline;
-    const policy = primaryEvidencePolicy(deps.config);
+    const policy = primaryEvidencePolicy(deps.config, deps.state);
     if (!existing && policy.toolOnly) {
-      setReviewWindowCheckpointBaseline(deps.state, { kind: "tool", cwd: deps.cwd(), capturedAt: new Date().toISOString() });
+      // A session-latched fallback (#465) acts as Tools only: no capture retry.
+      setReviewWindowCheckpointBaseline(deps.state, { kind: "tool", cwd: deps.cwd(), capturedAt: new Date().toISOString(), ...(policy.sessionFallback ? { fallback: true } : {}) });
       freezeReviewWindowConfig(deps.state, deps.config, deps.scopedModels());
       await deps.persist();
       return "armed";
@@ -322,8 +323,11 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       if (policy.snapshotFailureFallback && !signal?.aborted && isEligibleReviewCaptureFailure(captured)) {
         // Failed mandatory notification leaves initialization unarmed, so a
         // later start retries it instead of reusing an undisclosed fallback.
-        await deps.warnEvidenceMethod?.(evidenceMethodNotice("tool-only-fallback"));
+        // The local warning precedes the session latch (#465): Tools only then
+        // applies for the rest of this session without further capture.
+        await deps.warnEvidenceMethod?.(primaryFallbackUserWarning());
         signal?.throwIfAborted();
+        latchPrimarySnapshotFallback(deps.state);
         setReviewWindowCheckpointBaseline(deps.state, { kind: "tool", cwd: deps.cwd(), capturedAt: new Date().toISOString(), fallback: true });
         freezeReviewWindowConfig(deps.state, deps.config, deps.scopedModels());
         await deps.persist();
@@ -482,7 +486,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
           if (window?.baseline && !runAborted) {
             await collectPausedReviewExchange({
               notify: deps.warnEvidenceMethod,
-              evidencePolicy: primaryEvidencePolicy(deps.config),
+              evidencePolicy: primaryEvidencePolicy(deps.config, deps.state),
               cwd: deps.cwd(),
               checkpointScope: deps.state.checkpointScope,
               config: window.reviewConfig ?? deps.config,
@@ -535,7 +539,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
         }
         await collectPausedReviewExchange({
           notify: deps.warnEvidenceMethod,
-          evidencePolicy: primaryEvidencePolicy(deps.config),
+          evidencePolicy: primaryEvidencePolicy(deps.config, deps.state),
           cwd: deps.cwd(),
           checkpointScope: deps.state.checkpointScope,
           config: window.reviewConfig ?? freezeReviewWindowConfig(deps.state, deps.config, deps.scopedModels()),
@@ -614,7 +618,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       if (deps.state.reviewsPaused) {
         await collectPausedReviewExchange({
           notify: deps.warnEvidenceMethod,
-          evidencePolicy: primaryEvidencePolicy(deps.config),
+          evidencePolicy: primaryEvidencePolicy(deps.config, deps.state),
           cwd: deps.cwd(),
           checkpointScope: deps.state.checkpointScope,
           config: reviewConfig,
@@ -627,7 +631,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
 
       // Capture alongside ownership, before evidence draining or persistence
       // can yield to a settings apply. A deferred choice belongs to a later review.
-      const reviewEvidencePolicy = primaryEvidencePolicy(deps.config);
+      const reviewEvidencePolicy = primaryEvidencePolicy(deps.config, deps.state);
       deps.state.reviewInProgress = true;
       ownedReviewToken = beginOwnedReviewActivity();
       deps.state.reviewActivityToken = ownedReviewToken;

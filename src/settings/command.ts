@@ -29,6 +29,7 @@ import { prepareScheduledImageAssets, rollbackScheduledImageAssets, rollbackSche
 import { alignedSettingsRows, formatDuration, notify, type UiContext } from "./ui";
 import { deniableToolNames, readToolChoices, selectToolSettings, toolsRootSummary, type RetainedToolDenials } from "./tools";
 import {
+  disableUnservableScheduledTasks,
   expandScheduledTaskWorkspaces,
   scheduledSummary,
   selectScheduledTasks,
@@ -273,17 +274,23 @@ async function runSettingsMenu(
     catalogForApply: ScheduledTaskCatalog;
     warnings: Set<string>;
     validationPolicy: SettingsValidationPolicy;
+    scheduleDisableWarnings: string[];
   } | undefined> => {
     // Expand a leading `~`/`~/...` — entered above or hand-edited into the
     // config file — against the user's home before validation and persistence.
     // This stores an absolute spelling, not a symlink-resolved path. Relative
     // and other spellings keep their parent-session-cwd anchor at run time.
     scheduledTasks = expandScheduledTaskWorkspaces(scheduledTasks);
+    // #465: an entry whose pinned worker this change makes unrunnable is
+    // disabled in THIS apply candidate only, so Save persists it, root Escape
+    // applies it for the session, and the scheduler never admits it again. A
+    // failed attempt leaves the editable draft unchanged; a retry re-evaluates.
+    const unservable = disableUnservableScheduledTasks(scheduledTasks, workerResources, draftConfig, input.config);
     const warnings = new Set<string>();
     const validationPolicy: SettingsValidationPolicy = { allowMissingApplicationCli: true, warnings };
     const error = (await validateSelection(workerResources, primaryReviewers, draftConfig, input.scoped, executeRoute, researchRoute, validationPolicy))
       ?? (await validateSelection(workerResources, subtaskReviewers, draftConfig, input.scoped, executeRoute, researchRoute, validationPolicy))
-      ?? (await validateScheduledTasks(scheduledTasks, workerResources, draftConfig, input.scoped, input.ui.cwd, validationPolicy));
+      ?? (await validateScheduledTasks(unservable.catalog, workerResources, draftConfig, input.scoped, input.ui.cwd, validationPolicy));
     if (error) {
       await notify(input.ui, error, "error");
       return undefined;
@@ -299,15 +306,15 @@ async function runSettingsMenu(
     // untouched — the menu stays open, so the user can Cancel (which copies
     // nothing) or fix the entry and try again.
     let prepared: PreparedScheduledImageAssets | undefined;
-    let catalogForApply = scheduledTasks;
+    let catalogForApply = unservable.catalog;
     try {
-      prepared = await prepareScheduledImageAssets(input.configPath!, scheduledTasks, scheduledImageProvenance);
+      prepared = await prepareScheduledImageAssets(input.configPath!, catalogForApply, scheduledImageProvenance);
       catalogForApply = prepared.catalog;
     } catch (error) {
       await notify(input.ui, `review gate: ${error instanceof Error ? error.message : String(error)}`, "error");
       return undefined;
     }
-    return { prepared, catalogForApply, warnings, validationPolicy };
+    return { prepared, catalogForApply, warnings, validationPolicy, scheduleDisableWarnings: unservable.warnings };
   };
 
   // Issue #294: the root-Escape session-only apply: assemble the staged
@@ -322,6 +329,7 @@ async function runSettingsMenu(
     catalogForApply: ScheduledTaskCatalog;
     warnings: Set<string>;
     validationPolicy: SettingsValidationPolicy;
+    scheduleDisableWarnings: string[];
   }): Promise<boolean> => {
     let next: ReviewGateConfig;
     try {
@@ -360,6 +368,7 @@ async function runSettingsMenu(
     await input.onSaved?.(input.config, previousMode, { ui: input.ui });
     await notify(input.ui, "Review settings applied for this session (not saved to disk).", "info");
     for (const warning of staged.warnings) await notify(input.ui, warning, "warning");
+    for (const warning of staged.scheduleDisableWarnings) await notify(input.ui, warning, "warning");
     // The hotkey binding itself is captured by Pi at extension load, so a
     // changed key needs the documented /reload (same as keybindings.json).
     if (modeCycleShortcut !== previousModeCycleShortcut) {
@@ -719,6 +728,7 @@ async function runSettingsMenu(
     await input.onSaved?.(input.config, previousMode, { ui: input.ui });
     await notify(input.ui, "Review settings saved.", "info");
     for (const warning of staged.warnings) await notify(input.ui, warning, "warning");
+    for (const warning of staged.scheduleDisableWarnings) await notify(input.ui, warning, "warning");
     // The hotkey binding itself is captured by Pi at extension load, so a
     // changed key needs the documented /reload (same as keybindings.json);
     // the persisted mode change itself never needs a reload.

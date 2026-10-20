@@ -21,7 +21,8 @@ receipts of exactly what the model was told.
   [evidence controls](docs/configuration.md#review-evidence-methods) independently
   select **Tools + workspace changes** (default) or **Tools only** for Primary,
   isolated worktree, and InPlace review. Separate snapshot-failure fallback defaults
-  **Off**, with per-occurrence warnings and later snapshot retries when used.
+  **Off**; when used, Primary shows one local warning and stays Tools only for the
+  session (until `/review-clear` or a new session), while workers warn and retry per cycle.
   Workers pin evidence policy at firing/queue admission; missing observations permit
   degraded review with disclosed limits, never proof of no effects. These controls
   preserve bounded tool observations and read-only inspection, never replacing durability gates.

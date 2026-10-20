@@ -423,13 +423,18 @@ qualifies as review-evidence-only capture with fallback enabled.
 An eligible fallback uses retained current tool evidence with a durable, truthful
 basis. This includes an enabled fallback on the first Primary or InPlace review-baseline
 capture before work; it does not permit replacing missing/corrupt persisted evidence.
-Every actual fallback requires a prominent origin-correct warning to the user and
-implementing model and a truthful **Tools only (snapshot-failure fallback)** label for
-the reviewer, not just a settings description,
-log entry, or optional notice. It never claims approval or full snapshot coverage.
-Fallback is not sticky: snapshot-preferring configured/captured policy retries capture
-on later cycles/continuations. Later success cannot invent earlier coverage or discard
-retained current-work tool evidence, even after an unavailable first baseline.
+Every actual fallback requires a prominent origin-correct warning and a truthful
+**Tools only (snapshot-failure fallback)** label for the reviewer, not just a settings
+description, log entry, or optional notice. It never claims approval or full snapshot
+coverage. A Primary evidence warning is local to the user only: it is never model input
+and never triggers a model turn, and neither the warning nor the evidence method alone
+causes an automatic review. An eligible Primary fallback makes Primary act as Tools
+only for the rest of the session without capture retries; this runtime state is never
+written to configuration, and `/review-clear` or a new session ends it. Worker fallback
+warnings also reach the worker's implementing model, and snapshot-preferring captured
+worker policy retries capture on later cycles/continuations. Later success cannot invent
+earlier coverage or discard retained current-work tool evidence, even after an
+unavailable first baseline.
 Cancellation, review execution errors, isolated construction input capture, checkpoint
 and landing requirements, integrity failures, and recovery gates stay fail-closed.
 Shared isolated stages may remain blocking where checkpoint/landing needs them;

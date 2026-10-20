@@ -24,14 +24,18 @@ const fsPromises = require("node:fs/promises") as typeof import("node:fs/promise
 import * as checkpoints from "../src/review-checkpoint";
 import { SessionStateStore } from "../src/session-state";
 import { DEFAULT_MAX_UNTRACKED_BYTES } from "../src/checkpoint/run-git";
+import { ScheduledTaskRuntime } from "../src/scheduling/dispatcher";
+import { getSchedulerRuntime, resetSchedulerRuntimeForTests } from "../src/scheduling/runtime";
 import { agentCatalog } from "./helpers";
 import { countingPassReviewerWithPromptDump, createSessionRuntime, extractBundleDir, indexTestConfig, testAgentDir, trigger, triggerAgentEnd } from "./entrypoint-harness";
 
+/** Reviewer-directed evidence prose that must not appear in local user warnings (#465). */
+const REVIEWER_PROSE = /supplied claims|claims\/context|NOT certification|Unobserved external edits|missing observations are not proof/i;
 const fixtureEnvKeys = ["HOME", "GIT_CEILING_DIRECTORIES", "PI_REVIEW_GATE_CONFIG", "PI_REVIEW_GATE_DISABLED"] as const;
 type FixtureRuntime = ReturnType<typeof createSessionRuntime>;
 type FixtureSetupProbe = (stage: "beforeActivation" | "afterStartup", owned: { root: string; rt: FixtureRuntime }) => Promise<void>;
 
-async function fixture(evidence: Record<string, boolean> = {}, primaryEnabled = true, maxCorrectionCycles = indexTestConfig.maxCorrectionCycles as number, setupProbe?: FixtureSetupProbe) {
+async function fixture(evidence: Record<string, boolean> = {}, primaryEnabled = true, maxCorrectionCycles = indexTestConfig.maxCorrectionCycles as number, setupProbe?: FixtureSetupProbe, activationDependencies?: Parameters<typeof activate>[1]) {
   const priorEnv = fixtureEnvKeys.map((key) => [key, process.env[key]] as const);
   const root = await mkdtemp(join(await realpath(tmpdir()), "primary-tool-evidence-"));
   let runtime: FixtureRuntime | undefined;
@@ -89,12 +93,24 @@ async function fixture(evidence: Record<string, boolean> = {}, primaryEnabled = 
     runtime = rt;
     const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
     rt.pi.registerCommand = (name, options) => { commands.set(name, options.handler); };
+    // #465: observe the PRODUCTION local warning transport (warning-level UI
+    // notice). Any custom/system message is model-facing input and is recorded
+    // separately so tests can assert evidence warnings never use it.
     const warnings: string[] = [];
-    const warningDeliveries: unknown[] = [];
-    Object.assign(rt.pi, { sendMessage(message: { content: string }, delivery: unknown) { warnings.push(message.content); warningDeliveries.push(delivery); } });
+    const modelInputs: unknown[] = [];
+    const localNotice = (message: string, type?: unknown) => {
+      rt.notices.push(message);
+      if (type === "warning") warnings.push(message);
+    };
+    rt.ctx.ui.notify = localNotice as typeof rt.ctx.ui.notify;
+    rt.pi.notify = localNotice as typeof rt.pi.notify;
+    Object.assign(rt.pi, {
+      sendMessage(message: unknown, delivery: unknown) { modelInputs.push({ via: "sendMessage", message, delivery }); },
+      sendSystemMessage(message: unknown) { modelInputs.push({ via: "sendSystemMessage", message }); },
+    });
     await setupProbe?.("beforeActivation", { root, rt });
     activationStarted = true;
-    await activate(rt.pi);
+    await activate(rt.pi, activationDependencies);
     activationCompleted = true;
     await trigger(rt.hooks, "session_start", { type: "session_start", reason: "startup" }, rt.ctx);
     await setupProbe?.("afterStartup", { root, rt });
@@ -111,22 +127,24 @@ async function fixture(evidence: Record<string, boolean> = {}, primaryEnabled = 
       await trigger(rt.hooks, "tool_result", { toolName: "write", input, result: { content: [{ type: "text", text: "written" }] } }, rt.ctx);
     };
     const end = () => triggerAgentEnd(rt.hooks, { cwd, messages: [{ role: "assistant", content: "done" }] }, rt.ctx);
-    const settings = async (steps: Array<string | undefined>) => {
+    const settings = async (steps: Array<string | undefined | (() => Promise<string | undefined>)>) => {
       let i = 0;
       await commands.get("review-settings")!("", { ...rt.ctx, scopedModels: [], ui: {
         select: async (_title: string, options: string[]) => {
           assert.ok(i < steps.length, `unexpected menu: ${options.join(" | ")}`);
-          const prefix = steps[i++];
+          const step = steps[i++];
+          const prefix = typeof step === "function" ? await step() : step;
           if (prefix === undefined) return undefined;
           const match = options.find((option) => option.trimStart().startsWith(prefix));
           assert.ok(match, `missing ${prefix}: ${options.join(" | ")}`);
           return match;
         },
-        notify: (message: string) => rt.notices.push(message),
+        // Forward to the live UI target so injected warning faults apply here too.
+        notify: (message: string, type?: unknown) => (rt.ctx.ui.notify as (message: string, type?: unknown) => unknown)(message, type),
       } });
       assert.equal(i, steps.length);
     };
-    return { root, cwd, configPath, calls, prompt, rt, commands, warnings, warningDeliveries, restored, start, writeScript, end, settings, dispose };
+    return { root, cwd, configPath, calls, prompt, rt, commands, warnings, modelInputs, restored, start, writeScript, end, settings, dispose };
   } catch (setupError) {
     try { await dispose(); }
     catch (cleanupError) {
@@ -297,22 +315,28 @@ test("real settings apply warns Tools + workspace changes → Tools only reset; 
     assert.equal((await f.restored())!.state.reviewWindow!.evidence.events.length, count);
     await f.settings(["Reviewers", "Evidence methods", "Isolated worktree", "InPlace", "Snapshot-failure", "Back", "Back", undefined]);
     assert.equal((await f.restored())!.state.reviewWindow!.evidence.events.length, count);
-    assert.equal(f.warnings.length, 0);
+    // Independent-scope menu toggles may show their own local menu warnings.
+    const independent = f.warnings.length;
+    assert.ok(f.warnings.every((warning) => !/Primary evidence/.test(warning)));
     const diskBefore = await readFile(f.configPath, "utf8");
     await f.settings(["Reviewers", "Evidence methods", "Primary /", "Back", "Back", undefined]);
     assert.equal(await readFile(f.configPath, "utf8"), diskBefore, "root Escape is session-only");
     const reset = (await f.restored())!.state.reviewWindow!;
     assert.equal(reset.baseline?.kind, "tool");
     assert.equal(reset.evidence.events.length, 0);
-    assert.equal(f.warnings.length, 1);
-    assert.deepEqual(f.warningDeliveries.at(-1), { deliverAs: "steer", triggerTurn: true }, "the model-visible evidence warning steers and triggers a turn");
-    assert.match(f.warnings[0]!, /Primary evidence method changed: Tools \+ workspace changes → Tools only\./);
-    assert.match(f.warnings[0]!, /outstanding reviewer findings, correction requirements and pending deliveries remain in force/);
-    assert.doesNotMatch(f.warnings[0]!, /Off|On|enabled|disabled/);
-    assert.match(f.warnings[0]!, /CURRENT.*RESET/);
+    assert.ok(f.warnings.length > independent);
+    assert.equal(f.warnings.filter((warning) => /Primary evidence/.test(warning)).length, 1);
+    assert.deepEqual(f.modelInputs, [], "evidence warnings are local only: no custom/system model message, steering, or triggered turn");
+    assert.equal(f.rt.sent.length, 0, "a settings warning is not a follow-up or steering prompt");
+    assert.match(f.warnings.at(-1)!, /Primary evidence method changed: Tools \+ workspace changes → Tools only\./);
+    assert.match(f.warnings.at(-1)!, /outstanding reviewer findings, correction requirements and pending deliveries remain in force/);
+    assert.doesNotMatch(f.warnings.at(-1)!, /Off|On|enabled|disabled/);
+    assert.match(f.warnings.at(-1)!, /CURRENT.*RESET/);
     assert.match(f.rt.notices.join("\n"), /CURRENT.*RESET/);
+    // #465: concise human UI wording, not reviewer-directed evidence prose.
+    assert.doesNotMatch(f.warnings.join("\n"), REVIEWER_PROSE);
     await f.settings(["Save changes"]);
-    assert.equal(f.warnings.length, 1, "unchanged Save must not reset again");
+    assert.equal(f.warnings.filter((warning) => /Primary evidence/.test(warning)).length, 1, "unchanged Save must not reset again");
     assert.equal(JSON.parse(await readFile(f.configPath, "utf8")).review.evidence.primaryToolOnly, true);
     await f.start("new tool work");
     await f.writeScript("RETAIN_THIS_TOOL_WORK\n");
@@ -327,6 +351,9 @@ test("real settings apply warns Tools + workspace changes → Tools only reset; 
     assert.match(f.warnings.at(-1)!, /Existing tool evidence was retained and a NEW snapshot baseline established/);
     assert.match(f.warnings.at(-1)!, /Earlier Tools only reviews do not certify that baseline/);
     assert.doesNotMatch(f.warnings.at(-1)!, /Off|On|enabled|disabled/);
+    assert.doesNotMatch(f.warnings.join("\n"), REVIEWER_PROSE);
+    assert.deepEqual(f.modelInputs, [], "no evidence settings change is model input or a model turn");
+    assert.equal(f.rt.sent.length, 0);
     await f.start("snapshot edit after disable");
     await writeFile(join(f.cwd, "REPORT"), "SNAPSHOT_AFTER_DISABLE\n");
     await f.end();
@@ -363,6 +390,12 @@ for (const strategy of ["raw", "git"] as const) {
           await f.start();
           assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "tool");
           failed.mock.restore();
+          // #465: within a session the fallback applies Tools only without
+          // retry. Recovery to a NEW snapshot basis happens only after a session
+          // boundary resumes the retained tool-fallback window.
+          await trigger(f.rt.hooks, "session_start", { type: "session_start", reason: "resume" }, f.rt.ctx);
+          await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
+          assert.ok((await f.restored())!.state.reviewWindow!.baseline?.kind === "tool");
         } else await f.start();
         await f.writeScript("EARLIER_TOOL_SCRIPT\n");
         if (mode.startsWith("disable")) {
@@ -513,7 +546,7 @@ for (const initial of [true, false]) {
         assert.equal(metadata.exactSnapshotReviewed, false);
         const baseline = (await f.restored())!.state.reviewWindow!.baseline;
         if (initial) assert.ok(baseline?.kind === "tool" && baseline.fallback);
-        else assert.equal(baseline?.kind, "checkpoint", "later fallback preserves the valid historical basis for retry");
+        else assert.equal(baseline?.kind, "checkpoint", "a settlement fallback preserves the valid historical basis");
         assert.doesNotMatch(f.rt.notices.join("\n"), /CURRENT Primary collected evidence.*RESET/);
       } finally { await f.dispose(); }
     });
@@ -562,14 +595,19 @@ test("actual raw content-open failure qualifies; raw storage and record-publicat
       await f.start();
       assert.ok(f.warnings.some((warning) => warning.includes("Tools only (snapshot-failure fallback)")));
       mock.restoreAll();
+      // #465: the eligible fallback applies Tools only for the session; a
+      // repaired workspace is not re-captured until a new session.
+      const capture = checkpoints.captureReviewCheckpoint;
+      const retries = mock.method(checkpoints, "captureReviewCheckpoint", async (...args: Parameters<typeof capture>) => capture(...args));
       await f.writeScript("REAL_CAPTURE_FALLBACK_WORK\n");
       await f.end();
       assert.equal(await readFile(f.calls, "utf8"), "1");
-      assert.match(f.rt.sent[0]!.message, /Review evidence method: Tools only\./);
-      assert.match(f.rt.sent[0]!.message, /new Tools \+ workspace changes snapshot baseline covers subsequent work only/);
-      const recovered = (await f.restored())!.state.reviewWindow!.baseline;
-      assert.ok(recovered?.kind === "checkpoint" && recovered.toolOnlyHistory);
-      assert.match(f.warnings.join("\n"), /Snapshot capture recovered/);
+      assert.equal(retries.mock.callCount(), 0, "no snapshot retry after the session fallback");
+      assert.match(f.rt.sent[0]!.message, /Review evidence method: Tools only \(snapshot-failure fallback\)/);
+      const latched = (await f.restored())!.state.reviewWindow!.baseline;
+      assert.ok(latched?.kind === "tool" && latched.fallback);
+      assert.doesNotMatch(f.warnings.join("\n"), /Snapshot capture recovered/);
+      assert.equal(f.warnings.filter((warning) => warning.includes("snapshot-failure fallback")).length, 1);
     } finally { await f.dispose(); }
   }
 });
@@ -609,6 +647,7 @@ test("Primary policy apply during an active reviewer defers reset until settleme
     await f.settings(["Reviewers", "Evidence methods", "Primary /", "Back", "Back", "Save changes"]);
     assert.match(f.warnings.join("\n"), /pending until the running review settles/);
     assert.doesNotMatch(f.warnings.join("\n"), /CURRENT Primary collected evidence.*RESET/);
+    assert.deepEqual(f.modelInputs, [], "a deferred evidence change is not model input");
     assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "checkpoint");
     finish!();
     await ending;
@@ -646,44 +685,92 @@ test("tool-only correction inverse is reviewed and manual reviewer questions nee
   } finally { await f.dispose(); }
 });
 
-test("tool-only missing observations permits disclosed claims/context review without summary-only pass churn", async () => {
+test("Primary Tools only: summary-only and read-only turns run no automatic reviewer; mutation-capable work still reviews", async () => {
   const f = await fixture({ primaryToolOnly: true });
   try {
+    // #465: an evidence method, assistant summary, or known read-only
+    // observation is not reviewable work.
     await f.start("assess the supplied context");
     await f.end();
-    assert.equal(await readFile(f.calls, "utf8"), "1");
-    assert.match(f.rt.sent[0]!.message, /No structured tool observations were collected/);
-    assert.match(await readFile(f.prompt, "utf8"), /summaries and context are claims, not verified actions/);
-    await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
+    await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/);
+    await f.start("inspect SCRIPT");
+    await trigger(f.rt.hooks, "tool_call", { toolName: "read", input: { path: "SCRIPT" } }, f.rt.ctx);
+    await trigger(f.rt.hooks, "tool_result", { toolName: "read", input: { path: "SCRIPT" }, result: { content: [{ type: "text", text: "BEFORE_SCRIPT" }] } }, f.rt.ctx);
+    await trigger(f.rt.hooks, "tool_result", { toolName: "grep", input: { pattern: "X" }, isError: true, result: { content: [{ type: "text", text: "no match" }] } }, f.rt.ctx);
+    await trigger(f.rt.hooks, "tool_call", { toolName: "GitRead", input: { args: ["status"] } }, f.rt.ctx);
+    await trigger(f.rt.hooks, "tool_result", { toolName: "GitRead", input: { args: ["status"] }, result: { content: [{ type: "text", text: "clean" }] } }, f.rt.ctx);
+    // An unobserved outside write is outside this evidence method.
     await writeFile(join(f.cwd, "REPORT"), "outside-only report\n");
     await f.end();
+    await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/);
+    assert.equal(f.rt.sent.length, 0, "no review transmission, follow-up, or steering");
+    assert.deepEqual(f.modelInputs, []);
+    assert.doesNotMatch(f.rt.notices.join("\n"), /Review evidence method/, "no method notice labels a review that never ran");
+    // A shell command is mutation-capable even without a named path.
+    await f.start("run the generator");
+    await trigger(f.rt.hooks, "tool_call", { toolName: "bash", input: { command: "make generate" } }, f.rt.ctx);
+    await trigger(f.rt.hooks, "tool_result", { toolName: "bash", input: { command: "make generate" }, result: { content: [{ type: "text", text: "ok" }] } }, f.rt.ctx);
+    await f.end();
     assert.equal(await readFile(f.calls, "utf8"), "1");
+    assert.match(f.rt.sent[0]!.message, /Review evidence method: Tools only\./);
+    assert.ok(f.warnings.some((warning) => warning.startsWith("WARNING: Review evidence method: Tools only.")), "an actual review is labeled locally");
   } finally { await f.dispose(); }
 });
 
-test("snapshot preference retries each review: repeated failures warn each time; recovered snapshot captures outside edits", async () => {
+test("an eligible fallback applies Tools only for the session: one local warning, no capture retry, edits review, no-change does not, Save keeps config", async () => {
   const f = await fixture({ snapshotFailureFallback: true });
   try {
     await f.start();
     await f.writeScript("FALLBACK_ONE\n");
     const capture = mock.method(checkpoints, "captureReviewCheckpoint", async () => ({ status: "failed" as const, reason: "patch_too_large" as const, evidenceCaptureFailure: true as const }));
     await f.end();
+    assert.equal(capture.mock.callCount(), 1);
+    assert.equal(await readFile(f.calls, "utf8"), "1");
+    const fallbackWarnings = () => f.warnings.filter((warning) => warning.includes("snapshot-failure fallback"));
+    assert.equal(fallbackWarnings().length, 1);
+    assert.match(fallbackWarnings()[0]!, /Primary uses Tools only for the rest of this session; snapshot capture is not retried automatically/);
+    assert.doesNotMatch(fallbackWarnings()[0]!, REVIEWER_PROSE);
+    // Later turns and reviews act as Tools only without any capture attempt.
     await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
     await f.writeScript("FALLBACK_TWO\n");
     await f.end();
-    assert.equal(capture.mock.callCount(), 2);
-    assert.equal(f.warnings.filter((warning) => warning.includes("Review evidence method: Tools only (snapshot-failure fallback)")).length, 2);
     assert.equal(await readFile(f.calls, "utf8"), "2");
-    capture.mock.restore();
-    await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
-    await writeFile(join(f.cwd, "REPORT"), "SNAPSHOT_RECOVERED_REPORT\n");
+    assert.match(f.rt.sent[1]!.message, /Tools only \(snapshot-failure fallback\)/);
+    const bundle = extractBundleDir(f.rt.sent[1]!.message, 2);
+    assert.match(await readFile(join(bundle, "reviews/0002/side-effect.patch.diff"), "utf8"), /FALLBACK_TWO/);
+    assert.equal(JSON.parse(await readFile(join(bundle, "reviews/0002/metadata.json"), "utf8")).evidenceMethod, "tool-only-fallback");
+    const sentAfterEdits = f.rt.sent.length;
+    for (const text of ["just answer", "another question"]) {
+      await f.start(text);
+      await writeFile(join(f.cwd, "REPORT"), `${text}\n`);
+      await f.end();
+    }
+    await f.commands.get("review-now")!("", f.rt.ctx);
+    assert.match(f.rt.notices.at(-1)!, /no (changes detected|active review window)/);
+    assert.equal(await readFile(f.calls, "utf8"), "2", "no-change turns run no reviewer");
+    assert.equal(f.rt.sent.length, sentAfterEdits);
+    assert.equal(capture.mock.callCount(), 1, "zero snapshot retries after the first eligible fallback");
+    assert.equal(fallbackWarnings().length, 1, "the fallback warning is shown only at its transition");
+    assert.deepEqual(f.modelInputs, []);
+    // An unrelated Save never persists the session-only fallback.
+    const diskBefore = JSON.parse(await readFile(f.configPath, "utf8"));
+    await f.settings(["Save changes"]);
+    const saved = JSON.parse(await readFile(f.configPath, "utf8"));
+    assert.notEqual(diskBefore.review.evidence.primaryToolOnly, true);
+    assert.equal(saved.review.evidence.primaryToolOnly, false, "Save writes the configured preference, never the session fallback");
+    assert.equal(saved.review.evidence.snapshotFailureFallback, true);
+    assert.doesNotMatch(f.warnings.join("\n"), /RESET/);
+    await f.start("still Tools only after Save");
     await f.end();
-    assert.equal(await readFile(f.calls, "utf8"), "3");
-    assert.match(f.rt.sent[2]!.message, /Review evidence method: Tools \+ workspace changes/);
-    assert.doesNotMatch(f.rt.sent[2]!.message, /Tools only \(snapshot-failure fallback\)/);
-    const bundle = extractBundleDir(f.rt.sent[2]!.message, 3);
-    assert.match(await readFile(join(bundle, "reviews/0003/patch.diff"), "utf8"), /SNAPSHOT_RECOVERED_REPORT/);
-    assert.equal(f.warnings.filter((warning) => warning.includes("Review evidence method: Tools only (snapshot-failure fallback)")).length, 2);
+    assert.equal(capture.mock.callCount(), 1);
+    // A new session resumes the configured snapshot preference.
+    capture.mock.restore();
+    await trigger(f.rt.hooks, "session_start", { type: "session_start", reason: "new" }, f.rt.ctx);
+    await f.start("new session work");
+    assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "checkpoint");
+    await f.writeScript("NEW_SESSION_SNAPSHOT\n");
+    await f.end();
+    assert.match(f.rt.sent.at(-1)!.message, /Review evidence method: Tools \+ workspace changes/);
   } finally { await f.dispose(); }
 });
 
@@ -734,13 +821,17 @@ test("production Ctrl+S in the evidence submenu persists and resets Primary exac
     const base = menu.context as { ui: Record<string, unknown> };
     try {
       await f.commands.get("review-settings")!("", { ...f.rt.ctx, ...base,
-        ui: { ...base.ui, notify: (message: string) => f.rt.notices.push(message) },
+        ui: { ...base.ui, notify: (message: string, type?: unknown) => (f.rt.ctx.ui.notify as (message: string, type?: unknown) => unknown)(message, type) },
       });
     } finally { setMenuTuiHost(undefined); }
     assert.equal(menu.exhausted(), false);
     assert.equal(JSON.parse(await readFile(f.configPath, "utf8")).review.evidence.primaryToolOnly, true);
     assert.equal((await f.restored())!.state.reviewWindow!.evidence.events.length, 0);
     assert.equal(f.warnings.filter((warning) => warning.includes("collected evidence was RESET")).length, 1);
+    // #465: the native TUI menu Save path delivers only the local warning.
+    assert.deepEqual(f.modelInputs, []);
+    assert.equal(f.rt.sent.length, 0);
+    assert.doesNotMatch(f.warnings.join("\n"), REVIEWER_PROSE);
   } finally { await f.dispose(); }
 });
 
@@ -836,32 +927,51 @@ test("Primary Tools only → Tools + workspace changes capture failure names met
     assert.deepEqual(after.evidence, before.evidence);
     await assert.rejects(trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx), /Tools only → Tools \+ workspace changes could not establish/);
     assert.deepEqual(f.warnings, warningsBefore, "failed transition must not disclose fallback or a successful method change");
+    assert.deepEqual(f.modelInputs, []);
   } finally { await f.dispose(); }
 });
 
-test("Tools only → Tools + workspace changes honors opted-in acquisition fallback without resetting retained work or latching preference", async () => {
+test("Tools only → Tools + workspace changes acquisition fallback keeps retained work and applies Tools only for the session without retry", async () => {
   const f = await fixture({ primaryToolOnly: true, snapshotFailureFallback: true }, false);
   try {
     await f.start();
     await f.writeScript("RETAIN_WHILE_DISABLING\n");
     await f.end();
     const count = (await f.restored())!.state.reviewWindow!.evidence.events.length;
+    const diskBefore = await readFile(f.configPath, "utf8");
     const failed = mock.method(checkpoints, "captureReviewCheckpoint", async () => ({ status: "failed" as const, reason: "patch_too_large" as const, evidenceCaptureFailure: true as const }));
     await f.settings(["Reviewers", "Evidence methods", "Primary /", "Back", "Back", undefined]);
+    assert.equal(failed.mock.callCount(), 1);
     const fallback = (await f.restored())!.state.reviewWindow!;
     assert.equal(fallback.evidence.events.length, count);
     assert.ok(fallback.baseline?.kind === "tool" && fallback.baseline.fallback);
-    assert.match(f.warnings.at(-1)!, /preference changed: Tools only → Tools \+ workspace changes.*will be retried/);
+    assert.match(f.warnings.at(-1)!, /preference changed: Tools only → Tools \+ workspace changes, but a new snapshot baseline could not be acquired/);
     assert.match(f.warnings.at(-1)!, /Tools only \(snapshot-failure fallback\)/);
-    assert.doesNotMatch(f.warnings.at(-1)!, /RESET/);
+    assert.match(f.warnings.at(-1)!, /rest of this session; snapshot capture is not retried/);
+    assert.doesNotMatch(f.warnings.at(-1)!, /RESET|will be retried/);
+    assert.doesNotMatch(f.warnings.join("\n"), REVIEWER_PROSE);
+    assert.deepEqual(f.modelInputs, []);
+    assert.equal(await readFile(f.configPath, "utf8"), diskBefore);
     failed.mock.restore();
+    const capture = checkpoints.captureReviewCheckpoint;
+    const retries = mock.method(checkpoints, "captureReviewCheckpoint", async (...args: Parameters<typeof capture>) => capture(...args));
     await f.start("continued work with snapshot preference");
     await f.writeScript("CONTINUED_RETAINED_WORK\n");
     await f.end();
-    const recovered = (await f.restored())!.state.reviewWindow!;
-    assert.ok(recovered.baseline?.kind === "checkpoint" && recovered.baseline.toolOnlyHistory);
-    assert.equal(recovered.evidence.events.length, count + 2);
-    assert.match(f.warnings.at(-1)!, /Snapshot capture recovered/);
+    assert.equal(retries.mock.callCount(), 0, "a repaired workspace is not re-captured this session");
+    const continued = (await f.restored())!.state.reviewWindow!;
+    assert.ok(continued.baseline?.kind === "tool" && continued.baseline.fallback);
+    assert.equal(continued.evidence.events.length, count + 2);
+    assert.doesNotMatch(f.warnings.join("\n"), /Snapshot capture recovered/);
+    // Conservative while explicit re-selection semantics are undecided: a
+    // later explicit Tools only → Tools + workspace changes apply in this
+    // session does not retry capture either.
+    await f.settings(["Reviewers", "Evidence methods", "Primary /", "Back", "Back", undefined]);
+    assert.match(f.warnings.at(-1)!, /CURRENT Primary collected evidence was RESET/);
+    await f.settings(["Reviewers", "Evidence methods", "Primary /", "Back", "Back", undefined]);
+    assert.match(f.warnings.at(-1)!, /already fell back to Tools only.*not retried automatically.*\/review-clear/);
+    assert.equal(retries.mock.callCount(), 0);
+    assert.deepEqual(f.modelInputs, []);
   } finally { await f.dispose(); }
 });
 
@@ -897,11 +1007,10 @@ test("settings applied during owned pre-review persistence cannot change that re
       }
       return originalSave.apply(this, args);
     });
-    const host = f.rt.pi as typeof f.rt.pi & { sendMessage: (message: { content: string }) => unknown };
-    const sendMessage = host.sendMessage;
-    mock.method(host, "sendMessage", (message: { content: string }) => {
-      if (message.content.includes("pending until the running review settles")) deferred.resolve();
-      return sendMessage(message);
+    const notify = f.rt.ctx.ui.notify;
+    mock.method(f.rt.ctx.ui, "notify", (message: string, type?: unknown) => {
+      if (message.includes("pending until the running review settles")) deferred.resolve();
+      return (notify as (message: string, type?: unknown) => number)(message, type);
     });
     ending = f.end();
     await atBarrier(entered.promise, "pre-review save");
@@ -927,7 +1036,7 @@ test("settings applied during owned pre-review persistence cannot change that re
   }
 });
 
-for (const stage of ["persist", "sendMessage"] as const) {
+for (const stage of ["persist", "warning"] as const) {
   test(`an incomplete Primary transition retries ${stage} and blocks work without resetting later evidence again`, async () => {
     const f = await fixture();
     let fail = true;
@@ -946,11 +1055,10 @@ for (const stage of ["persist", "sendMessage"] as const) {
           return save.apply(this, args);
         });
       } else {
-        const host = f.rt.pi as typeof f.rt.pi & { sendMessage: (message: { content: string }) => unknown };
-        const sendMessage = host.sendMessage;
-        mock.method(host, "sendMessage", (message: { content: string }) => {
-          if (fail && message.content.includes("collected evidence was RESET")) throw new Error("injected transition sendMessage failure");
-          return sendMessage(message);
+        const notify = f.rt.ctx.ui.notify;
+        mock.method(f.rt.ctx.ui, "notify", (message: string, type?: unknown) => {
+          if (fail && message.includes("collected evidence was RESET")) throw new Error("injected transition warning failure");
+          return (notify as (message: string, type?: unknown) => number)(message, type);
         });
       }
       await assert.rejects(f.settings(["Reviewers", "Evidence methods", "Primary /", "Back", "Back", undefined]), /injected transition/);
@@ -1034,7 +1142,14 @@ for (const scenario of [
         assert.equal(afterWindow.activeExchange!.reviewResponseMode, "correction");
         assert.equal(afterWindow.reviewHistory.at(-1)!.disposition, "held_then_sent");
         assert.match(f.warnings.at(-1)!, /\/review-continue: WARNING: Review evidence method: Tools only \(snapshot-failure fallback\)/);
-        assert.match(f.rt.sent.at(-1)!.message, /Tools only \(snapshot-failure fallback\)/);
+        assert.match(f.warnings.at(-1)!, /\/review-clear/);
+        // #465: the warning is local only; the authorization carries only the
+        // capped correction follow-up to the model, sent and persisted alike.
+        const authorization = f.rt.sent.at(-1)!.message;
+        assert.match(authorization, /correction authorization for the implementing model/);
+        assert.doesNotMatch(authorization, /WARNING|snapshot-failure fallback|\/review-clear/);
+        assert.equal(after.pendingModelDeliveries.at(-1)!.message, authorization);
+        assert.deepEqual(f.modelInputs, []);
         assert.equal(after.pendingModelDeliveries.at(-1)!.kind, "review_authorization");
         assert.equal(after.pendingModelDeliveries.at(-1)!.status, "delivered");
       } else {
@@ -1049,7 +1164,7 @@ for (const scenario of [
   });
 }
 
-test("capped continuation retries a first-capture fallback and preserves its historical coverage limit on recovery", async () => {
+test("capped continuation after a session fallback stays Tools only without retry; outstanding corrections still review", async () => {
   const f = await fixture({ snapshotFailureFallback: true }, true, 1);
   try {
     let reviews = 0;
@@ -1064,21 +1179,33 @@ test("capped continuation retries a first-capture fallback and preserves its his
     await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
     await f.writeScript("SECOND_TOOL_CORRECTION\n");
     await f.end();
+    assert.equal(failure.mock.callCount(), 1);
     const before = (await f.restored())!.state.reviewWindow!;
     assert.ok(before.lastCappedFollowUp);
     assert.equal(before.baseline!.kind, "tool");
     failure.mock.restore();
+    const capture = checkpoints.captureReviewCheckpoint;
+    const retries = mock.method(checkpoints, "captureReviewCheckpoint", async (...args: Parameters<typeof capture>) => capture(...args));
+    const warningCount = f.warnings.length;
     await f.commands.get("review-continue")!("", f.rt.ctx);
     const after = (await f.restored())!.state.reviewWindow!;
-    assert.ok(after.baseline?.kind === "checkpoint" && after.baseline.toolOnlyHistory);
-    assert.deepEqual(after.activeExchange!.baseline, after.baseline);
+    assert.ok(after.baseline?.kind === "tool" && after.baseline.fallback);
+    const response = after.activeExchange!.baseline;
+    assert.ok(response?.kind === "tool" && response.fallback);
     assert.deepEqual(after.evidence, before.evidence);
     assert.equal(after.activeExchange!.reviewResponseMode, "correction");
     assert.equal(after.correctionCycles, 0);
     assert.equal(after.lastCappedFollowUp, undefined);
     assert.equal(reviews, 2);
-    assert.match(f.warnings.at(-1)!, /snapshot capture recovered; a NEW baseline covers subsequent work only/);
-    assert.match(f.rt.sent.at(-1)!.message, /no pre-work snapshot covers that interval/);
+    assert.equal(f.warnings.length, warningCount, "no repeated fallback warning");
+    // The outstanding correction requirement still reaches the reviewer even
+    // when the response turn has no new tool evidence.
+    await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
+    await f.end();
+    assert.equal(reviews, 3);
+    assert.match(f.rt.sent.at(-1)!.message, /Tools only \(snapshot-failure fallback\)/);
+    assert.equal(retries.mock.callCount(), 0);
+    assert.deepEqual(f.modelInputs, []);
   } finally { await f.dispose(); }
 });
 
@@ -1164,16 +1291,15 @@ test("initial fallback notification failure leaves initialization unarmed and re
       captureAttempts++;
       return { status: "failed" as const, reason: "patch_too_large" as const, evidenceCaptureFailure: true as const };
     });
-    const host = f.rt.pi as typeof f.rt.pi & { sendMessage: (message: { content: string }) => unknown };
-    const sendMessage = host.sendMessage;
-    mock.method(host, "sendMessage", (message: { content: string }) => {
-      if (message.content.includes("Review evidence method: Tools only (snapshot-failure fallback)")) {
+    const notify = f.rt.ctx.ui.notify;
+    mock.method(f.rt.ctx.ui, "notify", (message: string, type?: unknown) => {
+      if (message.includes("Review evidence method: Tools only (snapshot-failure fallback)")) {
         warningAttempts++;
-        if (failWarning) throw new Error("injected initial fallback sendMessage failure");
+        if (failWarning) throw new Error("injected initial fallback warning failure");
       }
-      return sendMessage(message);
+      return (notify as (message: string, type?: unknown) => number)(message, type);
     });
-    await assert.rejects(f.start(), /initial fallback sendMessage failure/);
+    await assert.rejects(f.start(), /initial fallback warning failure/);
     await f.commands.get("review-now")!("", f.rt.ctx);
     assert.match(f.rt.notices.at(-1)!, /no active review window with a baseline/);
     const unarmed = (await f.restored())!.state.reviewWindow!;
@@ -1292,4 +1418,265 @@ for (const shape of ["single", "cumulative"] as const) {
       });
     }
   }
+}
+
+// #465: the reported scenario over the actual Primary registration and a real
+// Git arm. An eligible over-budget capture with fallback On is a LOCAL warning
+// only; empty and read-only turns invoke no reviewer and no model turn, and
+// Tools only applies for the rest of the session without capture retries.
+test("real arm over budget with fallback On: local warning only; empty/read-only turns run no reviewer or model turn; edits still review", async () => {
+  const f = await fixture({ snapshotFailureFallback: true }, true, indexTestConfig.maxCorrectionCycles as number, async (stage, owned) => {
+    if (stage === "beforeActivation") await initGitRepo(join(owned.root, "workspace"), { SCRIPT: "BEFORE_SCRIPT\n" });
+  });
+  const big = join(f.cwd, "z-big.bin");
+  const bigReads: number[] = [];
+  const largeAllocations: number[] = [];
+  const outcomes: Array<{ status: string; reason?: string; evidenceCaptureFailure?: true }> = [];
+  try {
+    await writeFile(big, "");
+    await truncate(big, DEFAULT_MAX_UNTRACKED_BYTES + 1);
+    const alloc = Buffer.alloc.bind(Buffer);
+    mock.method(Buffer, "alloc", (size: number, ...rest: unknown[]) => {
+      if (size >= 64 * 1024 * 1024) { largeAllocations.push(size); throw new Error(`test refused ${size}-byte allocation`); }
+      return (alloc as (...args: unknown[]) => Buffer)(size, ...rest);
+    });
+    const open = fsPromises.open;
+    mock.method(fsPromises, "open", async (...args: Parameters<typeof open>) => {
+      const handle = await open(...args);
+      if (String(args[0]) === big) {
+        const read = handle.read.bind(handle) as (...forwarded: unknown[]) => Promise<unknown>;
+        Object.assign(handle, { read: (...forwarded: unknown[]) => { bigReads.push(Number(forwarded[2])); return read(...forwarded); } });
+      }
+      return handle;
+    });
+    const capture = checkpoints.captureReviewCheckpoint;
+    mock.method(checkpoints, "captureReviewCheckpoint", async (...args: Parameters<typeof capture>) => {
+      const outcome = await capture(...args);
+      outcomes.push(outcome);
+      return outcome;
+    });
+    // A normal response with no tool or file changes.
+    await f.start("explain the build");
+    assert.equal(f.warnings.length, 1);
+    assert.match(f.warnings[0]!, /^WARNING: Review evidence method: Tools only \(snapshot-failure fallback\)/);
+    assert.match(f.warnings[0]!, /rest of this session; snapshot capture is not retried/);
+    assert.doesNotMatch(f.warnings[0]!, REVIEWER_PROSE);
+    await f.end();
+    await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/, "zero reviewer invocations");
+    assert.equal(f.rt.sent.length, 0, "no follow-up, steering, or review transmission");
+    assert.deepEqual(f.modelInputs, [], "no custom/system model message or triggered turn");
+    // A read-only turn.
+    await f.start("inspect SCRIPT");
+    await trigger(f.rt.hooks, "tool_call", { toolName: "read", input: { path: "SCRIPT" } }, f.rt.ctx);
+    await trigger(f.rt.hooks, "tool_result", { toolName: "read", input: { path: "SCRIPT" }, result: { content: [{ type: "text", text: "BEFORE_SCRIPT" }] } }, f.rt.ctx);
+    await trigger(f.rt.hooks, "tool_result", { toolName: "read", input: { path: "MISSING" }, isError: true, result: { content: [{ type: "text", text: "ENOENT" }] } }, f.rt.ctx);
+    await f.end();
+    await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/);
+    assert.equal(f.rt.sent.length, 0);
+    // An actual edit reviews retained tool bytes with truthful fallback labels.
+    await f.start("change SCRIPT");
+    await f.writeScript("REAL_ARM_EDIT\n");
+    await f.end();
+    assert.equal(await readFile(f.calls, "utf8"), "1");
+    assert.match(f.rt.sent[0]!.message, /Tools only \(snapshot-failure fallback\)/);
+    assert.match(f.rt.sent[0]!.message, /NOT certification of an exact workspace snapshot/);
+    const bundle = extractBundleDir(f.rt.sent[0]!.message, 1);
+    const side = await readFile(join(bundle, "reviews/0001/side-effect.patch.diff"), "utf8");
+    assert.match(side, /BEFORE_SCRIPT/);
+    assert.match(side, /REAL_ARM_EDIT/);
+    assert.doesNotMatch(await readFile(join(bundle, "reviews/0001/patch.diff"), "utf8").catch(() => ""), /z-big\.bin/, "no fake full snapshot");
+    const metadata = JSON.parse(await readFile(join(bundle, "reviews/0001/metadata.json"), "utf8"));
+    assert.equal(metadata.evidenceMethod, "tool-only-fallback");
+    assert.equal(metadata.exactSnapshotReviewed, false);
+    assert.equal(outcomes.length, 1, "only the first prompt attempted capture");
+    assert.deepEqual([outcomes[0]!.status, outcomes[0]!.reason, outcomes[0]!.evidenceCaptureFailure], ["failed", "untracked_too_large", true]);
+    assert.equal(f.warnings.filter((warning) => warning.includes("snapshot-failure fallback")).length, 1);
+    assert.deepEqual(f.modelInputs, []);
+    assert.deepEqual(bigReads, [], "over-budget untracked bytes are never read");
+    assert.deepEqual(largeAllocations, []);
+  } finally { await f.dispose(); }
+});
+
+// #465: /review-clear (and a new session) are the user reset boundaries for the
+// session fallback. Clearing never captures by itself; the next prompt's
+// ordinary capture tries the configured snapshot preference exactly once.
+for (const outcome of ["success", "refail"] as const) {
+  test(`/review-clear ends the session fallback; the next prompt retries capture once (${outcome})`, async () => {
+    const f = await fixture({ snapshotFailureFallback: true });
+    try {
+      const diskBefore = await readFile(f.configPath, "utf8");
+      let fail = true;
+      const capture = checkpoints.captureReviewCheckpoint;
+      const attempts = mock.method(checkpoints, "captureReviewCheckpoint", async (...args: Parameters<typeof capture>) => fail
+        ? { status: "failed" as const, reason: "untracked_too_large" as const, detail: "injected eligible failure", evidenceCaptureFailure: true as const }
+        : capture(...args));
+      const fallbackWarnings = () => f.warnings.filter((warning) => warning.includes("snapshot-failure fallback"));
+      await f.start();
+      await f.writeScript("LATCHED_EDIT\n");
+      await f.end();
+      for (const text of ["question one", "question two"]) { await f.start(text); await f.end(); }
+      assert.equal(attempts.mock.callCount(), 1, "no retry while the session fallback applies");
+      assert.equal(await readFile(f.calls, "utf8"), "1");
+      assert.equal(fallbackWarnings().length, 1);
+      assert.match(fallbackWarnings()[0]!, /Optional: \/review-clear .* next prompt try a snapshot again/);
+      assert.doesNotMatch(f.rt.sent.map((entry) => entry.message).join("\n"), /\/review-clear/, "the retry hint is user-only");
+      await f.commands.get("review-clear")!("", f.rt.ctx);
+      assert.equal(attempts.mock.callCount(), 1, "/review-clear does not capture eagerly");
+      fail = outcome === "refail";
+      await f.start("after clear");
+      assert.equal(attempts.mock.callCount(), 2, "exactly one next-prompt capture attempt");
+      const baseline = (await f.restored())!.state.reviewWindow!.baseline;
+      if (outcome === "success") {
+        assert.equal(baseline?.kind, "checkpoint");
+        await f.writeScript("SNAPSHOT_AFTER_CLEAR\n");
+        await f.end();
+        assert.match(f.rt.sent.at(-1)!.message, /Review evidence method: Tools \+ workspace changes/);
+        assert.equal(fallbackWarnings().length, 1);
+      } else {
+        assert.ok(baseline?.kind === "tool" && baseline.fallback);
+        assert.equal(fallbackWarnings().length, 2, "a re-failure warns once more");
+        await f.end();
+        for (const text of ["question three", "question four"]) { await f.start(text); await f.end(); }
+        assert.equal(attempts.mock.callCount(), 2, "back to Tools only for the session; no retry loop");
+        assert.equal(fallbackWarnings().length, 2);
+        await f.start("edit after re-failure");
+        await f.writeScript("TOOLS_ONLY_AFTER_REFAIL\n");
+        await f.end();
+        assert.match(f.rt.sent.at(-1)!.message, /Tools only \(snapshot-failure fallback\)/);
+        assert.equal(await readFile(f.calls, "utf8"), "2");
+      }
+      assert.equal(await readFile(f.configPath, "utf8"), diskBefore, "saved defaults are unchanged");
+      assert.deepEqual(f.modelInputs, []);
+    } finally { await f.dispose(); }
+  });
+}
+
+
+// #465: a settings change that makes a pinned scheduled worker unrunnable
+// disables that entry (canonical `enabled` flag) BEFORE scheduler replan, with
+// a user-only warning. Save persists it, root Escape applies it for the
+// session only, and Cancel changes nothing. The real scheduler runtime then
+// never samples the entry as due.
+for (const apply of ["save", "escape", "cancel"] as const) {
+  test(`removing a pinned scheduled worker in /review-settings (${apply}) ${apply === "cancel" ? "changes nothing" : "disables the entry before replan, user-only"}`, async () => {
+    let now = Date.UTC(2026, 0, 1, 12, 0, 10);
+    resetSchedulerRuntimeForTests();
+    getSchedulerRuntime().setEnabled(true);
+    const f = await fixture({}, true, indexTestConfig.maxCorrectionCycles as number, async (stage, owned) => {
+      if (stage !== "beforeActivation") return;
+      const configPath = join(owned.root, "config.json");
+      const configured = JSON.parse(await readFile(configPath, "utf8"));
+      await writeFile(configPath, JSON.stringify({ ...configured,
+        externalAgents: { ...configured.externalAgents, worker: { adapter: "run-as-binary", command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", "process.exit(0)"] } } },
+        execution: { maxWorkers: 1, workerResources: { pinned: { selection: { source: "external", id: "worker" }, maxConcurrent: 1 } } },
+        scheduledTasks: { nightly: { name: "Nightly", cron: "* * * * *", enabled: true, kind: "execute",
+          instructions: "scheduled work", workspace: join(owned.root, "workspace"), workerResourceId: "pinned" } },
+      }));
+    }, { schedulerTimer: { now: () => now, tickIntervalMs: 5 } });
+    try {
+      const dues: string[] = [];
+      mock.method(ScheduledTaskRuntime.prototype as unknown as { dispatchDue: (id: string) => void }, "dispatchDue", (id: string) => { dues.push(id); });
+      const replan = ScheduledTaskRuntime.prototype.replan;
+      const enabledAtReplan: unknown[] = [];
+      mock.method(ScheduledTaskRuntime.prototype, "replan", function(this: ScheduledTaskRuntime) {
+        enabledAtReplan.push((this as unknown as { options: { catalog: () => Record<string, { enabled: boolean }> | undefined } }).options.catalog()?.nightly?.enabled);
+        return replan.call(this);
+      });
+      const diskBefore = JSON.parse(await readFile(f.configPath, "utf8"));
+      const root = apply === "save" ? "Save changes" : apply === "escape" ? undefined : "Cancel";
+      await f.settings(["Worker resources", "1. worker", "Remove", "Back", root]);
+      const disk = JSON.parse(await readFile(f.configPath, "utf8"));
+      const disabledWarnings = f.warnings.filter((warning) => warning.includes('Scheduled task "Nightly" was disabled'));
+      if (apply === "cancel") {
+        assert.deepEqual(disk, diskBefore);
+        assert.deepEqual(enabledAtReplan, [], "Cancel applies nothing");
+        assert.equal(disabledWarnings.length, 0);
+      } else {
+        assert.deepEqual(enabledAtReplan, [false], "the entry is disabled before the scheduler replans");
+        assert.equal(disabledWarnings.length, 1);
+        assert.match(disabledWarnings[0]!, /worker resource pinned no longer exists/);
+        if (apply === "save") {
+          assert.equal(disk.scheduledTasks.nightly.enabled, false, "Save persists the disable");
+          assert.equal(disk.scheduledTasks.nightly.workerResourceId, "pinned", "no other resource is chosen");
+          assert.equal(disk.execution.workerResources.pinned, undefined);
+        } else assert.deepEqual(disk, diskBefore, "root Escape applies for the session only");
+      }
+      // Cross the next due minute on the real runtime.
+      now += 60_000;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.deepEqual(dues, apply === "cancel" ? ["nightly"] : [], apply === "cancel" ? "positive control: the intact entry is still due" : "a disabled entry is never admitted");
+      assert.deepEqual(f.modelInputs, []);
+      assert.equal(f.rt.sent.length, 0, "no model turn or follow-up");
+    } finally {
+      getSchedulerRuntime().setEnabled(false);
+      resetSchedulerRuntimeForTests();
+      await f.dispose();
+    }
+  });
+}
+
+test("execution controller notices are bound to the native warning UI target, never model input", async () => {
+  const f = await fixture();
+  try {
+    // A command context without UI falls back to the controller notify.
+    await f.commands.get("subtasks")!("", {});
+    assert.match(f.warnings.at(-1) ?? "", /^review gate subtasks/);
+    // After a settings apply the target is that settings UI context.
+    await f.settings(["Bundle retention", undefined, undefined]);
+    const before = f.warnings.length;
+    await f.commands.get("subtasks")!("", {});
+    assert.equal(f.warnings.length, before + 1);
+    assert.deepEqual(f.modelInputs, []);
+    assert.equal(f.rt.sent.length, 0);
+  } finally { await f.dispose(); }
+});
+
+
+// #465 (review): the automatic disable belongs to each apply attempt, never the
+// editable draft. A failed Save must not consume the disable or its warning.
+for (const retry of ["keep-removed", "restore-before-retry"] as const) {
+  test(`a failed Save then successful retry ${retry === "keep-removed" ? "disables the entry with one warning" : "keeps a restored entry enabled"}`, async () => {
+    let missingWorkspace = "";
+    const f = await fixture({}, true, indexTestConfig.maxCorrectionCycles as number, async (stage, owned) => {
+      if (stage !== "beforeActivation") return;
+      const configPath = join(owned.root, "config.json");
+      const configured = JSON.parse(await readFile(configPath, "utf8"));
+      missingWorkspace = join(owned.root, "created-later");
+      await writeFile(configPath, JSON.stringify({ ...configured,
+        externalAgents: { ...configured.externalAgents, worker: { adapter: "run-as-binary", command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", "process.exit(0)"] } } },
+        execution: { maxWorkers: 1, workerResources: { "external-worker": { selection: { source: "external", id: "worker" }, maxConcurrent: 1 } } },
+        scheduledTasks: {
+          nightly: { name: "Nightly", cron: "0 3 * * *", enabled: true, kind: "execute", instructions: "scheduled work",
+            workspace: join(owned.root, "workspace"), workerResourceId: "external-worker" },
+          other: { name: "Other", cron: "0 4 * * *", enabled: true, kind: "execute", instructions: "unrelated", workspace: missingWorkspace },
+        },
+      }));
+    });
+    try {
+      const fixAndSave = async () => { await mkdir(missingWorkspace); return "Save changes"; };
+      await f.settings([
+        "Worker resources", "1. worker", "Remove", "Back",
+        "Save changes", // fails on the unrelated missing workspace
+        ...(retry === "restore-before-retry" ? ["Worker resources", "Add worker resource", "worker [run-as-binary]", "1", "Back"] : []),
+        fixAndSave,
+      ]);
+      assert.match(f.rt.notices.join("\n"), /workspace is not an existing directory/);
+      const disk = JSON.parse(await readFile(f.configPath, "utf8"));
+      const disabledWarnings = f.warnings.filter((warning) => warning.includes('Scheduled task "Nightly" was disabled'));
+      assert.equal(disk.scheduledTasks.nightly.workerResourceId, "external-worker");
+      assert.equal(disk.scheduledTasks.other.enabled, true);
+      if (retry === "keep-removed") {
+        assert.equal(disk.scheduledTasks.nightly.enabled, false);
+        assert.equal(disk.execution.workerResources["external-worker"], undefined);
+        assert.equal(disabledWarnings.length, 1, "the successful apply warns exactly once");
+      } else {
+        assert.equal(disk.scheduledTasks.nightly.enabled, true, "a restored worker keeps the entry enabled");
+        assert.ok(disk.execution.workerResources["external-worker"]);
+        assert.equal(disabledWarnings.length, 0);
+      }
+      assert.deepEqual(f.modelInputs, []);
+    } finally { await f.dispose(); }
+  });
 }

@@ -663,6 +663,9 @@ export function replaceReviewGateState(target: ReviewGateState, restored: Review
   target.reviewActivityToken = undefined;
   target.queuedUserInputsDuringReview = restored.queuedUserInputsDuringReview;
   target.pendingModelDeliveries = restored.pendingModelDeliveries;
+  // Session-local evidence fallback (#465) is never serialized: a session
+  // boundary always resumes the configured evidence preference.
+  target.primarySnapshotFallback = restored.primarySnapshotFallback;
 }
 
 export function configDigest(config: ReviewGateConfig): string {

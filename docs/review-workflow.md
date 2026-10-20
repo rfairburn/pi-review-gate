@@ -56,6 +56,11 @@ The Git checkpoint pins clean committed content and captures both staged and uns
 Git differences plus raw non-ignored untracked entries. Tracked content follows Git-normalized newline semantics: the checkpoint is
 not a raw CRLF reproduction guarantee and does not run a separate EOL proof pass.
 Untracked entries, and eligible entries in a non-Git workspace, retain their raw bytes.
+Git checkpoint capture checks each untracked file's size against the untracked byte
+budget still remaining before it allocates or reads the file, and reads it in bounded
+chunks. An untracked set that cannot fit fails with a typed size-limit capture failure.
+That failure follows [Snapshot-failure fallback](#snapshot-failure-fallback) only when
+fallback is enabled and the failure qualifies; otherwise it blocks.
 An initialized repository with a verified unborn symbolic `HEAD` uses a checkpoint-owned
 synthetic parentless commit with an empty tree as its baseline. This does not create the
 user's first commit, move `HEAD`, change branch refs, or write the live index; staged,

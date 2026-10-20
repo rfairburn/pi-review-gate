@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test, { mock } from "node:test";
@@ -23,6 +23,7 @@ import { createTuiSettingsContext, KEY_DOWN, KEY_ENTER } from "./menu-tui-fakes"
 const fsPromises = require("node:fs/promises") as typeof import("node:fs/promises");
 import * as checkpoints from "../src/review-checkpoint";
 import { SessionStateStore } from "../src/session-state";
+import { DEFAULT_MAX_UNTRACKED_BYTES } from "../src/checkpoint/run-git";
 import { agentCatalog } from "./helpers";
 import { countingPassReviewerWithPromptDump, createSessionRuntime, extractBundleDir, indexTestConfig, testAgentDir, trigger, triggerAgentEnd } from "./entrypoint-harness";
 
@@ -1199,3 +1200,96 @@ test("initial fallback notification failure leaves initialization unarmed and re
     assert.equal(await readFile(f.calls, "utf8"), "1");
   } finally { failWarning = false; await f.dispose(); }
 });
+
+// #462: the actual Primary prompt/evidence path over a real Git arm whose
+// non-ignored untracked set cannot fit the default untracked budget. The
+// oversized entry is sparse, and a test guard refuses any allocation of 64 MiB
+// or more, so a missing size preflight fails here instead of exhausting memory.
+for (const shape of ["single", "cumulative"] as const) {
+  for (const initial of [true, false]) {
+    for (const enabled of [false, true]) {
+      test(`real arm ${shape} untracked over budget at ${initial ? "initial" : "settlement"} capture: fallback ${enabled ? "On reviews retained tool evidence" : "Off blocks"}`, async () => {
+        const f = await fixture({ snapshotFailureFallback: enabled }, true, indexTestConfig.maxCorrectionCycles as number, async (stage, owned) => {
+          if (stage === "beforeActivation") await initGitRepo(join(owned.root, "workspace"), { SCRIPT: "BEFORE_SCRIPT\n" });
+        });
+        const big = join(f.cwd, "z-big.bin");
+        const bigReads: number[] = [];
+        const largeAllocations: number[] = [];
+        const outcomes: Array<{ status: string; reason?: string; evidenceCaptureFailure?: true }> = [];
+        const oversize = async () => {
+          // single: one entry over the cap; cumulative: each entry fits the
+          // cap alone, but the second exceeds the budget the first leaves.
+          if (shape === "cumulative") await writeFile(join(f.cwd, "a-small.txt"), "x".repeat(16));
+          await writeFile(big, "");
+          await truncate(big, shape === "single" ? DEFAULT_MAX_UNTRACKED_BYTES + 1 : DEFAULT_MAX_UNTRACKED_BYTES - 15);
+          const alloc = Buffer.alloc.bind(Buffer);
+          mock.method(Buffer, "alloc", (size: number, ...rest: unknown[]) => {
+            if (size >= 64 * 1024 * 1024) { largeAllocations.push(size); throw new Error(`test refused ${size}-byte allocation`); }
+            return (alloc as (...args: unknown[]) => Buffer)(size, ...rest);
+          });
+          const open = fsPromises.open;
+          mock.method(fsPromises, "open", async (...args: Parameters<typeof open>) => {
+            const handle = await open(...args);
+            if (String(args[0]) === big) {
+              const read = handle.read.bind(handle) as (...forwarded: unknown[]) => Promise<unknown>;
+              Object.assign(handle, { read: (...forwarded: unknown[]) => { bigReads.push(Number(forwarded[2])); return read(...forwarded); } });
+            }
+            return handle;
+          });
+          // Pass-through observation of the actual production capture result.
+          const capture = checkpoints.captureReviewCheckpoint;
+          mock.method(checkpoints, "captureReviewCheckpoint", async (...args: Parameters<typeof capture>) => {
+            const outcome = await capture(...args);
+            outcomes.push(outcome);
+            return outcome;
+          });
+        };
+        try {
+          if (initial) await oversize();
+          else {
+            await f.start();
+            assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "checkpoint");
+          }
+          if (initial && !enabled) {
+            await assert.rejects(f.start(), /baseline capture failed \(untracked_too_large\)/);
+            assert.equal(f.warnings.length, 0);
+            return;
+          }
+          if (initial) {
+            await f.start();
+            const baseline = (await f.restored())!.state.reviewWindow!.baseline;
+            assert.ok(baseline?.kind === "tool" && baseline.fallback);
+            assert.match(f.warnings.join("\n"), /Tools only \(snapshot-failure fallback\)/);
+          }
+          await f.writeScript("RETAINED_TOOL_WORK\n");
+          if (!initial) await oversize();
+          if (!enabled) {
+            await assert.rejects(f.end(), /acquisition failed/);
+            await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/);
+            assert.doesNotMatch(`${f.rt.notices.join("\n")}\n${f.warnings.join("\n")}`, /Tools only \(snapshot-failure fallback\)/);
+            const window = (await f.restored())!.state.reviewWindow!;
+            assert.equal(window.baseline?.kind, "checkpoint");
+            assert.ok(window.evidence.events.length > 0, "blocked work keeps its retained tool evidence");
+          } else {
+            await f.end();
+            assert.equal(await readFile(f.calls, "utf8"), "1", "the configured reviewer still runs; capture failure is not approval");
+            assert.match(f.rt.sent[0]!.message, /Tools only \(snapshot-failure fallback\)/);
+            assert.match(f.rt.sent[0]!.message, /CURRENT tool evidence was preserved, not reset/);
+            const bundle = extractBundleDir(f.rt.sent[0]!.message, 1);
+            assert.match(await readFile(join(bundle, "reviews/0001/side-effect.patch.diff"), "utf8"), /RETAINED_TOOL_WORK/);
+            const metadata = JSON.parse(await readFile(join(bundle, "reviews/0001/metadata.json"), "utf8"));
+            assert.equal(metadata.evidenceMethod, "tool-only-fallback");
+            assert.equal(metadata.exactSnapshotReviewed, false);
+            assert.match(await readFile(f.prompt, "utf8"), /RETAINED_TOOL_WORK/);
+          }
+          assert.ok(outcomes.length > 0);
+          for (const outcome of outcomes) {
+            assert.deepEqual([outcome.status, outcome.reason, outcome.evidenceCaptureFailure], ["failed", "untracked_too_large", true]);
+          }
+          assert.deepEqual(bigReads, [], "over-budget untracked bytes are never read");
+          assert.deepEqual(largeAllocations, [], "no buffer is allocated for the entry that cannot fit");
+        } finally { await f.dispose(); }
+      });
+    }
+  }
+}

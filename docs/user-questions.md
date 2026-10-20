@@ -101,8 +101,8 @@ A parent Main sidebar is outside the child conversation viewport and is not
 covered by this overlay. For SSH use through the sidebar, the host forwards verified
 native copy requests to the connecting terminal without adding popup selection state;
 see [SSH clipboard copying](session-host-alpha.md#clipboard-copying-over-ssh).
-A terminal-request notice is not proof that the client's clipboard changed: verify
-by pasting on the client. The complete notice body
+Pi's native **Copied!** feedback is unchanged and the host adds no per-copy notice;
+neither is proof that the client's clipboard changed: verify by pasting on the client. The complete notice body
 and optional context appear before its **More details** and **Close** actions. If native Markdown or
 its theme is unavailable, the view visibly discloses the limitation and shows
 the complete question, notice body, and optional context as width-wrapped plain

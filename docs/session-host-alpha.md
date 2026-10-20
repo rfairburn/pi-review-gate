@@ -787,14 +787,27 @@ clipboard. Ordinary local helper-only copying is unchanged.
 
 This provenance adapter is verified against the bundled **Pi 1.3.0** runtime. A changed
 runtime or unavailable native provenance fails closed rather than admitting arbitrary
-output; the host reports a withheld/unavailable request. This is not a sandbox against
-trusted executable extensions running with the user's operating-system authority.
-No clipboard text or source stack is added to status/diagnostic logs. Clipboard
-payloads are transient authenticated transport, not encrypted storage or a sync service.
+output. This is not a sandbox against trusted executable extensions running with the
+user's operating-system authority. Clipboard payloads are transient authenticated
+transport, not encrypted storage or a sync service.
 
-**Clipboard request sent to terminal; paste on client to verify** means exactly that:
-bytes were submitted, not that Ghostty or another terminal acknowledged an OS clipboard
-write. Existing terminal permissions, multiplexers, and native size limits still apply
+Copy feedback stays native: Pi's own **Copied!** flash is the only per-copy status, and
+the host adds no header notice, dialog, or setting for a copy. Ordinary safety
+refusals (stale, sibling, hidden, unfocused, covered, form, changed-geometry, or
+shutting-down owners) stay quiet. Only actual routing failures for the current,
+displayed Main owner are recorded, through the existing
+[terminal diagnostics](#terminal-parser-diagnostics) warning and private log: an
+authenticated unsupported-runtime or unavailable-provenance report, or a failed write
+of the host's OSC 52 request to the outer terminal. Those records carry only the
+`host-clipboard` category and a fixed message identifier
+(`clipboard-unsupported-runtime`, `clipboard-provenance-unavailable`, or
+`clipboard-terminal-write-failed`), with no stack or invented cause. No clipboard
+text or encoding, source stack, exception message, environment value, or path is
+recorded, and malformed, raw, or unauthenticated controls never produce a record.
+
+A successful copy records nothing. It means only that bytes were submitted, not that
+Ghostty or another terminal acknowledged an OS clipboard write; only a paste on the
+client verifies delivery. Existing terminal permissions, multiplexers, and native size limits still apply
 (Pi 1.3.0 bounds the encoded OSC 52 payload to 100,000 characters). No terminal/SSH
 configuration or multiplexer passthrough is forced. A terminal or multiplexer that
 disables/does not implement clipboard writes may discard the request. There is no
@@ -876,8 +889,9 @@ clipboard_proof node "$PI_CLI" --offline --no-context-files --no-skills --no-ext
    ```
 
    Use New session to select `$proof/a`. Repeat both commands and client-side pastes.
-   The selected text must match standalone, including Unicode and line breaks. The
-   host's terminal-request notice alone is not success evidence.
+   The selected text must match standalone, including Unicode and line breaks. Pi's
+   native **Copied!** flash alone is not success evidence; the host adds no per-copy
+   notice, and an absent Terminal diagnostics warning is not client-paste evidence.
 4. Create a sibling in `$proof/b`; switch focus, show/hide the sidebar, and open/cancel
    a host form. Copy only from the visible foreground owner. No old/sibling selection
    may overwrite the client clipboard, and ordinary typing/mouse behavior must remain.
@@ -1097,7 +1111,9 @@ internal xterm messages (for example listener-leak or invalid-option warnings) c
 the console directly rather than through the logger, and are outside this per-terminal
 containment.
 
-When xterm reports a warning or error, the host shows a clearable warning in its own UI:
+When xterm reports a warning or error, or an actual host clipboard routing failure
+occurs (see [Clipboard copying over SSH](#clipboard-copying-over-ssh)), the host shows
+a clearable warning in its own UI:
 
 - a right-aligned header notice, for example
   `! Terminal diagnostics: 3 (clear in sidebar)`, visible even while the sidebar is
@@ -1141,11 +1157,16 @@ record whose first key is the schema marker
   records state `not-applicable-parser-state-report` and never invent an originating
   child stack or cause. A genuine Error passed to the logger keeps only its own
   frames, labelled `logged-error`;
+- `diagnostic` records in the `host-clipboard` category for actual native clipboard
+  routing failures. They carry only time, run and session-row identifiers, level, the
+  fixed message identifier, the suppressed count, and `not-captured` in place of a
+  stack: no geometry, parser state, stack, error name, or exception text;
 - `dropped`, `diagnostic-omitted`, and `host-run-end` summary records.
 
 Logger message text, arbitrary logger arguments, raw terminal bytes, conversation or
 tool text, credentials, and environment values are never retained. Per session pane,
-at most 16 detailed records are kept in a burst, then one every 2 seconds. Further
+at most 16 detailed records are kept in a burst, then one every 2 seconds; host
+clipboard routing failures share one host-wide bound of the same size. Further
 calls are counted, and the next detailed record carries that count. Unwritten lines
 are held in a bounded queue (256 lines, 1 MiB); overflow is recorded as a dropped
 count, not as growing memory. Nothing is transmitted, and there is no polling, daemon,

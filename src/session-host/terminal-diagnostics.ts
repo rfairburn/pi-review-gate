@@ -30,6 +30,10 @@
  *   microtask after the current parse step, never inside the parser callback,
  *   and nothing here can throw into xterm.
  *
+ * The same sink also carries a closed set of host clipboard routing failures
+ * (#466, `HostClipboardDiagnosticCollector`): fixed category/message codes
+ * under the same rate bound and deferred delivery, with no payload or stack.
+ *
  * Pure module: no filesystem, process, or terminal I/O. Persistence lives in
  * `terminal-diagnostics-log.ts`; host warning state is `TerminalDiagnosticsWarning`.
  */
@@ -39,8 +43,12 @@ import { homedir } from "node:os";
 /** xterm logger levels (the pinned `ILogger` interface). */
 export type TerminalDiagnosticLevel = "trace" | "debug" | "info" | "warn" | "error";
 
-/** Coarse category used for the host warning and the persisted record. */
-export type TerminalDiagnosticCategory = "parser-error" | "xterm-warning" | "xterm-log";
+/**
+ * Coarse category used for the host warning and the persisted record.
+ * `host-clipboard` is a host routing failure for a verified native copy
+ * request (#466), never an xterm report.
+ */
+export type TerminalDiagnosticCategory = "parser-error" | "xterm-warning" | "xterm-log" | "host-clipboard";
 
 /** Bounded parser state copied from an xterm parse-error report. */
 export interface TerminalParserStateSnapshot {
@@ -344,6 +352,40 @@ function boundedErrorName(error: Error): string | undefined {
 }
 
 /**
+ * Detailed-record rate bound shared by every diagnostics producer: a burst of
+ * tokens refilled one per interval. Calls beyond it are counted by the caller.
+ */
+class DiagnosticTokenBucket {
+	private readonly burst: number;
+	private readonly refillMs: number;
+	private tokens: number;
+	private lastRefill: number;
+
+	constructor(burst: number | undefined, refillMs: number | undefined, now: number) {
+		this.burst = Math.max(1, Math.floor(burst ?? DEFAULT_BURST));
+		this.refillMs = Math.max(1, Math.floor(refillMs ?? DEFAULT_REFILL_MS));
+		this.tokens = this.burst;
+		this.lastRefill = now;
+	}
+
+	take(now: number): boolean {
+		if (now > this.lastRefill) {
+			const refilled = Math.floor((now - this.lastRefill) / this.refillMs);
+			if (refilled > 0) {
+				this.tokens = Math.min(this.burst, this.tokens + refilled);
+				this.lastRefill = this.tokens >= this.burst ? now : this.lastRefill + refilled * this.refillMs;
+			}
+		} else if (now < this.lastRefill) {
+			// A clock step backwards must not freeze the bucket forever.
+			this.lastRefill = now;
+		}
+		if (this.tokens < 1) return false;
+		this.tokens -= 1;
+		return true;
+	}
+}
+
+/**
  * One surface's xterm logger. `logger` is handed to the xterm Terminal
  * constructor; it never writes to the console and never throws.
  */
@@ -352,10 +394,7 @@ export class XtermDiagnosticCollector {
 	private readonly options: XtermDiagnosticCollectorOptions;
 	private readonly now: () => number;
 	private readonly schedule: (callback: () => void) => void;
-	private readonly burst: number;
-	private readonly refillMs: number;
-	private tokens: number;
-	private lastRefill: number;
+	private readonly bucket: DiagnosticTokenBucket;
 	private pending: TerminalDiagnosticRecord[] = [];
 	private pendingSuppressed = 0;
 	private pendingWarnings = 0;
@@ -368,10 +407,7 @@ export class XtermDiagnosticCollector {
 		this.options = options;
 		this.now = options.now ?? Date.now;
 		this.schedule = options.schedule ?? queueMicrotask;
-		this.burst = Math.max(1, Math.floor(options.burst ?? DEFAULT_BURST));
-		this.refillMs = Math.max(1, Math.floor(options.refillMs ?? DEFAULT_REFILL_MS));
-		this.tokens = this.burst;
-		this.lastRefill = this.safeNow();
+		this.bucket = new DiagnosticTokenBucket(options.burst, options.refillMs, this.safeNow());
 		const self = this;
 		// Plain functions: xterm binds each method to this object before calling.
 		this.logger = Object.freeze({
@@ -405,22 +441,6 @@ export class XtermDiagnosticCollector {
 		}
 	}
 
-	private takeToken(now: number): boolean {
-		if (now > this.lastRefill) {
-			const refilled = Math.floor((now - this.lastRefill) / this.refillMs);
-			if (refilled > 0) {
-				this.tokens = Math.min(this.burst, this.tokens + refilled);
-				this.lastRefill = this.tokens >= this.burst ? now : this.lastRefill + refilled * this.refillMs;
-			}
-		} else if (now < this.lastRefill) {
-			// A clock step backwards must not freeze the bucket forever.
-			this.lastRefill = now;
-		}
-		if (this.tokens < 1) return false;
-		this.tokens -= 1;
-		return true;
-	}
-
 	private note(level: TerminalDiagnosticLevel, message: unknown, args: readonly unknown[]): void {
 		// Everything here runs inside xterm's parser/log call: contain all failures.
 		try {
@@ -428,7 +448,7 @@ export class XtermDiagnosticCollector {
 			const messageId = message instanceof Error ? "logged-error" : classify(message);
 			if (level === "warn" || level === "error") this.pendingWarnings += 1;
 			const now = this.safeNow();
-			if (this.pending.length >= MAX_PENDING_RECORDS || !this.takeToken(now)) {
+			if (this.pending.length >= MAX_PENDING_RECORDS || !this.bucket.take(now)) {
 				this.pendingSuppressed += 1;
 				this.suppressedSinceRecord += 1;
 				this.requestDelivery();
@@ -518,6 +538,156 @@ export class XtermDiagnosticCollector {
 			this.options.deliver(event);
 		} catch {
 			// The owner's sink is responsible for its own failures.
+		}
+	}
+}
+
+/**
+ * Fixed identifiers of actual host clipboard routing failures (#466). Each is
+ * a closed code: no clipboard text or encoding, stack, exception message,
+ * environment value, or path is ever attached.
+ *
+ * - `clipboard-unsupported-runtime`: the eligible owner's authenticated child
+ *   reported a native copy on a runtime the provenance adapter does not support.
+ * - `clipboard-provenance-unavailable`: the eligible owner's authenticated child
+ *   could not verify native copy provenance, so the request was withheld.
+ * - `clipboard-terminal-write-failed`: writing the host-generated OSC 52
+ *   request to the outer terminal threw.
+ */
+export type HostClipboardDiagnosticId =
+	| "clipboard-unsupported-runtime"
+	| "clipboard-provenance-unavailable"
+	| "clipboard-terminal-write-failed";
+
+const HOST_CLIPBOARD_LEVELS: Readonly<Record<HostClipboardDiagnosticId, TerminalDiagnosticLevel>> = {
+	"clipboard-unsupported-runtime": "warn",
+	"clipboard-provenance-unavailable": "warn",
+	"clipboard-terminal-write-failed": "error",
+};
+
+export interface HostClipboardDiagnosticCollectorOptions {
+	/** Receives one delivery per session row; exceptions are contained. */
+	readonly deliver: (instanceId: string, event: TerminalDiagnosticEvent) => void;
+	readonly now?: () => number;
+	/** Injectable scheduler for the deferred delivery (default queueMicrotask). */
+	readonly schedule?: (callback: () => void) => void;
+	readonly burst?: number;
+	readonly refillMs?: number;
+}
+
+/**
+ * Host-owned producer of fixed-code clipboard routing diagnostics. It uses
+ * the same detailed-record token bucket, pending bound, counted overflow, and
+ * deferred delivery as the xterm collector, so callers inside a parser OSC
+ * callback never persist synchronously. Records carry no stack: a host routing
+ * failure is not an xterm parser report and no cause is fabricated.
+ */
+export class HostClipboardDiagnosticCollector {
+	private readonly options: HostClipboardDiagnosticCollectorOptions;
+	private readonly now: () => number;
+	private readonly schedule: (callback: () => void) => void;
+	private readonly bucket: DiagnosticTokenBucket;
+	/** Per-row pending deliveries, insertion ordered; cleared on every delivery. */
+	private pending = new Map<string, { records: TerminalDiagnosticRecord[]; suppressed: number; warnings: number }>();
+	private pendingRecords = 0;
+	private suppressedSinceRecord = 0;
+	private scheduled = false;
+	private disposed = false;
+
+	constructor(options: HostClipboardDiagnosticCollectorOptions) {
+		this.options = options;
+		this.now = options.now ?? Date.now;
+		this.schedule = options.schedule ?? queueMicrotask;
+		this.bucket = new DiagnosticTokenBucket(options.burst, options.refillMs, this.safeNow());
+	}
+
+	/** Record one actual routing failure for a session row. Never throws. */
+	note(instanceId: string, messageId: HostClipboardDiagnosticId): void {
+		try {
+			if (this.disposed || typeof instanceId !== "string") return;
+			if (!Object.hasOwn(HOST_CLIPBOARD_LEVELS, messageId)) return;
+			const level = HOST_CLIPBOARD_LEVELS[messageId];
+			if (level === undefined) return;
+			let entry = this.pending.get(instanceId);
+			if (entry === undefined) {
+				entry = { records: [], suppressed: 0, warnings: 0 };
+				this.pending.set(instanceId, entry);
+			}
+			entry.warnings += 1;
+			const now = this.safeNow();
+			if (this.pendingRecords >= MAX_PENDING_RECORDS || !this.bucket.take(now)) {
+				entry.suppressed += 1;
+				this.suppressedSinceRecord += 1;
+				this.requestDelivery();
+				return;
+			}
+			let time: string;
+			try { time = new Date(now).toISOString(); } catch { time = new Date(0).toISOString(); }
+			entry.records.push({
+				time,
+				level,
+				category: "host-clipboard",
+				messageId,
+				suppressedBefore: this.suppressedSinceRecord,
+				originatingStack: "not-captured",
+			});
+			this.pendingRecords += 1;
+			this.suppressedSinceRecord = 0;
+			this.requestDelivery();
+		} catch {
+			// A diagnostic failure must never escape into clipboard routing.
+		}
+	}
+
+	/** Deliver anything pending synchronously (used before the log closes). */
+	flushNow(): void {
+		this.deliverPending();
+	}
+
+	/** Stop collecting; later notes are ignored and nothing is delivered. */
+	dispose(): void {
+		this.disposed = true;
+		this.pending = new Map();
+		this.pendingRecords = 0;
+	}
+
+	private safeNow(): number {
+		try {
+			const value = this.now();
+			return Number.isFinite(value) ? value : 0;
+		} catch {
+			return 0;
+		}
+	}
+
+	private requestDelivery(): void {
+		if (this.scheduled) return;
+		this.scheduled = true;
+		try {
+			this.schedule(() => {
+				this.scheduled = false;
+				this.deliverPending();
+			});
+		} catch {
+			this.scheduled = false;
+		}
+	}
+
+	private deliverPending(): void {
+		if (this.disposed || this.pending.size === 0) return;
+		const pending = this.pending;
+		this.pending = new Map();
+		this.pendingRecords = 0;
+		for (const [instanceId, entry] of pending) {
+			try {
+				this.options.deliver(instanceId, {
+					records: entry.records,
+					suppressed: entry.suppressed,
+					warningCount: entry.warnings,
+				});
+			} catch {
+				// The owner's sink is responsible for its own failures.
+			}
 		}
 	}
 }

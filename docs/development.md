@@ -262,6 +262,8 @@ node --test dist-test/tests/session-host-native-clipboard.test.js \
   dist-test/tests/session-host-terminal.test.js \
   dist-test/tests/session-host-input.test.js \
   dist-test/tests/session-host-main.test.js \
+  dist-test/tests/session-host-terminal-diagnostics.test.js \
+  dist-test/tests/session-host-terminal-diagnostics-log.test.js \
   dist-test/tests/session-host-reporter.test.js \
   dist-test/tests/user-question-mouse-host.test.js
 ```
@@ -276,7 +278,10 @@ raw/render-path OSC 52 decoys. A real public `runSessionHost` process inside an 
 outer PTY covers native Main and foreground question/notice input through actual
 `ProcessTerminal` clipboard output and normal host shutdown/restoration. Codec and host
 controls separately cover replay, identity/epoch, geometry/focus, unsupported requests,
-and raw-terminal filtering. The source observer never patches Pi or reads private
+and raw-terminal filtering. Main controls also assert that neither a successful copy
+nor an ordinary refusal adds a host clipboard status, and that actual eligible-owner
+failures persist through the existing Terminal diagnostics log with fixed
+`host-clipboard` codes and no payload, stack, exception text, or path. The source observer never patches Pi or reads private
 selection fields; unavailable runtime provenance fails closed.
 
 These are process/protocol controls, not proof of physical clipboard delivery or the

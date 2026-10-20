@@ -2320,30 +2320,49 @@ test("a click on the displayed native Main pane returns focus without forwarding
   assert.equal(await closeWithSignal(harness), 0);
 });
 
-test("native clipboard routes only the displayed Main owner and reports a terminal request, not client success", async () => {
+/** Any host-authored per-copy clipboard status, including the removed #466 notices. */
+const HOST_CLIPBOARD_STATUS = /clipboard|paste on client|copied/i;
+
+test("native clipboard routes only the displayed Main owner; success and refusals add no host status", async () => {
   const harness = createHarness({ env: { PATH: process.env.PATH, HOME: "/synthetic-home", TERM: "xterm-ghostty" } });
   try {
     const manager = await startTwoSessions(harness);
     const event: NativeClipboardEvent = { kind: "copy", encoded: Buffer.from("Unicode α\n雪").toString("base64"),
       sessionId: "conversation-native-2", sessionEpoch: 1 };
     const copies = (): string[] => harness.terminal.writes.filter((write) => write.startsWith("\x1b]52;"));
+    const assertQuiet = (label: string): void => {
+      const frame = plain(harness.writer.frames.at(-1)?.frame);
+      assert.doesNotMatch(frame, HOST_CLIPBOARD_STATUS, `${label}: no host clipboard status is rendered`);
+      assert.ok(!frame.includes("Terminal diagnostics"), `${label}: no diagnostic is recorded`);
+      assert.equal(harness.sidebar?.terminalDiagnosticsWarning, undefined, `${label}: no diagnostic warning`);
+    };
     manager.options.onNativeClipboard?.("native-2", event); // roster focus cannot copy
+    manager.options.onNativeClipboard?.("native-2", { kind: "unavailable", reason: "unverified-native-origin", sessionId: event.sessionId, sessionEpoch: 1 });
+    await nextTurn();
     assert.deepEqual(copies(), []);
+    assertQuiet("roster focus");
     harness.terminal.emitInput(ENTER);
     await nextTurn();
     assert.equal(harness.sidebar?.focus, "main");
+    const framesBeforeCopy = harness.writer.frames.length;
     manager.options.onNativeClipboard?.("native-2", event);
-    assert.deepEqual(copies(), [`\x1b]52;c;${event.encoded}\x07`]);
+    assert.deepEqual(copies(), [`\x1b]52;c;${event.encoded}\x07`], "the native producer's exact bytes are submitted once");
     await nextTurn();
-    assert.match(plain(harness.writer.frames.at(-1)?.frame), /paste on client to verify/);
+    assert.equal(harness.writer.frames.length, framesBeforeCopy, "a successful copy schedules no host status redraw");
+    assertQuiet("successful copy");
     manager.options.onNativeClipboard?.("native-1", { ...event, sessionId: "conversation-native-1" });
+    manager.options.onNativeClipboard?.("native-1", { kind: "unavailable", reason: "unsupported-runtime", sessionId: "conversation-native-1", sessionEpoch: 1 });
     manager.options.onNativeClipboard?.("native-2", { ...event, sessionEpoch: 2 });
+    manager.options.onNativeClipboard?.("native-2", { kind: "unavailable", reason: "unsupported-runtime", sessionId: event.sessionId, sessionEpoch: 2 });
+    await nextTurn();
     assert.equal(copies().length, 1, "sibling and stale session cannot copy");
+    assertQuiet("sibling and stale refusals");
     harness.terminal.emitInput(ALT_LEFT); // focus roster
     harness.terminal.emitInput(ALT_LEFT); // hide sidebar and return to same Main
     await nextTurn();
     manager.options.onNativeClipboard?.("native-2", event);
     assert.equal(copies().length, 2, "hidden sidebar does not disable visible Main copying");
+    assert.equal(copies()[1], `\x1b]52;c;${event.encoded}\x07`);
     harness.terminal.emitInput(ALT_LEFT);
     await nextTurn();
     harness.terminal.emitInput("\x1b[B");
@@ -2354,49 +2373,93 @@ test("native clipboard routes only the displayed Main owner and reports a termin
     await nextTurn();
     assert.equal(harness.sidebar?.focus, "form", plain(harness.writer.frames.at(-1)?.frame));
     manager.options.onNativeClipboard?.("native-2", event);
+    manager.options.onNativeClipboard?.("native-2", { kind: "unavailable", reason: "unverified-native-origin", sessionId: event.sessionId, sessionEpoch: 1 });
+    await nextTurn();
     assert.equal(copies().length, 2, "host form covers Main and cannot authorize copying");
+    assertQuiet("covered by a host form");
   } finally { await closeWithSignal(harness); }
 });
 
-test("native clipboard rejects undrawn/changed geometry and unsupported or failed terminal delivery, and ignores TERM labels", async () => {
+test("native clipboard rejects undrawn/changed geometry quietly and logs only actual eligible-owner failures with fixed codes", async (t) => {
+  const owned = ownedAgentSetup();
+  t.after(() => rmSync(owned.agentDir, { recursive: true, force: true }));
   const output = new QueuedFrameOutput();
   output.refuseNextWrite();
   const harness = createHarness({ env: { PATH: process.env.PATH, HOME: "/synthetic-home", TERM: "xterm-ghostty" } }, {
+    ...owned.overrides,
     createWriter: (_stdout, writerOptions) => createSessionHostFrameWriter(output as unknown as Writable, { ...writerOptions, redrawIntervalMs: 0 }),
   });
+  harness.agentDir = owned.agentDir;
+  const secretText = "controlled clipboard secret";
+  const event: NativeClipboardEvent = { kind: "copy", encoded: Buffer.from(secretText).toString("base64"), sessionId: "conversation-native-2", sessionEpoch: 1 };
+  const exceptionText = `synthetic output failure at ${owned.agentDir}`;
   try {
     const manager = await startTwoSessions(harness);
     harness.terminal.emitInput(ENTER);
     await nextTurn();
-    const event: NativeClipboardEvent = { kind: "copy", encoded: Buffer.from("controlled").toString("base64"), sessionId: "conversation-native-2", sessionEpoch: 1 };
     const count = (): number => harness.terminal.writes.filter((write) => write.startsWith("\x1b]52;")).length;
+    const warnings = (): number => harness.sidebar?.terminalDiagnosticsWarning?.count ?? 0;
     manager.options.onNativeClipboard?.("native-2", event);
+    manager.options.onNativeClipboard?.("native-2", { kind: "unavailable", reason: "unsupported-runtime", sessionId: event.sessionId, sessionEpoch: 1 });
+    await nextTurn();
     assert.equal(count(), 0, "queued frame is not displayed ownership");
+    assert.equal(warnings(), 0, "an undisplayed owner is an ordinary quiet refusal");
     output.drain();
     await nextTurn();
     manager.options.onNativeClipboard?.("native-2", event);
     assert.equal(count(), 1);
+    await nextTurn();
+    assert.equal(warnings(), 0, "a successful copy records no diagnostic");
     output.refuseNextWrite();
     harness.terminal.setSize(90, 24);
     await nextTurn();
     manager.options.onNativeClipboard?.("native-2", event);
+    await nextTurn();
     assert.equal(count(), 1, "a resized but undrawn pane cannot authorize a clipboard operation");
+    assert.equal(warnings(), 0, "changed geometry is an ordinary quiet refusal");
     output.drain();
     await nextTurn();
-    harness.terminal.writeError = new Error("synthetic output failure");
+    harness.terminal.writeError = new Error(exceptionText);
     manager.options.onNativeClipboard?.("native-2", event);
     assert.equal(count(), 1, "failed write is not successful delivery");
     harness.terminal.writeError = undefined;
     manager.options.onNativeClipboard?.("native-2", { kind: "unavailable", reason: "unsupported-runtime", sessionId: event.sessionId, sessionEpoch: 1 });
-    assert.equal(count(), 1, "unsupported runtime does not emit clipboard bytes");
+    manager.options.onNativeClipboard?.("native-2", { kind: "unavailable", reason: "unverified-native-origin", sessionId: event.sessionId, sessionEpoch: 1 });
+    assert.equal(count(), 1, "unavailable runtime or provenance does not emit clipboard bytes");
+    // Sibling or stale reports are not the eligible owner's errors.
+    manager.options.onNativeClipboard?.("native-1", { kind: "unavailable", reason: "unsupported-runtime", sessionId: "conversation-native-1", sessionEpoch: 1 });
+    manager.options.onNativeClipboard?.("native-2", { kind: "unavailable", reason: "unsupported-runtime", sessionId: event.sessionId, sessionEpoch: 2 });
+    await nextTurn();
+    assert.equal(warnings(), 3, "actual eligible-owner failures enter the existing Terminal diagnostics warning");
+    const shown = output.writes.map((bytes) => bytes.toString("utf8")).join("");
+    assert.ok(shown.includes("Terminal diagnostics"), "the existing generic diagnostics indicator is drawn");
+    assert.doesNotMatch(shown.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ""), HOST_CLIPBOARD_STATUS, "no per-copy host clipboard status is drawn");
+    await waitFor(() => existsSync(diagnosticsLogPath(owned.agentDir))
+      && readFileSync(diagnosticsLogPath(owned.agentDir), "utf8").split("\"kind\":\"diagnostic\"").length === 4, "three diagnostic lines");
   } finally {
     harness.signals.emit("SIGTERM");
     output.drain();
-    await harness.result;
+    assert.equal(await harness.result, 0);
+  }
+  const logged = readFileSync(diagnosticsLogPath(owned.agentDir), "utf8");
+  for (const forbidden of [secretText, event.encoded, exceptionText, owned.agentDir, "synthetic output failure", "\\u001b]52"]) {
+    assert.ok(!logged.includes(forbidden), `persisted diagnostics never include ${JSON.stringify(forbidden)}`);
+  }
+  const entries = logged.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.deepEqual(entries.map((entry) => entry.kind), ["host-run", "diagnostic", "diagnostic", "diagnostic", "host-run-end"]);
+  const diagnostics = entries.filter((entry) => entry.kind === "diagnostic");
+  assert.deepEqual(diagnostics.map((entry) => [entry.instance, entry.level, entry.category, entry.messageId]), [
+    ["native-2", "error", "host-clipboard", "clipboard-terminal-write-failed"],
+    ["native-2", "warn", "host-clipboard", "clipboard-unsupported-runtime"],
+    ["native-2", "warn", "host-clipboard", "clipboard-provenance-unavailable"],
+  ]);
+  for (const entry of diagnostics) {
+    assert.equal(entry.originatingStack, "not-captured", "no xterm parser cause or stack is fabricated");
+    for (const absent of ["stack", "parser", "errorName", "context"]) assert.equal(entry[absent], undefined, `no ${absent}`);
   }
   // TERM is a terminal label, not evidence of OSC 52 capability. Under the same
   // verified Main-owner conditions, a dumb, empty, or absent TERM submits the
-  // native copy request exactly once and reports an unverified request.
+  // native copy request exactly once and adds no host status.
   for (const term of ["dumb", "", undefined] as const) {
     const label = term === undefined ? "absent" : term === "" ? "empty" : term;
     const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: "/synthetic-home" };
@@ -2415,9 +2478,8 @@ test("native clipboard rejects undrawn/changed geometry and unsupported or faile
         [`\x1b]52;c;${event.encoded}\x07`], `TERM ${label} submits the native request exactly once`);
       await nextTurn();
       const frame = plain(variant.writer.frames.at(-1)?.frame);
-      assert.match(frame, /paste on client to verify/, `TERM ${label} reports an unverified request`);
-      assert.doesNotMatch(frame, /terminal path unsupported|clipboard (set|written|updated|success)|copied to clipboard/i,
-        `TERM ${label} never claims client clipboard success`);
+      assert.doesNotMatch(frame, HOST_CLIPBOARD_STATUS, `TERM ${label} adds no host clipboard status`);
+      assert.equal(variant.sidebar?.terminalDiagnosticsWarning, undefined, `TERM ${label} records no diagnostic`);
     } finally { await closeWithSignal(variant); }
   }
 });

@@ -76,6 +76,7 @@ import {
 import type { TerminalMouseReportingRequest } from "./terminal-surface";
 import type { NativeClipboardEvent } from "./native-clipboard";
 import {
+  HostClipboardDiagnosticCollector,
   TerminalDiagnosticsWarning,
   terminalDiagnosticsHeaderNotice,
   type TerminalDiagnosticEvent,
@@ -686,7 +687,6 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let layout: HostLayout | undefined;
   let displayedMousePresentation: MouseFramePresentation | undefined;
   let latestMousePresentation: MouseFramePresentation | undefined;
-  let clipboardNotice: { id: string; sessionId: string; sessionEpoch: number; text: string } | undefined;
   let savedDeleteConfirmationFrame: SavedDeleteConfirmationFrame | undefined;
   let lastNativeCols: number | undefined;
   let lastNativeRows: number | undefined;
@@ -737,6 +737,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   // private bounded log. Clearing the warning never touches the log.
   const diagnosticsWarning = new TerminalDiagnosticsWarning();
   let diagnosticsLog: TerminalDiagnosticsLogLike | undefined;
+  // Actual native clipboard routing failures (#466) share that sink with
+  // fixed codes only. Native Pi's own Copied feedback is the per-copy status;
+  // the host adds none.
+  const clipboardDiagnostics = new HostClipboardDiagnosticCollector({
+    deliver: (instanceId, event) => handleTerminalDiagnostic(instanceId, event),
+  });
   let finishRun!: (status: number) => void;
   const runFinished = new Promise<number>((resolve) => { finishRun = resolve; });
 
@@ -912,11 +918,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // Title only. Lifecycle, activity and input ownership belong below
         // session-card titles, never on the active conversation's title line.
         const header = view ? view.label : "Session host";
-        const clipboardHeader = clipboardNotice && view?.id === clipboardNotice.id
-          && view.nativeSession?.sessionId === clipboardNotice.sessionId
-          && view.nativeSession.epoch === clipboardNotice.sessionEpoch ? clipboardNotice.text : undefined;
-        const notices = [terminalDiagnosticsHeaderNotice(diagnosticsWarning.view()), clipboardHeader].filter((item): item is string => item !== undefined);
-        const headerNotice = notices.length ? notices.join(" · ") : undefined;
+        const headerNotice = terminalDiagnosticsHeaderNotice(diagnosticsWarning.view());
         const composed = composeHostFrame(currentLayout, {
           main: mainFrame,
           sidebar: sidebarFrame,
@@ -1434,7 +1436,6 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const view = views.find((row) => row.id === id);
     if (!view?.hasLiveProcess || view.lifecycle !== "alive"
       || view.nativeSession?.sessionId !== event.sessionId || view.nativeSession.epoch !== event.sessionEpoch) return;
-    let notice = "Client clipboard request withheld";
     const shown = displayedMousePresentation;
     const latest = latestMousePresentation;
     const ownsVisibleMain = terminal !== undefined && terminalStarted && !shutdownRequested && !externalEditorActive
@@ -1446,25 +1447,30 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       && shown.layout.cols === layout.cols && shown.layout.rows === layout.rows
       && latest.layout.cols === layout.cols && latest.layout.rows === layout.rows
       && samePaneGeometry(shown.layout.native, layout.native) && samePaneGeometry(latest.layout.native, layout.native);
+    // Stale, sibling, hidden, unfocused, covered, form, changed-geometry, and
+    // shutting-down requests are ordinary safety refusals: quiet, fail closed.
+    if (!ownsVisibleMain) return;
     if (event.kind === "unavailable") {
-      notice = event.reason === "unsupported-runtime"
-        ? "Client clipboard unavailable: unsupported native runtime"
-        : "Client clipboard withheld: native copy provenance unavailable";
-    } else if (ownsVisibleMain) {
-      // TERM's label is not evidence of OSC 52 capability, and native Pi has
-      // already produced this user copy request. The started Main owner that
-      // cleared every source, session, focus, display, and geometry check
-      // submits the generated request; a successful write only proves the
-      // request left the host, never that the client clipboard changed.
-      try {
-        terminal!.write(`\x1b]52;c;${event.encoded}\x07`);
-        notice = "Clipboard request sent to terminal; paste on client to verify";
-      } catch {
-        notice = "Client clipboard unavailable: terminal write failed";
-      }
+      // The eligible owner's authenticated child reported a native copy it
+      // could not forward. Native Pi still shows its own feedback; the host
+      // records only a fixed diagnostic code.
+      clipboardDiagnostics.note(id, event.reason === "unsupported-runtime"
+        ? "clipboard-unsupported-runtime"
+        : "clipboard-provenance-unavailable");
+      return;
     }
-    clipboardNotice = { id, sessionId: event.sessionId, sessionEpoch: event.sessionEpoch, text: notice };
-    scheduleRedraw();
+    // TERM's label is not evidence of OSC 52 capability, and native Pi has
+    // already produced this user copy request (and its own Copied feedback).
+    // The started Main owner that cleared every source, session, focus,
+    // display, and geometry check submits the generated request; a successful
+    // write only proves the request left the host, never that the client
+    // clipboard changed, so success adds no host status or diagnostic.
+    try {
+      terminal!.write(`\x1b]52;c;${event.encoded}\x07`);
+    } catch {
+      // Never the exception text, payload, or stack: a fixed code only.
+      clipboardDiagnostics.note(id, "clipboard-terminal-write-failed");
+    }
   }
 
   function routeForward(data: string): void {
@@ -2809,7 +2815,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // Settled rows' surfaces were disposed above (each flushes its pending
       // diagnostics first). Settle the private log's owned IO before
       // reporting; anything an unsettled child emits after this is not
-      // persisted (the log no longer accepts records once closing).
+      // persisted (the log no longer accepts records once closing). Pending
+      // host clipboard routing diagnostics are handed over first, the same way.
+      clipboardDiagnostics.flushNow();
+      clipboardDiagnostics.dispose();
       if (diagnosticsLog) {
         try {
           const closed = await diagnosticsLog.close();

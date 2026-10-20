@@ -18,6 +18,7 @@ import { composeHostFrame, computeHostLayout } from "../src/session-host/composi
 import { createSessionHostFrameWriter } from "../src/session-host/frame-writer";
 import { TerminalSurface, type TerminalFrame } from "../src/session-host/terminal-surface";
 import {
+	HostClipboardDiagnosticCollector,
 	TerminalDiagnosticsWarning,
 	XtermDiagnosticCollector,
 	snapshotParserState,
@@ -213,6 +214,58 @@ test("collector refills slowly, labels suppression, and never throws into the ca
 	collector.dispose();
 	collector.logger.error("Parsing error: ", {});
 	assert.equal(scheduled.length, 0, "nothing is collected after disposal");
+});
+
+test("#466 host clipboard failures use fixed codes under the same deferred rate bound, with no stack or cause", () => {
+	let now = 5_000;
+	const delivered: { instanceId: string; event: TerminalDiagnosticEvent }[] = [];
+	const scheduled: (() => void)[] = [];
+	const collector = new HostClipboardDiagnosticCollector({
+		deliver: (instanceId, event) => { delivered.push({ instanceId, event }); throw new Error("sink failure is contained"); },
+		now: () => now,
+		schedule: (callback) => scheduled.push(callback),
+		burst: 2,
+		refillMs: 1000,
+	});
+	assert.doesNotThrow(() => collector.note("native-1", "clipboard-terminal-write-failed"));
+	collector.note("native-1", "clipboard-provenance-unavailable");
+	collector.note("native-2", "clipboard-unsupported-runtime");
+	collector.note("native-2", "clipboard-unsupported-runtime");
+	// Unknown codes are refused rather than invented.
+	collector.note("native-1", "clipboard-anything" as never);
+	for (const inherited of ["constructor", "toString", "__proto__"]) {
+		collector.note("native-1", inherited as never);
+	}
+	assert.equal(delivered.length, 0, "never delivered synchronously inside the routing call");
+	assert.equal(scheduled.length, 1, "one deferred delivery for the burst");
+	scheduled.splice(0).forEach((run) => run());
+	assert.deepEqual(delivered.map(({ instanceId, event }) => [instanceId, event.records.length, event.suppressed, event.warningCount]), [
+		["native-1", 2, 0, 2],
+		["native-2", 0, 2, 2],
+	], "per-row deliveries; calls beyond the burst are counted, never lost");
+	const records = delivered.flatMap(({ event }) => event.records);
+	assert.deepEqual(records.map((record) => [record.level, record.category, record.messageId]), [
+		["error", "host-clipboard", "clipboard-terminal-write-failed"],
+		["warn", "host-clipboard", "clipboard-provenance-unavailable"],
+	]);
+	for (const record of records) {
+		assert.deepEqual(Object.keys(record).sort(),
+			["category", "level", "messageId", "originatingStack", "suppressedBefore", "time"],
+			"fixed fields only: no payload, stack, parser state, error name, or context");
+		assert.equal(record.originatingStack, "not-captured", "no xterm parser cause or stack is fabricated");
+	}
+	now += 1000;
+	collector.note("native-2", "clipboard-unsupported-runtime");
+	scheduled.splice(0).forEach((run) => run());
+	assert.equal(delivered.at(-1)!.event.records[0]!.suppressedBefore, 2, "the next detailed record carries the suppressed count");
+	collector.note("native-1", "clipboard-terminal-write-failed");
+	collector.flushNow();
+	assert.equal(delivered.at(-1)!.event.warningCount, 1, "flushNow hands over pending work synchronously");
+	collector.dispose();
+	collector.note("native-1", "clipboard-terminal-write-failed");
+	scheduled.splice(0).forEach((run) => run());
+	collector.flushNow();
+	assert.equal(delivered.length, 4, "nothing is collected or delivered after disposal");
 });
 
 test("debug/trace messages and arbitrary arguments are classified without retaining their payload", () => {

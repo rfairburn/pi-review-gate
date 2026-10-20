@@ -40,6 +40,7 @@
  */
 
 import net from "node:net";
+import { updateNativeClipboardSession } from "./native-clipboard";
 import { NativePersistenceTracker, parseNativePersistenceReceipt, readNativePersistence, type NativePersistenceReceipt } from "./native-persistence";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { extractContext, extractToolName, registerHook, type HookHandler } from "../pi";
@@ -1410,6 +1411,7 @@ function createReporter(
     const read = readNativeSession(ctx);
     if (!read) {
       nativeSession = null;
+      updateNativeClipboardSession(undefined);
       if (emitUpdate) emit();
       return undefined;
     }
@@ -1425,6 +1427,7 @@ function createReporter(
       ...(read.currentFile === undefined ? {} : { currentFile: read.currentFile }),
     };
     if (sessionEpoch < 1) sessionEpoch = nativeSession.epoch;
+    updateNativeClipboardSession({ sessionId: nativeSession.sessionId, sessionEpoch: nativeSession.epoch });
     writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, nativePersistence: nativePersistenceTracker.snapshot(), shutdownRequested, teardown });
     if (emitUpdate) emit();
     return read;
@@ -2215,6 +2218,7 @@ function createReporter(
     sessionEpoch += 1; // Every native session_start/reload invalidates older host commands.
     nativeSessionId = undefined;
     nativeSession = null;
+    updateNativeClipboardSession(undefined);
     active = true;
     busy = null;
     // The decorator only observes future setWidget calls and nothing queries
@@ -2256,6 +2260,7 @@ function createReporter(
     active = false;
     currentContext = undefined;
     nativeSession = null;
+    updateNativeClipboardSession(undefined);
     restoreObserver();
     teardownSocket();
     busy = null;
@@ -2355,6 +2360,7 @@ function createReporter(
     const ctx = contextModeIsTui(eventContext) ? eventContext : currentContext;
     if (!contextModeIsTui(ctx)) {
       nativeSession = null;
+      updateNativeClipboardSession(undefined);
       emit();
       return;
     }

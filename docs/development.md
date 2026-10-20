@@ -252,6 +252,43 @@ separately covers the session-host authority this relies on: only an initial lef
 press above a pane can activate a row, so stray drag or release packets outside
 the popup cannot switch sessions or trigger a deliberate action.
 
+### Native SSH clipboard routing (#466)
+
+After `npm run build:test`, the focused controls are:
+
+```sh
+node --test dist-test/tests/session-host-native-clipboard.test.js \
+  dist-test/tests/session-host-native-clipboard-routing.test.js \
+  dist-test/tests/session-host-terminal.test.js \
+  dist-test/tests/session-host-input.test.js \
+  dist-test/tests/session-host-main.test.js \
+  dist-test/tests/session-host-terminal-diagnostics.test.js \
+  dist-test/tests/session-host-terminal-diagnostics-log.test.js \
+  dist-test/tests/session-host-reporter.test.js \
+  dist-test/tests/user-question-mouse-host.test.js
+```
+
+The native routing test uses the installed package's declared **bundled** Pi 1.3.0 CLI
+on owned POSIX PTYs and an inactive scratch build. Native OS clipboard-module loading
+is blocked in the child; all clipboard commands resolve to owned recording helpers.
+No user's clipboard or private session is read/written. It compares the exact native
+Unicode/multiline encoded selection with authenticated host consumption, retains the
+local-helper-only control, exercises configured explicit copy and reload, and challenges
+raw/render-path OSC 52 decoys. A real public `runSessionHost` process inside an owned
+outer PTY covers native Main and foreground question/notice input through actual
+`ProcessTerminal` clipboard output and normal host shutdown/restoration. Codec and host
+controls separately cover replay, identity/epoch, geometry/focus, unsupported requests,
+and raw-terminal filtering. Main controls also assert that neither a successful copy
+nor an ordinary refusal adds a host clipboard status, and that actual eligible-owner
+failures persist through the existing Terminal diagnostics log with fixed
+`host-clipboard` codes and no payload, stack, exception text, or path. The source observer never patches Pi or reads private
+selection fields; unavailable runtime provenance fails closed.
+
+These are process/protocol controls, not proof of physical clipboard delivery or the
+reported SSH host's exact environment. Use the
+[isolated manual comparison](session-host-alpha.md#isolated-manual-ssh-clipboard-comparison)
+for same-terminal standalone/hosted copying and an actual paste **on the client**.
+
 ## Static checks and docs validation
 
 `npm run check:static` runs `tsc --noEmit`, `shellcheck scripts/*.sh`, and

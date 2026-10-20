@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.187]
+
+### Fixed
+
+- The sidebar preserves native Pi SSH clipboard requests instead of discarding their
+  OSC 52 transport while still displaying **Copied!** (#466). Verified native copy
+  producers use an authenticated, session- and foreground-owner-fenced host route;
+  arbitrary raw/rendered PTY controls remain blocked. Pi's native selection, visible
+  question/notice copying, copy-on-select, configured copy shortcut, and local helper
+  remain unchanged; Pi itself is not patched. The provenance adapter is bounded to
+  the verified Pi 1.3.0 runtime and fails closed when provenance is unavailable. Copy
+  feedback stays native: Pi's **Copied!** flash is unchanged and the host adds no
+  per-copy notice. Ordinary safety refusals stay quiet; actual routing failures for
+  the displayed Main owner (unsupported runtime, unavailable provenance, or a failed
+  terminal write) are recorded through the existing Terminal diagnostics warning and
+  private log with fixed codes only, never clipboard text, stacks, exception messages,
+  or paths. A submitted request is not proof of client clipboard delivery; existing
+  terminal/multiplexer permissions and native size limits still apply.
+  Operator-driven isolated standalone/hosted client-paste checks are documented.
+
 ## [0.1.0-dev.186]
 
 ### Fixed

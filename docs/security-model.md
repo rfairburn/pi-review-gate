@@ -107,6 +107,29 @@ native-platform validation. This IPC support does not establish Windows host par
 delivery readiness, security equivalence with the POSIX filesystem boundary, or a
 private Windows ACL guarantee.
 
+### Session-host clipboard transport
+
+Raw child OSC 52 is still default-denied. On the verified Pi 1.3.0 runtime, the owned
+Node stdio adapter distinguishes native clipboard-producer/copy-surface provenance
+from arbitrary rendered or PTY output, without changing Pi's selection or copy
+callbacks. Input delivery captures the reporter's current native session tuple; an
+asynchronous request from a replaced session cannot acquire the new session's identity.
+A bounded, HMAC-authenticated private terminal capsule carries the existing native
+encoded text, child/generation identity, native session epoch, and a monotonic sequence.
+It is neither a status snapshot nor raw control passthrough. Authentication, replay
+rejection, exact current tuple, owned-process lifetime, and the host's actually displayed
+Main input owner all gate the generated outer-terminal request. Missing/changed source
+provenance fails closed. This is an application integration fence, not a sandbox against
+trusted executable extensions with the user's process authority.
+
+The selected text is transient transport data, not a new diagnostic, roster, or clipboard
+history. Source stacks are inspected in memory and not logged. HMAC authenticates but
+does not encrypt the payload. Ordinary native local-helper copying and downstream
+terminal/multiplexer permissions are unchanged. Sending a request cannot attest to the
+client OS clipboard; the host says to paste on the client to verify. No clipboard read,
+paste, bidirectional synchronization, image transfer, or new network service is added.
+See [Session-host clipboard copying](session-host-alpha.md#clipboard-copying-over-ssh).
+
 ### Session-host global roster and single-host ownership
 
 The optional `pi-review-sessions` host stores one ordered sidebar roster and one

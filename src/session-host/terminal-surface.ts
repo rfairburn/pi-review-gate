@@ -29,7 +29,12 @@
  *   bounded (cap 32 per buffer, newest push retained via FIFO eviction) and
  *   whenever pops empty the stack, ALL flags reset to zero, per protocol.
  * - Window operations (CSI t), OSC 52 clipboard writes, and title setting
- *   are swallowed (default deny). A narrow native Kitty PNG subset is split
+ *   are swallowed (default deny). The only clipboard route is the host-owned
+ *   native capsule OSC (`NATIVE_CLIPBOARD_OSC`, #466): its opaque payload is
+ *   handed verbatim to `onNativeClipboardCapsule` and is never rendered,
+ *   logged, forwarded, or turned into a clipboard action by this class — the
+ *   owner's authenticated receiver decides. Unrelated OSC numbers keep the
+ *   parser's default deny. A narrow native Kitty PNG subset is split
  *   before VT parsing, validated, and exposed only as typed image/placement
  *   and native-style fallback metadata; there is no renderer or host notice,
  *   and unsupported graphics commands are swallowed rather than forwarded.
@@ -101,6 +106,7 @@ import {
 	createTerminalGraphicsBudget,
 } from "./kitty-graphics";
 import { XtermDiagnosticCollector, type TerminalDiagnosticEvent } from "./terminal-diagnostics";
+import { NATIVE_CLIPBOARD_OSC } from "./native-clipboard";
 
 /** A cell color as recorded by headless: default, 256-palette index, or RGB. */
 export interface TerminalColorSpec {
@@ -224,6 +230,15 @@ export interface TerminalSurfaceOptions {
 	 * per-terminal logger and are outside this path.
 	 */
 	readonly onDiagnostic?: (event: TerminalDiagnosticEvent) => void;
+	/**
+	 * Called with the opaque payload of one parsed native clipboard capsule
+	 * (#466) — the host-authenticated route by which Pi's own copy request can
+	 * reach the outer terminal. This class never interprets, renders, logs,
+	 * stores, or forwards the capsule: the owner's receiver authenticates it and
+	 * decides. A bad callback (throw) is contained like every other peer
+	 * callback; the payload stays out of frame text either way.
+	 */
+	readonly onNativeClipboardCapsule?: (capsule: string) => void;
 	/** Optional budget shared by the host's surfaces; omitted means private. */
 	readonly graphicsBudget?: TerminalGraphicsBudget;
 	/** Bounded named scrollback lines (default 1000). */
@@ -765,10 +780,23 @@ export class TerminalSurface {
 		// commands, or other CSI t traffic is interpreted or exported.
 		this.attach(this.terminal.parser.registerCsiHandler({ final: "t" }, () => true));
 
-		// OSC 52 clipboard writes are swallowed and never exported; native
-		// clipboard / app-input support is a separate Pi native concern, not
-		// disabled by this class's text-only snapshots.
+		// Raw OSC 52 remains denied, including from an active child's output.
+		// Native Pi's client-bound copy previously disappeared here along with
+		// untrusted controls. Only the authenticated native-producer capsule
+		// below can now reach the owner's separate clipboard route; reconstructed
+		// screen text and arbitrary PTY bytes grant no clipboard authority.
 		this.attach(this.terminal.parser.registerOscHandler(52, () => true));
+		// The host's private capsule OSC (#466) is always claimed, so a capsule —
+		// verified or not — can never fall through to the parser's default OSC
+		// handling (icon/title side effects, diagnostics) or reach frame text.
+		// The payload is passed through verbatim to the owner's receiver and is
+		// never used, copied into a frame, or reported by this class.
+		this.attach(this.terminal.parser.registerOscHandler(NATIVE_CLIPBOARD_OSC, (data) => {
+			if (!this.disposed) {
+				this.safePeerInvoke(() => this.options.onNativeClipboardCapsule?.(data));
+			}
+			return true;
+		}));
 	}
 
 	/** Queues a raw chunk of child output for parsing. Throws on limit overrun. */

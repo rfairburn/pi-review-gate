@@ -13,6 +13,7 @@ import {
 import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "./kitty-graphics";
 import { TerminalSurface } from "./terminal-surface";
 import type { TerminalDiagnosticEvent } from "./terminal-diagnostics";
+import { createNativeClipboardReceiver, type NativeClipboardEvent } from "./native-clipboard";
 import {
 	hasCompleteSessionIdle,
 	MAX_SESSION_SPAWN_TITLE_BYTES,
@@ -96,6 +97,13 @@ import {
  *   arguments, no config contents, no tokens, and no provider environment
  *   values; the bootstrap token is redacted even if it somehow surfaced in
  *   an upstream message.
+ * - The native clipboard capsule route (#466) is per row and strictly fenced:
+ *   each row's receiver is created only from that row's own authenticated
+ *   registration bootstrap, and a verified event is forwarded to the host only
+ *   for the exact current row whose registration, owned live process, and
+ *   current native conversation tuple still match. A released registration, an
+ *   exited or stopped row, a replaced row, a sibling's capsule, and every
+ *   capsule payload itself never reach the host callback, a log, or a frame.
  * - Deliberate saved-conversation creation (issue 323) accepts a branded
  *   SavedSessionAdmission, reserves its session id/exact file synchronously
  *   before any await so concurrent deliberate opens cannot spawn duplicates,
@@ -328,6 +336,13 @@ export interface InstanceManagerOptions {
 	 * its parse step. Payload-free of child bytes; exceptions are contained.
 	 */
 	onTerminalDiagnostic?: (instanceId: string, event: TerminalDiagnosticEvent) => void;
+	/**
+	 * Host routing for one verified native clipboard request observed on a row
+	 * (#466). The manager forwards only the exact current row's live, unstopped
+	 * request whose native conversation tuple still matches; the capsule and its
+	 * encoded payload are never logged, rendered, or retained by this module.
+	 */
+	onNativeClipboard?: (instanceId: string, event: NativeClipboardEvent) => void;
 	/** Host-owned routing for reporter requests; the parent id is supplied by the manager, never by model input. */
 	onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	/** Current hypothetical-visible sidebar title width; captured per row as advisory presentation metadata. */
@@ -696,6 +711,7 @@ export class InstanceManager {
 	readonly #graphicsBudget: TerminalGraphicsBudget;
 	readonly #onChange?: (instanceId: string) => void;
 	readonly #onTerminalDiagnostic?: (instanceId: string, event: TerminalDiagnosticEvent) => void;
+	readonly #onNativeClipboard?: (instanceId: string, event: NativeClipboardEvent) => void;
 	readonly #onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	readonly #getSidebarTitleColumns?: () => number;
 	readonly #ptyFactory: PtyFactory;
@@ -740,6 +756,7 @@ export class InstanceManager {
 		this.#graphicsBudget = options.graphicsBudget ?? createTerminalGraphicsBudget();
 		this.#onChange = options.onChange;
 		this.#onTerminalDiagnostic = options.onTerminalDiagnostic;
+		this.#onNativeClipboard = options.onNativeClipboard;
 		this.#onSpawnRequest = options.onSpawnRequest;
 		this.#getSidebarTitleColumns = options.getSidebarTitleColumns;
 		this.#ptyFactory = options.ptyFactory ?? createDefaultPtyFactory();
@@ -1397,6 +1414,11 @@ export class InstanceManager {
 			registration.current = handle;
 			record.registration = handle;
 			record.registrationReleased = false;
+			// The native clipboard receiver (#466) exists only after this row's own
+			// registration actually exists, is built from that registration's own
+			// bootstrap, and is bound to this exact row/registration pair. A row
+			// never receives another row's receiver or capsule.
+			const nativeClipboardCapsule = this.#nativeClipboardCapsuleHandler(record, handle);
 
 			// 4. Synchronous spawn stretch: nothing yields until handlers and
 			// the terminal surface are attached, so ownership is recorded
@@ -1444,6 +1466,7 @@ export class InstanceManager {
 					onChange: () => this.#safeChanged(record.id),
 					onBackpressure: (paused) => this.#onBackpressure(record, paused),
 					onDiagnostic: (event) => this.#safeTerminalDiagnostic(record.id, event),
+					onNativeClipboardCapsule: nativeClipboardCapsule,
 					getSupportedKeyboardFlags: this.#getSupportedKeyboardFlags,
 					graphicsBudget: this.#graphicsBudget,
 				});
@@ -2096,6 +2119,76 @@ export class InstanceManager {
 			forcedIds: outcomes.filter((outcome) => outcome.forced).map((outcome) => outcome.id),
 			remainingIds: targets.filter((record) => record.pty && !record.ptyExited).map((record) => record.id),
 		};
+	}
+
+	/**
+	 * Build this row's capsule handler from this row's own registration
+	 * bootstrap (#466). Absent a host callback no receiver exists at all, so a
+	 * row keeps its previous behavior of swallowing the capsule OSC entirely.
+	 */
+	#nativeClipboardCapsuleHandler(
+		record: ManagedInstance,
+		registration: InstanceStatusRegistration,
+	): ((capsule: string) => void) | undefined {
+		if (this.#onNativeClipboard === undefined) {
+			return undefined;
+		}
+		let receiver: (capsule: string) => void;
+		try {
+			receiver = createNativeClipboardReceiver(registration.bootstrap, (event) => {
+				this.#forwardNativeClipboard(record, registration, event);
+			});
+		} catch {
+			// No receiver means no clipboard route for this row; the row itself is
+			// untouched and its capsule OSCs stay denied.
+			return undefined;
+		}
+		return (capsule) => {
+			try {
+				receiver(capsule);
+			} catch {
+				// Verification stays contained: nothing escapes into xterm's parser,
+				// and an unverified capsule never becomes an event.
+			}
+		};
+	}
+
+	/**
+	 * Strict source fence for one verified event: only the row still living in
+	 * the map under this id, still holding this exact unreleased registration,
+	 * still owning a live unstopped child, and still reporting the same current
+	 * native conversation tuple may route a clipboard request. Everything else
+	 * is dropped silently — never retried on a sibling, never logged, and never
+	 * turned into a host-side result by this module.
+	 */
+	#forwardNativeClipboard(
+		record: ManagedInstance,
+		registration: InstanceStatusRegistration,
+		event: NativeClipboardEvent,
+	): void {
+		const forward = this.#onNativeClipboard;
+		if (forward === undefined) {
+			return;
+		}
+		if (this.#disposed || this.#stopping
+			|| this.#records.get(record.id) !== record
+			|| record.registration !== registration || record.registrationReleased
+			|| record.pty === undefined || record.ptyExited
+			|| record.lifecycle !== "alive" || record.stopAdmissionClosed) {
+			return;
+		}
+		const nativeSession = record.nativeSession;
+		if (nativeSession === null
+			|| nativeSession.sessionId !== event.sessionId
+			|| nativeSession.epoch !== event.sessionEpoch) {
+			return;
+		}
+		try {
+			forward(record.id, event);
+		} catch {
+			// The host's clipboard route is best effort; a refusal cannot break a
+			// row or escape into the parser.
+		}
 	}
 
 	/** Forward one surface's bounded diagnostics; delivery failures stay contained. */

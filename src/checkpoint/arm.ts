@@ -354,13 +354,22 @@ export async function armGitCheckpoint(
       const paths = await listUntrackedPaths(gitPath, repo.root, spec);
       await options.faultHooks?.afterUntrackedList?.();
       untracked = [];
+      const maxUntrackedBytes = options.maxUntrackedBytes ?? DEFAULT_MAX_UNTRACKED_BYTES;
       let totalBytes = 0;
       for (const path of paths) {
         throwIfAborted(spec.signal);
-        const entry = await captureUntrackedEntry(repo.root, path, options.faultHooks?.beforeUntrackedRead);
+        // #462: pass the remaining aggregate budget so an entry that cannot
+        // fit is refused as untracked_too_large from its opened size, before
+        // its buffer is allocated or any of its bytes are read.
+        const entry = await captureUntrackedEntry(
+          repo.root,
+          path,
+          options.faultHooks?.beforeUntrackedRead,
+          maxUntrackedBytes - totalBytes,
+        );
         if (entry.kind === "file" && entry.contentB64 !== undefined) {
           totalBytes += Buffer.byteLength(entry.contentB64, "base64");
-          if (totalBytes > (options.maxUntrackedBytes ?? DEFAULT_MAX_UNTRACKED_BYTES)) {
+          if (totalBytes > maxUntrackedBytes) {
             throw new GitCheckpointError("captured untracked bytes exceeded the cap", "untracked_too_large");
           }
         }

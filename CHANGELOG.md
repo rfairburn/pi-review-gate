@@ -15,6 +15,27 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.185]
+
+### Fixed
+
+- Git checkpoint capture now enforces the untracked byte budget before reading an
+  untracked file (#462). The arm passes the budget still remaining to the existing
+  per-file size check, so a single oversized file, or a file that no longer fits after
+  earlier entries, is refused from its opened size with the typed `untracked_too_large`
+  failure before its buffer is allocated or any of its bytes are read. Previously the
+  arm checked the aggregate only after reading the whole file. Each native read is now
+  a bounded 8 MiB chunk instead of the whole remaining file; partial reads still
+  resume at the exact offset. This source gap is platform-neutral. The limits, the
+  exact/empty/below-limit behavior, no-follow and identity race checks, and cleanup are
+  unchanged. With `review.evidence.snapshotFailureFallback` On and owned cleanup
+  confirmed, the failure still takes the warned Tools only (snapshot-failure fallback)
+  review. With it Off, the failure still blocks. Cancellation, races, and unconfirmed
+  cleanup stay ineligible. The original report was a native Node filesystem assertion
+  on Linux with Node 24.19.0. Its exact trigger, file size, and installed revision were
+  not established, and that abort was not reproduced. Regressions use small and sparse
+  owned fixtures.
+
 ## [0.1.0-dev.184]
 
 ### Changed

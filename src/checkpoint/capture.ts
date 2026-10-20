@@ -171,6 +171,15 @@ export async function snapshotLiveIndexTree(
   }
 }
 
+/**
+ * Largest single read request for an untracked file (#462). Every request is
+ * bounded by this chunk rather than the whole remaining file, keeping each
+ * native read length far below the 32-bit length limit of Node's read
+ * binding regardless of file size or the configured capture cap. Partial reads
+ * simply advance the offset; the total still has to equal the opened size.
+ */
+export const UNTRACKED_READ_CHUNK_BYTES = 8 * 1024 * 1024;
+
 /** Non-ignored untracked paths (files, symlinks, and special entries). */
 export async function listUntrackedPaths(gitPath: string, root: string, spec: GitRunSpec): Promise<string[]> {
   let out: GitRunOutput;
@@ -304,8 +313,8 @@ export async function captureUntrackedEntry(
       throw new GitCheckpointError(`untracked path ${path} changed while being captured`, "untracked_capture_race");
     }
     await assertUntrackedParents(root, path, parents);
-    // Fail before allocating: a single file over the cap can never fit in
-    // the bounded capture budget.
+    // Fail before allocating or reading: a file larger than the budget the
+    // caller still has available can never fit in the bounded capture.
     if (maxFileBytes !== undefined && stat.size > maxFileBytes) {
       throw new GitCheckpointError(
         `untracked path ${path} is ${stat.size} bytes, exceeding the ${maxFileBytes}-byte cap`,
@@ -315,7 +324,8 @@ export async function captureUntrackedEntry(
     bytes = Buffer.alloc(stat.size);
     let offset = 0;
     while (offset < stat.size) {
-      const { bytesRead } = await handle.read(bytes, offset, stat.size - offset, offset).catch((error): never => {
+      const length = Math.min(UNTRACKED_READ_CHUNK_BYTES, stat.size - offset);
+      const { bytesRead } = await handle.read(bytes, offset, length, offset).catch((error): never => {
         throw untrackedEvidenceAcquisitionError(path, error, "could not read");
       });
       if (bytesRead === 0) break;

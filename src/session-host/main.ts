@@ -74,6 +74,7 @@ import {
   type SidebarMousePresentation,
 } from "./sidebar";
 import type { TerminalMouseReportingRequest } from "./terminal-surface";
+import type { NativeClipboardEvent } from "./native-clipboard";
 import {
   TerminalDiagnosticsWarning,
   terminalDiagnosticsHeaderNotice,
@@ -685,6 +686,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let layout: HostLayout | undefined;
   let displayedMousePresentation: MouseFramePresentation | undefined;
   let latestMousePresentation: MouseFramePresentation | undefined;
+  let clipboardNotice: { id: string; sessionId: string; sessionEpoch: number; text: string } | undefined;
   let savedDeleteConfirmationFrame: SavedDeleteConfirmationFrame | undefined;
   let lastNativeCols: number | undefined;
   let lastNativeRows: number | undefined;
@@ -910,7 +912,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // Title only. Lifecycle, activity and input ownership belong below
         // session-card titles, never on the active conversation's title line.
         const header = view ? view.label : "Session host";
-        const headerNotice = terminalDiagnosticsHeaderNotice(diagnosticsWarning.view());
+        const clipboardHeader = clipboardNotice && view?.id === clipboardNotice.id
+          && view.nativeSession?.sessionId === clipboardNotice.sessionId
+          && view.nativeSession.epoch === clipboardNotice.sessionEpoch ? clipboardNotice.text : undefined;
+        const notices = [terminalDiagnosticsHeaderNotice(diagnosticsWarning.view()), clipboardHeader].filter((item): item is string => item !== undefined);
+        const headerNotice = notices.length ? notices.join(" · ") : undefined;
         const composed = composeHostFrame(currentLayout, {
           main: mainFrame,
           sidebar: sidebarFrame,
@@ -1422,6 +1428,43 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     } catch {
       requestShutdown(true);
     }
+  }
+
+  function routeNativeClipboard(id: string, event: NativeClipboardEvent): void {
+    const view = views.find((row) => row.id === id);
+    if (!view?.hasLiveProcess || view.lifecycle !== "alive"
+      || view.nativeSession?.sessionId !== event.sessionId || view.nativeSession.epoch !== event.sessionEpoch) return;
+    let notice = "Client clipboard request withheld";
+    const shown = displayedMousePresentation;
+    const latest = latestMousePresentation;
+    const ownsVisibleMain = terminal !== undefined && terminalStarted && !shutdownRequested && !externalEditorActive
+      && sidebar?.focus === "main" && activeId === id && layout !== undefined
+      && layout.form === undefined && !layout.sidebarOverlay
+      && shown?.focus === "main" && latest?.focus === "main"
+      && shown.nativeOwnerId === id && latest.nativeOwnerId === id
+      && shown.layout.form === undefined && !shown.layout.sidebarOverlay
+      && shown.layout.cols === layout.cols && shown.layout.rows === layout.rows
+      && latest.layout.cols === layout.cols && latest.layout.rows === layout.rows
+      && samePaneGeometry(shown.layout.native, layout.native) && samePaneGeometry(latest.layout.native, layout.native);
+    if (event.kind === "unavailable") {
+      notice = event.reason === "unsupported-runtime"
+        ? "Client clipboard unavailable: unsupported native runtime"
+        : "Client clipboard withheld: native copy provenance unavailable";
+    } else if (ownsVisibleMain) {
+      // TERM's label is not evidence of OSC 52 capability, and native Pi has
+      // already produced this user copy request. The started Main owner that
+      // cleared every source, session, focus, display, and geometry check
+      // submits the generated request; a successful write only proves the
+      // request left the host, never that the client clipboard changed.
+      try {
+        terminal!.write(`\x1b]52;c;${event.encoded}\x07`);
+        notice = "Clipboard request sent to terminal; paste on client to verify";
+      } catch {
+        notice = "Client clipboard unavailable: terminal write failed";
+      }
+    }
+    clipboardNotice = { id, sessionId: event.sessionId, sessionEpoch: event.sessionEpoch, text: notice };
+    scheduleRedraw();
   }
 
   function routeForward(data: string): void {
@@ -3039,6 +3082,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       getSupportedKeyboardFlags: () => terminal?.kittyProtocolActive ? observedFlags & 7 : 0,
       onChange: (id) => noteManagerChanged(id),
       onTerminalDiagnostic: (id, event) => handleTerminalDiagnostic(id, event),
+      onNativeClipboard: routeNativeClipboard,
       onSpawnRequest: handleSessionSpawn,
       getSidebarTitleColumns: sidebarTitleColumnsSnapshot,
     });

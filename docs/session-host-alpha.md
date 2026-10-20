@@ -766,6 +766,137 @@ handles native Pi's Kitty PNG image commands for a directly attached Ghostty Mai
 pane. This is a display feature only: native image input, model processing, and
 ordinary standalone launchers are unchanged.
 
+### Clipboard copying over SSH
+
+Native Pi already sends SSH clipboard copies to the connecting terminal with OSC 52.
+The sidebar previously discarded that request while still displaying Pi's ordinary
+**Copied!** flash; a successful clipboard helper on the remote machine did not mean
+the connecting client's clipboard changed.
+
+The host now transports verified native copy requests separately from reconstructed
+screen text. Pi remains the only selection and clipboard producer: native Main,
+visible question/notice selections, copy-on-select, the configured application copy
+shortcut, and the original local clipboard helper remain native. Nothing patches Pi,
+changes its settings, or adds a second selection engine. Raw PTY OSC 52 remains denied.
+The owned child observes the native producer's runtime/call-stack provenance through
+Node's stdio boundary, then authenticates a bounded request with its existing
+per-child capability. The host checks the current session epoch and live, actually
+displayed Main input owner before generating its own outer-terminal OSC 52 command.
+Stale, hidden, covered, sibling, or shutting-down owners cannot write the client
+clipboard. Ordinary local helper-only copying is unchanged.
+
+This provenance adapter is verified against the bundled **Pi 1.3.0** runtime. A changed
+runtime or unavailable native provenance fails closed rather than admitting arbitrary
+output; the host reports a withheld/unavailable request. This is not a sandbox against
+trusted executable extensions running with the user's operating-system authority.
+No clipboard text or source stack is added to status/diagnostic logs. Clipboard
+payloads are transient authenticated transport, not encrypted storage or a sync service.
+
+**Clipboard request sent to terminal; paste on client to verify** means exactly that:
+bytes were submitted, not that Ghostty or another terminal acknowledged an OS clipboard
+write. Existing terminal permissions, multiplexers, and native size limits still apply
+(Pi 1.3.0 bounds the encoded OSC 52 payload to 100,000 characters). No terminal/SSH
+configuration or multiplexer passthrough is forced. A terminal or multiplexer that
+disables/does not implement clipboard writes may discard the request. There is no
+clipboard read, paste, synchronization, image transfer, or remote-host backend here.
+
+#### Isolated manual SSH clipboard comparison
+
+Run these source-checkout steps **on the SSH host**, from the checkout root, in the same
+client terminal for both controls. Set `PI_AGENT` to the installed Pi 1.3.0 package
+directory, not its launcher shim. This creates a disposable home, agent directory,
+workspaces, and an inactive candidate build; it does not use the live roster,
+credentials, or installation. Dependencies must already be installed in the checkout:
+the prepared candidate links to the checkout's own `node_modules` and `scripts`, so no
+`NODE_PATH` or global module fallback is needed. The fixture uses a scripted local faux
+provider, never an external model or API key, and never copies automatically.
+
+Every Node command below, including preparation and the compiler, runs through
+`clipboard_proof`, a subshell-scoped wrapper for this POSIX-only proof. It removes
+inherited `PI_REVIEW_GATE_*`, `PRG_FIXTURE_*`, and `PIP_*` variables plus
+`NODE_OPTIONS`, `NODE_PATH`, `PI_CODING_AGENT_SESSION_DIR`, and `XDG_CACHE_HOME`, then
+sets the disposable `HOME` and `PI_CODING_AGENT_DIR`, the fixture's provider values, and
+`PIP_CONFIG_FILE=/dev/null` (which makes pip skip every configuration file). An
+inherited review-gate config, scheduler, DDGS environment, or cache location therefore
+cannot retarget the proof at live configuration or a live DDGS environment, and ambient
+pip target, prefix, index, or configuration settings cannot redirect the disposable DDGS
+install. `PATH`, `TERM`, SSH and multiplexer markers, and the native clipboard
+environment pass through unchanged, so standalone and hosted runs see the same
+terminal. The calling shell's environment is not changed. If any removal or assignment
+fails (for example, a read-only `HOME` or `NODE_OPTIONS`), the wrapper exits nonzero
+before running the command; start a fresh shell without that setting rather than
+retrying without the wrapper. This isolates the proof harness only; it is not a product setting.
+
+The hosted control (step 3) prepares its own generation under the disposable agent
+directory and provisions DDGS under the disposable home's cache: it runs a locked
+`npm ci` against the public npm registry, then creates a virtual environment and
+downloads the pinned DDGS wheel from the default Python package index. That requires
+network access to both registries and Python 3.9 or newer with its `venv` module (some
+distributions package it separately, for example `python3-venv`). A failure there is a
+setup prerequisite, not a clipboard result.
+
+```sh
+PI_AGENT=/absolute/path/to/pi-coding-agent
+PI_CLI="$PI_AGENT/dist/bundle/cli.js"
+checkout="$(pwd)"
+fixture="$checkout/tests/fixtures/pi-host-clipboard-proof.cjs"
+proof=$(mktemp -d "${TMPDIR:-/tmp}/pi-host-clipboard-proof.XXXXXX")
+clipboard_proof() (
+  for name in $(env | sed -n -E 's/^((PI_REVIEW_GATE|PRG_FIXTURE|PIP)_[A-Za-z0-9_]*)=.*/\1/p'); do
+    unset "$name" || exit 1
+  done
+  unset NODE_OPTIONS NODE_PATH PI_CODING_AGENT_SESSION_DIR XDG_CACHE_HOME || exit 1
+  export HOME="$proof/home" PI_CODING_AGENT_DIR="$proof/agent" PIP_CONFIG_FILE=/dev/null \
+    PRG_FIXTURE_AGENT_DIR="$PI_AGENT" PRG_FIXTURE_STATE_DIR="$proof/provider" || exit 1
+  exec "$@"
+)
+clipboard_proof node "$fixture" --prepare "$proof"
+clipboard_proof node node_modules/typescript/bin/tsc -p tsconfig.json \
+  --outDir "$proof/candidate/dist"
+clipboard_proof node "$PI_CLI" --offline --no-context-files --no-skills --no-extensions \
+  --extension "$proof/candidate/dist/src/index.js" --extension "$fixture" \
+  --provider prg-native-question --model driven --tui-mode fullscreen
+```
+
+1. Record the client terminal/version, host OS/Node/Pi versions, terminal size, and
+   whether tmux/screen is present. Run `/clipboard-proof`, drag across the distinctive
+   Unicode/multiline text, release, and **paste on the client into a controlled local
+   text target**. Inspect the actual destination and exact content. This is the
+   standalone positive control; do not proceed as though it passed when it did not.
+2. Run `/clipboard-proof-popups`. Open the shared list with Ctrl+Alt+Up and inspect
+   both the synthetic question and notice. Copy visible body text, not a menu action,
+   and paste on the client. Close standalone Pi normally before the hosted control.
+3. Start the candidate from the same terminal/environment:
+
+   ```sh
+   clipboard_proof node scripts/pi-review-sessions.cjs --pi-executable "$PI_CLI" \
+     --sidebar-key f8 -- --offline --no-context-files --no-skills --no-extensions \
+     --extension "$fixture" --provider prg-native-question --model driven \
+     --tui-mode fullscreen
+   ```
+
+   Use New session to select `$proof/a`. Repeat both commands and client-side pastes.
+   The selected text must match standalone, including Unicode and line breaks. The
+   host's terminal-request notice alone is not success evidence.
+4. Create a sibling in `$proof/b`; switch focus, show/hide the sidebar, and open/cancel
+   a host form. Copy only from the visible foreground owner. No old/sibling selection
+   may overwrite the client clipboard, and ordinary typing/mouse behavior must remain.
+5. Quit normally. In **only the disposable agent's** `settings.json`, change
+   `fullscreenCopyOnSelect` to `false`. Repeat standalone/hosted: releasing a selection
+   must not copy; Pi's configured copy shortcut (Ctrl+X by default) must copy the live
+   selection. Select background text before opening a popup: the popup must clear that
+   inherited selection and never copy hidden conversation rows. Repeat with a shortcut
+   remap in only the disposable `keybindings.json` if needed.
+6. Repeat the local, non-SSH control in a fresh disposable context: a new proof
+   directory, prepared and run through the same wrapper. Keep existing
+   terminal/multiplexer permissions unchanged; where clipboard writes are disabled,
+   verify the limitation rather than treating helper success or emitted bytes as a
+   client-side paste result. Confirm normal terminal restoration and owned-child exit.
+
+Keep fixtures for inspection if shutdown is uncertain. Do not delete unknown files,
+kill other sessions, modify the active runtime, or change terminal security to obtain a
+passing result. Synthetic PTY tests do not replace these operator-driven paste checks.
+
 ### Inline images and compatibility
 
 Ghostty is the concrete image-display target, not a blanket terminal-graphics

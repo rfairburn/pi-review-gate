@@ -10,7 +10,9 @@
  * — so user fixtures and all descendants see a clean environment: no extra
  * preload, no status secret.
  *
- * Preload-only by design: no socket, hook registration, or UI setup — only
+ * No socket or UI setup. A valid top-level bootstrap also installs owned Node
+ * stdio adapters for authenticated native clipboard transport (bounded CLI package
+ * metadata inspection, no clipboard access). Otherwise this performs only
  * environment restoration, sticky priming, and (for a valid consumed
  * authenticated bootstrap, in a non-executor runtime) opting this process
  * into the pure in-memory owned-activity registry before native main and
@@ -29,6 +31,7 @@
 import { realpathSync } from "node:fs";
 
 import { activateOwnedActivity } from "./owned-activity";
+import { installNativeClipboardBridge } from "./native-clipboard";
 import { primeReporterBootstrap } from "./reporter";
 import { primeSessionHostStartupMetadata } from "./startup-request";
 
@@ -191,6 +194,11 @@ primeSessionHostStartupMetadata(
 // registry is itself exception-safe and performs no IO; this guard only keeps
 // any unexpected opt-in failure from affecting native startup.
 if (primed !== undefined && process.env.PI_REVIEW_GATE_RUNTIME_ROLE !== "executor") {
+  try {
+    installNativeClipboardBridge(primed);
+  } catch {
+    // Unsupported provenance never opens raw OSC forwarding or changes native copying.
+  }
   try {
     activateOwnedActivity();
   } catch {

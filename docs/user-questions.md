@@ -98,7 +98,11 @@ focus; opening the popup clears a selection made before it opened, so the copy
 key reads only selections made over the visible popup. Selections starting
 outside the popup, and all mouse handling in regular mode, are unchanged.
 A parent Main sidebar is outside the child conversation viewport and is not
-covered by this overlay. The complete notice body
+covered by this overlay. For SSH use through the sidebar, the host forwards verified
+native copy requests to the connecting terminal without adding popup selection state;
+see [SSH clipboard copying](session-host-alpha.md#clipboard-copying-over-ssh).
+A terminal-request notice is not proof that the client's clipboard changed: verify
+by pasting on the client. The complete notice body
 and optional context appear before its **More details** and **Close** actions. If native Markdown or
 its theme is unavailable, the view visibly discloses the limitation and shows
 the complete question, notice body, and optional context as width-wrapped plain

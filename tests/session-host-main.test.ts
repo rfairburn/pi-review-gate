@@ -28,6 +28,7 @@ import { SidebarController } from "../src/session-host/sidebar";
 import { isSavedSessionAdmission, listSavedSessions, type SavedSessionCatalog } from "../src/session-host/saved-sessions";
 import { deleteSavedSessionFile, type SavedSessionDeletionOptions } from "../src/session-host/saved-deletion";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
+import type { NativeClipboardEvent } from "../src/session-host/native-clipboard";
 import { __test, type SessionHostOptions } from "../src/session-host/main";
 import { sidebarNoticeRows } from "./helpers/session-host-notice-witness";
 
@@ -2317,6 +2318,108 @@ test("a click on the displayed native Main pane returns focus without forwarding
   assert.equal(harness.sidebar?.selectedId, selectedBefore);
   assert.equal(harness.sidebar?.activeMainOwnerID, ownerBefore);
   assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("native clipboard routes only the displayed Main owner and reports a terminal request, not client success", async () => {
+  const harness = createHarness({ env: { PATH: process.env.PATH, HOME: "/synthetic-home", TERM: "xterm-ghostty" } });
+  try {
+    const manager = await startTwoSessions(harness);
+    const event: NativeClipboardEvent = { kind: "copy", encoded: Buffer.from("Unicode α\n雪").toString("base64"),
+      sessionId: "conversation-native-2", sessionEpoch: 1 };
+    const copies = (): string[] => harness.terminal.writes.filter((write) => write.startsWith("\x1b]52;"));
+    manager.options.onNativeClipboard?.("native-2", event); // roster focus cannot copy
+    assert.deepEqual(copies(), []);
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "main");
+    manager.options.onNativeClipboard?.("native-2", event);
+    assert.deepEqual(copies(), [`\x1b]52;c;${event.encoded}\x07`]);
+    await nextTurn();
+    assert.match(plain(harness.writer.frames.at(-1)?.frame), /paste on client to verify/);
+    manager.options.onNativeClipboard?.("native-1", { ...event, sessionId: "conversation-native-1" });
+    manager.options.onNativeClipboard?.("native-2", { ...event, sessionEpoch: 2 });
+    assert.equal(copies().length, 1, "sibling and stale session cannot copy");
+    harness.terminal.emitInput(ALT_LEFT); // focus roster
+    harness.terminal.emitInput(ALT_LEFT); // hide sidebar and return to same Main
+    await nextTurn();
+    manager.options.onNativeClipboard?.("native-2", event);
+    assert.equal(copies().length, 2, "hidden sidebar does not disable visible Main copying");
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form", plain(harness.writer.frames.at(-1)?.frame));
+    manager.options.onNativeClipboard?.("native-2", event);
+    assert.equal(copies().length, 2, "host form covers Main and cannot authorize copying");
+  } finally { await closeWithSignal(harness); }
+});
+
+test("native clipboard rejects undrawn/changed geometry and unsupported or failed terminal delivery, and ignores TERM labels", async () => {
+  const output = new QueuedFrameOutput();
+  output.refuseNextWrite();
+  const harness = createHarness({ env: { PATH: process.env.PATH, HOME: "/synthetic-home", TERM: "xterm-ghostty" } }, {
+    createWriter: (_stdout, writerOptions) => createSessionHostFrameWriter(output as unknown as Writable, { ...writerOptions, redrawIntervalMs: 0 }),
+  });
+  try {
+    const manager = await startTwoSessions(harness);
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    const event: NativeClipboardEvent = { kind: "copy", encoded: Buffer.from("controlled").toString("base64"), sessionId: "conversation-native-2", sessionEpoch: 1 };
+    const count = (): number => harness.terminal.writes.filter((write) => write.startsWith("\x1b]52;")).length;
+    manager.options.onNativeClipboard?.("native-2", event);
+    assert.equal(count(), 0, "queued frame is not displayed ownership");
+    output.drain();
+    await nextTurn();
+    manager.options.onNativeClipboard?.("native-2", event);
+    assert.equal(count(), 1);
+    output.refuseNextWrite();
+    harness.terminal.setSize(90, 24);
+    await nextTurn();
+    manager.options.onNativeClipboard?.("native-2", event);
+    assert.equal(count(), 1, "a resized but undrawn pane cannot authorize a clipboard operation");
+    output.drain();
+    await nextTurn();
+    harness.terminal.writeError = new Error("synthetic output failure");
+    manager.options.onNativeClipboard?.("native-2", event);
+    assert.equal(count(), 1, "failed write is not successful delivery");
+    harness.terminal.writeError = undefined;
+    manager.options.onNativeClipboard?.("native-2", { kind: "unavailable", reason: "unsupported-runtime", sessionId: event.sessionId, sessionEpoch: 1 });
+    assert.equal(count(), 1, "unsupported runtime does not emit clipboard bytes");
+  } finally {
+    harness.signals.emit("SIGTERM");
+    output.drain();
+    await harness.result;
+  }
+  // TERM is a terminal label, not evidence of OSC 52 capability. Under the same
+  // verified Main-owner conditions, a dumb, empty, or absent TERM submits the
+  // native copy request exactly once and reports an unverified request.
+  for (const term of ["dumb", "", undefined] as const) {
+    const label = term === undefined ? "absent" : term === "" ? "empty" : term;
+    const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: "/synthetic-home" };
+    if (term !== undefined) env.TERM = term;
+    const variant = createHarness({ env });
+    try {
+      const manager = await startTwoSessions(variant);
+      variant.terminal.emitInput(ENTER);
+      await nextTurn();
+      assert.equal(variant.sidebar?.focus, "main", `TERM ${label} still verifies the displayed Main owner`);
+      const event: NativeClipboardEvent = {
+        kind: "copy", encoded: "QQ==", sessionId: "conversation-native-2", sessionEpoch: 1,
+      };
+      manager.options.onNativeClipboard?.("native-2", event);
+      assert.deepEqual(variant.terminal.writes.filter((write) => write.startsWith("\x1b]52;")),
+        [`\x1b]52;c;${event.encoded}\x07`], `TERM ${label} submits the native request exactly once`);
+      await nextTurn();
+      const frame = plain(variant.writer.frames.at(-1)?.frame);
+      assert.match(frame, /paste on client to verify/, `TERM ${label} reports an unverified request`);
+      assert.doesNotMatch(frame, /terminal path unsupported|clipboard (set|written|updated|success)|copied to clipboard/i,
+        `TERM ${label} never claims client clipboard success`);
+    } finally { await closeWithSignal(variant); }
+  }
 });
 
 test("native Main click focus requires a written frame for the current owner and geometry", async () => {

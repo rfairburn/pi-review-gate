@@ -4259,6 +4259,7 @@ describe("session-host bootstrap preload", () => {
         { relative: "src/session-host/bootstrap-preload.js", source: join(__dirname, "..", "src/session-host/bootstrap-preload.js") },
         { relative: "src/session-host/native-persistence.js", source: join(__dirname, "..", "src/session-host/native-persistence.js") },
         { relative: "src/session-host/owned-activity.js", source: join(__dirname, "..", "src/session-host/owned-activity.js") },
+        { relative: "src/session-host/native-clipboard.js", source: join(__dirname, "..", "src/session-host/native-clipboard.js") },
         { relative: "src/session-host/spawn-capability.js", source: join(__dirname, "..", "src/session-host/spawn-capability.js") },
         { relative: "src/session-host/startup-request.js", source: join(__dirname, "..", "src/session-host/startup-request.js") },
         { relative: "src/session-host/payload.js", source: join(__dirname, "..", "src/session-host/payload.js") },

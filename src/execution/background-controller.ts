@@ -106,13 +106,14 @@ import type { InPlaceLifecycleDeps } from "./inplace-task-lifecycle";
 import type { ResearchLifecycleDeps } from "./research-task-lifecycle";
 import type { WaveLifecycleDeps } from "./wave-task-lifecycle";
 import {
+  captureRejectionSummary,
   completionGroupAggregateLines,
   isToolResultConfirmedCompletionWake,
   type SubtaskWakeActor,
 } from "./subtask-notifications";
 import { notifyDispatchCards } from "./dispatch-cards";
 import type { ExecutorInteractionAcknowledgement, ExecutorLiveControl, SubtaskDispatchRecord } from "./types";
-import { readWaveCaptureRecord } from "./wave-repository";
+import { readWaveCaptureRecord, waveCaptureEntryRejectionOf } from "./wave-repository";
 import { executeWaveLanding, planWaveLanding } from "./wave-landing";
 import { waveLineageOf } from "./wave-commits";
 import { pinCommit } from "./wave-worktrees";
@@ -4145,12 +4146,16 @@ export class BackgroundExecutionController {
   /**
    * Issue #26: fail closed when a scheduled group's pinned worker resource
    * no longer resolves (removed or research-ineligible after dispatch).
-   * Each queued task is terminalized exactly once with an actionable
-   * failure wake; the skip never implies completion of skipped work.
+   * Each queued task is terminalized exactly once; the skip never implies
+   * completion of skipped work. #465: this is a settings-caused invalidation
+   * before any worker started, so it is reported to the USER only through the
+   * existing local notify callback — never a model wake, message, or turn —
+   * and nothing is re-routed, re-spawned, or retried.
    */
   private async failScheduledRoute(queued: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord }): Promise<void> {
     const resource = queued.group.scheduledWorkerResourceId!;
     const message = `Scheduled task ${queued.group.scheduledTaskId ?? queued.group.executionId} cannot run: pinned worker resource ${resource} no longer resolves in /review-settings. The due occurrence was skipped; fix the entry or its worker choice, and inspect the active tasks before re-dispatching.`;
+    let failed = 0;
     for (const task of queued.group.tasks) {
       if (task.state !== "queued") continue;
       transitionTaskState(task, "failed");
@@ -4158,7 +4163,17 @@ export class BackgroundExecutionController {
       task.summary = message;
       this.addActivity(task, "scheduled_route_failure", message);
       await this.save(queued.group);
-      await this.wake(task, "failure", message);
+      // Wake housekeeping without delivery: a one-shot watch on this group
+      // must not later carry the invalidation to the model either.
+      this.wakes.retireWakeWatch(task, "failure", { group: queued.group, task });
+      failed += 1;
+    }
+    if (failed > 0) {
+      try {
+        await this.input.notify?.(`review gate: ${message}`);
+      } catch {
+        // Best-effort; the failure is already recorded durably.
+      }
     }
   }
 
@@ -4280,6 +4295,8 @@ export class BackgroundExecutionController {
     const executionActiveBeforeLaunch = group.tasks.filter((candidate) => this.runtimes.has(candidate.taskId)).length;
     group.peakConcurrency = Math.max(group.peakConcurrency ?? 0, executionActiveBeforeLaunch + 1);
     task.executorEntryId = lease.entry.entryId;
+    // #467: a capture rejection describes one prior launch attempt only.
+    task.captureRejection = undefined;
     // #237: per-kind lifecycle runners (research/in-place/wave) receive only
     // their narrow capability slices; the controller keeps admission, runtime
     // registration, lease lifecycle, and handleLaunchRejection terminalization.
@@ -4346,7 +4363,18 @@ export class BackgroundExecutionController {
       this.failUndeliveredContinuation(task, "Task failed before the queued continuation was dispatched to an executor.");
       if (task.state !== "stopped_for_application_exit") transitionTaskState(task, "failed");
       task.error = messageOf(error);
-      task.summary = `Background controller failure: ${task.error}`;
+      // #467: a typed source-entry rejection happens inside isolated capture,
+      // before any worker exists. Record its exact cause and path from the
+      // typed error so recovery names them; it is an expected task outcome,
+      // never a controller failure, and nothing is retried or replaced here.
+      const rejection = task.state === "failed" ? waveCaptureEntryRejectionOf(error) : undefined;
+      if (rejection) {
+        task.captureRejection = { code: "source_entry_rejected", ...rejection };
+        task.summary = captureRejectionSummary(task.captureRejection);
+        this.addActivity(task, "capture_rejected", task.summary);
+      } else {
+        task.summary = `Background controller failure: ${task.error}`;
+      }
     }
     task.updatedAt = new Date().toISOString();
     try {

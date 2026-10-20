@@ -2,16 +2,14 @@ import { randomUUID } from "node:crypto";
 import { type ReviewGateConfig } from "../config";
 import { createEvidenceState } from "../evidence";
 import { captureReviewCheckpoint, releaseReviewCheckpoint } from "../review-checkpoint";
-import { primaryEvidencePolicy, evidenceMethodNotice, evidenceMethodLabel, TOOLS_ONLY_LABEL, WORKSPACE_CHANGES_LABEL, isEligibleReviewCaptureFailure } from "../review-evidence";
+import { primaryEvidencePolicy, evidenceMethodLabel, TOOLS_ONLY_LABEL, WORKSPACE_CHANGES_LABEL, PRIMARY_SESSION_FALLBACK_NOTICE, PRIMARY_TOOLS_ONLY_USER_NOTE, isEligibleReviewCaptureFailure, latchPrimarySnapshotFallback } from "../review-evidence";
 import type { ReviewBaseline, ReviewGateState } from "../state";
-import { sendNotice } from "../pi";
+import { sendLocalWarning } from "../pi";
 
-/** Always-on native UI and model channels, never an optional notice tool. */
-export async function sendPrimaryEvidenceWarning(pi: unknown, target: unknown, message: string): Promise<void> {
-  await sendNotice(target, message);
-  if (typeof pi === "object" && pi !== null && "sendMessage" in pi && typeof pi.sendMessage === "function") {
-    await pi.sendMessage({ customType: "pi-review-evidence-policy", content: message, display: true }, { deliverAs: "steer", triggerTurn: true });
-  }
+/** Always-on local warning to the USER only (#465). Evidence-method warnings are
+ * not work: no model-context message, steering, follow-up, or triggered turn. */
+export async function sendPrimaryEvidenceWarning(target: unknown, message: string): Promise<void> {
+  await sendLocalWarning(target, message);
 }
 
 /** Settings application only: menu navigation/cancel never invokes this path. */
@@ -25,7 +23,7 @@ export function createPrimaryEvidenceSettings(input: {
   let pendingCompletion: { persisted: boolean; warning: string } | undefined;
   let applyTail: Promise<void> = Promise.resolve();
   const deferForReview = async (): Promise<void> => {
-    if (!deferredNotice) await input.warn(`WARNING: Primary evidence method change ${evidenceMethodLabel(applied)} → ${evidenceMethodLabel(primaryEvidencePolicy(input.config).toolOnly)} is pending until the running review settles. Its captured policy and evidence remain unchanged; the transition will apply before the next Primary run or manual review.`);
+    if (!deferredNotice) await input.warn(`WARNING: Primary evidence method change ${evidenceMethodLabel(applied)} → ${evidenceMethodLabel(primaryEvidencePolicy(input.config).toolOnly)} is pending until the running review settles. That review keeps its current evidence; the change applies before the next Primary run or manual review.`);
     deferredNotice = true;
   };
   const completeTransition = async (): Promise<void> => {
@@ -42,6 +40,8 @@ export function createPrimaryEvidenceSettings(input: {
     // Mutation and completion are distinct: failure here blocks work, but a
     // retry must never discard observations collected after the original reset.
     await completeTransition();
+    // Transitions follow the CONFIGURED preference. A session-latched fallback
+    // (#465) is not an explicit Tools only selection and never resets evidence.
     const policy = primaryEvidencePolicy(input.config);
     const next = policy.toolOnly;
     if (next === applied) { deferredNotice = false; return; }
@@ -54,8 +54,13 @@ export function createPrimaryEvidenceSettings(input: {
     const captureScope = { scope: input.state.checkpointScope };
     let baseline: ReviewBaseline;
     let disableFellBack = false;
+    let sessionFallbackRetained = false;
     if (next) baseline = { kind: "tool", cwd: captureCwd, capturedAt: new Date().toISOString() };
-    else {
+    else if (policy.snapshotFailureFallback && input.state.primarySnapshotFallback === true) {
+      // Already fell back this session: keep acting as Tools only, never retry capture.
+      baseline = { kind: "tool", cwd: captureCwd, capturedAt: new Date().toISOString(), fallback: true };
+      sessionFallbackRetained = true;
+    } else {
       const captured = await captureReviewCheckpoint(captureCwd, `policy-${randomUUID()}`, captureScope);
       // Review ownership can begin while capture yields. Never publish this
       // now-unused basis into the window owned by that invocation.
@@ -70,7 +75,7 @@ export function createPrimaryEvidenceSettings(input: {
       if (captured.status !== "ok") {
         if (!policy.snapshotFailureFallback || !isEligibleReviewCaptureFailure(captured)) throw new Error(`review gate: Primary ${TOOLS_ONLY_LABEL} → ${WORKSPACE_CHANGES_LABEL} could not establish a new snapshot baseline (${captured.reason}); prior evidence retained; repair and retry before further work`);
         // Apply the snapshot preference without inventing a pre-work snapshot.
-        // A later review retries capture; this is actual fallback, never reset.
+        // Actual fallback, never reset: Tools only applies for the session (#465).
         baseline = { kind: "tool", cwd: captureCwd, capturedAt: new Date().toISOString(), fallback: true };
         disableFellBack = true;
       } else baseline = { kind: "checkpoint", descriptor: captured.value, cwd: captureCwd, capturedAt: new Date().toISOString(), toolOnlyHistory: true };
@@ -103,12 +108,15 @@ export function createPrimaryEvidenceSettings(input: {
       const released = await releaseReviewCheckpoint(captureCwd, baseline.descriptor, captureScope);
       if (released.status !== "ok") throw new Error("review gate: unused policy baseline cleanup failed");
     }
+    if (disableFellBack) latchPrimarySnapshotFallback(input.state);
     applied = next;
     deferredNotice = false;
     pendingCompletion = { persisted: false, warning: next
-      ? `WARNING: Primary evidence method changed: ${WORKSPACE_CHANGES_LABEL} → ${TOOLS_ONLY_LABEL}. CURRENT Primary collected evidence was RESET; outstanding reviewer findings, correction requirements and pending deliveries remain in force. Existing files are not retrospectively reviewed. ${evidenceMethodNotice("tool-only")}`
-      : disableFellBack
-        ? `Primary evidence preference changed: ${TOOLS_ONLY_LABEL} → ${WORKSPACE_CHANGES_LABEL}, but a new snapshot baseline could not be acquired; snapshot capture will be retried. ${evidenceMethodNotice("tool-only-fallback")}`
+      ? `WARNING: Primary evidence method changed: ${WORKSPACE_CHANGES_LABEL} → ${TOOLS_ONLY_LABEL}. CURRENT Primary collected evidence was RESET; outstanding reviewer findings, correction requirements and pending deliveries remain in force. Existing files are not retrospectively reviewed. ${PRIMARY_TOOLS_ONLY_USER_NOTE}`
+      : sessionFallbackRetained
+        ? `Primary evidence preference changed: ${TOOLS_ONLY_LABEL} → ${WORKSPACE_CHANGES_LABEL}. This session already fell back to ${TOOLS_ONLY_LABEL} after an eligible snapshot capture failure, so Primary stays ${TOOLS_ONLY_LABEL} and snapshot capture is not retried automatically. Existing tool evidence was retained. Optional: /review-clear discards the current review window and lets the next prompt try a snapshot again; a new session also does.`
+        : disableFellBack
+        ? `WARNING: Primary evidence preference changed: ${TOOLS_ONLY_LABEL} → ${WORKSPACE_CHANGES_LABEL}, but a new snapshot baseline could not be acquired; existing tool evidence is kept. Review evidence method: ${TOOLS_ONLY_LABEL} (snapshot-failure fallback). ${PRIMARY_SESSION_FALLBACK_NOTICE}`
         : `Primary evidence method changed: ${TOOLS_ONLY_LABEL} → ${WORKSPACE_CHANGES_LABEL}. Existing tool evidence was retained and a NEW snapshot baseline established; subsequent workspace changes will be reviewed with snapshots. Earlier ${TOOLS_ONLY_LABEL} reviews do not certify that baseline.` };
     await completeTransition();
   };

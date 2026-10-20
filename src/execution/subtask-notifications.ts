@@ -31,6 +31,7 @@ import {
   isActiveTaskState,
   isInterruptibleTaskState,
   type BackgroundActivityEvent,
+  type BackgroundCaptureRejection,
   type BackgroundTaskKind,
   type BackgroundTaskRecord,
   type BackgroundTaskState,
@@ -527,6 +528,8 @@ export interface WakeFailureDiagnostic {
     bundleWaveRoot?: string;
     executorEntryId?: string;
     conflictGate?: { paths: string[]; manifestPath: string; reason: string };
+    /** #467: typed pre-start capture rejection; no worker exists to resume or interrupt. */
+    captureRejection?: BackgroundCaptureRejection;
     suggestedActions: string[];
   };
   title: string;
@@ -564,27 +567,15 @@ export function buildWakeFailureDiagnostic(input: WakeFailureDiagnosticInput): W
   const conflictManifestPath = conflictGate
     ? boundDiagnosticText(conflictGate.manifestPath, WAKE_FAILURE_MAX_CONFLICT_PATH) ?? ""
     : undefined;
-  const suggestedActions = [
-    `SubtasksInspect (executionId ${group.executionId}, taskId ${task.taskId}) for the current bounded snapshot`,
-  ];
-  if (conflictGate) {
-    suggestedActions.push(`Resolve the conflict markers in recovery.conflictGate.paths (manifest: ${conflictManifestPath}), verify the workspace, then call SubtasksMarkClean (executionId ${group.executionId}, taskId ${task.taskId}); automatic landings stay blocked until then`);
-  }
-  if (live.bundle) {
-    suggestedActions.push(`SubtasksContinue (executionId ${group.executionId}, taskId ${task.taskId}) to resume from the durable checkpoint`);
-    if (group.kind === "execute" && !isActiveTaskState(live.state)) {
-      suggestedActions.push(`SubtasksForceMerge (executionId ${group.executionId}, taskId ${task.taskId}) to land the checkpoint mechanically, or salvage an identified snapshot of the worker's retained work when no verified checkpoint exists; manual workspace inspection is still required afterward`);
-    }
-  } else if (group.kind === "execute" && !isActiveTaskState(live.state)) {
-    suggestedActions.push(`No durable continuation bundle is available; SubtasksForceMerge (executionId ${group.executionId}, taskId ${task.taskId}) may still salvage an identified snapshot of the worker's retained work without a checkpoint — manual inspection required — or restart the task with SubtasksAdd if its outcome is still needed`);
-  } else if (group.kind === "inplace" && !isActiveTaskState(live.state)) {
-    // #220: an in-place task holds no checkpoint to force-merge — recovery is
-    // a same-workspace continuation or a fresh task, with manual inspection.
-    suggestedActions.push(`SubtasksContinue (executionId ${group.executionId}, taskId ${task.taskId}) to resume the worker in the same workspace (prior writes are NOT rolled back or verified), or inspect the workspace directly and restart with SubtasksAdd if the outcome is still needed`);
-  } else {
-    suggestedActions.push("No durable continuation bundle is available; inspect the execution record and restart the task with SubtasksAdd if its outcome is still needed");
-  }
-  suggestedActions.push(`SubtasksInterrupt (executionId ${group.executionId}, taskId ${task.taskId}, interrupt_as_failure) to quiesce any live writer`);
+  // #467: a positively pre-start capture rejection has no worker, bundle, or
+  // live writer, so it gets only its two explicit, path-bearing choices.
+  const rejected = live.captureRejection && !live.bundle && !conflictGate && !isActiveTaskState(live.state)
+    ? live.captureRejection
+    : undefined;
+  const captureRejection = rejected ? boundedCaptureRejection(rejected) : undefined;
+  const suggestedActions = rejected
+    ? captureRejectionRecoveryActions(rejected)
+    : workerRecoveryActions(group, task, live, conflictManifestPath);
   // Recovery handles are serialized first so any final JSON truncation hits
   // the verbose summary/error/activity tail, never the recovery block. Every
   // field is individually bounded so the structured object passed via
@@ -604,7 +595,8 @@ export function buildWakeFailureDiagnostic(input: WakeFailureDiagnosticInput): W
     recovery: {
       hasDurableBundle: Boolean(live.bundle),
       bundleWaveRoot: live.bundle ? boundDiagnosticText(live.bundle.waveRoot, WAKE_FAILURE_MAX_CONFLICT_PATH) : undefined,
-      executorEntryId: live.executorEntryId
+      // A leased-but-never-started executor entry is not a recovery handle.
+      executorEntryId: live.executorEntryId && !captureRejection
         ? boundDiagnosticText(live.executorEntryId, WAKE_FAILURE_MAX_EXECUTOR_ENTRY)
         : undefined,
       conflictGate: conflictGate
@@ -616,6 +608,7 @@ export function buildWakeFailureDiagnostic(input: WakeFailureDiagnosticInput): W
           reason: boundDiagnosticText(conflictGate.reason, WAKE_FAILURE_MAX_CONFLICT_REASON) ?? "",
         }
         : undefined,
+      ...(captureRejection ? { captureRejection } : {}),
       suggestedActions: suggestedActions.map((action) => boundDiagnosticText(action, WAKE_FAILURE_MAX_ACTION) ?? ""),
     },
     title: boundDiagnosticText(task.definition.title, WAKE_FAILURE_MAX_TITLE) ?? "",
@@ -634,6 +627,126 @@ export function buildWakeFailureDiagnostic(input: WakeFailureDiagnosticInput): W
         message: boundDiagnosticText(event.message, WAKE_FAILURE_MAX_ACTIVITY_MESSAGE) ?? "",
       })),
   });
+}
+
+/** Recovery actions for a task whose worker exists or may exist (unchanged pre-#467 policy). */
+function workerRecoveryActions(
+  group: BackgroundExecutionGroup,
+  task: BackgroundTaskRecord,
+  live: BackgroundTaskRecord,
+  conflictManifestPath: string | undefined,
+): string[] {
+  const suggestedActions = [
+    `SubtasksInspect (executionId ${group.executionId}, taskId ${task.taskId}) for the current bounded snapshot`,
+  ];
+  if (conflictManifestPath !== undefined) {
+    suggestedActions.push(`Resolve the conflict markers in recovery.conflictGate.paths (manifest: ${conflictManifestPath}), verify the workspace, then call SubtasksMarkClean (executionId ${group.executionId}, taskId ${task.taskId}); automatic landings stay blocked until then`);
+  }
+  if (live.bundle) {
+    suggestedActions.push(`SubtasksContinue (executionId ${group.executionId}, taskId ${task.taskId}) to resume from the durable checkpoint`);
+    if (group.kind === "execute" && !isActiveTaskState(live.state)) {
+      suggestedActions.push(`SubtasksForceMerge (executionId ${group.executionId}, taskId ${task.taskId}) to land the checkpoint mechanically, or salvage an identified snapshot of the worker's retained work when no verified checkpoint exists; manual workspace inspection is still required afterward`);
+    }
+  } else if (group.kind === "execute" && !isActiveTaskState(live.state)) {
+    suggestedActions.push(`No durable continuation bundle is available; SubtasksForceMerge (executionId ${group.executionId}, taskId ${task.taskId}) may still salvage an identified snapshot of the worker's retained work without a checkpoint — manual inspection required — or restart the task with SubtasksAdd if its outcome is still needed`);
+  } else if (group.kind === "inplace" && !isActiveTaskState(live.state)) {
+    // #220: an in-place task holds no checkpoint to force-merge — recovery is
+    // a same-workspace continuation or a fresh task, with manual inspection.
+    suggestedActions.push(`SubtasksContinue (executionId ${group.executionId}, taskId ${task.taskId}) to resume the worker in the same workspace (prior writes are NOT rolled back or verified), or inspect the workspace directly and restart with SubtasksAdd if the outcome is still needed`);
+  } else {
+    suggestedActions.push("No durable continuation bundle is available; inspect the execution record and restart the task with SubtasksAdd if its outcome is still needed");
+  }
+  suggestedActions.push(`SubtasksInterrupt (executionId ${group.executionId}, taskId ${task.taskId}, interrupt_as_failure) to quiesce any live writer`);
+  return suggestedActions;
+}
+
+// ── #467 typed pre-start capture rejection ──────────────────────────────────
+
+const CAPTURE_REJECTION_REASON_TEXT: Record<BackgroundCaptureRejection["reason"], string> = {
+  untracked_size_limit: "this non-ignored untracked file pushed the untracked capture total over maxSnapshotBytes",
+  unsupported_entry_type: "unsupported entry type; isolated capture accepts only regular files and symlinks",
+  symlink_target_absolute: "symlink with an absolute target, which isolated capture rejects",
+  symlink_target_escapes_root: "symlink whose target escapes the capture root, which isolated capture rejects",
+};
+
+/**
+ * Identity-preserving bound for a filesystem field: never normalizes or trims
+ * whitespace (distinct paths must stay distinct); only an over-budget value is
+ * cut at its JSON-encoded budget with the visible truncation marker.
+ */
+function boundExactText(value: string, max: number): string {
+  if (jsonEncodedTextLength(value) <= max) return value;
+  return `${value.slice(0, longestPrefix(value.length, (end) => jsonEncodedTextLength(`${value.slice(0, end)}${TRUNCATION_MARKER}`) <= max))}${TRUNCATION_MARKER}`;
+}
+
+/** Largest end in [0, length] satisfying a monotone predicate (binary search). */
+function longestPrefix(length: number, fits: (end: number) => boolean): number {
+  let low = 0;
+  let high = length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (fits(mid)) low = mid;
+    else high = mid - 1;
+  }
+  return low;
+}
+
+/**
+ * A JSON string literal for a filesystem path inside prose that is later
+ * whitespace-normalized by boundDiagnosticText. Every whitespace character
+ * except a lone interior U+0020 is written as a JSON \\u escape, so the literal
+ * contains no whitespace that normalization could collapse, trim, or rewrite;
+ * decoding it yields exactly the original path.
+ */
+function quotePathLiteral(path: string): string {
+  const quoted = JSON.stringify(path);
+  return quoted.replace(/\s/g, (ch: string, index: number) => {
+    const lone = ch === " "
+      && index > 1 && index < quoted.length - 2
+      && !/\s/.test(quoted[index - 1]!) && !/\s/.test(quoted[index + 1]!);
+    return lone ? ch : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`;
+  });
+}
+
+/** Bounded quoted literal: an over-budget path keeps an exact prefix, marked truncated outside the quotes. */
+function boundedPathLiteral(path: string): string {
+  const whole = quotePathLiteral(path);
+  if (whole.length <= WAKE_FAILURE_MAX_CONFLICT_PATH) return whole;
+  const end = longestPrefix(path.length, (candidate) =>
+    quotePathLiteral(path.slice(0, candidate)).length + TRUNCATION_MARKER.length <= WAKE_FAILURE_MAX_CONFLICT_PATH);
+  return `${quotePathLiteral(path.slice(0, end))}${TRUNCATION_MARKER}`;
+}
+
+/** Field-bounded copy; filesystem fields keep their exact identity up to the shared path bound. */
+function boundedCaptureRejection(rejection: BackgroundCaptureRejection): BackgroundCaptureRejection {
+  return {
+    code: rejection.code,
+    reason: rejection.reason,
+    path: boundExactText(rejection.path, WAKE_FAILURE_MAX_CONFLICT_PATH),
+    captureRoot: boundExactText(rejection.captureRoot, WAKE_FAILURE_MAX_CONFLICT_PATH),
+  };
+}
+
+/** #467: the task summary for a typed pre-start capture rejection (cause and path from the typed record). */
+export function captureRejectionSummary(rejection: BackgroundCaptureRejection): string {
+  return `Capture rejected before worker started: isolated source capture rejected ${boundedPathLiteral(rejection.path)} (${CAPTURE_REJECTION_REASON_TEXT[rejection.reason]}) under capture root ${boundedPathLiteral(rejection.captureRoot)}. No worker was started and nothing was retried or replaced automatically; choose one explicit recovery.`;
+}
+
+/**
+ * #467: exactly two explicit recovery choices, each naming the triggering
+ * path as an exact JSON string literal (whitespace-escaped, so the bounded
+ * prose rendering cannot alter it) before any other variable text. Guidance
+ * follows the actual capture boundary: a Git workspace is captured from its
+ * repository top level, so a nested cwd of that repository is never promised
+ * to exclude the path.
+ */
+export function captureRejectionRecoveryActions(rejection: BackgroundCaptureRejection): string[] {
+  const path = boundedPathLiteral(rejection.path);
+  const root = boundedPathLiteral(rejection.captureRoot);
+  return [
+    `Narrower workspace: explicitly start a new SubtasksStart task whose workspace has an actual capture root that excludes ${path}. A Git workspace is captured from its repository top level, so a subdirectory of the same repository still captures it; choose a separate repository/checkout or a non-Git directory that does not contain it (rejected capture root: ${root}).`,
+    `InPlace worker: explicitly start a new SubtasksStart task with kind inplace in this same workspace to work despite the capture blocked by ${path}. InPlace performs no isolated capture, so that entry does not block it, but it writes directly with no isolation or rollback, and its review uses the existing InPlace evidence setting (Tools only, or the qualified snapshot-failure fallback).`,
+  ];
 }
 
 /** JSON-encoded length of a string's content, excluding the surrounding quotes. */

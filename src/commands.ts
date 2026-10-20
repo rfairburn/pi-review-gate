@@ -17,7 +17,7 @@ import {
   type ReviewBaseline,
 } from "./state";
 import { runAskReviewer, runReview } from "./review";
-import { primaryEvidencePolicy, evidenceMethodNotice, isEligibleReviewCaptureFailure, TOOL_ONLY_HISTORY_NOTICE } from "./review-evidence";
+import { primaryEvidencePolicy, evidenceMethodNotice, isEligibleReviewCaptureFailure, latchPrimarySnapshotFallback, primaryFallbackUserWarning, PRIMARY_SNAPSHOT_RECOVERED_USER_NOTE } from "./review-evidence";
 import { sendPrimaryEvidenceWarning } from "./activation/primary-evidence";
 import { extractSignal, isEscapeTerminalInput, onTerminalInput, sendNotice, sendFollowUp, sendSteeringPrompt, createStatusTracker } from "./pi";
 import { reviewCancellationMessage, type ActiveReviewCancellation, type ReviewCancellationCoordinator } from "./review-cancellation";
@@ -196,7 +196,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       const reviewSignal = combineAbortSignals(extractSignal([ctx]), reviewAbort.signal);
       try {
         output = await runReview({
-          evidencePolicy: primaryEvidencePolicy(input.config),
+          evidencePolicy: primaryEvidencePolicy(input.config, input.state),
           cwd: input.cwd(),
           checkpointScope: input.state.checkpointScope,
           request: buildRequestContext(input.state) || "Manual /review-now request",
@@ -207,7 +207,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           window,
           signal: reviewSignal,
           notify: (message) => message.startsWith("WARNING: Review evidence method:") && isSessionActive()
-            ? sendPrimaryEvidenceWarning(input.pi, ctx, message) : sendCommandNotice(ctx, message),
+            ? sendPrimaryEvidenceWarning(ctx, message) : sendCommandNotice(ctx, message),
           onUpdate: (message) => statusTracker.update(message),
           onInvocationPrepared: () => input.onStateChanged?.(),
         });
@@ -309,7 +309,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const followUp = window.lastCappedFollowUp;
       const reviewConfig = window.reviewConfig ?? currentConfig();
-      const policy = primaryEvidencePolicy(input.config);
+      const policy = primaryEvidencePolicy(input.config, input.state);
       const reviewCwd = input.cwd();
       const signal = combineAbortSignals(extractSignal([ctx]), input.sessionSignal);
       const scope = { scope: input.state.checkpointScope };
@@ -339,11 +339,11 @@ export function registerCommands(input: RegisterCommandsInput): void {
           }
         }
         responseBaseline = exchangeBefore ?? before;
-        evidenceNotice = `Primary /review-continue: ${evidenceMethodNotice("tool-only-fallback")}`;
+        evidenceNotice = `Primary /review-continue: ${primaryFallbackUserWarning()}`;
       } else if (captured?.status === "ok") {
         const toolOnlyHistory = before.kind === "tool" || (before.kind === "checkpoint" && before.toolOnlyHistory);
         responseBaseline = { kind: "checkpoint", descriptor: captured.value, cwd: reviewCwd, capturedAt: new Date().toISOString(), ...(toolOnlyHistory ? { toolOnlyHistory: true } : {}) };
-        if (before.kind === "tool") evidenceNotice = `Primary /review-continue: snapshot capture recovered; a NEW baseline covers subsequent work only. ${TOOL_ONLY_HISTORY_NOTICE}`;
+        if (before.kind === "tool") evidenceNotice = `Primary /review-continue: ${PRIMARY_SNAPSHOT_RECOVERED_USER_NOTE}`;
       } else responseBaseline = exchangeBefore ?? before;
       const assertContinuationCurrent = () => {
         signal?.throwIfAborted();
@@ -351,7 +351,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       };
       try {
         assertContinuationCurrent();
-        if (evidenceNotice) await sendPrimaryEvidenceWarning(input.pi, ctx, evidenceNotice);
+        if (evidenceNotice) await sendPrimaryEvidenceWarning(ctx, evidenceNotice);
         assertContinuationCurrent();
       } catch (error) {
         if (captured?.status === "ok") {
@@ -360,6 +360,8 @@ export function registerCommands(input: RegisterCommandsInput): void {
         }
         throw error;
       }
+      // The warned first eligible fallback applies Tools only for this session (#465).
+      if (captured && captured.status !== "ok") latchPrimarySnapshotFallback(input.state);
       // Recovery from an earlier tool-only basis changes both kinds together;
       // the retained tool evidence and outstanding correction remain intact.
       if (before.kind === "tool" && responseBaseline.kind === "checkpoint") {
@@ -409,7 +411,9 @@ export function registerCommands(input: RegisterCommandsInput): void {
           invocationDir: join(window.bundleDir, "reviews", String(feedback.sequence).padStart(4, "0")),
           action: "correction_required" as const,
         } : {}),
-        message: evidenceNotice ? `${evidenceNotice}\n\n${followUp}` : followUp,
+        // #465: the evidence notice was delivered as a local user warning only;
+        // reviewer provenance stays in later review transmissions.
+        message: followUp,
       }, isSessionActive);
     },
   });
@@ -458,7 +462,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       const reviewSignal = combineAbortSignals(extractSignal([ctx]), reviewAbort.signal);
       try {
         output = await runAskReviewer({
-          evidencePolicy: primaryEvidencePolicy(input.config),
+          evidencePolicy: primaryEvidencePolicy(input.config, input.state),
           cwd: input.cwd(),
           checkpointScope: input.state.checkpointScope,
           question,
@@ -473,7 +477,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           window: contextWindow,
           signal: reviewSignal,
           notify: (message) => message.startsWith("WARNING: Review evidence method:") && isSessionActive()
-            ? sendPrimaryEvidenceWarning(input.pi, ctx, message) : sendCommandNotice(ctx, message),
+            ? sendPrimaryEvidenceWarning(ctx, message) : sendCommandNotice(ctx, message),
           onUpdate: (message) => statusTracker.update(message),
           onInvocationPrepared: () => input.onStateChanged?.(),
         });

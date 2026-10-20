@@ -26,7 +26,7 @@ import type { ModelAdapter, ReviewerSession } from "./adapters/types";
 import type { TokenUsage } from "./usage";
 import { completeActiveExchange, hasUnresolvedReview, isReviewBaseline, snapshotOfReviewBaseline, type GitCheckpointBaseline, type UnifiedReviewBaseline, type ReviewBaseline, type ReviewWindow } from "./state";
 import { aggregateReviewDisposition } from "./review-report";
-import { acquireReviewWorkspaceSnapshot, primaryEvidencePolicy, evidenceMethodNotice, retainedToolChanges, isEligibleReviewCaptureFailure, ReviewEvidenceCaptureFailure, TOOL_ONLY_HISTORY_NOTICE, type ReviewEvidencePolicy, type ReviewEvidenceMethod } from "./review-evidence";
+import { acquireReviewWorkspaceSnapshot, primaryEvidencePolicy, evidenceMethodNotice, retainedToolChanges, isEligibleReviewCaptureFailure, isReviewableToolObservation, latchPrimarySnapshotFallback, primaryFallbackUserWarning, ReviewEvidenceCaptureFailure, PRIMARY_SNAPSHOT_RECOVERED_USER_NOTE, PRIMARY_TOOLS_ONLY_USER_WARNING, TOOL_ONLY_HISTORY_NOTICE, type ReviewEvidencePolicy, type ReviewEvidenceMethod } from "./review-evidence";
 
 export interface ReviewRunInput {
   evidencePolicy?: ReviewEvidencePolicy;
@@ -252,7 +252,9 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     : undefined;
   const retainedObservationNeedsReview = input.evidence?.requiresReview === true
     && (settled.evidenceMethod === "snapshot" || (completedExchange?.evidenceEvents.length ?? input.evidence.events.length) > 0);
-  const observedToolWork = settled.evidenceMethod !== "snapshot" && (completedExchange?.evidenceEvents.length ?? input.evidence?.events.length ?? 0) > 0;
+  const observedToolWork = settled.evidenceMethod !== "snapshot" && (settled.primaryToolChangeGate
+    ? (completedExchange?.evidenceEvents ?? input.evidence?.events ?? []).some(isReviewableToolObservation)
+    : (completedExchange?.evidenceEvents.length ?? input.evidence?.events.length ?? 0) > 0);
   const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0 || hasExactChanges || retainedObservationNeedsReview || observedToolWork;
   if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges) {
     if (input.window?.bundleDir) {
@@ -276,6 +278,15 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
   if (settled.evidenceMethod === "snapshot" && changes.length === 0 && !isCorrectionValidation && !hasExactChanges && input.evidence?.requiresReview !== true) {
     return { changed: false, changes, noReviewReason: "no_initial_changes" };
   }
+  // #465: an evidence method, its warning, an assistant summary, or known
+  // read-only observations are not work. Primary Tools only review needs
+  // retained changes, a mutation-capable/uncertain observation, or an
+  // outstanding correction — the same no-change rule snapshots apply.
+  if (settled.primaryToolChangeGate && changes.length === 0 && sideEffectChanges.length === 0 && !isCorrectionValidation
+    && input.evidence?.requiresReview !== true && !(input.evidence?.events ?? []).some(isReviewableToolObservation)) {
+    return { changed: false, changes, noReviewReason: "no_initial_changes" };
+  }
+  if (settled.reviewMethodNotice) await input.notify?.(settled.reviewMethodNotice);
 
   // When exactChange is present, use the exact Git commit patch as authoritative.
   const patchResult = settled.evidenceMethod === "snapshot" && input.exactChange !== undefined
@@ -1205,22 +1216,38 @@ async function settleReviewEvidence(input: ReviewRunInput): Promise<SettledBasel
   }
   const toolBaseline = isReviewBaseline(input.before) && input.before.kind === "tool" ? input.before : undefined;
   if (toolBaseline && toolBaseline.cwd !== input.cwd) throw new Error("review gate: tool evidence basis root mismatch");
-  const tools = async (fallback: boolean, basis?: ReviewBaseline, coverageNotice?: string): Promise<SettledBaseline> => {
+  const tools = async (fallback: boolean, basis?: ReviewBaseline, coverageNotice?: string, userNote?: string): Promise<SettledBaseline> => {
     input.signal?.throwIfAborted();
-    const method: ReviewEvidenceMethod = fallback ? "tool-only-fallback" : "tool-only";
+    // A session-latched Primary fallback is ordinary Tools only labeled with
+    // its provenance (#465); it never retries capture.
+    const method: ReviewEvidenceMethod = fallback || policy.sessionFallback ? "tool-only-fallback" : "tool-only";
     if (!coverageNotice && basis?.kind === "checkpoint" && basis.toolOnlyHistory) coverageNotice = TOOL_ONLY_HISTORY_NOTICE;
+    // The first eligible Primary fallback applies Tools only for the session
+    // (runtime state only; configuration is never written).
+    const sessionTransition = fallback && policy.scope === "primary" && policy.snapshotFailureFallback
+      && policy.session !== undefined && policy.session.primarySnapshotFallback !== true;
     if (!input.evidence?.events.length) coverageNotice = [coverageNotice, "No structured tool observations were collected for this assessment; supplied summaries and context are claims, not verified actions or evidence of no effects."].filter(Boolean).join(" ");
-    const baseline: ReviewBaseline = basis ?? { kind: "tool", cwd: input.cwd, capturedAt: new Date().toISOString(), ...(fallback ? { fallback: true } : {}) };
-    // Preserve a valid historical snapshot basis on fallback so the next
-    // operation can retry it. Never reset current work or latch config here.
+    const baseline: ReviewBaseline = basis ?? { kind: "tool", cwd: input.cwd, capturedAt: new Date().toISOString(), ...(fallback || policy.sessionFallback ? { fallback: true } : {}) };
+    // Preserve a valid historical basis; never reset current work or write config here.
     if (input.window) {
       input.window.baseline = baseline;
       if (input.window.activeExchange && input.window.activeExchange.baseline?.kind !== baseline.kind) input.window.activeExchange.baseline = baseline;
     }
-    await input.notify?.(`${evidenceMethodNotice(method)}${coverageNotice ? ` ${coverageNotice}` : ""}`);
+    const methodNotice = `${evidenceMethodNotice(method)}${coverageNotice ? ` ${coverageNotice}` : ""}`;
+    // Primary (#465): a concise local user warning. A fallback transition warns
+    // whether or not work needs review; a session-latched fallback already
+    // warned at that one transition; an explicit Tools only notice labels an
+    // actual review only. Worker notice text and timing are unchanged.
+    const primary = policy.scope === "primary";
+    if (!primary) await input.notify?.(methodNotice);
+    else if (fallback) await input.notify?.(primaryFallbackUserWarning(sessionTransition));
+    // Latch only after the mandatory local warning was delivered.
+    if (sessionTransition) latchPrimarySnapshotFallback(policy.session);
     return { evidenceMethod: method, evidenceCoverageNotice: coverageNotice, workspaceChanges: [], exchangeWorkspaceChanges: [],
       snapshotOmissions: [], snapshotOmissionsTruncated: false, ownershipTransferred: false,
-      reviewedBaseline: input.window?.activeExchange?.baseline ?? baseline };
+      reviewedBaseline: input.window?.activeExchange?.baseline ?? baseline,
+      ...(primary && !fallback && !policy.sessionFallback ? { reviewMethodNotice: `${PRIMARY_TOOLS_ONLY_USER_WARNING}${userNote ? ` ${userNote}` : ""}` } : {}),
+      ...(primary ? { primaryToolChangeGate: true as const } : {}) };
   };
   if (input.evidenceCaptureFailure !== undefined) {
     if (!(input.evidenceCaptureFailure instanceof ReviewEvidenceCaptureFailure)) throw new Error("review gate: invalid evidence acquisition failure handoff");
@@ -1260,7 +1287,7 @@ async function settleReviewEvidence(input: ReviewRunInput): Promise<SettledBasel
     const baseline: UnifiedReviewBaseline = { kind: "checkpoint", descriptor: captured.value, cwd: input.cwd, capturedAt: new Date().toISOString(), toolOnlyHistory: true };
     const release = () => releaseCheckpoint(input.cwd, captured.value, input.checkpointScope);
     try {
-      const settled = await tools(false, baseline, `Snapshot capture recovered; a NEW baseline was established for subsequent captures. ${TOOL_ONLY_HISTORY_NOTICE}`);
+      const settled = await tools(false, baseline, `Snapshot capture recovered; a NEW baseline was established for subsequent captures. ${TOOL_ONLY_HISTORY_NOTICE}`, PRIMARY_SNAPSHOT_RECOVERED_USER_NOTE);
       return { ...settled, reviewedBaseline: baseline, releaseOrphan: input.window ? undefined : release, ownershipTransferred: Boolean(input.window) };
     } catch (error) {
       if (!input.window) return rethrowAfterRelease(error, release);
@@ -1304,6 +1331,10 @@ interface SettledBaseline {
   reviewedBaseline?: ReviewBaseline;
   /** Releases the ephemeral after-checkpoint pin (Git only). Throws on failure — never hides an orphaned pin. */
   releaseOrphan?: () => Promise<void>;
+  /** Tool-method notice sent only once an actual review proceeds (#465). */
+  reviewMethodNotice?: string;
+  /** Primary tool-method review requires reviewable change evidence (#465). */
+  primaryToolChangeGate?: true;
 }
 
 function typedCheckpointBaselineOf(value: WorkspaceSnapshot | ReviewBaseline | undefined): UnifiedReviewBaseline | null {
@@ -1645,6 +1676,8 @@ async function collectCurrentChanges(input: Omit<AskReviewerInput, "question" | 
   }
   const settled = await settleReviewEvidence({ ...input, before: input.before, request: "" });
   try {
+    // An explicit reviewer question always reaches a reviewer: label it now.
+    if (settled.reviewMethodNotice) await input.notify?.(settled.reviewMethodNotice);
     const evidenceChanges = settled.evidenceMethod !== "snapshot"
       ? retainedToolChanges(input.evidence)
       : input.evidence

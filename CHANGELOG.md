@@ -15,6 +15,57 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.186]
+
+### Fixed
+
+- Primary review-evidence warnings are now local to the user and no longer start model
+  turns or reviews (#465). The warning was sent as a `pi-review-evidence-policy` custom
+  message with `triggerTurn: true`, so an eligible snapshot-failure fallback started an
+  extra model turn. Tools only fallback also skipped the no-change check, so a response
+  with no file changes could still invoke the reviewer. Evidence warnings now use Pi's
+  warning-level UI notice only, with no custom, system, steering, or follow-up message
+  and no triggered turn. Automatic Primary Tools only review, including fallback, now
+  needs reviewable change evidence: retained changed content, a mutation-capable or
+  uncertain observation, or an outstanding correction. The evidence method, its warning,
+  an assistant summary, or known read-only observations alone run no reviewer, and
+  `/review-now` applies the same no-change rule that snapshot review already used. Real
+  edits still reach the reviewer with retained tool content and the truthful
+  **Tools only (snapshot-failure fallback)** label.
+- The first eligible Primary snapshot-failure fallback now applies **Tools only** for
+  the rest of the session (#465). Later turns, reviews, and `/review-continue` make no
+  snapshot capture attempt and repeat no fallback warning. This runtime state is never
+  saved, so the configured preference, the menu value, and Save are unaffected.
+  `/review-clear` or a new session ends it, and the next prompt's ordinary capture then
+  tries the configured snapshot preference once; an eligible re-failure warns once more
+  and returns to Tools only. With fallback Off, capture failure still blocks.
+  Cancellation, integrity, cleanup, checkpoint, and landing gates are unchanged, as are
+  explicit reviewer questions and the #462 capture budget preflight. Worker evidence
+  policies, their fallback warnings, and their per-cycle retries are unchanged.
+- Every Primary evidence settings change is now a short local warning, whether it is
+  applied, deferred, a reset, a success, or a failure (#465). Reviewer-directed
+  evidence prose no longer appears in user warnings, and `/review-continue` sends
+  the model only the correction authorization, never the local warning text.
+  Reviewer bundles and review transmissions keep the full evidence-method labels.
+- Settings changes no longer send model-facing warnings for scheduled work (#465).
+  When a `/review-settings` change removes a scheduled subtask's pinned worker, or
+  leaves it unable to serve that entry, the enabled entry is disabled with its
+  existing `enabled` flag before the scheduler replans, so it is never attempted
+  again. It keeps its pin and no other worker is chosen. Save persists the disable,
+  root Escape applies it for the session, and Cancel changes nothing. The user sees
+  one local warning per disabled entry, and an already-queued occurrence ends
+  without a worker attempt and is reported to the user only. Execution-controller
+  notices now go to the current native UI as warning-level notices instead of a
+  channel that could be silent.
+- A subtask whose isolated workspace capture refuses a source entry before any
+  worker starts now fails with a typed capture rejection naming the exact path
+  (#467). Examples are an untracked file over the budget, an unsupported file type,
+  or a symlink that is absolute or escapes the workspace. The failure notification
+  offers two explicit choices: retry with a narrower workspace that excludes that
+  path, or deliberately launch an InPlace task with degraded review. Nothing is
+  converted, spawned, or retried automatically. Start acceptance stays
+  asynchronous; the typed refusal arrives with the task's failure notification.
+
 ## [0.1.0-dev.185]
 
 ### Fixed

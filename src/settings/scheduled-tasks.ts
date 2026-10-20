@@ -533,6 +533,44 @@ export function expandScheduledTaskWorkspaces(catalog: ScheduledTaskCatalog): Sc
  * the independent catalog (research-capable for research tasks), and a
  * task-local reviewer set that resolves like any global one.
  */
+function unservablePinReason(entry: ScheduledTaskEntryConfig, workerResources: WorkerResourceCatalog, config: ReviewGateConfig): string | undefined {
+  if ((entry.destination ?? "subtask") !== "subtask" || entry.workerResourceId === undefined) return undefined;
+  const resource = Object.prototype.hasOwnProperty.call(workerResources, entry.workerResourceId)
+    ? workerResources[entry.workerResourceId]
+    : undefined;
+  if (!resource) return "no longer exists";
+  return entry.kind === "research" && !workerResourceSupportsResearch(config, resource.selection) ? "cannot run research tasks" : undefined;
+}
+
+/**
+ * #465: when a settings change makes an ENABLED subtask entry's pinned worker
+ * unrunnable (removed, or not research-capable for a research entry — the
+ * scheduler route resolver's rule) where it ran under the live settings, that
+ * entry is disabled with its canonical `enabled` flag before apply/persist.
+ * The pin is kept, so no other resource is chosen and re-enabling still needs
+ * a valid worker. Entries already invalid, or made invalid by editing the
+ * entry itself, keep the existing fail-closed validation.
+ * Returns user-only warning text for each entry it disabled.
+ */
+export function disableUnservableScheduledTasks(
+  catalog: ScheduledTaskCatalog,
+  workerResources: WorkerResourceCatalog,
+  config: ReviewGateConfig,
+  live: ReviewGateConfig,
+): { catalog: ScheduledTaskCatalog; warnings: string[] } {
+  const warnings: string[] = [];
+  const liveResources = live.execution?.workerResources ?? {};
+  let next = catalog;
+  for (const [id, entry] of Object.entries(catalog)) {
+    if (!entry.enabled) continue;
+    const reason = unservablePinReason(entry, workerResources, config);
+    if (!reason || unservablePinReason(entry, liveResources, live) !== undefined) continue;
+    next = { ...next, [id]: { ...entry, enabled: false } };
+    warnings.push(`Scheduled task "${entry.name}" was disabled: its worker resource ${entry.workerResourceId} ${reason}. It will not run until you choose an available worker and enable it again.`);
+  }
+  return { catalog: next, warnings };
+}
+
 export async function validateScheduledTasks(
   catalog: ScheduledTaskCatalog,
   workerResources: WorkerResourceCatalog,
@@ -563,7 +601,9 @@ export async function validateScheduledTasks(
     if (!await directoryExists(candidate)) {
       return `Scheduled task ${id} workspace is not an existing directory: ${entry.workspace}`;
     }
-    if (entry.workerResourceId !== undefined) {
+    // A disabled entry never dispatches; it may keep an unresolvable pin
+    // (#465) until the user chooses an available worker and enables it.
+    if (entry.workerResourceId !== undefined && entry.enabled) {
       const resource = Object.prototype.hasOwnProperty.call(workerResources, entry.workerResourceId)
         ? workerResources[entry.workerResourceId]
         : undefined;

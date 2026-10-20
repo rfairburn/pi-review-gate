@@ -75,7 +75,31 @@ export type WaveSourceType = "git-committed" | "git-unborn" | "non-git";
 
 // ── typed capture errors ─────────────────────────────────────────────────────
 
-export type WaveCaptureErrorCode = "workspace_changing_during_capture" | "capture_failed" | "cancelled";
+export type WaveCaptureErrorCode =
+  | "workspace_changing_during_capture"
+  | "capture_failed"
+  | "cancelled"
+  | "source_entry_rejected";
+
+/**
+ * #467: the specific cause for which one eligible source entry made the
+ * isolated capture impossible. Each value maps to exactly one validation
+ * branch; other capture failures keep their own codes.
+ */
+export type WaveCaptureEntryRejectionReason =
+  | "untracked_size_limit"
+  | "unsupported_entry_type"
+  | "symlink_target_absolute"
+  | "symlink_target_escapes_root";
+
+/** #467: the source entry that rejected an isolated capture before any worker existed. */
+export interface WaveCaptureEntryRejection {
+  reason: WaveCaptureEntryRejectionReason;
+  /** Capture-root-relative path of the triggering entry, exactly as enumerated. */
+  path: string;
+  /** Actual capture boundary that contains the entry (the Git top level for Git sources). */
+  captureRoot: string;
+}
 
 export class WaveCaptureError extends Error {
   constructor(
@@ -83,10 +107,28 @@ export class WaveCaptureError extends Error {
     public readonly code: WaveCaptureErrorCode,
     public readonly waveId?: string,
     public readonly phase?: string,
+    /** Present exactly when code is "source_entry_rejected". */
+    public readonly rejectedEntry?: WaveCaptureEntryRejection,
   ) {
     super(message);
     this.name = "WaveCaptureError";
   }
+}
+
+/** #467: the typed pre-start entry rejection carried by a capture error, if any. */
+export function waveCaptureEntryRejectionOf(error: unknown): WaveCaptureEntryRejection | undefined {
+  return error instanceof WaveCaptureError && error.code === "source_entry_rejected"
+    ? error.rejectedEntry
+    : undefined;
+}
+
+function entryRejection(
+  message: string,
+  reason: WaveCaptureEntryRejectionReason,
+  path: string,
+  captureRoot: string,
+): WaveCaptureError {
+  return new WaveCaptureError(message, "source_entry_rejected", undefined, "capturing", { reason, path, captureRoot });
 }
 
 export interface WaveSourceDiscovery {
@@ -1091,9 +1133,12 @@ async function validateEligiblePaths(
 
     // Reject unsupported entry types.
     if (!lstat.isFile() && !lstat.isSymbolicLink()) {
-      throw new Error(
+      throw entryRejection(
         `Unsupported entry type at "${relPath}": ${lstat.isDirectory() ? "directory" : "special"}. ` +
         `Only regular files and symlinks are supported.`,
+        "unsupported_entry_type",
+        relPath,
+        captureRoot,
       );
     }
 
@@ -1105,15 +1150,21 @@ async function validateEligiblePaths(
       const symlinkTarget = targetBuffer.toString("utf8");
       // Reject symlinks that escape the capture root.
       if (isAbsolute(symlinkTarget)) {
-        throw new Error(
+        throw entryRejection(
           `Symlink target is absolute and rejected: "${relPath}" -> ${symlinkTarget}`,
+          "symlink_target_absolute",
+          relPath,
+          captureRoot,
         );
       }
       const linkDir = fullPath.substring(0, fullPath.lastIndexOf(sep));
       const resolved = resolve(linkDir, symlinkTarget);
       if (!resolved.startsWith(captureRoot + sep) && resolved !== captureRoot) {
-        throw new Error(
+        throw entryRejection(
           `Symlink target escapes capture root and is rejected: "${relPath}" -> ${symlinkTarget} (resolves to ${resolved})`,
+          "symlink_target_escapes_root",
+          relPath,
+          captureRoot,
         );
       }
       size = targetBuffer.length;
@@ -1125,10 +1176,13 @@ async function validateEligiblePaths(
     if (untrackedPaths.has(relPath)) {
       untrackedBytes += size;
       if (untrackedBytes > maxSnapshotBytes) {
-        throw new Error(
+        throw entryRejection(
           `Snapshot size limit exceeded for untracked files: ${untrackedBytes} bytes exceeds ` +
           `maxSnapshotBytes of ${maxSnapshotBytes}. The untracked file "${relPath}" ` +
           `(${size} bytes) pushed the untracked total over the limit.`,
+          "untracked_size_limit",
+          relPath,
+          captureRoot,
         );
       }
     }

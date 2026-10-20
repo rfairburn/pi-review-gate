@@ -17,7 +17,7 @@ import {
   shouldRecordToolCallEvidence,
   shouldRecordToolResultEvidence,
 } from "./evidence";
-import { registerHook, captureSessionNotice, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolName, sendNotice, setStatus, type HookHandler } from "./pi";
+import { registerHook, captureSessionNotice, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolName, sendLocalWarning, sendNotice, setStatus, type HookHandler } from "./pi";
 import { createReviewCancellationCoordinator } from "./review-cancellation";
 import {
   beginAgentRun,
@@ -427,6 +427,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     associations: () => executionTools?.associations(),
     reviewConfig: () => effectiveReviewConfig(),
   });
+  // Latest native event/settings UI context (#465). User-only local warnings
+  // (evidence method, settings-driven controller notices) go here as
+  // warning-level UI notices, never as model input.
+  let localUiTarget: unknown = pi;
   executionTools = new ExecutionToolManager({
     pi,
     config,
@@ -435,7 +439,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     submittedFingerprintFor: (toolCallId, toolName) => nativeToolPreflight.admittedSubmittedFingerprint(toolCallId, toolName),
     onNativeToolError: (toolCallId, toolName) => nativeToolPreflight.observeReturnedError(toolCallId, toolName),
     authorizedTools: () => deferredTools.authorizedToolNames(),
-    notify: (message) => sendNotice(pi, message),
+    notify: (message) => sendLocalWarning(localUiTarget, message),
     // The session writer serializes save AND owner retirement. Distinguish its
     // completed retirement from a standalone controller's bare durable save.
     onAssociationsChanged: () => acknowledgeOwnerRetiringSave(() => sessionPersistence.persistConfirmed()),
@@ -502,8 +506,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // background-completion monitor/deferral state, and the triggering-message
   // failure flag. It returns handler bodies and narrow operations; every hook
   // registration stays in this root's manifest.
-  let primaryEvidenceNoticeTarget: unknown = pi;
-  const warnPrimaryEvidence = (message: string): Promise<void> => sendPrimaryEvidenceWarning(pi, primaryEvidenceNoticeTarget, message);
+  const warnPrimaryEvidence = (message: string): Promise<void> => sendPrimaryEvidenceWarning(localUiTarget, message);
   const applyPrimaryEvidenceSettings = createPrimaryEvidenceSettings({
     config, state, cwd: () => currentCwd, persist: () => sessionPersistence.persist(), warn: warnPrimaryEvidence,
     reviewActive: () => reviewCancellation.current() !== undefined,
@@ -517,7 +520,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     observeCwd: (args) => { currentCwd = extractCwd(args, currentCwd); },
     cwd: () => currentCwd,
     syncExecutionContext: (args) => {
-      primaryEvidenceNoticeTarget = extractContext(args) ?? pi;
+      localUiTarget = extractContext(args) ?? pi;
       updateScopedModels(args);
       executionTools.setScopedModels(currentScopedModels);
       executionTools.setUiContext(extractContext(args) ?? pi);
@@ -705,6 +708,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     updateScopedModels(args);
     executionTools.setScopedModels(currentScopedModels);
     executionTools.setUiContext(context ?? pi);
+    localUiTarget = context ?? pi;
     discardSessionState(state);
     checkpointRestartBlocked = undefined;
     sessionPersistence.resetLedger();
@@ -1096,7 +1100,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     if (!window || !shouldRecordToolResultEvidence(name, toolError)) {
       return;
     }
-    const evidencePolicy = primaryEvidencePolicy(config);
+    const evidencePolicy = primaryEvidencePolicy(config, state);
     if (evidencePolicy.toolOnly || evidencePolicy.snapshotFailureFallback || window.baseline?.kind === "tool") {
       await reviewTurn.trackEvidenceCapture(retainPrimaryToolAfter({
         state: window.evidence, cwd: currentCwd, toolName: name, toolInput: toolArgs, config,
@@ -1179,7 +1183,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // setEnabled, which stops or starts the timers immediately.
     schedulerRuntime: schedulerSwitch,
     onSaved: async (_saved, previousMode, context) => {
-      primaryEvidenceNoticeTarget = context ?? pi;
+      localUiTarget = context ?? pi;
       await reviewTurn.drainEvidenceCaptures();
       await applyPrimaryEvidenceSettings();
       executionTools.sync();

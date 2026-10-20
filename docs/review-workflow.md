@@ -195,6 +195,14 @@ a pass, independent `REPORT` additions alone do not retrigger tool-only review w
 new observed changes. A new observed edit still requires review; a summary alone is
 not proof of a change or a passing verdict.
 
+Automatic Primary tool-only review, including snapshot-failure fallback, needs
+reviewable change evidence: retained changed content, a mutation-capable or uncertain
+observation (for example a shell command, an edit tool, or bounded/truncated evidence),
+or an outstanding correction requirement. The evidence method, its warning, an assistant
+summary, or known read-only observations (`read`, `grep`, `find`, `ls`, `GitRead`, web
+fetch/search) alone run no reviewer, the same as a snapshot review with no changes;
+`/review-now` follows that same no-change rule. Reviewer questions are unchanged.
+
 This is a narrower evidence basis, not perfect authorship or universal side-effect
 coverage. Adapter events can be missing, unsupported, bounded, or truncated;
 `run-as-binary` supplies no structured tool events. Missing or unavailable observations
@@ -231,17 +239,30 @@ snapshot is disclosed, not fabricated, and actual fallback records its tool-only
 durably. This is different from losing or corrupting a previously persisted basis.
 
 Every actual fallback emits a prominent warning identifying the originating context
-(Primary, isolated worktree, or InPlace) to the user and implementing model, and labels
-the reviewer input with the actual **Tools only (snapshot-failure fallback)** basis and failed snapshot coverage.
+(Primary, isolated worktree, or InPlace), and labels the reviewer input with the actual
+**Tools only (snapshot-failure fallback)** basis and failed snapshot coverage. A Primary
+evidence warning is a local warning-level notice to the user only: it is never sent to
+the model as a custom message, steering, or follow-up, and never starts a model turn.
+Worker fallback warnings keep their existing delivery to the worker's implementing model.
 Evidence and user/model provenance stay truthful; a worker fallback is not presented
 as Primary activity. A settings description, log entry, or optional notice is not a
 substitute for this actual-use warning. Fallback neither approves the work nor creates
 a snapshot-equivalent verdict: the configured reviewer still has to run and return a
 usable result under the ordinary gate.
 
-Fallback is not sticky: when the configured Primary or captured worker policy prefers
-snapshots, retry snapshot capture on later review cycles and continuations, warning
-prominently on each actual fallback. A later successful baseline cannot fabricate
+Primary fallback applies for the session. After the first eligible Primary fallback,
+Primary acts as **Tools only** for the rest of the session: later turns, reviews, and
+continuations make no snapshot capture attempt and show no further fallback warning,
+while actual reviews stay labelled **Tools only (snapshot-failure fallback)**. This
+runtime state is never saved: the configured preference, its menu value, and Save are
+unaffected. `/review-clear` (which also discards the current review window) or a new
+session ends it; the next prompt's ordinary capture then tries the configured snapshot
+preference once, and an eligible failure warns again and returns to **Tools only**. While
+fallback is Off this session state does not apply, so capture failure blocks.
+
+Worker fallback is not sticky: when the captured worker policy prefers snapshots, retry
+snapshot capture on later review cycles and continuations, warning prominently on each
+actual fallback. A later successful baseline cannot fabricate
 coverage before it existed or discard retained current-work tool evidence, including
 when the first baseline was unavailable. Missing structured observations do not block
 degraded review; the evidence and limitations must remain explicit as above.
@@ -303,9 +324,12 @@ and authenticated; menu-only checks need no model call.
 5. In a controlled test setup that induces only a review-evidence capture failure,
    compare fallback Off (blocked) with On (tool-only review plus the actual origin-correct
    warning and reviewer disclosure). Include a first Primary and first InPlace baseline
-   failure before work. Restore capture and verify later cycles/continuations retry
-   snapshots without losing retained tool evidence or inventing earlier coverage;
-   each repeated actual fallback must warn again. Do not simulate an eligible failure
+   failure before work. For Primary, verify the warning is local only (no model turn),
+   a no-change or read-only response runs no reviewer, and later turns make no capture
+   attempt until `/review-clear` or a new session. For workers, restore capture and
+   verify later cycles/continuations retry snapshots without losing retained tool
+   evidence or inventing earlier coverage; each repeated actual worker fallback must
+   warn again. Do not simulate an eligible failure
    by deleting saved evidence or breaking construction/checkpoint/landing: those must
    still block. A capture fault
    that cannot be isolated from durability is not a successful fallback exercise.
@@ -531,7 +555,9 @@ content or private paths into the completion notice. With no review running,
 - `/review-clear` discards the active or retained review window, including its baseline,
   request history, captured evidence, prior reviewer feedback, held correction feedback,
   and queued user input. The next ordinary prompt starts a fresh window from the
-  workspace's current contents. It does not revert files or override bundle retention:
+  workspace's current contents. It also ends a session's Primary snapshot-failure
+  fallback, so that prompt's ordinary capture tries the configured snapshot preference
+  again; clearing itself captures nothing. It does not revert files or override bundle retention:
   bundles continue to be retained or removed by the configured `retainBundles` policy,
   and already-retained bundles remain governed by that policy. Reviewer sessions are
   never reused between passes. If a review is currently running, cancel it first and

@@ -5,12 +5,25 @@ import { extractCandidatePaths, type EvidenceState } from "./evidence";
 import { expandHomePath } from "./apply-patch/paths";
 import { resolve } from "node:path";
 import { redactSensitiveText } from "./redaction";
+import type { EvidenceEvent } from "./evidence";
 
 /** Per-invocation policy. Worker callers must pass their captured scope explicitly. */
 export interface ReviewEvidencePolicy {
   toolOnly: boolean;
   snapshotFailureFallback: boolean;
   scope: "primary" | "worktree" | "inplace";
+  /** Primary provenance only (#465): Tools only is session-effective because an
+   * earlier eligible snapshot capture failed this session. Same Tools only
+   * behavior; it only labels the reason and never retries capture. */
+  sessionFallback?: true;
+  /** Primary only: the live session whose first eligible fallback latches Tools only. */
+  session?: PrimaryEvidenceSession;
+}
+
+/** Runtime-only Primary session fact (#465). Lives on ReviewGateState, is reset
+ * at session boundaries, and is never persisted or written to configuration. */
+export interface PrimaryEvidenceSession {
+  primarySnapshotFallback?: boolean;
 }
 export type ReviewEvidenceMethod = "snapshot" | "tool-only" | "tool-only-fallback";
 export const TOOLS_ONLY_LABEL = "Tools only";
@@ -20,13 +33,46 @@ export function evidenceMethodLabel(toolOnly: boolean): string {
   return toolOnly ? TOOLS_ONLY_LABEL : WORKSPACE_CHANGES_LABEL;
 }
 export const TOOL_ONLY_HISTORY_NOTICE = `Earlier work used ${TOOLS_ONLY_LABEL}: no pre-work snapshot covers that interval. A new ${WORKSPACE_CHANGES_LABEL} snapshot baseline covers subsequent work only; earlier actions and claims are not exact-snapshot certification.`;
-export function primaryEvidencePolicy(config: ReviewGateConfig): ReviewEvidencePolicy {
+// Concise local user warning text (#465). Never reviewer instructions or model
+// input; reviewer bundles and transmissions keep evidenceMethodNotice provenance.
+const TOOLS_ONLY_USER_NOTE = "Reviews cover observed tool activity; unobserved workspace changes are not reviewed.";
+export const PRIMARY_SESSION_FALLBACK_NOTICE = `Primary uses ${TOOLS_ONLY_LABEL} for the rest of this session; snapshot capture is not retried automatically. The fallback does not change saved settings. Optional: /review-clear discards the current review window and lets the next prompt try a snapshot again.`;
+/** User warning for an actual Primary Tools only review or method change. */
+export const PRIMARY_TOOLS_ONLY_USER_WARNING = `WARNING: Review evidence method: ${TOOLS_ONLY_LABEL}. ${TOOLS_ONLY_USER_NOTE}`;
+export const PRIMARY_TOOLS_ONLY_USER_NOTE = TOOLS_ONLY_USER_NOTE;
+/** User warning for an actual Primary snapshot-failure fallback. */
+export function primaryFallbackUserWarning(sessionTransition = true): string {
+  return `WARNING: Review evidence method: ${TOOLS_ONLY_LABEL} (snapshot-failure fallback). The workspace snapshot could not be captured; current tool evidence is kept. ${sessionTransition ? `${PRIMARY_SESSION_FALLBACK_NOTICE} ` : ""}${TOOLS_ONLY_USER_NOTE}`;
+}
+export const PRIMARY_SNAPSHOT_RECOVERED_USER_NOTE = "Snapshot capture recovered; a new snapshot baseline covers later work only, and earlier Tools only work is not snapshot-certified.";
+/** Session-effective Primary policy. Configured preference stays the saved value;
+ * an eligible fallback earlier in this session makes it act as Tools only. */
+export function primaryEvidencePolicy(config: ReviewGateConfig, session?: PrimaryEvidenceSession): ReviewEvidencePolicy {
   const settings = effectiveReviewEvidenceSettings(config);
-  return { toolOnly: settings.primaryToolOnly, snapshotFailureFallback: settings.snapshotFailureFallback, scope: "primary" };
+  // Fallback Off keeps blocking: the session fact applies only while fallback is On.
+  const sessionFallback = !settings.primaryToolOnly && settings.snapshotFailureFallback && session?.primarySnapshotFallback === true;
+  return { toolOnly: settings.primaryToolOnly || sessionFallback, snapshotFailureFallback: settings.snapshotFailureFallback, scope: "primary",
+    ...(sessionFallback ? { sessionFallback: true as const } : {}), ...(session ? { session } : {}) };
+}
+/** Latch the first eligible Primary fallback for this session. True only on the transition. */
+export function latchPrimarySnapshotFallback(session: PrimaryEvidenceSession | undefined): boolean {
+  if (!session || session.primarySnapshotFallback === true) return false;
+  session.primarySnapshotFallback = true;
+  return true;
 }
 export function evidenceMethodNotice(method: ReviewEvidenceMethod): string {
   return method === "snapshot" ? `Review evidence method: ${WORKSPACE_CHANGES_LABEL}.`
     : `WARNING: Review evidence method: ${TOOLS_ONLY_LABEL}${method === "tool-only-fallback" ? " (snapshot-failure fallback)" : ""}. ${method === "tool-only-fallback" ? "Automatic snapshot capture failed; CURRENT tool evidence was preserved, not reset. " : ""}Available observed tool evidence and supplied claims/context are assessed with their disclosed limits; missing observations are not proof of no effects. This is NOT certification of an exact workspace snapshot. Unobserved external edits are outside this review.`;
+}
+
+const KNOWN_READ_ONLY_TOOLS = new Set(["read", "grep", "glob", "find", "ls", "gitread", "websearch", "webfetch", "browserscreenshot"]);
+/** Primary tool-method change evidence (#465). Known read-only observations
+ * (including their errors) alone are not reviewable work; every other tool,
+ * any named candidate path, and any mutation/risk signal stays conservative. */
+export function isReviewableToolObservation(event: EvidenceEvent): boolean {
+  return !KNOWN_READ_ONLY_TOOLS.has(event.toolName.trim().toLowerCase())
+    || event.candidatePaths.length > 0
+    || event.riskSignals.some((signal) => signal !== "tool_result_error");
 }
 
 /** Raised only by acquisition stages, never baseline verification/comparison/cleanup. */

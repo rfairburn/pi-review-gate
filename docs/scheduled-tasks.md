@@ -81,7 +81,13 @@ any stored copy going stale:
   catalog — it does not have to appear on the kind's global route, because
   route membership would defeat the entry's independence from later route
   edits. Research capability is still enforced: a `research` entry may only
-  name a research-capable resource.
+  name a research-capable resource. If a `/review-settings` change removes the
+  pinned resource, or leaves it unable to serve the entry, an enabled entry is
+  disabled before the scheduler replans, with a local user-only warning and no
+  model message or turn. It keeps its pin and never runs or switches workers
+  until you choose an available worker and enable it again. An occurrence that
+  was already queued for that worker is ended without a worker attempt and
+  reported to you only.
 - **Review:** an entry with no `review` inherits the current global subtask
   review settings at run time. An explicit choice is task-local and frozen per
   run: `{ "mode": "off" }` runs the task's subtasks without review — allowed

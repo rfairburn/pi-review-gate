@@ -40,6 +40,23 @@ export async function sendNotice(pi: unknown, message: string): Promise<void> {
   }
 }
 
+/**
+ * Prominent user-only warning (#465): Pi's native warning-level UI notice, the
+ * same channel as settings-menu warnings. Deliberately has no
+ * `sendSystemMessage`, custom-message, steering, follow-up, or turn-triggering
+ * fallback: a warning must never become model input or start a model turn.
+ */
+export async function sendLocalWarning(target: unknown, message: string): Promise<void> {
+  if (!isRecord(target)) return;
+  if (isRecord(target.ui) && typeof target.ui.notify === "function") {
+    await target.ui.notify(message, "warning");
+  } else if (typeof target.notify === "function") {
+    await target.notify(message, "warning");
+  } else if (typeof target.log === "function") {
+    target.log(message);
+  }
+}
+
 /** Capture one native event's UI target while suppressing notices after its session owner retires. */
 export function captureSessionNotice(
   pi: unknown,

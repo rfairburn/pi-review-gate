@@ -114,9 +114,10 @@ The optional `review.evidence.snapshotFailureFallback` setting defaults **Off**.
 snapshot capture failure remains blocking unless fallback is explicitly enabled and
 the failed operation qualifies as review-evidence capture only. When eligible, fallback
 uses retained current tool evidence with a durable, truthful tool-only basis and a
-prominent warning on every actual fallback identifying the originating review context to
-the user and implementing model; reviewer input discloses the same basis and missing snapshot
-coverage. A menu description, log entry, or optional notice alone is not the warning.
+prominent warning identifying the originating review context (for Primary, a local
+user-only warning that never becomes model input or starts a model turn; for workers,
+also delivered to the worker's implementing model); reviewer input discloses the same
+basis and missing snapshot coverage. A menu description, log entry, or optional notice alone is not the warning.
 A fallback is not approval, reconstructed snapshot coverage, or a successful recovery
 checkpoint. See [Review workflow](review-workflow.md#snapshot-failure-fallback).
 
@@ -128,8 +129,13 @@ or mismatched persisted evidence remains blocking, including an InPlace continua
 with no terminal result. Never delete a baseline to try to activate fallback or silently
 re-baseline over prior work.
 
-Fallback is not sticky: when configured/captured policy prefers snapshots, retry capture
-on later cycles/continuations and warn prominently on each actual fallback. A later
+An eligible Primary fallback makes Primary act as Tools only for the rest of the
+session: no later capture retries or repeated warnings, and no automatic review for
+no-change or read-only turns. To try snapshots again within the session, use
+`/review-clear` (it also discards the current review window); the next prompt captures
+once under the configured preference. A new session also resumes it. Worker fallback is
+not sticky: when captured worker policy prefers snapshots, retry capture on later
+cycles/continuations and warn prominently on each actual worker fallback. A later
 successful baseline cannot fabricate earlier coverage or discard retained current-work
 tool evidence. Missing/unavailable structured observations do not block degraded review:
 show as much retained evidence as collected, disclose adapter/capture limits, and permit

@@ -600,9 +600,8 @@ Capacity never refuses creation. A stale lock — one whose recorded pid is gone
 whose record stays empty/malformed across several observations — is reclaimed instead
 of becoming a permanent stop condition; a live owner is left alone and the producer
 skips cleanup with a bounded warning, then still creates its generation. An existing
-session-host ownership record makes cleanup skip the cache entirely. A real filesystem failure, an
-unsafe entry, or a `.terraform` subtree leaves that generation in place and reports a
-warning; startup continues and never claims a cleanup it did not perform. Generations
+session-host ownership record makes cleanup skip the cache entirely. A real filesystem failure
+or an unsafe entry leaves that generation in place and reports a warning; startup continues and never claims a cleanup it did not perform. Generations
 are removed in deterministic directory-name order; there is no age, size, or
 retention policy. `options.replacement` lets the isolated Pi producer retry its own settled incomplete
 version root after confirming that nothing was published; it applies the same
@@ -643,11 +642,9 @@ directory-heavy, or long-path generation keeps pace with the budget instead of p
 process per descendant or exceeding the platform argument limit; any identity-query
 failure aborts that pass with a truthful warning instead of walking on with missing
 data, and when the bulk tool is unavailable the same walk falls back to one no-follow
-`unlink` per name. A direct-child entry named `.terraform` under the
-producer-owned cache is ordinary disposable content, not an exemption.
-`.terraform` content inside a selected disposable generation is cleanup-specific and is
-removed with it (ordinary source discovery still prunes it before traversal). Partial
-removal leaves the entry counted for a later retry. These are public path-API fences, not an atomic sandbox
+`unlink` per name. Ordinary direct-child entries and nested content in a selected
+disposable generation remain subject to those confinement rules. Partial removal
+leaves the entry counted for a later retry. These are public path-API fences, not an atomic sandbox
 against a malicious same-user writer. No real user cache is used by the focused tests.
 
 Every in-flight generation carries one `.producer-active` marker, and the per-cache
@@ -670,7 +667,6 @@ preference, and checksum-pinned fresh Node extraction semantics unchanged.
 The fallback Node wrappers reclaim excess direct-child artifacts under
 `.pi-review-gate/node/` before creating another one, using the same best-effort rules and
 the same per-agent coordination entry, ownership rechecks, and destructive-boundary stop.
-Neither wrapper exempts a direct child named `.terraform`.
 The supported PATH-Node fast route is unchanged, and no mutable extracted Node is
 reused. POSIX uses `scripts/node-generations.sh`; native PowerShell uses an
 in-memory Reflection.Emit handle identity plus the same bounded no-follow deletion, live

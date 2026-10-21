@@ -16,9 +16,10 @@ accept from an untrusted repository, task, or process environment:
   ([Configuration](configuration.md#config-discovery)), the private non-Git review
   checkpoint records under `sessions/pi-review-gate/`
   ([Review workflow](review-workflow.md#non-git-checkpoint-storage)), and the optional
-  `pi-review-sessions` host's global sidebar roster plus its single-host ownership
-  record under `session-host/`
-  ([Session host](session-host-alpha.md#requirements-and-launch)).
+  `pi-review-sessions` host's global sidebar roster, single-host ownership record,
+  protected network preferences, and peer identity/trust state under `session-host/`
+  ([Session host](session-host-alpha.md#requirements-and-launch),
+  [Session-host peer network](#session-host-peer-network-optional)).
 - `PI_REVIEW_GATE_DISABLED` — the documented kill switch.
 - `PI_REVIEW_GATE_DDGS_VENV`, `XDG_CACHE_HOME` / `HOME` — venv and cache locations for
   the web search bridge. The default venv lives in a user-writable cache by design.
@@ -106,6 +107,81 @@ integration, ConPTY behavior, and restoration remain incomplete and require sepa
 native-platform validation. This IPC support does not establish Windows host parity,
 delivery readiness, security equivalence with the POSIX filesystem boundary, or a
 private Windows ACL guarantee.
+
+### Session-host peer network (optional)
+
+The optional `pi-review-sessions` host can expose a **Network** sidebar for explicit
+pairing and metadata-only remote session rows. Ordinary Pi sessions and the standalone
+review-gate launchers are unchanged and start no peer listener or client. This is an
+optional alpha surface: it does not certify native-Windows UI, physical input, mobile,
+browser, or release readiness.
+
+The transport is direct TLS/WSS with generated self-signed certificates. The authority for
+a peer is the exact subject-public-key information proved by its TLS handshake, not a
+CA-issued certificate, public domain name, SSH identity, or QR/code ceremony; no CA,
+domain, or other certificate-management service is required or consulted. First contact
+accepts an unknown key only through a bounded local human confirmation: accepting that key
+without independently comparing its fingerprint does not defeat an active interceptor
+during the first pairing, and later pin verification protects continuity rather than the
+authenticity of that first acceptance. A remembered key that changed, a missing
+initialized trust document, or a mismatched receiving identity fails closed. An explicit
+Connect does not replace a changed known key; only removing the destination and re-adding
+it starts a fresh confirmation. A key approval, a new incoming request, and a grant are
+separate facts. Directional grants are independent: A approving B does not grant A access
+to B.
+
+Human consent for an incoming request and for a first-use server key is bounded to two
+minutes, which is an approval deadline, not a trust or grant lifetime. The dialog latches
+the exact name, fingerprint, and endpoint captured at arrival (an endpoint that was not
+provided stays unknown), and its controls authorize only after the exact current frame
+was actually written; a resized or semantically changed frame must be written again.
+Incoming arrivals raise a persistent roster alert without stealing focus from the native
+owner, and the default-on bell is one best-effort attempt per arrival with a menu opt-out;
+muting it never hides the visual alert. A hidden or narrow sidebar may show a bounded
+alert band that reserves real rows and can resize or reflow the local child; it offers no
+approval control. Approval applies only to the exact live request and expires with the
+window; closing the view cannot invent a decision.
+
+Trust and preferences are stored separately. The protected trust document holds the local
+identity, accepted peers, directional receiving grants, and remembered outgoing server
+keys; it has no age-based expiry: outgoing pins persist until an explicit Remove of their
+destination, and receiving permission persists until an explicit Revoke. Hosting intent,
+the Auto and bell settings, and saved destinations live in a separate protected
+preferences document, so changing a display setting never creates an identity, a peer-key
+directory, or key material. Both documents require verified actual operating-system
+protection (owner/private modes and supported ACL checks, or Windows owner/DACL evidence)
+before private or preference bytes are written. They are not encrypted at rest and use no
+OS credential-store service. Unknown, malformed, oversized, unknown-version,
+missing-initialized, or unsafe documents are refused untouched: there is no repair, reset,
+rotation, backup search, sweep, or silent default overwrite. Same-account and
+OS-privileged access remains outside this boundary.
+
+A host with no saved network preferences creates no keys, preferences, trust document,
+listener, or connection at startup. Startup initializes no network state: it reads saved
+state and restores an explicitly saved hosting setting and schedules an eligible
+remembered Auto setting. A listener binds only an explicitly selected address and port
+shown to the operator; the application never substitutes a wildcard or fallback port,
+and it adds no discovery, SSH, or extra listener. Auto reconnect is off by default and
+attempts only previously connected destinations after startup or an unexpected loss, when
+a pin is currently remembered, no explicit suppression applies, and no terminal
+authorization failure has occurred; it never pairs, prompts for an unknown key, or
+replaces a changed pin. Disconnect keeps the association and suppresses automatic attempts
+until an explicit Connect, including across restarts. Remove forgets only this side's
+saved endpoint and remembered pin, and Revoke removes only this side's current receiving
+permission. Neither changes the opposite direction, stops a remote session, or shuts down
+the owning host.
+Shutdown closes only this host's owned local network resources and retains
+agent-directory ownership when local settlement is unconfirmed; it never waits for or
+claims a remote receipt or remote work outcome.
+
+The connected channel is a metadata-only projection of the owner's roster, not remote
+control. It carries bounded display facts, including the exact owner-side workspace path,
+and never the native current-file guard, agent/account directories, configuration,
+providers, credentials, prompts, transcripts, question text, terminal/output bytes, or
+image data. A lost projection is stale or unavailable, never idle or zero. There is no
+invented view-only permission kind: metadata-only is the implemented protocol scope.
+Remote terminal content and input, remote creation, `SessionSpawn`, Close, stop or resume,
+and clipboard attribution are unimplemented.
 
 ### Session-host clipboard transport
 
@@ -196,8 +272,7 @@ a second lifetime gate. Cleanup rechecks that record after any wait or stale-loc
 and at every destructive boundary, and it skips reclamation entirely when the per-agent
 coordination entry is unavailable instead of racing an ownership acquisition it cannot
 exclude. Reclamation is confined to one designated generation with
-no-follow link handling (links are unlinked, never traversed); a `.terraform` subtree
-inside a selected disposable generation is removed with it; partially removed entries
+no-follow link handling (links are unlinked, never traversed); partially removed entries
 stay counted for a later retry. One pass shares a single runtime budget and one progress
 allowance and deletes as it walks, so a large or deep generation makes real progress and is
 finished by later passes rather than being refused forever by a whole-tree bound, while a

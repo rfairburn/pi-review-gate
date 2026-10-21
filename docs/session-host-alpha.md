@@ -274,9 +274,10 @@ by a bounded index of the application inputs — `package.json`, `package-lock.j
 `tsconfig.json`, `src/`, `scripts/`, and `skills/` — captured during preparation. A
 recorded file's size, inode, device, mode, and modification/change times decide whether
 anything moved; only a metadata change triggers the small input checksum, which
-distinguishes a real edit from a touch-only change. `node_modules`, `dist`, `.git`,
-`docs`, `tests`, caches, private notes, and `.terraform` trees are never scanned or
-hashed. Added, edited, or deleted inputs invalidate; irrelevant or touch-only changes do
+distinguishes a real edit from a touch-only change. Only the explicit input roots are
+walked; other checkout trees, including top-level `node_modules`, `dist`, `.git`,
+`docs`, and `tests`, are not scanned or hashed. Added, edited, or deleted inputs
+invalidate; irrelevant or touch-only changes do
 not. A prepared generation is immutable installed code and keeps the same source
 identity as the checkout it came from, so starting a launcher from a prepared root never
 rebuilds recursively and never overwrites the checkout's freshness state.
@@ -332,9 +333,8 @@ creates its own, rechecks the ownership record after any wait or stale-lock reco
 and rechecks it again at every destructive boundary, so a host that becomes the owner
 mid-pass keeps the remaining generations. When that entry is unavailable (a busy live
 holder or an unremovable artifact) cleanup is skipped with a truthful warning and the
-launch continues; a direct-child `.terraform` entry and a special leaf (FIFO, socket, or
-device name) inside the producer-owned cache are ordinary disposable content and are
-unlinked without being opened. Active sessions stay protected by the host's own
+launch continues; a special leaf (FIFO, socket, or device name) inside the
+producer-owned cache is unlinked without being opened. Active sessions stay protected by the host's own
 exclusive agent-directory ownership record; cache entries are not a second lifetime
 gate, and no consumer is killed to obtain space. No age/size quotas, per-file creation
 receipts, mount censuses, or checkpoint/history cleanup are added; the `.producer-active`
@@ -583,18 +583,25 @@ copy of the truth. The sidebar projects the manager's current process/session fa
 remembered roster slots, their ordering, and the active selection remain separate
 presentation metadata. Those remembered observations never become a second authoritative
 process or status store. This ownership is
-local to one host process on one machine. It implies no remote control, no second host
-sharing the same sessions, and no change to how each child's own terminal, input, or saved
-conversations behave.
+local to one host process on one machine. A connected peer may see a metadata-only
+projection of this manager's roster (see
+[Network sidebar](#network-sidebar-hosting-pairing-and-remote-metadata)), but that implies
+no remote control, no second host sharing the same sessions, and no change to how each
+child's own terminal, input, or saved conversations behave.
 
 ### Paired peer transport foundation
 
-The source includes a separate, inert TLS/WSS peer-transport foundation (#475). It is
-**not wired into session-host or standalone startup**: there is no remote-session UI,
-network setting, automatic listener, or production pairing/key store yet. Importing the
-module creates no keys, files, sockets, or listeners. Explicit callers supply owned
-identity material, trust/grant stores and local consent callbacks, then explicitly bind
-an address. The current session host remains local-only.
+The source includes a TLS/WSS peer-transport foundation (#475). The optional native
+session host uses it for the
+[Network sidebar](#network-sidebar-hosting-pairing-and-remote-metadata); ordinary Pi
+sessions and the standalone review-gate launchers never start it. The transport modules
+themselves remain inert: importing or constructing them creates no keys, files, sockets,
+or listeners. Explicit callers supply owned identity material, trust/grant stores and
+local consent callbacks, then explicitly bind an address. A fresh host with no saved
+network preferences and no explicit network action starts no listener and no connection.
+With saved preferences, startup restores only what was explicitly saved: an enabled
+hosting setting may restore a listener, and an eligible remembered Auto setting may
+reconnect previously connected destinations. Those two roles are independent.
 
 The foundation follows KDE-style explicit device acceptance, using generated self-signed
 certificates and the exact peer key proved by TLS rather than public website PKI. Direct
@@ -608,22 +615,68 @@ remembered-key change is refused rather than silently accepted.
 Accepting an unknown identity without independently comparing its fingerprint does not
 defeat an active interceptor during first pairing. Later key verification protects
 continuity, not the authenticity of that first acceptance. No mandatory QR/code ceremony
-is added. Persistent identity storage, pairing controls, discovery, reconnection UI,
-and clipboard routing remain separate integration work. The only session-level protocol
+is added. Protected identity/trust storage is described below. The network sidebar
+supplies the explicit pairing controls, saved connection preferences and bounded automatic
+recovery; discovery and clipboard attribution remain unimplemented. The only session-level protocol
 implemented so far is the bounded roster-metadata channel described next; remote session
 content, terminal input, and session operations remain unimplemented. Native
 client-only mobile implementations can use this trust model; ordinary browser WebSockets
 do not expose self-signed certificate pinning and are not claimed supported.
 
+### Explicit protected peer-state foundation
+
+The source includes an explicit `openPeerStateStore({ agentDir })` entry point (#480).
+It uses the actual platform permission policy rather than a caller-selected test probe.
+Opening a fresh agent directory creates nothing; `initializeIdentity(label)` is the
+separate explicit action that generates and publishes a new identity. Normal startup
+never initializes an identity; only an explicit Enable hosting or Connect does, and only
+when no identity exists. A single bounded, versioned document at
+`<agentDir>/session-host/peers/state.json` holds the identity, accepted peers, directional
+receiving grants and independent outgoing remembered-key slots. It stores trust, not
+connection addresses, automatic reconnect preferences or a remote sidebar roster.
+Connection addresses and automatic reconnect preferences live in the separate protected
+preferences document described below; remote roster observations remain in memory.
+
+The application does not encrypt this file at rest or require an OS credential-store
+service. It verifies owner-only filesystem protection before secret bytes are written:
+POSIX ownership/private modes and supported extended-ACL checks, or actual Windows
+owner/DACL evidence. Existing unsafe files are refused, not permission-repaired. Unknown,
+malformed, oversized, missing initialized state or mismatched certificate/key/receiving
+identity is unavailable, never a fresh identity or empty-trust fallback. Initialization
+cannot silently replace a previously used identity. Fixed errors do not expose private
+keys or raw native diagnostics; same-account and OS-privileged access is outside this
+protection boundary.
+
+**Pair once, reconnect until revoked.** Reopening the same protected identity and stores
+retains the exact peer keys and directional grants without approval on each connection or
+session. Permission has no age-based expiry; disconnects and host restarts do not revoke
+it. Each outgoing target has its own remembered pin, and A accessing B never grants B
+access to A. Changed keys are refused, and a different receiving identity cannot inherit
+old grants. A pending human-approval deadline is separate from that remembered permission:
+the pairing callback exposes its configured deadline and a fixed settlement outcome for
+host-owned notifications, not a grant-expiry timer or proof the peer received a
+reply. The network sidebar's two-minute approval window is not a two-minute grant
+lifetime.
+
+Each synchronous store mutation publishes a complete candidate before making it usable
+in memory. The host's separate acceptance and grant writes are not one atomic pairing
+transaction; both current facts are still required. Uncertain publication invalidates the
+handle rather than asserting a successful rollback. File sync, atomic publication and
+best-effort directory sync are scoped guarantees, not a power-loss guarantee. This is a
+single-writer component under the existing owning-host lifecycle, not another daemon or
+an arbitrary multi-process database. Windows storage tests are filesystem evidence only,
+not native terminal UI readiness. The network sidebar is the explicit human-accessible
+pairing surface built on this foundation; starting a host still initializes nothing by
+itself.
+
 ### Remote roster metadata foundation (metadata only)
 
-The source also includes an explicitly constructed, metadata-only roster bridge over that
-peer transport (#478). Like the transport, it is **not wired into session-host or
-standalone startup**: no command-line option, setting, automatic listener, pairing UI, or
-remote sidebar exists, and importing the modules creates no keys, socket, or listener by
-itself. Existing local owner, viewer, and passive behavior stays fully active, so this is
-not a dormant feature: only the remote client side of this checkpoint is unreachable
-without an explicit caller. The transport it uses is ordinary TLS/WSS, not a stub.
+The source also includes a metadata-only roster bridge over that peer transport (#478).
+The network sidebar attaches one viewer per connected destination, so the bridge is
+reachable from the optional native session host. Ordinary Pi, the standalone launchers,
+and importing the modules still start no networking by themselves. Existing local owner,
+viewer, and passive behavior stays fully active. The transport it uses is ordinary
+TLS/WSS, not a stub.
 
 The owner side observes the same single local session manager that already backs local
 session operations, through a coherent snapshot-and-watch seam keyed to a fresh owner
@@ -659,15 +712,115 @@ unavailable owner — means *not current*, never idle and never zero. No second
 controlling host, separate ACL, exclusive-controller lease, or new revocation lifecycle
 policy is added.
 
-This checkpoint is an **internal-only automated-testing foundation**, not an announced
-remote feature and not an installation or release instruction. There is no new manual
-cross-machine workflow to run; the existing optional local manual comparison steps below
-remain useful for checking the current local host. Still unimplemented: production
-identity/trust persistence, a listener/consent/pairing surface, the remote sidebar UI,
-terminal streaming and remote input, creation/Close/`SessionSpawn` routing over a peer,
-reconnection UI or backoff, and clipboard attribution. No Windows, native-mobile,
-browser, or physical readiness is claimed, and no completed cross-machine operation is
-claimed.
+The roster projection stays metadata-only: connecting a destination never adds remote
+terminal content, input, or session operations, and a client cannot create, stop, or close
+an owner session. That is an implemented protocol scope, not a view-only permission kind.
+See the network sidebar's operational behavior and optional manual comparison next.
+
+### Network sidebar: hosting, pairing, and remote metadata
+
+The optional native session host exposes a **Network** entry in its sidebar when the
+network UI snapshot is attached. Ordinary Pi sessions and both standalone review-gate
+launchers are unchanged and have no Network entry. The sidebar is a pure display and
+command frontend: one coordinator owned by the host performs every listener, client,
+consent, trust-store, and preference write. Remote rows are metadata only and never
+become local sessions.
+
+**Fresh start versus saved state.** With no saved network preferences, a fresh host
+creates no peer keys or identity, no preferences or trust document, no listener, and no
+connection. Starting a host initializes no network state: it reads saved state, then
+restores an explicitly saved hosting setting and schedules an eligible remembered Auto
+setting, but never creates an identity, starts discovery, or silently chooses an address
+or port. The first explicit Enable hosting or Connect creates an identity when none
+exists. Hosting is initially off, and
+the Network pane requires an explicit listen address and port and shows the address and
+port actually bound. Disabling hosting stops the listener and keeps the saved setting;
+the operator's explicit address and port are the only bind input, and no wildcard or
+fallback is substituted. There is no daemon between host runs.
+
+**Destinations, pins, and approval.** Each saved destination is a local alias and
+endpoint with its own remembered server key; saving a destination creates no key, socket,
+or connection. When first pairing is needed, Connect requires the receiving person to
+approve the incoming request and the connecting person to confirm the
+exact server key their TLS handshake actually proved. The approval window is two minutes
+and is a human deadline, not a grant lifetime. Consent is shown with the immutable name,
+fingerprint, and endpoint captured when the request arrived (an endpoint that was not
+provided stays unknown), and its controls become actionable only after that exact dialog
+has actually been written; a resized or semantically changed dialog must be written again
+before it can approve or deny anything.
+Incoming requests also raise a persistent, non-focus-stealing alert in the roster, and a
+bell is attempted once when the request arrives when the remembered bell setting is on
+(it defaults on and can be turned off); the visual alert persists with the bell muted.
+The alert is not a modal and never takes focus or changes the selected native owner. When
+the roster is hidden or too narrow for a usable pane, a bounded alert band reserves real
+rows and may resize or reflow the local child; it renders no approval control.
+
+Association is one-time and persists until revoked, with no age-based expiry. Reopening
+the same identity and trust store needs no repeated approval. A changed key, missing
+initialized trust, or unsafe/corrupt store fails closed: it is reported and never
+re-paired, repaired, rotated, or overwritten, and an explicit Connect does not replace a
+changed remembered key. Independently verify the intended identity before choosing to
+Remove and re-add a destination to confirm a new key.
+Receiving approval is directional: A approving B lets B connect to A and does not grant A
+access to B.
+
+**Remembered settings and automatic recovery.** Auto reconnect is off by default. When
+enabled, it recovers only previously connected destinations after host start or an
+unexpected loss, and only when a pin is currently remembered, no explicit suppression
+applies, and no terminal authorization failure has occurred. It never prompts for an
+unknown key, never pairs automatically, and never replaces a changed pin. The bounded
+retry schedule is owned by the coordinator and is cancelled on Disconnect, Remove,
+turning Auto off, or host close. A healthy connected destination is not stopped by
+turning Auto off. Disconnect keeps the association but persists suppression until an
+explicit Connect, including across host restarts.
+
+**What each action does and does not do.** In the Network pane, Enter opens the
+highlighted control or row, and `c`, `x`, `r`, and `v` connect, disconnect, remove, and
+revoke the highlighted destination or receiving permission. Removing a destination
+forgets only this side's saved endpoint and local remembered pin; re-adding it requires
+confirming the key again. It never revokes the other host's receiving grant and never
+stops its sessions. Revoke removes only this side's current receiving permission for that
+peer; it does not change the opposite direction, stop a session, or shut down the owning
+host. None of
+Disconnect, Remove, or Revoke stops remote work. A receiving grant has no view-only
+variant: connected metadata is the implemented protocol scope, not a permission kind.
+
+**Ownership and shutdown.** Several destinations may be connected at once; only a
+selected local native session supplies displayed session content. A remote row is
+a separate typed entry, not a local session row; it shows the owner-side roster facts and
+honest current or stale state, and Enter on it only opens a metadata-only notice and
+leaves native selection and input ownership unchanged. There is no remote terminal
+streaming or input, no remote creation, `SessionSpawn`, Close, stop, or resume, and no
+clipboard attribution. Host shutdown closes only this host's owned local network
+resources and waits for that local settlement; an unconfirmed close is reported and
+retains agent-directory ownership. It never waits for a remote receipt or remote work.
+
+**Settings and trust storage.** Hosting intent, the Auto and bell settings, and saved
+destinations are kept in a protected preferences document below the session-host state
+directory, separate from the key/trust document. Saving a setting such as muting the bell
+never creates an identity, a `peers` directory, or key material. Both documents require
+verified operating-system protection before private or preference bytes are written;
+they are not encrypted at rest and use no OS credential-store service. Existing unsafe,
+malformed, unknown-version, or missing-initialized documents are refused untouched and
+never repaired, reset, or rotated. Same-account and OS-privileged access remains outside
+this boundary.
+
+Trust, storage, and consent boundaries are detailed in
+[Session-host peer network](security-model.md#session-host-peer-network-optional).
+This sidebar changes no Windows, native-mobile, browser, or physical-input certification
+claim; the alpha platform limitations above still apply.
+
+**Optional two-host comparison.** To check the current alpha by hand on two machines,
+run the optional `pi-review-sessions` host on each. On host A, open **Network**, enter an
+explicit listen address and port, apply, and start hosting; on host B, add a destination
+for A's address and port and press Connect. Compare each host's displayed identity key
+with the fingerprint the other host shows for approval through an independent channel if
+you need to rule out an active interceptor during first pairing, then confirm the
+server-key dialog on B, approve A's incoming request, and compare B's remote rows with
+A's local roster. Disconnect on B and confirm the rows become stale,
+then remove the destination on B and confirm it forgets only that endpoint and local pin.
+These are optional manual alpha checks, not an installation, support, release, or
+cross-machine readiness claim; CI does not run them.
 
 ## Focus, display, and status
 
@@ -1377,9 +1530,14 @@ public PTY handle's no-argument `kill()` and still waits for its actual exit eve
 shutdown acknowledgement is never exit proof. The host does not scan for processes or
 promise to stop arbitrary detached descendants. A forced stop or a child whose exit
 could not be confirmed is reported truthfully; do not assume such a handle has exited.
+The optional network coordinator closes only this host's owned local listener, client
+connections, viewers, and timers that it actually owns. An unconfirmed local settlement is
+reported and keeps agent-directory ownership; shutdown never waits for a remote receipt
+and never stops a remote session or remote work.
 Native Pi configuration, credentials, conversations, and unknown files are preserved,
 not removed as part of host shutdown. Apart from deliberate Saved-file deletion,
-Host shortcuts saves, and the bounded terminal diagnostics log (written only after a
+Host shortcuts saves, explicit network actions that save settings or trust, and the
+bounded terminal diagnostics log (written only after a
 diagnostic, see [Terminal parser diagnostics](#terminal-parser-diagnostics)), the
 persistent roster and ownership record are the only
 session-host files changed by a normal run: the roster is republished atomically when

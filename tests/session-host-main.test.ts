@@ -24,11 +24,13 @@ import { createNativeSavedQueryInput, runNativeExternalEditor } from "../src/ses
 import { TerminalSurface, type TerminalFrame, type TerminalInputModes, type TerminalMouseReportingRequest } from "../src/session-host/terminal-surface";
 import { TerminalDiagnosticsLog } from "../src/session-host/terminal-diagnostics-log";
 import type { TerminalGraphicsFrame } from "../src/session-host/kitty-graphics";
-import { SidebarController } from "../src/session-host/sidebar";
+import { SidebarController, type SidebarAction } from "../src/session-host/sidebar";
 import { isSavedSessionAdmission, listSavedSessions, type SavedSessionCatalog } from "../src/session-host/saved-sessions";
 import { deleteSavedSessionFile, type SavedSessionDeletionOptions } from "../src/session-host/saved-deletion";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import type { NativeClipboardEvent } from "../src/session-host/native-clipboard";
+import type { PeerCoordinatorOptions } from "../src/session-host/network/peer-coordinator";
+import type { PeerCoordinator, PeerUiCommand, PeerUiConsent, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 import { __test, type SessionHostOptions } from "../src/session-host/main";
 import {
   createLocalOwningHostService,
@@ -216,6 +218,7 @@ class FakeWriter {
   closeStarted = false;
   submitsAfterClose = 0;
   invalidateCalls = 0;
+  settlementDisposition: SessionHostFrameDisposition = "written";
   readonly frames: { frame: ComposedHostFrame; cols: number; rows: number }[] = [];
   readonly order: string[];
 
@@ -240,7 +243,7 @@ class FakeWriter {
       this.pendingSettle = onSettled; // the superseded candidate is dropped, unsettled
       return;
     }
-    onSettled?.("written");
+    onSettled?.(this.settlementDisposition);
   }
 
   invalidate(): void {
@@ -708,6 +711,103 @@ function createHarness(
   return harness;
 }
 
+class FakePeerCoordinator implements PeerCoordinator {
+  options: PeerCoordinatorOptions | undefined;
+  readonly decisions: Array<{ id: string; decision: "approve" | "deny" }> = [];
+  readonly commands: PeerUiCommand[] = [];
+  closeCalls = 0;
+  closeFailure = false;
+  startGate: Promise<void> | undefined;
+  performGate: Promise<void> | undefined;
+  now: () => number = Date.now;
+  snapshot: PeerUiSnapshot = {
+    revision: 1, status: "ready", identityFingerprint: null,
+    settings: { hostingEnabled: false, bindHost: "", bindPort: null, autoReconnect: false, bellEnabled: true },
+    listener: { state: "off", host: null, port: null, message: null },
+    hosts: [], trustedPeers: [], consents: [], notice: null,
+  };
+  async start(): Promise<void> { this.options?.onChange(this.snapshot); if (this.startGate) await this.startGate; }
+  read(): PeerUiSnapshot { return this.snapshot; }
+  async perform(command: PeerUiCommand): Promise<void> { this.commands.push(command); if (this.performGate) await this.performGate; }
+  decideConsent(id: string, decision: "approve" | "deny"): boolean {
+    if (!this.snapshot.consents.some((consent) => consent.id === id)) return false;
+    this.decisions.push({ id, decision });
+    this.publish({ consents: this.snapshot.consents.filter((consent) => consent.id !== id) });
+    return true;
+  }
+  async close(): Promise<void> {
+    this.closeCalls++;
+    if (this.closeFailure) throw new Error("synthetic unconfirmed network cleanup");
+  }
+  publish(patch: Partial<PeerUiSnapshot>): void {
+    this.snapshot = { ...this.snapshot, ...patch, revision: this.snapshot.revision + 1 };
+    this.options?.onChange(this.snapshot);
+  }
+  incoming(consent: PeerUiConsent): void {
+    this.publish({ consents: [...this.snapshot.consents, consent] });
+    this.options?.onIncomingConsentArrival(consent.id);
+  }
+}
+
+function syntheticPeerConsent(id: string, requestedAt = Date.now()): PeerUiConsent {
+  return { id, kind: "incoming", label: "Expected peer", fingerprint: "A".repeat(43), endpoint: null,
+    requestedAt, expiresAt: requestedAt + 120_000 };
+}
+
+async function peerMainHarness(t: { after(callback: () => void): void }, configure?: (peer: FakePeerCoordinator) => void): Promise<{
+  harness: Harness; peer: FakePeerCoordinator; dispatch(action: SidebarAction): void; releases(): number;
+}> {
+  const agentDir = makeMainTestDirectory("peer-ui-agent");
+  writeFileSync(join(agentDir, "keybindings.json"), "{}", "utf8");
+  t.after(() => rmSync(agentDir, { recursive: true, force: true }));
+  const peer = new FakePeerCoordinator();
+  configure?.(peer);
+  const controllers: SidebarController[] = [];
+  let releaseCalls = 0;
+  let dispatch = (_action: SidebarAction): void => { assert.fail("Main did not install its sidebar action handler"); };
+  const harness = createHarness({}, {
+    createSessionSetup: () => ({ nativeSetup: true, nativeAgentDir: agentDir,
+      profileRegistry: { prepare: () => { throw new Error("fake manager must not prepare a native profile"); } } }),
+    openHostState: ({ agentDir: ownedDir, hostId }) => ({ status: "opened", state: {
+      agentDir: ownedDir, hostId, ownershipPath: join(ownedDir, "synthetic-owner"), roster: undefined, problem: undefined,
+      persist: () => true, release: () => { releaseCalls++; return true; },
+    } }),
+    createSidebar: (options) => {
+      if (!options?.onAction) throw new Error("Main did not supply a sidebar handler");
+      dispatch = options.onAction;
+      const controller = new SidebarController({ ...options, now: peer.now }); controllers.push(controller); return controller;
+    },
+    createPeerCoordinator: (options) => { peer.options = options; return peer; },
+  });
+  await ready(harness);
+  const controller = controllers[0];
+  assert.ok(controller, "capture Main's actual controller, not a detached fixture");
+  harness.sidebar = controller;
+  assert.ok(peer.options, "network coordinator is owned under the acquired native agent directory");
+  return { harness, peer, dispatch: (action) => dispatch(action), releases: () => releaseCalls };
+}
+
+async function reviewOldestPeerConsent(harness: Harness): Promise<void> {
+  harness.sidebar!.openPeerMenu();
+  await nextTurn();
+  for (let step = 0; step < 40; step++) {
+    const frame = harness.writer.frames.at(-1)?.frame;
+    const selected = frame?.lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33))
+      .find((line) => line.startsWith("> "));
+    // The narrow form can truncate the trailing countdown; the fixture's
+    // unique consent label remains visible before that bounded truncation.
+    if (selected?.startsWith("> ! Expected peer")) {
+      harness.terminal.emitInput(ENTER);
+      await nextTurn();
+      assert.equal(harness.sidebar!.peerConsentConfirmationActive, true);
+      return;
+    }
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+  }
+  assert.fail("the actual rendered network pane never offered its pending consent row");
+}
+
 async function nextTurn(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
@@ -911,6 +1011,282 @@ function emitMouse(
 
 function emitX10Mouse(terminal: FakeTerminal, column: number, row: number, button = 0): void {
   terminal.emitInput(`${ESC}[M${String.fromCharCode(button + 32, column + 33, row + 33)}`);
+}
+
+test("Main refuses a non-local selection target without changing its selected native owner", async () => {
+  let dispatch = (_action: SidebarAction): void => { assert.fail("sidebar action handler was not captured"); };
+  const controllers: SidebarController[] = [];
+  const harness = createHarness({}, {
+    createSidebar: (options) => {
+      if (!options?.onAction) throw new Error("Main did not supply its sidebar action handler");
+      dispatch = options.onAction;
+      const controller = new SidebarController(options);
+      controllers.push(controller);
+      return controller;
+    },
+  });
+  try {
+    const manager = await startTwoSessions(harness);
+    const controller = controllers[0];
+    assert.ok(controller, "the injected factory captured Main's actual sidebar");
+    const owner = controller.activeMainOwnerID;
+    assert.equal(owner, "native-2");
+    dispatch({ type: "select", id: "remote-host:foreign-row" });
+    await nextTurn();
+    assert.equal(controller.activeMainOwnerID, owner);
+    assert.equal(manager.views.length, 2);
+    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), "That local session is no longer available") !== undefined);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("incoming peer alert and optional bell never steal native focus; hidden sidebar has a visible alert band", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  try {
+    fillForm(harness.terminal, "/peer-alert-native-owner");
+    await nextTurn();
+    const owner = harness.sidebar!.activeMainOwnerID;
+    assert.ok(owner);
+    assert.equal(harness.sidebar!.focus, "main");
+    harness.terminal.emitInput(ALT_LEFT);
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar!.visible, false);
+    const a = syntheticPeerConsent("incoming-A");
+    peer.incoming(a);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main");
+    assert.equal(harness.sidebar!.visible, false, "arrival does not toggle visibility/focus preferences");
+    assert.equal(harness.sidebar!.activeMainOwnerID, owner);
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Incoming connection request"));
+    assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 1);
+    peer.publish({ notice: "Unrelated metadata update" });
+    peer.options!.onIncomingConsentArrival(a.id);
+    await nextTurn();
+    assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 1, "redraw/replay is not a new arrival");
+    peer.publish({ settings: { ...peer.snapshot.settings!, bellEnabled: false } });
+    peer.incoming(syntheticPeerConsent("incoming-B"));
+    await nextTurn();
+    assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 1);
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Incoming connection request"));
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("Main independently refuses queued peer approval until the exact confirmation is actually written", async (t) => {
+  const { harness, peer, dispatch } = await peerMainHarness(t);
+  try {
+    peer.incoming(syntheticPeerConsent("request-A"));
+    await nextTurn();
+    harness.writer.holdWrites = true;
+    await reviewOldestPeerConsent(harness);
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    const candidate = harness.sidebar!.capturePeerConsentPresentation();
+    assert.ok(candidate, "the queued complete dialog has only a candidate token");
+    assert.equal(candidate.decision, "approve");
+    dispatch({ type: "peer-consent", consentId: candidate.consentId, renderToken: candidate.renderToken, decision: "approve" });
+    assert.deepEqual(peer.decisions, [], "UI DTO/candidate alone is never approval authority");
+    await nextTurn();
+    harness.writer.drainHeldWrites();
+    const written = harness.sidebar!.capturePeerConsentPresentation();
+    assert.ok(written);
+    dispatch({ type: "peer-consent", consentId: written.consentId, renderToken: written.renderToken, decision: "approve" });
+    assert.deepEqual(peer.decisions, [{ id: "request-A", decision: "approve" }]);
+  } finally { harness.writer.holdWrites = false; assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("expired A and new B cannot turn a stale consent action into approval of B", async (t) => {
+  const { harness, peer, dispatch } = await peerMainHarness(t);
+  try {
+    peer.incoming(syntheticPeerConsent("request-A"));
+    await nextTurn();
+    await reviewOldestPeerConsent(harness);
+    const a = harness.sidebar!.capturePeerConsentPresentation();
+    assert.ok(a);
+    assert.equal(a.decision, "deny");
+    dispatch({ type: "peer-consent", consentId: a.consentId, renderToken: a.renderToken, decision: "approve" });
+    assert.deepEqual(peer.decisions, [], "a written Deny target is not an Approve receipt");
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    const approvedTarget = harness.sidebar!.capturePeerConsentPresentation();
+    assert.ok(approvedTarget && approvedTarget.decision === "approve", "A's positive target has now actually rendered");
+    peer.publish({ consents: [syntheticPeerConsent("request-B")] });
+    await nextTurn();
+    dispatch({ type: "peer-consent", consentId: approvedTarget.consentId, renderToken: approvedTarget.renderToken, decision: "approve" });
+    assert.deepEqual(peer.decisions, []);
+    assert.equal(peer.snapshot.consents[0]?.id, "request-B");
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("an unchanged receipt only preserves an already-written peer consent target", async (t) => {
+  const now = Date.now();
+  const { harness, peer, dispatch } = await peerMainHarness(t, (fixture) => { fixture.now = () => now; });
+  try {
+    peer.incoming(syntheticPeerConsent("unchanged-existing", now));
+    await nextTurn();
+    await reviewOldestPeerConsent(harness);
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    const written = harness.sidebar!.capturePeerConsentPresentation();
+    assert.ok(written && written.decision === "approve");
+    const before = harness.writer.frames.at(-1)!.frame;
+    harness.writer.settlementDisposition = "unchanged";
+    peer.publish({ notice: "An unrelated metadata observation" });
+    await nextTurn();
+    assert.deepEqual(harness.writer.frames.at(-1)!.frame, before, "the unchanged witness really has identical composed bytes/cursor");
+    assert.equal(harness.sidebar!.capturePeerConsentPresentation()?.renderToken, written.renderToken);
+    dispatch({ type: "peer-consent", consentId: written.consentId, renderToken: written.renderToken, decision: "approve" });
+    assert.deepEqual(peer.decisions, [{ id: written.consentId, decision: "approve" }]);
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("a new handshake with identical visible consent bytes cannot inherit an unchanged receipt", async (t) => {
+  const now = Date.now();
+  const { harness, peer, dispatch } = await peerMainHarness(t, (fixture) => { fixture.now = () => now; });
+  try {
+    peer.incoming(syntheticPeerConsent("identical-A", now));
+    await nextTurn();
+    await reviewOldestPeerConsent(harness);
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    const a = harness.sidebar!.capturePeerConsentPresentation();
+    assert.ok(a && a.decision === "approve");
+    const aFrame = harness.writer.frames.at(-1)!.frame;
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.decisions, [{ id: "identical-A", decision: "approve" }]);
+    peer.incoming(syntheticPeerConsent("identical-B", now));
+    await nextTurn();
+    const invalidations = harness.writer.invalidateCalls;
+    harness.writer.settlementDisposition = "unchanged";
+    await reviewOldestPeerConsent(harness);
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    const b = harness.sidebar!.capturePeerConsentPresentation();
+    assert.ok(b && b.decision === "approve");
+    assert.notEqual(b.renderToken, a.renderToken);
+    assert.deepEqual(harness.writer.frames.at(-1)!.frame, aFrame, "new immutable handshake identity is deliberately not a display label");
+    assert.ok(harness.writer.invalidateCalls > invalidations, "semantic identity change forces the real writer to repaint");
+    dispatch({ type: "peer-consent", consentId: b.consentId, renderToken: b.renderToken, decision: "approve" });
+    assert.deepEqual(peer.decisions, [{ id: "identical-A", decision: "approve" }], "unchanged alone never settles the new request");
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("tiny and resized consent frames revoke Main proof until a complete replacement is written", async (t) => {
+  const { harness, peer, dispatch } = await peerMainHarness(t);
+  try {
+    peer.incoming(syntheticPeerConsent("resize-A"));
+    await nextTurn();
+    await reviewOldestPeerConsent(harness);
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    const old = harness.sidebar!.capturePeerConsentPresentation();
+    assert.ok(old && old.decision === "approve");
+    harness.writer.holdWrites = true;
+    harness.terminal.setSize(20, 4);
+    assert.equal(harness.sidebar!.capturePeerConsentPresentation(), undefined, "resize revokes synchronously before rendering");
+    await nextTurn();
+    assert.equal(harness.sidebar!.capturePeerConsentPresentation(), undefined, "tiny dialog cannot mint a candidate");
+    dispatch({ type: "peer-consent", consentId: old.consentId, renderToken: old.renderToken, decision: "approve" });
+    assert.deepEqual(peer.decisions, []);
+    harness.terminal.setSize(90, 24);
+    await nextTurn();
+    const next = harness.sidebar!.capturePeerConsentPresentation();
+    assert.ok(next && next.decision === "approve");
+    assert.notEqual(next.renderToken, old.renderToken);
+    dispatch({ type: "peer-consent", consentId: next.consentId, renderToken: next.renderToken, decision: "approve" });
+    assert.deepEqual(peer.decisions, [], "complete but queued replacement is still not written");
+    await nextTurn();
+    harness.writer.drainHeldWrites();
+    const written = harness.sidebar!.capturePeerConsentPresentation();
+    assert.ok(written);
+    dispatch({ type: "peer-consent", consentId: written.consentId, renderToken: written.renderToken, decision: "approve" });
+    assert.deepEqual(peer.decisions, [{ id: "resize-A", decision: "approve" }]);
+  } finally { harness.writer.holdWrites = false; assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("peer destination actions never target a local session even when opaque ids collide", async (t) => {
+  const { harness, peer, dispatch } = await peerMainHarness(t);
+  try {
+    fillForm(harness.terminal, "/peer-action-local-owner");
+    await nextTurn();
+    const owner = harness.sidebar!.activeMainOwnerID;
+    assert.ok(owner);
+    for (const command of [
+      { type: "peer-connect", hostId: owner }, { type: "peer-disconnect", hostId: owner },
+      { type: "peer-remove", hostId: owner }, { type: "peer-revoke", peerId: owner },
+    ] as const) dispatch(command);
+    await nextTurn();
+    assert.deepEqual(peer.commands.map((command) => command.type), ["peer-connect", "peer-disconnect", "peer-remove", "peer-revoke"]);
+    assert.equal(harness.sidebar!.activeMainOwnerID, owner);
+    assert.equal(harness.manager!.views.length, 1);
+    assert.equal(harness.manager!.views[0]?.lifecycle, "alive");
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("a failed advisory bell attempt never retries or shuts down a healthy Main", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const write = harness.terminal.write.bind(harness.terminal);
+  let attempts = 0;
+  harness.terminal.write = (value) => {
+    if (value === "\x07") { attempts++; throw new Error("synthetic suppressed bell"); }
+    write(value);
+  };
+  try {
+    const consent = syntheticPeerConsent("bell-failure");
+    peer.incoming(consent);
+    peer.options!.onIncomingConsentArrival(consent.id);
+    await nextTurn();
+    assert.equal(attempts, 1);
+    assert.equal(harness.terminal.started, true);
+    assert.equal(peer.closeCalls, 0);
+  } finally {
+    harness.terminal.write = write;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("unconfirmed owned network cleanup retains the host ownership record even after children settle", async (t) => {
+  const { harness, peer, releases } = await peerMainHarness(t);
+  peer.closeFailure = true;
+  assert.equal(await closeWithSignal(harness), 1);
+  assert.equal(peer.closeCalls, 1);
+  assert.equal(releases(), 0);
+  assert.ok(harness.reports.some((message) => message.includes("Network cleanup did not settle")));
+});
+
+for (const pending of ["start", "action"] as const) {
+  test(`a failed coordinator barrier does not hang Main on abandoned ${pending} work`, async (t) => {
+    let finishPending!: () => void;
+    const gate = new Promise<void>((resolve) => { finishPending = resolve; });
+    const { harness, peer, dispatch, releases } = await peerMainHarness(t, (fixture) => {
+      if (pending === "start") fixture.startGate = gate;
+      else fixture.performGate = gate;
+    });
+    if (pending === "action") {
+      dispatch({ type: "peer-bell", enabled: false });
+      await nextTurn();
+      assert.equal(peer.commands.length, 1, "the operation was actually admitted before shutdown");
+    }
+    peer.closeFailure = true;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // The fake close rejects immediately; the finite referenced guard reports
+      // an actual regression instead of cancelling when no real socket exists.
+      const guard = new Promise<never>((_resolve, reject) => {
+        deadline = setTimeout(() => reject(new Error("Main waited past a failed coordinator barrier")), 2000);
+      });
+      assert.equal(await Promise.race([closeWithSignal(harness), guard]), 1);
+      assert.equal(peer.closeCalls, 1);
+      assert.equal(releases(), 0);
+      assert.ok(harness.reports.some((message) => message.includes("Network cleanup did not settle")));
+    } finally {
+      if (deadline) clearTimeout(deadline);
+      finishPending();
+      await harness.result;
+    }
+  });
 }
 
 test("Main module import is inert: no ProcessTerminal, native PTY, terminal listeners, or timers are constructed", () => {

@@ -19,14 +19,14 @@ dates.
 
 ### Added
 
-- An inert TLS/WSS peer-transport foundation with KDE-style explicit device pairing
-  (#475). Explicit callers supply generated self-signed identities, consent and trust
-  stores, and a listener address; neither startup nor module import enables networking.
-  Actual TLS peer keys, remembered identity, and separate directional receiving grants
-  gate application channels. No CA-issued certificate or domain setup is required.
-  Bounded pairing metadata, cancellation, backpressure, and owned teardown are covered
-  without introducing session networking, pairing UI, persistent keys, or clipboard
-  synchronization. See [Paired peer transport foundation](docs/session-host-alpha.md#paired-peer-transport-foundation).
+- A TLS/WSS peer-transport foundation with KDE-style explicit device pairing (#475).
+  Explicit callers supply generated self-signed identities, consent and trust stores, and
+  a listener address; module import alone still enables nothing. Actual TLS peer keys,
+  remembered identity, and separate directional receiving grants gate application
+  channels. No CA-issued certificate or domain setup is required. Bounded pairing
+  metadata, cancellation, backpressure, and owned teardown are covered without adding
+  clipboard synchronization; the optional network sidebar now uses this transport
+  (#482). See [Paired peer transport foundation](docs/session-host-alpha.md#paired-peer-transport-foundation).
 - A metadata-only remote roster foundation projects the local session manager's roster
   facts over that explicitly constructed paired channel (#478). The owner observes its
   existing single manager through a coherent snapshot-and-watch seam with a fresh
@@ -47,10 +47,10 @@ dates.
   stays with the owner host: a client snapshot is only a projection, its loss means
   not-current rather than idle, and stopping a subscription or disposing the bridge never
   shuts down owner sessions. No second controller, separate ACL, or new revocation
-  lifecycle policy is added. Neither startup nor import enables networking, and no remote
-  UI, remote input, session-operation routing, pairing/consent surface, or reconnection
-  behavior exists yet; this checkpoint is an internal-only automated-testing foundation.
-  See [Remote roster metadata foundation](docs/session-host-alpha.md#remote-roster-metadata-foundation-metadata-only).
+  lifecycle policy is added. Importing this foundation enables no networking, and this
+  checkpoint adds no remote input, session-operation routing, or clipboard attribution;
+  the optional network sidebar now consumes this projection (#482). See
+  [Remote roster metadata foundation](docs/session-host-alpha.md#remote-roster-metadata-foundation-metadata-only).
 - The session host sizes each session for the surfaces that actually display it, and can
   display no session at all (#474). Every displayable surface registers as a viewer of one
   session, and a session's canonical content size is the independent minimum of those widths
@@ -73,8 +73,56 @@ dates.
   grants or revokes input. See
   [Per-session content geometry](docs/session-host-alpha.md#per-session-content-geometry).
 
+- An explicit protected peer-state library retains one per-agent identity, accepted
+  peers, directional grants and separate outgoing host pins (#480). Initialization is
+  explicit; startup creates no identity or fresh trust. Real
+  filesystem protection precedes private-key writes; unsafe, missing initialized,
+  corrupt or key-mismatched state fails closed without permission repair, silent identity
+  rotation or fresh-trust fallback.
+  One-time association remains valid until revoked: reconnects and restarts with the same
+  keys require no repeated approval, and pending consent deadlines never expire grants.
+  Synchronous publication and immutable projections preserve the current store seams;
+  uncertain commits invalidate the handle instead of claiming rollback. The receiving
+  pairing callback also exposes its actual configured deadline and sanitized settlement
+  without changing consent authority or timeout defaults (#475). The optional network
+  sidebar now builds its saved settings, listener, and consent surface on this state
+  (#482); remote terminal content, remote input, and session-operation routing remain
+  unimplemented. See
+  [Explicit protected peer-state foundation](docs/session-host-alpha.md#explicit-protected-peer-state-foundation).
+- The optional native session host now wires a **Network** sidebar over the paired peer
+  transport (#482). Hosting requires an explicit listen address and port; hosting is
+  initially off and remembered, and an enabled saved setting attempts to restore its
+  listener on the next start. Saved destinations, the default-off Auto setting, and the
+  default-on arrival bell are protected preferences kept separately from the
+  identity/trust document, so muting the bell or saving a destination creates no key
+  material. A fresh host with no saved preferences creates no peer keys, network
+  preferences, listener, or connection. The first explicit Enable hosting or Connect
+  initializes an identity only when none exists. First pairing has a two-minute human
+  approval window and a first-use server-key confirmation; the consent dialog's immutable
+  identity latches at arrival, and its controls authorize only after the exact frame was
+  actually written. Changed known pins and unsafe, corrupt, or
+  missing-initialized trust fail closed without repair, rotation, or silent key
+  replacement; explicit Connect is not pin replacement. Incoming requests raise a
+  persistent non-focus-stealing alert and one best-effort bell per arrival, with a
+  reserved alert band when the sidebar is hidden or narrow. Auto recovery is off by
+  default and attempts only previously connected, still-trusted destinations with a
+  remembered pin and no suppression after startup or an unexpected loss. Disconnect
+  persists suppression until an explicit Connect; Remove forgets only this side's
+  endpoint and remembered pin; Revoke removes only this side's current receiving grant.
+  None stops remote work or sessions.
+  Connected rows are metadata-only, and remote terminal content/input, remote creation,
+  `SessionSpawn`, Close, stop/resume, and clipboard attribution remain unimplemented; no
+  view-only permission kind is invented. See
+  [Network sidebar](docs/session-host-alpha.md#network-sidebar-hosting-pairing-and-remote-metadata)
+  and [Session-host peer network](docs/security-model.md#session-host-peer-network-optional).
+
 ### Changed
 
+- Removed infrastructure-specific directory handling from generic source/discovery,
+  copying and test harnesses (#481), with no replacement exclusion or configurable
+  special case. Generic input scopes, path/type/no-follow checks and ownership-confined
+  cleanup remain unchanged. Agent search-performance instructions are explicitly not
+  product requirements in the repository guide.
 - Session-host session operations now run through one presentation-independent local
   owning-host boundary over the host's single session manager (#473). Starting a session,
   admitting an authenticated background `SessionSpawn` sibling, resuming an exited row,
@@ -402,8 +450,8 @@ dates.
   actor can steal a live destructive holder's mutex mid-deletion. A live host's generations
   stay untouched. Cleanup-specific disposal is also less artificial: a special leaf entry
   (FIFO, socket, or device name) inside a selected disposable generation is unlinked without
-  being opened, and a direct-child `.terraform` entry under the producer-owned Node cache is
-  no longer exempt from reclamation.
+  being opened. Producer-owned Node-cache artifacts have no directory-name exemption
+  from reclamation.
 
 ## [0.1.0-dev.178]
 
@@ -426,8 +474,8 @@ dates.
   `pi-<version>.<n>` generations without a fixed limit (later launches reuse any
   valid generation for that exact version), and the same-version replacement path
   honors the live-owner marker, so a concurrently filling generation is never
-  deleted. Startup is not stopped by any of these cases. Initialized `.terraform`
-  content inside a selected disposable generation is removed with it. The
+  deleted. Startup is not stopped by any of these cases. Ordinary nested content
+  inside a selected disposable generation is removed with it. The
   previous durable lifetime receipts, holder pins, mount census, and Windows
   count-only admission gate are removed; active sessions remain guarded by the
   session host's existing exclusive agent-directory ownership record, and

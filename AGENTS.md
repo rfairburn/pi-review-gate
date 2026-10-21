@@ -49,6 +49,17 @@ public docs.
   or delete a live `dist/` in the primary checkout — build into scratch or staging trees
   instead.
 
+## Keep investigative search exclusions out of product code
+
+Personal or environment-specific search exclusions govern agents' investigative
+commands only. They have no place in production code, build/copy/cleanup/discovery
+logic, test harnesses, fixtures, or documented product behavior. Do not turn an
+operational search hint into a hardcoded directory exception. Remove any such
+special case outright: do not disguise the name or introduce a replacement filter,
+broader exclusion, or new configuration option. Preserve independently justified
+generic product boundaries such as explicit input scopes, path/type validation,
+no-follow handling, and ownership checks.
+
 ## Safety invariants (fail closed)
 
 Cancellation, durability, and security semantics are fail-closed by design (see

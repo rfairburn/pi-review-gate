@@ -235,6 +235,9 @@ jobs:
         run: node --test dist-test/tests/review-checkpoint-windows.test.js
       - name: Windows exact source identity regressions
         run: node --test dist-test/tests/wave-source-identity.test.js
+      - name: Protected peer state and native ACL storage (not terminal UI readiness)
+        timeout-minutes: 8
+        run: node --test --test-concurrency=1 --test-timeout=120000 dist-test/tests/session-host-peer-state-permissions-windows-native.test.js dist-test/tests/session-host-network-peer-state-default.test.js
       - name: Launcher tests (helper pipeline + native .cmd cases)
         run: node --test dist-test/tests/launcher-cmd.test.js
       - name: Fallback Node admission (native Windows, no rolling reclamation claim)

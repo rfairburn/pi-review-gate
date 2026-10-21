@@ -15,8 +15,10 @@
  * A card is therefore exactly 5 rows expanded (default) or 3 rows collapsed,
  * one card's extent never overlaps another's, and the three required fixed
  * actions ("Saved conversations", "New session", "Quit host") follow every
- * native card as ordered one-row entries, with an optional final "Host
- * shortcuts" action when settings are available. Only the leftmost sidebar columns (the wide
+ * native card as ordered one-row entries. Two optional one-row actions may
+ * appear among them, each only at the renderer's own position: "Network"
+ * between "New session" and "Quit host" when a network snapshot is attached,
+ * and a final "Host shortcuts" action when settings are available. Only the leftmost sidebar columns (the wide
  * 32-column pane or the full narrow-overlay width) are inspected, extracted by
  * the pinned terminal-cell width model so wide/combining characters can never
  * pull the divider or native right pane into scope.
@@ -25,9 +27,18 @@
  * cards under this grammar and yield no parse: a stale witness cannot silently
  * accept them. Public consumers are fail-closed: a frame is only usable when
  * the header-declared native count, every native card's full 3/5-row extent,
- * the ordered required action tail, and any optional final settings action
- * all agree, so a partially painted roster can never satisfy an entry, card,
- * selection, or "hidden" witness.
+ * the ordered required action tail (with the optional Network row only at its
+ * own position, and any optional final settings action) all agree, so a
+ * partially painted roster can never satisfy an entry, card, selection, or
+ * "hidden" witness.
+ *
+ * The optional Network row is accepted only as the exact renderer-drawn
+ * `Network` label at its exact position. The renderer's pending-consent
+ * annotation (`Network (2 requests)`) is deliberately NOT an accepted action:
+ * a roster carrying it stays incomplete (fail closed) instead of teaching the
+ * witness to accept an arbitrary annotated row, and the hide witness still
+ * treats every Network-shaped row — exact, annotated, or half-painted — as a
+ * visible sidebar remnant.
  */
 import { sliceByColumn, truncateToWidth, visibleWidth } from "pi-session-host-tui";
 
@@ -58,9 +69,18 @@ const MARKER_CELLS = 2;
 
 /** The three required fixed host actions, in their rendered order. */
 export const ROSTER_ACTIONS = ["Saved conversations", "New session", "Quit host"] as const;
+/**
+ * The optional network-menu action. The renderer draws it between
+ * `"New session"` and `"Quit host"` only while a network snapshot is attached,
+ * so it is never part of the required tail and never reorders that tail.
+ */
+export const NETWORK_ACTION = "Network";
 const HOST_SHORTCUTS_ACTION = "Host shortcuts";
 const HOST_SHORTCUTS_OVERRIDE_ACTION = "Host shortcuts (--sidebar-key override active)";
-export type RosterActionLabel = (typeof ROSTER_ACTIONS)[number] | typeof HOST_SHORTCUTS_ACTION;
+export type RosterActionLabel =
+  | (typeof ROSTER_ACTIONS)[number]
+  | typeof NETWORK_ACTION
+  | typeof HOST_SHORTCUTS_ACTION;
 
 export interface RosterCardEntry {
   readonly kind: "native";
@@ -123,8 +143,9 @@ export interface ParsedRoster {
   readonly entryEnd: number;
   /**
    * True only for a complete roster: exactly `count` full native cards followed
-   * by the ordered required three-action tail and optional final Host shortcuts action,
-   * with no extra entry-shaped row.
+   * by the ordered required action tail, with the optional Network row only
+   * between "New session" and "Quit host", the optional final Host shortcuts
+   * action only after "Quit host", and no extra entry-shaped row.
    */
   readonly complete: boolean;
 }
@@ -221,6 +242,7 @@ function rosterActionLabel(line: string, width: number): RosterActionLabel | und
   for (const label of ROSTER_ACTIONS) {
     if (rendered === renderedActionRow(`${prefix}${label}`, width)) return label;
   }
+  if (rendered === renderedActionRow(`${prefix}${NETWORK_ACTION}`, width)) return NETWORK_ACTION;
   const shortcuts = renderedActionRow(`${prefix}${HOST_SHORTCUTS_ACTION}`, width);
   const legacyOverride = renderedActionRow(`${prefix}${HOST_SHORTCUTS_OVERRIDE_ACTION}`, width);
   return rendered === shortcuts || rendered === legacyOverride ? HOST_SHORTCUTS_ACTION : undefined;
@@ -242,6 +264,23 @@ function isHostShortcutsActionRemnant(line: string, width: number): boolean {
   ];
   return candidates.some((candidate) => rendered.length < candidate.length
     && candidate.slice(0, rendered.length) === rendered);
+}
+
+/**
+ * A Network row in any paint state is a visible sidebar remnant: the exact
+ * label, a half-painted prefix of it, or the annotated pending-consent form the
+ * parser deliberately refuses as an action. Each proves the sidebar is still
+ * drawn, so none of them may accompany a "hidden" witness.
+ */
+function isNetworkActionRemnant(line: string, width: number): boolean {
+  const marker = statusMarker(line);
+  if (marker === undefined) return false;
+  const prefix = marker === "selected" ? MARKER_SELECTED : MARKER_PLAIN;
+  const rendered = line.trimEnd();
+  const full = `${prefix}${NETWORK_ACTION}`;
+  if (rendered.length < full.length && full.startsWith(rendered)) return true;
+  const text = rendered.startsWith(prefix) ? rendered.slice(prefix.length) : "";
+  return text.startsWith(`${NETWORK_ACTION} (`);
 }
 
 interface CardRead {
@@ -327,11 +366,11 @@ export function parseRosterLines(lines: readonly string[], width: number = SIDEB
   }
 
   const actions: RosterActionEntry[] = [];
-  for (const expected of ROSTER_ACTIONS) {
+  const consumeAction = (expected: RosterActionLabel): boolean => {
     const line = body[index];
     const marker = line === undefined ? undefined : statusMarker(line);
     if (line === undefined || marker === undefined || rosterActionLabel(line, width) !== expected) {
-      return incomplete(header, count, index);
+      return false;
     }
     const action: RosterActionEntry = {
       kind: "action",
@@ -344,7 +383,20 @@ export function parseRosterLines(lines: readonly string[], width: number = SIDEB
     actions.push(action);
     entries.push(action);
     index += 1;
-  }
+    return true;
+  };
+
+  // The renderer's fixed tail, in its actual order. The optional Network row
+  // is accepted only between "New session" and "Quit host", and only while a
+  // network snapshot is attached: a Network row before "Saved conversations",
+  // between "Saved conversations" and "New session", after "Quit host", or
+  // drawn twice is a misplaced or duplicated row and leaves the roster
+  // incomplete. The three required actions stay mandatory in their order.
+  const [saved, newSession, quitHost] = ROSTER_ACTIONS;
+  if (!consumeAction(saved)) return incomplete(header, count, index);
+  if (!consumeAction(newSession)) return incomplete(header, count, index);
+  if (rosterActionLabel(body[index] ?? "", width) === NETWORK_ACTION) consumeAction(NETWORK_ACTION);
+  if (!consumeAction(quitHost)) return incomplete(header, count, index);
 
   // Host shortcuts is the existing settings action and is appended only when
   // settings are available. Its legacy-override suffix is accepted only in
@@ -474,14 +526,71 @@ export function rosterNavigationTargets(
   return targets;
 }
 
-/** The next actual roster target after the uniquely highlighted position. */
+/**
+ * Index of the target drawn at `position`, or undefined when no target or more
+ * than one target claims it. A duplicated position is ambiguous, so stepping
+ * from it is refused rather than resolved by list order.
+ */
+function uniqueTargetIndex(targets: readonly RosterNavigationTarget[], position: number): number | undefined {
+  let found = -1;
+  for (let index = 0; index < targets.length; index += 1) {
+    if (targets[index]!.position !== position) continue;
+    if (found >= 0) return undefined;
+    found = index;
+  }
+  return found < 0 ? undefined : found;
+}
+
+/** Index of the single target labelled `label`, or undefined when absent or duplicated. */
+function uniqueTargetLabelIndex(targets: readonly RosterNavigationTarget[], label: string): number | undefined {
+  let found = -1;
+  for (let index = 0; index < targets.length; index += 1) {
+    if (targets[index]!.label !== label) continue;
+    if (found >= 0) return undefined;
+    found = index;
+  }
+  return found < 0 ? undefined : found;
+}
+
+/**
+ * The shortest known cyclic step direction from the uniquely highlighted
+ * position to `targetLabel`, or undefined when the step cannot be established:
+ * empty targets, a missing or duplicated current position, a missing or
+ * duplicated label, or a target that is already highlighted. Ties go to
+ * `"down"`, the direction every existing driver can press.
+ */
+export function rosterNavigationDirection(
+  targets: readonly RosterNavigationTarget[],
+  currentPosition: number,
+  targetLabel: string,
+): "up" | "down" | undefined {
+  if (targets.length === 0) return undefined;
+  const currentIndex = uniqueTargetIndex(targets, currentPosition);
+  if (currentIndex === undefined) return undefined;
+  const targetIndex = uniqueTargetLabelIndex(targets, targetLabel);
+  if (targetIndex === undefined || targetIndex === currentIndex) return undefined;
+  const forward = (targetIndex - currentIndex + targets.length) % targets.length;
+  const backward = (currentIndex - targetIndex + targets.length) % targets.length;
+  return backward < forward ? "up" : "down";
+}
+
+/**
+ * The actual roster target one cyclic step away from the uniquely highlighted
+ * position in `direction` (default `"down"`, matching the existing drivers).
+ * Empty targets, a missing or duplicated highlight, and an unknown direction
+ * are all refused, so no caller can step on an ambiguous roster.
+ */
 export function nextRosterNavigationTarget(
   targets: readonly RosterNavigationTarget[],
   currentPosition: number,
+  direction: "up" | "down" = "down",
 ): RosterNavigationTarget | undefined {
   if (targets.length === 0) return undefined;
-  const currentIndex = targets.findIndex((target) => target.position === currentPosition);
-  return currentIndex < 0 ? undefined : targets[(currentIndex + 1) % targets.length];
+  if (direction !== "up" && direction !== "down") return undefined;
+  const currentIndex = uniqueTargetIndex(targets, currentPosition);
+  if (currentIndex === undefined) return undefined;
+  const step = direction === "up" ? -1 : 1;
+  return targets[(currentIndex + step + targets.length) % targets.length];
 }
 
 /** Outer header line (line 0), sans generated SGR and trailing padding. */
@@ -540,7 +649,8 @@ export function sidebarRosterHidden(text: string, sidebarColumns: number = SIDEB
       if (STATUS_PATTERN.test(contents)
         || isBackgroundRow(contents, sidebarColumns)
         || rosterActionLabel(line, sidebarColumns) !== undefined
-        || isHostShortcutsActionRemnant(line, sidebarColumns)) return true;
+        || isHostShortcutsActionRemnant(line, sidebarColumns)
+        || isNetworkActionRemnant(line, sidebarColumns)) return true;
     }
     return /(?:F8 toggle|e edit name|d stop\/remove|esc hide|q quit|space expand)/u.test(line);
   });

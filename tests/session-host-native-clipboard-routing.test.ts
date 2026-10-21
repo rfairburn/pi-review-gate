@@ -345,7 +345,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     if (broker) await broker.dispose();
     for (const surface of surfaces) surface.dispose();
     // Retain invocation-owned synthetic evidence; never remove unconfirmed or
-    // unknown files, and never scan/clean user sessions or initialized Terraform.
+    // unknown files, and never scan/clean user sessions or unselected trees.
     assert.ok(owned.every((item) => item.exited));
   }
 });

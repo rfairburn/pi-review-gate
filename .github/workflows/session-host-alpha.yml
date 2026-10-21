@@ -96,8 +96,8 @@ jobs:
           npx tsc -p tsconfig.json --outDir "$env:PRG_ALPHA_CANDIDATE\dist"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Copy packaged scripts into fresh candidate (bounded copier)
-        # The bounded copier prunes .terraform before descending and refuses
-        # symlinks; it preserves every stage of the shipped scripts tree so the
+        # The bounded copier refuses symlinks and preserves every stage of the
+        # shipped scripts tree so the
         # staged candidate keeps its own package-root helper layout. No node_modules
         # link or dependency copy is created: the harness supplies NODE_PATH
         # (checkout node_modules plus the pinned runtime root) to the actual Main,

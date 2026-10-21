@@ -71,12 +71,59 @@ import {
 	type PeerByteChannel,
 } from "./channel";
 
+/**
+ * Fixed, sanitized outcome of one receiving pairing consent, reported after the
+ * host's actual decision path finished.
+ *
+ * - `accepted`: the receiving approval ran and both local commits (accepted
+ *   identity and directional grant) succeeded. It does not claim that the peer
+ *   received the HTTP reply.
+ * - `denied`: the receiving side denied, or had no approval handler; that
+ *   decision committed no new acceptance or grant.
+ * - `timeout`: the configured consent window elapsed with no decision.
+ * - `aborted`: the connection or the host went away before an acceptance was
+ *   usable, including an approval that arrives after the socket or listener is
+ *   gone.
+ * - `failed`: an injected store rejected the commit. This does not assert
+ *   rollback or the absence of previously stored authorization facts.
+ */
+export type PeerPairingOutcome = "accepted" | "denied" | "timeout" | "aborted" | "failed";
+
+/** Decision inputs the host can be asked for; `failed` is only ever observed. */
+type PairingDecision = Exclude<PeerPairingOutcome, "failed">;
+
+/**
+ * Observational completion of one pairing consent. It carries no key material,
+ * label, address, status text, or error object, and it carries no resolver: an
+ * observer cannot approve, deny, cancel, or otherwise change the outcome, and it
+ * never rejects.
+ */
+export interface PeerPairingSettlement {
+	readonly outcome: PeerPairingOutcome;
+	/** Wall-clock ms since epoch when the decision path settled. */
+	readonly settledAt: number;
+}
+
 export interface PeerPairingRequest {
 	/** Exact key from the live TLS handshake, never a claimed header value. */
 	readonly peerKey: PeerKey;
 	/** Bounded friendly label only; never identity. */
 	readonly label: string;
 	readonly requestedAt: number;
+	/**
+	 * Display-only deadline metadata: this request's start plus the host's
+	 * configured consent timeout, so a caller can render or expire a notice
+	 * without polling `isPending()`. It grants nothing and changes nothing: the
+	 * live connection checks and the existing consent timer stay the authority.
+	 */
+	readonly expiresAt: number;
+	/**
+	 * Resolves exactly once, from the existing decision path only, with what
+	 * actually happened. `accepted` means the local approval plus the accepted
+	 * identity and grant commit succeeded; a store failure reports `failed`, and a
+	 * lost connection or closed host reports `aborted` rather than acceptance.
+	 */
+	readonly settled: Promise<PeerPairingSettlement>;
 	isPending(): boolean;
 	/** Commit acceptance and the inbound grant; false when the connection is gone. */
 	approve(): boolean;
@@ -149,12 +196,10 @@ export interface PeerHost {
 	revoke(key: PeerKey | string): boolean;
 }
 
-type PairingOutcome = "accepted" | "denied" | "timeout" | "aborted";
-
 interface PendingPairing {
 	readonly connectionId: string;
 	readonly peerKey: PeerKey;
-	readonly decide: (outcome: PairingOutcome) => boolean;
+	readonly decide: (outcome: PairingDecision) => boolean;
 }
 
 const STATUS_REASONS: Readonly<Record<number, string>> = Object.freeze({
@@ -572,8 +617,19 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 
 		diagnostic("pairing_requested");
 		const connectionId = randomUUID();
+		const requestedAt = Date.now();
 		let settled = false;
 		let timer: NodeJS.Timeout | null = null;
+
+		// The settlement handle is created here and its resolver never leaves this
+		// closure, so a callback receiver can observe the real result but cannot
+		// manufacture one. It resolves at most once, below, from `decide`.
+		let observeSettlement: (outcome: PeerPairingOutcome) => void = () => undefined;
+		const settlement: Promise<PeerPairingSettlement> = new Promise<PeerPairingSettlement>((resolve) => {
+			observeSettlement = (outcome: PeerPairingOutcome): void => {
+				resolve(Object.freeze({ outcome, settledAt: Date.now() }));
+			};
+		});
 
 		const connectionIsLive = (): boolean =>
 			!closed &&
@@ -584,7 +640,7 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 			!response.writableEnded &&
 			!response.writableFinished;
 
-		const decide = (outcome: PairingOutcome): boolean => {
+		const decide = (outcome: PairingDecision): boolean => {
 			if (settled) return false;
 			let effective = outcome;
 			if (outcome === "accepted" && !connectionIsLive()) effective = "aborted";
@@ -624,10 +680,16 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 					stats.pairingFailed++;
 					diagnostic("pairing_denied");
 					rejectHttp(response, 500, "pairing_failed");
+					// The commit did not report success. Do not assert that rollback
+					// succeeded or that previously stored authorization facts are absent.
+					observeSettlement("failed");
 					return false;
 				}
 				stats.pairingAccepted++;
 				diagnostic("pairing_accepted");
+				// The local commit above is the accepted outcome; writing the reply is
+				// delivery to the peer and is deliberately not part of it.
+				observeSettlement("accepted");
 				writeHttpResponse(response, 200, { status: "accepted", acceptedPeerKey: peerKey.keyId });
 				return true;
 			}
@@ -644,21 +706,28 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 				diagnostic("pairing_aborted");
 				writeHttpResponse(response, 400, { status: "aborted" });
 			}
+			observeSettlement(effective);
 			return effective === outcome;
 		};
+
+		// Arm the existing consent timer before handing off the request. The display
+		// deadline uses this request setup and configured duration; only the timer
+		// and live connection checks are authority, not the wall clock.
+		timer = setTimeout(() => decide("timeout"), bounds.consentTimeoutMs);
+		timer.unref?.();
+		pendingTimers.add(timer);
 
 		const pairingRequest: PeerPairingRequest = Object.freeze({
 			peerKey,
 			label,
-			requestedAt: Date.now(),
+			requestedAt,
+			expiresAt: requestedAt + bounds.consentTimeoutMs,
+			settled: settlement,
 			isPending: () => !settled,
 			approve: () => decide("accepted"),
 			deny: () => decide("denied"),
 		});
 		pending.set(connectionId, { connectionId, peerKey, decide });
-		timer = setTimeout(() => decide("timeout"), bounds.consentTimeoutMs);
-		timer.unref?.();
-		pendingTimers.add(timer);
 
 		request.socket.once("close", () => {
 			if (!settled) decide("aborted");

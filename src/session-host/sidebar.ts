@@ -72,6 +72,39 @@
  * - Editable fields use the native Editor adapter; roster and surrounding form
  *   labels remain plain text + generated SGR.
  *
+ * Network sidebar (issue #482, pure frontend): every peer fact arrives as a
+ * `PeerUiSnapshot` DTO from the parent-owned coordinator. This module performs
+ * no network/process/filesystem/trust work; it only renders attached metadata
+ * and emits `PeerUiCommand` DTOs for the coordinator to perform. The network
+ * menu, incoming-consent alert, and remote roster rows appear ONLY while a
+ * peer snapshot is attached, so isolated legacy `Sidebar` callers never grow
+ * unsolicited entries. Attaching or updating a snapshot never changes
+ * visibility, focus, the highlighted entry, or the observed active Main owner,
+ * and an incoming request never opens a pane by itself.
+ *
+ * Incoming consent is the one deliberately fenced confirmation: the dialog
+ * latches its immutable identity (opaque consent id, kind, label, key
+ * fingerprint, endpoint), never retargets a newer request in place, and only
+ * authorizes a decision after Main reports the ACTUAL writer receipt for the
+ * exact current frame through `settlePeerConsentRender`. A render, capture,
+ * too-small frame, superseded frame, or snapshot arrival alone never enables
+ * Approve or Deny; changing the selected decision or the pane geometry
+ * invalidates that proof until the new exact frame is written.
+ *
+ * Remote roster rows are separate typed pane entries, never fabricated
+ * `SidebarItem`s: no invented agent dir, busy flag, input surface, or exit
+ * code. Their workspace path is exact display-only owner data (sanitized, never
+ * resolved or otherwise used), and activating one only shows a local
+ * metadata-only notice — no local select/resume/create/stop/remove/rename
+ * action is emitted and the native content owner is unchanged.
+ *
+ * `renderPeerAlert` is the one extra notification surface, for a host-owned
+ * alert band that the compositor places when the normal sidebar cannot show a
+ * pending request (hidden pane, or narrow layout while Main has focus). It is
+ * bounded, never renders confirmation controls, mints no consent frame token,
+ * and changes no focus or ownership; the settled consent-frame API above is
+ * unchanged.
+ *
  * Stable DTO/API surface for future root-host phases: `SidebarItem`,
  * `SidebarAction`, `SidebarControllerOptions`, and `SidebarController` with
  * the getters/setters documented below. Internal shapes may evolve.
@@ -110,6 +143,15 @@ import {
   terminalDiagnosticsFailurePhrase,
   type TerminalDiagnosticsWarningView,
 } from "./terminal-diagnostics";
+import type {
+  PeerConsentPresentation,
+  PeerUiAction,
+  PeerUiConsent,
+  PeerUiHost,
+  PeerUiSettings,
+  PeerUiSnapshot,
+  PeerUiTrustedPeer,
+} from "./peer-ui-protocol";
 
 /** One roster row: a top-level snapshot of one host-owned instance. */
 export interface SidebarItem {
@@ -251,7 +293,14 @@ export type SidebarAction =
       readonly requestId: number;
       readonly bindings: HostShortcutBindings;
     }
-  | { readonly type: "visibility"; readonly visible: boolean };
+  | { readonly type: "visibility"; readonly visible: boolean }
+  /**
+   * Network sidebar actions are exactly the parent-owned `PeerUiAction` DTOs.
+   * Consent decisions travel only as `peer-consent` with the written
+   * `renderToken`; Main independently rechecks them, and this module never
+   * performs the network or trust work itself.
+   */
+  | PeerUiAction;
 
 export interface SidebarControllerOptions {
   /** Canonical native KeyId or a bounded known alternative (e.g. "f8"). */
@@ -275,11 +324,21 @@ export interface SidebarControllerOptions {
   readonly onInvalidate?: () => void;
   /** Initial visibility (default true: the empty welcome picker shows). */
   readonly initialVisible?: boolean;
+  /**
+   * Injected clock used ONLY to display and fence the bounded human consent
+   * approval window (defaults to the wall clock). Tests and Main may supply a
+   * deterministic source; this module performs no IO.
+   */
+  readonly now?: () => number;
   readonly onAction?: (action: SidebarAction) => void;
 }
 
 export interface SidebarMousePresentation {
-  /** Stable signature of the captured maps' activation targets and pane-relative positions. */
+  /**
+   * Stable signature of the captured maps' activation targets and
+   * pane-relative positions, including the network pane's rows and the consent
+   * dialog's decision/geometry targets.
+   */
   readonly authorizationKey: string;
   /** Activates only entries captured by the exact sidebar render this token represents. */
   activateRosterAt(column: number, row: number, cols: number, rows: number): boolean;
@@ -342,7 +401,14 @@ const SGR_ACTIVE_MAIN_WHITE = "\x1b[1;97m";
 interface SidebarEntry {
   /** Internal key; real item ids are namespaced with "item:" to stay unique. */
   readonly key: string;
-  readonly kind: "item" | "saved" | "new" | "quit" | "settings" | "diagnostics";
+  readonly kind:
+    | "item"
+    | "saved"
+    | "new"
+    | "quit"
+    | "settings"
+    | "diagnostics"
+    | "peer";
   readonly item?: SidebarItem;
   /** Warning snapshot rendered by a `diagnostics` entry (display and clear fence). */
   readonly warning?: TerminalDiagnosticsWarningView;
@@ -409,15 +475,111 @@ interface DisplayedRoster {
   readonly focus: SidebarFocus;
 }
 
+/** One remote roster row exactly as the coordinator projected it (display only). */
+type PeerRosterRow = NonNullable<PeerUiHost["roster"]["rows"]>[number];
+
+/** Selectable network-panel rows; remote rows are a separate typed kind. */
+type PeerPaneRow =
+  | {
+      readonly kind:
+        | "toggle-hosting"
+        | "edit-bind-host"
+        | "edit-bind-port"
+        | "apply-hosting"
+        | "toggle-auto"
+        | "toggle-bell"
+        | "add-host";
+      readonly key: string;
+    }
+  | { readonly kind: "host"; readonly key: string; readonly host: PeerUiHost }
+  | { readonly kind: "trusted"; readonly key: string; readonly peer: PeerUiTrustedPeer }
+  | { readonly kind: "consent"; readonly key: string; readonly consent: PeerUiConsent }
+  | {
+      readonly kind: "remote";
+      readonly key: string;
+      readonly hostId: string;
+      readonly hostLabel: string;
+      readonly rosterState: "current" | "stale";
+      readonly row: PeerRosterRow;
+    };
+
+interface DisplayedPeerRows {
+  readonly cols: number;
+  readonly rows: number;
+  readonly signature: string;
+  readonly selectedKey: string | undefined;
+  readonly entries: readonly PeerPaneRow[];
+}
+
+/** Immutable, latched consent identity: snapshot reordering never retargets it. */
+interface PeerConsentLatch {
+  readonly id: string;
+  readonly kind: "incoming" | "server-key";
+  readonly label: string;
+  readonly fingerprint: string;
+  readonly endpoint: string | null;
+  readonly requestedAt: number;
+  readonly expiresAt: number;
+}
+
+/**
+ * The exact candidate frame: latched identity + semantic decision + geometry +
+ * the control positions/bytes actually emitted. `identity` names the semantic
+ * target; `key` additionally covers the rendered lines so any content or
+ * position change (for example a notice shifting Approve/Deny) mints a new
+ * token instead of silently inheriting the previous written proof.
+ */
+interface DisplayedPeerConsent {
+  readonly identity: string;
+  readonly key: string;
+  readonly token: number;
+  readonly consentId: string;
+  readonly choice: "approve" | "deny";
+  readonly cols: number;
+  readonly rows: number;
+  readonly approveRow: number;
+  readonly denyRow: number;
+}
+
+function peerPaneRowIdentity(row: PeerPaneRow): readonly unknown[] {
+  switch (row.kind) {
+    case "host":
+      return [row.key, row.kind, row.host.id, row.host.state, row.host.roster.state,
+        row.host.roster.rows === null ? null : row.host.roster.rows.length,
+        row.host.reconnectSuppressed, row.host.previouslyConnected];
+    case "trusted":
+      return [row.key, row.kind, row.peer.id, row.peer.hasInboundGrant];
+    case "consent":
+      return [row.key, row.kind, row.consent.id, row.consent.kind, row.consent.expiresAt];
+    case "remote":
+      return [row.key, row.kind, row.hostId, row.rosterState, row.row.id, row.row.lifecycle,
+        row.row.hasLiveProcess];
+    default:
+      return [row.key, row.kind];
+  }
+}
+
 function mouseAuthorizationKey(
   roster: DisplayedRoster | undefined,
   saved: DisplayedSavedRows | undefined,
+  peer: DisplayedPeerRows | undefined,
+  consent: DisplayedPeerConsent | undefined,
+  consentRendered: boolean,
 ): string {
   return JSON.stringify({
     roster: roster === undefined ? null : [roster.cols, roster.rows,
       [...roster.regions.values()].map((region) => [region.row, region.height, sidebarActivationIdentity(region.entry)])],
     saved: saved === undefined ? null : [saved.cols, saved.rows,
       saved.entries.map(({ paneRow, entry }) => [paneRow, entry.id, entry.file])],
+    // Network-panel targets and the consent dialog's decision geometry are part
+    // of the authorization identity: a presentation captured from a frame with
+    // different peer/consent targets can never authorize the current one.
+    peer: peer === undefined ? null : [peer.cols, peer.rows, peer.signature,
+      peer.entries.map((row) => peerPaneRowIdentity(row))],
+    consent: consent === undefined || !consentRendered ? null : [
+      consent.token, consent.consentId, consent.choice, consent.cols, consent.rows,
+      consent.approveRow, consent.denyRow,
+    ],
   });
 }
 
@@ -545,8 +707,29 @@ const ENTRY_QUIT_KEY = "quit";
 const ENTRY_SAVED_KEY = "saved";
 const ENTRY_SETTINGS_KEY = "host-shortcuts";
 const ENTRY_DIAGNOSTICS_KEY = "terminal-diagnostics";
+/** Network menu key; present only with an attached snapshot. */
+const ENTRY_PEER_KEY = "peer-network";
 /** Fixed height of the host-owned terminal diagnostics warning entry. */
 const DIAGNOSTICS_ENTRY_ROWS = 3;
+/**
+ * Fixed height of the prominent incoming-consent band: heading, name, key
+ * fingerprint, origin endpoint, remaining human window, and the review hint.
+ * The band is reserved OUTSIDE the scrolling roster so it stays visible while
+ * later rows are selected; it never collapses into a tiny indicator.
+ */
+const PEER_CONSENT_ALERT_ROWS = 6;
+/** Bounded display copies of coordinator DTO lists (render is bounded anyway). */
+const PEER_MAX_HOSTS = 32;
+const PEER_MAX_TRUSTED_PEERS = 32;
+const PEER_MAX_CONSENTS = 8;
+const PEER_MAX_ROSTER_ROWS = 64;
+const PEER_LABEL_MAX_CODEPOINTS = 256;
+const PEER_ADDRESS_MAX_CODEPOINTS = 256;
+const PEER_FINGERPRINT_MAX_CODEPOINTS = 256;
+const PEER_ENDPOINT_MAX_CODEPOINTS = 512;
+/** Explicit listen-port text admitted locally; the coordinator revalidates. */
+const PEER_PORT_MIN = 1;
+const PEER_PORT_MAX = 65535;
 const DIAGNOSTICS_CLEARED_NOTICE = "Terminal warning cleared; the diagnostics log was kept";
 const ITEM_KEY_PREFIX = "item:";
 
@@ -820,7 +1003,17 @@ function blankLines(count: number): string[] {
  * observed/unknown agent state, plus observed/unknown input state for live
  * rows. Unknown (null) is never rendered as if it were false.
  */
-function cardStatusText(item: SidebarItem): string {
+interface SessionStatusFacts {
+  readonly lifecycle: SidebarItem["lifecycle"];
+  readonly busy: boolean | null;
+  readonly pendingInput: boolean | null;
+  readonly inputSurface: boolean;
+  readonly activeTasks?: number | null;
+  readonly activeShells?: number | null;
+  readonly exitCode?: number;
+}
+
+function cardStatusText(item: SessionStatusFacts): string {
   const parts: string[] = [];
   switch (item.lifecycle) {
     case "starting":
@@ -867,7 +1060,7 @@ function cardStatusText(item: SidebarItem): string {
 }
 
 /** Honest ACTIVITY-INTENT counts: a missing/invalid count is "unknown", never 0. */
-function cardBackgroundText(item: SidebarItem): string {
+function cardBackgroundText(item: SessionStatusFacts): string {
   const tasks = sanitizeCount(item.activeTasks);
   const shells = sanitizeCount(item.activeShells);
   if (tasks === null && shells === null) {
@@ -964,6 +1157,246 @@ function copyItem(item: SidebarItem): SidebarItem {
   };
 }
 
+/**
+ * Bounded defensive copies of the coordinator's display DTOs. Nothing here
+ * performs IO, resolves paths, or invents facts: a malformed nested entry is
+ * dropped instead of being coerced into a plausible one, and absent
+ * observations stay unknown (`null`).
+ */
+function displayObject(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
+}
+
+function displayText(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function displayOptionalText(value: unknown): string | null | undefined {
+  if (value === null || value === undefined) return null;
+  return typeof value === "string" ? value : undefined;
+}
+
+function displayBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function displayObservation(value: unknown): boolean | null {
+  if (value === true) return true;
+  if (value === false) return false;
+  return null;
+}
+
+function displayNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function displayPersistence(value: unknown): "saved" | "unsaved" | "unknown" | undefined {
+  return value === "saved" || value === "unsaved" || value === "unknown" ? value : undefined;
+}
+
+function displayPort(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= PEER_PORT_MAX
+    ? value
+    : undefined;
+}
+
+function copyPeerSettings(value: unknown): PeerUiSettings | null {
+  if (value === null || value === undefined) return null;
+  const source = displayObject(value);
+  if (source === undefined) return null;
+  const hostingEnabled = displayBoolean(source.hostingEnabled);
+  const autoReconnect = displayBoolean(source.autoReconnect);
+  const bellEnabled = displayBoolean(source.bellEnabled);
+  const bindHost = displayText(source.bindHost);
+  const bindPort = source.bindPort === null ? null : displayPort(source.bindPort);
+  if (hostingEnabled === undefined || autoReconnect === undefined || bellEnabled === undefined
+    || bindHost === undefined || bindPort === undefined) return null;
+  return { hostingEnabled, bindHost, bindPort, autoReconnect, bellEnabled };
+}
+
+function copyPeerRosterRow(value: unknown): PeerRosterRow | null {
+  const source = displayObject(value);
+  if (source === undefined) return null;
+  const id = displayText(source.id);
+  const label = displayText(source.label);
+  const workspace = displayText(source.workspace);
+  const lifecycle = displayText(source.lifecycle);
+  const hasLiveProcess = displayBoolean(source.hasLiveProcess);
+  const inputSurface = displayBoolean(source.inputSurface);
+  if (id === undefined || id.length === 0 || label === undefined || workspace === undefined
+    || lifecycle === undefined || !LIFECYCLE_VALUES.has(lifecycle)
+    || hasLiveProcess === undefined || inputSurface === undefined) return null;
+  const nativeValue = displayObject(source.nativeSession);
+  const persistence = nativeValue === undefined ? undefined : displayPersistence(nativeValue.persistence);
+  const nativeSession = nativeValue === undefined ? null
+    : isValidNativeSessionId(displayText(nativeValue.sessionId) ?? "")
+      && Number.isSafeInteger(nativeValue.epoch) && (nativeValue.epoch as number) > 0
+      && typeof nativeValue.name === "string" && nativeValue.name.length > 0
+      ? {
+        sessionId: nativeValue.sessionId as string,
+        epoch: nativeValue.epoch as number,
+        name: nativeValue.name,
+        ...(persistence === undefined ? {} : { persistence }),
+      }
+      : null;
+  return {
+    id,
+    label,
+    workspace,
+    lifecycle: lifecycle as PeerRosterRow["lifecycle"],
+    hasLiveProcess,
+    busy: displayObservation(source.busy),
+    pendingInput: displayObservation(source.pendingInput),
+    inputSurface,
+    activity: Array.isArray(source.activity)
+      ? source.activity.filter((line): line is string => typeof line === "string")
+      : [],
+    nativeSession,
+    backgroundTasks: sanitizeCount(source.backgroundTasks),
+    backgroundShells: sanitizeCount(source.backgroundShells),
+    activeTasks: sanitizeCount(source.activeTasks),
+    activeShells: sanitizeCount(source.activeShells),
+    ...(displayNumber(source.exitCode) === undefined ? {} : { exitCode: displayNumber(source.exitCode) }),
+    ...(displayText(source.error) === undefined ? {} : { error: displayText(source.error) }),
+  };
+}
+
+function copyPeerHost(value: unknown): PeerUiHost | null {
+  const source = displayObject(value);
+  if (source === undefined) return null;
+  const id = displayText(source.id);
+  const label = displayText(source.label);
+  const host = displayText(source.host);
+  const port = displayPort(source.port);
+  const state = displayText(source.state);
+  const fingerprint = displayOptionalText(source.fingerprint);
+  const message = displayOptionalText(source.message);
+  const reconnectSuppressed = displayBoolean(source.reconnectSuppressed);
+  const previouslyConnected = displayBoolean(source.previouslyConnected);
+  const rosterValue = displayObject(source.roster);
+  const rosterState = displayText(rosterValue?.state);
+  const rowsValue = rosterValue?.rows;
+  if (id === undefined || id.length === 0 || label === undefined || host === undefined
+    || port === undefined || state === undefined
+    || fingerprint === undefined || message === undefined
+    || reconnectSuppressed === undefined || previouslyConnected === undefined
+    || rosterState === undefined) return null;
+  if (state !== "disconnected" && state !== "connecting" && state !== "pairing"
+    && state !== "connected" && state !== "retrying" && state !== "error") return null;
+  if (rosterState !== "never" && rosterState !== "current" && rosterState !== "stale") return null;
+  let rows: readonly PeerRosterRow[] | null = null;
+  if (rowsValue !== null && rowsValue !== undefined) {
+    if (!Array.isArray(rowsValue)) return null;
+    const accepted: PeerRosterRow[] = [];
+    for (const candidate of rowsValue.slice(0, PEER_MAX_ROSTER_ROWS)) {
+      const row = copyPeerRosterRow(candidate);
+      if (row !== null) accepted.push(row);
+    }
+    rows = accepted;
+  }
+  return {
+    id,
+    label,
+    host,
+    port,
+    state: state as PeerUiHost["state"],
+    fingerprint,
+    message,
+    reconnectSuppressed,
+    previouslyConnected,
+    roster: { state: rosterState, rows },
+  };
+}
+
+function copyPeerTrustedPeer(value: unknown): PeerUiTrustedPeer | null {
+  const source = displayObject(value);
+  if (source === undefined) return null;
+  const id = displayText(source.id);
+  const label = displayText(source.label);
+  const fingerprint = displayText(source.fingerprint);
+  const hasInboundGrant = displayBoolean(source.hasInboundGrant);
+  if (id === undefined || id.length === 0 || label === undefined
+    || fingerprint === undefined || hasInboundGrant === undefined) return null;
+  return { id, label, fingerprint, hasInboundGrant };
+}
+
+function copyPeerConsent(value: unknown): PeerUiConsent | null {
+  const source = displayObject(value);
+  if (source === undefined) return null;
+  const id = displayText(source.id);
+  const kind = displayText(source.kind);
+  const label = displayText(source.label);
+  const fingerprint = displayText(source.fingerprint);
+  const endpoint = displayOptionalText(source.endpoint);
+  const requestedAt = displayNumber(source.requestedAt);
+  const expiresAt = displayNumber(source.expiresAt);
+  if (id === undefined || id.length === 0 || label === undefined || fingerprint === undefined
+    || endpoint === undefined || requestedAt === undefined || expiresAt === undefined) return null;
+  if (kind !== "incoming" && kind !== "server-key") return null;
+  return { id, kind, label, fingerprint, endpoint, requestedAt, expiresAt };
+}
+
+function copyPeerList<T>(value: unknown, max: number, copy: (entry: unknown) => T | null): readonly T[] | null {
+  if (value === null || value === undefined) return null;
+  if (!Array.isArray(value)) return null;
+  const accepted: T[] = [];
+  for (const candidate of value.slice(0, max)) {
+    const item = copy(candidate);
+    if (item !== null) accepted.push(item);
+  }
+  return accepted;
+}
+
+/**
+ * Validates and copies one attached network snapshot. A snapshot that is not
+ * object-shaped is refused loudly; malformed nested rows are dropped so a
+ * hostile or buggy producer cannot fabricate a host, grant, or request. A
+ * `null` settings/hosts/trusted list stays `null` (unavailable/unknown), never
+ * an empty list that would read as "none".
+ */
+function copyPeerSnapshot(value: PeerUiSnapshot): PeerUiSnapshot {
+  const source = displayObject(value);
+  if (source === undefined) {
+    throw new Error("SidebarController.setPeerUiSnapshot expects a PeerUiSnapshot");
+  }
+  const revision = displayNumber(source.revision);
+  const status = displayText(source.status);
+  const listener = displayObject(source.listener);
+  const listenerState = displayText(listener?.state);
+  const listenerHost = displayOptionalText(listener?.host);
+  const listenerPort = listener?.port === null || listener?.port === undefined
+    ? null
+    : displayPort(listener?.port);
+  const listenerMessage = displayOptionalText(listener?.message);
+  const identityFingerprint = displayOptionalText(source.identityFingerprint);
+  const notice = displayOptionalText(source.notice);
+  if (revision === undefined || status === undefined
+    || (status !== "loading" && status !== "ready" && status !== "unavailable")
+    || listener === undefined || listenerState === undefined
+    || (listenerState !== "off" && listenerState !== "starting"
+      && listenerState !== "listening" && listenerState !== "error")
+    || listenerHost === undefined || listenerPort === undefined || listenerMessage === undefined
+    || identityFingerprint === undefined || notice === undefined) {
+    throw new Error("SidebarController.setPeerUiSnapshot expects a complete PeerUiSnapshot");
+  }
+  return {
+    revision,
+    status,
+    settings: copyPeerSettings(source.settings),
+    identityFingerprint,
+    listener: {
+      state: listenerState,
+      host: listenerHost,
+      port: listenerPort,
+      message: listenerMessage,
+    },
+    hosts: copyPeerList(source.hosts, PEER_MAX_HOSTS, copyPeerHost),
+    trustedPeers: copyPeerList(source.trustedPeers, PEER_MAX_TRUSTED_PEERS, copyPeerTrustedPeer),
+    consents: copyPeerList(source.consents, PEER_MAX_CONSENTS, copyPeerConsent) ?? [],
+    notice,
+  };
+}
+
 function assertPaneDimension(value: number, max: number, label: "cols" | "rows"): void {
   if (!Number.isSafeInteger(value) || value < 1 || value > max) {
     throw new Error(
@@ -999,6 +1432,48 @@ export class SidebarController {
   private readonly workspaceBasePath: string;
   private readonly createTextField?: SidebarControllerOptions["createTextField"];
   private readonly createSavedQueryInput?: SidebarControllerOptions["createSavedQueryInput"];
+  /** Clock for the bounded human consent window only; never used for IO. */
+  private readonly now: () => number;
+  /**
+   * Attached coordinator display snapshot. While it is undefined this
+   * controller is exactly the legacy local sidebar: no Network menu, no
+   * incoming-consent alert, and no remote rows exist at all.
+   */
+  private peerUiSnapshot: PeerUiSnapshot | undefined;
+  /** Highlighted network-panel row key (kept across snapshot updates). */
+  private peerSelectedKey: string | undefined;
+  private peerPaneTop = 0;
+  /** Exact rows/geometry drawn by the last complete network-panel render. */
+  private peerDisplay: DisplayedPeerRows | undefined;
+  private peerPaneError: string | undefined;
+  /** Local, fixed notice describing a requested action (never claimed success). */
+  private peerPaneNotice: string | undefined;
+  /** Unsaved explicit listen address/port drafts; no default port is invented. */
+  private peerBindHostDraft = "";
+  private peerBindPortDraft = "";
+  private peerBindDirty = false;
+  /** Unsaved Add-destination drafts. */
+  private peerAddDraft = { label: "", host: "", port: "" };
+  private peerFieldTarget: { readonly purpose: "bind-host" | "bind-port" | "add" } | undefined;
+  private peerFieldIndex: 0 | 1 | 2 = 0;
+  /** Frozen destination-removal target; later snapshots never retarget it. */
+  private peerRemoveTarget: { readonly hostId: string; readonly label: string; readonly endpoint: string } | undefined;
+  /** Frozen receiving-revocation target; independent of the outgoing direction. */
+  private peerRevokeTarget: { readonly peerId: string; readonly label: string; readonly fingerprint: string } | undefined;
+  /** True only while the complete remove/revoke warning was drawn. */
+  private peerConfirmDisplayed = false;
+  /** Latched incoming consent identity; never replaced in place by a newer request. */
+  private peerConsentLatch: PeerConsentLatch | undefined;
+  private peerConsentChoice: "approve" | "deny" = "deny";
+  /** Current candidate consent frame (identity + decision + geometry). */
+  private peerConsentDisplay: DisplayedPeerConsent | undefined;
+  /** True only while the last render drew this exact complete consent dialog. */
+  private peerConsentRendered = false;
+  /** Token Main reported as actually written; the ONLY decision authority. */
+  private peerConsentWrittenToken: number | undefined;
+  private peerConsentTokenSequence = 1;
+  /** Bounded local notice shown inside the consent dialog (never a decision). */
+  private peerConsentLocalNotice: string | undefined;
   private savedQueryInput?: SidebarSavedQueryInput;
   private formField?: SessionHostTextField;
   private formMatchesCancel: (data: string) => boolean = (data) => matchesKey(data, "escape");
@@ -1016,7 +1491,7 @@ export class SidebarController {
   private formHints = DEFAULT_FORM_HINTS;
   private formNotice: string | undefined;
   private formGeneration = 0;
-  private formKind: "new" | "edit" | "saved" | "shortcuts" | undefined;
+  private formKind: "new" | "edit" | "saved" | "shortcuts" | "peer" | "peer-field" | undefined;
   private shortcutDraft: { toggle: string; returnToMain: string } = { ...DEFAULT_HOST_SHORTCUTS };
   private shortcutFieldIndex: 0 | 1 = 0;
   private pendingShortcutSave: { readonly requestId: number } | undefined;
@@ -1093,7 +1568,13 @@ export class SidebarController {
   private pendingCreate: { readonly requestId: number } | undefined;
   private pendingRename: { readonly requestId: number } | undefined;
   /** Explicit confirmation purpose: quit the host or stop one owned session. */
-  private confirmPurpose: "quit" | "stop-remove" | "saved-delete" = "quit";
+  private confirmPurpose:
+    | "quit"
+    | "stop-remove"
+    | "saved-delete"
+    | "peer-consent"
+    | "peer-remove"
+    | "peer-revoke" = "quit";
   /** Frozen stop target id; later navigation never retargets the confirmation. */
   private stopRemoveTargetId: string | undefined;
   /** True only while the last render drew the complete stop warning dialog. */
@@ -1144,6 +1625,7 @@ export class SidebarController {
     this.workspaceBasePath = resolve(options.workspaceBasePath ?? "/");
     this.createTextField = options.createTextField;
     this.createSavedQueryInput = options.createSavedQueryInput;
+    this.now = options.now ?? (() => Date.now());
 
     const suggestedWorkspace = sanitizeCellText(options.initialWorkspace ?? "");
     if (countCodePoints(suggestedWorkspace) > PATH_FIELD_MAX_CODEPOINTS) {
@@ -1207,6 +1689,17 @@ export class SidebarController {
   /** True only for the Saved-file confirmation; this is a placement signal, not an input-focus alias. */
   get savedDeleteConfirmationActive(): boolean {
     return this._visible && this._focus === "confirm" && this.confirmPurpose === "saved-delete";
+  }
+
+  /**
+   * True while a latched consent confirmation owns confirm focus, whether or
+   * not it has rendered yet. Main uses it as a placement signal for the wide
+   * right-hand confirmation slot (the same shape as the Saved-delete warning);
+   * it is never an input-focus alias and grants no consent authority.
+   */
+  get peerConsentConfirmationActive(): boolean {
+    return this._visible && this._focus === "confirm" && this.confirmPurpose === "peer-consent"
+      && this.peerConsentLatch !== undefined;
   }
 
   /** Opaque token for the last fully rendered Saved-delete warning candidate. */
@@ -1624,6 +2117,187 @@ export class SidebarController {
     return this.diagnosticsWarning === undefined ? undefined : { ...this.diagnosticsWarning };
   }
 
+  // --- Network sidebar (pure DTO rendering; the coordinator owns all IO). ---
+
+  /**
+   * Attaches or replaces the coordinator's display snapshot. It never changes
+   * visibility, focus, the highlighted entry, or the observed active Main
+   * owner, so an incoming request can never steal focus, open a pane, or
+   * retarget native content by arriving.
+   */
+  setPeerUiSnapshot(snapshot: PeerUiSnapshot): void {
+    const next = copyPeerSnapshot(snapshot);
+    this.peerUiSnapshot = next;
+    if (this.peerBindDirty && next.settings !== null
+      && next.settings.bindHost === this.peerBindHostDraft.trim()
+      && (next.settings.bindPort === null ? "" : String(next.settings.bindPort)) === this.peerBindPortDraft.trim()) {
+      // The coordinator now reports exactly the value this pane requested, so
+      // the local draft is no longer unsaved.
+      this.peerBindDirty = false;
+    }
+    if (!this.peerBindDirty) {
+      this.peerBindHostDraft = sanitizeBounded(next.settings?.bindHost ?? "", PEER_ADDRESS_MAX_CODEPOINTS);
+      this.peerBindPortDraft = next.settings?.bindPort === null || next.settings?.bindPort === undefined
+        ? ""
+        : String(next.settings.bindPort);
+    }
+    // Arrival is never authority: a latched request that ended (removed,
+    // superseded, or past its human window) loses its frame and written proof.
+    // Unrelated snapshot metadata deliberately leaves an unchanged frame alone.
+    if (this.peerConsentLatch !== undefined
+      && this.peerConsentPendingState(this.peerConsentLatch) !== "current") {
+      this.invalidatePeerConsentDisplay();
+      this.peerConsentLocalNotice = "This request is no longer pending; no decision was sent";
+    }
+    this.rebuildEntries();
+    if (this.selectedEntryKey === ENTRY_PEER_KEY && this.currentEntry() === undefined) {
+      this.selectedEntryKey = undefined;
+    }
+  }
+
+  /**
+   * Operator-initiated open of the network settings/status pane. It is the
+   * only way the pane appears: an incoming request never opens it. With no
+   * attached snapshot there is nothing to show and nothing happens.
+   */
+  openPeerMenu(): void {
+    if (this.peerUiSnapshot === undefined) return;
+    if (!this._visible) {
+      this._visible = true;
+      this.emit({ type: "visibility", visible: true });
+    }
+    this.forgetDisplayedRoster();
+    this.disposeFormField();
+    this.pendingCreate = undefined;
+    this.pendingRename = undefined;
+    this.pendingShortcutSave = undefined;
+    this.pendingSavedOpen = undefined;
+    this.editTarget = undefined;
+    this.formKind = "peer";
+    this.formError = undefined;
+    this.noticeError = undefined;
+    this.peerPaneError = undefined;
+    this.peerPaneNotice = undefined;
+    this.peerFieldTarget = undefined;
+    this.peerConfirmDisplayed = false;
+    this.peerRemoveTarget = undefined;
+    this.peerRevokeTarget = undefined;
+    this.invalidatePeerConsentDisplay();
+    this.peerConsentLatch = undefined;
+    this.peerConsentLocalNotice = undefined;
+    this.confirmPurpose = "quit";
+    this._focus = "form";
+    this.onInvalidate?.();
+  }
+
+  /**
+   * Captures the exact current complete consent candidate for Main's frame
+   * writer. It returns undefined unless the whole identity and both decision
+   * controls fit, the candidate was not superseded, and the request is still
+   * pending inside its human window. Capturing authorizes nothing by itself.
+   */
+  capturePeerConsentPresentation(): PeerConsentPresentation | undefined {
+    const display = this.peerConsentDisplay;
+    if (display === undefined || !this.isPeerConsentRenderCurrent(display.token)) return undefined;
+    return { consentId: display.consentId, decision: display.choice, renderToken: display.token };
+  }
+
+  /**
+   * Whether this token still names the CURRENT complete consent frame: same
+   * latched identity, same semantic decision, same geometry, still open and
+   * pending. Superseded, dropped, too-small, expired, and retargeted frames
+   * are never current.
+   */
+  isPeerConsentRenderCurrent(token: number): boolean {
+    const display = this.peerConsentDisplay;
+    const latch = this.peerConsentLatch;
+    if (display === undefined || latch === undefined) return false;
+    if (token !== display.token || !this.peerConsentRendered) return false;
+    if (!this._visible || this._focus !== "confirm" || this.confirmPurpose !== "peer-consent") return false;
+    if (this.peerConsentPendingState(latch) !== "current") return false;
+    if (display.consentId !== latch.id || display.choice !== this.peerConsentChoice) return false;
+    return display.identity === this.peerConsentFrameIdentity(
+      latch,
+      this.peerConsentChoice,
+      display.cols,
+      display.rows,
+      display.approveRow,
+      display.denyRow,
+    );
+  }
+
+  /**
+   * Trusted Main-only settlement: the actual writer reported this exact frame
+   * as written. Until then Approve/Deny stay refused. A repeated settlement of
+   * an unchanged, already-written frame is idempotent rather than a revoke.
+   */
+  settlePeerConsentRender(token: number): boolean {
+    if (!this.isPeerConsentRenderCurrent(token)) return false;
+    this.peerConsentWrittenToken = token;
+    return true;
+  }
+
+  /**
+   * Revokes the candidate frame and any written proof without touching the
+   * latched request identity (the coordinator owns its lifecycle). Main calls
+   * this when the writer cannot prove the bytes, when a semantically different
+   * dialog target rendered identical bytes, and on any layout/target invalidation.
+   */
+  invalidatePeerConsentDisplay(): void {
+    this.peerConsentDisplay = undefined;
+    this.peerConsentRendered = false;
+    this.peerConsentWrittenToken = undefined;
+  }
+
+  /**
+   * The prominent pending-consent notification band for layouts where the
+   * normal sidebar cannot show it (hidden pane, or narrow layout while Main is
+   * focused). This is a notification surface only: it renders NO confirmation
+   * control, mints no frame token, and neither grants nor revokes consent
+   * authority, so a band that cannot show the complete identity still
+   * authorizes nothing. Useful for the bounded 1..6 row bands the compositor
+   * supplies; taller bands are padded, and short bands show the most important
+   * complete lines with the review hint kept in view.
+   */
+  renderPeerAlert(
+    cols: number,
+    rows: number,
+  ): { lines: string[]; cursor?: { column: number; row: number } } {
+    assertPaneDimension(cols, PANE_MAX_COLS, "cols");
+    assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
+    const consents = this.orderedPeerConsents();
+    const oldest = consents[0];
+    if (oldest === undefined) return { lines: [] };
+    const heading = oldest.kind === "incoming"
+      ? "! Incoming connection request"
+      : "! Server key confirmation needed";
+    const count = consents.length > 1 ? ` (${consents.length})` : "";
+    const hint = consents.length > 1
+      ? `open Network to review ${consents.length} pending requests`
+      : "open Network or the sidebar to review before approving";
+    const identityLines = [
+      `name: ${sanitizeBounded(oldest.label, PEER_LABEL_MAX_CODEPOINTS)}`,
+      `key: ${sanitizeBounded(oldest.fingerprint, PEER_FINGERPRINT_MAX_CODEPOINTS)}`,
+      `from: ${oldest.endpoint === null
+        ? "endpoint not provided"
+        : sanitizeBounded(oldest.endpoint, PEER_ENDPOINT_MAX_CODEPOINTS)}`,
+      this.peerConsentWindowText(oldest),
+    ];
+    const capacity = Math.min(rows, PEER_CONSENT_ALERT_ROWS);
+    const lines: string[] = [];
+    if (capacity === 1) {
+      // A single row cannot show identity; it only points at the real review
+      // surface. Nothing here can be approved.
+      lines.push(wrapRow(`${heading}${count} — review`, cols, "\x1b[1m"));
+    } else {
+      lines.push(wrapRow(`${heading}${count}`, cols, "\x1b[1m"));
+      for (const line of identityLines.slice(0, capacity - 2)) lines.push(wrapRow(line, cols));
+      lines.push(wrapRow(hint, cols));
+    }
+    while (lines.length < rows) lines.push("");
+    return { lines };
+  }
+
   /** Shows a bounded, sanitized error near the pane's footer. */
   showError(message: string): void {
     this.noticeError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
@@ -1638,8 +2312,16 @@ export class SidebarController {
   captureMousePresentation(): SidebarMousePresentation {
     const displayedRoster = this.displayedRoster;
     const displayedSavedRows = this.displayedSavedRows;
+    const displayedPeerRows = this.peerDisplay;
+    const displayedPeerConsent = this.peerConsentDisplay;
     return Object.freeze({
-      authorizationKey: mouseAuthorizationKey(displayedRoster, displayedSavedRows),
+      authorizationKey: mouseAuthorizationKey(
+        displayedRoster,
+        displayedSavedRows,
+        displayedPeerRows,
+        displayedPeerConsent,
+        this.peerConsentRendered,
+      ),
       activateRosterAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateRosterAtFrom(displayedRoster, column, row, cols, rows, false),
       activateSavedAt: (column: number, row: number, cols: number, rows: number): boolean =>
@@ -1746,6 +2428,9 @@ export class SidebarController {
   ): { lines: string[]; cursor?: { column: number; row: number } } {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
+    // A fresh frame starts with no settled consent-dialog authority; only a
+    // complete render of the exact dialog can re-establish a candidate token.
+    this.peerConsentRendered = false;
     if (!this._visible) {
       this.invalidateSavedDeleteConfirmationDisplay();
       return { lines: [] };
@@ -1761,6 +2446,7 @@ export class SidebarController {
   renderRoster(cols: number, rows: number): { lines: string[] } {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
+    this.peerConsentRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
       return this.renderRosterTooSmall(cols, rows);
@@ -1776,10 +2462,31 @@ export class SidebarController {
   renderForm(cols: number, rows: number): { lines: string[]; cursor?: { column: number; row: number } } {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
+    this.peerConsentRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
     this.displayedSavedRows = undefined;
+    // Only the network pane owns the displayed peer-row mapping; every other
+    // form-slot pane forgets it so a stale map can never authorize an action.
+    if (this.formKind !== "peer") this.peerDisplay = undefined;
     if (cols < FORM_MIN_COLS || rows < FORM_MIN_ROWS) {
+      // An unshowable form-slot frame forgets the drawn network rows and
+      // revokes any consent candidate/proof: nothing off-screen may act, and no
+      // earlier receipt may be restored by a later render at the old geometry.
+      this.peerDisplay = undefined;
+      this.invalidatePeerConsentDisplay();
       return this.renderTooSmall(cols, rows);
+    }
+    if (this.peerConsentConfirmationActive) {
+      // Wide hostConfirmation slot: the security-sensitive consent dialog is
+      // placed in the right-hand pane while confirm focus is unchanged. The
+      // roster render stays independent for the left-hand notice/rows.
+      return this.renderPeerConsentPane(cols, rows);
+    }
+    if (this.formKind === "peer") {
+      return this.renderPeerPane(cols, rows);
+    }
+    if (this.formKind === "peer-field") {
+      return this.renderPeerFieldPane(cols, rows);
     }
     if (this.formKind === "saved") {
       return this.renderSavedPane(cols, rows);
@@ -1798,6 +2505,7 @@ export class SidebarController {
   renderSavedDeleteConfirmation(cols: number, rows: number): { lines: string[] } {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
+    this.peerConsentRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
     if (!this.savedDeleteConfirmationActive) return { lines: [] };
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) return this.renderTooSmall(cols, rows);
@@ -1819,7 +2527,9 @@ export class SidebarController {
       this.forgetDisplayedRoster();
       if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
         this.stopConfirmDisplayed = false;
+        this.peerConfirmDisplayed = false;
         this.invalidateSavedDeleteConfirmationDisplay();
+        this.invalidatePeerConsentDisplay();
         return this.renderTooSmall(cols, rows);
       }
       return this.renderConfirmPane(cols, rows);
@@ -2163,6 +2873,10 @@ export class SidebarController {
       this.openHostShortcutForm();
       return;
     }
+    if (entry.kind === "peer") {
+      this.openPeerMenu();
+      return;
+    }
     this.activateQuit();
   }
 
@@ -2306,6 +3020,10 @@ export class SidebarController {
       this.handleSavedPaneInput(data);
       return;
     }
+    if (this.formKind === "peer") {
+      this.handlePeerPaneInput(data);
+      return;
+    }
     if (this.routeBracketedPaste(data)) {
       this.formField?.handleInput(data);
       return;
@@ -2327,6 +3045,10 @@ export class SidebarController {
     }
     if (this.formKind === "shortcuts" && matchesKey(data, "tab")) {
       if (!isKeyRelease(data) && !isKeyRepeat(data)) this.switchShortcutField();
+      return;
+    }
+    if (this.formKind === "peer-field" && matchesKey(data, "tab")) {
+      if (!isKeyRelease(data) && !isKeyRepeat(data)) this.switchPeerField();
       return;
     }
     if (isKeyRelease(data)) return;
@@ -2583,6 +3305,11 @@ export class SidebarController {
   }
 
   private claimSavedAction(matches: (data: string) => boolean): void {
+    this.claimHeldAction(matches);
+  }
+
+  /** Bounded held-key fence shared by picker and network-consent actions. */
+  private claimHeldAction(matches: (data: string) => boolean): void {
     this.savedActionClaims.push(matches);
     if (this.savedActionClaims.length > 8) this.savedActionClaims.splice(0, this.savedActionClaims.length - 8);
   }
@@ -2837,7 +3564,13 @@ export class SidebarController {
 
   private createFormField(initialText: string): void {
     this.disposeFormField();
-    const kind = this.formKind === "edit" || this.formKind === "shortcuts" ? "name" : "path";
+    // Network listen/destination fields are plain data, never filesystem
+    // paths: they use the bounded single-line name field, not the path
+    // completer, so nothing is resolved or rewritten.
+    const kind = this.formKind === "edit" || this.formKind === "shortcuts"
+      || this.formKind === "peer-field"
+      ? "name"
+      : "path";
     const generation = this.formGeneration;
     const fieldOptions: SidebarFieldFactoryOptions = {
       kind,
@@ -2850,6 +3583,7 @@ export class SidebarController {
         if (this.formKind === "edit") this.submitRename(submission);
         else if (this.formKind === "new") this.submitCreate(submission);
         else if (this.formKind === "shortcuts") this.submitHostShortcutForm();
+        else if (this.formKind === "peer-field") this.submitPeerField(submission);
       },
       onCancel: () => {
         if (generation === this.formGeneration) this.escapeFromForm();
@@ -2954,6 +3688,13 @@ export class SidebarController {
   }
 
   private escapeFromForm(): void {
+    if (this.formKind === "peer-field") {
+      // A cancelled listen/destination draft returns to the network pane. The
+      // held Escape is claimed so its repeat/release cannot hide the roster.
+      this.formEscapeClaimed = true;
+      this.closePeerFieldForm();
+      return;
+    }
     this.abandonForm();
     // New and Edit cancellations are both LOCAL: return to the VISIBLE roster
     // without hiding and without forwarding anything to the child. The active
@@ -2977,6 +3718,7 @@ export class SidebarController {
     this.pendingCreate = undefined;
     this.pendingRename = undefined;
     this.pendingShortcutSave = undefined;
+    this.peerFieldTarget = undefined;
     this.disposeFormField();
     this.formKind = undefined;
     this.editTarget = undefined;
@@ -2985,6 +3727,15 @@ export class SidebarController {
   // --- Confirm focus: explicit quit or stop confirmation. ---
 
   private handleConfirmInput(data: string): void {
+    // Streamed bracketed paste is opaque in the network dialogs: a pasted body
+    // chunk that merely equals Enter/y can never approve a settled consent
+    // frame, remove a destination, or revoke a receiving grant. Only the new
+    // network confirmations take this route; existing confirmation semantics
+    // are unchanged.
+    if ((this.confirmPurpose === "peer-consent"
+      || this.confirmPurpose === "peer-remove"
+      || this.confirmPurpose === "peer-revoke")
+      && this.routeBracketedPaste(data)) return;
     // Fence the held Escape that canceled only a host-owned form across focus
     // domains until its release or a fresh Escape press.
     if (this.consumeFormEscapeClaim(data)) return;
@@ -3006,6 +3757,14 @@ export class SidebarController {
     }
     if (this.confirmPurpose === "saved-delete") {
       this.handleSavedDeleteConfirmInput(data);
+      return;
+    }
+    if (this.confirmPurpose === "peer-consent") {
+      this.handlePeerConsentInput(data);
+      return;
+    }
+    if (this.confirmPurpose === "peer-remove" || this.confirmPurpose === "peer-revoke") {
+      this.handlePeerConfirmInput(data);
       return;
     }
     if (this.confirmPurpose === "stop-remove") {
@@ -3099,6 +3858,1068 @@ export class SidebarController {
     this.emit({ type: "quit" });
   }
 
+  // --- Network pane, incoming consent, and metadata-only remote rows. ---
+
+  /** Pending requests, oldest first, bounded; ordering never latches a target. */
+  private orderedPeerConsents(): readonly PeerUiConsent[] {
+    const consents = this.peerUiSnapshot?.consents ?? [];
+    return [...consents]
+      .sort((left, right) => left.requestedAt - right.requestedAt || left.id.localeCompare(right.id))
+      .slice(0, PEER_MAX_CONSENTS);
+  }
+
+  private peerPendingConsentCount(): number {
+    return this.peerUiSnapshot?.consents.length ?? 0;
+  }
+
+  /**
+   * The latched request's live state, re-derived from the current snapshot.
+   * A removed request or any changed identity fact ends this latch; expiry is
+   * decided by the injected clock, never assumed.
+   */
+  private peerConsentPendingState(latch: PeerConsentLatch): "current" | "ended" | "expired" {
+    const pending = this.peerUiSnapshot?.consents.find((consent) => consent.id === latch.id);
+    if (pending === undefined) return "ended";
+    if (pending.kind !== latch.kind || pending.label !== latch.label
+      || pending.fingerprint !== latch.fingerprint
+      || pending.endpoint !== latch.endpoint
+      || pending.expiresAt !== latch.expiresAt) return "ended";
+    const now = this.now();
+    if (!Number.isFinite(now) || now >= latch.expiresAt) return "expired";
+    return "current";
+  }
+
+  /**
+   * The exact semantic target identity: latched request facts + decision + pane
+   * geometry + decision-control rows. Unrelated snapshot metadata is
+   * deliberately absent, so an unchanged dialog keeps its token and its written
+   * proof, while a moved control can never keep the old target mapping.
+   */
+  private peerConsentFrameIdentity(
+    latch: PeerConsentLatch,
+    choice: "approve" | "deny",
+    cols: number,
+    rows: number,
+    approveRow: number,
+    denyRow: number,
+  ): string {
+    return JSON.stringify([
+      latch.id, latch.kind, latch.label, latch.fingerprint, latch.endpoint,
+      latch.expiresAt, choice, cols, rows, approveRow, denyRow,
+    ]);
+  }
+
+  /** Full frame bytes are part of the token identity as well. */
+  private peerConsentFrameKey(identity: string, lines: readonly string[]): string {
+    return `${identity}\n${lines.join("\n")}`;
+  }
+
+  private peerConsentWindowText(latch: PeerConsentLatch): string {
+    const remaining = latch.expiresAt - this.now();
+    if (!Number.isFinite(remaining) || remaining <= 0) return "approval window: ended";
+    return `approval window: ${Math.max(1, Math.ceil(remaining / 1000))}s remaining`;
+  }
+
+  /**
+   * Latches ONE request's immutable identity. A later request never replaces
+   * this dialog in place; it can only be opened after this view is closed.
+   */
+  private openPeerConsentReview(consent: PeerUiConsent): void {
+    if (this.peerUiSnapshot === undefined) return;
+    this.forgetDisplayedRoster();
+    this.disposeFormField();
+    this.pendingCreate = undefined;
+    this.pendingRename = undefined;
+    this.pendingShortcutSave = undefined;
+    this.pendingSavedOpen = undefined;
+    this.formKind = undefined;
+    this.peerDisplay = undefined;
+    this.peerConfirmDisplayed = false;
+    this.peerRemoveTarget = undefined;
+    this.peerRevokeTarget = undefined;
+    this.peerConsentLatch = Object.freeze({
+      id: consent.id,
+      kind: consent.kind,
+      label: consent.label,
+      fingerprint: consent.fingerprint,
+      endpoint: consent.endpoint,
+      requestedAt: consent.requestedAt,
+      expiresAt: consent.expiresAt,
+    });
+    this.peerConsentChoice = "deny";
+    this.peerConsentLocalNotice = undefined;
+    this.invalidatePeerConsentDisplay();
+    this.confirmPurpose = "peer-consent";
+    this._focus = "confirm";
+    this.onInvalidate?.();
+  }
+
+  /**
+   * Closes the view without inventing any decision. The coordinator still owns
+   * the request lifecycle; the persistent alert keeps showing it while pending.
+   */
+  private dismissPeerConsentReview(): void {
+    this.peerConsentLatch = undefined;
+    this.peerConsentLocalNotice = undefined;
+    this.invalidatePeerConsentDisplay();
+    this.confirmPurpose = "quit";
+    this._focus = "sidebar";
+    this.onInvalidate?.();
+  }
+
+  /**
+   * Complete consent dialog: the full identity and both decision controls must
+   * fit. A too-small frame mints no candidate token, so nothing can be approved
+   * or denied from a partial or invisible presentation.
+   */
+  private renderPeerConsentPane(cols: number, rows: number): { lines: string[] } {
+    // A frame that cannot show the complete identity and both controls is a
+    // dropped frame: it revokes the candidate token and any written proof so
+    // neither a smaller render nor a later re-render can inherit authority.
+    const tooSmall = (): { lines: string[] } => {
+      this.invalidatePeerConsentDisplay();
+      return this.renderTooSmall(cols, rows);
+    };
+    const latch = this.peerConsentLatch;
+    if (latch === undefined) return tooSmall();
+    const incoming = latch.kind === "incoming";
+    const header = incoming ? " Approve incoming connection? " : " Trust this server key? ";
+    const identity: ReadonlyArray<readonly [string, string]> = [
+      ["name", latch.label],
+      ["key", latch.fingerprint],
+      ["from", latch.endpoint === null ? "endpoint not provided" : latch.endpoint],
+    ];
+    const identityLines: string[] = [];
+    for (const [label, value] of identity) {
+      // Never ellipsize identity: an unshowable label/key/endpoint is too small.
+      const wrapped = wrapExactField(`${label}: ${sanitizeCellText(value)}`, cols, 4);
+      if (wrapped === undefined) return tooSmall();
+      identityLines.push(...wrapped);
+    }
+    const windowLines = wrapHintLines([this.peerConsentWindowText(latch)], cols);
+    const warningLines = wrapHintLines([
+      incoming
+        ? "Approving allows this peer to connect here until you revoke it."
+        : "Approving trusts this server key until you remove the destination.",
+      "The bounded window is the approval window, not the grant lifetime.",
+    ], cols);
+    const hintLines = wrapHintLines(["up/down choose", "enter apply", "esc close"], cols);
+    if (windowLines === undefined || warningLines === undefined || hintLines === undefined
+      || visibleWidth(header) > cols) {
+      return tooSmall();
+    }
+    const noticeLines = this.peerConsentLocalNotice === undefined
+      ? []
+      : wrapHintLines([`! ${this.peerConsentLocalNotice}`], cols) ?? [];
+    const bodyRows = 1 + identityLines.length + windowLines.length + warningLines.length
+      + noticeLines.length + 2 + hintLines.length;
+    if (bodyRows > rows) return tooSmall();
+
+    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
+    for (const line of identityLines) lines.push(wrapRow(line, cols));
+    for (const line of windowLines) lines.push(wrapRow(line, cols));
+    for (const line of warningLines) lines.push(wrapRow(line, cols));
+    for (const line of noticeLines) lines.push(wrapRow(line, cols));
+    const approveRow = lines.length;
+    lines.push(wrapRow(`${this.peerConsentChoice === "approve" ? "> " : "  "}Approve`, cols,
+      this.peerConsentChoice === "approve" ? SGR_SELECTION_BLUE : undefined));
+    const denyRow = lines.length;
+    lines.push(wrapRow(`${this.peerConsentChoice === "deny" ? "> " : "  "}Deny`, cols,
+      this.peerConsentChoice === "deny" ? SGR_SELECTION_BLUE : undefined));
+    lines.push(...blankLines(Math.max(0, rows - lines.length - hintLines.length)));
+    for (const line of hintLines) lines.push(wrapRow(line, cols));
+
+    if (this.peerConsentPendingState(latch) !== "current") {
+      // Ended/expired: the frame names no token and authorizes nothing.
+      this.invalidatePeerConsentDisplay();
+      return { lines };
+    }
+    const frameIdentity = this.peerConsentFrameIdentity(
+      latch, this.peerConsentChoice, cols, rows, approveRow, denyRow,
+    );
+    // The live countdown is display metadata, not identity: it changes every
+    // second and must not revoke a proven frame. Control positions are already
+    // covered by the decision rows, so this placeholder cannot hide a shift.
+    const windowRow = 1 + identityLines.length;
+    const keyLines = lines.map((line, index) =>
+      index >= windowRow && index < windowRow + windowLines.length ? "<approval-window>" : line);
+    const key = this.peerConsentFrameKey(frameIdentity, keyLines);
+    if (this.peerConsentDisplay !== undefined && this.peerConsentDisplay.key === key) {
+      // Identical identity/decision/geometry/bytes: keep the token that was
+      // already written instead of constantly revoking an unchanged frame.
+      this.peerConsentRendered = true;
+      return { lines };
+    }
+    const token = this.peerConsentTokenSequence++;
+    this.peerConsentDisplay = {
+      identity: frameIdentity,
+      key,
+      token,
+      consentId: latch.id,
+      choice: this.peerConsentChoice,
+      cols,
+      rows,
+      approveRow,
+      denyRow,
+    };
+    this.peerConsentWrittenToken = undefined;
+    this.peerConsentRendered = true;
+    return { lines };
+  }
+
+  private handlePeerConsentInput(data: string): void {
+    if (this.consumeSavedActionClaim(data)) return;
+    // Only deliberate initial presses decide; held repeats/releases never do.
+    if (isKeyRelease(data) || isKeyRepeat(data)) return;
+    if (matchesKey(data, "escape")) {
+      this.formEscapeClaimed = true;
+      this.dismissPeerConsentReview();
+      return;
+    }
+    if (matchesKey(data, "up") || matchesKey(data, "down") || matchesKey(data, "tab")) {
+      this.setPeerConsentChoice(this.peerConsentChoice === "approve" ? "deny" : "approve");
+      return;
+    }
+    if (matchesKey(data, "enter")) {
+      this.applyPeerConsentDecision(data);
+      return;
+    }
+    const printable = printableOf(data);
+    if (printable === "y" || printable === "Y") {
+      this.setPeerConsentChoice("approve");
+      return;
+    }
+    if (printable === "n" || printable === "N") this.setPeerConsentChoice("deny");
+  }
+
+  /**
+   * The semantic decision target changed: the previous frame token and any
+   * written proof named the other choice, so Apply stays refused until the new
+   * exact frame has been written.
+   */
+  private setPeerConsentChoice(choice: "approve" | "deny"): void {
+    if (this.peerConsentChoice === choice) return;
+    this.peerConsentChoice = choice;
+    this.invalidatePeerConsentDisplay();
+    this.peerConsentLocalNotice = "Decision changed; apply becomes available once this frame is written";
+    this.onInvalidate?.();
+  }
+
+  /**
+   * Emits one consent decision only for the exact CURRENT frame that Main
+   * already settled with an actual writer receipt. No render, capture, arrival,
+   * or too-small frame can reach this point, and the held key is fenced so a
+   * repeat/release cannot emit a second decision.
+   */
+  private applyPeerConsentDecision(data: string): void {
+    const display = this.peerConsentDisplay;
+    const latch = this.peerConsentLatch;
+    if (display === undefined || latch === undefined || !this.isPeerConsentRenderCurrent(display.token)) {
+      this.peerConsentLocalNotice = "No current dialog frame; no decision was sent";
+      this.onInvalidate?.();
+      return;
+    }
+    if (this.peerConsentWrittenToken !== display.token) {
+      this.peerConsentLocalNotice = "No written receipt for this frame yet; no decision was sent";
+      this.onInvalidate?.();
+      return;
+    }
+    const consentId = latch.id;
+    const decision = this.peerConsentChoice;
+    const renderToken = display.token;
+    this.claimHeldAction(this.peerConsentActionMatcher(data));
+    // Dispatch while this exact frame is still current: Main's independent
+    // synchronous guard rechecks the token during its onAction handling and
+    // must observe a live, current consent presentation.
+    this.emit({ type: "peer-consent", consentId, decision, renderToken });
+    // Close only the same view this decision came from. A callback that
+    // already replaced it (a newer review, dismissal, hide, or snapshot
+    // invalidation) keeps its own state untouched.
+    if (this.peerConsentLatch === latch) this.dismissPeerConsentReview();
+  }
+
+  private peerConsentActionMatcher(data: string): (candidate: string) => boolean {
+    const key = parseKey(data) as KeyId | undefined;
+    if (key !== undefined) return (candidate) => matchesKey(candidate, key);
+    const printable = printableOf(data);
+    return (candidate) => printable !== undefined && printableOf(candidate) === printable;
+  }
+
+  /** Selectable network-panel rows, built fresh from the attached snapshot. */
+  private buildPeerPaneRows(): readonly PeerPaneRow[] {
+    const rows: PeerPaneRow[] = [
+      { key: "toggle-hosting", kind: "toggle-hosting" },
+      { key: "edit-bind-host", kind: "edit-bind-host" },
+      { key: "edit-bind-port", kind: "edit-bind-port" },
+      { key: "apply-hosting", kind: "apply-hosting" },
+      { key: "toggle-auto", kind: "toggle-auto" },
+      { key: "toggle-bell", kind: "toggle-bell" },
+      { key: "add-host", kind: "add-host" },
+    ];
+    const snapshot = this.peerUiSnapshot;
+    if (snapshot === undefined) return rows;
+    for (const host of snapshot.hosts ?? []) {
+      rows.push({ key: `host:${host.id}`, kind: "host", host });
+      const rosterRows = host.roster.rows;
+      // rows === null is "no complete observation": never fabricate empty rows.
+      if (rosterRows === null) continue;
+      const rosterState = host.roster.state === "stale" ? "stale" : "current";
+      for (const row of rosterRows) {
+        rows.push({
+          key: `remote:${host.id}:${row.id}`,
+          kind: "remote",
+          hostId: host.id,
+          hostLabel: host.label,
+          rosterState,
+          row,
+        });
+      }
+    }
+    for (const peer of snapshot.trustedPeers ?? []) {
+      rows.push({ key: `trusted:${peer.id}`, kind: "trusted", peer });
+    }
+    for (const consent of this.orderedPeerConsents()) {
+      rows.push({ key: `consent:${consent.id}`, kind: "consent", consent });
+    }
+    return rows;
+  }
+
+  private peerPaneRowKeys(): string {
+    return this.buildPeerPaneRows().map((row) => row.key).join("|");
+  }
+
+  private normalizePeerSelection(paneRows: readonly PeerPaneRow[]): number {
+    if (paneRows.length === 0) {
+      this.peerSelectedKey = undefined;
+      return -1;
+    }
+    const index = paneRows.findIndex((row) => row.key === this.peerSelectedKey);
+    if (index >= 0) return index;
+    this.peerSelectedKey = paneRows[0]?.key;
+    return 0;
+  }
+
+  private peerScrollWindow(selectedIndex: number, listRows: number, count: number): number {
+    const maxTop = Math.max(0, count - 1);
+    let top = Math.min(Math.max(this.peerPaneTop, 0), maxTop);
+    if (selectedIndex < top) {
+      top = selectedIndex;
+    } else if (selectedIndex >= top + listRows) {
+      top = selectedIndex - listRows + 1;
+    }
+    this.peerPaneTop = top;
+    return top;
+  }
+
+  private movePeerSelection(delta: number): void {
+    const paneRows = this.buildPeerPaneRows();
+    if (paneRows.length === 0) return;
+    const current = paneRows.findIndex((row) => row.key === this.peerSelectedKey);
+    const next = current < 0
+      ? (delta > 0 ? 0 : paneRows.length - 1)
+      : (current + delta + paneRows.length) % paneRows.length;
+    this.peerSelectedKey = paneRows[next]?.key;
+    this.peerPaneError = undefined;
+  }
+
+  private peerStatusSegments(snapshot: PeerUiSnapshot): string[] {
+    const settings = snapshot.settings;
+    const segments = [
+      settings === null
+        ? "hosting: unknown (settings unavailable)"
+        : `hosting: ${settings.hostingEnabled ? "enabled" : "disabled"}`,
+    ];
+    const listener = snapshot.listener;
+    if (listener.state === "listening") {
+      const host = listener.host === null ? "" : ` on ${sanitizeBounded(listener.host, PEER_ADDRESS_MAX_CODEPOINTS)}`;
+      const port = listener.port === null ? "" : `:${listener.port}`;
+      segments.push(`listener: listening${host}${port}`);
+    } else if (listener.state === "error") {
+      const message = listener.message === null
+        ? ""
+        : ` (${sanitizeBounded(listener.message, ERROR_TEXT_MAX_CODEPOINTS)})`;
+      segments.push(`listener: error${message}`);
+    } else {
+      segments.push(`listener: ${listener.state}`);
+    }
+    segments.push(`auto: ${settings === null ? "unknown" : settings.autoReconnect ? "on" : "off"}`);
+    segments.push(`bell: ${settings === null ? "unknown" : settings.bellEnabled ? "on" : "off"}`);
+    segments.push(snapshot.hosts === null
+      ? "destinations: unavailable"
+      : `destinations: ${snapshot.hosts.length}`);
+    segments.push(snapshot.trustedPeers === null
+      ? "receiving: unavailable"
+      : `receiving: ${snapshot.trustedPeers.length}`);
+    return segments;
+  }
+
+  private peerIdentityText(snapshot: PeerUiSnapshot): string {
+    if (snapshot.identityFingerprint === null) {
+      return snapshot.status === "loading" ? "identity key: loading" : "identity key: unavailable";
+    }
+    return `identity key: ${sanitizeBounded(snapshot.identityFingerprint, PEER_FINGERPRINT_MAX_CODEPOINTS)}`;
+  }
+
+  private peerPaneRowText(row: PeerPaneRow): string {
+    const settings = this.peerUiSnapshot?.settings ?? null;
+    switch (row.kind) {
+      case "toggle-hosting":
+        return `Hosting: ${settings === null ? "unknown" : settings.hostingEnabled ? "enabled" : "disabled"} (enter to ${settings?.hostingEnabled === true ? "disable" : "enable"})`;
+      case "edit-bind-host":
+        return `Listen address: ${this.peerBindHostDraft.length > 0 ? sanitizeBounded(this.peerBindHostDraft, PEER_ADDRESS_MAX_CODEPOINTS) : "(not set)"} (enter to edit)`;
+      case "edit-bind-port":
+        return `Listen port: ${this.peerBindPortDraft.length > 0 ? sanitizeBounded(this.peerBindPortDraft, 16) : "(not set)"} (enter to edit)`;
+      case "apply-hosting":
+        return `Apply listen address/port${this.peerBindDirty ? " (unsaved changes)" : ""}`;
+      case "toggle-auto":
+        return `Auto reconnect: ${settings === null ? "unknown" : settings.autoReconnect ? "on" : "off"} (enter to toggle)`;
+      case "toggle-bell":
+        return `Incoming bell: ${settings === null ? "unknown" : settings.bellEnabled ? "on" : "off"} (enter to toggle)`;
+      case "add-host":
+        return "Add destination";
+      case "host": {
+        const host = row.host;
+        const endpoint = `${sanitizeBounded(host.host, PEER_ADDRESS_MAX_CODEPOINTS)}:${host.port}`;
+        const fingerprint = host.fingerprint === null
+          ? "key unknown"
+          : `key ${sanitizeBounded(host.fingerprint, PEER_FINGERPRINT_MAX_CODEPOINTS)}`;
+        const roster = host.roster.state === "current"
+          ? `roster current (${host.roster.rows === null ? "unknown" : host.roster.rows.length})`
+          : host.roster.state === "stale"
+            ? `roster stale (${host.roster.rows === null ? "rows unknown" : `${host.roster.rows.length} last seen`})`
+            : "roster never observed";
+        const flags = [
+          host.previouslyConnected ? "" : "never connected",
+          host.reconnectSuppressed ? "auto retry suppressed until Connect" : "",
+          host.message === null ? "" : sanitizeBounded(host.message, ERROR_TEXT_MAX_CODEPOINTS),
+        ].filter((flag) => flag.length > 0);
+        const suffix = flags.length === 0 ? "" : ` — ${flags.join(" | ")}`;
+        return `${sanitizeBounded(host.label, PEER_LABEL_MAX_CODEPOINTS)} ${endpoint} — ${host.state} — ${fingerprint} — ${roster}${suffix}`;
+      }
+      case "trusted":
+        return `${sanitizeBounded(row.peer.label, PEER_LABEL_MAX_CODEPOINTS)} — receiving grant ${row.peer.hasInboundGrant ? "allowed" : "none observed"} — key ${sanitizeBounded(row.peer.fingerprint, PEER_FINGERPRINT_MAX_CODEPOINTS)}`;
+      case "consent": {
+        const endpoint = row.consent.endpoint === null
+          ? "endpoint not provided"
+          : sanitizeBounded(row.consent.endpoint, PEER_ENDPOINT_MAX_CODEPOINTS);
+        return `! ${sanitizeBounded(row.consent.label, PEER_LABEL_MAX_CODEPOINTS)} — from ${endpoint} — ${this.peerConsentWindowText(row.consent)} (enter to review)`;
+      }
+      case "remote": {
+        const facts: SessionStatusFacts = {
+          lifecycle: row.row.lifecycle,
+          busy: row.row.busy,
+          pendingInput: row.row.pendingInput,
+          inputSurface: row.row.inputSurface,
+          activeTasks: row.row.activeTasks,
+          activeShells: row.row.activeShells,
+          ...(row.row.exitCode === undefined ? {} : { exitCode: row.row.exitCode }),
+        };
+        const stale = row.rosterState === "stale" ? " [stale]" : "";
+        const error = row.row.error === undefined
+          ? ""
+          : ` | error: ${sanitizeBounded(row.row.error, ERROR_TEXT_MAX_CODEPOINTS)}`;
+        const title = sanitizeBounded(row.row.label, ITEM_LABEL_INPUT_MAX_CODEPOINTS);
+        const workspace = sanitizeBounded(row.row.workspace, SAVED_WORKSPACE_MAX_CODEPOINTS);
+        const hostLabel = sanitizeBounded(row.hostLabel, PEER_LABEL_MAX_CODEPOINTS);
+        return `- ${hostLabel}: ${title}${stale} | ${cardStatusText(facts)} | ${cardBackgroundText(facts)} | ${workspace}${error}`;
+      }
+    }
+  }
+
+  private renderPeerPane(
+    cols: number,
+    rows: number,
+  ): { lines: string[]; cursor?: { column: number; row: number } } {
+    this.peerDisplay = undefined;
+    const snapshot = this.peerUiSnapshot;
+    if (snapshot === undefined) return this.renderTooSmall(cols, rows);
+    const header = " Network ";
+    const statusLines = wrapHintLines(this.peerStatusSegments(snapshot), cols);
+    const identityLines = wrapBoundedField(this.peerIdentityText(snapshot), cols, 2);
+    const notices = [snapshot.notice, this.peerPaneError, this.peerPaneNotice]
+      .filter((message): message is string => typeof message === "string" && message.trim().length > 0)
+      .map((message) => `! ${sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS)}`);
+    const noticeLines = notices.length === 0 ? [] : wrapHintLines(notices, cols) ?? [];
+    const footerLines = wrapHintLines([
+      `${this.toggleLabel} toggle`,
+      "up/down select",
+      "enter open",
+      "c connect",
+      "x disconnect",
+      "r remove",
+      "v revoke",
+      "esc back",
+    ], cols);
+    if (statusLines === undefined || footerLines === undefined) return this.renderTooSmall(cols, rows);
+    const fixedRows = 1 + statusLines.length + identityLines.length + noticeLines.length + footerLines.length;
+    const listRows = rows - fixedRows;
+    if (listRows < 1) return this.renderTooSmall(cols, rows);
+    const paneRows = this.buildPeerPaneRows();
+    const selectedIndex = this.normalizePeerSelection(paneRows);
+    const top = this.peerScrollWindow(Math.max(0, selectedIndex), listRows, paneRows.length);
+    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
+    for (const line of statusLines) lines.push(wrapRow(line, cols));
+    for (const line of identityLines) lines.push(wrapRow(line, cols));
+    for (const line of noticeLines) lines.push(wrapRow(line, cols));
+    const drawn: PeerPaneRow[] = [];
+    for (let index = top; index < paneRows.length && drawn.length < listRows; index += 1) {
+      const row = paneRows[index];
+      const selected = index === selectedIndex;
+      lines.push(wrapRow(
+        `${selected ? "> " : "  "}${this.peerPaneRowText(row)}`,
+        cols,
+        selected ? SGR_SELECTION_BLUE : undefined,
+      ));
+      drawn.push(row);
+    }
+    lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
+    for (const line of footerLines) lines.push(wrapRow(line, cols));
+    this.peerDisplay = {
+      cols,
+      rows,
+      signature: paneRows.map((row) => row.key).join("|"),
+      selectedKey: paneRows[selectedIndex]?.key,
+      entries: drawn,
+    };
+    return { lines };
+  }
+
+  private handlePeerPaneInput(data: string): void {
+    // There is no text target in this pane: pasted bodies are opaque.
+    if (this.routeBracketedPaste(data)) return;
+    if (this.consumeFormEscapeClaim(data)) return;
+    if (this.consumeClaimedReturnChord(data)) return;
+    if (this.handleReservedToggle(data, () => this.closePeerPane())) return;
+    const returnEvent = hostKeyEventType(data, this.returnToMainKey);
+    if (returnEvent !== undefined) {
+      if (returnEvent === "press") this.claimReturnToMainChord();
+      return;
+    }
+    if (this.consumeSavedActionClaim(data)) return;
+    if (isKeyRelease(data)) return;
+    if (matchesKey(data, "up")) {
+      this.movePeerSelection(-1);
+      this.onInvalidate?.();
+      return;
+    }
+    if (matchesKey(data, "down")) {
+      this.movePeerSelection(1);
+      this.onInvalidate?.();
+      return;
+    }
+    if (matchesKey(data, "escape")) {
+      this.formEscapeClaimed = true;
+      this.closePeerPane();
+      this._focus = "sidebar";
+      this.onInvalidate?.();
+      return;
+    }
+    if (matchesKey(data, "enter")) {
+      if (isKeyRepeat(data)) return;
+      this.activatePeerPaneRow();
+      return;
+    }
+    if (isKeyRepeat(data)) return;
+    const printable = printableOf(data);
+    if (printable === "c" || printable === "C") {
+      this.requestPeerConnect();
+      return;
+    }
+    if (printable === "x" || printable === "X") {
+      this.requestPeerDisconnect();
+      return;
+    }
+    if (printable === "r" || printable === "R") {
+      this.requestPeerRemoveConfirmation();
+      return;
+    }
+    if (printable === "v" || printable === "V") {
+      this.requestPeerRevokeConfirmation();
+    }
+  }
+
+  /** Acts only on a row the last complete network-pane render actually drew. */
+  private selectedPeerPaneRow(): PeerPaneRow | undefined {
+    const display = this.peerDisplay;
+    if (display === undefined || this.formKind !== "peer" || this._focus !== "form" || !this._visible) {
+      return undefined;
+    }
+    if (display.selectedKey !== this.peerSelectedKey || display.signature !== this.peerPaneRowKeys()) {
+      return undefined;
+    }
+    return display.entries.find((row) => row.key === this.peerSelectedKey);
+  }
+
+  private activatePeerPaneRow(): void {
+    const row = this.selectedPeerPaneRow();
+    if (row === undefined) {
+      this.peerPaneError = "The network pane changed; review it before acting";
+      this.onInvalidate?.();
+      return;
+    }
+    const settings = this.peerUiSnapshot?.settings ?? null;
+    switch (row.kind) {
+      case "toggle-hosting":
+        this.requestPeerListener(settings?.hostingEnabled !== true);
+        return;
+      case "edit-bind-host":
+        this.openPeerFieldForm("bind-host");
+        return;
+      case "edit-bind-port":
+        this.openPeerFieldForm("bind-port");
+        return;
+      case "apply-hosting":
+        this.requestPeerListener(settings?.hostingEnabled === true);
+        return;
+      case "toggle-auto":
+        this.emit({ type: "peer-auto-reconnect", enabled: settings?.autoReconnect !== true });
+        this.peerPaneNotice = "Auto reconnect change requested; the coordinator reports the saved setting";
+        this.peerPaneError = undefined;
+        this.onInvalidate?.();
+        return;
+      case "toggle-bell":
+        this.emit({ type: "peer-bell", enabled: settings?.bellEnabled !== true });
+        this.peerPaneNotice = "Bell change requested; the coordinator reports the saved setting";
+        this.peerPaneError = undefined;
+        this.onInvalidate?.();
+        return;
+      case "add-host":
+        this.openPeerFieldForm("add");
+        return;
+      case "host": {
+        const label = sanitizeBounded(row.host.label, PEER_LABEL_MAX_CODEPOINTS);
+        this.peerPaneError = undefined;
+        this.peerPaneNotice = `Selected ${label}; c connect, x disconnect, r remove`;
+        this.onInvalidate?.();
+        return;
+      }
+      case "trusted": {
+        const label = sanitizeBounded(row.peer.label, PEER_LABEL_MAX_CODEPOINTS);
+        const grant = row.peer.hasInboundGrant ? "" : " (no grant observed)";
+        this.peerPaneNotice = `Receiving permission for ${label}${grant}; v revoke`;
+        this.peerPaneError = undefined;
+        this.onInvalidate?.();
+        return;
+      }
+      case "consent":
+        this.openPeerConsentReview(row.consent);
+        return;
+      case "remote":
+        // Metadata-only: no local select/resume/create/stop/remove/rename
+        // action, no focus change, and the native content owner is untouched.
+        this.peerPaneError = undefined;
+        this.peerPaneNotice = `Remote session metadata only (${row.rosterState}): local display is not available in this version`;
+        this.onInvalidate?.();
+        return;
+    }
+  }
+
+  private requestPeerListener(enabled: boolean): void {
+    const host = this.peerBindHostDraft.trim();
+    const port = this.peerBindPortDraft.trim();
+    const error = peerHostFieldError(host, "Listen address") ?? peerPortFieldError(port, "Listen port");
+    if (error !== undefined) {
+      this.peerPaneError = error;
+      this.onInvalidate?.();
+      return;
+    }
+    this.peerPaneError = undefined;
+    this.peerPaneNotice = enabled
+      ? "Listen request sent; the coordinator reports the actual binding"
+      : "Hosting disable requested; the remembered settings stay saved";
+    this.emit({ type: "peer-listener", enabled, host, port });
+    this.onInvalidate?.();
+  }
+
+  private requestPeerConnect(): void {
+    const row = this.selectedPeerPaneRow();
+    if (row?.kind !== "host") {
+      this.peerPaneError = "Select a destination to connect";
+      this.onInvalidate?.();
+      return;
+    }
+    if (row.host.state === "connected") {
+      this.peerPaneError = "This destination is already connected";
+      this.onInvalidate?.();
+      return;
+    }
+    if (row.host.state === "pairing" || row.host.state === "connecting") {
+      this.peerPaneError = "This destination is already connecting";
+      this.onInvalidate?.();
+      return;
+    }
+    this.peerPaneError = undefined;
+    const label = sanitizeBounded(row.host.label, PEER_LABEL_MAX_CODEPOINTS);
+    const action = row.host.reconnectSuppressed || row.host.previouslyConnected ? "Retry" : "Connect";
+    this.peerPaneNotice = `${action} requested for ${label}; the coordinator decides the outcome`;
+    this.emit({ type: "peer-connect", hostId: row.host.id });
+    this.onInvalidate?.();
+  }
+
+  private requestPeerDisconnect(): void {
+    const row = this.selectedPeerPaneRow();
+    if (row?.kind !== "host") {
+      this.peerPaneError = "Select a destination to disconnect";
+      this.onInvalidate?.();
+      return;
+    }
+    const state = row.host.state;
+    if (state !== "connected" && state !== "connecting" && state !== "pairing" && state !== "retrying") {
+      this.peerPaneError = "This destination is not connected";
+      this.onInvalidate?.();
+      return;
+    }
+    this.peerPaneError = undefined;
+    this.peerPaneNotice = `Disconnect requested for ${sanitizeBounded(row.host.label, PEER_LABEL_MAX_CODEPOINTS)}; the association and its suppression are kept`;
+    this.emit({ type: "peer-disconnect", hostId: row.host.id });
+    this.onInvalidate?.();
+  }
+
+  private requestPeerRemoveConfirmation(): void {
+    const row = this.selectedPeerPaneRow();
+    if (row?.kind !== "host") {
+      this.peerPaneError = "Select a destination to remove";
+      this.onInvalidate?.();
+      return;
+    }
+    this.openPeerRemoveConfirmation(row.host);
+  }
+
+  private requestPeerRevokeConfirmation(): void {
+    const row = this.selectedPeerPaneRow();
+    if (row?.kind !== "trusted") {
+      this.peerPaneError = "Select a receiving permission to revoke";
+      this.onInvalidate?.();
+      return;
+    }
+    if (!row.peer.hasInboundGrant) {
+      this.peerPaneError = "No receiving grant is observed for this peer";
+      this.onInvalidate?.();
+      return;
+    }
+    this.openPeerRevokeConfirmation(row.peer);
+  }
+
+  private openPeerRemoveConfirmation(host: PeerUiHost): void {
+    this.forgetDisplayedRoster(); // the confirmation replaces the pane
+    this.disposeFormField();
+    this.formKind = undefined;
+    this.peerDisplay = undefined;
+    this.peerConfirmDisplayed = false;
+    this.peerRevokeTarget = undefined;
+    this.peerRemoveTarget = Object.freeze({
+      hostId: host.id,
+      label: sanitizeBounded(host.label, PEER_LABEL_MAX_CODEPOINTS),
+      endpoint: `${sanitizeBounded(host.host, PEER_ADDRESS_MAX_CODEPOINTS)}:${host.port}`,
+    });
+    this.confirmPurpose = "peer-remove";
+    this._focus = "confirm";
+    this.onInvalidate?.();
+  }
+
+  private openPeerRevokeConfirmation(peer: PeerUiTrustedPeer): void {
+    this.forgetDisplayedRoster();
+    this.disposeFormField();
+    this.formKind = undefined;
+    this.peerDisplay = undefined;
+    this.peerConfirmDisplayed = false;
+    this.peerRemoveTarget = undefined;
+    this.peerRevokeTarget = Object.freeze({
+      peerId: peer.id,
+      label: sanitizeBounded(peer.label, PEER_LABEL_MAX_CODEPOINTS),
+      fingerprint: sanitizeBounded(peer.fingerprint, PEER_FINGERPRINT_MAX_CODEPOINTS),
+    });
+    this.confirmPurpose = "peer-revoke";
+    this._focus = "confirm";
+    this.onInvalidate?.();
+  }
+
+  private renderPeerRemoveConfirmPane(cols: number, rows: number): { lines: string[] } {
+    this.peerConfirmDisplayed = false;
+    const target = this.peerRemoveTarget;
+    const header = " Remove destination? ";
+    const hints = wrapHintLines(["enter/y = remove", "esc/n = cancel"], cols);
+    const warnings = wrapHintLines([
+      "The saved destination and its local remembered key are forgotten.",
+      "The other host's receiving grant and its sessions are not changed.",
+    ], cols);
+    if (target === undefined || hints === undefined || warnings === undefined || visibleWidth(header) > cols) {
+      return this.renderTooSmall(cols, rows);
+    }
+    const nameLines = wrapExactField(`name: ${target.label}`, cols, 4);
+    const endpointLines = wrapExactField(`destination: ${target.endpoint}`, cols, 4);
+    if (nameLines === undefined || endpointLines === undefined) return this.renderTooSmall(cols, rows);
+    const targetLines = [...nameLines, ...endpointLines];
+    if (1 + targetLines.length + warnings.length + hints.length > rows) return this.renderTooSmall(cols, rows);
+    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    for (const line of targetLines) lines.push(wrapRow(line, cols));
+    for (const line of warnings) lines.push(wrapRow(line, cols));
+    lines.push(...blankLines(Math.max(0, rows - lines.length - hints.length)));
+    for (const line of hints) lines.push(wrapRow(line, cols));
+    this.peerConfirmDisplayed = true;
+    return { lines };
+  }
+
+  private renderPeerRevokeConfirmPane(cols: number, rows: number): { lines: string[] } {
+    this.peerConfirmDisplayed = false;
+    const target = this.peerRevokeTarget;
+    const header = " Revoke receiving permission? ";
+    const hints = wrapHintLines(["enter/y = revoke", "esc/n = cancel"], cols);
+    const warnings = wrapHintLines([
+      "This host may no longer connect here until it is approved again.",
+      "No session is stopped and the opposite direction is unchanged.",
+    ], cols);
+    if (target === undefined || hints === undefined || warnings === undefined || visibleWidth(header) > cols) {
+      return this.renderTooSmall(cols, rows);
+    }
+    const nameLines = wrapExactField(`name: ${target.label}`, cols, 4);
+    const keyLines = wrapExactField(`key: ${target.fingerprint}`, cols, 4);
+    if (nameLines === undefined || keyLines === undefined) return this.renderTooSmall(cols, rows);
+    const targetLines = [...nameLines, ...keyLines];
+    if (1 + targetLines.length + warnings.length + hints.length > rows) return this.renderTooSmall(cols, rows);
+    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    for (const line of targetLines) lines.push(wrapRow(line, cols));
+    for (const line of warnings) lines.push(wrapRow(line, cols));
+    lines.push(...blankLines(Math.max(0, rows - lines.length - hints.length)));
+    for (const line of hints) lines.push(wrapRow(line, cols));
+    this.peerConfirmDisplayed = true;
+    return { lines };
+  }
+
+  private handlePeerConfirmInput(data: string): void {
+    if (isKeyRepeat(data) || isKeyRelease(data)) return;
+    if (matchesKey(data, "escape")) {
+      this.cancelPeerConfirmation();
+      return;
+    }
+    const printable = printableOf(data);
+    if (printable === "n" || printable === "N") {
+      this.cancelPeerConfirmation();
+      return;
+    }
+    if (!this.peerConfirmDisplayed) return;
+    if (!matchesKey(data, "enter") && printable !== "y" && printable !== "Y") return;
+    const removeTarget = this.peerRemoveTarget;
+    const revokeTarget = this.peerRevokeTarget;
+    const purpose = this.confirmPurpose;
+    this.cancelPeerConfirmation();
+    if (purpose === "peer-remove" && removeTarget !== undefined) {
+      this.peerPaneNotice = `Remove requested for ${removeTarget.label}; the coordinator forgets the saved destination and local key`;
+      this.emit({ type: "peer-remove", hostId: removeTarget.hostId });
+      return;
+    }
+    if (purpose === "peer-revoke" && revokeTarget !== undefined) {
+      this.peerPaneNotice = `Revoke requested for ${revokeTarget.label}; the coordinator reports the current receiving permission`;
+      this.emit({ type: "peer-revoke", peerId: revokeTarget.peerId });
+    }
+  }
+
+  private cancelPeerConfirmation(): void {
+    this.peerConfirmDisplayed = false;
+    this.peerRemoveTarget = undefined;
+    this.peerRevokeTarget = undefined;
+    this.confirmPurpose = "quit";
+    this.formKind = this.peerUiSnapshot === undefined ? undefined : "peer";
+    this._focus = this.formKind === "peer" ? "form" : "sidebar";
+    this.onInvalidate?.();
+  }
+
+  private closePeerPane(): void {
+    this.disposeFormField();
+    this.formKind = undefined;
+    this.peerFieldTarget = undefined;
+    this.peerDisplay = undefined;
+    this.peerPaneError = undefined;
+    this.peerPaneNotice = undefined;
+    this.peerConfirmDisplayed = false;
+    this.peerRemoveTarget = undefined;
+    this.peerRevokeTarget = undefined;
+  }
+
+  /** Opens one bounded text editor for an explicit listen value or a new destination. */
+  private openPeerFieldForm(purpose: "bind-host" | "bind-port" | "add"): void {
+    this.disposeFormField();
+    this.pendingCreate = undefined;
+    this.pendingRename = undefined;
+    this.pendingShortcutSave = undefined;
+    this.formKind = "peer-field";
+    this.peerFieldTarget = { purpose };
+    this.peerFieldIndex = 0;
+    this.formError = undefined;
+    this._focus = "form";
+    this.createFormField(this.peerFieldValue(purpose, 0));
+  }
+
+  private peerFieldValue(purpose: "bind-host" | "bind-port" | "add", index: 0 | 1 | 2): string {
+    if (purpose === "bind-host") return this.peerBindHostDraft;
+    if (purpose === "bind-port") return this.peerBindPortDraft;
+    return index === 0 ? this.peerAddDraft.label : index === 1 ? this.peerAddDraft.host : this.peerAddDraft.port;
+  }
+
+  private closePeerFieldForm(): void {
+    this.abandonForm();
+    this.formKind = this.peerUiSnapshot === undefined ? undefined : "peer";
+    this._focus = this.formKind === "peer" ? "form" : "sidebar";
+    this.onInvalidate?.();
+  }
+
+  private switchPeerField(): void {
+    const purpose = this.peerFieldTarget?.purpose;
+    if (this.formKind !== "peer-field" || purpose !== "add") return;
+    const value = this.formField?.getValue() ?? "";
+    if (this.peerFieldIndex === 0) this.peerAddDraft.label = value;
+    else if (this.peerFieldIndex === 1) this.peerAddDraft.host = value;
+    else this.peerAddDraft.port = value;
+    this.peerFieldIndex = (this.peerFieldIndex + 1) % 3 as 0 | 1 | 2;
+    this.formError = undefined;
+    this.createFormField(this.peerFieldValue("add", this.peerFieldIndex));
+  }
+
+  private submitPeerField(submission: SessionHostFieldSubmission): void {
+    const purpose = this.peerFieldTarget?.purpose;
+    if (purpose === undefined) return;
+    const value = submission.value;
+    if (purpose === "bind-host") {
+      const error = peerHostFieldError(value, "Listen address");
+      if (error !== undefined) {
+        this.formError = error;
+        this.createFormField(value);
+        return;
+      }
+      this.peerBindHostDraft = value;
+      this.peerBindDirty = true;
+      this.peerPaneNotice = "Listen address updated locally; choose Apply to request it";
+      this.peerPaneError = undefined;
+      this.closePeerFieldForm();
+      return;
+    }
+    if (purpose === "bind-port") {
+      const error = peerPortFieldError(value, "Listen port");
+      if (error !== undefined) {
+        this.formError = error;
+        this.createFormField(value);
+        return;
+      }
+      this.peerBindPortDraft = value;
+      this.peerBindDirty = true;
+      this.peerPaneNotice = "Listen port updated locally; choose Apply to request it";
+      this.peerPaneError = undefined;
+      this.closePeerFieldForm();
+      return;
+    }
+    if (this.peerFieldIndex === 0) {
+      const error = peerLabelFieldError(value);
+      if (error !== undefined) {
+        this.formError = error;
+        this.createFormField(value);
+        return;
+      }
+      this.peerAddDraft.label = value;
+      this.peerFieldIndex = 1;
+      this.formError = undefined;
+      this.createFormField(this.peerAddDraft.host);
+      return;
+    }
+    if (this.peerFieldIndex === 1) {
+      const error = peerHostFieldError(value, "Destination host");
+      if (error !== undefined) {
+        this.formError = error;
+        this.createFormField(value);
+        return;
+      }
+      this.peerAddDraft.host = value;
+      this.peerFieldIndex = 2;
+      this.formError = undefined;
+      this.createFormField(this.peerAddDraft.port);
+      return;
+    }
+    const error = peerLabelFieldError(this.peerAddDraft.label)
+      ?? peerHostFieldError(this.peerAddDraft.host, "Destination host")
+      ?? peerPortFieldError(value, "Port");
+    if (error !== undefined) {
+      this.formError = error;
+      this.createFormField(value);
+      return;
+    }
+    const draft = { label: this.peerAddDraft.label, host: this.peerAddDraft.host, port: value };
+    this.peerAddDraft = { label: "", host: "", port: "" };
+    this.peerPaneError = undefined;
+    this.peerPaneNotice = "Destination add requested; the coordinator validates and saves it";
+    this.closePeerFieldForm();
+    this.emit({ type: "peer-add", label: draft.label, host: draft.host, port: draft.port });
+  }
+
+  private renderPeerFieldPane(
+    cols: number,
+    rows: number,
+  ): { lines: string[]; cursor?: { column: number; row: number } } {
+    const target = this.peerFieldTarget;
+    const field = this.formField;
+    const header = " Network settings ";
+    const purpose = target?.purpose;
+    if (target === undefined || field === undefined) return this.renderTooSmall(cols, rows);
+    const activeLabel = purpose === "bind-host"
+      ? "Listen address"
+      : purpose === "bind-port"
+        ? "Listen port"
+        : this.peerFieldIndex === 0 ? "Destination name" : this.peerFieldIndex === 1 ? "Host" : "Port";
+    const contextLines = wrapHintLines([
+      purpose === "add"
+        ? "The destination is display data; the coordinator validates and saves it."
+        : "An explicit local listen address/port is required; no wildcard or fallback is chosen.",
+    ], cols);
+    const errorLines = this.formError === undefined ? [] : wrapHintLines([`! ${this.formError}`], cols);
+    const hints = purpose === "add"
+      ? [`${this.formHints.submit} next/save`, "tab next field", `${this.formHints.cancel} cancel`]
+      : [`${this.formHints.submit} save`, `${this.formHints.cancel} cancel`];
+    const footerLines = wrapHintLines(hints, cols);
+    if (contextLines === undefined || errorLines === undefined || footerLines === undefined
+      || visibleWidth(header) > cols) return this.renderTooSmall(cols, rows);
+    const allFields = [
+      { label: "Destination name", value: this.peerAddDraft.label },
+      { label: "Host", value: this.peerAddDraft.host },
+      { label: "Port", value: this.peerAddDraft.port },
+    ];
+    const inactive = purpose === "add"
+      ? allFields.filter((_entry, index) => index !== this.peerFieldIndex)
+      : [];
+    const fixedRows = 1 + contextLines.length + inactive.length + 1 + errorLines.length + footerLines.length;
+    const activeRows = rows - fixedRows;
+    if (activeRows < 1) return this.renderTooSmall(cols, rows);
+    const prefix = `> ${activeLabel}: `;
+    const prefixWidth = Math.min(visibleWidth(prefix), cols - 1);
+    const fieldWidth = Math.max(1, cols - prefixWidth);
+    const fieldFrame = field.render(fieldWidth, activeRows);
+    if (!fieldFrame.cursor.visible || fieldFrame.lines.length === 0) return this.renderTooSmall(cols, rows);
+
+    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    for (const line of contextLines) lines.push(wrapRow(line, cols));
+    for (const entry of inactive) {
+      lines.push(wrapRow(
+        `  ${entry.label}: ${sanitizeBounded(entry.value, PEER_ADDRESS_MAX_CODEPOINTS)}`,
+        cols,
+      ));
+    }
+    const fieldTopRow = lines.length;
+    const fieldRowCount = Math.min(activeRows, fieldFrame.lines.length);
+    for (let index = 0; index < fieldRowCount; index += 1) {
+      const source = fieldFrame.lines[index] ?? "";
+      const positioned = index === 0 ? `${prefix}${source}` : `${" ".repeat(prefixWidth)}${source}`;
+      lines.push(wrapRow(positioned, cols));
+    }
+    lines.push(wrapRow(errorLines[0] ?? "", cols));
+    for (const line of errorLines.slice(1)) lines.push(wrapRow(line, cols));
+    lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
+    for (const line of footerLines) lines.push(wrapRow(line, cols));
+    return {
+      lines,
+      cursor: {
+        column: Math.min(prefixWidth + fieldFrame.cursor.column, cols - 1),
+        row: fieldTopRow + fieldFrame.cursor.row,
+      },
+    };
+  }
+
   // --- Visibility. ---
 
   /**
@@ -3114,6 +4935,16 @@ export class SidebarController {
     this.confirmPurpose = "quit";
     this.stopRemoveTargetId = undefined;
     this.stopConfirmDisplayed = false;
+    // A hidden pane also holds no consent dialog, network confirmation, or
+    // drawn peer-row map: none of them may authorize anything off-screen.
+    this.peerConsentLatch = undefined;
+    this.peerConsentLocalNotice = undefined;
+    this.invalidatePeerConsentDisplay();
+    this.peerConfirmDisplayed = false;
+    this.peerRemoveTarget = undefined;
+    this.peerRevokeTarget = undefined;
+    this.peerDisplay = undefined;
+    this.peerFieldTarget = undefined;
     this._visible = false;
     this._focus = "main";
     this.emit({ type: "visibility", visible: false });
@@ -3160,6 +4991,9 @@ export class SidebarController {
         : [{ key: ENTRY_DIAGNOSTICS_KEY, kind: "diagnostics" as const, warning: this.diagnosticsWarning }]),
       { key: ENTRY_SAVED_KEY, kind: "saved" },
       { key: ENTRY_NEW_KEY, kind: "new" },
+      ...(this.peerUiSnapshot === undefined
+        ? []
+        : [{ key: ENTRY_PEER_KEY, kind: "peer" as const }]),
       { key: ENTRY_QUIT_KEY, kind: "quit" },
       ...(this.settingsAvailable ? [{ key: ENTRY_SETTINGS_KEY, kind: "settings" as const }] : []),
     ];
@@ -3205,10 +5039,15 @@ export class SidebarController {
     const noticeLines = this.noticeError === undefined
       ? []
       : wrapHintLines([`! ${this.noticeError}`], cols);
+    // The pending-consent band is reserved ABOVE the scrolling list, so a later
+    // selected row can never scroll it out of view. It is the same bounded,
+    // notification-only presentation as renderPeerAlert: no confirmation
+    // control, no authority, and no focus/selection change.
+    const alertLines = this.renderPeerAlert(cols, PEER_CONSENT_ALERT_ROWS).lines;
     if (footerLines === undefined || noticeLines === undefined || visibleWidth(header) > cols) {
       return this.renderRosterTooSmall(cols, rows);
     }
-    const listRows = rows - 1 - noticeLines.length - footerLines.length;
+    const listRows = rows - 1 - alertLines.length - noticeLines.length - footerLines.length;
     const selectedIndex = this.entries.findIndex((entry) => entry.key === this.selectedEntryKey);
     const selectedHeight = selectedIndex >= 0 ? this.entryHeight(this.entries[selectedIndex]) : 1;
     // At least one entry row is required, and the highlighted entry (a card
@@ -3218,6 +5057,7 @@ export class SidebarController {
       return this.renderRosterTooSmall(cols, rows);
     }
     const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
+    lines.push(...alertLines);
     const top = this.scrollWindow(selectedIndex, listRows);
     const displayed = new Map<string, number>();
     const regions = new Map<string, DisplayedRosterRegion>();
@@ -3253,7 +5093,12 @@ export class SidebarController {
     return { lines };
   }
 
-  /** Too-small roster fallback: records that no entry is displayed. */
+  /**
+   * Too-small roster fallback: no entry is displayed (the hit map stays empty,
+   * so no roster target can act), but a pending request keeps its bounded,
+   * notification-only presentation instead of vanishing behind a generic
+   * message. With nothing pending the legacy too-small message is unchanged.
+   */
   private renderRosterTooSmall(cols: number, rows: number): { lines: string[] } {
     this.displayedRoster = {
       signature: this.rosterSignature(),
@@ -3263,7 +5108,8 @@ export class SidebarController {
       rows,
       focus: this._focus,
     };
-    return this.renderTooSmall(cols, rows);
+    const alert = this.renderPeerAlert(cols, rows);
+    return alert.lines.length === 0 ? this.renderTooSmall(cols, rows) : { lines: alert.lines };
   }
 
   /**
@@ -3356,6 +5202,10 @@ export class SidebarController {
       ? `${marker}Saved conversations`
       : entry.kind === "new"
         ? `${marker}New session`
+        : entry.kind === "peer"
+          ? `${marker}Network${this.peerPendingConsentCount() > 0
+            ? ` (${this.peerPendingConsentCount()} request${this.peerPendingConsentCount() === 1 ? "" : "s"})`
+            : ""}`
         : entry.kind === "settings"
           ? `${marker}Host shortcuts${this.legacyToggleOverride ? " (--sidebar-key override active)" : ""}`
           : `${marker}Quit host`;
@@ -3673,6 +5523,16 @@ export class SidebarController {
   }
 
   private renderConfirmPane(cols: number, rows: number): { lines: string[] } {
+    this.peerConsentRendered = false;
+    if (this.confirmPurpose === "peer-consent") {
+      return this.renderPeerConsentPane(cols, rows);
+    }
+    if (this.confirmPurpose === "peer-remove") {
+      return this.renderPeerRemoveConfirmPane(cols, rows);
+    }
+    if (this.confirmPurpose === "peer-revoke") {
+      return this.renderPeerRevokeConfirmPane(cols, rows);
+    }
     if (this.confirmPurpose === "saved-delete") {
       return this.renderSavedDeleteConfirmPane(cols, rows);
     }
@@ -3903,4 +5763,34 @@ function renameFailureNotice(status: string): string {
     case "invalid-request": return "Session rename request was rejected";
     default: return "Session name could not be changed";
   }
+}
+
+/**
+ * Fixed, local data-shape errors for network fields. They never claim network
+ * admission: the coordinator revalidates every command; these only refuse
+ * obviously unusable text before it is sent.
+ */
+function peerHostFieldError(value: string, label: string): string | undefined {
+  if (value.length === 0) return `${label} is required (no default is chosen for you)`;
+  if (/\s/.test(value)) return `${label} cannot contain whitespace`;
+  if (sanitizeCellText(value) !== value) return `${label} contains unsafe text`;
+  if (countCodePoints(value) > PEER_ADDRESS_MAX_CODEPOINTS) return `${label} is too long`;
+  return undefined;
+}
+
+function peerPortFieldError(value: string, label: string): string | undefined {
+  if (value.length === 0) return `${label} is required (no default port is chosen for you)`;
+  if (!/^[0-9]+$/.test(value)) return `${label} must be a whole number`;
+  const port = Number(value);
+  if (!Number.isSafeInteger(port) || port < PEER_PORT_MIN || port > PEER_PORT_MAX) {
+    return `${label} must be between ${PEER_PORT_MIN} and ${PEER_PORT_MAX}`;
+  }
+  return undefined;
+}
+
+function peerLabelFieldError(value: string): string | undefined {
+  if (value.trim().length === 0) return "A destination name is required";
+  if (sanitizeCellText(value) !== value) return "The destination name contains unsafe text";
+  if (countCodePoints(value) > PEER_LABEL_MAX_CODEPOINTS) return "The destination name is too long";
+  return undefined;
 }

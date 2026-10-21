@@ -1444,9 +1444,8 @@ interface CompiledLaunchModule {
 /**
  * Non-recursive teardown for the anchor-fixture trees: only the EXPLICIT owned
  * file paths are unlinked and the known directories are removed leaf-to-root.
- * No recursive scan or descent of any kind (the .terraform-pruning rule
- * applies to synthetic roots too); unknown content surfaces as an honest
- * rmdir error instead of being deleted.
+ * No recursive scan or descent of any kind; unknown content surfaces as an
+ * honest rmdir error instead of being deleted.
  */
 function removeOwnedFixtureTree(root: string, files: string[], dirsLeafToRoot: string[]): void {
   for (const file of files) {

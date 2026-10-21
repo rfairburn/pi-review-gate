@@ -60,6 +60,7 @@ import {
   isSidebarFocusedFrame,
   nextRosterNavigationTarget,
   parseRosterFrame,
+  rosterNavigationDirection,
   rosterNavigationTargets as parseRosterNavigationTargets,
   renderedTitleMatches,
   selectedRosterCard,
@@ -862,13 +863,12 @@ function copyBoundedRegularFile(
 /**
  * Copy one selected source tree into an owned destination tree.
  *
- * `.terraform` is pruned by name BEFORE lstat/readdir/descent at every depth,
- * including synthetic source roots. The source root and every intermediate are
- * real, non-linked directories whose retained receipt chain is re-verified
- * around every iteration; the identity inspected in the parent loop is passed
- * into the recursion and required, never recaptured. Directory iteration is
- * bounded (`opendirSync`/`readSync`) so an oversized directory never has its
- * full name array materialized. Linked or special source entries and linked
+ * The source root and every intermediate are real, non-linked directories
+ * whose retained receipt chain is re-verified around every iteration; the
+ * identity inspected in the parent loop is passed into the recursion and
+ * required, never recaptured. Directory iteration is bounded
+ * (`opendirSync`/`readSync`) so an oversized directory never has its full name
+ * array materialized. Linked or special source entries and linked
  * destination ancestors fail closed. The copier never realpaths a source root,
  * so it makes no link-following containment claim for it.
  */
@@ -895,9 +895,6 @@ function copyBoundedTree(
         const entry = directory.readSync();
         if (entry === null) break;
         const name = entry.name;
-        // Exclude initialized Terraform data before lstat, readdir, or descent
-        // at every depth, including inside the synthetic source roots.
-        if (name === ".terraform") continue;
         const sourceEntry = join(source, name);
         const destinationEntry = join(destination, name);
         const entryStats = lstatSync(sourceEntry, { bigint: true });
@@ -1000,8 +997,8 @@ function readBoundedManifest(
 /**
  * Reject unsafe shipped manifest entries BEFORE any access. Public package files
  * are accepted as relative strings only: empty, home-relative, absolute,
- * drive-qualified, traversal, `.terraform`, `.git`, and `node_modules`
- * components all fail closed.
+ * drive-qualified, traversal, `.git`, and `node_modules` components all fail
+ * closed.
  */
 function validateShippedEntry(shippedEntry: string): string {
   if (!shippedEntry || shippedEntry.startsWith("~")) {
@@ -1013,7 +1010,7 @@ function validateShippedEntry(shippedEntry: string): string {
   const components = shippedEntry.split(/[\\/]+/);
   for (const component of components) {
     if (!component || component === "." || component === ".."
-        || component === ".terraform" || component === ".git" || component === "node_modules") {
+        || component === ".git" || component === "node_modules") {
       throw new Error("candidate staging rejected an unsafe package file entry");
     }
   }
@@ -1364,9 +1361,9 @@ export function processIsAlive(pidValue: number | undefined): boolean {
  * Root creation alone does not prove ownership of every descendant subsequently
  * written there. Until each removable entry has a positive creation/identity
  * receipt, do not enumerate, descend, unlink, or remove any of them. This also
- * preserves unknown/replaced entries and initialized Terraform contents.
+ * preserves unknown and replaced entries.
  */
-export function removeOwnedScratchTreePruningTerraform(root: string): boolean {
+export function removeOwnedScratchTree(root: string): boolean {
   void root;
   return false;
 }
@@ -2073,7 +2070,7 @@ export class MainPtyDriver {
       && this.rosterTargetSelected(text, target.label);
   }
 
-  async moveRosterTo(label: string, maximumDowns = 5, timeoutMs = EVENT_TIMEOUT_MS): Promise<void> {
+  async moveRosterTo(label: string, maximumSteps = 5, timeoutMs = EVENT_TIMEOUT_MS): Promise<void> {
     if (this.rosterTargetSelected(this.currentText(), label)) {
       this.rememberSelectedTarget(label);
       return;
@@ -2103,7 +2100,7 @@ export class MainPtyDriver {
         return;
       }
     }
-    for (let count = 0; count < maximumDowns; count += 1) {
+    for (let count = 0; count < maximumSteps; count += 1) {
       // Observe an actual known row before authorizing any navigation key.
       await this.waitFrame((text) => this.rosterNavigationTargets(text)
         ?.some((target) => this.rosterTargetSelectedAt(text, target)) ?? false,
@@ -2116,10 +2113,15 @@ export class MainPtyDriver {
       assert.ok(targets !== undefined && selected !== undefined && selectedTarget !== undefined
         && this.rosterTargetSelectedAt(currentText, selectedTarget),
       `the owned roster has an observed highlighted row before navigation\nActual owned Main frame:\n${this.currentText()}`);
-      const nextTarget = nextRosterNavigationTarget(targets, selected.position);
+      // Navigate the actual known cyclic order, not an assumed legacy action
+      // count. The optional Network row needs no larger key budget: take the
+      // shortest proven direction and still observe every exact next highlight.
+      const direction = rosterNavigationDirection(targets, selected.position, label);
+      assert.ok(direction, "the complete roster has one known destination distinct from its highlight");
+      const nextTarget = nextRosterNavigationTarget(targets, selected.position, direction);
       assert.ok(nextTarget, "the current complete roster has an actual next entry after its highlight");
       const after = this.frameRevision;
-      this.pty.write(KEYS.down);
+      this.pty.write(KEYS[direction]);
       // Native output and status can repaint before this key changes the roster.
       // Wait for the actual next highlight, not merely any parsed frame.
       await this.waitFrame((text) => {

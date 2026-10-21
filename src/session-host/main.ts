@@ -29,6 +29,8 @@ import {
 import type { SessionGeometry } from "./instances";
 import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment, supportsSessionHostKittyGraphics } from "./launch";
 import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
+import { createPeerCoordinator, type PeerCoordinatorOptions } from "./network/peer-coordinator";
+import type { PeerCoordinator, PeerConsentPresentation, PeerUiCommand, PeerUiSnapshot } from "./peer-ui-protocol";
 import { isValidNativeSessionId } from "./protocol";
 import {
   createLocalOwningHostService,
@@ -162,6 +164,12 @@ interface SavedDeleteConfirmationFrame {
   settled: boolean;
 }
 
+interface PeerConsentConfirmationFrame extends PeerConsentPresentation {
+  readonly cols: number;
+  readonly rows: number;
+  settled: boolean;
+}
+
 function sameMouseAuthorization(a: MouseFramePresentation, b: MouseFramePresentation): boolean {
   // Focus and owner are part of native click authorization even when a
   // too-small fallback and a hidden native cursor make the composed bytes
@@ -249,6 +257,8 @@ interface MainDependencies {
     dependencies: OwningHostServiceDependencies,
   ) => OwningHostService;
   readonly createSidebar: (options: ConstructorParameters<typeof SidebarController>[0]) => SidebarController;
+  /** Main-owned networking; pure sidebar actions never construct transport or mutate trust. */
+  readonly createPeerCoordinator: (options: PeerCoordinatorOptions) => PeerCoordinator;
   /** Read-only listing of the shared native agent root's saved conversations. */
   readonly listSavedCatalog: (options: {
     agentDir: string;
@@ -624,6 +634,7 @@ function productionDependencies(): MainDependencies {
     createManager: (options) => new InstanceManager(options),
     createOwningHostService: (serviceDependencies) => createLocalOwningHostService(serviceDependencies),
     createSidebar: (options) => new SidebarController(options),
+    createPeerCoordinator,
     listSavedCatalog: listSavedSessions,
     deleteSavedFile: deleteSavedSessionFile,
     openHostState: openProductionHostState,
@@ -685,6 +696,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let observer: MainObserver | undefined;
   let writer: MainWriter | undefined;
   let sidebar: SidebarController | undefined;
+  let peerCoordinator: PeerCoordinator | undefined;
+  let peerUiSnapshot: PeerUiSnapshot | undefined;
+  let peerNetworkSettled = true;
+  const peerBellAttempts = new Set<string>();
+  let peerConsentConfirmationFrame: PeerConsentConfirmationFrame | undefined;
   let terminalStartAttempted = false;
   let terminalStarted = false;
   let observerListenerAttached = false;
@@ -855,6 +871,120 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     return activeId === undefined ? undefined : views.find((view) => view.id === activeId);
   }
 
+  function updatePeerUi(snapshot: PeerUiSnapshot): void {
+    if (shutdownRequested) return;
+    try {
+      sidebar?.setPeerUiSnapshot(snapshot);
+    } catch {
+      sidebar?.showError("Network display is unavailable; local sessions are unchanged");
+      scheduleRedraw();
+      return;
+    }
+    peerUiSnapshot = snapshot;
+    for (const id of peerBellAttempts) {
+      if (!snapshot.consents.some((consent) => consent.id === id)) peerBellAttempts.delete(id);
+    }
+    const shown = peerConsentConfirmationFrame;
+    if (shown && !isCurrentPeerConsentFrame(shown)) invalidatePeerConsentDisplay();
+    // A hidden/narrow sidebar may need a visible non-focusing alert band. Only
+    // the compositor/one viewer owner changes geometry; this never selects a row.
+    if (!externalEditorActive) reconcileLayout(true);
+    scheduleRedraw();
+  }
+
+  function attemptIncomingPeerBell(id: string): void {
+    if (shutdownRequested || peerBellAttempts.has(id)) return;
+    let current: PeerUiSnapshot | undefined;
+    try { current = peerCoordinator?.read() ?? peerUiSnapshot; } catch { return; }
+    if (!current?.consents.some((consent) => consent.id === id && consent.kind === "incoming")) return;
+    peerBellAttempts.add(id);
+    if (!current.settings?.bellEnabled || !terminalStarted || !terminal) return;
+    try { terminal.write("\x07"); } catch { /* Best-effort attempt only; no retries, fallback, or shutdown. */ }
+  }
+
+  function startPeerNetworking(): void {
+    const agentDir = sessionSetup?.nativeAgentDir;
+    if (shutdownRequested || !hostState || sessionSetup?.nativeSetup !== true
+      || typeof agentDir !== "string" || agentDir === "") return;
+    try {
+      const coordinator = dependencies.createPeerCoordinator({
+        agentDir,
+        inventory: hostService,
+        onChange: updatePeerUi,
+        onIncomingConsentArrival: attemptIncomingPeerBell,
+      });
+      peerCoordinator = coordinator;
+      peerNetworkSettled = false;
+      updatePeerUi(coordinator.read());
+      void Promise.resolve().then(async () => {
+        if (!shutdownRequested) await coordinator.start();
+      }).catch(() => {
+        if (!shutdownRequested) {
+          sidebar?.showError("Network setup could not be completed; local sessions are unchanged");
+          scheduleRedraw();
+        }
+      });
+    } catch {
+      sidebar?.showError("Network controls are unavailable; local sessions are unchanged");
+      scheduleRedraw();
+    }
+  }
+
+  function performPeerCommand(command: PeerUiCommand): void {
+    const coordinator = peerCoordinator;
+    if (!coordinator) {
+      sidebar?.showError("Network controls are unavailable in this host");
+      scheduleRedraw();
+      return;
+    }
+    void Promise.resolve().then(async () => {
+      if (!shutdownRequested) await coordinator.perform(command);
+    }).catch(() => {
+      if (!shutdownRequested) sidebar?.showError("The network action could not be completed; check the host status");
+    }).finally(() => {
+      if (!shutdownRequested) { reconcileLayout(true); scheduleRedraw(); }
+    });
+  }
+
+  function currentHostLayout(cols: number, rows: number): HostLayout {
+    const options = {
+      sidebarVisible: sidebar?.visible ?? false,
+      focus: sidebar ? sidebarFocus(sidebar.focus) : "main" as HostFocus,
+      savedDeleteConfirmation: sidebar?.savedDeleteConfirmationActive ?? false,
+      hostConfirmation: sidebar?.peerConsentConfirmationActive ?? false,
+    };
+    const basic = computeHostLayout(cols, rows, options);
+    // The normal narrow sidebar is hidden during Main focus. A bounded band
+    // keeps pending consent prominent without stealing focus or covering a
+    // child rectangle that geometry still claims is visible.
+    return peerUiSnapshot?.consents.length && basic.sidebar === undefined
+      ? computeHostLayout(cols, rows, { ...options, bannerRows: 6 })
+      : basic;
+  }
+
+  function invalidatePeerConsentDisplay(): void {
+    peerConsentConfirmationFrame = undefined;
+    sidebar?.invalidatePeerConsentDisplay();
+  }
+
+  function isCurrentPeerConsentFrame(frame: PeerConsentConfirmationFrame): boolean {
+    return !shutdownRequested && terminal !== undefined && terminalStarted && sidebar !== undefined
+      && sidebar.visible && sidebar.peerConsentConfirmationActive
+      && clampDimension(terminal.columns, 80) === frame.cols
+      && clampDimension(terminal.rows, 24) === frame.rows
+      && sidebar.isPeerConsentRenderCurrent(frame.renderToken)
+      && sidebar.capturePeerConsentPresentation()?.consentId === frame.consentId;
+  }
+
+  function hasWrittenPeerConsentFrame(consentId: string, renderToken: number, decision: "approve" | "deny"): boolean {
+    const frame = peerConsentConfirmationFrame;
+    if (!frame || !frame.settled || frame.consentId !== consentId
+      || frame.renderToken !== renderToken || frame.decision !== decision) return false;
+    if (isCurrentPeerConsentFrame(frame)) return true;
+    invalidatePeerConsentDisplay();
+    return false;
+  }
+
   function writeOwnedMouseSequence(sequence: string): boolean {
     if (!terminal || !terminalStarted) return false;
     try {
@@ -933,11 +1063,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       try {
         const cols = clampDimension(terminal.columns, 80);
         const rows = clampDimension(terminal.rows, 24);
-        const currentLayout = computeHostLayout(cols, rows, {
-          sidebarVisible: sidebar.visible,
-          focus: sidebarFocus(sidebar.focus),
-          savedDeleteConfirmation: sidebar.savedDeleteConfirmationActive,
-        });
+        const currentLayout = currentHostLayout(cols, rows);
         savedDeleteConfirmationFrame = undefined;
         sidebar.invalidateSavedDeleteConfirmationDisplay();
         layout = currentLayout;
@@ -959,6 +1085,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         let formFrame: RenderedSidebar | undefined;
         if (currentLayout.sidebar) {
           if (focus === "form" && currentLayout.form !== undefined) {
+            sidebarFrame = sidebar.renderRoster(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
+            formFrame = sidebar.renderForm(currentLayout.form.cols, currentLayout.form.rows);
+          } else if (focus === "confirm" && sidebar.peerConsentConfirmationActive
+            && currentLayout.form !== undefined) {
             sidebarFrame = sidebar.renderRoster(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
             formFrame = sidebar.renderForm(currentLayout.form.cols, currentLayout.form.rows);
           } else if (focus === "confirm" && sidebar.savedDeleteConfirmationActive
@@ -1001,6 +1131,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           main: mainFrame,
           sidebar: sidebarFrame,
           form: formFrame,
+          ...(currentLayout.banner === undefined ? {} : {
+            banner: sidebar.renderPeerAlert(currentLayout.banner.cols, currentLayout.banner.rows),
+          }),
           ...(nativeGraphics ? { nativeGraphics } : {}),
           header,
           ...(headerNotice === undefined ? {} : { headerNotice }),
@@ -1029,8 +1162,28 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           ? undefined
           : { renderToken: savedDeleteRenderToken, cols, rows, settled: false };
         savedDeleteConfirmationFrame = confirmationFrame;
+        const peerPresentation = sidebar.capturePeerConsentPresentation();
+        let peerFrame: PeerConsentConfirmationFrame | undefined;
+        if (peerPresentation !== undefined) {
+          const previous = peerConsentConfirmationFrame;
+          if (previous?.consentId === peerPresentation.consentId && previous.decision === peerPresentation.decision
+            && previous.renderToken === peerPresentation.renderToken && previous.cols === cols && previous.rows === rows) {
+            peerFrame = previous;
+          } else {
+            peerFrame = { ...peerPresentation, cols, rows, settled: false };
+            // Identical rendered text is not proof that a different request or
+            // confirmation choice was written. Force that new semantic boundary.
+            writer.invalidate?.();
+          }
+        }
+        peerConsentConfirmationFrame = peerFrame;
         writer.submit(composed, cols, rows, (disposition: SessionHostFrameDisposition) => {
           if (disposition === "written") displayedMousePresentation = mousePresentation;
+          if (peerFrame !== undefined && peerConsentConfirmationFrame === peerFrame
+            && isCurrentPeerConsentFrame(peerFrame)
+            && (disposition === "written" || (disposition === "unchanged" && peerFrame.settled))) {
+            if (activeSidebar.settlePeerConsentRender(peerFrame.renderToken)) peerFrame.settled = true;
+          }
           if (confirmationFrame === undefined || savedDeleteConfirmationFrame !== confirmationFrame) return;
           if (!isCurrentSavedDeleteConfirmationFrame(confirmationFrame)) {
             invalidateSavedDeleteConfirmationDisplay();
@@ -1595,11 +1748,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     try {
       const cols = clampDimension(terminal.columns, 80);
       const rows = clampDimension(terminal.rows, 24);
-      const next = computeHostLayout(cols, rows, {
-        sidebarVisible: sidebar.visible,
-        focus: sidebarFocus(sidebar.focus),
-        savedDeleteConfirmation: sidebar.savedDeleteConfirmationActive,
-      });
+      const next = currentHostLayout(cols, rows);
       layout = next;
       const changed = next.native.cols !== lastNativeCols || next.native.rows !== lastNativeRows;
       if (manager && !resizeInProgress && (resizeChildren || localViewerNeedsSync(next.native))) {
@@ -1833,6 +1982,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   function handleTerminalResize(): void {
+    invalidatePeerConsentDisplay();
     invalidateSavedDeleteConfirmationDisplay();
     // A real outer resize can reflow the physical screen and then return to
     // the same final geometry before the next coalesced redraw (for example
@@ -2495,6 +2645,35 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // Any deliberate user action invalidates a pending automatic activation.
     deliberateActionGeneration += 1;
     switch (action.type) {
+      case "peer-open":
+        sidebar?.openPeerMenu();
+        reconcileLayout(true);
+        scheduleRedraw();
+        return;
+      case "peer-consent": {
+        if (!hasWrittenPeerConsentFrame(action.consentId, action.renderToken, action.decision)) {
+          sidebar?.showError("Pairing confirmation changed or is not yet displayed; review it again");
+          scheduleRedraw();
+          return;
+        }
+        let confirmed = false;
+        try { confirmed = peerCoordinator?.decideConsent(action.consentId, action.decision) === true; } catch { /* fixed UI status below */ }
+        if (!confirmed) {
+          sidebar?.showError("The pairing decision was not confirmed; check the host status");
+          scheduleRedraw();
+        }
+        return;
+      }
+      case "peer-listener":
+      case "peer-auto-reconnect":
+      case "peer-bell":
+      case "peer-add":
+      case "peer-connect":
+      case "peer-disconnect":
+      case "peer-remove":
+      case "peer-revoke":
+        performPeerCommand(action);
+        return;
       case "forward":
         routeForward(action.data);
         return;
@@ -2505,6 +2684,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         const unavailableSlot = slotIdFromRosterErrorItemId(action.id);
         if (unavailableSlot !== undefined) {
           sidebar?.showError(ROSTER_UNAVAILABLE_MESSAGE);
+          scheduleRedraw();
+          return;
+        }
+        // Metadata-only remote rows and stale/malformed UI targets never become
+        // a local input owner. The sidebar's local/remote kinds stay separate;
+        // this independently refuses a target absent from the local inventory.
+        if (!views.some((view) => view.id === action.id) || removedExitedIds.has(action.id)) {
+          sidebar?.showError("That local session is no longer available");
           scheduleRedraw();
           return;
         }
@@ -2821,6 +3008,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     savedCatalogPickerId = undefined;
     savedCatalogRequestId = undefined;
     invalidateSavedDeleteConfirmationDisplay();
+    invalidatePeerConsentDisplay();
     sidebar?.disposeSavedPicker();
     invalidateMouseAuthorization();
     deferredCreates.clear();
@@ -2844,6 +3032,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       } catch { /* abort is best-effort */ }
     }
     savedListControllers.clear();
+    let peerShutdownTask: Promise<boolean> | undefined;
+    if (peerCoordinator) {
+      try {
+        // Close latches network admission synchronously, independently of the
+        // one local manager's child settlement. Neither path stops remote work.
+        peerShutdownTask = Promise.resolve(peerCoordinator.close()).then(() => true, () => false);
+      } catch {
+        cleanupFailure = true;
+        peerNetworkSettled = false;
+      }
+    }
     let shutdownTask: Promise<{ result?: ShutdownResult; failed: boolean }> | undefined;
     if (manager) {
       try {
@@ -2939,6 +3138,18 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           cleanupFailure = true;
         }
       }
+      if (peerShutdownTask) {
+        peerNetworkSettled = await peerShutdownTask;
+        if (!peerNetworkSettled) cleanupFailure = true;
+      }
+      // The one coordinator owns accepted network operations and its bounded
+      // close is their settlement barrier. UI/start wrappers already handle
+      // rejection and ignore shutdown callbacks; they own no other resources.
+      // Never turn an unconfirmed barrier into an unbounded second wait for
+      // abandoned work. Retain ownership and report the failed barrier below.
+      if (!peerNetworkSettled) {
+        safeReport(dependencies, "Network cleanup did not settle; agent-directory ownership is retained.");
+      }
       // Owned-child settlement evidence comes from the one authoritative
       // manager through the owning-host service: a query that actually answered
       // is positive evidence, and unknown child state keeps exclusive ownership
@@ -2980,7 +3191,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // query unavailable) keeps ownership held (fail closed) so a later host
       // refuses instead of racing children that may still be running.
       if (hostState !== undefined) {
-        if (remainingCount === 0 && ownedStateSettled) {
+        if (remainingCount === 0 && ownedStateSettled && peerNetworkSettled) {
           let released = false;
           try {
             released = hostState.release();
@@ -3205,11 +3416,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         scheduleRedraw();
       },
     });
-    layout = computeHostLayout(initialCols, initialRows, {
-      sidebarVisible: sidebar.visible,
-      focus: sidebarFocus(sidebar.focus),
-      savedDeleteConfirmation: sidebar.savedDeleteConfirmationActive,
-    });
+    layout = currentHostLayout(initialCols, initialRows);
     lastNativeCols = layout.native.cols;
     lastNativeRows = layout.native.rows;
 
@@ -3258,6 +3465,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     syncRosterAndSchedule();
     reconcileLayout(false);
     startupComplete = true;
+    if (!shutdownRequested) startPeerNetworking();
     if (shutdownRequested) beginShutdown();
     else {
       await observer.wait();

@@ -34,7 +34,7 @@ import {
   makeRuntimeEnvironment,
   makeWorkspace,
   processIsAlive,
-  removeOwnedScratchTreePruningTerraform,
+  removeOwnedScratchTree,
   resolveRuntimePin,
 } from "./helpers/session-host-native-main-harness";
 import { frameHeaderMatches, isSidebarFocusedFrame, parseRosterFrame } from "./helpers/session-host-native-roster-witness";
@@ -484,7 +484,7 @@ for (const mode of ["regular", "fullscreen"] as const) {
         && !cleanup.forced;
       if (assertionsCompleted && cleanupConfirmed) {
         try {
-          if (!removeOwnedScratchTreePruningTerraform(scratch)) {
+          if (!removeOwnedScratchTree(scratch)) {
             process.stderr.write(`preserved Main image witness (per-entry ownership receipts unavailable): ${scratch}\n`);
           }
         } catch {

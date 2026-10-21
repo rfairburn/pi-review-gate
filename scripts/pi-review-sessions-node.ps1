@@ -606,8 +606,8 @@ function Remove-NodeEntry([string]$Path) {
   # whole directories — so a directory-only generation cannot spend every pass
   # merely collecting candidates. There is no whole-tree preflight and no depth or
   # entry quota. Reparse points (symlinks/junctions) are unlinked themselves, never
-  # entered, so data outside the generation is untouched. Cleanup-specific: even an
-  # initialized `.terraform` subtree inside this disposable generation is removed.
+  # entered, so data outside the generation is untouched. Cleanup-specific:
+  # nested subtrees inside this disposable generation are removed too.
   $stack = New-Object 'System.Collections.Generic.Stack[object]'
   $stack.Push(@{ Path = $Path; Entries = $null; Index = 0 })
   try {

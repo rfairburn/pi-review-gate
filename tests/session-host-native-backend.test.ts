@@ -437,8 +437,6 @@ function copyBoundedCandidateTree(sourceRoot: string, destinationRoot: string): 
     }
     mkdirSync(destination, { recursive: true, mode: 0o700 });
     for (const name of readdirSync(source)) {
-      // Exclude initialized Terraform trees before any descent.
-      if (name === ".terraform") continue;
       const sourceEntry = join(source, name);
       const destinationEntry = join(destination, name);
       const stats = lstatSync(sourceEntry);
@@ -505,14 +503,9 @@ function stageCandidate(root: string, prerequisites: StaticPrerequisites): Stage
   return { packageRoot, entry, nodePath: prerequisites.moduleSearchPath };
 }
 
-function removeOwnedTreePruningTerraform(root: string): boolean {
+function removeOwnedTree(root: string): boolean {
   let complete = true;
-  const removeEntry = (path: string, entryName: string): void => {
-    // Never descend into initialized Terraform data, even under a test-owned root.
-    if (entryName === ".terraform") {
-      complete = false;
-      return;
-    }
+  const removeEntry = (path: string): void => {
     let stats;
     try {
       stats = lstatSync(path);
@@ -521,7 +514,7 @@ function removeOwnedTreePruningTerraform(root: string): boolean {
       throw new Error("could not inspect a test-owned synthetic entry during bounded cleanup");
     }
     if (stats.isDirectory() && !stats.isSymbolicLink()) {
-      for (const name of readdirSync(path)) removeEntry(join(path, name), name);
+      for (const name of readdirSync(path)) removeEntry(join(path, name));
       try {
         rmdirSync(path);
       } catch {
@@ -535,7 +528,7 @@ function removeOwnedTreePruningTerraform(root: string): boolean {
       }
     }
   };
-  removeEntry(root, "");
+  removeEntry(root);
   return complete;
 }
 
@@ -705,7 +698,7 @@ function finalizeEvidenceRoot(options: {
     }
     return { retainedRoot: options.retainedRoot };
   }
-  if (!(options.remove ?? removeOwnedTreePruningTerraform)(options.root)) {
+  if (!(options.remove ?? removeOwnedTree)(options.root)) {
     return { cleanupError: new Error("native proof cleanup preserved an unexpected entry"), retainedRoot: options.retainedRoot };
   }
   return { retainedRoot: options.retainedRoot };
@@ -1197,8 +1190,8 @@ async function disposeBackendResources(options: {
     try { profile.release(); } catch { cleanupError ??= new Error("a synthetic profile admission could not be released"); }
   }
   if (allProcessesExited && brokerClosed) {
-    const removed = removeOwnedTreePruningTerraform(options.root);
-    if (!removed) cleanupError ??= new Error("the synthetic root contains an entry intentionally preserved by bounded cleanup");
+    const removed = removeOwnedTree(options.root);
+    if (!removed) cleanupError ??= new Error("the synthetic root could not be fully removed by bounded cleanup");
   } else {
     cleanupError ??= new Error("the synthetic root was preserved because an owned process or broker resource remains live");
   }
@@ -2030,7 +2023,7 @@ test("bounded handoff failure diagnostics retain the owned evidence root without
   };
   t.after(() => {
     for (const root of createdRoots) {
-      try { removeOwnedTreePruningTerraform(root); } catch { /* only test-owned temporary roots are addressed */ }
+      try { removeOwnedTree(root); } catch { /* only test-owned temporary roots are addressed */ }
     }
   });
 
@@ -2175,7 +2168,7 @@ test("durable prompt-journal readiness observes un-notified exact records while 
   createdRoots.push(root);
   t.after(() => {
     for (const created of createdRoots) {
-      try { removeOwnedTreePruningTerraform(created); } catch { /* only test-owned temporary roots are addressed */ }
+      try { removeOwnedTree(created); } catch { /* only test-owned temporary roots are addressed */ }
     }
   });
   try {

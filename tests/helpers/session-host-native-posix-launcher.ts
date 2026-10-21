@@ -357,9 +357,9 @@ function discoverPython(): string {
 
 /**
  * Fresh, positive-owned source fixture built by the existing hardened
- * `copy-source` copier (exact six production build inputs; `.terraform` pruned
- * before descent; symlinks refused; no dist/node_modules/.git/tests). Retained
- * on success and failure alike: no recursive cleanup is attempted.
+ * `copy-source` copier (exact six production build inputs; symlinks and special
+ * entries refused; no dist/node_modules/.git/tests). Retained on success and
+ * failure alike: no recursive cleanup is attempted.
  */
 function createFreshSourceFixture(root: string, layout: PosixLauncherLegLayout): string {
   const destination = createOwnedDirectory(root, "source-fixture");

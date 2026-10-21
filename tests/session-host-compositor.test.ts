@@ -76,6 +76,49 @@ test("wide layout reserves the header and composes the exact sidebar/divider/nat
 	assert.deepEqual(minimumWide.native, { column: 33, row: 1, cols: 20, rows: 1 });
 });
 
+test("host alert band stays visible with hidden or narrow Main focus without taking its cursor", () => {
+	for (const cols of [40, 80]) {
+		const layout = computeHostLayout(cols, 12, { sidebarVisible: cols === 40, focus: "main", bannerRows: 5 });
+		assert.equal(layout.sidebar, undefined);
+		assert.deepEqual(layout.banner, { column: 0, row: 1, cols, rows: 5 });
+		assert.equal(layout.native.row, 6);
+		assert.equal(layout.native.rows, 6);
+		const result = composeHostFrame(layout, {
+			main: mainFrame(cols, 6, ["native owner remains selected"], { column: 2, row: 0, visible: true }),
+			banner: { lines: ["PAIRING REQUEST", "Expected device", "Fingerprint: public", "\x1b]52;c;not-clipboard\x07", "Focus sidebar to review"] },
+			header: "Owner", focus: "main",
+		});
+		assertBounded(result.lines, cols, 12);
+		noUnsafeControls(result.lines);
+		assert.ok(plain(result.lines[1]).startsWith("PAIRING REQUEST"));
+		assert.ok(plain(result.lines[6]).startsWith("native owner remains selected"));
+		assert.deepEqual(result.cursor, { column: 2, row: 6, visible: true });
+	}
+});
+
+test("an explicitly placed host confirmation uses the wide form pane without changing focus", () => {
+	const ordinary = computeHostLayout(80, 24, { sidebarVisible: true, focus: "confirm" });
+	assert.equal(ordinary.form, undefined, "existing ordinary confirmations retain their placement");
+	const peer = computeHostLayout(80, 24, { sidebarVisible: true, focus: "confirm", hostConfirmation: true });
+	assert.deepEqual(peer.form, peer.native);
+	assert.deepEqual(peer.native, ordinary.native, "placement never fabricates a child resize");
+});
+
+test("host alert reservation remains bounded and always leaves a native content row", () => {
+	for (const cols of [1, 5, 40]) for (const rows of [1, 2, 3, 4]) {
+		const layout = computeHostLayout(cols, rows, { sidebarVisible: false, focus: "main", bannerRows: 6 });
+		assert.ok(layout.native.rows >= 1);
+		assert.ok(layout.native.row + layout.native.rows <= rows);
+		if (layout.banner) assert.equal(layout.banner.row + layout.banner.rows, layout.native.row);
+		const result = composeHostFrame(layout, { banner: { lines: ["Pairing pending"] }, header: "Owner", focus: "main" });
+		assertBounded(result.lines, cols, rows);
+		noUnsafeControls(result.lines);
+	}
+	for (const bannerRows of [-1, Number.NaN, 1.5]) {
+		assert.throws(() => computeHostLayout(80, 24, { sidebarVisible: false, focus: "main", bannerRows }));
+	}
+});
+
 test("hidden sidebar gives the native pane the full width regardless of frontend focus", () => {
 	const layout = computeHostLayout(41, 3, { sidebarVisible: false, focus: "sidebar" });
 	assert.deepEqual(layout, {

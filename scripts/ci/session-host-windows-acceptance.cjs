@@ -21,7 +21,6 @@
  * copy-scripts copies the shipped scripts tree (every stage) into a fresh
  * candidate root so the staged candidate keeps its own package-root helper
  * layout:
- * - prunes directories named .terraform before descending into them, at every depth;
  * - refuses symlinks and non-regular files: any such entry in the source tree fails the copy;
  * - bounds file count, per-file size, directory count, nesting depth, per-directory
  *   entry count (checked while enumerating, so a runaway directory cannot exhaust
@@ -51,7 +50,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const PRUNED_DIR_NAME = '.terraform';
 // Exact production build inputs copied by copy-source. tests/, dist/,
 // node_modules/, .git/, private work notes, and every other root entry are
 // deliberately absent.
@@ -319,8 +317,6 @@ function copyStage(sourceDir, destDir, sourceReceipt, destReceipt, depth, counte
       fail(`refusing symlink in ${label} tree: ${sourcePath}`);
     }
     if (stats.isDirectory()) {
-      // Prune before descending: .terraform contents are never copied.
-      if (entry.name === PRUNED_DIR_NAME) continue;
       if (depth + 1 > MAX_DEPTH) {
         fail(`${label} tree exceeds the bounded depth of ${MAX_DEPTH}: ${sourcePath}`);
       }
@@ -411,8 +407,8 @@ function admitDestination(dest) {
  * Copy the exact production build inputs of one source checkout into a fresh
  * complete source fixture. Each named file is copied through the bounded
  * exclusive descriptor path; each named tree is copied stage-by-stage (with
- * .terraform pruned before descent and symlinks/special files refused). The
- * source root and the destination root are re-verified around every action.
+ * symlinks and special files refused). The source root and the destination
+ * root are re-verified around every action.
  */
 function copySource(sourceArg, destArg) {
   const source = path.resolve(sourceArg);

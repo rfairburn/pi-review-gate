@@ -32,7 +32,7 @@ import {
   makeNativeAgentRoot,
   makeWorkspace,
   processIsAlive,
-  removeOwnedScratchTreePruningTerraform,
+  removeOwnedScratchTree,
   resolveRuntimePin,
 } from "./helpers/session-host-native-main-harness";
 import {
@@ -462,7 +462,7 @@ function registerCleanup(t: { after(fn: () => Promise<void>): void }, state: Tes
       && !cleanup.forced;
     if (state.assertionsCompleted === true && cleanupConfirmed) {
       try {
-        if (!removeOwnedScratchTreePruningTerraform(state.scratch)) {
+        if (!removeOwnedScratchTree(state.scratch)) {
           process.stderr.write(`preserved native notice witness (per-entry ownership receipts unavailable): ${state.scratch}\n`);
         }
       } catch {

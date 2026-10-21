@@ -291,8 +291,8 @@ test("touch-only and irrelevant changes never force preparation", async () => {
 
   // Irrelevant paths are outside the bounded application inputs: no inventory,
   // no invalidation. node_modules/dist/.git/docs/tests/private notes and
-  // initialized Terraform trees are never scanned.
-  for (const relative of ["node_modules", "dist", ".git", "docs", "tests", "notes", "infra/.terraform"]) {
+  // unrelated nested paths are never scanned.
+  for (const relative of ["node_modules", "dist", ".git", "docs", "tests", "notes", "infra/cache"]) {
     mkdirSync(join(fixture.root, relative), { recursive: true });
     writeFileSync(join(fixture.root, relative, "irrelevant.txt"), "irrelevant\n", "utf8");
   }
@@ -300,7 +300,7 @@ test("touch-only and irrelevant changes never force preparation", async () => {
   assert.equal(fixture.prepareCalls, 1);
   const identity = prepare.computeInputIdentity(fixture.root);
   assert.equal(identity.files.some((file) => file.path.includes("irrelevant")), false);
-  assert.equal(identity.directories.some((directory) => directory.path.includes("terraform")), false);
+  assert.equal(identity.directories.some((directory) => directory.path.includes("infra")), false);
 });
 
 test("a source tree containing a symlink is refused instead of being fingerprinted", () => {
@@ -1059,7 +1059,7 @@ test("recorded application-input paths are strictly validated before any filesys
     ...marker,
     preparedRootIdentity: identity(first.preparedRoot as string),
   };
-  for (const badPath of ["../escape.ts", "/etc/passwd", "src\\index.ts", "src/../index.ts", "src/.terraform/x", "src//index.ts", "src/\u0000x"]) {
+  for (const badPath of ["../escape.ts", "/etc/passwd", "src\\index.ts", "src/../index.ts", "src//index.ts", "src/\u0000x"]) {
     writeFileSync(markerPath(fixture.agentDir), JSON.stringify({
       ...base,
       sourceIndex: { ...marker.sourceIndex, files: [...marker.sourceIndex.files, { path: badPath, size: "1", mtimeNs: "1", ctimeNs: "1", ino: "1", dev: "1", mode: "420" }] },

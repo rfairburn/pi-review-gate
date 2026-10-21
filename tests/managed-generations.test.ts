@@ -193,14 +193,15 @@ test("legacy generations without receipts are pruned to five per type, not used 
   assert.equal(generations.LIMIT, 5);
 });
 
-test("cleanup is confined: outside sentinels survive while links and .terraform content are removed without following them", posix, () => {
+test("cleanup is confined: outside sentinels survive while links and ordinary nested content are removed without following them", posix, () => {
   const f = fixture();
   const outside = join(f.root, "outside"); mkdirSync(outside); writeFileSync(join(outside, "sentinel"), "outside data");
   const linked = seedLegacy(f.builds, ["a-link"]);
   symlinkSync(outside, join(linked[0]!, "outside-link"));
-  const terraform = seedLegacy(f.builds, ["b-terraform"]);
-  mkdirSync(join(terraform[0]!, ".terraform"));
-  writeFileSync(join(terraform[0]!, ".terraform", "sentinel"), "never entered");
+  const populated = seedLegacy(f.builds, ["b-populated"]);
+  mkdirSync(join(populated[0]!, "nested", "deep"), { recursive: true });
+  writeFileSync(join(populated[0]!, "nested", "deep", "sentinel"), "ordinary disposable content");
+  writeFileSync(join(populated[0]!, "direct-child.txt"), "ordinary disposable content");
   const hardlinked = seedLegacy(f.builds, ["0-hardlink"]);
   const hardlinkTarget = join(f.root, "hardlink-target");
   writeFileSync(hardlinkTarget, "hardlinked outside bytes");
@@ -215,9 +216,9 @@ test("cleanup is confined: outside sentinels survive while links and .terraform 
   assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "outside data");
   assert.equal(existsSync(linked[0]!), false, "a generation holding an outside link is removed without following it");
   assert.equal(existsSync(rootLink), false, "a direct-child link is unlinked, never entered");
-  assert.equal(existsSync(terraform[0]!), false,
-    "cleanup-specific traversal removes an initialized .terraform subtree inside a selected disposable generation");
-  assert.equal(existsSync(join(terraform[0]!, ".terraform", "sentinel")), false);
+  assert.equal(existsSync(populated[0]!), false,
+    "cleanup traversal removes ordinary nested content inside a selected disposable generation");
+  assert.equal(existsSync(join(populated[0]!, "nested", "deep", "sentinel")), false);
   assert.equal(existsSync(hardlinked[0]!), false, "a hardlinked descendant name is unlinked with its generation");
   assert.equal(readFileSync(hardlinkTarget, "utf8"), "hardlinked outside bytes", "outside bytes survive the hardlink removal");
   assert.equal(lstatSync(hardlinkTarget).nlink, 1, "only the cache name is removed");
@@ -412,8 +413,8 @@ test("a prepared generation stays current across repeated launches without new b
 test("a large and deep generation is deleted progressively instead of hitting a zero-deletion preflight", posix, () => {
   const f = fixture();
   // One over-full generation with >10k real entries, a chain far deeper than any
-  // former recursion quota, an initialized .terraform subtree, and outside
-  // hardlink/symlink sentinels.
+  // former recursion quota, ordinary nested content, and outside hardlink/symlink
+  // sentinels.
   const big = join(f.builds, "a-large");
   let deepest = big;
   for (let depth = 0; depth < 90; depth += 1) {
@@ -425,8 +426,8 @@ test("a large and deep generation is deleted progressively instead of hitting a 
   for (let index = 0; index < 12_000; index += 1) {
     writeFileSync(join(big, `files-${index % 40}`, `f-${index}.txt`), "disposable");
   }
-  mkdirSync(join(big, ".terraform"), { recursive: true, mode: 0o700 });
-  writeFileSync(join(big, ".terraform", "sentinel"), "cleanup-specific");
+  mkdirSync(join(big, "nested-cache", "deep"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(big, "nested-cache", "deep", "sentinel"), "ordinary nested content");
   const outside = join(f.root, "outside");
   writeFileSync(outside, "outside bytes");
   linkSync(outside, join(big, "outside-hardlink"));
@@ -1899,23 +1900,6 @@ test("a stale or special-leaf entry inside a designated disposable generation ca
     "a special leaf is unlinked with its disposable generation instead of pinning it forever");
   assert.equal(readFileSync(outside, "utf8"), "outside bytes");
   assert.ok(count(f.builds) <= generations.LIMIT);
-});
-
-test("a direct-child .terraform entry in the Node cache is not exempt from reclamation", posix, () => {
-  const f = fixture();
-  const nodeCache = join(f.agentDir, ".pi-review-gate", "node");
-  mkdirSync(join(nodeCache, ".terraform"), { recursive: true, mode: 0o700 });
-  writeFileSync(join(nodeCache, ".terraform", "sentinel"), "cleanup-specific disposable content");
-  const outside = join(f.root, "outside-terraform");
-  writeFileSync(outside, "outside stays");
-  for (let index = 0; index < 5; index += 1) {
-    mkdirSync(join(nodeCache, `bootstrap.legacy-${index}`), { recursive: true, mode: 0o700 });
-  }
-  // The wrapper script owns this exclusion, so the source contract is pinned
-  // here and the native behaviour is exercised by session-host-entrypoints.
-  const source = readFileSync(join(process.cwd(), "scripts", "node-generations.sh"), "utf8");
-  assert.doesNotMatch(source, /\.terraform" \] \] \|\| continue/, "a direct child named .terraform is ordinary disposable cache content");
-  assert.equal(readFileSync(outside, "utf8"), "outside stays");
 });
 
 /**

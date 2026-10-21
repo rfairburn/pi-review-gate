@@ -196,8 +196,7 @@ a second lifetime gate. Cleanup rechecks that record after any wait or stale-loc
 and at every destructive boundary, and it skips reclamation entirely when the per-agent
 coordination entry is unavailable instead of racing an ownership acquisition it cannot
 exclude. Reclamation is confined to one designated generation with
-no-follow link handling (links are unlinked, never traversed); a `.terraform` subtree
-inside a selected disposable generation is removed with it; partially removed entries
+no-follow link handling (links are unlinked, never traversed); partially removed entries
 stay counted for a later retry. One pass shares a single runtime budget and one progress
 allowance and deletes as it walks, so a large or deep generation makes real progress and is
 finished by later passes rather than being refused forever by a whole-tree bound, while a

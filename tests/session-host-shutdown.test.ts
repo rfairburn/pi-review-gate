@@ -258,18 +258,17 @@ function removeSuccessfulHarness(harness: Harness): void {
 	}
 }
 
-/** Remove only this test-created tree, pruning `.terraform` before descent and never following symlinks. */
+/** Remove only this test-created tree and never follow symlinks. */
 function removeOwnedFixtureTree(path: string): void {
 	const current = lstatSync(path);
 	if (current.isDirectory() && !current.isSymbolicLink()) {
 		for (const name of readdirSync(path)) {
-			if (name === ".terraform") continue;
 			removeOwnedFixtureTree(join(path, name));
 		}
 		try {
 			rmdirSync(path);
 		} catch {
-			// Retain a directory if an excluded or otherwise unknown entry remains.
+			// Retain a directory if an otherwise unknown entry remains.
 		}
 		return;
 	}

@@ -327,19 +327,18 @@ test("sessionHostSourceModules derives only flat .ts files", (t) => {
   assert.deepEqual(smoke.sessionHostSourceModules(f.sourceModulesDir), ["alpha.ts", "beta.ts"]);
 });
 
-// Owned-scratch retention semantics (MOCK/SYNTHETIC markers only — no actual
-// initialized Terraform content is created or accessed).
-test("removeOwnedScratch retains unknown, symlink, FIFO, and .terraform descendants without traversal", () => {
+// Owned-scratch retention semantics (MOCK/SYNTHETIC markers only).
+test("removeOwnedScratch retains unknown, symlink, and FIFO descendants without traversal", () => {
   const root = mkdtempSync(join(os.tmpdir(), "session-host-scratch-retention-"));
   const unknownMarker = join(root, "package", "node_modules", "unknown.txt");
-  const tfMarker = join(root, "consumer", ".terraform", "marker.txt");
+  const nestedMarker = join(root, "consumer", "notes", "marker.txt");
   const symlinkTargetMarker = join(root, "symlink-target", "marker.txt");
   const symlinkPath = join(root, "links", "target-dir");
   const fifoPath = join(root, "consumer", "runtime-fifo");
   mkdirSync(join(root, "package", "node_modules"), { recursive: true });
   writeFileSync(unknownMarker, "synthetic unknown descendant\n");
-  mkdirSync(join(root, "consumer", ".terraform"), { recursive: true });
-  writeFileSync(tfMarker, "synthetic terraform marker\n");
+  mkdirSync(join(root, "consumer", "notes"), { recursive: true });
+  writeFileSync(nestedMarker, "synthetic nested marker\n");
   mkdirSync(join(root, "symlink-target"), { recursive: true });
   writeFileSync(symlinkTargetMarker, "synthetic symlink target\n");
   mkdirSync(join(root, "links"), { recursive: true });
@@ -390,7 +389,7 @@ test("removeOwnedScratch retains unknown, symlink, FIFO, and .terraform descenda
   assert.deepEqual(retained, [root]);
   assert.ok(existsSync(root), "the scratch root is retained");
   assert.equal(readFileSync(unknownMarker, "utf8"), "synthetic unknown descendant\n");
-  assert.equal(readFileSync(tfMarker, "utf8"), "synthetic terraform marker\n");
+  assert.equal(readFileSync(nestedMarker, "utf8"), "synthetic nested marker\n");
   assert.equal(lstatSync(symlinkPath).isSymbolicLink(), true, "the symlink itself is retained");
   assert.equal(readFileSync(symlinkTargetMarker, "utf8"), "synthetic symlink target\n");
   assert.equal(lstatSync(fifoPath).isFIFO(), true, "the FIFO is retained");

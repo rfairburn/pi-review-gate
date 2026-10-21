@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, opendirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
 import nodeTest, { type TestContext } from "node:test";
 
 interface ParsedArguments {
@@ -269,7 +269,6 @@ function removeFixtureTree(
   ancestors: Array<{ target: string; identity: OwnedFixture["identity"] }> = [],
   expectedEntry?: { dev: bigint; ino: bigint },
 ): boolean {
-  if (basename(target) === ".terraform") return false;
   if (depth > 128 || budget.entries >= 200_000) return false;
   budget.entries += 1;
   let stats;
@@ -330,10 +329,6 @@ function removeFixtureTree(
       if (budget.entries > 200_000) {
         complete = false;
         break;
-      }
-      if (name === ".terraform") {
-        complete = false;
-        continue;
       }
       if (!sameFixtureDirectoryChain(directoryChain)) {
         complete = false;
@@ -1162,11 +1157,15 @@ test("stageSourcePackage copies build and runtime inputs without touching the ch
   const skillsDir = join(fixture.packageRoot, "skills", "pi-review-gate-execution");
   mkdirSync(skillsDir, { recursive: true });
   writeFileSync(join(skillsDir, "SKILL.md"), "# skill\n", "utf8");
-  // Nested initialized-Terraform directories at several depths: pruned at
-  // traversal time, never copied into the stage.
-  for (const dir of [join(fixture.packageRoot, "src", ".terraform"), join(fixture.packageRoot, "scripts", "nested", ".terraform"), join(skillsDir, ".terraform")]) {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "sentinel"), "do not copy\n", "utf8");
+  // Ordinary nested content under each selected root at several depths.
+  const nestedSources = [
+    { directory: join(fixture.packageRoot, "src", "nested"), file: "deep.ts" },
+    { directory: join(fixture.packageRoot, "scripts", "nested"), file: "helper.cjs" },
+    { directory: join(skillsDir, "nested"), file: "NOTES.md" },
+  ];
+  for (const { directory, file } of nestedSources) {
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, file), "nested shipped content\n", "utf8");
   }
   const checkoutDependencies = join(fixture.root, "foreign checkout dependencies");
   mkdirSync(checkoutDependencies);
@@ -1179,24 +1178,19 @@ test("stageSourcePackage copies build and runtime inputs without touching the ch
   const stagingRoot = ownedStage.root;
   assert.ok(stagingRoot.startsWith(buildCacheRoot));
   assert.equal(Number(lstatSync(stagingRoot).mode & 0o077), 0, "owned staging root is private");
-  for (const name of ["package.json", "package-lock.json", "tsconfig.json", join("src", "session-host", "main.ts"), join("scripts", "helper.ps1"), join("skills", "pi-review-gate-execution", "SKILL.md")]) {
+  for (const name of ["package.json", "package-lock.json", "tsconfig.json", join("src", "session-host", "main.ts"),
+    join("src", "nested", "deep.ts"), join("scripts", "helper.ps1"), join("scripts", "nested", "helper.cjs"),
+    join("skills", "pi-review-gate-execution", "SKILL.md"), join("skills", "pi-review-gate-execution", "nested", "NOTES.md")]) {
     assert.ok(existsSync(join(stagingRoot, name)), `staged package must include ${name}`);
   }
   assert.deepEqual(readFileSync(join(stagingRoot, "package-lock.json")), lockBytes, "lockfile is byte-for-byte unchanged");
   assert.equal(existsSync(join(stagingRoot, "node_modules")), false, "checkout dependencies are not linked into staging");
   assert.equal(existsSync(join(stagingRoot, "dist")), false, "the source checkout dist is not copied");
-  for (const name of [join("src", ".terraform"), join("scripts", "nested", ".terraform"), join("skills", "pi-review-gate-execution", ".terraform")]) {
-    assert.ok(!existsSync(join(stagingRoot, name)), `staged package must omit ${name}`);
-  }
   // The checkout is untouched: its live dist sentinel and sources remain.
   assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
   assert.ok(existsSync(join(fixture.packageRoot, "src", "session-host", "main.ts")));
   assert.equal(lstatSync(join(fixture.packageRoot, "node_modules")).isSymbolicLink(), true, "the source dependency alias is left untouched");
   assert.equal(readFileSync(join(checkoutDependencies, "sentinel"), "utf8"), "must not be followed\n");
-  for (const dir of [join(fixture.packageRoot, "src", ".terraform"), join(fixture.packageRoot, "scripts", "nested", ".terraform"), join(skillsDir, ".terraform")]) {
-    unlinkSync(join(dir, "sentinel"));
-    rmdirSync(dir);
-  }
   assert.equal(existsSync(stagingRoot), true, "the staged source is retained for reuse after assertions");
 });
 

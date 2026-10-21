@@ -39,6 +39,16 @@ dates.
   everything else, including unknown files next to them, stays captured. The delegated
   capture limitation tracked in #318 remains.
 
+## [0.1.0-dev.189]
+
+### Changed
+
+- Removed infrastructure-specific directory handling from generic source/discovery,
+  copying and test harnesses (#481), with no replacement exclusion or configurable
+  special case. Generic input scopes, path/type/no-follow checks and ownership-confined
+  cleanup remain unchanged. Agent search-performance instructions are explicitly not
+  product requirements in the repository guide.
+
 ## [0.1.0-dev.188]
 
 ### Added
@@ -357,8 +367,8 @@ dates.
   actor can steal a live destructive holder's mutex mid-deletion. A live host's generations
   stay untouched. Cleanup-specific disposal is also less artificial: a special leaf entry
   (FIFO, socket, or device name) inside a selected disposable generation is unlinked without
-  being opened, and a direct-child `.terraform` entry under the producer-owned Node cache is
-  no longer exempt from reclamation.
+  being opened. Producer-owned Node-cache artifacts have no directory-name exemption
+  from reclamation.
 
 ## [0.1.0-dev.178]
 
@@ -381,8 +391,8 @@ dates.
   `pi-<version>.<n>` generations without a fixed limit (later launches reuse any
   valid generation for that exact version), and the same-version replacement path
   honors the live-owner marker, so a concurrently filling generation is never
-  deleted. Startup is not stopped by any of these cases. Initialized `.terraform`
-  content inside a selected disposable generation is removed with it. The
+  deleted. Startup is not stopped by any of these cases. Ordinary nested content
+  inside a selected disposable generation is removed with it. The
   previous durable lifetime receipts, holder pins, mount census, and Windows
   count-only admission gate are removed; active sessions remain guarded by the
   session host's existing exclusive agent-directory ownership record, and

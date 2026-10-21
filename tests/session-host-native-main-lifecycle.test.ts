@@ -59,7 +59,7 @@ import {
   makeNativeAgentRoot,
   makeWorkspace,
   processIsAlive,
-  removeOwnedScratchTreePruningTerraform,
+  removeOwnedScratchTree,
   resolveRuntimePin,
 } from "./helpers/session-host-native-main-harness";
 import {
@@ -231,7 +231,7 @@ function registerCaseCleanup(t: { after(fn: () => Promise<void>): void }, state:
     // receipts exist; root creation alone never authorizes recursive removal.
     if (state.assertionsCompleted === true && cleanupConfirmed) {
       try {
-        if (!removeOwnedScratchTreePruningTerraform(state.scratch)) {
+        if (!removeOwnedScratchTree(state.scratch)) {
           process.stderr.write(`preserved Main runtime witness (per-entry ownership receipts unavailable): ${state.scratch}\n`);
         }
       } catch {

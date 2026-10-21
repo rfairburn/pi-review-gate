@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
@@ -610,7 +610,12 @@ class ChangeSignal {
           finish(new Error(`${description}: the bounded event predicate failed`));
         }
       };
-      const timer = setTimeout(() => finish(new Error(`${description}: deadline exceeded`)), timeoutMs);
+      // One exact-predicate recheck at the unchanged deadline so a missed
+      // notification cannot turn an already-true condition into a failure.
+      const timer = setTimeout(() => {
+        check();
+        finish(new Error(`${description}: deadline exceeded`));
+      }, timeoutMs);
       this.listeners.add(check);
       check();
     });
@@ -1006,6 +1011,19 @@ function createSessionObserverFiles(root: string, owner: string): { log: string;
   writeFileSync(extension, observerExtensionSource(), { mode: 0o600 });
   return { log, extension };
 }
+
+test("ChangeSignal.waitFor rechecks its exact predicate once at the unchanged deadline", async () => {
+  let ready = false;
+  let calls = 0;
+  const missed = new ChangeSignal().waitFor(() => (calls++, ready), 20, "missed notification");
+  queueMicrotask(() => { ready = true; }); // condition becomes true without notify()
+  await missed;
+  assert.equal(calls, 2, "one initial check plus one deadline recheck; no polling");
+  await assert.rejects(new ChangeSignal().waitFor(() => false, 20, "still false"), /^Error: still false: deadline exceeded$/);
+  let thrown = 0;
+  const throwing = (): boolean => { if (thrown++ > 0) throw new Error("predicate"); return false; };
+  await assert.rejects(new ChangeSignal().waitFor(throwing, 20, "throwing"), /^Error: throwing: the bounded event predicate failed$/);
+});
 
 test("production early preload consumes native authorization before trusted require and its real Node descendant", { timeout: TEST_TIMEOUT_MS }, async (t) => {
   const prerequisites = staticPrerequisites(t, false);
@@ -1611,18 +1629,29 @@ test("real registered SessionSpawn delivers one exact long handoff and one short
   const pi = resolvePiExecutable(prerequisites, root, t);
   if (!pi) return;
   const candidate = stageCandidate(root, prerequisites);
-  const parentWorkspace = createWorkspace(root, "spawn-parent");
-  const longWorkspace = createWorkspace(root, "spawn-long");
-  const shortWorkspace = createWorkspace(root, "spawn-short");
-  const agentDir = join(root, "agent");
+  const parentWorkspace = createWorkspace(root, "spawn-parent"); // ordinary control
+  // #461: default synthetic <owned home>/.pi/agent layout (no
+  // PI_CODING_AGENT_DIR). Children run in the shared agent root itself and in
+  // its Git-initialized `.pi` parent, which holds no broker/candidate/output.
+  const piParent = join(root, "home", ".pi");
+  const agentDir = join(piParent, "agent");
+  const longWorkspace = agentDir;
+  const shortWorkspace = piParent;
   const providerState = join(root, "provider-state");
-  mkdirSync(agentDir, { mode: 0o700 });
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
   mkdirSync(providerState, { mode: 0o700 });
   writeFileSync(join(agentDir, "review-gate.json"), JSON.stringify({
     enabled: true, review: { activeReviewers: [] },
     execution: { deferredPiTools: false, workerResources: {}, routes: { execute: [], research: [] } },
     externalAgents: {},
   }), { mode: 0o600 });
+  writeFileSync(join(agentDir, "AGENTS.md"), "synthetic shared instructions\n", { mode: 0o600 });
+  execFileSync("git", ["init", "-q", "--template=", piParent], { stdio: "ignore", env: {
+    PATH: makeSyntheticEnvironment(root).PATH, HOME: join(root, "home"), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
+  } });
+  const sharedDigest = (): string[] => ["review-gate.json", "AGENTS.md"]
+    .map((name) => createHash("sha256").update(readFileSync(join(agentDir, name))).digest("hex"));
+  const sharedBefore = sharedDigest();
   const beginning = "--session is literal DATA, not an option. BEGIN_SESSION_SPAWN_447\n";
   const middle = "\nMIDDLE_SESSION_SPAWN_447\n";
   const ending = "\nEND_SESSION_SPAWN_447: preserve every requirement and this trailing newline.\n";
@@ -1638,7 +1667,8 @@ test("real registered SessionSpawn delivers one exact long handoff and one short
   const trigger = "SYNTHETIC_SESSION_SPAWN_447_PARENT";
   const requests = [
     { workspace: longWorkspace, title: "Rejected empty prompt", prompt: "" },
-    { workspace: longWorkspace, title: "Long exact native handoff", prompt: longPrompt },
+    // A non-canonical spelling of the agent root is admitted canonically.
+    { workspace: `${piParent}/./agent/`, title: "Long exact native handoff", prompt: longPrompt },
     { workspace: shortWorkspace, title: "Short exact native handoff", prompt: shortPrompt },
   ];
   writeFileSync(join(providerState, "turn-script.json"), JSON.stringify({ steps: [
@@ -1672,7 +1702,6 @@ module.exports = (pi) => {
   watcher = watch(providerState, () => signal.notify());
   const env = {
     ...makeSyntheticEnvironment(root, candidate.nodePath),
-    PI_CODING_AGENT_DIR: agentDir,
     PRG_FIXTURE_AGENT_DIR: realpathSync(resolve(process.env.PI_REVIEW_GATE_INSTALLED_AGENT!)),
     PRG_FIXTURE_STATE_DIR: providerState,
     PRG_FIXTURE_JOURNAL_PROMPT_DIGEST: "1",
@@ -1683,7 +1712,7 @@ module.exports = (pi) => {
   manager = new InstanceManager({
     packageRoot: candidate.packageRoot, piExecutable: pi.file,
     statusRegistrar: broker, profileRegistry: new NativeAgentRegistry({ env }),
-    nativeSetup: false, env, cols: PTY_COLS, rows: PTY_ROWS,
+    nativeSetup: true, env, cols: PTY_COLS, rows: PTY_ROWS,
     getSidebarTitleColumns: () => 47,
     args: ["--offline", "--no-context-files", "--no-skills", "--no-themes", "--no-extensions",
       "--extension", join(repositoryRoot(), "tests", "fixtures", "session-host-native-provider.cjs"),
@@ -1715,6 +1744,14 @@ module.exports = (pi) => {
     EVENT_TIMEOUT_MS, "parent observes all native tool results");
   assert.deepEqual(hostRequests, requests.slice(1), "schema rejection creates no child; each valid request reaches the production broker exactly once");
   assert.equal(owned.length, 3, "one parent plus exactly one long-prompt and one short-prompt child, with no automatic retry/grandchild");
+  assert.deepEqual(owned.map((entry) => entry.descriptor.cwd).sort(), [parentWorkspace, agentDir, piParent].sort(),
+    "the ordinary parent, canonical agent root, and its `.pi` parent are the actual native cwds");
+  assert.equal(new Set(owned.map((entry) => entry.handle.pid)).size, 3, "each native child has its own process");
+  for (const entry of owned) {
+    assert.equal(entry.descriptor.env.PI_CODING_AGENT_DIR, agentDir, "every child shares the one default native agent root");
+    assert.equal(entry.descriptor.env.PI_REVIEW_GATE_CONFIG, undefined, "native setup leaves ordinary config discovery intact");
+  }
+  assert.deepEqual(sharedDigest(), sharedBefore, "shared native config and instructions stay byte-identical");
   const schemaRows = records(observerLog).filter((record) => record.type === "schema");
   assert.equal(schemaRows.length, 3);
   assert.equal(new Set(schemaRows.map((record) => record.sessionId)).size, 3, "all three native conversations are independent");

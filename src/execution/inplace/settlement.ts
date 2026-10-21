@@ -46,6 +46,7 @@ async function writeInPlaceResult(artifactDir: string, result: InPlaceLifecycleR
         toolObservationRevision: cycle.toolObservationRevision,
         changedSinceLaunchCount: cycle.changedSinceLaunch.length,
       })),
+      ...(result.automaticReviewNotArmed ? { automaticReviewNotArmed: result.automaticReviewNotArmed } : {}),
       reviewReport: result.reviewReport,
       operationRecord: result.operationRecord,
       incidents: result.incidents,
@@ -78,7 +79,8 @@ async function operationStateFor(input: Pick<InPlaceLifecycleInput, "taskId" | "
 export async function settleInPlace(input: InPlaceLifecycleInput, result: InPlaceLifecycleResult): Promise<InPlaceLifecycleResult> {
   const evidence = createEvidenceState();
   await restoreObservedToolEvidence(evidence, result.artifactDir, result.workspaceRoot, {
-    required: result.baseline.mode === "tool" || input.task.reviewEvidencePolicy?.toolOnly === true
+    required: result.automaticReviewNotArmed !== undefined
+      || result.baseline.mode === "tool" || input.task.reviewEvidencePolicy?.toolOnly === true
       || result.evidenceMethod === "tool-only" || result.evidenceMethod === "tool-only-fallback",
   });
   result.observedExternalPaths = [...evidence.candidates.values()]

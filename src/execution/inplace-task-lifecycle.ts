@@ -375,13 +375,16 @@ export function inPlaceReviewDisposition(result: {
   status: InPlaceLifecycleStatus;
   reviewReport?: InPlaceLifecycleResult["reviewReport"];
   reviewCycles: InPlaceLifecycleResult["reviewCycles"];
+  automaticReviewNotArmed?: string;
 }): string {
   switch (result.status) {
-    case "reviewed":
-      return result.reviewReport?.aggregate === "pass_with_warnings"
+    case "reviewed": {
+      const passed = result.reviewReport?.aggregate === "pass_with_warnings"
         ? "passed with reviewer infrastructure warnings"
         : "passed";
-    case "unreviewed": return "disabled";
+      return result.automaticReviewNotArmed ? `${passed} for the earlier reviewed delta only; later turns were not reviewed` : passed;
+    }
+    case "unreviewed": return result.automaticReviewNotArmed ? "not run (no new qualifying tool activity)" : "disabled";
     case "no_changes": {
       if (result.reviewCycles.length === 0) return "not run";
       const verdicts = [...new Set(result.reviewCycles.map((cycle) => cycle.verdict))].join(", ");

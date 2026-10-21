@@ -50,6 +50,10 @@ export interface InPlaceWorkerResult {
   effectiveAssignment?: ExecutorPoolAssignment;
   /** A failover route was attempted but had no successor lease; do not retry on the released assignment. */
   failoverExhausted?: boolean;
+  /** True only when every executor adapter that ran this turn declared a structured tool-event stream. */
+  structuredToolEvents?: boolean;
+  /** Observations in this turn that the shared classification counts as reviewable work (counted before ledger bounds). */
+  qualifyingObservations?: number;
 }
 
 // ── lifecycle types ──────────────────────────────────────────────────────────
@@ -117,6 +121,12 @@ export interface InPlaceLifecycleResult {
    */
   attributionError?: string;
   reviewCycles: InPlaceReviewCycle[];
+  /**
+   * Set when an automatic review was not armed for the final executor turns
+   * (no new qualifying structured tool activity, or the run-as-binary final
+   * pass response). Names what was NOT reviewed; never a verdict.
+   */
+  automaticReviewNotArmed?: string;
   reviewReport?: SubtaskReviewReport;
   artifactDir: string;
   operationRecord: string;

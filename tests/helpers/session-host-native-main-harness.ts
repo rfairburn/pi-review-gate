@@ -221,7 +221,12 @@ export class ChangeSignal {
           finish(new Error(`${description}: bounded event predicate failed`));
         }
       };
-      const timer = setTimeout(() => finish(new Error(`${description}: deadline exceeded`)), timeoutMs);
+      // One exact-predicate recheck at the unchanged deadline so a missed
+      // notification cannot turn an already-true condition into a failure.
+      const timer = setTimeout(() => {
+        check();
+        finish(new Error(`${description}: deadline exceeded`));
+      }, timeoutMs);
       this.listeners.add(check);
       check();
     });

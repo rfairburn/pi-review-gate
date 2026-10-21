@@ -15,6 +15,30 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.190]
+
+### Changed
+
+- Automatic Primary review, and automatic review of InPlace workers with structured
+  tool events, now also needs a new qualifying tool call since the preceding review
+  (#461). Filesystem changes alone (runtime, background, or external writers) no
+  longer start or retrigger it, a call never forces an empty-diff review, and skipped
+  changes stay unreviewed and earlier findings unresolved, never accepted. A tool call
+  is not proof that the agent caused every captured change. `/review-now` and
+  `/ask-reviewer` are unchanged, and there is no new setting.
+- After a pass, a user-selected `run-as-binary` InPlace executor's final pass-response
+  turn is returned to the orchestrator as unreviewed evidence without another review
+  (#461). Initial and correction review eligibility and caps are unchanged.
+
+### Fixed
+
+- The session host now accepts the native Pi agent directory, or its `.pi` parent, as
+  an ordinary session workspace with the same effective `PI_CODING_AGENT_DIR` and shared
+  native configuration, and non-Git review of such a root no longer fails (#461). Raw
+  capture skips only this extension's own private checkpoint `record.json` files;
+  everything else, including unknown files next to them, stays captured. The delegated
+  capture limitation tracked in #318 remains.
+
 ## [0.1.0-dev.188]
 
 ### Added

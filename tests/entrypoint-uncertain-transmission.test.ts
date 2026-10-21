@@ -113,6 +113,7 @@ test("a throwing automatic transmission is durably uncertain and surfaced once i
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "change index", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
+    await trigger(first.hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } }, first.ctx);
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     await trigger(first.hooks, "agent_end", { cwd: dir }, first.ctx);
     await trigger(first.hooks, "agent_settled", { cwd: dir }, first.ctx);
@@ -164,6 +165,7 @@ test("uncertain transmission notices bound long transport diagnostics with visib
     await trigger(runtime.hooks, "session_start", { type: "session_start", reason: "startup" }, runtime.ctx);
     await trigger(runtime.hooks, "input", { cwd: dir, text: "change index", source: "user" }, runtime.ctx);
     await trigger(runtime.hooks, "before_agent_start", { cwd: dir }, runtime.ctx);
+    await trigger(runtime.hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } }, runtime.ctx);
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     await trigger(runtime.hooks, "agent_end", { cwd: dir }, runtime.ctx);
     await trigger(runtime.hooks, "agent_settled", { cwd: dir }, runtime.ctx);
@@ -208,6 +210,7 @@ test("a failing uncertain-state persist rejects agent_settled without emitting t
     await trigger(runtime.hooks, "session_start", { type: "session_start", reason: "startup" }, runtime.ctx);
     await trigger(runtime.hooks, "input", { cwd: dir, text: "change index", source: "user" }, runtime.ctx);
     await trigger(runtime.hooks, "before_agent_start", { cwd: dir }, runtime.ctx);
+    await trigger(runtime.hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } }, runtime.ctx);
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     await trigger(runtime.hooks, "agent_end", { cwd: dir }, runtime.ctx);
     await assert.rejects(
@@ -267,6 +270,7 @@ test("shutdown before uncertain-state persistence does not masquerade as a durab
     await trigger(runtime.hooks, "session_start", { type: "session_start", reason: "startup" }, runtime.ctx);
     await trigger(runtime.hooks, "input", { cwd: dir, text: "change index", source: "user" }, runtime.ctx);
     await trigger(runtime.hooks, "before_agent_start", { cwd: dir }, runtime.ctx);
+    await trigger(runtime.hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } }, runtime.ctx);
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     await trigger(runtime.hooks, "agent_end", { cwd: dir }, runtime.ctx);
 
@@ -308,6 +312,7 @@ test("a pre-existing uncertain delivery record cannot duplicate the in-session n
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "change index", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
+    await trigger(first.hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } }, first.ctx);
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     await trigger(first.hooks, "agent_end", { cwd: dir }, first.ctx);
     await trigger(first.hooks, "agent_settled", { cwd: dir }, first.ctx);
@@ -349,6 +354,7 @@ test("a pre-existing uncertain delivery record cannot duplicate the in-session n
     assert.equal(second.followUps.length, 0, "recovery does not re-dispatch an uncertain delivery");
     await trigger(second.hooks, "input", { cwd: dir, text: "change index again", source: "user" }, second.ctx);
     await trigger(second.hooks, "before_agent_start", { cwd: dir }, second.ctx);
+    await trigger(second.hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } }, second.ctx);
     await writeFile(join(dir, "index.ts"), "after again\n", "utf8");
     await trigger(second.hooks, "agent_end", { cwd: dir }, second.ctx);
     await assert.rejects(

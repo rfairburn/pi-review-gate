@@ -550,8 +550,9 @@ test("listen copy explains the dual-stack request and an IPv6 endpoint renders a
   assert.ok(flat.includes("IPv4 and IPv6"), "dual-stack means both families on one handle");
   assert.ok(flat.includes("0.0.0.0") && flat.includes("IPv4 only"), "an explicit IPv4-only request stays available");
   assert.ok(flat.includes("Address and port are separate"), "the two fields stay separate");
-  assert.ok(flat.includes("Hosting stays off until you choose Enable"), "hosting stays off until enabled");
-  assert.ok(flat.includes("nothing is bound or saved until you act"), "no side effect before an explicit action");
+  assert.ok(flat.includes("New hosts start with Hosting off"), "the off default is described as an initial state");
+  assert.ok(!flat.includes("Hosting stays off until"), "editing an already enabled listener must not claim hosting is off");
+  assert.ok(flat.includes("Edits stay local until Apply or Enable"), "editing alone does not change the current listener");
   assert.ok(flat.includes("no other address or port is substituted"), "no silent fallback");
   assert.ok(!/no wildcard/i.test(flat), "the copy never makes the wildcard look forbidden");
   harness.send(ESC);

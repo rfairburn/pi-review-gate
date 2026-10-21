@@ -163,9 +163,10 @@ remembered Auto setting. A listener binds only an address and port the operator 
 submitted. When nothing is saved yet, the Network pane prefills the editable suggestion
 `*:8088` as a local draft: `*` requests one dual-stack listener (the transport maps it to
 a single `::` listener that is not IPv6-only, so IPv4 and IPv6 share that one handle),
-while an explicit `0.0.0.0` stays an IPv4-only request. Hosting stays off, and nothing is
-bound, saved, keyed, or created until the operator chooses Enable or Apply, and unknown,
-unavailable, or unsafe settings are never filled in with that suggestion or enabled. No
+while an explicit `0.0.0.0` stays an IPv4-only request. A fresh host stays off; showing
+or editing this draft neither persists it nor creates an identity or listener. Enable
+or Apply explicitly submits the listener draft. Unknown, unavailable, or unsafe
+settings are never filled in with that suggestion or enabled. No
 other address or port is ever substituted as a fallback, an address that cannot be bound
 fails with its own error, and the application adds no discovery, SSH, or extra listener.
 Auto reconnect is off by default and

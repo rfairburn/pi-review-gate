@@ -755,7 +755,7 @@ const PEER_ENDPOINT_MAX_CODEPOINTS = 512;
 const PEER_PORT_MIN = 1;
 const PEER_PORT_MAX = 65535;
 /**
- * Operator-approved fresh-start listen suggestion shown as editable draft text
+ * Fresh-start listen suggestion shown as editable draft text
  * when a KNOWN settings snapshot has no saved listen address/port. It is a
  * local UI draft only: never written to the settings DTO or the store, never
  * sent unless the operator acts, and never substituted while settings are
@@ -4991,7 +4991,7 @@ export class SidebarController {
     const contextLines = wrapHintLines([
       addField !== undefined
         ? "The destination is display data; the coordinator validates and saves it."
-        : "Address and port are separate fields. \"*\" asks for one dual-stack listener (IPv4 and IPv6); \"0.0.0.0\" is IPv4 only. Hosting stays off until you choose Enable, nothing is bound or saved until you act, and no other address or port is substituted.",
+        : "Address and port are separate fields. \"*\" asks for one dual-stack listener (IPv4 and IPv6); \"0.0.0.0\" is IPv4 only. New hosts start with Hosting off. Edits stay local until Apply or Enable; no other address or port is substituted.",
     ], cols);
     const errorLines = this.formError === undefined ? [] : wrapHintLines([`! ${this.formError}`], cols);
     // One editor holds one field: Enter saves that field to the local draft and
@@ -5893,7 +5893,7 @@ function renameFailureNotice(status: string): string {
 /**
  * The listen address/port text the Network pane drafts for one snapshot. A
  * KNOWN settings document with no saved address/port is prefilled with the
- * approved editable suggestion (`*:8088`); an explicit stored value — including
+ * editable initial suggestion (`*:8088`); an explicit stored value — including
  * a stored port of `0` — is shown exactly as stored and is never defaulted.
  * Unknown, unavailable, or unsafe settings suggest nothing: the drafts stay
  * empty so the pane keeps refusing to enable hosting. This is local display

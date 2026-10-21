@@ -698,7 +698,11 @@ export class SavedMainDriver {
     afterOffset = 0,
     timeoutMs = EVENT_TIMEOUT_MS,
   ): Promise<SessionRecord[]> {
-    await this.journalSignal.waitFor(() => predicate(this.records().slice(afterOffset)), timeoutMs, description);
+    // The observer journal is a durable file, so a positive lifecycle fact is
+    // re-read on the shared bounded recheck as well as on every notification.
+    // The predicate, offset, returned records, description, and timeout are
+    // unchanged and the original deadline still bounds the wait.
+    await this.journalSignal.waitForRecheck(() => predicate(this.records().slice(afterOffset)), timeoutMs, description);
     return this.records();
   }
 
@@ -708,7 +712,10 @@ export class SavedMainDriver {
     afterOffset = 0,
     timeoutMs = EVENT_TIMEOUT_MS,
   ): Promise<PtyJournalRecord[]> {
-    await this.ptySignal.waitFor(() => predicate(this.ptyRecords().slice(afterOffset)), timeoutMs, description);
+    // The public PTY journal is a durable file: re-read it on the shared bounded
+    // recheck in addition to notifications, with predicate, offset, returned
+    // records, description, timeout, and the original deadline unchanged.
+    await this.ptySignal.waitForRecheck(() => predicate(this.ptyRecords().slice(afterOffset)), timeoutMs, description);
     return this.ptyRecords();
   }
 
@@ -775,7 +782,10 @@ export class SavedMainDriver {
   }
 
   async waitForRunnerResult(timeoutMs = EVENT_TIMEOUT_MS): Promise<RunnerResult> {
-    await this.ptySignal.waitFor(() => readJsonl<RunnerResult>(this.resultFile).length === 1,
+    // The runner result is a durable file, so re-read it on the shared bounded
+    // recheck; the predicate, description, timeout, and post-wait assertions are
+    // unchanged.
+    await this.ptySignal.waitForRecheck(() => readJsonl<RunnerResult>(this.resultFile).length === 1,
       timeoutMs, "the public runSessionHost return and terminal restoration record");
     const results = readJsonl<RunnerResult>(this.resultFile);
     assert.equal(results.length, 1, "the runner result is one bounded metadata record");
@@ -1021,7 +1031,11 @@ export async function waitForJsonl<T>(
     if (filename === null || filename.toString() === basename(path)) signal.notify();
   });
   try {
-    await signal.waitFor(() => predicate(readJsonl<T>(path)), timeoutMs, description);
+    // This wrapper re-reads the durable JSONL file on every evaluation, so it also
+    // re-reads on the shared bounded recheck. Notification remains the fast path,
+    // the predicate and the caller's original timeout are unchanged, and the
+    // returned records still come from a fresh read.
+    await signal.waitForRecheck(() => predicate(readJsonl<T>(path)), timeoutMs, description);
     return readJsonl<T>(path);
   } finally {
     watcher.close();

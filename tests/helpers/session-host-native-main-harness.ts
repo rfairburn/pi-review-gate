@@ -50,6 +50,7 @@ import { watch, type FSWatcher } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
+import { ChangeSignal } from "./change-signal";
 import {
   NATIVE_PANE_START,
   SIDEBAR_COLUMNS,
@@ -161,6 +162,57 @@ export interface SessionRecord {
   credentialLikeEnvironmentNames?: string[];
 }
 
+/** One native child's own reported pane size (observer-fixture evidence). */
+export interface PaneGeometry {
+  readonly cols: number;
+  readonly rows: number;
+}
+
+/**
+ * Per-session viewer sizing expectation for one deliberate outer resize (#474).
+ *
+ * The host sizes only the row it actually displays; every other live owned row
+ * keeps the geometry it last reported. `viewed: undefined` is the deliberate
+ * "this host displays no row" case, where no child may be resized at all.
+ */
+export interface OuterResizeExpectation {
+  /** The row this host displays — the only row an outer resize may address. */
+  readonly viewed?: OwnedSession;
+  /** Every other live owned row, each of which must keep its last pane. */
+  readonly retained?: readonly OwnedSession[];
+}
+
+/**
+ * Complete-frame requirements for one deliberate roster activation.
+ *
+ * `restoredNativeEditorFrame` is the structural fence for the row that just
+ * became the displayed owner: exact header, complete roster/footer, and a
+ * width-correct bordered editor whose content row is exactly the expected
+ * draft. Supplying it turns `activateRoster` into a complete-frame witness
+ * instead of a header-plus-substring match.
+ */
+export interface RosterActivationWitness {
+  readonly draft: string;
+  readonly nativeWidth: number;
+  readonly focus?: RestoredNativeEditorFocus;
+  readonly sidebarColumns?: number;
+}
+
+/**
+ * What one witnessed activation actually observed, kept for failure evidence.
+ *
+ * `SessionHostFrameWriter` emits only the rows that changed since the frame it
+ * last wrote, with no atomic frame marker, so a live emulator can be read in
+ * the middle of one logical frame. `looseFrame` is the first frame the driver
+ * saw for the activation and `looseFrameWasPartial` records that the host was
+ * still repainting after it; content isolation is judged on `settledFrame`.
+ */
+export interface RosterActivationEvidence {
+  readonly looseFrame: string;
+  readonly settledFrame: string;
+  readonly looseFrameWasPartial: boolean;
+}
+
 export interface OwnedSession {
   /** Stable fixture-side row probe; visible matching uses the canonical caption and current pane geometry. */
   rowProbe: string;
@@ -195,87 +247,16 @@ export interface PtyExitRecord {
   signal?: number | string | null;
 }
 
-export class ChangeSignal {
-  private readonly listeners = new Set<() => void>();
-
-  notify(): void {
-    for (const listener of [...this.listeners]) listener();
-  }
-
-  waitFor(predicate: () => boolean, timeoutMs: number, description: string): Promise<void> {
-    return new Promise<void>((resolvePromise, rejectPromise) => {
-      let settled = false;
-      const finish = (error?: Error): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        this.listeners.delete(check);
-        if (error) rejectPromise(error);
-        else resolvePromise();
-      };
-      const check = (): void => {
-        if (settled) return;
-        try {
-          if (predicate()) finish();
-        } catch {
-          finish(new Error(`${description}: bounded event predicate failed`));
-        }
-      };
-      const timer = setTimeout(() => finish(new Error(`${description}: deadline exceeded`)), timeoutMs);
-      this.listeners.add(check);
-      check();
-    });
-  }
-
-  waitForQuiet(predicate: () => boolean, timeoutMs: number, description: string): Promise<void> {
-    return new Promise<void>((resolvePromise, rejectPromise) => {
-      let settled = false;
-      const finish = (error?: Error): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        this.listeners.delete(check);
-        if (error) rejectPromise(error);
-        else resolvePromise();
-      };
-      const check = (): void => {
-        if (settled) return;
-        try {
-          if (predicate()) finish(new Error(`${description}: unexpected owned event`));
-        } catch {
-          finish(new Error(`${description}: bounded event predicate failed`));
-        }
-      };
-      const timer = setTimeout(() => finish(), timeoutMs);
-      this.listeners.add(check);
-      check();
-    });
-  }
-
-  waitForQuietPeriod(quietMs: number, timeoutMs: number, description: string): Promise<void> {
-    return new Promise<void>((resolvePromise, rejectPromise) => {
-      let settled = false;
-      let quietTimer: ReturnType<typeof setTimeout> | undefined;
-      const finish = (error?: Error): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(deadlineTimer);
-        if (quietTimer !== undefined) clearTimeout(quietTimer);
-        this.listeners.delete(restart);
-        if (error) rejectPromise(error);
-        else resolvePromise();
-      };
-      const restart = (): void => {
-        if (settled) return;
-        if (quietTimer !== undefined) clearTimeout(quietTimer);
-        quietTimer = setTimeout(() => finish(), quietMs);
-      };
-      const deadlineTimer = setTimeout(() => finish(new Error(`${description}: deadline exceeded before quiet`)), timeoutMs);
-      this.listeners.add(restart);
-      restart();
-    });
-  }
-}
+// The positive/quiet wait mechanics now come from the one neutral shared module
+// the Windows harness and both launchers also use
+// (tests/helpers/change-signal.ts), so `tests/session-host-journal-signal.test.ts`
+// exercises the class this harness actually waits on. `waitFor` (in-process
+// frame/output/exit readiness) and the `waitForQuiet`/`waitForQuietPeriod`
+// negative witnesses keep their reviewed notification-driven semantics unchanged;
+// only `waitForRecords` below and the structural-control Escape journal wait (it
+// re-reads a durable journal on every evaluation) opt into the durable recheck. The name stays
+// exported here so every existing harness and test import resolves unchanged.
+export { ChangeSignal };
 
 export class OwnedPidExitWatcher {
   readonly pid: number;
@@ -1544,6 +1525,14 @@ export class MainPtyDriver {
   parserError?: Error;
   private forcedCleanup = false;
   private selectedNativeTarget?: { readonly workspace: string; readonly pid: number; readonly sessionId: string };
+  /**
+   * The row this host deliberately made its Main input owner (#474), from the
+   * driver's own actions plus observer-confirmed identity — never from scraping
+   * production state. Per-session sizing witnesses address exactly this row.
+   */
+  private displayedRow?: { readonly workspace: string; readonly pid: number; readonly sessionId: string };
+  /** Evidence from the most recent witnessed `activateRoster` call. */
+  lastActivationEvidence?: RosterActivationEvidence;
   private rosterSelectionClearedByRemoval = false;
   frameRevision = 0;
   outputRevision = 0;
@@ -1787,7 +1776,12 @@ export class MainPtyDriver {
     const watcher = watch(file, () => change.notify());
     try {
       this.pty.write(KEYS.escape);
-      await change.waitFor(() => count() > before, EVENT_TIMEOUT_MS,
+      // `count()` re-reads the durable pty-controls journal on every evaluation and
+      // `before` stays the pre-keypress snapshot, so the unchanged positive
+      // "a fresh exact-owner Escape record now exists" predicate uses the durable
+      // recheck: the journal append is the readiness fact, and its only live
+      // trigger is an `fs.watch` notification that can be coalesced or dropped.
+      await change.waitForRecheck(() => count() > before, EVENT_TIMEOUT_MS,
         "unmodified native Escape freshly reaches the exact owned child's real public PTY write");
       await this.waitForFrameQuiet("idle native Escape preserves a bounded stable owner frame");
     } finally { watcher.close(); }
@@ -1913,7 +1907,14 @@ export class MainPtyDriver {
     timeoutMs = EVENT_TIMEOUT_MS,
   ): Promise<SessionRecord[]> {
     try {
-      await this.journalSignal.waitFor(() => predicate(this.records()), timeoutMs, description);
+      // The observer journal is a durable append-only file whose only live
+      // trigger is this driver's fs.watch notification. A coalesced or missed
+      // watcher event must not leave an already-durable record unexamined, so
+      // the unchanged predicate is re-evaluated on the shared bounded cadence
+      // and once at the original absolute deadline, with notify() still the fast
+      // path. The deadline, predicate, and predicate-exception semantics and this
+      // frame-preserving failure diagnostic are unchanged.
+      await this.journalSignal.waitForRecheck(() => predicate(this.records()), timeoutMs, description);
     } catch (error) {
       // Controlled fixture content only. Preserve the actual frame in the
       // failure diagnostic so a UI/backend error is not hidden by an empty
@@ -1925,6 +1926,54 @@ export class MainPtyDriver {
 
   async assertNoJournalEvent(predicate: (records: SessionRecord[]) => boolean, description: string): Promise<void> {
     await this.journalSignal.waitForQuiet(() => predicate(this.records()), SHORT_QUIET_WINDOW_MS, description);
+  }
+
+  /** Journal length now, the marker for "no child moved after this point" witnesses. */
+  recordCount(): number {
+    return this.records().length;
+  }
+
+  /**
+   * The pane the observer fixture last reported for one owned child, read from
+   * that child's own newest journal record (`process.stdout.columns/rows`).
+   * Undefined only when the child has never journaled a dimension.
+   */
+  paneGeometry(session: OwnedSession): PaneGeometry | undefined {
+    const records = this.records();
+    for (let index = records.length - 1; index >= 0; index -= 1) {
+      const record = records[index]!;
+      if (record.pid !== session.record.pid) continue;
+      if (typeof record.columns === "number" && typeof record.rows === "number") {
+        return { cols: record.columns, rows: record.rows };
+      }
+    }
+    return undefined;
+  }
+
+  /** Wait for one exact owned child to report a fresh pane of the given size. */
+  async waitForPane(
+    session: OwnedSession,
+    cols: number,
+    rows: number,
+    description: string,
+    marker = 0,
+  ): Promise<void> {
+    await this.waitForRecords(
+      (records) => records.slice(marker).some((record) => record.type === "resize"
+        && record.pid === session.record.pid && record.columns === cols && record.rows === rows),
+      description,
+    );
+  }
+
+  /** Witness that none of `sessions` reported any geometry change since `marker`. */
+  async assertPanesUnchanged(
+    sessions: readonly OwnedSession[],
+    marker: number,
+    description: string,
+  ): Promise<void> {
+    const pids = sessions.map((session) => session.record.pid);
+    await this.assertNoJournalEvent((records) => records.slice(marker).some((record) => record.type === "resize"
+      && pids.includes(record.pid)), description);
   }
 
   async waitForFrameQuiet(description: string): Promise<void> {
@@ -2194,7 +2243,23 @@ export class MainPtyDriver {
       "the complete sidebar-only footer proves real sidebar focus");
   }
 
-  async activateRoster(label: string, expectedDraft?: string): Promise<void> {
+  /**
+   * Activate one roster row through the real Enter binding and return the frame
+   * its content assertions may be read from.
+   *
+   * Without `witness` this keeps the historical header-plus-draft match and
+   * returns that first matching frame. With `witness` the activation is only
+   * accepted once the newly displayed row draws its COMPLETE native editor at
+   * the current pane width, the real frame writer has gone quiet (every changed
+   * row of that logical frame has been emitted), and the settled frame still
+   * draws the same complete editor. Nothing is inferred from a partially drawn
+   * frame, and no text is required to disappear.
+   */
+  async activateRoster(
+    label: string,
+    expectedDraft?: string,
+    witness?: RosterActivationWitness,
+  ): Promise<string> {
     await this.ensureSidebarFocus();
     await this.moveRosterTo(label);
     const after = this.frameRevision;
@@ -2203,6 +2268,86 @@ export class MainPtyDriver {
     await this.waitFrame((text) => frameHeaderMatches(text, label)
       && (expectedDraft === undefined || text.includes(expectedDraft)),
     `Enter activates the highlighted native session ${label} with its own observed header and surface`, after);
+    const looseFrame = this.currentText();
+    let frameForCallers = looseFrame;
+    if (witness !== undefined) {
+      const settledFrame = await this.settledNativeEditorFrame({
+        ownerLabel: label,
+        draft: witness.draft,
+        nativeWidth: witness.nativeWidth,
+        focus: witness.focus,
+        sidebarColumns: witness.sidebarColumns,
+      });
+      this.lastActivationEvidence = {
+        looseFrame,
+        settledFrame,
+        looseFrameWasPartial: looseFrame !== settledFrame,
+      };
+      frameForCallers = settledFrame;
+    }
+    // A deliberate activation is how a row starts being displayed and sized by
+    // this host (#474); track it from the frame the driver just witnessed.
+    this.trackActivatedRow(frameForCallers, label);
+    return frameForCallers;
+  }
+
+  /**
+   * Correlate the settled header the driver just witnessed with one
+   * observer-confirmed owned row (workspace/PID/conversation), never with
+   * scraped production state. An unresolvable caption leaves the tracking empty
+   * rather than guessing a row a later resize might address.
+   */
+  private trackActivatedRow(frame: string, label: string): void {
+    const header = frameHeader(frame);
+    const byHeader = this.sessions().filter((session) => renderedTitleMatches(header, session.displayName));
+    const byLabel = this.sessions().filter((session) => session.displayName === label
+      || session.currentName === label || session.rowProbe === label);
+    const activated = byHeader.length === 1 ? byHeader : byLabel;
+    this.displayedRow = activated.length === 1
+      ? { workspace: activated[0]!.workspace, pid: activated[0]!.record.pid!, sessionId: activated[0]!.record.sessionId! }
+      : undefined;
+  }
+
+  /**
+   * Witness the displayed row's complete native editor, then wait for the real
+   * frame writer to stop emitting changed rows, and return that settled frame.
+   *
+   * `SessionHostFrameWriter` writes only the rows that changed since the frame it
+   * last wrote, with no atomic frame marker, so one logical frame is observable
+   * in pieces. A complete editor block can therefore share the screen with rows
+   * of the previous paint; content isolation must be judged on the settled
+   * frame. Callers that press Enter themselves use this after the activation;
+   * `activateRoster` applies the same fence internally. Nothing is required to
+   * disappear, and a settled frame that fails the witness fails loudly.
+   */
+  async settledNativeEditorFrame(options: {
+    readonly ownerLabel: string;
+    readonly draft: string;
+    readonly nativeWidth: number;
+    readonly focus?: RestoredNativeEditorFocus;
+    readonly sidebarColumns?: number;
+  }): Promise<string> {
+    const witness = {
+      ownerLabel: options.ownerLabel,
+      draft: options.draft,
+      sidebarColumns: options.sidebarColumns ?? this.sidebarColumnCount(),
+      nativeWidth: options.nativeWidth,
+      focus: options.focus,
+    };
+    const firstFrame = this.currentText();
+    await this.waitFrame((text) => restoredNativeEditorFrame(text, witness),
+    `${options.ownerLabel}'s complete native editor is drawn at the current pane width`);
+    await this.waitForFrameQuiet(`the real Main frame writer finishes repainting ${options.ownerLabel}'s frame`);
+    const settledFrame = this.currentText();
+    assert.equal(restoredNativeEditorFrame(settledFrame, witness), true,
+      `the settled frame for ${options.ownerLabel} still draws the complete native editor\nActual owned Main frame:\n${settledFrame}`);
+    this.lastActivationEvidence = {
+      looseFrame: firstFrame,
+      settledFrame,
+      looseFrameWasPartial: firstFrame !== settledFrame,
+    };
+    this.trackActivatedRow(settledFrame, options.ownerLabel);
+    return settledFrame;
   }
 
   /** Create one real native session through the Workspace-only public form. */
@@ -2272,6 +2417,7 @@ export class MainPtyDriver {
     `new canonical row ${displayName} is the active Main input owner with a complete Main-focused frame`);
     this.focus = "main"; // the completed New child owns Main input
     this.selectedNativeTarget = { workspace: canonicalWorkspace, pid: record.pid!, sessionId: record.sessionId! };
+    this.displayedRow = this.selectedNativeTarget;
     return { rowProbe, currentName, displayName, workspace: canonicalWorkspace, record, exitWatcher };
   }
 
@@ -2397,25 +2543,98 @@ export class MainPtyDriver {
     }
   }
 
+  /** True when the observed header names `displayName` as the active owner. */
+  private headerNamesOwner(displayName: string): boolean {
+    const header = frameHeader(this.currentText());
+    // The header carries the active owner's caption, optionally followed by a
+    // host notice after the production " | " separator. Either way the title
+    // part must still name the row it displays.
+    const headerTitle = header.split(" | ")[0] ?? header;
+    return renderedTitleMatches(header, displayName) || renderedTitleMatches(headerTitle, displayName);
+  }
+
+  /**
+   * Record that a test-witnessed keyboard action deliberately made `session`
+   * the row this host displays. Per-session sizing (#474) addresses exactly
+   * this row, so the expectation comes from explicit driver action state.
+   */
+  noteDisplayedRow(session: OwnedSession): void {
+    assert.equal(processIsAlive(session.record.pid), true,
+      `${session.rowProbe} is a live owned child when it becomes the displayed row`);
+    assert.ok(this.headerNamesOwner(session.displayName),
+      `the witnessed action leaves ${session.displayName} as the observed Main owner:\n${this.currentText()}`);
+    this.displayedRow = {
+      workspace: session.workspace,
+      pid: session.record.pid!,
+      sessionId: session.record.sessionId!,
+    };
+  }
+
+  /**
+   * Resize the owned outer PTY and witness per-session viewer sizing (#474):
+   * the row this host actually displays takes the new pane, every other live
+   * owned row keeps the pane it last reported, and the outer terminal still
+   * repaints. The addressed row comes from the driver's own deliberate
+   * activation state, never from scraping production; the resize evidence is
+   * each exact child's own observer record.
+   */
   async setOuterSize(
     cols: number,
     rows: number,
-    sessions: readonly OwnedSession[],
+    expectation: OuterResizeExpectation,
     expectedNativeCols: number,
     expectedNativeRows: number,
   ): Promise<void> {
-    const outputBefore = this.outputRevision;
+    const viewed = expectation.viewed;
+    const retained = expectation.retained ?? [];
+    if (viewed !== undefined) {
+      assert.ok(retained.every((session) => session.record.pid !== viewed.record.pid),
+        "one row cannot be both the displayed row and a retained row in one resize witness");
+      const displayed = this.displayedRow;
+      assert.ok(displayed !== undefined,
+        "an outer resize witness needs the row this driver deliberately made the Main owner",
+      );
+      assert.ok(viewed.workspace === displayed!.workspace
+        && viewed.record.pid === displayed!.pid
+        && viewed.record.sessionId === displayed!.sessionId,
+      `the outer resize must address the row this host displays (${displayed!.workspace}), not ${viewed.workspace}`);
+      // The observed header must still name the row this driver believes it
+      // displays before the outer resize addresses it.
+      assert.ok(this.headerNamesOwner(viewed.displayName),
+        `the observed Main header still names the displayed row ${viewed.displayName} before the outer resize:\n${this.currentText()}`);
+    }
+    // Every other live owned row has to be declared retained: a witness cannot
+    // quietly leave a sibling's geometry unasserted.
+    const undeclared = this.sessions().filter((session) => session.record.pid !== viewed?.record.pid
+      && !session.exitWatcher.observedExit
+      && !retained.some((candidate) => candidate.record.pid === session.record.pid));
+    assert.deepEqual(undeclared.map((session) => session.rowProbe), [],
+      "an outer resize witness declares every other live owned row as retained");
     const recordCountBeforeResize = this.records().length;
+    const retainedBefore = retained.map((session) => ({ session, pane: this.paneGeometry(session) }));
+    const outputBefore = this.outputRevision;
     this.pty.resize(cols, rows);
     this.surface.resize(cols, rows);
     await this.waitForOuterOutput(outputBefore, `real ProcessTerminal redraw after outer resize to ${cols}x${rows}`);
-    for (const session of sessions) {
-      await this.waitForRecords(
-        (records) => records.slice(recordCountBeforeResize).some((record) => record.type === "resize"
-          && record.pid === session.record.pid
-          && record.columns === expectedNativeCols && record.rows === expectedNativeRows),
-        `owned native ${session.rowProbe} receives a fresh ${expectedNativeCols}x${expectedNativeRows} pane after outer resize to ${cols}x${rows}`,
-      );
+    if (viewed === undefined) {
+      // This host displays no row, so its surface contributes no geometry: no
+      // child moves, and only the initial rule for rows created later changes.
+      await this.assertPanesUnchanged(this.sessions().filter((session) => !session.exitWatcher.observedExit),
+        recordCountBeforeResize,
+        `no owned native child resizes on an outer resize to ${cols}x${rows} while this host displays no session`);
+      return;
+    }
+    await this.waitForRecords(
+      (records) => records.slice(recordCountBeforeResize).some((record) => record.type === "resize"
+        && record.pid === viewed.record.pid
+        && record.columns === expectedNativeCols && record.rows === expectedNativeRows),
+      `displayed native ${viewed.rowProbe} receives a fresh ${expectedNativeCols}x${expectedNativeRows} pane after outer resize to ${cols}x${rows}`,
+    );
+    await this.assertPanesUnchanged(retained, recordCountBeforeResize,
+      `no other owned native child resizes on the outer resize to ${cols}x${rows}`);
+    for (const { session, pane } of retainedBefore) {
+      assert.deepEqual(this.paneGeometry(session), pane,
+        `the unviewed native row ${session.rowProbe} keeps the pane it last reported`);
     }
   }
 
@@ -2478,6 +2697,10 @@ export class MainPtyDriver {
       rowProbe: exitCaption, currentName: session.currentName,
       displayName: exitCaption, workspace: session.workspace,
     });
+    // A finished row is no longer a displayable target: this host's surface
+    // contributes no geometry to it, and no sibling is displayed in its place
+    // until a deliberate activation (#474).
+    if (this.displayedRow?.pid === session.record.pid) this.displayedRow = undefined;
   }
 
   /** Remove one positively exited row via the real sidebar Delete action only. */
@@ -2514,6 +2737,7 @@ export class MainPtyDriver {
     `the public Delete action removes only ${session.rowProbe}'s confirmed exited row from a complete roster and clears its highlight`, beforeDelete);
     this.removedWorkspaces.add(session.workspace);
     this.selectedNativeTarget = undefined;
+    if (this.displayedRow?.pid === session.record.pid) this.displayedRow = undefined;
     this.rosterSelectionClearedByRemoval = true;
     assert.equal(this.sessions().length, beforeRows - 1,
       "current roster removal does not discard historical native process ownership");

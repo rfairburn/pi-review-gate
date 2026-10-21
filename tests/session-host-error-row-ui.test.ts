@@ -32,7 +32,17 @@ import test from "node:test";
 import { isKittyProtocolActive, setKittyProtocolActive } from "pi-session-host-tui";
 import type { StatusBroker } from "../src/session-host/broker";
 import type { ComposedHostFrame } from "../src/session-host/compositor";
-import type { InstanceManagerOptions, NativeInstanceView, ShutdownResult, StopInstanceResult } from "../src/session-host/instances";
+import type {
+  InstanceManagerOptions,
+  NativeInstanceView,
+  SessionGeometry,
+  SessionViewerState,
+  SessionViewerUpdate,
+  SessionViewerUpdateResult,
+  ShutdownResult,
+  StopInstanceResult,
+} from "../src/session-host/instances";
+import { FakeViewerSeam } from "./session-host-viewer-fakes";
 import { EXECUTOR_TOOL_CATALOG_ENV, RUNTIME_ROLE_ENV } from "../src/session-host/launch";
 import type { ProfilePreparer } from "../src/session-host/profiles";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
@@ -264,7 +274,36 @@ class FakeManager {
   }
 
   write(id: string, data: string | Buffer): void { this.writes.push({ id, data }); }
+  // --- #474 per-session viewer seam: viewer facts and per-row geometry only. ---
+  // This fixture's frames are size-independent, so the geometry it reports is its
+  // own record of what the host asked each row to be, never a second process store.
+  readonly geometry = new Map<string, { cols: number; rows: number }>();
+  readonly viewers = new FakeViewerSeam({
+    isViewable: (id) => {
+      const view = this.views.find((candidate) => candidate.id === id);
+      return view !== undefined && view.hasLiveProcess && (view.lifecycle === "alive" || view.lifecycle === "starting");
+    },
+    read: (id) => this.geometry.get(id) ?? { cols: this.options.cols ?? 80, rows: this.options.rows ?? 24 },
+    apply: (id, cols, rows) => { this.geometry.set(id, { cols, rows }); },
+  });
+
   resize(): void {}
+
+  openViewer(): SessionViewerState { return this.viewers.openViewer(); }
+
+  viewerState(viewerId: string): SessionViewerState | undefined { return this.viewers.viewerState(viewerId); }
+
+  sessionViewers(sessionId: string): SessionViewerState[] { return this.viewers.sessionViewers(sessionId); }
+
+  updateViewer(viewerId: string, update: SessionViewerUpdate): SessionViewerUpdateResult {
+    return this.viewers.updateViewer(viewerId, update);
+  }
+
+  closeViewer(viewerId: string): boolean { return this.viewers.closeViewer(viewerId); }
+
+  instanceGeometry(id: string): SessionGeometry | undefined { return this.viewers.instanceGeometry(id); }
+
+  setInitialGeometry(cols: number, rows: number): void { this.viewers.setInitialGeometry(cols, rows); }
   hasLiveProcesses(): boolean { return this.views.some((view) => view.hasLiveProcess); }
 
   async rename(): Promise<never> { throw new Error("rename is not exercised by these tests"); }

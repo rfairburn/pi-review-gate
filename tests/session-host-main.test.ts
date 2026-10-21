@@ -30,6 +30,18 @@ import { deleteSavedSessionFile, type SavedSessionDeletionOptions } from "../src
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import type { NativeClipboardEvent } from "../src/session-host/native-clipboard";
 import { __test, type SessionHostOptions } from "../src/session-host/main";
+import {
+  createLocalOwningHostService,
+  type OwningHostService,
+  type OwningHostServiceDependencies,
+} from "../src/session-host/owning-host-service";
+import { FakeViewerSeam } from "./session-host-viewer-fakes";
+import type {
+  SessionGeometry,
+  SessionViewerState,
+  SessionViewerUpdate,
+  SessionViewerUpdateResult,
+} from "../src/session-host/instances";
 import { sidebarNoticeRows } from "./helpers/session-host-notice-witness";
 
 const ESC = "\x1b";
@@ -223,12 +235,34 @@ class FakeWriter {
   ): void {
     if (this.closed) this.submitsAfterClose += 1;
     this.frames.push({ frame, cols, rows });
+    if (this.holdWrites) {
+      this.heldSubmits += 1;
+      this.pendingSettle = onSettled; // the superseded candidate is dropped, unsettled
+      return;
+    }
     onSettled?.("written");
   }
 
   invalidate(): void {
     this.order.push("writer.invalidate");
     this.invalidateCalls += 1;
+  }
+
+  /**
+   * Block the sink (#474 backpressure tests). Like the real writer, only the
+   * newest candidate is retained; a superseded candidate never settles, and no
+   * submitted frame is reported as written until the sink drains.
+   */
+  holdWrites = false;
+  heldSubmits = 0;
+  private pendingSettle: ((disposition: SessionHostFrameDisposition) => void) | undefined;
+
+  /** Drain the blocked sink: the newest retained candidate is written. */
+  drainHeldWrites(): void {
+    const settle = this.pendingSettle;
+    this.pendingSettle = undefined;
+    this.holdWrites = false;
+    settle?.("written");
   }
 
   async close(): Promise<boolean> {
@@ -263,6 +297,11 @@ class FakeSurface {
     this.writesAsFrame = [text];
   }
 
+  resize(cols: number, rows: number): void {
+    this.cols = cols;
+    this.rows = rows;
+  }
+
   frame(): TerminalFrame {
     this.frameCalls += 1;
     const lines = Array.from({ length: this.rows }, (_, index) => index === 0 ? this.writesAsFrame.join("") : "");
@@ -293,6 +332,28 @@ class FakeManager {
   readonly closeExitedCalls: string[] = [];
   readonly refusedCloseIds = new Set<string>();
   readonly resizeCalls: { cols: number; rows: number; ids: string[] }[] = [];
+  // --- #474 per-session viewer seam: viewer facts and per-row geometry only. ---
+  // The geometry this fake reports is its own record of what the host asked each
+  // row to be, so it stays correct when a test swaps in a real terminal surface.
+  readonly geometry = new Map<string, { cols: number; rows: number }>();
+  readonly viewers = new FakeViewerSeam({
+    isViewable: (id) => {
+      const view = this.views.find((candidate) => candidate.id === id);
+      return view !== undefined && view.hasLiveProcess && (view.lifecycle === "alive" || view.lifecycle === "starting");
+    },
+    // The row's own canonical record: seeded when the row is created and updated
+    // only when the host asks for a size, exactly like the manager's own fact. It
+    // deliberately does not read the terminal surface, so a test that swaps in a
+    // real surface cannot lose or invent the row's authoritative size.
+    read: (id) => this.geometry.get(id),
+    apply: (id, cols, rows) => {
+      this.geometry.set(id, { cols, rows });
+      const surface = this.surfaces.get(id);
+      if (surface === undefined) return;
+      surface.resize(cols, rows);
+      this.resizeCalls.push({ cols, rows, ids: [id] });
+    },
+  });
   readonly createOptions: CreateInstanceOptions[] = [];
   /** Known-owned live session data served to deliberate saved-conversation admission. */
   ownedLiveSessionsData: { id?: string; file?: string }[] = [];
@@ -334,6 +395,7 @@ class FakeManager {
     if (!view || view.lifecycle !== "exited" || view.hasLiveProcess !== false) return false;
     this.views.splice(index, 1);
     this.surfaces.delete(id);
+    this.geometry.delete(id);
     this.onChange?.(id);
     return true;
   }
@@ -345,8 +407,11 @@ class FakeManager {
     const id = `native-${this.nextId++}`;
     const error = this.nextError;
     this.nextError = false;
-    const surface = new FakeSurface(this.options.cols ?? 80, this.options.rows ?? 24, `frame:${id}`);
+    const initial = this.initialGeometry
+      ?? { cols: this.options.cols ?? 80, rows: this.options.rows ?? 24 };
+    const surface = new FakeSurface(initial.cols, initial.rows, `frame:${id}`);
     this.surfaces.set(id, surface);
+    this.geometry.set(id, { cols: initial.cols, rows: initial.rows });
     this.views.push({
       id,
       label: "(session starting)",
@@ -430,8 +495,48 @@ class FakeManager {
       liveIds.push(view.id);
       const surface = this.surfaces.get(view.id);
       if (surface) { surface.cols = cols; surface.rows = rows; }
+      // A host-wide resize of a live row moves that row's own canonical record too,
+      // exactly like the manager's addressed resize (#474).
+      this.geometry.set(view.id, { cols, rows });
+      this.viewers.record(view.id, cols, rows);
     }
     this.resizeCalls.push({ cols, rows, ids: liveIds });
+  }
+
+  openViewer(): SessionViewerState {
+    return this.viewers.openViewer();
+  }
+
+  viewerState(viewerId: string): SessionViewerState | undefined {
+    return this.viewers.viewerState(viewerId);
+  }
+
+  sessionViewers(sessionId: string): SessionViewerState[] {
+    return this.viewers.sessionViewers(sessionId);
+  }
+
+  updateViewer(viewerId: string, update: SessionViewerUpdate): SessionViewerUpdateResult {
+    return this.viewers.updateViewer(viewerId, update);
+  }
+
+  closeViewer(viewerId: string): boolean {
+    return this.viewers.closeViewer(viewerId);
+  }
+
+  instanceGeometry(id: string): SessionGeometry | undefined {
+    if (this.geometryReadThrows) throw new Error("synthetic canonical geometry read failure");
+    return this.viewers.instanceGeometry(id);
+  }
+
+  /** When true, the canonical-geometry read itself fails (the service reports none). */
+  geometryReadThrows = false;
+
+  /** The host's adopted initial-sizing rule (#474); rows created later start here. */
+  initialGeometry: { cols: number; rows: number } | undefined;
+
+  setInitialGeometry(cols: number, rows: number): void {
+    this.initialGeometry = { cols, rows };
+    this.viewers.setInitialGeometry(cols, rows);
   }
 
   hasLiveProcesses(): boolean { return this.views.some((view) => view.hasLiveProcess); }
@@ -1407,7 +1512,12 @@ test("pending Main input stays draw-free until focus or resize changes the host 
   await nextTurn();
   assert.equal(harness.writer.frames.length, beforeResizeFrames + 1, "the resize boundary submits one full redraw");
   assert.equal(manager.resizeCalls.length, beforeResizeCalls + 1, "the real resize still propagates changed native geometry");
-  assert.equal(harness.writer.invalidateCalls, beforeInvalidations + 1, "the resize still invalidates the writer baseline");
+  // Two baseline discards, one submitted redraw: the outer resize physically
+  // reflowed the screen, and the displayed session's own drawn content and
+  // canonical size moved (#474), so positional authority must cross a written
+  // boundary before the new geometry authorizes anything.
+  assert.equal(harness.writer.invalidateCalls, beforeInvalidations + 2,
+    "the resize and the per-session geometry change each discard the writer baseline");
   const resizedFrame = harness.writer.frames.at(-1);
   assert.deepEqual({ cols: resizedFrame?.cols, rows: resizedFrame?.rows }, { cols: 70, rows: 24 });
   assert.equal(await closeWithSignal(harness), 0);
@@ -2853,6 +2963,10 @@ test("visible roster mouse activates a clicked live owner; host gestures stay fe
   assert.equal(harness.sidebar?.focus, "main");
   assert.equal(harness.sidebar?.selectedId, "native-1", "the clicked A row becomes Main owner");
   assert.equal(manager.views[1]?.hasLiveProcess, true, "B remains live after A activation");
+  // The newly activated owner must be drawn before its cells carry positional
+  // authority (#474): the host renders and writes the owner's frame first, then
+  // native gestures in that pane are translated.
+  await nextTurn();
   const beforeNativeWhileHostHeld = manager.writes.length;
   emitMouse(harness.terminal, 33, 1, 1); // independent native middle-button press
   emitMouse(harness.terminal, 34, 2, 33); // its motion remains native while host-left is held
@@ -2881,6 +2995,8 @@ test("visible roster mouse activates a clicked live owner; host gestures stay fe
   assert.ok(surface);
   surface.modes = { ...surface.modes, mouseTracking: "any", mouseEncoding: "sgr" };
   manager.notify("native-mouse-mode");
+  // The newly activated owner is drawn before its cells carry positional authority (#474).
+  await nextTurn();
   const beforeNativeGesture = manager.writes.length;
   emitMouse(harness.terminal, 33, 1); // native press: local (0,0)
   emitMouse(harness.terminal, 34, 2, 32); // native drag motion: local (1,1)
@@ -3417,7 +3533,7 @@ test("held synchronized frames keep outer mouse capture stable while native pack
   }
 });
 
-test("responsive resize resizes every owned child only when native geometry changes; overlays keep geometry stable", async () => {
+test("responsive resize sizes the displayed session only when native geometry changes; overlays keep geometry stable", async () => {
   const harness = createHarness();
   const manager = await ready(harness);
   fillForm(harness.terminal, "first");
@@ -3429,12 +3545,20 @@ test("responsive resize resizes every owned child only when native geometry chan
   completeForm(harness.terminal, "/workspace-two");
   await nextTurn();
   assert.equal(manager.views.length, 2);
+  // native-2 is the displayed Main owner; native-1 is a background sibling with no viewer.
+  const hiddenGeometryBefore = manager.geometry.get("native-1");
+  const hiddenSurfaceBefore = { cols: manager.surfaces.get("native-1")?.cols, rows: manager.surfaces.get("native-1")?.rows };
 
   harness.terminal.setSize(60, 10); // wide: 32 + divider + 27 native, nine content rows
-  assert.deepEqual(manager.resizeCalls.at(-1), { cols: 27, rows: 9, ids: ["native-1", "native-2"] });
+  assert.deepEqual(manager.resizeCalls.at(-1), { cols: 27, rows: 9, ids: ["native-2"] },
+    "only the session the host actually displays is resized; each session is sized for its own viewers");
+  assert.deepEqual(manager.geometry.get("native-1"), hiddenGeometryBefore,
+    "a session nobody is displaying keeps its last canonical size");
+  assert.deepEqual({ cols: manager.surfaces.get("native-1")?.cols, rows: manager.surfaces.get("native-1")?.rows },
+    hiddenSurfaceBefore, "an unviewed sibling's terminal is untouched");
   const beforeNarrow = manager.resizeCalls.length;
   harness.terminal.setSize(52, 10); // overlay: full-width native viewport
-  assert.deepEqual(manager.resizeCalls.at(-1), { cols: 52, rows: 9, ids: ["native-1", "native-2"] });
+  assert.deepEqual(manager.resizeCalls.at(-1), { cols: 52, rows: 9, ids: ["native-2"] });
   const afterNarrow = manager.resizeCalls.length;
   assert.equal(afterNarrow, beforeNarrow + 1);
   harness.terminal.emitInput(ALT_LEFT); // focus Main then hide
@@ -3443,6 +3567,460 @@ test("responsive resize resizes every owned child only when native geometry chan
   await nextTurn();
   assert.ok(harness.writer.frames.some(({ cols, rows }) => cols === 52 && rows === 10));
   assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("a second surface displaying a background session sizes only that session", async () => {
+  const harness = createHarness();
+  const manager = await startTwoSessions(harness);
+  const displayedBefore = { cols: manager.surfaces.get("native-2")?.cols, rows: manager.surfaces.get("native-2")?.rows };
+  const displayedGeometryBefore = manager.geometry.get("native-2");
+  const writesBefore = manager.writes.length;
+
+  const viewer = manager.openViewer();
+  assert.equal(manager.updateViewer(viewer.viewerId, { sessionId: "native-1", cols: 40, rows: 12 }).applied, true);
+
+  const sized = manager.instanceGeometry("native-1");
+  assert.deepEqual({ cols: sized?.cols, rows: sized?.rows }, { cols: 40, rows: 12 },
+    "the addressed session takes the size of the surface that displays it");
+  assert.deepEqual({ cols: manager.surfaces.get("native-1")?.cols, rows: manager.surfaces.get("native-1")?.rows },
+    { cols: 40, rows: 12 });
+  assert.deepEqual(manager.geometry.get("native-2"), displayedGeometryBefore,
+    "the session the local surface displays keeps its own size");
+  assert.deepEqual({ cols: manager.surfaces.get("native-2")?.cols, rows: manager.surfaces.get("native-2")?.rows },
+    displayedBefore);
+
+  // Two surfaces on two sessions create no exclusive lease: each session stays
+  // writable through the one manager.
+  manager.write("native-2", "still addressed input");
+  assert.deepEqual(manager.writes.slice(writesBefore), [{ id: "native-2", data: "still addressed input" }]);
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("a missing or malformed canonical size fails positional input closed while keyboard input continues", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "geometry-fenced mouse");
+  await nextTurn();
+  const surface = manager.surface("native-1");
+  assert.ok(surface);
+  surface.modes = { ...surface.modes, mouseTracking: "any", mouseEncoding: "sgr" };
+  manager.notify("native-input-modes");
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "main");
+
+  const CLICK = "\x1b[<0;35;2M"; // inside the displayed native pane
+  const forwarded = manager.writes.length;
+  harness.terminal.emitInput(CLICK);
+  assert.deepEqual(manager.writes.slice(forwarded).map((entry) => entry.data), ["\x1b[<0;2;1M"],
+    "an authoritative canonical size translates the packet normally");
+
+  // The manager no longer has an authoritative size for the displayed row. Both
+  // the seam's own record and this fixture's row record are cleared, so the read
+  // has no fact left to return.
+  manager.geometry.delete("native-1");
+  manager.viewers.geometry.delete("native-1");
+  const afterValid = manager.writes.length;
+  harness.terminal.emitInput(CLICK);
+  assert.equal(manager.writes.length, afterValid,
+    "without an authoritative canonical size, a positional packet is dropped rather than authorized against the padded pane");
+  harness.terminal.emitInput("k");
+  assert.deepEqual(manager.writes.slice(afterValid).map((entry) => entry.data), ["k"],
+    "keyboard input makes no positional claim and keeps its ordinary path");
+
+  // A malformed canonical size is equally no authority.
+  manager.geometry.set("native-1", { cols: 0, rows: 0 });
+  manager.viewers.geometry.set("native-1", { cols: 0, rows: 0, revision: 1 });
+  const afterKeyboard = manager.writes.length;
+  harness.terminal.emitInput(CLICK);
+  assert.equal(manager.writes.length, afterKeyboard,
+    "a malformed canonical size cannot authorize padded or stale positional input");
+  harness.terminal.emitInput("k");
+  assert.deepEqual(manager.writes.slice(afterKeyboard).map((entry) => entry.data), ["k"]);
+
+  // An unavailable canonical-geometry read is no authority either: the service
+  // reports no geometry, and a failed read never widens what may reach the child.
+  manager.geometryReadThrows = true;
+  const afterMalformed = manager.writes.length;
+  harness.terminal.emitInput(CLICK);
+  assert.equal(manager.writes.length, afterMalformed,
+    "a failed canonical-geometry read drops positional input instead of guessing a viewport");
+  harness.terminal.emitInput("k");
+  assert.deepEqual(manager.writes.slice(afterMalformed).map((entry) => entry.data), ["k"]);
+  manager.geometryReadThrows = false;
+
+  // A valid size restores ordinary translation for the same packet — once a frame
+  // has actually been drawn from it (#474 binds positional authority to the drawn
+  // snapshot, so a size nobody has drawn yet authorizes nothing).
+  manager.geometry.set("native-1", { cols: surface.cols, rows: surface.rows });
+  manager.viewers.geometry.set("native-1", { cols: surface.cols, rows: surface.rows, revision: 2 });
+  manager.notify("native-1");
+  await nextTurn();
+  const afterUnavailable = manager.writes.length;
+  harness.terminal.emitInput(CLICK);
+  assert.deepEqual(manager.writes.slice(afterUnavailable).map((entry) => entry.data), ["\x1b[<0;2;1M"],
+    "the written frame drawn from the restored size re-authorizes the same packet");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("a queued per-session resize authorizes neither newly exposed padding nor the not-yet-drawn size", async () => {
+  const INSIDE = "\x1b[<0;35;2M"; // one cell inside the drawn content
+  const PAD = "\x1b[<0;70;2M";    // inside the pane, outside a 30-column session
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "backpressure geometry owner");
+  await nextTurn();
+  const surface = manager.surface("native-1");
+  assert.ok(surface);
+  surface.modes = { ...surface.modes, mouseTracking: "any", mouseEncoding: "sgr" };
+  manager.notify("native-input-modes");
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "main");
+
+  const first = manager.writes.length;
+  harness.terminal.emitInput(INSIDE);
+  harness.terminal.emitInput(PAD);
+  const [INSIDE_FORWARDED, PAD_FORWARDED] = manager.writes.slice(first).map((entry) => entry.data);
+  assert.equal(INSIDE_FORWARDED, "\x1b[<0;2;1M");
+  assert.ok(PAD_FORWARDED !== undefined && PAD_FORWARDED !== INSIDE_FORWARDED,
+    "a full-pane session owns every native cell it drew");
+
+  // A second surface displays the same session in a smaller pane, and the local
+  // replacement frame is queued behind a blocked sink: nothing new is on screen.
+  harness.writer.holdWrites = true;
+  const other = manager.viewers.openViewer();
+  manager.viewers.updateViewer(other.viewerId, { sessionId: "native-1", cols: 30, rows: 20 });
+  manager.notify("native-1");
+  await nextTurn();
+  assert.ok(harness.writer.heldSubmits > 0, "the replacement frame is queued, not written");
+  assert.deepEqual({ cols: surface.cols, rows: surface.rows }, { cols: 30, rows: 20 },
+    "the addressed row shrank to the independent minimum");
+
+  const queued = manager.writes.length;
+  harness.terminal.emitInput(INSIDE);
+  harness.terminal.emitInput(PAD);
+  assert.equal(manager.writes.length, queued,
+    "an undrawn replacement frame authorizes neither its new size nor the padding it exposes");
+  harness.terminal.emitInput("k");
+  assert.deepEqual(manager.writes.slice(queued).map((entry) => entry.data), ["k"],
+    "keyboard input is unaffected by a queued geometry change");
+
+  harness.writer.drainHeldWrites();
+  const drained = manager.writes.length;
+  harness.terminal.emitInput(INSIDE);
+  assert.deepEqual(manager.writes.slice(drained).map((entry) => entry.data), [INSIDE_FORWARDED],
+    "the written padded frame keeps translating cells it actually drew");
+  const afterInside = manager.writes.length;
+  harness.terminal.emitInput(PAD);
+  assert.equal(manager.writes.length, afterInside,
+    "a padded pane cell stays host-owned once the smaller session is actually drawn");
+
+  // Growing back: the last other viewer leaves and the session returns to the
+  // local pane. Again nothing is authorized until that frame is written.
+  harness.writer.holdWrites = true;
+  assert.equal(manager.viewers.closeViewer(other.viewerId), true);
+  manager.notify("native-1");
+  await nextTurn();
+  const growing = manager.writes.length;
+  harness.terminal.emitInput(PAD);
+  assert.equal(manager.writes.length, growing,
+    "padding exposed only by a queued grow cannot reach the child");
+  harness.writer.drainHeldWrites();
+  const grown = manager.writes.length;
+  harness.terminal.emitInput(PAD);
+  assert.deepEqual(manager.writes.slice(grown).map((entry) => entry.data), [PAD_FORWARDED],
+    "the written grown frame owns the cells it now draws");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("a row activated by creation follows the native pane without a deliberate selection", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "created row sizing");
+  await nextTurn();
+  const surface = manager.surface("native-1");
+  assert.ok(surface);
+  const created = { cols: surface.cols, rows: surface.rows };
+  assert.deepEqual(manager.geometry.get("native-1"), created,
+    "the displayed row carries the size this host's own surface displays");
+
+  harness.terminal.setSize(70, 24);
+  await nextTurn();
+  const resized = manager.geometry.get("native-1");
+  assert.ok(resized !== undefined && resized.cols < created.cols,
+    `a real pane change re-registers the displayed row (${JSON.stringify(resized)} vs ${JSON.stringify(created)})`);
+  assert.deepEqual({ cols: surface.cols, rows: surface.rows }, resized,
+    "only that row's own surface moved with it");
+  assert.equal(manager.views.length, 1, "nothing else was created or removed");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("a narrow overlay-capable layout keeps Main mouse input and waits to uncover Main", async () => {
+  const CLICK = "\x1b[<0;6;3M"; // inside the full-width native pane
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "narrow overlay mouse owner");
+  await nextTurn();
+  const surface = manager.surface("native-1");
+  assert.ok(surface);
+  surface.modes = { ...surface.modes, mouseTracking: "any", mouseEncoding: "sgr" };
+  manager.notify("native-input-modes");
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "main");
+
+  // Narrow terminal: the sidebar becomes an overlay *capability*, but with Main
+  // focused nothing is drawn over the native pane, so Main owns it.
+  harness.terminal.setSize(52, 24);
+  await nextTurn();
+  assert.equal(harness.sidebar?.visible, true);
+  assert.equal(harness.sidebar?.focus, "main");
+  const narrow = manager.writes.length;
+  harness.terminal.emitInput(CLICK);
+  assert.equal(manager.writes.length, narrow + 1,
+    "an overlay-capable layout with Main focused still forwards native mouse input");
+  assert.match(String(manager.writes[narrow]?.data ?? ""), /^\x1b\[<0;\d+;\d+M$/, "the packet is translated, not dropped");
+
+  // Focus the drawn overlay, then uncover Main behind a blocked writer: the
+  // uncovered frame must be written before its cells authorize anything.
+  harness.terminal.emitInput(ALT_LEFT); // Main -> roster focus; the overlay is actually drawn
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  harness.writer.holdWrites = true;
+  harness.terminal.emitInput(ENTER); // display the same row again: the overlay uncovers Main
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.ok(harness.writer.heldSubmits > 0, "the uncovered frame is queued, not written");
+  const refused = manager.writes.length;
+  harness.terminal.emitInput(CLICK);
+  assert.equal(manager.writes.length, refused,
+    "a still-covered written frame cannot authorize input for a frame nobody has drawn");
+  harness.terminal.emitInput("k");
+  assert.deepEqual(manager.writes.slice(refused).map((entry) => entry.data), ["k"],
+    "keyboard input keeps its ordinary path");
+
+  harness.writer.drainHeldWrites();
+  const written = manager.writes.length;
+  harness.terminal.emitInput(CLICK);
+  assert.equal(manager.writes.length, written + 1,
+    "the written uncovered frame re-authorizes the content it draws");
+  assert.match(String(manager.writes[written]?.data ?? ""), /^\x1b\[<0;\d+;\d+M$/);
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("a narrow overlay-capable layout copies only when Main is actually uncovered", async () => {
+  const harness = createHarness({ env: { PATH: process.env.PATH, HOME: "/synthetic-home", TERM: "xterm-ghostty" } });
+  const event: NativeClipboardEvent = {
+    kind: "copy",
+    encoded: Buffer.from("narrow overlay copy").toString("base64"),
+    sessionId: "conversation-native-1",
+    sessionEpoch: 1,
+  };
+  const expected = `\x1b]52;c;${event.encoded}\x07`;
+  try {
+    const manager = await ready(harness);
+    fillForm(harness.terminal, "narrow overlay clipboard owner");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "main");
+    const copies = (): string[] => harness.terminal.writes.filter((write) => write.startsWith("\x1b]52;"));
+
+    // Narrow terminal: `sidebarOverlay` is only a *capability*. With Main focused
+    // the host draws no sidebar rectangle, so the visible owner's verified copy is
+    // authorized by what is actually on screen, exactly like native mouse input.
+    harness.terminal.setSize(52, 24);
+    await nextTurn();
+    assert.equal(harness.sidebar?.visible, true);
+    assert.equal(harness.sidebar?.focus, "main");
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("frame:native-1"),
+      "the narrow Main-focused layout actually draws the owner's content across the pane");
+    manager.options.onNativeClipboard?.("native-1", event);
+    assert.deepEqual(copies(), [expected],
+      "an overlay-capable layout with Main actually uncovered forwards the verified copy");
+    await nextTurn();
+    assert.doesNotMatch(plain(harness.writer.frames.at(-1)?.frame), HOST_CLIPBOARD_STATUS,
+      "a successful narrow copy renders no host clipboard status");
+    assert.equal(harness.sidebar?.terminalDiagnosticsWarning, undefined,
+      "a successful narrow copy records no diagnostic");
+
+    // The existing authentication fences stay in force in the narrow layout.
+    manager.options.onNativeClipboard?.("native-1", { ...event, sessionEpoch: 2 });
+    manager.options.onNativeClipboard?.("native-1", { ...event, sessionId: "conversation-native-2" });
+    await nextTurn();
+    assert.equal(copies().length, 1, "a stale epoch and a changed session tuple cannot copy in a narrow layout");
+
+    // Now the overlay is actually drawn over Main: the same row owns Main but its
+    // content is covered, so neither the copy nor its unavailable report is forwarded.
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "sidebar");
+    const covered = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(!covered.includes("frame:native-1"), "the drawn sidebar overlay really covers the native pane");
+    assert.ok(covered.includes("New session"), "the roster overlay is the content on screen");
+    manager.options.onNativeClipboard?.("native-1", event);
+    manager.options.onNativeClipboard?.("native-1", { kind: "unavailable", reason: "unsupported-runtime", sessionId: event.sessionId, sessionEpoch: 1 });
+    await nextTurn();
+    assert.equal(copies().length, 1, "an actually drawn sidebar covering Main cannot authorize a copy");
+    assert.equal(harness.sidebar?.terminalDiagnosticsWarning, undefined,
+      "a covered copy is an ordinary quiet refusal");
+
+    // Returning to Main behind a blocked writer queues the uncovering frame. Until
+    // that frame is written, the displayed content is still the covered overlay.
+    harness.writer.holdWrites = true;
+    harness.terminal.emitInput(ENTER); // display the same row again: the overlay uncovers Main
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "main");
+    assert.ok(harness.writer.heldSubmits > 0, "the uncovered frame is queued, not written");
+    manager.options.onNativeClipboard?.("native-1", event);
+    await nextTurn();
+    assert.equal(copies().length, 1,
+      "a queued, undrawn uncovering frame cannot authorize a copy of content nobody has drawn");
+
+    // Once the matching uncovered frame is actually written, the same verified copy works.
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("frame:native-1"),
+      "the written frame uncovers the owner's content again");
+    manager.options.onNativeClipboard?.("native-1", event);
+    assert.deepEqual(copies(), [expected, expected],
+      "the written uncovered frame authorizes the verified copy again");
+  } finally {
+    await closeWithSignal(harness);
+  }
+});
+
+test("a fully drawn padded session keeps copying, click-to-focus, and its image owner while padding stays host-owned", async () => {
+  const INSIDE = "\x1b[<0;35;2M";
+  const INSIDE_RELEASE = "\x1b[<0;35;2m";
+  const PAD = "\x1b[<0;70;2M";
+  const PAD_RELEASE = "\x1b[<0;70;2m";
+  const harness = createHarness({ env: { PATH: process.env.PATH, HOME: "/synthetic-home", TERM: "xterm-ghostty" } });
+  try {
+    const manager = await ready(harness);
+    fillForm(harness.terminal, "padded session owner");
+    await nextTurn();
+    const surface = manager.surface("native-1");
+    assert.ok(surface);
+    surface.writesAsFrame.splice(0, surface.writesAsFrame.length, "padded child content");
+    surface.graphics = {
+      images: [],
+      placements: [],
+      fallbacks: [{
+        id: "padded-image",
+        mimeType: "image/png",
+        widthPx: 320,
+        heightPx: 160,
+        column: 2,
+        row: 1,
+        columns: 4,
+        rows: 2,
+        clip: { leftColumns: 0, topRows: 0, rightColumns: 0, bottomRows: 0 },
+      }],
+    };
+    // Another surface with a smaller pane makes this session smaller than the
+    // local pane: its frame is drawn at the pane's top-left corner and padded.
+    const other = manager.viewers.openViewer();
+    manager.viewers.updateViewer(other.viewerId, { sessionId: "native-1", cols: 30, rows: 20 });
+    manager.notify("native-1");
+    await nextTurn();
+    assert.deepEqual({ cols: surface.cols, rows: surface.rows }, { cols: 30, rows: 20 });
+
+    const frame = harness.writer.frames.at(-1)?.frame;
+    assert.ok(frame, "the padded session still renders a host frame");
+    assert.ok(plain(frame).includes("padded child content"), "the drawn content stays visible");
+    assert.ok(frame.graphics, "a padded session keeps its image owner instead of losing graphics");
+    assert.deepEqual({ cols: frame.graphics.pane.cols, rows: frame.graphics.pane.rows }, { cols: 30, rows: 20 },
+      "the image layer is bounded by the drawn content, not by the padded pane");
+    // The layer pane starts on the native pane's first output row; the padded
+    // rows below the 20-row content are host space, not child content.
+    const belowContent = frame.graphics.pane.row + 20;
+    if (belowContent < frame.lines.length) {
+      // Slice from the native pane's own column so the roster divider is not
+      // mistaken for child content.
+      const paddedRow = plainLine(frame, belowContent).slice(frame.graphics.pane.column);
+      assert.equal(paddedRow.trim(), "",
+        "the first padded row below the drawn content stays blank host space");
+    }
+
+    // A copy is a claim about content the user saw: the padded owner still copies.
+    const copies = (): string[] => harness.terminal.writes.filter((write) => write.startsWith("\x1b]52;"));
+    const event: NativeClipboardEvent = {
+      kind: "copy",
+      encoded: Buffer.from("padded copy").toString("base64"),
+      sessionId: "conversation-native-1",
+      sessionEpoch: 1,
+    };
+    manager.options.onNativeClipboard?.("native-1", event);
+    assert.deepEqual(copies(), [`\x1b]52;c;${event.encoded}\x07`],
+      "a fully drawn padded owner still submits its native copy");
+
+    // Click-to-focus follows the drawn content, and stops at it.
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "sidebar");
+    const packets = manager.writes.length;
+    harness.terminal.emitInput(PAD);
+    harness.terminal.emitInput(PAD_RELEASE);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "sidebar", "a padded cell is not a focus gesture");
+    assert.equal(manager.writes.length, packets, "a padded cell never reaches the child");
+    harness.terminal.emitInput(INSIDE);
+    harness.terminal.emitInput(INSIDE_RELEASE);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "main",
+      "a click on drawn content still focuses Main even when the session is padded");
+    assert.equal(manager.writes.length, packets, "the host-owned focus gesture stays out of the child");
+  } finally {
+    await closeWithSignal(harness);
+  }
+});
+
+test("n displays no session without stopping, creating, or feeding anything", async () => {
+  const harness = createHarness();
+  const manager = await startTwoSessions(harness);
+  const sidebar = harness.sidebar;
+  assert.ok(sidebar);
+  assert.equal(sidebar.focus, "sidebar");
+  assert.equal(sidebar.activeMainOwnerID, "native-2");
+  const selectedBefore = sidebar.selectedId;
+  const createsBefore = manager.createOptions.length;
+  const shutdownsBefore = manager.shutdownCalls;
+  const writesBefore = manager.writes.length;
+
+  harness.terminal.emitInput("n");
+  await nextTurn();
+
+  assert.equal(sidebar.activeMainOwnerID, undefined, "no session is the displayed Main owner any more");
+  assert.equal(sidebar.selectedId, selectedBefore, "the roster keeps its rows, order, and highlight");
+  assert.equal(sidebar.visible, true, "the roster stays open");
+  const detached = plain(harness.writer.frames.at(-1)?.frame);
+  assert.ok(detached.includes("No session is displayed"), detached);
+  assert.equal(manager.shutdownCalls, shutdownsBefore, "detaching the local view never stops or quits a child");
+  assert.equal(manager.createOptions.length, createsBefore, "detaching starts nothing");
+  assert.deepEqual(manager.views.map((view) => view.hasLiveProcess), [true, true], "both children keep running");
+  assert.equal(manager.writes.length, writesBefore, "nothing is fed to a child while nothing is displayed");
+
+  // An inert keystroke while detached still reaches no child.
+  harness.terminal.emitInput(" ");
+  await nextTurn();
+  assert.equal(manager.writes.length, writesBefore);
+
+  // A second press says so truthfully and changes nothing else.
+  harness.terminal.emitInput("n");
+  await nextTurn();
+  const again = plain(harness.writer.frames.at(-1)?.frame);
+  assert.ok(again.includes("No session is displayed") && again.includes("already"), again);
+  assert.equal(manager.shutdownCalls, shutdownsBefore);
+  assert.equal(manager.createOptions.length, createsBefore);
+
+  // Enter on the highlighted row displays that session again, with no restart.
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+  assert.equal(sidebar.activeMainOwnerID, selectedBefore, "the same session is displayed again");
+  assert.equal(manager.createOptions.length, createsBefore, "re-displaying a running session never restarts it");
+  harness.terminal.emitInput("back to the child");
+  assert.deepEqual(manager.writes.slice(writesBefore), [{ id: selectedBefore ?? "native-2", data: "back to the child" }]);
+
+  // Quit still shuts every owned child down.
+  assert.equal(await closeWithSignal(harness), 0);
+  assert.equal(manager.shutdownCalls, shutdownsBefore + 1);
 });
 
 test("an actual outer resize notification invalidates the writer baseline even when final geometry is unchanged", async () => {
@@ -4935,4 +5513,120 @@ test("#428 a rejected final log sync makes host shutdown report cleanup failure 
   assert.ok(harness.reports.every((report) => !report.includes(owned.agentDir) && !report.includes("EIO")));
   assert.ok(readFileSync(diagnosticsLogPath(owned.agentDir), "utf8").includes("\"kind\":\"host-run-end\""),
     "accepted records were written before the sync failure");
+});
+
+/**
+ * Wrap the real owning-host service so a wiring test can see exactly which
+ * operations the production host performs through it. Nothing is substituted:
+ * the same local service the host constructs is the one being observed.
+ */
+function recordOwningHostService(
+  calls: string[],
+  opened: unknown[],
+  spawns: { parent: string; request: unknown }[],
+): (dependencies: OwningHostServiceDependencies) => OwningHostService {
+  return (dependencies) => {
+    const service = createLocalOwningHostService(dependencies);
+    return new Proxy(service, {
+      get(target, property) {
+        const value = Reflect.get(target, property);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          calls.push(String(property));
+          if (property === "spawnRequestedChild") spawns.push({ parent: String(args[0]), request: args[1] });
+          const result = (value as (...a: unknown[]) => unknown).apply(target, args);
+          if (property === "openManager") opened.push(result);
+          return result;
+        };
+      },
+    });
+  };
+}
+
+test("the host runs every session operation through one local owning-host service", async () => {
+  const calls: string[] = [];
+  const opened: unknown[] = [];
+  const spawns: { parent: string; request: unknown }[] = [];
+  let constructions = 0;
+  const harness = createHarness({}, {
+    createOwningHostService: (dependencies) => {
+      constructions += 1;
+      return recordOwningHostService(calls, opened, spawns)(dependencies);
+    },
+  });
+  const manager = await startTwoSessions(harness);
+
+  assert.equal(constructions, 1, "one host run owns exactly one session operation boundary");
+  assert.equal(calls.filter((name) => name === "openManager").length, 1,
+    "the host opens exactly one authoritative manager, through the service");
+  assert.equal(opened[0], manager, "the manager the service opened is the manager the host uses");
+  assert.equal(calls.filter((name) => name === "startSession").length, 2,
+    "both deliberate New sessions went through the service start path");
+  assert.equal(calls.includes("spawnRequestedChild"), false,
+    "no background child is admitted before one is requested");
+
+  const sidebar = harness.sidebar;
+  assert.ok(sidebar);
+  const before = {
+    selectedId: sidebar.selectedId,
+    focus: sidebar.focus,
+    activeMainOwnerID: sidebar.activeMainOwnerID,
+    visible: sidebar.visible,
+  };
+  const spawn = manager.options.onSpawnRequest;
+  assert.equal(typeof spawn, "function");
+  const request = {
+    workspace: "/requested/existing/workspace",
+    title: "Exact sibling title",
+    prompt: "@/literal\n--session is prompt content\n",
+  };
+  assert.equal(await spawn!("native-2", request), "started");
+  assert.deepEqual(spawns, [{ parent: "native-2", request }],
+    "the broker-authenticated request is admitted by the owning-host service, with the parent id the manager supplied");
+  assert.deepEqual(manager.createOptions.at(-1), {
+    workspace: request.workspace,
+    initialRequest: { title: request.title, prompt: request.prompt },
+  }, "the exact workspace/title/prompt still reach the one manager unchanged");
+  assert.equal(manager.views.length, 3, "the background child is an independent new row");
+  assert.deepEqual({
+    selectedId: sidebar.selectedId,
+    focus: sidebar.focus,
+    activeMainOwnerID: sidebar.activeMainOwnerID,
+    visible: sidebar.visible,
+  }, before, "the service-owned background path changes no presentation or Main ownership state");
+
+  assert.equal(await closeWithSignal(harness), 0);
+  assert.ok(calls.includes("observeOwnedChildSettlement"),
+    "teardown takes its owned-child settlement evidence from the same service");
+});
+
+test("a background child that finishes launching while the host quits is unknown, not a failure", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "/first/workspace");
+  await nextTurn();
+
+  let releaseCreate!: () => void;
+  let enterCreate!: () => void;
+  const createEntered = new Promise<void>((resolve) => { enterCreate = resolve; });
+  manager.createGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
+  manager.createGateEntered = enterCreate;
+
+  const spawn = manager.options.onSpawnRequest;
+  assert.equal(typeof spawn, "function");
+  const pending = spawn!("native-1", {
+    workspace: "/requested/existing/workspace",
+    title: "Pending sibling title",
+    prompt: "pending sibling prompt",
+  });
+  await createEntered;
+  assert.equal(manager.views.length, 2);
+
+  harness.signals.emit("SIGTERM");
+  releaseCreate();
+  assert.equal(await pending, "unknown",
+    "a child that finished launching during teardown may exist; the host never claims a definite result");
+  assert.equal(await harness.result, 0, "the uncertain child still settles inside the owned teardown");
+  assert.equal(harness.sidebar?.activeMainOwnerID, "native-1",
+    "the quitting host never moved Main ownership to the background child");
 });

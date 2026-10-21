@@ -928,18 +928,24 @@ export class PosixLauncherPtyDriver {
     });
   }
 
+  // The three journal waits below read durable append-only JSONL files whose only
+  // live trigger is an fs.watch notification. A missed or coalesced watcher
+  // event must not strand an already-durable record, so they re-evaluate the
+  // same predicate on a bounded periodic cadence plus once at the original
+  // absolute deadline instead of relying on notification alone. The deadline,
+  // cancellation, and predicate-exception semantics are unchanged.
   async waitForNative(predicate: (records: NativeJournalRecord[]) => boolean, stage: string, timeoutMs = POSIX_LAUNCHER_EVENT_TIMEOUT_MS): Promise<NativeJournalRecord[]> {
-    await this.journalSignal.waitFor(() => predicate(this.records()), timeoutMs, stage, this.deadline.signal);
+    await this.journalSignal.waitForRecheck(() => predicate(this.records()), timeoutMs, stage, this.deadline.signal);
     return this.records();
   }
 
   async waitForPty(predicate: (records: PtyJournalRecord[]) => boolean, stage: string, timeoutMs = POSIX_LAUNCHER_EVENT_TIMEOUT_MS): Promise<PtyJournalRecord[]> {
-    await this.journalSignal.waitFor(() => predicate(this.ptyRecords()), timeoutMs, stage, this.deadline.signal);
+    await this.journalSignal.waitForRecheck(() => predicate(this.ptyRecords()), timeoutMs, stage, this.deadline.signal);
     return this.ptyRecords();
   }
 
   async waitForProvider(predicate: (records: Record<string, unknown>[]) => boolean, stage: string, timeoutMs = POSIX_LAUNCHER_EVENT_TIMEOUT_MS): Promise<Record<string, unknown>[]> {
-    await this.journalSignal.waitFor(() => predicate(this.providerRecords()), timeoutMs, stage, this.deadline.signal);
+    await this.journalSignal.waitForRecheck(() => predicate(this.providerRecords()), timeoutMs, stage, this.deadline.signal);
     return this.providerRecords();
   }
 

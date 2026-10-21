@@ -26,9 +26,19 @@ import {
   type ShutdownResult,
   type StatusRegistrar,
 } from "./instances";
+import type { SessionGeometry } from "./instances";
 import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment, supportsSessionHostKittyGraphics } from "./launch";
 import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
-import { isValidNativeSessionId, type SessionSpawnInput, type SessionSpawnOutcome } from "./protocol";
+import { isValidNativeSessionId } from "./protocol";
+import {
+  createLocalOwningHostService,
+  isDuplicateOwnedLaunchFailure,
+  savedDeletionOwnedSessions,
+  validateOwnedSavedSessionDeletion,
+  type OwningHostManager,
+  type OwningHostService,
+  type OwningHostServiceDependencies,
+} from "./owning-host-service";
 import {
   assertHostShortcutsDistinct,
   DEFAULT_HOST_SHORTCUTS,
@@ -52,18 +62,13 @@ import {
   type RosterEntry,
   type StoredRoster,
 } from "./roster-store";
-import type { NativePersistenceReceipt } from "./native-persistence";
 import {
-  admitSavedSession,
   isSavedSessionCatalog,
   listSavedSessions,
   searchSavedSessions,
-  type SavedSessionAdmissionResult,
   type SavedSessionCatalog,
   type SavedSessionDeletionRefusalReason,
   type SavedSessionRefusalReason,
-  type SavedSessionRow,
-  validateSavedSessionDeletion,
 } from "./saved-sessions";
 import { deleteSavedSessionFile, type SavedSessionDeletionResult } from "./saved-deletion";
 import {
@@ -97,6 +102,8 @@ const SAVED_UNAVAILABLE = "Saved conversations are unavailable in this host";
 const REMOVE_REFUSED_MESSAGE = "Session not removed; it may be live, unconfirmed, or no longer available.";
 const REMOVE_FAILURE_MESSAGE = "Session was not removed; its state could not be confirmed.";
 const ROSTER_UNAVAILABLE_MESSAGE = "That remembered conversation is unavailable; remove it or open a saved conversation";
+const LOCAL_VIEW_DETACHED_MESSAGE = "No session is displayed. Every session keeps running; press enter on a row to display it.";
+const NO_LOCAL_VIEW_MESSAGE = "No session is displayed already; press enter on a row to display it";
 const ROSTER_SAVE_FAILURE_MESSAGE = "The session roster could not be saved; these rows will not be restored after a restart";
 const ROSTER_OVERFLOW_MESSAGE = "The session roster is larger than this host can save; the saved roster was left unchanged";
 const ROSTER_OWNERSHIP_MESSAGE = "Session host ownership was not confirmed released; a later host will refuse to start until it is resolved.";
@@ -122,18 +129,30 @@ export interface SessionHostOptions {
 type MainTerminal = Pick<ProcessTerminal,
   "start" | "stop" | "drainInput" | "write" | "columns" | "rows" | "kittyProtocolActive" | "modifyOtherKeysActive"
 >;
-type MainManager = Pick<InstanceManager,
-  "list" | "surface" | "write" | "resize" | "hasLiveProcesses" | "create" | "rename" | "closeExited" | "shutdown" | "dispose" | "ownedLiveSessions"
-> & Partial<Pick<InstanceManager, "stop" | "closeError">>;
 type MainObserver = Pick<KeyboardCapabilityObserver, "flags" | "wait" | "dispose" | "feed">;
 type MainWriter = Pick<SessionHostFrameWriter, "start" | "submit" | "close">
   & Partial<Pick<SessionHostFrameWriter, "invalidate">>;
+/** The canonical session size and revision a native frame was drawn from (#474). */
+interface CanonicalSessionGeometry {
+  readonly cols: number;
+  readonly rows: number;
+  readonly revision: number;
+}
+
 interface MouseFramePresentation {
   readonly layout: HostLayout;
   readonly focus: SidebarController["focus"];
   readonly sidebar: SidebarMousePresentation;
   /** Current active owner only when its complete native frame matched this layout. */
   readonly nativeOwnerId: string | undefined;
+  /**
+   * The rectangle the owner's frame actually filled inside the native pane (#474).
+   * A session smaller than this pane is drawn at the pane's top-left corner and
+   * padded, so positional authority ends where this rectangle ends.
+   */
+  readonly nativeContent: HostPaneRect | undefined;
+  /** Canonical size/revision the drawn content came from, when the manager reported one. */
+  readonly nativeGeometry: CanonicalSessionGeometry | undefined;
 }
 
 interface SavedDeleteConfirmationFrame {
@@ -154,6 +173,18 @@ function sameMouseAuthorization(a: MouseFramePresentation, b: MouseFramePresenta
   if (a.layout.sidebarOverlay !== b.layout.sidebarOverlay
     || pane(a.layout.sidebar)?.join(",") !== pane(b.layout.sidebar)?.join(",")
     || pane(a.layout.form)?.join(",") !== pane(b.layout.form)?.join(",")) return false;
+  // The drawn content rectangle and the canonical size it was drawn from are part
+  // of positional authority (#474). A session that grew or shrank behind a queued
+  // replacement frame crosses the writer's written boundary before newly exposed
+  // padding, or a new size, authorizes anything at all.
+  const rect = (value: HostPaneRect | undefined): string => value === undefined
+    ? ""
+    : `${value.column}:${value.row}:${value.cols}:${value.rows}`;
+  const geometry = (value: CanonicalSessionGeometry | undefined): string => value === undefined
+    ? ""
+    : `${value.cols}x${value.rows}@${value.revision}`;
+  if (rect(a.nativeContent) !== rect(b.nativeContent)
+    || geometry(a.nativeGeometry) !== geometry(b.nativeGeometry)) return false;
   if (a.layout.sidebar === undefined && a.layout.form === undefined) return true;
   return a.sidebar.authorizationKey === b.sidebar.authorizationKey;
 }
@@ -176,6 +207,7 @@ function sameNativePaneGeometry(a: HostLayout, b: HostLayout): boolean {
 function sameNativeMouseTarget(a: MouseFramePresentation, b: MouseFramePresentation): boolean {
   return a.focus === "sidebar" && b.focus === "sidebar"
     && a.nativeOwnerId !== undefined && a.nativeOwnerId === b.nativeOwnerId
+    && samePaneGeometry(a.nativeContent, b.nativeContent)
     && sameNativePaneGeometry(a.layout, b.layout);
 }
 
@@ -206,7 +238,16 @@ interface MainDependencies {
     profileRegistry: ProfilePreparer;
     nativeAgentDir?: string;
   };
-  readonly createManager: (options: InstanceManagerOptions) => MainManager;
+  readonly createManager: (options: InstanceManagerOptions) => OwningHostManager;
+  /**
+   * The presentation-independent owning-session operation boundary (#473): it
+   * opens the host's one authoritative manager and owns the UI-independent row
+   * operations. Focused tests may wrap the production factory to observe the
+   * exact wiring without changing any behavior.
+   */
+  readonly createOwningHostService: (
+    dependencies: OwningHostServiceDependencies,
+  ) => OwningHostService;
   readonly createSidebar: (options: ConstructorParameters<typeof SidebarController>[0]) => SidebarController;
   /** Read-only listing of the shared native agent root's saved conversations. */
   readonly listSavedCatalog: (options: {
@@ -274,6 +315,28 @@ type RowResumeReadiness = "ready" | "pending" | "failed";
 function containsHostPoint(rect: HostPaneRect, column: number, row: number): boolean {
   return column >= rect.column && column < rect.column + rect.cols
     && row >= rect.row && row < rect.row + rect.rows;
+}
+
+/**
+ * The rectangle a native frame actually filled inside the native pane (#474).
+ *
+ * A session smaller than the pane is drawn at the pane's top-left corner and
+ * padded, so its content rectangle is smaller than the pane. `undefined` means
+ * nothing defensible was drawn: a missing or malformed frame, or a frame larger
+ * than the pane, which the compositor clips rather than displays whole.
+ */
+function nativeContentRect(pane: HostPaneRect, frame: { cols: number, rows: number } | undefined): HostPaneRect | undefined {
+  if (frame === undefined) return undefined;
+  if (!Number.isSafeInteger(frame.cols) || !Number.isSafeInteger(frame.rows)
+    || frame.cols < 1 || frame.rows < 1
+    || frame.cols > pane.cols || frame.rows > pane.rows) return undefined;
+  if (frame.cols === pane.cols && frame.rows === pane.rows) return pane;
+  return { column: pane.column, row: pane.row, cols: frame.cols, rows: frame.rows };
+}
+
+function sameCanonicalGeometry(a: CanonicalSessionGeometry | undefined, b: CanonicalSessionGeometry | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.cols === b.cols && a.rows === b.rows && a.revision === b.revision;
 }
 
 function mouseButtonId(mouse: ParsedMouseInput): number | undefined {
@@ -459,23 +522,6 @@ function savedRefusalNotice(reason: SavedSessionRefusalReason): string {
   }
 }
 
-function savedDeletionOwnedSessions(owner: MainManager): ReturnType<MainManager["ownedLiveSessions"]> {
-  const owned = owner.ownedLiveSessions();
-  // Historical duplicate evidence does not establish the current binding of
-  // a live child whose reporter disconnected or became unavailable.
-  return owner.list().some((view) => view.hasLiveProcess && !view.nativeSession)
-    ? [...owned, {}]
-    : owned;
-}
-
-function validateOwnedSavedSessionDeletion(
-  owner: MainManager,
-  catalog: SavedSessionCatalog,
-  row: SavedSessionRow,
-): SavedSessionDeletionRefusalReason | undefined {
-  return validateSavedSessionDeletion(catalog, row, { ownedLiveSessions: savedDeletionOwnedSessions(owner) });
-}
-
 function savedDeletionRefusalNotice(reason: SavedSessionDeletionRefusalReason): string {
   if (reason === "known-owned-duplicate" || reason === "unknown-live-binding") {
     return "Close the Pi session using this conversation before deleting its saved file";
@@ -576,6 +622,7 @@ function productionDependencies(): MainDependencies {
       return { nativeSetup: true, profileRegistry: registry, nativeAgentDir: registry.agentDir };
     },
     createManager: (options) => new InstanceManager(options),
+    createOwningHostService: (serviceDependencies) => createLocalOwningHostService(serviceDependencies),
     createSidebar: (options) => new SidebarController(options),
     listSavedCatalog: listSavedSessions,
     deleteSavedFile: deleteSavedSessionFile,
@@ -633,7 +680,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     nativeAgentDir?: string;
   } | undefined;
   let broker: StatusBroker | undefined;
-  let manager: MainManager | undefined;
+  let manager: OwningHostManager | undefined;
   let terminal: MainTerminal | undefined;
   let observer: MainObserver | undefined;
   let writer: MainWriter | undefined;
@@ -691,6 +738,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let lastNativeCols: number | undefined;
   let lastNativeRows: number | undefined;
   let resizeInProgress = false;
+  // This host's own local viewing surface (#474). Its content target follows the
+  // local Main owner and its size follows the native pane; the one manager stores
+  // both facts and performs the only resize. `localViewerState` is what this host
+  // last registered — the row it displays and the pane it offered — so a created
+  // row, a new selection, a detach, and any pane change all re-state the fact at
+  // the one owner of geometry, while plain input and unrelated redraws do not.
+  // `localViewerDirty` forces a re-state after a local action that must reach the
+  // manager even when these recorded facts did not visibly move.
+  let localViewerId: string | undefined;
+  let localViewerState: { target: string | undefined; cols: number; rows: number } | undefined;
+  let localViewerDirty = true;
   let rosterSyncInProgress = false;
   let rosterSyncQueued = false;
   let redrawQueued = false;
@@ -742,6 +800,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   // the host adds none.
   const clipboardDiagnostics = new HostClipboardDiagnosticCollector({
     deliver: (instanceId, event) => handleTerminalDiagnostic(instanceId, event),
+  });
+  // The one presentation-independent owning-session boundary (#473). It is
+  // constructed before any listener or teardown path can run, opens the only
+  // manager this host will ever have, and owns the row operations that need no
+  // presentation state. It keeps no session facts of its own: the teardown
+  // latch is read live from this controller, never copied.
+  const hostService = dependencies.createOwningHostService({
+    createManager: dependencies.createManager,
+    teardownRequested: () => shutdownRequested,
   });
   let finishRun!: (status: number) => void;
   const runFinished = new Promise<number>((resolve) => { finishRun = resolve; });
@@ -902,17 +969,28 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             sidebarFrame = sidebar.render(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
           }
         }
+        // A session can legitimately be smaller than this pane when another viewer
+        // holds a smaller minimum (#474). Its frame is drawn at the pane's top-left
+        // corner and padded, so the content rectangle — not the containing pane —
+        // is what this row actually displayed, and that rectangle is what image
+        // placement and positional authority are bounded by.
+        const nativeContent = nativeContentRect(currentLayout.native, mainFrame);
+        const nativeGeometry = view?.hasLiveProcess === true && view.lifecycle === "alive"
+          ? canonicalGeometryStamp(view.id)
+          : undefined;
         const nativeOwnerId = view?.hasLiveProcess === true && view.lifecycle === "alive"
           && surface !== undefined
-          && mainFrame !== undefined
-          && mainFrame.cols === currentLayout.native.cols && mainFrame.rows === currentLayout.native.rows
+          && nativeContent !== undefined
           ? view.id
           : undefined;
         // Graphics follow the real active view/surface pair, never the
-        // sidebar's highlighted row. The compositor removes this layer when
-        // an overlay or form actually covers the native pane.
+        // sidebar's highlighted row, and are projected only into the validated
+        // content rectangle so a padded session keeps its images and their text
+        // fallback. The compositor removes this layer when an overlay or form
+        // actually covers the native pane.
         const nativeGraphics = nativeOwnerId !== undefined && mainFrame?.graphics !== undefined
-          ? { ownerId: nativeOwnerId, pane: currentLayout.native, frame: mainFrame.graphics }
+          && nativeContent !== undefined
+          ? { ownerId: nativeOwnerId, pane: nativeContent, frame: mainFrame.graphics }
           : undefined;
         const savedDeleteRenderToken = sidebar.savedDeleteConfirmationRenderTokenNumber;
         // Title only. Lifecycle, activity and input ownership belong below
@@ -933,6 +1011,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           focus,
           sidebar: sidebar.captureMousePresentation(),
           nativeOwnerId,
+          nativeContent: nativeOwnerId === undefined ? undefined : nativeContent,
+          nativeGeometry: nativeOwnerId === undefined ? undefined : nativeGeometry,
         };
         // Distinct targets can render identical bytes (for example Saved
         // conversations with matching captions and workspaces). Their maps
@@ -1308,12 +1388,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             ? "This conversation was never saved to disk; it was not restarted"
             : "This conversation is no longer saved to disk; it was not restarted";
       } else {
-        let admitted: SavedSessionAdmissionResult;
-        try {
-          admitted = admitSavedSession(catalog, row, { ownedLiveSessions: activeManager.ownedLiveSessions() });
-        } catch {
-          admitted = { status: "refused", reason: "unknown-row" };
-        }
+        const admitted = hostService.admitSavedConversation(catalog, row);
         if (admitted.status === "refused") {
           reason = `This conversation could not be revalidated: ${savedRefusalNotice(admitted.reason)}`;
         } else if (rememberedWorkspace === undefined || rememberedWorkspace !== admitted.admission.workspace) {
@@ -1336,6 +1411,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       adoptingSlot = decision.entry.slotId;
       let created: Promise<string>;
       try {
+        // Restoration creates on the same single manager the owning-host service
+        // opened: the slot-adoption window has to wrap the synchronous stretch of
+        // the create call itself, so this path cannot use the async start path.
         created = activeManager.create(decision.createOptions);
       } finally {
         adoptingSlot = undefined;
@@ -1384,6 +1462,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       if (activeId !== undefined && !views.some((view) => view.id === activeId)) {
         activeId = undefined;
         rememberedActiveSlot = undefined;
+        // The manager already retired every surface on that row; re-state the
+        // local view so it displays nothing rather than a vanished row.
+        localViewerDirty = true;
       }
       // View-only observer: the sidebar's white title highlight follows the
       // actual active Main owner; clearing it here (owner row gone) prevents a
@@ -1400,6 +1481,115 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
   }
 
+  /**
+   * Restate this host's local viewing surface on the one manager (#474): which
+   * session it displays (possibly none) and how wide its native pane is. Only
+   * the addressed session can be resized by this; a background session nobody
+   * displays keeps its last size, and `adoptAsInitialGeometry` alone changes the
+   * initial-sizing rule for sessions created later.
+   */
+  function localViewerNeedsSync(pane: HostPaneRect): boolean {
+    if (localViewerDirty) return true;
+    if (localViewerState === undefined) return activeId !== undefined;
+    return localViewerState.target !== activeId
+      || localViewerState.cols !== pane.cols
+      || localViewerState.rows !== pane.rows;
+  }
+
+  function syncLocalViewerGeometry(pane: HostPaneRect, adoptAsInitialGeometry: boolean): void {
+    if (!manager) return;
+    if (adoptAsInitialGeometry) hostService.setInitialGeometry(pane.cols, pane.rows);
+    if (localViewerId === undefined) {
+      const opened = hostService.openViewer();
+      if (opened === undefined) return;
+      localViewerId = opened.viewerId;
+    }
+    const result = hostService.updateViewer(localViewerId, {
+      sessionId: activeId ?? null,
+      cols: pane.cols,
+      rows: pane.rows,
+    });
+    // What this host asked for, whether or not the manager accepted it: an
+    // exited or errored row stays refused rather than retried on every redraw.
+    localViewerState = { target: activeId, cols: pane.cols, rows: pane.rows };
+    if (result.applied) {
+      localViewerDirty = false;
+      return;
+    }
+    if (result.reason === "unknown-viewer") {
+      // The manager no longer has this surface (its row finished or teardown
+      // began). Nothing is retried blindly; a later deliberate selection or
+      // layout change registers a fresh surface.
+      localViewerId = undefined;
+      localViewerState = undefined;
+      localViewerDirty = false;
+      return;
+    }
+    // `unknown-session` is the truthful current answer (the displayed row
+    // exited or errored), and `invalid-geometry` cannot come from a computed
+    // pane. Either way the manager's own facts stand.
+    localViewerDirty = false;
+  }
+
+  /**
+   * The manager's canonical size for one row, or nothing when the row, the
+   * dimensions, or the read itself is unusable (#474). A missing fact is never
+   * replaced with a guessed size.
+   */
+  function canonicalGeometryStamp(id: string): CanonicalSessionGeometry | undefined {
+    const geometry: SessionGeometry | undefined = hostService.readSessionGeometry(id);
+    if (geometry === undefined) return undefined;
+    if (!Number.isSafeInteger(geometry.cols) || !Number.isSafeInteger(geometry.rows)
+      || !Number.isSafeInteger(geometry.revision)
+      || geometry.cols < 1 || geometry.rows < 1) return undefined;
+    return { cols: geometry.cols, rows: geometry.rows, revision: geometry.revision };
+  }
+
+  /**
+   * Positional native input and native clipboard requests are authorized only
+   * against the content the display actually committed for that row (#474):
+   *
+   * - the written frame and the latest render agree on one owner, one native pane,
+   *   and one drawn content rectangle, so nothing is authorized against a frame
+   *   that was never written;
+   * - the manager's current canonical size and revision still match the ones that
+   *   drawn content came from, so a resize queued behind writer backpressure
+   *   authorizes neither its newly exposed padding nor its not-yet-drawn size;
+   * - no form or actually drawn sidebar overlay covers the native pane. An
+   *   overlay-capable layout with Main focused draws no sidebar rectangle, so it
+   *   covers nothing and native input keeps its ordinary path.
+   *
+   * The returned rectangle is the drawn content, never the containing pane: cells
+   * of a padded pane belong to the host, not the child. `undefined` refuses
+   * positional work outright; keyboard and paste input claims no cell and is
+   * unaffected.
+   */
+  function nativeInputAuthority(id: string): HostPaneRect | undefined {
+    const shown = displayedMousePresentation;
+    const latest = latestMousePresentation;
+    if (layout === undefined || shown === undefined || latest === undefined) return undefined;
+    // Coverage, not overlay capability: a narrow layout keeps `sidebarOverlay`
+    // set while Main is focused, but draws no sidebar rectangle there, and Main
+    // owns the whole content pane. Only a layout that actually paints something
+    // over the native pane refuses positional authority — and the written and
+    // latest layouts both count, so uncovering Main cannot authorize input before
+    // its uncovered frame has been written.
+    const covered = (value: HostLayout): boolean => value.form !== undefined
+      || (value.sidebarOverlay && value.sidebar !== undefined);
+    if (covered(layout) || covered(shown.layout) || covered(latest.layout)) return undefined;
+    if (shown.nativeOwnerId !== id || latest.nativeOwnerId !== id) return undefined;
+    if (!samePaneGeometry(shown.layout.native, layout.native)
+      || !samePaneGeometry(latest.layout.native, layout.native)) return undefined;
+    const drawn = shown.nativeContent;
+    if (drawn === undefined || !samePaneGeometry(drawn, latest.nativeContent)) return undefined;
+    const current = canonicalGeometryStamp(id);
+    if (current === undefined
+      || shown.nativeGeometry === undefined || latest.nativeGeometry === undefined
+      || !sameCanonicalGeometry(shown.nativeGeometry, current)
+      || !sameCanonicalGeometry(latest.nativeGeometry, current)) return undefined;
+    return drawn;
+  }
+
   function reconcileLayout(resizeChildren: boolean): void {
     if (!terminal || !sidebar || shutdownRequested) return;
     try {
@@ -1412,12 +1602,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       });
       layout = next;
       const changed = next.native.cols !== lastNativeCols || next.native.rows !== lastNativeRows;
-      if (resizeChildren && changed && manager && !resizeInProgress) {
+      if (manager && !resizeInProgress && (resizeChildren || localViewerNeedsSync(next.native))) {
         resizeInProgress = true;
         try {
-          manager.resize(next.native.cols, next.native.rows);
-          lastNativeCols = next.native.cols;
-          lastNativeRows = next.native.rows;
+          syncLocalViewerGeometry(next.native, resizeChildren && changed);
+          if (resizeChildren) {
+            lastNativeCols = next.native.cols;
+            lastNativeRows = next.native.rows;
+          }
         } finally {
           resizeInProgress = false;
         }
@@ -1440,13 +1632,19 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const latest = latestMousePresentation;
     const ownsVisibleMain = terminal !== undefined && terminalStarted && !shutdownRequested && !externalEditorActive
       && sidebar?.focus === "main" && activeId === id && layout !== undefined
-      && layout.form === undefined && !layout.sidebarOverlay
+      && layout.form === undefined
       && shown?.focus === "main" && latest?.focus === "main"
       && shown.nativeOwnerId === id && latest.nativeOwnerId === id
-      && shown.layout.form === undefined && !shown.layout.sidebarOverlay
+      && shown.layout.form === undefined
       && shown.layout.cols === layout.cols && shown.layout.rows === layout.rows
       && latest.layout.cols === layout.cols && latest.layout.rows === layout.rows
-      && samePaneGeometry(shown.layout.native, layout.native) && samePaneGeometry(latest.layout.native, layout.native);
+      && samePaneGeometry(shown.layout.native, layout.native) && samePaneGeometry(latest.layout.native, layout.native)
+      // Use the same actual-coverage and written-owner/geometry authority as
+      // positional input. Overlay capability alone does not cover Main: the gate
+      // checks current, shown, and latest layouts so an actual overlay or an
+      // undrawn uncovering/geometry transition cannot authorize a copy (#474).
+      // Padding stays host-owned; valid fully drawn child content stays eligible.
+      && nativeInputAuthority(id) !== undefined;
     // Stale, sibling, hidden, unfocused, covered, form, changed-geometry, and
     // shutting-down requests are ordinary safety refusals: quiet, fail closed.
     if (!ownsVisibleMain) return;
@@ -1481,7 +1679,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     if (!surface) return;
     try {
       const sourceNormalized = normalizeNativeSourceInput(data, terminal.kittyProtocolActive);
-      const translated = translateInput(sourceNormalized, surface.inputModes(), layout.native);
+      const viewport = nativeInputAuthority(view.id);
+      // A mouse packet claims a cell of the displayed content. With no written,
+      // current snapshot for that row there is no defensible viewport, so the
+      // packet is dropped; keyboard and paste packets make no positional claim
+      // (the translator never consults a viewport for them) and keep their
+      // ordinary path.
+      if (viewport === undefined && parseMouseInput(sourceNormalized) !== undefined) return;
+      const translated = translateInput(sourceNormalized, surface.inputModes(), viewport ?? layout.native);
       if (translated !== undefined) manager.write(view.id, translated);
     } catch {
       // The process may have exited between the snapshot and write. Never
@@ -1498,8 +1703,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       || !sidebar.visible || sidebar.focus !== "sidebar"
       || !sameNativeMouseTarget(presentation, latest)
       || !sameNativePaneGeometry(presentation.layout, layout)
-      || !containsHostPoint(presentation.layout.native, mouse.x, mouse.y)
       || activeId !== presentation.nativeOwnerId) return false;
+    // A padded cell belongs to the host, not the child: only a click on content
+    // this row actually drew is a focus gesture (#474).
+    const drawn = presentation.nativeContent;
+    if (drawn === undefined || !containsHostPoint(drawn, mouse.x, mouse.y)) return false;
     const view = findActiveView();
     if (!view || view.id !== presentation.nativeOwnerId || !view.hasLiveProcess || view.lifecycle !== "alive") return false;
     try {
@@ -1735,19 +1943,23 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     let task!: Promise<void>;
     task = (async () => {
       try {
-        const id = await manager!.create(createOptions);
-        if (shutdownRequested || !sidebar || !manager) return;
-        const row = manager.list().find((candidate) => candidate.id === id);
-        if (!row || row.lifecycle === "error" || row.lifecycle === "starting") {
+        const outcome = await hostService.startSession(createOptions);
+        if (outcome.status === "unavailable" || shutdownRequested || !sidebar) return;
+        if (outcome.status === "failed") {
           sidebar.failCreate(action.requestId, GENERIC_CREATE_FAILURE);
+          scheduleRedraw();
         } else {
-          // A successful New submission activates the created child as the
-          // Main input owner (the sidebar emits select); launch-error rows
-          // never reach this success path.
-          sidebar.completeCreate(action.requestId, id);
+          if (outcome.status === "started") {
+            // A successful New submission activates the created child as the
+            // Main input owner (the sidebar emits select); launch-error rows
+            // never reach this success path.
+            sidebar.completeCreate(action.requestId, outcome.id);
+          } else {
+            sidebar.failCreate(action.requestId, GENERIC_CREATE_FAILURE);
+          }
+          syncRosterAndSchedule();
+          reconcileLayout(true);
         }
-        syncRosterAndSchedule();
-        reconcileLayout(true);
       } catch {
         if (!shutdownRequested && sidebar) {
           sidebar.failCreate(action.requestId, GENERIC_CREATE_FAILURE);
@@ -1758,44 +1970,6 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       }
     })();
     createTasks.add(task);
-  }
-
-  /**
-   * Authenticated child request: add a fresh sibling directly through the
-   * manager. This path intentionally never completes a sidebar form or
-   * activates the created row; manager onChange only refreshes the roster.
-   */
-  async function handleSessionSpawn(parentInstanceId: string, request: SessionSpawnInput): Promise<SessionSpawnOutcome> {
-    const currentManager = manager;
-    if (!currentManager || shutdownRequested) return "failed";
-    let parent: NativeInstanceView | undefined;
-    try {
-      parent = currentManager.list().find((view) => view.id === parentInstanceId);
-    } catch {
-      return "failed";
-    }
-    if (!parent || parent.lifecycle !== "alive" || parent.hasLiveProcess !== true) return "failed";
-
-    let childId: string;
-    try {
-      childId = await currentManager.create({
-        workspace: request.workspace,
-        initialRequest: { title: request.title, prompt: request.prompt },
-      });
-    } catch {
-      return "failed";
-    }
-    // A create interrupted by host teardown may have launched a child that is
-    // no longer observable here. Never report that case as a definite failure.
-    if (currentManager !== manager || shutdownRequested) return "unknown";
-    let child: NativeInstanceView | undefined;
-    try {
-      child = currentManager.list().find((view) => view.id === childId);
-    } catch {
-      return "unknown";
-    }
-    if (!child) return "unknown";
-    return child.hasLiveProcess === true || child.exitCode !== undefined ? "started" : "failed";
   }
 
   /** Snapshot actual title-line columns for the layout with the sidebar shown. */
@@ -1829,39 +2003,41 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       scheduleRedraw();
       return;
     }
-    let result: SavedSessionAdmissionResult;
-    try {
-      result = admitSavedSession(catalog, row, { ownedLiveSessions: manager.ownedLiveSessions() });
-    } catch {
-      result = { status: "refused", reason: "unknown-row" };
-    }
-    if (result.status === "refused") {
-      sidebar.failSavedOpen(requestId, savedRefusalNotice(result.reason));
+    const admission = hostService.admitSavedConversation(catalog, row);
+    if (admission.status === "refused") {
+      sidebar.failSavedOpen(requestId, savedRefusalNotice(admission.reason));
       scheduleRedraw();
       return;
     }
-    const admission = result.admission;
+    const receipt = admission.admission;
     let task!: Promise<void>;
     task = (async () => {
       try {
         // The exact saved header cwd determines the workspace; the manager
         // refuses any conflicting explicit workspace and fences duplicates.
-        const id = await manager!.create({ workspace: admission.workspace, savedSession: admission });
-        if (shutdownRequested || !sidebar || !manager) return;
-        const created = manager.list().find((candidate) => candidate.id === id);
-        if (!created || created.lifecycle === "error" || created.lifecycle === "starting") {
-          sidebar.failSavedOpen(requestId, GENERIC_CREATE_FAILURE);
+        const outcome = await hostService.startSession({ workspace: receipt.workspace, savedSession: receipt });
+        if (outcome.status === "unavailable" || shutdownRequested || !sidebar) return;
+        if (outcome.status === "failed" || outcome.status === "duplicate") {
+          sidebar.failSavedOpen(requestId,
+            outcome.status === "duplicate"
+              ? "That saved conversation is already open in this host"
+              : GENERIC_CREATE_FAILURE);
+          scheduleRedraw();
         } else {
-          // A successful Saved open activates the restored child as the Main
-          // input owner; launch-error rows never reach this success path.
-          sidebar.completeSavedOpen(requestId, id);
+          if (outcome.status === "started") {
+            // A successful Saved open activates the restored child as the Main
+            // input owner; launch-error rows never reach this success path.
+            sidebar.completeSavedOpen(requestId, outcome.id);
+          } else {
+            sidebar.failSavedOpen(requestId, GENERIC_CREATE_FAILURE);
+          }
+          syncRosterAndSchedule();
+          reconcileLayout(true);
         }
-        syncRosterAndSchedule();
-        reconcileLayout(true);
       } catch (error) {
         if (!shutdownRequested && sidebar) {
           sidebar.failSavedOpen(requestId,
-            error instanceof Error && error.message.includes("already open in this host")
+            isDuplicateOwnedLaunchFailure(error)
               ? "That saved conversation is already open in this host"
               : GENERIC_CREATE_FAILURE);
           scheduleRedraw();
@@ -1941,44 +2117,6 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   /**
-   * The exact current exited binding of one row, read fresh from the manager:
-   * only an actual confirmed exit with no owned process qualifies. The retained
-   * last-observed native binding is the restart target; a missing persistence
-   * observation is unknown, never assumed unsaved.
-   */
-  function readExitedResumeTarget(id: string):
-    { readonly workspace: string; readonly binding: NativePersistenceReceipt; readonly epoch: number } | undefined {
-    if (!manager) return undefined;
-    let view: NativeInstanceView | undefined;
-    try {
-      view = manager.list().find((candidate) => candidate.id === id);
-    } catch {
-      return undefined;
-    }
-    if (!view || view.lifecycle !== "exited" || view.hasLiveProcess !== false) return undefined;
-    const retained = view.lastNativeSession;
-    if (!retained || !isValidNativeSessionId(retained.sessionId)
-      || !Number.isSafeInteger(retained.epoch) || retained.epoch < 1) return undefined;
-    const persistence = retained.persistence === "saved" || retained.persistence === "unsaved"
-      ? retained.persistence
-      : "unknown";
-    return { workspace: view.workspace, binding: { sessionId: retained.sessionId, persistence }, epoch: retained.epoch };
-  }
-
-  /**
-   * Current manager row for one replacement child. A listing failure is a
-   * readiness failure, never a success and never a poll.
-   */
-  function readReadinessView(id: string): NativeInstanceView | undefined {
-    if (!manager) return undefined;
-    try {
-      return manager.list().find((candidate) => candidate.id === id);
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
    * Manager onChange fan-out: wake only the readiness waiters for the changed
    * row (each re-reads current state), then run the ordinary roster
    * synchronization. A wake only resolves a promise, so it cannot reenter
@@ -2039,7 +2177,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         }
         let outcome: RowResumeReadiness;
         try {
-          outcome = rowResumeReadiness(readReadinessView(id), expectedSessionId);
+          outcome = rowResumeReadiness(hostService.readRow(id), expectedSessionId);
         } catch {
           // A throwing metadata read is a readiness failure, never a leak: the
           // listener and deadline timer settle through the same path, so no
@@ -2116,7 +2254,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     };
     const controller = record.controller;
     // Capture the exact current exited binding before the read-only listing.
-    const before = readExitedResumeTarget(oldId);
+    const before = hostService.readExitedResumeTarget(oldId);
     if (!before) {
       fail(ROW_RESUME_FAILURE);
       return;
@@ -2145,7 +2283,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     if (controller.signal.aborted || shutdownRequested || manager !== owner) return;
     // Re-read the exited/current binding immediately before any spawn: a row
     // that rebound or was replaced refuses instead of restarting something else.
-    const after = readExitedResumeTarget(oldId);
+    const after = hostService.readExitedResumeTarget(oldId);
     if (!after || after.binding.sessionId !== before.binding.sessionId || after.epoch !== before.epoch) {
       fail(ROW_RESUME_FAILURE);
       return;
@@ -2158,21 +2296,16 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     let createOptions: CreateInstanceOptions;
     let expectedSessionId: string | undefined;
     if (choice.kind === "saved") {
-      let result: SavedSessionAdmissionResult;
-      try {
-        result = admitSavedSession(catalog, choice.row, { ownedLiveSessions: owner.ownedLiveSessions() });
-      } catch {
-        result = { status: "refused", reason: "unknown-row" };
-      }
-      if (result.status === "refused") {
-        fail(savedRefusalNotice(result.reason));
+      const admitted = hostService.admitSavedConversation(catalog, choice.row);
+      if (admitted.status === "refused") {
+        fail(savedRefusalNotice(admitted.reason));
         return;
       }
       // The exact branded admission is passed verbatim; the manager owns the
       // launch-time file revalidation and known-owned duplicate fence. The
       // replacement must report exactly this saved conversation to qualify.
-      expectedSessionId = result.admission.sessionId;
-      createOptions = { workspace: result.admission.workspace, savedSession: result.admission };
+      expectedSessionId = admitted.admission.sessionId;
+      createOptions = { workspace: admitted.admission.workspace, savedSession: admitted.admission };
     } else {
       // Positive known-unsaved binding plus an issue-free, safely absent
       // catalog: a fresh child in the SAME exited owned workspace.
@@ -2193,7 +2326,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     } catch (error) {
       if (shutdownRequested || !sidebar) return;
       sidebar.failRowResume(requestId,
-        error instanceof Error && error.message.includes("already open in this host")
+        isDuplicateOwnedLaunchFailure(error)
           ? "That saved conversation is already open in this host"
           : ROW_RESUME_FAILURE);
       syncRosterAndSchedule();
@@ -2318,10 +2451,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * the decision to the caller; a thrown closeError reports the generic
    * failure and keeps the row. No signal, sibling, or other fallback.
    */
-  function tryCloseError(owner: MainManager, id: string): "closed" | "not-applicable" | "failure" {
+  function tryCloseError(owner: OwningHostManager, id: string): "closed" | "not-applicable" | "failure" {
     const closeError = owner.closeError;
     if (typeof closeError !== "function") return "not-applicable";
-    if (readReadinessView(id)?.lifecycle !== "error") return "not-applicable";
+    if (hostService.readRow(id)?.lifecycle !== "error") return "not-applicable";
     try {
       return closeError.call(owner, id) === true ? "closed" : "not-applicable";
     } catch {
@@ -2377,8 +2510,32 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         }
         activeId = action.id;
         rememberedActiveSlot = rowSlots.get(action.id);
+        // Selecting is how a session starts being displayed and sized by this
+        // terminal; the manager recomputes only this row's geometry (#474).
+        localViewerDirty = true;
         syncRosterAndSchedule();
         reconcileLayout(true);
+        return;
+      }
+      case "detach-view": {
+        // Explicit local "no session selected" (#474): this sidebar stops
+        // displaying, feeding, and sizing one session. Owned processes and their
+        // work, status, the roster's remembered entries, saved conversations, and
+        // this host's lifetime are untouched; no child is stopped, closed, or
+        // replaced, and a later Enter on a row displays that session again
+        // without starting or restarting anything.
+        if (activeId === undefined) {
+          sidebar?.showError(NO_LOCAL_VIEW_MESSAGE);
+          scheduleRedraw();
+          return;
+        }
+        activeId = undefined;
+        rememberedActiveSlot = undefined;
+        localViewerDirty = true;
+        syncRosterAndSchedule();
+        reconcileLayout(true);
+        sidebar?.showError(LOCAL_VIEW_DETACHED_MESSAGE);
+        scheduleRedraw();
         return;
       }
       case "create":
@@ -2522,12 +2679,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             && savedCatalogRequestId !== undefined) {
             const row = catalog.rows.find((candidate) => candidate.id === action.id && candidate.file === action.file);
             if (row !== undefined && searchSavedSessions(catalog, activeSidebar.savedQuery).includes(row)) {
-              let refusal: SavedSessionDeletionRefusalReason | undefined;
-              try {
-                refusal = validateOwnedSavedSessionDeletion(owner, catalog, row);
-              } catch {
-                refusal = "unknown-live-binding";
-              }
+              const refusal = hostService.validateSavedConversationDeletion(catalog, row);
               if (refusal === undefined) {
                 allowed = true;
                 message = "";
@@ -2572,11 +2724,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             || !searchSavedSessions(catalog, activeSidebar.savedQuery).includes(row)) {
             return "stale-catalog";
           }
-          try {
-            return validateOwnedSavedSessionDeletion(owner, catalog, row);
-          } catch {
-            return "unknown-live-binding";
-          }
+          return hostService.validateSavedConversationDeletion(catalog, row);
         };
         let result: SavedSessionDeletionResult;
         try {
@@ -2790,28 +2938,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         } catch {
           cleanupFailure = true;
         }
-        try {
-          const liveViews = manager.list().filter((view) => view.hasLiveProcess);
-          remainingCount = liveViews.length;
-          // A live-state query that actually answered is positive evidence.
-          ownedStateSettled = true;
-        } catch {
-          remainingCount = shutdownResult?.remainingIds.length ?? 0;
-          try {
-            if (remainingCount === 0 && manager.hasLiveProcesses()) remainingCount = 1;
-            // The fallback liveness query answered truthfully.
-            ownedStateSettled = true;
-          } catch {
-            // Both owned-child queries are unavailable: no positive settlement
-            // evidence exists, so exclusive ownership is retained fail closed.
-            cleanupFailure = true;
-          }
-        }
-      } else {
-        // No manager was ever constructed: this host owns no child at all.
-        remainingCount = shutdownResult?.remainingIds.length ?? 0;
-        ownedStateSettled = true;
       }
+      // Owned-child settlement evidence comes from the one authoritative
+      // manager through the owning-host service: a query that actually answered
+      // is positive evidence, and unknown child state keeps exclusive ownership
+      // held fail closed instead of releasing it.
+      const settlement = hostService.observeOwnedChildSettlement(shutdownResult?.remainingIds.length);
+      remainingCount = settlement.remaining;
+      if (settlement.settled) ownedStateSettled = true;
+      else cleanupFailure = true;
       // Settled rows' surfaces were disposed above (each flushes its pending
       // diagnostics first). Settle the private log's owned IO before
       // reporting; anything an unsettled child emits after this is not
@@ -3078,7 +3213,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     lastNativeCols = layout.native.cols;
     lastNativeRows = layout.native.rows;
 
-    manager = dependencies.createManager({
+    manager = hostService.openManager({
       packageRoot,
       piExecutable: pi.file,
       statusRegistrar: statusRegistrar(broker),
@@ -3092,7 +3227,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       onChange: (id) => noteManagerChanged(id),
       onTerminalDiagnostic: (id, event) => handleTerminalDiagnostic(id, event),
       onNativeClipboard: routeNativeClipboard,
-      onSpawnRequest: handleSessionSpawn,
+      // Authenticated background child requests are admitted by the owning-host
+      // service. This path never completes a sidebar form and never activates
+      // the created row; manager onChange only refreshes the roster.
+      onSpawnRequest: (parentInstanceId, request) => hostService.spawnRequestedChild(parentInstanceId, request),
       getSidebarTitleColumns: sidebarTitleColumnsSnapshot,
     });
     writer = createFrameWriter();

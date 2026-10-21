@@ -2934,6 +2934,181 @@ test(".sh replaces a wrong-pin marker that still references an existing runtime"
     "the replaced record is reused on the next launch");
 });
 
+// ---------------------------------------------------------------------------
+// Which cached generation is ACTIVE? The published `current-node.txt` record is
+// the only authoritative pointer (scripts/pi-review-sessions.sh
+// `current_runtime_generation`). Bootstrap generation names come from
+// `mktemp bootstrap.XXXXXXXX` randomness (scripts/node-generations.sh), so
+// lexical order, mtimes, and readdir order carry no creation or validity
+// meaning: a test that guesses can mutate a generation the product already
+// rejected while the runtime the product actually executes stays valid, and a
+// security expectation about the active runtime silently measures nothing.
+// ---------------------------------------------------------------------------
+
+/** `dev:ino` identity in the same format the POSIX producer records with `stat`. */
+function pathIdentity(path: string): string {
+  const stat = lstatSync(path);
+  return `${stat.dev}:${stat.ino}`;
+}
+
+function isRealDirectory(path: string): boolean {
+  if (!existsSync(path)) return false;
+  const stat = lstatSync(path);
+  return stat.isDirectory() && !stat.isSymbolicLink();
+}
+
+/** `key=value` parsing matching `runtime_marker_value` (first value per key wins). */
+function runtimeMarkerRecord(marker: string): Map<string, string> {
+  const values = new Map<string, string>();
+  for (const line of readFileSync(marker, "utf8").split("\n")) {
+    const split = line.indexOf("=");
+    if (split < 1) continue;
+    const key = line.slice(0, split);
+    if (!values.has(key)) values.set(key, line.slice(split + 1));
+  }
+  return values;
+}
+
+function nodeRuntimeRecord(generation: string, nodeIdentity: string): string {
+  return [
+    "schema=1",
+    "version=22.19.0",
+    "platform=linux-x64",
+    "archive=node-v22.19.0-linux-x64.tar.gz",
+    `sha256=${POSIX_PINS["linux-x64"]}`,
+    `generation=${generation}`,
+    `node_identity=${nodeIdentity}`,
+    "",
+  ].join("\n");
+}
+
+interface ActiveNodeGeneration {
+  generation: string;
+  dir: string;
+  nodeRoot: string;
+  nodeBin: string;
+  nodeIdentity: string;
+}
+
+/**
+ * The generation the product actually published as the current cached runtime:
+ * the `generation=` record of `current-node.txt`, validated the way
+ * `current_runtime_generation` validates it — the source-pinned artifact, a
+ * direct bootstrap-shaped child of this fixture's own cache, real non-link fixed
+ * ancestors, and the recorded Node identity. Fails closed: a missing, malformed,
+ * wrong-pin, foreign, or identity-mismatched record throws instead of degrading
+ * to any order-based guess.
+ */
+function activeNodeGeneration(fixture: EntrypointFixture): ActiveNodeGeneration {
+  const cache = nodeCache(fixture);
+  const marker = join(cache, "current-node.txt");
+  assert.ok(existsSync(marker) && !lstatSync(marker).isSymbolicLink() && lstatSync(marker).isFile(),
+    "the completed-runtime record must be a regular file in this fixture's cache");
+  const record = runtimeMarkerRecord(marker);
+  const version = record.get("version") ?? "";
+  const platform = record.get("platform") ?? "";
+  const archive = record.get("archive") ?? "";
+  assert.equal(version, "22.19.0", "the record names the source-pinned Node version");
+  assert.equal(archive, `node-v${version}-${platform}.tar.gz`, "the record names the pinned archive for its platform");
+  assert.equal(record.get("sha256") ?? "", POSIX_PINS[platform], "the record carries the source-pinned digest for that platform");
+  const generation = record.get("generation") ?? "";
+  assert.match(generation, /^bootstrap[-.][A-Za-z0-9-]+$/u,
+    "the record names a direct bootstrap-shaped generation and can never point outside the cache");
+  const dir = join(cache, generation);
+  assert.ok(isRealDirectory(dir), `the marked generation ${generation} is a real directory in this fixture's cache`);
+  const nodeRoot = join(dir, "extracted", `node-v${version}-${platform}`);
+  for (const ancestor of [join(dir, "extracted"), nodeRoot, join(nodeRoot, "bin"), join(nodeRoot, "lib"),
+    join(nodeRoot, "lib", "node_modules"), join(nodeRoot, "lib", "node_modules", "npm"),
+    join(nodeRoot, "lib", "node_modules", "npm", "bin")]) {
+    assert.ok(isRealDirectory(ancestor), `${ancestor} is a real directory of the active generation`);
+  }
+  const nodeBin = join(nodeRoot, "bin", "node");
+  assert.ok(existsSync(nodeBin) && !lstatSync(nodeBin).isSymbolicLink() && lstatSync(nodeBin).isFile(),
+    "the active Node entry is a regular file");
+  const nodeIdentity = record.get("node_identity") ?? "";
+  assert.ok(nodeIdentity !== "", "the record carries the published Node identity");
+  assert.equal(pathIdentity(nodeBin), nodeIdentity, "the generation's Node identity matches the published record");
+  return { generation, dir, nodeRoot, nodeBin, nodeIdentity };
+}
+
+/** One controlled generation laid out exactly as the producer publishes one. */
+function seedNodeRuntimeGeneration(root: string, content: string): void {
+  const nodeRoot = join(root, "extracted", "node-v22.19.0-linux-x64");
+  mkdirSync(join(nodeRoot, "bin"), { recursive: true });
+  mkdirSync(join(nodeRoot, "lib", "node_modules", "npm", "bin"), { recursive: true });
+  writeFileSync(join(nodeRoot, "bin", "node"), `#!/bin/sh\n${content}\n`, "utf8");
+  chmodSync(join(nodeRoot, "bin", "node"), 0o700);
+  writeFileSync(join(nodeRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js"), "#!/bin/sh\n", "utf8");
+}
+
+test("the active cached runtime is the published record's generation, not the last name in order", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-active-generation-record-");
+  cleanupFixture(t, f);
+  const cache = nodeCache(f);
+  mkdirSync(cache, { recursive: true });
+  // Two controlled generations whose lexical order contradicts the published
+  // record: the active one sorts FIRST, the stale one sorts LAST.
+  const activeDir = join(cache, "bootstrap.aaa-active");
+  const staleDir = join(cache, "bootstrap.zzz-stale");
+  seedNodeRuntimeGeneration(activeDir, "active runtime");
+  seedNodeRuntimeGeneration(staleDir, "stale runtime");
+  const marker = join(cache, "current-node.txt");
+  const activeIdentity = pathIdentity(join(activeDir, "extracted", "node-v22.19.0-linux-x64", "bin", "node"));
+  const staleIdentity = pathIdentity(join(staleDir, "extracted", "node-v22.19.0-linux-x64", "bin", "node"));
+  writeFileSync(marker, nodeRuntimeRecord("bootstrap.aaa-active", activeIdentity), "utf8");
+
+  const active = activeNodeGeneration(f);
+  assert.equal(active.generation, "bootstrap.aaa-active", "the selection follows the published record");
+  assert.equal(active.dir, activeDir);
+  assert.equal(active.nodeIdentity, activeIdentity);
+
+  // Deterministic regression control: the former "sort the generation names and
+  // take the last" choice lands on the stale generation, whose recorded identity
+  // differs from the published runtime. Aliasing that directory leaves the
+  // product's actual runtime untouched, so an alias-rejection launch would reuse
+  // it and never perform the expected installation.
+  const lexicalLast = readdirSync(cache).filter((name) => name.startsWith("bootstrap.")).sort().at(-1);
+  assert.equal(lexicalLast, "bootstrap.zzz-stale", "name order contradicts the published record by construction");
+  assert.notEqual(lexicalLast, active.generation, "the former lexical-last choice is not the active generation");
+  assert.notEqual(staleIdentity, activeIdentity, "the generations are distinguishable by recorded identity, so the wrong target cannot pass as the published runtime");
+
+  // An unusable record fails the selection closed; it never degrades to an
+  // order-based guess (which would silently return the lexical-last generation).
+  for (const [label, record] of [
+    ["a malformed record", "not a record at all\n"],
+    ["a record without a generation key", `schema=1\nversion=22.19.0\nplatform=linux-x64\narchive=node-v22.19.0-linux-x64.tar.gz\nsha256=${POSIX_PINS["linux-x64"]}\nnode_identity=${activeIdentity}\n`],
+    ["a wrong-pin record", `schema=1\nversion=22.19.0\nplatform=linux-x64\narchive=node-v22.19.0-linux-x64.tar.gz\nsha256=${"0".repeat(64)}\ngeneration=bootstrap.aaa-active\nnode_identity=${activeIdentity}\n`],
+    ["a deleted generation", nodeRuntimeRecord("bootstrap.never-created", activeIdentity)],
+    ["a parent-escaping path", nodeRuntimeRecord("..", activeIdentity)],
+    ["an absolute foreign path", nodeRuntimeRecord("/tmp/foreign-generation", activeIdentity)],
+    ["a foreign runtime identity", nodeRuntimeRecord("bootstrap.aaa-active", staleIdentity)],
+  ] as Array<[string, string]>) {
+    writeFileSync(marker, record, "utf8");
+    assert.throws(() => activeNodeGeneration(f), assert.AssertionError, `${label}: the selection fails closed instead of guessing`);
+  }
+
+  // A marked generation that is itself a link points outside the cache.
+  mkdirSync(join(f.root, "foreign-generation"), { recursive: true });
+  symlinkSync(join(f.root, "foreign-generation"), join(cache, "bootstrap.escaped"), "dir");
+  writeFileSync(marker, nodeRuntimeRecord("bootstrap.escaped", activeIdentity), "utf8");
+  assert.throws(() => activeNodeGeneration(f), assert.AssertionError, "a marked generation that is a symlink fails closed");
+  unlinkSync(join(cache, "bootstrap.escaped"));
+
+  // A marker replaced by a link is not this fixture's record at all.
+  const foreignMarker = join(f.root, "foreign-marker.txt");
+  writeFileSync(foreignMarker, nodeRuntimeRecord("bootstrap.aaa-active", activeIdentity), "utf8");
+  unlinkSync(marker);
+  symlinkSync(foreignMarker, marker, "file");
+  assert.throws(() => activeNodeGeneration(f), assert.AssertionError, "a marker that is a symlink fails closed");
+  unlinkSync(marker);
+  assert.throws(() => activeNodeGeneration(f), assert.AssertionError, "a missing marker fails closed");
+
+  writeFileSync(marker, nodeRuntimeRecord("bootstrap.aaa-active", activeIdentity), "utf8");
+  assert.equal(activeNodeGeneration(f).generation, "bootstrap.aaa-active",
+    "a valid published record still selects the active generation afterwards");
+  f.markAssertionsPassed();
+});
+
 test(".sh rejects a cached runtime whose extracted or npm ancestor is an alias", { skip: isWindows }, (t) => {
   const f = makeEntrypointFixture(".node-ancestor-alias-");
   cleanupFixture(t, f);
@@ -2942,10 +3117,13 @@ test(".sh rejects a cached runtime whose extracted or npm ancestor is an alias",
   const first = runSh(f, ["--help"], env);
   assert.equal(first.status, 0, first.stderr);
   const cache = nodeCache(f);
-  const generation = readdirSync(cache).find((name) => name.startsWith("bootstrap."));
-  assert.ok(generation);
-  const generationDir = join(cache, generation);
-  const nodeRoot = join(generationDir, "extracted", "node-v22.19.0-linux-x64");
+  // The alias is applied to the generation the product actually published as
+  // current — the `generation=` record of `current-node.txt`, the same pointer
+  // `current_runtime_generation` follows — never to a generation guessed from
+  // sorted names, mtimes, or readdir order.
+  const published = activeNodeGeneration(f);
+  const generationDir = published.dir;
+  const nodeRoot = published.nodeRoot;
   // Move the whole distribution outside the generation and alias `extracted`:
   // the Node leaf (and its inode) stay identical, but the ancestor is now a link.
   const outside = join(f.root, "outside-extracted");
@@ -2955,19 +3133,34 @@ test(".sh rejects a cached runtime whose extracted or npm ancestor is an alias",
   assert.equal(aliasedExtracted.status, 0, aliasedExtracted.stderr);
   assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, 2,
     "the alias is rejected before probing or executing the outside Node");
+  assert.equal(lstatSync(join(generationDir, "extracted")).isSymbolicLink(), true,
+    "the rejected generation keeps its alias; nothing is repaired or deleted through it");
+  assert.equal(pathIdentity(join(nodeRoot, "bin", "node")), pathIdentity(join(outside, "node-v22.19.0-linux-x64", "bin", "node")),
+    "the aliased leaf still resolves to the outside distribution, so the recorded leaf identity alone cannot catch the alias");
 
-  // Aliased deeper npm ancestor inside the (fresh) installed generation.
-  const current = readdirSync(cache).filter((name) => name.startsWith("bootstrap.")).sort();
-  const fresh = join(cache, current[current.length - 1]!);
-  const freshNodeRoot = join(fresh, "extracted", "node-v22.19.0-linux-x64");
+  // Aliased deeper npm ancestor inside the generation the replacement published.
+  const active = activeNodeGeneration(f);
+  assert.notEqual(active.generation, published.generation,
+    "the aliased runtime was replaced by a newly published generation");
+  // An unrelated extra generation that sorts after the active one. A lexical-last
+  // choice would alias this directory instead, the launch below would reuse the
+  // still-valid published runtime, and the expected installation would never
+  // happen — the count would stay at 2 while nothing was actually fenced.
+  const unrelated = join(cache, "bootstrap.zzz-unrelated");
+  seedNodeRuntimeGeneration(unrelated, "unrelated generation runtime");
+  assert.equal(readdirSync(cache).filter((name) => name.startsWith("bootstrap.")).sort().at(-1), "bootstrap.zzz-unrelated",
+    "name order contradicts the published record while this launch runs");
   const outsideLib = join(f.root, "outside-lib");
-  renameSync(join(freshNodeRoot, "lib"), outsideLib);
-  symlinkSync(outsideLib, join(freshNodeRoot, "lib"), "dir");
+  renameSync(join(active.nodeRoot, "lib"), outsideLib);
+  symlinkSync(outsideLib, join(active.nodeRoot, "lib"), "dir");
   const aliasedLib = runSh(f, ["--help"], env, { reuseCompletedRuntime: true });
   assert.equal(aliasedLib.status, 0, aliasedLib.stderr);
   assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, 3,
     "an aliased npm ancestor is rejected before reuse");
   assert.equal(existsSync(join(outside, "node-v22.19.0-linux-x64", "bin", "node")), true,
     "the outside distribution is left in place (never moved or deleted through the alias)");
-  void nodeRoot;
+  assert.equal(existsSync(join(outsideLib, "node_modules", "npm", "bin", "npm-cli.js")), true,
+    "the aliased npm tree is left in place too");
+  assert.ok(isRealDirectory(join(unrelated, "extracted", "node-v22.19.0-linux-x64", "lib")),
+    "the generation outside the published record is untouched: the alias targeted the runtime actually in use");
 });

@@ -19,6 +19,12 @@
  * The existing standalone fixture (session-host-native-provider.cjs) is left
  * untouched for its own question test.
  *
+ * A script step may also set `holdMs` to hold its request in flight (nothing
+ * streamed yet) for that bounded period, journaled as `turn_hold_started` /
+ * `turn_hold_released`. That gives a rendered agent-running observation a
+ * deterministic window instead of racing a sub-second canned stream; it fakes
+ * no lifecycle or status state, only ordinary in-flight request latency.
+ *
  * Environment contract (set by the native Main integration tests):
  * - PRG_FIXTURE_AGENT_DIR   installed pi-coding-agent package root (pi-ai import)
  * - PRG_FIXTURE_STATE_DIR   fixture scratch state dir (turn script, journal)
@@ -38,6 +44,26 @@ const STOP_TEXT = 'fixture-turn-script-exhausted';
  * [AGENT: running] state before the public agent_settled boundary.
  */
 const TOKENS_PER_SECOND = 32;
+/**
+ * Optional per-step barrier: a script step may set `holdMs` to keep its
+ * request in flight (no streamed bytes yet) for that bounded period, so a
+ * rendered agent-running observation has a deterministic window instead of
+ * racing a sub-second canned stream. The bound keeps a fixture barrier from
+ * ever becoming an open-ended wait; no step holds unless its script asks.
+ */
+const MAX_STEP_HOLD_MS = 20_000;
+
+function stepHoldMs(step) {
+	const hold = step?.holdMs;
+	if (typeof hold !== 'number' || !Number.isFinite(hold) || hold <= 0) return 0;
+	return Math.min(Math.trunc(hold), MAX_STEP_HOLD_MS);
+}
+
+function waitBounded(ms) {
+	return new Promise((resolveWait) => {
+		setTimeout(resolveWait, ms);
+	});
+}
 
 function statePath(kind) {
 	const dir = process.env.PRG_FIXTURE_STATE_DIR;
@@ -195,7 +221,17 @@ module.exports = async function (pi) {
 		// model input. Other fixture tests keep the bounded preview only.
 		if (step?.captureLastUser === true) requestFields.lastUserMessage = lastUserText(contextMessages);
 		journal('model_request', requestFields);
-		return stepToMessage(step, requestIndex);
+		// Controlled barrier (only for a step that opts in): the request stays
+		// in flight with nothing streamed, so the real agent/gate/reporter path
+		// has a deterministic running window to publish. The fixture fakes no
+		// lifecycle or status state; the hold is ordinary in-flight latency.
+		const holdMs = stepHoldMs(step);
+		if (holdMs === 0) return stepToMessage(step, requestIndex);
+		journal('turn_hold_started', { requestIndex, holdMs });
+		return waitBounded(holdMs).then(() => {
+			journal('turn_hold_released', { requestIndex, holdMs });
+			return stepToMessage(step, requestIndex);
+		});
 	}
 
 	provider.appendResponses([respondFromScript]);

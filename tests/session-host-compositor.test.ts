@@ -255,6 +255,61 @@ test("graphics composition follows the matching native pane and disappears behin
 	}).graphics, undefined, "stale frame geometry cannot retain an image owner");
 });
 
+test("a padded native owner keeps graphics bounded by its drawn content rectangle", () => {
+	const wide = computeHostLayout(80, 8, { sidebarVisible: true, focus: "main" });
+	const graphics: TerminalGraphicsFrame = { images: [], placements: [], fallbacks: [] };
+	const content = {
+		column: wide.native.column,
+		row: wide.native.row,
+		cols: wide.native.cols - 6,
+		rows: wide.native.rows - 2,
+	};
+	const padded = mainFrame(content.cols, content.rows, Array.from({ length: content.rows }, () => "native frame"));
+	const layer: HostGraphicsLayer = { ownerId: "padded-owner", pane: content, frame: graphics };
+	const result = composeHostFrame(wide, {
+		main: padded,
+		sidebar: { lines: ["roster"] },
+		nativeGraphics: layer,
+		header: "host",
+		focus: "main",
+	});
+	assert.equal(result.graphics, layer, "the drawn content rectangle, not the pane, bounds a padded session's layer");
+	const firstDrawn = result.lines.findIndex((line) => plain(line).includes("native frame"));
+	assert.ok(firstDrawn >= 0, "the drawn rows stay visible");
+
+	// Padding is checked without the roster so the divider column cannot appear
+	// in the padded row.
+	const bare = computeHostLayout(80, 8, { sidebarVisible: false, focus: "main" });
+	const bareContent = { column: bare.native.column, row: bare.native.row, cols: bare.native.cols - 6, rows: bare.native.rows - 2 };
+	const bareResult = composeHostFrame(bare, {
+		main: mainFrame(bareContent.cols, bareContent.rows, Array.from({ length: bareContent.rows }, () => "native frame")),
+		nativeGraphics: { ownerId: "padded-owner", pane: bareContent, frame: graphics },
+		header: "host",
+		focus: "main",
+	});
+	const bareFirstDrawn = bareResult.lines.findIndex((line) => plain(line).includes("native frame"));
+	assert.ok(bareFirstDrawn >= 0, "a padded session keeps its drawn rows without the roster");
+	assert.equal(plain(bareResult.lines[bareFirstDrawn + bareContent.rows] ?? "x").trim(), "",
+		"the first padded row below the drawn content stays blank host space");
+
+	assert.equal(composeHostFrame(wide, {
+		main: padded,
+		sidebar: { lines: ["roster"] },
+		nativeGraphics: { ...layer, pane: wide.native },
+		header: "host",
+		focus: "main",
+	}).graphics, undefined, "a layer claiming more than the frame drew keeps no image owner");
+
+	const oversized = mainFrame(wide.native.cols + 1, wide.native.rows, Array.from({ length: wide.native.rows }, () => "native frame"));
+	assert.equal(composeHostFrame(wide, {
+		main: oversized,
+		sidebar: { lines: ["roster"] },
+		nativeGraphics: layer,
+		header: "host",
+		focus: "main",
+	}).graphics, undefined, "a frame too large for the pane is clipped by composition and owns nothing");
+});
+
 test("only the explicit Saved-delete placement replaces the right pane while confirm keeps dialog focus", () => {
 	const layout = computeHostLayout(80, 10, {
 		sidebarVisible: true,

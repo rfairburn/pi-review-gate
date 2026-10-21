@@ -3234,3 +3234,85 @@ test("saved picker footer shows the complete keyboard hints with tiny-terminal f
   // Tiny geometry falls back to the truthful too-small pane.
   assert.ok(savedView(harness, 20, 4).some((line) => line.includes("too small")));
 });
+
+test("n detaches only the local content view and leaves every row alone", () => {
+  const harness = makeRoster(["a", "b"]);
+  rosterView(harness.controller, 60, 24);
+  harness.send(UP); // Saved conversations
+  harness.send(UP); // the last session row
+  assert.equal(harness.controller.selectedId, "b");
+  harness.baseline = harness.actions.length;
+
+  harness.send("n");
+  assert.deepEqual(harness.focusedActions(), [{ type: "detach-view" }],
+    "the local detach is its own action: never select, stop, remove, quit, or forwarded child input");
+  assert.equal(harness.controller.focus, "sidebar", "detaching the view keeps the operator in the roster");
+  assert.equal(harness.controller.visible, true, "the roster stays open with every row still listed");
+  assert.equal(harness.controller.selectedId, "b", "the highlighted row is not moved or removed");
+
+  // Displaying a session again is the ordinary row activation: no restart, and
+  // the row the operator picks is the row that comes back.
+  harness.send(ENTER);
+  assert.deepEqual(harness.focusedActions().at(-1), { type: "select", id: "b" });
+  assert.equal(harness.focusedActions().some((action) => action.type === "resume-row"), false,
+    "re-displaying a live session never restarts it");
+});
+
+test("a held n never re-fires the local view detach", () => {
+  const harness = makeRoster(["a"]);
+  rosterView(harness.controller, 60, 24);
+  harness.baseline = harness.actions.length;
+  const previous = isKittyProtocolActive();
+  setKittyProtocolActive(true);
+  try {
+    harness.send("\x1b[110u"); // fresh `n`
+    harness.send("\x1b[110;1:2u"); // held repeat
+    harness.send("\x1b[110;1:3u"); // release
+  } finally {
+    setKittyProtocolActive(previous);
+  }
+  assert.deepEqual(harness.focusedActions(), [{ type: "detach-view" }],
+    "one deliberate press, one detach; a held key and its release are inert");
+});
+
+test("n typed in a text field is content, not a local view detach", () => {
+  const tuple = { sessionId: "session-123", epoch: 7, name: "Observed title" };
+  const harness = makeRoster(["a"]);
+  harness.controller.updateItems([makeItem({ id: "a", nativeSession: tuple, label: "stale row label" })]);
+  assertPaneSafe(harness.controller.renderRoster(48, 14).lines, 48, 14);
+  harness.send(UP); // Saved conversations
+  harness.send(UP); // the session row
+  harness.send("e");
+  assert.equal(harness.controller.openEdit({ id: "a", nativeSession: tuple, currentName: tuple.name }), true);
+  harness.baseline = harness.actions.length;
+
+  harness.send("n");
+  harness.send("o");
+  harness.send(ENTER);
+  assert.deepEqual(harness.focusedActions().at(-1), {
+    type: "rename", requestId: 1, id: "a", expectedSessionId: "session-123",
+    expectedSessionEpoch: 7, name: "no",
+  }, "the field keeps the typed letters");
+  assert.equal(harness.focusedActions().some((action) => action.type === "detach-view"), false,
+    "a detached-view key never fires from inside a text field");
+});
+
+test("detaching the local view cancels an in-flight exited-row restart", () => {
+  const tuple = { sessionId: "session-123", epoch: 1, name: "Nine" };
+  const harness = makeRoster(["a"]);
+  harness.controller.updateItems([makeItem({ id: "a", lifecycle: "exited", hasLiveProcess: false, nativeSession: tuple })]);
+  rosterView(harness.controller, 60, 24);
+  harness.send(UP); // Saved conversations
+  harness.send(UP); // the exited card
+  harness.send(ENTER);
+  assert.deepEqual(harness.sinceActions(), [{ type: "resume-row", requestId: 1, id: "a" }]);
+  harness.baseline = harness.actions.length;
+
+  harness.send("n");
+  assert.deepEqual(harness.sinceActions(), [
+    { type: "resume-row-cancel", requestId: 1 },
+    { type: "detach-view" },
+  ], "the operator's choice wins and the pending restart is cancelled");
+  assert.equal(harness.controller.completeRowResume(1, "a", "late-row"), false,
+    "a late restart completion cannot display itself over the detached view");
+});

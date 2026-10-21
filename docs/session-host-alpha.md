@@ -572,6 +572,47 @@ The host itself does not require Git merely to start a session. It adds no
 question-only, no-worktree, or capture-bypass mode: the normal review, evidence-capture,
 and delegated-execution policies still apply to native activity.
 
+### One owning host, one session manager
+
+Each session-host window is the single owner of its children. One local session manager
+holds the authoritative conversation identity, lifecycle, and liveness facts, and the host
+performs its session operations — starting a session, admitting an authenticated
+`SessionSpawn` sibling, resuming an exited row, checking a saved-conversation deletion, and
+settling its children at quit — against that one manager rather than against a parallel
+copy of the truth. The sidebar projects the manager's current process/session facts;
+remembered roster slots, their ordering, and the active selection remain separate
+presentation metadata. Those remembered observations never become a second authoritative
+process or status store. This ownership is
+local to one host process on one machine. It implies no remote control, no second host
+sharing the same sessions, and no change to how each child's own terminal, input, or saved
+conversations behave.
+
+### Paired peer transport foundation
+
+The source includes a separate, inert TLS/WSS peer-transport foundation (#475). It is
+**not wired into session-host or standalone startup**: there is no remote-session UI,
+network setting, automatic listener, or production pairing/key store yet. Importing the
+module creates no keys, files, sockets, or listeners. Explicit callers supply owned
+identity material, trust/grant stores and local consent callbacks, then explicitly bind
+an address. The current session host remains local-only.
+
+The foundation follows KDE-style explicit device acceptance, using generated self-signed
+certificates and the exact peer key proved by TLS rather than public website PKI. Direct
+IP operation needs no CA-issued certificate or domain name. Friendly names are bounded
+display labels, never identity. First contact permits only bounded encrypted pairing
+metadata; application channels require accepted identity plus a current receiving-side
+grant. The client verifies the server key before sending HTTP headers or application
+bytes. A grant for A accessing B does not authorize B accessing A, and an unexpected
+remembered-key change is refused rather than silently accepted.
+
+Accepting an unknown identity without independently comparing its fingerprint does not
+defeat an active interceptor during first pairing. Later key verification protects
+continuity, not the authenticity of that first acceptance. No mandatory QR/code ceremony
+is added. Persistent identity storage, pairing controls, discovery, session protocols,
+reconnection UI, and clipboard routing remain separate integration work. Native
+client-only mobile implementations can use this trust model; ordinary browser WebSockets
+do not expose self-signed certificate pinning and are not claimed supported.
+
 ## Focus, display, and status
 
 Host keyboard controls apply only while the corresponding host surface has focus. In
@@ -610,6 +651,18 @@ files, or saved conversation files. Removing the active owner clears ownership w
 auto-activating a sibling; removing an inactive row preserves the existing owner.
 Delete remains native input in Main focus unless it is itself the explicitly configured
 sidebar-toggle chord.
+With the roster focused, `n`/`N` displays no session: the host retires only its own local
+content and input participation. The Main pane shows no native session, no keystroke reaches
+a child, and every session keeps running in the background. The roster keeps its rows and
+their ordering, the host stays up and able to display a session again, and nothing is
+stopped, removed, closed, quit, or deleted; the Quit host row still shuts its children down
+exactly as before. Input and clipboard routing follow the actually displayed owner, so while
+nothing is displayed nothing is fed to or copied on behalf of a session. Enter on a row
+displays that session again and an already-running child is never restarted; a restart of an
+exited row that was still in flight is cancelled instead of displaying itself over the
+detached view. `n` is a roster-focus control: inside a form field it stays ordinary typed
+text.
+
 In the New session form, Enter (or the configured native submit binding) submits the
 explicit workspace path; the native Editor
 provides path completion and its current Pi editing bindings. A successful submission
@@ -765,6 +818,47 @@ raw child escape streams are never forwarded. A separate, bounded graphics path
 handles native Pi's Kitty PNG image commands for a directly attached Ghostty Main
 pane. This is a display feature only: native image input, model processing, and
 ordinary standalone launchers are unchanged.
+
+### Per-session content geometry
+
+Each session's content area is sized for the surfaces that actually display it. Every
+host surface that can display a session registers as a viewer of one session and reports its
+own content size, and a session's canonical size is the independent minimum of those widths
+and the independent minimum of those heights across the surfaces displaying it: a 100x40
+surface and an 80x50 surface showing the same session give that session 80 columns and 40
+rows. Only sessions whose viewer set actually changed are recomputed, and only that session's
+own child is resized, so a sibling nobody is viewing keeps its size. A surface that displays
+no session, or one with no content size yet, contributes no dimensions. When the last surface
+stops displaying a session, that session keeps its last canonical size instead of resetting,
+and a later viewer can change it again. A session nobody has ever viewed keeps the existing
+initial-sizing rule and is created at the host's current pane size.
+
+These viewer facts live once on the host's single session manager, and the host reads them
+back instead of keeping a second copy. Retiring a surface — closing a pane, displaying no
+session, or a row whose child exited or was removed — ends its participation immediately, and
+a completion carrying an older viewer state is refused instead of resurrecting a detached
+view, retargeting a finished row, or overwriting a later selection.
+
+Because a child's size can change while a frame is in flight, native input is translated only
+against what was actually committed to the screen: the content rectangle the session's frame
+drew, together with the canonical size and revision that frame was drawn from. A resize still
+queued behind a blocked writer authorizes nothing — neither the padding it will expose nor the
+size nobody has drawn yet. The same written snapshot governs native clipboard copies, so a copy
+is transported only for content the user actually saw. When the manager reports no usable
+canonical size for the displayed session, a positional packet is dropped: a missing or malformed
+size is never taken as permission to treat padded pane cells as the child's. Keyboard and paste
+input claim no cell of the content area and keep their ordinary path.
+
+A session smaller than its pane is drawn at the pane's top-left corner and padded. That padding
+is host space: a click there is neither forwarded to the child nor treated as a focus gesture.
+A fully drawn padded session keeps what a drawn session has — native clipboard copying,
+click-to-focus on its own content, and its images, whose layer is bounded by the drawn content
+rectangle rather than by the containing pane, with the ordinary text fallback where the terminal
+cannot render them.
+
+This is display sizing inside one host process. It adds no remote viewer, protocol, control
+channel, or stored state, and no session becomes exclusive to one surface: registering or
+closing a viewer never grants, leases, or revokes input or output participation.
 
 ### Clipboard copying over SSH
 

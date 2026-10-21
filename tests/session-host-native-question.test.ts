@@ -63,6 +63,10 @@ import { HOST_BOOTSTRAP_ENV, type SessionHostStatus } from "../src/session-host/
 import { ProfileRegistry, type PreparedProfile } from "../src/session-host/profiles";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import { skipOrFail } from "./bridge-fakes";
+// Dedicated durable-file signals (the owned observer/provider journals) use the
+// one shared durable-readiness class; in-process status/frame/reply/exit
+// readiness keeps the notification-driven local signal below.
+import { ChangeSignal as DurableChangeSignal } from "./helpers/change-signal";
 
 const TEST_TIMEOUT_MS = 240_000;
 const EVENT_TIMEOUT_MS = 30_000;
@@ -899,7 +903,7 @@ test("short question popup matcher rejects answer/body sentinels above and below
 });
 
 /** Event-driven directory watch that notifies when the named file changes. */
-function watchOwnedFile(directory: string, fileName: string, signal: ChangeSignal): () => void {
+function watchOwnedFile(directory: string, fileName: string, signal: DurableChangeSignal): () => void {
   const watcher = fsWatch(directory, (_event, filename) => {
     if (filename === null || filename.toString() === fileName) signal.notify();
   });
@@ -1210,8 +1214,11 @@ test("native Pi TUI accepts an exact bracketed image-path answer in its first fr
   owner = liveOwner;
 
   // --- Event-driven journal watches (fs.watch on the owned directories) ---
-  const observerSignal = new ChangeSignal();
-  const providerSignal = new ChangeSignal();
+  // Each journal is a durable file re-read by the predicates below and the
+  // watcher notification is its only live trigger, so these two dedicated
+  // signals use the shared durable recheck.
+  const observerSignal = new DurableChangeSignal();
+  const providerSignal = new DurableChangeSignal();
   const closeObserverWatch = watchOwnedFile(observerDir, "question.jsonl", observerSignal);
   const closeProviderWatch = watchOwnedFile(stateDir, "provider-journal.jsonl", providerSignal);
 
@@ -1227,7 +1234,7 @@ test("native Pi TUI accepts an exact bracketed image-path answer in its first fr
     await liveOwner.frames.signal.waitFor(() => liveOwner.frames.revision > 1, EVENT_TIMEOUT_MS, "native Pi output parsed into its owning TerminalSurface");
     assert.equal(liveOwner.parseFailed, false, "the production TerminalSurface accepted native Pi output");
 
-    await observerSignal.waitFor(
+    await observerSignal.waitForRecheck(
       () => countRecords(observerFile, "session_start") > 0,
       EVENT_TIMEOUT_MS,
       "native session_start observation",
@@ -1240,7 +1247,7 @@ test("native Pi TUI accepts an exact bracketed image-path answer in its first fr
     assert.ok(activeTools!.includes("AskUserQuestion"), "AskUserQuestion is launch-active in the real gate session");
 
     // The scripted model must be selected before any prompt is submitted.
-    await providerSignal.waitFor(
+    await providerSignal.waitForRecheck(
       () => journalRecords(providerJournalFile).some((record) => record.event === "auto_model_selected"),
       EVENT_TIMEOUT_MS,
       "scripted faux model auto-selection",
@@ -1253,22 +1260,22 @@ test("native Pi TUI accepts an exact bracketed image-path answer in its first fr
     liveOwner.pty!.write(KEY_ENTER);
 
     // The first run: agent_start → AskUserQuestion executes → pending result → settled.
-    await observerSignal.waitFor(
+    await observerSignal.waitForRecheck(
       () => countRecords(observerFile, "agent_start") >= 1,
       EVENT_TIMEOUT_MS,
       "first native agent run start",
     );
-    await observerSignal.waitFor(
+    await observerSignal.waitForRecheck(
       () => journalRecords(observerFile).some((record) => record.type === "tool_execution_start" && record.toolName === "AskUserQuestion"),
       EVENT_TIMEOUT_MS,
       "real AskUserQuestion tool execution start",
     );
-    await observerSignal.waitFor(
+    await observerSignal.waitForRecheck(
       () => journalRecords(observerFile).some((record) => record.type === "tool_execution_end" && record.toolName === "AskUserQuestion" && record.isError === false),
       EVENT_TIMEOUT_MS,
       "real AskUserQuestion tool execution end without error",
     );
-    await observerSignal.waitFor(
+    await observerSignal.waitForRecheck(
       () => countRecords(observerFile, "agent_settled") >= 1,
       EVENT_TIMEOUT_MS,
       "first native agent run settled",
@@ -1372,12 +1379,12 @@ test("native Pi TUI accepts an exact bracketed image-path answer in its first fr
 
     // The delivered answer arrives as an ordinary user message and starts a
     // normal next turn whose model context contains the answer.
-    await observerSignal.waitFor(
+    await observerSignal.waitForRecheck(
       () => countRecords(observerFile, "agent_start") >= 2,
       EVENT_TIMEOUT_MS,
       "second native agent run start from the UI-delivered answer",
     );
-    await observerSignal.waitFor(
+    await observerSignal.waitForRecheck(
       () => countRecords(observerFile, "agent_settled") >= 2,
       EVENT_TIMEOUT_MS,
       "second native agent run settled",
@@ -1442,7 +1449,7 @@ test("native Pi TUI accepts an exact bracketed image-path answer in its first fr
     assert.equal(processIsAlive(liveOwner.pty!.pid), false, "the owned native Pi child PID is no longer alive");
 
     // The genuine shutdown lifecycle ran in the real extension runtime.
-    await observerSignal.waitFor(
+    await observerSignal.waitForRecheck(
       () => countRecords(observerFile, "session_shutdown") > 0,
       EVENT_TIMEOUT_MS,
       "genuine native session_shutdown observation",
@@ -1730,8 +1737,8 @@ test("native Pi fullscreen: the compact shared popup scrolls by keyboard over th
   });
   owner = live;
 
-  const observerSignal = new ChangeSignal();
-  const providerSignal = new ChangeSignal();
+  const observerSignal = new DurableChangeSignal();
+  const providerSignal = new DurableChangeSignal();
   const closeObserverWatch = watchOwnedFile(observerDir, "popup.jsonl", observerSignal);
   const closeProviderWatch = watchOwnedFile(stateDir, "provider-journal.jsonl", providerSignal);
   const modelRequests = (): number => journalRecords(providerJournalFile).filter((record) => record.event === "model_request").length;
@@ -1762,13 +1769,13 @@ test("native Pi fullscreen: the compact shared popup scrolls by keyboard over th
 
   try {
     await statuses.waitFor((status) => status.type === "status", EVENT_TIMEOUT_MS, "authenticated native status");
-    await observerSignal.waitFor(() => countRecords(observerFile, "session_start") > 0, EVENT_TIMEOUT_MS, "native session_start");
+    await observerSignal.waitForRecheck(() => countRecords(observerFile, "session_start") > 0, EVENT_TIMEOUT_MS, "native session_start");
     const sessionStart = journalRecords(observerFile).find((record) => record.type === "session_start");
     assert.equal(sessionStart?.mode, "tui", "the scenario drives an actual interactive native TUI session");
     const activeTools = sessionStart?.activeTools as string[] | undefined;
     assert.ok(activeTools?.includes("AskUserQuestion") && activeTools.includes("YouShouldKnow"),
       "the real gate admits both shared-popup tools");
-    await providerSignal.waitFor(
+    await providerSignal.waitForRecheck(
       () => journalRecords(providerJournalFile).some((record) => record.event === "auto_model_selected"),
       EVENT_TIMEOUT_MS,
       "scripted faux model auto-selection",
@@ -1778,7 +1785,7 @@ test("native Pi fullscreen: the compact shared popup scrolls by keyboard over th
     live.pty!.write(POPUP_PROMPT);
     await live.frames.waitFor((frame) => frameContains(frame, POPUP_PROMPT), EVENT_TIMEOUT_MS, "prompt visible as an editor draft", beforePrompt);
     live.pty!.write(KEY_ENTER);
-    await observerSignal.waitFor(() => countRecords(observerFile, "agent_settled") >= 1, EVENT_TIMEOUT_MS, "first native agent run settled");
+    await observerSignal.waitForRecheck(() => countRecords(observerFile, "agent_settled") >= 1, EVENT_TIMEOUT_MS, "first native agent run settled");
     for (const toolName of ["YouShouldKnow", "AskUserQuestion"]) {
       assert.ok(journalRecords(observerFile).some((record) => record.type === "tool_execution_end"
         && record.toolName === toolName && record.isError === false), `${toolName} executed without error`);
@@ -1987,7 +1994,7 @@ test("native Pi fullscreen: the compact shared popup scrolls by keyboard over th
         && selectedBodyRow(nextView, `n1: ${POPUP_NOTICE_TITLE}`) && bodyContains(nextView, `n2: ${POPUP_SHORT_NOTICE_TITLE}`)
         && !bodyContains(nextView, "q1:") && nativeRowsAroundFrame(next, nextView);
     }, "confirming the choice answers only the question; the two-notice list is sized to its two entries");
-    await observerSignal.waitFor(() => countRecords(observerFile, "agent_settled") >= 2, EVENT_TIMEOUT_MS,
+    await observerSignal.waitForRecheck(() => countRecords(observerFile, "agent_settled") >= 2, EVENT_TIMEOUT_MS,
       "the confirmed choice starts and settles one ordinary answer turn");
     // The answer turn's echo renders in the LIVE native transcript outside the
     // still-open compact list (Pi follows the transcript end).
@@ -2016,7 +2023,7 @@ test("native Pi fullscreen: the compact shared popup scrolls by keyboard over th
       "the shortcut closes the popup, leaving both notices pending");
     assert.ok(frameContains(frame, `${ECHO_PREFIX}Answer to pending question`) && frameContains(frame, `": ${POPUP_CHOICE_B}`),
       "the delivered answer echo is visible at the transcript end");
-    await providerSignal.waitFor(() => modelRequests() >= 5, EVENT_TIMEOUT_MS, "the answer reaches the scripted model");
+    await providerSignal.waitForRecheck(() => modelRequests() >= 5, EVENT_TIMEOUT_MS, "the answer reaches the scripted model");
     const requests = journalRecords(providerJournalFile).filter((record) => record.event === "model_request");
     assert.equal(requests.length, 5, "exactly one model request followed the popup interaction");
     assert.equal(requests[4]?.lastUserPreview, expectedAnswer, "the exact selected choice reached the model as an ordinary user message");
@@ -2026,7 +2033,7 @@ test("native Pi fullscreen: the compact shared popup scrolls by keyboard over th
     await waitForOwnerExit(live, CHILD_EXIT_TIMEOUT_MS);
     assert.equal(live.exit?.exitCode, 0, "native Pi exits through the documented Ctrl+C-twice path");
     assert.equal(processIsAlive(live.pty!.pid), false, "the owned native Pi child is no longer alive");
-    await observerSignal.waitFor(() => countRecords(observerFile, "session_shutdown") > 0, EVENT_TIMEOUT_MS, "genuine session_shutdown");
+    await observerSignal.waitForRecheck(() => countRecords(observerFile, "session_shutdown") > 0, EVENT_TIMEOUT_MS, "genuine session_shutdown");
     assert.equal(live.parseFailed, false, "the production TerminalSurface accepted every native fullscreen frame");
   } finally {
     closeObserverWatch();

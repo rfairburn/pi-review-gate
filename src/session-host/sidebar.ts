@@ -50,6 +50,14 @@
  *   process and no confirmed exit is refused with a bounded notice.
  *   The stop confirmation freezes the target id and never retargets a later
  *   highlighted row; the quit host confirmation stays separate.
+ * - `n` displays no session: it detaches only this sidebar's own content/input
+ *   view (issue 474). Every session keeps running, the roster and its entries,
+ *   saved conversations, and the host itself are untouched, and a later Enter on
+ *   a row displays that session again; only the remembered active entry is
+ *   dropped, so a later roster restore cannot silently re-adopt a session the
+ *   operator deliberately stopped displaying. It is never Close, Quit, a removal,
+ *   or a stop, and while detached the local surface contributes no size to any
+ *   session.
  * - Roster/form/error text is sanitized (C0/C1/DEL and ANSI/OSC/APC
  *   sequences stripped) and bounded before it can appear in a rendered line.
  *   Generated hint text wraps across reserved footer rows instead of being
@@ -199,6 +207,8 @@ export type SidebarAction =
    * confirmed:true followed a deliberate confirmation of the frozen target.
    */
   | { readonly type: "stop-remove"; readonly id: string; readonly confirmed: boolean }
+  /** Detach only this sidebar's own content/input view (#474); never a stop, removal, or Quit. */
+  | { readonly type: "detach-view" }
   | { readonly type: "edit"; readonly id: string; readonly nativeSession: SessionHostNativeSession }
   /** Open the saved-conversation picker and list the shared native catalog. */
   | { readonly type: "saved-list"; readonly requestId: number }
@@ -2009,6 +2019,13 @@ export class SidebarController {
       this.editSelectedEntry();
       return;
     }
+    if (printable === "n" || printable === "N") {
+      // Explicit "no session displayed": a fresh press only, and it targets no
+      // highlighted row, so it needs no draw fence. A held n never re-fires.
+      if (isKeyRepeat(data)) return;
+      this.detachLocalView();
+      return;
+    }
     if (printable === "q" || printable === "Q") {
       // Menu `q` is the same explicit Quit action as the Quit host row.
       this.activateQuit();
@@ -2147,6 +2164,18 @@ export class SidebarController {
       return;
     }
     this.activateQuit();
+  }
+
+  /**
+   * `n`: display no session. Emits the local view detach, which retires only
+   * this sidebar's content/input participation — no stop, removal, quit, roster
+   * purge, or saved-conversation change — and cancels an in-flight exited-row
+   * restart so its completion cannot display itself over the operator's choice.
+   */
+  private detachLocalView(): void {
+    this.cancelRowResume();
+    this.noticeError = undefined;
+    this.emit({ type: "detach-view" });
   }
 
   private editSelectedEntry(): void {

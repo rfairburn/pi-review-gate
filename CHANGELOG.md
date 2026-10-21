@@ -15,6 +15,51 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.188]
+
+### Added
+
+- An inert TLS/WSS peer-transport foundation with KDE-style explicit device pairing
+  (#475). Explicit callers supply generated self-signed identities, consent and trust
+  stores, and a listener address; neither startup nor module import enables networking.
+  Actual TLS peer keys, remembered identity, and separate directional receiving grants
+  gate application channels. No CA-issued certificate or domain setup is required.
+  Bounded pairing metadata, cancellation, backpressure, and owned teardown are covered
+  without introducing session networking, pairing UI, persistent keys, or clipboard
+  synchronization. See [Paired peer transport foundation](docs/session-host-alpha.md#paired-peer-transport-foundation).
+- The session host sizes each session for the surfaces that actually display it, and can
+  display no session at all (#474). Every displayable surface registers as a viewer of one
+  session, and a session's canonical content size is the independent minimum of those widths
+  and the independent minimum of those heights (a 100x40 and an 80x50 surface on one session
+  give it 80x40). Only sessions whose viewer set changed are recomputed and only that
+  session's own child is resized, so a sibling nobody views keeps its size; a session whose
+  last viewer left keeps its last size, a session nobody has ever viewed keeps the existing
+  initial-sizing rule, and a surface with no content size contributes nothing. Those viewer
+  facts live once on the host's single session manager, and a completion carrying an older
+  viewer state is refused instead of resurrecting a detached view, retargeting a finished row,
+  or overwriting a later selection. With the roster focused, `n` displays no session: it
+  retires only this host's local content and input participation, so every session keeps
+  running, the roster, saved conversations, host lifetime, and Quit's child shutdown stay
+  unchanged, and Enter on a row displays that session again without restarting it. A session
+  smaller than its pane is drawn padded at the pane's top-left corner: that padding stays host
+  space, while the drawn content keeps its clipboard copy, click-to-focus, and image ownership,
+  and native positional input is authorized only against the frame actually written. This local
+  geometry change enables no network, remote protocol, daemon, stored state, or exclusive-control
+  lease, and viewing never
+  grants or revokes input. See
+  [Per-session content geometry](docs/session-host-alpha.md#per-session-content-geometry).
+
+### Changed
+
+- Session-host session operations now run through one presentation-independent local
+  owning-host boundary over the host's single session manager (#473). Starting a session,
+  admitting an authenticated background `SessionSpawn` sibling, resuming an exited row,
+  checking a saved-conversation deletion, and owned-child settlement at quit read and use
+  that one manager's facts, and a host run refuses to open a second manager. The sidebar
+  stays a disposable view of those facts, and delegated children gain no new
+  session-creation authority. No behavior, protocol, control, or setting changes. See
+  [One owning host, one session manager](docs/session-host-alpha.md#one-owning-host-one-session-manager).
+
 ## [0.1.0-dev.187]
 
 ### Fixed

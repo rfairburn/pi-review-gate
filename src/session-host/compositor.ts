@@ -217,19 +217,30 @@ export function composeHostFrame(layout: HostLayout, options: ComposeHostFrameOp
 		}
 	}
 
-	const graphics = options.nativeGraphics
+	const graphics = options.nativeGraphics !== undefined
 		&& options.main !== undefined
-		&& options.main.cols === layout.native.cols
-		&& options.main.rows === layout.native.rows
-		&& options.nativeGraphics.pane.column === layout.native.column
-		&& options.nativeGraphics.pane.row === layout.native.row
-		&& options.nativeGraphics.pane.cols === layout.native.cols
-		&& options.nativeGraphics.pane.rows === layout.native.rows
+		&& drawnContentMatchesLayer(options.main, options.nativeGraphics.pane, layout.native)
 		&& layout.form === undefined
 		&& !(layout.sidebarOverlay && layout.sidebar !== undefined && options.focus !== "main")
 		? options.nativeGraphics
 		: undefined;
 	return { lines, cursor, ...(graphics ? { graphics } : {}) };
+}
+
+/**
+ * A graphics layer is projected only into the rectangle its own frame actually
+ * filled. A session smaller than the native pane (#474) is drawn at the pane's
+ * top-left corner and padded, so that content rectangle — not the whole pane —
+ * bounds the layer, its images, and their fallback text. A layer claiming more
+ * than the frame drew, a frame larger than the pane (which composition clips),
+ * or malformed bounds keeps no image owner.
+ */
+function drawnContentMatchesLayer(main: TerminalFrame, layer: HostPaneRect, native: HostPaneRect): boolean {
+	return Number.isSafeInteger(main.cols) && Number.isSafeInteger(main.rows)
+		&& main.cols >= 1 && main.rows >= 1
+		&& main.cols <= native.cols && main.rows <= native.rows
+		&& layer.column === native.column && layer.row === native.row
+		&& layer.cols === main.cols && layer.rows === main.rows;
 }
 
 function validateDimension(value: number, label: "cols" | "rows"): void {

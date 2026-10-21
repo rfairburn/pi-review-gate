@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
+  appendFileSync,
   chmodSync,
   copyFileSync,
   existsSync,
@@ -33,6 +34,7 @@ import { HOST_BOOTSTRAP_ENV, type SessionHostStatus } from "../src/session-host/
 import { NativeAgentRegistry, ProfileRegistry, type PreparedProfile } from "../src/session-host/profiles";
 import { InstanceManager, type InstancePty, type InstanceSpawnDescriptor } from "../src/session-host/instances";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
+import { ChangeSignal as DurableChangeSignal } from "./helpers/session-host-native-windows-harness";
 import { skipOrFail } from "./bridge-fakes";
 
 const TEST_TIMEOUT_MS = 180_000;
@@ -535,6 +537,234 @@ function removeOwnedTreePruningTerraform(root: string): boolean {
   };
   removeEntry(root, "");
   return complete;
+}
+
+const MAX_DIAGNOSTIC_REQUEST_ROWS = 12;
+const DIAGNOSTIC_DIGEST_PREFIX_LENGTH = 16;
+const DIAGNOSTIC_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,31}$/;
+
+interface HandoffPromptExpectation {
+  /** Bounded label only; the prompt itself is never rendered. */
+  label: string;
+  prompt: string;
+}
+
+interface HandoffJournalBarrier {
+  /** Bounded identity for a failure report; never a prompt body. */
+  label: string;
+  /** The exact readiness predicate over durable journal records. */
+  predicate: (records: ReadonlyArray<Record<string, unknown>>) => boolean;
+  /** The original failure bound for this barrier; never widened or reset. */
+  timeoutMs: number;
+  /** The original failure description for this barrier. */
+  description: string;
+}
+
+interface SessionSpawnFailureEvidence {
+  /** Exact test-owned synthetic root whose evidence is kept after cleanup. */
+  retainedRoot: string;
+  /** Bounded, read-once failure facts attached to the original failure. */
+  diagnostics: string;
+}
+
+function promptJsonDigest(prompt: string): string {
+  // The single digest definition shared by the fidelity wait and its failure
+  // diagnostics: exact SHA-256 over JSON.stringify so lone-surrogate and
+  // whitespace differences are never conflated.
+  return createHash("sha256").update(JSON.stringify(prompt), "utf8").digest("hex");
+}
+
+function boundedNumericField(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "unknown";
+}
+
+function boundedDigestField(value: unknown): string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value)
+    ? value.slice(0, DIAGNOSTIC_DIGEST_PREFIX_LENGTH)
+    : "absent";
+}
+
+/**
+ * Bounded failure facts for the registered SessionSpawn handoff wait, read once
+ * at the original readiness deadline. It never renders prompt text, never
+ * claims an unreadable journal is empty, and never reinterprets matching
+ * records as success: it only reports what the retained journal contains.
+ */
+function describeSessionSpawnHandoffFailure(options: {
+  root: string;
+  journalPath: string;
+  expectations: readonly HandoffPromptExpectation[];
+  readJournal?: (path: string) => string;
+  /** Optional extra readiness fact reported as a boolean, never as success. */
+  barrier?: { label: string; matches: (records: ReadonlyArray<Record<string, unknown>>) => boolean };
+}): string {
+  const expected = options.expectations.map((expectation) => ({
+    label: expectation.label,
+    digest: promptJsonDigest(expectation.prompt),
+  }));
+  const parts = [`retained synthetic root ${options.root}`];
+  let journalText: string | undefined;
+  let readError = "unreadable";
+  let readableRecords: ReadonlyArray<Record<string, unknown>> | undefined;
+  try {
+    journalText = (options.readJournal ?? ((path: string) => readFileSync(path, "utf8")))(options.journalPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (typeof code === "string" && DIAGNOSTIC_ERROR_CODE_PATTERN.test(code)) readError = code;
+  }
+  let matches: Array<{ label: string; matched: boolean }> = [];
+  if (journalText === undefined) {
+    // A read failure is reported as unknown evidence, never as zero records.
+    parts.push(`provider journal unreadable (${readError}); record counts and digest matches are unknown, not zero`);
+  } else {
+    const lines = journalText.split("\n").filter((line) => line.trim().length > 0);
+    const journalRecords: Array<Record<string, unknown>> = [];
+    let unparsable = 0;
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) journalRecords.push(parsed as Record<string, unknown>);
+        else unparsable += 1;
+      } catch {
+        unparsable += 1;
+      }
+    }
+    const modelRequests = journalRecords.filter((record) => record.event === "model_request");
+    parts.push(`provider journal readable: ${lines.length} line(s), ${journalRecords.length} record(s), ${unparsable} unparsable record(s), ${modelRequests.length} model_request record(s)`);
+    for (const request of modelRequests.slice(0, MAX_DIAGNOSTIC_REQUEST_ROWS)) {
+      parts.push(`model_request pid=${boundedNumericField(request.pid)} requestIndex=${boundedNumericField(request.requestIndex)} lastUserLength=${boundedNumericField(request.lastUserLength)} lastUserSha256=${boundedDigestField(request.lastUserSha256)}`);
+    }
+    if (modelRequests.length > MAX_DIAGNOSTIC_REQUEST_ROWS) {
+      parts.push(`${modelRequests.length - MAX_DIAGNOSTIC_REQUEST_ROWS} further model_request record(s) omitted from bounded diagnostics`);
+    }
+    matches = expected.map((entry) => ({
+      label: entry.label,
+      matched: modelRequests.some((record) => record.lastUserSha256 === entry.digest),
+    }));
+    readableRecords = journalRecords;
+  }
+  parts.push(`expected exact digests: ${expected.map((entry) => `${entry.label} sha256=${entry.digest.slice(0, DIAGNOSTIC_DIGEST_PREFIX_LENGTH)}`).join(", ")}`);
+  parts.push(matches.length > 0
+    ? `exact expected digest matches: ${matches.map((match) => `${match.label}=${match.matched}`).join(", ")}`
+    : "exact expected digest matches: unknown (provider journal unreadable)");
+  if (options.barrier) {
+    let barrierVerdict = "unknown (provider journal unreadable)";
+    if (readableRecords !== undefined) {
+      try {
+        barrierVerdict = String(options.barrier.matches(readableRecords));
+      } catch {
+        barrierVerdict = "unknown (barrier predicate failed)";
+      }
+    }
+    parts.push(`barrier ${options.barrier.label}=${barrierVerdict}`);
+  }
+  return parts.join("; ");
+}
+
+/**
+ * Record retention intent and bounded facts without ever replacing the original
+ * readiness failure: a diagnostics defect still reports the retained root.
+ */
+function collectSessionSpawnHandoffFailure(options: {
+  root: string;
+  journalPath: string;
+  expectations: readonly HandoffPromptExpectation[];
+  readJournal?: (path: string) => string;
+  barrier?: { label: string; matches: (records: ReadonlyArray<Record<string, unknown>>) => boolean };
+}): SessionSpawnFailureEvidence {
+  try {
+    return { retainedRoot: options.root, diagnostics: describeSessionSpawnHandoffFailure(options) };
+  } catch {
+    return {
+      retainedRoot: options.root,
+      diagnostics: `retained synthetic root ${options.root}; bounded failure diagnostics unavailable`,
+    };
+  }
+}
+
+/**
+ * Decide the fate of the test-owned synthetic root after every owned process,
+ * subscription, broker, registration, and profile has already been cleaned up
+ * and settled. A recorded handoff failure keeps exactly that owned root so its
+ * evidence survives; cleanup-error precedence and the existing unexpected-entry
+ * failure stay unchanged.
+ */
+function finalizeEvidenceRoot(options: {
+  root: string;
+  retainedRoot?: string;
+  cleanupError?: unknown;
+  remove?: (root: string) => boolean;
+}): { cleanupError?: unknown; retainedRoot?: string } {
+  if (options.cleanupError) return { cleanupError: options.cleanupError, retainedRoot: options.retainedRoot };
+  if (options.retainedRoot !== undefined) {
+    if (resolve(options.retainedRoot) !== resolve(options.root)) {
+      return {
+        cleanupError: new Error("the recorded native proof evidence root is not the test-owned synthetic root"),
+        retainedRoot: options.retainedRoot,
+      };
+    }
+    return { retainedRoot: options.retainedRoot };
+  }
+  if (!(options.remove ?? removeOwnedTreePruningTerraform)(options.root)) {
+    return { cleanupError: new Error("native proof cleanup preserved an unexpected entry"), retainedRoot: options.retainedRoot };
+  }
+  return { retainedRoot: options.retainedRoot };
+}
+
+/**
+ * One durable prompt-journal readiness barrier. It uses the already-exported
+ * durable `ChangeSignal.waitForRecheck` with the exact predicate, the original
+ * timeout, and the original description, so an independently appended durable
+ * record is observed even when no watcher notification arrives. It never
+ * retries, resets, or extends the bound, and a diagnostic record never becomes
+ * success. A failure is rethrown unchanged with bounded retained evidence.
+ */
+async function awaitDurableJournalBarrier(options: {
+  signal: DurableChangeSignal;
+  barrier: HandoffJournalBarrier;
+  records: () => ReadonlyArray<Record<string, unknown>>;
+  onFailure?: (barrier: HandoffJournalBarrier) => SessionSpawnFailureEvidence | undefined;
+}): Promise<void> {
+  try {
+    await options.signal.waitForRecheck(
+      () => options.barrier.predicate(options.records()),
+      options.barrier.timeoutMs,
+      options.barrier.description,
+    );
+  } catch (error) {
+    const evidence = options.onFailure?.(options.barrier);
+    if (!evidence) throw error;
+    const originalMessage = error instanceof Error ? error.message : `${options.barrier.description}: operation failed`;
+    throw new Error(`${originalMessage} (${evidence.diagnostics})`, { cause: error });
+  }
+}
+
+/**
+ * The registered handoff case's two positive provider-journal barriers: the
+ * exact long+short digest predicate and the existing parent follow-up
+ * requestIndex barrier. Their original bounds and descriptions live here so the
+ * deterministic control can assert they were not widened, reset, or reworded.
+ */
+function sessionSpawnJournalBarriers(options: {
+  longPrompt: string;
+  shortPrompt: string;
+  expectedDigest: (prompt: string) => string;
+}): HandoffJournalBarrier[] {
+  return [
+    {
+      label: "long-and-short-first-user-text",
+      predicate: (journalRecords) => [options.longPrompt, options.shortPrompt].every((prompt) => journalRecords
+        .some((record) => record.event === "model_request" && record.lastUserSha256 === options.expectedDigest(prompt))),
+      timeoutMs: 90_000,
+      description: "real native children receive exact long and short first-user text",
+    },
+    {
+      label: "parent-followup-requestIndex",
+      predicate: (journalRecords) => journalRecords.some((record) => record.requestIndex === 1),
+      timeoutMs: EVENT_TIMEOUT_MS,
+      description: "parent observes all native tool results",
+    },
+  ];
 }
 
 function safeNodeOptionsQuote(path: string): string {
@@ -1268,9 +1498,12 @@ test("two real native Pi PTYs retain per-owner status, draft, gate-menu, query-r
   }
 
   const observationDeadline = EVENT_TIMEOUT_MS;
-  const observationSignalA = new ChangeSignal();
-  const observationSignalB = new ChangeSignal();
-  const watchObserver = (path: string, signal: ChangeSignal): (() => void) => {
+  // Dedicated durable-file signals: each `fs.watch` notification only triggers a
+  // re-read of that owned observer journal, so readiness uses the shared durable
+  // recheck. Both predicates, the deadline, and the descriptions are unchanged.
+  const observationSignalA = new DurableChangeSignal();
+  const observationSignalB = new DurableChangeSignal();
+  const watchObserver = (path: string, signal: DurableChangeSignal): (() => void) => {
     const fsWatch = require("node:fs").watch(dirname(path), (_event: string, filename: string | Buffer | null) => {
       if (filename === null || filename.toString() === path.slice(dirname(path).length + 1)) signal.notify();
     }) as { close(): void };
@@ -1280,8 +1513,8 @@ test("two real native Pi PTYs retain per-owner status, draft, gate-menu, query-r
   const closeWatchB = watchObserver(join(root, "observer", "owner-b.jsonl"), observationSignalB);
   try {
     await Promise.all([
-      observationSignalA.waitFor(() => observerRecords(join(root, "observer", "owner-a.jsonl")).some((record) => record.type === "session_start"), observationDeadline, "owner A native ctx.isIdle observation"),
-      observationSignalB.waitFor(() => observerRecords(join(root, "observer", "owner-b.jsonl")).some((record) => record.type === "session_start"), observationDeadline, "owner B native ctx.isIdle observation"),
+      observationSignalA.waitForRecheck(() => observerRecords(join(root, "observer", "owner-a.jsonl")).some((record) => record.type === "session_start"), observationDeadline, "owner A native ctx.isIdle observation"),
+      observationSignalB.waitForRecheck(() => observerRecords(join(root, "observer", "owner-b.jsonl")).some((record) => record.type === "session_start"), observationDeadline, "owner B native ctx.isIdle observation"),
     ]);
   } finally {
     closeWatchA();
@@ -1452,7 +1685,7 @@ test("real Pi receives literal SessionSpawn prompts and preserves long native ti
     journal: string;
     prompt: string;
     title: string;
-    signal: ChangeSignal;
+    signal: DurableChangeSignal;
   }> = [];
   for (const request of cases) {
     const profile = registry.prepare({ workspace: createWorkspace(root, `workspace-${request.key}`) });
@@ -1495,7 +1728,9 @@ test("real Pi receives literal SessionSpawn prompts and preserves long native ti
     assert.equal(nativeDescriptor.cwd, profile.workspace, "the native child runs in the explicitly selected workspace");
     assert.equal(nativeDescriptor.args.includes(request.prompt), false, "the prompt never reaches Pi's CLI parser");
     const providerJournal = join(providerState, "provider-journal.jsonl");
-    const signal = new ChangeSignal();
+    // The provider journal is a durable file appended by the native child; this
+    // dedicated signal's only live trigger is the directory `fs.watch`.
+    const signal = new DurableChangeSignal();
     watchers.push(watch(providerState, () => signal.notify()));
     prepared.push({
       id: request.id,
@@ -1541,7 +1776,7 @@ test("real Pi receives literal SessionSpawn prompts and preserves long native ti
     const readProviderRecords = (): Array<Record<string, unknown>> => existsSync(entry.journal)
       ? readFileSync(entry.journal, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>)
       : [];
-    await entry.signal.waitFor(
+    await entry.signal.waitForRecheck(
       () => readProviderRecords().some((record) => record.event === "model_request"),
       EVENT_TIMEOUT_MS,
       `${entry.id} real Pi faux-provider receives its first native user turn`,
@@ -1575,6 +1810,8 @@ test("real registered SessionSpawn delivers one exact long handoff and one short
   const root = makeSyntheticRoot();
   const owned: Array<{ handle: InstancePty; descriptor: InstanceSpawnDescriptor; exited: boolean; subscription?: Disposable }> = [];
   const signal = new ChangeSignal();
+  const journalSignal = new DurableChangeSignal();
+  let handoffFailureEvidence: SessionSpawnFailureEvidence | undefined;
   let manager: InstanceManager | undefined;
   let broker: StatusBroker | undefined;
   let watcher: ReturnType<typeof watch> | undefined;
@@ -1603,8 +1840,24 @@ test("real registered SessionSpawn delivers one exact long handoff and one short
       try { await broker?.dispose(); } catch (error) { cleanupError ??= error; }
     }
     for (const entry of owned) entry.subscription?.dispose();
-    if (!cleanupError && !removeOwnedTreePruningTerraform(root)) cleanupError = new Error("native proof cleanup preserved an unexpected entry");
-    if (cleanupError) throw cleanupError;
+    // Every owned process, subscription, broker, registration, and profile above
+    // was cleaned up and its settlement asserted exactly as before. Only a
+    // recorded handoff failure keeps this test-owned root so its evidence
+    // survives the after hook.
+    const disposition = finalizeEvidenceRoot({
+      root,
+      retainedRoot: handoffFailureEvidence?.retainedRoot,
+      cleanupError,
+    });
+    cleanupError = disposition.cleanupError;
+    if (disposition.retainedRoot !== undefined) {
+      if (disposition.cleanupError !== undefined) {
+        const message = disposition.cleanupError instanceof Error ? disposition.cleanupError.message : "native proof cleanup failed";
+        throw new Error(`${message}; native proof evidence retained at ${disposition.retainedRoot}`);
+      }
+      t.diagnostic(`native proof evidence retained at ${disposition.retainedRoot}`);
+    }
+    if (disposition.cleanupError !== undefined) throw disposition.cleanupError;
   });
   initializeSyntheticDirectories(root);
   assertBrokerSocketPathBudget(root);
@@ -1669,7 +1922,7 @@ module.exports = (pi) => {
   const providerJournal = join(providerState, "provider-journal.jsonl");
   const records = (path: string): Array<Record<string, unknown>> => existsSync(path)
     ? readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>) : [];
-  watcher = watch(providerState, () => signal.notify());
+  watcher = watch(providerState, () => journalSignal.notify());
   const env = {
     ...makeSyntheticEnvironment(root, candidate.nodePath),
     PI_CODING_AGENT_DIR: agentDir,
@@ -1705,14 +1958,34 @@ module.exports = (pi) => {
     },
   });
   await manager.create({ workspace: parentWorkspace, initialRequest: { title: "Synthetic spawn parent", prompt: trigger } });
-  const expectedDigest = (prompt: string): string => createHash("sha256").update(JSON.stringify(prompt), "utf8").digest("hex");
-  await signal.waitFor(() => [longPrompt, shortPrompt].every((prompt) => records(providerJournal)
-    .some((record) => record.event === "model_request" && record.lastUserSha256 === expectedDigest(prompt))),
-  90_000, "real native children receive exact long and short first-user text");
-  // A parent follow-up model request happens only after all three native
-  // tool results, so its journal event is also an event-driven barrier.
-  await signal.waitFor(() => records(providerJournal).some((record) => record.requestIndex === 1),
-    EVENT_TIMEOUT_MS, "parent observes all native tool results");
+  const expectedDigest = promptJsonDigest;
+  // The provider journal is durable evidence appended by independent native
+  // children, so its readiness barriers use a separate durable recheck signal
+  // driven by this test's own watcher notification (fast path only). The
+  // file-local `signal` above stays notification-only for in-process uses.
+  const journalBarriers = sessionSpawnJournalBarriers({ longPrompt, shortPrompt, expectedDigest });
+  const promptExpectations: HandoffPromptExpectation[] = [
+    { label: "long-prompt", prompt: longPrompt },
+    { label: "short-prompt", prompt: shortPrompt },
+  ];
+  for (const barrier of journalBarriers) {
+    await awaitDurableJournalBarrier({
+      signal: journalSignal,
+      barrier,
+      records: () => records(providerJournal),
+      onFailure: (failed) => {
+        // Retention and bounded facts survive either readiness barrier; a
+        // matching diagnostic record still never becomes success.
+        handoffFailureEvidence = collectSessionSpawnHandoffFailure({
+          root,
+          journalPath: providerJournal,
+          expectations: promptExpectations,
+          barrier: { label: failed.label, matches: (journalRecords) => failed.predicate(journalRecords) },
+        });
+        return handoffFailureEvidence;
+      },
+    });
+  }
   assert.deepEqual(hostRequests, requests.slice(1), "schema rejection creates no child; each valid request reaches the production broker exactly once");
   assert.equal(owned.length, 3, "one parent plus exactly one long-prompt and one short-prompt child, with no automatic retry/grandchild");
   const schemaRows = records(observerLog).filter((record) => record.type === "schema");
@@ -1740,5 +2013,360 @@ module.exports = (pi) => {
     assert.equal(turns[0]!.lastUserLength, prompt.length);
     assert.equal(turns[0]!.lastUserSha256, expectedDigest(prompt));
     assert.equal(turns[0]!.userMessageCount, 1, "no parent history or startup context is inherited");
+  }
+});
+
+test("bounded handoff failure diagnostics retain the owned evidence root without weakening the exact fidelity predicate", { timeout: 30_000 }, async (t) => {
+  // Deterministic control for the failure path of the registered native
+  // SessionSpawn handoff case: no native runtime, PTY, provider, or broker is
+  // involved. It exercises the same helpers that case uses at its original
+  // deadline, so retention and bounded facts stay covered even when the real
+  // handoff passes.
+  const createdRoots: string[] = [];
+  const makeEvidenceRoot = (): string => {
+    const root = mkdtempSync(join(tmpdir(), "prg-handoff-evidence-"));
+    createdRoots.push(root);
+    return root;
+  };
+  t.after(() => {
+    for (const root of createdRoots) {
+      try { removeOwnedTreePruningTerraform(root); } catch { /* only test-owned temporary roots are addressed */ }
+    }
+  });
+
+  const longPrompt = `LONG_HANDOFF_PROMPT_${"z".repeat(96)}\n`;
+  const shortPrompt = "@literal-file-is-not-expanded\nKeep the final newline.\n";
+  const expectations: HandoffPromptExpectation[] = [
+    { label: "long-prompt", prompt: longPrompt },
+    { label: "short-prompt", prompt: shortPrompt },
+  ];
+  const expectedLongDigest = createHash("sha256").update(JSON.stringify(longPrompt), "utf8").digest("hex");
+  assert.equal(promptJsonDigest(longPrompt), expectedLongDigest,
+    "failure diagnostics use the exact JSON-string SHA-256 predicate of the fidelity wait");
+  const shortDigest = promptJsonDigest(shortPrompt);
+  const driftedLongDigest = promptJsonDigest(`${longPrompt}drifted`);
+
+  // 1. Readable journal: bounded model_request metadata and exact match booleans.
+  const readableRoot = makeEvidenceRoot();
+  const journalPath = join(readableRoot, "provider-journal.jsonl");
+  writeFileSync(journalPath, [
+    JSON.stringify({ event: "provider_registered" }),
+    JSON.stringify({ event: "model_request", pid: 4242, requestIndex: 0, lastUserLength: shortPrompt.length, lastUserSha256: shortDigest }),
+    JSON.stringify({ event: "model_request", pid: 4343, requestIndex: 1, lastUserLength: longPrompt.length + 7, lastUserSha256: driftedLongDigest }),
+    "{torn",
+    "",
+  ].join("\n"), { mode: 0o600 });
+  const readable = collectSessionSpawnHandoffFailure({ root: readableRoot, journalPath, expectations });
+  assert.equal(readable.retainedRoot, readableRoot, "the exact owned root is the reported evidence location");
+  assert.ok(readable.diagnostics.includes(`retained synthetic root ${readableRoot}`), "the retained root location is reported");
+  assert.ok(
+    readable.diagnostics.includes("4 line(s), 3 record(s), 1 unparsable record(s), 2 model_request record(s)"),
+    `the bounded record count reports real journal contents: ${readable.diagnostics}`,
+  );
+  assert.ok(readable.diagnostics.includes("model_request pid=4242 requestIndex=0"), "bounded pid/requestIndex metadata is retained");
+  assert.ok(readable.diagnostics.includes(`lastUserLength=${shortPrompt.length}`), "bounded user length is retained");
+  assert.ok(readable.diagnostics.includes(`lastUserSha256=${shortDigest.slice(0, DIAGNOSTIC_DIGEST_PREFIX_LENGTH)}`),
+    "only a bounded digest prefix is retained");
+  assert.ok(readable.diagnostics.includes(`long-prompt sha256=${expectedLongDigest.slice(0, DIAGNOSTIC_DIGEST_PREFIX_LENGTH)}`),
+    "the expected exact long-prompt digest is reported");
+  assert.ok(readable.diagnostics.includes("exact expected digest matches: long-prompt=false, short-prompt=true"),
+    "expectation matches are reported as exact booleans, not as success");
+  assert.equal(readable.diagnostics.includes(longPrompt), false, "the whole long prompt is never logged");
+  assert.equal(readable.diagnostics.includes("LONG_HANDOFF_PROMPT_"), false, "no long-prompt body is logged");
+  assert.equal(readable.diagnostics.includes(shortPrompt), false, "no prompt body is logged");
+  assert.equal(readable.diagnostics.includes(driftedLongDigest), false, "only bounded digest prefixes are logged");
+
+  // 2. Bounded row count: surplus model_request rows are summarized, not dumped.
+  const crowdedRoot = makeEvidenceRoot();
+  const crowdedJournal = join(crowdedRoot, "provider-journal.jsonl");
+  writeFileSync(crowdedJournal, `${Array.from({ length: 20 }, (_, index) => JSON.stringify({
+    event: "model_request", pid: 5000 + index, requestIndex: index, lastUserLength: 10, lastUserSha256: shortDigest,
+  })).join("\n")}\n`, { mode: 0o600 });
+  const crowded = collectSessionSpawnHandoffFailure({ root: crowdedRoot, journalPath: crowdedJournal, expectations });
+  assert.ok(crowded.diagnostics.includes("20 model_request record(s)"), "the full record count stays visible");
+  assert.ok(crowded.diagnostics.includes(`${20 - MAX_DIAGNOSTIC_REQUEST_ROWS} further model_request record(s) omitted from bounded diagnostics`),
+    "diagnostics stay bounded above their row ceiling");
+
+  // 3. Unreadable journal: unknown evidence, never a zero-record claim.
+  const unreadableRoot = makeEvidenceRoot();
+  const unreadable = collectSessionSpawnHandoffFailure({
+    root: unreadableRoot,
+    journalPath: join(unreadableRoot, "absent", "provider-journal.jsonl"),
+    expectations,
+  });
+  assert.ok(unreadable.diagnostics.includes("provider journal unreadable (ENOENT)"),
+    `the read failure is reported as an error: ${unreadable.diagnostics}`);
+  assert.ok(unreadable.diagnostics.includes("unknown, not zero"), "a read error is never reported as no records");
+  assert.ok(unreadable.diagnostics.includes("exact expected digest matches: unknown (provider journal unreadable)"),
+    "unreadable evidence yields no digest verdict");
+  assert.equal(unreadable.diagnostics.includes("0 record(s)"), false, "no fabricated empty-journal count is emitted");
+
+  // 4. A diagnostics defect still reports retention and never replaces the failure.
+  const fallback = collectSessionSpawnHandoffFailure({
+    root: readableRoot,
+    journalPath,
+    expectations: [{ label: "broken", prompt: undefined as unknown as string }],
+  });
+  assert.equal(fallback.retainedRoot, readableRoot, "retention survives a diagnostics defect");
+  assert.ok(fallback.diagnostics.includes(`retained synthetic root ${readableRoot}`));
+  assert.ok(fallback.diagnostics.includes("bounded failure diagnostics unavailable"));
+
+  // 5. Retention: the recorded failure keeps exactly the owned root on disk.
+  const retainedRoot = makeEvidenceRoot();
+  writeFileSync(join(retainedRoot, "provider-journal.jsonl"), JSON.stringify({ event: "model_request" }), { mode: 0o600 });
+  const retained = finalizeEvidenceRoot({ root: retainedRoot, retainedRoot });
+  assert.equal(retained.cleanupError, undefined, "intentional retention is not a cleanup failure");
+  assert.equal(retained.retainedRoot, retainedRoot);
+  assert.equal(existsSync(join(retainedRoot, "provider-journal.jsonl")), true, "retained evidence is still readable");
+
+  // 6. Without a recorded failure the existing bounded cleanup still removes it.
+  const discardedRoot = makeEvidenceRoot();
+  writeFileSync(join(discardedRoot, "marker.txt"), "marker", { mode: 0o600 });
+  const discarded = finalizeEvidenceRoot({ root: discardedRoot });
+  assert.equal(discarded.cleanupError, undefined, "ordinary cleanup still succeeds");
+  assert.equal(discarded.retainedRoot, undefined, "ordinary cleanup retains nothing");
+  assert.equal(existsSync(discardedRoot), false, "the unchanged bounded cleanup removed the owned root");
+
+  // 7. An existing cleanup failure still fails the after hook and keeps evidence.
+  const failedCleanupRoot = makeEvidenceRoot();
+  const settlementError = new Error("native proof child settlement unconfirmed; retain fixture");
+  const preserved = finalizeEvidenceRoot({
+    root: failedCleanupRoot,
+    retainedRoot: failedCleanupRoot,
+    cleanupError: settlementError,
+    remove: () => { throw new Error("removal must not be attempted after a cleanup failure"); },
+  });
+  assert.equal(preserved.cleanupError, settlementError, "the original cleanup failure is preserved verbatim");
+  assert.equal(existsSync(failedCleanupRoot), true);
+
+  // 8. A mismatched evidence root fails closed without removing either path.
+  const mismatchedRoot = makeEvidenceRoot();
+  const mismatched = finalizeEvidenceRoot({
+    root: mismatchedRoot,
+    retainedRoot: join(mismatchedRoot, "other-root"),
+    remove: () => { throw new Error("removal must not be attempted for an unmatched evidence root"); },
+  });
+  assert.ok(mismatched.cleanupError instanceof Error, "an unmatched evidence root fails closed");
+  assert.equal(mismatched.cleanupError.message, "the recorded native proof evidence root is not the test-owned synthetic root");
+  assert.equal(existsSync(mismatchedRoot), true);
+
+  // 9. Incomplete removal keeps the existing unexpected-entry failure.
+  const unexpectedRoot = makeEvidenceRoot();
+  const unexpected = finalizeEvidenceRoot({ root: unexpectedRoot, remove: () => false });
+  assert.ok(unexpected.cleanupError instanceof Error, "incomplete removal still fails closed");
+  assert.equal(unexpected.cleanupError.message, "native proof cleanup preserved an unexpected entry");
+  assert.equal(existsSync(unexpectedRoot), true);
+});
+
+test("durable prompt-journal readiness observes un-notified exact records while notification-only readiness and wrong evidence still fail at their bounds", { timeout: 30_000 }, async (t) => {
+  // Deterministic control for the actual prompt-journal readiness wiring of the
+  // registered handoff case. Only scheduling and time are virtual (node:test
+  // mock timers for setTimeout/setInterval/Date); every journal fact is a real
+  // file written synchronously by this test, and the awaited barrier is the
+  // same awaitDurableJournalBarrier the native case uses. Nothing here sleeps,
+  // polls, or retries, and no bound is widened: the native case's original
+  // 90s/25s bounds are asserted unchanged below.
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 0 });
+  const CONTROL_BOUND_MS = 500;
+  const CONTROL_FAILURE_BOUND_MS = 200;
+  const RECHECK_TICK_MS = 25; // the shared durable ChangeSignal recheck cadence
+  const createdRoots: string[] = [];
+  const root = mkdtempSync(join(tmpdir(), "prg-handoff-wiring-"));
+  createdRoots.push(root);
+  t.after(() => {
+    for (const created of createdRoots) {
+      try { removeOwnedTreePruningTerraform(created); } catch { /* only test-owned temporary roots are addressed */ }
+    }
+  });
+  try {
+    const readRecords = (path: string): Array<Record<string, unknown>> => existsSync(path)
+      ? readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>)
+      : [];
+
+    const longPrompt = `DURABLE_WIRING_LONG_${"q".repeat(48)}\n`;
+    const shortPrompt = "@literal-not-expanded\nkeep the newline.\n";
+    const expectedDigest = promptJsonDigest;
+    const expectations: HandoffPromptExpectation[] = [
+      { label: "long-prompt", prompt: longPrompt },
+      { label: "short-prompt", prompt: shortPrompt },
+    ];
+    const longLine = JSON.stringify({ event: "model_request", pid: 7101, requestIndex: 0, lastUserLength: longPrompt.length, lastUserSha256: expectedDigest(longPrompt) });
+    const shortLine = JSON.stringify({ event: "model_request", pid: 7102, requestIndex: 0, lastUserLength: shortPrompt.length, lastUserSha256: expectedDigest(shortPrompt) });
+    const nativeBarriers = sessionSpawnJournalBarriers({ longPrompt, shortPrompt, expectedDigest });
+    assert.deepEqual(nativeBarriers.map((barrier) => [barrier.label, barrier.timeoutMs, barrier.description]), [
+      ["long-and-short-first-user-text", 90_000, "real native children receive exact long and short first-user text"],
+      ["parent-followup-requestIndex", EVENT_TIMEOUT_MS, "parent observes all native tool results"],
+    ], "the native barriers keep their original bounds, descriptions, and order");
+    const controlBarriers = sessionSpawnJournalBarriers({ longPrompt, shortPrompt, expectedDigest });
+    const digestBarrier: HandoffJournalBarrier = { ...controlBarriers[0]!, timeoutMs: CONTROL_BOUND_MS };
+    const parentBarrier: HandoffJournalBarrier = { ...controlBarriers[1]!, timeoutMs: CONTROL_BOUND_MS };
+    const durable = new DurableChangeSignal();
+    const notificationOnly = new ChangeSignal();
+
+    // 1. Durable opt-in: genuine records append synchronously with NO notify.
+    //    Virtual recheck ticks with only one exact digest present stay pending,
+    //    and the tick after the second append settles the wait.
+    const durableJournal = join(root, "durable-journal.jsonl");
+    writeFileSync(durableJournal, `${JSON.stringify({ event: "provider_registered" })}\n`, { mode: 0o600 });
+    assert.equal(digestBarrier.predicate(readRecords(durableJournal)), false,
+      "the immediate evaluation cannot satisfy the predicate before the append");
+    const durableWait = awaitDurableJournalBarrier({
+      signal: durable,
+      barrier: digestBarrier,
+      records: () => readRecords(durableJournal),
+    });
+    appendFileSync(durableJournal, `${longLine}\n`, "utf8");
+    t.mock.timers.tick(RECHECK_TICK_MS);
+    t.mock.timers.tick(RECHECK_TICK_MS);
+    assert.equal(durable.pendingWaiterCount, 1,
+      "recheck ticks stay pending while the short exact digest is still absent");
+    appendFileSync(durableJournal, `${shortLine}\n`, "utf8");
+    t.mock.timers.tick(RECHECK_TICK_MS);
+    await durableWait;
+    assert.equal(digestBarrier.predicate(readRecords(durableJournal)), true, "the exact long+short digests are genuinely present on disk");
+    assert.equal(durable.pendingWaiterCount, 0, "the durable wait settled exactly once inside its virtual bound");
+
+    // 2. Notification-only baseline: the same predicate, genuine records, and
+    //    the same configured bound expires at exactly that virtual deadline.
+    const baselineJournal = join(root, "notification-only-journal.jsonl");
+    writeFileSync(baselineJournal, "", { mode: 0o600 });
+    assert.equal(digestBarrier.predicate(readRecords(baselineJournal)), false,
+      "the notification-only baseline also starts without the exact records");
+    const baselineRejection = assert.rejects(
+      notificationOnly.waitFor(
+        () => digestBarrier.predicate(readRecords(baselineJournal)),
+        CONTROL_BOUND_MS,
+        digestBarrier.description,
+      ),
+      /real native children receive exact long and short first-user text: deadline exceeded/,
+      "notification-only readiness still expires when no notification arrives",
+    );
+    appendFileSync(baselineJournal, `${longLine}\n${shortLine}\n`, "utf8");
+    // Nothing notifies this wait and it has no recheck, so it can only settle
+    // on its own virtual deadline; the deadline error is that settlement fact.
+    t.mock.timers.tick(CONTROL_BOUND_MS - 1);
+    t.mock.timers.tick(1);
+    await baselineRejection;
+    assert.equal(digestBarrier.predicate(readRecords(baselineJournal)), true,
+      "the same exact records were durably present; only the notification was missing");
+
+    // 3. A permanently wrong digest still fails at the barrier's virtual bound,
+    //    and its evidence reports the exact boolean facts instead of success.
+    const driftedJournal = join(root, "drifted-journal.jsonl");
+    writeFileSync(driftedJournal, [
+      JSON.stringify({ event: "model_request", pid: 7103, requestIndex: 0, lastUserLength: longPrompt.length + 7, lastUserSha256: expectedDigest(`${longPrompt}drifted`) }),
+      shortLine,
+      "",
+    ].join("\n"), { mode: 0o600 });
+    let driftedEvidence: SessionSpawnFailureEvidence | undefined;
+    const driftedRejection = assert.rejects(awaitDurableJournalBarrier({
+      signal: durable,
+      barrier: { ...digestBarrier, timeoutMs: CONTROL_FAILURE_BOUND_MS },
+      records: () => readRecords(driftedJournal),
+      onFailure: (failed) => {
+        driftedEvidence = collectSessionSpawnHandoffFailure({
+          root,
+          journalPath: driftedJournal,
+          expectations,
+          barrier: { label: failed.label, matches: (journalRecords) => failed.predicate(journalRecords) },
+        });
+        return driftedEvidence;
+      },
+    }), /real native children receive exact long and short first-user text: deadline exceeded/,
+    "a permanently wrong digest can never satisfy the durable barrier");
+    t.mock.timers.tick(CONTROL_FAILURE_BOUND_MS - 1);
+    assert.equal(durable.pendingWaiterCount, 1,
+      "the wrong-digest barrier is still pending one virtual millisecond before its bound");
+    t.mock.timers.tick(1);
+    await driftedRejection;
+    assert.equal(durable.pendingWaiterCount, 0, "no durable wait remains pending after the wrong-digest barrier fails");
+    assert.ok(driftedEvidence);
+    assert.equal(driftedEvidence.retainedRoot, root, "the failing barrier reports the owned evidence root");
+    assert.ok(driftedEvidence.diagnostics.includes("exact expected digest matches: long-prompt=false, short-prompt=true"),
+      `bounded facts report the exact mismatch: ${driftedEvidence.diagnostics}`);
+    assert.ok(driftedEvidence.diagnostics.includes("barrier long-and-short-first-user-text=false"));
+    assert.equal(driftedEvidence.diagnostics.includes(longPrompt), false, "the whole long prompt is never logged");
+
+    // 4. A missing digest in a readable journal fails and is reported as a real
+    //    zero-record count, never as an unreadable-journal excuse.
+    const emptyJournal = join(root, "empty-journal.jsonl");
+    writeFileSync(emptyJournal, "", { mode: 0o600 });
+    let missingEvidence: SessionSpawnFailureEvidence | undefined;
+    const missingRejection = assert.rejects(awaitDurableJournalBarrier({
+      signal: durable,
+      barrier: { ...digestBarrier, timeoutMs: CONTROL_FAILURE_BOUND_MS },
+      records: () => readRecords(emptyJournal),
+      onFailure: (failed) => {
+        missingEvidence = collectSessionSpawnHandoffFailure({
+          root,
+          journalPath: emptyJournal,
+          expectations,
+          barrier: { label: failed.label, matches: (journalRecords) => failed.predicate(journalRecords) },
+        });
+        return missingEvidence;
+      },
+    }), /real native children receive exact long and short first-user text: deadline exceeded/,
+    "absent exact records can never satisfy the durable barrier");
+    t.mock.timers.tick(CONTROL_FAILURE_BOUND_MS);
+    await missingRejection;
+    assert.equal(durable.pendingWaiterCount, 0, "no durable wait remains pending after the missing-digest barrier fails");
+    assert.ok(missingEvidence);
+    assert.ok(missingEvidence.diagnostics.includes("provider journal readable: 0 line(s), 0 record(s), 0 unparsable record(s), 0 model_request record(s)"),
+      `a readable empty journal is reported as a real zero count: ${missingEvidence.diagnostics}`);
+    assert.ok(missingEvidence.diagnostics.includes("exact expected digest matches: long-prompt=false, short-prompt=false"));
+    assert.equal(missingEvidence.diagnostics.includes("unreadable"), false, "a readable journal is never reported as unreadable");
+
+    // 5. An absent parent follow-up barrier still fails at its own virtual bound
+    //    even though both exact digests are present, so matching records never
+    //    become success.
+    const parentJournal = join(root, "parent-barrier-journal.jsonl");
+    writeFileSync(parentJournal, `${longLine}\n${shortLine}\n`, { mode: 0o600 });
+    assert.equal(parentBarrier.predicate(readRecords(parentJournal)), false,
+      "the parent barrier record is absent while both exact digests are already present");
+    let parentEvidence: SessionSpawnFailureEvidence | undefined;
+    const parentRejection = assert.rejects(awaitDurableJournalBarrier({
+      signal: durable,
+      barrier: { ...parentBarrier, timeoutMs: CONTROL_FAILURE_BOUND_MS },
+      records: () => readRecords(parentJournal),
+      onFailure: (failed) => {
+        parentEvidence = collectSessionSpawnHandoffFailure({
+          root,
+          journalPath: parentJournal,
+          expectations,
+          barrier: { label: failed.label, matches: (journalRecords) => failed.predicate(journalRecords) },
+        });
+        return parentEvidence;
+      },
+    }), /parent observes all native tool results: deadline exceeded/,
+    "the parent follow-up barrier keeps failing when its record is absent");
+    t.mock.timers.tick(CONTROL_FAILURE_BOUND_MS - 1);
+    assert.equal(durable.pendingWaiterCount, 1,
+      "the parent barrier is still pending one virtual millisecond before its bound");
+    t.mock.timers.tick(1);
+    await parentRejection;
+    assert.equal(durable.pendingWaiterCount, 0, "no durable wait remains pending after the parent barrier fails");
+    assert.ok(parentEvidence);
+    assert.equal(digestBarrier.predicate(readRecords(parentJournal)), true, "both exact digests were already satisfied");
+    assert.ok(parentEvidence.diagnostics.includes("exact expected digest matches: long-prompt=true, short-prompt=true"));
+    assert.ok(parentEvidence.diagnostics.includes("barrier parent-followup-requestIndex=false"),
+      `the absent parent barrier is reported as false: ${parentEvidence.diagnostics}`);
+    assert.equal(parentEvidence.retainedRoot, root);
+
+    // 6. `notify()` is only the fast path: it can never authorize readiness that
+    //    the durable predicate does not see, and it never resets the deadline.
+    const notifyRejection = assert.rejects(awaitDurableJournalBarrier({
+      signal: durable,
+      barrier: { ...parentBarrier, timeoutMs: CONTROL_FAILURE_BOUND_MS },
+      records: () => readRecords(parentJournal),
+    }), /parent observes all native tool results: deadline exceeded/,
+    "an unrelated notify never satisfies the exact durable predicate");
+    durable.notify();
+    t.mock.timers.tick(10);
+    durable.notify();
+    t.mock.timers.tick(CONTROL_FAILURE_BOUND_MS);
+    await notifyRejection;
+    assert.equal(durable.pendingWaiterCount, 0, "no durable wait remains pending after notifications alone");
+  } finally {
+    t.mock.timers.reset();
   }
 });

@@ -104,6 +104,21 @@ import {
  *   current native conversation tuple still match. A released registration, an
  *   exited or stopped row, a replaced row, a sibling's capsule, and every
  *   capsule payload itself never reach the host callback, a log, or a frame.
+ * - Per-session viewing geometry (issue 474): each row owns its canonical content
+ *   geometry, and one or more registered viewers of that row decide it together as
+ *   the independent minimum columns and minimum rows across the viewers that
+ *   contribute dimensions. A geometry change is always addressed to exactly one
+ *   row: siblings and rows nobody is viewing are never resized, a row whose viewer
+ *   set becomes empty keeps its last canonical size, and a row never viewed keeps
+ *   the initial-sizing rule. Viewer records hold only a viewer's own target and
+ *   pane size — never a process, frame, status, or input-lease mirror — and every
+ *   viewer's participation in a row ends when that row's child exits, the row is
+ *   removed, or the manager is disposed. Viewer ids are never reused and each
+ *   accepted change bumps that viewer's revision, so a stale asynchronous writer
+ *   can neither resurrect a detached surface nor overwrite a later selection.
+ *   Nothing here grants or withholds input: input remains addressed-only and every
+ *   existing displayed-owner fence stays where it is.
+ *
  * - Deliberate saved-conversation creation (issue 323) accepts a branded
  *   SavedSessionAdmission, reserves its session id/exact file synchronously
  *   before any await so concurrent deliberate opens cannot spawn duplicates,
@@ -151,6 +166,57 @@ export const MAX_INSTANCE_ERROR_CHARS = 240;
 
 /** Lifecycle of one owned instance row; always the process's actual state. */
 export type InstanceLifecycle = "starting" | "alive" | "exited" | "error";
+
+/**
+ * What one viewing surface contributes to the sessions it displays (#474).
+ *
+ * A viewer is a display surface, not a controller: registering one takes no
+ * input lease, and several viewers of the same row may all provide input.
+ * `cols`/`rows` are that surface's own content-pane size; a metadata-only
+ * surface reports neither and contributes no dimensions. `revision` increases
+ * with every accepted change to this viewer, so a writer holding an older
+ * revision is refused instead of overwriting a newer selection.
+ */
+export interface SessionViewerState {
+	readonly viewerId: string;
+	/** The live row this viewer displays, or undefined while it displays none. */
+	readonly sessionId: string | undefined;
+	readonly cols: number | undefined;
+	readonly rows: number | undefined;
+	readonly revision: number;
+}
+
+/**
+ * One viewer change. Omitted fields keep their current value; `sessionId: null`
+ * is the explicit "displays no session" state (the surface stays registered but
+ * contributes neither a target nor a geometry contribution to any row).
+ */
+export interface SessionViewerUpdate {
+	readonly sessionId?: string | null;
+	readonly cols?: number;
+	readonly rows?: number;
+	/** Apply only while this viewer still has exactly this revision. */
+	readonly expectedRevision?: number;
+}
+
+/** Why one viewer change was refused. None of them is a retry instruction. */
+export type SessionViewerRefusal =
+	| "disposed"
+	| "unknown-viewer"
+	| "stale"
+	| "unknown-session"
+	| "invalid-geometry";
+
+export type SessionViewerUpdateResult =
+	| { readonly applied: true; readonly state: SessionViewerState }
+	| { readonly applied: false; readonly reason: SessionViewerRefusal };
+
+/** One row's canonical content geometry and the count of applied changes to it. */
+export interface SessionGeometry {
+	readonly cols: number;
+	readonly rows: number;
+	readonly revision: number;
+}
 
 /**
  * The small structural PTY surface the manager needs — the exact public
@@ -438,6 +504,15 @@ interface ManagedInstance {
 	surface?: TerminalSurface;
 	pty?: InstancePty;
 	ptyExited: boolean;
+	/**
+	 * Canonical content geometry of this row (#474): the size its PTY and terminal
+	 * surface actually have (or will have at spawn). Only the manager changes it,
+	 * through an addressed per-row change or a host-wide resize.
+	 */
+	cols: number;
+	rows: number;
+	/** Bumped on every accepted geometry change; stale interaction is fenced on it. */
+	geometryRevision: number;
 	/** Spawn admission closes while an idle preflight or confirmed Stop is unresolved. */
 	stopAdmissionClosed: boolean;
 	sigtermSent: boolean;
@@ -519,6 +594,30 @@ function validateShutdownMs(value: number, label: string): void {
 	if (!Number.isSafeInteger(value) || value < 0) {
 		throw new Error(`session-host: shutdown ${label} must be a non-negative safe integer, got ${value}`);
 	}
+}
+
+/** Internal viewer record: one surface's own target and pane size, nothing more. */
+interface ManagedViewer {
+	id: string;
+	sessionId: string | undefined;
+	cols: number | undefined;
+	rows: number | undefined;
+	revision: number;
+}
+
+function viewerState(viewer: ManagedViewer): SessionViewerState {
+	return {
+		viewerId: viewer.id,
+		sessionId: viewer.sessionId,
+		cols: viewer.cols,
+		rows: viewer.rows,
+		revision: viewer.revision,
+	};
+}
+
+/** True only for a row a viewer may display: present, launched or launching, and not finished. */
+function isViewableRow(record: ManagedInstance | undefined): boolean {
+	return record !== undefined && !record.ptyExited && record.lifecycle !== "error";
 }
 
 /** Only a well-shaped accepted public response suppresses the POSIX SIGTERM fallback. */
@@ -717,6 +816,9 @@ export class InstanceManager {
 	readonly #ptyFactory: PtyFactory;
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
+	/** Registered viewing surfaces (#474): the only store of viewer facts. */
+	readonly #viewers = new Map<string, ManagedViewer>();
+	#nextViewerId = 1;
 	readonly #inflightCreates = new Set<Promise<void>>();
 	#stopping = false;
 	#disposed = false;
@@ -904,6 +1006,8 @@ export class InstanceManager {
 		// any retained resource is disposed, and cannot resurrect or retarget
 		// this row.
 		this.#records.delete(record.id);
+		// No surface may keep displaying (or sizing) a row that is gone.
+		this.#retireViewerTargets(record.id);
 		this.#releaseRegistration(record);
 		this.#disposeDataListener(record);
 		this.#disposeExitListener(record);
@@ -1026,6 +1130,9 @@ export class InstanceManager {
 			activityRefreshEpisodeOpen: false,
 			statusRevision: 0,
 			activity: [],
+			cols: this.#cols,
+			rows: this.#rows,
+			geometryRevision: 0,
 			savedReservation: savedSession !== undefined
 				? { sessionId: savedSession.sessionId, file: savedSession.file }
 				: undefined,
@@ -1201,7 +1308,11 @@ export class InstanceManager {
 	/**
 	 * Update the geometry of every live instance: both instances the
 	 * frontend shows and hidden ones (hiding or switching is a frontend
-	 * concern; the manager never stops a child for selection or hiding).
+	 * concern; the manager never stops a child for selection or hiding). This is
+	 * the host-wide operation for a host that gives every child one shared
+	 * geometry; a host that sizes each session by its own viewers uses
+	 * {@linkcode resizeInstance} through the viewer seam instead, and rows with no
+	 * viewers of their own keep their last size.
 	 */
 	resize(cols: number, rows: number): void {
 		this.#assertUsable("resize");
@@ -1210,22 +1321,220 @@ export class InstanceManager {
 		this.#cols = cols;
 		this.#rows = rows;
 		for (const record of this.#records.values()) {
-			if (!record.pty || record.ptyExited) {
+			// A finished child keeps its frozen frame; only rows that can still
+			// run (or have not spawned yet) take the new geometry.
+			if (record.ptyExited) {
 				continue;
 			}
+			this.#applyGeometry(record, cols, rows);
+		}
+	}
+
+	/**
+	 * Adopt one host pane size as the initial-sizing rule for rows created from
+	 * now on (#474). Resizes nothing: a row nobody is viewing keeps its last
+	 * canonical size, while a new row that has never been viewed starts at the
+	 * host's current geometry, exactly as before per-session sizing.
+	 */
+	setInitialGeometry(cols: number, rows: number): void {
+		this.#assertUsable("setInitialGeometry");
+		validateDimension(cols, "cols");
+		validateDimension(rows, "rows");
+		this.#cols = cols;
+		this.#rows = rows;
+	}
+
+	/**
+	 * Resize exactly one addressed row (#474). Never touches a sibling: per-row
+	 * geometry is deliberate and addressed, and an unknown, finished, or errored
+	 * row is reported as not resized rather than guessed at. A row that has not
+	 * spawned yet records the geometry its spawn will use.
+	 */
+	resizeInstance(id: string, cols: number, rows: number): boolean {
+		this.#assertUsable("resizeInstance");
+		validateDimension(cols, "cols");
+		validateDimension(rows, "rows");
+		const record = this.#records.get(id);
+		if (!isViewableRow(record)) {
+			return false;
+		}
+		return this.#applyGeometry(record as ManagedInstance, cols, rows);
+	}
+
+	/**
+	 * The canonical content geometry of one row, or undefined for an unknown row.
+	 * This is the manager's own fact (the size its PTY and surface have), so a
+	 * frontend can fence stale hit targets on it without a second geometry store.
+	 */
+	instanceGeometry(id: string): SessionGeometry | undefined {
+		const record = this.#records.get(id);
+		if (record === undefined) {
+			return undefined;
+		}
+		return { cols: record.cols, rows: record.rows, revision: record.geometryRevision };
+	}
+
+	/**
+	 * Register one viewing surface (#474). The registration carries no authority
+	 * over input, lifecycle, or another row; ids are never reused, so a stale
+	 * callback can never address a newer surface. Returns undefined once this
+	 * manager is stopping or disposed.
+	 */
+	openViewer(): SessionViewerState | undefined {
+		if (this.#disposed || this.#stopping) {
+			return undefined;
+		}
+		const viewer: ManagedViewer = {
+			id: `viewer-${this.#nextViewerId++}`,
+			sessionId: undefined,
+			cols: undefined,
+			rows: undefined,
+			revision: 1,
+		};
+		this.#viewers.set(viewer.id, viewer);
+		return viewerState(viewer);
+	}
+
+	/** Current facts of one registered surface, or undefined once it is gone. */
+	viewerState(viewerId: string): SessionViewerState | undefined {
+		const viewer = this.#viewers.get(viewerId);
+		return viewer === undefined ? undefined : viewerState(viewer);
+	}
+
+	/** Every registered surface currently displaying one row (copied facts). */
+	sessionViewers(sessionId: string): SessionViewerState[] {
+		const states: SessionViewerState[] = [];
+		for (const viewer of this.#viewers.values()) {
+			if (viewer.sessionId === sessionId) states.push(viewerState(viewer));
+		}
+		return states;
+	}
+
+	/**
+	 * Change one surface's content target and/or pane size, then recompute only
+	 * the sessions its change could affect: its previous target and its new one.
+	 * A row's canonical geometry becomes the independent minimum columns and
+	 * minimum rows over the surfaces that display it and contribute dimensions;
+	 * with no contributing surface the row keeps its last size. No other row is
+	 * ever resized, and no viewer gets exclusive control of anything.
+	 */
+	updateViewer(viewerId: string, update: SessionViewerUpdate = {}): SessionViewerUpdateResult {
+		if (this.#disposed) {
+			return { applied: false, reason: "disposed" };
+		}
+		const viewer = this.#viewers.get(viewerId);
+		if (viewer === undefined) {
+			return { applied: false, reason: "unknown-viewer" };
+		}
+		if (update.expectedRevision !== undefined && update.expectedRevision !== viewer.revision) {
+			return { applied: false, reason: "stale" };
+		}
+		const target = update.sessionId === null ? undefined : update.sessionId ?? viewer.sessionId;
+		const cols = update.cols === undefined ? viewer.cols : update.cols;
+		const rows = update.rows === undefined ? viewer.rows : update.rows;
+		if ((cols === undefined) !== (rows === undefined)) {
+			return { applied: false, reason: "invalid-geometry" };
+		}
+		if (cols !== undefined) {
 			try {
-				record.pty.resize(cols, rows);
+				validateDimension(cols, "cols");
+				validateDimension(rows as number, "rows");
+			} catch {
+				return { applied: false, reason: "invalid-geometry" };
+			}
+		}
+		if (target !== undefined && !isViewableRow(this.#records.get(target))) {
+			// An unknown, exited, or errored row is never a content target, so a
+			// late completion cannot resurrect a finished view or hold geometry for it.
+			return { applied: false, reason: "unknown-session" };
+		}
+		const previous = viewer.sessionId;
+		viewer.sessionId = target;
+		viewer.cols = cols;
+		viewer.rows = rows;
+		viewer.revision += 1;
+		if (previous !== undefined) this.#recomputeViewerGeometry(previous);
+		if (target !== undefined && target !== previous) this.#recomputeViewerGeometry(target);
+		return { applied: true, state: viewerState(viewer) };
+	}
+
+	/** Retire one surface. Its previous session keeps its last size for any viewer left. */
+	closeViewer(viewerId: string): boolean {
+		const viewer = this.#viewers.get(viewerId);
+		if (viewer === undefined) {
+			return false;
+		}
+		this.#viewers.delete(viewerId);
+		if (viewer.sessionId !== undefined) this.#recomputeViewerGeometry(viewer.sessionId);
+		return true;
+	}
+
+	/**
+	 * Recompute one row's canonical geometry from its viewers. Columns and rows
+	 * take their own minimum (100x40 and 80x50 give 80x40), and a row with no
+	 * contributing viewer is left exactly as it is.
+	 */
+	#recomputeViewerGeometry(sessionId: string): void {
+		const record = this.#records.get(sessionId);
+		if (!isViewableRow(record)) {
+			return;
+		}
+		let cols: number | undefined;
+		let rows: number | undefined;
+		for (const viewer of this.#viewers.values()) {
+			if (viewer.sessionId !== sessionId || viewer.cols === undefined || viewer.rows === undefined) {
+				continue;
+			}
+			if (cols === undefined || viewer.cols < cols) cols = viewer.cols;
+			if (rows === undefined || viewer.rows < rows) rows = viewer.rows;
+		}
+		if (cols === undefined || rows === undefined) {
+			return;
+		}
+		this.#applyGeometry(record as ManagedInstance, cols, rows);
+	}
+
+	/**
+	 * Apply one row's canonical geometry to its own PTY and surface. Failures are
+	 * contained on this row exactly as a host-wide resize contains them.
+	 */
+	#applyGeometry(record: ManagedInstance, cols: number, rows: number): boolean {
+		if (record.cols === cols && record.rows === rows) {
+			return false;
+		}
+		const pty = record.pty;
+		if (pty && !record.ptyExited) {
+			try {
+				pty.resize(cols, rows);
 			} catch {
 				this.#failRunningInstance(record, "ptyResize");
-				continue;
+				return false;
 			}
-			if (record.surface) {
-				try {
-					record.surface.resize(cols, rows);
-				} catch {
-					this.#failRunningInstance(record, "surfaceResize");
-				}
+		}
+		record.cols = cols;
+		record.rows = rows;
+		record.geometryRevision += 1;
+		if (record.surface) {
+			try {
+				record.surface.resize(cols, rows);
+			} catch {
+				this.#failRunningInstance(record, "surfaceResize");
 			}
+		}
+		return true;
+	}
+
+	/**
+	 * End every surface's participation in one row that can no longer be
+	 * displayed (its child exited, the row was removed, or the manager disposed).
+	 * The revision bump makes an in-flight writer for the old view stale, and
+	 * viewer ids are never reused, so nothing can resurrect the finished view.
+	 */
+	#retireViewerTargets(sessionId: string): void {
+		for (const viewer of this.#viewers.values()) {
+			if (viewer.sessionId !== sessionId) continue;
+			viewer.sessionId = undefined;
+			viewer.revision += 1;
 		}
 	}
 
@@ -1297,6 +1606,8 @@ export class InstanceManager {
 			// Contained: disposal proceeds with owned resource cleanup below.
 		}
 		this.#disposed = true;
+		// No surface survives this host's manager: every viewer fact is dropped.
+		this.#viewers.clear();
 		for (const record of this.#records.values()) {
 			record.busy = null;
 			record.pendingInput = null;
@@ -1447,8 +1758,8 @@ export class InstanceManager {
 					args: descriptor.args,
 					env: spawnEnv,
 					cwd: descriptor.cwd,
-					cols: this.#cols,
-					rows: this.#rows,
+					cols: record.cols,
+					rows: record.rows,
 				});
 				record.pty = pty;
 				record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
@@ -1461,7 +1772,7 @@ export class InstanceManager {
 						return;
 					}
 				}
-				record.surface = new TerminalSurface(this.#cols, this.#rows, {
+				record.surface = new TerminalSurface(record.cols, record.rows, {
 					onReply: (data) => this.#onQueryReply(record, data),
 					onChange: () => this.#safeChanged(record.id),
 					onBackpressure: (paused) => this.#onBackpressure(record, paused),
@@ -1623,6 +1934,9 @@ export class InstanceManager {
 			return; // stale or already-final exit
 		}
 		record.ptyExited = true;
+		// A finished child displays nothing: every surface's participation in this
+		// row ends here, and its retained last frame stays readable until removal.
+		this.#retireViewerTargets(record.id);
 		record.busy = null;
 		record.pendingInput = null;
 		record.inputSurface = false;

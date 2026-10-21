@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.188]
+## [0.1.0-dev.189]
 
 ### Added
 
@@ -27,6 +27,30 @@ dates.
   Bounded pairing metadata, cancellation, backpressure, and owned teardown are covered
   without introducing session networking, pairing UI, persistent keys, or clipboard
   synchronization. See [Paired peer transport foundation](docs/session-host-alpha.md#paired-peer-transport-foundation).
+- A metadata-only remote roster foundation projects the local session manager's roster
+  facts over that explicitly constructed paired channel (#478). The owner observes its
+  existing single manager through a coherent snapshot-and-watch seam with a fresh
+  owner-run identity and monotonic observation revisions, and publishes one bounded
+  versioned metadata snapshot plus bounded live updates. A full snapshot is assembled
+  and applied as a whole, fenced to the current subscription, owner run, and observation
+  revision, with authority rechecked against the current accepted peer identity and
+  receiving grant. Rows carry only local-equivalent display facts — stable row id, title,
+  exact owner-side workspace path, lifecycle, live-process/input-surface and
+  busy/pending-input observations, generic activity, canonical native conversation
+  identity, separate ownership and activity-intent counts, a known exit code, and
+  bounded display-safe error text — while unknown observations stay unknown rather than
+  idle or zero. The native current-file guard, agent/account directories, configuration,
+  providers, credentials, prompts, transcripts, question text, terminal/output bytes, and
+  image data never cross, and native session-pane contents are never altered, filtered,
+  or rebuilt. Error text strips terminal-control hazards and recognizable credential
+  patterns with a fixed fallback; it is not an arbitrary-secrets guarantee. Ownership
+  stays with the owner host: a client snapshot is only a projection, its loss means
+  not-current rather than idle, and stopping a subscription or disposing the bridge never
+  shuts down owner sessions. No second controller, separate ACL, or new revocation
+  lifecycle policy is added. Neither startup nor import enables networking, and no remote
+  UI, remote input, session-operation routing, pairing/consent surface, or reconnection
+  behavior exists yet; this checkpoint is an internal-only automated-testing foundation.
+  See [Remote roster metadata foundation](docs/session-host-alpha.md#remote-roster-metadata-foundation-metadata-only).
 - The session host sizes each session for the surfaces that actually display it, and can
   display no session at all (#474). Every displayable surface registers as a viewer of one
   session, and a session's canonical content size is the independent minimum of those widths

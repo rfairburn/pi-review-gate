@@ -608,10 +608,66 @@ remembered-key change is refused rather than silently accepted.
 Accepting an unknown identity without independently comparing its fingerprint does not
 defeat an active interceptor during first pairing. Later key verification protects
 continuity, not the authenticity of that first acceptance. No mandatory QR/code ceremony
-is added. Persistent identity storage, pairing controls, discovery, session protocols,
-reconnection UI, and clipboard routing remain separate integration work. Native
+is added. Persistent identity storage, pairing controls, discovery, reconnection UI,
+and clipboard routing remain separate integration work. The only session-level protocol
+implemented so far is the bounded roster-metadata channel described next; remote session
+content, terminal input, and session operations remain unimplemented. Native
 client-only mobile implementations can use this trust model; ordinary browser WebSockets
 do not expose self-signed certificate pinning and are not claimed supported.
+
+### Remote roster metadata foundation (metadata only)
+
+The source also includes an explicitly constructed, metadata-only roster bridge over that
+peer transport (#478). Like the transport, it is **not wired into session-host or
+standalone startup**: no command-line option, setting, automatic listener, pairing UI, or
+remote sidebar exists, and importing the modules creates no keys, socket, or listener by
+itself. Existing local owner, viewer, and passive behavior stays fully active, so this is
+not a dormant feature: only the remote client side of this checkpoint is unreachable
+without an explicit caller. The transport it uses is ordinary TLS/WSS, not a stub.
+
+The owner side observes the same single local session manager that already backs local
+session operations, through a coherent snapshot-and-watch seam keyed to a fresh owner
+service-run identity and monotonic observation revisions. It publishes one bounded,
+versioned roster-metadata snapshot and bounded live updates over an explicit paired
+channel. A full snapshot is assembled and applied as a whole, fenced to the current
+subscription, owner run, and observation revision, so an older, duplicate, or
+partially applied update cannot regress or mix a roster. Authority is rechecked against
+the current accepted peer identity and the current receiving-side grant. Stopping a
+subscription or disposing the bridge releases only that observation; it never shuts
+down, pauses, or stops owner sessions.
+
+Each published row carries only display-oriented roster facts: the stable row id, title,
+the exact owner-side workspace path, lifecycle, live-process and input-surface
+observations, busy and pending-input observations, generic activity lines, the canonical
+native conversation identity (session id, epoch, and observed native name), separate
+ownership and activity-intent counts, a known exit code, and bounded display-safe error
+text. Unknown and absent observations stay unknown — never idle, zero, or false — and
+ownership counts stay separate from the displayed activity-intent counts, exactly as
+locally. The native current-file guard, agent/account directories, configuration,
+provider and credential data, prompts, transcripts, question text, terminal or output
+bytes, and image data never enter a row. The metadata projection does not alter, filter,
+or rebuild native session-pane contents, which remain the owner's own terminal. Error text
+is stripped of terminal-control hazards and recognizable credential patterns and bounded
+to a display-safe message with a fixed fallback; that is not a blanket
+arbitrary-secrets guarantee, and nothing here globally scrubs native pane or workspace
+data. Workspace paths are exact owner-side values: bounded, never resolved, rewritten,
+or redacted, with rendering sanitizing its own cells.
+
+One owner is unchanged: session ownership stays with the owner host, and a client holds
+only a projection of it. A lost projection — a disconnect, a stopped subscription, or an
+unavailable owner — means *not current*, never idle and never zero. No second
+controlling host, separate ACL, exclusive-controller lease, or new revocation lifecycle
+policy is added.
+
+This checkpoint is an **internal-only automated-testing foundation**, not an announced
+remote feature and not an installation or release instruction. There is no new manual
+cross-machine workflow to run; the existing optional local manual comparison steps below
+remain useful for checking the current local host. Still unimplemented: production
+identity/trust persistence, a listener/consent/pairing surface, the remote sidebar UI,
+terminal streaming and remote input, creation/Close/`SessionSpawn` routing over a peer,
+reconnection UI or backoff, and clipboard attribution. No Windows, native-mobile,
+browser, or physical readiness is claimed, and no completed cross-machine operation is
+claimed.
 
 ## Focus, display, and status
 

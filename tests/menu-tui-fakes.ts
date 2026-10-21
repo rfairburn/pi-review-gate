@@ -20,7 +20,8 @@
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { MenuContainer, MenuSelectItem, MenuSelectList, MenuSelectListTheme, MenuTuiHost } from "../src/settings/menu";
+import { Input as NativeInput } from "pi-session-host-tui";
+import type { MenuContainer, MenuInput, MenuSelectItem, MenuSelectList, MenuSelectListTheme, MenuTuiHost } from "../src/settings/menu";
 
 /** Raw key sequences matching pi-tui's default tui.select.* bindings. */
 export const KEY_UP = "\x1b[A";
@@ -115,6 +116,58 @@ export class FakeDynamicBorder {
   invalidate(): void {}
 }
 
+/**
+ * The native pi-tui single-line Input (issue #463).
+ *
+ * The fake host uses the REAL installed `pi-session-host-tui` Input rather
+ * than a hand-written stand-in, so the deny picker's search field is driven
+ * by the same component the saved-conversation picker uses: the same value
+ * handling, the same editing keys, the same bracketed-paste insertion, and
+ * the same cursor semantics. Only the rendered line is normalized (the ANSI
+ * cursor markers are stripped) so assertions can read it.
+ */
+export class FakeInput implements MenuInput {
+  private readonly native = new NativeInput();
+
+  constructor() {
+    this.native.focused = true;
+  }
+
+  get focused(): boolean {
+    return this.native.focused;
+  }
+
+  set focused(value: boolean) {
+    this.native.focused = value;
+  }
+
+  getValue(): string {
+    return this.native.getValue();
+  }
+
+  setValue(value: string): void {
+    this.native.setValue(value);
+  }
+
+  handleInput(data: string): void {
+    this.native.handleInput(data);
+  }
+
+  render(width: number): string[] {
+    return this.native.render(width).map((line) => stripAnsi(line));
+  }
+
+  invalidate(): void {
+    this.native.invalidate();
+  }
+}
+
+/** Removes ANSI escape sequences (including the zero-width cursor marker). */
+export function stripAnsi(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "").replace(/\x1b_pi:[^\x07]*\x07/g, "");
+}
+
 export interface FakeMenuTuiHostOptions {
   /** Collects every FakeSelectList created, in construction order. */
   lists?: FakeSelectList[];
@@ -134,6 +187,7 @@ export function createFakeMenuTuiHost(options: FakeMenuTuiHostOptions = {}): Men
     },
     Container: FakeContainer,
     Text: FakeText,
+    Input: FakeInput,
     DynamicBorder: FakeDynamicBorder,
     setKeybindings: (keybindings: unknown): void => {
       setKeybindingsCalls.push(keybindings);
@@ -162,6 +216,19 @@ export interface TuiSettingsHarness {
   lists: FakeSelectList[];
   /** Every manager the adapter passed to the host's setKeybindings(). */
   setKeybindingsCalls: unknown[];
+  /**
+   * One frame rendered after every raw key the harness fed to a component,
+   * in order. The `frames` array keeps the first frame of each menu; this
+   * array is the per-keystroke view, so a live-filtering menu can be
+   * asserted at the exact moment its result set changed (issue #463).
+   */
+  inputFrames: string[][];
+  /**
+   * Per scripted step: the menu's initial frame followed by one frame after
+   * every key of that step (issue #463), so a flow can assert one exact
+   * presentation of a re-shown menu.
+   */
+  framesByStep: string[][][];
   /** Plain/RPC fallback calls plus retained choices driven by legacy selectScript entries. */
   selectCalls: Array<{ title: string; options: string[] }>;
   inputCalls: Array<{ title: string; placeholder?: string }>;
@@ -169,6 +236,12 @@ export interface TuiSettingsHarness {
   notifyCalls: Array<{ message: string; type?: string }>;
   /** True once a menu was shown with no scripted step left (defensive). */
   exhausted(): boolean;
+  /**
+   * Scripted steps that ended without settling their menu, or menus shown
+   * after the script ran out, recorded only with `failUnresolvedSteps`
+   * (issue #463). Each entry names the step index.
+   */
+  failures(): string[];
 }
 
 /**
@@ -187,12 +260,22 @@ export function createTuiSettingsContext(
     confirms?: boolean[];
     /** The keybindings manager the host injects into custom() (null = none). */
     keybindings?: unknown;
+    /**
+     * Fail boundedly instead of waiting forever (issue #463): a step whose
+     * keys do not settle its menu, or a menu shown after the script ran out,
+     * is recorded in failures() and resolved as a cancel so the flow unwinds.
+     */
+    failUnresolvedSteps?: boolean;
+    /** Width used for the per-keystroke inputFrames (default 80). */
+    renderWidth?: number;
   } = {},
 ): TuiSettingsHarness {
   const lists: FakeSelectList[] = [];
   const setKeybindingsCalls: unknown[] = [];
   const host = createFakeMenuTuiHost({ lists, setKeybindingsCalls });
   const frames: string[][] = [];
+  const inputFrames: string[][] = [];
+  const framesByStep: string[][][] = [];
   const initialIndexes: number[] = [];
   const selectCalls: TuiSettingsHarness["selectCalls"] = [];
   const inputCalls: TuiSettingsHarness["inputCalls"] = [];
@@ -203,17 +286,28 @@ export function createTuiSettingsContext(
   let confirmIndex = 0;
   let confirmCount = 0;
   let exhausted = false;
+  const failures: string[] = [];
+  const renderWidth = options.renderWidth ?? 80;
 
   const ui = {
     custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: string | undefined) => void) => unknown): Promise<string | undefined> {
       return new Promise<string | undefined>((resolve) => {
+        let settled = false;
+        const done = (value: string | undefined): void => {
+          settled = true;
+          resolve(value);
+        };
         // Simulate the host showExtensionCustom: run the factory with the
-        // real done() as resolver, render one initial frame (so the
-        // preselection is observable), then feed this menu's scripted keys.
-        const component = factory(FAKE_TUI, IDENTITY_THEME, options.keybindings ?? null, resolve) as {
+        // real done() as resolver, focus the component like the host's
+        // ui.setFocus() (only a Focusable component has `focused`), render
+        // one initial frame (so the preselection is observable), then feed
+        // this menu's scripted keys.
+        const component = factory(FAKE_TUI, IDENTITY_THEME, options.keybindings ?? null, done) as {
           render?(width: number): string[];
           handleInput?(data: string): void;
+          focused?: boolean;
         };
+        if (component !== null && typeof component === "object" && "focused" in component) component.focused = true;
         const frame = component.render?.(80);
         if (Array.isArray(frame)) frames.push(frame);
         const lastList = lists[lists.length - 1];
@@ -236,13 +330,34 @@ export function createTuiSettingsContext(
           component.handleInput?.(KEY_ENTER);
           return;
         }
+        const currentStep = stepIndex;
         const step = steps[stepIndex++];
         if (step === undefined) {
           exhausted = true;
+          if (options.failUnresolvedSteps) failures.push(`menu shown after the script ran out (step ${currentStep})`);
           resolve(undefined);
           return;
         }
-        for (const key of step) component.handleInput?.(key);
+        const stepFrames: string[][] = [];
+        framesByStep[currentStep] = stepFrames;
+        const initial = component.render?.(renderWidth);
+        if (Array.isArray(initial)) stepFrames.push(initial);
+        for (const key of step) {
+          if (settled && options.failUnresolvedSteps) {
+            failures.push(`step ${currentStep} has keys after its menu settled`);
+            break;
+          }
+          component.handleInput?.(key);
+          const after = component.render?.(renderWidth);
+          if (Array.isArray(after)) {
+            inputFrames.push(after);
+            stepFrames.push(after);
+          }
+        }
+        if (!settled && options.failUnresolvedSteps) {
+          failures.push(`step ${currentStep} did not settle its menu`);
+          resolve(undefined);
+        }
       });
     },
     async select(title: string, opts: string[]): Promise<string | undefined> {
@@ -269,6 +384,8 @@ export function createTuiSettingsContext(
     context: { mode: "tui", scopedModels: options.scopedModels ?? [], ui },
     host,
     frames,
+    inputFrames,
+    framesByStep,
     initialIndexes,
     lists,
     setKeybindingsCalls,
@@ -277,6 +394,7 @@ export function createTuiSettingsContext(
     confirmCalls: () => confirmCount,
     notifyCalls,
     exhausted: () => exhausted,
+    failures: () => [...failures],
   };
 }
 
@@ -430,6 +548,11 @@ export async function loadRealMenuTuiHost(): Promise<MenuTuiHost | undefined> {
     Container: tui.Container as MenuTuiHost["Container"],
     Text: tui.Text as MenuTuiHost["Text"],
   };
+  // The public single-line Input backs the deny picker's search field
+  // (issue #463): the real component, driven like the saved picker drives it.
+  if (typeof tui.Input === "function") {
+    host.Input = tui.Input as MenuTuiHost["Input"];
+  }
   if (typeof tui.setKeybindings === "function") {
     host.setKeybindings = tui.setKeybindings as MenuTuiHost["setKeybindings"];
   }

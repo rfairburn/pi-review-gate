@@ -1056,4 +1056,6 @@ bridge (`src/stream-failure-report.ts`), consumed by both tool families
   Pi Coding Agent v1.1.0 under the MIT License. See [NOTICE](../NOTICE) and
   [LICENSES/MIT-pi-session-search.txt](../LICENSES/MIT-pi-session-search.txt). The
   fuzzy matcher is imported from the pinned `pi-session-host-tui` dependency and is not
-  copied.
+  copied. The parser and matcher live in the shared `src/session-host/saved-search.ts`
+  module, which the saved-conversation catalog search and the settings deny pickers
+  (issue #463) both use, so the two surfaces search with exactly one grammar.

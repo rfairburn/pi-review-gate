@@ -13,6 +13,14 @@
  * two selectors are independent: a top-level denial never cascades to
  * executors, and an executor denial only governs newly captured executors.
  *
+ * Both deny selectors also carry a live tool-NAME search field (issue #463):
+ * a native single-line query above the result list, the same
+ * saved-conversation search grammar the saved-conversation picker uses, and a
+ * truthful no-match state. The query is a pure view filter — it never changes
+ * the staged denial set, and a denial hidden by the query stays denied and
+ * stays in the saved configuration. It is transient UI state, it belongs to
+ * one picker alone, and it is never persisted or staged.
+ *
  * The candidate inventory comes from the runtime through the
  * `getToolChoices` callback — the authoritative, otherwise-discoverable
  * pre-deny inventory the host already has — and is used for display only:
@@ -31,6 +39,7 @@ import {
 import { compactToolPurpose, DEFERRED_TOOL_SEARCH_NAME } from "../tool-inventory";
 import { alignedSettingsRows, formatByteSize, type UiContext } from "./ui";
 import { retainedSelect } from "./menu";
+import { retainedDenySelect, type DenyPickerRow } from "./deny-picker";
 import { selectWebSettings } from "./web";
 
 /** One candidate tool from the runtime-supplied pre-deny inventory. */
@@ -159,6 +168,14 @@ export function toolsRootSummary(state: {
  * Rows are keyed by the literal tool name (prefixed so a tool named `back`
  * cannot collide with the Back row), which keeps the toggled row highlighted
  * across the checked/unchecked re-show.
+ *
+ * The picker also carries a live NAME search field (issue #463): a native
+ * single-line query above the result list, the same saved-conversation search
+ * grammar, and a truthful no-match state. The query is a pure view filter —
+ * it never changes the staged denial set, and a denial hidden by the query
+ * stays denied and stays in the saved configuration. The query is transient
+ * and belongs to THIS picker alone: the Top-level and Executor pickers never
+ * share it, and it is never persisted or staged.
  */
 async function selectDeniedTools(
   ui: UiContext,
@@ -170,6 +187,10 @@ async function selectDeniedTools(
   let denied = deniableToolNames(initial);
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
+  // The transient search query for THIS picker only (issue #463). It is
+  // retained across the toggle redraws so a narrowed view survives a
+  // toggle, and it is never shared with the other picker.
+  let query = "";
   while (true) {
     const available = new Set(choices.map((choice) => choice.name));
     // The transaction-opening names and any staged denial stay configured rows
@@ -183,23 +204,33 @@ async function selectDeniedTools(
       seenAbsent.add(name);
       absent.push(name);
     }
-    const rows = [
+    const rows: DenyPickerRow[] = [
       ...choices.map((choice) => ({
         key: `tool:${choice.name}`,
         label: `${choice.name}${choice.description ? ` (${compactToolPurpose(choice.description)})` : ""}  ${denied.includes(choice.name) ? "✓ denied" : "✗ allowed"}`,
+        searchText: choice.name,
       })),
       ...absent.map((name) => ({
         key: `tool:${name}`,
         label: `${name} [not currently available]  ${denied.includes(name) ? "✓ denied" : "✗ allowed"}`,
+        searchText: name,
       })),
-      { key: "back", label: "Back" },
+      // The Back row is never filtered away: the nested navigation out of the
+      // picker stays available under any query.
+      { key: "back", label: "Back", searchText: "back", alwaysVisible: true },
     ];
-    const choice = await retainedSelect(ui, {
+    const result = await retainedDenySelect(ui, {
       title: `${title} — Enter toggles — ${denied.length} denied`,
       rows,
+      query,
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return denied;
+    // The query is view state only: it is carried into the next presentation
+    // of THIS picker and never staged into the settings draft.
+    query = result.query;
+    if (result.key === undefined) return denied;
+    const choice = result.key;
+    if (choice === "back") return denied;
     lastKey = choice;
     if (!choice.startsWith("tool:")) continue;
     const name = choice.slice("tool:".length);

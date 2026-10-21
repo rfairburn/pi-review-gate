@@ -101,7 +101,8 @@ supplies the live switch (the ordinary extension entry point always does):
   [Delegated execution](delegated-execution.md#notifications-and-ui).
 - **Tools** opens the **Tools** submenu: two independent exact-name deny
   multi-selectors (**Top-level tools** and **Executor tools**, checked = denied) over
-  the runtime's pre-deny candidate inventory, plus the moved **Deferred Pi tools**,
+  the runtime's pre-deny candidate inventory, each with a live tool-name search field,
+  plus the moved **Deferred Pi tools**,
   **YouShouldKnow notices**, **Completion guidance**, and **Web** controls. Denials only
   narrow existing authority, and the two lists never cascade to each other. See
   [Tools subsection](#tools-subsection).
@@ -333,6 +334,19 @@ the same candidate inventory. Rows are the runtime's pre-deny, otherwise-discove
 tool names other than the reserved `tool_search` loader (see below) — rendering them
 neither activates nor authorizes anything. Enter toggles the selected row; a checked row
 means **denied**, the opposite of the reviewer picker's allowed marker.
+- **Both deny pickers have a live search field.** In the TUI, a query line sits above
+the rows: type part of a tool name to narrow the list as you type, move through the
+matches with the arrow keys, and press Enter to toggle the highlighted row. Navigation,
+confirm, and cancel follow your `tui.select.*` keybindings. The query uses the
+saved-conversation picker's grammar: whitespace-separated fuzzy tokens,
+`"quoted phrases"`, and `re:<pattern>`; every term must match. Only tool names are searched,
+never descriptions. A query that matches nothing shows **No matching tools** and the
+picker stays open and editable, with **Back** and Escape still available. The query is
+view state only: it never changes what is denied, a denial hidden by the query stays
+denied and is applied or saved with the whole draft, and the query is never stored.
+Each picker keeps its own query, and a non-TUI (RPC) host offers the plain, unfiltered
+list. On terminals that report held-key repeats, a held Enter, Escape, or Ctrl+S acts
+only once.
 - The lists are independent. A top-level-only denial leaves the tool eligible for a
 newly captured executor; an executor-only denial leaves the primary eligible. With both
 checked the name is excluded from both; with neither it is unchanged.

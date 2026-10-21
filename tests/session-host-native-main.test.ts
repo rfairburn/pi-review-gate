@@ -385,6 +385,31 @@ test("the settled-frame activation fence waits past a mixed frame and still fail
 
 // Guards the immutable startup-option contract as well as this alpha's
 // local-scripted-provider/no-session-override fixture boundary.
+test("roster navigation sends no key when its fresh complete frame already selects the destination", async () => {
+  const frame = ["Session host", ...[
+    " Sessions (0)", "  Saved conversations", "> New session", "  Network", "  Quit host", "  Host shortcuts",
+  ].map((line) => line.padEnd(32) + "│Welcome")].join("\n");
+  let displayed = ""; // The first synchronous probe is still an incomplete paint.
+  let waits = 0;
+  const keys: string[] = [];
+  const driver = Object.create(MainPtyDriver.prototype) as MainPtyDriver;
+  Object.assign(driver, {
+    currentText: () => displayed,
+    sidebarColumnCount: () => 32,
+    sessions: () => [],
+    pty: { write: (key: string) => { keys.push(key); } },
+    waitFrame: async (predicate: (text: string) => boolean) => {
+      waits++;
+      displayed = frame;
+      assert.equal(predicate(displayed), true, "the actual complete highlight satisfies the awaited witness");
+      return displayed;
+    },
+  });
+  await driver.moveRosterTo("New session");
+  assert.equal(waits, 1);
+  assert.deepEqual(keys, [], "a newly observed destination is not navigated away from");
+});
+
 const FORBIDDEN_SESSION_ARGS = new Set([
   "--session", "--session-id", "--sessionID", "--session-dir", "--no-session",
   "--continue", "--resume", "--fork",

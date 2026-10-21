@@ -2106,6 +2106,12 @@ export class MainPtyDriver {
         ?.some((target) => this.rosterTargetSelectedAt(text, target)) ?? false,
         "the current owned roster finishes painting its actual highlighted row before navigation", -1, timeoutMs);
       const currentText = this.currentText();
+      // Waiting for a complete highlight can itself reveal that the requested
+      // target is already selected. Do not issue a navigation key away from it.
+      if (this.rosterTargetSelected(currentText, label)) {
+        this.rememberSelectedTarget(label);
+        return;
+      }
       const targets = this.rosterNavigationTargets(currentText);
       const selected = selectedRosterEntry(currentText, this.sidebarColumnCount());
       const selectedTarget = selected === undefined ? undefined

@@ -3,8 +3,8 @@
  * representation as Git's non-ignored untracked entries for EVERY eligible file.
  * This module does not restore or write a target index.
  *
- * Raw (non-Git) records never live inside a workspace (#301). Every raw record
- * is stored in the live Pi session's external namespace under the Pi-resolved
+ * Raw (non-Git) records never live inside an ordinary workspace (#301). Every
+ * raw record is stored in the live Pi session's namespace under the Pi-resolved
  * agent-data directory:
  *
  *   <agentDir>/sessions/pi-review-gate/<sessionId>/checkpoints/<workspace-key>/<windowId>-<owner>/record.json
@@ -12,12 +12,14 @@
  * for persisted and in-memory (`--no-session`) sessions alike. The location is
  * derived only from the trusted caller scope (live session id + agent dir) and
  * the canonical workspace root, never from a stored descriptor path or the
- * conversation file's directory.
+ * conversation file's directory. When that agent-data directory (or an
+ * ancestor such as its `.pi` parent) is itself the selected workspace, capture
+ * skips exactly those owned records and nothing else (#461).
  */
 import { execFile, spawn } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rm, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve, relative, isAbsolute, sep } from "node:path";
 import { promisify } from "node:util";
@@ -170,11 +172,49 @@ function within(parent: string, child: string): boolean {
   const path = relative(parent, child);
   return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
 }
-/** Records must stay outside the capture root, and the root outside the store. */
-function assertOutsideRoot(store: string, root: string): void {
-  if (within(root, store) || within(store, root)) {
-    throw new Error(`raw checkpoint storage ${store} overlaps the capture workspace ${root}; this Pi agent-data directory configuration is unsupported for non-Git review checkpoints`);
+/** The capture root must never be (inside) the extension-owned store. The
+ * store may lie inside the root (the agent-data directory or its parent
+ * selected as the workspace): capture then skips only the owned raw records
+ * themselves (see ownedRawRecordPaths). */
+function assertRootOutsideStore(store: string, root: string): void {
+  if (within(store, root)) {
+    throw new Error(`capture workspace ${root} lies inside the raw checkpoint storage ${store}; refusing to capture extension-owned checkpoint storage`);
   }
+}
+const OWNER_GENERATION = /^(.+)-([0-9a-f]{32})$/;
+/** Root-relative paths of extension-owned raw records stored inside the
+ * capture root. Only the exact storage layout
+ * `<sessions>/pi-review-gate/<session>/checkpoints/<workspace-key>/<window>-<owner>/record.json`
+ * whose extension-owned directories are all real and private, and whose record
+ * is a private regular file, qualifies;
+ * neighboring and unknown files stay captured. Without this, every capture
+ * would copy earlier records (and so itself) into its own record. */
+async function ownedRawRecordPaths(base: string, root: string, files: readonly string[]): Promise<Set<string>> {
+  const owned = new Set<string>();
+  const ownedDirectories = new Map<string, boolean>();
+  for (const path of files) {
+    const parts = relative(base, join(root, path)).split(sep);
+    if (parts.length !== 6 || parts[0] !== SESSION_NAMESPACE || !isSafeCheckpointSessionId(parts[1])
+      || parts[2] !== CHECKPOINTS_DIRECTORY || !/^[0-9a-f]{32}$/.test(parts[3]!) || parts[5] !== "record.json") continue;
+    const generation = OWNER_GENERATION.exec(parts[4]!);
+    if (!generation || !isSafeWindowId(generation[1]!)) continue;
+    // Every extension-owned directory, as sessionStore requires, and the
+    // record itself must be real and private; otherwise it stays captured.
+    let directory = base, ownedChain = true;
+    for (const name of parts.slice(0, 5)) {
+      directory = join(directory, name);
+      let checked = ownedDirectories.get(directory);
+      if (checked === undefined) {
+        const s = await lstat(directory);
+        checked = s.isDirectory() && !s.isSymbolicLink() && isPrivate(s);
+        ownedDirectories.set(directory, checked);
+      }
+      if (!checked) { ownedChain = false; break; }
+    }
+    const file = ownedChain ? await lstat(join(root, path)) : undefined;
+    if (file?.isFile() && isPrivate(file)) owned.add(path);
+  }
+  return owned;
 }
 /** Canonical form of a possibly not-yet-existing path: realpath of the deepest
  * existing ancestor plus the remaining lexical segments. */
@@ -192,10 +232,13 @@ async function canonicalProspective(path: string): Promise<string> {
 }
 /** Private-directory/file check for checkpoint-owned storage (POSIX only:
  * Windows modes are not ACLs and process.getuid is unavailable there). */
-function assertPrivate(s: Stats, what: string): void {
-  if (process.platform === "win32") return;
+function isPrivate(s: Stats): boolean {
+  if (process.platform === "win32") return true;
   const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  if ((s.mode & 0o077) !== 0 || (uid !== undefined && s.uid !== uid)) throw new Error(`${what} is not private to the current user`);
+  return (s.mode & 0o077) === 0 && (uid === undefined || s.uid === uid);
+}
+function assertPrivate(s: Stats, what: string): void {
+  if (!isPrivate(s)) throw new Error(`${what} is not private to the current user`);
 }
 
 interface SessionStore {
@@ -220,7 +263,7 @@ async function sessionStore(scopeInput: ReviewCheckpointScope | undefined, root:
   const scope = validateScope(scopeInput);
   const lexicalAgentDir = resolve(scope.agentDir);
   const owned = [SESSION_NAMESPACE, scope.sessionId, CHECKPOINTS_DIRECTORY, workspaceKey(root)];
-  assertOutsideRoot(join(await canonicalProspective(join(lexicalAgentDir, SESSIONS_DIRECTORY)), ...owned), root);
+  assertRootOutsideStore(join(await canonicalProspective(join(lexicalAgentDir, SESSIONS_DIRECTORY)), ...owned), root);
   const missing = (what: string): Error => create ? new Error(`raw checkpoint storage missing: ${what}`) : new RawCheckpointDamage(`missing ${what}`);
   const createDirectory = async (path: string): Promise<void> => {
     try { await mkdir(path, { mode: 0o700 }); }
@@ -268,7 +311,7 @@ async function sessionStore(scopeInput: ReviewCheckpointScope | undefined, root:
   }
   // The final location is canonical by construction (canonical base plus
   // verified non-symlink components); recheck it against the root.
-  assertOutsideRoot(store, root);
+  assertRootOutsideStore(store, root);
   return { store, base, agentDir };
 }
 
@@ -377,8 +420,8 @@ async function walk(root: string, path: string, files: string[], ignores: string
   const before = await lstat(dir);
   if (!before.isDirectory() || before.isSymbolicLink()) throw new Error(`directory changed: ${path}`);
   for (const name of (await acquireRawEvidence(() => readdir(dir))).sort()) {
-    // Ordinary project content named .pi-review-gate stays eligible: raw
-    // records never live inside the workspace (#301).
+    // Ordinary project content named .pi-review-gate stays eligible: owned
+    // raw records are recognized only by their exact storage layout (#301).
     if (path === "" && name === ".git") continue;
     const rel = path ? `${path}/${name}` : name;
     if (!safePath(rel) || Buffer.from(rel).toString("utf8") !== rel) throw new Error("unrepresentable path");
@@ -531,6 +574,7 @@ export async function captureReviewCheckpoint(root: string, windowId: string, op
       let acquisitionStage: "enumeration" | "ignore-policy" | "content" | "integrity" = "enumeration";
       try {
       await walk(dir, "", files, ignores, options);
+      const ownedRecords = await ownedRawRecordPaths(location.base, dir, files);
       acquisitionStage = "ignore-policy";
       const ignoreEntries = await Promise.all(ignores.map((path) => rawEntry(dir, path, options)));
       const excluded = await ignoredPaths(dir, files, ignores.length > 0);
@@ -538,7 +582,7 @@ export async function captureReviewCheckpoint(root: string, windowId: string, op
       let bytes = 0;
       acquisitionStage = "content";
       for (const path of files) {
-        if (excluded.has(path)) continue;
+        if (excluded.has(path) || ownedRecords.has(path)) continue;
         const entry = await rawEntry(dir, path, options);
         bytes += entry.size;
         if (bytes > MAX_BYTES) throw new RawReviewAcquisitionError("raw review-evidence exceeds capture cap");
@@ -856,9 +900,12 @@ export async function releaseReviewCheckpoint(root: string, descriptor: ReviewCh
     const s = await lstat(owned);
     if (!s.isDirectory() || s.isSymbolicLink()) throw new Error("unsafe owner directory");
     assertPrivate(s, "raw checkpoint owner directory");
-    // No recursive parent deletion; the validated owner directory is this
-    // generation's only removal target.
-    await rm(owned, { recursive: true });
+    // Remove only the verified record, then the owner directory only when it
+    // is empty: unknown entries (ordinary content when the store lies inside
+    // the workspace) are never deleted. No parent is ever removed.
+    await rm(join(owned, "record.json"));
+    try { await rmdir(owned); }
+    catch (error) { if (!["ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
     return { status: "ok", value: undefined };
   } catch (error) { return fail(errorOf(error)); }
 }

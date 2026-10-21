@@ -149,6 +149,7 @@ review: { activeReviewers: [
     // Automatic review, manual review, and ask-reviewer all use the real hooks.
     await writeFile(join(root, "work.ts"), "before\n");
     await parent.emit("before_agent_start", { prompt: "change fixture", systemPrompt: "fixture" }, ctx);
+    await parent.emit("tool_call", { toolName: "write", input: { path: join(root, "work.ts") } }, ctx);
     await writeFile(join(root, "work.ts"), "after\n");
     await parent.emit("agent_end", { messages: [] }, ctx);
     const automatic = parent.emit("agent_settled", {}, ctx);
@@ -161,6 +162,7 @@ review: { activeReviewers: [
     assert.match(parent.notices.join("\n"), /passed/);
     await manager.screenshot(opened.session, opened.tab, "viewport", undefined);
     await parent.emit("before_agent_start", { prompt: "another change", systemPrompt: "fixture" }, ctx);
+    await parent.emit("tool_call", { toolName: "write", input: { path: join(root, "work.ts") } }, ctx);
     await writeFile(join(root, "work.ts"), "third\n");
     await parent.commands.get("review-now").handler("", ctx);
     // Exercise active-turn ask-reviewer pause, released only by agent_settled.

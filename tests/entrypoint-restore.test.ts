@@ -801,6 +801,7 @@ review: { activeReviewers: [
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
     await trigger(resumed.hooks, "input", { cwd: dir, text: "continue the change", source: "user" }, resumed.ctx);
     await trigger(resumed.hooks, "before_agent_start", { cwd: dir }, resumed.ctx);
+    await trigger(resumed.hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } }, resumed.ctx);
     await writeFile(join(dir, "index.ts"), "v2\n", "utf8");
     await triggerAgentEnd(resumed.hooks, {
       cwd: dir,
@@ -942,6 +943,7 @@ review: { activeReviewers: [
 
     await trigger(resumed.hooks, "input", { cwd: dir, text: "continue the change", source: "user" }, resumed.ctx);
     await trigger(resumed.hooks, "before_agent_start", { cwd: dir }, resumed.ctx);
+    await trigger(resumed.hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } }, resumed.ctx);
     await writeFile(join(dir, "index.ts"), "v2\n", "utf8");
     await triggerAgentEnd(resumed.hooks, {
       cwd: dir,
@@ -1378,6 +1380,7 @@ review: { activeReviewers: [
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "initial request", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
+    await trigger(first.hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } }, first.ctx);
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
 

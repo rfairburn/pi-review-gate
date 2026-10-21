@@ -1,5 +1,6 @@
 import { DEFAULT_EXECUTION_RETRY_POLICY, executorAgentFingerprint, type ReviewGateConfig } from "../../config";
 import { recordObservedToolEventEvidence, type EvidenceState } from "../../evidence";
+import { isReviewableToolObservation } from "../../review-evidence";
 import type { ExecutorAdapter, ExecutorLiveControl, ExecutorSession, ExecutorTurn, SubtaskDispatchRecord, SubtaskProgressUpdate } from "../types";
 import type { WaveWorkerTask } from "../wave-worker";
 import type { ExecutorPoolAssignment } from "../executor-pool";
@@ -199,6 +200,8 @@ export async function runInplaceTurnLoop(input: {
   assignment: ExecutorPoolAssignment;
   onUpdate?: (update: SubtaskProgressUpdate) => void;
   onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
+  /** Called once per observation the shared classification counts as reviewable work. */
+  onQualifyingObservation?: () => void;
 }): Promise<RecoveredInPlaceRun> {
   const retryPolicy = input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY;
   const incidents: ExecutionIncident[] = [];
@@ -265,18 +268,34 @@ export async function runInplaceTurnLoop(input: {
             model: input.adapter.model,
           }),
           onLiveControl: input.onLiveControl,
-          onToolObservation: (event) => recordObservedToolEventEvidence({
-            state: input.evidence,
-            cwd: input.workspaceRoot,
-            selectedRoot: input.baseline.workspaceRoot,
-            adapter: input.adapter.kind,
-            stage: event.stage,
-            toolName: event.toolName,
-            observationId: event.observationId,
-            toolInput: event.toolInput,
-            result: event.result,
-            isError: event.isError,
-          }),
+          onToolObservation: (event) => {
+            const retained = input.evidence.events.length;
+            recordObservedToolEventEvidence({
+              state: input.evidence,
+              cwd: input.workspaceRoot,
+              selectedRoot: input.baseline.workspaceRoot,
+              adapter: input.adapter.kind,
+              stage: event.stage,
+              toolName: event.toolName,
+              observationId: event.observationId,
+              toolInput: event.toolInput,
+              result: event.result,
+              isError: event.isError,
+            });
+            // Classify every observation, including ones a full bounded ledger
+            // no longer retains, with the shared reviewable-work classification.
+            // Overflowed observations are classified by metadata only, never by
+            // re-reading raw tool input: non-read-only names qualify by name.
+            const recorded = input.evidence.events.length > retained ? input.evidence.events.at(-1) : undefined;
+            if (isReviewableToolObservation(recorded ?? {
+              sequence: 0,
+              phase: event.stage === "start" ? "tool_call" : "tool_result",
+              toolName: event.toolName || "unknown",
+              summary: "",
+              candidatePaths: [],
+              riskSignals: event.isError && event.stage === "end" ? ["tool_result_error"] : [],
+            })) input.onQualifyingObservation?.();
+          },
           // #93: the authoritative dispatch capture fires at the transport
           // delivery boundary. In-place dispatches name the in-place workspace
           // root; baseCommit stays empty (no captured base exists).

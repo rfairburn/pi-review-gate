@@ -450,7 +450,11 @@ form keys; an unavailable, unsafe, or unsupported file keeps a bounded warning a
 same default keys. The per-window Profile field is removed: every child uses the same
 canonical native Pi agent directory, resolved from `PI_CODING_AGENT_DIR` or Pi's
 ordinary `~/.pi/agent` default. That directory is fixed user configuration, not a
-workspace selector, and cannot also be selected as a session workspace.
+workspace selector. It (or its `.pi` parent) may still be chosen as an ordinary session
+workspace: that child runs with that canonical directory as its cwd while keeping the
+same effective `PI_CODING_AGENT_DIR` and shared native configuration. Review of such a
+non-Git workspace follows
+[A workspace that contains the checkpoint store](review-workflow.md#a-workspace-that-contains-the-checkpoint-store).
 
 Each host-created row owns a separate top-level native Pi process, selected workspace,
 new conversation, input route, terminal frame, and lifecycle. Restoring a remembered row

@@ -15,7 +15,8 @@ import { promisify } from "node:util";
 const exec = promisify(execFile);
 import { createWorkspaceSnapshot } from "../src/capture";
 import { publishForegroundEscape, routeForegroundEscape } from "../src/foreground-escape";
-import { createState, rememberUserRequest, snapshotReviewBaseline } from "../src/state";
+import { beginAgentRun, createState, rememberUserRequest, snapshotReviewBaseline } from "../src/state";
+import { recordToolCallEvidence, recordToolResultEvidence } from "../src/evidence";
 import { createReviewTurnCoordinator } from "../src/activation/review-turn";
 import { createReviewCancellationCoordinator } from "../src/review-cancellation";
 import { registerCommands } from "../src/commands";
@@ -189,9 +190,23 @@ for (const kind of ["question", "notice"] as const) {
             const state = createState();
             rememberUserRequest(state, "change index");
             const window = state.reviewWindow!;
-            window.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(root, { maxFileBytes: 1048576, maxSnapshotBytes: 52428800 }));
+            const snapshotOptions = { maxFileBytes: 1048576, maxSnapshotBytes: 52428800 };
+            window.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(root, snapshotOptions));
             const baseline = window.baseline;
+            // Automatic review requires agent tool activity: model the agent's
+            // write tool around the actual write. The command path stays an
+            // intentionally filesystem-only control.
+            const write = { toolName: "write", toolInput: { path: "index.ts", content: "after\n" } };
+            let exchangeSequence: number | undefined;
+            if (path === "automatic") {
+              beginAgentRun(state);
+              exchangeSequence = window.activeExchange!.sequence;
+              await recordToolCallEvidence({ state: window.evidence, cwd: root, ...write, snapshotOptions, exchangeSequence });
+            }
             await writeFile(join(root, "index.ts"), "after\n");
+            if (path === "automatic") {
+              recordToolResultEvidence({ state: window.evidence, ...write, result: { content: [{ type: "text", text: "Wrote index.ts" }] }, exchangeSequence });
+            }
             const pidPath = join(root, "pid");
             const releasePath = join(root, "release");
             const reviewer = [

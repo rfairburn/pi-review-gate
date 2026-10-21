@@ -86,6 +86,7 @@ test("an in-memory session without a session file reviews with external checkpoi
     await trigger(rt.hooks, "input", { cwd: f.cwd, source: "user", text: "edit the work file" }, rt.ctx);
     await trigger(rt.hooks, "before_agent_start", { cwd: f.cwd }, rt.ctx);
     assert.ok((await namespaceRecords("ephemeral-session")).length >= 1, "baseline armed in the live session namespace");
+    await trigger(rt.hooks, "tool_call", { cwd: f.cwd, toolName: "write", input: { path: join(f.cwd, "work.txt") } }, rt.ctx);
     await writeFile(join(f.cwd, "work.txt"), "baseline\nreviewed edit\n");
     await triggerAgentEnd(rt.hooks, { cwd: f.cwd, messages: [{ role: "assistant", content: "edited" }] }, rt.ctx);
     // Review is not disabled merely because there is no session file.
@@ -130,6 +131,7 @@ test("a conversation file inside the workspace still uses external checkpoints a
     assert.match(resumed.notices.join("\n"), /restored conversation state revision/);
     assert.doesNotMatch(resumed.notices.join("\n"), /cannot resume|not restored/);
     await trigger(resumed.hooks, "before_agent_start", { cwd: f.cwd }, resumed.ctx);
+    await trigger(resumed.hooks, "tool_call", { cwd: f.cwd, toolName: "write", input: { path: join(f.cwd, "work.txt") } }, resumed.ctx);
     await writeFile(join(f.cwd, "work.txt"), "baseline\nresumed edit\n");
     await triggerAgentEnd(resumed.hooks, { cwd: f.cwd, messages: [{ role: "assistant", content: "edited" }] }, resumed.ctx);
     assert.equal(await readFile(f.callsPath, "utf8").catch(() => "missing"), "1", resumed.notices.join(" | "));

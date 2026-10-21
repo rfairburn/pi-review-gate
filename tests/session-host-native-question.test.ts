@@ -650,7 +650,12 @@ class ChangeSignal {
           finish(new Error(`${description}: the bounded event predicate failed`));
         }
       };
-      const timer = setTimeout(() => finish(new Error(`${description}: deadline exceeded`)), timeoutMs);
+      // One exact-predicate recheck at the unchanged deadline so a missed
+      // notification cannot turn an already-true condition into a failure.
+      const timer = setTimeout(() => {
+        check();
+        finish(new Error(`${description}: deadline exceeded`));
+      }, timeoutMs);
       this.listeners.add(check);
       check();
     });
@@ -826,6 +831,19 @@ function questionBodyBetweenHeaderAndFirstChoice(frame: string): boolean {
   const body = popupLines.slice(questionHeader + 1, firstChoice).join("\n");
   return frameContains(body, QUESTION_TEXT);
 }
+
+test("ChangeSignal.waitFor rechecks its exact predicate once at the unchanged deadline", async () => {
+  let ready = false;
+  let calls = 0;
+  const missed = new ChangeSignal().waitFor(() => (calls++, ready), 20, "missed notification");
+  queueMicrotask(() => { ready = true; }); // condition becomes true without notify()
+  await missed;
+  assert.equal(calls, 2, "one initial check plus one deadline recheck; no polling");
+  await assert.rejects(new ChangeSignal().waitFor(() => false, 20, "still false"), /^Error: still false: deadline exceeded$/);
+  let thrown = 0;
+  const throwing = (): boolean => { if (thrown++ > 0) throw new Error("predicate"); return false; };
+  await assert.rejects(new ChangeSignal().waitFor(throwing, 20, "throwing"), /^Error: throwing: the bounded event predicate failed$/);
+});
 
 test("question popup matcher excludes transcript text outside the modal geometry", () => {
   const lines = Array.from({ length: PTY_ROWS }, () => " ".repeat(PTY_COLS));

@@ -506,7 +506,9 @@ test("external-only correction observations count as progress when the workspace
     toolEventObservability: { mode: "structured", description: "test structured tool events" },
     async run(request) {
       turns += 1;
-      if (turns <= 2) {
+      // Every correction makes a qualifying observed call; a no-call correction
+      // would settle with unresolved findings instead of another review.
+      if (turns <= 3) {
         await writeFile(externalPath, `external correction ${turns}\n`, "utf8");
         request.onToolObservation?.({ stage: "start", toolName: "write", toolInput: { path: externalPath } });
         request.onToolObservation?.({ stage: "end", toolName: "write", toolInput: { path: externalPath }, result: "updated external file" });
@@ -536,10 +538,10 @@ test("external-only correction observations count as progress when the workspace
     assert.equal(result.status, "reviewed");
     assert.equal(result.reviewCycles.length, 3, "two external-only corrections must not be stopped as no progress");
     assert.deepEqual(result.reviewCycles.map((cycle) => cycle.verdict), ["needs_changes", "needs_changes", "pass"]);
-    assert.deepEqual(result.reviewCycles.map((cycle) => cycle.externalObservationRevision), [2, 4, 4]);
+    assert.deepEqual(result.reviewCycles.map((cycle) => cycle.externalObservationRevision), [2, 4, 6]);
     assert.equal(result.changedSinceLaunch.length, 0, "external-only corrections leave the workspace identity unchanged");
     assert.equal(turns, 4, "the passing review is confirmed without another external write");
-    assert.equal(await readFile(externalPath, "utf8"), "external correction 2\n");
+    assert.equal(await readFile(externalPath, "utf8"), "external correction 3\n");
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
@@ -1278,7 +1280,7 @@ async function waitForPathGone(path: string, timeoutMs = 10_000): Promise<void> 
   }
 }
 
-test("a pass confirmation that changes reviewed CONTENT re-reviews instead of settling (finding-1 identity)", async () => {
+test("a run-as-binary pass response that changes reviewed CONTENT is reported as unreviewed final evidence without another review", async () => {
   const scratch = await mkdtemp(join(tmpdir(), "pi-review-inplace-confirm-"));
   const workspace = join(scratch, "workspace");
   await mkdir(workspace, { recursive: true });
@@ -1321,12 +1323,14 @@ test("a pass confirmation that changes reviewed CONTENT re-reviews instead of se
     assert.equal(task.state, "reported", `pass-confirm task settled at ${task.state}: ${task.error ?? ""} · last activity: ${task.activity.at(-1)?.message ?? ""}`);
     assert.equal(await readFile(payload, "utf8"), "v2\n", "the confirmation-turn rewrite is present in the workspace");
     assert.ok(task.result?.taskResults[0]?.reviewReport, "a review report exists");
-    assert.equal(task.result!.taskResults[0]!.reviewReport!.reviewCycles, 2, "two review cycles ran");
-    const cycleOne = JSON.parse(await readFile(join(task.artifactDir!, "reviews", "inplace", "cycle-000001.json"), "utf8")) as Record<string, unknown>;
-    const cycleTwo = JSON.parse(await readFile(join(task.artifactDir!, "reviews", "inplace", "cycle-000002.json"), "utf8")) as Record<string, unknown>;
-    const attributionOne = cycleOne.attribution as Record<string, unknown>;
-    const attributionTwo = cycleTwo.attribution as Record<string, unknown>;
-    assert.notEqual(attributionOne.deltaIdentitySha256, attributionTwo.deltaIdentitySha256, "the second review covered different content");
+    assert.equal(task.result!.taskResults[0]!.reviewReport!.reviewCycles, 1, "the final pass response is not re-reviewed");
+    assert.equal(existsSync(join(task.artifactDir!, "reviews", "inplace", "cycle-000002.json")), false);
+    assert.equal(await readFile(counter, "utf8"), "2", "the final pass-response turn actually ran");
+    const durable = JSON.parse(await readFile(join(task.artifactDir!, "result.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(durable.status, "reviewed");
+    assert.match(String(durable.automaticReviewNotArmed), /captured but NOT reviewed: added payload\.txt/);
+    assert.match(task.report ?? "", /not certified by that pass/);
+    assert.match(task.summary ?? "", /passed for the earlier reviewed delta only/);
   } finally {
     await instance?.shutdown();
     await instance?.detach();

@@ -651,12 +651,9 @@ export class NativeAgentRegistry implements ProfilePreparer {
     if (options.profile !== undefined && options.profile !== "") {
       throw new Error("session-host: per-instance profiles are not supported; children use the native Pi agent directory");
     }
+    // The canonical native agent directory (or its `.pi` parent) is an
+    // ordinary workspace choice: children keep sharing this same root.
     const workspace = resolveExistingDirectory(options.workspace, "workspace");
-    if (workspace === this.#agentDir) {
-      throw new Error(
-        `session-host: native Pi agent directory ${this.#agentDir} must not be the workspace; native agent state is never the workspace`,
-      );
-    }
 
     ensureNativeReviewGateConfig(this.#agentDir, workspace, this.#env);
 

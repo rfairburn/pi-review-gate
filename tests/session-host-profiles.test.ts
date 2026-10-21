@@ -199,8 +199,24 @@ test("NativeAgentRegistry admits simultaneous children against one untouched nat
     second.release();
     assertTreesEqual(before, agentDir);
     expectError(() => registry.prepare({ workspace: workspaceA, profile: join(root, "legacy-profile") }), "per-instance profiles are not supported");
-    expectError(() => registry.prepare({ workspace: agentDir }), "must not be the workspace");
+    // #461: the canonical native root and its `.pi` parent are ordinary
+    // workspaces that keep sharing the same untouched native setup.
+    const agentWorkspace = registry.prepare({ workspace: agentDir });
+    assert.equal(agentWorkspace.workspace, realpathSync(agentDir));
+    assert.equal(agentWorkspace.agentDir, realpathSync(agentDir));
+    assert.equal(registry.prepare({ workspace: dirname(agentDir) }).workspace, realpathSync(dirname(agentDir)));
+    expectError(() => registry.prepare({ workspace: join(agentDir, "missing") }), "does not exist");
     assertTreesEqual(before, agentDir);
+    // A nondefault root, spelled through a symlink, is admitted canonically.
+    const nondefault = join(root, "nondefault-agent");
+    mkdirSync(nondefault);
+    writeConfig(nondefault, enabledConfig());
+    symlinkSync(nondefault, join(root, "nondefault-link"));
+    const custom = new NativeAgentRegistry({ env: { HOME: home, [PI_AGENT_DIR_ENV]: join(root, "nondefault-link") } });
+    const customWorkspace = custom.prepare({ workspace: join(root, "nondefault-link") });
+    assert.equal(customWorkspace.workspace, realpathSync(nondefault));
+    assert.equal(customWorkspace.agentDir, realpathSync(nondefault));
+    assert.deepEqual(readdirSync(nondefault), ["review-gate.json"], "existing native config is never rewritten");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

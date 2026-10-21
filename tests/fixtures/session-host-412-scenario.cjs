@@ -317,7 +317,12 @@ async function scenarioRealWork() {
       // settles only after the adapter observed reviewer process exit.
       await lab.host.trigger("input", { cwd: lab.workspace, text: "review the synthetic change", source: "user" }, lab.ctx);
       await lab.host.trigger("before_agent_start", { cwd: lab.workspace }, lab.ctx);
+      // Automatic review requires agent tool activity: deliver the agent's
+      // write tool hooks around the actual write.
+      const write = { toolCallId: "synthetic-412-write", toolName: "write", input: { path: "reviewed.txt", content: "synthetic reviewed change\n" } };
+      await lab.host.trigger("tool_call", write, lab.ctx);
       writeFileSync(join(lab.workspace, "reviewed.txt"), "synthetic reviewed change\n", "utf8");
+      await lab.host.trigger("tool_result", { ...write, result: { content: [{ type: "text", text: "Wrote reviewed.txt" }] }, isError: false }, lab.ctx);
       await lab.host.trigger("agent_start", { type: "agent_start" }, lab.ctx);
       lab.isIdle = () => true;
       await lab.host.trigger("agent_end", { type: "agent_end", cwd: lab.workspace }, lab.ctx);

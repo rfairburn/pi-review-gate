@@ -1,7 +1,7 @@
-import { readdir } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ReviewRunOutput } from "../../review";
-import { atomicWriteExclusive } from "../durable-write";
+import { atomicWrite, atomicWriteExclusive } from "../durable-write";
 import type { InPlaceAttribution } from "./basis";
 
 // ── durable in-place review cycle records ────────────────────────────────────
@@ -148,4 +148,52 @@ export async function persistInPlaceReviewCycleRecord(artifactDir: string, recor
       // available with unknown completeness, never definitively current.
     }
   }
+}
+
+// ── durable review-activity boundary (automatic review gating) ──────────────
+
+export const INPLACE_REVIEW_ACTIVITY_FILE = "review-activity.json";
+
+/** The last completed (pass/needs_changes) review and what happened since it. */
+export interface InPlaceReviewActivity {
+  version: 1;
+  taskId: string;
+  /** Work is in progress, or the retained review boundary remains unverifiable. */
+  inFlight: boolean;
+  /** Some turn since the last review ran on an adapter without a structured tool stream. */
+  unobservedSinceReview: boolean;
+  qualifyingSinceReview: boolean;
+  lastReview?: {
+    cycle: number;
+    verdict: "pass" | "needs_changes";
+    toolObservationsTruncated: boolean;
+    requiresReview: boolean;
+    identity: string;
+    changedSinceLaunch: Array<{ status: string; path: string }>;
+  };
+}
+
+export async function persistInPlaceReviewActivity(artifactDir: string, activity: InPlaceReviewActivity): Promise<void> {
+  await atomicWrite(join(artifactDir, INPLACE_REVIEW_ACTIVITY_FILE), `${JSON.stringify(activity, null, 2)}\n`);
+}
+
+/** Undefined when absent, unreadable, malformed, or foreign: callers treat that as unknown, never as no activity. */
+export async function loadInPlaceReviewActivity(artifactDir: string, taskId: string): Promise<InPlaceReviewActivity | undefined> {
+  let value: unknown;
+  try { value = JSON.parse(await readFile(join(artifactDir, INPLACE_REVIEW_ACTIVITY_FILE), "utf8")); }
+  catch { return undefined; }
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.version !== 1 || record.taskId !== taskId || typeof record.inFlight !== "boolean"
+    || typeof record.unobservedSinceReview !== "boolean" || typeof record.qualifyingSinceReview !== "boolean") return undefined;
+  const last = record.lastReview as Record<string, unknown> | undefined;
+  if (last !== undefined && (!last || typeof last !== "object"
+    || !Number.isSafeInteger(last.cycle) || (last.verdict !== "pass" && last.verdict !== "needs_changes")
+    || typeof last.toolObservationsTruncated !== "boolean" || typeof last.requiresReview !== "boolean"
+    || typeof last.identity !== "string" || !Array.isArray(last.changedSinceLaunch)
+    || !last.changedSinceLaunch.every((change: unknown) => !!change && typeof change === "object"
+      && typeof (change as Record<string, unknown>).status === "string" && typeof (change as Record<string, unknown>).path === "string"))) {
+    return undefined;
+  }
+  return record as unknown as InPlaceReviewActivity;
 }

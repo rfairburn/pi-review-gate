@@ -21,8 +21,10 @@ import {
   computeInPlaceAttribution,
   createInPlaceBaseline,
   createInPlaceToolBasis,
+  inPlaceDeltaEntries,
   inPlaceToolIdentity,
   inPlaceDeltaIdentity,
+  inPlaceUnknownEvidenceMark,
   type InPlaceBaseline,
   type InPlaceBasis,
   type InPlaceAttribution,
@@ -33,7 +35,15 @@ import { ensureArtifactDir } from "./containment";
 import { runInplaceTurnWorker } from "./adapter-workflow";
 import { OBSERVED_TOOL_EVIDENCE_FILE, persistObservedToolEvidence, restoreObservedToolEvidence } from "../observed-evidence";
 import { buildInPlaceReviewRequest } from "./prompts";
-import { buildInPlaceReviewCycleRecord, nextInPlaceReviewCycle, persistInPlaceReviewCycleRecord } from "./review-records";
+import {
+  buildInPlaceReviewCycleRecord,
+  INPLACE_REVIEW_ACTIVITY_FILE,
+  loadInPlaceReviewActivity,
+  nextInPlaceReviewCycle,
+  persistInPlaceReviewActivity,
+  persistInPlaceReviewCycleRecord,
+  type InPlaceReviewActivity,
+} from "./review-records";
 import { settleInPlace as settleResult } from "./settlement";
 
 function reportLifecycleProgress(input: InPlaceLifecycleInput, update: Omit<SubtaskProgressUpdate, "subtaskId">): void {
@@ -119,9 +129,19 @@ async function recoverInPlaceContinuationContext(input: {
  * 5. Reviews that delta (snapshot scope, truthful attribution) and resumes
  *    the same executor session in the same workspace for correction on
  *    needs_changes, honoring maxCorrectionCycles and no-progress detection.
- * 6. On pass, transmits the pass for observation and resumes once; only an
- *    unchanged delta versus the passed cycle settles as reviewed; any new
- *    workspace change re-enters review.
+ * 6. On pass, transmits the pass for observation and resumes once; an
+ *    unchanged delta versus the passed cycle settles as reviewed; a changed
+ *    delta re-enters review only through the qualifying-activity gate below.
+ *
+ * Automatic review is only ever narrowed, never widened: when every executor
+ * turn since the last completed review ran on a structured tool-event stream,
+ * a review (initial, correction, or post-pass) additionally requires new
+ * qualifying tool activity since that review. Filesystem changes alone then
+ * settle without a new review: unreviewed before any review, unresolved
+ * findings after needs_changes, and the earlier pass (with the later delta
+ * disclosed as not reviewed) after a pass. Unobserved turns keep the existing
+ * eligibility, except that a run-as-binary final pass response is reported as
+ * evidence without another review.
  * 7. Writes result.json with the truthful status and attribution data.
  *
  * A verdict never represents a pre-write gate or a rollback: writes already
@@ -250,10 +270,17 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
   // evidence, and pass observation share one serial state like execute runs.
   const retainedEvidenceExpected = input.initialResult !== undefined || recoveredContinuation?.hadPriorExecution === true
     || Boolean(input.continuation && !capturedFreshBasis);
+  // Once a turn has started, the durable review-activity boundary exists; the
+  // retained ledger is then required, never replaced by an empty one that
+  // could suppress review against that boundary.
+  let activityRetained = false;
+  if (retainedEvidenceExpected) {
+    try { await stat(join(resolvedArtifactDir, INPLACE_REVIEW_ACTIVITY_FILE)); activityRetained = true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
   await restoreObservedToolEvidence(window.evidence, resolvedArtifactDir, workspaceRoot, {
-    required: retainedEvidenceExpected && (
-      evidencePolicy.toolOnly || evidencePolicy.snapshotFailureFallback || baseline.mode === "tool"
-    ),
+    required: retainedEvidenceExpected && (activityRetained
+      || evidencePolicy.toolOnly || evidencePolicy.snapshotFailureFallback || baseline.mode === "tool"),
   });
   if (resolve(baseline.workspaceRoot) !== resolve(workspaceRoot)) throw new Error("InPlace evidence basis root mismatch.");
   if (launchFallback) await warnFallback();
@@ -280,16 +307,39 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
     window.evidence.requiresReview = true;
   }
   let effectiveAssignment = input.executorAssignment;
+  // Qualifying structured activity is measured from the last completed
+  // (pass/needs_changes) review, whose boundary survives pauses durably. A
+  // continuation without a verifiable boundary (absent, corrupt, foreign, or
+  // written mid-turn/mid-review) is unknown: that uncertainty is disclosed and
+  // refuses success, but it is not itself a new qualifying call. Durably
+  // recorded qualifying/unobserved activity in a parseable record still arms.
+  const restoredActivity = retainedEvidenceExpected ? await loadInPlaceReviewActivity(resolvedArtifactDir, taskId) : undefined;
+  const activityKnown = !retainedEvidenceExpected || (restoredActivity !== undefined && !restoredActivity.inFlight);
+  let lastReview: InPlaceReviewActivity["lastReview"] = activityKnown ? restoredActivity?.lastReview : undefined;
+  let unobservedSinceReview = restoredActivity?.unobservedSinceReview === true;
+  let qualifyingSinceReview = restoredActivity?.qualifyingSinceReview === true;
+  let binaryPassFinal = false;
+  const saveActivity = (inFlight: boolean) => persistInPlaceReviewActivity(resolvedArtifactDir, {
+    version: 1, taskId,
+    // Finishing a turn cannot reconstruct a lost boundary: it stays unknown
+    // until a completed review in this run supplies a replacement.
+    inFlight: inFlight || (!activityKnown && !lastReview),
+    unobservedSinceReview, qualifyingSinceReview, ...(lastReview ? { lastReview } : {}),
+  });
   type InPlaceTurnInput = Omit<Parameters<typeof runInplaceTurnWorker>[0], "executorAssignment" | "evidence" | "baseline">;
   const runTurn = async (turnInput: InPlaceTurnInput): Promise<InPlaceWorkerResult> => {
+    let result: InPlaceWorkerResult | undefined;
     try {
-      const result = await runInplaceTurnWorker({
+      await saveActivity(true);
+      result = await runInplaceTurnWorker({
         ...turnInput,
         executorAssignment: effectiveAssignment,
         evidence: window.evidence,
         baseline,
       });
       effectiveAssignment = result.effectiveAssignment ?? effectiveAssignment;
+      if (result.structuredToolEvents !== true) unobservedSinceReview = true;
+      if ((result.qualifyingObservations ?? 0) > 0) qualifyingSinceReview = true;
       if (result.status === "completed") {
         // #266: record the completed turn's final summary BEFORE this turn's
         // durable evidence checkpoint in the finally block below. Reviewers
@@ -305,7 +355,9 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
       }
       return result;
     } finally {
+      if (!result) unobservedSinceReview = true; // An unsettled turn's activity is unknown.
       await persistObservedToolEvidence(window.evidence, resolvedArtifactDir);
+      await saveActivity(false);
     }
   };
 
@@ -657,6 +709,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
           });
         }
         currentResult = resumed;
+        binaryPassFinal = false; // Newer instructions are new work, not the final pass response.
         attribution = await baselineFor();
       }
     }
@@ -665,11 +718,26 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
     const currentDeltaIdentity = inPlaceDeltaIdentity(attribution);
     if (method === "snapshot" && correctionCount === 0 && changedPaths.length === 0 && !window.evidence.requiresReview
       && !snapshotBasis?.toolOnlyHistory && baseline.mode !== "tool") {
+      // The empty-delta upper bound still invokes no reviewer, but restored
+      // unresolved findings are never reported as a successful no_changes.
+      // An unverifiable retained boundary (absent, corrupt, or in flight) may
+      // hide unresolved findings until a review in this run replaces it.
+      const unresolved = lastReview?.verdict === "needs_changes" ? lastReview : undefined;
+      const unknownBoundary = !activityKnown && reviewCycles.length === 0;
       return await settleInPlace(input, {
-        status: "no_changes",
+        status: unresolved || unknownBoundary ? "correction_cap" : "no_changes",
         taskId,
         title: task.title,
-        summary: currentResult.summary,
+        summary: unresolved
+          ? `The recorded snapshot delta is empty, but the findings of review cycle ${unresolved.cycle} remain unresolved; no review ran on the empty delta.`
+          : unknownBoundary
+            ? "The recorded snapshot delta is empty, but the retained review-activity boundary cannot be verified; prior findings may remain unresolved. No review ran on the empty delta."
+            : currentResult.summary,
+        ...(unresolved || unknownBoundary ? {
+          error: unresolved
+            ? "Review findings unresolved; no review ran on the empty delta."
+            : "Retained review-activity boundary is unverifiable; successful completion refused.",
+        } : {}),
         adapter: currentResult.adapter,
         model: currentResult.model,
         usage: currentResult.usage,
@@ -749,7 +817,64 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
       });
     }
 
+    // Retention/uncertainty flags (a full ledger, clipped inputs) are disclosed
+    // but are not new calls: qualifying calls are counted per observation
+    // before any ledger discard.
+    if ((binaryPassFinal || !unobservedSinceReview) && !qualifyingSinceReview) {
+      // Not armed: settle honestly from the last completed review, never as a new verdict.
+      const unknownBoundary = !activityKnown && reviewCycles.length === 0;
+      const since = lastReview ? `since review cycle ${lastReview.cycle}` : input.continuation ? "in this continuation" : "since launch";
+      const reviewedEntries = new Set(lastReview?.identity.split("|") ?? []);
+      const currentEntries = inPlaceDeltaEntries(attribution);
+      const currentPaths = new Set(changedPaths.map((change) => change.path));
+      const unreviewed = [
+        ...(currentEntries ?? []).filter((entry) => !reviewedEntries.has(entry.identity)).map((entry) => `${entry.status} ${entry.path}`),
+        ...(lastReview && currentEntries ? lastReview.changedSinceLaunch.filter((change) => !currentPaths.has(change.path)).map((change) => `restored ${change.path}`) : []),
+      ];
+      const scope = currentEntries === undefined
+        ? "No whole-root snapshot delta exists under the current evidence method; only observed tool evidence is retained."
+        : unreviewed.length === 0
+          ? "No workspace delta change was recorded after that point."
+          : `Workspace changes recorded after that point were captured but NOT reviewed: ${unreviewed.slice(0, 10).join(", ")}${unreviewed.length > 10 ? ` (+${unreviewed.length - 10} more)` : ""}.`;
+      const trigger = binaryPassFinal
+        ? "The run-as-binary final pass-response turn ran and is reported as evidence without another review (that protocol forwards no tool calls; none are claimed)."
+        : `No new qualifying structured tool activity was observed ${since} (known read-only calls do not qualify); filesystem changes alone do not arm automatic InPlace review.`;
+      const notArmed = `${trigger} ${scope} Missing observations are not proof that no effects occurred.`;
+      // Only a pass reviewed in THIS run settles as reviewed; an earlier run's
+      // pass never certifies a continuation's new instructions.
+      const passedCycle = lastReview?.verdict === "pass"
+        ? reviewCycles.find((cycle) => cycle.cycle === lastReview!.cycle && cycle.verdict === "pass")
+        : undefined;
+      return await settleInPlace(input, {
+        status: passedCycle ? "reviewed" : lastReview?.verdict === "needs_changes" || unknownBoundary ? "correction_cap" : "unreviewed",
+        taskId,
+        title: task.title,
+        summary: passedCycle
+          ? `${currentResult.summary}\n\nReview cycle ${passedCycle.cycle} passed the delta it reviewed${hasPartialReviewerFailure(passedCycle.reviewOutput.reviewerResults) ? " with reviewer infrastructure warnings" : ""}; the current workspace state is not certified by that pass. ${notArmed}`
+          : lastReview?.verdict === "needs_changes"
+            ? `No progress: the findings of review cycle ${lastReview.cycle} remain unresolved. ${notArmed}`
+            : unknownBoundary
+              ? `${currentResult.summary}\n\nNo automatic review ran; the retained review-activity boundary cannot be verified; prior findings may remain unresolved. ${notArmed}`
+              : `${currentResult.summary}\n\nNo automatic review ran${lastReview ? `; review cycle ${lastReview.cycle} passed only an earlier delta in a prior run` : ""}. ${notArmed}`,
+        adapter: currentResult.adapter,
+        model: currentResult.model,
+        usage: currentResult.usage,
+        ...(lastReview?.verdict === "needs_changes" ? { error: "No qualifying correction activity; review findings unresolved." }
+          : unknownBoundary ? { error: "Retained review-activity boundary is unverifiable; successful completion refused." } : {}),
+        workspaceRoot,
+        baseline,
+        changedSinceLaunch: changedPaths,
+        reviewCycles,
+        automaticReviewNotArmed: notArmed,
+        artifactDir: resolvedArtifactDir,
+        operationRecord: currentResult.operationRecord,
+        lastExecutorTurn,
+        session: currentResult.session,
+      });
+    }
+
     const reviewCycle = nextReviewCycle++;
+    await saveActivity(true); // Until this review completes, the boundary is uncertain.
     const reviewerLabels = resolveReviewers(frozen.frozenConfig).reviewers.map(reviewerProgressLabel);
     reportLifecycleProgress(input, {
       phase: "reviewing",
@@ -921,6 +1046,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         });
       }
       currentResult = steered;
+      binaryPassFinal = false;
       attribution = await baselineFor();
       continue;
     }
@@ -987,6 +1113,16 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         session: currentResult.session,
       });
     }
+
+    // The boundary advances only after a durably recorded pass/needs_changes;
+    // an errored review leaves earlier activity unreviewed.
+    if (verdict === "pass" || verdict === "needs_changes") {
+      lastReview = { cycle: reviewCycle, verdict, ...inPlaceUnknownEvidenceMark(window.evidence), identity: currentDeltaIdentity, changedSinceLaunch: changedPaths };
+      unobservedSinceReview = false;
+      qualifyingSinceReview = false;
+      binaryPassFinal = false;
+    }
+    await saveActivity(false);
 
     if (verdict === "error") {
       return await settleInPlace(input, {
@@ -1262,10 +1398,15 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         session: confirmed.session,
       });
     }
-    // The workspace changed after the pass: the old pass is invalid and the
-    // new delta must be reviewed (the review verdict is post-hoc; the writes
-    // that produced this new delta were already performed either way).
+    // The workspace changed after the pass: the old pass does not cover the
+    // new delta. The loop's qualifying-activity gate decides whether it is
+    // reviewed or reported as unreviewed evidence (the review verdict is
+    // post-hoc; the writes were already performed either way).
     currentResult = confirmed;
+    // The user's run-as-binary contract: its final pass-response turn is
+    // captured and reported as evidence; its unobserved changes alone never
+    // arm another review (actual qualifying activity still can).
+    binaryPassFinal = confirmed.adapter === "run-as-binary";
     attribution = passedMethod === "snapshot" ? confirmAttribution : await baselineFor();
     continue;
   }

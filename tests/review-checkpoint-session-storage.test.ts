@@ -4,7 +4,7 @@
 // for persisted and in-memory sessions alike; never inside a workspace.
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { promisify } from "node:util";
@@ -326,20 +326,78 @@ test("non-private extension directories are refused on POSIX", posixOnly, async 
   assert.deepEqual(await readdir(namespace), []);
 }));
 
-test("an agent-data directory overlapping the capture workspace is refused explicitly, creating nothing", async () => fixture(async ({ root }) => {
-  await writeFile(join(root, "file.txt"), "x");
-  // e.g. PI_CODING_AGENT_DIR inside the workspace, or a session started in an
-  // ancestor of the agent directory such as the home directory.
-  const inside = { agentDir: join(root, ".pi", "agent"), sessionId: "session-inside" };
-  const refused = await captureReviewCheckpoint(root, "window-1-overlap", { scope: inside });
-  assert.equal(refused.status, "failed");
-  if (refused.status === "failed") assert.match(refused.detail ?? "", /overlaps the capture workspace.*unsupported/);
-  assert.deepEqual(await readdir(root), ["file.txt"], "no storage is created inside the workspace");
-  const ancestorRoot = dirname(root);
-  const nested = { agentDir: join(root, "agent"), sessionId: "session-nested" };
-  const ancestor = await captureReviewCheckpoint(ancestorRoot, "window-1-ancestor", { scope: nested });
-  assert.equal(ancestor.status, "failed");
-  assert.equal(await exists(join(root, "agent")), false);
+// #461: the agent-data directory, or its `.pi` parent, may itself be the
+// selected workspace. Only exact-layout private owned records are skipped.
+test("agent-data and .pi-parent workspaces capture, compare and release without record recursion; Git is unchanged", async () => fixture(async ({ base }) => {
+  const pi = join(base, "home", ".pi");
+  const agentDir = join(pi, "agent");
+  await mkdir(join(agentDir, "sessions"), { recursive: true });
+  await writeFile(join(pi, "notes.txt"), "parent\n");
+  await writeFile(join(agentDir, "settings.json"), "{}\n");
+  await writeFile(join(agentDir, "sessions", "conversation.jsonl"), "turn-1\n");
+  for (const [root, sessionId] of [[pi, "parent-session"], [agentDir, "agent-session"]] as const) {
+    const scope = { agentDir, sessionId };
+    const first = await raw(root, "window-1-self", scope);
+    const firstRecord = rawReviewCheckpointRecordPath(scope, root, first);
+    assert.ok(firstRecord.startsWith(`${root}${sep}`), "the owned record is published inside the selected root");
+    await writeFile(join(agentDir, "sessions", "conversation.jsonl"), `turn-2 ${sessionId}\n`);
+    // Unknown neighbors and a non-private look-alike stay captured.
+    await writeFile(join(dirname(firstRecord), "unknown.txt"), "neighbor\n");
+    const lookAlike = join(dirname(dirname(firstRecord)), `window-9-x-${"a".repeat(32)}`, "record.json");
+    await mkdir(dirname(lookAlike), { mode: 0o700 });
+    await writeFile(lookAlike, "not owned\n", { mode: 0o644 });
+    // A private generation/record beneath a non-private intermediate session
+    // directory was never published by this extension: it stays captured.
+    const foreignSession = join(dirname(dirname(dirname(dirname(dirname(firstRecord))))), "foreign-session");
+    const foreignRecord = join(foreignSession, "checkpoints", "b".repeat(32), `window-1-y-${"c".repeat(32)}`, "record.json");
+    await mkdir(dirname(foreignRecord), { recursive: true, mode: 0o700 });
+    await chmod(foreignSession, 0o755);
+    await writeFile(foreignRecord, "foreign\n", { mode: 0o600 });
+    const second = await raw(root, "window-2-self", scope);
+    const third = await raw(root, "window-3-self", scope);
+    const entries = JSON.parse(await readFile(rawReviewCheckpointRecordPath(scope, root, third), "utf8")).entries as Array<{ path: string }>;
+    const paths = entries.map((entry) => entry.path);
+    const prefix = root === pi ? "agent/" : "";
+    assert.ok(paths.includes(`${prefix}settings.json`) && paths.includes(`${prefix}sessions/conversation.jsonl`));
+    assert.ok(paths.some((path) => path.endsWith("/unknown.txt")), "unknown files next to records stay visible");
+    assert.equal(paths.some((path) => path.endsWith(`window-9-x-${"a".repeat(32)}/record.json`)), process.platform !== "win32");
+    assert.equal(paths.some((path) => path.endsWith(`window-1-y-${"c".repeat(32)}/record.json`)), process.platform !== "win32");
+    assert.equal(paths.filter((path) => path.endsWith("/record.json") && !path.includes("window-9-x-") && !path.includes("window-1-y-")).length, 0, "owned records never copy themselves");
+    // Repeated publication does not grow: the third record matches the second.
+    const secondBytes = (await stat(rawReviewCheckpointRecordPath(scope, root, second))).size;
+    const thirdBytes = (await stat(rawReviewCheckpointRecordPath(scope, root, third))).size;
+    assert.ok(Math.abs(thirdBytes - secondBytes) < 512, `${secondBytes} vs ${thirdBytes}`);
+    const compared = await compareReviewCheckpoints(root, first, third, { scope });
+    assert.equal(compared.status, "ok", JSON.stringify(compared));
+    if (compared.status === "ok") {
+      const changed = compared.value.changes.map((change) => change.path);
+      assert.ok(changed.includes(`${prefix}sessions/conversation.jsonl`));
+      assert.equal(changed.some((path) => path.endsWith("/record.json") && !path.includes("window-9-x-") && !path.includes("window-1-y-")), false);
+    }
+    for (const descriptor of [first, second, third]) assert.equal((await releaseReviewCheckpoint(root, descriptor, { scope })).status, "ok");
+    // Release removes only verified records: unknown neighbors survive and
+    // an emptied owner directory is removed.
+    assert.equal(await readFile(join(dirname(firstRecord), "unknown.txt"), "utf8"), "neighbor\n");
+    assert.equal(await exists(firstRecord), false);
+    assert.equal(await exists(dirname(rawReviewCheckpointRecordPath(scope, root, third))), false);
+    await rm(dirname(firstRecord), { recursive: true });
+    await rm(foreignSession, { recursive: true });
+    await rm(dirname(lookAlike), { recursive: true });
+  }
+  // A Git agent-data root keeps the Git backend with ordinary captured files.
+  await exec("git", ["init", "-q"], { cwd: agentDir });
+  const gitBefore = await captureReviewCheckpoint(agentDir, "window-1-git-agent", { scope: { agentDir, sessionId: "git-session" } });
+  assert.equal(gitBefore.status, "ok", JSON.stringify(gitBefore));
+  await writeFile(join(agentDir, "settings.json"), "{\"changed\":true}\n");
+  const gitAfter = await captureReviewCheckpoint(agentDir, "window-2-git-agent", { scope: { agentDir, sessionId: "git-session" } });
+  assert.equal(gitAfter.status, "ok", JSON.stringify(gitAfter));
+  if (gitBefore.status === "ok" && gitAfter.status === "ok") {
+    assert.equal(gitBefore.value.kind, "git");
+    const compared = await compareReviewCheckpoints(agentDir, gitBefore.value, gitAfter.value);
+    assert.equal(compared.status, "ok", JSON.stringify(compared));
+    if (compared.status === "ok") assert.deepEqual(compared.value.changes.map((change) => change.path), ["settings.json"]);
+    for (const descriptor of [gitBefore.value, gitAfter.value]) assert.equal((await releaseReviewCheckpoint(agentDir, descriptor)).status, "ok");
+  }
 }));
 
 test("live session scope resolution: session id without a session file, Pi-native agent dir semantics", () => {

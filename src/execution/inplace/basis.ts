@@ -58,6 +58,16 @@ export function inPlaceObservedWorkIdentity(evidence: EvidenceState): string {
   return createHash("sha256").update(JSON.stringify(events)).digest("hex");
 }
 
+/** Unknown-evidence state recorded when a review completes. */
+export interface InPlaceUnknownEvidenceMark {
+  toolObservationsTruncated: boolean;
+  requiresReview: boolean;
+}
+
+export function inPlaceUnknownEvidenceMark(evidence: EvidenceState): InPlaceUnknownEvidenceMark {
+  return { toolObservationsTruncated: evidence.toolObservationsTruncated === true, requiresReview: evidence.requiresReview === true };
+}
+
 export function inPlaceToolIdentity(evidence: EvidenceState): string {
   // Revisions advance before the bounded event ledger fills, including unknown scope.
   return JSON.stringify([evidence.toolObservationRevision ?? 0, evidence.externalObservationRevision ?? 0,
@@ -172,13 +182,19 @@ function snapshotEntryId(entry: FileSnapshot | undefined): string {
  * changes what was reviewed must never settle the task as reviewed.
  */
 export function inPlaceDeltaIdentity(attribution: InPlaceAttribution): string {
+  const entries = inPlaceDeltaEntries(attribution);
+  if (!entries) return attribution.toolIdentity ?? "tool-unknown";
+  return entries.map((entry) => entry.identity).sort().join("|");
+}
+
+/** Per-path content identities of a snapshot delta; undefined without a snapshot pair. */
+export function inPlaceDeltaEntries(attribution: InPlaceAttribution): Array<{ status: ChangedFile["status"]; path: string; identity: string }> | undefined {
   const before = attribution.baseline.snapshot;
   const after = attribution.snapshotAfter;
-  if (!before || !after) return attribution.toolIdentity ?? "tool-unknown";
-  const identity = attribution.changes.map((change) => {
+  if (!before || !after) return undefined;
+  return attribution.changes.map((change) => {
     const beforeId = snapshotEntryId(before.files.get(change.path));
     const afterId = snapshotEntryId(after.files.get(change.path));
-    return `${change.status}:${change.path}:${beforeId}=>${afterId}`;
-  }).sort();
-  return identity.join("|");
+    return { status: change.status, path: change.path, identity: `${change.status}:${change.path}:${beforeId}=>${afterId}` };
+  });
 }

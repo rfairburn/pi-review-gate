@@ -9,7 +9,8 @@ import { createWorkspaceSnapshot } from "../src/capture";
 import { registerCommands } from "../src/commands";
 import { createReviewTurnCoordinator } from "../src/activation/review-turn";
 import { createReviewCancellationCoordinator } from "../src/review-cancellation";
-import { createState, rememberUserRequest, snapshotReviewBaseline } from "../src/state";
+import { beginAgentRun, createState, rememberUserRequest, snapshotReviewBaseline } from "../src/state";
+import { recordToolCallEvidence, recordToolResultEvidence } from "../src/evidence";
 import { waitForPromiseBounded } from "../src/adapters/process";
 import { fakeNeedsChangesConfig } from "./helpers";
 
@@ -33,9 +34,17 @@ for (const path of ["automatic", "review-now", "ask-reviewer"] as const) {
       await writeFile(join(cwd, "index.ts"), "before\n");
       rememberUserRequest(state, "change index");
       const window = state.reviewWindow!;
-      window.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(cwd, { maxFileBytes: 1048576, maxSnapshotBytes: 52428800 }));
+      const snapshotOptions = { maxFileBytes: 1048576, maxSnapshotBytes: 52428800 };
+      window.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(cwd, snapshotOptions));
       const baseline = window.baseline;
+      // Automatic review requires agent tool activity: model the agent's write
+      // tool around the actual write; command paths stay filesystem-only controls.
+      const write = { toolName: "write", toolInput: { path: "index.ts", content: "after\n" } };
+      if (path === "automatic") beginAgentRun(state);
+      const exchangeSequence = path === "automatic" ? window.activeExchange!.sequence : undefined;
+      if (path === "automatic") await recordToolCallEvidence({ state: window.evidence, cwd, ...write, snapshotOptions, exchangeSequence });
       await writeFile(join(cwd, "index.ts"), "after\n");
+      if (path === "automatic") recordToolResultEvidence({ state: window.evidence, ...write, result: { content: [{ type: "text", text: "Wrote index.ts" }] }, exchangeSequence });
       const config = fakeNeedsChangesConfig();
       const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
       const notices: string[] = [];

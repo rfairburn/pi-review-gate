@@ -919,12 +919,19 @@ test("real public Main shares native pending notice/question details and preserv
   await driver.waitFrame((frame) => selectedEntryContains(frame, `3. ${CHOICE_CONTROL_VISIBLE}`),
     "the native answer selection reaches the displayed escaped-control choice", beforeControlChoice);
   const beforeSubmit = driver.frameRevision;
-  driver.pty.write(KEYS.enter); // choose the displayed escaped label; submit its raw original value
-  await driver.waitForRecords((records) => records.filter((record) => record.type === "agent_start"
-    && record.pid === sessionA.record.pid).length > startsBeforeAnswer,
-  "the ordinary UI-delivered question answer starts a native model turn");
-  await driver.waitFrame((frame) => rowBadgeState(frame, labelA) === "running",
+  // Arm the fresh running observation before the submit so a short real
+  // answer turn cannot finish before the frame waiter subscribes.
+  const answerRunning = driver.waitFrame((frame) => rowBadgeState(frame, labelA) === "running",
   "the question answer turn has a fresh real running sidebar observation", beforeSubmit);
+  const answerStarted = (async () => {
+    driver.pty.write(KEYS.enter); // choose the displayed escaped label; submit its raw original value
+    await driver.waitForRecords((records) => records.filter((record) => record.type === "agent_start"
+      && record.pid === sessionA.record.pid).length > startsBeforeAnswer,
+    "the ordinary UI-delivered question answer starts a native model turn");
+  })();
+  for (const outcome of await Promise.allSettled([answerStarted, answerRunning])) {
+    if (outcome.status === "rejected") throw outcome.reason;
+  }
   await waitForProvider(providerSignal, providerJournalFile,
     (records) => records.filter((record) => record.event === "model_request").length >= 7,
     "the normal question answer is the seventh A-owned scripted request");

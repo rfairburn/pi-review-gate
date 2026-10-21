@@ -409,6 +409,7 @@ for (const strategy of ["raw", "git"] as const) {
           if (mode === "fallback") {
             // Recovery itself establishes a shared NEW baseline. A subsequent
             // real snapshot review supplies the distinct exchange owner.
+            await trigger(f.rt.hooks, "tool_call", { cwd: f.cwd, toolName: "write", input: { path: "REPORT" } }, f.rt.ctx);
             await writeFile(join(f.cwd, "REPORT"), "SUBSEQUENT_SNAPSHOT_INTERVAL\n");
             await f.end();
             await f.start("continue after snapshot recovery review");
@@ -795,9 +796,14 @@ test("explicit evidence reset preserves outstanding correction requirements, bud
     assert.deepEqual(after.pendingModelDeliveries, before.pendingModelDeliveries);
     assert.equal(after.reviewWindow!.evidence.events.length, 0);
     assert.match(f.warnings.join("\n"), /correction requirements and pending deliveries remain in force/);
-    // Even an event-free response must validate the outstanding correction;
-    // the reset cannot turn it into an unchanged passing response.
+    // #461: an event-free response is not reviewed, and the reset cannot turn
+    // it into an accepted response: the correction stays unresolved.
     await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
+    await f.end();
+    assert.equal(reviews, 1);
+    assert.equal((await f.restored())!.state.reviewWindow!.reviewHistory.at(-1)!.verdict, "needs_changes");
+    await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
+    await f.writeScript("CORRECTED\n");
     await f.end();
     assert.equal(reviews, 2);
     const bundle = extractBundleDir(f.rt.sent[1]!.message, 2);
@@ -1164,7 +1170,7 @@ for (const scenario of [
   });
 }
 
-test("capped continuation after a session fallback stays Tools only without retry; outstanding corrections still review", async () => {
+test("capped continuation after a session fallback stays Tools only without retry; outstanding corrections stay unresolved", async () => {
   const f = await fixture({ snapshotFailureFallback: true }, true, 1);
   try {
     let reviews = 0;
@@ -1198,9 +1204,14 @@ test("capped continuation after a session fallback stays Tools only without retr
     assert.equal(after.lastCappedFollowUp, undefined);
     assert.equal(reviews, 2);
     assert.equal(f.warnings.length, warningCount, "no repeated fallback warning");
-    // The outstanding correction requirement still reaches the reviewer even
-    // when the response turn has no new tool evidence.
+    // #461: a response turn without new tool evidence is not reviewed and the
+    // correction stays outstanding; the next tool turn still validates it.
     await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
+    await f.end();
+    assert.equal(reviews, 2);
+    assert.equal((await f.restored())!.state.reviewWindow!.reviewHistory.at(-1)!.verdict, "needs_changes");
+    await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
+    await f.writeScript("THIRD_TOOL_CORRECTION\n");
     await f.end();
     assert.equal(reviews, 3);
     assert.match(f.rt.sent.at(-1)!.message, /Tools only \(snapshot-failure fallback\)/);

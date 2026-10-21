@@ -12,9 +12,14 @@ import test from "node:test";
 import { activate } from "../src/index";
 import { reapAll } from "../src/background-shell";
 import { SessionStateStore } from "../src/session-state";
+import { normalizeConfig } from "../src/config";
+import { recordToolCallEvidence } from "../src/evidence";
+import { runReview } from "../src/review";
+import { beginAgentRun, buildRequestContext, getCorrectionAttemptCount } from "../src/state";
 import { agentCatalog } from "./helpers";
 import {
   createSessionRuntime,
+  countingPassReviewer,
   countingPassReviewerWithPromptDump,
   extractBundleDir,
   indexTestConfig,
@@ -25,6 +30,7 @@ import {
   waitForCondition,
   waitForFile,
   testActivation,
+  testAgentDir,
 } from "./entrypoint-harness";
 
 test("ordinary prompt in an initialized empty Git repository reaches normal review settlement", async () => {
@@ -52,6 +58,7 @@ test("ordinary prompt in an initialized empty Git repository reaches normal revi
     await trigger(session.hooks, "session_start", { type: "session_start", reason: "startup" }, session.ctx);
     await trigger(session.hooks, "input", { cwd: dir, text: "create the first file", source: "user" }, session.ctx);
     await trigger(session.hooks, "before_agent_start", { cwd: dir }, session.ctx);
+    await trigger(session.hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "first.txt") } }, session.ctx);
     await writeFile(join(dir, "first.txt"), "review this new file\n", "utf8");
     await triggerAgentEnd(session.hooks, {
       cwd: dir,
@@ -127,6 +134,7 @@ review: { activeReviewers: [
     await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     await triggerAgentEnd(hooks, { cwd: dir });
 
@@ -292,6 +300,7 @@ review: { activeReviewers: [
     await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
     // Automatic finalization starts at agent_settled, so steer the input in
@@ -374,6 +383,7 @@ review: { activeReviewers: [
     await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
     const controller = new AbortController();
@@ -385,6 +395,7 @@ review: { activeReviewers: [
 
     await trigger(hooks, "input", { cwd: dir, text: "redirect to finish safely", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after redirected\n", "utf8");
     await triggerAgentEnd(hooks, { cwd: dir });
 
@@ -507,6 +518,7 @@ review: { activeReviewers: [
     await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
     await trigger(hooks, "agent_end", ctx);
@@ -678,6 +690,7 @@ review: { activeReviewers: [
     await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
     await trigger(hooks, "agent_end", { cwd: dir, ui: pi.ui });
@@ -710,6 +723,7 @@ review: { activeReviewers: [
 
     await trigger(hooks, "input", { cwd: dir, text: "redirect after cancelling review", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after redirected\n", "utf8");
     await triggerAgentEnd(hooks, { cwd: dir, ui: pi.ui });
 
@@ -813,6 +827,7 @@ review: { activeReviewers: [
     await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
     await trigger(hooks, "agent_end", { cwd: dir, ui: pi.ui });
@@ -858,6 +873,7 @@ review: { activeReviewers: [
     // The aborted invocation leaves the user-canceled tombstone artifact.
     await trigger(hooks, "input", { cwd: dir, text: "redirect after cancelling review", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after redirected\n", "utf8");
     await triggerAgentEnd(hooks, { cwd: dir, ui: pi.ui });
 
@@ -925,6 +941,7 @@ review: { activeReviewers: [
     assert.equal(commands.has("review-cancel"), true);
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     await trigger(hooks, "agent_end", { cwd: dir, ui: pi });
 
@@ -1055,6 +1072,7 @@ review: { activeReviewers: [
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "initial request", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
+    await trigger(first.hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } }, first.ctx);
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
 
@@ -1406,6 +1424,7 @@ review: { activeReviewers: [
     await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "incorrect\n", "utf8");
     await triggerAgentEnd(hooks, {
       cwd: dir,
@@ -1417,6 +1436,7 @@ review: { activeReviewers: [
 
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo correction-tool-evidence" } });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "original\n", "utf8");
     await triggerAgentEnd(hooks, {
       cwd: dir,
@@ -1497,11 +1517,13 @@ review: { activeReviewers: [
     await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "broken\n", "utf8");
     await triggerAgentEnd(hooks, { cwd: dir });
     assert.equal(followUps.length, 1);
 
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "fixed\n", "utf8");
     await triggerAgentEnd(hooks, { cwd: dir });
 
@@ -1831,6 +1853,7 @@ review: { activeReviewers: [
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: outside } });
     await writeFile(outside, "rewritten review document\n", "utf8");
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "Dockerfile") } });
     await writeFile(join(dir, "Dockerfile"), "FROM alpine:3.20\n", "utf8");
     await triggerAgentEnd(hooks, {
       cwd: dir,
@@ -1856,6 +1879,7 @@ review: { activeReviewers: [
 
     await trigger(hooks, "input", { cwd: dir, text: "second Docker task", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "Dockerfile") } });
     await writeFile(join(dir, "Dockerfile"), "FROM alpine:3.21\n", "utf8");
     await triggerAgentEnd(hooks, {
       cwd: dir,
@@ -1876,7 +1900,7 @@ review: { activeReviewers: [
   }
 });
 
-test("repeated no-progress reviewer feedback stops automatic correction loop", async () => {
+test("a correction turn without new tool calls stays unresolved instead of looping", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-no-progress-loop-"));
   const invocationPath = join(tmpdir(), `pi-review-gate-no-progress-${process.pid}-${Date.now()}.txt`);
 
@@ -1938,6 +1962,7 @@ review: { activeReviewers: [
     await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "write hello world and flag review-gate", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     await triggerAgentEnd(hooks, {
       cwd: dir,
@@ -1952,10 +1977,11 @@ review: { activeReviewers: [
       messages: [{ role: "assistant", content: "no implementation change is required" }],
     });
 
-    assert.equal(followUps.length, 2);
-    assert.match(followUps[1]?.message ?? "", /automatic correction is deferred/);
-    assert.match(notices.join("\n"), /repeated changes requested with no new correction evidence/);
-    assert.match(notices.join("\n"), /Stopping automatic correction to avoid a loop/);
+    // #461: a correction turn without a new tool call is not reviewed and
+    // never accepted: the requested changes stay visibly unresolved.
+    assert.equal(followUps.length, 1);
+    assert.equal(await readFile(invocationPath, "utf8"), "1");
+    assert.match(notices.join("\n"), /automatic review skipped because no new qualifying tool call was recorded since the last review; the earlier requested changes remain unresolved/);
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(invocationPath, { force: true });
@@ -2034,6 +2060,7 @@ review: { activeReviewers: [
     await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "implement the change", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "first implementation\n", "utf8");
     await triggerAgentEnd(hooks, { cwd: dir });
 
@@ -2062,6 +2089,7 @@ review: { activeReviewers: [
     assert.equal(delivery.deliveries[0].content, "implementing-model-transmission.md");
     assert.equal(delivery.deliveries[0].message, undefined);
 
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "follow-up implementation\n", "utf8");
     await triggerAgentEnd(hooks, { cwd: dir });
 
@@ -2079,6 +2107,211 @@ review: { activeReviewers: [
     await rm(dir, { recursive: true, force: true });
     await rm(alphaCount, { force: true });
     await rm(betaCount, { force: true });
+  }
+});
+
+test("#461 automatic review requires a new qualifying tool call; filesystem-only turns and read-only observations never start it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-tool-prerequisite-"));
+  const invocationCount = join(tmpdir(), `pi-review-gate-tool-prerequisite-${process.pid}-${Date.now()}.txt`);
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      externalAgents: { counting: { adapter: "generic-cli", command: process.execPath, args: [], review: {
+        args: ["-e", `const fs=require('node:fs');const p=${JSON.stringify(invocationCount)};fs.writeFileSync(p,String((fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0)+1));process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewed',findings:[]})))`],
+        timeoutMs: 15000 } } },
+      review: { activeReviewers: [{ source: "external", id: "counting" }] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const followUps: string[] = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) { hooks.set(name, [...(hooks.get(name) ?? []), handler]); },
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) { commands.set(name, options.handler); },
+      notify() {},
+      sendUserMessage(message: string) { followUps.push(message); },
+    };
+    const reviews = async () => Number(await readFile(invocationCount, "utf8").catch(() => "0"));
+    const turn = async (text: string, act: () => Promise<void>) => {
+      await trigger(hooks, "input", { cwd: dir, text, source: "user" });
+      await trigger(hooks, "before_agent_start", { cwd: dir });
+      await act();
+      await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: text }] });
+    };
+    await activate(pi, testActivation());
+
+    // A qualifying call without reviewable changes is not newly reviewed.
+    await turn("run a command", () => trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo no-change" } }));
+    assert.equal(await reviews(), 0);
+    // Filesystem-only work (another writer) does not start review.
+    await turn("chat only", () => writeFile(join(dir, "index.ts"), "external writer\n", "utf8"));
+    assert.equal(await reviews(), 0);
+    // Known read-only observations alone do not arm it either.
+    await turn("inspect", async () => {
+      await trigger(hooks, "tool_call", { cwd: dir, toolName: "read", input: { path: join(dir, "index.ts") } });
+      await trigger(hooks, "tool_call", { cwd: dir, toolName: "GitRead", input: { args: ["status"] } });
+    });
+    assert.equal(await reviews(), 0);
+    assert.equal(followUps.length, 0);
+    // A qualifying edit follows the existing eligibility; the retained window
+    // also covers the earlier unreviewed delta (a call is not authorship proof).
+    await turn("edit", async () => {
+      await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
+      await writeFile(join(dir, "index.ts"), "implemented\n", "utf8");
+    });
+    assert.equal(await reviews(), 1);
+    assert.equal(followUps.length, 1);
+    const bundleDir = extractBundleDir(followUps[0] ?? "", 1);
+    assert.match(await readFile(join(bundleDir, "reviews", "0001", "reviewer-context.md"), "utf8"), /other writers/);
+    // After a pass, filesystem-only changes do not retrigger automatic review.
+    await turn("chat after pass", () => writeFile(join(dir, "index.ts"), "external after pass\n", "utf8"));
+    assert.equal(await reviews(), 1);
+    assert.equal(followUps.length, 1);
+    // Explicit /review-now is unchanged and reviews the current workspace.
+    await commands.get("review-now")?.("", pi);
+    assert.equal(await reviews(), 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(invocationCount, { force: true });
+  }
+});
+
+/** #461 persisted Primary session: real sidecar persistence plus every command. */
+async function primaryToolPrerequisiteSession(root: string) {
+  const ws = join(root, "ws");
+  const count = join(root, "reviews.txt");
+  await mkdir(ws, { recursive: true });
+  await writeFile(join(ws, "index.ts"), "before\n", "utf8");
+  await writeFile(join(root, "review-gate.json"), JSON.stringify({
+    ...indexTestConfig,
+    externalAgents: agentCatalog(countingPassReviewer("counting", count)),
+    review: { activeReviewers: [{ source: "external", id: "counting" }] },
+  }), "utf8");
+  process.env.PI_REVIEW_GATE_CONFIG = join(root, "review-gate.json");
+  delete process.env.PI_REVIEW_GATE_DISABLED;
+  const sessionFile = join(root, "session.jsonl");
+  const open = async (reason: "startup" | "resume") => {
+    const s = createSessionRuntime("tool-prerequisite", sessionFile, ws);
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    await activate({ ...s.pi, registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) { commands.set(name, options.handler); } }, testActivation());
+    await trigger(s.hooks, "session_start", { type: "session_start", reason }, s.ctx);
+    const call = (toolName: string, input: Record<string, unknown>) => trigger(s.hooks, "tool_call", { cwd: ws, toolName, input }, s.ctx);
+    const turn = async (act: () => Promise<unknown> = async () => {}) => {
+      await trigger(s.hooks, "input", { cwd: ws, text: "turn", source: "user" }, s.ctx);
+      await trigger(s.hooks, "before_agent_start", { cwd: ws }, s.ctx);
+      await act();
+      await triggerAgentEnd(s.hooks, { cwd: ws, messages: [{ role: "assistant", content: "turn done" }] }, s.ctx);
+    };
+    const command = (name: string) => commands.get(name)!("", s.ctx);
+    const close = () => trigger(s.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, s.ctx);
+    return { ...s, call, turn, command, close };
+  };
+  const reviews = async () => Number(await readFile(count, "utf8").catch(() => "0"));
+  const edit = (content: string) => writeFile(join(ws, "index.ts"), content, "utf8");
+  const sidecar = new SessionStateStore({ sessionId: "tool-prerequisite", sessionFile, cwd: ws }).path;
+  return { ws, open, reviews, edit, sidecar };
+}
+
+test("#461 a latched truncation flag never rearms automatic Primary review; a new qualifying call still does", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-gate-tool-prerequisite-truncated-"));
+  try {
+    const f = await primaryToolPrerequisiteSession(root);
+    const s = await f.open("startup");
+    await s.turn(async () => {
+      await s.call("write", { path: join(f.ws, "index.ts") });
+      await f.edit("implemented\n");
+    });
+    assert.equal(await f.reviews(), 1);
+    await s.close();
+    // The restored, passed window with its armed response exchange; bounded
+    // evidence latches the truncation flag (which also requires review).
+    const scope = { agentDir: testAgentDir, sessionId: "tool-prerequisite" };
+    const state = (await new SessionStateStore({ sessionId: "tool-prerequisite", sessionFile: join(root, "session.jsonl"), cwd: f.ws }).restore(f.ws, scope))!.state;
+    state.checkpointScope = scope;
+    const window = state.reviewWindow!;
+    window.evidence.toolObservationsTruncated = true;
+    window.evidence.requiresReview = true;
+    const config = normalizeConfig(JSON.parse(await readFile(join(root, "review-gate.json"), "utf8")));
+    const review = async (act: () => Promise<unknown>) => {
+      beginAgentRun(state);
+      await act();
+      return runReview({ cwd: f.ws, request: buildRequestContext(state), before: window.baseline!, config, evidence: window.evidence,
+        correctionAttemptCount: getCorrectionAttemptCount(window), window, checkpointScope: scope, requireNewToolActivity: true });
+    };
+    const call = (toolName: string, toolInput: Record<string, unknown>) => recordToolCallEvidence({ state: window.evidence, cwd: f.ws, toolName, toolInput,
+      snapshotOptions: { maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes }, exchangeSequence: window.activeExchange!.sequence });
+    for (const act of [async () => {}, () => f.edit("external writer\n"), async () => {
+      await call("GitRead", { args: ["status"] });
+      await f.edit("external writer two\n");
+    }]) {
+      const skipped = await review(act);
+      assert.equal(skipped.noReviewReason, "no_new_tool_activity", "the truncation flag is not a new qualifying call");
+    }
+    assert.equal(await f.reviews(), 1);
+    assert.equal(window.reviewHistory.at(-1)!.verdict, "pass");
+    const reviewed = await review(async () => {
+      await call("write", { path: join(f.ws, "index.ts") });
+      await f.edit("second implementation\n");
+    });
+    await reviewed.releaseReviewedBaseline?.();
+    assert.equal(reviewed.result?.verdict, "pass");
+    assert.equal(await f.reviews(), 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#461 restored legacy unattributed calls arm only their unreviewed paused exchange, never a later review", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-gate-tool-prerequisite-legacy-"));
+  try {
+    const f = await primaryToolPrerequisiteSession(root);
+    let s = await f.open("startup");
+    await s.command("review-pause");
+    await s.turn(async () => {
+      await s.call("write", { path: join(f.ws, "index.ts") });
+      await f.edit("paused implementation\n");
+    });
+    await s.turn(() => s.call("GitRead", { args: ["status"] }));
+    await s.close();
+    // A legacy sidecar: retained calls carry no exchange attribution.
+    const raw = JSON.parse(await readFile(f.sidecar, "utf8"));
+    const window = raw.state.reviewWindow;
+    for (const event of [...window.evidence.events, ...window.exchanges.flatMap((exchange: { evidenceEvents: unknown[] }) => exchange.evidenceEvents)]) {
+      assert.equal(typeof event.exchangeSequence, "number");
+      delete event.exchangeSequence;
+    }
+    assert.equal(window.exchanges.length, 2);
+    const { integritySha256: _integrity, ...unsigned } = raw;
+    raw.integritySha256 = createHash("sha256").update(stableJsonForTest(JSON.parse(JSON.stringify(unsigned)))).digest("hex");
+    await writeFile(f.sidecar, `${JSON.stringify(raw)}\n`, "utf8");
+
+    s = await f.open("resume");
+    await s.command("review-unpause");
+    // The paused exchange still holds its qualifying call: one first review.
+    await s.turn();
+    assert.equal(await f.reviews(), 1);
+    // The retained unattributed call predates that review and never rearms it.
+    await s.turn(() => f.edit("external after pass\n"));
+    await s.turn();
+    await s.turn(() => s.call("GitRead", { args: ["status"] }));
+    assert.equal(await f.reviews(), 1, "an unattributed retained call is not a new qualifying call");
+    assert.equal(s.sent.length, 1);
+    await s.turn(async () => {
+      await s.call("bash", { command: "echo new-qualifying-call" });
+      await f.edit("new implementation\n");
+    });
+    assert.equal(await f.reviews(), 2);
+    await s.turn(() => f.edit("external after second pass\n"));
+    assert.equal(await f.reviews(), 2);
+    // Explicit manual review of the current workspace is unchanged.
+    await s.command("review-now");
+    assert.equal(await f.reviews(), 3);
+    await s.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -2124,6 +2357,7 @@ review: { activeReviewers: [
     await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "implement the change", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "implemented\n", "utf8");
     await triggerAgentEnd(hooks, { cwd: dir });
     const bundleDir = extractBundleDir(followUps[0] ?? "", 1);
@@ -2312,6 +2546,7 @@ review: { activeReviewers: [
     // The retry makes the actual edit. Retries do not re-fire
     // before_agent_start, and no review may run between this agent_end and
     // agent_settled either — the workspace is still mutable until then.
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after retry\n", "utf8");
     await trigger(hooks, "agent_end", {
       cwd: dir,

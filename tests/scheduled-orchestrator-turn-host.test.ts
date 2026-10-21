@@ -46,7 +46,7 @@ import test from "node:test";
 import { activate } from "../src/index";
 import type { ScheduledOrchestratorTurnTracker } from "../src/scheduling/orchestrator-turn";
 import { getSchedulerRuntime, resetSchedulerRuntimeForTests } from "../src/scheduling/runtime";
-import { indexTestConfig, waitForCondition } from "./entrypoint-harness";
+import { indexTestConfig, invokeNativeToolCall, waitForCondition } from "./entrypoint-harness";
 
 type HookHandler = (...args: unknown[]) => unknown;
 
@@ -118,6 +118,8 @@ class HostMachine {
   readonly entries: Array<{ type: string; data: unknown }> = [];
   /** Event names the host refuses to register (simulates a host without them). */
   rejectsEvent: ReadonlySet<string> = new Set();
+  /** Whether the host exposes Pi's native tool registry API. */
+  exposesToolRegistry = true;
   private readonly dir: string;
   private readonly sessionFile: string;
   private readonly followUps: MachineMessage[] = [];
@@ -126,6 +128,11 @@ class HostMachine {
   private emittingAgentSettled = false;
   private readonly deferredSettledActions: Array<() => Promise<void>> = [];
   private readonly modelPhase: (message: MachineMessage) => Promise<void> | void;
+  /** Native tool registry: only the simulated model write tool is seeded, direct and active. */
+  private readonly toolDefinitions = new Map<string, Record<string, unknown>>([
+    ["write", { name: "write", description: "Simulated workspace write.", exposure: "direct" }],
+  ]);
+  private activeTools: string[] = ["write"];
   readonly variant: HostVariant;
 
   constructor(
@@ -147,6 +154,17 @@ class HostMachine {
         if (machine.rejectsEvent.has(name)) throw new Error(`host has no ${name} hook`);
         machine.hooks.set(name, [...(machine.hooks.get(name) ?? []), handler]);
       },
+      // Native registry (Pi's public tool API): definitions are returned as
+      // copies, registration activates, and hidden exposures never activate.
+      ...(machine.exposesToolRegistry ? {
+        registerTool(tool: Record<string, unknown>): void {
+          machine.toolDefinitions.set(String(tool.name), tool);
+          machine.setActive([...machine.activeTools, String(tool.name)]);
+        },
+        getAllTools: () => [...machine.toolDefinitions.values()].map((tool) => ({ ...tool })),
+        getActiveTools: () => [...machine.activeTools],
+        setActiveTools: (names: string[]) => machine.setActive(names),
+      } : {}),
       notify(message: string): void {
         machine.notices.push(message);
       },
@@ -212,6 +230,13 @@ class HostMachine {
         await cycle;
       },
     };
+  }
+
+  private setActive(names: string[]): void {
+    this.activeTools = [...new Set(names)].filter((name) => {
+      const exposure = this.toolDefinitions.get(name)?.exposure;
+      return this.toolDefinitions.has(name) && exposure !== "hidden";
+    });
   }
 
   /** Register a test-side hook BEFORE activate (model-request probe seam). */
@@ -608,11 +633,17 @@ test(`an idle scheduled orchestrator turn arms review before its model request a
   writeFileSync(editedPath, "before\n", "utf8");
   let started: StartedSession | undefined;
   try {
-    started = await startScheduledSession(dir, (message) => {
-      // The "model" performs one workspace edit during the scheduled turn so
-      // its review has changes to settle.
+    started = await startScheduledSession(dir, async (message) => {
+      // The "model" performs one observed write-tool edit during the
+      // scheduled turn so its review has changes to settle.
       if (typeof message.customType === "string" && message.customType.startsWith("pi-review-")) {
-        writeFileSync(editedPath, "after\n", "utf8");
+        await invokeNativeToolCall(started!.machine.hooks, {
+          name: "write",
+          execute: async () => {
+            writeFileSync(editedPath, "after\n", "utf8");
+            return { content: [{ type: "text", text: "written" }] };
+          },
+        }, "scheduled-write", { path: "index.ts", content: "after\n" }, started!.machine.buildCtx());
       }
     }, variant);
     const { machine, tracker } = started;
@@ -708,18 +739,25 @@ test(`a busy queued scheduled turn shares the existing armed window and settles 
     // The human turn's model phase is gated so the scheduled dispatch lands
     // while the unrelated human cycle is streaming.
     const humanPhaseGate = new Promise<void>((resolvePromise) => { releaseGate = resolvePromise; });
+    // Each model phase edits through one observed write-tool call.
+    const observedWrite = async (toolCallId: string, content: string): Promise<void> => {
+      await invokeNativeToolCall(started!.machine.hooks, {
+        name: "write",
+        execute: async () => {
+          writeFileSync(editedPath, content, "utf8");
+          return { content: [{ type: "text", text: "written" }] };
+        },
+      }, toolCallId, { path: "index.ts", content }, started!.machine.buildCtx());
+    };
     started = await startScheduledSession(dir, (message) => {
       if (message.role === "user") {
         // The human turn blocks mid-cycle until the test releases it.
-        const gated = humanPhaseGate.then(() => {
-          writeFileSync(editedPath, "human\n", "utf8");
-        });
+        const gated = humanPhaseGate.then(() => observedWrite("human-write", "human\n"));
         void gated;
         return gated;
       }
       // The scheduled queued segment's model phase edits again.
-      writeFileSync(editedPath, "human+scheduled\n", "utf8");
-      return;
+      return observedWrite("scheduled-write", "human+scheduled\n");
     }, variant);
     const { machine, tracker } = started;
 
@@ -876,6 +914,7 @@ test("a host without the message_start hook has the scheduled orchestrator dispa
     schedulerRuntime.setEnabled(true);
     const machine = new HostMachine(dir, join(sessionsDir, "turn-lifecycle.jsonl"), () => undefined);
     machine.rejectsEvent = new Set(["message_start"]);
+    machine.exposesToolRegistry = false; // keep this negative control's original registry-less host shape
     const modelRequests: unknown[] = [];
     machine.probe("model_request_probe", (event) => { modelRequests.push(event); });
     const consoleWarnings: string[] = [];

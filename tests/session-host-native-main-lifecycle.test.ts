@@ -486,7 +486,7 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
     if (filename === null || filename.toString() === "provider-journal.jsonl") providerSignal.notify();
   });
   state.closeProviderWatch = () => providerWatch.close();
-  await providerSignal.waitFor(
+  await providerSignal.waitForRecheck(
     () => providerJournalRecords(providerJournalFile).filter((record) => record.event === "auto_model_selected").length >= 2,
     EVENT_TIMEOUT_MS,
     "both real native children auto-selected the scripted faux model",
@@ -530,14 +530,14 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
   // still be running while q1 stays pending. Require its real settlement
   // boundary and a fresh rendered idle row — badge and panel still present —
   // before answering, so the UI answer starts a NEW ordinary native agent
-  // turn instead of steering a busy run.
-  const beforeFirstSettle = driver.frameRevision;
+  // turn instead of steering a busy run. Freshness is anchored at the
+  // pre-prompt revision: the waiting frame may already be current here.
   await driver.waitForRecords((records) => records.some((record) => record.type === "agent_settled"
     && record.pid === sessionA.record.pid),
     "first public agent_settled boundary in A closes the pending-question turn");
   await driver.waitFrame((text) => rowBadgeState(text, labelA) === "waiting"
     && rowHasInputBadge(text, labelA) && frameContains(text, panelLine),
-    "A's card status row is fresh agent-waiting with q1 still pending before the answer", beforeFirstSettle);
+    "A's card status row is fresh agent-waiting with q1 still pending before the answer", beforePrompt);
 
   // Ownership isolation while A holds the pending question: switch to B
   // through the real roster; B keeps its own draft and neither surface nor
@@ -579,32 +579,36 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
     "real answer mode shows the scripted choices plus free text and decline", beforeAnswer);
   assertPopupSpansConversationPane(driver.currentText(), "question answer view");
 
-  // Submit the approved canned choice.
+  // Submit the approved canned choice. The fresh running observation for the
+  // answer turn is armed before the submit so a short real turn cannot finish
+  // before the frame waiter subscribes.
   const beforeSubmit = driver.frameRevision;
-  driver.pty.write(KEYS.enter);
-
+  const answerRunning = driver.waitFrame((text) => rowBadgeState(text, labelA) === "running",
+    "A's card status row shows the fresh agent-running state for the answer turn", beforeSubmit)
+    .then(() => driver.frameRevision);
   // Second ordinary native agent turn from the UI-delivered answer.
-  await driver.waitForRecords((records) => records.filter((record) => record.type === "agent_start"
-    && record.pid === sessionA.record.pid).length >= 2,
-    "second native agent run start in A from the UI-delivered answer");
-
-  // Controlled fixture evidence that the answer turn is genuinely in flight:
-  // the third scripted faux request arrived and its barrier is holding, so the
-  // running observation below cannot be a race against an already-settled run.
   const answerRequestIndex = 2;
-  await providerSignal.waitFor(() => {
-    const journal = providerJournalRecords(providerJournalFile);
-    return journal.some((record) => record.event === "model_request"
-        && record.requestIndex === answerRequestIndex)
-      && journal.some((record) => record.event === "turn_hold_started"
-        && record.requestIndex === answerRequestIndex);
-  }, EVENT_TIMEOUT_MS, "the UI-delivered answer reaches the third scripted faux request and its controlled hold");
-
-  // Fresh running observation for the answer turn, witnessed while the barrier
-  // holds: the reporter's published agent state must reach the sidebar card.
-  await driver.waitFrame((text) => rowBadgeState(text, labelA) === "running",
-    "A's card status row shows the fresh agent-running state for the answer turn", beforeSubmit);
-  const afterRunning = driver.frameRevision;
+  const answerStarted = (async () => {
+    driver.pty.write(KEYS.enter);
+    await driver.waitForRecords((records) => records.filter((record) => record.type === "agent_start"
+      && record.pid === sessionA.record.pid).length >= 2,
+      "second native agent run start in A from the UI-delivered answer");
+    // The durable provider journal proves that this is the controlled answer
+    // request. Its unchanged predicate/deadline uses the shared durable recheck;
+    // the actual running frame above remains notification-driven and was armed
+    // before submission, so a short turn cannot escape the observation window.
+    await providerSignal.waitForRecheck(() => {
+      const journal = providerJournalRecords(providerJournalFile);
+      return journal.some((record) => record.event === "model_request"
+          && record.requestIndex === answerRequestIndex)
+        && journal.some((record) => record.event === "turn_hold_started"
+          && record.requestIndex === answerRequestIndex);
+    }, EVENT_TIMEOUT_MS, "the UI-delivered answer reaches the third scripted faux request and its controlled hold");
+  })();
+  const [startedOutcome, runningOutcome] = await Promise.allSettled([answerStarted, answerRunning]);
+  if (startedOutcome.status === "rejected") throw startedOutcome.reason;
+  if (runningOutcome.status === "rejected") throw runningOutcome.reason;
+  const afterRunning = runningOutcome.value;
 
   // Native completion frame/transcript: delivered answer and its echo.
   await driver.waitFrame((frame) => frameContains(frame, `Answer to pending question "${QUESTION_TEXT}": ${CHOICE_A}`)

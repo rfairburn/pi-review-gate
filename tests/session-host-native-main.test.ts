@@ -7,6 +7,7 @@ import { SidebarController } from "../src/session-host/sidebar";
 import { stripGeneratedSgr } from "../src/session-host/terminal-surface";
 
 import {
+  ChangeSignal,
   CleanupOutcome,
   ChangeSignal,
   KEYS,
@@ -138,6 +139,19 @@ async function settingsSmoke(driver: MainPtyDriver, session: OwnedSession, works
   assert.equal(entry!.instructions, instructions);
   assert.equal(entry!.workspace, workspaceEditValue, "the actual Ctrl+G editor's changed value was persisted");
 }
+
+test("ChangeSignal.waitFor rechecks its exact predicate once at the unchanged deadline", async () => {
+  let ready = false;
+  let calls = 0;
+  const missed = new ChangeSignal().waitFor(() => (calls++, ready), 20, "missed notification");
+  queueMicrotask(() => { ready = true; }); // condition becomes true without notify()
+  await missed;
+  assert.equal(calls, 2, "one initial check plus one deadline recheck; no polling");
+  await assert.rejects(new ChangeSignal().waitFor(() => false, 20, "still false"), /^Error: still false: deadline exceeded$/);
+  let thrown = 0;
+  const throwing = (): boolean => { if (thrown++ > 0) throw new Error("predicate"); return false; };
+  await assert.rejects(new ChangeSignal().waitFor(throwing, 20, "throwing"), /^Error: throwing: bounded event predicate failed$/);
+});
 
 test("the complete restored-native-editor witness rejects stale narrow frames, partial repaints, and altered drafts", () => {
   const controller = new SidebarController({ toggleKey: "f8" });
@@ -462,9 +476,10 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     }
   });
 
-  const workspaceA = makeWorkspace(scratch, "workspace-a");
-  const workspaceB = makeWorkspace(scratch, "workspace-b");
+  const workspaceA = makeWorkspace(scratch, "workspace-a"); // ordinary-workspace control
   const nativeAgentDir = makeNativeAgentRoot(scratch);
+  // #461: B's New-form workspace is the admitted nondefault shared agent root itself (non-Git).
+  const workspaceB = nativeAgentDir;
   const editorMarker = `editor-${Math.random().toString(16).slice(2, 8)}`;
   const workspaceEditTarget = join(workspaceA, editorMarker);
   mkdirSync(workspaceEditTarget, { mode: 0o700 });
@@ -491,6 +506,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     nativeAgentDir,
   );
   startEnv.EDITOR = join(scratch, "unavailable-editor-must-not-be-selected");
+  // A non-canonical spelling of the nondefault root; children must receive the canonical root.
+  startEnv.PI_CODING_AGENT_DIR = `${scratch}/home/../native-agent/`;
   // Native Pi creates a saved conversation only after an actual user message.
   // Two explicit UI-delivered seed turns exercise ordinary persistence; this
   // existing public faux-provider seam makes no external AI/API requests.
@@ -566,6 +583,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.ok(typeof sessionB.record.sessionId === "string" && sessionB.record.sessionId.length > 0);
   assert.equal(sessionA.record.cwd, workspaceA, "A runs in the explicitly selected canonical workspace");
   assert.equal(sessionB.record.cwd, workspaceB, "B runs in the explicitly selected canonical workspace");
+  assert.equal(sessionB.record.cwd, sessionB.record.agentDir, "B's actual cwd is the admitted shared native agent root");
+  assert.notEqual(sessionA.record.cwd, sessionA.record.agentDir, "A remains an ordinary-workspace control");
   assert.notEqual(sessionA.record.sessionFile, sessionB.record.sessionFile,
     "the two native conversations retain independent files under shared discovery");
   assert.equal(sessionA.record.sessionFile!.startsWith(nativeAgentDir + sep), true,

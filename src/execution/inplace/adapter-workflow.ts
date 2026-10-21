@@ -108,6 +108,8 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
   let session = input.priorSession;
   let startingTurn = input.startingTurn;
   let failoverExhausted = false;
+  let structuredToolEvents = true;
+  let qualifyingObservations = 0;
   let reason: ExecutorAssignmentRecord["reason"] = input.mode === "continuation" ? "continuation" : "initial";
   for (;;) {
     const assignmentRecord = beginInPlaceAssignment(operation, assignment, reason, config);
@@ -128,6 +130,7 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
       adapter = (input.adapterFactory ?? createExecutorAdapter)(config, assignment.entry.selection);
       operation.adapter = adapter.kind;
       operation.model = adapter.model;
+      if (adapter.toolEventObservability?.mode !== "structured") structuredToolEvents = false;
       recordToolEventObservability(input.evidence, adapter.kind, adapter.toolEventObservability ?? {
         mode: "unavailable",
         description: "This executor adapter does not expose a structured tool-event stream; tool-level write paths are not observed.",
@@ -210,6 +213,7 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
         assignment,
         onUpdate: input.onUpdate,
         onLiveControl: input.onLiveControl,
+        onQualifyingObservation: () => { qualifyingObservations += 1; },
       });
     } finally {
       assignmentRecord.endedAt = new Date().toISOString();
@@ -288,6 +292,8 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
       lastExecutorTurn: run.lastTurnNumber,
       effectiveAssignment: assignment,
       failoverExhausted,
+      structuredToolEvents,
+      qualifyingObservations,
     };
     if (run.status === "cancelled" || input.signal?.aborted) {
       input.onUpdate?.({

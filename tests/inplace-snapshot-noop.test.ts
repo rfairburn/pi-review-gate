@@ -151,3 +151,30 @@ test("new in-root SCRIPT plus unknown overflow advances both review revisions an
   assert.equal(saved.requiresReview, true);
   assert.equal(saved.toolObservationsTruncated, true);
 });
+
+test("snapshot pass followed by REPORT-only churn settles the reviewed pass without re-review; a new qualifying edit still re-reviews", async (t) => {
+  const f = await fixture(t);
+  f.setAction(async (request, turn) => {
+    if (turn === 1) await f.observedWrite(request, "reviewed SCRIPT\n");
+    else await writeFile(join(f.workspaceRoot, "REPORT"), `independent REPORT writer ${turn}\n`);
+  });
+  const result = await runInplaceLifecycle(f.input);
+  assert.equal(result.status, "reviewed", result.error);
+  assert.equal(result.reviewCycles.length, 1);
+  assert.equal(f.turns, 2, "one pass-response turn, no confirmation loop");
+  assert.equal((await f.prompts()).length, 1);
+  assert.ok(result.changedSinceLaunch.some((change) => change.path === "REPORT"), "post-pass churn is still reported");
+  assert.match(result.summary, /captured but NOT reviewed: added REPORT/);
+  assert.match(result.summary, /not certified by that pass/);
+
+  const g = await fixture(t);
+  g.setAction(async (request, turn) => {
+    if (turn === 1) await g.observedWrite(request, "reviewed SCRIPT\n");
+    if (turn === 2) await g.observedWrite(request, "post-pass SCRIPT edit\n");
+  });
+  const rereviewed = await runInplaceLifecycle(g.input);
+  assert.equal(rereviewed.status, "reviewed", rereviewed.error);
+  assert.equal(rereviewed.reviewCycles.length, 2);
+  assert.equal(rereviewed.automaticReviewNotArmed, undefined);
+  assert.ok((await g.prompts())[1]!.includes("post-pass SCRIPT edit"));
+});

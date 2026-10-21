@@ -79,8 +79,8 @@ review or a substitute for either baseline.
 
 ### Non-Git checkpoint storage
 
-Non-Git checkpoint records are never written inside a workspace. Every record lives in
-the live Pi session's namespace under Pi's agent-data directory:
+Non-Git checkpoint records always use the live Pi session's namespace under Pi's
+agent-data directory, even when that directory is inside the selected workspace:
 `<agent dir>/sessions/pi-review-gate/<session id>/checkpoints/` (the agent directory
 is `~/.pi/agent` by default, following Pi's `PI_CODING_AGENT_DIR` semantics on every
 platform). This applies equally to persisted sessions and to in-memory sessions such
@@ -117,28 +117,26 @@ Records are located from the agent directory resolved when the session starts; i
 directory changes between restarts, the earlier record is reported as damaged and
 review starts fresh from the current workspace.
 
-#### Known limitation: a workspace that overlaps the checkpoint store
+#### A workspace that contains the checkpoint store
 
 The checkpoint store has one location for every non-Git session, with no alternate or
-configurable base. This release accepts two limitations when a workspace overlaps it:
+configurable base. A non-Git review root may contain it — for example the Pi agent
+directory itself, its `.pi` parent, or another ancestor such as the home directory.
+Raw capture of such a root then skips only this extension's own record files: a
+private regular `record.json` at the exact store layout above, below real private
+extension-owned directories. Everything else remains eligible for ordinary capture
+and review, including the roster, conversations, sidecars, config, skills, and any
+unknown file next to a record, and release leaves those neighbors in place. This is a narrow raw-capture
+exception, not a runtime-file classifier, and Git checkpoints are unchanged. A root
+inside the store itself still fails closed, and ownership, symlink, path, and
+capture-size limits apply as described above.
 
-- **Non-Git review root.** If the store overlaps the non-Git workspace being captured
-  for review (for example `PI_CODING_AGENT_DIR` inside the workspace, or a non-Git
-  session started in an ancestor of the agent directory such as the home directory),
-  non-Git checkpoint capture fails closed with an explicit unsupported-configuration
-  error instead of writing records into the workspace or choosing another location.
-  Reviewing such a root is unsupported.
-- **Delegated target.** A delegated execution target whose tree contains the store is
-  not rejected. Its automatic task capture and downstream snapshots may include
-  checkpoint record files, and those bytes count against capture budgets such as
-  `maxSnapshotBytes`.
-
-Keeping the Pi agent directory outside review and delegated workspaces avoids both.
-Follow-up [#318](https://github.com/rfairburn/pi-review-gate/issues/318) will exclude
-exactly this extension's checkpoint record files from automatic and downstream
-collection. It will not choose another storage destination, and tool-based evidence
-of modifications to those files will still be retained. Record file permissions and
-capture-size limits stay as described above.
+A delegated execution target whose tree contains the store is not rejected, and this
+exception does not apply to it: its task capture and downstream snapshots may include
+checkpoint record files, which count against capture budgets such as
+`maxSnapshotBytes`. [#318](https://github.com/rfairburn/pi-review-gate/issues/318)
+tracks that remaining delegated-capture limitation; keeping the Pi agent directory
+outside delegated targets avoids it.
 
 On Windows, synthetic checkpoint objects are flushed by Git at write time; this
 requires Git 2.36.0 or newer, and older versions fail closed. Git and non-Git
@@ -160,7 +158,8 @@ tool-only review never claims full snapshot coverage. A response that does not i
 new changes under the selected evidence method closes the window at settlement while
 retaining it for an immediate `/ask-reviewer` follow-up. If the implementing model makes
 another reviewable change after seeing the passing observations, that response becomes
-a new exchange in the same window and triggers another review. Later ordinary work
+a new exchange in the same window and triggers another review, subject to the
+[automatic review trigger](#automatic-review-trigger). Later ordinary work
 starts a fresh window under the selected method and does not re-review changes that
 already passed.
 
@@ -170,6 +169,26 @@ a pass on the new window. If a new checkpoint is damaged or cannot be verified, 
 evidence is preserved and the user is notified. Review starts fresh from the current
 workspace as baseline rather than claiming that edits under the damaged checkpoint
 passed. A fresh baseline cannot retroactively certify those earlier edits.
+
+### Automatic review trigger
+
+Automatic Primary review, and automatic review of InPlace workers whose adapter
+reports structured tool events, runs only when the existing eligibility rules hold
+**and** the agent made a new qualifying tool call since the preceding review. Calls the
+existing read-only classification already knows (`read`, `grep`, `find`, `ls`,
+`GitRead`, web fetch/search) do not qualify. Filesystem changes alone — runtime,
+background, generator, or other external writers, in any workspace whether or not it
+is an agent directory — neither start nor retrigger automatic review.
+The call is necessary, not sufficient: a turn without reviewable changes still runs
+no reviewer, and this rule never forces an empty-diff review. When it skips a review,
+captured changes stay unreviewed evidence and earlier requested changes stay
+unresolved (Primary points to `/review-now`); nothing is silently accepted. Missing or
+truncated call attribution is not itself a new qualifying call and cannot rearm review.
+An unknown retained review boundary cannot certify completion. There is no new setting;
+`/review-now` and `/ask-reviewer` are unchanged. Snapshots remain before/after delta
+evidence, not complete history or authorship: a tool call does not prove that the agent
+caused every captured change. InPlace specifics, including the run-as-binary final
+pass response, are in [Delegated execution](delegated-execution.md#in-place-subtask-kind).
 
 ## Review evidence methods
 

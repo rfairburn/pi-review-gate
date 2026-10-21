@@ -25,6 +25,7 @@ import {
   closeReviewWindow,
   freezeReviewWindowConfig,
   getCorrectionAttemptCount,
+  hasUnresolvedReview,
   recordReviewerFeedbackAndArmExchange,
   rememberUserRequest,
   setReviewWindowCheckpointBaseline,
@@ -703,6 +704,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
             : sendNoticeWhileSessionActive(noticeTarget, message, () => deps.isSessionActive()),
           onUpdate: (message) => statusTracker.update(message),
           onInvocationPrepared: () => deps.persist(),
+          requireNewToolActivity: true,
         });
       } catch (error) {
         if (!deps.isSessionActive()) {
@@ -733,6 +735,19 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
 
       if (!output.changed) {
         if (output.noReviewReason === "unchanged_deferred_response") {
+          await releaseQueuedUserInputs(deps.pi, deps.state, () => deps.isSessionActive(), () => deps.persist());
+          return;
+        }
+        if (output.noReviewReason === "no_new_tool_activity") {
+          // #461: keep the window, its evidence and history open for a later
+          // qualifying turn or /review-now; never settle or accept feedback here.
+          if (hasUnresolvedReview(window)) {
+            await sendNoticeWhileSessionActive(
+              noticeTarget,
+              "review gate: automatic review skipped because no new qualifying tool call was recorded since the last review; the earlier requested changes remain unresolved. Use /review-now to review the current workspace.",
+              () => deps.isSessionActive(),
+            );
+          }
           await releaseQueuedUserInputs(deps.pi, deps.state, () => deps.isSessionActive(), () => deps.persist());
           return;
         }

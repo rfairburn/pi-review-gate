@@ -7,7 +7,7 @@ import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, s
 import { BINARY_SAMPLE_BYTES, looksBinary, compareFileSnapshots, compareSnapshots, createPathSnapshot, createWorkspaceSnapshot, type ChangedFile, type FileSnapshot, type SnapshotOmission, type WorkspaceSnapshot } from "./capture";
 import { captureReviewCheckpoint, compareReviewCheckpoints, loadReviewCheckpoint, releaseReviewCheckpoint, reviewCheckpointWorkspaceRoot, type ReviewCheckpointDescriptor, type ReviewCheckpointChange, type ReviewCheckpointScope, type ReviewCheckpointState } from "./review-checkpoint";
 import { buildUnifiedPatch, type PatchBuildResult } from "./diff";
-import { buildEvidenceBundle, collectEvidenceChanges, type EvidenceState } from "./evidence";
+import { buildEvidenceBundle, collectEvidenceChanges, type EvidenceEvent, type EvidenceState } from "./evidence";
 import {
   armGitCheckpoint,
   compareGitCheckpoints,
@@ -57,6 +57,10 @@ export interface ReviewRunInput {
   window?: ReviewWindow;
   /** Trusted live-session scope that locates raw (non-Git) checkpoint records. */
   checkpointScope?: ReviewCheckpointScope;
+  /** Automatic Primary settlement only (#461): additionally require a new
+   * qualifying tool call since the window's last recorded review. Narrows the
+   * existing eligibility; explicit reviews and other callers never set it. */
+  requireNewToolActivity?: boolean;
 }
 
 /** Exact Git-derived change data for a normalized candidate commit. */
@@ -76,7 +80,7 @@ export interface ReviewRunOutput {
   evidenceCoverageNotice?: string;
   changed: boolean;
   changes: ChangedFile[];
-  noReviewReason?: "no_initial_changes" | "unchanged_review_response" | "unchanged_deferred_response";
+  noReviewReason?: "no_initial_changes" | "unchanged_review_response" | "unchanged_deferred_response" | "no_new_tool_activity";
   result?: ReviewResult;
   reviewerResults?: ReviewResult[];
   reviewerDisplayLabels?: Record<string, string>;
@@ -256,7 +260,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     ? (completedExchange?.evidenceEvents ?? input.evidence?.events ?? []).some(isReviewableToolObservation)
     : (completedExchange?.evidenceEvents.length ?? input.evidence?.events.length ?? 0) > 0);
   const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0 || hasExactChanges || retainedObservationNeedsReview || observedToolWork;
-  if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges) {
+  const syncUnreviewedExchangeArtifacts = async (): Promise<void> => {
     if (input.window?.bundleDir) {
       await syncReviewWindowArtifacts({
         dir: input.window.bundleDir,
@@ -266,6 +270,9 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
         exchanges: input.window.exchanges,
       });
     }
+  };
+  if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges) {
+    await syncUnreviewedExchangeArtifacts();
     return {
       changed: false,
       changes,
@@ -285,6 +292,15 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
   if (settled.primaryToolChangeGate && changes.length === 0 && sideEffectChanges.length === 0 && !isCorrectionValidation
     && input.evidence?.requiresReview !== true && !(input.evidence?.events ?? []).some(isReviewableToolObservation)) {
     return { changed: false, changes, noReviewReason: "no_initial_changes" };
+  }
+  // #461: automatic Primary review also needs a new qualifying tool call since
+  // the last recorded review. This only narrows the checks above: workspace
+  // changes alone (runtime, external or background writers) never start or
+  // retrigger it, and a call is a prerequisite, not proof of authorship. The
+  // window, its evidence and any unresolved feedback stay open, unreviewed.
+  if (input.requireNewToolActivity === true && !hasNewQualifyingToolCall(input.window)) {
+    await syncUnreviewedExchangeArtifacts();
+    return { changed: false, changes, noReviewReason: "no_new_tool_activity" };
   }
   if (settled.reviewMethodNotice) await input.notify?.(settled.reviewMethodNotice);
 
@@ -421,6 +437,27 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     releaseReviewedBaseline: settled.releaseOrphan,
     bundleRetained: invocation.bundleRetained,
   };
+}
+
+/**
+ * #461: whether a known qualifying tool call (the existing read-only
+ * classifier; results are not calls) was recorded since the window's last
+ * recorded review. A call counts when its own exchange attribution is not an
+ * earlier exchange (a later exchange-slice reset cannot hide it), or when a
+ * completed exchange since that review retained it. A truncation flag or an
+ * unattributed retained event establishes no new call: the window stays open.
+ */
+function hasNewQualifyingToolCall(window: ReviewWindow | undefined): boolean {
+  if (!window) return true;
+  const lastReview = window.reviewHistory.at(-1)?.sequence;
+  const isCall = (event: EvidenceEvent): boolean => event.phase === "tool_call" && isReviewableToolObservation(event);
+  const earlier = new Set<number>();
+  for (const exchange of window.exchanges) {
+    if (exchange.causedByReviewSequence !== lastReview) earlier.add(exchange.sequence);
+    else if (exchange.evidenceEvents.some(isCall)) return true;
+  }
+  return window.evidence.events.some((event) => isCall(event)
+    && event.exchangeSequence !== undefined && !earlier.has(event.exchangeSequence));
 }
 
 export async function collectPausedReviewExchange(input: PausedExchangeInput): Promise<void> {

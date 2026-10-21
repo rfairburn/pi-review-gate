@@ -15,6 +15,19 @@
  * `portable diagnostics:` cases at the end check that formatting layer on every
  * host — they prove nothing about NTFS ACLs either.
  *
+ * The head 6959841 native run then showed the fixed system tool reporting
+ * success for an `ACCESS_SYSTEM_SECURITY` grant while the helper *and* an
+ * independent raw read saw that bit absent from a complete six-ACE descriptor.
+ * A command's exit status is therefore not proof, and the security fixture no
+ * longer treats it as such: it requires the exact numeric bit on Authenticated
+ * Users in the complete raw enumeration, aggregated per principal rather than
+ * read from the bounded display slice. Unavailable, incomplete, or opaque
+ * evidence fails that fixture; complete evidence of absence is reported as
+ * explicitly unclaimed native coverage. The mandatory `WRITE_DAC` and
+ * `WRITE_OWNER` fixtures install their bit through the fixed tool and prove it
+ * the same way before requiring the unchanged-parent refusal — no skip, no
+ * fallback, no command-success shortcut.
+ *
  * Parent integration command (add to the existing Windows CI job):
  *   node --test --test-concurrency=1 dist-test/tests/session-host-peer-state-permissions-windows-native.test.js
  */
@@ -153,8 +166,12 @@ function describeAcl(target: string): string {
  *   error and never changes a test result.
  * ------------------------------------------------------------------------- */
 
-/** `ACCESS_SYSTEM_SECURITY`: the right the negative parent case installs. */
+/** `ACCESS_SYSTEM_SECURITY`: the right the bounded security-right fixture installs. */
 const ACCESS_SYSTEM_SECURITY = 0x0100_0000;
+/** `WRITE_DAC`: rewrite the DACL. Installed by the mandatory untrusted-right fixtures. */
+const WRITE_DAC = 0x0004_0000;
+/** `WRITE_OWNER`: take ownership. Installed by the mandatory untrusted-right fixtures. */
+const WRITE_OWNER = 0x0008_0000;
 const DIAGNOSTIC_PREFIX = "prg-native-acl-diagnostic";
 /** The one line printed whenever a diagnostic could not be produced safely. */
 const DIAGNOSTIC_UNAVAILABLE = `${DIAGNOSTIC_PREFIX} unavailable`;
@@ -222,6 +239,21 @@ interface RawAceSummary {
 	securityRight: boolean;
 }
 
+/**
+ * One principal's rights aggregated over the *complete* raw enumeration. It is
+ * computed before the bounded display slice is taken, so a right carried by an
+ * ACE that does not fit in a diagnostic line still takes part in the proof.
+ * Every mask is an OR of readable ACE masks for that principal class; an ACE
+ * whose numeric mask could not be read (an object or otherwise non-common ACE)
+ * is counted instead, because it could hide the very bit being looked for.
+ */
+interface RawRightAggregate {
+	allowMask: number;
+	denyMask: number;
+	aceCount: number;
+	unreadableAces: number;
+}
+
 interface RawAclSummary {
 	available: boolean;
 	reason?: string;
@@ -235,6 +267,10 @@ interface RawAclSummary {
 	opaqueAcePresent?: boolean;
 	aces?: RawAceSummary[];
 	acesTruncated?: boolean;
+	/** Per-principal aggregates over every enumerated ACE, never the display slice. */
+	principalRights?: Partial<Record<PrincipalClass, RawRightAggregate>>;
+	/** ACEs in the enumeration whose principal SID could not be read at all. */
+	unclassifiedAces?: number;
 }
 
 interface HelperCallRecord {
@@ -475,12 +511,33 @@ function summarizeRawEvidence(parsed: unknown, aceLimit = DIAGNOSTIC_MAX_ACE_REC
 	if (!Array.isArray(entries) || entries.length !== count) return unavailableRaw("unavailable");
 	const currentSid = (record.c as string).toUpperCase();
 	const aces: RawAceSummary[] = [];
+	const principalRights: Partial<Record<PrincipalClass, RawRightAggregate>> = {};
 	let securityRightPresent = false;
+	let unclassifiedAces = 0;
 	for (const entry of entries) {
 		const ace = parseRawAce(entry, currentSid);
 		if (ace === null) return unavailableRaw("unavailable");
 		if (ace.securityRight) securityRightPresent = true;
 		aces.push(ace);
+		// The aggregate is taken here, over every enumerated ACE, so the bounded
+		// display slice below can never decide whether a target right is present.
+		const fields = entry as Record<string, unknown>;
+		const mask = fields.m;
+		const sid = fields.s;
+		const aggregate = principalRights[ace.principal]
+			?? { allowMask: 0, denyMask: 0, aceCount: 0, unreadableAces: 0 };
+		aggregate.aceCount += 1;
+		if (typeof sid !== "string" || sid.length === 0) unclassifiedAces += 1;
+		if (typeof mask !== "number") {
+			aggregate.unreadableAces += 1;
+		} else if (ace.aceType === 0) {
+			// `>>> 0` keeps the aggregate an unsigned 32-bit mask; `|` alone would
+			// hand back a signed Int32 for any mask with the top bit set.
+			aggregate.allowMask = (aggregate.allowMask | mask) >>> 0;
+		} else if (ace.aceType === 1) {
+			aggregate.denyMask = (aggregate.denyMask | mask) >>> 0;
+		}
+		principalRights[ace.principal] = aggregate;
 	}
 	return {
 		available: true,
@@ -492,10 +549,59 @@ function summarizeRawEvidence(parsed: unknown, aceLimit = DIAGNOSTIC_MAX_ACE_REC
 		controlFlags: control,
 		aceCount: count,
 		securityRightPresent,
-		opaqueAcePresent: aces.some((ace) => ace.mask === "none" || ace.mask === "invalid"),
+		opaqueAcePresent: aces.some((ace) => ace.mask === "none" || ace.mask === "invalid"
+			|| (ace.aceType !== 0 && ace.aceType !== 1)),
+		principalRights,
+		unclassifiedAces,
 		aces: aces.slice(0, Math.max(0, aceLimit)),
 		acesTruncated: aces.length > aceLimit,
 	};
+}
+
+/** A bounded rendering of one principal's aggregate; numbers only, never a SID. */
+function renderRightAggregate(
+	raw: RawAclSummary,
+	principal: PrincipalClass,
+): { allow: string; deny: string; aces: number; unreadable: number } {
+	const aggregate = raw.principalRights?.[principal];
+	return {
+		allow: maskToHex(aggregate?.allowMask ?? 0),
+		deny: maskToHex(aggregate?.denyMask ?? 0),
+		aces: aggregate?.aceCount ?? 0,
+		unreadable: aggregate?.unreadableAces ?? 0,
+	};
+}
+
+type RawRightVerdict = "present" | "absent" | "unknown";
+
+/**
+ * Prove from an independent raw descriptor whether one principal's ACEs really
+ * carry an exact numeric access bit. Only the complete enumeration counts: the
+ * displayed ACE list is bounded for the diagnostic line, so an ACE beyond that
+ * slice is still part of the aggregate. This is strict by design: an opaque
+ * (unreadable-mask) or unclassified (unreadable-SID) ACE anywhere in the
+ * descriptor could be the very reason production refuses, so it makes the
+ * verdict `unknown` rather than letting a readable grant stand in for the whole
+ * proof. `unknown` is never treated as absence.
+ */
+function proveRawPrincipalRight(raw: RawAclSummary, principal: PrincipalClass, right: number): RawRightVerdict {
+	if (!isBoundedInteger(right, 1, 0xffff_ffff)) return "unknown";
+	if (raw.available !== true) return "unknown";
+	// A summary without the full-enumeration aggregate can prove nothing at all.
+	if (raw.principalRights === undefined) return "unknown";
+	// Whole-descriptor precondition: every ACE must have a readable principal and
+	// a readable numeric mask before presence or absence can be attributed to
+	// this right at all.
+	if (raw.opaqueAcePresent !== false) return "unknown";
+	if ((raw.unclassifiedAces ?? 0) > 0) return "unknown";
+	const aggregate = raw.principalRights[principal];
+	if (aggregate !== undefined && ((aggregate.allowMask & right) >>> 0) === right) return "present";
+	if (aggregate === undefined || aggregate.aceCount === 0) return "absent";
+	// A bit carried only by a deny ACE is present but is not an installed grant.
+	if (((aggregate.denyMask & right) >>> 0) === right) return "unknown";
+	// Defense in depth: an unreadable mask for this principal could hide the bit.
+	if (aggregate.unreadableAces > 0) return "unknown";
+	return "absent";
 }
 
 function reduceRawSummary(summary: RawAclSummary, limit: number): RawAclSummary {
@@ -752,25 +858,93 @@ function reportProtectFailure(
 }
 
 /**
+ * The bounded rendering of one target-right proof. It is shared by the detail
+ * payload and the compact fallback, so no fallback can drop the proof itself.
+ */
+function renderTargetProof(
+	proof: { principal: PrincipalClass; right: number; verdict: RawRightVerdict },
+	raw: RawAclSummary,
+): {
+	principal: PrincipalClass;
+	right: string;
+	verdict: RawRightVerdict;
+	aggregate: { allow: string; deny: string; aces: number; unreadable: number };
+	unclassified: number;
+} {
+	return {
+		principal: proof.principal,
+		right: maskToHex(proof.right),
+		verdict: proof.verdict,
+		aggregate: renderRightAggregate(raw, proof.principal),
+		unclassified: raw.unclassifiedAces ?? 0,
+	};
+}
+
+/**
+ * The last payload that still says something useful: availability, the
+ * security-bit counts, and the target proof, with every ACE list and every
+ * per-principal aggregate dropped. A wide descriptor can push both the detail
+ * and the two-ACE rendering past the line ceiling, so this is what keeps a
+ * multi-principal failure from degrading to a bare verdict marker.
+ */
+function compactSecurityRightEvidence(
+	verdict: SecurityRightVerdict,
+	helper: HelperAclSummary,
+	raw: RawAclSummary,
+	proof?: { principal: PrincipalClass; right: number; verdict: RawRightVerdict },
+): object {
+	return {
+		verdict,
+		target: proof === undefined ? undefined : renderTargetProof(proof, raw),
+		helper: {
+			available: helper.available === true,
+			securityRightAces: helper.securityRightAces ?? 0,
+			enumerationComplete: helper.enumerationComplete === true,
+			daclProtected: helper.daclProtected === true,
+			aceCount: helper.aceCount ?? 0,
+		},
+		raw: {
+			available: raw.available === true,
+			securityRightPresent: raw.securityRightPresent === true,
+			opaqueAcePresent: raw.opaqueAcePresent === true,
+			aceCount: raw.aceCount ?? 0,
+			unclassified: raw.unclassifiedAces ?? 0,
+		},
+	};
+}
+
+/**
  * Emitted after the `(AS)` grant and before the existing assertions: the
- * helper's numeric view, an independent numeric view of the same raw DACL, and
- * the verdict that separates "the OS never created the ACE" from "the helper
- * lost the bit".
+ * helper's numeric view, an independent numeric view of the same raw DACL, the
+ * verdict that separates "the OS never created the ACE" from "the helper lost
+ * the bit", and — when the fixture asked for one — the proof for one exact
+ * right on one target principal, aggregated over the complete enumeration.
+ * Detail degrades from full to two ACEs to a compact proof payload; the proof
+ * survives every step.
  */
 function reportSecurityRightEvidence(
 	t: { diagnostic(message: string): void },
 	fixture: { target: string; root: string },
+	proof?: { principal: PrincipalClass; right: number; verdict: RawRightVerdict },
 ): void {
 	try {
 		const helper = summarizeHelperAcl(fixture.target);
 		const raw = readRawDaclNumeric(fixture.target, fixture.root);
 		const verdict = securityRightVerdict(helper, raw);
+		const target = proof === undefined ? undefined : renderTargetProof(proof, raw);
+		const withEvidence = proof === undefined
+			? { evidence: { verdict, helper, raw }, reduced: { verdict, helper: reduceHelperSummary(helper, 2), raw: reduceRawSummary(raw, 2) } }
+			: {
+				evidence: { verdict, target, helper, raw },
+				reduced: { verdict, target, helper: reduceHelperSummary(helper, 2), raw: reduceRawSummary(raw, 2) },
+			};
 		emitDiagnostic(
 			t,
 			"as-evidence",
 			[
-				{ verdict, helper, raw },
-				{ verdict, helper: reduceHelperSummary(helper, 2), raw: reduceRawSummary(raw, 2) },
+				withEvidence.evidence,
+				withEvidence.reduced,
+				compactSecurityRightEvidence(verdict, helper, raw, proof),
 				{ verdict, available: false },
 			],
 			[fixture.root, fixture.target],
@@ -864,23 +1038,93 @@ test("native: a real read-only generic parent ACE is accepted with an unsigned A
 	assert.ok(observed.evidence.aces.some((ace) => ace.sid.toUpperCase() === AUTHENTICATED_USERS));
 });
 
-test("native: an untrusted security or unknown parent right is refused where the OS accepts it", { skip: SKIP }, (t) => {
+/**
+ * Mandatory installation proof for one untrusted right on a synthetic parent
+ * this file created: the fixed system tool must report success *and* a complete
+ * independent raw descriptor must show the exact numeric bit on the target
+ * principal. A command that exits 0 is not proof — the head 6959841 native run
+ * did exactly that with the security bit absent — so this helper fails rather
+ * than skipping, falling back, or treating command success as coverage.
+ */
+function assertUntrustedRightInstalled(root: string, rights: string, right: number): void {
+	grantForTest(root, AUTHENTICATED_USERS, rights);
+	const raw = readRawDaclNumeric(root, root);
+	assert.equal(raw.available, true, "this fixture requires a complete independent raw DACL observation");
+	assert.equal(
+		proveRawPrincipalRight(raw, "authenticated-users", right),
+		"present",
+		`the complete raw descriptor must prove ${maskToHex(right)} on the target principal`,
+	);
+}
+
+/**
+ * Fixed, non-claiming message for the case the native run at head 6959841 hit:
+ * the grant command answers success while a complete raw descriptor shows no
+ * such bit for the target principal. Nothing here pretends to be coverage.
+ */
+const NO_VERIFIED_SECURITY_RIGHT_MESSAGE
+	= "icacls reported success granting ACCESS_SYSTEM_SECURITY to Authenticated Users, but the"
+	+ " complete raw descriptor shows no such bit for that principal; native coverage of that"
+	+ " right is unavailable on this host";
+
+test("native: an untrusted security parent right is refused only once the descriptor proves the bit", { skip: SKIP }, (t) => {
 	const root = ownedRoot(t);
 	const policy = createPeerStatePermissionPolicy();
-	// `(AS)` is ACCESS_SYSTEM_SECURITY: read *and rewrite* the SACL. If the host
-	// allows the ACE to be created at all, the parent must be refused; otherwise the
-	// pure fixtures remain the coverage and this case states that honestly.
+	// `(AS)` is ACCESS_SYSTEM_SECURITY: read *and rewrite* the SACL. The fixed
+	// system tool answering success is not evidence that the ACE reached the
+	// descriptor, so this fixture proves the exact bit from a complete raw read
+	// before it claims that right, and fails — never skips — when it cannot.
 	if (!tryGrantForTest(root, AUTHENTICATED_USERS, "(AS)")) {
 		t.diagnostic("this host refused to create an ACCESS_SYSTEM_SECURITY ACE; native coverage of that bit is unavailable");
 		return;
 	}
-	// Bounded numeric evidence first: the helper's view, an independent raw-DACL
-	// view of the same fixture, and whether the security bit is really there.
-	// Nothing below changes the assertions that follow.
-	reportSecurityRightEvidence(t, { target: root, root });
+	const raw = readRawDaclNumeric(root, root);
+	assert.equal(raw.available, true, "the (AS) fixture requires a complete independent raw DACL observation");
+	const proof = { principal: "authenticated-users" as const, right: ACCESS_SYSTEM_SECURITY };
+	const verdict = proveRawPrincipalRight(raw, proof.principal, proof.right);
+	assert.notEqual(
+		verdict,
+		"unknown",
+		"the (AS) fixture requires readable numeric evidence for every ACE in the descriptor",
+	);
+	if (verdict === "absent") {
+		// The command reported success, but the complete descriptor genuinely has no
+		// such bit for this principal. That is not native coverage of the right, and
+		// this branch says so instead of claiming it: no refusal is asserted here.
+		reportSecurityRightEvidence(t, { target: root, root }, { ...proof, verdict });
+		t.diagnostic(NO_VERIFIED_SECURITY_RIGHT_MESSAGE);
+		return;
+	}
+	// The descriptor really carries the bit: the refusal and the unchanged-
+	// descriptor assertion below are the native proof of that untrusted right.
+	reportSecurityRightEvidence(t, { target: root, root }, { ...proof, verdict });
 	const before = describeAcl(root);
 	assert.throws(() => policy.assertOwnerControlledDirectory(root), (error) => assertFixedFailure(error, root));
 	assert.equal(describeAcl(root), before, "an unknown-right parent is refused, never edited");
+});
+
+test("native: an untrusted WRITE_DAC parent right is installed, then refused unchanged", { skip: SKIP }, (t) => {
+	const root = ownedRoot(t);
+	const policy = createPeerStatePermissionPolicy();
+	// The synthetic parent is genuinely owner-controlled before the grant, so the
+	// refusal below is caused by the untrusted right and not by the fixture.
+	policy.assertOwnerControlledDirectory(root);
+	assertUntrustedRightInstalled(root, "(WDAC)", WRITE_DAC);
+	const before = describeAcl(root);
+	assert.ok(before.includes(AUTHENTICATED_USERS));
+	assert.throws(() => policy.assertOwnerControlledDirectory(root), (error) => assertFixedFailure(error, root));
+	assert.equal(describeAcl(root), before, "an untrusted change-permissions parent is refused whole, never edited");
+});
+
+test("native: an untrusted WRITE_OWNER parent right is installed, then refused unchanged", { skip: SKIP }, (t) => {
+	const root = ownedRoot(t);
+	const policy = createPeerStatePermissionPolicy();
+	policy.assertOwnerControlledDirectory(root);
+	assertUntrustedRightInstalled(root, "(WO)", WRITE_OWNER);
+	const before = describeAcl(root);
+	assert.ok(before.includes(AUTHENTICATED_USERS));
+	assert.throws(() => policy.assertOwnerControlledDirectory(root), (error) => assertFixedFailure(error, root));
+	assert.equal(describeAcl(root), before, "an untrusted take-ownership parent is refused whole, never edited");
 });
 
 test("native: an existing broad DACL is refused and never repaired", { skip: SKIP }, (t) => {
@@ -1208,6 +1452,198 @@ test("portable diagnostics: the ACCESS_SYSTEM_SECURITY verdict separates a missi
 	assert.equal(beyondDisplay.aces?.length, DIAGNOSTIC_MAX_ACE_RECORDS);
 	assert.equal(beyondDisplay.opaqueAcePresent, true, "uncertainty includes ACEs beyond the displayed slice");
 	assert.equal(securityRightVerdict(helperWithoutAs, beyondDisplay), "unknown");
+});
+
+test("portable diagnostics: per-principal right aggregates cover the complete enumeration", () => {
+	const raw = summarizeRawEvidence({
+		v: 1, ok: true, c: FAKE_CURRENT, o: FAKE_CURRENT, k: 4, p: true, n: 5,
+		a: [
+			{ t: 0, f: 0, i: false, m: 0x8000_0000, s: AUTHENTICATED_USERS },
+			{ t: 0, f: 3, i: true, m: 0x0010_0000, s: AUTHENTICATED_USERS },
+			{ t: 0, f: 0, i: false, m: WRITE_OWNER, s: AUTHENTICATED_USERS },
+			{ t: 1, f: 0, i: false, m: WRITE_DAC, s: AUTHENTICATED_USERS },
+			{ t: 9, f: 0, i: false, m: null, s: "" },
+		],
+	});
+	const aggregate = raw.principalRights?.["authenticated-users"];
+	assert.equal(aggregate?.aceCount, 4);
+	assert.equal(aggregate?.allowMask, (0x8000_0000 | 0x0010_0000 | WRITE_OWNER) >>> 0);
+	assert.equal(aggregate?.denyMask, WRITE_DAC);
+	assert.equal(aggregate?.unreadableAces, 0);
+	assert.equal(raw.unclassifiedAces, 1, "an ACE whose SID could not be read is counted, never trusted");
+	assert.equal(raw.principalRights?.other?.unreadableAces, 1);
+	assert.deepEqual(renderRightAggregate(raw, "authenticated-users"), {
+		allow: "0x80180000",
+		deny: "0x00040000",
+		aces: 4,
+		unreadable: 0,
+	});
+	// The display slice is bounded, but the aggregate a proof depends on is not
+	// reduced with it: reducing detail never loses the target-right evidence.
+	const reduced = reduceRawSummary(raw, 1);
+	assert.equal(reduced.aces?.length, 1);
+	assert.deepEqual(reduced.principalRights, raw.principalRights);
+	assert.equal(JSON.stringify(renderRightAggregate(reduced, "authenticated-users")).includes("S-1-"), false);
+	// An unavailable read renders bounded zero counts instead of throwing.
+	assert.deepEqual(renderRightAggregate(unavailableRaw("unavailable"), "authenticated-users"), {
+		allow: "0x00000000",
+		deny: "0x00000000",
+		aces: 0,
+		unreadable: 0,
+	});
+});
+
+test("portable diagnostics: target-right proofs need the complete raw enumeration", () => {
+	type RawEntry = { t: number; f: number; i: boolean; m: number | null; s: string };
+	const response = (aces: readonly RawEntry[], overrides: Record<string, unknown> = {}) => ({
+		v: 1, ok: true, c: FAKE_CURRENT, o: FAKE_CURRENT, k: 4 | 4_096, p: true,
+		n: aces.length, a: aces, ...overrides,
+	});
+	const ace = (mask: number | null, sid: string, type = 0): RawEntry => ({ t: type, f: 3, i: true, m: mask, s: sid });
+	const filler = Array.from({ length: DIAGNOSTIC_MAX_ACE_RECORDS }, () => ace(0x001f_01ff, FAKE_CURRENT));
+
+	// The target ACE is the last entry, beyond the bounded display slice: the proof
+	// must come from the complete enumeration, never from the displayed ACEs.
+	const beyond = summarizeRawEvidence(response([...filler, ace(ACCESS_SYSTEM_SECURITY, AUTHENTICATED_USERS)]));
+	assert.equal(beyond.aces?.length, DIAGNOSTIC_MAX_ACE_RECORDS);
+	assert.equal(beyond.acesTruncated, true);
+	assert.equal((beyond.aces ?? []).some((entry) => entry.principal === "authenticated-users"), false);
+	assert.equal(proveRawPrincipalRight(beyond, "authenticated-users", ACCESS_SYSTEM_SECURITY), "present");
+
+	// Complete readable evidence: installed bits are present, a different right is absent.
+	const installed = summarizeRawEvidence(response([
+		ace(0x001f_01ff, FAKE_CURRENT),
+		ace(WRITE_DAC | WRITE_OWNER, AUTHENTICATED_USERS),
+	]));
+	assert.equal(proveRawPrincipalRight(installed, "authenticated-users", WRITE_DAC), "present");
+	assert.equal(proveRawPrincipalRight(installed, "authenticated-users", WRITE_OWNER), "present");
+	assert.equal(proveRawPrincipalRight(installed, "authenticated-users", ACCESS_SYSTEM_SECURITY), "absent");
+	// Another principal's matching bit says nothing about the target principal.
+	assert.equal(proveRawPrincipalRight(
+		summarizeRawEvidence(response([ace(WRITE_DAC, EVERYONE)])),
+		"authenticated-users",
+		WRITE_DAC,
+	), "absent");
+
+	// Unproven evidence is never presence or absence: an opaque mask for the target
+	// principal, an ACE whose SID could not be read, a bit carried only by a deny
+	// ACE, an unavailable read, an incomplete enumeration, or a summary without the
+	// full-enumeration aggregate all stay unknown.
+	assert.equal(proveRawPrincipalRight(
+		summarizeRawEvidence(response([ace(WRITE_DAC, AUTHENTICATED_USERS), ace(null, AUTHENTICATED_USERS)])),
+		"authenticated-users",
+		ACCESS_SYSTEM_SECURITY,
+	), "unknown");
+	assert.equal(proveRawPrincipalRight(
+		summarizeRawEvidence(response([ace(WRITE_DAC, AUTHENTICATED_USERS), ace(null, "")])),
+		"authenticated-users",
+		ACCESS_SYSTEM_SECURITY,
+	), "unknown");
+	assert.equal(proveRawPrincipalRight(
+		summarizeRawEvidence(response([ace(ACCESS_SYSTEM_SECURITY, AUTHENTICATED_USERS, 1)])),
+		"authenticated-users",
+		ACCESS_SYSTEM_SECURITY,
+	), "unknown", "a deny ACE carries the bit but is not an installed grant");
+	assert.equal(proveRawPrincipalRight(unavailableRaw("unavailable"), "authenticated-users", WRITE_DAC), "unknown");
+	assert.equal(proveRawPrincipalRight({ available: true, securityRightPresent: false }, "authenticated-users", WRITE_DAC), "unknown");
+	assert.equal(proveRawPrincipalRight(
+		summarizeRawEvidence(response([ace(WRITE_DAC, AUTHENTICATED_USERS)], { n: 2 })),
+		"authenticated-users",
+		WRITE_DAC,
+	), "unknown");
+
+	// A readable target grant is not enough on its own: an opaque ACE anywhere in
+	// the descriptor could be the reason production refuses, so the fixture can
+	// never attribute that refusal to the target right. This holds for an opaque
+	// ACE inside and beyond the bounded display slice alike.
+	const opaqueNear = summarizeRawEvidence(response([
+		ace(ACCESS_SYSTEM_SECURITY, AUTHENTICATED_USERS),
+		ace(null, EVERYONE),
+	]));
+	assert.equal(opaqueNear.opaqueAcePresent, true);
+	assert.equal(proveRawPrincipalRight(opaqueNear, "authenticated-users", ACCESS_SYSTEM_SECURITY), "unknown");
+	const opaqueBeyond = summarizeRawEvidence(response([
+		...filler,
+		ace(ACCESS_SYSTEM_SECURITY, AUTHENTICATED_USERS),
+		ace(null, EVERYONE),
+	]));
+	assert.equal(opaqueBeyond.aces?.length, DIAGNOSTIC_MAX_ACE_RECORDS);
+	assert.equal(opaqueBeyond.acesTruncated, true);
+	assert.equal((opaqueBeyond.aces ?? []).some((entry) => entry.principal === "authenticated-users"), false);
+	assert.equal(renderRightAggregate(opaqueBeyond, "authenticated-users").allow, "0x01000000");
+	assert.equal(
+		proveRawPrincipalRight(opaqueBeyond, "authenticated-users", ACCESS_SYSTEM_SECURITY),
+		"unknown",
+		"an opaque ACE beyond the display slice still blocks the proof",
+	);
+	// An unclassified ACE is opaque by construction, so it blocks presence too.
+	assert.equal(proveRawPrincipalRight(
+		summarizeRawEvidence(response([ace(ACCESS_SYSTEM_SECURITY, AUTHENTICATED_USERS), ace(null, "")])),
+		"authenticated-users",
+		ACCESS_SYSTEM_SECURITY,
+	), "unknown");
+	// A readable numeric mask does not make an unsupported callback/object ACE
+	// an ordinary grant. It must not silently establish absence or attribution.
+	const unsupported = summarizeRawEvidence(response([
+		...filler, ace(WRITE_DAC, AUTHENTICATED_USERS), ace(ACCESS_SYSTEM_SECURITY, EVERYONE, 9),
+	]));
+	assert.equal(unsupported.opaqueAcePresent, true);
+	assert.equal(proveRawPrincipalRight(unsupported, "authenticated-users", WRITE_DAC), "unknown");
+	assert.equal(proveRawPrincipalRight(unsupported, "authenticated-users", ACCESS_SYSTEM_SECURITY), "unknown");
+});
+
+test("portable diagnostics: an oversized security-right report still carries the proof", () => {
+	// A wide multi-principal descriptor: five principal classes, eight ACEs. Its
+	// full and two-ACE renderings are larger than one diagnostic line.
+	const helperAces = [
+		syntheticAce(FAKE_CURRENT, 0x1000_0000),
+		syntheticAce(FAKE_CURRENT, 0x001f_01ff),
+		syntheticAce(LOCAL_SYSTEM, 0x001f_01ff),
+		syntheticAce(ADMINISTRATORS, 0x001f_01ff),
+		syntheticAce(AUTHENTICATED_USERS, ACCESS_SYSTEM_SECURITY, { inherit: 3, inherited: true }),
+		syntheticAce(AUTHENTICATED_USERS, 0x0000_0021, { inherit: 3, inherited: true }),
+		syntheticAce(EVERYONE, 0x0000_0001, { inherit: 3, inherited: true }),
+		syntheticAce(EVERYONE, 0x0000_0002, { aceType: "deny" }),
+	];
+	const helper = summarizeHelperEvidence({ currentSid: FAKE_CURRENT, evidence: syntheticEvidence(helperAces) });
+	const raw = summarizeRawEvidence({
+		v: 1, ok: true, c: FAKE_CURRENT, o: FAKE_CURRENT, k: 4 | 4_096, p: true,
+		n: 8,
+		a: [
+			{ t: 0, f: 0, i: false, m: 0x1000_0000, s: FAKE_CURRENT },
+			{ t: 0, f: 0, i: false, m: 0x001f_01ff, s: FAKE_CURRENT },
+			{ t: 0, f: 0, i: false, m: 0x001f_01ff, s: LOCAL_SYSTEM },
+			{ t: 0, f: 0, i: false, m: 0x001f_01ff, s: ADMINISTRATORS },
+			{ t: 0, f: 3, i: true, m: ACCESS_SYSTEM_SECURITY, s: AUTHENTICATED_USERS },
+			{ t: 0, f: 3, i: true, m: 0x0000_0021, s: AUTHENTICATED_USERS },
+			{ t: 0, f: 3, i: true, m: 0x0000_0001, s: EVERYONE },
+			{ t: 1, f: 0, i: false, m: 0x0000_0002, s: EVERYONE },
+		],
+	});
+	const proof = { principal: "authenticated-users" as const, right: ACCESS_SYSTEM_SECURITY, verdict: "present" as const };
+	const verdict: SecurityRightVerdict = "as-lost-by-helper";
+	const full = { verdict, target: renderTargetProof(proof, raw), helper, raw };
+	const compact = compactSecurityRightEvidence(verdict, helper, raw, proof);
+
+	// The full payload alone is too large, so the ceiling is genuinely in play...
+	assert.equal(renderDiagnosticLine("as-evidence", [full], []), DIAGNOSTIC_UNAVAILABLE);
+	// ...and the compact payload is what still delivers the proof and the counts.
+	const line = renderDiagnosticLine("as-evidence", [full, compact, { verdict, available: false }], []);
+	assert.notEqual(line, DIAGNOSTIC_UNAVAILABLE);
+	assert.ok(line.startsWith(`${DIAGNOSTIC_PREFIX} as-evidence `));
+	assert.ok(line.length <= DIAGNOSTIC_MAX_LINE_CHARS);
+	assert.ok(line.includes('"target"'), "the compact fallback must keep the target proof");
+	assert.ok(line.includes("0x01000000"), "the compact fallback must keep the aggregate mask");
+	assert.ok(line.includes('"securityRightPresent"') && line.includes('"securityRightAces"'));
+	const compactText = JSON.stringify(compact);
+	assert.ok(
+		!compactText.includes("principalRights") && !compactText.includes('"sid"') && !compactText.includes('"mask"'),
+		"ACE lists and per-principal aggregate maps are dropped from the compact payload",
+	);
+	assert.ok(!compactText.includes("S-1-"));
+	// Without the proof there is nothing target-shaped to keep.
+	const bare = JSON.stringify(compactSecurityRightEvidence(verdict, helper, raw));
+	assert.ok(!bare.includes('"target"'));
 });
 
 test("portable diagnostics: protect failure classification separates helper exit from verifier rejection", () => {

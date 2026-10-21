@@ -28,6 +28,7 @@ import test from "node:test";
 import { isPeerTransportError } from "../src/session-host/network/index";
 import { createPeerStatePermissionPolicy, proveExtendedAcl } from "../src/session-host/network/peer-state-permissions";
 import {
+	verifyCreatedObjectEligibility,
 	verifyOwnerControlledAclEvidence,
 	verifyPrivateAclEvidence,
 	type WindowsAclAceEvidence,
@@ -903,6 +904,155 @@ test("Windows fixtures: protection re-checks that the object is still the empty 
 		(error) => isFixedFailure(error),
 		"a file that already holds bytes is not a created object",
 	);
+});
+
+/** Decode the fixed helper script exactly as the child receives it. */
+function helperScriptFromCall(call: RecordedCall): string {
+	const index = call.args.indexOf("-EncodedCommand");
+	assert.ok(index >= 0 && index + 1 < call.args.length, "the fixed script must travel as an encoded command");
+	const encoded = call.args[index + 1];
+	assert.equal(typeof encoded, "string");
+	return Buffer.from(encoded, "base64").toString("utf16le");
+}
+
+/**
+ * The one `protect` block of the fixed script, up to the point where the helper
+ * re-reads the descriptor it just produced. The final private proof runs on that
+ * re-read in TypeScript, so this slice is the whole pre-protection admission.
+ */
+function helperProtectBlock(script: string): string {
+	const start = script.indexOf("if ($op -eq 'protect') {");
+	const end = script.indexOf("$evidence = Read-Evidence $path", start);
+	assert.ok(start >= 0 && end > start, "the fixed script must protect, then re-read the descriptor it produced");
+	return script.slice(start, end);
+}
+
+test("Windows fixtures: the helper admits only the created object's Administrators default owner, and only by re-owning it to this account", () => {
+	const { policy, calls } = windowsFixturePolicy((request) =>
+		helperSuccess(request, request.op === "protect" ? WINDOWS_PRIVATE_DIR : WINDOWS_PARENT));
+	policy.protectCreatedDirectory("/agent/peers");
+	const protectCall = calls.find((call) => call.op === "protect");
+	assert.ok(protectCall !== undefined, "the created-object path must reach the helper once");
+	const script = helperScriptFromCall(protectCall);
+	const block = helperProtectBlock(script);
+
+	// The pre-protection owner test may name exactly two principals: this account, and
+	// the fixed built-in Administrators alias already inside the OS-privileged boundary.
+	const ownerLines = block.split("\n").filter((line) => line.includes(".ownerSid"));
+	assert.equal(ownerLines.length, 2, "one admission test and one refusal, no other owner rule");
+	for (const line of ownerLines) {
+		for (const sid of line.match(/S-\d+(?:-\d+)+/gu) ?? []) {
+			assert.equal(sid, "S-1-5-32-544", `only the fixed alias may be admitted as a pre-protection owner, not ${sid}`);
+		}
+		assert.ok(!line.includes("S-1-5-18"), "LocalSystem is never an admitted pre-protection owner");
+	}
+	assert.match(
+		block,
+		/if \(\$takeCreatedOwner -and \$before\.ownerSid -ne 'S-1-5-32-544'\) \{ exit 5 \}/u,
+		"any owner other than this account or the created-object default must refuse untouched",
+	);
+	assert.match(
+		block,
+		/if \(\$takeCreatedOwner\) \{ \$security\.SetOwner\(\$identity\) \}/u,
+		"ownership is written only where the default owner needed correcting",
+	);
+
+	// Eligibility is proved first, so the correction can never reach a used object.
+	const admission = block.indexOf("$takeCreatedOwner =");
+	assert.ok(admission > 0, "the owner admission must exist");
+	for (const guard of ["$before.isDirectory -ne", "$before.isReparsePoint", "$before.entryCount -ne 0", "$before.fileLength -ne 0"]) {
+		assert.ok(block.indexOf(guard) < admission, `${guard} must be proved before any owner is admitted`);
+	}
+	const setOwner = block.indexOf("$security.SetOwner($identity)");
+	assert.ok(setOwner > admission, "ownership may be corrected only after admission");
+	assert.ok(
+		setOwner < block.indexOf("$target.SetAccessControl($security)"),
+		"the owner change must ride the same descriptor write as the private DACL",
+	);
+	assert.ok(
+		script.indexOf("$evidence = Read-Evidence $path") > setOwner,
+		"the private proof must re-read the corrected descriptor",
+	);
+	assert.equal(script.match(/\.SetOwner\(/g)?.length, 1, "the protect path is the only place ownership is ever written");
+	assert.equal(block.match(/SetAccessControl\(\$security\)/g)?.length, 1, "one descriptor write: no retry and no repair pass");
+	// The request shape is unchanged: the caller never supplies an owner, SID, or account.
+	assert.deepEqual(Object.keys(JSON.parse(protectCall.options.input) as Record<string, unknown>).sort(), ["kind", "op", "path", "v"]);
+});
+
+test("Windows fixtures: a created object with the Administrators default owner is protected once ownership reads back as this account", () => {
+	// The fixtures below stand in for the descriptor the helper returns *after* the
+	// correction; the native Windows suite owns the real-NTFS proof of that read-back.
+	for (const [kind, target, post] of [
+		["dir", "/agent/peers", WINDOWS_PRIVATE_DIR],
+		["file", "/agent/peers/state.json", WINDOWS_PRIVATE_FILE],
+	] as const) {
+		const { policy, calls } = windowsFixturePolicy((request) => {
+			if (request.op === "protect") return helperSuccess(request, post);
+			// A created file needs a private containing directory; a created directory
+			// needs an owner-controlled one. Neither parent view carries the child's owner.
+			return helperSuccess(request, kind === "file" && request.path === "/agent/peers" ? WINDOWS_PRIVATE_DIR : WINDOWS_PARENT);
+		});
+		if (kind === "dir") policy.protectCreatedDirectory(target);
+		else policy.protectCreatedFile(target);
+		assert.deepEqual(calls.map((call) => call.op), ["inspect", "protect"], kind);
+	}
+});
+
+test("Windows fixtures: protection refuses any descriptor whose owner is not this account, even after a protect call", () => {
+	for (const [name, owner] of [
+		["administrators-owner-uncorrected", ADMINISTRATORS],
+		["local-system-owner", SYSTEM],
+		["foreign-account-owner", "S-1-5-21-9999-1000"],
+	] as const) {
+		for (const [kind, target, base] of [
+			["dir", "/agent/peers", WINDOWS_PRIVATE_DIR],
+			["file", "/agent/peers/state.json", WINDOWS_PRIVATE_FILE],
+		] as const) {
+			const post = { ...base, ownerSid: owner };
+			const { policy, calls } = windowsFixturePolicy((request) => {
+				if (request.op === "protect") return helperSuccess(request, post);
+				return helperSuccess(request, kind === "file" && request.path === "/agent/peers" ? WINDOWS_PRIVATE_DIR : WINDOWS_PARENT);
+			});
+			assert.throws(
+				() => (kind === "dir" ? policy.protectCreatedDirectory(target) : policy.protectCreatedFile(target)),
+				(error) => isFixedFailure(error),
+				`${name}/${kind}`,
+			);
+			assert.deepEqual(
+				calls.map((call) => call.op),
+				["inspect", "protect"],
+				`${name}/${kind}: exactly one protect, never a repair retry`,
+			);
+		}
+	}
+});
+
+test("Windows fixtures: the final private proof stays current-account-only and eligibility never stands in for it", () => {
+	for (const [name, owner] of [
+		["administrators", ADMINISTRATORS],
+		["local-system", SYSTEM],
+		["foreign", "S-1-5-21-9999-1000"],
+	] as const) {
+		const dir = evidence({ ownerSid: owner });
+		const file = evidence({ isDirectory: false, entryCount: -1, ownerSid: owner });
+		assert.equal(verifyPrivateAclEvidence(dir, CURRENT, "dir"), false, `${name}: an alias or foreign owner is never private`);
+		assert.equal(verifyPrivateAclEvidence(file, CURRENT, "file"), false, `${name}: an alias or foreign owner is never private`);
+		// Emptiness and type eligibility stays owner-blind on purpose: it is neither a
+		// creation receipt nor an ownership proof, so it must never read as privacy.
+		assert.equal(verifyCreatedObjectEligibility(dir, "dir"), true, `${name}: eligibility is an emptiness check only`);
+		assert.equal(verifyCreatedObjectEligibility(file, "file"), true, `${name}: eligibility is an emptiness check only`);
+
+		// The assert methods are unchanged: read-only inspection, fixed refusal, no repair.
+		const asserted = windowsFixturePolicy((request) =>
+			helperSuccess(request, request.path === "/agent/peers/state.json" ? file : dir));
+		assert.throws(() => asserted.policy.assertPrivateDirectory("/agent/peers"), (error) => isFixedFailure(error), `${name}: assert dir`);
+		assert.throws(() => asserted.policy.assertPrivateFile("/agent/peers/state.json"), (error) => isFixedFailure(error), `${name}: assert file`);
+		assert.deepEqual(asserted.calls.map((call) => call.op), ["inspect", "inspect"], `${name}: asserting never mutates`);
+	}
+	// The parent boundary the created-object admission reuses stays as it was: an
+	// OS-privileged alias owner can prove a parent, and never proves privacy.
+	assert.equal(verifyOwnerControlledAclEvidence(evidence({ ownerSid: ADMINISTRATORS }), CURRENT), true);
+	assert.equal(verifyPrivateAclEvidence(evidence({ ownerSid: ADMINISTRATORS }), CURRENT, "dir"), false);
 });
 
 test("Windows fixtures: a drive-root parent is C:\\, never the drive-relative C:", () => {

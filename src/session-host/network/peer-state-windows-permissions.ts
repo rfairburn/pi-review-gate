@@ -43,6 +43,16 @@
  * - Emptiness and type observations are *eligibility* checks, not a creation
  *   receipt: they keep a used object from being re-ACL'd, while the caller owns
  *   the exclusive-create/inode proof for the object it hands over.
+ * - An elevated Windows token can use the built-in Administrators alias as
+ *   its default object owner, as observed by the native acceptance run. The
+ *   protect path therefore corrects that one creation default: for
+ *   the empty object of the expected kind that the caller has just created, it
+ *   sets the owner to this exact account in the same descriptor write that
+ *   installs the private DACL, then re-reads the descriptor and accepts only that
+ *   account as owner before any private byte may be written. This is not an
+ *   ownership relaxation: no other pre-protection owner is admitted (LocalSystem,
+ *   another account, and unknown SIDs still refuse), no existing object is ever
+ *   re-owned or repaired, and the finished private proof stays current-account-only.
  * - NTFS has no link-count analogue to the POSIX `nlink` check. Hard links
  *   share one security descriptor, so a second name cannot carry different
  *   protection; the residual exposure is deletion through another name's
@@ -390,10 +400,21 @@ try {
 		if ($null -eq $before) { exit 4 }
 		if ($before.isDirectory -ne ($kind -eq 'dir')) { exit 5 }
 		if ($before.isReparsePoint) { exit 5 }
-		if ($before.ownerSid -ne $current) { exit 5 }
+		# Type and emptiness are checked before owner correction. They are eligibility
+		# checks only: the caller still owns the exclusive-create and inode receipt.
 		if ($kind -eq 'dir' -and $before.entryCount -ne 0) { exit 5 }
 		if ($kind -eq 'file' -and $before.fileLength -ne 0) { exit 5 }
 		$identity = New-Object System.Security.Principal.SecurityIdentifier($current)
+		# An elevated token can make Administrators the default owner of a fresh object,
+		# as observed on the native runner before any private DACL exists. Correcting
+		# that creation default is the only ownership change this module ever
+		# makes and it is reachable only here: the caller positively proved it exclusively
+		# created this empty object under a parent already proven safe, and the admitted SID
+		# is the fixed alias already inside the OS-privileged trust boundary. Any other
+		# pre-protection owner - LocalSystem, another account, an unknown SID - still exits 5
+		# with the descriptor untouched, and the proof below still accepts one owner only.
+		$takeCreatedOwner = $before.ownerSid -ne $current
+		if ($takeCreatedOwner -and $before.ownerSid -ne 'S-1-5-32-544') { exit 5 }
 		if ($kind -eq 'dir') {
 			$target = New-Object System.IO.DirectoryInfo($path)
 			$inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
@@ -402,6 +423,10 @@ try {
 			$inheritance = [System.Security.AccessControl.InheritanceFlags]::None
 		}
 		$security = $target.GetAccessControl($sections)
+		# Ownership is corrected in the same descriptor write that installs the private
+		# DACL, so no window exists in which the object is private but still owned by the
+		# alias; the re-read below is what proves the correction actually landed.
+		if ($takeCreatedOwner) { $security.SetOwner($identity) }
 		$security.SetAccessRuleProtection($true, $false)
 		foreach ($existing in @($security.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
 			[void]$security.RemoveAccessRuleSpecific($existing)
@@ -706,6 +731,11 @@ export function verifyPrivateAclEvidence(
  * object of the expected kind. This is not a creation receipt — the caller owns
  * the exclusive-create/inode proof — it only keeps a used, replaced, or
  * repurposed object from being re-ACL'd into looking newly protected.
+ *
+ * Ownership is deliberately not part of eligibility, and this predicate is never
+ * a pass on its own: the private proof in {@link verifyPrivateAclEvidence} still
+ * accepts only the current account as owner, which is what makes the helper's
+ * created-object owner correction provable rather than assumed.
  */
 export function verifyCreatedObjectEligibility(
 	evidence: WindowsAclEvidence,
@@ -811,6 +841,15 @@ export function createWindowsPeerStatePermissions(
 		if (observed === null || !check(observed.evidence, observed.currentSid)) throw peerError("TRUST_STORE_FAILED");
 	};
 
+	/**
+	 * Apply the private DACL, then prove the descriptor the helper actually left
+	 * behind: the object must now be owned by this exact account, carry a protected
+	 * private DACL, and still be the empty object of the expected kind. A created
+	 * object whose default owner was the built-in Administrators alias is accepted
+	 * only once that owner correction is visible in this post-protection evidence;
+	 * any other owner, or a correction that did not land, is the fixed refusal, and
+	 * the caller writes no private byte until this returns.
+	 */
 	const protect = (path: string, kind: "dir" | "file"): void => {
 		const observed = runAclHelper({ op: "protect", path, kind }, probe);
 		if (observed === null

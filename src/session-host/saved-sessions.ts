@@ -11,11 +11,11 @@ import {
   statSync,
 } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { fuzzyMatch } from "pi-session-host-tui";
 import {
   NativeSessionSdkInfo,
   resolveNativeSessionSdk,
 } from "./native-session-sdk";
+import { matchSavedSearchText, parseSavedSearchQuery } from "./saved-search";
 import { isValidNativeSessionFile, isValidNativeSessionId } from "./protocol";
 
 /**
@@ -245,113 +245,12 @@ export function isSavedSessionAdmission(value: unknown): value is SavedSessionAd
  * `session-selector-search.ts` (MIT; attribution in NOTICE). The selector's
  * threaded/recent UI modes and controls are intentionally not part of this
  * saved-catalog data API.
+ *
+ * The parser and matcher themselves live in the shared
+ * src/session-host/saved-search.ts module (issue #463), which the settings
+ * deny pickers reuse so both surfaces search with the same grammar. This
+ * module's own filtering, ordering, and tie-breaking are unchanged.
  */
-interface SavedSearchToken {
-  kind: "fuzzy" | "phrase";
-  value: string;
-}
-
-interface ParsedSavedSearchQuery {
-  mode: "tokens" | "regex";
-  tokens: SavedSearchToken[];
-  regex: RegExp | null;
-  error?: string;
-}
-
-function parseSavedSearchQuery(query: string): ParsedSavedSearchQuery {
-  const trimmed = query.trim();
-  if (!trimmed) return { mode: "tokens", tokens: [], regex: null };
-
-  if (trimmed.startsWith("re:")) {
-    const pattern = trimmed.slice(3).trim();
-    if (!pattern) return { mode: "regex", tokens: [], regex: null, error: "Empty regex" };
-    try {
-      return { mode: "regex", tokens: [], regex: new RegExp(pattern, "i") };
-    } catch (error) {
-      return {
-        mode: "regex",
-        tokens: [],
-        regex: null,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
-  const tokens: SavedSearchToken[] = [];
-  let buffer = "";
-  let inQuote = false;
-  let hadUnclosedQuote = false;
-  const flush = (kind: SavedSearchToken["kind"]): void => {
-    const value = buffer.trim();
-    buffer = "";
-    if (value) tokens.push({ kind, value });
-  };
-
-  for (let index = 0; index < trimmed.length; index += 1) {
-    const character = trimmed[index]!;
-    if (character === '"') {
-      if (inQuote) {
-        flush("phrase");
-        inQuote = false;
-      } else {
-        flush("fuzzy");
-        inQuote = true;
-      }
-      continue;
-    }
-    if (!inQuote && /\s/.test(character)) {
-      flush("fuzzy");
-      continue;
-    }
-    buffer += character;
-  }
-
-  if (inQuote) hadUnclosedQuote = true;
-  if (hadUnclosedQuote) {
-    return {
-      mode: "tokens",
-      tokens: trimmed.split(/\s+/)
-        .map((token) => token.trim())
-        .filter((token) => token.length > 0)
-        .map((value) => ({ kind: "fuzzy" as const, value })),
-      regex: null,
-    };
-  }
-
-  flush(inQuote ? "phrase" : "fuzzy");
-  return { mode: "tokens", tokens, regex: null };
-}
-
-function normalizeSearchWhitespace(text: string): string {
-  return text.toLowerCase().replace(/\s+/g, " ").trim();
-}
-
-function matchSavedSearchText(text: string, parsed: ParsedSavedSearchQuery): { matches: boolean; score: number } {
-  if (parsed.mode === "regex") {
-    if (!parsed.regex) return { matches: false, score: 0 };
-    const index = text.search(parsed.regex);
-    return index < 0 ? { matches: false, score: 0 } : { matches: true, score: index * 0.1 };
-  }
-  if (parsed.tokens.length === 0) return { matches: true, score: 0 };
-
-  let totalScore = 0;
-  let normalizedText: string | null = null;
-  for (const token of parsed.tokens) {
-    if (token.kind === "phrase") {
-      normalizedText ??= normalizeSearchWhitespace(text);
-      const phrase = normalizeSearchWhitespace(token.value);
-      if (!phrase) continue;
-      const index = normalizedText.indexOf(phrase);
-      if (index < 0) return { matches: false, score: 0 };
-      totalScore += index * 0.1;
-      continue;
-    }
-    const match = fuzzyMatch(token.value, text);
-    if (!match.matches) return { matches: false, score: 0 };
-    totalScore += match.score;
-  }
-  return { matches: true, score: totalScore };
-}
 
 /** Per-agent-directory query revision: a newer list supersedes older catalogs. */
 const catalogRevisions = new Map<string, number>();

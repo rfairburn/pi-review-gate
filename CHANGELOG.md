@@ -84,6 +84,31 @@ dates.
   session-creation authority. No behavior, protocol, control, or setting changes. See
   [One owning host, one session manager](docs/session-host-alpha.md#one-owning-host-one-session-manager).
 
+## [0.1.0-dev.188]
+
+### Added
+
+- Both scoped tool-denial pickers in `/review-settings` > **Tools** (**Top-level
+  tools** and **Executor tools**) now have a live tool-name search field (#463). It
+  works like the saved-conversation picker: a native query line above the rows narrows
+  the list as you type, using the same grammar (fuzzy tokens, `"quoted phrases"`, and
+  `re:<pattern>`, all of which must match). Only tool names are searched, never
+  descriptions. The arrow keys move through the matches and Enter still toggles the
+  highlighted row, all through your `tui.select.*` keybindings. A query that matches
+  nothing shows **No matching tools** and keeps **Back** and Escape available. The
+  query is view state only: each picker keeps its own query, the query is never
+  saved, and a denial hidden by the query stays denied and is still applied or saved
+  with the whole draft. Denial semantics, the staged transaction, and the saved
+  configuration are unchanged, and a non-TUI (RPC) host keeps the plain, unfiltered
+  list.
+
+### Fixed
+
+- On terminals that report held-key repeats, a held key no longer replays its action
+  across the settings menus: a held Enter does not toggle a second row, a held Escape
+  does not close the parent menu and then apply the staged draft at the root, and a
+  held Ctrl+S does not save (#463). Navigation and query-editing repeats still repeat.
+
 ## [0.1.0-dev.187]
 
 ### Fixed

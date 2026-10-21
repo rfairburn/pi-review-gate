@@ -1904,6 +1904,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   const compiledConfigPath = join(process.cwd(), "dist-test", "src", "config-path.js");
   const compiledRecordGuard = join(process.cwd(), "dist-test", "src", "record-guard.js");
   const compiledSavedSessions = join(process.cwd(), "dist-test", "src", "session-host", "saved-sessions.js");
+  const compiledSavedSearch = join(process.cwd(), "dist-test", "src", "session-host", "saved-search.js");
   const compiledNativeSessionSdk = join(process.cwd(), "dist-test", "src", "session-host", "native-session-sdk.js");
   const compiledStartupRequest = join(process.cwd(), "dist-test", "src", "session-host", "startup-request.js");
   const compiledPayload = join(process.cwd(), "dist-test", "src", "session-host", "payload.js");
@@ -1912,6 +1913,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   assert.ok(existsSync(compiledConfigPath), "the compiled native config-path helper must exist");
   assert.ok(existsSync(compiledRecordGuard), "the compiled record guard must exist");
   assert.ok(existsSync(compiledSavedSessions), "the compiled saved-session catalog module must exist");
+  assert.ok(existsSync(compiledSavedSearch), "the compiled shared saved-session search module must exist");
   assert.ok(existsSync(compiledNativeSessionSdk), "the compiled public SDK loader module must exist");
   assert.ok(existsSync(compiledStartupRequest), "the compiled startup-request module must exist");
   assert.ok(existsSync(compiledPayload), "the compiled startup payload transport must exist");
@@ -1925,6 +1927,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   t.after(() => removeOwnedFixtureTree(rootA, [
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "launch.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "saved-sessions.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "saved-search.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-session-sdk.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "startup-request.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "payload.js"),
@@ -1947,6 +1950,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   await mkdir(distA, { recursive: true });
   await cp(compiledLaunch, join(distA, "launch.js"));
   await cp(compiledSavedSessions, join(distA, "saved-sessions.js"));
+  await cp(compiledSavedSearch, join(distA, "saved-search.js"));
   await cp(compiledNativeSessionSdk, join(distA, "native-session-sdk.js"));
   await cp(compiledStartupRequest, join(distA, "startup-request.js"));
   await cp(compiledPayload, join(distA, "payload.js"));
@@ -1975,6 +1979,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   t.after(() => removeOwnedFixtureTree(rootB, [
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "launch.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "saved-sessions.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "saved-search.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-session-sdk.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "startup-request.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "payload.js"),
@@ -1996,6 +2001,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   await mkdir(distB, { recursive: true });
   await cp(compiledLaunch, join(distB, "launch.js"));
   await cp(compiledSavedSessions, join(distB, "saved-sessions.js"));
+  await cp(compiledSavedSearch, join(distB, "saved-search.js"));
   await cp(compiledNativeSessionSdk, join(distB, "native-session-sdk.js"));
   await cp(compiledStartupRequest, join(distB, "startup-request.js"));
   await cp(compiledPayload, join(distB, "payload.js"));

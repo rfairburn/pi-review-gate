@@ -20,7 +20,7 @@ import {
 import { OPERATING_MODE_LABELS } from "../operating-mode";
 import { registerHook, sendNotice } from "../pi";
 import { abortActiveNativeEditorField } from "../native-editor-bridge";
-import { retainedSelect, type SettingsSaveControl } from "./menu";
+import { createMenuActionFence, retainedSelect, type SettingsSaveControl } from "./menu";
 import { captureExternalAgentReferenceBaseline, changeExternalAgent, manageExternalAgents, stageExternalAgentOperation, type ExternalAgentOperation } from "./external-agent-catalog";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { assembleStagedSelectionConfig, captureScheduledAlreadyRun, persistReviewSettings, replaceConfig, type ReviewSettingsSelection } from "./persistence";
@@ -253,7 +253,15 @@ async function runSettingsMenu(
   // pre-loop, so a save request latched there unwinds through the same
   // canonical Save path as one latched deeper in the tree. The control is
   // UI-only state — never copied into settings drafts.
-  const saveControl: SettingsSaveControl = { saveRequested: false, suspended: 0 };
+  //
+  // Issue #463: the control also carries the transaction's shared held-action
+  // fence. A held key's repeat/release must never replay a host action, and
+  // the claim has to survive the transition from a nested menu (the deny
+  // picker) back to its parent (Tools) and on to the root — otherwise a held
+  // Escape could close the picker, then the Tools menu, and then apply the
+  // staged draft. The fence is created eagerly so every menu of this
+  // transaction shares the SAME fence object.
+  const saveControl: SettingsSaveControl = { saveRequested: false, suspended: 0, actionFence: createMenuActionFence() };
   input.ui.saveControl = saveControl;
 
   // Issue #190: /scheduled-tasks lands in the existing Scheduled tasks submenu

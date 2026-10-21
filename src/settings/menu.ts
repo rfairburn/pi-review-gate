@@ -51,6 +51,7 @@
 
 import { loadHostPeerModule } from "../host-peer-loader";
 import { isRecord } from "../record-guard";
+import { isKeyRelease, isKeyRepeat, matchesKey } from "pi-session-host-tui";
 
 /** One selectable row: a stable logical key plus its rendered label. */
 export interface RetainedRow {
@@ -73,6 +74,94 @@ export interface RetainedSelectInput {
 export interface SettingsSaveControl {
   saveRequested: boolean;
   suspended: number;
+  /**
+   * The held-action fence shared by every nested settings menu of ONE
+   * transaction (issue #463).
+   *
+   * A held key's repeat/release must never replay a host action. The fence
+   * lives on the root-owned control — not on one menu's local state — so the
+   * claim survives the transition from a nested menu back to its parent: a
+   * held Escape that closed the deny picker cannot also close the Tools menu
+   * and then apply the staged draft at the root.
+   *
+   * The entries are opaque matchers, not key data, so the fence can never
+   * leak what was pressed.
+   */
+  actionFence?: MenuActionFence;
+}
+
+/**
+ * The held-action fence of one settings transaction.
+ *
+ * A claim records the matcher of an action that has just been performed. A
+ * later event that matches the claim is consumed: a repeat is swallowed
+ * outright, and a release ends the claim. A FRESH press of the same action
+ * ends the claim and is handled normally, so the user is never stuck.
+ */
+export interface MenuActionFence {
+  /** Record that an action was just performed. */
+  claim(matches: (data: string) => boolean): void;
+  /**
+   * Consume a held-key event that replays a claimed action.
+   * Returns true when the event was consumed by the fence.
+   */
+  consume(data: string): boolean;
+  /** Drop every claim (used when the whole transaction ends). */
+  clear(): void;
+}
+
+/**
+ * The maximum number of live claims. A claim lives only until the matching
+ * key is released (or a fresh press supersedes it), so this bound is a
+ * safety net against an unbounded claim list, never a behavior limit.
+ */
+const MAX_ACTION_FENCE_CLAIMS = 8;
+
+/**
+ * Create the held-action fence for one settings transaction.
+ *
+ * The fence is the same mechanism the session-host sidebar uses for its
+ * held-key claims: a claim is consumed by a repeat of the claimed action
+ * and ended by its release, while a fresh press of the same action ends the
+ * claim and proceeds normally.
+ */
+export function createMenuActionFence(): MenuActionFence {
+  const claims: Array<(data: string) => boolean> = [];
+  return {
+    claim(matches: (data: string) => boolean): void {
+      claims.push(matches);
+      if (claims.length > MAX_ACTION_FENCE_CLAIMS) claims.splice(0, claims.length - MAX_ACTION_FENCE_CLAIMS);
+    },
+    consume(data: string): boolean {
+      let consumed = false;
+      for (const matches of [...claims]) {
+        let matched = false;
+        try {
+          matched = matches(data);
+        } catch {
+          // A malformed event is not a match.
+        }
+        if (!matched) continue;
+        const index = claims.indexOf(matches);
+        if (isKeyRelease(data)) {
+          // The key was released: the hold is over, so the claim ends.
+          if (index >= 0) claims.splice(index, 1);
+          consumed = true;
+        } else if (isKeyRepeat(data)) {
+          // A held-key repeat never replays the action.
+          consumed = true;
+        } else if (index >= 0) {
+          // A fresh press of the same action supersedes the claim and is
+          // handled normally by the caller.
+          claims.splice(index, 1);
+        }
+      }
+      return consumed;
+    },
+    clear(): void {
+      claims.length = 0;
+    },
+  };
 }
 
 /** The theme passed to custom component factories (the host Theme). */
@@ -125,6 +214,16 @@ export interface MenuSelectList {
   invalidate(): void;
 }
 
+/** The pi-tui Input surface the search-capable picker drives (issue #463). */
+export interface MenuInput {
+  getValue(): string;
+  setValue(value: string): void;
+  handleInput(data: string): void;
+  render(width: number): string[];
+  invalidate(): void;
+  focused: boolean;
+}
+
 /** The pi-tui Container surface this adapter builds into. */
 export interface MenuContainer {
   addChild(component: unknown): void;
@@ -141,6 +240,12 @@ export interface MenuTuiHost {
   SelectList: new (items: MenuSelectItem[], maxVisible: number, theme: MenuSelectListTheme) => MenuSelectList;
   Container: new () => MenuContainer;
   Text: new (text: string, x?: number, y?: number) => unknown;
+  /**
+   * The pi-tui single-line Input the search-capable deny picker uses
+   * (issue #463). Optional: a host peer without it degrades to the plain
+   * selector, exactly like a peer without SelectList.
+   */
+  Input?: new () => MenuInput;
   /**
    * The loaded pi-tui module's public setKeybindings(); points that module's
    * global keybinding state at the host's live manager so embedded components
@@ -186,6 +291,30 @@ function resolveMenuTuiHost(): Promise<MenuTuiHost | undefined> {
   return hostLoadPromise;
 }
 
+/**
+ * The shared host resolution for the settings renderers (issue #463).
+ *
+ * The deny picker's search-capable renderer resolves the SAME host through
+ * this seam, so an injected fake or the running Pi's own modules are used
+ * identically by every settings menu, and the load failure mode stays the
+ * same: a rejecting or unloadable peer resolves to undefined and the caller
+ * degrades to the plain selector.
+ */
+export function resolveMenuTuiHostForRenderers(): Promise<MenuTuiHost | undefined> {
+  return resolveMenuTuiHost().catch(() => undefined);
+}
+
+/**
+ * True only for an injected live KeybindingsManager (the host's own manager
+ * with the user's keybindings.json). The search-capable renderer uses it to
+ * resolve tui.select.* through the same live manager the plain menus use.
+ */
+export function isLiveMenuKeybindingsManager(
+  value: unknown,
+): value is { matches(data: string, keybinding: string): boolean } {
+  return isLiveKeybindingsManager(value);
+}
+
 async function loadMenuTuiHost(): Promise<MenuTuiHost | undefined> {
   const tui = await loadHostPeerModule(PI_TUI_PACKAGE_NAME, { entryProvider: hostEntryProvider, packageMainFallback: true });
   if (!isSelectListProvider(tui)) {
@@ -198,6 +327,11 @@ async function loadMenuTuiHost(): Promise<MenuTuiHost | undefined> {
     Container: tui.Container as MenuTuiHost["Container"],
     Text: tui.Text as MenuTuiHost["Text"],
   };
+  // The public single-line Input backs the deny picker's search field
+  // (issue #463). It is optional: a peer without it keeps the plain selector.
+  if (typeof tui.Input === "function") {
+    host.Input = tui.Input as MenuTuiHost["Input"];
+  }
   if (typeof tui.setKeybindings === "function") {
     host.setKeybindings = tui.setKeybindings as MenuTuiHost["setKeybindings"];
   }
@@ -221,11 +355,69 @@ async function loadMenuTuiHost(): Promise<MenuTuiHost | undefined> {
   return host;
 }
 
-/** True when the injected keybindings argument is a live KeybindingsManager. */
+/**
+ * True when the injected keybindings argument is a live KeybindingsManager.
+ */
 function isLiveKeybindingsManager(
   value: unknown,
 ): value is { matches(data: string, keybinding: string): boolean } {
   return isRecord(value) && typeof (value as Record<string, unknown>).matches === "function";
+}
+
+/**
+ * The public pi-tui action ids the settings menus resolve through the host's
+ * live keybindings.
+ */
+export type MenuActionId =
+  | "tui.select.up"
+  | "tui.select.down"
+  | "tui.select.confirm"
+  | "tui.select.cancel";
+
+/**
+ * The native default chords for the settings menus' actions, used when the
+ * host injects no live keybindings manager (an RPC host, a test mock, or a
+ * host that injects none). These are Pi's own published defaults.
+ */
+const MENU_ACTION_DEFAULT_KEYS: Readonly<Record<MenuActionId, readonly string[]>> = {
+  "tui.select.up": ["up"],
+  "tui.select.down": ["down"],
+  "tui.select.confirm": ["enter"],
+  "tui.select.cancel": ["escape", "ctrl+c"],
+};
+
+/**
+ * Resolves the settings menus' action chords through the host's LIVE
+ * keybindings manager, with Pi's native defaults as the fallback.
+ *
+ * The host injects its live KeybindingsManager (built-in defaults plus the
+ * user's keybindings.json) into every custom component, so a user remap of
+ * `tui.select.*` must reach the menus. When a live manager is present it is
+ * AUTHORITATIVE: the native defaults are consulted only when the host
+ * injects no manager at all. A user who rebinds `tui.select.cancel` — or
+ * disables it with an empty list — therefore gets exactly that behavior,
+ * and the menus never silently keep the old chord.
+ *
+ * The returned matcher is safe to call with any raw key data: a manager that
+ * throws (an uninitialized theme or a partial peer) falls back to the
+ * defaults instead of eating the key.
+ */
+export function resolveMenuActionMatcher(
+  keybindings: unknown,
+  action: MenuActionId,
+): (data: string) => boolean {
+  const defaults = MENU_ACTION_DEFAULT_KEYS[action] ?? [];
+  if (isLiveKeybindingsManager(keybindings)) {
+    return (data: string): boolean => {
+      try {
+        return keybindings.matches(data, action);
+      } catch {
+        // A failing manager must not eat the key: use the native default.
+        return defaults.some((key) => matchesKey(data, key as Parameters<typeof matchesKey>[1]));
+      }
+    };
+  }
+  return (data: string): boolean => defaults.some((key) => matchesKey(data, key as Parameters<typeof matchesKey>[1]));
 }
 
 /** The pi-tui exports the adapter actually drives. */
@@ -235,6 +427,7 @@ function isSelectListProvider(
   SelectList: MenuTuiHost["SelectList"];
   Container: MenuTuiHost["Container"];
   Text: MenuTuiHost["Text"];
+  Input?: MenuTuiHost["Input"];
 } {
   return (
     mod !== undefined &&
@@ -306,6 +499,11 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
         // A failing sync must not break the menu: keep component defaults.
       }
     }
+    // The action chords are resolved through the host's LIVE manager, so a
+    // user's remap of tui.select.* reaches the menu, with Pi's native
+    // defaults as the fallback (issue #463).
+    const confirmMatch = resolveMenuActionMatcher(keybindings, "tui.select.confirm");
+    const cancelMatch = resolveMenuActionMatcher(keybindings, "tui.select.cancel");
     const container = new host.Container();
     if (host.DynamicBorder) container.addChild(new host.DynamicBorder(borderColor(theme)));
     container.addChild(new host.Text(titleText(theme, input.title), 1, 0));
@@ -330,10 +528,31 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
       render: (width: number): string[] => container.render(width),
       invalidate: (): void => container.invalidate(),
       handleInput: (data: string): void => {
-        if (ui.saveControl && ui.saveControl.suspended === 0 && matchesCtrlS(host, data)) {
-          ui.saveControl.saveRequested = true;
+        // A held-key event that replays an action this transaction already
+        // performed is consumed by the shared fence BEFORE any action runs,
+        // so a held Escape cannot close this menu, then its parent, and then
+        // apply the staged draft at the root (issue #463).
+        if (consumeMenuActionFence(ui.saveControl, data)) return;
+        // A held key's release never replays an action.
+        if (isKeyRelease(data)) return;
+        const saveChord = ui.saveControl !== undefined
+          && ui.saveControl.suspended === 0
+          && matchesCtrlS(host, data);
+        // A held key's repeat never replays a save, a confirm, or a cancel;
+        // the SelectList's own navigation repeats stay ordinary navigation.
+        if (isKeyRepeat(data) && (saveChord || confirmMatch(data) || cancelMatch(data))) return;
+        if (saveChord) {
+          ui.saveControl!.saveRequested = true;
+          claimMenuAction(ui.saveControl, (event) => menuMatchesCtrlS(host, event));
           done(undefined);
           return;
+        }
+        // A confirm or a cancel claims the action so its held repeat and
+        // release cannot replay it in the parent menu.
+        if (confirmMatch(data)) {
+          claimMenuAction(ui.saveControl, confirmMatch);
+        } else if (cancelMatch(data)) {
+          claimMenuAction(ui.saveControl, cancelMatch);
         }
         selectList.handleInput(data);
         tui.requestRender?.();
@@ -366,6 +585,17 @@ function borderColor(theme: MenuTheme): (segment: string) => string {
     }
   };
 }
+
+/**
+ * Shared render helpers for the settings renderers (issue #463). The
+ * search-capable deny picker reuses these so its border, title, and list
+ * theme are byte-identical to the plain retained menus.
+ */
+export const menuRenderTheme = {
+  borderColor,
+  titleText,
+  selectListTheme,
+};
 
 function titleText(theme: MenuTheme, title: string): string {
   try {
@@ -420,6 +650,52 @@ function hintText(host: MenuTuiHost, saveHintAvailable: boolean, cancelHint = "c
 
 function saveIsRequested(control: SettingsSaveControl | undefined): boolean {
   return control?.saveRequested === true && control.suspended === 0;
+}
+
+/** True when a latched Ctrl+S save request must unwind this selector. */
+export function menuSaveIsRequested(control: SettingsSaveControl | undefined): boolean {
+  return saveIsRequested(control);
+}
+
+/** True when the host's Ctrl+S matcher recognizes the raw key data. */
+export function menuMatchesCtrlS(host: MenuTuiHost, data: string): boolean {
+  return matchesCtrlS(host, data);
+}
+
+/**
+ * The shared held-action fence of one settings transaction, created on first
+ * use. Every nested menu of the transaction resolves the SAME fence through
+ * the root-owned save control, so a claim made in a nested menu is still
+ * honored by its parent.
+ */
+export function menuActionFence(control: SettingsSaveControl | undefined): MenuActionFence | undefined {
+  if (!control) return undefined;
+  control.actionFence ??= createMenuActionFence();
+  return control.actionFence;
+}
+
+/**
+ * Claim a performed action on the transaction's shared fence, so its held
+ * repeat and release cannot replay it in a parent menu.
+ */
+export function claimMenuAction(
+  control: SettingsSaveControl | undefined,
+  matches: (data: string) => boolean,
+): void {
+  menuActionFence(control)?.claim(matches);
+}
+
+/**
+ * Consume a held-key event that replays an already-performed action.
+ * Returns true when the event was consumed by the fence.
+ */
+export function consumeMenuActionFence(
+  control: SettingsSaveControl | undefined,
+  data: string,
+): boolean {
+  const fence = control?.actionFence;
+  if (!fence) return false;
+  return fence.consume(data);
 }
 
 function matchesCtrlS(host: MenuTuiHost, data: string): boolean {

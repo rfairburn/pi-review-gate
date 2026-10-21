@@ -3,7 +3,7 @@ import { execFile, spawnSync } from "node:child_process";
 import { chmod, copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { after, before, test } from "node:test";
 import { extensionFromArgs, isCompiledExtension, writeFakeNpm, writeRequiredOutputs } from "./launcher-prepare-fixtures";
@@ -344,10 +344,7 @@ async function stageLauncherScripts(stage: string): Promise<void> {
 
 /** Copy the real shipped skills into a staged package tree. */
 async function stageShippedSkills(stage: string): Promise<void> {
-  await cp(resolve("skills"), join(stage, "skills"), {
-    recursive: true,
-    filter: (source) => basename(source) !== ".terraform",
-  });
+  await cp(resolve("skills"), join(stage, "skills"), { recursive: true });
 }
 
 interface LaunchCapture {

@@ -16,8 +16,8 @@
  *   are copied into a fresh private generation under the managed build cache.
  *   The live checkout's dist/ and node_modules/ are never read through, copied,
  *   written, or removed, so a running extension that uses them is unaffected.
- * - Copies are bounded (files, bytes, depth, elapsed time), reject symlinks and
- *   special files, and prune initialized `.terraform` trees before descent.
+ * - Copies are bounded (files, bytes, depth, elapsed time) and reject symlinks
+ *   and special files.
  * - Installation runs the locked dependency graph (`npm ci --include=dev
  *   --ignore-scripts`) with the staged install's own private npm cache, logs,
  *   temp, and home directories. The compiler is the staged install's own
@@ -345,8 +345,6 @@ function copySourceDirectory(source, destination, budget, depth, ownedStage) {
       const name = entry.name;
       budget.entries += 1;
       if (budget.entries > MAX_SOURCE_FILES) throw new Error("source copy entry limit exceeded");
-      // Prune initialized Terraform trees before lstat, alias checks, or descent.
-      if (name === ".terraform") continue;
       const sourceEntry = path.join(source, name);
       const destinationEntry = path.join(destination, name);
       const stats = fs.lstatSync(sourceEntry, { bigint: true });
@@ -372,9 +370,9 @@ function copySourceDirectory(source, destination, budget, depth, ownedStage) {
 
 /**
  * Stage only explicit build/runtime inputs into a fresh private root. Copies
- * are bounded and reject symlinks/special files; package-lock.json is copied
- * byte-for-byte, source .terraform directories are pruned before descent, and
- * the live checkout's node_modules/dist are never followed or copied.
+ * are bounded and reject symlinks/special files, package-lock.json is copied
+ * byte-for-byte, and the live checkout's node_modules/dist are never followed
+ * or copied.
  */
 function stageSourcePackage(packageRoot, buildCacheRoot, testHooks, warn = () => undefined, boundary) {
   const parentChain = ensureDirectoryTree(buildCacheRoot, boundary);

@@ -25,7 +25,7 @@ import {
   makeNativeAgentRoot,
   makeWorkspace,
   processIsAlive,
-  removeOwnedScratchTreePruningTerraform,
+  removeOwnedScratchTree,
   resolveRuntimePin,
   restoredNativeEditorFrame,
   sessionFileHasStoredName,
@@ -259,7 +259,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     // receipts exist; root creation alone never authorizes recursive removal.
     if (scratchOwned && assertionsCompleted && cleanupConfirmed) {
       try {
-        if (!removeOwnedScratchTreePruningTerraform(scratch)) {
+        if (!removeOwnedScratchTree(scratch)) {
           process.stderr.write(`preserved Main runtime witness (per-entry ownership receipts unavailable): ${scratch}\n`);
         }
       } catch {

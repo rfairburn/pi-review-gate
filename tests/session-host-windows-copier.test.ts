@@ -9,8 +9,8 @@ import { ensureIgnoredFixtureRoot } from "./helpers/ignored-fixture-root";
 // scripts/ci/session-host-windows-acceptance.cjs (copy-scripts): exclusive
 // create-new writes that preserve a replaced or prepopulated leaf, bounded
 // descriptor reads, finite file/directory/entry/depth/aggregate budgets,
-// symlink and non-regular refusal, .terraform pruning without traversal, and
-// retained partial output. Like the workflow contract tests, every synthetic
+// symlink and non-regular refusal, ordinary nested copy, and retained partial
+// output. Like the workflow contract tests, every synthetic
 // fixture is allocated under the ignored own-root node_modules subtree with
 // explicit names and retained: no default-temp allocation, no recursive
 // deletion, no cleanup at all.
@@ -94,29 +94,26 @@ test("copyFileBounded rejects zero-byte write progress and retains partial outpu
   assert.equal(readFileSync(source, "utf8"), "owned synthetic input");
 });
 
-test("copy-scripts copies a bounded tree and prunes .terraform before descent", () => {
+test("copy-scripts copies a bounded tree of ordinary files and directories", () => {
   const root = allocateFixtureRoot();
   const source = join(root, "source");
-  writeFileTree(source, {
+  const files = {
     "a.txt": "alpha",
     "nested/deep/b.txt": "beta",
     "empty.txt": "",
-    ".terraform/state.tf": "must not be copied",
-    "sub/.terraform/nested-state.tf": "also pruned",
-  });
-  // A symlink inside .terraform: if the copier ever descended into a pruned
-  // directory it would have to refuse this entry, so success proves pruning
-  // happens before descent.
-  symlinkSync(join(source, "a.txt"), join(source, ".terraform", "evil-link"));
+    "assets/entry.bin": "ordinary nested content",
+  };
+  writeFileTree(source, files);
   const dest = join(root, "dest");
   const result = runCopier(source, dest);
   assert.equal(result.code, 0, `the bounded copy must succeed: ${result.stderr}`);
   assert.equal(readFileSync(join(dest, "a.txt"), "utf8"), "alpha");
   assert.equal(readFileSync(join(dest, "nested", "deep", "b.txt"), "utf8"), "beta");
   assert.equal(readFileSync(join(dest, "empty.txt"), "utf8"), "");
-  assert.ok(!existsSync(join(dest, ".terraform")), "top-level .terraform must be pruned");
-  assert.ok(!existsSync(join(dest, "sub", ".terraform")), "nested .terraform must be pruned at every depth");
-  assert.match(result.stdout, /copied 3 scripts files \(3 directories, 9 bytes\)/,
+  assert.equal(readFileSync(join(dest, "assets", "entry.bin"), "utf8"), "ordinary nested content",
+    "a nested directory is copied with its ordinary content");
+  const bytes = Object.values(files).reduce((total, content) => total + Buffer.byteLength(content), 0);
+  assert.match(result.stdout, new RegExp(`copied 4 scripts files \\(3 directories, ${bytes} bytes\\)`),
     "the report must reflect exactly the copied files, directories, and bytes");
   // Retained fixtures: both trees remain under the ignored own-root subtree.
   assert.ok(existsSync(source) && existsSync(dest), "source and destination fixture trees must be retained");
@@ -546,7 +543,7 @@ test("copyFileBounded rejects growth immediately after the final source descript
   assert.ok(existsSync(join(dest, "source.txt")), "partial output must be retained");
 });
 
-test("copy-source copies only the exact production build inputs and prunes .terraform", () => {
+test("copy-source copies only the exact production build inputs", () => {
   const root = allocateFixtureRoot();
   const source = join(root, "package");
   writeFileTree(source, {
@@ -554,8 +551,7 @@ test("copy-source copies only the exact production build inputs and prunes .terr
     "package-lock.json": "{\"lockfileVersion\":3}",
     "tsconfig.json": "{}",
     "src/session-host/main.ts": "export {};",
-    "src/.terraform/state.tf": "must not be copied",
-    "src/nested/.terraform/other.tf": "also pruned",
+    "src/nested/deep/helper.ts": "export const helper = 1;",
     "scripts/pi-review-sessions.cjs": "// launcher",
     "skills/pi-review-gate-execution/SKILL.md": "# skill",
     "tests/should-not-copy.test.ts": "must not be copied",
@@ -564,21 +560,18 @@ test("copy-source copies only the exact production build inputs and prunes .terr
     ".git/config": "must not be copied",
     "private-notes.md": "must not be copied",
   });
-  // A symlink inside a pruned .terraform tree would be refused if the copier
-  // ever descended there, so success proves pruning happens before descent.
-  symlinkSync(join(source, "package.json"), join(source, "src", ".terraform", "evil-link"));
   const dest = join(root, "source-fixture");
   const result = runSourceCopier(source, dest);
   assert.equal(result.code, 0, `copy-source must succeed: ${result.stderr}`);
   for (const rel of ["package.json", "package-lock.json", "tsconfig.json",
-    "src/session-host/main.ts", "scripts/pi-review-sessions.cjs", "skills/pi-review-gate-execution/SKILL.md"]) {
+    "src/session-host/main.ts", "src/nested/deep/helper.ts",
+    "scripts/pi-review-sessions.cjs", "skills/pi-review-gate-execution/SKILL.md"]) {
     assert.ok(existsSync(join(dest, rel)), `the exact production build input must be copied: ${rel}`);
   }
-  for (const rel of ["tests", "dist", "node_modules", ".git", "private-notes.md",
-    "src/.terraform", "src/nested/.terraform"]) {
+  for (const rel of ["tests", "dist", "node_modules", ".git", "private-notes.md"]) {
     assert.ok(!existsSync(join(dest, rel)), `copy-source must never copy: ${rel}`);
   }
-  assert.match(result.stdout, /copied 6 source files \(\d+ directories, \d+ bytes\)/,
+  assert.match(result.stdout, /copied 7 source files \(\d+ directories, \d+ bytes\)/,
     "the report must reflect exactly the copied production inputs");
   assert.ok(existsSync(source) && existsSync(dest), "both fixture trees must be retained");
 });

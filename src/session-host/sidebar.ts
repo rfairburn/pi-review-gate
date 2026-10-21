@@ -473,6 +473,7 @@ interface DisplayedRoster {
   readonly cols: number;
   readonly rows: number;
   readonly focus: SidebarFocus;
+  readonly selectedKey: string | undefined;
 }
 
 /** One remote roster row exactly as the coordinator projected it (display only). */
@@ -2367,6 +2368,10 @@ export class SidebarController {
    * Activates the exact roster entry whose complete row/card was drawn at this
    * pane-relative coordinate. Main consumes all other gestures in the visible
    * pane; this method never derives row positions independently of rendering.
+   * While a right-hand host UI is open beside that written roster, a click on a
+   * different row closes the UI through its own cancellation route and then
+   * performs the clicked row's ordinary action once; a click on the
+   * currently highlighted row is a pure no-op.
    */
   activateRosterAt(column: number, row: number, cols: number, rows: number): boolean {
     return this.activateRosterAtFrom(this.displayedRoster, column, row, cols, rows, true);
@@ -2380,7 +2385,12 @@ export class SidebarController {
     rows: number,
     requireCurrentSignature: boolean,
   ): boolean {
-    if (!this._visible || (this._focus !== "main" && this._focus !== "sidebar")
+    // A right-hand host UI is only in play when it actually owns the wide
+    // layout's right pane slot; the written-roster proof below is what shows
+    // the clicked picker is the one on screen beside it.
+    const rightPaneOpen = this.rightHandPaneIsOpen();
+    if (!this._visible
+      || (this._focus !== "main" && this._focus !== "sidebar" && !rightPaneOpen)
       || !validHitGeometry(column, row, cols, rows)) return false;
     if (shown === undefined || (requireCurrentSignature
       && (shown.signature !== this.rosterSignature() || shown.focus !== this._focus))
@@ -2388,21 +2398,125 @@ export class SidebarController {
     const region = [...shown.regions.values()].find((candidate) => row >= candidate.row
       && row < candidate.row + candidate.height);
     if (region === undefined || region.height !== this.entryHeight(region.entry)) return false;
-    const current = this.entries.find((entry) => entry.key === region.entry.key);
-    if (current === undefined || !sameSidebarEntry(current, region.entry)) return false;
-    this.selectedEntryKey = current.key;
+    // The clicked target is the drawn entry's immutable key and activation
+    // identity — never a row index — so a later reorder, state change, or
+    // cancellation can only refuse it, never retarget it.
+    const clicked = region.entry;
+    let target = this.entries.find((entry) => entry.key === clicked.key);
+    if (target === undefined || !sameSidebarEntry(target, clicked)) return false;
+    if (rightPaneOpen) {
+      // Same-row semantics belong to the drawn highlight, not a newer backend
+      // selection. A stale captured presentation cannot cancel or swallow a click.
+      if (shown.selectedKey !== this.selectedEntryKey) return false;
+      // Clicking the row that already holds the LEFT highlight while a
+      // right-hand UI is open changes nothing at all: the pane, its draft,
+      // focus, selection, notices, and any pending operation stay exactly as
+      // they were, and no cancellation or activation action is emitted. The
+      // left highlight decides, not the native Main owner, an edit target, or
+      // whichever row originally opened the pane.
+      if (target.key === shown.selectedKey) return true;
+      // A different row first closes that UI through its own existing
+      // cancellation route, then performs the clicked row's ordinary action
+      // once. Nothing is confirmed, approved, denied, submitted, or deleted by
+      // the cancellation itself.
+      if (!this.cancelRightHandPaneForRosterClick()) return false;
+      // Re-prove the clicked target after the cancellation: a vanished or
+      // changed entry is refused silently, exactly as a stale draw already is.
+      target = this.entries.find((entry) => entry.key === clicked.key);
+      if (target === undefined || !sameSidebarEntry(target, clicked)) return false;
+    }
+    this.selectedEntryKey = target.key;
     this.desiredSelectionId = undefined;
     this.noticeError = undefined;
     // A mouse activation can originate while Main owns input. Exited-row
     // recovery is a sidebar-owned intent: move focus there before invoking the
     // existing resume guard so completeRowResume can validate the same request.
-    if (current.kind === "item" && current.item?.lifecycle === "exited"
-      && current.item.unavailable !== true && this.pendingRowResume === undefined
+    if (target.kind === "item" && target.item?.lifecycle === "exited"
+      && target.item.unavailable !== true && this.pendingRowResume === undefined
       && this._focus === "main") {
       this._focus = "sidebar";
     }
-    this.activateEntry(region.entry);
+    this.activateEntry(clicked);
     return true;
+  }
+
+  /**
+   * True only while a host UI occupies the wide layout's right-hand pane slot
+   * next to the still-visible roster: any host form, or exactly the
+   * confirmation the compositor places there (the same rule as the layout's
+   * form slot). Confirmations that replace the roster instead — Quit, stop or
+   * remove, peer remove and revoke — are never reported here, and the
+   * written-roster check in the activation path still refuses any frame whose
+   * roster was not actually drawn at this geometry.
+   */
+  private rightHandPaneIsOpen(): boolean {
+    if (!this._visible) return false;
+    if (this._focus === "form") return this.formKind !== undefined;
+    if (this._focus === "confirm") {
+      return this.savedDeleteConfirmationActive || this.peerConsentConfirmationActive;
+    }
+    return false;
+  }
+
+  /**
+   * Closes the whole right-hand host UI so a left-roster click can activate
+   * its own row against a closed pane. Every branch is the UI's own keyboard
+   * cancellation route minus the held-Escape claim, which is keyboard
+   * provenance only and is never set from a pointer gesture. Each route keeps
+   * its existing draft retention or discard semantics and clears its own
+   * pending UI ownership; nested UI is dismissed completely (the Saved-delete
+   * confirmation returns to its picker, then the picker's own dismissal closes
+   * the containing pane) so no hidden pane, query, or pending UI ownership
+   * survives. Backend work keeps its existing cancellation and request-id
+   * fences; dismissing a pane does not guarantee that a submitted operation
+   * stops. Returns false when the current focus holds no closable right-hand
+   * UI, in which case the click activates nothing.
+   */
+  private cancelRightHandPaneForRosterClick(): boolean {
+    if (this._focus === "confirm") {
+      if (this.confirmPurpose === "saved-delete") {
+        this.cancelSavedDeleteConfirmation();
+        this.dismissSavedPane();
+        return true;
+      }
+      // Only a dismissal, never a decision: the pending request stays in
+      // Main's snapshot and its alert band.
+      if (this.confirmPurpose === "peer-consent") {
+        this.dismissPeerConsentReview();
+        return true;
+      }
+      return false;
+    }
+    if (this._focus !== "form") return false;
+    switch (this.formKind) {
+      case "saved":
+        this.dismissSavedPane();
+        return true;
+      case "peer":
+        if (this.peerAddMenuOpen) this.closePeerAddMenu();
+        this.closePeerPane();
+        this._focus = "sidebar";
+        this.onInvalidate?.();
+        return true;
+      case "peer-field":
+        // The field editor returns to its Add menu/network pane; the whole
+        // containing pane closes after it, so nothing stays open underneath.
+        this.closePeerFieldForm();
+        if (this.peerAddMenuOpen) this.closePeerAddMenu();
+        this.closePeerPane();
+        this._focus = "sidebar";
+        this.onInvalidate?.();
+        return true;
+      case "new":
+      case "edit":
+      case "shortcuts":
+        this.abandonForm();
+        this._focus = "sidebar";
+        this.onInvalidate?.();
+        return true;
+      default:
+        return false;
+    }
   }
 
   /** Activates a fully drawn saved row in the currently owned Saved pane. */
@@ -4994,18 +5108,14 @@ export class SidebarController {
         : "Address and port are separate fields. \"*\" asks for one dual-stack listener (IPv4 and IPv6); \"0.0.0.0\" is IPv4 only. New hosts start with Hosting off. Edits stay local until Apply or Enable; no other address or port is substituted.",
     ], cols);
     const errorLines = this.formError === undefined ? [] : wrapHintLines([`! ${this.formError}`], cols);
-    // One editor holds one field: Enter saves that field to the local draft and
-    // goes back; there is no field cycling and no implicit submit of anything.
+    // One editor holds and shows only the chosen field: Enter saves that field
+    // to the local draft and goes back; there is no field cycling, no implicit
+    // submit of anything, and no read-only sibling rows beside the input.
     const hints = [`${this.formHints.submit} save`, `${this.formHints.cancel} cancel`];
     const footerLines = wrapHintLines(hints, cols);
     if (contextLines === undefined || errorLines === undefined || footerLines === undefined
       || visibleWidth(header) > cols) return this.renderTooSmall(cols, rows);
-    const inactive = addField === undefined
-      ? []
-      : (["label", "host", "port"] as const)
-        .filter((entry) => entry !== addField)
-        .map((entry) => ({ label: peerAddFieldLabel(entry), value: this.peerAddDraft[entry] }));
-    const fixedRows = 1 + contextLines.length + inactive.length + 1 + errorLines.length + footerLines.length;
+    const fixedRows = 1 + contextLines.length + 1 + errorLines.length + footerLines.length;
     const activeRows = rows - fixedRows;
     if (activeRows < 1) return this.renderTooSmall(cols, rows);
     const prefix = `> ${activeLabel}: `;
@@ -5016,12 +5126,6 @@ export class SidebarController {
 
     const lines = [wrapRow(header, cols, "\x1b[1m")];
     for (const line of contextLines) lines.push(wrapRow(line, cols));
-    for (const entry of inactive) {
-      lines.push(wrapRow(
-        `  ${entry.label}: ${sanitizeBounded(entry.value, PEER_ADDRESS_MAX_CODEPOINTS)}`,
-        cols,
-      ));
-    }
     const fieldTopRow = lines.length;
     const fieldRowCount = Math.min(activeRows, fieldFrame.lines.length);
     for (let index = 0; index < fieldRowCount; index += 1) {
@@ -5207,6 +5311,7 @@ export class SidebarController {
       cols,
       rows,
       focus: this._focus,
+      selectedKey: this.selectedEntryKey,
     };
     for (const noticeLine of noticeLines) {
       lines.push(wrapRow(noticeLine, cols));
@@ -5232,6 +5337,7 @@ export class SidebarController {
       cols,
       rows,
       focus: this._focus,
+      selectedKey: undefined,
     };
     const alert = this.renderPeerAlert(cols, rows);
     return alert.lines.length === 0 ? this.renderTooSmall(cols, rows) : { lines: alert.lines };

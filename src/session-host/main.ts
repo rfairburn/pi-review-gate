@@ -1896,17 +1896,20 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const pane = formPane ?? sidebarPane;
     if (pane !== undefined) {
       if (isMouseButtonPress(mouse) && buttonId !== undefined) hostMouseButtons.add(buttonId);
-      const savedDeleteDialogOwnsPointer = presentation?.focus === "confirm"
-        && presentation.layout.form !== undefined;
-      if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending
-        && !savedDeleteDialogOwnsPointer) {
+      if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending) {
         const previousFocus = sidebar.focus;
         const previousSelection = sidebar.selectedId;
         const previousVisibility = sidebar.visible;
+        // A host confirmation owns the pointer inside its own pane: while
+        // confirm focus the right-hand slot belongs to the dialog, so only the
+        // actually written left roster may act on a press. The Sidebar still
+        // refuses any click whose written frame drew no visible roster.
+        const confirmationOwnsRightPane = presentation.focus === "confirm";
         // Keep the emitted frame's source pane identity and its render-derived
         // maps: a newer coalesced render must never retarget this coordinate.
         const activated = formPane !== undefined
-          ? presentation.sidebar.activateSavedAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
+          ? !confirmationOwnsRightPane
+            && presentation.sidebar.activateSavedAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
           : hitLayout.sidebarOverlay && presentation.focus === "form"
             ? presentation.sidebar.activateSavedAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
             : presentation.sidebar.activateRosterAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows);

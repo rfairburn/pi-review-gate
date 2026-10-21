@@ -3909,6 +3909,16 @@ test("clicking an exited row from Main transfers only the recovery intent and ac
 test("wide equal-sized panes dispatch Saved hit tests only in the right form", async () => {
   const fixture = makeSavedMainFixture("mouse-pane-identity");
   const { overrides } = savedFixtureDependencies(fixture);
+  const plainRow = (frame: ComposedHostFrame | undefined, row: number): string =>
+    plainLine(frame, row).slice(0, 32);
+  const leftRow = (frame: ComposedHostFrame | undefined, text: string): number =>
+    frame?.lines.findIndex((line, row) => row >= 1
+      && line.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 32).includes(text)) ?? -1;
+  const rightRow = (frame: ComposedHostFrame | undefined, text: string): number =>
+    frame?.lines.findIndex((line, row) => row >= 1
+      && line.replace(/\x1b\[[0-9;]*m/g, "").slice(33).includes(text)) ?? -1;
+  const rightText = (frame: ComposedHostFrame | undefined): string =>
+    (frame?.lines.slice(1) ?? []).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33)).join("\n");
   try {
     const harness = createHarness({}, overrides);
     harness.terminal.columns = 65; // sidebar and Saved form are both exactly 32 columns
@@ -3922,19 +3932,53 @@ test("wide equal-sized panes dispatch Saved hit tests only in the right form", a
     await nextTurn();
     assert.equal(harness.sidebar?.focus, "form");
     const savedFrame = harness.writer.frames.at(-1)?.frame;
-    const savedRow = screenRowContaining(savedFrame, "First");
-    assert.ok(savedRow > 0);
+    const savedRow = rightRow(savedFrame, "First");
+    assert.ok(savedRow > 0, rightText(savedFrame));
     assert.equal(manager.createOptions.length, 0);
+    const sharedLeftRow = plainRow(savedFrame, savedRow).trim();
+    assert.ok(sharedLeftRow.includes("New session"),
+      `the first Saved result must share its row with another left roster entry: ${JSON.stringify(sharedLeftRow)}`);
 
-    // The left Saved action shares the first result's local row; pane identity
-    // must prevent it from hitting the right-hand Saved row's hit region.
+    // The left New row shares the first Saved result's local row. Pane
+    // identity must still prevent it from hitting the right-hand Saved row's
+    // hit region, and the click performs the LEFT row's own ordinary action:
+    // it cancels the open Saved picker first (#486), admits nothing, and then
+    // opens New exactly once.
     emitMouse(harness.terminal, 1, savedRow);
     emitMouse(harness.terminal, 1, savedRow, 0, "m");
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      if (rightText(harness.writer.frames.at(-1)?.frame).includes("Workspace")) break;
+    }
+    await nextTurn(); // the cancelling frame settles before the next host click
     assert.equal(manager.createOptions.length, 0, "left-pane rows cannot hit Saved rows in the right form");
-    assert.equal(harness.sidebar?.focus, "form");
+    assert.equal(harness.sidebar?.savedPickerRequestId, undefined,
+      "the left click cancelled the picker instead of activating the shared right-hand row");
+    assert.equal(harness.sidebar?.focus, "form", "the clicked left row opened its own ordinary form");
+    const cancelled = harness.writer.frames.at(-1)?.frame;
+    assert.ok(rightText(cancelled).includes("Workspace"), rightText(cancelled));
+    assert.equal(rightRow(cancelled, "Saved conversations"), -1,
+      "no hidden Saved picker survives in the right-hand pane");
 
-    emitMouse(harness.terminal, 34, savedRow); // the actual right-hand Saved row
-    emitMouse(harness.terminal, 34, savedRow, 0, "m");
+    // Reopen Saved from the newly written roster, await its listing, then
+    // click the actual right-hand Saved result at its own current row.
+    const reopenRow = leftRow(cancelled, "Saved conversations");
+    assert.ok(reopenRow > 0, JSON.stringify(cancelled?.lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "")) ?? []));
+    emitMouse(harness.terminal, 1, reopenRow);
+    emitMouse(harness.terminal, 1, reopenRow, 0, "m");
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      if (rightText(harness.writer.frames.at(-1)?.frame).includes("First")) break;
+    }
+    await nextTurn();
+    const reopened = harness.writer.frames.at(-1)?.frame;
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.ok(rightText(reopened).includes("Saved conversations"), rightText(reopened));
+    const reopenedSavedRow = rightRow(reopened, "First");
+    assert.ok(reopenedSavedRow > 0, rightText(reopened));
+
+    emitMouse(harness.terminal, 34, reopenedSavedRow); // the actual right-hand Saved row
+    emitMouse(harness.terminal, 34, reopenedSavedRow, 0, "m");
     await nextTurn();
     await nextTurn();
     assert.equal(manager.createOptions.length, 1);
@@ -5684,12 +5728,19 @@ test("confirmed Saved deletion uses shell-free trash fallback for only the displ
     assert.ok(leftSavedRow > 0 && plainLine(confirmationFrame, leftSavedRow).slice(0, 32).includes("Saved conversations"),
       "the visible left roster is present beside the right-pane confirmation");
     const writesBeforeDialogInput = manager.writes.length;
-    emitMouse(harness.terminal, 2, leftSavedRow); // dialog clicks cannot activate the left roster
+    // The click lands on the row that already holds the LEFT highlight while
+    // the confirmation is open: a pure no-op that keeps the dialog, its
+    // picker, and the query draft exactly as they were (#486). A different
+    // left row would cancel the UI first; a press inside the confirmation
+    // pane stays dialog-owned either way.
+    emitMouse(harness.terminal, 2, leftSavedRow);
     emitMouse(harness.terminal, 2, leftSavedRow, 0, "m");
     emitMouse(harness.terminal, 34, 1); // or the right/main confirmation pane
     emitMouse(harness.terminal, 34, 1, 0, "m");
     harness.terminal.emitInput("x"); // confirmation owns all keyboard input; arbitrary text is not forwarded
     assert.equal(harness.sidebar?.focus, "confirm");
+    assert.equal(harness.sidebar?.savedDeleteConfirmationActive, true,
+      "the same-row click keeps the confirmation open and confirmable");
     assert.equal(harness.sidebar?.savedPickerRequestId, pickerBeforeCancel);
     assert.equal(harness.sidebar?.savedQuery, savedQuery);
     assert.equal(manager.writes.length, writesBeforeDialogInput);
@@ -5751,6 +5802,147 @@ test("confirmed Saved deletion uses shell-free trash fallback for only the displ
   } finally {
     if (!closed) await closeWithSignal(harness).catch(() => undefined);
     rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a different left-roster row cancels the open Saved-delete confirmation and its picker without deleting", async () => {
+  const fixture = makeSavedMainFixture("left-click-cancel");
+  writeFileSync(join(fixture.agentDir, "keybindings.json"), JSON.stringify({ "app.session.delete": "ctrl+x" }), "utf8");
+  const { overrides } = savedFixtureDependencies(fixture);
+  const trashCalls: Array<{ command: string; args: readonly string[] }> = [];
+  const trashFailure = ((command: string, args: readonly string[]) => {
+    trashCalls.push({ command, args: [...args] });
+    return { pid: 13, output: [null, "", "trash unavailable"], stdout: "", stderr: "trash unavailable", status: 1, signal: null };
+  }) as NonNullable<SavedSessionDeletionOptions["spawnSync"]>;
+  const harness = createHarness({}, {
+    ...overrides,
+    deleteSavedFile: (file, options) => deleteSavedSessionFile(file, { ...options, spawnSync: trashFailure }),
+  });
+  let closed = false;
+  try {
+    const manager = await ready(harness);
+    openSavedPicker(harness.terminal); // the Saved row takes the left highlight
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      if (plain(harness.writer.frames.at(-1)?.frame).includes("First conversation left-click-cancel")) break;
+    }
+    assert.equal(harness.sidebar?.focus, "form");
+    const pickerBefore = harness.sidebar?.savedPickerRequestId;
+    assert.ok(pickerBefore !== undefined, "the picker owns its own id");
+    harness.terminal.emitInput("\x18"); // user-configured Saved delete action
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "confirm");
+    const confirmationFrame = harness.writer.frames.at(-1)!.frame;
+    assertSavedDeleteConfirmationRightPanel(confirmationFrame, fixture.file);
+    const leftNewRow = screenRowContaining(confirmationFrame, "New session");
+    const confirmationRow = screenRowContaining(confirmationFrame, "Delete saved conversation?");
+    assert.ok(leftNewRow > 0, "the visible left roster is present beside the right-pane confirmation");
+    assert.ok(confirmationRow > 0);
+    const writesBefore = manager.writes.length;
+    const resizeBefore = manager.resizeCalls.length;
+
+    // Pointer ownership and the dialog's own pane stay inert.
+    emitMouse(harness.terminal, 2, leftNewRow, 0, "m"); // release without its press
+    emitMouse(harness.terminal, 2, leftNewRow, 32); // drag motion across the row
+    emitMouse(harness.terminal, 2, leftNewRow, 2); // right-button press
+    emitMouse(harness.terminal, 34, confirmationRow); // a press inside the confirmation
+    emitMouse(harness.terminal, 34, confirmationRow, 0, "m");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "confirm", "only a left press on another written row acts");
+    assert.equal(harness.sidebar?.savedPickerRequestId, pickerBefore);
+    assert.equal(harness.sidebar?.savedDeleteConfirmationActive, true);
+    assert.deepEqual(trashCalls, [], "no mutation process starts before confirmation");
+    assert.equal(existsSync(fixture.file), true);
+
+    // A different left row closes the confirmation AND its picker, then
+    // performs the clicked row's ordinary action once.
+    emitMouse(harness.terminal, 2, leftNewRow);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      if (plain(harness.writer.frames.at(-1)?.frame).includes("Workspace")) break;
+    }
+    assert.equal(harness.sidebar?.focus, "form", "the clicked New row opened its ordinary form");
+    assert.equal(harness.sidebar?.savedDeleteConfirmationActive, false, "the confirmation closed");
+    assert.equal(harness.sidebar?.savedPickerRequestId, undefined, "its picker closed with it");
+    assert.equal(harness.sidebar?.savedQuery, "", "the dismissed picker keeps no query ownership");
+    const after = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(after.includes("Workspace"), after);
+    assert.equal(after.includes("Delete saved conversation?"), false, "the confirmation cannot resurrect itself");
+    assert.deepEqual(trashCalls, [], "a pointer gesture never confirms a deletion");
+    assert.equal(existsSync(fixture.file), true, "the saved file is untouched");
+    assert.equal(manager.createOptions.length, 0, "cancelling and re-activating starts no child");
+    assert.equal(manager.writes.length, writesBefore, "no mouse packet reaches the native child");
+    assert.equal(manager.resizeCalls.length, resizeBefore, "no native child is resized");
+    assert.equal(await closeWithSignal(harness), 0);
+    closed = true;
+  } finally {
+    if (!closed) await closeWithSignal(harness).catch(() => undefined);
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a left-roster click beside the live network pane closes it and decides nothing", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const plainRow = (frame: ComposedHostFrame, row: number): string =>
+    frame.lines[row]?.replace(/\x1b\[[0-9;]*m/g, "") ?? "";
+  const leftRow = (frame: ComposedHostFrame, text: string): number =>
+    frame.lines.findIndex((line, row) => row >= 1 && line.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 32).includes(text));
+  const rightText = (frame: ComposedHostFrame): string =>
+    frame.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33)).join("\n");
+  try {
+    assert.ok(harness.manager !== undefined, "Main created its single session manager");
+    const manager = harness.manager!;
+    fillForm(harness.terminal, "/left-click-network");
+    await nextTurn();
+    const ownerBefore = harness.sidebar?.activeMainOwnerID;
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    await activateRosterRow(harness, "Network");
+    assert.equal(harness.sidebar?.focus, "form", "the Network pane owns the right-hand slot");
+    const networkFrame = harness.writer.frames.at(-1)!.frame;
+    assert.ok(rightText(networkFrame).includes("Network"), rightText(networkFrame));
+    const writesBefore = manager.writes.length;
+    const createsBefore = manager.createOptions.length;
+    const commandsBefore = peer.commands.length;
+
+    // The highlighted Network row is a pure no-op while its own pane is open.
+    emitMouse(harness.terminal, 2, leftRow(networkFrame, "Network"));
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form", "the highlighted row keeps the pane open");
+    assert.equal(peer.commands.length, commandsBefore, "the no-op sends nothing");
+    assert.ok(rightText(harness.writer.frames.at(-1)!.frame).includes("Network"));
+
+    // A different left row closes the whole pane first, then acts normally.
+    emitMouse(harness.terminal, 2, leftRow(networkFrame, "New session"));
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      const frame = harness.writer.frames.at(-1);
+      if (frame !== undefined && rightText(frame.frame).includes("Workspace")) break;
+    }
+    const closedFrame = harness.writer.frames.at(-1)!.frame;
+    assert.equal(harness.sidebar?.focus, "form", "the clicked New row opened its ordinary form");
+    assert.ok(rightText(closedFrame).includes("Workspace"), rightText(closedFrame));
+    assert.equal(rightText(closedFrame).includes("Network"), false, "the network pane is really closed");
+    assert.equal(peer.commands.length, commandsBefore, "closing the network pane sends no command");
+    assert.equal(manager.createOptions.length, createsBefore, "no destination or session was added");
+    assert.equal(manager.writes.length, writesBefore, "no mouse packet reaches the native child");
+    assert.equal(harness.sidebar?.activeMainOwnerID, ownerBefore, "the native Main owner is unchanged");
+    assert.ok(plainRow(closedFrame, leftRow(closedFrame, "Network")).slice(0, 32).includes("Network"),
+      "the Network row is still drawn for a later deliberate visit");
+
+    // Its own row performs its ordinary action again afterwards.
+    emitMouse(harness.terminal, 2, leftRow(closedFrame, "Network"));
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      const frame = harness.writer.frames.at(-1);
+      if (frame !== undefined && rightText(frame.frame).includes("Network")) break;
+    }
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.ok(rightText(harness.writer.frames.at(-1)!.frame).includes("Network"),
+      "the clicked row reopens its ordinary pane");
+    assert.equal(peer.commands.length, commandsBefore, "reopening the pane sends nothing either");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
   }
 });
 

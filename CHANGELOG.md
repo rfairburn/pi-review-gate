@@ -129,6 +129,18 @@ dates.
   stays a disposable view of those facts, and delegated children gain no new
   session-creation authority. No behavior, protocol, control, or setting changes. See
   [One owning host, one session manager](docs/session-host-alpha.md#one-owning-host-one-session-manager).
+- Left roster rows stay clickable while a right-hand host UI is open beside them (#486).
+  A click on a different left row first closes that UI through its own existing
+  cancellation route — including the nested Saved-delete confirmation together with its
+  picker, so no hidden pane or pending UI ownership survives — and then performs the
+  clicked row's ordinary action exactly once, without confirming, approving, submitting,
+  or deleting anything. Backend work keeps its existing cancellation and request-id
+  fences; dismissing a pane does not guarantee that an operation already submitted to
+  Main stops. A click on the row that already holds the left highlight is a pure no-op that
+  preserves the open pane, its draft, focus, notices, and pending work. Only the roster
+  actually drawn in the written frame authorizes the click, and no keyboard, consent,
+  confirmation, or native-input ownership fence changes. See
+  [Focus, display, and status](docs/session-host-alpha.md#focus-display-and-status).
 ## [0.1.0-dev.190]
 
 ### Changed

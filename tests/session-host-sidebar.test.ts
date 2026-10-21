@@ -308,6 +308,257 @@ test("draw-derived action-row mouse activation reuses New and Quit behavior", ()
   assert.deepEqual(quitAction.focusedActions(), []);
 });
 
+/**
+ * Draws the wide two-pane frame exactly as Main does — the left roster beside
+ * the right-hand host UI — and returns the plain roster rows with the geometry
+ * that written frame authorizes.
+ */
+function widePanes(harness: Harness, rows = 24): { roster: string[]; rows: number } {
+  const roster = assertPaneSafe(harness.controller.renderRoster(32, rows).lines, 32, rows);
+  void harness.controller.renderForm(47, rows);
+  return { roster, rows };
+}
+
+/** The written roster row that begins the entry containing `text`. */
+function wideRosterRow(roster: readonly string[], text: string): number {
+  const row = roster.findIndex((line) => line.includes(text));
+  assert.ok(row > 0, `the written roster drew no ${JSON.stringify(text)} row: ${JSON.stringify(roster)}`);
+  return row;
+}
+
+/** Plain text of the right-hand pane at the wide geometry. */
+function wideFormText(harness: Harness, rows = 24): string {
+  return assertPaneSafe(harness.controller.renderForm(47, rows).lines, 47, rows).join("\n");
+}
+
+test("a left-roster click beside an open right-hand UI cancels it and activates the clicked row once", () => {
+  // New session with a dirty draft: a different row abandons the form through
+  // its own cancellation route and then performs only the clicked row's action.
+  const newForm = makeRoster(["a"]);
+  newForm.send(ENTER); // the default New row opens its form; the highlight stays on New
+  assert.equal(newForm.controller.focus, "form");
+  newForm.send("/dirty-draft");
+  newForm.baseline = newForm.actions.length;
+  const newView = widePanes(newForm);
+  assert.equal(newForm.controller.activateRosterAt(1, wideRosterRow(newView.roster, "label-a"), 32, newView.rows), true);
+  assert.equal(newForm.controller.focus, "main");
+  assert.deepEqual(newForm.focusedActions(), [{ type: "select", id: "a" }],
+    "the click cancels the form and performs the clicked row's ordinary action exactly once");
+  const reopened = widePanes(newForm);
+  assert.equal(newForm.controller.activateRosterAt(1, wideRosterRow(reopened.roster, "New session"), 32, reopened.rows), true);
+  assert.equal(newForm.controller.focus, "form");
+  assert.ok(wideFormText(newForm).includes("/dirty-draft"), "the abandoned New draft keeps its existing retention");
+  assert.deepEqual(newForm.focusedActions().filter((action) => action.type === "create"), [],
+    "cancelling a form never submits it");
+
+  // A click on the row that already holds the left highlight is a pure no-op:
+  // right pane, dirty draft, focus, selection, and actions all unchanged.
+  const same = makeRoster(["a"]);
+  same.send(ENTER);
+  same.send("/keep-me");
+  same.baseline = same.actions.length;
+  const sameView = widePanes(same);
+  assert.equal(same.controller.activateRosterAt(1, wideRosterRow(sameView.roster, "New session"), 32, sameView.rows), true);
+  assert.deepEqual(same.focusedActions(), [], "the highlighted row neither cancels nor re-activates");
+  assert.equal(same.controller.focus, "form", "the right-hand form stays open");
+  assert.ok(wideFormText(same).includes("/keep-me"), "the dirty draft survives the same-row click");
+
+  // Saved picker: a different row runs the picker's own dismissal first, then
+  // activates the clicked row; the same row keeps the picker open untouched.
+  const saved = savedPaneWith(["a"]);
+  const list = saved.actions.at(-1);
+  assert.ok(list !== undefined && list.type === "saved-list");
+  saved.controller.completeSavedList(list.requestId, [...SAVED_ROWS], 0);
+  saved.baseline = saved.actions.length;
+  const savedView = widePanes(saved);
+  assert.equal(saved.controller.activateRosterAt(1, wideRosterRow(savedView.roster, "label-a"), 32, savedView.rows), true);
+  assert.equal(saved.controller.focus, "main");
+  assert.deepEqual(saved.focusedActions(), [
+    { type: "saved-dismiss", pickerId: list.requestId },
+    { type: "select", id: "a" },
+  ], "the picker's own dismissal runs first, then the clicked row acts once");
+  assert.equal(saved.controller.savedPickerRequestId, undefined, "the dismissed picker owns nothing afterwards");
+
+  const savedSame = savedPaneWith(["a"]);
+  const savedSameList = savedSame.actions.at(-1);
+  assert.ok(savedSameList !== undefined && savedSameList.type === "saved-list");
+  savedSame.controller.completeSavedList(savedSameList.requestId, [...SAVED_ROWS], 0);
+  savedSame.baseline = savedSame.actions.length;
+  const savedSameView = widePanes(savedSame);
+  assert.equal(savedSame.controller.activateRosterAt(
+    1, wideRosterRow(savedSameView.roster, "Saved conversations"), 32, savedSameView.rows), true);
+  assert.deepEqual(savedSame.focusedActions(), [], "a click on the highlighted Saved row emits nothing");
+  assert.equal(savedSame.controller.focus, "form", "the picker stays open under the same-row click");
+  assert.equal(savedSame.controller.savedPickerRequestId, savedSameList.requestId, "the same picker is retained");
+
+  // Host shortcuts: a different row closes the editor through its own cancel
+  // route without saving anything, and the clicked row acts normally.
+  const shortcuts = makeRoster(["a"], { settingsAvailable: true });
+  const shortcutsRoster = assertPaneSafe(shortcuts.controller.renderRoster(32, 24).lines, 32, 24);
+  assert.equal(shortcuts.controller.activateRosterAt(1, wideRosterRow(shortcutsRoster, "Host shortcuts"), 32, 24), true);
+  assert.equal(shortcuts.controller.focus, "form");
+  shortcuts.baseline = shortcuts.actions.length;
+  const shortcutView = widePanes(shortcuts);
+  assert.equal(shortcuts.controller.activateRosterAt(1, wideRosterRow(shortcutView.roster, "label-a"), 32, shortcutView.rows), true);
+  assert.equal(shortcuts.controller.focus, "main");
+  assert.deepEqual(shortcuts.focusedActions(), [{ type: "select", id: "a" }],
+    "the shortcuts editor closes through its cancel route and never saves");
+  const closedShortcuts = wideFormText(shortcuts);
+  assert.equal(closedShortcuts.includes("Host shortcuts"), false,
+    "no hidden shortcuts editor survives the click");
+});
+
+test("a left-roster click cancels nested and divergent right-hand UI without deciding anything", () => {
+  // Nested Saved delete over its picker: the click dismisses BOTH the
+  // confirmation and the picker with their existing routes and never deletes.
+  const nested = savedPaneWith(["a"]);
+  const nestedList = nested.actions.at(-1);
+  assert.ok(nestedList !== undefined && nestedList.type === "saved-list");
+  nested.controller.completeSavedList(nestedList.requestId, [...SAVED_ROWS], 0);
+  savedView(nested, 40, 16);
+  nested.send("\x04"); // native default app.session.delete
+  const prepare = nested.actions.at(-1);
+  assert.ok(prepare !== undefined && prepare.type === "saved-delete-prepare");
+  assert.equal(nested.controller.completeSavedDeleteCheck(prepare.requestId, true), true);
+  assert.equal(nested.controller.focus, "confirm");
+  nested.baseline = nested.actions.length;
+  const nestedRoster = assertPaneSafe(nested.controller.renderRoster(32, 20).lines, 32, 20);
+  void nested.controller.renderSavedDeleteConfirmation(47, 20);
+  assert.equal(nested.controller.activateRosterAt(1, wideRosterRow(nestedRoster, "label-a"), 32, 20), true);
+  assert.equal(nested.controller.focus, "main");
+  assert.deepEqual(nested.focusedActions(), [
+    { type: "saved-dismiss", pickerId: nestedList.requestId },
+    { type: "select", id: "a" },
+  ], "the confirmation and its containing picker both close, then the clicked row acts once");
+  assert.equal(nested.actions.some((action) => action.type === "saved-delete"), false,
+    "a pointer gesture never confirms a deletion");
+  assert.equal(nested.controller.savedDeleteConfirmationActive, false);
+  assert.equal(nested.controller.savedPickerRequestId, undefined, "no hidden picker state survives the click");
+  assert.deepEqual(nested.controller.renderSavedDeleteConfirmation(47, 20).lines, [],
+    "the closed confirmation cannot resurrect itself in the right-hand slot");
+
+  // Edit whose target is NOT the left highlight: the left selection decides.
+  const tupleA = { sessionId: "session-a", epoch: 7, name: "Left card" };
+  const tupleB = { sessionId: "session-b", epoch: 8, name: "Edited card" };
+  const edit = makeRoster(["a", "b"]);
+  edit.controller.updateItems([
+    makeItem({ id: "a", nativeSession: tupleA }),
+    makeItem({ id: "b", nativeSession: tupleB }),
+  ]);
+  assert.equal(edit.controller.openEdit({ id: "b", nativeSession: tupleB, currentName: tupleB.name }), true);
+  assert.equal(edit.controller.selectedId, undefined, "the Edit target is not the left highlight");
+  edit.baseline = edit.actions.length;
+  const editView = widePanes(edit);
+  assert.equal(edit.controller.activateRosterAt(1, wideRosterRow(editView.roster, "New session"), 32, editView.rows), true);
+  assert.deepEqual(edit.focusedActions(), [], "the highlighted row is a pure no-op even when the pane targets another row");
+  assert.equal(edit.controller.focus, "form", "the Edit form stays open under the same-row click");
+  assert.ok(wideFormText(edit).includes("New name:"), "the open Edit form is preserved");
+  const editAgain = widePanes(edit);
+  assert.equal(edit.controller.activateRosterAt(1, wideRosterRow(editAgain.roster, "Left card"), 32, editAgain.rows), true);
+  assert.equal(edit.controller.focus, "main");
+  assert.deepEqual(edit.focusedActions(), [{ type: "select", id: "a" }],
+    "a different row abandons the Edit and activates the clicked row once");
+  assert.equal(edit.actions.some((action) => action.type === "rename"), false,
+    "a pointer gesture never submits a rename");
+  assert.equal(wideFormText(edit).includes("New name:"), false, "no hidden Edit form survives the click");
+
+  // The native Main owner never decides "same": with a live owner elsewhere,
+  // the highlighted row is still a no-op and another row still acts.
+  const owner = makeRoster(["a", "b"]);
+  owner.controller.setActiveMainOwner("a");
+  owner.send(ENTER); // New form opens while owner A keeps native input
+  assert.equal(owner.controller.focus, "form");
+  assert.equal(owner.controller.activeMainOwnerID, "a", "the native owner differs from the highlighted New row");
+  owner.baseline = owner.actions.length;
+  const ownerView = widePanes(owner);
+  assert.equal(owner.controller.activateRosterAt(1, wideRosterRow(ownerView.roster, "New session"), 32, ownerView.rows), true);
+  assert.deepEqual(owner.focusedActions(), [], "a divergent native owner does not turn the highlighted row into an action");
+  assert.equal(owner.controller.focus, "form");
+  const ownerAgain = widePanes(owner);
+  assert.equal(owner.controller.activateRosterAt(1, wideRosterRow(ownerAgain.roster, "label-b"), 32, ownerAgain.rows), true);
+  assert.deepEqual(owner.focusedActions(), [{ type: "select", id: "b" }]);
+  assert.equal(owner.controller.activeMainOwnerID, "a", "the click only selects; Main reassigns ownership on completion");
+
+  // A changed row identity is refused silently, exactly like any stale draw:
+  // nothing is cancelled and the open pane keeps its own state.
+  const stale = savedPaneWith(["a", "b"]);
+  const staleList = stale.actions.at(-1);
+  assert.ok(staleList !== undefined && staleList.type === "saved-list");
+  stale.controller.completeSavedList(staleList.requestId, [...SAVED_ROWS], 0);
+  stale.baseline = stale.actions.length;
+  const staleView = widePanes(stale);
+  const staleRow = wideRosterRow(staleView.roster, "label-b");
+  stale.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "b", lifecycle: "exited" })]);
+  assert.equal(stale.controller.activateRosterAt(1, staleRow, 32, staleView.rows), false,
+    "a row whose activation identity changed after the draw is refused");
+  assert.deepEqual(stale.focusedActions(), [], "a refused click cancels nothing");
+  assert.equal(stale.controller.focus, "form", "the open picker is left to its own rules");
+  assert.equal(stale.controller.savedPickerRequestId, staleList.requestId);
+
+  // Only the roster actually written at this geometry authorizes the click.
+  const unwritten = savedPaneWith(["a"]);
+  const unwrittenList = unwritten.actions.at(-1);
+  assert.ok(unwrittenList !== undefined && unwrittenList.type === "saved-list");
+  unwritten.controller.completeSavedList(unwrittenList.requestId, [...SAVED_ROWS], 0);
+  unwritten.baseline = unwritten.actions.length;
+  const unwrittenView = widePanes(unwritten);
+  const unwrittenRow = wideRosterRow(unwrittenView.roster, "label-a");
+  assert.equal(unwritten.controller.activateRosterAt(1, unwrittenRow, 40, 30), false,
+    "a click at another pane geometry matches no written region");
+  void unwritten.controller.render(40, 16); // the narrow full-pane render replaces the roster
+  assert.equal(unwritten.controller.activateRosterAt(1, unwrittenRow, 32, unwrittenView.rows), false,
+    "a roster that is not actually on screen authorizes nothing");
+  assert.deepEqual(unwritten.focusedActions(), [], "neither refused click cancels the open picker");
+  assert.equal(unwritten.controller.savedPickerRequestId, unwrittenList.requestId);
+
+  // With no right-hand UI open, the ordinary row action is unchanged: even a
+  // click on the highlighted row performs its normal action.
+  const plainRoster = makeRoster(["a"]);
+  plainRoster.baseline = plainRoster.actions.length;
+  const plainView = assertPaneSafe(plainRoster.controller.renderRoster(32, 24).lines, 32, 24);
+  assert.equal(plainRoster.controller.activateRosterAt(1, wideRosterRow(plainView, "New session"), 32, 24), true);
+  assert.equal(plainRoster.controller.focus, "form",
+    "the no-op applies only while a right-hand UI is open");
+});
+
+for (const clicked of ["drawn-highlight", "live-highlight"] as const) {
+  test(`a captured right-pane roster refuses a changed drawn selection (${clicked})`, () => {
+    const harness = savedPaneWith(["a", "b"]);
+    const list = harness.actions.at(-1);
+    assert.ok(list !== undefined && list.type === "saved-list");
+    harness.controller.completeSavedList(list.requestId, [...SAVED_ROWS], 0);
+    const written = widePanes(harness);
+    const capture = harness.controller.captureMousePresentation();
+    const savedRow = wideRosterRow(written.roster, "Saved conversations");
+    const localRow = wideRosterRow(written.roster, "label-a");
+    harness.baseline = harness.actions.length;
+
+    // Exercise the controller's backend-selection seam directly: current Main
+    // does not wire a selection-only change while this picker remains open.
+    harness.controller.select("a");
+    assert.equal(harness.controller.focus, "form");
+    assert.equal(harness.controller.selectedId, "a");
+    const row = clicked === "drawn-highlight" ? savedRow : localRow;
+    assert.equal(capture.activateRosterAt(1, row, 32, written.rows), false,
+      "an old drawn highlight cannot be reinterpreted as cancellation or a no-op");
+    assert.deepEqual(harness.focusedActions(), [], "the stale click cancels and activates nothing");
+    assert.equal(harness.controller.savedPickerRequestId, list.requestId);
+
+    const current = widePanes(harness);
+    const fresh = harness.controller.captureMousePresentation();
+    assert.equal(capture.activateRosterAt(1, row, 32, written.rows), false,
+      "another render cannot update the immutable old presentation's highlight");
+    assert.equal(fresh.activateRosterAt(1, wideRosterRow(current.roster, "label-a"), 32, current.rows), true);
+    assert.deepEqual(harness.focusedActions(), [], "the newly drawn highlight is now a genuine no-op");
+    assert.equal(harness.controller.savedPickerRequestId, list.requestId);
+    assert.equal(fresh.activateRosterAt(1, wideRosterRow(current.roster, "label-b"), 32, current.rows), true);
+    assert.deepEqual(harness.focusedActions(), [
+      { type: "saved-dismiss", pickerId: list.requestId },
+      { type: "select", id: "b" },
+    ], "a different row in the fresh presentation retains ordinary cancel-and-activate behavior");
+  });
+}
+
 test("initialVisible is honored in both directions", () => {
   const hidden = makeController({ initialVisible: false });
   assert.equal(hidden.controller.visible, false);

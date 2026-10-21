@@ -698,8 +698,9 @@ test("each Add field stores only a local draft, in any order, and one Add emits 
   assert.equal(harness.controller.focus, "form");
   const editor = peerPaneText(harness);
   assert.ok(editor.some((line) => line.startsWith("> Host:")), "the editor holds exactly the chosen field");
-  assert.ok(editor.some((line) => line.includes("Destination name:"))
-    && editor.some((line) => line.includes("Port:")), "the other draft values stay visible as data");
+  assert.ok(!editor.some((line) => line.includes("Destination name:"))
+    && !editor.some((line) => line.includes("Port:")),
+    "the editor renders only the chosen field; its sibling drafts stay on the menu");
   assert.ok(!editor.some((line) => line.includes("tab next field")), "the editor offers no field cycling");
   submitField(harness, "10.1.2.3");
   assert.equal(harness.controller.focus, "form", "a saved field returns to the Add menu");
@@ -756,6 +757,104 @@ test("each Add field stores only a local draft, in any order, and one Add emits 
     && again.some((line) => line.includes("Port: (not set)")), "the sent draft is cleared");
   assert.deepEqual(harness.commands(), []);
 });
+
+/** Asserts the Add menu still shows all three stored draft values. */
+function assertAddDraftRows(menu: readonly string[]): void {
+  assert.ok(menu.some((line) => line.includes("Name: studio-mac (enter to edit)")),
+    "the stored name is still on the menu");
+  assert.ok(menu.some((line) => line.includes("Host: 10.1.2.3 (enter to edit)")),
+    "the stored host is still on the menu");
+  assert.ok(menu.some((line) => line.includes("Port: 7000 (enter to edit)")),
+    "the stored port is still on the menu");
+}
+
+/** Fills a complete, distinct Name/Host/Port draft through the real menu and editors. */
+function seedFullAddDraft(harness: Harness): void {
+  openNetworkPane(harness);
+  openAddMenu(harness);
+  focusPeerEntry(harness, "Name:");
+  harness.send(ENTER);
+  submitField(harness, "studio-mac");
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER);
+  submitField(harness, "10.1.2.3");
+  focusPeerEntry(harness, "Port:");
+  harness.send(ENTER);
+  submitField(harness, "7000");
+  assert.deepEqual(harness.commands(), [], "seeding three draft values emits nothing");
+  harness.baseline = harness.actions.length;
+}
+
+const SELECTED_ADD_FIELDS = [
+  {
+    menuRow: "Name:",
+    label: "Destination name",
+    value: "studio-mac",
+    siblings: [{ label: "Host", value: "10.1.2.3" }, { label: "Port", value: "7000" }],
+  },
+  {
+    menuRow: "Host:",
+    label: "Host",
+    value: "10.1.2.3",
+    siblings: [{ label: "Destination name", value: "studio-mac" }, { label: "Port", value: "7000" }],
+  },
+  {
+    menuRow: "Port:",
+    label: "Port",
+    value: "7000",
+    siblings: [{ label: "Destination name", value: "studio-mac" }, { label: "Host", value: "10.1.2.3" }],
+  },
+] as const;
+
+for (const selected of SELECTED_ADD_FIELDS) {
+  test(`choosing ${selected.label} renders only that Add field and keeps the other drafts on the menu`, () => {
+    const harness = makeHarness(makeSnapshot());
+    seedFullAddDraft(harness);
+
+    focusPeerEntry(harness, selected.menuRow);
+    harness.send(ENTER);
+    assert.equal(harness.controller.focus, "form", "the chosen field opened its own editor");
+    const frame = harness.controller.renderForm(70, 26);
+    const editor = assertPaneSafe(frame.lines, 70, 26);
+    assert.ok(frame.cursor, "the Add editor exposes its actual input cursor");
+    const inputRow = editor[frame.cursor.row]?.trim();
+    assert.equal(inputRow, selected.value,
+      "the actual input row, not its border or help text, holds the selected draft value");
+    assert.ok(editor.some((line) => line.startsWith(`> ${selected.label}:`)),
+      "the selected field is the labelled active input");
+    for (const sibling of selected.siblings) {
+      assert.ok(!editor.some((line) => line.includes(`${sibling.label}:`)),
+        `the unselected ${sibling.label} field renders no read-only row in this editor`);
+      assert.ok(!editor.join(" ").includes(sibling.value),
+        `the unselected ${sibling.label} draft value stays out of this editor`);
+    }
+    assert.deepEqual(harness.commands(), [], "opening and reading one Add editor sends nothing");
+
+    // Escape closes the editor and the menu still carries all three drafts.
+    harness.send(ESC);
+    assert.ok(peerPaneText(harness).some((line) => line.includes("Add destination (enter to add)")),
+      "Escape returns from the editor to the Add menu");
+    assertAddDraftRows(peerPaneText(harness));
+    assert.deepEqual(harness.commands(), [], "Escape from an Add editor emits nothing");
+
+    // Enter saves the unchanged value, returns the same way, and still emits nothing.
+    focusPeerEntry(harness, selected.menuRow);
+    harness.send(ENTER);
+    harness.send(ENTER);
+    assert.equal(harness.controller.focus, "form", "Enter returns from the editor to the Add menu");
+    assert.ok(peerPaneText(harness).some((line) => line.includes("Add destination (enter to add)")),
+      "Enter on an unchanged field lands on the menu, not on another field");
+    assertAddDraftRows(peerPaneText(harness));
+    assert.deepEqual(harness.commands(), [], "a saved field emits no command");
+
+    // The single unchanged Add action still sends the whole draft exactly once.
+    focusPeerEntry(harness, "enter to add");
+    harness.send(ENTER);
+    assert.deepEqual(harness.commands(), [
+      { type: "peer-add", label: "studio-mac", host: "10.1.2.3", port: "7000" },
+    ], "the final Add payload is unchanged by selected-only rendering");
+  });
+}
 
 test("Escape abandons only the current Add edit and Escape in the menu adds nothing", () => {
   const harness = makeHarness(makeSnapshot());
@@ -1655,4 +1754,115 @@ test("without a pending request the short roster keeps the legacy too-small mess
   assert.ok(!lines.join(" ").includes("Incoming connection request"));
   harness.send(ENTER);
   assert.deepEqual(harness.commands(), []);
+});
+
+// ---------------------------------------------------------------------------
+// Left-roster clicks while the right-hand network UI owns its pane (#486)
+// ---------------------------------------------------------------------------
+
+/** Draws the wide two-pane frame: the left roster beside the right-hand UI. */
+function wideDraw(
+  harness: Harness,
+  rosterCols = 32,
+  rows = 24,
+  formCols = 47,
+): string[] {
+  const roster = assertPaneSafe(harness.controller.renderRoster(rosterCols, rows).lines, rosterCols, rows);
+  void harness.controller.renderForm(formCols, rows);
+  return roster;
+}
+
+/** The written roster row that begins the entry containing `text`. */
+function wideRow(roster: readonly string[], text: string): number {
+  const row = roster.findIndex((line) => line.includes(text));
+  assert.ok(row > 0, `the written roster drew no ${JSON.stringify(text)} row: ${JSON.stringify(roster)}`);
+  return row;
+}
+
+/** Plain text of the right-hand pane at the wide geometry. */
+function wideRightPane(harness: Harness, formCols = 47, rows = 24): string {
+  return assertPaneSafe(harness.controller.renderForm(formCols, rows).lines, formCols, rows).join("\n");
+}
+
+/** Opens the Network pane from the roster so the LEFT highlight owns the pane. */
+function openNetworkFromRoster(harness: Harness): void {
+  show(harness);
+  void rosterText(harness); // deliberate Enter only acts on a row the last roster render drew
+  harness.send(DOWN); // New session -> Network
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "form");
+  harness.baseline = harness.actions.length;
+}
+
+test("a left-roster click closes the network pane and its Add menu without sending anything", () => {
+  const harness = makeHarness(makeSnapshot());
+  harness.controller.updateItems([makeItem("local-a")]);
+  openNetworkFromRoster(harness);
+
+  // The highlighted Network row is a pure no-op while its own pane is open.
+  let roster = wideDraw(harness);
+  assert.equal(harness.controller.activateRosterAt(1, wideRow(roster, "Network"), 32, 24), true);
+  assert.deepEqual(harness.commands(), [], "the highlighted Network row emits nothing while its pane is open");
+  assert.equal(harness.controller.focus, "form", "the network pane stays open");
+  assert.ok(wideRightPane(harness).includes("Network"), "the same pane is still on screen");
+
+  // A different row closes the whole pane first, then acts normally once.
+  roster = wideDraw(harness);
+  assert.equal(harness.controller.activateRosterAt(1, wideRow(roster, "label-local-a"), 32, 24), true);
+  assert.equal(harness.controller.focus, "main");
+  assert.deepEqual(harness.commands(), [{ type: "select", id: "local-a" }],
+    "the clicked row performs its ordinary action exactly once");
+  assert.equal(wideRightPane(harness).includes("Network"), false, "the network pane is really closed");
+  assert.deepEqual(harness.actions.filter((action) => action.type.startsWith("peer-")), [],
+    "closing the pane sends no network command of any kind");
+
+  // Reopen through the roster, then abandon a half-edited Add-destination
+  // field: the click closes the editor AND its containing pane and adds
+  // nothing, while the untouched local draft rules stay as they are.
+  roster = wideDraw(harness);
+  assert.equal(harness.controller.activateRosterAt(1, wideRow(roster, "Network"), 32, 24), true);
+  assert.equal(harness.controller.focus, "form");
+  harness.baseline = harness.actions.length; // the shared Add-menu helper compares against this point
+  openAddMenu(harness);
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER); // one field editor, still inside the Add menu
+  harness.send("half-edited.example");
+  harness.baseline = harness.actions.length;
+  roster = wideDraw(harness);
+  assert.equal(harness.controller.activateRosterAt(1, wideRow(roster, "label-local-a"), 32, 24), true);
+  assert.equal(harness.controller.focus, "main");
+  assert.deepEqual(harness.commands(), [{ type: "select", id: "local-a" }],
+    "the field editor and its Add menu both close, then the clicked row acts once");
+  assert.equal(harness.actions.some((action) => action.type === "peer-add"), false,
+    "a pointer gesture never adds a destination");
+  const closedAddMenu = wideRightPane(harness);
+  assert.equal(closedAddMenu.includes("Add destination"), false, "no hidden Add menu survives the click");
+  assert.equal(closedAddMenu.includes("Network"), false, "the containing network pane closed with it");
+});
+
+test("a left-roster click dismisses a pending consent review without deciding it", () => {
+  const harness = makeHarness(makeSnapshot({
+    consents: [makeConsent({ id: "A", label: "studio", fingerprint: "SHA256:studio" })],
+  }));
+  harness.controller.updateItems([makeItem("local-a")]);
+  openConsentFromAlert(harness);
+  assert.equal(harness.controller.peerConsentConfirmationActive, true);
+  harness.baseline = harness.actions.length;
+
+  const roster = wideDraw(harness, 40, 22, 50);
+  assert.ok(roster.join("\n").includes("Incoming connection request"),
+    "the left roster stays visible beside the consent dialog");
+  assert.equal(harness.controller.activateRosterAt(1, wideRow(roster, "label-local-a"), 40, 22), true);
+  assert.equal(harness.controller.focus, "main");
+  assert.deepEqual(harness.commands(), [{ type: "select", id: "local-a" }],
+    "the click dismisses the review and performs the clicked row's ordinary action once");
+  assert.equal(harness.actions.some((action) => action.type === "peer-consent"), false,
+    "a pointer gesture never approves or denies a request");
+  assert.equal(harness.controller.peerConsentConfirmationActive, false, "the review is closed");
+  assert.equal(harness.controller.capturePeerConsentPresentation(), undefined,
+    "a dismissed review keeps no written decision authority");
+
+  const after = assertPaneSafe(harness.controller.renderRoster(40, 22).lines, 40, 22);
+  assert.ok(after.join(" ").includes("Incoming connection request"),
+    "the still-pending request keeps its alert band");
 });

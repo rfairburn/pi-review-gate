@@ -790,7 +790,8 @@ explicit Connect, including across host restarts.
 **What each action does and does not do.** In the Network pane, Enter opens the
 highlighted control or row, and `c`, `x`, `r`, and `v` connect, disconnect, remove, and
 revoke the highlighted destination or receiving permission. Add destination opens a field
-menu whose Name, Host, and Port rows each edit one local draft value in any order: Enter
+menu whose Name, Host, and Port rows each edit one local draft value in any order: the
+editor shows only the chosen field and the other two drafts stay on the menu; Enter
 saves that field and returns to the menu, Escape abandons only that edit, and the
 destination is sent only by the menu's single Add destination action, which validates all
 three values first and then returns to the Network pane; leaving the menu sends nothing.
@@ -857,6 +858,21 @@ This applies only when the visible native pane still belongs to the current live
 at the displayed geometry. Forms, confirmations, and the narrow sidebar overlay are not
 native Main click targets. Once Main already has focus, mouse input keeps its existing
 native behavior.
+While a host UI occupies the right-hand pane beside the visible roster, the roster stays
+clickable. A single left click on a *different* left row first closes that right-hand UI
+through its own cancellation route — the same route its keyboard cancel uses, so an
+unsent New or Edit draft keeps its existing retention, a Saved picker is dismissed, and a
+Saved-delete confirmation closes together with its picker rather than leaving a hidden
+pane — and then performs the clicked row's ordinary action exactly once. That
+cancellation confirms, approves, denies, submits, or deletes nothing. Backend work keeps
+its existing cancellation and request-id fences; dismissing a pane does not guarantee
+that work already submitted to the host stops. A pending consent review is only
+dismissed and its request stays pending, and Quit, stop/remove, peer remove, and peer
+revoke confirmations never leave a clickable roster behind. A click on the row that
+already holds the left highlight changes nothing at all — the right-hand UI, its draft,
+focus, notices, and pending UI ownership are preserved. The left highlight,
+not the native Main owner or an edit target, decides which row counts as the same one,
+and only the roster actually drawn in the current written frame authorizes such a click.
 The `d`/`D` or Delete keys stop/remove precisely the selected, fully displayed row,
 `q`/`Q` activates Quit host, and the configured return-to-Main chord (Alt+Right by
 default) returns input focus to the existing Main owner without activating the highlighted

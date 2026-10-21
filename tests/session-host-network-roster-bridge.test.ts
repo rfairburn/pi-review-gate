@@ -3,8 +3,10 @@
  *
  * Everything here is pure: an in-memory loopback channel pair stands in for the
  * transport, and a thin fake inventory source stands in for the owning-host
- * service's read-only watch. No socket, listener, timer outside the bridge's own
- * finite guards, process, filesystem, or product state is touched. The paired
+ * service's read-only watch. No socket, listener, process, filesystem, or product
+ * state is touched; the only timers are the bridge's own finite guards and the
+ * test's own bounded, self-clearing observation windows, which never settle a
+ * bridge promise on its behalf. The paired
  * TLS/WSS coverage lives in
  * `session-host-network-roster-bridge-integration.test.ts`.
  *
@@ -347,6 +349,7 @@ class ScriptedPeer {
   received: RosterBridgeFrame[] = [];
   /** A scripted owner acknowledges a hello unless a test wants silence. */
   autoAck = true;
+  #confirmUnsubscribes = false;
   #onHello: ((frame: RosterBridgeHelloFrame) => void) | undefined;
 
   constructor(channel: LoopbackChannel) {
@@ -358,6 +361,15 @@ class ScriptedPeer {
     channel.onMessage((bytes) => {
       const frame = decodeRosterBridgeFrame(bytes);
       this.received.push(frame);
+      if (frame.type === "unsubscribe") {
+        // The real owner confirms every unsubscribe idempotently once it is past
+        // the hello, so a test that only needs an ordinary stop gets that answer
+        // from the simulated owner instead of from a timer.
+        if (this.#confirmUnsubscribes) {
+          this.write({ type: "unsubscribed", subscriptionId: frame.subscriptionId });
+        }
+        return;
+      }
       if (frame.type !== "hello") return;
       if (this.autoAck) {
         this.write({
@@ -374,6 +386,26 @@ class ScriptedPeer {
 
   onHello(handler: (frame: RosterBridgeHelloFrame) => void): void {
     this.#onHello = handler;
+  }
+
+  /**
+   * Confirm every `unsubscribe` this side has received, and every one that still
+   * arrives, exactly as the real owner bridge's idempotent acknowledgement does.
+   *
+   * A test's own teardown calls this before stopping a viewer, so the retirement the
+   * stop starts (and any retirement the test body left the viewer waiting on) settles
+   * on a frame the simulated owner delivers. Without such an answer the only thing
+   * that could settle the cleanup is the bridge's stop-acknowledgement guard, which is
+   * finite and deliberately `unref()`'d: with no other work pending the event loop
+   * resolves first, and the Node test runner reports the still-pending cleanup as
+   * cancelled rather than letting the guard run. Tests that script the acknowledgement
+   * themselves (a withheld or unwritable one) never call this and keep their silence.
+   */
+  confirmUnsubscribes(): void {
+    for (const frame of this.received) {
+      if (frame.type === "unsubscribe") this.write({ type: "unsubscribed", subscriptionId: frame.subscriptionId });
+    }
+    this.#confirmUnsubscribes = true;
   }
 
   write(frame: RosterBridgeFrame): void {
@@ -928,6 +960,9 @@ test("an inconsistent transfer is discarded whole and a fresh one still works", 
     assert.equal(viewer.projection.revision, 6, "a stale-subscription frame changes nothing");
     assert.equal(viewer.projection.state, "current");
   } finally {
+    // The second subscription is still live, so the owner confirms the stop the
+    // way the real bridge does instead of the test waiting on the stop guard.
+    scripted.confirmUnsubscribes();
     await viewer.stop();
   }
 });
@@ -1009,6 +1044,7 @@ test("a revision jump is legitimate while a same-run regression is refused", asy
     assert.equal(viewer.projection.reason, "revision-regression");
     assert.equal(viewer.projection.rows.length, 1, "last-observed rows are kept, not cleared");
   } finally {
+    scripted.confirmUnsubscribes();
     await viewer.stop();
   }
 });
@@ -1053,6 +1089,7 @@ test("resync uses a fresh subscription after the stop acknowledgement and accept
     assert.deepEqual(snapshot.rows.map((row) => row.id), ["a", "b"]);
     assert.equal(scripted.received.filter((frame) => frame.type === "subscribe").length, 2);
   } finally {
+    scripted.confirmUnsubscribes();
     await viewer.stop();
   }
 });
@@ -1106,6 +1143,7 @@ test("owner errors mark observations not current without inventing idle state", 
       assert.equal(projection.revision, 3, `${code} never claims a newer revision`);
     }
   } finally {
+    scripted.confirmUnsubscribes();
     await viewer.stop();
   }
 });
@@ -1293,11 +1331,20 @@ test("a stalled transfer fails its subscription on a finite guard without wideni
     scripted.write(begin(subscriptionId, "t-stall", 2, 4, 2));
     scripted.write(page(subscriptionId, "t-stall", 0, remoteRows(["a"])));
     // The rest of the transfer never arrives.
-    await assert.rejects(started, (error: unknown) => isRosterBridgeViewerError(error) && error.code === "timeout");
+    // The idle guard is the bridge's own finite timer, which is unref'd: the bound
+    // await keeps the loop alive long enough to observe it fail and names the
+    // failure if it never does. No protocol deadline changes.
+    await mustSettle(
+      assert.rejects(started, (error: unknown) => isRosterBridgeViewerError(error) && error.code === "timeout"),
+      "the stalled transfer failing its subscription",
+    );
     assert.equal(viewer.projection.state, "empty");
     assert.equal(viewer.projection.rows.length, 0, "a stalled transfer never publishes its staged rows");
     assert.equal(viewer.subscriptionId, null);
   } finally {
+    // The abandoned transfer named its subscription to the owner on the way out;
+    // the scripted owner confirms that retirement so the teardown settles.
+    scripted.confirmUnsubscribes();
     await viewer.stop();
   }
 });
@@ -1317,13 +1364,20 @@ test("a control-send backlog is refused rather than queued without bound", async
     for (let index = 0; index < 8; index += 1) {
       attempts.push(viewer.resync().then(() => undefined));
     }
-    await Promise.allSettled(attempts);
+    // Only the bridge's own finite guards can settle an admitted attempt here, and
+    // they are deliberately unref'd: bound the wait so those guards are actually
+    // observed, and name the failure if an attempt never settles. No protocol
+    // deadline changes and nothing here settles a resync on the bridge's behalf.
+    await mustSettle(Promise.allSettled(attempts), "every control-send attempt settling");
     release();
     await settle();
     const sent = pair.viewerSide.sent.length;
     assert.ok(sent <= 4, `at most the queue bound is admitted (${sent})`);
   } finally {
-    await viewer.stop();
+    // Nothing owns the owner side of this pair, so only the bridge's own finite stop
+    // guard can settle the teardown. Bounded observation of that guard, not a wider
+    // deadline: an unconfirmed retirement still ends the session on its own timer.
+    await mustSettle(viewer.stop(), "the viewer's bounded stop after a refused backlog");
   }
 });
 
@@ -1529,7 +1583,18 @@ function outcome(promise: Promise<unknown>): Promise<string> {
   );
 }
 
-/** Fail with a named message instead of hanging when a promise never settles. */
+/**
+ * Fail with a named message instead of hanging when a promise never settles.
+ *
+ * The bound timer stays ref'd on purpose. Every bridge guard is finite and
+ * deliberately `unref()`'d, so an in-memory test waiting on a guard-settled
+ * promise would otherwise let the event loop resolve while that guard still has
+ * time to run; the Node test runner then reports the test as cancelled instead of
+ * observing the guard's own outcome. This window keeps the loop alive for a bounded
+ * moment, clears itself, and rejects with a named timeout when the promise does not
+ * settle, so a stranded promise is still a visible failure. It never settles the
+ * awaited promise itself and changes no protocol deadline.
+ */
 async function mustSettle<T>(promise: Promise<T>, label: string, ms = 2_000): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -1537,7 +1602,6 @@ async function mustSettle<T>(promise: Promise<T>, label: string, ms = 2_000): Pr
       promise,
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), ms);
-        timer.unref?.();
       }),
     ]);
   } finally {
@@ -1596,6 +1660,7 @@ test("frames admitted before an unsubscribe are retirement noise, not a violatio
     assert.equal(snapshot.state, "current", "the fresh subscription publishes normally");
     assert.equal(snapshot.rows.length, 2);
   } finally {
+    scripted.confirmUnsubscribes();
     await viewer.stop();
   }
 });
@@ -1767,6 +1832,7 @@ test("another owner run cannot be adopted mid-subscription and needs a fresh sub
     assert.equal(viewer.projection.rows.length, 1);
     void first;
   } finally {
+    scripted.confirmUnsubscribes();
     await viewer.stop();
   }
 });

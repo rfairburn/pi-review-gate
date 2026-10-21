@@ -9,7 +9,6 @@ import { stripGeneratedSgr } from "../src/session-host/terminal-surface";
 import {
   ChangeSignal,
   CleanupOutcome,
-  ChangeSignal,
   KEYS,
   MainPtyDriver,
   OBSERVER_FIXTURE,

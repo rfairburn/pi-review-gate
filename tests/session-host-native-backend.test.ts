@@ -833,12 +833,10 @@ class ChangeSignal {
           finish(new Error(`${description}: the bounded event predicate failed`));
         }
       };
-      // One exact-predicate recheck at the unchanged deadline so a missed
-      // notification cannot turn an already-true condition into a failure.
-      const timer = setTimeout(() => {
-        check();
-        finish(new Error(`${description}: deadline exceeded`));
-      }, timeoutMs);
+      // Status/frame/reply/output/exit state changes notify in process.
+      // Durable file journals use the shared waitForRecheck seam instead;
+      // this strict baseline must still expose a missing notification.
+      const timer = setTimeout(() => finish(new Error(`${description}: deadline exceeded`)), timeoutMs);
       this.listeners.add(check);
       check();
     });
@@ -1235,17 +1233,20 @@ function createSessionObserverFiles(root: string, owner: string): { log: string;
   return { log, extension };
 }
 
-test("ChangeSignal.waitFor rechecks its exact predicate once at the unchanged deadline", async () => {
+test("the durable journal signal rechecks its exact predicate once at the unchanged deadline", async () => {
+  // A cadence beyond this unchanged 20ms deadline isolates the shared durable
+  // method's final recheck; in-process notification waits remain strict.
+  const recheckIntervalMs = 1_000;
   let ready = false;
   let calls = 0;
-  const missed = new ChangeSignal().waitFor(() => (calls++, ready), 20, "missed notification");
+  const missed = new DurableChangeSignal().waitForRecheck(() => (calls++, ready), 20, "missed notification", undefined, recheckIntervalMs);
   queueMicrotask(() => { ready = true; }); // condition becomes true without notify()
   await missed;
   assert.equal(calls, 2, "one initial check plus one deadline recheck; no polling");
-  await assert.rejects(new ChangeSignal().waitFor(() => false, 20, "still false"), /^Error: still false: deadline exceeded$/);
+  await assert.rejects(new DurableChangeSignal().waitForRecheck(() => false, 20, "still false", undefined, recheckIntervalMs), /^Error: still false: deadline exceeded$/);
   let thrown = 0;
   const throwing = (): boolean => { if (thrown++ > 0) throw new Error("predicate"); return false; };
-  await assert.rejects(new ChangeSignal().waitFor(throwing, 20, "throwing"), /^Error: throwing: the bounded event predicate failed$/);
+  await assert.rejects(new DurableChangeSignal().waitForRecheck(throwing, 20, "throwing", undefined, recheckIntervalMs), /^Error: throwing: bounded event predicate failed$/);
 });
 
 test("production early preload consumes native authorization before trusted require and its real Node descendant", { timeout: TEST_TIMEOUT_MS }, async (t) => {

@@ -863,6 +863,56 @@ async function reviewOldestPeerConsentNarrow(harness: Harness): Promise<void> {
   assert.fail("the actual rendered narrow network pane never offered its pending consent row");
 }
 
+/** Selected-row text of the last written frame, with generated SGR removed. */
+function selectedScreenRow(harness: Harness): string {
+  return harness.writer.frames.at(-1)?.frame.lines
+    .map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))
+    .find((line) => line.startsWith("> ")) ?? "";
+}
+
+/**
+ * Opens the Add-destination field menu in the actual narrow Network pane with
+ * real host input only, and waits for the frame that actually wrote it.
+ */
+async function openAddMenuInNarrowNetwork(harness: Harness): Promise<void> {
+  for (let step = 0; step <= 12; step += 1) {
+    if (selectedScreenRow(harness).includes("Add destination")) {
+      harness.terminal.emitInput(ENTER);
+      await nextTurn();
+      const frame = harness.writer.frames.at(-1)?.frame;
+      assert.ok(plain(frame).includes("Add destination (enter to add)"),
+        "the actual Add-destination field menu is open and written");
+      assert.equal(screenRowOfHeader(frame, "Add destination"), 1,
+        "the open menu owns every content row before the request arrives");
+      return;
+    }
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+  }
+  assert.fail("the actual rendered network pane never offered its Add destination row");
+}
+
+/**
+ * Opens exactly one Add-destination field editor (by row label) from the open
+ * Add menu, again with real host input and a real written receipt.
+ */
+async function openOneAddFieldEditor(harness: Harness, label: string): Promise<void> {
+  for (let step = 0; step <= 8; step += 1) {
+    if (selectedScreenRow(harness).includes(label)) {
+      harness.terminal.emitInput(ENTER);
+      await nextTurn();
+      const frame = harness.writer.frames.at(-1)?.frame;
+      assert.ok(plain(frame).includes(`> ${label}`), `the actual ${label} field editor is open and written`);
+      assert.equal(screenRowOfHeader(frame, "Add destination"), 1,
+        "the open editor owns every content row before the request arrives");
+      return;
+    }
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+  }
+  assert.fail(`the actual rendered Add menu never offered its ${label} row`);
+}
+
 function emptySavedCatalog(agentDir: string): SavedSessionCatalog {
   return {
     agentDir,
@@ -1262,6 +1312,108 @@ test("a muted request arriving above the open narrow Network pane stays visible"
     assert.equal(harness.sidebar!.capturePeerConsentPresentation(), undefined,
       "neither the band nor the list grants approval authority without the written dialog");
     assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 0);
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("a muted request arriving while the Add destination menu is open stays visible and grants nothing", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  try {
+    fillForm(harness.terminal, "/narrow-add-menu");
+    await nextTurn();
+    const owner = harness.sidebar!.activeMainOwnerID;
+    assert.ok(owner, "a live native owner exists before the request arrives");
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    harness.terminal.setSize(40, 40); // narrow: below the 53-column split, tall enough for the band
+    await nextTurn();
+    await activateRosterRow(harness, "Network");
+    assert.equal(harness.sidebar!.focus, "form", "the narrow Network pane opened before the request arrived");
+    await openAddMenuInNarrowNetwork(harness);
+
+    // Capture the open menu's ownership and geometry before the asynchronous arrival.
+    const selection = harness.sidebar!.selectedId;
+    const commandsBeforeArrival = peer.commands.length;
+    const resizesBeforeArrival = harness.manager!.resizeCalls.length;
+
+    await deliverMutedIncomingRequest(peer, "narrow-add-menu");
+
+    const frame = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(frame).includes("Add destination (enter to add)"), "the open Add menu survives the arrival");
+    assert.equal(screenRowContaining(frame, INCOMING_ALERT), 1,
+      "an arrival while the Add menu is open still reserves its rows above the pane");
+    assert.equal(screenRowOfHeader(frame, "Add destination"), 1 + PEER_ALERT_ROWS,
+      "the Add menu moves down genuinely reserved rows instead of under an overlay");
+    assert.deepEqual(harness.manager!.resizeCalls.at(-1), { cols: 40, rows: 40 - 1 - PEER_ALERT_ROWS, ids: [owner] },
+      "the band takes real compositor rows rather than covering geometry the child still claims");
+    assert.ok(harness.manager!.resizeCalls.length > resizesBeforeArrival,
+      "the arrival reflowed the child to the reduced native pane");
+    assert.equal(harness.sidebar!.focus, "form", "arrival never takes focus from the open Add menu");
+    assert.equal(harness.sidebar!.selectedId, selection, "arrival never changes the roster selection");
+    assert.equal(harness.sidebar!.visible, true, "arrival never toggles sidebar visibility");
+    assert.equal(harness.sidebar!.activeMainOwnerID, owner, "arrival never changes the native owner");
+    assert.equal(harness.sidebar!.peerConsentConfirmationActive, false,
+      "the notification band is not a consent dialog");
+    assert.equal(harness.sidebar!.capturePeerConsentPresentation(), undefined,
+      "the Add menu grants no approval authority");
+    assert.equal(peer.commands.length, commandsBeforeArrival, "an arrival performs no network command");
+    assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 0,
+      "the muted bell is never written and the alert does not depend on it");
+
+    peer.publish({ notice: "Unrelated metadata update" });
+    await nextTurn();
+    const redrawn = harness.writer.frames.at(-1)?.frame;
+    assert.equal(screenRowContaining(redrawn, INCOMING_ALERT), 1,
+      "the band persists across an unrelated redraw while the request stays pending");
+    assert.ok(plain(redrawn).includes("Add destination (enter to add)"),
+      "the unrelated redraw keeps the operator's open menu");
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("a muted request arriving with one Add destination field editor open stays visible and grants nothing", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  try {
+    fillForm(harness.terminal, "/narrow-add-field");
+    await nextTurn();
+    const owner = harness.sidebar!.activeMainOwnerID;
+    assert.ok(owner, "a live native owner exists before the request arrives");
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    harness.terminal.setSize(40, 40); // narrow: below the 53-column split, tall enough for the band
+    await nextTurn();
+    await activateRosterRow(harness, "Network");
+    await openAddMenuInNarrowNetwork(harness);
+    await openOneAddFieldEditor(harness, "Host:");
+    assert.equal(harness.sidebar!.focus, "form", "the single-field editor opened before the request arrived");
+
+    const selection = harness.sidebar!.selectedId;
+    const commandsBeforeArrival = peer.commands.length;
+
+    await deliverMutedIncomingRequest(peer, "narrow-add-field");
+
+    const frame = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(frame).includes("> Host:"), "the open field editor survives the arrival");
+    assert.equal(screenRowContaining(frame, INCOMING_ALERT), 1,
+      "an arrival while one Add field is open still reserves its rows above the editor");
+    assert.equal(screenRowOfHeader(frame, "Add destination"), 1 + PEER_ALERT_ROWS,
+      "the editor moves down genuinely reserved rows instead of under an overlay");
+    assert.deepEqual(harness.manager!.resizeCalls.at(-1), { cols: 40, rows: 40 - 1 - PEER_ALERT_ROWS, ids: [owner] },
+      "the band takes real compositor rows rather than covering geometry the child still claims");
+    assert.equal(harness.sidebar!.focus, "form", "arrival never takes focus from the open editor");
+    assert.equal(harness.sidebar!.selectedId, selection, "arrival never changes the roster selection");
+    assert.equal(harness.sidebar!.activeMainOwnerID, owner, "arrival never changes the native owner");
+    assert.equal(harness.sidebar!.peerConsentConfirmationActive, false,
+      "the notification band is not a consent dialog");
+    assert.equal(harness.sidebar!.capturePeerConsentPresentation(), undefined,
+      "an open destination editor grants no approval authority");
+    assert.equal(peer.commands.length, commandsBeforeArrival, "an arrival performs no network command");
+    assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 0);
+
+    peer.publish({ notice: "Unrelated metadata update" });
+    await nextTurn();
+    const redrawn = harness.writer.frames.at(-1)?.frame;
+    assert.equal(screenRowContaining(redrawn, INCOMING_ALERT), 1,
+      "the band persists across an unrelated redraw while the request stays pending");
+    assert.ok(plain(redrawn).includes("> Host:"), "the unrelated redraw keeps the operator's open editor");
   } finally { assert.equal(await closeWithSignal(harness), 0); }
 });
 

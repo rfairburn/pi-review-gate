@@ -159,9 +159,16 @@ OS-privileged access remains outside this boundary.
 A host with no saved network preferences creates no keys, preferences, trust document,
 listener, or connection at startup. Startup initializes no network state: it reads saved
 state and restores an explicitly saved hosting setting and schedules an eligible
-remembered Auto setting. A listener binds only an explicitly selected address and port
-shown to the operator; the application never substitutes a wildcard or fallback port,
-and it adds no discovery, SSH, or extra listener. Auto reconnect is off by default and
+remembered Auto setting. A listener binds only an address and port the operator actually
+submitted. When nothing is saved yet, the Network pane prefills the editable suggestion
+`*:8088` as a local draft: `*` requests one dual-stack listener (the transport maps it to
+a single `::` listener that is not IPv6-only, so IPv4 and IPv6 share that one handle),
+while an explicit `0.0.0.0` stays an IPv4-only request. Hosting stays off, and nothing is
+bound, saved, keyed, or created until the operator chooses Enable or Apply, and unknown,
+unavailable, or unsafe settings are never filled in with that suggestion or enabled. No
+other address or port is ever substituted as a fallback, an address that cannot be bound
+fails with its own error, and the application adds no discovery, SSH, or extra listener.
+Auto reconnect is off by default and
 attempts only previously connected destinations after startup or an unexpected loss, when
 a pin is currently remembered, no explicit suppression applies, and no terminal
 authorization failure has occurred; it never pairs, prompts for an unknown key, or

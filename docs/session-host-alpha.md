@@ -733,11 +733,19 @@ connection. Starting a host initializes no network state: it reads saved state, 
 restores an explicitly saved hosting setting and schedules an eligible remembered Auto
 setting, but never creates an identity, starts discovery, or silently chooses an address
 or port. The first explicit Enable hosting or Connect creates an identity when none
-exists. Hosting is initially off, and
-the Network pane requires an explicit listen address and port and shows the address and
-port actually bound. Disabling hosting stops the listener and keeps the saved setting;
-the operator's explicit address and port are the only bind input, and no wildcard or
-fallback is substituted. There is no daemon between host runs.
+exists. Hosting is initially off. With no saved listen address or port, the Network pane
+prefills the editable suggestion `*:8088` in the separate Listen address and Listen port
+rows and in their editors, so Enable or Apply can be chosen without typing first; `*`
+requests one dual-stack listener that accepts IPv4 and IPv6 on that single handle, and an
+explicit `0.0.0.0` is an IPv4-only request. The suggestion is a local draft only: it is
+not written to the saved settings, and nothing is bound, saved, or created until an
+explicit action. A saved address and port stay shown exactly as stored, an unsaved edit
+stays visible until the next explicit action, and unavailable settings stay unknown and
+keep Enable refused. The pane shows the address and port actually bound, with a bound
+IPv6 endpoint written `[::]:8088`. Disabling hosting stops the listener and keeps the
+saved setting; the address and port the operator submitted are the only bind input, no
+other address or port is substituted, and a failed bind is reported rather than retried
+somewhere else. There is no daemon between host runs.
 
 **Destinations, pins, and approval.** Each saved destination is a local alias and
 endpoint with its own remembered server key; saving a destination creates no key, socket,
@@ -777,8 +785,13 @@ explicit Connect, including across host restarts.
 
 **What each action does and does not do.** In the Network pane, Enter opens the
 highlighted control or row, and `c`, `x`, `r`, and `v` connect, disconnect, remove, and
-revoke the highlighted destination or receiving permission. Removing a destination
-forgets only this side's saved endpoint and local remembered pin; re-adding it requires
+revoke the highlighted destination or receiving permission. Add destination opens a field
+menu whose Name, Host, and Port rows each edit one local draft value in any order: Enter
+saves that field and returns to the menu, Escape abandons only that edit, and the
+destination is sent only by the menu's single Add destination action, which validates all
+three values first and then returns to the Network pane; leaving the menu sends nothing.
+Removing a destination forgets only this side's saved endpoint and local remembered pin;
+re-adding it requires
 confirming the key again. It never revokes the other host's receiving grant and never
 stops its sessions. Revoke removes only this side's current receiving permission for that
 peer; it does not change the opposite direction, stop a session, or shut down the owning
@@ -812,9 +825,10 @@ This sidebar changes no Windows, native-mobile, browser, or physical-input certi
 claim; the alpha platform limitations above still apply.
 
 **Optional two-host comparison.** To check the current alpha by hand on two machines,
-run the optional `pi-review-sessions` host on each. On host A, open **Network**, enter an
-explicit listen address and port, apply, and start hosting; on host B, add a destination
-for A's address and port and press Connect. Compare each host's displayed identity key
+run the optional `pi-review-sessions` host on each. On host A, open **Network**, review or
+edit the prefilled listen address and port, apply, and start hosting; on host B, add a
+destination for A's address and port and press Connect. Compare each host's displayed
+identity key
 with the fingerprint the other host shows for approval through an independent channel if
 you need to rule out an active interceptor during first pairing, then confirm the
 server-key dialog on B, approve A's incoming request, and compare B's remote rows with

@@ -214,6 +214,11 @@ function peerPaneText(harness: Harness, cols = 70, rows = 26): string[] {
   return assertPaneSafe(harness.controller.renderForm(cols, rows).lines, cols, rows);
 }
 
+/** The form-pane text with wrapped notice and error lines rejoined. */
+function peerPaneFlat(harness: Harness, cols = 70, rows = 26): string {
+  return peerPaneText(harness, cols, rows).join(" ");
+}
+
 function confirmText(harness: Harness, cols = 60, rows = 22): string[] {
   return assertPaneSafe(harness.controller.render(cols, rows).lines, cols, rows);
 }
@@ -315,26 +320,251 @@ test("an attached snapshot adds the Network menu and the alert without stealing 
 // Network pane: explicit, honest controls that emit commands only
 // ---------------------------------------------------------------------------
 
-test("the network pane shows honest state and requires an explicit listen port", () => {
+test("a known fresh snapshot prefills the approved editable defaults and starts nothing", () => {
   const harness = makeHarness(makeSnapshot({
     settings: { ...DEFAULT_SETTINGS, bindHost: "", bindPort: null },
     listener: { state: "off", host: null, port: null, message: null },
   }));
+  assert.deepEqual(harness.commands(), [], "attaching a snapshot emits nothing at all");
   openNetworkPane(harness);
   const text = peerPaneText(harness);
   assert.ok(text.some((line) => line.includes("Network")));
-  assert.ok(text.some((line) => line.includes("hosting: disabled")));
+  assert.ok(text.some((line) => line.includes("hosting: disabled")), "hosting stays off until enabled");
   assert.ok(text.some((line) => line.includes("listener: off")));
   assert.ok(text.some((line) => line.includes("auto: off")), "Auto reconnect is displayed from the snapshot");
   assert.ok(text.some((line) => line.includes("bell: on")));
-  assert.ok(text.some((line) => line.includes("Listen port: (not set)")), "no default port is invented");
-  assert.ok(text.some((line) => line.includes("Listen address: (not set)")));
+  assert.ok(text.some((line) => line.includes("Listen address: * (enter to edit)")),
+    "the dual-stack suggestion is prefilled and stays editable");
+  assert.ok(text.some((line) => line.includes("Listen port: 8088 (enter to edit)")),
+    "the approved port is prefilled instead of leaving the row blank");
+  assert.deepEqual(harness.commands(), [], "rendering the prefilled draft emits nothing");
 
-  // Enabling hosting with no explicit address/port is refused locally: it
-  // emits nothing and never silently chooses a wildcard or fallback port.
+  // Both editors open prefilled with the same local draft text.
+  focusPeerEntry(harness, "Listen address:");
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "form");
+  const addressEditor = peerPaneText(harness).find((line) => line.startsWith("> Listen address:")) ?? "";
+  assert.ok(addressEditor.includes("*"), `the address editor opens prefilled: ${JSON.stringify(addressEditor)}`);
+  harness.send(ESC);
+  focusPeerEntry(harness, "Listen port:");
+  harness.send(ENTER);
+  const portEditor = peerPaneText(harness).find((line) => line.startsWith("> Listen port:")) ?? "";
+  assert.ok(portEditor.includes("8088"), `the port editor opens prefilled: ${JSON.stringify(portEditor)}`);
+  harness.send(ESC);
+  assert.deepEqual(harness.commands(), [], "opening and cancelling the prefilled editors emits nothing");
+  assert.equal(harness.controller.visible, true);
+});
+
+test("the explicit Enable gesture sends the prefilled defaults exactly", () => {
+  const harness = makeHarness(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, bindHost: "", bindPort: null },
+  }));
+  openNetworkPane(harness);
+
+  // The operator can now enable without typing first: the draft is sent as shown.
   harness.send(ENTER); // highlighted row 0 = Hosting
-  assert.deepEqual(harness.commands(), []);
-  assert.ok(peerPaneText(harness).some((line) => line.includes("Listen address is required")));
+  assert.deepEqual(harness.commands(), [{ type: "peer-listener", enabled: true, host: "*", port: "8088" }],
+    "the exact approved dual-stack request is what the unchanged command carries");
+  assert.ok(peerPaneFlat(harness).includes("Listen request sent"),
+    "the notice reports a request, never a completed bind");
+});
+
+test("Apply on a fresh known snapshot keeps the disabled semantics and sends nothing else", () => {
+  const harness = makeHarness(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, bindHost: "", bindPort: null },
+  }));
+  openNetworkPane(harness);
+  focusPeerEntry(harness, "Apply listen address/port");
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), [{ type: "peer-listener", enabled: false, host: "*", port: "8088" }],
+    "Apply still requests the disabled state; it never starts a listener");
+  assert.ok(peerPaneFlat(harness).includes("Hosting disable requested"));
+});
+
+test("stored address/port and dirty drafts are never replaced by the defaults", () => {
+  const harness = makeHarness(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, bindHost: "0.0.0.0", bindPort: 8443 },
+  }));
+  openNetworkPane(harness);
+  const text = peerPaneText(harness);
+  assert.ok(text.some((line) => line.includes("Listen address: 0.0.0.0 (enter to edit)")),
+    "an explicit IPv4 choice stays shown exactly as stored");
+  assert.ok(text.some((line) => line.includes("Listen port: 8443 (enter to edit)")));
+  assert.ok(!text.some((line) => line.includes("8088")), "an explicit port is never defaulted");
+
+  // A local edit stays the operator's draft across an unrelated refresh.
+  focusPeerEntry(harness, "Listen port:");
+  harness.send(ENTER);
+  harness.send("\x15"); // clear the retained text, then edit it
+  harness.send("9099");
+  harness.send(ENTER);
+  peerPaneText(harness);
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    revision: 2,
+    settings: { ...DEFAULT_SETTINGS, bindHost: "0.0.0.0", bindPort: 8443 },
+    notice: "Unrelated metadata update",
+  }));
+  const refreshed = peerPaneText(harness);
+  assert.ok(refreshed.some((line) => line.includes("Listen port: 9099 (enter to edit)")),
+    "the unsaved draft survives a snapshot refresh instead of reverting to the default");
+  assert.ok(refreshed.some((line) => line.includes("Apply listen address/port (unsaved changes)")));
+  harness.baseline = harness.actions.length;
+
+  focusPeerEntry(harness, "Hosting:");
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), [{ type: "peer-listener", enabled: true, host: "0.0.0.0", port: "9099" }],
+    "the edited IPv4 request is sent exactly as the operator left it");
+});
+
+test("a stored port of 0 stays stored and is refused locally instead of defaulted", () => {
+  const harness = makeHarness(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, bindHost: "127.0.0.1", bindPort: 0 },
+  }));
+  openNetworkPane(harness);
+  const text = peerPaneText(harness);
+  assert.ok(text.some((line) => line.includes("Listen port: 0 (enter to edit)")),
+    "a stored 0 is a stored value, never treated as unset and rewritten to the default");
+  assert.ok(!text.some((line) => line.includes("8088")));
+
+  harness.send(ENTER); // highlighted row 0 = Hosting
+  assert.deepEqual(harness.commands(), [], "an unusable stored port emits no command");
+  assert.ok(peerPaneFlat(harness).includes("Listen port must be between 1 and 65535"),
+    "the local shape error explains the stored value rather than silently fixing it");
+});
+
+test("a stored address that sanitizes away stays empty instead of taking the suggestion", () => {
+  const harness = makeHarness(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, bindHost: "\u0007", bindPort: 8443 },
+  }));
+  openNetworkPane(harness);
+  const text = peerPaneText(harness);
+  assert.ok(text.some((line) => line.includes("Listen address: (not set)")),
+    "an unusable stored address is never replaced by the dual-stack suggestion");
+  assert.ok(text.some((line) => line.includes("Listen port: 8443 (enter to edit)")),
+    "the usable stored port stays exactly as stored");
+  harness.send(ENTER); // highlighted row 0 = Hosting
+  assert.deepEqual(harness.commands(), [], "nothing is sent for an address the pane cannot show");
+});
+
+test("unknown settings stay unknown: no fresh default is substituted and Enable stays refused", () => {
+  const harness = makeHarness(makeSnapshot({ settings: null }));
+  openNetworkPane(harness);
+  const text = peerPaneText(harness);
+  assert.ok(text.some((line) => line.includes("hosting: unknown (settings unavailable)")));
+  assert.ok(text.some((line) => line.includes("Listen address: (not set)")),
+    "an unavailable document is never filled in with the suggestion");
+  assert.ok(text.some((line) => line.includes("Listen port: (not set)")));
+  assert.ok(!text.some((line) => line.includes("8088")), "no default is substituted for unknown settings");
+
+  harness.send(ENTER); // highlighted row 0 = Hosting
+  assert.deepEqual(harness.commands(), [], "unknown settings cannot enable hosting");
+  assert.ok(peerPaneFlat(harness).includes("no hosting change was sent"),
+    "the refusal names the unavailable settings document");
+
+  focusPeerEntry(harness, "Listen address:");
+  harness.send(ENTER);
+  const editorLine = peerPaneText(harness).find((line) => line.startsWith("> Listen address:")) ?? "";
+  assert.ok(!editorLine.includes("*"), `the editor stays empty while settings are unknown: ${JSON.stringify(editorLine)}`);
+  assert.ok(!peerPaneText(harness).some((line) => line.includes("8088")));
+  harness.send(ESC);
+  assert.deepEqual(harness.commands(), [], "reading the empty editor sends nothing");
+});
+
+test("a valid dirty draft is never authority when settings become unavailable", () => {
+  // A known fresh snapshot: the operator edits one prefilled field locally.
+  const harness = makeHarness(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, bindHost: "", bindPort: null },
+  }));
+  openNetworkPane(harness);
+  focusPeerEntry(harness, "Listen port:");
+  harness.send(ENTER);
+  harness.send("\x15");
+  harness.send("9099");
+  harness.send(ENTER);
+  peerPaneText(harness);
+  harness.baseline = harness.actions.length;
+
+  // The settings document then becomes unavailable. The retained draft stays
+  // visible as display text, but it grants no listener authority.
+  harness.controller.setPeerUiSnapshot(makeSnapshot({ revision: 2, settings: null }));
+  const text = peerPaneText(harness);
+  assert.ok(text.some((line) => line.includes("hosting: unknown (settings unavailable)")));
+  assert.ok(text.some((line) => line.includes("Listen port: 9099 (enter to edit)")),
+    "the unsaved draft is retained instead of being discarded");
+
+  focusPeerEntry(harness, "Hosting:");
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), [], "a retained valid draft authorizes no Enable");
+  assert.ok(peerPaneFlat(harness).includes("no hosting change was sent"),
+    "the refusal names the unavailable settings document");
+
+  // The disabled Apply gesture is refused by the same availability guard.
+  focusPeerEntry(harness, "Apply listen address/port");
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), [], "Apply is refused while settings are unavailable");
+  assert.ok(peerPaneFlat(harness).includes("no hosting change was sent"));
+});
+
+test("typing both listen fields while settings stay unknown emits no listener command", () => {
+  const harness = makeHarness(makeSnapshot({ settings: null }));
+  openNetworkPane(harness);
+
+  focusPeerEntry(harness, "Listen address:");
+  harness.send(ENTER);
+  harness.send("0.0.0.0");
+  harness.send(ENTER);
+  focusPeerEntry(harness, "Listen port:");
+  harness.send(ENTER);
+  harness.send("8443");
+  harness.send(ENTER);
+  const text = peerPaneText(harness);
+  assert.ok(text.some((line) => line.includes("Listen address: 0.0.0.0 (enter to edit)")),
+    "the local drafts stay editable data");
+  assert.ok(text.some((line) => line.includes("Listen port: 8443 (enter to edit)")));
+  assert.deepEqual(harness.commands(), [], "filling the fields emits nothing");
+
+  focusPeerEntry(harness, "Hosting:");
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), [], "typed values are not authority while settings are unknown");
+  assert.ok(peerPaneFlat(harness).includes("no hosting change was sent"));
+});
+
+test("listen copy explains the dual-stack request and an IPv6 endpoint renders as [host]:port", () => {
+  const harness = makeHarness(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, hostingEnabled: true, bindHost: "", bindPort: null },
+    listener: { state: "listening", host: "::", port: 8088, message: null },
+  }));
+  openNetworkPane(harness);
+  const pane = peerPaneText(harness);
+  assert.ok(pane.some((line) => line.includes("listener: listening on [::]:8088")),
+    "a bound IPv6 endpoint is bracketed so it reads unambiguously");
+  assert.ok(!pane.some((line) => line.includes(":::")), "the ambiguous :::port form is never rendered");
+
+  // The listen editor explains the request instead of making it look forbidden.
+  // Trimming each wrapped line and rejoining reconstructs the copy exactly:
+  // wrapping only ever breaks at spaces.
+  focusPeerEntry(harness, "Listen address:");
+  harness.send(ENTER);
+  const flat = peerPaneText(harness).map((line) => line.trim()).join(" ");
+  assert.ok(flat.includes("dual-stack"), "the copy explains what * asks for");
+  assert.ok(flat.includes("IPv4 and IPv6"), "dual-stack means both families on one handle");
+  assert.ok(flat.includes("0.0.0.0") && flat.includes("IPv4 only"), "an explicit IPv4-only request stays available");
+  assert.ok(flat.includes("Address and port are separate"), "the two fields stay separate");
+  assert.ok(flat.includes("Hosting stays off until you choose Enable"), "hosting stays off until enabled");
+  assert.ok(flat.includes("nothing is bound or saved until you act"), "no side effect before an explicit action");
+  assert.ok(flat.includes("no other address or port is substituted"), "no silent fallback");
+  assert.ok(!/no wildcard/i.test(flat), "the copy never makes the wildcard look forbidden");
+  harness.send(ESC);
+
+  // A hostile bound address stays display-safe and the pane still fills its grid.
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    revision: 2,
+    settings: { ...DEFAULT_SETTINGS, bindHost: "", bindPort: null },
+    listener: { state: "listening", host: "\x1b[31m::\x1b[0m\u0007", port: 8088, message: null },
+  }));
+  const sanitized = peerPaneText(harness);
+  assert.ok(sanitized.some((line) => line.includes("listener: listening on [::]:8088")),
+    "sanitizing removes the controls without losing the endpoint");
 });
 
 test("explicit address/port, hosting, Auto, and bell controls emit exact commands", () => {
@@ -343,10 +573,12 @@ test("explicit address/port, hosting, Auto, and bell controls emit exact command
   }));
   openNetworkPane(harness);
 
-  // Edit the explicit listen address (row 1).
+  // Edit the explicit listen address (row 1). The editor opens prefilled with
+  // the approved suggestion, so the operator clears it before typing their own.
   movePeerRow(harness, 1);
   harness.send(ENTER);
   assert.equal(harness.controller.focus, "form");
+  harness.send("\x15");
   harness.send("127.0.0.1");
   harness.send(ENTER);
   assert.equal(harness.controller.focus, "form");
@@ -355,6 +587,7 @@ test("explicit address/port, hosting, Auto, and bell controls emit exact command
   // Edit the explicit listen port (row 2).
   movePeerRow(harness, 1);
   harness.send(ENTER);
+  harness.send("\x15");
   harness.send("8443");
   harness.send(ENTER);
   assert.ok(peerPaneText(harness).some((line) => line.includes("Listen port: 8443")));
@@ -383,22 +616,310 @@ test("explicit address/port, hosting, Auto, and bell controls emit exact command
   assert.deepEqual(harness.commands(), [{ type: "peer-bell", enabled: false }]);
 });
 
-test("adding a destination requires label, host and port and emits one peer-add", () => {
-  const harness = makeHarness(makeSnapshot());
-  openNetworkPane(harness);
-  movePeerRow(harness, 6);
+/** Opens the Add-destination field menu through the actual network row. */
+function openAddMenu(harness: Harness): void {
+  focusPeerEntry(harness, "Add destination");
   harness.send(ENTER);
-  assert.equal(harness.controller.focus, "form");
-  harness.send("studio");
-  harness.send(TAB);
-  harness.send("10.1.2.3");
-  harness.send(TAB);
-  harness.send("7000");
+  const text = peerPaneText(harness);
+  assert.ok(text.some((line) => line.includes("Add destination (enter to add)")),
+    "the Add destination entry opens its own field menu");
+  assert.deepEqual(harness.commands(), [], "opening the menu sends nothing");
+  harness.baseline = harness.actions.length;
+}
+
+/** Types into the open single-field editor and submits with Enter. */
+function submitField(harness: Harness, value: string): void {
+  harness.send(value);
   harness.send(ENTER);
   peerPaneText(harness);
+}
+
+test("Add destination opens a navigable field menu with one Add action and no wizard", () => {
+  const harness = makeHarness(makeSnapshot());
+  openNetworkPane(harness);
+  focusPeerEntry(harness, "Add destination");
+  harness.send(ENTER);
+  const text = peerPaneText(harness);
+  assert.equal(harness.controller.focus, "form", "the menu stays in the same form-pane route");
+  assert.ok(text.some((line) => line.trim() === "Add destination"), "the menu names itself");
+  assert.ok(text.some((line) => line.includes("Name: (not set) (enter to edit)")));
+  assert.ok(text.some((line) => line.includes("Host: (not set) (enter to edit)")));
+  assert.ok(text.some((line) => line.includes("Port: (not set) (enter to edit)")));
+  assert.ok(text.some((line) => line.includes("Add destination (enter to add)")));
+  assert.ok(!text.some((line) => line.includes("Hosting:")), "the menu replaces the network rows");
+  assert.ok(!text.some((line) => line.includes("tab")), "there is no Tab-to-cycle wizard left");
+  assert.deepEqual(harness.commands(), [], "opening and reading the menu sends nothing");
+
+  // Up/Down reach every row, in both directions and in any order.
+  focusPeerEntry(harness, "Port:");
+  harness.send(UP);
+  assert.ok((peerPaneText(harness).find((line) => line.startsWith("> ")) ?? "").includes("Host:"));
+  harness.send(UP);
+  assert.ok((peerPaneText(harness).find((line) => line.startsWith("> ")) ?? "").includes("Name:"));
+  harness.send(DOWN);
+  harness.send(DOWN);
+  harness.send(DOWN);
+  assert.ok((peerPaneText(harness).find((line) => line.startsWith("> ")) ?? "").includes("enter to add"));
+  assert.deepEqual(harness.commands(), [], "navigating the menu sends nothing");
+
+  // Tab no longer cycles fields: one editor holds exactly one field, and an
+  // unsubmitted editor value never reaches the draft.
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER);
+  harness.send(TAB);
+  harness.send("10.1.2.3");
+  const typed = peerPaneText(harness);
+  assert.ok(typed.some((line) => line.startsWith("> Host:")), "Tab advanced to no other field");
+  assert.ok(peerPaneFlat(harness).includes("10.1.2.3"), "Tab inserted nothing into the value");
+  assert.deepEqual(harness.commands(), [], "typing in an editor sends nothing");
+  harness.send(ESC);
+  assert.ok(peerPaneText(harness).some((line) => line.includes("Host: (not set)")),
+    "the abandoned value stays out of the draft");
+});
+
+test("each Add field stores only a local draft, in any order, and one Add emits the exact payload", () => {
+  const harness = makeHarness(makeSnapshot());
+  openNetworkPane(harness);
+  openAddMenu(harness);
+
+  // Host is chosen first: the fields are independent, not a fixed sequence.
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "form");
+  const editor = peerPaneText(harness);
+  assert.ok(editor.some((line) => line.startsWith("> Host:")), "the editor holds exactly the chosen field");
+  assert.ok(editor.some((line) => line.includes("Destination name:"))
+    && editor.some((line) => line.includes("Port:")), "the other draft values stay visible as data");
+  assert.ok(!editor.some((line) => line.includes("tab next field")), "the editor offers no field cycling");
+  submitField(harness, "10.1.2.3");
+  assert.equal(harness.controller.focus, "form", "a saved field returns to the Add menu");
+  let menu = peerPaneText(harness);
+  assert.ok(menu.some((line) => line.includes("Host: 10.1.2.3 (enter to edit)")));
+  assert.ok(peerPaneFlat(harness).includes("Host updated locally; choose Add destination to request it"));
+  assert.deepEqual(harness.commands(), [], "a stored field emits no command");
+  harness.baseline = harness.actions.length;
+
+  // Then Port, then the name, then the host again — prefilled and revisited.
+  focusPeerEntry(harness, "Port:");
+  harness.send(ENTER);
+  submitField(harness, "7000");
+  menu = peerPaneText(harness);
+  assert.ok(menu.some((line) => line.includes("Port: 7000 (enter to edit)")));
+  focusPeerEntry(harness, "Name:");
+  harness.send(ENTER);
+  submitField(harness, "studio");
+  menu = peerPaneText(harness);
+  assert.ok(menu.some((line) => line.includes("Name: studio (enter to edit)")));
+  assert.deepEqual(harness.commands(), [], "three stored fields still emit nothing");
+
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER);
+  const reopened = peerPaneText(harness);
+  assert.ok(reopened.some((line) => line.startsWith("> Host:")), "the editor still holds the Host field");
+  assert.ok(peerPaneFlat(harness).includes("10.1.2.3"), "the editor opens prefilled with the stored draft");
+  harness.send("\x15"); // clear the retained text, then type the corrected host
+  submitField(harness, "10.9.9.9");
+  menu = peerPaneText(harness);
+  assert.ok(menu.some((line) => line.includes("Host: 10.9.9.9 (enter to edit)")));
+  assert.deepEqual(harness.commands(), []);
+  harness.baseline = harness.actions.length;
+
+  // The single Add action sends the whole draft once, then returns to Network.
+  focusPeerEntry(harness, "enter to add");
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), [
+    { type: "peer-add", label: "studio", host: "10.9.9.9", port: "7000" },
+  ]);
+  const back = peerPaneText(harness);
+  assert.ok(back.some((line) => line.trim() === "Network"), "a successful Add returns to the network pane");
+  assert.ok(peerPaneFlat(harness).includes("Destination add requested"));
+  assert.ok((back.find((line) => line.startsWith("> ")) ?? "").includes("Add destination"),
+    "the network pane still highlights the row the operator came from");
+  harness.baseline = harness.actions.length;
+
+  // A sent destination clears the draft for the next visit.
+  focusPeerEntry(harness, "Add destination");
+  harness.send(ENTER);
+  const again = peerPaneText(harness);
+  assert.ok(again.some((line) => line.includes("Name: (not set)"))
+    && again.some((line) => line.includes("Host: (not set)"))
+    && again.some((line) => line.includes("Port: (not set)")), "the sent draft is cleared");
+  assert.deepEqual(harness.commands(), []);
+});
+
+test("Escape abandons only the current Add edit and Escape in the menu adds nothing", () => {
+  const harness = makeHarness(makeSnapshot());
+  openNetworkPane(harness);
+  openAddMenu(harness);
+
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER);
+  submitField(harness, "10.1.2.3");
+  assert.deepEqual(harness.commands(), []);
+
+  // Reopen the host field, type over it, and cancel that one edit.
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER);
+  harness.send("\x15");
+  harness.send("typo-host");
+  harness.send(ESC);
+  assert.equal(harness.controller.focus, "form");
+  const menu = peerPaneText(harness);
+  assert.ok(menu.some((line) => line.includes("Add destination (enter to add)")),
+    "Escape returns from the editor to the Add menu");
+  assert.ok(menu.some((line) => line.includes("Host: 10.1.2.3 (enter to edit)")),
+    "the abandoned edit left the previously stored draft value alone");
+  assert.deepEqual(harness.commands(), [], "an abandoned edit emits nothing");
+
+  // Escape in the menu returns to the network pane without adding.
+  harness.send(ESC);
+  const network = peerPaneText(harness);
+  assert.ok(network.some((line) => line.trim() === "Network"));
+  assert.ok(network.some((line) => line.includes("Hosting:")), "the network rows are back");
+  assert.deepEqual(harness.commands(), [], "leaving the menu sends nothing");
+  harness.baseline = harness.actions.length;
+
+  // The half-edited draft is still there for a later visit.
+  focusPeerEntry(harness, "Add destination");
+  harness.send(ENTER);
+  assert.ok(peerPaneText(harness).some((line) => line.includes("Host: 10.1.2.3 (enter to edit)")),
+    "leaving the menu keeps the local draft, exactly as the listen drafts persist");
+});
+
+test("Add refuses an incomplete or invalid draft with the fixed local error and sends nothing", () => {
+  const harness = makeHarness(makeSnapshot());
+  openNetworkPane(harness);
+  openAddMenu(harness);
+
+  // Nothing typed yet: the name is missing first, exactly as before.
+  focusPeerEntry(harness, "enter to add");
+  harness.send(ENTER);
+  assert.ok(peerPaneFlat(harness).includes("A destination name is required"));
+  assert.deepEqual(harness.commands(), []);
+
+  // A name alone cannot be sent.
+  focusPeerEntry(harness, "Name:");
+  harness.send(ENTER);
+  submitField(harness, "studio");
+  focusPeerEntry(harness, "enter to add");
+  harness.send(ENTER);
+  assert.ok(peerPaneFlat(harness)
+    .includes("Destination host is required (no default is chosen for you)"));
+  assert.deepEqual(harness.commands(), []);
+
+  // An unusable host keeps the editor open with its fixed message and is
+  // never stored in the draft.
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER);
+  harness.send("10.1.2. 3");
+  harness.send(ENTER);
+  assert.ok(peerPaneFlat(harness).includes("Destination host cannot contain whitespace"));
+  assert.equal(harness.controller.focus, "form", "an invalid field stays in its editor");
+  harness.send(ESC);
+  assert.ok(peerPaneText(harness).some((line) => line.includes("Host: (not set)")),
+    "a rejected value never reaches the draft");
+  assert.deepEqual(harness.commands(), []);
+
+  // A valid host with no port still cannot be added: no partial destination.
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER);
+  submitField(harness, "10.1.2.3");
+  focusPeerEntry(harness, "enter to add");
+  harness.send(ENTER);
+  assert.ok(peerPaneFlat(harness)
+    .includes("Port is required (no default port is chosen for you)"));
+  assert.deepEqual(harness.commands(), []);
+
+  // An out-of-range port is refused in its editor and stays unset.
+  focusPeerEntry(harness, "Port:");
+  harness.send(ENTER);
+  harness.send("0");
+  harness.send(ENTER);
+  assert.ok(peerPaneFlat(harness).includes("Port must be between 1 and 65535"));
+  harness.send(ESC);
+  focusPeerEntry(harness, "enter to add");
+  harness.send(ENTER);
+  assert.ok(peerPaneFlat(harness).includes("Port is required"));
+  assert.deepEqual(harness.commands(), [], "an out-of-range port was never stored or sent");
+
+  // Completing the draft emits exactly one command with the stored values.
+  focusPeerEntry(harness, "Port:");
+  harness.send(ENTER);
+  submitField(harness, "7000");
+  harness.baseline = harness.actions.length;
+  focusPeerEntry(harness, "enter to add");
+  harness.send(ENTER);
   assert.deepEqual(harness.commands(), [
     { type: "peer-add", label: "studio", host: "10.1.2.3", port: "7000" },
   ]);
+});
+
+test("the Add menu is a distinct pointer target and returns to the same network row", () => {
+  const harness = makeHarness(makeSnapshot());
+  show(harness);
+  rosterText(harness);
+  harness.controller.openPeerMenu();
+  peerPaneText(harness);
+  const networkKey = harness.controller.captureMousePresentation().authorizationKey;
+
+  openAddMenu(harness);
+  assert.notEqual(harness.controller.captureMousePresentation().authorizationKey, networkKey,
+    "the Add menu is its own drawn target mapping");
+
+  harness.send(ESC);
+  peerPaneText(harness);
+  assert.equal(harness.controller.captureMousePresentation().authorizationKey, networkKey,
+    "returning restores the exact network target mapping");
+  assert.ok((peerPaneText(harness).find((line) => line.startsWith("> ")) ?? "").includes("Add destination"),
+    "the stable network selection is where the operator left it");
+});
+
+test("an arrival while the Add menu or its field editor is open keeps alert, focus, and ownership", () => {
+  const harness = makeHarness(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, bellEnabled: false },
+  }));
+  openNetworkPane(harness);
+  harness.controller.setActiveMainOwner("native-a");
+  openAddMenu(harness);
+  const selection = harness.controller.selectedId;
+  harness.baseline = harness.actions.length;
+
+  // A muted request arrives while the menu is open.
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, bellEnabled: false },
+    consents: [makeConsent({ id: "A", label: "studio" })],
+  }));
+  const band = assertPaneSafe(harness.controller.renderPeerAlert(60, 6).lines, 60, 6).join("\n");
+  assert.ok(band.includes("Incoming connection request"), "the alert band still renders with the menu open");
+  const menu = peerPaneText(harness);
+  assert.ok(menu.some((line) => line.includes("Add destination (enter to add)")),
+    "the open menu survives the arrival");
+  assert.equal(harness.controller.focus, "form", "arrival never takes focus from the open menu");
+  assert.equal(harness.controller.selectedId, selection, "arrival never changes the roster selection");
+  assert.equal(harness.controller.activeMainOwnerID, "native-a", "arrival never changes the native owner");
+  assert.equal(harness.controller.capturePeerConsentPresentation(), undefined,
+    "the menu grants no approval authority");
+  assert.deepEqual(harness.commands(), [], "an arrival emits nothing from the menu");
+
+  // And while one field editor is open.
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER);
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, bellEnabled: false },
+    consents: [makeConsent({ id: "A", label: "studio" }), makeConsent({ id: "B", label: "laptop" })],
+  }));
+  const editor = peerPaneText(harness);
+  assert.ok(editor.some((line) => line.startsWith("> Host:")), "the open editor survives the arrival");
+  assert.equal(harness.controller.focus, "form", "arrival never takes focus from the open editor");
+  assert.equal(harness.controller.selectedId, selection);
+  assert.equal(harness.controller.activeMainOwnerID, "native-a");
+  assert.equal(harness.controller.capturePeerConsentPresentation(), undefined);
+  harness.send(ESC);
+  harness.send(ESC);
+  const network = peerPaneText(harness);
+  assert.ok(network.some((line) => line.includes("approval window")),
+    "the still-pending request stays reviewable from the network pane");
+  assert.deepEqual(harness.commands(), [], "nothing was approved, denied, or added on the way out");
 });
 
 test("per-host connect, disconnect, remove-confirmation and revoke-confirmation emit commands", () => {

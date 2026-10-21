@@ -174,7 +174,12 @@ export interface PeerHostOptions {
 }
 
 export interface PeerHostListenOptions {
-	/** Explicit bind address; there is no public or wildcard default. */
+	/**
+	 * Explicit bind address; there is no default. Only an explicit `*` is
+	 * translated by the transport: it requests one IPv6 unspecified listener
+	 * with IPv4+IPv6 dual-stack (`::`, `ipv6Only: false`). `0.0.0.0` stays a
+	 * plain IPv4 bind, and any other host is forwarded unchanged.
+	 */
 	readonly host: string;
 	/** Explicit port; tests normally use 0 for an owned loopback port. */
 	readonly port: number;
@@ -309,6 +314,25 @@ function validateListenAddress(host: unknown, port: unknown): { host: string; po
 		throw peerError("INVALID_ARGUMENT");
 	}
 	return { host, port };
+}
+
+/**
+ * The single bind this transport opens for one admitted listen request. This is
+ * the whole wildcard policy: only an explicit `*` is mapped, to one IPv6
+ * unspecified listener that accepts IPv4 and IPv6 on the same handle. Every
+ * other host (including `0.0.0.0`) keeps its existing IPv4/IPv6 semantics, an
+ * explicit port is always forwarded as given (port `0` still means an owned
+ * ephemeral port), and nothing here retries, falls back, picks another address,
+ * or opens a second listener. A platform that cannot bind the requested
+ * dual-stack listener fails with the existing bind error.
+ */
+function resolveListenTarget(address: { host: string; port: number }): {
+	host: string;
+	port: number;
+	ipv6Only?: false;
+} {
+	if (address.host !== "*") return address;
+	return { host: "::", port: address.port, ipv6Only: false };
 }
 
 export function createPeerHost(options: PeerHostOptions): PeerHost {
@@ -952,7 +976,7 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 		async listen(listenOptions: PeerHostListenOptions): Promise<{ host: string; port: number }> {
 			if (closed) throw peerError("HOST_CLOSED");
 			if (server.listening || listenStartup !== null) throw peerError("INVALID_ARGUMENT");
-			const address = validateListenAddress(listenOptions?.host, listenOptions?.port);
+			const target = resolveListenTarget(validateListenAddress(listenOptions?.host, listenOptions?.port));
 			let startupFinished = false;
 			const startup = new Promise<void>((resolve, reject) => {
 				let settled = false;
@@ -994,7 +1018,7 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 				server.once("error", onError);
 				server.once("listening", onListening);
 				try {
-					server.listen({ host: address.host, port: address.port });
+					server.listen(target);
 				} catch {
 					finish(peerError("LISTENER_BIND_FAILED"));
 				}
@@ -1018,7 +1042,8 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 				throw peerError("LISTENER_BIND_FAILED");
 			}
 			port = bound.port;
-			return { host: address.host, port: bound.port };
+			// Canonical bound host: `*` reports the `::` listener it actually bound.
+			return { host: target.host, port: bound.port };
 		},
 		close(): Promise<void> {
 			if (closing) return closing;

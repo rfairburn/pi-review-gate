@@ -26,9 +26,9 @@ import { isValidNativeSessionFile, isValidNativeSessionId } from "./protocol";
  * through the Pi package's PUBLIC SDK surface only:
  *
  * - Top-level discovery of `<agentDir>/sessions` project directories uses
- *   dirents + lstat and prunes `.terraform` BEFORE any descent; directory
- *   symlinks are never followed. Only approved real project session
- *   directories are enumerated.
+ *   dirents + lstat of the sessions root's immediate entries and never
+ *   descends into an entry; directory symlinks are never followed. Only
+ *   approved real project session directories are enumerated.
  * - Each approved directory is listed with the public
  *   `SessionManager.listAll(EXPLICIT projectDir, progress?, AbortSignal)`
  *   flat-directory overload (the SDK's flat list filters `.jsonl` and does
@@ -65,9 +65,6 @@ import { isValidNativeSessionFile, isValidNativeSessionId } from "./protocol";
 
 /** Directory name holding the native saved conversations under the agent root. */
 export const SAVED_SESSIONS_DIRNAME = "sessions";
-
-/** Pruned before any descent, at every discovery level (see AGENTS.md search safety). */
-const TERRAFORM_DIRNAME = ".terraform";
 
 /** Canonical display caption limit in Unicode codepoints (display only, not rename prefill). */
 export const MAX_SAVED_SESSION_CAPTION_CODEPOINTS = 256;
@@ -411,9 +408,10 @@ interface PathIdentity {
 
 /**
  * Top-level discovery of approved real project session directories under the
- * sessions root: dirents + lstat only, `.terraform` pruned BEFORE any
- * descent, directory symlinks never followed. Unknown files and directories
- * are preserved (never touched); only real directories become listing targets.
+ * sessions root: dirents + lstat of the root's immediate entries only, no
+ * descent into any entry, directory symlinks never followed.
+ * Unknown files and directories are preserved (never touched); only real
+ * directories become listing targets.
  * Each discovered directory's dev/ino identity is retained so a later swap
  * (symlink or replacement directory) is detectable before any SDK call.
  */
@@ -431,7 +429,6 @@ function discoverProjectSessionDirs(
   const dirs: string[] = [];
   const identities = new Map<string, PathIdentity>();
   for (const entry of entries) {
-    if (entry.name === TERRAFORM_DIRNAME) continue; // pruned before any descent
     const full = join(sessionsRoot, entry.name);
     let stats;
     try {
@@ -511,7 +508,7 @@ function revalidateProjectChain(
  * recheck that it is still a real non-symlink directory (it may have been
  * swapped after discovery), and that every `.jsonl` entry the flat list would
  * read is already a safe regular readable file. Flat-directory entry checks
- * only — no descent anywhere, `.terraform` pruned before any descent. Returns
+ * only — no descent anywhere. Returns
  * a bounded issue reason when the directory must not be listed (the explicit
  * flat overload has no per-file filter, so one unsafe entry fails the whole
  * project listing; the entries are preserved untouched).
@@ -531,7 +528,6 @@ function preflightProjectSessionDir(projectDir: string): string | undefined {
     return "project directory could not be read";
   }
   for (const entry of entries) {
-    if (entry.name === TERRAFORM_DIRNAME) continue; // pruned before any descent
     if (!entry.name.endsWith(".jsonl")) continue; // the flat SDK list reads .jsonl entries only
     const full = join(projectDir, entry.name);
     let fileStats;

@@ -43,11 +43,6 @@ function snapshotTree(dir: string): Map<string, { mode: number; bytes?: Buffer }
   const snapshot = new Map<string, { mode: number; bytes?: Buffer }>();
   const visit = (current: string, prefix: string): void => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
-      // Traversal-time prune: never descend into directories named .terraform
-      // (global search-scope rule applies to owned synthetic test roots too).
-      if (entry.isDirectory() && entry.name === ".terraform") {
-        continue;
-      }
       const path = join(current, entry.name);
       const key = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
       if (entry.isDirectory()) {
@@ -1253,25 +1248,6 @@ test("FIFO config pathnames are rejected without blocking via the nonblocking bo
       "is not a regular file",
     );
     assert.ok(fs.lstatSync(join(profile, "review-gate.json")).isFIFO());
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("snapshot tree helper prunes .terraform directories at traversal time", () => {
-  const root = makeTestRoot("terraform-prune");
-  try {
-    const workspace = join(root, "workspace");
-    mkdirSync(join(workspace, ".terraform", "providers"), { recursive: true });
-    writeFileSync(join(workspace, ".terraform", "providers", "big.bin"), "synthetic-terraform-payload", "utf8");
-    writeFileSync(join(workspace, "ordinary.txt"), "ordinary", "utf8");
-
-    const snapshot = snapshotTree(workspace);
-    assert.ok(!snapshot.has(".terraform/"), ".terraform must be pruned before descending");
-    assert.ok(!snapshot.has(".terraform/providers/"), ".terraform must be pruned before descending");
-    assert.ok(snapshot.has("ordinary.txt"), "unrelated files are still recorded");
-    assert.ok(statSync(join(workspace, ".terraform")).isDirectory(), "the owned synthetic fixture itself is untouched");
-    assert.equal(readFileSync(join(workspace, ".terraform", "providers", "big.bin"), "utf8"), "synthetic-terraform-payload");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

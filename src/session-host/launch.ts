@@ -553,8 +553,8 @@ function extractPiVersion(output: string): string | null {
  *   consulted (aliases are a shell feature a child cannot see), and a bare name that
  *   contains whitespace or shell metacharacters is rejected — an exact
  *   filename is required, not a shell command line. No global directory or
- *   process scan happens: PATH filename checks only, never a home or
- *   Terraform recursion.
+ *   process scan happens: PATH filename checks only, never a home-directory or
+ *   other recursive filesystem walk.
  * - An explicit executable path is honored for installed managed or custom Pi
  *   builds: it is validated and resolved to an absolute regular file exactly
  *   as a whole filename (POSIX also requires X_OK; Windows requires read
@@ -1456,8 +1456,8 @@ function refreshNativeProfileSkills(packageRoot: string, skillsRoot: string): vo
   // tree ("unknown target untouched"). A component that is missing ends the
   // walk for that destination (everything below will be created componentwise
   // after all pre-validation): deeper components cannot exist below a missing
-  // directory. No home scan, no Terraform recursion: only the validated
-  // per-profile agent tree is inspected.
+  // directory. No home scan and no recursive filesystem walk: only the
+  // validated per-profile agent tree is inspected.
   const agentDirReal = realpathSync(dirname(skillsRoot));
   for (const stage of staged) {
     if (relative(agentDirReal, stage.destination).startsWith("..") || isAbsolute(relative(agentDirReal, stage.destination))) {

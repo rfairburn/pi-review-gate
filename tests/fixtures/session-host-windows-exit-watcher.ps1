@@ -96,22 +96,10 @@ function Get-ValidatedRootPath {
         throw 'Root must be a fully qualified drive or complete UNC path.'
     }
 
-    # Reject the forbidden segment lexically before any filesystem traversal.
-    foreach ($segment in [regex]::Split($Candidate, '[\\/]')) {
-        if ([string]::Equals($segment, '.terraform', [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw 'Root path contains a forbidden segment.'
-        }
-    }
-
     $fullPath = [System.IO.Path]::GetFullPath($Candidate)
     if ($fullPath.StartsWith('\\?\', [System.StringComparison]::OrdinalIgnoreCase) -or
         $fullPath.StartsWith('\\.\', [System.StringComparison]::OrdinalIgnoreCase)) {
         throw 'Device and extended paths are not supported.'
-    }
-    foreach ($segment in [regex]::Split($fullPath, '[\\/]')) {
-        if ([string]::Equals($segment, '.terraform', [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw 'Root path contains a forbidden segment.'
-        }
     }
 
     $pathRoot = [System.IO.Path]::GetPathRoot($fullPath)

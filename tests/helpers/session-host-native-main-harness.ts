@@ -881,13 +881,12 @@ function copyBoundedRegularFile(
 /**
  * Copy one selected source tree into an owned destination tree.
  *
- * `.terraform` is pruned by name BEFORE lstat/readdir/descent at every depth,
- * including synthetic source roots. The source root and every intermediate are
- * real, non-linked directories whose retained receipt chain is re-verified
- * around every iteration; the identity inspected in the parent loop is passed
- * into the recursion and required, never recaptured. Directory iteration is
- * bounded (`opendirSync`/`readSync`) so an oversized directory never has its
- * full name array materialized. Linked or special source entries and linked
+ * The source root and every intermediate are real, non-linked directories
+ * whose retained receipt chain is re-verified around every iteration; the
+ * identity inspected in the parent loop is passed into the recursion and
+ * required, never recaptured. Directory iteration is bounded
+ * (`opendirSync`/`readSync`) so an oversized directory never has its full name
+ * array materialized. Linked or special source entries and linked
  * destination ancestors fail closed. The copier never realpaths a source root,
  * so it makes no link-following containment claim for it.
  */
@@ -914,9 +913,6 @@ function copyBoundedTree(
         const entry = directory.readSync();
         if (entry === null) break;
         const name = entry.name;
-        // Exclude initialized Terraform data before lstat, readdir, or descent
-        // at every depth, including inside the synthetic source roots.
-        if (name === ".terraform") continue;
         const sourceEntry = join(source, name);
         const destinationEntry = join(destination, name);
         const entryStats = lstatSync(sourceEntry, { bigint: true });
@@ -1019,8 +1015,8 @@ function readBoundedManifest(
 /**
  * Reject unsafe shipped manifest entries BEFORE any access. Public package files
  * are accepted as relative strings only: empty, home-relative, absolute,
- * drive-qualified, traversal, `.terraform`, `.git`, and `node_modules`
- * components all fail closed.
+ * drive-qualified, traversal, `.git`, and `node_modules` components all fail
+ * closed.
  */
 function validateShippedEntry(shippedEntry: string): string {
   if (!shippedEntry || shippedEntry.startsWith("~")) {
@@ -1032,7 +1028,7 @@ function validateShippedEntry(shippedEntry: string): string {
   const components = shippedEntry.split(/[\\/]+/);
   for (const component of components) {
     if (!component || component === "." || component === ".."
-        || component === ".terraform" || component === ".git" || component === "node_modules") {
+        || component === ".git" || component === "node_modules") {
       throw new Error("candidate staging rejected an unsafe package file entry");
     }
   }
@@ -1383,9 +1379,9 @@ export function processIsAlive(pidValue: number | undefined): boolean {
  * Root creation alone does not prove ownership of every descendant subsequently
  * written there. Until each removable entry has a positive creation/identity
  * receipt, do not enumerate, descend, unlink, or remove any of them. This also
- * preserves unknown/replaced entries and initialized Terraform contents.
+ * preserves unknown and replaced entries.
  */
-export function removeOwnedScratchTreePruningTerraform(root: string): boolean {
+export function removeOwnedScratchTree(root: string): boolean {
   void root;
   return false;
 }

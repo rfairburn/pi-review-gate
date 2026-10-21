@@ -8,19 +8,12 @@ const path = require("node:path");
 
 const projectRoot = path.resolve(__dirname, "..");
 
-// Traversal-time exclusion for staged copies: never descend into initialized
-// Terraform directories (they can be hundreds of GB), at any depth. The
-// selected entry list below stays narrow; this filter only prunes .terraform.
-function stageFilter(source) {
-  return path.basename(source) !== ".terraform";
-}
-
 /**
  * Retain an owned package-smoke scratch tree. Root origin and identity do not
  * establish creation ownership for its descendants, and the smoke has no
  * complete per-entry BigInt identity receipts. Therefore cleanup must not
- * enumerate, inspect, or remove any descendant (including symlinks and
- * .terraform directories). The returned array keeps the existing export shape
+ * enumerate, inspect, or remove any descendant (including symlinks and other
+ * special files). The returned array keeps the existing export shape
  * and contains the retained root path.
  *
  * Guards: the root must exist, be a real directory (not a symlink). This
@@ -617,7 +610,7 @@ function runPackageSmoke(scratch) {
     "examples",
     "docs",
   ]) {
-    fs.cpSync(path.join(projectRoot, entry), path.join(stage, entry), { recursive: true, filter: stageFilter });
+    fs.cpSync(path.join(projectRoot, entry), path.join(stage, entry), { recursive: true });
   }
 
   // Build production output only into the staging tree. The --outDir override

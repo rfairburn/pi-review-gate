@@ -71,8 +71,8 @@ async function makePrivateRoot(prefix: string): Promise<string> {
 /**
  * Preserve failed-test witnesses at 0700. Only successfully completed tests
  * may remove their positively identified roots (dev/ino verified against the
- * creation-time observation); `.terraform` is pruned before any descent. On a
- * cleanup failure the tree is retained with 0700 permissions.
+ * creation-time observation). On a cleanup failure the tree is retained with
+ * 0700 permissions.
  */
 async function removeFixtureTree(root: string): Promise<void> {
   const owner = fixtureOwners.get(root);
@@ -106,7 +106,6 @@ async function pruneAndRemove(dir: string): Promise<void> {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     const full = join(dir, entry.name);
     if (entry.isDirectory() && !entry.isSymbolicLink()) {
-      if (entry.name === ".terraform") continue; // pruned before any descent: preserved
       await pruneAndRemove(full);
     } else {
       await rm(full);
@@ -251,17 +250,15 @@ async function snapshotSessionsTree(sessionsRoot: string): Promise<Map<string, s
   return snapshot;
 }
 
-test("listSavedSessions uses the public explicit flat-directory listAll only: prunes .terraform before descent and skips directory symlinks", async (t) => {
+test("listSavedSessions uses the public explicit flat-directory listAll only and skips directory symlinks", async (t) => {
   const fixture = await makeCatalogFixture();
   t.after(() => removeFixtureTree(fixture.root));
   const projA = join(fixture.sessionsRoot, "proj-a");
   const projB = join(fixture.sessionsRoot, "proj-b");
-  const terraform = join(fixture.sessionsRoot, ".terraform", "module");
   const outside = join(fixture.root, "outside-proj");
-  await Promise.all([mkdir(projA, { recursive: true }), mkdir(projB, { recursive: true }), mkdir(terraform, { recursive: true }), mkdir(outside, { recursive: true })]);
+  await Promise.all([mkdir(projA, { recursive: true }), mkdir(projB, { recursive: true }), mkdir(outside, { recursive: true })]);
   await writeSessionFile(projA, "s1.jsonl", "id-a1", fixture.workspace);
   await writeSessionFile(projB, "s2.jsonl", "id-b1", fixture.workspace);
-  const terraformFile = await writeSessionFile(terraform, "tf.jsonl", "id-tf", fixture.workspace);
   const outsideFile = await writeSessionFile(outside, "o1.jsonl", "id-out", fixture.workspace);
   await symlink(outside, join(fixture.sessionsRoot, "link-proj"));
 
@@ -273,7 +270,6 @@ test("listSavedSessions uses the public explicit flat-directory listAll only: pr
     [projA, projB].sort(),
     "only the approved real project directories are listed, each with its EXPLICIT path (no no-arg scan)",
   );
-  assert.ok(!calls.some((dir) => dir.includes(".terraform")), ".terraform is pruned before any descent");
   assert.ok(!calls.some((dir) => dir === join(fixture.sessionsRoot, "link-proj")), "directory symlinks are never followed");
   assert.deepEqual(
     catalog.rows.map((row) => row.id).sort(),
@@ -289,8 +285,7 @@ test("listSavedSessions uses the public explicit flat-directory listAll only: pr
   assert.equal(catalog.sessionsRoot, fixture.sessionsRoot);
   assert.equal(catalog.issueCount, 0);
 
-  // Read-only: the pruned and skipped trees keep their exact bytes.
-  assert.match(await readFile(terraformFile, "utf8"), /id-tf/, ".terraform content is untouched");
+  // Read-only: the skipped external tree keeps its exact bytes.
   assert.match(await readFile(outsideFile, "utf8"), /id-out/, "the symlinked external tree is untouched");
 });
 
@@ -882,22 +877,22 @@ test("listSavedSessions refuses a project directory replaced with another real d
   assert.match(issue.reason, /project directory was replaced after discovery/);
 });
 
-test("listSavedSessions prunes .terraform inside a project directory before any descent", async (t) => {
+test("listSavedSessions never descends into nested project subdirectories (flat listing only)", async (t) => {
   const fixture = await makeCatalogFixture();
   t.after(() => removeFixtureTree(fixture.root));
   const projA = join(fixture.sessionsRoot, "proj-a");
-  const terraformModule = join(projA, ".terraform", "module");
-  await mkdir(terraformModule, { recursive: true });
+  const nestedModule = join(projA, "nested", "module");
+  await mkdir(nestedModule, { recursive: true });
   await writeSessionFile(projA, "s1.jsonl", "id-a1", fixture.workspace);
-  const tfFile = await writeSessionFile(terraformModule, "tf.jsonl", "id-tf", fixture.workspace);
+  const nestedFile = await writeSessionFile(nestedModule, "nested.jsonl", "id-nested", fixture.workspace);
 
   const calls: string[] = [];
   const catalog = await listSavedSessions({ agentDir: fixture.agentDir, listAll: makeInjectedListAll({ calls }) });
   assert.deepEqual(calls, [projA], "the project directory is listed with its explicit path");
-  assert.ok(!calls.some((dir) => dir.includes(".terraform")), ".terraform is never a listing target");
-  assert.deepEqual(catalog.rows.map((row) => row.id), ["id-a1"], ".terraform content is never listed");
+  assert.ok(!calls.some((dir) => dir !== projA), "nested directories are never listing targets");
+  assert.deepEqual(catalog.rows.map((row) => row.id), ["id-a1"], "nested content is never listed");
   assert.equal(catalog.issueCount, 0);
-  assert.match(await readFile(tfFile, "utf8"), /id-tf/, ".terraform bytes are untouched");
+  assert.match(await readFile(nestedFile, "utf8"), /id-nested/, "nested bytes are untouched");
 });
 
 test("listSavedSessions retains at most MAX_CATALOG_ISSUES issues with an exact total for large faults", async (t) => {

@@ -583,9 +583,9 @@ node_generation_active() {
 }
 
 # Append the direct children of one directory to NODE_CHILDREN with the caller's
-# glob options preserved. Cleanup-specific: hidden legacy records and initialized
-# .terraform subtrees inside a selected disposable generation are ordinary
-# removable content.
+# glob options preserved. Cleanup-specific: hidden legacy records and nested
+# subtrees inside a selected disposable generation are ordinary removable
+# content.
 node_list_children() {
   local file="$1" restore_nullglob restore_dotglob
   shopt -q nullglob; restore_nullglob=$?
@@ -645,7 +645,7 @@ node_unlink_batch() {
 # before deleting anything. There is no whole-tree preflight, no entry-count or
 # depth quota, and never a deletion of an ancestor of the selected generation.
 # Arbitrary creators' ordinary descendants — including hardlinked names and
-# initialized .terraform subtrees inside the selected disposable generation — are
+# nested subtrees inside the selected disposable generation — are
 # disposable BY PATH, not by file creation receipts or link counts. Links are
 # unlinked themselves and never entered, and ordinary or special leaves (FIFO,
 # socket, device) are unlinked without being opened.

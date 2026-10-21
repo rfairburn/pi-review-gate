@@ -69,22 +69,16 @@ function makeEntrypointFixture(prefix: string): EntrypointFixture {
   return fixture;
 }
 
-function removeFixtureTree(path: string): boolean {
-  let containsTerraform = false;
+function removeFixtureTree(path: string): void {
   for (const entry of readdirSync(path, { withFileTypes: true })) {
-    if (entry.name === ".terraform") {
-      containsTerraform = true;
-      continue;
-    }
     const childPath = join(path, entry.name);
     if (entry.isDirectory() && !entry.isSymbolicLink()) {
-      if (removeFixtureTree(childPath)) containsTerraform = true;
+      removeFixtureTree(childPath);
     } else {
       unlinkSync(childPath);
     }
   }
-  if (!containsTerraform) rmdirSync(path);
-  return containsTerraform;
+  rmdirSync(path);
 }
 
 function removeFixtureIfOwned(fixture: EntrypointFixture, assertionsPassed: boolean): boolean {
@@ -743,8 +737,8 @@ function fillNodeGeneration(root: string, files: number, directories: number): v
 
 /**
  * A representative populated fallback-Node generation: thousands of real files,
- * a chain deeper than any former recursion quota, cleanup-specific `.terraform`
- * content, and an outside hardlink/symlink that must never be followed. The
+ * a chain deeper than any former recursion quota, ordinary nested content, and
+ * an outside hardlink/symlink that must never be followed. The
  * native producers (not a substitute pruner) are what delete it.
  */
 function seedPopulatedNodeGeneration(cache: string, name: string, outside: string): { root: string; entries: number } {
@@ -759,8 +753,8 @@ function seedPopulatedNodeGeneration(cache: string, name: string, outside: strin
   for (let index = 0; index < 2000; index += 1) {
     writeFileSync(join(root, `files-${index % 25}`, `f-${index}.txt`), "disposable by location");
   }
-  mkdirSync(join(root, ".terraform"), { recursive: true });
-  writeFileSync(join(root, ".terraform", "sentinel"), "cleanup-specific");
+  mkdirSync(join(root, "nested-cache", "deep"), { recursive: true });
+  writeFileSync(join(root, "nested-cache", "deep", "sentinel"), "ordinary nested content");
   linkSync(outside, join(root, "outside-hardlink"));
   symlinkSync(outside, join(root, "outside-symlink"));
   return { root, entries: countTreeEntries(root) };
@@ -1301,7 +1295,7 @@ test(".sh never deletes another producer's live lock that replaced malformed met
   f.markAssertionsPassed();
 });
 
-test(".sh malformed, legacy, hardlinked and .terraform-bearing roots are reclaimed without escaping", { skip: isWindows }, (t) => {
+test(".sh malformed, legacy, hardlinked and populated roots are reclaimed without escaping", { skip: isWindows }, (t) => {
   const f = makeEntrypointFixture(".node-cap-unsafe-");
   cleanupFixture(t, f);
   writeBootstrapTools(f);
@@ -1313,14 +1307,14 @@ test(".sh malformed, legacy, hardlinked and .terraform-bearing roots are reclaim
   const sentinel = join(f.root, "outside");
   writeFileSync(sentinel, "hardlinked outside");
   linkSync(sentinel, join(cache, names[3]!, "hardlink"));
-  mkdirSync(join(cache, names[2]!, ".terraform"));
-  writeFileSync(join(cache, names[2]!, ".terraform", "sentinel"), "disposable cleanup content");
+  mkdirSync(join(cache, names[2]!, "nested", "deep"), { recursive: true });
+  writeFileSync(join(cache, names[2]!, "nested", "deep", "sentinel"), "disposable cleanup content");
   const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stderr, /capacity exhausted/);
   assert.equal(readFileSync(sentinel, "utf8"), "hardlinked outside", "a hardlink only loses its generation-internal name");
   assert.equal(existsSync(join(cache, names[2]!)), false,
-    "cleanup-specific traversal removes an initialized .terraform subtree inside a disposable generation");
+    "cleanup traversal removes ordinary nested content inside a disposable generation");
   assert.ok(nodeRoots(f).length <= 5);
   f.markAssertionsPassed();
 });
@@ -2263,8 +2257,8 @@ test("native Windows deletes a populated Node generation and recovers a reused-p
   mkdirSync(big, { recursive: true });
   // One representative ~10k-entry generation for the native Windows walker.
   fillNodeGeneration(big, 10_000, 400);
-  mkdirSync(join(big, ".terraform"), { recursive: true });
-  writeFileSync(join(big, ".terraform", "sentinel"), "cleanup-specific");
+  mkdirSync(join(big, "nested-cache"), { recursive: true });
+  writeFileSync(join(big, "nested-cache", "sentinel"), "ordinary nested content");
   assert.ok(countTreeEntries(big) > 10_000, `the fixture holds a representative volume: ${countTreeEntries(big)}`);
   const reused = join(cache, "bootstrap.1-reused");
   mkdirSync(reused, { recursive: true });

@@ -1130,8 +1130,8 @@ function remove(root, deadline, pass) {
         }
         if (entry.isDirectory()) {
           // Cleanup-specific traversal: this whole generation is a designated
-          // disposable cache, so even an initialized `.terraform` subtree inside
-          // it is removed (still no-follow and confined to this generation).
+          // disposable cache, so nested directories inside it are entered and
+          // removed by path (still no-follow and confined to this generation).
           stack.push({ file: child, entries: undefined, index: 0 });
           continue;
         }

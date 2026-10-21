@@ -21,8 +21,7 @@
  *   files and directories: a touched file or a changed directory timestamp is
  *   the only thing that can trigger the small app-input checksum, which then
  *   distinguishes a real edit from a touch-only change. node_modules, dist,
- *   .git, docs, tests, private notes, caches, and `.terraform` trees are never
- *   scanned or hashed.
+ *   .git, docs, tests, private notes, and caches are never scanned or hashed.
  * - Packaged installs do not need any of that: their full exact package version
  *   (for example 0.1.0-dev.180, a valid SemVer prerelease) identifies the
  *   prebuilt code, so an installed package is current without compiling.
@@ -414,7 +413,7 @@ function preparedRootIsSafe(preparedRoot, expectedParent) {
  * Walk exactly the application inputs once, bounded, and return both the
  * metadata index (for cheap later change detection) and a content digest (to
  * tell a real edit from a metadata-only touch). Symlinks and special files are
- * refused; `.terraform` trees are pruned before lstat or descent.
+ * refused.
  */
 function computeInputIdentity(packageRoot, testHooks) {
   const root = path.resolve(packageRoot);
@@ -513,8 +512,6 @@ function computeInputIdentity(packageRoot, testHooks) {
         if (!entry) break;
         budget.entries += 1;
         checkBounds();
-        // Prune initialized Terraform trees before lstat or descent.
-        if (entry.name === ".terraform") continue;
         if (entry.name.includes("\\")) throw new Error("application input contains a non-portable path");
         const child = path.join(directory, entry.name);
         const childRelative = `${relative}/${entry.name}`;
@@ -552,16 +549,14 @@ function computeInputIdentity(packageRoot, testHooks) {
 /**
  * A recorded application-input path is always a simple relative path inside the
  * package root: no absolute form, no `..` segment, no separator/control trick,
- * no Windows backslash, and never an initialized Terraform tree. Validating the
- * recorded path before touching the filesystem keeps a marker from steering a
- * stat outside the package.
+ * and no Windows backslash. Validating the recorded path before touching the
+ * filesystem keeps a marker from steering a stat outside the package.
  */
 function validIndexPath(value) {
   if (typeof value !== "string" || value.length === 0 || value.length > MAX_INPUT_PATH_LENGTH) return false;
   if (value.startsWith("/") || value.includes("\\") || /[\u0000-\u001f\u007f]/u.test(value)) return false;
   const segments = value.split("/");
-  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) return false;
-  return !segments.includes(".terraform");
+  return !segments.some((segment) => segment.length === 0 || segment === "." || segment === "..");
 }
 
 function validateInputIndex(index) {

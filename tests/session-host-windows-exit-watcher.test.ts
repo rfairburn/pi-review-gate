@@ -88,7 +88,6 @@ test("Windows exit-watcher source contract: fail-closed states and exact witness
 test("Windows exit-watcher source contract: exclusive root-bound publication only", () => {
   assert.match(code, /Get-ValidatedRootPath/);
   assert.match(code, /IsPathRooted\(\$Candidate\)/);
-  assert.match(code, /'\.terraform'/);
   assert.match(code, /FileAttributes\]::ReparsePoint/);
   assert.match(code, /\$RequestNonce \+ '\.ready\.json'/);
   assert.match(code, /\$RequestNonce \+ '\.result\.json'/);
@@ -111,7 +110,6 @@ test("Windows exit-watcher source contract: root is fully qualified before norma
   const deviceGuard = validator.indexOf("$Candidate.StartsWith(");
   const driveCheck = validator.indexOf("$isDriveAbsolute = $Candidate -match");
   const uncCheck = validator.indexOf("$isUncAbsolute = $Candidate -match");
-  const terraformCheck = validator.indexOf("'.terraform'");
   const normalize = validator.indexOf("[System.IO.Path]::GetFullPath($Candidate)");
   const filesystemAccess = validator.indexOf("[System.IO.File]::GetAttributes(");
 
@@ -119,7 +117,6 @@ test("Windows exit-watcher source contract: root is fully qualified before norma
   assert.ok(validator.includes(String.raw`$isUncAbsolute = $Candidate -match '\A\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$)'`));
   assert.match(validator, /if \(-not \(\$isDriveAbsolute -or \$isUncAbsolute\) -or\s+-not \[System\.IO\.Path\]::IsPathRooted\(\$Candidate\)\)/);
   assert.ok(deviceGuard >= 0 && driveCheck > deviceGuard && uncCheck > driveCheck);
-  assert.ok(terraformCheck >= 0 && terraformCheck < normalize);
   assert.ok(normalize > uncCheck && filesystemAccess > normalize, "reject relative/device paths before canonicalization or descent");
 });
 

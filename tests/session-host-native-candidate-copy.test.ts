@@ -259,34 +259,6 @@ test("candidate copy refuses to overwrite an existing destination leaf and prese
     "the pre-existing destination leaf permissions are preserved");
 });
 
-test("candidate copy prunes every .terraform subtree before inspecting it", () => {
-  const root = retainedFixtureRoot("terraform");
-  const source = join(root, "source");
-  const destination = join(root, "destination");
-  mkdirSync(source, { mode: 0o700 });
-  mkdirSync(destination, { mode: 0o700 });
-  writeFileSync(join(source, "kept.txt"), "kept", "utf8");
-
-  const terraform = join(source, ".terraform");
-  mkdirSync(terraform, { mode: 0o700 });
-  // A linked entry inside .terraform would fail the copy if it were inspected
-  // or descended into; pruning happens by name first.
-  symlinkSync(join(root, "missing-target"), join(terraform, "linked-entry"));
-  writeFileSync(join(terraform, "provider.bin"), "terraform-state", "utf8");
-  mkdirSync(join(source, "nested", ".terraform"), { recursive: true, mode: 0o700 });
-  writeFileSync(join(source, "nested", ".terraform", "inner.bin"), "inner", "utf8");
-
-  stageCandidateTreeForTest(source, destination);
-
-  assert.equal(readFileSync(join(destination, "kept.txt"), "utf8"), "kept");
-  assert.equal(existsSync(join(destination, ".terraform")), false,
-    "the top-level .terraform subtree is pruned before inspection");
-  assert.equal(existsSync(join(destination, "nested", ".terraform")), false,
-    "a nested .terraform subtree is pruned at its own depth");
-  assert.equal(existsSync(join(destination, "nested")), true,
-    "the ordinary sibling directory is still copied");
-});
-
 test("candidate copy enforces its leaf, file, byte, directory, and depth bounds", () => {
   const root = retainedFixtureRoot("bounds");
   const source = join(root, "source");

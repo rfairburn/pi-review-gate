@@ -277,8 +277,8 @@ anything moved; only a metadata change triggers the small input checksum, which
 distinguishes a real edit from a touch-only change. Only the explicit input roots are
 walked; other checkout trees, including top-level `node_modules`, `dist`, `.git`,
 `docs`, and `tests`, are not scanned or hashed. Added, edited, or deleted inputs
-invalidate; irrelevant or touch-only changes do
-not. A prepared generation is immutable installed code and keeps the same source
+invalidate; irrelevant or touch-only changes do not. A prepared generation is immutable
+installed code and keeps the same source
 identity as the checkout it came from, so starting a launcher from a prepared root never
 rebuilds recursively and never overwrites the checkout's freshness state.
 
@@ -334,7 +334,8 @@ and rechecks it again at every destructive boundary, so a host that becomes the 
 mid-pass keeps the remaining generations. When that entry is unavailable (a busy live
 holder or an unremovable artifact) cleanup is skipped with a truthful warning and the
 launch continues; a special leaf (FIFO, socket, or device name) inside the
-producer-owned cache is unlinked without being opened. Active sessions stay protected by the host's own
+producer-owned cache is unlinked without being opened. Active sessions stay protected by
+the host's own
 exclusive agent-directory ownership record; cache entries are not a second lifetime
 gate, and no consumer is killed to obtain space. No age/size quotas, per-file creation
 receipts, mount censuses, or checkpoint/history cleanup are added; the `.producer-active`

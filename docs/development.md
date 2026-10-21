@@ -600,8 +600,9 @@ Capacity never refuses creation. A stale lock — one whose recorded pid is gone
 whose record stays empty/malformed across several observations — is reclaimed instead
 of becoming a permanent stop condition; a live owner is left alone and the producer
 skips cleanup with a bounded warning, then still creates its generation. An existing
-session-host ownership record makes cleanup skip the cache entirely. A real filesystem failure
-or an unsafe entry leaves that generation in place and reports a warning; startup continues and never claims a cleanup it did not perform. Generations
+session-host ownership record makes cleanup skip the cache entirely. A real filesystem
+failure or an unsafe entry leaves that generation in place and reports a warning; startup
+continues and never claims a cleanup it did not perform. Generations
 are removed in deterministic directory-name order; there is no age, size, or
 retention policy. `options.replacement` lets the isolated Pi producer retry its own settled incomplete
 version root after confirming that nothing was published; it applies the same
@@ -643,9 +644,10 @@ process per descendant or exceeding the platform argument limit; any identity-qu
 failure aborts that pass with a truthful warning instead of walking on with missing
 data, and when the bulk tool is unavailable the same walk falls back to one no-follow
 `unlink` per name. Ordinary direct-child entries and nested content in a selected
-disposable generation remain subject to those confinement rules. Partial removal
-leaves the entry counted for a later retry. These are public path-API fences, not an atomic sandbox
-against a malicious same-user writer. No real user cache is used by the focused tests.
+disposable generation remain subject to those confinement rules. Partial removal leaves
+the entry counted for a later retry. These are public path-API fences, not an atomic
+sandbox against a malicious same-user writer. No real user cache is used by the focused
+tests.
 
 Every in-flight generation carries one `.producer-active` marker, and the per-cache
 `.admission.lock` names its owner the same way: `<pid>` plus the owner's targeted birth

@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.189]
+## [0.1.0-dev.190]
 
 ### Added
 
@@ -118,11 +118,6 @@ dates.
 
 ### Changed
 
-- Removed infrastructure-specific directory handling from generic source/discovery,
-  copying and test harnesses (#481), with no replacement exclusion or configurable
-  special case. Generic input scopes, path/type/no-follow checks and ownership-confined
-  cleanup remain unchanged. Agent search-performance instructions are explicitly not
-  product requirements in the repository guide.
 - Session-host session operations now run through one presentation-independent local
   owning-host boundary over the host's single session manager (#473). Starting a session,
   admitting an authenticated background `SessionSpawn` sibling, resuming an exited row,
@@ -131,6 +126,16 @@ dates.
   stays a disposable view of those facts, and delegated children gain no new
   session-creation authority. No behavior, protocol, control, or setting changes. See
   [One owning host, one session manager](docs/session-host-alpha.md#one-owning-host-one-session-manager).
+
+## [0.1.0-dev.189]
+
+### Changed
+
+- Removed infrastructure-specific directory handling from generic source/discovery,
+  copying and test harnesses (#481), with no replacement exclusion or configurable
+  special case. Generic input scopes, path/type/no-follow checks and ownership-confined
+  cleanup remain unchanged. Agent search-performance instructions are explicitly not
+  product requirements in the repository guide.
 
 ## [0.1.0-dev.188]
 

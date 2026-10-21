@@ -343,13 +343,19 @@ test("a known fresh snapshot prefills the approved editable defaults and starts 
   focusPeerEntry(harness, "Listen address:");
   harness.send(ENTER);
   assert.equal(harness.controller.focus, "form");
-  const addressEditor = peerPaneText(harness).find((line) => line.startsWith("> Listen address:")) ?? "";
-  assert.ok(addressEditor.includes("*"), `the address editor opens prefilled: ${JSON.stringify(addressEditor)}`);
+  const addressEditor = harness.controller.renderForm(70, 26);
+  assert.ok(addressEditor.cursor, "the address editor exposes its actual input cursor");
+  const addressLines = assertPaneSafe(addressEditor.lines, 70, 26);
+  assert.equal(addressLines[addressEditor.cursor.row]?.trim(), "*",
+    "the actual address input row, not its border or help text, contains the prefilled value");
   harness.send(ESC);
   focusPeerEntry(harness, "Listen port:");
   harness.send(ENTER);
-  const portEditor = peerPaneText(harness).find((line) => line.startsWith("> Listen port:")) ?? "";
-  assert.ok(portEditor.includes("8088"), `the port editor opens prefilled: ${JSON.stringify(portEditor)}`);
+  const portEditor = harness.controller.renderForm(70, 26);
+  assert.ok(portEditor.cursor, "the port editor exposes its actual input cursor");
+  const portLines = assertPaneSafe(portEditor.lines, 70, 26);
+  assert.equal(portLines[portEditor.cursor.row]?.trim(), "8088",
+    "the actual port input row contains the prefilled value");
   harness.send(ESC);
   assert.deepEqual(harness.commands(), [], "opening and cancelling the prefilled editors emits nothing");
   assert.equal(harness.controller.visible, true);
@@ -463,8 +469,11 @@ test("unknown settings stay unknown: no fresh default is substituted and Enable 
 
   focusPeerEntry(harness, "Listen address:");
   harness.send(ENTER);
-  const editorLine = peerPaneText(harness).find((line) => line.startsWith("> Listen address:")) ?? "";
-  assert.ok(!editorLine.includes("*"), `the editor stays empty while settings are unknown: ${JSON.stringify(editorLine)}`);
+  const editorFrame = harness.controller.renderForm(70, 26);
+  assert.ok(editorFrame.cursor, "the unavailable-settings editor still exposes its actual input row");
+  const editorLines = assertPaneSafe(editorFrame.lines, 70, 26);
+  assert.ok(!(editorLines[editorFrame.cursor.row] ?? "").includes("*"),
+    "the actual input row, not just the label, has no wildcard while settings are unknown");
   assert.ok(!peerPaneText(harness).some((line) => line.includes("8088")));
   harness.send(ESC);
   assert.deepEqual(harness.commands(), [], "reading the empty editor sends nothing");

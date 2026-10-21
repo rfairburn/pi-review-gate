@@ -139,17 +139,21 @@ async function settingsSmoke(driver: MainPtyDriver, session: OwnedSession, works
   assert.equal(entry!.workspace, workspaceEditValue, "the actual Ctrl+G editor's changed value was persisted");
 }
 
-test("ChangeSignal.waitFor rechecks its exact predicate once at the unchanged deadline", async () => {
+test("the Main durable-journal signal rechecks its exact predicate once at the unchanged deadline", async () => {
+  // In-process frame/exit waits retain strict notification-only waitFor.
+  // Durable journals use waitForRecheck; a cadence beyond this unchanged 20ms
+  // deadline isolates its final recheck without any intervening polling tick.
+  const recheckIntervalMs = 1_000;
   let ready = false;
   let calls = 0;
-  const missed = new ChangeSignal().waitFor(() => (calls++, ready), 20, "missed notification");
+  const missed = new ChangeSignal().waitForRecheck(() => (calls++, ready), 20, "missed notification", undefined, recheckIntervalMs);
   queueMicrotask(() => { ready = true; }); // condition becomes true without notify()
   await missed;
   assert.equal(calls, 2, "one initial check plus one deadline recheck; no polling");
-  await assert.rejects(new ChangeSignal().waitFor(() => false, 20, "still false"), /^Error: still false: deadline exceeded$/);
+  await assert.rejects(new ChangeSignal().waitForRecheck(() => false, 20, "still false", undefined, recheckIntervalMs), /^Error: still false: deadline exceeded$/);
   let thrown = 0;
   const throwing = (): boolean => { if (thrown++ > 0) throw new Error("predicate"); return false; };
-  await assert.rejects(new ChangeSignal().waitFor(throwing, 20, "throwing"), /^Error: throwing: bounded event predicate failed$/);
+  await assert.rejects(new ChangeSignal().waitForRecheck(throwing, 20, "throwing", undefined, recheckIntervalMs), /^Error: throwing: bounded event predicate failed$/);
 });
 
 test("the complete restored-native-editor witness rejects stale narrow frames, partial repaints, and altered drafts", () => {

@@ -715,7 +715,9 @@ const DIAGNOSTICS_ENTRY_ROWS = 3;
  * Fixed height of the prominent incoming-consent band: heading, name, key
  * fingerprint, origin endpoint, remaining human window, and the review hint.
  * The band is reserved OUTSIDE the scrolling roster so it stays visible while
- * later rows are selected; it never collapses into a tiny indicator.
+ * later rows are selected; it never collapses into a tiny indicator. Main also
+ * reserves bounded compositor rows when a form or confirmation obscures this
+ * roster notice; that notification surface grants no approval authority.
  */
 const PEER_CONSENT_ALERT_ROWS = 6;
 /** Bounded display copies of coordinator DTO lists (render is bounded anyway). */

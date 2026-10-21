@@ -754,7 +754,11 @@ function syntheticPeerConsent(id: string, requestedAt = Date.now()): PeerUiConse
     requestedAt, expiresAt: requestedAt + 120_000 };
 }
 
-async function peerMainHarness(t: { after(callback: () => void): void }, configure?: (peer: FakePeerCoordinator) => void): Promise<{
+async function peerMainHarness(
+  t: { after(callback: () => void): void },
+  configure?: (peer: FakePeerCoordinator) => void,
+  extraDependencies: MainTestDependencies = {},
+): Promise<{
   harness: Harness; peer: FakePeerCoordinator; dispatch(action: SidebarAction): void; releases(): number;
 }> {
   const agentDir = makeMainTestDirectory("peer-ui-agent");
@@ -778,6 +782,7 @@ async function peerMainHarness(t: { after(callback: () => void): void }, configu
       const controller = new SidebarController({ ...options, now: peer.now }); controllers.push(controller); return controller;
     },
     createPeerCoordinator: (options) => { peer.options = options; return peer; },
+    ...extraDependencies,
   });
   await ready(harness);
   const controller = controllers[0];
@@ -806,6 +811,67 @@ async function reviewOldestPeerConsent(harness: Harness): Promise<void> {
     await nextTurn();
   }
   assert.fail("the actual rendered network pane never offered its pending consent row");
+}
+
+/** Rendered heading of the pending-consent notice (band or roster alert). */
+const INCOMING_ALERT = "Incoming connection request";
+/** Rows the pending-consent notice occupies; Main reserves the same fixed band height. */
+const PEER_ALERT_ROWS = 6;
+
+/** Activates the roster row whose complete rendered label is selected, with real host input only. */
+async function activateRosterRow(harness: Harness, label: string): Promise<void> {
+  for (let step = 0; step <= 12; step += 1) {
+    const selected = harness.writer.frames.at(-1)?.frame.lines
+      .map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))
+      .find((line) => line.startsWith("> "));
+    if (selected?.includes(label)) {
+      harness.terminal.emitInput(ENTER);
+      await nextTurn();
+      return;
+    }
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+  }
+  assert.fail(`the actual rendered roster never offered its ${label} row`);
+}
+
+/** Mutes the arrival bell first, so only the visual alert can prove the request is visible. */
+async function deliverMutedIncomingRequest(peer: FakePeerCoordinator, id: string): Promise<void> {
+  peer.publish({ settings: { ...peer.snapshot.settings!, bellEnabled: false } });
+  await nextTurn();
+  peer.incoming(syntheticPeerConsent(id));
+  await nextTurn();
+}
+
+/** Opens the latched consent dialog from the narrow (full-width) Network pane. */
+async function reviewOldestPeerConsentNarrow(harness: Harness): Promise<void> {
+  harness.sidebar!.openPeerMenu();
+  await nextTurn();
+  for (let step = 0; step < 40; step++) {
+    const selected = harness.writer.frames.at(-1)?.frame?.lines
+      .map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))
+      .find((line) => line.startsWith("> "));
+    if (selected?.startsWith("> ! Expected peer")) {
+      harness.terminal.emitInput(ENTER);
+      await nextTurn();
+      assert.equal(harness.sidebar!.peerConsentConfirmationActive, true);
+      return;
+    }
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+  }
+  assert.fail("the actual rendered narrow network pane never offered its pending consent row");
+}
+
+function emptySavedCatalog(agentDir: string): SavedSessionCatalog {
+  return {
+    agentDir,
+    sessionsRoot: join(agentDir, "sessions"),
+    revision: 1,
+    rows: [],
+    issues: [],
+    issueCount: 0,
+  };
 }
 
 async function nextTurn(): Promise<void> {
@@ -874,6 +940,12 @@ function plainLine(frame: ComposedHostFrame | undefined, row: number): string {
 function screenRowContaining(frame: ComposedHostFrame | undefined, text: string, fromRow = 1): number {
   return frame?.lines.findIndex((line, row) => row >= fromRow
     && line.replace(/\x1b\[[0-9;]*m/g, "").includes(text)) ?? -1;
+}
+
+/** Row of a pane header alone on its line, matched exactly so band text cannot shadow it. */
+function screenRowOfHeader(frame: ComposedHostFrame | undefined, header: string): number {
+  return frame?.lines.findIndex((line, row) => row >= 1
+    && line.replace(/\x1b\[[0-9;]*m/g, "").trim() === header) ?? -1;
 }
 
 function graphicsPngBase64(seed: number): string {
@@ -1070,6 +1142,247 @@ test("incoming peer alert and optional bell never steal native focus; hidden sid
     await nextTurn();
     assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 1);
     assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Incoming connection request"));
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("a muted request arriving above an open narrow New session form keeps focus and reserves its rows", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  try {
+    fillForm(harness.terminal, "/narrow-form");
+    await nextTurn();
+    const owner = harness.sidebar!.activeMainOwnerID;
+    assert.ok(owner, "a live native owner exists before the request arrives");
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    harness.terminal.setSize(40, 24); // narrow: the sidebar rectangle is a full-width overlay
+    await nextTurn();
+    await activateRosterRow(harness, "New session");
+    assert.equal(harness.sidebar!.focus, "form", "the narrow New session form opened before the request arrived");
+
+    // Capture the open pane's ownership and geometry before the asynchronous arrival.
+    const selection = harness.sidebar!.selectedId;
+    const opened = harness.writer.frames.at(-1)?.frame;
+    assert.equal(screenRowContaining(opened, "New session"), 1, "the open form owns every content row");
+    assert.equal(plain(opened).includes(INCOMING_ALERT), false, "nothing is pending yet");
+    const resizesBeforeArrival = harness.manager!.resizeCalls.length;
+
+    await deliverMutedIncomingRequest(peer, "narrow-new");
+
+    const frame = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(frame).includes("New session"), "the form still owns the sidebar pane");
+    assert.equal(screenRowContaining(frame, INCOMING_ALERT), 1,
+      "an arrival while the form is open still reserves its rows above the pane");
+    assert.equal(screenRowContaining(frame, "New session"), 1 + PEER_ALERT_ROWS,
+      "the form pane starts below genuinely reserved rows instead of under an overlay");
+    assert.deepEqual(harness.manager!.resizeCalls.at(-1), { cols: 40, rows: 24 - 1 - PEER_ALERT_ROWS, ids: [owner] },
+      "the band takes real compositor rows rather than covering geometry the child still claims");
+    assert.ok(harness.manager!.resizeCalls.length > resizesBeforeArrival,
+      "the arrival reflowed the child to the reduced native pane");
+    assert.equal(harness.sidebar!.focus, "form", "arrival never takes focus from the open form");
+    assert.equal(harness.sidebar!.selectedId, selection, "arrival never changes the roster selection");
+    assert.equal(harness.sidebar!.visible, true, "arrival never toggles sidebar visibility");
+    assert.equal(harness.sidebar!.activeMainOwnerID, owner, "arrival never changes the native owner");
+    assert.equal(harness.sidebar!.capturePeerConsentPresentation(), undefined,
+      "the notification band grants no approval authority");
+    assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 0,
+      "the muted bell is never written and the alert does not depend on it");
+
+    peer.publish({ notice: "Unrelated metadata update" });
+    await nextTurn();
+    assert.equal(screenRowContaining(harness.writer.frames.at(-1)?.frame, INCOMING_ALERT), 1,
+      "the band persists across an unrelated redraw while the request stays pending");
+
+    peer.publish({ consents: [] });
+    await nextTurn();
+    const settled = harness.writer.frames.at(-1)?.frame;
+    assert.equal(plain(settled).includes(INCOMING_ALERT), false, "the band dismisses when the request settles");
+    assert.equal(screenRowContaining(settled, "New session"), 1, "the form pane regains the reserved rows");
+    assert.deepEqual(harness.manager!.resizeCalls.at(-1), { cols: 40, rows: 23, ids: [owner] },
+      "the child regains its full native height");
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("a muted request arriving above an open narrow Saved conversations picker stays visible", async (t) => {
+  const { harness, peer } = await peerMainHarness(t, undefined, {
+    listSavedCatalog: async ({ agentDir }) => emptySavedCatalog(agentDir),
+  });
+  try {
+    fillForm(harness.terminal, "/narrow-saved");
+    await nextTurn();
+    const owner = harness.sidebar!.activeMainOwnerID;
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    harness.terminal.setSize(40, 24);
+    await nextTurn();
+    await activateRosterRow(harness, "Saved conversations");
+    assert.equal(harness.sidebar!.focus, "form", "the narrow Saved picker opened before the request arrived");
+    const selection = harness.sidebar!.selectedId;
+    assert.equal(screenRowContaining(harness.writer.frames.at(-1)?.frame, "Saved conversations"), 1,
+      "the open picker owns every content row");
+
+    await deliverMutedIncomingRequest(peer, "narrow-saved");
+
+    const frame = harness.writer.frames.at(-1)?.frame;
+    assert.equal(screenRowContaining(frame, INCOMING_ALERT), 1,
+      "an arrival while the picker is open cannot hide the pending request");
+    assert.equal(screenRowContaining(frame, "Saved conversations"), 1 + PEER_ALERT_ROWS);
+    assert.equal(harness.sidebar!.focus, "form", "arrival never takes focus from the open picker");
+    assert.equal(harness.sidebar!.selectedId, selection, "arrival never changes the roster selection");
+    assert.equal(harness.sidebar!.activeMainOwnerID, owner, "arrival never changes the native owner");
+    assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 0);
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("a muted request arriving above the open narrow Network pane stays visible", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  try {
+    fillForm(harness.terminal, "/narrow-network");
+    await nextTurn();
+    const owner = harness.sidebar!.activeMainOwnerID;
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    harness.terminal.setSize(40, 24);
+    await nextTurn();
+    await activateRosterRow(harness, "Network");
+    assert.equal(harness.sidebar!.focus, "form", "the narrow Network pane opened before the request arrived");
+    const selection = harness.sidebar!.selectedId;
+    assert.equal(screenRowOfHeader(harness.writer.frames.at(-1)?.frame, "Network"), 1,
+      "the open network pane owns every content row");
+
+    await deliverMutedIncomingRequest(peer, "narrow-network");
+
+    const frame = harness.writer.frames.at(-1)?.frame;
+    assert.equal(screenRowContaining(frame, INCOMING_ALERT), 1,
+      "an arrival while the list is open keeps its identity and review hint above it");
+    assert.equal(screenRowOfHeader(frame, "Network"), 1 + PEER_ALERT_ROWS,
+      "the network pane moves down the reserved rows instead of under an overlay");
+    assert.equal(harness.sidebar!.focus, "form", "arrival never takes focus from the open network pane");
+    assert.equal(harness.sidebar!.selectedId, selection, "arrival never changes the roster selection");
+    assert.equal(harness.sidebar!.activeMainOwnerID, owner, "arrival never changes the native owner");
+    assert.equal(harness.sidebar!.capturePeerConsentPresentation(), undefined,
+      "neither the band nor the list grants approval authority without the written dialog");
+    assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 0);
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("a muted request arriving above an open ordinary confirmation stays visible in narrow and wide layouts", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  try {
+    fillForm(harness.terminal, "/narrow-confirm");
+    await nextTurn();
+    const owner = harness.sidebar!.activeMainOwnerID;
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    harness.terminal.setSize(40, 24);
+    await nextTurn();
+    harness.terminal.emitInput("q"); // the ordinary Quit host confirmation, not a consent dialog
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "confirm", "the ordinary confirmation opened before the request arrived");
+    assert.equal(harness.sidebar!.peerConsentConfirmationActive, false);
+    const selection = harness.sidebar!.selectedId;
+    assert.equal(screenRowContaining(harness.writer.frames.at(-1)?.frame, "Quit host?"), 1,
+      "the open confirmation owns every content row");
+
+    await deliverMutedIncomingRequest(peer, "narrow-confirm");
+
+    const narrow = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(narrow).includes("Quit host?"), "the confirmation stays open through the arrival");
+    assert.equal(screenRowContaining(narrow, INCOMING_ALERT), 1,
+      "an arrival while an ordinary confirmation is open still reserves its rows");
+    assert.equal(screenRowContaining(narrow, "Quit host?"), 1 + PEER_ALERT_ROWS);
+    assert.equal(harness.sidebar!.focus, "confirm", "arrival never takes focus from the open confirmation");
+    assert.equal(harness.sidebar!.selectedId, selection, "arrival never changes the roster selection");
+    assert.equal(harness.sidebar!.activeMainOwnerID, owner, "arrival never changes the native owner");
+    assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 0);
+
+    harness.terminal.setSize(80, 24);
+    await nextTurn();
+    const wide = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(wide).includes("Quit host?"), "the same confirmation stays open in the wide sidebar pane");
+    assert.equal(screenRowContaining(wide, INCOMING_ALERT), 1,
+      "a wide confirmation that replaces the roster also loses the hidden alert without the band");
+    assert.equal(harness.sidebar!.focus, "confirm");
+    assert.equal(harness.sidebar!.activeMainOwnerID, owner);
+
+    peer.publish({ consents: [] });
+    await nextTurn();
+    const settled = harness.writer.frames.at(-1)?.frame;
+    assert.equal(plain(settled).includes(INCOMING_ALERT), false, "the band dismisses when the request settles");
+    assert.equal(screenRowContaining(settled, "Quit host?"), 1, "the confirmation regains the reserved rows");
+    assert.equal(harness.sidebar!.focus, "confirm", "settlement never takes focus either");
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("a physically insufficient consent dialog refuses its own action while the alert band persists", async (t) => {
+  const { harness, peer, dispatch } = await peerMainHarness(t);
+  try {
+    fillForm(harness.terminal, "/narrow-consent");
+    await nextTurn();
+    const owner = harness.sidebar!.activeMainOwnerID;
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    harness.terminal.setSize(40, 40); // below the 53-column split; tall enough for the dialog plus alert
+    await nextTurn();
+    await deliverMutedIncomingRequest(peer, "narrow-consent");
+    await reviewOldestPeerConsentNarrow(harness);
+
+    const frame = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(frame).includes("Approve incoming connection?"), "the narrow consent dialog is open");
+    assert.equal(screenRowContaining(frame, INCOMING_ALERT), 1,
+      "the roster was replaced, so the reserved band keeps the request visible");
+    const candidate = harness.sidebar!.capturePeerConsentPresentation();
+    assert.ok(candidate && candidate.consentId === "narrow-consent",
+      "the complete dialog written beside the band keeps its own authority");
+
+    // A terminal too short for both is the dialog's problem to refuse, never a
+    // reason to drop the pending alert: the band stays and the partial frame
+    // revokes its token through the existing complete-written-frame fence.
+    harness.terminal.setSize(40, 8);
+    await nextTurn();
+    const tiny = harness.writer.frames.at(-1)?.frame;
+    assert.equal(screenRowContaining(tiny, INCOMING_ALERT), 1,
+      "the pending request is never traded away for pane comfort");
+    assert.equal(harness.sidebar!.capturePeerConsentPresentation(), undefined,
+      "a dialog that cannot show its full frame mints no candidate");
+    dispatch({
+      type: "peer-consent",
+      consentId: candidate.consentId,
+      renderToken: candidate.renderToken,
+      decision: candidate.decision,
+    });
+    assert.deepEqual(peer.decisions, [], "the revoked frame authorizes nothing, even with its own captured decision");
+    assert.equal(harness.sidebar!.focus, "confirm", "the band never takes focus");
+    assert.equal(harness.sidebar!.activeMainOwnerID, owner);
+    assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 0);
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("a wide roster beside an open form keeps its own alert and gains no redundant band", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  try {
+    fillForm(harness.terminal, "/wide-form");
+    await nextTurn();
+    const owner = harness.sidebar!.activeMainOwnerID;
+    const resizesBeforeForm = harness.manager!.resizeCalls.length;
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    await deliverMutedIncomingRequest(peer, "wide-form");
+
+    await activateRosterRow(harness, "New session");
+    assert.equal(harness.sidebar!.focus, "form");
+    const frame = harness.writer.frames.at(-1)?.frame;
+    const body = frame!.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    const left = body.map((line) => line.slice(0, 32)).join("\n");
+    const right = body.map((line) => line.slice(33)).join("\n");
+    assert.ok(left.includes("Sessions"), "the roster stays in the left pane");
+    assert.ok(left.includes(INCOMING_ALERT), "the roster keeps announcing the pending request");
+    assert.ok(right.includes("New session"), "the form stays in the right pane");
+    assert.ok(body[0]?.startsWith(" Sessions"), "the roster header keeps row 1 — no rows were reserved");
+    assert.equal(harness.manager!.resizeCalls.length, resizesBeforeForm,
+      "the visible roster case never resizes the child for a band");
+    assert.equal(harness.sidebar!.focus, "form");
+    assert.equal(harness.sidebar!.activeMainOwnerID, owner);
+    assert.equal(harness.terminal.writes.filter((value) => value === "\x07").length, 0);
   } finally { assert.equal(await closeWithSignal(harness), 0); }
 });
 

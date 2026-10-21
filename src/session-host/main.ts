@@ -954,10 +954,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       hostConfirmation: sidebar?.peerConsentConfirmationActive ?? false,
     };
     const basic = computeHostLayout(cols, rows, options);
-    // The normal narrow sidebar is hidden during Main focus. A bounded band
-    // keeps pending consent prominent without stealing focus or covering a
-    // child rectangle that geometry still claims is visible.
-    return peerUiSnapshot?.consents.length && basic.sidebar === undefined
+    // Match the redraw routes: forms and ordinary confirmations can replace
+    // the roster even when a sidebar rectangle exists. Reserve real rows
+    // whenever its notification is obscured; never probe by rendering or
+    // trade the alert away to preserve a form's minimum height.
+    const rosterShowsNotice = basic.sidebar !== undefined
+      && (basic.form !== undefined || (options.focus !== "form" && options.focus !== "confirm"));
+    return peerUiSnapshot?.consents.length && !rosterShowsNotice
       ? computeHostLayout(cols, rows, { ...options, bannerRows: 6 })
       : basic;
   }

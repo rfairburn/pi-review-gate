@@ -214,14 +214,26 @@ display is part of the same implemented grant scope, a lost stream is stale or u
 with the deliberate target preserved, and no local row, sibling destination, or silent
 fallback replaces it.
 
-At this ordered interim slice, remote keyboard and mouse input, remote clipboard
-attribution, remote creation, `SessionSpawn`, and resume are unimplemented. Close is
-owner-routed from the requesting sidebar's actually written highlighted row. Native
-input still fails closed: packets are not forwarded to a remote owner, and no local child
-receives them on that stream's behalf.
-That is an interim ordering bound, not a permanent view-only policy. Authenticated local
-and SSH clipboard copying is unchanged, nothing is broadcast, no remote copy request is
-transported, and raw PTY OSC 52 stays denied.
+Remote keyboard, canonical mouse, whole text paste, and text-copy transport now exist only
+as an internal, explicitly opted-in extension of that same content lane; the production
+Main caller never enables it, and there is no CLI, environment, configuration, or UI
+opt-in, live-child retrofit, human handoff, or system-environment change. Without that
+opt-in, native input still fails closed: packets are not forwarded to a remote owner and
+no local child receives them on that stream's behalf, so ordinary remote viewing
+remains display-only. When an explicit host caller supplies the closed internal seam,
+`native-input-copy-v1` negotiation is explicit and default-empty. Every protected write
+is re-proved against the actually written, uncovered, Main-focused viewer frame plus
+current owner facts, the current TLS-proved peer key, remembered pin, directional
+grant, endpoint, subscription, and selection. That dynamic proof runs before every write
+and is re-checked after callback reentry; the source token is descriptive rather than a
+grant or lease. A whole paste is validated up to exactly 1 MiB of decoded UTF-8 before
+one PTY handoff and is never truncated, and a completed copy reaches only its exact
+initiating viewer. Input submission reports `not-sent` only before any transport-write invocation,
+`submitted` only as local transport completion, and a possibly invoked loss or source change as
+`unknown`, with no replay, retry, or cancellation claim. Remote creation, `SessionSpawn`,
+resume, and human handoff remain unimplemented. The default-off state is an interim
+integration boundary, not a permanent view-only policy. Close remains owner-routed from
+the requesting sidebar's actually written highlighted row, as described below.
 
 The optional owner Close capability runs over the existing roster channel, not a new
 listener or permission kind. The current TLS-proved key, pin, and owner's receiving
@@ -265,14 +277,18 @@ requires that readiness before both local user writes and non-user terminal repl
 unknown bootstrap modes or requested installation failures refuse without downgrade,
 raw fallback, queue or replay. Non-user input cannot authorize a copy.
 
-Only future explicitly opted-in native children receive a cloned environment with
+Only explicitly opted-in native children receive a cloned environment with
 Pi's static `PI_CLIPBOARD_OSC52=1` capture flag; normal descendant inheritance stays
 inside that hosted process tree. Native owner OS clipboard writes stay unchanged.
 Local-origin capsules still require existing current/liveness/written/uncovered source
-proof; viewer-origin capsules never fall back to the owner's outer terminal. No
-production Main caller enables this mode, so no forced capture, remote input, viewer
-clipboard egress, native Pi change, system environment change or live retrofit is
-activated by this checkpoint.
+proof; viewer-origin capsules never fall back to the owner's outer terminal or local
+clipboard callback. Under the same internal host opt-in, a completed viewer-origin copy
+travels only to its exact initiating viewer, with the full native encoded payload up to
+the unchanged 100,000-character producer bound retained whole. No production Main caller
+enables this mode, so no forced capture, native input or copy transport, native Pi change,
+system environment change, or live retrofit is activated by this checkpoint. Authenticated
+local and SSH clipboard copying is unchanged, nothing is broadcast, and raw PTY OSC 52
+stays denied.
 
 The selected text is transient transport data, not a new diagnostic, roster, or clipboard
 history. Source stacks are inspected in memory and not logged. HMAC authenticates but

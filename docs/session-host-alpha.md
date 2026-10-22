@@ -624,12 +624,16 @@ defeat an active interceptor during first pairing. Later key verification protec
 continuity, not the authenticity of that first acceptance. No mandatory QR/code ceremony
 is added. Protected identity/trust storage is described below. The network sidebar
 supplies the explicit pairing controls, saved connection preferences and bounded automatic
-recovery; discovery and clipboard attribution remain unimplemented. The session-level
-protocols implemented so far are the bounded roster-metadata channel described next and
-the single-row native viewport lane described under
+recovery; discovery remains unimplemented. The session-level protocols implemented so far
+are the bounded roster-metadata channel described next, the single-row native viewport
+lane described under
 [Selected native viewport](#selected-native-viewport-interim-display-scope), and the
-[owner-routed Close](#owner-close-transport-foundation). Remote terminal input,
-remote clipboard attribution, and the other session operations remain unimplemented. Native client-only mobile implementations can use this trust model;
+[owner-routed Close](#owner-close-transport-foundation). The content lane also carries an
+internal, explicitly opted-in native input and text-copy extension; normal production
+Main does not enable it (see
+[Internal default-off native input and copy](#internal-default-off-native-input-and-copy)).
+Remote creation, `SessionSpawn`, resume, and human handoff remain unimplemented. Native
+client-only mobile implementations can use this trust model;
 ordinary browser WebSockets do not expose self-signed certificate pinning and are not
 claimed supported.
 
@@ -823,8 +827,9 @@ intact: that view uses the owning peer's separate receiving grant. Revocation by
 owning peer makes the selected display unavailable. None of Disconnect, Remove, or Revoke
 stops remote work. A receiving grant has no view-only
 variant: displaying the selected row's native viewport is part of the same implemented
-display scope, not a separate permission kind. Remote input forwarding remains
-unimplemented at this interim checkpoint.
+display scope, not a separate permission kind. Remote input forwarding and copy travel
+only through the internal, default-off native I/O extension described below; ordinary
+remote viewing forwards neither, and no production Main caller enables that extension.
 
 **Ownership and shutdown.** Several destinations may be connected at once. Every
 destination's rows project into the same existing left roster as typed remote cards, and
@@ -835,9 +840,12 @@ honest current or stale state, and Enter or a drawn left click on it selects tha
 native viewport for display (see
 [Selected native viewport](#selected-native-viewport-interim-display-scope)) without
 changing any local row's process, input ownership, saved state, or the roster. Remote
-keyboard and mouse input, remote creation, `SessionSpawn`, resume, and clipboard
-attribution remain unimplemented at this ordered interim slice. Close uses the
-highlighted remote row and its owner, independently of the displayed stream. Host shutdown
+keyboard, canonical mouse, whole text paste, and text-copy transport exist only in the
+internal, explicitly opted-in native I/O extension described below; no production Main
+caller enables it, so ordinary remote viewing remains display-only and forwards
+no native input or copy. Remote creation, `SessionSpawn`, resume, and human handoff remain unimplemented
+at this ordered interim slice. Close uses the highlighted remote row and its owner,
+independently of the displayed stream. Host shutdown
 closes only this host's owned local network
 resources and waits for that local settlement; an unconfirmed close is reported and
 retains agent-directory ownership. It never waits for a remote receipt or remote work.
@@ -939,17 +947,20 @@ semantic source cannot authorize a click or copy. Repainting the same accepted f
 not invent a new source receipt. Input modes and cursor facts carried with a
 viewport are inert observations for rendering; they grant no input.
 
-This is an ordered interim slice, not a finished remote session surface. Remote keyboard
-and mouse input, remote clipboard attribution, remote creation, `SessionSpawn`, and
-resume are not implemented. The owner-routed Close controls are described below.
-Native input still fails closed: while a
-remote viewport is displayed, native-pane keyboard, paste, and mouse packets are not
-forwarded to the remote owner and no local child receives them on that stream's behalf.
-That ordering is an interim implementation bound, not a permanent view-only mode,
-permission kind, or policy. Authenticated local and SSH clipboard copying, ordinary
-standalone Pi, and local host input are unchanged: nothing is broadcast, no remote copy
-request is transported, raw PTY OSC 52 stays denied, and no last-input-origin inference is
-added. Native Pi clipboard-producer coverage keeps the limits the
+This is an ordered interim slice, not a finished remote session surface. Keyboard,
+canonical mouse, whole text paste, and text copy have an implemented internal, explicitly
+opted-in transport, but normal production Main leaves it off; the
+[internal native I/O section](#internal-default-off-native-input-and-copy) states its
+boundaries. Without that opt-in, native input still fails closed: while a remote viewport
+is displayed, native-pane keyboard, paste, and mouse packets are not forwarded to the
+remote owner and no local child receives them on that stream's behalf. The default-off
+state is an interim integration boundary, not a permanent view-only mode, permission
+kind, or policy. Remote creation, `SessionSpawn`, resume, and human handoff are not
+implemented. The owner-routed Close controls are described below.
+Authenticated local and SSH clipboard copying, ordinary standalone Pi, and local host
+input are unchanged: nothing is broadcast, no remote copy request is transported by
+default, raw PTY OSC 52 stays denied, and no last-input-origin inference is added. Native
+Pi clipboard-producer coverage keeps the limits the
 [clipboard section](#clipboard-copying-over-ssh) describes.
 
 ### Owner Close transport foundation
@@ -990,8 +1001,9 @@ deliberate Close opens confirmation; it never opens automatically or replays the
 request. Every still-addressable target retains that reminder until it is acted on or
 positive owner/run/row disappearance or settlement makes it obsolete. An exited or
 settled-error row still sends removal to its owner, not local deletion. Local Close,
-Quit, saved-history deletion and stream selection are unchanged. This does not enable
-remote keyboard, mouse, creation, resume, or clipboard delivery.
+Quit, saved-history deletion and stream selection are unchanged. Close itself enables no
+native input, paste, copy, creation, or resume; those remain the separate, internal
+default-off extension below where implemented.
 
 ## Focus, display, and status
 
@@ -1055,7 +1067,9 @@ a child, and every session keeps running in the background. The roster keeps its
 their ordering, the host stays up and able to display a session again, and nothing is
 stopped, removed, closed, quit, or deleted; the Quit host row still shuts its children down
 exactly as before. Input and clipboard routing follow the actually displayed owner, so while
-nothing is displayed nothing is fed to or copied on behalf of a session. Enter on a row
+nothing is displayed nothing is fed to or copied on behalf of a session; for a remote
+viewport this routing exists only under the internal native I/O opt-in, and otherwise
+nothing is fed or copied on its behalf. Enter on a row
 displays that session again and an already-running child is never restarted; a restart of an
 exited row that was still in flight is cancelled instead of displaying itself over the
 detached view. `n` is a roster-focus control: inside a form field it stays ordinary typed
@@ -1312,29 +1326,93 @@ client verifies delivery. Existing terminal permissions, multiplexers, and nativ
 configuration or multiplexer passthrough is forced. A terminal or multiplexer that
 disables/does not implement clipboard writes may discard the request. There is no
 clipboard read, paste, synchronization, image transfer, or remote-host backend here. The
-same routing follows the actually displayed owner: while a remote viewport is displayed,
-this host has no displayed local owner to copy for, a remote copy request is not
-transported, and nothing is broadcast to a child or a peer.
+default routing follows the actually displayed owner: while a remote viewport is
+displayed, this host has no displayed local owner to copy for, a remote copy request is
+not transported, and nothing is broadcast to a child or a peer. Under the internal native
+I/O opt-in described next, a completed remote copy is delivered only to its initiating
+viewer.
 
-#### Inert hosted input-origin mode
+#### Internal default-off native input and copy
 
-An internal `nativeInputOriginFraming` option is disabled by default and is not enabled
-by production Main. For future explicitly opted-in hosted native children only, the
-host requests bootstrap mode `1` and waits for authenticated decoder readiness before
-writing either user input or terminal-query responses. There is no raw fallback,
-queued replay, or late reporter-HELLO readiness guess. User input has local origin;
-query replies have non-user origin and cannot authorize a clipboard copy. Unknown
-bootstrap modes and requested bridge-installation failures refuse instead of downgrading.
+An internal, explicitly opted-in extension of the content lane can carry native keyboard,
+canonical mouse, whole text paste, and text-copy results between one remote viewer and the
+exact native child that viewer displays. It is absent by default. An explicit host caller
+sets the closed internal `MainDependencies.nativeInputOriginFraming?: boolean` dependency
+seam, which defaults to false; when it is true, Main itself supplies both native I/O
+callbacks to the coordinator. The production Main caller never enables the seam. There
+is no CLI,
+environment, configuration, or UI opt-in flag, no standalone or live-child retrofit, and
+no system-environment change. Existing defaults, native Pi, protected state, Close, and
+the sidebar UI are otherwise unchanged. This is internal wiring and an acceptance
+boundary, not a production activation or a human handoff path.
 
-In that opt-in mode, a cloned native child environment uses Pi's supported static
-`PI_CLIPBOARD_OSC52=1` capture flag. It inherits normally through that hosted process
-tree, including nested Pi; the system environment and standalone launches outside the
-tree stay unchanged. Native owner-side OS clipboard writes are not replaced or
-suppressed. Authenticated local-origin capsules reuse the existing live, current,
-actually-written/uncovered Main-source fences before outer-terminal relay. Viewer-origin
-capsules are denied local fallback; initiating-viewer delivery is not implemented.
-This mode is not a platform or physical clipboard certification, and it does not change
-already-running children or activate remote input/copy transport.
+Negotiation is explicit and default-empty: `native-input-copy-v1` is offered only by that
+opt-in, and knowing or acknowledging the identifier grants no authority. The owner side
+binds one viewer to one existing content subscription and states a host-written source;
+the viewer side only describes and submits against that exact source. On the child side,
+the same internal opt-in requests bootstrap mode `1` and requires an authenticated
+readiness statement before writing user input or terminal-query responses. Unknown
+bootstrap modes and requested bridge-installation failures refuse without downgrade, raw
+fallback, queued replay, or a late readiness guess. Local-origin and non-user origins keep
+their existing local-path fences; non-user input cannot authorize a copy.
+
+**Input authority.** Every protected write is measured against the frame the writer
+actually committed: one uncovered, Main-focused remote viewer frame, with the exact
+host-written source (owner run and row, native session id and epoch, viewer revision,
+canonical geometry and revision, and source commitment) and observed input modes.
+The owner independently compares those expected facts with its current source and binds
+the commitment to its current private registration identity and generation; those private
+registration facts are not exported. Current TLS-proved peer key, remembered pin,
+directional receiving grant, endpoint, subscription, and selection are also required. The same dynamic proof runs before every protected write and
+is re-checked after the caller's callback returns, so reentrant code cannot leave a write
+admitted. The source token is a descriptive commitment, not a grant; no registry, second
+manager, permission kind, or controller lease is added. The owner's own Main pane need not
+display or focus the controlled row.
+
+With semantic source and modes unchanged, ordinary terminal output, a new snapshot
+object, or a new publish sequence does not stall input. A semantic native-source or mode-only change requires a real writer boundary even
+when the visible bytes are identical. Keyboard packets, canonical content-coordinate SGR
+mouse reports, and whole text pastes are the only input kinds; images and files are not
+expressible. A paste is validated whole as decoded UTF-8 at up to exactly 1,048,576 bytes
+before one PTY handoff, never truncated; bracketed-paste markers are added only when the
+child's current native mode asks for them. The child authenticates an entire viewer
+logical dispatch before any native listener sees it, using a technical assembly bound of
+1,048,588 bytes (the 1 MiB body plus its two six-byte paste markers). Local input,
+non-user terminal-query replies, and legacy streaming keep their unchanged paths. Atomic
+assembly and admission are protocol boundaries, not an operating-system delivery
+guarantee.
+
+**Text copy.** Only the exact initiating viewer receives a completed copy; there is no
+owner outer-terminal or local clipboard fallback, broadcast, raw OSC 52 relay, or
+highest-input-dispatch filter. An asynchronous copy caused by earlier input A still
+arrives after input B when it is still valid, because copies are ordered by their own
+emission sequence, not by input dispatch id. The full native producer payload is retained:
+up to 100,000 canonical base64 characters, representing at most 75,000 decoded text
+bytes. Small copies may fit inline; paging preserves the complete encoded string as
+ASCII bytes, without reducing the producer bound to a single message.
+The native producer and OS clipboard writer are unchanged. An explicitly opted-in hosted
+child tree receives the static `PI_CLIPBOARD_OSC52=1` capture setting, and it inherits
+only inside that tree; standalone launches and the system environment stay unchanged, and
+no clipboard image push, read, or synchronization is added. The existing 64 MiB
+whole-viewport assembly bound is unchanged.
+
+**Outcomes.** `not-sent` is possible only before any transport-write invocation;
+`submitted` means only that local transport writes returned, never that the owner or
+child executed anything. If a transport write may have been invoked, loss, rejection,
+malformed results, or source changes leave the handoff `unknown`, with no replay, retry,
+or cancellation claim. Refusals, an oversize paste, or a full or
+busy queue use one brief non-modal notice; they never open a dialog, steal focus, or
+truncate input.
+
+Close, Disconnect, Remove, Revoke, and stream loss keep their existing boundaries. Close
+is authorized only by the highlighted host/run/row plus its actual written receipt or
+confirmation, independently of the native tuple, epoch, modes, selected stream, or viewer
+lease. Disconnect, Remove, Revoke, or a lost stream does not stop work the owner already
+accepted; a local receiving-side Revoke does not block this side's outbound view; and
+retiring a viewer may legitimately recompute a row's minimum size, with the last
+canonical size retained at zero viewers. This extension is not a platform, physical
+clipboard, or native-Windows certification, and it cannot retrofit an already-running
+child.
 
 #### Isolated manual SSH clipboard comparison
 

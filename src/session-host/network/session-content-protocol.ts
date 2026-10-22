@@ -43,12 +43,22 @@
  * The publisher maps one already-observed owning-host snapshot into a transfer;
  * this schema can express only that session's owner row id, a bounded native
  * session id/epoch pair, geometry, input modes, and the native frame itself.
- * There is no transcript, configuration, auth, current-file, or clipboard
- * capsule field, and no raw child PTY byte or escape payload: frame line text is
- * restricted to the native serializer's visible text plus exactly the SGR forms
- * its own generator emits (allowlisted attributes and bounded palette/RGB
- * groups), and typing is validated by the same Kitty PNG validator the native
- * surface uses rather than by a weaker duplicate.
+ * The viewport payload has no transcript, configuration, auth, current-file, or
+ * clipboard capsule field, and no raw child PTY byte or escape payload: frame
+ * line text is restricted to the native serializer's visible text plus exactly
+ * the SGR forms its own generator emits (allowlisted attributes and bounded
+ * palette/RGB groups), and typing is validated by the same Kitty PNG validator
+ * the native surface uses rather than by a weaker duplicate.
+ *
+ * The optional native input / text-copy frames at the end of this module are an
+ * additive, default-off extension of the same lane: this file defines and
+ * validates their exact shapes, refuses any frame whose source and snapshot (or
+ * event) metadata describe different native tuples or geometry revisions, and
+ * packs and assembles them atomically. It offers and acknowledges no capability
+ * by default, wires no endpoint, listener, or provider, and never writes input or
+ * clipboard data anywhere. Until a future owner adapter re-checks its own current
+ * source and grant, a decoded native IO frame is a well-formed message and
+ * nothing more.
  */
 
 import { Buffer } from "node:buffer";
@@ -63,6 +73,7 @@ import {
 	type TerminalGraphicsPlacement,
 } from "../kitty-graphics";
 import type { SessionGeometry } from "../instances";
+import type { NativeClipboardEvent } from "../native-clipboard";
 import type {
 	TerminalCellRun,
 	TerminalColorSpec,
@@ -83,11 +94,48 @@ export const SESSION_CONTENT_MINOR = 0;
  */
 export const SESSION_CONTENT_REQUIRED_CAPABILITY = "native-viewport-v1";
 /**
- * Optional capabilities this implementation knows. None exist yet, so an
- * identifier offered by a peer is recorded only when it appears here and is
- * otherwise ignored — an unimplemented capability can never be assumed.
+ * Optional capability naming the native input / text-copy frames below.
+ *
+ * Knowing this identifier is never an offer and never an acknowledgement.
+ * Negotiation requires an explicit supported set whose default is empty, so an
+ * existing host or client keeps its exact legacy behavior — display only, no
+ * input authority, no clipboard transport — until a real provider that owns a
+ * written native source opts in.
+ */
+export const SESSION_CONTENT_NATIVE_IO_CAPABILITY = "native-input-copy-v1";
+/**
+ * Optional capabilities this lane negotiates without an explicit opt-in. There
+ * are none: unlike a purely additive capability, the native IO extension can
+ * carry input and clipboard data, so offering or acknowledging it on the
+ * strength of a peer's hello alone would be an activation. This value stays
+ * empty; {@link SESSION_CONTENT_IMPLEMENTABLE_OPTIONAL_CAPABILITIES} names what
+ * an explicit opt-in may enable.
  */
 export const SESSION_CONTENT_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Object.freeze([]);
+/**
+ * Optional capabilities this build can implement once a provider explicitly
+ * enables them. Being implementable is never an offer: negotiation still needs
+ * an explicit supported set whose default is empty, and an acknowledgement may
+ * never claim one this side did not offer.
+ */
+export const SESSION_CONTENT_IMPLEMENTABLE_OPTIONAL_CAPABILITIES: readonly string[] = Object.freeze([
+	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+]);
+
+/**
+ * Decoded UTF-8 bytes accepted by one atomic native text paste: exactly 1 MiB.
+ * This is a text bound, not a transport bound: messages stay within
+ * `maxFrameBytes` and one raw chunk stays within `maxChunkPayloadBytes`.
+ */
+export const NATIVE_TEXT_PASTE_MAX_BYTES = 1_048_576;
+/**
+ * Canonical encoded characters in one native text copy — the unchanged native
+ * producer bound (the pinned runtime's OSC 52 text limit), carried whole across
+ * bounded pages rather than reduced to a transport message size.
+ */
+export const NATIVE_COPY_MAX_ENCODED_CHARS = 100_000;
+/** Bytes in one host-issued native IO source token. */
+export const NATIVE_IO_MAX_SOURCE_TOKEN_BYTES = 128;
 
 /** One content subscription per channel; not configurable. */
 export const SESSION_CONTENT_MAX_SUBSCRIPTIONS_PER_CHANNEL = 1;
@@ -331,6 +379,13 @@ export interface SessionContentBeginFrame {
 	readonly sequence: number;
 	readonly geometry: SessionContentGeometry;
 	readonly inputModes: TerminalInputModes;
+	/**
+	 * Host-written native IO source. Present only when the optional native IO
+	 * capability was negotiated explicitly; null means the owner cannot state
+	 * one. Absent for every legacy publish, so an old view keeps its exact key
+	 * set and shape validation stays separate from any runtime capability gate.
+	 */
+	readonly inputSource?: NativeIoSource | null;
 	/** Exact decoded payload bytes of the canonical viewport JSON below. */
 	readonly byteLength: number;
 	readonly chunkCount: number;
@@ -353,6 +408,157 @@ export interface SessionContentEndTransferFrame {
 	readonly sequence: number;
 }
 
+/* ------------------------------------------------------------------------- *
+ * Native IO frame types (optional capability)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Exact host-written native IO source for one input or copy frame.
+ *
+ * `sourceToken` is an opaque commitment the owning host writes and later
+ * re-checks against its own live binding; nothing in this module derives it or
+ * treats it — nor the tuple, geometry, or modes — as authority for a write.
+ * There is deliberately no bootstrap secret, agent path, current file,
+ * configuration, permission, or lease field.
+ */
+export interface NativeIoSource {
+	readonly hostRunId: string;
+	/** Owner row id of the session, never a native conversation id. */
+	readonly sessionId: string;
+	readonly nativeSession: SessionContentNativeSessionRef;
+	readonly geometry: SessionContentGeometry;
+	/** Positive viewer revision: equal dimensions alone never identify a viewport. */
+	readonly viewerRevision: number;
+	readonly sourceToken: string;
+}
+
+/** Native input payload kinds. Image and file payloads are not expressible. */
+export type NativeIoInputKind = "keyboard" | "paste" | "mouse";
+
+/** One inline native input packet; only payloads that fit one message use it. */
+export interface SessionContentInputFrame {
+	readonly type: "input";
+	readonly subscriptionId: string;
+	readonly inputId: string;
+	/** Positive per-binding dispatch ordinal; never a u32-limited counter. */
+	readonly ordinal: number;
+	readonly source: NativeIoSource;
+	readonly inputModes: TerminalInputModes;
+	readonly kind: NativeIoInputKind;
+	/** Canonical base64 of the UTF-8 payload bytes. */
+	readonly data: string;
+}
+
+/** Begin of one atomic paged native text paste. */
+export interface SessionContentInputBeginFrame {
+	readonly type: "input_begin";
+	readonly subscriptionId: string;
+	readonly inputId: string;
+	readonly ordinal: number;
+	readonly source: NativeIoSource;
+	readonly inputModes: TerminalInputModes;
+	/** Only text pastes page; keyboard and mouse packets stay inline. */
+	readonly kind: "paste";
+	readonly byteLength: number;
+	readonly chunkCount: number;
+}
+
+export interface SessionContentInputChunkFrame {
+	readonly type: "input_chunk";
+	readonly subscriptionId: string;
+	readonly inputId: string;
+	readonly index: number;
+	/** Canonical base64 of one sequential payload slice. */
+	readonly data: string;
+}
+
+export interface SessionContentInputEndFrame {
+	readonly type: "input_end";
+	readonly subscriptionId: string;
+	readonly inputId: string;
+	readonly ordinal: number;
+}
+
+/**
+ * Fixed reasons a native copy can be unavailable; mirrors the producer's closed
+ * set in `./native-clipboard` without importing its runtime module.
+ */
+export type NativeIoCopyUnavailableReason = Extract<NativeClipboardEvent, { kind: "unavailable" }>["reason"];
+
+/**
+ * Copy payload carried by the wire: canonical base64 text, or a fixed reason,
+ * always together with the authenticated native tuple of the copy that caused
+ * it. Never a raw OSC 52 sequence and never image data.
+ *
+ * The tuple is the producer's own `sessionId`/`sessionEpoch`; it must agree with
+ * the frame's `source.nativeSession`, so a payload can never be attributed to a
+ * different native conversation than the one it was emitted for.
+ */
+export type NativeIoCopyEvent =
+	| {
+		readonly kind: "copy";
+		readonly encoded: string;
+		readonly sessionId: string;
+		readonly sessionEpoch: number;
+	}
+	| {
+		readonly kind: "unavailable";
+		readonly reason: NativeIoCopyUnavailableReason;
+		readonly sessionId: string;
+		readonly sessionEpoch: number;
+	};
+
+/** One inline native text copy that fits a single message. */
+export interface SessionContentCopyFrame {
+	readonly type: "copy";
+	readonly subscriptionId: string;
+	readonly copyId: string;
+	/** Positive emission order per binding; independent of `dispatchId`. */
+	readonly sequence: number;
+	readonly source: NativeIoSource;
+	/**
+	 * Native input dispatch that caused this copy. Informational only: it may
+	 * arrive out of order (an asynchronous copy from input A can follow B), so it
+	 * never orders, fences, or drops a copy.
+	 */
+	readonly dispatchId: number;
+	/**
+	 * Producer event for this copy. Its `sessionId`/`sessionEpoch` must equal
+	 * `source.nativeSession`; a frame that names two different conversations is
+	 * refused rather than merged.
+	 */
+	readonly event: NativeIoCopyEvent;
+}
+
+/** Begin of one atomic paged native text copy; never carries the payload. */
+export interface SessionContentCopyBeginFrame {
+	readonly type: "copy_begin";
+	readonly subscriptionId: string;
+	readonly copyId: string;
+	readonly sequence: number;
+	readonly source: NativeIoSource;
+	readonly dispatchId: number;
+	readonly byteLength: number;
+	readonly chunkCount: number;
+}
+
+export interface SessionContentCopyChunkFrame {
+	readonly type: "copy_chunk";
+	readonly subscriptionId: string;
+	readonly copyId: string;
+	readonly index: number;
+	/** Canonical base64 of one sequential slice of the ASCII encoded payload. */
+	readonly data: string;
+}
+
+export interface SessionContentCopyEndFrame {
+	readonly type: "copy_end";
+	readonly subscriptionId: string;
+	readonly copyId: string;
+	/** Repeats the begin sequence so an end cannot belong to another emission. */
+	readonly sequence: number;
+}
+
 export type SessionContentControlFrame =
 	| SessionContentHelloFrame
 	| SessionContentHelloAckFrame
@@ -369,7 +575,25 @@ export type SessionContentTransferFrame =
 	| SessionContentChunkFrame
 	| SessionContentEndTransferFrame;
 
-export type SessionContentFrame = SessionContentControlFrame | SessionContentTransferFrame;
+/**
+ * Optional native IO frames. No endpoint, listener, or provider consumes them
+ * yet: the reader recognizes them so a negotiated capability can use them
+ * later, and every current owner/viewer binding still refuses them as unknown.
+ */
+export type SessionContentNativeIoFrame =
+	| SessionContentInputFrame
+	| SessionContentInputBeginFrame
+	| SessionContentInputChunkFrame
+	| SessionContentInputEndFrame
+	| SessionContentCopyFrame
+	| SessionContentCopyBeginFrame
+	| SessionContentCopyChunkFrame
+	| SessionContentCopyEndFrame;
+
+export type SessionContentFrame =
+	| SessionContentControlFrame
+	| SessionContentTransferFrame
+	| SessionContentNativeIoFrame;
 
 const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze({
 	hello: new Set(["type", "service", "major", "minor", "capabilities"]),
@@ -393,9 +617,54 @@ const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze(
 		"inputModes",
 		"byteLength",
 		"chunkCount",
+		"inputSource",
 	]),
 	content_chunk: new Set(["type", "subscriptionId", "transferId", "index", "data"]),
 	content_end: new Set(["type", "subscriptionId", "transferId", "sequence"]),
+	input: new Set([
+		"type",
+		"subscriptionId",
+		"inputId",
+		"ordinal",
+		"source",
+		"inputModes",
+		"kind",
+		"data",
+	]),
+	input_begin: new Set([
+		"type",
+		"subscriptionId",
+		"inputId",
+		"ordinal",
+		"source",
+		"inputModes",
+		"kind",
+		"byteLength",
+		"chunkCount",
+	]),
+	input_chunk: new Set(["type", "subscriptionId", "inputId", "index", "data"]),
+	input_end: new Set(["type", "subscriptionId", "inputId", "ordinal"]),
+	copy: new Set([
+		"type",
+		"subscriptionId",
+		"copyId",
+		"sequence",
+		"source",
+		"dispatchId",
+		"event",
+	]),
+	copy_begin: new Set([
+		"type",
+		"subscriptionId",
+		"copyId",
+		"sequence",
+		"source",
+		"dispatchId",
+		"byteLength",
+		"chunkCount",
+	]),
+	copy_chunk: new Set(["type", "subscriptionId", "copyId", "index", "data"]),
+	copy_end: new Set(["type", "subscriptionId", "copyId", "sequence"]),
 });
 
 const REQUIRED_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze({
@@ -422,6 +691,39 @@ const REQUIRED_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.free
 	]),
 	content_chunk: new Set(["subscriptionId", "transferId", "index", "data"]),
 	content_end: new Set(["subscriptionId", "transferId", "sequence"]),
+	input: new Set([
+		"subscriptionId",
+		"inputId",
+		"ordinal",
+		"source",
+		"inputModes",
+		"kind",
+		"data",
+	]),
+	input_begin: new Set([
+		"subscriptionId",
+		"inputId",
+		"ordinal",
+		"source",
+		"inputModes",
+		"kind",
+		"byteLength",
+		"chunkCount",
+	]),
+	input_chunk: new Set(["subscriptionId", "inputId", "index", "data"]),
+	input_end: new Set(["subscriptionId", "inputId", "ordinal"]),
+	copy: new Set(["subscriptionId", "copyId", "sequence", "source", "dispatchId", "event"]),
+	copy_begin: new Set([
+		"subscriptionId",
+		"copyId",
+		"sequence",
+		"source",
+		"dispatchId",
+		"byteLength",
+		"chunkCount",
+	]),
+	copy_chunk: new Set(["subscriptionId", "copyId", "index", "data"]),
+	copy_end: new Set(["subscriptionId", "copyId", "sequence"]),
 });
 
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
@@ -601,6 +903,208 @@ function readChunkPayload(value: unknown, bounds: SessionContentBounds): Buffer 
 	return bytes;
 }
 
+/* ------------------------------------------------------------------------- *
+ * Optional native IO readers
+ *
+ * Every shape here is closed and bounded. These readers only establish what a
+ * frame may express: they never decide that a capability was negotiated, that a
+ * source is current, or that a write is allowed. Each helper returns owned,
+ * deeply frozen copies so no caller object can be aliased into a published
+ * frame.
+ * ------------------------------------------------------------------------- */
+
+const NATIVE_IO_SOURCE_KEYS: ReadonlySet<string> = new Set([
+	"hostRunId",
+	"sessionId",
+	"nativeSession",
+	"geometry",
+	"viewerRevision",
+	"sourceToken",
+]);
+/** Host-issued opaque commitment: bounded printable ASCII, never interpreted. */
+const NATIVE_IO_SOURCE_TOKEN_RE = /^[\x21-\x7e]+$/;
+/**
+ * One canonical viewer SGR mouse packet in CONTENT coordinates. Host-screen
+ * coordinates, legacy X10 packets, and pixel encodings are not expressible.
+ */
+const NATIVE_IO_MOUSE_RE = /^\x1b\[<(?:0|[1-9][0-9]{0,2});(?:[1-9][0-9]{0,3});(?:[1-9][0-9]{0,3})[Mm]$/;
+const NATIVE_IO_COPY_EVENT_KEYS: ReadonlySet<string> = new Set(["kind", "encoded", "sessionId", "sessionEpoch"]);
+const NATIVE_IO_COPY_UNAVAILABLE_KEYS: ReadonlySet<string> = new Set([
+	"kind",
+	"reason",
+	"sessionId",
+	"sessionEpoch",
+]);
+/** Fixed unavailable reasons; the union type keeps this set tied to the producer. */
+const NATIVE_IO_COPY_UNAVAILABLE_REASONS: ReadonlySet<NativeIoCopyUnavailableReason> =
+	new Set<NativeIoCopyUnavailableReason>(["unverified-native-origin", "unsupported-runtime"]);
+/**
+ * Native IO text decoder. Unlike the viewport decoder it keeps a leading BOM:
+ * U+FEFF is ordinary user text in an input or clipboard payload, so stripping it
+ * would change what the peer typed or copied, and would also hide a BOM-prefixed
+ * non-base64 copy payload from the canonical-encoding check. The viewport decoder
+ * is deliberately left unchanged.
+ */
+const nativeIoUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+/**
+ * Strict UTF-8 with exact text preservation. Invalid, overlong, or lone-surrogate
+ * encodings are refused: a payload is text or it is not transportable at all,
+ * never silently repaired, and never silently rewritten.
+ */
+function decodeNativeIoText(bytes: Uint8Array): string {
+	try {
+		return nativeIoUtf8.decode(bytes);
+	} catch {
+		fail("bad_frame");
+	}
+}
+
+function readNativeIoSourceToken(value: unknown): string {
+	if (typeof value !== "string" || value.length === 0) fail("bad_frame");
+	if (value.length > NATIVE_IO_MAX_SOURCE_TOKEN_BYTES) fail("bad_frame");
+	if (!NATIVE_IO_SOURCE_TOKEN_RE.test(value)) fail("bad_frame");
+	return value;
+}
+
+function isNativeIoInputKind(value: unknown): value is NativeIoInputKind {
+	return value === "keyboard" || value === "paste" || value === "mouse";
+}
+
+/** Validate one exact native IO source; the native tuple is always non-null. */
+function readNativeIoSource(value: unknown, bounds: SessionContentBounds): NativeIoSource {
+	if (!isPlainRecord(value)) fail("bad_frame");
+	readExactKeys(value, NATIVE_IO_SOURCE_KEYS, NATIVE_IO_SOURCE_KEYS, "bad_frame");
+	const nativeSession = readNativeSession(ownField(value, "nativeSession"), bounds);
+	if (nativeSession === null) fail("bad_frame");
+	return Object.freeze({
+		hostRunId: readIdentifier(ownField(value, "hostRunId"), bounds.maxIdentifierBytes),
+		sessionId: readIdentifier(ownField(value, "sessionId"), bounds.maxIdentifierBytes),
+		nativeSession,
+		geometry: readGeometry(ownField(value, "geometry"), bounds),
+		// A viewer revision is a positive count, never the zero a geometry starts at.
+		viewerRevision: readInteger(ownField(value, "viewerRevision"), 1, Number.MAX_SAFE_INTEGER),
+		sourceToken: readNativeIoSourceToken(ownField(value, "sourceToken")),
+	});
+}
+
+/**
+ * Exact structural equality of two sources. Equal dimensions are never enough:
+ * the epoch, the geometry revision, the viewer revision, and the host token must
+ * all agree, so an A→B→A viewport change is never treated as the original A.
+ * This is a comparison only; it grants and implies no authority.
+ */
+export function nativeIoSourceEquals(left: NativeIoSource, right: NativeIoSource): boolean {
+	return left.hostRunId === right.hostRunId
+		&& left.sessionId === right.sessionId
+		&& left.nativeSession.sessionId === right.nativeSession.sessionId
+		&& left.nativeSession.epoch === right.nativeSession.epoch
+		&& left.geometry.cols === right.geometry.cols
+		&& left.geometry.rows === right.geometry.rows
+		&& left.geometry.revision === right.geometry.revision
+		&& left.viewerRevision === right.viewerRevision
+		&& left.sourceToken === right.sourceToken;
+}
+
+/** One bounded native input payload slice, decoded by kind. */
+function readNativeInputData(value: unknown, kind: NativeIoInputKind, bounds: SessionContentBounds): Buffer {
+	const bytes = readChunkPayload(value, bounds);
+	if (kind === "paste" && bytes.length > NATIVE_TEXT_PASTE_MAX_BYTES) fail("transfer_too_large");
+	const text = decodeNativeIoText(bytes);
+	if (kind === "mouse" && !NATIVE_IO_MOUSE_RE.test(text)) fail("bad_frame");
+	return bytes;
+}
+
+/** Declared decoded byte length of one paged native text paste. */
+function readNativePasteByteLength(value: unknown, bounds: SessionContentBounds): number {
+	return readInteger(value, 1, Math.min(NATIVE_TEXT_PASTE_MAX_BYTES, bounds.maxTransferBytes));
+}
+
+/**
+ * One whole native text-copy payload: canonical base64 of UTF-8 text, bounded by
+ * the unchanged producer limit. Binary/image clipboard data is refused here.
+ */
+function readNativeCopyEncoded(value: unknown): string {
+	if (typeof value !== "string" || value.length === 0) fail("bad_frame");
+	if (value.length > NATIVE_COPY_MAX_ENCODED_CHARS) fail("transfer_too_large");
+	if (!BASE64_RE.test(value)) fail("bad_frame");
+	const bytes = Buffer.from(value, "base64");
+	if (bytes.length === 0 || bytes.toString("base64") !== value) fail("bad_frame");
+	decodeNativeIoText(bytes);
+	return value;
+}
+
+function readNativeCopyEvent(value: unknown, bounds: SessionContentBounds): NativeIoCopyEvent {
+	if (!isPlainRecord(value)) fail("bad_frame");
+	const kind = ownField(value, "kind");
+	if (kind !== "copy" && kind !== "unavailable") fail("bad_frame");
+	// Closed keys first: nothing outside the producer's event shape rides along.
+	readExactKeys(
+		value,
+		kind === "copy" ? NATIVE_IO_COPY_EVENT_KEYS : NATIVE_IO_COPY_UNAVAILABLE_KEYS,
+		kind === "copy" ? NATIVE_IO_COPY_EVENT_KEYS : NATIVE_IO_COPY_UNAVAILABLE_KEYS,
+		"bad_frame",
+	);
+	const tuple = {
+		// The same bound the native tuple uses on the wire, so the two are
+		// comparable; native id policy itself belongs to the producer.
+		sessionId: readOpaqueId(ownField(value, "sessionId"), bounds.maxIdentifierBytes),
+		sessionEpoch: readInteger(ownField(value, "sessionEpoch"), 1, Number.MAX_SAFE_INTEGER),
+	};
+	if (kind === "copy") {
+		return Object.freeze({ kind, encoded: readNativeCopyEncoded(ownField(value, "encoded")), ...tuple });
+	}
+	const reason = ownField(value, "reason");
+	if (typeof reason !== "string") fail("bad_frame");
+	if (!(NATIVE_IO_COPY_UNAVAILABLE_REASONS as ReadonlySet<string>).has(reason)) fail("bad_frame");
+	return Object.freeze({ kind, reason: reason as NativeIoCopyUnavailableReason, ...tuple });
+}
+
+/**
+ * A `content_begin` may describe a native IO source only for ITS OWN native
+ * snapshot: the source must name the same owner run, the same owner row, the
+ * same native tuple, and exactly the same geometry including its revision as the
+ * frame that carries it, and a frame that reports no native session cannot be
+ * handed a live tuple by its source. Two independently well-formed objects that
+ * describe different snapshots are refused, never merged into one publish.
+ *
+ * This is a coherence check and nothing else: it creates no permission, gate, or
+ * lease, and the source token remains non-authoritative.
+ */
+function checkInputSourceCoherence(inputSource: NativeIoSource, frame: {
+	readonly hostRunId: string;
+	readonly sessionId: string;
+	readonly nativeSession: SessionContentNativeSessionRef | null;
+	readonly geometry: SessionContentGeometry;
+}): void {
+	const nativeSession = frame.nativeSession;
+	// No native session in the frame means there is no tuple a source may claim.
+	if (nativeSession === null) fail("bad_frame");
+	if (inputSource.hostRunId !== frame.hostRunId) fail("bad_frame");
+	if (inputSource.sessionId !== frame.sessionId) fail("bad_frame");
+	if (inputSource.nativeSession.sessionId !== nativeSession.sessionId) fail("bad_frame");
+	if (inputSource.nativeSession.epoch !== nativeSession.epoch) fail("bad_frame");
+	// Equal dimensions are not enough: the geometry revision is part of identity.
+	if (inputSource.geometry.cols !== frame.geometry.cols
+		|| inputSource.geometry.rows !== frame.geometry.rows
+		|| inputSource.geometry.revision !== frame.geometry.revision) {
+		fail("bad_frame");
+	}
+}
+
+/**
+ * A copy names one authenticated native conversation twice: in the frame source
+ * and in the producer's event. The two must agree, so an inline payload can
+ * never be attributed to a different tuple, and an assembled copy keeps the
+ * header source and the event tuple consistent.
+ *
+ * Coherence only; no permission, gate, or lease is created here.
+ */
+function checkCopyTupleCoherence(source: NativeIoSource, event: NativeIoCopyEvent): void {
+	if (event.sessionId !== source.nativeSession.sessionId) fail("bad_frame");
+	if (event.sessionEpoch !== source.nativeSession.epoch) fail("bad_frame");
+}
+
 function validateFrame(frame: SessionContentFrame, bounds: SessionContentBounds): SessionContentFrame {
 	switch (frame.type) {
 		case "hello":
@@ -649,16 +1153,29 @@ function validateFrame(frame: SessionContentFrame, bounds: SessionContentBounds)
 		case "content_begin": {
 			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
 			readIdentifier(frame.transferId, bounds.maxIdentifierBytes);
-			readIdentifier(frame.hostRunId, bounds.maxIdentifierBytes);
-			readIdentifier(frame.sessionId, bounds.maxIdentifierBytes);
-			readNativeSession(frame.nativeSession, bounds);
+			const hostRunId = readIdentifier(frame.hostRunId, bounds.maxIdentifierBytes);
+			const sessionId = readIdentifier(frame.sessionId, bounds.maxIdentifierBytes);
+			const nativeSession = readNativeSession(frame.nativeSession, bounds);
 			readInteger(frame.sequence, 1, Number.MAX_SAFE_INTEGER);
-			readGeometry(frame.geometry, bounds);
+			const geometry = readGeometry(frame.geometry, bounds);
 			readInputModes(frame.inputModes);
 			const byteLength = readInteger(frame.byteLength, 1, bounds.maxTransferBytes);
 			const chunkCount = readInteger(frame.chunkCount, 1, byteLength);
 			const minimumChunks = Math.ceil(byteLength / bounds.maxChunkPayloadBytes);
 			if (chunkCount < minimumChunks) fail("invalid_frame");
+			// `inputSource` may exist only when the optional native IO capability was
+			// negotiated. Shape validation never asks whether it was: that gate belongs
+			// to a future endpoint, which this module does not wire or authorize. It
+			// must, however, describe THIS frame's own native snapshot.
+			if (Object.prototype.hasOwnProperty.call(frame, "inputSource")) {
+				if (frame.inputSource === undefined) fail("invalid_frame");
+				if (frame.inputSource !== null) {
+					checkInputSourceCoherence(
+						readNativeIoSource(frame.inputSource, bounds),
+						{ hostRunId, sessionId, nativeSession, geometry },
+					);
+				}
+			}
 			return frame;
 		}
 		case "content_chunk": {
@@ -671,6 +1188,75 @@ function validateFrame(frame: SessionContentFrame, bounds: SessionContentBounds)
 		case "content_end": {
 			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
 			readIdentifier(frame.transferId, bounds.maxIdentifierBytes);
+			readInteger(frame.sequence, 1, Number.MAX_SAFE_INTEGER);
+			return frame;
+		}
+		case "input": {
+			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+			readIdentifier(frame.inputId, bounds.maxIdentifierBytes);
+			readInteger(frame.ordinal, 1, Number.MAX_SAFE_INTEGER);
+			readNativeIoSource(frame.source, bounds);
+			readInputModes(frame.inputModes);
+			if (!isNativeIoInputKind(frame.kind)) fail("invalid_frame");
+			readNativeInputData(frame.data, frame.kind, bounds);
+			return frame;
+		}
+		case "input_begin": {
+			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+			readIdentifier(frame.inputId, bounds.maxIdentifierBytes);
+			readInteger(frame.ordinal, 1, Number.MAX_SAFE_INTEGER);
+			readNativeIoSource(frame.source, bounds);
+			readInputModes(frame.inputModes);
+			if (frame.kind !== "paste") fail("invalid_frame");
+			const byteLength = readNativePasteByteLength(frame.byteLength, bounds);
+			const chunkCount = readInteger(frame.chunkCount, 1, byteLength);
+			if (chunkCount < Math.ceil(byteLength / bounds.maxChunkPayloadBytes)) fail("invalid_frame");
+			return frame;
+		}
+		case "input_chunk": {
+			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+			readIdentifier(frame.inputId, bounds.maxIdentifierBytes);
+			readInteger(frame.index, 0, Number.MAX_SAFE_INTEGER);
+			readChunkPayload(frame.data, bounds);
+			return frame;
+		}
+		case "input_end": {
+			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+			readIdentifier(frame.inputId, bounds.maxIdentifierBytes);
+			readInteger(frame.ordinal, 1, Number.MAX_SAFE_INTEGER);
+			return frame;
+		}
+		case "copy": {
+			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+			readIdentifier(frame.copyId, bounds.maxIdentifierBytes);
+			readInteger(frame.sequence, 1, Number.MAX_SAFE_INTEGER);
+			const source = readNativeIoSource(frame.source, bounds);
+			readInteger(frame.dispatchId, 1, Number.MAX_SAFE_INTEGER);
+			// The producer's event tuple must be the source's native tuple.
+			checkCopyTupleCoherence(source, readNativeCopyEvent(frame.event, bounds));
+			return frame;
+		}
+		case "copy_begin": {
+			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+			readIdentifier(frame.copyId, bounds.maxIdentifierBytes);
+			readInteger(frame.sequence, 1, Number.MAX_SAFE_INTEGER);
+			readNativeIoSource(frame.source, bounds);
+			readInteger(frame.dispatchId, 1, Number.MAX_SAFE_INTEGER);
+			const byteLength = readInteger(frame.byteLength, 1, NATIVE_COPY_MAX_ENCODED_CHARS);
+			const chunkCount = readInteger(frame.chunkCount, 1, byteLength);
+			if (chunkCount < Math.ceil(byteLength / bounds.maxChunkPayloadBytes)) fail("invalid_frame");
+			return frame;
+		}
+		case "copy_chunk": {
+			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+			readIdentifier(frame.copyId, bounds.maxIdentifierBytes);
+			readInteger(frame.index, 0, Number.MAX_SAFE_INTEGER);
+			readChunkPayload(frame.data, bounds);
+			return frame;
+		}
+		case "copy_end": {
+			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+			readIdentifier(frame.copyId, bounds.maxIdentifierBytes);
 			readInteger(frame.sequence, 1, Number.MAX_SAFE_INTEGER);
 			return frame;
 		}
@@ -792,18 +1378,33 @@ function buildFrame(record: Record<string, unknown>, bounds: SessionContentBound
 			const byteLength = readInteger(ownField(record, "byteLength"), 1, bounds.maxTransferBytes);
 			const chunkCount = readInteger(ownField(record, "chunkCount"), 1, byteLength);
 			if (chunkCount < Math.ceil(byteLength / bounds.maxChunkPayloadBytes)) fail("bad_frame");
+			const hostRunId = readIdentifier(ownField(record, "hostRunId"), bounds.maxIdentifierBytes);
+			const sessionId = readIdentifier(ownField(record, "sessionId"), bounds.maxIdentifierBytes);
+			const nativeSession = readNativeSession(ownField(record, "nativeSession"), bounds);
+			const geometry = readGeometry(ownField(record, "geometry"), bounds);
+			const rawInputSource = ownField(record, "inputSource");
+			const inputSource = rawInputSource === undefined
+				? undefined
+				: rawInputSource === null ? null : readNativeIoSource(rawInputSource, bounds);
+			if (inputSource !== undefined && inputSource !== null) {
+				// Mixed A-frame / B-source metadata is refused, not merged.
+				checkInputSourceCoherence(inputSource, { hostRunId, sessionId, nativeSession, geometry });
+			}
 			return Object.freeze({
 				type,
 				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
 				transferId: readIdentifier(ownField(record, "transferId"), bounds.maxIdentifierBytes),
-				hostRunId: readIdentifier(ownField(record, "hostRunId"), bounds.maxIdentifierBytes),
-				sessionId: readIdentifier(ownField(record, "sessionId"), bounds.maxIdentifierBytes),
-				nativeSession: readNativeSession(ownField(record, "nativeSession"), bounds),
+				hostRunId,
+				sessionId,
+				nativeSession,
 				sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
-				geometry: readGeometry(ownField(record, "geometry"), bounds),
+				geometry,
 				inputModes: readInputModes(ownField(record, "inputModes")),
 				byteLength,
 				chunkCount,
+				// Absent unless the wire actually carried it, so a legacy begin keeps
+				// its exact key set and an old view is never handed a new field.
+				...(inputSource === undefined ? {} : { inputSource }),
 			});
 		}
 		case "content_chunk": {
@@ -822,6 +1423,104 @@ function buildFrame(record: Record<string, unknown>, bounds: SessionContentBound
 				type,
 				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
 				transferId: readIdentifier(ownField(record, "transferId"), bounds.maxIdentifierBytes),
+				sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
+			});
+		}
+		case "input": {
+			const kind = ownField(record, "kind");
+			if (!isNativeIoInputKind(kind)) fail("bad_frame");
+			const payload = readNativeInputData(ownField(record, "data"), kind, bounds);
+			return Object.freeze({
+				type,
+				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
+				inputId: readIdentifier(ownField(record, "inputId"), bounds.maxIdentifierBytes),
+				ordinal: readInteger(ownField(record, "ordinal"), 1, Number.MAX_SAFE_INTEGER),
+				source: readNativeIoSource(ownField(record, "source"), bounds),
+				inputModes: readInputModes(ownField(record, "inputModes")),
+				kind,
+				data: payload.toString("base64"),
+			});
+		}
+		case "input_begin": {
+			const byteLength = readNativePasteByteLength(ownField(record, "byteLength"), bounds);
+			const chunkCount = readInteger(ownField(record, "chunkCount"), 1, byteLength);
+			if (chunkCount < Math.ceil(byteLength / bounds.maxChunkPayloadBytes)) fail("bad_frame");
+			if (ownField(record, "kind") !== "paste") fail("bad_frame");
+			return Object.freeze({
+				type,
+				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
+				inputId: readIdentifier(ownField(record, "inputId"), bounds.maxIdentifierBytes),
+				ordinal: readInteger(ownField(record, "ordinal"), 1, Number.MAX_SAFE_INTEGER),
+				source: readNativeIoSource(ownField(record, "source"), bounds),
+				inputModes: readInputModes(ownField(record, "inputModes")),
+				kind: "paste",
+				byteLength,
+				chunkCount,
+			});
+		}
+		case "input_chunk": {
+			const payload = readChunkPayload(ownField(record, "data"), bounds);
+			return Object.freeze({
+				type,
+				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
+				inputId: readIdentifier(ownField(record, "inputId"), bounds.maxIdentifierBytes),
+				index: readInteger(ownField(record, "index"), 0, Number.MAX_SAFE_INTEGER),
+				data: payload.toString("base64"),
+			});
+		}
+		case "input_end": {
+			return Object.freeze({
+				type,
+				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
+				inputId: readIdentifier(ownField(record, "inputId"), bounds.maxIdentifierBytes),
+				ordinal: readInteger(ownField(record, "ordinal"), 1, Number.MAX_SAFE_INTEGER),
+			});
+		}
+		case "copy": {
+			const source = readNativeIoSource(ownField(record, "source"), bounds);
+			const event = readNativeCopyEvent(ownField(record, "event"), bounds);
+			// The event tuple and the source tuple name the same conversation.
+			checkCopyTupleCoherence(source, event);
+			return Object.freeze({
+				type,
+				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
+				copyId: readIdentifier(ownField(record, "copyId"), bounds.maxIdentifierBytes),
+				sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
+				source,
+				dispatchId: readInteger(ownField(record, "dispatchId"), 1, Number.MAX_SAFE_INTEGER),
+				event,
+			});
+		}
+		case "copy_begin": {
+			const byteLength = readInteger(ownField(record, "byteLength"), 1, NATIVE_COPY_MAX_ENCODED_CHARS);
+			const chunkCount = readInteger(ownField(record, "chunkCount"), 1, byteLength);
+			if (chunkCount < Math.ceil(byteLength / bounds.maxChunkPayloadBytes)) fail("bad_frame");
+			return Object.freeze({
+				type,
+				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
+				copyId: readIdentifier(ownField(record, "copyId"), bounds.maxIdentifierBytes),
+				sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
+				source: readNativeIoSource(ownField(record, "source"), bounds),
+				dispatchId: readInteger(ownField(record, "dispatchId"), 1, Number.MAX_SAFE_INTEGER),
+				byteLength,
+				chunkCount,
+			});
+		}
+		case "copy_chunk": {
+			const payload = readChunkPayload(ownField(record, "data"), bounds);
+			return Object.freeze({
+				type,
+				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
+				copyId: readIdentifier(ownField(record, "copyId"), bounds.maxIdentifierBytes),
+				index: readInteger(ownField(record, "index"), 0, Number.MAX_SAFE_INTEGER),
+				data: payload.toString("base64"),
+			});
+		}
+		case "copy_end": {
+			return Object.freeze({
+				type,
+				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
+				copyId: readIdentifier(ownField(record, "copyId"), bounds.maxIdentifierBytes),
 				sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
 			});
 		}
@@ -869,13 +1568,58 @@ export type SessionContentNegotiation =
 	| { readonly ok: false; readonly code: "unsupported_version" | "missing_capability" };
 
 /**
+ * Explicit optional-capability opt-in. The default (`undefined`, `{}`, or an
+ * empty list) offers and accepts nothing, so knowing a capability never enables
+ * it and an existing host or client keeps its legacy, display-only behavior.
+ */
+export interface SessionContentNegotiationOptions {
+	readonly supportedOptionalCapabilities?: readonly string[];
+}
+
+const NEGOTIATION_OPTION_KEYS: ReadonlySet<string> = new Set(["supportedOptionalCapabilities"]);
+const NO_KEYS: ReadonlySet<string> = new Set();
+
+/**
+ * Resolve the explicitly enabled optional capabilities. Only identifiers this
+ * build implements may be enabled, and a malformed, duplicated, oversized, or
+ * unimplementable entry fails closed instead of being silently dropped.
+ */
+function enabledOptionalCapabilities(options: unknown): readonly string[] {
+	if (options === undefined) return Object.freeze([]);
+	if (!isPlainRecord(options)) fail("invalid_bounds");
+	readExactKeys(options, NEGOTIATION_OPTION_KEYS, NO_KEYS, "invalid_bounds");
+	const raw = ownField(options, "supportedOptionalCapabilities");
+	if (raw === undefined) return Object.freeze([]);
+	if (!Array.isArray(raw)) fail("invalid_bounds");
+	if (raw.length > DEFAULT_SESSION_CONTENT_BOUNDS.maxCapabilities) fail("invalid_bounds");
+	const enabled: string[] = [];
+	for (const entry of raw) {
+		if (typeof entry !== "string") fail("invalid_bounds");
+		if (Buffer.byteLength(entry, "utf8") > DEFAULT_SESSION_CONTENT_BOUNDS.maxCapabilityIdBytes) {
+			fail("invalid_bounds");
+		}
+		if (!IDENTIFIER_RE.test(entry)) fail("invalid_bounds");
+		if (!SESSION_CONTENT_IMPLEMENTABLE_OPTIONAL_CAPABILITIES.includes(entry)) fail("invalid_bounds");
+		if (enabled.includes(entry)) fail("invalid_bounds");
+		enabled.push(entry);
+	}
+	return Object.freeze(enabled);
+}
+
+/**
  * Owner-side decision on one hello. A different service or major version is
  * refused, and a hello without the native-viewport capability is refused.
- * Unknown optional capabilities are ignored rather than trusted, and the
- * negotiated minor is the lower of the two so a newer peer cannot imply
- * behavior this implementation does not have.
+ * Optional capabilities are recorded only when they appear in the explicit
+ * enabled set — never merely because the peer offered a known identifier — so
+ * the default decision acknowledges the baseline alone. The negotiated minor is
+ * the lower of the two so a newer peer cannot imply behavior this implementation
+ * does not have.
  */
-export function negotiateSessionContentHello(hello: SessionContentHelloFrame): SessionContentNegotiation {
+export function negotiateSessionContentHello(
+	hello: SessionContentHelloFrame,
+	options?: SessionContentNegotiationOptions,
+): SessionContentNegotiation {
+	const enabled = enabledOptionalCapabilities(options);
 	if (hello.service !== SESSION_CONTENT_SERVICE || hello.major !== SESSION_CONTENT_MAJOR) {
 		return { ok: false, code: "unsupported_version" };
 	}
@@ -883,8 +1627,7 @@ export function negotiateSessionContentHello(hello: SessionContentHelloFrame): S
 		return { ok: false, code: "missing_capability" };
 	}
 	const negotiated = hello.capabilities.filter((capability) =>
-		capability !== SESSION_CONTENT_REQUIRED_CAPABILITY
-		&& SESSION_CONTENT_KNOWN_OPTIONAL_CAPABILITIES.includes(capability));
+		capability !== SESSION_CONTENT_REQUIRED_CAPABILITY && enabled.includes(capability));
 	return Object.freeze({
 		ok: true,
 		major: SESSION_CONTENT_MAJOR,
@@ -900,9 +1643,10 @@ export type SessionContentAckVerdict =
 /**
  * Viewer-side decision on one `hello_ack`. The owner must confirm this side's
  * service and major version and must acknowledge the requested capability. An
- * acknowledgement that claims a capability this side never offered, or a minor
- * above the one offered, is a protocol violation: negotiation can only narrow
- * what either side may assume, never widen it.
+ * acknowledgement that claims a capability this side never offered, or one this
+ * build cannot implement, or a minor above the one offered, is a protocol
+ * violation: negotiation can only narrow what either side may assume, never
+ * widen it.
  */
 export function reviewSessionContentHelloAck(
 	ack: SessionContentHelloAckFrame,
@@ -916,6 +1660,12 @@ export function reviewSessionContentHelloAck(
 	}
 	if (ack.minor > SESSION_CONTENT_MINOR) return { ok: false, code: "protocol_violation" };
 	for (const capability of ack.capabilities) {
+		// A capability this build cannot implement is never accepted, even when a
+		// caller mistakenly listed it as offered.
+		if (capability !== SESSION_CONTENT_REQUIRED_CAPABILITY
+			&& !SESSION_CONTENT_IMPLEMENTABLE_OPTIONAL_CAPABILITIES.includes(capability)) {
+			return { ok: false, code: "protocol_violation" };
+		}
 		if (!offered.capabilities.includes(capability)) return { ok: false, code: "protocol_violation" };
 	}
 	return Object.freeze({ ok: true, minor: ack.minor, capabilities: Object.freeze([...ack.capabilities]) });
@@ -1486,6 +2236,12 @@ export interface SessionContentTransferMeta {
 	readonly sequence: number;
 	readonly geometry: SessionContentGeometry;
 	readonly inputModes: TerminalInputModes;
+	/**
+	 * Present only when the publisher passed an explicit native IO source: the
+	 * host-written source this publish belongs to, or null when unavailable. Never
+	 * set by default, so a legacy snapshot keeps its exact shape.
+	 */
+	readonly inputSource?: NativeIoSource | null;
 	readonly byteLength: number;
 	readonly chunkCount: number;
 }
@@ -1523,6 +2279,13 @@ export function buildSessionContentTransfer(options: {
 	readonly geometry: SessionContentGeometry;
 	readonly inputModes: TerminalInputModes;
 	readonly frame: TerminalFrame;
+	/**
+	 * Explicit native IO source for this publish. Pass it only when the optional
+	 * native IO capability was negotiated; omit it entirely (the default) so a
+	 * legacy `content_begin` keeps its exact key set. `null` states that the owner
+	 * has no source to report.
+	 */
+	readonly inputSource?: NativeIoSource | null;
 	readonly bounds?: SessionContentBounds;
 }): SessionContentBuiltTransfer {
 	const bounds = options.bounds ?? DEFAULT_SESSION_CONTENT_BOUNDS;
@@ -1537,6 +2300,9 @@ export function buildSessionContentTransfer(options: {
 	const geometry = readGeometry(options.geometry, bounds);
 	const inputModes = readInputModes(options.inputModes);
 	const nativeSession = readNativeSession(options.nativeSession, bounds);
+	const inputSource = options.inputSource === undefined
+		? undefined
+		: options.inputSource === null ? null : readNativeIoSource(options.inputSource, bounds);
 	const begin: SessionContentBeginFrame = Object.freeze({
 		type: "content_begin",
 		subscriptionId: options.subscriptionId,
@@ -1549,6 +2315,7 @@ export function buildSessionContentTransfer(options: {
 		inputModes,
 		byteLength,
 		chunkCount,
+		...(inputSource === undefined ? {} : { inputSource }),
 	});
 	const frames: Buffer[] = [encodeSessionContentFrame(begin, bounds)];
 	for (let index = 0; index < chunkCount; index += 1) {
@@ -1581,6 +2348,7 @@ export function buildSessionContentTransfer(options: {
 		inputModes,
 		byteLength,
 		chunkCount,
+		...(inputSource === undefined ? {} : { inputSource }),
 	});
 	return Object.freeze({
 		frames: Object.freeze(frames),
@@ -1655,6 +2423,19 @@ export function createSessionContentTransferAssembler(
 					// wire decoder uses, and no partial transfer was staged yet.
 					fail("bad_frame");
 				}
+				const rawInputSource = frame.inputSource;
+				const inputSource = rawInputSource === undefined
+					? undefined
+					: rawInputSource === null ? null : readNativeIoSource(rawInputSource, bounds);
+				if (inputSource !== undefined && inputSource !== null) {
+					// The source must describe this same begin, not a neighbouring snapshot.
+					checkInputSourceCoherence(inputSource, {
+						hostRunId: frame.hostRunId,
+						sessionId: frame.sessionId,
+						nativeSession,
+						geometry,
+					});
+				}
 				const meta: SessionContentTransferMeta = Object.freeze({
 					subscriptionId: frame.subscriptionId,
 					transferId: frame.transferId,
@@ -1666,6 +2447,8 @@ export function createSessionContentTransferAssembler(
 					inputModes,
 					byteLength,
 					chunkCount,
+					// Preserved exactly when the wire carried it; absent otherwise.
+					...(inputSource === undefined ? {} : { inputSource }),
 				});
 				partial = { meta, buffer: undefined, written: 0, nextIndex: 0 };
 				return undefined;
@@ -1723,6 +2506,715 @@ export function createSessionContentTransferAssembler(
 				return Object.freeze({ meta: transfer.meta, frame: viewport });
 			}
 			// Control frames belong to the endpoint state machine.
+			return undefined;
+		},
+		reset: () => {
+			discard();
+		},
+	});
+}
+
+/* ------------------------------------------------------------------------- *
+ * Optional native IO helpers: packers and atomic assemblers
+ *
+ * Everything below is pure. No function here writes to a PTY, a socket, the OS
+ * clipboard, or an escape stream; none starts a timer, retries, queues, or
+ * callback, and none grants, leases, or implies input authority. A future
+ * endpoint must still re-authorize before every part and immediately before any
+ * write, and must clear an assembly on tuple, geometry, generation, or grant
+ * change. Packing and assembly state only that the bytes are well formed.
+ * ------------------------------------------------------------------------- */
+
+/** One atomically completed native input packet. */
+export interface NativeIoCompletedInput {
+	readonly subscriptionId: string;
+	readonly inputId: string;
+	readonly ordinal: number;
+	readonly source: NativeIoSource;
+	readonly inputModes: TerminalInputModes;
+	readonly kind: NativeIoInputKind;
+	/**
+	 * Exactly the declared payload bytes. Owned by this result: the assembler
+	 * never reuses, resizes, or mutates them afterwards.
+	 */
+	readonly data: Uint8Array;
+	/** The same bytes decoded as strict UTF-8 text (or the normalized packet). */
+	readonly text: string;
+	readonly byteLength: number;
+}
+
+/**
+ * One atomically completed native text copy. `event` carries canonical base64
+ * text (or a fixed unavailable reason) together with the authenticated native
+ * tuple of the copy, which is always the header source's own tuple — never a raw
+ * OSC 52 sequence, and never a request to relay one.
+ */
+export interface NativeIoCompletedCopy {
+	readonly subscriptionId: string;
+	readonly copyId: string;
+	readonly sequence: number;
+	readonly source: NativeIoSource;
+	readonly dispatchId: number;
+	readonly event: NativeIoCopyEvent;
+}
+
+/** Encoded frames of one packed native IO unit, in wire order. */
+export interface NativeIoBuiltTransfer {
+	readonly frames: readonly Buffer[];
+	readonly messageBytes: readonly number[];
+	readonly totalMessageBytes: number;
+	/** Decoded payload bytes; 0 for an inline copy-unavailable event. */
+	readonly byteLength: number;
+	readonly chunkCount: number;
+}
+
+/**
+ * A builder's own refused input is a caller/programming failure, not a peer
+ * frame: the same fixed local code `encodeSessionContentFrame` reports.
+ */
+function builderFailure<T>(run: () => T): T {
+	try {
+		return run();
+	} catch (error) {
+		if (isSessionContentProtocolError(error) && error.code === "bad_frame") fail("invalid_frame");
+		throw error;
+	}
+}
+
+/** Owned bytes for one payload argument: text is UTF-8 encoded, bytes are copied. */
+function nativeIoPayloadBytes(data: string | Uint8Array): Buffer {
+	if (typeof data === "string") return Buffer.from(data, "utf8");
+	if (data instanceof Uint8Array) return Buffer.from(data);
+	fail("invalid_frame");
+}
+
+function nativeIoChunkCount(byteLength: number, chunkBytes: number): number {
+	return Math.max(1, Math.ceil(byteLength / chunkBytes));
+}
+
+/**
+ * Raw payload bytes one chunk may carry so that its WHOLE encoded message — the
+ * JSON envelope, both identifiers, the widest possible index, and the base64
+ * expansion — still fits `maxFrameBytes`. The result never exceeds
+ * `maxChunkPayloadBytes`, and a tight message bound yields dynamically smaller
+ * chunks instead of an unrepresentable frame. With the default bounds it is
+ * exactly the raw chunk bound.
+ */
+function nativeIoChunkPayloadBytes(bounds: SessionContentBounds, template: SessionContentFrame): number {
+	let envelopeBytes: number;
+	try {
+		// The exact envelope of this chunk shape with an empty payload and the widest
+		// index, so the size is safe for every chunk of the transfer.
+		envelopeBytes = Buffer.byteLength(
+			JSON.stringify({ ...template, index: Number.MAX_SAFE_INTEGER, data: "" }),
+			"utf8",
+		);
+	} catch {
+		fail("frame_too_large");
+	}
+	const available = bounds.maxFrameBytes - envelopeBytes;
+	if (available <= 0) fail("frame_too_large");
+	let raw = Math.min(bounds.maxChunkPayloadBytes, Math.floor((available / 4) * 3));
+	// Base64 pads to a multiple of four characters; back off until it fits.
+	while (raw > 0 && 4 * Math.ceil(raw / 3) > available) raw -= 1;
+	if (raw <= 0) fail("frame_too_large");
+	return raw;
+}
+
+/**
+ * Encode every frame of one unit up front under the per-message bound, so a
+ * caller can re-check its own guards immediately before each write and a unit
+ * that cannot be represented is refused whole, never trimmed or partially
+ * emitted.
+ */
+function encodeNativeIoFrames(
+	frames: readonly SessionContentFrame[],
+	bounds: SessionContentBounds,
+	byteLength: number,
+	chunkCount: number,
+): NativeIoBuiltTransfer {
+	const encoded = frames.map((frame) => encodeSessionContentFrame(frame, bounds));
+	const messageBytes = encoded.map((bytes) => bytes.length);
+	return Object.freeze({
+		frames: Object.freeze(encoded),
+		messageBytes: Object.freeze(messageBytes),
+		totalMessageBytes: messageBytes.reduce((total, size) => total + size, 0),
+		byteLength,
+		chunkCount,
+	});
+}
+
+/**
+ * Pack one inline native input packet.
+ *
+ * Inline frames are bounded by the raw chunk bound, which is a transport bound
+ * and not the paste cap: a larger text paste uses {@link buildNativeInputPaste}
+ * and is never truncated. `data` is the already-normalized keyboard packet, the
+ * canonical content-coordinate SGR mouse packet, or the UTF-8 paste body; this
+ * packer performs no new input parsing beyond that bounded shape check.
+ */
+export function buildNativeInputInline(options: {
+	readonly subscriptionId: string;
+	readonly inputId: string;
+	readonly ordinal: number;
+	readonly source: NativeIoSource;
+	readonly inputModes: TerminalInputModes;
+	readonly kind: NativeIoInputKind;
+	readonly data: string | Uint8Array;
+	readonly bounds?: SessionContentBounds;
+}): NativeIoBuiltTransfer {
+	return builderFailure(() => {
+		const bounds = options.bounds ?? DEFAULT_SESSION_CONTENT_BOUNDS;
+		const kind = options.kind;
+		if (!isNativeIoInputKind(kind)) fail("invalid_frame");
+		const bytes = nativeIoPayloadBytes(options.data);
+		if (bytes.length === 0) fail("invalid_frame");
+		if (bytes.length > bounds.maxChunkPayloadBytes) fail("transfer_too_large");
+		if (kind === "paste" && bytes.length > NATIVE_TEXT_PASTE_MAX_BYTES) fail("transfer_too_large");
+		const text = decodeNativeIoText(bytes);
+		if (kind === "mouse" && !NATIVE_IO_MOUSE_RE.test(text)) fail("invalid_frame");
+		const frame: SessionContentInputFrame = Object.freeze({
+			type: "input",
+			subscriptionId: options.subscriptionId,
+			inputId: options.inputId,
+			ordinal: options.ordinal,
+			source: options.source,
+			inputModes: options.inputModes,
+			kind,
+			data: bytes.toString("base64"),
+		});
+		return encodeNativeIoFrames([frame], bounds, bytes.length, 1);
+	});
+}
+
+/**
+ * Pack one atomic native text paste of up to exactly 1 MiB of decoded UTF-8.
+ *
+ * The entire payload is validated — bound and strict UTF-8 — before a single
+ * frame exists, and one byte over the cap is refused rather than truncated.
+ * Native bracketed-paste wrapping belongs to a future adapter and its current
+ * modes, after assembly; nothing here reads or writes a system clipboard.
+ */
+export function buildNativeInputPaste(options: {
+	readonly subscriptionId: string;
+	readonly inputId: string;
+	readonly ordinal: number;
+	readonly source: NativeIoSource;
+	readonly inputModes: TerminalInputModes;
+	readonly text: string | Uint8Array;
+	readonly bounds?: SessionContentBounds;
+}): NativeIoBuiltTransfer {
+	return builderFailure(() => {
+		const bounds = options.bounds ?? DEFAULT_SESSION_CONTENT_BOUNDS;
+		const bytes = nativeIoPayloadBytes(options.text);
+		if (bytes.length === 0) fail("invalid_frame");
+		if (bytes.length > NATIVE_TEXT_PASTE_MAX_BYTES || bytes.length > bounds.maxTransferBytes) {
+			fail("transfer_too_large");
+		}
+		decodeNativeIoText(bytes);
+		const chunkTemplate: SessionContentInputChunkFrame = Object.freeze({
+			type: "input_chunk",
+			subscriptionId: options.subscriptionId,
+			inputId: options.inputId,
+			index: 0,
+			data: "",
+		});
+		const chunkBytes = nativeIoChunkPayloadBytes(bounds, chunkTemplate);
+		const chunkCount = nativeIoChunkCount(bytes.length, chunkBytes);
+		const begin: SessionContentInputBeginFrame = Object.freeze({
+			type: "input_begin",
+			subscriptionId: options.subscriptionId,
+			inputId: options.inputId,
+			ordinal: options.ordinal,
+			source: options.source,
+			inputModes: options.inputModes,
+			kind: "paste",
+			byteLength: bytes.length,
+			chunkCount,
+		});
+		const frames: SessionContentFrame[] = [begin];
+		for (let index = 0; index < chunkCount; index += 1) {
+			const chunk: SessionContentInputChunkFrame = Object.freeze({
+				...chunkTemplate,
+				index,
+				data: bytes.subarray(index * chunkBytes, (index + 1) * chunkBytes).toString("base64"),
+			});
+			frames.push(chunk);
+		}
+		const end: SessionContentInputEndFrame = Object.freeze({
+			type: "input_end",
+			subscriptionId: options.subscriptionId,
+			inputId: options.inputId,
+			ordinal: options.ordinal,
+		});
+		frames.push(end);
+		return encodeNativeIoFrames(frames, bounds, bytes.length, chunkCount);
+	});
+}
+
+/**
+ * Pack one inline native copy. Use it for an event that fits one message; a
+ * longer encoded text uses {@link buildNativeCopyPaged} and is never reduced to
+ * a transport message size.
+ */
+export function buildNativeCopyInline(options: {
+	readonly subscriptionId: string;
+	readonly copyId: string;
+	readonly sequence: number;
+	readonly source: NativeIoSource;
+	readonly dispatchId: number;
+	readonly event: NativeIoCopyEvent;
+	readonly bounds?: SessionContentBounds;
+}): NativeIoBuiltTransfer {
+	return builderFailure(() => {
+		const bounds = options.bounds ?? DEFAULT_SESSION_CONTENT_BOUNDS;
+		const event = readNativeCopyEvent(options.event, bounds);
+		const frame: SessionContentCopyFrame = Object.freeze({
+			type: "copy",
+			subscriptionId: options.subscriptionId,
+			copyId: options.copyId,
+			sequence: options.sequence,
+			source: options.source,
+			dispatchId: options.dispatchId,
+			event,
+		});
+		return encodeNativeIoFrames([frame], bounds, event.kind === "copy" ? event.encoded.length : 0, 1);
+	});
+}
+
+/**
+ * Pack one whole native text copy across bounded pages.
+ *
+ * The complete encoded payload — up to the unchanged 100,000-character producer
+ * bound — is validated before any frame exists and is carried whole: the header
+ * never contains it, and one character over the bound is refused rather than
+ * removed. The paged header carries no event tuple, so the assembled copy
+ * inherits the header source's native tuple and stays consistent with it by
+ * construction.
+ */
+export function buildNativeCopyPaged(options: {
+	readonly subscriptionId: string;
+	readonly copyId: string;
+	readonly sequence: number;
+	readonly source: NativeIoSource;
+	readonly dispatchId: number;
+	readonly encoded: string;
+	readonly bounds?: SessionContentBounds;
+}): NativeIoBuiltTransfer {
+	return builderFailure(() => {
+		const bounds = options.bounds ?? DEFAULT_SESSION_CONTENT_BOUNDS;
+		const encoded = readNativeCopyEncoded(options.encoded);
+		const byteLength = encoded.length;
+		const chunkTemplate: SessionContentCopyChunkFrame = Object.freeze({
+			type: "copy_chunk",
+			subscriptionId: options.subscriptionId,
+			copyId: options.copyId,
+			index: 0,
+			data: "",
+		});
+		const chunkBytes = nativeIoChunkPayloadBytes(bounds, chunkTemplate);
+		const chunkCount = nativeIoChunkCount(byteLength, chunkBytes);
+		const begin: SessionContentCopyBeginFrame = Object.freeze({
+			type: "copy_begin",
+			subscriptionId: options.subscriptionId,
+			copyId: options.copyId,
+			sequence: options.sequence,
+			source: options.source,
+			dispatchId: options.dispatchId,
+			byteLength,
+			chunkCount,
+		});
+		const frames: SessionContentFrame[] = [begin];
+		for (let index = 0; index < chunkCount; index += 1) {
+			const chunk: SessionContentCopyChunkFrame = Object.freeze({
+				...chunkTemplate,
+				index,
+				data: Buffer.from(
+					encoded.slice(index * chunkBytes, (index + 1) * chunkBytes),
+					"ascii",
+				).toString("base64"),
+			});
+			frames.push(chunk);
+		}
+		const end: SessionContentCopyEndFrame = Object.freeze({
+			type: "copy_end",
+			subscriptionId: options.subscriptionId,
+			copyId: options.copyId,
+			sequence: options.sequence,
+		});
+		frames.push(end);
+		return encodeNativeIoFrames(frames, bounds, byteLength, chunkCount);
+	});
+}
+
+/** Receive-side atomic assembly of one native input at a time. */
+export interface NativeInputAssembler {
+	/**
+	 * Consume one frame. Returns a completed input only for an inline packet that
+	 * validates whole, or for an `input_end` that exactly completes the begin
+	 * tuple, ordinal, chunk count, and declared byte length. Every other native IO
+	 * frame yields undefined; non-IO control and transfer frames are the
+	 * endpoint's business and are ignored.
+	 */
+	accept(frame: SessionContentFrame): NativeIoCompletedInput | undefined;
+	/**
+	 * Drop any partial assembly. Idempotent; completed inputs and the ordinal fence
+	 * remain, because a replayed ordinal must never complete. A changed source or
+	 * binding uses a new assembler rather than reviving this one.
+	 */
+	reset(): void;
+}
+
+interface PartialNativeInput {
+	readonly subscriptionId: string;
+	readonly inputId: string;
+	readonly ordinal: number;
+	readonly source: NativeIoSource;
+	readonly inputModes: TerminalInputModes;
+	readonly byteLength: number;
+	readonly chunkCount: number;
+	/** One contiguous buffer of exactly `byteLength`, allocated on the first chunk. */
+	buffer: Buffer | undefined;
+	written: number;
+	nextIndex: number;
+}
+
+/**
+ * Create the atomic native input assembler.
+ *
+ * It holds at most one assembly, refuses the declaration before allocating
+ * anything, and never publishes partial data: a missing, duplicated, reordered,
+ * foreign, oversized, length-mismatched, or non-UTF-8 transfer leaves no
+ * completed input behind. A completed input is a well-formed packet and nothing
+ * more — it carries no authorization to write it to a child PTY, and the caller
+ * still owes its own current-source and grant re-check.
+ */
+export function createNativeInputAssembler(
+	bounds: SessionContentBounds = DEFAULT_SESSION_CONTENT_BOUNDS,
+): NativeInputAssembler {
+	let partial: PartialNativeInput | undefined;
+	/** Highest ordinal already completed; a replay can never complete twice. */
+	let completedOrdinal = 0;
+	const discard = (): void => {
+		partial = undefined;
+	};
+	const refuse = (): never => {
+		discard();
+		fail("transfer_failed");
+	};
+	const complete = (
+		subscriptionId: string,
+		inputId: string,
+		ordinal: number,
+		source: NativeIoSource,
+		inputModes: TerminalInputModes,
+		kind: NativeIoInputKind,
+		data: Buffer,
+	): NativeIoCompletedInput => {
+		// Duplicate or reordered ordinals never emit a second completed input.
+		if (ordinal <= completedOrdinal) refuse();
+		const text = decodeNativeIoText(data);
+		if (kind === "mouse" && !NATIVE_IO_MOUSE_RE.test(text)) refuse();
+		completedOrdinal = ordinal;
+		return Object.freeze({
+			subscriptionId,
+			inputId,
+			ordinal,
+			source,
+			inputModes,
+			kind,
+			data,
+			text,
+			byteLength: data.length,
+		});
+	};
+	return Object.freeze({
+		accept: (frame: SessionContentFrame): NativeIoCompletedInput | undefined => {
+			if (frame.type === "input") {
+				// An inline packet never interleaves with an open paged paste.
+				if (partial !== undefined) refuse();
+				const subscriptionId = readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+				const inputId = readIdentifier(frame.inputId, bounds.maxIdentifierBytes);
+				const ordinal = readInteger(frame.ordinal, 1, Number.MAX_SAFE_INTEGER);
+				const source = readNativeIoSource(frame.source, bounds);
+				const inputModes = readInputModes(frame.inputModes);
+				const kind = frame.kind;
+				if (!isNativeIoInputKind(kind)) refuse();
+				let data: Buffer;
+				try {
+					data = readNativeInputData(frame.data, kind, bounds);
+				} catch (error) {
+					discard();
+					throw error;
+				}
+				return complete(subscriptionId, inputId, ordinal, source, inputModes, kind, data);
+			}
+			if (frame.type === "input_begin") {
+				if (partial !== undefined) refuse();
+				const subscriptionId = readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+				const inputId = readIdentifier(frame.inputId, bounds.maxIdentifierBytes);
+				const ordinal = readInteger(frame.ordinal, 1, Number.MAX_SAFE_INTEGER);
+				const source = readNativeIoSource(frame.source, bounds);
+				const inputModes = readInputModes(frame.inputModes);
+				if (frame.kind !== "paste") fail("bad_frame");
+				const byteLength = readNativePasteByteLength(frame.byteLength, bounds);
+				const chunkCount = readInteger(frame.chunkCount, 1, byteLength);
+				if (chunkCount < Math.ceil(byteLength / bounds.maxChunkPayloadBytes)) fail("bad_frame");
+				// A replayed ordinal is refused before any assembly buffer exists.
+				if (ordinal <= completedOrdinal) refuse();
+				partial = {
+					subscriptionId,
+					inputId,
+					ordinal,
+					source,
+					inputModes,
+					byteLength,
+					chunkCount,
+					buffer: undefined,
+					written: 0,
+					nextIndex: 0,
+				};
+				return undefined;
+			}
+			if (frame.type === "input_chunk") {
+				const transfer = partial ?? refuse();
+				if (frame.subscriptionId !== transfer.subscriptionId || frame.inputId !== transfer.inputId) {
+					refuse();
+				}
+				if (frame.index !== transfer.nextIndex || frame.index >= transfer.chunkCount) refuse();
+				let payload: Buffer;
+				try {
+					payload = readChunkPayload(frame.data, bounds);
+				} catch (error) {
+					// A malformed or oversized chunk discards the whole partial transfer.
+					discard();
+					throw error;
+				}
+				// Enforce the declared payload budget before copying anything.
+				if (transfer.written + payload.length > transfer.byteLength) refuse();
+				let buffer = transfer.buffer;
+				if (buffer === undefined) {
+					try {
+						buffer = Buffer.allocUnsafe(transfer.byteLength);
+					} catch {
+						// An allocation the platform refuses is a bounded failure, not a crash.
+						return refuse();
+					}
+					transfer.buffer = buffer;
+				}
+				payload.copy(buffer, transfer.written);
+				transfer.written += payload.length;
+				transfer.nextIndex += 1;
+				return undefined;
+			}
+			if (frame.type === "input_end") {
+				const transfer = partial ?? refuse();
+				if (frame.subscriptionId !== transfer.subscriptionId
+					|| frame.inputId !== transfer.inputId
+					|| frame.ordinal !== transfer.ordinal) {
+					refuse();
+				}
+				if (transfer.nextIndex !== transfer.chunkCount || transfer.written !== transfer.byteLength) {
+					// Truncated, over-long, or chunk-count-inconsistent: never publish.
+					refuse();
+				}
+				const buffer = transfer.buffer;
+				discard();
+				if (buffer === undefined) fail("transfer_failed");
+				return complete(
+					transfer.subscriptionId,
+					transfer.inputId,
+					transfer.ordinal,
+					transfer.source,
+					transfer.inputModes,
+					"paste",
+					buffer,
+				);
+			}
+			// Control and viewport transfer frames belong to the endpoint state machine.
+			return undefined;
+		},
+		reset: () => {
+			discard();
+		},
+	});
+}
+
+/** Receive-side atomic assembly of one native text copy at a time. */
+export interface NativeCopyAssembler {
+	/**
+	 * Consume one frame. Returns a completed copy only for an inline event that
+	 * validates whole, or for a `copy_end` that exactly completes the begin tuple,
+	 * sequence, chunk count, and declared payload length. A completed copy carries
+	 * canonical base64 text and nothing executable: no raw OSC 52 sequence is ever
+	 * produced, reassembled, or forwarded here.
+	 */
+	accept(frame: SessionContentFrame): NativeIoCompletedCopy | undefined;
+	/**
+	 * Drop any partial assembly. Idempotent; completed sequences stay committed, so
+	 * a replayed emission order can never publish twice. A new binding uses a new
+	 * assembler rather than reviving this one.
+	 */
+	reset(): void;
+}
+
+interface PartialNativeCopy {
+	readonly subscriptionId: string;
+	readonly copyId: string;
+	readonly sequence: number;
+	readonly source: NativeIoSource;
+	readonly dispatchId: number;
+	readonly byteLength: number;
+	readonly chunkCount: number;
+	buffer: Buffer | undefined;
+	written: number;
+	nextIndex: number;
+}
+
+/**
+ * Create the atomic native text-copy assembler.
+ *
+ * Ordering is the copy sequence — the per-binding emission order — and nothing
+ * else. The native input dispatch id is carried, never consulted: an
+ * asynchronous copy caused by input A may legitimately arrive after input B's,
+ * so a dispatch-id fence would silently drop real copies. A sequence this helper
+ * already completed is refused as a replay, which is why `reset` releases only
+ * buffered bytes and keeps the committed sequence.
+ */
+export function createNativeCopyAssembler(
+	bounds: SessionContentBounds = DEFAULT_SESSION_CONTENT_BOUNDS,
+): NativeCopyAssembler {
+	let partial: PartialNativeCopy | undefined;
+	/** Highest emission-order sequence already completed by this helper. */
+	let completedSequence = 0;
+	const discard = (): void => {
+		partial = undefined;
+	};
+	const refuse = (): never => {
+		discard();
+		fail("transfer_failed");
+	};
+	const complete = (
+		subscriptionId: string,
+		copyId: string,
+		sequence: number,
+		source: NativeIoSource,
+		dispatchId: number,
+		event: NativeIoCopyEvent,
+	): NativeIoCompletedCopy => {
+		// Emission order is the copy sequence; `dispatchId` never orders or fences.
+		if (sequence <= completedSequence) refuse();
+		// The completed event always names the header source's own native tuple.
+		checkCopyTupleCoherence(source, event);
+		completedSequence = sequence;
+		return Object.freeze({ subscriptionId, copyId, sequence, source, dispatchId, event });
+	};
+	return Object.freeze({
+		accept: (frame: SessionContentFrame): NativeIoCompletedCopy | undefined => {
+			if (frame.type === "copy") {
+				if (partial !== undefined) refuse();
+				const subscriptionId = readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+				const copyId = readIdentifier(frame.copyId, bounds.maxIdentifierBytes);
+				const sequence = readInteger(frame.sequence, 1, Number.MAX_SAFE_INTEGER);
+				const source = readNativeIoSource(frame.source, bounds);
+				const dispatchId = readInteger(frame.dispatchId, 1, Number.MAX_SAFE_INTEGER);
+				let event: NativeIoCopyEvent;
+				try {
+					event = readNativeCopyEvent(frame.event, bounds);
+				} catch (error) {
+					discard();
+					throw error;
+				}
+				return complete(subscriptionId, copyId, sequence, source, dispatchId, event);
+			}
+			if (frame.type === "copy_begin") {
+				if (partial !== undefined) refuse();
+				const subscriptionId = readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+				const copyId = readIdentifier(frame.copyId, bounds.maxIdentifierBytes);
+				const sequence = readInteger(frame.sequence, 1, Number.MAX_SAFE_INTEGER);
+				const source = readNativeIoSource(frame.source, bounds);
+				const dispatchId = readInteger(frame.dispatchId, 1, Number.MAX_SAFE_INTEGER);
+				const byteLength = readInteger(frame.byteLength, 1, NATIVE_COPY_MAX_ENCODED_CHARS);
+				const chunkCount = readInteger(frame.chunkCount, 1, byteLength);
+				if (chunkCount < Math.ceil(byteLength / bounds.maxChunkPayloadBytes)) fail("bad_frame");
+				if (sequence <= completedSequence) refuse();
+				partial = {
+					subscriptionId,
+					copyId,
+					sequence,
+					source,
+					dispatchId,
+					byteLength,
+					chunkCount,
+					buffer: undefined,
+					written: 0,
+					nextIndex: 0,
+				};
+				return undefined;
+			}
+			if (frame.type === "copy_chunk") {
+				const transfer = partial ?? refuse();
+				if (frame.subscriptionId !== transfer.subscriptionId || frame.copyId !== transfer.copyId) {
+					refuse();
+				}
+				if (frame.index !== transfer.nextIndex || frame.index >= transfer.chunkCount) refuse();
+				let payload: Buffer;
+				try {
+					payload = readChunkPayload(frame.data, bounds);
+				} catch (error) {
+					discard();
+					throw error;
+				}
+				if (transfer.written + payload.length > transfer.byteLength) refuse();
+				let buffer = transfer.buffer;
+				if (buffer === undefined) {
+					try {
+						buffer = Buffer.allocUnsafe(transfer.byteLength);
+					} catch {
+						return refuse();
+					}
+					transfer.buffer = buffer;
+				}
+				payload.copy(buffer, transfer.written);
+				transfer.written += payload.length;
+				transfer.nextIndex += 1;
+				return undefined;
+			}
+			if (frame.type === "copy_end") {
+				const transfer = partial ?? refuse();
+				if (frame.subscriptionId !== transfer.subscriptionId
+					|| frame.copyId !== transfer.copyId
+					|| frame.sequence !== transfer.sequence) {
+					refuse();
+				}
+				if (transfer.nextIndex !== transfer.chunkCount || transfer.written !== transfer.byteLength) {
+					// A partial, over-long, or reordered payload never yields an event.
+					refuse();
+				}
+				const buffer = transfer.buffer;
+				discard();
+				if (buffer === undefined) fail("transfer_failed");
+				// The assembled payload must be the producer's canonical, UTF-8 text
+				// encoding before it can become a completed copy.
+				const encoded = readNativeCopyEncoded(decodeNativeIoText(buffer));
+				// The assembled payload inherits the header source's authenticated tuple,
+				// so the completed event and the header source stay consistent by
+				// construction and are re-checked by `complete`.
+				return complete(
+					transfer.subscriptionId,
+					transfer.copyId,
+					transfer.sequence,
+					transfer.source,
+					transfer.dispatchId,
+					Object.freeze({
+						kind: "copy",
+						encoded,
+						sessionId: transfer.source.nativeSession.sessionId,
+						sessionEpoch: transfer.source.nativeSession.epoch,
+					}),
+				);
+			}
+			// Control and viewport transfer frames belong to the endpoint state machine.
 			return undefined;
 		},
 		reset: () => {

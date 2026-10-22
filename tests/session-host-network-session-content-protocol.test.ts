@@ -22,22 +22,40 @@ import { validateTerminalGraphicsPng } from "../src/session-host/kitty-graphics"
 import { decodeRosterBridgeFrame, encodeRosterBridgeFrame } from "../src/session-host/network/index";
 import {
 	DEFAULT_SESSION_CONTENT_BOUNDS,
+	NATIVE_COPY_MAX_ENCODED_CHARS,
+	NATIVE_TEXT_PASTE_MAX_BYTES,
+	SESSION_CONTENT_IMPLEMENTABLE_OPTIONAL_CAPABILITIES,
+	SESSION_CONTENT_KNOWN_OPTIONAL_CAPABILITIES,
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
 	SessionContentProtocolError,
+	buildNativeCopyInline,
+	buildNativeCopyPaged,
+	buildNativeInputInline,
+	buildNativeInputPaste,
 	buildSessionContentTransfer,
+	createNativeCopyAssembler,
+	createNativeInputAssembler,
 	createSessionContentTransferAssembler,
 	decodeSessionContentFrame,
 	decodeSessionContentViewport,
 	encodeSessionContentFrame,
 	encodeSessionContentViewport,
 	isSessionContentProtocolError,
+	nativeIoSourceEquals,
 	negotiateSessionContentHello,
 	resolveSessionContentBounds,
 	reviewSessionContentHelloAck,
 	sessionContentWireCodeForFailure,
+	type NativeIoCompletedCopy,
+	type NativeIoCompletedInput,
+	type NativeIoCopyEvent,
+	type NativeIoCopyUnavailableReason,
+	type NativeIoInputKind,
+	type NativeIoSource,
 	type SessionContentBounds,
 	type SessionContentFailureCode,
 	type SessionContentFrame,
@@ -1292,4 +1310,883 @@ test("metadata-v1 framing keeps its unknown-key fail-closed behavior", () => {
 		() => decodeRosterBridgeFrame(Buffer.from(JSON.stringify({ ...hello, extra: true }), "utf8")),
 		(error: unknown) => error instanceof Error && (error as { code?: string }).code === "bad_frame",
 	);
+});
+
+/* ------------------------------------------------------------------------- *
+ * Optional native IO frames (native input and native text copy)
+ * ------------------------------------------------------------------------- */
+
+function nativeSource(overrides: Partial<NativeIoSource> = {}): NativeIoSource {
+	return {
+		hostRunId: "run-1",
+		sessionId: "instance-1",
+		nativeSession: { sessionId: "native-session-1", epoch: 3 },
+		geometry: { cols: 80, rows: 24, revision: 7 },
+		viewerRevision: 2,
+		sourceToken: "host-source-token-1",
+		...overrides,
+	};
+}
+
+/** The source of the `transferOptions()` publish: same run, row, tuple, and geometry. */
+function contentSource(overrides: Partial<NativeIoSource> = {}): NativeIoSource {
+	return {
+		hostRunId: "run-1",
+		sessionId: "instance-1",
+		nativeSession: { sessionId: "native-session-1", epoch: 3 },
+		geometry: { cols: 12, rows: 3, revision: 0 },
+		viewerRevision: 2,
+		sourceToken: "host-source-token-1",
+		...overrides,
+	};
+}
+
+/** A copy event carrying the same tuple as `nativeSource()`'s native session. */
+function copyEvent(
+	encoded: string,
+	overrides: { readonly sessionId?: string; readonly sessionEpoch?: number } = {},
+): NativeIoCopyEvent {
+	return { kind: "copy", encoded, sessionId: "native-session-1", sessionEpoch: 3, ...overrides };
+}
+
+function unavailableEvent(
+	reason: NativeIoCopyUnavailableReason,
+	overrides: { readonly sessionId?: string; readonly sessionEpoch?: number } = {},
+): NativeIoCopyEvent {
+	return { kind: "unavailable", reason, sessionId: "native-session-1", sessionEpoch: 3, ...overrides };
+}
+
+function pasteOptions(
+	text: string | Uint8Array,
+	overrides: Partial<Parameters<typeof buildNativeInputPaste>[0]> = {},
+): Parameters<typeof buildNativeInputPaste>[0] {
+	return {
+		subscriptionId: "sub-1",
+		inputId: "input-1",
+		ordinal: 1,
+		source: nativeSource(),
+		inputModes: INPUT_MODES,
+		text,
+		...overrides,
+	};
+}
+
+function copyBase(): {
+	readonly subscriptionId: string;
+	readonly copyId: string;
+	readonly sequence: number;
+	readonly source: NativeIoSource;
+	readonly dispatchId: number;
+} {
+	return { subscriptionId: "sub-1", copyId: "copy-1", sequence: 1, source: nativeSource(), dispatchId: 1 };
+}
+
+function copyOptions(
+	overrides: Partial<Parameters<typeof buildNativeCopyPaged>[0]> = {},
+): Parameters<typeof buildNativeCopyPaged>[0] {
+	return { ...copyBase(), encoded: Buffer.from("copy").toString("base64"), ...overrides };
+}
+
+function copyInlineOptions(
+	event: NativeIoCopyEvent,
+	overrides: Partial<Parameters<typeof buildNativeCopyInline>[0]> = {},
+): Parameters<typeof buildNativeCopyInline>[0] {
+	return { ...copyBase(), event, ...overrides };
+}
+
+function assembleInput(
+	frames: readonly SessionContentFrame[],
+	bounds: SessionContentBounds = DEFAULT_SESSION_CONTENT_BOUNDS,
+): NativeIoCompletedInput | undefined {
+	const assembler = createNativeInputAssembler(bounds);
+	let completed: NativeIoCompletedInput | undefined;
+	for (const frame of frames) {
+		const result = assembler.accept(frame);
+		if (result === undefined) continue;
+		assert.equal(completed, undefined, "one native input completes once");
+		completed = result;
+	}
+	return completed;
+}
+
+function assembleCopy(
+	frames: readonly SessionContentFrame[],
+	bounds: SessionContentBounds = DEFAULT_SESSION_CONTENT_BOUNDS,
+): NativeIoCompletedCopy | undefined {
+	const assembler = createNativeCopyAssembler(bounds);
+	let completed: NativeIoCompletedCopy | undefined;
+	for (const frame of frames) {
+		const result = assembler.accept(frame);
+		if (result === undefined) continue;
+		assert.equal(completed, undefined, "one native copy completes once");
+		completed = result;
+	}
+	return completed;
+}
+
+function decodedFrames(
+	built: { readonly frames: readonly Buffer[] },
+	bounds: SessionContentBounds = DEFAULT_SESSION_CONTENT_BOUNDS,
+): SessionContentFrame[] {
+	return built.frames.map((message) => decodeSessionContentFrame(message, bounds));
+}
+
+test("the native IO capability is implementable but never offered or acknowledged by default", () => {
+	assert.deepEqual([...SESSION_CONTENT_KNOWN_OPTIONAL_CAPABILITIES], [], "no optional capability is negotiable on its own");
+	assert.deepEqual([...SESSION_CONTENT_IMPLEMENTABLE_OPTIONAL_CAPABILITIES], [SESSION_CONTENT_NATIVE_IO_CAPABILITY]);
+	const hello: SessionContentHelloFrame = {
+		type: "hello",
+		service: SESSION_CONTENT_SERVICE,
+		major: SESSION_CONTENT_MAJOR,
+		minor: 4,
+		capabilities: [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY],
+	};
+	assert.deepEqual(
+		negotiateSessionContentHello(hello),
+		{ ok: true, major: SESSION_CONTENT_MAJOR, minor: SESSION_CONTENT_MINOR, capabilities: [] },
+		"an implementable capability is never offered or accepted by default",
+	);
+	assert.deepEqual(
+		negotiateSessionContentHello(hello, { supportedOptionalCapabilities: [] }),
+		{ ok: true, major: SESSION_CONTENT_MAJOR, minor: SESSION_CONTENT_MINOR, capabilities: [] },
+	);
+	assert.deepEqual(
+		negotiateSessionContentHello(hello, {
+			supportedOptionalCapabilities: [SESSION_CONTENT_NATIVE_IO_CAPABILITY],
+		}),
+		{
+			ok: true,
+			major: SESSION_CONTENT_MAJOR,
+			minor: SESSION_CONTENT_MINOR,
+			capabilities: [SESSION_CONTENT_NATIVE_IO_CAPABILITY],
+		},
+		"only an explicit opt-in records the capability",
+	);
+	for (const options of [
+		{ supportedOptionalCapabilities: ["unimplemented"] },
+		{ supportedOptionalCapabilities: [SESSION_CONTENT_NATIVE_IO_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY] },
+		{ supportedOptionalCapability: [SESSION_CONTENT_NATIVE_IO_CAPABILITY] },
+		{ supportedOptionalCapabilities: SESSION_CONTENT_NATIVE_IO_CAPABILITY },
+		{ supportedOptionalCapabilities: [""] },
+	]) {
+		refused("invalid_bounds", () => negotiateSessionContentHello(hello, options as never));
+	}
+
+	const ack = (capabilities: readonly string[]): Parameters<typeof reviewSessionContentHelloAck>[0] => ({
+		type: "hello_ack",
+		service: SESSION_CONTENT_SERVICE,
+		major: SESSION_CONTENT_MAJOR,
+		minor: SESSION_CONTENT_MINOR,
+		capabilities,
+	});
+	assert.deepEqual(
+		reviewSessionContentHelloAck(ack([SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY]), {
+			capabilities: [SESSION_CONTENT_REQUIRED_CAPABILITY],
+		}),
+		{ ok: false, code: "protocol_violation" },
+		"an acknowledgement can never select a capability this side did not offer",
+	);
+	assert.deepEqual(
+		reviewSessionContentHelloAck(ack([SESSION_CONTENT_REQUIRED_CAPABILITY, "future-optional"]), {
+			capabilities: [SESSION_CONTENT_REQUIRED_CAPABILITY, "future-optional"],
+		}),
+		{ ok: false, code: "protocol_violation" },
+		"a capability this build cannot implement is never accepted",
+	);
+	assert.deepEqual(
+		reviewSessionContentHelloAck(ack([SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY]), {
+			capabilities: [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY],
+		}),
+		{
+			ok: true,
+			minor: SESSION_CONTENT_MINOR,
+			capabilities: [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY],
+		},
+	);
+});
+
+test("native IO source identity is exact, never an equal-dimensions ABA assumption", () => {
+	const original = nativeSource();
+	assert.equal(nativeIoSourceEquals(original, nativeSource()), true);
+	assert.equal(
+		nativeIoSourceEquals(original, nativeSource({ geometry: { cols: 80, rows: 24, revision: 8 } })),
+		false,
+		"the same dimensions with a new geometry revision are a different source",
+	);
+	assert.equal(nativeIoSourceEquals(original, nativeSource({ viewerRevision: 3 })), false);
+	assert.equal(
+		nativeIoSourceEquals(original, nativeSource({ nativeSession: { sessionId: "native-session-1", epoch: 4 } })),
+		false,
+	);
+	assert.equal(nativeIoSourceEquals(original, nativeSource({ sourceToken: "host-source-token-2" })), false);
+});
+
+test("content_begin carries a native IO source only when a publisher states one", () => {
+	const frame = sampleFrame();
+	const plain = framesOf(buildSessionContentTransfer(transferOptions(frame)))[0];
+	if (plain?.type !== "content_begin") throw new Error("expected begin");
+	assert.equal(Object.hasOwn(plain, "inputSource"), false, "a legacy publish keeps its exact key set");
+
+	const explicitNull = framesOf(buildSessionContentTransfer(transferOptions(frame, { inputSource: null })))[0];
+	if (explicitNull?.type !== "content_begin") throw new Error("expected begin");
+	assert.equal(explicitNull.inputSource, null);
+
+	const source = contentSource();
+	const built = buildSessionContentTransfer(transferOptions(frame, { inputSource: source }));
+	const carried = framesOf(built)[0];
+	if (carried?.type !== "content_begin") throw new Error("expected begin");
+	assert.deepEqual(carried.inputSource, source, "the source roundtrips exactly, epoch and revisions included");
+	assert.ok(isFrozenDeep(carried.inputSource));
+
+	const snapshot = assembleContent(built);
+	assert.ok(snapshot);
+	assert.deepEqual(snapshot.meta.inputSource, source);
+	const legacy = assembleContent(buildSessionContentTransfer(transferOptions(frame)));
+	assert.ok(legacy);
+	assert.equal(Object.hasOwn(legacy.meta, "inputSource"), false, "a legacy snapshot is unchanged");
+
+	// Malformed or foreign source shapes are refused before coherence is even reached.
+	for (const invalid of [
+		{ ...source, nativeSession: null },
+		{ ...source, nativeSession: { sessionId: "native-session-1", epoch: 0 } },
+		{ ...source, viewerRevision: 0 },
+		{ ...source, geometry: { cols: 12, rows: 3 } },
+		{ ...source, geometry: { cols: 12, rows: 3, revision: -1 } },
+		{ ...source, sourceToken: "" },
+		{ ...source, sourceToken: "x".repeat(129) },
+		{ ...source, sourceToken: "host source token" },
+		{ ...source, hostRunId: "run\n1" },
+		{ ...source, agentPath: "/tmp/agent" },
+		{ ...source, inputGrant: true },
+		{ ...source, lease: "granted" },
+	]) {
+		refused(
+			"bad_frame",
+			() => buildSessionContentTransfer(transferOptions(frame, { inputSource: invalid as unknown as NativeIoSource })),
+			"a malformed, missing, or foreign source field never publishes",
+		);
+	}
+
+	// A well-formed source that describes a DIFFERENT snapshot is mixed metadata.
+	const coherent = decodeSessionContentFrame(
+		buildSessionContentTransfer(transferOptions(frame, { inputSource: contentSource() })).frames[0] as Buffer,
+	);
+	if (coherent.type !== "content_begin") throw new Error("expected begin");
+	assert.deepEqual(coherent.inputSource, contentSource(), "the same snapshot in both places is accepted");
+	const mixed: ReadonlyArray<readonly [string, NativeIoSource]> = [
+		["a different owner run", contentSource({ hostRunId: "run-2" })],
+		["a different owner row", contentSource({ sessionId: "instance-2" })],
+		["a different native session id", contentSource({ nativeSession: { sessionId: "native-session-2", epoch: 3 } })],
+		["a different native epoch", contentSource({ nativeSession: { sessionId: "native-session-1", epoch: 4 } })],
+		[
+			"a different geometry revision at the same dimensions",
+			contentSource({ geometry: { cols: 12, rows: 3, revision: 1 } }),
+		],
+		["different dimensions", contentSource({ geometry: { cols: 13, rows: 3, revision: 0 } })],
+	];
+	for (const [label, invalid] of mixed) {
+		refused(
+			"invalid_frame",
+			() => buildSessionContentTransfer(transferOptions(frame, { inputSource: invalid })),
+			`the publisher refuses ${label}`,
+		);
+		refused(
+			"invalid_frame",
+			() => encodeSessionContentFrame({ ...coherent, inputSource: invalid }),
+			`encoding refuses ${label}`,
+		);
+		refused(
+			"bad_frame",
+			() => decodeSessionContentFrame(Buffer.from(JSON.stringify({ ...coherent, inputSource: invalid }))),
+			`decoding refuses ${label}`,
+		);
+	}
+
+	// A frame that reports no native session cannot be handed a live tuple.
+	const noTuple = { ...coherent, nativeSession: null };
+	refused("invalid_frame", () => encodeSessionContentFrame({ ...noTuple, inputSource: contentSource() }));
+	refused(
+		"bad_frame",
+		() => decodeSessionContentFrame(Buffer.from(JSON.stringify({ ...noTuple, inputSource: contentSource() }))),
+	);
+	const nullSourceNoTuple = decodeSessionContentFrame(Buffer.from(JSON.stringify({ ...noTuple, inputSource: null })));
+	if (nullSourceNoTuple.type !== "content_begin") throw new Error("expected begin");
+	assert.equal(nullSourceNoTuple.inputSource, null, "an unavailable source claims no tuple");
+});
+
+function assembleContent(built: ReturnType<typeof buildSessionContentTransfer>): SessionContentSnapshot | undefined {
+	const assembler = createSessionContentTransferAssembler();
+	let snapshot: SessionContentSnapshot | undefined;
+	for (const message of framesOf(built)) snapshot = assembler.accept(message) ?? snapshot;
+	return snapshot;
+}
+
+test("inline native input completes exactly one packet per ordinal", () => {
+	const assembler = createNativeInputAssembler();
+	const packets: ReadonlyArray<readonly [NativeIoInputKind, string]> = [
+		["keyboard", "\x1b[A"],
+		["mouse", "\x1b[<0;13;4M"],
+		["paste", "ls -la\r\u0000ctrl\u4e16"],
+	];
+	let ordinal = 0;
+	for (const [kind, data] of packets) {
+		ordinal += 1;
+		const built = buildNativeInputInline({
+			subscriptionId: "sub-1",
+			inputId: `input-${ordinal}`,
+			ordinal,
+			source: nativeSource(),
+			inputModes: INPUT_MODES,
+			kind,
+			data,
+		});
+		assert.equal(built.frames.length, 1);
+		assert.equal(built.chunkCount, 1);
+		assert.equal(built.byteLength, Buffer.byteLength(data, "utf8"));
+		assert.ok(built.totalMessageBytes <= DEFAULT_SESSION_CONTENT_BOUNDS.maxFrameBytes);
+		const decoded = decodeSessionContentFrame(built.frames[0] as Buffer);
+		if (decoded.type !== "input") throw new Error("expected an inline input");
+		assert.equal(decoded.kind, kind);
+		assert.deepEqual(decoded.source, nativeSource());
+		const completed = assembler.accept(decoded);
+		assert.ok(completed);
+		assert.equal(completed.kind, kind);
+		assert.equal(completed.text, data, "the payload roundtrips byte for byte");
+		assert.equal(completed.byteLength, Buffer.byteLength(data, "utf8"));
+		assert.deepEqual(completed.source, nativeSource());
+		assert.deepEqual(completed.inputModes, INPUT_MODES);
+	}
+
+	// A malformed packet is never repaired locally.
+	refused("invalid_frame", () => buildNativeInputInline({
+		subscriptionId: "sub-1",
+		inputId: "input-9",
+		ordinal: 9,
+		source: nativeSource(),
+		inputModes: INPUT_MODES,
+		kind: "mouse",
+		data: "\x1b[<0;13M",
+	}));
+	refused("invalid_frame", () => buildNativeInputInline({
+		subscriptionId: "sub-1",
+		inputId: "input-9",
+		ordinal: 9,
+		source: nativeSource(),
+		inputModes: INPUT_MODES,
+		kind: "keyboard",
+		data: Buffer.from([0x61, 0xff]),
+	}));
+	// An inline frame is chunk-bounded; a larger paste must page instead.
+	refused("transfer_too_large", () => buildNativeInputInline({
+		subscriptionId: "sub-1",
+		inputId: "input-9",
+		ordinal: 9,
+		source: nativeSource(),
+		inputModes: INPUT_MODES,
+		kind: "paste",
+		data: "y".repeat(DEFAULT_SESSION_CONTENT_BOUNDS.maxChunkPayloadBytes + 1),
+	}));
+});
+
+test("an atomic native text paste crosses the chunk bound up to exactly 1 MiB", () => {
+	assert.equal(NATIVE_TEXT_PASTE_MAX_BYTES, 1_048_576);
+	assert.equal(DEFAULT_SESSION_CONTENT_BOUNDS.maxChunkPayloadBytes, 32 * 1024);
+	assert.equal(DEFAULT_SESSION_CONTENT_BOUNDS.maxTransferBytes, 64 * 1024 * 1024);
+
+	const text = `${"a".repeat(40_000)}\u4e16\u754c\u0000\x1b`;
+	const built = buildNativeInputPaste(pasteOptions(text));
+	assert.ok(built.chunkCount > 1, "a paste above the raw chunk bound is paged, never truncated");
+	assert.equal(built.frames.length, built.chunkCount + 2);
+	assert.equal(built.byteLength, Buffer.byteLength(text, "utf8"));
+	assert.deepEqual(built.messageBytes, built.frames.map((message) => message.length));
+	assert.ok(built.messageBytes.every((size) => size <= DEFAULT_SESSION_CONTENT_BOUNDS.maxFrameBytes));
+	const decoded = decodedFrames(built);
+	for (const frame of decoded) {
+		if (frame.type !== "input_chunk") continue;
+		assert.ok(Buffer.from(frame.data, "base64").length <= DEFAULT_SESSION_CONTENT_BOUNDS.maxChunkPayloadBytes);
+	}
+	const completed = assembleInput(decoded);
+	assert.ok(completed);
+	assert.equal(completed.text, text);
+	assert.equal(completed.byteLength, Buffer.byteLength(text, "utf8"));
+
+	// Exactly 1 MiB of decoded text is accepted whole.
+	const exact = "b".repeat(NATIVE_TEXT_PASTE_MAX_BYTES);
+	const whole = buildNativeInputPaste(pasteOptions(exact, { inputId: "input-2", ordinal: 2 }));
+	assert.equal(whole.byteLength, NATIVE_TEXT_PASTE_MAX_BYTES);
+	assert.equal(whole.chunkCount, NATIVE_TEXT_PASTE_MAX_BYTES / DEFAULT_SESSION_CONTENT_BOUNDS.maxChunkPayloadBytes);
+	const wholeCompleted = assembleInput(decodedFrames(whole));
+	assert.equal(wholeCompleted?.text.length, NATIVE_TEXT_PASTE_MAX_BYTES);
+	assert.equal(wholeCompleted?.data.length, NATIVE_TEXT_PASTE_MAX_BYTES);
+
+	// One byte over the cap is refused before any frame exists.
+	refused(
+		"transfer_too_large",
+		() => buildNativeInputPaste(pasteOptions("c".repeat(NATIVE_TEXT_PASTE_MAX_BYTES + 1), {
+			inputId: "input-3",
+			ordinal: 3,
+		})),
+	);
+
+	// A hand-declared paste above the cap never completes, and leaves nothing behind.
+	const overCap = createNativeInputAssembler();
+	refused("bad_frame", () => overCap.accept({
+		type: "input_begin",
+		subscriptionId: "sub-1",
+		inputId: "input-3",
+		ordinal: 3,
+		source: nativeSource(),
+		inputModes: INPUT_MODES,
+		kind: "paste",
+		byteLength: NATIVE_TEXT_PASTE_MAX_BYTES + 1,
+		chunkCount: 33,
+	}));
+	refused("transfer_failed", () => overCap.accept({
+		type: "input_end",
+		subscriptionId: "sub-1",
+		inputId: "input-3",
+		ordinal: 3,
+	}));
+
+	// The paste cap is a text bound, not a transport bound, and no image or
+	// clipboard payload is expressible on either input shape.
+	refused("bad_frame", () => decodeSessionContentFrame(Buffer.from(JSON.stringify({
+		type: "input_begin",
+		subscriptionId: "sub-1",
+		inputId: "input-4",
+		ordinal: 4,
+		source: nativeSource(),
+		inputModes: INPUT_MODES,
+		kind: "paste",
+		byteLength: 4,
+		chunkCount: 1,
+		image: "png",
+	}))));
+	const inlineDecoded = decodeSessionContentFrame(buildNativeInputInline({
+		subscriptionId: "sub-1",
+		inputId: "input-5",
+		ordinal: 5,
+		source: nativeSource(),
+		inputModes: INPUT_MODES,
+		kind: "paste",
+		data: "text",
+	}).frames[0] as Buffer);
+	refused("bad_frame", () => decodeSessionContentFrame(Buffer.from(JSON.stringify({
+		...inlineDecoded,
+		clipboard: "image/png",
+	}))));
+});
+
+test("native text preserves a leading BOM instead of silently rewriting it", () => {
+	const inlineText = "\uFEFFx";
+	const inline = buildNativeInputInline({
+		subscriptionId: "sub-1",
+		inputId: "input-1",
+		ordinal: 1,
+		source: nativeSource(),
+		inputModes: INPUT_MODES,
+		kind: "paste",
+		data: inlineText,
+	});
+	const inlineCompleted = assembleInput(decodedFrames(inline));
+	assert.ok(inlineCompleted);
+	assert.equal(inlineCompleted.text, inlineText, "a leading U+FEFF is text, not a byte-order mark to discard");
+	assert.equal(inlineCompleted.byteLength, 4);
+	assert.equal(Buffer.from(inlineCompleted.data).toString("hex"), "efbbbf78");
+
+	const pagedText = `\uFEFF${"w".repeat(40_000)}`;
+	const paged = buildNativeInputPaste(pasteOptions(pagedText, { inputId: "input-2", ordinal: 2 }));
+	assert.equal(paged.byteLength, Buffer.byteLength(pagedText, "utf8"));
+	const pagedCompleted = assembleInput(decodedFrames(paged));
+	assert.ok(pagedCompleted);
+	assert.equal(pagedCompleted.text, pagedText, "the leading BOM survives paging and assembly");
+	assert.equal(Buffer.from(pagedCompleted.data).subarray(0, 3).toString("hex"), "efbbbf");
+
+	// A BOM-prefixed encoded copy is not silently cleaned into canonical base64.
+	const encoded = Buffer.from("bom").toString("base64");
+	refused("invalid_frame", () => buildNativeCopyInline(copyInlineOptions(copyEvent(`\uFEFF${encoded}`))));
+	const assembler = createNativeCopyAssembler();
+	assert.equal(assembler.accept({
+		type: "copy_begin",
+		subscriptionId: "sub-1",
+		copyId: "copy-1",
+		sequence: 1,
+		source: nativeSource(),
+		dispatchId: 1,
+		byteLength: 3 + encoded.length,
+		chunkCount: 1,
+	}), undefined);
+	assert.equal(assembler.accept({
+		type: "copy_chunk",
+		subscriptionId: "sub-1",
+		copyId: "copy-1",
+		index: 0,
+		data: Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(encoded, "ascii")]).toString("base64"),
+	}), undefined);
+	refused("bad_frame", () => assembler.accept({
+		type: "copy_end",
+		subscriptionId: "sub-1",
+		copyId: "copy-1",
+		sequence: 1,
+	}), "a BOM-prefixed copy payload is never canonical base64");
+	refused("transfer_failed", () => assembler.accept({
+		type: "copy_end",
+		subscriptionId: "sub-1",
+		copyId: "copy-1",
+		sequence: 1,
+	}), "the refused partial is discarded");
+});
+
+test("paged transfers shrink their chunks to fit a tight message bound", () => {
+	// Valid bounds where a full 32 KiB chunk plus its JSON envelope cannot fit.
+	const tight = resolveSessionContentBounds({ maxFrameBytes: 43_700 });
+	assert.equal(tight.maxChunkPayloadBytes, DEFAULT_SESSION_CONTENT_BOUNDS.maxChunkPayloadBytes);
+
+	const pasteText = `${"t".repeat(39_990)}\u4e16\u754c`;
+	const paste = buildNativeInputPaste(pasteOptions(pasteText, { bounds: tight }));
+	assert.ok(paste.chunkCount >= 2);
+	assert.deepEqual(paste.messageBytes, paste.frames.map((message) => message.length));
+	assert.ok(
+		paste.messageBytes.every((size) => size <= tight.maxFrameBytes),
+		"every paste message fits the tight bound",
+	);
+	const pasteCompleted = assembleInput(decodedFrames(paste, tight), tight);
+	assert.equal(pasteCompleted?.text, pasteText);
+	assert.equal(pasteCompleted?.byteLength, Buffer.byteLength(pasteText, "utf8"));
+
+	const encoded = Buffer.from("u".repeat(75_000), "utf8").toString("base64");
+	const copy = buildNativeCopyPaged(copyOptions({ encoded, bounds: tight }));
+	assert.equal(copy.byteLength, encoded.length);
+	assert.ok(copy.chunkCount >= 4);
+	assert.deepEqual(copy.messageBytes, copy.frames.map((message) => message.length));
+	assert.ok(
+		copy.messageBytes.every((size) => size <= tight.maxFrameBytes),
+		"every copy message fits the tight bound",
+	);
+	const copyCompleted = assembleCopy(decodedFrames(copy, tight), tight);
+	assert.ok(copyCompleted);
+	assert.equal(copyCompleted.event.kind, "copy");
+	if (copyCompleted.event.kind !== "copy") throw new Error("expected a copy event");
+	assert.equal(copyCompleted.event.encoded, encoded, "the tight bound never truncates the payload");
+
+	// The shrink is local to the tight bound: default bounds still use full raw chunks.
+	const full = buildNativeInputPaste(pasteOptions("v".repeat(40_000), { inputId: "input-2", ordinal: 2 }));
+	assert.equal(full.chunkCount, 2);
+	const firstChunk = decodedFrames(full)[1];
+	if (firstChunk?.type !== "input_chunk") throw new Error("expected a chunk");
+	assert.equal(Buffer.from(firstChunk.data, "base64").length, DEFAULT_SESSION_CONTENT_BOUNDS.maxChunkPayloadBytes);
+});
+
+test("fragmented or replayed native input never yields a completed packet", () => {
+	const built = buildNativeInputPaste(pasteOptions("d".repeat(70_000)));
+	const frames = decodedFrames(built);
+	const begin = frames[0] as SessionContentFrame;
+	const chunks = frames.slice(1, -1);
+	const end = frames[frames.length - 1] as SessionContentFrame;
+	assert.ok(chunks.length >= 3);
+
+	const feed = (
+		sequence: readonly SessionContentFrame[],
+	): { readonly completed: NativeIoCompletedInput[]; readonly code?: SessionContentFailureCode } => {
+		const assembler = createNativeInputAssembler();
+		const completed: NativeIoCompletedInput[] = [];
+		try {
+			for (const frame of sequence) {
+				const result = assembler.accept(frame);
+				if (result !== undefined) completed.push(result);
+			}
+			return { completed };
+		} catch (error) {
+			if (!isSessionContentProtocolError(error)) throw error;
+			return { completed, code: error.code };
+		}
+	};
+
+	const cases: ReadonlyArray<readonly [string, readonly SessionContentFrame[]]> = [
+		["missing part", [begin, ...chunks.slice(1), end]],
+		["duplicated part", [begin, chunks[0] as SessionContentFrame, chunks[0] as SessionContentFrame, ...chunks.slice(1), end]],
+		["reordered part", [begin, chunks[1] as SessionContentFrame, chunks[0] as SessionContentFrame, ...chunks.slice(2), end]],
+		["premature end", [begin, chunks[0] as SessionContentFrame, end]],
+		["foreign input id", [begin, { ...(chunks[0] as object), inputId: "other-input" } as unknown as SessionContentFrame]],
+		["second begin", [begin, { ...(begin as object), inputId: "other-input" } as unknown as SessionContentFrame]],
+		["chunk without begin", [chunks[0] as SessionContentFrame]],
+		["end without begin", [end]],
+	];
+	for (const [label, sequence] of cases) {
+		const outcome = feed(sequence);
+		assert.equal(outcome.code, "transfer_failed", label);
+		assert.deepEqual(outcome.completed, [], `${label} never completes an input`);
+	}
+
+	// Parts that assemble to non-UTF-8 bytes refuse at the end, after being accepted.
+	const invalidUtf8 = createNativeInputAssembler();
+	assert.equal(invalidUtf8.accept({
+		type: "input_begin",
+		subscriptionId: "sub-1",
+		inputId: "input-8",
+		ordinal: 8,
+		source: nativeSource(),
+		inputModes: INPUT_MODES,
+		kind: "paste",
+		byteLength: 2,
+		chunkCount: 1,
+	}), undefined);
+	assert.equal(invalidUtf8.accept({
+		type: "input_chunk",
+		subscriptionId: "sub-1",
+		inputId: "input-8",
+		index: 0,
+		data: Buffer.from([0x61, 0xff]).toString("base64"),
+	}), undefined);
+	refused("bad_frame", () => invalidUtf8.accept({
+		type: "input_end",
+		subscriptionId: "sub-1",
+		inputId: "input-8",
+		ordinal: 8,
+	}));
+	refused("transfer_failed", () => invalidUtf8.accept({
+		type: "input_end",
+		subscriptionId: "sub-1",
+		inputId: "input-8",
+		ordinal: 8,
+	}), "the refused partial is discarded");
+
+	// A completed ordinal never completes twice, and its parts are not replayable.
+	const replay = createNativeInputAssembler();
+	assert.equal(replay.accept(begin), undefined);
+	for (const chunk of chunks) replay.accept(chunk);
+	assert.ok(replay.accept(end));
+	for (const frame of [begin, ...chunks, end]) {
+		refused("transfer_failed", () => replay.accept(frame), "a replayed input never completes");
+	}
+});
+
+test("a full native text copy crosses bounded pages and completes atomically", () => {
+	const text = "z".repeat(75_000);
+	const encoded = Buffer.from(text, "utf8").toString("base64");
+	assert.equal(encoded.length, NATIVE_COPY_MAX_ENCODED_CHARS);
+	assert.equal(NATIVE_COPY_MAX_ENCODED_CHARS, 100_000);
+
+	const built = buildNativeCopyPaged(copyOptions({ encoded }));
+	assert.ok(built.chunkCount > 1, "a producer-bound copy is paged, never reduced to a message size");
+	assert.equal(built.frames.length, built.chunkCount + 2);
+	assert.equal(built.byteLength, encoded.length);
+	assert.deepEqual(built.messageBytes, built.frames.map((message) => message.length));
+	assert.ok(built.messageBytes.every((size) => size <= DEFAULT_SESSION_CONTENT_BOUNDS.maxFrameBytes));
+
+	const frames = decodedFrames(built);
+	const begin = frames[0];
+	if (begin?.type !== "copy_begin") throw new Error("expected copy begin");
+	assert.equal(begin.byteLength, encoded.length);
+	assert.equal(begin.chunkCount, built.chunkCount);
+	assert.equal(Object.hasOwn(begin, "event"), false, "the header never carries the clipboard payload");
+	const completed = assembleCopy(frames);
+	assert.ok(completed);
+	assert.equal(completed.event.kind, "copy");
+	if (completed.event.kind !== "copy") throw new Error("expected a copy event");
+	assert.equal(completed.event.encoded, encoded, "the entire 100,000-character payload survives");
+	assert.equal(completed.event.sessionId, nativeSource().nativeSession.sessionId, "the event tuple follows the header source");
+	assert.equal(completed.event.sessionEpoch, nativeSource().nativeSession.epoch);
+	assert.equal(completed.sequence, 1);
+	assert.deepEqual(completed.source, nativeSource());
+
+	// Above the unchanged producer bound, malformed, and non-text payloads refuse.
+	refused(
+		"transfer_too_large",
+		() => buildNativeCopyPaged(copyOptions({ encoded: Buffer.from("y".repeat(75_003)).toString("base64") })),
+	);
+	refused(
+		"invalid_frame",
+		() => buildNativeCopyPaged(copyOptions({ encoded: `${encoded.slice(0, -1)}!` })),
+	);
+	refused(
+		"invalid_frame",
+		() => buildNativeCopyPaged(copyOptions({ encoded: Buffer.from([0xff, 0xfe, 0xfd]).toString("base64") })),
+	);
+	// A small copy still fits one inline message.
+	const inline = buildNativeCopyInline(copyInlineOptions(
+		copyEvent(Buffer.from("small").toString("base64")),
+		{ sequence: 2, dispatchId: 2 },
+	));
+	assert.equal(inline.frames.length, 1);
+	const inlineCompleted = assembleCopy(decodedFrames(inline));
+	assert.equal(inlineCompleted?.event.kind, "copy");
+});
+
+test("copy emission order is the copy sequence, never the native input dispatch order", () => {
+	const assembler = createNativeCopyAssembler();
+	const first = buildNativeCopyInline(copyInlineOptions(
+		copyEvent(Buffer.from("first").toString("base64")),
+		{ sequence: 1, dispatchId: 2 },
+	));
+	const second = buildNativeCopyInline(copyInlineOptions(
+		copyEvent(Buffer.from("second").toString("base64")),
+		{ sequence: 2, dispatchId: 1 },
+	));
+	const one = assembler.accept(decodeSessionContentFrame(first.frames[0] as Buffer));
+	const two = assembler.accept(decodeSessionContentFrame(second.frames[0] as Buffer));
+	assert.equal(one?.sequence, 1);
+	assert.equal(one?.dispatchId, 2, "the copy caused by an earlier dispatch may arrive first");
+	assert.equal(two?.sequence, 2);
+	assert.equal(two?.dispatchId, 1, "an asynchronous copy from input A may follow input B");
+	assert.notEqual(one, undefined);
+	assert.notEqual(two, undefined);
+
+	// Emission order is still fenced: a completed sequence never publishes twice.
+	refused("transfer_failed", () => assembler.accept(decodeSessionContentFrame(first.frames[0] as Buffer)));
+	refused("transfer_failed", () => assembler.accept(decodeSessionContentFrame(second.frames[0] as Buffer)));
+	const stalePaged = buildNativeCopyPaged(copyOptions({
+		sequence: 2,
+		dispatchId: 9,
+		encoded: Buffer.from("q".repeat(40_000)).toString("base64"),
+	}));
+	const staleAssembler = createNativeCopyAssembler();
+	assert.ok(staleAssembler.accept(decodeSessionContentFrame(second.frames[0] as Buffer)));
+	refused(
+		"transfer_failed",
+		() => staleAssembler.accept(decodeSessionContentFrame(stalePaged.frames[0] as Buffer)),
+		"a replayed emission sequence is refused before any page is buffered",
+	);
+
+	// An unavailable copy is inline, fixed-reason only, and never carries payload.
+	const unavailable = buildNativeCopyInline(copyInlineOptions(
+		unavailableEvent("unsupported-runtime"),
+		{ sequence: 3, dispatchId: 4 },
+	));
+	const three = assembler.accept(decodeSessionContentFrame(unavailable.frames[0] as Buffer));
+	assert.deepEqual(three?.event, unavailableEvent("unsupported-runtime"));
+	assert.equal(three?.dispatchId, 4);
+	refused("invalid_frame", () => buildNativeCopyInline(copyInlineOptions(
+		unavailableEvent("unsupported" as unknown as NativeIoCopyUnavailableReason),
+		{ sequence: 4 },
+	)));
+	refused("invalid_frame", () => buildNativeCopyInline(copyInlineOptions(
+		{ ...copyEvent(Buffer.from("x").toString("base64")), image: "png" } as unknown as NativeIoCopyEvent,
+		{ sequence: 4 },
+	)));
+	refused("invalid_frame", () => buildNativeCopyInline(copyInlineOptions(
+		copyEvent("\x1b]52;c;ZA==\x07"),
+		{ sequence: 4 },
+	)));
+});
+
+test("a copy names one authenticated native tuple in both its source and its event", () => {
+	const encoded = Buffer.from("copied text").toString("base64");
+	// The coherent pair roundtrips on the wire and completes.
+	const built = buildNativeCopyInline(copyInlineOptions(copyEvent(encoded)));
+	const decoded = decodeSessionContentFrame(built.frames[0] as Buffer);
+	if (decoded.type !== "copy") throw new Error("expected copy");
+	assert.equal(decoded.event.sessionId, nativeSource().nativeSession.sessionId);
+	assert.equal(decoded.event.sessionEpoch, nativeSource().nativeSession.epoch);
+	const completed = createNativeCopyAssembler().accept(decoded);
+	assert.deepEqual(completed?.event, copyEvent(encoded));
+
+	// A mixed pair is refused on the encode side, the decode side, and in assembly.
+	const mixedEvents: ReadonlyArray<readonly [string, NativeIoCopyEvent]> = [
+		["a different native session id", copyEvent(encoded, { sessionId: "native-session-2" })],
+		["a different native epoch", copyEvent(encoded, { sessionEpoch: 4 })],
+		["an unavailable event for another conversation", unavailableEvent("unsupported-runtime", { sessionEpoch: 9 })],
+	];
+	for (const [label, event] of mixedEvents) {
+		refused(
+			"invalid_frame",
+			() => buildNativeCopyInline(copyInlineOptions(event)),
+			`the publisher refuses ${label}`,
+		);
+		refused(
+			"invalid_frame",
+			() => encodeSessionContentFrame({ ...decoded, event }),
+			`encoding refuses ${label}`,
+		);
+		refused(
+			"bad_frame",
+			() => decodeSessionContentFrame(Buffer.from(JSON.stringify({ ...decoded, event }))),
+			`decoding refuses ${label}`,
+		);
+		const assembler = createNativeCopyAssembler();
+		refused("bad_frame", () => assembler.accept({ ...decoded, event }), `assembly refuses ${label}`);
+		// A refused mixed event never commits the sequence it named.
+		assert.equal(assembler.accept(decodeSessionContentFrame(built.frames[0] as Buffer))?.sequence, 1);
+	}
+
+	// A paged copy inherits the header source's tuple; nothing else can supply it,
+	// so the completed event and the preserved header source always agree.
+	const headerSource = nativeSource({ nativeSession: { sessionId: "native-session-9", epoch: 5 } });
+	const paged = buildNativeCopyPaged(copyOptions({
+		source: headerSource,
+		encoded: Buffer.from("p".repeat(40_000)).toString("base64"),
+	}));
+	const pagedCompleted = assembleCopy(decodedFrames(paged));
+	assert.equal(pagedCompleted?.event.kind, "copy");
+	assert.equal(pagedCompleted?.event.sessionId, "native-session-9");
+	assert.equal(pagedCompleted?.event.sessionEpoch, 5);
+	assert.equal(pagedCompleted?.source.nativeSession.sessionId, "native-session-9", "the header source is preserved");
+	assert.equal(pagedCompleted?.source.nativeSession.epoch, 5);
+});
+
+test("a paged copy publishes nothing unless every part is contiguous and exact", () => {
+	const encoded = Buffer.from("q".repeat(50_000), "utf8").toString("base64");
+	const built = buildNativeCopyPaged(copyOptions({ encoded }));
+	const frames = decodedFrames(built);
+	assert.ok(frames.length >= 4, "the fixture spans at least three pages");
+	const begin = frames[0] as SessionContentFrame;
+	const chunks = frames.slice(1, -1);
+	const end = frames[frames.length - 1] as SessionContentFrame;
+
+	const feed = (
+		sequence: readonly SessionContentFrame[],
+	): { readonly completed: NativeIoCompletedCopy[]; readonly code?: SessionContentFailureCode } => {
+		const assembler = createNativeCopyAssembler();
+		const completed: NativeIoCompletedCopy[] = [];
+		try {
+			for (const frame of sequence) {
+				const result = assembler.accept(frame);
+				if (result !== undefined) completed.push(result);
+			}
+			return { completed };
+		} catch (error) {
+			if (!isSessionContentProtocolError(error)) throw error;
+			return { completed, code: error.code };
+		}
+	};
+
+	const cases: ReadonlyArray<readonly [string, readonly SessionContentFrame[]]> = [
+		["missing part", [begin, ...chunks.slice(1), end]],
+		["duplicated part", [begin, chunks[0] as SessionContentFrame, chunks[0] as SessionContentFrame, ...chunks.slice(1), end]],
+		["reordered part", [begin, chunks[1] as SessionContentFrame, chunks[0] as SessionContentFrame, ...chunks.slice(2), end]],
+		["premature end", [begin, chunks[0] as SessionContentFrame, end]],
+		["foreign copy id", [begin, { ...(chunks[0] as object), copyId: "other-copy" } as unknown as SessionContentFrame]],
+		["mismatched end sequence", [begin, ...chunks, { ...(end as object), sequence: 7 } as unknown as SessionContentFrame]],
+		["page without begin", [chunks[0] as SessionContentFrame]],
+	];
+	for (const [label, sequence] of cases) {
+		const outcome = feed(sequence);
+		assert.equal(outcome.code, "transfer_failed", label);
+		assert.deepEqual(outcome.completed, [], `${label} never completes a copy`);
+	}
+	assert.deepEqual(assembleCopy(frames)?.event, copyEvent(encoded));
+});
+
+test("native IO frames leave the bounded viewport transfer and its bounds unchanged", () => {
+	assert.equal(DEFAULT_SESSION_CONTENT_BOUNDS.maxTransferBytes, 64 * 1024 * 1024);
+	assert.equal(DEFAULT_SESSION_CONTENT_BOUNDS.maxFrameBytes, 65_536);
+	assert.equal(DEFAULT_SESSION_CONTENT_BOUNDS.maxChunkPayloadBytes, 32 * 1024);
+
+	const snapshot = assembleContent(buildSessionContentTransfer(transferOptions(sampleFrame())));
+	assert.ok(snapshot);
+	assert.ok((snapshot.frame.graphics?.images.length ?? 0) > 0, "typed PNG viewport content still roundtrips");
+	assert.deepEqual(snapshot.frame.graphics?.images, sampleFrame().graphics?.images);
+
+	// A native IO frame is recognized, still closed, and never a legacy shape.
+	const input = decodedFrames(buildNativeInputInline({
+		subscriptionId: "sub-1",
+		inputId: "input-1",
+		ordinal: 1,
+		source: nativeSource(),
+		inputModes: INPUT_MODES,
+		kind: "keyboard",
+		data: "a",
+	}))[0];
+	assert.equal(input?.type, "input");
+	assert.equal(input !== undefined && "subscriptionId" in input, true);
 });

@@ -215,12 +215,23 @@ with the deliberate target preserved, and no local row, sibling destination, or 
 fallback replaces it.
 
 At this ordered interim slice, remote keyboard and mouse input, remote clipboard
-attribution, remote creation, `SessionSpawn`, Close, stop or resume, and owner-routed
-session operations are unimplemented and fail closed: native-pane packets are not
-forwarded to a remote owner, and no local child receives them on that stream's behalf.
+attribution, remote creation, `SessionSpawn`, and resume are unimplemented. The owner
+Close transport exists, but its requester sidebar controls are not wired. Native input
+still fails closed: packets are not forwarded to a remote owner, and no local child
+receives them on that stream's behalf.
 That is an interim ordering bound, not a permanent view-only policy. Authenticated local
 and SSH clipboard copying is unchanged, nothing is broadcast, no remote copy request is
 transported, and raw PTY OSC 52 stays denied.
+
+The optional owner Close capability runs over the existing roster channel, not a new
+listener or permission kind. The current TLS-proved key, pin, and owner's receiving
+grant authorize each request and each result write. Main's same owner provider checks
+the exact run/row and real idle/exit facts; no selected content stream, native tuple,
+viewer or controller lease is required. Accepted work remains owned by Main after
+channel loss or revocation, while unauthorized replies are withheld. A send attempt or
+acknowledgement is not process exit: lost replies remain unknown, no request is replayed,
+and only owner observations remove the projected row. Saved history is never deleted.
+See [Owner Close transport](session-host-alpha.md#owner-close-transport-foundation).
 
 ### Session-host clipboard transport
 
@@ -236,6 +247,14 @@ rejection, exact current tuple, owned-process lifetime, and the host's actually 
 Main input owner all gate the generated outer-terminal request. Missing/changed source
 provenance fails closed. This is an application integration fence, not a sandbox against
 trusted executable extensions with the user's process authority.
+
+An opt-in owned-bridge foundation can authenticate ASCII input fragments, including
+payload bytes and explicit local, non-user, or opaque viewer origins, and carry that
+immutable origin through asynchronous native copy callbacks in a separate v2 capsule.
+Its signed one-shot readiness statement proves only decoder installation, not input
+permission, a drawn source, or clipboard delivery. No production caller enables this
+mode yet. Origin-bearing copies never enter the legacy local callback implicitly; no
+remote input, forced capture, viewer clipboard egress, or new Pi hook is enabled.
 
 The selected text is transient transport data, not a new diagnostic, roster, or clipboard
 history. Source stacks are inspected in memory and not logged. HMAC authenticates but

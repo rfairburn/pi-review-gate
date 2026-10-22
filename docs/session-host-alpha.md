@@ -627,9 +627,10 @@ supplies the explicit pairing controls, saved connection preferences and bounded
 recovery; discovery and clipboard attribution remain unimplemented. The session-level
 protocols implemented so far are the bounded roster-metadata channel described next and
 the single-row native viewport lane described under
-[Selected native viewport](#selected-native-viewport-interim-display-scope); remote
-terminal input, remote clipboard attribution, and session operations remain
-unimplemented. Native client-only mobile implementations can use this trust model;
+[Selected native viewport](#selected-native-viewport-interim-display-scope), and the
+[owner Close transport](#owner-close-transport-foundation). Requester Close controls,
+remote terminal input, remote clipboard attribution, and other session operations
+remain unimplemented. Native client-only mobile implementations can use this trust model;
 ordinary browser WebSockets do not expose self-signed certificate pinning and are not
 claimed supported.
 
@@ -723,8 +724,10 @@ controlling host, separate ACL, exclusive-controller lease, or new revocation li
 policy is added.
 
 The roster projection itself stays metadata-only: connecting a destination adds no
-terminal content, input, or session operations by itself, and a client cannot create,
-stop, or close an owner session. A separate deliberate selection can display one exact
+terminal content, input, or session operation by itself. The base `roster-v1` capability
+cannot create, stop, or close an owner session; the separate optional
+[Close capability](#owner-close-transport-foundation) adds an explicit owner-routed
+operation without requiring a content selection. A deliberate selection can display one exact
 row's native viewport (see
 [Selected native viewport](#selected-native-viewport-interim-display-scope)); every other
 row stays metadata-only. That is an implemented protocol scope, not a view-only permission
@@ -833,8 +836,9 @@ honest current or stale state, and Enter or a drawn left click on it selects tha
 native viewport for display (see
 [Selected native viewport](#selected-native-viewport-interim-display-scope)) without
 changing any local row's process, input ownership, saved state, or the roster. Remote
-keyboard and mouse input, remote creation, `SessionSpawn`, Close, stop, resume, and
-clipboard attribution remain unimplemented at this ordered interim slice. Host shutdown
+keyboard and mouse input, remote creation, `SessionSpawn`, resume, and clipboard
+attribution remain unimplemented at this ordered interim slice. The owner Close
+transport exists, but its requester sidebar controls are not yet wired. Host shutdown
 closes only this host's owned local network
 resources and waits for that local settlement; an unconfirmed close is reported and
 retains agent-directory ownership. It never waits for a remote receipt or remote work.
@@ -937,8 +941,9 @@ not invent a new source receipt. Input modes and cursor facts carried with a
 viewport are inert observations for rendering; they grant no input.
 
 This is an ordered interim slice, not a finished remote session surface. Remote keyboard
-and mouse input, remote clipboard attribution, and owner-routed session operations (remote
-creation, `SessionSpawn`, Close, stop, resume) are not implemented and fail closed: while a
+and mouse input, remote clipboard attribution, remote creation, `SessionSpawn`, and
+resume are not implemented. The Close transport below has no requester sidebar controls
+yet. Native input still fails closed: while a
 remote viewport is displayed, native-pane keyboard, paste, and mouse packets are not
 forwarded to the remote owner and no local child receives them on that stream's behalf.
 That ordering is an interim implementation bound, not a permanent view-only mode,
@@ -947,6 +952,35 @@ standalone Pi, and local host input are unchanged: nothing is broadcast, no remo
 request is transported, raw PTY OSC 52 stays denied, and no last-input-origin inference is
 added. Native Pi clipboard-producer coverage keeps the limits the
 [clipboard section](#clipboard-copying-over-ssh) describes.
+
+### Owner Close transport foundation
+
+An optional `roster-close-v1` capability adds exact owner-run/row Close requests to
+that owner's existing paired roster channel. It is acknowledged only when the host
+has a real owner Close provider. An older peer or a host without that provider is
+unsupported, not silently upgraded or connected on demand. The current TLS-proved
+peer key, pin and directional receiving grant still gate each request and reply;
+capability negotiation grants no authority.
+
+The provider reuses Main's one manager, stop ladder, and roster-removal bookkeeping.
+It needs no selected content stream, native conversation tuple, viewer, or controller
+lease. Unconfirmed requests recheck positive idle on the owner; busy or unknown activity
+returns `confirmation-required`. Requesters supply the confirmed flag only after explicit
+confirmation; the corresponding sidebar controls are not yet wired. Confirmed requests
+use only the existing bounded stop ladder. Only the manager's actual exit or settled-error removal authority can
+remove a row; saved conversations are never deleted. Different rows may close in
+parallel, while a pending close never starts a second ladder for the same row.
+
+Fixed results distinguish removal, stopped-but-retained, confirmation required,
+unconfirmed, refused, busy, and unknown. The requester does not optimistically delete
+a row: only the owner's roster observation changes that projection. Once a send was
+attempted, a lost reply or uncertain write remains unknown and is not replayed.
+Disconnect, Remove, Revoke, or dismissing requester UI cannot cancel a stop the owner
+already accepted; network teardown does not establish process settlement.
+
+This is a backend transport foundation: the sidebar's remote Close controls and their
+written-confirmation receipts are not yet wired. It does not enable remote keyboard,
+mouse, creation, resume, or clipboard delivery.
 
 ## Focus, display, and status
 

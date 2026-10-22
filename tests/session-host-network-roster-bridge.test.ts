@@ -38,6 +38,8 @@ import {
 } from "../src/session-host/network/roster-bridge-host";
 import {
   DEFAULT_ROSTER_BRIDGE_BOUNDS,
+  ROSTER_BRIDGE_CLOSE_CAPABILITY,
+  ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
@@ -46,6 +48,7 @@ import {
   buildRosterBridgeTransfer,
   decodeRosterBridgeFrame,
   encodeRosterBridgeFrame,
+  isRosterBridgeIdentifier,
   isRosterBridgeProtocolError,
   negotiateRosterBridgeHello,
   packRosterBridgePages,
@@ -53,10 +56,13 @@ import {
   reviewRosterBridgeHelloAck,
   rosterBridgeWireCodeForFailure,
   type RosterBridgeBounds,
+  type RosterBridgeCloseRequestFrame,
+  type RosterBridgeCloseResultFrame,
   type RosterBridgeErrorCode,
   type RosterBridgeFrame,
   type RosterBridgeHelloFrame,
 } from "../src/session-host/network/roster-bridge-protocol";
+import type { OwnerCloseFacts, OwnerCloseHandler, OwnerCloseRequest } from "../src/session-host/network/peer-close";
 import { toRemoteSessionMetadata, type RemoteSessionMetadata } from "../src/session-host/network/roster-metadata";
 
 const SECRET_AGENT_DIR = "/Users/owner/.pi/agent";
@@ -450,6 +456,7 @@ const FAST_BOUNDS: Partial<RosterBridgeBounds> = {
   transferIdleTimeoutMs: 250,
   stopAckTimeoutMs: 120,
   helloTimeoutMs: 250,
+  closeResultTimeoutMs: 200,
 };
 
 // --- pure protocol -----------------------------------------------------------
@@ -620,6 +627,7 @@ function harness(options: {
   bounds?: Partial<RosterBridgeBounds>;
   authorize?: (peerKey: { keyId: string; fingerprint: string }) => boolean;
   rows?: readonly string[];
+  close?: OwnerCloseHandler;
 } = {}) {
   const pair = channelPair();
   const inventory = new FakeInventory();
@@ -631,6 +639,7 @@ function harness(options: {
     inventory,
     authorizePeer: authorize,
     bounds: { ...FAST_BOUNDS, ...options.bounds },
+    ...(options.close === undefined ? {} : { closeOwnedSession: options.close }),
     onDiagnostic: (event) => {
       ownerDiagnostics.push(event.code);
     },
@@ -2107,6 +2116,670 @@ test("an owner stop whose notification cannot be written still ends the channel"
     assert.equal(h.viewer.projection.state, "stale", "silence is never freshness");
     assert.equal(h.viewer.projection.reason, "channel-closed");
     assert.equal(h.viewer.projection.rows.length, 3);
+  } finally {
+    await h.stop();
+  }
+});
+
+// --- owner Close RPC over the same roster lane -------------------------------
+
+function closeRequest(overrides: Partial<RosterBridgeCloseRequestFrame> = {}): RosterBridgeCloseRequestFrame {
+  return { type: "close_request", requestId: "req-1", hostRunId: RUN_A, rowId: "row-1", confirmed: false, ...overrides };
+}
+
+function closeResult(requestId: string, facts: OwnerCloseFacts): RosterBridgeCloseResultFrame {
+  return { type: "close_result", requestId, outcome: facts };
+}
+
+/** True only for the protocol's own fixed refusal of a frame it cannot carry. */
+function refusedFrame(frame: unknown): boolean {
+  try {
+    decodeRosterBridgeFrame(encodeFrameOrThrow(frame));
+    return false;
+  } catch (error) {
+    return isRosterBridgeProtocolError(error) && error.code === "bad_frame";
+  }
+}
+
+test("Close is an optional capability with fixed framing and no version or metadata meaning", () => {
+  assert.deepEqual([...ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES], [ROSTER_BRIDGE_CLOSE_CAPABILITY]);
+  const decision = negotiateRosterBridgeHello(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CLOSE_CAPABILITY]));
+  assert.equal(decision.ok, true);
+  assert.deepEqual(decision.ok ? decision.capabilities : null, [ROSTER_BRIDGE_CLOSE_CAPABILITY]);
+  // A minor version alone still grants nothing, and the major version is unchanged.
+  assert.equal(ROSTER_BRIDGE_MINOR, 0);
+  assert.equal(negotiateRosterBridgeHello({ ...helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY]), minor: 99 }).ok, true);
+
+  // The result deadline is one more validated finite bound, not a lifetime.
+  assert.equal(DEFAULT_ROSTER_BRIDGE_BOUNDS.closeResultTimeoutMs, 15_000);
+  assert.equal(resolveRosterBridgeBounds({ closeResultTimeoutMs: 1 }).closeResultTimeoutMs, 1);
+  for (const value of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => resolveRosterBridgeBounds({ closeResultTimeoutMs: value }),
+      (error: unknown) => isRosterBridgeProtocolError(error) && error.code === "invalid_bounds");
+  }
+
+  const request = closeRequest({ confirmed: true });
+  assert.deepEqual(decodeRosterBridgeFrame(encodeRosterBridgeFrame(request)), request);
+  assert.deepEqual(decodeRosterBridgeFrame(encodeRosterBridgeFrame(closeResult("req-1", { kind: "stopped-retained" }))),
+    { type: "close_result", requestId: "req-1", outcome: { kind: "stopped-retained" } });
+  // The opaque identifier rule is the same 64-byte rule the metadata lane uses.
+  assert.equal(isRosterBridgeIdentifier("row-1"), true);
+  assert.equal(isRosterBridgeIdentifier("x".repeat(64)), true);
+  assert.equal(isRosterBridgeIdentifier("x".repeat(65)), false);
+});
+
+test("close frames refuse any shape outside their closed schema", () => {
+  for (const extra of [{ payload: "x" }, { error: "boom" }, { signal: "TERM" }, { path: "/tmp/x" }, { nativeSession: {} }, { force: true }]) {
+    assert.equal(refusedFrame({ ...closeRequest(), ...extra }), true, `${JSON.stringify(extra)} must never decode`);
+    assert.equal(refusedFrame({ ...closeResult("req-1", { kind: "removed" }), ...extra }), true);
+  }
+  for (const requestId of ["", "-lead", "has space", "x".repeat(65), 7, null]) {
+    assert.equal(refusedFrame(closeRequest({ requestId: requestId as never })), true, `${String(requestId)} must never decode`);
+  }
+  for (const field of ["hostRunId", "rowId"] as const) {
+    for (const value of ["", "x".repeat(65), 3, null]) {
+      assert.equal(refusedFrame({ ...closeRequest(), [field]: value }), true, `${field}=${String(value)} must never decode`);
+    }
+  }
+  for (const confirmed of [1, 0, "true", null, undefined]) {
+    assert.equal(refusedFrame({ ...closeRequest(), confirmed }), true, `confirmed=${String(confirmed)} must never decode`);
+  }
+  for (const outcome of [
+    {},
+    { kind: "removed", extra: 1 },
+    { kind: "forced" },
+    { kind: "REMOVED" },
+    { kind: "removed " },
+    "removed",
+    [],
+    null,
+  ]) {
+    assert.equal(refusedFrame({ type: "close_result", requestId: "req-1", outcome }), true,
+      `${JSON.stringify(outcome)} must never decode`);
+  }
+  // The encoder refuses the same closed schema for a frame this side built wrongly.
+  assert.throws(() => encodeRosterBridgeFrame({ ...closeRequest(), confirmed: "yes" } as never),
+    (error: unknown) => isRosterBridgeProtocolError(error) && error.code === "invalid_frame");
+  assert.throws(() => encodeRosterBridgeFrame(closeResult("req-1", { kind: "forced" } as never)),
+    (error: unknown) => isRosterBridgeProtocolError(error) && error.code === "invalid_frame");
+});
+
+test("a provider-less owner never acknowledges Close and an old viewer is never sent one", async () => {
+  const h = harness({ rows: ["row-1"] });
+  try {
+    await h.viewer.hello;
+    assert.equal(h.viewer.supportsClose, false);
+    assert.deepEqual(h.viewer.capabilities, [ROSTER_BRIDGE_REQUIRED_CAPABILITY]);
+    const refused = await h.viewer.closeSession({ hostRunId: h.inventory.hostRunId, rowId: "row-1", confirmed: false });
+    assert.deepEqual(refused, { kind: "not-sent", reason: "capability-unsupported" });
+    await settle();
+    assert.deepEqual(h.pair.viewerSide.types(), ["hello"], "no close frame exists to send without the negotiation");
+    assert.equal(h.binding.subscribed, false, "refusing a close changes no metadata state");
+    // An ordinary subscription still works exactly as before.
+    const snapshot = await h.viewer.subscribe();
+    assert.equal(snapshot.state, "current");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("an old viewer that never offers Close is refused outside the negotiated protocol", async () => {
+  const pair = channelPair();
+  const inventory = new FakeInventory();
+  inventory.rows = [ownerRow("row-1")];
+  const calls: OwnerCloseRequest[] = [];
+  const owner = createRosterBridgeHost({
+    inventory,
+    authorizePeer: () => true,
+    bounds: FAST_BOUNDS,
+    closeOwnedSession: async (request) => {
+      calls.push(request);
+      return { kind: "removed" };
+    },
+  });
+  const binding = owner.attach(pair.ownerSide);
+  const scripted = new ScriptedPeer(pair.viewerSide);
+  try {
+    scripted.write(helloFrame());
+    await settle();
+    const ack = pair.ownerSide.frames()[0];
+    assert.ok(ack !== undefined && ack.type === "hello_ack");
+    assert.deepEqual(ack.capabilities, [ROSTER_BRIDGE_REQUIRED_CAPABILITY],
+      "a viewer that offered no Close support is acknowledged with the baseline only");
+    scripted.write(closeRequest());
+    await settle();
+    assert.deepEqual(calls, [], "nothing outside the negotiated protocol reaches the provider");
+    const frames = pair.ownerSide.frames();
+    assert.ok(frames.some((frame) => frame.type === "error" && frame.code === "bad_frame"),
+      "a close frame on a channel that never negotiated it is refused once");
+    assert.equal(pair.ownerSide.frames().some((frame) => frame.type === "close_result"), false);
+    assert.equal(binding.subscribed, false);
+    assert.equal(pair.ownerSide.closedCalls, 1, "the violating channel is closed once through its bounded API");
+  } finally {
+    await owner.stopAll();
+  }
+});
+
+test("only the exact requested run, row, and confirmation reach the owner provider", async () => {
+  const calls: OwnerCloseRequest[] = [];
+  const h = harness({
+    close: async (request) => {
+      calls.push(request);
+      return { kind: "confirmation-required" };
+    },
+  });
+  try {
+    await h.viewer.hello;
+    assert.equal(h.viewer.supportsClose, true);
+    assert.deepEqual(h.viewer.capabilities, [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CLOSE_CAPABILITY]);
+    await h.viewer.subscribe();
+    const first = await h.viewer.closeSession({ hostRunId: h.inventory.hostRunId, rowId: "row-2", confirmed: false });
+    assert.deepEqual(first, { kind: "owner-result", facts: { kind: "confirmation-required" } });
+    const second = await h.viewer.closeSession({ hostRunId: h.inventory.hostRunId, rowId: "row-2", confirmed: true });
+    assert.deepEqual(second, { kind: "owner-result", facts: { kind: "confirmation-required" } });
+    assert.deepEqual(calls, [
+      { hostRunId: h.inventory.hostRunId, rowId: "row-2", confirmed: false },
+      { hostRunId: h.inventory.hostRunId, rowId: "row-2", confirmed: true },
+    ]);
+    // Every request has its own correlation id, and nothing else rides the wire.
+    const requests = h.pair.viewerSide.frames().filter((frame) => frame.type === "close_request");
+    assert.equal(requests.length, 2);
+    const ids = requests.map((frame) => (frame.type === "close_request" ? frame.requestId : ""));
+    assert.equal(new Set(ids).size, 2, "each request gets a fresh id");
+    assert.deepEqual([...new Set(h.pair.viewerSide.types())].sort(), ["close_request", "hello", "subscribe"],
+      "the requester writes only its own request frames");
+    // The projection is untouched by a close: only a new owner snapshot changes rows.
+    assert.deepEqual(h.viewer.projection.rows.map((row) => row.id), ["row-1", "row-2", "row-3"]);
+    assert.equal(h.viewer.projection.state, "current");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("metadata acknowledgements and projections continue while the owner provider holds a close", async () => {
+  let release: (facts: OwnerCloseFacts) => void = () => undefined;
+  const calls: OwnerCloseRequest[] = [];
+  const h = harness({
+    close: (request) => {
+      calls.push(request);
+      return new Promise<OwnerCloseFacts>((resolve) => {
+        release = resolve;
+      });
+    },
+  });
+  try {
+    await h.viewer.hello;
+    const first = await h.viewer.subscribe();
+    const pending = h.viewer.closeSession({ hostRunId: h.inventory.hostRunId, rowId: "row-1", confirmed: false });
+    // The provider call is what proves the request was admitted; `ownerSide.types()`
+    // records frames the OWNER wrote, so it never shows the requester's request.
+    await until("the close reaches the owner provider", () => calls.length === 1);
+    assert.equal(h.pair.ownerSide.types().includes("close_request"), false,
+      "the request is written by the requester, never echoed by the owner");
+    // The ordered receive path is not blocked: a fresh authoritative snapshot is
+    // still published while the owner provider owns the operation.
+    h.inventory.rows = [ownerRow("row-1"), ownerRow("row-3")];
+    h.inventory.emit();
+    const refreshed = await until("a newer snapshot is published during the close", () => h.viewer.projection.rows.length === 2)
+      .then(() => h.viewer.projection);
+    assert.equal(refreshed.state, "current");
+    assert.deepEqual(refreshed.rows.map((row) => row.id), ["row-1", "row-3"]);
+    assert.notEqual(refreshed.revision, first.revision);
+    assert.equal(h.pair.ownerSide.types().includes("close_result"), false, "no result exists before the provider answers");
+    release({ kind: "removed" });
+    assert.deepEqual(await mustSettle(pending, "the held close result"), { kind: "owner-result", facts: { kind: "removed" } });
+  } finally {
+    await h.stop();
+  }
+});
+
+test("concurrent closes for different rows are independent and a duplicate row is busy", async () => {
+  const held = new Map<string, (facts: OwnerCloseFacts) => void>();
+  const calls: OwnerCloseRequest[] = [];
+  const h = harness({
+    rows: ["row-1", "row-2", "row-3"],
+    close: (request) => {
+      calls.push(request);
+      return new Promise<OwnerCloseFacts>((resolve) => {
+        held.set(request.rowId, resolve);
+      });
+    },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const run = h.inventory.hostRunId;
+    const one = h.viewer.closeSession({ hostRunId: run, rowId: "row-1", confirmed: false });
+    const two = h.viewer.closeSession({ hostRunId: run, rowId: "row-2", confirmed: false });
+    await until("both closes reach the provider", () => calls.length === 2);
+    // The requester's own per-row fence refuses a duplicate without submitting one.
+    assert.deepEqual(await h.viewer.closeSession({ hostRunId: run, rowId: "row-1", confirmed: true }),
+      { kind: "not-sent", reason: "busy" });
+    assert.equal(calls.length, 2, "a duplicate row never reaches the provider");
+    // Each answer settles its own row, in either order.
+    held.get("row-2")?.({ kind: "refused" });
+    held.get("row-1")?.({ kind: "stopped-retained" });
+    assert.deepEqual(await mustSettle(two, "row-2 result"), { kind: "owner-result", facts: { kind: "refused" } });
+    assert.deepEqual(await mustSettle(one, "row-1 result"), { kind: "owner-result", facts: { kind: "stopped-retained" } });
+    assert.deepEqual(calls.map((call) => call.rowId).sort(), ["row-1", "row-2"]);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("the owner answers a duplicate request id or row busy without a second ladder", async () => {
+  const pair = channelPair();
+  const inventory = new FakeInventory();
+  inventory.rows = [ownerRow("row-1"), ownerRow("row-2")];
+  const calls: OwnerCloseRequest[] = [];
+  const held = new Map<string, (facts: OwnerCloseFacts) => void>();
+  const owner = createRosterBridgeHost({
+    inventory,
+    authorizePeer: () => true,
+    // The owner's own in-flight close bookkeeping uses the same existing row bound.
+    bounds: { ...FAST_BOUNDS, maxRowsPerPage: 2, maxSnapshotRows: 2 },
+    closeOwnedSession: (request) => {
+      calls.push(request);
+      return new Promise<OwnerCloseFacts>((resolve) => {
+        held.set(request.rowId, resolve);
+      });
+    },
+  });
+  const binding = owner.attach(pair.ownerSide);
+  const scripted = new ScriptedPeer(pair.viewerSide);
+  try {
+    scripted.write(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CLOSE_CAPABILITY]));
+    await settle();
+    const run = inventory.hostRunId;
+    scripted.write(closeRequest({ requestId: "req-1", hostRunId: run, rowId: "row-1" }));
+    await until("the first close reaches the provider", () => calls.length === 1);
+    scripted.write(closeRequest({ requestId: "req-1", hostRunId: run, rowId: "row-1" }));
+    scripted.write(closeRequest({ requestId: "req-2", hostRunId: run, rowId: "row-1" }));
+    await settle();
+    const results = pair.ownerSide.frames().filter((frame) => frame.type === "close_result");
+    assert.deepEqual(results.map((frame) => (frame.type === "close_result" ? [frame.requestId, frame.outcome.kind] : [])),
+      [["req-1", "busy"], ["req-2", "busy"]]);
+    assert.equal(calls.length, 1, "a duplicate never starts a second stop ladder");
+    // A different row is still independent while the first is held.
+    scripted.write(closeRequest({ requestId: "req-3", hostRunId: run, rowId: "row-2" }));
+    await until("the second row reaches the provider", () => calls.length === 2);
+    // The bound is now full: overflow is refused rather than queued or evicted.
+    scripted.write(closeRequest({ requestId: "req-4", hostRunId: run, rowId: "row-9" }));
+    await until("the overflow is refused", () => pair.ownerSide.frames()
+      .filter((frame) => frame.type === "close_result").length === 3);
+    assert.deepEqual(pair.ownerSide.frames()
+      .filter((frame) => frame.type === "close_result")
+      .map((frame) => (frame.type === "close_result" ? [frame.requestId, frame.outcome.kind] : [])),
+    [["req-1", "busy"], ["req-2", "busy"], ["req-4", "refused"]]);
+    assert.equal(calls.length, 2, "an overflow never reaches the provider");
+    held.get("row-1")?.({ kind: "unconfirmed" });
+    await until("the held result is written", () => pair.ownerSide.frames()
+      .filter((frame) => frame.type === "close_result").length === 4);
+    const written = pair.ownerSide.frames().filter((frame) => frame.type === "close_result");
+    assert.deepEqual(written.map((frame) => (frame.type === "close_result" ? [frame.requestId, frame.outcome.kind] : [])),
+      [["req-1", "busy"], ["req-2", "busy"], ["req-4", "refused"], ["req-1", "unconfirmed"]]);
+    assert.equal(binding.subscribed, false, "close traffic never subscribes or unsubscribes metadata");
+  } finally {
+    await owner.stopAll();
+  }
+});
+
+test("close bookkeeping is bounded by the existing row bound and refuses overflow", async () => {
+  const held: (() => void)[] = [];
+  const h = harness({
+    rows: ["row-1", "row-2"],
+    bounds: { maxRowsPerPage: 2, maxSnapshotRows: 2 },
+    close: () => new Promise<OwnerCloseFacts>((resolve) => {
+      held.push(() => resolve({ kind: "unknown" }));
+    }),
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const run = h.inventory.hostRunId;
+    const one = h.viewer.closeSession({ hostRunId: run, rowId: "row-1", confirmed: false });
+    const two = h.viewer.closeSession({ hostRunId: run, rowId: "row-2", confirmed: false });
+    await until("both bounded closes are outstanding", () => held.length === 2);
+    // The requester's pending map is full: nothing is queued, evicted, or retargeted.
+    assert.deepEqual(await h.viewer.closeSession({ hostRunId: run, rowId: "row-3", confirmed: false }),
+      { kind: "not-sent", reason: "row-limit" });
+    for (const release of held) release();
+    assert.deepEqual(await mustSettle(one, "row-1 bounded result"), { kind: "owner-result", facts: { kind: "unknown" } });
+    assert.deepEqual(await mustSettle(two, "row-2 bounded result"), { kind: "owner-result", facts: { kind: "unknown" } });
+    assert.equal(h.pair.viewerSide.frames().filter((frame) => frame.type === "close_request").length, 2);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a close the owner never authorized calls no provider and writes no result", async () => {
+  let allowed = true;
+  const calls: OwnerCloseRequest[] = [];
+  const h = harness({
+    authorize: () => allowed,
+    close: async (request) => {
+      calls.push(request);
+      return { kind: "removed" };
+    },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    allowed = false;
+    const result = await mustSettle(
+      h.viewer.closeSession({ hostRunId: h.inventory.hostRunId, rowId: "row-1", confirmed: true }),
+      "an unauthorized close settles",
+    );
+    assert.deepEqual(result, { kind: "unknown" }, "an unanswered request is never a fabricated refusal");
+    assert.deepEqual(calls, [], "the revoke is checked before the provider is reached");
+    assert.equal(h.pair.ownerSide.frames().some((frame) => frame.type === "close_result"), false,
+      "an unauthorized request produces no reply at all");
+    assert.ok(h.ownerDiagnostics.includes("close_refused"));
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a revoke during an accepted close lets the operation finish but drops the reply", async () => {
+  let allowed = true;
+  let release: (facts: OwnerCloseFacts) => void = () => undefined;
+  const calls: OwnerCloseRequest[] = [];
+  const h = harness({
+    authorize: () => allowed,
+    close: (request) => {
+      calls.push(request);
+      return new Promise<OwnerCloseFacts>((resolve) => {
+        release = resolve;
+      });
+    },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const pending = h.viewer.closeSession({ hostRunId: h.inventory.hostRunId, rowId: "row-1", confirmed: false });
+    await until("the accepted close reaches the provider", () => calls.length === 1);
+    // The receiving grant is revoked while Main still owns the operation. Nothing
+    // cancels, rolls back, or reports an exit for work already accepted.
+    allowed = false;
+    release({ kind: "removed" });
+    assert.deepEqual(await mustSettle(pending, "the late reply is dropped"), { kind: "unknown" });
+    assert.equal(h.pair.ownerSide.frames().some((frame) => frame.type === "close_result"), false,
+      "a reply after the revoke is dropped rather than written");
+    assert.deepEqual(calls, [{ hostRunId: h.inventory.hostRunId, rowId: "row-1", confirmed: false }],
+      "the accepted operation itself was neither re-run nor cancelled");
+    assert.ok(h.ownerDiagnostics.includes("close_refused"));
+  } finally {
+    await h.stop();
+  }
+});
+
+test("stopping the channel never cancels or awaits an accepted close", async () => {
+  const calls: OwnerCloseRequest[] = [];
+  let settled = false;
+  const h = harness({
+    close: (request) => {
+      calls.push(request);
+      return new Promise<OwnerCloseFacts>((resolve) => {
+        setTimeout(() => {
+          settled = true;
+          resolve({ kind: "stopped-retained" });
+        }, 40);
+      });
+    },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const pending = h.viewer.closeSession({ hostRunId: h.inventory.hostRunId, rowId: "row-1", confirmed: false });
+    await until("the accepted close reaches the provider", () => calls.length === 1);
+    // The binding's own stop is a network-delivery stop: it resolves without
+    // waiting for the provider, and Main keeps owning the row.
+    await h.owner.stopAll();
+    assert.equal(settled, false, "stopAll does not wait for the owner's operation");
+    // The requester settles honestly as unknown: the reply can no longer arrive.
+    assert.deepEqual(await mustSettle(pending, "a stopped channel settles its close"), { kind: "unknown" });
+    await until("the owner operation still completes on its own", () => settled);
+    assert.deepEqual(calls.length, 1);
+    assert.equal(h.pair.ownerSide.frames().some((frame) => frame.type === "close_result"), false,
+      "a finished binding writes no close result");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("an unsolicited, foreign, or expired close result settles nothing", async () => {
+  const pair = channelPair();
+  // A wider deadline than FAST_BOUNDS so the scripted replies below can never race it.
+  const viewer = attachRosterBridgeViewer({
+    channel: pair.viewerSide,
+    bounds: { ...FAST_BOUNDS, closeResultTimeoutMs: 800 },
+  });
+  const scripted = new ScriptedPeer(pair.ownerSide);
+  scripted.autoAck = false;
+  scripted.onHello(() => {
+    scripted.write({
+      type: "hello_ack",
+      service: ROSTER_BRIDGE_SERVICE,
+      major: ROSTER_BRIDGE_MAJOR,
+      minor: ROSTER_BRIDGE_MINOR,
+      capabilities: [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CLOSE_CAPABILITY],
+    });
+  });
+  try {
+    await mustSettle(viewer.hello, "the handshake");
+    assert.equal(viewer.supportsClose, true);
+    let settled: string | null = null;
+    const pending = viewer.closeSession({ hostRunId: RUN_A, rowId: "row-1", confirmed: false });
+    void pending.then((result) => {
+      settled = JSON.stringify(result);
+    });
+    await until("the close frame is received by the owner", () => scripted.received.some((frame) => frame.type === "close_request"));
+    const request = scripted.received.find((frame) => frame.type === "close_request");
+    assert.ok(request !== undefined && request.type === "close_request");
+    // A foreign request id and a duplicated copy of an unrelated id resolve nothing.
+    scripted.write(closeResult("not-this-request", { kind: "removed" }));
+    scripted.write(closeResult("00000000-0000-4000-8000-000000000000", { kind: "removed" }));
+    await settle();
+    assert.equal(settled, null, "an unsolicited reply can never settle another operation");
+    // The owner's real answer for this id does.
+    scripted.write(closeResult(request.requestId, { kind: "removed" }));
+    await until("the matching result settles", () => settled !== null);
+    assert.deepEqual(JSON.parse(settled ?? "null"), { kind: "owner-result", facts: { kind: "removed" } });
+    // A duplicated copy of that same id after settlement resolves nothing again.
+    scripted.write(closeResult(request.requestId, { kind: "refused" }));
+    await settle();
+    assert.deepEqual(JSON.parse(settled ?? "null"), { kind: "owner-result", facts: { kind: "removed" } });
+  } finally {
+    scripted.confirmUnsubscribes();
+    await viewer.stop();
+  }
+});
+
+test("a lost result is unknown after a finite deadline and is never replayed", async () => {
+  const pair = channelPair();
+  const viewer = attachRosterBridgeViewer({ channel: pair.viewerSide, bounds: FAST_BOUNDS });
+  const scripted = new ScriptedPeer(pair.ownerSide);
+  scripted.autoAck = false;
+  scripted.onHello(() => {
+    scripted.write({
+      type: "hello_ack",
+      service: ROSTER_BRIDGE_SERVICE,
+      major: ROSTER_BRIDGE_MAJOR,
+      minor: ROSTER_BRIDGE_MINOR,
+      capabilities: [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CLOSE_CAPABILITY],
+    });
+  });
+  try {
+    await mustSettle(viewer.hello, "the handshake");
+    const result = await mustSettle(
+      viewer.closeSession({ hostRunId: RUN_A, rowId: "row-1", confirmed: false }),
+      "a silent owner settles the close at its deadline",
+    );
+    assert.deepEqual(result, { kind: "unknown" });
+    const requests = scripted.received.filter((frame) => frame.type === "close_request");
+    assert.equal(requests.length, 1, "nothing is re-sent for an unanswered close");
+    // A result that arrives after the deadline is dropped, not resurrected.
+    const request = requests[0];
+    assert.ok(request !== undefined && request.type === "close_request");
+    scripted.write(closeResult(request.requestId, { kind: "removed" }));
+    await settle();
+    assert.equal(viewer.projection.rows.length, 0, "no late reply invents a roster or removes a row");
+  } finally {
+    scripted.confirmUnsubscribes();
+    await viewer.stop();
+  }
+});
+
+test("a submitted write that is refused is unknown, while pre-submission refusals are not-sent", async () => {
+  const h = harness({ close: async () => ({ kind: "removed" }) });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const run = h.inventory.hostRunId;
+    // Invalid ids and non-boolean confirmation never become frames.
+    assert.deepEqual(await h.viewer.closeSession({ hostRunId: "-bad", rowId: "row-1", confirmed: false }),
+      { kind: "not-sent", reason: "invalid-request" });
+    assert.deepEqual(await h.viewer.closeSession({ hostRunId: run, rowId: "row-1", confirmed: "yes" as never }),
+      { kind: "not-sent", reason: "invalid-request" });
+    assert.equal(h.pair.viewerSide.frames().filter((frame) => frame.type === "close_request").length, 0);
+    // A transport that refuses the write after it was invoked cannot be claimed as
+    // "never submitted": the owner may have accepted it.
+    h.pair.viewerSide.failNextSend = true;
+    assert.deepEqual(await mustSettle(h.viewer.closeSession({ hostRunId: run, rowId: "row-1", confirmed: false }),
+      "a refused write settles"), { kind: "unknown" });
+    assert.equal(h.pair.viewerSide.frames().filter((frame) => frame.type === "close_request").length, 0);
+    // A stopped viewer is positively not-sent and never writes at all.
+    await h.viewer.stop();
+    assert.deepEqual(await h.viewer.closeSession({ hostRunId: run, rowId: "row-1", confirmed: false }),
+      { kind: "not-sent", reason: "not-ready" });
+  } finally {
+    await h.owner.stopAll();
+  }
+});
+
+test("a close result never removes a row on its own; only the owner's snapshot does", async () => {
+  const h = harness({ close: async () => ({ kind: "removed" }) });
+  try {
+    await h.viewer.hello;
+    const first = await h.viewer.subscribe();
+    assert.deepEqual(first.rows.map((row) => row.id), ["row-1", "row-2", "row-3"]);
+    const result = await h.viewer.closeSession({ hostRunId: h.inventory.hostRunId, rowId: "row-2", confirmed: false });
+    assert.deepEqual(result, { kind: "owner-result", facts: { kind: "removed" } });
+    assert.deepEqual(h.viewer.projection.rows.map((row) => row.id), ["row-1", "row-2", "row-3"],
+      "an owner result is never an optimistic local removal");
+    assert.equal(h.viewer.projection.state, "current");
+    // The owner's next authoritative snapshot is what removes the row.
+    h.inventory.rows = [ownerRow("row-1"), ownerRow("row-3")];
+    h.inventory.emit();
+    await until("the owner snapshot lands", () => h.viewer.projection.rows.length === 2);
+    assert.deepEqual(h.viewer.projection.rows.map((row) => row.id), ["row-1", "row-3"]);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a close queued behind a held write is never submitted after stop", async () => {
+  const calls: OwnerCloseRequest[] = [];
+  const h = harness({
+    bounds: { stopAckTimeoutMs: 5_000 },
+    close: async (request) => {
+      calls.push(request);
+      return { kind: "removed" };
+    },
+  });
+  try {
+    await h.viewer.hello;
+    const snapshot = await h.viewer.subscribe();
+    assert.equal(snapshot.state, "current");
+    // Occupy the single ordered send slot so the next control write waits in the
+    // queue and has NOT yet been handed to the transport.
+    h.pair.viewerSide.hold = true;
+    const resyncing = h.viewer.resync();
+    void resyncing.catch(() => undefined);
+    await settle();
+    const closing = h.viewer.closeSession({ hostRunId: h.inventory.hostRunId, rowId: "row-1", confirmed: false });
+    await settle();
+    assert.equal(h.pair.viewerSide.types().filter((type) => type === "close_request").length, 0,
+      "the queued close has not been submitted yet");
+    // stop() latches synchronously and settles outstanding closes at once.
+    const stopping = h.viewer.stop();
+    assert.deepEqual(await mustSettle(closing, "a stopped viewer settles its queued close"), { kind: "unknown" });
+    h.pair.viewerSide.release();
+    await mustSettle(stopping, "the stop settles");
+    await settle();
+    assert.equal(h.pair.viewerSide.types().filter((type) => type === "close_request").length, 0,
+      "a close whose lifetime ended while queued is discarded at dispatch");
+    assert.deepEqual(calls, [], "no owner provider was ever reached");
+  } finally {
+    await h.owner.stopAll();
+  }
+});
+
+test("a close that times out while queued is never submitted when the queue drains", async () => {
+  const calls: OwnerCloseRequest[] = [];
+  const h = harness({
+    bounds: { stopAckTimeoutMs: 5_000 },
+    close: async (request) => {
+      calls.push(request);
+      return { kind: "removed" };
+    },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    h.pair.viewerSide.hold = true;
+    const resyncing = h.viewer.resync();
+    void resyncing.catch(() => undefined);
+    await settle();
+    const closing = h.viewer.closeSession({ hostRunId: h.inventory.hostRunId, rowId: "row-1", confirmed: false });
+    await settle();
+    // Its own finite deadline elapses while it is still waiting to be written.
+    assert.deepEqual(await mustSettle(closing, "a queued close settles at its deadline"), { kind: "unknown" });
+    // Draining the queue must not deliver it late: its lifetime is over.
+    h.pair.viewerSide.release();
+    await settle();
+    assert.equal(h.pair.viewerSide.types().filter((type) => type === "close_request").length, 0,
+      "an expired queued close is invalidated, not delivered");
+    assert.deepEqual(calls, [], "nothing reached the owner provider");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a replaced destination at dispatch time refuses the queued close before submission", async () => {
+  const calls: OwnerCloseRequest[] = [];
+  const h = harness({
+    bounds: { stopAckTimeoutMs: 5_000 },
+    close: async (request) => {
+      calls.push(request);
+      return { kind: "removed" };
+    },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    h.pair.viewerSide.hold = true;
+    const resyncing = h.viewer.resync();
+    void resyncing.catch(() => undefined);
+    await settle();
+    // A caller fence standing in for the coordinator's captured destination, pin,
+    // identity, channel, and epoch.
+    let current = true;
+    const closing = h.viewer.closeSession(
+      { hostRunId: h.inventory.hostRunId, rowId: "row-1", confirmed: false },
+      { stillCurrent: () => current },
+    );
+    await settle();
+    assert.equal(h.pair.viewerSide.types().filter((type) => type === "close_request").length, 0);
+    // The destination is replaced while the request is still queued.
+    current = false;
+    h.pair.viewerSide.release();
+    assert.deepEqual(await mustSettle(closing, "the replaced destination settles the close"),
+      { kind: "not-sent", reason: "target-unavailable" });
+    await settle();
+    assert.equal(h.pair.viewerSide.types().filter((type) => type === "close_request").length, 0,
+      "a fence that no longer holds is checked before the transport write");
+    assert.deepEqual(calls, [], "no provider was reached for a replaced destination");
   } finally {
     await h.stop();
   }

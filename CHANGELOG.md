@@ -19,6 +19,16 @@ dates.
 
 ### Added
 
+- A capability-gated owner Close transport on the existing paired roster channel
+  (#389). It uses the owning Main's same stop/removal path, current directional
+  receiving grant, and exact owner run/row; parallel rows remain independent. Lost
+  replies stay unknown and are never replayed. Requester Close controls are not yet
+  wired. See [Owner Close transport foundation](docs/session-host-alpha.md#owner-close-transport-foundation).
+- Opt-in authenticated input-origin framing and origin-bearing clipboard capsules
+  for the existing owned Node stdio bridge (#389). Payloads and explicit origins are
+  authenticated, and a separate signed readiness signal precedes framed input. No
+  production caller enables this mode yet; local/SSH copying and standalone Pi are
+  unchanged, and remote input/clipboard delivery remains unfinished.
 - A TLS/WSS peer-transport foundation with KDE-style explicit device pairing (#475).
   Explicit callers supply generated self-signed identities, consent and trust stores, and
   a listener address; module import alone still enables nothing. Actual TLS peer keys,
@@ -157,6 +167,12 @@ dates.
   [Focus, display, and status](docs/session-host-alpha.md#focus-display-and-status).
 ### Fixed
 
+- The Windows bootstrap test fixture now allows 120 seconds for its cold first
+  attempt and records bounded per-launch phase diagnostics; subsequent attempts
+  retain their existing limits and all integrity assertions remain.
+- The retired-activity census regression installs its gates before a fresh retired
+  uncertainty mark, preventing an automatic refresh from consuming the proof first.
+  Test cleanup releases held operations; production activity fences are unchanged.
 - Session-host field labels now sit beside the native Editor's first editable body row,
   not its top border (#482). New/Edit, Host shortcuts, and Network editors share the
   same stable anchor; wrapped caret movement leaves the label, drafts, and editing

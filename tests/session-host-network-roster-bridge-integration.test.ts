@@ -25,6 +25,7 @@ import {
 } from "../src/session-host/owning-host-service";
 import type { PeerByteChannel } from "../src/session-host/network/channel";
 import {
+  ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
   attachRosterBridgeViewer,
@@ -39,6 +40,7 @@ import {
   type RosterBridgeInventorySource,
   type RosterBridgeViewer,
 } from "../src/session-host/network/index";
+import type { OwnerCloseFacts, OwnerCloseHandler, OwnerCloseRequest } from "../src/session-host/network/peer-close";
 import {
   newIdentity,
   startClient,
@@ -260,6 +262,7 @@ async function startOwner(
     rows?: readonly string[];
     authorize?: boolean | ((keyId: string) => boolean);
     source?: (service: OwningHostService) => RosterBridgeInventorySource;
+    close?: OwnerCloseHandler;
   } = {},
 ): Promise<OwnerFixture> {
   const identity = await newIdentity("owner-host");
@@ -291,6 +294,7 @@ async function startOwner(
     inventory: options.source?.(service) ?? service,
     authorizePeer: (peerKey) => (typeof allowed === "function" ? allowed(peerKey.keyId) : allowed),
     bounds: options.bounds,
+    ...(options.close === undefined ? {} : { closeOwnedSession: options.close }),
     onDiagnostic: (event) => {
       diagnostics.push(event.code);
     },
@@ -880,4 +884,64 @@ test("an owner whose terminal notification cannot be written closes the real cha
   assert.equal(viewer.projection.reason, "channel-closed");
   assert.equal(viewer.projection.rows.length, 3, "an unwritable notification never becomes an empty roster");
   assert.ok(owner.diagnostics.includes("send_failed"), "the failed write is recorded where it happened");
+});
+
+test("a paired viewer closes one owner row through the injected provider over the real channel", async (t) => {
+  const calls: OwnerCloseRequest[] = [];
+  const owner = await startOwner(t, {
+    rows: ["row-1", "row-2"],
+    close: async (request): Promise<OwnerCloseFacts> => {
+      calls.push(request);
+      return { kind: "stopped-retained" };
+    },
+  });
+  const { viewer } = await connectViewer(t, owner);
+  await viewer.hello;
+  assert.equal(viewer.supportsClose, true, "the owner that holds a provider acknowledges the capability");
+  assert.deepEqual(viewer.capabilities, [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CLOSE_CAPABILITY]);
+  const snapshot = await withTimeout(viewer.subscribe(), 5_000, "first snapshot");
+  const hostRunId = snapshot.hostRunId;
+  assert.ok(hostRunId);
+
+  const result = await withTimeout(
+    viewer.closeSession({ hostRunId, rowId: "row-2", confirmed: false }),
+    5_000,
+    "close result over the real channel",
+  );
+  assert.deepEqual(result, { kind: "owner-result", facts: { kind: "stopped-retained" } });
+  assert.deepEqual(calls, [{ hostRunId, rowId: "row-2", confirmed: false }],
+    "the exact owner run, row, and confirmation reach the provider");
+  const tap = owner.taps[0];
+  assert.ok(tap);
+  const types = tap.types();
+  assert.equal(types[types.length - 1], "close_result");
+  assert.equal(types.filter((type) => type === "close_result").length, 1,
+    "the owner writes exactly one result for the one request");
+  assert.deepEqual(snapshot.rows.map((row) => row.id), ["row-1", "row-2"],
+    "the owner's published snapshot is unchanged by a close reply");
+  // The owner's own inventory remains the only row authority for this projection,
+  // and no mutating manager operation is reached by a close request.
+  assert.equal(viewer.projection.rows.length, 2);
+  assert.deepEqual(
+    owner.manager.otherCalls.filter((call) => ["write", "resize", "create", "closeExited", "shutdown", "dispose"].includes(call)),
+    [],
+    "the bridge never reaches for a session operation",
+  );
+});
+
+test("an owner without the provider never offers Close and the real viewer reports not-sent", async (t) => {
+  const owner = await startOwner(t, { rows: ["row-1"] });
+  const { viewer } = await connectViewer(t, owner);
+  await viewer.hello;
+  assert.equal(viewer.supportsClose, false);
+  assert.deepEqual(viewer.capabilities, [ROSTER_BRIDGE_REQUIRED_CAPABILITY]);
+  const snapshot = await withTimeout(viewer.subscribe(), 5_000, "first snapshot");
+  const hostRunId = snapshot.hostRunId;
+  assert.ok(hostRunId);
+  const tap = owner.taps[0];
+  assert.ok(tap);
+  const before = tap.types().length;
+  assert.deepEqual(await viewer.closeSession({ hostRunId, rowId: "row-1", confirmed: false }),
+    { kind: "not-sent", reason: "capability-unsupported" });
+  assert.equal(tap.types().length, before, "no close frame exists for an owner that never acknowledged it");
 });

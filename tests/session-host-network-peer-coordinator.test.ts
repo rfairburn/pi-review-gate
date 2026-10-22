@@ -21,8 +21,10 @@ import {
 	PEER_UI_PAIRING_RESPONSE_TIMEOUT_MS,
 	createPeerCoordinator,
 	isPeerCoordinatorCloseError,
+	type PeerCoordinatorOptions,
 	type PeerCoordinatorTestHooks,
 } from "../src/session-host/network/peer-coordinator";
+import type { OwnerCloseRequest } from "../src/session-host/network/peer-close";
 import type { PeerByteChannel } from "../src/session-host/network/channel";
 import {
 	DEFAULT_PEER_PREFERENCES,
@@ -1797,4 +1799,235 @@ test("muting the arrival bell keeps the prominent pending alert and its single a
 	assert.equal(b.coordinator.decideConsent(b.log.arrivals[0]!, "approve"), true);
 	await connecting;
 	await waitConnected(a, "the muted-but-approved connection");
+});
+
+// --- owner-routed Close over the existing roster channel ---------------------
+
+/** The owner run the requester's last complete roster observation named. */
+function observedRun(side: StartedCoordinator): string {
+	const host = side.coordinator.read().hosts?.[0];
+	const hostRunId = host?.roster.hostRunId;
+	assert.ok(hostRunId, "the destination has a complete current roster observation");
+	return hostRunId;
+}
+
+/**
+ * A live owner destination plus a connected requester: the requester holds one
+ * authoritative observation of the owner's run and rows, and the owner's close
+ * provider is the only thing that can act on it. No content is ever selected.
+ */
+async function closePair(
+	t: TestContext,
+	options: { readonly closeOwnedSession?: PeerCoordinatorOptions["closeOwnedSession"] } = {},
+): Promise<{
+	host: StartedCoordinator;
+	requester: StartedCoordinator;
+	hostId: string;
+}> {
+	const hostFixture = createOwnedAgentDir(t);
+	const requesterFixture = createOwnedAgentDir(t);
+	const host = await startCoordinator(t, {
+		agentDir: hostFixture.agentDir,
+		inventory: createFakeInventory([rowView("row-1"), rowView("row-2")]),
+		testHooks: hooks(),
+		...(options.closeOwnedSession === undefined ? {} : { closeOwnedSession: options.closeOwnedSession }),
+	});
+	await host.coordinator.perform({ type: "peer-listener", enabled: true, host: "127.0.0.1", port: "0" });
+	const port = host.coordinator.read().listener.port as number;
+	const requester = await startCoordinator(t, {
+		agentDir: requesterFixture.agentDir,
+		inventory: createFakeInventory(),
+		testHooks: hooks(),
+	});
+	const hostId = await addDestination(requester, "Owner host", port);
+	await connectWithApprovals(requester, host, hostId);
+	await waitConnected(requester, "the owner roster observation");
+	return { host, requester, hostId };
+}
+
+test("a close reaches the shared owner provider for the exact current run and row without a content selection", async (t) => {
+	const calls: OwnerCloseRequest[] = [];
+	const pair = await closePair(t, {
+		closeOwnedSession: async (request) => {
+			calls.push(request);
+			return { kind: "removed" };
+		},
+	});
+	const hostRunId = observedRun(pair.requester);
+	// Nothing is selected and no content endpoint exists: a close never needs a
+	// displayed row, a native tuple, a viewer, or a controller lease.
+	assert.equal(pair.requester.coordinator.content.readContent().state, "none");
+	const result = await pair.requester.coordinator.ownerClose.closeSession({
+		hostId: pair.hostId,
+		hostRunId,
+		rowId: "row-2",
+		confirmed: false,
+	});
+	assert.deepEqual(result, { kind: "owner-result", facts: { kind: "removed" } });
+	assert.deepEqual(calls, [{ hostRunId, rowId: "row-2", confirmed: false }],
+		"the exact owner run, row, and confirmation reach the shared provider");
+	// The reply is never an optimistic removal: only the owner's own roster does that.
+	assert.equal(pair.requester.coordinator.read().hosts?.[0]?.roster.rows?.length, 2);
+	await pair.host.inventory.setRows([rowView("row-1")]);
+	await pair.requester.log.waitFor(
+		(snapshot) => snapshot.hosts?.[0]?.roster.rows?.length === 1,
+		"the owner's own removal reaches the projection",
+	);
+	assert.equal(pair.requester.coordinator.content.readContent().target, null,
+		"no selection is ever created by a close");
+});
+
+test("an owner without a provider refuses with a fixed not-sent capability result", async (t) => {
+	const pair = await closePair(t);
+	const hostRunId = observedRun(pair.requester);
+	assert.deepEqual(await pair.requester.coordinator.ownerClose.closeSession({
+		hostId: pair.hostId,
+		hostRunId,
+		rowId: "row-1",
+		confirmed: true,
+	}), { kind: "not-sent", reason: "capability-unsupported" });
+});
+
+test("a close names one exact run and row and refuses to retarget anything else", async (t) => {
+	const calls: OwnerCloseRequest[] = [];
+	const pair = await closePair(t, {
+		closeOwnedSession: async (request) => {
+			calls.push(request);
+			return { kind: "refused" };
+		},
+	});
+	const hostRunId = observedRun(pair.requester);
+	const target = pair.requester.coordinator.ownerClose;
+	assert.deepEqual(await target.closeSession({ hostId: "not-a-host", hostRunId, rowId: "row-1", confirmed: false }),
+		{ kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(await target.closeSession({ hostId: pair.hostId, hostRunId: "other-run", rowId: "row-1", confirmed: false }),
+		{ kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(await target.closeSession({ hostId: pair.hostId, hostRunId, rowId: "row-9", confirmed: false }),
+		{ kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(await target.closeSession({ hostId: pair.hostId, hostRunId, rowId: "row-1", confirmed: "yes" as never }),
+		{ kind: "not-sent", reason: "invalid-request" });
+	assert.deepEqual(calls, [], "no unusable request is ever forwarded or retargeted");
+});
+
+test("a disconnected destination cannot be addressed by a close", async (t) => {
+	const calls: OwnerCloseRequest[] = [];
+	const pair = await closePair(t, {
+		closeOwnedSession: async (request) => {
+			calls.push(request);
+			return { kind: "removed" };
+		},
+	});
+	const hostRunId = observedRun(pair.requester);
+	await pair.requester.coordinator.perform({ type: "peer-disconnect", hostId: pair.hostId });
+	assert.equal(pair.requester.coordinator.read().hosts?.[0]?.state, "disconnected");
+	assert.deepEqual(await pair.requester.coordinator.ownerClose.closeSession({
+		hostId: pair.hostId,
+		hostRunId,
+		rowId: "row-1",
+		confirmed: false,
+	}), { kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(calls, [], "a disconnected destination is never addressed");
+});
+
+test("this side's own receiving Revoke never blocks an outbound close", async (t) => {
+	const calls: OwnerCloseRequest[] = [];
+	const pair = await closePair(t, {
+		closeOwnedSession: async (request) => {
+			calls.push(request);
+			return { kind: "stopped-retained" };
+		},
+	});
+	const hostRunId = observedRun(pair.requester);
+	// This test needs the OTHER direction of trust: the requester must hold a real
+	// receiving permission for the owner's key. The ordinary pair above only gave
+	// the owner a receiving grant for the requester, so admit a second, reverse
+	// connection with the existing public pairing fixtures: the requester listens,
+	// the owner connects to it and is approved. The original outbound
+	// requester -> owner connection, its pin, and the owner's grant stay untouched.
+	await pair.requester.coordinator.perform({
+		type: "peer-listener",
+		enabled: true,
+		host: "127.0.0.1",
+		port: "0",
+	});
+	const requesterPort = pair.requester.coordinator.read().listener.port;
+	assert.ok(requesterPort !== null);
+	assert.ok(requesterPort > 0, "the requester's listener reported its bound port");
+	const reverseHostId = await addDestination(pair.host, "Requester host", requesterPort);
+	await connectWithApprovals(pair.host, pair.requester, reverseHostId);
+	const received = await pair.requester.log.waitFor(
+		(snapshot) => {
+			const peers = snapshot.trustedPeers;
+			return peers !== null && peers.length === 1 && peers[0]?.hasInboundGrant === true;
+		},
+		"the requester's own real receiving grant for the owner",
+	);
+	const trusted = received.trustedPeers;
+	assert.ok(trusted !== null);
+	assert.equal(trusted.length, 1);
+	const peerId = trusted[0]?.id;
+	assert.ok(peerId !== undefined);
+	const outboundBefore = pair.requester.coordinator.read().hosts?.[0];
+	assert.ok(outboundBefore);
+	assert.equal(outboundBefore.state, "connected");
+	const outboundPin = outboundBefore.fingerprint;
+	assert.ok(outboundPin, "the original outbound destination stays pinned");
+	// Now the requester revokes that RECEIVING permission. It covers the reverse
+	// inbound direction only and must not gate the legitimate outbound request; the
+	// owner's own receiving grant for this viewer is what authorizes the close.
+	await pair.requester.coordinator.perform({ type: "peer-revoke", peerId });
+	assert.deepEqual(pair.requester.coordinator.read().trustedPeers, []);
+	const outboundAfter = pair.requester.coordinator.read().hosts?.[0];
+	assert.ok(outboundAfter);
+	assert.equal(outboundAfter.state, "connected", "the revoke never tears down the outbound transport");
+	assert.equal(outboundAfter.roster.state, "current", "the owner's own observations keep flowing");
+	assert.equal(outboundAfter.roster.rows?.length, 2, "the exact current owner roster survives the revoke");
+	assert.equal(outboundAfter.fingerprint, outboundPin, "the outbound pin is unchanged by the revoke");
+	assert.deepEqual(await pair.requester.coordinator.ownerClose.closeSession({
+		hostId: pair.hostId,
+		hostRunId,
+		rowId: "row-1",
+		confirmed: true,
+	}), { kind: "owner-result", facts: { kind: "stopped-retained" } });
+	assert.deepEqual(calls, [{ hostRunId, rowId: "row-1", confirmed: true }]);
+});
+
+test("a removed destination cannot be addressed and its cleared pin is never reused", async (t) => {
+	const calls: OwnerCloseRequest[] = [];
+	const pair = await closePair(t, {
+		closeOwnedSession: async (request) => {
+			calls.push(request);
+			return { kind: "removed" };
+		},
+	});
+	const hostRunId = observedRun(pair.requester);
+	// Remove clears this side's remembered key and retires the destination runtime.
+	await pair.requester.coordinator.perform({ type: "peer-remove", hostId: pair.hostId });
+	assert.equal(pair.requester.coordinator.read().hosts?.length, 0);
+	assert.deepEqual(await pair.requester.coordinator.ownerClose.closeSession({
+		hostId: pair.hostId,
+		hostRunId,
+		rowId: "row-1",
+		confirmed: false,
+	}), { kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(calls, [], "a removed destination is refused before submission");
+});
+
+test("a coordinator that is closing never submits a close", async (t) => {
+	const calls: OwnerCloseRequest[] = [];
+	const pair = await closePair(t, {
+		closeOwnedSession: async (request) => {
+			calls.push(request);
+			return { kind: "removed" };
+		},
+	});
+	const hostRunId = observedRun(pair.requester);
+	await pair.requester.coordinator.close();
+	assert.deepEqual(await pair.requester.coordinator.ownerClose.closeSession({
+		hostId: pair.hostId,
+		hostRunId,
+		rowId: "row-1",
+		confirmed: false,
+	}), { kind: "not-sent", reason: "not-ready" });
+	assert.deepEqual(calls, []);
 });

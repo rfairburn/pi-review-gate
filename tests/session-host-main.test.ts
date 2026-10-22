@@ -11,7 +11,7 @@ import test from "node:test";
 import { isKittyProtocolActive, setKittyProtocolActive } from "pi-session-host-tui";
 
 import type { ComposedHostFrame } from "../src/session-host/compositor";
-import type { CreateInstanceOptions, InstanceManagerOptions, NativeInstanceView, ShutdownResult } from "../src/session-host/instances";
+import type { CreateInstanceOptions, InstanceManagerOptions, NativeInstanceView, ShutdownResult, StopInstanceResult } from "../src/session-host/instances";
 import {
   createSessionHostFrameWriter,
   type SessionHostFrameDisposition,
@@ -30,6 +30,7 @@ import { deleteSavedSessionFile, type SavedSessionDeletionOptions } from "../src
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import type { NativeClipboardEvent } from "../src/session-host/native-clipboard";
 import type { PeerCoordinatorOptions } from "../src/session-host/network/peer-coordinator";
+import type { OwnerCloseFacts, OwnerCloseHandler } from "../src/session-host/network/peer-close";
 import type {
   PeerContentController,
   PeerContentObservation,
@@ -8054,5 +8055,711 @@ test("an explicit New while a remote target is selected creates locally and neve
     assert.equal(manager.stopping, false);
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Owner-side Close provider (#389 owner Close phase).
+//
+// Main owns the ONE row close: the manager's addressed stop, then removal only
+// after a positive exit, with the same roster slot, ghost, remembered-active,
+// replacement, and persist bookkeeping and the same per-row fence and shutdown
+// barrier. The local `d`/Delete route and the owner-side provider are the same
+// core; this phase enables no remote Close, so these tests drive the provider
+// exactly as Main handed it to the one coordinator.
+// ---------------------------------------------------------------------------
+
+const REMOVE_FAILURE_NOTICE = "Session was not removed; its state could not be confirmed.";
+const STOP_CONFIRMATION_NOTICE = "Activity changed or is unknown. Press d again to confirm stopping this session.";
+
+/** One synthetic manager `stop` seam plus everything it was addressed with. */
+interface FakeStopSeam {
+  /** Every addressed stop, in order. */
+  readonly calls: Array<{ readonly id: string; readonly confirmed: boolean }>;
+  /** When set, the stop waits for it before reporting any outcome. */
+  gate: Promise<void> | undefined;
+  /** The status the next addressed stop reports. */
+  status: StopInstanceResult["status"];
+  /** When true, the stop throws instead of reporting an outcome. */
+  throws: boolean;
+  /** When true, the stop reports a result this host's adapter does not recognize. */
+  unrecognized: boolean;
+}
+
+/**
+ * Installs the OPTIONAL manager `stop` seam on this harness's manager. The
+ * default fixture deliberately has none: a manager that cannot stop must stay
+ * an honest refusal rather than a startup failure, so close tests attach one
+ * explicitly and then assert exactly which row was addressed and how.
+ */
+function attachManagerStop(manager: FakeManager): FakeStopSeam {
+  const seam: FakeStopSeam = { calls: [], gate: undefined, status: "exited", throws: false, unrecognized: false };
+  Object.defineProperty(manager, "stop", {
+    configurable: true,
+    value: async (id: string, options: { readonly confirmed: boolean }): Promise<StopInstanceResult> => {
+      seam.calls.push({ id, confirmed: options.confirmed });
+      if (seam.gate !== undefined) await seam.gate;
+      if (seam.throws) throw new Error("synthetic stop failure");
+      // Another adapter build can report something this host does not recognize.
+      // It settles nothing, so the row is left exactly as it was found.
+      if (seam.unrecognized) return { status: "not-a-real-status", forced: false } as unknown as StopInstanceResult;
+      const index = manager.views.findIndex((view) => view.id === id);
+      if (index >= 0 && seam.status === "exited") {
+        const view = manager.views[index]!;
+        manager.views[index] = {
+          ...view,
+          lifecycle: "exited",
+          hasLiveProcess: false,
+          ...(view.nativeSession === null ? {} : { lastNativeSession: view.nativeSession }),
+        };
+        manager.notify(id);
+      }
+      return { status: seam.status, forced: false };
+    },
+  });
+  return seam;
+}
+
+/** Removes the optional stop seam again: a manager that cannot stop. */
+function detachManagerStop(manager: FakeManager): void {
+  delete (manager as { stop?: unknown }).stop;
+}
+
+/** Installs the optional `closeError` seam; returns the ids it was asked to settle. */
+/**
+ * Adds the manager's own `closeError` authority. `settles: false` models the real
+ * refusal: an error row whose child is still live, or whose launch cleanup has
+ * not positively completed, is not settled by `closeError`.
+ */
+function attachManagerCloseError(manager: FakeManager, options?: { settles?: boolean }): string[] {
+  const calls: string[] = [];
+  const settles = options?.settles !== false;
+  Object.defineProperty(manager, "closeError", {
+    configurable: true,
+    value: (id: string): boolean => {
+      calls.push(id);
+      const index = manager.views.findIndex((view) => view.id === id);
+      if (index < 0 || !settles) return false;
+      manager.views.splice(index, 1);
+      manager.surfaces.delete(id);
+      manager.notify(id);
+      return true;
+    },
+  });
+  return calls;
+}
+
+/**
+ * Makes the manager's removal authority itself throw, so what it did to the row
+ * is unobservable rather than refused.
+ */
+function attachThrowingManagerCloseExited(manager: FakeManager): string[] {
+  const calls: string[] = [];
+  Object.defineProperty(manager, "closeExited", {
+    configurable: true,
+    value: (id: string): boolean => {
+      calls.push(id);
+      throw new Error("synthetic removal authority failure");
+    },
+  });
+  return calls;
+}
+
+/** Creates two local rows (native-1, native-2) on an already-ready harness. */
+async function startTwoLocalRows(harness: Harness): Promise<FakeManager> {
+  const manager = harnessManager(harness);
+  fillForm(harness.terminal, "/first/workspace");
+  await nextTurn();
+  harness.terminal.emitInput(ALT_LEFT);
+  harness.terminal.emitInput("\x1b[B"); // first row -> Saved conversations
+  harness.terminal.emitInput("\x1b[B"); // -> New session
+  harness.terminal.emitInput(ENTER);
+  completeForm(harness.terminal, "/another/workspace");
+  await nextTurn();
+  assert.deepEqual(manager.views.map((view) => view.id), ["native-1", "native-2"]);
+  harness.terminal.emitInput(ALT_LEFT); // the visible roster is focused again
+  await nextTurn();
+  return manager;
+}
+
+/** Main's owner-side Close provider, exactly as handed to the one coordinator. */
+function ownerCloseProvider(peer: FakePeerCoordinator): OwnerCloseHandler {
+  const provider = peer.options?.closeOwnedSession;
+  assert.equal(typeof provider, "function",
+    "Main supplies the one coordinator its owner-side Close provider");
+  return provider!;
+}
+
+/** The exact owner run id of the manager Main actually opened (the one inventory). */
+function ownerRunId(peer: FakePeerCoordinator): string {
+  const inventory = peer.options?.inventory as unknown as OwningHostService | undefined;
+  assert.ok(inventory, "the coordinator receives the host's one authoritative inventory");
+  const snapshot = inventory.readInventorySnapshot();
+  assert.ok(snapshot, "the one manager reports an observable inventory");
+  return snapshot.hostRunId;
+}
+
+/** Row ids the actual sidebar still lists. */
+function listedRowIds(harness: Harness): string[] {
+  return harness.sidebar!.items.map((item) => item.id).filter((id) => id.startsWith("native-"));
+}
+
+/** True when the owner's own screen drew none of the close/removal notices. */
+function ownerShowsNoCloseNotice(harness: Harness): boolean {
+  const text = plain(harness.writer.frames.at(-1)?.frame);
+  return sidebarNoticeRows(text, REMOVE_REFUSED_NOTICE) === undefined
+    && sidebarNoticeRows(text, REMOVE_FAILURE_NOTICE) === undefined
+    && sidebarNoticeRows(text, STOP_CONFIRMATION_NOTICE) === undefined;
+}
+
+/** A host-state seam recording every roster projection Main asked to persist. */
+function recordingHostState(persisted: string[]): MainTestDependencies["openHostState"] {
+  return ({ agentDir: ownedDir, hostId }) => ({
+    status: "opened",
+    state: {
+      agentDir: ownedDir,
+      hostId,
+      ownershipPath: join(ownedDir, "synthetic-owner"),
+      roster: undefined,
+      problem: undefined,
+      persist: (roster) => { persisted.push(JSON.stringify(roster)); return true; },
+      release: () => true,
+    },
+  });
+}
+
+test("Main hands its owner-side Close provider to the one coordinator and enables nothing else", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    const provider = ownerCloseProvider(peer);
+    assert.equal(typeof provider, "function");
+    assert.equal(harness.events.filter((name) => name === "manager.create").length, 1,
+      "the provider reuses the one manager and inventory: no second manager, store, or registry");
+    assert.equal(peer.commands.length, 0, "handing over a provider issues no network command");
+    assert.equal(harness.writer.frames.length > 0, true);
+    assert.equal(manager.shutdownCalls, 0);
+    assert.deepEqual(harness.reports, [], "the handover reports nothing to the operator");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("the owner-side Close provider stops one idle live row and removes exactly that row", async (t) => {
+  const deletedSavedFiles: string[] = [];
+  const { harness, peer } = await peerMainHarness(t, undefined, {
+    deleteSavedFile: (file, options) => {
+      deletedSavedFiles.push(file);
+      return deleteSavedSessionFile(file, options);
+    },
+  });
+  const manager = harnessManager(harness);
+  try {
+    const seam = attachManagerStop(manager);
+    await startTwoLocalRows(harness);
+    // The row's status reporter is disconnected: a close needs no native
+    // conversation tuple, and no local side operator is asked to confirm.
+    const first = manager.views[0]!;
+    manager.views[0] = { ...first, nativeSession: null };
+    manager.notify("native-1");
+    await nextTurn();
+
+    const close = ownerCloseProvider(peer);
+    const runId = ownerRunId(peer);
+    const siblingSurface = manager.surface("native-2");
+    const framesBefore = harness.writer.frames.length;
+
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-1", confirmed: false }), { kind: "removed" });
+    await nextTurn();
+
+    assert.deepEqual(seam.calls, [{ id: "native-1", confirmed: false }],
+      "an idle request addresses exactly the manager's idle-only stop for that one row");
+    assert.deepEqual(manager.closeExitedCalls, ["native-1"], "removal follows the reported exit");
+    assert.deepEqual(manager.views.map((view) => view.id), ["native-2"]);
+    assert.deepEqual(listedRowIds(harness), ["native-2"], "the roster drops exactly the closed row");
+    assert.equal(manager.surface("native-2"), siblingSurface, "the sibling keeps its own surface and row");
+    assert.equal(manager.views[0]?.hasLiveProcess, true, "the sibling is untouched");
+    assert.equal(manager.shutdownCalls, 0, "an owner close never uses the host-wide shutdown");
+    assert.deepEqual(manager.writes, [], "closing a row writes nothing to any child");
+    assert.deepEqual(deletedSavedFiles, [], "closing a row never deletes a saved conversation");
+    assert.ok(harness.writer.frames.length > framesBefore,
+      "the notice-free close still redraws the owner's own roster");
+    assert.equal(ownerShowsNoCloseNotice(harness), true,
+      "the owner's screen is not written for a close it did not initiate");
+    assert.equal(harness.sidebar!.peerConsentConfirmationActive, false,
+      "an owner close never opens this host's local confirmation popup");
+    assert.equal(harness.sidebar!.savedDeleteConfirmationActive, false,
+      "an owner close never starts a saved-conversation deletion confirmation");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("another owner run, an unknown row, and an unobservable inventory never reach the manager", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    const seam = attachManagerStop(manager);
+    await startTwoLocalRows(harness);
+    const close = ownerCloseProvider(peer);
+    const runId = ownerRunId(peer);
+
+    assert.deepEqual(await close({ hostRunId: "run-this-host-never-had", rowId: "native-1", confirmed: true }),
+      { kind: "refused" }, "a stale owner run is refused, never applied to the current run");
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-404", confirmed: true }),
+      { kind: "refused" }, "a row this run does not have is refused");
+    assert.deepEqual(seam.calls, [], "a refused request never reaches the manager's stop");
+    assert.deepEqual(manager.closeExitedCalls, [], "a refused request never removes anything");
+    assert.deepEqual(manager.views.map((view) => view.id), ["native-1", "native-2"]);
+    assert.equal(manager.views[0]?.hasLiveProcess, true);
+    assert.equal(ownerShowsNoCloseNotice(harness), true);
+
+    // An inventory that cannot be observed is unknown, never an empty roster.
+    manager.list = () => { throw new Error("synthetic unobservable inventory"); };
+    let facts: OwnerCloseFacts | undefined;
+    try {
+      facts = await close({ hostRunId: runId, rowId: "native-1", confirmed: false });
+    } finally {
+      delete (manager as { list?: unknown }).list;
+    }
+    assert.deepEqual(facts, { kind: "unknown" }, "an unobservable inventory is unknown, not a refusal or a claim");
+    assert.deepEqual(seam.calls, [], "an unknown inventory authorizes no stop");
+    assert.deepEqual(manager.closeExitedCalls, [], "an unknown inventory authorizes no removal");
+    manager.notify("inventory-restored");
+    await nextTurn();
+    assert.deepEqual(manager.views.map((view) => view.id), ["native-1", "native-2"],
+      "every row and its registration survive a refused or unknown request");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("an already exited or settled error row is removed by the manager's own authority, never blindly stopped", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    const seam = attachManagerStop(manager);
+    await startTwoLocalRows(harness);
+    const close = ownerCloseProvider(peer);
+    const runId = ownerRunId(peer);
+
+    // Already exited: the direct removal route, with no stop at all.
+    manager.views[0] = { ...manager.views[0]!, lifecycle: "exited", hasLiveProcess: false };
+    manager.notify("native-1-exited");
+    await nextTurn();
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-1", confirmed: false }), { kind: "removed" });
+    assert.deepEqual(seam.calls, [], "an exited row is never sent through the stop ladder");
+    assert.deepEqual(manager.closeExitedCalls, ["native-1"]);
+    assert.deepEqual(manager.views.map((view) => view.id), ["native-2"]);
+
+    // An error row that closeExited refuses, with no closeError authority: the
+    // row and its registration stay, the owner is not written to, and the facts
+    // refuse instead of promising an exit this host never observed.
+    manager.refusedCloseIds.add("native-2");
+    manager.views[0] = { ...manager.views[0]!, lifecycle: "error", hasLiveProcess: false, error: "synthetic-launch-error" };
+    manager.notify("native-2-error");
+    await nextTurn();
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-2", confirmed: true }), { kind: "refused" },
+      "a refused error-row removal never claims an exit");
+    assert.deepEqual(seam.calls, [], "an error row that may own no PTY is never stopped");
+    assert.deepEqual(manager.views.map((view) => view.id), ["native-2"], "a refused removal keeps the row");
+    assert.deepEqual(listedRowIds(harness), ["native-2"]);
+    assert.equal(ownerShowsNoCloseNotice(harness), true,
+      "the requester gets the facts; the owner's screen is not written");
+
+    // The fallback authority may refuse too: an error row whose launch cleanup has
+    // not positively completed is settled by neither of the manager's authorities,
+    // and no amount of confirmation turns a settled error row into a stop target.
+    const refusingErrors = attachManagerCloseError(manager, { settles: false });
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-2", confirmed: true }), { kind: "refused" },
+      "a refused closeError settles nothing and never claims an exit");
+    assert.deepEqual(refusingErrors, ["native-2"], "the lifecycle-gated closeError is the only fallback");
+    assert.deepEqual(seam.calls, [], "a settled error row is never stopped instead, confirmed or not");
+    assert.deepEqual(manager.views.map((view) => view.id), ["native-2"], "the row and its registration stand");
+    assert.equal(ownerShowsNoCloseNotice(harness), true);
+
+    // With the manager's own closeError authority the same row settles.
+    const errorCloses = attachManagerCloseError(manager);
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-2", confirmed: true }), { kind: "removed" });
+    assert.deepEqual(errorCloses, ["native-2"], "only the manager's closeError may settle an error row");
+    assert.deepEqual(seam.calls, [], "still no stop was ever addressed to the error row");
+    assert.deepEqual(manager.views, []);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("an error row whose child is still live follows the local stop route and claims no unobserved exit", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    const seam = attachManagerStop(manager);
+    await startTwoLocalRows(harness);
+    const close = ownerCloseProvider(peer);
+    const runId = ownerRunId(peer);
+    const liveChild = (id: string): boolean | undefined =>
+      manager.views.find((view) => view.id === id)?.hasLiveProcess;
+    // A fatal display/setup error does NOT settle a row: the manager still owns a
+    // live PTY, which is exactly the state in which local `d`/Delete asks for a
+    // stop. The owner close therefore takes the SAME route for that row.
+    const markLiveError = (id: string): void => {
+      const index = manager.views.findIndex((view) => view.id === id);
+      manager.views[index] = {
+        ...manager.views[index]!,
+        lifecycle: "error",
+        hasLiveProcess: true,
+        error: "synthetic-display-error",
+      };
+      manager.notify(id);
+    };
+
+    markLiveError("native-2");
+    await nextTurn();
+
+    // Unconfirmed request: the manager's own idle preflight answers, nothing is
+    // signalled, and the row keeps both its live child and its registration.
+    seam.status = "confirmation-required";
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-2", confirmed: false }),
+      { kind: "confirmation-required" });
+    assert.deepEqual(seam.calls, [{ id: "native-2", confirmed: false }],
+      "a live error row takes the manager's real idle preflight, never a removal authority");
+    assert.deepEqual(manager.closeExitedCalls, [], "a confirmation never removes the row");
+    assert.equal(liveChild("native-2"), true, "the live child behind the error is untouched");
+    assert.equal(manager.views.find((view) => view.id === "native-2")?.lifecycle, "error",
+      "the row keeps the state its operator can still act on");
+    assert.deepEqual(listedRowIds(harness), ["native-1", "native-2"], "the row and its registration stand");
+    assert.equal(ownerShowsNoCloseNotice(harness), true, "the owner's screen is not written");
+    assert.equal(harness.sidebar!.peerConsentConfirmationActive, false,
+      "a close requested elsewhere never raises this host's confirmation");
+    assert.equal(manager.shutdownCalls, 0, "a confirmation never falls back to a host-wide shutdown");
+
+    // Confirmed request: the same existing bounded ladder, and only the exit the
+    // manager then reports lets this host's removal authority settle the row.
+    seam.status = "exited";
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-2", confirmed: true }), { kind: "removed" });
+    assert.deepEqual(seam.calls.slice(1), [{ id: "native-2", confirmed: true }],
+      "exactly one addressed stop per request, confirmed as asked and never a second ladder");
+    assert.deepEqual(manager.closeExitedCalls, ["native-2"], "removal follows the observed exit");
+    assert.deepEqual(manager.views.map((view) => view.id), ["native-1"]);
+    assert.deepEqual(listedRowIds(harness), ["native-1"], "the sibling is untouched");
+    assert.equal(ownerShowsNoCloseNotice(harness), true);
+
+    // The ladder ending without an exit retains everything and claims nothing: the
+    // child's real state stays unconfirmed rather than "still running".
+    markLiveError("native-1");
+    await nextTurn();
+    seam.status = "unconfirmed";
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-1", confirmed: true }), { kind: "unconfirmed" });
+    assert.equal(liveChild("native-1"), true, "an unconfirmed ladder keeps the live row");
+    assert.equal(manager.views[0]?.lifecycle, "error", "an unconfirmed ladder leaves the row actable");
+    assert.deepEqual(listedRowIds(harness), ["native-1"], "an unconfirmed ladder keeps the roster row");
+    assert.deepEqual(manager.closeExitedCalls, ["native-2"], "an unconfirmed ladder never removes the row");
+    assert.equal(ownerShowsNoCloseNotice(harness), true);
+
+    // A positively observed exit whose removal the manager refuses reports the stop
+    // it saw and the row it kept, and never a removal.
+    manager.refusedCloseIds.add("native-1");
+    seam.status = "exited";
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-1", confirmed: true }),
+      { kind: "stopped-retained" });
+    assert.deepEqual(manager.closeExitedCalls, ["native-2", "native-1"], "one removal attempt per observed exit");
+    assert.deepEqual(listedRowIds(harness), ["native-1"], "a refused removal keeps the row and its registration");
+    assert.equal(ownerShowsNoCloseNotice(harness), true, "the requester gets the facts, not the owner's screen");
+
+    // A removal authority that throws leaves even the row's presence unobservable:
+    // unknown, never `removed` or `stopped-retained`, and never a retried stop.
+    manager.refusedCloseIds.delete("native-1");
+    const stopsBeforeThrow = seam.calls.length;
+    const thrown = attachThrowingManagerCloseExited(manager);
+    try {
+      assert.deepEqual(await close({ hostRunId: runId, rowId: "native-1", confirmed: true }), { kind: "unknown" },
+        "a throwing removal authority reports an unknown outcome, never an exit or a removal");
+    } finally {
+      delete (manager as { closeExited?: unknown }).closeExited;
+    }
+    assert.deepEqual(thrown, ["native-1"]);
+    assert.equal(seam.calls.length, stopsBeforeThrow, "an unknown removal outcome never retries with a stop");
+    assert.deepEqual(listedRowIds(harness), ["native-1"], "nothing was removed on an unknown outcome");
+    assert.equal(liveChild("native-1"), false, "the row this host kept is the row its stop reported exited");
+    assert.equal(ownerShowsNoCloseNotice(harness), true);
+    assert.equal(manager.shutdownCalls, 0, "no close ever falls back to a host-wide shutdown");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("busy, unconfirmed, refused, throwing, and missing-stop closes report fixed facts and keep the row", async (t) => {
+  const { harness, peer, dispatch } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  let released: (() => void) | undefined;
+  try {
+    const seam = attachManagerStop(manager);
+    await startTwoLocalRows(harness);
+    const close = ownerCloseProvider(peer);
+    const runId = ownerRunId(peer);
+
+    // One row, one stop ladder: a duplicate never re-signals or queues behind it.
+    seam.gate = new Promise<void>((resolve) => { released = resolve; });
+    const inFlight = close({ hostRunId: runId, rowId: "native-1", confirmed: true });
+    await nextTurn();
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-1", confirmed: true }), { kind: "busy" });
+    // The local route keeps ignoring a row that is already closing.
+    dispatch({ type: "stop-remove", id: "native-1", confirmed: true });
+    await nextTurn();
+    assert.deepEqual(seam.calls, [{ id: "native-1", confirmed: true }],
+      "the shared per-row fence admits exactly one stop for the row");
+    released!();
+    assert.deepEqual(await inFlight, { kind: "removed" });
+    assert.deepEqual(manager.views.map((view) => view.id), ["native-2"]);
+
+    // Every non-exited outcome retains the row, its registration, and ownership.
+    const retained = async (
+      status: StopInstanceResult["status"] | "unrecognized",
+      kind: OwnerCloseFacts["kind"],
+    ): Promise<void> => {
+      seam.status = status === "unrecognized" ? "exited" : status;
+      seam.unrecognized = status === "unrecognized";
+      const stopsBefore = seam.calls.length;
+      try {
+        assert.deepEqual(await close({ hostRunId: runId, rowId: "native-2", confirmed: true }), { kind });
+      } finally {
+        seam.unrecognized = false;
+      }
+      assert.equal(seam.calls.length, stopsBefore + 1,
+        `${status} is answered by exactly one addressed stop, never a retry`);
+      assert.equal(manager.views[0]?.hasLiveProcess, true, `${status} keeps the live row`);
+      assert.deepEqual(listedRowIds(harness), ["native-2"], `${status} keeps the roster row`);
+      assert.equal(manager.closeExitedCalls.length, 1, `${status} never removes the row`);
+      assert.equal(ownerShowsNoCloseNotice(harness), true, `${status} never writes the owner's screen`);
+      assert.equal(harness.sidebar!.peerConsentConfirmationActive, false, `${status} never opens a local popup`);
+      assert.equal(harness.sidebar!.savedDeleteConfirmationActive, false, `${status} never starts a saved deletion`);
+    };
+    await retained("unconfirmed", "unconfirmed");
+    await retained("confirmation-required", "confirmation-required");
+    // `unavailable` is ambiguous: this manager can report it AFTER it accepted the
+    // shutdown request and lost the record or the manager during the await, and
+    // another adapter build can report a status this host does not recognize.
+    // Neither may claim that nothing was submitted, and neither removes or re-sends.
+    await retained("unavailable", "unknown");
+    await retained("unrecognized", "unknown");
+
+    // A manager failure leaves the outcome unknown; nothing is claimed.
+    seam.throws = true;
+    seam.status = "exited";
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-2", confirmed: true }), { kind: "unknown" });
+    assert.equal(manager.views[0]?.hasLiveProcess, true, "a throwing stop never removes the row");
+    assert.equal(manager.closeExitedCalls.length, 1);
+    seam.throws = false;
+
+    // A manager that cannot stop refuses honestly instead of failing startup.
+    detachManagerStop(manager);
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-2", confirmed: true }), { kind: "refused" });
+    assert.equal(manager.views[0]?.hasLiveProcess, true);
+    assert.equal(harness.sidebar!.items.length > 0, true, "the host stays usable");
+    assert.equal(manager.shutdownCalls, 0, "no close ever falls back to a host-wide shutdown");
+  } finally {
+    released?.();
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("the local stop route keeps every existing notice through the shared close core", async (t) => {
+  const { harness, peer, dispatch } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    const seam = attachManagerStop(manager);
+    await startTwoLocalRows(harness);
+    const noticeFor = async (expected: string): Promise<void> => {
+      await nextTurn();
+      const text = plain(harness.writer.frames.at(-1)?.frame);
+      assert.ok(sidebarNoticeRows(text, expected) !== undefined,
+        `the local route still renders the complete existing notice: ${expected} / ${text}`);
+    };
+
+    seam.status = "confirmation-required";
+    dispatch({ type: "stop-remove", id: "native-2", confirmed: true });
+    await noticeFor(STOP_CONFIRMATION_NOTICE);
+
+    seam.status = "unconfirmed";
+    dispatch({ type: "stop-remove", id: "native-2", confirmed: true });
+    await noticeFor(REMOVE_REFUSED_NOTICE);
+
+    seam.status = "unavailable";
+    dispatch({ type: "stop-remove", id: "native-2", confirmed: true });
+    await noticeFor(REMOVE_REFUSED_NOTICE);
+
+    seam.throws = true;
+    seam.status = "exited";
+    dispatch({ type: "stop-remove", id: "native-2", confirmed: true });
+    await noticeFor(REMOVE_FAILURE_NOTICE);
+    seam.throws = false;
+
+    detachManagerStop(manager);
+    dispatch({ type: "stop-remove", id: "native-2", confirmed: true });
+    await noticeFor(REMOVE_FAILURE_NOTICE);
+
+    // A local removal of an exited row whose removal the manager refuses keeps
+    // its own notice too, and nothing was ever stopped or force-removed.
+    manager.refusedCloseIds.add("native-2");
+    dispatch({ type: "remove", id: "native-2" });
+    await noticeFor(REMOVE_REFUSED_NOTICE);
+    assert.equal(manager.shutdownCalls, 0);
+    assert.deepEqual(listedRowIds(harness), ["native-1", "native-2"], "every refusal keeps both rows");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a provider close updates the persisted roster, the ghost set, and the remembered active row", async (t) => {
+  const persisted: string[] = [];
+  const { harness, peer } = await peerMainHarness(t, undefined, { openHostState: recordingHostState(persisted) });
+  const manager = harnessManager(harness);
+  try {
+    const seam = attachManagerStop(manager);
+    await startTwoLocalRows(harness);
+    const close = ownerCloseProvider(peer);
+    const runId = ownerRunId(peer);
+    assert.equal(harness.sidebar!.activeMainOwnerID, "native-2", "the newest local row is the displayed owner");
+    const closed = manager.views[1]!;
+
+    // The displayed/active local row itself: its slot, active mapping, and the
+    // persisted projection all follow the removal.
+    assert.deepEqual(await close({ hostRunId: runId, rowId: "native-2", confirmed: false }), { kind: "removed" });
+    await nextTurn();
+    assert.deepEqual(seam.calls, [{ id: "native-2", confirmed: false }]);
+    const last = JSON.parse(persisted.at(-1)!) as { entries: Array<{ slotId: string }>; activeSlotId?: string };
+    assert.deepEqual(last.entries.map((entry) => entry.slotId), ["native-1"],
+      "the closed row's remembered slot is gone from the persisted roster");
+    assert.ok(last.activeSlotId === undefined || last.activeSlotId === "native-1",
+      "the persisted active slot never keeps a removed row");
+    assert.equal(harness.sidebar!.activeMainOwnerID, undefined,
+      "the displayed owner retires instead of claiming a removed row");
+
+    // The ghost set: a delayed stale listing for the removed id never returns it.
+    const persistedBefore = persisted.length;
+    manager.staleListedViews.push({ ...closed, lifecycle: "exited", hasLiveProcess: false });
+    manager.notify("late-stale-snapshot");
+    await nextTurn();
+    assert.deepEqual(listedRowIds(harness), ["native-1"], "a late snapshot never resurrects the closed row");
+    assert.equal(persisted.length, persistedBefore, "a ghost never re-adds its slot to the persisted roster");
+    assert.deepEqual(manager.closeExitedCalls, ["native-2"]);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("closing a local row leaves a deliberately selected remote viewport selected", async (t) => {
+  const { harness, peer, content } = await remoteContentMainHarness(t, [
+    remotePeerHost({
+      id: "lab-a",
+      label: "Lab Alpha",
+      hostRunId: "run-a",
+      rows: [remoteRosterRow({ id: "row-a", label: "Alpha remote" })],
+    }),
+  ]);
+  const manager = harnessManager(harness);
+  try {
+    const seam = attachManagerStop(manager);
+    fillForm(harness.terminal, "/local/workspace");
+    await nextTurn();
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    await activateRemoteRosterRow(harness, "Lab Alpha");
+    assert.deepEqual(harness.sidebar!.activeMainOwnerKey,
+      { kind: "remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    const selectionsBefore = content.selections.length;
+    const viewportsBefore = content.viewports.length;
+    const close = ownerCloseProvider(peer);
+
+    // The owner is displaying REMOTE row-a while one of ITS OWN local rows is
+    // closed: the remote selection, its stream, and its viewport request stand.
+    assert.deepEqual(await close({ hostRunId: ownerRunId(peer), rowId: "native-1", confirmed: false }),
+      { kind: "removed" });
+    await nextTurn();
+
+    assert.deepEqual(seam.calls, [{ id: "native-1", confirmed: false }]);
+    assert.deepEqual(manager.views.map((view) => view.id), [], "the owner's own row is gone");
+    assert.equal(content.selections.length, selectionsBefore,
+      "closing a local row never re-targets or releases the selected remote stream");
+    assert.equal(content.viewports.length, viewportsBefore, "no viewport is requested or withdrawn on its behalf");
+    assert.deepEqual(harness.sidebar!.activeMainOwnerKey,
+      { kind: "remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" },
+      "the remote selection stays selected when a local row retires");
+    assert.equal(harness.sidebar!.activeMainOwnerID, undefined,
+      "a remote owner is never mistaken for a local row id");
+    assert.equal(ownerShowsNoCloseNotice(harness), true, "the close is notice-free for the owner");
+    assert.equal(harness.sidebar!.peerConsentConfirmationActive, false,
+      "a close requested elsewhere never raises a local confirmation");
+    assert.equal(harness.sidebar!.savedDeleteConfirmationActive, false,
+      "a close requested elsewhere never starts a saved-conversation deletion");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("teardown fences a late close: an accepted close joins the shutdown barrier and claims nothing", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  let released: (() => void) | undefined;
+  try {
+    const seam = attachManagerStop(manager);
+    await startTwoLocalRows(harness);
+    const close = ownerCloseProvider(peer);
+    const runId = ownerRunId(peer);
+    seam.gate = new Promise<void>((resolve) => { released = resolve; });
+    const inFlight = close({ hostRunId: runId, rowId: "native-1", confirmed: true });
+    await nextTurn();
+    assert.deepEqual(seam.calls, [{ id: "native-1", confirmed: true }]);
+
+    harness.signals.emit("SIGTERM");
+    await nextTurn();
+    let settled = false;
+    const result = harness.result.then((status) => { settled = true; return status; });
+    await nextTurn();
+    assert.equal(settled, false, "shutdown waits for the close it accepted");
+    assert.equal(manager.disposeCalls, 0, "the manager is disposed only after the accepted close settles");
+    released!();
+    assert.equal(await result, 0);
+    assert.deepEqual(await inFlight, { kind: "unknown" },
+      "a close still running when teardown began claims no exit and no removal");
+    assert.deepEqual(manager.closeExitedCalls, [], "no removal runs after teardown began");
+    assert.equal(manager.disposeCalls, 1,
+      "the accepted close joined the existing shutdown barrier: disposal waited for it with no new await");
+    assert.ok(manager.order.indexOf("manager.shutdown") < manager.order.indexOf("manager.dispose"),
+      "the existing teardown order still disposes after shutdown, never before");
+  } finally {
+    released?.();
+    harness.signals.emit("SIGTERM");
+    assert.equal(await harness.result, 0);
+  }
+});
+
+test("teardown inside the close's first yield fences the manager call itself", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    const seam = attachManagerStop(manager);
+    await startTwoLocalRows(harness);
+    const close = ownerCloseProvider(peer);
+    const runId = ownerRunId(peer);
+
+    // The per-row fence is published before the close's first await, so teardown can
+    // begin inside that window. The close must re-read the host's authority before it
+    // addresses the adapter at all: the captured manager is never written to, nothing
+    // is removed, and the row is claimed neither stopped nor refused-stopped.
+    const inFlight = close({ hostRunId: runId, rowId: "native-1", confirmed: true });
+    harness.signals.emit("SIGTERM");
+    assert.equal(await harness.result, 0,
+      "the close registered before teardown still joined the existing shutdown barrier");
+
+    assert.deepEqual(await inFlight, { kind: "unknown" },
+      "a close fenced before its manager call claims no exit, no removal, and no stop");
+    assert.deepEqual(seam.calls, [], "the captured manager is never addressed after teardown began");
+    assert.deepEqual(manager.closeExitedCalls, [], "no removal authority runs after teardown began");
+    assert.equal(manager.disposeCalls, 1,
+      "disposal waited for the registered close with no new registry and no new await");
+  } finally {
+    harness.signals.emit("SIGTERM");
+    assert.equal(await harness.result, 0);
   }
 });

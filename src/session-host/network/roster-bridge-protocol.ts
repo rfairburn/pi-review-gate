@@ -30,9 +30,18 @@
  * directory, current file, prompt, transcript, question, environment,
  * configuration, token, or output byte can be expressed in this schema, and an
  * unknown key is refused rather than passed through.
+ *
+ * The same lane, direction, and authentication also carry the optional owner
+ * Close exchange (`close_request` / `close_result`) when and only when both sides
+ * acknowledged {@link ROSTER_BRIDGE_CLOSE_CAPABILITY}. A close frame is a fixed
+ * request for exactly one owner run and row plus one fixed fact set in reply; it
+ * carries no payload, error, signal, path, or native conversation tuple, and it
+ * adds no listener, manager, grant, or persisted state. Metadata semantics —
+ * pages, revisions, runs, subscriptions — are completely unaffected by it.
  */
 
 import { isRecord } from "../../record-guard";
+import { isOwnerCloseFacts, type OwnerCloseFacts } from "./peer-close";
 import { parseRemoteSessionMetadata, type RemoteSessionMetadata } from "./roster-metadata";
 
 /** Service identity of the metadata channel; distinct from the child IPC protocol. */
@@ -44,11 +53,20 @@ export const ROSTER_BRIDGE_MINOR = 0;
 /** Every viewer must offer this; a hello without it is refused. */
 export const ROSTER_BRIDGE_REQUIRED_CAPABILITY = "roster-v1";
 /**
- * Optional capabilities this implementation knows. None exist yet, so an
- * identifier offered by a peer is recorded only when it appears here and is
- * otherwise ignored — an unimplemented capability can never be assumed.
+ * Optional capability for the owner Close exchange. It means protocol support
+ * only, never authority: the owner acknowledges it solely when it really holds
+ * its own close provider, and every request is still authorized and preflighted
+ * by that owner. A peer that does not offer it is never sent a close frame.
  */
-export const ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Object.freeze([]);
+export const ROSTER_BRIDGE_CLOSE_CAPABILITY = "roster-close-v1";
+/**
+ * Optional capabilities this implementation knows. An identifier offered by a
+ * peer is recorded only when it appears here and is otherwise ignored; an
+ * acknowledgement additionally narrows to what the owner can really honour.
+ */
+export const ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Object.freeze([
+  ROSTER_BRIDGE_CLOSE_CAPABILITY,
+]);
 
 /** One metadata subscription per channel; not configurable. */
 export const ROSTER_BRIDGE_MAX_SUBSCRIPTIONS_PER_CHANNEL = 1;
@@ -85,6 +103,13 @@ export interface RosterBridgeBounds {
   readonly transferIdleTimeoutMs: number;
   /** How long the viewer waits for `unsubscribed` before completing a stop. */
   readonly stopAckTimeoutMs: number;
+  /**
+   * How long a requester waits for one `close_result` after the close frame was
+   * handed to the transport. Exceeding it is `unknown`, never a retry. It is
+   * deliberately longer than the owner's own bounded stop ladder grace: it bounds
+   * this side's patience, not the owner's operation.
+   */
+  readonly closeResultTimeoutMs: number;
 }
 
 export const DEFAULT_ROSTER_BRIDGE_BOUNDS: RosterBridgeBounds = Object.freeze({
@@ -101,6 +126,7 @@ export const DEFAULT_ROSTER_BRIDGE_BOUNDS: RosterBridgeBounds = Object.freeze({
   snapshotStartTimeoutMs: 15_000,
   transferIdleTimeoutMs: 30_000,
   stopAckTimeoutMs: 2_000,
+  closeResultTimeoutMs: 15_000,
 });
 
 const BOUND_KEYS = Object.keys(DEFAULT_ROSTER_BRIDGE_BOUNDS) as ReadonlyArray<keyof RosterBridgeBounds>;
@@ -268,6 +294,30 @@ export interface RosterBridgeErrorFrame {
   readonly subscriptionId?: string;
 }
 
+/**
+ * One owner-routed Close request. Every identifier is opaque and bounded, the
+ * confirmation is a strict boolean, and nothing else is expressible: no payload,
+ * error, signal, path, native tuple, or owner text can ride along.
+ */
+export interface RosterBridgeCloseRequestFrame {
+  readonly type: "close_request";
+  /** This requester's fresh, unpredictable correlation id. */
+  readonly requestId: string;
+  /** Exact owner run id the request names. */
+  readonly hostRunId: string;
+  /** Exact owner row id within that run. */
+  readonly rowId: string;
+  /** True only when the operator deliberately confirmed a busy or unknown row. */
+  readonly confirmed: boolean;
+}
+
+/** One fixed owner answer for exactly one request id. */
+export interface RosterBridgeCloseResultFrame {
+  readonly type: "close_result";
+  readonly requestId: string;
+  readonly outcome: OwnerCloseFacts;
+}
+
 export type RosterBridgeFrame =
   | RosterBridgeHelloFrame
   | RosterBridgeHelloAckFrame
@@ -277,6 +327,8 @@ export type RosterBridgeFrame =
   | RosterBridgeSnapshotEndFrame
   | RosterBridgeUnsubscribeFrame
   | RosterBridgeUnsubscribedFrame
+  | RosterBridgeCloseRequestFrame
+  | RosterBridgeCloseResultFrame
   | RosterBridgeErrorFrame;
 
 const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze({
@@ -288,6 +340,8 @@ const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze(
   snapshot_end: new Set(["type", "subscriptionId", "transferId", "revision", "totalRows"]),
   unsubscribe: new Set(["type", "subscriptionId"]),
   unsubscribed: new Set(["type", "subscriptionId"]),
+  close_request: new Set(["type", "requestId", "hostRunId", "rowId", "confirmed"]),
+  close_result: new Set(["type", "requestId", "outcome"]),
   error: new Set(["type", "code", "subscriptionId"]),
 });
 
@@ -300,6 +354,8 @@ const REQUIRED_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.free
   snapshot_end: new Set(["subscriptionId", "transferId", "revision", "totalRows"]),
   unsubscribe: new Set(["subscriptionId"]),
   unsubscribed: new Set(["subscriptionId"]),
+  close_request: new Set(["requestId", "hostRunId", "rowId", "confirmed"]),
+  close_result: new Set(["requestId", "outcome"]),
   error: new Set(["code"]),
 });
 
@@ -322,6 +378,24 @@ function readIdentifier(value: unknown, maxBytes: number): string {
   if (Buffer.byteLength(value, "utf8") > maxBytes) fail("bad_frame");
   if (!IDENTIFIER_RE.test(value)) fail("bad_frame");
   return value;
+}
+
+/**
+ * True only for a value this protocol can carry as one opaque identifier: a
+ * bounded, non-empty, unremarkable token. This is a type predicate so a caller
+ * that validates its own request before encoding gets a narrowed `string`, not a
+ * boolean it would have to re-check with `typeof`.
+ */
+export function isRosterBridgeIdentifier(
+  value: unknown,
+  bounds: RosterBridgeBounds = DEFAULT_ROSTER_BRIDGE_BOUNDS,
+): value is string {
+  try {
+    readIdentifier(value, bounds.maxIdentifierBytes);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function readService(value: unknown): string {
@@ -411,6 +485,18 @@ function validateFrame(frame: RosterBridgeFrame, bounds: RosterBridgeBounds): Ro
       if (!Number.isSafeInteger(frame.totalRows) || frame.totalRows < 0 || frame.totalRows > bounds.maxSnapshotRows) {
         fail("invalid_frame");
       }
+      return frame;
+    }
+    case "close_request": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      readIdentifier(frame.hostRunId, bounds.maxIdentifierBytes);
+      readIdentifier(frame.rowId, bounds.maxIdentifierBytes);
+      if (typeof frame.confirmed !== "boolean") fail("invalid_frame");
+      return frame;
+    }
+    case "close_result": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      if (!isOwnerCloseFacts(frame.outcome)) fail("invalid_frame");
       return frame;
     }
     case "error": {
@@ -513,6 +599,27 @@ function buildFrame(record: Record<string, unknown>, bounds: RosterBridgeBounds)
         transferId: readIdentifier(ownField(record, "transferId"), bounds.maxIdentifierBytes),
         revision: readInteger(ownField(record, "revision"), 1, Number.MAX_SAFE_INTEGER),
         totalRows: readInteger(ownField(record, "totalRows"), 0, bounds.maxSnapshotRows),
+      });
+    }
+    case "close_request": {
+      const confirmed = ownField(record, "confirmed");
+      if (typeof confirmed !== "boolean") fail("bad_frame");
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        hostRunId: readIdentifier(ownField(record, "hostRunId"), bounds.maxIdentifierBytes),
+        rowId: readIdentifier(ownField(record, "rowId"), bounds.maxIdentifierBytes),
+        confirmed,
+      });
+    }
+    case "close_result": {
+      const outcome = ownField(record, "outcome");
+      // The fact boundary is closed: exactly one fixed kind, nothing else.
+      if (!isOwnerCloseFacts(outcome)) fail("bad_frame");
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        outcome: Object.freeze({ kind: outcome.kind }),
       });
     }
     case "error": {

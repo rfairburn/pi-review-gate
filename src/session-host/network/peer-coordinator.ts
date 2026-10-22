@@ -66,6 +66,12 @@
  * owned-work tracking and retired through the existing bounded settlement graph, so
  * an unconfirmed content or inbound-binding retirement stays the sticky, ownership-
  * retaining failure it already is instead of becoming a fabricated clean close.
+ *
+ * The one owner-routed Close controller (see `peer-close.ts`) rides that SAME
+ * already-connected metadata viewer under the same verified pin and destination
+ * epoch. It selects nothing, opens nothing, and removes nothing locally: the
+ * owner's own Main provider decides and acts, and only the owner's next
+ * authoritative snapshot can change the roster projection.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -116,6 +122,7 @@ import type {
 	PeerCoordinatorWithContent,
 	PeerSelectedContent,
 } from "./peer-content";
+import type { OwnerCloseHandler, PeerCloseController, PeerCloseResult, PeerCloseTarget, PeerCoordinatorWithClose } from "./peer-close";
 import {
 	DEFAULT_PEER_PREFERENCES,
 	MAX_PEER_DESTINATIONS,
@@ -137,6 +144,7 @@ import {
 	type PeerTransportBounds,
 	type PeerTransportErrorCode,
 } from "./protocol";
+import { isRosterBridgeIdentifier } from "./roster-bridge-protocol";
 import { attachRosterBridgeViewer, type RosterBridgeProjection, type RosterBridgeViewer } from "./roster-bridge-client";
 import {
 	createRosterBridgeHost,
@@ -264,6 +272,18 @@ export interface PeerCoordinatorOptions {
 	 * is still authorized by the current directional receiving grant.
 	 */
 	readonly contentSource?: SessionContentSource;
+	/**
+	 * The host's ONE owner-side Close provider, supplied by Main, which already
+	 * owns the only manager, the only roster, and the only row-removal path.
+	 *
+	 * The owner bridge offers the optional Close capability only when this provider
+	 * is present, and every request is reauthorized against the current TLS-proved
+	 * peer key and current directional receiving grant before it is reached. The
+	 * coordinator never wraps it: Main's own row-stop lifecycle owns the operation,
+	 * and a host that supplies nothing (or an old peer that never negotiated the
+	 * capability) behaves exactly as it does today.
+	 */
+	readonly closeOwnedSession?: OwnerCloseHandler;
 	readonly onChange: (snapshot: PeerUiSnapshot) => void;
 	/** Advisory, exactly-once-per-new-incoming-handle arrival signal. */
 	readonly onIncomingConsentArrival: (consentId: string) => void;
@@ -499,6 +519,22 @@ function sameContentTarget(left: PeerContentTarget, right: PeerContentTarget): b
 }
 
 /**
+ * Validate and copy one Close request. Both owner identifiers must be carryable
+ * as opaque protocol identifiers and the confirmation must be a real boolean; a
+ * request this contract cannot represent is refused rather than repaired,
+ * defaulted to another row, or matched to a sibling destination.
+ */
+function normalizeCloseTarget(value: unknown): PeerCloseTarget | null {
+	if (!isRecord(value)) return null;
+	const { hostId, hostRunId, rowId, confirmed } = value;
+	if (typeof hostId !== "string" || hostId.length === 0) return null;
+	if (!isRosterBridgeIdentifier(hostRunId)) return null;
+	if (!isRosterBridgeIdentifier(rowId)) return null;
+	if (typeof confirmed !== "boolean") return null;
+	return Object.freeze({ hostId, hostRunId, rowId, confirmed });
+}
+
+/**
  * Map one failed content-channel open onto a fixed code. A content open never
  * asks a human: its per-connection server-key approver rejects, so a missing or
  * changed key is reported as such and nothing is retried or re-prompted.
@@ -631,7 +667,7 @@ function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
 	});
 }
 
-class OwnedPeerCoordinator implements PeerCoordinatorWithContent {
+class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinatorWithClose {
 	readonly #options: PeerCoordinatorOptions;
 	readonly #consentWindowMs: number;
 	readonly #autoReconnectDelaysMs: readonly number[];
@@ -709,6 +745,14 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent {
 		updateContentViewport: (viewport: PeerContentViewport): void => this.#updateContentViewport(viewport),
 		readContent: (): PeerContentObservation => this.#readContent(),
 	};
+	/**
+	 * The ONE owner-routed Close controller: a property of this coordinator rather
+	 * than a second manager, needing no selection, viewer, lease, or on-demand
+	 * connection.
+	 */
+	readonly #ownerCloseController: PeerCloseController = {
+		closeSession: (target: PeerCloseTarget): Promise<PeerCloseResult> => this.#closeSession(target),
+	};
 	#host: PeerHost | null = null;
 	#preferences: PeerPreferences | null = null;
 	#preferencesLoaded = false;
@@ -760,6 +804,16 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent {
 	 */
 	get content(): PeerContentController {
 		return this.#contentController;
+	}
+
+	/**
+	 * The one Close controller. It exists from construction and needs nothing
+	 * selected or displayed: a request addresses one already connected destination
+	 * by its own saved handle plus the exact owner run and row the last roster
+	 * observation named.
+	 */
+	get ownerClose(): PeerCloseController {
+		return this.#ownerCloseController;
 	}
 
 	read(): PeerUiSnapshot {
@@ -903,6 +957,9 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent {
 			this.#bridge = createRosterBridgeHost({
 				inventory: this.#options.inventory,
 				authorizePeer: (peerKey) => this.#authorizePeer(peerKey),
+				...(this.#options.closeOwnedSession === undefined
+					? {}
+					: { closeOwnedSession: this.#options.closeOwnedSession }),
 			});
 		} catch {
 			this.#bridge = null;
@@ -2089,6 +2146,111 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent {
 		// back may restore that one selection, and a projection that no longer holds it
 		// stops claiming content. Nothing here connects, retries, pairs, or retargets.
 		this.#reconcileContentWithRoster(runtime.id);
+	}
+
+	// ------------------------------------------------------------- owner Close
+
+	/**
+	 * Send one owner-routed Close through the destination's EXISTING connected
+	 * metadata viewer.
+	 *
+	 * No selection, published stream, native conversation tuple, controller lease,
+	 * or on-demand connection is involved: the request names one local saved
+	 * destination plus the exact owner run and row the last roster observation
+	 * named, and the owner's own real preflight decides what to do with it.
+	 *
+	 * Everything this attempt borrows is captured and revalidated after the await:
+	 * the destination runtime, its metadata channel, its borrowed client, its
+	 * destination epoch, the remembered pin, and this side's current identity. A
+	 * replacement or re-pin cannot inherit an older answer, so a completed result
+	 * whose fences no longer hold is reported `unknown` rather than retargeted. The
+	 * REVOKE that affects an OUTBOUND close is the owner's own receiving grant for
+	 * this viewer; this side's local receiving direction never gates it.
+	 */
+	async #closeSession(target: PeerCloseTarget): Promise<PeerCloseResult> {
+		if (this.#closed || this.#tearingDown) return { kind: "not-sent", reason: "not-ready" };
+		const request = normalizeCloseTarget(target);
+		if (request === null) return { kind: "not-sent", reason: "invalid-request" };
+		const runtime = this.#runtime.get(request.hostId);
+		if (runtime === undefined) return { kind: "not-sent", reason: "target-unavailable" };
+		const viewer = runtime.viewer;
+		const metadata = runtime.channel;
+		const client = runtime.client;
+		if (
+			runtime.state !== "connected"
+			|| viewer === null
+			|| metadata === null
+			|| client === null
+		) return { kind: "not-sent", reason: "target-unavailable" };
+		// The exact run and row must be present in the LAST observed roster of this
+		// destination. A stale observation is allowed — the owner's preflight decides —
+		// and the request is never rewritten to a newer run or a sibling row.
+		const roster = runtime.roster;
+		if (roster.rows === null || roster.hostRunId === null) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		if (roster.hostRunId !== request.hostRunId) return { kind: "not-sent", reason: "target-unavailable" };
+		if (!roster.rows.some((row) => row.id === request.rowId)) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		// The verified destination facts the request is fenced against: the pin saved
+		// for this destination is still the key the live metadata channel really
+		// proved, and this side's current identity is still the one the borrowed
+		// client proves. No new pin is written and no identity is created here.
+		const pin = this.#readPin(runtime.id);
+		if (pin === null || !peerKeysEqual(pin, metadata.peerKey)) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		const identity = this.#currentIdentity();
+		if (identity === null || !peerKeysEqual(identity.key, client.key)) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		// The owner never acknowledged Close support for this channel: no frame exists.
+		if (!viewer.supportsClose) return { kind: "not-sent", reason: "capability-unsupported" };
+		const destinationEpoch = runtime.epoch;
+		const result = await viewer.closeSession(
+			{
+				hostRunId: request.hostRunId,
+				rowId: request.rowId,
+				confirmed: request.confirmed,
+			},
+			{
+				// The last-instant half of the SAME fence: the viewer evaluates this
+				// synchronously immediately before it calls `channel.send`, so a request
+				// whose destination, pin, identity, channel, or epoch was replaced while it
+				// waited in the send queue is never submitted at all.
+				stillCurrent: () => this.#closeFenceHolds(runtime, viewer, metadata, client, destinationEpoch),
+			},
+		);
+		// A positively-not-sent answer stays true regardless of any later change.
+		if (result.kind === "not-sent") return result;
+		if (!this.#closeFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) {
+			// The request may already have been submitted, so nothing here can claim it
+			// never happened; an answer from a replaced destination is not this one's.
+			return { kind: "unknown" };
+		}
+		return result;
+	}
+
+	/** True only while every fact one close attempt borrowed is still current. */
+	#closeFenceHolds(
+		runtime: DestinationRuntime,
+		viewer: RosterBridgeViewer,
+		metadata: PeerByteChannel,
+		client: PeerClient,
+		destinationEpoch: number,
+	): boolean {
+		if (this.#closed || this.#tearingDown) return false;
+		if (runtime.viewer !== viewer) return false;
+		if (runtime.state !== "connected") return false;
+		if (runtime.channel !== metadata) return false;
+		if (runtime.client !== client) return false;
+		if (runtime.epoch !== destinationEpoch) return false;
+		const pin = this.#readPin(runtime.id);
+		if (pin === null || !peerKeysEqual(pin, metadata.peerKey)) return false;
+		const identity = this.#currentIdentity();
+		if (identity === null || !peerKeysEqual(identity.key, client.key)) return false;
+		return true;
 	}
 
 	// ------------------------------------------------------ selected content lane
@@ -3367,6 +3529,11 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
 	if (options.onContentChange !== undefined && typeof options.onContentChange !== "function") {
 		throw new TypeError("peer coordinator content callback is invalid");
 	}
+	if (options.closeOwnedSession !== undefined && typeof options.closeOwnedSession !== "function") {
+		// No implicit close provider: a non-callable value would otherwise look like
+		// support this host cannot honour.
+		throw new TypeError("peer coordinator close provider is invalid");
+	}
 	if (options.testHooks !== undefined) {
 		const hooks = options.testHooks;
 		if (!isRecord(hooks)) throw new TypeError("peer coordinator test hooks are invalid");
@@ -3409,7 +3576,15 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
  * the content source, and at most one destination/run/row is selected outgoing at
  * a time. A metadata-only caller passes neither and observes exactly the previous
  * behavior.
+ *
+ * It additionally exposes the one Close controller. Supplying an owner close
+ * provider makes the owner side of the existing metadata lane acknowledge the
+ * optional Close capability; supplying none changes nothing at all, and the
+ * requester side still refuses with `not-sent` for an owner that never
+ * acknowledged it.
  */
-export function createPeerCoordinator(options: PeerCoordinatorOptions): PeerCoordinatorWithContent {
+export function createPeerCoordinator(
+	options: PeerCoordinatorOptions,
+): PeerCoordinatorWithContent & PeerCoordinatorWithClose {
 	return new OwnedPeerCoordinator(assertOptions(options));
 }

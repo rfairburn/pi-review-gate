@@ -44,22 +44,35 @@
  * reconnect, retry, backoff, or heartbeat policy here, and no claim that a resolved
  * send means the peer received anything. Every asynchronous send owns its rejection,
  * because the transport only catches synchronous handler throws.
+ *
+ * The same channel also carries the optional owner Close exchange, only when the
+ * owner's acknowledgement retained {@link ROSTER_BRIDGE_CLOSE_CAPABILITY}.
+ * {@link RosterBridgeViewer.closeSession} generates its own fresh request id and
+ * answers with one fixed result union: an owner-reported fact set, a positively
+ * not-sent refusal (no bytes ever handed to the transport), or `unknown`. A
+ * resolved send is never an exit, a lost reply is never "never happened", and
+ * nothing is queued, replayed, or optimistically removed from the projection: only
+ * a later complete snapshot can change the rows.
  */
 
 import { randomUUID } from "node:crypto";
 import type { PeerByteChannel } from "./channel";
 import type { PeerKey } from "./identity";
+import type { OwnerCloseRequest, PeerCloseResult } from "./peer-close";
 import type { RemoteSessionMetadata } from "./roster-metadata";
 import {
+  ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
   ROSTER_BRIDGE_SERVICE,
   decodeRosterBridgeFrame,
   encodeRosterBridgeFrame,
+  isRosterBridgeIdentifier,
   resolveRosterBridgeBounds,
   reviewRosterBridgeHelloAck,
   type RosterBridgeBounds,
+  type RosterBridgeCloseResultFrame,
   type RosterBridgeErrorCode,
   type RosterBridgeFrame,
 } from "./roster-bridge-protocol";
@@ -175,6 +188,14 @@ export interface RosterBridgeViewer {
   /** Current projection. Never a live view of owner state. */
   readonly projection: RosterBridgeProjection;
   readonly subscriptionId: string | null;
+  /**
+   * Optional capabilities this owner acknowledged for this channel. Read-only:
+   * an acknowledgement states what the owner can honour, and never grants this
+   * side any authority of its own.
+   */
+  readonly capabilities: readonly string[];
+  /** True only when this owner acknowledged the optional Close capability. */
+  readonly supportsClose: boolean;
   /** Resolves on `hello_ack`; rejects on refusal, protocol failure, or channel loss. */
   readonly hello: Promise<void>;
   /** Subscribes and resolves with that subscription's first complete snapshot. */
@@ -185,13 +206,63 @@ export interface RosterBridgeViewer {
    * equals the last published one.
    */
   resync(): Promise<RosterBridgeProjection>;
+  /**
+   * Ask this owner to close exactly one of its rows through the shared owner
+   * provider. Never throws and never surfaces a raw error: the fixed result says
+   * what is actually known, and only a later complete snapshot can change the
+   * projected rows.
+   *
+   * `options.stillCurrent` is this caller's own last-instant fence over the
+   * destination, pin, and epoch its request was authorized against. It is
+   * evaluated synchronously immediately before the bytes are handed to the
+   * transport, so a queued request whose destination changed in the meantime is
+   * never submitted.
+   */
+  closeSession(
+    request: OwnerCloseRequest,
+    options?: { readonly stillCurrent?: () => boolean },
+  ): Promise<PeerCloseResult>;
   /** Idempotent: unsubscribes, discards any partial transfer, and detaches. */
   stop(): Promise<void>;
   onProjection(listener: (projection: RosterBridgeProjection) => void): () => void;
 }
 
-/** Queued viewer control sends. Control traffic is hello, subscribe, unsubscribe, and errors. */
+/** Queued viewer control sends. Control traffic is hello, subscribe, unsubscribe, close, and errors. */
 const MAX_QUEUED_VIEWER_SENDS = 4;
+
+/**
+ * Optional capabilities this viewer knows and offers. Offering one grants
+ * nothing: it only makes the owner's acknowledgement possible, and the owner
+ * narrows it further to what it can really honour.
+ */
+const DEFAULT_OFFERED_CAPABILITIES: readonly string[] = Object.freeze([
+  ROSTER_BRIDGE_CLOSE_CAPABILITY,
+]);
+
+/** One outstanding close: its own deadline, and the one settlement it may have. */
+interface PendingClose {
+  readonly requestId: string;
+  readonly rowId: string;
+  readonly settle: (result: PeerCloseResult) => void;
+  timer: NodeJS.Timeout | null;
+}
+
+/** Why a write was refused before it was handed to the transport. */
+type ViewerSendRefusal = "not-ready" | "target-unavailable";
+
+type ViewerSendOutcome =
+  | { readonly ok: true }
+  /** No bytes were handed to the transport: nothing was submitted. */
+  | { readonly ok: false; readonly sent: false; readonly reason: ViewerSendRefusal }
+  /** The transport write was invoked, so acceptance can no longer be excluded. */
+  | { readonly ok: false; readonly sent: true };
+
+/**
+ * One last-instant decision, evaluated synchronously inside the write that is
+ * about to call `channel.send`. Refusing here is positive proof of a
+ * pre-submission lifetime end: the transport was never invoked.
+ */
+type ViewerSendGate = () => { readonly allow: true } | { readonly allow: false; readonly reason: ViewerSendRefusal };
 
 type ViewerState = "awaiting_ack" | "ready" | "subscribed" | "failed" | "detached";
 
@@ -255,6 +326,19 @@ function wireCodeToViewerError(code: RosterBridgeErrorCode): RosterBridgeViewerE
   }
 }
 
+/**
+ * Strict local validation of one close request before anything is encoded. Both
+ * owner identifiers must be carryable opaque identifiers and the confirmation
+ * must be a real boolean: nothing else is ever submitted.
+ */
+function isCloseRequest(value: unknown, bounds: RosterBridgeBounds): value is OwnerCloseRequest {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (!isRosterBridgeIdentifier(record.hostRunId, bounds)) return false;
+  if (!isRosterBridgeIdentifier(record.rowId, bounds)) return false;
+  return typeof record.confirmed === "boolean";
+}
+
 class ViewerBinding implements RosterBridgeViewer {
   readonly peerKey: PeerKey;
 
@@ -295,6 +379,11 @@ class ViewerBinding implements RosterBridgeViewer {
    * fresh subscription, never as a mid-subscription surprise.
    */
   #subscriptionRun: string | null = null;
+  /** Optional capabilities the owner acknowledged for this channel. Read-only. */
+  #capabilities: readonly string[] = Object.freeze([]);
+  /** Outstanding closes by this side's own request id, and the per-row fence. */
+  readonly #pendingCloses = new Map<string, PendingClose>();
+  readonly #pendingCloseRows = new Map<string, string>();
   #helloSettled = false;
   #lastComplete: { readonly hostRunId: string; readonly revision: number; readonly subscriptionId: string } | null = null;
   #startTimer: NodeJS.Timeout | null = null;
@@ -314,10 +403,11 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#diagnostic = diagnostic;
     this.peerKey = options.channel.peerKey;
     const extra = options.capabilities === undefined ? [] : [...new Set(options.capabilities)];
-    // The required baseline is always offered first, and the list is deduplicated:
-    // a caller that repeats it must not produce a frame the encoder refuses.
+    // The required baseline and every capability this implementation knows are
+    // offered first, and the list is deduplicated: a caller that repeats one must
+    // not produce a frame the encoder refuses.
     this.#offeredCapabilities = Object.freeze([
-      ...new Set([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ...extra]),
+      ...new Set([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ...DEFAULT_OFFERED_CAPABILITIES, ...extra]),
     ]);
     this.#projection = Object.freeze({
       state: "empty" as RosterBridgeProjectionState,
@@ -367,6 +457,14 @@ class ViewerBinding implements RosterBridgeViewer {
     return this.#subscriptionId;
   }
 
+  get capabilities(): readonly string[] {
+    return this.#capabilities;
+  }
+
+  get supportsClose(): boolean {
+    return this.#capabilities.includes(ROSTER_BRIDGE_CLOSE_CAPABILITY);
+  }
+
   get hello(): Promise<void> {
     return this.#helloDeferred.promise;
   }
@@ -405,11 +503,146 @@ class ViewerBinding implements RosterBridgeViewer {
     });
   }
 
+  /**
+   * Ask the owner to close exactly one of its rows through its own provider.
+   *
+   * Every refusal before the transport write is positively `not-sent`; once
+   * `send` has been invoked the only honest answers are the owner's own facts or
+   * `unknown`. Each call uses its own fresh request id, and the pending entry is
+   * settled exactly once by a matching result, the finite deadline, or channel
+   * loss — never by an unsolicited, stale, or duplicated reply, and never by a
+   * replay. Rows are not touched here: only a later complete snapshot can change
+   * the projection.
+   *
+   * A write that is still queued when this request's lifetime ends (deadline,
+   * stop, channel loss, or a failed caller fence) is invalidated at the dispatch
+   * boundary and never reaches the transport, so a delayed drain can never
+   * deliver a destructive request after its own lifetime.
+   */
+  closeSession(
+    request: OwnerCloseRequest,
+    options: { readonly stillCurrent?: () => boolean } = {},
+  ): Promise<PeerCloseResult> {
+    const refusal = this.#closeRefusal();
+    if (refusal !== null) return Promise.resolve(refusal);
+    // The owner acknowledged no Close support for this channel, so no close frame
+    // exists to send at all.
+    if (!this.supportsClose) return Promise.resolve({ kind: "not-sent", reason: "capability-unsupported" });
+    if (!isCloseRequest(request, this.#bounds)) {
+      return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    }
+    // One in-flight close per row, and a bounded pending map: a duplicate or an
+    // overflow is refused here rather than queued behind live work.
+    if (this.#pendingCloseRows.has(request.rowId)) return Promise.resolve({ kind: "not-sent", reason: "busy" });
+    if (this.#pendingCloses.size >= this.#bounds.maxSnapshotRows) {
+      return Promise.resolve({ kind: "not-sent", reason: "row-limit" });
+    }
+    const requestId = randomUUID();
+    const outcome = deferred<PeerCloseResult>();
+    const pending: PendingClose = {
+      requestId,
+      rowId: request.rowId,
+      settle: (result) => outcome.resolve(result),
+      timer: null,
+    };
+    this.#pendingCloses.set(requestId, pending);
+    this.#pendingCloseRows.set(request.rowId, requestId);
+    pending.timer = this.#arm(null, this.#bounds.closeResultTimeoutMs, () => {
+      pending.timer = null;
+      // A silent owner is unobservable, not "never happened": the row may already
+      // be stopping, and nothing is re-sent on its behalf.
+      this.#settleClose(requestId, { kind: "unknown" });
+    });
+    const stillCurrent = options.stillCurrent;
+    // The lifetime latch: this exact request must still be outstanding, this
+    // viewer must not have stopped or failed, and the caller's own destination /
+    // pin / epoch fence must still hold — all checked synchronously inside the
+    // write that is about to call `channel.send`.
+    const gate: ViewerSendGate = () => {
+      if (this.#stopRequested || this.#state === "detached" || this.#state === "failed") {
+        return { allow: false, reason: "not-ready" };
+      }
+      if (this.#pendingCloses.get(requestId) !== pending) {
+        return { allow: false, reason: "not-ready" };
+      }
+      if (stillCurrent !== undefined) {
+        try {
+          if (stillCurrent() !== true) return { allow: false, reason: "target-unavailable" };
+        } catch {
+          // An unavailable fence decision is no decision at all.
+          return { allow: false, reason: "target-unavailable" };
+        }
+      }
+      return { allow: true };
+    };
+    void this.#queueSend({
+      type: "close_request",
+      requestId,
+      hostRunId: request.hostRunId,
+      rowId: request.rowId,
+      confirmed: request.confirmed,
+    }, gate).then((written) => {
+      if (written.ok) return;
+      if (!written.sent) {
+        // Positive proof this request never reached the transport.
+        this.#settleClose(requestId, { kind: "not-sent", reason: written.reason });
+        return;
+      }
+      // The write was invoked and then rejected: the owner may still have accepted
+      // it, so no outcome is established either way.
+      this.#settleClose(requestId, { kind: "unknown" });
+    });
+    return outcome.promise;
+  }
+
+  /** The single reason this viewer cannot submit a close now, or null. */
+  #closeRefusal(): PeerCloseResult | null {
+    if (this.#stopRequested || this.#state === "detached") return { kind: "not-sent", reason: "not-ready" };
+    if (this.#state === "failed") return { kind: "not-sent", reason: "not-ready" };
+    // Before the acknowledgement there is no negotiated capability at all, so
+    // nothing may be submitted: this is the pre-handshake "no eligible channel".
+    if (this.#state === "awaiting_ack") return { kind: "not-sent", reason: "not-ready" };
+    return null;
+  }
+
+  /**
+   * One owner answer, matched only by the request id THIS side generated. An
+   * unsolicited, duplicated, foreign, or already-timed-out reply resolves nothing
+   * and is dropped: it can never settle another operation or fail the channel.
+   */
+  #onCloseResult(frame: RosterBridgeCloseResultFrame): void {
+    if (!this.#pendingCloses.has(frame.requestId)) return;
+    this.#settleClose(frame.requestId, { kind: "owner-result", facts: frame.outcome });
+  }
+
+  /** Settle one pending close exactly once and release its timer and fences. */
+  #settleClose(requestId: string, result: PeerCloseResult): void {
+    const pending = this.#pendingCloses.get(requestId);
+    if (pending === undefined) return;
+    this.#pendingCloses.delete(requestId);
+    if (this.#pendingCloseRows.get(pending.rowId) === requestId) this.#pendingCloseRows.delete(pending.rowId);
+    if (pending.timer !== null) {
+      clearTimeout(pending.timer);
+      pending.timer = null;
+    }
+    pending.settle(result);
+  }
+
+  /** Every outstanding close becomes unknown: lost channels are never replayed. */
+  #settleAllCloses(): void {
+    for (const requestId of [...this.#pendingCloses.keys()]) {
+      this.#settleClose(requestId, { kind: "unknown" });
+    }
+  }
+
   stop(): Promise<void> {
     if (this.#stopPromise !== null) return this.#stopPromise;
     // Recorded synchronously: a resync already waiting on a retirement cannot
     // start another subscription once stop has been requested.
     this.#stopRequested = true;
+    // Every outstanding close settles honestly as unknown before any await: a
+    // stopped viewer cannot observe an owner's answer, and nothing is replayed.
+    this.#settleAllCloses();
     const wasAwaitingAck = this.#state === "awaiting_ack";
     this.#stopPromise = this.#awaitRetirement()
       .then(() => this.#beginRetirement("graceful", undefined, "stopped"))
@@ -616,9 +849,13 @@ class ViewerBinding implements RosterBridgeViewer {
       case "error":
         this.#onOwnerError(frame.code, frame.subscriptionId);
         return;
+      case "close_result":
+        this.#onCloseResult(frame);
+        return;
       default:
-        // The viewer sends hello, subscribe, and unsubscribe; receiving one of
-        // those (or any other frame) means the peer is not speaking this protocol.
+        // The viewer sends hello, subscribe, unsubscribe, close, and errors;
+        // receiving one of those (or any other frame) means the peer is not
+        // speaking this protocol.
         this.#protocolFailure();
     }
   }
@@ -639,6 +876,9 @@ class ViewerBinding implements RosterBridgeViewer {
     }
     this.#state = "ready";
     this.#diagnostic("hello_accepted");
+    // The acknowledgement's capability set is what this channel may ever assume.
+    // Nothing is enabled by it beyond protocol support, and it is never widened.
+    this.#capabilities = Object.freeze([...verdict.capabilities]);
     this.#resolveHello();
   }
 
@@ -827,6 +1067,9 @@ class ViewerBinding implements RosterBridgeViewer {
     // Transport loss is the owner's answer for any retirement still outstanding:
     // the barrier settles so every waiting subscribe, resync, or stop settles too.
     this.#settleRetirement();
+    // A lost channel never answers an outstanding close: no outcome is
+    // established, and nothing is replayed or guessed at.
+    this.#settleAllCloses();
     this.#transfer = null;
     this.#subscriptionId = null;
     this.#subscriptionRun = null;
@@ -919,33 +1162,70 @@ class ViewerBinding implements RosterBridgeViewer {
   }
 
   #sendControl(frame: RosterBridgeFrame): Promise<void> {
-    if (this.#state === "detached") return Promise.reject(new RosterBridgeViewerError("stopped"));
+    return this.#queueSend(frame).then((outcome) => {
+      if (outcome.ok) return;
+      throw new RosterBridgeViewerError("send-failed");
+    });
+  }
+
+  /**
+   * One ordered control write, reported honestly: `ok` means the bytes were
+   * admitted to the socket (never that the peer acted on them), and a failure says
+   * whether `channel.send` was actually invoked, because that is the boundary
+   * between "positively not submitted" and "acceptance cannot be excluded".
+   *
+   * `gate` is evaluated inside the write that is about to call `channel.send`, so
+   * a request whose own lifetime ended while it was queued is discarded instead
+   * of being delivered late.
+   */
+  #queueSend(frame: RosterBridgeFrame, gate?: ViewerSendGate): Promise<ViewerSendOutcome> {
+    if (this.#state === "detached") {
+      return Promise.resolve<ViewerSendOutcome>({ ok: false, sent: false, reason: "not-ready" });
+    }
     if (this.#queuedSends >= MAX_QUEUED_VIEWER_SENDS) {
       // Control traffic is tiny and sequential by design; a backlog means the
       // channel is not draining, so nothing further is queued.
       this.#diagnostic("send_failed");
-      return Promise.reject(new RosterBridgeViewerError("send-failed"));
+      return Promise.resolve<ViewerSendOutcome>({ ok: false, sent: false, reason: "not-ready" });
     }
     this.#queuedSends += 1;
-    const write = (): Promise<void> => {
+    const write = (): Promise<ViewerSendOutcome> => {
+      if (this.#state === "detached") {
+        // A write that has not started by the time this viewer detached is never
+        // submitted, so its caller can honestly report a pre-submission refusal.
+        return Promise.resolve<ViewerSendOutcome>({ ok: false, sent: false, reason: "not-ready" });
+      }
+      if (gate !== undefined) {
+        const decision = gate();
+        if (!decision.allow) {
+          this.#diagnostic("send_failed");
+          return Promise.resolve<ViewerSendOutcome>({ ok: false, sent: false, reason: decision.reason });
+        }
+      }
       let bytes: Buffer;
       try {
         bytes = encodeRosterBridgeFrame(frame, this.#bounds);
       } catch {
         this.#diagnostic("send_failed");
-        return Promise.reject(new RosterBridgeViewerError("send-failed"));
+        return Promise.resolve<ViewerSendOutcome>({ ok: false, sent: false, reason: "not-ready" });
       }
       let written: Promise<void>;
       try {
         written = this.#channel.send(bytes);
       } catch {
-        written = Promise.reject(new RosterBridgeViewerError("send-failed"));
+        // The write was invoked even though it refused immediately; a conservative
+        // caller must not claim the bytes were never offered to the transport.
+        this.#diagnostic("send_failed");
+        return Promise.resolve<ViewerSendOutcome>({ ok: false, sent: true });
       }
       // Resolution means the bytes were admitted to the socket, nothing more.
-      return written.catch(() => {
-        this.#diagnostic("send_failed");
-        throw new RosterBridgeViewerError("send-failed");
-      });
+      return written.then<ViewerSendOutcome, ViewerSendOutcome>(
+        () => ({ ok: true }),
+        () => {
+          this.#diagnostic("send_failed");
+          return { ok: false, sent: true };
+        },
+      );
     };
     const result = this.#sendTail.then(write, write);
     this.#sendTail = result.then(() => undefined, () => undefined);
@@ -1022,6 +1302,8 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#clearHandshakeTimer();
     // No barrier may outlive the handler: whoever is waiting has to settle.
     this.#settleRetirement();
+    // Nor may a close: a detached viewer observes no owner answer.
+    this.#settleAllCloses();
     this.#detachHandler();
   }
 }

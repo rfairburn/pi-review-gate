@@ -11,8 +11,14 @@
  * Authority stays exactly where it was. The only owner capability used here is
  * the injected service's read-only inventory watch over the one manager, so this
  * module holds no rows of its own, is never a second roster, and never starts,
- * stops, writes, resizes, or closes a session. Stopping a subscription, fencing
- * a channel, or losing the transport changes metadata delivery only.
+ * stops, writes, resizes, or closes a session from that watch. The optional
+ * close provider is a SEPARATE injected callback supplied by the owner's Main
+ * process, which already owns the only manager, roster, and row-removal path:
+ * this bridge only forwards one request to it and reports its fixed facts back.
+ * Stopping a subscription, fencing a channel, or losing the transport changes
+ * metadata delivery only; it never cancels, rolls back, or reports an exit for a
+ * close the owner already accepted, and it never claims a close operation exited
+ * because this binding is gone.
  *
  * Identity is the exact `channel.peerKey` proved by the live TLS handshake. A
  * friendly label and any key claimed in a frame are display data, never
@@ -53,8 +59,15 @@ import type {
 } from "../owning-host-service";
 import type { PeerByteChannel } from "./channel";
 import type { PeerKey } from "./identity";
+import {
+  isOwnerCloseFacts,
+  type OwnerCloseFacts,
+  type OwnerCloseHandler,
+  type OwnerCloseRequest,
+} from "./peer-close";
 import { isRemoteSessionMetadataError, toRemoteSessionMetadata, type RemoteSessionMetadata } from "./roster-metadata";
 import {
+  ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
@@ -67,6 +80,7 @@ import {
   resolveRosterBridgeBounds,
   rosterBridgeWireCodeForFailure,
   type RosterBridgeBounds,
+  type RosterBridgeCloseRequestFrame,
   type RosterBridgeErrorCode,
   type RosterBridgeFrame,
   type RosterBridgeHelloFrame,
@@ -102,7 +116,10 @@ export type RosterBridgeOwnerDiagnosticCode =
   | "protocol_violation"
   | "send_failed"
   | "channel_closed"
-  | "binding_stopped";
+  | "binding_stopped"
+  | "close_accepted"
+  | "close_refused"
+  | "close_reply_dropped";
 
 export interface RosterBridgeOwnerDiagnostic {
   readonly code: RosterBridgeOwnerDiagnosticCode;
@@ -118,6 +135,15 @@ export interface RosterBridgeHostOptions {
   readonly inventory: RosterBridgeInventorySource;
   /** Required explicit policy: no authorizer means no metadata is ever written. */
   readonly authorizePeer: RosterBridgeAuthorizer;
+  /**
+   * The owner's ONE close provider, supplied by Main, which already owns the only
+   * manager, roster, and row-removal path. Absent means this host never
+   * acknowledges or accepts the Close capability and behaves exactly as a
+   * metadata-only host does. Supplying it grants nothing by itself: every request
+   * is reauthorized against the current proved peer key and directional
+   * receiving grant before this handler can be reached.
+   */
+  readonly closeOwnedSession?: OwnerCloseHandler;
   readonly bounds?: Partial<RosterBridgeBounds>;
   readonly onDiagnostic?: RosterBridgeOwnerDiagnosticSink;
 }
@@ -176,6 +202,19 @@ class OwnerBinding implements RosterBridgeChannelBinding {
   #state: OwnerState = "awaiting_hello";
   #fenced = false;
   #fenceCode: RosterBridgeErrorCode = "bad_frame";
+  /**
+   * Optional capabilities acknowledged for this channel. The Close capability is
+   * included only when the peer offered it AND this owner really holds its close
+   * provider, so a provider-less owner never widens anything.
+   */
+  #capabilities: readonly string[] = Object.freeze([]);
+  /**
+   * In-flight close requests by request id, plus the per-row fence that makes a
+   * duplicate answerable without a second ladder. Both are bounded by the
+   * existing roster row bound and are never an execution queue.
+   */
+  readonly #inflightCloses = new Set<string>();
+  readonly #closeRows = new Set<string>();
   #installing = false;
   #installUnavailable = false;
   #subscriptionRun: string | null = null;
@@ -272,6 +311,9 @@ class OwnerBinding implements RosterBridgeChannelBinding {
         if (this.#state === "awaiting_hello" || this.#fenced) this.#refuse();
         else this.#onUnsubscribe(frame.subscriptionId);
         return;
+      case "close_request":
+        this.#onCloseRequest(frame);
+        return;
       default:
         // A frame this side did not ask for (its own ack, an unknown type, or a
         // second hello) is a protocol violation, answered once.
@@ -301,16 +343,20 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     this.#state = "ready";
     this.#diagnostic("hello_accepted");
     // The acknowledgement carries no roster content. Nothing else is sent until
-    // the viewer subscribes: the owner is never eager.
+    // the viewer subscribes: the owner is never eager. It states the capability
+    // set in force for this session: the required baseline this owner implements,
+    // plus only the optional capabilities both sides offered AND this owner can
+    // really honour. Negotiation can only narrow what either side assumes.
+    this.#capabilities = Object.freeze(decision.capabilities.filter((capability) => (
+      capability !== ROSTER_BRIDGE_CLOSE_CAPABILITY
+      || typeof this.#options.closeOwnedSession === "function"
+    )));
     this.#sendControl({
       type: "hello_ack",
       service: ROSTER_BRIDGE_SERVICE,
       major: ROSTER_BRIDGE_MAJOR,
       minor: Math.min(frame.minor, ROSTER_BRIDGE_MINOR),
-      // The acknowledgement states the capability set in force for this session:
-      // the required baseline this owner implements, plus any optional capability
-      // both sides offered. Negotiation can only narrow what either side assumes.
-      capabilities: Object.freeze([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ...decision.capabilities]),
+      capabilities: Object.freeze([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ...this.#capabilities]),
     });
   }
 
@@ -393,6 +439,127 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     // confirmed without touching anything else. No session is affected either
     // way, and the channel stays open for an explicit fresh subscription.
     this.#sendControl({ type: "unsubscribed", subscriptionId });
+  }
+
+  // -------------------------------------------------------------------- close
+
+  /**
+   * Answer one close request with the owner's ONE provider, or not at all.
+   *
+   * Admission is decided here and now: the capability must have been negotiated
+   * for this channel (which already required a real provider), the channel must
+   * not be fenced or pre-hello, and the EXACT proved peer key must still carry
+   * this owner's current directional receiving grant. Only then is the provider
+   * reached, with the exact owner run, row, and confirmation the request named.
+   *
+   * The provider is invoked from a detached continuation on purpose: a long
+   * owner stop must never block the ordered metadata receive path, so other
+   * rows' requests, acknowledgements, and snapshots keep flowing while Main owns
+   * the operation. There is one in-flight close per row and per request id; a
+   * duplicate is answered with a fixed fact instead of being queued.
+   */
+  #onCloseRequest(frame: RosterBridgeCloseRequestFrame): void {
+    if (this.#state === "finished") return;
+    const handler = this.#options.closeOwnedSession;
+    if (handler === undefined || !this.#capabilities.includes(ROSTER_BRIDGE_CLOSE_CAPABILITY)) {
+      // Nothing was acknowledged for this channel, so a close frame is outside the
+      // negotiated protocol: it is refused exactly like any other unexpected frame
+      // and never reaches an authority.
+      this.#violation();
+      return;
+    }
+    if (this.#fenced) {
+      this.#refuse();
+      return;
+    }
+    if (this.#state === "awaiting_hello") {
+      this.#violation();
+      return;
+    }
+    if (!this.#authorized()) {
+      // No callback and no write: an unauthorized request establishes nothing, and
+      // the requester learns `unknown` from its own finite deadline rather than a
+      // fabricated refusal or stop.
+      this.#diagnostic("close_refused");
+      return;
+    }
+    if (this.#inflightCloses.has(frame.requestId) || this.#closeRows.has(frame.rowId)) {
+      // Already being handled: answer the fixed fact, never a second ladder and
+      // never an execution queue behind the live one.
+      this.#writeCloseResult(frame.requestId, { kind: "busy" });
+      return;
+    }
+    if (this.#inflightCloses.size >= this.#bounds.maxSnapshotRows) {
+      // Bounded by the existing roster row bound. Overflow is refused rather than
+      // queued, evicted, or retargeted, and nothing was stopped or signalled.
+      this.#writeCloseResult(frame.requestId, { kind: "refused" });
+      return;
+    }
+    const request: OwnerCloseRequest = Object.freeze({
+      hostRunId: frame.hostRunId,
+      rowId: frame.rowId,
+      confirmed: frame.confirmed,
+    });
+    this.#inflightCloses.add(frame.requestId);
+    this.#closeRows.add(frame.rowId);
+    this.#diagnostic("close_accepted");
+    // A rejected or throwing provider, and a value that is not one of the fixed
+    // fact sets, are all honestly `unknown`: nothing here can invent an exit, a
+    // removal, or a retention, and nothing is retried.
+    void Promise.resolve()
+      .then(() => handler(request))
+      .then(
+        (facts) => this.#completeClose(frame.requestId, frame.rowId, isOwnerCloseFacts(facts) ? facts : { kind: "unknown" }),
+        () => this.#completeClose(frame.requestId, frame.rowId, { kind: "unknown" }),
+      );
+  }
+
+  /**
+   * Answer one completed close. Authorization is re-proved immediately before the
+   * reply is written, so a Revoke, a closed channel, or a fenced binding that
+   * happened while Main was working drops the reply truthfully. The operation
+   * itself is never cancelled, rolled back, or reported as an exit: Main's own
+   * row-stop lifecycle owns it, and this binding only ever owns network delivery.
+   */
+  #completeClose(requestId: string, rowId: string, facts: OwnerCloseFacts): void {
+    // A request abandoned by teardown is no longer this binding's to answer.
+    if (!this.#inflightCloses.delete(requestId)) return;
+    this.#closeRows.delete(rowId);
+    if (this.#state === "finished" || this.#fenced) {
+      this.#diagnostic("close_reply_dropped");
+      return;
+    }
+    if (!this.#authorized()) {
+      this.#diagnostic("close_refused");
+      return;
+    }
+    this.#writeCloseResult(requestId, facts);
+  }
+
+  /**
+   * Write one fixed result. A result that cannot be written is simply dropped: it
+   * never fences the metadata channel, never closes the transport, and never
+   * claims the operation did not happen. A resolved write means the bytes were
+   * admitted, never that any row stopped.
+   */
+  #writeCloseResult(requestId: string, facts: OwnerCloseFacts): void {
+    let bytes: Buffer;
+    try {
+      bytes = encodeRosterBridgeFrame({ type: "close_result", requestId, outcome: facts }, this.#bounds);
+    } catch {
+      this.#diagnostic("close_reply_dropped");
+      return;
+    }
+    let written: Promise<void>;
+    try {
+      written = this.#channel.send(bytes);
+    } catch {
+      this.#diagnostic("close_reply_dropped");
+      return;
+    }
+    void written.catch(() => {
+      this.#diagnostic("close_reply_dropped");
+    });
   }
 
   #onInventory(snapshot: OwningHostInventorySnapshot | undefined): void {
@@ -607,6 +774,12 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       this.#clearHelloTimer();
       const subscriptionId = this.#subscriptionId;
       this.#retireSubscription();
+      // Close bookkeeping is network-delivery bookkeeping only. Clearing it does
+      // not cancel, roll back, or await the owner's operation: an accepted close
+      // keeps running under Main's existing row-stop lifecycle, and its result is
+      // dropped rather than claimed after this binding is gone.
+      this.#inflightCloses.clear();
+      this.#closeRows.clear();
       if (this.#state !== "finished") {
         // An owner-initiated stop tells the viewer its observations are no
         // longer current; it never fabricates an empty roster.

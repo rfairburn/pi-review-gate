@@ -36,6 +36,7 @@ import type {
   PeerCoordinatorWithContent,
   PeerSelectedContent,
 } from "./network/peer-content";
+import type { OwnerCloseFacts, OwnerCloseRequest } from "./network/peer-close";
 import type { PeerCoordinator, PeerConsentPresentation, PeerUiCommand, PeerUiSnapshot } from "./peer-ui-protocol";
 import { isValidNativeSessionId } from "./protocol";
 import {
@@ -43,6 +44,7 @@ import {
   isDuplicateOwnedLaunchFailure,
   savedDeletionOwnedSessions,
   validateOwnedSavedSessionDeletion,
+  type OwningHostInventorySnapshot,
   type OwningHostManager,
   type OwningHostService,
   type OwningHostServiceDependencies,
@@ -110,6 +112,8 @@ const ROW_RESUME_DUPLICATE = "This conversation is already restarting";
 const SAVED_UNAVAILABLE = "Saved conversations are unavailable in this host";
 const REMOVE_REFUSED_MESSAGE = "Session not removed; it may be live, unconfirmed, or no longer available.";
 const REMOVE_FAILURE_MESSAGE = "Session was not removed; its state could not be confirmed.";
+/** The existing notice for a stop this host will not perform without a deliberate confirmation. */
+const ROW_STOP_CONFIRMATION_MESSAGE = "Activity changed or is unknown. Press d again to confirm stopping this session.";
 const ROSTER_UNAVAILABLE_MESSAGE = "That remembered conversation is unavailable; remove it or open a saved conversation";
 const LOCAL_VIEW_DETACHED_MESSAGE = "No session is displayed. Every session keeps running; press enter on a row to display it.";
 const NO_LOCAL_VIEW_MESSAGE = "No session is displayed already; press enter on a row to display it";
@@ -887,7 +891,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let externalEditorAbort: AbortController | undefined;
   let externalEditorTask: Promise<string | undefined> | undefined;
   const createTasks = new Set<Promise<void>>();
-  const rowStopTasks = new Map<string, Promise<void>>();
+  // One close per row: the shared fence for BOTH the local `d`/Delete route and
+  // the owner-side Close provider, and the existing shutdown barrier that awaits
+  // every accepted close.
+  const rowStopTasks = new Map<string, Promise<OwnerCloseFacts>>();
   // Exited-row restart (deliberate Enter): one attempt per old row id, a
   // per-request mapping for cancellation, and every task promise retained for
   // shutdown awaiting. The task map is the duplicate fence; the set is not.
@@ -1321,6 +1328,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // listener, store, grant, lease, or permission type; the owner-side
         // endpoint stays unreachable without a listener this coordinator starts.
         contentSource: hostService,
+        // The owner-side Close provider is handed over at construction only.
+        // This phase enables no remote Close: the coordinator never advertises,
+        // sends, receives, or calls anything with it, so every existing lane,
+        // fake, and frame behaves exactly as before. Main keeps the one close
+        // core; no service, manager, store, registry, or global close API is
+        // added, and `closeViewer` remains a display-surface retirement, never a
+        // session close.
+        closeOwnedSession,
         onChange: updatePeerUi,
         onIncomingConsentArrival: attemptIncomingPeerBell,
         onContentChange: handleContentChange,
@@ -3020,6 +3035,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   /**
+   * What one {@link removeExitedRow} call established about THIS host's removal
+   * authority. Only `"removed"` claims anything: `"retained"` is the manager
+   * refusing to settle the row (so the row and whatever it still owns, possibly
+   * a live PTY, stand untouched), and `"failed"` is a manager authority that
+   * threw, leaving its effect unobservable.
+   */
+  type RowRemovalOutcome = "removed" | "retained" | "failed";
+
+  /**
    * Remove one row, optionally completing a confirmed deliberate replacement.
    *
    * A successful replacement transfers its stable roster slot into the old
@@ -3029,10 +3053,25 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * row's removal is confirmed, and synchronous roster synchronization is
    * suppressed across that confirmation so the old slot cannot be dropped
    * before the transfer runs.
+   *
+   * Returns what this host's removal authority established, so the shared close
+   * core can report truthful facts instead of a notice: only `"removed"` is a
+   * positive claim, `"retained"` is an authority refusal (nothing was settled),
+   * and `"failed"` is a thrown authority whose effect is unobservable.
+   * `notify: false` is for the owner-side Close provider: it holds back only
+   * this host's own removal notices. Every other effect — the ghost set, the
+   * roster slot and remembered record, the replacement slot transfer, the
+   * remembered active row, the displayed local content target, the roster
+   * redraw, the roster persist, and the layout reconcile — is unchanged for
+   * every caller.
    */
-  function removeExitedRow(id: string, options?: { readonly replaced?: boolean; readonly replacementId?: string }): void {
-    if (!manager || !sidebar) return;
+  function removeExitedRow(
+    id: string,
+    options?: { readonly replaced?: boolean; readonly replacementId?: string; readonly notify?: boolean },
+  ): RowRemovalOutcome {
+    if (!manager || !sidebar) return "retained";
     const replacing = options?.replaced === true;
+    const notify = options?.notify !== false;
     const replacementId = options?.replacementId;
     const oldSlot = rowSlots.get(id);
     const replacementSlot = replacementId === undefined ? undefined : rowSlots.get(replacementId);
@@ -3046,8 +3085,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
     catch {
       if (replacing) sidebar.clearRowReplacement(id);
-      else { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
-      return;
+      else if (notify) { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
+      return "failed";
     } finally {
       rosterSyncInProgress = wasSyncing;
     }
@@ -3055,15 +3094,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // A settled error row without an owned PTY exit is closed only through
       // the manager's own closeError authority. Resume replacements never get
       // this fallback: they remain closeExited-only.
-      const outcome = tryCloseError(manager, id);
+      const outcome = tryCloseError(manager, id, notify);
       if (outcome === "closed") removed = true;
-      else if (outcome === "failure") return; // generic failure already shown
+      else if (outcome === "failure") return "failed"; // generic failure already shown
     }
     if (!removed) {
       // An already-removed placeholder is tolerated; nothing else is touched.
       if (replacing) sidebar.clearRowReplacement(id);
-      else { sidebar.showError(REMOVE_REFUSED_MESSAGE); scheduleRedraw(); }
-      return;
+      else if (notify) { sidebar.showError(REMOVE_REFUSED_MESSAGE); scheduleRedraw(); }
+      return "retained";
     }
     removedExitedIds.add(id);
     if (replacing && replacementId !== undefined && oldSlot !== undefined
@@ -3084,6 +3123,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // Authoritatively settled removal never activates a sibling or loses its owner.
     syncRosterAndSchedule();
     reconcileLayout(true);
+    return "removed";
   }
 
   /**
@@ -3093,43 +3133,215 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * the decision to the caller; a thrown closeError reports the generic
    * failure and keeps the row. No signal, sibling, or other fallback.
    */
-  function tryCloseError(owner: OwningHostManager, id: string): "closed" | "not-applicable" | "failure" {
+  function tryCloseError(owner: OwningHostManager, id: string, notify: boolean): "closed" | "not-applicable" | "failure" {
     const closeError = owner.closeError;
     if (typeof closeError !== "function") return "not-applicable";
     if (hostService.readRow(id)?.lifecycle !== "error") return "not-applicable";
     try {
       return closeError.call(owner, id) === true ? "closed" : "not-applicable";
     } catch {
-      sidebar?.showError(REMOVE_FAILURE_MESSAGE);
-      scheduleRedraw();
+      if (notify) { sidebar?.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
       return "failure";
     }
   }
 
-  function launchRowStop(id: string, confirmed: boolean): void {
-    if (!manager || !sidebar || rowStopTasks.has(id)) return;
-    const owner = manager;
-    let task!: Promise<void>;
-    task = (async () => {
+  /**
+   * The host's ONE row close: stop one owned row, then remove its row only
+   * after the manager POSITIVELY reports the exit.
+   *
+   * The local `d`/Delete route drives this with `notify: true` and gets exactly
+   * the notices it always got; the owner-side Close provider drives it with
+   * `notify: false` and reads the returned facts instead of writing anything to
+   * this host's screen. Both routes share one per-row `rowStopTasks` fence (so
+   * one row has one stop ladder and a duplicate request never re-signals or
+   * queues a second one), the same authority re-check before the manager is
+   * addressed and after its await, the same {@link removeExitedRow} bookkeeping
+   * (ghost set, roster slot and remembered record, remembered active row,
+   * displayed local content target, roster redraw, roster persist, layout
+   * reconcile), and the same shutdown barrier: teardown already awaits every task
+   * in `rowStopTasks`, so a close accepted here joins it with no second registry
+   * and no new unbounded await.
+   *
+   * The facts say only what this host observed. `confirmed` runs the manager's
+   * existing bounded ladder (graceful request, then TERM, then the owned-handle
+   * kill) and adds no force of its own; nothing here signals a sibling, cancels
+   * an in-flight restart or resume, reports a sent signal or an acknowledgement as
+   * an exit, or deletes a saved conversation. An outcome this host did not
+   * positively settle stays `unknown` instead of becoming a claim that nothing was
+   * submitted.
+   */
+  function startRowClose(
+    owner: OwningHostManager,
+    id: string,
+    confirmed: boolean,
+    notify: boolean,
+  ): Promise<OwnerCloseFacts> {
+    const task = (async (): Promise<OwnerCloseFacts> => {
       // Publish duplicate fencing before even a synchronously throwing adapter.
       await Promise.resolve();
       try {
+        // That yield is the only window in which this row's close is registered and
+        // the adapter has not been addressed. Teardown may have begun or the run
+        // replaced inside it, and the captured manager must not be written to
+        // afterwards, so the host's authority is re-read here rather than after a
+        // stop this host no longer owns. This close signalled nothing, and the row's
+        // fate from here is unobservable, so the same conservative fact as the
+        // post-stop fence applies.
+        if (shutdownRequested || manager !== owner) return { kind: "unknown" };
         const stop = owner.stop;
-        if (typeof stop !== "function") throw new Error("owned row stop unavailable");
+        if (typeof stop !== "function") {
+          // A manager that cannot stop refuses honestly: no signal, no startup
+          // failure, and the local route keeps its existing bounded notice. This is
+          // a positive pre-call proof that nothing was submitted.
+          if (notify && !shutdownRequested && sidebar) { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
+          return { kind: "refused" };
+        }
         const result = await stop.call(owner, id, { confirmed: confirmed === true });
-        if (shutdownRequested || manager !== owner || !sidebar) return;
-        if (result.status === "exited") removeExitedRow(id);
-        else {
+        // Teardown began, or this is no longer the host's manager run: what
+        // happened to the child is unknown, and nothing may be re-sent or
+        // re-signalled on its behalf, so no exit or removal is claimed.
+        if (shutdownRequested || manager !== owner) return { kind: "unknown" };
+        if (result.status === "exited") {
+          // Removal follows a positive exit and nothing else, through the one
+          // path that owns this host's roster bookkeeping. The exit itself was
+          // observed, so a clean refusal to remove truthfully reports a stopped row
+          // this host kept; a removal authority that threw leaves even the row's
+          // presence unobservable.
+          const removal = removeExitedRow(id, { notify });
+          return removal === "removed" ? { kind: "removed" }
+            : removal === "failed" ? { kind: "unknown" }
+              : { kind: "stopped-retained" };
+        }
+        // Every non-exited outcome keeps the row, its registration, this host's
+        // surface, and its ownership exactly as they were; the local route keeps
+        // the notice and the roster restatement it always produced.
+        if (notify && sidebar) {
           sidebar.showError(result.status === "confirmation-required"
-            ? "Activity changed or is unknown. Press d again to confirm stopping this session."
+            ? ROW_STOP_CONFIRMATION_MESSAGE
             : REMOVE_REFUSED_MESSAGE);
           syncRosterAndSchedule();
         }
+        // `unconfirmed` is this manager's own report that its bounded ladder ended
+        // without an exit. `unavailable` is ambiguous: the manager can report it
+        // AFTER accepting the shutdown request, when its record or the manager
+        // itself went away during the await, and another adapter build can report a
+        // status this host does not recognize. Neither proves that nothing was
+        // submitted, so both stay unknown instead of becoming a refusal.
+        return result.status === "confirmation-required"
+          ? { kind: "confirmation-required" }
+          : result.status === "unconfirmed"
+            ? { kind: "unconfirmed" }
+            : { kind: "unknown" };
       } catch {
-        if (!shutdownRequested && sidebar) { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
-      } finally { rowStopTasks.delete(id); }
+        // The manager threw, so whether it signalled anything is unknown. The
+        // local route keeps its existing bounded failure notice; no exit,
+        // removal, or cleanup is ever claimed for either route.
+        if (notify && !shutdownRequested && sidebar) { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
+        return { kind: "unknown" };
+      } finally {
+        rowStopTasks.delete(id);
+      }
     })();
     rowStopTasks.set(id, task);
+    return task;
+  }
+
+  /**
+   * The local `d`/Delete route: the shared close core with this host's notices.
+   * Its preconditions and duplicate handling are exactly what they were before
+   * the core existed — a row with an in-flight close is simply ignored.
+   */
+  function launchRowStop(id: string, confirmed: boolean): void {
+    if (!manager || !sidebar || rowStopTasks.has(id)) return;
+    void startRowClose(manager, id, confirmed, true);
+  }
+
+  /**
+   * The ONE owner-side Close provider. It closes one row of THIS host by reusing
+   * {@link startRowClose} — the exact stop-and-exit-only-removal core the local
+   * route uses, with the same per-row fence and roster bookkeeping — and answers
+   * with fixed facts only.
+   *
+   * Nothing is enabled by this phase: no capability is advertised, no frame
+   * carries a close, and no coordinator code calls this handler. Only a future
+   * owner endpoint behind the current TLS-proved peer key and the current
+   * directional receiving grant can reach it, and that endpoint must reauthorize
+   * before writing any reply.
+   *
+   * The request is resolved ONLY against this owner's authoritative inventory,
+   * never against a viewer's local manager, and it needs no native conversation
+   * tuple, no displayed or selected row, no viewer, no controller lease, and no
+   * local popup or setting. It is notice-free toward this host's operator (the
+   * requester gets the facts instead) while the shared core still performs its
+   * normal roster redraw, status, and persistence-warning paths.
+   *
+   * The facts never overstate what this host saw. `removed` is the manager's own
+   * confirmed removal — after an exit this host actually observed (a row already in
+   * `exited` lifecycle, or a stop that reported one) or under its settled
+   * launch-error removal authority — while `stopped-retained` requires an exit this
+   * host actually observed. An `error` row takes the same route the local
+   * `d`/Delete route takes for that same row: the manager's real stop when it
+   * reports the child live, its own settled-removal authority when it reports the
+   * child settled. A refusal is reserved for authority this host positively
+   * established before any call; an ambiguous result after a stop was addressed,
+   * and any thrown authority, reports `unknown`, which claims neither removal nor
+   * retention.
+   */
+  async function closeOwnedSession(request: OwnerCloseRequest): Promise<OwnerCloseFacts> {
+    // Fence teardown and the one manager run before anything is read or written.
+    const owner = manager;
+    if (owner === undefined || shutdownRequested) return { kind: "refused" };
+    // An inventory that cannot be observed is unknown; a different owner run or
+    // a row this run does not have is refused. None of these reads writes,
+    // signals, stops, or removes anything.
+    let inventory: OwningHostInventorySnapshot | undefined;
+    try {
+      inventory = hostService.readInventorySnapshot();
+    } catch {
+      inventory = undefined;
+    }
+    if (inventory === undefined) return { kind: "unknown" };
+    if (inventory.hostRunId !== request.hostRunId) return { kind: "refused" };
+    const row = inventory.rows.find((candidate) => candidate.id === request.rowId);
+    if (row === undefined) return { kind: "refused" };
+    // One close per row: an in-flight close already owns this row's stop ladder,
+    // and a second request never re-signals or queues behind it.
+    if (rowStopTasks.has(request.rowId)) return { kind: "busy" };
+    // An already exited row is REMOVED, never blindly stopped: it may own no
+    // PTY at all, and only the manager's own removal authority may settle it.
+    // This is the same route local d/Delete takes, and it takes no await, so no
+    // stale authority is possible here. Its lifecycle IS a positive exit, so a
+    // clean refusal still reports the observed stop honestly; a thrown authority
+    // leaves even the row's presence unobservable.
+    if (row.lifecycle === "exited") {
+      const outcome = removeExitedRow(request.rowId, { notify: false });
+      if (outcome === "removed") return { kind: "removed" };
+      return outcome === "failed" ? { kind: "unknown" } : { kind: "stopped-retained" };
+    }
+    // An error lifecycle is NOT a settlement: the manager can keep a live PTY
+    // behind a fatal display or setup error, so the error badge alone is neither
+    // exit nor removal authority. The owner close follows the manager's own read of
+    // the child, exactly like the local `d`/Delete route for that row: a child the
+    // manager reports LIVE goes through the shared core's real idle preflight and
+    // existing bounded ladder (`confirmed` authorizes that ladder only), and only
+    // an exit it then reports may lead to removal. A child the manager reports
+    // SETTLED is removed by the manager's own authorities (`closeExited`, then the
+    // lifecycle-gated `closeError`) and never blindly stopped; a refusal settled
+    // nothing and a thrown authority is unobservable, and neither claims an exit.
+    // Anything else — a live state this host cannot read — is refused without
+    // signalling anything, because no inference from a badge is authority.
+    if (row.lifecycle === "error") {
+      if (row.hasLiveProcess === true) return startRowClose(owner, request.rowId, request.confirmed, false);
+      if (row.hasLiveProcess !== false) return { kind: "refused" };
+      const outcome = removeExitedRow(request.rowId, { notify: false });
+      if (outcome === "removed") return { kind: "removed" };
+      return outcome === "failed" ? { kind: "unknown" } : { kind: "refused" };
+    }
+    // A live row goes through the shared core with the manager's real idle
+    // preflight. `confirmed` authorizes only the existing bounded ladder, never
+    // a force, and the core re-checks teardown and manager identity before the
+    // stop and after its await before removing anything.
+    return startRowClose(owner, request.rowId, request.confirmed, false);
   }
 
   function handleSidebarAction(action: SidebarAction): void {

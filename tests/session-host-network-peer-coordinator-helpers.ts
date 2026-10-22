@@ -26,7 +26,7 @@ import {
 	createPeerCoordinator,
 	type PeerCoordinatorOptions,
 } from "../src/session-host/network/peer-coordinator";
-import type { PeerCoordinator, PeerUiConsent, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
+import type { PeerUiConsent, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 
 export { assert };
 
@@ -239,7 +239,7 @@ export function createOwnedAgentDir(t: TestContext): AgentFixture {
 }
 
 export interface StartedCoordinator {
-	readonly coordinator: PeerCoordinator;
+	readonly coordinator: ReturnType<typeof createPeerCoordinator>;
 	readonly log: SnapshotLog;
 	readonly inventory: FakeInventory;
 }
@@ -251,6 +251,7 @@ export async function startCoordinator(
 		readonly inventory?: FakeInventory;
 		readonly testHooks?: PeerCoordinatorOptions["testHooks"];
 		readonly log?: SnapshotLog;
+		readonly closeOwnedSession?: PeerCoordinatorOptions["closeOwnedSession"];
 	},
 ): Promise<StartedCoordinator> {
 	const log = options.log ?? createSnapshotLog();
@@ -261,6 +262,7 @@ export async function startCoordinator(
 		onChange: log.onChange,
 		onIncomingConsentArrival: log.onArrival,
 		...(options.testHooks === undefined ? {} : { testHooks: options.testHooks }),
+		...(options.closeOwnedSession === undefined ? {} : { closeOwnedSession: options.closeOwnedSession }),
 	});
 	t.after(async () => {
 		try {

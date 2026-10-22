@@ -23,13 +23,19 @@ import {
 	DEFAULT_SESSION_CONTENT_BOUNDS,
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
+	buildNativeCopyInline,
+	buildNativeCopyPaged,
 	buildSessionContentTransfer,
 	decodeSessionContentFrame,
 	encodeSessionContentFrame,
 	isSessionContentProtocolError,
 	resolveSessionContentBounds,
+	type NativeIoCompletedCopy,
+	type NativeIoCopyEvent,
+	type NativeIoSource,
 	type SessionContentBuiltTransfer,
 	type SessionContentFrame,
 	type SessionContentHelloAckFrame,
@@ -38,8 +44,11 @@ import {
 import {
 	attachSessionContentViewer,
 	isSessionContentViewerError,
+	type NativeInputNotSentReason,
 	type SessionContentViewer,
 	type SessionContentViewerDiagnostic,
+	type SessionContentViewerInputRequest,
+	type SessionContentViewerNativeIo,
 	type SessionContentViewerOptions,
 } from "../src/session-host/network/session-content-client";
 import type {
@@ -356,6 +365,8 @@ interface OwnerScript {
 	readonly autoUnsubscribe?: boolean;
 	readonly hostRunId?: string;
 	readonly sessionId?: string;
+	/** Acknowledge the optional native IO capability, but only if it was offered. */
+	readonly ackNativeIo?: boolean;
 }
 
 /** A minimal scripted owner that answers only what the test asks for. */
@@ -366,7 +377,19 @@ function scriptOwner(channel: FakeContentChannel, script: OwnerScript = {}): Scr
 		received.push(frame);
 		switch (frame.type) {
 			case "hello":
-				if (script.autoHelloAck ?? true) channel.deliver(helloAck());
+				if (script.autoHelloAck ?? true) {
+					const native = (script.ackNativeIo ?? false)
+						&& frame.capabilities.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY);
+					channel.deliver({
+						type: "hello_ack",
+						service: SESSION_CONTENT_SERVICE,
+						major: SESSION_CONTENT_MAJOR,
+						minor: SESSION_CONTENT_MINOR,
+						capabilities: native
+							? [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY]
+							: [SESSION_CONTENT_REQUIRED_CAPABILITY],
+					});
+				}
 				return;
 			case "subscribe":
 				if (script.autoSubscribe ?? true) {
@@ -429,8 +452,83 @@ function viewportViewer(
 	});
 }
 
-function deliverAll(channel: FakeContentChannel, built: SessionContentBuiltTransfer): void {
+function deliverAll(channel: FakeContentChannel, built: { readonly frames: readonly Buffer[] }): void {
 	for (const bytes of built.frames) channel.deliver(bytes);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Native IO fixtures (optional capability)
+ * ------------------------------------------------------------------------- */
+
+/** The one native conversation the content fixtures publish. */
+const NATIVE_SESSION = Object.freeze({ sessionId: "native-conversation-1", epoch: 2 });
+
+/** One exact host-written native source matching `sampleFrame`'s 12x3 geometry. */
+function nativeSource(overrides: Partial<NativeIoSource> = {}): NativeIoSource {
+	return {
+		hostRunId: RUN,
+		sessionId: ROW,
+		nativeSession: NATIVE_SESSION,
+		geometry: { cols: 12, rows: 3, revision: 0 },
+		viewerRevision: 1,
+		sourceToken: "token-A",
+		...overrides,
+	};
+}
+
+function nativeIoFixture(overrides: Partial<SessionContentViewerNativeIo> = {}): SessionContentViewerNativeIo {
+	return {
+		authorizeInput: () => true,
+		onCopy: () => undefined,
+		...overrides,
+	};
+}
+
+function copyEvent(source: NativeIoSource, text: string): NativeIoCopyEvent {
+	return {
+		kind: "copy",
+		encoded: Buffer.from(text, "utf8").toString("base64"),
+		sessionId: source.nativeSession.sessionId,
+		sessionEpoch: source.nativeSession.epoch,
+	};
+}
+
+/** Publish one complete viewport carrying the given exact native input source. */
+function publishSource(
+	channel: FakeContentChannel,
+	viewer: SessionContentViewer,
+	source: NativeIoSource,
+	sequence: number,
+	frame: TerminalFrame = sampleFrame(),
+): void {
+	deliverAll(channel, transfer(frame, {
+		subscriptionId: viewer.subscriptionId,
+		transferId: `transfer-${sequence}`,
+		sequence,
+		geometry: source.geometry,
+		nativeSession: source.nativeSession,
+		inputSource: source,
+	}));
+}
+
+/** Run the owner script, then additional inspection inside the same send callback. */
+function chainSend(channel: FakeContentChannel, extra: (bytes: Buffer) => void): void {
+	const previous = channel.onSend;
+	channel.onSend = (bytes) => {
+		previous?.(bytes);
+		extra(bytes);
+	};
+}
+
+/** Replace only the visible text rows, so the semantic source stays unchanged. */
+function textVariant(text: string): TerminalFrame {
+	const frame = sampleFrame();
+	return {
+		cols: frame.cols,
+		rows: frame.rows,
+		lines: [text, ...frame.lines.slice(1)],
+		cursor: frame.cursor,
+	};
 }
 
 /* ------------------------------------------------------------------------- *
@@ -1548,4 +1646,1003 @@ test("observed input modes and graphics are inert data with no input, clipboard,
 		assert.ok(["hello", "subscribe", "resize", "unsubscribe", "error"].includes(type), `unexpected write ${type}`);
 	}
 	await deadlined(viewer.stop(), "stop");
+});
+
+/* ------------------------------------------------------------------------- *
+ * Optional native IO: default inert
+ * ------------------------------------------------------------------------- */
+
+test("native input and copies stay unoffered and completely inert without explicit callbacks", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel);
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3 });
+	await deadlined(viewer.ready, "ready");
+
+	const hello = decodeSessionContentFrame(channel.sent[0], BOUNDS);
+	assert.equal(hello.type, "hello");
+	if (hello.type !== "hello") throw new Error("unreachable");
+	assert.deepEqual(hello.capabilities, [SESSION_CONTENT_REQUIRED_CAPABILITY],
+		"the default hello offers only the required capability");
+	assert.equal(viewer.readNativeInputSource(), undefined, "no source exists without the extension");
+
+	const before = channel.sent.length;
+	deliverAll(channel, transfer(sampleFrame(), { subscriptionId: viewer.subscriptionId, sequence: 1 }));
+	assert.ok(viewer.readSnapshot(), "the legacy display path is untouched");
+	assert.equal(viewer.readNativeInputSource(), undefined, "a published source is not exposed without the extension");
+	assert.deepEqual(
+		await viewer.sendInput({ source: nativeSource(), inputModes: INPUT_MODES, kind: "keyboard", text: "a" }),
+		{ status: "not-sent", reason: "not-negotiated" },
+	);
+	assert.equal(channel.sent.length, before, "no unnegotiated input byte is written");
+
+	// An owner that publishes a native source this side never offered is refused.
+	const beginChannel = new FakeContentChannel();
+	scriptOwner(beginChannel);
+	const beginViewer = viewportViewer(beginChannel, { cols: 12, rows: 3 });
+	await deadlined(beginViewer.ready, "begin ready");
+	const built = transfer(sampleFrame(), {
+		subscriptionId: beginViewer.subscriptionId,
+		inputSource: nativeSource(),
+	});
+	beginChannel.deliver(built.frames[0] as Buffer);
+	await deadlined(beginViewer.closed, "closed after an unoffered source");
+	assert.equal(beginViewer.readSnapshot(), undefined);
+
+	// An owner that sends a copy this side never offered is refused too.
+	const copyChannel = new FakeContentChannel();
+	scriptOwner(copyChannel);
+	const copyViewer = viewportViewer(copyChannel, { cols: 12, rows: 3 });
+	await deadlined(copyViewer.ready, "copy ready");
+	const source = nativeSource();
+	// An ordinary display-only publish carries no source at all.
+	deliverAll(copyChannel, transfer(sampleFrame(), { subscriptionId: copyViewer.subscriptionId, sequence: 1 }));
+	assert.ok(copyViewer.readSnapshot(), "the legacy view is current before the copy arrives");
+	deliverAll(copyChannel, buildNativeCopyInline({
+		subscriptionId: copyViewer.subscriptionId,
+		copyId: "copy-1",
+		sequence: 1,
+		source,
+		dispatchId: 1,
+		event: copyEvent(source, "hello"),
+		bounds: BOUNDS,
+	}));
+	await deadlined(copyViewer.closed, "closed after an unnegotiated copy");
+	assert.equal(copyViewer.readSnapshot(), undefined, "the unnegotiated copy never became anything");
+	assert.equal(copyChannel.closeCalls, 1);
+});
+
+/* ------------------------------------------------------------------------- *
+ * Optional native IO: negotiated input
+ * ------------------------------------------------------------------------- */
+
+test("explicit callbacks offer and acknowledge the optional capability, and typed current inputs are submitted", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const authorized: NativeIoSource[] = [];
+	const viewer = viewportViewer(channel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({
+			authorizeInput: (expected) => {
+				authorized.push(expected);
+				return true;
+			},
+		}),
+	});
+	await deadlined(viewer.ready, "ready");
+
+	const hello = decodeSessionContentFrame(channel.sent[0], BOUNDS);
+	assert.equal(hello.type, "hello");
+	if (hello.type !== "hello") throw new Error("unreachable");
+	assert.deepEqual(hello.capabilities, [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY],
+		"only explicit callbacks offer the optional capability");
+
+	const source = nativeSource();
+	assert.equal(viewer.readNativeInputSource(), undefined, "no source before a source-carrying publish");
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "\x1b[A" }),
+		{ status: "not-sent", reason: "not-ready" },
+		"nothing is queued before a current source exists",
+	);
+
+	publishSource(channel, viewer, source, 1);
+	const current = viewer.readNativeInputSource();
+	assert.ok(current, "the current published source is exposed");
+	assert.deepEqual(current, source);
+	assert.ok(isFrozenDeep(current), "the exposed source is immutable end to end");
+
+	authorized.length = 0;
+	let before = channel.sent.length;
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "\x1b[A" }),
+		{ status: "submitted" },
+	);
+	let frames = channel.frames().slice(before);
+	assert.equal(frames.length, 1);
+	const keyboard = frames[0];
+	if (keyboard.type !== "input") throw new Error("unreachable");
+	assert.equal(keyboard.subscriptionId, viewer.subscriptionId);
+	assert.equal(keyboard.kind, "keyboard");
+	assert.equal(keyboard.ordinal, 1);
+	assert.deepEqual(keyboard.inputModes, INPUT_MODES);
+	assert.deepEqual(keyboard.source, source);
+	assert.equal(Buffer.from(keyboard.data, "base64").toString("utf8"), "\x1b[A");
+	assert.ok(authorized.length >= 2, "the guard runs at admission and again immediately before the write");
+	for (const expected of authorized) assert.deepEqual(expected, source);
+
+	// A canonical content-space SGR mouse report travels as its own inline packet.
+	before = channel.sent.length;
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "mouse", text: "\x1b[<0;5;3M" }),
+		{ status: "submitted" },
+	);
+	frames = channel.frames().slice(before);
+	const mouse = frames[0];
+	if (mouse.type !== "input") throw new Error("unreachable");
+	assert.equal(mouse.kind, "mouse");
+	assert.equal(Buffer.from(mouse.data, "base64").toString("utf8"), "\x1b[<0;5;3M");
+	assert.equal(mouse.ordinal, 2, "dispatch ordinals stay positive and monotonic per binding");
+
+	// A small paste fits one inline packet and keeps its exact UTF-8 body.
+	before = channel.sent.length;
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "paste", text: "h\u00e9llo \u4e16\u754c" }),
+		{ status: "submitted" },
+	);
+	frames = channel.frames().slice(before);
+	const paste = frames[0];
+	if (paste.type !== "input") throw new Error("unreachable");
+	assert.equal(paste.kind, "paste");
+	assert.equal(Buffer.from(paste.data, "base64").toString("utf8"), "h\u00e9llo \u4e16\u754c");
+
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("stale source, stale modes, and a refusing or throwing guard refuse before any write", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	let allow = true;
+	let throwGuard = false;
+	const viewer = viewportViewer(channel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({
+			authorizeInput: () => {
+				if (throwGuard) throw new Error("synthetic guard fault");
+				return allow;
+			},
+		}),
+	});
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+	const before = channel.sent.length;
+
+	const cases: ReadonlyArray<{ readonly label: string; readonly request: SessionContentViewerInputRequest; readonly reason: NativeInputNotSentReason }> = [
+		{
+			label: "another owner run",
+			request: { source: nativeSource({ hostRunId: OTHER_RUN }), inputModes: INPUT_MODES, kind: "keyboard", text: "a" },
+			reason: "stale-source",
+		},
+		{
+			label: "another owner row",
+			request: { source: nativeSource({ sessionId: OTHER_ROW }), inputModes: INPUT_MODES, kind: "keyboard", text: "a" },
+			reason: "stale-source",
+		},
+		{
+			label: "another native epoch",
+			request: {
+				source: nativeSource({ nativeSession: { sessionId: NATIVE_SESSION.sessionId, epoch: NATIVE_SESSION.epoch + 1 } }),
+				inputModes: INPUT_MODES,
+				kind: "keyboard",
+				text: "a",
+			},
+			reason: "stale-source",
+		},
+		{
+			label: "another geometry revision",
+			request: { source: nativeSource({ geometry: { cols: 12, rows: 3, revision: 1 } }), inputModes: INPUT_MODES, kind: "keyboard", text: "a" },
+			reason: "stale-source",
+		},
+		{
+			label: "another viewer revision",
+			request: { source: nativeSource({ viewerRevision: 2 }), inputModes: INPUT_MODES, kind: "keyboard", text: "a" },
+			reason: "stale-source",
+		},
+		{
+			label: "another source token",
+			request: { source: nativeSource({ sourceToken: "token-B" }), inputModes: INPUT_MODES, kind: "keyboard", text: "a" },
+			reason: "stale-source",
+		},
+		{
+			label: "another input mode snapshot",
+			request: { source, inputModes: { ...INPUT_MODES, bracketedPaste: true }, kind: "paste", text: "a" },
+			reason: "stale-modes",
+		},
+		{
+			label: "a malformed source",
+			request: {
+				source: { ...source, nativeSession: null } as unknown as NativeIoSource,
+				inputModes: INPUT_MODES,
+				kind: "keyboard",
+				text: "a",
+			},
+			reason: "invalid-input",
+		},
+		{
+			label: "empty text",
+			request: { source, inputModes: INPUT_MODES, kind: "keyboard", text: "" },
+			reason: "invalid-input",
+		},
+		{
+			label: "non-canonical mouse bytes",
+			request: { source, inputModes: INPUT_MODES, kind: "mouse", text: "\x1b[M !!" },
+			reason: "invalid-input",
+		},
+	];
+	for (const entry of cases) {
+		assert.deepEqual(await viewer.sendInput(entry.request), { status: "not-sent", reason: entry.reason }, entry.label);
+	}
+	assert.equal(channel.sent.length, before, "no refused input writes a single byte");
+
+	allow = false;
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "a" }),
+		{ status: "not-sent", reason: "unauthorized" },
+		"a guard that is not exactly true refuses the input",
+	);
+	allow = true;
+	throwGuard = true;
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "a" }),
+		{ status: "not-sent", reason: "unauthorized" },
+		"a throwing guard refuses the input",
+	);
+	throwGuard = false;
+	assert.equal(channel.sent.length, before);
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("a bounded paste pages atomically, preserves Unicode, and refuses one byte above its bound", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+
+	const text = "\u4e16\u754c".repeat(20_000);
+	const bytes = Buffer.from(text, "utf8");
+	assert.ok(bytes.length > BOUNDS.maxChunkPayloadBytes, "the paste is larger than one raw chunk");
+	let before = channel.sent.length;
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "paste", text }),
+		{ status: "submitted" },
+	);
+	let frames = channel.frames().slice(before);
+	const begin = frames[0];
+	if (begin.type !== "input_begin") throw new Error("unreachable");
+	const end = frames[frames.length - 1];
+	if (end.type !== "input_end") throw new Error("unreachable");
+	assert.equal(begin.kind, "paste");
+	assert.equal(begin.byteLength, bytes.length);
+	assert.equal(begin.chunkCount, frames.length - 2);
+	assert.equal(end.ordinal, begin.ordinal, "every page names the one dispatch ordinal");
+	assert.equal(end.inputId, begin.inputId, "every page names the one input id");
+	const assembled: Buffer[] = [];
+	frames.slice(1, -1).forEach((frame, index) => {
+		if (frame.type !== "input_chunk") throw new Error("unreachable");
+		assert.equal(frame.index, index, "chunk indexes are zero-based and contiguous");
+		assert.equal(frame.inputId, begin.inputId);
+		assert.equal(frame.subscriptionId, viewer.subscriptionId);
+		assembled.push(Buffer.from(frame.data, "base64"));
+	});
+	assert.deepEqual(Buffer.concat(assembled), bytes, "the Unicode text body survives the pages exactly");
+
+	// Exactly 1 MiB of decoded UTF-8 is accepted whole.
+	const exact = "a".repeat(1_048_576);
+	before = channel.sent.length;
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "paste", text: exact }),
+		{ status: "submitted" },
+	);
+	frames = channel.frames().slice(before);
+	const exactBegin = frames[0];
+	if (exactBegin.type !== "input_begin") throw new Error("unreachable");
+	assert.equal(exactBegin.byteLength, 1_048_576);
+	assert.equal(frames[frames.length - 1]?.type, "input_end");
+
+	// One byte above the decoded text bound is refused before any frame exists.
+	before = channel.sent.length;
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "paste", text: "a".repeat(1_048_577) }),
+		{ status: "not-sent", reason: "too-large" },
+	);
+	assert.equal(channel.sent.length, before, "an oversized paste writes nothing and is never truncated");
+
+	// Repeating one input creates a new logical packet, never a duplicate page.
+	before = channel.sent.length;
+	for (const text of ["x", "x"]) {
+		assert.deepEqual(await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text }), { status: "submitted" });
+	}
+	frames = channel.frames().slice(before);
+	assert.equal(frames.length, 2, "each submission is its own single packet");
+	const firstInput = frames[0];
+	const secondInput = frames[1];
+	if (firstInput.type !== "input" || secondInput.type !== "input") throw new Error("unreachable");
+	assert.notEqual(firstInput.inputId, secondInput.inputId);
+	assert.ok(secondInput.ordinal > firstInput.ordinal);
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("logical inputs are ordered, bounded at four pending operations, and never interleave pages", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+	const before = channel.sent.length;
+
+	channel.holdSend = true;
+	const paste = "\u4e16\u754c".repeat(20_000);
+	const first = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "paste", text: paste });
+	const second = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "b" });
+	const third = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "c" });
+	const fourth = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "d" });
+	await settle();
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "e" }),
+		{ status: "not-sent", reason: "busy" },
+		"the fifth logical operation is refused while four are pending",
+	);
+	const started = channel.types().slice(before).filter((type) => type === "input_begin" || type === "input");
+	assert.equal(started.length, 1, "only the first frame of the first operation reached the transport");
+
+	channel.releaseSends();
+	for (const pending of [first, second, third, fourth]) {
+		assert.deepEqual(await deadlined(pending, "queued input"), { status: "submitted" });
+	}
+	const frames = channel.frames().slice(before);
+	const types = frames.map((frame) => frame.type);
+	const endIndex = types.indexOf("input_end");
+	assert.ok(endIndex > 1, "the paste really paged");
+	assert.equal(types[0], "input_begin");
+	assert.ok(types.slice(1, endIndex).every((type) => type === "input_chunk"),
+		"the paste's pages are contiguous");
+	assert.deepEqual(types.slice(endIndex + 1), ["input", "input", "input"],
+		"each later input is one inline packet after the paste finished, never interleaved");
+	assert.equal(types.filter((type) => type === "input_end").length, 1, "no page is replayed");
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("a source change between pages, a rejected write, and a stop never become a false not-sent", async () => {
+	// A source change between the pages of one paste is unknown, not unsent.
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+	const next = nativeSource({ viewerRevision: 2, sourceToken: "token-B" });
+	let injected = false;
+	chainSend(channel, (bytes) => {
+		if (injected) return;
+		const frame = decodeSessionContentFrame(bytes, BOUNDS);
+		if (frame.type !== "input_chunk") return;
+		injected = true;
+		publishSource(channel, viewer, next, 2);
+	});
+	assert.deepEqual(
+		await deadlined(viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "paste", text: "\u4e16\u754c".repeat(20_000) }), "paste across a source change"),
+		{ status: "unknown" },
+	);
+	assert.equal(injected, true, "the source really changed between pages");
+	assert.equal(channel.types().filter((type) => type === "input_end").length, 0,
+		"no later page is written once the source changed");
+	assert.equal(channel.types().filter((type) => type === "input_begin").length, 1);
+	await deadlined(viewer.stop(), "stop after the source change");
+
+	// A write that was invoked and rejected is unknown and is never retried.
+	const rejectedChannel = new FakeContentChannel();
+	scriptOwner(rejectedChannel, { ackNativeIo: true });
+	const rejectedViewer = viewportViewer(rejectedChannel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(rejectedViewer.ready, "rejected ready");
+	publishSource(rejectedChannel, rejectedViewer, source, 1);
+	const beforeReject = rejectedChannel.sent.length;
+	rejectedChannel.failNextSend = true;
+	assert.deepEqual(
+		await rejectedViewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "x" }),
+		{ status: "unknown" },
+		"an invoked rejection is never reported as definitely unsent",
+	);
+	assert.equal(rejectedChannel.sent.length, beforeReject, "the failed write is not replayed");
+	assert.equal(rejectedChannel.types().filter((type) => type === "input").length, 0);
+	await deadlined(rejectedViewer.stop(), "rejected stop");
+
+	// A stop while a page write is outstanding settles truthfully and writes no more.
+	const stopChannel = new FakeContentChannel();
+	scriptOwner(stopChannel, { ackNativeIo: true });
+	const stopViewer = viewportViewer(stopChannel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(stopViewer.ready, "stop ready");
+	publishSource(stopChannel, stopViewer, source, 1);
+	const beforeStop = stopChannel.sent.length;
+	stopChannel.holdSend = true;
+	const pendingPaste = stopViewer.sendInput({ source, inputModes: INPUT_MODES, kind: "paste", text: "\u4e16\u754c".repeat(20_000) });
+	await settle();
+	const stopping = stopViewer.stop();
+	assert.deepEqual(await deadlined(pendingPaste, "pending paste at stop"), { status: "unknown" },
+		"bytes already handed over are never called unsent");
+	await deadlined(stopping, "stop");
+	stopChannel.releaseSends();
+	await settle(10);
+	const written = stopChannel.types().slice(beforeStop)
+		.filter((type) => type === "input_begin" || type === "input_chunk" || type === "input" || type === "input_end");
+	assert.equal(written.length, 1, "no input frame is written after the stop intent");
+	// A submission after retirement is refused without inventing a write.
+	assert.deepEqual(
+		await stopViewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "y" }),
+		{ status: "not-sent", reason: "stopped" },
+	);
+});
+
+/* ------------------------------------------------------------------------- *
+ * Optional native IO: copies
+ * ------------------------------------------------------------------------- */
+
+test("an assembled native copy reaches only this endpoint's callback, whole and never partial or stale", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const copies: NativeIoCompletedCopy[] = [];
+	const viewer = viewportViewer(channel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({ onCopy: (copy) => copies.push(copy) }),
+	});
+	await deadlined(viewer.ready, "ready");
+	const sourceA = nativeSource();
+	publishSource(channel, viewer, sourceA, 1);
+
+	// Native input dispatch ids may arrive out of order; only the copy sequence orders.
+	deliverAll(channel, buildNativeCopyInline({
+		subscriptionId: viewer.subscriptionId,
+		copyId: "copy-1",
+		sequence: 1,
+		source: sourceA,
+		dispatchId: 2,
+		event: copyEvent(sourceA, "after input B"),
+		bounds: BOUNDS,
+	}));
+	deliverAll(channel, buildNativeCopyInline({
+		subscriptionId: viewer.subscriptionId,
+		copyId: "copy-2",
+		sequence: 2,
+		source: sourceA,
+		dispatchId: 1,
+		event: copyEvent(sourceA, "after input A"),
+		bounds: BOUNDS,
+	}));
+	assert.deepEqual(copies.map((copy) => copy.dispatchId), [2, 1],
+		"an asynchronous copy from an earlier input is still delivered");
+	assert.deepEqual(copies.map((copy) => copy.sequence), [1, 2],
+		"emission order is the copy sequence, never the dispatch id");
+	// Nothing is ever echoed to the transport: no OSC 52, no clipboard frame.
+	assert.equal(channel.types().filter((type) => type === "copy" || type === "input").length, 0,
+		"a received copy is never re-emitted on any wire");
+
+	const encoded = Buffer.alloc(75_000, 0x41).toString("base64");
+	assert.equal(encoded.length, 100_000, "the unchanged native producer text bound");
+	const paged = buildNativeCopyPaged({
+		subscriptionId: viewer.subscriptionId,
+		copyId: "copy-3",
+		sequence: 3,
+		source: sourceA,
+		dispatchId: 3,
+		encoded,
+		bounds: BOUNDS,
+	});
+	assert.ok(paged.chunkCount > 1, "the full producer bound pages across bounded chunks");
+	channel.deliver(paged.frames[0] as Buffer);
+	for (let index = 1; index < paged.frames.length - 1; index += 1) channel.deliver(paged.frames[index] as Buffer);
+	assert.equal(copies.length, 2, "a partial copy never reaches the callback");
+	channel.deliver(paged.frames[paged.frames.length - 1] as Buffer);
+	assert.equal(copies.length, 3, "exactly one callback after the completing end");
+	const delivered = copies[2];
+	assert.ok(delivered);
+	assert.equal(delivered.copyId, "copy-3");
+	assert.equal(delivered.sequence, 3);
+	assert.equal(delivered.dispatchId, 3);
+	assert.equal(delivered.source.sourceToken, sourceA.sourceToken);
+	if (delivered.event.kind !== "copy") throw new Error("unreachable");
+	assert.equal(delivered.event.encoded, encoded, "the whole 100000-character payload is carried, never reduced");
+	assert.equal(delivered.event.encoded.includes("\x1b"), false, "no OSC or escape bytes are ever handed over");
+	assert.ok(isFrozenDeep(delivered));
+
+	// A copy for a source this endpoint never published is consumed and withheld.
+	deliverAll(channel, buildNativeCopyInline({
+		subscriptionId: viewer.subscriptionId,
+		copyId: "copy-4",
+		sequence: 4,
+		source: nativeSource({ sourceToken: "token-old" }),
+		dispatchId: 4,
+		event: copyEvent(sourceA, "stale"),
+		bounds: BOUNDS,
+	}));
+	assert.equal(copies.length, 3, "a stale source is never routed");
+
+	// A partial copy spanning an ordinary source change is discarded whole.
+	const sourceB = nativeSource({ viewerRevision: 2, sourceToken: "token-B" });
+	const spanning = buildNativeCopyPaged({
+		subscriptionId: viewer.subscriptionId,
+		copyId: "copy-5",
+		sequence: 5,
+		source: sourceA,
+		dispatchId: 5,
+		encoded,
+		bounds: BOUNDS,
+	});
+	channel.deliver(spanning.frames[0] as Buffer);
+	channel.deliver(spanning.frames[1] as Buffer);
+	publishSource(channel, viewer, sourceB, 2);
+	for (const bytes of spanning.frames.slice(2)) channel.deliver(bytes);
+	assert.equal(copies.length, 3, "a source change invalidates the partial copy");
+
+	// A -> B -> A never revives the old source's data.
+	const sourceA2 = nativeSource({ viewerRevision: 3, sourceToken: "token-C" });
+	publishSource(channel, viewer, sourceA2, 3);
+	deliverAll(channel, buildNativeCopyInline({
+		subscriptionId: viewer.subscriptionId,
+		copyId: "copy-6",
+		sequence: 6,
+		source: sourceA,
+		dispatchId: 6,
+		event: copyEvent(sourceA, "old A again"),
+		bounds: BOUNDS,
+	}));
+	assert.equal(copies.length, 3, "returning to a same-shape viewport does not revive old source bytes");
+	deliverAll(channel, buildNativeCopyInline({
+		subscriptionId: viewer.subscriptionId,
+		copyId: "copy-7",
+		sequence: 7,
+		source: sourceA2,
+		dispatchId: 7,
+		event: copyEvent(sourceA2, "current"),
+		bounds: BOUNDS,
+	}));
+	assert.equal(copies.length, 4, "the current source's own copy is still delivered");
+
+	// A retirement detaches the receiver, so a late end can never call back.
+	const late = buildNativeCopyPaged({
+		subscriptionId: viewer.subscriptionId,
+		copyId: "copy-8",
+		sequence: 8,
+		source: sourceA2,
+		dispatchId: 8,
+		encoded,
+		bounds: BOUNDS,
+	});
+	channel.deliver(late.frames[0] as Buffer);
+	await deadlined(viewer.stop(), "stop mid-copy");
+	for (const bytes of late.frames.slice(1)) channel.deliver(bytes);
+	assert.equal(copies.length, 4, "a retired endpoint never receives a copy");
+});
+
+test("an incomplete, malformed, or foreign copy never reaches the callback and fails the channel closed", async () => {
+	// A copy that stops arriving is bounded by the existing transfer idle deadline.
+	const timeoutChannel = new FakeContentChannel();
+	scriptOwner(timeoutChannel, { ackNativeIo: true });
+	const timeoutCopies: NativeIoCompletedCopy[] = [];
+	const timeoutViewer = viewportViewer(timeoutChannel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({ onCopy: (copy) => timeoutCopies.push(copy) }),
+	});
+	await deadlined(timeoutViewer.ready, "timeout ready");
+	const source = nativeSource();
+	publishSource(timeoutChannel, timeoutViewer, source, 1);
+	const paged = buildNativeCopyPaged({
+		subscriptionId: timeoutViewer.subscriptionId,
+		copyId: "copy-timeout",
+		sequence: 1,
+		source,
+		dispatchId: 1,
+		encoded: Buffer.from("partial text", "utf8").toString("base64"),
+		bounds: BOUNDS,
+	});
+	timeoutChannel.deliver(paged.frames[0] as Buffer);
+	await deadlined(timeoutViewer.closed, "copy assembly deadline");
+	assert.deepEqual(timeoutCopies, [], "an incomplete copy never reaches the callback");
+	assert.equal(timeoutChannel.closeCalls, 1, "the current channel is closed, nothing remote is stopped");
+
+	// A chunk with no begin is a malformed copy transfer.
+	const malformedChannel = new FakeContentChannel();
+	scriptOwner(malformedChannel, { ackNativeIo: true });
+	const malformedCopies: NativeIoCompletedCopy[] = [];
+	const malformedViewer = viewportViewer(malformedChannel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({ onCopy: (copy) => malformedCopies.push(copy) }),
+	});
+	await deadlined(malformedViewer.ready, "malformed ready");
+	publishSource(malformedChannel, malformedViewer, source, 1);
+	malformedChannel.deliver({
+		type: "copy_chunk",
+		subscriptionId: malformedViewer.subscriptionId,
+		copyId: "copy-orphan",
+		index: 0,
+		data: Buffer.from("a", "utf8").toString("base64"),
+	});
+	await deadlined(malformedViewer.closed, "malformed copy refusal");
+	assert.deepEqual(malformedCopies, []);
+
+	// A copy whose producer tuple disagrees with its source is refused, never merged.
+	const mixedChannel = new FakeContentChannel();
+	scriptOwner(mixedChannel, { ackNativeIo: true });
+	const mixedCopies: NativeIoCompletedCopy[] = [];
+	const mixedViewer = viewportViewer(mixedChannel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({ onCopy: (copy) => mixedCopies.push(copy) }),
+	});
+	await deadlined(mixedViewer.ready, "mixed ready");
+	publishSource(mixedChannel, mixedViewer, source, 1);
+	// Encoded directly so the protocol's own coherence check is what refuses it.
+	mixedChannel.deliver(Buffer.from(JSON.stringify({
+		type: "copy",
+		subscriptionId: mixedViewer.subscriptionId,
+		copyId: "copy-mixed",
+		sequence: 1,
+		source,
+		dispatchId: 1,
+		event: {
+			kind: "copy",
+			encoded: Buffer.from("mixed", "utf8").toString("base64"),
+			sessionId: "another-native-conversation",
+			sessionEpoch: source.nativeSession.epoch,
+		},
+	}), "utf8"));
+	await deadlined(mixedViewer.closed, "mixed source copy refusal");
+	assert.deepEqual(mixedCopies, []);
+
+	// A copy naming another subscription is never silently adopted.
+	const foreignChannel = new FakeContentChannel();
+	scriptOwner(foreignChannel, { ackNativeIo: true });
+	const foreignCopies: NativeIoCompletedCopy[] = [];
+	const foreignViewer = viewportViewer(foreignChannel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({ onCopy: (copy) => foreignCopies.push(copy) }),
+	});
+	await deadlined(foreignViewer.ready, "foreign ready");
+	publishSource(foreignChannel, foreignViewer, source, 1);
+	deliverAll(foreignChannel, buildNativeCopyInline({
+		subscriptionId: "foreign-copy-subscription",
+		copyId: "copy-foreign",
+		sequence: 1,
+		source,
+		dispatchId: 1,
+		event: copyEvent(source, "foreign"),
+		bounds: BOUNDS,
+	}));
+	await deadlined(foreignViewer.closed, "foreign copy refusal");
+	assert.deepEqual(foreignCopies, []);
+});
+
+test("an ordinary viewport text update with an unchanged native source keeps input eligible", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "a" }),
+		{ status: "submitted" },
+	);
+	// The visible text changes; the semantic source does not.
+	publishSource(channel, viewer, source, 2, textVariant("updated text"));
+	assert.deepEqual(viewer.readNativeInputSource(), source, "a text-only update keeps the same current source");
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "b" }),
+		{ status: "submitted" },
+	);
+	assert.equal(channel.types().filter((type) => type === "input").length, 2);
+	await deadlined(viewer.stop(), "stop");
+});
+
+/* ------------------------------------------------------------------------- *
+ * Optional native IO: caller-callback and source-lifetime regressions
+ * ------------------------------------------------------------------------- */
+
+test("a guard that stops the endpoint from the pre-write check never lets the input reach the transport", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	let calls = 0;
+	let viewer: SessionContentViewer;
+	viewer = viewportViewer(channel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({
+			authorizeInput: () => {
+				calls += 1;
+				// The pre-write evaluation (`calls === 2`) stops the endpoint and still
+				// answers `true`: the endpoint must not trust that answer.
+				if (calls === 2) void viewer.stop();
+				return true;
+			},
+		}),
+	});
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+	const before = channel.sent.length;
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "a" }),
+		{ status: "not-sent", reason: "stopped" },
+		"an operation stopped before its first write is truthfully unsent",
+	);
+	assert.equal(calls, 2, "the guard ran at admission and again before the write");
+	const writtenInput = channel.types().slice(before)
+		.filter((type) => type === "input" || type === "input_begin" || type === "input_chunk" || type === "input_end");
+	assert.deepEqual(writtenInput, [], "no input reaches the transport");
+	await deadlined(viewer.closed, "closed");
+});
+
+test("a guard that publishes another source from the pre-write check never lets the input reach the transport", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const next = nativeSource({ viewerRevision: 2, sourceToken: "token-B" });
+	let calls = 0;
+	let viewer: SessionContentViewer;
+	viewer = viewportViewer(channel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({
+			authorizeInput: () => {
+				calls += 1;
+				// The pre-write evaluation publishes a different source and returns `true`.
+				if (calls === 2) publishSource(channel, viewer, next, 2);
+				return true;
+			},
+		}),
+	});
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+	const before = channel.sent.length;
+	assert.deepEqual(
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "a" }),
+		{ status: "not-sent", reason: "stale-source" },
+	);
+	assert.deepEqual(channel.types().slice(before), [], "the invalidated input is never handed to the transport");
+	assert.deepEqual(viewer.readNativeInputSource(), next, "the newer source is the current one");
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("a source change while an inline input write is outstanding reports unknown", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+	const next = nativeSource({ viewerRevision: 2, sourceToken: "token-B" });
+
+	channel.holdSend = true;
+	const pending = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "x" });
+	await settle();
+	assert.equal(channel.types().filter((type) => type === "input").length, 1,
+		"the inline write was invoked and is still outstanding");
+
+	publishSource(channel, viewer, next, 2);
+	channel.releaseSends();
+	assert.deepEqual(await deadlined(pending, "held inline input"), { status: "unknown" },
+		"an invoked write invalidated by a later source never reports submitted");
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("a source change while the final paste write is outstanding reports unknown", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+	const next = nativeSource({ viewerRevision: 2, sourceToken: "token-B" });
+	let changed = false;
+	chainSend(channel, (bytes) => {
+		if (changed) return;
+		const frame = decodeSessionContentFrame(bytes, BOUNDS);
+		if (frame.type !== "input_end") return;
+		changed = true;
+		// The final page has already been handed over when this runs; the operation
+		// must not then be reported as submitted.
+		publishSource(channel, viewer, next, 2);
+	});
+	const before = channel.sent.length;
+	assert.deepEqual(
+		await deadlined(
+			viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "paste", text: "\u4e16\u754c".repeat(20_000) }),
+			"paste invalidated at its last page",
+		),
+		{ status: "unknown" },
+	);
+	assert.equal(changed, true, "the source really changed while the last page was in flight");
+	const types = channel.types().slice(before);
+	assert.equal(types.filter((type) => type === "input_begin").length, 1);
+	assert.equal(types.filter((type) => type === "input_end").length, 1, "the final page is written exactly once");
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("an ordinary text-only publication does not invalidate an input that is already streaming", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+
+	channel.holdSend = true;
+	const pending = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "paste", text: "\u4e16\u754c".repeat(20_000) });
+	await settle();
+	// Same semantic source and modes: only the visible text moved.
+	publishSource(channel, viewer, source, 2, textVariant("streaming text"));
+	channel.releaseSends();
+	assert.deepEqual(await deadlined(pending, "text-only publication"), { status: "submitted" },
+		"ordinary output does not deny typing on the same source");
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("an exact A to B to A source return never delivers the old partial copy", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const copies: NativeIoCompletedCopy[] = [];
+	const viewer = viewportViewer(channel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({ onCopy: (copy) => copies.push(copy) }),
+	});
+	await deadlined(viewer.ready, "ready");
+	const sourceA = nativeSource();
+	publishSource(channel, viewer, sourceA, 1);
+
+	const encoded = Buffer.alloc(75_000, 0x41).toString("base64");
+	const paged = buildNativeCopyPaged({
+		subscriptionId: viewer.subscriptionId,
+		copyId: "copy-1",
+		sequence: 1,
+		source: sourceA,
+		dispatchId: 1,
+		encoded,
+		bounds: BOUNDS,
+	});
+	channel.deliver(paged.frames[0] as Buffer);
+	channel.deliver(paged.frames[1] as Buffer);
+	// B is another source lifetime, and then the exact original A returns.
+	publishSource(channel, viewer, nativeSource({ viewerRevision: 2, sourceToken: "token-B" }), 2);
+	publishSource(channel, viewer, sourceA, 3);
+	assert.deepEqual(viewer.readNativeInputSource(), sourceA, "the exact original source is current again");
+	for (const bytes of paged.frames.slice(2)) channel.deliver(bytes);
+	assert.deepEqual(copies, [],
+		"the old pages are withheld even though the current source compares equal");
+
+	// A fresh copy under the current lifetime is still delivered.
+	deliverAll(channel, buildNativeCopyInline({
+		subscriptionId: viewer.subscriptionId,
+		copyId: "copy-2",
+		sequence: 2,
+		source: sourceA,
+		dispatchId: 2,
+		event: copyEvent(sourceA, "fresh"),
+		bounds: BOUNDS,
+	}));
+	assert.equal(copies.length, 1, "a new copy on the current lifetime still reaches the callback");
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("an input queued behind a held control write is not sent after an exact A to B to A change", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	const sourceA = nativeSource();
+	publishSource(channel, viewer, sourceA, 1);
+	const before = channel.sent.length;
+
+	// A resize write occupies the ordered writer and is deliberately left unsettled.
+	channel.holdSend = true;
+	viewer.resize(90, 30);
+	await settle();
+	assert.equal(channel.types().slice(before).filter((type) => type === "resize").length, 1,
+		"the resize write is invoked and outstanding");
+
+	// The input is admitted while A is current, but its write is still queued behind it.
+	const pending = viewer.sendInput({ source: sourceA, inputModes: INPUT_MODES, kind: "keyboard", text: "x" });
+	await settle();
+	assert.equal(channel.types().slice(before).filter((type) => type === "input").length, 0,
+		"the input write has not reached the transport yet");
+
+	// Exact A -> B -> A while the input is queued: present equality is restored, but the
+	// semantic generation advanced at B.
+	publishSource(channel, viewer, nativeSource({ viewerRevision: 2, sourceToken: "token-B" }), 2);
+	publishSource(channel, viewer, sourceA, 3);
+	assert.deepEqual(viewer.readNativeInputSource(), sourceA, "the exact original source is current again");
+
+	channel.releaseSends();
+	assert.deepEqual(
+		await deadlined(pending, "queued input after A to B to A"),
+		{ status: "not-sent", reason: "stale-source" },
+		"the writer refuses the obsolete bytes instead of invoking the transport",
+	);
+	assert.equal(channel.types().slice(before).filter((type) => type === "input").length, 0,
+		"no input frame reaches the transport");
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("an exact A to B to A published inside the authorization callback is never admitted", async () => {
+	// Admission-time transition: there is no pending operation to invalidate yet, so
+	// only the semantic generation can prove it happened.
+	const admissionChannel = new FakeContentChannel();
+	scriptOwner(admissionChannel, { ackNativeIo: true });
+	const admissionSource = nativeSource();
+	let admissionViewer: SessionContentViewer;
+	let publishAba: (() => void) | null = null;
+	admissionViewer = viewportViewer(admissionChannel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({
+			authorizeInput: () => {
+				publishAba?.();
+				publishAba = null;
+				return true;
+			},
+		}),
+	});
+	await deadlined(admissionViewer.ready, "admission ready");
+	publishSource(admissionChannel, admissionViewer, admissionSource, 1);
+	publishAba = (): void => {
+		publishSource(admissionChannel, admissionViewer, nativeSource({ viewerRevision: 2, sourceToken: "token-B" }), 2);
+		publishSource(admissionChannel, admissionViewer, admissionSource, 3);
+	};
+	const beforeAdmission = admissionChannel.sent.length;
+	assert.deepEqual(
+		await admissionViewer.sendInput({ source: admissionSource, inputModes: INPUT_MODES, kind: "keyboard", text: "x" }),
+		{ status: "not-sent", reason: "stale-source" },
+		"admission-time A to B to A is refused by generation, not by present equality",
+	);
+	assert.equal(admissionChannel.types().slice(beforeAdmission).filter((type) => type === "input").length, 0,
+		"nothing is admitted or written");
+	await deadlined(admissionViewer.stop(), "admission stop");
+
+	// Pre-write transition: the operation exists, and the writer must still refuse.
+	const prewriteChannel = new FakeContentChannel();
+	scriptOwner(prewriteChannel, { ackNativeIo: true });
+	const prewriteSource = nativeSource();
+	let calls = 0;
+	let prewriteViewer: SessionContentViewer;
+	prewriteViewer = viewportViewer(prewriteChannel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({
+			authorizeInput: () => {
+				calls += 1;
+				if (calls === 2) {
+					publishSource(prewriteChannel, prewriteViewer, nativeSource({ viewerRevision: 2, sourceToken: "token-B" }), 2);
+					publishSource(prewriteChannel, prewriteViewer, prewriteSource, 3);
+				}
+				return true;
+			},
+		}),
+	});
+	await deadlined(prewriteViewer.ready, "pre-write ready");
+	publishSource(prewriteChannel, prewriteViewer, prewriteSource, 1);
+	const beforePrewrite = prewriteChannel.sent.length;
+	assert.deepEqual(
+		await prewriteViewer.sendInput({ source: prewriteSource, inputModes: INPUT_MODES, kind: "keyboard", text: "x" }),
+		{ status: "not-sent", reason: "stale-source" },
+		"pre-write A to B to A is refused before the transport is invoked",
+	);
+	assert.equal(prewriteChannel.types().slice(beforePrewrite).filter((type) => type === "input").length, 0,
+		"no input frame reaches the transport");
+	await deadlined(prewriteViewer.stop(), "pre-write stop");
 });

@@ -364,15 +364,24 @@ function createMarkerObserver(
           reject(new Error(`marker wait is already active for owned signal root ${root}`));
           return;
         }
-        const timer = setTimeout(() => {
+        const deadline = Date.now() + timeoutMs;
+        const expire = (): void => {
           const current = waiter;
           if (!current) return;
+          // Timer delivery alone does not prove this clock's deadline passed.
+          // If it arrived early, retain the same absolute deadline and ownership.
+          const remaining = deadline - Date.now();
+          if (remaining > 0) {
+            current.timer = setTimeout(expire, remaining);
+            return;
+          }
           waiter = undefined;
           releaseTimers(current);
           current.reject(new Error(
             `complete "caught" marker did not arrive before the deadline: ${marker} under ${root}`,
           ));
-        }, timeoutMs);
+        };
+        const timer = setTimeout(expire, timeoutMs);
         // Second, equivalent observation path for exactly as long as this wait
         // is pending: a completed marker must not be missed solely because the
         // platform coalesced or dropped its watch notification. This never

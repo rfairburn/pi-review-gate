@@ -18,9 +18,18 @@
  * is in flight with one newest-wins pending snapshot, authorization is
  * re-checked before every frame, and a stalled write or a lost source retires
  * local resources truthfully instead of claiming settled cleanup.
+ *
+ * The native input and text-copy extension (#481 path) is asserted the same way:
+ * it is inert unless an explicit opt-in, a real provider seam, and a peer offer
+ * all line up; an echoed source is re-proved against the CURRENT owner facts so a
+ * stale or incomplete input hands over zero bytes and poisons nothing after it;
+ * every packet is translated once by the owner's own translator; one text paste of
+ * up to exactly 1 MiB is atomic; and a native copy reaches only the viewer whose
+ * own input caused it, whole, on the one serialized writer, never as a PTY write.
  */
 
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import test from "node:test";
 import type {
@@ -30,12 +39,20 @@ import type {
 	SessionViewerUpdate,
 	SessionViewerUpdateResult,
 } from "../src/session-host/instances";
+import { translateInput } from "../src/session-host/input";
+import type { NativeClipboardEvent } from "../src/session-host/native-clipboard";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import type {
+	NativeViewerClipboardReceipt,
+	NativeViewerClipboardSink,
+	NativeViewerInputRequest,
+	NativeViewerInputResult,
+	NativeViewerInputSource,
 	OwningHostInventorySnapshot,
 	OwningHostSessionContentListener,
 	OwningHostSessionContentSnapshot,
 	OwningHostSessionContentWatch,
+	OwningHostViewerOptions,
 } from "../src/session-host/owning-host-service";
 import type { PeerKey } from "../src/session-host/network/identity";
 import type { PeerAppLane } from "../src/session-host/network/protocol";
@@ -53,13 +70,25 @@ import {
 } from "../src/session-host/network/session-content-host";
 import {
 	DEFAULT_SESSION_CONTENT_BOUNDS,
+	NATIVE_COPY_MAX_ENCODED_CHARS,
+	NATIVE_TEXT_PASTE_MAX_BYTES,
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
+	buildNativeInputInline,
+	buildNativeInputPaste,
+	createNativeCopyAssembler,
 	createSessionContentTransferAssembler,
 	decodeSessionContentFrame,
 	encodeSessionContentFrame,
+	isSessionContentProtocolError,
+	nativeIoSourceEquals,
+	type NativeIoBuiltTransfer,
+	type NativeIoCompletedCopy,
+	type NativeIoInputKind,
+	type NativeIoSource,
 	type SessionContentBounds,
 	type SessionContentFrame,
 	type SessionContentHelloFrame,
@@ -329,7 +358,7 @@ interface FakeRow {
 	cols: number;
 	rows: number;
 	revision: number;
-	readonly nativeSession: SessionHostNativeSession;
+	nativeSession: SessionHostNativeSession;
 }
 
 interface FakeViewer {
@@ -384,6 +413,17 @@ class FakeContentSource implements SessionContentSource {
 	readonly installedRowIds: string[] = [];
 	readonly updateCalls: Array<{ readonly viewerId: string; readonly update: SessionViewerUpdate }> = [];
 	readonly closedViewerIds: string[] = [];
+	/** The copy sink each surface registered with, as the manager keeps it. */
+	readonly viewerSinks = new Map<string, NativeViewerClipboardSink>();
+	/** Every `openViewer` argument, in order, to prove the default stays option-free. */
+	readonly openViewerOptions: Array<OwningHostViewerOptions | undefined> = [];
+	/**
+	 * Every handoff this source was asked for, in order. This is the strictest
+	 * observable: an endpoint that invoked the seam with stale facts is itself
+	 * wrong, whether or not the fake's own fence then refused it.
+	 */
+	readonly inputWrites: Array<{ readonly viewerId: string; readonly data: string | Buffer }> = [];
+	readonly #sourceTokens = new Map<string, string>();
 	/** Every release this source was asked for, in order, successful or not. */
 	readonly closeViewerAttempts: string[] = [];
 	readonly builtSnapshots: OwningHostSessionContentSnapshot[] = [];
@@ -400,6 +440,15 @@ class FakeContentSource implements SessionContentSource {
 	throwOnCloseViewer = false;
 	/** Fail the unsubscribe the source hands back with its watch. */
 	throwOnUnsubscribe = false;
+	/**
+	 * Faithful manager notification: a viewer change notifies a content change only for
+	 * a row whose canonical geometry actually MOVED. The real manager takes a row's
+	 * size as the minimum over the viewers that display it, so a sibling holding a
+	 * smaller size leaves the row exactly as it is and its watch stays silent even
+	 * though the changed viewer's own revision moved. Off by default, so every
+	 * pre-existing test keeps exactly the emissions it was written against.
+	 */
+	emitOnlyOnCanonicalChange = false;
 	/** Runs after a viewer is allocated, before it is handed back to the endpoint. */
 	openViewerHook: (() => void) | undefined;
 	/** Publish the install snapshot under a different owner run. */
@@ -408,9 +457,17 @@ class FakeContentSource implements SessionContentSource {
 	updateHook: ((rowId: string) => void) | undefined;
 	/** Runs before `watchSessionContent` returns, as a retained source change would. */
 	installHook: ((rowId: string) => void) | undefined;
+	/** The input modes every capture reports; a test changes them to model the child. */
+	inputModes: TerminalInputModes = INPUT_MODES;
+	/** Report that no surface can take input right now, as teardown or no seam would. */
+	inputUnavailable = false;
+	/** Force every handoff outcome, as a manager that refuses or loses track would. */
+	inputWriteOutcome: NativeViewerInputResult | undefined;
+	inputReads = 0;
 	#nextViewerId = 1;
 	#sequence = 0;
 	#inventoryRevision = 0;
+	#nextToken = 1;
 
 	constructor(runId = RUN_ID) {
 		this.runId = runId;
@@ -489,8 +546,9 @@ class FakeContentSource implements SessionContentSource {
 		return Object.freeze({ snapshot, unsubscribe });
 	}
 
-	openViewer(): SessionViewerState | undefined {
+	openViewer(options?: OwningHostViewerOptions): SessionViewerState | undefined {
 		this.events.push("openViewer");
+		this.openViewerOptions.push(options);
 		if (this.viewerUnavailable) return undefined;
 		const viewer: FakeViewer = {
 			viewerId: `viewer-${this.#nextViewerId++}`,
@@ -500,6 +558,12 @@ class FakeContentSource implements SessionContentSource {
 			revision: 0,
 		};
 		this.viewers.set(viewer.viewerId, viewer);
+		// Exactly like the manager: the sink stays in the viewer's own record, and a
+		// surface registered without one can never become an input source.
+		if (options?.nativeClipboardSink !== undefined) {
+			this.viewerSinks.set(viewer.viewerId, options.nativeClipboardSink);
+			this.#sourceTokens.set(viewer.viewerId, `token-${this.#nextToken++}`);
+		}
 		const hook = this.openViewerHook;
 		if (hook !== undefined) {
 			this.openViewerHook = undefined;
@@ -528,8 +592,15 @@ class FakeContentSource implements SessionContentSource {
 		if (update.rows !== undefined) viewer.rows = update.rows;
 		viewer.revision += 1;
 		this.events.push(`updateViewer:${viewerId}`);
-		for (const rowId of this.#affectedRows(previousSession, viewer.sessionId)) this.#recompute(rowId);
-		for (const rowId of this.#affectedRows(previousSession, viewer.sessionId)) this.emit(rowId);
+		const moved: string[] = [];
+		for (const rowId of this.#affectedRows(previousSession, viewer.sessionId)) {
+			if (this.#recompute(rowId)) moved.push(rowId);
+		}
+		for (const rowId of this.#affectedRows(previousSession, viewer.sessionId)) {
+			// The real manager notifies only a row whose canonical geometry moved; the
+			// default emits as this fake always has, so existing tests are untouched.
+			if (moved.includes(rowId) || !this.emitOnlyOnCanonicalChange) this.emit(rowId);
+		}
 		const hook = this.updateHook;
 		if (hook !== undefined) {
 			this.updateHook = undefined;
@@ -546,12 +617,93 @@ class FakeContentSource implements SessionContentSource {
 		const viewer = this.viewers.get(viewerId);
 		if (viewer === undefined) return false;
 		this.viewers.delete(viewerId);
+		this.viewerSinks.delete(viewerId);
+		this.#sourceTokens.delete(viewerId);
 		this.closedViewerIds.push(viewerId);
 		if (viewer.sessionId !== undefined) {
-			this.#recompute(viewer.sessionId);
-			this.emit(viewer.sessionId);
+			const moved = this.#recompute(viewer.sessionId);
+			if (moved || !this.emitOnlyOnCanonicalChange) this.emit(viewer.sessionId);
 		}
 		return true;
+	}
+
+	/* --------------------------------------------------------------------- *
+	 * Strict viewer input seam (#481 path), modeled the way the manager fences it
+	 * --------------------------------------------------------------------- */
+
+	/** The CURRENT owner-private input scope of one surface, or undefined. */
+	readViewerInputSource(viewerId: string): NativeViewerInputSource | undefined {
+		this.inputReads += 1;
+		if (this.inputUnavailable) return undefined;
+		const viewer = this.viewers.get(viewerId);
+		if (viewer === undefined || viewer.sessionId === undefined) return undefined;
+		// A surface with no copy sink of its own is never an input source.
+		if (!this.viewerSinks.has(viewerId)) return undefined;
+		const row = this.rows.get(viewer.sessionId);
+		if (row === undefined) return undefined;
+		return Object.freeze({
+			hostRunId: this.runId,
+			viewerId,
+			viewerRevision: viewer.revision,
+			rowId: row.id,
+			nativeSession: Object.freeze({ sessionId: row.nativeSession.sessionId, epoch: row.nativeSession.epoch }),
+			geometry: Object.freeze({ cols: row.cols, rows: row.rows, revision: row.revision }),
+			registrationIdentity: `registration-${viewerId}`,
+			registrationGeneration: `generation-${viewerId}`,
+			sourceToken: this.#sourceTokens.get(viewerId) ?? `token-rotated-${viewerId}`,
+		});
+	}
+
+	/** The one handoff: every current fact is re-checked before it is "submitted". */
+	writeViewerInput(viewerId: string, request: NativeViewerInputRequest): NativeViewerInputResult {
+		this.inputWrites.push({ viewerId, data: request.data });
+		if (this.inputWriteOutcome !== undefined) return this.inputWriteOutcome;
+		const current = this.readViewerInputSource(viewerId);
+		if (current === undefined) return { status: "refused", reason: "no-input-source" };
+		if (!sameScopeFacts(current, request.expectedSource)) return { status: "refused", reason: "stale-source" };
+		if (!sameModesFacts(this.inputModes, request.expectedInputModes)) {
+			return { status: "refused", reason: "stale-input-modes" };
+		}
+		if (request.data.length === 0) return { status: "refused", reason: "invalid-input" };
+		return { status: "submitted" };
+	}
+
+	/** Deliver a native copy on one surface's own bound sink, as the manager would. */
+	emitCopy(viewerId: string, event: NativeClipboardEvent, dispatchId: number): void {
+		const source = this.readViewerInputSource(viewerId);
+		assert.ok(source !== undefined, "the viewer must have a current input scope");
+		const receipt: NativeViewerClipboardReceipt = Object.freeze({ source, event, dispatchId });
+		this.sinkFor(viewerId)(receipt);
+	}
+
+	/** Deliver an arbitrary receipt to one surface's sink, as a hostile caller could. */
+	sinkFor(viewerId: string): NativeViewerClipboardSink {
+		const sink = this.viewerSinks.get(viewerId);
+		assert.ok(sink !== undefined, "the endpoint must have registered this viewer's own sink");
+		return sink;
+	}
+
+	/** Replace a surface's host-minted token, as a re-registration would. */
+	rotateSourceToken(viewerId: string): void {
+		this.#sourceTokens.set(viewerId, `token-${this.#nextToken++}`);
+	}
+
+	/** Start a new native conversation on one row, changing every tuple fact. */
+	rotateNativeSession(rowId: string): void {
+		const row = this.rows.get(rowId);
+		assert.ok(row !== undefined);
+		row.nativeSession = {
+			sessionId: `conversation-${rowId}-next`,
+			epoch: row.nativeSession.epoch + 1,
+			name: `Conversation ${rowId} next`,
+		};
+	}
+
+	/** Bump only a surface's revision, as an unrelated viewer change would. */
+	bumpViewerRevision(viewerId: string): void {
+		const viewer = this.viewers.get(viewerId);
+		assert.ok(viewer !== undefined);
+		viewer.revision += 1;
 	}
 
 	/** One live change to every watch of `rowId`, as the manager's hook would. */
@@ -616,7 +768,7 @@ class FakeContentSource implements SessionContentSource {
 			sequence: this.#sequence,
 			geometry: Object.freeze({ cols: row.cols, rows: row.rows, revision: row.revision }),
 			frame: Object.freeze(styledViewport(row.cols, row.rows)),
-			inputModes: INPUT_MODES,
+			inputModes: this.inputModes,
 		});
 		this.builtSnapshots.push(snapshot);
 		return snapshot;
@@ -638,18 +790,19 @@ class FakeContentSource implements SessionContentSource {
 	 * With no such viewer the row keeps its last canonical geometry: zero viewers
 	 * is not a size, and the endpoint's own arrival must never touch a sibling.
 	 */
-	#recompute(rowId: string): void {
+	#recompute(rowId: string): boolean {
 		const row = this.rows.get(rowId);
-		if (row === undefined) return;
+		if (row === undefined) return false;
 		const contributions = [...this.viewers.values()]
 			.filter((viewer) => viewer.sessionId === rowId && viewer.cols !== undefined && viewer.rows !== undefined);
-		if (contributions.length === 0) return;
+		if (contributions.length === 0) return false;
 		const cols = Math.min(...contributions.map((viewer) => viewer.cols as number));
 		const rows = Math.min(...contributions.map((viewer) => viewer.rows as number));
-		if (cols === row.cols && rows === row.rows) return;
+		if (cols === row.cols && rows === row.rows) return false;
 		row.cols = cols;
 		row.rows = rows;
 		row.revision += 1;
+		return true;
 	}
 }
 
@@ -677,6 +830,7 @@ function createHarness(options: {
 		readonly stopAckTimeoutMs?: number;
 	};
 	readonly authorizePeer?: (peerKey: PeerKey) => boolean;
+	readonly nativeIo?: boolean;
 } = {}): Harness {
 	const source = options.source ?? new FakeContentSource();
 	const channel = new ContentChannel();
@@ -685,6 +839,7 @@ function createHarness(options: {
 	const allow = { value: true };
 	const host = createSessionContentHost({
 		source,
+		nativeIo: options.nativeIo,
 		authorizePeer: options.authorizePeer ?? (() => allow.value),
 		bounds: options.bounds,
 		timeouts: { ...FAST_TIMEOUTS, ...options.timeouts },
@@ -789,6 +944,237 @@ async function openHello(harness: Harness, overrides: Partial<SessionContentHell
 	harness.channel.deliver(helloFrame(overrides));
 	await settle();
 	assert.equal(harness.binding.subscribed, false);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Native IO helpers (#481 path) — every frame here is built by the protocol's
+ * own builders, so the tests exercise the real wire shape.
+ * ------------------------------------------------------------------------- */
+
+const NATIVE_IO_CAPABILITIES = [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY] as const;
+
+const SGR_MOUSE_MODES: TerminalInputModes = Object.freeze({
+	...INPUT_MODES,
+	mouseEncoding: "sgr",
+	mouseTracking: "any",
+});
+const X10_MOUSE_MODES: TerminalInputModes = Object.freeze({
+	...INPUT_MODES,
+	mouseEncoding: "default",
+	mouseTracking: "any",
+});
+/** A child with no kitty protocol, no bracketed paste, and no application cursor keys. */
+const PLAIN_TEXT_MODES: TerminalInputModes = Object.freeze({
+	...INPUT_MODES,
+	kittyFlags: 0,
+	modifyOtherKeys: 0,
+	bracketedPaste: false,
+	applicationCursorKeys: false,
+});
+
+function sameScopeFacts(left: NativeViewerInputSource, right: NativeViewerInputSource): boolean {
+	return left.hostRunId === right.hostRunId
+		&& left.viewerId === right.viewerId
+		&& left.viewerRevision === right.viewerRevision
+		&& left.rowId === right.rowId
+		&& left.nativeSession.sessionId === right.nativeSession.sessionId
+		&& left.nativeSession.epoch === right.nativeSession.epoch
+		&& left.geometry.cols === right.geometry.cols
+		&& left.geometry.rows === right.geometry.rows
+		&& left.geometry.revision === right.geometry.revision
+		&& left.registrationIdentity === right.registrationIdentity
+		&& left.registrationGeneration === right.registrationGeneration
+		&& left.sourceToken === right.sourceToken;
+}
+
+function sameModesFacts(left: TerminalInputModes, right: TerminalInputModes): boolean {
+	return left.kittyFlags === right.kittyFlags
+		&& left.modifyOtherKeys === right.modifyOtherKeys
+		&& left.bracketedPaste === right.bracketedPaste
+		&& left.applicationCursorKeys === right.applicationCursorKeys
+		&& left.mouseEncoding === right.mouseEncoding
+		&& left.mouseTracking === right.mouseTracking;
+}
+
+/** A source view that provides none of the native IO primitives. */
+function displayOnlySource(source: FakeContentSource): SessionContentSource {
+	return {
+		watchSessionContent: (rowId, listener) => source.watchSessionContent(rowId, listener),
+		readInventorySnapshot: () => source.readInventorySnapshot(),
+		openViewer: () => source.openViewer(),
+		readViewer: (viewerId) => source.readViewer(viewerId),
+		updateViewer: (viewerId, update) => source.updateViewer(viewerId, update),
+		closeViewer: (viewerId) => source.closeViewer(viewerId),
+	};
+}
+
+/** A hello from a peer that offered the optional extension. */
+function nativeIoHello(overrides: Partial<SessionContentHelloFrame> = {}): Partial<SessionContentHelloFrame> {
+	return { capabilities: [...NATIVE_IO_CAPABILITIES], ...overrides };
+}
+
+/** Hello on a negotiated channel, asserting the acknowledgement carried the offer. */
+async function openNativeHello(harness: Harness): Promise<void> {
+	harness.channel.deliver(helloFrame(nativeIoHello()));
+	await settle();
+	assert.deepEqual(
+		onlyFrameOfType(harness.channel.frames(), "hello_ack").capabilities,
+		NATIVE_IO_CAPABILITIES,
+		"an explicit opt-in with a real provider acknowledges the peer's own offer",
+	);
+}
+
+/** The input source carried by the last published viewport, if any. */
+function publishedSource(channel: ContentChannel): NativeIoSource | null | undefined {
+	const begin = framesOfType(channel.frames(), "content_begin").at(-1);
+	assert.ok(begin !== undefined, "a viewport must have been published");
+	return begin.inputSource;
+}
+
+/** Subscribe a negotiated binding and return the source this endpoint published. */
+async function subscribeNative(harness: Harness, overrides: Partial<SessionContentSubscribeFrame> = {}): Promise<NativeIoSource> {
+	harness.channel.deliver(subscribeFrame(harness.source, overrides));
+	await settle();
+	assert.equal(harness.binding.subscribed, true, "the native IO subscription must be live");
+	const published = publishedSource(harness.channel);
+	assert.ok(published !== null && published !== undefined, "a negotiated publish carries the input source");
+	return published;
+}
+
+/** The CURRENT wire source of one surface, exactly as its owner sees it. */
+function wireSourceOf(source: FakeContentSource, viewerId: string): NativeIoSource {
+	const scope = source.readViewerInputSource(viewerId);
+	assert.ok(scope !== undefined, "the surface must have a current input scope");
+	return {
+		hostRunId: scope.hostRunId,
+		sessionId: scope.rowId,
+		nativeSession: { sessionId: scope.nativeSession.sessionId, epoch: scope.nativeSession.epoch },
+		geometry: { cols: scope.geometry.cols, rows: scope.geometry.rows, revision: scope.geometry.revision },
+		viewerRevision: scope.viewerRevision,
+		sourceToken: scope.sourceToken,
+	};
+}
+
+/** A syntactically valid source for a surface that never existed here. */
+function foreignWireSource(overrides: Partial<NativeIoSource> = {}): NativeIoSource {
+	return {
+		hostRunId: OTHER_RUN,
+		sessionId: "row-z",
+		nativeSession: { sessionId: "conversation-row-z", epoch: 1 },
+		geometry: { cols: 80, rows: 24, revision: 0 },
+		viewerRevision: 1,
+		sourceToken: "token-foreign",
+		...overrides,
+	};
+}
+
+function deliverBuilt(channel: ContentChannel, built: NativeIoBuiltTransfer): void {
+	for (const frame of built.frames) channel.deliverBytes(frame);
+}
+
+/** Send one complete inline input through the protocol's own builder. */
+function sendNativeInput(channel: ContentChannel, send: {
+	readonly source: NativeIoSource;
+	readonly kind: NativeIoInputKind;
+	readonly data: string;
+	readonly ordinal: number;
+	readonly subscriptionId?: string;
+	readonly inputModes?: TerminalInputModes;
+	readonly inputId?: string;
+}): void {
+	deliverBuilt(channel, buildNativeInputInline({
+		subscriptionId: send.subscriptionId ?? "sub-1",
+		inputId: send.inputId ?? randomUUID(),
+		ordinal: send.ordinal,
+		source: send.source,
+		inputModes: send.inputModes ?? INPUT_MODES,
+		kind: send.kind,
+		data: send.data,
+		bounds: DEFAULT_SESSION_CONTENT_BOUNDS,
+	}));
+}
+
+/** Build one atomic paged paste; the caller decides which pages to deliver. */
+function buildPaste(send: {
+	readonly source: NativeIoSource;
+	readonly ordinal: number;
+	readonly text: string;
+	readonly subscriptionId?: string;
+	readonly inputModes?: TerminalInputModes;
+	readonly bounds?: SessionContentBounds;
+}): NativeIoBuiltTransfer {
+	return buildNativeInputPaste({
+		subscriptionId: send.subscriptionId ?? "sub-1",
+		inputId: randomUUID(),
+		ordinal: send.ordinal,
+		source: send.source,
+		inputModes: send.inputModes ?? INPUT_MODES,
+		text: send.text,
+		bounds: send.bounds ?? DEFAULT_SESSION_CONTENT_BOUNDS,
+	});
+}
+
+/** Reassemble every native copy emission a peer actually received. */
+function assembledCopies(frames: readonly SessionContentFrame[]): NativeIoCompletedCopy[] {
+	const assembler = createNativeCopyAssembler(DEFAULT_SESSION_CONTENT_BOUNDS);
+	const copies: NativeIoCompletedCopy[] = [];
+	for (const frame of frames) {
+		if (frame.type !== "copy" && frame.type !== "copy_begin" && frame.type !== "copy_chunk"
+			&& frame.type !== "copy_end") continue;
+		const copy = assembler.accept(frame);
+		if (copy !== undefined) copies.push(copy);
+	}
+	return copies;
+}
+
+/** Copies received since `mark` frames were written, so sequences stay fresh. */
+function copiesSince(channel: ContentChannel, mark: number): NativeIoCompletedCopy[] {
+	return assembledCopies(channel.frames().slice(mark));
+}
+
+function copyEventOf(text: string, rowId = "row-a"): NativeClipboardEvent {
+	return {
+		kind: "copy",
+		encoded: Buffer.from(text, "utf8").toString("base64"),
+		sessionId: `conversation-${rowId}`,
+		sessionEpoch: 3,
+	};
+}
+
+function decodedCopy(copy: NativeIoCompletedCopy): string {
+	assert.equal(copy.event.kind, "copy");
+	if (copy.event.kind !== "copy") return "";
+	return Buffer.from(copy.event.encoded, "base64").toString("utf8");
+}
+
+/** The bytes this endpoint handed to the child, as text. */
+function handedText(source: FakeContentSource, index = 0): string {
+	const write = source.inputWrites[index];
+	assert.ok(write !== undefined, "a handoff must have happened");
+	return typeof write.data === "string" ? write.data : Buffer.from(write.data).toString("utf8");
+}
+
+/**
+ * A live native IO subscription whose child reports `modes`, with the source this
+ * endpoint published. The caller owns the returned harness and must stop it.
+ */
+async function openInputCase(
+	modes: TerminalInputModes,
+	geometry: { readonly cols?: number; readonly rows?: number } = {},
+): Promise<{
+	readonly source: FakeContentSource;
+	readonly harness: Harness;
+	readonly published: NativeIoSource;
+}> {
+	const source = new FakeContentSource();
+	const cols = geometry.cols ?? 80;
+	const rows = geometry.rows ?? 24;
+	source.addRow("row-a", cols, rows);
+	source.inputModes = modes;
+	const harness = createHarness({ source, nativeIo: true });
+	await openNativeHello(harness);
+	const published = await subscribeNative(harness, { cols, rows });
+	return { source, harness, published };
 }
 
 /* ------------------------------------------------------------------------- *
@@ -2806,5 +3192,1380 @@ test("stopAll reports uncertainty latched by a binding it never swept", async ()
 	} finally {
 		source.refuseViewerCloseIds.clear();
 		await host.stopAll().catch(() => undefined);
+	}
+});
+
+/* ------------------------------------------------------------------------- *
+ * Native input and native copy (#481 path)
+ * ------------------------------------------------------------------------- */
+
+test("native input and copy are inert without an explicit opt-in, however a peer greets it", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source });
+	try {
+		await openHello(harness, nativeIoHello());
+		assert.deepEqual(
+			onlyFrameOfType(harness.channel.frames(), "hello_ack").capabilities,
+			[SESSION_CONTENT_REQUIRED_CAPABILITY],
+			"a peer's offer alone never activates this endpoint",
+		);
+		harness.channel.deliver(subscribeFrame(source));
+		await settle();
+		assert.ok(harness.binding.viewerId !== null);
+		assert.equal(source.openViewerOptions.length, 1);
+		assert.equal(source.openViewerOptions[0], undefined, "a display-only viewer is registered with no options at all");
+		assert.equal(source.viewerSinks.size, 0, "no copy sink is registered");
+		assert.equal(source.inputReads, 0, "the input seam is never consulted");
+		assert.equal(
+			"inputSource" in onlyFrameOfType(harness.channel.frames(), "content_begin"),
+			false,
+			"a legacy publish keeps its exact key set",
+		);
+		sendNativeInput(harness.channel, { source: foreignWireSource(), kind: "keyboard", data: "a", ordinal: 1 });
+		await settle();
+		assert.equal(framesOfType(harness.channel.frames(), "error").at(-1)?.code, "bad_frame");
+		assert.equal(harness.channel.closeCalls, 1, "an unnegotiated extension frame retires this content lane only");
+		assert.equal(source.inputWrites.length, 0);
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+
+	// An opt-in whose injected source provides none of the primitives is no offer:
+	// this peer never sees a capability, a source, or a sink.
+	const plainChannel = new ContentChannel();
+	source.events = plainChannel.events;
+	const plainHost = createSessionContentHost({
+		source: displayOnlySource(source),
+		nativeIo: true,
+		authorizePeer: () => true,
+		timeouts: FAST_TIMEOUTS,
+	});
+	try {
+		plainHost.attach(plainChannel);
+		plainChannel.deliver(helloFrame(nativeIoHello()));
+		await settle();
+		assert.deepEqual(
+			onlyFrameOfType(plainChannel.frames(), "hello_ack").capabilities,
+			[SESSION_CONTENT_REQUIRED_CAPABILITY],
+			"an opt-in with no provider behind it is no offer",
+		);
+		plainChannel.deliver(subscribeFrame(source, { subscriptionId: "sub-plain" }));
+		await settle();
+		assert.equal(source.viewerSinks.size, 0);
+		assert.equal(source.inputReads, 0);
+		assert.equal("inputSource" in onlyFrameOfType(plainChannel.frames(), "content_begin"), false);
+		assert.equal(source.inputWrites.length, 0);
+	} finally {
+		await plainHost.stopAll().catch(() => undefined);
+	}
+
+	// The opt-in itself is validated before any channel exists.
+	assert.throws(
+		() => createSessionContentHost({ source, authorizePeer: () => true, nativeIo: "yes" as unknown as boolean }),
+		(error: unknown) => error instanceof TypeError,
+	);
+});
+
+test("an explicit opt-in acknowledges only an offering peer, on one viewer with its own sink", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	// This host opted in, but a peer that never offered the extension keeps the
+	// exact display-only channel it always had.
+	const legacy = createHarness({ source, nativeIo: true });
+	try {
+		await openHello(legacy);
+		assert.deepEqual(
+			onlyFrameOfType(legacy.channel.frames(), "hello_ack").capabilities,
+			[SESSION_CONTENT_REQUIRED_CAPABILITY],
+		);
+		legacy.channel.deliver(subscribeFrame(source, { subscriptionId: "sub-legacy" }));
+		await settle();
+		assert.equal(source.viewerSinks.size, 0, "a legacy subscription registers no copy sink");
+		assert.equal(source.inputReads, 0, "a legacy subscription never consults the input seam");
+		assert.equal("inputSource" in onlyFrameOfType(legacy.channel.frames(), "content_begin"), false);
+		sendNativeInput(legacy.channel, {
+			source: foreignWireSource(),
+			subscriptionId: "sub-legacy",
+			kind: "keyboard",
+			data: "a",
+			ordinal: 1,
+		});
+		await settle();
+		assert.equal(framesOfType(legacy.channel.frames(), "error").at(-1)?.code, "bad_frame");
+		assert.equal(legacy.channel.closeCalls, 1);
+		assert.equal(source.inputWrites.length, 0);
+	} finally {
+		await legacy.host.stopAll().catch(() => undefined);
+	}
+
+	// The same host and source, with a peer that did offer it.
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		const published = await subscribeNative(harness);
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		assert.equal(source.viewers.size, 1, "exactly one viewer for this binding");
+		assert.deepEqual([...source.viewerSinks.keys()], [viewerId], "the sink is bound to this endpoint's own viewer");
+		assert.ok(source.openViewerOptions.at(-1)?.nativeClipboardSink !== undefined);
+		const scope = source.readViewerInputSource(viewerId);
+		assert.ok(scope !== undefined);
+		assert.equal(published.hostRunId, scope.hostRunId);
+		assert.equal(published.sessionId, scope.rowId);
+		assert.equal(published.nativeSession.sessionId, scope.nativeSession.sessionId);
+		assert.equal(published.nativeSession.epoch, scope.nativeSession.epoch);
+		assert.deepEqual(published.geometry, {
+			cols: scope.geometry.cols,
+			rows: scope.geometry.rows,
+			revision: scope.geometry.revision,
+		});
+		assert.equal(published.viewerRevision, scope.viewerRevision);
+		assert.equal(published.sourceToken, scope.sourceToken);
+		// Owner-private facts never cross the wire.
+		const wire = JSON.stringify(published);
+		assert.equal(wire.includes("registration-"), false, "registration identity never crosses the wire");
+		assert.equal(wire.includes("generation-"), false, "registration generation never crosses the wire");
+		assert.equal(wire.includes(viewerId), false, "the owner's viewer id never crosses the wire");
+		assert.equal(Object.hasOwn(published, "viewerId"), false);
+		assert.equal(Object.hasOwn(published, "registrationIdentity"), false);
+		assert.equal(Object.hasOwn(published, "registrationGeneration"), false);
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("input admission re-proves every echoed source fact against the CURRENT owner facts", async () => {
+	const mutations: Array<{ readonly name: string; readonly mutate: (published: NativeIoSource) => NativeIoSource }> = [
+		{ name: "another host run", mutate: (published) => ({ ...published, hostRunId: OTHER_RUN }) },
+		{ name: "another owner row", mutate: (published) => ({ ...published, sessionId: "row-b" }) },
+		{
+			name: "another native conversation",
+			mutate: (published) => ({ ...published, nativeSession: { ...published.nativeSession, sessionId: "conversation-row-b" } }),
+		},
+		{
+			name: "a retired conversation epoch",
+			mutate: (published) => ({ ...published, nativeSession: { ...published.nativeSession, epoch: published.nativeSession.epoch + 1 } }),
+		},
+		{
+			name: "a stale geometry revision",
+			mutate: (published) => ({ ...published, geometry: { ...published.geometry, revision: published.geometry.revision + 1 } }),
+		},
+		{
+			name: "dimensions that were never published",
+			mutate: (published) => ({ ...published, geometry: { ...published.geometry, cols: published.geometry.cols - 1 } }),
+		},
+		{ name: "a stale viewer revision", mutate: (published) => ({ ...published, viewerRevision: published.viewerRevision + 1 }) },
+		{ name: "a rotated source token", mutate: (published) => ({ ...published, sourceToken: "token-rotated" }) },
+		{ name: "a wholly foreign scope", mutate: () => foreignWireSource() },
+	];
+	for (const mutation of mutations) {
+		const source = new FakeContentSource();
+		source.addRow("row-a", 80, 24);
+		source.addRow("row-b", 90, 30);
+		const harness = createHarness({ source, nativeIo: true });
+		try {
+			await openNativeHello(harness);
+			const published = await subscribeNative(harness);
+			sendNativeInput(harness.channel, {
+				source: mutation.mutate(published),
+				kind: "keyboard",
+				data: "a",
+				ordinal: 1,
+			});
+			await settle();
+			assert.equal(source.inputWrites.length, 0, `${mutation.name}: no byte reaches a child`);
+			assert.ok(harness.diagnostics.includes("input_refused"), `${mutation.name}: the refusal is diagnosed`);
+			assert.equal(
+				framesOfType(harness.channel.frames(), "error").length,
+				0,
+				`${mutation.name}: ordinary staleness is never a protocol failure`,
+			);
+			assert.equal(harness.binding.subscribed, true, `${mutation.name}: the refusal leaves the subscription usable`);
+			assert.equal(harness.channel.closeCalls, 0);
+			// The refusal never poisons the valid input that follows it.
+			const viewerId = harness.binding.viewerId;
+			assert.ok(viewerId !== null);
+			sendNativeInput(harness.channel, { source: wireSourceOf(source, viewerId), kind: "keyboard", data: "b", ordinal: 2 });
+			await settle();
+			assert.equal(source.inputWrites.length, 1, `${mutation.name}: the CURRENT scope is still admitted`);
+			assert.equal(source.inputWrites[0]?.viewerId, viewerId, `${mutation.name}: only this endpoint's own surface`);
+			assert.equal(handedText(harness.source), "b");
+		} finally {
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+});
+
+test("an old viewport, conversation, mode set, or surface revision never retargets input", async () => {
+	interface LifecycleCase {
+		readonly name: string;
+		readonly change: (harness: Harness) => void | Promise<void>;
+		readonly staleModes?: TerminalInputModes;
+		readonly currentModes?: TerminalInputModes;
+		/** Whether this change moves the owner scope itself, or only the mode set. */
+		readonly sourceChanges?: boolean;
+	}
+	const modesWithoutPaste: TerminalInputModes = Object.freeze({ ...INPUT_MODES, bracketedPaste: false });
+	const cases: LifecycleCase[] = [
+		{
+			name: "a resize to a new viewport",
+			change: (harness) => {
+				harness.channel.deliver(resizeFrame({ cols: 60, rows: 20 }));
+			},
+		},
+		{
+			// Equal dimensions alone never identify a viewport: an A -> B -> A change
+			// differs by geometry revision and viewer revision, so old A is refused.
+			name: "an A -> B -> A resize back to the original dimensions",
+			change: async (harness) => {
+				harness.channel.deliver(resizeFrame({ cols: 60, rows: 20 }));
+				await settle();
+				harness.channel.deliver(resizeFrame({ cols: 80, rows: 24 }));
+			},
+		},
+		{
+			name: "a replaced native conversation",
+			change: (harness) => {
+				harness.source.rotateNativeSession("row-a");
+				harness.source.emit("row-a");
+			},
+		},
+		{
+			// The scope is identical; only the modes the child actually has differ, and
+			// that alone is enough to refuse a packet made for another mode set.
+			name: "input modes the packet was not made for",
+			change: (harness) => {
+				harness.source.inputModes = modesWithoutPaste;
+				harness.source.emit("row-a");
+			},
+			staleModes: INPUT_MODES,
+			currentModes: modesWithoutPaste,
+			sourceChanges: false,
+		},
+		{
+			name: "a surface re-registered under a new revision",
+			change: (harness) => {
+				const viewerId = harness.binding.viewerId;
+				assert.ok(viewerId !== null);
+				harness.source.bumpViewerRevision(viewerId);
+			},
+		},
+		{
+			name: "a rotated host-minted token",
+			change: (harness) => {
+				const viewerId = harness.binding.viewerId;
+				assert.ok(viewerId !== null);
+				harness.source.rotateSourceToken(viewerId);
+				harness.source.emit("row-a");
+			},
+		},
+	];
+	for (const lifecycleCase of cases) {
+		const source = new FakeContentSource();
+		source.addRow("row-a", 80, 24);
+		const harness = createHarness({ source, nativeIo: true });
+		try {
+			await openNativeHello(harness);
+			const stale = await subscribeNative(harness);
+			await settle();
+			await lifecycleCase.change(harness);
+			await settle();
+			const viewerId = harness.binding.viewerId;
+			assert.ok(viewerId !== null);
+			const current = wireSourceOf(source, viewerId);
+			if (lifecycleCase.sourceChanges === false) {
+				assert.equal(
+					JSON.stringify(current),
+					JSON.stringify(stale),
+					`${lifecycleCase.name}: the refusal below cannot rest on a scope change`,
+				);
+			} else {
+				assert.notEqual(
+					JSON.stringify(current),
+					JSON.stringify(stale),
+					`${lifecycleCase.name}: the scope really changed`,
+				);
+			}
+			sendNativeInput(harness.channel, {
+				source: stale,
+				kind: "keyboard",
+				data: "a",
+				ordinal: 1,
+				inputModes: lifecycleCase.staleModes ?? INPUT_MODES,
+			});
+			await settle();
+			assert.equal(source.inputWrites.length, 0, `${lifecycleCase.name}: zero PTY bytes`);
+			assert.ok(harness.diagnostics.includes("input_refused"), `${lifecycleCase.name}: diagnosed as a refusal`);
+			assert.equal(
+				framesOfType(harness.channel.frames(), "error").length,
+				0,
+				`${lifecycleCase.name}: staleness is never a protocol failure and never disconnects`,
+			);
+			assert.equal(harness.binding.subscribed, true);
+			sendNativeInput(harness.channel, {
+				source: current,
+				kind: "keyboard",
+				data: "b",
+				ordinal: 2,
+				inputModes: lifecycleCase.currentModes ?? INPUT_MODES,
+			});
+			await settle();
+			assert.equal(source.inputWrites.length, 1, `${lifecycleCase.name}: the CURRENT scope is admitted`);
+			assert.equal(handedText(source), "b");
+		} finally {
+			source.inputModes = INPUT_MODES;
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+});
+
+test("a source that cannot provide an input scope admits nothing and changes nothing", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		const published = await subscribeNative(harness);
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		source.inputUnavailable = true;
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "a", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "no seam means no handoff, never a guess");
+		assert.ok(harness.diagnostics.includes("input_refused"));
+		assert.equal(harness.binding.subscribed, true, "a refusal never retires the subscription");
+		assert.equal(framesOfType(harness.channel.frames(), "error").length, 0);
+		source.inputUnavailable = false;
+		// A handoff whose outcome is genuinely uncertain is reported as uncertain and
+		// never retried.
+		source.inputWriteOutcome = { status: "unknown" };
+		sendNativeInput(harness.channel, { source: wireSourceOf(source, viewerId), kind: "keyboard", data: "b", ordinal: 2 });
+		await settle();
+		assert.equal(source.inputWrites.length, 1, "an uncertain handoff is never retried");
+		assert.ok(harness.diagnostics.includes("input_uncertain"));
+		assert.equal(harness.binding.subscribed, true);
+		source.inputWriteOutcome = { status: "refused", reason: "input-unready" };
+		sendNativeInput(harness.channel, { source: wireSourceOf(source, viewerId), kind: "keyboard", data: "c", ordinal: 3 });
+		await settle();
+		assert.equal(source.inputWrites.length, 2, "a lower refusal is not retried either");
+		assert.equal(harness.binding.subscribed, true, "a lower refusal never stops an owner view or a session");
+		assert.equal(framesOfType(harness.channel.frames(), "error").length, 0);
+	} finally {
+		source.inputWriteOutcome = undefined;
+		source.inputUnavailable = false;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("native packets are translated exactly once by the owner's existing translator", async () => {
+	const viewport = { column: 0, row: 0, cols: 80, rows: 24 };
+	{
+		const { source, harness, published } = await openInputCase(INPUT_MODES);
+		try {
+			sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "hello there", ordinal: 1 });
+			await settle();
+			assert.equal(source.inputWrites.length, 1, "exactly one handoff per packet");
+			// The handoff is addressed by this binding's OWN viewer id, never by anything
+			// the peer echoed: that id is the only address the lower fence accepts.
+			assert.equal(source.inputWrites[0]?.viewerId, harness.binding.viewerId);
+			assert.equal(handedText(source), "hello there", "joined text is not a protocol packet");
+			// A legacy cursor packet is re-encoded for the child's own modes, not copied.
+			const cursor = "\u001b[A";
+			sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: cursor, ordinal: 2 });
+			await settle();
+			assert.equal(source.inputWrites.length, 2);
+			assert.equal(handedText(source, 1), translateInput(cursor, INPUT_MODES, viewport));
+			// Bracketed paste: the child's own mode decides whether the markers appear.
+			sendNativeInput(harness.channel, { source: published, kind: "paste", data: "line1\nline2", ordinal: 3 });
+			await settle();
+			assert.equal(handedText(source, 2), `\u001b[200~line1\nline2\u001b[201~`);
+		} finally {
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+	{
+		const { source, harness, published } = await openInputCase(PLAIN_TEXT_MODES);
+		try {
+			const cursor = "\u001b[A";
+			sendNativeInput(harness.channel, {
+				source: published, kind: "keyboard", data: cursor, ordinal: 1, inputModes: PLAIN_TEXT_MODES,
+			});
+			await settle();
+			assert.equal(handedText(source), translateInput(cursor, PLAIN_TEXT_MODES, viewport));
+			assert.notEqual(handedText(source), "\u001bOA", "the child's modes, not the source's, shape the bytes");
+			sendNativeInput(harness.channel, {
+				source: published, kind: "paste", data: "line1\nline2", ordinal: 2, inputModes: PLAIN_TEXT_MODES,
+			});
+			await settle();
+			assert.equal(handedText(source, 1), "line1\nline2", "a child without bracketed paste gets the text alone");
+		} finally {
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+	{
+		// A child reporting SGR mouse coordinates receives the canonical report.
+		const { source, harness, published } = await openInputCase(SGR_MOUSE_MODES);
+		try {
+			sendNativeInput(harness.channel, {
+				source: published, kind: "mouse", data: "\u001b[<0;5;3M", ordinal: 1, inputModes: SGR_MOUSE_MODES,
+			});
+			await settle();
+			assert.equal(source.inputWrites.length, 1);
+			assert.equal(handedText(source), "\u001b[<0;5;3M");
+			// A report outside the published viewport is refused quietly, and the next
+			// valid packet still works: a refusal is never a disconnect.
+			sendNativeInput(harness.channel, {
+				source: published, kind: "mouse", data: "\u001b[<0;500;3M", ordinal: 2, inputModes: SGR_MOUSE_MODES,
+			});
+			await settle();
+			assert.equal(source.inputWrites.length, 1, "nothing the child cannot use is written");
+			assert.ok(harness.diagnostics.includes("input_refused"));
+			assert.equal(framesOfType(harness.channel.frames(), "error").length, 0);
+			sendNativeInput(harness.channel, {
+				source: published, kind: "keyboard", data: "b", ordinal: 3, inputModes: SGR_MOUSE_MODES,
+			});
+			await settle();
+			assert.equal(source.inputWrites.length, 2);
+			assert.equal(handedText(source, 1), "b");
+		} finally {
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+	{
+		// A legacy X10 child: the translator's raw bytes cross unchanged, so a
+		// coordinate above 127 is never UTF-8 recoded.
+		const { source, harness, published } = await openInputCase(X10_MOUSE_MODES, { cols: 240, rows: 60 });
+		try {
+			sendNativeInput(harness.channel, {
+				source: published, kind: "mouse", data: "\u001b[<0;200;3M", ordinal: 1, inputModes: X10_MOUSE_MODES,
+			});
+			await settle();
+			assert.equal(source.inputWrites.length, 1);
+			const write = source.inputWrites[0];
+			assert.ok(write !== undefined);
+			assert.ok(Buffer.isBuffer(write.data), "a legacy report crosses as raw bytes, never as a JS string");
+			assert.deepEqual(write.data, Buffer.from([0x1b, 0x5b, 0x4d, 32, 232, 35]));
+			assert.equal(Buffer.isBuffer(write.data) ? write.data[4] : 0, 232, "a coordinate above 127 is never UTF-8 recoded");
+		} finally {
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+	// A mouse packet must already be one canonical SGR report: this is refused by the
+	// wire itself, so a legacy report or a key can never be relabeled as mouse input.
+	assert.throws(
+		() => buildNativeInputInline({
+			subscriptionId: "sub-1",
+			inputId: randomUUID(),
+			ordinal: 1,
+			source: foreignWireSource(),
+			inputModes: X10_MOUSE_MODES,
+			kind: "mouse",
+			data: "\u001b[M ghe",
+			bounds: DEFAULT_SESSION_CONTENT_BOUNDS,
+		}),
+		(error: unknown) => isSessionContentProtocolError(error) && error.code === "invalid_frame",
+	);
+});
+
+test("a paste body is preserved exactly, whatever control characters it contains", async () => {
+	// A paste is never reinterpreted as a keyboard packet. An embedded Escape, a
+	// literal bracketed-paste marker inside the text, a trailing escape, and control
+	// characters all survive translation byte for byte; the only thing the endpoint
+	// decides is the outer wrapper, and that follows the CHILD's own mode.
+	const bodies: readonly string[] = [
+		"plain text",
+		"esc\u001b[Ainside",
+		"marker \u001b[200~inside\u001b[201~ tail",
+		"trailing escape\u001b",
+		"tab\t, bell \u0007, nul \u0000, and \u00e9moji",
+	];
+	for (const modes of [INPUT_MODES, PLAIN_TEXT_MODES]) {
+		const { source, harness, published } = await openInputCase(modes);
+		try {
+			for (const [index, body] of bodies.entries()) {
+				sendNativeInput(harness.channel, {
+					source: published, kind: "paste", data: body, ordinal: index + 1, inputModes: modes,
+				});
+				await settle();
+				assert.equal(
+					source.inputWrites.length,
+					index + 1,
+					`${JSON.stringify(body)}: a paste is never refused as an unknown key`,
+				);
+				const expected = modes.bracketedPaste ? `\u001b[200~${body}\u001b[201~` : body;
+				assert.equal(
+					handedText(source, index),
+					expected,
+					`${JSON.stringify(body)}: body preserved with bracketedPaste=${String(modes.bracketedPaste)}`,
+				);
+			}
+			assert.equal(framesOfType(harness.channel.frames(), "error").length, 0);
+		} finally {
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+});
+
+test("one atomic native paste crosses whole at exactly 1 MiB and never partially", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		const published = await subscribeNative(harness);
+		// Exactly 1 MiB of decoded UTF-8 text, in multi-byte characters.
+		const whole = "\u4e16".repeat(349_525) + "a";
+		assert.equal(Buffer.byteLength(whole, "utf8"), NATIVE_TEXT_PASTE_MAX_BYTES);
+		const built = buildPaste({ source: published, ordinal: 1, text: whole });
+		assert.ok(built.frames.length > 3, "the paste really crosses as bounded pages");
+		deliverBuilt(harness.channel, built);
+		await settle(20);
+		assert.equal(source.inputWrites.length, 1, "the whole paste is handed over exactly once");
+		assert.equal(handedText(source), `\u001b[200~${whole}\u001b[201~`, "no character is truncated");
+		assert.equal(harness.binding.subscribed, true);
+		// One byte more is not expressible on this wire at all, so no partial paste can
+		// ever be built, sent, or half-written.
+		assert.throws(
+			() => buildPaste({ source: published, ordinal: 2, text: `${whole}x` }),
+			(error: unknown) => isSessionContentProtocolError(error) && error.code === "transfer_too_large",
+		);
+		assert.equal(source.inputWrites.length, 1, "an over-cap paste writes nothing at all");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+
+	// A missing page is refused whole: the partial text is never handed over.
+	const truncated = new FakeContentSource();
+	truncated.addRow("row-a", 80, 24);
+	const partial = createHarness({ source: truncated, nativeIo: true });
+	try {
+		await openNativeHello(partial);
+		const published = await subscribeNative(partial);
+		const built = buildPaste({ source: published, ordinal: 1, text: "x".repeat(40_000) });
+		assert.ok(built.frames.length >= 4);
+		partial.channel.deliverBytes(built.frames[0] ?? Buffer.alloc(0));
+		partial.channel.deliverBytes(built.frames[1] ?? Buffer.alloc(0));
+		partial.channel.deliverBytes(built.frames[built.frames.length - 1] ?? Buffer.alloc(0));
+		await settle();
+		assert.equal(truncated.inputWrites.length, 0, "a missing page never produces a partial paste");
+		assert.equal(framesOfType(partial.channel.frames(), "error").at(-1)?.code, "bad_frame");
+		assert.equal(partial.channel.closeCalls, 1, "a broken input assembly fails this content lane closed");
+		assert.equal(truncated.viewers.size, 0, "and retires this endpoint's own resources");
+	} finally {
+		await partial.host.stopAll().catch(() => undefined);
+	}
+
+	// A reordered page is refused whole as well.
+	const reordered = new FakeContentSource();
+	reordered.addRow("row-a", 80, 24);
+	const outOfOrder = createHarness({ source: reordered, nativeIo: true });
+	try {
+		await openNativeHello(outOfOrder);
+		const published = await subscribeNative(outOfOrder);
+		const built = buildPaste({ source: published, ordinal: 1, text: "y".repeat(40_000) });
+		outOfOrder.channel.deliverBytes(built.frames[0] ?? Buffer.alloc(0));
+		for (const frame of built.frames.slice(2)) outOfOrder.channel.deliverBytes(frame);
+		outOfOrder.channel.deliverBytes(built.frames[1] ?? Buffer.alloc(0));
+		await settle();
+		assert.equal(reordered.inputWrites.length, 0, "pages are never reassembled out of order");
+		assert.equal(framesOfType(outOfOrder.channel.frames(), "error").at(-1)?.code, "bad_frame");
+	} finally {
+		await outOfOrder.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a partial paste dies with the viewport it was made for and never blocks the next input", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		const stale = await subscribeNative(harness);
+		const built = buildPaste({ source: stale, ordinal: 1, text: "y".repeat(40_000) });
+		assert.ok(built.frames.length >= 4);
+		harness.channel.deliverBytes(built.frames[0] ?? Buffer.alloc(0));
+		harness.channel.deliverBytes(built.frames[1] ?? Buffer.alloc(0));
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "an incomplete paste is never handed over");
+		// The viewport changes underneath it.
+		harness.channel.deliver(resizeFrame({ cols: 60, rows: 20 }));
+		await settle();
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		// The remaining pages of the abandoned input are consumed and dropped quietly.
+		for (const frame of built.frames.slice(2)) harness.channel.deliverBytes(frame);
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "an abandoned paste is never resumed or completed");
+		assert.equal(
+			framesOfType(harness.channel.frames(), "error").length,
+			0,
+			"an ordinary staleness refusal never becomes a protocol failure",
+		);
+		assert.equal(harness.binding.subscribed, true);
+		assert.equal(harness.channel.closeCalls, 0);
+		// The new viewport takes input immediately.
+		sendNativeInput(harness.channel, { source: wireSourceOf(source, viewerId), kind: "keyboard", data: "b", ordinal: 2 });
+		await settle();
+		assert.equal(source.inputWrites.length, 1, "a stale refusal never poisons the valid input that follows");
+		assert.equal(handedText(source), "b");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a paste begun for a scope that is already stale never opens", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		const stale = await subscribeNative(harness);
+		// The owner viewport changes first, so this paste is stale before its first page.
+		harness.channel.deliver(resizeFrame({ cols: 60, rows: 20 }));
+		await settle();
+		const built = buildPaste({ source: stale, ordinal: 1, text: "y".repeat(40_000) });
+		for (const frame of built.frames) harness.channel.deliverBytes(frame);
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "a stale paste is refused whole, before any assembly opens");
+		assert.ok(harness.diagnostics.includes("input_refused"));
+		assert.equal(
+			framesOfType(harness.channel.frames(), "error").length,
+			0,
+			"staleness is never a protocol failure and never disconnects",
+		);
+		assert.equal(harness.binding.subscribed, true);
+		assert.equal(harness.channel.closeCalls, 0);
+		// The valid packet that follows has no open partial assembly to step over.
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		sendNativeInput(harness.channel, {
+			source: wireSourceOf(source, viewerId), kind: "keyboard", data: "b", ordinal: 2,
+		});
+		await settle();
+		assert.equal(source.inputWrites.length, 1, "an old paste cannot block a current packet");
+		assert.equal(handedText(source), "b");
+		assert.equal(harness.channel.closeCalls, 0, "nothing on either side became a protocol violation");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a paste cannot survive an input-mode change, even back to the modes it began with", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true });
+	const modesWithoutPaste: TerminalInputModes = Object.freeze({ ...INPUT_MODES, bracketedPaste: false });
+	try {
+		await openNativeHello(harness);
+		const published = await subscribeNative(harness);
+		const built = buildPaste({ source: published, ordinal: 1, text: "y".repeat(40_000) });
+		harness.channel.deliverBytes(built.frames[0] ?? Buffer.alloc(0));
+		harness.channel.deliverBytes(built.frames[1] ?? Buffer.alloc(0));
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "an incomplete paste is never handed over");
+		// Only the child's modes move, and then move back. The paste was made for the
+		// modes it began with, but its assembly was freed the moment they changed, so it
+		// cannot finish against a mode set that was observed and then restored.
+		source.inputModes = modesWithoutPaste;
+		source.emit("row-a");
+		await settle();
+		source.inputModes = INPUT_MODES;
+		source.emit("row-a");
+		await settle();
+		for (const frame of built.frames.slice(2)) harness.channel.deliverBytes(frame);
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "a paste whose modes moved is never completed");
+		assert.ok(harness.diagnostics.includes("input_incomplete"), "the freed paste is diagnosed");
+		assert.equal(framesOfType(harness.channel.frames(), "error").length, 0);
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		sendNativeInput(harness.channel, {
+			source: wireSourceOf(source, viewerId), kind: "keyboard", data: "b", ordinal: 2, inputModes: INPUT_MODES,
+		});
+		await settle();
+		assert.equal(source.inputWrites.length, 1, "the current packet after the change is admitted");
+		assert.equal(handedText(source), "b");
+	} finally {
+		source.inputModes = INPUT_MODES;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("an open paste is bounded by the existing transfer deadline and leaves nothing behind", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true, timeouts: { transferIdleTimeoutMs: 60 } });
+	try {
+		await openNativeHello(harness);
+		const published = await subscribeNative(harness);
+		const built = buildPaste({ source: published, ordinal: 1, text: "z".repeat(40_000) });
+		harness.channel.deliverBytes(built.frames[0] ?? Buffer.alloc(0));
+		harness.channel.deliverBytes(built.frames[1] ?? Buffer.alloc(0));
+		await waitFor(() => harness.diagnostics.includes("input_incomplete"), "the partial paste deadline never fired");
+		assert.equal(source.inputWrites.length, 0, "an expired partial paste is never handed over");
+		assert.equal(harness.binding.subscribed, false, "the subscription retired");
+		assert.equal(framesOfType(harness.channel.frames(), "error").at(-1)?.code, "transfer_failed");
+		assert.equal(source.liveWatches.length, 0, "the watch was released");
+		assert.equal(source.viewers.size, 0, "the viewer was released");
+		assert.equal(harness.channel.closeCalls, 0, "an expired partial retires the subscription, not the channel");
+		// The deadline is gone with the subscription: nothing is left to fire later.
+		const frames = harness.channel.sent.length;
+		await new Promise<void>((resolve) => setTimeout(resolve, 120));
+		assert.equal(harness.channel.sent.length, frames, "no timer keeps writing after retirement");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("input for another or a retired subscription is refused without touching any viewer", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		sendNativeInput(harness.channel, {
+			source: foreignWireSource(), kind: "keyboard", data: "a", ordinal: 1, subscriptionId: "sub-none",
+		});
+		await settle();
+		assert.equal(framesOfType(harness.channel.frames(), "error").at(-1)?.code, "protocol_violation");
+		assert.equal(source.viewers.size, 0, "no viewer exists yet, and none was created");
+		assert.equal(source.inputWrites.length, 0);
+		await subscribeNative(harness);
+		// Another subscription id on this channel is never retargeted onto this one.
+		sendNativeInput(harness.channel, {
+			source: foreignWireSource(), kind: "keyboard", data: "a", ordinal: 1, subscriptionId: "sub-other",
+		});
+		await settle();
+		assert.equal(framesOfType(harness.channel.frames(), "error").at(-1)?.code, "protocol_violation");
+		assert.equal(source.inputWrites.length, 0);
+		assert.equal(harness.binding.subscribed, true);
+		// Once retired, its input frames change nothing either.
+		harness.channel.deliver({ type: "unsubscribe", subscriptionId: "sub-1" });
+		await settle();
+		sendNativeInput(harness.channel, { source: foreignWireSource(), kind: "keyboard", data: "a", ordinal: 1 });
+		await settle();
+		assert.equal(framesOfType(harness.channel.frames(), "error").at(-1)?.code, "protocol_violation");
+		assert.equal(source.inputWrites.length, 0);
+		assert.equal(harness.channel.closeCalls, 0);
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a revoked grant stops input before any handoff and still retires its own resources", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		const published = await subscribeNative(harness);
+		harness.allow.value = false;
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "a", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "a revoked peer writes nothing");
+		assert.equal(framesOfType(harness.channel.frames(), "error").at(-1)?.code, "not_authorized");
+		assert.equal(harness.binding.subscribed, false);
+		assert.equal(source.viewers.size, 0, "refusal still retires this endpoint's own resources");
+		assert.equal(source.inputWrites.length, 0);
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a native copy crosses only its own initiating viewer, whole, and never to the child", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	source.addRow("row-b", 100, 30);
+	const diagnostics: SessionContentHostDiagnosticCode[] = [];
+	const host = createSessionContentHost({
+		source,
+		nativeIo: true,
+		authorizePeer: () => true,
+		timeouts: FAST_TIMEOUTS,
+		onDiagnostic: (event) => {
+			diagnostics.push(event.code);
+		},
+	});
+	const channelA = new ContentChannel();
+	const channelB = new ContentChannel();
+	source.events = channelA.events;
+	const bindingA = host.attach(channelA);
+	const bindingB = host.attach(channelB);
+	try {
+		channelA.deliver(helloFrame(nativeIoHello()));
+		channelB.deliver(helloFrame(nativeIoHello()));
+		await settle();
+		channelA.deliver(subscribeFrame(source, { subscriptionId: "sub-a" }));
+		channelB.deliver(subscribeFrame(source, { subscriptionId: "sub-b", sessionId: "row-b" }));
+		await settle(20);
+		assert.equal(bindingA.subscribed, true);
+		assert.equal(bindingB.subscribed, true);
+		const viewerA = bindingA.viewerId;
+		const viewerB = bindingB.viewerId;
+		assert.ok(viewerA !== null && viewerB !== null);
+		assert.notEqual(viewerA, viewerB, "each binding owns its own viewer and only its own sink");
+		assert.equal(source.viewerSinks.size, 2);
+
+		// Three emissions on A's own sink, deliberately out of native dispatch order,
+		// including one that needs pages. If two assemblies interleaved on the single
+		// writer, the real assembler below would refuse them.
+		const markA = channelA.sent.length;
+		const markB = channelB.sent.length;
+		source.emitCopy(viewerA, copyEventOf("first A", "row-a"), 9);
+		source.emitCopy(viewerA, {
+			kind: "copy",
+			encoded: Buffer.alloc(75_000, 0x41).toString("base64"),
+			sessionId: "conversation-row-a",
+			sessionEpoch: 3,
+		}, 2);
+		source.emitCopy(viewerA, copyEventOf("third A", "row-a"), 5);
+		await settle(20);
+		const copiesA = copiesSince(channelA, markA);
+		assert.equal(copiesSince(channelB, markB).length, 0, "a copy never crosses to another viewer's channel");
+		assert.equal(copiesA.length, 3, "every emission is carried whole, pages and all");
+		assert.deepEqual(copiesA.map((copy) => copy.sequence), [1, 2, 3], "one emission at a time, in this endpoint's order");
+		assert.deepEqual(copiesA.map((copy) => copy.dispatchId), [9, 2, 5], "an out-of-order native dispatch is carried, not reordered");
+		assert.deepEqual(copiesA.map((copy) => decodedCopy(copy)).slice(0, 1), ["first A"]);
+		const paged = copiesA[1];
+		const third = copiesA[2];
+		assert.ok(paged !== undefined && third !== undefined);
+		assert.equal(decodedCopy(paged), "A".repeat(75_000), "the whole 100,000-character bound crossed");
+		assert.equal(decodedCopy(third), "third A");
+		assert.deepEqual(copiesA.map((copy) => copy.subscriptionId), ["sub-a", "sub-a", "sub-a"]);
+		const publishedA = publishedSource(channelA);
+		assert.ok(publishedA !== null && publishedA !== undefined);
+		assert.ok(copiesA.every((copy) => nativeIoSourceEquals(copy.source, publishedA)), "each copy names this surface's own scope");
+
+		// B receives only its own copy.
+		const markB2 = channelB.sent.length;
+		const markA2 = channelA.sent.length;
+		source.emitCopy(viewerB, copyEventOf("only B", "row-b"), 1);
+		await settle();
+		const copiesB = copiesSince(channelB, markB2);
+		assert.equal(copiesB.length, 1);
+		const ownB = copiesB[0];
+		assert.ok(ownB !== undefined);
+		assert.equal(decodedCopy(ownB), "only B");
+		assert.equal(copiesSince(channelA, markA2).length, 0, "B's copy never appears on A");
+
+		// A receipt naming another surface's scope is dropped on the floor.
+		const markA3 = channelA.sent.length;
+		const scopeB = source.readViewerInputSource(viewerB);
+		assert.ok(scopeB !== undefined);
+		source.sinkFor(viewerA)(Object.freeze({ source: scopeB, event: copyEventOf("not yours", "row-a"), dispatchId: 11 }));
+		await settle();
+		assert.equal(copiesSince(channelA, markA3).length, 0, "a receipt for another surface's scope crosses nothing");
+		assert.ok(diagnostics.includes("copy_dropped"));
+
+		// A copy event whose native tuple disagrees with this surface's own is dropped.
+		const markA4 = channelA.sent.length;
+		source.emitCopy(viewerA, copyEventOf("stale tuple", "row-b"), 12);
+		await settle();
+		assert.equal(copiesSince(channelA, markA4).length, 0, "a copy from another conversation crosses nothing");
+
+		assert.equal(source.inputWrites.length, 0, "a copy never falls back to the child's input");
+	} finally {
+		await host.stopAll().catch(() => undefined);
+	}
+});
+
+test("one native copy carries the whole producer bound, and an unavailable copy keeps its reason", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		await subscribeNative(harness);
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		// The unchanged native producer bound, in encoded characters, crosses whole.
+		const encoded = Buffer.alloc(75_000, 0x41).toString("base64");
+		assert.equal(encoded.length, NATIVE_COPY_MAX_ENCODED_CHARS);
+		const mark = harness.channel.sent.length;
+		source.emitCopy(viewerId, { kind: "copy", encoded, sessionId: "conversation-row-a", sessionEpoch: 3 }, 1);
+		await settle(20);
+		const copies = copiesSince(harness.channel, mark);
+		assert.equal(copies.length, 1, "one emission, one whole copy");
+		const event = copies[0]?.event;
+		assert.equal(event?.kind, "copy");
+		if (event !== undefined && event.kind === "copy") assert.equal(event.encoded, encoded, "nothing is trimmed to a message size");
+		assert.equal(framesOfType(harness.channel.frames(), "copy_begin").length, 1);
+		assert.ok(framesOfType(harness.channel.frames(), "copy_chunk").length > 1, "the copy really crosses as pages");
+		assert.equal(framesOfType(harness.channel.frames(), "copy_end").length, 1);
+		// One character more is refused whole, never truncated.
+		const markTooLong = harness.channel.sent.length;
+		source.emitCopy(viewerId, { kind: "copy", encoded: `${encoded}A`, sessionId: "conversation-row-a", sessionEpoch: 3 }, 2);
+		await settle();
+		assert.equal(copiesSince(harness.channel, markTooLong).length, 0, "a copy over the producer bound is refused whole");
+		assert.ok(harness.diagnostics.includes("copy_dropped"));
+		assert.equal(harness.binding.subscribed, true, "a refused copy never retires the subscription");
+		assert.equal(framesOfType(harness.channel.frames(), "error").length, 0);
+		// An unavailable copy crosses as its fixed reason with the same authenticated tuple.
+		const markUnavailable = harness.channel.sent.length;
+		source.emitCopy(viewerId, {
+			kind: "unavailable",
+			reason: "unsupported-runtime",
+			sessionId: "conversation-row-a",
+			sessionEpoch: 3,
+		}, 3);
+		await settle();
+		const unavailable = copiesSince(harness.channel, markUnavailable);
+		assert.equal(unavailable.length, 1);
+		assert.deepEqual(unavailable[0]?.event, {
+			kind: "unavailable",
+			reason: "unsupported-runtime",
+			sessionId: "conversation-row-a",
+			sessionEpoch: 3,
+		});
+		assert.equal(source.inputWrites.length, 0);
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a copy is fenced before every part, and a retired surface emits nothing at all", async () => {
+	// (1) The scope changes while later pages are still queued, after the begin crossed.
+	{
+		const source = new FakeContentSource();
+		source.addRow("row-a", 80, 24);
+		const harness = createHarness({ source, nativeIo: true });
+		// The viewer's own assembler, fed only what actually arrived on the wire.
+		const assembler = createNativeCopyAssembler(DEFAULT_SESSION_CONTENT_BOUNDS);
+		const viewer: { fed: number; completed: NativeIoCompletedCopy | undefined } = { fed: 0, completed: undefined };
+		const feedViewer = (): void => {
+			const all = harness.channel.frames();
+			for (; viewer.fed < all.length; viewer.fed += 1) {
+				const frame = all[viewer.fed];
+				if (frame === undefined) continue;
+				if (frame.type !== "copy" && frame.type !== "copy_begin" && frame.type !== "copy_chunk"
+					&& frame.type !== "copy_end") continue;
+				viewer.completed = assembler.accept(frame) ?? viewer.completed;
+			}
+		};
+		try {
+			await openNativeHello(harness);
+			await subscribeNative(harness);
+			const viewerId = harness.binding.viewerId;
+			assert.ok(viewerId !== null);
+			harness.channel.hold = true;
+			source.emitCopy(viewerId, {
+				kind: "copy",
+				encoded: Buffer.alloc(75_000, 0x41).toString("base64"),
+				sessionId: "conversation-row-a",
+				sessionEpoch: 3,
+			}, 1);
+			await settle();
+			assert.equal(harness.channel.heldWrites, 1, "the one writer holds exactly one outstanding copy frame");
+			// The surface is re-registered under a new token while pages are queued.
+			source.rotateSourceToken(viewerId);
+			harness.channel.hold = false;
+			harness.channel.release();
+			await settle(20);
+			feedViewer();
+			assert.equal(framesOfType(harness.channel.frames(), "copy_begin").length, 1);
+			assert.equal(
+				framesOfType(harness.channel.frames(), "copy_end").length,
+				0,
+				"no part of a stale emission is written after its scope changed",
+			);
+			assert.ok(harness.diagnostics.includes("copy_dropped"));
+			assert.equal(viewer.completed, undefined, "the viewer is never told a truncated copy is its clipboard");
+			assert.equal(source.inputWrites.length, 0, "a dropped copy is never re-routed to the child");
+			// An interrupted emission whose begin the viewer already holds cannot simply be
+			// forgotten: its pages can never arrive, so the subscription retires instead of
+			// leaving the peer holding an assembly that poisons every later copy.
+			assert.equal(
+				framesOfType(harness.channel.frames(), "error").at(-1)?.code,
+				"transfer_failed",
+				"the unusable stream ends through the existing transfer-failure path",
+			);
+			assert.equal(harness.binding.subscribed, false, "the interrupted copy retires its subscription");
+			assert.equal(source.liveWatches.length, 0);
+			assert.equal(source.viewers.size, 0, "retirement releases this binding's own viewer");
+			assert.equal(harness.channel.closeCalls, 0, "only the subscription ends; the lane stays usable");
+			// A fresh subscription starts clean: its own copy assembles whole on the wire
+			// this time, which an interrupted earlier stream could never have allowed.
+			await subscribeNative(harness, { subscriptionId: "sub-2" });
+			const nextViewerId = harness.binding.viewerId;
+			assert.ok(nextViewerId !== null);
+			const firstFreshFrame = harness.channel.frames().length;
+			source.emitCopy(nextViewerId, copyEventOf("the next copy", "row-a"), 1);
+			await settle();
+			const fresh = createNativeCopyAssembler(DEFAULT_SESSION_CONTENT_BOUNDS);
+			let completed: NativeIoCompletedCopy | undefined;
+			for (const frame of harness.channel.frames().slice(firstFreshFrame)) {
+				if (frame.type !== "copy") continue;
+				completed = fresh.accept(frame);
+			}
+			assert.ok(completed !== undefined, "a later copy on the fresh subscription completes whole");
+			assert.equal(decodedCopy(completed), "the next copy");
+		} finally {
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+	// (2) Authority is revoked in the middle of an emission.
+	{
+		const source = new FakeContentSource();
+		source.addRow("row-a", 80, 24);
+		const harness = createHarness({ source, nativeIo: true });
+		try {
+			await openNativeHello(harness);
+			await subscribeNative(harness);
+			const viewerId = harness.binding.viewerId;
+			assert.ok(viewerId !== null);
+			harness.channel.hold = true;
+			source.emitCopy(viewerId, copyEventOf("half an emission", "row-a"), 1);
+			source.emitCopy(viewerId, {
+				kind: "copy",
+				encoded: Buffer.alloc(75_000, 0x41).toString("base64"),
+				sessionId: "conversation-row-a",
+				sessionEpoch: 3,
+			}, 2);
+			await settle();
+			harness.allow.value = false;
+			harness.channel.hold = false;
+			harness.channel.release();
+			await settle(20);
+			assert.equal(
+				framesOfType(harness.channel.frames(), "copy_end").length,
+				0,
+				"a revoked grant writes no further copy frame, chunk, or end",
+			);
+			assert.equal(framesOfType(harness.channel.frames(), "error").at(-1)?.code, "not_authorized");
+			assert.equal(source.viewers.size, 0, "refusal still retires this endpoint's own resources");
+			assert.equal(source.inputWrites.length, 0);
+		} finally {
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+	// (3) A surface whose release the source could not confirm still emits nothing.
+	{
+		const source = new FakeContentSource();
+		source.addRow("row-a", 80, 24);
+		const harness = createHarness({ source, nativeIo: true });
+		try {
+			await openNativeHello(harness);
+			await subscribeNative(harness);
+			const viewerId = harness.binding.viewerId;
+			assert.ok(viewerId !== null);
+			source.refuseViewerClose = true;
+			await harness.binding.stop().catch(() => undefined);
+			source.refuseViewerClose = false;
+			assert.equal(harness.binding.subscribed, false);
+			const mark = harness.channel.sent.length;
+			source.emitCopy(viewerId, copyEventOf("a late copy", "row-a"), 1);
+			await settle();
+			assert.equal(harness.channel.sent.length, mark, "a retired binding writes nothing at all");
+			assert.equal(source.inputWrites.length, 0, "a retired surface never falls back to the child");
+		} finally {
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+});
+
+test("native copies share the one bounded writer and fail closed rather than drop silently", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		await subscribeNative(harness);
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		harness.channel.hold = true;
+		// The backlog is deeper than the one bounded writer can represent. Emission
+		// stops the moment the endpoint has failed closed: its own viewer is already
+		// released, and a released surface has nothing to copy.
+		for (let index = 1; index <= 12 && harness.binding.subscribed && !harness.diagnostics.includes("send_failed"); index += 1) {
+			source.emitCopy(viewerId, copyEventOf(`copy ${index}`, "row-a"), index);
+		}
+		await settle();
+		assert.ok(
+			harness.diagnostics.includes("send_failed"),
+			"an unrepresentable backlog fails closed instead of dropping a copy silently",
+		);
+		assert.equal(harness.binding.subscribed, false);
+		assert.equal(source.inputWrites.length, 0, "a failed copy backlog never becomes input");
+		harness.channel.release();
+		await waitFor(() => harness.channel.closeCalls === 1, "the fenced content channel never closed");
+		assert.equal(source.liveWatches.length, 0);
+		assert.equal(source.viewers.size, 0, "retirement still releases this binding's own viewer");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a copy never interleaves with a viewport transfer and the viewport still completes", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true, bounds: { maxChunkPayloadBytes: 512 } });
+	try {
+		await openNativeHello(harness);
+		await subscribeNative(harness);
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		harness.channel.hold = true;
+		harness.channel.deliver(resizeFrame({ cols: 60, rows: 20 }));
+		await settle();
+		source.emitCopy(viewerId, copyEventOf("a copy between frames", "row-a"), 1);
+		harness.channel.hold = false;
+		harness.channel.release();
+		await settle(30);
+		const copies = assembledCopies(harness.channel.frames());
+		assert.equal(copies.length, 1, "the copy arrived whole among the viewport frames");
+		const interleaved = copies[0];
+		assert.ok(interleaved !== undefined);
+		assert.equal(decodedCopy(interleaved), "a copy between frames");
+		// The interrupted viewport still finishes: one writer, one assembly at a time.
+		assert.ok(
+			framesOfType(harness.channel.frames(), "content_end").length >= 2,
+			"both viewport transfers completed",
+		);
+		const begin = framesOfType(harness.channel.frames(), "content_begin").at(-1);
+		assert.ok(begin !== undefined);
+		assert.equal(begin.geometry.cols, 60, "the resized viewport published completely");
+		assert.equal(harness.binding.subscribed, true);
+		assert.equal(harness.channel.heldWrites, 0, "nothing is left outstanding");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a copy frame from a viewer is a frame this side never receives", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		await subscribeNative(harness);
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		// A copy is owner-to-viewer only: a peer cannot push clipboard content, an
+		// owner-terminal write, or a relay request onto this lane.
+		harness.channel.deliver({
+			type: "copy",
+			subscriptionId: "sub-1",
+			copyId: randomUUID(),
+			sequence: 1,
+			source: wireSourceOf(source, viewerId),
+			dispatchId: 1,
+			event: {
+				kind: "copy",
+				encoded: Buffer.from("claimed by the viewer").toString("base64"),
+				sessionId: "conversation-row-a",
+				sessionEpoch: 3,
+			},
+		});
+		await settle();
+		assert.equal(framesOfType(harness.channel.frames(), "error").at(-1)?.code, "bad_frame");
+		assert.equal(harness.channel.closeCalls, 1, "this content lane fails closed and nothing else changes");
+		assert.equal(source.inputWrites.length, 0, "a claimed copy never reaches a child or a clipboard");
+		// The lane fails closed, and failing closed still means retiring this endpoint's
+		// own resources: the viewer and the copy sink it registered are released.
+		assert.equal(harness.binding.viewerId, null);
+		assert.equal(source.viewers.size, 0);
+		assert.equal(source.viewerSinks.size, 0, "a closed lane keeps no sink behind");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a completed input ordinal cannot reach the child twice because a refusal freed a buffer", async () => {
+	const { source, harness, published } = await openInputCase(INPUT_MODES);
+	try {
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "a", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 1, "the first packet was handed over exactly once");
+		// An ordinary stale paste begin is a quiet refusal that frees its partial buffer.
+		// Freeing bytes is not a new session: the ordinals already completed stay fence.
+		const staleBegin = buildPaste({
+			source: { ...published, sourceToken: "token-another-surface" },
+			ordinal: 2,
+			text: "y".repeat(40_000),
+		});
+		harness.channel.deliverBytes(staleBegin.frames[0] ?? Buffer.alloc(0));
+		await settle();
+		assert.equal(source.inputWrites.length, 1);
+		assert.ok(harness.diagnostics.includes("input_refused"), "the stale begin is refused quietly");
+		assert.equal(
+			framesOfType(harness.channel.frames(), "error").length,
+			0,
+			"staleness is not a protocol failure and never disconnects",
+		);
+		// The completed packet replayed at its own ordinal can never execute again.
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "a", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 1, "a replayed ordinal never produces a second PTY handoff");
+		assert.equal(
+			framesOfType(harness.channel.frames(), "error").at(-1)?.code,
+			"bad_frame",
+			"a replay is a protocol failure under the existing wire policy",
+		);
+		assert.equal(harness.channel.closeCalls, 1, "this content lane fails closed and nothing else");
+		assert.equal(source.viewers.size, 0, "failing closed still retires this endpoint's own resources");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a modes-only abandonment cannot unlock the completed ordinal fence", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	const harness = createHarness({ source, nativeIo: true });
+	const modesWithoutPaste: TerminalInputModes = Object.freeze({ ...INPUT_MODES, bracketedPaste: false });
+	try {
+		await openNativeHello(harness);
+		const published = await subscribeNative(harness);
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "a", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 1);
+		const built = buildPaste({ source: published, ordinal: 2, text: "y".repeat(40_000) });
+		harness.channel.deliverBytes(built.frames[0] ?? Buffer.alloc(0));
+		harness.channel.deliverBytes(built.frames[1] ?? Buffer.alloc(0));
+		await settle();
+		source.inputModes = modesWithoutPaste;
+		source.emit("row-a");
+		await settle();
+		source.inputModes = INPUT_MODES;
+		source.emit("row-a");
+		await settle();
+		assert.ok(harness.diagnostics.includes("input_incomplete"), "the modes move freed the open paste");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "a", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 1, "a freed paste cannot re-admit a completed ordinal");
+		assert.equal(framesOfType(harness.channel.frames(), "error").at(-1)?.code, "bad_frame");
+		assert.equal(harness.channel.closeCalls, 1);
+	} finally {
+		source.inputModes = INPUT_MODES;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a viewer revision change with no geometry notification still refreshes the published source", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	// Exactly like the manager: a row's size is the minimum over the viewers that
+	// display it, so a sibling at 80x24 keeps the canonical geometry while this
+	// endpoint's own surface grows — and no content change is ever delivered.
+	source.emitOnlyOnCanonicalChange = true;
+	const sibling = source.openViewer();
+	assert.ok(sibling !== undefined);
+	assert.equal(sibling.sessionId, undefined, "a fresh surface shows no row until it is placed");
+	assert.equal(
+		source.updateViewer(sibling.viewerId, { sessionId: "row-a", cols: 80, rows: 24 }).applied,
+		true,
+	);
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		const before = await subscribeNative(harness);
+		await settle();
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		const capturesBefore = source.builtSnapshots.length;
+		const watchesBefore = source.installedRowIds.length;
+		harness.channel.deliver(resizeFrame({ cols: 100, rows: 30 }));
+		await settle();
+		assert.equal(source.geometryOf("row-a").cols, 80, "the sibling still decides the canonical width");
+		assert.equal(source.readViewer(viewerId)?.cols, 100, "this surface really did change");
+		assert.equal(
+			source.builtSnapshots.length,
+			capturesBefore + 1,
+			"the owner's facts were re-read exactly once, and only an observed snapshot is published",
+		);
+		assert.equal(source.installedRowIds.length, watchesBefore + 1, "the watch was replaced, never stacked");
+		assert.equal(source.watches[0]?.unsubscribed, 1, "the old watch was retired before its replacement");
+		assert.equal(source.liveWatches.length, 1, "this binding holds exactly one watch");
+		const after = publishedSource(harness.channel);
+		assert.ok(after !== null && after !== undefined, "the refresh published this viewer's viewport");
+		assert.notEqual(JSON.stringify(after), JSON.stringify(before), "the new surface revision reached the wire");
+		assert.deepEqual(after, wireSourceOf(source, viewerId), "what is stated is the CURRENT owner scope");
+		sendNativeInput(harness.channel, { source: before, kind: "keyboard", data: "x", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "the superseded source is still refused");
+		sendNativeInput(harness.channel, { source: after, kind: "keyboard", data: "a", ordinal: 2 });
+		await settle();
+		assert.equal(source.inputWrites.length, 1, "input works on an idle terminal, without waiting for output");
+		assert.equal(handedText(source), "a");
+		assert.equal(framesOfType(harness.channel.frames(), "error").length, 0);
+		assert.equal(harness.binding.subscribed, true);
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a resize that frees an open paste leaves no deadline to retire the subscription later", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	source.emitOnlyOnCanonicalChange = true;
+	const sibling = source.openViewer();
+	assert.ok(sibling !== undefined);
+	source.updateViewer(sibling.viewerId, { sessionId: "row-a", cols: 80, rows: 24 });
+	const harness = createHarness({ source, nativeIo: true, timeouts: { transferIdleTimeoutMs: 60 } });
+	try {
+		await openNativeHello(harness);
+		const published = await subscribeNative(harness);
+		const built = buildPaste({ source: published, ordinal: 1, text: "y".repeat(40_000) });
+		harness.channel.deliverBytes(built.frames[0] ?? Buffer.alloc(0));
+		harness.channel.deliverBytes(built.frames[1] ?? Buffer.alloc(0));
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "an incomplete paste is never handed over");
+		harness.channel.deliver(resizeFrame({ cols: 100, rows: 30 }));
+		await settle();
+		assert.ok(harness.diagnostics.includes("input_incomplete"), "the pane change freed the paste immediately");
+		// A real wait past the 60ms idle deadline the abandoned paste had armed. Without
+		// an immediate release, this is where the subscription would quietly end.
+		await new Promise<void>((resolve) => setTimeout(resolve, 200));
+		await settle();
+		assert.equal(harness.binding.subscribed, true, "a freed paste leaves no deadline to end the subscription");
+		assert.equal(framesOfType(harness.channel.frames(), "error").length, 0);
+		assert.equal(harness.channel.closeCalls, 0);
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		sendNativeInput(harness.channel, {
+			source: wireSourceOf(source, viewerId), kind: "keyboard", data: "a", ordinal: 2,
+		});
+		await settle();
+		assert.equal(source.inputWrites.length, 1, "input continues on the refreshed source");
+		assert.equal(handedText(source), "a");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a resize whose watch replacement cannot be retired ends the subscription as retained evidence", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	source.emitOnlyOnCanonicalChange = true;
+	const sibling = source.openViewer();
+	assert.ok(sibling !== undefined);
+	source.updateViewer(sibling.viewerId, { sessionId: "row-a", cols: 80, rows: 24 });
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		await subscribeNative(harness);
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		source.throwOnUnsubscribe = true;
+		harness.channel.deliver(resizeFrame({ cols: 100, rows: 30 }));
+		await settle();
+		assert.ok(
+			harness.diagnostics.includes("watch_release_uncertain"),
+			"a release that cannot be proven is evidence, not best-effort cleanup",
+		);
+		assert.equal(source.installedRowIds.length, 1, "no replacement watch is installed beside an unretired one");
+		assert.equal(source.watches[0]?.unsubscribed, 0, "the failed release stays visible");
+		assert.equal(source.liveWatches.length, 1, "the unretired watch stays retained by this binding");
+		assert.equal(harness.binding.subscribed, false, "the subscription cannot continue on an unretirable handle");
+		assert.equal(framesOfType(harness.channel.frames(), "error").at(-1)?.code, "unavailable");
+		assert.equal(source.viewers.has(viewerId), false, "the viewer this endpoint did release is released");
+		assert.equal(source.viewers.has(sibling.viewerId), true, "the separately owned sibling viewer is preserved");
+		assert.equal(source.viewers.size, 1, "only the sibling remains; no endpoint viewer leaked");
+		assert.equal(source.inputWrites.length, 0, "a refresh never writes to a child");
+		await assert.rejects(harness.binding.stop(), isCloseFailure, "unproven cleanup never settles green");
+	} finally {
+		source.throwOnUnsubscribe = false;
+		await harness.host.stopAll().catch(() => undefined);
 	}
 });

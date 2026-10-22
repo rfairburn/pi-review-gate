@@ -77,10 +77,38 @@
  * accumulated by a replacement binding. Uncertainty is latched at the operation
  * that failed, not only when a binding finally settles, so admission is fenced
  * immediately while a bounded close may still be pending.
+ *
+ * Native input and text copy are an explicit, default-off extension of this same
+ * lane. Nothing is offered or acknowledged unless this host was constructed with
+ * `nativeIo: true` AND the injected source actually provides the manager's own
+ * `readViewerInputSource` / `writeViewerInput` seam, and then only when the peer
+ * offered the capability: the default hello, acknowledgement, publishes, and
+ * refusals stay exactly what a display-only viewer already gets, including the
+ * absence of any input-source field. When it is negotiated, this endpoint
+ * registers its ONE viewer with its own private copy sink, states a host-written
+ * input source on a publish only when it describes that publish's exact native
+ * tuple and canonical geometry, re-proves the peer's echoed source against the
+ * CURRENT owner facts before every part and immediately before the single
+ * synchronous handoff, and routes a native copy only to the exact viewer whose own
+ * input caused it — never to the owner's local clipboard, the outer terminal, a
+ * sibling viewer, or a PTY write. Every packet is translated exactly once with the
+ * owner's existing translator, and a whole text paste of up to exactly 1 MiB is
+ * assembled before any handoff, so an incomplete or stale input writes zero bytes
+ * and poisons nothing that follows it. A native copy shares the ONE serialized
+ * writer and the existing bounded backlog, and an unsendable copy fails closed
+ * rather than being dropped while claiming delivery. No input lease, focus rule,
+ * receipt store, retry queue, second viewer, second writer, or session lifecycle
+ * call appears here.
  */
 
 import { randomUUID } from "node:crypto";
+import { parseMouseInput, translateInput, type InputViewport } from "../input";
 import type {
+	NativeViewerClipboardReceipt,
+	NativeViewerClipboardSink,
+	NativeViewerInputRequest,
+	NativeViewerInputResult,
+	NativeViewerInputSource,
 	OwningHostInventorySnapshot,
 	OwningHostService,
 	OwningHostSessionContentSnapshot,
@@ -88,26 +116,42 @@ import type {
 	SessionViewerState,
 	SessionViewerUpdateResult,
 } from "../owning-host-service";
+import type { TerminalInputModes } from "../terminal-surface";
 import type { PeerByteChannel } from "./channel";
 import type { PeerKey } from "./identity";
 import { DEFAULT_ROSTER_BRIDGE_BOUNDS, type RosterBridgeBounds } from "./roster-bridge-protocol";
 import {
+	NATIVE_TEXT_PASTE_MAX_BYTES,
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
+	buildNativeCopyInline,
+	buildNativeCopyPaged,
 	buildSessionContentTransfer,
+	createNativeInputAssembler,
 	decodeSessionContentFrame,
 	encodeSessionContentFrame,
 	isSessionContentProtocolError,
 	negotiateSessionContentHello,
+	nativeIoSourceEquals,
 	resolveSessionContentBounds,
 	sessionContentWireCodeForFailure,
+	type NativeInputAssembler,
+	type NativeIoBuiltTransfer,
+	type NativeIoCompletedInput,
+	type NativeIoSource,
 	type SessionContentBounds,
 	type SessionContentBuiltTransfer,
 	type SessionContentErrorCode,
 	type SessionContentFrame,
 	type SessionContentHelloFrame,
+	type SessionContentInputBeginFrame,
+	type SessionContentInputChunkFrame,
+	type SessionContentInputEndFrame,
+	type SessionContentInputFrame,
+	type SessionContentNegotiationOptions,
 	type SessionContentResizeFrame,
 	type SessionContentSubscribeFrame,
 } from "./session-content-protocol";
@@ -117,11 +161,17 @@ import {
  * watch, one read-only inventory snapshot per subscribe, and the manager's own
  * per-session viewer registration. There is no row mutator, no direct resize,
  * no session lifecycle call, and no second listing path here.
+ *
+ * The same capabilities plus the optional strict viewer input seam. Both native
+ * IO primitives are optional here so a display-only source — and every existing
+ * consumer of this endpoint — keeps compiling and keeps its exact behavior; the
+ * endpoint only ever calls them when the explicit opt-in was resolved with real
+ * implementations behind them.
  */
 export type SessionContentSource = Pick<
 	OwningHostService,
 	"watchSessionContent" | "readInventorySnapshot" | "openViewer" | "readViewer" | "updateViewer" | "closeViewer"
->;
+> & Partial<Pick<OwningHostService, "readViewerInputSource" | "writeViewerInput">>;
 
 /**
  * Trusted synchronous authorization decision for one exact verified peer key.
@@ -152,7 +202,11 @@ export type SessionContentHostDiagnosticCode =
 	| "viewer_release_uncertain"
 	| "watch_release_uncertain"
 	| "handler_release_uncertain"
-	| "channel_close_uncertain";
+	| "channel_close_uncertain"
+	| "input_refused"
+	| "input_uncertain"
+	| "input_incomplete"
+	| "copy_dropped";
 
 export interface SessionContentHostDiagnostic {
 	readonly code: SessionContentHostDiagnosticCode;
@@ -205,6 +259,19 @@ export interface SessionContentHostOptions {
 		>
 	>;
 	readonly onDiagnostic?: SessionContentHostDiagnosticSink;
+	/**
+	 * Explicit native input / text-copy opt-in. Default `false`: this endpoint
+	 * offers and acknowledges nothing, publishes no input source, recognizes no
+	 * native IO frame, and registers no copy sink, exactly as it always has.
+	 *
+	 * `true` is still not an activation on its own. The optional capability is
+	 * offered only when the injected source really provides the manager's own
+	 * `readViewerInputSource` and `writeViewerInput` primitives (no implementation
+	 * means no offer, checked before any channel side effect), and acknowledged only
+	 * when the peer actually offered it. Knowing the capability identifier, or a
+	 * peer offering it, never enables anything.
+	 */
+	readonly nativeIo?: boolean;
 }
 
 /** One attached content channel. Stopping it ends viewport delivery and nothing else. */
@@ -304,6 +371,160 @@ type TimeoutOverrides = Partial<Pick<RosterBridgeBounds, (typeof TIMEOUT_KEYS)[n
  * unbounded queue.
  */
 const MAX_PENDING_CONTROLS = 8;
+
+/**
+ * The resolved native input seam, or `null` when this host is display-only. It is
+ * built once from the injected source so the endpoint never reaches for a method
+ * that the source does not have, and every failure of a seam call is turned into
+ * the absence of a fact rather than an inferred one.
+ */
+interface NativeIoProvider {
+	/** The manager's CURRENT owner-private input scope for one surface. */
+	readSource(viewerId: string): NativeViewerInputSource | undefined;
+	/** The one strict viewer input handoff: synchronous, never retried or queued. */
+	write(viewerId: string, request: NativeViewerInputRequest): NativeViewerInputResult;
+}
+
+/** One native input target proven against the source and modes the peer named. */
+interface NativeInputTarget {
+	/** The CURRENT owner-private scope, handed to the lower fence unchanged. */
+	readonly lower: NativeViewerInputSource;
+	/** The same facts in wire shape, never including owner-only identity. */
+	readonly wire: NativeIoSource;
+	readonly modes: TerminalInputModes;
+}
+
+/**
+ * One queued native copy: every encoded frame of one atomic emission, in wire
+ * order. `source` is the exact scope the copy was emitted for and is re-proven
+ * before every part; `generation` fences a retired subscription.
+ */
+interface QueuedNativeCopy {
+	readonly frames: readonly Buffer[];
+	readonly subscriptionId: string;
+	readonly hostRunId: string;
+	readonly source: NativeIoSource;
+	readonly generation: number;
+	index: number;
+	/**
+	 * Whether any part of this emission already left this endpoint. An untouched unit
+	 * can be discarded whole with no consequence; once its begin (or any page) is on
+	 * the wire, the viewer holds an assembly that only an ending subscription frees, so
+	 * an interrupted started unit ends the content subscription instead of being
+	 * silently dropped.
+	 */
+	started: boolean;
+}
+
+/** Whose work holds the one send slot for the current write. */
+type QueuedWrite =
+	| { readonly kind: "transfer"; readonly transfer: InFlightTransfer }
+	| { readonly kind: "copy"; readonly copy: QueuedNativeCopy };
+
+/** One of the four native input wire frames this endpoint can receive. */
+type NativeInputWireFrame =
+	| SessionContentInputFrame
+	| SessionContentInputBeginFrame
+	| SessionContentInputChunkFrame
+	| SessionContentInputEndFrame;
+
+/** The native bracketed-paste markers the owner's own translator recognizes. */
+const PASTE_START = "\u001b[200~";
+const PASTE_END = "\u001b[201~";
+/** One canonical SGR mouse report; a legacy report is never accepted as input. */
+const SGR_MOUSE_PREFIX = "\u001b[<";
+
+/**
+ * Map the owner-private current scope to the exact wire shape a peer may echo.
+ * The private viewer id, registration identity, and registration generation stay
+ * owner-only; the host-minted token is descriptive and grants nothing.
+ */
+function toNativeIoSource(lower: NativeViewerInputSource | undefined): NativeIoSource | null {
+	if (!lower) return null;
+	if (typeof lower.sourceToken !== "string" || lower.sourceToken.length === 0) return null;
+	if (!Number.isSafeInteger(lower.viewerRevision) || lower.viewerRevision < 1) return null;
+	return Object.freeze({
+		hostRunId: lower.hostRunId,
+		sessionId: lower.rowId,
+		nativeSession: Object.freeze({
+			sessionId: lower.nativeSession.sessionId,
+			epoch: lower.nativeSession.epoch,
+		}),
+		geometry: Object.freeze({
+			cols: lower.geometry.cols,
+			rows: lower.geometry.rows,
+			revision: lower.geometry.revision,
+		}),
+		viewerRevision: lower.viewerRevision,
+		sourceToken: lower.sourceToken,
+	});
+}
+
+/**
+ * Exact equality of every owner-private scope fact, including the fields that
+ * never cross the wire. This is how a copy proves it belongs to THIS surface and
+ * to no sibling; it grants nothing and selects no destination.
+ */
+function sameNativeViewerScope(left: NativeViewerInputSource, right: NativeViewerInputSource): boolean {
+	return left.hostRunId === right.hostRunId
+		&& left.viewerId === right.viewerId
+		&& left.viewerRevision === right.viewerRevision
+		&& left.rowId === right.rowId
+		&& left.nativeSession.sessionId === right.nativeSession.sessionId
+		&& left.nativeSession.epoch === right.nativeSession.epoch
+		&& left.geometry.cols === right.geometry.cols
+		&& left.geometry.rows === right.geometry.rows
+		&& left.geometry.revision === right.geometry.revision
+		&& left.registrationIdentity === right.registrationIdentity
+		&& left.registrationGeneration === right.registrationGeneration
+		&& left.sourceToken === right.sourceToken;
+}
+
+/** Exact equality of the input-mode set one packet was translated for. */
+function sameInputModes(left: TerminalInputModes, right: TerminalInputModes): boolean {
+	return left.kittyFlags === right.kittyFlags
+		&& left.modifyOtherKeys === right.modifyOtherKeys
+		&& left.applicationCursorKeys === right.applicationCursorKeys
+		&& left.applicationKeypad === right.applicationKeypad
+		&& left.bracketedPaste === right.bracketedPaste
+		&& left.mouseTracking === right.mouseTracking
+		&& left.mouseEncoding === right.mouseEncoding;
+}
+
+/**
+ * Resolve the optional native IO seam exactly once, before any channel exists.
+ * The option defaults to off and must be a real boolean; an enabled opt-in whose
+ * injected source lacks either primitive is treated as no opt-in at all, because
+ * no implementation is no offer. A seam call that throws never becomes a retry, a
+ * queue, or an assumed fact: an unavailable read is no scope, and a handoff that
+ * threw has the one truthful outcome, uncertain.
+ */
+function resolveNativeIoProvider(options: SessionContentHostOptions): NativeIoProvider | null {
+	if (options.nativeIo !== undefined && typeof options.nativeIo !== "boolean") {
+		throw new TypeError("session content host requires a boolean native IO opt-in");
+	}
+	if (options.nativeIo !== true) return null;
+	const source = options.source;
+	const read = source.readViewerInputSource;
+	const write = source.writeViewerInput;
+	if (typeof read !== "function" || typeof write !== "function") return null;
+	return Object.freeze({
+		readSource: (viewerId: string): NativeViewerInputSource | undefined => {
+			try {
+				return read.call(source, viewerId);
+			} catch {
+				return undefined;
+			}
+		},
+		write: (viewerId: string, request: NativeViewerInputRequest): NativeViewerInputResult => {
+			try {
+				return write.call(source, viewerId, request);
+			} catch {
+				return { status: "unknown" };
+			}
+		},
+	});
+}
 
 /**
  * Resolve the owner-side deadlines against the fixed roster-bridge defaults.
@@ -438,12 +659,67 @@ class OwnerBinding implements SessionContentChannelBinding {
 	#stopPromise: Promise<void> | null = null;
 	/** The one bounded content-channel close this binding requested, if any. */
 	#closePromise: Promise<void> | null = null;
+	/** The resolved native input seam, or `null` while this host is display-only. */
+	readonly #provider: NativeIoProvider | null;
+	/** True only when THIS channel negotiated the optional native IO extension. */
+	#nativeIoNegotiated = false;
+	/** The one native input assembly belonging to the current subscription. */
+	#inputAssembler: NativeInputAssembler | null = null;
+	/** The open paged paste's identifier, while one is open. */
+	#inputAssemblyId: string | null = null;
+	/**
+	 * The header facts of the one open paged paste. Its source and modes are proven
+	 * when the begin arrives and re-proved before every page and before its end, so
+	 * a stale paste is freed where the change is observed instead of surviving to
+	 * collide with a later valid packet.
+	 */
+	#inputHeader: { readonly inputId: string; readonly source: NativeIoSource; readonly inputModes: TerminalInputModes } | null = null;
+	/**
+	 * The ONE abandoned input whose remaining pages are dropped rather than treated
+	 * as a fresh input or a protocol failure. A single value, never a history or a
+	 * map, and a new start replaces it.
+	 */
+	#ignoredInputId: string | null = null;
+	/** Finite idle deadline for the open partial input, from the existing bounds. */
+	#inputTimer: NodeJS.Timeout | null = null;
+	/** The newest input modes this endpoint observed for this subscription. */
+	#inputModes: TerminalInputModes | null = null;
+	/** The native source this endpoint last stated on a publish, or none. */
+	#statedSource: NativeIoSource | null = null;
+	/**
+	 * Binding-lifetime native copy emission order, strictly increasing and minted
+	 * here. It is deliberately NOT the native input dispatch order: an asynchronous
+	 * copy caused by input A may legitimately follow one caused by input B, and both
+	 * must be delivered.
+	 */
+	#nextCopySequence = 0;
+	/** The one copy assembly whose frames are being written, never two at a time. */
+	#copyInFlight: QueuedNativeCopy | null = null;
+	/** Bounded backlog of whole copy emissions behind the current write. */
+	#copyQueue: QueuedNativeCopy[] = [];
+	/**
+	 * This binding's OWN native copy sink, registered only with its own viewer. A
+	 * receipt is re-proved here every time, so a callback that outlives this
+	 * binding's viewer — including one the source could not release — still routes
+	 * nothing.
+	 */
+	readonly #copySink: NativeViewerClipboardSink = (receipt) => {
+		try {
+			this.#onNativeCopy(receipt);
+		} catch {
+			// A copy this side cannot handle is dropped where it arrived. It never
+			// becomes a claim that a clipboard changed, and it never propagates out of
+			// the owner's own dispatch as an exception.
+			this.#diagnostic("copy_dropped");
+		}
+	};
 
 	constructor(
 		channel: PeerByteChannel,
 		options: SessionContentHostOptions,
 		bounds: SessionContentBounds,
 		timeouts: SessionContentTimeouts,
+		provider: NativeIoProvider | null,
 		diagnostic: (code: SessionContentHostDiagnosticCode, extra?: DiagnosticExtra) => void,
 		onUncertain: () => void,
 	) {
@@ -451,6 +727,7 @@ class OwnerBinding implements SessionContentChannelBinding {
 		this.#options = options;
 		this.#bounds = bounds;
 		this.#timeouts = timeouts;
+		this.#provider = provider;
 		this.#diagnostic = diagnostic;
 		this.#onUncertain = onUncertain;
 		this.peerKey = channel.peerKey;
@@ -568,6 +845,12 @@ class OwnerBinding implements SessionContentChannelBinding {
 				else if (frame.type === "resize") this.#onResize(frame);
 				else this.#onUnsubscribe(frame.subscriptionId);
 				return;
+			case "input":
+			case "input_begin":
+			case "input_chunk":
+			case "input_end":
+				this.#onNativeInput(frame);
+				return;
 			default:
 				// Everything else is a frame this side never receives: its own
 				// acknowledgement or end, and every transfer frame. Answer once.
@@ -581,7 +864,7 @@ class OwnerBinding implements SessionContentChannelBinding {
 			return;
 		}
 		this.#clearHelloTimer();
-		const decision = negotiateSessionContentHello(frame);
+		const decision = negotiateSessionContentHello(frame, this.#nativeIoOffer());
 		if (!decision.ok) {
 			this.#diagnostic("hello_refused");
 			this.#enqueueControl({ type: "error", code: decision.code });
@@ -591,6 +874,12 @@ class OwnerBinding implements SessionContentChannelBinding {
 		if (!this.#authorize()) {
 			this.#refuseUnauthorized(undefined);
 			return;
+		}
+		// Only a capability this side could actually offer AND that the peer actually
+		// offered is negotiated. An acknowledgement of the baseline alone leaves this
+		// channel display-only, with no input source and no copy sink.
+		if (decision.capabilities.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)) {
+			this.#nativeIoNegotiated = true;
 		}
 		this.#state = "ready";
 		this.#diagnostic("hello_accepted");
@@ -789,7 +1078,15 @@ class OwnerBinding implements SessionContentChannelBinding {
 		}
 		let viewer: SessionViewerState | undefined;
 		try {
-			viewer = this.#options.source.openViewer();
+			// This endpoint's ONE viewer, registered with its own private copy sink when
+			// — and only when — this channel negotiated the extension. The host run
+			// identity is the injected service's own, never peer data, and a
+			// non-negotiated channel keeps the exact legacy registration with no options.
+			viewer = this.#options.source.openViewer(
+				this.#provider !== null && this.#nativeIoNegotiated
+					? { nativeClipboardSink: this.#copySink }
+					: undefined,
+			);
 		} catch {
 			viewer = undefined;
 		}
@@ -852,6 +1149,13 @@ class OwnerBinding implements SessionContentChannelBinding {
 		this.#sessionId = frame.sessionId;
 		this.#publishedSequence = 0;
 		this.#installSnapshot = initial;
+		if (this.#provider !== null && this.#nativeIoNegotiated) {
+			// One input assembly per subscription. Retirement dropped the previous helper
+			// entirely, so this is a fresh ordinal fence for the new subscription; the
+			// manager owns every scope fact, and a refusal inside one subscription frees
+			// buffered bytes without ever reviving a completed ordinal.
+			this.#resetInputAssembler();
+		}
 		this.#state = "subscribed";
 		return "installed";
 	}
@@ -896,6 +1200,10 @@ class OwnerBinding implements SessionContentChannelBinding {
 			this.#refuseUnauthorized(frame.subscriptionId);
 			return;
 		}
+		// The pane is about to move under any partially received paste: it was made for
+		// the geometry and source observed until now, so it is freed BEFORE the protected
+		// viewer change instead of lingering until its deadline or its next page.
+		this.#abandonInputAssembly();
 		let applied: SessionViewerUpdateResult | undefined;
 		try {
 			applied = this.#options.source.updateViewer(viewerId, {
@@ -918,8 +1226,80 @@ class OwnerBinding implements SessionContentChannelBinding {
 			this.#terminateSubscription("unavailable", "source_unavailable");
 			return;
 		}
-		// Nothing is sent here. The manager's own canonical geometry arrives through
-		// the live content watch, so only that geometry ever reaches the wire.
+		// No viewport is invented here: the published frame still comes from a snapshot
+		// the owner actually observed. What a resize DOES have to guarantee is that this
+		// endpoint's next observation is current, because the owner does not promise to
+		// notify one.
+		this.#refreshNativeObservationAfterResize();
+	}
+
+	/**
+	 * A successful viewer change can move THIS surface's revision — and with it the
+	 * facts its input source states — without any content notification: the manager's
+	 * canonical geometry is the minimum over the row's viewers, so a sibling holding a
+	 * smaller size leaves the row exactly as it is and the content watch stays silent.
+	 * Without a refresh this endpoint would go on stating a source the owner no longer
+	 * holds, and every later packet would be refused until unrelated terminal output
+	 * happened to arrive. The authoritative facts are re-read through this binding's
+	 * own single-watch lifecycle — the old watch is retired before its replacement is
+	 * registered, and every step stays generation-fenced — and the newest observation
+	 * goes through the existing publish path. Display-only channels are untouched.
+	 */
+	#refreshNativeObservationAfterResize(): void {
+		if (this.#provider === null || !this.#nativeIoNegotiated) return;
+		const sessionId = this.#sessionId;
+		const watch = this.#watch;
+		if (sessionId === null || watch === null || this.#state !== "subscribed") return;
+		const generation = this.#generation;
+		let replacement: OwningHostSessionContentWatch | undefined;
+		// The same install guard a fresh subscription uses: a change delivered from
+		// inside the source is retained as an observation instead of being published
+		// beside a watch this binding has not adopted yet.
+		this.#installing = true;
+		this.#installUnavailable = false;
+		try {
+			if (!this.#retireWatch(watch)) {
+				// A release that cannot be proven stays owned evidence: no replacement
+				// watch may be installed beside it, so the subscription ends truthfully
+				// instead of continuing on a handle nobody can retire.
+				this.#terminateSubscription("unavailable", "source_unavailable");
+				return;
+			}
+			if (!this.#installActive(generation)) return;
+			try {
+				replacement = this.#options.source.watchSessionContent(
+					sessionId,
+					(snapshot) => this.#onContent(snapshot),
+				);
+			} catch {
+				replacement = undefined;
+			}
+		} finally {
+			this.#installing = false;
+		}
+		if (!this.#installActive(generation)) {
+			// A reentrant stop or retirement landed mid-refresh. It owns whatever it
+			// acquired; this attempt adopts nothing and announces nothing.
+			if (replacement !== undefined) this.#retireWatch(replacement);
+			return;
+		}
+		if (replacement === undefined || this.#installUnavailable) {
+			// The row cannot be observed right now: the subscription ends the same
+			// truthful way it does when an install cannot watch it.
+			if (replacement !== undefined) this.#retireWatch(replacement);
+			this.#installUnavailable = false;
+			this.#terminateSubscription("unavailable", "source_unavailable");
+			return;
+		}
+		this.#watch = replacement;
+		const retained = this.#pending;
+		this.#pending = null;
+		this.#installUnavailable = false;
+		const initial = replacement.snapshot;
+		// The newest observation wins, exactly as at install: a retained change can be
+		// newer than the handle's own sample, and only an observed snapshot is ever
+		// published.
+		this.#onContent(retained !== null && retained.sequence > initial.sequence ? retained : initial);
 	}
 
 	#onUnsubscribe(subscriptionId: string): void {
@@ -934,6 +1314,531 @@ class OwnerBinding implements SessionContentChannelBinding {
 		// retirement. No session is affected either way and the channel stays open
 		// for an explicit fresh subscription.
 		this.#enqueueControl({ type: "unsubscribed", subscriptionId }, subscriptionId);
+	}
+
+	/* --------------------------------------------------------------------- *
+	 * Native input (optional capability)
+	 * --------------------------------------------------------------------- */
+
+	/**
+	 * The explicit optional-capability offer. Nothing is offered unless this host
+	 * was constructed with `nativeIo: true` AND the injected source really provides
+	 * both native IO primitives; a peer offering the identifier is never an offer,
+	 * and an un-negotiated channel keeps the exact legacy acknowledgement bytes.
+	 */
+	#nativeIoOffer(): SessionContentNegotiationOptions | undefined {
+		if (this.#provider === null) return undefined;
+		return { supportedOptionalCapabilities: [SESSION_CONTENT_NATIVE_IO_CAPABILITY] };
+	}
+
+	/**
+	 * Consume one native input frame. Nothing here is trusted because it arrived:
+	 * the exact peer key is re-authorized for every request, chunk, and end, the
+	 * frame must belong to this channel's own live subscription, and the echoed
+	 * source is compared field by field against the CURRENT owner facts before any
+	 * owner-private fact is used for a write. An abandoned input's remaining pages
+	 * are dropped quietly — an ordinary staleness refusal never becomes a protocol
+	 * failure and never poisons the valid input that follows it.
+	 */
+	#onNativeInput(frame: NativeInputWireFrame): void {
+		if (!this.#nativeIoNegotiated || this.#provider === null) {
+			// An extension this channel never negotiated is a frame this side never
+			// receives: a peer cannot quietly begin sending input or claim a copy.
+			this.#violation();
+			return;
+		}
+		if (!this.#authorize()) {
+			this.#refuseUnauthorized(frame.subscriptionId);
+			return;
+		}
+		if (this.#state === "finished") return;
+		if (this.#fenced) {
+			this.#refuse();
+			return;
+		}
+		const assembler = this.#inputAssembler;
+		if (this.#state !== "subscribed" || assembler === null || this.#viewerId === null
+			|| frame.subscriptionId !== this.#subscriptionId) {
+			// A frame for no subscription, a retired subscription, or another viewer's
+			// subscription changes nothing, writes nothing, and is never retargeted onto
+			// this one. One fixed refusal answers it, exactly as a resize is answered.
+			this.#diagnostic("protocol_violation");
+			this.#enqueueControl({ type: "error", code: "protocol_violation", subscriptionId: frame.subscriptionId });
+			return;
+		}
+		if (this.#ignoredInputId !== null && frame.inputId === this.#ignoredInputId) {
+			if (frame.type === "input" || frame.type === "input_begin") {
+				// A fresh start replaces the single discard marker.
+				this.#ignoredInputId = null;
+			} else {
+				// At most one abandoned input's remaining pages are consumed and dropped.
+				return;
+			}
+		}
+		if (frame.type === "input_begin") {
+			// A paged paste is admitted by its own header: the source and the modes it
+			// names must be CURRENT now, or the whole paste is freed here and never
+			// becomes an open assembly a later valid packet has to step over.
+			if (this.#inputTarget(frame.source, frame.inputModes) === null) {
+				this.#refuseInputQuietly(frame.inputId);
+				return;
+			}
+		} else if (frame.type !== "input") {
+			// A chunk or an end belongs to the open assembly, whose own header facts are
+			// re-proved before the page is taken. A change in the owner's scope or modes
+			// frees the partial paste instead of letting it finish against facts it was
+			// never made for, and a later current packet is unaffected.
+			const header = this.#inputHeader;
+			if (header !== null && header.inputId === frame.inputId
+				&& this.#inputTarget(header.source, header.inputModes) === null) {
+				this.#refuseInputQuietly(header.inputId);
+				return;
+			}
+		}
+		let completed: NativeIoCompletedInput | undefined;
+		try {
+			completed = assembler.accept(frame);
+		} catch {
+			// Malformed, reordered, foreign, oversized, or replayed: the helper already
+			// discarded the partial assembly, no partial packet was written, and this
+			// lane fails closed under the existing wire policy. No session is touched.
+			this.#resetInputAssembler();
+			this.#violation();
+			return;
+		}
+		if (completed !== undefined) {
+			this.#clearInputAssembly();
+			this.#admitInput(completed);
+			return;
+		}
+		// An open paged paste is bounded by the existing transfer idle deadline;
+		// each accepted page restarts it, and it never outlives this binding.
+		if (frame.type === "input_begin") {
+			this.#inputHeader = { inputId: frame.inputId, source: frame.source, inputModes: frame.inputModes };
+		}
+		this.#inputAssemblyId = frame.inputId;
+		this.#armInputDeadline();
+	}
+
+	/**
+	 * Free one input with no protocol consequence: any partial assembly is discarded,
+	 * its remaining pages are marked for quiet dropping, and the next valid packet is
+	 * unaffected. Nothing was written, nothing is retried, and nothing is reported to
+	 * the peer — an ordinary staleness refusal stays off the wire.
+	 */
+	#refuseInputQuietly(inputId: string): void {
+		this.#ignoredInputId = inputId;
+		this.#resetInputAssembler();
+		this.#diagnostic("input_refused");
+	}
+
+	/**
+	 * Admit one atomically assembled input packet. The current target is proven, the
+	 * packet is translated exactly once with the owner's existing translator, then
+	 * the grant and the target are proven again immediately before the one
+	 * synchronous handoff. Every refusal writes zero bytes, retries nothing, and
+	 * leaves the subscription usable.
+	 */
+	#admitInput(completed: NativeIoCompletedInput): void {
+		const provider = this.#provider;
+		if (provider === null) {
+			this.#diagnostic("input_refused");
+			return;
+		}
+		const admitted = this.#inputTarget(completed.source, completed.inputModes);
+		if (admitted === null) {
+			// Stale, foreign, incomplete, or mode-mismatched: no owner-private fact is
+			// consulted and no byte is produced.
+			this.#diagnostic("input_refused");
+			return;
+		}
+		const data = this.#translateNativeInput(completed, admitted.modes, {
+			// Canonical content geometry: this endpoint publishes one whole viewport, so
+			// its packets are already in content coordinates.
+			column: 0,
+			row: 0,
+			cols: admitted.wire.geometry.cols,
+			rows: admitted.wire.geometry.rows,
+		});
+		if (data === undefined) {
+			// Nothing the owner cannot translate reaches a child. This is a quiet refusal,
+			// not a protocol failure: no dialog, no retry, no disconnect.
+			this.#diagnostic("input_refused");
+			return;
+		}
+		if (!this.#authorize()) {
+			this.#refuseUnauthorized(this.#subscriptionId ?? undefined);
+			return;
+		}
+		// Re-proved after arbitrary authorizer code and immediately before the single
+		// write: these bytes were made for THIS scope and THESE modes, and only the
+		// CURRENT owner-private scope is handed to the lower fence.
+		const target = this.#inputTarget(completed.source, completed.inputModes);
+		if (target === null) {
+			this.#diagnostic("input_refused");
+			return;
+		}
+		let outcome: NativeViewerInputResult;
+		try {
+			// The lower seam is addressed by the owner's OWN viewer id, and every current
+			// fact travels as the expected source it re-checks. A wire value is never an
+			// address: this id came from this binding's own registration.
+			outcome = provider.write(target.lower.viewerId, {
+				expectedSource: target.lower,
+				expectedInputModes: target.modes,
+				data,
+			});
+		} catch {
+			outcome = { status: "unknown" };
+		}
+		if (outcome.status === "refused") {
+			// A refusal before any write is ordinary staleness. Nothing here stops an
+			// owner view, opens a dialog, retries, or disconnects.
+			this.#diagnostic("input_refused");
+			return;
+		}
+		if (outcome.status === "unknown") {
+			// The handoff was invoked and its result is genuinely uncertain. It is never
+			// retried and never reported as either delivered or definitely not sent.
+			this.#diagnostic("input_uncertain");
+		}
+	}
+
+	/**
+	 * The owner's CURRENT input target for one echoed wire source, or null. Every
+	 * field of the echoed source must equal the CURRENT mapped owner scope, so an
+	 * old A source is never retargeted onto a current B viewport (not even an
+	 * A -> B -> A change, which differs by geometry or viewer revision), and the
+	 * modes the packet was made for must equal the modes last observed.
+	 */
+	#inputTarget(expected: NativeIoSource, expectedModes: TerminalInputModes): NativeInputTarget | null {
+		const provider = this.#provider;
+		const viewerId = this.#viewerId;
+		if (provider === null || viewerId === null) return null;
+		const lower = provider.readSource(viewerId);
+		const wire = toNativeIoSource(lower);
+		if (lower === undefined || wire === null) return null;
+		if (lower.hostRunId !== this.#subscriptionRun || lower.rowId !== this.#sessionId) return null;
+		if (!nativeIoSourceEquals(expected, wire)) return null;
+		const modes = this.#inputModes;
+		if (modes === null || !sameInputModes(expectedModes, modes)) return null;
+		return { lower, wire, modes };
+	}
+
+	/**
+	 * Translate one packet exactly once with the owner's existing translator.
+	 * A keyboard packet arrives already normalized for its own source; a mouse
+	 * packet must be one canonical SGR report in content coordinates (never a key or
+	 * a paste in disguise) which the translator re-encodes for the child's actual
+	 * X10/SGR modes and geometry, returning raw bytes for a legacy report; a paste
+	 * carries only its text body, wrapped in the native bracketed-paste markers only
+	 * when the child's own current mode asks for them. There is no second
+	 * translator, no image path, and no raw control export.
+	 */
+	#translateNativeInput(
+		completed: NativeIoCompletedInput,
+		modes: TerminalInputModes,
+		viewport: InputViewport,
+	): string | Buffer | undefined {
+		if (completed.kind === "mouse") {
+			if (!completed.text.startsWith(SGR_MOUSE_PREFIX)) return undefined;
+			const mouse = parseMouseInput(completed.text);
+			if (mouse === undefined || mouse === null) return undefined;
+			return translateInput(completed.text, modes, viewport);
+		}
+		if (completed.kind === "paste") {
+			// The whole paste was validated and assembled before this point; it is handed
+			// over complete or not at all, never truncated. It is always presented to the
+			// owner's translator AS a paste: that translator keeps the bracketed-paste
+			// markers when the child asked for them and removes exactly that outer wrapper
+			// when it did not, so a body is never reinterpreted as a keyboard packet —
+			// an embedded Escape or literal paste markers inside it stay untouched.
+			if (completed.byteLength === 0 || completed.byteLength > NATIVE_TEXT_PASTE_MAX_BYTES) return undefined;
+			return translateInput(
+				`${PASTE_START}${completed.text}${PASTE_END}`,
+				modes,
+				viewport,
+			);
+		}
+		return translateInput(completed.text, modes, viewport);
+	}
+
+	/**
+	 * Discard partial bytes WITHOUT forgetting the ordinals already completed. The
+	 * helper's own reset keeps its replay fence, because a dispatch ordinal belongs to
+	 * this binding and a packet that already reached the child must never be handed
+	 * over a second time by a refusal that merely freed a buffer. Only retirement
+	 * (`#clearInputState`) drops the helper, so a new subscription starts a new fence.
+	 */
+	#resetInputAssembler(): void {
+		if (this.#provider === null || !this.#nativeIoNegotiated) {
+			this.#inputAssembler = null;
+		} else if (this.#inputAssembler === null) {
+			this.#inputAssembler = createNativeInputAssembler(this.#bounds);
+		} else {
+			this.#inputAssembler.reset();
+		}
+		this.#clearInputAssembly();
+	}
+
+	/** Drop any partial assembly and its owned deadline. Idempotent. */
+	#clearInputAssembly(): void {
+		this.#clearInputDeadline();
+		this.#inputAssemblyId = null;
+		this.#inputHeader = null;
+	}
+
+	/** Release every input fact this binding holds, including the discard marker. */
+	#clearInputState(): void {
+		this.#clearInputAssembly();
+		this.#inputAssembler = null;
+		this.#ignoredInputId = null;
+		this.#statedSource = null;
+		this.#inputModes = null;
+	}
+
+	/**
+	 * Free a partial assembly the moment its scope is gone — from the content watch
+	 * or a lifecycle change, not only when the next page happens to arrive. The one
+	 * abandoned input's remaining pages are then dropped rather than mistaken for a
+	 * protocol failure, and nothing partial is ever produced.
+	 */
+	#abandonInputAssembly(): void {
+		if (this.#inputAssemblyId === null) return;
+		this.#ignoredInputId = this.#inputAssemblyId;
+		this.#resetInputAssembler();
+		// The owner is told a partial input was freed, with no wire consequence and no
+		// claim that anything was written.
+		this.#diagnostic("input_incomplete");
+	}
+
+	#armInputDeadline(): void {
+		this.#clearInputDeadline();
+		const timer = setTimeout(() => {
+			this.#inputTimer = null;
+			this.#onInputDeadline();
+		}, this.#timeouts.transferIdleTimeoutMs);
+		timer.unref?.();
+		this.#inputTimer = timer;
+	}
+
+	#clearInputDeadline(): void {
+		if (this.#inputTimer === null) return;
+		clearTimeout(this.#inputTimer);
+		this.#inputTimer = null;
+	}
+
+	/**
+	 * A paged paste that stopped making progress ends THIS content subscription —
+	 * the same bounded way a stalled write does — and nothing else. No child is
+	 * stopped, no partial text is produced, nothing is replayed, and the channel
+	 * stays open for an explicit fresh subscription.
+	 */
+	#onInputDeadline(): void {
+		if (this.#state !== "subscribed" || this.#fenced) return;
+		if (this.#inputAssemblyId === null) return;
+		this.#terminateSubscription("transfer_failed", "input_incomplete");
+	}
+
+	/**
+	 * The input source this endpoint may state for one publish, or null when nothing
+	 * is coherent right now. A source is stated only when it names this snapshot's
+	 * own run, row, native tuple, and canonical geometry including its revision: a
+	 * viewport that reports no native conversation never carries a live tuple, and a
+	 * newer tuple is never stamped onto an older viewport.
+	 */
+	#snapshotInputSource(snapshot: OwningHostSessionContentSnapshot): NativeIoSource | null {
+		const provider = this.#provider;
+		const viewerId = this.#viewerId;
+		if (provider === null || !this.#nativeIoNegotiated || viewerId === null) return null;
+		if (snapshot.nativeSession === null) return null;
+		if (snapshot.hostRunId !== this.#subscriptionRun || snapshot.sessionId !== this.#sessionId) return null;
+		const wire = toNativeIoSource(provider.readSource(viewerId));
+		if (wire === null) return null;
+		if (wire.hostRunId !== snapshot.hostRunId || wire.sessionId !== snapshot.sessionId) return null;
+		if (wire.nativeSession.sessionId !== snapshot.nativeSession.sessionId
+			|| wire.nativeSession.epoch !== snapshot.nativeSession.epoch) {
+			return null;
+		}
+		if (wire.geometry.cols !== snapshot.geometry.cols
+			|| wire.geometry.rows !== snapshot.geometry.rows
+			|| wire.geometry.revision !== snapshot.geometry.revision) {
+			return null;
+		}
+		return wire;
+	}
+
+	/**
+	 * State the source for one publish and free any partial input it no longer
+	 * describes. Ordinary viewport text and sequence changes leave the semantic input
+	 * source unchanged, so they never invalidate an unchanged source; a run, row,
+	 * tuple, geometry-revision, viewer-revision, or token change does.
+	 */
+	#publishInputSource(snapshot: OwningHostSessionContentSnapshot): NativeIoSource | null {
+		const mapped = this.#snapshotInputSource(snapshot);
+		const previous = this.#statedSource;
+		const changed = previous === null
+			? mapped !== null
+			: mapped === null || !nativeIoSourceEquals(previous, mapped);
+		this.#statedSource = mapped;
+		if (changed) this.#abandonInputAssembly();
+		return mapped;
+	}
+
+	/**
+	 * Record the newest observation for input admission and source coherence. A
+	 * partial input was made for one geometry, one mode set, and one source, so a
+	 * change to ANY of them frees it — including a mode change that goes A -> B -> A
+	 * back to the modes it started with.
+	 */
+	#noteInputObservation(snapshot: OwningHostSessionContentSnapshot): void {
+		if (this.#provider === null || !this.#nativeIoNegotiated) return;
+		const previousModes = this.#inputModes;
+		this.#inputModes = snapshot.inputModes;
+		if (previousModes !== null && !sameInputModes(previousModes, snapshot.inputModes)) {
+			this.#abandonInputAssembly();
+		}
+		this.#publishInputSource(snapshot);
+	}
+
+	/* --------------------------------------------------------------------- *
+	 * Native copy (optional capability)
+	 * --------------------------------------------------------------------- */
+
+	/**
+	 * This binding's own native copy sink. The manager calls it with the receipt for
+	 * the input THIS surface caused, and everything is re-proved here: the lane, the
+	 * grant, this binding's own live viewer, and the exact owner-private scope the
+	 * receipt names. Nothing falls back to the owner's local clipboard callback, the
+	 * outer terminal, a sibling viewer, the last or highest input dispatch, or a PTY
+	 * write, and a receipt that arrives after this binding retired is simply dropped.
+	 */
+	#onNativeCopy(receipt: NativeViewerClipboardReceipt): void {
+		if (this.#provider === null || !this.#nativeIoNegotiated) return;
+		if (this.#state !== "subscribed" || this.#fenced) return;
+		const subscriptionId = this.#subscriptionId;
+		const hostRunId = this.#subscriptionRun;
+		const viewerId = this.#viewerId;
+		if (subscriptionId === null || hostRunId === null || viewerId === null) return;
+		const generation = this.#generation;
+		if (!this.#authorize()) return;
+		const current = this.#provider.readSource(viewerId);
+		if (current === undefined) {
+			this.#diagnostic("copy_dropped");
+			return;
+		}
+		// The exact initiating surface: same viewer, registration, generation, row,
+		// run, native tuple, geometry, viewer revision, and token as right now.
+		if (!sameNativeViewerScope(current, receipt.source)) {
+			this.#diagnostic("copy_dropped");
+			return;
+		}
+		// The producer's own event must name the same native conversation.
+		if (receipt.event.sessionId !== current.nativeSession.sessionId
+			|| receipt.event.sessionEpoch !== current.nativeSession.epoch) {
+			this.#diagnostic("copy_dropped");
+			return;
+		}
+		const source = toNativeIoSource(current);
+		if (source === null) {
+			this.#diagnostic("copy_dropped");
+			return;
+		}
+		const identity = {
+			subscriptionId,
+			copyId: randomUUID(),
+			sequence: this.#nextCopySequence + 1,
+			source,
+			dispatchId: receipt.dispatchId,
+			bounds: this.#bounds,
+		};
+		let built: NativeIoBuiltTransfer;
+		try {
+			built = this.#buildCopyUnit(identity, receipt.event);
+		} catch {
+			// A copy this side cannot represent whole is refused whole: no partial
+			// emission, no truncated clipboard text, and no claim of delivery.
+			this.#diagnostic("copy_dropped");
+			return;
+		}
+		if (this.#copyQueue.length >= MAX_PENDING_CONTROLS) {
+			// Copies share the one bounded writer. Silently dropping one while an older
+			// copy stays queued would claim a clipboard change that never happened, so the
+			// transport fails closed instead. The session is untouched.
+			this.#diagnostic("send_failed");
+			this.#fence("send_failed", { closeChannel: true });
+			return;
+		}
+		this.#nextCopySequence = identity.sequence;
+		this.#copyQueue.push({
+			frames: built.frames,
+			subscriptionId,
+			hostRunId,
+			source,
+			generation,
+			index: 0,
+			started: false,
+		});
+		this.#drain();
+	}
+
+	/**
+	 * Pack one whole native text copy: one message when the encoded text fits, and
+	 * otherwise the paged form across the unchanged native 100,000-character producer
+	 * bound. A copy is never trimmed to a transport message size, and an unavailable
+	 * copy is carried as its fixed reason with the same authenticated tuple.
+	 */
+	#buildCopyUnit(
+		identity: {
+			readonly subscriptionId: string;
+			readonly copyId: string;
+			readonly sequence: number;
+			readonly source: NativeIoSource;
+			readonly dispatchId: number;
+			readonly bounds: SessionContentBounds;
+		},
+		event: NativeViewerClipboardReceipt["event"],
+	): NativeIoBuiltTransfer {
+		if (event.kind !== "copy") return buildNativeCopyInline({ ...identity, event });
+		try {
+			return buildNativeCopyInline({ ...identity, event });
+		} catch (error) {
+			if (!(isSessionContentProtocolError(error)
+				&& (error.code === "frame_too_large" || error.code === "transfer_too_large"))) {
+				throw error;
+			}
+			// Too wide for one message: the whole encoded text crosses as pages.
+			return buildNativeCopyPaged({ ...identity, encoded: event.encoded });
+		}
+	}
+
+	/** Next copy emission to write, dropping any whose subscription is already gone. */
+	#takeCopyUnit(): QueuedNativeCopy | null {
+		for (;;) {
+			const unit = this.#copyQueue.shift();
+			if (unit === undefined) return null;
+			if (unit.generation !== this.#generation || unit.subscriptionId !== this.#subscriptionId
+				|| unit.hostRunId !== this.#subscriptionRun) {
+				this.#diagnostic("copy_dropped");
+				continue;
+			}
+			return unit;
+		}
+	}
+
+	/** The exact scope this copy was emitted for, proven against the CURRENT facts. */
+	#copyScopeCurrent(copy: QueuedNativeCopy): boolean {
+		const provider = this.#provider;
+		const viewerId = this.#viewerId;
+		if (provider === null || viewerId === null) return false;
+		const wire = toNativeIoSource(provider.readSource(viewerId));
+		return wire !== null && nativeIoSourceEquals(wire, copy.source);
+	}
+
+	/** Release every queued and in-flight copy. Never claims they were delivered. */
+	#clearCopyWork(): void {
+		this.#copyInFlight = null;
+		this.#copyQueue = [];
 	}
 
 	/* --------------------------------------------------------------------- *
@@ -973,6 +1878,10 @@ class OwnerBinding implements SessionContentChannelBinding {
 		if (this.#pending !== null && snapshot.sequence <= this.#pending.sequence) return;
 		const replaced = this.#pending !== null;
 		this.#pending = snapshot;
+		// The newest observation decides both the input modes and whether the source
+		// this endpoint may still state changed; a change frees a partial input here,
+		// not only when the next page happens to arrive.
+		this.#noteInputObservation(snapshot);
 		if (replaced) this.#diagnostic("viewport_pending_replaced");
 		// With no transfer in flight this newer snapshot starts immediately; with one
 		// in flight it waits as the single newest-wins pending snapshot.
@@ -985,10 +1894,11 @@ class OwnerBinding implements SessionContentChannelBinding {
 
 	/**
 	 * The single writer. Control frames go first (they are the peer's refusals,
-	 * acknowledgements, and owner notifications), then the next frame of the one
-	 * in-flight transfer. Only one write is ever outstanding, so no control frame
-	 * can race a viewport begin and no request flood can multiply outstanding
-	 * writes.
+	 * acknowledgements, and owner notifications), then one frame of the one queued
+	 * native copy emission, then the next frame of the one in-flight transfer. Only
+	 * one write is ever outstanding, so no control frame can race a viewport begin,
+	 * two copy assemblies never interleave, and no request flood can multiply
+	 * outstanding writes.
 	 */
 	#drain(): void {
 		if (this.#sending) return;
@@ -1008,6 +1918,55 @@ class OwnerBinding implements SessionContentChannelBinding {
 		}
 		if (this.#state === "finished" || this.#fenced || this.#state !== "subscribed") {
 			this.#notifyWriterIdle();
+			return;
+		}
+		// A native copy is this viewer's own clipboard feedback, so it is admitted
+		// ahead of the next viewport frame; control frames keep their priority and the
+		// viewport still advances whenever no copy is queued. Exactly one assembly is
+		// written at a time, so two copies never interleave their pages.
+		if (this.#copyInFlight === null) this.#copyInFlight = this.#takeCopyUnit();
+		const copy = this.#copyInFlight;
+		if (copy !== null) {
+			if (copy.generation !== this.#generation || copy.subscriptionId !== this.#subscriptionId
+				|| copy.hostRunId !== this.#subscriptionRun || !this.#copyScopeCurrent(copy)) {
+				// A stale emission is never reported as delivered.
+				this.#copyInFlight = null;
+				this.#diagnostic("copy_dropped");
+				if (copy.started) {
+					// Part of THIS copy already reached the viewer, and its pages can never
+					// be completed. Leaving the peer holding an unfinished assembly would
+					// poison every later copy on this subscription, so the content
+					// subscription retires through the existing transfer-failure path: the
+					// viewer's assembly dies with it, and a fresh subscription starts clean.
+					this.#terminateSubscription("transfer_failed", "copy_dropped");
+					return;
+				}
+				// Nothing of it ever left, so the viewer never saw it. Drop it whole and
+				// keep this subscription serving viewport and later copies.
+				this.#drain();
+				return;
+			}
+			if (copy.index >= copy.frames.length) {
+				this.#copyInFlight = null;
+				this.#drain();
+				return;
+			}
+			// Authorization, binding, subscription, and scope are re-checked before every
+			// copy frame, chunk, and end.
+			if (!this.#authorize()) {
+				this.#refuseUnauthorized(copy.subscriptionId);
+				return;
+			}
+			const frame = copy.frames[copy.index];
+			if (frame === undefined) {
+				this.#copyInFlight = null;
+				this.#notifyWriterIdle();
+				return;
+			}
+			// From this point the viewer has seen part of this emission, so it can no
+			// longer be discarded as if it had never happened.
+			copy.started = true;
+			this.#write(frame, { kind: "copy", copy });
 			return;
 		}
 		if (this.#transfer === null) {
@@ -1053,7 +2012,7 @@ class OwnerBinding implements SessionContentChannelBinding {
 			this.#terminateSubscription("send_failed", "viewport_failed");
 			return;
 		}
-		this.#write(frame, transfer);
+		this.#write(frame, { kind: "transfer", transfer });
 	}
 
 	#beginTransfer(snapshot: OwningHostSessionContentSnapshot): void {
@@ -1066,6 +2025,13 @@ class OwnerBinding implements SessionContentChannelBinding {
 			return;
 		}
 		if (snapshot.sequence <= this.#publishedSequence) return;
+		let inputSource: NativeIoSource | null | undefined;
+		if (this.#provider !== null && this.#nativeIoNegotiated) {
+			// What goes on the wire is this publish's own current observation: the modes
+			// the child actually has, and only a source that describes this exact frame.
+			this.#noteInputObservation(snapshot);
+			inputSource = this.#statedSource;
+		}
 		let built: SessionContentBuiltTransfer;
 		try {
 			// The codec produces the complete immutable transfer: begin, sequential
@@ -1081,6 +2047,9 @@ class OwnerBinding implements SessionContentChannelBinding {
 				geometry: snapshot.geometry,
 				inputModes: snapshot.inputModes,
 				frame: snapshot.frame,
+				// Omitted entirely while the extension was not negotiated, so a legacy
+				// publish keeps its exact key set; null states that no source exists now.
+				...(inputSource === undefined ? {} : { inputSource }),
 				bounds: this.#bounds,
 			});
 		} catch (error) {
@@ -1102,10 +2071,10 @@ class OwnerBinding implements SessionContentChannelBinding {
 	}
 
 	/**
-	 * Take the one send slot for exactly one message and bound it. `transfer` is
-	 * null for a control frame and the owning transfer for a content frame.
+	 * Take the one send slot for exactly one message and bound it. `owner` is null
+	 * for a control frame, the owning viewport transfer, or the owning copy emission.
 	 */
-	#write(bytes: Buffer, transfer: InFlightTransfer | null): void {
+	#write(bytes: Buffer, owner: QueuedWrite | null): void {
 		const token = {};
 		this.#sending = true;
 		this.#writeToken = token;
@@ -1120,24 +2089,43 @@ class OwnerBinding implements SessionContentChannelBinding {
 		// peer received them. The rejection and settlement paths are both owned.
 		void written.then(() => {
 			if (!this.#settleWrite(token)) return;
-			if (transfer !== null && this.#transfer !== transfer) {
+			if (owner !== null && owner.kind === "transfer" && this.#transfer !== owner.transfer) {
 				// A stop, unsubscribe, or replacement during the write cancelled the
 				// rest of this transfer. That write was holding the single send slot,
 				// so whatever replaced it has to be picked up here.
 				this.#drain();
 				return;
 			}
-			if (transfer !== null) transfer.index += 1;
-			this.#drain();
-		}, () => {
-			if (!this.#settleWrite(token)) return;
-			if (transfer !== null && this.#transfer !== transfer) {
+			if (owner !== null && owner.kind === "copy" && this.#copyInFlight !== owner.copy) {
 				this.#drain();
 				return;
 			}
-			if (transfer === null) {
+			if (owner !== null) {
+				if (owner.kind === "transfer") owner.transfer.index += 1;
+				else owner.copy.index += 1;
+			}
+			this.#drain();
+		}, () => {
+			if (!this.#settleWrite(token)) return;
+			if (owner !== null && owner.kind === "transfer" && this.#transfer !== owner.transfer) {
+				this.#drain();
+				return;
+			}
+			if (owner !== null && owner.kind === "copy" && this.#copyInFlight !== owner.copy) {
+				this.#drain();
+				return;
+			}
+			if (owner === null) {
 				// A control frame the peer never received: this binding has no way to
 				// keep the viewer's view truthful, so it retires and closes.
+				this.#failWriter();
+				return;
+			}
+			if (owner.kind === "copy") {
+				// A copy frame the peer never received is never presented as a clipboard
+				// change that happened: the content lane retires and closes, with no retry,
+				// no cancellation claim about bytes already admitted, and no session stop.
+				this.#diagnostic("send_failed");
 				this.#failWriter();
 				return;
 			}
@@ -1172,6 +2160,7 @@ class OwnerBinding implements SessionContentChannelBinding {
 			this.#control = [];
 			this.#transfer = null;
 			this.#pending = null;
+			this.#clearCopyWork();
 			this.#diagnostic("send_timeout");
 			this.#fence("send_failed", { closeChannel: true });
 			// The failed writer also requests the same one bounded close directly, so
@@ -1203,6 +2192,10 @@ class OwnerBinding implements SessionContentChannelBinding {
 		this.#generation += 1;
 		this.#transfer = null;
 		this.#pending = null;
+		// Queued native copies and any partial input belong to this subscription: they
+		// are released here, never rewritten afterwards and never claimed as delivered.
+		this.#clearCopyWork();
+		this.#clearInputState();
 		this.#installSnapshot = null;
 		this.#subscriptionRun = null;
 		this.#publishedSequence = 0;
@@ -1407,6 +2400,7 @@ class OwnerBinding implements SessionContentChannelBinding {
 			this.#sending = false;
 			this.#clearSendTimer();
 			this.#control = [];
+			this.#clearCopyWork();
 			void this.#closeChannel();
 		}
 		// A fence or writer failure may already have requested this one bounded
@@ -1473,6 +2467,7 @@ class OwnerBinding implements SessionContentChannelBinding {
 		this.#control = [];
 		this.#transfer = null;
 		this.#pending = null;
+		this.#clearCopyWork();
 		this.#diagnostic("send_failed");
 		this.#fenced = true;
 		this.#retireSubscription();
@@ -1487,6 +2482,7 @@ class OwnerBinding implements SessionContentChannelBinding {
 	#isWriterIdle(): boolean {
 		if (this.#sending) return false;
 		if (this.#control.length > 0) return false;
+		if (this.#copyInFlight !== null || this.#copyQueue.length > 0) return false;
 		if (this.#state === "subscribed" && (this.#transfer !== null || this.#pending !== null)) return false;
 		return true;
 	}
@@ -1661,6 +2657,9 @@ export function createSessionContentHost(options: SessionContentHostOptions): Se
 	}
 	const bounds = resolveSessionContentBounds(options.bounds);
 	const timeouts = resolveTimeouts(options.timeouts);
+	// Resolved before any channel can be attached: an opt-in without a real provider
+	// is no offer, and an invalid opt-in is refused here rather than at a hello.
+	const provider = resolveNativeIoProvider(options);
 	const bindings = new Set<OwnerBinding>();
 	/**
 	 * Sticky fail-closed state: once any owned retirement is unconfirmed this host
@@ -1701,7 +2700,7 @@ export function createSessionContentHost(options: SessionContentHostOptions): Se
 				// resources could not be retired never registers another participant.
 				throw new SessionContentHostCloseError();
 			}
-			const binding = new OwnerBinding(channel, options, bounds, timeouts, diagnostic, () => {
+			const binding = new OwnerBinding(channel, options, bounds, timeouts, provider, diagnostic, () => {
 				// Admission is fenced the instant cleanup becomes uncertain, before any
 				// settlement and before the bounded close has finished.
 				cleanupUnconfirmed = true;

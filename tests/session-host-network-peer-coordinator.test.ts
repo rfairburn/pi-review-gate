@@ -25,12 +25,47 @@ import {
 	type PeerCoordinatorTestHooks,
 } from "../src/session-host/network/peer-coordinator";
 import type { OwnerCloseRequest } from "../src/session-host/network/peer-close";
-import type { PeerByteChannel } from "../src/session-host/network/channel";
+import type { PeerByteChannel, PeerChannelClose } from "../src/session-host/network/channel";
+import type {
+	PeerContentController,
+	PeerContentObservation,
+	PeerNativeCopyReceipt,
+	PeerNativeInputRequest,
+	PeerNativeInputTarget,
+} from "../src/session-host/network/peer-content";
+import {
+	SESSION_CONTENT_MAJOR,
+	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+	SESSION_CONTENT_REQUIRED_CAPABILITY,
+	SESSION_CONTENT_SERVICE,
+	buildNativeCopyInline,
+	buildSessionContentTransfer,
+	decodeSessionContentFrame,
+	encodeSessionContentFrame,
+	resolveSessionContentBounds,
+	type NativeIoSource,
+	type SessionContentFrame,
+} from "../src/session-host/network/session-content-protocol";
+import type { SessionContentSource } from "../src/session-host/network/session-content-host";
+import type {
+	OwningHostInventoryListener,
+	OwningHostInventorySnapshot,
+	OwningHostInventoryWatch,
+	OwningHostSessionContentListener,
+	OwningHostSessionContentSnapshot,
+	OwningHostSessionContentWatch,
+	SessionViewerState,
+	SessionViewerUpdate,
+	SessionViewerUpdateResult,
+} from "../src/session-host/owning-host-service";
+import type { NativeInstanceView, SessionGeometry } from "../src/session-host/instances";
+import type { TerminalFrame, TerminalInputModes } from "../src/session-host/terminal-surface";
 import {
 	DEFAULT_PEER_PREFERENCES,
 	openPeerPreferencesStoreWithPermissions,
 } from "../src/session-host/network/peer-preferences-store";
-import { generatePeerIdentity } from "../src/session-host/network/identity";
+import { generatePeerIdentity, type PeerKey } from "../src/session-host/network/identity";
 import { openPeerStateStoreWithPermissions } from "../src/session-host/network/peer-state-store";
 import type { PeerCoordinator } from "../src/session-host/peer-ui-protocol";
 import { assertRefused } from "./session-host-network-helpers";
@@ -46,6 +81,8 @@ import {
 	rowView,
 	startCoordinator,
 	type FakeInventory,
+	type InventorySource,
+	type SnapshotLog,
 	type StartedCoordinator,
 } from "./session-host-network-peer-coordinator-helpers";
 
@@ -78,8 +115,11 @@ async function bindHost(t: TestContext, agentDir: string, port: number | 0, extr
 	return side;
 }
 
+/** Only the two facts a connect/observe helper needs; every fixture side has them. */
+type CoordinatorSide = Pick<StartedCoordinator, "coordinator" | "log">;
+
 async function addDestination(
-	side: StartedCoordinator,
+	side: Pick<StartedCoordinator, "coordinator">,
 	label: string,
 	port: number,
 ): Promise<string> {
@@ -93,8 +133,8 @@ async function addDestination(
 
 /** Connect and approve the local first-use key plus the remote human window. */
 async function connectWithApprovals(
-	clientSide: StartedCoordinator,
-	hostSide: StartedCoordinator,
+	clientSide: CoordinatorSide,
+	hostSide: CoordinatorSide,
 	hostId: string,
 	options: { approveServerKey?: boolean; decideIncoming?: "approve" | "deny" } = APPROVE_BOTH,
 ): Promise<void> {
@@ -120,7 +160,7 @@ async function connectWithApprovals(
 	await connecting;
 }
 
-async function waitConnected(side: StartedCoordinator, message: string, timeoutMs = 10_000) {
+async function waitConnected(side: Pick<StartedCoordinator, "log">, message: string, timeoutMs = 10_000) {
 	return side.log.waitFor(
 		(snapshot) => snapshot.hosts?.[0]?.state === "connected" && snapshot.hosts[0].roster.state === "current",
 		message,
@@ -2030,4 +2070,1118 @@ test("a coordinator that is closing never submits a close", async (t) => {
 		confirmed: false,
 	}), { kind: "not-sent", reason: "not-ready" });
 	assert.deepEqual(calls, []);
+});
+
+/* ------------------------------------------------------------------------- *
+ * Default-inert native input / copy seam (optional capability)
+ *
+ * These cases hold the coordinator to the SEAM only: callbacks are validated
+ * and closed, an owner that was given no binding publishes no native source, and
+ * a display stream never turns into input or copy by itself. The composing gates
+ * themselves need an owner endpoint that actually answers native IO, so they are
+ * proven against the real endpoint by the parent's two-endpoint TLS integration
+ * rather than by a synthesized assertion here.
+ * ------------------------------------------------------------------------- */
+
+const CONTENT_ROW = "instance-row-1";
+const OWNER_COLS = 80;
+const OWNER_ROWS = 24;
+
+/** The one observed input-mode set every fixture viewport carries. */
+const FIXTURE_INPUT_MODES: TerminalInputModes = Object.freeze({
+	kittyFlags: 0,
+	applicationCursorKeys: false,
+	applicationKeypad: false,
+	bracketedPaste: false,
+	mouseTracking: "none",
+	modifyOtherKeys: 0,
+	mouseEncoding: "default",
+});
+
+/** One plain fixture viewport at exactly the row's canonical geometry. */
+function fixtureViewport(cols: number, rows: number): TerminalFrame {
+	return Object.freeze({
+		cols,
+		rows,
+		// Runtime-frozen; the public frame type declares a mutable array.
+		lines: Object.freeze(Array.from({ length: rows }, (_unused, index) => `row ${index}`)) as string[],
+		cursor: Object.freeze({ column: 0, row: 0, visible: true }),
+	});
+}
+
+/** A caller expectation. A synthesized source is never authority by itself. */
+function inputSourceFixture(overrides: Partial<NativeIoSource> = {}): NativeIoSource {
+	return {
+		hostRunId: "run-fixture",
+		sessionId: CONTENT_ROW,
+		nativeSession: { sessionId: `conversation-${CONTENT_ROW}`, epoch: 3 },
+		geometry: { cols: OWNER_COLS, rows: OWNER_ROWS, revision: 0 },
+		viewerRevision: 1,
+		sourceToken: "token-fixture",
+		...overrides,
+	};
+}
+
+function inputRequestFixture(overrides: Partial<PeerNativeInputRequest> = {}): PeerNativeInputRequest {
+	return {
+		hostId: "destination-fixture",
+		selectionGeneration: 1,
+		subscriptionId: "subscription-fixture",
+		source: inputSourceFixture(),
+		inputModes: FIXTURE_INPUT_MODES,
+		kind: "keyboard",
+		text: "a",
+		...overrides,
+	};
+}
+
+interface OwnerInventoryWatch {
+	listener: OwningHostInventoryListener;
+	active: boolean;
+}
+
+interface OwnerContentWatch {
+	listener: OwningHostSessionContentListener;
+	active: boolean;
+}
+
+interface OwnerViewerRecord {
+	readonly viewerId: string;
+	sessionId: string | undefined;
+	cols: number | undefined;
+	rows: number | undefined;
+	revision: number;
+}
+
+/**
+ * The narrowest read-only owning-host stand-in this file needs: ONE owner run
+ * identity shared by the metadata inventory watch and one row's native viewport,
+ * plus the manager's own viewer registration. It has no session operation to
+ * call, so a content endpoint that needed one could never pass these cases.
+ */
+class FakeContentOwner implements InventorySource, SessionContentSource {
+	readonly runId = `run-${Math.random().toString(36).slice(2, 10)}`;
+	readonly rows: readonly string[];
+	/** Every capability call, in order, for inertness assertions. */
+	readonly calls: string[] = [];
+	// The initial authoritative inventory is revision one, as the roster wire requires.
+	#revision = 1;
+	#sequence = 0;
+	#nextViewerId = 1;
+	readonly #inventoryWatches = new Set<OwnerInventoryWatch>();
+	readonly #contentWatches = new Set<OwnerContentWatch>();
+	readonly #viewers = new Map<string, OwnerViewerRecord>();
+
+	constructor(rows: readonly string[]) {
+		this.rows = [...rows];
+	}
+
+	get liveViewers(): number {
+		return this.#viewers.size;
+	}
+
+	// ------------------------------------------------------------- metadata side
+
+	watchInventory(listener: OwningHostInventoryListener): OwningHostInventoryWatch | undefined {
+		this.calls.push("watchInventory");
+		if (typeof listener !== "function") throw new TypeError("inventory listener must be callable");
+		const watch: OwnerInventoryWatch = { listener, active: true };
+		this.#inventoryWatches.add(watch);
+		return Object.freeze({
+			snapshot: this.#inventorySnapshot(),
+			unsubscribe: (): void => {
+				if (!watch.active) return;
+				watch.active = false;
+				this.#inventoryWatches.delete(watch);
+			},
+		});
+	}
+
+	// -------------------------------------------------------------- content side
+
+	readInventorySnapshot(): OwningHostInventorySnapshot | undefined {
+		this.calls.push("readInventorySnapshot");
+		return this.#inventorySnapshot();
+	}
+
+	watchSessionContent(
+		sessionId: string,
+		listener: OwningHostSessionContentListener,
+	): OwningHostSessionContentWatch | undefined {
+		this.calls.push(`watchSessionContent:${sessionId}`);
+		if (typeof listener !== "function") throw new TypeError("content listener must be callable");
+		if (!this.rows.includes(sessionId)) return undefined;
+		const watch: OwnerContentWatch = { listener, active: true };
+		this.#contentWatches.add(watch);
+		return Object.freeze({
+			snapshot: this.#capture(sessionId),
+			unsubscribe: (): void => {
+				if (!watch.active) return;
+				watch.active = false;
+				this.#contentWatches.delete(watch);
+			},
+		});
+	}
+
+	openViewer(): SessionViewerState | undefined {
+		this.calls.push("openViewer");
+		const viewer: OwnerViewerRecord = {
+			viewerId: `viewer-${this.#nextViewerId++}`,
+			sessionId: undefined,
+			cols: undefined,
+			rows: undefined,
+			revision: 0,
+		};
+		this.#viewers.set(viewer.viewerId, viewer);
+		return this.#viewerState(viewer);
+	}
+
+	readViewer(viewerId: string): SessionViewerState | undefined {
+		const viewer = this.#viewers.get(viewerId);
+		return viewer === undefined ? undefined : this.#viewerState(viewer);
+	}
+
+	updateViewer(viewerId: string, update: SessionViewerUpdate = {}): SessionViewerUpdateResult {
+		this.calls.push(`updateViewer:${viewerId}`);
+		const viewer = this.#viewers.get(viewerId);
+		if (viewer === undefined) return { applied: false, reason: "unknown-viewer" };
+		if (update.expectedRevision !== undefined && update.expectedRevision !== viewer.revision) {
+			return { applied: false, reason: "stale" };
+		}
+		if (update.sessionId !== undefined) viewer.sessionId = update.sessionId ?? undefined;
+		if (update.cols !== undefined) viewer.cols = update.cols;
+		if (update.rows !== undefined) viewer.rows = update.rows;
+		viewer.revision += 1;
+		return { applied: true, state: this.#viewerState(viewer) };
+	}
+
+	closeViewer(viewerId: string): boolean {
+		this.calls.push(`closeViewer:${viewerId}`);
+		return this.#viewers.delete(viewerId);
+	}
+
+	// ----------------------------------------------------------------- internals
+
+	#inventorySnapshot(): OwningHostInventorySnapshot {
+		// The same synthetic row views the inventory fixtures own, on this run.
+		const rows: NativeInstanceView[] = this.rows.map((id) => rowView(id));
+		return Object.freeze({
+			hostRunId: this.runId,
+			revision: this.#revision,
+			rows: Object.freeze(rows),
+		});
+	}
+
+	#capture(sessionId: string): OwningHostSessionContentSnapshot {
+		this.#sequence += 1;
+		const geometry: SessionGeometry = Object.freeze({ cols: OWNER_COLS, rows: OWNER_ROWS, revision: 0 });
+		return Object.freeze({
+			hostRunId: this.runId,
+			sessionId,
+			nativeSession: Object.freeze({ sessionId: `conversation-${sessionId}`, epoch: 3 }),
+			sequence: this.#sequence,
+			geometry,
+			frame: fixtureViewport(geometry.cols, geometry.rows),
+			inputModes: FIXTURE_INPUT_MODES,
+		});
+	}
+
+	#viewerState(viewer: OwnerViewerRecord): SessionViewerState {
+		return Object.freeze({
+			viewerId: viewer.viewerId,
+			sessionId: viewer.sessionId,
+			cols: viewer.cols,
+			rows: viewer.rows,
+			revision: viewer.revision,
+		});
+	}
+}
+
+interface ContentSide {
+	readonly coordinator: ReturnType<typeof createPeerCoordinator>;
+	readonly log: SnapshotLog;
+}
+
+/**
+ * One coordinator with the content contracts wired. `contentSource` and
+ * `nativeIo` are optional on purpose: omitting them is the metadata-only,
+ * display-only coordinator the surrounding cases already rely on.
+ */
+async function startContentSide(
+	t: TestContext,
+	options: {
+		readonly agentDir: string;
+		readonly inventory: FakeContentOwner;
+		readonly contentSource?: FakeContentOwner;
+		readonly nativeIo?: PeerCoordinatorOptions["nativeIo"];
+		readonly listen?: boolean;
+	},
+): Promise<ContentSide> {
+	const log = createSnapshotLog();
+	const coordinator = createPeerCoordinator({
+		agentDir: options.agentDir,
+		inventory: options.inventory,
+		onChange: log.onChange,
+		onIncomingConsentArrival: log.onArrival,
+		testHooks: hooks(),
+		...(options.contentSource === undefined ? {} : { contentSource: options.contentSource }),
+		...(options.nativeIo === undefined ? {} : { nativeIo: options.nativeIo }),
+	});
+	t.after(async () => {
+		try {
+			await coordinator.close();
+		} catch {
+			// A rejected close is this test's own observed outcome, never a hook failure.
+		}
+	});
+	await coordinator.start();
+	if (options.listen === true) {
+		await coordinator.perform({ type: "peer-listener", enabled: true, host: "127.0.0.1", port: "0" });
+		assert.equal(coordinator.read().listener.state, "listening");
+	}
+	return { coordinator, log };
+}
+
+/** Wait for one honest content state through the real reconciler. */
+async function waitForContentState(
+	side: Pick<ContentSide, "coordinator">,
+	state: PeerContentObservation["state"],
+	message: string,
+	timeoutMs = 10_000,
+): Promise<PeerContentObservation> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const observation = side.coordinator.content.readContent();
+		if (observation.state === state) return observation;
+		if (Date.now() > deadline) {
+			throw new Error(
+				`timed out waiting for ${message} (state=${observation.state}, reason=${observation.reason ?? "none"})`,
+			);
+		}
+		await delay(10);
+	}
+}
+
+/** One owner that serves one synthetic row's viewport over the real listener. */
+async function startContentOwner(t: TestContext, nativeIo?: PeerCoordinatorOptions["nativeIo"]): Promise<{
+	readonly side: ContentSide;
+	readonly source: FakeContentOwner;
+	readonly port: number;
+}> {
+	const source = new FakeContentOwner([CONTENT_ROW]);
+	const side = await startContentSide(t, {
+		agentDir: createOwnedAgentDir(t).agentDir,
+		inventory: source,
+		contentSource: source,
+		listen: true,
+		...(nativeIo === undefined ? {} : { nativeIo }),
+	});
+	const port = side.coordinator.read().listener.port;
+	assert.ok(port, "the owner listener did not report its owned port");
+	return { side, source, port };
+}
+
+/** Viewer -> owner: the viewer requests the exact owner run and row. */
+async function connectContentStream(
+	t: TestContext,
+	owner: ContentSide,
+	viewerOptions: {
+		readonly nativeIo?: PeerCoordinatorOptions["nativeIo"];
+	},
+): Promise<{
+	readonly viewer: ContentSide;
+	readonly hostId: string;
+	readonly observation: PeerContentObservation;
+}> {
+	const ownerPort = owner.coordinator.read().listener.port;
+	assert.ok(ownerPort, "the owner listener did not report its owned port");
+	const viewer = await startContentSide(t, {
+		agentDir: createOwnedAgentDir(t).agentDir,
+		inventory: new FakeContentOwner([]),
+		...(viewerOptions.nativeIo === undefined ? {} : { nativeIo: viewerOptions.nativeIo }),
+	});
+	const hostId = await addDestination(viewer, "Owner laptop", ownerPort);
+	await connectWithApprovals(viewer, owner, hostId);
+	await waitConnected(viewer, "the viewer's connected metadata roster");
+	const host = viewer.coordinator.read().hosts?.[0];
+	assert.ok(host, "the destination must be observed before selecting its row");
+	assert.ok(host.roster.hostRunId, "the viewer must preserve the owner run identity");
+	viewer.coordinator.content.selectContent({
+		hostId,
+		hostRunId: host.roster.hostRunId,
+		rowId: CONTENT_ROW,
+		selectionGeneration: 1,
+		cols: 40,
+		rows: 12,
+	});
+	const observation = await waitForContentState(viewer, "current", "the selected content stream");
+	return { viewer, hostId, observation };
+}
+
+test("native IO callbacks are refused unless both are present, and adding them creates nothing", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const inventory = createFakeInventory();
+	const base = {
+		agentDir: fixture.agentDir,
+		inventory,
+		onChange: () => undefined,
+		onIncomingConsentArrival: () => undefined,
+	};
+	const malformed: unknown[] = [
+		null,
+		true,
+		"callbacks",
+		{ authorizeInput: () => true },
+		{ onCopy: () => undefined },
+		{ authorizeInput: true, onCopy: () => undefined },
+		{ authorizeInput: () => true, onCopy: "onCopy" },
+	];
+	for (const value of malformed) {
+		// A partially or wrongly shaped option is closed at construction: it can
+		// never look like native IO support this coordinator cannot honour.
+		assert.throws(
+			() => createPeerCoordinator({ ...base, nativeIo: value as PeerCoordinatorOptions["nativeIo"] }),
+			TypeError,
+		);
+	}
+	assert.equal(existsSync(fixture.sessionHostDir), false, "a refused option creates no local state");
+
+	// A display-only controller implementation stays valid: both native IO members
+	// are optional, so no existing caller or fake has to grow them.
+	const displayOnly: PeerContentController = {
+		selectContent: () => undefined,
+		updateContentViewport: () => undefined,
+		readContent: () => ({ target: null, state: "none", view: undefined, reason: null }),
+	};
+	assert.equal(displayOnly.readNativeInputTarget, undefined);
+	assert.equal(displayOnly.sendNativeInput, undefined);
+
+	// The absent default: the exact legacy display-only controller, with both
+	// native IO primitives inert before and after start.
+	const legacy = createPeerCoordinator(base);
+	t.after(async () => {
+		try {
+			await legacy.close();
+		} catch {
+			// A rejected close is an observed outcome, never a hook failure.
+		}
+	});
+	assert.equal(legacy.content.readNativeInputTarget?.(), undefined);
+	assert.deepEqual(
+		await legacy.content.sendNativeInput?.(inputRequestFixture()),
+		{ status: "not-sent", reason: "not-negotiated" },
+	);
+	await legacy.start();
+	assert.equal(legacy.content.readNativeInputTarget?.(), undefined);
+	assert.deepEqual(
+		await legacy.content.sendNativeInput?.(inputRequestFixture()),
+		{ status: "not-sent", reason: "not-negotiated" },
+	);
+});
+
+test("an owner given no callback binding publishes no native source and admits no input", async (t) => {
+	const owner = await startContentOwner(t);
+	const proofs: PeerNativeInputTarget[] = [];
+	const copies: PeerNativeCopyReceipt[] = [];
+	const { viewer, hostId, observation } = await connectContentStream(t, owner.side, {
+		nativeIo: {
+			authorizeInput: (target) => {
+				proofs.push(target);
+				return true;
+			},
+			onCopy: (receipt) => {
+				copies.push(receipt);
+			},
+		},
+	});
+	const view = observation.view;
+	assert.ok(view, "the selected stream must publish one complete view");
+	assert.equal(view.hostId, hostId);
+	assert.equal(view.selectionGeneration, 1);
+	assert.equal(view.snapshot.meta.sessionId, CONTENT_ROW);
+	// The owner endpoint was constructed without the native IO binding, so the
+	// published viewport carries no native source at all: the display path is byte
+	// for byte the one it always was.
+	assert.equal(view.snapshot.meta.inputSource, undefined);
+	assert.ok(owner.source.calls.includes(`watchSessionContent:${CONTENT_ROW}`));
+	assert.equal(owner.source.liveViewers, 1, "the selected stream owns exactly one owner viewer");
+	// No target can be described, no proof is ever consulted, and no copy can be
+	// invented, even though this side supplied explicit callbacks.
+	assert.equal(viewer.coordinator.content.readNativeInputTarget?.(), undefined);
+	assert.deepEqual(
+		await viewer.coordinator.content.sendNativeInput?.(inputRequestFixture({
+			hostId,
+			subscriptionId: view.snapshot.meta.subscriptionId,
+			source: inputSourceFixture({ hostRunId: view.snapshot.meta.hostRunId }),
+		})),
+		{ status: "not-sent", reason: "not-ready" },
+	);
+	assert.deepEqual(proofs, [], "no proof is consulted without a provable current target");
+	assert.deepEqual(copies, [], "no copy is invented");
+	// Clearing the selection is the unchanged legacy path.
+	viewer.coordinator.content.selectContent(null);
+	assert.equal(viewer.coordinator.content.readContent().state, "none");
+});
+
+test("an owner-side callback binding still serves the same display-only stream", async (t) => {
+	// The owner side receives the forwarded explicit enable; that must not make it
+	// refuse, publish, or require anything the plain display path did not.
+	const owner = await startContentOwner(t, {
+		authorizeInput: () => true,
+		onCopy: () => undefined,
+	});
+	const { viewer, hostId, observation } = await connectContentStream(t, owner.side, {});
+	const view = observation.view;
+	assert.ok(view, "the owner-side binding must not disturb the display stream");
+	assert.equal(view.hostId, hostId);
+	assert.equal(view.snapshot.meta.sessionId, CONTENT_ROW);
+	// This viewer supplied no callbacks of its own, so it offers nothing and the
+	// coordinator's native IO seam stays entirely closed on this side.
+	assert.equal(viewer.coordinator.content.readNativeInputTarget?.(), undefined);
+	assert.deepEqual(
+		await viewer.coordinator.content.sendNativeInput?.(inputRequestFixture()),
+		{ status: "not-sent", reason: "not-negotiated" },
+	);
+});
+
+/* ------------------------------------------------------------------------- *
+ * Controlled content-protocol fixture
+ *
+ * The selected-stream endpoint is exercised through a scripted content-lane peer
+ * that this file owns, substituted for the real channel through the existing
+ * fixture seam. The destination, its metadata channel, the pin, the roster
+ * observation, and this side's identity all stay real; only the content-lane
+ * bytes are scripted, so the coordinator's own fences and its composed per-write
+ * gate are what decides every input write and every copy delivery.
+ * ------------------------------------------------------------------------- */
+
+interface ControlledContentLane {
+	/** The channel the coordinator attached: everything it wrote, in order. */
+	readonly received: SessionContentFrame[];
+	/** The subscription the endpoint itself named. */
+	readonly subscriptionId: string;
+	/** Publish one complete viewport carrying an explicit native input source. */
+	publish(options: {
+		readonly sequence: number;
+		readonly source: NativeIoSource;
+		readonly line?: string;
+	}): void;
+	/** Emit one atomically assembled native text copy. */
+	copy(options: {
+		readonly sequence: number;
+		readonly dispatchId: number;
+		readonly text: string;
+		readonly source: NativeIoSource;
+	}): void;
+	framesOfType(type: SessionContentFrame["type"]): SessionContentFrame[];
+}
+
+/** One scripted content-lane channel that answers the viewer's own handshake. */
+class FakeContentLane implements PeerByteChannel {
+	readonly lane = "content" as const;
+	readonly peerKey: PeerKey;
+	readonly label: string | null = "content";
+	readonly received: SessionContentFrame[] = [];
+	readonly #bounds = resolveSessionContentBounds();
+	readonly #handlers = new Set<(bytes: Buffer) => void>();
+	readonly #closed: Promise<PeerChannelClose>;
+	#finish: (value: PeerChannelClose) => void = () => undefined;
+	#done = false;
+	#subscriptionId: string | null = null;
+
+	constructor(peerKey: PeerKey) {
+		this.peerKey = peerKey;
+		this.#closed = new Promise<PeerChannelClose>((resolve) => {
+			this.#finish = resolve;
+		});
+		// Nobody has to await a local close for the fixture to be usable.
+		this.#closed.catch(() => undefined);
+	}
+
+	get bufferedAmount(): number {
+		return 0;
+	}
+
+	get closed(): Promise<PeerChannelClose> {
+		return this.#closed;
+	}
+
+	get subscriptionId(): string {
+		assert.ok(this.#subscriptionId, "the endpoint has not subscribed yet");
+		return this.#subscriptionId;
+	}
+
+	send(bytes: Uint8Array): Promise<void> {
+		if (this.#done) return Promise.reject(new Error("content lane closed"));
+		const frame = decodeSessionContentFrame(Buffer.from(bytes), this.#bounds);
+		this.received.push(frame);
+		// Answer only what the endpoint's own handshake requires, exactly as the
+		// real owner would: nothing is volunteered and no viewport is invented.
+		switch (frame.type) {
+			case "hello": {
+				const native = frame.capabilities.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY);
+				this.deliverBytes(encodeSessionContentFrame({
+					type: "hello_ack",
+					service: SESSION_CONTENT_SERVICE,
+					major: SESSION_CONTENT_MAJOR,
+					minor: SESSION_CONTENT_MINOR,
+					capabilities: native
+						? [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY]
+						: [SESSION_CONTENT_REQUIRED_CAPABILITY],
+				}, this.#bounds));
+				return Promise.resolve();
+			}
+			case "subscribe": {
+				this.#subscriptionId = frame.subscriptionId;
+				this.deliverBytes(encodeSessionContentFrame({
+					type: "subscribed",
+					subscriptionId: frame.subscriptionId,
+					sessionId: frame.sessionId,
+					hostRunId: frame.hostRunId,
+				}, this.#bounds));
+				return Promise.resolve();
+			}
+			case "unsubscribe": {
+				this.deliverBytes(encodeSessionContentFrame({
+					type: "unsubscribed",
+					subscriptionId: frame.subscriptionId,
+				}, this.#bounds));
+				return Promise.resolve();
+			}
+			default:
+				return Promise.resolve();
+		}
+	}
+
+	close(): Promise<void> {
+		if (!this.#done) {
+			this.#done = true;
+			this.#finish(Object.freeze({ code: 1000, reason: "" }));
+		}
+		return Promise.resolve();
+	}
+
+	onMessage(handler: (bytes: Buffer) => void): () => void {
+		this.#handlers.add(handler);
+		return () => {
+			this.#handlers.delete(handler);
+		};
+	}
+
+	deliverBytes(bytes: Buffer): void {
+		if (this.#done) return;
+		for (const handler of [...this.#handlers]) handler(bytes);
+	}
+
+	framesOfType(type: SessionContentFrame["type"]): SessionContentFrame[] {
+		return this.received.filter((frame) => frame.type === type);
+	}
+}
+
+interface ContentLaneFixture {
+	readonly lanes: FakeContentLane[];
+	/** The fixture seam: substitutes ONLY this client's content lane. */
+	readonly hook: (channel: PeerByteChannel) => PeerByteChannel;
+	readonly latest: () => FakeContentLane;
+}
+
+/**
+ * One content-lane substitution. Each content upgrade of the destination client
+ * gets its own scripted peer, so a replacement selection is a different lane.
+ */
+function contentLaneFixture(): ContentLaneFixture {
+	const lanes: FakeContentLane[] = [];
+	return {
+		lanes,
+		hook: (channel) => {
+			if (channel.lane !== "content") return channel;
+			const lane = new FakeContentLane(channel.peerKey);
+			lanes.push(lane);
+			// The real upgrade is retired locally; the scripted peer speaks for it.
+			void channel.close();
+			return lane;
+		},
+		latest: () => {
+			const lane = lanes[lanes.length - 1];
+			assert.ok(lane, "no content lane was substituted");
+			return lane;
+		},
+	};
+}
+
+/** One published viewport at the source's own geometry. */
+function sourceViewport(source: NativeIoSource, line?: string): TerminalFrame {
+	const rows = source.geometry.rows;
+	const lines = Array.from({ length: rows }, (_unused, index) => `row ${index}`);
+	if (line !== undefined && lines.length > 0) lines[0] = line;
+	return {
+		cols: source.geometry.cols,
+		rows,
+		lines,
+		cursor: { column: 0, row: 0, visible: true },
+	};
+}
+
+function contentLane(lane: FakeContentLane): ControlledContentLane {
+	return {
+		received: lane.received,
+		get subscriptionId(): string {
+			return lane.subscriptionId;
+		},
+		publish: (options): void => {
+			// One complete, immutable transfer: begin, every chunk, then end.
+			const built = buildSessionContentTransfer({
+				subscriptionId: lane.subscriptionId,
+				transferId: `transfer-${options.sequence}`,
+				hostRunId: options.source.hostRunId,
+				sessionId: options.source.sessionId,
+				nativeSession: options.source.nativeSession,
+				sequence: options.sequence,
+				geometry: options.source.geometry,
+				inputModes: FIXTURE_INPUT_MODES,
+				frame: sourceViewport(options.source, options.line),
+				inputSource: options.source,
+			});
+			for (const bytes of built.frames) lane.deliverBytes(bytes);
+		},
+		copy: (options): void => {
+			const built = buildNativeCopyInline({
+				subscriptionId: lane.subscriptionId,
+				copyId: `copy-${options.sequence}`,
+				sequence: options.sequence,
+				source: options.source,
+				dispatchId: options.dispatchId,
+				event: {
+					kind: "copy",
+					encoded: Buffer.from(options.text, "utf8").toString("base64"),
+					sessionId: options.source.nativeSession.sessionId,
+					sessionEpoch: options.source.nativeSession.epoch,
+				},
+			});
+			for (const bytes of built.frames) lane.deliverBytes(bytes);
+		},
+		framesOfType: (type): SessionContentFrame[] => lane.framesOfType(type),
+	};
+}
+
+/** Start one viewer whose content lane is the scripted peer above. */
+async function startScriptedSide(
+	t: TestContext,
+	options: {
+		readonly agentDir: string;
+		readonly nativeIo: PeerCoordinatorOptions["nativeIo"];
+		readonly lanes: ContentLaneFixture;
+	},
+): Promise<ContentSide> {
+	const log = createSnapshotLog();
+	const coordinator = createPeerCoordinator({
+		agentDir: options.agentDir,
+		inventory: new FakeContentOwner([]),
+		onChange: log.onChange,
+		onIncomingConsentArrival: log.onArrival,
+		testHooks: { ...hooks(), wrapClientChannel: options.lanes.hook },
+		nativeIo: options.nativeIo,
+	});
+	t.after(async () => {
+		try {
+			await coordinator.close();
+		} catch {
+			// A rejected close is this test's own observed outcome, never a hook failure.
+		}
+	});
+	await coordinator.start();
+	return { coordinator, log };
+}
+
+/** Select the owner's one row and wait until the scripted lane subscribed. */
+async function selectScriptedContent(
+	t: TestContext,
+	owner: ContentSide,
+	lanes: ContentLaneFixture,
+	nativeIo: PeerCoordinatorOptions["nativeIo"],
+): Promise<{
+	readonly viewer: ContentSide;
+	readonly hostId: string;
+	readonly runId: string;
+	readonly lane: ControlledContentLane;
+}> {
+	const ownerPort = owner.coordinator.read().listener.port;
+	assert.ok(ownerPort, "the owner listener did not report its owned port");
+	const viewer = await startScriptedSide(t, {
+		agentDir: createOwnedAgentDir(t).agentDir,
+		nativeIo,
+		lanes,
+	});
+	const hostId = await addDestination(viewer, "Owner laptop", ownerPort);
+	await connectWithApprovals(viewer, owner, hostId);
+	await waitConnected(viewer, "the viewer's connected metadata roster");
+	const host = viewer.coordinator.read().hosts?.[0];
+	assert.ok(host, "the destination must be observed before selecting its row");
+	assert.ok(host.roster.hostRunId, "the viewer must preserve the owner run identity");
+	viewer.coordinator.content.selectContent({
+		hostId,
+		hostRunId: host.roster.hostRunId,
+		rowId: CONTENT_ROW,
+		selectionGeneration: 1,
+		cols: 40,
+		rows: 12,
+	});
+	const deadline = Date.now() + 10_000;
+	for (;;) {
+		const lane = lanes.lanes[lanes.lanes.length - 1];
+		if (lane !== undefined && lane.received.some((frame) => frame.type === "subscribe")) break;
+		if (Date.now() > deadline) throw new Error("the scripted content lane never received a subscription");
+		await delay(10);
+	}
+	return { viewer, hostId, runId: host.roster.hostRunId, lane: contentLane(lanes.latest()) };
+}
+
+/** Wait until the coordinator publishes the scripted view as its current stream. */
+async function waitForScriptedContent(
+	viewer: ContentSide,
+	message: string,
+	timeoutMs = 10_000,
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		if (viewer.coordinator.content.readContent().state === "current") return;
+		if (Date.now() > deadline) {
+			const observation = viewer.coordinator.content.readContent();
+			throw new Error(`timed out waiting for ${message} (state=${observation.state}, reason=${observation.reason ?? "none"})`);
+		}
+		await delay(10);
+	}
+}
+
+test("native input binds the exact current target and refuses stale or foreign requests", async (t) => {
+	const owner = await startContentOwner(t);
+	const proofs: PeerNativeInputTarget[] = [];
+	const { viewer, hostId, runId, lane } = await selectScriptedContent(t, owner.side, contentLaneFixture(), {
+		authorizeInput: (target) => {
+			proofs.push(target);
+			return true;
+		},
+		onCopy: () => undefined,
+	});
+	const source = inputSourceFixture({ hostRunId: runId });
+	lane.publish({ sequence: 1, source });
+	await waitForScriptedContent(viewer, "the scripted native viewport");
+
+	// The described target is this endpoint's own whole target: the saved
+	// destination handle, this selection generation, this subscription, and the
+	// exact published source and modes.
+	const target = viewer.coordinator.content.readNativeInputTarget?.();
+	assert.ok(target, "a negotiated current stream must describe a target");
+	assert.equal(target.hostId, hostId);
+	assert.equal(target.selectionGeneration, 1);
+	assert.equal(target.subscriptionId, lane.subscriptionId);
+	assert.deepEqual(target.source, source);
+	assert.deepEqual(target.inputModes, FIXTURE_INPUT_MODES);
+
+	const exact = inputRequestFixture({ hostId, subscriptionId: lane.subscriptionId, source });
+	// Every way of naming something other than the exact current target is refused
+	// before any write, and no proof is consulted for a request that cannot be the
+	// current one.
+	const stale: PeerNativeInputRequest[] = [
+		{ ...exact, hostId: `${hostId}-other` },
+		{ ...exact, selectionGeneration: 2 },
+		{ ...exact, subscriptionId: "subscription-other" },
+		{ ...exact, source: inputSourceFixture({ hostRunId: runId, sourceToken: "token-other" }) },
+		{ ...exact, inputModes: { ...FIXTURE_INPUT_MODES, kittyFlags: 1 } },
+	];
+	for (const request of stale) {
+		const result = await viewer.coordinator.content.sendNativeInput?.(request);
+		assert.equal(result?.status, "not-sent", "a stale or foreign request is never submitted");
+	}
+	assert.equal(lane.framesOfType("input").length, 0, "no stale request reached the wire");
+	assert.equal(proofs.length, 0, "no proof is consulted for a request that is not the exact current target");
+
+	// The exact request is admitted, proven per write, and written with the
+	// CALLER's expected source (never a re-read of the owner's current facts).
+	const submitted = await viewer.coordinator.content.sendNativeInput?.(exact);
+	assert.deepEqual(submitted, { status: "submitted" });
+	const written = lane.framesOfType("input");
+	assert.equal(written.length, 1);
+	const frame = written[0];
+	assert.ok(frame && frame.type === "input");
+	assert.deepEqual(frame.source, source);
+	assert.deepEqual(frame.inputModes, FIXTURE_INPUT_MODES);
+	assert.equal(frame.kind, "keyboard");
+	assert.equal(frame.data, Buffer.from("a", "utf8").toString("base64"));
+	assert.ok(proofs.length >= 2, "the dynamic proof gates admission and the protected write");
+	for (const proof of proofs) {
+		assert.equal(proof.hostId, hostId);
+		assert.equal(proof.subscriptionId, lane.subscriptionId);
+		assert.deepEqual(proof.source, source);
+	}
+});
+
+test("a withdrawn dynamic proof withholds the remaining pages of one paste", async (t) => {
+	const owner = await startContentOwner(t);
+	let calls = 0;
+	const { viewer, hostId, runId, lane } = await selectScriptedContent(t, owner.side, contentLaneFixture(), {
+		authorizeInput: () => {
+			calls += 1;
+			// Admitted for the caller's own proof, the endpoint's admission, and the
+			// FIRST page only: the owner's written source stops being authorized while
+			// the paste is still in flight.
+			return calls <= 3;
+		},
+		onCopy: () => undefined,
+	});
+	const source = inputSourceFixture({ hostRunId: runId });
+	lane.publish({ sequence: 1, source });
+	await waitForScriptedContent(viewer, "the scripted native viewport");
+
+	const result = await viewer.coordinator.content.sendNativeInput?.(inputRequestFixture({
+		hostId,
+		subscriptionId: lane.subscriptionId,
+		source,
+		kind: "paste",
+		// Well past one bounded chunk, so the operation is several protected writes.
+		text: "p".repeat(100_000),
+	}));
+	// Bytes already written can never be reported as unsent.
+	assert.deepEqual(result, { status: "unknown" });
+	assert.equal(lane.framesOfType("input_begin").length, 1, "the first page was admitted and written");
+	assert.equal(lane.framesOfType("input_chunk").length, 0, "no later page was written");
+	assert.equal(lane.framesOfType("input_end").length, 0, "the operation was never completed");
+
+	// The refusal is not sticky: a later, separately proven input is admitted.
+	calls = 0;
+	const recovered = await viewer.coordinator.content.sendNativeInput?.(inputRequestFixture({
+		hostId,
+		subscriptionId: lane.subscriptionId,
+		source,
+	}));
+	assert.deepEqual(recovered, { status: "submitted" });
+});
+
+test("a selection or source change during the proof refuses the write", async (t) => {
+	// Reentry variant one: the caller's own proof replaces the selection and still
+	// claims success. Nothing may be written for facts that moved underneath it.
+	let clearingSide: ContentSide | undefined;
+	const clearOnProof: PeerCoordinatorOptions["nativeIo"] = {
+		authorizeInput: () => {
+			clearingSide?.coordinator.content.selectContent(null);
+			return true;
+		},
+		onCopy: () => undefined,
+	};
+	const firstOwner = await startContentOwner(t);
+	const first = await selectScriptedContent(t, firstOwner.side, contentLaneFixture(), clearOnProof);
+	clearingSide = first.viewer;
+	const firstSource = inputSourceFixture({ hostRunId: first.runId });
+	first.lane.publish({ sequence: 1, source: firstSource });
+	await waitForScriptedContent(first.viewer, "the scripted native viewport");
+	const cleared = await first.viewer.coordinator.content.sendNativeInput?.(inputRequestFixture({
+		hostId: first.hostId,
+		subscriptionId: first.lane.subscriptionId,
+		source: firstSource,
+	}));
+	assert.deepEqual(cleared, { status: "not-sent", reason: "stale-source" });
+	assert.equal(first.lane.framesOfType("input").length, 0, "a reentrant selection change writes nothing");
+	assert.equal(first.viewer.coordinator.content.readContent().state, "none");
+
+	// Reentry variant two: the proof publishes a NEWER source for the same stream,
+	// so the caller's exact expected source no longer describes what is current.
+	const secondOwner = await startContentOwner(t);
+	let publisher: ControlledContentLane | undefined;
+	let secondSourceRef: NativeIoSource | undefined;
+	let swapArmed = false;
+	const swapOnProof: PeerCoordinatorOptions["nativeIo"] = {
+		authorizeInput: () => {
+			if (!swapArmed) return true;
+			swapArmed = false;
+			assert.ok(publisher);
+			assert.ok(secondSourceRef);
+			publisher.publish({
+				sequence: 2,
+				source: { ...secondSourceRef, sourceToken: "token-B", viewerRevision: 2 },
+			});
+			return true;
+		},
+		onCopy: () => undefined,
+	};
+	const second = await selectScriptedContent(t, secondOwner.side, contentLaneFixture(), swapOnProof);
+	publisher = second.lane;
+	const secondSource = inputSourceFixture({ hostRunId: second.runId });
+	secondSourceRef = secondSource;
+	second.lane.publish({ sequence: 1, source: secondSource });
+	await waitForScriptedContent(second.viewer, "the scripted native viewport");
+	swapArmed = true;
+	const swapped = await second.viewer.coordinator.content.sendNativeInput?.(inputRequestFixture({
+		hostId: second.hostId,
+		subscriptionId: second.lane.subscriptionId,
+		source: secondSource,
+	}));
+	assert.deepEqual(swapped, { status: "not-sent", reason: "stale-source" });
+	assert.equal(second.lane.framesOfType("input").length, 0, "an exact A -> B change writes nothing for A");
+});
+
+test("unchanged-source output keeps typing, and copies reach only the current initiating endpoint", async (t) => {
+	const owner = await startContentOwner(t);
+	const receipts: PeerNativeCopyReceipt[] = [];
+	const { viewer, hostId, runId, lane } = await selectScriptedContent(t, owner.side, contentLaneFixture(), {
+		authorizeInput: () => true,
+		onCopy: (receipt) => {
+			receipts.push(receipt);
+		},
+	});
+	const source = inputSourceFixture({ hostRunId: runId });
+	lane.publish({ sequence: 1, source });
+	await waitForScriptedContent(viewer, "the scripted native viewport");
+	const exact = inputRequestFixture({ hostId, subscriptionId: lane.subscriptionId, source });
+	assert.deepEqual(await viewer.coordinator.content.sendNativeInput?.(exact), { status: "submitted" });
+
+	// Ordinary terminal output: a fresh transfer, sequence, and frame with the SAME
+	// written source. Typing must not be interrupted by the new snapshot object.
+	lane.publish({ sequence: 2, source, line: "fresh output" });
+	await delay(50);
+	const afterOutput = viewer.coordinator.content.readContent();
+	assert.equal(afterOutput.state, "current");
+	assert.equal(afterOutput.view?.snapshot.meta.sequence, 2);
+	assert.deepEqual(viewer.coordinator.content.readNativeInputTarget?.()?.source, source);
+	const afterExact = await viewer.coordinator.content.sendNativeInput?.(exact);
+	assert.deepEqual(afterExact, { status: "submitted" }, "an unchanged written source keeps typing");
+
+	// Two async copies of the same initiator, emitted with DESCENDING dispatch ids:
+	// emission order (the copy sequence), never a dispatch-id heuristic, decides.
+	lane.copy({ sequence: 1, dispatchId: 7, text: "later input copy", source });
+	lane.copy({ sequence: 2, dispatchId: 3, text: "earlier input copy", source });
+	assert.equal(receipts.length, 2, "both copies are delivered");
+	assert.deepEqual(receipts.map((receipt) => receipt.dispatchId), [7, 3]);
+	for (const receipt of receipts) {
+		assert.equal(receipt.hostId, hostId);
+		assert.equal(receipt.selectionGeneration, 1);
+		assert.equal(receipt.subscriptionId, lane.subscriptionId);
+		assert.deepEqual(receipt.source, source);
+		assert.equal(receipt.event.kind, "copy");
+	}
+	// The payload is the producer's own opaque base64 text, never an OSC 52
+	// sequence or a local clipboard write.
+	const encoded = receipts.map((receipt) => (
+		receipt.event.kind === "copy" ? receipt.event.encoded : ""
+	));
+	assert.deepEqual(encoded, [
+		Buffer.from("later input copy", "utf8").toString("base64"),
+		Buffer.from("earlier input copy", "utf8").toString("base64"),
+	]);
+	for (const value of encoded) {
+		assert.equal(Buffer.from(value, "base64").toString("utf8").includes("\u001b"), false);
+	}
+
+	// A copy whose source is no longer the current stream is dropped, not
+	// rebroadcast: A -> B makes the old A copy unroutable.
+	const sourceB: NativeIoSource = { ...source, sourceToken: "token-B", viewerRevision: 2 };
+	lane.publish({ sequence: 3, source: sourceB });
+	await delay(50);
+	lane.copy({ sequence: 3, dispatchId: 9, text: "stale source copy", source });
+	assert.equal(receipts.length, 2, "a copy from a replaced source is never delivered");
+
+	// Retirement and selection loss stop both directions for good.
+	viewer.coordinator.content.selectContent(null);
+	const retiredTarget = viewer.coordinator.content.readNativeInputTarget?.();
+	assert.equal(retiredTarget, undefined);
+	const afterRetire = await viewer.coordinator.content.sendNativeInput?.(inputRequestFixture({
+		hostId,
+		subscriptionId: lane.subscriptionId,
+		source: sourceB,
+	}));
+	assert.equal(afterRetire?.status, "not-sent");
+	lane.copy({ sequence: 4, dispatchId: 11, text: "after retirement", source: sourceB });
+	await delay(50);
+	assert.equal(receipts.length, 2, "no copy is delivered after retirement");
+});
+
+test("source ABA during coordinator admission cannot revive the old request", async (t) => {
+	const owner = await startContentOwner(t);
+	let transition: (() => void) | undefined;
+	const { viewer, hostId, runId, lane } = await selectScriptedContent(t, owner.side, contentLaneFixture(), {
+		authorizeInput: () => {
+			// The caller's own proof runs arbitrary code: here it replaces the written
+			// source and restores it again before returning `true`.
+			const action = transition;
+			transition = undefined;
+			action?.();
+			return true;
+		},
+		onCopy: () => undefined,
+	});
+	const source = inputSourceFixture({ hostRunId: runId });
+	lane.publish({ sequence: 1, source });
+	await waitForScriptedContent(viewer, "the scripted native viewport");
+	transition = () => {
+		lane.publish({ sequence: 2, source: { ...source, sourceToken: "token-B", viewerRevision: 2 } });
+		lane.publish({ sequence: 3, source });
+	};
+	// Present equality alone would look unchanged here; the semantic generation
+	// advanced twice, so this admission can never be written.
+	assert.deepEqual(await viewer.coordinator.content.sendNativeInput?.(inputRequestFixture({
+		hostId,
+		subscriptionId: lane.subscriptionId,
+		source,
+	})), { status: "not-sent", reason: "stale-source" });
+	assert.equal(lane.framesOfType("input").length, 0);
+
+	// A second, differently-tokened A -> B -> A is refused the same way, and a later
+	// request that is proven against the settled lifetime is still served: the fence
+	// is not a blanket refusal of every input after any publication.
+	transition = () => {
+		lane.publish({ sequence: 4, source: { ...source, sourceToken: "token-C", viewerRevision: 3 } });
+		lane.publish({ sequence: 5, source });
+	};
+	assert.deepEqual(await viewer.coordinator.content.sendNativeInput?.(inputRequestFixture({
+		hostId,
+		subscriptionId: lane.subscriptionId,
+		source,
+	})), { status: "not-sent", reason: "stale-source" });
+	assert.equal(lane.framesOfType("input").length, 0);
+	const served = await viewer.coordinator.content.sendNativeInput?.(inputRequestFixture({
+		hostId,
+		subscriptionId: lane.subscriptionId,
+		source,
+	}));
+	assert.deepEqual(served, { status: "submitted" });
+	assert.equal(lane.framesOfType("input").length, 1);
+});
+
+test("a throwing request accessor is a malformed-input refusal, not a rejection", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const log = createSnapshotLog();
+	const coordinator = createPeerCoordinator({
+		agentDir: fixture.agentDir,
+		inventory: createFakeInventory(),
+		onChange: log.onChange,
+		onIncomingConsentArrival: log.onArrival,
+		testHooks: hooks(),
+		nativeIo: { authorizeInput: () => true, onCopy: () => undefined },
+	});
+	t.after(async () => {
+		try {
+			await coordinator.close();
+		} catch {
+			// A rejected close is an observed outcome, never a hook failure.
+		}
+	});
+	await coordinator.start();
+	const hostile = {
+		get hostId(): string {
+			throw new Error("hostile accessor");
+		},
+	};
+	const result = await coordinator.content.sendNativeInput?.(hostile as unknown as PeerNativeInputRequest);
+	assert.deepEqual(result, { status: "not-sent", reason: "invalid-input" });
+	// A nested accessor is refused the same way.
+	const nested = inputRequestFixture();
+	const nestedHostile = {
+		...nested,
+		get source(): never {
+			throw new Error("hostile nested accessor");
+		},
+	};
+	const nestedResult = await coordinator.content.sendNativeInput?.(
+		nestedHostile as unknown as PeerNativeInputRequest,
+	);
+	assert.deepEqual(nestedResult, { status: "not-sent", reason: "invalid-input" });
 });

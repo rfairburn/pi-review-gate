@@ -72,11 +72,21 @@
  * epoch. It selects nothing, opens nothing, and removes nothing locally: the
  * owner's own Main provider decides and acts, and only the owner's next
  * authoritative snapshot can change the roster projection.
+ *
+ * Native input and text copies for that selected stream are optional and
+ * default-inert. Without explicit `nativeIo` callbacks this coordinator is exactly
+ * the previous display-only one: no native capability is offered, no input or copy
+ * callback exists, and both controller primitives stay inert. With them, each
+ * protected write is gated by the current selection/peer/pin/run/row/source fences
+ * AND the caller's own dynamic written-source proof, re-proved after that proof
+ * returns; copies reach only the current initiating endpoint's callback, and this
+ * coordinator still emits no OSC 52, reads no clipboard, and writes no terminal.
  */
 
 import { createHash, randomUUID } from "node:crypto";
 
 import type { OwningHostService } from "../owning-host-service";
+import type { TerminalInputModes } from "../terminal-surface";
 import type {
 	PeerUiCommand,
 	PeerUiConsent,
@@ -100,11 +110,17 @@ import {
 } from "./peer-host";
 import {
 	DEFAULT_SESSION_CONTENT_BOUNDS,
+	nativeIoSourceEquals,
+	type NativeIoCompletedCopy,
+	type NativeIoInputKind,
+	type NativeIoSource,
 	type SessionContentSnapshot,
 } from "./session-content-protocol";
 import {
 	attachSessionContentViewer,
 	isSessionContentViewerError,
+	type NativeInputNotSentReason,
+	type NativeInputSendResult,
 	type SessionContentViewer,
 } from "./session-content-client";
 import {
@@ -120,6 +136,10 @@ import type {
 	PeerContentTarget,
 	PeerContentViewport,
 	PeerCoordinatorWithContent,
+	PeerNativeCopyReceipt,
+	PeerNativeInputRequest,
+	PeerNativeInputTarget,
+	PeerNativeIoCallbacks,
 	PeerSelectedContent,
 } from "./peer-content";
 import type { OwnerCloseHandler, PeerCloseController, PeerCloseResult, PeerCloseTarget, PeerCoordinatorWithClose } from "./peer-close";
@@ -252,7 +272,11 @@ export interface PeerCoordinatorTestHooks {
 	readonly clientBounds?: Partial<PeerTransportBounds>;
 	/**
 	 * Fixture-only: wrap one already-authenticated outgoing channel so a test can
-	 * control or fail its LOCAL closure. Production callers never pass it.
+	 * control or fail its LOCAL closure. It is applied to the metadata channel of a
+	 * destination client and, when one is opened, to that same client's dedicated
+	 * content-lane channel — which is the only way a test can speak the content
+	 * protocol directly at the selected-stream endpoint. Production callers never
+	 * pass it.
 	 */
 	readonly wrapClientChannel?: (channel: PeerByteChannel) => PeerByteChannel;
 }
@@ -293,6 +317,21 @@ export interface PeerCoordinatorOptions {
 	 * written or received, and a callback that throws is contained here.
 	 */
 	readonly onContentChange?: (observation: PeerContentObservation) => void;
+	/**
+	 * Optional native input / text-copy callbacks for the selected outgoing content
+	 * stream. Omitted (the default) is exactly the legacy display-only coordinator:
+	 * no native capability is offered by any endpoint it attaches, both controller
+	 * primitives stay inert, and nothing new is created.
+	 *
+	 * Supplying BOTH functions is what makes the extension exist for this host. It
+	 * is not a permission and not a grant: `authorizeInput` is the caller's dynamic
+	 * written-source/focus/coverage proof, re-evaluated for every protected write
+	 * alongside this coordinator's own current selection, peer, pin, run, row, and
+	 * source fences, and `onCopy` only ever receives a copy whose source is still
+	 * this coordinator's current stream. A partially or wrongly shaped value is
+	 * refused at construction rather than silently enabling anything.
+	 */
+	readonly nativeIo?: PeerNativeIoCallbacks;
 	/** Test-only seams; there is no insecure production fallback for them. */
 	readonly testHooks?: PeerCoordinatorTestHooks;
 }
@@ -352,6 +391,24 @@ interface ContentEndpoint {
 	readonly client: PeerClient;
 	/** Destination epoch at open time; any advance invalidates this endpoint. */
 	readonly destinationEpoch: number;
+}
+
+/**
+ * The owner-side content endpoint's options plus its own explicit native IO
+ * enable. That flag is the sibling owner-endpoint option this coordinator is
+ * allowed to forward (nothing else about that endpoint changes here), and it is
+ * spelled as a local intersection so an absent flag stays a compile-time no-op.
+ */
+type OwnerContentHostOptions = Parameters<typeof createSessionContentHost>[0] & {
+	readonly nativeIo?: boolean;
+};
+
+/**
+ * One whole, descriptive native input target of an endpoint's own currently
+ * published stream. Descriptive facts only: never a permission or a grant.
+ */
+interface NativeInputFacts {
+	readonly target: PeerNativeInputTarget;
 }
 
 /** The single global content selection and its honest display state. */
@@ -667,6 +724,142 @@ function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
 	});
 }
 
+/** One fixed, truthful pre-delegate refusal; never a claim that nothing happened later. */
+function nativeInputNotSent(reason: NativeInputNotSentReason): NativeInputSendResult {
+	return { status: "not-sent", reason };
+}
+
+/**
+ * Exact structural equality of two observed input-mode sets. Geometry, text, and
+ * viewport sequences are deliberately absent: ordinary output never invalidates
+ * an otherwise identical written source, while a mode change does.
+ */
+function nativeInputModesEqual(left: TerminalInputModes, right: TerminalInputModes): boolean {
+	return left.kittyFlags === right.kittyFlags
+		&& left.applicationCursorKeys === right.applicationCursorKeys
+		&& left.applicationKeypad === right.applicationKeypad
+		&& left.bracketedPaste === right.bracketedPaste
+		&& left.mouseTracking === right.mouseTracking
+		&& left.modifyOtherKeys === right.modifyOtherKeys
+		&& left.mouseEncoding === right.mouseEncoding;
+}
+
+/**
+ * Whether two publications describe a DIFFERENT native input target: the written
+ * source or the observed modes changed, including an A -> B -> A return. Text,
+ * geometry, transfer, and sequence changes alone never count, so ordinary
+ * output keeps typing eligible.
+ */
+function nativeInputTargetChanged(
+	previous: SessionContentSnapshot["meta"],
+	next: SessionContentSnapshot["meta"],
+): boolean {
+	const before = previous.inputSource;
+	const after = next.inputSource;
+	const sourceChanged = before === undefined || before === null || after === undefined || after === null
+		? before !== after
+		: !nativeIoSourceEquals(before, after);
+	return sourceChanged || !nativeInputModesEqual(previous.inputModes, next.inputModes);
+}
+
+/**
+ * Normalize one caller-supplied source into this process's own plain immutable
+ * copy. The caller's object is arbitrary code: every field is read once, so a
+ * getter cannot hand one value to a comparison and another to a write.
+ */
+function readNativeIoSourceValue(value: unknown): NativeIoSource | null {
+	if (!isRecord(value)) return null;
+	const native = value.nativeSession;
+	const geometry = value.geometry;
+	if (!isRecord(native) || !isRecord(geometry)) return null;
+	const hostRunId = value.hostRunId;
+	const sessionId = value.sessionId;
+	const nativeSessionId = native.sessionId;
+	const nativeEpoch = native.epoch;
+	const cols = geometry.cols;
+	const rows = geometry.rows;
+	const geometryRevision = geometry.revision;
+	const viewerRevision = value.viewerRevision;
+	const sourceToken = value.sourceToken;
+	if (typeof hostRunId !== "string" || typeof sessionId !== "string") return null;
+	if (typeof nativeSessionId !== "string" || typeof nativeEpoch !== "number") return null;
+	if (typeof cols !== "number" || typeof rows !== "number" || typeof geometryRevision !== "number") return null;
+	if (typeof viewerRevision !== "number" || typeof sourceToken !== "string") return null;
+	return Object.freeze({
+		hostRunId,
+		sessionId,
+		nativeSession: Object.freeze({ sessionId: nativeSessionId, epoch: nativeEpoch }),
+		geometry: Object.freeze({ cols, rows, revision: geometryRevision }),
+		viewerRevision,
+		sourceToken,
+	});
+}
+
+function isMouseTrackingModeValue(value: unknown): value is TerminalInputModes["mouseTracking"] {
+	return value === "none" || value === "x10" || value === "vt200" || value === "drag" || value === "any";
+}
+
+function isModifyOtherKeysValue(value: unknown): value is TerminalInputModes["modifyOtherKeys"] {
+	return value === 0 || value === 1 || value === 2;
+}
+
+function isMouseEncodingValue(value: unknown): value is TerminalInputModes["mouseEncoding"] {
+	return value === "default" || value === "sgr" || value === "sgr-pixels";
+}
+
+function isNativeIoInputKindValue(value: unknown): value is NativeIoInputKind {
+	return value === "keyboard" || value === "paste" || value === "mouse";
+}
+
+/** One validated input-mode set read exactly once from the caller's object. */
+function readInputModesValue(value: unknown): TerminalInputModes | null {
+	if (!isRecord(value)) return null;
+	const kittyFlags = value.kittyFlags;
+	const applicationCursorKeys = value.applicationCursorKeys;
+	const applicationKeypad = value.applicationKeypad;
+	const bracketedPaste = value.bracketedPaste;
+	const mouseTracking = value.mouseTracking;
+	const modifyOtherKeys = value.modifyOtherKeys;
+	const mouseEncoding = value.mouseEncoding;
+	if (typeof kittyFlags !== "number") return null;
+	if (typeof applicationCursorKeys !== "boolean") return null;
+	if (typeof applicationKeypad !== "boolean") return null;
+	if (typeof bracketedPaste !== "boolean") return null;
+	if (!isMouseTrackingModeValue(mouseTracking)) return null;
+	if (!isModifyOtherKeysValue(modifyOtherKeys)) return null;
+	if (!isMouseEncodingValue(mouseEncoding)) return null;
+	return Object.freeze({
+		kittyFlags,
+		applicationCursorKeys,
+		applicationKeypad,
+		bracketedPaste,
+		mouseTracking,
+		modifyOtherKeys,
+		mouseEncoding,
+	});
+}
+
+/**
+ * Normalize one caller request into plain immutable facts. A malformed value is
+ * `null` and is a refusal, never a thrown or rejected call from this seam.
+ */
+function readNativeInputRequest(value: unknown): PeerNativeInputRequest | null {
+	if (!isRecord(value)) return null;
+	const hostId = value.hostId;
+	const selectionGeneration = value.selectionGeneration;
+	const subscriptionId = value.subscriptionId;
+	const source = readNativeIoSourceValue(value.source);
+	const inputModes = readInputModesValue(value.inputModes);
+	const kind = value.kind;
+	const text = value.text;
+	if (typeof hostId !== "string" || typeof subscriptionId !== "string") return null;
+	if (typeof selectionGeneration !== "number" || !Number.isSafeInteger(selectionGeneration)) return null;
+	if (source === null || inputModes === null) return null;
+	if (!isNativeIoInputKindValue(kind)) return null;
+	if (typeof text !== "string") return null;
+	return Object.freeze({ hostId, selectionGeneration, subscriptionId, source, inputModes, kind, text });
+}
+
 class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinatorWithClose {
 	readonly #options: PeerCoordinatorOptions;
 	readonly #consentWindowMs: number;
@@ -675,6 +868,20 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 	readonly #peerStatePermissions: PeerStatePermissionPolicy | undefined;
 	readonly #hostBounds: Partial<PeerTransportBounds>;
 	readonly #clientBounds: Partial<PeerTransportBounds>;
+	/**
+	 * The caller's optional native IO proof/observation seam, or null for the exact
+	 * legacy display-only coordinator. It is immutable for the whole lifecycle:
+	 * there is no setter, registry, lease, or per-endpoint copy of it.
+	 */
+	readonly #nativeIo: PeerNativeIoCallbacks | null;
+	/**
+	 * Monotonic semantic invalidation of the native input target. It advances only
+	 * when a publication changes the written source or the observed input modes, so
+	 * an exact A -> B -> A change inside caller code is detectable by comparison and
+	 * never revived by present equality. Ordinary output does not advance it, and the
+	 * legacy display-only coordinator never advances it at all.
+	 */
+	#nativeInputGeneration = 0;
 
 	readonly #runtime = new Map<string, DestinationRuntime>();
 	readonly #consents = new Map<string, PendingConsent>();
@@ -744,6 +951,8 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		selectContent: (target: PeerContentTarget | null): void => this.#selectContent(target),
 		updateContentViewport: (viewport: PeerContentViewport): void => this.#updateContentViewport(viewport),
 		readContent: (): PeerContentObservation => this.#readContent(),
+		readNativeInputTarget: (): PeerNativeInputTarget | undefined => this.#readNativeInputTarget(),
+		sendNativeInput: (request: PeerNativeInputRequest): Promise<NativeInputSendResult> => this.#sendNativeInput(request),
 	};
 	/**
 	 * The ONE owner-routed Close controller: a property of this coordinator rather
@@ -780,6 +989,11 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		this.#peerStatePermissions = hooks.peerStatePermissions;
 		this.#hostBounds = hooks.hostBounds ?? {};
 		this.#clientBounds = hooks.clientBounds ?? {};
+		// Both callbacks were validated together at construction admission; a missing
+		// option keeps the exact legacy display-only coordinator.
+		this.#nativeIo = options.nativeIo === undefined
+			? null
+			: Object.freeze({ authorizeInput: options.nativeIo.authorizeInput, onCopy: options.nativeIo.onCopy });
 		this.#snapshot = this.#buildSnapshot(0);
 	}
 
@@ -971,11 +1185,19 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		// owning-host service as the content source. Without it the transport keeps
 		// refusing content upgrades, exactly as a metadata-only host does today.
 		if (this.#options.contentSource !== undefined) {
+			// The owner endpoint's own native IO support is enabled ONLY for an explicit
+			// callback binding. It grants nothing and authorizes nothing by itself: that
+			// endpoint still proves its own current provider, receiving grant, and lower
+			// source for every protected request, independently of this side's outgoing
+			// written-source proof. Without explicit callbacks the options are byte-for-
+			// byte the previous ones.
+			const hostOptions: OwnerContentHostOptions = {
+				source: this.#options.contentSource,
+				authorizePeer: (peerKey) => this.#authorizeContentPeer(peerKey),
+				...(this.#nativeIo === null ? {} : { nativeIo: true }),
+			};
 			try {
-				this.#contentHost = createSessionContentHost({
-					source: this.#options.contentSource,
-					authorizePeer: (peerKey) => this.#authorizeContentPeer(peerKey),
-				});
+				this.#contentHost = createSessionContentHost(hostOptions);
 			} catch {
 				this.#contentHost = null;
 			}
@@ -2588,6 +2810,20 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 			if (this.#contentIntentCurrent(epoch)) this.#setContentUnavailable(epoch, reason, false);
 			await this.#track(closing);
 		};
+		const wrapChannel = this.#options.testHooks?.wrapClientChannel;
+		if (wrapChannel !== undefined) {
+			// Fixture-only: this content lane is one more already-authenticated outgoing
+			// channel of the same borrowed client, so a controlled test peer can be
+			// substituted for it. Production callers pass nothing and the verified
+			// channel is used exactly as received; a refused substitution attaches
+			// nothing and reports the same fixed open failure as a refused upgrade.
+			try {
+				channel = wrapChannel(channel);
+			} catch {
+				await abandon("open-failed");
+				return;
+			}
+		}
 		// Re-check every fence after the await, including the latest viewport intent, the
 		// exact destination runtime/channel/client references this attempt borrowed, and
 		// the exact TLS identity the content channel actually proved.
@@ -2624,6 +2860,7 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		}
 		let live: ContentEndpoint | null = null;
 		let viewer: SessionContentViewer;
+		const nativeIo = this.#nativeIo;
 		try {
 			viewer = attachSessionContentViewer({
 				channel,
@@ -2634,6 +2871,22 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 				onSnapshot: (snapshot): void => {
 					if (live !== null) this.#onContentSnapshot(live, snapshot);
 				},
+				// The optional native IO capability is offered only for an explicit
+				// callback binding, and each callback re-proves THIS endpoint before it
+				// answers. `live` is assigned immediately after attach, so no input or
+				// copy can be admitted against a half-built endpoint.
+				...(nativeIo === null
+					? {}
+					: {
+						nativeIo: {
+							authorizeInput: (expected: NativeIoSource): boolean => (
+								live !== null && this.#authorizeNativeInput(live, expected)
+							),
+							onCopy: (copy: NativeIoCompletedCopy): void => {
+								if (live !== null) this.#routeNativeCopy(live, copy);
+							},
+						},
+					}),
 			});
 		} catch {
 			// Attaching refused before a handler was installed: only this channel is closed.
@@ -2754,6 +3007,16 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 			this.#publishContent();
 			return;
 		}
+		// A publication that changes the written source or the observed modes starts a
+		// new input lifetime, EVEN when the change is restored (A -> B -> A) before the
+		// next protected write. Caller code can do exactly that from inside its own
+		// proof, so the generation — never a snapshot object, text, or present equality —
+		// is what proves the request was admitted against the current lifetime.
+		const previousMeta = selection.view?.snapshot.meta;
+		if (this.#nativeIo !== null && previousMeta !== undefined
+			&& nativeInputTargetChanged(previousMeta, snapshot.meta)) {
+			this.#nativeInputGeneration += 1;
+		}
 		selection.view = Object.freeze({
 			hostId: endpoint.target.hostId,
 			selectionGeneration: endpoint.target.selectionGeneration,
@@ -2823,6 +3086,239 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 			if (selection.retirement === retirement) selection.retirement = null;
 		};
 		void retirement.then(release, release);
+	}
+
+	/* ------------------------------------------------------------------ *
+	 * Native input / text copy (optional, bound to the ONE current endpoint)
+	 * ------------------------------------------------------------------ */
+
+	/**
+	 * True only while this exact endpoint still owns the single current selection
+	 * and every authority fact it was opened against still holds. This is the same
+	 * fence the publishing path uses, never a second or weaker one, and it reads no
+	 * metadata, token, or snapshot object identity.
+	 */
+	#nativeIoEndpointCurrent(endpoint: ContentEndpoint): boolean {
+		const selection = this.#content;
+		if (selection.endpoint !== endpoint) return false;
+		if (selection.epoch !== endpoint.epoch) return false;
+		if (!this.#contentIntentCurrent(endpoint.epoch)) return false;
+		return this.#contentEndpointFence(endpoint) === null;
+	}
+
+	/**
+	 * The endpoint's own complete, currently published native IO facts, described
+	 * immutably: this selection's saved destination handle and generation, this
+	 * endpoint's own subscription id, and the exact source and input modes the
+	 * publisher wrote for the currently published view. Nothing is derived from a
+	 * newer target and nothing here is authority.
+	 */
+	#nativeInputFacts(endpoint: ContentEndpoint): NativeInputFacts | null {
+		const viewer = endpoint.viewer;
+		// A legacy endpoint with no native IO primitives simply offers none: its
+		// display behavior is untouched and no input or copy is ever described.
+		if (typeof viewer.readNativeInputSource !== "function") return null;
+		// The coordinator's own currently published view, carried unmodified: it is
+		// the exact endpoint's complete viewport, and it is cleared the moment it stops
+		// being current.
+		const view = this.#content.view;
+		if (view === undefined) return null;
+		if (view.hostId !== endpoint.target.hostId) return null;
+		if (view.selectionGeneration !== endpoint.target.selectionGeneration) return null;
+		const meta = view.snapshot.meta;
+		if (meta.subscriptionId !== viewer.subscriptionId) return null;
+		if (meta.hostRunId !== endpoint.target.hostRunId || meta.sessionId !== endpoint.target.rowId) return null;
+		const published = meta.inputSource;
+		if (published === undefined || published === null) return null;
+		// The endpoint's own negotiated, descriptive source must be the SAME semantic
+		// source as the published view's; no text, object, or sequence identity is
+		// involved, so ordinary output never blocks typing.
+		const source = viewer.readNativeInputSource();
+		if (source === undefined) return null;
+		if (!nativeIoSourceEquals(source, published)) return null;
+		return Object.freeze({
+			target: Object.freeze({
+				hostId: endpoint.target.hostId,
+				selectionGeneration: endpoint.target.selectionGeneration,
+				subscriptionId: viewer.subscriptionId,
+				source: published,
+				inputModes: meta.inputModes,
+			}),
+		});
+	}
+
+	/**
+	 * The composed per-write input gate handed to the existing viewer endpoint. It
+	 * runs for EVERY protected input write that endpoint makes, so it combines this
+	 * coordinator's current selection/peer/pin/run/row/destination fences with the
+	 * caller's dynamic written-source proof, and re-proves the fences AFTER that
+	 * proof returns because it is arbitrary caller code that may reenter.
+	 */
+	#authorizeNativeInput(endpoint: ContentEndpoint, expected: NativeIoSource): boolean {
+		const nativeIo = this.#nativeIo;
+		if (nativeIo === null) return false;
+		if (!this.#nativeIoEndpointCurrent(endpoint)) return false;
+		const before = this.#nativeInputFacts(endpoint);
+		if (before === null) return false;
+		// The endpoint hands over its own current published source; it must be the
+		// exact source of this whole target, never a newer or older one.
+		if (!nativeIoSourceEquals(expected, before.target.source)) return false;
+		// Captured before caller code runs: a proof that publishes another source and
+		// restores it (A -> B -> A) must not leave this write looking admitted.
+		const generation = this.#nativeInputGeneration;
+		let allowed: boolean;
+		try {
+			allowed = nativeIo.authorizeInput(before.target) === true;
+		} catch {
+			return false;
+		}
+		if (!allowed) return false;
+		// The proof may have resized, switched selection or focus, revoked a pin,
+		// replaced the destination, or published a different source and still
+		// returned `true`. Its answer is never trusted: re-prove everything, including
+		// the semantic source and the observed modes, without comparing snapshot
+		// objects or sequences (ordinary output must not block typing).
+		if (!this.#nativeIoEndpointCurrent(endpoint)) return false;
+		if (generation !== this.#nativeInputGeneration) return false;
+		const after = this.#nativeInputFacts(endpoint);
+		if (after === null) return false;
+		if (!nativeIoSourceEquals(expected, after.target.source)) return false;
+		return nativeInputModesEqual(before.target.inputModes, after.target.inputModes);
+	}
+
+	/**
+	 * Descriptive facts for the caller, never permission and never a proof: this is
+	 * PURE description of the one current endpoint, so the caller's own dynamic
+	 * proof may call it again from inside that proof without recursing.
+	 */
+	#readNativeInputTarget(): PeerNativeInputTarget | undefined {
+		if (this.#nativeIo === null) return undefined;
+		const endpoint = this.#content.endpoint;
+		if (endpoint === null) return undefined;
+		if (!this.#nativeIoEndpointCurrent(endpoint)) return undefined;
+		const facts = this.#nativeInputFacts(endpoint);
+		return facts === null ? undefined : facts.target;
+	}
+
+	/**
+	 * Submit one caller-normalized input to the SAME viewer endpoint that published
+	 * the target. The caller's own expected source and modes are what the wire
+	 * carries: this method never substitutes the owner's current facts for them and
+	 * never retargets one stream's input onto another. Everything that can be proven
+	 * before a write is proven before the delegate is invoked; once it is invoked, an
+	 * unknown outcome stays `unknown` instead of a false `not-sent`.
+	 */
+	async #sendNativeInput(request: PeerNativeInputRequest): Promise<NativeInputSendResult> {
+		const nativeIo = this.#nativeIo;
+		if (nativeIo === null) return nativeInputNotSent("not-negotiated");
+		const expected = ((): PeerNativeInputRequest | null => {
+			try {
+				return readNativeInputRequest(request);
+			} catch {
+				// A hostile getter, revoked proxy, or otherwise throwing argument is a
+				// refusal, never a rejected call from this seam.
+				return null;
+			}
+		})();
+		if (expected === null) return nativeInputNotSent("invalid-input");
+		const endpoint = this.#content.endpoint;
+		// Feature-detect the endpoint's own optional primitives: an older endpoint
+		// keeps its exact display behavior and simply cannot accept input.
+		if (endpoint === null
+			|| typeof endpoint.viewer.sendInput !== "function"
+			|| typeof endpoint.viewer.readNativeInputSource !== "function") {
+			return nativeInputNotSent("not-negotiated");
+		}
+		if (!this.#nativeIoEndpointCurrent(endpoint)) return nativeInputNotSent("not-ready");
+		const before = this.#nativeInputFacts(endpoint);
+		if (before === null) return nativeInputNotSent("not-ready");
+		// The caller's expectation must BE this endpoint's current target, field by
+		// field. A different host handle, generation, subscription, source, or mode set
+		// is a stale or foreign request, never something to reinterpret.
+		if (expected.hostId !== before.target.hostId
+			|| expected.selectionGeneration !== before.target.selectionGeneration
+			|| expected.subscriptionId !== before.target.subscriptionId
+			|| !nativeIoSourceEquals(expected.source, before.target.source)) {
+			return nativeInputNotSent("stale-source");
+		}
+		if (!nativeInputModesEqual(expected.inputModes, before.target.inputModes)) {
+			return nativeInputNotSent("stale-modes");
+		}
+		// Captured BEFORE the caller's proof runs: that callback is arbitrary code and
+		// may publish another source and restore it again before returning.
+		const generation = this.#nativeInputGeneration;
+		let allowed: boolean;
+		try {
+			allowed = nativeIo.authorizeInput(before.target) === true;
+		} catch {
+			return nativeInputNotSent("unauthorized");
+		}
+		if (!allowed) return nativeInputNotSent("unauthorized");
+		// Reentry may have replaced the selection, the source, or the modes while the
+		// caller's proof ran: nothing is handed to the endpoint for facts that moved.
+		if (!this.#nativeIoEndpointCurrent(endpoint)) return nativeInputNotSent("stale-source");
+		// A source lifetime that changed at all — including A -> B -> A, which present
+		// equality cannot see — invalidates this admission before anything is written.
+		if (generation !== this.#nativeInputGeneration) return nativeInputNotSent("stale-source");
+		const after = this.#nativeInputFacts(endpoint);
+		if (after === null) return nativeInputNotSent("not-ready");
+		if (!nativeIoSourceEquals(expected.source, after.target.source)) {
+			return nativeInputNotSent("stale-source");
+		}
+		if (!nativeInputModesEqual(expected.inputModes, after.target.inputModes)) {
+			return nativeInputNotSent("stale-modes");
+		}
+		try {
+			// The endpoint re-proves its own state, this exact source/modes pair, and this
+			// composed gate immediately before every protected write; the caller's own
+			// expected source and modes are what it is asked to write.
+			return await endpoint.viewer.sendInput({
+				source: expected.source,
+				inputModes: expected.inputModes,
+				kind: expected.kind,
+				text: expected.text,
+			});
+		} catch {
+			// The delegate was invoked, so bytes may already exist: never report a false
+			// "nothing happened", and never retry, replay, reconnect, or re-grant.
+			return { status: "unknown" };
+		}
+	}
+
+	/**
+	 * Forward one atomically assembled copy to the caller's callback ONLY while it is
+	 * still this coordinator's current endpoint, selection, subscription, and exact
+	 * published source. There is no dispatch-order heuristic, broadcast, OSC 52
+	 * emission, local clipboard write, or owner-local fallback: a copy that cannot
+	 * prove all of that is dropped, and a throwing callback is contained.
+	 */
+	#routeNativeCopy(endpoint: ContentEndpoint, copy: NativeIoCompletedCopy): void {
+		const nativeIo = this.#nativeIo;
+		if (nativeIo === null) return;
+		if (!this.#nativeIoEndpointCurrent(endpoint)) return;
+		if (copy.subscriptionId !== endpoint.viewer.subscriptionId) return;
+		const facts = this.#nativeInputFacts(endpoint);
+		if (facts === null) return;
+		// Exact semantic equality of the WHOLE source, checked once more on the
+		// completed data: a source change while the pages arrived never hands an
+		// older copy to a newer view, and an A -> B -> A return never revives it.
+		if (!nativeIoSourceEquals(copy.source, facts.target.source)) return;
+		const receipt: PeerNativeCopyReceipt = Object.freeze({
+			subscriptionId: copy.subscriptionId,
+			copyId: copy.copyId,
+			sequence: copy.sequence,
+			source: copy.source,
+			dispatchId: copy.dispatchId,
+			event: copy.event,
+			hostId: endpoint.target.hostId,
+			selectionGeneration: endpoint.target.selectionGeneration,
+		});
+		try {
+			nativeIo.onCopy(receipt);
+		} catch {
+			// The caller's own clipboard/focus proof and any OS write stay its business;
+			// nothing is retried, replayed, or fallen back to here.
+		}
 	}
 
 	/**
@@ -3529,6 +4025,17 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
 	if (options.onContentChange !== undefined && typeof options.onContentChange !== "function") {
 		throw new TypeError("peer coordinator content callback is invalid");
 	}
+	if (options.nativeIo !== undefined) {
+		// Both callbacks or nothing: a partially shaped option must never look like
+		// native IO support this coordinator cannot honour. Validation is pure — no
+		// listener, channel, identity, file, or callback is created here.
+		const nativeIo = options.nativeIo;
+		if (!isRecord(nativeIo)
+			|| typeof nativeIo.authorizeInput !== "function"
+			|| typeof nativeIo.onCopy !== "function") {
+			throw new TypeError("peer coordinator native IO callbacks are invalid");
+		}
+	}
 	if (options.closeOwnedSession !== undefined && typeof options.closeOwnedSession !== "function") {
 		// No implicit close provider: a non-callable value would otherwise look like
 		// support this host cannot honour.
@@ -3582,6 +4089,11 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
  * optional Close capability; supplying none changes nothing at all, and the
  * requester side still refuses with `not-sent` for an owner that never
  * acknowledged it.
+ *
+ * Optional `nativeIo` callbacks add the native input/copy seam for the selected
+ * stream and nothing else: they are refused unless both are functions, they never
+ * enable anything by themselves, and omitting them keeps every byte and every
+ * behavior of the display-only coordinator.
  */
 export function createPeerCoordinator(
 	options: PeerCoordinatorOptions,

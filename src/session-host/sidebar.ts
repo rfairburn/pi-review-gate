@@ -306,6 +306,33 @@ export type SidebarAction =
       readonly rowId: string;
     }
   | { readonly type: "remove"; readonly id: string }
+  /**
+   * Ordinary `d`/Delete on the remote card the left roster actually drew as its
+   * complete highlight. It names the owner's frozen run and row and nothing
+   * else: it is not a local stop/removal, not a confirmation, and not authority.
+   * Main independently proves that this exact row is the written highlight
+   * before it asks the owner anything.
+   */
+  | {
+      readonly type: "remote-close-request";
+      readonly hostId: string;
+      readonly hostRunId: string | null;
+      readonly rowId: string;
+    }
+  /**
+   * One deliberate confirmation of the frozen remote-close target, emitted
+   * while that exact dialog frame is still current and written. `generation`
+   * and `renderToken` are the frozen intent; Main's own synchronous recheck and
+   * one-shot consumption decide whether anything is sent.
+   */
+  | {
+      readonly type: "remote-close-confirmed";
+      readonly hostId: string;
+      readonly hostRunId: string;
+      readonly rowId: string;
+      readonly generation: number;
+      readonly renderToken: number;
+    }
   | { readonly type: "resume-row"; readonly requestId: number; readonly id: string }
   | { readonly type: "resume-row-cancel"; readonly requestId: number }
   /**
@@ -405,6 +432,16 @@ export interface SidebarMousePresentation {
    * dialog's decision/geometry targets.
    */
   readonly authorizationKey: string;
+  /**
+   * The exact remote card this render drew as the complete left-roster
+   * highlight, or undefined when the highlight was not a fully drawn remote
+   * row (tiny/clipped fallback, another pane, hidden, or a non-remote entry).
+   * It is the minimal frozen owner target plus the drawn row/geometry and the
+   * condensed local preflight facts of that same drawn row. It grants nothing:
+   * Main requires the writer's own written receipt for this exact value before
+   * any Close is requested, and the owner host revalidates its own row.
+   */
+  readonly remoteClose: SidebarRemoteCloseRow | undefined;
   /** Activates only entries captured by the exact sidebar render this token represents. */
   activateRosterAt(column: number, row: number, cols: number, rows: number): boolean;
   /** Activates only saved rows captured by the exact sidebar render this token represents. */
@@ -421,6 +458,42 @@ export interface SidebarMousePresentation {
    * exactly one map — if either — can act.
    */
   activateFormRowAt(column: number, row: number, cols: number, rows: number): boolean;
+}
+
+/**
+ * One written left-roster highlight of a remote card, captured at render time.
+ *
+ * This is deliberately NOT the sidebar's activation identity, authorization
+ * key, or content key: those embed the native conversation tuple, lifecycle,
+ * labels, and stream identity, and a Close needs none of them. It carries only
+ * the minimal owner target ({hostId, hostRunId, rowId}), the drawn row/geometry
+ * of the complete highlighted card, its display labels, and the condensed local
+ * preflight facts of that same drawn row.
+ */
+export interface SidebarRemoteCloseRow {
+  /** Local saved-destination handle of the owner host. */
+  readonly hostId: string;
+  /** Exact observed owner run, or null when the projection carries none. */
+  readonly hostRunId: string | null;
+  /** Exact owner row id within that run. */
+  readonly rowId: string;
+  /** Pane row and complete card height this render actually drew. */
+  readonly row: number;
+  readonly height: number;
+  /** Pane geometry the card was drawn in. */
+  readonly cols: number;
+  readonly rows: number;
+  /** Focus domain of that render; only a roster-owned highlight can act. */
+  readonly focus: SidebarFocus;
+  /** Drawn lifecycle/process observation of this same row. */
+  readonly lifecycle: SidebarItem["lifecycle"];
+  readonly hasLiveProcess: boolean;
+  /** Existing complete-idle preflight over this same drawn row's facts. */
+  readonly idle: boolean;
+  /** Bounded display title of the drawn card (UI only, never identity). */
+  readonly title: string;
+  /** Bounded display friendly label of the owner host (UI only). */
+  readonly hostLabel: string;
 }
 
 export interface SidebarFieldFactoryOptions {
@@ -717,6 +790,34 @@ interface DisplayedPeerConsent {
   readonly rows: number;
   readonly approveRow: number;
   readonly denyRow: number;
+}
+
+/**
+ * Frozen remote-close target: the minimal owner identity a Close names plus the
+ * bounded display labels of the card the operator actually saw. The labels are
+ * UI text only; no comparison or authorization ever reads them.
+ */
+interface FrozenRemoteCloseTarget {
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly rowId: string;
+  readonly title: string;
+  readonly hostLabel: string;
+}
+
+/**
+ * The exact remote-close dialog candidate: frozen target + monotonic
+ * confirmation generation + complete pane geometry + the control rows that
+ * were actually emitted. Any new generation or moved control mints a new
+ * token instead of inheriting the previous written proof.
+ */
+interface DisplayedRemoteClose {
+  readonly identity: string;
+  readonly generation: number;
+  readonly token: number;
+  readonly cols: number;
+  readonly rows: number;
+  readonly target: FrozenRemoteCloseTarget;
 }
 
 function peerPaneRowIdentity(row: PeerPaneRow): readonly unknown[] {
@@ -1376,7 +1477,13 @@ function requiresQuitConfirmation(item: SidebarItem): boolean {
  * activity-intent counts: retained cleanup/recovery work still requires
  * confirmation before a stop or removal.
  */
-function isCompleteIdle(item: SidebarItem): boolean {
+function isCompleteIdle(item: {
+  readonly busy: boolean | null;
+  readonly pendingInput: boolean | null;
+  readonly inputSurface: boolean;
+  readonly backgroundTasks?: number | null;
+  readonly backgroundShells?: number | null;
+}): boolean {
   return (
     item.busy === false &&
     item.pendingInput === false &&
@@ -1882,11 +1989,33 @@ export class SidebarController {
     | "saved-delete"
     | "peer-consent"
     | "peer-remove"
-    | "peer-revoke" = "quit";
+    | "peer-revoke"
+    | "remote-close" = "quit";
   /** Frozen stop target id; later navigation never retargets the confirmation. */
   private stopRemoveTargetId: string | undefined;
   /** True only while the last render drew the complete stop warning dialog. */
   private stopConfirmDisplayed = false;
+  /**
+   * Frozen minimal remote-close target (owner host/run/row) plus its bounded
+   * display labels. Opened only by Main after it proved the drawn highlight and
+   * asked for a confirmation; later snapshots, navigation, or a newer
+   * projection never retarget it.
+   */
+  private remoteCloseTarget: FrozenRemoteCloseTarget | undefined;
+  /**
+   * Monotonic confirmation generation. Every deliberate open advances it, so a
+   * re-opened dialog with identical bytes is still a different decision.
+   */
+  private remoteCloseGeneration = 0;
+  /** Candidate remote-close dialog frame (identity + generation + geometry). */
+  private remoteCloseDisplay: DisplayedRemoteClose | undefined;
+  /** True only while the last render drew this exact complete dialog. */
+  private remoteCloseRendered = false;
+  /** Token Main reported as actually written; the ONLY confirmation authority. */
+  private remoteCloseWrittenToken: number | undefined;
+  private remoteCloseTokenSequence = 1;
+  /** Bounded local notice shown inside the remote-close dialog (never authority). */
+  private remoteCloseNotice: string | undefined;
   private formError: string | undefined;
   private noticeError: string | undefined;
   private nextRequestId = 1;
@@ -2031,6 +2160,113 @@ export class SidebarController {
   /** Opaque token for the last fully rendered Saved-delete warning candidate. */
   get savedDeleteConfirmationRenderTokenNumber(): number | undefined {
     return this.savedDeleteConfirmationRenderToken;
+  }
+
+  /**
+   * True only while the frozen remote-close dialog owns confirm focus. Main uses
+   * it as a state signal, never as an input or confirmation authority: a
+   * confirmation additionally needs the written receipt below.
+   */
+  get remoteCloseConfirmationActive(): boolean {
+    return this._visible && this._focus === "confirm" && this.confirmPurpose === "remote-close"
+      && this.remoteCloseTarget !== undefined;
+  }
+
+  /**
+   * Capture the exact current complete dialog candidate for Main's frame
+   * writer, or undefined when no complete dialog candidate exists. Capturing
+   * authorizes nothing by itself.
+   */
+  captureRemoteCloseConfirmationPresentation(): {
+    readonly generation: number;
+    readonly renderToken: number;
+    readonly target: {
+      readonly hostId: string;
+      readonly hostRunId: string;
+      readonly rowId: string;
+    };
+    /** Bounded display title of the frozen target. Never part of the token. */
+    readonly title: string;
+  } | undefined {
+    const display = this.remoteCloseDisplay;
+    const target = this.remoteCloseTarget;
+    if (display === undefined || target === undefined) return undefined;
+    if (!this.isRemoteCloseConfirmationRenderCurrent(display.generation, display.token)) return undefined;
+    return {
+      generation: display.generation,
+      renderToken: display.token,
+      target: { hostId: target.hostId, hostRunId: target.hostRunId, rowId: target.rowId },
+      title: target.title,
+    };
+  }
+
+  /**
+   * Whether this exact generation/render token is the complete dialog frame the
+   * last render drew and is still the current one. A superseded, replaced,
+   * too-small, or non-dialog frame is not current.
+   */
+  isRemoteCloseConfirmationRenderCurrent(generation: number, renderToken: number): boolean {
+    const display = this.remoteCloseDisplay;
+    const target = this.remoteCloseTarget;
+    return display !== undefined && target !== undefined && this.remoteCloseRendered
+      && display.generation === generation && display.token === renderToken
+      && display.target === target
+      && this._visible && this._focus === "confirm" && this.confirmPurpose === "remote-close";
+  }
+
+  /**
+   * Grant confirmation authority only after Main's writer settles this exact
+   * frame, i.e. after the operator's own terminal actually shows it.
+   */
+  settleRemoteCloseConfirmationRender(generation: number, renderToken: number): boolean {
+    if (!this.isRemoteCloseConfirmationRenderCurrent(generation, renderToken)) return false;
+    this.remoteCloseWrittenToken = renderToken;
+    return true;
+  }
+
+  /** Revoke remote-close display authority before any focus, target, or geometry invalidation. */
+  invalidateRemoteCloseConfirmationDisplay(): void {
+    this.remoteCloseDisplay = undefined;
+    this.remoteCloseRendered = false;
+    this.remoteCloseWrittenToken = undefined;
+  }
+
+  /**
+   * Dismiss a pending remote-close dialog without emitting anything, because
+   * Main positively observed that its frozen owner target no longer exists (the
+   * row was removed or the owner run was replaced). It decides nothing, sends
+   * nothing, and preserves focus ownership of the roster itself.
+   */
+  abandonRemoteCloseConfirmation(): boolean {
+    if (!this.remoteCloseConfirmationActive) return false;
+    this.cancelRemoteCloseConfirmation();
+    return true;
+  }
+
+  /**
+   * Main's synchronous two-phase entry point for one deliberate `d`/Delete on a
+   * remote card. It re-proves that the currently drawn highlight is exactly the
+   * frozen request target, then either reports the direct plan (`direct`, the
+   * caller performs the one owner request) or opens the written confirmation
+   * (`confirmation-opened`) and returns. It never emits anything, so a request
+   * that arrives here is not re-routed or duplicated.
+   */
+  prepareRemoteClose(
+    target: {
+      readonly hostId: string;
+      readonly hostRunId: string | null;
+      readonly rowId: string;
+    },
+    options: { readonly direct: boolean },
+  ): "direct" | "confirmation-opened" | "refused" {
+    const drawn = this.drawnRemoteCloseTarget();
+    if (drawn === undefined) return "refused";
+    if (target.hostRunId === null || target.hostRunId.length === 0) return "refused";
+    if (drawn.hostId !== target.hostId || drawn.hostRunId !== target.hostRunId
+      || drawn.rowId !== target.rowId) return "refused";
+    if (options.direct) return "direct";
+    this.openRemoteCloseConfirmation(drawn);
+    return "confirmation-opened";
   }
 
   /** Revoke Saved-delete display authority before any focus, target, or geometry invalidation. */
@@ -2552,6 +2788,9 @@ export class SidebarController {
     this.invalidatePeerConsentDisplay();
     this.peerConsentLatch = undefined;
     this.peerConsentLocalNotice = undefined;
+    this.remoteCloseTarget = undefined;
+    this.remoteCloseNotice = undefined;
+    this.invalidateRemoteCloseConfirmationDisplay();
     this.confirmPurpose = "quit";
     this._focus = "form";
     this.onInvalidate?.();
@@ -2689,6 +2928,7 @@ export class SidebarController {
         displayedPeerConsent,
         this.peerConsentRendered,
       ),
+      remoteClose: this.remoteCloseRowFrom(displayedRoster),
       activateRosterAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateRosterAtFrom(displayedRoster, column, row, cols, rows, false),
       activateSavedAt: (column: number, row: number, cols: number, rows: number): boolean =>
@@ -2701,6 +2941,61 @@ export class SidebarController {
         displayedSavedRows !== undefined
           ? this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows)
           : this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows),
+    });
+  }
+
+  /**
+   * The written remote-close highlight of one roster render record, or
+   * undefined when that render did not draw a complete remote card as its
+   * highlight. Only the drawn region's own entry is used, never a newer
+   * projection or the logical selection alone.
+   */
+  private remoteCloseRowFrom(shown: DisplayedRoster | undefined): SidebarRemoteCloseRow | undefined {
+    // The DRAWN highlight decides, never the logical selection: a capture from
+    // an older record must describe the row that record actually marked.
+    const key = shown?.selectedKey;
+    if (shown === undefined || key === undefined) return undefined;
+    if (shown.focus !== "sidebar" || shown.signature !== this.rosterSignature()) return undefined;
+    const region = shown.regions.get(key);
+    const entry = region?.entry;
+    if (region === undefined || entry === undefined) return undefined;
+    if (entry.kind !== "remote" || entry.remote === undefined) return undefined;
+    if (region.height !== this.entryHeight(entry)) return undefined;
+    const remote = entry.remote;
+    return Object.freeze({
+      hostId: remote.hostId,
+      hostRunId: remote.hostRunId,
+      rowId: remote.row.id,
+      row: region.row,
+      height: region.height,
+      cols: shown.cols,
+      rows: shown.rows,
+      focus: shown.focus,
+      lifecycle: remote.row.lifecycle,
+      hasLiveProcess: remote.row.hasLiveProcess,
+      idle: isCompleteIdle(remote.row),
+      title: cardTitle(remote.row),
+      hostLabel: sanitizeBounded(remote.hostLabel, PEER_LABEL_MAX_CODEPOINTS),
+    });
+  }
+
+  /**
+   * The remote-close target this sidebar's last complete roster render drew as
+   * its highlight. Undefined when that card is not a fully drawn remote row, or
+   * when the projection carried no owner run (a Close is never guessed).
+   */
+  private drawnRemoteCloseTarget(): FrozenRemoteCloseTarget | undefined {
+    const shown = this.displayedRoster;
+    if (shown === undefined || shown.selectedKey === undefined
+      || shown.selectedKey !== this.selectedEntryKey) return undefined;
+    const drawn = this.remoteCloseRowFrom(shown);
+    if (drawn === undefined || drawn.hostRunId === null || drawn.hostRunId.length === 0) return undefined;
+    return Object.freeze({
+      hostId: drawn.hostId,
+      hostRunId: drawn.hostRunId,
+      rowId: drawn.rowId,
+      title: drawn.title,
+      hostLabel: drawn.hostLabel,
     });
   }
 
@@ -2978,8 +3273,12 @@ export class SidebarController {
     // A fresh frame starts with no settled consent-dialog authority; only a
     // complete render of the exact dialog can re-establish a candidate token.
     this.peerConsentRendered = false;
+    // The remote-close dialog's written proof is re-established the same way:
+    // only a complete render of the exact frozen target can mint/keep its token.
+    this.remoteCloseRendered = false;
     if (!this._visible) {
       this.invalidateSavedDeleteConfirmationDisplay();
+      this.invalidateRemoteCloseConfirmationDisplay();
       return { lines: [] };
     }
     return this.renderForFocus(cols, rows);
@@ -2994,6 +3293,7 @@ export class SidebarController {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
     this.peerConsentRendered = false;
+    this.remoteCloseRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
       return this.renderRosterTooSmall(cols, rows);
@@ -3010,6 +3310,7 @@ export class SidebarController {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
     this.peerConsentRendered = false;
+    this.remoteCloseRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
     this.displayedSavedRows = undefined;
     // Only the network pane owns the displayed peer-row mapping; every other
@@ -3053,6 +3354,7 @@ export class SidebarController {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
     this.peerConsentRendered = false;
+    this.remoteCloseRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
     if (!this.savedDeleteConfirmationActive) return { lines: [] };
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) return this.renderTooSmall(cols, rows);
@@ -3077,6 +3379,9 @@ export class SidebarController {
         this.peerConfirmDisplayed = false;
         this.invalidateSavedDeleteConfirmationDisplay();
         this.invalidatePeerConsentDisplay();
+        // An unshowable confirmation proves nothing: no pending remote close
+        // keeps a written receipt or a confirmable token at this geometry.
+        this.invalidateRemoteCloseConfirmationDisplay();
         return this.renderTooSmall(cols, rows);
       }
       return this.renderConfirmPane(cols, rows);
@@ -3506,6 +3811,13 @@ export class SidebarController {
   private stopRemoveSelectedEntry(): void {
     this.cancelRowResume();
     const entry = this.currentEntry();
+    if (entry?.kind === "remote") {
+      // A remote card is never a local row: this asks the OWNER host about its
+      // own session through Main's independent written-highlight gate. Nothing
+      // is stopped, removed, or confirmed here.
+      this.requestRemoteClose();
+      return;
+    }
     if (entry === undefined || entry.kind !== "item" || entry.item === undefined) {
       this.noticeError = "Select a session row to stop or remove";
       return;
@@ -3582,6 +3894,118 @@ export class SidebarController {
       return;
     }
     this.emit({ type: "stop-remove", id, confirmed: true });
+  }
+
+  // --- Remote Close: the owner's row, asked over the existing roster lane. ---
+
+  /**
+   * One deliberate `d`/Delete on a remote card. It emits the drawn target and
+   * nothing else: no confirmation flag, no local removal, no guess. Main proves
+   * the exact written highlight and decides whether an owner request may be
+   * sent directly or needs this operator's written confirmation first.
+   */
+  private requestRemoteClose(): void {
+    const shown = this.displayedRoster;
+    const drawn = shown !== undefined && shown.selectedKey !== undefined
+      && shown.selectedKey === this.selectedEntryKey
+      ? this.remoteCloseRowFrom(shown)
+      : undefined;
+    if (drawn === undefined) {
+      this.noticeError = "Highlight a completely displayed remote session row to close it";
+      return;
+    }
+    if (drawn.hostRunId === null || drawn.hostRunId.length === 0) {
+      // No observed owner run: a Close is never guessed against another run.
+      this.noticeError = "That remote session's owner run was not observed; no close was requested";
+      return;
+    }
+    this.noticeError = undefined;
+    this.emit({
+      type: "remote-close-request",
+      hostId: drawn.hostId,
+      hostRunId: drawn.hostRunId,
+      rowId: drawn.rowId,
+    });
+  }
+
+  /**
+   * Opens the deliberate remote-close confirmation for the frozen target. The
+   * generation advances on every open, so a re-opened dialog is a new decision
+   * even when every drawn byte matches the previous one.
+   */
+  private openRemoteCloseConfirmation(target: FrozenRemoteCloseTarget): void {
+    this.forgetDisplayedRoster(); // the confirmation replaces the roster
+    this.remoteCloseTarget = target; // frozen: later navigation never retargets
+    this.remoteCloseGeneration += 1;
+    this.remoteCloseNotice = undefined;
+    this.invalidateRemoteCloseConfirmationDisplay();
+    this.confirmPurpose = "remote-close";
+    this._focus = "confirm";
+    this.onInvalidate?.();
+  }
+
+  /**
+   * Cancel without any owner request: the highlighted row, focus ownership, and
+   * every local session stay exactly as they were, and nothing is emitted.
+   */
+  private cancelRemoteCloseConfirmation(): void {
+    this.remoteCloseTarget = undefined;
+    this.remoteCloseNotice = undefined;
+    this.invalidateRemoteCloseConfirmationDisplay();
+    this.confirmPurpose = "quit";
+    this._focus = "sidebar";
+    this.onInvalidate?.();
+  }
+
+  /**
+   * One deliberate confirmation of the frozen target, emitted only while this
+   * exact dialog frame is current AND already settled by the actual writer.
+   * Main rechecks the same receipt synchronously before it awaits anything, so a
+   * cancelled, superseded, too-small, queued, held, or stale frame sends nothing.
+   */
+  private applyRemoteCloseConfirmation(data: string): void {
+    const display = this.remoteCloseDisplay;
+    const target = this.remoteCloseTarget;
+    if (display === undefined || target === undefined
+      || !this.isRemoteCloseConfirmationRenderCurrent(display.generation, display.token)) {
+      this.remoteCloseNotice = "No current dialog frame; no close was requested";
+      this.onInvalidate?.();
+      return;
+    }
+    if (this.remoteCloseWrittenToken !== display.token) {
+      this.remoteCloseNotice = "No written receipt for this dialog yet; no close was requested";
+      this.onInvalidate?.();
+      return;
+    }
+    const generation = display.generation;
+    const renderToken = display.token;
+    // Claim the held confirm key so its repeat/release cannot submit twice.
+    this.claimHeldAction(this.peerConsentActionMatcher(data));
+    // Dispatch while this exact dialog is still current: Main's synchronous
+    // guard must observe a live, current, written dialog for this generation.
+    this.emit({
+      type: "remote-close-confirmed",
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      rowId: target.rowId,
+      generation,
+      renderToken,
+    });
+    // Dismiss only the same dialog this intent came from, and only while its
+    // written proof still stands: a refused submission keeps the frame (and its
+    // notice) so the operator can review it again.
+    if (this.remoteCloseTarget !== target || this.remoteCloseGeneration !== generation) return;
+    if (this.remoteCloseDisplay === undefined || this.remoteCloseWrittenToken !== renderToken) {
+      this.remoteCloseNotice = "No current written dialog frame; no close was requested";
+      this.onInvalidate?.();
+      return;
+    }
+    this.remoteCloseTarget = undefined;
+    this.remoteCloseNotice = undefined;
+    this.invalidateRemoteCloseConfirmationDisplay();
+    this.confirmPurpose = "quit";
+    this._focus = "sidebar";
+    this.onInvalidate?.();
   }
 
   /**
@@ -4322,7 +4746,8 @@ export class SidebarController {
     // are unchanged.
     if ((this.confirmPurpose === "peer-consent"
       || this.confirmPurpose === "peer-remove"
-      || this.confirmPurpose === "peer-revoke")
+      || this.confirmPurpose === "peer-revoke"
+      || this.confirmPurpose === "remote-close")
       && this.routeBracketedPaste(data)) return;
     // Fence the held Escape that canceled only a host-owned form across focus
     // domains until its release or a fresh Escape press.
@@ -4357,6 +4782,10 @@ export class SidebarController {
     }
     if (this.confirmPurpose === "stop-remove") {
       this.handleStopRemoveConfirmInput(data);
+      return;
+    }
+    if (this.confirmPurpose === "remote-close") {
+      this.handleRemoteCloseConfirmInput(data);
       return;
     }
     if (matchesKey(data, "escape")) {
@@ -4444,6 +4873,29 @@ export class SidebarController {
   private confirmQuit(): void {
     this._focus = "sidebar";
     this.emit({ type: "quit" });
+  }
+
+  /**
+   * Remote Close confirmation: deliberate initial presses only. Cancel sends no
+   * owner request and keeps the highlighted row and roster focus; confirm is
+   * accepted only while the complete dialog frame is on screen and written.
+   */
+  private handleRemoteCloseConfirmInput(data: string): void {
+    if (this.consumeSavedActionClaim(data)) return;
+    if (isKeyRepeat(data) || isKeyRelease(data)) return;
+    if (matchesKey(data, "escape")) {
+      this.formEscapeClaimed = true;
+      this.cancelRemoteCloseConfirmation();
+      return;
+    }
+    const printable = printableOf(data);
+    if (printable === "n" || printable === "N") {
+      this.cancelRemoteCloseConfirmation();
+      return;
+    }
+    if (!matchesKey(data, "enter") && printable !== "y" && printable !== "Y") return;
+    if (!this.remoteCloseRendered) return;
+    this.applyRemoteCloseConfirmation(data);
   }
 
   // --- Network pane, incoming consent, and metadata-only remote rows. ---
@@ -5664,10 +6116,13 @@ export class SidebarController {
       return;
     }
     this.forgetDisplayedRoster();
-    // A hidden pane cannot hold an open stop confirmation.
+    // A hidden pane cannot hold an open stop confirmation or remote close.
     this.confirmPurpose = "quit";
     this.stopRemoveTargetId = undefined;
     this.stopConfirmDisplayed = false;
+    this.remoteCloseTarget = undefined;
+    this.remoteCloseNotice = undefined;
+    this.invalidateRemoteCloseConfirmationDisplay();
     // A hidden pane also holds no consent dialog, network confirmation, or
     // drawn peer-row map: none of them may authorize anything off-screen.
     this.peerConsentLatch = undefined;
@@ -6419,6 +6874,9 @@ export class SidebarController {
     if (this.confirmPurpose === "stop-remove") {
       return this.renderStopRemoveConfirmPane(cols, rows);
     }
+    if (this.confirmPurpose === "remote-close") {
+      return this.renderRemoteCloseConfirmPane(cols, rows);
+    }
     const header = " Quit host? ";
     const liveCount = this.rowStore.filter(requiresQuitConfirmation).length;
     const countLines = wrapHintLines(
@@ -6533,6 +6991,76 @@ export class SidebarController {
       lines.push(wrapRow(line, cols));
     }
     this.stopConfirmDisplayed = true;
+    return { lines };
+  }
+
+  /**
+   * The remote Close confirmation: the frozen target's display title and owner
+   * host, the two bounded warnings that describe exactly what the owner may do,
+   * and the confirm/cancel hints. The dialog is the WHOLE frozen target: nothing
+   * here is re-read from a newer projection, so a snapshot, reorder, or
+   * navigation can only refuse it.
+   *
+   * A frame that cannot show every line mints no candidate token at all. An
+   * identical target/generation/geometry keeps the token it already had, while
+   * a new generation is a new decision even when the drawn bytes match.
+   */
+  private renderRemoteCloseConfirmPane(cols: number, rows: number): { lines: string[] } {
+    const tooSmall = (): { lines: string[] } => {
+      this.invalidateRemoteCloseConfirmationDisplay();
+      return this.renderTooSmall(cols, rows);
+    };
+    const target = this.remoteCloseTarget;
+    if (target === undefined) return tooSmall();
+    const header = " Close remote session? ";
+    const hints = wrapHintLines(["enter/y = close", "esc/n = cancel"], cols);
+    const warnings = wrapHintLines([
+      "Only this session on its owner host is asked to stop; saved conversations are kept.",
+      "The owner removes the row only after it observes an actual exit.",
+    ], cols);
+    if (hints === undefined || warnings === undefined || visibleWidth(header) > cols) return tooSmall();
+    const titleLines = wrapHintLines([truncateToWidth(target.title, cols, "...", true)], cols);
+    const hostLines = wrapHintLines([`host: ${target.hostLabel}`], cols);
+    if (titleLines === undefined || hostLines === undefined) return tooSmall();
+    const noticeLines = this.remoteCloseNotice === undefined
+      ? []
+      : wrapHintLines([`! ${this.remoteCloseNotice}`], cols) ?? [];
+    const bodyRows = 1 + titleLines.length + hostLines.length + warnings.length
+      + noticeLines.length + hints.length;
+    if (bodyRows > rows) return tooSmall();
+
+    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
+    for (const line of titleLines) lines.push(wrapRow(line, cols));
+    for (const line of hostLines) lines.push(wrapRow(line, cols));
+    for (const line of warnings) lines.push(wrapRow(line, cols));
+    for (const line of noticeLines) lines.push(wrapRow(line, cols));
+    lines.push(...blankLines(Math.max(0, rows - lines.length - hints.length)));
+    const controlRow = lines.length;
+    for (const line of hints) lines.push(wrapRow(line, cols));
+
+    const generation = this.remoteCloseGeneration;
+    // Identity is the frozen target, the monotonic generation, this pane's
+    // geometry, and where the confirm/cancel controls were actually written.
+    // The bounded notice is presentation text, not identity.
+    const identity = JSON.stringify([
+      target.hostId, target.hostRunId, target.rowId, generation,
+      cols, rows, controlRow, hints.length,
+    ]);
+    if (this.remoteCloseDisplay !== undefined && this.remoteCloseDisplay.identity === identity) {
+      this.remoteCloseRendered = true;
+      return { lines };
+    }
+    const token = this.remoteCloseTokenSequence++;
+    this.remoteCloseDisplay = Object.freeze({
+      identity,
+      generation,
+      token,
+      cols,
+      rows,
+      target,
+    });
+    this.remoteCloseWrittenToken = undefined;
+    this.remoteCloseRendered = true;
     return { lines };
   }
 }

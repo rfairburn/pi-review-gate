@@ -30,7 +30,7 @@ import { deleteSavedSessionFile, type SavedSessionDeletionOptions } from "../src
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import type { NativeClipboardEvent } from "../src/session-host/native-clipboard";
 import type { PeerCoordinatorOptions } from "../src/session-host/network/peer-coordinator";
-import type { OwnerCloseFacts, OwnerCloseHandler } from "../src/session-host/network/peer-close";
+import type { OwnerCloseFacts, OwnerCloseHandler, PeerCloseController, PeerCloseResult } from "../src/session-host/network/peer-close";
 import type {
   PeerContentController,
   PeerContentObservation,
@@ -55,6 +55,7 @@ import type {
   SessionViewerUpdateResult,
 } from "../src/session-host/instances";
 import { sidebarNoticeRows } from "./helpers/session-host-notice-witness";
+import { sidebarPaneLines } from "./helpers/session-host-native-roster-witness";
 
 const ESC = "\x1b";
 const ALT_LEFT = `${ESC}[1;3D`;
@@ -250,7 +251,14 @@ class FakeWriter {
     this.frames.push({ frame, cols, rows });
     if (this.holdWrites) {
       this.heldSubmits += 1;
-      this.pendingSettle = onSettled; // the superseded candidate is dropped, unsettled
+      if (this.queueWrites) {
+        // Opt-in: retain every in-flight settlement in order, so a test can
+        // settle an older frame as actually written before a newer identical
+        // candidate is reported unchanged.
+        this.queuedSettles.push({ settle: onSettled });
+      } else {
+        this.pendingSettle = onSettled; // the superseded candidate is dropped, unsettled
+      }
       return;
     }
     onSettled?.(this.settlementDisposition);
@@ -267,8 +275,17 @@ class FakeWriter {
    * submitted frame is reported as written until the sink drains.
    */
   holdWrites = false;
+  /** Opt-in: retain every held settlement instead of only the newest candidate. */
+  queueWrites = false;
+  readonly queuedSettles: Array<{ settle?: (disposition: SessionHostFrameDisposition) => void }> = [];
   heldSubmits = 0;
   private pendingSettle: ((disposition: SessionHostFrameDisposition) => void) | undefined;
+
+  /** Settle one retained in-flight submission with an explicit disposition. */
+  settleQueued(index: number, disposition: SessionHostFrameDisposition): void {
+    const [entry] = this.queuedSettles.splice(index, 1);
+    entry?.settle?.(disposition);
+  }
 
   /** Drain the blocked sink: the newest retained candidate is written. */
   drainHeldWrites(): void {
@@ -8761,5 +8778,752 @@ test("teardown inside the close's first yield fences the manager call itself", a
   } finally {
     harness.signals.emit("SIGTERM");
     assert.equal(await harness.result, 0);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Requester-side remote Close.
+//
+// The remote card the left roster actually WROTE is the only thing `d`/Delete can
+// act on. Main proves that written highlight by value, asks the operator for a
+// written confirmation only when the drawn facts are busy or unknown, and then
+// hands exactly one request to the coordinator's existing optional Close
+// controller. Nothing here removes a row locally: only the owner's own roster
+// projection can do that.
+// ---------------------------------------------------------------------------
+
+/** The fake coordinator plus the ONE optional Close controller Main feature-detects. */
+class FakePeerCoordinatorWithClose extends FakePeerCoordinator {
+  readonly closeTargets: Array<{
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+    readonly confirmed: boolean;
+  }> = [];
+  closeResult: PeerCloseResult = { kind: "owner-result", facts: { kind: "removed" } };
+  closeGate: Promise<void> | undefined;
+  closeThrows = false;
+  readonly ownerClose: PeerCloseController = {
+    closeSession: async (target) => {
+      this.closeTargets.push({ ...target });
+      if (this.closeGate !== undefined) await this.closeGate;
+      if (this.closeThrows) throw new Error("synthetic close transport failure");
+      return this.closeResult;
+    },
+  };
+}
+
+/** A remote row whose drawn facts are positively, completely idle. */
+function idleRemoteRosterRow(
+  overrides: Partial<RemoteSessionMetadata> & { id: string },
+): RemoteSessionMetadata {
+  return remoteRosterRow({
+    busy: false,
+    pendingInput: false,
+    inputSurface: false,
+    backgroundTasks: 0,
+    backgroundShells: 0,
+    activeTasks: 0,
+    activeShells: 0,
+    nativeSession: { sessionId: `sess-${overrides.id}`, epoch: 2, name: `Remote ${overrides.id}` },
+    ...overrides,
+  });
+}
+
+/** One connected destination with the given remote cards, published by the fake. */
+function remoteCloseHosts(
+  rows: readonly RemoteSessionMetadata[],
+  options: { hostRunId?: string | null; rosterState?: "current" | "stale" } = {},
+): PeerUiSnapshot["hosts"] {
+  return [remotePeerHost({
+    id: "lab-a",
+    label: "Lab Alpha",
+    hostRunId: options.hostRunId === undefined ? "run-a" : options.hostRunId,
+    rosterState: options.rosterState,
+    rows,
+  })] as unknown as PeerUiSnapshot["hosts"];
+}
+
+/** Highlights the drawn remote card whose status line names `hostLabel`. */
+async function highlightRemoteRosterCard(harness: Harness, hostLabel: string): Promise<void> {
+  for (let step = 0; step <= 16; step += 1) {
+    const selected = harness.writer.frames.at(-1)?.frame.lines
+      .map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))
+      .find((line) => line.startsWith("> "));
+    if (selected?.includes(hostLabel)) {
+      await nextTurn();
+      return;
+    }
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+  }
+  assert.fail(`the actual rendered roster never offered its ${hostLabel} remote card`);
+}
+
+/** Publishes one remote host and puts the written roster highlight on its card. */
+async function remoteCloseMainHarness(
+  t: { after(callback: () => void): void },
+  rows: readonly RemoteSessionMetadata[],
+  options: { hostRunId?: string | null; rosterState?: "current" | "stale" } = {},
+): Promise<{ harness: Harness; peer: FakePeerCoordinatorWithClose; dispatch(action: SidebarAction): void }> {
+  const peer = new FakePeerCoordinatorWithClose();
+  const started = await peerMainHarness(t, undefined, {}, peer);
+  peer.publish({ hosts: remoteCloseHosts(rows, options) });
+  await nextTurn();
+  await highlightRemoteRosterCard(started.harness, "Lab Alpha");
+  return { harness: started.harness, peer, dispatch: started.dispatch };
+}
+
+/** True when the drawn roster still lists the owner's remote card. */
+function rosterShowsRemoteCard(harness: Harness): boolean {
+  return plain(harness.writer.frames.at(-1)?.frame).includes("Lab Alpha");
+}
+
+/**
+ * The actually drawn left-roster pane text with its row wrapping collapsed to
+ * single spaces, so a bounded notice the narrow pane splits across rows is
+ * still asserted whole. Only the wide layout's sidebar columns are read: the
+ * composed frame's `│` divider and native right pane sit on every roster row,
+ * so joining the whole frame would interleave them and split a wrapped notice.
+ */
+function drawnRosterText(harness: Harness): string {
+  return sidebarPaneLines(plain(harness.writer.frames.at(-1)?.frame)).join(" ").replace(/\s+/g, " ");
+}
+
+test("an idle written remote highlight closes that owner row directly and removes nothing locally", async (t) => {
+  const { harness, peer } = await remoteCloseMainHarness(t, [
+    idleRemoteRosterRow({ id: "row-a" }),
+    idleRemoteRosterRow({ id: "row-b" }),
+  ]);
+  const manager = harnessManager(harness);
+  try {
+    assert.equal(rosterShowsRemoteCard(harness), true);
+    harness.terminal.emitInput("d");
+    await nextTurn();
+
+    assert.deepEqual(peer.closeTargets, [{
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-a", confirmed: false,
+    }], "a positively idle written row is requested directly, unconfirmed");
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false,
+      "no dialog is opened for a positively idle row");
+    assert.deepEqual(peer.commands, [], "no connect, remove, revoke, or listener command is used");
+    assert.deepEqual(manager.closeExitedCalls, [], "no local row removal is performed");
+    assert.equal(manager.writes.length, 0, "nothing is written to any local child");
+    assert.equal(rosterShowsRemoteCard(harness), true,
+      "the row stays listed until the OWNER's roster projection says otherwise");
+    assert.deepEqual(listedRowIds(harness), [], "no local row is created, stopped, or removed");
+    assert.equal(manager.shutdownCalls, 0);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a busy written remote row needs the written confirmation, and submits that target once", async (t) => {
+  const { harness, peer } = await remoteCloseMainHarness(t, [
+    remoteRosterRow({
+      id: "row-a",
+      busy: true,
+      pendingInput: true,
+      nativeSession: { sessionId: "sess-row-a", epoch: 2, name: "Remote row-a" },
+    }),
+  ]);
+  const manager = harnessManager(harness);
+  try {
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [], "a busy row sends nothing before a deliberate confirmation");
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, true,
+      "the frozen target's confirmation owns the roster pane");
+    const dialog = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(dialog.includes("Close remote session?"), "the written dialog is on screen");
+    assert.ok(dialog.includes("Remote row-a"), "the frozen display title is shown");
+    assert.ok(dialog.includes("Lab Alpha"), "the owner host label is shown");
+
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [{
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-a", confirmed: true,
+    }], "the deliberate confirmation submits exactly the frozen target once");
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false,
+      "the submitted dialog is dismissed");
+    assert.deepEqual(peer.commands, [], "a submitted close issues no disconnect, remove, or revoke");
+
+    // Dismissing after the submission cannot cancel, replay, or retarget it.
+    harness.terminal.emitInput(ESC);
+    await nextTurn();
+    assert.equal(peer.closeTargets.length, 1, "nothing is re-sent, cancelled, or retargeted");
+    assert.equal(manager.writes.length, 0);
+    assert.deepEqual(listedRowIds(harness), []);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a held writer exposes no request for a highlight it has not written", async (t) => {
+  const { harness, peer } = await remoteCloseMainHarness(t, [
+    idleRemoteRosterRow({ id: "row-a" }),
+    idleRemoteRosterRow({ id: "row-b" }),
+  ]);
+  try {
+    // Hold the sink, then move the highlight to row-b: the operator's screen
+    // still shows row-a, so a Delete now must request nothing at all.
+    harness.writer.holdWrites = true;
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [],
+      "a highlight that was never written requests nothing");
+
+    // Drain: the held frame is written, and only now is row-b the written highlight.
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [{
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-b", confirmed: false,
+    }], "the written highlight acts, and it is the row the operator can see");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("an unwritten, stale, or forged confirmation DTO is refused independently", async (t) => {
+  const { harness, peer, dispatch } = await remoteCloseMainHarness(t, [
+    remoteRosterRow({ id: "row-a", busy: true }),
+  ]);
+  try {
+    // No dialog exists at all: a direct DTO can never confirm anything.
+    dispatch({
+      type: "remote-close-confirmed",
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-a", generation: 1, renderToken: 1,
+    });
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [], "an unwritten confirmation DTO sends nothing");
+
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, true);
+    // A stale token for the right target is still refused.
+    dispatch({
+      type: "remote-close-confirmed",
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-a", generation: 1, renderToken: 99,
+    });
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [], "a token that was never written sends nothing");
+    // A different row's confirmation never retargets this dialog.
+    dispatch({
+      type: "remote-close-confirmed",
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-z", generation: 1, renderToken: 1,
+    });
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [], "another row is never substituted for the frozen target");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("an exited remote row asks its owner to remove it without a confirmation", async (t) => {
+  const { harness, peer } = await remoteCloseMainHarness(t, [
+    remoteRosterRow({ id: "row-a", lifecycle: "exited", hasLiveProcess: false, exitCode: 1 }),
+  ]);
+  try {
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [{
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-a", confirmed: false,
+    }], "an exited remote row is an owner removal request, not a refusal or a local delete");
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("an owner confirmation-required fact arms the next deliberate confirmation over cached idle", async (t) => {
+  const { harness, peer } = await remoteCloseMainHarness(t, [
+    idleRemoteRosterRow({ id: "row-a" }),
+  ]);
+  try {
+    peer.closeResult = { kind: "owner-result", facts: { kind: "confirmation-required" } };
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [{
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-a", confirmed: false,
+    }], "the first request is the ordinary unconfirmed idle request");
+    assert.ok(drawnRosterText(harness).includes(
+      "The remote host needs confirmation before stopping that session: Remote row-a",
+    ), "the owner's own fact is reported truthfully");
+
+    // No automatic dialog, retry, or resync happened: the next press is deliberate.
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false);
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.equal(peer.closeTargets.length, 1, "the reminder itself sends nothing");
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, true,
+      "the cached idle projection no longer authorizes a direct request");
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets[1], {
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-a", confirmed: true,
+    }, "the confirmed request follows the owner's own requirement");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("more than 32 owner reminders keep every earlier target deliberate and confirmed", async (t) => {
+  // Every card is a currently valid target on the SAME observed owner run, so
+  // none of them may be evicted to make room for a later reminder.
+  const rows = Array.from({ length: 33 }, (_, index) =>
+    idleRemoteRosterRow({ id: `row-${String(index).padStart(2, "0")}` }));
+  const { harness, peer } = await remoteCloseMainHarness(t, rows);
+  try {
+    peer.closeResult = { kind: "owner-result", facts: { kind: "confirmation-required" } };
+    // Arm one reminder per target: the first card is the written highlight, and
+    // each further press follows one deliberate navigation step.
+    for (let index = 0; index < rows.length; index += 1) {
+      if (index > 0) {
+        harness.terminal.emitInput("\x1b[B");
+        await nextTurn();
+      }
+      harness.terminal.emitInput("d");
+      await nextTurn();
+      assert.deepEqual(peer.closeTargets.at(-1), {
+        hostId: "lab-a", hostRunId: "run-a", rowId: rows[index]!.id, confirmed: false,
+      }, `target ${index} receives its own ordinary unconfirmed request`);
+      assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false,
+        `target ${index} arms a reminder without opening a dialog on its own`);
+    }
+    assert.equal(peer.closeTargets.length, rows.length,
+      "every valid target was requested exactly once while its reminder was armed");
+
+    // Return deliberately to the FIRST target. Its reminder must have survived
+    // the 32 later ones, so the next press is a written confirmation rather
+    // than a direct request over the drawn idle projection.
+    for (let step = 0; step < rows.length - 1; step += 1) {
+      harness.terminal.emitInput("\x1b[A");
+      await nextTurn();
+    }
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.equal(peer.closeTargets.length, rows.length,
+      "the first target's reminder sends nothing by itself");
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, true,
+      "the first target still requires its written confirmation after 32 later reminders");
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets.at(-1), {
+      hostId: "lab-a", hostRunId: "run-a", rowId: rows[0]!.id, confirmed: true,
+    }, "the confirmed request follows the first target's own owner requirement");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("remote closes are per row and never blocked by another row's in-flight request", async (t) => {
+  const { harness, peer } = await remoteCloseMainHarness(t, [
+    idleRemoteRosterRow({ id: "row-a" }),
+    idleRemoteRosterRow({ id: "row-b" }),
+  ]);
+  try {
+    let release: (() => void) | undefined;
+    peer.closeGate = new Promise<void>((resolve) => { release = resolve; });
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.equal(peer.closeTargets.length, 1, "the first row's request is in flight");
+
+    // The same row again is busy: no second request, no dialog, no queue.
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.equal(peer.closeTargets.length, 1, "the same row is never requested twice");
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false);
+
+    // A different row still acts: one row's in-flight close is not a global lease.
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.equal(peer.closeTargets.length, 2, "another row's close is not blocked by the first");
+    assert.equal(peer.closeTargets[1]?.rowId, "row-b");
+    release?.();
+    await nextTurn();
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a coordinator without the optional Close controller refuses truthfully, with no local fallback", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    peer.publish({ hosts: remoteCloseHosts([idleRemoteRosterRow({ id: "row-a" })]) });
+    await nextTurn();
+    await highlightRemoteRosterCard(harness, "Lab Alpha");
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.ok(drawnRosterText(harness).includes("This host cannot ask another host to close a session"),
+      "the unsupported case is reported in fixed, bounded wording");
+    assert.deepEqual(listedRowIds(harness), [], "no local row is used as a fallback");
+    assert.deepEqual(manager.closeExitedCalls, [], "no local removal route is taken");
+    assert.equal(manager.writes.length, 0);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a lost or failed remote close result claims neither removal nor cancellation", async (t) => {
+  const { harness, peer } = await remoteCloseMainHarness(t, [
+    idleRemoteRosterRow({ id: "row-a" }),
+  ]);
+  try {
+    peer.closeResult = { kind: "unknown" };
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.ok(drawnRosterText(harness).includes(
+      "The remote close result is unknown; nothing was re-sent: Remote row-a",
+    ), "an unobservable outcome is reported as unknown");
+    assert.equal(peer.closeTargets.length, 1, "nothing is re-sent after an unknown outcome");
+    assert.equal(rosterShowsRemoteCard(harness), true, "no optimistic removal is applied");
+
+    // A thrown controller call after the handoff is likewise unknown, never not-sent.
+    peer.closeResult = { kind: "owner-result", facts: { kind: "removed" } };
+    peer.closeThrows = true;
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.ok(drawnRosterText(harness).includes(
+      "The remote close result is unknown; nothing was re-sent: Remote row-a",
+    ), "a thrown handoff is reported as an unknown outcome");
+    assert.equal(peer.closeTargets.length, 2);
+
+    peer.closeResult = { kind: "not-sent", reason: "capability-unsupported" };
+    peer.closeThrows = false;
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.ok(drawnRosterText(harness).includes("This host cannot ask another host to close a session"),
+      "a positive not-sent result keeps its own fixed wording");
+    assert.equal(rosterShowsRemoteCard(harness), true);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("the local stop/remove route is unchanged and never touches the remote close controller", async (t) => {
+  const peer = new FakePeerCoordinatorWithClose();
+  const { harness } = await peerMainHarness(t, undefined, {}, peer);
+  const manager = harnessManager(harness);
+  try {
+    await startTwoLocalRows(harness);
+    manager.views[1] = { ...manager.views[1]!, lifecycle: "exited", hasLiveProcess: false };
+    manager.notify("native-2-exited");
+    await nextTurn();
+    // Highlight the drawn exited local row with real navigation, then press Delete.
+    for (let step = 0; step < 8 && harness.sidebar!.selectedId !== "native-2"; step += 1) {
+      harness.terminal.emitInput("\x1b[B");
+      await nextTurn();
+    }
+    assert.equal(harness.sidebar!.selectedId, "native-2");
+    harness.terminal.emitInput(DELETE);
+    await nextTurn();
+    assert.deepEqual(manager.closeExitedCalls, ["native-2"],
+      "the local Delete key still removes the local exited row through the local route");
+    assert.deepEqual(listedRowIds(harness), ["native-1"]);
+    assert.deepEqual(peer.closeTargets, [],
+      "the local route never asks any owner host to close a row");
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false,
+      "the local route opens no remote close dialog");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a target the owner no longer lists is refused before any request is sent", async (t) => {
+  const { harness, peer, dispatch } = await remoteCloseMainHarness(t, [
+    idleRemoteRosterRow({ id: "row-a" }),
+  ]);
+  try {
+    // The written frame still shows the row, but the owner's current roster does
+    // not: the check runs before the pending repaint as well as after it.
+    peer.publish({ hosts: remoteCloseHosts([]) });
+    dispatch({ type: "remote-close-request", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    assert.deepEqual(peer.closeTargets, [],
+      "a row that disappeared from its owner's roster is never requested");
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false);
+    await nextTurn();
+    assert.ok(drawnRosterText(harness).includes(
+      "That remote session is no longer in its owner's roster; no close was requested",
+    ), "the refusal is reported in fixed, bounded wording");
+    assert.deepEqual(peer.closeTargets, []);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("an obsolete owner run is refused while a new run's own row stays eligible", async (t) => {
+  const { harness, peer, dispatch } = await remoteCloseMainHarness(t, [
+    idleRemoteRosterRow({ id: "row-a" }),
+  ]);
+  try {
+    peer.publish({
+      hosts: remoteCloseHosts([idleRemoteRosterRow({ id: "row-a" })], { hostRunId: "run-b" }),
+    });
+    dispatch({ type: "remote-close-request", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    assert.deepEqual(peer.closeTargets, [], "the replaced owner run is never addressed again");
+    await nextTurn();
+
+    // The new run's own written highlight is a different target and stays usable.
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [{
+      hostId: "lab-a", hostRunId: "run-b", rowId: "row-a", confirmed: false,
+    }], "the current run's row is requested, not the replaced one");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a written dialog loses its authority the moment its row or run goes away", async (t) => {
+  const { harness, peer, dispatch } = await remoteCloseMainHarness(t, [
+    remoteRosterRow({ id: "row-a", busy: true }),
+  ]);
+  try {
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, true);
+    const dialogGeneration = 1;
+    const dialogToken = 1;
+
+    // The owner run is replaced while the dialog is on screen: its frozen target
+    // is gone, so the dialog is abandoned and no submission can use it.
+    peer.publish({
+      hosts: remoteCloseHosts([remoteRosterRow({ id: "row-a", busy: true })], { hostRunId: "run-b" }),
+    });
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false,
+      "the dialog is abandoned as soon as its frozen run is replaced");
+    await nextTurn();
+    assert.ok(drawnRosterText(harness).includes(
+      "That remote session is no longer in its owner's roster; no close was requested",
+    ), "the abandonment is explained truthfully");
+    dispatch({
+      type: "remote-close-confirmed",
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-a",
+      generation: dialogGeneration, renderToken: dialogToken,
+    });
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [], "a written dialog never submits an obsolete target");
+
+    // The current run's own row can still open its own written dialog.
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, true,
+      "a present row in the current run still gets its confirmation");
+    peer.publish({ hosts: remoteCloseHosts([]) });
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false,
+      "a vanished row abandons its dialog too");
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [], "a vanished row is never requested");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("an idleness change with identical bytes needs its own written frame", async (t) => {
+  const retainedRow = (backgroundTasks: number): RemoteSessionMetadata => remoteRosterRow({
+    id: "row-a",
+    busy: false,
+    pendingInput: false,
+    inputSurface: false,
+    backgroundTasks,
+    backgroundShells: 0,
+    activeTasks: 0,
+    activeShells: 0,
+    nativeSession: { sessionId: "sess-row-a", epoch: 2, name: "Remote row-a" },
+  });
+  const { harness, peer } = await remoteCloseMainHarness(t, [retainedRow(1)]);
+  try {
+    // A retained ownership count is not drawn, so this card's bytes equal the
+    // idle card's bytes; only the condensed preflight value differs.
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, true,
+      "retained ownership work needs a written confirmation");
+    harness.terminal.emitInput(ESC);
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, []);
+
+    const steady = harness.writer.invalidateCalls;
+    peer.publish({ hosts: remoteCloseHosts([retainedRow(1)]) });
+    await nextTurn();
+    assert.equal(harness.writer.invalidateCalls, steady,
+      "an unchanged projection needs no new written boundary");
+
+    // The ownership count drops: identical bytes, different written value.
+    peer.publish({ hosts: remoteCloseHosts([retainedRow(0)]) });
+    await nextTurn();
+    assert.ok(harness.writer.invalidateCalls > steady,
+      "the changed remote-close value must force a real write of its own");
+
+    // That value was actually written, so the same press is now a direct close.
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [{
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-a", confirmed: false,
+    }], "the written value authorizes its own request");
+
+    // An `unchanged` settlement never installs a new value: the older written
+    // receipt stays the only one, and the changed highlight refuses.
+    harness.writer.settlementDisposition = "unchanged";
+    peer.publish({ hosts: remoteCloseHosts([retainedRow(1)]) });
+    await nextTurn();
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets.length, 1,
+      "an unchanged settlement cannot authorize a value that was never written");
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false);
+  } finally {
+    harness.writer.settlementDisposition = "written";
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a reflow revokes the written highlight until a replacement frame settles", async (t) => {
+  const { harness, peer } = await remoteCloseMainHarness(t, [
+    idleRemoteRosterRow({ id: "row-a" }),
+  ]);
+  try {
+    harness.writer.holdWrites = true;
+    harness.terminal.setSize(40, 24); // a real reflow away from the written geometry
+    await nextTurn();
+    harness.terminal.setSize(80, 24); // back to the same size before any repaint
+    await nextTurn();
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [],
+      "a highlight written before the reflow cannot submit, even at the old size");
+
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [{
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-a", confirmed: false,
+    }], "only the replacement frame's own written highlight acts");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a written dialog is abandoned when its owner run is cleared or replaced, even with unavailable rows", async (t) => {
+  const busyRow = (): RemoteSessionMetadata => remoteRosterRow({
+    id: "row-a",
+    busy: true,
+    nativeSession: { sessionId: "sess-row-a", epoch: 2, name: "Remote row-a" },
+  });
+  const { harness, peer } = await remoteCloseMainHarness(t, [busyRow()]);
+  const publishHost = (options: {
+    hostRunId?: string | null;
+    rosterState?: "never" | "current" | "stale";
+    rows?: readonly RemoteSessionMetadata[] | null;
+  }): void => {
+    peer.publish({
+      hosts: [remotePeerHost({
+        id: "lab-a",
+        label: "Lab Alpha",
+        hostRunId: options.hostRunId,
+        rosterState: options.rosterState,
+        rows: options.rows,
+      })] as unknown as PeerUiSnapshot["hosts"],
+    });
+  };
+  try {
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, true);
+
+    // A reconnect resets the production roster to `rows: null, hostRunId: null`.
+    // The cleared run must abandon the written dialog and never reach the owner.
+    publishHost({ hostRunId: null, rows: null });
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false,
+      "a cleared owner run abandons the dialog even while its rows are unavailable");
+    await nextTurn();
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [],
+      "an unavailable roster never carries a cleared run's obsolete target to the owner");
+
+    // The same row on the original run is written again, then its run is replaced
+    // while the rows stay unavailable: that dialog is abandoned too.
+    publishHost({ hostRunId: "run-a", rows: [busyRow()] });
+    await nextTurn();
+    await highlightRemoteRosterCard(harness, "Lab Alpha");
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, true);
+    publishHost({ hostRunId: "run-b", rows: null });
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, false,
+      "a replaced owner run abandons the dialog even while its rows are unavailable");
+    await nextTurn();
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [],
+      "an unavailable roster never carries a replaced run's obsolete target to the owner");
+
+    // A stale-but-present observation on the SAME run stays eligible.
+    publishHost({ hostRunId: "run-a", rosterState: "stale", rows: [busyRow()] });
+    await nextTurn();
+    await highlightRemoteRosterCard(harness, "Lab Alpha");
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, true);
+    publishHost({ hostRunId: "run-a", rosterState: "stale", rows: [busyRow()] });
+    await nextTurn();
+    assert.equal(harness.sidebar!.remoteCloseConfirmationActive, true,
+      "a stale but present row on the same run keeps its written dialog");
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [{
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-a", confirmed: true,
+    }], "the same run's stale-but-present row still confirms normally");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("an actual write publishes its receipt even when a newer identical candidate is pending", async (t) => {
+  const { harness, peer, dispatch } = await remoteCloseMainHarness(t, [
+    idleRemoteRosterRow({ id: "row-a" }),
+  ]);
+  try {
+    // Revoke the published receipt with an existing stale-preparation path, then
+    // hold the sink so ONLY a frame that actually completed writing can publish.
+    harness.writer.holdWrites = true;
+    harness.writer.queueWrites = true;
+    dispatch({
+      type: "saved-delete-prepare", pickerId: -1, requestId: -1, id: "stale", file: "stale", revision: -1,
+    });
+    await nextTurn();
+    harness.writer.settleQueued(0, "unchanged"); // no receipt published yet
+
+    // Two identical compositions: the older one is the frame that reached the
+    // operator's screen, and the newer one is reported as unchanged.
+    harness.terminal.emitInput("z");
+    await nextTurn();
+    harness.terminal.emitInput("z");
+    await nextTurn();
+    assert.ok(harness.writer.queuedSettles.length >= 2, "both in-flight candidates are retained");
+    harness.writer.settleQueued(0, "written"); // the actual write is the OLDER frame
+    harness.writer.settleQueued(0, "unchanged"); // the newest candidate wrote nothing new
+
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    assert.deepEqual(peer.closeTargets, [{
+      hostId: "lab-a", hostRunId: "run-a", rowId: "row-a", confirmed: false,
+    }], "the one actual write publishes the receipt every written-screen path needs");
+  } finally {
+    harness.writer.holdWrites = false;
+    harness.writer.queueWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
   }
 });

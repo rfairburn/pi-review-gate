@@ -425,13 +425,24 @@ test("a normal left press selects a remote card once and local-only keys refuse 
   show(harness);
   void rosterText(harness);
   focusCard(harness, "Remote dup");
+  // A deliberate d/Delete on the WRITTEN remote card asks Main about that owner
+  // row only: it never claims the colliding local id, never starts a local stop,
+  // and never carries a confirmation or a local removal of its own.
+  const remoteCloseRequest = { type: "remote-close-request", hostId: "h1", hostRunId: "run-1", rowId: "dup" };
   baseline = harness.actions.length;
   harness.send("d");
+  assert.deepEqual(commandsSince(harness, baseline), [remoteCloseRequest],
+    "d asks for that remote owner row exactly once");
+  baseline = harness.actions.length;
   harness.send(DELETE);
+  assert.deepEqual(commandsSince(harness, baseline), [remoteCloseRequest],
+    "Delete is the same deliberate remote request");
+  baseline = harness.actions.length;
   harness.send("e");
   assert.deepEqual(commandsSince(harness, baseline), [],
-    "stop/remove/edit refuse a remote card instead of emitting any local command");
-  assert.equal(harness.controller.selectedId, undefined);
+    "edit still refuses a remote card instead of emitting any local command");
+  assert.equal(harness.controller.selectedId, undefined,
+    "the colliding local id is never claimed by a remote close");
 
   // The local row with the colliding id is still reachable through the
   // backend selection seam, and only it becomes the local selection.
@@ -894,4 +905,338 @@ test("Main's actual remote owner is structured and distinct from the left highli
   harness.controller.setActiveMainOwnerKey(undefined);
   assert.equal(harness.controller.activeMainOwnerKey, undefined);
   assert.equal(harness.controller.activeMainOwnerID, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Remote Close: the written highlight, the frozen confirmation, and its receipt
+// ---------------------------------------------------------------------------
+
+/** Fixed display title of the remote card these fixtures draw. */
+const REMOTE_CLOSE_TITLE = "Remote build";
+/** Fixed owner host label the dialog shows beside that title. */
+const REMOTE_CLOSE_HOST = "studio";
+const KITTY_ENTER_REPEAT = "\x1b[13;1:2u";
+const KITTY_ENTER_RELEASE = "\x1b[13;1:3u";
+
+/** A remote card whose drawn facts are positively, completely idle. */
+function idleRemoteRow(overrides: Partial<RemoteSessionMetadata> & { id: string }): RemoteSessionMetadata {
+  return makeRemoteRow({
+    label: "fallback-label",
+    busy: false,
+    pendingInput: false,
+    inputSurface: false,
+    backgroundTasks: 0,
+    backgroundShells: 0,
+    activeTasks: 0,
+    activeShells: 0,
+    nativeSession: { sessionId: "sess-remote", epoch: 4, name: REMOTE_CLOSE_TITLE },
+    ...overrides,
+  });
+}
+
+function remoteCloseHarness(options: {
+  rows?: readonly RemoteSessionMetadata[];
+  hostRunId?: string | null;
+  rosterState?: "current" | "stale";
+} = {}): Harness {
+  const harness = makeHarness();
+  harness.controller.updateItems([makeItem({ id: "local-a" })]);
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    hosts: [makeHost({
+      id: "h1",
+      label: REMOTE_CLOSE_HOST,
+      hostRunId: options.hostRunId === undefined ? "run-1" : options.hostRunId,
+      rosterState: options.rosterState ?? "current",
+      rows: options.rows ?? [idleRemoteRow({ id: "r1" }), idleRemoteRow({ id: "r2" })],
+    })],
+  }));
+  show(harness);
+  void rosterText(harness, 40, 30);
+  focusCard(harness, REMOTE_CLOSE_TITLE);
+  void rosterText(harness, 40, 30);
+  return harness;
+}
+
+test("a deliberate d/Delete names only the completely drawn remote highlight", () => {
+  const harness = remoteCloseHarness();
+  const drawn = harness.controller.captureMousePresentation().remoteClose;
+  assert.ok(drawn, "the written highlight of a complete remote card is captured");
+  assert.deepEqual(
+    { hostId: drawn.hostId, hostRunId: drawn.hostRunId, rowId: drawn.rowId },
+    { hostId: "h1", hostRunId: "run-1", rowId: "r1" },
+    "the captured target is the minimal owner host/run/row tuple",
+  );
+  assert.equal(drawn.focus, "sidebar");
+  assert.equal(drawn.height, 5, "the complete expanded card height was drawn");
+  assert.equal(drawn.cols, 40);
+  assert.equal(drawn.rows, 30);
+  assert.equal(drawn.idle, true,
+    "the condensed preflight uses the same complete-idle rule as a local card");
+  assert.equal(drawn.title, REMOTE_CLOSE_TITLE);
+  assert.equal(drawn.hostLabel, REMOTE_CLOSE_HOST);
+
+  let baseline = harness.actions.length;
+  harness.send("d");
+  assert.deepEqual([...commandsSince(harness, baseline)], [{
+    type: "remote-close-request", hostId: "h1", hostRunId: "run-1", rowId: "r1",
+  }], "d emits exactly one minimal target and no confirmed flag");
+
+  // A local highlight never captures a remote close, and never asks an owner.
+  harness.controller.select("local-a");
+  void rosterText(harness, 40, 30);
+  assert.equal(harness.controller.captureMousePresentation().remoteClose, undefined,
+    "a local highlight captures no remote target");
+  baseline = harness.actions.length;
+  harness.send("d");
+  assert.equal(
+    commandsSince(harness, baseline).some((action) => action.type.startsWith("remote-close")),
+    false,
+    "a local highlight never asks any owner to close a remote row",
+  );
+  // The local refusal stays on the roster: nothing replaced the pane, so no
+  // dismissal is needed (and ESC here would hide the sidebar instead).
+  assert.equal(harness.controller.visible, true, "the local refusal leaves the roster visible");
+  assert.equal(harness.controller.focus, "sidebar", "the local refusal keeps roster focus");
+  void rosterText(harness, 40, 30);
+
+  // A too-small pane draws no complete card, so nothing is captured at all.
+  void assertPaneSafe(harness.controller.render(10, 3).lines, 10, 3);
+  assert.equal(harness.controller.captureMousePresentation().remoteClose, undefined,
+    "a tiny fallback authorizes no remote close");
+  baseline = harness.actions.length;
+  harness.send("d");
+  assert.deepEqual(commandsSince(harness, baseline), [],
+    "a tiny fallback cannot ask for a close");
+});
+
+test("a remote row without an observed owner run refuses instead of guessing", () => {
+  const harness = remoteCloseHarness({ hostRunId: null });
+  const drawn = harness.controller.captureMousePresentation().remoteClose;
+  assert.ok(drawn, "the drawn highlight is still described honestly");
+  assert.equal(drawn.hostRunId, null, "no owner run is invented");
+  const baseline = harness.actions.length;
+  harness.send("d");
+  assert.deepEqual(commandsSince(harness, baseline), [],
+    "no close is requested without an observed owner run");
+  assert.equal(harness.controller.prepareRemoteClose(
+    { hostId: "h1", hostRunId: null, rowId: "r1" }, { direct: false },
+  ), "refused", "preparation refuses an unknown run as well");
+  assert.ok(rosterText(harness, 96, 30).join("\n").includes("owner run was not observed"),
+    "the refusal is a bounded local notice, never a request");
+});
+
+test("the written remote close confirmation submits once and only after the exact frame is written", () => {
+  const harness = remoteCloseHarness();
+  const drawn = harness.controller.captureMousePresentation().remoteClose!;
+  const target = { hostId: drawn.hostId, hostRunId: drawn.hostRunId, rowId: drawn.rowId };
+  const baseline = harness.actions.length;
+
+  assert.equal(harness.controller.prepareRemoteClose(target, { direct: true }), "direct",
+    "an idle written row is reported as a direct plan");
+  assert.equal(harness.controller.remoteCloseConfirmationActive, false,
+    "a direct plan opens no dialog and emits nothing");
+  assert.deepEqual(commandsSince(harness, baseline), []);
+
+  assert.equal(harness.controller.prepareRemoteClose(target, { direct: false }), "confirmation-opened");
+  assert.equal(harness.controller.remoteCloseConfirmationActive, true);
+  assert.equal(harness.controller.focus, "confirm");
+  const dialog = assertPaneSafe(harness.controller.render(40, 24).lines, 40, 24);
+  const joined = dialog.join("\n");
+  assert.ok(joined.includes("Close remote session?"), "the dialog names its purpose");
+  assert.ok(joined.includes(REMOTE_CLOSE_TITLE), "the frozen display title is shown");
+  assert.ok(joined.includes(REMOTE_CLOSE_HOST), "the owner host label is shown");
+  assert.ok(joined.includes("enter/y = close") && joined.includes("esc/n = cancel"),
+    "the drawn controls are the confirm/cancel rows");
+  const first = harness.controller.captureRemoteCloseConfirmationPresentation();
+  assert.ok(first, "the complete dialog mints a candidate token");
+  assert.deepEqual(first.target, { hostId: "h1", hostRunId: "run-1", rowId: "r1" },
+    "the frozen target carries only the minimal owner identity");
+
+  // No writer receipt yet: a deliberate Enter says so and sends nothing.
+  harness.send(ENTER);
+  assert.deepEqual(commandsSince(harness, baseline), [],
+    "an unwritten frame can never confirm anything");
+  assert.equal(harness.controller.remoteCloseConfirmationActive, true,
+    "the refused confirmation keeps its dialog for review");
+  const notice = harness.controller.render(40, 24).lines.join("\n");
+  assert.ok(notice.includes("No written receipt"), "the dialog states why nothing was sent");
+
+  assert.equal(
+    harness.controller.settleRemoteCloseConfirmationRender(first.generation, first.renderToken),
+    true,
+    "Main's actual-written settlement grants confirmation authority",
+  );
+  harness.send(ENTER);
+  assert.deepEqual(commandsSince(harness, baseline), [{
+    type: "remote-close-confirmed",
+    hostId: "h1",
+    hostRunId: "run-1",
+    rowId: "r1",
+    generation: first.generation,
+    renderToken: first.renderToken,
+  }], "exactly one confirmation of that exact written frame is emitted");
+  assert.equal(harness.controller.remoteCloseConfirmationActive, false,
+    "the submitted dialog is dismissed");
+  assert.equal(harness.controller.focus, "sidebar");
+
+  // The held key's repeat/release never reaches a second submission.
+  harness.send(KITTY_ENTER_REPEAT);
+  harness.send(KITTY_ENTER_RELEASE);
+  assert.deepEqual(commandsSince(harness, baseline).slice(1), [],
+    "a held Enter cannot submit a second close");
+
+  // Re-opening the same frozen target is a NEW decision: new generation, new token.
+  void rosterText(harness, 40, 24);
+  assert.equal(harness.controller.prepareRemoteClose(target, { direct: false }), "confirmation-opened");
+  void harness.controller.render(40, 24);
+  const second = harness.controller.captureRemoteCloseConfirmationPresentation();
+  assert.ok(second);
+  assert.ok(second.generation > first.generation, "each deliberate open advances the generation");
+  assert.notEqual(second.renderToken, first.renderToken,
+    "identical bytes in a new generation never inherit the previous token");
+  assert.equal(harness.controller.isRemoteCloseConfirmationRenderCurrent(first.generation, first.renderToken), false,
+    "the previous generation is no longer current");
+  assert.equal(harness.controller.settleRemoteCloseConfirmationRender(first.generation, first.renderToken), false);
+
+  // Another row's request cannot be prepared while this dialog owns the roster.
+  assert.equal(
+    harness.controller.prepareRemoteClose({ hostId: "h1", hostRunId: "run-1", rowId: "r2" }, { direct: true }),
+    "refused",
+    "a dialog in progress never retargets to another row",
+  );
+
+  // Cancel sends nothing at all and restores roster focus.
+  const afterCancel = harness.actions.length;
+  harness.send(ESC);
+  assert.deepEqual(commandsSince(harness, afterCancel), [], "cancel before submission sends no request");
+  assert.equal(harness.controller.remoteCloseConfirmationActive, false);
+  assert.equal(harness.controller.focus, "sidebar");
+});
+
+test("a tiny, replaced, or superseded dialog frame cannot confirm anything", () => {
+  const harness = remoteCloseHarness();
+  const drawn = harness.controller.captureMousePresentation().remoteClose!;
+  const target = { hostId: drawn.hostId, hostRunId: drawn.hostRunId, rowId: drawn.rowId };
+  const baseline = harness.actions.length;
+  assert.equal(harness.controller.prepareRemoteClose(target, { direct: false }), "confirmation-opened");
+  void harness.controller.render(40, 24);
+  const frame = harness.controller.captureRemoteCloseConfirmationPresentation();
+  assert.ok(frame);
+  assert.equal(harness.controller.settleRemoteCloseConfirmationRender(frame.generation, frame.renderToken), true);
+
+  // A frame that cannot show the whole target/control set revokes the token.
+  void assertPaneSafe(harness.controller.render(10, 3).lines, 10, 3);
+  assert.equal(harness.controller.isRemoteCloseConfirmationRenderCurrent(frame.generation, frame.renderToken), false);
+  assert.equal(harness.controller.settleRemoteCloseConfirmationRender(frame.generation, frame.renderToken), false,
+    "an unshowable frame can never be settled");
+  harness.send(ENTER);
+  assert.deepEqual(commandsSince(harness, baseline), [],
+    "no confirmation can come from a frame that was never fully drawn");
+
+  // Drawing the identical dialog again is a new candidate that must be settled again.
+  void harness.controller.render(40, 24);
+  const redrawn = harness.controller.captureRemoteCloseConfirmationPresentation();
+  assert.ok(redrawn);
+  assert.notEqual(redrawn.renderToken, frame.renderToken,
+    "a re-established candidate after revocation is a new token");
+  assert.equal(harness.controller.isRemoteCloseConfirmationRenderCurrent(frame.generation, frame.renderToken), false);
+  harness.send(ENTER);
+  assert.deepEqual(commandsSince(harness, baseline), [],
+    "the superseded token can never be replayed");
+
+  // The new frame is confirmable only after its own actual-written settlement.
+  assert.equal(
+    harness.controller.settleRemoteCloseConfirmationRender(redrawn.generation, redrawn.renderToken),
+    true,
+  );
+  // An identical redraw of the SAME frame keeps that written receipt.
+  void harness.controller.render(40, 24);
+  const again = harness.controller.captureRemoteCloseConfirmationPresentation();
+  assert.ok(again);
+  assert.equal(again.renderToken, redrawn.renderToken, "an unchanged semantic frame keeps its token");
+  harness.send(ENTER);
+  assert.deepEqual(commandsSince(harness, baseline), [{
+    type: "remote-close-confirmed",
+    hostId: "h1",
+    hostRunId: "run-1",
+    rowId: "r1",
+    generation: redrawn.generation,
+    renderToken: redrawn.renderToken,
+  }], "exactly one confirmation is emitted for the settled frame");
+});
+
+test("the written remote close presentation tracks the drawn highlight, row, and idleness by value", () => {
+  const harness = remoteCloseHarness();
+  const first = harness.controller.captureMousePresentation().remoteClose;
+  assert.ok(first);
+  void rosterText(harness, 40, 30);
+  assert.deepEqual(harness.controller.captureMousePresentation().remoteClose, first,
+    "the same written frame describes the same value");
+
+  // Collapsing the highlighted card changes the drawn height, so it is a
+  // different presented value (never inherited from the previous draw).
+  harness.send(SPACE);
+  void rosterText(harness, 40, 30);
+  const collapsed = harness.controller.captureMousePresentation().remoteClose;
+  assert.ok(collapsed);
+  assert.equal(collapsed.height, 3);
+  assert.notEqual(collapsed.row, undefined);
+
+  // A changed observation of the SAME row changes the condensed preflight facts.
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    revision: 2,
+    hosts: [makeHost({
+      id: "h1",
+      label: REMOTE_CLOSE_HOST,
+      hostRunId: "run-1",
+      rows: [idleRemoteRow({ id: "r1", busy: true }), idleRemoteRow({ id: "r2" })],
+    })],
+  }));
+  void rosterText(harness, 40, 30);
+  const busy = harness.controller.captureMousePresentation().remoteClose;
+  assert.ok(busy);
+  assert.equal(busy.rowId, "r1");
+  assert.equal(busy.idle, false, "a busy observation is never condensed as idle");
+
+  // The same row drawn lower (a new card ahead of it) is a different value.
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    revision: 3,
+    hosts: [makeHost({
+      id: "h1",
+      label: REMOTE_CLOSE_HOST,
+      hostRunId: "run-1",
+      rows: [idleRemoteRow({ id: "r2" }), idleRemoteRow({ id: "r3" }), idleRemoteRow({ id: "r1" })],
+    })],
+  }));
+  void rosterText(harness, 40, 30);
+  const reordered = harness.controller.captureMousePresentation().remoteClose;
+  assert.ok(reordered);
+  assert.equal(reordered.rowId, "r1", "the highlight still names the same owner row");
+  assert.notEqual(reordered.row, busy.row, "its drawn pane row moved, so the value moved with it");
+});
+
+test("a dialog whose owner target vanished is abandoned without any request", () => {
+  const harness = remoteCloseHarness();
+  const drawn = harness.controller.captureMousePresentation().remoteClose!;
+  const baseline = harness.actions.length;
+  assert.equal(harness.controller.prepareRemoteClose(
+    { hostId: drawn.hostId, hostRunId: drawn.hostRunId, rowId: drawn.rowId }, { direct: false },
+  ), "confirmation-opened");
+  void harness.controller.render(40, 24);
+  const frame = harness.controller.captureRemoteCloseConfirmationPresentation();
+  assert.ok(frame);
+
+  // Main observed that the row disappeared, so it abandons the dialog. Nothing
+  // is emitted, nothing is confirmed, and the previous token can never submit.
+  assert.equal(harness.controller.abandonRemoteCloseConfirmation(), true);
+  assert.equal(harness.controller.remoteCloseConfirmationActive, false);
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.equal(harness.controller.abandonRemoteCloseConfirmation(), false,
+    "a second abandonment has nothing to dismiss");
+  void rosterText(harness, 40, 30);
+  assert.equal(harness.controller.settleRemoteCloseConfirmationRender(
+    frame.generation, frame.renderToken,
+  ), false, "the abandoned frame can never be settled again");
+  assert.deepEqual(commandsSince(harness, baseline), [],
+    "abandoning a dialog sends no owner request at all");
 });

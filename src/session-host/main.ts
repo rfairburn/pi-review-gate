@@ -36,7 +36,14 @@ import type {
   PeerCoordinatorWithContent,
   PeerSelectedContent,
 } from "./network/peer-content";
-import type { OwnerCloseFacts, OwnerCloseRequest } from "./network/peer-close";
+import {
+  isOwnerCloseFacts,
+  type OwnerCloseFacts,
+  type OwnerCloseRequest,
+  type PeerCloseController,
+  type PeerCloseResult,
+  type PeerCoordinatorWithClose,
+} from "./network/peer-close";
 import type { PeerCoordinator, PeerConsentPresentation, PeerUiCommand, PeerUiSnapshot } from "./peer-ui-protocol";
 import { isValidNativeSessionId } from "./protocol";
 import {
@@ -88,6 +95,7 @@ import {
   type SidebarItem,
   type SidebarMainOwnerKey,
   type SidebarMousePresentation,
+  type SidebarRemoteCloseRow,
 } from "./sidebar";
 import type { TerminalFrame, TerminalMouseReportingRequest } from "./terminal-surface";
 import type { NativeClipboardEvent } from "./native-clipboard";
@@ -127,6 +135,26 @@ const REMOTE_CONTENT_UNAVAILABLE_MESSAGE = "The selected remote session's displa
 const REMOTE_CONTENT_UNOBSERVED_MESSAGE = "That remote session's owner run was not observed; nothing is displayed";
 const REMOTE_CONTENT_UNSUPPORTED_MESSAGE = "Remote display is unavailable in this host; local sessions are unchanged";
 const REMOTE_CONTENT_INVALID_MESSAGE = "That remote row is no longer displayed; select it again from the roster";
+/**
+ * Fixed, bounded notices for one remote Close attempt. They describe only what
+ * this side knows: a close that was never drawn, never addressable, never sent,
+ * or whose owner outcome is a fixed fact. Nothing here claims a local removal,
+ * a saved-conversation change, or a retry, and no path or raw error is shown.
+ */
+const REMOTE_CLOSE_NOT_DRAWN_MESSAGE =
+  "That remote session is not the displayed highlight; nothing was requested";
+const REMOTE_CLOSE_NO_RUN_MESSAGE =
+  "That remote session's owner run was not observed; no close was requested";
+const REMOTE_CLOSE_NO_PROCESS_MESSAGE =
+  "That remote session has no owned process to stop; no close was requested";
+const REMOTE_CLOSE_UNSUPPORTED_MESSAGE =
+  "This host cannot ask another host to close a session";
+const REMOTE_CLOSE_BUSY_MESSAGE =
+  "That remote session already has a close in progress";
+const REMOTE_CLOSE_DIALOG_CHANGED_MESSAGE =
+  "The remote close confirmation changed or is not displayed; review it again";
+const REMOTE_CLOSE_TARGET_GONE_MESSAGE =
+  "That remote session is no longer in its owner's roster; no close was requested";
 /** The content protocol's own viewport bound; a larger owner frame is never claimed. */
 const MAX_CONTENT_DIMENSION = 1000;
 const INPUT_DRAIN_MAX_MS = 250;
@@ -192,6 +220,13 @@ interface MouseFramePresentation {
    * never becomes one.
    */
   readonly contentSource: string | undefined;
+  /**
+   * Geometry epoch of the remote-close highlight receipt. A resize advances the
+   * live epoch, so a presentation written before it can never authorize a Close
+   * after the terminal reflowed — even when the reflow returns to the same size
+   * before anything is repainted, and even if an older in-flight write settles.
+   */
+  readonly remoteCloseEpoch: number;
 }
 
 /**
@@ -254,6 +289,53 @@ interface PeerConsentConfirmationFrame extends PeerConsentPresentation {
   settled: boolean;
 }
 
+/**
+ * One frozen remote-close confirmation candidate: the minimal owner target and
+ * the monotonic generation the dialog was opened with, plus the token the
+ * sidebar minted for this exact drawn frame and the terminal geometry it was
+ * composed at. Only a frame the actual writer reported as written (or as an
+ * unchanged repaint of a frame this same candidate already settled) is proof.
+ */
+interface RemoteCloseConfirmationFrame {
+  readonly target: {
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+  };
+  /** Bounded display title of the frozen target. Never part of any identity. */
+  readonly title: string;
+  readonly generation: number;
+  readonly renderToken: number;
+  readonly cols: number;
+  readonly rows: number;
+  settled: boolean;
+}
+
+/** One bounded remote Close attempt, frozen for its notices and its marker. */
+interface RemoteCloseAttempt {
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly rowId: string;
+  /** Bounded display title of the row this attempt was about. */
+  readonly title: string;
+  /** True only for a deliberately confirmed request. */
+  readonly confirmed: boolean;
+  /** True only when this side's drawn facts positively showed complete idleness. */
+  readonly cachedIdle: boolean;
+}
+
+/**
+ * A bounded, ephemeral per-target reminder that the owner reported it was not
+ * idle after an unconfirmed request this side believed was idle. It never
+ * authorizes anything and never sets `confirmed` by itself: the next deliberate
+ * request for the same owner run/row must be confirmed on a WRITTEN dialog.
+ */
+interface RemoteCloseConfirmationMarker {
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly rowId: string;
+}
+
 function sameMouseAuthorization(a: MouseFramePresentation, b: MouseFramePresentation): boolean {
   // Focus and owner are part of native click authorization even when a
   // too-small fallback and a hidden native cursor make the composed bytes
@@ -284,6 +366,36 @@ function sameMouseAuthorization(a: MouseFramePresentation, b: MouseFramePresenta
   if (a.contentKey !== b.contentKey) return false;
   if (a.layout.sidebar === undefined && a.layout.form === undefined) return true;
   return a.sidebar.authorizationKey === b.sidebar.authorizationKey;
+}
+
+/**
+ * Value equality for one written remote-close highlight. Only the minimal owner
+ * target, the drawn row/height, the pane geometry, the focus domain, and the
+ * condensed preflight facts matter: never object identity, never the sidebar's
+ * mouse-authorization key, and never the native conversation tuple, labels, or
+ * content stream. A moved highlight, a reordered/reflowed row, or a changed
+ * idleness/progress observation is a different written frame.
+ */
+function sameRemoteCloseRow(a: SidebarRemoteCloseRow | undefined, b: SidebarRemoteCloseRow | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.hostId === b.hostId
+    && a.hostRunId === b.hostRunId
+    && a.rowId === b.rowId
+    && a.row === b.row
+    && a.height === b.height
+    && a.cols === b.cols
+    && a.rows === b.rows
+    && a.focus === b.focus
+    && a.lifecycle === b.lifecycle
+    && a.hasLiveProcess === b.hasLiveProcess
+    && a.idle === b.idle;
+}
+
+function sameRemoteCloseTarget(
+  a: { readonly hostId: string; readonly hostRunId: string; readonly rowId: string },
+  b: { readonly hostId: string; readonly hostRunId: string; readonly rowId: string },
+): boolean {
+  return a.hostId === b.hostId && a.hostRunId === b.hostRunId && a.rowId === b.rowId;
 }
 
 function samePaneGeometry(a: HostPaneRect | undefined, b: HostPaneRect | undefined): boolean {
@@ -858,6 +970,22 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let displayedMousePresentation: MouseFramePresentation | undefined;
   let latestMousePresentation: MouseFramePresentation | undefined;
   let savedDeleteConfirmationFrame: SavedDeleteConfirmationFrame | undefined;
+  /** The one frozen remote-close confirmation candidate of the last composition. */
+  let remoteCloseConfirmationFrame: RemoteCloseConfirmationFrame | undefined;
+  /** Remote targets with a close request already on its way to the owner. */
+  const remoteCloseAttempts = new Set<string>();
+  /**
+   * Per-target owner-confirmation reminders (never authority). The observed
+   * roster/run/host identity bounds this set; there is deliberately no fixed
+   * cap that could evict a still-valid target's reminder.
+   */
+  const remoteCloseMarkers = new Map<string, RemoteCloseConfirmationMarker>();
+  /**
+   * Advances on every terminal geometry change. A remote-close highlight receipt
+   * carries the epoch it was written in, so a reflow (even one that returns to
+   * the previous size) never leaves stale highlight authority behind.
+   */
+  let remoteCloseHighlightEpoch = 0;
   let lastNativeCols: number | undefined;
   let lastNativeRows: number | undefined;
   let resizeInProgress = false;
@@ -1294,6 +1422,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       return;
     }
     peerUiSnapshot = snapshot;
+    // A reminder this host can positively see no longer applies is dropped here;
+    // nothing is opened, retried, or confirmed by this reconciliation.
+    reconcileRemoteCloseMarkers(snapshot);
+    // A written dialog for a target the owner no longer lists loses its
+    // authority immediately instead of staying confirmable until a redraw.
+    abandonVanishedRemoteCloseTarget();
     for (const id of peerBellAttempts) {
       if (!snapshot.consents.some((consent) => consent.id === id)) peerBellAttempts.delete(id);
     }
@@ -1583,6 +1717,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           ? { ownerId: nativeGraphicsOwnerId, pane: nativeContent, frame: mainFrame.graphics }
           : undefined;
         const savedDeleteRenderToken = sidebar.savedDeleteConfirmationRenderTokenNumber;
+        // The remote-close dialog replaces the left roster, so its candidate is
+        // captured AFTER that render and before the writer sees this frame.
+        const remoteClosePresentation = sidebar.captureRemoteCloseConfirmationPresentation();
         // Title only. Lifecycle, activity and input ownership belong below
         // session-card titles, never on the active conversation's title line. A
         // remote owner is identified by its own sanitized roster labels.
@@ -1622,14 +1759,28 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
                 + `@${remoteDrawn.view.geometry.revision}`
                 + `|rect=${remoteDrawn.rect.column}:${remoteDrawn.rect.row}`
                 + `:${remoteDrawn.rect.cols}:${remoteDrawn.rect.rows}`,
+          remoteCloseEpoch: remoteCloseHighlightEpoch,
         };
         // Distinct targets can render identical bytes (for example Saved
         // conversations with matching captions and workspaces). Their maps
         // still need a written boundary before mouse authorization changes.
+        //
+        // The remote-close highlight is its own written value: an ownership
+        // count can take a card from "not idle" to "idle" without changing a
+        // single rendered byte or the mouse authorization identity, so it is
+        // compared separately and invalidates the writer on its own.
         if ((displayedMousePresentation !== undefined
-          && !sameMouseAuthorization(displayedMousePresentation, mousePresentation))
+          && (!sameMouseAuthorization(displayedMousePresentation, mousePresentation)
+            || !sameRemoteCloseRow(
+              displayedMousePresentation.sidebar.remoteClose, mousePresentation.sidebar.remoteClose,
+            )
+            || displayedMousePresentation.remoteCloseEpoch !== mousePresentation.remoteCloseEpoch))
           || (latestMousePresentation !== undefined
-            && !sameMouseAuthorization(latestMousePresentation, mousePresentation))) {
+            && (!sameMouseAuthorization(latestMousePresentation, mousePresentation)
+              || !sameRemoteCloseRow(
+                latestMousePresentation.sidebar.remoteClose, mousePresentation.sidebar.remoteClose,
+              )
+              || latestMousePresentation.remoteCloseEpoch !== mousePresentation.remoteCloseEpoch))) {
           writer.invalidate?.();
         }
         latestMousePresentation = mousePresentation;
@@ -1653,12 +1804,55 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           }
         }
         peerConsentConfirmationFrame = peerFrame;
+        let remoteCloseFrame: RemoteCloseConfirmationFrame | undefined;
+        if (remoteClosePresentation !== undefined) {
+          const previous = remoteCloseConfirmationFrame;
+          if (previous !== undefined
+            && previous.generation === remoteClosePresentation.generation
+            && previous.renderToken === remoteClosePresentation.renderToken
+            && sameRemoteCloseTarget(previous.target, remoteClosePresentation.target)
+            && previous.title === remoteClosePresentation.title
+            && previous.cols === cols && previous.rows === rows) {
+            // The identical semantic dialog is being redrawn: keep the receipt
+            // this exact candidate already earned instead of revoking it.
+            remoteCloseFrame = previous;
+          } else {
+            remoteCloseFrame = {
+              target: remoteClosePresentation.target,
+              title: remoteClosePresentation.title,
+              generation: remoteClosePresentation.generation,
+              renderToken: remoteClosePresentation.renderToken,
+              cols,
+              rows,
+              settled: false,
+            };
+            // Identical drawn bytes are not proof that a different frozen target
+            // or a new confirmation generation was written: force the boundary.
+            writer.invalidate?.();
+          }
+        }
+        remoteCloseConfirmationFrame = remoteCloseFrame;
         writer.submit(composed, cols, rows, (disposition: SessionHostFrameDisposition) => {
-          if (disposition === "written") displayedMousePresentation = mousePresentation;
+          // Retain what ACTUALLY completed writing, even when a newer identical
+          // candidate is already queued: discarding the only real write would
+          // close the pointer/clipboard paths over a screen the operator sees.
+          // Consumers re-read it against the latest candidate by value, and the
+          // remote-close receipt additionally checks its geometry epoch, so a
+          // stale or reflowed write never authorizes anything.
+          if (disposition === "written") {
+            displayedMousePresentation = mousePresentation;
+          }
           if (peerFrame !== undefined && peerConsentConfirmationFrame === peerFrame
             && isCurrentPeerConsentFrame(peerFrame)
             && (disposition === "written" || (disposition === "unchanged" && peerFrame.settled))) {
             if (activeSidebar.settlePeerConsentRender(peerFrame.renderToken)) peerFrame.settled = true;
+          }
+          if (remoteCloseFrame !== undefined && remoteCloseConfirmationFrame === remoteCloseFrame
+            && isCurrentRemoteCloseConfirmationFrame(remoteCloseFrame)
+            && (disposition === "written" || (disposition === "unchanged" && remoteCloseFrame.settled))) {
+            if (activeSidebar.settleRemoteCloseConfirmationRender(
+              remoteCloseFrame.generation, remoteCloseFrame.renderToken,
+            )) remoteCloseFrame.settled = true;
           }
           if (confirmationFrame === undefined || savedDeleteConfirmationFrame !== confirmationFrame) return;
           if (!isCurrentSavedDeleteConfirmationFrame(confirmationFrame)) {
@@ -2488,6 +2682,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   function handleTerminalResize(): void {
     invalidatePeerConsentDisplay();
     invalidateSavedDeleteConfirmationDisplay();
+    // A resize can reflow the terminal before the next coalesced redraw: no
+    // pending remote close may keep a confirmable token at the old geometry,
+    // and no highlight written at the old geometry may authorize a request.
+    invalidateRemoteCloseConfirmationDisplay();
+    remoteCloseHighlightEpoch += 1;
     // A real outer resize can reflow the physical screen and then return to
     // the same final geometry before the next coalesced redraw (for example
     // 80 -> 40 -> 80). Invalidate the known baseline before recomputing so the
@@ -3344,6 +3543,451 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     return startRowClose(owner, request.rowId, request.confirmed, false);
   }
 
+  // --- Requester-side remote Close (the owner's row, asked over roster metadata) ---
+
+  /**
+   * The optional Close controller of the ONE existing coordinator. It is read
+   * only here, feature-detected every time, and never used to connect, pair,
+   * grant, pin, or advertise anything: an older coordinator or fake simply has
+   * no `ownerClose`, and this host then reports a truthful unsupported notice.
+   */
+  function ownerCloseController(): PeerCloseController | undefined {
+    const coordinator = peerCoordinator as (Partial<PeerCoordinatorWithClose> | undefined);
+    if (coordinator === undefined) return undefined;
+    try {
+      const candidate = coordinator.ownerClose;
+      if (candidate === undefined || typeof candidate.closeSession !== "function") return undefined;
+      return candidate;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function remoteCloseTargetKey(target: {
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+  }): string {
+    return JSON.stringify([target.hostId, target.hostRunId, target.rowId]);
+  }
+
+  /**
+   * The ONE written-highlight gate for a remote Close. It proves, by value, that
+   * the frame the writer actually committed drew this exact owner row as its
+   * complete left-roster highlight, that no newer composition has moved or
+   * changed that highlight, and that the terminal is still at the written
+   * geometry. A held/queued write, a moved highlight, a reordered or clipped
+   * row, a replaced run, or a resize therefore requests nothing at all.
+   */
+  function writtenRemoteCloseRow(
+    target: { readonly hostId: string; readonly hostRunId: string | null; readonly rowId: string },
+  ): SidebarRemoteCloseRow | undefined {
+    if (shutdownRequested || externalEditorActive || !terminal || !terminalStarted || !sidebar) return undefined;
+    if (target.hostRunId === null || target.hostRunId.length === 0) return undefined;
+    if (sidebar.focus !== "sidebar" || !sidebar.visible) return undefined;
+    if (layout === undefined) return undefined;
+    const shown = displayedMousePresentation;
+    const latest = latestMousePresentation;
+    if (shown === undefined || latest === undefined) return undefined;
+    // The written receipt must belong to the CURRENT geometry epoch: a reflow
+    // revokes highlight authority until a replacement frame is actually written.
+    if (shown.remoteCloseEpoch !== remoteCloseHighlightEpoch
+      || latest.remoteCloseEpoch !== remoteCloseHighlightEpoch) return undefined;
+    const drawn = shown.sidebar.remoteClose;
+    if (drawn === undefined || !sameRemoteCloseRow(drawn, latest.sidebar.remoteClose)) return undefined;
+    if (drawn.focus !== "sidebar" || drawn.hostRunId === null) return undefined;
+    // The terminal geometry must still be the geometry that was written.
+    const cols = clampDimension(terminal.columns, 80);
+    const rows = clampDimension(terminal.rows, 24);
+    if (shown.layout.cols !== cols || shown.layout.rows !== rows) return undefined;
+    if (shown.layout.sidebar === undefined
+      || shown.layout.sidebar.cols !== drawn.cols || shown.layout.sidebar.rows !== drawn.rows) return undefined;
+    // The request names exactly the written row: no retarget, no local id
+    // collision, no selection-driven substitution.
+    if (drawn.hostId !== target.hostId || drawn.hostRunId !== target.hostRunId
+      || drawn.rowId !== target.rowId) return undefined;
+    return drawn;
+  }
+
+  /**
+   * Revalidate ONLY the minimal frozen target against the coordinator's current
+   * roster observation: the same destination, the same owner run, and a row that
+   * is still present. Nothing else is read — no native conversation tuple, no
+   * epoch, no viewer, no selection, and no display facts — so a stale-but-present
+   * row is still eligible and a same-target native-epoch change is not a denial.
+   *
+   * `absent` is reserved for positive observations (a complete roster without
+   * that destination, run, or row). `unknown` is no complete observation at all
+   * and is never treated as disappearance; the owner host revalidates anyway.
+   */
+  function remoteCloseTargetPresence(
+    target: { readonly hostId: string; readonly hostRunId: string; readonly rowId: string },
+  ): "present" | "absent" | "unknown" {
+    const hosts = peerUiSnapshot?.hosts;
+    if (hosts === null || hosts === undefined) return "unknown";
+    const host = hosts.find((candidate) => candidate.id === target.hostId);
+    if (host === undefined) return "absent";
+    // The owner-run fence comes FIRST: a reconnect resets the production roster
+    // to `rows: null, hostRunId: null`, and an unavailable row observation must
+    // never carry an obsolete run past this check. A CLEARED run is therefore
+    // `absent` (not "no observation"), while a same-run unavailable row stays
+    // `unknown` and is left to the owner's own revalidation.
+    if ((host.roster.hostRunId ?? null) !== target.hostRunId) return "absent";
+    const rows = host.roster.rows;
+    if (rows === null) return "unknown";
+    return rows.some((row) => row.id === target.rowId) ? "present" : "absent";
+  }
+
+  /**
+   * Drop a pending remote-close dialog whose frozen target this host can
+   * positively see is gone (row removed or owner run replaced). It sends
+   * nothing, confirms nothing, and leaves every other surface untouched.
+   */
+  function abandonVanishedRemoteCloseTarget(): void {
+    const frame = remoteCloseConfirmationFrame;
+    if (frame === undefined) return;
+    if (remoteCloseTargetPresence(frame.target) !== "absent") return;
+    invalidateRemoteCloseConfirmationDisplay();
+    sidebar?.abandonRemoteCloseConfirmation();
+    sidebar?.showError(REMOTE_CLOSE_TARGET_GONE_MESSAGE);
+    reconcileLayout(true);
+    scheduleRedraw();
+  }
+
+  /**
+   * This side's condensed preflight over the SAME drawn card, matching the local
+   * `d`/Delete route: a confirmed exit or a settled error row is an owner
+   * removal, a row without an owned process is refused, and a live row is
+   * requested directly only when complete idleness was positively drawn. The
+   * owner host always revalidates its own row; this only decides whether the
+   * operator must confirm first.
+   */
+  function remoteClosePreflight(
+    drawn: SidebarRemoteCloseRow,
+  ): "direct" | "confirmation" | "refuse" {
+    if (drawn.hostRunId === null || drawn.hostRunId.length === 0) return "refuse";
+    if (drawn.lifecycle === "exited") return "direct";
+    if (drawn.lifecycle === "error" && drawn.hasLiveProcess === false) return "direct";
+    if (drawn.hasLiveProcess !== true) return "refuse";
+    if (!drawn.idle) return "confirmation";
+    // The owner already told this host that this exact row was not idle after an
+    // unconfirmed request this host believed idle, so the cached idle projection
+    // is not enough: the next deliberate request is confirmed on a written dialog.
+    if (remoteCloseMarkers.has(remoteCloseTargetKey({
+      hostId: drawn.hostId,
+      hostRunId: drawn.hostRunId,
+      rowId: drawn.rowId,
+    }))) return "confirmation";
+    return "direct";
+  }
+
+  /** Fixed, truthful notice for one settled owner result (never a retry claim). */
+  function remoteCloseResultNotice(attempt: RemoteCloseAttempt, result: PeerCloseResult): string | undefined {
+    if (result.kind === "owner-result") {
+      const facts: OwnerCloseFacts | undefined = isOwnerCloseFacts(result.facts) ? result.facts : undefined;
+      if (facts === undefined) return remoteCloseUnknownNotice(attempt);
+      switch (facts.kind) {
+        case "removed":
+          return `Remote session removed by its host: ${attempt.title}`;
+        case "stopped-retained":
+          return `Remote session stopped but its host kept the row: ${attempt.title}`;
+        case "confirmation-required":
+          return `The remote host needs confirmation before stopping that session: ${attempt.title}`;
+        case "unconfirmed":
+          return `The remote host could not confirm stopping that session; the row is retained: ${attempt.title}`;
+        case "refused":
+          return `The remote host did not accept that close; nothing was stopped: ${attempt.title}`;
+        case "busy":
+          return `${REMOTE_CLOSE_BUSY_MESSAGE}: ${attempt.title}`;
+        case "unknown":
+          return remoteCloseUnknownNotice(attempt);
+      }
+    }
+    if (result.kind === "not-sent") {
+      switch (result.reason) {
+        case "capability-unsupported":
+          return REMOTE_CLOSE_UNSUPPORTED_MESSAGE;
+        case "not-ready":
+          return `That destination is not ready; no close was sent: ${attempt.title}`;
+        case "invalid-request":
+          return `The close request could not be represented; nothing was sent: ${attempt.title}`;
+        case "target-unavailable":
+          return `That remote session is no longer addressable; no close was sent: ${attempt.title}`;
+        case "busy":
+          return `${REMOTE_CLOSE_BUSY_MESSAGE}: ${attempt.title}`;
+        case "row-limit":
+          return `Too many remote closes are already in progress; no close was sent: ${attempt.title}`;
+      }
+    }
+    return remoteCloseUnknownNotice(attempt);
+  }
+
+  function remoteCloseUnknownNotice(attempt: RemoteCloseAttempt): string {
+    return `The remote close result is unknown; nothing was re-sent: ${attempt.title}`;
+  }
+
+  /**
+   * Records one settled owner fact without touching any local row, manager,
+   * slot, task, or saved conversation. The owner's own roster projection is the
+   * only thing that can remove or retain a remote row, so this only reports and
+   * maintains the bounded confirmation reminder.
+   */
+  function applyRemoteCloseResult(attempt: RemoteCloseAttempt, result: PeerCloseResult): void {
+    const target = { hostId: attempt.hostId, hostRunId: attempt.hostRunId, rowId: attempt.rowId };
+    const facts = result.kind === "owner-result" && isOwnerCloseFacts(result.facts)
+      ? result.facts
+      : undefined;
+    if (facts?.kind === "confirmation-required") {
+      // Only this explicit owner fact, and only after an unconfirmed request this
+      // side believed was idle, arms the next deliberate confirmation. The marker
+      // never confirms anything by itself and never opens a dialog on its own.
+      if (!attempt.confirmed && attempt.cachedIdle) markRemoteCloseConfirmationRequired(target);
+    } else if (facts !== undefined) {
+      clearRemoteCloseMarker(target);
+    }
+    const notice = remoteCloseResultNotice(attempt, result);
+    if (notice !== undefined) sidebar?.showError(notice);
+  }
+
+  function markRemoteCloseConfirmationRequired(target: RemoteCloseConfirmationMarker): void {
+    const key = remoteCloseTargetKey(target);
+    if (remoteCloseMarkers.has(key)) return;
+    remoteCloseMarkers.set(key, {
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      rowId: target.rowId,
+    });
+  }
+
+  function clearRemoteCloseMarker(target: {
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+  }): void {
+    remoteCloseMarkers.delete(remoteCloseTargetKey(target));
+  }
+
+  /**
+   * Drops reminders this host can positively see no longer apply: its owner
+   * host is gone from a complete observation, its owner run was replaced (even
+   * while that run's rows are unavailable), its row is gone from that run, or
+   * the row settled. Positive absence and settlement are the ONLY reasons to
+   * prune; the observed hosts/runs/rows themselves bound the set, so an older
+   * target's still-valid reminder is never silently discarded to make room. An
+   * unobserved roster (null rows) on the SAME run is not evidence either way
+   * and leaves its reminder alone.
+   */
+  function reconcileRemoteCloseMarkers(snapshot: PeerUiSnapshot): void {
+    if (remoteCloseMarkers.size === 0) return;
+    const hosts = snapshot.hosts;
+    if (hosts === null) return;
+    for (const [key, marker] of [...remoteCloseMarkers]) {
+      const host = hosts.find((candidate) => candidate.id === marker.hostId);
+      if (host === undefined) {
+        // A complete observation without this destination: positively gone.
+        remoteCloseMarkers.delete(key);
+        continue;
+      }
+      // The owner-run fence applies even while the rows are unavailable: a
+      // reconnect's `rows: null, hostRunId: null` or a replaced run can never
+      // inherit the previous run's reminder.
+      if ((host.roster.hostRunId ?? null) !== marker.hostRunId) {
+        remoteCloseMarkers.delete(key);
+        continue;
+      }
+      const rows = host.roster.rows;
+      if (rows === null) continue;
+      const row = rows.find((candidate) => candidate.id === marker.rowId);
+      if (row === undefined || row.lifecycle === "exited"
+        || (row.lifecycle === "error" && row.hasLiveProcess === false)) {
+        remoteCloseMarkers.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Sends exactly one request to the owner's existing Close controller for one
+   * frozen attempt, then reports the one fixed result. Nothing is retried,
+   * replayed, cancelled, or retargeted, and a throw after the handoff is an
+   * unknown outcome rather than a not-sent or cancelled claim.
+   */
+  function startRemoteClose(attempt: RemoteCloseAttempt, controller: PeerCloseController): void {
+    const key = remoteCloseTargetKey(attempt);
+    if (remoteCloseAttempts.has(key)) {
+      sidebar?.showError(REMOTE_CLOSE_BUSY_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    remoteCloseAttempts.add(key);
+    void (async () => {
+      let result: PeerCloseResult;
+      try {
+        result = await controller.closeSession({
+          hostId: attempt.hostId,
+          hostRunId: attempt.hostRunId,
+          rowId: attempt.rowId,
+          confirmed: attempt.confirmed,
+        });
+        if (typeof result !== "object" || result === null
+          || (result.kind !== "owner-result" && result.kind !== "not-sent" && result.kind !== "unknown")) {
+          result = { kind: "unknown" };
+        }
+      } catch {
+        result = { kind: "unknown" };
+      }
+      remoteCloseAttempts.delete(key);
+      if (shutdownRequested) return;
+      applyRemoteCloseResult(attempt, result);
+      reconcileLayout(true);
+      scheduleRedraw();
+    })();
+  }
+
+  /** True only while this exact written dialog frame is still the current one. */
+  function isCurrentRemoteCloseConfirmationFrame(frame: RemoteCloseConfirmationFrame): boolean {
+    return terminal !== undefined && sidebar !== undefined && sidebar.visible && sidebar.focus === "confirm"
+      && sidebar.remoteCloseConfirmationActive
+      && clampDimension(terminal.columns, 80) === frame.cols
+      && clampDimension(terminal.rows, 24) === frame.rows
+      && sidebar.isRemoteCloseConfirmationRenderCurrent(frame.generation, frame.renderToken);
+  }
+
+  /** Revoke remote-close confirmation authority before any target/focus invalidation. */
+  function invalidateRemoteCloseConfirmationDisplay(): void {
+    remoteCloseConfirmationFrame = undefined;
+    sidebar?.invalidateRemoteCloseConfirmationDisplay();
+  }
+
+  /** The one deliberately confirmed remote Close, rechecked synchronously. */
+  function confirmRemoteClose(action: {
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+    readonly generation: number;
+    readonly renderToken: number;
+  }): void {
+    const activeSidebar = sidebar;
+    const frame = remoteCloseConfirmationFrame;
+    if (!activeSidebar || frame === undefined) {
+      sidebar?.showError(REMOTE_CLOSE_DIALOG_CHANGED_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    if (!frame.settled
+      || frame.generation !== action.generation
+      || frame.renderToken !== action.renderToken
+      || !sameRemoteCloseTarget(frame.target, action)
+      || !isCurrentRemoteCloseConfirmationFrame(frame)) {
+      // A forged, stale, superseded, resized, queued, held, or unwritten DTO can
+      // never confirm anything: the exact written frame is the only authority.
+      invalidateRemoteCloseConfirmationDisplay();
+      activeSidebar.showError(REMOTE_CLOSE_DIALOG_CHANGED_MESSAGE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    const target = frame.target;
+    if (remoteCloseTargetPresence(target) === "absent") {
+      // The written dialog can outlive its row or its owner run. Submission
+      // revalidates that minimal target, so an obsolete one is never sent.
+      invalidateRemoteCloseConfirmationDisplay();
+      activeSidebar.showError(REMOTE_CLOSE_TARGET_GONE_MESSAGE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    // Consume the one-shot receipt BEFORE dispatch so this same generation can
+    // never be confirmed twice, while a duplicate that arrives later has no
+    // current frame to match.
+    remoteCloseConfirmationFrame = undefined;
+    const controller = ownerCloseController();
+    if (controller === undefined) {
+      activeSidebar.showError(REMOTE_CLOSE_UNSUPPORTED_MESSAGE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    clearRemoteCloseMarker(target);
+    startRemoteClose({
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      rowId: target.rowId,
+      title: frame.title,
+      confirmed: true,
+      cachedIdle: false,
+    }, controller);
+    reconcileLayout(true);
+    scheduleRedraw();
+  }
+
+  /** The one deliberate `d`/Delete on a written remote highlight. */
+  function requestRemoteClose(action: {
+    readonly hostId: string;
+    readonly hostRunId: string | null;
+    readonly rowId: string;
+  }): void {
+    const activeSidebar = sidebar;
+    if (!activeSidebar) return;
+    if (action.hostRunId === null || action.hostRunId.length === 0) {
+      activeSidebar.showError(REMOTE_CLOSE_NO_RUN_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    if (remoteCloseTargetPresence({ hostId: action.hostId, hostRunId: action.hostRunId, rowId: action.rowId })
+      === "absent") {
+      // Positively gone or replaced, even if the last drawn frame still shows it:
+      // nothing is requested for a target the owner no longer lists.
+      activeSidebar.showError(REMOTE_CLOSE_TARGET_GONE_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    const drawn = writtenRemoteCloseRow(action);
+    if (drawn === undefined) {
+      // Not the actually written highlight: request nothing, open nothing.
+      activeSidebar.showError(REMOTE_CLOSE_NOT_DRAWN_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    const plan = remoteClosePreflight(drawn);
+    if (plan === "refuse") {
+      activeSidebar.showError(REMOTE_CLOSE_NO_PROCESS_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    const controller = ownerCloseController();
+    if (controller === undefined) {
+      activeSidebar.showError(REMOTE_CLOSE_UNSUPPORTED_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    const target = { hostId: drawn.hostId, hostRunId: action.hostRunId, rowId: drawn.rowId };
+    if (remoteCloseAttempts.has(remoteCloseTargetKey(target))) {
+      activeSidebar.showError(REMOTE_CLOSE_BUSY_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    const prepared = activeSidebar.prepareRemoteClose(target, { direct: plan === "direct" });
+    if (prepared === "refused") {
+      activeSidebar.showError(REMOTE_CLOSE_NOT_DRAWN_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    if (prepared === "confirmation-opened") {
+      // Busy or unknown: a written dialog decides. No request is sent yet.
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    startRemoteClose({
+      hostId: drawn.hostId,
+      hostRunId: action.hostRunId,
+      rowId: drawn.rowId,
+      title: drawn.title,
+      confirmed: false,
+      cachedIdle: drawn.idle,
+    }, controller);
+  }
+
   function handleSidebarAction(action: SidebarAction): void {
     if (shutdownRequested) return;
     // Any deliberate user action invalidates a pending automatic activation.
@@ -3414,6 +4058,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         reconcileLayout(true);
         return;
       }
+      case "remote-close-request":
+        // A deliberate d/Delete on a remote card. Nothing is sent until this
+        // side's own written-highlight gate, the local preflight, and (when the
+        // owner row is busy or unknown) a written confirmation all agree.
+        requestRemoteClose(action);
+        return;
+      case "remote-close-confirmed":
+        // The one deliberate confirmation of a written dialog frame. It is
+        // rechecked and consumed synchronously, before any await.
+        confirmRemoteClose(action);
+        return;
       case "select-remote": {
         // An ordinary Enter/left press on one projected remote roster card. It
         // selects only the DISPLAYED source: never a local select, resume,
@@ -3733,6 +4388,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     savedCatalogRequestId = undefined;
     invalidateSavedDeleteConfirmationDisplay();
     invalidatePeerConsentDisplay();
+    invalidateRemoteCloseConfirmationDisplay();
+    // Ephemeral per-target reminders never outlive this host run. An in-flight
+    // close already handed to the owner is never re-sent or cancelled here.
+    remoteCloseMarkers.clear();
+    remoteCloseAttempts.clear();
     sidebar?.disposeSavedPicker();
     invalidateMouseAuthorization();
     // Display facts only. The coordinator's own bounded close stays the single
@@ -4143,6 +4803,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       onAction: handleSidebarAction,
       onInvalidate: () => {
         invalidateSavedDeleteConfirmationDisplay();
+        invalidateRemoteCloseConfirmationDisplay();
         scheduleRedraw();
       },
     });

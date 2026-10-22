@@ -278,7 +278,8 @@ export const REVIEW_SUBTASK_ENABLED_DEFAULT = true;
 /** Default landed-change re-review posture: landed changes stay checkpointed out of the primary window. */
 export const REVIEW_LANDED_CHANGES_DEFAULT = false;
 
-/** Independent evidence-method choices; omission preserves snapshot evidence. */
+/** Independent evidence-method choices; omission preserves snapshot evidence.
+ * An absent snapshotFailureFallback is On (#491); an explicit false stays Off. */
 export interface ReviewEvidenceConfig {
   primaryToolOnly?: boolean;
   worktreeToolOnly?: boolean;
@@ -295,7 +296,8 @@ export function effectiveReviewEvidenceSettings(config: Pick<ReviewGateConfig, "
     primaryToolOnly: evidence?.primaryToolOnly ?? false,
     worktreeToolOnly: evidence?.worktreeToolOnly ?? false,
     inplaceToolOnly: evidence?.inplaceToolOnly ?? false,
-    snapshotFailureFallback: evidence?.snapshotFailureFallback ?? false,
+    // #491: derived in memory only; loading never writes the default back.
+    snapshotFailureFallback: evidence?.snapshotFailureFallback ?? true,
   };
 }
 

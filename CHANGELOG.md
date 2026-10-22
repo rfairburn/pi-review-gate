@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.192]
+
+### Changed
+
+- `review.evidence.snapshotFailureFallback` now defaults On when absent (#491). An
+  explicit `false` stays Off, and the default is never written back to saved settings.
+  Existing On behavior is unchanged: the Tools only (snapshot-failure fallback) warning,
+  retained tool evidence, the session latch, and `/review-clear`.
+- With the fallback explicitly Off, an eligible Primary review-baseline capture failure
+  (for example an over-budget untracked set) no longer blocks the prompt (#491). A
+  prominent local warning says review is disabled for that turn and no snapshot coverage
+  is available. The work then continues unreviewed: no Tools only substitute, no
+  reviewer, and no reviewed or passed result. The decision covers the whole turn:
+  re-arming it before settlement never captures a later baseline. Nothing latches for
+  the session, so the next fresh prompt tries a snapshot again. Capture limits and
+  eligibility are unchanged. These still block:
+  cancellation, a failed warning, ineligible failures, settlement and worker captures,
+  missing or corrupt persisted evidence, reviewer errors, and construction, checkpoint
+  and landing failures.
+
 ## [0.1.0-dev.191]
 
 ### Security

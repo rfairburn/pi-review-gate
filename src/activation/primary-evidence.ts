@@ -8,8 +8,8 @@ import { sendLocalWarning } from "../pi";
 
 /** Always-on local warning to the USER only (#465). Evidence-method warnings are
  * not work: no model-context message, steering, follow-up, or triggered turn. */
-export async function sendPrimaryEvidenceWarning(target: unknown, message: string): Promise<void> {
-  await sendLocalWarning(target, message);
+export async function sendPrimaryEvidenceWarning(target: unknown, message: string, required = false): Promise<void> {
+  await sendLocalWarning(target, message, required);
 }
 
 /** Settings application only: menu navigation/cancel never invokes this path. */

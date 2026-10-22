@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { effectiveReviewSettings, type ReviewGateConfig } from "../config";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "../correction-feedback";
 import { rememberFinalAssistantSummary } from "../evidence";
-import { primaryEvidencePolicy, evidenceMethodNotice, isEligibleReviewCaptureFailure, latchPrimarySnapshotFallback, primaryFallbackUserWarning } from "../review-evidence";
+import { primaryEvidencePolicy, evidenceMethodNotice, isEligibleReviewCaptureFailure, latchPrimarySnapshotFallback, primaryFallbackUserWarning, PRIMARY_REVIEW_DISABLED_USER_WARNING } from "../review-evidence";
 import { BackgroundProcessReadiness } from "../background-process-readiness";
 import { type BackgroundShellController, type BackgroundShellLifecycleEvent } from "../background-shell";
 import {
@@ -85,7 +85,8 @@ export interface ReviewTurnDependencies {
   checkpointRestartBlocked: () => string | undefined;
   effectiveReviewConfig: () => ReviewGateConfig;
   applyPendingEvidenceSettings?: () => Promise<void>;
-  warnEvidenceMethod?: (message: string) => Promise<void>;
+  /** `required` rejects when no local warning transport exists (#491). */
+  warnEvidenceMethod?: (message: string, required?: boolean) => Promise<void>;
   /** Ordinary save (may resolve without writing). */
   persist: () => Promise<void>;
   /** Durable-boolean save for the automatic-delivery uncertainty gate. */
@@ -163,6 +164,14 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
    * scheduled orchestrator turns rather than allowing an unreviewed change.
    */
   let triggeringMessageReviewFailure: string | undefined;
+  /**
+   * #491 runtime-only: the window whose eligible baseline capture failed with
+   * fallback explicitly Off after its review-disabled warning was shown. Later
+   * arming of that same window (for example a queued triggering message before
+   * settlement) never captures, so earlier unreviewed work cannot be certified
+   * by a later baseline; settlement closes it without review. Never persisted.
+   */
+  let reviewDisabledWindow: ReviewGateState["reviewWindow"];
   let backgroundCompletionMonitor: Promise<void> | undefined;
   let backgroundMonitorGeneration = 0;
   let backgroundReviewDeferred = false;
@@ -301,6 +310,8 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
     beginAgentRun(deps.state);
     if (activeExchangeHasBaseline(deps.state)) return "armed";
     const existing = deps.state.reviewWindow?.baseline;
+    // #491: this window already continues unreviewed; never capture for it.
+    if (!existing && reviewDisabledWindow !== undefined && reviewDisabledWindow === deps.state.reviewWindow) return "armed";
     const policy = primaryEvidencePolicy(deps.config, deps.state);
     if (!existing && policy.toolOnly) {
       // A session-latched fallback (#465) acts as Tools only: no capture retry.
@@ -332,6 +343,20 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
         setReviewWindowCheckpointBaseline(deps.state, { kind: "tool", cwd: deps.cwd(), capturedAt: new Date().toISOString(), fallback: true });
         freezeReviewWindowConfig(deps.state, deps.config, deps.scopedModels());
         await deps.persist();
+        return "armed";
+      }
+      if (!policy.snapshotFailureFallback && !signal?.aborted && isEligibleReviewCaptureFailure(captured) && deps.warnEvidenceMethod) {
+        // #491: explicit fallback Off. The work continues honestly unreviewed:
+        // no baseline (and no Tools only substitute) is set, so settlement
+        // closes this window without running a reviewer or recording a verdict.
+        // Nothing is latched for the session, so the next fresh prompt (a new
+        // window) tries a snapshot again. The mandatory warning must succeed
+        // first; its failure or cancellation stays blocking and records nothing.
+        // Required delivery: a missing local transport rejects instead of a
+        // silent no-op, so undisclosed unreviewed work is never admitted.
+        await deps.warnEvidenceMethod(PRIMARY_REVIEW_DISABLED_USER_WARNING, true);
+        signal?.throwIfAborted();
+        reviewDisabledWindow = deps.state.reviewWindow;
         return "armed";
       }
       throw new Error(`review gate: baseline capture failed (${captured.reason}): ${captured.detail}`);
@@ -506,6 +531,16 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       const window = deps.state.reviewWindow;
       if (!window) {
         return;
+      }
+      if (window === reviewDisabledWindow) {
+        reviewDisabledWindow = undefined;
+        if (!window.baseline) {
+          // #491: explicit-Off review-disabled turn. Close without review on
+          // every settlement path (no background deferral or reviewer), so the
+          // next fresh prompt opens a new window and tries a snapshot again.
+          closeReviewWindow(deps.state);
+          return;
+        }
       }
       if (!primaryEnabled) {
         // Automatic primary review is off (issue #175): no reviewer runs at
@@ -984,6 +1019,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       unsubscribeBackgroundLifecycle = shell ? shell.subscribe(handleBackgroundLifecycle) : undefined;
     },
     resetForSessionStart() {
+      reviewDisabledWindow = undefined;
       backgroundMonitorGeneration += 1;
       backgroundCompletionMonitor = undefined;
       backgroundReviewDeferred = false;
@@ -1015,6 +1051,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       activeStatusTracker = undefined;
     },
     resetForShutdown() {
+      reviewDisabledWindow = undefined;
       agentRunActive = false;
       reviewerQuestionPausePending = false;
       backgroundMonitorGeneration += 1;

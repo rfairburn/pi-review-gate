@@ -59,8 +59,10 @@ Untracked entries, and eligible entries in a non-Git workspace, retain their raw
 Git checkpoint capture checks each untracked file's size against the untracked byte
 budget still remaining before it allocates or reads the file, and reads it in bounded
 chunks. An untracked set that cannot fit fails with a typed size-limit capture failure.
-That failure follows [Snapshot-failure fallback](#snapshot-failure-fallback) only when
-fallback is enabled and the failure qualifies; otherwise it blocks.
+That failure follows [Snapshot-failure fallback](#snapshot-failure-fallback) when the
+failure qualifies: with fallback On (the default) it uses that fallback, and with fallback
+explicitly Off a Primary baseline failure warns that review is disabled for that turn.
+Otherwise it blocks.
 An initialized repository with a verified unborn symbolic `HEAD` uses a checkpoint-owned
 synthetic parentless commit with an empty tree as its baseline. This does not create the
 user's first commit, move `HEAD`, change branch refs, or write the live index; staged,
@@ -249,8 +251,22 @@ routes or reviewer selections.
 
 ### Snapshot-failure fallback
 
-`review.evidence.snapshotFailureFallback` is an independent opt-in, default **Off**.
-Off leaves snapshot capture failure blocking. On allows an eligible
+`review.evidence.snapshotFailureFallback` is an independent setting. It is **On** when
+absent; an explicit `false` (**Off**) stays Off and is never rewritten.
+
+With fallback Off, an eligible Primary review-baseline capture failure before work does
+not block the prompt. A prominent local warning says that review is disabled for that
+turn and no snapshot coverage is available, and the work continues unreviewed. No
+**Tools only** substitute is used, no reviewer runs, and nothing is reported as reviewed
+or passed. The decision covers that whole turn: re-arming it before settlement (for
+example a queued triggering message) never captures a later baseline, and settlement
+closes it without review. Nothing latches for the session, so the next fresh prompt
+tries a snapshot again. If that warning
+cannot be shown, the prompt still blocks. Other capture failures with fallback Off block:
+ineligible or cancelled captures, settlement captures, worker captures, and settings
+transitions.
+
+On allows an eligible
 **review-evidence-only** snapshot capture failure to use retained current tool evidence
 instead, with a durable, truthfully labelled **Tools only (snapshot-failure fallback)** basis. It is allowed even on
 the **first Primary or InPlace review-baseline capture before work**: an absent initial
@@ -277,7 +293,7 @@ runtime state is never saved: the configured preference, its menu value, and Sav
 unaffected. `/review-clear` (which also discards the current review window) or a new
 session ends it; the next prompt's ordinary capture then tries the configured snapshot
 preference once, and an eligible failure warns again and returns to **Tools only**. While
-fallback is Off this session state does not apply, so capture failure blocks.
+fallback is Off this session state does not apply (see the Off behavior above).
 
 Worker fallback is not sticky: when the captured worker policy prefers snapshots, retry
 snapshot capture on later review cycles and continuations, warning prominently on each
@@ -341,8 +357,9 @@ and authenticated; menu-only checks need no model call.
    missing structured observations permit review with retained evidence and disclosed
    limits, without claiming clean work or no effects.
 5. In a controlled test setup that induces only a review-evidence capture failure,
-   compare fallback Off (blocked) with On (tool-only review plus the actual origin-correct
-   warning and reviewer disclosure). Include a first Primary and first InPlace baseline
+   compare fallback Off (Primary baseline: warning and unreviewed continuation; other
+   captures: blocked) with On (tool-only review plus the actual origin-correct warning
+   and reviewer disclosure). Include a first Primary and first InPlace baseline
    failure before work. For Primary, verify the warning is local only (no model turn),
    a no-change or read-only response runs no reviewer, and later turns make no capture
    attempt until `/review-clear` or a new session. For workers, restore capture and

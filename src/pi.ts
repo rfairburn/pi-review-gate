@@ -46,14 +46,22 @@ export async function sendNotice(pi: unknown, message: string): Promise<void> {
  * `sendSystemMessage`, custom-message, steering, follow-up, or turn-triggering
  * fallback: a warning must never become model input or start a model turn.
  */
-export async function sendLocalWarning(target: unknown, message: string): Promise<void> {
-  if (!isRecord(target)) return;
+export async function sendLocalWarning(target: unknown, message: string, required = false): Promise<void> {
+  // #491: a mandatory warning (required) rejects when no local transport
+  // exists, so the caller cannot treat a silent no-op as delivery. It still
+  // never falls back to a model-facing channel.
+  if (!isRecord(target)) {
+    if (required) throw new Error("review gate: mandatory local warning transport unavailable");
+    return;
+  }
   if (isRecord(target.ui) && typeof target.ui.notify === "function") {
     await target.ui.notify(message, "warning");
   } else if (typeof target.notify === "function") {
     await target.notify(message, "warning");
   } else if (typeof target.log === "function") {
     target.log(message);
+  } else if (required) {
+    throw new Error("review gate: mandatory local warning transport unavailable");
   }
 }
 

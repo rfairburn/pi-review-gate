@@ -44,12 +44,16 @@ export const PRIMARY_TOOLS_ONLY_USER_NOTE = TOOLS_ONLY_USER_NOTE;
 export function primaryFallbackUserWarning(sessionTransition = true): string {
   return `WARNING: Review evidence method: ${TOOLS_ONLY_LABEL} (snapshot-failure fallback). The workspace snapshot could not be captured; current tool evidence is kept. ${sessionTransition ? `${PRIMARY_SESSION_FALLBACK_NOTICE} ` : ""}${TOOLS_ONLY_USER_NOTE}`;
 }
+/** User warning for an eligible Primary baseline capture failure with the
+ * fallback explicitly Off (#491). Work continues, but no review runs for it:
+ * there is no Tools only substitute, no snapshot coverage and no review verdict. */
+export const PRIMARY_REVIEW_DISABLED_USER_WARNING = "WARNING: Review disabled for this turn: the workspace snapshot could not be captured and the snapshot-failure fallback is Off. No snapshot coverage is available and this turn's work will not be reviewed or reported as reviewed. The next prompt tries a snapshot again; turn the snapshot-failure fallback On to review with Tools only instead.";
 export const PRIMARY_SNAPSHOT_RECOVERED_USER_NOTE = "Snapshot capture recovered; a new snapshot baseline covers later work only, and earlier Tools only work is not snapshot-certified.";
 /** Session-effective Primary policy. Configured preference stays the saved value;
  * an eligible fallback earlier in this session makes it act as Tools only. */
 export function primaryEvidencePolicy(config: ReviewGateConfig, session?: PrimaryEvidenceSession): ReviewEvidencePolicy {
   const settings = effectiveReviewEvidenceSettings(config);
-  // Fallback Off keeps blocking: the session fact applies only while fallback is On.
+  // Fallback Off never acts as Tools only: the session fact applies only while fallback is On.
   const sessionFallback = !settings.primaryToolOnly && settings.snapshotFailureFallback && session?.primarySnapshotFallback === true;
   return { toolOnly: settings.primaryToolOnly || sessionFallback, snapshotFailureFallback: settings.snapshotFailureFallback, scope: "primary",
     ...(sessionFallback ? { sessionFallback: true as const } : {}), ...(session ? { session } : {}) };

@@ -19,6 +19,7 @@ import {
 	mintNativeViewerScopeToken,
 	parseNativeViewerScopeToken,
 	verifyNativeViewerScopeToken,
+	NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES,
 	type NativeInputEncoder,
 	type NativeInputExpectedTuple,
 	type NativeInputOrigin,
@@ -325,7 +326,13 @@ export type NativeViewerInputResult =
 export interface NativeViewerInputRequest {
 	readonly expectedSource: NativeViewerInputSource;
 	readonly expectedInputModes: TerminalInputModes;
-	/** Native translated bytes; legacy X10 mouse packets must remain byte-oriented. */
+	/**
+	 * Native translated bytes; legacy X10 mouse packets must remain byte-oriented.
+	 * One dispatch is bounded, in raw bytes (UTF-8 for a string, `length` for a
+	 * Buffer), by the child's technical whole-dispatch assembly bound — the agreed
+	 * 1 MiB paste body plus its two markers. Larger input is refused as
+	 * `invalid-input` before the PTY, never truncated and never sent unframed.
+	 */
 	readonly data: string | Buffer;
 }
 
@@ -988,7 +995,17 @@ function invalidViewerInputRequest(request: NativeViewerInputRequest): boolean {
 		|| !hasExactKeys(request, ["expectedSource", "expectedInputModes", "data"])) return true;
 	if (!isViewerInputSource(request.expectedSource)) return true;
 	if (!isViewerInputModes(request.expectedInputModes)) return true;
-	return (typeof request.data !== "string" && !Buffer.isBuffer(request.data)) || request.data.length === 0;
+	if ((typeof request.data !== "string" && !Buffer.isBuffer(request.data)) || request.data.length === 0) return true;
+	// The child assembles ONE viewer dispatch whole before any native input listener
+	// sees it, so this seam admits it against the same technical assembly bound the
+	// child enforces, counted in raw native bytes exactly as they will be written.
+	// This is a refusal before the PTY (the existing `invalid-input` reason, no new
+	// wire error), never a paste policy: the 1 MiB wire body bound, the per-fragment
+	// transport bound, and every local or protocol-reply write stay unchanged.
+	const bytes = typeof request.data === "string"
+		? Buffer.byteLength(request.data, "utf8")
+		: request.data.length;
+	return bytes > NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES;
 }
 
 function publicInstanceError(code: InstanceErrorCode): string {
@@ -1878,7 +1895,8 @@ export class InstanceManager {
 	 *
 	 * Fail-closed order, all of it before any possible PTY write and with no await
 	 * anywhere:
-	 * 1. the request shape (a malformed request or empty bytes is refused);
+	 * 1. the request shape (a malformed request, empty bytes, or a dispatch larger
+	 *    than the child's technical whole-dispatch assembly bound is refused);
 	 * 2. the CURRENT scope — same manager, live row, exact unreleased registration,
 	 *    framed and ready, known native tuple, and a mintable scope token;
 	 * 3. EVERY expected source fact against the current one, including the canonical

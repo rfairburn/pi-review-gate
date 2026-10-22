@@ -10,9 +10,12 @@
  * observes. These cases prove the owned bridge's strict input framing, its
  * per-dispatch AsyncLocalStorage tuple/origin capture, the readiness statement,
  * the v2 capsule wire shape, and that the default one-argument install stays the
- * legacy bridge. They make no claim about the installed Pi source, a real native
- * PTY/Windows/SSH child, the broker or viewer plumbing, or any physical
- * clipboard — none of those runs here, and no production caller enables the mode.
+ * legacy bridge. The one `nativeParser` case additionally feeds the bridge's own
+ * emitted chunks into the ACTUAL pinned public `StdinBuffer` from
+ * `pi-session-host-tui` (`@earendil-works/pi-tui@1.3.0`), so it does observe real
+ * native parser state — but it is not the full native Pi UI, a real native
+ * PTY/Windows/SSH child, the broker or viewer plumbing, or any physical clipboard,
+ * and no production caller enables the mode.
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -26,7 +29,7 @@ import {
   type NativeClipboardEvent,
   type NativeClipboardOriginEvent,
 } from "../src/session-host/native-clipboard";
-import { createNativeInputEncoder, NATIVE_INPUT_RAW_FRAGMENT_BYTES, type NativeInputOrigin } from "../src/session-host/native-input-origin";
+import { createNativeInputDecoder, createNativeInputEncoder, frameNativeInputBody, NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES, type NativeInputOrigin } from "../src/session-host/native-input-origin";
 import type { SessionHostBootstrap } from "../src/session-host/protocol";
 
 const bootstrap: SessionHostBootstrap = {
@@ -66,6 +69,10 @@ interface Report {
   readonly feeds: readonly boolean[];
   readonly callbackCompletions: readonly string[];
   readonly plainReturns: readonly boolean[];
+  /** `data` sequences emitted by the ACTUAL pinned public StdinBuffer consumer. */
+  readonly parserData: readonly string[];
+  /** `paste` bodies emitted by that same real parser. */
+  readonly parserPaste: readonly string[];
   readonly errors: readonly string[];
 }
 
@@ -262,18 +269,17 @@ test("strict framing captures the dispatch tuple/origin once across an epoch upd
     options: { inputOriginFraming: true },
     steps: [
       { op: "session", tuple: conversation("native-session-a", 3) },
-      // A's copy is scheduled while A's part 0 is the live dispatch, then deferred.
-      { op: "armCopy", text: "copy-alpha", defer: true, delay: 0 },
+      // A is a viewer dispatch: its prefix is assembled, never emitted, so a
+      // session change before its tail refuses the WHOLE dispatch.
       { op: "feed", hex: alpha[0]! },
       { op: "feed", hex: alpha[1]! },
       // The Reporter publishes a newer epoch in the middle of A's dispatch — what
       // an in-child /new or /resume performed by an earlier listener looks like.
       { op: "session", tuple: conversation("native-session-a", 4) },
       { op: "feed", hex: alpha[2]! },
-      // B is a local dispatch on the newer tuple, delivered before A's deferred copy.
+      // B is a local dispatch on the newer tuple, delivered before D's deferred copy.
       { op: "armCopy", text: "copy-beta", defer: false },
       { op: "feed", hex: beta[0]! },
-      { op: "wait", ms: 30 },
       // D and E share one tuple: origins must not leak between dispatches.
       { op: "session", tuple: conversation("native-session-a", 5) },
       { op: "armCopy", text: "copy-delta", defer: true, delay: 0 },
@@ -289,22 +295,21 @@ test("strict framing captures the dispatch tuple/origin once across an epoch upd
   assert.equal(readyWrites(report).length, 1);
   assert.deepEqual(otherTexts(report), []);
   assert.deepEqual(report.feeds, [true, true, true, true, true, true],
-    "every authenticated chunk is consumed, including a stale viewer tail");
+    "every authenticated chunk is consumed, including a stale viewer dispatch");
 
-  // Alpha's own fence named epoch 3, so once the child moved to epoch 4 its tail
-  // belonged to no conversation: consumed, never delivered, never re-tagged onto
-  // the newer one. The local beta dispatch carries no such fence and keeps its
-  // unchanged whole-dispatch delivery on the newer tuple.
-  assert.equal(report.payloads.length, 5);
+  // Alpha's own fence named epoch 3, so once the child moved to epoch 4 none of
+  // alpha belonged to a conversation: not one native listener saw a byte of it.
+  // The local beta dispatch and the current-tuple delta dispatch keep their exact
+  // delivery, and a stale viewer dispatch poisons nothing.
+  assert.equal(report.payloads.length, 3, "only the local and current-tuple dispatches are delivered");
   assert.equal(Buffer.concat(report.payloads.map(bytesOf)).equals(Buffer.concat([
-    alphaPayload.subarray(0, 2 * NATIVE_INPUT_RAW_FRAGMENT_BYTES),
     betaPayload, deltaPayload, epsilonPayload,
   ])), true,
   "no framing byte reaches native listeners, no admitted payload byte is lost, and no stale byte is added");
-  assert.deepEqual(bytesOf(report.payloads[1]!),
-    alphaPayload.subarray(NATIVE_INPUT_RAW_FRAGMENT_BYTES, 2 * NATIVE_INPUT_RAW_FRAGMENT_BYTES));
-  assert.deepEqual(bytesOf(report.payloads[2]!), betaPayload,
-    "the next dispatch is delivered normally: a stale viewer tail poisons nothing");
+  assert.equal(Buffer.concat(report.payloads.map(bytesOf)).includes(Buffer.from("A")), false,
+    "no fragment of the refused viewer dispatch ever became a native prefix");
+  assert.deepEqual(bytesOf(report.payloads[0]!), betaPayload,
+    "the next dispatch is delivered normally: a stale viewer dispatch poisons nothing");
   assert.ok(report.payloads.every((payload) => payload.kind === "buffer"));
   assert.ok(report.payloads.every((payload) => payload.thisIsStdin && payload.argCount === 0));
   assert.ok(copyCapsules(report).every((capsule) => capsule.startsWith("prg-native-copy-v2;")),
@@ -314,27 +319,23 @@ test("strict framing captures the dispatch tuple/origin once across an epoch upd
 
   const byText = new Map(receiveOrigin(report).map((receipt): [string, NativeClipboardOriginEvent] =>
     [copiedText(receipt.event), receipt]));
-  assert.deepEqual([...byText.keys()].sort(),
-    ["copy-alpha", "copy-beta", "copy-delta", "copy-epsilon"], "every proven copy arrives once");
-
-  const alphaReceipt = byText.get("copy-alpha")!;
-  assert.deepEqual(alphaReceipt.event, {
-    kind: "copy", encoded: copyText("copy-alpha"), sessionId: "native-session-a", sessionEpoch: 3,
-  });
-  assert.deepEqual(alphaReceipt.origin, { kind: "viewer", token: "opaque-viewer-1" });
-  assert.equal(alphaReceipt.dispatchId, 1);
-  assert.equal(alphaReceipt.event.sessionEpoch, 3,
-    "a deferred copy keeps the epoch captured at dispatch start, not the most recent one");
+  assert.deepEqual([...byText.keys()].sort(), ["copy-beta", "copy-delta", "copy-epsilon"],
+    "every proven copy arrives once, and a refused dispatch produces none");
 
   assert.deepEqual(byText.get("copy-beta")!.origin, { kind: "local" });
   assert.equal(byText.get("copy-beta")!.dispatchId, 2);
   assert.equal(byText.get("copy-beta")!.event.sessionEpoch, 4);
 
-  assert.deepEqual(byText.get("copy-delta")!.origin, { kind: "viewer", token: "opaque-viewer-2" });
+  // D's copy was deferred inside D's own listener, so it must still state D's
+  // captured epoch and origin after E has already run on the same tuple.
+  const deltaReceipt = byText.get("copy-delta")!;
+  assert.deepEqual(deltaReceipt.event, {
+    kind: "copy", encoded: copyText("copy-delta"), sessionId: "native-session-a", sessionEpoch: 5,
+  });
+  assert.deepEqual(deltaReceipt.origin, { kind: "viewer", token: "opaque-viewer-2" });
   assert.deepEqual(byText.get("copy-epsilon")!.origin, { kind: "local" });
-  assert.equal(byText.get("copy-delta")!.dispatchId, 3);
+  assert.equal(deltaReceipt.dispatchId, 3);
   assert.equal(byText.get("copy-epsilon")!.dispatchId, 4);
-  assert.equal(byText.get("copy-delta")!.event.sessionEpoch, 5);
   assert.equal(byText.get("copy-epsilon")!.event.sessionEpoch, 5);
 
   for (const receipt of byText.values()) {
@@ -386,10 +387,12 @@ test("strict framing preserves exact bytes across splits, coalescing, decoys, la
   assert.deepEqual(otherTexts(report), [], "no copy was armed and no framing byte reached stdout");
 
   const buffers = report.payloads.filter((payload) => payload.kind === "buffer").map(bytesOf);
-  assert.equal(buffers.length, 6);
+  assert.equal(buffers.length, 4,
+    "the viewer dispatch is one assembled emit, the local ones keep their per-fragment delivery");
   assert.deepEqual(buffers[0], decoy, "NUL, controls, paste markers and framing decoys survive exactly");
-  assert.equal(Buffer.concat(buffers.slice(1, 4)).equals(large), true);
-  assert.equal(Buffer.concat(buffers.slice(4)).toString("utf8"), "thirdfourth",
+  assert.deepEqual(buffers[1], large,
+    "a viewer dispatch spanning many fragments is emitted exactly once, whole");
+  assert.equal(Buffer.concat(buffers.slice(2)).toString("utf8"), "thirdfourth",
     "coalesced frames stay ordered and unframed");
   assert.ok(buffers.slice(1).every((buffer) => !buffer.toString("latin1").includes("prg-ni-v1;")));
   assert.equal(buffers[0]!.toString("latin1").includes("prg-ni-v1;"), true,
@@ -642,15 +645,321 @@ test("a stale viewer fence is consumed before any listener and never poisons the
   assert.deepEqual(copyCapsules(report), [], "a refused dispatch never produces a copy capsule");
   assert.equal(report.copies.length, 0, "no native listener ran for a refused dispatch");
 
-  assert.equal(report.payloads.length, 3, "only admitted fragments are delivered");
-  assert.deepEqual(bytesOf(report.payloads[0]!), midPayload.subarray(0, NATIVE_INPUT_RAW_FRAGMENT_BYTES),
-    "the fragment admitted against the live conversation is delivered exactly");
-  assert.deepEqual(bytesOf(report.payloads[1]!), Buffer.from("local spans on", "utf8"),
-    "local input semantics are unchanged by a stale viewer tail");
-  assert.deepEqual(bytesOf(report.payloads[2]!), Buffer.from("current keys", "utf8"),
-    "a valid viewer dispatch after a stale one is delivered normally");
+  assert.equal(report.payloads.length, 2, "only whole current-tuple dispatches are delivered");
+  assert.deepEqual(bytesOf(report.payloads[0]!), Buffer.from("local spans on", "utf8"),
+    "local input semantics are unchanged by a stale viewer dispatch");
+  assert.deepEqual(bytesOf(report.payloads[1]!), Buffer.from("current keys", "utf8"),
+    "a valid viewer dispatch after a stale one is delivered normally, exactly once");
   const delivered = Buffer.concat(report.payloads.map(bytesOf)).toString("utf8");
   assert.equal(delivered.includes("stale whole dispatch"), false, "a whole stale dispatch delivers nothing");
-  assert.equal(delivered.includes("M".repeat(NATIVE_INPUT_RAW_FRAGMENT_BYTES + 1)), false,
-    "the stale tail is never re-tagged onto the newer conversation");
+  assert.equal(delivered.includes("M"), false,
+    "the mid dispatch delivered ZERO native bytes: not even its admitted first fragment was a prefix");
+});
+
+/** Flip the last MAC nibble of one frame so its own bytes stay well-formed but unauthenticated. */
+function flipFrameMac(frameHex: string): string {
+  const bytes = Buffer.from(frameHex, "hex");
+  const index = bytes.length - 2; // last MAC hex character, before the newline
+  bytes[index] = bytes[index] === 0x30 ? 0x31 : 0x30;
+  return bytes.toString("hex");
+}
+
+/**
+ * Hand-build one viewer dispatch's frames, so an empty or tiny part can be
+ * exercised without an encoder shortcut. The body follows the codec's exact
+ * canonical key order; only the payload parts differ from an encoder output.
+ */
+function handBuiltViewerFrames(
+  dispatchId: number, firstSequence: number, payloads: readonly Buffer[],
+  token: string, expected: { sessionId: string; epoch: number },
+): string[] {
+  return payloads.map((payload, part) => frameNativeInputBody(bootstrap, Buffer.from(JSON.stringify({
+    v: 1,
+    instanceId: bootstrap.instanceId,
+    generation: bootstrap.generation,
+    sequence: firstSequence + part,
+    dispatchId,
+    part,
+    final: part === payloads.length - 1,
+    origin: { kind: "viewer", token },
+    expectedNativeTuple: expected,
+    encoded: payload.toString("base64url"),
+  }), "utf8").toString("base64url")));
+}
+
+test("the ACTUAL pinned native StdinBuffer never sees a stale viewer paste prefix", () => {
+  const pasteStart = "\x1b[200~";
+  const pasteEnd = "\x1b[201~";
+  const bPasteBody = "B-paste-body";
+
+  /**
+   * A's bracketed paste is larger than one technical fragment, so the old
+   * per-fragment delivery handed native Pi an unterminated paste prefix. The
+   * framing stream is split physically: no chunk boundary coincides with a frame,
+   * a payload fragment, or a paste marker. Then one conversation event happens
+   * with no stdin in between, then A's remainder and a corrupted or truncated
+   * tail land, then the next conversation's keyboard input and its own paste.
+   */
+  const run = (variant: "changed" | "aba" | "corrupt" | "truncated"): Report => {
+    const encoder = createNativeInputEncoder(bootstrap);
+    const aPayload = Buffer.from(`${pasteStart}${"A".repeat(40_000)}${pasteEnd}`, "utf8");
+    const aFrames = frameChunks(encoder.encode(aPayload, viewer("opaque-viewer-a"), fence("native-session-a", 1)));
+    assert.equal(aFrames.length, 2, "the stale paste spans two technical fragments");
+    const aStream = Buffer.from(aFrames.join(""), "hex");
+    const aSplit = aFrames[0]!.length / 2 + 1_000; // part 0 complete, part 1 partly present
+    assert.ok(aSplit < aStream.length, "the physical split leaves a real remainder of A");
+
+    // "aba" returns to A's own tuple, so A's next dispatch is admitted on A.
+    const nextFence = variant === "aba" ? fence("native-session-a", 1) : fence("native-session-b", 2);
+    const keyboard = Buffer.from("ok\r", "utf8");
+    const keyboardFrame = frameChunks(encoder.encode(
+      keyboard, viewer("opaque-viewer-next"), nextFence,
+    ))[0]!;
+    const pasteFrame = frameChunks(encoder.encode(
+      Buffer.from(`${pasteStart}${bPasteBody}${pasteEnd}`, "utf8"), viewer("opaque-viewer-next"), nextFence,
+    ))[0]!;
+
+    const feeds = (bytes: Buffer): Record<string, unknown>[] => {
+      const steps: Record<string, unknown>[] = [];
+      for (let offset = 0; offset < bytes.length; offset += 7_000) {
+        steps.push({ op: "feed", hex: bytes.subarray(offset, Math.min(offset + 7_000, bytes.length)).toString("hex") });
+      }
+      return steps;
+    };
+    const steps: Record<string, unknown>[] = [
+      { op: "session", tuple: conversation("native-session-a", 1) },
+      ...feeds(aStream.subarray(0, aSplit)),
+    ];
+    if (variant === "changed") steps.push({ op: "session", tuple: conversation("native-session-b", 2) });
+    if (variant === "aba") {
+      steps.push({ op: "session", tuple: conversation("native-session-b", 2) });
+      // Back to exactly the tuple A was admitted against, still with no stdin.
+      steps.push({ op: "session", tuple: conversation("native-session-a", 1) });
+    }
+    if (variant === "truncated") steps.push({ op: "end" });
+    // A's own final frame with one MAC nibble inverted: a strict decoder failure in
+    // the middle of the dispatch, so A never completes.
+    const remainder = variant === "corrupt"
+      ? Buffer.from(flipFrameMac(aFrames[1]!), "hex").subarray(aSplit - aFrames[0]!.length / 2)
+      : aStream.subarray(aSplit);
+    steps.push(...feeds(remainder));
+    if (variant === "changed" || variant === "aba") {
+      steps.push({ op: "feed", hex: keyboardFrame });
+      steps.push({ op: "feed", hex: pasteFrame });
+    }
+    steps.push({ op: "wait", ms: 80 });
+    return runScenario({ options: { inputOriginFraming: true }, nativeParser: true, steps });
+  };
+
+  for (const variant of ["changed", "aba"] as const) {
+    const report = run(variant);
+    assert.equal(report.installed, true);
+    assert.ok(report.feeds.every((value) => value === true), "every physical read is consumed");
+
+    // The ACTUAL native parser is asserted FIRST and exactly, with no normalization
+    // of anything the parser reported: the real pinned StdinBuffer native Pi 1.3.0
+    // uses (not a reimplementation and not a patched native class) must report
+    // exactly the next paste body and exactly the next keyboard input — no buffered
+    // A prefix, no stray marker, no contamination of any kind. The old per-fragment
+    // streaming cannot satisfy this: it hands the parser A's unterminated `200~`
+    // prefix, and the next `201~` then closes an A+B paste.
+    assert.deepEqual(report.parserPaste, [bPasteBody],
+      `${variant}: the real parser sees exactly the next paste body, with no stale A contamination and no stray markers`);
+    assert.equal(report.parserData.join(""), "ok\r",
+      `${variant}: the next keyboard input reaches the real parser byte-exact and outside paste mode`);
+
+    // Owned-bridge level, asserted afterwards: only the two current dispatches were
+    // emitted at all, so no fragment of the stale A dispatch ever became a prefix.
+    assert.equal(report.payloads.length, 2,
+      `${variant}: the stale A dispatch emitted nothing at all, not even its first fragment`);
+    const emitted = Buffer.concat(report.payloads.map(bytesOf)).toString("latin1");
+    assert.equal(emitted, `ok\r${pasteStart}${bPasteBody}${pasteEnd}`);
+    assert.equal(emitted.includes("A"), false, `${variant}: no A byte reached a native listener`);
+  }
+
+  for (const variant of ["corrupt", "truncated"] as const) {
+    const report = run(variant);
+    assert.equal(report.installed, true);
+    // Again the real parser first: an incomplete viewer dispatch must leave it with
+    // no paste and no data at all, rather than with an unclosed paste prefix.
+    assert.deepEqual(report.parserPaste, [], `${variant}: the real parser saw no paste at all`);
+    assert.deepEqual(report.parserData, [], `${variant}: the real parser saw no keyboard data`);
+    assert.deepEqual(report.payloads, [],
+      `${variant}: an incomplete viewer dispatch never becomes a native prefix`);
+  }
+});
+
+test("one complete viewer dispatch is assembled whole against the technical bound", () => {
+  const encoder = createNativeInputEncoder(bootstrap);
+  const pasteStart = "\x1b[200~";
+  const pasteEnd = "\x1b[201~";
+  const exact = Buffer.from(
+    `${pasteStart}${"U".repeat(NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES - pasteStart.length - pasteEnd.length)}${pasteEnd}`,
+    "utf8",
+  );
+  assert.equal(exact.length, NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES,
+    "the technical bound is the agreed 1 MiB body plus its two six-byte markers");
+  const exactFrames = frameChunks(encoder.encode(
+    exact, viewer("opaque-viewer-exact"), fence("native-session-bound", 1),
+  ));
+  assert.ok(exactFrames.length > 1, "the bounded dispatch really spans many fragments");
+  const over = Buffer.from("O".repeat(NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES + 1), "utf8");
+  const overFrames = frameChunks(encoder.encode(
+    over, viewer("opaque-viewer-over"), fence("native-session-bound", 1),
+  ));
+  const next = frameChunks(encoder.encode(
+    Buffer.from("next valid"), viewer("opaque-viewer-next"), fence("native-session-bound", 2),
+  ));
+  const unicodeText = `${"a".repeat(32_767)}\u00e9tail`;
+  const unicode = frameChunks(encoder.encode(
+    Buffer.from(unicodeText, "utf8"), viewer("opaque-viewer-unicode"), fence("native-session-bound", 2),
+  ));
+  assert.equal(unicode.length, 2, "a UTF-8 sequence straddles the fragment bound");
+  // Encode and deliver in the same order: this case tests the byte bound, not a
+  // replay/gap rejection of an accidentally reordered authenticated stream.
+  const independentlyChecked = createNativeInputDecoder(bootstrap);
+  for (const hex of [...exactFrames, ...overFrames, ...next, ...unicode]) {
+    assert.equal(independentlyChecked.feed(Buffer.from(hex, "hex")).ok, true,
+      "the bound fixture itself has a valid authenticated dispatch sequence");
+  }
+  assert.equal(independentlyChecked.finish().ok, true);
+
+  const report = runScenario({
+    options: { inputOriginFraming: true },
+    steps: [
+      { op: "session", tuple: conversation("native-session-bound", 1) },
+      // Every fragment arrives in its own physical read: no early native emit.
+      ...exactFrames.map((hex) => ({ op: "feed", hex })),
+      ...overFrames.map((hex) => ({ op: "feed", hex })),
+      // The next dispatch matches the current conversation and is delivered normally.
+      { op: "session", tuple: conversation("native-session-bound", 2) },
+      { op: "feed", hex: next[0]! },
+      { op: "stringMode" },
+      { op: "feed", hex: unicode[0]! },
+      { op: "feed", hex: unicode[1]! },
+    ],
+  });
+  assert.equal(report.installed, true);
+  assert.ok(report.feeds.every((value) => value === true));
+
+  assert.equal(report.payloads.length, 3,
+    "the exact-bound dispatch emitted once, the +1 dispatch emitted nothing, the next dispatch emitted once");
+  assert.deepEqual(bytesOf(report.payloads[0]!), exact,
+    "the exact technical bound is accepted and delivered once, byte-exact");
+  assert.deepEqual(bytesOf(report.payloads[1]!), Buffer.from("next valid"),
+    "an over-bound refusal poisons nothing: the next valid dispatch is delivered exactly");
+  assert.equal(Buffer.concat(report.payloads.slice(0, 2).map(bytesOf)).includes(Buffer.from("O")), false,
+    "not one byte of the over-bound dispatch (no truncation, no prefix) reached a listener");
+  const strings = report.payloads.filter((payload) => payload.kind === "string").map((payload) => payload.text!);
+  assert.deepEqual(strings, [unicodeText],
+    "string-mode viewer input is decoded once, whole, with the split UTF-8 sequence intact");
+  assert.equal(strings.join("").includes("\ufffd"), false);
+});
+
+test("many empty or tiny viewer fragments stay bounded and never emit a prefix", () => {
+  // 64 empty parts and one tiny final part in one logical dispatch: only payload
+  // bytes are retained, so an empty-fragment flood cannot grow metadata.
+  const payloads = [...Array.from({ length: 64 }, () => Buffer.alloc(0)), Buffer.from("tail after empty parts", "utf8")];
+  const frames = frameChunks(handBuiltViewerFrames(
+    1, 1, payloads, "opaque-viewer-empty", { sessionId: "native-session-sparse", epoch: 1 },
+  ).join(""));
+  assert.equal(frames.length, payloads.length);
+  const report = runScenario({
+    options: { inputOriginFraming: true },
+    steps: [
+      { op: "session", tuple: conversation("native-session-sparse", 1) },
+      ...frames.map((hex) => ({ op: "feed", hex })),
+    ],
+  });
+  assert.equal(report.installed, true);
+  assert.ok(report.feeds.every((value) => value === true));
+  assert.equal(report.payloads.length, 1, "the whole dispatch is emitted exactly once, at its final part");
+  assert.deepEqual(bytesOf(report.payloads[0]!), Buffer.from("tail after empty parts", "utf8"),
+    "empty fragments add no bytes and no metadata");
+});
+
+test("an incomplete viewer dispatch before a malformed frame or end of input never reaches a listener", () => {
+  const encoderA = createNativeInputEncoder(bootstrap);
+  const partial = frameChunks(encoderA.encode(
+    Buffer.from("P".repeat(40_000), "utf8"), viewer("opaque-viewer-partial"), fence("native-session-partial", 1),
+  ));
+  assert.equal(partial.length, 2);
+  const afterPoison = frameChunks(encoderA.encode(Buffer.from("after poison"), local))[0]!;
+  const malformed = runScenario({
+    options: { inputOriginFraming: true },
+    steps: [
+      { op: "session", tuple: conversation("native-session-partial", 1) },
+      { op: "feed", hex: partial[0]! },
+      { op: "feed", hex: flipFrameMac(partial[1]!) },
+      { op: "feed", hex: afterPoison },
+    ],
+  });
+  assert.equal(malformed.installed, true);
+  assert.ok(malformed.feeds.every((value) => value === true));
+  assert.deepEqual(malformed.payloads, [],
+    "a viewer prefix is never a native prefix, and a poisoned decoder re-enables nothing");
+  assert.deepEqual(malformed.copies, [], "no native listener ran at all");
+
+  // End of input with an open viewer dispatch is a truncation, never a flush.
+  const encoderB = createNativeInputEncoder(bootstrap);
+  const truncated = frameChunks(encoderB.encode(
+    Buffer.from("T".repeat(40_000), "utf8"), viewer("opaque-viewer-truncated"), fence("native-session-partial", 2),
+  ));
+  const eof = runScenario({
+    options: { inputOriginFraming: true },
+    steps: [
+      { op: "session", tuple: conversation("native-session-partial", 2) },
+      { op: "feed", hex: truncated[0]! },
+      { op: "end" },
+      { op: "feed", hex: truncated[1]! },
+    ],
+  });
+  assert.deepEqual(eof.payloads, [], "an open viewer dispatch at end of input delivers nothing");
+
+  // A COMPLETE viewer dispatch in the same physical chunk as a later failing frame
+  // is still delivered: completion, not chunking, decides.
+  const encoderC = createNativeInputEncoder(bootstrap);
+  const whole = frameChunks(encoderC.encode(
+    Buffer.from("whole dispatch"), viewer("opaque-viewer-whole"), fence("native-session-partial", 3),
+  ))[0]!;
+  const failing = frameChunks(encoderC.encode(Buffer.from("never delivered"), local))[0]!;
+  const coalesced = runScenario({
+    options: { inputOriginFraming: true },
+    steps: [
+      { op: "session", tuple: conversation("native-session-partial", 3) },
+      { op: "feed", hex: `${whole}${flipFrameMac(failing)}` },
+      { op: "feed", hex: whole },
+    ],
+  });
+  assert.deepEqual(coalesced.payloads.map(bytesOf), [Buffer.from("whole dispatch")],
+    "the dispatch that completed before the failing frame is delivered once, and nothing after it");
+});
+
+test("A -> B -> A session updates never revive a buffered viewer dispatch", () => {
+  const encoder = createNativeInputEncoder(bootstrap);
+  const aPayload = Buffer.from("a".repeat(40_000), "utf8");
+  const a = frameChunks(encoder.encode(aPayload, viewer("opaque-viewer-aba"), fence("native-session-aba", 1)));
+  assert.equal(a.length, 2);
+  const next = frameChunks(encoder.encode(
+    Buffer.from("next good"), viewer("opaque-viewer-aba"), fence("native-session-aba", 1),
+  ))[0]!;
+  for (const intermediate of [conversation("native-session-aba", 2), null]) {
+    const report = runScenario({
+      options: { inputOriginFraming: true },
+      steps: [
+        { op: "session", tuple: conversation("native-session-aba", 1) },
+        { op: "feed", hex: a[0]! },
+        // The conversation leaves (a newer epoch, or no conversation at all) and
+        // comes back with no stdin in between: A's buffered prefix must be gone.
+        { op: "session", tuple: intermediate },
+        { op: "session", tuple: conversation("native-session-aba", 1) },
+        { op: "feed", hex: a[1]! },
+        { op: "feed", hex: next },
+      ],
+    });
+    assert.equal(report.installed, true);
+    assert.deepEqual(report.feeds, [true, true, true]);
+    assert.deepEqual(report.payloads.map(bytesOf), [Buffer.from("next good")],
+      `a returned tuple (${JSON.stringify(intermediate)}) never revives buffered A bytes`);
+  }
 });

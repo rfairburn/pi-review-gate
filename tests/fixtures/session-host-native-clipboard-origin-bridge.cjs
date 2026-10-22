@@ -15,6 +15,13 @@
  * stdin payloads, captured stdout writes, copy invocations, and feed return
  * values. Only fixed strings and exact bytes are reported; no token, header, or
  * raw frame text is added beyond what the scenario itself supplied.
+ *
+ * `nativeParser: true` additionally feeds every delivered stdin payload into the
+ * ACTUAL pinned public `StdinBuffer` from `pi-session-host-tui` (the real
+ * `@earendil-works/pi-tui@1.3.0` parser native Pi's terminal uses), recording the
+ * `data` sequences and `paste` bodies that parser emits. It is the real parser,
+ * not a reimplementation and not a patched native class, and it is loaded only
+ * for scenarios that ask for it so every other scenario is unchanged.
  */
 "use strict";
 
@@ -77,8 +84,11 @@ async function main() {
     feeds: [],
     callbackCompletions: [],
     plainReturns: [],
+    parserData: [],
+    parserPaste: [],
     errors: [],
   };
+  let parser;
   let runtime;
   try {
     runtime = makeFakeRuntime();
@@ -115,6 +125,15 @@ async function main() {
       : bridge.installNativeClipboardBridge(scenario.bootstrap, options === null ? undefined : options);
 
     let pendingArm;
+    if (scenario.nativeParser === true) {
+      // The real pinned public parser native Pi 1.3.0 consumes stdin with. The
+      // bridge's emitted chunks are fed as text, exactly as the native terminal
+      // wrapper feeds them after its own stdin decode.
+      const { StdinBuffer } = require("pi-session-host-tui");
+      parser = new StdinBuffer({ timeout: 20, escapeTimeout: 20 });
+      parser.on("data", (sequence) => { report.parserData.push(String(sequence)); });
+      parser.on("paste", (body) => { report.parserPaste.push(String(body)); });
+    }
     process.stdin.on("data", function onData(chunk, ...rest) {
       if (Buffer.isBuffer(chunk)) {
         report.payloads.push({
@@ -132,6 +151,9 @@ async function main() {
           argCount: rest.length,
           thisIsStdin: this === process.stdin,
         });
+      }
+      if (parser !== undefined) {
+        parser.process(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
       }
       const arm = pendingArm;
       pendingArm = undefined;
@@ -189,6 +211,9 @@ async function main() {
         case "wait":
           await delay(step.ms || 10);
           break;
+        case "end":
+          process.stdin.emit("end");
+          break;
         default:
           throw new Error(`unknown scenario op: ${String(step.op)}`);
       }
@@ -198,6 +223,9 @@ async function main() {
   } catch (error) {
     report.errors.push(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
   } finally {
+    if (parser !== undefined && typeof parser.destroy === "function") {
+      try { parser.destroy(); } catch { /* The report is already complete. */ }
+    }
     if (runtime) rmSync(runtime.root, { recursive: true, force: true });
     writeFileSync(reportPath, JSON.stringify(report), { mode: 0o600 });
   }

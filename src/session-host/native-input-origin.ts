@@ -166,6 +166,18 @@ export interface NativeInputEncoder {
 
 /** Technical fragment transport bound; this is not a paste or product limit. */
 export const NATIVE_INPUT_RAW_FRAGMENT_BYTES = 32 * 1024;
+/**
+ * Technical bound for ONE complete `viewer` dispatch, in raw decoded native
+ * bytes. It is derived, not chosen: the already-agreed 1 MiB bracketed-paste TEXT
+ * body plus the two six-byte bracket markers (`ESC [ 2 0 0 ~`, `ESC [ 2 0 1 ~`)
+ * that wrap it. The child assembles a `viewer` dispatch whole before any native
+ * input listener sees it, so the host admits it against this same bound before
+ * the PTY; the 1 MiB wire body policy, every local/protocol write, and the
+ * per-fragment transport bound above are unchanged. This is a technical
+ * assembly bound, NOT a new paste policy, and it counts raw decoded bytes — never
+ * encoded framing, envelope JSON, or JavaScript string length.
+ */
+export const NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES = 1024 * 1024 + 2 * 6;
 /** Bound for the opaque viewer token carried inside an origin. */
 export const NATIVE_INPUT_MAX_VIEWER_TOKEN_CHARS = 128;
 /** Bound for one host-minted viewer scope token; identical to the origin bound. */

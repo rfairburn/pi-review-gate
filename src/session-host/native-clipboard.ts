@@ -409,7 +409,11 @@ export interface NativeClipboardBridgeOptions {
    * payload bytes (never the framing text) are re-emitted through the ORIGINAL
    * stdin emitter inside the dispatch's AsyncLocalStorage context, which also
    * carries the captured native session tuple, explicit origin, and logical
-   * dispatch id into native async copies. When absent/false nothing changes.
+   * dispatch id into native async copies. `local` and `none` dispatches keep that
+   * per-fragment delivery, while one `viewer` dispatch is assembled whole and
+   * delivered exactly once at its final fragment, so native Pi's bracketed-paste
+   * parser never sees a prefix of a dispatch that a later conversation change
+   * would have to abandon. When absent/false nothing changes.
    * No production caller sets this option; it is inert until a later host phase.
    */
   readonly inputOriginFraming?: boolean;
@@ -435,26 +439,101 @@ function tupleStillExpected(expected: NativeInputExpectedTuple | undefined, actu
   return actual !== undefined && actual.sessionId === expected.sessionId && actual.sessionEpoch === expected.epoch;
 }
 
+/** First allocation of one pending viewer dispatch, so a keystroke costs a small buffer. */
+const PENDING_VIEWER_INITIAL_BYTES = 1024;
+
+/** One bounded allocation, or undefined when the engine could not satisfy it. */
+function pendingBytes(capacity: number): Buffer | undefined {
+  try {
+    return Buffer.allocUnsafe(capacity);
+  } catch {
+    return undefined; // Allocation failure refuses this dispatch; it never escapes.
+  }
+}
+
 /**
- * Strict mode: framing bytes are consumed, verified payload bytes are delivered
+ * The ONE pending `viewer` dispatch: a single owned, growable byte buffer bounded
+ * by the technical assembly bound. Retained state is a function of payload BYTES
+ * only — an empty or tiny fragment adds no bookkeeping — so a flood of small
+ * frames cannot grow metadata, and a keystroke never allocates the maximum.
+ * Growth is geometric from {@linkcode PENDING_VIEWER_INITIAL_BYTES} and an
+ * allocation failure is reported as an ordinary refusal, never a throw.
+ */
+class PendingViewerDispatch {
+  #bytes: Buffer | undefined;
+  #length = 0;
+
+  /** Append one verified fragment; false when this whole dispatch cannot fit. */
+  append(payload: Buffer, maxBytes: number): boolean {
+    if (payload.length === 0) return true;
+    const needed = this.#length + payload.length;
+    if (!Number.isSafeInteger(needed) || needed > maxBytes) return false;
+    let bytes = this.#bytes;
+    if (bytes === undefined || needed > bytes.length) {
+      let capacity = bytes === undefined
+        ? Math.min(maxBytes, Math.max(PENDING_VIEWER_INITIAL_BYTES, needed))
+        : bytes.length;
+      while (capacity < needed) capacity = Math.min(capacity * 2, maxBytes);
+      const grown = pendingBytes(capacity);
+      if (grown === undefined) return false;
+      if (bytes !== undefined) bytes.copy(grown, 0, 0, this.#length);
+      this.#bytes = grown;
+      bytes = grown;
+    }
+    payload.copy(bytes, this.#length);
+    this.#length = needed;
+    return true;
+  }
+
+  /** Take the assembled bytes and release the owned buffer immediately. */
+  take(): Buffer | undefined {
+    const bytes = this.#bytes;
+    const length = this.#length;
+    this.clear();
+    return bytes === undefined || length === 0 ? undefined : bytes.subarray(0, length);
+  }
+
+  /** Release every retained byte now. */
+  clear(): void {
+    this.#bytes = undefined;
+    this.#length = 0;
+  }
+}
+
+/** The private hook the bridge's session update uses to release pending viewer bytes. */
+interface FramedStdinHandle {
+  /** A published native-conversation change (including an undefined tuple) arrived. */
+  onTupleChange(): void;
+}
+
+/**
+ * Strict mode: framing bytes are consumed and verified payload bytes are delivered
  * through the original `data` emitter under the dispatch's ALS context. The
  * boolean returned to the caller is Node's listener-dispatch boolean (true when
  * the chunk was consumed, buffered, delivered, or poisoned); it is not a
  * native-write acknowledgement. A poisoned decoder never re-enables, never
- * falls back to raw keystrokes, and never retargets. Fragments authenticated
- * before a failure in the same chunk are still delivered under their captured
- * dispatch scope, so accepted input never depends on transport chunking; the
- * failing frame and every later byte are never delivered.
+ * falls back to raw keystrokes, and never retargets.
  *
- * A `viewer` dispatch additionally carries the native conversation it was admitted
- * against. That expectation is compared with the child's ACTUAL conversation before
- * the first fragment reaches a native input listener and again before every later
- * fragment, so a `/new`, `/resume`, or reload performed inside an earlier listener
- * cannot receive the rest of the older dispatch. Once a mismatch is seen, the
- * remainder of that dispatch is consumed and suppressed through its final fragment:
- * no raw fallback, no re-tagging the stale bytes to the new conversation, and no
- * poisoning — the next dispatch that matches the current conversation is delivered
- * normally, and nothing is replayed automatically.
+ * `local` and `none` dispatches keep their unchanged per-fragment streaming: a
+ * fragment authenticated before a later failure in the same chunk is still
+ * delivered under its captured dispatch scope, so local input never depends on
+ * transport chunking.
+ *
+ * A `viewer` dispatch is different, because native Pi's bracketed-paste parser
+ * retains partial state across a session change: delivering its prefix would
+ * poison the next conversation's paste. So one whole `viewer` dispatch is
+ * assembled and delivered EXACTLY ONCE, immediately before its own final
+ * fragment, and no fragment of it ever reaches a native listener early. The
+ * expected native conversation is compared with the child's ACTUAL conversation
+ * at dispatch start, at EVERY authenticated fragment, and again immediately
+ * before that one emit. A `/new`, `/resume`, or reload seen at any point (or a
+ * published tuple change, including one reported while no stdin arrives at all)
+ * refuses the WHOLE dispatch through its final fragment: the owned bytes are
+ * released at once, no native prefix is emitted, the remainder is consumed, and
+ * nothing is re-tagged, replayed, truncated into a later dispatch, or fallen
+ * back to raw. Neither a refusal nor the bound latches the decoder: the next
+ * dispatch that matches the current conversation is delivered normally, and an
+ * A -> B -> A tuple sequence never revives buffered bytes from A.
  */
 function installFramedStdin(
   stdin: typeof process.stdin,
@@ -462,7 +541,8 @@ function installFramedStdin(
   decoder: NativeInputDecoder,
   framed: AsyncLocalStorage<FramedInputScope>,
   currentTuple: () => SessionTuple | undefined,
-): void {
+  maxViewerPayloadBytes: number,
+): FramedStdinHandle {
   let poisoned = false;
   // The open dispatch survives chunk boundaries: its captured tuple/origin and
   // its string decoder are per LOGICAL DISPATCH, never per chunk or feed.
@@ -472,21 +552,34 @@ function installFramedStdin(
     readonly expected: NativeInputExpectedTuple | undefined;
     suppressed: boolean;
   } | undefined;
+  const pending = new PendingViewerDispatch();
   stdin.emit = function (event: string | symbol, ...args: unknown[]): boolean {
     if (event !== "data") {
-      // End of input with a partial frame or dispatch is a truncation, not a raw fallback.
-      if (event === "end" && !poisoned && !decoder.finish().ok) poisoned = true;
+      // End of input releases the owned bytes immediately and, with a partial frame
+      // or dispatch, is a truncation rather than a raw fallback.
+      if (event === "end") {
+        open = undefined;
+        pending.clear();
+        if (!poisoned && !decoder.finish().ok) poisoned = true;
+      }
       return emit.call(this, event, ...args);
     }
     if (poisoned) return true;
     const encoding = (stdin as unknown as { readonly readableEncoding?: string | null }).readableEncoding ?? null;
-    if (encoding !== null && textDecoder(encoding) === undefined) { poisoned = true; open = undefined; return true; }
+    if (encoding !== null && textDecoder(encoding) === undefined) {
+      poisoned = true;
+      open = undefined;
+      pending.clear();
+      return true;
+    }
     const fed = decoder.feed(args[0] as Buffer | string);
     let consumed = fed.fragments.length === 0; // Framing bytes accepted, nothing to deliver yet.
     for (const fragment of fed.fragments) {
       if (fragment.start) {
         const tuple = currentTuple();
         const expected = fragment.expectedNativeTuple;
+        // A new logical dispatch never inherits an earlier dispatch's owned bytes.
+        pending.clear();
         open = {
           scope: Object.freeze({
             tuple: tuple ? Object.freeze({ ...tuple }) : undefined,
@@ -502,7 +595,63 @@ function installFramedStdin(
         };
       }
       const active = open;
-      if (active === undefined) { poisoned = true; return true; } // Unreachable: part 0 always opens.
+      if (active === undefined) {
+        // Unreachable: part 0 always opens.
+        poisoned = true;
+        pending.clear();
+        return true;
+      }
+      if (active.expected !== undefined) {
+        // VIEWER: assemble one whole logical dispatch and emit it once at its end.
+        if (!active.suppressed && !tupleStillExpected(active.expected, currentTuple())) {
+          // A session change seen at any fragment: the rest of this dispatch belongs
+          // to no conversation. Consume it, deliver none of it, never re-tag.
+          active.suppressed = true;
+        }
+        if (active.suppressed) {
+          pending.clear(); // Release the owned bytes now, not at the dispatch end.
+          consumed = true; // Authenticated framing bytes are consumed, not passed on.
+          if (fragment.end) open = undefined;
+          continue;
+        }
+        if (!pending.append(fragment.payload, maxViewerPayloadBytes)) {
+          // Over the technical bound (or out of memory): this whole dispatch is an
+          // ordinary refusal. No truncation, no partial emit, no raw fallback, and
+          // the next valid dispatch is unaffected.
+          active.suppressed = true;
+          pending.clear();
+          consumed = true;
+          if (fragment.end) open = undefined;
+          continue;
+        }
+        if (!fragment.end) {
+          consumed = true; // Held, never emitted: a native listener sees no prefix.
+          continue;
+        }
+        // Final fragment: release the owned bytes BEFORE the one emit, then recheck
+        // the exact captured fence immediately before delivery.
+        const assembled = pending.take();
+        const stillCurrent = tupleStillExpected(active.expected, currentTuple());
+        open = undefined;
+        if (!stillCurrent) {
+          consumed = true; // The conversation moved on: nothing of this dispatch is delivered.
+          continue;
+        }
+        if (assembled === undefined) {
+          consumed = true;
+          continue;
+        }
+        const chunk: Buffer | string = active.text === undefined
+          ? assembled
+          : `${active.text.write(assembled)}${active.text.end()}`;
+        if (chunk.length > 0) {
+          consumed = framed.run(active.scope, () => emit.call(this, "data", chunk, ...args.slice(1))) || consumed;
+        } else {
+          consumed = true;
+        }
+        continue;
+      }
+      // LOCAL / NONE: the unchanged per-fragment streaming contract.
       if (!active.suppressed && !tupleStillExpected(active.expected, currentTuple())) {
         // A session change inside an earlier listener: the rest of this dispatch
         // belongs to no conversation. Consume it, deliver none of it, never re-tag.
@@ -531,13 +680,30 @@ function installFramedStdin(
       if (fragment.end) open = undefined;
     }
     if (!fed.ok) {
-      // Everything authenticated before the failing byte has already been
-      // delivered above; from here on nothing is. Poison immediately.
+      // Everything authenticated before the failing byte has already been delivered
+      // above (local/none only: a viewer fragment is never delivered early); from
+      // here on nothing is. Poison immediately and release the owned bytes.
       poisoned = true;
       open = undefined;
+      pending.clear();
       return true;
     }
     return consumed;
+  };
+  return {
+    onTupleChange: () => {
+      const active = open;
+      // Only a pending VIEWER dispatch carries the conversation fence; `local` and
+      // `none` keep their unchanged per-fragment streaming.
+      if (active === undefined || active.expected === undefined) return;
+      // A republished identical tuple is not a change: the dispatch stays intact.
+      if (tupleStillExpected(active.expected, currentTuple())) return;
+      // Release the owned bytes now even when no further stdin ever arrives, and
+      // latch the refusal for the rest of this dispatch, so returning to the earlier
+      // tuple (A -> B -> A) can never revive buffered bytes from A.
+      active.suppressed = true;
+      pending.clear();
+    },
   };
 }
 
@@ -556,20 +722,29 @@ export function installNativeClipboardBridge(
   const runtime = resolveNativeClipboardRuntime(process.argv[1] ?? "");
   if (!runtime) return false;
   let inputDecoder: NativeInputDecoder | undefined;
+  let viewerPayloadBound = 0;
   if (framing) {
     try {
       // The inert input codec is loaded only when the opt-in mode is requested,
       // so the default bridge keeps its exact module graph and behavior.
       const codec = require("./native-input-origin") as typeof import("./native-input-origin");
       inputDecoder = codec.createNativeInputDecoder(bootstrap);
+      // Same exported technical assembly bound the host admits a viewer dispatch
+      // against; read from the lazily loaded codec so the default graph is unchanged.
+      viewerPayloadBound = codec.NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES;
     } catch { return false; }
   }
   const scope = new AsyncLocalStorage<SessionTuple>();
   const framed = new AsyncLocalStorage<FramedInputScope>();
   let current: SessionTuple | undefined;
+  let framedInput: FramedStdinHandle | undefined;
   let sequence = 0;
   const state: BridgeState = Object.freeze({ version: 1, setSession: (tuple: SessionTuple | undefined) => {
     current = tuple && validTuple(tuple) ? { sessionId: tuple.sessionId, sessionEpoch: tuple.sessionEpoch } : undefined;
+    // A published conversation change reaches the strict bridge immediately, so a
+    // pending viewer dispatch releases its owned bytes and stays refused even if no
+    // further stdin ever arrives. The legacy bridge installs no such handle.
+    framedInput?.onTupleChange();
   } });
   Object.defineProperty(globalThis, BRIDGE_STATE, { value: state });
   const stdin = process.stdin;
@@ -581,7 +756,7 @@ export function installNativeClipboardBridge(
       return scope.run(snapshot, () => emit.call(this, event, ...args));
     };
   } else {
-    installFramedStdin(stdin, emit, inputDecoder!, framed, () => current);
+    framedInput = installFramedStdin(stdin, emit, inputDecoder!, framed, () => current, viewerPayloadBound);
   }
   const stdout = process.stdout;
   const write = stdout.write as (...args: unknown[]) => boolean;

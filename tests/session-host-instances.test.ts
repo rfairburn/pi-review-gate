@@ -46,6 +46,8 @@ import {
 import { SESSION_HOST_BOOTSTRAP_ENV, composeFreshSessionSpawnArgs, prepareNativeLaunch } from "../src/session-host/launch";
 import {
   createNativeInputDecoder,
+  NATIVE_INPUT_RAW_FRAGMENT_BYTES,
+  NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES,
   type NativeInputDecoder,
   type NativeInputFragment,
   type NativeInputOrigin,
@@ -4957,6 +4959,84 @@ test("a conversation identity outside ASCII is still a viewer input source and s
       scopes.push(source.sourceToken);
     }
     assert.notEqual(scopes[0], scopes[1], "each conversation identity commits to its own scope");
+    assert.equal(viewFor(harness.manager, row.id).lifecycle, "alive");
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a viewer dispatch is admitted only up to the child's whole-dispatch assembly bound", async () => {
+  const harness = makeFramingHarness("viewer-payload-bound", { framing: true });
+  try {
+    const row = await createFramingRow(harness);
+    await markReady(harness, row);
+    reportConversation(row, VIEWER_SESSION, 1);
+    const bound = boundSurface(harness.manager);
+    displayRow(harness.manager, bound.viewerId, row.id);
+    const source = harness.manager.readViewerInputSource(bound.viewerId);
+    assert.ok(source);
+    const modes = harness.manager.surface(row.id)!.inputModes();
+    const send = (data: string | Buffer): { status: string; reason?: string } => harness.manager.writeViewerInput(
+      bound.viewerId, { expectedSource: source, expectedInputModes: modes, data },
+    );
+
+    // The exact technical bound is admitted, and high-bit native bytes are never
+    // re-encoded: the bound is counted in raw bytes, not characters or base64.
+    const exactBytes = Buffer.alloc(NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES, 0xa9);
+    assert.deepEqual(send(exactBytes), { status: "submitted" });
+    let admitted = row.pty.writes.length;
+    assert.equal(admitted, 1, "the exact-bound dispatch is the only write this child has taken");
+    const byteFragments = readViewerFrames(row);
+    assert.ok(byteFragments.length > 1, "the bounded payload still travels as several transport fragments");
+    assert.ok(byteFragments.every((fragment) => fragment.payload.length <= NATIVE_INPUT_RAW_FRAGMENT_BYTES),
+      "the unchanged per-fragment transport bound still applies to the framed wire body");
+    assert.equal(Buffer.concat(byteFragments.map((fragment) => fragment.payload)).equals(exactBytes), true,
+      "the exact bound arrives byte-exact");
+    assert.deepEqual(byteFragments[0]!.origin, { kind: "viewer", token: source.sourceToken });
+    assert.deepEqual(byteFragments[0]!.expectedNativeTuple, { sessionId: VIEWER_SESSION, epoch: 1 });
+
+    // One byte over is refused before the PTY: no truncation, no prefix, no error.
+    assert.deepEqual(send(Buffer.alloc(NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES + 1)), {
+      status: "refused", reason: "invalid-input",
+    }, "one byte over the technical bound is refused before the child");
+    assert.equal(row.pty.writes.length, admitted, "an over-bound dispatch never reached the child");
+
+    // The same bound applies to a string in UTF-8 BYTES: this one is half the bound
+    // in characters but exactly the bound in bytes, so it is admitted.
+    const exactText = "\u00e9".repeat(NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES / 2);
+    assert.equal(Buffer.byteLength(exactText, "utf8"), NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES);
+    assert.deepEqual(send(exactText), { status: "submitted" });
+    admitted = row.pty.writes.length;
+    assert.equal(admitted, 2, "the byte-exact string dispatch is admitted");
+    const textFragments = readViewerFrames(row);
+    assert.equal(Buffer.concat(textFragments.map((fragment) => fragment.payload)).toString("utf8"), exactText,
+      "the string travels exactly, with no character-length shortcut");
+
+    // Fewer characters than the bound but more UTF-8 bytes is over the bound.
+    const overText = "\u96ea".repeat(Math.ceil((NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES + 3) / 3));
+    assert.ok(overText.length < NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES,
+      "the refusal is about UTF-8 bytes, not JavaScript string length");
+    assert.ok(Buffer.byteLength(overText, "utf8") > NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES);
+    assert.deepEqual(send(overText), { status: "refused", reason: "invalid-input" },
+      "a multi-byte string over the byte bound is refused before the child");
+    assert.equal(row.pty.writes.length, admitted, "no over-bound string reached the child");
+
+    // A refusal is not sticky: a normal dispatch on the same row still works.
+    assert.deepEqual(send("still works\r"), { status: "submitted" });
+    assert.equal(row.pty.writes.length, admitted + 1, "the next admitted dispatch is written normally");
+    assert.equal(lastViewerFrame(row).text, "still works\r");
+
+    // Local user input keeps its unchanged, uncapped behavior: the bound is a
+    // viewer-dispatch admission fact, not a paste policy for local writes.
+    const localPayload = "L".repeat(NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES + 1);
+    harness.manager.write(row.id, localPayload);
+    assert.equal(row.pty.writes.length, admitted + 2, "local input past the viewer bound is still written");
+    const localFragments = readViewerFrames(row);
+    assert.equal(Buffer.concat(localFragments.map((fragment) => fragment.payload)).toString("utf8"), localPayload,
+      "local input beyond the viewer assembly bound travels unchanged");
+    assert.deepEqual(localFragments[0]!.origin, { kind: "local" });
+
     assert.equal(viewFor(harness.manager, row.id).lifecycle, "alive");
     await disposeFramingHarness(harness);
   } finally {

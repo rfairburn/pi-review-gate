@@ -56,6 +56,17 @@ const helperModule = require(helperPath) as {
   selectReviewGateConfig: (candidates: string[]) => { status: number; path?: string };
 };
 
+/**
+ * The shared preparation authority the helper itself requires. Only its
+ * `applicationStateRoot` is used: the coordination diagnostic must scope itself
+ * to the exact synthetic state directory the product resolves, so the scope can
+ * never drift from the launcher's own layout. Requiring it reuses the module
+ * instance the helper already loaded.
+ */
+const prepareModule = require(resolve("scripts/prepare-application.cjs")) as {
+  applicationStateRoot: (agentDir: string) => string;
+};
+
 interface SimulatedWindowsSpawnCase {
   args: string[];
   env: NodeJS.ProcessEnv;
@@ -1346,19 +1357,144 @@ test("skill publication rename probes the real destination for the directory fai
   }
 });
 
-test("concurrent first launches never clobber or expose partial JSON", async () => {
+// ---------------------------------------------------------------------------
+// Coordination diagnostics for the concurrent first-launch race.
+//
+// The eight-racer test below is the one place launch coordination contention is
+// reproducible, and its busy-path message alone says nothing about which branch
+// produced it. A test-only observational preload
+// (tests/fixtures/launcher-coordination-diagnostic.cjs) is appended to the
+// racers' inherited NODE_OPTIONS. It keeps bounded fixed-code evidence about the
+// fixture's own synthetic application state directory and the native PowerShell
+// owner-birth probe, and it changes nothing the launcher observes. The evidence
+// is printed as `t.diagnostic` records BEFORE the first status assertion so a
+// failing racer's log keeps every racer's report. These records are evidence
+// about a failure, never a pass/fail signal; a missing or unusable report is
+// reported as `unknown`.
+//
+// Evidence limits, stated honestly: the aggregate counters discriminate what was
+// OBSERVED — a non-EEXIST filesystem refusal, an unexpected state-root kind, or
+// repeated canonical-entry contention whose owner-record probes consumed the
+// bounded wait — plus whether the exact initial-selection busy message was
+// written (the later publication-busy message is not classified). They are not
+// proof of the branch the product finally returned, and this test neither
+// claims a root cause nor treats a green diagnostic run as resolving the race.
+// ---------------------------------------------------------------------------
+
+const coordinationDiagnosticPreload = resolve("tests/fixtures/launcher-coordination-diagnostic.cjs");
+const coordinationDiagnosticDirEnv = "PRG_LAUNCHER_COORDINATION_DIAGNOSTIC_DIR";
+const coordinationDiagnosticStateRootEnv = "PRG_LAUNCHER_COORDINATION_DIAGNOSTIC_STATE_ROOT";
+const coordinationDiagnosticSchema = "prg-launcher-coordination-diagnostic/1";
+const coordinationDiagnosticMaxReportBytes = 8192;
+const coordinationDiagnosticMaxReports = 4;
+const coordinationBusyMessage = "application state coordination is busy right now";
+
+/**
+ * Append the diagnostic preload to a racer's environment without disturbing an
+ * inherited NODE_OPTIONS (the same portable encoding the spawn recorder uses).
+ */
+function coordinationDiagnosticEnv(
+  env: NodeJS.ProcessEnv,
+  diagnosticDir: string,
+  stateRoot: string,
+): NodeJS.ProcessEnv {
+  const inherited = env.NODE_OPTIONS === undefined || env.NODE_OPTIONS.length === 0 ? "" : `${env.NODE_OPTIONS} `;
+  return {
+    ...env,
+    NODE_OPTIONS: `${inherited}${nodeOptionsPreload(coordinationDiagnosticPreload)}`,
+    [coordinationDiagnosticDirEnv]: diagnosticDir,
+    [coordinationDiagnosticStateRootEnv]: stateRoot,
+  };
+}
+
+/**
+ * Read one racer's bounded reports as a compact fixed-shape summary. A missing,
+ * corrupt, oversized, or unexpected report is summarized as `unknown` with a
+ * fixed reason code and is never summarized as success. Passing racers keep only
+ * their aggregate counters; a racer that did not exit 0 keeps its bounded event
+ * tail (and birth-probe samples) as the evidence for that failure.
+ */
+async function readCoordinationDiagnostics(directory: string, includeEvents: boolean): Promise<string> {
+  let names: string[];
+  try {
+    names = (await readdir(directory)).filter((name) => /^report-[0-9]{1,10}\.json$/u.test(name)).sort();
+  } catch {
+    return "unknown(no-report-directory)";
+  }
+  if (names.length === 0) return "unknown(no-report-written)";
+  const summaries: string[] = [];
+  for (const name of names.slice(0, coordinationDiagnosticMaxReports)) {
+    try {
+      const file = join(directory, name);
+      const info = await lstat(file);
+      if (!info.isFile()) {
+        summaries.push("unknown(not-a-regular-file)");
+        continue;
+      }
+      if (info.size > coordinationDiagnosticMaxReportBytes) {
+        summaries.push("unknown(report-too-large)");
+        continue;
+      }
+      const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
+      if (
+        parsed === null
+        || typeof parsed !== "object"
+        || (parsed as { schema?: unknown }).schema !== coordinationDiagnosticSchema
+      ) {
+        summaries.push("unknown(unexpected-schema)");
+        continue;
+      }
+      const report = parsed as Record<string, unknown>;
+      const reportedEvents = report.events;
+      if (!includeEvents && Array.isArray(reportedEvents)) {
+        summaries.push(JSON.stringify({ ...report, events: [], omittedEvents: reportedEvents.length }));
+        continue;
+      }
+      summaries.push(JSON.stringify(report));
+    } catch {
+      summaries.push("unknown(corrupt-report)");
+    }
+  }
+  const extra = names.length > coordinationDiagnosticMaxReports
+    ? `;unknown(${names.length - coordinationDiagnosticMaxReports}-more-reports)`
+    : "";
+  return `${summaries.join(";")}${extra}`;
+}
+
+test("concurrent first launches never clobber or expose partial JSON", async (t) => {
   const fixture = await makeFixture("pi-review-cmd-race-");
+  const diagnosticRoot = join(fixture.root, "coordination-diagnostics");
+  const stateRoot = prepareModule.applicationStateRoot(fixture.agentDir);
   const racers = await Promise.all(
     Array.from({ length: 8 }, async (_value, index) => {
       const capture = join(fixture.root, `capture-${index + 1}`);
       await mkdir(capture, { recursive: true });
+      const diagnosticDir = join(diagnosticRoot, `racer-${index + 1}`);
+      await mkdir(diagnosticDir, { recursive: true });
       const env = fixtureEnv(fixture);
       env.CAPTURE_DIR = capture;
       env.CAPTURE_FILE = join(capture, "pi.json");
-      const outcome = await runHelperExpectingFailure([], env);
-      return { outcome };
+      const outcome = await runHelperExpectingFailure(
+        [],
+        coordinationDiagnosticEnv(env, diagnosticDir, stateRoot),
+      );
+      return { outcome, diagnosticDir };
     }),
   );
+
+  // Diagnostic-only evidence, emitted before the first status assertion so a
+  // failing racer's CI log keeps all eight bounded reports. No assertion below
+  // is added, relaxed, or reordered for these records.
+  const diagnostics = await Promise.all(
+    racers.map((racer) => readCoordinationDiagnostics(racer.diagnosticDir, racer.outcome.status !== 0)),
+  );
+  racers.forEach((racer, index) => {
+    t.diagnostic(
+      `coordination racer ${index + 1}: status=${racer.outcome.status} `
+      + `busyMessage=${racer.outcome.stderr.includes(coordinationBusyMessage)} `
+      + `diagnostic=${diagnostics[index]}`,
+    );
+  });
 
   for (const { outcome } of racers) {
     assert.equal(outcome.status, 0, `a racer failed: ${outcome.stderr}`);
@@ -1387,6 +1523,219 @@ test("concurrent first launches never clobber or expose partial JSON", async () 
     await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
   );
   await assertNoTempLitter(skillDir);
+});
+
+/**
+ * The fixed, bounded schema the coordination diagnostic preload writes. Every
+ * field is a number, a boolean, a null, or a fixed code; there are no free-form
+ * strings, and no path, argument, token, lock body, or environment value.
+ */
+interface CoordinationDiagnosticReport {
+  schema: string;
+  pid: number;
+  nodeVersion: string;
+  platform: string;
+  entry: "launcher-helper" | "descendant" | "unknown-entry";
+  stateRoot: {
+    kind: string;
+    errno: string | null;
+    firstKind: string;
+    firstErrno: string | null;
+    lstatAttempts: number;
+  };
+  ops: Record<"lstat" | "open" | "link" | "write" | "fsync" | "unlink" | "close", number>;
+  errno: Array<{ op: string; code: string; count: number }>;
+  errnoOverflow: number;
+  scopedOps: number;
+  cleanupLock: {
+    attempts: number;
+    acquired: number;
+    eexist: number;
+    ownerRecordReads: number;
+    released: number;
+    reclaimUnlinks: number;
+    holdMsTotal: number;
+    holdMsMax: number;
+    heldAtExit: boolean;
+  };
+  birthProbe: {
+    calls: number;
+    self: number;
+    foreign: number;
+    ok: number;
+    failed: number;
+    timedOut: number;
+    totalMs: number;
+    maxMs: number;
+    lastErrno: string | null;
+    lastSignal: string | null;
+    probes: Array<{ atMs: number; ms: number; self: boolean; code: string | null }>;
+  };
+  events: Array<{ op: string; target: string; code: string | null; atMs: number; ms: number }>;
+  truncated: boolean;
+  droppedEvents: number;
+  unknown: string[];
+}
+
+const coordinationDiagnosticEventOps = ["lstat", "open", "link", "write", "fsync", "unlink", "close"];
+const coordinationDiagnosticEventTargets = ["state-root", "cleanup-lock", "lock-candidate", "state-other"];
+
+/** A driver that exercises the exact wrapped calls without the launcher. */
+const coordinationDiagnosticDriver = [
+  '"use strict";',
+  'const fs = require("node:fs");',
+  'const path = require("node:path");',
+  'const stateRoot = process.env.PRG_DIAGNOSTIC_CONTRACT_ROOT;',
+  'const fingerprint = [];',
+  'const record = (op, run) => {',
+  '  try {',
+  '    const value = run();',
+  '    fingerprint.push({ op, ok: true, kind: value === undefined ? "undefined" : typeof value });',
+  '  } catch (error) {',
+  '    fingerprint.push({',
+  '      op,',
+  '      ok: false,',
+  '      name: error && error.name,',
+  '      code: (error && error.code) ?? null,',
+  '      syscall: (error && error.syscall) ?? null,',
+  '      keepsPath: typeof (error && error.path) === "string",',
+  '    });',
+  '  }',
+  '};',
+  'const nested = path.join(stateRoot, "nested");',
+  'const missing = path.join(stateRoot, "missing.json");',
+  'const candidate = path.join(stateRoot, ".cleanup.lock.1234.abcdef");',
+  'const lockFile = path.join(stateRoot, "cleanup.lock");',
+  'const outside = path.join(path.dirname(stateRoot), "outside", "unscoped.txt");',
+  'record("mkdir", () => fs.mkdirSync(nested, { recursive: true }));',
+  'record("mkdir-outside", () => fs.mkdirSync(path.dirname(outside), { recursive: true }));',
+  'record("lstat-directory", () => fs.lstatSync(nested, { bigint: true }).isDirectory());',
+  'record("lstat-missing", () => fs.lstatSync(missing, { bigint: true }).isFile());',
+  'record("open-candidate", () => {',
+  '  const fd = fs.openSync(candidate, "wx", 0o600);',
+  '  fs.writeFileSync(fd, "observation-body\\n");',
+  '  fs.fsyncSync(fd);',
+  '  fs.closeSync(fd);',
+  '  return fd;',
+  '});',
+  'record("link", () => { fs.linkSync(candidate, lockFile); });',
+  'record("link-again", () => { fs.linkSync(candidate, lockFile); });',
+  'record("open-missing", () => fs.openSync(path.join(stateRoot, "absent.lock"), "r"));',
+  'record("unlink-candidate", () => { fs.unlinkSync(candidate); });',
+  'record("unlink-lock", () => { fs.unlinkSync(lockFile); });',
+  'record("lstat-outside", () => { fs.writeFileSync(outside, "unscoped\\n"); return fs.lstatSync(outside).isFile(); });',
+  'fs.writeFileSync(process.env.PRG_DIAGNOSTIC_CONTRACT_OUTPUT, JSON.stringify(fingerprint));',
+  "",
+].join("\n");
+
+/**
+ * The observational preload is only acceptable if it is exactly that. This
+ * contract test runs the same driver twice — once with the preload and once
+ * without — and requires identical observable behavior (return shapes plus each
+ * thrown error's name, errno, syscall, and `path` presence), then validates that
+ * the report is bounded and made only of fixed fields.
+ *
+ * The honest limit: this proves observable equivalence against the unwrapped
+ * implementation. It cannot distinguish a wrapper that rethrew a lookalike error
+ * object carrying identical fields, which is why the fixture returns and rethrows
+ * the original call's value/error directly instead of reconstructing them.
+ */
+test("coordination diagnostic preload observes without changing filesystem behavior", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "pi-review-cmd-diagnostic-contract-"));
+  try {
+    const diagnosticDir = join(scratch, "diagnostic");
+    await mkdir(diagnosticDir, { recursive: true });
+
+    const runDriver = async (withPreload: boolean) => {
+      const runRoot = join(scratch, withPreload ? "instrumented" : "control");
+      const stateRoot = join(runRoot, "application");
+      await mkdir(stateRoot, { recursive: true });
+      const output = join(runRoot, "fingerprint.json");
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        PRG_DIAGNOSTIC_CONTRACT_ROOT: stateRoot,
+        PRG_DIAGNOSTIC_CONTRACT_OUTPUT: output,
+      };
+      delete env.NODE_OPTIONS;
+      if (withPreload) {
+        env.NODE_OPTIONS = nodeOptionsPreload(coordinationDiagnosticPreload);
+        env[coordinationDiagnosticDirEnv] = diagnosticDir;
+        env[coordinationDiagnosticStateRootEnv] = stateRoot;
+      }
+      const result = spawnSync(process.execPath, ["-e", coordinationDiagnosticDriver], { env, encoding: "utf8" });
+      assert.equal(result.status, 0, `diagnostic contract driver failed: ${result.stderr}`);
+      return JSON.parse(await readFile(output, "utf8")) as unknown;
+    };
+
+    const control = await runDriver(false);
+    const instrumented = await runDriver(true);
+    assert.deepEqual(
+      instrumented,
+      control,
+      "the diagnostic wrappers must leave every return value, error identity field, and errno unchanged",
+    );
+
+    const reports = (await readdir(diagnosticDir)).filter((name) => /^report-[0-9]{1,10}\.json$/u.test(name));
+    assert.equal(reports.length, 1, "an instrumented process writes exactly one bounded report");
+    const raw = await readFile(join(diagnosticDir, reports[0]), "utf8");
+    assert.ok(Buffer.byteLength(raw, "utf8") <= coordinationDiagnosticMaxReportBytes,
+      "the report must stay within its bounded size");
+    const report = JSON.parse(raw) as CoordinationDiagnosticReport;
+
+    assert.equal(report.schema, coordinationDiagnosticSchema);
+    assert.ok(Number.isInteger(report.pid) && report.pid > 0);
+    assert.match(report.nodeVersion, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/u);
+    assert.equal(report.platform, process.platform);
+    assert.notEqual(report.entry, "launcher-helper", "a -e driver is not the launcher helper");
+
+    // Scoping is exact: the directory probe and the linked lock record are
+    // observed; the sibling unscoped file is not.
+    assert.deepEqual(report.ops, { lstat: 2, open: 2, link: 2, write: 1, fsync: 1, unlink: 1, close: 0 });
+    assert.deepEqual(report.errno, [
+      { op: "lstat", code: "ENOENT", count: 1 },
+      { op: "link", code: "EEXIST", count: 1 },
+      { op: "open", code: "ENOENT", count: 1 },
+    ]);
+    assert.equal(report.errnoOverflow, 0);
+    assert.equal(report.scopedOps, 9);
+
+    // The state root itself was never probed by this driver, and the preload
+    // says so instead of inventing a kind.
+    assert.deepEqual(report.stateRoot, {
+      kind: "not-observed",
+      errno: null,
+      firstKind: "not-observed",
+      firstErrno: null,
+      lstatAttempts: 0,
+    });
+    assert.equal(report.cleanupLock.attempts, 2);
+    assert.equal(report.cleanupLock.acquired, 1);
+    assert.equal(report.cleanupLock.eexist, 1);
+    assert.equal(report.cleanupLock.released, 1);
+    assert.equal(report.cleanupLock.reclaimUnlinks, 0);
+    assert.equal(report.cleanupLock.heldAtExit, false);
+    assert.ok(Number.isInteger(report.cleanupLock.holdMsTotal) && report.cleanupLock.holdMsTotal >= 0);
+    assert.equal(report.birthProbe.calls, 0, "no PowerShell birth probe runs outside native Windows");
+    assert.deepEqual(report.birthProbe.probes, []);
+
+    assert.equal(report.truncated, false);
+    assert.equal(report.droppedEvents, 0);
+    assert.deepEqual(report.unknown, []);
+    assert.ok(report.events.length <= 32, "the event tail must stay bounded");
+    assert.equal(report.events.length, 9);
+    for (const event of report.events) {
+      assert.ok(coordinationDiagnosticEventOps.includes(event.op), `fixed op code: ${String(event.op)}`);
+      assert.ok(coordinationDiagnosticEventTargets.includes(event.target), `fixed target code: ${String(event.target)}`);
+      assert.ok(
+        event.code === null || (typeof event.code === "string" && /^[A-Z][A-Z0-9_]{0,15}$/u.test(event.code)),
+        `bounded safe errno code: ${String(event.code)}`,
+      );
+      assert.ok(Number.isInteger(event.atMs) && event.atMs >= 0);
+      assert.ok(Number.isInteger(event.ms) && event.ms >= 0);
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

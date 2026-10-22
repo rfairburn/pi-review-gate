@@ -194,7 +194,7 @@ function rowOf(texts: readonly string[], needle: string): number {
   return row;
 }
 
-/** The drawn title line plus the highlighted line of the focused entry. */
+/** The drawn title line, host line (remote only), and the highlighted line. */
 function highlightedCardIn(texts: readonly string[]): string {
   const markerRow = texts.findIndex((line) => line.startsWith("> "));
   if (markerRow < 0) return "";
@@ -203,8 +203,15 @@ function highlightedCardIn(texts: readonly string[]): string {
   // sits on the status row. The preceding action is never the selected title.
   if (["Saved conversations", "New session", "Network", "Quit host", "Host shortcuts"]
     .some((caption) => marker.slice(2).trim() === caption)) return marker;
-  const titleRow = markerRow > 0 ? texts[markerRow - 1] ?? "" : "";
-  return `${titleRow}\n${marker}`;
+  // A remote card inserts one ordinary indented host line directly under its
+  // title; the marker stays on the status line exactly like a local card.
+  const hostRow = markerRow > 0 && (texts[markerRow - 1] ?? "").startsWith("  host ")
+    ? markerRow - 1
+    : -1;
+  const titleRow = hostRow >= 1
+    ? texts[hostRow - 1] ?? ""
+    : markerRow > 0 ? texts[markerRow - 1] ?? "" : "";
+  return hostRow >= 1 ? `${titleRow}\n${texts[hostRow]}\n${marker}` : `${titleRow}\n${marker}`;
 }
 
 function highlightedEntryText(harness: Harness): string {
@@ -277,7 +284,8 @@ test("the left roster projects remote cards alongside locals with honest facts a
   assert.ok(!joined.includes("agent idle"));
   assert.ok(!joined.includes("bg tasks 0"));
   assert.ok(!joined.includes("/agents/"), "no private owner fields are projected");
-  assert.ok(joined.includes("/owner/work/build"), "the exact owner workspace is display-only data");
+  assert.equal(joined.includes("/owner/work/build"), false,
+    "the LEFT card no longer draws the owner workspace path");
   assert.ok(joined.includes("activity-remote"), "generic activity is shown when expanded");
   assert.ok(joined.includes("exited (code 1)"), "a known exit code is shown honestly");
 
@@ -292,8 +300,8 @@ test("the left roster projects remote cards alongside locals with honest facts a
   assert.deepEqual(commandsSince(harness, baseline), [], "projection emits nothing");
 });
 
-test("a stale card keeps its honest marker visible ahead of a long owner label", () => {
-  const longLabel = "studio-owner-".padEnd(80, "x");
+test("a stale card keeps its honest marker visible ahead of a long unicode owner label", () => {
+  const longLabel = `studio-${"界".repeat(40)}\x1b[31m`;
   const harness = makeHarness();
   harness.controller.updateItems([makeItem({ id: "a" })]);
   harness.controller.setPeerUiSnapshot(makeSnapshot({
@@ -308,10 +316,138 @@ test("a stale card keeps its honest marker visible ahead of a long owner label",
   const texts = rosterText(harness, 32, 30);
   const staleLine = texts.find((line) => line.includes("[stale]"));
   assert.ok(staleLine !== undefined, "the stale marker survives narrow clipping");
-  assert.ok(staleLine.trimStart().startsWith("[stale]"),
-    "the marker leads the variable-length owner label so truncation cannot hide it");
+  assert.ok(staleLine.trimStart().startsWith("host [stale]"),
+    "the host line leads with the honest marker, ahead of the variable-length label");
   assert.ok(!texts.join("\n").includes(longLabel),
     "the long label is clipped rather than widening the card");
+  assert.ok(!texts.join("\n").includes("界".repeat(40)),
+    "the clipped wide unicode label never exceeds the 32-column card");
+  assert.ok(!texts.join("\n").includes("\x1b"),
+    "unsafe control/escape bytes are stripped before the host line is drawn");
+});
+
+test("a 32-column remote card is the local card plus exactly one clipped host line", () => {
+  const title = "Fake Session Title";
+  const hostLabel = "studio-workstation";
+  const local = makeItem({
+    id: "local-match",
+    label: title,
+    workspace: "/local/ws/local-match",
+    busy: false,
+    pendingInput: false,
+    inputSurface: false,
+    activeTasks: 0,
+    activeShells: 0,
+    activity: ["Ready"],
+  });
+  const remote = makeRemoteRow({
+    id: "remote-match",
+    label: title,
+    workspace: "/owner/private/workspace",
+    busy: false,
+    pendingInput: false,
+    inputSurface: false,
+    activeTasks: 0,
+    activeShells: 0,
+    activity: ["Ready"],
+  });
+  const harness = makeHarness();
+  harness.controller.updateItems([local]);
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    hosts: [makeHost({ id: "h1", label: hostLabel, rows: [remote] })],
+  }));
+  show(harness);
+
+  let written = wideRoster(harness, 32, 30);
+  const hostRow = written.text.findIndex((line) => line.includes(`host ${hostLabel}`));
+  assert.ok(hostRow > 0, "the host line is drawn under the remote title");
+  const localTop = written.text.findIndex((line) => line.includes(title));
+  assert.ok(localTop >= 0 && localTop < hostRow, "the local card is drawn first at this geometry");
+  const remoteTop = hostRow - 1;
+  const trim = (rows: readonly string[]): string[] => rows.map((line) => line.trimEnd());
+  const localText = trim(written.text.slice(localTop, localTop + 5));
+  const remoteText = trim(written.text.slice(remoteTop, remoteTop + 6));
+
+  assert.deepEqual(localText, [
+    title,
+    "  agent idle | input none",
+    "  bg tasks 0 | shells 0",
+    "    Ready",
+    "",
+  ], "the local card keeps its exact 3/5-row grammar");
+  assert.deepEqual(remoteText, [
+    title,
+    `  host ${hostLabel}`,
+    "  agent idle | input none",
+    "  bg tasks 0 | shells 0",
+    "    Ready",
+    "",
+  ], "the remote card is the local card plus one indented host line");
+  assert.deepEqual(written.raw.slice(remoteTop, remoteTop + 1), written.raw.slice(localTop, localTop + 1),
+    "the title row is byte-for-byte the local title row, including its SGR");
+  assert.deepEqual(written.raw.slice(remoteTop + 2, remoteTop + 6), written.raw.slice(localTop + 1, localTop + 5),
+    "status, background, and activity rows reuse the local rows unchanged");
+  assert.equal(written.text.join("\n").includes("/owner/private/workspace"), false,
+    "no workspace or path line is drawn anywhere on the LEFT card");
+
+  // Keyboard selection keeps the marker on the status line, exactly like local.
+  for (let step = 0; step < 6; step += 1) {
+    written = wideRoster(harness, 32, 30);
+    if (highlightedCardIn(written.text).includes(`host ${hostLabel}`)) break;
+    harness.send(DOWN);
+  }
+  written = wideRoster(harness, 32, 30);
+  assert.ok(highlightedCardIn(written.text).includes(title),
+    "the highlighted remote card is identified by its title above the host line");
+  const selectedHostRow = written.text.findIndex((line) => line.includes(`host ${hostLabel}`));
+  assert.ok(selectedHostRow > 0);
+  assert.equal(written.text[selectedHostRow]?.trimEnd(), `  host ${hostLabel}`,
+    "the host line itself is ordinary and indented, never the selection marker");
+  assert.equal(written.text[selectedHostRow + 1]?.trimEnd(), "> agent idle | input none",
+    "the one selection marker stays on the status line like a local card");
+
+  let captured = harness.controller.captureMousePresentation();
+  assert.ok(captured.remoteClose, "the complete expanded remote card is captured");
+  assert.equal(captured.remoteClose.height, 6, "the expanded remote card is fixed at six rows");
+  assert.equal(captured.remoteClose.row, selectedHostRow - 1,
+    "the captured target begins at the card title row");
+  assert.equal(captured.remoteClose.hostLabel, hostLabel);
+
+  // Collapse hides ONLY the activity rows and updates every derived height.
+  harness.send(SPACE);
+  written = wideRoster(harness, 32, 30);
+  const collapsedHostRow = written.text.findIndex((line) => line.includes(`host ${hostLabel}`));
+  assert.ok(collapsedHostRow > 0);
+  assert.deepEqual(trim(written.text.slice(collapsedHostRow - 1, collapsedHostRow + 3)), [
+    title,
+    `  host ${hostLabel}`,
+    "> agent idle | input none",
+    "  bg tasks 0 | shells 0",
+  ], "the collapsed remote card is the local collapsed card plus the host line");
+  assert.equal(written.text.slice(collapsedHostRow - 1, collapsedHostRow + 3).join("\n").includes("Ready"), false,
+    "collapse hides the remote card's activity rows");
+  assert.equal(harness.controller.captureMousePresentation().remoteClose?.height, 4,
+    "the collapsed remote card is fixed at four rows");
+  assert.equal(captured.activateRosterAt(1, captured.remoteClose!.row + 5, 32, 30), false,
+    "a captured six-row written map refuses after the card collapses");
+
+  harness.send(SPACE);
+  written = wideRoster(harness, 32, 30);
+  const expandedTop = written.text.findIndex((line) => line.includes(`host ${hostLabel}`)) - 1;
+  assert.ok(written.text.slice(expandedTop, expandedTop + 6).join("\n").includes("Ready"),
+    "re-expand restores the remote card's activity rows");
+  const selectedTop = expandedTop;
+  captured = harness.controller.captureMousePresentation();
+  assert.equal(captured.remoteClose?.height, 6);
+  const baseline = harness.actions.length;
+  assert.equal(captured.activateRosterAt(1, selectedTop + 5, 32, 30), true,
+    "the last written activity row is inside the six-row pointer target");
+  assert.deepEqual(commandsSince(harness, baseline), [{
+    type: "select-remote",
+    hostId: "h1",
+    hostRunId: null,
+    rowId: "remote-match",
+  }], "the actual written pointer target selects the remote card once");
 });
 
 test("empty and never-observed rosters add no cards and do not disturb the local roster", () => {
@@ -967,7 +1103,7 @@ test("a deliberate d/Delete names only the completely drawn remote highlight", (
     "the captured target is the minimal owner host/run/row tuple",
   );
   assert.equal(drawn.focus, "sidebar");
-  assert.equal(drawn.height, 5, "the complete expanded card height was drawn");
+  assert.equal(drawn.height, 6, "the complete expanded card height was drawn");
   assert.equal(drawn.cols, 40);
   assert.equal(drawn.rows, 30);
   assert.equal(drawn.idle, true,
@@ -1179,7 +1315,7 @@ test("the written remote close presentation tracks the drawn highlight, row, and
   void rosterText(harness, 40, 30);
   const collapsed = harness.controller.captureMousePresentation().remoteClose;
   assert.ok(collapsed);
-  assert.equal(collapsed.height, 3);
+  assert.equal(collapsed.height, 4);
   assert.notEqual(collapsed.row, undefined);
 
   // A changed observation of the SAME row changes the condensed preflight facts.

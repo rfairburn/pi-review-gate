@@ -196,6 +196,13 @@ dates.
   actually drawn in the written frame authorizes the click, and no keyboard, consent,
   confirmation, or native-input ownership fence changes. See
   [Focus, display, and status](docs/session-host-alpha.md#focus-display-and-status).
+- Remote roster cards in the left sidebar now use the same card layout and facts as local
+  rows, with one indented `host <label>` line directly below the title and no workspace
+  path in the card (#482). An unusually long label is clipped on that one line, and the
+  honest stale marker leads it so clipping cannot hide the observation. The exact
+  owner-side workspace path and other roster metadata, Network details, selection, Enter
+  and drawn-click actions, and activity-only collapse are unchanged. See
+  [Network sidebar](docs/session-host-alpha.md#network-sidebar-hosting-pairing-and-remote-metadata).
 ### Fixed
 
 - The Windows bootstrap test fixture now allows 120 seconds for its cold first

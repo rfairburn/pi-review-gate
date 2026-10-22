@@ -908,6 +908,18 @@ function selectedScreenRow(harness: Harness): string {
 }
 
 /**
+ * The ordinary indented owner-host line directly above the selected roster
+ * marker. Remote cards put their host line under the title and keep the
+ * selection marker on the status line, exactly like a local card.
+ */
+function selectedRosterHostLine(harness: Harness): string {
+  const lines = harness.writer.frames.at(-1)?.frame.lines
+    .map((line) => line.replace(/\x1b\[[0-9;]*m/g, "")) ?? [];
+  const markerRow = lines.findIndex((line) => line.startsWith("> "));
+  return markerRow > 0 ? lines[markerRow - 1] ?? "" : "";
+}
+
+/**
  * Opens the Add-destination field menu in the actual narrow Network pane with
  * real host input only, and waits for the frame that actually wrote it.
  */
@@ -7222,10 +7234,8 @@ function assertWideRemoteStatus(harness: Harness, message: string, description?:
 /** Activates the rendered remote card whose host line is selected, with real input. */
 async function activateRemoteRosterRow(harness: Harness, hostLabel: string): Promise<void> {
   for (let step = 0; step <= 16; step += 1) {
-    const selected = harness.writer.frames.at(-1)?.frame.lines
-      .map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))
-      .find((line) => line.startsWith("> "));
-    if (selected?.includes(hostLabel)) {
+    const hostLine = selectedRosterHostLine(harness);
+    if (hostLine.startsWith("  host ") && hostLine.includes(hostLabel)) {
       harness.terminal.emitInput(ENTER);
       await nextTurn();
       return;
@@ -8143,7 +8153,7 @@ test("a pending New finishes behind a later remote selection without taking over
       "a late local completion never replaces the later remote owner's frame");
     assert.equal(nativePaneText(afterCompletion).includes("frame:native-1"), false,
       "the completed row is never displayed in its place");
-    assert.ok(plain(afterCompletion).includes("> Lab Alpha"),
+    assert.ok(selectedRosterHostLine(harness).includes("Lab Alpha"),
       "the roster keeps its highlight on the deliberately selected remote card");
     assert.equal(harness.sidebar!.focus, "main", "the late completion neither opens a pane nor moves focus elsewhere");
     assert.equal(harness.sidebar!.activeMainOwnerID, undefined, "the late child never takes the Main owner highlight");
@@ -9006,13 +9016,11 @@ function remoteCloseHosts(
   })] as unknown as PeerUiSnapshot["hosts"];
 }
 
-/** Highlights the drawn remote card whose status line names `hostLabel`. */
+/** Highlights the drawn remote card whose host line names `hostLabel`. */
 async function highlightRemoteRosterCard(harness: Harness, hostLabel: string): Promise<void> {
   for (let step = 0; step <= 16; step += 1) {
-    const selected = harness.writer.frames.at(-1)?.frame.lines
-      .map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))
-      .find((line) => line.startsWith("> "));
-    if (selected?.includes(hostLabel)) {
+    const hostLine = selectedRosterHostLine(harness);
+    if (hostLine.startsWith("  host ") && hostLine.includes(hostLabel)) {
       await nextTurn();
       return;
     }

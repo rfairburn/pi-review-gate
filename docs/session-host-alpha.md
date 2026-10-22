@@ -850,6 +850,29 @@ closes only this host's owned local network
 resources and waits for that local settlement; an unconfirmed close is reported and
 retains agent-directory ownership. It never waits for a remote receipt or remote work.
 
+**Remote card display.** A remote row's left card uses the local card layout and facts:
+the title, the same status line, the same background activity counts, and the same
+activity lines under the existing activity-only collapse. It adds exactly one owner line
+— an indented `host <label>` line directly below the title, where the label is the
+destination's bounded local display name, never an identity claim — and it shows no
+workspace path. That one line is clipped with the card's usual ellipsis when the label is
+unusually long, rather than wrapping or widening the card, and the honest stale marker
+leads it so a long label cannot hide the observation. The leading selection marker is
+omitted in this example:
+
+```
+Build runner
+  host studio-mac
+  agent idle | input none
+  bg tasks 0 | shells 0
+    Ready
+```
+
+The exact owner-side workspace path and the rest of each row remain transported roster
+metadata exactly as before; this is a readability change to the left card only. Network
+details, selection, Enter and drawn-click actions, and activity-only collapse are
+unchanged.
+
 **Settings and trust storage.** Hosting intent, the Auto and bell settings, and saved
 destinations are kept in a protected preferences document below the session-host state
 directory, separate from the key/trust document. Saving a setting such as muting the bell

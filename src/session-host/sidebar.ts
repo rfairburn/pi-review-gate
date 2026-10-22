@@ -993,6 +993,9 @@ const DEFAULT_FORM_HINTS = {
 const CARD_COLLAPSED_ROWS = 3;
 const CARD_EXPANDED_ROWS = 5;
 const ACTIVITY_LINES_MAX = CARD_EXPANDED_ROWS - CARD_COLLAPSED_ROWS;
+/** Projected remote cards add exactly one indented owner-host line under the title. */
+const REMOTE_CARD_COLLAPSED_ROWS = CARD_COLLAPSED_ROWS + 1;
+const REMOTE_CARD_EXPANDED_ROWS = CARD_EXPANDED_ROWS + 1;
 const ACTIVITY_INPUT_MAX_CODEPOINTS = 400;
 const SAVED_CAPTION_MAX_CODEPOINTS = 256;
 const MAX_SAVED_QUERY_DISPLAY_CODEPOINTS = 4096;
@@ -3642,11 +3645,13 @@ export class SidebarController {
     }
   }
 
-  /** Rendered height of one entry: cards are 3 or 5 rows, actions 1 row. */
+  /** Rendered height of one entry: local cards are 3/5 rows, remote cards 4/6, actions 1. */
   private entryHeight(entry: SidebarEntry | undefined): number {
     if (entry?.kind === "diagnostics") return DIAGNOSTICS_ENTRY_ROWS;
     if (entry?.kind === "remote") {
-      return this.collapsedRemoteEntryKeys.has(entry.key) ? CARD_COLLAPSED_ROWS : CARD_EXPANDED_ROWS;
+      return this.collapsedRemoteEntryKeys.has(entry.key)
+        ? REMOTE_CARD_COLLAPSED_ROWS
+        : REMOTE_CARD_EXPANDED_ROWS;
     }
     if (entry?.kind !== "item" || entry.item === undefined) {
       return 1;
@@ -6305,8 +6310,8 @@ export class SidebarController {
     const listRows = rows - 1 - alertLines.length - noticeLines.length - footerLines.length;
     const selectedIndex = this.entries.findIndex((entry) => entry.key === this.selectedEntryKey);
     const selectedHeight = selectedIndex >= 0 ? this.entryHeight(this.entries[selectedIndex]) : 1;
-    // At least one entry row is required, and the highlighted entry (a card
-    // is 3 or 5 rows) must fit completely: a picker whose selected target is
+    // At least one entry row is required, and the highlighted entry (a local
+    // card is 3 or 5 rows, a remote card 4 or 6) must fit completely: a picker whose selected target is
     // invisible or clipped would let Enter act on something not shown.
     if (listRows < 1 || listRows < selectedHeight) {
       return this.renderRosterTooSmall(cols, rows);
@@ -6407,7 +6412,8 @@ export class SidebarController {
    * One entry's rows. Native-session cards: a title line holding ONLY the
    * sanitized canonical title, a status line (selection marker plus
    * observed/unknown agent and input state), an honest background-count
-   * line, and — when expanded — two generic sanitized activity rows.
+   * line, and — when expanded — two generic sanitized activity rows. A remote
+   * card inserts exactly one indented owner-host line directly under the title.
    */
   private renderEntryLines(entry: SidebarEntry, selected: boolean, cols: number): string[] {
     const marker = selected ? "> " : "  ";
@@ -6481,11 +6487,13 @@ export class SidebarController {
   }
 
   /**
-   * One projected remote card at the same 3/5-row shape as a local card. It
-   * reuses the existing bounded title/status/background helpers through the
-   * remote display-facts adapter, adds only the owner host label, honest
-   * current-vs-stale marking, and the exact display-only owner workspace, and
-   * never invents a local status, agent dir, or current file.
+   * One projected remote card at the local card shape plus exactly one line:
+   * an ordinary indented owner-host line directly under the canonical title.
+   * It reuses the existing bounded title/status/background/activity helpers
+   * through the remote display-facts adapter, keeps the honest current-vs-stale
+   * mark on the host line ahead of the variable-length friendly label, and
+   * never draws the owner workspace path, invents a local status, agent dir,
+   * or current file.
    */
   private renderRemoteEntryLines(
     entry: SidebarEntry,
@@ -6510,11 +6518,11 @@ export class SidebarController {
     // Staleness leads the variable-length owner label so clipping can never
     // hide the honest observation behind a long friendly name.
     const stale = remote.rosterState === "stale" ? "[stale] " : "";
-    const workspace = sanitizeBounded(remote.row.workspace, SAVED_WORKSPACE_MAX_CODEPOINTS);
     const lines = [
       wrapRow(cardTitle(remote.row), cols, titleSgr),
-      wrapRow(`${marker}${stale}${hostLabel} | ${cardStatusText(facts)}`, cols),
-      wrapRow(`  ${cardBackgroundText(facts)} | ${workspace}`, cols),
+      wrapRow(`  host ${stale}${hostLabel}`, cols),
+      wrapRow(`${marker}${cardStatusText(facts)}`, cols),
+      wrapRow(`  ${cardBackgroundText(facts)}`, cols),
     ];
     if (!this.collapsedRemoteEntryKeys.has(entry.key)) {
       const activity = renderActivityLines(remote.row.activity, cols);

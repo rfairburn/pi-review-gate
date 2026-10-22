@@ -1164,8 +1164,10 @@ test("remote host rows stay honest metadata and never emit a local session actio
   // unchanged, and the local action filter still finds nothing there either.
   harness.send(ESC);
   const left = rosterText(harness, 140, 40).join("\n");
-  assert.ok(left.includes("build") && left.includes("/owner/work/build"),
-    "the left roster projects the same remote rows alongside locals");
+  assert.ok(left.includes("build") && left.includes("  host studio"),
+    "the left roster projects the same remote rows alongside locals, with the owner host line");
+  assert.equal(left.includes("/owner/work/build"), false,
+    "the left card draws no owner workspace path; that remains Network-pane data");
   assert.ok(left.includes("old-row") && left.includes("[stale]"),
     "stale remote cards are marked in the left roster too");
   assert.deepEqual(harness.commands(), [], "projecting the left cards emits nothing");

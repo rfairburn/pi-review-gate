@@ -1383,12 +1383,14 @@ export function nativeFormFieldIsEmpty(text: string, marker: "> Workspace:" | ">
   const index = rows.findIndex((line) => line.includes(marker));
   if (index < 0) return false;
   const start = rows[index]!.indexOf(marker) + marker.length + 1;
-  const top = rows[index]!.slice(start).trim();
-  const body = rows[index + 1]?.slice(start);
-  const bottom = rows[index + 2]?.slice(start).trim();
-  // Require the real empty single-line Editor structure. A missing content
-  // row, text draft, menu, or mere blank label is never evidence of clearance.
-  return /^─+$/.test(top) && body !== undefined && body.trim() === ""
+  // The label sits beside the row that carries the editable content, and the
+  // Editor's own rules are the rows directly above and below it. Require the
+  // real empty single-line Editor structure: a missing content row, text draft,
+  // menu, or mere blank label is never evidence of clearance.
+  const content = rows[index]!.slice(start);
+  const top = rows[index - 1]?.slice(start).trim();
+  const bottom = rows[index + 1]?.slice(start).trim();
+  return top !== undefined && /^─+$/.test(top) && content.trim() === ""
     && bottom !== undefined && /^─+$/.test(bottom);
 }
 
@@ -2378,7 +2380,9 @@ export class MainPtyDriver {
       const fieldIndex = fieldRows.findIndex((line) => line.includes("> Workspace:"));
       if (fieldIndex < 0) return undefined;
       const fieldColumn = fieldRows[fieldIndex]!.indexOf("> Workspace:") + "> Workspace: ".length;
-      return fieldRows[fieldIndex + 1]?.slice(fieldColumn).trim();
+      // The label sits beside the editable content row, so the value is read
+      // from the labelled row itself, never from the Editor's rule above it.
+      return fieldRows[fieldIndex]!.slice(fieldColumn).trim();
     };
     const beforeFirstEnter = this.frameRevision;
     this.pty.write(KEYS.enter);

@@ -206,6 +206,34 @@ function assertPaneSafe(lines: string[], cols: number, rows?: number): string[] 
   return lines.map((line) => line.replace(SGR_PATTERN, ""));
 }
 
+/**
+ * Real-native-field alignment proof. The field's own cursor DTO names the pane
+ * row that carries the editable content, so the pane must label exactly that
+ * row: the value is read from the same row between the label and the native
+ * caret, and the caret must stay inside the value's cells on that row. A label
+ * beside a border row, a help row, or a label with no content behind it fails.
+ */
+function assertLabeledInputRow(
+  frame: { lines: string[]; cursor?: { column: number; row: number } },
+  cols: number,
+  rows: number,
+  label: string,
+  value: string,
+): void {
+  const lines = assertPaneSafe(frame.lines, cols, rows);
+  assert.ok(frame.cursor !== undefined, `${label} editor exposes its actual native input cursor`);
+  const cursor = frame.cursor;
+  const inputRow = lines[cursor.row] ?? "";
+  assert.ok(inputRow.startsWith(label),
+    `the label sits beside the editable content row, not a border row: ${JSON.stringify(inputRow)}`);
+  assert.equal(inputRow.slice(label.length).trimEnd(), value,
+    `the labeled input row carries the field's real value: ${JSON.stringify(inputRow)}`);
+  assert.ok(cursor.column >= label.length && cursor.column <= label.length + visibleWidth(value),
+    `the native caret stays inside the labeled row's value cells: ${JSON.stringify({ cursor, inputRow })}`);
+  assert.equal(lines.filter((line) => line.includes(label.trimEnd())).length, 1,
+    `the pane labels ${label.trimEnd()} exactly once, on its editable content row`);
+}
+
 function rosterText(harness: Harness, cols = 60, rows = 30): string[] {
   return assertPaneSafe(harness.controller.render(cols, rows).lines, cols, rows);
 }
@@ -344,18 +372,12 @@ test("a known fresh snapshot prefills the approved editable defaults and starts 
   harness.send(ENTER);
   assert.equal(harness.controller.focus, "form");
   const addressEditor = harness.controller.renderForm(70, 26);
-  assert.ok(addressEditor.cursor, "the address editor exposes its actual input cursor");
-  const addressLines = assertPaneSafe(addressEditor.lines, 70, 26);
-  assert.equal(addressLines[addressEditor.cursor.row]?.trim(), "*",
-    "the actual address input row, not its border or help text, contains the prefilled value");
+  assertLabeledInputRow(addressEditor, 70, 26, "> Listen address: ", "*");
   harness.send(ESC);
   focusPeerEntry(harness, "Listen port:");
   harness.send(ENTER);
   const portEditor = harness.controller.renderForm(70, 26);
-  assert.ok(portEditor.cursor, "the port editor exposes its actual input cursor");
-  const portLines = assertPaneSafe(portEditor.lines, 70, 26);
-  assert.equal(portLines[portEditor.cursor.row]?.trim(), "8088",
-    "the actual port input row contains the prefilled value");
+  assertLabeledInputRow(portEditor, 70, 26, "> Listen port: ", "8088");
   harness.send(ESC);
   assert.deepEqual(harness.commands(), [], "opening and cancelling the prefilled editors emits nothing");
   assert.equal(harness.controller.visible, true);
@@ -815,13 +837,8 @@ for (const selected of SELECTED_ADD_FIELDS) {
     harness.send(ENTER);
     assert.equal(harness.controller.focus, "form", "the chosen field opened its own editor");
     const frame = harness.controller.renderForm(70, 26);
+    assertLabeledInputRow(frame, 70, 26, `> ${selected.label}: `, selected.value);
     const editor = assertPaneSafe(frame.lines, 70, 26);
-    assert.ok(frame.cursor, "the Add editor exposes its actual input cursor");
-    const inputRow = editor[frame.cursor.row]?.trim();
-    assert.equal(inputRow, selected.value,
-      "the actual input row, not its border or help text, holds the selected draft value");
-    assert.ok(editor.some((line) => line.startsWith(`> ${selected.label}:`)),
-      "the selected field is the labelled active input");
     for (const sibling of selected.siblings) {
       assert.ok(!editor.some((line) => line.includes(`${sibling.label}:`)),
         `the unselected ${sibling.label} field renders no read-only row in this editor`);
@@ -1865,4 +1882,372 @@ test("a left-roster click dismisses a pending consent review without deciding it
   const after = assertPaneSafe(harness.controller.renderRoster(40, 22).lines, 40, 22);
   assert.ok(after.join(" ").includes("Incoming connection request"),
     "the still-pending request keeps its alert band");
+});
+
+// ---------------------------------------------------------------------------
+// Field labels align with the editable content row (#482 UI correction)
+// ---------------------------------------------------------------------------
+
+test("every Network field label sits beside the editable content row it names", () => {
+  // The two listen editors, opened prefilled from a known fresh snapshot.
+  const listen = makeHarness(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, bindHost: "", bindPort: null },
+  }));
+  openNetworkPane(listen);
+  focusPeerEntry(listen, "Listen address:");
+  listen.send(ENTER);
+  assertLabeledInputRow(listen.controller.renderForm(70, 26), 70, 26, "> Listen address: ", "*");
+  listen.send(ESC);
+  focusPeerEntry(listen, "Listen port:");
+  listen.send(ENTER);
+  assertLabeledInputRow(listen.controller.renderForm(70, 26), 70, 26, "> Listen port: ", "8088");
+  listen.send(ESC);
+  assert.deepEqual(listen.commands(), [], "reading the listen editors emits nothing");
+
+  // The three Add-destination editors, each revisited from its stored draft.
+  const add = makeHarness(makeSnapshot());
+  seedFullAddDraft(add);
+  for (const [menuRow, label, value] of [
+    ["Name:", "> Destination name: ", "studio-mac"],
+    ["Host:", "> Host: ", "10.1.2.3"],
+    ["Port:", "> Port: ", "7000"],
+  ] as const) {
+    focusPeerEntry(add, menuRow);
+    add.send(ENTER);
+    assertLabeledInputRow(add.controller.renderForm(70, 26), 70, 26, label, value);
+    add.send(ESC);
+  }
+  assert.deepEqual(add.commands(), [], "reading the Add-field editors emits nothing");
+});
+
+test("a typed Network value stays on the labelled row with the caret immediately after it", () => {
+  const harness = makeHarness(makeSnapshot({ settings: null }));
+  openNetworkPane(harness);
+  focusPeerEntry(harness, "Listen address:");
+  harness.send(ENTER);
+  harness.send("10.0.0.7");
+  const frame = harness.controller.renderForm(70, 26);
+  const lines = assertPaneSafe(frame.lines, 70, 26);
+  assert.ok(frame.cursor, "the editor exposes its actual native input cursor");
+  const label = "> Listen address: ";
+  assert.equal(lines[frame.cursor.row]?.slice(0, label.length), label,
+    "the label is beside the row the native cursor is on");
+  assert.equal(lines[frame.cursor.row]?.slice(label.length, frame.cursor.column), "10.0.0.7",
+    "the native caret sits immediately after the typed value on the labelled row");
+  assert.equal(lines.filter((line) => line.includes(label.trimEnd())).length, 1,
+    "the field is labelled exactly once, and never on a border row");
+});
+
+test("the smallest usable Network field frame still labels its content row; one row less refuses", () => {
+  const harness = makeHarness(makeSnapshot());
+  seedFullAddDraft(harness);
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER);
+  let usable = 0;
+  for (let rows = 4; rows <= 26; rows += 1) {
+    if (harness.controller.renderForm(60, rows).cursor !== undefined) {
+      usable = rows;
+      break;
+    }
+  }
+  assert.ok(usable > 0, "some frame shows the Host editor with its native cursor");
+  assertLabeledInputRow(harness.controller.renderForm(60, usable), 60, usable, "> Host: ", "10.1.2.3");
+  const refused = assertPaneSafe(harness.controller.renderForm(60, usable - 1).lines, 60, usable - 1);
+  assert.ok(refused.join(" ").includes("too small"), "one row less shows the truthful refusal");
+  assert.equal(refused.some((line) => line.includes("> Host:")), false,
+    "a refused frame draws no field label at all");
+  assert.deepEqual(harness.commands(), [], "reading and refusing a frame emits nothing");
+});
+
+// ---------------------------------------------------------------------------
+// Pointer activation inside the Network menus (#482 UI correction)
+// ---------------------------------------------------------------------------
+
+/** The pane row the current network render drew the row containing `text` on. */
+function peerRowOf(harness: Harness, text: string, cols = 70, rows = 26): number {
+  const lines = peerPaneText(harness, cols, rows);
+  const row = lines.findIndex((line) => line.includes(text));
+  assert.ok(row >= 0, `the network pane drew no ${JSON.stringify(text)} row: ${JSON.stringify(lines)}`);
+  return row;
+}
+
+/** The row currently highlighted in the network pane. */
+function peerHighlighted(harness: Harness): string {
+  return peerPaneText(harness).find((line) => line.startsWith("> ")) ?? "";
+}
+
+const LOCAL_SESSION_ACTIONS: readonly string[] = ["select", "create", "remove", "stop-remove", "quit", "rename"];
+
+test("a press on a drawn Network row performs that row's ordinary Enter action once", () => {
+  const harness = makeHarness(makeSnapshot());
+  openNetworkPane(harness);
+
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "Hosting: disabled"), 70, 26), true);
+  assert.deepEqual(harness.commands(), [{ type: "peer-listener", enabled: true, host: "127.0.0.1", port: "8443" }],
+    "the press runs exactly the command Enter runs, and runs it once");
+  assert.equal(harness.controller.focus, "form", "the pane stays open under the pointer");
+  harness.baseline = harness.actions.length;
+
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "Auto reconnect: off"), 70, 26), true);
+  assert.deepEqual(harness.commands(), [{ type: "peer-auto-reconnect", enabled: true }]);
+  harness.baseline = harness.actions.length;
+
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "Incoming bell: on"), 70, 26), true);
+  assert.deepEqual(harness.commands(), [{ type: "peer-bell", enabled: false }]);
+});
+
+test("a press targets the row it landed on, not the row the pane highlighted", () => {
+  const harness = makeHarness(makeSnapshot({
+    hosts: [makeHost({ id: "studio" }), makeHost({ id: "lab", host: "10.0.0.9" })],
+  }));
+  openNetworkPane(harness);
+  assert.ok(peerHighlighted(harness).includes("Hosting:"), "the pane still highlights row 0");
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "host-lab"), 70, 26), true);
+  assert.deepEqual(harness.commands(), [], "selecting a destination sends nothing");
+  assert.ok(peerHighlighted(harness).includes("host-lab"),
+    "the press moved the highlight to the row it actually hit");
+  assert.ok(peerPaneFlat(harness).includes("Selected host-lab"));
+});
+
+test("informational and permission rows keep their no-authority semantics under the pointer", () => {
+  const harness = makeHarness(makeSnapshot({
+    hosts: [makeHost({ id: "studio", roster: { state: "current", rows: [makeRemoteRow({ id: "r1" })] } })],
+    trustedPeers: [makeTrustedPeer({ id: "t1" })],
+  }));
+  openNetworkPane(harness);
+
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "- host-studio: remote-r1"), 70, 26), true);
+  // The pane holds one notice at a time, so each row's own receipt is read
+  // before the next press replaces it.
+  const remoteFlat = peerPaneFlat(harness);
+  assert.ok(remoteFlat.includes("Remote session metadata only"), remoteFlat);
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "trusted-t1"), 70, 26), true);
+  assert.deepEqual(harness.commands(), [],
+    "metadata and permission rows never become a local or network action under the pointer");
+  assert.deepEqual(harness.actions.filter((action) => LOCAL_SESSION_ACTIONS.includes(action.type)), [],
+    "a pointer press on a remote row emits no local session action of any kind");
+  const flat = peerPaneFlat(harness);
+  assert.ok(flat.includes("Receiving permission for trusted-t1"), flat);
+  assert.equal(harness.controller.focus, "form", "informational rows change no focus");
+});
+
+test("a press on a pending request opens its review and decides nothing", () => {
+  const harness = makeHarness(makeSnapshot({ consents: [makeConsent({ id: "A" })] }));
+  openNetworkPane(harness);
+  harness.baseline = harness.actions.length;
+
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "approval window"), 70, 26), true);
+  assert.equal(harness.controller.peerConsentConfirmationActive, true, "the review opened");
+  assert.deepEqual(harness.commands(), [], "opening a review is not a decision");
+  assert.equal(harness.actions.some((action) => action.type === "peer-consent"), false,
+    "a pointer press never approves or denies a request");
+  assert.equal(harness.controller.capturePeerConsentPresentation(), undefined,
+    "no written frame has authorized a decision yet");
+});
+
+test("the Add-destination menu acts under the pointer through the same rows as Enter", () => {
+  const harness = makeHarness(makeSnapshot());
+  openNetworkPane(harness);
+
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "Add destination"), 70, 26), true);
+  assert.ok(peerPaneText(harness).some((line) => line.includes("Add destination (enter to add)")),
+    "the press opened the field menu");
+  assert.deepEqual(harness.commands(), [], "opening the menu sends nothing");
+  harness.baseline = harness.actions.length;
+
+  // A field row opens exactly that editor, empty and unchanged.
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "Host: (not set)"), 70, 26), true);
+  assertLabeledInputRow(harness.controller.renderForm(70, 26), 70, 26, "> Host: ", "");
+  assert.deepEqual(harness.commands(), [], "opening an editor sends nothing and types nothing");
+  harness.send(ESC);
+
+  // An incomplete draft stays a local refusal under the pointer too.
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "Add destination (enter to add)"), 70, 26), true);
+  assert.deepEqual(harness.commands(), [], "an incomplete draft is never added");
+  assert.ok(peerPaneFlat(harness).includes("A destination name is required"));
+  harness.baseline = harness.actions.length;
+
+  // A complete draft sends exactly one Add through the same single action row.
+  focusPeerEntry(harness, "Name:");
+  harness.send(ENTER);
+  submitField(harness, "studio");
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER);
+  submitField(harness, "10.1.2.3");
+  focusPeerEntry(harness, "Port:");
+  harness.send(ENTER);
+  submitField(harness, "7000");
+  harness.baseline = harness.actions.length;
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "Add destination (enter to add)"), 70, 26), true);
+  assert.deepEqual(harness.commands(), [{ type: "peer-add", label: "studio", host: "10.1.2.3", port: "7000" }],
+    "one press on the single Add action sends the draft once");
+});
+
+test("pointer targets are the written rows: header, footer, blank, geometry, focus, and hidden refusals", () => {
+  const harness = makeHarness(makeSnapshot({ hosts: [makeHost({ id: "studio" })] }));
+  openNetworkPane(harness);
+  const drawn = peerRowOf(harness, "host-studio");
+  const lines = peerPaneText(harness);
+  const footerRow = lines.findIndex((line) => line.includes("up/down select"));
+  const blankRow = lines.findIndex((line, index) => index > drawn && line.trim() === "");
+
+  assert.equal(harness.controller.activatePeerAt(0, 0, 70, 26), false, "the pane header is not a row");
+  assert.equal(harness.controller.activatePeerAt(1, footerRow, 70, 26), false, "footer hints are not rows");
+  assert.ok(blankRow > drawn);
+  assert.equal(harness.controller.activatePeerAt(1, blankRow, 70, 26), false, "blank padding is not a row");
+  assert.equal(harness.controller.activatePeerAt(1, drawn, 69, 26), false, "a different pane width authorizes nothing");
+  assert.equal(harness.controller.activatePeerAt(1, drawn, 70, 25), false, "a different pane height authorizes nothing");
+  assert.equal(harness.controller.activatePeerAt(-1, drawn, 70, 26), false, "a negative column is not a cell");
+  assert.deepEqual(harness.commands(), [], "every refused press sends nothing");
+
+  // The Add field editor owns its own pane: a press there activates no menu row
+  // and cannot touch the value being edited.
+  focusPeerEntry(harness, "Add destination");
+  harness.send(ENTER);
+  const hostRowInMenu = peerRowOf(harness, "Host: (not set)");
+  focusPeerEntry(harness, "Host:");
+  harness.send(ENTER);
+  harness.send("10.1.2.3");
+  harness.baseline = harness.actions.length;
+  const editorFrame = harness.controller.renderForm(70, 26);
+  assert.equal(harness.controller.activatePeerAt(1, hostRowInMenu, 70, 26), false,
+    "no network menu row exists while a field editor is open");
+  assertLabeledInputRow(harness.controller.renderForm(70, 26), 70, 26, "> Host: ", "10.1.2.3");
+  assert.equal(editorFrame.cursor?.column, harness.controller.renderForm(70, 26).cursor?.column,
+    "the refused press left the editor's native caret untouched");
+  assert.deepEqual(harness.commands(), [], "a press inside a field editor sends nothing");
+  harness.send(ESC);
+  harness.send(ESC);
+
+  // A hidden pane holds no drawn rows at all.
+  harness.send("\x1b[1;3D"); // the reserved toggle hides the pane
+  assert.equal(harness.controller.visible, false);
+  assert.equal(harness.controller.activatePeerAt(1, drawn, 70, 26), false, "a hidden pane authorizes nothing");
+});
+
+test("a captured pointer presentation cannot outlive or retarget its drawn rows", () => {
+  const harness = makeHarness(makeSnapshot({ hosts: [makeHost({ id: "studio" })] }));
+  openNetworkPane(harness);
+  const studioRow = peerRowOf(harness, "host-studio");
+  const written = harness.controller.captureMousePresentation();
+  const networkKey = written.authorizationKey;
+
+  // The destination is removed while the captured frame is still held.
+  harness.controller.setPeerUiSnapshot(makeSnapshot({ revision: 2, hosts: [] }));
+  peerPaneText(harness);
+  assert.notEqual(harness.controller.captureMousePresentation().authorizationKey, networkKey,
+    "the removed destination changes the pointer authorization identity");
+  assert.equal(written.activatePeerAt(1, studioRow, 70, 26), false,
+    "the captured presentation refuses the row its frame no longer offers");
+  assert.deepEqual(harness.commands(), [], "a refused press sends nothing");
+
+  // A row that moved to a different pane row keeps its own identity: the press
+  // that was captured for the old position never activates whatever sits there.
+  const reordered = makeHarness(makeSnapshot({
+    hosts: [makeHost({ id: "studio" }), makeHost({ id: "lab", host: "10.0.0.9" })],
+  }));
+  openNetworkPane(reordered);
+  const labRow = peerRowOf(reordered, "host-lab");
+  const before = reordered.controller.captureMousePresentation();
+  reordered.controller.setPeerUiSnapshot(makeSnapshot({
+    revision: 2,
+    hosts: [makeHost({ id: "lab", host: "10.0.0.9" }), makeHost({ id: "studio" })],
+  }));
+  peerPaneText(reordered);
+  assert.equal(before.activatePeerAt(1, labRow, 70, 26), false,
+    "a reordered pane cannot make an old press activate a different row");
+  assert.deepEqual(reordered.commands(), [], "the reordered refusal sent nothing");
+  // The freshly drawn pane still acts on its own rows.
+  assert.equal(reordered.controller.activatePeerAt(1, peerRowOf(reordered, "host-lab"), 70, 26), true);
+  assert.deepEqual(reordered.commands(), [], "selecting a destination still sends nothing");
+  assert.ok(peerPaneFlat(reordered).includes("Selected host-lab"));
+});
+
+test("the captured form map acts only on its written row and refuses a row that moved", () => {
+  const harness = makeHarness(makeSnapshot({
+    hosts: [makeHost({ id: "studio" }), makeHost({ id: "lab", host: "10.0.0.9" })],
+  }));
+  openNetworkPane(harness);
+  const labRow = peerRowOf(harness, "host-lab");
+  const formMap = harness.controller.captureMousePresentation();
+  assert.equal(formMap.activateFormRowAt(1, labRow, 70, 26), true,
+    "the written form map acts on the row it was drawn with");
+  assert.deepEqual(harness.commands(), [], "selecting a destination still sends nothing");
+  assert.ok(peerPaneFlat(harness).includes("Selected host-lab"));
+  harness.baseline = harness.actions.length;
+
+  // A destination added above shifts the same row to a later written row, and
+  // the old coordinate now sits over a different destination.
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    revision: 2,
+    hosts: [makeHost({ id: "aaa" }), makeHost({ id: "studio" }), makeHost({ id: "lab", host: "10.0.0.9" })],
+  }));
+  peerPaneText(harness);
+  assert.notEqual(harness.controller.captureMousePresentation().authorizationKey,
+    formMap.authorizationKey, "a shifted written row is a different pointer authorization identity");
+  assert.equal(formMap.activateFormRowAt(1, labRow, 70, 26), false,
+    "the captured form map refuses the coordinate whose row has moved");
+  assert.equal(formMap.activatePeerAt(1, labRow, 70, 26), false,
+    "the captured network map refuses it through its own entry point too");
+  assert.deepEqual(harness.commands(), [], "the refused press sent nothing");
+  const stillSelected = peerPaneFlat(harness);
+  assert.ok(stillSelected.includes("Selected host-lab"),
+    "the refusal neither selects nor clears a row");
+  assert.ok(!stillSelected.includes("Selected host-aaa"),
+    "the old coordinate never activates whatever now sits on that written row");
+
+  // Resolve the actual menu row, not the notice above it that also names
+  // host-lab, then capture that exact render's map.
+  const freshRows = peerPaneText(harness);
+  const freshLabRow = freshRows.findIndex((line) => /^(?:> |  )host-lab\b/.test(line));
+  assert.ok(freshLabRow >= 0, "the current menu actually draws the host-lab destination row");
+  const freshMap = harness.controller.captureMousePresentation();
+  assert.equal(freshMap.activateFormRowAt(1, freshLabRow, 70, 26), true,
+    "the current written form map remains usable");
+  assert.ok(peerPaneFlat(harness).includes("Selected host-lab"));
+});
+
+test("a press acts on the intent its frame drew, never on state the operator never saw", () => {
+  const harness = makeHarness(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, hostingEnabled: false, autoReconnect: false, bellEnabled: true },
+  }));
+  openNetworkPane(harness);
+  const hostingRow = peerRowOf(harness, "Hosting: disabled");
+  const bellRow = peerRowOf(harness, "Incoming bell: on");
+  const written = harness.controller.captureMousePresentation();
+
+  // The coordinator reports that hosting turned on while the captured frame is
+  // still held. The drawn row promised "enter to enable"; acting on the live
+  // state would send the opposite of what the operator was shown.
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    settings: { ...DEFAULT_SETTINGS, hostingEnabled: true, autoReconnect: false, bellEnabled: true },
+  }));
+  assert.equal(written.activatePeerAt(1, hostingRow, 70, 26), false,
+    "a toggle whose drawn state changed refuses instead of flipping the opposite");
+  assert.deepEqual(harness.commands(), [], "the refused toggle sent nothing");
+
+  // The refusal is per row: an unrelated settings change leaves a row whose own
+  // intent is untouched fully actionable.
+  assert.equal(written.activatePeerAt(1, bellRow, 70, 26), true,
+    "an unrelated settings change does not invalidate a row whose intent is unchanged");
+  assert.deepEqual(harness.commands(), [{ type: "peer-bell", enabled: false }]);
+
+  // Known-then-unknown is a different intent as well: a press whose frame showed
+  // a real setting never substitutes a fresh default.
+  harness.baseline = harness.actions.length;
+  const enabledRow = peerRowOf(harness, "Hosting: enabled");
+  const enabledFrame = harness.controller.captureMousePresentation();
+  harness.controller.setPeerUiSnapshot(makeSnapshot({ revision: 3, settings: null }));
+  assert.equal(enabledFrame.activatePeerAt(1, enabledRow, 70, 26), false,
+    "a press whose settings became unknown refuses rather than inventing a default");
+  assert.deepEqual(harness.commands(), [], "the unknown-settings refusal sent nothing");
+
+  // Once the pane has drawn the unknown state, the ordinary row behaves exactly
+  // as it always has: it refuses with a visible reason and sends no command.
+  const unknownRow = peerRowOf(harness, "Hosting: unknown");
+  assert.equal(harness.controller.activatePeerAt(1, unknownRow, 70, 26), true,
+    "the drawn unknown row stays the row the operator can act on");
+  assert.deepEqual(harness.commands(), [], "an unknown setting authorizes no listener command");
+  assert.ok(peerPaneFlat(harness).includes("no hosting change was sent"),
+    "the refusal names the unavailable settings document");
 });

@@ -7,16 +7,18 @@ import { nativeFormFieldIsEmpty, OUTER_RESTORATION_BASELINE } from "./helpers/se
 function frame(marker: "> Workspace:" | "> New name:", value: string): string {
   const roster = "  sibling                       │";
   const padding = " ".repeat(marker.length + 1);
+  // The label sits beside the editable content row; the Editor's own rules stay
+  // unlabeled above and below it.
   return [
     "Session host",
-    `${roster}${marker} ───────────────`,
-    `${roster}${padding}${value.padEnd(15)}`,
+    `${roster}${padding}───────────────`,
+    `${roster}${marker} ${value.padEnd(15)}`,
     `${roster}${padding}───────────────`,
     `${roster}enter submit | escape cancel`,
   ].join("\n");
 }
 
-test("native form witness observes empty Editor content below the top border", () => {
+test("native form witness observes empty Editor content beside its own label", () => {
   assert.equal(nativeFormFieldIsEmpty(frame("> Workspace:", ""), "> Workspace:"), true);
   assert.equal(nativeFormFieldIsEmpty(frame("> New name:", ""), "> New name:"), true);
 });
@@ -31,6 +33,7 @@ test("native form witness rejects missing borders/content rather than assuming e
   assert.equal(nativeFormFieldIsEmpty("> Workspace: ", "> Workspace:"), false);
   assert.equal(nativeFormFieldIsEmpty(frame("> Workspace:", "").replace(/─/g, " "), "> Workspace:"), false);
   assert.equal(nativeFormFieldIsEmpty("Session host\n> Workspace: ─────\n", "> Workspace:"), false);
+  assert.equal(nativeFormFieldIsEmpty("Session host\n> Workspace: \n", "> Workspace:"), false);
 });
 
 test("native outer restoration witness survives the actual tiny-pane resize sequence in the primary buffer", async () => {

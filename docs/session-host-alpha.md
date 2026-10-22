@@ -795,6 +795,12 @@ editor shows only the chosen field and the other two drafts stay on the menu; En
 saves that field and returns to the menu, Escape abandons only that edit, and the
 destination is sent only by the menu's single Add destination action, which validates all
 three values first and then returns to the Network pane; leaving the menu sends nothing.
+A single left-click on a row the pane actually drew performs that row's ordinary Enter
+action once through the same activation path — it selects a destination, opens a field or
+the Add menu, or opens a pending request's review — and it decides nothing that Enter would
+not. A press whose drawn row, pane geometry, or displayed state has since changed is
+refused instead of retargeted, and releases, drags, and non-left buttons activate nothing
+and are never forwarded to a native child.
 Removing a destination forgets only this side's saved endpoint and local remembered pin;
 re-adding it requires
 confirming the key again. It never revokes the other host's receiving grant and never

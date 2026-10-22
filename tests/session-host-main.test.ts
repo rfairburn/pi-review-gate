@@ -6663,3 +6663,203 @@ test("a background child that finishes launching while the host quits is unknown
   assert.equal(harness.sidebar?.activeMainOwnerID, "native-1",
     "the quitting host never moved Main ownership to the background child");
 });
+
+
+// ---------------------------------------------------------------------------
+// Network menu pointer activation through Main's real dispatch
+// ---------------------------------------------------------------------------
+
+/**
+ * Row of the wide composed frame whose RIGHT-PANE (form-slot) text contains
+ * `text`. The left roster is composed on the same lines, so a whole-line search
+ * cannot tell a pane row from roster or alert text; the right pane begins at
+ * column 33 after the divider.
+ */
+function formPaneRowContaining(frame: ComposedHostFrame | undefined, text: string, fromRow = 1): number {
+  return frame?.lines.findIndex((line, row) => row >= fromRow
+    && line.replace(/\x1b\[[0-9;]*m/g, "").slice(33).includes(text)) ?? -1;
+}
+
+/** Row of the wide composed frame whose right-pane text trims exactly to a pane header. */
+function formPaneRowOfHeader(frame: ComposedHostFrame | undefined, header: string, fromRow = 1): number {
+  return frame?.lines.findIndex((line, row) => row >= fromRow
+    && line.replace(/\x1b\[[0-9;]*m/g, "").slice(33).trim() === header) ?? -1;
+}
+
+/**
+ * Scrolls the open network pane with real input until `rowOf` locates a drawn
+ * row, then reports that written row. A target is only ever clicked where the
+ * current written frame actually drew it.
+ */
+async function scrollUntilRow(
+  harness: Harness,
+  rowOf: (frame: ComposedHostFrame | undefined) => number,
+  describe: string,
+  maxSteps = 24,
+): Promise<number> {
+  for (let step = 0; step <= maxSteps; step += 1) {
+    const row = rowOf(harness.writer.frames.at(-1)?.frame);
+    if (row > 0) return row;
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+  }
+  assert.fail(`the written network pane never drew ${describe}`);
+}
+
+test("Network menu pointer clicks act on the written row once and refuse unseen or non-press gestures", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const sidebar = harness.sidebar!;
+  const manager = harness.manager!;
+  // Every target is resolved from the frame Main has actually written at that
+  // moment: an action can add notice rows and shift the whole menu downward.
+  const written = () => harness.writer.frames.at(-1)?.frame;
+  const wideRow = (text: string): number => {
+    const row = formPaneRowContaining(written(), text);
+    assert.ok(row > 1, `the written wide form pane drew a ${JSON.stringify(text)} row`);
+    return row;
+  };
+  const clickWide = (row: number, button = 0, final: "M" | "m" = "M"): void =>
+    emitMouse(harness.terminal, 34, row, button, final);
+  try {
+    if (sidebar.focus !== "sidebar") {
+      harness.terminal.emitInput(ALT_LEFT);
+      await nextTurn();
+    }
+    assert.equal(sidebar.visible, true, "the host panes are visible before the pointer gestures");
+    assert.equal(sidebar.focus, "sidebar", "the host roster owns input before the pointer gestures");
+    await activateRosterRow(harness, "Network");
+    assert.equal(sidebar.focus, "form", "the Network menu opened in the right-hand form slot");
+    assert.ok(formPaneRowOfHeader(written(), "Network") > 0,
+      "the open network pane is drawn in the right-hand slot beside the roster");
+    const childWritesBefore = manager.writes.length;
+
+    // A left press on a drawn row performs that row's ordinary Enter action, once.
+    const hostingCommands = peer.commands.length;
+    clickWide(wideRow("Hosting: disabled"));
+    await nextTurn();
+    assert.deepEqual(peer.commands.slice(hostingCommands),
+      [{ type: "peer-listener", enabled: true, host: "*", port: "8088" }],
+      "the press enabled hosting exactly as Enter on that row would, and only once");
+
+    // The next target is resolved from the frame written AFTER that notice.
+    const autoCommands = peer.commands.length;
+    clickWide(wideRow("Auto reconnect: off"));
+    await nextTurn();
+    assert.deepEqual(peer.commands.slice(autoCommands), [{ type: "peer-auto-reconnect", enabled: true }],
+      "the press acts on the row it landed on, not on the row the pane had highlighted");
+
+    // The drawn pane header is not an actionable row, and no host-owned gesture
+    // is forwarded to a native child. The requested commands were only sent to
+    // the coordinator, so the pane still draws the same row captions.
+    const headerRow = formPaneRowOfHeader(written(), "Network");
+    const refusedCommands = peer.commands.length;
+    clickWide(headerRow);                                   // header: no action
+    clickWide(headerRow, 0, "m");                           // matching release
+    clickWide(wideRow("Auto reconnect: off"), 0, "m");      // a release without a press
+    clickWide(wideRow("Auto reconnect: off"), 32);          // drag with the button held
+    clickWide(wideRow("Auto reconnect: off"), 2);           // right-button press
+    await nextTurn();
+    assert.equal(peer.commands.length, refusedCommands,
+      "headers, releases, drags, and non-left buttons activate nothing");
+
+    // A snapshot flips hosting behind the frame the operator is looking at. The
+    // drawn row promised "enter to enable", so a press computed from that frame
+    // must not send the opposite. Its current coordinate is captured immediately
+    // before the flip and pressed in the same turn, before any repaint.
+    const staleHostingRow = wideRow("Hosting: disabled");
+    peer.publish({ settings: { ...peer.snapshot.settings!, hostingEnabled: true } });
+    const staleCommands = peer.commands.length;
+    clickWide(staleHostingRow);
+    assert.equal(peer.commands.length, staleCommands,
+      "a stale-intent press sends nothing instead of flipping the unseen state");
+    await nextTurn();
+    const redrawnRow = wideRow("Hosting: enabled");
+    const refreshedCommands = peer.commands.length;
+    clickWide(redrawnRow);
+    await nextTurn();
+    assert.deepEqual(peer.commands.slice(refreshedCommands),
+      [{ type: "peer-listener", enabled: false, host: "*", port: "8088" }],
+      "once the pane has drawn the new state, the same row acts on what is now shown");
+
+    // Held writer: the newest frame is produced but never written, so its map
+    // authorizes nothing at all — the operator still sees the older frame.
+    const visibleFrame = written();
+    const visibleAutoRow = formPaneRowContaining(visibleFrame, "Auto reconnect: off");
+    assert.ok(visibleAutoRow > 1);
+    harness.writer.holdWrites = true;
+    peer.publish({ settings: { ...peer.snapshot.settings!, autoReconnect: true } });
+    await nextTurn();
+    const heldCommands = peer.commands.length;
+    clickWide(visibleAutoRow);
+    assert.equal(peer.commands.length, heldCommands,
+      "a press against an unwritten held frame authorizes no command");
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    const drainedCommands = peer.commands.length;
+    clickWide(wideRow("Auto reconnect: on"));
+    await nextTurn();
+    assert.deepEqual(peer.commands.slice(drainedCommands), [{ type: "peer-auto-reconnect", enabled: false }],
+      "the written frame restores the ordinary one-action press");
+
+    // Unchanged semantic replacement: a repaint whose bytes are unchanged keeps
+    // the written authorization instead of silently refusing every row.
+    harness.writer.settlementDisposition = "unchanged";
+    peer.publish({});
+    await nextTurn();
+    const unchangedCommands = peer.commands.length;
+    clickWide(wideRow("Incoming bell: on"));
+    await nextTurn();
+    assert.deepEqual(peer.commands.slice(unchangedCommands), [{ type: "peer-bell", enabled: false }],
+      "an unchanged repaint neither revokes nor duplicates the row's action");
+    harness.writer.settlementDisposition = "written";
+
+    assert.equal(manager.writes.length, childWritesBefore,
+      "every host-owned gesture stays in the host and never reaches a native child");
+
+    // Narrow layout: the form slot owns the whole content width and the same
+    // captured form map routes the press.
+    harness.terminal.setSize(40, 24);
+    await nextTurn();
+    const narrowBellRow = screenRowContaining(written(), "Incoming bell: on");
+    assert.ok(narrowBellRow > 1, "the narrow content pane drew its bell row");
+    const narrowCommands = peer.commands.length;
+    emitMouse(harness.terminal, 1, narrowBellRow);
+    await nextTurn();
+    assert.deepEqual(peer.commands.slice(narrowCommands), [{ type: "peer-bell", enabled: false }],
+      "the narrow press routes through the captured form map and acts once");
+
+    // Opening a consent review under the pointer decides nothing; the written
+    // confirmation still owns the decision.
+    await deliverMutedIncomingRequest(peer, "pointer-consent");
+    const consentRow = await scrollUntilRow(harness, (frame) => {
+      const paneTop = screenRowOfHeader(frame, "Network");
+      return paneTop > 0 ? screenRowContaining(frame, "Expected peer", paneTop + 1) : -1;
+    }, "the pending request row in the network pane");
+    const decisionsBefore = peer.decisions.length;
+    const reviewCommands = peer.commands.length;
+    emitMouse(harness.terminal, 1, consentRow);
+    await nextTurn();
+    assert.equal(sidebar.peerConsentConfirmationActive, true,
+      "the press opened the existing review exactly as Enter on that row does");
+    assert.equal(peer.decisions.length, decisionsBefore, "opening the review approves and denies nothing");
+    assert.equal(peer.commands.length, reviewCommands, "opening the review sends no command");
+
+    // The written confirmation owns its pointer: pressing its Approve row is
+    // not a decision; only the explicit written key still decides.
+    const approveRow = written()?.lines.findIndex((line, row) => row > 0
+      && line.replace(/\x1b\[[0-9;]*m/g, "").trim() === "Approve") ?? -1;
+    assert.ok(approveRow > 0, "the written confirmation offers its Approve decision row");
+    emitMouse(harness.terminal, 1, approveRow);
+    await nextTurn();
+    assert.equal(peer.decisions.length, decisionsBefore,
+      "a press on the confirmation's Approve row decides nothing");
+    assert.equal(sidebar.peerConsentConfirmationActive, true,
+      "the press neither decides nor dismisses the confirmation");
+    assert.equal(manager.writes.length, childWritesBefore,
+      "the whole pointer session never forwarded a packet to a native child");
+  } finally {
+    harness.writer.holdWrites = false;
+    harness.writer.settlementDisposition = "written";
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});

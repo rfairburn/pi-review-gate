@@ -141,6 +141,16 @@ dates.
   actually drawn in the written frame authorizes the click, and no keyboard, consent,
   confirmation, or native-input ownership fence changes. See
   [Focus, display, and status](docs/session-host-alpha.md#focus-display-and-status).
+### Fixed
+
+- Session-host field labels now sit beside the native Editor's first editable body row,
+  not its top border (#482). New/Edit, Host shortcuts, and Network editors share the
+  same stable anchor; wrapped caret movement leaves the label, drafts, and editing
+  behavior unchanged.
+- A single left press on a drawn Network menu row now performs its normal Enter action
+  once (#482). Captured row positions and displayed action values fence stale or unwritten
+  clicks; opening consent review decides nothing, and host gestures never reach a child.
+
 ## [0.1.0-dev.190]
 
 ### Changed

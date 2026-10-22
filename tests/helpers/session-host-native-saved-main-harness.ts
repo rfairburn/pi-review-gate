@@ -330,7 +330,9 @@ function workspaceFieldValue(text: string): string | undefined {
   const index = rows.findIndex((line) => line.includes(marker));
   if (index < 0) return undefined;
   const start = rows[index]!.indexOf(marker) + marker.length + 1;
-  return rows[index + 1]?.slice(start).trim();
+  // The label sits beside the editable content row, so the value is read from
+  // the labelled row itself rather than the Editor's rule above it.
+  return rows[index]!.slice(start).trim();
 }
 
 /**

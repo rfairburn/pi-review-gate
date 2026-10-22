@@ -1907,11 +1907,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         const confirmationOwnsRightPane = presentation.focus === "confirm";
         // Keep the emitted frame's source pane identity and its render-derived
         // maps: a newer coalesced render must never retarget this coordinate.
+        // Inside the form slot the Sidebar dispatches to whichever pane that
+        // captured render actually drew — the Saved picker or the Network menu —
+        // and a Network row's press performs that row's ordinary Enter action
+        // once through the pane's own activation routine.
         const activated = formPane !== undefined
           ? !confirmationOwnsRightPane
-            && presentation.sidebar.activateSavedAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
+            && presentation.sidebar.activateFormRowAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
           : hitLayout.sidebarOverlay && presentation.focus === "form"
-            ? presentation.sidebar.activateSavedAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
+            ? presentation.sidebar.activateFormRowAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
             : presentation.sidebar.activateRosterAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows);
         if (activated) {
           if (sidebar.focus !== previousFocus || sidebar.selectedId !== previousSelection

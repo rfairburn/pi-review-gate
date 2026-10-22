@@ -696,6 +696,37 @@ test("the configured return chord is consumed in host forms and confirmations", 
   assert.deepEqual(confirmation.focusedActions(), []);
 });
 
+test("both Host shortcuts labels stay beside their real editable body row", () => {
+  const harness = makeController({ settingsAvailable: true });
+  void harness.controller.render(60, 20);
+  harness.send(DOWN);
+  harness.send(DOWN);
+  void harness.controller.render(60, 20);
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "form");
+  for (const [index, prefix, value, inactive] of [
+    [0, "> Toggle (stored): ", "f8", "  Return to Main: "],
+    [1, "> Return to Main: ", "f9", "  Toggle (stored): f8"],
+  ] as const) {
+    if (index === 1) harness.send("\t");
+    harness.send("\x15");
+    harness.send(value);
+    const frame = harness.controller.render(60, 20);
+    const rows = assertPaneSafe(frame.lines, 60, 20);
+    assert.ok(frame.cursor);
+    const { row, column } = frame.cursor;
+    assert.equal(rows[row]?.slice(0, prefix.length), prefix,
+      "the active shortcut label is on the native text row, not its top rule");
+    assert.equal(rows[row]?.slice(prefix.length, column), value);
+    assert.equal(rows[row - 1]?.slice(0, prefix.length), " ".repeat(prefix.length));
+    assert.match(rows[row - 1]?.slice(prefix.length) ?? "", /^─+$/);
+    assert.ok(rows.some((line) => line.startsWith(inactive)),
+      "the inactive sibling keeps its draft beside its own inline label");
+  }
+  harness.send(ESC);
+  assert.deepEqual(harness.focusedActions(), [], "alignment changes commit no settings");
+});
+
 test("host shortcut settings edit configured bindings and Cancel leaves active bindings unchanged", () => {
   const harness = makeController({ settingsAvailable: true });
   const open = (): void => {
@@ -1982,7 +2013,10 @@ test("New session has only an explicit workspace field and creates without a man
   assert.ok(!texts.some((line) => /Label:|Profile:/.test(line)));
   assert.equal(first.cursor?.row, 2, "the native Editor owns a completion viewport above the path cursor");
   assert.equal(first.cursor?.column, 13);
-  assert.ok(texts[first.cursor!.row]?.startsWith(" ".repeat(13)), "the empty insertion row begins under the workspace field label");
+  assert.equal(texts[first.cursor!.row]?.slice(0, 13), "> Workspace: ",
+    "the label is beside the actual empty insertion row");
+  assert.equal(texts[first.cursor!.row]?.slice(13).trim(), "",
+    "the labelled native body contains no workspace draft yet");
   harness.send("/workspace");
   harness.send(ENTER); // workspace submits directly
   assert.deepEqual(harness.focusedActions(), [
@@ -2213,20 +2247,64 @@ test("exact-width form text reserves a visible end-of-value caret", () => {
   }
   const frame = harness.controller.render(24, 20);
   const texts = assertPaneSafe(frame.lines, 24, 20);
-  assert.ok(texts[2]?.startsWith(" ".repeat(13)), JSON.stringify(texts));
+  assert.ok(texts[2]?.startsWith("> Workspace: "), JSON.stringify(texts));
   assert.ok(texts[2]?.slice(13).trimEnd().endsWith("abcdefghij"), JSON.stringify(texts));
   assert.ok(texts[3]?.startsWith(" ".repeat(13)), JSON.stringify(texts));
   assert.ok(texts[3]?.slice(13).trimEnd().endsWith("k"), JSON.stringify(texts));
   assert.deepEqual(frame.cursor, { column: 14, row: 3 }, "hardware cursor follows the native Editor's wrapped value");
   assert.equal(texts[frame.cursor!.row]?.slice(13, frame.cursor!.column), "k", "cursor is at the insertion cell after the wrapped character");
+  assert.notEqual(frame.cursor?.row, 2,
+    "the caret wrapped to a later row while the label stayed on the field's first editable row");
 });
 
-test("empty, populated, Unicode, and Edit cursors align with their indented native text rows", () => {
+test("a wrapped value keeps its label on the field's first editable row as the caret moves", () => {
+  const harness = formWith({ cols: 24 });
+  for (const char of "abcdefghijk") {
+    harness.send(char);
+  }
+  // Rows are compared as written text with the generated SGR removed, exactly
+  // as every other pane witness here does; the caret is asserted against the
+  // original frame's cursor DTO.
+  const pane = () => {
+    const frame = harness.controller.render(24, 20);
+    return { rows: assertPaneSafe(frame.lines, 24, 20), cursor: frame.cursor };
+  };
+  const labelRow = (rows: readonly string[]): number =>
+    rows.findIndex((line) => line.startsWith("> Workspace: "));
+
+  const wrapped = pane();
+  const firstLabelRow = labelRow(wrapped.rows);
+  assert.equal(firstLabelRow, 2, "the label sits beside the first editable row, below the Editor's own top border");
+  assert.equal(wrapped.rows[firstLabelRow]?.slice(13).trimEnd(), "abcdefghij",
+    "the labelled row carries the field's first wrapped segment, not a border or help row");
+  assert.equal(wrapped.cursor?.row, firstLabelRow + 1, "the caret wrapped to the following row");
+
+  // Home moves the caret onto the labelled row; End moves it away again. Neither
+  // movement may drag the label with the caret.
+  harness.send("\x1b[H");
+  const atHome = pane();
+  assert.equal(labelRow(atHome.rows), firstLabelRow, "Home leaves the label on the same row");
+  assert.equal(atHome.cursor?.row, firstLabelRow, "the caret is now on the labelled row itself");
+  assert.equal(atHome.rows.filter((line) => line.startsWith("> Workspace: ")).length, 1,
+    "the field never gains a second label row");
+
+  harness.send("\x1b[4~");
+  const atEnd = pane();
+  assert.equal(labelRow(atEnd.rows), firstLabelRow, "End leaves the label on the same row");
+  assert.equal(atEnd.cursor?.row, firstLabelRow + 1, "the caret wrapped away again");
+  assert.equal(atEnd.rows[firstLabelRow]?.slice(13).trimEnd(), "abcdefghij",
+    "the labelled row still carries the first wrapped segment of the value");
+  assert.deepEqual(atEnd.cursor, wrapped.cursor,
+    "the native caret geometry is exactly what it was before the round trip");
+});
+
+test("empty, populated, Unicode, and Edit cursors sit on their labelled native text rows", () => {
   const empty = formWith({ cols: 44, rows: 10 });
   const emptyFrame = empty.controller.render(44, 10);
   const emptyRows = assertPaneSafe(emptyFrame.lines, 44, 10);
   assert.ok(emptyFrame.cursor);
-  assert.equal(emptyRows[emptyFrame.cursor.row]?.slice(0, 13), " ".repeat(13));
+  assert.equal(emptyRows[emptyFrame.cursor.row]?.slice(0, 13), "> Workspace: ",
+    "the label sits beside the editable content row, not the Editor's top rule");
   assert.equal(emptyRows[emptyFrame.cursor.row]?.slice(13).trim(), "");
 
   empty.send("/a");
@@ -2240,7 +2318,7 @@ test("empty, populated, Unicode, and Edit cursors align with their indented nati
   const unicodeFrame = unicode.controller.render(44, 10);
   const unicodeRows = assertPaneSafe(unicodeFrame.lines, 44, 10);
   assert.ok(unicodeFrame.cursor);
-  assert.equal(unicodeRows[unicodeFrame.cursor.row]?.slice(0, 13), " ".repeat(13));
+  assert.equal(unicodeRows[unicodeFrame.cursor.row]?.slice(0, 13), "> Workspace: ");
   assert.equal(unicodeRows[unicodeFrame.cursor.row]?.slice(13).trimStart().startsWith("雪"), true);
   assert.equal(visibleWidth(" ".repeat(13) + "雪"), unicodeFrame.cursor.column,
     "the Unicode grapheme occupies two terminal cells before the insertion point");
@@ -2253,7 +2331,7 @@ test("empty, populated, Unicode, and Edit cursors align with their indented nati
   const editFrame = edit.controller.render(48, 12);
   const editRows = assertPaneSafe(editFrame.lines, 48, 12);
   assert.ok(editFrame.cursor);
-  assert.equal(editRows[editFrame.cursor.row]?.slice(0, 12), " ".repeat(12));
+  assert.equal(editRows[editFrame.cursor.row]?.slice(0, 12), "> New name: ");
   assert.equal(editRows[editFrame.cursor.row]?.slice(12).trimStart().startsWith("雪"), true);
   assert.equal(visibleWidth(" ".repeat(12) + "雪"), editFrame.cursor.column,
     "Edit cursor follows the wide Unicode grapheme by terminal cells, not UTF-16 code units");

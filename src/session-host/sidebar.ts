@@ -70,7 +70,12 @@
  *   adapter provide field editing, grapheme-safe caret movement, and bounded
  *   single-line input.
  * - Editable fields use the native Editor adapter; roster and surrounding form
- *   labels remain plain text + generated SGR.
+ *   labels remain plain text + generated SGR. Every labeled field places its
+ *   label beside the Editor's first editable body row — a structural anchor that
+ *   never follows the caret across wrapped values — and never beside a rule.
+ *   The value column, cursor geometry, clipping, and tiny-pane refusal are
+ *   untouched. New/Edit, Host shortcuts, and the Network listen/Add-destination
+ *   editors share that one layout seam.
  *
  * Network sidebar (issue #482, pure frontend): every peer fact arrives as a
  * `PeerUiSnapshot` DTO from the parent-owned coordinator. This module performs
@@ -127,6 +132,7 @@ import { resolve } from "node:path";
 import {
 	createSessionHostTextField,
 	type SessionHostFieldRejection,
+	type SessionHostFieldRender,
 	type SessionHostFieldSubmission,
 	type SessionHostTextField,
 } from "./field-editor";
@@ -344,6 +350,18 @@ export interface SidebarMousePresentation {
   activateRosterAt(column: number, row: number, cols: number, rows: number): boolean;
   /** Activates only saved rows captured by the exact sidebar render this token represents. */
   activateSavedAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Activates only a network-menu row the captured render actually drew, using
+   * the network pane's ordinary Enter action.
+   */
+  activatePeerAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Dispatches one press inside the form-slot pane (the wide right pane or the
+   * narrow full-content form) to whichever pane that captured render actually
+   * drew: the Saved picker or the Network menu. A render never draws both, so
+   * exactly one map — if either — can act.
+   */
+  activateFormRowAt(column: number, row: number, cols: number, rows: number): boolean;
 }
 
 export interface SidebarFieldFactoryOptions {
@@ -479,22 +497,39 @@ interface DisplayedRoster {
 /** One remote roster row exactly as the coordinator projected it (display only). */
 type PeerRosterRow = NonNullable<PeerUiHost["roster"]["rows"]>[number];
 
+/**
+ * The semantic state one actionable network row's ordinary Enter action reads:
+ * a flat list of primitives captured with the row when the pane renders it.
+ *
+ * Toggles act on the opposite of the state that was drawn, and Apply rows send
+ * the local drafts that were shown, so a captured pointer target must bind the
+ * intent itself and not merely the row's stable key. Otherwise a snapshot or a
+ * draft change behind an unwritten frame could make a press run the opposite
+ * action or send values the operator never saw. A press whose intent no longer
+ * matches refuses instead of reinterpreting the row.
+ */
+type PeerPaneRowIntent = readonly (string | number | boolean | null)[];
+
+/** The row kinds whose Enter action changes state rather than showing information. */
+type PeerActionRowKind =
+  | "toggle-hosting"
+  | "edit-bind-host"
+  | "edit-bind-port"
+  | "apply-hosting"
+  | "toggle-auto"
+  | "toggle-bell"
+  | "add-host"
+  | "edit-add-label"
+  | "edit-add-host"
+  | "edit-add-port"
+  | "apply-add";
+
 /** Selectable network-panel rows; remote rows are a separate typed kind. */
 type PeerPaneRow =
   | {
-      readonly kind:
-        | "toggle-hosting"
-        | "edit-bind-host"
-        | "edit-bind-port"
-        | "apply-hosting"
-        | "toggle-auto"
-        | "toggle-bell"
-        | "add-host"
-        | "edit-add-label"
-        | "edit-add-host"
-        | "edit-add-port"
-        | "apply-add";
+      readonly kind: PeerActionRowKind;
       readonly key: string;
+      readonly intent: PeerPaneRowIntent;
     }
   | { readonly kind: "host"; readonly key: string; readonly host: PeerUiHost }
   | { readonly kind: "trusted"; readonly key: string; readonly peer: PeerUiTrustedPeer }
@@ -531,7 +566,17 @@ interface DisplayedPeerRows {
   readonly rows: number;
   readonly signature: string;
   readonly selectedKey: string | undefined;
-  readonly entries: readonly PeerPaneRow[];
+  readonly entries: readonly DisplayedPeerRow[];
+}
+
+/**
+ * One network-menu row paired with the pane row it was actually drawn on, so a
+ * pointer target is the written geometry and row identity rather than an index
+ * a later snapshot could reinterpret.
+ */
+interface DisplayedPeerRow {
+  readonly paneRow: number;
+  readonly row: PeerPaneRow;
 }
 
 /** Immutable, latched consent identity: snapshot reordering never retargets it. */
@@ -578,8 +623,36 @@ function peerPaneRowIdentity(row: PeerPaneRow): readonly unknown[] {
       return [row.key, row.kind, row.hostId, row.rosterState, row.row.id, row.row.lifecycle,
         row.row.hasLiveProcess];
     default:
-      return [row.key, row.kind];
+      // Actionable rows bind their drawn semantic intent, so a captured pointer
+      // target can never run the opposite or unseen action.
+      return [row.key, row.kind, row.intent];
   }
+}
+
+/** True when a captured drawn row still names the same current pane target. */
+function samePeerPaneRow(a: PeerPaneRow, b: PeerPaneRow): boolean {
+  return JSON.stringify(peerPaneRowIdentity(a)) === JSON.stringify(peerPaneRowIdentity(b));
+}
+
+/**
+ * True when a captured pointer map is still the map the pane currently draws:
+ * the same pane geometry, the same drawn ordering, and every written row still
+ * on its own written pane row. Row identity alone is not enough — a stable key
+ * that scrolled, reordered, or re-flowed to a different row would otherwise let
+ * an old coordinate activate whatever now sits under it.
+ */
+function sameDisplayedPeerRows(
+  captured: DisplayedPeerRows,
+  current: DisplayedPeerRows,
+): boolean {
+  if (captured.cols !== current.cols || captured.rows !== current.rows
+    || captured.signature !== current.signature
+    || captured.entries.length !== current.entries.length) return false;
+  return captured.entries.every((entry, index) => {
+    const live = current.entries[index];
+    return live !== undefined && entry.paneRow === live.paneRow
+      && samePeerPaneRow(entry.row, live.row);
+  });
 }
 
 function mouseAuthorizationKey(
@@ -598,7 +671,7 @@ function mouseAuthorizationKey(
     // of the authorization identity: a presentation captured from a frame with
     // different peer/consent targets can never authorize the current one.
     peer: peer === undefined ? null : [peer.cols, peer.rows, peer.signature,
-      peer.entries.map((row) => peerPaneRowIdentity(row))],
+      peer.entries.map((entry) => [entry.paneRow, ...peerPaneRowIdentity(entry.row)])],
     consent: consent === undefined || !consentRendered ? null : [
       consent.token, consent.consentId, consent.choice, consent.cols, consent.rows,
       consent.approveRow, consent.denyRow,
@@ -1030,6 +1103,42 @@ function wrapHintLines(segments: readonly string[], cols: number): string[] | un
 
 function blankLines(count: number): string[] {
   return Array.from({ length: count }, () => "");
+}
+
+/**
+ * The rows one labeled native field occupies, in pane order.
+ *
+ * The label belongs beside the field's editable body row, which the field
+ * adapter reports from the pinned Editor's own layout contract: the public
+ * Editor renders its top border first and its editable rows after it, so the
+ * body row is structural and never the caret. The label therefore stays put
+ * while the caret moves within the field or a value wraps over several rows.
+ * Every other row keeps the same-width gutter, so the value column, the native
+ * cursor geometry, the Editor's clipping, and its tiny-pane refusal stay exactly
+ * as the field rendered them. All session-host field panes (New/Edit, Host
+ * shortcuts, and the Network listen/Add-destination editors) place their label
+ * through this one seam instead of assuming row 0.
+ *
+ * A frame whose row budget never reaches the Editor's body row returns
+ * undefined: callers keep their existing truthful too-small refusal rather than
+ * labelling a border row or forcing out-of-range native geometry into range.
+ */
+function labeledFieldRows(
+  frame: SessionHostFieldRender,
+  rowCount: number,
+  prefix: string,
+  prefixWidth: number,
+  cols: number,
+): string[] | undefined {
+  const bodyRow = frame.contentRow;
+  if (!Number.isSafeInteger(bodyRow) || bodyRow < 0 || bodyRow >= rowCount) return undefined;
+  const gutter = " ".repeat(prefixWidth);
+  const rows: string[] = [];
+  for (let index = 0; index < rowCount; index += 1) {
+    const source = frame.lines[index] ?? "";
+    rows.push(wrapRow(index === bodyRow ? `${prefix}${source}` : `${gutter}${source}`, cols));
+  }
+  return rows;
 }
 
 /**
@@ -2361,6 +2470,14 @@ export class SidebarController {
         this.activateRosterAtFrom(displayedRoster, column, row, cols, rows, false),
       activateSavedAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows),
+      activatePeerAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows),
+      // Only one form-slot pane is ever drawn by one render, so the captured
+      // maps dispatch to exactly the surface the operator saw (or to neither).
+      activateFormRowAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        displayedSavedRows !== undefined
+          ? this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows)
+          : this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows),
     });
   }
 
@@ -2524,6 +2641,15 @@ export class SidebarController {
     return this.activateSavedAtFrom(this.displayedSavedRows, column, row, cols, rows);
   }
 
+  /**
+   * Activates a fully drawn network-menu row in the currently owned Network
+   * pane: the click selects that exact row and performs its ordinary Enter
+   * action once, exactly like a Saved-picker click and like the Enter key.
+   */
+  activatePeerAt(column: number, row: number, cols: number, rows: number): boolean {
+    return this.activatePeerAtFrom(this.peerDisplay, column, row, cols, rows);
+  }
+
   private activateSavedAtFrom(
     shown: DisplayedSavedRows | undefined,
     column: number,
@@ -2541,6 +2667,50 @@ export class SidebarController {
     if (currentIndex < 0) return false;
     this.savedSelectedIndex = currentIndex;
     this.activateSavedRow();
+    return true;
+  }
+
+  /**
+   * Selects the exact network row this captured render actually drew at the
+   * pressed pane coordinate and performs its ordinary Enter action once through
+   * the pane's single activation routine — the same action the Enter key runs,
+   * so no second copy of any menu action exists.
+   *
+   * The target is the written row's immutable identity, never its index: a
+   * snapshot that reordered, changed, or removed that row refuses the press
+   * instead of retargeting it, and a hidden, replaced, superseded, or
+   * differently sized pane authorizes nothing. Selecting a destination, opening
+   * the Add-destination menu, or opening a pending request's review decides
+   * nothing: consent, removal, and revoke keep their existing separately
+   * confirmed written-confirmation paths, and no field value is touched.
+   */
+  private activatePeerAtFrom(
+    shown: DisplayedPeerRows | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    if (!this._visible || this._focus !== "form" || this.formKind !== "peer"
+      || !validHitGeometry(column, row, cols, rows)) return false;
+    if (shown === undefined || shown.cols !== cols || shown.rows !== rows) return false;
+    // The captured map must still be the map the pane currently draws: same
+    // geometry, same drawn ordering, and each written row still on the pane row
+    // it was written on. A reordered, scrolled, or re-flowed pane refuses rather
+    // than letting an old coordinate activate whatever now sits there.
+    const live = this.peerDisplay;
+    if (live === undefined || !sameDisplayedPeerRows(shown, live)) return false;
+    const clicked = shown.entries.find((candidate) => candidate.paneRow === row);
+    if (clicked === undefined) return false;
+    // The row now drawn on that written pane row must still be the same target,
+    // and the current complete render must still draw it with the same semantic
+    // intent it was drawn with. Stale targets refuse rather than reinterpret.
+    const drawn = live.entries.find((candidate) => candidate.paneRow === row);
+    if (drawn === undefined || !samePeerPaneRow(drawn.row, clicked.row)) return false;
+    const current = this.drawnPeerPaneRow(drawn.row.key);
+    if (current === undefined || !samePeerPaneRow(current, drawn.row)) return false;
+    this.peerSelectedKey = current.key;
+    this.performPeerPaneAction(current);
     return true;
   }
 
@@ -4294,27 +4464,62 @@ export class SidebarController {
     return (candidate) => printable !== undefined && printableOf(candidate) === printable;
   }
 
+  /**
+   * The semantic intent one actionable network row acts on, read at the moment
+   * the row is built. Toggles flip the opposite of the drawn state and Apply rows
+   * send the current local drafts, so availability, the drawn toggle states, and
+   * the exact draft values are all part of what a press was allowed to do.
+   */
+  private peerPaneRowIntent(kind: PeerActionRowKind): PeerPaneRowIntent {
+    const settings = this.peerUiSnapshot?.settings ?? null;
+    const known = settings !== null;
+    const bindHost = this.peerBindHostDraft;
+    const bindPort = this.peerBindPortDraft;
+    const add = this.peerAddDraft;
+    switch (kind) {
+      // Both hosting rows send the drawn listen endpoint together with the
+      // opposite-or-remembered hosting state the row displayed.
+      case "toggle-hosting":
+      case "apply-hosting":
+        return [kind, known, settings?.hostingEnabled ?? null, bindHost, bindPort];
+      case "edit-bind-host":
+        return [kind, known, bindHost];
+      case "edit-bind-port":
+        return [kind, known, bindPort];
+      case "toggle-auto":
+        return [kind, known, settings?.autoReconnect ?? null];
+      case "toggle-bell":
+        return [kind, known, settings?.bellEnabled ?? null];
+      // Opening the menu shows the whole draft, so the whole draft is its intent.
+      case "add-host":
+      case "apply-add":
+        return [kind, add.label, add.host, add.port];
+      case "edit-add-label":
+        return [kind, add.label];
+      case "edit-add-host":
+        return [kind, add.host];
+      case "edit-add-port":
+        return [kind, add.port];
+    }
+  }
+
   /** Selectable network-panel rows, built fresh from the attached snapshot. */
   private buildPeerPaneRows(): readonly PeerPaneRow[] {
     // The Add-destination menu is its own field menu: the draft's three fields
     // and one explicit Add action, reachable in any order like the Listen rows.
     if (this.peerAddMenuOpen) {
-      return [
-        { key: "edit-add-label", kind: "edit-add-label" },
-        { key: "edit-add-host", kind: "edit-add-host" },
-        { key: "edit-add-port", kind: "edit-add-port" },
-        { key: "apply-add", kind: "apply-add" },
-      ];
+      return (["edit-add-label", "edit-add-host", "edit-add-port", "apply-add"] as const)
+        .map((kind) => ({ key: kind, kind, intent: this.peerPaneRowIntent(kind) }));
     }
-    const rows: PeerPaneRow[] = [
-      { key: "toggle-hosting", kind: "toggle-hosting" },
-      { key: "edit-bind-host", kind: "edit-bind-host" },
-      { key: "edit-bind-port", kind: "edit-bind-port" },
-      { key: "apply-hosting", kind: "apply-hosting" },
-      { key: "toggle-auto", kind: "toggle-auto" },
-      { key: "toggle-bell", kind: "toggle-bell" },
-      { key: "add-host", kind: "add-host" },
-    ];
+    const rows: PeerPaneRow[] = ([
+      "toggle-hosting",
+      "edit-bind-host",
+      "edit-bind-port",
+      "apply-hosting",
+      "toggle-auto",
+      "toggle-bell",
+      "add-host",
+    ] as const).map((kind) => ({ key: kind, kind, intent: this.peerPaneRowIntent(kind) }));
     const snapshot = this.peerUiSnapshot;
     if (snapshot === undefined) return rows;
     for (const host of snapshot.hosts ?? []) {
@@ -4538,16 +4743,18 @@ export class SidebarController {
     for (const line of statusLines) lines.push(wrapRow(line, cols));
     for (const line of identityLines) lines.push(wrapRow(line, cols));
     for (const line of noticeLines) lines.push(wrapRow(line, cols));
-    const drawn: PeerPaneRow[] = [];
+    const drawn: DisplayedPeerRow[] = [];
     for (let index = top; index < paneRows.length && drawn.length < listRows; index += 1) {
       const row = paneRows[index];
       const selected = index === selectedIndex;
+      // Record the written row position so a pointer target is the geometry the
+      // operator actually saw, never an index a later snapshot could reuse.
+      drawn.push({ paneRow: lines.length, row });
       lines.push(wrapRow(
         `${selected ? "> " : "  "}${this.peerPaneRowText(row)}`,
         cols,
         selected ? SGR_SELECTION_BLUE : undefined,
       ));
-      drawn.push(row);
     }
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
     for (const line of footerLines) lines.push(wrapRow(line, cols));
@@ -4629,13 +4836,29 @@ export class SidebarController {
   /** Acts only on a row the last complete network-pane render actually drew. */
   private selectedPeerPaneRow(): PeerPaneRow | undefined {
     const display = this.peerDisplay;
+    // The keyboard acts on the drawn highlight only: a newer highlight the
+    // current frame never drew is not a target.
+    if (display === undefined || display.selectedKey !== this.peerSelectedKey) return undefined;
+    return this.drawnPeerPaneRow(display.selectedKey ?? "");
+  }
+
+  /** The row the current complete network render actually drew for `key`. */
+  private drawnPeerPaneRow(key: string): PeerPaneRow | undefined {
+    const display = this.peerDisplay;
     if (display === undefined || this.formKind !== "peer" || this._focus !== "form" || !this._visible) {
       return undefined;
     }
-    if (display.selectedKey !== this.peerSelectedKey || display.signature !== this.peerPaneRowKeys()) {
-      return undefined;
-    }
-    return display.entries.find((row) => row.key === this.peerSelectedKey);
+    if (display.signature !== this.peerPaneRowKeys()) return undefined;
+    const drawn = display.entries.find((entry) => entry.row.key === key)?.row;
+    if (drawn === undefined) return undefined;
+    // The row the current state would draw must still carry the same immutable
+    // identity and the same semantic intent the operator was shown: a toggle
+    // never flips the opposite of the drawn state, and an Apply never sends a
+    // draft or endpoint the drawn frame never displayed. Stale intents refuse
+    // rather than reinterpret the row.
+    const current = this.buildPeerPaneRows().find((row) => row.key === key);
+    if (current === undefined || !samePeerPaneRow(current, drawn)) return undefined;
+    return drawn;
   }
 
   private activatePeerPaneRow(): void {
@@ -4645,6 +4868,18 @@ export class SidebarController {
       this.onInvalidate?.();
       return;
     }
+    this.performPeerPaneAction(row);
+  }
+
+  /**
+   * The network pane's single row-activation routine. The Enter key (on the
+   * drawn highlight) and a pointer press (on a drawn row) both arrive here with
+   * an already-authorized row, so neither path duplicates a menu action.
+   * Consent rows only OPEN their review, host/trusted/remote rows stay
+   * informational, and removal and revoke stay on their own explicitly
+   * confirmed keyboard paths.
+   */
+  private performPeerPaneAction(row: PeerPaneRow): void {
     const settings = this.peerUiSnapshot?.settings ?? null;
     switch (row.kind) {
       case "toggle-hosting":
@@ -5123,16 +5358,19 @@ export class SidebarController {
     const fieldWidth = Math.max(1, cols - prefixWidth);
     const fieldFrame = field.render(fieldWidth, activeRows);
     if (!fieldFrame.cursor.visible || fieldFrame.lines.length === 0) return this.renderTooSmall(cols, rows);
+    const labeledRows = labeledFieldRows(
+      fieldFrame,
+      Math.min(activeRows, fieldFrame.lines.length),
+      prefix,
+      prefixWidth,
+      cols,
+    );
+    if (labeledRows === undefined) return this.renderTooSmall(cols, rows);
 
     const lines = [wrapRow(header, cols, "\x1b[1m")];
     for (const line of contextLines) lines.push(wrapRow(line, cols));
     const fieldTopRow = lines.length;
-    const fieldRowCount = Math.min(activeRows, fieldFrame.lines.length);
-    for (let index = 0; index < fieldRowCount; index += 1) {
-      const source = fieldFrame.lines[index] ?? "";
-      const positioned = index === 0 ? `${prefix}${source}` : `${" ".repeat(prefixWidth)}${source}`;
-      lines.push(wrapRow(positioned, cols));
-    }
+    lines.push(...labeledRows);
     lines.push(wrapRow(errorLines[0] ?? "", cols));
     for (const line of errorLines.slice(1)) lines.push(wrapRow(line, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
@@ -5470,6 +5708,14 @@ export class SidebarController {
     const fieldWidth = Math.max(1, cols - prefixWidth);
     const fieldFrame = this.formField.render(fieldWidth, fieldRows);
     if (!fieldFrame.cursor.visible || fieldFrame.lines.length === 0) return this.renderTooSmall(cols, rows);
+    const labeledRows = labeledFieldRows(
+      fieldFrame,
+      Math.min(fieldRows, fieldFrame.lines.length),
+      prefix,
+      prefixWidth,
+      cols,
+    );
+    if (labeledRows === undefined) return this.renderTooSmall(cols, rows);
 
     const lines = [wrapRow(header, cols, "\x1b[1m")];
     if (editing) {
@@ -5478,12 +5724,7 @@ export class SidebarController {
       lines.push(wrapRow(truncateToWidth(currentName, cols, "...", true), cols));
     }
     const fieldTopRow = lines.length;
-    const fieldRowsToShow = Math.min(fieldRows, fieldFrame.lines.length);
-    for (let index = 0; index < fieldRowsToShow; index += 1) {
-      const source = fieldFrame.lines[index] ?? "";
-      const positionedSource = index === 0 ? `${prefix}${source}` : `${" ".repeat(prefixWidth)}${source}`;
-      lines.push(wrapRow(positionedSource, cols));
-    }
+    lines.push(...labeledRows);
     lines.push(
       this.pendingCreate !== undefined
         ? wrapRow(` Starting (request ${this.pendingCreate.requestId}) `, cols)
@@ -5546,15 +5787,21 @@ export class SidebarController {
 
     const lines = [wrapRow(header, cols, "\x1b[1m")];
     for (const contextLine of contextLines) lines.push(wrapRow(contextLine, cols));
-    const activeLines = fieldFrame.lines.slice(0, activeRows);
     const inactiveRows = inactiveLines.map((line, index) => wrapRow(
       `${index === 0 ? inactivePrefix : " ".repeat(inactivePrefixWidth)}${line}`,
       cols,
     ));
-    const activeRowsToDraw = activeLines.map((line, index) => wrapRow(
-      `${index === 0 ? activePrefix : " ".repeat(activePrefixWidth)}${line}`,
+    // The active editor's label sits beside its editable body row, exactly like
+    // the inactive sibling row above/below it, whose label already sits beside
+    // its value text.
+    const activeRowsToDraw = labeledFieldRows(
+      fieldFrame,
+      Math.min(activeRows, fieldFrame.lines.length),
+      activePrefix,
+      activePrefixWidth,
       cols,
-    ));
+    );
+    if (activeRowsToDraw === undefined) return this.renderTooSmall(cols, rows);
     const toggleRows = this.shortcutFieldIndex === 0 ? activeRowsToDraw : inactiveRows;
     const returnRows = this.shortcutFieldIndex === 1 ? activeRowsToDraw : inactiveRows;
     lines.push(...toggleRows, ...returnRows);

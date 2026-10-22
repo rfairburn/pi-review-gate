@@ -68,7 +68,9 @@ export function sameFileIdentity(left: FileIdentity, right: FileIdentity): boole
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-/** The pinned Editor draws horizontal rules and unboxed, possibly wrapped content rows. */
+/** The pinned Editor draws horizontal rules and unboxed, possibly wrapped
+ * content rows. Its label sits immediately left of the field column on the
+ * first editable body row — the row after the top rule — never on a rule. */
 interface NativeEditorContent {
   readonly rows: readonly string[];
 }
@@ -78,44 +80,67 @@ const HORIZONTAL_RULE = "─";
 function readNativeEditorContent(frame: string, fieldLabel: "> Workspace:" | "> New name:"): NativeEditorContent {
   const lines = frame.split("\n");
   const prefix = `${fieldLabel} `;
-  let labelRow = -1;
-  let labelColumn = -1;
-  let fieldColumn = -1;
-  let fieldWidth = 0;
 
+  // The Editor block is identified by its own horizontal rules, never by an
+  // assumed offset from the label. A rule is a maximal run of rule glyphs that
+  // starts the field column (line start or a space to its left) and runs to the
+  // right edge of the field.
+  interface RuleRun { topRow: number; column: number; width: number }
+  interface FieldBlock { topRow: number; bottomRow: number; column: number; width: number }
+  const runs: RuleRun[] = [];
   for (let row = 0; row < lines.length; row += 1) {
     const line = lines[row]!;
-    const candidateLabelColumn = line.indexOf(fieldLabel);
-    if (candidateLabelColumn < 0 || line.slice(candidateLabelColumn, candidateLabelColumn + prefix.length) !== prefix) continue;
-    const column = candidateLabelColumn + prefix.length;
-    const border = /^─+/.exec(line.slice(column))?.[0];
-    if (!border) continue;
-    labelRow = row;
-    labelColumn = candidateLabelColumn;
-    fieldColumn = column;
-    fieldWidth = border.length;
-    break;
+    for (let column = 0; column < line.length; column += 1) {
+      if (line[column] !== HORIZONTAL_RULE) continue;
+      if (column > 0 && line[column - 1] !== " ") continue;
+      let end = column;
+      while (end < line.length && line[end] === HORIZONTAL_RULE) end += 1;
+      if (line.slice(end).trim() !== "") continue;
+      runs.push({ topRow: row, column, width: end - column });
+      column = end;
+    }
   }
 
-  if (labelRow < 0 || fieldWidth < 1) {
-    throw new Error(`public native Editor ${fieldLabel} has no visible horizontal top rule at its field column`);
+  // The label must sit inside the field's content body: immediately left of the
+  // field column on the first editable row, the row directly after the top rule.
+  // A label beside the top or bottom rule is the superseded mislabelled Editor
+  // and is rejected, never accepted as a fallback. More than one labelled field
+  // box in one frame is ambiguous and fails closed.
+  const candidates: FieldBlock[] = [];
+  for (const run of runs) {
+    const labelledRow = run.topRow + 1;
+    if (lines[labelledRow] === undefined
+      || lines[labelledRow]!.slice(run.column - prefix.length, run.column) !== prefix) continue;
+    // The Editor may wrap one logical value over several unboxed rows. Use the
+    // matching bottom rule, not an assumed single content row or corner glyph.
+    let bottomRow = -1;
+    const rule = HORIZONTAL_RULE.repeat(run.width);
+    for (let row = run.topRow + 1; row < lines.length; row += 1) {
+      if (lines[row]!.slice(run.column, run.column + run.width) === rule) bottomRow = row;
+    }
+    if (bottomRow <= labelledRow) {
+      throw new Error(
+        `public native Editor ${fieldLabel} has no complete horizontal bottom rule and content body`,
+      );
+    }
+    candidates.push({ topRow: run.topRow, bottomRow, column: run.column, width: run.width });
   }
 
-  // The Editor may wrap one logical value over several unboxed rows. Use the
-  // matching bottom rule, not an assumed single content row or corner glyph.
-  let bottomRow = -1;
-  const rule = HORIZONTAL_RULE.repeat(fieldWidth);
-  for (let row = labelRow + 1; row < lines.length; row += 1) {
-    if (lines[row]!.slice(fieldColumn, fieldColumn + fieldWidth) === rule) bottomRow = row;
+  if (candidates.length > 1) {
+    throw new Error(`public native Editor ${fieldLabel} is ambiguous: more than one field box carries its label`);
   }
-  if (bottomRow <= labelRow + 1) {
-    throw new Error(`public native Editor ${fieldLabel} has no complete horizontal bottom rule and content body`);
+  if (candidates.length === 0) {
+    throw new Error(
+      `public native Editor ${fieldLabel} has no visible horizontal top rule at its field column`,
+    );
   }
+  const { topRow, bottomRow, column: fieldColumn, width: fieldWidth } = candidates[0]!;
+  const labelRow = topRow + 1;
 
   const rows: string[] = [];
-  for (let row = labelRow + 1; row < bottomRow; row += 1) {
+  for (let row = topRow + 1; row < bottomRow; row += 1) {
     const line = lines[row]!;
-    if (line.slice(labelColumn, fieldColumn).trim() !== "") {
+    if (row !== labelRow && line.slice(fieldColumn - prefix.length, fieldColumn).trim() !== "") {
       throw new Error(`public native Editor ${fieldLabel} content is not aligned under its visible field column`);
     }
     const content = line.slice(fieldColumn, fieldColumn + fieldWidth);

@@ -69,7 +69,30 @@ test("Windows native helper contract compares filesystem identities without Numb
   assert.equal(sameFileIdentity(same, { dev: same.dev, ino: same.ino + 1n }), false);
 });
 
+/**
+ * The real pinned Editor contract as the session host draws it: the field label
+ * sits immediately left of the field column on the first editable body row, and
+ * the Editor's own top and bottom rules stay unlabeled.
+ */
 function publicEditorFrame(
+  fieldLabel: "> Workspace:" | "> New name:",
+  bodyRows: readonly string[],
+  width = 24,
+): string {
+  const indent = "     ";
+  const prefix = `${fieldLabel} `;
+  const gutter = `${indent}${" ".repeat(prefix.length)}`;
+  const rule = "─".repeat(width);
+  return [
+    "Session host · Welcome",
+    `${gutter}${rule}`,
+    ...bodyRows.map((row, index) => `${index === 0 ? `${indent}${prefix}` : gutter}${row.padEnd(width)}`),
+    `${gutter}${rule}`,
+  ].join("\n");
+}
+
+/** The superseded mislabelled Editor: the label sits beside the top rule. */
+function publicEditorFrameLabelOnTopRule(
   fieldLabel: "> Workspace:" | "> New name:",
   bodyRows: readonly string[],
   width = 24,
@@ -85,6 +108,37 @@ function publicEditorFrame(
     `${bodyIndent}${rule}`,
   ].join("\n");
 }
+
+test("Windows native helper contract requires the field label inside the content body", () => {
+  // The corrected alignment is read as the field's own complete body.
+  const labelled = publicEditorFrame("> Workspace:", ["", "C:\\owned\\project"]);
+  assert.equal(readBorderedEditorContent(labelled, "> Workspace:"), "C:\\owned\\project");
+  assertNativeEditorFieldEmpty(publicEditorFrame("> New name:", ["", ""]), "> New name:");
+  assert.throws(() => assertNativeEditorFieldEmpty(
+    publicEditorFrame("> Workspace:", ["", "draft"]), "> Workspace:",
+  ), /not empty/);
+
+  // The superseded layout, where the label sat beside the top rule and the body
+  // rows were unlabeled, is never accepted as a field.
+  const mislabelled = publicEditorFrameLabelOnTopRule("> Workspace:", ["C:\\owned\\project"]);
+  assert.throws(() => readBorderedEditorContent(mislabelled, "> Workspace:"), /horizontal top rule/);
+  assert.throws(() => readBorderedEditorContent(publicEditorFrameLabelOnTopRule("> New name:", [""]), "> New name:"),
+    /horizontal top rule/);
+  // A label beside no field column at all is still not a field.
+  assert.throws(() => assertNativeEditorFieldEmpty(" > Workspace: ", "> Workspace:"), /horizontal top rule/);
+  // And a labelled block with no bottom rule is never a complete body.
+  const truncated = publicEditorFrame("> Workspace:", ["", ""]).split("\n").slice(0, -1).join("\n");
+  assert.throws(() => assertNativeEditorFieldEmpty(truncated, "> Workspace:"), /horizontal bottom rule/);
+  // A body row whose left gutter carries other text is not aligned field content.
+  const crowded = publicEditorFrame("> Workspace:", ["", "x"]).split("\n");
+  const crowdedRow = crowded[3]!;
+  crowded[3] = `${crowdedRow.slice(0, 10)}x${crowdedRow.slice(11)}`;
+  assert.throws(() => readBorderedEditorContent(crowded.join("\n"), "> Workspace:"),
+    /not aligned under its visible field column/);
+  // Two labelled field boxes in one frame never resolve to "the first one".
+  const doubled = `${publicEditorFrame("> Workspace:", ["", ""])}\n${publicEditorFrame("> Workspace:", ["", ""])}`;
+  assert.throws(() => readBorderedEditorContent(doubled, "> Workspace:"), /ambiguous/);
+});
 
 test("Windows native helper contract parses the pinned Editor's horizontal rules and complete empty bodies", () => {
   const workspace = publicEditorFrame("> Workspace:", [""]);

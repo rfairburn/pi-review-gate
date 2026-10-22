@@ -103,12 +103,18 @@ receipts of exactly what the model was told.
 
 ## Prerequisites
 
-- Node.js 22.19.0 or newer for package installation and direct package commands; this
-  extension's support floor matches Pi 1.0.0's verified minimum (see
-  [Getting started](docs/getting-started.md#prerequisites)). The `.sh` and `.cmd`
-  session-host entry points can bootstrap an isolated, checksum-pinned official Node
-  22.19.0 runtime on supported OS/architectures when PATH has no supported Node; a
-  supported PATH Node is retained.
+- Node.js at or above its release line's security floor for package installation and
+  direct package commands: 22.23.4 or newer on Node 22, 24.22.1 or newer on Node 24,
+  or 26.12.1 or newer on Node 26. These are the October 2026 Node.js security
+  releases, which include the eMudhra intermediate-CA compromise fix. Later patches in
+  a line are accepted, and Node 26 is not required. Other majors keep their existing
+  eligibility (see
+  [Node.js security floors](docs/getting-started.md#nodejs-security-floors)). The
+  `.sh` and `.cmd` session-host entry points can bootstrap an isolated,
+  checksum-pinned official Node 22.23.4 runtime on supported OS/architectures when
+  PATH has no supported Node; a supported PATH Node is retained. Updating the
+  requirement does not update or restart Node processes that are already installed or
+  running. Update Node.js yourself, then restart those processes.
 - Pi 1.0.0 or newer, installed independently; Pi versions below 1.0.0 are outside
   the supported compatibility scope.
 - Git on `PATH` for captured/worktree-based delegated execution (capture, landing,
@@ -180,8 +186,8 @@ in one terminal on macOS/Linux. It does not replace either launcher; see the
 [session-host alpha guide](docs/session-host-alpha.md) for requirements, limitations,
 and the host-only shortcut configuration/editor.
 Launch it with the one-command entry points. They retain a supported Node on PATH or
-bootstrap the source-pinned official Node.js 22.19.0 archive under an isolated per-agent
-cache when Node is missing or too old (macOS/Linux x64 or
+bootstrap the source-pinned official Node.js 22.23.4 archive under an isolated per-agent
+cache when Node is missing or below its release line's security floor (macOS/Linux x64 or
 arm64; Windows x64, arm64, or x86). The pinned archive digest is verified and freshly
 extracted on installation/update; a previously completed fallback runtime is reused when
 it is still current, so later fallback launches do not download or extract again. This
@@ -190,8 +196,10 @@ change normal user configuration. The launcher also resolves (or provisions) the
 Pi runtime automatically — no manual Pi CLI path is needed. The `.cmd` entry point
 performs the Node bootstrap. Experimental same-machine Windows source paths for the
 native session-host backend are prepared for validation only: they do not establish
-Windows support, parity, or readiness, and real Windows Node 22.19 and 24 native
-runtime validation remains required. POSIX macOS/Linux remains the supported alpha
+Windows support, parity, or readiness, and real Windows native runtime validation on
+the patched Node 22 and 24 lines remains required. Earlier Windows CI evidence on Node
+22.19.0 and 24.x is historical: it predates these floors and is not a patched-runtime
+run. POSIX macOS/Linux remains the supported alpha
 host scope:
 
 ```bash

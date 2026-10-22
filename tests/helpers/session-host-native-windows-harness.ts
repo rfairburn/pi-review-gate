@@ -87,6 +87,7 @@ import {
   validateNativeExchangeGuardCorrelation,
   type NativeExchangeGuardSnapshot,
 } from "./session-host-windows-native-exchange-guard-contract";
+import { NODE_SECURITY_FLOOR_TEXT, stableNodeMeetsSecurityFloor } from "./node-security-floor";
 
 export {
   assertNativeEditorFieldEmpty,
@@ -573,9 +574,9 @@ export function resolveWindowsRuntime(): WindowsRuntimePin {
   if (process.platform !== "win32") throw new Error("required real Windows Main acceptance was requested on a non-Windows host");
   const nodeVersion = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(process.versions.node);
   if (!nodeVersion) throw new Error("stable Node version could not be established for the Windows native host");
-  const major = Number(nodeVersion[1]);
-  const minor = Number(nodeVersion[2]);
-  if (!(major > 22 || (major === 22 && minor >= 19))) throw new Error("Windows native Main acceptance requires stable Node >=22.19.0");
+  if (!stableNodeMeetsSecurityFloor(process.versions.node)) {
+    throw new Error(`Windows native Main acceptance requires stable ${NODE_SECURITY_FLOOR_TEXT}`);
+  }
 
   // Refuse real executor capabilities before constructing the allowlisted test env.
   assertNoRoleOrCatalogMarkers(process.env);

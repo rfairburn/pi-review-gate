@@ -69,7 +69,7 @@ REVIEW_GATE_ROOT="$(launcher_package_root pi-review-gate)" || exit 1
 # (the platform's native home), and the per-platform separators. That keeps Git
 # Bash/MSYS launches from handing native-invalid /c/... paths to Node.
 if ! command -v node >/dev/null 2>&1; then
-  echo "pi-review-gate: Node.js 22.19.0 or newer is required to launch pi-review-gate." >&2
+  echo "pi-review-gate: Node.js 22.23.4 or newer (Node 24 >=24.22.1, Node 26 >=26.12.1) is required to launch pi-review-gate." >&2
   exit 127
 fi
 

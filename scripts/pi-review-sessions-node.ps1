@@ -18,7 +18,11 @@ $env:PI_REVIEW_GATE_NODE_GENERATION = $null
 $env:PI_REVIEW_GATE_NODE_HOLDER = $null
 
 $CjsEntry = Join-Path $PSScriptRoot 'pi-review-sessions.cjs'
-$MinimumNode = [version]'22.19.0'
+# Per-release-line Node security minimums (issue 489), mirroring meetsNodeFloor
+# in pi-review-sessions.cjs. Ordered newest line first: any other major inherits
+# the floor of the nearest listed lower line, so newer unlisted majors keep the
+# existing policy and releases below Node 22 compare against the Node 22 floor.
+$NodeLineFloors = @([version]'26.12.1', [version]'24.22.1', [version]'22.23.4')
 
 # One cleanup pass (inventory plus every removal it attempts) shares this elapsed
 # budget, so a large or deep generation cannot reset the clock per generation.
@@ -41,8 +45,12 @@ function Test-NodeFloor([string]$VersionText) {
   } catch {
     return $false
   }
-  if ($candidate -lt $MinimumNode) { return $false }
-  if ($candidate -eq $MinimumNode -and $Matches[4]) { return $false }
+  $minimum = $NodeLineFloors[$NodeLineFloors.Count - 1]
+  foreach ($floor in $NodeLineFloors) {
+    if ($floor.Major -le $candidate.Major) { $minimum = $floor; break }
+  }
+  if ($candidate -lt $minimum) { return $false }
+  if ($candidate -eq $minimum -and $Matches[4]) { return $false }
   return $true
 }
 
@@ -133,21 +141,21 @@ if ([string]::IsNullOrEmpty($NativeArchitecture)) { $NativeArchitecture = '' }
 switch ($NativeArchitecture.ToUpperInvariant()) {
   'AMD64' {
     $NodePlatform = 'win-x64'
-    $NodeArchive = 'node-v22.19.0-win-x64.zip'
-    $NodeSha256 = 'ea3fad0e67a991d8477d8c01344b56e69c676ccb733f065b22436994b1253f86'
+    $NodeArchive = 'node-v22.23.4-win-x64.zip'
+    $NodeSha256 = 'cbc74b5e0982c9dbb41525fd8fb5dcd32fbee237863f7829072f4639a1ce5f20'
   }
   'ARM64' {
     $NodePlatform = 'win-arm64'
-    $NodeArchive = 'node-v22.19.0-win-arm64.zip'
-    $NodeSha256 = 'e4a7336010d58ff35b53d9dd5869095c56089c70913cf22508cf8183593e56b2'
+    $NodeArchive = 'node-v22.23.4-win-arm64.zip'
+    $NodeSha256 = 'a8b8cd79cbbb3062435f449591d98dd63730bbbf30ce2d7cc3a6376c236cb111'
   }
   'X86' {
     $NodePlatform = 'win-x86'
-    $NodeArchive = 'node-v22.19.0-win-x86.zip'
-    $NodeSha256 = '708b8a297a19e9ac433e32ac0fc496755757c5e00bd5a0683917e73cae5fe8ea'
+    $NodeArchive = 'node-v22.23.4-win-x86.zip'
+    $NodeSha256 = '7d6c4dce2ecccca46e3c4b3e43c8bebbd1969bd616fdb4fda1e8269171d9ccea'
   }
   default {
-    [Console]::Error.WriteLine('pi-review-sessions: no pinned Node.js 22.19.0 archive is available for this Windows architecture.')
+    [Console]::Error.WriteLine('pi-review-sessions: no pinned Node.js 22.23.4 archive is available for this Windows architecture.')
     exit 1
   }
 }
@@ -326,12 +334,12 @@ function Read-RuntimeMarker([string]$Path) {
 function Test-CurrentFallbackRuntime([string]$CacheRoot) {
   $record = Read-RuntimeMarker (Join-Path $CacheRoot 'current-node.txt')
   if ($null -eq $record) { return $null }
-  if ($record['version'] -cne '22.19.0' -or $record['platform'] -cne $NodePlatform -or $record['archive'] -cne $NodeArchive -or $record['sha256'] -cne $NodeSha256) { return $null }
+  if ($record['version'] -cne '22.23.4' -or $record['platform'] -cne $NodePlatform -or $record['archive'] -cne $NodeArchive -or $record['sha256'] -cne $NodeSha256) { return $null }
   $generation = [string]$record['generation']
   if ($generation -notmatch '^(?:bootstrap[-.])[A-Za-z0-9-]+$') { return $null }
   $generationDirectory = Join-Path $CacheRoot $generation
   try { Assert-OrdinaryDirectory $generationDirectory } catch { return $null }
-  $nodeRoot = Join-Path (Join-Path $generationDirectory 'extracted') ('node-v22.19.0-' + $NodePlatform)
+  $nodeRoot = Join-Path (Join-Path $generationDirectory 'extracted') ('node-v22.23.4-' + $NodePlatform)
   $nodeExe = Join-Path $nodeRoot 'node.exe'
   $npmCommand = Join-Path $nodeRoot 'npm.cmd'
   $npmCli = Join-Path $nodeRoot 'node_modules\npm\bin\npm-cli.js'
@@ -365,16 +373,16 @@ function Publish-RuntimeMarker([string]$CacheRoot, [string]$GenerationRoot) {
   $markerPath = Join-Path $CacheRoot 'current-node.txt'
   $generation = [IO.Path]::GetFileName($GenerationRoot)
   $existing = Read-RuntimeMarker $markerPath
-  if ($null -ne $existing -and $existing['version'] -ceq '22.19.0' -and $existing['platform'] -ceq $NodePlatform -and $existing['archive'] -ceq $NodeArchive -and $existing['sha256'] -ceq $NodeSha256 -and $existing['generation'] -ceq $generation) {
+  if ($null -ne $existing -and $existing['version'] -ceq '22.23.4' -and $existing['platform'] -ceq $NodePlatform -and $existing['archive'] -ceq $NodeArchive -and $existing['sha256'] -ceq $NodeSha256 -and $existing['generation'] -ceq $generation) {
     return
   }
-  $nodeExe = Join-Path (Join-Path (Join-Path $GenerationRoot 'extracted') ('node-v22.19.0-' + $NodePlatform)) 'node.exe'
+  $nodeExe = Join-Path (Join-Path (Join-Path $GenerationRoot 'extracted') ('node-v22.23.4-' + $NodePlatform)) 'node.exe'
   $identity = $null
   try { $identity = Get-PathIdentity $nodeExe } catch { return }
   $temporary = Join-Path $CacheRoot ('.current-node.' + [string]$PID + '.' + [Guid]::NewGuid().ToString('N'))
   $body = @(
     'schema=1',
-    'version=22.19.0',
+    'version=22.23.4',
     ('platform=' + $NodePlatform),
     ('archive=' + $NodeArchive),
     ('sha256=' + $NodeSha256),
@@ -420,7 +428,7 @@ function Protect-CachedFallbackRuntime([string]$CacheRoot, [string]$GenerationRo
     Assert-NodeFence $chain
     $selected = Test-CurrentFallbackRuntime $CacheRoot
     if ($null -eq $selected -or (Join-Path $CacheRoot $selected.Generation) -cne $GenerationRoot) { return $false }
-    $nodeExe = Join-Path (Join-Path (Join-Path $GenerationRoot 'extracted') ('node-v22.19.0-' + $NodePlatform)) 'node.exe'
+    $nodeExe = Join-Path (Join-Path (Join-Path $GenerationRoot 'extracted') ('node-v22.23.4-' + $NodePlatform)) 'node.exe'
     try {
       Assert-OrdinaryDirectory $GenerationRoot
       Assert-OrdinaryFile $nodeExe
@@ -1288,7 +1296,7 @@ try {
   # This is the sole download URL; redirects and caller-controlled URLs are
   # rejected. The downloader has both elapsed-time and byte limits.
   if (-not (Assert-PathIdentity $cacheRoot $cacheIdentity) -or -not (Assert-PathIdentity $WorkRoot $workIdentity)) { throw 'Bootstrap root identity changed before download.' }
-  $url = 'https://nodejs.org/dist/v22.19.0/' + $NodeArchive
+  $url = 'https://nodejs.org/dist/v22.23.4/' + $NodeArchive
   Receive-OfficialArchive $url $archivePath
   Assert-OrdinaryFile $archivePath
   $archiveIdentity = Get-PathIdentity $archivePath
@@ -1297,7 +1305,7 @@ try {
   if ($actualSha256 -cne $NodeSha256) { throw 'Official Node archive checksum mismatch.' }
   if (-not (Assert-PathIdentity $cacheRoot $cacheIdentity) -or -not (Assert-PathIdentity $WorkRoot $workIdentity) -or -not (Assert-PathIdentity $archivePath $archiveIdentity)) { throw 'Archive identity changed after checksum verification.' }
 
-  $expectedRoot = 'node-v22.19.0-' + $NodePlatform
+  $expectedRoot = 'node-v22.23.4-' + $NodePlatform
   Expand-VerifiedZip $archivePath $extractRoot $expectedRoot
   if (-not (Assert-PathIdentity $cacheRoot $cacheIdentity) -or -not (Assert-PathIdentity $WorkRoot $workIdentity) -or -not (Assert-PathIdentity $extractRoot $extractIdentity) -or -not (Assert-PathIdentity $archivePath $archiveIdentity)) { throw 'Extraction ownership changed.' }
   $nodeRoot = Join-Path $extractRoot $expectedRoot

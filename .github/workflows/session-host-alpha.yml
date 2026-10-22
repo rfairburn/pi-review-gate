@@ -46,7 +46,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [22.19.0, 24.x]
+        # Exact patched per-line security floors (October 2026 security
+        # releases). Earlier Node 22.19.0/24.x runs are historical evidence.
+        node-version: [22.23.4, 24.22.1]
     env:
       PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
     steps:

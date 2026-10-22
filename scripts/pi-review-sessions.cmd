@@ -2,7 +2,7 @@
 setlocal DisableDelayedExpansion
 rem Native Windows one-command session-host entry point. The PowerShell
 rem bootstrap selects supported PATH Node or verifies/extracts the fixed
-rem official Node 22.19.0 archive before invoking the shared CJS unchanged.
+rem official Node 22.23.4 archive before invoking the shared CJS unchanged.
 
 rem Capability isolation must precede the PowerShell child, every Node probe,
 rem and every bootstrap network/archive child. Never remove role/catalog

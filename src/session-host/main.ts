@@ -426,11 +426,25 @@ function canonicalExistingDirectory(path: string | undefined): string | undefine
   }
 }
 
+/**
+ * Per-release-line Node security minimums (issue 489), mirroring meetsNodeFloor
+ * in scripts/pi-review-sessions.cjs. Any other major inherits the floor of the
+ * nearest listed lower line, so newer unlisted majors keep the existing policy
+ * and releases below Node 22 are refused. Main admits stable versions only.
+ */
+const NODE_LINE_FLOORS: readonly (readonly [number, number, number])[] = [[22, 23, 4], [24, 22, 1], [26, 12, 1]];
+
 function stableNodeVersion(version: string): boolean {
   const parsed = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
   if (!parsed) return false;
-  const [major, minor] = parsed.slice(1).map(Number);
-  return major !== undefined && minor !== undefined && (major > 22 || (major === 22 && minor >= 19));
+  const actual = parsed.slice(1).map(Number);
+  const major = actual[0]!;
+  const floor = [...NODE_LINE_FLOORS].reverse().find(([floorMajor]) => floorMajor <= major) ?? NODE_LINE_FLOORS[0]!;
+  for (let index = 0; index < floor.length; index += 1) {
+    if (actual[index]! > floor[index]!) return true;
+    if (actual[index]! < floor[index]!) return false;
+  }
+  return true;
 }
 
 function sidebarFocus(focus: SidebarController["focus"]): HostFocus {

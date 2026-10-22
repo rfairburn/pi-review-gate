@@ -85,6 +85,7 @@ import {
   type PtyJournalRecord,
 } from "./session-host-native-windows-harness";
 import { LegDeadline, frameWaitFailure } from "./session-host-native-windows-launcher";
+import { NODE_SECURITY_FLOOR_TEXT, stableNodeMeetsSecurityFloor } from "./node-security-floor";
 
 export { LegDeadline, frameWaitFailure };
 export {
@@ -405,9 +406,9 @@ export function resolveLauncherRuntime(layout: PosixLauncherLegLayout): PosixLau
   }
   const nodeVersion = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(process.versions.node);
   if (!nodeVersion) throw new Error("stable Node version could not be established for the POSIX launcher host");
-  const major = Number(nodeVersion[1]);
-  const minor = Number(nodeVersion[2]);
-  if (!(major > 22 || (major === 22 && minor >= 19))) throw new Error("POSIX source-launcher acceptance requires stable Node >=22.19.0");
+  if (!stableNodeMeetsSecurityFloor(process.versions.node)) {
+    throw new Error(`POSIX source-launcher acceptance requires stable ${NODE_SECURITY_FLOOR_TEXT}`);
+  }
 
   assertAdmissibleOriginalEnvironment(process.env);
   const agentPin = process.env.PI_REVIEW_GATE_INSTALLED_AGENT?.trim();

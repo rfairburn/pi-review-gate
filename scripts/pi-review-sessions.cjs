@@ -96,8 +96,9 @@ const {
 const USAGE = `Usage: pi-review-sessions [--pi-executable <path>] [--state-root <path>] [--sidebar-key <key>] [--help] [-- <Pi arguments...>]
 
 Alpha same-machine macOS/Linux session host with Windows source paths available
-for native validation only (not a Windows readiness claim). Requires Node >=22.19.0
-and Pi >=1.0.4 with a positively identified Node CLI entry. Without --pi-executable the
+for native validation only (not a Windows readiness claim). Requires Node >=22.23.4
+with the per-line security minimums Node 24 >=24.22.1 and Node 26 >=26.12.1, and
+Pi >=1.0.4 with a positively identified Node CLI entry. Without --pi-executable the
 launcher resolves the public @earendil-works/pi-coding-agent installation
 (npm global root, then PATH) and, when none is supported, provisions an
 isolated Pi 1.3.0 runtime cache under the native Pi agent directory; no
@@ -131,7 +132,19 @@ const ROLE_ENV_NAMES = [
   "PI_REVIEW_GATE_RUNTIME_ROLE",
   "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG",
 ];
-const MIN_NODE_VERSION = [22, 19, 0];
+// Per-release-line Node security minimums (issue 489). A listed line must meet
+// its own floor; any other major inherits the floor of the nearest listed lower
+// line, so an unlisted newer major (23, 25, 27, ...) keeps the existing
+// newer-major policy while every release below Node 22 stays refused. Mirrored
+// by node_version_supported (pi-review-sessions.sh), Test-NodeFloor
+// (pi-review-sessions-node.ps1), stableNodeVersion (src/session-host/main.ts),
+// and the package engines range.
+const NODE_LINE_FLOORS = Object.freeze([
+  Object.freeze([22, 23, 4]),
+  Object.freeze([24, 22, 1]),
+  Object.freeze([26, 12, 1]),
+]);
+const NODE_FLOOR_REQUIREMENT = "Node >=22.23.4 (Node 24 >=24.22.1, Node 26 >=26.12.1)";
 
 // Public Pi runtime identity (issue 323): the supported package and its
 // exact provisioned version. The floor matches the native launch contract in
@@ -264,15 +277,31 @@ function parseSessionHostArguments(argv) {
   return result;
 }
 
+function applicableNodeFloor(major) {
+  for (let index = NODE_LINE_FLOORS.length - 1; index >= 0; index -= 1) {
+    if (NODE_LINE_FLOORS[index][0] <= major) return NODE_LINE_FLOORS[index];
+  }
+  return NODE_LINE_FLOORS[0];
+}
+
 function meetsNodeFloor(version) {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/u.exec(version);
   if (!match) return false;
   const actual = [Number(match[1]), Number(match[2]), Number(match[3])];
-  for (let index = 0; index < MIN_NODE_VERSION.length; index += 1) {
-    if (actual[index] > MIN_NODE_VERSION[index]) return true;
-    if (actual[index] < MIN_NODE_VERSION[index]) return false;
+  const floor = applicableNodeFloor(actual[0]);
+  for (let index = 0; index < floor.length; index += 1) {
+    if (actual[index] > floor[index]) return true;
+    if (actual[index] < floor[index]) return false;
   }
   return match[4] === undefined;
+}
+
+/** Truthful, bounded refusal naming the applicable line minimum when parseable. */
+function nodeFloorRefusal(version) {
+  const match = typeof version === "string" ? /^(\d{1,6})\.(\d{1,6})\.(\d{1,6})(?:-[0-9A-Za-z.-]{1,64})?$/u.exec(version) : null;
+  if (!match) return `pi-review-sessions: ${NODE_FLOOR_REQUIREMENT} is required.\n`;
+  const floor = applicableNodeFloor(Number(match[1])).join(".");
+  return `pi-review-sessions: Node ${version} is below the ${floor} security minimum for its release line; ${NODE_FLOOR_REQUIREMENT} is required.\n`;
 }
 
 function isNonempty(value) {
@@ -1584,7 +1613,7 @@ async function runSessionHostLauncher(argv, overrides = {}) {
     return 1;
   }
   if (!meetsNodeFloor(deps.nodeVersion)) {
-    deps.writeError("pi-review-sessions: Node >=22.19.0 is required.\n");
+    deps.writeError(nodeFloorRefusal(deps.nodeVersion));
     return 1;
   }
   if (!deps.stdinIsTTY || !deps.stdoutIsTTY) {

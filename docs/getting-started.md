@@ -7,14 +7,17 @@ Behavioral detail lives in the linked pages.
 
 ### Installed by you
 
-- **Node.js 22.19.0 or newer**, plus **npm** for installation and source-checkout
-  builds. CI exercises Node 22.19.0 (the supported minimum) and Node 24.
+- **Node.js at or above its release line's security floor**, plus **npm** for
+  installation and source-checkout builds (see [Node.js security floors](#nodejs-security-floors)):
+  Node 22.x needs **22.23.4** or newer, Node 24.x needs **24.22.1** or newer, and
+  Node 26.x needs **26.12.1** or newer. CI's `verify` matrix exercises exactly those
+  three floors.
 - **Pi 1.0.0 or newer**, installed independently. `pi-review-gate` consumes Pi's
   public extension and CLI/RPC surfaces; it does not patch or bundle Pi, and Pi
   remains independently installed and upgradeable. Pi versions below 1.0.0 are
-  outside the supported compatibility scope. The Node.js 22.19.0 floor is verified
-  by Pi 1.0.0's own package metadata; use a Node version meeting both packages'
-  requirements.
+  outside the supported compatibility scope. Pi 1.0.0's own package metadata
+  requires Node.js 22.19.0 or newer; this package's per-line security floors are
+  higher, so use a Node version meeting both packages' requirements.
 - **For reviews or worker execution: the chosen harness**, installed and
   authenticated through its own login/configuration: the Codex CLI (`codex` by default), the Claude CLI (`claude`),
   a Pi-scoped model (the `pi` CLI), or a generic CLI program. Do not put OAuth tokens
@@ -90,6 +93,41 @@ engine declaration; do not interpret that absence as verification of every versi
 
 No API keys or OAuth tokens belong in the review-gate config; harness authentication
 stays in each harness's own login/configuration.
+
+### Node.js security floors
+
+The Node.js requirement is a minimum per release line, not a single version:
+
+| Release line | Minimum version |
+| --- | --- |
+| Node 22.x | 22.23.4 |
+| Node 24.x | 24.22.1 |
+| Node 26.x | 26.12.1 |
+
+These minimums are the
+[October 2026 Node.js security releases](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases),
+which fix several vulnerabilities in the 22.x, 24.x, and 26.x lines, including the
+eMudhra intermediate-CA compromise. The
+[Node.js 26.12.1 release notes](https://nodejs.org/en/blog/release/v26.12.1/), for
+example, update the root certificates to NSS 3.131.1 and reject certificate chains
+that contain blocked public keys. The package declares the floors as
+`>=22.23.4 <24.0.0 || >=24.22.1 <26.0.0 || >=26.12.1`. A bare `>=22.23.4` would
+still admit unpatched 24.x and 26.x releases.
+
+- Later patch and minor releases in the same line are accepted. You do not need to
+  move to Node 26; any supported line at or above its own floor works.
+- Other majors keep their existing eligibility. This baseline adds no floor for
+  them and drops none. The October 2026 security releases cover only the 22.x,
+  24.x, and 26.x lines.
+- The session-host entry points' managed fallback runtime stays on Node 22 and
+  is now the checksum-pinned official Node.js 22.23.4 archive. A fallback runtime
+  that an earlier release set up on Node.js 22.19.0 is not reused.
+- Raising the documented minimum does not change any Node.js already installed or
+  running on your machine, and nothing replaces a live runtime automatically. Update
+  Node.js through your usual installer or version manager. Then restart running Pi,
+  review-gate, session-host, and web-tool processes so they load the patched
+  runtime. A process started before the update keeps running the old runtime until
+  it exits.
 
 ## Installation
 

@@ -5,6 +5,7 @@ import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "no
 import { stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 import { SIDEBAR_COLUMNS, parseRosterFrame, sidebarPaneLines } from "./session-host-native-roster-witness";
 import type { NativePtyModule, RuntimePin } from "./session-host-native-main-harness";
+import { NODE_SECURITY_FLOOR_TEXT, stableNodeMeetsSecurityFloor } from "./node-security-floor";
 
 /**
  * Bounded test-only companion for the real native row-lifecycle acceptance
@@ -18,11 +19,7 @@ import type { NativePtyModule, RuntimePin } from "./session-host-native-main-har
  */
 
 function nodeVersionMeetsFloor(): boolean {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(process.version);
-  if (!match) return false;
-  const major = Number(match[1]);
-  const minor = Number(match[2]);
-  return major > 22 || (major === 22 && minor >= 19);
+  return stableNodeMeetsSecurityFloor(process.versions.node);
 }
 
 /**
@@ -59,7 +56,7 @@ export function resolveRowLifecycleRuntimePin(t: { skip(message?: string): void 
     return undefined;
   }
   if (!nodeVersionMeetsFloor()) {
-    admission.skip("the real native Pi runtime requires stable Node >=22.19.0");
+    admission.skip(`the real native session host requires stable ${NODE_SECURITY_FLOOR_TEXT}`);
     return undefined;
   }
 

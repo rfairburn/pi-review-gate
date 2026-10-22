@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, opendirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 import nodeTest, { type TestContext } from "node:test";
+import { NODE_SECURITY_FLOOR_CASES, stableNodeMeetsSecurityFloor } from "./helpers/node-security-floor";
 
 interface ParsedArguments {
   help: boolean;
@@ -482,7 +483,7 @@ function baseOverrides(
     getEnv: () => env,
     processEnv: {},
     platform: "linux",
-    nodeVersion: "22.19.0",
+    nodeVersion: "22.23.4",
     stdinIsTTY: true,
     stdoutIsTTY: true,
     packageRoot,
@@ -598,7 +599,7 @@ test("Windows role aliases and ambiguous ordinary aliases stop before setup", as
       getEnv: () => env,
       processEnv: {},
       platform: "win32",
-      nodeVersion: "22.19.0",
+      nodeVersion: "22.23.4",
       stdinIsTTY: true,
       stdoutIsTTY: true,
       packageRoot: process.cwd(),
@@ -845,7 +846,9 @@ test("--help works in the real CLI without TTY, role setup, build, or provisioni
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Alpha same-machine macOS\/Linux/);
-  assert.match(result.stdout, /Node >=22\.19\.0/);
+  assert.match(result.stdout, /Node >=22\.23\.4/);
+  assert.match(result.stdout, /Node 24 >=24\.22\.1/);
+  assert.match(result.stdout, /Node 26 >=26\.12\.1/);
   assert.match(result.stdout, /Pi >=1\.0\.4/);
   assert.match(result.stdout, /no\s+manual Pi CLI path is needed/);
   assert.match(result.stdout, /Basic controls only; bounded native Kitty PNG rendering targets direct Ghostty/);
@@ -1098,7 +1101,7 @@ test("synthetic stage cleanup retains source stages across setup and host outcom
       getEnv: () => makeEnvironment({ HOME: fixture.root }),
       processEnv: {},
       platform: "linux",
-      nodeVersion: "22.19.0",
+      nodeVersion: "22.23.4",
       stdinIsTTY: true,
       stdoutIsTTY: true,
       packageRoot: fixture.packageRoot,
@@ -1316,7 +1319,7 @@ test("a relative PI_CODING_AGENT_DIR anchors host paths against the startup cwd"
     getEnv: () => env,
     processEnv: {},
     platform: "linux",
-    nodeVersion: "22.19.0",
+    nodeVersion: "22.23.4",
     stdinIsTTY: true,
     stdoutIsTTY: true,
     packageRoot: fixture.packageRoot,
@@ -1393,7 +1396,7 @@ test("the preparation seam receives the sanitized setup environment exactly once
     getEnv: () => env,
     processEnv: {},
     platform: "linux",
-    nodeVersion: "22.19.0",
+    nodeVersion: "22.23.4",
     stdinIsTTY: true,
     stdoutIsTTY: true,
     packageRoot: fixture.packageRoot,
@@ -1473,8 +1476,8 @@ test("role, platform, Node floor, and TTY failures stop before setup without lea
       secret: "private-catalog-secret",
     },
     { env: makeEnvironment(), overrides: { platform: "freebsd" }, expected: /macOS\/Linux and Windows source admission only/ },
-    { env: makeEnvironment(), overrides: { nodeVersion: "22.18.9" }, expected: /Node >=22\.19\.0/ },
-    { env: makeEnvironment(), overrides: { nodeVersion: "22.19.0-rc.1" }, expected: /Node >=22\.19\.0/ },
+    { env: makeEnvironment(), overrides: { nodeVersion: "22.23.3" }, expected: /Node 22\.23\.3 is below the 22\.23\.4 security minimum/ },
+    { env: makeEnvironment(), overrides: { nodeVersion: "22.23.4-rc.1" }, expected: /below the 22\.23\.4 security minimum/ },
     { env: makeEnvironment(), overrides: { stdinIsTTY: false }, expected: /interactive stdin and stdout/ },
     { env: makeEnvironment(), overrides: { stdoutIsTTY: false }, expected: /interactive stdin and stdout/ },
   ];
@@ -1485,7 +1488,7 @@ test("role, platform, Node floor, and TTY failures stop before setup without lea
       getEnv: () => failure.env,
       processEnv: {},
       platform: "linux",
-      nodeVersion: "22.19.0",
+      nodeVersion: "22.23.4",
       stdinIsTTY: true,
       stdoutIsTTY: true,
       packageRoot: process.cwd(),
@@ -1501,6 +1504,75 @@ test("role, platform, Node floor, and TTY failures stop before setup without lea
     assert.deepEqual(events, []);
     assert.match(stderr, failure.expected);
     if (failure.secret) assert.doesNotMatch(stderr, new RegExp(failure.secret));
+  }
+});
+
+test("per-line Node security minimums gate the launcher before any setup (issue 489)", async (t) => {
+  const fixture = makePackageFixture(false);
+  cleanupFixture(t, fixture);
+  // Literal applicable line floors for every refused parseable case.
+  const refusedFloor: Record<string, string> = {
+    "21.99.99": "22.23.4", "22.19.0": "22.23.4", "22.23.3": "22.23.4", "22.23.4-rc.1": "22.23.4",
+    "24.0.0": "24.22.1", "24.22.0": "24.22.1", "24.22.1-rc.1": "24.22.1",
+    "26.0.0": "26.12.1", "26.5.0": "26.12.1", "26.12.0": "26.12.1", "26.12.1-rc.1": "26.12.1",
+  };
+  for (const entry of NODE_SECURITY_FLOOR_CASES) {
+    const events: string[] = [];
+    const captured: HostOptions[] = [];
+    let stderr = "";
+    const status = await launcher.__test.runSessionHostLauncher([], baseOverrides(fixture.packageRoot, makeEnvironment(), events, captured, {
+      nodeVersion: entry.version,
+      writeError: (text) => { stderr += text; },
+    }));
+    if (entry.launcher) {
+      assert.equal(status, 0, `${entry.version} (${entry.why}) must launch: ${stderr}`);
+      assert.deepEqual(events, ["build", "ddgs", "pi", "load", "run"], `${entry.version} reaches the normal launch sequence`);
+      assert.equal(captured.length, 1, `${entry.version} starts exactly one host`);
+    } else {
+      const floor = refusedFloor[entry.version];
+      assert.ok(floor, `${entry.version} has a literal expected floor`);
+      assert.equal(status, 1, `${entry.version} (${entry.why}) must be refused`);
+      assert.deepEqual(events, [], `${entry.version} is refused before build, Pi, DDGS, load, or run`);
+      assert.equal(stderr,
+        `pi-review-sessions: Node ${entry.version} is below the ${floor} security minimum for its release line; `
+        + "Node >=22.23.4 (Node 24 >=24.22.1, Node 26 >=26.12.1) is required.\n");
+    }
+  }
+  for (const malformed of ["v22.23.4", "22.23", "", "22.23.4.1"]) {
+    let stderr = "";
+    const events: string[] = [];
+    const status = await launcher.__test.runSessionHostLauncher([], baseOverrides(fixture.packageRoot, makeEnvironment(), events, [], {
+      nodeVersion: malformed,
+      writeError: (text) => { stderr += text; },
+    }));
+    assert.equal(status, 1, `malformed ${JSON.stringify(malformed)} is refused`);
+    assert.deepEqual(events, []);
+    assert.equal(stderr, "pi-review-sessions: Node >=22.23.4 (Node 24 >=24.22.1, Node 26 >=26.12.1) is required.\n");
+  }
+});
+
+test("the real CLI judges its actually loaded Node runtime against the per-line minimum (issue 489)", (t) => {
+  // REAL HOST: no injected version. Non-TTY stdio makes an admitted runtime stop
+  // at the interactive-stdio check right after the floor, before any setup.
+  const loaded = process.versions.node;
+  if (loaded.includes("-")) {
+    t.skip(`prerelease host Node ${loaded}: the stable expectation does not apply`);
+    return;
+  }
+  assert.equal(process.version, `v${loaded}`, "the loaded runtime reports one consistent version");
+  const result = spawnSync(process.execPath, [SCRIPT], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: makeEnvironment(),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  assert.equal(result.status, 1, result.stderr);
+  if (stableNodeMeetsSecurityFloor(loaded)) {
+    assert.equal(result.stderr, "pi-review-sessions: an interactive stdin and stdout are required.\n",
+      `loaded Node ${loaded} passes the per-line minimum`);
+  } else {
+    assert.match(result.stderr, new RegExp(`^pi-review-sessions: Node ${loaded.replace(/\./g, "\\.")} is below the `),
+      `loaded Node ${loaded} is refused with an actionable per-line minimum`);
   }
 });
 

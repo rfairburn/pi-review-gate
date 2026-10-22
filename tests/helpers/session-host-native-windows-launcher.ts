@@ -87,6 +87,7 @@ import {
   type WindowsOwnedSession,
   type WindowsPowerShellPin,
 } from "./session-host-native-windows-harness";
+import { NODE_SECURITY_FLOOR_TEXT, stableNodeMeetsSecurityFloor } from "./node-security-floor";
 
 export { WindowsOwnedExitObserver };
 export type { NativePtyHandle };
@@ -206,9 +207,9 @@ export function resolveLauncherRuntime(): LauncherRuntimePin {
   if (process.platform !== "win32") throw new Error("required real Windows source-launcher acceptance was requested on a non-Windows host");
   const nodeVersion = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(process.versions.node);
   if (!nodeVersion) throw new Error("stable Node version could not be established for the Windows launcher host");
-  const major = Number(nodeVersion[1]);
-  const minor = Number(nodeVersion[2]);
-  if (!(major > 22 || (major === 22 && minor >= 19))) throw new Error("Windows source-launcher acceptance requires stable Node >=22.19.0");
+  if (!stableNodeMeetsSecurityFloor(process.versions.node)) {
+    throw new Error(`Windows source-launcher acceptance requires stable ${NODE_SECURITY_FLOOR_TEXT}`);
+  }
 
   assertNoRoleOrCatalogMarkers(process.env);
   const agentPin = process.env.PI_REVIEW_GATE_INSTALLED_AGENT?.trim();

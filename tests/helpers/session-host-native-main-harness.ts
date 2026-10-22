@@ -67,6 +67,7 @@ import {
   sidebarRosterHidden,
   type RosterNavigationTarget,
 } from "./session-host-native-roster-witness";
+import { NODE_SECURITY_FLOOR_TEXT, stableNodeMeetsSecurityFloor } from "./node-security-floor";
 
 export const TEST_TIMEOUT_MS = 8 * 60_000;
 export const EVENT_TIMEOUT_MS = 30_000;
@@ -370,11 +371,7 @@ export function requiredOrSkip(t: { skip(message?: string): void }, message: str
 }
 
 function nodeVersionMeetsFloor(): boolean {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(process.version);
-  if (!match) return false;
-  const major = Number(match[1]);
-  const minor = Number(match[2]);
-  return major > 22 || (major === 22 && minor >= 19);
+  return stableNodeMeetsSecurityFloor(process.versions.node);
 }
 
 export function resolveRuntimePin(t: { skip(message?: string): void }): RuntimePin | undefined {
@@ -386,7 +383,7 @@ export function resolveRuntimePin(t: { skip(message?: string): void }): RuntimeP
     return undefined;
   }
   if (!nodeVersionMeetsFloor()) {
-    requiredOrSkip(t, "the real native Pi runtime requires stable Node >=22.19.0");
+    requiredOrSkip(t, `the real native session host requires stable ${NODE_SECURITY_FLOOR_TEXT}`);
     return undefined;
   }
 

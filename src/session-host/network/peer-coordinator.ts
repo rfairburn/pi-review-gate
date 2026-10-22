@@ -73,6 +73,12 @@
  * owner's own Main provider decides and acts, and only the owner's next
  * authoritative snapshot can change the roster projection.
  *
+ * The one ROWLESS owner-create controller (see `peer-create.ts`) rides that same
+ * lane under the same verified pin, destination epoch, and owner run: it needs no
+ * row, selection, native tuple, viewer, or display fact, creates no local row, and
+ * selects and focuses nothing. The owner's own Main provider is the only thing
+ * that can start a child, and only from the owner's exact current run.
+ *
  * Native input and text copies for that selected stream are optional and
  * default-inert. Without explicit `nativeIo` callbacks this coordinator is exactly
  * the previous display-only one: no native capability is offered, no input or copy
@@ -144,6 +150,16 @@ import type {
 } from "./peer-content";
 import type { OwnerCloseHandler, PeerCloseController, PeerCloseResult, PeerCloseTarget, PeerCoordinatorWithClose } from "./peer-close";
 import {
+	isOwnerCreateRunStillCurrent,
+	isOwnerCreateWorkspace,
+	type OwnerCreateHandler,
+	type PeerCreateController,
+	type PeerCreateOptions,
+	type PeerCreateResult,
+	type PeerCreateTarget,
+	type PeerCoordinatorWithCreate,
+} from "./peer-create";
+import {
 	DEFAULT_PEER_PREFERENCES,
 	MAX_PEER_DESTINATIONS,
 	isValidPeerEndpointHost,
@@ -164,7 +180,7 @@ import {
 	type PeerTransportBounds,
 	type PeerTransportErrorCode,
 } from "./protocol";
-import { isRosterBridgeIdentifier } from "./roster-bridge-protocol";
+import { isRosterBridgeIdentifier, ROSTER_BRIDGE_CREATE_CAPABILITY } from "./roster-bridge-protocol";
 import { attachRosterBridgeViewer, type RosterBridgeProjection, type RosterBridgeViewer } from "./roster-bridge-client";
 import {
 	createRosterBridgeHost,
@@ -308,6 +324,19 @@ export interface PeerCoordinatorOptions {
 	 * capability) behaves exactly as it does today.
 	 */
 	readonly closeOwnedSession?: OwnerCloseHandler;
+	/**
+	 * The host's ONE rowless owner-create provider, supplied by Main, which already
+	 * owns the only manager, the only run identity, and the only launch path.
+	 *
+	 * The owner bridge offers the optional create capability only when this provider
+	 * is present, and every request is reauthorized against the current TLS-proved
+	 * peer key and current directional receiving grant immediately before it is
+	 * reached. The coordinator never wraps it and never emulates a create: Main's own
+	 * launch lifecycle owns the operation, and a host that supplies nothing (or an
+	 * old peer that never negotiated the capability) behaves exactly as it does
+	 * today.
+	 */
+	readonly createOwnedSession?: OwnerCreateHandler;
 	readonly onChange: (snapshot: PeerUiSnapshot) => void;
 	/** Advisory, exactly-once-per-new-incoming-handle arrival signal. */
 	readonly onIncomingConsentArrival: (consentId: string) => void;
@@ -592,6 +621,23 @@ function normalizeCloseTarget(value: unknown): PeerCloseTarget | null {
 }
 
 /**
+ * Validate and copy one rowless create request. The destination handle is a local
+ * action handle, the owner run must be carryable as an opaque protocol identifier
+ * and is REQUIRED input from the caller's last written form destination, and the
+ * workspace must be the canonical single-line text the New form can hold. A
+ * request this contract cannot represent is refused rather than repaired,
+ * defaulted to another destination or run, or rewritten to a newer one.
+ */
+function normalizeCreateTarget(value: unknown): PeerCreateTarget | null {
+	if (!isRecord(value)) return null;
+	const { hostId, hostRunId, workspace } = value;
+	if (typeof hostId !== "string" || hostId.length === 0) return null;
+	if (!isRosterBridgeIdentifier(hostRunId)) return null;
+	if (!isOwnerCreateWorkspace(workspace)) return null;
+	return Object.freeze({ hostId, hostRunId, workspace });
+}
+
+/**
  * Map one failed content-channel open onto a fixed code. A content open never
  * asks a human: its per-connection server-key approver rejects, so a missing or
  * changed key is reported as such and nothing is retried or re-prompted.
@@ -860,7 +906,7 @@ function readNativeInputRequest(value: unknown): PeerNativeInputRequest | null {
 	return Object.freeze({ hostId, selectionGeneration, subscriptionId, source, inputModes, kind, text });
 }
 
-class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinatorWithClose {
+class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinatorWithClose, PeerCoordinatorWithCreate {
 	readonly #options: PeerCoordinatorOptions;
 	readonly #consentWindowMs: number;
 	readonly #autoReconnectDelaysMs: readonly number[];
@@ -962,6 +1008,15 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 	readonly #ownerCloseController: PeerCloseController = {
 		closeSession: (target: PeerCloseTarget): Promise<PeerCloseResult> => this.#closeSession(target),
 	};
+	/**
+	 * The ONE rowless owner-create controller: a property of this coordinator rather
+	 * than a second manager, needing no selection, row, viewer, lease, or on-demand
+	 * connection. The caller's own written-form proof is REQUIRED for every request.
+	 */
+	readonly #ownerCreateController: PeerCreateController = {
+		createSession: (target: PeerCreateTarget, options: PeerCreateOptions): Promise<PeerCreateResult> =>
+			this.#createSession(target, options),
+	};
 	#host: PeerHost | null = null;
 	#preferences: PeerPreferences | null = null;
 	#preferencesLoaded = false;
@@ -1028,6 +1083,16 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 	 */
 	get ownerClose(): PeerCloseController {
 		return this.#ownerCloseController;
+	}
+
+	/**
+	 * The one rowless Create controller. It exists from construction and needs
+	 * nothing selected or displayed: a request addresses one already connected
+	 * destination by its own saved handle plus the exact owner run and workspace its
+	 * last written form destination named, and needs no row to exist yet.
+	 */
+	get ownerCreate(): PeerCreateController {
+		return this.#ownerCreateController;
 	}
 
 	read(): PeerUiSnapshot {
@@ -1174,6 +1239,9 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 				...(this.#options.closeOwnedSession === undefined
 					? {}
 					: { closeOwnedSession: this.#options.closeOwnedSession }),
+				...(this.#options.createOwnedSession === undefined
+					? {}
+					: { createOwnedSession: this.#options.createOwnedSession }),
 			});
 		} catch {
 			this.#bridge = null;
@@ -2313,6 +2381,11 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		try {
 			viewer = attachRosterBridgeViewer({
 				channel,
+				// This side knows the rowless create exchange and says so explicitly. It is
+				// not part of the viewer's default offers, so nothing about the existing lane
+				// changes for a caller that never asks, and the owner still acknowledges it
+				// only when it really holds a create provider.
+				capabilities: [ROSTER_BRIDGE_CREATE_CAPABILITY],
 				onProjection: (projection) => this.#onProjection(runtime, epoch, projection),
 			});
 		} catch {
@@ -2441,12 +2514,12 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 				// synchronously immediately before it calls `channel.send`, so a request
 				// whose destination, pin, identity, channel, or epoch was replaced while it
 				// waited in the send queue is never submitted at all.
-				stillCurrent: () => this.#closeFenceHolds(runtime, viewer, metadata, client, destinationEpoch),
+				stillCurrent: () => this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch),
 			},
 		);
 		// A positively-not-sent answer stays true regardless of any later change.
 		if (result.kind === "not-sent") return result;
-		if (!this.#closeFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) {
+		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) {
 			// The request may already have been submitted, so nothing here can claim it
 			// never happened; an answer from a replaced destination is not this one's.
 			return { kind: "unknown" };
@@ -2454,8 +2527,104 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		return result;
 	}
 
-	/** True only while every fact one close attempt borrowed is still current. */
-	#closeFenceHolds(
+	// ------------------------------------------------------- owner create (rowless)
+
+	/**
+	 * Create one blank child in ONE exact owner run through the destination's
+	 * EXISTING connected metadata viewer.
+	 *
+	 * No row, selection, published stream, native conversation tuple, controller
+	 * lease, or on-demand connection is involved, and an owner whose current roster
+	 * is empty is a perfectly valid first target. The request names one local saved
+	 * destination, the exact owner run its last WRITTEN form destination named, and
+	 * the canonical workspace that form held; the owner's own provider decides and
+	 * starts the child.
+	 *
+	 * Everything this attempt borrows is captured and revalidated after the await:
+	 * the destination runtime, its metadata channel, its borrowed client, its
+	 * destination epoch, the remembered pin, and this side's current identity. The
+	 * caller's own written-form/run/workspace proof is REQUIRED and is combined with
+	 * those independent owner facts inside the transport write boundary, with the
+	 * owner facts re-proved AFTER the callback returns, so an admission-only proof
+	 * can never submit a stale create. A completed result whose fences no longer hold
+	 * is reported `unknown` rather than retargeted, and nothing is created, selected,
+	 * or focused locally.
+	 */
+	async #createSession(target: PeerCreateTarget, options: PeerCreateOptions): Promise<PeerCreateResult> {
+		if (this.#closed || this.#tearingDown) return { kind: "not-sent", reason: "not-ready" };
+		const request = normalizeCreateTarget(target);
+		if (request === null) return { kind: "not-sent", reason: "invalid-request" };
+		// The caller's last-instant proof is required, not optional: without a real
+		// written form/run/workspace fence nothing may be submitted at all.
+		const proof: unknown = options;
+		if (!isRecord(proof) || typeof proof.stillCurrent !== "function") {
+			return { kind: "not-sent", reason: "invalid-request" };
+		}
+		const callerStillCurrent = proof.stillCurrent;
+		const runtime = this.#runtime.get(request.hostId);
+		if (runtime === undefined) return { kind: "not-sent", reason: "target-unavailable" };
+		const viewer = runtime.viewer;
+		const metadata = runtime.channel;
+		const client = runtime.client;
+		if (
+			runtime.state !== "connected"
+			|| viewer === null
+			|| metadata === null
+			|| client === null
+		) return { kind: "not-sent", reason: "target-unavailable" };
+		// The exact run the caller's written form destination named must still be the
+		// run this side observed for that destination. A row is never required, and a
+		// missing, newer, or unknown run is refused rather than rewritten.
+		const roster = runtime.roster;
+		if (!isOwnerCreateRunStillCurrent(roster.hostRunId, request.hostRunId)) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		// The verified destination facts the request is fenced against: the pin saved
+		// for this destination is still the key the live metadata channel really
+		// proved, and this side's current identity is still the one the borrowed
+		// client proves. No new pin is written and no identity is created here.
+		const pin = this.#readPin(runtime.id);
+		if (pin === null || !peerKeysEqual(pin, metadata.peerKey)) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		const identity = this.#currentIdentity();
+		if (identity === null || !peerKeysEqual(identity.key, client.key)) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		// The owner never acknowledged create support for this channel: no frame exists.
+		if (!viewer.supportsCreate) return { kind: "not-sent", reason: "capability-unsupported" };
+		const destinationEpoch = runtime.epoch;
+		const result = await viewer.createSession(
+			{ hostRunId: request.hostRunId, workspace: request.workspace },
+			{
+				stillCurrent: () => {
+					let callerOwns = false;
+					try {
+						callerOwns = callerStillCurrent() === true;
+					} catch {
+						// An unavailable caller proof is no proof at all.
+						return false;
+					}
+					if (!callerOwns) return false;
+					// The independent owner facts are re-proved AFTER the caller's proof
+					// returns, so a callback cannot authorize a create on its own, and the
+					// requested owner run is re-checked here at the transport boundary.
+					return this.#createFenceHolds(runtime, viewer, metadata, client, destinationEpoch, request.hostRunId);
+				},
+			},
+		);
+		// A positively-not-sent answer stays true regardless of any later change.
+		if (result.kind === "not-sent") return result;
+		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) {
+			// The request may already have been submitted, so nothing here can claim it
+			// never happened; an answer from a replaced destination is not this one's.
+			return { kind: "unknown" };
+		}
+		return result;
+	}
+
+	/** True only while every fact one protected owner request borrowed is still current. */
+	#protectedRequestFenceHolds(
 		runtime: DestinationRuntime,
 		viewer: RosterBridgeViewer,
 		metadata: PeerByteChannel,
@@ -2473,6 +2642,28 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		const identity = this.#currentIdentity();
 		if (identity === null || !peerKeysEqual(identity.key, client.key)) return false;
 		return true;
+	}
+
+	/**
+	 * The create-specific last-instant fence: every borrowed owner fact is still
+	 * current AND this side still observes the EXACT owner run the request was built
+	 * for. It is re-proved after the caller's own proof inside the transport write
+	 * boundary, so an over-permissive or stale caller callback can never submit a
+	 * create for a run whose observation was replaced while the request waited.
+	 *
+	 * Close keeps its own fence unchanged: a close names an existing row, while a
+	 * create names the run itself.
+	 */
+	#createFenceHolds(
+		runtime: DestinationRuntime,
+		viewer: RosterBridgeViewer,
+		metadata: PeerByteChannel,
+		client: PeerClient,
+		destinationEpoch: number,
+		hostRunId: string,
+	): boolean {
+		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) return false;
+		return isOwnerCreateRunStillCurrent(runtime.roster.hostRunId, hostRunId);
 	}
 
 	// ------------------------------------------------------ selected content lane
@@ -4041,6 +4232,11 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
 		// support this host cannot honour.
 		throw new TypeError("peer coordinator close provider is invalid");
 	}
+	if (options.createOwnedSession !== undefined && typeof options.createOwnedSession !== "function") {
+		// The same rule for the rowless create provider: no implicit support this host
+		// cannot honour.
+		throw new TypeError("peer coordinator create provider is invalid");
+	}
 	if (options.testHooks !== undefined) {
 		const hooks = options.testHooks;
 		if (!isRecord(hooks)) throw new TypeError("peer coordinator test hooks are invalid");
@@ -4097,6 +4293,6 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
  */
 export function createPeerCoordinator(
 	options: PeerCoordinatorOptions,
-): PeerCoordinatorWithContent & PeerCoordinatorWithClose {
+): PeerCoordinatorWithContent & PeerCoordinatorWithClose & PeerCoordinatorWithCreate {
 	return new OwnedPeerCoordinator(assertOptions(options));
 }

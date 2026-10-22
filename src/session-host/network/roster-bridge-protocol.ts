@@ -38,10 +38,23 @@
  * carries no payload, error, signal, path, or native conversation tuple, and it
  * adds no listener, manager, grant, or persisted state. Metadata semantics —
  * pages, revisions, runs, subscriptions — are completely unaffected by it.
+ *
+ * The optional ROWLESS owner-create exchange (`create_request` / `create_result`)
+ * rides that same lane under the same rules and only when both sides
+ * acknowledged {@link ROSTER_BRIDGE_CREATE_CAPABILITY}. One request names this
+ * owner's exact run, one canonical workspace, and a per-channel monotonic
+ * sequence; nothing in it is a row id, a native conversation tuple, a display
+ * fact, or a path decision. It adds no listener, manager, grant, queue, replay
+ * cache, or persisted state, and metadata semantics are untouched by it.
  */
 
 import { isRecord } from "../../record-guard";
 import { isOwnerCloseFacts, type OwnerCloseFacts } from "./peer-close";
+import {
+  isOwnerCreateFacts,
+  isOwnerCreateWorkspace,
+  type OwnerCreateFacts,
+} from "./peer-create";
 import { parseRemoteSessionMetadata, type RemoteSessionMetadata } from "./roster-metadata";
 
 /** Service identity of the metadata channel; distinct from the child IPC protocol. */
@@ -60,12 +73,22 @@ export const ROSTER_BRIDGE_REQUIRED_CAPABILITY = "roster-v1";
  */
 export const ROSTER_BRIDGE_CLOSE_CAPABILITY = "roster-close-v1";
 /**
+ * Optional capability for the rowless owner-create exchange. Like Close, it means
+ * protocol support only, never authority: the owner acknowledges it solely when
+ * it really holds its own create provider, and every request is still authorized
+ * and re-proved by that owner before its provider is invoked. It is known here but
+ * is never offered by default, so nothing about the existing lane activates by
+ * this declaration alone.
+ */
+export const ROSTER_BRIDGE_CREATE_CAPABILITY = "roster-create-v1";
+/**
  * Optional capabilities this implementation knows. An identifier offered by a
  * peer is recorded only when it appears here and is otherwise ignored; an
  * acknowledgement additionally narrows to what the owner can really honour.
  */
 export const ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Object.freeze([
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
+  ROSTER_BRIDGE_CREATE_CAPABILITY,
 ]);
 
 /** One metadata subscription per channel; not configurable. */
@@ -110,6 +133,14 @@ export interface RosterBridgeBounds {
    * this side's patience, not the owner's operation.
    */
   readonly closeResultTimeoutMs: number;
+  /**
+   * How long a requester waits for one `create_result` after the create frame was
+   * handed to the transport. Exceeding it is `unknown`, never a retry, a cancel,
+   * or a replay. It reuses the same patience class as Close (`closeResultTimeoutMs`)
+   * because it bounds this side's patience with one owner-answered request, and it
+   * never bounds the owner's own operation.
+   */
+  readonly createResultTimeoutMs: number;
 }
 
 export const DEFAULT_ROSTER_BRIDGE_BOUNDS: RosterBridgeBounds = Object.freeze({
@@ -127,6 +158,7 @@ export const DEFAULT_ROSTER_BRIDGE_BOUNDS: RosterBridgeBounds = Object.freeze({
   transferIdleTimeoutMs: 30_000,
   stopAckTimeoutMs: 2_000,
   closeResultTimeoutMs: 15_000,
+  createResultTimeoutMs: 15_000,
 });
 
 const BOUND_KEYS = Object.keys(DEFAULT_ROSTER_BRIDGE_BOUNDS) as ReadonlyArray<keyof RosterBridgeBounds>;
@@ -318,6 +350,32 @@ export interface RosterBridgeCloseResultFrame {
   readonly outcome: OwnerCloseFacts;
 }
 
+/**
+ * One rowless owner-create request. Every identifier is opaque and bounded, the
+ * workspace is canonical single-line text inside the New form's own bound, and
+ * `sequence` is this channel's strictly increasing attempt number. Nothing else
+ * is expressible: no row id, no payload, no path decision, no error, no native
+ * tuple, and no display or selection fact can ride along.
+ */
+export interface RosterBridgeCreateRequestFrame {
+  readonly type: "create_request";
+  /** This requester's fresh, unpredictable correlation id. */
+  readonly requestId: string;
+  /** Exact owner run id the request names and the result must still belong to. */
+  readonly hostRunId: string;
+  /** Canonical workspace text exactly as the requester's form held it. */
+  readonly workspace: string;
+  /** Strictly increasing, positive per-channel attempt number. */
+  readonly sequence: number;
+}
+
+/** One fixed owner answer for exactly one request id. */
+export interface RosterBridgeCreateResultFrame {
+  readonly type: "create_result";
+  readonly requestId: string;
+  readonly outcome: OwnerCreateFacts;
+}
+
 export type RosterBridgeFrame =
   | RosterBridgeHelloFrame
   | RosterBridgeHelloAckFrame
@@ -329,6 +387,8 @@ export type RosterBridgeFrame =
   | RosterBridgeUnsubscribedFrame
   | RosterBridgeCloseRequestFrame
   | RosterBridgeCloseResultFrame
+  | RosterBridgeCreateRequestFrame
+  | RosterBridgeCreateResultFrame
   | RosterBridgeErrorFrame;
 
 const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze({
@@ -342,6 +402,8 @@ const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze(
   unsubscribed: new Set(["type", "subscriptionId"]),
   close_request: new Set(["type", "requestId", "hostRunId", "rowId", "confirmed"]),
   close_result: new Set(["type", "requestId", "outcome"]),
+  create_request: new Set(["type", "requestId", "hostRunId", "workspace", "sequence"]),
+  create_result: new Set(["type", "requestId", "outcome"]),
   error: new Set(["type", "code", "subscriptionId"]),
 });
 
@@ -356,6 +418,8 @@ const REQUIRED_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.free
   unsubscribed: new Set(["subscriptionId"]),
   close_request: new Set(["requestId", "hostRunId", "rowId", "confirmed"]),
   close_result: new Set(["requestId", "outcome"]),
+  create_request: new Set(["requestId", "hostRunId", "workspace", "sequence"]),
+  create_result: new Set(["requestId", "outcome"]),
   error: new Set(["code"]),
 });
 
@@ -425,6 +489,16 @@ function readCapabilities(value: unknown, bounds: RosterBridgeBounds): readonly 
     capabilities.push(entry);
   }
   return Object.freeze(capabilities);
+}
+
+/**
+ * One canonical workspace. The field rule itself lives in the pure create
+ * contract, so the wire acceptance and the requester's local acceptance can
+ * never disagree; nothing is trimmed, resolved, rewritten, or truncated here.
+ */
+function readWorkspace(value: unknown): string {
+  if (!isOwnerCreateWorkspace(value)) fail("bad_frame");
+  return value;
 }
 
 function readRows(value: unknown, bounds: RosterBridgeBounds): readonly RemoteSessionMetadata[] {
@@ -497,6 +571,27 @@ function validateFrame(frame: RosterBridgeFrame, bounds: RosterBridgeBounds): Ro
     case "close_result": {
       readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
       if (!isOwnerCloseFacts(frame.outcome)) fail("invalid_frame");
+      return frame;
+    }
+    case "create_request": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      readIdentifier(frame.hostRunId, bounds.maxIdentifierBytes);
+      readWorkspace(frame.workspace);
+      // The anti-replay scalar must be a positive safe integer; the per-channel
+      // high-water comparison itself belongs to the two endpoints.
+      if (!Number.isSafeInteger(frame.sequence) || frame.sequence < 1) fail("invalid_frame");
+      return frame;
+    }
+    case "create_result": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      if (!isOwnerCreateFacts(frame.outcome)) fail("invalid_frame");
+      // A `started` fact names one owner run and one row, so both must be
+      // carryable identifiers on this side too; otherwise the peer could never
+      // decode what this side built.
+      if (frame.outcome.kind === "started") {
+        readIdentifier(frame.outcome.hostRunId, bounds.maxIdentifierBytes);
+        readIdentifier(frame.outcome.rowId, bounds.maxIdentifierBytes);
+      }
       return frame;
     }
     case "error": {
@@ -620,6 +715,32 @@ function buildFrame(record: Record<string, unknown>, bounds: RosterBridgeBounds)
         type,
         requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
         outcome: Object.freeze({ kind: outcome.kind }),
+      });
+    }
+    case "create_request": {
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        hostRunId: readIdentifier(ownField(record, "hostRunId"), bounds.maxIdentifierBytes),
+        workspace: readWorkspace(ownField(record, "workspace")),
+        sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
+      });
+    }
+    case "create_result": {
+      const outcome = ownField(record, "outcome");
+      // The fact boundary is closed: one fixed kind, and for `started` exactly the
+      // owner run and row it names. Nothing else is carried.
+      if (!isOwnerCreateFacts(outcome)) fail("bad_frame");
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        outcome: outcome.kind === "started"
+          ? Object.freeze({
+            kind: "started" as const,
+            hostRunId: readIdentifier(outcome.hostRunId, bounds.maxIdentifierBytes),
+            rowId: readIdentifier(outcome.rowId, bounds.maxIdentifierBytes),
+          })
+          : Object.freeze({ kind: outcome.kind }),
       });
     }
     case "error": {

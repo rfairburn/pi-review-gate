@@ -39,6 +39,7 @@ import {
 import {
   DEFAULT_ROSTER_BRIDGE_BOUNDS,
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
+  ROSTER_BRIDGE_CREATE_CAPABILITY,
   ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
@@ -58,11 +59,14 @@ import {
   type RosterBridgeBounds,
   type RosterBridgeCloseRequestFrame,
   type RosterBridgeCloseResultFrame,
+  type RosterBridgeCreateRequestFrame,
+  type RosterBridgeCreateResultFrame,
   type RosterBridgeErrorCode,
   type RosterBridgeFrame,
   type RosterBridgeHelloFrame,
 } from "../src/session-host/network/roster-bridge-protocol";
 import type { OwnerCloseFacts, OwnerCloseHandler, OwnerCloseRequest } from "../src/session-host/network/peer-close";
+import type { OwnerCreateFacts, OwnerCreateHandler, OwnerCreateRequest } from "../src/session-host/network/peer-create";
 import { toRemoteSessionMetadata, type RemoteSessionMetadata } from "../src/session-host/network/roster-metadata";
 
 const SECRET_AGENT_DIR = "/Users/owner/.pi/agent";
@@ -457,6 +461,7 @@ const FAST_BOUNDS: Partial<RosterBridgeBounds> = {
   stopAckTimeoutMs: 120,
   helloTimeoutMs: 250,
   closeResultTimeoutMs: 200,
+  createResultTimeoutMs: 200,
 };
 
 // --- pure protocol -----------------------------------------------------------
@@ -628,6 +633,8 @@ function harness(options: {
   authorize?: (peerKey: { keyId: string; fingerprint: string }) => boolean;
   rows?: readonly string[];
   close?: OwnerCloseHandler;
+  create?: OwnerCreateHandler;
+  capabilities?: readonly string[];
 } = {}) {
   const pair = channelPair();
   const inventory = new FakeInventory();
@@ -640,6 +647,7 @@ function harness(options: {
     authorizePeer: authorize,
     bounds: { ...FAST_BOUNDS, ...options.bounds },
     ...(options.close === undefined ? {} : { closeOwnedSession: options.close }),
+    ...(options.create === undefined ? {} : { createOwnedSession: options.create }),
     onDiagnostic: (event) => {
       ownerDiagnostics.push(event.code);
     },
@@ -648,6 +656,7 @@ function harness(options: {
   const viewer = attachRosterBridgeViewer({
     channel: pair.viewerSide,
     bounds: { ...FAST_BOUNDS, ...options.bounds },
+    ...(options.capabilities === undefined ? {} : { capabilities: options.capabilities }),
     onDiagnostic: (event) => {
       viewerDiagnostics.push(event.code);
     },
@@ -2142,7 +2151,8 @@ function refusedFrame(frame: unknown): boolean {
 }
 
 test("Close is an optional capability with fixed framing and no version or metadata meaning", () => {
-  assert.deepEqual([...ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES], [ROSTER_BRIDGE_CLOSE_CAPABILITY]);
+  assert.deepEqual([...ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES],
+    [ROSTER_BRIDGE_CLOSE_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY]);
   const decision = negotiateRosterBridgeHello(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CLOSE_CAPABILITY]));
   assert.equal(decision.ok, true);
   assert.deepEqual(decision.ok ? decision.capabilities : null, [ROSTER_BRIDGE_CLOSE_CAPABILITY]);
@@ -2782,5 +2792,714 @@ test("a replaced destination at dispatch time refuses the queued close before su
     assert.deepEqual(calls, [], "no provider was reached for a replaced destination");
   } finally {
     await h.stop();
+  }
+});
+
+// --- rowless owner create over the existing roster channel -------------------
+
+const ASTRAL = "\u{1f5c2}";
+/** The one explicit opt-in a caller needs to offer the optional create exchange. */
+const CREATE_CAPS: readonly string[] = [ROSTER_BRIDGE_CREATE_CAPABILITY];
+
+function createFrame(overrides: Partial<RosterBridgeCreateRequestFrame> = {}): RosterBridgeCreateRequestFrame {
+  return {
+    type: "create_request",
+    requestId: "create-1",
+    hostRunId: RUN_A,
+    workspace: "/srv/owner/new-child",
+    sequence: 1,
+    ...overrides,
+  };
+}
+
+function createResult(requestId: string, facts: OwnerCreateFacts): RosterBridgeCreateResultFrame {
+  return { type: "create_result", requestId, outcome: facts };
+}
+
+test("Create is an optional capability a provider-less owner never acknowledges and a caller must opt in", async () => {
+  const h = harness();
+  try {
+    await h.viewer.hello;
+    assert.equal(h.viewer.supportsCreate, false);
+    // The default viewer does not even offer the exchange, so nothing changes.
+    assert.deepEqual(h.viewer.capabilities, [ROSTER_BRIDGE_REQUIRED_CAPABILITY]);
+    assert.deepEqual(await h.viewer.createSession({ hostRunId: h.inventory.hostRunId, workspace: "/srv/owner/x" }),
+      { kind: "not-sent", reason: "capability-unsupported" });
+    await settle();
+    assert.deepEqual(h.pair.viewerSide.types(), ["hello"], "no create frame exists without the optional offer");
+    // Ordinary metadata is completely unaffected.
+    const snapshot = await h.viewer.subscribe();
+    assert.equal(snapshot.state, "current");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a provider-less owner refuses an offered create frame outside the negotiated protocol", async () => {
+  const pair = channelPair();
+  const inventory = new FakeInventory();
+  inventory.rows = [ownerRow("row-1")];
+  const owner = createRosterBridgeHost({ inventory, authorizePeer: () => true, bounds: FAST_BOUNDS });
+  const binding = owner.attach(pair.ownerSide);
+  const scripted = new ScriptedPeer(pair.viewerSide);
+  try {
+    scripted.write(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY]));
+    await settle();
+    const ack = pair.ownerSide.frames()[0];
+    assert.ok(ack !== undefined && ack.type === "hello_ack");
+    assert.deepEqual(ack.capabilities, [ROSTER_BRIDGE_REQUIRED_CAPABILITY],
+      "an owner without a create provider acknowledges the baseline only");
+    scripted.write(createFrame({ hostRunId: inventory.hostRunId }));
+    await settle();
+    assert.equal(pair.ownerSide.frames().some((frame) => frame.type === "create_result"), false,
+      "nothing outside the negotiated protocol reaches an authority");
+    assert.ok(pair.ownerSide.frames().some((frame) => frame.type === "error" && frame.code === "bad_frame"));
+    assert.equal(binding.subscribed, false);
+  } finally {
+    await owner.stopAll();
+  }
+});
+
+test("only the exact requested owner run and canonical workspace reach the create provider", async () => {
+  const calls: OwnerCreateRequest[] = [];
+  let guardCalls = 0;
+  const h = harness({
+    capabilities: CREATE_CAPS,
+    create: async (request, stillAuthorized) => {
+      calls.push(request);
+      guardCalls += 1;
+      assert.equal(stillAuthorized(), true, "the provider is handed the owner's live re-proof");
+      return { kind: "started", hostRunId: request.hostRunId, rowId: "native-9" };
+    },
+  });
+  try {
+    await h.viewer.hello;
+    assert.equal(h.viewer.supportsCreate, true);
+    assert.deepEqual(h.viewer.capabilities, [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY]);
+    const snapshot = await h.viewer.subscribe();
+    const rowsBefore = snapshot.rows.map((row) => row.id);
+    const workspace = "C:\\Users\\owner\\My Projects\\pi";
+    const result = await h.viewer.createSession({ hostRunId: h.inventory.hostRunId, workspace });
+    assert.deepEqual(result, {
+      kind: "owner-result",
+      facts: { kind: "started", hostRunId: h.inventory.hostRunId, rowId: "native-9" },
+    });
+    assert.deepEqual(calls, [{ hostRunId: h.inventory.hostRunId, workspace }]);
+    assert.equal(guardCalls, 1, "the provider checks the owner's re-proof once");
+    // A create result never creates, selects, removes, or retargets a projected row.
+    assert.deepEqual(h.viewer.projection.rows.map((row) => row.id), rowsBefore);
+    assert.equal(h.viewer.projection.state, "current");
+    const requests = h.pair.viewerSide.frames().filter((frame) => frame.type === "create_request");
+    assert.equal(requests.length, 1);
+    assert.deepEqual(Object.keys(requests[0]!).sort(), ["hostRunId", "requestId", "sequence", "type", "workspace"],
+      "nothing but the closed request schema rides the wire");
+    assert.equal(new Set(requests.map((frame) => (frame.type === "create_request" ? frame.requestId : ""))).size, 1);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("an owner whose current roster is empty is a valid first create target", async () => {
+  const calls: OwnerCreateRequest[] = [];
+  const h = harness({
+    rows: [],
+    capabilities: CREATE_CAPS,
+    create: async (request) => {
+      calls.push(request);
+      return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+    },
+  });
+  try {
+    await h.viewer.hello;
+    const snapshot = await h.viewer.subscribe();
+    assert.deepEqual(snapshot.rows, [], "a complete snapshot with zero rows is a real observation");
+    assert.equal(snapshot.state, "current");
+    const result = await h.viewer.createSession({ hostRunId: h.inventory.hostRunId, workspace: "/srv/owner/first" });
+    assert.deepEqual(result, {
+      kind: "owner-result",
+      facts: { kind: "started", hostRunId: h.inventory.hostRunId, rowId: "native-1" },
+    });
+    assert.deepEqual(calls.map((call) => call.hostRunId), [h.inventory.hostRunId]);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a create is reauthorized before the provider and a revoke in that window starts nothing", async () => {
+  let allowed = true;
+  const calls: OwnerCreateRequest[] = [];
+  const h = harness({
+    capabilities: CREATE_CAPS,
+    authorize: () => allowed,
+    create: async (request) => {
+      calls.push(request);
+      return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+    },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    allowed = false;
+    const result = await mustSettle(
+      h.viewer.createSession({ hostRunId: h.inventory.hostRunId, workspace: "/srv/owner/blocked" }),
+      "a revoked create settles",
+    );
+    assert.deepEqual(result, { kind: "unknown" }, "an unanswered request is never a fabricated refusal");
+    assert.deepEqual(calls, [], "the revoke is re-proved before the provider is reached");
+    assert.equal(h.pair.ownerSide.frames().some((frame) => frame.type === "create_result"), false,
+      "an unauthorized request produces no reply at all");
+    assert.ok(h.ownerDiagnostics.includes("create_refused"));
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a throwing owner authorizer before the create is a closed door, not an open one", async () => {
+  let mode: "allow" | "throw" = "allow";
+  let providerCalls = 0;
+  const h = harness({
+    capabilities: CREATE_CAPS,
+    authorize: () => {
+      if (mode === "throw") throw new Error("synthetic authorizer failure");
+      return true;
+    },
+    create: async (request) => {
+      providerCalls += 1;
+      return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+    },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    mode = "throw";
+    const result = await mustSettle(
+      h.viewer.createSession({ hostRunId: h.inventory.hostRunId, workspace: "/srv/owner/denied" }),
+      "a throwing authorizer settles the create",
+    );
+    assert.deepEqual(result, { kind: "unknown" });
+    assert.equal(providerCalls, 0);
+    assert.equal(h.pair.ownerSide.frames().some((frame) => frame.type === "create_result"), false);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a duplicated sequence never starts a second child, even after the first completed", async () => {
+  const pair = channelPair();
+  const inventory = new FakeInventory();
+  inventory.rows = [];
+  const calls: OwnerCreateRequest[] = [];
+  const owner = createRosterBridgeHost({
+    inventory,
+    authorizePeer: () => true,
+    bounds: FAST_BOUNDS,
+    createOwnedSession: async (request) => {
+      calls.push(request);
+      return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+    },
+  });
+  const binding = owner.attach(pair.ownerSide);
+  const scripted = new ScriptedPeer(pair.viewerSide);
+  scripted.autoAck = false;
+  scripted.onHello(() => {
+    scripted.write({
+      type: "hello_ack",
+      service: ROSTER_BRIDGE_SERVICE,
+      major: ROSTER_BRIDGE_MAJOR,
+      minor: ROSTER_BRIDGE_MINOR,
+      capabilities: [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY],
+    });
+  });
+  try {
+    scripted.write(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY]));
+    await until("the owner acknowledges the create capability", () => pair.ownerSide.frames()
+      .some((frame) => frame.type === "hello_ack"));
+    scripted.write(createFrame({ requestId: "create-1", hostRunId: inventory.hostRunId, sequence: 1 }));
+    await until("the first create reaches the provider", () => calls.length === 1);
+    await settle();
+    // Replaying the same attempt number is refused before any provider call, even
+    // though the first operation has already completed.
+    scripted.write(createFrame({ requestId: "create-2", hostRunId: inventory.hostRunId, sequence: 1 }));
+    await until("the replay is answered", () => pair.ownerSide.frames()
+      .filter((frame) => frame.type === "create_result").length === 2);
+    const results = pair.ownerSide.frames().filter((frame) => frame.type === "create_result");
+    assert.deepEqual(results.map((frame) => (frame.type === "create_result" ? [frame.requestId, frame.outcome.kind] : [])),
+      [["create-1", "started"], ["create-2", "refused"]]);
+    assert.equal(calls.length, 1, "a replayed sequence never reaches the provider again");
+    // A fresh, higher attempt number is a fresh attempt.
+    scripted.write(createFrame({ requestId: "create-3", hostRunId: inventory.hostRunId, sequence: 2 }));
+    await until("the fresh attempt reaches the provider", () => calls.length === 2);
+    assert.equal(binding.subscribed, false, "create traffic never subscribes or unsubscribes metadata");
+  } finally {
+    await owner.stopAll();
+  }
+});
+
+test("one create per channel: a second is refused while the first is held and metadata still flows", async () => {
+  let release: (facts: OwnerCreateFacts) => void = () => undefined;
+  const calls: OwnerCreateRequest[] = [];
+  const h = harness({
+    capabilities: CREATE_CAPS,
+    create: (request) => {
+      calls.push(request);
+      return new Promise<OwnerCreateFacts>((resolve) => {
+        release = resolve;
+      });
+    },
+  });
+  try {
+    await h.viewer.hello;
+    const firstSnapshot = await h.viewer.subscribe();
+    const first = h.viewer.createSession({ hostRunId: h.inventory.hostRunId, workspace: "/srv/owner/one" });
+    await until("the first create reaches the provider", () => calls.length === 1);
+    // The requester's own one-in-flight rule refuses a second without submitting it.
+    assert.deepEqual(await h.viewer.createSession({ hostRunId: h.inventory.hostRunId, workspace: "/srv/owner/two" }),
+      { kind: "not-sent", reason: "busy" });
+    assert.equal(calls.length, 1, "a second create never reaches the owner");
+    // The ordered metadata path is not blocked while the owner provider holds it.
+    h.inventory.rows = [ownerRow("row-1")];
+    h.inventory.emit();
+    await until("a newer snapshot is published during the create", () => h.viewer.projection.revision !== null
+      && h.viewer.projection.rows.length === 1);
+    assert.notEqual(h.viewer.projection.revision, firstSnapshot.revision);
+    assert.equal(h.viewer.projection.state, "current");
+    release({ kind: "unconfirmed" });
+    assert.deepEqual(await mustSettle(first, "the held create result"),
+      { kind: "owner-result", facts: { kind: "unconfirmed" } });
+    // A later attempt after completion is a fresh number and reaches the owner.
+    const second = h.viewer.createSession({ hostRunId: h.inventory.hostRunId, workspace: "/srv/owner/three" });
+    await until("the second attempt reaches the provider", () => calls.length === 2);
+    const requests = h.pair.viewerSide.frames().filter((frame) => frame.type === "create_request");
+    assert.deepEqual(requests.map((frame) => (frame.type === "create_request" ? frame.sequence : -1)), [1, 2],
+      "each attempt takes the next number from this channel's monotonic high-water");
+    release({ kind: "refused" });
+    assert.deepEqual(await mustSettle(second, "the second result"),
+      { kind: "owner-result", facts: { kind: "refused" } });
+    assert.deepEqual(calls.map((call) => call.workspace), ["/srv/owner/one", "/srv/owner/three"]);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a lost create result is unknown after a finite deadline and is never replayed", async () => {
+  const pair = channelPair();
+  const viewer = attachRosterBridgeViewer({ channel: pair.viewerSide, bounds: FAST_BOUNDS, capabilities: CREATE_CAPS });
+  const scripted = new ScriptedPeer(pair.ownerSide);
+  scripted.autoAck = false;
+  scripted.onHello(() => {
+    scripted.write({
+      type: "hello_ack",
+      service: ROSTER_BRIDGE_SERVICE,
+      major: ROSTER_BRIDGE_MAJOR,
+      minor: ROSTER_BRIDGE_MINOR,
+      capabilities: [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY],
+    });
+  });
+  try {
+    await mustSettle(viewer.hello, "the handshake");
+    const result = await mustSettle(
+      viewer.createSession({ hostRunId: RUN_A, workspace: "/srv/owner/silent" }),
+      "a silent owner settles the create at its deadline",
+    );
+    assert.deepEqual(result, { kind: "unknown" });
+    const requests = scripted.received.filter((frame) => frame.type === "create_request");
+    assert.equal(requests.length, 1, "nothing is re-sent, cancelled, or replayed for an unanswered create");
+    const request = requests[0];
+    assert.ok(request !== undefined && request.type === "create_request");
+    // A reply that arrives after the deadline is dropped, never resurrected.
+    scripted.write(createResult(request.requestId, { kind: "started", hostRunId: RUN_A, rowId: "native-1" }));
+    await settle();
+    assert.deepEqual(viewer.projection.rows, [], "no late reply invents a row");
+  } finally {
+    scripted.confirmUnsubscribes();
+    await viewer.stop();
+  }
+});
+
+test("a create result naming another owner run is never reported as this request's", async () => {
+  const pair = channelPair();
+  const viewer = attachRosterBridgeViewer({ channel: pair.viewerSide, bounds: FAST_BOUNDS, capabilities: CREATE_CAPS });
+  const scripted = new ScriptedPeer(pair.ownerSide);
+  scripted.autoAck = false;
+  scripted.onHello(() => {
+    scripted.write({
+      type: "hello_ack",
+      service: ROSTER_BRIDGE_SERVICE,
+      major: ROSTER_BRIDGE_MAJOR,
+      minor: ROSTER_BRIDGE_MINOR,
+      capabilities: [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY],
+    });
+  });
+  try {
+    await mustSettle(viewer.hello, "the handshake");
+    const pending = viewer.createSession({ hostRunId: RUN_A, workspace: "/srv/owner/run-a" });
+    await until("the create frame is received", () => scripted.received.some((frame) => frame.type === "create_request"));
+    const request = scripted.received.find((frame) => frame.type === "create_request");
+    assert.ok(request !== undefined && request.type === "create_request");
+    // The same request id answered about a different run is unobservable.
+    scripted.write(createResult(request.requestId, { kind: "started", hostRunId: RUN_B, rowId: "native-1" }));
+    assert.deepEqual(await mustSettle(pending, "the mismatched run settles"), { kind: "unknown" });
+  } finally {
+    scripted.confirmUnsubscribes();
+    await viewer.stop();
+  }
+});
+
+test("a submitted create write that is refused is unknown, while pre-submission refusals are not-sent", async () => {
+  const h = harness({
+    capabilities: CREATE_CAPS,
+    create: async (request) => ({ kind: "started", hostRunId: request.hostRunId, rowId: "native-1" }),
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const run = h.inventory.hostRunId;
+    // A request this contract cannot represent never becomes a frame.
+    for (const request of [
+      { hostRunId: "-bad", workspace: "/srv/owner/x" },
+      { hostRunId: "x".repeat(65), workspace: "/srv/owner/x" },
+      { hostRunId: run, workspace: "" },
+      { hostRunId: run, workspace: "/srv/\u0000" },
+      { hostRunId: run, workspace: ASTRAL.repeat(2_049) },
+      { hostRunId: run },
+      { hostRunId: run, workspace: 7 as never },
+    ]) {
+      assert.deepEqual(await h.viewer.createSession(request as never),
+        { kind: "not-sent", reason: "invalid-request" }, `${JSON.stringify(request).slice(0, 40)} must be refused`);
+    }
+    assert.equal(h.pair.viewerSide.frames().filter((frame) => frame.type === "create_request").length, 0);
+    // A transport that refuses the write after it was invoked cannot be claimed as
+    // "never submitted": the owner may have created a child anyway.
+    h.pair.viewerSide.failNextSend = true;
+    assert.deepEqual(await mustSettle(
+      h.viewer.createSession({ hostRunId: run, workspace: "/srv/owner/refused" }),
+      "a refused write settles",
+    ), { kind: "unknown" });
+    assert.equal(h.pair.viewerSide.frames().filter((frame) => frame.type === "create_request").length, 0);
+    // A stopped viewer is positively not-sent and never writes at all.
+    await h.viewer.stop();
+    assert.deepEqual(await h.viewer.createSession({ hostRunId: run, workspace: "/srv/owner/stopped" }),
+      { kind: "not-sent", reason: "not-ready" });
+  } finally {
+    await h.owner.stopAll();
+  }
+});
+
+test("a caller fence that no longer holds refuses the queued create before submission", async () => {
+  const calls: OwnerCreateRequest[] = [];
+  const h = harness({
+    bounds: { stopAckTimeoutMs: 5_000 },
+    capabilities: CREATE_CAPS,
+    create: async (request) => {
+      calls.push(request);
+      return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+    },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    // Occupy the single ordered send slot so the next control write waits in the
+    // queue and has NOT yet been handed to the transport.
+    h.pair.viewerSide.hold = true;
+    const resyncing = h.viewer.resync();
+    void resyncing.catch(() => undefined);
+    await settle();
+    // A caller fence standing in for the coordinator's written form, run, and
+    // workspace proof.
+    let current = true;
+    const creating = h.viewer.createSession(
+      { hostRunId: h.inventory.hostRunId, workspace: "/srv/owner/queued" },
+      { stillCurrent: () => current },
+    );
+    await settle();
+    assert.equal(h.pair.viewerSide.types().filter((type) => type === "create_request").length, 0,
+      "the queued create has not been submitted yet");
+    // The form is replaced while the request is still queued, and the queue drains.
+    current = false;
+    h.pair.viewerSide.release();
+    assert.deepEqual(await mustSettle(creating, "the replaced form settles the create"),
+      { kind: "not-sent", reason: "target-unavailable" });
+    await settle();
+    assert.equal(h.pair.viewerSide.types().filter((type) => type === "create_request").length, 0,
+      "a fence that no longer holds is checked at the transport write boundary");
+    assert.deepEqual(calls, [], "no owner provider was reached for a form that no longer owns the request");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a channel whose create result cannot be written drops it instead of claiming a child", async () => {
+  const h = harness({
+    capabilities: CREATE_CAPS,
+    create: async (request) => ({ kind: "started", hostRunId: request.hostRunId, rowId: "native-1" }),
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    h.pair.ownerSide.failNextSend = true;
+    const result = await mustSettle(
+      h.viewer.createSession({ hostRunId: h.inventory.hostRunId, workspace: "/srv/owner/unwritable" }),
+      "an unwritable create result settles as unknown",
+    );
+    assert.deepEqual(result, { kind: "unknown" });
+    assert.ok(h.ownerDiagnostics.includes("create_reply_dropped"));
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a channel that goes away between admission and the provider starts nothing", async () => {
+  const pair = channelPair();
+  const inventory = new FakeInventory();
+  inventory.rows = [];
+  const calls: OwnerCreateRequest[] = [];
+  const owner = createRosterBridgeHost({
+    inventory,
+    authorizePeer: () => true,
+    bounds: FAST_BOUNDS,
+    createOwnedSession: async (request) => {
+      calls.push(request);
+      return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+    },
+  });
+  const binding = owner.attach(pair.ownerSide);
+  const scripted = new ScriptedPeer(pair.viewerSide);
+  scripted.autoAck = false;
+  scripted.onHello(() => {
+    scripted.write({
+      type: "hello_ack",
+      service: ROSTER_BRIDGE_SERVICE,
+      major: ROSTER_BRIDGE_MAJOR,
+      minor: ROSTER_BRIDGE_MINOR,
+      capabilities: [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY],
+    });
+  });
+  try {
+    scripted.write(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY]));
+    await until("the owner acknowledges the create capability", () => pair.ownerSide.frames()
+      .some((frame) => frame.type === "hello_ack"));
+    // The frame is admitted, then this binding retires before the provider
+    // continuation runs: the owner re-proof fails and nothing is started.
+    scripted.write(createFrame({ hostRunId: inventory.hostRunId }));
+    await owner.stopAll();
+    await settle();
+    assert.deepEqual(calls, [], "a binding that retired after admission never reaches the provider");
+    assert.equal(pair.ownerSide.frames().some((frame) => frame.type === "create_result"), false,
+      "an abandoned request produces no reply that would claim a child");
+    assert.equal(binding.subscribed, false);
+  } finally {
+    await owner.stopAll();
+  }
+});
+
+test("independent peers create through their own channels without blocking each other", async () => {
+  const inventory = new FakeInventory();
+  inventory.rows = [];
+  const released = new Map<string, (facts: OwnerCreateFacts) => void>();
+  const workspaces: string[] = [];
+  const owner = createRosterBridgeHost({
+    inventory,
+    authorizePeer: () => true,
+    bounds: FAST_BOUNDS,
+    createOwnedSession: (request) => new Promise<OwnerCreateFacts>((resolve) => {
+      // Only the canonical workspace distinguishes these two independent peers.
+      workspaces.push(request.workspace);
+      released.set(request.workspace, resolve);
+    }),
+  });
+  const first = channelPair("viewer-key-1", "owner-key-1");
+  const second = channelPair("viewer-key-2", "owner-key-2");
+  const firstViewer = attachRosterBridgeViewer({ channel: first.viewerSide, bounds: FAST_BOUNDS, capabilities: CREATE_CAPS });
+  const secondViewer = attachRosterBridgeViewer({ channel: second.viewerSide, bounds: FAST_BOUNDS, capabilities: CREATE_CAPS });
+  const firstBinding = owner.attach(first.ownerSide);
+  const secondBinding = owner.attach(second.ownerSide);
+  try {
+    await Promise.all([firstViewer.hello, secondViewer.hello]);
+    assert.equal(firstViewer.supportsCreate, true);
+    assert.equal(secondViewer.supportsCreate, true);
+    const firstRun = inventory.hostRunId;
+    const one = firstViewer.createSession({ hostRunId: firstRun, workspace: "/srv/owner/peer-one" });
+    const two = secondViewer.createSession({ hostRunId: firstRun, workspace: "/srv/owner/peer-two" });
+    await until("both peers reach the provider", () => workspaces.length === 2);
+    // One peer's in-flight create never blocks the other's channel.
+    assert.deepEqual(workspaces.slice().sort(), ["/srv/owner/peer-one", "/srv/owner/peer-two"]);
+    released.get("/srv/owner/peer-two")?.({ kind: "started", hostRunId: firstRun, rowId: "native-2" });
+    assert.deepEqual(await mustSettle(two, "the second peer's result"),
+      { kind: "owner-result", facts: { kind: "started", hostRunId: firstRun, rowId: "native-2" } });
+    released.get("/srv/owner/peer-one")?.({ kind: "started", hostRunId: firstRun, rowId: "native-1" });
+    assert.deepEqual(await mustSettle(one, "the first peer's result"),
+      { kind: "owner-result", facts: { kind: "started", hostRunId: firstRun, rowId: "native-1" } });
+    assert.equal(firstBinding.subscribed, false);
+    assert.equal(secondBinding.subscribed, false);
+  } finally {
+    await firstViewer.stop();
+    await secondViewer.stop();
+    await owner.stopAll();
+  }
+});
+
+test("an authorizer that retires the binding during the final re-proof starts nothing", async () => {
+  let binding: RosterBridgeChannelBinding | undefined;
+  let arming = false;
+  let providerCalls = 0;
+  let starts = 0;
+  const pair = channelPair();
+  const inventory = new FakeInventory();
+  inventory.rows = [];
+  const owner = createRosterBridgeHost({
+    inventory,
+    authorizePeer: () => {
+      if (arming && binding !== undefined) {
+        // The injected authorizer is arbitrary code: it may retire this very binding
+        // (a Revoke that also drops the channel, teardown, replacement) and still
+        // answer `true`.
+        void binding.stop();
+      }
+      return true;
+    },
+    bounds: FAST_BOUNDS,
+    createOwnedSession: async (request, stillAuthorized) => {
+      providerCalls += 1;
+      // Main's final re-proof, immediately before it starts anything.
+      arming = true;
+      const stillOk = stillAuthorized();
+      arming = false;
+      if (!stillOk) return { kind: "refused" };
+      starts += 1;
+      return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+    },
+  });
+  binding = owner.attach(pair.ownerSide);
+  const scripted = new ScriptedPeer(pair.viewerSide);
+  scripted.autoAck = false;
+  scripted.onHello(() => {
+    scripted.write({
+      type: "hello_ack",
+      service: ROSTER_BRIDGE_SERVICE,
+      major: ROSTER_BRIDGE_MAJOR,
+      minor: ROSTER_BRIDGE_MINOR,
+      capabilities: [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY],
+    });
+  });
+  try {
+    scripted.write(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY]));
+    await until("the owner acknowledges the create capability", () => pair.ownerSide.frames()
+      .some((frame) => frame.type === "hello_ack"));
+    scripted.write(createFrame({ hostRunId: inventory.hostRunId }));
+    await until("the provider is reached", () => providerCalls === 1);
+    await settle();
+    assert.equal(starts, 0,
+      "a binding that retired inside its own final re-proof never starts a child");
+    assert.equal(pair.ownerSide.frames().some((frame) => frame.type === "create_result"), false,
+      "no result is written for a binding that is already gone");
+    assert.equal(binding?.subscribed, false);
+  } finally {
+    await owner.stopAll();
+  }
+});
+
+test("a synchronous provider throw and a rejected provider both settle unknown and free the channel", async () => {
+  let mode: "sync-throw" | "reject" | "ok" = "sync-throw";
+  const h = harness({
+    capabilities: CREATE_CAPS,
+    create: (request): Promise<OwnerCreateFacts> => {
+      if (mode === "sync-throw") throw new Error("synthetic synchronous provider throw");
+      if (mode === "reject") return Promise.reject(new Error("synthetic rejected provider"));
+      return Promise.resolve({ kind: "started", hostRunId: request.hostRunId, rowId: "native-1" });
+    },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const run = h.inventory.hostRunId;
+    for (const expected of ["sync-throw", "reject"] as const) {
+      mode = expected;
+      // A synchronous throw must not become an unhandled rejection, and neither
+      // failure may leave this channel's one create slot occupied.
+      const result = await mustSettle(
+        h.viewer.createSession({ hostRunId: run, workspace: "/srv/owner/failure" }),
+        `the ${expected} provider`,
+      );
+      assert.deepEqual(result, { kind: "owner-result", facts: { kind: "unknown" } },
+        `a ${expected} provider establishes neither a child nor its absence`);
+      await settle();
+    }
+    // The bookkeeping is released: a later request still reaches the owner.
+    mode = "ok";
+    assert.deepEqual(await mustSettle(
+      h.viewer.createSession({ hostRunId: run, workspace: "/srv/owner/recovered" }),
+      "the recovered create",
+    ), { kind: "owner-result", facts: { kind: "started", hostRunId: run, rowId: "native-1" } });
+    const requests = h.pair.viewerSide.frames().filter((frame) => frame.type === "create_request");
+    assert.deepEqual(requests.map((frame) => (frame.type === "create_request" ? frame.sequence : -1)), [1, 2, 3],
+      "each attempt consumes the next sequence and never reuses one");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a retirement queued by the final authorizer cannot land before the provider call", async () => {
+  let binding: RosterBridgeChannelBinding | undefined;
+  let arming = false;
+  let createAuthorizations = 0;
+  let providerCalls = 0;
+  let retiredAtInvocation = true;
+  let retired = false;
+  const pair = channelPair();
+  const inventory = new FakeInventory();
+  inventory.rows = [];
+  const owner = createRosterBridgeHost({
+    inventory,
+    authorizePeer: () => {
+      // Armed before admission: the first create authorization is admission, and
+      // the SECOND is the detached continuation's final check immediately before
+      // the provider call. Scheduling the retirement from that check is exactly the
+      // gap an extra intervening microtask would open.
+      if (arming && binding !== undefined && ++createAuthorizations === 2) {
+        queueMicrotask(() => {
+          retired = true;
+          void binding?.stop();
+        });
+      }
+      return true;
+    },
+    bounds: FAST_BOUNDS,
+    createOwnedSession: async (request, stillAuthorized) => {
+      providerCalls += 1;
+      retiredAtInvocation = retired;
+      const stillOk = stillAuthorized();
+      if (!stillOk) return { kind: "refused" };
+      return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+    },
+  });
+  binding = owner.attach(pair.ownerSide);
+  const scripted = new ScriptedPeer(pair.viewerSide);
+  scripted.autoAck = false;
+  scripted.onHello(() => {
+    scripted.write({
+      type: "hello_ack",
+      service: ROSTER_BRIDGE_SERVICE,
+      major: ROSTER_BRIDGE_MAJOR,
+      minor: ROSTER_BRIDGE_MINOR,
+      capabilities: [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY],
+    });
+  });
+  try {
+    scripted.write(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY]));
+    await until("the owner acknowledges the create capability", () => pair.ownerSide.frames()
+      .some((frame) => frame.type === "hello_ack"));
+    arming = true;
+    scripted.write(createFrame({ hostRunId: inventory.hostRunId }));
+    await until("the provider is reached", () => providerCalls === 1);
+    await settle();
+    assert.equal(retiredAtInvocation, false,
+      "the provider is invoked while its authorization is still current, before the queued retirement");
+    assert.equal(providerCalls, 1);
+    assert.equal(retired, true, "the queued retirement did run afterwards");
+    assert.equal(pair.ownerSide.frames().some((frame) => frame.type === "create_result"), false,
+      "a binding retired before its reply writes nothing");
+    assert.equal(binding?.subscribed, false);
+  } finally {
+    await owner.stopAll();
   }
 });

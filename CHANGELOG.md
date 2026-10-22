@@ -27,6 +27,28 @@ dates.
   activity needs an exact written requester confirmation. Exited or settled-error
   removal stays owner-routed, and saved history is untouched. See
   [Owner Close transport foundation](docs/session-host-alpha.md#owner-close-transport-foundation).
+- The New session form now has one **Host** line, naming **Local** each time it opens
+  (#389). Choosing one already-connected saved destination makes the Workspace field
+  plain bounded owner text and submits one rowless create request to that owner's own
+  manager over the existing paired roster channel's optional `roster-create-v1`
+  capability; the owner creates one blank native child in its own run with no initial
+  prompt, and its own local focus, selection, and drafts are untouched. No local row,
+  child, or input owner is created, selected, or focused: only the owner's roster
+  projection lists the new row, and a `started` answer displays that exact returned run
+  and row only while
+  the same request still owns the form. Every actual Host change clears the Workspace
+  value, choosing the same Host is a no-op with no per-host history, and the Local form
+  keeps its native path editor and completion. A request carries the exact owner run, a
+  canonical workspace (2048 code points, derived 8192 UTF-8-byte ceiling), a fresh
+  correlation id, and one monotonic anti-replay attempt number; the current pin,
+  directional grant, destination channel, and the written, uncovered New-form frame are
+  independently re-checked, and the caller's written-form check and the owner facts are
+  re-evaluated inside the ordered write. Fixed facts distinguish started, unconfirmed,
+  refused, and unknown; a lost reply, elapsed requester patience (15 seconds on this
+  side only), or a retired destination is never retried, replayed, or cancelled. A
+  missing capability is refused with a fixed notice and no upgrade or connect. No new
+  listener, manager, registry, permission kind, or stored state is added. See
+  [Owner Create transport foundation](docs/session-host-alpha.md#owner-create-transport-foundation).
 - Opt-in authenticated input-origin framing and origin-bearing clipboard capsules
   for the existing owned Node stdio bridge (#389). Payloads and explicit origins are
   authenticated, and a separate signed readiness signal precedes framed input. The
@@ -34,8 +56,10 @@ dates.
   refuses unknown bootstrap modes, and sets native capture only for the explicitly
   opted-in hosted child tree with ordinary descendant inheritance. No production Main
   caller enables it; local/SSH copying and standalone Pi remain unchanged, the network
-  native input/copy extension stays internal and default-off, and remote creation,
-  `SessionSpawn`, resume, and human handoff are unfinished.
+  native input/copy extension stays internal and default-off, a rowless New-form Host
+  choice can now ask one connected owner for a blank child, `SessionSpawn` stays the
+  native, owner-bound tool, and remote saved conversations, resume, catalog/history, and
+  human handoff remain unfinished.
 - An internal, explicitly opted-in native input and text-copy extension on the existing
   selected-content lane (#389). It adds no CLI, environment, configuration, or UI opt-in,
   and no production Main caller enables it, so normal remote viewing remains
@@ -54,8 +78,9 @@ dates.
   real writer boundary. Refusals stay brief and non-modal; only a pre-invoke refusal is
   `not-sent`, and an invoked loss is truthfully unknown without replay. This extension
   changes no Close behavior, local/SSH copying, native producers, or production defaults.
-  Remote creation,
-  `SessionSpawn`, resume, and human handoff remain unfinished. See
+  Remote saved conversations,
+  resume, catalog/history, and human handoff remain unfinished, and `SessionSpawn` stays
+  the native, owner-bound tool. See
   [Internal default-off native input and copy](docs/session-host-alpha.md#internal-default-off-native-input-and-copy).
 - A TLS/WSS peer-transport foundation with KDE-style explicit device pairing (#475).
   Explicit callers supply generated self-signed identities, consent and trust stores, and
@@ -124,9 +149,11 @@ dates.
   pairing callback also exposes its actual configured deadline and sanitized settlement
   without changing consent authority or timeout defaults (#475). The optional network
   sidebar now builds its saved settings, listener, and consent surface on this state
-  (#482); the internal native input/copy extension remains default-off, while remote
-  creation, `SessionSpawn`, resume, and human handoff remain unfinished and one
-  deliberately selected remote row's native viewport can now be displayed. See
+  (#482); the internal native input/copy extension remains default-off, one deliberately
+  selected remote row's native viewport can now be displayed, and a rowless New-form
+  Host choice can now ask one connected owner for a blank child; `SessionSpawn` stays the
+  native, owner-bound tool, while remote saved conversations, resume, catalog/history,
+  and human handoff remain unfinished. See
   [Explicit protected peer-state foundation](docs/session-host-alpha.md#explicit-protected-peer-state-foundation).
 - The optional native session host now displays one deliberately selected remote native
   viewport through the existing left roster, compositor, graphics layer, and writer
@@ -134,13 +161,15 @@ dates.
   fallbacks are included; visible text can itself be sensitive. Unselected rows stay
   metadata-only. One selected stream uses the same owning manager, per-session viewer
   minima, TLS-proved key, remembered pin, and directional grant, without another listener,
-  manager, controller lease, or permission kind. New session stays local; loss or
-  disconnection never stops remote work or silently selects another row. Exact source,
+  manager, controller lease, or permission kind. New session starts on Local and a
+  deliberate Host choice can target one connected owner; loss or disconnection never
+  stops remote work or silently selects another row. Exact source,
   run, generation, geometry, and written-display fences remain fail closed; 64 KiB bounds
   messages, not whole viewports. Native input, text paste, and copy travel only through
   the separate internal, explicitly opted-in extension described above; ordinary
-  operation remains display-only, and remote creation, `SessionSpawn`, resume, and human
-  handoff remain unfinished at this interim checkpoint, not a permanent view-only mode.
+  operation remains display-only, and remote saved conversations, resume,
+  catalog/history, and human handoff remain unfinished at this interim checkpoint, not a
+  permanent view-only mode; `SessionSpawn` stays the native, owner-bound tool.
   Ordinary Pi and authenticated local/SSH clipboard are unchanged. See
   [Selected native viewport](docs/session-host-alpha.md#selected-native-viewport-interim-display-scope).
 - The optional native session host now wires a **Network** sidebar over the paired peer
@@ -169,8 +198,10 @@ dates.
   explicit Add action, rather than a sequential wizard.
   Connected rows stay metadata-only until one is deliberately selected. Close is
   owner-routed as described above; native input, text paste, and copy are reachable only
-  through the internal default-off extension; remote creation, `SessionSpawn`, and resume
-  remain unimplemented; no view-only permission kind or controller lease is invented. See
+  through the internal default-off extension; a deliberate New-form Host choice can ask
+  one connected owner for a blank child, and `SessionSpawn` stays the native, owner-bound
+  tool; remote saved conversations, resume, catalog/history, and human handoff remain
+  unimplemented; no view-only permission kind or controller lease is invented. See
   [Network sidebar](docs/session-host-alpha.md#network-sidebar-hosting-pairing-and-remote-metadata)
   and [Session-host peer network](docs/security-model.md#session-host-peer-network-optional).
 
@@ -205,6 +236,12 @@ dates.
   [Network sidebar](docs/session-host-alpha.md#network-sidebar-hosting-pairing-and-remote-metadata).
 ### Fixed
 
+- Cleanup-lock contention keeps trying atomic publication while one owned, targeted
+  process-start query runs asynchronously, rather than blocking on that query (#389).
+  The existing two-second deadline and 50 ms cadence remain unchanged; only a real
+  helper close can settle ownership, and confirmation expiry is re-proved against the
+  absolute clock even before a delayed timer dispatches. Unknown owners and replaced
+  records remain protected, and the original Windows eight-racer checks are unchanged.
 - The Windows bootstrap test fixture now allows 120 seconds for its cold first
   attempt and records bounded per-launch phase diagnostics; subsequent attempts
   retain their existing limits and all integrity assertions remain.

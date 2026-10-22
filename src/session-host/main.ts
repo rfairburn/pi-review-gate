@@ -58,6 +58,14 @@ import {
   type PeerCloseResult,
   type PeerCoordinatorWithClose,
 } from "./network/peer-close";
+import {
+  isOwnerCreateFacts,
+  type OwnerCreateFacts,
+  type OwnerCreateRequest,
+  type PeerCoordinatorWithCreate,
+  type PeerCreateController,
+  type PeerCreateResult,
+} from "./network/peer-create";
 import type { PeerCoordinator, PeerConsentPresentation, PeerUiCommand, PeerUiSnapshot } from "./peer-ui-protocol";
 import { isValidNativeSessionId } from "./protocol";
 import {
@@ -69,6 +77,7 @@ import {
   type OwningHostManager,
   type OwningHostService,
   type OwningHostServiceDependencies,
+  type StartedSessionOutcome,
 } from "./owning-host-service";
 import {
   assertHostShortcutsDistinct,
@@ -104,7 +113,12 @@ import {
 import { deleteSavedSessionFile, type SavedSessionDeletionResult } from "./saved-deletion";
 import {
   SidebarController,
+  createPlainOwnerWorkspaceField,
+  CREATE_ON_PEER_OTHER_RUN_NOTICE,
+  CREATE_ON_PEER_UNCERTAIN_NOTICE,
+  CREATE_ON_PEER_UNWRITTEN_NOTICE,
   type SidebarAction,
+  type SidebarCreateFormPresentation,
   type SidebarFieldFactoryOptions,
   type SidebarItem,
   type SidebarMainOwnerKey,
@@ -147,6 +161,14 @@ const ROSTER_RETAINED_MESSAGE = "Session host ownership is retained because shut
 const REMOTE_CONTENT_WAITING_MESSAGE = "Waiting for the selected remote session's display";
 const REMOTE_CONTENT_UNAVAILABLE_MESSAGE = "The selected remote session's display is unavailable; its session keeps running on its host";
 const REMOTE_CONTENT_UNOBSERVED_MESSAGE = "That remote session's owner run was not observed; nothing is displayed";
+/**
+ * Truthful status while an owner-reported `started` row has not yet appeared in
+ * the requester's own roster observation. The coordinator's existing selection
+ * intent is retained and served by the next roster event, so this is pending —
+ * never an "unavailable" claim about a row the owner just created.
+ */
+const REMOTE_CONTENT_CREATED_WAITING_MESSAGE =
+  "Waiting for the new remote session in its host's roster";
 const REMOTE_CONTENT_UNSUPPORTED_MESSAGE = "Remote display is unavailable in this host; local sessions are unchanged";
 const REMOTE_CONTENT_INVALID_MESSAGE = "That remote row is no longer displayed; select it again from the roster";
 /**
@@ -187,6 +209,28 @@ const REMOTE_CLOSE_TARGET_GONE_MESSAGE =
   "That remote session is no longer in its owner's roster; no close was requested";
 /** The content protocol's own viewport bound; a larger owner frame is never claimed. */
 const MAX_CONTENT_DIMENSION = 1000;
+/**
+ * Fixed, bounded notices for one requester-side remote New submission. Each says
+ * only what this side positively knows: a form that was never drawn, a target
+ * that is no longer addressable, a reply-before-observation selection, an owner
+ * fact, or an outcome this side can no longer observe. Nothing here claims a
+ * local creation, a retry, a reconnect, a regrant, or a cancellation, and no
+ * path, error payload, or exception text is ever shown.
+ */
+const CREATE_ON_PEER_UNSUPPORTED_MESSAGE =
+  "This host cannot ask another host to create a session";
+const CREATE_ON_PEER_BUSY_MESSAGE =
+  "Another remote create is already in progress; nothing was sent";
+const CREATE_ON_PEER_GONE_MESSAGE =
+  "That destination or its owner run is no longer observed; nothing was sent";
+const CREATE_ON_PEER_FORM_CHANGED_MESSAGE =
+  "The New session form changed before it was sent; nothing was sent";
+const CREATE_ON_PEER_UNCONFIRMED_MESSAGE =
+  "The remote host could not confirm that the session started; nothing was selected";
+const CREATE_ON_PEER_REFUSED_MESSAGE =
+  "The remote host did not accept that create; nothing was started";
+/** One wording source for uncertainty: the sidebar's own fixed notice. */
+const CREATE_ON_PEER_UNKNOWN_MESSAGE = CREATE_ON_PEER_UNCERTAIN_NOTICE;
 const INPUT_DRAIN_MAX_MS = 250;
 const INPUT_DRAIN_IDLE_MS = 50;
 // One bounded readiness deadline for a just-spawned exited-row replacement:
@@ -362,10 +406,14 @@ function boundedOwnerKey(prefix: string, raw: string): string {
 
 /**
  * Main's view of the ONE coordinator: everything {@link PeerCoordinator} already
- * promised, plus the content controller the production factory actually returns.
- * A metadata-only coordinator keeps satisfying it without inventing frame facts.
+ * promised, plus the content controller the production factory actually returns
+ * and the rowless create controller the production factory now exposes. These are
+ * typed as optional so a metadata-only or older coordinator keeps satisfying this
+ * view without inventing frames, controllers, or capabilities it does not have.
  */
-type MainPeerCoordinator = PeerCoordinator & Partial<Pick<PeerCoordinatorWithContent, "content">>;
+type MainPeerCoordinator = PeerCoordinator
+  & Partial<Pick<PeerCoordinatorWithContent, "content">>
+  & Partial<Pick<PeerCoordinatorWithCreate, "ownerCreate">>;
 
 interface SavedDeleteConfirmationFrame {
   readonly renderToken: number;
@@ -400,6 +448,49 @@ interface RemoteCloseConfirmationFrame {
   readonly cols: number;
   readonly rows: number;
   settled: boolean;
+}
+
+/**
+ * One frozen New-form frame: exactly what the sidebar drew (host identity, the
+ * DTO's observed owner run, and the canonical workspace the field held), the
+ * OUTER terminal geometry it was composed at, the form PANE rectangle the
+ * sidebar actually rendered into, the geometry epoch it belongs to, and the
+ * monotonic token that names it. Only a frame the actual writer reported as
+ * written (or an unchanged repaint of a candidate this same frame already
+ * settled) is proof that the operator sees this exact form.
+ *
+ * Terminal and pane geometry are deliberately separate facts: the pane is the
+ * layout's form rect (wide) or its overlay rect (narrow), never the terminal
+ * size, and a comparison across the two can never settle.
+ */
+interface CreateFormFrame extends SidebarCreateFormPresentation {
+  /** Outer terminal columns/rows this composition was made at. */
+  readonly terminalCols: number;
+  readonly terminalRows: number;
+  /** Geometry epoch; a resize retires every frame composed before it. */
+  readonly epoch: number;
+  settled: boolean;
+}
+
+/**
+ * One bounded remote New attempt: the exact submitted destination, owner run,
+ * workspace, form generation, and written receipt, plus the terminal AND form
+ * pane geometry and the geometry epoch that receipt belonged to. Every fact was
+ * captured at submission and is never re-derived from a later roster index,
+ * label, selection, or layout; the owner host revalidates its own run.
+ */
+interface CreateOnPeerAttempt {
+  readonly requestId: number;
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly workspace: string;
+  readonly formGeneration: number;
+  readonly renderToken: number;
+  readonly terminalCols: number;
+  readonly terminalRows: number;
+  readonly paneCols: number;
+  readonly paneRows: number;
+  readonly epoch: number;
 }
 
 /** One bounded remote Close attempt, frozen for its notices and its marker. */
@@ -1266,6 +1357,38 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let savedDeleteConfirmationFrame: SavedDeleteConfirmationFrame | undefined;
   /** The one frozen remote-close confirmation candidate of the last composition. */
   let remoteCloseConfirmationFrame: RemoteCloseConfirmationFrame | undefined;
+  /**
+   * The one New-form frame the last composition actually handed the writer, and
+   * the ONLY proof a remote New submission may rely on: it becomes authority
+   * only when that exact candidate is reported written.
+   */
+  let createFormFrame: CreateFormFrame | undefined;
+  /**
+   * Advances on every terminal reflow/geometry retirement. A remote-New receipt
+   * carries the epoch it was composed under, so a resize that returns to the same
+   * dimensions before anything is repainted can never revive a stale receipt.
+   * Ordinary renders, roster updates, and the pending-status repaint of an
+   * already submitted form deliberately do NOT advance it.
+   */
+  let createFormEpoch = 0;
+  /**
+   * The ONE remote New request in flight on this host. It is deliberately not a
+   * queue: a second submission while it is outstanding is refused truthfully
+   * rather than queued, batched, or retargeted, and nothing about it is
+   * re-derived from a later roster observation.
+   */
+  let createOnPeerAttempt: CreateOnPeerAttempt | undefined;
+  /**
+   * One owner-reported `started` row whose requester roster observation has not
+   * arrived yet. It exists only to keep this side truthful while the coordinator's
+   * own selection intent waits for the row: a `roster-unavailable`/`row-unavailable`
+   * fence is then reported as pending, never as "unavailable". The ordinary roster
+   * event (or any later deliberate selection) ends it; it never selects, polls,
+   * replays, or retries anything by itself.
+   */
+  let pendingCreatedRemote:
+    | { readonly hostId: string; readonly hostRunId: string; readonly rowId: string }
+    | undefined;
   /** Remote targets with a close request already on its way to the owner. */
   const remoteCloseAttempts = new Set<string>();
   /**
@@ -1466,6 +1589,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     remoteContentStatus = undefined;
     lastContentViewport = undefined;
     remoteInputNotice = undefined;
+    // A later local selection or an explicit detach supersedes any create-awaiting
+    // fact; it never re-selects, retries, or polls on its own.
+    pendingCreatedRemote = undefined;
     releaseSelectedContent();
     // Releasing the remote source returns pointer capture to the ordinary host
     // path; nothing is submitted without a written remote source.
@@ -1495,6 +1621,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // A new deliberate selection is a new context: the one brief notice belongs
     // to the previous target and is not carried over.
     remoteInputNotice = undefined;
+    // Any LATER selection supersedes the freshly created row's awaiting fact. The
+    // selection the create completion itself emits names that exact row, so it is
+    // recognized here by identity — never by a label, index, or ordering.
+    if (pendingCreatedRemote !== undefined
+      && (pendingCreatedRemote.hostId !== hostId
+        || pendingCreatedRemote.hostRunId !== hostRunId
+        || pendingCreatedRemote.rowId !== rowId)) {
+      pendingCreatedRemote = undefined;
+    }
     const content = contentController();
     if (hostRunId === null || content === undefined) {
       // Nothing exact can be named to the coordinator, so nothing is requested.
@@ -1566,6 +1701,20 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     if (remoteNativeInputEnabled) syncOuterMouseModes();
     if (observation.state === "connecting" || observation.state === "current") {
       remoteContentStatus = { state: "waiting", message: REMOTE_CONTENT_WAITING_MESSAGE };
+      scheduleRedraw();
+      return;
+    }
+    // An owner-reported `started` row this side has not observed yet is NOT an
+    // unavailable display: the coordinator's retained selection intent is served
+    // by the next roster event. Only the two availability reasons are treated this
+    // way; a lost connection, changed run, or missing pin stays a real refusal.
+    const awaitingCreatedRow = pendingCreatedRemote !== undefined
+      && pendingCreatedRemote.hostId === target.hostId
+      && pendingCreatedRemote.hostRunId === target.hostRunId
+      && pendingCreatedRemote.rowId === target.rowId
+      && (observation.reason === "roster-unavailable" || observation.reason === "row-unavailable");
+    if (awaitingCreatedRow) {
+      remoteContentStatus = { state: "waiting", message: REMOTE_CONTENT_CREATED_WAITING_MESSAGE };
       scheduleRedraw();
       return;
     }
@@ -1663,6 +1812,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       inputSource,
       inputModes,
     };
+    // A positively accepted viewport for this exact row ends any awaiting fact: the
+    // ordinary content path owns it from here, so a later loss is reported honestly.
+    if (pendingCreatedRemote !== undefined
+      && pendingCreatedRemote.hostId === target.hostId
+      && pendingCreatedRemote.hostRunId === target.hostRunId
+      && pendingCreatedRemote.rowId === target.rowId) {
+      pendingCreatedRemote = undefined;
+    }
     remoteContentStatus = undefined;
     // A freshly published view's own retained reporting mode (including a
     // mode-only change) is what the outer capture must follow.
@@ -1745,6 +1902,22 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // A reminder this host can positively see no longer applies is dropped here;
     // nothing is opened, retried, or confirmed by this reconciliation.
     reconcileRemoteCloseMarkers(snapshot);
+    // The freshly created row's own roster event ends its awaiting fact: from here
+    // the coordinator's ordinary roster reconciliation owns the retained
+    // selection. A complete observation without that host/run/row is positive
+    // loss, and an unobserved projection is no evidence either way.
+    const created = pendingCreatedRemote;
+    if (created !== undefined) {
+      const host = snapshot.hosts?.find((candidate) => candidate.id === created.hostId);
+      if (host === undefined) {
+        pendingCreatedRemote = undefined;
+      } else if ((host.roster.hostRunId ?? null) !== created.hostRunId) {
+        pendingCreatedRemote = undefined;
+      } else if (host.roster.rows !== null
+        && host.roster.rows.some((row) => row.id === created.rowId)) {
+        pendingCreatedRemote = undefined;
+      }
+    }
     // A written dialog for a target the owner no longer lists loses its
     // authority immediately instead of staying confirmable until a redraw.
     abandonVanishedRemoteCloseTarget();
@@ -1790,6 +1963,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // added, and `closeViewer` remains a display-surface retirement, never a
         // session close.
         closeOwnedSession,
+        // The owner-side rowless Create provider is handed over at construction
+        // only, exactly like Close. It is the same seam the local New action uses
+        // (`hostService.startSession`), so it needs no second manager, no selected
+        // row, no native conversation tuple, no viewer, and no launch/activate
+        // path: the owner's own provider decides, and only a peer that negotiated
+        // the optional capability can ever reach it.
+        createOwnedSession,
         onChange: updatePeerUi,
         onIncomingConsentArrival: attemptIncomingPeerBell,
         onContentChange: handleContentChange,
@@ -2094,6 +2274,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // The remote-close dialog replaces the left roster, so its candidate is
         // captured AFTER that render and before the writer sees this frame.
         const remoteClosePresentation = sidebar.captureRemoteCloseConfirmationPresentation();
+        // The New form's own drawn candidate (host line + live workspace body)
+        // is captured the same way, so a remote submission can require the
+        // writer's receipt for THIS frame rather than a later render.
+        const createFormPresentation = sidebar.captureCreateFormPresentation();
         // Title only. Lifecycle, activity and input ownership belong below
         // session-card titles, never on the active conversation's title line. A
         // remote owner is identified by its own sanitized roster labels.
@@ -2223,6 +2407,41 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           }
         }
         remoteCloseConfirmationFrame = remoteCloseFrame;
+        let nextCreateFormFrame: CreateFormFrame | undefined;
+        if (createFormPresentation !== undefined) {
+          const previous = createFormFrame;
+          if (previous !== undefined
+            // The identical drawn form, at the same outer geometry, in the same
+            // geometry epoch: keep the receipt this candidate already earned
+            // instead of revoking it. The pane rectangle is part of the drawn
+            // presentation itself.
+            && previous.renderToken === createFormPresentation.renderToken
+            && previous.formGeneration === createFormPresentation.formGeneration
+            && previous.hostKind === createFormPresentation.hostKind
+            && previous.hostId === createFormPresentation.hostId
+            && previous.hostRunId === createFormPresentation.hostRunId
+            && previous.workspace === createFormPresentation.workspace
+            && previous.cols === createFormPresentation.cols
+            && previous.rows === createFormPresentation.rows
+            && previous.terminalCols === cols
+            && previous.terminalRows === rows
+            && previous.epoch === createFormEpoch) {
+            nextCreateFormFrame = previous;
+          } else {
+            nextCreateFormFrame = {
+              ...createFormPresentation,
+              terminalCols: cols,
+              terminalRows: rows,
+              epoch: createFormEpoch,
+              settled: false,
+            };
+            // Identical drawn bytes are not proof that a different host line,
+            // owner run, workspace, or form generation was written: force the
+            // writer's own boundary before anything may be submitted.
+            writer.invalidate?.();
+          }
+        }
+        createFormFrame = nextCreateFormFrame;
         writer.submit(composed, cols, rows, (disposition: SessionHostFrameDisposition) => {
           // Retain what ACTUALLY completed writing, even when a newer identical
           // candidate is already queued: discarding the only real write would
@@ -2244,6 +2463,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             if (activeSidebar.settleRemoteCloseConfirmationRender(
               remoteCloseFrame.generation, remoteCloseFrame.renderToken,
             )) remoteCloseFrame.settled = true;
+          }
+          if (createFormFrame !== undefined && nextCreateFormFrame === createFormFrame
+            && isCurrentCreateFormFrame(createFormFrame)
+            && (disposition === "written" || (disposition === "unchanged" && createFormFrame.settled))) {
+            if (activeSidebar.settleCreateFormRender(createFormFrame.renderToken)) createFormFrame.settled = true;
           }
           if (confirmationFrame === undefined || savedDeleteConfirmationFrame !== confirmationFrame) return;
           if (!isCurrentSavedDeleteConfirmationFrame(confirmationFrame)) {
@@ -3413,6 +3637,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // and no highlight written at the old geometry may authorize a request.
     invalidateRemoteCloseConfirmationDisplay();
     remoteCloseHighlightEpoch += 1;
+    // A remote New submission's written form receipt belongs to the geometry it
+    // was written at. Physical reflow retires it (and any in-flight request's
+    // last-instant proof) until a replacement frame in this new epoch is written,
+    // including a resize that returns to the previous size before repainting.
+    createFormEpoch += 1;
     // Physical reflow revokes every remote native IO receipt until a post-resize
     // frame is actually written, including a resize that returns to the previous
     // size before anything is repainted. Remote input/copy only; Close and
@@ -3433,6 +3662,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       throw new Error("external editor handoff is unavailable");
     }
     externalEditorActive = true;
+    // The handoff retires every geometry-bound receipt: the terminal is handed to
+    // the editor and repainted, so a remote New receipt composed before it is dead.
+    createFormEpoch += 1;
     hostMouseButtons.clear(); // no terminal gesture ownership survives a tty handoff
     const controller = new AbortController();
     externalEditorAbort = controller;
@@ -4274,6 +4506,95 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     return startRowClose(owner, request.rowId, request.confirmed, false);
   }
 
+  /**
+   * The ONE owner-side rowless Create provider. It creates one blank child in THIS
+   * host's exact current run by reusing the very seam the local New action uses —
+   * {@link OwningHostService.startSession} with only the canonical workspace — and
+   * answers with fixed facts only.
+   *
+   * Nothing else about the local New route happens here: no duplicate fence, no
+   * workspace deduplication, no path resolution or cwd substitution, no trimming,
+   * no form bookkeeping, no row selection, and no activation or focus change. The
+   * request is resolved ONLY against this owner's authoritative inventory, which is
+   * read before the create for the exact run and after it for the row that actually
+   * came up, and it needs no native conversation tuple, displayed or selected row,
+   * viewer, controller lease, or local popup or setting. It is notice-free toward
+   * this host's operator (the requester gets the facts instead) while the service's
+   * normal roster redraw and persistence-warning paths still run.
+   *
+   * The facts never overstate what this host saw. `started` requires the row to be
+   * alive with a live process in THIS run's own post-create inventory. `unconfirmed`
+   * is an addressed create that produced nothing usable (a not-ready or failed
+   * create may have left an error row, which this fact neither removes nor
+   * describes). `refused` is reserved for authority or identity this host
+   * positively established before any create was invoked, including the minimal
+   * re-proof checked immediately before that invocation. A throwing manager, an
+   * interrupted run, an unexpected duplicate, or an unrecognized status is
+   * `unknown` and claims neither a child nor its absence.
+   */
+  async function createOwnedSession(
+    request: OwnerCreateRequest,
+    stillAuthorized: () => boolean,
+  ): Promise<OwnerCreateFacts> {
+    // Fence teardown and the one manager run before anything is read or written.
+    if (manager === undefined || shutdownRequested) return { kind: "refused" };
+    // An inventory that cannot be observed is unknown, and another owner run is
+    // refused. Neither read starts, writes, selects, activates, or focuses anything.
+    let before: OwningHostInventorySnapshot | undefined;
+    try {
+      before = hostService.readInventorySnapshot();
+    } catch {
+      before = undefined;
+    }
+    if (before === undefined) return { kind: "unknown" };
+    if (before.hostRunId !== request.hostRunId) return { kind: "refused" };
+    // The owner's minimal re-proof is checked IMMEDIATELY before the create is
+    // invoked — after every callout above — so a Revoke, a replaced grant, or a
+    // retired channel that landed after admission never starts a child.
+    let authorized = false;
+    try {
+      authorized = stillAuthorized() === true;
+    } catch {
+      authorized = false;
+    }
+    if (!authorized || shutdownRequested) return { kind: "refused" };
+    // A blank create has no saved-conversation duplicate fence: the canonical form
+    // text is forwarded verbatim and the manager applies its own existing launch
+    // semantics.
+    let outcome: StartedSessionOutcome;
+    try {
+      outcome = await hostService.startSession({ workspace: request.workspace });
+    } catch {
+      return { kind: "unknown" };
+    }
+    // Not-ready and failed are addressed operations that produced nothing usable.
+    if (outcome.status === "not-ready" || outcome.status === "failed") {
+      return { kind: "unconfirmed" };
+    }
+    // `duplicate` is never a saved-duplicate refusal here, because a blank create
+    // has no duplicate fence at all; an interrupted run and any unrecognized status
+    // are equally unobservable.
+    if (outcome.status !== "started") return { kind: "unknown" };
+    // `started` requires this exact run's own post-create inventory to report the
+    // row alive with a live process. An unreadable inventory, or one belonging to a
+    // different run, cannot establish that nothing usable came up: a live child may
+    // already exist and merely be unobservable, so both stay `unknown`. Only an
+    // observable row that is absent, starting, errored, or exited is `unconfirmed`.
+    let after: OwningHostInventorySnapshot | undefined;
+    try {
+      after = hostService.readInventorySnapshot();
+    } catch {
+      after = undefined;
+    }
+    if (after === undefined) return { kind: "unknown" };
+    if (after.hostRunId !== request.hostRunId) return { kind: "unknown" };
+    const row = after.rows.find((candidate) => candidate.id === outcome.id);
+    if (row === undefined || row.lifecycle !== "alive" || row.hasLiveProcess !== true) {
+      return { kind: "unconfirmed" };
+    }
+    return { kind: "started", hostRunId: after.hostRunId, rowId: outcome.id };
+  }
+
   // --- Requester-side remote Close (the owner's row, asked over roster metadata) ---
 
   /**
@@ -4719,6 +5040,251 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }, controller);
   }
 
+  // --- Requester-side remote New (`create-on-peer`). ---
+
+  /**
+   * The optional Create controller of the ONE existing coordinator. It is read
+   * only here, feature-detected every time exactly like Close, and never used to
+   * connect, pair, grant, pin, or advertise anything: an older coordinator or
+   * fake simply has no `ownerCreate`, and this host then reports a truthful
+   * unsupported notice without falling back to a local create.
+   */
+  function ownerCreateController(): PeerCreateController | undefined {
+    const coordinator = peerCoordinator as (Partial<PeerCoordinatorWithCreate> | undefined);
+    if (coordinator === undefined) return undefined;
+    try {
+      const candidate = coordinator.ownerCreate;
+      if (candidate === undefined || typeof candidate.createSession !== "function") return undefined;
+      return candidate;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The form PANE the New form would occupy right now, or `undefined` when that
+   * pane is not drawn at all (hidden sidebar, a covering dialog, or focus away
+   * from the form). It is the layout's form rect on a wide layout and the
+   * overlay rect on a narrow one — never the outer terminal size.
+   */
+  function currentCreateFormPane(
+    terminalCols: number,
+    terminalRows: number,
+  ): { readonly cols: number; readonly rows: number } | undefined {
+    const currentLayout = currentHostLayout(terminalCols, terminalRows);
+    const rect = currentLayout.form
+      ?? (currentLayout.sidebarOverlay ? currentLayout.sidebar : undefined);
+    return rect === undefined ? undefined : { cols: rect.cols, rows: rect.rows };
+  }
+
+  /** True only while this exact drawn New-form frame is still the current one. */
+  function isCurrentCreateFormFrame(frame: CreateFormFrame): boolean {
+    if (shutdownRequested || externalEditorActive || terminal === undefined || !terminalStarted) return false;
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || !activeSidebar.visible) return false;
+    if (activeSidebar.focus !== "form") return false;
+    if (clampDimension(terminal.columns, 80) !== frame.terminalCols
+      || clampDimension(terminal.rows, 24) !== frame.terminalRows) return false;
+    // A pre-reflow frame never authorizes anything until a replacement frame in
+    // the current epoch is actually written, even when the terminal returned to
+    // the same dimensions before anything was repainted.
+    if (frame.epoch !== createFormEpoch) return false;
+    // The pane must be drawn now, at the same pane rectangle it was drawn at.
+    const pane = currentCreateFormPane(frame.terminalCols, frame.terminalRows);
+    if (pane === undefined) return false;
+    if (pane.cols !== frame.cols || pane.rows !== frame.rows) return false;
+    return activeSidebar.isCreateFormRenderCurrent(frame.renderToken);
+  }
+
+  /** The fixed notice for one settled owner/not-sent Create result. */
+  function createOnPeerResultNotice(result: PeerCreateResult): string {
+    if (result.kind === "owner-result") {
+      const facts: OwnerCreateFacts | undefined = isOwnerCreateFacts(result.facts) ? result.facts : undefined;
+      if (facts === undefined) return CREATE_ON_PEER_UNKNOWN_MESSAGE;
+      switch (facts.kind) {
+        case "started":
+          // Handled by the caller; a started fact without an exact run never
+          // reaches this notice.
+          return CREATE_ON_PEER_OTHER_RUN_NOTICE;
+        case "unconfirmed":
+          return CREATE_ON_PEER_UNCONFIRMED_MESSAGE;
+        case "refused":
+          return CREATE_ON_PEER_REFUSED_MESSAGE;
+        case "unknown":
+          return CREATE_ON_PEER_UNKNOWN_MESSAGE;
+      }
+    }
+    if (result.kind === "not-sent") {
+      switch (result.reason) {
+        case "capability-unsupported":
+          return CREATE_ON_PEER_UNSUPPORTED_MESSAGE;
+        case "not-ready":
+        case "target-unavailable":
+          return CREATE_ON_PEER_GONE_MESSAGE;
+        case "invalid-request":
+          return CREATE_ON_PEER_FORM_CHANGED_MESSAGE;
+        case "busy":
+        case "limit":
+          return CREATE_ON_PEER_BUSY_MESSAGE;
+      }
+    }
+    return CREATE_ON_PEER_UNKNOWN_MESSAGE;
+  }
+
+  /**
+   * Record one settled requester-side Create result. The owner's own roster
+   * projection is the only thing that can list the new remote row, so nothing
+   * local is created, selected, activated, or focused here: an exact `started`
+   * fact hands the sidebar the returned run and row (which emits the ordinary
+   * remote display selection only while that exact request still owns the form),
+   * and every other fact is a bounded notice on the same request.
+   */
+  function applyCreateOnPeerResult(attempt: CreateOnPeerAttempt, result: PeerCreateResult): void {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined) return;
+    const facts = result.kind === "owner-result" && isOwnerCreateFacts(result.facts)
+      ? result.facts
+      : undefined;
+    if (facts !== undefined && facts.kind === "started") {
+      // This side's own last-instant ownership proof, re-evaluated at the reply:
+      // a request this host already retired (a destination run/connection/identity
+      // transition, a newer form, or a dismissal) never selects anything and never
+      // installs an awaiting fact — whatever the owner did with the bytes.
+      if (!activeSidebar.createOnPeerStillCurrent(attempt)) return;
+      // The `started` reply can legitimately arrive before this side's own roster
+      // observation of the new row, and an ALREADY observed row must never later be
+      // described as awaiting its first observation. Record the exact row only for
+      // the submitted run and only while it is genuinely unobserved.
+      const rowObserved = peerUiSnapshot?.hosts?.some((host) =>
+        host.id === attempt.hostId
+        && (host.roster.hostRunId ?? null) === facts.hostRunId
+        && host.roster.rows?.some((row) => row.id === facts.rowId) === true) === true;
+      pendingCreatedRemote = facts.hostRunId === attempt.hostRunId && !rowObserved
+        ? { hostId: attempt.hostId, hostRunId: facts.hostRunId, rowId: facts.rowId }
+        : undefined;
+      activeSidebar.completeCreateOnPeer(attempt.requestId, {
+        hostRunId: facts.hostRunId,
+        rowId: facts.rowId,
+      });
+      return;
+    }
+    activeSidebar.failCreateOnPeer(attempt.requestId, createOnPeerResultNotice(result));
+  }
+
+  /**
+   * Submit ONE frozen remote New attempt to the coordinator's existing Create
+   * controller. Nothing is retried, replayed, cancelled, or retargeted: the
+   * caller's `stillCurrent` proof is handed to the backend so it is evaluated
+   * again inside the ordered write that actually calls the transport, and a
+   * throw after that handoff is an unknown outcome rather than a not-sent claim.
+   */
+  function startCreateOnPeer(
+    attempt: CreateOnPeerAttempt,
+    controller: PeerCreateController,
+  ): void {
+    createOnPeerAttempt = attempt;
+    const stillCurrent = (): boolean => {
+      if (shutdownRequested || externalEditorActive) return false;
+      if (createOnPeerAttempt !== attempt) return false;
+      const activeSidebar = sidebar;
+      if (activeSidebar === undefined || terminal === undefined) return false;
+      if (clampDimension(terminal.columns, 80) !== attempt.terminalCols
+        || clampDimension(terminal.rows, 24) !== attempt.terminalRows) return false;
+      // The geometry epoch, not the dimensions alone: a resize that returned to
+      // the submitted size before anything was repainted retires this attempt.
+      if (attempt.epoch !== createFormEpoch) return false;
+      const pane = currentCreateFormPane(attempt.terminalCols, attempt.terminalRows);
+      if (pane === undefined || pane.cols !== attempt.paneCols || pane.rows !== attempt.paneRows) return false;
+      return activeSidebar.createOnPeerStillCurrent({
+        requestId: attempt.requestId,
+        formGeneration: attempt.formGeneration,
+        hostId: attempt.hostId,
+        hostRunId: attempt.hostRunId,
+        workspace: attempt.workspace,
+      });
+    };
+    void (async () => {
+      let result: PeerCreateResult;
+      try {
+        result = await controller.createSession({
+          hostId: attempt.hostId,
+          hostRunId: attempt.hostRunId,
+          workspace: attempt.workspace,
+        }, { stillCurrent });
+        if (typeof result !== "object" || result === null
+          || (result.kind !== "owner-result" && result.kind !== "not-sent" && result.kind !== "unknown")) {
+          result = { kind: "unknown" };
+        }
+      } catch {
+        result = { kind: "unknown" };
+      }
+      if (createOnPeerAttempt === attempt) createOnPeerAttempt = undefined;
+      if (shutdownRequested) return;
+      applyCreateOnPeerResult(attempt, result);
+      reconcileLayout(true);
+      scheduleRedraw();
+    })();
+  }
+
+  /**
+   * One deliberate remote New submission. The sidebar's action DTO carries the
+   * host, the exact owner run, the canonical workspace, the form generation, and
+   * the drawn-frame token it captured; this side proves that exact frame was the
+   * one the writer actually committed, and then freezes it. Nothing is re-derived
+   * from a later list, index, label, or selection, and a local `create` takes the
+   * completely unchanged path above.
+   */
+  function launchCreateOnPeer(action: Extract<SidebarAction, { type: "create-on-peer" }>): void {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested || terminal === undefined) return;
+    const frame = createFormFrame;
+    if (frame === undefined || !frame.settled
+      || frame.renderToken !== action.renderToken
+      || frame.formGeneration !== action.formGeneration
+      || frame.hostKind !== "remote"
+      || frame.hostId !== action.hostId
+      || frame.hostRunId !== action.hostRunId
+      || frame.workspace !== action.workspace
+      || !isCurrentCreateFormFrame(frame)) {
+      // A forged, stale, superseded, resized, queued, held, or unwritten DTO can
+      // never send anything: the exact written form is the only authority.
+      activeSidebar.failCreateOnPeer(action.requestId, CREATE_ON_PEER_UNWRITTEN_NOTICE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    // Consume the one-shot receipt BEFORE dispatch so this same submission can
+    // never be sent twice, while a duplicate that arrives later has no current
+    // frame to match.
+    createFormFrame = undefined;
+    if (createOnPeerAttempt !== undefined) {
+      activeSidebar.failCreateOnPeer(action.requestId, CREATE_ON_PEER_BUSY_MESSAGE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    const controller = ownerCreateController();
+    if (controller === undefined) {
+      activeSidebar.failCreateOnPeer(action.requestId, CREATE_ON_PEER_UNSUPPORTED_MESSAGE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    startCreateOnPeer({
+      requestId: action.requestId,
+      hostId: action.hostId,
+      hostRunId: action.hostRunId,
+      workspace: action.workspace,
+      formGeneration: action.formGeneration,
+      renderToken: action.renderToken,
+      terminalCols: frame.terminalCols,
+      terminalRows: frame.terminalRows,
+      paneCols: frame.cols,
+      paneRows: frame.rows,
+      epoch: frame.epoch,
+    }, controller);
+  }
+
   function handleSidebarAction(action: SidebarAction): void {
     if (shutdownRequested) return;
     // Any deliberate user action invalidates a pending automatic activation.
@@ -4838,6 +5404,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       case "create":
         if (negotiationReady) launchCreate(action);
         else deferredCreates.set(action.requestId, action);
+        reconcileLayout(true);
+        scheduleRedraw();
+        return;
+      case "create-on-peer":
+        // A deliberate REMOTE New submission. It is never folded into the local
+        // `create` path: this side proves the exact written form first, and the
+        // owner host performs the one create in its own run.
+        launchCreateOnPeer(action);
         reconcileLayout(true);
         scheduleRedraw();
         return;
@@ -5120,6 +5694,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     invalidateSavedDeleteConfirmationDisplay();
     invalidatePeerConsentDisplay();
     invalidateRemoteCloseConfirmationDisplay();
+    // A drawn New form's receipt and Host line map never survive teardown; an
+    // already-handed remote create is not cancelled or re-sent here.
+    createFormFrame = undefined;
+    pendingCreatedRemote = undefined;
+    sidebar?.invalidateCreateFormPresentation();
     // Ephemeral per-target reminders never outlive this host run. An in-flight
     // close already handed to the owner is never re-sent or cancelled here.
     remoteCloseMarkers.clear();
@@ -5480,13 +6059,20 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         onReject: options.onReject,
         onExternalEditor: startExternalEditor,
       };
+      // `plain` is a REMOTE New form's workspace: canonical owner text with the
+      // ordinary workspace bound and NO local filesystem completion at all.
       const field = options.kind === "path"
         ? createSessionHostTextField({
           ...common,
           kind: "path",
           workspaceBasePath: snapshot.startupCwd,
         })
-        : createSessionHostTextField({ ...common, kind: "name" });
+        : options.kind === "plain"
+          ? createPlainOwnerWorkspaceField({
+            ...common,
+            workspaceBasePath: snapshot.startupCwd,
+          })
+          : createSessionHostTextField({ ...common, kind: "name" });
       return {
         field,
         matchesCancel: (data: string) =>

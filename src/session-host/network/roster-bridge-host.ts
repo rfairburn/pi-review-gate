@@ -15,10 +15,15 @@
  * close provider is a SEPARATE injected callback supplied by the owner's Main
  * process, which already owns the only manager, roster, and row-removal path:
  * this bridge only forwards one request to it and reports its fixed facts back.
+ * The optional create provider is the same kind of separate injected callback:
+ * it is handed one exact owner run and one canonical workspace plus a minimal
+ * re-proof, and this bridge only forwards the request and reports the fixed facts
+ * back. Neither provider is wrapped or emulated here, and neither needs a selected
+ * or displayed row, a viewer, a native conversation tuple, or a local prompt.
  * Stopping a subscription, fencing a channel, or losing the transport changes
  * metadata delivery only; it never cancels, rolls back, or reports an exit for a
- * close the owner already accepted, and it never claims a close operation exited
- * because this binding is gone.
+ * close or a create the owner already accepted, and it never claims such an
+ * operation exited because this binding is gone.
  *
  * Identity is the exact `channel.peerKey` proved by the live TLS handshake. A
  * friendly label and any key claimed in a frame are display data, never
@@ -65,9 +70,16 @@ import {
   type OwnerCloseHandler,
   type OwnerCloseRequest,
 } from "./peer-close";
+import {
+  isOwnerCreateFacts,
+  type OwnerCreateFacts,
+  type OwnerCreateHandler,
+  type OwnerCreateRequest,
+} from "./peer-create";
 import { isRemoteSessionMetadataError, toRemoteSessionMetadata, type RemoteSessionMetadata } from "./roster-metadata";
 import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
+  ROSTER_BRIDGE_CREATE_CAPABILITY,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
@@ -81,6 +93,7 @@ import {
   rosterBridgeWireCodeForFailure,
   type RosterBridgeBounds,
   type RosterBridgeCloseRequestFrame,
+  type RosterBridgeCreateRequestFrame,
   type RosterBridgeErrorCode,
   type RosterBridgeFrame,
   type RosterBridgeHelloFrame,
@@ -119,7 +132,10 @@ export type RosterBridgeOwnerDiagnosticCode =
   | "binding_stopped"
   | "close_accepted"
   | "close_refused"
-  | "close_reply_dropped";
+  | "close_reply_dropped"
+  | "create_accepted"
+  | "create_refused"
+  | "create_reply_dropped";
 
 export interface RosterBridgeOwnerDiagnostic {
   readonly code: RosterBridgeOwnerDiagnosticCode;
@@ -144,6 +160,16 @@ export interface RosterBridgeHostOptions {
    * receiving grant before this handler can be reached.
    */
   readonly closeOwnedSession?: OwnerCloseHandler;
+  /**
+   * The owner's ONE rowless create provider, supplied by Main, which already owns
+   * the only manager, run identity, and launch path. Absent means this host never
+   * acknowledges or accepts the create capability and behaves exactly as a
+   * metadata-and-close host does. Supplying it grants nothing by itself: every
+   * request is reauthorized against the current proved peer key and directional
+   * receiving grant immediately before this handler is reached, and the handler is
+   * handed a minimal re-proof for its own last-instant check.
+   */
+  readonly createOwnedSession?: OwnerCreateHandler;
   readonly bounds?: Partial<RosterBridgeBounds>;
   readonly onDiagnostic?: RosterBridgeOwnerDiagnosticSink;
 }
@@ -205,6 +231,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
   /**
    * Optional capabilities acknowledged for this channel. The Close capability is
    * included only when the peer offered it AND this owner really holds its close
+   * provider, and the create capability only when it really holds its create
    * provider, so a provider-less owner never widens anything.
    */
   #capabilities: readonly string[] = Object.freeze([]);
@@ -215,6 +242,20 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    */
   readonly #inflightCloses = new Set<string>();
   readonly #closeRows = new Set<string>();
+  /**
+   * The ONE in-flight create on this channel, plus this channel's monotonic
+   * anti-replay high-water. They are two scalars, not a request history, replay
+   * cache, queue, or authority registry: a sequence at or below the high-water is
+   * refused before any provider is invoked, whether its request is still in flight
+   * or already completed, and a second create while one is in flight is refused
+   * rather than queued, evicted, or retargeted.
+   *
+   * The high-water is an ADMISSION fence only. It never invalidates an operation
+   * this binding already accepted: a later request that advances or is refused on
+   * that scalar neither cancels the earlier child nor drops its fixed result.
+   */
+  #inflightCreate: { readonly requestId: string; readonly hostRunId: string } | null = null;
+  #createSequence = 0;
   #installing = false;
   #installUnavailable = false;
   #subscriptionRun: string | null = null;
@@ -314,6 +355,9 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       case "close_request":
         this.#onCloseRequest(frame);
         return;
+      case "create_request":
+        this.#onCreateRequest(frame);
+        return;
       default:
         // A frame this side did not ask for (its own ack, an unknown type, or a
         // second hello) is a protocol violation, answered once.
@@ -347,10 +391,15 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     // set in force for this session: the required baseline this owner implements,
     // plus only the optional capabilities both sides offered AND this owner can
     // really honour. Negotiation can only narrow what either side assumes.
-    this.#capabilities = Object.freeze(decision.capabilities.filter((capability) => (
-      capability !== ROSTER_BRIDGE_CLOSE_CAPABILITY
-      || typeof this.#options.closeOwnedSession === "function"
-    )));
+    this.#capabilities = Object.freeze(decision.capabilities.filter((capability) => {
+      if (capability === ROSTER_BRIDGE_CLOSE_CAPABILITY) {
+        return typeof this.#options.closeOwnedSession === "function";
+      }
+      if (capability === ROSTER_BRIDGE_CREATE_CAPABILITY) {
+        return typeof this.#options.createOwnedSession === "function";
+      }
+      return false;
+    }));
     this.#sendControl({
       type: "hello_ack",
       service: ROSTER_BRIDGE_SERVICE,
@@ -543,22 +592,211 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    * admitted, never that any row stopped.
    */
   #writeCloseResult(requestId: string, facts: OwnerCloseFacts): void {
+    this.#writeResult({ type: "close_result", requestId, outcome: facts }, "close_reply_dropped");
+  }
+
+  // ------------------------------------------------------------------- create
+
+  /**
+   * Answer one rowless create request with the owner's ONE provider, or not at all.
+   *
+   * Admission is decided here and now: the capability must have been negotiated
+   * for this channel (which already required a real provider), the channel must
+   * not be fenced or pre-hello, and the EXACT proved peer key must still carry this
+   * owner's current directional receiving grant. The per-channel monotonic
+   * sequence is then compared against the high-water and consumed, so a duplicated
+   * or older request — whether still in flight or already completed — is answered
+   * `refused` without ever reaching the provider, and a second create while one is
+   * live is refused rather than queued.
+   *
+   * The provider is invoked from a detached continuation on purpose: a manager
+   * create must never block the ordered metadata receive path, so other requests,
+   * acknowledgements, and snapshots keep flowing while Main owns the operation.
+   * Authorization is re-proved immediately before that invocation — not merely
+   * before the queued continuation — and the provider is handed the same minimal
+   * re-proof so it can check once more immediately before it starts anything.
+   *
+   * The sequence high-water decides ADMISSION only. It is never a newest-dispatch
+   * fence for work already accepted, so a later request cannot cancel this child or
+   * drop this request's result.
+   */
+  #onCreateRequest(frame: RosterBridgeCreateRequestFrame): void {
+    if (this.#state === "finished") return;
+    const handler = this.#options.createOwnedSession;
+    if (handler === undefined || !this.#capabilities.includes(ROSTER_BRIDGE_CREATE_CAPABILITY)) {
+      // Nothing was acknowledged for this channel, so a create frame is outside the
+      // negotiated protocol: it is refused exactly like any other unexpected frame
+      // and never reaches an authority.
+      this.#violation();
+      return;
+    }
+    if (this.#fenced) {
+      this.#refuse();
+      return;
+    }
+    if (this.#state === "awaiting_hello") {
+      this.#violation();
+      return;
+    }
+    if (!this.#createStillAuthorized()) {
+      // No callback and no write: an unauthorized request establishes nothing, and
+      // the requester learns `unknown` from its own finite deadline rather than a
+      // fabricated refusal or a created child. The same check re-proves this
+      // binding's lifecycle after the authorizer callout, so an authorizer that
+      // retires it while returning `true` cannot reach any result write either.
+      this.#diagnostic("create_refused");
+      return;
+    }
+    if (frame.sequence <= this.#createSequence) {
+      // A previous or duplicated attempt number. Refused before any provider call,
+      // and the high-water is unchanged, so nothing can be replayed.
+      this.#writeCreateResult(frame.requestId, { kind: "refused" });
+      return;
+    }
+    // The attempt number is consumed now, whichever answer follows: it is a scalar
+    // high-water, not a history, and a fresh higher number is a fresh attempt.
+    this.#createSequence = frame.sequence;
+    if (this.#inflightCreate !== null) {
+      // One create per channel. A second is refused, never queued, evicted, or
+      // retargeted, and nothing was started for it.
+      this.#writeCreateResult(frame.requestId, { kind: "refused" });
+      return;
+    }
+    const request: OwnerCreateRequest = Object.freeze({
+      hostRunId: frame.hostRunId,
+      workspace: frame.workspace,
+    });
+    const inflight = { requestId: frame.requestId, hostRunId: frame.hostRunId };
+    this.#inflightCreate = inflight;
+    this.#diagnostic("create_accepted");
+    // The minimal re-proof handed to the provider: the current proved key, the
+    // current receiving grant, and this live binding, checked again by the owner
+    // immediately before it starts anything. It is a check, never a lease.
+    //
+    // The injected authorizer is arbitrary code and may itself retire this binding
+    // (a Revoke that also drops the channel, a teardown, a replacement) while still
+    // returning `true`. The lifecycle is therefore re-proved AFTER that callout as
+    // well as before it, so a create never starts for a binding that retired during
+    // its own final authorization.
+    const stillAuthorized = (): boolean => this.#createStillAuthorized();
+    void Promise.resolve()
+      .then(() => {
+        // Re-proved inside the detached continuation, immediately before the call:
+        // a Revoke, a replacement, or a teardown that landed while this was queued
+        // means the provider is never reached and nothing is claimed either way.
+        if (!stillAuthorized()) {
+          this.#completeCreate(inflight, { kind: "unknown" }, false);
+          return;
+        }
+        // The provider is invoked directly in THIS continuation, immediately after
+        // its authorization check, so no extra microtask can slip a revoke or a
+        // binding retirement between the check and the call. A synchronous throw
+        // from the provider still reaches the outer `.catch` below, which settles
+        // the request honestly and releases the one-in-flight bookkeeping.
+        return handler(request, stillAuthorized).then(
+          (facts) => this.#completeCreate(inflight, isOwnerCreateFacts(facts) ? facts : { kind: "unknown" }, true),
+          () => this.#completeCreate(inflight, { kind: "unknown" }, true),
+        );
+      })
+      .catch(() => {
+        // Nothing above may leave an accepted request stranded: an unexpected fault
+        // still completes it honestly and releases the one-in-flight bookkeeping.
+        this.#completeCreate(inflight, { kind: "unknown" }, false);
+      });
+  }
+
+  /**
+   * A fresh runtime read of this binding's lifecycle. It is a separate method so a
+   * recheck after the injected authorizer still reads the CURRENT state: TypeScript
+   * would otherwise keep the earlier narrowing and treat the comparison as
+   * impossible.
+   */
+  #createBindingIsLive(): boolean {
+    return this.#state !== "finished" && !this.#fenced;
+  }
+
+  /**
+   * The create-side re-proof: this binding is live and unfenced BOTH before and
+   * after the injected authorizer runs. The second check is what makes a Revoke,
+   * teardown, or replacement that happens inside that callout fail closed.
+   */
+  #createStillAuthorized(): boolean {
+    if (!this.#createBindingIsLive()) return false;
+    if (!this.#authorized()) return false;
+    return this.#createBindingIsLive();
+  }
+
+  /**
+   * Answer one completed create. Authorization is re-proved immediately before the
+   * reply is written, so a Revoke, a closed channel, or a fenced binding that
+   * happened while Main was working drops the reply truthfully. The operation
+   * itself is never cancelled, rolled back, retried, or reported as a stop: Main's
+   * own launch lifecycle owns it, and this binding only ever owns network delivery.
+   *
+   * A `started` fact that does not name the EXACT owner run the request named is
+   * never forwarded: this channel may not report another run's child.
+   */
+  #completeCreate(
+    inflight: { readonly requestId: string; readonly hostRunId: string },
+    facts: OwnerCreateFacts,
+    providerReturned: boolean,
+  ): void {
+    // A request abandoned by teardown is no longer this binding's to answer.
+    if (this.#inflightCreate !== inflight) return;
+    this.#inflightCreate = null;
+    if (this.#state === "finished" || this.#fenced) {
+      this.#diagnostic("create_reply_dropped");
+      return;
+    }
+    if (!this.#createStillAuthorized()) {
+      // A binding that retired inside the authorizer's own callout can no longer
+      // write a result at all; one that is merely unauthorized reports the refusal.
+      this.#diagnostic(!this.#createBindingIsLive() ? "create_reply_dropped" : "create_refused");
+      return;
+    }
+    if (facts.kind === "started" && facts.hostRunId !== inflight.hostRunId) {
+      // The answer belongs to another run, so this request's outcome is
+      // unobservable rather than a claimed child of the run it named.
+      this.#writeCreateResult(inflight.requestId, { kind: "unknown" });
+      return;
+    }
+    if (!providerReturned && facts.kind !== "unknown") {
+      // A re-proof that failed before the provider was reached establishes nothing
+      // about this owner's state.
+      this.#writeCreateResult(inflight.requestId, { kind: "unknown" });
+      return;
+    }
+    this.#writeCreateResult(inflight.requestId, facts);
+  }
+
+  /** Write one fixed create result, or drop it without touching the channel. */
+  #writeCreateResult(requestId: string, facts: OwnerCreateFacts): void {
+    this.#writeResult({ type: "create_result", requestId, outcome: facts }, "create_reply_dropped");
+  }
+
+  /**
+   * Write one fixed result frame. A result that cannot be written is simply
+   * dropped: it never fences the metadata channel, never closes the transport, and
+   * never claims the operation did not happen. A resolved write means the bytes
+   * were admitted, never that the peer acted on them.
+   */
+  #writeResult(frame: RosterBridgeFrame, droppedDiagnostic: RosterBridgeOwnerDiagnosticCode): void {
     let bytes: Buffer;
     try {
-      bytes = encodeRosterBridgeFrame({ type: "close_result", requestId, outcome: facts }, this.#bounds);
+      bytes = encodeRosterBridgeFrame(frame, this.#bounds);
     } catch {
-      this.#diagnostic("close_reply_dropped");
+      this.#diagnostic(droppedDiagnostic);
       return;
     }
     let written: Promise<void>;
     try {
       written = this.#channel.send(bytes);
     } catch {
-      this.#diagnostic("close_reply_dropped");
+      this.#diagnostic(droppedDiagnostic);
       return;
     }
     void written.catch(() => {
-      this.#diagnostic("close_reply_dropped");
+      this.#diagnostic(droppedDiagnostic);
     });
   }
 
@@ -780,6 +1018,10 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       // dropped rather than claimed after this binding is gone.
       this.#inflightCloses.clear();
       this.#closeRows.clear();
+      // Create bookkeeping is network-delivery bookkeeping only, for the same
+      // reason: an accepted create keeps running under Main's launch lifecycle, and
+      // its result is dropped rather than claimed after this binding is gone.
+      this.#inflightCreate = null;
       if (this.#state !== "finished") {
         // An owner-initiated stop tells the viewer its observations are no
         // longer current; it never fabricates an empty roster.

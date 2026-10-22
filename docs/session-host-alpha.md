@@ -396,13 +396,25 @@ any deliberate user
 action is admitted, and the remembered active entry becomes the active Main input owner
 only when no deliberate user action happened while restoration was still running, so a
 slow restoration can never take over a user's own focus or action. Each **New session**
-asks only for an
-explicit existing workspace directory; there is no separate host display-label field.
-Submitting New creates the child and immediately makes it the active Main input owner
-without a second row Enter; the sidebar stays visible.
+has one explicit **Workspace** field and one **Host** line; there is no separate host
+display-label field. The Host line names **Local** every time the form opens: a Local
+submission asks only for an explicit existing workspace directory, keeps the native path
+editor and its completion, and immediately makes the created child the active Main input
+owner without a second row Enter, with the sidebar still visible. A previous remote choice
+is never carried forward, an actual Host change clears the Workspace value, and choosing
+the same Host again is a no-op, so no per-host history is kept. Choosing one
+already-connected saved destination makes Workspace plain bounded text for that owner's
+filesystem and submits a single create request to that owner, which creates one blank
+native child in its own run with no initial prompt (see
+[Owner Create transport foundation](#owner-create-transport-foundation)). That Host
+choice is not a Network destination action: it adds no destination, connection, pin, or
+grant.
 
 An authenticated top-level session-host child with the review-gate reporter also exposes
-`SessionSpawn`; delegated executor children do not. It requires exactly an existing
+`SessionSpawn`; delegated executor children do not. It remains a native, owner-bound
+tool: the child is created in its own hosting process through the same owner service,
+without adding a network `SessionSpawn` RPC. The optional owner-create exchange later
+in this page is a separate operation. `SessionSpawn` requires exactly an existing
 workspace, title, and nonempty prompt. It creates a fresh native Pi process and
 conversation in that workspace, without creating a worktree, clone, or branch. Native
 settings and compatible inherited launch options remain shared, but the parent's
@@ -442,16 +454,19 @@ resize. Ordinary launch, New-session, and saved-conversation behavior is unchang
 The sidebar name comes from the observed native conversation metadata (the stored
 native name or Pi's native first-user-message fallback). Until that metadata is observed,
 the row reports that the session name is unavailable rather than inventing a user label.
-The New field uses Pi's native path completion, with relative suggestions rooted at the
-host startup working directory; this does not select that directory as the workspace.
-Its on-screen key cues reflect the current `keybindings.json` in the shared native Pi
-agent directory. A genuinely absent optional file is silent and uses Pi's real default
-form keys; an unavailable, unsafe, or unsupported file keeps a bounded warning and the
-same default keys. The per-window Profile field is removed: every child uses the same
-canonical native Pi agent directory, resolved from `PI_CODING_AGENT_DIR` or Pi's
-ordinary `~/.pi/agent` default. That directory is fixed user configuration, not a
-workspace selector. It (or its `.pi` parent) may still be chosen as an ordinary session
-workspace: that child runs with that canonical directory as its cwd while keeping the
+A Local New's Workspace field uses Pi's native path completion, with relative
+suggestions rooted at the host startup working directory; this does not select that
+directory as the workspace. A New form whose Host line names a destination keeps plain
+owner-interpreted text instead, with no requester filesystem completion or local path
+interpretation. The New form's on-screen key cues reflect the current `keybindings.json`
+in the shared native Pi agent directory. A genuinely absent optional file is silent and
+uses Pi's real default form keys; an unavailable, unsafe, or unsupported file keeps a
+bounded warning and the same default keys. The per-window Profile field is removed:
+every child uses the same canonical native Pi agent directory, resolved from
+`PI_CODING_AGENT_DIR` or Pi's ordinary `~/.pi/agent` default. That directory is fixed
+user configuration, not a workspace selector. It (or its `.pi` parent) may still be
+chosen as an ordinary session workspace: that child runs with that canonical directory
+as its cwd while keeping the
 same effective `PI_CODING_AGENT_DIR` and shared native configuration. Review of such a
 non-Git workspace follows
 [A workspace that contains the checkpoint store](review-workflow.md#a-workspace-that-contains-the-checkpoint-store).
@@ -486,8 +501,10 @@ them, or reparent work. Moving the sidebar highlight does not change the active
 session. A single left-click on a displayed instance card invokes that row's existing
 Enter action: activating a live row makes it the active Main input owner and focuses
 Main, while sibling sessions continue running; exited and error rows retain their
-existing Enter behavior and guards. A successful New submission or saved-conversation
-open activates the created or restored child directly, without a second row Enter.
+existing Enter behavior and guards. A successful Local New submission or
+saved-conversation open activates the created or restored child directly, without a second
+row Enter; a successful remote New selects only the viewport of the returned owner run and
+row (see [Owner Create transport foundation](#owner-create-transport-foundation)).
 Enter on an exited row instead starts a new
 owned process for its current observed conversation, using a freshly revalidated saved
 entry. A positively never-saved binding can start fresh in the same workspace only when
@@ -627,12 +644,16 @@ supplies the explicit pairing controls, saved connection preferences and bounded
 recovery; discovery remains unimplemented. The session-level protocols implemented so far
 are the bounded roster-metadata channel described next, the single-row native viewport
 lane described under
-[Selected native viewport](#selected-native-viewport-interim-display-scope), and the
-[owner-routed Close](#owner-close-transport-foundation). The content lane also carries an
+[Selected native viewport](#selected-native-viewport-interim-display-scope), the
+[owner-routed Close](#owner-close-transport-foundation), and the rowless
+[owner-routed Create](#owner-create-transport-foundation) that an explicit New-form Host
+choice uses. The content lane also carries an
 internal, explicitly opted-in native input and text-copy extension; normal production
 Main does not enable it (see
 [Internal default-off native input and copy](#internal-default-off-native-input-and-copy)).
-Remote creation, `SessionSpawn`, resume, and human handoff remain unimplemented. Native
+`SessionSpawn` is unchanged: it remains the native, owner-bound tool inside a hosted
+child and is not a network request. Remote saved conversations, resume, catalog/history,
+and human handoff remain unimplemented. Native
 client-only mobile implementations can use this trust model;
 ordinary browser WebSockets do not expose self-signed certificate pinning and are not
 claimed supported.
@@ -843,7 +864,11 @@ changing any local row's process, input ownership, saved state, or the roster. R
 keyboard, canonical mouse, whole text paste, and text-copy transport exist only in the
 internal, explicitly opted-in native I/O extension described below; no production Main
 caller enables it, so ordinary remote viewing remains display-only and forwards
-no native input or copy. Remote creation, `SessionSpawn`, resume, and human handoff remain unimplemented
+no native input or copy. A deliberate New-form Host choice can ask one connected
+destination's owner for one blank child, as described under
+[Owner Create transport foundation](#owner-create-transport-foundation); `SessionSpawn`
+remains the native, owner-bound tool described above, and remote saved conversations,
+resume, catalog/history, and human handoff remain unimplemented
 at this ordered interim slice. Close uses the highlighted remote row and its owner,
 independently of the displayed stream. Host shutdown
 closes only this host's owned local network
@@ -949,9 +974,11 @@ Selecting a remote row retires only this viewing surface's local participation: 
 longer displays that local row or contributes its geometry or input, and every
 local and remote child keeps running. `n`/No session, Main focus, and passive behavior
 remain exactly as described elsewhere in this page, and a session with no viewer keeps its
-last canonical size. New session stays local while a remote row is displayed: it never
-redirects creation to the remote owner, and a late completion cannot replace a later
-deliberate selection. A lost connection, Remove, Disconnect, or revocation by the owning
+last canonical size. New session starts on Local while a remote row is displayed, so an
+ordinary New never redirects creation to the remote owner; a deliberate Host choice on
+the New form can still target one connected destination, and a late completion cannot
+replace a later deliberate selection. A lost connection, Remove, Disconnect, or
+revocation by the owning
 peer makes the selected display unavailable without stopping remote work. The deliberate
 target stays selected and the pane shows a host-owned status instead of another host's
 content, a local session, or a silent fallback. Replacing one selection with another — remote A,
@@ -978,8 +1005,11 @@ boundaries. Without that opt-in, native input still fails closed: while a remote
 is displayed, native-pane keyboard, paste, and mouse packets are not forwarded to the
 remote owner and no local child receives them on that stream's behalf. The default-off
 state is an interim integration boundary, not a permanent view-only mode, permission
-kind, or policy. Remote creation, `SessionSpawn`, resume, and human handoff are not
-implemented. The owner-routed Close controls are described below.
+kind, or policy. A deliberate New-form Host choice can create one blank child through
+the owner-routed Create capability described below; `SessionSpawn` remains the native,
+owner-bound tool described above rather than a network request, and remote saved
+conversations, resume, catalog/history, and human handoff are not implemented. The
+owner-routed Close controls are described below.
 Authenticated local and SSH clipboard copying, ordinary standalone Pi, and local host
 input are unchanged: nothing is broadcast, no remote copy request is transported by
 default, raw PTY OSC 52 stays denied, and no last-input-origin inference is added. Native
@@ -1025,8 +1055,74 @@ request. Every still-addressable target retains that reminder until it is acted 
 positive owner/run/row disappearance or settlement makes it obsolete. An exited or
 settled-error row still sends removal to its owner, not local deletion. Local Close,
 Quit, saved-history deletion and stream selection are unchanged. Close itself enables no
-native input, paste, copy, creation, or resume; those remain the separate, internal
-default-off extension below where implemented.
+native input, paste, copy, creation, or resume; native input, paste, and copy remain the
+separate, internal default-off extension below where implemented, and creation is the
+separate rowless capability described next.
+
+### Owner Create transport foundation
+
+An optional `roster-create-v1` capability adds rowless owner-create requests to that
+owner's existing paired roster channel. It rides the same authenticated
+roster-metadata lane on the same listener and TLS/WSS `/app` upgrade, and it is
+acknowledged only when the host really holds its own create provider. An older peer, or
+one without that provider, is unsupported rather than silently upgraded, paired, or
+connected on demand: the New form reports one fixed notice and sends nothing. The
+current TLS-proved peer key, remembered pin, and directional receiving grant still gate
+every request and reply, and capability negotiation grants no authority.
+
+One request names only this owner's exact run, one canonical workspace, a fresh
+correlation id, and a per-channel monotonic attempt number. It carries no row id, native
+conversation tuple, epoch, input mode, viewer, selected stream, displayed row, or path
+decision, so an owner whose current roster is empty is a valid first target. The owner's
+provider reuses the same one manager, run identity, and launch path as its own local New,
+with only the workspace: no duplicate fence, workspace deduplication, path resolution,
+trimming, activation, or focus change. The owner's own local Main owner, selection, and
+drafts stay exactly as they were. No new creation prompt or extra creation notice is
+shown to the owner; normal roster updates and runtime/persistence warnings are unchanged.
+
+Requester-side facts are checked independently of the owner's. Admission and the final
+transport write re-check the observed exact owner run, the remembered pin against the
+channel's TLS-proved key, this side's identity against the borrowed client, and the
+destination channel and epoch. The New form adds its own fences: the exact drawn,
+uncovered frame the writer actually committed, its host identity and owner run, its
+canonical workspace, its pane geometry and geometry epoch, and one request receipt that
+is consumed before dispatch. The caller's written-form check is evaluated first inside
+the ordered write and the owner facts are re-checked after it returns, so a stale caller
+cannot submit anything by itself. One create is in flight per channel; a second is
+refused rather than queued, evicted, or retargeted. The attempt number is a monotonic
+anti-replay scalar, not a newest-answer fence: a duplicate or older number is refused
+before the provider is reached, and a later request never cancels a child or drops an
+earlier result.
+
+Workspace text is the exact canonical value the form held, inside the form's own existing
+bound of 2048 code points and its derived 8192 UTF-8-byte ceiling. Nothing is trimmed,
+resolved, normalized, or substituted by the transport, and the owner applies its own
+existing launch semantics; spaces, slashes, and Windows backslashes are preserved. No new
+listener, manager, queue, replay cache, registry, permission kind, controller lease, or
+stored state is added.
+
+Fixed owner facts are the whole answer. `started` means this owner's manager created a
+row in the exact requested run that is alive with a live process in the owner's own
+post-create inventory; it claims nothing about agent execution, native readiness, a
+durable roster write, or a requester/client receipt. An addressed create that produced
+nothing usable is `unconfirmed`, and it may have left an error row behind. `refused` is
+reserved for authority this host positively established before any create was invoked.
+`unknown` claims nothing either way, and it is also what a lost reply, an elapsed
+patience window, a retired destination, or an unreadable inventory produces. The
+requester's patience is one fixed 15-second window on its own side only: it is not the
+owner's deadline, it does not cancel the owner's create, and a timeout is never retried.
+
+Nothing local is fabricated by a request: no local row, child, or input owner is created
+or accepted. Only the owner's roster projection lists the new row, so no optimistic row
+exists; until that projection arrives the pane reports that it is waiting for the row.
+A `started` answer displays that exact returned run and row only while the same request
+still owns the form; a superseded, dismissed, or newer form is left untouched. Every
+refusal or uncertainty is reported as a brief, non-modal, fixed notice that carries no
+payload, path, exception text, retry, or automatic re-send. Local New, Close, Quit, saved history,
+hosting settings, Auto, the
+editable listen default, and protected identity/pin persistence are unchanged.
+`SessionSpawn` is not replaced: it stays the native, owner-bound tool described above.
+Remote New does not add or require a network `SessionSpawn` RPC.
 
 ## Focus, display, and status
 
@@ -1098,16 +1194,31 @@ exited row that was still in flight is cancelled instead of displaying itself ov
 detached view. `n` is a roster-focus control: inside a form field it stays ordinary typed
 text.
 
-In the New session form, Enter (or the configured native submit binding) submits the
-explicit workspace path; the native Editor
-provides path completion and its current Pi editing bindings. A successful submission
-activates the created child as the active Main input owner, and that submission key's
-repeat/release is fenced so it is never replayed into the new child as native input. If a completion menu is
-open, the first Escape/cancel action dismisses that native menu and keeps the form; the
+In the Local New session form, Enter (or the configured native submit binding) submits
+the explicit workspace path; the native Editor
+provides path completion and its current Pi editing bindings. A New form whose Host line
+names a destination keeps the same native editing bindings but no requester filesystem
+completion, and its Workspace text is forwarded verbatim. The form's single Host
+line is one host-owned selection control: Shift+Tab moves the form focus to it, Tab or
+one fresh Escape returns to the Workspace editor, and Up/Left and Down/Right step through
+Local and the connected saved destinations while it holds that focus. Every other press
+there is consumed instead of editing the hidden Workspace text, and a bracketed paste is
+consumed too. A single left press on the Host value the render actually drew cycles that
+one selection; a press elsewhere on that same drawn row only focuses the control, and
+any other row, geometry, or option list refuses. Changing the Host clears the Workspace
+value, and a chosen destination that later disconnects stays named but cannot be
+submitted. The Host line uses the single spacer row the form already reserved, so the
+editable body keeps its previous row budget. A successful Local submission activates the
+created child as the active Main input owner, while a successful remote submission only
+selects the viewport of the returned owner run and row, and never makes it a local input
+owner or enables native remote input. The submission key's repeat/release is fenced in
+both cases so it is never replayed as native input. In a Local form, if a completion menu
+is open, the first Escape/cancel action dismisses that native menu and keeps the form; the
 next fresh Escape cancels only New and returns to the visible roster without hiding the
 sidebar. New and Edit cancellation are both local to their own form: the active Main
 owner, native process, native input draft, persisted name, selection, and geometry are
-preserved, a retained New **Workspace** draft is still offered by a later form, and the
+preserved, a retained Local New **Workspace** draft is still offered by a later Local
+form, a previous remote Host choice resets to Local and clears that draft, and the
 held Escape's repeat/release neither hides the roster nor reaches the child as native
 input. A form can also be abandoned while a launch/rename result is pending; that changes
 UI ownership only and does not stop or roll back the backend operation, and its late

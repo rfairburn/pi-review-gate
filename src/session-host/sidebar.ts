@@ -129,6 +129,7 @@ import {
   isKeyRelease,
   isKeyRepeat,
   Input,
+  type AutocompleteProvider,
   type KeyId,
   matchesKey,
   parseKey,
@@ -138,6 +139,7 @@ import {
 import { resolve } from "node:path";
 import {
 	createSessionHostTextField,
+	type SessionHostFieldOptions,
 	type SessionHostFieldRejection,
 	type SessionHostFieldRender,
 	type SessionHostFieldSubmission,
@@ -365,6 +367,22 @@ export type SidebarAction =
       readonly requestId: number;
       readonly workspace: string;
     }
+  /**
+   * One deliberate REMOTE New submission: exactly the destination host, the
+   * exact owner run this form's Host line named, the canonical workspace text
+   * the form held, and the frozen id of the New-form frame the writer actually
+   * wrote. It is never a local `create`, never a connect, and Main never
+   * re-derives any field of it from a later roster index, label, or selection.
+   */
+  | {
+      readonly type: "create-on-peer";
+      readonly requestId: number;
+      readonly formGeneration: number;
+      readonly renderToken: number;
+      readonly hostId: string;
+      readonly hostRunId: string;
+      readonly workspace: string;
+    }
   | {
       readonly type: "rename";
       readonly requestId: number;
@@ -458,6 +476,13 @@ export interface SidebarMousePresentation {
    * exactly one map — if either — can act.
    */
   activateFormRowAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Activates only the Host line the captured New-form render actually drew:
+   * a press on the drawn value cycles that one selection, and a press elsewhere
+   * on that same drawn row only focuses it. Any other row, geometry, or option
+   * list refuses, so an invisible or since-changed control can never act.
+   */
+  activateFormHostAt(column: number, row: number, cols: number, rows: number): boolean;
 }
 
 /**
@@ -497,7 +522,14 @@ export interface SidebarRemoteCloseRow {
 }
 
 export interface SidebarFieldFactoryOptions {
-  readonly kind: "name" | "path";
+  /**
+   * `plain` is bounded OWNER text: the ordinary workspace field bound (the same
+   * 2048 code points the rowless create contract carries) with no local
+   * filesystem completion at all. It exists so a remote workspace can be typed
+   * as canonical raw text for the OWNER's filesystem without the rename field's
+   * tighter name bound and without this machine reading any path.
+   */
+  readonly kind: "name" | "path" | "plain";
   readonly initialText: string;
   readonly onInvalidate: () => void;
   readonly onSubmit: (submission: SessionHostFieldSubmission) => void;
@@ -526,6 +558,47 @@ export interface SidebarFieldFactoryResult {
 }
 
 export type SidebarFocus = "main" | "sidebar" | "form" | "confirm";
+
+/**
+ * The no-completion provider installed on a plain owner-entry field. Text the
+ * operator types is canonical input for the OWNER's filesystem, so this side
+ * never completes, lists, resolves, or reads any path: this provider has no
+ * suggestions and never asks the native Editor for a file branch.
+ */
+const NO_LOCAL_COMPLETION_PROVIDER: AutocompleteProvider = {
+  triggerCharacters: [],
+  async getSuggestions(): Promise<null> { return null; },
+  applyCompletion(lines: string[], cursorLine: number, cursorCol: number) {
+    return { lines, cursorLine, cursorCol };
+  },
+  shouldTriggerFileCompletion(): boolean { return false; },
+};
+
+/** Options for one plain owner-entry workspace field; the kind is fixed. */
+export type PlainOwnerWorkspaceFieldOptions =
+  Omit<SessionHostFieldOptions, "kind" | "workspaceBasePath" | "maxNameBytes">
+  & { readonly workspaceBasePath: string };
+
+/**
+ * Build one plain OWNER-entry workspace field: the ordinary workspace text bound
+ * (2048 code points, exactly the bound the rowless create contract carries) with
+ * no local filesystem completion at all. It is the ordinary path field whose
+ * completion provider is replaced for the WHOLE field lifetime, so nothing on
+ * this machine is ever read, listed, resolved, or offered as a suggestion. The
+ * LOCAL New form's path field and every rename/name field stay untouched.
+ */
+export function createPlainOwnerWorkspaceField(
+  options: PlainOwnerWorkspaceFieldOptions,
+): SessionHostTextField {
+  const field = createSessionHostTextField({ ...options, kind: "path" });
+  // The field re-installs its retained provider on cancel/settle, so replacing
+  // that retained provider (not only the Editor's current one) is what keeps
+  // this machine's filesystem out of the field for its whole lifetime.
+  (field as unknown as { autocompleteProvider?: AutocompleteProvider }).autocompleteProvider =
+    NO_LOCAL_COMPLETION_PROVIDER;
+  field.editor.setAutocompleteProvider(NO_LOCAL_COMPLETION_PROVIDER);
+  return field;
+}
 
 /**
  * The complete set of generated SGR sequences this renderer may ever embed
@@ -675,6 +748,81 @@ interface DisplayedRoster {
   readonly rows: number;
   readonly focus: SidebarFocus;
   readonly selectedKey: string | undefined;
+}
+
+/**
+ * One Host choice the New form's single Host line can name. `hostId` is the
+ * local saved-destination handle (never a native instance id, endpoint, label,
+ * index, or fingerprint), and `hostRunId` is the EXACT owner run the attached
+ * DTO reported for that destination's last complete observation — or `null`
+ * when no run was observed, which is never guessed.
+ */
+interface NewFormHostOption {
+  readonly kind: "local" | "remote";
+  readonly hostId: string;
+  readonly label: string;
+  readonly hostRunId: string | null;
+  /** False for a chosen destination a later observation no longer reports. */
+  readonly connected: boolean;
+}
+
+/** Stable identity of one Host choice: Local, or one saved destination. */
+function newFormHostOptionKey(option: { readonly kind: "local" | "remote"; readonly hostId: string }): string {
+  return option.kind === "local" ? "local" : `remote:${option.hostId}`;
+}
+
+/**
+ * The exact New-form frame one render actually drew, retained so a NEW form
+ * submission can require the writer's own receipt for it instead of relying on
+ * any later render, DTO, or selection. `written` becomes true only when Main's
+ * frame writer reports THIS candidate as written.
+ *
+ * `workspace` is the field value that was drawn, so a source-only change whose
+ * visible bytes were clipped away still mints a new candidate and needs its own
+ * written boundary before anything may be sent.
+ */
+interface CreateFormCandidate {
+  readonly token: number;
+  /** Complete identity of the drawn form; an identical redraw keeps this entry. */
+  readonly identity: string;
+  readonly formGeneration: number;
+  readonly hostKind: "local" | "remote";
+  readonly hostId: string;
+  readonly hostRunId: string | null;
+  readonly workspace: string;
+  /** Pane geometry this candidate was composed at. */
+  readonly cols: number;
+  readonly rows: number;
+  written: boolean;
+}
+
+/** The frozen public description of one drawn New-form candidate. */
+export interface SidebarCreateFormPresentation {
+  readonly formGeneration: number;
+  readonly renderToken: number;
+  readonly hostKind: "local" | "remote";
+  readonly hostId: string;
+  readonly hostRunId: string | null;
+  readonly workspace: string;
+  readonly cols: number;
+  readonly rows: number;
+}
+
+/**
+ * One Host line drawn completely in a New-form pane, with the pane geometry and
+ * the exact column span its value occupied, so a pointer target is written
+ * geometry rather than an inferred row. `optionKey` binds the drawn option list
+ * and selection, so a press can never act on a list that changed behind the
+ * frame the operator saw.
+ */
+interface DisplayedFormHostRow {
+  readonly cols: number;
+  readonly rows: number;
+  readonly row: number;
+  readonly valueStart: number;
+  readonly valueEnd: number;
+  readonly optionKey: string;
+  readonly formGeneration: number;
 }
 
 /** One remote roster row exactly as the coordinator projected it (display only). */
@@ -872,6 +1020,7 @@ function mouseAuthorizationKey(
   peer: DisplayedPeerRows | undefined,
   consent: DisplayedPeerConsent | undefined,
   consentRendered: boolean,
+  formHost: DisplayedFormHostRow | undefined,
 ): string {
   return JSON.stringify({
     roster: roster === undefined ? null : [roster.cols, roster.rows,
@@ -886,6 +1035,14 @@ function mouseAuthorizationKey(
     consent: consent === undefined || !consentRendered ? null : [
       consent.token, consent.consentId, consent.choice, consent.cols, consent.rows,
       consent.approveRow, consent.denyRow,
+    ],
+    // The New form's Host line is a written pointer target like every other
+    // host-owned row: its drawn row, value span, and option list are part of
+    // the authorization identity, so a moved or re-labeled control needs its
+    // own written boundary.
+    formHost: formHost === undefined ? null : [
+      formHost.cols, formHost.rows, formHost.row, formHost.valueStart, formHost.valueEnd,
+      formHost.optionKey, formHost.formGeneration,
     ],
   });
 }
@@ -989,6 +1146,26 @@ const DEFAULT_FORM_HINTS = {
   clear: "ctrl+c",
   externalEditor: "ctrl+g",
 };
+/**
+ * Fixed, bounded notices for a remote New submission this side refuses BEFORE
+ * anything is sent. They describe only what is known locally: the form that was
+ * not the written one, a destination that is no longer connected, and an owner
+ * run that was never observed. No dialog, path, exception text, reconnect,
+ * regrant, or retry is claimed or offered.
+ */
+export const CREATE_ON_PEER_UNWRITTEN_NOTICE =
+  "That New session form is not the displayed form; nothing was sent";
+export const CREATE_ON_PEER_TARGET_CHANGED_NOTICE =
+  "That destination is disconnected or gone; nothing was sent";
+export const CREATE_ON_PEER_NO_RUN_NOTICE =
+  "That destination's owner run was not observed; nothing was sent";
+export const CREATE_ON_PEER_OTHER_RUN_NOTICE =
+  "The remote host reported a different owner run; nothing was selected";
+export const CREATE_ON_PEER_UNCERTAIN_NOTICE =
+  "UNCERTAIN: the remote create may have been handed off; outcome unknown";
+/** The one Host line of the New form names Local until the operator changes it. */
+const NEW_FORM_LOCAL_HOST_LABEL = "Local";
+const NEW_FORM_HOST_PREFIX = "Host: ";
 /** Native-session card heights: title, status, background (+2 activity). */
 const CARD_COLLAPSED_ROWS = 3;
 const CARD_EXPANDED_ROWS = 5;
@@ -1236,6 +1413,15 @@ function hostKeyEventType(data: string, key: string): KeyEventType | undefined {
   if (isKeyRelease(data) || fallback === "release") return "release";
   if (isKeyRepeat(data) || fallback === "repeat") return "repeat";
   return "press";
+}
+
+/**
+ * Standard Shift+Tab, as the pinned matcher identifies it. The canonical xterm
+ * back-tab packet is accepted as the same gesture because that legacy encoding
+ * carries no modifier bits, exactly like the ordinary F-key packets above.
+ */
+function matchesShiftTab(data: string): boolean {
+  return matchesKey(data, asHostKeyId("shift+tab")) || data === "\x1b[Z";
 }
 
 /** Fixed, generated display label for a normalized toggle key id. */
@@ -1909,6 +2095,22 @@ export class SidebarController {
   private formNotice: string | undefined;
   private formGeneration = 0;
   private formKind: "new" | "edit" | "saved" | "shortcuts" | "peer" | "peer-field" | undefined;
+  /**
+   * The New form's one Host choice. It is Local at every form opening and is
+   * never carried across forms; `label` is a bounded display copy remembered
+   * for a destination a later observation stopped listing, and it is never
+   * identity — the saved `hostId` (plus the DTO's exact owner run) is.
+   */
+  private newFormHost:
+    | { readonly kind: "local" }
+    | { readonly kind: "remote"; readonly hostId: string; readonly label: string } = { kind: "local" };
+  /** True only while the New form's Host line owns the form's keyboard focus. */
+  private formHostFocused = false;
+  /** The Host line the last complete New-form render drew, or undefined. */
+  private formHostDisplay: DisplayedFormHostRow | undefined;
+  /** The New-form frame the last complete render drew (writer receipt pending). */
+  private createFormCandidate: CreateFormCandidate | undefined;
+  private createFormTokenSequence = 1;
   private shortcutDraft: { toggle: string; returnToMain: string } = { ...DEFAULT_HOST_SHORTCUTS };
   private shortcutFieldIndex: 0 | 1 = 0;
   private pendingShortcutSave: { readonly requestId: number } | undefined;
@@ -1983,7 +2185,19 @@ export class SidebarController {
    * survives the field teardown that follows a successful completion.
    */
   private formSubmitClaim: ((data: string) => boolean) | undefined;
-  private pendingCreate: { readonly requestId: number } | undefined;
+  private pendingCreate:
+    | {
+        readonly requestId: number;
+        /** Frozen remote target facts; absent for a local `create`. */
+        readonly peer?: {
+          readonly formGeneration: number;
+          readonly renderToken: number;
+          readonly hostId: string;
+          readonly hostRunId: string;
+          readonly workspace: string;
+        };
+      }
+    | undefined;
   private pendingRename: { readonly requestId: number } | undefined;
   /** Explicit confirmation purpose: quit the host or stop one owned session. */
   private confirmPurpose:
@@ -2733,7 +2947,36 @@ export class SidebarController {
    */
   setPeerUiSnapshot(snapshot: PeerUiSnapshot): void {
     const next = copyPeerSnapshot(snapshot);
+    const previous = this.peerUiSnapshot;
+    // A chosen destination's own identity facts: connection state, exact owner
+    // run, destination key fingerprint, and this host's requester identity.
+    const chosenHostId = this.formKind === "new" && this.newFormHost.kind === "remote"
+      ? this.newFormHost.hostId
+      : undefined;
+    const before = previous?.hosts?.find((host) => host.id === chosenHostId);
+    const after = next.hosts?.find((host) => host.id === chosenHostId);
+    const targetChanged = chosenHostId !== undefined && (
+      previous?.identityFingerprint !== next.identityFingerprint
+      || before?.state !== after?.state
+      || before?.roster.hostRunId !== after?.roster.hostRunId
+      || before?.fingerprint !== after?.fingerprint
+    );
     this.peerUiSnapshot = next;
+    if (targetChanged) {
+      // Comparing present values is not enough: a run or connection that returns
+      // to its earlier value (A -> B -> A, or disconnected -> connected) must
+      // never revive a receipt that was written before the transition. Retire the
+      // drawn New-form receipt synchronously, so a queued or held write can never
+      // be submitted again on this side.
+      this.invalidateCreateFormPresentation();
+      const pending = this.pendingCreate;
+      if (pending !== undefined && pending.peer !== undefined) {
+        // Dispatch may already have happened, so only uncertainty is claimed. This
+        // releases this side's UI ownership; the owner's accepted work is never
+        // cancelled, re-sent, retried, or retargeted by it.
+        this.failCreateOnPeer(pending.requestId, CREATE_ON_PEER_UNCERTAIN_NOTICE);
+      }
+    }
     if (this.peerBindDirty && next.settings !== null
       && next.settings.bindHost === this.peerBindHostDraft.trim()
       && (next.settings.bindPort === null ? "" : String(next.settings.bindPort)) === this.peerBindPortDraft.trim()) {
@@ -2923,6 +3166,7 @@ export class SidebarController {
     const displayedSavedRows = this.displayedSavedRows;
     const displayedPeerRows = this.peerDisplay;
     const displayedPeerConsent = this.peerConsentDisplay;
+    const displayedFormHost = this.formHostDisplay;
     return Object.freeze({
       authorizationKey: mouseAuthorizationKey(
         displayedRoster,
@@ -2930,6 +3174,7 @@ export class SidebarController {
         displayedPeerRows,
         displayedPeerConsent,
         this.peerConsentRendered,
+        displayedFormHost,
       ),
       remoteClose: this.remoteCloseRowFrom(displayedRoster),
       activateRosterAt: (column: number, row: number, cols: number, rows: number): boolean =>
@@ -2938,12 +3183,15 @@ export class SidebarController {
         this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows),
       activatePeerAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows),
+      activateFormHostAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.activateFormHostAtFrom(displayedFormHost, column, row, cols, rows),
       // Only one form-slot pane is ever drawn by one render, so the captured
       // maps dispatch to exactly the surface the operator saw (or to neither).
       activateFormRowAt: (column: number, row: number, cols: number, rows: number): boolean =>
-        displayedSavedRows !== undefined
-          ? this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows)
-          : this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows),
+        this.activateFormHostAtFrom(displayedFormHost, column, row, cols, rows)
+          || (displayedSavedRows !== undefined
+            ? this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows)
+            : this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows)),
     });
   }
 
@@ -3177,6 +3425,35 @@ export class SidebarController {
     return this.activatePeerAtFrom(this.peerDisplay, column, row, cols, rows);
   }
 
+  /**
+   * Activates only the New form's Host line that the captured render drew: the
+   * drawn value span cycles that one selection, and any other column on that
+   * same drawn row only focuses the control. A different row, pane geometry, form
+   * generation, or option list refuses, so no invisible field can be clicked.
+   */
+  private activateFormHostAtFrom(
+    shown: DisplayedFormHostRow | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    if (shown === undefined) return false;
+    if (!this._visible || this._focus !== "form" || this.formKind !== "new"
+      || this.pendingCreate !== undefined) return false;
+    if (!validHitGeometry(column, row, cols, rows)) return false;
+    if (shown.cols !== cols || shown.rows !== rows || shown.row !== row) return false;
+    if (this.formGeneration !== shown.formGeneration) return false;
+    if (shown.optionKey !== this.newFormHostOptionsKey()) return false;
+    if (column >= shown.valueStart && column < shown.valueEnd) {
+      this.cycleNewFormHost(1);
+      return true;
+    }
+    this.formHostFocused = true;
+    this.onInvalidate?.();
+    return true;
+  }
+
   private activateSavedAtFrom(
     shown: DisplayedSavedRows | undefined,
     column: number,
@@ -3280,6 +3557,8 @@ export class SidebarController {
     // only a complete render of the exact frozen target can mint/keep its token.
     this.remoteCloseRendered = false;
     if (!this._visible) {
+      // A hidden pane draws no form, so nothing of the drawn New form survives it.
+      this.invalidateCreateFormPresentation();
       this.invalidateSavedDeleteConfirmationDisplay();
       this.invalidateRemoteCloseConfirmationDisplay();
       return { lines: [] };
@@ -3298,6 +3577,10 @@ export class SidebarController {
     this.peerConsentRendered = false;
     this.remoteCloseRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
+    // A standalone roster render draws no form pane. The wide layout renders the
+    // roster and then the form in one pass, so only a render that is NOT part of
+    // a form pass may retire the drawn New form.
+    if (this._focus !== "form") this.invalidateCreateFormPresentation();
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
       return this.renderRosterTooSmall(cols, rows);
     }
@@ -3325,26 +3608,36 @@ export class SidebarController {
       // earlier receipt may be restored by a later render at the old geometry.
       this.peerDisplay = undefined;
       this.invalidatePeerConsentDisplay();
+      // An unshowable New form is not on screen at all.
+      this.invalidateCreateFormPresentation();
       return this.renderTooSmall(cols, rows);
     }
     if (this.peerConsentConfirmationActive) {
       // Wide hostConfirmation slot: the security-sensitive consent dialog is
       // placed in the right-hand pane while confirm focus is unchanged. The
       // roster render stays independent for the left-hand notice/rows.
+      // A covering dialog means the New form is not the displayed pane.
+      this.invalidateCreateFormPresentation();
       return this.renderPeerConsentPane(cols, rows);
     }
     if (this.formKind === "peer") {
+      this.invalidateCreateFormPresentation();
       return this.renderPeerPane(cols, rows);
     }
     if (this.formKind === "peer-field") {
+      this.invalidateCreateFormPresentation();
       return this.renderPeerFieldPane(cols, rows);
     }
     if (this.formKind === "saved") {
+      this.invalidateCreateFormPresentation();
       return this.renderSavedPane(cols, rows);
     }
     if (this.formKind === "shortcuts") {
+      this.invalidateCreateFormPresentation();
       return this.renderHostShortcutPane(cols, rows);
     }
+    // The New/Edit pane is the only render that re-establishes (or, for an
+    // absent/covered/Edit/Local form, retires) the drawn New-form candidate.
     return this.renderFormPane(cols, rows);
   }
 
@@ -3359,6 +3652,7 @@ export class SidebarController {
     this.peerConsentRendered = false;
     this.remoteCloseRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
+    this.invalidateCreateFormPresentation();
     if (!this.savedDeleteConfirmationActive) return { lines: [] };
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) return this.renderTooSmall(cols, rows);
     return this.renderSavedDeleteConfirmPane(cols, rows);
@@ -3377,6 +3671,8 @@ export class SidebarController {
     }
     if (this._focus === "confirm") {
       this.forgetDisplayedRoster();
+      // A confirmation replaces the content pane: the New form is not drawn.
+      this.invalidateCreateFormPresentation();
       if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
         this.stopConfirmDisplayed = false;
         this.peerConfirmDisplayed = false;
@@ -3390,6 +3686,9 @@ export class SidebarController {
       return this.renderConfirmPane(cols, rows);
     }
     this.invalidateSavedDeleteConfirmationDisplay();
+    // Roster-only focus draws no content pane, so nothing of a drawn New form
+    // can be submitted from it.
+    this.invalidateCreateFormPresentation();
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
       return this.renderRosterTooSmall(cols, rows);
     }
@@ -4040,8 +4339,18 @@ export class SidebarController {
       this.handlePeerPaneInput(data);
       return;
     }
+    // Standard Shift+Tab is recognized BEFORE the bracketed-paste carry: the
+    // canonical back-tab packet ends with a lone ESC[ prefix, which that fence
+    // would otherwise park as a possible paste opener and consume. Nothing is
+    // bypassed while a real paste is in progress or a carry is outstanding.
+    if (!this.formPasteActive && this.formPasteCarry.length === 0
+      && this.formKind === "new" && matchesShiftTab(data)
+      && this.handleNewFormHostKey(data)) return;
     if (this.routeBracketedPaste(data)) {
-      this.formField?.handleInput(data);
+      // A pasted body is opaque to host actions, and it can never edit a field
+      // the operator is not typing in: while the New form's Host line owns the
+      // focus the chunk is consumed instead of reaching the hidden editor.
+      if (this.formKind !== "new" || !this.formHostFocused) this.formField?.handleInput(data);
       return;
     }
     // Fence the held Escape that canceled only a host-owned form across focus
@@ -4089,6 +4398,11 @@ export class SidebarController {
     // input. The field still receives the press first, so its completion-list
     // precedence and the reserved-toggle priority are unchanged.
     if (matchesKey(data, "escape")) this.formEscapeClaimed = true;
+    // The New form's Host line is one host-owned selection control: Shift+Tab
+    // reaches it, Tab (or one fresh Escape) returns to the ordinary workspace
+    // editor, and its cycle keys act only while IT holds the form's focus.
+    // Nothing here changes the path editor's own keys while it has the focus.
+    if (this.handleNewFormHostKey(data)) return;
     if (this.formField) {
       // Capture the exact canonical key id while the field synchronously
       // handles this packet, so a multi-binding submit fences the binding that
@@ -4497,8 +4811,260 @@ export class SidebarController {
     this.pendingRename = undefined;
     this.pendingShortcutSave = undefined;
     this.formError = undefined;
+    // Every New form opens on the LOCAL host. A previous REMOTE choice is an
+    // actual Host change, so it clears the workspace field exactly like an
+    // in-form change; an ordinary local draft is retained as before.
+    const wasRemote = this.newFormHost.kind === "remote";
+    this.newFormHost = { kind: "local" };
+    this.formHostFocused = false;
+    if (wasRemote) this.workspaceDraft = "";
     this._focus = "form";
     this.createFormField(this.workspaceDraft);
+  }
+
+  // --- New form Host line: Local by default, one host-owned selection. ---
+
+  /**
+   * The Host choices this form can name: Local first, then every destination the
+   * attached DTO reports as connected. A destination the operator already chose
+   * is kept even after it disconnects or disappears from a complete observation,
+   * so a later submit refuses truthfully instead of silently falling back to
+   * Local, connecting, or retargeting another destination.
+   */
+  private newFormHostOptions(): NewFormHostOption[] {
+    const options: NewFormHostOption[] = [{
+      kind: "local", hostId: "", label: NEW_FORM_LOCAL_HOST_LABEL, hostRunId: null, connected: true,
+    }];
+    const chosen = this.newFormHost;
+    const chosenHostId = chosen.kind === "remote" ? chosen.hostId : undefined;
+    const chosenLabel = chosen.kind === "remote" ? chosen.label : "";
+    let chosenListed = false;
+    for (const host of this.peerUiSnapshot?.hosts ?? []) {
+      const chosenHere = chosenHostId !== undefined && host.id === chosenHostId;
+      if (!chosenHere && host.state !== "connected") continue;
+      if (chosenHere) chosenListed = true;
+      options.push({
+        kind: "remote",
+        hostId: host.id,
+        label: sanitizeBounded(host.label, PEER_LABEL_MAX_CODEPOINTS),
+        hostRunId: typeof host.roster.hostRunId === "string" && host.roster.hostRunId.length > 0
+          ? host.roster.hostRunId
+          : null,
+        connected: host.state === "connected",
+      });
+    }
+    if (chosenHostId !== undefined && !chosenListed) {
+      // The chosen destination is no longer reported at all. Its saved handle and
+      // the label the operator selected stay on screen; nothing is substituted.
+      options.push({
+        kind: "remote",
+        hostId: chosenHostId,
+        label: chosenLabel,
+        hostRunId: null,
+        connected: false,
+      });
+    }
+    return options;
+  }
+
+  /** Stable identity of the Host line's current choice. */
+  private newFormHostKey(): string {
+    return newFormHostOptionKey(this.newFormHost.kind === "local"
+      ? { kind: "local", hostId: "" }
+      : { kind: "remote", hostId: this.newFormHost.hostId });
+  }
+
+  /** The drawn identity of the whole option list plus its current choice. */
+  private newFormHostOptionsKey(): string {
+    return JSON.stringify([
+      this.newFormHostOptions().map((option) => [
+        newFormHostOptionKey(option), option.label, option.hostRunId, option.connected,
+      ]),
+      this.newFormHostKey(),
+    ]);
+  }
+
+  /** The current choice as the fresh option list describes it, if it is listed. */
+  private currentNewFormHostOption(): NewFormHostOption | undefined {
+    const key = this.newFormHostKey();
+    return this.newFormHostOptions().find((option) => newFormHostOptionKey(option) === key);
+  }
+
+  /** The bounded display label of the current choice, exactly as it will be drawn. */
+  private currentNewFormHostLabel(): string {
+    const option = this.currentNewFormHostOption();
+    if (option !== undefined) return option.label;
+    return this.newFormHost.kind === "remote" ? this.newFormHost.label : NEW_FORM_LOCAL_HOST_LABEL;
+  }
+
+  /** True while the form's target is a remote destination (plain owner entry). */
+  private newFormHostIsRemote(): boolean {
+    return this.newFormHost.kind === "remote";
+  }
+
+  /**
+   * One ACTUAL Host choice change. Reselecting the very same destination is a
+   * no-op that preserves the draft, its caret, and its completer state; a
+   * different destination atomically clears the workspace value, the stored
+   * draft, the caret, and any completer state by reopening the field for the
+   * new field kind.
+   */
+  private selectNewFormHost(option: NewFormHostOption): void {
+    if (this.formKind !== "new" || this.pendingCreate !== undefined) return;
+    if (newFormHostOptionKey(option) === this.newFormHostKey()) return;
+    this.newFormHost = option.kind === "local"
+      ? { kind: "local" }
+      : { kind: "remote", hostId: option.hostId, label: option.label };
+    this.workspaceDraft = "";
+    this.formError = undefined;
+    this.createFormField("");
+  }
+
+  /** Cycle the one Host selection; never a submit, connect, or retarget. */
+  private cycleNewFormHost(direction: 1 | -1): void {
+    if (this.formKind !== "new" || this.pendingCreate !== undefined) return;
+    const options = this.newFormHostOptions();
+    if (options.length < 2) return;
+    const key = this.newFormHostKey();
+    const index = options.findIndex((option) => newFormHostOptionKey(option) === key);
+    const next = index < 0
+      ? options[0]
+      : options[((index + direction) % options.length + options.length) % options.length];
+    if (next !== undefined) this.selectNewFormHost(next);
+  }
+
+  /**
+   * One fresh key while the Host line owns the form's focus. Only that control's
+   * own dropdown/cycle gestures and Tab act; every other press is consumed so it
+   * can never edit the workspace underneath the control the operator is using,
+   * and the ordinary path editor's keys are untouched while IT has the focus.
+   */
+  private handleNewFormHostKey(data: string): boolean {
+    if (this.formKind !== "new") return false;
+    if (!this.formHostFocused) {
+      if (!matchesShiftTab(data)) return false;
+      if (!isKeyRelease(data) && !isKeyRepeat(data)) {
+        this.formHostFocused = true;
+        this.onInvalidate?.();
+      }
+      return true;
+    }
+    if (matchesKey(data, "tab") || matchesShiftTab(data)) {
+      if (!isKeyRelease(data) && !isKeyRepeat(data)) {
+        this.formHostFocused = false;
+        this.onInvalidate?.();
+      }
+      return true;
+    }
+    if (isKeyRelease(data) || isKeyRepeat(data)) return true;
+    if (matchesKey(data, "escape")) {
+      // Leaving the control is this form's own back gesture: no cancel, no
+      // submit, no data loss, and the still-held Escape keeps its fence.
+      this.formHostFocused = false;
+      this.onInvalidate?.();
+      return true;
+    }
+    if (matchesKey(data, "up") || matchesKey(data, "left")) this.cycleNewFormHost(-1);
+    else if (matchesKey(data, "down") || matchesKey(data, "right")) this.cycleNewFormHost(1);
+    return true;
+  }
+
+  /**
+   * The New-form frame this renderer last drew completely, with the exact host
+   * identity, owner run, and drawn workspace it held. Main captures this beside
+   * the composed frame and keeps it only while the writer reports THAT frame
+   * written, so a queued, held, clipped, or too-small frame authorizes nothing.
+   */
+  captureCreateFormPresentation(): SidebarCreateFormPresentation | undefined {
+    const candidate = this.createFormCandidate;
+    if (candidate === undefined) return undefined;
+    return Object.freeze({
+      formGeneration: candidate.formGeneration,
+      renderToken: candidate.token,
+      hostKind: candidate.hostKind,
+      hostId: candidate.hostId,
+      hostRunId: candidate.hostRunId,
+      workspace: candidate.workspace,
+      cols: candidate.cols,
+      rows: candidate.rows,
+    });
+  }
+
+  /** True while this token is still the renderer's current complete New form. */
+  isCreateFormRenderCurrent(renderToken: number): boolean {
+    return this.createFormCandidate?.token === renderToken;
+  }
+
+  /** Main's actual-writer receipt for the exact New-form candidate it submitted. */
+  settleCreateFormRender(renderToken: number): boolean {
+    const candidate = this.createFormCandidate;
+    if (candidate === undefined || candidate.token !== renderToken) return false;
+    candidate.written = true;
+    return true;
+  }
+
+  /** Forget the drawn New form (a covering pane, a resize, or a dismissal). */
+  invalidateCreateFormPresentation(): void {
+    this.createFormCandidate = undefined;
+    this.formHostDisplay = undefined;
+  }
+
+  /**
+   * Capture one completely drawn New form. The candidate is kept across
+   * identical redraws so an ordinary repaint never revokes the receipt it
+   * already earned; any change of generation, host identity, owner run, drawn
+   * workspace, or pane geometry mints a new token that starts unwritten.
+   */
+  private captureCreateFormCandidate(workspace: string, cols: number, rows: number): void {
+    const hostKind = this.newFormHost.kind;
+    const hostId = this.newFormHost.kind === "remote" ? this.newFormHost.hostId : "";
+    const option = this.currentNewFormHostOption();
+    const hostRunId = option !== undefined && option.kind === "remote" ? option.hostRunId : null;
+    const identity = JSON.stringify([
+      this.formGeneration, hostKind, hostId, hostRunId, workspace, cols, rows,
+    ]);
+    const previous = this.createFormCandidate;
+    if (previous !== undefined && previous.identity === identity) return;
+    this.createFormCandidate = {
+      token: this.createFormTokenSequence++,
+      identity,
+      formGeneration: this.formGeneration,
+      hostKind,
+      hostId,
+      hostRunId,
+      workspace,
+      cols,
+      rows,
+      written: false,
+    };
+  }
+
+  /**
+   * The caller's last-instant proof for one frozen remote New submission: this
+   * EXACT request still owns this form, and the host choice, its exact owner run,
+   * the canonical workspace, and the form generation are still the submitted
+   * ones. Nothing is re-derived from a later roster index, label, or selection.
+   */
+  createOnPeerStillCurrent(submission: {
+    readonly requestId: number;
+    readonly formGeneration: number;
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly workspace: string;
+  }): boolean {
+    if (!this._visible || this._focus !== "form") return false;
+    if (this.formKind !== "new") return false;
+    const pending = this.pendingCreate;
+    if (pending === undefined || pending.requestId !== submission.requestId) return false;
+    if (pending.peer === undefined) return false;
+    if (this.formGeneration !== submission.formGeneration) return false;
+    if (this.newFormHost.kind !== "remote" || this.newFormHost.hostId !== submission.hostId) return false;
+    const option = this.currentNewFormHostOption();
+    if (option === undefined || option.kind !== "remote" || !option.connected) return false;
+    if (option.hostRunId !== submission.hostRunId) return false;
+    if (this.workspaceDraft !== submission.workspace) return false;
+    const field = this.formField;
+    return field !== undefined && field.getValue() === submission.workspace;
   }
 
   private openHostShortcutForm(): void {
@@ -4584,10 +5150,19 @@ export class SidebarController {
     // Network listen/destination fields are plain data, never filesystem
     // paths: they use the bounded single-line name field, not the path
     // completer, so nothing is resolved or rewritten.
-    const kind = this.formKind === "edit" || this.formKind === "shortcuts"
-      || this.formKind === "peer-field"
+    //
+    // A New form whose Host line names a REMOTE destination is plain OWNER text:
+    // the workspace belongs to that owner's filesystem (a POSIX or Windows path,
+    // relative or absolute, with spaces or Unicode), so it keeps the workspace
+    // text bound and installs NO local completer at all — this machine neither
+    // reads nor lists anything on its behalf. Only the LOCAL New form keeps the
+    // ordinary path editor and its startup-cwd completion base.
+    const kind: SidebarFieldFactoryOptions["kind"] = this.formKind === "edit"
+      || this.formKind === "shortcuts" || this.formKind === "peer-field"
       ? "name"
-      : "path";
+      : this.formKind === "new" && this.newFormHostIsRemote()
+        ? "plain"
+        : "path";
     const generation = this.formGeneration;
     const fieldOptions: SidebarFieldFactoryOptions = {
       kind,
@@ -4616,17 +5191,23 @@ export class SidebarController {
       const created: SidebarFieldFactoryResult = this.createTextField
         ? this.createTextField(fieldOptions)
         : {
-          field: kind === "path"
-            ? createSessionHostTextField({
-              kind: "path", initialText, workspaceBasePath: this.workspaceBasePath,
+          field: kind === "plain"
+            ? createPlainOwnerWorkspaceField({
+              initialText, workspaceBasePath: this.workspaceBasePath,
               onInvalidate: fieldOptions.onInvalidate, onSubmit: fieldOptions.onSubmit,
               onCancel: fieldOptions.onCancel, onReject: fieldOptions.onReject,
             })
-            : createSessionHostTextField({
-              kind: "name", initialText, onInvalidate: fieldOptions.onInvalidate,
-              onSubmit: fieldOptions.onSubmit, onCancel: fieldOptions.onCancel,
-              onReject: fieldOptions.onReject,
-            }),
+            : kind === "path"
+              ? createSessionHostTextField({
+                kind: "path", initialText, workspaceBasePath: this.workspaceBasePath,
+                onInvalidate: fieldOptions.onInvalidate, onSubmit: fieldOptions.onSubmit,
+                onCancel: fieldOptions.onCancel, onReject: fieldOptions.onReject,
+              })
+              : createSessionHostTextField({
+                kind: "name", initialText, onInvalidate: fieldOptions.onInvalidate,
+                onSubmit: fieldOptions.onSubmit, onCancel: fieldOptions.onCancel,
+                onReject: fieldOptions.onReject,
+              }),
         };
       this.formField = created.field;
       this.formMatchesCancel = created.matchesCancel ?? ((data) => matchesKey(data, "escape"));
@@ -4656,6 +5237,10 @@ export class SidebarController {
 
   private submitCreate(submission: SessionHostFieldSubmission): void {
     if (this.pendingCreate || this.formKind !== "new") return;
+    if (this.newFormHostIsRemote()) {
+      this.submitCreateOnPeer(submission);
+      return;
+    }
     const workspace = submission.value;
     if (workspace.length === 0) {
       this.formError = "Workspace is required";
@@ -4682,6 +5267,125 @@ export class SidebarController {
       ? undefined
       : (data: string) => matchesKey(data, submitKey);
     this.emit({ type: "create", requestId, workspace });
+  }
+
+  /**
+   * One deliberate REMOTE New submission. The workspace text is the operator's
+   * canonical value for the OWNER's filesystem: it is forwarded verbatim (only
+   * the form's own single-line/limit safety rule applies), never resolved,
+   * completed, guessed, or validated locally. Nothing is emitted unless the
+   * form that is actually on screen is the one this renderer drew completely and
+   * the writer reported written, and unless the chosen destination is still
+   * connected with the EXACT owner run that was drawn.
+   */
+  private submitCreateOnPeer(submission: SessionHostFieldSubmission): void {
+    const workspace = submission.value;
+    if (workspace.length === 0) {
+      this.formError = "Workspace is required";
+      this.workspaceDraft = "";
+      this.createFormField("");
+      return;
+    }
+    if (sanitizeCellText(workspace) !== workspace || countCodePoints(workspace) > PATH_FIELD_MAX_CODEPOINTS) {
+      this.formError = `Path exceeds ${PATH_FIELD_MAX_CODEPOINTS} characters or contains unsafe text`;
+      this.workspaceDraft = this.formField?.getValue() ?? "";
+      this.createFormField(this.workspaceDraft);
+      return;
+    }
+    this.workspaceDraft = workspace;
+    const target = this.currentNewFormHostOption();
+    const chosen = this.newFormHost;
+    if (chosen.kind !== "remote" || target === undefined || target.kind !== "remote"
+      || !target.connected) {
+      // A destination that disconnected, retired, or vanished is refused here
+      // instead of silently becoming Local, connecting, or another host.
+      this.formError = CREATE_ON_PEER_TARGET_CHANGED_NOTICE;
+      this.createFormField(workspace);
+      return;
+    }
+    if (target.hostRunId === null || target.hostRunId.length === 0) {
+      // No exact owner run is observed, so nothing can be addressed. This is
+      // never guessed from a label, endpoint, native tuple, or an older run.
+      this.formError = CREATE_ON_PEER_NO_RUN_NOTICE;
+      this.createFormField(workspace);
+      return;
+    }
+    const drawn = this.createFormCandidate;
+    if (drawn === undefined || !drawn.written
+      || drawn.formGeneration !== this.formGeneration
+      || drawn.hostKind !== "remote"
+      || drawn.hostId !== target.hostId
+      || drawn.hostRunId !== target.hostRunId
+      || drawn.workspace !== workspace) {
+      // The exact displayed form is the only thing that may submit: a too-small,
+      // covered, queued, held, or since-changed frame sends nothing.
+      this.formError = CREATE_ON_PEER_UNWRITTEN_NOTICE;
+      this.createFormField(workspace);
+      return;
+    }
+    const requestId = this.nextRequestId++;
+    this.pendingCreate = {
+      requestId,
+      peer: {
+        formGeneration: drawn.formGeneration,
+        renderToken: drawn.token,
+        hostId: target.hostId,
+        hostRunId: target.hostRunId,
+        workspace,
+      },
+    };
+    this.formError = undefined;
+    const submitKey = this.formInputSubmitKey;
+    this.formSubmitClaim = submitKey === undefined
+      ? undefined
+      : (data: string) => matchesKey(data, submitKey);
+    this.emit({
+      type: "create-on-peer",
+      requestId,
+      formGeneration: drawn.formGeneration,
+      renderToken: drawn.token,
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      workspace,
+    });
+  }
+
+  /**
+   * Resolves one remote New submission that the OWNER reported started. Nothing
+   * local is created or accepted: no row is added to this roster and no local
+   * manager is touched. The returned owner run must be the exact run that was
+   * submitted, and the display selection is emitted only while this exact
+   * request still owns the form — a late reply never steals a newer form, a
+   * newer selection, or the panes the operator moved on to.
+   */
+  completeCreateOnPeer(requestId: number, facts: { readonly hostRunId: string; readonly rowId: string }): void {
+    const pending = this.pendingCreate;
+    if (pending === undefined || pending.requestId !== requestId || pending.peer === undefined) return;
+    const target = pending.peer;
+    if (facts.hostRunId !== target.hostRunId) {
+      this.failCreateOnPeer(requestId, CREATE_ON_PEER_OTHER_RUN_NOTICE);
+      return;
+    }
+    this.pendingCreate = undefined;
+    if (this.formKind === "new" && this.formField) this.workspaceDraft = this.formField.getValue();
+    this.disposeFormField();
+    this.formKind = undefined;
+    this.formError = undefined;
+    this.formHostFocused = false;
+    this.invalidateCreateFormPresentation();
+    if (this._focus !== "form") return; // the request no longer owns the pane
+    this._focus = "main";
+    this.emit({
+      type: "select-remote",
+      hostId: target.hostId,
+      hostRunId: facts.hostRunId,
+      rowId: facts.rowId,
+    });
+  }
+
+  /** Fails one remote New submission only while that exact request still owns it. */
+  failCreateOnPeer(requestId: number, message: string): void {
+    this.failCreate(requestId, message);
   }
 
   private submitRename(submission: SessionHostFieldSubmission): void {
@@ -4736,6 +5440,8 @@ export class SidebarController {
     this.pendingRename = undefined;
     this.pendingShortcutSave = undefined;
     this.peerFieldTarget = undefined;
+    this.formHostFocused = false;
+    this.invalidateCreateFormPresentation();
     this.disposeFormField();
     this.formKind = undefined;
     this.editTarget = undefined;
@@ -6553,6 +7259,9 @@ export class SidebarController {
     rows: number,
   ): { lines: string[]; cursor?: { column: number; row: number } } {
     const editing = this.formKind === "edit";
+    // Only the New form carries the single Host line; Edit keeps its exact
+    // existing layout and budget.
+    const newForm = this.formKind === "new";
     const header = editing ? " Edit native session name " : " New session ";
     const hints = editing
       ? [`${this.formHints.submit} save`, `${this.formHints.cancel} cancel`, `${this.formHints.clear} clear`, `${this.formHints.externalEditor} external editor`]
@@ -6564,7 +7273,13 @@ export class SidebarController {
     if (footerLines === undefined || noticeLines === undefined || visibleWidth(header) > cols || !this.formField) {
       return this.renderTooSmall(cols, rows);
     }
-    const fixedRows = 1 + (editing ? 2 : 0) + 1 + 1 + noticeLines.length + footerLines.length;
+    // The New form's one Host line takes the single spacer row the form has
+    // always reserved below the editor, so the editable body keeps exactly its
+    // previous row budget at every geometry; Edit is untouched.
+    const hostRows = newForm ? 1 : 0;
+    const fixedRows = editing
+      ? 1 + 2 + 1 + 1 + noticeLines.length + footerLines.length
+      : 1 + hostRows + 1 + noticeLines.length + footerLines.length;
     const fieldRows = rows - fixedRows;
     if (fieldRows < 1) return this.renderTooSmall(cols, rows);
 
@@ -6583,6 +7298,21 @@ export class SidebarController {
     if (labeledRows === undefined) return this.renderTooSmall(cols, rows);
 
     const lines = [wrapRow(header, cols, "\x1b[1m")];
+    let hostRow: number | undefined;
+    let hostValueStart = 0;
+    let hostValueEnd = 0;
+    if (newForm) {
+      // One fixed Host line, drawn with the pane's ordinary marker/label style
+      // and clipped exactly like every other bounded host-owned row.
+      const hostPrefix = this.formHostFocused ? `> ${NEW_FORM_HOST_PREFIX}` : `  ${NEW_FORM_HOST_PREFIX}`;
+      const hostPrefixWidth = Math.min(visibleWidth(hostPrefix), cols - 1);
+      const hostAvailable = Math.max(1, cols - hostPrefixWidth);
+      const hostValue = truncateToWidth(`[ ${this.currentNewFormHostLabel()} ]`, hostAvailable, "...", true);
+      hostRow = lines.length;
+      hostValueStart = hostPrefixWidth;
+      hostValueEnd = hostPrefixWidth + Math.max(1, visibleWidth(hostValue));
+      lines.push(wrapRow(`${hostPrefix}${hostValue}`, cols));
+    }
     if (editing) {
       lines.push(wrapRow(" Current name (display only; type a complete replacement): ", cols));
       const currentName = sanitizeBounded(this.editTarget?.currentName ?? "", 256);
@@ -6603,12 +7333,39 @@ export class SidebarController {
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
     for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols));
 
+    // This complete pane IS the drawn New form: retain the Host line's written
+    // geometry so only that drawn control can be clicked.
+    this.formHostDisplay = newForm && hostRow !== undefined
+      ? Object.freeze({
+        cols,
+        rows,
+        row: hostRow,
+        valueStart: hostValueStart,
+        valueEnd: hostValueEnd,
+        optionKey: this.newFormHostOptionsKey(),
+        formGeneration: this.formGeneration,
+      })
+      : undefined;
+    // The written-submit candidate exists only for a REMOTE destination: a
+    // Local submission keeps its exact previous path and needs no receipt, and
+    // it therefore adds no extra writer boundary either.
+    if (newForm && this.newFormHostIsRemote()) {
+      this.captureCreateFormCandidate(this.formField.getValue(), cols, rows);
+    } else {
+      this.createFormCandidate = undefined;
+    }
+
+    const fieldCursor = {
+      column: Math.min(prefixWidth + fieldFrame.cursor.column, cols - 1),
+      row: fieldTopRow + fieldFrame.cursor.row,
+    };
     return {
       lines,
-      cursor: {
-        column: Math.min(prefixWidth + fieldFrame.cursor.column, cols - 1),
-        row: fieldTopRow + fieldFrame.cursor.row,
-      },
+      // While the Host line owns the form's focus the hardware cursor belongs to
+      // that drawn control; the workspace body keeps its label and geometry.
+      cursor: newForm && this.formHostFocused && hostRow !== undefined
+        ? { column: Math.min(hostValueEnd, cols - 1), row: hostRow }
+        : fieldCursor,
     };
   }
 

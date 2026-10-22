@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, watch, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { createStatusBroker } from "../src/session-host/broker";
 import { hostOwnershipPath } from "../src/session-host/roster-store";
@@ -182,6 +183,63 @@ test("diagnostic formatter withholds private sequences and every substantial tok
   }
 });
 
+const CLIPBOARD_COMMANDS = ["pbcopy", "xclip", "xsel", "wl-copy", "termux-clipboard-set"] as const;
+type Witness = Record<string, unknown>;
+interface CopyFixtureIdentity {
+  readonly nonce: string;
+  readonly moduleUrl: string;
+  readonly bin: string;
+  /** Main's outer PTY owns one native child; ordinary legs own the producer directly. */
+  readonly producer: { readonly pid: number } | { readonly parentPid: number };
+}
+function witness(value: unknown): Witness | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Witness : undefined;
+}
+
+/** Positive public startup AND observed isolation, never an editor-border heuristic. */
+function copyFixtureReady(identity: CopyFixtureIdentity, startupValue: unknown, isolationValue: unknown): boolean {
+  const startup = witness(startupValue);
+  const isolation = witness(isolationValue);
+  if (!startup || !isolation || startup.version !== 1 || isolation.version !== 1) return false;
+  if (startup.nonce !== identity.nonce || isolation.nonce !== identity.nonce) return false;
+  if (!Number.isSafeInteger(startup.pid) || (startup.pid as number) <= 0 || isolation.pid !== startup.pid) return false;
+  if ("pid" in identity.producer ? startup.pid !== identity.producer.pid : startup.parentPid !== identity.producer.parentPid) return false;
+  if (startup.event !== "session_start" || startup.moduleUrl !== identity.moduleUrl
+    || startup.probe !== "getNativeClipboard" || startup.exportType !== "function"
+    || startup.backendUnavailable !== true || startup.failure !== undefined) return false;
+  if (isolation.armed !== true || isolation.dlopenHook !== true) return false;
+  const resolved = witness(isolation.resolved);
+  if (!resolved || !CLIPBOARD_COMMANDS.every((command) => resolved[command] === join(identity.bin, command))) return false;
+  return Array.isArray(isolation.blocked) && isolation.blocked.some((name: unknown) => typeof name === "string"
+    && /^(?:darwin|win32|linux)-platform(?:-x11)?\.node$/.test(name));
+}
+
+test("clipboard fixture readiness requires this producer's public startup and observed pre-copy isolation", () => {
+  const identity: CopyFixtureIdentity = { nonce: "fresh-launch", moduleUrl: "file:///owned/public-tui/index.js", bin: "/owned/bin", producer: { pid: 101 } };
+  const startup = { version: 1, nonce: identity.nonce, pid: 101, parentPid: 99, event: "session_start",
+    moduleUrl: identity.moduleUrl, probe: "getNativeClipboard", exportType: "function", backendUnavailable: true };
+  const isolation = { version: 1, nonce: identity.nonce, pid: 101, armed: true, dlopenHook: true,
+    resolved: Object.fromEntries(CLIPBOARD_COMMANDS.map((command) => [command, join(identity.bin, command)])),
+    blocked: ["darwin-platform.node"] };
+  assert.equal(copyFixtureReady(identity, startup, isolation), true);
+  assert.equal(copyFixtureReady({ ...identity, producer: { parentPid: 99 } }, startup, isolation), true,
+    "the outer Main's exact native child has its own PID and the owned outer parent");
+  assert.equal(copyFixtureReady(identity, undefined, isolation), false,
+    "an editor border and an installed hook are not public startup evidence");
+  assert.equal(copyFixtureReady(identity, startup, undefined), false, "public startup alone grants no copy safety");
+  for (const changed of [{ nonce: "older-launch" }, { pid: 102 }, { event: "loaded" }, { moduleUrl: "file:///other/index.js" },
+    { exportType: "missing" }, { backendUnavailable: false }, { failure: "probe failed" }]) {
+    assert.equal(copyFixtureReady(identity, { ...startup, ...changed }, isolation), false, "foreign or failed public startup is refused");
+  }
+  assert.equal(copyFixtureReady({ ...identity, producer: { parentPid: 98 } }, startup, isolation), false);
+  for (const changed of [{ nonce: "older-launch" }, { pid: 102 }, { armed: false }, { dlopenHook: false },
+    { blocked: [] }, { blocked: ["unrelated.node"] }, { resolved: {} },
+    { resolved: { ...isolation.resolved, pbcopy: "/usr/bin/pbcopy" } }]) {
+    assert.equal(copyFixtureReady(identity, startup, { ...isolation, ...changed }), false,
+      "an unobserved native block or non-owned helper path refuses before any copy");
+  }
+});
+
 /**
  * Real bundled CLI/PTY proof. No physical clipboard is read or written.
  *
@@ -202,6 +260,19 @@ test("real bundled native and hosted clipboard producers preserve selected paylo
   const cli = realpathSync(join(packageRoot, manifest.bin.pi));
   assert.match(manifest.bin.pi, /dist\/bundle\/cli\.js$/, "exercise the actual package-declared bundled executable");
   const requireHere = createRequire(join(process.cwd(), "package.json"));
+  // The same public pinned entry used by the network-native acceptance fixture;
+  // no private native subpath or substituted backend is a readiness witness.
+  const tuiEntry = realpathSync(requireHere.resolve("pi-session-host-tui"));
+  let tuiRoot = dirname(tuiEntry);
+  while (!existsSync(join(tuiRoot, "package.json"))) {
+    const parent = dirname(tuiRoot);
+    assert.notEqual(parent, tuiRoot, "the public TUI entry has its own package manifest");
+    tuiRoot = parent;
+  }
+  const tuiManifest = JSON.parse(readFileSync(join(tuiRoot, "package.json"), "utf8")) as { name: string; version: string };
+  assert.equal(tuiManifest.name, "@earendil-works/pi-tui");
+  assert.equal(tuiManifest.version, "1.3.0");
+  const nativeTuiUrl = pathToFileURL(tuiEntry).href;
   const pty = requireHere("@lydell/node-pty") as { spawn(file: string, args: string[], options: Record<string, unknown>): InstancePty };
   const root = realpathSync(mkdtempSync("/tmp/prg-copy-"));
   const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
@@ -214,14 +285,56 @@ test("real bundled native and hosted clipboard producers preserve selected paylo
   const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
   // These are the ONLY clipboard commands on the isolated PATH. Native modules
   // are blocked below, so no success path can reach the user's OS clipboard.
-  for (const name of ["pbcopy", "xclip", "xsel", "wl-copy", "termux-clipboard-set"]) {
+  for (const name of CLIPBOARD_COMMANDS) {
     writeFileSync(join(root, "bin", name), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(recorder)}\n`, { mode: 0o700, flag: "wx" });
   }
+  const isolationStem = join(root, "clipboard-isolation");
+  const startupStem = join(root, "public-startup");
   const preload = join(root, "block-native-clipboard.cjs");
-  writeFileSync(preload, `const dlopen=process.dlopen;process.dlopen=function(mod,file,...args){if(/(?:darwin|win32|linux)-platform(?:-x11)?\\.node$/.test(file))throw Error('owned fixture blocks OS clipboard');return dlopen.call(this,mod,file,...args)};`, { mode: 0o600, flag: "wx" });
+  writeFileSync(preload, `const fs=require('node:fs'),path=require('node:path');
+const commands=${JSON.stringify(CLIPBOARD_COMMANDS)};
+const record={version:1,nonce:process.env.PRG_COPY_NONCE,pid:process.pid,armed:true,dlopenHook:false,resolved:{},blocked:[]};
+function publish(){
+ // Re-prove the child's CURRENT helper PATH when the public probe actually
+ // reaches the interception, not only when this preload was installed. Once
+ // any check fails, this launch stays disarmed; publication never repairs it.
+ for(const name of commands){
+  let found=null;
+  for(const dir of (process.env.PATH||'').split(path.delimiter)){
+   if(!dir)continue;const file=path.join(dir,name);
+   try{if(!fs.lstatSync(file).isFile())continue;fs.accessSync(file,fs.constants.X_OK);found=file;break;}catch{}
+  }
+  record.resolved[name]=found;
+  if(found!==path.join(process.env.PRG_COPY_BIN||'',name))record.armed=false;
+ }
+ try{const target=process.env.PRG_COPY_ISOLATION+'.'+process.pid+'.json';const temp=target+'.staging';fs.writeFileSync(temp,JSON.stringify(record),{mode:0o600});fs.renameSync(temp,target);}catch{/* missing receipt refuses every copy */}
+}
+const dlopen=process.dlopen;
+process.dlopen=function(mod,file,...args){
+ if(/(?:darwin|win32|linux)-platform(?:-x11)?\\.node$/.test(String(file))){
+  if(record.blocked.length<8)record.blocked.push(path.basename(String(file)));publish();
+  throw Error('owned fixture blocks OS clipboard');
+ }
+ return dlopen.call(this,mod,file,...args);
+};
+record.dlopenHook=process.dlopen!==dlopen;publish();`, { mode: 0o600, flag: "wx" });
   const fixture = join(root, "clipboard-proof.cjs");
   const decoy = Buffer.from("UNSOLICITED-466").toString("base64");
-  writeFileSync(fixture, `module.exports=pi=>{
+  writeFileSync(fixture, `const fs=require('node:fs');
+module.exports=pi=>{
+// In pinned Pi 1.3.0 the real submit handler is installed before the public
+// session_start event. An editor border can be drawn earlier with startup-only
+// submission feedback. Probe only the documented LOAD-only backend accessor:
+// never getText/getImage/getFilePaths/setText or any physical clipboard action.
+pi.on('session_start',async()=>{
+ const record={version:1,nonce:process.env.PRG_COPY_NONCE,pid:process.pid,parentPid:process.ppid,event:'session_start',moduleUrl:${JSON.stringify(nativeTuiUrl)},probe:'getNativeClipboard',exportType:'missing',backendUnavailable:false};
+ try{
+  const api=await import(record.moduleUrl);record.exportType=typeof api.getNativeClipboard;
+  if(record.exportType!=='function')throw Error('public clipboard accessor missing');
+  record.backendUnavailable=api.getNativeClipboard()==null;
+ }catch(error){record.failure=String(error&&error.message||error);}
+ try{const target=process.env.PRG_COPY_STARTUP+'.'+record.nonce+'.json';const temp=target+'.staging';fs.writeFileSync(temp,JSON.stringify(record),{mode:0o600});fs.renameSync(temp,target);}catch{/* a missing receipt fails closed */}
+});
 pi.registerCommand('input-proof',{description:'Verify owned input bytes',handler:async(input)=>pi.sendMessage({customType:'input-proof',content:'INPUT466:'+require('node:crypto').createHash('sha256').update(input,'utf8').digest('hex'),display:true})});
 pi.registerCommand('copy-proof',{description:'Synthetic visible text',handler:async()=>pi.sendMessage({customType:'copy-proof-'+(globalThis[Symbol.for('prg.copy-proof.counter')]=(globalThis[Symbol.for('prg.copy-proof.counter')]||0)+1),content:'CLIP466-A αβ café\\nCLIP466-B 雪 end',display:true})});
 pi.registerCommand('copy-decoy',{description:'Synthetic raw-output refusal',handler:async()=>process.stdout.write('\\x1b]52;c;${decoy}\\x07')});
@@ -235,17 +348,43 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     PI_OFFLINE: "1", PI_TELEMETRY: "0", LANG: "C.UTF-8", LC_ALL: "C.UTF-8",
     TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty", DISPLAY: ":synthetic-recording-only",
     SSH_CONNECTION: "synthetic-client 1234 synthetic-host 22", NODE_OPTIONS: `--require=${preload}`, PRG_COPY_LOG: helperLog,
+    PRG_COPY_ISOLATION: isolationStem, PRG_COPY_STARTUP: startupStem, PRG_COPY_BIN: join(root, "bin"),
   };
   const args = ["--offline", "--no-context-files", "--no-skills", "--no-themes", "--no-extensions", "--extension", fixture, "--tui-mode", "fullscreen"];
-  const owned: Array<{ handle: InstancePty; exited: boolean; raw: string; exitCode?: number; bootstrap?: SessionHostBootstrap }> = [];
-  const spawn = (file: string, argv: string[], env: NodeJS.ProcessEnv, cwd: string, cols = 80, rows = 30): (typeof owned)[number] => {
-    const handle = pty.spawn(file, argv, { name: "xterm-ghostty", cols, rows, cwd, env, encoding: "utf8" });
-    const item: (typeof owned)[number] = { handle, exited: false, raw: "", ...(env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP
+  const owned: Array<{ handle: InstancePty; nonce: string; ownsNativeChild: boolean; exited: boolean; raw: string; exitCode?: number; bootstrap?: SessionHostBootstrap }> = [];
+  let proofWatchError: Error | undefined;
+  let proofWatcher: ReturnType<typeof watch> | undefined;
+  const spawn = (file: string, argv: string[], env: NodeJS.ProcessEnv, cwd: string, cols = 80, rows = 30, ownsNativeChild = false): (typeof owned)[number] => {
+    const nonce = randomUUID(); // fresh even if a later owned launch reuses an OS PID
+    const handle = pty.spawn(file, argv, { name: "xterm-ghostty", cols, rows, cwd, env: { ...env, PRG_COPY_NONCE: nonce }, encoding: "utf8" });
+    const item: (typeof owned)[number] = { handle, nonce, ownsNativeChild, exited: false, raw: "", ...(env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP
       ? { bootstrap: JSON.parse(env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP) as SessionHostBootstrap } : {}) };
     owned.push(item); // ownership before callbacks/awaits
     handle.onExit((event) => { item.exited = true; item.exitCode = event.exitCode; signal.notify(); });
     handle.onData((data) => { item.raw += data; signal.notify(); });
     return item;
+  };
+  const readWitness = (file: string): unknown => {
+    if (!existsSync(file)) return undefined;
+    try { return JSON.parse(readFileSync(file, "utf8")) as unknown; } catch { return undefined; }
+  };
+  const readyForCopy = (item: (typeof owned)[number]): boolean => {
+    if (proofWatchError) throw new Error("owned clipboard fixture receipt watcher failed", { cause: proofWatchError });
+    if (item.exited) return false;
+    const startup = readWitness(`${startupStem}.${item.nonce}.json`);
+    const pid = witness(startup)?.pid;
+    if (!Number.isSafeInteger(pid) || (pid as number) <= 0) return false;
+    return copyFixtureReady({ nonce: item.nonce, moduleUrl: nativeTuiUrl, bin: join(root, "bin"),
+      producer: item.ownsNativeChild ? { parentPid: item.handle.pid } : { pid: item.handle.pid } },
+    startup, readWitness(`${isolationStem}.${pid as number}.json`));
+  };
+  const requireCopyIsolation = (surface: TerminalSurface): void => {
+    const owner = paneOwners.get(surface);
+    assert.ok(owner && readyForCopy(owner), "this exact producer observed public startup and owned clipboard interception before the copy gesture");
+  };
+  const copyKey = (surface: TerminalSurface, write: (data: string) => void, data: string): void => {
+    if (data === "\x1b[17~") requireCopyIsolation(surface);
+    write(data);
   };
   const text = (surface: TerminalSurface): string => surface.frame().lines.map(stripGeneratedSgr).join("\n");
   const helperRecords = (): string[] => existsSync(helperLog) ? readFileSync(helperLog, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string) : [];
@@ -260,6 +399,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     : [...item.raw.matchAll(/\x1b\]52;c;([^\x07]*)\x07/g)].map((match) => match[1]!);
   const select = (surface: TerminalSurface, write: (data: string) => void,
     first = "CLIP466-A", last = "CLIP466-B", top = -1, bottom = Number.MAX_SAFE_INTEGER): void => {
+    requireCopyIsolation(surface); // copy-on-select can copy on this gesture's release
     const lines = surface.frame().lines.map(stripGeneratedSgr);
     const y1 = lines.findIndex((line, row) => row > top && row < bottom && line.includes(first));
     const y2 = lines.findIndex((line, row) => row > top && row < bottom && line.includes(last));
@@ -419,12 +559,15 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
   disposeProbe.dispose();
   disposeProbe.dispose();
   try {
+    proofWatcher = watch(root, { persistent: false }, () => signal.notify());
+    proofWatcher.on("error", (error) => { proofWatchError = error; signal.notify(); });
     at("standalone", "spawn");
     const direct = spawn(cli, args, common, join(root, "work"));
     const directSurface = new TerminalSurface(80, 30, { onReply: (data) => direct.handle.write(data), onChange: () => signal.notify() });
     trackPane("standalone", directSurface, direct);
     direct.handle.onData((data) => directSurface.write(data));
-    await signal.waitFor(() => text(directSurface).includes("─".repeat(20)), 20_000, at("standalone", "native editor", directSurface));
+    await signal.waitForRecheck(() => text(directSurface).includes("─".repeat(20)) && readyForCopy(direct), 20_000,
+      at("standalone", "native editor with public startup and observed copy isolation", directSurface));
     direct.handle.write("/copy-proof\r");
     await signal.waitFor(() => text(directSurface).includes("CLIP466-B"), 20_000, at("standalone", "native synthetic text", directSurface));
     select(directSurface, (data) => direct.handle.write(data));
@@ -447,8 +590,9 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const id = await manager.create({ workspace: join(root, "work") });
     const surface = manager.surface(id)!;
     trackPane("hosted", surface, hosted);
-    const write = (data: string): void => manager!.write(id, data);
-    await signal.waitFor(() => text(surface).includes("─".repeat(20)), 20_000, at("hosted", "editor", surface));
+    const write = (data: string): void => copyKey(surface, (packet) => manager!.write(id, packet), data);
+    await signal.waitForRecheck(() => text(surface).includes("─".repeat(20)) && readyForCopy(hosted!), 20_000,
+      at("hosted", "editor with public startup and observed copy isolation", surface));
     write("/copy-proof\r");
     await signal.waitFor(() => text(surface).includes("CLIP466-B"), 20_000, at("hosted", "synthetic text", surface));
     select(surface, write);
@@ -501,11 +645,13 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       const row = await manager.create({ workspace: join(root, "work") });
       const pane = manager.surface(row)!;
       trackPane(leg, pane, child);
-      const input = (data: string): void => manager!.write(row, data);
-      await signal.waitFor(() => text(pane).includes("─".repeat(20)), 20_000, at(leg, "fresh native editor", pane));
+      const input = (data: string): void => copyKey(pane, (packet) => manager!.write(row, packet), data);
+      await signal.waitForRecheck(() => text(pane).includes("─".repeat(20)) && readyForCopy(child!), 20_000,
+        at(leg, "fresh native editor with public startup and observed copy isolation", pane));
       input("/copy-proof\r");
       // The original CLIP466-B condition keeps its unchanged 20 000 ms budget, no
-      // retry, and no added readiness heuristic. Observing an owned child exit or
+      // retry, and no added readiness heuristic (the preceding wait now requires
+      // the positive public startup/isolation receipt). Observing an owned child exit or
       // an error row INSIDE that same wait turns a would-be full-timeout into an
       // early, distinct failure carrying the liveness facts instead of burning
       // the budget on a silent row.
@@ -604,12 +750,13 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const framedId = await framedManager.create({ workspace: join(root, "work") });
     const framedPane = framedManager.surface(framedId)!;
     trackPane("framed", framedPane, framedChild);
-    const framedInput = (data: string): void => framedManager!.write(framedId, data);
+    const framedInput = (data: string): void => copyKey(framedPane, (packet) => framedManager!.write(framedId, packet), data);
     assert.ok(framedChild && framedChild.bootstrap, "the opted-in row owns its child and bootstrap");
     const framedBootstrap = framedChild.bootstrap;
     assert.equal(framedChild.bootstrap.inputOriginFraming, 1, "the closed mode reached the actual one-shot bootstrap");
     assert.equal(framedSpawnEnv?.PI_CLIPBOARD_OSC52, "1", "only this opted-in launch gained the static capture flag");
-    await signal.waitFor(() => text(framedPane).includes("─".repeat(20)), 20_000, at("framed", "opted-in native editor", framedPane));
+    await signal.waitForRecheck(() => text(framedPane).includes("─".repeat(20)) && readyForCopy(framedChild!), 20_000,
+      at("framed", "opted-in native editor with public startup and observed copy isolation", framedPane));
     await signal.waitFor(() => framedChild!.raw.includes("\x1b]777;prg-native-input-ready-v1;"), 20_000,
       at("framed", "the strict child authenticated its decoder installation", framedPane));
     const readyAt = framedChild.raw.indexOf("\x1b]777;prg-native-input-ready-v1;");
@@ -777,16 +924,17 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const popupPane = new TerminalSurface(120, 40, { onReply: (data) => popupChild?.handle.write(data), onChange: () => signal.notify() });
     trackPane("popup", popupPane);
     popupPane.write("PRG-COPY-RESTORE");
-    popupChild = spawn(process.execPath, [runner], { ...popupEnv, PRG_COPY_MAIN_ARGS: JSON.stringify(popupArgs) }, join(root, "work"), 120, 40);
+    popupChild = spawn(process.execPath, [runner], { ...popupEnv, PRG_COPY_MAIN_ARGS: JSON.stringify(popupArgs) }, join(root, "work"), 120, 40, true);
     paneOwners.set(popupPane, popupChild);
     popupChild.handle.onData((data) => popupPane.write(data));
-    const popupInput = (data: string): void => popupChild!.handle.write(data);
+    const popupInput = (data: string): void => copyKey(popupPane, (packet) => popupChild!.handle.write(packet), data);
     await signal.waitFor(() => text(popupPane).includes("New session"), 20_000, at("popup", "real host welcome", popupPane));
     popupInput("\r");
     await signal.waitFor(() => text(popupPane).includes("Workspace"), 20_000, at("popup", "real host New form", popupPane));
     popupInput(`\x1b[200~${join(root, "work")}\x1b[201~`);
     popupInput("\r");
-    await signal.waitFor(() => text(popupPane).includes("prg-native-question") || text(popupPane).includes("driven"), 30_000, at("popup", "real native Main", popupPane));
+    await signal.waitForRecheck(() => (text(popupPane).includes("prg-native-question") || text(popupPane).includes("driven"))
+      && readyForCopy(popupChild!), 30_000, at("popup", "real native Main with exact native-child startup/isolation", popupPane));
     popupInput("populate synthetic clipboard proof\r");
     await signal.waitFor(() => text(popupPane).includes("ASSISTANT466-B 雪 end") && text(popupPane).includes("Pending input"), 30_000,
       at("popup", "actual registered question and notice tools finish the synthetic turn", popupPane));
@@ -892,6 +1040,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     }
     throw error;
   } finally {
+    proofWatcher?.close();
     if (manager) await manager.shutdown({ graceMs: 2000, killMs: 2000 });
     for (const item of owned) {
       if (!item.exited) {

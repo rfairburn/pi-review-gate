@@ -82,6 +82,11 @@ export interface FakeInventory extends InventorySource {
 	setRows(rows: readonly NativeInstanceView[] | undefined): void;
 	/** Make the authoritative source unobservable, so installing a watch fails. */
 	setUnobservable(value: boolean): void;
+	/**
+	 * Fixture-only: adopt a different owner run, exactly as a restarted manager
+	 * would. Nothing is emitted; a fresh subscription observes the new run.
+	 */
+	setRun(nextHostRunId: string): void;
 	readonly activeWatches: number;
 	readonly revisions: number;
 }
@@ -90,7 +95,7 @@ export function createFakeInventory(initial: readonly NativeInstanceView[] = [])
 	let rows: readonly NativeInstanceView[] | undefined = copyRows(initial);
 	let unobservable = false;
 	let revision = 0;
-	const hostRunId = `run-${Math.random().toString(36).slice(2, 10)}`;
+	let hostRunId = `run-${Math.random().toString(36).slice(2, 10)}`;
 	const watches = new Set<{ listener: OwningHostInventoryListener; active: boolean }>();
 
 	const snapshotOf = (): OwningHostInventorySnapshot | undefined => (
@@ -125,6 +130,9 @@ export function createFakeInventory(initial: readonly NativeInstanceView[] = [])
 		},
 		setUnobservable(value: boolean): void {
 			unobservable = value === true;
+		},
+		setRun(nextHostRunId: string): void {
+			hostRunId = nextHostRunId;
 		},
 		setRows(next: readonly NativeInstanceView[] | undefined): void {
 			revision += 1;
@@ -252,6 +260,7 @@ export async function startCoordinator(
 		readonly testHooks?: PeerCoordinatorOptions["testHooks"];
 		readonly log?: SnapshotLog;
 		readonly closeOwnedSession?: PeerCoordinatorOptions["closeOwnedSession"];
+		readonly createOwnedSession?: PeerCoordinatorOptions["createOwnedSession"];
 	},
 ): Promise<StartedCoordinator> {
 	const log = options.log ?? createSnapshotLog();
@@ -263,6 +272,7 @@ export async function startCoordinator(
 		onIncomingConsentArrival: log.onArrival,
 		...(options.testHooks === undefined ? {} : { testHooks: options.testHooks }),
 		...(options.closeOwnedSession === undefined ? {} : { closeOwnedSession: options.closeOwnedSession }),
+		...(options.createOwnedSession === undefined ? {} : { createOwnedSession: options.createOwnedSession }),
 	});
 	t.after(async () => {
 		try {

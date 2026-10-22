@@ -25,6 +25,7 @@ import {
 	type PeerCoordinatorTestHooks,
 } from "../src/session-host/network/peer-coordinator";
 import type { OwnerCloseRequest } from "../src/session-host/network/peer-close";
+import type { OwnerCreateRequest } from "../src/session-host/network/peer-create";
 import type { PeerByteChannel, PeerChannelClose } from "../src/session-host/network/channel";
 import type {
 	PeerContentController,
@@ -3184,4 +3185,197 @@ test("a throwing request accessor is a malformed-input refusal, not a rejection"
 		nestedHostile as unknown as PeerNativeInputRequest,
 	);
 	assert.deepEqual(nestedResult, { status: "not-sent", reason: "invalid-input" });
+});
+
+/* ------------------------------------------------------------------------- *
+ * Rowless owner create over the existing roster channel.
+ *
+ * These cases use the REAL TLS loopback pair, the real roster bridge, and the
+ * real coordinator, with an in-memory authoritative inventory standing in for the
+ * session manager. The owner here starts with an EMPTY roster on purpose: a
+ * first child is exactly the rowless case, so no row, selection, native tuple,
+ * viewer, or display fact may be required anywhere on the path.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * An owner destination with an EMPTY current roster plus a connected requester
+ * that holds one authoritative observation of the owner's run.
+ */
+async function createPair(
+	t: TestContext,
+	options: { readonly createOwnedSession?: PeerCoordinatorOptions["createOwnedSession"] } = {},
+): Promise<{ host: StartedCoordinator; requester: StartedCoordinator; hostId: string }> {
+	const hostFixture = createOwnedAgentDir(t);
+	const requesterFixture = createOwnedAgentDir(t);
+	const host = await startCoordinator(t, {
+		agentDir: hostFixture.agentDir,
+		inventory: createFakeInventory([]),
+		testHooks: hooks(),
+		...(options.createOwnedSession === undefined ? {} : { createOwnedSession: options.createOwnedSession }),
+	});
+	await host.coordinator.perform({ type: "peer-listener", enabled: true, host: "127.0.0.1", port: "0" });
+	const port = host.coordinator.read().listener.port as number;
+	const requester = await startCoordinator(t, {
+		agentDir: requesterFixture.agentDir,
+		inventory: createFakeInventory(),
+		testHooks: hooks(),
+	});
+	const hostId = await addDestination(requester, "Owner host", port);
+	await connectWithApprovals(requester, host, hostId);
+	await waitConnected(requester, "the owner's empty current roster observation");
+	return { host, requester, hostId };
+}
+
+test("a create reaches the shared owner provider for the exact observed run and workspace, with no row or selection", async (t) => {
+	const calls: OwnerCreateRequest[] = [];
+	const pair = await createPair(t, {
+		createOwnedSession: async (request, stillAuthorized) => {
+			calls.push(request);
+			assert.equal(stillAuthorized(), true, "the provider is handed the owner's live re-proof");
+			return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+		},
+	});
+	const hostRunId = observedRun(pair.requester);
+	const workspace = "/srv/owner/first child";
+	// Nothing is selected, displayed, or projected as a row yet.
+	assert.equal(pair.requester.coordinator.content.readContent().state, "none");
+	assert.deepEqual(pair.requester.coordinator.read().hosts?.[0]?.roster.rows, []);
+	const result = await pair.requester.coordinator.ownerCreate.createSession(
+		{ hostId: pair.hostId, hostRunId, workspace },
+		{ stillCurrent: () => true },
+	);
+	assert.deepEqual(result, {
+		kind: "owner-result",
+		facts: { kind: "started", hostRunId, rowId: "native-1" },
+	});
+	assert.deepEqual(calls, [{ hostRunId, workspace }],
+		"the exact observed run and canonical workspace reach the shared provider");
+	// A result is never an optimistic local row, selection, or focus change.
+	assert.deepEqual(pair.requester.coordinator.read().hosts?.[0]?.roster.rows, []);
+	assert.equal(pair.requester.coordinator.content.readContent().target, null);
+	// Only the owner's own authoritative roster can add the new row.
+	await pair.host.inventory.setRows([rowView("native-1")]);
+	await pair.requester.log.waitFor(
+		(snapshot) => snapshot.hosts?.[0]?.roster.rows?.length === 1,
+		"the owner's own new row reaches the projection",
+	);
+	assert.deepEqual(pair.requester.coordinator.read().hosts?.[0]?.roster.rows?.map((row) => row.id), ["native-1"]);
+});
+
+test("an owner without a create provider refuses with a fixed not-sent capability result", async (t) => {
+	const pair = await createPair(t);
+	const hostRunId = observedRun(pair.requester);
+	assert.deepEqual(await pair.requester.coordinator.ownerCreate.createSession(
+		{ hostId: pair.hostId, hostRunId, workspace: "/srv/owner/child" },
+		{ stillCurrent: () => true },
+	), { kind: "not-sent", reason: "capability-unsupported" });
+});
+
+test("a create names one exact run, destination, and workspace and refuses to retarget anything else", async (t) => {
+	const calls: OwnerCreateRequest[] = [];
+	const pair = await createPair(t, {
+		createOwnedSession: async (request) => {
+			calls.push(request);
+			return { kind: "refused" };
+		},
+	});
+	const hostRunId = observedRun(pair.requester);
+	const target = pair.requester.coordinator.ownerCreate;
+	const stillCurrent = { stillCurrent: () => true };
+	assert.deepEqual(await target.createSession(
+		{ hostId: "not-a-host", hostRunId, workspace: "/srv/owner/child" }, stillCurrent),
+	{ kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(await target.createSession(
+		{ hostId: pair.hostId, hostRunId: "other-run", workspace: "/srv/owner/child" }, stillCurrent),
+	{ kind: "not-sent", reason: "target-unavailable" },
+	"the run is required input and is never rewritten to a newer one");
+	assert.deepEqual(await target.createSession(
+		{ hostId: pair.hostId, hostRunId, workspace: "" }, stillCurrent),
+	{ kind: "not-sent", reason: "invalid-request" });
+	assert.deepEqual(await target.createSession(
+		{ hostId: pair.hostId, hostRunId, workspace: "/srv/\u0000bad" }, stillCurrent),
+	{ kind: "not-sent", reason: "invalid-request" });
+	assert.deepEqual(await target.createSession(
+		{ hostId: pair.hostId, hostRunId, workspace: 7 as never }, stillCurrent),
+	{ kind: "not-sent", reason: "invalid-request" });
+	// The caller's own written-form/run/workspace proof is required, not optional.
+	assert.deepEqual(await target.createSession(
+		{ hostId: pair.hostId, hostRunId, workspace: "/srv/owner/child" }, {} as never),
+	{ kind: "not-sent", reason: "invalid-request" });
+	// A proof that no longer holds refuses the request before submission.
+	assert.deepEqual(await target.createSession(
+		{ hostId: pair.hostId, hostRunId, workspace: "/srv/owner/child" },
+		{ stillCurrent: () => false }),
+	{ kind: "not-sent", reason: "target-unavailable" });
+	// A throwing proof is no proof at all.
+	assert.deepEqual(await target.createSession(
+		{ hostId: pair.hostId, hostRunId, workspace: "/srv/owner/child" },
+		{ stillCurrent: () => { throw new Error("synthetic form fence failure"); } }),
+	{ kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(calls, [], "no unusable or unproved request is ever forwarded or retargeted");
+});
+
+test("a disconnected destination cannot be addressed by a create", async (t) => {
+	const calls: OwnerCreateRequest[] = [];
+	const pair = await createPair(t, {
+		createOwnedSession: async (request) => {
+			calls.push(request);
+			return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+		},
+	});
+	const hostRunId = observedRun(pair.requester);
+	await pair.requester.coordinator.perform({ type: "peer-disconnect", hostId: pair.hostId });
+	assert.equal(pair.requester.coordinator.read().hosts?.[0]?.state, "disconnected");
+	assert.deepEqual(await pair.requester.coordinator.ownerCreate.createSession(
+		{ hostId: pair.hostId, hostRunId, workspace: "/srv/owner/child" },
+		{ stillCurrent: () => true },
+	), { kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(calls, [], "a disconnected destination is never addressed");
+});
+
+test("a coordinator that is closing never submits a create", async (t) => {
+	const calls: OwnerCreateRequest[] = [];
+	const pair = await createPair(t, {
+		createOwnedSession: async (request) => {
+			calls.push(request);
+			return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+		},
+	});
+	const hostRunId = observedRun(pair.requester);
+	await pair.requester.coordinator.close();
+	assert.deepEqual(await pair.requester.coordinator.ownerCreate.createSession(
+		{ hostId: pair.hostId, hostRunId, workspace: "/srv/owner/child" },
+		{ stillCurrent: () => true },
+	), { kind: "not-sent", reason: "not-ready" });
+	assert.deepEqual(calls, []);
+});
+
+test("a create is never submitted for a run the destination no longer observes", async (t) => {
+	const calls: OwnerCreateRequest[] = [];
+	const pair = await createPair(t, {
+		createOwnedSession: async (request) => {
+			calls.push(request);
+			return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+		},
+	});
+	const runA = observedRun(pair.requester);
+	// The owner's manager is replaced by a new run, exactly as a restarted host's
+	// would be, and the same destination adopts it through an explicit reconnect.
+	pair.host.inventory.setRun("owner-run-b");
+	await pair.requester.coordinator.perform({ type: "peer-disconnect", hostId: pair.hostId });
+	await pair.requester.coordinator.perform({ type: "peer-connect", hostId: pair.hostId });
+	const adopted = await pair.requester.log.waitFor(
+		(snapshot) => snapshot.hosts?.[0]?.roster.state === "current"
+			&& snapshot.hosts[0].roster.hostRunId === "owner-run-b",
+		"the destination's adopted owner run",
+	);
+	assert.equal(adopted.hosts?.[0]?.roster.hostRunId, "owner-run-b");
+	assert.notEqual(observedRun(pair.requester), runA, "the observed run really changed");
+	// A request built from the previous observation is refused before submission,
+	// even though the caller's own proof still answers true.
+	assert.deepEqual(await pair.requester.coordinator.ownerCreate.createSession(
+		{ hostId: pair.hostId, hostRunId: runA, workspace: "/srv/owner/old-run" },
+		{ stillCurrent: () => true },
+	), { kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(calls, [], "no create frame is submitted for a run this side no longer observes");
 });

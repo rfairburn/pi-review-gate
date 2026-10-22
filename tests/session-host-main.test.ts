@@ -21,6 +21,7 @@ import {
 import type { KeyboardCapabilityObserverOptions } from "../src/session-host/input";
 import { createStatusBroker, type StatusBroker, type StatusRegistrationOptions, type StatusRenameRequest, type StatusRenameResult } from "../src/session-host/broker";
 import { SESSION_HOST_BOOTSTRAP_ENV } from "../src/session-host/launch";
+import { SESSION_HOST_STARTUP_REQUEST_ENV } from "../src/session-host/startup-request";
 import { NativeAgentRegistry, type ProfilePreparer } from "../src/session-host/profiles";
 import { createNativeSavedQueryInput, runNativeExternalEditor } from "../src/session-host/form-support";
 import { TerminalSurface, type TerminalFrame, type TerminalInputModes, type TerminalMouseReportingRequest } from "../src/session-host/terminal-surface";
@@ -31,8 +32,9 @@ import { isSavedSessionAdmission, listSavedSessions, type SavedSessionCatalog } 
 import { deleteSavedSessionFile, type SavedSessionDeletionOptions } from "../src/session-host/saved-deletion";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import type { NativeClipboardEvent } from "../src/session-host/native-clipboard";
-import type { PeerCoordinatorOptions } from "../src/session-host/network/peer-coordinator";
+import { createPeerCoordinator, type PeerCoordinatorOptions } from "../src/session-host/network/peer-coordinator";
 import type { OwnerCloseFacts, OwnerCloseHandler, PeerCloseController, PeerCloseResult } from "../src/session-host/network/peer-close";
+import type { OwnerCreateHandler, PeerCreateController, PeerCreateOptions, PeerCreateResult } from "../src/session-host/network/peer-create";
 import type {
   PeerContentController,
   PeerContentObservation,
@@ -63,6 +65,8 @@ import type {
 } from "../src/session-host/instances";
 import { sidebarNoticeRows } from "./helpers/session-host-notice-witness";
 import { sidebarPaneLines } from "./helpers/session-host-native-roster-witness";
+import { consentsOf, createFakeInventory, createOwnedAgentDir, delay, startCoordinator } from "./session-host-network-peer-coordinator-helpers";
+import { createPosixTestPolicy } from "./session-host-network-peer-state-fixtures";
 
 const ESC = "\x1b";
 const ALT_LEFT = `${ESC}[1;3D`;
@@ -3115,8 +3119,9 @@ test("wide form temporarily replaces the right pane; the child stays alive, unre
   assert.ok(right.trimStart().startsWith("New session"), `form owns the right pane: ${JSON.stringify(right)}`);
   assert.ok(!frame.lines.join("\n").includes("frame:native-1"), "the child frame is hidden, not destroyed, while the form is open");
   // The retained workspace draft ("first" + "draft label") puts the caret at
-  // pane column 13 + 16 = 29, offset by the right pane origin.
-  assert.deepEqual(frame.cursor, { column: 62, row: 3, visible: true }, "form caret offsets into the right pane and native Editor completion viewport");
+  // pane column 13 + 16 = 29, offset by the right pane origin. The Host selector
+  // adds one row above the unchanged Workspace Editor content row.
+  assert.deepEqual(frame.cursor, { column: 62, row: 4, visible: true }, "form caret offsets into the right pane and native Editor completion viewport");
   assert.equal(manager.resizeCalls.length, resizesBeforeForm, "opening the form never resizes the child");
   assert.deepEqual(manager.writes, [], "form input is never broadcast to the child");
 
@@ -10544,5 +10549,924 @@ test("the production Main status adapter forwards the closed framing option thro
     await broker.dispose().catch(() => undefined);
     rmSync(socketRoot, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Owner-side rowless Create provider.
+//
+// The provider Main hands the one coordinator must be the REAL one: it reuses
+// the same `hostService.startSession` seam the local New action uses, resolves
+// the request only against the one authoritative inventory, starts nothing when
+// its re-proof no longer holds, and never selects, activates, or focuses
+// anything. Nothing here dispatches a UI action or asks a human anything.
+// ---------------------------------------------------------------------------
+
+/** Main's owner-side Create provider, exactly as handed to the one coordinator. */
+function ownerCreateProvider(peer: FakePeerCoordinator): OwnerCreateHandler {
+  const provider = peer.options?.createOwnedSession;
+  assert.equal(typeof provider, "function",
+    "Main supplies the one coordinator its owner-side rowless create provider");
+  return provider!;
+}
+
+test("Main hands its owner-side Create provider to the one coordinator and enables nothing else", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    const provider = ownerCreateProvider(peer);
+    assert.equal(typeof provider, "function");
+    assert.equal(harness.events.filter((name) => name === "manager.create").length, 1,
+      "the provider reuses the one manager and inventory: no second manager, store, or registry");
+    assert.deepEqual(peer.commands, [], "handing over a provider issues no network command");
+    assert.equal(manager.shutdownCalls, 0);
+    assert.deepEqual(harness.reports, [], "the handover reports nothing to the operator");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("the owner-side Create provider starts one blank child in the exact run without selecting or focusing", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  const sidebar = harness.sidebar;
+  assert.ok(sidebar);
+  try {
+    const provider = ownerCreateProvider(peer);
+    const runId = ownerRunId(peer);
+    const focusBefore = sidebar.focus;
+    const selectedBefore = sidebar.selectedId;
+    // An owner with no rows at all is exactly the first-child case.
+    assert.deepEqual(manager.views, []);
+    const workspace = "/srv/owner/first child";
+    const facts = await provider({ hostRunId: runId, workspace }, () => true);
+    assert.deepEqual(facts, { kind: "started", hostRunId: runId, rowId: "native-1" });
+    // Exactly one create reached the manager, with the canonical workspace only:
+    // no prompt, no title, no saved-conversation fence, and no second option.
+    assert.deepEqual(manager.createOptions, [{ workspace }]);
+    assert.equal(manager.views.length, 1);
+    // The owner's own focus and selection are untouched: this provider never
+    // activates, selects, or completes a local New form.
+    assert.equal(sidebar.focus, focusBefore, "the owner's focus is unchanged by a remote create");
+    assert.equal(sidebar.selectedId, selectedBefore, "nothing is selected by a remote create");
+    assert.deepEqual(peer.commands, []);
+    assert.deepEqual(harness.reports, []);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("the owner-side Create provider refuses another run and starts nothing", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    const provider = ownerCreateProvider(peer);
+    assert.deepEqual(await provider({ hostRunId: "some-other-run", workspace: "/srv/owner/x" }, () => true),
+      { kind: "refused" }, "a request for another owner run is refused before anything starts");
+    assert.deepEqual(manager.createOptions, [], "no create was invoked");
+    assert.deepEqual(manager.views, []);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("the owner-side Create provider starts nothing when its re-proof no longer holds", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    const provider = ownerCreateProvider(peer);
+    const runId = ownerRunId(peer);
+    assert.deepEqual(await provider({ hostRunId: runId, workspace: "/srv/owner/x" }, () => false),
+      { kind: "refused" }, "a re-proof that failed is a positive pre-invocation refusal");
+    assert.deepEqual(await provider({ hostRunId: runId, workspace: "/srv/owner/x" }, () => {
+      throw new Error("synthetic re-proof failure");
+    }), { kind: "refused" }, "a throwing re-proof is no proof at all");
+    assert.deepEqual(manager.createOptions, [], "nothing was started");
+    assert.deepEqual(manager.views, []);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("the owner-side Create provider reports unconfirmed when no usable row came up", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    const provider = ownerCreateProvider(peer);
+    const runId = ownerRunId(peer);
+    // A launch error leaves a real error row behind: the fact must not claim a
+    // start, must not remove that row, and must not claim the child's state.
+    manager.nextError = true;
+    assert.deepEqual(await provider({ hostRunId: runId, workspace: "/srv/owner/broken" }, () => true),
+      { kind: "unconfirmed" });
+    assert.equal(manager.views.length, 1);
+    assert.equal(manager.views[0]?.lifecycle, "error");
+    assert.deepEqual(manager.createOptions, [{ workspace: "/srv/owner/broken" }]);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a remote create crosses real TLS into Main's real manager and publishes the launched child", async (t) => {
+  const root = makeMainTestDirectory("main-remote-create");
+  const fixture = makeMainAdapterPackageFixture(root);
+  const socketRoot = realpathSync(mkdtempSync(join(tmpdir(), "prg-remote-create-")));
+  const broker = await createStatusBroker({ socketRoot });
+  const spawned: AdapterSpawnedPty[] = [];
+  const managers: InstanceManager[] = [];
+  const controllers: SidebarController[] = [];
+  let ownerCoordinator: ReturnType<typeof createPeerCoordinator> | undefined;
+  let harness: Harness | undefined;
+  let closed = false;
+  writeFileSync(join(fixture.agentDir, "keybindings.json"), "{}", "utf8");
+  try {
+    harness = createHarness({ env: { ...fixture.env } }, {
+      // The fixture's synthetic Pi executable is a real, executable file, so the
+      // launch admission validates it exactly as production does.
+      resolvePi: () => ({ file: fixture.piExecutable, version: "1.0.4" }),
+      createBroker: async () => broker,
+      createSessionSetup: () => {
+        // The real native profile preparer, rooted inside this test's own agent
+        // directory: no shared or ambient Pi configuration is touched.
+        const registry = new NativeAgentRegistry({ env: { ...fixture.env } });
+        return { nativeSetup: true, profileRegistry: registry, nativeAgentDir: registry.agentDir };
+      },
+      createManager: (managerOptions) => {
+        const manager = new InstanceManager({
+          ...managerOptions,
+          packageRoot: fixture.packageRoot,
+          piExecutable: fixture.piExecutable,
+          // The only substitution: a synthetic PTY instead of a real child process.
+          // Every lifecycle and live-process fact below is the real manager's own.
+          ptyFactory: adapterPtyFactory(spawned),
+        });
+        managers.push(manager);
+        return manager;
+      },
+      openHostState: ({ agentDir: ownedDir, hostId }) => ({
+        status: "opened",
+        state: {
+          agentDir: ownedDir,
+          hostId,
+          ownershipPath: join(ownedDir, "synthetic-owner"),
+          roster: undefined,
+          problem: undefined,
+          persist: () => true,
+          release: () => true,
+        },
+      }),
+      createSidebar: (sidebarOptions) => {
+        if (!sidebarOptions?.onAction) throw new Error("Main did not supply a sidebar handler");
+        const controller = new SidebarController(sidebarOptions);
+        controllers.push(controller);
+        return controller;
+      },
+      // Main's ONE real coordinator: the real roster bridge answers create behind
+      // the real TLS listener, and its provider is the one Main constructs.
+      createPeerCoordinator: (coordinatorOptions) => {
+        // Main supplies no fixture hooks, so the one test-only seam here is the
+        // deterministic POSIX protection policy the rest of the peer suite uses.
+        const created = createPeerCoordinator({
+          ...coordinatorOptions,
+          testHooks: {
+            preferencesPermissions: createPosixTestPolicy(),
+            peerStatePermissions: createPosixTestPolicy(),
+          },
+        });
+        ownerCoordinator = created;
+        return created;
+      },
+    });
+    const running = harness;
+    for (let attempt = 0; attempt < 400 && ownerCoordinator === undefined; attempt += 1) await nextTurn();
+    const owner = ownerCoordinator;
+    assert.ok(owner, "Main constructed its one real peer coordinator");
+    for (let attempt = 0; attempt < 400 && running.observer.waitCalls === 0; attempt += 1) await nextTurn();
+    assert.equal(running.observer.waitCalls, 1, "Main waited for actual keyboard negotiation");
+    running.observer.settle(0);
+    await nextTurn();
+    // The sidebar is constructed during startup, before Main waits for keyboard
+    // negotiation, so the captured controller exists by now.
+    running.sidebar = controllers[0];
+    assert.ok(running.sidebar, "Main constructed its sidebar");
+    assert.equal(managers.length, 1, "Main opened its one real manager");
+
+    // The owner listens on a real loopback TLS endpoint through its one coordinator.
+    await owner.start();
+    await owner.perform({ type: "peer-listener", enabled: true, host: "127.0.0.1", port: "0" });
+    const port = owner.read().listener.port;
+    if (port === null || port <= 0) throw new Error("Main's real listener reported no bound port");
+
+    // A separate, real requester coordinator pairs with it over real TLS.
+    const requesterFixture = createOwnedAgentDir(t);
+    const requester = await startCoordinator(t, {
+      agentDir: requesterFixture.agentDir,
+      inventory: createFakeInventory(),
+      testHooks: {
+        preferencesPermissions: createPosixTestPolicy(),
+        peerStatePermissions: createPosixTestPolicy(),
+      },
+    });
+    await requester.coordinator.perform({ type: "peer-add", label: "Owner host", host: "127.0.0.1", port: String(port) });
+    const hostId = requester.coordinator.read().hosts?.[0]?.id;
+    if (hostId === undefined) throw new Error("the destination was not saved");
+    const connecting = requester.coordinator.perform({ type: "peer-connect", hostId });
+    const keySnapshot = await requester.log.waitFor(
+      (snapshot) => consentsOf(snapshot, "server-key").length > 0,
+      "the local first-use server-key consent",
+    );
+    const keyConsent = consentsOf(keySnapshot, "server-key")[0];
+    assert.ok(keyConsent);
+    assert.equal(requester.coordinator.decideConsent(keyConsent.id, "approve"), true);
+    // The owner's own human window is approved through its one coordinator.
+    let approved = false;
+    for (let attempt = 0; attempt < 400 && !approved; attempt += 1) {
+      const incoming = owner.read().consents.find((consent) => consent.kind === "incoming");
+      if (incoming !== undefined) {
+        assert.equal(owner.decideConsent(incoming.id, "approve"), true);
+        approved = true;
+        break;
+      }
+      await delay(5);
+    }
+    assert.equal(approved, true, "the owner's incoming approval reached its one coordinator");
+    await connecting;
+    const observed = await requester.log.waitFor(
+      (snapshot) => snapshot.hosts?.[0]?.state === "connected" && snapshot.hosts[0].roster.state === "current",
+      "the owner's real roster observation",
+    );
+    const hostRunId = observed.hosts?.[0]?.roster.hostRunId;
+    if (hostRunId === null || hostRunId === undefined) throw new Error("the requester observed no owner run");
+    assert.deepEqual(observed.hosts?.[0]?.roster.rows, [], "the owner's real inventory is empty before the create");
+
+    const sidebar = running.sidebar;
+    assert.ok(sidebar);
+    const focusBefore = sidebar.focus;
+    const selectedBefore = sidebar.selectedId;
+    const ownerBefore = sidebar.activeMainOwnerID;
+    const spawnedBefore = spawned.length;
+    const created = await requester.coordinator.ownerCreate.createSession(
+      { hostId, hostRunId, workspace: fixture.workspace },
+      { stillCurrent: () => true },
+    );
+    if (created.kind !== "owner-result" || created.facts.kind !== "started") {
+      assert.fail(`the remote create reported no started child: ${JSON.stringify(created)}`);
+    }
+    assert.equal(created.facts.hostRunId, hostRunId, "the facts name the exact observed owner run");
+    // The real manager spawned exactly one blank child, in the canonical workspace.
+    assert.equal(spawned.length, spawnedBefore + 1, "exactly one child was spawned");
+    const spawn = spawned.at(-1)!;
+    assert.equal(spawn.descriptor.cwd, fixture.workspace, "the canonical workspace reached the real launch");
+    assert.equal(spawn.descriptor.env[SESSION_HOST_STARTUP_REQUEST_ENV], undefined,
+      "a blank create carries no title or prompt");
+    const manager = managers[0]!;
+    const rows = manager.list();
+    assert.equal(rows.length, 1, "the one manager owns exactly one row");
+    const row = rows[0]!;
+    assert.equal(row.id, created.facts.rowId, "the reported row is the owner's own authoritative row");
+    assert.equal(row.workspace, fixture.workspace);
+    assert.equal(row.lifecycle, "alive", "the real manager reports the launched row alive");
+    assert.equal(row.hasLiveProcess, true, "the real manager reports its own live process");
+    // Nothing about the owner's presentation moved: this was not a local New.
+    assert.equal(sidebar.focus, focusBefore, "the owner's focus is unchanged");
+    assert.equal(sidebar.selectedId, selectedBefore, "nothing was selected");
+    assert.equal(sidebar.activeMainOwnerID, ownerBefore, "Main's input owner is unchanged");
+    // The requester only ever sees the owner's own authoritative snapshot.
+    await requester.log.waitFor(
+      (snapshot) => snapshot.hosts?.[0]?.roster.state === "current"
+        && snapshot.hosts[0].roster.rows?.some((projected) => projected.id === row.id) === true,
+      "the owner's launched row in the requester projection",
+    );
+
+    closed = true;
+    assert.equal(await closeWithSignal(running), 0, "Main shuts down cleanly after the remote create");
+  } finally {
+    if (!closed && harness !== undefined) {
+      harness.signals.emit("SIGTERM");
+      await harness.result.catch(() => undefined);
+    }
+    for (const manager of managers) await manager.dispose().catch(() => undefined);
+    await broker.dispose().catch(() => undefined);
+    rmSync(socketRoot, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Main's ACTUAL owner-create provider: post-create observation failures.
+//
+// A create that already reached the real manager may have produced a live child
+// that this host can no longer observe. That is `unknown`, never `unconfirmed`
+// and never `refused`. Only the provider's own POST-create read is controlled
+// here; the one owning-host service, its manager, and the pre-create read stay
+// exactly as production wires them.
+// ---------------------------------------------------------------------------
+
+type PostCreateObservation = "unobservable" | "throwing" | "other-run";
+
+async function ownerCreateProviderWithPostCreate(
+  t: Parameters<typeof peerMainHarness>[0],
+  observation: PostCreateObservation,
+): Promise<{
+  harness: Harness;
+  peer: FakePeerCoordinator;
+  provider: OwnerCreateHandler;
+  manager: FakeManager;
+  createCalls: () => number;
+}> {
+  let armed = false;
+  let createCalls = 0;
+  const { harness, peer } = await peerMainHarness(t, undefined, {
+    createOwningHostService: (serviceDependencies) => {
+      const service = createLocalOwningHostService(serviceDependencies);
+      return new Proxy(service, {
+        get(target, property) {
+          if (property === "readInventorySnapshot") {
+            return () => {
+              if (!armed) return target.readInventorySnapshot();
+              armed = false;
+              if (observation === "throwing") {
+                throw new Error("synthetic post-create inventory failure");
+              }
+              if (observation === "unobservable") return undefined;
+              const current = target.readInventorySnapshot();
+              return current === undefined
+                ? undefined
+                : Object.freeze({ ...current, hostRunId: "synthetic-other-owner-run" });
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(target)
+            : value;
+        },
+      }) as OwningHostService;
+    },
+  });
+  const manager = harnessManager(harness);
+  const originalCreate = manager.create.bind(manager);
+  Object.defineProperty(manager, "create", {
+    configurable: true,
+    value: async (createOptions: CreateInstanceOptions) => {
+      createCalls += 1;
+      const id = await originalCreate(createOptions);
+      // Armed only once the create has fully settled, so the next inventory read is
+      // the provider's own post-create observation rather than a change-driven read.
+      armed = true;
+      return id;
+    },
+  });
+  return { harness, peer, provider: ownerCreateProvider(peer), manager, createCalls: () => createCalls };
+}
+
+test("the owner provider reports unknown when its post-create inventory is unobservable", async (t) => {
+  const setup = await ownerCreateProviderWithPostCreate(t, "unobservable");
+  try {
+    const runId = ownerRunId(setup.peer);
+    const workspace = "/srv/owner/unobservable";
+    assert.deepEqual(await setup.provider({ hostRunId: runId, workspace }, () => true), { kind: "unknown" },
+      "an inventory this host cannot read cannot establish that nothing usable came up");
+    assert.equal(setup.createCalls(), 1, "exactly one start invocation");
+    assert.deepEqual(setup.manager.createOptions, [{ workspace }],
+      "the create itself still reached the one real manager with the exact workspace");
+  } finally {
+    assert.equal(await closeWithSignal(setup.harness), 0);
+  }
+});
+
+test("the owner provider reports unknown when its post-create inventory throws", async (t) => {
+  const setup = await ownerCreateProviderWithPostCreate(t, "throwing");
+  try {
+    const runId = ownerRunId(setup.peer);
+    const workspace = "/srv/owner/throwing";
+    assert.deepEqual(await setup.provider({ hostRunId: runId, workspace }, () => true), { kind: "unknown" },
+      "a throwing observation is no observation at all");
+    assert.equal(setup.createCalls(), 1, "exactly one start invocation");
+    assert.deepEqual(setup.manager.createOptions, [{ workspace }]);
+  } finally {
+    assert.equal(await closeWithSignal(setup.harness), 0);
+  }
+});
+
+test("the owner provider reports unknown when its post-create inventory is another run", async (t) => {
+  const setup = await ownerCreateProviderWithPostCreate(t, "other-run");
+  try {
+    const runId = ownerRunId(setup.peer);
+    const workspace = "/srv/owner/other-run";
+    assert.deepEqual(await setup.provider({ hostRunId: runId, workspace }, () => true), { kind: "unknown" },
+      "a child of an interrupted run is never attributed to the requested one");
+    assert.equal(setup.createCalls(), 1, "exactly one start invocation");
+    assert.deepEqual(setup.manager.createOptions, [{ workspace }]);
+  } finally {
+    assert.equal(await closeWithSignal(setup.harness), 0);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Requester-side remote New (Main's `create-on-peer` wiring).
+//
+// The New form's one Host line names Local or one connected destination. A
+// remote submission is dispatched ONLY from the exact New-form frame the writer
+// actually committed, with the exact host, owner run, and canonical workspace
+// that frame held; the owner host performs the one create in its own run and
+// this side creates no local row. A late reply never steals a newer form.
+// ---------------------------------------------------------------------------
+
+/**
+ * The fake coordinator plus the ONE optional Create controller Main feature-detects.
+ * It also exposes the one content controller, so the create completion's ordinary
+ * selection intent (`select-remote`) reaches the same path a deliberate roster
+ * activation uses.
+ */
+class FakePeerCoordinatorWithCreate extends FakePeerCoordinator {
+  readonly content: PeerContentController;
+  readonly createTargets: Array<{
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly workspace: string;
+  }> = [];
+  /** The exact caller proofs Main handed over, retained for later re-evaluation. */
+  readonly createOptions: PeerCreateOptions[] = [];
+  createResult: PeerCreateResult = {
+    kind: "owner-result",
+    facts: { kind: "started", hostRunId: "run-a", rowId: "row-a" },
+  };
+  createGate: Promise<void> | undefined;
+  createThrows = false;
+  /** True while the backend's required last-instant proof still held. */
+  readonly createProofs: boolean[] = [];
+  readonly ownerCreate: PeerCreateController = {
+    createSession: async (target, options) => {
+      this.createTargets.push({ ...target });
+      this.createOptions.push(options);
+      this.createProofs.push(options.stillCurrent());
+      if (this.createGate !== undefined) await this.createGate;
+      if (this.createThrows) throw new Error("synthetic create transport failure");
+      return this.createResult;
+    },
+  };
+
+  constructor(content: PeerContentController = new FakePeerContentPort()) {
+    super();
+    this.content = content;
+  }
+}
+
+/** One connected destination whose complete observation is an EMPTY roster. */
+function connectedCreateHost(
+  hostRunId: string | null = "run-a",
+  state: PeerUiHost["state"] = "connected",
+): PeerUiHost {
+  const host = remotePeerHost({
+    id: "lab-a",
+    label: "Lab Alpha",
+    hostRunId,
+    rows: [],
+  });
+  return { ...host, state } as PeerUiHost;
+}
+
+/** The drawn Host line of the New form pane, which exists only while it is open. */
+function formHostLineOpen(harness: Harness): boolean {
+  return plain(harness.writer.frames.at(-1)?.frame).includes("Host: [ Lab Alpha ]");
+}
+
+/** Opens the New form, selects the one connected destination, and types a path. */
+async function fillRemoteNewForm(harness: Harness, workspace: string): Promise<void> {
+  harness.terminal.emitInput(ENTER); // New session row (default highlight)
+  await nextTurn();
+  harness.terminal.emitInput("\x1b[Z"); // Shift+Tab: the form's Host line
+  await nextTurn();
+  harness.terminal.emitInput("\x1b[B"); // Local -> the one destination
+  await nextTurn();
+  harness.terminal.emitInput("\t"); // Tab: back to the workspace editor
+  await nextTurn();
+  harness.terminal.emitInput(workspace);
+  await nextTurn(); // the typed value's frame must be written before Enter
+  assert.equal(harness.sidebar!.focus, "form");
+  assert.equal(formHostLineOpen(harness), true, "the written New form names the chosen destination");
+}
+
+/** Publishes one connected destination and opens the remote New form. */
+async function remoteCreateMainHarness(
+  t: { after(callback: () => void): void },
+  options: {
+    hostRunId?: string | null;
+    workspace?: string;
+    /** Actual geometry to drive the flow at (defaults to a wide terminal). */
+    size?: { readonly cols: number; readonly rows: number };
+    /** Supply the port when the test needs the coordinator's own observations. */
+    content?: FakePeerContentPort;
+  } = {},
+): Promise<{
+  harness: Harness;
+  peer: FakePeerCoordinatorWithCreate;
+  content: FakePeerContentPort;
+  dispatch(action: SidebarAction): void;
+}> {
+  const content = options.content ?? new FakePeerContentPort();
+  const peer = new FakePeerCoordinatorWithCreate(content);
+  const started = await peerMainHarness(t, undefined, {}, peer);
+  if (options.content !== undefined) content.attach(started.peer.options?.onContentChange);
+  // Wide enough that a bounded host refusal is drawn whole in the form pane; a
+  // narrow size exercises the overlay form of the same flow.
+  const size = options.size ?? { cols: 120, rows: 30 };
+  started.harness.terminal.setSize(size.cols, size.rows);
+  await nextTurn();
+  peer.publish({ hosts: [connectedCreateHost(options.hostRunId === undefined ? "run-a" : options.hostRunId)] as unknown as PeerUiSnapshot["hosts"] });
+  await nextTurn();
+  await fillRemoteNewForm(started.harness, options.workspace ?? "/srv/owner/project");
+  return { harness: started.harness, peer, content, dispatch: started.dispatch };
+}
+
+test("a written remote New form asks the owner to create exactly one child in its own run", async (t) => {
+  const { harness, peer } = await remoteCreateMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+
+    assert.deepEqual(peer.createTargets, [{
+      hostId: "lab-a",
+      hostRunId: "run-a",
+      workspace: "/srv/owner/project",
+    }], "the exact submitted destination, owner run, and canonical workspace reach the one controller");
+    assert.deepEqual(peer.createProofs, [true],
+      "the backend's last-instant proof held when the request was handed over");
+    assert.deepEqual(peer.commands, [], "no connect, pair, grant, remove, or listener command is used");
+    assert.deepEqual(manager.createOptions, [], "no LOCAL child is started for a remote create");
+    assert.deepEqual(manager.views, [], "no optimistic local row is fabricated");
+    assert.deepEqual(listedRowIds(harness), [], "the local roster is untouched");
+
+    // The owner reported its own started fact: this side only displays that
+    // returned owner row. It never accepts or selects a local row.
+    assert.equal(harness.sidebar!.focus, "main",
+      "the submitted form hands the view to the selected remote row");
+    assert.equal(formHostLineOpen(harness), false, "the submitted form is dismissed, not left pending");
+    assert.equal(manager.writes.length, 0, "nothing is written to any local child");
+    assert.deepEqual(listedRowIds(harness), []);
+    assert.equal(manager.shutdownCalls, 0);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("an owner fact other than started is reported truthfully and selects nothing", async (t) => {
+  const { harness, peer } = await remoteCreateMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    peer.createResult = { kind: "owner-result", facts: { kind: "unconfirmed" } };
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(peer.createTargets.length, 1);
+    assert.equal(harness.sidebar!.focus, "form", "a non-started fact leaves the form with its request");
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes(
+      "The remote host could not confirm that the session started; nothing was selected"), true,
+    "the owner's own unconfirmed fact is shown instead of a started claim");
+    assert.deepEqual(manager.views, [], "no local row is created for any owner fact");
+    assert.deepEqual(listedRowIds(harness), []);
+
+    // An unobservable outcome claims nothing either way and is never re-sent.
+    peer.createResult = { kind: "unknown" };
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(peer.createTargets.length, 2, "only the operator's own second deliberate submit is sent");
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes(
+      "UNCERTAIN: the remote create may have been handed off; outcome unknown"), true);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a coordinator without the optional Create controller refuses truthfully, with no local fallback", async (t) => {
+  const peer = new FakePeerCoordinator();
+  const started = await peerMainHarness(t, undefined, {}, peer);
+  const harness = started.harness;
+  const manager = harnessManager(harness);
+  try {
+    harness.terminal.setSize(120, 30);
+    await nextTurn();
+    peer.publish({ hosts: [connectedCreateHost()] as unknown as PeerUiSnapshot["hosts"] });
+    await nextTurn();
+    await fillRemoteNewForm(harness, "/srv/owner/project");
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes(
+      "This host cannot ask another host to create a session"), true,
+    "an older coordinator is reported as unsupported");
+    assert.deepEqual(manager.createOptions, [],
+      "the exact local `create` path is never used as a silent fallback");
+    assert.deepEqual(listedRowIds(harness), []);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a held writer exposes no remote create for a form it has not written", async (t) => {
+  const { harness, peer } = await remoteCreateMainHarness(t, { workspace: "/srv/owner/project" });
+  const manager = harnessManager(harness);
+  try {
+    // Hold the sink, then extend the value: the operator's screen still shows the
+    // previous form, so a submit now must send nothing at all.
+    harness.writer.holdWrites = true;
+    harness.terminal.emitInput("/child");
+    await nextTurn();
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.createTargets, [], "a form frame that was never written sends nothing");
+    assert.deepEqual(manager.createOptions, [], "and no local create is substituted");
+
+    // Drain: the held frame is written, so the identical submission now acts.
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.createTargets, [{
+      hostId: "lab-a",
+      hostRunId: "run-a",
+      workspace: "/srv/owner/project/child",
+    }], "the written form submits exactly what the operator can see");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a late remote create never steals a newer form, and the owner's work is never cancelled", async (t) => {
+  const { harness, peer } = await remoteCreateMainHarness(t);
+  try {
+    let release: (() => void) | undefined;
+    peer.createGate = new Promise<void>((resolve) => { release = resolve; });
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(peer.createTargets.length, 1, "the owner request is in flight");
+
+    // The operator abandons that form and opens an ordinary Local one.
+    harness.terminal.emitInput(ESC);
+    await nextTurn();
+    harness.terminal.emitInput(ENTER); // the New session row is highlighted again
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "form");
+    harness.terminal.emitInput("/local/workspace");
+    await nextTurn();
+
+    release?.();
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "form",
+      "the late reply never steals the newer form the operator owns");
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes("New session"), true);
+    assert.equal(peer.createTargets.length, 1, "nothing was re-sent, replayed, or retargeted");
+    assert.deepEqual(peer.commands, [], "no disconnect, removal, or revoke is issued on the owner's behalf");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a disconnected destination is refused before any remote create is sent", async (t) => {
+  const { harness, peer } = await remoteCreateMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    peer.publish({ hosts: [connectedCreateHost("run-a", "disconnected")] as unknown as PeerUiSnapshot["hosts"] });
+    await nextTurn();
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.createTargets, [],
+      "a destination that is no longer connected sends nothing at all");
+    assert.deepEqual(manager.createOptions, [], "and never becomes a local create");
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes("Lab Alpha"), true,
+      "the chosen destination is still named instead of silently becoming Local");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("the narrow overlay form submits the same remote create through its own written receipt", async (t) => {
+  // A narrow terminal draws the New form as the full-content overlay rather than
+  // the wide right-hand pane: its receipt is that overlay's rectangle, not the
+  // terminal size the wide layout's right pane also happens to fit inside.
+  const { harness, peer } = await remoteCreateMainHarness(t, { size: { cols: 50, rows: 24 } });
+  const manager = harnessManager(harness);
+  try {
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.createTargets, [{
+      hostId: "lab-a",
+      hostRunId: "run-a",
+      workspace: "/srv/owner/project",
+    }], "the narrow overlay form settles and submits the same exact target");
+    assert.deepEqual(manager.createOptions, [], "still no local child is started");
+    assert.equal(harness.sidebar!.focus, "main", "the submitted overlay hands the view to the remote row");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a reflow retires an in-flight remote create's last-instant proof", async (t) => {
+  const { harness, peer } = await remoteCreateMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    let release: (() => void) | undefined;
+    peer.createGate = new Promise<void>((resolve) => { release = resolve; });
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.createProofs, [true], "the proof held when the request was handed over");
+
+    // Hold the sink so nothing is repainted, then resize away and back: the
+    // physical screen was reflowed, so the submitted receipt is dead even though
+    // the final dimensions match the ones it was written at.
+    harness.writer.holdWrites = true;
+    harness.terminal.setSize(60, 30);
+    await nextTurn();
+    harness.terminal.setSize(120, 30);
+    await nextTurn();
+    assert.equal(peer.createOptions[0]!.stillCurrent(), false,
+      "a reflow retires the geometry-bound receipt instead of restoring it");
+
+    // The backend's refusal for a failed caller proof is reported truthfully.
+    peer.createResult = { kind: "not-sent", reason: "invalid-request" };
+    release?.();
+    await nextTurn();
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes(
+      "The New session form changed before it was sent; nothing was sent"), true);
+    assert.equal(harness.sidebar!.focus, "form", "nothing is selected on a not-sent create");
+    assert.deepEqual(manager.createOptions, []);
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("an owner-started row this side has not observed yet is pending, never unavailable", async (t) => {
+  const content = new FakePeerContentPort();
+  const { harness, peer } = await remoteCreateMainHarness(t, { content });
+  const manager = harnessManager(harness);
+  const unavailableNotice = "The selected remote session's display is unavailable; its session keeps running on its host";
+  try {
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(peer.createTargets.length, 1);
+    const target = content.currentTarget();
+    assert.deepEqual(
+      { hostId: target.hostId, hostRunId: target.hostRunId, rowId: target.rowId },
+      { hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" },
+      "the create completion reuses the ordinary selection intent for the returned row",
+    );
+
+    // The coordinator's own fence cannot see the row in this side's roster yet.
+    content.deliver({ target, state: "unavailable", view: undefined, reason: "row-unavailable" });
+    await nextTurn();
+    const afterFence = plain(harness.writer.frames.at(-1)?.frame);
+    assert.equal(afterFence.includes(unavailableNotice), false,
+      "a row the owner just created is never reported as an unavailable display");
+    assert.equal(afterFence.includes("Waiting for the new remote session in its host's roster"), true,
+      "the truthful pending status is shown instead");
+
+    // The roster event arrives with the row and the retained intent streams it.
+    peer.publish({
+      hosts: [remotePeerHost({
+        id: "lab-a",
+        label: "Lab Alpha",
+        hostRunId: "run-a",
+        rows: [remoteRosterRow({ id: "row-a", label: "New remote" })],
+      }) as unknown as PeerUiHost] as unknown as PeerUiSnapshot["hosts"],
+    });
+    await nextTurn();
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a",
+      sequence: 1, cols: 40, rows: 20, marker: "NEW-REMOTE-ROW",
+    }));
+    await nextTurn();
+    const displayed = plain(harness.writer.frames.at(-1)?.frame);
+    assert.equal(displayed.includes("NEW-REMOTE-ROW"), true,
+      "the new row is displayed through the ordinary content path");
+    assert.equal(displayed.includes(unavailableNotice), false,
+      "no unavailable claim was ever shown for the row that started");
+    assert.deepEqual(harness.sidebar!.activeMainOwnerKey,
+      { kind: "remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    assert.deepEqual(manager.createOptions, [], "the remote row never becomes a local row");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a run transition retires an in-flight remote create, and its late reply selects nothing", async (t) => {
+  const { harness, peer, content } = await remoteCreateMainHarness(t);
+  const UNCERTAIN = "UNCERTAIN: the remote create may have been handed off; outcome unknown";
+  try {
+    let release: (() => void) | undefined;
+    peer.createGate = new Promise<void>((resolve) => { release = resolve; });
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.createProofs, [true], "the proof held when the request was handed over");
+
+    // Hold the sink and move the destination's owner run away and back: the
+    // transition, not the final value, decides, so the submitted proof is dead.
+    harness.writer.holdWrites = true;
+    peer.publish({ hosts: [connectedCreateHost("run-b")] as unknown as PeerUiSnapshot["hosts"] });
+    await nextTurn();
+    peer.publish({ hosts: [connectedCreateHost("run-a")] as unknown as PeerUiSnapshot["hosts"] });
+    await nextTurn();
+    assert.equal(peer.createOptions[0]!.stillCurrent(), false,
+      "run A -> B -> A never revives the queued proof");
+
+    // The owner still reports its own started fact for the run it was asked about;
+    // a request this host retired must not select from it.
+    peer.createResult = { kind: "owner-result", facts: { kind: "started", hostRunId: "run-a", rowId: "row-a" } };
+    release?.();
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "form",
+      "a late started reply never steals the view from a retired request");
+    assert.deepEqual(content.selections, [], "the retired request asks for no remote stream");
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes(UNCERTAIN), true,
+      "the retirement is reported as uncertainty, not as a cancellation or a failure");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a disconnect and reconnect retires an in-flight remote create the same way", async (t) => {
+  const { harness, peer, content } = await remoteCreateMainHarness(t);
+  const UNCERTAIN = "UNCERTAIN: the remote create may have been handed off; outcome unknown";
+  try {
+    let release: (() => void) | undefined;
+    peer.createGate = new Promise<void>((resolve) => { release = resolve; });
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.createProofs, [true]);
+    harness.writer.holdWrites = true;
+    peer.publish({ hosts: [connectedCreateHost("run-a", "disconnected")] as unknown as PeerUiSnapshot["hosts"] });
+    await nextTurn();
+    peer.publish({ hosts: [connectedCreateHost("run-a", "connected")] as unknown as PeerUiSnapshot["hosts"] });
+    await nextTurn();
+    assert.equal(peer.createOptions[0]!.stillCurrent(), false,
+      "a reconnect never revives the proof from before the drop");
+    peer.createResult = { kind: "owner-result", facts: { kind: "started", hostRunId: "run-a", rowId: "row-a" } };
+    release?.();
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "form", "no selection follows a retired request");
+    assert.deepEqual(content.selections, []);
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes(UNCERTAIN), true);
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a row observed before the started reply is never described as awaiting its first observation", async (t) => {
+  const content = new FakePeerContentPort();
+  const { harness, peer } = await remoteCreateMainHarness(t, { content });
+  const awaitingNotice = "Waiting for the new remote session in its host's roster";
+  const unavailableNotice = "The selected remote session's display is unavailable; its session keeps running on its host";
+  try {
+    let release: (() => void) | undefined;
+    peer.createGate = new Promise<void>((resolve) => { release = resolve; });
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(peer.createTargets.length, 1);
+
+    // This side observes the created row BEFORE the owner's reply lands.
+    peer.publish({
+      hosts: [remotePeerHost({
+        id: "lab-a",
+        label: "Lab Alpha",
+        hostRunId: "run-a",
+        rows: [remoteRosterRow({ id: "row-a", label: "New remote" })],
+      }) as unknown as PeerUiHost] as unknown as PeerUiSnapshot["hosts"],
+    });
+    await nextTurn();
+    const framesBeforeReply = harness.writer.frames.length;
+    release?.();
+    await nextTurn();
+    assert.deepEqual(content.selections.length, 1,
+      "the reply still selects the returned row through the ordinary intent");
+    const target = content.currentTarget();
+    assert.deepEqual(
+      { hostId: target.hostId, hostRunId: target.hostRunId, rowId: target.rowId },
+      { hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" },
+    );
+
+    // The row then disappears from the owner's roster and the coordinator's own
+    // fence reports that exact row as unavailable.
+    peer.publish({ hosts: [connectedCreateHost("run-a")] as unknown as PeerUiSnapshot["hosts"] });
+    await nextTurn();
+    content.deliver({ target, state: "unavailable", view: undefined, reason: "row-unavailable" });
+    await nextTurn();
+    const afterLoss = harness.writer.frames.slice(framesBeforeReply)
+      .map((entry) => plain(entry.frame));
+    assert.equal(afterLoss.some((text) => text.includes(awaitingNotice)), false,
+      "an already observed row is never described as awaiting its first observation");
+    const renderedLossFrame = plain(harness.writer.frames.at(-1)?.frame);
+    // The 87-column display pane clips this longer message. The 32-column left
+    // notice wraps it instead: reconstruct those actually drawn cells to check
+    // the complete notice, not an impossible contiguous full-width substring.
+    const renderedLeftNotice = renderedLossFrame.split("\n")
+      .map((line) => line.slice(0, 32).trim()).join(" ");
+    assert.equal(renderedLeftNotice.includes(unavailableNotice), true,
+      "the complete drawn notice reports the row's loss honestly instead of as pending");
+    assert.equal(renderedLossFrame.includes("The selected remote session's display is unavailable;"), true,
+      "the display pane also reports unavailability rather than first-observation waiting");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
   }
 });

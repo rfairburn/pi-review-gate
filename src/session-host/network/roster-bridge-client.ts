@@ -53,15 +53,31 @@
  * resolved send is never an exit, a lost reply is never "never happened", and
  * nothing is queued, replayed, or optimistically removed from the projection: only
  * a later complete snapshot can change the rows.
+ *
+ * The optional ROWLESS create exchange rides the same channel, and only when the
+ * owner acknowledged {@link ROSTER_BRIDGE_CREATE_CAPABILITY}.
+ * {@link RosterBridgeViewer.createSession} needs no row, selection, viewer, or
+ * native tuple: it names the exact owner run and one canonical workspace, uses one
+ * fresh correlation id and one strictly increasing per-channel attempt number, and
+ * answers with the same three-way fixed result union. One create is in flight per
+ * channel and a second is refused rather than queued, evicted, or retargeted; a
+ * lost reply or an elapsed deadline is `unknown` and is never retried, replayed,
+ * cancelled, or turned into a local row.
  */
 
 import { randomUUID } from "node:crypto";
 import type { PeerByteChannel } from "./channel";
 import type { PeerKey } from "./identity";
 import type { OwnerCloseRequest, PeerCloseResult } from "./peer-close";
+import {
+  isOwnerCreateWorkspace,
+  type OwnerCreateRequest,
+  type PeerCreateResult,
+} from "./peer-create";
 import type { RemoteSessionMetadata } from "./roster-metadata";
 import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
+  ROSTER_BRIDGE_CREATE_CAPABILITY,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
@@ -73,6 +89,7 @@ import {
   reviewRosterBridgeHelloAck,
   type RosterBridgeBounds,
   type RosterBridgeCloseResultFrame,
+  type RosterBridgeCreateResultFrame,
   type RosterBridgeErrorCode,
   type RosterBridgeFrame,
 } from "./roster-bridge-protocol";
@@ -196,6 +213,8 @@ export interface RosterBridgeViewer {
   readonly capabilities: readonly string[];
   /** True only when this owner acknowledged the optional Close capability. */
   readonly supportsClose: boolean;
+  /** True only when this owner acknowledged the optional create capability. */
+  readonly supportsCreate: boolean;
   /** Resolves on `hello_ack`; rejects on refusal, protocol failure, or channel loss. */
   readonly hello: Promise<void>;
   /** Subscribes and resolves with that subscription's first complete snapshot. */
@@ -222,18 +241,36 @@ export interface RosterBridgeViewer {
     request: OwnerCloseRequest,
     options?: { readonly stillCurrent?: () => boolean },
   ): Promise<PeerCloseResult>;
+  /**
+   * Ask this owner to create one blank child in exactly one of its runs through
+   * the shared owner provider. Never throws and never surfaces a raw error: the
+   * fixed result says what is actually known, and no local row, selection, or
+   * focus is ever created by it.
+   *
+   * `options.stillCurrent` is this caller's own last-instant fence over the
+   * written form destination, run, and workspace its request was built from. It
+   * is evaluated synchronously immediately before the bytes are handed to the
+   * transport, so a queued request whose form was replaced in the meantime is
+   * never submitted.
+   */
+  createSession(
+    request: OwnerCreateRequest,
+    options?: { readonly stillCurrent?: () => boolean },
+  ): Promise<PeerCreateResult>;
   /** Idempotent: unsubscribes, discards any partial transfer, and detaches. */
   stop(): Promise<void>;
   onProjection(listener: (projection: RosterBridgeProjection) => void): () => void;
 }
 
-/** Queued viewer control sends. Control traffic is hello, subscribe, unsubscribe, close, and errors. */
+/** Queued viewer control sends. Control traffic is hello, subscribe, unsubscribe, close, create, and errors. */
 const MAX_QUEUED_VIEWER_SENDS = 4;
 
 /**
  * Optional capabilities this viewer knows and offers. Offering one grants
  * nothing: it only makes the owner's acknowledgement possible, and the owner
- * narrows it further to what it can really honour.
+ * narrows it further to what it can really honour. Create is deliberately NOT in
+ * this default set: a caller opts in explicitly, so nothing on the existing lane
+ * changes for a viewer that never asks.
  */
 const DEFAULT_OFFERED_CAPABILITIES: readonly string[] = Object.freeze([
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
@@ -244,6 +281,18 @@ interface PendingClose {
   readonly requestId: string;
   readonly rowId: string;
   readonly settle: (result: PeerCloseResult) => void;
+  timer: NodeJS.Timeout | null;
+}
+
+/**
+ * The ONE outstanding create on this channel. Its attempt number is retained so a
+ * result that names another owner run can never be reported as this request's.
+ */
+interface PendingCreate {
+  readonly requestId: string;
+  readonly hostRunId: string;
+  readonly sequence: number;
+  readonly settle: (result: PeerCreateResult) => void;
   timer: NodeJS.Timeout | null;
 }
 
@@ -339,6 +388,19 @@ function isCloseRequest(value: unknown, bounds: RosterBridgeBounds): value is Ow
   return typeof record.confirmed === "boolean";
 }
 
+/**
+ * Strict local validation of one create request before anything is encoded. The
+ * owner run must be a carryable opaque identifier and the workspace must be the
+ * canonical single-line text the New form can hold; nothing is trimmed, resolved,
+ * rewritten, or truncated, and no path syntax is interpreted.
+ */
+function isCreateRequest(value: unknown, bounds: RosterBridgeBounds): value is OwnerCreateRequest {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (!isRosterBridgeIdentifier(record.hostRunId, bounds)) return false;
+  return isOwnerCreateWorkspace(record.workspace);
+}
+
 class ViewerBinding implements RosterBridgeViewer {
   readonly peerKey: PeerKey;
 
@@ -384,6 +446,14 @@ class ViewerBinding implements RosterBridgeViewer {
   /** Outstanding closes by this side's own request id, and the per-row fence. */
   readonly #pendingCloses = new Map<string, PendingClose>();
   readonly #pendingCloseRows = new Map<string, string>();
+  /** The one outstanding create on this channel, if any. */
+  #pendingCreate: PendingCreate | null = null;
+  /**
+   * This channel's monotonic anti-replay high-water. It advances once per attempt
+   * and is never rewound or reused, so no request number is ever sent twice on one
+   * channel even after a failed or timed-out attempt. A new channel starts at 0.
+   */
+  #createSequence = 0;
   #helloSettled = false;
   #lastComplete: { readonly hostRunId: string; readonly revision: number; readonly subscriptionId: string } | null = null;
   #startTimer: NodeJS.Timeout | null = null;
@@ -463,6 +533,10 @@ class ViewerBinding implements RosterBridgeViewer {
 
   get supportsClose(): boolean {
     return this.#capabilities.includes(ROSTER_BRIDGE_CLOSE_CAPABILITY);
+  }
+
+  get supportsCreate(): boolean {
+    return this.#capabilities.includes(ROSTER_BRIDGE_CREATE_CAPABILITY);
   }
 
   get hello(): Promise<void> {
@@ -595,14 +669,24 @@ class ViewerBinding implements RosterBridgeViewer {
     return outcome.promise;
   }
 
-  /** The single reason this viewer cannot submit a close now, or null. */
-  #closeRefusal(): PeerCloseResult | null {
-    if (this.#stopRequested || this.#state === "detached") return { kind: "not-sent", reason: "not-ready" };
-    if (this.#state === "failed") return { kind: "not-sent", reason: "not-ready" };
+  /** The single reason this viewer cannot submit a protected control request now, or null. */
+  #controlRefusalReason(): "not-ready" | "awaiting-ack" | null {
+    if (this.#stopRequested || this.#state === "detached") return "not-ready";
+    if (this.#state === "failed") return "not-ready";
     // Before the acknowledgement there is no negotiated capability at all, so
     // nothing may be submitted: this is the pre-handshake "no eligible channel".
-    if (this.#state === "awaiting_ack") return { kind: "not-sent", reason: "not-ready" };
+    if (this.#state === "awaiting_ack") return "awaiting-ack";
     return null;
+  }
+
+  /** The single reason this viewer cannot submit a close now, or null. */
+  #closeRefusal(): PeerCloseResult | null {
+    return this.#controlRefusalReason() === null ? null : { kind: "not-sent", reason: "not-ready" };
+  }
+
+  /** The single reason this viewer cannot submit a create now, or null. */
+  #createRefusal(): PeerCreateResult | null {
+    return this.#controlRefusalReason() === null ? null : { kind: "not-sent", reason: "not-ready" };
   }
 
   /**
@@ -635,6 +719,134 @@ class ViewerBinding implements RosterBridgeViewer {
     }
   }
 
+  /**
+   * Ask this owner to create one blank child in exactly one of its runs.
+   *
+   * Every refusal before the transport write is positively `not-sent`; once
+   * `send` has been invoked the only honest answers are the owner's own facts or
+   * `unknown`. One create is in flight per channel: a second is refused with
+   * `busy` rather than queued, evicted, or retargeted. Each attempt takes the next
+   * number from this channel's monotonic high-water, which is advanced before the
+   * write is queued and never rewound, so a request number is never reused.
+   *
+   * Nothing local is created, selected, or focused here: only the owner's own
+   * result describes what its manager did, and only a later complete snapshot can
+   * change the projected rows.
+   */
+  createSession(
+    request: OwnerCreateRequest,
+    options: { readonly stillCurrent?: () => boolean } = {},
+  ): Promise<PeerCreateResult> {
+    const refusal = this.#createRefusal();
+    if (refusal !== null) return Promise.resolve(refusal);
+    // The owner acknowledged no create support for this channel, so no create
+    // frame exists to send at all.
+    if (!this.supportsCreate) return Promise.resolve({ kind: "not-sent", reason: "capability-unsupported" });
+    if (!isCreateRequest(request, this.#bounds)) {
+      return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    }
+    if (this.#pendingCreate !== null) return Promise.resolve({ kind: "not-sent", reason: "busy" });
+    if (this.#createSequence >= Number.MAX_SAFE_INTEGER) {
+      // The scalar is exhausted: nothing further may be submitted on this channel.
+      return Promise.resolve({ kind: "not-sent", reason: "limit" });
+    }
+    const sequence = this.#createSequence + 1;
+    // Advanced now and never rewound: this attempt owns its number even if the
+    // write below is refused or the request later times out, so no later attempt
+    // can reuse it and no owner can mistake it for the one already seen.
+    this.#createSequence = sequence;
+    const requestId = randomUUID();
+    const outcome = deferred<PeerCreateResult>();
+    const pending: PendingCreate = {
+      requestId,
+      hostRunId: request.hostRunId,
+      sequence,
+      settle: (result) => outcome.resolve(result),
+      timer: null,
+    };
+    this.#pendingCreate = pending;
+    pending.timer = this.#arm(null, this.#bounds.createResultTimeoutMs, () => {
+      pending.timer = null;
+      // A silent owner is unobservable, not "never happened": a child may already
+      // exist, and nothing is re-sent, cancelled, or replayed on its behalf.
+      this.#settleCreate(pending, { kind: "unknown" });
+    });
+    const stillCurrent = options.stillCurrent;
+    // The lifetime latch: this exact create must still be outstanding, this viewer
+    // must not have stopped or failed, and the caller's own written-form fence
+    // must still hold — all checked synchronously inside the write that is about
+    // to call `channel.send`.
+    const gate: ViewerSendGate = () => {
+      if (this.#stopRequested || this.#state === "detached" || this.#state === "failed") {
+        return { allow: false, reason: "not-ready" };
+      }
+      if (this.#pendingCreate !== pending) return { allow: false, reason: "not-ready" };
+      if (stillCurrent !== undefined) {
+        try {
+          if (stillCurrent() !== true) return { allow: false, reason: "target-unavailable" };
+        } catch {
+          // An unavailable fence decision is no decision at all.
+          return { allow: false, reason: "target-unavailable" };
+        }
+      }
+      return { allow: true };
+    };
+    void this.#queueSend({
+      type: "create_request",
+      requestId,
+      hostRunId: request.hostRunId,
+      workspace: request.workspace,
+      sequence,
+    }, gate).then((written) => {
+      if (written.ok) return;
+      if (!written.sent) {
+        // Positive proof this request never reached the transport.
+        this.#settleCreate(pending, { kind: "not-sent", reason: written.reason });
+        return;
+      }
+      // The write was invoked and then rejected: the owner may still have accepted
+      // it, so no outcome is established either way.
+      this.#settleCreate(pending, { kind: "unknown" });
+    });
+    return outcome.promise;
+  }
+
+  /**
+   * One owner answer, matched only by the request id THIS side generated. An
+   * unsolicited, duplicated, foreign, or already-timed-out reply resolves nothing
+   * and is dropped, and a `started` fact that names another owner run can never be
+   * reported as a result of this request.
+   */
+  #onCreateResult(frame: RosterBridgeCreateResultFrame): void {
+    const pending = this.#pendingCreate;
+    if (pending === null || pending.requestId !== frame.requestId) return;
+    const facts = frame.outcome;
+    if (facts.kind === "started" && facts.hostRunId !== pending.hostRunId) {
+      // The request named one exact run; an answer about another run establishes
+      // nothing about this one.
+      this.#settleCreate(pending, { kind: "unknown" });
+      return;
+    }
+    this.#settleCreate(pending, { kind: "owner-result", facts });
+  }
+
+  /** Settle the one outstanding create exactly once and release its timer. */
+  #settleCreate(pending: PendingCreate, result: PeerCreateResult): void {
+    if (this.#pendingCreate !== pending) return;
+    this.#pendingCreate = null;
+    if (pending.timer !== null) {
+      clearTimeout(pending.timer);
+      pending.timer = null;
+    }
+    pending.settle(result);
+  }
+
+  /** Every outstanding create becomes unknown: lost channels are never replayed. */
+  #settleAllCreates(): void {
+    const pending = this.#pendingCreate;
+    if (pending !== null) this.#settleCreate(pending, { kind: "unknown" });
+  }
+
   stop(): Promise<void> {
     if (this.#stopPromise !== null) return this.#stopPromise;
     // Recorded synchronously: a resync already waiting on a retirement cannot
@@ -643,6 +855,7 @@ class ViewerBinding implements RosterBridgeViewer {
     // Every outstanding close settles honestly as unknown before any await: a
     // stopped viewer cannot observe an owner's answer, and nothing is replayed.
     this.#settleAllCloses();
+    this.#settleAllCreates();
     const wasAwaitingAck = this.#state === "awaiting_ack";
     this.#stopPromise = this.#awaitRetirement()
       .then(() => this.#beginRetirement("graceful", undefined, "stopped"))
@@ -852,10 +1065,13 @@ class ViewerBinding implements RosterBridgeViewer {
       case "close_result":
         this.#onCloseResult(frame);
         return;
+      case "create_result":
+        this.#onCreateResult(frame);
+        return;
       default:
-        // The viewer sends hello, subscribe, unsubscribe, close, and errors;
-        // receiving one of those (or any other frame) means the peer is not
-        // speaking this protocol.
+        // The viewer sends hello, subscribe, unsubscribe, close, create, and
+        // errors; receiving one of those (or any other frame) means the peer is
+        // not speaking this protocol.
         this.#protocolFailure();
     }
   }
@@ -1070,6 +1286,7 @@ class ViewerBinding implements RosterBridgeViewer {
     // A lost channel never answers an outstanding close: no outcome is
     // established, and nothing is replayed or guessed at.
     this.#settleAllCloses();
+    this.#settleAllCreates();
     this.#transfer = null;
     this.#subscriptionId = null;
     this.#subscriptionRun = null;
@@ -1304,6 +1521,7 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#settleRetirement();
     // Nor may a close: a detached viewer observes no owner answer.
     this.#settleAllCloses();
+    this.#settleAllCreates();
     this.#detachHandler();
   }
 }

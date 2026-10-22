@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import test, { type TestContext } from "node:test";
@@ -1959,6 +1959,193 @@ const PS_OWNERSHIP_RECORD_AT_REMOVAL: WindowsFixturePatch = {
   replacement: [PS_OWNERSHIP_TRIGGER, "if (Remove-NodeEntry $entry) {"],
 };
 
+// ---------------------------------------------------------------------------
+// Native Windows observational phase witnesses
+//
+// The native fallback case below runs only in the native Windows CI job, and its
+// timed-out launch used to leave nothing behind but `status null`: no launch index,
+// no error code, no indication of which producer phase the launch had reached.
+// These witnesses are inserted beside real producer lines by the same pure patch
+// helper as the substitutions above; they never replace, reorder, or wrap one.
+// Each appends one fixed code plus a monotonic elapsed-milliseconds value to that
+// launch's own test-owned trace through a guarded observer that writes no pipeline
+// output and contains its own I/O errors. Observation can still perturb timing;
+// it does not intentionally alter producer control flow or return values. It is
+// inert without the test-only FAKE_PHASE_TRACE variable, which production
+// producers never read.
+// ---------------------------------------------------------------------------
+
+const WINDOWS_PHASE_TRACE_ENV = "FAKE_PHASE_TRACE";
+const WINDOWS_PHASE_TRACE_PREFIX = "native-phase-trace";
+/** Bounded observation only: at most this many trace bytes are ever read. */
+const WINDOWS_PHASE_TRACE_LIMIT_BYTES = 2048;
+/** Bounded tail: at most this many completed witnesses are ever reported. */
+const WINDOWS_PHASE_TAIL_LIMIT = 12;
+const WINDOWS_PHASE_CODE_PATTERN = /^[A-Z][A-Z0-9-]{0,31}$/u;
+const WINDOWS_PHASE_LINE_PATTERN = /^([A-Z][A-Z0-9-]{0,31})\t([0-9]{1,9})$/u;
+
+interface WindowsPhaseWitnessSpec {
+  /** What producer phase this observation marks; used in failure messages. */
+  readonly label: string;
+  /** The whole real producer line the observation is placed beside. */
+  readonly anchor: string;
+  /** The one fixed code this observation may ever write. */
+  readonly code: string;
+}
+
+/** One guarded, output-free observation line for one fixed phase code. */
+function windowsPhaseWitness(code: string): string {
+  assert.match(code, WINDOWS_PHASE_CODE_PATTERN, `${code}: a phase witness writes one fixed bounded code`);
+  return [
+    `if (-not [string]::IsNullOrEmpty($env:${WINDOWS_PHASE_TRACE_ENV})) { try {`,
+    "if ($null -eq $script:FixturePhaseWatch) { $script:FixturePhaseWatch = [Diagnostics.Stopwatch]::StartNew() };",
+    `[IO.File]::AppendAllText($env:${WINDOWS_PHASE_TRACE_ENV}, '${code}' + [char]9 + ([string]$script:FixturePhaseWatch.ElapsedMilliseconds) + [char]10)`,
+    "} catch { } }",
+  ].join(" ");
+}
+
+/** Insert one observation beside (never instead of) a real producer line. */
+function windowsPhaseWitnessPatch(spec: WindowsPhaseWitnessSpec): WindowsFixturePatch {
+  return { label: `${spec.label} phase witness`, anchor: spec.anchor, replacement: [spec.anchor, windowsPhaseWitness(spec.code)] };
+}
+
+/**
+ * The fixed phase vocabulary, in producer order, each bound to the real producer
+ * line the observation follows. ENTRY observes the start of the helper; the rest
+ * observe completion of one narrow producer step. They establish only observed
+ * progress, not an exact blocking site or a historical cause.
+ */
+const WINDOWS_NATIVE_PHASE_WITNESS_SPECS: readonly WindowsPhaseWitnessSpec[] = [
+  { label: "entry", anchor: "$ErrorActionPreference = 'Stop'", code: "ENTRY" },
+  { label: "agent directory", anchor: "$agentDirectory = Get-AgentDirectory", code: "AGENT-DIR-READY" },
+  { label: "identity type", anchor: "Initialize-IdentityType", code: "IDENTITY-READY" },
+  { label: "cached runtime probe", anchor: "$currentRuntime = Test-CurrentFallbackRuntime $cacheRoot", code: "FALLBACK-PROBE-DONE" },
+  { label: "generation creation", anchor: "$WorkRoot = New-NodeGeneration $cacheRoot $agentDirectory $keepPath", code: "GENERATION-READY" },
+  { label: "extraction directory", anchor: "New-ExclusiveDirectory $extractRoot", code: "EXTRACT-DIR-READY" },
+  { label: "pre-download identity", anchor: "if (-not (Assert-PathIdentity $cacheRoot $cacheIdentity) -or -not (Assert-PathIdentity $WorkRoot $workIdentity)) { throw 'Bootstrap root identity changed before download.' }", code: "PRE-DOWNLOAD-IDENTITY-OK" },
+  { label: "download preparation", anchor: "$url = 'https://nodejs.org/dist/v22.19.0/' + $NodeArchive", code: "DOWNLOAD-PREP" },
+  { label: "failed preparation", anchor: "[Console]::Error.WriteLine('pi-review-sessions: isolated Node bootstrap failed: unsafe path or download/validation failure.')", code: "BOOTSTRAP-FAILED" },
+  { label: "settlement retry", anchor: "Invoke-NodeSettlementCleanup $cacheRoot $agentDirectory $settleKeep", code: "SETTLEMENT-DONE" },
+];
+
+const WINDOWS_NATIVE_PHASE_WITNESSES: readonly WindowsFixturePatch[] = WINDOWS_NATIVE_PHASE_WITNESS_SPECS.map(windowsPhaseWitnessPatch);
+
+/** Every fixed code the generated fixture may write, from that same single source. */
+const WINDOWS_PHASE_CODES: readonly string[] = WINDOWS_NATIVE_PHASE_WITNESS_SPECS.map((spec) => spec.code);
+
+/** Pure, assertion-free, content-bounded formatting of an observed trace tail. */
+function formatWindowsPhaseTail(text: string, truncated: boolean): string {
+  if (truncated) return "UNKNOWN(trace-truncated)";
+  if (text.length === 0) return "EMPTY(no-completed-witness)";
+  // The observer terminates every record with its own newline. A trace that does
+  // not end with one can end mid-record (a killed or partially flushed append), so
+  // it is never parsed as a completed witness.
+  if (!text.endsWith("\n")) return "UNKNOWN(trace-truncated)";
+  const lines = text.slice(0, -1).split("\n");
+  const observed: string[] = [];
+  for (const line of lines) {
+    const match = WINDOWS_PHASE_LINE_PATTERN.exec(line);
+    if (match === null) return "UNKNOWN(unvalidated-trace)";
+    const code = match[1]!;
+    if (!WINDOWS_PHASE_CODES.includes(code)) return "UNKNOWN(unexpected-code)";
+    observed.push(`${code}@${match[2]}ms`);
+  }
+  const tail = observed.slice(-WINDOWS_PHASE_TAIL_LIMIT);
+  const earlier = observed.length - tail.length;
+  return earlier > 0 ? `${tail.join(",")} (+${earlier} earlier)` : tail.join(",");
+}
+
+/**
+ * One distinct test-owned trace path per launch (1-based index). A launch that
+ * completes no witness therefore cannot inherit another launch's records, even if
+ * a previous trace file could not be removed on this host.
+ */
+function windowsLaunchTracePath(root: string, index: number): string {
+  assert.ok(Number.isInteger(index) && index >= 1 && index <= 99,
+    `${index}: a launch index is a bounded positive integer`);
+  return join(root, `${WINDOWS_PHASE_TRACE_PREFIX}-${index}.tsv`);
+}
+
+/**
+ * Bounded read of the test-owned trace. A missing, unreadable, empty, corrupt, or
+ * truncated trace is reported as UNKNOWN or EMPTY: an empty trace proves only
+ * that no witness completed, never that the producer body did not run.
+ */
+function readWindowsPhaseTail(tracePath: string): string {
+  try {
+    if (!existsSync(tracePath)) return "UNKNOWN(no-trace)";
+    const descriptor = openSync(tracePath, "r");
+    try {
+      const buffer = Buffer.alloc(WINDOWS_PHASE_TRACE_LIMIT_BYTES);
+      const bytesRead = readSync(descriptor, buffer, 0, buffer.length, 0);
+      return formatWindowsPhaseTail(buffer.subarray(0, bytesRead).toString("utf8"), bytesRead >= buffer.length);
+    } finally {
+      closeSync(descriptor);
+    }
+  } catch {
+    return "UNKNOWN(unreadable-trace)";
+  }
+}
+
+interface WindowsLaunchResult {
+  readonly status: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly error?: Error | undefined;
+  readonly stdout?: string | null;
+  readonly stderr?: string | null;
+}
+
+/** A platform error code is reported only when it is a short uppercase token. */
+const WINDOWS_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,23}$/u;
+
+/**
+ * One bounded, path-free observation of a launch: index/kind, exit status, signal,
+ * a validated error code (never a raw message or stack), elapsed wall time, the
+ * stdout/stderr byte lengths, and the bounded validated phase tail.
+ */
+function windowsLaunchDiagnostic(label: string, result: WindowsLaunchResult, elapsedMs: number, tracePath: string, traceReady: boolean): string {
+  // Only a validated platform error code is reported: never the raw message,
+  // stack, or any path that message might carry.
+  const rawCode: unknown = result.error === undefined ? undefined : Reflect.get(result.error, "code");
+  const errorCode = result.error === undefined
+    ? "none"
+    : typeof rawCode === "string" && WINDOWS_ERROR_CODE_PATTERN.test(rawCode) ? rawCode : "unlisted";
+  return [
+    label,
+    `status=${result.status === null ? "none" : String(result.status)}`,
+    `signal=${result.signal === null ? "none" : String(result.signal)}`,
+    `error=${errorCode}`,
+    `elapsedMs=${Math.max(0, Math.round(elapsedMs))}`,
+    `stdoutBytes=${Buffer.byteLength(result.stdout ?? "", "utf8")}`,
+    `stderrBytes=${Buffer.byteLength(result.stderr ?? "", "utf8")}`,
+    // A trace whose own removal could not be verified is never read: its content
+    // could be an earlier launch's evidence rather than this launch's.
+    `phases=${traceReady ? readWindowsPhaseTail(tracePath) : "UNKNOWN(trace-reset-failed)"}`,
+  ].join(" ");
+}
+
+/**
+ * Remove this launch's test-owned trace before it starts. Returns whether the path
+ * is now verifiably absent, so a failed removal becomes an explicit UNKNOWN instead
+ * of a stale witness attributed to the current launch.
+ */
+function resetWindowsPhaseTrace(tracePath: string): boolean {
+  try {
+    rmSync(tracePath, { force: true });
+    return !existsSync(tracePath);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Emit one observation before the original assertion. Observation never changes
+ * the launch result that assertion inspects: any diagnostic failure is contained.
+ */
+function reportWindowsLaunch(t: TestContext, label: string, result: WindowsLaunchResult, elapsedMs: number, tracePath: string, traceReady: boolean): void {
+  try { t.diagnostic(windowsLaunchDiagnostic(label, result, elapsedMs, tracePath, traceReady)); } catch { }
+}
+
 /** Every producer anchor the native Windows fixtures depend on. */
 const WINDOWS_FIXTURE_PATCHES: readonly WindowsFixturePatch[] = [
   PS_DOWNLOAD_STUB,
@@ -1968,6 +2155,7 @@ const WINDOWS_FIXTURE_PATCHES: readonly WindowsFixturePatch[] = [
   PS_LOCK_ACQUISITION_WITNESS,
   PS_COORDINATION_REPLACEMENT,
   PS_OWNERSHIP_RECORD_AT_REMOVAL,
+  ...WINDOWS_NATIVE_PHASE_WITNESSES,
 ];
 
 function writeWindowsFixtureHelper(f: EntrypointFixture, patches: readonly WindowsFixturePatch[]): { helper: string; downloads: string; powershell: string; env: NodeJS.ProcessEnv } {
@@ -2016,6 +2204,96 @@ test("Windows fixture anchors still match the real producer source on every plat
   const loopEnd = boundary.indexOf("$held = $count");
   assert.ok(loopStart >= 0 && ownershipRecheck > loopStart && removal > ownershipRecheck && loopEnd > removal,
     "the injected record sits at the real per-candidate removal boundary after the ownership recheck");
+});
+
+test("native Windows phase witnesses are inert, bounded, and derived from real producer lines", () => {
+  // Source-only control for the observational instrument in the native fallback
+  // case below. That case runs only in the native Windows CI job, so this is the
+  // all-platform source control for the anchors, fixed-code observer structure,
+  // and bounded, fail-closed parent formatting. It does not execute PowerShell
+  // or establish native Windows runtime behavior.
+  const source = readFileSync(psPath, "utf8");
+  const sourceLines = source.split("\n");
+  assert.equal(new Set(WINDOWS_PHASE_CODES).size, WINDOWS_PHASE_CODES.length,
+    "each witness owns a distinct fixed phase code");
+  assert.equal(WINDOWS_PHASE_CODES.length, WINDOWS_NATIVE_PHASE_WITNESSES.length,
+    "the code vocabulary and the witness set come from one source");
+  const anchorIndexes: number[] = [];
+  for (const spec of WINDOWS_NATIVE_PHASE_WITNESS_SPECS) {
+    assert.match(spec.code, WINDOWS_PHASE_CODE_PATTERN, `${spec.label}: the code is a bounded fixed token`);
+    const anchorIndex = sourceLines.findIndex((line) => line.trim() === spec.anchor.trim());
+    assert.ok(anchorIndex >= 0, `${spec.label}: the observation anchor is a real producer line`);
+    anchorIndexes.push(anchorIndex);
+  }
+  for (let position = 1; position < anchorIndexes.length; position += 1) {
+    assert.ok(anchorIndexes[position]! > anchorIndexes[position - 1]!,
+      `${WINDOWS_NATIVE_PHASE_WITNESS_SPECS[position]!.code}: witnesses follow real producer order`);
+  }
+  for (const spec of WINDOWS_NATIVE_PHASE_WITNESS_SPECS) {
+    const patch = WINDOWS_NATIVE_PHASE_WITNESSES.find((candidate) => candidate.anchor === spec.anchor)!;
+    assert.equal(patch.replacement.length, 2, `${patch.label}: exactly one observation is inserted`);
+    assert.equal(patch.replacement.filter((line) => line === patch.anchor).length, 1,
+      `${patch.label}: the original producer line is preserved verbatim, never rewritten`);
+    const witness = patch.replacement.find((line) => line !== patch.anchor)!;
+    assert.ok(!witness.includes("\n"), `${patch.label}: the observation is one producer line`);
+    // No output-producing or control-flow cmdlet, no pipe, no redirection, no
+    // exception: an observation may only append one fixed code and its monotonic
+    // elapsed milliseconds, so it cannot alter a return, error, or pipeline result.
+    assert.doesNotMatch(witness, /(?:Write-Output|Write-Host|Write-Error|Write-Warning|Out-File|Out-String|Start-Process|Invoke-Expression|throw|exit|\||>)/u,
+      `${patch.label}: the observation emits no pipeline output and changes no control flow`);
+    assert.ok(witness.startsWith(`if (-not [string]::IsNullOrEmpty($env:${WINDOWS_PHASE_TRACE_ENV})) { try { if ($null -eq $script:FixturePhaseWatch)`),
+      `${patch.label}: the observation is guarded by the test-only trace variable`);
+    assert.ok(witness.endsWith(`([string]$script:FixturePhaseWatch.ElapsedMilliseconds) + [char]10) } catch { } }`),
+      `${patch.label}: the observation contains its own I/O failure and writes only code plus elapsed time`);
+    assert.ok(witness.includes(`[IO.File]::AppendAllText($env:${WINDOWS_PHASE_TRACE_ENV}, '${spec.code}' + `),
+      `${patch.label}: the observation writes exactly its own fixed code`);
+    const patchedLines = buildWindowsFixtureSource(source, [patch]).split("\n");
+    assert.equal(patchedLines.length, sourceLines.length + 1,
+      `${patch.label}: one producer line is added beside the untouched original`);
+    assert.equal(patchedLines.filter((line) => line.trim() === spec.anchor.trim()).length, 1,
+      `${patch.label}: the real producer line survives the insertion unchanged`);
+  }
+  assert.ok(WINDOWS_PHASE_TRACE_LIMIT_BYTES <= 4096 && WINDOWS_PHASE_TAIL_LIMIT <= 16,
+    "the parent reads a bounded amount of trace and reports a bounded tail");
+  // Parent-side reader controls: an observed phase is reported only from a line
+  // that validates against the fixed vocabulary. A missing, empty, corrupt, or
+  // truncated trace is never reported as an observed phase, and an empty trace
+  // proves only that no witness completed.
+  assert.equal(formatWindowsPhaseTail("", false), "EMPTY(no-completed-witness)");
+  assert.equal(formatWindowsPhaseTail("ENTRY\t7\n", false), "ENTRY@7ms");
+  assert.equal(formatWindowsPhaseTail("ENTRY\t7\nBOOTSTRAP-FAILED\t9\n", false), "ENTRY@7ms,BOOTSTRAP-FAILED@9ms");
+  // Every record the observer writes ends with its own newline. A trace that ends
+  // without one can end mid-record, so it is truncated evidence rather than a
+  // completed witness — including when complete records precede it.
+  assert.equal(formatWindowsPhaseTail("ENTRY\t7", false), "UNKNOWN(trace-truncated)",
+    "a lone unterminated record is not a completed witness");
+  assert.equal(formatWindowsPhaseTail("ENTRY\t7\nBOOTSTRAP-FAILED\t9", false), "UNKNOWN(trace-truncated)",
+    "an unterminated record after completed records still fails closed");
+  assert.equal(formatWindowsPhaseTail("ENTRY\t", false), "UNKNOWN(trace-truncated)",
+    "a record truncated before its timestamp is refused");
+  assert.match(formatWindowsPhaseTail("ENTRY\t7\nsome leaked path\n", false), /^UNKNOWN\(/u,
+    "an unvalidated trace line is refused instead of echoed");
+  assert.match(formatWindowsPhaseTail("ENTRY@7ms\n", false), /^UNKNOWN\(/u,
+    "a line without the fixed separator is refused");
+  assert.match(formatWindowsPhaseTail("NOT-A-CODE\t7\n", false), /^UNKNOWN\(/u,
+    "a code outside the fixed vocabulary is refused");
+  assert.equal(formatWindowsPhaseTail("ENTRY\t7\n", true), "UNKNOWN(trace-truncated)",
+    "a truncated trace is UNKNOWN, never a phase claim");
+  assert.equal(formatWindowsPhaseTail(Array.from({ length: 20 }, () => "ENTRY\t1\n").join(""), false).split(",").length,
+    WINDOWS_PHASE_TAIL_LIMIT, "the reported phase tail is bounded");
+  assert.match(readWindowsPhaseTail(join(process.cwd(), "node_modules", ".worker-private", "session-host-fixtures", "absent-phase-trace")),
+    /^UNKNOWN\(/u, "a missing trace is UNKNOWN, never a success claim");
+  // Each launch owns a distinct trace path, and a reset that cannot be verified is
+  // reported without reading anything, so an earlier launch's witnesses can never
+  // be presented as the current launch's evidence.
+  assert.notEqual(windowsLaunchTracePath("launch-root", 1), windowsLaunchTracePath("launch-root", 2),
+    "each launch observes its own trace file");
+  const unverifiedReset = windowsLaunchDiagnostic("launch 2/6", { status: null, signal: null }, 10_026, "unread-launch-trace", false);
+  assert.match(unverifiedReset, /phases=UNKNOWN\(trace-reset-failed\)$/u,
+    "an unverified trace reset is UNKNOWN rather than an earlier launch's evidence");
+  assert.ok(!unverifiedReset.includes("unread-launch-trace"), "the diagnostic never discloses the trace path");
+  assert.match(unverifiedReset, /status=none signal=none error=none elapsedMs=10026/u,
+    "a failed reset still reports every other diagnostic field");
 });
 
 test("producer captures admission entry identity at acquisition and releases exactly that entry", () => {
@@ -2096,21 +2374,38 @@ test("a failed node preparation retains its witness and protects the marked runt
     "a completed preparation preserves the generation it launched");
 });
 
-test("native Windows fallback bootstrap prunes legacy artifacts and never refuses a sixth", { skip: !isWindows, timeout: 60_000 }, (t) => {
+test("native Windows fallback bootstrap prunes legacy artifacts and never refuses a sixth", { skip: !isWindows, timeout: 240_000 }, (t) => {
   const f = makeEntrypointFixture(".node-cap-native-windows-");
   cleanupFixture(t, f);
   const helper = join(f.root, "bootstrap.ps1");
   const downloads = join(f.root, "download-witness");
   // Network is the only substituted operation. Native path/identity checks,
   // exclusive generation creation and bounded no-follow cleanup execute unchanged.
-  writeFileSync(helper, windowsFixtureHelperSource([PS_DOWNLOAD_STUB]), "utf8");
+  // The phase witnesses add one guarded observation beside each of a few producer
+  // steps: no producer line is replaced, reordered, or wrapped, and the observer is
+  // inert unless this generated fixture reads the test-only trace variable.
+  writeFileSync(helper, windowsFixtureHelperSource([PS_DOWNLOAD_STUB, ...WINDOWS_NATIVE_PHASE_WITNESSES]), "utf8");
   const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
   for (let i = 0; i < 6; i++) {
+    // A distinct test-owned trace per launch, reset verifiably before it starts: a
+    // launch that completes no witness can never inherit another launch's records.
+    const trace = windowsLaunchTracePath(f.root, i + 1);
+    const traceReady = resetWindowsPhaseTrace(trace);
+    const launchEnv = { ...env, [WINDOWS_PHASE_TRACE_ENV]: trace };
+    const startedAt = Date.now();
     const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
-      env: i === 0 ? { ...env, PI_CODING_AGENT_DIR: ".\\agent dir π" } : env,
-      cwd: f.root, encoding: "utf8", timeout: 10_000,
+      env: i === 0 ? { ...launchEnv, PI_CODING_AGENT_DIR: ".\\agent dir π" } : launchEnv,
+      cwd: f.root, encoding: "utf8", timeout: i === 0 ? 120_000 : 10_000,
     });
+    // Observation before the original assertion: a timed-out launch reports its
+    // index, kind, status, signal, error code, elapsed time, output byte lengths,
+    // and the bounded phase tail it actually completed. An empty tail proves only
+    // that no witness completed — never that the producer body did not run. The
+    // extra appends perturb wall time slightly, so a green instrumented run is not
+    // evidence about the original failure, and this observation can never turn a
+    // failing launch result green.
+    reportWindowsLaunch(t, `native fallback launch ${i + 1}/6`, result, Date.now() - startedAt, trace, traceReady);
     assert.equal(result.status, 1, result.stderr);
     assert.equal(nodeRoots(f).length, Math.min(i + 1, 5), result.stderr);
     assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, i + 1, "every launch reaches the download; capacity never refuses it");
@@ -2126,9 +2421,13 @@ test("native Windows fallback bootstrap prunes legacy artifacts and never refuse
   const aliasAgent = join(f.root, "alias-agent");
   mkdirSync(aliasAgent);
   symlinkSync(outside, join(aliasAgent, ".pi-review-gate"), "junction");
+  const refusalTrace = windowsLaunchTracePath(f.root, 7);
+  const refusalTraceReady = resetWindowsPhaseTrace(refusalTrace);
+  const refusedStartedAt = Date.now();
   const refused = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper], {
-    env: { ...env, PI_CODING_AGENT_DIR: aliasAgent }, encoding: "utf8", timeout: 10_000,
+    env: { ...env, [WINDOWS_PHASE_TRACE_ENV]: refusalTrace, PI_CODING_AGENT_DIR: aliasAgent }, encoding: "utf8", timeout: 10_000,
   });
+  reportWindowsLaunch(t, "native fallback alias refusal 7/7", refused, Date.now() - refusedStartedAt, refusalTrace, refusalTraceReady);
   assert.equal(refused.status, 1);
   assert.deepEqual(readdirSync(outside), ["sentinel"]);
   assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "outside");

@@ -1029,7 +1029,11 @@ function savedDeletionFailureMessage(result: SavedSessionDeletionResult): string
 
 function statusRegistrar(broker: StatusBroker): StatusRegistrar {
   return {
-    register(instanceId, handlers) {
+    register(instanceId, handlers, options) {
+      // The manager's closed per-registration options are not this adapter's to
+      // interpret: forward the exact object so the ACTUAL broker records the
+      // requested mode in the one-shot bootstrap before any child exists. An
+      // absent request stays absent, preserving the legacy bootstrap.
       const registration = broker.register(instanceId, {
         onStatus: (status) => {
           const update: InstanceStatusUpdate = {
@@ -1048,7 +1052,7 @@ function statusRegistrar(broker: StatusBroker): StatusRegistrar {
         onDisconnect: handlers.onDisconnect,
         ...(handlers.onReconnect ? { onReconnect: handlers.onReconnect } : {}),
         ...(handlers.onSpawnRequest ? { onSpawnRequest: handlers.onSpawnRequest } : {}),
-      });
+      }, options);
       // Keep the broker's exact registration closures and their auth/tuple fences.
       return registration satisfies InstanceStatusRegistration;
     },

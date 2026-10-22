@@ -3,7 +3,8 @@ import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { Buffer } from "node:buffer";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import type { Writable } from "node:stream";
@@ -11,14 +12,15 @@ import test from "node:test";
 import { isKittyProtocolActive, setKittyProtocolActive } from "pi-session-host-tui";
 
 import type { ComposedHostFrame } from "../src/session-host/compositor";
-import type { CreateInstanceOptions, InstanceManagerOptions, NativeInstanceView, ShutdownResult, StopInstanceResult } from "../src/session-host/instances";
+import { InstanceManager, type CreateInstanceOptions, type InstanceManagerOptions, type InstancePty, type InstanceSpawnDescriptor, type InstanceStatusUpdate, type NativeInstanceView, type ShutdownResult, type StopInstanceResult } from "../src/session-host/instances";
 import {
   createSessionHostFrameWriter,
   type SessionHostFrameDisposition,
   type SessionHostFrameWriterOptions,
 } from "../src/session-host/frame-writer";
 import type { KeyboardCapabilityObserverOptions } from "../src/session-host/input";
-import type { StatusBroker, StatusRenameRequest, StatusRenameResult } from "../src/session-host/broker";
+import { createStatusBroker, type StatusBroker, type StatusRegistrationOptions, type StatusRenameRequest, type StatusRenameResult } from "../src/session-host/broker";
+import { SESSION_HOST_BOOTSTRAP_ENV } from "../src/session-host/launch";
 import { NativeAgentRegistry, type ProfilePreparer } from "../src/session-host/profiles";
 import { createNativeSavedQueryInput, runNativeExternalEditor } from "../src/session-host/form-support";
 import { TerminalSurface, type TerminalFrame, type TerminalInputModes, type TerminalMouseReportingRequest } from "../src/session-host/terminal-surface";
@@ -10315,5 +10317,224 @@ test("a refused remote input notice stays visible when no sidebar pane is drawn"
       "a narrow Main pane also shows the oversized-paste refusal");
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Production Main status adapter -> real broker -> real manager admission.
+//
+// The internal input-framing opt-in is an InstanceManager registration option.
+// Main's adapter sits between the manager and the actual broker, so dropping
+// that option there silently opts the child out and the manager's strict
+// bootstrap fence refuses before any PTY exists. These fixtures use the real
+// broker and the real manager admission path; only the PTY factory and the
+// native package layout are synthetic.
+// ---------------------------------------------------------------------------
+
+interface AdapterSpawnedPty {
+  readonly descriptor: InstanceSpawnDescriptor;
+  readonly writes: (string | Buffer)[];
+}
+
+interface ForwardedRegistration {
+  readonly instanceId: string;
+  readonly handlers: Parameters<StatusBroker["register"]>[1];
+  readonly options: StatusRegistrationOptions | undefined;
+  readonly registration: ReturnType<StatusBroker["register"]>;
+}
+
+function makeMainAdapterPackageFixture(root: string): {
+  readonly packageRoot: string;
+  readonly piExecutable: string;
+  readonly agentDir: string;
+  readonly workspace: string;
+  readonly env: NodeJS.ProcessEnv;
+} {
+  const packageRoot = join(root, "package");
+  mkdirSync(join(packageRoot, "dist", "src", "session-host"), { recursive: true });
+  mkdirSync(join(packageRoot, "scripts"), { recursive: true });
+  writeFileSync(join(packageRoot, "dist", "src", "index.js"), "// synthetic Main adapter package fixture\n", "utf8");
+  writeFileSync(join(packageRoot, "dist", "src", "session-host", "reporter.js"), "// synthetic reporter\n", "utf8");
+  writeFileSync(join(packageRoot, "dist", "src", "session-host", "bootstrap-preload.js"), "// synthetic preload\n", "utf8");
+  for (const [skill, files] of [
+    ["pi-review-gate-orchestrator", ["SKILL.md", "references/recovery.md"]],
+    ["pi-review-gate-execution", ["SKILL.md"]],
+    ["pi-review-gate-research", ["SKILL.md"]],
+    ["pi-review-gate-completion", ["SKILL.md"]],
+  ] as const) {
+    for (const file of files) {
+      const path = join(packageRoot, "skills", skill, ...file.split("/"));
+      mkdirSync(join(path, ".."), { recursive: true });
+      writeFileSync(path, `${skill}/${file}\n`, "utf8");
+    }
+  }
+  const piExecutable = join(root, "bin", "mock-pi");
+  mkdirSync(join(root, "bin"), { recursive: true });
+  writeFileSync(piExecutable, "#!/usr/bin/env node\n\"use strict\";\n// Synthetic inert CLI fixture.\n", { mode: 0o755 });
+  chmodSync(piExecutable, 0o755);
+  const home = join(root, "home");
+  const agentDir = join(root, "native-agent");
+  const workspace = join(root, "workspace");
+  for (const path of [home, join(agentDir, "extensions"), join(agentDir, "sessions"), workspace]) {
+    mkdirSync(path, { recursive: true, mode: 0o700 });
+  }
+  return {
+    packageRoot,
+    piExecutable,
+    agentDir,
+    workspace,
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, PI_CODING_AGENT_DIR: agentDir },
+  };
+}
+
+function adapterPtyFactory(spawned: AdapterSpawnedPty[]): (descriptor: InstanceSpawnDescriptor) => InstancePty {
+  return (descriptor) => {
+    const exitListeners: Array<(event: { exitCode: number; signal?: number }) => void> = [];
+    const entry: AdapterSpawnedPty = { descriptor, writes: [] };
+    spawned.push(entry);
+    return {
+      pid: 61000 + spawned.length,
+      cols: descriptor.cols,
+      rows: descriptor.rows,
+      onData: () => ({ dispose() {} }),
+      onExit: (listener) => {
+        exitListeners.push(listener);
+        return {
+          dispose: () => {
+            const index = exitListeners.indexOf(listener);
+            if (index >= 0) exitListeners.splice(index, 1);
+          },
+        };
+      },
+      on: () => undefined,
+      removeListener: () => undefined,
+      write: (data) => { entry.writes.push(data); },
+      resize: () => undefined,
+      kill: () => { for (const listener of [...exitListeners]) listener({ exitCode: 0 }); },
+      pause: () => undefined,
+      resume: () => undefined,
+    };
+  };
+}
+
+test("the production Main status adapter forwards the closed framing option through the real broker before the manager spawns", async () => {
+  const root = makeMainTestDirectory("main-framing-adapter");
+  const fixture = makeMainAdapterPackageFixture(root);
+  const socketRoot = realpathSync(mkdtempSync(join(tmpdir(), "prg-ma-")));
+  const broker = await createStatusBroker({ socketRoot });
+  const forwarded: ForwardedRegistration[] = [];
+  // Strict pass-through: the real broker owns every registration, token, and
+  // bootstrap; this only records what Main's adapter actually handed it.
+  const forwardingBroker: StatusBroker = {
+    socketPath: broker.socketPath,
+    generation: broker.generation,
+    register(instanceId, handlers, options) {
+      const registration = broker.register(instanceId, handlers, options);
+      forwarded.push({ instanceId, handlers, options, registration });
+      return registration;
+    },
+    dispose: () => broker.dispose(),
+  };
+  const spawned: AdapterSpawnedPty[] = [];
+  const managers: InstanceManager[] = [];
+  const newManager = (framing: boolean | undefined): InstanceManager => {
+    const manager = new InstanceManager({
+      packageRoot: fixture.packageRoot,
+      piExecutable: fixture.piExecutable,
+      statusRegistrar: __test.statusRegistrar(forwardingBroker),
+      args: [],
+      env: { ...fixture.env },
+      ptyFactory: adapterPtyFactory(spawned),
+      ...(framing === undefined ? {} : { nativeInputOriginFraming: framing }),
+    });
+    managers.push(manager);
+    return manager;
+  };
+  try {
+    // Direct adapter registration: the exact options object and the caller's
+    // closures must reach the actual broker unchanged.
+    const updates: InstanceStatusUpdate[] = [];
+    let disconnects = 0;
+    let reconnects = 0;
+    const onDisconnect = () => { disconnects += 1; };
+    const onReconnect = () => { reconnects += 1; };
+    const onSpawnRequest = async () => "failed" as const;
+    const registrationOptions = { inputOriginFraming: true } as const;
+    const directId = "11111111-1111-4111-8111-111111111111";
+    const registrar = __test.statusRegistrar(forwardingBroker);
+    const registration = registrar.register(directId, {
+      onStatus: (update) => updates.push(update),
+      onDisconnect,
+      onReconnect,
+      onSpawnRequest,
+    }, registrationOptions);
+    const direct = forwarded.at(-1)!;
+    assert.equal(direct.options, registrationOptions, "the exact manager options object is forwarded unchanged");
+    assert.equal(direct.instanceId, directId);
+    assert.equal(direct.registration, registration, "the adapter returns the broker's exact registration");
+    assert.equal(direct.handlers.onDisconnect, onDisconnect, "the caller's disconnect closure is preserved");
+    assert.equal(direct.handlers.onReconnect, onReconnect, "the caller's reconnect closure is preserved");
+    assert.equal(direct.handlers.onSpawnRequest, onSpawnRequest, "the caller's spawn-request closure is preserved");
+    assert.equal(registration.bootstrap.inputOriginFraming, 1,
+      "the actual broker records mode 1 before any child exists");
+    const nativeSession = { sessionId: "conversation-a", epoch: 2, name: "Conversation A" };
+    direct.handlers.onStatus({
+      version: 1, type: "status", instanceId: directId, generation: broker.generation, sequence: 1,
+      busy: false, pendingInput: true, inputSurface: false,
+      backgroundTasks: 2, backgroundShells: null, activeTasks: 1, activeShells: 0,
+      activity: ["Working", "Reviewing"], nativeSession,
+    });
+    assert.deepEqual(updates, [{
+      busy: false, pendingInput: true, inputSurface: false,
+      backgroundTasks: 2, backgroundShells: null, activeTasks: 1, activeShells: 0,
+      activity: ["Working", "Reviewing"], nativeSession,
+    }], "the adapter's exact status mapping and caller callback are preserved");
+    direct.handlers.onDisconnect();
+    assert.equal(disconnects, 1, "the caller's disconnect callback is not replaced");
+    assert.equal(reconnects, 0);
+    registration.release();
+
+    // Ordinary absence: no options object, and no bootstrap marker.
+    const legacyId = "22222222-2222-4222-8222-222222222222";
+    const legacyRegistration = registrar.register(legacyId, {
+      onStatus: () => undefined,
+      onDisconnect: () => undefined,
+    });
+    const legacy = forwarded.at(-1)!;
+    assert.equal(legacy.options, undefined, "an ordinary registration forwards no option object");
+    assert.equal(Object.hasOwn(legacyRegistration.bootstrap, "inputOriginFraming"), false,
+      "absence keeps the legacy bootstrap byte-for-byte");
+    legacyRegistration.release();
+
+    // Real manager admission: an opted-in row must reach the actual spawn. An
+    // adapter that dropped the option refuses here before any PTY is created.
+    const manager = newManager(true);
+    const id = await manager.create({ workspace: fixture.workspace });
+    const framing = forwarded.find((entry) => entry.instanceId === id);
+    assert.ok(framing, "the manager registered its row through Main's adapter");
+    assert.deepEqual(framing.options, { inputOriginFraming: true },
+      "the manager's closed request reaches the actual broker unchanged");
+    const spawn = spawned.at(-1);
+    assert.ok(spawn, "the opted-in row spawned its PTY through the manager seam");
+    const bootstrap = JSON.parse(String(spawn.descriptor.env[SESSION_HOST_BOOTSTRAP_ENV])) as Record<string, unknown>;
+    assert.equal(bootstrap.inputOriginFraming, 1,
+      "the mode is present in the one-shot bootstrap before the child exists");
+    assert.equal(bootstrap.token, framing.registration.bootstrap.token);
+
+    // The same real seam without the internal opt-in stays legacy.
+    const defaultManager = newManager(undefined);
+    const legacyRow = await defaultManager.create({ workspace: fixture.workspace });
+    const legacyForward = forwarded.find((entry) => entry.instanceId === legacyRow);
+    assert.ok(legacyForward);
+    assert.equal(legacyForward.options, undefined, "the default manager sends no registration options");
+    const defaultSpawn = spawned.at(-1)!;
+    const defaultBootstrap = JSON.parse(String(defaultSpawn.descriptor.env[SESSION_HOST_BOOTSTRAP_ENV])) as Record<string, unknown>;
+    assert.equal(Object.hasOwn(defaultBootstrap, "inputOriginFraming"), false,
+      "the ordinary manager row keeps the legacy bootstrap and never opts in");
+  } finally {
+    for (const manager of managers) await manager.dispose().catch(() => undefined);
+    await broker.dispose().catch(() => undefined);
+    rmSync(socketRoot, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
   }
 });

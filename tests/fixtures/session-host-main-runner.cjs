@@ -18,6 +18,13 @@
  * adding a terminal listener/writer. It performs no kills and preserves errors. This is authorized test
  * instrumentation of the public API, not a production stub or factory
  * override: production code paths are untouched.
+ *
+ * Internal-opt-in fixture: when PRG_SESSION_HOST_NATIVE_MAIN_INTERNAL_FRAMING
+ * is "1", this runner calls the staged candidate's internal-only
+ * __test.runWithDependencies seam with exactly one MainDependencies override
+ * (`nativeInputOriginFraming: true`). Every other dependency, the broker, the
+ * manager, and every production code path remain the real ones; without the
+ * variable the public runSessionHost(options) entry is used unchanged.
  */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -100,7 +107,11 @@ async function main() {
     installPtyExitObservation(process.env.PRG_SESSION_HOST_NATIVE_MAIN_ENTRY, exitLog,
       process.env.PRG_SESSION_HOST_NATIVE_MAIN_PTY_CONTROL_LOG);
   }
-  const { runSessionHost } = require(process.env.PRG_SESSION_HOST_NATIVE_MAIN_ENTRY);
+  const { runSessionHost, __test } = require(process.env.PRG_SESSION_HOST_NATIVE_MAIN_ENTRY);
+  const internalFraming = process.env.PRG_SESSION_HOST_NATIVE_MAIN_INTERNAL_FRAMING === '1';
+  if (internalFraming && typeof __test?.runWithDependencies !== 'function') {
+    throw new Error('the staged candidate does not expose the internal dependency seam needed for the framing fixture');
+  }
   const before = readControllingTtyState();
   const rawBefore = process.stdin.isRaw;
   const baseline = process.env.PRG_SESSION_HOST_NATIVE_MAIN_BASELINE;
@@ -109,7 +120,9 @@ async function main() {
   let status = 1;
   let threw = false;
   try {
-    status = await runSessionHost(options);
+    status = internalFraming
+      ? await __test.runWithDependencies(options, { nativeInputOriginFraming: true })
+      : await runSessionHost(options);
   } catch {
     threw = true;
   }

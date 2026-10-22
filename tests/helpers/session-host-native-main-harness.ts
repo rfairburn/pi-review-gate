@@ -1597,6 +1597,14 @@ export class MainPtyDriver {
     editorValue: string;
     args?: readonly string[];
     env?: NodeJS.ProcessEnv;
+    /**
+     * Test-only request to supply Main's existing internal
+     * `nativeInputOriginFraming` dependency override. The runner uses the
+     * candidate's internal `__test.runWithDependencies` seam with exactly that
+     * one override; every other production dependency stays real. Absent/false
+     * keeps the public `runSessionHost(options)` entry unchanged.
+     */
+    internalInputOriginFraming?: boolean;
   }): Promise<MainPtyDriver> {
     const stateRoot = join(options.scratchRoot, "native-state");
     // The transport option names an existing directory, not a profile root
@@ -1650,6 +1658,9 @@ export class MainPtyDriver {
       PRG_SESSION_HOST_NATIVE_MAIN_BASELINE: BASELINE,
       PRG_SESSION_HOST_NATIVE_MAIN_PTY_EXIT_LOG: ptyExitLog,
       PRG_SESSION_HOST_NATIVE_MAIN_PTY_CONTROL_LOG: join(options.scratchRoot, "pty-controls.jsonl"),
+      ...(options.internalInputOriginFraming === true
+        ? { PRG_SESSION_HOST_NATIVE_MAIN_INTERNAL_FRAMING: "1" }
+        : {}),
       PI_REVIEW_GATE_CANDIDATE_ENTRY: options.candidate.entry,
       PI_REVIEW_GATE_INSTALLED_AGENT: process.env.PI_REVIEW_GATE_INSTALLED_AGENT,
       PI_REVIEW_GATE_INSTALLED_PI_BIN: process.env.PI_REVIEW_GATE_INSTALLED_PI_BIN,

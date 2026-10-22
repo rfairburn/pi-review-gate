@@ -27,10 +27,17 @@ import {
   type InstanceStatusRegistrationOptions,
   type InstanceStatusUpdate,
   type NativeInstanceView,
+  type NativeViewerClipboardReceipt,
+  type NativeViewerClipboardSink,
+  type NativeViewerInputRefusal,
+  type NativeViewerInputRequest,
+  type NativeViewerInputSource,
   type PtyFactory,
   type StatusRegistrar,
+  type ViewerOpenOptions,
 } from "../src/session-host/instances";
 import { ProfileRegistry } from "../src/session-host/profiles";
+import { translateInput } from "../src/session-host/input";
 import {
   admitSavedSession,
   listSavedSessions,
@@ -39,9 +46,14 @@ import {
 import { SESSION_HOST_BOOTSTRAP_ENV, composeFreshSessionSpawnArgs, prepareNativeLaunch } from "../src/session-host/launch";
 import {
   createNativeInputDecoder,
+  type NativeInputDecoder,
   type NativeInputFragment,
   type NativeInputOrigin,
 } from "../src/session-host/native-input-origin";
+import {
+  encodeNativeClipboardOriginCapsule,
+  type NativeClipboardEvent,
+} from "../src/session-host/native-clipboard";
 import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "../src/session-host/startup-request";
 import { readSessionHostPayloadSync } from "../src/session-host/payload";
 import { TerminalSurface } from "../src/session-host/terminal-surface";
@@ -54,6 +66,7 @@ import type {
   StatusRenameResult,
   StatusShutdownResult,
 } from "../src/session-host/broker";
+import type { SessionHostBootstrap } from "../src/session-host/protocol";
 import activateReporter, {
   beginSessionHostRestore,
   completeSessionHostRestore,
@@ -3881,7 +3894,10 @@ interface FramingHarness {
   callerEnv: NodeJS.ProcessEnv;
 }
 
-function makeFramingHarness(label: string, options: { framing?: boolean } = {}): FramingHarness {
+function makeFramingHarness(
+  label: string,
+  options: { framing?: boolean; onNativeClipboard?: (instanceId: string, event: NativeClipboardEvent) => void } = {},
+): FramingHarness {
   const root = makeTestRoot(label);
   const pkg = makePackageFixture(root);
   const home = join(root, "home");
@@ -3914,6 +3930,7 @@ function makeFramingHarness(label: string, options: { framing?: boolean } = {}):
       return pty;
     },
     ...(options.framing === undefined ? {} : { nativeInputOriginFraming: options.framing }),
+    ...(options.onNativeClipboard === undefined ? {} : { onNativeClipboard: options.onNativeClipboard }),
   });
   return { root, workspace, packageRoot: pkg.packageRoot, piExecutable: pkg.piExecutable, registrar, spawned, manager, callerEnv };
 }
@@ -4300,6 +4317,647 @@ test("framing input survives a large paste and multibyte boundaries as one conti
     const rejoined = Buffer.concat(fragments.map((fragment) => fragment.payload)).toString("utf8");
     assert.equal(rejoined, paste, "payload bytes are preserved exactly across fragment boundaries");
     assert.deepEqual(fragments[0]?.origin, { kind: "local" });
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Strict same-manager viewer input boundary (#481 interactive path): the manager
+// owns every input fact and the one PTY write; a host-minted scope token describes
+// those facts and is never a grant.
+//
+// IMPORTANT EVIDENCE SCOPE: these cases use the same synthetic PTYs, synthetic
+// registrar, and real TerminalSurface as the framing cases above. They prove the
+// host-side contract only — what may become an input source, which current facts
+// every write is fenced on, that every refusal happens before any byte reaches the
+// child, and that an authenticated viewer-origin copy is delivered to exactly the
+// viewer whose token named it. They make no claim about a real PTY, a real native
+// child, a browser viewer, a transport, or any physical clipboard, and nothing here
+// enables network input: no listener, socket, or activation exists in this seam.
+// ---------------------------------------------------------------------------
+
+const VIEWER_HOST_RUN = "11111111-2222-4333-8444-555555555555";
+const VIEWER_SESSION = "conversation-viewer-input";
+
+/** One viewer's own copy sink plus the receipts it received, in arrival order. */
+function viewerSink(): { receipts: NativeViewerClipboardReceipt[]; sink: NativeViewerClipboardSink } {
+  const receipts: NativeViewerClipboardReceipt[] = [];
+  return { receipts, sink: (receipt) => { receipts.push(receipt); } };
+}
+
+/**
+ * Register one surface with EXACTLY the given open options and nothing else, so a
+ * half-bound surface really is half-bound: a sink is never supplied on the caller's
+ * behalf, and an omitted option stays omitted.
+ */
+function openSurface(manager: InstanceManager, options?: ViewerOpenOptions): string {
+  const state = manager.openViewer(options);
+  assert.ok(state, "a live manager registers the surface");
+  return state.viewerId;
+}
+
+/** One fully bound surface: its own copy sink, the receipts it took, its own id. */
+function boundSurface(manager: InstanceManager): {
+  viewerId: string;
+  receipts: NativeViewerClipboardReceipt[];
+} {
+  const own = viewerSink();
+  const viewerId = openSurface(manager, { hostRunId: VIEWER_HOST_RUN, nativeClipboardSink: own.sink });
+  return { viewerId, receipts: own.receipts };
+}
+
+/** Point one registered surface at a row. */
+function displayRow(manager: InstanceManager, viewerId: string, rowId: string): void {
+  const applied = manager.updateViewer(viewerId, { sessionId: rowId, cols: 80, rows: 24 });
+  assert.equal(applied.applied, true, JSON.stringify(applied));
+}
+
+/** Report the row's current native conversation the way its live client would. */
+function reportConversation(row: FramingRow, sessionId: string, epoch: number): void {
+  row.entry.handlers.onStatus({
+    busy: false, pendingInput: false, inputSurface: false, activity: [],
+    nativeSession: { sessionId, epoch, name: `Viewer ${epoch}` },
+  });
+}
+
+/** A complete, well-formed request built from the caller's own observations. */
+function viewerRequest(
+  manager: InstanceManager, rowId: string, source: NativeViewerInputSource, data: string,
+): NativeViewerInputRequest {
+  const modes = manager.surface(rowId)?.inputModes();
+  assert.ok(modes, "a live row exposes its own input modes");
+  return { expectedSource: source, expectedInputModes: modes, data };
+}
+
+/**
+ * Framed dispatches are an ORDERED stream for one registration: a later frame
+ * cannot be decoded by a restarted decoder. One decoder per row consumes every
+ * framed write in order and remembers the fragments of the last one.
+ */
+interface ViewerFrameStream {
+  readonly decoder: NativeInputDecoder;
+  next: number;
+  last: readonly NativeInputFragment[];
+}
+const viewerFrameStreams = new WeakMap<FramingRow, ViewerFrameStream>();
+
+function readViewerFrames(row: FramingRow): readonly NativeInputFragment[] {
+  let stream = viewerFrameStreams.get(row);
+  if (stream === undefined) {
+    stream = { decoder: createNativeInputDecoder(row.bootstrap), next: 0, last: [] };
+    viewerFrameStreams.set(row, stream);
+  }
+  while (stream.next < row.pty.writes.length) {
+    const write = row.pty.writes[stream.next++];
+    if (typeof write !== "string" || !write.startsWith("prg-ni-v1;")) continue;
+    const fed = stream.decoder.feed(write);
+    assert.equal(fed.ok, true,
+      `this registration decodes its own framing in order: ${fed.ok ? "" : fed.code}`);
+    const closed = stream.decoder.finish();
+    assert.equal(closed.ok, true, "one host write is one complete logical dispatch");
+    stream.last = fed.fragments;
+  }
+  return stream.last;
+}
+
+/** The one dispatch the most recent framed write produced. */
+function lastViewerFrame(row: FramingRow): {
+  text: string;
+  origin: NativeInputOrigin;
+  tuple: { sessionId: string; epoch: number } | undefined;
+} {
+  const fragments = readViewerFrames(row);
+  assert.equal(fragments.length, 1, "the accepted write left exactly one framed fragment");
+  const fragment = fragments[0]!;
+  return {
+    text: fragment.payload.toString("utf8"),
+    origin: fragment.origin,
+    tuple: fragment.expectedNativeTuple === undefined ? undefined : { ...fragment.expectedNativeTuple },
+  };
+}
+
+/** One authenticated v2 copy capsule from this row's own child bridge. */
+function originCapsule(
+  row: FramingRow, sequence: number, event: NativeClipboardEvent,
+  input: { origin: { kind: "local" } | { kind: "viewer"; token: string }; dispatchId: number },
+): string {
+  return encodeNativeClipboardOriginCapsule(
+    row.bootstrap as SessionHostBootstrap, sequence, event, input,
+  );
+}
+
+const copyEvent = (text: string, sessionId: string, sessionEpoch: number): NativeClipboardEvent => ({
+  kind: "copy", encoded: Buffer.from(text, "utf8").toString("base64"), sessionId, sessionEpoch,
+});
+const copiedText = (event: NativeClipboardEvent): string => Buffer.from(
+  event.kind === "copy" ? event.encoded : "", "base64",
+).toString("utf8");
+
+test("a viewer input source exists only for a bound surface on a ready framed row with a known conversation", async () => {
+  const harness = makeFramingHarness("viewer-source", { framing: true });
+  try {
+    const row = await createFramingRow(harness);
+    // Exactly the four bindings under test: no options at all, a sink with no run
+    // identity, a run identity with no sink, and a fully bound surface.
+    const plain = openSurface(harness.manager);
+    const unbound = openSurface(harness.manager, { nativeClipboardSink: viewerSink().sink });
+    const runOnly = openSurface(harness.manager, { hostRunId: VIEWER_HOST_RUN });
+    const bound = boundSurface(harness.manager);
+
+    // A surface that displays nothing is not an input source.
+    assert.equal(harness.manager.readViewerInputSource(bound.viewerId), undefined,
+      "a surface showing no row has no scope");
+    assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId, {
+      expectedSource: {} as NativeViewerInputSource, expectedInputModes: {} as never, data: "x",
+    }), { status: "refused", reason: "invalid-input" },
+    "a malformed request is refused before any fact is read");
+
+    displayRow(harness.manager, bound.viewerId, row.id);
+    assert.equal(harness.manager.readViewerInputSource(bound.viewerId), undefined,
+      "readiness was never verified on this row");
+    await markReady(harness, row);
+    assert.equal(harness.manager.readViewerInputSource(bound.viewerId), undefined,
+      "an unknown native conversation is never guessed into a scope");
+
+    reportConversation(row, VIEWER_SESSION, 3);
+    const source = harness.manager.readViewerInputSource(bound.viewerId);
+    assert.ok(source, "a bound surface on a ready framed row with a known conversation has a scope");
+    const geometry = harness.manager.instanceGeometry(row.id);
+    assert.ok(geometry, "a row with a viewer has canonical geometry");
+    assert.deepEqual(source, {
+      hostRunId: VIEWER_HOST_RUN,
+      viewerId: bound.viewerId,
+      viewerRevision: 2,
+      rowId: row.id,
+      nativeSession: { sessionId: VIEWER_SESSION, epoch: 3 },
+      geometry: { cols: geometry.cols, rows: geometry.rows, revision: geometry.revision },
+      registrationIdentity: row.bootstrap.instanceId,
+      registrationGeneration: row.bootstrap.generation,
+      sourceToken: source!.sourceToken,
+    });
+    assert.match(source!.sourceToken, /^nvs1\./);
+    assert.ok(Object.isFrozen(source));
+    assert.ok(Object.isFrozen(source!.nativeSession));
+    assert.ok(Object.isFrozen(source!.geometry));
+    assert.equal(source!.sourceToken.includes(row.bootstrap.token), false,
+      "the scope token never carries the registration secret");
+    // Reading is a pure fact read: nothing was written, resized, spawned, or armed.
+    assert.deepEqual(row.pty.writes, [], "reading a source touched no child");
+    assert.deepEqual(row.pty.killSignals, []);
+    assert.equal(harness.spawned.length, 1);
+
+    // The published viewer facts stay exactly what they were: no new public field,
+    // no second viewer store, and the run identity and sink stay host-side.
+    const published = harness.manager.viewerState(bound.viewerId);
+    assert.deepEqual(Object.keys(published!).sort(), ["cols", "revision", "rows", "sessionId", "viewerId"]);
+    assert.equal(JSON.stringify(published).includes(VIEWER_HOST_RUN), false);
+    assert.equal(JSON.stringify(harness.manager.sessionViewers(row.id)).includes(VIEWER_HOST_RUN), false);
+
+    // An unbound or half-bound surface is never an input source, and neither is an
+    // unknown id. Each refusal is truthful and writes nothing.
+    const liveRequest = viewerRequest(harness.manager, row.id, source!, "x");
+    for (const viewerId of [plain, unbound, runOnly]) {
+      assert.deepEqual(harness.manager.writeViewerInput(viewerId, liveRequest),
+        { status: "refused", reason: "no-input-source" },
+        "a surface without this host's run identity AND its own sink has no input path");
+    }
+    assert.deepEqual(harness.manager.writeViewerInput("viewer-never-registered", liveRequest),
+      { status: "refused", reason: "unknown-viewer" });
+    assert.deepEqual(row.pty.writes, [], "every refusal above left the child untouched");
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a malformed viewer request, options object, or surface is refused without touching any state", async () => {
+  const harness = makeFramingHarness("viewer-request-shape", { framing: true });
+  try {
+    const row = await createFramingRow(harness);
+    await markReady(harness, row);
+    reportConversation(row, VIEWER_SESSION, 1);
+    const bound = boundSurface(harness.manager);
+    displayRow(harness.manager, bound.viewerId, row.id);
+    const source = harness.manager.readViewerInputSource(bound.viewerId);
+    assert.ok(source);
+    const modes = harness.manager.surface(row.id)!.inputModes();
+    const good = { expectedSource: source, expectedInputModes: modes, data: "ls\r" };
+    assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId, good), { status: "submitted" });
+    const writes = row.pty.writes.length;
+
+    for (const bad of [
+      undefined, null, 7, "ls\r", [],
+      { expectedSource: source, expectedInputModes: modes },
+      { expectedSource: source, expectedInputModes: modes, data: "" },
+      { expectedSource: source, expectedInputModes: modes, data: 5 },
+      { expectedSource: source, expectedInputModes: modes, data: Buffer.alloc(0) },
+      { expectedSource: source, expectedInputModes: modes, data: Uint8Array.of(0x41) },
+      { expectedSource: source, expectedInputModes: modes, data: "x", extra: 1 },
+      { expectedInputModes: modes, data: "x" },
+      { expectedSource: { ...source, extra: 1 }, expectedInputModes: modes, data: "x" },
+      { expectedSource: { ...source, sourceToken: "" }, expectedInputModes: modes, data: "x" },
+      { expectedSource: { ...source, hostRunId: "" }, expectedInputModes: modes, data: "x" },
+      { expectedSource: { ...source, nativeSession: { sessionId: VIEWER_SESSION } }, expectedInputModes: modes, data: "x" },
+      { expectedSource: { ...source, nativeSession: { sessionId: VIEWER_SESSION, epoch: 0 } }, expectedInputModes: modes, data: "x" },
+      { expectedSource: { ...source, geometry: { cols: 0, rows: 24, revision: 0 } }, expectedInputModes: modes, data: "x" },
+      { expectedSource: source, expectedInputModes: { ...modes, bracketedPaste: "yes" }, data: "x" },
+      { expectedSource: source, expectedInputModes: { ...modes, mouseTracking: "packet" }, data: "x" },
+      { expectedSource: source, expectedInputModes: { ...modes, kittyFlags: 9 }, data: "x" },
+      { expectedSource: source, expectedInputModes: { ...modes, extra: 1 }, data: "x" },
+    ]) {
+      assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId, bad as unknown as NativeViewerInputRequest),
+        { status: "refused", reason: "invalid-input" }, `${JSON.stringify(bad)} is not a closed request`);
+    }
+    assert.equal(row.pty.writes.length, writes, "a malformed request never reached the child");
+
+    // A well-formed mode object that simply is not the row's current mode is a
+    // FRESHNESS refusal, and stays distinguishable from a shape refusal.
+    assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId, {
+      expectedSource: source, expectedInputModes: { ...modes, bracketedPaste: !modes.bracketedPaste }, data: "x",
+    }), { status: "refused", reason: "stale-input-modes" },
+    "another input mode is stale evidence, not a malformed request");
+    assert.equal(row.pty.writes.length, writes, "a stale mode observation wrote nothing");
+
+    // A closed options object is the only shape a surface may register with.
+    for (const bad of [{ extra: 1 }, { sink: () => undefined }, "bound", 7, null]) {
+      assert.throws(() => harness.manager.openViewer(bad as never), /closed options object/);
+    }
+    assert.throws(() => harness.manager.openViewer({ hostRunId: "has space" } as never), /bounded printable text/);
+    assert.throws(() => harness.manager.openViewer({ hostRunId: "r".repeat(200) } as never), /bounded printable text/);
+    assert.throws(() => harness.manager.openViewer({ nativeClipboardSink: "sink" } as never), /must be a function/);
+    assert.equal(harness.manager.sessionViewers(row.id).length, 1, "a refused registration created no surface");
+    assert.equal(row.pty.writes.length, writes, "a refused registration wrote nothing");
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("every viewer write is fenced on the manager's current facts and refuses before any byte", async () => {
+  const harness = makeFramingHarness("viewer-fence", { framing: true });
+  try {
+    const row = await createFramingRow(harness);
+    row.pty.exitsOnSignal = "none";
+    await markReady(harness, row);
+    reportConversation(row, VIEWER_SESSION, 4);
+    const bound = boundSurface(harness.manager);
+    displayRow(harness.manager, bound.viewerId, row.id);
+    const source = harness.manager.readViewerInputSource(bound.viewerId);
+    assert.ok(source);
+    const modes = harness.manager.surface(row.id)!.inputModes();
+    const request = (data: string): NativeViewerInputRequest =>
+      ({ expectedSource: source, expectedInputModes: modes, data });
+
+    // The admitted write frames with the viewer origin and the CURRENT conversation
+    // as the child-side fence, verified here by an independent decoder.
+    assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId, request("ls\r")), { status: "submitted" });
+    let admitted = row.pty.writes.length;
+    assert.equal(admitted, 1, "the admitted write is the only write this child has taken");
+    const frame = lastViewerFrame(row);
+    assert.equal(frame.text, "ls\r", "the payload travels exactly as given");
+    assert.deepEqual(frame.origin, { kind: "viewer", token: source.sourceToken });
+    assert.deepEqual(frame.tuple, { sessionId: VIEWER_SESSION, epoch: 4 });
+
+    const refuse = (reason: NativeViewerInputRefusal, label: string): void => {
+      assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId, request("stale bytes")),
+        { status: "refused", reason }, label);
+      assert.equal(row.pty.writes.length, admitted, `${label}: nothing reached the child`);
+    };
+
+    // The same bytes mean something else in another mode: the modes the caller
+    // observed must still be the modes the row is in.
+    await deliver(harness, row, "\x1b[?2004h");
+    assert.notEqual(harness.manager.surface(row.id)!.inputModes().bracketedPaste, modes.bracketedPaste,
+      "the row really changed input mode");
+    refuse("stale-input-modes", "bytes made for another input mode are refused");
+    const freshModes = harness.manager.surface(row.id)!.inputModes();
+    assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId,
+      { expectedSource: source, expectedInputModes: freshModes, data: "ok\r" }), { status: "submitted" },
+    "the mode fence is a freshness check, never a blanket refusal");
+    admitted = row.pty.writes.length;
+    assert.equal(admitted, 2, "the freshness check admitted exactly one more dispatch");
+    assert.deepEqual(readViewerFrames(row).map((fragment) => fragment.payload.toString("utf8")), ["ok\r"],
+      "the second dispatch decodes in stream order, never with a restarted decoder");
+
+    // A newer native conversation (an in-child /new or /resume) invalidates it.
+    reportConversation(row, VIEWER_SESSION, 5);
+    refuse("stale-source", "a newer native epoch is not the observed conversation");
+    // An unknown conversation is never guessed back into existence.
+    row.entry.handlers.onStatus({
+      busy: false, pendingInput: false, inputSurface: false, activity: [], nativeSession: null,
+    });
+    refuse("unknown-native-tuple", "an unknown conversation has no scope");
+    reportConversation(row, VIEWER_SESSION, 6);
+    refuse("stale-source", "a different session id is not the observed conversation");
+
+    // An ABA geometry change still describes a newer canonical geometry.
+    const geometryBefore = geometryOf(harness, row);
+    assert.deepEqual(source.geometry, { cols: geometryBefore.cols, rows: geometryBefore.rows, revision: geometryBefore.revision },
+      "the source stated the row's canonical geometry at read time");
+    assert.equal(harness.manager.updateViewer(bound.viewerId, { cols: 90, rows: 30 }).applied, true);
+    assert.equal(harness.manager.updateViewer(bound.viewerId, { cols: 80, rows: 24 }).applied, true);
+    const geometryAfter = geometryOf(harness, row);
+    assert.deepEqual([geometryAfter.cols, geometryAfter.rows], [geometryBefore.cols, geometryBefore.rows],
+      "the row came back to the same size");
+    assert.ok(geometryAfter.revision > geometryBefore.revision, "at a strictly newer geometry revision");
+    refuse("stale-source", "an ABA geometry change is stale");
+
+    // A source cannot be pointed at another run, viewer, row, or token.
+    for (const forged of [
+      { ...source, hostRunId: "11111111-9999-8888-7777-666666666666" },
+      { ...source, viewerId: "viewer-someone-else" },
+      { ...source, viewerRevision: 99 },
+      { ...source, rowId: "row-someone-else" },
+      { ...source, registrationIdentity: "99999999-9999-9999-9999-999999999999" },
+      { ...source, registrationGeneration: "88888888-8888-8888-8888-888888888888" },
+      { ...source, nativeSession: { sessionId: VIEWER_SESSION, epoch: 4 } },
+      { ...source, geometry: { cols: 80, rows: 24, revision: 0 } },
+      { ...source, sourceToken: `${source.sourceToken.slice(0, -1)}${source.sourceToken.endsWith("0") ? "1" : "0"}` },
+    ]) {
+      assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId,
+        { expectedSource: forged, expectedInputModes: freshModes, data: "x" }),
+      { status: "refused", reason: "stale-source" }, `${JSON.stringify(forged)} is not the current scope`);
+    }
+    assert.equal(row.pty.writes.length, admitted, "a forged source never reached the child");
+
+    // Displaying no row is not an input path, and an unconfirmed Stop closes it
+    // while the child is still running and still owned.
+    assert.equal(harness.manager.updateViewer(bound.viewerId, { sessionId: null }).applied, true);
+    refuse("row-unavailable", "a surface displaying no row has no input path");
+    assert.equal(harness.manager.updateViewer(bound.viewerId, { sessionId: row.id }).applied, true);
+    const stopping = harness.manager.stop(row.id, { confirmed: true });
+    void stopping.catch(() => undefined);
+    await until(() => row.pty.killSignals.length > 0, "the owned stop signalled its child");
+    refuse("row-unavailable", "an unresolved stop closes the viewer input path too");
+    assert.equal(row.entry.released, false, "the refusal never dropped ownership");
+
+    // Once the child really exits, the surface's participation ends with the row.
+    row.pty.emitExit(0);
+    await until(() => row.entry.released, "the confirmed exit released the registration");
+    refuse("row-unavailable", "a finished row has no input path");
+
+    // Disposal closes the seam for every surface, ready or not.
+    await harness.manager.dispose();
+    assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId, request("x")),
+      { status: "refused", reason: "disposed" });
+    assert.equal(harness.manager.readViewerInputSource(bound.viewerId), undefined);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+function geometryOf(harness: FramingHarness, row: FramingRow): { cols: number; rows: number; revision: number } {
+  const geometry = harness.manager.instanceGeometry(row.id);
+  assert.ok(geometry, "the row still has canonical geometry");
+  return geometry;
+}
+
+test("a viewer-origin copy reaches exactly the viewer whose input caused it", async () => {
+  const routed: { instanceId: string; event: NativeClipboardEvent }[] = [];
+  const harness = makeFramingHarness("viewer-copy", {
+    framing: true,
+    onNativeClipboard: (instanceId, event) => { routed.push({ instanceId, event }); },
+  });
+  try {
+    const row = await createFramingRow(harness);
+    await markReady(harness, row);
+    reportConversation(row, VIEWER_SESSION, 2);
+    const a = boundSurface(harness.manager);
+    const b = boundSurface(harness.manager);
+    const sibling = boundSurface(harness.manager);
+    for (const viewer of [a, b, sibling]) displayRow(harness.manager, viewer.viewerId, row.id);
+    const sourceA = harness.manager.readViewerInputSource(a.viewerId);
+    const sourceB = harness.manager.readViewerInputSource(b.viewerId);
+    assert.ok(sourceA && sourceB);
+    assert.notEqual(sourceA.sourceToken, sourceB.sourceToken, "each surface commits to its own scope");
+
+    // A copy for B's dispatch arrives first, then the older copy for A's dispatch:
+    // each lands on its own sink with its own dispatch id and origin.
+    await deliver(harness, row, capsuleOsc(originCapsule(row, 1,
+      copyEvent("copied by B", VIEWER_SESSION, 2), { origin: { kind: "viewer", token: sourceB.sourceToken }, dispatchId: 7 })));
+    assert.deepEqual(b.receipts.map((receipt) => [copiedText(receipt.event), receipt.dispatchId, receipt.source.sourceToken]),
+      [["copied by B", 7, sourceB.sourceToken]]);
+    assert.deepEqual([...a.receipts], [], "a copy is never attributed to the most recent viewer");
+    assert.deepEqual(sibling.receipts, [], "a copy is never broadcast to a sibling surface");
+    assert.deepEqual(routed, [], "a viewer copy never takes the owner's local clipboard route");
+
+    await deliver(harness, row, capsuleOsc(originCapsule(row, 2,
+      copyEvent("copied by A", VIEWER_SESSION, 2), { origin: { kind: "viewer", token: sourceA.sourceToken }, dispatchId: 3 })));
+    assert.deepEqual(a.receipts.map((receipt) => [copiedText(receipt.event), receipt.dispatchId]),
+      [["copied by A", 3]], "the initiating viewer gets its own copy, in whatever order it arrives");
+    assert.equal(b.receipts.length, 1);
+    const receipt = a.receipts[0]!;
+    assert.deepEqual(Object.keys(receipt).sort(), ["dispatchId", "event", "source"]);
+    assert.ok(Object.isFrozen(receipt) && Object.isFrozen(receipt.event) && Object.isFrozen(receipt.source));
+    assert.deepEqual(receipt.source, sourceA, "the receipt restates the exact scope that caused the copy");
+    assert.deepEqual(routed, []);
+
+    // Anything the token does not vouch for delivers nothing anywhere.
+    const closedToken = sourceB.sourceToken;
+    assert.equal(harness.manager.closeViewer(b.viewerId), true);
+    await deliver(harness, row, capsuleOsc(originCapsule(row, 3,
+      copyEvent("after close", VIEWER_SESSION, 2), { origin: { kind: "viewer", token: closedToken }, dispatchId: 8 })));
+    assert.deepEqual(routed, [], "a retired surface gets nothing, and nothing falls back to the owner");
+    assert.equal(a.receipts.length, 1);
+
+    // A newer surface revision invalidates a token minted for the older one.
+    assert.equal(harness.manager.updateViewer(a.viewerId, { cols: 90, rows: 30 }).applied, true);
+    await deliver(harness, row, capsuleOsc(originCapsule(row, 4,
+      copyEvent("stale revision", VIEWER_SESSION, 2), { origin: { kind: "viewer", token: sourceA.sourceToken }, dispatchId: 9 })));
+    assert.equal(a.receipts.length, 1, "a stale scope token delivers nothing");
+
+    // A stale conversation, a foreign or uncanonical token, and a surface with no
+    // sink are all dropped quietly — never re-attributed, never broadcast.
+    const siblingToken = harness.manager.readViewerInputSource(sibling.viewerId)!.sourceToken;
+    for (const [sequence, input] of [
+      [5, { origin: { kind: "viewer", token: siblingToken }, dispatchId: 10, event: copyEvent("wrong conversation", VIEWER_SESSION, 1) }],
+      [6, { origin: { kind: "viewer", token: "nvs1.viewer-nobody.00000000000000000000000000000000" }, dispatchId: 11, event: copyEvent("nobody", VIEWER_SESSION, 2) }],
+      [7, { origin: { kind: "viewer", token: "peer-token-1" }, dispatchId: 12, event: copyEvent("uncanonical", VIEWER_SESSION, 2) }],
+      [8, { origin: { kind: "viewer", token: `nvs1.${sibling.viewerId}.00000000000000000000000000000000` }, dispatchId: 13, event: copyEvent("forged", VIEWER_SESSION, 2) }],
+    ] as const) {
+      await deliver(harness, row, capsuleOsc(originCapsule(row, sequence, input.event, {
+        origin: input.origin, dispatchId: input.dispatchId,
+      })));
+    }
+    assert.deepEqual(routed, [], "none of those became a local copy");
+    assert.equal(sibling.receipts.length, 0, "a forged commitment never opens a sink");
+    assert.equal(a.receipts.length, 1);
+
+    // A surface with no sink of its own is never a copy destination, and a sink
+    // that refuses cannot break the row or push the copy somewhere else.
+    const grumpy = harness.manager.openViewer({
+      hostRunId: VIEWER_HOST_RUN,
+      nativeClipboardSink: () => { throw new Error("the viewer refused"); },
+    });
+    assert.ok(grumpy);
+    displayRow(harness.manager, grumpy!.viewerId, row.id);
+    const grumpySource = harness.manager.readViewerInputSource(grumpy!.viewerId);
+    assert.ok(grumpySource, "a bound surface with its own sink is a source even if that sink refuses");
+    await deliver(harness, row, capsuleOsc(originCapsule(row, 9,
+      copyEvent("refused copy", VIEWER_SESSION, 2), { origin: { kind: "viewer", token: grumpySource.sourceToken }, dispatchId: 14 })));
+    assert.equal(viewFor(harness.manager, row.id).lifecycle, "alive", "a throwing sink cannot break the row");
+    assert.deepEqual(routed, [], "a refused viewer copy never escapes to the owner's route");
+    assert.equal(a.receipts.length, 1, "and it never lands on another viewer instead");
+
+    // A local receipt still travels ONLY the unchanged local route, and the exit
+    // fence closes both routes.
+    const localEvent = copyEvent("owner copy", VIEWER_SESSION, 2);
+    await deliver(harness, row, capsuleOsc(originCapsule(row, 10, localEvent, { origin: { kind: "local" }, dispatchId: 15 })));
+    assert.deepEqual(routed, [{ instanceId: row.id, event: localEvent }],
+      "the owner's local route is unchanged and stays the only destination for a local receipt");
+    assert.equal(a.receipts.length, 1, "a local receipt never becomes a viewer copy");
+
+    row.pty.emitExit(0);
+    await deliver(harness, row, capsuleOsc(originCapsule(row, 11,
+      copyEvent("after exit", VIEWER_SESSION, 2), { origin: { kind: "viewer", token: sourceA.sourceToken }, dispatchId: 16 })));
+    assert.equal(a.receipts.length, 1, "an exited row delivers nothing at all");
+    assert.equal(routed.length, 1);
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("the viewer input seam is closed on a legacy row and never changes local or protocol bytes", async () => {
+  const harness = makeFramingHarness("viewer-legacy-closed");
+  try {
+    const row = await createFramingRow(harness);
+    reportConversation(row, VIEWER_SESSION, 1);
+    const bound = boundSurface(harness.manager);
+    displayRow(harness.manager, bound.viewerId, row.id);
+    const modes = harness.manager.surface(row.id)!.inputModes();
+    assert.equal(harness.manager.readViewerInputSource(bound.viewerId), undefined,
+      "a legacy row is never an input source, ready or not");
+    assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId, {
+      expectedSource: {
+        hostRunId: VIEWER_HOST_RUN, viewerId: bound.viewerId, viewerRevision: 2, rowId: row.id,
+        nativeSession: { sessionId: VIEWER_SESSION, epoch: 1 },
+        geometry: { cols: 80, rows: 24, revision: 0 },
+        registrationIdentity: row.bootstrap.instanceId, registrationGeneration: row.bootstrap.generation,
+        sourceToken: "nvs1.aaaa.00000000000000000000000000000000",
+      },
+      expectedInputModes: modes, data: "ls\r",
+    }), { status: "refused", reason: "input-unready" },
+    "an unframed child is never typed into with framing text or raw viewer bytes");
+    assert.deepEqual(row.pty.writes, [], "a refused viewer write put nothing in the legacy child");
+
+    // Local input on that same legacy row is still the unchanged raw forward.
+    harness.manager.write(row.id, "ls -la\r");
+    harness.manager.write(row.id, Buffer.from([0x1b, 0x5b, 0x41]));
+    assert.deepEqual(row.pty.writes, ["ls -la\r", Buffer.from([0x1b, 0x5b, 0x41])]);
+    // The no-argument registration and its published facts are unchanged.
+    const plain = harness.manager.openViewer();
+    assert.deepEqual(Object.keys(plain!).sort(), ["cols", "revision", "rows", "sessionId", "viewerId"]);
+    assert.equal(plain!.revision, 1);
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+
+  // On a framed row, the two pre-existing write sources keep their exact dispatch
+  // shape: no expected native tuple, no new key, no viewer origin.
+  const framing = makeFramingHarness("viewer-local-shape", { framing: true });
+  try {
+    const row = await createFramingRow(framing);
+    await markReady(framing, row);
+    reportConversation(row, VIEWER_SESSION, 1);
+    framing.manager.write(row.id, "local keys");
+    const localFrame = readViewerFrames(row);
+    assert.equal(localFrame.length, 1);
+    assert.deepEqual(localFrame[0]!.origin, { kind: "local" });
+    assert.equal(Object.hasOwn(localFrame[0]!, "expectedNativeTuple"), true);
+    assert.equal(localFrame[0]!.expectedNativeTuple, undefined,
+      "a local dispatch keeps its unchanged body: the fence is viewer-only");
+    assert.equal((row.pty.writes.at(-1) as string).split(";").length, 5, "the frame header shape is unchanged");
+
+    await deliver(framing, row, "\x1b[>7u\x1b[?u");
+    const reply = readViewerFrames(row);
+    assert.deepEqual(reply[0]!.origin, { kind: "none" }, "a protocol reply still carries no user origin");
+    assert.equal(reply[0]!.expectedNativeTuple, undefined);
+    assert.equal(viewFor(framing.manager, row.id).lifecycle, "alive");
+    await disposeFramingHarness(framing);
+  } finally {
+    rmSync(framing.root, { recursive: true, force: true });
+  }
+});
+
+test("a strict viewer input preserves translated legacy mouse bytes without UTF-8 conversion", async () => {
+  const harness = makeFramingHarness("viewer-native-mouse", { framing: true });
+  try {
+    const row = await createFramingRow(harness);
+    await markReady(harness, row);
+    reportConversation(row, VIEWER_SESSION, 1);
+    const bound = boundSurface(harness.manager);
+    assert.equal(harness.manager.updateViewer(bound.viewerId, {
+      sessionId: row.id, cols: 240, rows: 200,
+    }).applied, true);
+    row.pty.emitData("\x1b[?1000h\x1b[?1006l");
+    await harness.manager.surface(row.id)!.flush();
+    const source = harness.manager.readViewerInputSource(bound.viewerId);
+    assert.ok(source);
+    const modes = harness.manager.surface(row.id)!.inputModes();
+    assert.equal(modes.mouseTracking, "vt200");
+    assert.equal(modes.mouseEncoding, "default");
+    const native = translateInput("\x1b[<0;170;170M", modes, {
+      column: 0, row: 0, cols: source.geometry.cols, rows: source.geometry.rows,
+    });
+    assert.ok(Buffer.isBuffer(native), "the native translator returns byte-oriented X10");
+    assert.deepEqual([...native], [0x1b, 0x5b, 0x4d, 32, 202, 202]);
+    const before = row.pty.writes.length;
+    assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId, {
+      expectedSource: source, expectedInputModes: modes, data: native,
+    }), { status: "submitted" });
+    assert.equal(row.pty.writes.length, before + 1);
+    const framed = row.pty.writes.at(-1);
+    assert.ok(typeof framed === "string", "viewer bytes travel as authenticated framing, never raw mouse bytes");
+    const fragments = decodeFramedWrite(row.bootstrap, framed);
+    assert.equal(fragments.length, 1);
+    assert.deepEqual(fragments[0]!.payload, native, "high-bit native mouse bytes are not UTF-8 re-encoded");
+    assert.deepEqual(fragments[0]!.origin, { kind: "viewer", token: source.sourceToken });
+    assert.deepEqual(fragments[0]!.expectedNativeTuple, { sessionId: VIEWER_SESSION, epoch: 1 });
+  } finally {
+    try {
+      await disposeFramingHarness(harness);
+    } finally {
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a conversation identity outside ASCII is still a viewer input source and still frames", async () => {
+  const harness = makeFramingHarness("viewer-identity-domain", { framing: true });
+  try {
+    const row = await createFramingRow(harness);
+    await markReady(harness, row);
+    const bound = boundSurface(harness.manager);
+    displayRow(harness.manager, bound.viewerId, row.id);
+
+    const scopes: string[] = [];
+    // Both identities are valid protocol conversation IDs — opaque text bounded in
+    // UTF-8 bytes — so neither may lose the row its input source.
+    for (const { sessionId, epoch } of [
+      { sessionId: "conversation-雪", epoch: 1 },
+      { sessionId: "n".repeat(256), epoch: 2 },
+    ]) {
+      reportConversation(row, sessionId, epoch);
+      const source = harness.manager.readViewerInputSource(bound.viewerId);
+      assert.ok(source, `a valid conversation identity describes a scope (${sessionId.length} chars)`);
+      assert.deepEqual(source.nativeSession, { sessionId, epoch });
+      const modes = harness.manager.surface(row.id)!.inputModes();
+      assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId,
+        { expectedSource: source, expectedInputModes: modes, data: "x" }), { status: "submitted" },
+      "input is admitted for a conversation whose identity is not ASCII");
+      const frame = lastViewerFrame(row);
+      assert.deepEqual(frame.tuple, { sessionId, epoch }, "the child is told this exact conversation");
+      assert.equal(frame.text, "x", "the payload travels unchanged");
+      const raw = row.pty.writes.at(-1) as string;
+      assert.equal(/[\u0080-\uffff]/.test(raw), false, "the framed bytes stay ASCII");
+      scopes.push(source.sourceToken);
+    }
+    assert.notEqual(scopes[0], scopes[1], "each conversation identity commits to its own scope");
+    assert.equal(viewFor(harness.manager, row.id).lifecycle, "alive");
     await disposeFramingHarness(harness);
   } finally {
     rmSync(harness.root, { recursive: true, force: true });

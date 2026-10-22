@@ -11,13 +11,18 @@ import {
   prepareNativeLaunch,
 } from "./launch";
 import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "./kitty-graphics";
-import { TerminalSurface } from "./terminal-surface";
+import { TerminalSurface, type TerminalInputModes } from "./terminal-surface";
 import type { TerminalDiagnosticEvent } from "./terminal-diagnostics";
-import { createNativeClipboardReceiver, type NativeClipboardEvent } from "./native-clipboard";
+import { createNativeClipboardReceiver, type NativeClipboardEvent, type NativeClipboardOriginEvent } from "./native-clipboard";
 import {
 	createNativeInputEncoder,
+	mintNativeViewerScopeToken,
+	parseNativeViewerScopeToken,
+	verifyNativeViewerScopeToken,
 	type NativeInputEncoder,
+	type NativeInputExpectedTuple,
 	type NativeInputOrigin,
+	type NativeViewerScopeFacts,
 } from "./native-input-origin";
 import {
 	hasCompleteSessionIdle,
@@ -86,8 +91,12 @@ import {
  *   and refuses ALL of them until that same registration's authenticated
  *   readiness arrives — no raw fallback, no fabricated reply, no queue or
  *   replay, and no framing text typed into a legacy child. Rows without the
- *   mode keep forwarding bytes unchanged, and viewer input stays refused with
- *   no API: an opaque origin is a classification, never a grant.
+ *   mode keep forwarding bytes unchanged. Viewer input travels only through the
+ *   strict same-manager viewer seam and stays refused by default: an opaque origin
+ *   is a classification, never a grant, and every viewer write is fenced on the
+ *   manager's own current row, registration, native tuple, geometry, revision, and
+ *   input-mode facts. A viewer copy is returned only to that viewer's own bound
+ *   sink, never to the owner's local clipboard route.
  * - Exit and disconnect are truthful: the lifecycle badge is the actual
  *   owned child state, the exit code comes only from the owned exit event,
  *   and `busy`/`pendingInput`/owned-work counts collapse to null on exit or
@@ -231,6 +240,121 @@ export interface SessionGeometry {
 	readonly cols: number;
 	readonly rows: number;
 	readonly revision: number;
+}
+
+/** The current native conversation a viewer input scope is admitted against. */
+export interface NativeViewerInputTuple {
+	readonly sessionId: string;
+	readonly epoch: number;
+}
+
+/** The row's canonical geometry as recorded in one viewer input source. */
+export interface NativeViewerInputGeometry {
+	readonly cols: number;
+	readonly rows: number;
+	readonly revision: number;
+}
+
+/**
+ * The host's own immutable description of one viewer's input scope at one instant
+ * (#481 interactive path). Every field is a fact this manager already owns — the
+ * host run that registered the surface, the viewer's identity and revision, the row
+ * it displays, the exact registration and generation, the current native
+ * conversation tuple, and the row's canonical geometry and its revision — plus the
+ * host-minted scope token committing to them.
+ *
+ * It is an expected-value fence, never an authority: a caller reads it, hands it
+ * back unchanged, and the manager compares EVERY field against the current record
+ * immediately before writing. Nothing in it selects a row, a viewer, a child, or a
+ * copy destination, and terminal TEXT changes are deliberately absent — new output
+ * on an unchanged conversation never moves the input owner.
+ */
+export interface NativeViewerInputSource {
+	readonly hostRunId: string;
+	readonly viewerId: string;
+	readonly viewerRevision: number;
+	readonly rowId: string;
+	readonly nativeSession: NativeViewerInputTuple;
+	readonly geometry: NativeViewerInputGeometry;
+	readonly registrationIdentity: string;
+	readonly registrationGeneration: string;
+	/** Descriptive, echoable host-minted token; never a grant by itself. */
+	readonly sourceToken: string;
+}
+
+/**
+ * Why one viewer input was refused. Every refusal happens strictly BEFORE any PTY
+ * write, and none of them is a retry instruction.
+ */
+export type NativeViewerInputRefusal =
+	/** No manager, this host is closing, or the manager offers no viewer input seam. */
+	| "unavailable"
+	/** This manager is stopping or disposed. */
+	| "disposed"
+	/** Never registered, retired by closeViewer, or an unknown id. */
+	| "unknown-viewer"
+	/** Registered without this host's run identity or without a copy sink. */
+	| "no-input-source"
+	/** Displays no row, or its row is gone, finished, stopping, or unregistered. */
+	| "row-unavailable"
+	/** Framing not requested for this registration, or its readiness unverified. */
+	| "input-unready"
+	/** The row's current native conversation is unknown. */
+	| "unknown-native-tuple"
+	/** Any expected fact differs from the current one, including an ABA change. */
+	| "stale-source"
+	/** The row's current input modes differ from the modes the bytes were made for. */
+	| "stale-input-modes"
+	/** The row's input modes cannot be read, so the fence cannot be evaluated. */
+	| "modes-unavailable"
+	/** Malformed request or no bytes to send. */
+	| "invalid-input";
+
+/**
+ * Viewer input outcome. `submitted` means the write was invoked and returned; it is
+ * never an acknowledgement that the child processed anything. `unknown` means the
+ * handoff is genuinely uncertain after the write was invoked. There is no retry,
+ * queue, replay, resize, spawn, or stop on any path.
+ */
+export type NativeViewerInputResult =
+	| { readonly status: "submitted" }
+	| { readonly status: "refused"; readonly reason: NativeViewerInputRefusal }
+	| { readonly status: "unknown" };
+
+/** One strict viewer input request: current facts, current modes, and the bytes. */
+export interface NativeViewerInputRequest {
+	readonly expectedSource: NativeViewerInputSource;
+	readonly expectedInputModes: TerminalInputModes;
+	/** Native translated bytes; legacy X10 mouse packets must remain byte-oriented. */
+	readonly data: string | Buffer;
+}
+
+/**
+ * One native copy this exact viewer's own input caused. It travels to that viewer's
+ * bound sink and to nobody else: never the owner's local clipboard callback, never
+ * another viewer, never a broadcast.
+ */
+export interface NativeViewerClipboardReceipt {
+	readonly source: NativeViewerInputSource;
+	readonly event: NativeClipboardEvent;
+	readonly dispatchId: number;
+}
+
+/** One viewer's own copy destination, supplied by the host that owns that surface. */
+export type NativeViewerClipboardSink = (receipt: NativeViewerClipboardReceipt) => void;
+
+/**
+ * Local-only registration options for one viewing surface. Both are immutable for
+ * the life of the viewer and stay in the manager's own viewer record: they never
+ * enter the public viewer state, a roster, or any second store, and neither grants
+ * input. A viewer registered without them keeps every existing behavior and can
+ * never be an input source.
+ */
+export interface ViewerOpenOptions {
+	/** The host run that owns this surface, minted by that host, never by a caller. */
+	readonly hostRunId?: string;
+	/** This surface's own native copy sink; required before it may take input. */
+	readonly nativeClipboardSink?: NativeViewerClipboardSink;
 }
 
 /**
@@ -465,9 +589,11 @@ export interface InstanceManagerOptions {
 	 * registration's authenticated readiness arrives. Absent/false keeps the
 	 * legacy behavior byte-for-byte: raw bytes forwarded, v1 capsules only, no
 	 * readiness observed. This is not a user setting, a permission, or remote
-	 * input: viewer input stays refused with no API, and an opaque origin alone is
-	 * never a grant. Only native setup may request it — legacy private profiles
-	 * and injected non-native preparers cannot frame by accident.
+	 * input: viewer input is admitted only through {@linkcode writeViewerInput} on a
+	 * surface this host registered with its own run identity and its own copy sink,
+	 * and an opaque origin alone is never a grant. Only native setup may request it
+	 * — legacy private profiles and injected non-native preparers cannot frame by
+	 * accident.
 	 */
 	nativeInputOriginFraming?: boolean;
 }
@@ -668,13 +794,25 @@ function validateShutdownMs(value: number, label: string): void {
 	}
 }
 
-/** Internal viewer record: one surface's own target and pane size, nothing more. */
+/** Internal viewer record: one surface's facts, its host run identity, and its own sink. */
 interface ManagedViewer {
 	id: string;
 	sessionId: string | undefined;
 	cols: number | undefined;
 	rows: number | undefined;
 	revision: number;
+	/**
+	 * Immutable identity of the host run that registered this surface, supplied by
+	 * that host at registration. Local-only: never published, never chosen by a
+	 * caller of a write, and absent for a surface that took part in no input scope.
+	 */
+	hostRunId?: string;
+	/**
+	 * Immutable copy destination for copies this surface's own input caused. Required
+	 * before the viewer may take input, because this path has no intentional
+	 * permanent copy drop. Retired with the record by closeViewer or disposal.
+	 */
+	nativeClipboardSink?: NativeViewerClipboardSink;
 }
 
 function viewerState(viewer: ManagedViewer): SessionViewerState {
@@ -735,6 +873,123 @@ const LOCAL_INPUT_ORIGIN: NativeInputOrigin = Object.freeze({ kind: "local" } as
  * or label a clipboard copy.
  */
 const PROTOCOL_INPUT_ORIGIN: NativeInputOrigin = Object.freeze({ kind: "none" } as const);
+
+/** Printable-ASCII bounded identity field shared by every viewer input source fact. */
+const VIEWER_FACT_FIELD = /^[\x21-\x7e]{1,128}$/;
+const VIEWER_MOUSE_TRACKING_MODES = new Set<string>(["none", "x10", "vt200", "drag", "any"]);
+const VIEWER_MOUSE_ENCODINGS = new Set<string>(["default", "sgr", "sgr-pixels"]);
+const VIEWER_INPUT_MODE_KEYS = ["kittyFlags", "applicationCursorKeys", "applicationKeypad",
+  "bracketedPaste", "mouseTracking", "modifyOtherKeys", "mouseEncoding"] as const;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+	const own = Object.keys(value);
+	return own.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function isOrdinal(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Bounded printable-ASCII fact field of an unknown value (never a regex on unknown). */
+function isBoundedFactField(value: unknown): boolean {
+	return typeof value === "string" && VIEWER_FACT_FIELD.test(value);
+}
+
+/** The closed modifyOtherKeys level set, checked without assuming a type. */
+function isModifyOtherKeysLevel(value: unknown): boolean {
+	return typeof value === "number" && (value === 0 || value === 1 || value === 2);
+}
+
+/**
+ * Shape check for an expected source handed back by a caller. It validates the
+ * closed fact shape only — the manager still compares every field against the
+ * current record, so a well-formed forged source is simply stale.
+ */
+function isViewerInputSource(value: unknown): value is NativeViewerInputSource {
+	if (!isPlainRecord(value)
+		|| !hasExactKeys(value, [
+			"hostRunId", "viewerId", "viewerRevision", "rowId", "nativeSession", "geometry",
+			"registrationIdentity", "registrationGeneration", "sourceToken",
+		])) {
+		return false;
+	}
+	if (!isBoundedFactField(value.hostRunId)
+		|| !isBoundedFactField(value.sourceToken)
+		|| !isBoundedFactField(value.rowId)
+		|| !isBoundedFactField(value.registrationIdentity)
+		|| !isBoundedFactField(value.registrationGeneration)
+		|| !isOrdinal(value.viewerRevision)) {
+		return false;
+	}
+	const native = value.nativeSession;
+	const geometry = value.geometry;
+	if (!isPlainRecord(native) || !hasExactKeys(native, ["sessionId", "epoch"])
+		// The conversation identity keeps the protocol's own domain (opaque, bounded in
+		// UTF-8 bytes, path-free, control-free, possibly non-ASCII), so a valid
+		// conversation is never refused an input source by an extra ASCII-only rule.
+		|| !isValidNativeSessionId(native.sessionId)
+		|| typeof native.epoch !== "number" || !Number.isSafeInteger(native.epoch) || native.epoch < 1) {
+		return false;
+	}
+	return isPlainRecord(geometry) && hasExactKeys(geometry, ["cols", "rows", "revision"])
+		&& typeof geometry.cols === "number" && Number.isSafeInteger(geometry.cols)
+		&& geometry.cols >= 1 && geometry.cols <= 1000
+		&& typeof geometry.rows === "number" && Number.isSafeInteger(geometry.rows)
+		&& geometry.rows >= 1 && geometry.rows <= 1000
+		&& isOrdinal(geometry.revision);
+}
+
+function sameViewerInputSource(left: NativeViewerInputSource, right: NativeViewerInputSource): boolean {
+	return left.hostRunId === right.hostRunId
+		&& left.viewerId === right.viewerId
+		&& left.viewerRevision === right.viewerRevision
+		&& left.rowId === right.rowId
+		&& left.nativeSession.sessionId === right.nativeSession.sessionId
+		&& left.nativeSession.epoch === right.nativeSession.epoch
+		&& left.geometry.cols === right.geometry.cols
+		&& left.geometry.rows === right.geometry.rows
+		&& left.geometry.revision === right.geometry.revision
+		&& left.registrationIdentity === right.registrationIdentity
+		&& left.registrationGeneration === right.registrationGeneration
+		// The token commits to every fact above; comparing it catches a source that
+		// was rebuilt from older facts the individual fields no longer describe.
+		&& left.sourceToken === right.sourceToken;
+}
+
+/** Shape check for the input modes a caller observed (an observation, never authority). */
+function isViewerInputModes(value: unknown): value is TerminalInputModes {
+	if (!isPlainRecord(value) || !hasExactKeys(value, VIEWER_INPUT_MODE_KEYS)) return false;
+	if (!isOrdinal(value.kittyFlags) || value.kittyFlags > 7) return false;
+	for (const key of ["applicationCursorKeys", "applicationKeypad", "bracketedPaste"] as const) {
+		if (typeof value[key] !== "boolean") return false;
+	}
+	if (typeof value.mouseTracking !== "string" || !VIEWER_MOUSE_TRACKING_MODES.has(value.mouseTracking)) return false;
+	if (!isModifyOtherKeysLevel(value.modifyOtherKeys)) return false;
+	return typeof value.mouseEncoding === "string" && VIEWER_MOUSE_ENCODINGS.has(value.mouseEncoding);
+}
+
+function sameViewerInputModes(left: TerminalInputModes, right: TerminalInputModes): boolean {
+	return left.kittyFlags === right.kittyFlags
+		&& left.applicationCursorKeys === right.applicationCursorKeys
+		&& left.applicationKeypad === right.applicationKeypad
+		&& left.bracketedPaste === right.bracketedPaste
+		&& left.mouseTracking === right.mouseTracking
+		&& left.modifyOtherKeys === right.modifyOtherKeys
+		&& left.mouseEncoding === right.mouseEncoding;
+}
+
+/** One strict viewer input request; anything else is refused before any state is read. */
+function invalidViewerInputRequest(request: NativeViewerInputRequest): boolean {
+	if (!isPlainRecord(request)
+		|| !hasExactKeys(request, ["expectedSource", "expectedInputModes", "data"])) return true;
+	if (!isViewerInputSource(request.expectedSource)) return true;
+	if (!isViewerInputModes(request.expectedInputModes)) return true;
+	return (typeof request.data !== "string" && !Buffer.isBuffer(request.data)) || request.data.length === 0;
+}
 
 function publicInstanceError(code: InstanceErrorCode): string {
 	const message = PUBLIC_INSTANCE_ERRORS[code];
@@ -1481,8 +1736,16 @@ export class InstanceManager {
 	 * over input, lifecycle, or another row; ids are never reused, so a stale
 	 * callback can never address a newer surface. Returns undefined once this
 	 * manager is stopping or disposed.
+	 *
+	 * The optional local-only options bind this surface to its owning host run and
+	 * give it its own native copy sink. Both are stored in this viewer's own record
+	 * and are immutable for its life; the published {@linkcode viewerState} facts and
+	 * the no-argument call are unchanged, and no second viewer store exists. Binding
+	 * them is what makes the surface eligible for {@linkcode readViewerInputSource}
+	 * and {@linkcode writeViewerInput} later — it grants nothing by itself, and a
+	 * callback is never an input authority.
 	 */
-	openViewer(): SessionViewerState | undefined {
+	openViewer(options?: ViewerOpenOptions): SessionViewerState | undefined {
 		if (this.#disposed || this.#stopping) {
 			return undefined;
 		}
@@ -1493,6 +1756,28 @@ export class InstanceManager {
 			rows: undefined,
 			revision: 1,
 		};
+		if (options !== undefined) {
+			// A closed, optional options object: only these two facts exist, and both are
+			// immutable for the life of this viewer record.
+			if (!isPlainRecord(options)
+				|| !Object.keys(options).every((key) => key === "hostRunId" || key === "nativeClipboardSink")) {
+				throw new Error("session-host: viewer registration options must be an absent or closed options object");
+			}
+			const hostRunId = options.hostRunId;
+			if (hostRunId !== undefined) {
+				if (typeof hostRunId !== "string" || !VIEWER_FACT_FIELD.test(hostRunId)) {
+					throw new Error("session-host: viewer host run identity must be bounded printable text");
+				}
+				viewer.hostRunId = hostRunId;
+			}
+			const sink = options.nativeClipboardSink;
+			if (sink !== undefined) {
+				if (typeof sink !== "function") {
+					throw new Error("session-host: viewer native clipboard sink must be a function");
+				}
+				viewer.nativeClipboardSink = (receipt) => { sink(receipt); };
+			}
+		}
 		this.#viewers.set(viewer.id, viewer);
 		return viewerState(viewer);
 	}
@@ -1569,6 +1854,234 @@ export class InstanceManager {
 		this.#viewers.delete(viewerId);
 		if (viewer.sessionId !== undefined) this.#recomputeViewerGeometry(viewer.sessionId);
 		return true;
+	}
+
+	/**
+	 * The CURRENT immutable input scope of one registered surface, or undefined when
+	 * this surface cannot take viewer input right now: it is unknown or retired, was
+	 * registered without this host's run identity or without its own copy sink, shows
+	 * no row or a row that is gone/finished/stopping, is not a framed row whose own
+	 * readiness was verified, or has no current native conversation. Resolving never
+	 * writes, resizes, queues, spawns, or changes any state, and the returned token
+	 * describes the facts rather than granting anything.
+	 *
+	 * There is no terminal-text field on purpose: the input owner is the surface and
+	 * its conversation, not the newest line on screen.
+	 */
+	readViewerInputSource(viewerId: string): NativeViewerInputSource | undefined {
+		const scope = this.#viewerInputScope(viewerId);
+		return scope.ok ? scope.source : undefined;
+	}
+
+	/**
+	 * Write viewer-origin input to exactly the row this viewer displays.
+	 *
+	 * Fail-closed order, all of it before any possible PTY write and with no await
+	 * anywhere:
+	 * 1. the request shape (a malformed request or empty bytes is refused);
+	 * 2. the CURRENT scope — same manager, live row, exact unreleased registration,
+	 *    framed and ready, known native tuple, and a mintable scope token;
+	 * 3. EVERY expected source fact against the current one, including the canonical
+	 *    geometry revision, this viewer's revision, the native tuple, the
+	 *    registration identity/generation, and the host run — an ABA change (resized
+	 *    away and back, reselected, new run, new registration, new epoch, row exit,
+	 *    stop, release) is a refusal, and nothing is ever inferred from the bytes;
+	 * 4. the CURRENT input modes against the modes the bytes were made for, because
+	 *    the same bytes mean something else in another mode (modes, descriptors, and
+	 *    tokens are freshness evidence, never authority);
+	 * 5. one more core-scope recheck after the modes read, in case a reentrant
+	 *    observer changed the facts in between.
+	 *
+	 * The row's input is then framed with this registration's own encoder under the
+	 * viewer origin, carrying the current native tuple as the child-side fence. A
+	 * refusal never touches the child. Once the write seam was invoked, a throw is
+	 * reported as `unknown` — never retried, queued, replayed, or re-routed.
+	 */
+	writeViewerInput(viewerId: string, request: NativeViewerInputRequest): NativeViewerInputResult {
+		if (invalidViewerInputRequest(request)) {
+			return { status: "refused", reason: "invalid-input" };
+		}
+		const scope = this.#viewerInputScope(viewerId);
+		if (!scope.ok) {
+			return { status: "refused", reason: scope.reason };
+		}
+		if (!sameViewerInputSource(scope.source, request.expectedSource)) {
+			return { status: "refused", reason: "stale-source" };
+		}
+		const modes = this.#readViewerInputModes(scope.record);
+		if (modes === undefined) {
+			return { status: "refused", reason: "modes-unavailable" };
+		}
+		if (!sameViewerInputModes(modes, request.expectedInputModes)) {
+			return { status: "refused", reason: "stale-input-modes" };
+		}
+		const current = this.#viewerInputScope(viewerId);
+		if (!current.ok) {
+			return { status: "refused", reason: current.reason };
+		}
+		if (!sameViewerInputSource(current.source, scope.source)
+			|| current.source.sourceToken !== request.expectedSource.sourceToken) {
+			return { status: "refused", reason: "stale-source" };
+		}
+		const pty = current.record.pty;
+		const native = current.record.nativeSession;
+		if (pty === undefined || native === null) {
+			return { status: "refused", reason: "row-unavailable" };
+		}
+		const origin: NativeInputOrigin = Object.freeze({ kind: "viewer" as const, token: current.source.sourceToken });
+		const expectedNativeTuple: NativeInputExpectedTuple = Object.freeze({
+			sessionId: native.sessionId, epoch: native.epoch,
+		});
+		try {
+			this.#writeChildInput(current.record, pty, request.data, origin, expectedNativeTuple);
+		} catch {
+			// The seam was open when it was last checked and the write was invoked, so
+			// whether the child received the bytes is genuinely unknown.
+			return { status: "unknown" };
+		}
+		return { status: "submitted" };
+	}
+
+	/**
+	 * One read of the row's own current input modes, or undefined when they cannot be
+	 * observed (no surface, or a throwing read). A refused modes read is never a
+	 * guess: the caller writes nothing rather than send bytes whose meaning it cannot
+	 * check.
+	 */
+	#readViewerInputModes(record: ManagedInstance): TerminalInputModes | undefined {
+		const surface = record.surface;
+		if (surface === undefined) {
+			return undefined;
+		}
+		try {
+			const modes = surface.inputModes();
+			return isViewerInputModes(modes) ? modes : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Resolve one viewer's current input scope and mint its scope token from the
+	 * exact registration this row holds. Every unresolvable case is a truthful
+	 * refusal reason; nothing here mutates a row, a viewer, a surface, or a queue.
+	 */
+	#viewerInputScope(viewerId: string):
+		| { readonly ok: true; readonly viewer: ManagedViewer; readonly record: ManagedInstance; readonly source: NativeViewerInputSource }
+		| { readonly ok: false; readonly reason: NativeViewerInputRefusal } {
+		if (this.#disposed || this.#stopping) {
+			return { ok: false, reason: "disposed" };
+		}
+		const viewer = this.#viewers.get(viewerId);
+		if (viewer === undefined) {
+			return { ok: false, reason: "unknown-viewer" };
+		}
+		if (viewer.hostRunId === undefined || viewer.nativeClipboardSink === undefined) {
+			// No host run identity and no copy destination means no verifiable scope:
+			// this path has no intentional permanent copy drop.
+			return { ok: false, reason: "no-input-source" };
+		}
+		const rowId = viewer.sessionId;
+		if (rowId === undefined) {
+			return { ok: false, reason: "row-unavailable" };
+		}
+		const record = this.#records.get(rowId);
+		if (record === undefined) {
+			return { ok: false, reason: "row-unavailable" };
+		}
+		const registration = record.registration;
+		if (registration === undefined || record.registrationReleased) {
+			return { ok: false, reason: "row-unavailable" };
+		}
+		if (record.pty === undefined || record.ptyExited || record.lifecycle !== "alive" || record.stopAdmissionClosed) {
+			return { ok: false, reason: "row-unavailable" };
+		}
+		if (!record.inputFramingRequested || !record.inputFramingReady || record.inputEncoder === undefined) {
+			return { ok: false, reason: "input-unready" };
+		}
+		if (record.nativeSession === null) {
+			return { ok: false, reason: "unknown-native-tuple" };
+		}
+		const source = this.#viewerInputSource(viewer, record, registration);
+		if (source === undefined) {
+			// The current facts could not be described at all (for example a viewer
+			// identity outside the bounded scope shape): no scope, no input.
+			return { ok: false, reason: "no-input-source" };
+		}
+		return { ok: true, viewer, record, source };
+	}
+
+	/**
+	 * The immutable facts one viewer's scope commits to, read from the CURRENT
+	 * record. Undefined when a fact is missing (no run identity, no sink, no
+	 * registration, or no current native conversation).
+	 */
+	#viewerScopeFacts(
+		viewer: ManagedViewer,
+		record: ManagedInstance,
+		registration: InstanceStatusRegistration,
+	): NativeViewerScopeFacts | undefined {
+		const hostRunId = viewer.hostRunId;
+		const native = record.nativeSession;
+		if (hostRunId === undefined || viewer.nativeClipboardSink === undefined || native === null) {
+			return undefined;
+		}
+		return Object.freeze({
+			hostRunId,
+			viewerId: viewer.id,
+			viewerRevision: viewer.revision,
+			rowId: record.id,
+			registrationIdentity: registration.bootstrap.instanceId,
+			registrationGeneration: registration.bootstrap.generation,
+			nativeSessionId: native.sessionId,
+			nativeSessionEpoch: native.epoch,
+			cols: record.cols,
+			rows: record.rows,
+			geometryRevision: record.geometryRevision,
+		});
+	}
+
+	/**
+	 * Mint one viewer's current input source with its scope token, or undefined when
+	 * the current facts cannot be described. The token is derived from this
+	 * registration's own existing bootstrap key — no new secret, no new state.
+	 */
+	#viewerInputSource(
+		viewer: ManagedViewer,
+		record: ManagedInstance,
+		registration: InstanceStatusRegistration,
+	): NativeViewerInputSource | undefined {
+		const facts = this.#viewerScopeFacts(viewer, record, registration);
+		if (facts === undefined) {
+			return undefined;
+		}
+		const sourceToken = mintNativeViewerScopeToken(registration.bootstrap, facts);
+		if (sourceToken === undefined) {
+			return undefined;
+		}
+		return this.#viewerInputSourceFromFacts(facts, sourceToken);
+	}
+
+	/** Owned, frozen description of already-verified scope facts. */
+	#viewerInputSourceFromFacts(facts: NativeViewerScopeFacts, sourceToken: string): NativeViewerInputSource {
+		return Object.freeze({
+			hostRunId: facts.hostRunId,
+			viewerId: facts.viewerId,
+			viewerRevision: facts.viewerRevision,
+			rowId: facts.rowId,
+			nativeSession: Object.freeze({
+				sessionId: facts.nativeSessionId,
+				epoch: facts.nativeSessionEpoch,
+			}),
+			geometry: Object.freeze({
+				cols: facts.cols,
+				rows: facts.rows,
+				revision: facts.geometryRevision,
+			}),
+			registrationIdentity: facts.registrationIdentity,
+			registrationGeneration: facts.registrationGeneration,
+			sourceToken,
+		});
 	}
 
 	/**
@@ -2569,15 +3082,17 @@ export class InstanceManager {
 	 * v2 copy receipts both arrive on this same ordered stdout stream. Readiness
 	 * is independent of the native conversation tuple (it can and must be
 	 * observed before any session metadata exists), while copy callbacks keep the
-	 * unchanged tuple/live-record fences. A strict row accepts ONLY typed v2
-	 * `local` receipts for local delivery: its own strict bridge emits v2
+	 * unchanged tuple/live-record fences. A strict row delivers a typed v2 `local`
+	 * receipt on the owner's local route only: its own strict bridge emits v2
 	 * capsules only, so an authenticated v1 capsule on such a row is NOT a
 	 * downgrade path and is dropped (its sequence is still consumed, so the same
-	 * authenticated request can never be replayed as v2). A viewer-origin capsule
-	 * is likewise dropped quietly (no owner-terminal fallback, no local delivery,
-	 * no copy diagnostic, even when this row is locally displayed) and is never
-	 * downgraded to a v1 event. Legacy rows observe neither v2 nor readiness at
-	 * all and keep the v1 route exactly as before.
+	 * authenticated request can never be replayed as v2). A viewer-origin capsule is
+	 * routed ONLY to the viewer its token names, and only after that viewer's current
+	 * facts re-commit to exactly that token; anything else about it is dropped
+	 * quietly — no owner-terminal fallback, no local delivery, no sibling viewer, no
+	 * broadcast, and no copy diagnostic — and it is never downgraded to a v1 event.
+	 * Legacy rows observe neither v2 nor readiness at all and keep the v1 route
+	 * exactly as before.
 	 */
 	#nativeClipboardCapsuleHandler(
 		record: ManagedInstance,
@@ -2601,13 +3116,14 @@ export class InstanceManager {
 					// receiver, so it cannot be replayed) and otherwise dropped.
 					() => undefined,
 					(receipt) => {
-						// Viewer-origin copies belong to their initiating viewer only, and no
-						// viewer input or viewer copy route exists in this phase: an
-						// unexpected one is dropped without any local route or diagnostic.
-						if (receipt.origin.kind !== "local") {
+						if (receipt.origin.kind === "local") {
+							onCopyEvent(receipt.event);
 							return;
 						}
-						onCopyEvent(receipt.event);
+						// A viewer-origin copy belongs to the one viewer whose input caused it,
+						// and to nobody else: never the owner's local clipboard route, never a
+						// sibling viewer, never a broadcast, and never a diagnostic.
+						this.#forwardViewerNativeClipboard(record, registration, receipt);
 					},
 					() => this.#markInputFramingReady(record, registration),
 				)
@@ -2644,17 +3160,7 @@ export class InstanceManager {
 		if (forward === undefined) {
 			return;
 		}
-		if (this.#disposed || this.#stopping
-			|| this.#records.get(record.id) !== record
-			|| record.registration !== registration || record.registrationReleased
-			|| record.pty === undefined || record.ptyExited
-			|| record.lifecycle !== "alive" || record.stopAdmissionClosed) {
-			return;
-		}
-		const nativeSession = record.nativeSession;
-		if (nativeSession === null
-			|| nativeSession.sessionId !== event.sessionId
-			|| nativeSession.epoch !== event.sessionEpoch) {
+		if (!this.#clipboardEventLive(record, registration, event)) {
 			return;
 		}
 		try {
@@ -2666,10 +3172,88 @@ export class InstanceManager {
 	}
 
 	/**
+	 * The shared live-source fence for one verified capsule on this row: only the
+	 * row still living in the map under this id, still holding this exact unreleased
+	 * registration, still owning a live unstopped child, and still reporting the
+	 * same current native conversation tuple may route anything. It is the unchanged
+	 * local-route fence, reused for a viewer copy so neither route can weaken the
+	 * other.
+	 */
+	#clipboardEventLive(
+		record: ManagedInstance,
+		registration: InstanceStatusRegistration,
+		event: NativeClipboardEvent,
+	): boolean {
+		if (this.#disposed || this.#stopping
+			|| this.#records.get(record.id) !== record
+			|| record.registration !== registration || record.registrationReleased
+			|| record.pty === undefined || record.ptyExited
+			|| record.lifecycle !== "alive" || record.stopAdmissionClosed) {
+			return false;
+		}
+		const nativeSession = record.nativeSession;
+		return nativeSession !== null
+			&& nativeSession.sessionId === event.sessionId
+			&& nativeSession.epoch === event.sessionEpoch;
+	}
+
+	/**
+	 * Route one authenticated viewer-origin copy to the ONE viewer that caused it.
+	 *
+	 * The token is only a lookup aid: its handle names the viewer record to consult,
+	 * and the copy is delivered only after that record is re-read and its CURRENT
+	 * facts re-commit to exactly the received token under THIS registration's key.
+	 * So a retired or closed viewer, a viewer now showing another row, a replaced row,
+	 * a released registration, a new run, a new native epoch, an ABA geometry change,
+	 * or a newer viewer revision delivers nothing. Nothing is scanned, broadcast, or
+	 * fallen back to the owner's local callback, no copy is attributed to the newest
+	 * input or the highest dispatch id, and a throwing sink is contained: an async
+	 * copy for an earlier dispatch still arrives with that dispatch's own origin.
+	 */
+	#forwardViewerNativeClipboard(
+		record: ManagedInstance,
+		registration: InstanceStatusRegistration,
+		receipt: NativeClipboardOriginEvent,
+	): void {
+		if (!this.#clipboardEventLive(record, registration, receipt.event)) {
+			return;
+		}
+		const origin = receipt.origin;
+		if (origin.kind !== "viewer") {
+			return; // A closed origin shape: only a viewer dispatch routes to a viewer.
+		}
+		const handle = parseNativeViewerScopeToken(origin.token);
+		if (handle === undefined) {
+			return;
+		}
+		const viewer = this.#viewers.get(handle.viewerId);
+		const sink = viewer?.nativeClipboardSink;
+		if (viewer === undefined || sink === undefined || viewer.sessionId !== record.id) {
+			return;
+		}
+		const facts = this.#viewerScopeFacts(viewer, record, registration);
+		if (facts === undefined
+			|| !verifyNativeViewerScopeToken(registration.bootstrap, origin.token, facts)) {
+			return;
+		}
+		const delivered: NativeViewerClipboardReceipt = Object.freeze({
+			source: this.#viewerInputSourceFromFacts(facts, origin.token),
+			event: Object.freeze({ ...receipt.event }),
+			dispatchId: receipt.dispatchId,
+		});
+		try {
+			sink(delivered);
+		} catch {
+			// A viewer's own refusal cannot break a row or escape into the parser.
+		}
+	}
+
+	/**
 	 * The ONE seam through which every byte the host writes to a hosted child's
-	 * PTY passes, for exactly the two existing sources: local user input
-	 * ({@linkcode write}) and TerminalSurface protocol replies
-	 * ({@linkcode #onQueryReply}). There is no raw unframed bypass and no third
+	 * PTY passes, for exactly the three admitted sources: local user input
+	 * ({@linkcode write}), TerminalSurface protocol replies
+	 * ({@linkcode #onQueryReply}), and strict viewer-origin input
+	 * ({@linkcode writeViewerInput}). There is no raw unframed bypass and no fourth
 	 * caller.
 	 *
 	 * - Legacy rows (mode absent) forward the bytes exactly as before.
@@ -2687,12 +3271,18 @@ export class InstanceManager {
 	 *   manager-wide stop or disposal) closes the seam immediately even though the
 	 *   row stays `alive` until its child's actual exit event, and ownership of the
 	 *   still-running child is retained rather than silently dropped.
+	 *
+	 * `expectedNativeTuple` accompanies a viewer dispatch only: it is the native
+	 * conversation the child must still be in before it delivers any of these bytes,
+	 * and it is authenticated inside the frame. Local and protocol-reply dispatches
+	 * keep their unchanged shape and semantics.
 	 */
 	#writeChildInput(
 		record: ManagedInstance,
 		pty: InstancePty,
 		data: string | Buffer,
 		origin: NativeInputOrigin,
+		expectedNativeTuple?: NativeInputExpectedTuple,
 	): void {
 		if (!record.inputFramingRequested) {
 			pty.write(data);
@@ -2704,7 +3294,11 @@ export class InstanceManager {
 				`session-host: instance ${record.id} has no admitted native input framing; refusing unframed input`,
 			);
 		}
-		pty.write(encoder.encode(typeof data === "string" ? Buffer.from(data, "utf8") : data, origin));
+		pty.write(encoder.encode(
+			typeof data === "string" ? Buffer.from(data, "utf8") : data,
+			origin,
+			expectedNativeTuple,
+		));
 	}
 
 	/**

@@ -9,10 +9,15 @@ import type {
   InstanceManager,
   InstanceManagerOptions,
   NativeInstanceView,
+  NativeViewerClipboardSink,
+  NativeViewerInputRequest,
+  NativeViewerInputResult,
+  NativeViewerInputSource,
   SessionGeometry,
   SessionViewerState,
   SessionViewerUpdate,
   SessionViewerUpdateResult,
+  ViewerOpenOptions,
 } from "./instances";
 import type { NativePersistenceReceipt } from "./native-persistence";
 import type {
@@ -58,7 +63,11 @@ import {
  * and copy provenance fences remain exactly where they are. Per-session viewer
  * facts (#474) are recorded once — on the manager — and this boundary only forwards
  * the addressed registration, update, and removal, so per-session geometry never
- * becomes a second store here.
+ * becomes a second store here. The strict viewer input seam (#481 interactive
+ * path) is the same kind of forwarding boundary: the manager owns every input fact
+ * and the single PTY write, this service adds only its own run fence (a source from
+ * another host run is refused before the manager is consulted) and never keeps a
+ * viewer, source, sink, queue, or timer of its own.
  *
  * The inventory snapshot and watch (#478) are a read-only observation of that
  * same manager: a snapshot is one copied read of `list()`, and a watch observes
@@ -84,15 +93,36 @@ import {
 export type OwningHostManager = Pick<InstanceManager,
   | "list" | "surface" | "write" | "resize" | "hasLiveProcesses" | "create" | "rename" | "closeExited" | "shutdown" | "dispose" | "ownedLiveSessions"
   | "openViewer" | "viewerState" | "sessionViewers" | "updateViewer" | "closeViewer" | "instanceGeometry" | "setInitialGeometry"
-> & Partial<Pick<InstanceManager, "stop" | "closeError">>;
+> & Partial<Pick<InstanceManager, "stop" | "closeError"
+  // The strict viewer input seam is an optional manager capability: a manager that
+  // does not offer it is simply not an input path, never an inferred one.
+  | "readViewerInputSource" | "writeViewerInput">>;
 
 export type {
+  NativeViewerClipboardReceipt,
+  NativeViewerClipboardSink,
+  NativeViewerInputGeometry,
+  NativeViewerInputRefusal,
+  NativeViewerInputRequest,
+  NativeViewerInputResult,
+  NativeViewerInputSource,
+  NativeViewerInputTuple,
   SessionGeometry,
   SessionViewerRefusal,
   SessionViewerState,
   SessionViewerUpdate,
   SessionViewerUpdateResult,
 } from "./instances";
+
+/**
+ * Local-only options for registering one viewing surface on the host's one manager.
+ * The caller can supply only its own surface's copy sink: the host run identity is
+ * always this service's own run, never a caller's choice, so a consumer cannot
+ * claim another host's scope.
+ */
+export interface OwningHostViewerOptions {
+  readonly nativeClipboardSink?: NativeViewerClipboardSink;
+}
 
 /** The manager launch fence's refusal text for an already-owned conversation. */
 const DUPLICATE_OWNED_MARKER = "already open in this host";
@@ -512,8 +542,13 @@ export interface OwningHostService {
    * Register one viewing surface on the one manager (#474). The surface is only a
    * display participant: it takes no input lease and excludes nobody. Returns
    * undefined when no manager is open or the host is already closing.
+   *
+   * The only option a caller may supply is its own surface's native copy sink; this
+   * service always records its OWN run identity with the surface, so no caller can
+   * claim another host run's viewer scope. A surface registered with no options
+   * behaves exactly as before and can never take viewer input.
    */
-  openViewer(): SessionViewerState | undefined;
+  openViewer(options?: OwningHostViewerOptions): SessionViewerState | undefined;
   /** Current facts of one registered surface, or undefined once it is gone. */
   readViewer(viewerId: string): SessionViewerState | undefined;
   /** Every surface currently displaying one row, as copied facts. */
@@ -526,6 +561,32 @@ export interface OwningHostService {
   updateViewer(viewerId: string, update?: SessionViewerUpdate): SessionViewerUpdateResult;
   /** Retire one surface; the row it displayed keeps its last canonical size. */
   closeViewer(viewerId: string): boolean;
+  /**
+   * The manager's CURRENT immutable input scope for one surface (#481 interactive
+   * path), or undefined when that surface cannot take viewer input right now: no
+   * manager, host teardown, a manager without the seam, an unknown or retired
+   * surface, a surface with no copy sink or no row, a row that is gone, finished,
+   * stopping, or unregistered, a row whose input framing was not requested or whose
+   * readiness was never verified, or an unknown native conversation.
+   *
+   * Reading is a pure fact read: nothing is written, queued, resized, spawned, or
+   * armed, and the returned token describes those facts instead of granting
+   * anything. Hand it back unchanged to {@linkcode writeViewerInput}.
+   */
+  readViewerInputSource(viewerId: string): NativeViewerInputSource | undefined;
+  /**
+   * Write viewer-origin input through the one manager, fenced on the CURRENT facts
+   * the caller observed. This boundary first requires the expected source to carry
+   * THIS run's identity — a foreign or replayed run is refused before the manager is
+   * consulted — and the manager then re-checks every fact, the row's current input
+   * modes, and its own live ownership immediately before the single PTY write.
+   *
+   * Every refusal happens before any possible write; `unknown` means the handoff was
+   * invoked and its result is genuinely uncertain. Nothing here retries, queues,
+   * replays, resizes, spawns, stops, or activates anything, and no copy is routed by
+   * this call.
+   */
+  writeViewerInput(viewerId: string, request: NativeViewerInputRequest): NativeViewerInputResult;
   /**
    * The manager's canonical content geometry for one row, or undefined for a row
    * this manager does not have. This is the manager's own fact, never a copy.
@@ -1124,11 +1185,18 @@ class LocalOwningHostService implements OwningHostService {
     }
   }
 
-  openViewer(): SessionViewerState | undefined {
+  openViewer(options?: OwningHostViewerOptions): SessionViewerState | undefined {
     const manager = this.#manager;
     if (manager === undefined || this.dependencies.teardownRequested()) return undefined;
+    const viewerOptions: ViewerOpenOptions | undefined = options === undefined
+      ? undefined
+      : {
+        // This host's own run identity, never a caller-selected one.
+        hostRunId: this.#hostRunId,
+        nativeClipboardSink: options.nativeClipboardSink,
+      };
     try {
-      return manager.openViewer();
+      return manager.openViewer(viewerOptions);
     } catch {
       return undefined;
     }
@@ -1173,6 +1241,55 @@ class LocalOwningHostService implements OwningHostService {
       return manager.closeViewer(viewerId);
     } catch {
       return false;
+    }
+  }
+
+  readViewerInputSource(viewerId: string): NativeViewerInputSource | undefined {
+    const manager = this.#manager;
+    // A manager without the seam, a throwing read, or a closing host is simply not
+    // an input path; nothing is inferred and no provider is fabricated.
+    if (manager === undefined || this.dependencies.teardownRequested()
+      || typeof manager.readViewerInputSource !== "function") {
+      return undefined;
+    }
+    try {
+      return manager.readViewerInputSource(viewerId);
+    } catch {
+      return undefined;
+    }
+  }
+
+  writeViewerInput(viewerId: string, request: NativeViewerInputRequest): NativeViewerInputResult {
+    const manager = this.#manager;
+    if (manager === undefined || this.dependencies.teardownRequested()) {
+      return { status: "refused", reason: "unavailable" };
+    }
+    if (typeof manager.writeViewerInput !== "function") {
+      return { status: "refused", reason: "unavailable" };
+    }
+    // The run fence belongs to this boundary: only the host run that minted the
+    // source can spend it, and this service never accepts another run's identity.
+    const candidate: unknown = request;
+    if (typeof candidate !== "object" || candidate === null
+      || !Object.hasOwn(candidate, "expectedSource")
+      || !Object.hasOwn(candidate, "expectedInputModes")
+      || !Object.hasOwn(candidate, "data")) {
+      return { status: "refused", reason: "invalid-input" };
+    }
+    const expected = (candidate as { expectedSource: unknown }).expectedSource;
+    const runId = typeof expected === "object" && expected !== null
+      ? (expected as { hostRunId?: unknown }).hostRunId
+      : undefined;
+    if (runId !== this.#hostRunId) {
+      return { status: "refused", reason: "stale-source" };
+    }
+    try {
+      return manager.writeViewerInput(viewerId, request);
+    } catch {
+      // The manager threw somewhere inside an operation whose PTY handoff cannot be
+      // observed from here: that is an unknown outcome, never a claimed refusal and
+      // never a retry.
+      return { status: "unknown" };
     }
   }
 

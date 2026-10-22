@@ -5,10 +5,15 @@ import type {
   CreateInstanceOptions,
   InstanceManagerOptions,
   NativeInstanceView,
+  NativeViewerClipboardSink,
+  NativeViewerInputRequest,
+  NativeViewerInputResult,
+  NativeViewerInputSource,
   SessionGeometry,
   SessionViewerState,
   SessionViewerUpdate,
   SessionViewerUpdateResult,
+  ViewerOpenOptions,
 } from "../src/session-host/instances";
 import { FakeViewerSeam } from "./session-host-viewer-fakes";
 import type { SessionHostNativeSession, SessionSpawnInput } from "../src/session-host/protocol";
@@ -19,6 +24,7 @@ import {
   savedDeletionOwnedSessions,
   type OwningHostManager,
   type OwningHostService,
+  type OwningHostViewerOptions,
 } from "../src/session-host/owning-host-service";
 
 /**
@@ -115,7 +121,40 @@ class SyntheticManager {
     apply: (id, cols, rows) => { this.geometry.set(id, { cols, rows }); },
   });
 
-  openViewer(): SessionViewerState { return this.viewers.openViewer(); }
+  openViewer(options?: ViewerOpenOptions): SessionViewerState {
+    this.openViewerOptions.push(options);
+    return this.viewers.openViewer();
+  }
+
+  /** What the strict viewer input seam was asked to do, in call order. */
+  readonly openViewerOptions: (ViewerOpenOptions | undefined)[] = [];
+  readonly viewerInputSources = new Map<string, NativeViewerInputSource>();
+  readViewerInputSourceThrows = false;
+  readViewerInputSourceCalls: string[] = [];
+  readonly writeViewerInputCalls: { viewerId: string; request: NativeViewerInputRequest }[] = [];
+  writeViewerInputResult: NativeViewerInputResult = { status: "submitted" };
+  writeViewerInputThrows = false;
+
+  readViewerInputSource(viewerId: string): NativeViewerInputSource | undefined {
+    this.readViewerInputSourceCalls.push(viewerId);
+    if (this.readViewerInputSourceThrows) throw new Error("synthetic input-source failure");
+    return this.viewerInputSources.get(viewerId);
+  }
+
+  writeViewerInput(viewerId: string, request: NativeViewerInputRequest): NativeViewerInputResult {
+    this.writeViewerInputCalls.push({ viewerId, request });
+    if (this.writeViewerInputThrows) throw new Error("synthetic viewer write failure");
+    return this.writeViewerInputResult;
+  }
+
+  /** A manager fixture that offers no viewer input seam at all. */
+  withoutViewerInputSeam(): this {
+    // Own properties shadow the prototype methods, so the seam is genuinely absent
+    // for the service's capability check rather than merely throwing.
+    Object.defineProperty(this, "readViewerInputSource", { value: undefined });
+    Object.defineProperty(this, "writeViewerInput", { value: undefined });
+    return this;
+  }
 
   viewerState(viewerId: string): SessionViewerState | undefined { return this.viewers.viewerState(viewerId); }
 
@@ -570,4 +609,132 @@ test("only the manager's own duplicate refusal reads as an already-owned convers
   assert.equal(isDuplicateOwnedLaunchFailure(new Error("synthetic secret launch error")), false);
   assert.equal(isDuplicateOwnedLaunchFailure("already open in this host"), false);
   assert.equal(isDuplicateOwnedLaunchFailure(undefined), false);
+});
+
+const viewerModes = {
+  kittyFlags: 0,
+  applicationCursorKeys: false,
+  applicationKeypad: false,
+  bracketedPaste: false,
+  mouseTracking: "none",
+  modifyOtherKeys: 0,
+  mouseEncoding: "default",
+} as const;
+
+const viewerSource = (hostRunId: string): NativeViewerInputSource => ({
+  hostRunId,
+  viewerId: "viewer-1",
+  viewerRevision: 2,
+  rowId: "row-1",
+  nativeSession: { sessionId: "conversation-row-1", epoch: 3 },
+  geometry: { cols: 80, rows: 24, revision: 1 },
+  registrationIdentity: "registration-1",
+  registrationGeneration: "generation-1",
+  sourceToken: "nvs1.viewer-1.00000000000000000000000000000000",
+});
+
+test("viewer registration carries only the caller's own sink and always this host's run identity", () => {
+  const harness = fixture();
+  const snapshot = harness.service.readInventorySnapshot();
+  assert.ok(snapshot, "an open host reports its own run identity");
+  const sink: NativeViewerClipboardSink = () => undefined;
+  const bound = harness.service.openViewer({ nativeClipboardSink: sink });
+  assert.ok(bound);
+  assert.equal(harness.manager.openViewerOptions.length, 1, "the manager is asked once");
+  const options = harness.manager.openViewerOptions[0]!;
+  assert.deepEqual(Object.keys(options).sort(), ["hostRunId", "nativeClipboardSink"]);
+  assert.equal(options.hostRunId, snapshot.hostRunId, "the run identity is always the service's own");
+  assert.equal(options.nativeClipboardSink, sink, "the surface keeps exactly its own copy sink");
+
+  // A caller cannot choose the run identity: a supplied one is never forwarded, and
+  // a second surface of the same host gets the same run.
+  const other: NativeViewerClipboardSink = () => undefined;
+  const hijack = { nativeClipboardSink: other, hostRunId: "someone-elses-run" } as OwningHostViewerOptions;
+  assert.ok(harness.service.openViewer(hijack));
+  const second = harness.manager.openViewerOptions[1]!;
+  assert.equal(second.hostRunId, snapshot.hostRunId, "a foreign run identity never reaches the manager");
+  assert.equal(second.nativeClipboardSink, other);
+
+  // The no-argument registration is unchanged: the manager sees no options object at
+  // all, so an ordinary display surface gains no scope, sink, or input path.
+  assert.ok(harness.service.openViewer());
+  assert.equal(harness.manager.openViewerOptions[2], undefined);
+});
+
+test("the service forwards the viewer input seam and adds only its own run fence", () => {
+  const manager = new SyntheticManager();
+  const harness = fixture({ manager });
+  const runId = harness.service.readInventorySnapshot()!.hostRunId;
+  const source = viewerSource(runId);
+  manager.viewerInputSources.set("viewer-1", source);
+  assert.deepEqual(harness.service.readViewerInputSource("viewer-1"), source,
+    "the manager's own description is handed back unchanged");
+  assert.deepEqual(manager.readViewerInputSourceCalls, ["viewer-1"]);
+
+  const request: NativeViewerInputRequest = { expectedSource: source, expectedInputModes: viewerModes, data: "ls\r" };
+  assert.deepEqual(harness.service.writeViewerInput("viewer-1", request), { status: "submitted" });
+  assert.deepEqual(manager.writeViewerInputCalls, [{ viewerId: "viewer-1", request }],
+    "the observed facts are forwarded unchanged, exactly once");
+
+  // Only the run that minted a source may spend it, and the refusal happens before
+  // the manager is consulted at all.
+  assert.deepEqual(harness.service.writeViewerInput("viewer-1",
+    { ...request, expectedSource: { ...source, hostRunId: "another-host-run" } }),
+  { status: "refused", reason: "stale-source" }, "another host run's source is not spendable here");
+  for (const bad of [
+    {}, null, 7, "ls\r",
+    { expectedSource: source },
+    { expectedInputModes: viewerModes, data: "ls\r" },
+    { expectedSource: source, expectedInputModes: viewerModes },
+  ]) {
+    assert.deepEqual(harness.service.writeViewerInput("viewer-1", bad as unknown as NativeViewerInputRequest),
+      { status: "refused", reason: "invalid-input" }, `${JSON.stringify(bad)} is not a closed request`);
+  }
+  assert.equal(manager.writeViewerInputCalls.length, 1, "nothing refused here reached the manager");
+
+  // The manager's own truthful outcomes pass through unchanged, and a handoff whose
+  // result cannot be observed is an unknown outcome — never a claimed refusal, and
+  // never retried.
+  manager.writeViewerInputResult = { status: "refused", reason: "stale-input-modes" };
+  assert.deepEqual(harness.service.writeViewerInput("viewer-1", request),
+    { status: "refused", reason: "stale-input-modes" });
+  manager.writeViewerInputResult = { status: "unknown" };
+  assert.deepEqual(harness.service.writeViewerInput("viewer-1", request), { status: "unknown" });
+  manager.writeViewerInputThrows = true;
+  assert.deepEqual(harness.service.writeViewerInput("viewer-1", request), { status: "unknown" },
+    "a throwing handoff is unknown, not a refusal");
+  assert.equal(manager.writeViewerInputCalls.length, 4, "one call per attempt, never a retry");
+
+  // A manager without the seam, a throwing read, a closing host, or no manager at
+  // all is simply not an input path: nothing is inferred and no provider is invented.
+  const bare = fixture({ manager: new SyntheticManager().withoutViewerInputSeam() });
+  assert.equal(bare.service.readViewerInputSource("viewer-1"), undefined);
+  assert.deepEqual(bare.service.writeViewerInput("viewer-1", request), { status: "refused", reason: "unavailable" });
+
+  const throwingManager = new SyntheticManager();
+  throwingManager.readViewerInputSourceThrows = true;
+  const throwing = fixture({ manager: throwingManager });
+  assert.equal(throwing.service.readViewerInputSource("viewer-1"), undefined,
+    "a manager that cannot answer has no source, never a fabricated one");
+  // This service owns its own host run, so its caller observes its own source.
+  const throwingRequest: NativeViewerInputRequest = {
+    expectedSource: viewerSource(throwing.service.readInventorySnapshot()!.hostRunId),
+    expectedInputModes: viewerModes,
+    data: "ls\r",
+  };
+  assert.deepEqual(throwing.service.writeViewerInput("viewer-1", throwingRequest), { status: "submitted" },
+    "a read that cannot answer does not close the write seam, which stays the manager's to answer");
+  assert.equal(throwingManager.writeViewerInputCalls.length, 1, "the write seam was consulted once");
+
+  const torn = fixture();
+  torn.beginTeardown();
+  assert.equal(torn.service.readViewerInputSource("viewer-1"), undefined);
+  assert.deepEqual(torn.service.writeViewerInput("viewer-1", request), { status: "refused", reason: "unavailable" },
+    "a closing host takes no viewer input");
+  assert.equal(torn.manager.writeViewerInputCalls.length, 0);
+
+  const closed = fixture({ open: false });
+  assert.equal(closed.service.readViewerInputSource("viewer-1"), undefined);
+  assert.deepEqual(closed.service.writeViewerInput("viewer-1", request), { status: "refused", reason: "unavailable" });
+  assert.equal(closed.service.openViewer({ nativeClipboardSink: () => undefined }), undefined);
 });

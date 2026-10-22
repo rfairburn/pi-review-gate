@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join, relative } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { getCallSites } from "node:util";
-import type { NativeInputDecoder, NativeInputOrigin } from "./native-input-origin";
+import type { NativeInputDecoder, NativeInputExpectedTuple, NativeInputOrigin } from "./native-input-origin";
 import { isValidNativeSessionId, type SessionHostBootstrap } from "./protocol";
 
 /** Private authenticated transport, NOT permission to forward raw child OSC 52. */
@@ -390,6 +390,12 @@ interface FramedInputScope {
   readonly tuple: SessionTuple | undefined;
   readonly origin: NativeInputOrigin;
   readonly dispatchId: number;
+  /**
+   * The native conversation this dispatch was admitted against, for `viewer`
+   * dispatches only. It is carried with the dispatch so a deferred copy states the
+   * conversation its input actually belonged to, never the newest one.
+   */
+  readonly expectedNativeTuple: NativeInputExpectedTuple | undefined;
 }
 
 /**
@@ -423,6 +429,12 @@ function textDecoder(encoding: string): StringDecoder | undefined {
   try { return new StringDecoder(encoding as BufferEncoding); } catch { return undefined; }
 }
 
+/** True only while the child is still in the conversation this dispatch expected. */
+function tupleStillExpected(expected: NativeInputExpectedTuple | undefined, actual: SessionTuple | undefined): boolean {
+  if (expected === undefined) return true; // No viewer fence: unchanged legacy semantics.
+  return actual !== undefined && actual.sessionId === expected.sessionId && actual.sessionEpoch === expected.epoch;
+}
+
 /**
  * Strict mode: framing bytes are consumed, verified payload bytes are delivered
  * through the original `data` emitter under the dispatch's ALS context. The
@@ -433,6 +445,16 @@ function textDecoder(encoding: string): StringDecoder | undefined {
  * before a failure in the same chunk are still delivered under their captured
  * dispatch scope, so accepted input never depends on transport chunking; the
  * failing frame and every later byte are never delivered.
+ *
+ * A `viewer` dispatch additionally carries the native conversation it was admitted
+ * against. That expectation is compared with the child's ACTUAL conversation before
+ * the first fragment reaches a native input listener and again before every later
+ * fragment, so a `/new`, `/resume`, or reload performed inside an earlier listener
+ * cannot receive the rest of the older dispatch. Once a mismatch is seen, the
+ * remainder of that dispatch is consumed and suppressed through its final fragment:
+ * no raw fallback, no re-tagging the stale bytes to the new conversation, and no
+ * poisoning — the next dispatch that matches the current conversation is delivered
+ * normally, and nothing is replayed automatically.
  */
 function installFramedStdin(
   stdin: typeof process.stdin,
@@ -444,7 +466,12 @@ function installFramedStdin(
   let poisoned = false;
   // The open dispatch survives chunk boundaries: its captured tuple/origin and
   // its string decoder are per LOGICAL DISPATCH, never per chunk or feed.
-  let open: { readonly scope: FramedInputScope; readonly text: StringDecoder | undefined } | undefined;
+  let open: {
+    readonly scope: FramedInputScope;
+    readonly text: StringDecoder | undefined;
+    readonly expected: NativeInputExpectedTuple | undefined;
+    suppressed: boolean;
+  } | undefined;
   stdin.emit = function (event: string | symbol, ...args: unknown[]): boolean {
     if (event !== "data") {
       // End of input with a partial frame or dispatch is a truncation, not a raw fallback.
@@ -459,17 +486,33 @@ function installFramedStdin(
     for (const fragment of fed.fragments) {
       if (fragment.start) {
         const tuple = currentTuple();
+        const expected = fragment.expectedNativeTuple;
         open = {
           scope: Object.freeze({
             tuple: tuple ? Object.freeze({ ...tuple }) : undefined,
+            expectedNativeTuple: expected ? Object.freeze({ ...expected }) : undefined,
             origin: fragment.origin,
             dispatchId: fragment.dispatchId,
           }),
           text: encoding === null ? undefined : textDecoder(encoding),
+          expected,
+          // A viewer dispatch admitted against another conversation is refused
+          // whole, before a single byte reaches a listener.
+          suppressed: !tupleStillExpected(expected, tuple),
         };
       }
       const active = open;
       if (active === undefined) { poisoned = true; return true; } // Unreachable: part 0 always opens.
+      if (!active.suppressed && !tupleStillExpected(active.expected, currentTuple())) {
+        // A session change inside an earlier listener: the rest of this dispatch
+        // belongs to no conversation. Consume it, deliver none of it, never re-tag.
+        active.suppressed = true;
+      }
+      if (active.suppressed) {
+        consumed = true; // Authenticated framing bytes are consumed, not passed on.
+        if (fragment.end) open = undefined;
+        continue;
+      }
       const payload = fragment.payload;
       if (payload.length > 0) {
         const chunk: Buffer | string = active.text === undefined ? payload : active.text.write(payload);

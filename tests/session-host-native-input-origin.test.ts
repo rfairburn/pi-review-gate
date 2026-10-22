@@ -5,14 +5,20 @@ import {
   NATIVE_INPUT_MAX_ENVELOPE_BYTES,
   NATIVE_INPUT_MAX_VIEWER_TOKEN_CHARS,
   NATIVE_INPUT_RAW_FRAGMENT_BYTES,
+  NATIVE_INPUT_VIEWER_SCOPE_TOKEN_CHARS,
   createNativeInputDecoder,
   createNativeInputEncoder,
   frameNativeInputBody,
   isValidNativeInputOrigin,
+  mintNativeViewerScopeToken,
+  parseNativeViewerScopeToken,
+  verifyNativeViewerScopeToken,
   type NativeInputDecoder,
+  type NativeInputExpectedTuple,
   type NativeInputFailureCode,
   type NativeInputFragment,
   type NativeInputOrigin,
+  type NativeViewerScopeFacts,
 } from "../src/session-host/native-input-origin";
 import type { SessionHostBootstrap } from "../src/session-host/protocol";
 
@@ -43,6 +49,10 @@ function flipHex(value: string, index: number): string {
 }
 
 function bodyText(overrides: Record<string, unknown> = {}): string {
+  // Hand-built bodies are built in the encoder's canonical key order, including the
+  // optional fence, which sits between `origin` and `encoded`. An unknown key still
+  // lands last, exactly where it always did.
+  const { expectedNativeTuple, ...rest } = overrides;
   return JSON.stringify({
     v: 1,
     instanceId: bootstrap.instanceId,
@@ -52,8 +62,9 @@ function bodyText(overrides: Record<string, unknown> = {}): string {
     part: 0,
     final: true,
     origin: { kind: "local" },
+    ...(expectedNativeTuple === undefined ? {} : { expectedNativeTuple }),
     encoded: "",
-    ...overrides,
+    ...rest,
   });
 }
 
@@ -63,6 +74,19 @@ function frameText(text: string): string {
 
 function frameBody(overrides: Record<string, unknown> = {}): string {
   return frameText(bodyText(overrides));
+}
+
+/** One authenticated native-conversation fence carried by a `viewer` dispatch. */
+const nativeTuple = (sessionId: string, epoch: number): NativeInputExpectedTuple => ({ sessionId, epoch });
+/** The fence a viewer origin must carry; absent for every other origin. */
+const tupleFor = (origin: NativeInputOrigin): NativeInputExpectedTuple | undefined =>
+  origin.kind === "viewer" ? nativeTuple("conversation-scope", 4) : undefined;
+
+/** The decoded canonical body of one complete single-frame dispatch. */
+function bodyOf(framed: string): Record<string, unknown> {
+  const fields = framed.slice(0, -1).split(";");
+  assert.equal(fields.length, 5);
+  return JSON.parse(Buffer.from(fields[3]!, "base64url").toString("utf8")) as Record<string, unknown>;
 }
 
 function expectRefused(input: string, code: NativeInputFailureCode): void {
@@ -94,7 +118,8 @@ test("every origin carries exact payload bytes once, including NUL, controls and
   ];
   for (const origin of origins) {
     for (const payload of payloads) {
-      const framed = createNativeInputEncoder(bootstrap).encode(payload, origin);
+      const expected = tupleFor(origin);
+      const framed = createNativeInputEncoder(bootstrap).encode(payload, origin, expected);
       const decoder = createNativeInputDecoder(bootstrap);
       const result = decoder.feed(framed);
       assert.equal(result.ok, true);
@@ -105,6 +130,16 @@ test("every origin carries exact payload bytes once, including NUL, controls and
       assert.equal(fragment.origin.kind, origin.kind);
       assert.deepEqual(Object.keys(fragment.origin), origin.kind === "viewer" ? ["kind", "token"] : ["kind"]);
       assert.equal(fragment.origin.kind === "viewer", origin.kind === "viewer", "only an explicit viewer origin is viewer");
+      // The fence is part of the closed fragment shape: always present, only ever
+      // valued for a viewer dispatch, and owned rather than shared with the caller.
+      assert.equal(Object.hasOwn(fragment, "expectedNativeTuple"), true);
+      if (origin.kind === "viewer") {
+        assert.deepEqual({ ...fragment.expectedNativeTuple }, expected);
+        assert.ok(Object.isFrozen(fragment.expectedNativeTuple));
+        assert.notEqual(fragment.expectedNativeTuple, expected, "the decoder owns its own fence object");
+      } else {
+        assert.equal(fragment.expectedNativeTuple, undefined, "local and none dispatches never carry a viewer fence");
+      }
       assert.equal(fragment.dispatchId, 1);
       assert.equal(fragment.part, 0);
       assert.equal(fragment.start, true);
@@ -140,7 +175,8 @@ test("empty dispatches deliver an empty owned payload without inventing input or
 
 test("every split boundary and one-byte feeds decode without early or partial delivery", () => {
   const payload = Buffer.from("boundary 雪 🙂 payload", "utf8");
-  const framed = createNativeInputEncoder(bootstrap).encode(payload, { kind: "viewer", token: "viewer-boundary" });
+  const framed = createNativeInputEncoder(bootstrap)
+    .encode(payload, { kind: "viewer", token: "viewer-boundary" }, nativeTuple("conversation-boundary", 1));
 
   for (const asBuffer of [false, true]) {
     for (let split = 0; split <= framed.length; split += 1) {
@@ -170,7 +206,7 @@ test("coalesced dispatches keep ordered context and interleaving is rejected", (
   const encoder = createNativeInputEncoder(bootstrap);
   const first = encoder.encode(Buffer.from("first", "utf8"), { kind: "local" });
   const second = encoder.encode(Buffer.alloc(0), { kind: "none" });
-  const third = encoder.encode(Buffer.from("third", "utf8"), { kind: "viewer", token: "viewer-three" });
+  const third = encoder.encode(Buffer.from("third", "utf8"), { kind: "viewer", token: "viewer-three" }, nativeTuple("conversation-three", 2));
   const decoder = createNativeInputDecoder(bootstrap);
   const result = decoder.feed(first + second + third);
   assert.equal(result.ok, true);
@@ -184,6 +220,10 @@ test("coalesced dispatches keep ordered context and interleaving is rejected", (
   assert.equal(result.fragments[2]!.origin.kind, "viewer");
   const viewerFragment = result.fragments[2]!;
   assert.equal(viewerFragment.origin.kind === "viewer" ? viewerFragment.origin.token : "", "viewer-three");
+  assert.deepEqual({ ...viewerFragment.expectedNativeTuple }, nativeTuple("conversation-three", 2),
+    "each dispatch carries only its own fence");
+  assert.equal(result.fragments[0]!.expectedNativeTuple, undefined);
+  assert.equal(result.fragments[1]!.expectedNativeTuple, undefined);
 
   const opener = createNativeInputEncoder(bootstrap);
   const left = fragmentsOf(opener.encode(Buffer.alloc(NATIVE_INPUT_RAW_FRAGMENT_BYTES + 8, 1), { kind: "local" }));
@@ -492,4 +532,293 @@ test("origin validation and encoder misuse never echo tokens or payloads", () =>
   );
   assert.throws(() => encoder.encode("not a buffer" as unknown as Buffer, { kind: "local" }),
     (error: unknown) => error instanceof Error && !error.message.includes("not a buffer"));
+});
+
+test("a viewer dispatch requires exactly one authenticated native-conversation fence", () => {
+  const encoder = createNativeInputEncoder(bootstrap);
+  const tuple = nativeTuple("conversation-a", 3);
+  const viewerOrigin: NativeInputOrigin = { kind: "viewer", token: "viewer-1" };
+
+  // A viewer dispatch without its fence, and a non-viewer dispatch claiming one,
+  // are both caller errors: the closed shape cannot be skipped or borrowed.
+  assert.throws(() => encoder.encode(Buffer.from("x"), viewerOrigin), /expected tuple/);
+  for (const origin of [{ kind: "local" }, { kind: "none" }] as NativeInputOrigin[]) {
+    assert.throws(() => encoder.encode(Buffer.from("x"), origin, tuple), /expected tuple/);
+  }
+
+  for (const bad of [
+    { sessionId: "conversation-a" },
+    { epoch: 3 },
+    { sessionId: "conversation-a", epoch: 0 },
+    { sessionId: "conversation-a", epoch: -1 },
+    { sessionId: "conversation-a", epoch: 1.5 },
+    { sessionId: "conversation-a", epoch: Number.MAX_SAFE_INTEGER + 1 },
+    { sessionId: "conversation-a", epoch: 3, extra: 1 },
+    { sessionId: "", epoch: 3 },
+    { sessionId: "conversation\u0000a", epoch: 3 },
+    { sessionId: "conversation\na", epoch: 3 },
+    { sessionId: "a/b", epoch: 3 },
+    { sessionId: "a".repeat(4096), epoch: 3 },
+    { sessionId: 7, epoch: 3 },
+    null,
+    "conversation-a",
+    3,
+  ]) {
+    assert.throws(
+      () => encoder.encode(Buffer.from("x"), viewerOrigin, bad as unknown as NativeInputExpectedTuple),
+      /expected tuple/, `${JSON.stringify(bad)} is not a bounded native conversation tuple`,
+    );
+  }
+
+  // A refusal never echoes the payload, the token, or the conversation identity.
+  const secretToken = "opaque-viewer-token-with-secret-shape";
+  assert.throws(
+    () => encoder.encode(Buffer.from("secret-payload-bytes"), { kind: "viewer", token: secretToken },
+      { sessionId: "secret-conversation", epoch: 0 }),
+    (error: unknown) => error instanceof Error
+      && !error.message.includes(secretToken)
+      && !error.message.includes("secret-payload-bytes")
+      && !error.message.includes("secret-conversation"),
+  );
+
+  // The VALUE is never validated by the codec: an expectation the child has
+  // already outgrown is authenticated framing, and refusing it is the bridge's
+  // ordinary per-fragment decision, not protocol corruption.
+  const stale = nativeTuple("conversation-long-gone", 99);
+  const framed = encoder.encode(Buffer.from("stale keys"), viewerOrigin, stale);
+  const decoder = createNativeInputDecoder(bootstrap);
+  const result = decoder.feed(framed);
+  assert.equal(result.ok, true, "a stale fence is not a decoder failure");
+  assert.deepEqual({ ...result.fragments[0]!.expectedNativeTuple }, stale);
+  assert.equal(decoder.finish().ok, true, "the decoder stays usable for the next dispatch");
+});
+
+test("the fence is canonical authenticated framing while local and none bodies stay byte-for-byte unchanged", () => {
+  // Each byte comparison gets its own encoder at sequence 1, so it is compared
+  // against the first frame a registration ever produces, never a continuation.
+  assert.equal(createNativeInputEncoder(bootstrap).encode(Buffer.alloc(0), { kind: "local" }), frameBody(),
+    "the unchanged canonical body is exactly what a local dispatch produced before this fence existed");
+  assert.equal(createNativeInputEncoder(bootstrap).encode(Buffer.alloc(0), { kind: "none" }),
+    frameBody({ origin: { kind: "none" } }),
+    "no new key, no reordering, no new bytes");
+
+  const tuple = nativeTuple("conversation-canonical", 2);
+  const framed = createNativeInputEncoder(bootstrap)
+    .encode(Buffer.from("v"), { kind: "viewer", token: "viewer-1" }, tuple);
+  assert.deepEqual(bodyOf(framed).expectedNativeTuple, tuple);
+  assert.deepEqual(Object.keys(bodyOf(framed)), [
+    "v", "instanceId", "generation", "sequence", "dispatchId", "part", "final",
+    "origin", "expectedNativeTuple", "encoded",
+  ], "the fence travels in its own canonical position, inside the signed body");
+  assert.equal(createNativeInputDecoder(bootstrap).feed(framed).ok, true);
+
+  // Any other key order is non-canonical authenticated framing, even when every
+  // field is otherwise perfect and correctly signed.
+  const handBuilt = {
+    v: 1, instanceId: bootstrap.instanceId, generation: bootstrap.generation,
+    sequence: 1, dispatchId: 1, part: 0, final: true,
+    origin: { kind: "viewer", token: "viewer-1" },
+    expectedNativeTuple: { sessionId: "conversation-canonical", epoch: 2 },
+    encoded: Buffer.from("v", "utf8").toString("base64url"),
+  };
+  const canonicalText = JSON.stringify(handBuilt);
+  assert.equal(createNativeInputDecoder(bootstrap).feed(frameText(canonicalText)).ok, true,
+    "a hand-built canonical body with the fence is exactly what the encoder produces");
+  const swapped = canonicalText.replace(
+    '"origin":{"kind":"viewer","token":"viewer-1"},"expectedNativeTuple":{"sessionId":"conversation-canonical","epoch":2},',
+    '"expectedNativeTuple":{"sessionId":"conversation-canonical","epoch":2},"origin":{"kind":"viewer","token":"viewer-1"},',
+  );
+  assert.notEqual(swapped, canonicalText, "the swap really moved the fence");
+  expectRefused(frameText(swapped), "malformed-frame");
+
+  // A viewer dispatch cannot drop its fence mid-dispatch or move it to another origin.
+  expectRefused(frameBody({ origin: { kind: "viewer", token: "v" } }), "invalid-origin");
+  expectRefused(frameBody({
+    origin: { kind: "viewer", token: "v" },
+    expectedNativeTuple: { sessionId: "conversation-a", epoch: 0 },
+  }), "malformed-frame");
+  expectRefused(frameBody({ expectedNativeTuple: { sessionId: "conversation-a", epoch: 1 } }), "invalid-origin");
+  expectRefused(frameBody({ expectedNativeTuple: null }), "malformed-frame");
+
+  // One logical dispatch carries exactly one immutable fence.
+  const opener = createNativeInputEncoder(bootstrap);
+  const parts = fragmentsOf(opener.encode(Buffer.alloc(NATIVE_INPUT_RAW_FRAGMENT_BYTES + 4, 1),
+    { kind: "viewer", token: "viewer-open" }, nativeTuple("conversation-open", 5)));
+  assert.equal(parts.length, 2);
+  const decoder = createNativeInputDecoder(bootstrap);
+  const opened = decoder.feed(parts[0]!);
+  assert.equal(opened.ok, true);
+  assert.deepEqual({ ...opened.fragments[0]!.expectedNativeTuple }, nativeTuple("conversation-open", 5));
+  const moved = decoder.feed(frameBody({
+    sequence: 2, dispatchId: 1, part: 1, final: true,
+    origin: { kind: "viewer", token: "viewer-open" },
+    expectedNativeTuple: { sessionId: "conversation-open", epoch: 6 },
+  }));
+  assert.equal(moved.ok, false);
+  if (moved.ok) assert.fail("a fence change inside one dispatch must be rejected");
+  assert.equal(moved.code, "invalid-dispatch");
+  assert.deepEqual(moved.fragments, [], "nothing of the tampered dispatch is delivered");
+});
+
+/** One viewer scope fact set for the pure commitment helpers. */
+function scopeFacts(overrides: Partial<NativeViewerScopeFacts> = {}): NativeViewerScopeFacts {
+  return {
+    hostRunId: "host-run-1",
+    viewerId: "viewer-1",
+    viewerRevision: 1,
+    rowId: "row-1",
+    registrationIdentity: bootstrap.instanceId,
+    registrationGeneration: bootstrap.generation,
+    nativeSessionId: "conversation-a",
+    nativeSessionEpoch: 1,
+    cols: 80,
+    rows: 24,
+    geometryRevision: 0,
+    ...overrides,
+  };
+}
+
+test("a viewer scope token commits to the host's own facts and fits the existing origin bound", () => {
+  const minted = mintNativeViewerScopeToken(bootstrap, scopeFacts());
+  assert.ok(typeof minted === "string");
+  const token = minted as string;
+  assert.match(token, /^nvs1\.viewer-1\.[0-9a-f]{32}$/);
+  assert.ok(token.length <= NATIVE_INPUT_VIEWER_SCOPE_TOKEN_CHARS, "a minted token is a legal origin token");
+  assert.equal(NATIVE_INPUT_VIEWER_SCOPE_TOKEN_CHARS, NATIVE_INPUT_MAX_VIEWER_TOKEN_CHARS);
+  assert.equal(token.split(".").length, 3, "tag, one opaque handle, one commitment, nothing else");
+  assert.equal(isValidNativeInputOrigin({ kind: "viewer", token }), true);
+  assert.equal(token.includes(bootstrap.token), false, "the registration secret never appears in a token");
+  assert.equal(token.includes(bootstrap.generation), false);
+  assert.deepEqual(parseNativeViewerScopeToken(token), { viewerId: "viewer-1" });
+  assert.equal(Object.isFrozen(parseNativeViewerScopeToken(token)), true);
+  assert.equal(verifyNativeViewerScopeToken(bootstrap, token, scopeFacts()), true);
+  assert.equal(verifyNativeViewerScopeToken(bootstrap, token, scopeFacts({ hostRunId: "host-run-2" })), false,
+    "another host run's viewer cannot spend this scope");
+});
+
+test("scope verification refuses every stale fact, foreign registration and uncanonical token", () => {
+  const token = mintNativeViewerScopeToken(bootstrap, scopeFacts()) as string;
+
+  // Every committed fact is load-bearing: changing any one of them (including an
+  // ABA geometry change that lands back on the same size) verifies to false.
+  for (const stale of [
+    scopeFacts({ viewerId: "viewer-2" }),
+    scopeFacts({ viewerRevision: 2 }),
+    scopeFacts({ hostRunId: "host-run-2" }),
+    scopeFacts({ rowId: "row-2" }),
+    scopeFacts({ registrationIdentity: "99999999-9999-9999-9999-999999999999" }),
+    scopeFacts({ registrationGeneration: "88888888-8888-8888-8888-888888888888" }),
+    scopeFacts({ nativeSessionId: "conversation-b" }),
+    scopeFacts({ nativeSessionEpoch: 2 }),
+    scopeFacts({ cols: 81 }),
+    scopeFacts({ rows: 25 }),
+    // Resized away and back to the identical size: still a newer geometry.
+    scopeFacts({ geometryRevision: 1 }),
+  ]) {
+    assert.equal(verifyNativeViewerScopeToken(bootstrap, token, stale), false,
+      `${JSON.stringify(stale)} is not the committed scope`);
+  }
+
+  // A different registration derives a different commitment for identical facts.
+  for (const foreign of [
+    { ...bootstrap, token: "cd".repeat(32) },
+    { ...bootstrap, instanceId: "77777777-7777-7777-7777-777777777777" },
+    { ...bootstrap, generation: "66666666-6666-6666-6666-666666666666" },
+  ]) {
+    assert.equal(verifyNativeViewerScopeToken(foreign, token, scopeFacts()), false);
+    assert.notEqual(mintNativeViewerScopeToken(foreign, scopeFacts()), token);
+  }
+
+  // Parsing is only a lookup aid; a well-formed but unauthenticated token verifies
+  // to false, and an uncanonical token never yields a handle at all.
+  const flipped = `${token.slice(0, -1)}${token.endsWith("0") ? "1" : "0"}`;
+  assert.equal(verifyNativeViewerScopeToken(bootstrap, flipped, scopeFacts()), false);
+  assert.deepEqual(parseNativeViewerScopeToken(flipped), { viewerId: "viewer-1" });
+  const forged = `nvs1.viewer-1.${"0".repeat(32)}`;
+  assert.equal(verifyNativeViewerScopeToken(bootstrap, forged, scopeFacts()), false);
+  for (const junk of [
+    "", "nvs1.viewer-1", `nvs1.viewer-1.${"a".repeat(31)}`, `nvs1.viewer-1.${"a".repeat(33)}`,
+    `nvs1.viewer-1.${"A".repeat(32)}`, "nvs1..".concat("a".repeat(32)), `nvs1.viewer-1.extra.${"a".repeat(32)}`,
+    `nvs2.viewer-1.${"a".repeat(32)}`, `nvs1.vi ewer.${"a".repeat(32)}`, `nvs1.viewer-1.${"a".repeat(32)}\n`,
+    `nvs1.viewer-1.${"g".repeat(32)}`, `${token}\n`, token.toUpperCase(),
+    null, undefined, 7, { viewerId: "viewer-1" }, Symbol.iterator,
+  ]) {
+    assert.equal(parseNativeViewerScopeToken(junk), undefined);
+    assert.equal(verifyNativeViewerScopeToken(bootstrap, junk, scopeFacts()), false);
+  }
+
+  // The handle itself is bounded, so a hostile identity can never widen the token.
+  assert.equal(mintNativeViewerScopeToken(bootstrap, scopeFacts({ viewerId: `${"v".repeat(64)}x` })), undefined);
+  assert.equal(mintNativeViewerScopeToken(bootstrap, scopeFacts({ viewerId: "" })), undefined);
+  assert.equal(mintNativeViewerScopeToken(bootstrap, scopeFacts({ viewerId: "has space" })), undefined);
+});
+
+test("scope minting and verification fail closed on malformed facts and registrations without throwing", () => {
+  for (const bad of [
+    undefined, null, 7, "facts", [],
+    { ...scopeFacts(), extra: 1 },
+    Object.fromEntries(Object.entries(scopeFacts()).filter(([key]) => key !== "hostRunId")),
+    { ...scopeFacts(), hostRunId: "" },
+    { ...scopeFacts(), hostRunId: "\u0000run" },
+    { ...scopeFacts(), hostRunId: "r".repeat(200) },
+    { ...scopeFacts(), viewerRevision: -1 },
+    { ...scopeFacts(), viewerRevision: 1.5 },
+    { ...scopeFacts(), nativeSessionEpoch: 0 },
+    { ...scopeFacts(), nativeSessionEpoch: "1" },
+    { ...scopeFacts(), cols: 0 },
+    { ...scopeFacts(), rows: -1 },
+    { ...scopeFacts(), geometryRevision: Number.MAX_SAFE_INTEGER + 1 },
+    { ...scopeFacts(), registrationGeneration: "" },
+  ]) {
+    assert.equal(mintNativeViewerScopeToken(bootstrap, bad as unknown as NativeViewerScopeFacts), undefined);
+    assert.equal(verifyNativeViewerScopeToken(bootstrap, "nvs1.viewer-1.".concat("a".repeat(32)),
+      bad as unknown as NativeViewerScopeFacts), false);
+  }
+
+  // A malformed registration mints nothing and verifies nothing; it never throws
+  // into an input path and never falls back to another key.
+  const broken = { ...bootstrap, token: "not-hex" } as unknown as typeof bootstrap;
+  assert.equal(mintNativeViewerScopeToken(broken, scopeFacts()), undefined);
+  assert.equal(verifyNativeViewerScopeToken(broken, "nvs1.viewer-1.".concat("a".repeat(32)), scopeFacts()), false);
+
+  // Minting is a pure derivation: no state, no nonce, no counter, and no reuse of
+  // any other dispatch's sequence.
+  assert.equal(mintNativeViewerScopeToken(bootstrap, scopeFacts()), mintNativeViewerScopeToken(bootstrap, scopeFacts()));
+});
+
+test("viewer tuples and commitments preserve the protocol's native session ID domain", () => {
+  // The protocol's own native identity domain is opaque text bounded in UTF-8
+  // bytes, control-free and path-free — it is NOT ASCII-only. The framing envelope
+  // stays ASCII bytes by escaping canonically, so a valid identity neither fails
+  // its own decoder nor poisons anything that follows it.
+  for (const sessionId of ["conversation-雪", "n".repeat(256)]) {
+    const encoder = createNativeInputEncoder(bootstrap);
+    const decoder = createNativeInputDecoder(bootstrap);
+    const tuple = nativeTuple(sessionId, 1);
+    const framed = encoder.encode(Buffer.from("x"), { kind: "viewer", token: "viewer-1" }, tuple);
+    assert.equal(/[\u0080-\uffff]/.test(framed), false, "the envelope itself stays pure ASCII bytes");
+    const result = decoder.feed(framed);
+    assert.equal(result.ok, true, "a valid conversation identity is never a decoder failure");
+    assert.deepEqual(result.fragments[0]!.expectedNativeTuple, tuple, "the identity round-trips exactly");
+    assert.deepEqual(result.fragments[0]!.payload.toString("utf8"), "x");
+    const next = decoder.feed(encoder.encode(Buffer.from("next"), { kind: "local" }));
+    assert.equal(next.ok, true, "the next dispatch on this registration is delivered normally");
+    assert.deepEqual(next.fragments[0]!.payload.toString("utf8"), "next");
+
+    const facts = scopeFacts({ nativeSessionId: sessionId });
+    const token = mintNativeViewerScopeToken(bootstrap, facts);
+    assert.equal(typeof token, "string", "a valid identity still describes a scope");
+    assert.equal(verifyNativeViewerScopeToken(bootstrap, token, facts), true);
+    assert.equal(verifyNativeViewerScopeToken(bootstrap, token,
+      scopeFacts({ nativeSessionId: `${sessionId}-other` })), false,
+    "another conversation identity is a different scope");
+  }
+
+  // An identity the protocol itself rejects still mints nothing and frames nothing.
+  assert.equal(mintNativeViewerScopeToken(bootstrap, scopeFacts({ nativeSessionId: "" })), undefined);
+  assert.equal(mintNativeViewerScopeToken(bootstrap, scopeFacts({ nativeSessionId: "a/b" })), undefined);
+  assert.equal(mintNativeViewerScopeToken(bootstrap, scopeFacts({ nativeSessionId: "a\u0000b" })), undefined);
+  assert.equal(mintNativeViewerScopeToken(bootstrap, scopeFacts({ nativeSessionId: "n".repeat(257) })), undefined);
+  assert.throws(() => createNativeInputEncoder(bootstrap).encode(Buffer.from("x"),
+    { kind: "viewer", token: "viewer-1" }, nativeTuple("a\u0000b", 1)), /expected tuple/);
 });

@@ -26,7 +26,7 @@ import {
   type NativeClipboardEvent,
   type NativeClipboardOriginEvent,
 } from "../src/session-host/native-clipboard";
-import { createNativeInputEncoder, type NativeInputOrigin } from "../src/session-host/native-input-origin";
+import { createNativeInputEncoder, NATIVE_INPUT_RAW_FRAGMENT_BYTES, type NativeInputOrigin } from "../src/session-host/native-input-origin";
 import type { SessionHostBootstrap } from "../src/session-host/protocol";
 
 const bootstrap: SessionHostBootstrap = {
@@ -131,6 +131,10 @@ function frameChunks(framed: string): string[] {
 const local: NativeInputOrigin = { kind: "local" };
 const viewer = (token: string): NativeInputOrigin => ({ kind: "viewer", token });
 const none: NativeInputOrigin = { kind: "none" };
+/** The child's current conversation, exactly as the Reporter states it. */
+const conversation = (sessionId: string, epoch: number): Record<string, unknown> => ({ sessionId, sessionEpoch: epoch });
+/** The native conversation one viewer dispatch is admitted against. */
+const fence = (sessionId: string, epoch: number) => ({ sessionId, epoch });
 const copyText = (text: string): string => Buffer.from(text, "utf8").toString("base64");
 const copiedText = (event: NativeClipboardEvent): string => Buffer.from(
   event.kind === "copy" ? event.encoded : "", "base64",
@@ -248,29 +252,30 @@ test("strict framing captures the dispatch tuple/origin once across an epoch upd
   const betaPayload = Buffer.from("beta payload", "utf8");
   const deltaPayload = Buffer.from("delta payload", "utf8");
   const epsilonPayload = Buffer.from("epsilon payload", "utf8");
-  const alpha = frameChunks(encoder.encode(alphaPayload, viewer("opaque-viewer-1")));
+  const alpha = frameChunks(encoder.encode(alphaPayload, viewer("opaque-viewer-1"), fence("native-session-a", 3)));
   const beta = frameChunks(encoder.encode(betaPayload, local));
-  const delta = frameChunks(encoder.encode(deltaPayload, viewer("opaque-viewer-2")));
+  const delta = frameChunks(encoder.encode(deltaPayload, viewer("opaque-viewer-2"), fence("native-session-a", 5)));
   const epsilon = frameChunks(encoder.encode(epsilonPayload, local));
   assert.equal(alpha.length, 3, "the alpha dispatch spans three technical fragments");
 
   const report = runScenario({
     options: { inputOriginFraming: true },
     steps: [
-      { op: "session", tuple: { sessionId: "native-session-a", sessionEpoch: 3 } },
+      { op: "session", tuple: conversation("native-session-a", 3) },
       // A's copy is scheduled while A's part 0 is the live dispatch, then deferred.
       { op: "armCopy", text: "copy-alpha", defer: true, delay: 0 },
       { op: "feed", hex: alpha[0]! },
       { op: "feed", hex: alpha[1]! },
-      // The Reporter publishes a newer epoch in the middle of A's dispatch.
-      { op: "session", tuple: { sessionId: "native-session-a", sessionEpoch: 4 } },
+      // The Reporter publishes a newer epoch in the middle of A's dispatch — what
+      // an in-child /new or /resume performed by an earlier listener looks like.
+      { op: "session", tuple: conversation("native-session-a", 4) },
       { op: "feed", hex: alpha[2]! },
       // B is a local dispatch on the newer tuple, delivered before A's deferred copy.
       { op: "armCopy", text: "copy-beta", defer: false },
       { op: "feed", hex: beta[0]! },
       { op: "wait", ms: 30 },
       // D and E share one tuple: origins must not leak between dispatches.
-      { op: "session", tuple: { sessionId: "native-session-a", sessionEpoch: 5 } },
+      { op: "session", tuple: conversation("native-session-a", 5) },
       { op: "armCopy", text: "copy-delta", defer: true, delay: 0 },
       { op: "feed", hex: delta[0]! },
       { op: "armCopy", text: "copy-epsilon", defer: false },
@@ -283,11 +288,23 @@ test("strict framing captures the dispatch tuple/origin once across an epoch upd
   assert.equal(report.reinstall, false);
   assert.equal(readyWrites(report).length, 1);
   assert.deepEqual(otherTexts(report), []);
+  assert.deepEqual(report.feeds, [true, true, true, true, true, true],
+    "every authenticated chunk is consumed, including a stale viewer tail");
 
-  assert.equal(report.payloads.length, 6);
-  assert.equal(Buffer.concat(report.payloads.map(bytesOf)).equals(
-    Buffer.concat([alphaPayload, betaPayload, deltaPayload, epsilonPayload]),
-  ), true, "no framing byte reaches native listeners and no payload byte is lost");
+  // Alpha's own fence named epoch 3, so once the child moved to epoch 4 its tail
+  // belonged to no conversation: consumed, never delivered, never re-tagged onto
+  // the newer one. The local beta dispatch carries no such fence and keeps its
+  // unchanged whole-dispatch delivery on the newer tuple.
+  assert.equal(report.payloads.length, 5);
+  assert.equal(Buffer.concat(report.payloads.map(bytesOf)).equals(Buffer.concat([
+    alphaPayload.subarray(0, 2 * NATIVE_INPUT_RAW_FRAGMENT_BYTES),
+    betaPayload, deltaPayload, epsilonPayload,
+  ])), true,
+  "no framing byte reaches native listeners, no admitted payload byte is lost, and no stale byte is added");
+  assert.deepEqual(bytesOf(report.payloads[1]!),
+    alphaPayload.subarray(NATIVE_INPUT_RAW_FRAGMENT_BYTES, 2 * NATIVE_INPUT_RAW_FRAGMENT_BYTES));
+  assert.deepEqual(bytesOf(report.payloads[2]!), betaPayload,
+    "the next dispatch is delivered normally: a stale viewer tail poisons nothing");
   assert.ok(report.payloads.every((payload) => payload.kind === "buffer"));
   assert.ok(report.payloads.every((payload) => payload.thisIsStdin && payload.argCount === 0));
   assert.ok(copyCapsules(report).every((capsule) => capsule.startsWith("prg-native-copy-v2;")),
@@ -335,7 +352,7 @@ test("strict framing preserves exact bytes across splits, coalescing, decoys, la
   );
   const first = Buffer.from(encoder.encode(decoy, local), "ascii");
   const large = Buffer.from("L".repeat(70_000), "latin1");
-  const largeFrames = frameChunks(encoder.encode(large, viewer("opaque-viewer-3")));
+  const largeFrames = frameChunks(encoder.encode(large, viewer("opaque-viewer-3"), fence("native-session-bytes", 1)));
   const coalesced = Buffer.from([...frameChunks(encoder.encode(Buffer.from("third"), local)),
     ...frameChunks(encoder.encode(Buffer.from("fourth"), local))].join(""), "hex");
   const unicodeText = `${"a".repeat(32_767)}\u00e9tail`;
@@ -581,4 +598,59 @@ test("suppressed copies and forwarded or encapsulated writes keep stdout callbac
   assert.equal(legacy.writes[0]!.callbackProvided, true, "the legacy capsule write keeps its callback");
   assert.ok(copyCapsules(legacy)[0]!.startsWith("prg-native-copy-v1;"));
   assert.ok(legacy.writes.every((write) => write.receiverIsStdout));
+});
+
+test("a stale viewer fence is consumed before any listener and never poisons the next dispatch", () => {
+  const encoder = createNativeInputEncoder(bootstrap);
+  const staleWhole = frameChunks(encoder.encode(
+    Buffer.from("stale whole dispatch", "utf8"), viewer("opaque-viewer-stale"), fence("native-session-fence", 7),
+  ));
+  const midPayload = Buffer.from("M".repeat(70_000), "utf8");
+  const mid = frameChunks(encoder.encode(midPayload, viewer("opaque-viewer-mid"), fence("native-session-fence", 8)));
+  const localSpanning = frameChunks(encoder.encode(Buffer.from("local spans on", "utf8"), local));
+  const currentWhole = frameChunks(encoder.encode(
+    Buffer.from("current keys", "utf8"), viewer("opaque-viewer-current"), fence("native-session-fence", 9),
+  ));
+  assert.equal(mid.length, 3, "the mid dispatch spans the fragment boundary");
+
+  const report = runScenario({
+    options: { inputOriginFraming: true },
+    steps: [
+      // 1. The child already moved on: a whole viewer dispatch admitted against an
+      //    older conversation is refused before its first byte reaches a listener.
+      { op: "session", tuple: conversation("native-session-fence", 8) },
+      { op: "feed", hex: staleWhole[0]! },
+      // 2. A viewer dispatch for the CURRENT conversation starts normally, then the
+      //    conversation changes before its tail arrives: the rest is consumed.
+      { op: "feed", hex: mid[0]! },
+      { op: "session", tuple: conversation("native-session-fence", 9) },
+      { op: "feed", hex: mid[1]! },
+      { op: "feed", hex: mid[2]! },
+      // 3. A local dispatch on the newer conversation keeps its unchanged
+      //    whole-dispatch delivery: the fence is a viewer-only rule.
+      { op: "feed", hex: localSpanning[0]! },
+      // 4. The next viewer dispatch matching the current conversation is delivered.
+      { op: "feed", hex: currentWhole[0]! },
+      { op: "session", tuple: null },
+    ],
+  });
+  assert.equal(report.installed, true);
+  assert.equal(readyWrites(report).length, 1, "readiness stays a one-time statement");
+  assert.deepEqual(report.feeds, [true, true, true, true, true, true],
+    "refused bytes are consumed, never thrown back to the caller");
+  assert.deepEqual(otherTexts(report), [], "no framing byte and no refused payload byte reaches stdout");
+  assert.deepEqual(copyCapsules(report), [], "a refused dispatch never produces a copy capsule");
+  assert.equal(report.copies.length, 0, "no native listener ran for a refused dispatch");
+
+  assert.equal(report.payloads.length, 3, "only admitted fragments are delivered");
+  assert.deepEqual(bytesOf(report.payloads[0]!), midPayload.subarray(0, NATIVE_INPUT_RAW_FRAGMENT_BYTES),
+    "the fragment admitted against the live conversation is delivered exactly");
+  assert.deepEqual(bytesOf(report.payloads[1]!), Buffer.from("local spans on", "utf8"),
+    "local input semantics are unchanged by a stale viewer tail");
+  assert.deepEqual(bytesOf(report.payloads[2]!), Buffer.from("current keys", "utf8"),
+    "a valid viewer dispatch after a stale one is delivered normally");
+  const delivered = Buffer.concat(report.payloads.map(bytesOf)).toString("utf8");
+  assert.equal(delivered.includes("stale whole dispatch"), false, "a whole stale dispatch delivers nothing");
+  assert.equal(delivered.includes("M".repeat(NATIVE_INPUT_RAW_FRAGMENT_BYTES + 1)), false,
+    "the stale tail is never re-tagged onto the newer conversation");
 });

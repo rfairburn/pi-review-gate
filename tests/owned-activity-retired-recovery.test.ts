@@ -21,6 +21,7 @@ import {
 import {
   BackgroundExecutionController,
   type BackgroundExecutionGroup,
+  type BackgroundInspection,
   type BackgroundTaskRecord,
 } from "../src/execution/background-controller";
 import { transitionTaskState } from "../src/execution/task-state";
@@ -32,7 +33,12 @@ import {
   releaseOperationOwner,
   writeOperationRecord,
 } from "../src/execution/operation-record";
-import { boundedScalingConfig, initGitRepo, settleOldestUnsettled } from "./helpers/background-controller-fixtures";
+import {
+  awaitBounded,
+  boundedScalingConfig,
+  initGitRepo,
+  settleOldestUnsettled,
+} from "./helpers/background-controller-fixtures";
 
 const EMPTY_ASSOCIATIONS = { waveRoots: [], bundles: [], groupRoots: [] };
 
@@ -1361,10 +1367,19 @@ test("a retired intent census racing a late admission is discarded instead of pu
   const root = await mkdtemp(join(tmpdir(), "pi-review-retired-intent-admission-race-"));
   let executionRoot: string | undefined;
   let lateRoot: string | undefined;
+  // Hoisted so the finally can release both gates, finish a late admission, and
+  // detach/remove every root even when an assertion fails.
+  let old: BackgroundExecutionController | undefined;
+  let replacement: BackgroundExecutionController | undefined;
+  let lateAdmission: Promise<BackgroundInspection | Error> | undefined;
+  let lateSettled = false;
+  let verified = false;
+  let releaseCensus: (() => void) | undefined;
+  let releaseAdmission: (() => void) | undefined;
   try {
     await initGitRepo(root);
     completeExpectedSources();
-    const old = controller(() => root);
+    old = controller(() => root);
     await old.restore(EMPTY_ASSOCIATIONS);
     const started = await old.start([{
       title: "settled local record",
@@ -1382,6 +1397,8 @@ test("a retired intent census racing a late admission is discarded instead of pu
         associationRevision?: number,
       ): Promise<{ status: string }>;
       resolveExecutionTarget(workspace?: string): Promise<string>;
+      censusRevision: number;
+      retiredCensus?: { detachComplete?: boolean; detachedRevision?: number };
     };
     const group = internals.groups.get(started.executionId)!;
     const task = group.tasks[0]!;
@@ -1404,19 +1421,26 @@ test("a retired intent census racing a late admission is discarded instead of pu
     task.bundle = createReattachmentBundle(operation, group.root);
     transitionTaskState(task, "failed");
     await internals.save(group);
-    // Make the retired source a candidate for the forced fresh pass.
+    // Retire an uncertain source: the pass this schedules is drained below,
+    // before any gate exists, so it cannot consume the gated retired census.
     internals.ownedActivity.markIntentUncertain();
     await old.detach();
 
     const nextCwd = join(root, "replacement-session");
     await mkdir(nextCwd);
-    const replacement = controller(() => nextCwd);
+    replacement = controller(() => nextCwd);
     await replacement.restore(EMPTY_ASSOCIATIONS);
+    // Settle the coalesced passes the pre-detach uncertainty and this
+    // registration already scheduled BEFORE any gate exists. A pass that proves
+    // the retired inventory empty here is finished, so no later automatic pass
+    // can consume the retired census past the gates installed below.
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
 
     // Hold the retired intent census inside its read-only operation evidence.
     const originalRead = internals.readCensusOperation.bind(old);
-    let releaseCensus!: () => void;
-    const censusBarrier = new Promise<void>((resolve) => { releaseCensus = resolve; });
+    let releaseCensusBarrier!: () => void;
+    const censusBarrier = new Promise<void>((resolve) => { releaseCensusBarrier = resolve; });
+    releaseCensus = releaseCensusBarrier;
     let signalCensus!: () => void;
     const censusEntered = new Promise<void>((resolve) => { signalCensus = resolve; });
     let gateCensus = true;
@@ -1431,8 +1455,9 @@ test("a retired intent census racing a late admission is discarded instead of pu
     // Hold a late start admission after its synchronous revision bump but
     // before any activity token is acquired.
     const originalTarget = internals.resolveExecutionTarget.bind(old);
-    let releaseAdmission!: () => void;
-    const admissionBarrier = new Promise<void>((resolve) => { releaseAdmission = resolve; });
+    let releaseAdmissionBarrier!: () => void;
+    const admissionBarrier = new Promise<void>((resolve) => { releaseAdmissionBarrier = resolve; });
+    releaseAdmission = releaseAdmissionBarrier;
     let signalAdmission!: () => void;
     const admissionEntered = new Promise<void>((resolve) => { signalAdmission = resolve; });
     internals.resolveExecutionTarget = async (workspace?: string) => {
@@ -1441,31 +1466,123 @@ test("a retired intent census racing a late admission is discarded instead of pu
       return originalTarget(workspace);
     };
 
+    // A retired incarnation whose resolved inventory is already empty is its own
+    // settled proof and is skipped by a forced pass, so re-mark THIS retired
+    // handle uncertain only after every gate exists: whichever scheduler proves
+    // it (the automatic pass this schedules or the forced pass below) must reach
+    // the gated retired census, and the mark changes no controller seal.
+    internals.ownedActivity.markIntentUncertain();
     const pass = refreshOwnedActivityIntent();
-    await censusEntered;
-    const lateAdmission = old.start([{
+    try {
+      await awaitBounded(censusEntered, 30_000, "retired intent census entered");
+    } catch {
+      // Bounded diagnostic only: fixed registry/seal facts, never a path, token,
+      // or raw error.
+      const registry = (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] as {
+        sources: Map<string, Map<string, Array<{
+          retired: boolean;
+          intentUncertain?: boolean;
+          intentRevision?: number;
+          intentTokens?: Set<string>;
+        }>>>;
+      } | undefined;
+      const retired = registry?.sources.get("backgroundTasks")?.get("execution")
+        ?.find((entry) => entry.retired);
+      throw new Error([
+        "retired intent census was never entered",
+        `retired=${retired?.retired === true}`,
+        `intentUncertain=${retired?.intentUncertain === true}`,
+        `intentTokens=${retired?.intentTokens?.size ?? -1}`,
+        `intentRevision=${retired?.intentRevision ?? -1}`,
+        `refreshPasses=${ownedActivityTest.ownedActivityIntentRefreshPassCount()}`,
+        `sealComplete=${internals.retiredCensus?.detachComplete === true}`,
+        `sealMatches=${internals.retiredCensus?.detachedRevision === internals.censusRevision}`,
+      ].join(" "));
+    }
+    const admission = old.start([{
       title: "late post-detach admission",
       instructions: "run",
       acceptanceCriteria: ["done"],
     }]).catch((error: unknown) => error as Error);
-    await admissionEntered;
-    releaseCensus();
+    lateAdmission = admission;
+    await awaitBounded(admissionEntered, 30_000, "late admission reached its held target resolution");
+    releaseCensusBarrier();
     await pass;
     assert.equal(activeActivitySnapshot().activeTasks, null,
       "the stale pre-admission read is discarded, never a false zero during an unresolved admission");
 
-    releaseAdmission();
-    const lateResult = await lateAdmission;
+    releaseAdmissionBarrier();
+    const lateResult = await admission;
     if (lateResult instanceof Error) throw lateResult;
     lateRoot = lateResult.root;
     await settleOldestUnsettled(old, lateResult.executionId, "late post-detach admission settled");
-    await old.detach();
-    await replacement.detach();
+    lateSettled = true;
+    verified = true;
   } finally {
-    if (lateRoot) await rm(lateRoot, { recursive: true, force: true });
-    if (executionRoot) await rm(executionRoot, { recursive: true, force: true });
-    ownedActivityTest.resetOwnedActivityForTests();
-    await rm(root, { recursive: true, force: true });
+    // Release both held gates first: a held census read or start admission must
+    // never outlive this case, even when an assertion failed.
+    releaseCensus?.();
+    releaseAdmission?.();
+    let teardownError: unknown;
+    let teardownFailed = false;
+    try {
+      await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+      // Join a released admission under the same finite bound before any root is
+      // removed, so its execution group is finished being created and saved; a
+      // verified body already settled it above.
+      if (old !== undefined && lateAdmission !== undefined) {
+        const settled = await awaitBounded(
+          lateAdmission,
+          30_000,
+          "late admission settled during teardown",
+        );
+        if (!(settled instanceof Error)) {
+          lateRoot ??= settled.root;
+          if (!lateSettled) {
+            lateSettled = true;
+            await settleOldestUnsettled(old, settled.executionId, "late post-detach admission settled");
+          }
+        }
+      }
+    } catch (error) {
+      teardownFailed = true;
+      teardownError = error;
+    }
+    // Attempt every detach even when one fails: a failed old-controller detach
+    // must not skip the replacement source's teardown.
+    for (const source of [old, replacement]) {
+      try {
+        if (source !== undefined) await source.detach();
+      } catch (error) {
+        teardownFailed = true;
+        teardownError ??= error;
+      }
+    }
+    try {
+      // Each execution root is a separate temporary tree, so every removal is
+      // attempted even when another one fails.
+      for (const execution of [lateRoot, executionRoot]) {
+        try {
+          if (execution !== undefined) await rm(execution, { recursive: true, force: true });
+        } catch (error) {
+          teardownFailed = true;
+          teardownError ??= error;
+        }
+      }
+    } finally {
+      // The registry reset and the enclosing root removal still happen after a
+      // failed root removal.
+      ownedActivityTest.resetOwnedActivityForTests();
+      try {
+        await rm(root, { recursive: true, force: true });
+      } catch (error) {
+        teardownFailed = true;
+        teardownError ??= error;
+      }
+    }
+    // A contained teardown failure never replaces the failure that brought this
+    // case here, and is never dropped when the body itself verified.
+    if (verified && teardownFailed) throw teardownError;
   }
 });
 

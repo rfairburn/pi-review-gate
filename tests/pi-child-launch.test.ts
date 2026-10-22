@@ -496,6 +496,14 @@ test("native Windows starts the Pi child through trusted System32 cmd despite PA
         "the shared resolver must use the parent's absolute SystemRoot cmd.exe, not child SystemRoot, ComSpec, PATH, or CWD");
       assert.equal(spec.windowsVerbatimArguments, true);
       assert.deepEqual(spec.args.slice(0, 3), ["/d", "/s", "/c"]);
+      // Diagnostic-only observation: drain both pipes fully but retain at most
+      // the first CHILD_OUTPUT_RETAIN_BYTES of each, reported only on failure.
+      const CHILD_OUTPUT_RETAIN_BYTES = 4096;
+      const childOutput = {
+        stdout: { retained: [] as Buffer[], retainedBytes: 0, totalBytes: 0 },
+        stderr: { retained: [] as Buffer[], retainedBytes: 0, totalBytes: 0 },
+      };
+      let closeSignal: NodeJS.Signals | null = null;
       const exitCode = await new Promise<number | null>((done) => {
         const child = spawn(spec.file, spec.args, {
           cwd: root,
@@ -503,10 +511,38 @@ test("native Windows starts the Pi child through trusted System32 cmd despite PA
           shell: false,
           ...(spec.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
         });
+        for (const name of ["stdout", "stderr"] as const) {
+          const sink = childOutput[name];
+          child[name]?.on("data", (chunk: Buffer) => {
+            sink.totalBytes += chunk.length;
+            const room = CHILD_OUTPUT_RETAIN_BYTES - sink.retainedBytes;
+            if (room <= 0) return;
+            const kept = chunk.length > room ? chunk.subarray(0, room) : chunk;
+            sink.retained.push(kept);
+            sink.retainedBytes += kept.length;
+          });
+        }
         child.on("error", () => done(null));
-        child.on("close", (code) => done(code));
+        child.on("close", (code, signal) => {
+          closeSignal = signal;
+          done(code);
+        });
       });
-      assert.equal(exitCode, 0, `${shape} must launch a real child that exits cleanly`);
+      const describeChildStream = (name: "stdout" | "stderr"): string => {
+        const sink = childOutput[name];
+        const text = Buffer.concat(sink.retained).toString("utf8");
+        const truncated = sink.totalBytes > sink.retainedBytes
+          ? ` (first ${sink.retainedBytes} of ${sink.totalBytes} bytes retained)`
+          : "";
+        return `child ${name}${truncated}: ${JSON.stringify(text)}`;
+      };
+      assert.equal(exitCode, 0, [
+        `${shape} must launch a real child that exits cleanly`,
+        `actual exit code: ${String(exitCode)}; close signal: ${String(closeSignal)}`,
+        `parent test process: node ${process.version}, openssl ${process.versions.openssl ?? "unknown"}`,
+        describeChildStream("stdout"),
+        describeChildStream("stderr"),
+      ].join("\n"));
       const [captured] = await readCaptureLines(fixture.captureFile);
       assert.deepEqual(captured.argv, argv, `${shape} must forward the exact original argv`);
       assert.equal(existsSync(shadowMarker), false, "no PATH/CWD/ComSpec/SystemRoot shadow CMD may run");

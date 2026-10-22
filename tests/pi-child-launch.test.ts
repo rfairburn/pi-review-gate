@@ -482,48 +482,18 @@ test("native Windows starts the Pi child through trusted System32 cmd despite PA
     env.PATH = [fakeCmdBin, fixture.bin, dirname(process.execPath), join(trustedSystemRoot, "System32")].join(delimiter);
     env.SystemRoot = fakeSystemRoot;
     env.ComSpec = join(fakeCmdBin, "cmd.exe");
-
-    // TEMPORARY #489 diagnostic (one native CI observation; removed in the next
-    // phase). Causal control for the observed Node startup abort: run the SAME
-    // Node executable with the SAME fixed argv, cwd, and spawn options twice —
-    // once with the exact hostile `env` above, once with a clone that differs
-    // ONLY in the value of the existing `SystemRoot` entry (restored to the
-    // parent's trusted value). Results are reported solely through the
-    // existing exit-code assertion message below; they impose no new
-    // assertion, retry, or change to the expected outcome. Only env KEY NAMES
-    // are reported, never env values.
-    const CONTROL_RETAIN_BYTES = 4096;
-    const controlArgv = ["-e", "process.stdout.write(JSON.stringify({node:process.version,openssl:process.versions.openssl}));"];
-    const controlOptions = { cwd: root, shell: false, timeout: 5_000, maxBuffer: 64 * 1024, windowsHide: true } as const;
-    const systemRootKeyNames = (source: NodeJS.ProcessEnv): string =>
-      JSON.stringify(Object.keys(source).filter((key) => key.toLowerCase() === "systemroot"));
-    const describeControlBuffer = (name: string, value: Buffer | null | undefined): string => {
-      if (!value) return `${name}: <none>`;
-      const kept = value.subarray(0, CONTROL_RETAIN_BYTES);
-      const truncated = value.length > kept.length ? ` (first ${kept.length} of ${value.length} bytes retained)` : "";
-      return `${name}${truncated}: ${JSON.stringify(kept.toString("utf8"))}`;
-    };
-    const runSystemRootControl = (label: string, controlEnv: NodeJS.ProcessEnv): string => {
-      const result = spawnSync(process.execPath, controlArgv, { ...controlOptions, env: controlEnv });
-      const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
-      return [
-        `[temporary #489 SystemRoot control: ${label}] env SystemRoot key names: ${systemRootKeyNames(controlEnv)}`,
-        `  exit status: ${String(result.status)}; signal: ${String(result.signal)}; spawn error: ${String(errorCode ?? result.error?.message ?? "none")}`,
-        `  ${describeControlBuffer("stdout", result.stdout)}`,
-        `  ${describeControlBuffer("stderr", result.stderr)}`,
-      ].join("\n");
-    };
-    const trustedSystemRootControlEnv: NodeJS.ProcessEnv = { ...env, SystemRoot: trustedSystemRoot };
-    const systemRootControlReport = [
-      `[temporary #489 SystemRoot control] parent node ${process.version}, openssl ${process.versions.openssl ?? "unknown"}; parent SystemRoot key name: ${JSON.stringify(parentSystemRootKey ?? null)}`,
-      runSystemRootControl("original hostile env", env),
-      runSystemRootControl("clone with only SystemRoot restored to trusted value", trustedSystemRootControlEnv),
-    ].join("\n");
-
     const argv = ["--probe", "spaces & pipes | caret ^ parentheses (x)", 'say "hello"'];
+    // Newer Node runtimes abort at CSPRNG startup without a valid SystemRoot,
+    // so each owned shim restores the parent's trusted SystemRoot just before
+    // Node starts. This happens only INSIDE the shim, after the resolver and
+    // the outer cmd.exe have already received the unmodified hostile `env` and
+    // passed the trusted-CMD selection challenge. The npm shape gets it ahead
+    // of its SETLOCAL because its `endLocal` reverts locals before Node runs.
+    const restoreTrustedSystemRoot = `SET "SystemRoot=${trustedSystemRoot.replace(/%/g, "%%")}"`;
+    const [npmShimHeader, ...npmShimRest] = npmCmdShim("..\\pkg\\pi-entry.cjs").split("\r\n");
     const shimShapes = [
-      ["simple managed shim", '@ECHO off\r\nnode "%~dp0\\..\\pkg\\pi-entry.cjs" %*\r\n'],
-      ["npm-generated shim", npmCmdShim("..\\pkg\\pi-entry.cjs")],
+      ["simple managed shim", `@ECHO off\r\n${restoreTrustedSystemRoot}\r\nnode "%~dp0\\..\\pkg\\pi-entry.cjs" %*\r\n`],
+      ["npm-generated shim", [npmShimHeader, restoreTrustedSystemRoot, ...npmShimRest].join("\r\n")],
     ] as const;
     for (const [shape, shim] of shimShapes) {
       await writeFile(join(fixture.bin, "pi.cmd"), shim, "utf8");
@@ -580,7 +550,6 @@ test("native Windows starts the Pi child through trusted System32 cmd despite PA
         `parent test process: node ${process.version}, openssl ${process.versions.openssl ?? "unknown"}`,
         describeChildStream("stdout"),
         describeChildStream("stderr"),
-        systemRootControlReport,
       ].join("\n"));
       const [captured] = await readCaptureLines(fixture.captureFile);
       assert.deepEqual(captured.argv, argv, `${shape} must forward the exact original argv`);

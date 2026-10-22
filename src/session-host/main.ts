@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { realpathSync } from "node:fs";
@@ -34,8 +35,21 @@ import type {
   PeerContentController,
   PeerContentObservation,
   PeerCoordinatorWithContent,
+  PeerNativeCopyReceipt,
+  PeerNativeInputRequest,
+  PeerNativeInputTarget,
   PeerSelectedContent,
 } from "./network/peer-content";
+import type { NativeInputSendResult } from "./network/session-content-client";
+import {
+  DEFAULT_SESSION_CONTENT_BOUNDS,
+  NATIVE_COPY_MAX_ENCODED_CHARS,
+  NATIVE_IO_MAX_SOURCE_TOKEN_BYTES,
+  NATIVE_TEXT_PASTE_MAX_BYTES,
+  nativeIoSourceEquals,
+  type NativeIoInputKind,
+  type NativeIoSource,
+} from "./network/session-content-protocol";
 import {
   isOwnerCloseFacts,
   type OwnerCloseFacts,
@@ -97,7 +111,7 @@ import {
   type SidebarMousePresentation,
   type SidebarRemoteCloseRow,
 } from "./sidebar";
-import type { TerminalFrame, TerminalMouseReportingRequest } from "./terminal-surface";
+import type { TerminalFrame, TerminalInputModes, TerminalMouseReportingRequest } from "./terminal-surface";
 import type { NativeClipboardEvent } from "./native-clipboard";
 import {
   HostClipboardDiagnosticCollector,
@@ -135,6 +149,22 @@ const REMOTE_CONTENT_UNAVAILABLE_MESSAGE = "The selected remote session's displa
 const REMOTE_CONTENT_UNOBSERVED_MESSAGE = "That remote session's owner run was not observed; nothing is displayed";
 const REMOTE_CONTENT_UNSUPPORTED_MESSAGE = "Remote display is unavailable in this host; local sessions are unchanged";
 const REMOTE_CONTENT_INVALID_MESSAGE = "That remote row is no longer displayed; select it again from the roster";
+/**
+ * Fixed, bounded, non-modal notices for refused remote native input. They say only
+ * what this side actually knows: a refusal before any submission sent nothing; a
+ * refusal the owner may already have received is labelled UNCERTAIN. The
+ * uncertainty label leads the message because the composed notice surface keeps
+ * one bounded row and clips its tail, so the essential classification survives on
+ * a narrow terminal. No dialog, retry, truncation of input, focus change, payload,
+ * or exception text is involved.
+ */
+const REMOTE_INPUT_NOT_SENT_MESSAGE = "Remote input was refused; nothing was sent to the remote session";
+const REMOTE_INPUT_PASTE_TOO_LARGE_MESSAGE = "That paste is larger than a remote session accepts; nothing was sent";
+const REMOTE_INPUT_UNCERTAIN_MESSAGE =
+  "UNCERTAIN: remote input may have been handed off; outcome unknown";
+/** Exact outer brackets of one complete host-delivered bracketed paste packet. */
+const BRACKETED_PASTE_START = "\x1b[200~";
+const BRACKETED_PASTE_END = "\x1b[201~";
 /**
  * Fixed, bounded notices for one remote Close attempt. They describe only what
  * this side knows: a close that was never drawn, never addressable, never sent,
@@ -188,6 +218,45 @@ interface CanonicalSessionGeometry {
   readonly revision: number;
 }
 
+/**
+ * Immutable receipt of the ONE remote native IO source a frame ACTUALLY drew.
+ *
+ * Every fact is captured with the candidate the writer was handed and becomes a
+ * receipt only when that exact candidate is reported `written`; a queued, held,
+ * or superseded candidate never becomes one. The receipt is what later input and
+ * copy attempts are measured against, so an old written source can never be
+ * retargeted onto a newer owner source (or the reverse).
+ *
+ * It carries no permission by itself: every attempt re-proves the current Main
+ * focus, actual coverage, drawn content rectangle, canonical geometry, the
+ * coordinator's own current selection/endpoint, and (for input) the exact
+ * observed modes before anything is submitted.
+ */
+interface WrittenRemoteNativeInput {
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly rowId: string;
+  readonly selectionGeneration: number;
+  readonly subscriptionId: string;
+  /** Exact host-written source of the drawn viewport. */
+  readonly source: NativeIoSource;
+  /** Exact observed input modes of that same drawn publish. */
+  readonly inputModes: TerminalInputModes;
+  /** Canonical size/revision the drawn content came from. */
+  readonly geometry: CanonicalSessionGeometry;
+  /** The rectangle inside the native pane the written frame actually filled. */
+  readonly nativeContent: HostPaneRect;
+  /**
+   * Remote native IO geometry epoch of the frame that was actually written. An
+   * outer resize can reflow the physical screen and return to the same dimensions
+   * before any replacement frame is written, so rectangle equality alone cannot
+   * prove this receipt still belongs to what the operator sees; the current epoch
+   * must equal this one. It gates remote input/copy only — never Close or any
+   * other host UI.
+   */
+  readonly resizeEpoch: number;
+}
+
 interface MouseFramePresentation {
   readonly layout: HostLayout;
   readonly focus: SidebarController["focus"];
@@ -227,6 +296,14 @@ interface MouseFramePresentation {
    * before anything is repainted, and even if an older in-flight write settles.
    */
   readonly remoteCloseEpoch: number;
+  /**
+   * Actual-written remote native IO receipt of THIS frame, only while the frame
+   * drew the selected remote viewport uncovered inside Main. Absent for local
+   * rows, covered panes, and for legacy display-only streams that publish no
+   * host-written source. Never authority: the input and copy paths re-prove every
+   * current fact on each protected attempt.
+   */
+  readonly nativeInput: WrittenRemoteNativeInput | undefined;
 }
 
 /**
@@ -260,6 +337,20 @@ interface AcceptedRemoteContent {
   readonly sourceKey: string;
   /** Bounded graphics owner key: never another host's image-id cache. */
   readonly graphicsOwnerId: string;
+  /**
+   * Immutable host-written native IO source carried by this exact complete
+   * publish, or `undefined` when the owner offered none (or it was not coherent
+   * with this view). Descriptive only: it is never authority, and it is never
+   * re-read from a newer publish on an older viewport's behalf.
+   */
+  readonly inputSource: NativeIoSource | undefined;
+  /**
+   * Exact observed input modes of that same publish, or `undefined` when absent or
+   * malformed. Both this and {@link inputSource} must be present before any input
+   * may be attempted, so a missing or invalid fact removes the capability rather
+   * than being guessed.
+   */
+  readonly inputModes: TerminalInputModes | undefined;
 }
 
 /** A graphics owner key the writer accepts (nonempty, control-free, <= 256 chars). */
@@ -489,6 +580,17 @@ interface MainDependencies {
   readonly createTerminal: () => MainTerminal;
   readonly createObserver: (options: ConstructorParameters<typeof KeyboardCapabilityObserver>[0]) => MainObserver;
   readonly createWriter: (output: Writable, options: Parameters<typeof createSessionHostFrameWriter>[1]) => MainWriter;
+  /**
+   * Internal, default-off opt-in for the closed native input-framing mode of this
+   * host's owned children, plus the remote native input/text-copy integration for
+   * the ONE selected remote viewport. Only an explicit `true` supplies the
+   * coordinator's dynamic callbacks and forwards the existing manager option to
+   * children created later by this host; the legacy call shape, the display-only
+   * remote path, local input, and the local clipboard route are byte-for-byte
+   * unchanged otherwise. It is not a CLI flag, setting, public option, permission,
+   * grant, lease, or activation.
+   */
+  readonly nativeInputOriginFraming?: boolean;
   readonly runExternalEditor: typeof runNativeExternalEditor;
   /**
    * Private bounded terminal diagnostics log under the canonical native agent
@@ -553,6 +655,169 @@ function nativeContentRect(pane: HostPaneRect, frame: { cols: number, rows: numb
 function sameCanonicalGeometry(a: CanonicalSessionGeometry | undefined, b: CanonicalSessionGeometry | undefined): boolean {
   if (a === undefined || b === undefined) return a === b;
   return a.cols === b.cols && a.rows === b.rows && a.revision === b.revision;
+}
+
+/**
+ * Outer terminal mouse-reporting mode number for one observed tracking mode; the
+ * same mapping the local child path already uses. `none` requests no capture, and
+ * `sgr-pixels` is never requested because positional input is expressed in cells.
+ */
+function mouseTrackingNumber(tracking: TerminalInputModes["mouseTracking"]): number | undefined {
+  return tracking === "x10" ? 9
+    : tracking === "vt200" ? 1000
+      : tracking === "drag" ? 1002
+        : tracking === "any" ? 1003
+          : undefined;
+}
+
+const NATIVE_IO_MOUSE_TRACKING: ReadonlySet<string> = new Set(["none", "x10", "vt200", "drag", "any"]);
+const NATIVE_IO_MOUSE_ENCODING: ReadonlySet<string> = new Set(["default", "sgr", "sgr-pixels"]);
+const NATIVE_IO_SOURCE_TOKEN = /^[\x21-\x7e]+$/;
+
+/**
+ * Validate and take an immutable copy of the input modes carried by one complete
+ * publish. Only the closed shape the protocol reader admits is accepted; a
+ * missing or malformed fact yields `undefined` (no input capability) instead of a
+ * guess or an inferred default.
+ */
+function readRemoteInputModes(value: unknown): TerminalInputModes | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const modes = value as Record<string, unknown>;
+  const kittyFlags = modes.kittyFlags;
+  if (typeof kittyFlags !== "number" || !Number.isSafeInteger(kittyFlags) || kittyFlags < 0 || kittyFlags > 7) {
+    return undefined;
+  }
+  const modifyOtherKeys = modes.modifyOtherKeys;
+  if (modifyOtherKeys !== 0 && modifyOtherKeys !== 1 && modifyOtherKeys !== 2) return undefined;
+  const applicationCursorKeys = modes.applicationCursorKeys;
+  const applicationKeypad = modes.applicationKeypad;
+  const bracketedPaste = modes.bracketedPaste;
+  if (typeof applicationCursorKeys !== "boolean"
+    || typeof applicationKeypad !== "boolean"
+    || typeof bracketedPaste !== "boolean") return undefined;
+  const mouseTracking = modes.mouseTracking;
+  if (typeof mouseTracking !== "string" || !NATIVE_IO_MOUSE_TRACKING.has(mouseTracking)) return undefined;
+  const mouseEncoding = modes.mouseEncoding;
+  if (typeof mouseEncoding !== "string" || !NATIVE_IO_MOUSE_ENCODING.has(mouseEncoding)) return undefined;
+  return Object.freeze({
+    kittyFlags,
+    applicationCursorKeys,
+    applicationKeypad,
+    bracketedPaste,
+    mouseTracking: mouseTracking as TerminalInputModes["mouseTracking"],
+    modifyOtherKeys,
+    mouseEncoding: mouseEncoding as TerminalInputModes["mouseEncoding"],
+  });
+}
+
+/** Exact semantic equality of one observed mode set. */
+function sameTerminalInputModes(a: TerminalInputModes | undefined, b: TerminalInputModes | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.kittyFlags === b.kittyFlags
+    && a.applicationCursorKeys === b.applicationCursorKeys
+    && a.applicationKeypad === b.applicationKeypad
+    && a.bracketedPaste === b.bracketedPaste
+    && a.mouseTracking === b.mouseTracking
+    && a.modifyOtherKeys === b.modifyOtherKeys
+    && a.mouseEncoding === b.mouseEncoding;
+}
+
+/**
+ * Validate and take an immutable copy of the host-written native IO source of one
+ * complete accepted publish. It must be coherent with that publish's own owner
+ * run, row, native conversation tuple, and canonical geometry; anything else is
+ * not an input source. Every source field is copied, never retained by reference.
+ */
+function readRemoteNativeIoSource(
+  value: unknown,
+  expected: {
+    readonly hostRunId: string;
+    readonly sessionId: string;
+    readonly nativeSession: { readonly sessionId: string; readonly epoch: number } | null;
+    readonly geometry: CanonicalSessionGeometry;
+  },
+): NativeIoSource | undefined {
+  if (value === null || typeof value !== "object" || expected.nativeSession === null) return undefined;
+  const record = value as Record<string, unknown>;
+  const hostRunId = record.hostRunId;
+  const sessionId = record.sessionId;
+  const maxIdentifier = DEFAULT_SESSION_CONTENT_BOUNDS.maxIdentifierBytes;
+  if (typeof hostRunId !== "string" || hostRunId.length === 0 || hostRunId.length > maxIdentifier) return undefined;
+  if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > maxIdentifier) return undefined;
+  if (hostRunId !== expected.hostRunId || sessionId !== expected.sessionId) return undefined;
+  const native = record.nativeSession;
+  if (native === null || typeof native !== "object") return undefined;
+  const nativeRecord = native as Record<string, unknown>;
+  const nativeSessionId = nativeRecord.sessionId;
+  const epoch = nativeRecord.epoch;
+  if (typeof nativeSessionId !== "string" || nativeSessionId.length === 0 || nativeSessionId.length > maxIdentifier) {
+    return undefined;
+  }
+  if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 1) return undefined;
+  if (nativeSessionId !== expected.nativeSession.sessionId || epoch !== expected.nativeSession.epoch) return undefined;
+  const geometry = record.geometry;
+  if (geometry === null || typeof geometry !== "object") return undefined;
+  const geometryRecord = geometry as Record<string, unknown>;
+  const cols = geometryRecord.cols;
+  const rows = geometryRecord.rows;
+  const revision = geometryRecord.revision;
+  if (typeof cols !== "number" || !Number.isSafeInteger(cols) || cols < 1
+    || typeof rows !== "number" || !Number.isSafeInteger(rows) || rows < 1
+    || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) return undefined;
+  if (cols !== expected.geometry.cols || rows !== expected.geometry.rows
+    || revision !== expected.geometry.revision) return undefined;
+  const viewerRevision = record.viewerRevision;
+  if (typeof viewerRevision !== "number" || !Number.isSafeInteger(viewerRevision) || viewerRevision < 1) {
+    return undefined;
+  }
+  const sourceToken = record.sourceToken;
+  if (typeof sourceToken !== "string" || sourceToken.length === 0
+    || sourceToken.length > NATIVE_IO_MAX_SOURCE_TOKEN_BYTES || !NATIVE_IO_SOURCE_TOKEN.test(sourceToken)) {
+    return undefined;
+  }
+  return Object.freeze({
+    hostRunId,
+    sessionId,
+    nativeSession: Object.freeze({ sessionId: nativeSessionId, epoch }),
+    geometry: Object.freeze({ cols, rows, revision }),
+    viewerRevision,
+    sourceToken,
+  });
+}
+
+/**
+ * Semantic identity of one actual-written remote native IO receipt.
+ *
+ * Two equal keys mean the same written source, native tuple and epoch, canonical
+ * geometric revision, viewer revision, host commitment, observed modes, and drawn
+ * content rectangle — so ordinary terminal text output (which mints fresh
+ * snapshots, frames, and sequences without changing any of these) never forces a
+ * writer boundary or stalls typing. Object identity and publish sequence are
+ * deliberately absent. This key only decides writer-invalidation and the remote IO
+ * proof; it is never part of the shared UI/mouse/Close authorization identity.
+ */
+function nativeIoReceiptKey(receipt: WrittenRemoteNativeInput | undefined): string {
+  if (receipt === undefined) return "";
+  const source = receipt.source;
+  const modes = receipt.inputModes;
+  const rect = receipt.nativeContent;
+  return JSON.stringify([
+    receipt.hostId, receipt.hostRunId, receipt.rowId, receipt.selectionGeneration, receipt.subscriptionId,
+    source.hostRunId, source.sessionId, source.nativeSession.sessionId, source.nativeSession.epoch,
+    source.geometry.cols, source.geometry.rows, source.geometry.revision,
+    source.viewerRevision, source.sourceToken,
+    modes.kittyFlags, modes.applicationCursorKeys, modes.applicationKeypad, modes.bracketedPaste,
+    modes.mouseTracking, modes.modifyOtherKeys, modes.mouseEncoding,
+    rect.column, rect.row, rect.cols, rect.rows,
+    receipt.resizeEpoch,
+  ]);
+}
+
+function sameNativeIoReceipt(
+  a: WrittenRemoteNativeInput | undefined,
+  b: WrittenRemoteNativeInput | undefined,
+): boolean {
+  return a === b || nativeIoReceiptKey(a) === nativeIoReceiptKey(b);
 }
 
 function mouseButtonId(mouse: ParsedMouseInput): number | undefined {
@@ -927,6 +1192,31 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let contentSelectionGeneration = 0;
   /** The accepted remote viewport, dropped the moment it stops being current. */
   let remoteContentView: AcceptedRemoteContent | undefined;
+  /**
+   * Internal, default-off opt-in for remote native input and text copies. Read once
+   * from the injected dependencies; nothing in this host turns it on, and an
+   * absent/false value keeps the exact legacy display-only path.
+   */
+  const remoteNativeInputEnabled = dependencies.nativeInputOriginFraming === true;
+  /**
+   * Monotonic remote native IO geometry epoch, advanced by every outer resize.
+   *
+   * An outer resize can reflow the physical screen and then return to its original
+   * dimensions before any replacement frame is written (80 -> 70 -> 80). Pane
+   * rectangle equality alone would then let a pre-resize receipt authorize input
+   * and copies again, even though the screen may have been physically reflowed and
+   * the replacement frame was never written. A written receipt carries the epoch
+   * it was composed under; authority additionally requires the current epoch to
+   * match, so a late pre-resize settlement can never revive it. This is a
+   * remote-IO-only fact and adds nothing to Close or ordinary sidebar authority.
+   */
+  let remoteInputEpoch = 0;
+  /**
+   * The ONE brief remote-input notice shown when no sidebar pane is drawn to
+   * carry the sidebar's own notice slot. Set and replaced by the same fixed
+   * messages; no per-input history, and no focus or overlay change.
+   */
+  let remoteInputNotice: string | undefined;
   /** Truthful display status of the deliberately selected remote stream. */
   let remoteContentStatus: { state: "waiting" | "unavailable"; message: string } | undefined;
   /** The one viewport this viewer last asked the selected stream for (deduped). */
@@ -1171,7 +1461,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     remoteContentView = undefined;
     remoteContentStatus = undefined;
     lastContentViewport = undefined;
+    remoteInputNotice = undefined;
     releaseSelectedContent();
+    // Releasing the remote source returns pointer capture to the ordinary host
+    // path; nothing is submitted without a written remote source.
+    if (remoteNativeInputEnabled) syncOuterMouseModes();
   }
 
   /**
@@ -1194,6 +1488,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     contentTarget = { kind: "remote", hostId, hostRunId, rowId };
     remoteContentView = undefined;
     lastContentViewport = undefined;
+    // A new deliberate selection is a new context: the one brief notice belongs
+    // to the previous target and is not carried over.
+    remoteInputNotice = undefined;
     const content = contentController();
     if (hostRunId === null || content === undefined) {
       // Nothing exact can be named to the coordinator, so nothing is requested.
@@ -1260,6 +1557,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
     const wasUnavailable = remoteContentStatus?.state === "unavailable";
     remoteContentView = undefined;
+    // A retired or not-yet-current view stops defining pointer capture, so the
+    // ordinary host path resumes until this owner publishes again.
+    if (remoteNativeInputEnabled) syncOuterMouseModes();
     if (observation.state === "connecting" || observation.state === "current") {
       remoteContentStatus = { state: "waiting", message: REMOTE_CONTENT_WAITING_MESSAGE };
       scheduleRedraw();
@@ -1332,6 +1632,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       target.hostId, target.hostRunId, target.rowId, String(generation),
       nativeSession === null ? "none" : nativeSession.sessionId, epoch,
     ].join("|"));
+    // The host-written native IO source and observed modes are retained from THIS
+    // exact complete publish (never re-read from a newer one on its behalf). Both
+    // are validated, copied, and frozen; a missing, unknown, or incoherent fact
+    // leaves no input capability at all rather than an inferred one.
+    const inputModes = readRemoteInputModes(meta.inputModes);
+    const inputSource = inputModes === undefined ? undefined : readRemoteNativeIoSource(meta.inputSource, {
+      hostRunId: target.hostRunId,
+      sessionId: target.rowId,
+      nativeSession,
+      geometry: { cols: geometry.cols, rows: geometry.rows, revision: geometry.revision },
+    });
     remoteContentView = {
       hostId: target.hostId,
       hostRunId: target.hostRunId,
@@ -1345,8 +1656,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       contentKey,
       sourceKey: contentKey,
       graphicsOwnerId: contentKey,
+      inputSource,
+      inputModes,
     };
     remoteContentStatus = undefined;
+    // A freshly published view's own retained reporting mode (including a
+    // mode-only change) is what the outer capture must follow.
+    if (remoteNativeInputEnabled) syncOuterMouseModes();
     // A published viewport is the only reason this frame appears: an arriving
     // frame repaints on its own, with no keyboard, roster, or resize event.
     scheduleRedraw();
@@ -1473,6 +1789,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         onChange: updatePeerUi,
         onIncomingConsentArrival: attemptIncomingPeerBell,
         onContentChange: handleContentChange,
+        // Only an explicit internal opt-in supplies these callbacks. Each one is a
+        // DYNAMIC re-proof of Main's current written/uncovered/focused source on
+        // every protected write or completed copy; supplying them is not a
+        // permission, and omitting them keeps the exact legacy display-only
+        // coordinator with no native capability offered anywhere.
+        ...(remoteNativeInputEnabled ? {
+          nativeIo: {
+            authorizeInput: authorizeRemoteNativeInput,
+            onCopy: handleRemoteNativeCopy,
+          },
+        } : {}),
       });
       peerCoordinator = coordinator;
       peerNetworkSettled = false;
@@ -1601,6 +1928,25 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // press cannot receive its matching release; discard that stale owner.
       hostMouseButtons.clear();
     }
+    // A remote-enabled Main displaying a selected remote owner must capture the
+    // pointer for THAT owner's own retained reporting mode: a drag/any gesture,
+    // and every gesture in a narrow or hidden-sidebar Main pane, has to reach the
+    // written-source gate instead of being limited to (or losing) the host's
+    // press-only capture. Only an explicit opt-in with a current remote view
+    // changes anything; local rows and the legacy display-only path keep their
+    // exact capture, and packet forwarding stays gated per attempt.
+    if (remoteNativeInputEnabled && sidebar.focus === "main") {
+      const remoteModes = currentRemoteContentView()?.inputModes;
+      if (remoteModes !== undefined
+        && remoteModes.mouseTracking !== "none"
+        && remoteModes.mouseEncoding !== "sgr-pixels") {
+        const remoteTracking = mouseTrackingNumber(remoteModes.mouseTracking);
+        if (remoteTracking !== undefined) {
+          desiredTracking = remoteTracking;
+          useSgr = true;
+        }
+      }
+    }
 
     if (mouseTrackingMode !== desiredTracking) {
       if (mouseTrackingMode !== undefined) {
@@ -1699,6 +2045,30 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           && nativeContent !== undefined
           ? { view: remoteView, rect: nativeContent }
           : undefined;
+        // The accepted publish's own retained native IO facts, if it carried any.
+        // Copied into the candidate receipt below; never re-read from a newer view.
+        const drawnInputSource = remoteDrawn?.view.inputSource;
+        const drawnInputModes = remoteDrawn?.view.inputModes;
+        const nativeIoReceipt: WrittenRemoteNativeInput | undefined = remoteNativeInputEnabled
+          && remoteDrawn !== undefined && drawnInputSource !== undefined && drawnInputModes !== undefined
+          ? Object.freeze({
+            hostId: remoteDrawn.view.hostId,
+            hostRunId: remoteDrawn.view.hostRunId,
+            rowId: remoteDrawn.view.rowId,
+            selectionGeneration: remoteDrawn.view.selectionGeneration,
+            subscriptionId: remoteDrawn.view.subscriptionId,
+            source: drawnInputSource,
+            inputModes: drawnInputModes,
+            geometry: remoteDrawn.view.geometry,
+            nativeContent: Object.freeze({
+              column: remoteDrawn.rect.column,
+              row: remoteDrawn.rect.row,
+              cols: remoteDrawn.rect.cols,
+              rows: remoteDrawn.rect.rows,
+            }),
+            resizeEpoch: remoteInputEpoch,
+          })
+          : undefined;
         // The graphics layer's owner key distinguishes the actual source. A local
         // row keeps its exact manager id (unchanged image-id cache); a remote
         // viewport gets a key carrying its host, run, row, selection, and native
@@ -1726,7 +2096,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         const header = contentTarget?.kind === "remote"
           ? remoteContentHeader(contentTarget.hostId, contentTarget.rowId)
           : view ? view.label : "Session host";
-        const headerNotice = terminalDiagnosticsHeaderNotice(diagnosticsWarning.view());
+        // The existing host notice surface. The diagnostics warning keeps its
+        // ordinary priority; the one brief remote-input notice uses the same
+        // header only while no sidebar pane is drawn to carry it, so an ordinary
+        // wide layout still shows it in the roster exactly like every other
+        // sidebar notice.
+        const diagnosticsHeaderNotice = terminalDiagnosticsHeaderNotice(diagnosticsWarning.view());
+        const headerNotice = remoteInputNotice !== undefined && currentLayout.sidebar === undefined
+          ? remoteInputNotice
+          : diagnosticsHeaderNotice;
         const composed = composeHostFrame(currentLayout, {
           main: mainFrame,
           sidebar: sidebarFrame,
@@ -1760,6 +2138,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
                 + `|rect=${remoteDrawn.rect.column}:${remoteDrawn.rect.row}`
                 + `:${remoteDrawn.rect.cols}:${remoteDrawn.rect.rows}`,
           remoteCloseEpoch: remoteCloseHighlightEpoch,
+          // The candidate receipt of the remote native source this frame draws. It
+          // becomes authority only when the writer reports THIS candidate written.
+          nativeInput: nativeIoReceipt,
         };
         // Distinct targets can render identical bytes (for example Saved
         // conversations with matching captions and workspaces). Their maps
@@ -1774,13 +2155,19 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             || !sameRemoteCloseRow(
               displayedMousePresentation.sidebar.remoteClose, mousePresentation.sidebar.remoteClose,
             )
-            || displayedMousePresentation.remoteCloseEpoch !== mousePresentation.remoteCloseEpoch))
+            || displayedMousePresentation.remoteCloseEpoch !== mousePresentation.remoteCloseEpoch
+            // A mode- or source-only change can render identical bytes. It is still
+            // a new native IO boundary, so the next frame must be actually written
+            // before it authorizes any input or copy. This is separate from the
+            // shared UI identity above and never becomes a Close prerequisite.
+            || !sameNativeIoReceipt(displayedMousePresentation.nativeInput, mousePresentation.nativeInput)))
           || (latestMousePresentation !== undefined
             && (!sameMouseAuthorization(latestMousePresentation, mousePresentation)
               || !sameRemoteCloseRow(
                 latestMousePresentation.sidebar.remoteClose, mousePresentation.sidebar.remoteClose,
               )
-              || latestMousePresentation.remoteCloseEpoch !== mousePresentation.remoteCloseEpoch))) {
+              || latestMousePresentation.remoteCloseEpoch !== mousePresentation.remoteCloseEpoch
+              || !sameNativeIoReceipt(latestMousePresentation.nativeInput, mousePresentation.nativeInput)))) {
           writer.invalidate?.();
         }
         latestMousePresentation = mousePresentation;
@@ -2419,6 +2806,334 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     return drawn;
   }
 
+  /**
+   * The ONE actual-written remote native IO receipt, but only while every
+   * independent current fact still proves it.
+   *
+   * Called synchronously for EVERY protected input write (and re-checked by the
+   * coordinator/client after each caller callback), so nothing cached, queued, or
+   * descriptor-shaped can authorize a write. It deliberately re-reads:
+   *
+   * - the started/not-shutting-down/not-handed-off terminal state;
+   * - CURRENT, WRITTEN, and latest-candidate Main focus, and whether each of those
+   *   layouts actually paints a form or sidebar rectangle over the native pane;
+   *   the same native pane geometry and drawn content rectangle must agree, so a
+   *   pending resize, an undrawn layout, or an uncovering frame refuses input until
+   *   its own frame is written;
+   * - the deliberate remote target, which must still be the written receipt's own
+   *   host, owner run, row, and selection generation;
+   * - the caller's expected source (the whole tuple, epoch, geometry revision,
+   *   viewer revision, and host commitment), which must BE the written one;
+   * - the CURRENT accepted viewport, whose retained source must still be that
+   *   exact source (ordinary text output with fresh snapshots and sequences is
+   *   fine), plus the requested input modes when this is an input proof;
+   * - the coordinator's own descriptive target, compared field by field as an
+   *   independent second opinion; it never selects or rewrites anything.
+   *
+   * No manager, owner-local row, `localActiveId`, local clipboard route, native
+   * input authority, last-input/dispatch counter, or history participates.
+   */
+  function currentWrittenRemoteNativeInput(expected: {
+    readonly hostId: string;
+    readonly selectionGeneration: number;
+    readonly subscriptionId: string;
+    readonly source: NativeIoSource;
+    readonly inputModes?: TerminalInputModes;
+  }): WrittenRemoteNativeInput | undefined {
+    if (!remoteNativeInputEnabled || shutdownRequested || externalEditorActive) return undefined;
+    if (terminal === undefined || !terminalStarted || sidebar === undefined) return undefined;
+    if (sidebar.focus !== "main") return undefined;
+    const shown = displayedMousePresentation;
+    const latest = latestMousePresentation;
+    const currentLayout = layout;
+    if (shown === undefined || latest === undefined || currentLayout === undefined) return undefined;
+    const receipt = shown.nativeInput;
+    if (receipt === undefined) return undefined;
+    // A resize (even one that returns to the original dimensions before anything
+    // is repainted) revokes the written receipt until a post-resize frame is
+    // actually written.
+    if (receipt.resizeEpoch !== remoteInputEpoch) return undefined;
+    // Physical Main focus on the actually written frame AND on the latest candidate.
+    if (shown.focus !== "main" || latest.focus !== "main") return undefined;
+    // Actual coverage, not overlay capability: an overlay-capable layout with Main
+    // focused paints no sidebar rectangle and covers nothing.
+    const covered = (value: HostLayout): boolean => value.form !== undefined
+      || (value.sidebarOverlay && value.sidebar !== undefined);
+    if (covered(currentLayout) || covered(shown.layout) || covered(latest.layout)) return undefined;
+    if (!samePaneGeometry(shown.layout.native, currentLayout.native)
+      || !samePaneGeometry(latest.layout.native, currentLayout.native)) return undefined;
+    // The written receipt's rectangle is exactly what THIS pane draws for that same
+    // canonical geometry, so a moved/resized pane or a new frame size cannot reuse
+    // an old rectangle's coordinates.
+    if (!samePaneGeometry(receipt.nativeContent, {
+      column: currentLayout.native.column,
+      row: currentLayout.native.row,
+      cols: receipt.geometry.cols,
+      rows: receipt.geometry.rows,
+    })) return undefined;
+    // The deliberate target is the written receipt's own target, exactly.
+    const target = contentTarget;
+    if (target === undefined || target.kind !== "remote" || target.hostRunId === null) return undefined;
+    if (target.hostId !== receipt.hostId || target.hostRunId !== receipt.hostRunId
+      || target.rowId !== receipt.rowId) return undefined;
+    if (receipt.selectionGeneration !== contentSelectionGeneration) return undefined;
+    if (shown.contentSource?.startsWith("remote|") !== true) return undefined;
+    // The caller's expected target must BE the written receipt.
+    if (expected.hostId !== receipt.hostId
+      || expected.selectionGeneration !== receipt.selectionGeneration
+      || expected.subscriptionId !== receipt.subscriptionId
+      || !nativeIoSourceEquals(expected.source, receipt.source)) return undefined;
+    if (expected.inputModes !== undefined && !sameTerminalInputModes(expected.inputModes, receipt.inputModes)) {
+      return undefined;
+    }
+    // The currently published view must still carry this exact written source (and
+    // the same modes for input). Its publish sequence and snapshot object are never
+    // compared, so ordinary output never stalls typing or held input.
+    const view = currentRemoteContentView();
+    if (view === undefined || view.inputSource === undefined || view.inputModes === undefined) return undefined;
+    if (view.subscriptionId !== receipt.subscriptionId) return undefined;
+    if (!nativeIoSourceEquals(view.inputSource, receipt.source)) return undefined;
+    if (expected.inputModes !== undefined && !sameTerminalInputModes(view.inputModes, receipt.inputModes)) {
+      return undefined;
+    }
+    // The coordinator's own description is an independent comparison only.
+    const content = contentController();
+    if (content === undefined || typeof content.readNativeInputTarget !== "function") return undefined;
+    const described = content.readNativeInputTarget();
+    if (described === undefined) return undefined;
+    if (described.hostId !== receipt.hostId
+      || described.selectionGeneration !== receipt.selectionGeneration
+      || described.subscriptionId !== receipt.subscriptionId
+      || !nativeIoSourceEquals(described.source, receipt.source)) return undefined;
+    // Modes are freshness evidence for INPUT only; a copy is text, so it never
+    // gains a per-input-mode history or dispatch counter of its own.
+    if (expected.inputModes !== undefined && !sameTerminalInputModes(described.inputModes, receipt.inputModes)) {
+      return undefined;
+    }
+    return receipt;
+  }
+
+  /** The existing sidebar's brief, sanitized, non-modal notice slot. */
+  function showRemoteInputNotice(message: string): void {
+    // One fixed slot, no per-input history, no dialog, no retry, no focus change.
+    // The sidebar carries it whenever its pane is drawn; the composed header
+    // carries the same slot whenever no sidebar pane is drawn (hidden sidebar or
+    // narrow Main), so a refusal is never invisible.
+    remoteInputNotice = message;
+    sidebar?.showError(message);
+    scheduleRedraw();
+  }
+
+  /**
+   * Submit ONE caller-normalized remote input against the actual-written receipt.
+   *
+   * Only a local refusal (before any submission) may say nothing was sent. Once
+   * the delegate was invoked, a rejection, a malformed result, or an explicit
+   * `unknown` is reported as UNCERTAIN — never as nothing sent, success, or an
+   * executed command. Nothing is retried, replayed, reconnected, re-granted,
+   * queued for a later frame, or handed to a local row.
+   */
+  function submitRemoteNativeInput(kind: NativeIoInputKind, text: string): void {
+    try {
+      if (!remoteNativeInputEnabled) return;
+      const written = displayedMousePresentation?.nativeInput;
+      if (written === undefined) {
+        showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+        return;
+      }
+      const expected = {
+        hostId: written.hostId,
+        selectionGeneration: written.selectionGeneration,
+        subscriptionId: written.subscriptionId,
+        source: written.source,
+        inputModes: written.inputModes,
+      };
+      if (currentWrittenRemoteNativeInput(expected) === undefined) {
+        showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+        return;
+      }
+      const content = contentController();
+      if (content === undefined || typeof content.sendNativeInput !== "function") {
+        // An older/display-only controller offers no native capability: a fixed
+        // refusal, never a local fallback.
+        showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+        return;
+      }
+      const request: PeerNativeInputRequest = { ...expected, kind, text };
+      let pending: Promise<NativeInputSendResult> | undefined;
+      try {
+        pending = content.sendNativeInput(request);
+      } catch {
+        // The delegate was invoked and its outcome is unknowable.
+        showRemoteInputNotice(REMOTE_INPUT_UNCERTAIN_MESSAGE);
+        return;
+      }
+      if (pending === undefined) {
+        // A controller that produced no outcome told us nothing about the wire.
+        showRemoteInputNotice(REMOTE_INPUT_UNCERTAIN_MESSAGE);
+        return;
+      }
+      // One truthful settlement: only a fixed `not-sent` may say nothing was sent;
+      // `unknown`, a rejection, or no recognizable outcome stays UNCERTAIN.
+      const settle = (result: NativeInputSendResult | undefined): void => {
+        try {
+          if (result === undefined) {
+            showRemoteInputNotice(REMOTE_INPUT_UNCERTAIN_MESSAGE);
+          } else if (result.status === "submitted") {
+            // Local transport return only: never claimed as processed or executed.
+          } else if (result.status === "not-sent") {
+            showRemoteInputNotice(result.reason === "too-large"
+              ? REMOTE_INPUT_PASTE_TOO_LARGE_MESSAGE
+              : REMOTE_INPUT_NOT_SENT_MESSAGE);
+          } else {
+            showRemoteInputNotice(REMOTE_INPUT_UNCERTAIN_MESSAGE);
+          }
+        } catch {
+          // A notice failure never becomes an unhandled rejection.
+        }
+      };
+      void Promise.resolve(pending).then((result) => settle(result), () => settle(undefined));
+    } catch {
+      // Containment only: routing must never take down the host.
+      showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+    }
+  }
+
+  /**
+   * ONE keyboard or paste packet for the selected remote owner.
+   *
+   * Keyboard text is the existing source normalization under the ACTUAL public
+   * `ProcessTerminal.kittyProtocolActive` value; the owner translates once for its
+   * own native modes. A complete bracketed paste contributes only its exact outer
+   * brackets' TEXTBODY, refused whole above the decoded 1 MiB text bound (never
+   * truncated, and never an image or clipboard payload). An incomplete packet is
+   * never handed to the owner.
+   */
+  function routeRemoteForward(data: string): void {
+    try {
+      if (!remoteNativeInputEnabled || terminal === undefined) return;
+      if (data.startsWith(BRACKETED_PASTE_START)) {
+        if (!data.endsWith(BRACKETED_PASTE_END)
+          || data.length < BRACKETED_PASTE_START.length + BRACKETED_PASTE_END.length) return;
+        const body = data.slice(BRACKETED_PASTE_START.length, data.length - BRACKETED_PASTE_END.length);
+        if (Buffer.byteLength(body, "utf8") > NATIVE_TEXT_PASTE_MAX_BYTES) {
+          showRemoteInputNotice(REMOTE_INPUT_PASTE_TOO_LARGE_MESSAGE);
+          return;
+        }
+        submitRemoteNativeInput("paste", body);
+        return;
+      }
+      submitRemoteNativeInput("keyboard", normalizeNativeSourceInput(data, terminal.kittyProtocolActive));
+    } catch {
+      showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+    }
+  }
+
+  /**
+   * ONE native pointer packet for the selected remote owner, mapped from the
+   * screen cell into the written content rectangle's own content coordinates.
+   *
+   * A packet in the pane's padding claims no content cell and is dropped without
+   * a submission. The emitted form is one canonical SGR report with the observed
+   * button/modifiers/release preserved; raw terminal coordinates, raw X10 bytes,
+   * and image payloads are never forwarded. The owner maps this SGR report to its
+   * own actual mouse modes (including legacy X10).
+   */
+  function routeRemoteMouseInput(mouse: ParsedMouseInput): void {
+    try {
+      if (!remoteNativeInputEnabled) return;
+      const written = displayedMousePresentation?.nativeInput;
+      if (written === undefined) {
+        showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+        return;
+      }
+      const drawn = written.nativeContent;
+      if (mouse.x < drawn.column || mouse.x >= drawn.column + drawn.cols
+        || mouse.y < drawn.row || mouse.y >= drawn.row + drawn.rows) {
+        // Padding belongs to the host: no content cell was claimed, so nothing is
+        // submitted and no input notice is raised for a mere pointer position.
+        return;
+      }
+      const localX = mouse.x - drawn.column;
+      const localY = mouse.y - drawn.row;
+      submitRemoteNativeInput("mouse",
+        `\x1b[<${mouse.button};${localX + 1};${localY + 1}${mouse.release ? "m" : "M"}`);
+    } catch {
+      showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+    }
+  }
+
+  /**
+   * The coordinator's dynamic per-write proof. It is deliberately stateless: every
+   * call re-evaluates the current written receipt, focus, coverage, geometry,
+   * source, modes, and the coordinator's own description. Anything but an
+   * independent `true` (including a throw) refuses the write.
+   */
+  function authorizeRemoteNativeInput(target: PeerNativeInputTarget): boolean {
+    try {
+      return currentWrittenRemoteNativeInput({
+        hostId: target.hostId,
+        selectionGeneration: target.selectionGeneration,
+        subscriptionId: target.subscriptionId,
+        source: target.source,
+        inputModes: target.inputModes,
+      }) !== undefined;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The coordinator's copy callback: emit the EXISTING outer OSC 52 form for this
+   * initiating viewer's own written, uncovered, Main-focused remote source only.
+   *
+   * The copy arrives after the coordinator has already proved its current selected
+   * endpoint and exact source; Main independently re-proves the same facts here.
+   * Copies are not input: no input modes, dispatch order, per-input history, or
+   * last-input counter participates, so an asynchronously later copy from an
+   * earlier input is still delivered when it belongs to the same current scope.
+   * Nothing is broadcast, relayed raw, written to the owner/local clipboard route,
+   * or replayed after the source moves.
+   */
+  function handleRemoteNativeCopy(receipt: PeerNativeCopyReceipt): void {
+    try {
+      if (!remoteNativeInputEnabled || terminal === undefined) return;
+      const source = receipt.source;
+      const event = receipt.event;
+      // Validate the producer's own native tuple against the source it rode with.
+      if (source === null || typeof source !== "object" || event === null || typeof event !== "object") return;
+      if (event.sessionId !== source.nativeSession.sessionId
+        || event.sessionEpoch !== source.nativeSession.epoch) return;
+      if (currentWrittenRemoteNativeInput({
+        hostId: receipt.hostId,
+        selectionGeneration: receipt.selectionGeneration,
+        subscriptionId: receipt.subscriptionId,
+        source,
+      }) === undefined) return;
+      if (event.kind === "unavailable") {
+        // The eligible owner's own authenticated producer could not forward a
+        // copy. Only a fixed diagnostic code is recorded; no success is claimed.
+        clipboardDiagnostics.note(source.sessionId, event.reason === "unsupported-runtime"
+          ? "clipboard-unsupported-runtime"
+          : "clipboard-provenance-unavailable");
+        return;
+      }
+      const encoded = event.encoded;
+      // The client already validated and assembled the whole encoded payload under
+      // this unchanged producer bound; it is carried here in full, never shrunk.
+      if (typeof encoded !== "string" || encoded.length === 0
+        || encoded.length > NATIVE_COPY_MAX_ENCODED_CHARS) return;
+      try {
+        terminal.write(`\x1b]52;c;${encoded}\x07`);
+      } catch {
+        // Never the exception text, payload, or stack: a fixed code only.
+        clipboardDiagnostics.note(source.sessionId, "clipboard-terminal-write-failed");
+      }
+    } catch {
+      // Containment only; a copy failure never escapes into the coordinator.
+    }
+  }
+
   function reconcileLayout(resizeChildren: boolean): void {
     if (!terminal || !sidebar || shutdownRequested) return;
     try {
@@ -2502,12 +3217,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function routeForward(data: string): void {
     if (!terminal || !sidebar || sidebar.focus !== "main" || shutdownRequested || externalEditorActive) return;
-    // Remote terminal input is NOT part of this slice: a selected remote viewport
-    // is display-only. Nothing is forwarded to a remote owner and no keystroke is
-    // ever written to a local manager row on its behalf (no local `manager.write`,
-    // no raw remote input) until the owner-bound viewer and its per-origin
-    // written-receipt fence exist. Observed `inputModes` are render facts only.
-    if (contentTarget?.kind === "remote") return;
+    // A deliberately selected remote viewport never falls back to a local row.
+    // With the internal opt-in it routes one caller-normalized native submission to
+    // that exact selected stream; without it the legacy display-only drop stands.
+    if (contentTarget?.kind === "remote") {
+      routeRemoteForward(data);
+      return;
+    }
     const view = findActiveView();
     if (!view || !view.hasLiveProcess || view.lifecycle !== "alive" || !layout || !manager) return;
     const surface = manager.surface(view.id);
@@ -2614,11 +3330,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // activate a draw-derived row.
       return;
     }
-    // A written remote viewport is display-only in this slice: native-pane
-    // packets are dropped instead of focusing or forwarding, and only the frame
-    // the writer actually committed is consulted — never a queued or held
-    // candidate. Local rows keep their ordinary focus and forwarding path.
-    if (writtenSourceIsRemote()) return;
+    // A written remote viewport is display-only unless the internal native IO
+    // opt-in supplied its dynamic callbacks: then a Main-focused pointer packet is
+    // submitted as one canonical content-space SGR report for the exact written
+    // source. A deliberately selected remote target whose new viewport is not
+    // written yet has no pointer authority either — its packet is refused rather
+    // than reinterpreted as keyboard input or forwarded to a local row. A
+    // roster-focused packet keeps the existing non-activating drop.
+    if (writtenSourceIsRemote() || contentTarget?.kind === "remote") {
+      if (sidebar.focus === "main") routeRemoteMouseInput(mouse);
+      return;
+    }
     // With the roster focused, a left click in the actually displayed, current
     // native pane is a focus gesture only. The activation press and its matching
     // release/motion stay host-owned; no part of that first click reaches Pi.
@@ -2687,6 +3409,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // and no highlight written at the old geometry may authorize a request.
     invalidateRemoteCloseConfirmationDisplay();
     remoteCloseHighlightEpoch += 1;
+    // Physical reflow revokes every remote native IO receipt until a post-resize
+    // frame is actually written, including a resize that returns to the previous
+    // size before anything is repainted. Remote input/copy only; Close and
+    // ordinary host UI keep their own independent written proofs.
+    remoteInputEpoch += 1;
     // A real outer resize can reflow the physical screen and then return to
     // the same final geometry before the next coalesced redraw (for example
     // 80 -> 40 -> 80). Invalidate the known baseline before recomputing so the
@@ -4830,6 +5557,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // the created row; manager onChange only refreshes the roster.
       onSpawnRequest: (parentInstanceId, request) => hostService.spawnRequestedChild(parentInstanceId, request),
       getSidebarTitleColumns: sidebarTitleColumnsSnapshot,
+      // Explicit internal opt-in only; the legacy manager call shape (and every
+      // existing child it creates) is unchanged when the option is absent.
+      ...(remoteNativeInputEnabled ? { nativeInputOriginFraming: true } : {}),
     });
     writer = createFrameWriter();
 

@@ -36,9 +36,14 @@ import type {
   PeerContentObservation,
   PeerContentTarget,
   PeerContentViewport,
+  PeerNativeCopyReceipt,
+  PeerNativeInputRequest,
+  PeerNativeInputTarget,
+  PeerNativeIoCallbacks,
   PeerSelectedContent,
 } from "../src/session-host/network/peer-content";
-import type { SessionContentSnapshot } from "../src/session-host/network/session-content-protocol";
+import type { NativeIoSource, SessionContentSnapshot } from "../src/session-host/network/session-content-protocol";
+import type { NativeInputSendResult } from "../src/session-host/network/session-content-client";
 import type { RemoteSessionMetadata } from "../src/session-host/network/roster-metadata";
 import type { PeerCoordinator, PeerUiCommand, PeerUiConsent, PeerUiHost, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 import { __test, type SessionHostOptions } from "../src/session-host/main";
@@ -6913,6 +6918,12 @@ const REMOTE_INPUT_MODES: TerminalInputModes = {
   mouseEncoding: "default",
 };
 
+/** Fixed notices the host shows for refused remote input (brief, non-modal). */
+const REMOTE_INPUT_NOT_SENT_NOTICE = "Remote input was refused; nothing was sent to the remote session";
+const REMOTE_INPUT_PASTE_TOO_LARGE_NOTICE = "That paste is larger than a remote session accepts; nothing was sent";
+const REMOTE_INPUT_UNCERTAIN_NOTICE =
+  "UNCERTAIN: remote input may have been handed off; outcome unknown";
+
 function remoteRosterRow(overrides: Partial<RemoteSessionMetadata> & { id: string }): RemoteSessionMetadata {
   return {
     label: `remote-${overrides.id}`,
@@ -6971,6 +6982,8 @@ function remoteViewport(input: {
   marker: string;
   nativeSession?: { sessionId: string; epoch: number } | null;
   graphics?: TerminalGraphicsFrame;
+  inputModes?: TerminalInputModes;
+  inputSource?: NativeIoSource;
 }): SessionContentSnapshot {
   return {
     meta: {
@@ -6981,7 +6994,8 @@ function remoteViewport(input: {
       nativeSession: input.nativeSession === undefined ? null : input.nativeSession,
       sequence: input.sequence,
       geometry: { cols: input.cols, rows: input.rows, revision: input.revision ?? 1 },
-      inputModes: REMOTE_INPUT_MODES,
+      inputModes: input.inputModes ?? REMOTE_INPUT_MODES,
+      ...(input.inputSource === undefined ? {} : { inputSource: input.inputSource }),
       byteLength: 512,
       chunkCount: 1,
     },
@@ -6996,6 +7010,30 @@ function remoteViewport(input: {
 }
 
 /**
+ * One coherent host-written native source for a published remote viewport. Every
+ * field is the owner's own fact; it is descriptive only and never authority.
+ */
+function remoteNativeSource(input: {
+  hostRunId: string;
+  sessionId: string;
+  nativeSession: { sessionId: string; epoch: number };
+  cols: number;
+  rows: number;
+  revision?: number;
+  viewerRevision?: number;
+  sourceToken?: string;
+}): NativeIoSource {
+  return {
+    hostRunId: input.hostRunId,
+    sessionId: input.sessionId,
+    nativeSession: { sessionId: input.nativeSession.sessionId, epoch: input.nativeSession.epoch },
+    geometry: { cols: input.cols, rows: input.rows, revision: input.revision ?? 1 },
+    viewerRevision: input.viewerRevision ?? 1,
+    sourceToken: input.sourceToken ?? "commit-a",
+  };
+}
+
+/**
  * The content port the coordinator fake hands Main. It records Main's own
  * requests and publishes owner viewports the way the real controller does: one
  * global selection, one complete current view, one advisory callback.
@@ -7005,11 +7043,83 @@ class FakePeerContentPort implements PeerContentController {
   readonly viewports: PeerContentViewport[] = [];
   readCalls = 0;
   selectThrows = false;
+  /** Main's registered dynamic callbacks, when the internal opt-in supplied them. */
+  nativeIo: PeerNativeIoCallbacks | undefined;
+  /** Every input Main handed this port, including ones the proof refused. */
+  readonly inputRequests: PeerNativeInputRequest[] = [];
+  /** Inputs that passed both the admission proof and the pre-write re-proof. */
+  readonly deliveredInputs: PeerNativeInputRequest[] = [];
+  /** Outcome this fake endpoint reports for one accepted input. */
+  sendResult: NativeInputSendResult = { status: "submitted" };
+  rejectNextInput = false;
+  /** State change between the admission proof and the pre-write re-proof. */
+  beforeWrite: (() => void) | undefined;
+  readNativeInputTargetCalls = 0;
   private changeHandler: ((observation: PeerContentObservation) => void) | undefined;
   private observation: PeerContentObservation = { target: null, state: "none", view: undefined, reason: null };
 
   attach(onChange: ((observation: PeerContentObservation) => void) | undefined): void {
     this.changeHandler = onChange;
+  }
+
+  attachNativeIo(callbacks: PeerNativeIoCallbacks | undefined): void {
+    this.nativeIo = callbacks;
+  }
+
+  /**
+   * The descriptive target of the currently published view, exactly as the real
+   * controller describes its own current endpoint. Descriptive only: it never
+   * selects, rewrites, or authorizes anything.
+   */
+  readNativeInputTarget(): PeerNativeInputTarget | undefined {
+    this.readNativeInputTargetCalls += 1;
+    const target = this.observation.target;
+    const view = this.observation.state === "current" ? this.observation.view : undefined;
+    if (target === null || view === undefined) return undefined;
+    const source = view.snapshot.meta.inputSource;
+    if (source === undefined || source === null) return undefined;
+    return {
+      hostId: target.hostId,
+      selectionGeneration: target.selectionGeneration,
+      subscriptionId: view.snapshot.meta.subscriptionId,
+      source,
+      inputModes: view.snapshot.meta.inputModes,
+    };
+  }
+
+  /**
+   * Mirror the real coordinator/endpoint composition: the caller's dynamic proof
+   * runs at admission AND immediately before the protected write, so a state
+   * change between them refuses the write entirely.
+   */
+  sendNativeInput(request: PeerNativeInputRequest): Promise<NativeInputSendResult> {
+    this.inputRequests.push(request);
+    if (this.rejectNextInput) {
+      this.rejectNextInput = false;
+      return Promise.reject(new Error("synthetic input rejection"));
+    }
+    const target: PeerNativeInputTarget = {
+      hostId: request.hostId,
+      selectionGeneration: request.selectionGeneration,
+      subscriptionId: request.subscriptionId,
+      source: request.source,
+      inputModes: request.inputModes,
+    };
+    const authorize = this.nativeIo?.authorizeInput;
+    if (authorize === undefined || authorize(target) !== true) {
+      return Promise.resolve({ status: "not-sent", reason: "unauthorized" });
+    }
+    try { this.beforeWrite?.(); } catch { /* a throwing hook is still just a state change */ }
+    if (authorize(target) !== true) {
+      return Promise.resolve({ status: "not-sent", reason: "unauthorized" });
+    }
+    if (this.sendResult.status !== "not-sent") this.deliveredInputs.push(request);
+    return Promise.resolve(this.sendResult);
+  }
+
+  /** Deliver one completed copy through the callback Main registered, if any. */
+  deliverCopy(receipt: PeerNativeCopyReceipt): void {
+    this.nativeIo?.onCopy(receipt);
   }
 
   selectContent(target: PeerContentTarget | null): void {
@@ -7068,6 +7178,7 @@ class FakePeerCoordinatorWithContent extends FakePeerCoordinator {
 async function remoteContentMainHarness(
   t: { after(callback: () => void): void },
   hosts: readonly RemotePeerUiHost[],
+  dependencies: MainTestDependencies = {},
 ): Promise<{
   harness: Harness;
   peer: FakePeerCoordinatorWithContent;
@@ -7076,8 +7187,9 @@ async function remoteContentMainHarness(
 }> {
   const content = new FakePeerContentPort();
   const peer = new FakePeerCoordinatorWithContent(content);
-  const started = await peerMainHarness(t, undefined, {}, peer);
+  const started = await peerMainHarness(t, undefined, dependencies, peer);
   content.attach(started.peer.options?.onContentChange);
+  content.attachNativeIo(started.peer.options?.nativeIo);
   assert.ok(started.peer.options?.contentSource,
     "Main hands the one coordinator its own already-acquired owning-host service");
   started.peer.publish({ hosts: hosts as unknown as PeerUiSnapshot["hosts"] });
@@ -7120,6 +7232,54 @@ async function activateRemoteRosterRow(harness: Harness, hostLabel: string): Pro
     await nextTurn();
   }
   assert.fail(`the actual rendered roster never offered its ${hostLabel} remote card`);
+}
+
+/**
+ * The actual-written remote native IO scenario: one local row exists (so a local
+ * fallback would be observable), one remote card is deliberately activated with
+ * real host input, and one complete viewport carrying a coherent host-written
+ * source is published and actually written. The internal opt-in is supplied by
+ * the caller's own dependency override, exactly like production wiring would.
+ */
+async function remoteNativeInputHarness(
+  t: { after(callback: () => void): void },
+): Promise<{
+  harness: Harness;
+  content: FakePeerContentPort;
+  manager: FakeManager;
+  source: NativeIoSource;
+  generation: number;
+  rect: { readonly column: number; readonly row: number; readonly cols: number; readonly rows: number };
+}> {
+  const { harness, content } = await remoteContentMainHarness(t, [
+    remotePeerHost({
+      id: "lab-a",
+      label: "Lab Alpha",
+      hostRunId: "run-a",
+      rows: [remoteRosterRow({ id: "row-a", label: "Alpha remote" })],
+    }),
+  ], { nativeInputOriginFraming: true });
+  const manager = harnessManager(harness);
+  fillForm(harness.terminal, "/local/workspace");
+  await nextTurn();
+  harness.terminal.emitInput(ALT_LEFT);
+  await nextTurn();
+  await activateRemoteRosterRow(harness, "Lab Alpha");
+  const generation = content.currentTarget().selectionGeneration;
+  const nativeSession = { sessionId: "conversation-a", epoch: 3 };
+  const source = remoteNativeSource({
+    hostRunId: "run-a", sessionId: "row-a", nativeSession, cols: 40, rows: 20,
+  });
+  content.publish(remoteViewport({
+    subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 1,
+    cols: 40, rows: 20, marker: "REMOTE-NATIVE-IO", nativeSession, inputSource: source,
+  }));
+  await nextTurn();
+  assert.equal(harness.sidebar!.focus, "main", "the written remote source owns Main focus");
+  assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-NATIVE-IO"));
+  // Wide layout: 32 sidebar columns plus one divider. The 40x20 frame is drawn at
+  // the native pane's top-left corner, so everything past it is host padding.
+  return { harness, content, manager, source, generation, rect: { column: 33, row: 1, cols: 40, rows: 20 } };
 }
 
 test("activating a remote roster card displays that owner's native viewport through the one writer", async (t) => {
@@ -9524,6 +9684,636 @@ test("an actual write publishes its receipt even when a newer identical candidat
   } finally {
     harness.writer.holdWrites = false;
     harness.writer.queueWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Remote native input / text copy: internal opt-in, actual-written authority.
+//
+// Every fixture below is a controlled DTO or an owned fake; no real peer,
+// transport, child, PTY, or physical clipboard is involved. A "submitted" result
+// is only ever local transport return, never proof the remote child processed it.
+// ---------------------------------------------------------------------------
+
+test("remote native IO stays inert by default and only an explicit internal opt-in wires it", async (t) => {
+  const hosts = [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
+  ];
+  const off = await remoteContentMainHarness(t, hosts);
+  try {
+    assert.equal(off.peer.options?.nativeIo, undefined,
+      "the default coordinator receives no native input/copy callbacks at all");
+    assert.equal(harnessManager(off.harness).options.nativeInputOriginFraming, undefined,
+      "the default manager call shape is unchanged, so no child is framed by accident");
+  } finally {
+    assert.equal(await closeWithSignal(off.harness), 0);
+  }
+
+  const on = await remoteContentMainHarness(t, hosts, { nativeInputOriginFraming: true });
+  try {
+    assert.equal(harnessManager(on.harness).options.nativeInputOriginFraming, true,
+      "an explicit opt-in forwards the existing framing option to children created later");
+    assert.equal(typeof on.peer.options?.nativeIo?.authorizeInput, "function",
+      "the opt-in supplies the coordinator's dynamic written-source proof");
+    assert.equal(typeof on.peer.options?.nativeIo?.onCopy, "function",
+      "the opt-in supplies the initiating-viewer copy callback");
+  } finally {
+    assert.equal(await closeWithSignal(on.harness), 0);
+  }
+});
+
+test("one written remote source receives canonical keyboard, paste, and mouse submissions and no local fallback", async (t) => {
+  const { harness, content, manager, source, generation, rect } = await remoteNativeInputHarness(t);
+  try {
+    const localWrites = manager.writes.length;
+    const requestShape = (index: number) => {
+      const request = content.inputRequests[index]!;
+      return {
+        kind: request.kind,
+        text: request.text,
+        hostId: request.hostId,
+        selectionGeneration: request.selectionGeneration,
+        subscriptionId: request.subscriptionId,
+        source: request.source,
+      };
+    };
+    const expectedTarget = {
+      hostId: "lab-a",
+      selectionGeneration: generation,
+      subscriptionId: "sub-a",
+      source,
+    };
+
+    // Keyboard is source-normalized under the ACTUAL public terminal state; the
+    // owner (not Main) translates once for its own native modes.
+    harness.terminal.kittyProtocolActive = true;
+    harness.terminal.emitInput(`${ESC}\r`);
+    await nextTurn();
+    assert.deepEqual(requestShape(0), { ...expectedTarget, kind: "keyboard", text: `${ESC}[13;2u` },
+      "a Kitty-active source reports Shift+Enter with its own canonical spelling");
+
+    harness.terminal.kittyProtocolActive = false;
+    harness.terminal.emitInput("ls\r");
+    await nextTurn();
+    assert.deepEqual(requestShape(1), { ...expectedTarget, kind: "keyboard", text: "ls\r" },
+      "ordinary text is carried unchanged and claims no viewport");
+
+    harness.terminal.emitInput(`${ESC}[200~h\u00e9llo${ESC}[201~`);
+    await nextTurn();
+    assert.deepEqual(requestShape(2), { ...expectedTarget, kind: "paste", text: "h\u00e9llo" },
+      "a complete bracketed paste contributes only its TEXTBODY");
+
+    // The pointer maps from the screen cell into the written content rectangle.
+    emitMouse(harness.terminal, rect.column + 2, rect.row + 3);
+    await nextTurn();
+    assert.deepEqual(requestShape(3), { ...expectedTarget, kind: "mouse", text: `${ESC}[<0;3;4M` },
+      "a press becomes one canonical content-space SGR report");
+
+    emitMouse(harness.terminal, rect.column + 2, rect.row + 3, 0, "m");
+    await nextTurn();
+    assert.deepEqual(requestShape(4), { ...expectedTarget, kind: "mouse", text: `${ESC}[<0;3;4m` },
+      "the release keeps its own final byte");
+
+    const paddingColumn = rect.column + rect.cols + 1;
+    emitMouse(harness.terminal, paddingColumn, rect.row + 1);
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 5, "a pointer in host padding claims no content cell and sends nothing");
+
+    assert.equal(content.deliveredInputs.length, 5, "every admitted packet reached the one delegate exactly once");
+    assert.equal(manager.writes.length, localWrites, "no remote attempt ever reaches a local row's PTY");
+    assert.equal(harness.sidebar!.focus, "main", "remote input never steals focus");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("remote input authority is the actual written source, never a queued candidate or a stale one", async (t) => {
+  const { harness, content, manager, generation } = await remoteNativeInputHarness(t);
+  try {
+    harness.writer.holdWrites = true;
+    const nextSession = { sessionId: "conversation-b", epoch: 4 };
+    const nextSource = remoteNativeSource({
+      hostRunId: "run-a", sessionId: "row-a", nativeSession: nextSession, cols: 40, rows: 20,
+      revision: 2, viewerRevision: 2, sourceToken: "commit-b",
+    });
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
+      cols: 40, rows: 20, revision: 2, marker: "REMOTE-NATIVE-IO-B",
+      nativeSession: nextSession, inputSource: nextSource,
+    }));
+    await nextTurn();
+
+    harness.terminal.emitInput("x");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 0, "a published-but-unwritten source authorizes nothing");
+    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_NOT_SENT_NOTICE) !== undefined,
+      "the refusal is the existing brief non-modal notice, not a silent drop or a local fallback");
+
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    assert.equal(content.deliveredInputs.length, 1, "the new frame's own write establishes the next authority");
+    assert.deepEqual(content.deliveredInputs[0]!.source, nextSource,
+      "the submission carries the expected written source, never a re-read of owner facts");
+    assert.equal(content.deliveredInputs[0]!.selectionGeneration, generation,
+      "the deliberate selection generation is carried, not advanced");
+    assert.equal(manager.writes.length, 0, "nothing was retargeted to the local row");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("ordinary remote output never stalls typing while a mode-only change needs its own written frame", async (t) => {
+  const { harness, content, source } = await remoteNativeInputHarness(t);
+  try {
+    const nativeSession = { sessionId: "conversation-a", epoch: 3 };
+    const invalidations = harness.writer.invalidateCalls;
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
+      cols: 40, rows: 20, marker: "REMOTE-NATIVE-IO-TEXT", nativeSession, inputSource: source,
+    }));
+    await nextTurn();
+    assert.equal(harness.writer.invalidateCalls, invalidations,
+      "a fresh snapshot and sequence with the same written source is not a semantic boundary");
+    harness.terminal.emitInput("k");
+    await nextTurn();
+    assert.equal(content.deliveredInputs.length, 1, "typing continues across ordinary terminal output");
+
+    const changedModes = { ...REMOTE_INPUT_MODES, kittyFlags: 1 };
+    harness.writer.holdWrites = true;
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 3,
+      cols: 40, rows: 20, marker: "REMOTE-NATIVE-IO-TEXT", nativeSession, inputSource: source,
+      inputModes: changedModes,
+    }));
+    await nextTurn();
+    assert.ok(harness.writer.invalidateCalls > invalidations,
+      "an observed mode-only change forces the writer boundary even with identical visible bytes");
+    harness.terminal.emitInput("k");
+    await nextTurn();
+    assert.equal(content.deliveredInputs.length, 1, "input waits for the new modes' own written frame");
+
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    harness.terminal.emitInput("k");
+    await nextTurn();
+    assert.equal(content.deliveredInputs.length, 2, "the written boundary restores input");
+    assert.deepEqual(content.deliveredInputs[1]!.inputModes, changedModes,
+      "the submission carries the modes it was actually written for");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("every protected remote input write re-proves current focus, coverage, and geometry", async (t) => {
+  const { harness, content, manager } = await remoteNativeInputHarness(t);
+  try {
+    content.beforeWrite = () => { harness.terminal.setSize(100, 30); };
+    harness.terminal.emitInput("x");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 1, "the admission proof ran for the held write");
+    assert.equal(content.deliveredInputs.length, 0,
+      "a geometry change between admission and the write refuses the write entirely");
+    assert.equal(manager.writes.length, 0, "the refused write never falls back to a local row");
+    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_NOT_SENT_NOTICE) !== undefined,
+      "the refusal is a brief, non-modal notice");
+
+    content.beforeWrite = undefined;
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    assert.equal(content.deliveredInputs.length, 1,
+      "once the resized geometry has its own written frame, input resumes against it");
+    assert.equal(content.deliveredInputs[0]!.text, "y");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("remote paste is bounded by decoded text bytes and never truncated, paged, or imaged", async (t) => {
+  const { harness, content } = await remoteNativeInputHarness(t);
+  try {
+    harness.terminal.emitInput(`${ESC}[200~partial`);
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 0, "an incomplete bracketed paste is never handed to the owner");
+
+    const exact = "x".repeat(1024 * 1024);
+    harness.terminal.emitInput(`${ESC}[200~${exact}${ESC}[201~`);
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 1, "exactly 1 MiB of decoded text is accepted");
+    assert.equal(Buffer.byteLength(content.inputRequests[0]!.text, "utf8"), 1024 * 1024);
+
+    const over = "x".repeat(1024 * 1024 + 1);
+    harness.terminal.emitInput(`${ESC}[200~${over}${ESC}[201~`);
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 1, "an oversized paste is refused whole");
+    assert.equal(content.deliveredInputs.length, 1);
+    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_PASTE_TOO_LARGE_NOTICE) !== undefined,
+      "the fixed non-modal refusal notice says nothing was sent");
+
+    // The bound is decoded bytes, not characters: 600k two-byte characters exceed it.
+    harness.terminal.emitInput(`${ESC}[200~${"\u00e9".repeat(600_000)}${ESC}[201~`);
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 1, "a multi-byte body is measured by its decoded size");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("remote input results stay truthful: refusal notices and UNCERTAIN, never a claimed submission", async (t) => {
+  const { harness, content, manager } = await remoteNativeInputHarness(t);
+  try {
+    content.sendResult = { status: "not-sent", reason: "busy" };
+    harness.terminal.emitInput("a");
+    await nextTurn();
+    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_NOT_SENT_NOTICE) !== undefined,
+      "a client-side refusal truthfully says nothing was sent");
+
+    content.sendResult = { status: "unknown" };
+    harness.terminal.emitInput("b");
+    await nextTurn();
+    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_UNCERTAIN_NOTICE) !== undefined,
+      "an unknown outcome is labelled UNCERTAIN instead of claiming nothing was sent");
+
+    content.rejectNextInput = true;
+    content.sendResult = { status: "submitted" };
+    harness.terminal.emitInput("c");
+    await nextTurn();
+    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_UNCERTAIN_NOTICE) !== undefined,
+      "a rejected delegate is uncertain, not unsent");
+
+    assert.equal(content.deliveredInputs.length, 1, "only the outcome that may have been written counts as handed over");
+    assert.equal(content.inputRequests.length, 3, "every attempt reached the one delegate once, with no retry");
+    assert.equal(manager.writes.length, 0, "no outcome routes input to a local row");
+    assert.equal(harness.sidebar!.focus, "main", "no result steals focus");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("native copies emit one outer OSC 52 only for the current initiating viewer's written source", async (t) => {
+  const { harness, content, manager, source, generation } = await remoteNativeInputHarness(t);
+  try {
+    const deliver = (input: {
+      copyId: string;
+      sequence: number;
+      dispatchId: number;
+      encoded?: string;
+      source?: NativeIoSource;
+      sessionEpoch?: number;
+    }): void => {
+      const copySource = input.source ?? source;
+      const copyTuple = copySource.nativeSession;
+      content.deliverCopy({
+        subscriptionId: "sub-a",
+        copyId: input.copyId,
+        sequence: input.sequence,
+        source: copySource,
+        dispatchId: input.dispatchId,
+        event: input.encoded === undefined
+          ? { kind: "unavailable", reason: "unsupported-runtime", sessionId: copyTuple.sessionId, sessionEpoch: copyTuple.epoch }
+          : {
+            kind: "copy",
+            encoded: input.encoded,
+            sessionId: copyTuple.sessionId,
+            sessionEpoch: input.sessionEpoch ?? copyTuple.epoch,
+          },
+        hostId: "lab-a",
+        selectionGeneration: generation,
+      });
+    };
+
+    const writesBefore = harness.terminal.writes.length;
+    // An asynchronous copy from an earlier input is still delivered: the copy
+    // emission order, not an input dispatch id, orders copies.
+    deliver({ copyId: "copy-b", sequence: 2, dispatchId: 7, encoded: "aGVsbG8=" });
+    deliver({ copyId: "copy-a", sequence: 1, dispatchId: 3, encoded: "d29ybGQ=" });
+    assert.deepEqual(harness.terminal.writes.slice(writesBefore),
+      [`${ESC}]52;c;aGVsbG8=\x07`, `${ESC}]52;c;d29ybGQ=\x07`],
+      "both copies of the same current scope are delivered exactly once each");
+
+    const afterCopies = harness.terminal.writes.length;
+    deliver({ copyId: "copy-unavailable", sequence: 3, dispatchId: 8 });
+    assert.equal(harness.terminal.writes.length, afterCopies,
+      "an unavailable copy never emits an outer sequence and claims no clipboard success");
+
+    const staleSource = remoteNativeSource({
+      hostRunId: "run-a", sessionId: "row-a",
+      nativeSession: { sessionId: "conversation-a", epoch: 9 }, cols: 40, rows: 20,
+    });
+    deliver({ copyId: "copy-stale", sequence: 4, dispatchId: 9, encoded: "c3RhbGU=", source: staleSource });
+    assert.equal(harness.terminal.writes.length, afterCopies, "an old source's copy is dropped, never replayed");
+
+    deliver({ copyId: "copy-tuple", sequence: 5, dispatchId: 10, encoded: "dHVwbGU=", sessionEpoch: 99 });
+    assert.equal(harness.terminal.writes.length, afterCopies, "a copy naming another native tuple is refused");
+
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    const afterFocus = harness.terminal.writes.length;
+    deliver({ copyId: "copy-focus", sequence: 6, dispatchId: 11, encoded: "Zm9jdXM=" });
+    assert.equal(harness.terminal.writes.length, afterFocus,
+      "an uncovered, Main-focused written source is required; roster focus drops the copy");
+
+    assert.equal(manager.writes.length, 0, "copies never reach a local child or the local clipboard route");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a full-length remote native copy is emitted once, whole, under the unchanged bound", async (t) => {
+  const { harness, content, source, generation } = await remoteNativeInputHarness(t);
+  try {
+    const encoded = "A".repeat(100_000);
+    const writesBefore = harness.terminal.writes.length;
+    content.deliverCopy({
+      subscriptionId: "sub-a",
+      copyId: "copy-full",
+      sequence: 1,
+      source,
+      dispatchId: 1,
+      event: {
+        kind: "copy",
+        encoded,
+        sessionId: source.nativeSession.sessionId,
+        sessionEpoch: source.nativeSession.epoch,
+      },
+      hostId: "lab-a",
+      selectionGeneration: generation,
+    });
+    const written = harness.terminal.writes.slice(writesBefore);
+    assert.equal(written.length, 1, "the assembled copy is handed to the terminal exactly once");
+    assert.equal(written[0], `${ESC}]52;c;${encoded}\x07`,
+      "the full producer bound is carried whole, never shrunk or re-encoded");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a copy of the current written source is not gated by input modes", async (t) => {
+  const { harness, content, source, generation } = await remoteNativeInputHarness(t);
+  try {
+    const nativeSession = { sessionId: "conversation-a", epoch: 3 };
+    // A mode-only change with identical bytes: input needs the new written frame,
+    // but a copy is text, so it gains no per-input-mode history or dispatch fence.
+    harness.writer.holdWrites = true;
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
+      cols: 40, rows: 20, marker: "REMOTE-NATIVE-IO", nativeSession, inputSource: source,
+      inputModes: { ...REMOTE_INPUT_MODES, kittyFlags: 1 },
+    }));
+    await nextTurn();
+    const writesBefore = harness.terminal.writes.length;
+    content.deliverCopy({
+      subscriptionId: "sub-a",
+      copyId: "copy-modes",
+      sequence: 1,
+      source,
+      dispatchId: 1,
+      event: {
+        kind: "copy",
+        encoded: "bW9kZXM=",
+        sessionId: nativeSession.sessionId,
+        sessionEpoch: nativeSession.epoch,
+      },
+      hostId: "lab-a",
+      selectionGeneration: generation,
+    });
+    assert.equal(harness.terminal.writes.length, writesBefore + 1,
+      "the same written source still delivers its copy across a pending mode boundary");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a resize that returns to its original size revokes remote authority until a post-resize frame is written", async (t) => {
+  const { harness, content, source, generation } = await remoteNativeInputHarness(t);
+  try {
+    harness.writer.holdWrites = true;
+    // 80 -> 70 -> 80 before any replacement frame is written. Pane rectangles
+    // match the pre-resize receipt again, but the physical screen may have
+    // reflowed and nothing newer has been written.
+    harness.terminal.setSize(70, 24);
+    harness.terminal.setSize(80, 24);
+    await nextTurn();
+    assert.ok(harness.writer.heldSubmits > 0, "the post-resize candidate is queued, never written");
+
+    harness.terminal.emitInput("x");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 0,
+      "the pre-resize receipt never regains authority when the size returns to its old value");
+    assert.equal(harness.sidebar!.focus, "main");
+
+    const writesBefore = harness.terminal.writes.length;
+    content.deliverCopy({
+      subscriptionId: "sub-a",
+      copyId: "copy-aba",
+      sequence: 1,
+      source,
+      dispatchId: 1,
+      event: {
+        kind: "copy",
+        encoded: "YWJh",
+        sessionId: source.nativeSession.sessionId,
+        sessionEpoch: source.nativeSession.epoch,
+      },
+      hostId: "lab-a",
+      selectionGeneration: generation,
+    });
+    assert.equal(harness.terminal.writes.length, writesBefore,
+      "a pre-resize copy emits nothing after the resize boundary");
+
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    assert.equal(content.deliveredInputs.length, 1,
+      "only the post-resize written frame restores input authority");
+    assert.equal(content.deliveredInputs[0]!.text, "y");
+    content.deliverCopy({
+      subscriptionId: "sub-a",
+      copyId: "copy-post",
+      sequence: 2,
+      source,
+      dispatchId: 2,
+      event: {
+        kind: "copy",
+        encoded: "cG9zdA==",
+        sessionId: source.nativeSession.sessionId,
+        sessionEpoch: source.nativeSession.epoch,
+      },
+      hostId: "lab-a",
+      selectionGeneration: generation,
+    });
+    assert.equal(harness.terminal.writes.length, writesBefore + 1,
+      "the post-resize copy is delivered exactly once");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("remote-enabled Main captures the displayed owner's own mouse reporting mode", async (t) => {
+  const { harness, content, source } = await remoteNativeInputHarness(t);
+  const nativeSession = { sessionId: "conversation-a", epoch: 3 };
+  try {
+    const dragModes: TerminalInputModes = { ...REMOTE_INPUT_MODES, mouseTracking: "drag", mouseEncoding: "sgr" };
+    const anyModes: TerminalInputModes = { ...REMOTE_INPUT_MODES, mouseTracking: "any", mouseEncoding: "sgr" };
+
+    const beforeDrag = harness.terminal.writes.length;
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
+      cols: 40, rows: 20, marker: "REMOTE-MOUSE-DRAG", nativeSession, inputSource: source,
+      inputModes: dragModes,
+    }));
+    await nextTurn();
+    assert.deepEqual(harness.terminal.writes.slice(beforeDrag), [`${ESC}[?1000l`, `${ESC}[?1002h`],
+      "the written owner's drag mode replaces the host's press-only capture");
+
+    const beforeAny = harness.terminal.writes.length;
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 3,
+      cols: 40, rows: 20, marker: "REMOTE-MOUSE-ANY", nativeSession, inputSource: source,
+      inputModes: anyModes,
+    }));
+    await nextTurn();
+    assert.deepEqual(harness.terminal.writes.slice(beforeAny), [`${ESC}[?1002l`, `${ESC}[?1003h`],
+      "a mode-only change resynchronizes capture immediately");
+
+    // Narrow Main: no sidebar rectangle is drawn, so the host's own pane capture
+    // is absent; the displayed owner's capture must survive.
+    const beforeNarrow = harness.terminal.writes.length;
+    harness.terminal.setSize(50, 24);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main");
+    assert.deepEqual(harness.terminal.writes.slice(beforeNarrow), [],
+      "a narrow Main pane keeps the owner's any-mode capture instead of dropping it");
+
+    // Hidden sidebar: host focus drops to press-only capture, then returning to
+    // the displayed owner restores its own any-mode capture.
+    const beforeHide = harness.terminal.writes.length;
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar!.visible, false);
+    assert.equal(harness.sidebar!.focus, "main");
+    assert.deepEqual(harness.terminal.writes.slice(beforeHide),
+      [`${ESC}[?1003l`, `${ESC}[?1000h`, `${ESC}[?1000l`, `${ESC}[?1003h`],
+      "a hidden sidebar returns to the owner's capture once Main is focused again");
+    assert.equal(harness.terminal.writes.includes(`${ESC}[?1006l`), false,
+      "cell-coordinate capture is never dropped while the owner is displayed");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("default-off remote display keeps the host's press-only capture for published mouse modes", async (t) => {
+  const { harness, content, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
+  ]);
+  try {
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    await nextTurn();
+    const nativeSession = { sessionId: "conversation-a", epoch: 3 };
+    const source = remoteNativeSource({ hostRunId: "run-a", sessionId: "row-a", nativeSession, cols: 40, rows: 20 });
+    const dragModes: TerminalInputModes = { ...REMOTE_INPUT_MODES, mouseTracking: "drag", mouseEncoding: "sgr" };
+    const before = harness.terminal.writes.length;
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 1,
+      cols: 40, rows: 20, marker: "REMOTE-OFF-MOUSE", nativeSession, inputSource: source,
+      inputModes: dragModes,
+    }));
+    await nextTurn();
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-OFF-MOUSE"),
+      "the legacy display-only path still paints the published view");
+    assert.deepEqual(harness.terminal.writes.slice(before), [],
+      "without the internal opt-in a published mouse mode changes no outer capture");
+    assert.equal(harness.terminal.writes.includes(`${ESC}[?1002h`), false);
+    assert.equal(harness.terminal.writes.includes(`${ESC}[?1003h`), false);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a refused remote input notice stays visible when no sidebar pane is drawn", async (t) => {
+  const { harness, content } = await remoteNativeInputHarness(t);
+  try {
+    // Hidden sidebar at 80 columns: Main owns the full width and no roster pane
+    // exists, so only the composed header can carry the brief notice.
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar!.visible, false);
+    assert.equal(harness.sidebar!.focus, "main");
+    harness.terminal.emitInput(`${ESC}[200~${"x".repeat(1024 * 1024 + 1)}${ESC}[201~`);
+    await nextTurn();
+    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 0).includes(REMOTE_INPUT_PASTE_TOO_LARGE_NOTICE),
+      "the header carries the oversized-paste refusal while the sidebar is hidden");
+
+    // Unknown outcome at the ordinary 80-column width with no sidebar: the
+    // uncertainty label must lead the one composed notice row so clipping cannot
+    // remove the essential classification.
+    content.sendResult = { status: "unknown" };
+    harness.terminal.emitInput("k");
+    await nextTurn();
+    const hiddenUnknown = plainLine(harness.writer.frames.at(-1)?.frame, 0);
+    assert.ok(hiddenUnknown.includes("UNCERTAIN"),
+      "the uncertainty label survives header clipping at 80 columns");
+    assert.equal(hiddenUnknown.includes("nothing was sent"), false,
+      "an unknown outcome is never presented as nothing sent");
+
+    // Also retain the complete uncertainty wording on a wider terminal.
+    harness.terminal.setSize(120, 30);
+    await nextTurn();
+    assert.equal(harness.sidebar!.visible, false);
+    content.sendResult = { status: "unknown" };
+    harness.terminal.emitInput("k");
+    await nextTurn();
+    const hiddenUncertain = plainLine(harness.writer.frames.at(-1)?.frame, 0);
+    assert.ok(hiddenUncertain.includes(REMOTE_INPUT_UNCERTAIN_NOTICE),
+      "the complete UNCERTAIN wording is composed without a sidebar");
+    assert.ok(hiddenUncertain.includes("UNCERTAIN"), "the uncertainty label is never dropped");
+    assert.equal(hiddenUncertain.includes(REMOTE_INPUT_NOT_SENT_NOTICE), false,
+      "an unknown outcome is never presented as nothing sent");
+
+    // Narrow Main with the sidebar visible again: the overlay draws no sidebar
+    // rectangle while Main owns focus, so the header still carries the notice.
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    harness.terminal.emitInput(`${ESC}[1;3C`); // Alt+Right: return input ownership to Main.
+    await nextTurn();
+    assert.equal(harness.sidebar!.visible, true);
+    assert.equal(harness.sidebar!.focus, "main");
+    harness.terminal.setSize(50, 24);
+    await nextTurn();
+    content.sendResult = { status: "unknown" };
+    harness.terminal.emitInput("k");
+    await nextTurn();
+    const narrowUnknown = plainLine(harness.writer.frames.at(-1)?.frame, 0);
+    assert.ok(narrowUnknown.includes("UNCERTAIN"),
+      "the uncertainty label survives header clipping at 50 columns");
+    assert.equal(narrowUnknown.includes("nothing was sent"), false,
+      "a narrow unknown outcome is never presented as nothing sent");
+    content.sendResult = { status: "not-sent", reason: "busy" };
+    harness.terminal.emitInput("k");
+    await nextTurn();
+    const narrowRefused = plainLine(harness.writer.frames.at(-1)?.frame, 0);
+    assert.ok(narrowRefused.includes("Remote input was refused"),
+      "a narrow Main pane still shows the brief refusal instead of dropping it");
+    assert.equal(narrowRefused.includes("UNCERTAIN"), false,
+      "the newer local refusal replaces the previous uncertainty wording");
+
+    harness.terminal.emitInput(`${ESC}[200~${"x".repeat(1024 * 1024 + 1)}${ESC}[201~`);
+    await nextTurn();
+    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 0)
+      .includes("That paste is larger than a remote session"),
+      "a narrow Main pane also shows the oversized-paste refusal");
+  } finally {
     assert.equal(await closeWithSignal(harness), 0);
   }
 });

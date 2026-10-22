@@ -30,7 +30,16 @@ import { deleteSavedSessionFile, type SavedSessionDeletionOptions } from "../src
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import type { NativeClipboardEvent } from "../src/session-host/native-clipboard";
 import type { PeerCoordinatorOptions } from "../src/session-host/network/peer-coordinator";
-import type { PeerCoordinator, PeerUiCommand, PeerUiConsent, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
+import type {
+  PeerContentController,
+  PeerContentObservation,
+  PeerContentTarget,
+  PeerContentViewport,
+  PeerSelectedContent,
+} from "../src/session-host/network/peer-content";
+import type { SessionContentSnapshot } from "../src/session-host/network/session-content-protocol";
+import type { RemoteSessionMetadata } from "../src/session-host/network/roster-metadata";
+import type { PeerCoordinator, PeerUiCommand, PeerUiConsent, PeerUiHost, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 import { __test, type SessionHostOptions } from "../src/session-host/main";
 import {
   createLocalOwningHostService,
@@ -758,13 +767,16 @@ async function peerMainHarness(
   t: { after(callback: () => void): void },
   configure?: (peer: FakePeerCoordinator) => void,
   extraDependencies: MainTestDependencies = {},
+  suppliedPeer?: FakePeerCoordinator,
 ): Promise<{
   harness: Harness; peer: FakePeerCoordinator; dispatch(action: SidebarAction): void; releases(): number;
 }> {
   const agentDir = makeMainTestDirectory("peer-ui-agent");
   writeFileSync(join(agentDir, "keybindings.json"), "{}", "utf8");
   t.after(() => rmSync(agentDir, { recursive: true, force: true }));
-  const peer = new FakePeerCoordinator();
+  // The coordinator Main actually receives is the one this harness publishes and
+  // asserts on, so a content-capable fake needs no second coordinator anywhere.
+  const peer = suppliedPeer ?? new FakePeerCoordinator();
   configure?.(peer);
   const controllers: SidebarController[] = [];
   let releaseCalls = 0;
@@ -6860,6 +6872,1187 @@ test("Network menu pointer clicks act on the written row once and refuse unseen 
   } finally {
     harness.writer.holdWrites = false;
     harness.writer.settlementDisposition = "written";
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// One selected remote native viewport in Main.
+//
+// The coordinator fake hands Main the already-landed content controller and
+// publishes owner viewports through the callback Main itself supplied. Tuple
+// facts are controlled DTOs; the existing harness uses owned filesystem
+// fixtures and fake transport/children, never a real peer or physical clipboard.
+// ---------------------------------------------------------------------------
+
+const REMOTE_INPUT_MODES: TerminalInputModes = {
+  kittyFlags: 0,
+  modifyOtherKeys: 0,
+  applicationCursorKeys: false,
+  applicationKeypad: false,
+  bracketedPaste: false,
+  mouseTracking: "none",
+  mouseEncoding: "default",
+};
+
+function remoteRosterRow(overrides: Partial<RemoteSessionMetadata> & { id: string }): RemoteSessionMetadata {
+  return {
+    label: `remote-${overrides.id}`,
+    workspace: `/remote/ws/${overrides.id}`,
+    lifecycle: "alive",
+    hasLiveProcess: true,
+    busy: null,
+    pendingInput: null,
+    inputSurface: false,
+    activity: [],
+    nativeSession: null,
+    backgroundTasks: null,
+    backgroundShells: null,
+    activeTasks: null,
+    activeShells: null,
+    ...overrides,
+  };
+}
+
+type RemotePeerUiHost = PeerUiHost & { roster: PeerUiHost["roster"] & { hostRunId?: string | null } };
+
+function remotePeerHost(options: {
+  id: string;
+  label?: string;
+  hostRunId?: string | null;
+  rows?: readonly RemoteSessionMetadata[] | null;
+  rosterState?: "never" | "current" | "stale";
+}): RemotePeerUiHost {
+  return {
+    id: options.id,
+    label: options.label ?? `host-${options.id}`,
+    host: "10.0.0.5",
+    port: 8443,
+    state: "connected",
+    fingerprint: null,
+    message: null,
+    reconnectSuppressed: false,
+    previouslyConnected: true,
+    roster: {
+      state: options.rosterState ?? "current",
+      rows: options.rows ?? null,
+      ...(options.hostRunId === undefined ? {} : { hostRunId: options.hostRunId }),
+    },
+  };
+}
+
+/** One complete owner-published native viewport: immutable metadata plus frame. */
+function remoteViewport(input: {
+  subscriptionId: string;
+  hostRunId: string;
+  sessionId: string;
+  sequence: number;
+  cols: number;
+  rows: number;
+  revision?: number;
+  marker: string;
+  nativeSession?: { sessionId: string; epoch: number } | null;
+  graphics?: TerminalGraphicsFrame;
+}): SessionContentSnapshot {
+  return {
+    meta: {
+      subscriptionId: input.subscriptionId,
+      transferId: `transfer-${input.sequence}`,
+      hostRunId: input.hostRunId,
+      sessionId: input.sessionId,
+      nativeSession: input.nativeSession === undefined ? null : input.nativeSession,
+      sequence: input.sequence,
+      geometry: { cols: input.cols, rows: input.rows, revision: input.revision ?? 1 },
+      inputModes: REMOTE_INPUT_MODES,
+      byteLength: 512,
+      chunkCount: 1,
+    },
+    frame: {
+      cols: input.cols,
+      rows: input.rows,
+      lines: Array.from({ length: input.rows }, (_unused, row) => row === 0 ? input.marker : ""),
+      cursor: { column: 0, row: 0, visible: true },
+      ...(input.graphics === undefined ? {} : { graphics: input.graphics }),
+    },
+  };
+}
+
+/**
+ * The content port the coordinator fake hands Main. It records Main's own
+ * requests and publishes owner viewports the way the real controller does: one
+ * global selection, one complete current view, one advisory callback.
+ */
+class FakePeerContentPort implements PeerContentController {
+  readonly selections: Array<PeerContentTarget | null> = [];
+  readonly viewports: PeerContentViewport[] = [];
+  readCalls = 0;
+  selectThrows = false;
+  private changeHandler: ((observation: PeerContentObservation) => void) | undefined;
+  private observation: PeerContentObservation = { target: null, state: "none", view: undefined, reason: null };
+
+  attach(onChange: ((observation: PeerContentObservation) => void) | undefined): void {
+    this.changeHandler = onChange;
+  }
+
+  selectContent(target: PeerContentTarget | null): void {
+    this.selections.push(target);
+    if (this.selectThrows) throw new Error("synthetic selection failure");
+    this.observation = target === null
+      ? { target: null, state: "none", view: undefined, reason: null }
+      : { target, state: "connecting", view: undefined, reason: null };
+    this.changeHandler?.(this.observation);
+  }
+
+  updateContentViewport(viewport: PeerContentViewport): void {
+    this.viewports.push(viewport);
+  }
+
+  readContent(): PeerContentObservation {
+    this.readCalls += 1;
+    return this.observation;
+  }
+
+  /** The exact selection Main last asked for. */
+  currentTarget(): PeerContentTarget {
+    const target = this.selections.at(-1);
+    assert.ok(target, "Main asked the content port for exactly one selection");
+    return target;
+  }
+
+  /** Publish one completed viewport as the port's current view and notify Main. */
+  publish(snapshot: SessionContentSnapshot, patch: Partial<PeerContentObservation> = {}): void {
+    const target = this.observation.target ?? this.selections.at(-1) ?? null;
+    const view: PeerSelectedContent = {
+      hostId: target?.hostId ?? "",
+      selectionGeneration: target?.selectionGeneration ?? 0,
+      snapshot,
+    };
+    this.observation = { target, state: "current", view, reason: null, ...patch };
+    this.changeHandler?.(this.observation);
+  }
+
+  /** Deliver one observation without changing what the port itself holds. */
+  deliver(observation: PeerContentObservation): void {
+    this.changeHandler?.(observation);
+  }
+}
+
+class FakePeerCoordinatorWithContent extends FakePeerCoordinator {
+  readonly content: PeerContentController;
+
+  constructor(content: PeerContentController) {
+    super();
+    this.content = content;
+  }
+}
+
+/** The peer Main harness plus the content controller the production factory returns. */
+async function remoteContentMainHarness(
+  t: { after(callback: () => void): void },
+  hosts: readonly RemotePeerUiHost[],
+): Promise<{
+  harness: Harness;
+  peer: FakePeerCoordinatorWithContent;
+  content: FakePeerContentPort;
+  dispatch(action: SidebarAction): void;
+}> {
+  const content = new FakePeerContentPort();
+  const peer = new FakePeerCoordinatorWithContent(content);
+  const started = await peerMainHarness(t, undefined, {}, peer);
+  content.attach(started.peer.options?.onContentChange);
+  assert.ok(started.peer.options?.contentSource,
+    "Main hands the one coordinator its own already-acquired owning-host service");
+  started.peer.publish({ hosts: hosts as unknown as PeerUiSnapshot["hosts"] });
+  await nextTurn();
+  return { harness: started.harness, peer, content, dispatch: started.dispatch };
+}
+
+function harnessManager(harness: Harness): FakeManager {
+  assert.ok(harness.manager, "the harness manager is open after preflight");
+  return harness.manager;
+}
+
+/** Text the compositor actually drew in the native pane of the wide layout. */
+function nativePaneText(frame: ComposedHostFrame | undefined): string {
+  return frame?.lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33)).join("\n") ?? "";
+}
+
+/** Exact visible status in these wide, banner-free fixtures: the host's own line, clipped to the pane. */
+function assertWideRemoteStatus(harness: Harness, message: string, description?: string): void {
+  const cols = harness.terminal.columns - 33;
+  assert.equal(
+    plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(33),
+    message.slice(0, cols).padEnd(cols, " "),
+    description,
+  );
+}
+
+/** Activates the rendered remote card whose host line is selected, with real input. */
+async function activateRemoteRosterRow(harness: Harness, hostLabel: string): Promise<void> {
+  for (let step = 0; step <= 16; step += 1) {
+    const selected = harness.writer.frames.at(-1)?.frame.lines
+      .map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))
+      .find((line) => line.startsWith("> "));
+    if (selected?.includes(hostLabel)) {
+      harness.terminal.emitInput(ENTER);
+      await nextTurn();
+      return;
+    }
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+  }
+  assert.fail(`the actual rendered roster never offered its ${hostLabel} remote card`);
+}
+
+test("activating a remote roster card displays that owner's native viewport through the one writer", async (t) => {
+  const { harness, content } = await remoteContentMainHarness(t, [
+    remotePeerHost({
+      id: "lab-a",
+      label: "Lab Alpha",
+      hostRunId: "run-a",
+      rows: [remoteRosterRow({ id: "row-a", label: "Alpha remote" })],
+    }),
+  ]);
+  const manager = harnessManager(harness);
+  try {
+    fillForm(harness.terminal, "/local/workspace");
+    await nextTurn();
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(manager.viewers.sessionViewers("native-1").length, 1, "the local row is displayed before the remote selection");
+
+    await activateRemoteRosterRow(harness, "Lab Alpha");
+
+    assert.equal(content.selections.length, 1, "one deliberate selection asks for exactly one stream");
+    const selection = content.currentTarget();
+    assert.deepEqual(
+      { hostId: selection.hostId, hostRunId: selection.hostRunId, rowId: selection.rowId },
+      { hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" },
+    );
+    assert.ok(Number.isSafeInteger(selection.selectionGeneration) && selection.selectionGeneration > 0,
+      "a deliberate selection carries a monotonic generation");
+    assert.ok(selection.cols >= 20 && selection.rows >= 3, "the request is this viewer's actual pane size");
+    assert.equal(harness.sidebar!.activeMainOwnerID, undefined, "a remote owner never claims a local row id");
+    assert.deepEqual(harness.sidebar!.activeMainOwnerKey,
+      { kind: "remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    assert.equal(manager.viewers.sessionViewers("native-1").length, 0, "the local row stops being displayed");
+    assertWideRemoteStatus(harness, "Waiting for the selected remote session's display",
+      "the pane says what is actually happening while the first viewport is awaited");
+    assert.equal(manager.writes.length, 0, "selecting a remote row writes nothing to any local session");
+
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 1,
+      cols: 40, rows: 20, marker: "REMOTE-VIEWPORT-ONE",
+      nativeSession: { sessionId: "conversation-a", epoch: 3 },
+    }));
+    await nextTurn();
+
+    const painted = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(painted).includes("REMOTE-VIEWPORT-ONE"), "the accepted viewport composes through the existing compositor");
+    assert.ok(plainLine(painted, 0).includes("Lab Alpha") && plainLine(painted, 0).includes("Alpha remote"),
+      "the title line names the remote owner with its own sanitized roster labels");
+    assert.equal(nativePaneText(painted).includes("/local/workspace"), false,
+      "no local content is displayed while a remote owner is shown");
+    assert.equal(harness.terminal.writes.join("").includes("REMOTE-VIEWPORT-ONE"), false,
+      "remote content never reaches the terminal as raw bytes outside the one writer");
+    assert.equal(harness.events.filter((name) => name === "manager.create").length, 1,
+      "displaying remote content creates no second manager, inventory, or viewer registry");
+
+    // A later publish repaints on its own: no keyboard, roster, or resize event.
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
+      cols: 40, rows: 20, marker: "REMOTE-VIEWPORT-TWO",
+      nativeSession: { sessionId: "conversation-a", epoch: 3 },
+    }));
+    await nextTurn();
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-VIEWPORT-TWO"),
+      "an arriving viewport update repaints without any other event");
+    assert.equal(manager.writes.length, 0, "displaying remote content writes nothing to a local child");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a remote row id that collides with a local row never reaches local row authority", async (t) => {
+  const { harness, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "native-1" })] }),
+  ]);
+  const manager = harnessManager(harness);
+  try {
+    fillForm(harness.terminal, "/local/workspace");
+    await nextTurn();
+    const surfaceReads: string[] = [];
+    const readSurface = manager.surface.bind(manager);
+    manager.surface = (id: string) => {
+      surfaceReads.push(id);
+      return readSurface(id);
+    };
+    surfaceReads.length = 0;
+
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "native-1" });
+    await nextTurn();
+
+    assert.deepEqual(surfaceReads, [], "a remote selection never reads a local row's surface, even on an id collision");
+    assert.equal(manager.writes.length, 0, "nothing is written to a local row on a remote owner's behalf");
+    assert.deepEqual(manager.closeExitedCalls, [], "no local row is closed or stopped");
+    assert.equal(manager.views.length, 1, "the local row keeps running and stays in the roster");
+    assert.equal(harness.sidebar!.activeMainOwnerID, undefined, "the local row keeps no false Main-owner highlight");
+    assert.equal(nativePaneText(harness.writer.frames.at(-1)?.frame).includes("/local/workspace"), false,
+      "the local row is not displayed under a remote selection");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a superseded generation, foreign tuple, mixed geometry pair, and regressed sequence never paint another viewport", async (t) => {
+  const { harness, content, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({
+      id: "lab-a",
+      label: "Lab Alpha",
+      hostRunId: "run-a",
+      rows: [remoteRosterRow({ id: "row-a", label: "Alpha remote" }), remoteRosterRow({ id: "row-b", label: "Beta remote" })],
+    }),
+  ]);
+  try {
+    const shown = (): string => plain(harness.writer.frames.at(-1)?.frame);
+    const viewport = (input: { sessionId: string; sequence: number; marker: string; subscriptionId?: string }) => ({
+      subscriptionId: input.subscriptionId ?? "sub-a",
+      hostRunId: "run-a",
+      sessionId: input.sessionId,
+      sequence: input.sequence,
+      cols: 40,
+      rows: 20,
+      marker: input.marker,
+    });
+
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    await nextTurn();
+    const generation = content.currentTarget().selectionGeneration;
+    content.publish(remoteViewport(viewport({ sessionId: "row-a", sequence: 1, marker: "REMOTE-ROW-A" })));
+    await nextTurn();
+    assert.ok(shown().includes("REMOTE-ROW-A"), "the selected row's own viewport is displayed");
+
+    // A new deliberate selection supersedes the first one entirely.
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-b" });
+    await nextTurn();
+    const nextGeneration = content.currentTarget().selectionGeneration;
+    assert.ok(nextGeneration > generation, "a new deliberate selection advances the generation");
+    assert.equal(shown().includes("REMOTE-ROW-A"), false, "the superseded row stops being displayed");
+
+    content.deliver({
+      target: { hostId: "lab-a", hostRunId: "run-a", rowId: "row-a", selectionGeneration: generation, cols: 40, rows: 20 },
+      state: "current",
+      view: {
+        hostId: "lab-a",
+        selectionGeneration: generation,
+        snapshot: remoteViewport(viewport({ sessionId: "row-a", sequence: 7, marker: "STALE-GENERATION" })),
+      },
+      reason: null,
+    });
+    await nextTurn();
+    assert.equal(shown().includes("STALE-GENERATION"), false, "a superseded selection never repaints the pane");
+
+    content.publish(remoteViewport({
+      subscriptionId: "sub-b", hostRunId: "run-a", sessionId: "row-a",
+      sequence: 2, cols: 40, rows: 20, marker: "FOREIGN-ROW",
+    }));
+    await nextTurn();
+    assert.equal(shown().includes("FOREIGN-ROW"), false, "a view published on another owner row is refused");
+
+    const mismatched = remoteViewport({
+      subscriptionId: "sub-b", hostRunId: "run-a", sessionId: "row-b",
+      sequence: 3, cols: 40, rows: 20, marker: "MIXED-GEOMETRY",
+    });
+    content.publish({ meta: mismatched.meta, frame: { ...mismatched.frame, cols: 41 } });
+    await nextTurn();
+    assert.equal(shown().includes("MIXED-GEOMETRY"), false,
+      "a frame that disagrees with its own canonical geometry is refused");
+
+    content.publish(remoteViewport({
+      subscriptionId: "sub-b", hostRunId: "run-a", sessionId: "row-b",
+      sequence: 4, cols: 40, rows: 20, marker: "REMOTE-ROW-B",
+    }));
+    await nextTurn();
+    assert.ok(shown().includes("REMOTE-ROW-B"), "the current row's own complete viewport is accepted");
+
+    content.publish(remoteViewport({
+      subscriptionId: "sub-b", hostRunId: "run-a", sessionId: "row-b",
+      sequence: 1, cols: 40, rows: 20, marker: "REGRESSED-SEQUENCE",
+    }));
+    await nextTurn();
+    assert.equal(shown().includes("REGRESSED-SEQUENCE"), false,
+      "a repeated or regressed publish never replaces the frame on screen");
+    assert.ok(shown().includes("REMOTE-ROW-B"), "the accepted frame remains painted");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a view the coordinator no longer holds as current is never painted", async (t) => {
+  const { harness, content, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
+  ]);
+  try {
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    await nextTurn();
+    const target = content.currentTarget();
+    // A callback naming a view the port itself does not hold as current.
+    content.deliver({
+      target,
+      state: "current",
+      view: {
+        hostId: "lab-a",
+        selectionGeneration: target.selectionGeneration,
+        snapshot: remoteViewport({
+          subscriptionId: "sub-x", hostRunId: "run-a", sessionId: "row-a",
+          sequence: 1, cols: 40, rows: 20, marker: "NOT-CURRENT-VIEW",
+        }),
+      },
+      reason: null,
+    });
+    await nextTurn();
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes("NOT-CURRENT-VIEW"), false,
+      "only the coordinator's own complete current view may be painted");
+    assertWideRemoteStatus(harness, "Waiting for the selected remote session's display",
+      "the honest awaiting state stays until a current view arrives");
+
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a",
+      sequence: 2, cols: 40, rows: 20, marker: "CURRENT-VIEW",
+    }));
+    await nextTurn();
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("CURRENT-VIEW"),
+      "the view the port actually holds is painted when it arrives");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a remote row whose owner run was never observed is reported unavailable without requesting a stream", async (t) => {
+  const { harness, content } = await remoteContentMainHarness(t, [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", rows: [remoteRosterRow({ id: "row-a", label: "Alpha remote" })] }),
+  ]);
+  const manager = harnessManager(harness);
+  try {
+    fillForm(harness.terminal, "/local/workspace");
+    await nextTurn();
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+
+    await activateRemoteRosterRow(harness, "Lab Alpha");
+
+    assert.deepEqual(content.selections, [], "no owner run was observed, so nothing is asked of the coordinator");
+    assertWideRemoteStatus(harness,
+      "That remote session's owner run was not observed; nothing is displayed",
+      "the pane reports the missing observation instead of guessing a run");
+    assert.equal(harness.sidebar!.activeMainOwnerKey?.kind, "remote", "the deliberate target is still named truthfully");
+    assert.equal(manager.views.length, 1, "the local row keeps running");
+    assert.equal(nativePaneText(harness.writer.frames.at(-1)?.frame).includes("/local/workspace"), false,
+      "an unavailable remote display never silently falls back to the local row");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a coordinator without a content port reports remote display unavailable and leaves local sessions unchanged", async (t) => {
+  const { harness, dispatch, peer } = await peerMainHarness(t);
+  const manager = harnessManager(harness);
+  try {
+    fillForm(harness.terminal, "/local/workspace");
+    await nextTurn();
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    await nextTurn();
+    assertWideRemoteStatus(harness,
+      "Remote display is unavailable in this host; local sessions are unchanged",
+      "a metadata-only coordinator says so plainly instead of inventing a frame");
+    assert.equal(manager.views.length, 1, "the local row is untouched");
+    assert.equal(manager.writes.length, 0, "nothing is written on a remote owner's behalf");
+    assert.equal(harness.sidebar!.activeMainOwnerID, undefined, "no local row takes a false Main-owner highlight");
+    assert.equal(peer.commands.length, 0, "no network command is issued");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a content port that refuses the selection is reported unavailable and changes nothing else", async (t) => {
+  const { harness, content, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
+  ]);
+  const manager = harnessManager(harness);
+  try {
+    fillForm(harness.terminal, "/local/workspace");
+    await nextTurn();
+    content.selectThrows = true;
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    await nextTurn();
+    assertWideRemoteStatus(harness,
+      "The selected remote session's display is unavailable; its session keeps running on its host",
+      "a refused selection is reported honestly instead of crashing or pretending a frame exists");
+    assert.equal(content.viewports.length, 0, "a refused selection forwards no viewport");
+    assert.equal(manager.views.length, 1, "the local row keeps running");
+    assert.equal(manager.writes.length, 0, "nothing is written on a remote owner's behalf");
+    assert.equal(nativePaneText(harness.writer.frames.at(-1)?.frame).includes("frame:native-1"), false,
+      "a refused remote display never falls back to the local row");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a displayed remote viewport is display-only for keyboard and pointer input while local rows keep their path", async (t) => {
+  const { harness, content, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
+  ]);
+  const manager = harnessManager(harness);
+  try {
+    fillForm(harness.terminal, "/local/workspace");
+    await nextTurn();
+    const surface = manager.surface("native-1");
+    assert.ok(surface, "the local row has a surface to display");
+    surface.modes = { ...surface.modes, mouseTracking: "any", mouseEncoding: "sgr" };
+    manager.notify("local-mouse-mode");
+    await nextTurn();
+
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    await activateRemoteRosterRow(harness, "Lab Alpha");
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a",
+      sequence: 1, cols: 40, rows: 20, marker: "REMOTE-DISPLAY-ONLY",
+    }));
+    await nextTurn();
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-DISPLAY-ONLY"));
+    assert.equal(harness.sidebar!.focus, "main", "activating a card returns focus to Main, as a local row does");
+
+    const writesBefore = manager.writes.length;
+    harness.terminal.emitInput("ls\r");
+    emitMouse(harness.terminal, 40, 5);
+    emitMouse(harness.terminal, 40, 5, 0, "m");
+    await nextTurn();
+    assert.equal(manager.writes.length, writesBefore,
+      "keystrokes and pointer packets are never forwarded to a local child for a remote viewport");
+    assert.equal(harness.sidebar!.focus, "main", "a pointer packet never moves focus away from the displayed viewport");
+
+    // Back to a local row: the ordinary native mouse path is intact, so the
+    // refusal above came from the remote source, not from a blanket disable.
+    dispatch({ type: "select", id: "native-1" });
+    await nextTurn();
+    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(33).startsWith("frame:native-1"),
+      "the local row's own frame is displayed again");
+    const localWritesBefore = manager.writes.length;
+    emitMouse(harness.terminal, 40, 5);
+    emitMouse(harness.terminal, 40, 5, 0, "m");
+    await nextTurn();
+    assert.ok(manager.writes.length > localWritesBefore,
+      "the live local row keeps receiving the native mouse packets it asked for");
+    assert.deepEqual([...new Set(manager.writes.slice(localWritesBefore).map((entry) => entry.id))], ["native-1"]);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("layout changes forward one deduped viewport and a lost stream is reported without a local fallback", async (t) => {
+  const { harness, content, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
+  ]);
+  const manager = harnessManager(harness);
+  let closed = false;
+  try {
+    fillForm(harness.terminal, "/local/workspace");
+    await nextTurn();
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    await nextTurn();
+    const generation = content.currentTarget().selectionGeneration;
+    assert.equal(content.selections.length, 1, "one selection carries the initial viewport");
+    assert.equal(content.viewports.length, 0, "initial geometry is not forwarded redundantly");
+
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a",
+      sequence: 1, cols: 40, rows: 20, marker: "REMOTE-SIZED",
+    }));
+    await nextTurn();
+
+    harness.terminal.setSize(100, 30);
+    await nextTurn();
+    await nextTurn();
+    assert.equal(content.viewports.length, 1, "one resize forwards exactly one newest viewport");
+    const forwarded = content.viewports.at(-1)!;
+    assert.deepEqual({ generation: forwarded.selectionGeneration, }, { generation },
+      "a viewport change never names a superseded generation");
+    assert.ok(forwarded.cols > 40 && forwarded.rows > 20, "the request carries the new pane size");
+
+    manager.notify("redraw-without-layout-change");
+    await nextTurn();
+    assert.equal(content.viewports.length, 1, "a redraw with the same pane size forwards nothing new");
+
+    // The stream ends: the pane stays honest and never shows a local row.
+    content.deliver({
+      target: content.currentTarget(),
+      state: "unavailable",
+      view: undefined,
+      reason: "destination-unavailable",
+    });
+    await nextTurn();
+    const afterLoss = harness.writer.frames.at(-1)?.frame;
+    assert.equal(plain(afterLoss).includes("REMOTE-SIZED"), false, "a retired viewport stops being painted");
+    assertWideRemoteStatus(harness,
+      "The selected remote session's display is unavailable; its session keeps running on its host");
+    assert.equal(nativePaneText(afterLoss).includes("frame:native-1"), false,
+      "an unavailable remote display never silently falls back to a local row");
+    assert.equal(manager.views.length, 1, "nothing local was stopped, started, or replaced");
+    const selectionsBefore = content.selections.length;
+    await nextTurn();
+    assert.equal(content.selections.length, selectionsBefore, "Main never re-requests or retries the stream itself");
+
+    // A local selection releases the one global stream and resumes the local view.
+    dispatch({ type: "select", id: "native-1" });
+    await nextTurn();
+    assert.equal(content.selections.at(-1), null, "a local selection releases the single remote stream");
+    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(33).startsWith("frame:native-1"));
+    assert.equal(manager.viewers.sessionViewers("native-1").length, 1, "the local row is displayed and sized again");
+
+    // Selecting again is a new generation; detaching releases without a stop.
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    await nextTurn();
+    assert.ok(content.currentTarget().selectionGeneration > generation, "a later selection is a newer generation");
+    const selectionsAtDetach = content.selections.length;
+    dispatch({ type: "detach-view" });
+    await nextTurn();
+    assert.equal(content.selections.at(-1), null, "detaching releases the stream");
+    assert.equal(harness.sidebar!.activeMainOwnerKey, undefined, "nothing is claimed as the displayed owner");
+    assert.equal(content.selections.length, selectionsAtDetach + 1, "detaching sends one release and retries nothing");
+
+    const selectionsAtShutdown = content.selections.length;
+    assert.equal(await closeWithSignal(harness), 0);
+    closed = true;
+    assert.equal(content.selections.length, selectionsAtShutdown, "shutdown never re-requests or retries the stream");
+  } finally {
+    if (!closed) await closeWithSignal(harness).catch(() => undefined);
+  }
+});
+
+test("a frame the writer has not committed is never the displayed source, and a committed one is display-only", async (t) => {
+  const { harness, content, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
+  ]);
+  const manager = harnessManager(harness);
+  try {
+    fillForm(harness.terminal, "/local/workspace");
+    await nextTurn();
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar");
+
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    await nextTurn();
+    harness.writer.holdWrites = true;
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a",
+      sequence: 1, cols: 40, rows: 20, marker: "REMOTE-QUEUED",
+    }));
+    await nextTurn();
+    assert.ok(harness.writer.heldSubmits > 0, "the viewport reached the writer as an unsettled candidate");
+
+    // Nothing was committed, so no remote source is displayed: a native-pane
+    // press is refused rather than authorized against a queued candidate.
+    emitMouse(harness.terminal, 40, 5);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar", "a queued candidate establishes no displayed source");
+    assert.equal(manager.writes.length, 0, "a queued candidate forwards nothing either");
+
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-QUEUED"),
+      "the committed frame is the one now displayed");
+    emitMouse(harness.terminal, 40, 5);
+    emitMouse(harness.terminal, 40, 5, 0, "m");
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar",
+      "a written remote viewport is display-only: a native-pane press never focuses or forwards");
+    assert.equal(manager.writes.length, 0, "the written remote source forwards nothing to a local child");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("remote graphics keep their own owner key and an oversized owner frame keeps no image owner", async (t) => {
+  const { harness, content, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
+  ]);
+  try {
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    await nextTurn();
+    const image = graphicsPngBase64(41);
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 1,
+      cols: 47, rows: 22, marker: "REMOTE-GRAPHICS", graphics: fakeGraphicsFrame(image),
+    }));
+    await nextTurn();
+    const painted = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(painted).includes("REMOTE-GRAPHICS"));
+    assert.ok(painted?.graphics?.ownerId.startsWith("remote|lab-a|run-a|row-a|"),
+      "a remote graphics layer is owned by the exact host, run, row, and selection, never a local row");
+
+    // A new native conversation is a new owner key: no image cache is reused.
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
+      cols: 47, rows: 22, marker: "REMOTE-GRAPHICS-EPOCH",
+      nativeSession: { sessionId: "conversation-a", epoch: 4 }, graphics: fakeGraphicsFrame(image),
+    }));
+    await nextTurn();
+    assert.notEqual(harness.writer.frames.at(-1)?.frame?.graphics?.ownerId, painted?.graphics?.ownerId,
+      "a different native conversation epoch never reuses another owner's image cache");
+
+    // The owner's own frame is larger than this pane: composition clips it and
+    // keeps no image owner, so the text fallback stays the whole story.
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 3,
+      cols: 100, rows: 30, marker: "REMOTE-CLIPPED", graphics: fakeGraphicsFrame(image),
+    }));
+    await nextTurn();
+    const clipped = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(clipped).includes("REMOTE-CLIPPED"), "the pane still shows the owner's content");
+    assert.equal(clipped?.graphics, undefined, "a frame larger than the pane keeps no image owner");
+    assert.ok(clipped !== undefined && clipped.lines.every((line) => visibleWidthOf(line) <= harness.terminal.columns),
+      "clipped remote content never spills past the terminal width");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+function visibleWidthOf(line: string): number {
+  return line.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
+test("a written form or narrow overlay shows host content and never establishes a remote drawn source", async (t) => {
+  const { harness, content, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
+  ]);
+  const manager = harnessManager(harness);
+  try {
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    await nextTurn();
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a",
+      sequence: 1, cols: 40, rows: 20, marker: "REMOTE-COVERED",
+    }));
+    await nextTurn();
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-COVERED"));
+
+    // A wide form replaces the native pane; the written frame is host content.
+    const focusBefore = harness.sidebar!.focus;
+    assert.equal(focusBefore, "sidebar", "direct dispatch leaves the roster focused");
+    await activateRosterRow(harness, "New session");
+    await nextTurn();
+    const formFrame = harness.writer.frames.at(-1)?.frame;
+    assert.equal(harness.sidebar!.focus, "form", "the form owns the replaced right pane while it is written");
+    assert.equal(plain(formFrame).includes("REMOTE-COVERED"), false,
+      "a written host form never claims the remote content underneath it was drawn");
+    harness.terminal.emitInput(ESC);
+    await nextTurn();
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-COVERED"),
+      "closing the form shows the same deliberate remote selection again");
+
+    // A narrow sidebar overlay covers the pane completely.
+    harness.terminal.setSize(48, 24);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, focusBefore, "resizing alone never moves focus");
+    const overlay = harness.writer.frames.at(-1)?.frame;
+    assert.equal(plain(overlay).includes("REMOTE-COVERED"), false,
+      "a written overlay shows only host content, never the covered remote viewport");
+    assert.equal(manager.writes.length, 0, "neither overlay established any local write");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Selected remote ownership boundaries that a late or byte-identical local
+// event must not cross: repaint identity across a new native conversation
+// epoch, native clipboard source control, a pending New finishing behind a
+// later remote selection, and an explicit New staying local.
+// ---------------------------------------------------------------------------
+
+test("an accepted remote viewport repaints without a new callback and a new conversation epoch still crosses the writer boundary", async (t) => {
+  const { harness, content, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({
+      id: "lab-a",
+      label: "Lab Alpha",
+      hostRunId: "run-a",
+      rows: [remoteRosterRow({ id: "row-a", label: "Alpha remote" })],
+    }),
+  ]);
+  const manager = harnessManager(harness);
+  try {
+    fillForm(harness.terminal, "/local/workspace");
+    await nextTurn();
+    const surface = manager.surface("native-1");
+    assert.ok(surface, "the local row has a surface whose native mouse modes the paired leg needs");
+    surface.modes = { ...surface.modes, mouseTracking: "any", mouseEncoding: "sgr" };
+    manager.notify("local-mouse-mode");
+    await nextTurn();
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+
+    await activateRemoteRosterRow(harness, "Lab Alpha");
+    // One viewport raster, cursor, and header, differing only in the native
+    // conversation epoch the owner published alongside them.
+    const epochViewport = (sequence: number, epoch: number): SessionContentSnapshot => remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence,
+      cols: 40, rows: 20, marker: "REMOTE-IDENTICAL-RASTER",
+      nativeSession: { sessionId: "conversation-a", epoch },
+    });
+    content.publish(epochViewport(1, 3));
+    await nextTurn();
+
+    const accepted = harness.writer.frames.at(-1)!;
+    const selectionsAtAccept = content.selections.length;
+    assert.ok(plain(accepted.frame).includes("REMOTE-IDENTICAL-RASTER"), "the accepted viewport is the displayed source");
+    assert.deepEqual(harness.sidebar!.activeMainOwnerKey,
+      { kind: "remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+
+    // A local row event repaints the already-accepted snapshot with no content
+    // callback at all: same owner, same stream, same composed bytes.
+    const submissionsBeforeRepaint = harness.writer.frames.length;
+    const invalidationsBeforeRepaint = harness.writer.invalidateCalls;
+    manager.notify("local-row-changed-while-remote-displayed");
+    await nextTurn();
+    assert.ok(harness.writer.frames.length > submissionsBeforeRepaint,
+      "the ordinary host redraw repaints the accepted snapshot without any content callback");
+    assert.deepEqual(harness.writer.frames.at(-1)!.frame, accepted.frame,
+      "repainting one accepted snapshot composes identical bytes and cursor");
+    assert.equal(harness.writer.invalidateCalls, invalidationsBeforeRepaint,
+      "repainting the same source is not a new semantic boundary");
+    assert.equal(content.selections.length, selectionsAtAccept, "a repaint asks the coordinator for no new stream");
+
+    // The same raster, cursor, and header under a NEW native conversation epoch.
+    // The fake writer deliberately reports these bytes as `unchanged`, which is
+    // never a receipt for the new source, so only its semantic boundary can
+    // tell the two owners apart.
+    harness.writer.settlementDisposition = "unchanged";
+    const invalidationsBeforeEpoch = harness.writer.invalidateCalls;
+    content.publish(epochViewport(2, 4));
+    await nextTurn();
+    assert.deepEqual(harness.writer.frames.at(-1)!.frame, accepted.frame,
+      "a new native conversation epoch can compose byte-identical content");
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-IDENTICAL-RASTER"),
+      "the newly accepted source stays displayed");
+    assert.equal(harness.writer.invalidateCalls, invalidationsBeforeEpoch + 1,
+      "a new native conversation epoch invalidates the writer's semantic authorization even though the bytes match");
+    assert.equal(content.selections.length, selectionsAtAccept,
+      "the repaint never re-selects, releases, or retries the stream");
+
+    // Remote terminal input is not part of this ordering slice, so identical
+    // composed bytes grant nothing: keystrokes and pointer packets stay
+    // unforwarded and the displayed owner stays the remote one.
+    const writesBeforeRemoteInput = manager.writes.length;
+    harness.terminal.emitInput("ls\r");
+    emitMouse(harness.terminal, 40, 5);
+    emitMouse(harness.terminal, 40, 5, 0, "m");
+    await nextTurn();
+    assert.equal(manager.writes.length, writesBeforeRemoteInput,
+      "neither keystrokes nor pointer packets are forwarded while a remote viewport is displayed");
+    assert.equal(harness.sidebar!.activeMainOwnerID, undefined,
+      "an identical repaint never hands a local row id to Main");
+    assert.deepEqual(harness.sidebar!.activeMainOwnerKey,
+      { kind: "remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" },
+      "the refusal left the displayed owner untouched");
+
+    // Paired: the refusal belongs to this source only. Once a local frame is
+    // actually written again, its ordinary native path is intact.
+    harness.writer.settlementDisposition = "written";
+    dispatch({ type: "select", id: "native-1" });
+    await nextTurn();
+    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(33).startsWith("frame:native-1"),
+      "the local row's own frame is displayed again");
+    assert.equal(content.selections.at(-1), null, "the local selection releases the one remote stream");
+    const localWritesBefore = manager.writes.length;
+    emitMouse(harness.terminal, 40, 5);
+    emitMouse(harness.terminal, 40, 5, 0, "m");
+    await nextTurn();
+    assert.ok(manager.writes.length > localWritesBefore,
+      "the live local row keeps receiving the native mouse packets it asked for");
+    assert.deepEqual([...new Set(manager.writes.slice(localWritesBefore).map((entry) => entry.id))], ["native-1"],
+      "the resumed packets belong to the local row and to no sibling");
+  } finally {
+    harness.writer.settlementDisposition = "written";
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a remote selection with a colliding row id and conversation tuple suspends local clipboard authority", async (t) => {
+  const { harness, content, peer, dispatch } = await remoteContentMainHarness(t, [
+    // The remote owner's opaque row id collides with the local row's id.
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "native-1" })] }),
+  ]);
+  const manager = harnessManager(harness);
+  const secretText = "controlled local copy payload \u03b1";
+  const event: NativeClipboardEvent = {
+    kind: "copy",
+    encoded: Buffer.from(secretText).toString("base64"),
+    sessionId: "conversation-native-1",
+    sessionEpoch: 1,
+  };
+  const unavailable = (reason: "unsupported-runtime" | "unverified-native-origin"): NativeClipboardEvent => ({
+    kind: "unavailable", reason, sessionId: event.sessionId, sessionEpoch: event.sessionEpoch,
+  });
+  const copies = (): string[] => harness.terminal.writes.filter((write) => write.startsWith("\x1b]52;"));
+  const assertQuiet = (label: string): void => {
+    const frame = plain(harness.writer.frames.at(-1)?.frame);
+    assert.doesNotMatch(frame, HOST_CLIPBOARD_STATUS, `${label}: no host clipboard status is rendered`);
+    assert.ok(!frame.includes("Terminal diagnostics"), `${label}: no diagnostic is recorded`);
+    assert.equal(harness.sidebar!.terminalDiagnosticsWarning, undefined, `${label}: no diagnostic warning`);
+  };
+  try {
+    fillForm(harness.terminal, "/local/workspace");
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main", "the written local row owns Main before the remote selection");
+    // A terminal-type string is never capability authority. TERM stays identical
+    // for this whole test, every refusal below is decided by the written owner,
+    // and the very same event is accepted again the moment a local frame is
+    // actually written — a "this terminal type can do OSC 52" claim could not
+    // produce that difference. (TERM's own coverage is the dumb/empty/absent TERM
+    // case above.) Main's refusal is silent by design: no host diagnostic and no
+    // clipboard status line ever reaches the operator for a refused copy.
+    manager.options.onNativeClipboard?.("native-1", event);
+    assert.deepEqual(copies(), [`\x1b]52;c;${event.encoded}\x07`],
+      "the displayed local owner submits the native request exactly once");
+    await nextTurn();
+    assertQuiet("written local owner");
+
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    await activateRemoteRosterRow(harness, "Lab Alpha");
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "native-1",
+      sequence: 1, cols: 40, rows: 20, marker: "REMOTE-SAME-OWNER-VIEW",
+      nativeSession: { sessionId: "conversation-native-1", epoch: 1 },
+    }));
+    await nextTurn();
+    const remoteFrame = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(remoteFrame).includes("REMOTE-SAME-OWNER-VIEW"), "the colliding remote owner is the displayed source");
+    assert.equal(nativePaneText(remoteFrame).includes("frame:native-1"), false,
+      "the colliding local row is not displayed under its own id");
+    assert.equal(harness.sidebar!.focus, "main", "the refusals below are about the source, not about focus");
+    assert.deepEqual(harness.sidebar!.activeMainOwnerKey,
+      { kind: "remote", hostId: "lab-a", hostRunId: "run-a", rowId: "native-1" });
+
+    const copiesBeforeRemote = copies().length;
+    const commandsBeforeClipboard = peer.commands.length;
+    manager.options.onNativeClipboard?.("native-1", event);
+    manager.options.onNativeClipboard?.("native-1", unavailable("unsupported-runtime"));
+    manager.options.onNativeClipboard?.("native-1", unavailable("unverified-native-origin"));
+    await nextTurn();
+    assert.equal(copies().length, copiesBeforeRemote,
+      "the same row id and the same native conversation tuple cannot copy while the remote owner is displayed");
+    assertQuiet("colliding remote selection");
+    assert.equal(harness.terminal.writes.join("").includes(secretText), false,
+      "the copy payload never reaches the terminal as ordinary output");
+    assert.deepEqual(manager.writes, [], "nothing is delivered to a local child on a remote owner's behalf");
+    assert.equal(peer.commands.length, commandsBeforeClipboard,
+      "a refused copy never becomes a network command or a payload broadcast to the peer");
+
+    // Back to a local target whose frame was only queued: an unsettled
+    // candidate is not a displayed source and authorizes no copy.
+    harness.writer.holdWrites = true;
+    dispatch({ type: "select", id: "native-1" });
+    await nextTurn();
+    assert.equal(content.selections.at(-1), null, "the local selection released the one remote stream");
+    manager.options.onNativeClipboard?.("native-1", event);
+    manager.options.onNativeClipboard?.("native-1", unavailable("unsupported-runtime"));
+    await nextTurn();
+    assert.equal(copies().length, copiesBeforeRemote, "a queued local candidate authorizes no copy");
+    assertQuiet("local selection with an unwritten frame");
+
+    // The same frame settling as `unchanged` is still not a written receipt.
+    harness.writer.holdWrites = false;
+    harness.writer.settlementDisposition = "unchanged";
+    manager.notify("local-frame-settles-unchanged");
+    await nextTurn();
+    manager.options.onNativeClipboard?.("native-1", event);
+    manager.options.onNativeClipboard?.("native-1", unavailable("unverified-native-origin"));
+    await nextTurn();
+    assert.equal(copies().length, copiesBeforeRemote, "an unchanged settlement is not a written receipt either");
+    assertQuiet("local selection with an unchanged frame");
+
+    // A real written local frame resumes ordinary copying, one request per copy.
+    harness.writer.settlementDisposition = "written";
+    manager.notify("local-frame-written");
+    await nextTurn();
+    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(33).startsWith("frame:native-1"),
+      "the written local frame is the displayed source again");
+    manager.options.onNativeClipboard?.("native-1", event);
+    assert.deepEqual(copies(), [
+      `\x1b]52;c;${event.encoded}\x07`,
+      `\x1b]52;c;${event.encoded}\x07`,
+    ], "ordinary copy resumes for the written local owner, exactly one request per copy");
+    await nextTurn();
+    assertQuiet("copy resumed for the written local owner");
+  } finally {
+    harness.writer.holdWrites = false;
+    harness.writer.settlementDisposition = "written";
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a pending New finishes behind a later remote selection without taking over the pane", async (t) => {
+  const { harness, content } = await remoteContentMainHarness(t, [
+    remotePeerHost({
+      id: "lab-a",
+      label: "Lab Alpha",
+      hostRunId: "run-a",
+      rows: [remoteRosterRow({ id: "row-a", label: "Alpha remote" })],
+    }),
+  ]);
+  const manager = harnessManager(harness);
+  // Initialised to a no-op so the cleanup below can always call it: an assertion
+  // that fails before the gate is installed must still never block shutdown.
+  let releaseCreate: () => void = () => {};
+  try {
+    let enterCreate!: () => void;
+    const createEntered = new Promise<void>((resolve) => { enterCreate = resolve; });
+    manager.createGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
+    manager.createGateEntered = enterCreate;
+
+    fillForm(harness.terminal, "/pending/local");
+    await createEntered;
+    assert.equal(harness.sidebar!.focus, "form", "the submitted New form still owns the pane while its create is pending");
+    assert.equal(manager.createOptions.length, 1, "the submitted create reached the one local manager");
+    assert.equal(manager.views.length, 1, "the pending row exists while it launches");
+    assert.equal(manager.views[0]?.hasLiveProcess, false, "the create is genuinely still pending");
+    const pendingFrame = harness.writer.frames.at(-1)!.frame;
+    assert.ok(plain(pendingFrame).includes("Starting (request"), "the written pane says the create is pending");
+    const remoteCardRow = screenRowContaining(pendingFrame, "Alpha remote");
+    assert.ok(remoteCardRow > 0, "the remote card is actually drawn beside the pending New form");
+
+    // A real pointer activation of another row closes the pending UI through
+    // its own cancellation route (#486) and then performs the clicked card's
+    // ordinary action once.
+    emitMouse(harness.terminal, 2, remoteCardRow);
+    emitMouse(harness.terminal, 2, remoteCardRow, 0, "m");
+    await nextTurn();
+    const afterClick = plain(harness.writer.frames.at(-1)?.frame);
+    assert.equal(afterClick.includes("Starting (request"), false, "the abandoned New UI is gone");
+    assert.equal(afterClick.includes("Workspace:"), false, "the abandoned form no longer owns the pane");
+    assert.equal(manager.createOptions.length, 1, "cancelling the UI never cancels the submitted native launch");
+    assert.equal(harness.sidebar!.focus, "main", "activating the remote card returns focus to Main as a local row does");
+    assert.equal(content.selections.length, 1, "the later deliberate remote selection asks for exactly one stream");
+    assert.deepEqual(harness.sidebar!.activeMainOwnerKey,
+      { kind: "remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    assert.equal(harness.sidebar!.activeMainOwnerID, undefined, "a remote owner never claims a local row id");
+
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a",
+      sequence: 1, cols: 40, rows: 20, marker: "REMOTE-SELECTED-LATER",
+    }));
+    await nextTurn();
+    const generation = content.currentTarget().selectionGeneration;
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-SELECTED-LATER"),
+      "the later selection's own viewport is displayed");
+
+    // The abandoned launch finishes now, after the deliberate remote selection.
+    releaseCreate();
+    await nextTurn();
+    await nextTurn();
+    assert.equal(manager.views.length, 1, "the late create still finishes its own row");
+    assert.equal(manager.views[0]?.id, "native-1");
+    assert.equal(manager.views[0]?.hasLiveProcess, true, "the local child survives the abandoned UI");
+    assert.equal(manager.views[0]?.lifecycle, "alive");
+    const afterCompletion = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(afterCompletion).includes("REMOTE-SELECTED-LATER"),
+      "a late local completion never replaces the later remote owner's frame");
+    assert.equal(nativePaneText(afterCompletion).includes("frame:native-1"), false,
+      "the completed row is never displayed in its place");
+    assert.ok(plain(afterCompletion).includes("> Lab Alpha"),
+      "the roster keeps its highlight on the deliberately selected remote card");
+    assert.equal(harness.sidebar!.focus, "main", "the late completion neither opens a pane nor moves focus elsewhere");
+    assert.equal(harness.sidebar!.activeMainOwnerID, undefined, "the late child never takes the Main owner highlight");
+    assert.deepEqual(harness.sidebar!.activeMainOwnerKey,
+      { kind: "remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" },
+      "the later remote target survives the late local completion");
+    assert.equal(content.selections.length, 1, "the late completion releases nothing and re-requests nothing");
+    assert.equal(content.currentTarget().selectionGeneration, generation, "the remote selection generation is unchanged");
+    assert.equal(content.viewports.length, 0, "the late completion forwards no viewport for the remote stream");
+    assert.equal(manager.viewers.sessionViewers("native-1").length, 0, "the late local row is never displayed by this host");
+
+    harness.terminal.emitInput("typed-after-late-create");
+    emitMouse(harness.terminal, 40, 5);
+    emitMouse(harness.terminal, 40, 5, 0, "m");
+    await nextTurn();
+    assert.deepEqual(manager.writes, [], "a late local completion never routes input to the new row");
+    assert.deepEqual(manager.closeExitedCalls, [], "nothing local or remote was stopped or removed");
+    assert.equal(manager.shutdownCalls, 0, "the late completion never shuts the host down");
+    assert.equal(manager.stopping, false, "the surviving child was not put into shutdown");
+  } finally {
+    // A failing assertion must not leave the gated create blocking shutdown.
+    // FakeManager.shutdown() awaits pendingCreates, and clearing the property
+    // cannot unblock the await already registered inside finishCreate, so the
+    // gate promise itself has to be resolved. Resolving again after the success
+    // path already did it is a harmless no-op, and a create finishing behind
+    // shutdown stays fenced the way the existing gated-create tests expect.
+    releaseCreate();
+    manager.createGate = undefined;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("an explicit New while a remote target is selected creates locally and never redirects to that peer", async (t) => {
+  const { harness, content, peer } = await remoteContentMainHarness(t, [
+    remotePeerHost({
+      id: "lab-a",
+      label: "Lab Alpha",
+      hostRunId: "run-a",
+      rows: [remoteRosterRow({ id: "row-a", label: "Alpha remote" })],
+    }),
+  ]);
+  const manager = harnessManager(harness);
+  try {
+    await activateRemoteRosterRow(harness, "Lab Alpha");
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a",
+      sequence: 1, cols: 40, rows: 20, marker: "REMOTE-BEFORE-LOCAL-NEW",
+    }));
+    await nextTurn();
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-BEFORE-LOCAL-NEW"));
+    assert.deepEqual(harness.sidebar!.activeMainOwnerKey,
+      { kind: "remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+
+    // The ordinary New menu and form, with the remote target already selected.
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    await activateRosterRow(harness, "New session");
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "form", "the existing New form opened normally");
+    const commandsBeforeNew = peer.commands.length;
+    completeForm(harness.terminal, "/explicit/local/new");
+    await nextTurn();
+
+    assert.equal(manager.createOptions.length, 1, "the explicit New started exactly one child");
+    assert.deepEqual(manager.createOptions[0], { workspace: "/explicit/local/new" },
+      "the create carries the requested workspace and nothing else: no host, run, row, or peer target");
+    assert.equal(harness.events.filter((name) => name === "manager.create").length, 1,
+      "the local create reuses the one manager, inventory, and viewer registry");
+    assert.deepEqual(manager.views.map((view) => view.id), ["native-1"], "the new row is a local manager row");
+    assert.equal(manager.views[0]?.hasLiveProcess, true, "the local child actually launched");
+    assert.equal(peer.commands.length, commandsBeforeNew,
+      "an explicit New issues no network command and is never redirected to the selected peer");
+    assert.deepEqual(content.selections.map((selection) => (selection === null
+      ? null
+      : { hostId: selection.hostId, hostRunId: selection.hostRunId, rowId: selection.rowId })),
+      [{ hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" }, null],
+      "the stream was never re-targeted at the peer; the completed local row released it once");
+    assert.equal(content.viewports.length, 0, "the local create forwarded no viewport request to the peer");
+
+    const created = harness.writer.frames.at(-1)?.frame;
+    assert.equal(harness.sidebar!.focus, "main", "the completed New child keeps its existing activation");
+    assert.equal(harness.sidebar!.activeMainOwnerID, "native-1", "the local child is the Main owner");
+    assert.deepEqual(harness.sidebar!.activeMainOwnerKey, { kind: "local", id: "native-1" });
+    assert.ok(plainLine(created, 1).slice(33).startsWith("frame:native-1"), "the local row's own frame is displayed");
+    assert.equal(plain(created).includes("REMOTE-BEFORE-LOCAL-NEW"), false,
+      "the released peer viewport stops being painted instead of lingering under a local owner");
+    assert.deepEqual(manager.closeExitedCalls, [], "no local or remote session was stopped or removed");
+    assert.equal(manager.stopping, false);
+  } finally {
     assert.equal(await closeWithSignal(harness), 0);
   }
 });

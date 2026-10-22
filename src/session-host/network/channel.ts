@@ -2,10 +2,14 @@
  * Bounded byte-channel contract shared by both ends of the inert peer
  * transport. A channel carries bytes only: no session permissions, capability
  * matrix, view-only policy, or controller lease exists here.
+ *
+ * `lane` is the exact lane negotiated on this connection. It never grants
+ * anything: it only tells a caller which callback the receiving host used and
+ * lets a sender verify it opened the lane it meant to use.
  */
 
 import WebSocket from "ws";
-import { peerError, type PeerDiagnosticCode, type PeerTransportBounds } from "./protocol";
+import { peerError, type PeerAppLane, type PeerDiagnosticCode, type PeerTransportBounds } from "./protocol";
 import type { PeerKey } from "./identity";
 
 export interface PeerChannelClose {
@@ -16,6 +20,8 @@ export interface PeerChannelClose {
 export interface PeerByteChannel {
 	/** Exact peer identity verified on this connection. */
 	readonly peerKey: PeerKey;
+	/** Exact lane negotiated for this connection; metadata and content never mix. */
+	readonly lane: PeerAppLane;
 	/** Bounded display label from the peer certificate, never identity. */
 	readonly label: string | null;
 	readonly bufferedAmount: number;
@@ -40,6 +46,8 @@ export function sanitizePeerCloseReason(reason: Buffer | string | undefined): st
 export interface ByteChannelOptions {
 	readonly ws: InstanceType<typeof WebSocket>;
 	readonly peerKey: PeerKey;
+	/** Negotiated lane; omitted means the unchanged legacy `app` lane. */
+	readonly lane?: PeerAppLane;
 	readonly label: string | null;
 	readonly bounds: PeerTransportBounds;
 	readonly isServer: boolean;
@@ -52,6 +60,10 @@ const CONTROL_FRAME_OVERHEAD = 32;
 
 export function createPeerByteChannel(options: ByteChannelOptions): PeerByteChannel {
 	const { ws, peerKey, label, bounds, onFinalized, diagnostic } = options;
+	// The lane is a fixed closed set: an unknown value is refused rather than
+	// carried as an unvalidated label.
+	const lane: PeerAppLane = options.lane ?? "app";
+	if (lane !== "app" && lane !== "content") throw peerError("INVALID_ARGUMENT");
 	const handlers = new Set<(bytes: Buffer) => void>();
 	let resolveClosed: (value: PeerChannelClose) => void = () => undefined;
 	const closed = new Promise<PeerChannelClose>((resolve) => {
@@ -148,6 +160,7 @@ export function createPeerByteChannel(options: ByteChannelOptions): PeerByteChan
 	const channel: PeerByteChannel = {
 		peerKey,
 		label,
+		lane,
 		get bufferedAmount() {
 			return ws.bufferedAmount + pendingControlBytes;
 		},

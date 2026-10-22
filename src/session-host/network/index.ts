@@ -11,7 +11,13 @@
  * and the metadata-only roster bridge built on it are exported here as well: they
  * are usable only over a channel the caller already authenticated and attached
  * explicitly, and nothing in this module attaches itself to a session host, a
- * sidebar, or a listener.
+ * sidebar, or a listener. The native viewport content protocol exported last is a
+ * pure wire contract for the additive content lane: it defines frames, bounds,
+ * transfer packing, and receive assembly, and it creates no channel, endpoint,
+ * grant, or timer of its own. The selected-content contracts exported before it are
+ * likewise pure: they name the one globally selected outgoing content target, its
+ * honest observation, and the controller the existing coordinator owns, and they
+ * add no manager, listener, store, lease, or permission of their own.
  */
 
 export * from "./protocol";
@@ -26,3 +32,5 @@ export * from "./roster-metadata";
 export * from "./roster-bridge-protocol";
 export * from "./roster-bridge-host";
 export * from "./roster-bridge-client";
+export * from "./peer-content";
+export * from "./session-content-protocol";

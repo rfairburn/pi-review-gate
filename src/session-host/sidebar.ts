@@ -96,12 +96,18 @@
  * Approve or Deny; changing the selected decision or the pane geometry
  * invalidates that proof until the new exact frame is written.
  *
- * Remote roster rows are separate typed pane entries, never fabricated
- * `SidebarItem`s: no invented agent dir, busy flag, input surface, or exit
- * code. Their workspace path is exact display-only owner data (sanitized, never
- * resolved or otherwise used), and activating one only shows a local
- * metadata-only notice — no local select/resume/create/stop/remove/rename
- * action is emitted and the native content owner is unchanged.
+ * Remote roster rows are separate typed entries in both surfaces, never
+ * fabricated `SidebarItem`s: no invented agent dir, busy flag, input surface,
+ * or exit code. The Network pane keeps its metadata-only notice, and the LEFT
+ * roster projects the SAME attached `PeerUiSnapshot` host rosters into typed
+ * `remote` cards whose ordinary activation emits exactly one
+ * `select-remote` DTO (host id, exact observed owner run or null, and owner row
+ * id). No local select/resume/create/stop/remove/rename/quit/consent action can
+ * be reached from a remote card, even when an opaque remote id collides with a
+ * local one, and the native content owner is never changed by this module.
+ * Their workspace path is exact display-only owner data (sanitized, never
+ * resolved or otherwise used), and a stale observation is marked as stale
+ * rather than refreshed, reconnected, or guessed.
  *
  * `renderPeerAlert` is the one extra notification surface, for a host-owned
  * alert band that the compositor places when the normal sidebar cannot show a
@@ -111,8 +117,9 @@
  * unchanged.
  *
  * Stable DTO/API surface for future root-host phases: `SidebarItem`,
- * `SidebarAction`, `SidebarControllerOptions`, and `SidebarController` with
- * the getters/setters documented below. Internal shapes may evolve.
+ * `SidebarAction`, `SidebarControllerOptions`, `SidebarMainOwnerKey`, and
+ * `SidebarController` with the getters/setters documented below. Internal
+ * shapes may evolve.
  */
 
 import {
@@ -207,6 +214,45 @@ export interface SidebarItem {
 }
 
 /**
+ * One remote roster row exactly as the coordinator projected it. This is the
+ * SAME display DTO the Network pane renders, never a private owner view.
+ */
+export type SidebarRemoteRosterRow = NonNullable<PeerUiHost["roster"]["rows"]>[number];
+
+/**
+ * Structured identity and display facts of one remote card projected into the
+ * LEFT roster. It is derived from the attached `PeerUiSnapshot` during entry
+ * rebuild and is not another manager, authority, or cache: `hostId` and the
+ * row are DTO values, `hostLabel` is the owner's sanitized friendly label, and
+ * `hostRunId` is the exact opaque owner run the coordinator reported for this
+ * host's projection — or `null` when an older DTO/fake carries none. Nothing
+ * here is normalized, defaulted, or guessed.
+ */
+export interface SidebarRemoteEntry {
+  readonly hostId: string;
+  readonly hostLabel: string;
+  readonly hostRunId: string | null;
+  readonly rosterState: "current" | "stale";
+  readonly row: SidebarRemoteRosterRow;
+}
+
+/**
+ * Structured identity of the conversation Main is ACTUALLY displaying. It is
+ * deliberately independent of the left-roster highlight: Main marks the real
+ * content owner here, and a remote owner can never be mistaken for a local
+ * item id (or vice versa). `hostRunId` is the exact observed owner run or
+ * `null` when no run was observed.
+ */
+export type SidebarMainOwnerKey =
+  | { readonly kind: "local"; readonly id: string }
+  | {
+      readonly kind: "remote";
+      readonly hostId: string;
+      readonly hostRunId: string | null;
+      readonly rowId: string;
+    };
+
+/**
  * One saved-conversation row for the deliberate picker (issue 323): identity
  * and canonical caption only. Never a transcript, tool argument, question
  * text, or credential — the read-only listing API guarantees that shape.
@@ -246,6 +292,19 @@ export interface SidebarSavedQueryInput {
 export type SidebarAction =
   | { readonly type: "forward"; readonly data: string }
   | { readonly type: "select"; readonly id: string }
+  /**
+   * Ordinary Enter/normal left press on one projected remote roster card.
+   * `hostRunId` is the exact opaque owner run observed when that card was
+   * projected, or `null` when the DTO carried none. It is a display-selection
+   * intent for Main only: never a local select, resume, create, stop, remove,
+   * rename, quit, consent, connect, or trust change.
+   */
+  | {
+      readonly type: "select-remote";
+      readonly hostId: string;
+      readonly hostRunId: string | null;
+      readonly rowId: string;
+    }
   | { readonly type: "remove"; readonly id: string }
   | { readonly type: "resume-row"; readonly requestId: number; readonly id: string }
   | { readonly type: "resume-row-cancel"; readonly requestId: number }
@@ -421,6 +480,7 @@ interface SidebarEntry {
   readonly key: string;
   readonly kind:
     | "item"
+    | "remote"
     | "saved"
     | "new"
     | "quit"
@@ -428,8 +488,52 @@ interface SidebarEntry {
     | "diagnostics"
     | "peer";
   readonly item?: SidebarItem;
+  /** Structured remote facts; present only for kind "remote". */
+  readonly remote?: SidebarRemoteEntry;
   /** Warning snapshot rendered by a `diagnostics` entry (display and clear fence). */
   readonly warning?: TerminalDiagnosticsWarningView;
+}
+
+/**
+ * Stable composite key for one remote card: owner host id plus owner row id,
+ * length-prefixed so two different (host, row) pairs can never share a key even
+ * when either value contains separators. The structured `SidebarRemoteEntry`
+ * fields remain the authority for what a card names; this key is only map,
+ * expansion, and selection identity.
+ */
+export function remoteRosterEntryKey(hostId: string, rowId: string): string {
+  return `${REMOTE_ENTRY_KEY_PREFIX}${hostId.length}:${hostId}:${rowId}`;
+}
+
+/** Exact native-session tuple/epoch identity, or null when none was observed. */
+function remoteNativeSessionIdentity(row: SidebarRemoteRosterRow): readonly [string, number] | null {
+  const native = row.nativeSession;
+  return native === null ? null : [native.sessionId, native.epoch];
+}
+
+/**
+ * True when a captured remote card still names the same owner target: the same
+ * host, the same exact (or absent) owner run, the same owner row id, the same
+ * lifecycle/process observation, the same native-session tuple/epoch, and the
+ * same current-vs-stale observation. Display-only facts (activity, counts,
+ * error text) are not target identity.
+ */
+function sameRemoteEntry(a: SidebarRemoteEntry, b: SidebarRemoteEntry): boolean {
+  return a.hostId === b.hostId
+    && a.hostRunId === b.hostRunId
+    && a.rosterState === b.rosterState
+    && a.hostLabel === b.hostLabel
+    && a.row.id === b.row.id
+    && a.row.lifecycle === b.row.lifecycle
+    && a.row.hasLiveProcess === b.row.hasLiveProcess
+    && JSON.stringify(remoteNativeSessionIdentity(a.row))
+      === JSON.stringify(remoteNativeSessionIdentity(b.row));
+}
+
+function remoteEntryActivationIdentity(entryKey: string, remote: SidebarRemoteEntry): readonly unknown[] {
+  return [entryKey, "remote", remote.hostId, remote.hostRunId, remote.rosterState,
+    remote.hostLabel, remote.row.id, remote.row.lifecycle, remote.row.hasLiveProcess,
+    remoteNativeSessionIdentity(remote.row)];
 }
 
 // updateItems rebuilds bounded DTO snapshots even when their content is
@@ -437,6 +541,9 @@ interface SidebarEntry {
 // the activation identity and safety state, not display/telemetry metadata.
 function sameSidebarEntry(a: SidebarEntry, b: SidebarEntry): boolean {
   if (a.key !== b.key || a.kind !== b.kind) return false;
+  if (a.kind === "remote" || b.kind === "remote") {
+    return a.remote !== undefined && b.remote !== undefined && sameRemoteEntry(a.remote, b.remote);
+  }
   if (a.item === undefined || b.item === undefined) return a.item === b.item;
   return a.item.id === b.item.id
     && a.item.lifecycle === b.item.lifecycle
@@ -448,6 +555,9 @@ function sameSidebarEntry(a: SidebarEntry, b: SidebarEntry): boolean {
 }
 
 function sidebarActivationIdentity(entry: SidebarEntry): readonly unknown[] {
+  if (entry.kind === "remote" && entry.remote !== undefined) {
+    return remoteEntryActivationIdentity(entry.key, entry.remote);
+  }
   const item = entry.item;
   return item === undefined
     ? [entry.key, entry.kind]
@@ -495,7 +605,7 @@ interface DisplayedRoster {
 }
 
 /** One remote roster row exactly as the coordinator projected it (display only). */
-type PeerRosterRow = NonNullable<PeerUiHost["roster"]["rows"]>[number];
+type PeerRosterRow = SidebarRemoteRosterRow;
 
 /**
  * The semantic state one actionable network row's ordinary Enter action reads:
@@ -803,6 +913,8 @@ const ENTRY_QUIT_KEY = "quit";
 const ENTRY_SAVED_KEY = "saved";
 const ENTRY_SETTINGS_KEY = "host-shortcuts";
 const ENTRY_DIAGNOSTICS_KEY = "terminal-diagnostics";
+/** Namespace of projected remote cards; never a local item id namespace. */
+const REMOTE_ENTRY_KEY_PREFIX = "remote:";
 /** Network menu key; present only with an attached snapshot. */
 const ENTRY_PEER_KEY = "peer-network";
 /** Fixed height of the host-owned terminal diagnostics warning entry. */
@@ -1219,8 +1331,32 @@ function sanitizeCount(value: unknown): number | null {
     : null;
 }
 
+/**
+ * The existing card status facts one remote roster DTO exposes. This adapter is
+ * the only seam between a remote row and the local card renderer: the same
+ * lifecycle/input/activity/unknown facts, no fabricated `SidebarItem` fields
+ * (no agent dir, current file, ownership, or exit authority).
+ */
+function remoteSessionStatusFacts(row: SidebarRemoteRosterRow): SessionStatusFacts {
+  return {
+    lifecycle: row.lifecycle,
+    busy: row.busy,
+    pendingInput: row.pendingInput,
+    inputSurface: row.inputSurface,
+    activeTasks: row.activeTasks,
+    activeShells: row.activeShells,
+    ...(row.exitCode === undefined ? {} : { exitCode: row.exitCode }),
+  };
+}
+
+/** Canonical card title facts shared by local items and projected remote rows. */
+interface CardTitleFacts {
+  readonly label: string;
+  readonly nativeSession?: { readonly name: string } | null;
+}
+
 /** Canonical card title: validated native name, else the row label. */
-function cardTitle(item: SidebarItem): string {
+function cardTitle(item: CardTitleFacts): string {
   return sanitizeBounded(item.nativeSession?.name ?? item.label, ITEM_LABEL_INPUT_MAX_CODEPOINTS);
 }
 
@@ -1404,7 +1540,28 @@ function copyPeerRosterRow(value: unknown): PeerRosterRow | null {
   };
 }
 
-function copyPeerHost(value: unknown): PeerUiHost | null {
+/**
+ * A copied host plus the optional owner-run identity the coordinator may report
+ * alongside its roster projection. Older DTOs and fakes omit it; absence and
+ * `null` both mean "not observed" and never a fabricated run identity.
+ */
+type SidebarPeerHost = PeerUiHost & {
+  readonly roster: PeerUiHost["roster"] & { readonly hostRunId?: string | null };
+};
+
+/**
+ * The exact opaque owner-run id the coordinator reported for this host's row
+ * projection, read with a safe optional presence/type check so an older DTO or
+ * a test fake stays backward compatible. The value is returned exactly as
+ * observed (never normalized, defaulted, or guessed); anything else is null.
+ */
+function peerHostRosterRunId(host: PeerUiHost): string | null {
+  const roster = host.roster as SidebarPeerHost["roster"];
+  const value = roster.hostRunId;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function copyPeerHost(value: unknown): SidebarPeerHost | null {
   const source = displayObject(value);
   if (source === undefined) return null;
   const id = displayText(source.id);
@@ -1419,6 +1576,7 @@ function copyPeerHost(value: unknown): PeerUiHost | null {
   const rosterValue = displayObject(source.roster);
   const rosterState = displayText(rosterValue?.state);
   const rowsValue = rosterValue?.rows;
+  const rosterRun = displayOptionalText(rosterValue?.hostRunId);
   if (id === undefined || id.length === 0 || label === undefined || host === undefined
     || port === undefined || state === undefined
     || fingerprint === undefined || message === undefined
@@ -1447,7 +1605,12 @@ function copyPeerHost(value: unknown): PeerUiHost | null {
     message,
     reconnectSuppressed,
     previouslyConnected,
-    roster: { state: rosterState, rows },
+    roster: {
+      state: rosterState,
+      rows,
+      // Preserved only when the coordinator actually reports a nonempty run id.
+      ...(typeof rosterRun === "string" && rosterRun.length > 0 ? { hostRunId: rosterRun } : {}),
+    },
   };
 }
 
@@ -1678,11 +1841,12 @@ export class SidebarController {
   private _focus: SidebarFocus = "main";
   /**
    * View-only observer of the host's actual active Main owner (the explicitly
-   * activated live child). Set by Main, never inferred from the selection; it
-   * only drives the white title highlight and is cleared when the row leaves
-   * the roster. It never changes activation or input ownership.
+   * activated live local child or remote card). Set by Main through
+   * `setActiveMainOwner`/`setActiveMainOwnerKey`, never inferred from the
+   * selection; it only drives the white title highlight and is cleared when
+   * Main reports no owner. It never changes activation or input ownership.
    */
-  private activeMainOwnerID_: string | undefined;
+  private activeMainOwner_: SidebarMainOwnerKey | undefined;
   /**
    * Provenance fence for every host-claimed return chord. Retain each chord's
    * identity across successful rebinding so its repeat/release cannot leak
@@ -1732,6 +1896,12 @@ export class SidebarController {
    * expanded; each card's state persists independently of the highlight.
    */
   private readonly collapsedItemIds = new Set<string>();
+  /**
+   * Composite entry keys of collapsed REMOTE cards. Remote expansion is keyed
+   * by the composite (host, row) entry key, never by the owner row id, so two
+   * hosts that expose the same opaque row id expand independently.
+   */
+  private readonly collapsedRemoteEntryKeys = new Set<string>();
   /**
    * Narrow resume-replacement fence: old exited placeholder ids the backend is
    * removing because their replacement child actually started. Consumed by the
@@ -1811,9 +1981,21 @@ export class SidebarController {
       : undefined;
   }
 
-  /** View-only: the host's actual active Main owner id (undefined when none). */
+  /** View-only: the host's actual active Main owner id (undefined when none or remote). */
   get activeMainOwnerID(): string | undefined {
-    return this.activeMainOwnerID_;
+    return this.activeMainOwner_?.kind === "local" ? this.activeMainOwner_.id : undefined;
+  }
+
+  /**
+   * View-only: the structured actual Main owner. A remote owner never appears
+   * as a local item id, and `activeMainOwnerID` stays undefined for it.
+   */
+  get activeMainOwnerKey(): SidebarMainOwnerKey | undefined {
+    const owner = this.activeMainOwner_;
+    if (owner === undefined) return undefined;
+    return owner.kind === "local"
+      ? { kind: "local", id: owner.id }
+      : { kind: "remote", hostId: owner.hostId, hostRunId: owner.hostRunId, rowId: owner.rowId };
   }
 
   /** Opaque identity of the currently open Saved picker, when one owns the pane. */
@@ -1971,13 +2153,54 @@ export class SidebarController {
   }
 
   /**
-   * Main-owned, view-only observer of the actual active Main conversation.
-   * It only drives the white title highlight; it never activates a row,
-   * moves input focus, or changes ownership. Main clears it (undefined) when
-   * the owner row leaves the roster so a sibling is never falsely highlighted.
+   * Main-owned, view-only observer of the actual active LOCAL Main
+   * conversation. It only drives the white title highlight; it never activates
+   * a row, moves input focus, or changes ownership. Main clears it (undefined)
+   * when the owner row leaves the roster so a sibling is never falsely
+   * highlighted. Remote content owners use `setActiveMainOwnerKey`.
    */
   setActiveMainOwner(id: string | undefined): void {
-    this.activeMainOwnerID_ = typeof id === "string" && id.length > 0 ? id : undefined;
+    this.activeMainOwner_ = typeof id === "string" && id.length > 0
+      ? { kind: "local", id }
+      : undefined;
+  }
+
+  /**
+   * Main-owned, view-only observer of the ACTUAL conversation Main displays,
+   * local or remote, with the left-roster highlight kept entirely separate.
+   * This is the stable public API for marking remote content ownership: a
+   * structured key, never a parsed string, and a remote key can never be read
+   * back as a local id through `selectedId`/`activeMainOwnerID`.
+   *
+   * It only drives the white title highlight. It never activates a row, moves
+   * focus, emits an action, changes the left highlight, connects, pairs, or
+   * retargets anything. An unobserved/empty identity fails closed to no owner.
+   */
+  setActiveMainOwnerKey(owner: SidebarMainOwnerKey | undefined): void {
+    if (owner === undefined) {
+      this.activeMainOwner_ = undefined;
+      return;
+    }
+    switch (owner.kind) {
+      case "local":
+        this.setActiveMainOwner(owner.id);
+        return;
+      case "remote":
+        this.activeMainOwner_ = typeof owner.hostId === "string" && owner.hostId.length > 0
+          && typeof owner.rowId === "string" && owner.rowId.length > 0
+          && (owner.hostRunId === null || (typeof owner.hostRunId === "string" && owner.hostRunId.length > 0))
+          ? {
+            kind: "remote",
+            hostId: owner.hostId,
+            hostRunId: owner.hostRunId,
+            rowId: owner.rowId,
+          }
+          : undefined;
+        return;
+      default:
+        // An unknown kind is not an observed owner: fail closed to none.
+        this.activeMainOwner_ = undefined;
+    }
   }
 
   /** Read-only view of the last updateItems roster (defensive copies). */
@@ -2519,6 +2742,12 @@ export class SidebarController {
     // identity — never a row index — so a later reorder, state change, or
     // cancellation can only refuse it, never retarget it.
     const clicked = region.entry;
+    // A captured remote presentation is a coordinate + structured target from
+    // one written roster. Even when the caller's capture token is not the
+    // uncaptured controller path, a reordered/replaced projection must refuse
+    // it instead of resolving that coordinate against a newer order. Local
+    // rows keep their existing capture semantics unchanged.
+    if (clicked.kind === "remote" && shown.signature !== this.rosterSignature()) return false;
     let target = this.entries.find((entry) => entry.key === clicked.key);
     if (target === undefined || !sameSidebarEntry(target, clicked)) return false;
     if (rightPaneOpen) {
@@ -3084,7 +3313,20 @@ export class SidebarController {
   /** Flips the highlighted card between 5-line expanded and 3-line collapsed. */
   private toggleSelectedExpansion(): void {
     const entry = this.currentEntry();
-    if (entry?.kind !== "item" || entry.item === undefined) {
+    if (entry === undefined) {
+      return;
+    }
+    if (entry.kind === "remote") {
+      // Composite entry key: two hosts exposing the same opaque row id keep
+      // independent expansion state.
+      if (this.collapsedRemoteEntryKeys.has(entry.key)) {
+        this.collapsedRemoteEntryKeys.delete(entry.key);
+      } else {
+        this.collapsedRemoteEntryKeys.add(entry.key);
+      }
+      return;
+    }
+    if (entry.kind !== "item" || entry.item === undefined) {
       return;
     }
     const id = entry.item.id;
@@ -3098,6 +3340,9 @@ export class SidebarController {
   /** Rendered height of one entry: cards are 3 or 5 rows, actions 1 row. */
   private entryHeight(entry: SidebarEntry | undefined): number {
     if (entry?.kind === "diagnostics") return DIAGNOSTICS_ENTRY_ROWS;
+    if (entry?.kind === "remote") {
+      return this.collapsedRemoteEntryKeys.has(entry.key) ? CARD_COLLAPSED_ROWS : CARD_EXPANDED_ROWS;
+    }
     if (entry?.kind !== "item" || entry.item === undefined) {
       return 1;
     }
@@ -3151,6 +3396,30 @@ export class SidebarController {
         type: "terminal-diagnostics-clear",
         throughCount: shown.throughCount,
         failureShown: shown.failureNotice,
+      });
+      return;
+    }
+    if (entry.kind === "remote") {
+      // The emitted target is the structure of the card that was actually
+      // drawn. A vanished, replaced, stale, reordered, or otherwise changed
+      // card refuses instead of retargeting whatever now holds its key.
+      const shown = displayed?.kind === "remote" ? displayed : undefined;
+      const remote = shown?.remote;
+      if (shown === undefined || remote === undefined || !sameSidebarEntry(entry, shown)) return;
+      this.cancelRowResume();
+      this.selectedEntryKey = entry.key;
+      this.desiredSelectionId = undefined;
+      this.noticeError = undefined;
+      // Same existing selection convention as a local row: the sidebar stays
+      // visible and focus returns to Main. Main resolves the actual remote
+      // content owner separately; no local action, connect, pair, or fallback
+      // is emitted here.
+      this._focus = "main";
+      this.emit({
+        type: "select-remote",
+        hostId: remote.hostId,
+        hostRunId: remote.hostRunId,
+        rowId: remote.row.id,
       });
       return;
     }
@@ -5453,6 +5722,11 @@ export class SidebarController {
       ...this.rowStore.map(
         (item): SidebarEntry => ({ key: ITEM_KEY_PREFIX + item.id, kind: "item", item }),
       ),
+      // Remote cards are a display projection of the SAME attached peer
+      // snapshot the Network pane renders. Local rows keep their existing order
+      // and the projection preserves the DTO's host order and each host's own
+      // row order: no sorting, deduplication, cache, or new authority.
+      ...this.projectRemoteEntries(),
       ...(this.diagnosticsWarning === undefined
         ? []
         : [{ key: ENTRY_DIAGNOSTICS_KEY, kind: "diagnostics" as const, warning: this.diagnosticsWarning }]),
@@ -5464,6 +5738,65 @@ export class SidebarController {
       { key: ENTRY_QUIT_KEY, kind: "quit" },
       ...(this.settingsAvailable ? [{ key: ENTRY_SETTINGS_KEY, kind: "settings" as const }] : []),
     ];
+    this.pruneVanishedRemoteSelection();
+    this.pruneRemoteExpansionMemory();
+  }
+
+  /**
+   * One typed card per observed remote roster row. `rows: null` means "no
+   * complete observation" and contributes no cards at all; a `stale` host
+   * projection is marked stale rather than refreshed, reconnected, or guessed.
+   * This derives every rebuild from the existing snapshot and keeps no second
+   * authoritative row store.
+   */
+  private projectRemoteEntries(): SidebarEntry[] {
+    const snapshot = this.peerUiSnapshot;
+    if (snapshot === undefined) return [];
+    const entries: SidebarEntry[] = [];
+    for (const host of snapshot.hosts ?? []) {
+      const rows = host.roster.rows;
+      if (rows === null) continue;
+      const rosterState: "current" | "stale" = host.roster.state === "stale" ? "stale" : "current";
+      const hostRunId = peerHostRosterRunId(host);
+      for (const row of rows) {
+        entries.push({
+          key: remoteRosterEntryKey(host.id, row.id),
+          kind: "remote",
+          remote: {
+            hostId: host.id,
+            hostLabel: host.label,
+            hostRunId,
+            rosterState,
+            row,
+          },
+        });
+      }
+    }
+    return entries;
+  }
+
+  /**
+   * A remote card that a metadata update removed or replaced loses only the
+   * left highlight. Focus, visibility, an open pane/draft, Main's actual
+   * content owner, and every local row are untouched, and nothing is
+   * retargeted to whatever now happens to sit near the old position.
+   */
+  private pruneVanishedRemoteSelection(): void {
+    const key = this.selectedEntryKey;
+    if (key === undefined || !key.startsWith(REMOTE_ENTRY_KEY_PREFIX)) return;
+    if (this.entries.some((entry) => entry.key === key)) return;
+    this.selectedEntryKey = undefined;
+  }
+
+  /** Keeps per-card expansion memory bounded to the currently projected cards. */
+  private pruneRemoteExpansionMemory(): void {
+    if (this.collapsedRemoteEntryKeys.size === 0) return;
+    const live = new Set(
+      this.entries.filter((entry) => entry.kind === "remote").map((entry) => entry.key),
+    );
+    for (const key of [...this.collapsedRemoteEntryKeys]) {
+      if (!live.has(key)) this.collapsedRemoteEntryKeys.delete(key);
+    }
   }
 
   private findItemEntry(id: string): SidebarEntry | undefined {
@@ -5495,7 +5828,7 @@ export class SidebarController {
           : []),
         "esc hide",
         "q quit",
-        ...(this._focus === "sidebar" && this.rowStore.length > 0 ? ["space expand"] : []),
+        ...(this._focus === "sidebar" && this.hasExpandableCards() ? ["space expand"] : []),
         // The configured return chord focuses the existing Main owner (roster-only);
         // it never activates the highlighted row. Shown only while the roster
         // owns focus, where the key actually acts.
@@ -5630,7 +5963,7 @@ export class SidebarController {
       // selected navigation target while the sidebar-owned surfaces have
       // focus. Never both at once, and never a false sibling/owner mark.
       let titleSgr: string;
-      if (this._focus === "main" && this.activeMainOwnerID_ === item.id) {
+      if (this._focus === "main" && this.activeMainOwnerID === item.id) {
         titleSgr = SGR_ACTIVE_MAIN_WHITE;
       } else if (selected && this._focus !== "main") {
         titleSgr = SGR_SELECTION_BLUE;
@@ -5650,6 +5983,15 @@ export class SidebarController {
         lines.push(...activity);
       }
       return lines;
+    }
+    if (entry.kind === "remote") {
+      // A projected remote card always carries its structured facts; if one
+      // somehow does not, draw an honest placeholder instead of falling
+      // through to a host action row that could be mistaken for Quit host.
+      if (entry.remote === undefined) {
+        return [wrapRow(`${marker}Remote session unavailable`, cols)];
+      }
+      return this.renderRemoteEntryLines(entry, entry.remote, selected, cols);
     }
     if (entry.kind === "diagnostics" && entry.warning !== undefined) {
       const warning = entry.warning;
@@ -5681,6 +6023,66 @@ export class SidebarController {
     // Host-owned action rows take the blue selection target while a
     // sidebar-owned surface has focus; they are never the native active owner.
     return [wrapRow(text, cols, selected && this._focus !== "main" ? SGR_SELECTION_BLUE : undefined)];
+  }
+
+  /**
+   * One projected remote card at the same 3/5-row shape as a local card. It
+   * reuses the existing bounded title/status/background helpers through the
+   * remote display-facts adapter, adds only the owner host label, honest
+   * current-vs-stale marking, and the exact display-only owner workspace, and
+   * never invents a local status, agent dir, or current file.
+   */
+  private renderRemoteEntryLines(
+    entry: SidebarEntry,
+    remote: SidebarRemoteEntry,
+    selected: boolean,
+    cols: number,
+  ): string[] {
+    const marker = selected ? "> " : "  ";
+    const facts = remoteSessionStatusFacts(remote.row);
+    // Same one focus-domain title highlight as local cards; the white mark is
+    // Main's actual content owner, which is always a structured identity and
+    // never inferred from the left highlight.
+    let titleSgr: string;
+    if (this._focus === "main" && this.remoteIsActiveMainOwner(remote)) {
+      titleSgr = SGR_ACTIVE_MAIN_WHITE;
+    } else if (selected && this._focus !== "main") {
+      titleSgr = SGR_SELECTION_BLUE;
+    } else {
+      titleSgr = "\x1b[1m";
+    }
+    const hostLabel = sanitizeBounded(remote.hostLabel, PEER_LABEL_MAX_CODEPOINTS);
+    // Staleness leads the variable-length owner label so clipping can never
+    // hide the honest observation behind a long friendly name.
+    const stale = remote.rosterState === "stale" ? "[stale] " : "";
+    const workspace = sanitizeBounded(remote.row.workspace, SAVED_WORKSPACE_MAX_CODEPOINTS);
+    const lines = [
+      wrapRow(cardTitle(remote.row), cols, titleSgr),
+      wrapRow(`${marker}${stale}${hostLabel} | ${cardStatusText(facts)}`, cols),
+      wrapRow(`  ${cardBackgroundText(facts)} | ${workspace}`, cols),
+    ];
+    if (!this.collapsedRemoteEntryKeys.has(entry.key)) {
+      const activity = renderActivityLines(remote.row.activity, cols);
+      while (activity.length < ACTIVITY_LINES_MAX) {
+        activity.push(wrapRow("", cols));
+      }
+      lines.push(...activity);
+    }
+    return lines;
+  }
+
+  /** True only when Main reports this exact remote card as the actual content owner. */
+  private remoteIsActiveMainOwner(remote: SidebarRemoteEntry): boolean {
+    const owner = this.activeMainOwner_;
+    return owner !== undefined && owner.kind === "remote"
+      && owner.hostId === remote.hostId
+      && owner.hostRunId === remote.hostRunId
+      && owner.rowId === remote.row.id;
+  }
+
+  /** True when at least one left-roster card can be expanded/collapsed with Space. */
+  private hasExpandableCards(): boolean {
+    return this.entries.some((entry) => entry.kind === "item" || entry.kind === "remote");
   }
 
   private renderFormPane(

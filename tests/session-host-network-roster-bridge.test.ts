@@ -102,6 +102,7 @@ function remoteRows(ids: readonly string[]): RemoteSessionMetadata[] {
  */
 class LoopbackChannel implements PeerByteChannel {
   readonly peerKey: { keyId: string; fingerprint: string };
+  readonly lane = "app";
   readonly label: string | null;
   readonly sent: Buffer[] = [];
   readonly events: string[];

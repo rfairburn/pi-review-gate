@@ -27,6 +27,13 @@ export interface PeerUiHost {
 		readonly state: "never" | "current" | "stale";
 		/** null means no complete observation; current [] is a valid empty roster. */
 		readonly rows: readonly RemoteSessionMetadata[] | null;
+		/**
+		 * Owner run identity of the last complete observation. A stale roster keeps
+		 * the run it was observed on; `never`/unknown is null, never a guess. This is
+		 * a display fact only: it grants nothing and authorizes nothing. Optional so
+		 * an older coordinator's DTO stays representable.
+		 */
+		readonly hostRunId?: string | null;
 	};
 }
 

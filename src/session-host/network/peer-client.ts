@@ -21,7 +21,6 @@ import type { ClientRequest, IncomingMessage } from "node:http";
 import WebSocket from "ws";
 import {
 	APP_PATH,
-	APP_SUBPROTOCOL,
 	PAIRING_PATH,
 	PEER_KEY_HEADER,
 	PEER_LABEL_HEADER,
@@ -29,7 +28,10 @@ import {
 	emitDiagnostic,
 	isPeerTransportError,
 	isValidPeerLabel,
+	peerAppLaneForSubprotocol,
 	peerError,
+	peerSubprotocolForLane,
+	type PeerAppLane,
 	type PeerDiagnostic,
 	type PeerDiagnosticCode,
 	type PeerDiagnosticSink,
@@ -78,6 +80,13 @@ export interface PeerAppOptions {
 	readonly host?: string;
 	readonly port: number;
 	readonly signal?: AbortSignal;
+	/**
+	 * Exact lane for this connection. Defaults to the unchanged legacy `app`
+	 * lane; `content` offers the additive `pi-peer-content-v1` subprotocol and
+	 * opens only when the receiving host supplied a content callback. This client
+	 * never offers both protocols. The negotiated lane must match this value.
+	 */
+	readonly lane?: PeerAppLane;
 	/** Extra application headers; only sent after the server key is accepted. */
 	readonly headers?: Readonly<Record<string, string>>;
 	/** Per-connection local server-key approver; overrides the client default. */
@@ -544,6 +553,9 @@ export function createPeerClient(options: PeerClientOptions): PeerClient {
 			const { host, port } = validateEndpoint(appOptions.host ?? "127.0.0.1", appOptions.port);
 			const signal = appOptions.signal;
 			if (signal?.aborted) throw peerError("ABORTED");
+			const lane = appOptions.lane ?? "app";
+			if (lane !== "app" && lane !== "content") throw peerError("INVALID_ARGUMENT");
+			const subprotocol = peerSubprotocolForLane(lane);
 			const extraHeaders = validateCallerHeaders(appOptions.headers, bounds);
 			if (!reserveOperation()) throw peerError("CLIENT_LIMIT_REACHED");
 			stats.appAttempts++;
@@ -562,7 +574,7 @@ export function createPeerClient(options: PeerClientOptions): PeerClient {
 			}
 			let ws: InstanceType<typeof WebSocket>;
 			try {
-				ws = new WebSocket(wssUrl(host, port), APP_SUBPROTOCOL, {
+				ws = new WebSocket(wssUrl(host, port), subprotocol, {
 					agent,
 					headers: extraHeaders,
 					perMessageDeflate: false,
@@ -638,10 +650,16 @@ export function createPeerClient(options: PeerClientOptions): PeerClient {
 				if (!opened) throw lastGateError ?? peerError("APP_REFUSED");
 				if (agent.handshakes.length !== 1) throw peerError("PEER_KEY_MISMATCH");
 				const handshake: PeerServerHandshake = agent.handshakes[0];
+				// Trust only the protocol the server actually selected, and only when it
+				// is exactly the lane this connection asked for. A server that selects
+				// nothing or something else is refused rather than reinterpreted.
+				const negotiatedLane = peerAppLaneForSubprotocol(ws.protocol);
+				if (negotiatedLane === null || negotiatedLane !== lane) throw peerError("APP_REFUSED");
 				if (signal) signal.removeEventListener("abort", onAbort);
 				const channel = createPeerByteChannel({
 					ws,
 					peerKey: handshake.key,
+					lane: negotiatedLane,
 					label: handshake.label,
 					bounds,
 					isServer: false,

@@ -111,8 +111,9 @@ private Windows ACL guarantee.
 ### Session-host peer network (optional)
 
 The optional `pi-review-sessions` host can expose a **Network** sidebar for explicit
-pairing and metadata-only remote session rows. Ordinary Pi sessions and the standalone
-review-gate launchers are unchanged and start no peer listener or client. This is an
+pairing, remote session rows, and one deliberately selected row's native
+viewport. Ordinary Pi sessions and the standalone review-gate launchers are unchanged
+and start no peer listener or client. This is an
 optional alpha surface: it does not certify native-Windows UI, physical input, mobile,
 browser, or release readiness.
 
@@ -182,14 +183,44 @@ Shutdown closes only this host's owned local network resources and retains
 agent-directory ownership when local settlement is unconfirmed; it never waits for or
 claims a remote receipt or remote work outcome.
 
-The connected channel is a metadata-only projection of the owner's roster, not remote
-control. It carries bounded display facts, including the exact owner-side workspace path,
-and never the native current-file guard, agent/account directories, configuration,
-providers, credentials, prompts, transcripts, question text, terminal/output bytes, or
-image data. A lost projection is stale or unavailable, never idle or zero. There is no
-invented view-only permission kind: metadata-only is the implemented protocol scope.
-Remote terminal content and input, remote creation, `SessionSpawn`, Close, stop or resume,
-and clipboard attribution are unimplemented.
+The connected application channel is a projection of the owner's roster, not remote
+control. Its roster lane carries bounded display facts, including the exact owner-side
+workspace path, and never the native current-file guard, agent/account directories,
+configuration, providers, credentials, prompts, transcripts, question text,
+terminal/output bytes, or image data. A lost projection is stale or unavailable, never
+idle or zero.
+
+One deliberate local selection may instead display one exact owner row's native
+viewport, on the additive content lane of the same TLS/WSS listener and `/app` path,
+under the same exact TLS-proved peer key, current remembered pin, and directional
+receiving grant. It adds no second listener, daemon, manager, permission kind, controller
+lease, trust document, or stored state. That viewport is the owner's own visible native
+frame — ordinary conversation and terminal text with its generated styling, cursor,
+Unicode cells, and the bounded typed PNG images, placements, and text fallbacks the native
+surface already produces — carried as one complete, bounded, atomically assembled
+transfer. It is not a transcript, a raw PTY or terminal-control stream, and it carries no
+separate private configuration, provider/credential, authentication, current-file,
+structured-question, or hidden telemetry records. Rows that are not selected stay
+metadata-only, and a session
+nobody selected is neither watched nor resized for that viewer. Visible terminal text can
+itself be sensitive, and displaying the deliberately selected row is the intended
+behavior. A published view must still match the current selection generation,
+destination, owner run, and owner row, plus the owner's subscription identity, monotonic
+publish sequence, canonical geometry and revision, and the exact native conversation tuple
+when one is known (an unknown tuple is not guessed);
+only the frame the writer actually committed identifies the drawn source. Carried input
+modes are inert rendering facts. There is no invented view-only permission kind: this
+display is part of the same implemented grant scope, a lost stream is stale or unavailable
+with the deliberate target preserved, and no local row, sibling destination, or silent
+fallback replaces it.
+
+At this ordered interim slice, remote keyboard and mouse input, remote clipboard
+attribution, remote creation, `SessionSpawn`, Close, stop or resume, and owner-routed
+session operations are unimplemented and fail closed: native-pane packets are not
+forwarded to a remote owner, and no local child receives them on that stream's behalf.
+That is an interim ordering bound, not a permanent view-only policy. Authenticated local
+and SSH clipboard copying is unchanged, nothing is broadcast, no remote copy request is
+transported, and raw PTY OSC 52 stays denied.
 
 ### Session-host clipboard transport
 

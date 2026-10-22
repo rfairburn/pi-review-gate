@@ -14,6 +14,14 @@
  *   directional grant (`peer->host`) recorded for this stable receiving
  *   identity, and only then calls `wss.handleUpgrade`.
  *
+ * Two exact lanes share that one upgrade, distinguished only by subprotocol:
+ * the unchanged legacy `pi-peer-app-v1` lane delivered to `onAppChannel`, and an
+ * additive `pi-peer-content-v1` lane delivered to `onContentChannel`. The
+ * content lane is opt-in: without a content callback it is refused exactly like
+ * any other unknown subprotocol, so content bytes can never reach the metadata
+ * receiver. Both lanes run the same TLS, accepted-identity, grant, connection
+ * bound, and settlement paths.
+ *
  * Pairing and approval records are not scoped to a listener or process instance.
  * Closing and recreating a listener with the same identity and the same injected
  * stores preserves remembered access; a different receiving identity cannot use
@@ -38,6 +46,7 @@ import WebSocket from "ws";
 import {
 	APP_PATH,
 	APP_SUBPROTOCOL,
+	CONTENT_SUBPROTOCOL,
 	GRANT_CAPABILITY,
 	GRANT_DIRECTION,
 	PAIRING_PATH,
@@ -48,8 +57,10 @@ import {
 	isPeerTransportError,
 	isValidPeerLabel,
 	matchFixedPeerPath,
+	peerAppLaneForSubprotocol,
 	peerError,
 	resolvePeerTransportBounds,
+	type PeerAppLane,
 	type PeerDiagnostic,
 	type PeerDiagnosticCode,
 	type PeerDiagnosticSink,
@@ -166,7 +177,15 @@ export interface PeerHostOptions {
 	readonly acceptedPeers: AcceptedPeerStore;
 	readonly grants: DirectionalGrantStore;
 	readonly onPairingRequest?: PeerPairingRequestHandler;
+	/** Legacy `app` lane receiver; unchanged. */
 	readonly onAppChannel?: PeerAppChannelHandler;
+	/**
+	 * Opt-in `content` lane receiver. Supplying this callback is the only way the
+	 * listener will negotiate `pi-peer-content-v1`; without it, a content upgrade
+	 * keeps the existing `unsupported_subprotocol` refusal. Content channels are
+	 * never passed to `onAppChannel`.
+	 */
+	readonly onContentChannel?: PeerAppChannelHandler;
 	readonly bounds?: Partial<PeerTransportBounds>;
 	readonly onDiagnostic?: PeerDiagnosticSink;
 	/** Test-only fixture injection; see `PeerPairingTestHooks`. */
@@ -349,6 +368,9 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 		throw peerError("INVALID_ARGUMENT");
 	}
 	const bounds = resolvePeerTransportBounds(options.bounds);
+	// Content is opt-in per host instance: the lane only exists when a receiver
+	// was actually supplied for it.
+	const contentEnabled = typeof options.onContentChannel === "function";
 	const acceptedPeers = options.acceptedPeers;
 	const grants = options.grants;
 	const onDiagnostic = options.onDiagnostic;
@@ -400,7 +422,14 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 		perMessageDeflate: false,
 		autoPong: false,
 		maxPayload: bounds.maxWebSocketMessageBytes,
-		handleProtocols: (protocols: Set<string>) => (protocols.has(APP_SUBPROTOCOL) ? APP_SUBPROTOCOL : false),
+		handleProtocols: (protocols: Set<string>) => {
+			// Deterministic preference: if a peer offers both supported protocols the
+			// unchanged legacy lane wins. A content upgrade negotiates only on a host
+			// that opted in; anything else leaves the upgrade refused.
+			if (protocols.has(APP_SUBPROTOCOL)) return APP_SUBPROTOCOL;
+			if (contentEnabled && protocols.has(CONTENT_SUBPROTOCOL)) return CONTENT_SUBPROTOCOL;
+			return false;
+		},
 		// ws 8.22.0 supports closeTimeout; the pinned @types/ws 8.18.2 does not declare it.
 		closeTimeout: bounds.closeTimeoutMs,
 	} as WebSocket.ServerOptions & { closeTimeout: number });
@@ -847,7 +876,21 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 			return;
 		}
 		const offered = protocolHeader?.split(",").map((value) => value.trim()) ?? [];
-		if (!offered.includes(APP_SUBPROTOCOL)) {
+		// The requested lane comes only from the exact supported protocols the peer
+		// offered. Unknown or missing protocols have no lane and fail closed; if both
+		// are offered, the legacy lane is the deterministic choice.
+		const requestedLane: PeerAppLane | null = offered.includes(APP_SUBPROTOCOL)
+			? "app"
+			: offered.includes(CONTENT_SUBPROTOCOL)
+				? "content"
+				: null;
+		if (requestedLane === null) {
+			rejectSocket(socket, 400, "unsupported_subprotocol");
+			return;
+		}
+		if (requestedLane === "content" && !contentEnabled) {
+			// No content receiver was supplied, so the content lane does not exist on
+			// this host. Refuse it exactly like any other unsupported subprotocol.
 			rejectSocket(socket, 400, "unsupported_subprotocol");
 			return;
 		}
@@ -867,7 +910,7 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 			rejectSocket(socket, 403, "not_authorized");
 			return;
 		}
-		if (typeof options.onAppChannel !== "function") {
+		if (requestedLane === "app" && typeof options.onAppChannel !== "function") {
 			rejectSocket(socket, 503, "app_unavailable");
 			return;
 		}
@@ -907,9 +950,22 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 						}
 						return;
 					}
+					// The lane is the protocol ws actually negotiated, never an unvalidated
+					// label, and it must match the lane this request was admitted for.
+					const lane = peerAppLaneForSubprotocol(ws.protocol);
+					const handler = lane === "content" ? options.onContentChannel : options.onAppChannel;
+					if (lane === null || lane !== requestedLane || typeof handler !== "function") {
+						try {
+							ws.terminate();
+						} catch {
+							// Already gone.
+						}
+						return;
+					}
 					const channel = createPeerByteChannel({
 						ws,
 						peerKey,
+						lane,
 						label: acceptedRecord?.label ?? null,
 						bounds,
 						isServer: true,
@@ -926,7 +982,7 @@ export function createPeerHost(options: PeerHostOptions): PeerHost {
 					stats.appChannelsOpened++;
 					diagnostic("app_channel_opened");
 					try {
-						const result = options.onAppChannel?.(channel);
+						const result = handler(channel);
 						if (result && typeof (result as Promise<void>).then === "function") {
 							(result as Promise<void>).catch(() => {
 								void channel.close();

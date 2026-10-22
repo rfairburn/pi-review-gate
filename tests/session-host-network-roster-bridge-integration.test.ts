@@ -178,6 +178,10 @@ class WireTap implements PeerByteChannel {
     return this.inner.peerKey;
   }
 
+  get lane(): PeerByteChannel["lane"] {
+    return this.inner.lane;
+  }
+
   get label(): string | null {
     return this.inner.label;
   }

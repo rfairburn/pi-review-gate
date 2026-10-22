@@ -64,6 +64,13 @@ export interface TerminalGraphicsFrame {
 	readonly fallbacks: readonly TerminalGraphicsFallback[];
 }
 
+/** Result of the shared native PNG validation. */
+export interface ValidatedTerminalGraphicsPng {
+	readonly widthPx: number;
+	readonly heightPx: number;
+	readonly byteLength: number;
+}
+
 /** Idempotent resource reservation owned by one retained image/placement. */
 export interface TerminalGraphicsBudgetLease {
 	release(): void;
@@ -1522,11 +1529,21 @@ function isBase64WithinLimit(value: string): boolean {
 		&& /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value);
 }
 
-function decodePng(base64: string): {
-	readonly widthPx: number;
-	readonly heightPx: number;
-	readonly byteLength: number;
-} | undefined {
+/**
+ * Validate one canonical base64 PNG against the exact native Kitty subset this
+ * surface accepts (signature, chunk CRCs, IHDR depth/color/interlace rules,
+ * dimension, pixel, decoded and base64 byte bounds, non-animated).
+ *
+ * It is the same decoder the native surface uses, exported as a pure check so a
+ * wire boundary can reuse these limits instead of maintaining a weaker
+ * duplicate. It retains nothing; anything outside the subset yields undefined.
+ */
+export function validateTerminalGraphicsPng(base64: string): ValidatedTerminalGraphicsPng | undefined {
+	if (typeof base64 !== "string") return undefined;
+	return decodePng(base64);
+}
+
+function decodePng(base64: string): ValidatedTerminalGraphicsPng | undefined {
 	if (!isBase64WithinLimit(base64)) {
 		return undefined;
 	}

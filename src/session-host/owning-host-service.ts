@@ -15,6 +15,19 @@ import type {
   SessionViewerUpdateResult,
 } from "./instances";
 import type { NativePersistenceReceipt } from "./native-persistence";
+import type {
+  TerminalCellRun,
+  TerminalFrame,
+  TerminalInputModes,
+  TerminalLineStyles,
+  TerminalSurface,
+} from "./terminal-surface";
+import type {
+  TerminalGraphicsFallback,
+  TerminalGraphicsFrame,
+  TerminalGraphicsImage,
+  TerminalGraphicsPlacement,
+} from "./kitty-graphics";
 import {
   admitSavedSession,
   validateSavedSessionDeletion,
@@ -56,6 +69,15 @@ import {
  * is a single event-loop continuation that delivers a change it already
  * observed, after a bounded synchronous delivery pass. What crosses a network
  * boundary is decided by that boundary, not here.
+ *
+ * The selected-session content watch (#389) observes one row's native content
+ * through that same manager and the same change hook: its row tuple, canonical
+ * geometry, and the exact typed frame (`surface.frame()`, including generated
+ * SGR, structured styles, the cursor, and every bounded typed graphics image,
+ * placement, and fallback) and input modes (`surface.inputModes()`). It adds no
+ * content manager, roster, transcript, or cache, does not strip graphics or
+ * styles, and grants no input, clipboard, resize, or process authority: input
+ * modes are an observation only.
  */
 
 /** The one manager shape this host speaks to (the production `InstanceManager`). */
@@ -184,6 +206,76 @@ interface InventoryWatchRecord {
 }
 
 /**
+ * One immutable observation of one row's native visible content (#389).
+ *
+ * Every fact is read from the ONE manager that owns the row: `sessionId` is the
+ * manager row id, `nativeSession` is only the allowlisted native conversation
+ * tuple (never a current-file, persistence, or agent-directory guard fact), and
+ * `geometry`, `frame`, and `inputModes` are the canonical row geometry and that
+ * row's own surface output. `hostRunId` reuses the inventory run identity, and
+ * `sequence` is this run's capture ordinal for content: every snapshot a watch
+ * receives carries a strictly greater sequence than the one it received before,
+ * is never reused, and never wraps.
+ *
+ * A snapshot is a deep, frozen copy: mutating it cannot change the owner's
+ * surface or another subscriber's snapshot. Graphics payloads are the canonical
+ * base64 strings the surface already validated.
+ */
+export interface OwningHostSessionContentSnapshot {
+  readonly hostRunId: string;
+  /** The owning manager's row id this content belongs to. */
+  readonly sessionId: string;
+  /** Allowlisted native conversation tuple; null while unavailable/unknown. */
+  readonly nativeSession: { readonly sessionId: string; readonly epoch: number } | null;
+  readonly sequence: number;
+  readonly geometry: SessionGeometry;
+  readonly frame: TerminalFrame;
+  readonly inputModes: TerminalInputModes;
+}
+
+/**
+ * One content watch's notification sink. `undefined` means this row's content is
+ * currently unobservable (missing row, missing surface or geometry, a throwing
+ * read, or host teardown); it is never used for a fabricated empty frame or a
+ * guessed size.
+ */
+export type OwningHostSessionContentListener = (snapshot: OwningHostSessionContentSnapshot | undefined) => void;
+
+/**
+ * One live content watch. `snapshot` is the content captured when the watch was
+ * installed; `unsubscribe()` retires it idempotently, and a retired watch is
+ * never notified again, including by a notification already in flight.
+ */
+export interface OwningHostSessionContentWatch {
+  readonly snapshot: OwningHostSessionContentSnapshot;
+  unsubscribe(): void;
+}
+
+/** One live content watch record, keyed by the row id it observes. */
+interface SessionContentWatchRecord {
+  readonly id: number;
+  readonly sessionId: string;
+  readonly listener: OwningHostSessionContentListener;
+  active: boolean;
+}
+
+/** The watches already selected for one affected row in one delivery pass. */
+interface SessionContentDelivery {
+  readonly sessionId: string;
+  readonly watches: readonly SessionContentWatchRecord[];
+}
+
+/**
+ * One content capture attempt. `superseded` means a change to this same row
+ * landed while the capture was reading, so the facts it could see may mix two
+ * states; nothing is published and the retained change delivers a fresh capture.
+ */
+type SessionContentCapture =
+  | { readonly status: "observed"; readonly snapshot: OwningHostSessionContentSnapshot }
+  | { readonly status: "unavailable" }
+  | { readonly status: "superseded" };
+
+/**
  * Upper bound on consecutive re-delivery rounds after reentrant changes. A
  * watcher that mutates the manager from its own callback is a pathological
  * consumer; the bound keeps one such watcher from spinning the host inside a
@@ -191,6 +283,13 @@ interface InventoryWatchRecord {
  * exhausted gets one event-loop continuation, so a finite chain still lands.
  */
 const MAX_INVENTORY_DELIVERY_ROUNDS = 8;
+
+/**
+ * Bounded synchronous re-capture attempts when an install's first capture is
+ * superseded by a change to the same row. A fixture or manager that changes the
+ * row on every read still refuses installation instead of looping.
+ */
+const MAX_CONTENT_CAPTURE_ATTEMPTS = 3;
 
 /**
  * Copy one manager listing into immutable snapshot rows. The manager's own
@@ -203,6 +302,84 @@ function copyInventoryRows(rows: readonly NativeInstanceView[]): readonly Native
     ...row,
     activity: Array.isArray(row.activity) ? Object.freeze([...row.activity]) : row.activity,
   })));
+}
+
+/** Writable mirror of one readonly frame fact, used only while copying it. */
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
+/**
+ * Freeze a copied array while keeping the frame's declared mutable shape. The
+ * runtime value really is frozen; only the declaration still says `string[]`.
+ */
+function frozenArray<T>(values: T[]): T[] {
+  return Object.freeze(values) as unknown as T[];
+}
+
+/** Copy one style run, including its color records, so no surface state is shared. */
+function copyCellRun(run: TerminalCellRun): TerminalCellRun {
+  const copy: Mutable<TerminalCellRun> = { ...run };
+  if (run.fg !== undefined) copy.fg = Object.freeze({ ...run.fg });
+  if (run.bg !== undefined) copy.bg = Object.freeze({ ...run.bg });
+  return Object.freeze(copy);
+}
+
+/** Copy one row's structured style runs. */
+function copyLineStyles(line: TerminalLineStyles): TerminalLineStyles {
+  return Object.freeze({ line: line.line, runs: Object.freeze(line.runs.map(copyCellRun)) });
+}
+
+/**
+ * Copy every bounded typed graphics fact of one frame. The images, placements,
+ * fallbacks, crops, and clips are all copied and frozen; base64 payloads are
+ * canonical immutable strings, so they never need re-encoding or clipping.
+ */
+function copyGraphicsFrame(graphics: TerminalGraphicsFrame): TerminalGraphicsFrame {
+  return Object.freeze({
+    images: Object.freeze(graphics.images.map((image): TerminalGraphicsImage => Object.freeze({ ...image }))),
+    placements: Object.freeze(graphics.placements.map((placement): TerminalGraphicsPlacement => Object.freeze({
+      ...placement,
+      crop: Object.freeze({ ...placement.crop }),
+      clip: Object.freeze({ ...placement.clip }),
+    }))),
+    fallbacks: Object.freeze(graphics.fallbacks.map((fallback): TerminalGraphicsFallback => Object.freeze({
+      ...fallback,
+      clip: Object.freeze({ ...fallback.clip }),
+    }))),
+  });
+}
+
+/**
+ * Deep-copy one surface frame into an immutable snapshot frame: lines, cursor,
+ * styles with their runs and colors, and all graphics facts. A held synchronized
+ * frame may share objects with other frames the surface returns; copying keeps a
+ * subscriber's retained snapshot independent of the owner and of every other
+ * subscriber.
+ */
+function copyTerminalFrame(frame: TerminalFrame): TerminalFrame {
+  const lines = frozenArray([...frame.lines]);
+  const cursor = Object.freeze({ ...frame.cursor });
+  const styles = frame.styles === undefined
+    ? undefined
+    : frozenArray(frame.styles.map(copyLineStyles));
+  const graphics = frame.graphics === undefined ? undefined : copyGraphicsFrame(frame.graphics);
+  return Object.freeze({
+    cols: frame.cols,
+    rows: frame.rows,
+    lines,
+    cursor,
+    ...(styles === undefined ? {} : { styles }),
+    ...(graphics === undefined ? {} : { graphics }),
+  });
+}
+
+/** Copy only the allowlisted native tuple; every private guard fact is dropped. */
+function copyNativeSessionTuple(
+  value: NativeInstanceView["nativeSession"],
+): OwningHostSessionContentSnapshot["nativeSession"] {
+  if (!value) return null;
+  // The row's non-null tuple is the manager's own validated fact; this seam
+  // copies exactly its two public fields and nothing else.
+  return Object.freeze({ sessionId: value.sessionId, epoch: value.epoch });
 }
 
 export interface OwningHostServiceDependencies {
@@ -260,6 +437,42 @@ export interface OwningHostService {
    * Throws only on a non-callable listener, which is a programmer error.
    */
   watchInventory(listener: OwningHostInventoryListener): OwningHostInventoryWatch | undefined;
+  /**
+   * Install one live content watch over the one manager that owns `sessionId`.
+   * The returned watch carries the snapshot captured at installation, and the
+   * watch is installed in that same synchronous operation, so no change can slip
+   * between the capture and the subscription and no duplicate initial callback is
+   * needed. Later manager changes for that row deliver a newer snapshot, or
+   * `undefined` while the row's content is unobservable.
+   *
+   * Only the affected row is captured: a change to another row never reads this
+   * row's surface, and with no content watch installed nothing calls
+   * `surface.frame()` or `surface.inputModes()` at all. Every fact comes from the
+   * same manager run: the row's allowlisted native tuple, its canonical
+   * `instanceGeometry`, and its own surface frame and input modes. A frame whose
+   * dimensions disagree with that canonical geometry is a mixed observation and
+   * is reported as unavailable instead of being published.
+   *
+   * Returns undefined and installs nothing when no coherent snapshot can be
+   * captured: no manager opened yet, host teardown, a missing or throwing row,
+   * surface, geometry, frame, or input-mode read. This observation grants no
+   * input, clipboard, resize, or process authority and never writes, spawns,
+   * resizes, stops, or removes anything.
+   *
+   * `unsubscribe()` is idempotent, a retired watch is never notified again even
+   * by a delivery already in flight, one watcher's failure never reaches the
+   * host's own change hook or another watcher, and losing a watch never affects a
+   * session. Delivery shares the inventory seam's ordering guarantees: a change
+   * that lands during a capture or delivery is retained and delivered as a newer
+   * capture once the in-flight work unwinds, and re-delivery is bounded with one
+   * event-loop continuation for a still-retained change.
+   *
+   * Throws only on a non-callable listener, which is a programmer error.
+   */
+  watchSessionContent(
+    sessionId: string,
+    listener: OwningHostSessionContentListener,
+  ): OwningHostSessionContentWatch | undefined;
   /**
    * Start one session through the manager and classify the row that actually
    * came up. Never activates, focuses, or notifies anything: presentation reads
@@ -332,15 +545,28 @@ class LocalOwningHostService implements OwningHostService {
   /** Highest revision this run has issued; strictly increasing, never reused. */
   #inventoryRevision = 0;
   readonly #inventoryWatches = new Map<number, InventoryWatchRecord>();
+  readonly #contentWatches = new Map<number, SessionContentWatchRecord>();
   #nextWatchId = 1;
+  /** Highest content sequence this run has issued; strictly increasing, never reused. */
+  #contentSequence = 0;
   /** Nesting depth of guarded inventory work; changes inside it are retained. */
   #inventoryGuardDepth = 0;
-  /** A manager change arrived inside a guarded capture or delivery. */
-  #inventoryPending = false;
+  /**
+   * Row ids whose manager change arrived inside a guarded capture or delivery.
+   * Retaining the ids (not just a flag) is what lets the drain capture only the
+   * rows that actually changed, and only for rows someone watches.
+   */
+  readonly #pendingChangedIds = new Set<string>();
   /** True while the drain loop owns delivery, so nested rounds join it instead of recursing. */
   #inventoryDraining = false;
   /** True while one capture's listing is in flight; overlapping captures are refused. */
   #inventoryCapturing = false;
+  /** True while one content capture is in flight; overlapping captures are refused. */
+  #contentCapturing = false;
+  /** The row whose content capture is reading right now, if any. */
+  #contentCaptureSessionId: string | undefined;
+  /** A change to that same row landed while its capture was reading. */
+  #contentCaptureSuperseded = false;
   /** True while the post-bound continuation for a retained change is queued. */
   #inventoryDrainScheduled = false;
   /** The host's own manager change hook, forwarded exactly once per change. */
@@ -358,9 +584,10 @@ class LocalOwningHostService implements OwningHostService {
       // authoritative sets of session facts, so refuse instead of adapting.
       throw new Error("this session host already owns a session manager");
     }
-    // The inventory seam observes this manager's existing change hook and then
-    // forwards the host's own hook, so the host keeps the callback it passed in
-    // and no second notification path is created.
+    // The observation seams (inventory and selected-session content) observe this
+    // manager's existing change hook and then forward the host's own hook, so the
+    // host keeps the callback it passed in and no second notification path is
+    // created.
     this.#hostOnChange = options.onChange;
     const manager = this.dependencies.createManager({
       ...options,
@@ -412,6 +639,53 @@ class LocalOwningHostService implements OwningHostService {
         // Idempotent, and a retired watch can never be re-added or re-notified.
         watch.active = false;
         if (this.#inventoryWatches.get(watch.id) === watch) this.#inventoryWatches.delete(watch.id);
+      },
+    });
+  }
+
+  watchSessionContent(
+    sessionId: string,
+    listener: OwningHostSessionContentListener,
+  ): OwningHostSessionContentWatch | undefined {
+    if (typeof listener !== "function") {
+      throw new TypeError("session-host: watchSessionContent requires a listener function");
+    }
+    // Capture and registration are one guarded operation over the one manager, so
+    // nothing can change between them without being retained, no duplicate
+    // initial callback is required, and a change that lands while the capture is
+    // reading is delivered to this watch as its first notification.
+    let record: SessionContentWatchRecord | undefined;
+    let initial: OwningHostSessionContentSnapshot | undefined;
+    const snapshot = this.#withInventoryGuard((): OwningHostSessionContentSnapshot | undefined => {
+      for (let attempt = 0; attempt < MAX_CONTENT_CAPTURE_ATTEMPTS; attempt += 1) {
+        const captured = this.#captureSessionContent(sessionId);
+        // A superseded attempt consumed no sequence and published nothing: the
+        // retained change delivers a fresh capture, so re-read once synchronously
+        // rather than installing a snapshot that could mix two row states.
+        if (captured.status === "superseded") continue;
+        if (captured.status === "unavailable") return undefined;
+        initial = captured.snapshot;
+        break;
+      }
+      if (initial === undefined) return undefined;
+      const created: SessionContentWatchRecord = {
+        id: this.#nextWatchId++,
+        sessionId,
+        listener,
+        active: true,
+      };
+      this.#contentWatches.set(created.id, created);
+      record = created;
+      return initial;
+    });
+    if (snapshot === undefined || record === undefined) return undefined;
+    const watch = record;
+    return Object.freeze({
+      snapshot,
+      unsubscribe: (): void => {
+        // Idempotent, and a retired watch can never be re-added or re-notified.
+        watch.active = false;
+        if (this.#contentWatches.get(watch.id) === watch) this.#contentWatches.delete(watch.id);
       },
     });
   }
@@ -533,9 +807,9 @@ class LocalOwningHostService implements OwningHostService {
   }
 
   /**
-   * Run one inventory operation so a manager change arriving inside it is
-   * retained rather than interleaved. Only the outermost frame drains, so nested
-   * work joins one delivery loop instead of recursing into another delivery.
+   * Run one observation so a manager change arriving inside it is retained
+   * rather than interleaved. Only the outermost frame drains, so nested work
+   * joins one delivery loop instead of recursing into another delivery.
    */
   #withInventoryGuard<T>(operation: () => T): T {
     this.#inventoryGuardDepth += 1;
@@ -543,7 +817,7 @@ class LocalOwningHostService implements OwningHostService {
       return operation();
     } finally {
       this.#inventoryGuardDepth -= 1;
-      if (this.#inventoryGuardDepth === 0) this.#drainInventory();
+      if (this.#inventoryGuardDepth === 0) this.#drainWatches();
     }
   }
 
@@ -610,6 +884,164 @@ class LocalOwningHostService implements OwningHostService {
   }
 
   /**
+   * Capture one coherent content observation of one row from the one manager.
+   *
+   * The row listing is read first, then the row's canonical geometry, then its
+   * own surface. The manager's change hook is the only synchronous reentrant
+   * point in a capture, and it can only run from inside a manager call; a change
+   * to this same row while the capture is reading is therefore reported as
+   * superseded and never published, because the tuple, geometry, frame, and
+   * input modes it could see may mix two states. A retained change delivers a
+   * fresh capture once the guard unwinds.
+   *
+   * Every other failure is an honest unavailable observation: a missing or
+   * throwing row, surface, or geometry read, a throwing frame or input-mode read,
+   * host teardown, or an overlapping capture. A frame whose dimensions disagree
+   * with the canonical geometry is a mixed observation too, so it is refused
+   * rather than resized or padded. Nothing is fabricated, no fallback dimensions
+   * are used, and no sequence is consumed by a refused attempt.
+   */
+  #captureSessionContent(sessionId: string): SessionContentCapture {
+    if (this.#contentCapturing) return { status: "unavailable" };
+    const manager = this.#manager;
+    if (manager === undefined || this.dependencies.teardownRequested()) return { status: "unavailable" };
+    this.#contentCapturing = true;
+    this.#contentCaptureSessionId = sessionId;
+    this.#contentCaptureSuperseded = false;
+    try {
+      let row: NativeInstanceView | undefined;
+      try {
+        row = manager.list().find((candidate) => candidate.id === sessionId);
+      } catch {
+        return { status: "unavailable" };
+      }
+      if (row === undefined) return { status: "unavailable" };
+      if (this.#contentCaptureSuperseded) return { status: "superseded" };
+
+      let geometry: SessionGeometry | undefined;
+      try {
+        geometry = manager.instanceGeometry(sessionId);
+      } catch {
+        return { status: "unavailable" };
+      }
+      if (geometry === undefined) return { status: "unavailable" };
+
+      let surface: TerminalSurface | undefined;
+      try {
+        surface = manager.surface(sessionId);
+      } catch {
+        return { status: "unavailable" };
+      }
+      if (surface === undefined) return { status: "unavailable" };
+
+      let observed: { readonly frame: TerminalFrame; readonly inputModes: TerminalInputModes } | undefined;
+      try {
+        observed = { frame: surface.frame(), inputModes: surface.inputModes() };
+      } catch {
+        return { status: "unavailable" };
+      }
+      if (observed === undefined) return { status: "unavailable" };
+      const { frame, inputModes } = observed;
+      if (this.#contentCaptureSuperseded) return { status: "superseded" };
+      // A teardown that began during the read leaves the row unobservable: do not
+      // publish a snapshot for a host that is already closing.
+      if (this.dependencies.teardownRequested()) return { status: "unavailable" };
+      if (frame.cols !== geometry.cols || frame.rows !== geometry.rows) {
+        // A frame at any other size is not this row's canonical content.
+        return { status: "unavailable" };
+      }
+
+      // The sequence is taken only after every fact was read, so a capture can
+      // never publish or roll back a sequence underneath a running one. Past the
+      // safe-integer ceiling this run stops reporting content rather than wrapping.
+      const sequence = this.#contentSequence + 1;
+      if (!Number.isSafeInteger(sequence)) return { status: "unavailable" };
+      this.#contentSequence = sequence;
+      return {
+        status: "observed",
+        snapshot: Object.freeze({
+          hostRunId: this.#hostRunId,
+          sessionId,
+          nativeSession: copyNativeSessionTuple(row.nativeSession),
+          sequence,
+          geometry: Object.freeze({
+            cols: geometry.cols,
+            rows: geometry.rows,
+            revision: geometry.revision,
+          }),
+          frame: copyTerminalFrame(frame),
+          inputModes: Object.freeze({
+            kittyFlags: inputModes.kittyFlags,
+            applicationCursorKeys: inputModes.applicationCursorKeys,
+            applicationKeypad: inputModes.applicationKeypad,
+            bracketedPaste: inputModes.bracketedPaste,
+            mouseTracking: inputModes.mouseTracking,
+            modifyOtherKeys: inputModes.modifyOtherKeys,
+            mouseEncoding: inputModes.mouseEncoding,
+          }),
+        }),
+      };
+    } finally {
+      this.#contentCapturing = false;
+      this.#contentCaptureSessionId = undefined;
+    }
+  }
+
+  /** Select the live watches of each changed row before anything is notified. */
+  #planContentDeliveries(changedIds: readonly string[]): SessionContentDelivery[] {
+    const planned: SessionContentDelivery[] = [];
+    for (const sessionId of changedIds) {
+      const watches = [...this.#contentWatches.values()]
+        .filter((watch) => watch.sessionId === sessionId);
+      if (watches.length > 0) planned.push({ sessionId, watches });
+    }
+    return planned;
+  }
+
+  /**
+   * Capture each affected row once and deliver it to the watches selected for
+   * that row. A retired watch is skipped at call time, even when it was retired
+   * by another listener in this same pass, and each listener's failure stays
+   * contained. Nothing is captured for a row nobody watches.
+   */
+  #deliverSessionContent(planned: readonly SessionContentDelivery[]): void {
+    for (const { sessionId, watches } of planned) {
+      // Every watch selected for this row was retired by a callback before its
+      // turn: capture nothing for a row nobody observes.
+      if (!watches.some((watch) => watch.active)) continue;
+      const captured = this.#captureSessionContent(sessionId);
+      // A same-row change landed during this capture: it is retained, so a newer
+      // capture follows. Publishing this one could mix two row states.
+      if (captured.status === "superseded") continue;
+      const snapshot = captured.status === "observed" ? captured.snapshot : undefined;
+      for (const watch of watches) {
+        if (!watch.active) continue;
+        try {
+          watch.listener(snapshot);
+        } catch {
+          // Contained: content observation is never load-bearing for a row, a
+          // launch, the host's own refresh path, or another watcher.
+        }
+      }
+    }
+  }
+
+  /**
+   * Deliver one manager change to the inventory and the affected content rows.
+   * The affected watch sets are selected before any listener runs, so a watch
+   * installed by a callback — which already captured its own initial snapshot —
+   * never receives this in-flight notification. With no watch at all this does
+   * no capture: no listing, no frame, no input modes.
+   */
+  #deliverChangedRows(changedIds: readonly string[]): void {
+    const inventoryWatched = this.#inventoryWatches.size > 0;
+    const planned = this.#planContentDeliveries(changedIds);
+    if (!inventoryWatched && planned.length === 0) return;
+    if (inventoryWatched) this.#notifyInventory(this.#captureInventory());
+    this.#deliverSessionContent(planned);
+  }
+
+  /**
    * The manager's single change hook. With no watchers this allocates no
    * snapshot at all — ordinary per-row change notifications stay as cheap as
    * they were before this seam existed — and the host's original hook runs
@@ -618,55 +1050,75 @@ class LocalOwningHostService implements OwningHostService {
    */
   #observeManagerChange(instanceId: string): void {
     if (this.#inventoryGuardDepth > 0) {
-      // A change landed inside a capture or a delivery. Retain it: the outermost
-      // frame delivers a newer capture once the in-flight work unwinds, so no
-      // watcher can be handed older rows after newer ones and no revision is
-      // issued from two places at once.
-      this.#inventoryPending = true;
+      // A change landed inside a capture or a delivery. Retain which row changed:
+      // the outermost frame delivers a newer capture once the in-flight work
+      // unwinds, so no watcher is handed older facts after newer ones and no
+      // revision or sequence is issued from two places at once. A change to the
+      // row a capture is reading also marks that capture superseded.
+      this.#pendingChangedIds.add(instanceId);
+      if (instanceId === this.#contentCaptureSessionId) this.#contentCaptureSuperseded = true;
     } else {
-      this.#withInventoryGuard(() => {
-        if (this.#inventoryWatches.size > 0) this.#notifyInventory(this.#captureInventory());
-      });
+      this.#withInventoryGuard(() => this.#deliverChangedRows([instanceId]));
     }
     this.#hostOnChange?.(instanceId);
   }
 
+  /** True while a retained change has at least one live observer to deliver it to. */
+  #hasDeliverablePendingChange(): boolean {
+    // A completed drain leaves nothing retained: never queue a continuation for
+    // an empty pending set, whatever watches still exist.
+    if (this.#pendingChangedIds.size === 0) return false;
+    if (this.#inventoryWatches.size > 0) return true;
+    for (const sessionId of this.#pendingChangedIds) {
+      for (const watch of this.#contentWatches.values()) {
+        if (watch.sessionId === sessionId) return true;
+      }
+    }
+    return false;
+  }
+
   /**
    * Deliver what a reentrant change retained, once the outermost guarded
-   * operation unwound. Each round is one fresh capture delivered to every live
-   * watch, so a watcher only ever moves forward. Rounds are bounded so a watcher
-   * that mutates the manager from its own callback cannot spin the host inside
-   * one manager notification. A change still retained when that bound is
-   * exhausted gets exactly one event-loop continuation, so a finite chain of
-   * callback-driven mutations reaches its final state without depending on an
-   * unrelated change, read, or subscription. The continuation is one-shot per
-   * outstanding retained change — never a poll, never a retry of a listing that
-   * already answered — and the same live-and-active watch checks apply, so a
-   * retired watch is never resurrected.
+   * operation unwound. Each round is one fresh capture per interested observer,
+   * so a watcher only ever moves forward, and only rows that actually changed
+   * are captured. Rounds are bounded so a watcher that mutates the manager from
+   * its own callback cannot spin the host inside one manager notification. A
+   * change still retained when that bound is exhausted gets exactly one
+   * event-loop continuation, so a finite chain of callback-driven mutations
+   * reaches its final state without depending on an unrelated change, read, or
+   * subscription. The continuation is one-shot per outstanding retained change —
+   * never a poll, never a retry of a read that already answered — and the same
+   * live-and-active watch checks apply, so a retired watch is never resurrected.
    */
-  #drainInventory(): void {
-    if (!this.#inventoryPending || this.#inventoryDraining) return;
+  #drainWatches(): void {
+    if (this.#pendingChangedIds.size === 0 || this.#inventoryDraining) return;
     this.#inventoryDraining = true;
     try {
-      for (let round = 0; round < MAX_INVENTORY_DELIVERY_ROUNDS && this.#inventoryPending; round += 1) {
-        this.#inventoryPending = false;
-        if (this.#inventoryWatches.size === 0) continue;
+      for (let round = 0;
+        round < MAX_INVENTORY_DELIVERY_ROUNDS && this.#pendingChangedIds.size > 0;
+        round += 1) {
+        const changedIds = [...this.#pendingChangedIds];
+        this.#pendingChangedIds.clear();
+        const inventoryWatched = this.#inventoryWatches.size > 0;
+        const planned = this.#planContentDeliveries(changedIds);
+        if (!inventoryWatched && planned.length === 0) continue;
         // Guarded inline rather than through #withInventoryGuard, so this loop and
         // not a nested guard exit owns every round.
         this.#inventoryGuardDepth += 1;
         try {
-          this.#notifyInventory(this.#captureInventory());
+          if (inventoryWatched) this.#notifyInventory(this.#captureInventory());
+          this.#deliverSessionContent(planned);
         } finally {
           this.#inventoryGuardDepth -= 1;
         }
       }
     } finally {
       this.#inventoryDraining = false;
-      if (this.#inventoryPending && this.#inventoryWatches.size > 0 && !this.#inventoryDrainScheduled) {
+      if (this.#hasDeliverablePendingChange() && !this.#inventoryDrainScheduled) {
         this.#inventoryDrainScheduled = true;
         setImmediate(() => {
           this.#inventoryDrainScheduled = false;
-          this.#drainInventory();
+          this.#drainWatches();
         });
       }
     }

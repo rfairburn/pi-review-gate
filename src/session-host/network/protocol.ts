@@ -9,9 +9,13 @@
  * - `POST /pair` carries bounded pairing metadata in headers (`x-peer-label` and
  *   an optional `x-peer-key` claim) and no body. It is the only pre-acceptance
  *   path and never creates a session, channel, or application callback.
- * - `GET /app` is a fixed WebSocket upgrade using the exact `pi-peer-app-v1`
- *   subprotocol. It is admitted only after the live TLS peer key matches an
- *   accepted identity and a current directional grant.
+ * - `GET /app` is a fixed WebSocket upgrade using an exact subprotocol. It is
+ *   admitted only after the live TLS peer key matches an accepted identity and
+ *   a current directional grant. The legacy `pi-peer-app-v1` subprotocol is
+ *   unchanged; `pi-peer-content-v1` is an additive opt-in lane on the same
+ *   listener, same path, and same gates that only selects which caller callback
+ *   receives the channel. Neither subprotocol is ever offered as a preference
+ *   list by this transport: a caller names one exact lane.
  *
  * Friendly labels are display metadata, never identity. Identity is always the
  * exact SPKI of the certificate the peer proved possession of during the
@@ -21,13 +25,48 @@
 export const PAIRING_PATH = "/pair";
 export const APP_PATH = "/app";
 export const APP_SUBPROTOCOL = "pi-peer-app-v1";
+/** Additive opt-in lane: a second exact subprotocol on the same `/app` upgrade. */
+export const CONTENT_SUBPROTOCOL = "pi-peer-content-v1";
 export const PEER_LABEL_HEADER = "x-peer-label";
 export const PEER_KEY_HEADER = "x-peer-key";
 
 /** Grants are always inbound to the listener that recorded them. */
 export const GRANT_DIRECTION = "peer->host";
-/** The only capability this adapter knows; no per-session permission policy. */
+/**
+ * The only capability this adapter knows; no per-session permission policy.
+ * It covers the paired application transport family as a whole, so both the
+ * legacy `app` lane and the additive `content` lane require this same grant.
+ * It is not per-lane authority and there is no content-specific capability.
+ */
 export const GRANT_CAPABILITY = "app";
+
+/**
+ * Exact lane of one admitted application connection. A lane selects only which
+ * caller callback receives the channel; it grants nothing and carries no
+ * per-session permission policy.
+ */
+export type PeerAppLane = "app" | "content";
+
+/**
+ * The exact subprotocol a caller must offer for one lane. Each connection names
+ * one protocol; there is no preference list and no version negotiation.
+ */
+export function peerSubprotocolForLane(lane: PeerAppLane): typeof APP_SUBPROTOCOL | typeof CONTENT_SUBPROTOCOL {
+	if (lane === "app") return APP_SUBPROTOCOL;
+	if (lane === "content") return CONTENT_SUBPROTOCOL;
+	throw peerError("INVALID_ARGUMENT");
+}
+
+/**
+ * Derive the lane from the protocol actually negotiated on the wire. Only the
+ * two exact known protocols have a lane; a missing, empty, or unknown protocol
+ * returns `null` and the caller must fail closed.
+ */
+export function peerAppLaneForSubprotocol(protocol: unknown): PeerAppLane | null {
+	if (protocol === APP_SUBPROTOCOL) return "app";
+	if (protocol === CONTENT_SUBPROTOCOL) return "content";
+	return null;
+}
 
 /** Bound on a canonical key id (base64 SPKI DER) carried in a header. */
 export const MAX_PEER_KEY_ID_CHARS = 512;

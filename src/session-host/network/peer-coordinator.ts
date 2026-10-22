@@ -51,13 +51,27 @@
  * minutes, the same window for the local first-use server-key confirmation, and a
  * pairing-response deadline that allows the remote two-minute window plus finite
  * commit/reply overhead. Transport defaults themselves are unchanged.
+ *
+ * The native viewport content lane is wired through THIS coordinator and nothing
+ * else (see `peer-content.ts` for the contracts). Incoming content channels arrive
+ * on the SAME optional listener under the SAME current directional receiving grant,
+ * attached to the SAME owning-host service the roster metadata bridge already uses;
+ * without a content source the listener keeps refusing content upgrades. Outgoing
+ * content is globally singular: at most ONE destination, owner run, and owner row is
+ * selected at a time, over ONE dedicated content channel with ONE reconciler task
+ * and ONE latest intent/viewport, while every other connected host keeps metadata
+ * only. Selecting content never pairs, never creates an identity, never prompts for
+ * or replaces a pin, never implicitly connects or retries, and never disposes the
+ * borrowed destination client. Every new resource is registered through the existing
+ * owned-work tracking and retired through the existing bounded settlement graph, so
+ * an unconfirmed content or inbound-binding retirement stays the sticky, ownership-
+ * retaining failure it already is instead of becoming a fabricated clean close.
  */
 
 import { createHash, randomUUID } from "node:crypto";
 
 import type { OwningHostService } from "../owning-host-service";
 import type {
-	PeerCoordinator,
 	PeerUiCommand,
 	PeerUiConsent,
 	PeerUiHost,
@@ -78,6 +92,30 @@ import {
 	type PeerHost,
 	type PeerPairingRequest,
 } from "./peer-host";
+import {
+	DEFAULT_SESSION_CONTENT_BOUNDS,
+	type SessionContentSnapshot,
+} from "./session-content-protocol";
+import {
+	attachSessionContentViewer,
+	isSessionContentViewerError,
+	type SessionContentViewer,
+} from "./session-content-client";
+import {
+	createSessionContentHost,
+	type SessionContentHost,
+	type SessionContentSource,
+} from "./session-content-host";
+import type {
+	PeerContentController,
+	PeerContentObservation,
+	PeerContentReason,
+	PeerContentState,
+	PeerContentTarget,
+	PeerContentViewport,
+	PeerCoordinatorWithContent,
+	PeerSelectedContent,
+} from "./peer-content";
 import {
 	DEFAULT_PEER_PREFERENCES,
 	MAX_PEER_DESTINATIONS,
@@ -102,7 +140,6 @@ import {
 import { attachRosterBridgeViewer, type RosterBridgeProjection, type RosterBridgeViewer } from "./roster-bridge-client";
 import {
 	createRosterBridgeHost,
-	type RosterBridgeChannelBinding,
 	type RosterBridgeHost,
 } from "./roster-bridge-host";
 import type { RemoteSessionMetadata } from "./roster-metadata";
@@ -217,9 +254,25 @@ export interface PeerCoordinatorOptions {
 	readonly agentDir: string;
 	/** The host's one authoritative inventory source (never a proxy roster). */
 	readonly inventory: Pick<OwningHostService, "watchInventory">;
+	/**
+	 * The SAME owning-host service instance already supplied as `inventory`, narrowed
+	 * to the read-only native viewport capabilities the owner side of the content
+	 * lane needs. It is never a clone or a second roster/content source. Absent means
+	 * this host never accepts an incoming content lane: the listener keeps refusing
+	 * content upgrades exactly as it does today, and no content watch or viewer is
+	 * ever registered. It grants nothing by itself — every protected content request
+	 * is still authorized by the current directional receiving grant.
+	 */
+	readonly contentSource?: SessionContentSource;
 	readonly onChange: (snapshot: PeerUiSnapshot) => void;
 	/** Advisory, exactly-once-per-new-incoming-handle arrival signal. */
 	readonly onIncomingConsentArrival: (consentId: string) => void;
+	/**
+	 * Advisory observation of the globally selected outgoing content stream. It is
+	 * display only: it cannot steal focus or selection, it never means a frame was
+	 * written or received, and a callback that throws is contained here.
+	 */
+	readonly onContentChange?: (observation: PeerContentObservation) => void;
 	/** Test-only seams; there is no insecure production fallback for them. */
 	readonly testHooks?: PeerCoordinatorTestHooks;
 }
@@ -229,6 +282,78 @@ type DestinationState = PeerUiHost["state"];
 interface RosterObservation {
 	readonly state: "never" | "current" | "stale";
 	readonly rows: readonly RemoteSessionMetadata[] | null;
+	/**
+	 * Owner run identity of the last complete observation. A stale observation keeps
+	 * the run it was observed on; `never` is null. The selected content stream is
+	 * fenced against this exact value, so dropping it would let a new owner run be
+	 * mistaken for the one the operator selected.
+	 */
+	readonly hostRunId: string | null;
+}
+
+/**
+ * Structural retirement contract shared by every inbound lane binding this
+ * coordinator owns. Both the roster metadata bridge and the native viewport
+ * content endpoint retire the same way: a bounded local `stop()`, and a `closed`
+ * that settles only once that retirement is positively confirmed (a content
+ * binding rejects it with the endpoint's fixed close error when it is not).
+ */
+interface InboundBinding {
+	/** Exact verified peer identity of the channel this binding serves. */
+	readonly peerKey: PeerKey;
+	/**
+	 * Bounded LOCAL retirement. It resolves only once the endpoint's own resources
+	 * are confirmed released and rejects with the endpoint's fixed close error when
+	 * they are not; it never means the peer saw anything.
+	 */
+	stop(): Promise<void>;
+	readonly closed: Promise<void>;
+}
+
+/**
+ * One live outgoing content endpoint, plus EVERY borrowed fact the attempt was
+ * authorized against. The authority facts are retained precisely so publication
+ * can revalidate them after each await: an endpoint may only publish while the
+ * destination runtime, metadata channel, borrowed client, destination epoch,
+ * current pin, and current local identity are still the ones it started with.
+ */
+interface ContentEndpoint {
+	/** The selection intent this endpoint was opened for. */
+	readonly epoch: number;
+	/** The exact tuple this endpoint may accept content for. */
+	readonly target: PeerContentTarget;
+	readonly channel: PeerByteChannel;
+	readonly viewer: SessionContentViewer;
+	/** The destination runtime this attempt borrowed, by identity. */
+	readonly runtime: DestinationRuntime;
+	/** The metadata channel whose verified key the content channel must match. */
+	readonly metadata: PeerByteChannel;
+	/** The borrowed destination client this endpoint must never dispose. */
+	readonly client: PeerClient;
+	/** Destination epoch at open time; any advance invalidates this endpoint. */
+	readonly destinationEpoch: number;
+}
+
+/** The single global content selection and its honest display state. */
+interface ContentSelection {
+	/** The deliberate target; kept while unavailable, null only when nothing is selected. */
+	desired: PeerContentTarget | null;
+	/** Bumped by every replacement so a superseded attempt can never publish. */
+	epoch: number;
+	/**
+	 * The epoch whose real network attempt is SPENT and must not be silently
+	 * retried. Cleared by a new selection and by any genuine reachability
+	 * transition (connection loss or a roster that stopped holding the target),
+	 * so an existing recovery may restore the same deliberate target once, while
+	 * ordinary repeated roster updates never restart a failed stream.
+	 */
+	spentEpoch: number | null;
+	state: PeerContentState;
+	reason: PeerContentReason | null;
+	view: PeerSelectedContent | undefined;
+	endpoint: ContentEndpoint | null;
+	/** Bounded retirement of the previous endpoint, still owned and undecided. */
+	retirement: Promise<void> | null;
 }
 
 interface DestinationRuntime {
@@ -320,6 +445,105 @@ function copyRoster(rows: readonly RemoteSessionMetadata[] | null): readonly Rem
 	return Object.freeze(rows.map(copyRosterRow));
 }
 
+/** A viewport dimension this endpoint can actually ask the owner for. */
+function isContentDimension(value: unknown, max: number): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= max;
+}
+
+/**
+ * Validate and copy one requested selection. Nothing is ever inferred here: a
+ * target this contract cannot represent is refused as an invalid selection rather
+ * than partially adopted, defaulted to a local row, or matched to a sibling.
+ */
+function normalizeContentTarget(value: unknown): PeerContentTarget | null {
+	if (!isRecord(value)) return null;
+	const { hostId, hostRunId, rowId, selectionGeneration, cols, rows } = value;
+	if (typeof hostId !== "string" || hostId.length === 0) return null;
+	if (typeof hostRunId !== "string" || hostRunId.length === 0) return null;
+	if (typeof rowId !== "string" || rowId.length === 0) return null;
+	if (
+		typeof selectionGeneration !== "number"
+		|| !Number.isSafeInteger(selectionGeneration)
+		|| selectionGeneration < 0
+	) return null;
+	if (!isContentDimension(cols, DEFAULT_SESSION_CONTENT_BOUNDS.maxCols)) return null;
+	if (!isContentDimension(rows, DEFAULT_SESSION_CONTENT_BOUNDS.maxRows)) return null;
+	return Object.freeze({
+		hostId,
+		hostRunId,
+		rowId,
+		selectionGeneration,
+		cols,
+		rows,
+	});
+}
+
+function copyContentTarget(target: PeerContentTarget): PeerContentTarget {
+	return Object.freeze({
+		hostId: target.hostId,
+		hostRunId: target.hostRunId,
+		rowId: target.rowId,
+		selectionGeneration: target.selectionGeneration,
+		cols: target.cols,
+		rows: target.rows,
+	});
+}
+
+function sameContentTarget(left: PeerContentTarget, right: PeerContentTarget): boolean {
+	return left.hostId === right.hostId
+		&& left.hostRunId === right.hostRunId
+		&& left.rowId === right.rowId
+		&& left.selectionGeneration === right.selectionGeneration
+		&& left.cols === right.cols
+		&& left.rows === right.rows;
+}
+
+/**
+ * Map one failed content-channel open onto a fixed code. A content open never
+ * asks a human: its per-connection server-key approver rejects, so a missing or
+ * changed key is reported as such and nothing is retried or re-prompted.
+ */
+function contentOpenReason(error: unknown): PeerContentReason {
+	if (!isPeerTransportError(error)) return "open-failed";
+	switch (error.code) {
+		case "PEER_KEY_CHANGED":
+		case "PEER_KEY_MISMATCH":
+			return "key-changed";
+		case "PEER_KEY_REJECTED":
+		case "PEER_KEY_CANCELLED":
+		case "PEER_KEY_APPROVER_FAILED":
+			return "key-unavailable";
+		case "APP_REFUSED":
+			return error.statusCode === 403 ? "not-authorized" : "open-failed";
+		default:
+			return "open-failed";
+	}
+}
+
+/** Map one retired content viewer failure onto a fixed code. */
+function contentViewerReason(error: unknown): PeerContentReason {
+	if (isSessionContentViewerError(error)) {
+		switch (error.code) {
+			case "refused":
+				return "owner-refused";
+			case "timeout":
+				return "subscription-timeout";
+			case "protocol-violation":
+				return "protocol-violation";
+			case "send-failed":
+				return "send-failed";
+			case "transfer-failed":
+				return "transfer-failed";
+			case "channel-closed":
+			case "unavailable":
+				return "content-lost";
+			case "stopped":
+				return "connection-lost";
+		}
+	}
+	return contentOpenReason(error);
+}
+
 function pairFailure(result: PeerPairResult): PeerFailure {
 	if (result.status === "denied") return { terminal: true, message: HOST_MESSAGE.pairingDenied };
 	if (result.status === "timeout") return { terminal: true, message: HOST_MESSAGE.pairingExpired };
@@ -407,7 +631,7 @@ function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
 	});
 }
 
-class OwnedPeerCoordinator implements PeerCoordinator {
+class OwnedPeerCoordinator implements PeerCoordinatorWithContent {
 	readonly #options: PeerCoordinatorOptions;
 	readonly #consentWindowMs: number;
 	readonly #autoReconnectDelaysMs: readonly number[];
@@ -418,7 +642,7 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 
 	readonly #runtime = new Map<string, DestinationRuntime>();
 	readonly #consents = new Map<string, PendingConsent>();
-	readonly #inboundBindings = new Map<string, RosterBridgeChannelBinding[]>();
+	readonly #inboundBindings = new Map<string, InboundBinding[]>();
 	readonly #suppressionOverride = new Set<string>();
 	/**
 	 * Lifecycle-local receiving denials. A Revoke whose persistence fails must
@@ -450,6 +674,41 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 	#preferencesStore: PeerPreferencesStore | null = null;
 	#trustStore: PeerStateStore | null = null;
 	#bridge: RosterBridgeHost | null = null;
+	/**
+	 * Owner side of the native viewport content lane, created only when the caller
+	 * supplied the same owning-host service as a content source. Creating it binds
+	 * nothing and watches nothing: the transport only offers the content lane when
+	 * this coordinator hands it a receiver, which happens only for an actual listener.
+	 */
+	#contentHost: SessionContentHost | null = null;
+	/**
+	 * Sticky content-retirement uncertainty. A content endpoint whose bounded local
+	 * retirement could not be positively confirmed stays owned by this lifecycle:
+	 * shutdown rejects instead of reporting a settled close, and a transport-level
+	 * channel close is never taken as proof that the endpoint's own resources are gone.
+	 */
+	#contentCleanupUnconfirmed = false;
+	/** Abort signal of the ONE pending content-channel open, if any. */
+	#contentAbort: AbortController | null = null;
+	readonly #content: ContentSelection = {
+		desired: null,
+		epoch: 0,
+		spentEpoch: null,
+		state: "none",
+		reason: null,
+		view: undefined,
+		endpoint: null,
+		retirement: null,
+	};
+	/** True while the ONE content reconciler task is running. */
+	#contentPumping = false;
+	/** True when the newest intent still needs a reconciler pass (latest-only work). */
+	#contentDirty = false;
+	readonly #contentController: PeerContentController = {
+		selectContent: (target: PeerContentTarget | null): void => this.#selectContent(target),
+		updateContentViewport: (viewport: PeerContentViewport): void => this.#updateContentViewport(viewport),
+		readContent: (): PeerContentObservation => this.#readContent(),
+	};
 	#host: PeerHost | null = null;
 	#preferences: PeerPreferences | null = null;
 	#preferencesLoaded = false;
@@ -491,6 +750,16 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 		if (this.#closed) return Promise.resolve();
 		if (this.#startPromise === null) this.#startPromise = this.#track(this.#start());
 		return this.#startPromise;
+	}
+
+	/**
+	 * The one selected-content controller. It exists from construction, before any
+	 * selection and before startup, and using it creates no channel, watch, viewer,
+	 * identity, file, or timer until an explicit selection targets an already
+	 * connected destination whose current roster really holds that run and row.
+	 */
+	get content(): PeerContentController {
+		return this.#contentController;
 	}
 
 	read(): PeerUiSnapshot {
@@ -639,6 +908,22 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 			this.#bridge = null;
 		}
 
+		// Constructing the owner-side content endpoint allocates no socket, watch,
+		// viewer, or timer; it becomes reachable only through a listener this
+		// coordinator actually starts, and only when the caller supplied its own
+		// owning-host service as the content source. Without it the transport keeps
+		// refusing content upgrades, exactly as a metadata-only host does today.
+		if (this.#options.contentSource !== undefined) {
+			try {
+				this.#contentHost = createSessionContentHost({
+					source: this.#options.contentSource,
+					authorizePeer: (peerKey) => this.#authorizeContentPeer(peerKey),
+				});
+			} catch {
+				this.#contentHost = null;
+			}
+		}
+
 		this.#started = true;
 		this.#emit();
 
@@ -659,6 +944,10 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 		//    handles) and every automatic attempt/timer before any await.
 		for (const entry of [...this.#consents.values()]) entry.release();
 		this.#consents.clear();
+		// The selected content stream is local state too: its display clears and its
+		// endpoint is retired before the first await, so no continuation can publish a
+		// view after close has latched admission.
+		this.#clearContentForShutdown();
 		for (const runtime of this.#runtime.values()) {
 			runtime.epoch += 1;
 			if (runtime.retryTimer !== null) {
@@ -672,9 +961,7 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 			runtime.state = "disconnected";
 			runtime.message = null;
 			// The final display state is last-observed, never fabricated current.
-			runtime.roster = runtime.roster.rows === null
-				? { state: "never", rows: null }
-				: { state: "stale", rows: runtime.roster.rows };
+			this.#markRosterStale(runtime);
 		}
 
 		// 2. Settle this side's local network resources. Listener teardown is bounded
@@ -691,6 +978,27 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 				await bridge.stopAll();
 			} catch {
 				confirmed = false;
+			}
+		}
+		// The content endpoint retires its own watch and viewer within its own bounded
+		// API. A rejected `stopAll()` means at least one binding's local retirement is
+		// NOT confirmed: the endpoint retains that evidence and refuses further
+		// attaches, and this coordinator keeps the reference and rejects shutdown
+		// instead of claiming a settled close. A fulfilled one is not treated as remote
+		// receipt — nothing here ever waits for a peer.
+		const contentHost = this.#contentHost;
+		if (contentHost !== null) {
+			let contentSettled = true;
+			try {
+				await contentHost.stopAll();
+			} catch {
+				contentSettled = false;
+			}
+			if (contentSettled) {
+				this.#contentHost = null;
+			} else {
+				confirmed = false;
+				this.#contentCleanupUnconfirmed = true;
 			}
 		}
 
@@ -724,9 +1032,12 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 			confirmed
 			&& !this.#resourceCleanupFailed
 			&& !this.#listenerRetirementUnconfirmed
+			&& !this.#contentCleanupUnconfirmed
+			&& this.#content.endpoint === null
 			&& resourcesSettled
 			&& this.#host === null
 			&& this.#bridge === null
+			&& this.#contentHost === null
 			&& this.#consents.size === 0
 			&& this.#listener.state !== "listening";
 		if (!settled) throw new PeerCoordinatorCloseError();
@@ -860,6 +1171,11 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 		this.#emit();
 
 		let hostInstance: PeerHost;
+		// The content lane is offered only while this coordinator owns an owner-side
+		// content endpoint. Without one the transport keeps its existing
+		// `unsupported_subprotocol` refusal, so an opt-out host stays metadata-only and
+		// no content channel can ever reach a receiver.
+		const contentHost = this.#contentHost;
 		try {
 			hostInstance = createPeerHost({
 				identity,
@@ -867,6 +1183,9 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 				grants: store.grants,
 				onPairingRequest: (request) => this.#onPairingRequest(request),
 				onAppChannel: (channel) => this.#onAppChannel(channel),
+				...(contentHost === null
+					? {}
+					: { onContentChannel: (channel: PeerByteChannel): void => this.#onContentChannel(contentHost, channel) }),
 				bounds: {
 					consentTimeoutMs: this.#consentWindowMs,
 					// The first-use server-key decision happens BEFORE any HTTP byte is
@@ -903,14 +1222,60 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 	}
 
 	/**
-	 * Take every inbound binding currently owned by the listener transport. The
-	 * caller retires them as part of the same owned, settled teardown.
+	 * Take every inbound binding currently owned by the listener transport — metadata
+	 * and content lane alike. The caller retires them as part of the same owned,
+	 * settled teardown, and re-registers any whose retirement was not confirmed.
 	 */
-	#takeInboundBindings(): RosterBridgeChannelBinding[] {
-		const bindings: RosterBridgeChannelBinding[] = [];
+	#takeInboundBindings(): InboundBinding[] {
+		const bindings: InboundBinding[] = [];
 		for (const list of this.#inboundBindings.values()) bindings.push(...list);
 		this.#inboundBindings.clear();
 		return bindings;
+	}
+
+	/**
+	 * Re-register bindings whose bounded retirement could not be confirmed, so the
+	 * next listener sweep or shutdown still owns them. Ownership is released only by a
+	 * positively confirmed settlement, never by an error being noticed and dropped.
+	 */
+	#retainInboundBindings(bindings: readonly InboundBinding[]): void {
+		for (const binding of bindings) {
+			const keyId = binding.peerKey.keyId;
+			const list = this.#inboundBindings.get(keyId) ?? [];
+			if (!list.includes(binding)) list.push(binding);
+			this.#inboundBindings.set(keyId, list);
+		}
+	}
+
+	/**
+	 * Register one admitted inbound binding under its exact verified key id. Its
+	 * `closed` promise settles only after that endpoint's own bounded retirement, so a
+	 * fulfillment is the only thing that releases local ownership here; a rejection is
+	 * recorded as sticky unconfirmed cleanup — the binding stays registered, a later
+	 * sweep still owns it, shutdown rejects, and no further listener bind is allowed
+	 * over resources this process cannot prove it released.
+	 */
+	#trackInboundBinding(keyId: string, binding: InboundBinding): void {
+		const list = this.#inboundBindings.get(keyId) ?? [];
+		list.push(binding);
+		this.#inboundBindings.set(keyId, list);
+		void binding.closed.then(
+			() => this.#releaseInboundBinding(keyId, binding),
+			() => {
+				this.#resourceCleanupFailed = true;
+				this.#noteListenerRetirementUnconfirmed();
+				this.#retainInboundBindings([binding]);
+				this.#emit();
+			},
+		);
+	}
+
+	#releaseInboundBinding(keyId: string, binding: InboundBinding): void {
+		const current = this.#inboundBindings.get(keyId);
+		if (current === undefined) return;
+		const index = current.indexOf(binding);
+		if (index >= 0) current.splice(index, 1);
+		if (current.length === 0) this.#inboundBindings.delete(keyId);
 	}
 
 	/**
@@ -920,7 +1285,7 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 	 */
 	#startListenerRetirement(
 		hostInstance: PeerHost | null,
-		bindings: readonly RosterBridgeChannelBinding[],
+		bindings: readonly InboundBinding[],
 	): Promise<boolean> {
 		const retirement = this.#retireListener(hostInstance, bindings);
 		const pending = retirement.then(() => undefined, () => undefined);
@@ -937,7 +1302,7 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 	 */
 	async #retireListener(
 		hostInstance: PeerHost | null,
-		bindings: readonly RosterBridgeChannelBinding[],
+		bindings: readonly InboundBinding[],
 	): Promise<boolean> {
 		let confirmed = true;
 		if (hostInstance !== null) {
@@ -952,6 +1317,10 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 		}
 		const results = await Promise.allSettled(bindings.map((binding) => binding.stop()));
 		if (results.some((result) => result.status === "rejected")) confirmed = false;
+		// A binding that refused to settle is still owned: put it back so a later sweep
+		// or shutdown retires it again rather than forgetting it with the failure.
+		const retained = bindings.filter((_binding, index) => results[index]?.status === "rejected");
+		if (retained.length > 0) this.#retainInboundBindings(retained);
 		if (!confirmed) this.#noteListenerRetirementUnconfirmed();
 		return confirmed;
 	}
@@ -1023,6 +1392,17 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 	}
 
 	// ------------------------------------------------------------ receiving side
+
+	/**
+	 * Incoming content authority is the SAME current directional receiving grant as
+	 * metadata, plus the lifecycle the grant read alone does not observe: a closing
+	 * or tearing-down coordinator authorizes nothing new. It never reads the opposite
+	 * direction, never consults a selected outgoing target, and creates no grant.
+	 */
+	#authorizeContentPeer(peerKey: PeerKey): boolean {
+		if (this.#closed || this.#tearingDown) return false;
+		return this.#authorizePeer(peerKey);
+	}
 
 	#authorizePeer(peerKey: PeerKey): boolean {
 		if (this.#receiverDenials.has(peerKey.keyId)) return false;
@@ -1110,18 +1490,37 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 		}
 		try {
 			const binding = bridge.attach(channel);
-			const keyId = channel.peerKey.keyId;
-			const list = this.#inboundBindings.get(keyId) ?? [];
-			list.push(binding);
-			this.#inboundBindings.set(keyId, list);
-			void binding.closed.then(() => {
-				const current = this.#inboundBindings.get(keyId);
-				if (current === undefined) return;
-				const index = current.indexOf(binding);
-				if (index >= 0) current.splice(index, 1);
-				if (current.length === 0) this.#inboundBindings.delete(keyId);
-			}, () => undefined);
+			this.#trackInboundBinding(channel.peerKey.keyId, binding);
 		} catch {
+			void channel.close().catch(() => undefined);
+		}
+	}
+
+	/**
+	 * Admit one inbound native viewport channel. It arrives on the SAME listener
+	 * under the SAME directional receiving grant as metadata, is attached to the SAME
+	 * owning-host service the roster bridge already uses, and is retired by the same
+	 * listener teardown/Revoke graph. There is no second receiving authority, store,
+	 * or listener here, and the endpoint itself re-checks authority before every
+	 * protected write.
+	 */
+	#onContentChannel(contentHost: SessionContentHost, channel: PeerByteChannel): void {
+		if (
+			this.#contentHost !== contentHost
+			|| this.#closed
+			|| this.#tearingDown
+			|| !this.#authorizeContentPeer(channel.peerKey)
+		) {
+			void channel.close().catch(() => undefined);
+			return;
+		}
+		try {
+			const binding = contentHost.attach(channel);
+			this.#trackInboundBinding(channel.peerKey.keyId, binding);
+		} catch {
+			// The endpoint refuses a channel that is not on the content lane, and refuses
+			// while its own retirement is unconfirmed. Either way nothing is installed and
+			// only this channel is closed.
 			void channel.close().catch(() => undefined);
 		}
 	}
@@ -1212,7 +1611,7 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 			id: destination.id,
 			state: "disconnected",
 			message: null,
-			roster: { state: "never", rows: null },
+			roster: { state: "never", rows: null, hostRunId: null },
 			autoAttempts: 0,
 			retryTimer: null,
 			mode: null,
@@ -1400,9 +1799,11 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 		runtime.mode = null;
 		runtime.state = "disconnected";
 		runtime.message = message;
-		runtime.roster = runtime.roster.rows === null
-			? { state: "never", rows: null }
-			: { state: "stale", rows: runtime.roster.rows };
+		this.#markRosterStale(runtime);
+		// A destination that stopped carrying its connection cannot carry content
+		// either: the authorized view is cleared and its endpoint retired immediately,
+		// while the deliberate selection is kept as an honest `unavailable`.
+		this.#contentLostHost(id, "connection-lost");
 		// Register the retirement BEFORE publishing the disconnected snapshot, so
 		// an immediate close() sees the still-owned connection.
 		this.#retireDestinationResources(runtime);
@@ -1568,7 +1969,7 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 			runtime.state = "connected";
 			runtime.message = null;
 			runtime.autoAttempts = 0;
-			runtime.roster = { state: "never", rows: null };
+			runtime.roster = { state: "never", rows: null, hostRunId: null };
 			this.#markPreviouslyConnected(id);
 			this.#emit();
 			this.#watchChannel(runtime, epoch, channel);
@@ -1621,9 +2022,8 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 		runtime.mode = null;
 		runtime.state = "disconnected";
 		runtime.message = HOST_MESSAGE.connectionLost;
-		runtime.roster = runtime.roster.rows === null
-			? { state: "never", rows: null }
-			: { state: "stale", rows: runtime.roster.rows };
+		this.#markRosterStale(runtime);
+		this.#contentLostHost(runtime.id, "connection-lost");
 		this.#retireDestinationResources(runtime);
 		this.#emit();
 		this.#scheduleRetry(runtime.id);
@@ -1672,14 +2072,682 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 		// complete snapshot.
 		const observed = projection.revision !== null && projection.hostRunId !== null;
 		if (!observed) {
-			runtime.roster = { state: "never", rows: null };
+			runtime.roster = { state: "never", rows: null, hostRunId: null };
 		} else {
 			runtime.roster = {
 				state: projection.state === "current" ? "current" : "stale",
 				rows: copyRoster(projection.rows),
+				// The owner run identity is a load-bearing fact, not decoration: the one
+				// selected content stream is fenced against this exact value, so a new
+				// owner run can never be mistaken for the run the operator selected.
+				hostRunId: projection.hostRunId,
 			};
 		}
 		this.#emit();
+		// A projection is the only thing that can make a deliberate selection reachable
+		// again: an existing Auto reconnect that brings the SAME exact owner run and row
+		// back may restore that one selection, and a projection that no longer holds it
+		// stops claiming content. Nothing here connects, retries, pairs, or retargets.
+		this.#reconcileContentWithRoster(runtime.id);
+	}
+
+	// ------------------------------------------------------ selected content lane
+
+	/**
+	 * Immutable copy of the single global content observation. The published viewport
+	 * itself is the endpoint's own deep-frozen object and is handed over unchanged.
+	 */
+	#readContent(): PeerContentObservation {
+		const selection = this.#content;
+		const view = selection.view;
+		return Object.freeze({
+			target: selection.desired === null ? null : copyContentTarget(selection.desired),
+			state: selection.state,
+			view: view === undefined
+				? undefined
+				: Object.freeze({
+					hostId: view.hostId,
+					selectionGeneration: view.selectionGeneration,
+					snapshot: view.snapshot,
+				}),
+			reason: selection.reason,
+		});
+	}
+
+	/**
+	 * Hand the current observation to the advisory content callback. It is display
+	 * only — it cannot steal focus or selection — and a callback that throws is
+	 * contained here rather than allowed to gate content state.
+	 */
+	#publishContent(): void {
+		const callback = this.#options.onContentChange;
+		if (callback === undefined) return;
+		try {
+			callback(this.#readContent());
+		} catch {
+			// The observation is advisory; the state it describes already landed.
+		}
+	}
+
+	#selectContent(target: PeerContentTarget | null): void {
+		// Admission is latched by close(): a later selection is inert.
+		if (this.#closed) return;
+		const selection = this.#content;
+		if (target === null) {
+			// Local sessions and passive viewing select nothing. Clearing is immediate and
+			// queues no remote notice beyond this endpoint's own bounded retirement.
+			this.#replaceContentIntent({ desired: null, state: "none", reason: null });
+			return;
+		}
+		const next = normalizeContentTarget(target);
+		if (next === null) {
+			// An unusable selection is reported, never guessed at: no local row, no
+			// sibling destination, and no partial adoption of the fields that did look
+			// representable.
+			this.#replaceContentIntent({ desired: null, state: "unavailable", reason: "invalid-selection" });
+			return;
+		}
+		const desired = selection.desired;
+		if (desired !== null && next.selectionGeneration < desired.selectionGeneration) {
+			// A stale generation from a superseded UI selection changes nothing at all.
+			return;
+		}
+		if (desired !== null && sameContentTarget(desired, next)) {
+			// Re-selecting the identical target is a no-op. It never tears down and
+			// reopens a live stream, and it is never a disguised retry of a stream that
+			// already failed or was lost: only a new selection or a fresh roster
+			// observation of the already-selected target can start another attempt.
+			return;
+		}
+		this.#replaceContentIntent({ desired: next, state: "connecting", reason: null });
+	}
+
+	/**
+	 * Replace the intent synchronously: the current view is gone, a pending open is
+	 * abandoned, and the previous endpoint's bounded retirement is registered before
+	 * this call returns, so a late acknowledgement for the old target can never
+	 * resurrect it and one click can never queue unbounded work.
+	 */
+	#replaceContentIntent(next: {
+		desired: PeerContentTarget | null;
+		state: PeerContentState;
+		reason: PeerContentReason | null;
+	}): void {
+		const selection = this.#content;
+		selection.epoch += 1;
+		selection.spentEpoch = null;
+		selection.desired = next.desired;
+		selection.view = undefined;
+		selection.state = next.state;
+		selection.reason = next.reason;
+		this.#retireContentEndpoint();
+		this.#publishContent();
+		if (next.desired !== null) this.#requestContentPump();
+	}
+
+	#updateContentViewport(viewport: PeerContentViewport): void {
+		if (this.#closed) return;
+		const selection = this.#content;
+		const desired = selection.desired;
+		if (desired === null) return;
+		if (!isRecord(viewport)) return;
+		if (viewport.selectionGeneration !== desired.selectionGeneration) return;
+		if (
+			!isContentDimension(viewport.cols, DEFAULT_SESSION_CONTENT_BOUNDS.maxCols)
+			|| !isContentDimension(viewport.rows, DEFAULT_SESSION_CONTENT_BOUNDS.maxRows)
+		) return;
+		if (viewport.cols === desired.cols && viewport.rows === desired.rows) return;
+		// Latest-only: the newest size replaces the pending one, and an endpoint that is
+		// not attached yet picks these dimensions up when it attaches. No per-resize
+		// promise, and no re-derivation of the owner's canonical geometry.
+		selection.desired = Object.freeze({ ...desired, cols: viewport.cols, rows: viewport.rows });
+		const endpoint = selection.endpoint;
+		if (endpoint !== null && endpoint.epoch === selection.epoch) {
+			try {
+				endpoint.viewer.resize(viewport.cols, viewport.rows);
+			} catch {
+				// An endpoint that already retired ignores a resize; an invalid size was
+				// refused above. Either way nothing accumulates and nothing restarts.
+			}
+		}
+		this.#publishContent();
+	}
+
+	/**
+	 * Ask the ONE content reconciler for a pass over the NEWEST intent.
+	 *
+	 * There is exactly one reconciler task per coordinator, independent of the
+	 * selection epoch. Replacing a selection never starts a second task: it marks
+	 * the work dirty, aborts the superseded open, and registers the superseded
+	 * endpoint's bounded retirement, and the running task joins that retirement and
+	 * then consumes only the newest intent. An arbitrary burst of selections
+	 * therefore produces at most one outstanding reconciler and one outstanding
+	 * open, never a promise per click waiting on the same retirement.
+	 */
+	#requestContentPump(): void {
+		if (this.#closed || this.#tearingDown) return;
+		this.#contentDirty = true;
+		if (this.#contentPumping) return;
+		this.#contentPumping = true;
+		// The reconciler is owned tracked work that never rejects into the harness: an
+		// unexpected fault can leave local resources whose release cannot be proven,
+		// so it becomes sticky content-cleanup uncertainty instead of an unhandled
+		// rejection or a claim of a settled close.
+		const pass = this.#runContentPump().then(
+			(): undefined => undefined,
+			(): undefined => {
+				this.#contentCleanupUnconfirmed = true;
+				return undefined;
+			},
+		);
+		void this.#track(pass);
+	}
+
+	/**
+	 * The one tracked reconciler task. It stays the single owner of content work until
+	 * nothing is dirty any more, so every pass it runs is inside the promise shutdown
+	 * awaits, and a request that landed while a pass was unwinding still gets its pass.
+	 */
+	async #runContentPump(): Promise<void> {
+		try {
+			for (;;) {
+				await this.#reconcileContent();
+				if (!this.#contentDirty || this.#closed || this.#tearingDown) return;
+			}
+		} finally {
+			this.#contentPumping = false;
+		}
+	}
+
+	/**
+	 * The single reconciler loop. Each pass works on the newest intent only, and a
+	 * pass re-runs when a newer intent landed while it was awaiting, so supersession
+	 * converges on the latest selection instead of stacking attempts.
+	 */
+	async #reconcileContent(): Promise<void> {
+		while (this.#contentDirty) {
+			this.#contentDirty = false;
+			if (this.#closed || this.#tearingDown) return;
+			const selection = this.#content;
+			const epoch = selection.epoch;
+			if (selection.desired === null) return;
+			// Already streaming this exact intent, or its real attempt is spent: no
+			// second stream and no silent retry until a new selection or a genuine
+			// reachability transition re-arms the intent.
+			if (selection.endpoint !== null && selection.endpoint.epoch === epoch) continue;
+			if (selection.spentEpoch === epoch) continue;
+			const retiring = selection.retirement;
+			if (retiring !== null) {
+				// One superseded endpoint retires (bounded by its own deadline) before
+				// another subscription is installed, so replacements can never stack.
+				try {
+					await retiring;
+				} catch {
+					// The retirement recorded its own uncertainty; nothing is retried here.
+				}
+				if (this.#closed || this.#tearingDown) return;
+				// Superseded while joining: loop and consume the newest intent instead.
+				if (selection.epoch !== epoch) {
+					this.#contentDirty = true;
+					continue;
+				}
+				if (selection.desired === null) return;
+				if (selection.spentEpoch === epoch) continue;
+				if (selection.endpoint !== null && selection.endpoint.epoch === epoch) continue;
+			}
+			await this.#openContentAttempt(epoch);
+			if (this.#closed || this.#tearingDown) return;
+			// A replacement that landed during the attempt is handled by the next pass.
+			if (selection.epoch !== epoch) this.#contentDirty = true;
+		}
+	}
+
+	/** True only while this intent still owns the single content selection. */
+	#contentIntentCurrent(epoch: number): boolean {
+		return !this.#closed && !this.#tearingDown && this.#content.epoch === epoch;
+	}
+
+	/**
+	 * Revalidate everything an ALREADY opened endpoint was authorized against. A
+	 * live endpoint may publish only while its own borrowed destination runtime,
+	 * metadata channel, client, and destination epoch are still current, the roster
+	 * still holds the exact run and row, the remembered pin still matches the live
+	 * metadata key, and this side still holds the identity that client proves. This
+	 * is the after-await half of the same fence, not a second, weaker one.
+	 */
+	#contentEndpointFence(endpoint: ContentEndpoint): PeerContentReason | null {
+		if (endpoint.runtime.state !== "connected") return "connection-lost";
+		if (endpoint.runtime.channel !== endpoint.metadata) return "connection-lost";
+		if (endpoint.runtime.client !== endpoint.client) return "connection-lost";
+		if (endpoint.runtime.epoch !== endpoint.destinationEpoch) return "connection-lost";
+		const refusal = this.#contentTargetFence(endpoint.runtime, endpoint.target);
+		if (refusal !== null) return refusal;
+		if (!peerKeysEqual(endpoint.channel.peerKey, endpoint.metadata.peerKey)) return "key-changed";
+		return null;
+	}
+
+	/** Clear and retire the current endpoint because an authority fence failed. */
+	#contentFenceFailed(epoch: number, refusal: PeerContentReason): void {
+		this.#setContentUnavailable(epoch, refusal, false);
+	}
+
+	/**
+	 * Everything that must hold before a content channel may be opened or used for a
+	 * target: an actually connected destination, a complete CURRENT roster whose exact
+	 * owner run contains the exact owner row, a remembered pin equal to the key the
+	 * live metadata channel actually proved, and this side's current identity matching
+	 * the borrowed client. Every failure is a fixed reason with no fallback selection.
+	 */
+	#contentTargetFence(runtime: DestinationRuntime, target: PeerContentTarget): PeerContentReason | null {
+		if (runtime.state !== "connected" || runtime.channel === null || runtime.client === null) {
+			return "destination-unavailable";
+		}
+		const roster = runtime.roster;
+		if (roster.state !== "current" || roster.rows === null) return "roster-unavailable";
+		if (roster.hostRunId === null) return "roster-unavailable";
+		if (roster.hostRunId !== target.hostRunId) return "run-changed";
+		if (!roster.rows.some((row) => row.id === target.rowId)) return "row-unavailable";
+		const pin = this.#readPin(runtime.id);
+		if (pin === null) return "key-unavailable";
+		if (!peerKeysEqual(pin, runtime.channel.peerKey)) return "key-changed";
+		const identity = this.#currentIdentity();
+		if (identity === null) return "identity-unavailable";
+		if (!peerKeysEqual(identity.key, runtime.client.key)) return "identity-unavailable";
+		return null;
+	}
+
+	/**
+	 * Open ONE content endpoint for one intent. Every fact the attempt depends on is
+	 * checked before and re-checked after each await, so a superseded or falsified
+	 * attempt attaches nothing, a late channel is closed instead, and a live endpoint
+	 * keeps proving the same fences before it publishes anything.
+	 *
+	 * The bounded retirement of a superseded endpoint is joined by the reconciler
+	 * loop, never here, so this function is the only outstanding open at a time.
+	 */
+	async #openContentAttempt(epoch: number): Promise<void> {
+		const selection = this.#content;
+		if (!this.#contentIntentCurrent(epoch)) return;
+		let target = selection.desired;
+		if (target === null) return;
+		const runtime = this.#runtime.get(target.hostId);
+		if (runtime === undefined) {
+			this.#setContentUnavailable(epoch, "destination-unavailable", true);
+			return;
+		}
+		const refusal = this.#contentTargetFence(runtime, target);
+		if (refusal !== null) {
+			this.#setContentUnavailable(epoch, refusal, true);
+			return;
+		}
+		const destination = this.#destination(target.hostId);
+		const metadata = runtime.channel;
+		const client = runtime.client;
+		if (destination === undefined || metadata === null || client === null) {
+			this.#setContentUnavailable(epoch, "destination-unavailable", true);
+			return;
+		}
+		const destinationEpoch = runtime.epoch;
+		const abort = new AbortController();
+		this.#contentAbort = abort;
+		let channel: PeerByteChannel;
+		try {
+			// The borrowed destination client only. This per-connection approver rejects, so
+			// a missing or changed key fails closed instead of prompting, pairing, creating
+			// an identity, replacing a pin, or connecting anything new.
+			channel = await client.connectApp({
+				host: destination.host,
+				port: destination.port,
+				lane: "content",
+				approveServerKey: () => "reject" as const,
+				signal: abort.signal,
+			});
+		} catch (error) {
+			if (this.#contentAbort === abort) this.#contentAbort = null;
+			if (!this.#contentIntentCurrent(epoch)) return;
+			this.#setContentUnavailable(epoch, contentOpenReason(error), false);
+			return;
+		}
+		if (this.#contentAbort === abort) this.#contentAbort = null;
+		const abandon = async (reason: PeerContentReason): Promise<void> => {
+			// A late channel for a superseded intent is closed, never attached, and the
+			// reconciler stays occupied until that bounded LOCAL close settles: an
+			// abandoned channel is still owned work, so the pump must never consume a
+			// replacement intent or subscribe elsewhere while it is outstanding. The close
+			// is tracked, and an unconfirmed close stays a real failure.
+			const closing = (async (): Promise<void> => {
+				try {
+					await channel.close();
+				} catch {
+					this.#contentCleanupUnconfirmed = true;
+					this.#resourceCleanupFailed = true;
+				}
+			})();
+			if (this.#contentIntentCurrent(epoch)) this.#setContentUnavailable(epoch, reason, false);
+			await this.#track(closing);
+		};
+		// Re-check every fence after the await, including the latest viewport intent, the
+		// exact destination runtime/channel/client references this attempt borrowed, and
+		// the exact TLS identity the content channel actually proved.
+		target = selection.desired;
+		const current = target === null ? undefined : this.#runtime.get(target.hostId);
+		if (target === null || current === undefined) {
+			await abandon("destination-unavailable");
+			return;
+		}
+		// A reference or epoch mismatch is its own honest reason: the target fence can
+		// still succeed while the borrowed references this attempt was authorized
+		// against have already been replaced, and that attempt must never attach.
+		if (
+			current !== runtime
+			|| metadata !== current.channel
+			|| client !== current.client
+			|| current.epoch !== destinationEpoch
+		) {
+			await abandon("connection-lost");
+			return;
+		}
+		const refusalAfter = this.#contentTargetFence(current, target);
+		if (refusalAfter !== null) {
+			await abandon(refusalAfter);
+			return;
+		}
+		if (!this.#contentIntentCurrent(epoch)) {
+			await abandon("connection-lost");
+			return;
+		}
+		if (channel.lane !== "content" || !peerKeysEqual(channel.peerKey, metadata.peerKey)) {
+			await abandon("key-changed");
+			return;
+		}
+		let live: ContentEndpoint | null = null;
+		let viewer: SessionContentViewer;
+		try {
+			viewer = attachSessionContentViewer({
+				channel,
+				hostRunId: target.hostRunId,
+				sessionId: target.rowId,
+				cols: target.cols,
+				rows: target.rows,
+				onSnapshot: (snapshot): void => {
+					if (live !== null) this.#onContentSnapshot(live, snapshot);
+				},
+			});
+		} catch {
+			// Attaching refused before a handler was installed: only this channel is closed.
+			await abandon("owner-refused");
+			return;
+		}
+		// The endpoint carries every authority fact it was opened against, so every
+		// later publication can re-prove them instead of trusting this await's
+		// snapshot of the world.
+		live = Object.freeze({
+			epoch,
+			target,
+			channel,
+			viewer,
+			runtime,
+			metadata,
+			client,
+			destinationEpoch,
+		});
+		selection.endpoint = live;
+		const retired = (): void => {
+			if (live !== null) this.#onContentEndpointClosed(live);
+		};
+		void viewer.closed.then(retired, retired);
+		this.#publishContent();
+		try {
+			await viewer.ready;
+		} catch (error) {
+			if (!this.#contentIntentCurrent(epoch) || selection.endpoint !== live) return;
+			this.#setContentUnavailable(epoch, contentViewerReason(error), false);
+			return;
+		}
+		if (!this.#contentIntentCurrent(epoch) || selection.endpoint !== live) return;
+		// Readiness is an await too: the pin, this side's identity, the destination
+		// runtime/client/channel/epoch references, and the roster fence are all
+		// re-proved before anything is announced as current.
+		const staleAuthority = this.#contentEndpointFence(live);
+		if (staleAuthority !== null) {
+			this.#contentFenceFailed(epoch, staleAuthority);
+			return;
+		}
+		// `ready` is this viewer's exact `subscribed` acknowledgement. It never means a
+		// frame was written, observed, or rendered: `current` requires a complete view.
+		if (selection.view !== undefined) selection.state = "current";
+		selection.reason = null;
+		this.#publishContent();
+	}
+
+	/**
+	 * Record that the deliberate target cannot currently be streamed.
+	 *
+	 * `reachable` says whether the refusal happened BEFORE this endpoint ever touched
+	 * the network (the target simply was not reachable yet, so a later roster
+	 * observation of the SAME target may complete the one selection), or after a real
+	 * channel/viewer attempt (which is never silently retried: the attempt stays
+	 * spent until the operator selects again or the destination reconnects).
+	 */
+	#setContentUnavailable(epoch: number, reason: PeerContentReason, reachable: boolean): void {
+		if (!this.#contentIntentCurrent(epoch)) return;
+		const selection = this.#content;
+		selection.spentEpoch = reachable ? null : epoch;
+		selection.view = undefined;
+		selection.state = "unavailable";
+		selection.reason = reason;
+		this.#retireContentEndpoint();
+		this.#publishContent();
+	}
+
+	/**
+	 * Publish, or refuse to publish, one viewport handed over by the live endpoint.
+	 *
+	 * A view becomes `current` only while the endpoint still proves every authority
+	 * fact it was opened against: an identity or pin that went missing, a replaced
+	 * destination channel or client, an advanced destination epoch, or a roster that
+	 * no longer holds the exact run and row all stop publication immediately, with
+	 * the endpoint retired and no stale frame kept up as a substitute.
+	 */
+	#onContentSnapshot(endpoint: ContentEndpoint, snapshot: SessionContentSnapshot | undefined): void {
+		const selection = this.#content;
+		// Only the endpoint this coordinator still owns can publish a view.
+		if (selection.endpoint !== endpoint || selection.epoch !== endpoint.epoch) return;
+		if (
+			snapshot !== undefined
+			&& (snapshot.meta.hostRunId !== endpoint.target.hostRunId
+				|| snapshot.meta.sessionId !== endpoint.target.rowId)
+		) {
+			// The endpoint validates its own tuple; this is a second fence, not a filter:
+			// content that is not the selected run and row is never displayed.
+			selection.view = undefined;
+			selection.state = "unavailable";
+			selection.reason = "protocol-violation";
+			selection.spentEpoch = endpoint.epoch;
+			this.#retireContentEndpoint();
+			this.#publishContent();
+			return;
+		}
+		if (snapshot === undefined) {
+			// The endpoint cleared its published view while still selected: content is no
+			// longer current, and nothing older is kept up as a substitute.
+			selection.view = undefined;
+			selection.state = "unavailable";
+			selection.reason = "content-lost";
+			selection.spentEpoch = endpoint.epoch;
+			this.#retireContentEndpoint();
+			this.#publishContent();
+			return;
+		}
+		const staleAuthority = this.#contentEndpointFence(endpoint);
+		if (staleAuthority !== null) {
+			// The stream can no longer prove the authority it was opened under, so this
+			// viewport is not published even though it is well-formed: the view clears
+			// synchronously and the endpoint retires with the fixed refusal reason.
+			selection.view = undefined;
+			selection.state = "unavailable";
+			selection.reason = staleAuthority;
+			selection.spentEpoch = endpoint.epoch;
+			this.#retireContentEndpoint();
+			this.#publishContent();
+			return;
+		}
+		selection.view = Object.freeze({
+			hostId: endpoint.target.hostId,
+			selectionGeneration: endpoint.target.selectionGeneration,
+			snapshot,
+		});
+		selection.state = "current";
+		selection.reason = null;
+		this.#publishContent();
+	}
+
+	/**
+	 * The endpoint reported its own retirement. Its `closed` settles only after the
+	 * local channel close settled, so this is confirmation of LOCAL cleanup and never a
+	 * claim about the remote owner.
+	 */
+	#onContentEndpointClosed(endpoint: ContentEndpoint): void {
+		const selection = this.#content;
+		if (selection.endpoint !== endpoint) return;
+		selection.endpoint = null;
+		if (this.#closed || this.#tearingDown || selection.epoch !== endpoint.epoch) return;
+		selection.view = undefined;
+		selection.state = "unavailable";
+		selection.reason = "connection-lost";
+		// The attempt for this intent is spent: a content channel that died is never
+		// silently reopened. Only a new selection, or the destination's existing
+		// automatic reconnect producing a new run observation, restores the stream.
+		selection.spentEpoch = endpoint.epoch;
+		this.#publishContent();
+	}
+
+	/**
+	 * Retire the current content endpoint as bounded, tracked, owned work. A
+	 * content-only retirement never disposes the borrowed destination client, never
+	 * touches the metadata channel, and never waits for a remote acknowledgement. An
+	 * unconfirmed settlement is sticky: shutdown rejects instead of claiming a settled
+	 * close, and a closed transport is never taken as proof the endpoint released its
+	 * own resources.
+	 */
+	#retireContentEndpoint(): void {
+		const selection = this.#content;
+		const endpoint = selection.endpoint;
+		const abort = this.#contentAbort;
+		selection.endpoint = null;
+		this.#contentAbort = null;
+		if (abort !== null) {
+			try {
+				abort.abort();
+			} catch {
+				// The attempt already settled.
+			}
+		}
+		if (endpoint === null) return;
+		const previous = selection.retirement;
+		const retirement = (async (): Promise<void> => {
+			const results = await Promise.allSettled([
+				...(previous === null ? [] : [previous]),
+				endpoint.viewer.stop(),
+			]);
+			if (results.some((result) => result.status === "rejected")) {
+				this.#contentCleanupUnconfirmed = true;
+				this.#resourceCleanupFailed = true;
+			}
+		})();
+		selection.retirement = retirement;
+		void this.#track(retirement);
+		const release = (): void => {
+			if (selection.retirement === retirement) selection.retirement = null;
+		};
+		void retirement.then(release, release);
+	}
+
+	/**
+	 * A destination that lost its connection cannot carry content either. The
+	 * authorized view is cleared and its endpoint retired immediately; the deliberate
+	 * selection itself is kept as an honest `unavailable` so an existing automatic
+	 * recovery may restore exactly that target. Removal preserves the old target too;
+	 * a re-added destination has a different local id and cannot inherit it.
+	 */
+	#contentLostHost(hostId: string, reason: PeerContentReason, removed = false): void {
+		const selection = this.#content;
+		if (selection.desired === null || selection.desired.hostId !== hostId) return;
+		// A genuine connection loss is a reachability transition, so it re-arms the
+		// deliberate selection even when content was ALREADY unavailable because an
+		// earlier attempt failed. Without the epoch bump here, a later current roster
+		// for the same run and row would be rejected as "already attempted" and the
+		// existing automatic reconnect could never restore the selected target.
+		const rearm = selection.endpoint !== null
+			|| selection.state !== "unavailable"
+			|| selection.reason !== reason
+			|| selection.spentEpoch !== null
+			|| removed;
+		selection.epoch += 1;
+		selection.spentEpoch = null;
+		selection.view = undefined;
+		selection.state = "unavailable";
+		selection.reason = reason;
+		this.#retireContentEndpoint();
+		if (rearm) this.#publishContent();
+	}
+
+	/** Close owns the selection too: it is cleared before the first await. */
+	#clearContentForShutdown(): void {
+		const selection = this.#content;
+		selection.epoch += 1;
+		selection.spentEpoch = null;
+		selection.desired = null;
+		selection.view = undefined;
+		selection.state = "none";
+		selection.reason = null;
+		this.#contentDirty = false;
+		this.#retireContentEndpoint();
+		this.#publishContent();
+	}
+
+	/**
+	 * Re-check the one deliberate selection against a fresh roster. Restoring content
+	 * requires the SAME target on a connection that already exists; losing the exact
+	 * run or row stops claiming content. Never a new connection, never a different row,
+	 * and never a rewritten target.
+	 *
+	 * A reachable target hands the work to the single reconciler, which decides
+	 * whether the newest intent still needs an attempt. A target that stopped being
+	 * reachable is re-armed (epoch bumped, spent attempt cleared) even when content is
+	 * already unavailable, so row-loss recovery does not depend on whether the content
+	 * channel or the metadata roster noticed first, while an unchanged repeat
+	 * projection never restarts a spent network attempt.
+	 */
+	#reconcileContentWithRoster(hostId: string): void {
+		if (this.#closed || this.#tearingDown) return;
+		const selection = this.#content;
+		const desired = selection.desired;
+		if (desired === null || desired.hostId !== hostId) return;
+		const runtime = this.#runtime.get(hostId);
+		const refusal = runtime === undefined
+			? "destination-unavailable" as const
+			: this.#contentTargetFence(runtime, desired);
+		if (refusal === null) {
+			this.#requestContentPump();
+			return;
+		}
+		const streaming = selection.endpoint !== null || selection.state === "current";
+		if (!streaming && selection.reason === refusal && selection.spentEpoch === null) return;
+		selection.epoch += 1;
+		selection.spentEpoch = null;
+		selection.view = undefined;
+		selection.state = "unavailable";
+		selection.reason = refusal;
+		this.#retireContentEndpoint();
+		this.#publishContent();
+	}
+
+	/** Last-observed rows and owner run are kept as stale, never as current. */
+	#markRosterStale(runtime: DestinationRuntime): void {
+		runtime.roster = runtime.roster.rows === null
+			? { state: "never", rows: null, hostRunId: null }
+			: { state: "stale", rows: runtime.roster.rows, hostRunId: runtime.roster.hostRunId };
 	}
 
 	// --------------------------------------------------------------- commands
@@ -1931,6 +2999,9 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 			return;
 		}
 		this.#cancelActivity(hostId, null);
+		// The unavailable selection is preserved under its old destination id. Re-adding
+		// this endpoint creates a different id and must never retarget that selection.
+		this.#contentLostHost(hostId, "connection-lost", true);
 		// Forgetting this side's remembered server key is local only. It never
 		// revokes the other host's receiving grant and never stops its sessions.
 		const store = this.#trustStore;
@@ -2031,10 +3102,21 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 	#stopInboundBindings(keyId: string): void {
 		const bindings = this.#inboundBindings.get(keyId);
 		if (bindings === undefined) return;
+		// Ownership is released only by a confirmed settlement. A binding whose bounded
+		// local stop could not be confirmed stays registered, marks this lifecycle's
+		// cleanup unconfirmed so shutdown rejects rather than claiming a settled revoke,
+		// and is retired again by the next listener sweep instead of having its failure
+		// swallowed here.
 		this.#inboundBindings.delete(keyId);
-		for (const binding of bindings) {
-			void binding.stop().catch(() => undefined);
-		}
+		const retirement = (async (): Promise<void> => {
+			const results = await Promise.allSettled(bindings.map((binding) => binding.stop()));
+			const retained = bindings.filter((_binding, index) => results[index]?.status === "rejected");
+			if (retained.length === 0) return;
+			this.#resourceCleanupFailed = true;
+			this.#retainInboundBindings(retained);
+			this.#emit();
+		})();
+		void this.#track(retirement);
 	}
 
 	// --------------------------------------------------------------- snapshots
@@ -2149,7 +3231,7 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 		if (message === null && destination.previouslyConnected && pin === null) {
 			message = HOST_MESSAGE.savedKeyMissing;
 		}
-		const roster = runtime?.roster ?? { state: "never" as const, rows: null };
+		const roster = runtime?.roster ?? { state: "never" as const, rows: null, hostRunId: null };
 		return Object.freeze({
 			id: destination.id,
 			label: destination.label,
@@ -2163,6 +3245,7 @@ class OwnedPeerCoordinator implements PeerCoordinator {
 			roster: Object.freeze({
 				state: roster.state,
 				rows: copyRoster(roster.rows),
+				hostRunId: roster.hostRunId,
 			}),
 		});
 	}
@@ -2259,6 +3342,31 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
 	if (typeof options.onIncomingConsentArrival !== "function") {
 		throw new TypeError("peer coordinator requires an arrival callback");
 	}
+	const contentSource = options.contentSource;
+	if (contentSource !== undefined) {
+		// The content source is the caller's own owning-host service, narrowed. A
+		// partial or cloned stand-in is refused rather than half-wired: without every
+		// read-only capability the owner side cannot fence a request before a viewer
+		// mutation, so the incoming content lane stays entirely unoffered instead.
+		if (!isRecord(contentSource)) {
+			throw new TypeError("peer coordinator requires the owning-host content source");
+		}
+		for (const method of [
+			"watchSessionContent",
+			"readInventorySnapshot",
+			"openViewer",
+			"readViewer",
+			"updateViewer",
+			"closeViewer",
+		] as const) {
+			if (typeof contentSource[method] !== "function") {
+				throw new TypeError("peer coordinator requires the owning-host content source");
+			}
+		}
+	}
+	if (options.onContentChange !== undefined && typeof options.onContentChange !== "function") {
+		throw new TypeError("peer coordinator content callback is invalid");
+	}
 	if (options.testHooks !== undefined) {
 		const hooks = options.testHooks;
 		if (!isRecord(hooks)) throw new TypeError("peer coordinator test hooks are invalid");
@@ -2294,7 +3402,14 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
  * pairs, prompts for an unknown key, or replaces a changed pin; a fresh,
  * default-disabled start only reads protected state. Only explicit commands
  * initialize an identity, pair a new key, or change saved intent/trust.
+ *
+ * The returned coordinator also owns the single selected native viewport content
+ * stream: the same optional listener and the same directional authority carry an
+ * incoming content lane when the caller supplied its own owning-host service as
+ * the content source, and at most one destination/run/row is selected outgoing at
+ * a time. A metadata-only caller passes neither and observes exactly the previous
+ * behavior.
  */
-export function createPeerCoordinator(options: PeerCoordinatorOptions): PeerCoordinator {
+export function createPeerCoordinator(options: PeerCoordinatorOptions): PeerCoordinatorWithContent {
 	return new OwnedPeerCoordinator(assertOptions(options));
 }

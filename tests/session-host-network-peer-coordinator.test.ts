@@ -176,6 +176,9 @@ function controlledChannel(): ControlledChannel {
 		get peerKey() {
 			return requireInner().peerKey;
 		},
+		get lane() {
+			return requireInner().lane;
+		},
 		get label() {
 			return requireInner().label;
 		},

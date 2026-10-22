@@ -86,9 +86,23 @@ dates.
   pairing callback also exposes its actual configured deadline and sanitized settlement
   without changing consent authority or timeout defaults (#475). The optional network
   sidebar now builds its saved settings, listener, and consent surface on this state
-  (#482); remote terminal content, remote input, and session-operation routing remain
-  unimplemented. See
+  (#482); remote input, remote clipboard attribution, and session-operation routing remain
+  unimplemented, while one deliberately selected remote row's native viewport
+  can now be displayed. See
   [Explicit protected peer-state foundation](docs/session-host-alpha.md#explicit-protected-peer-state-foundation).
+- The optional native session host now displays one deliberately selected remote native
+  viewport through the existing left roster, compositor, graphics layer, and writer
+  (#389). Visible Pi/chat text, styling, cursor, Unicode, and bounded typed PNG images and
+  fallbacks are included; visible text can itself be sensitive. Unselected rows stay
+  metadata-only. One selected stream uses the same owning manager, per-session viewer
+  minima, TLS-proved key, remembered pin, and directional grant, without another listener,
+  manager, controller lease, or permission kind. New session stays local; loss or
+  disconnection never stops remote work or silently selects another row. Exact source,
+  run, generation, geometry, and written-display fences remain fail closed; 64 KiB bounds
+  messages, not whole viewports. Remote input, clipboard attribution, and owner-routed
+  session operations remain unfinished at this interim checkpoint, not a permanent
+  view-only mode. Ordinary Pi and authenticated local/SSH clipboard are unchanged. See
+  [Selected native viewport](docs/session-host-alpha.md#selected-native-viewport-interim-display-scope).
 - The optional native session host now wires a **Network** sidebar over the paired peer
   transport (#482). A fresh Network pane prefills the editable local listen draft
   `*:8088`; `*` requests IPv4/IPv6 dual-stack on one listener, while explicit addresses
@@ -113,9 +127,9 @@ dates.
   None stops remote work or sessions.
   Add destination uses independently navigable Name, Host, and Port fields and one
   explicit Add action, rather than a sequential wizard.
-  Connected rows are metadata-only, and remote terminal content/input, remote creation,
-  `SessionSpawn`, Close, stop/resume, and clipboard attribution remain unimplemented; no
-  view-only permission kind is invented. See
+  Connected rows stay metadata-only until one is deliberately selected, and remote input,
+  remote creation, `SessionSpawn`, Close, stop/resume, and clipboard attribution remain
+  unimplemented; no view-only permission kind or controller lease is invented. See
   [Network sidebar](docs/session-host-alpha.md#network-sidebar-hosting-pairing-and-remote-metadata)
   and [Session-host peer network](docs/security-model.md#session-host-peer-network-optional).
 

@@ -1158,6 +1158,17 @@ test("remote host rows stay honest metadata and never emit a local session actio
     || action.type === "stop-remove" || action.type === "edit" || action.type === "create"
     || action.type === "rename");
   assert.deepEqual(localActions, [], "no local session action is fabricated for a remote row");
+
+  // The SAME attached DTO also projects those rows into the LEFT roster as a
+  // separate typed kind; the Network pane's metadata-only behavior above is
+  // unchanged, and the local action filter still finds nothing there either.
+  harness.send(ESC);
+  const left = rosterText(harness, 140, 40).join("\n");
+  assert.ok(left.includes("build") && left.includes("/owner/work/build"),
+    "the left roster projects the same remote rows alongside locals");
+  assert.ok(left.includes("old-row") && left.includes("[stale]"),
+    "stale remote cards are marked in the left roster too");
+  assert.deepEqual(harness.commands(), [], "projecting the left cards emits nothing");
 });
 
 // ---------------------------------------------------------------------------

@@ -588,10 +588,12 @@ copy of the truth. The sidebar projects the manager's current process/session fa
 remembered roster slots, their ordering, and the active selection remain separate
 presentation metadata. Those remembered observations never become a second authoritative
 process or status store. This ownership is
-local to one host process on one machine. A connected peer may see a metadata-only
-projection of this manager's roster (see
-[Network sidebar](#network-sidebar-hosting-pairing-and-remote-metadata)), but that implies
-no remote control, no second host sharing the same sessions, and no change to how each
+local to one host process on one machine. A connected peer may see a projection of this
+manager's roster metadata and, when this sidebar deliberately selects one row, that row's
+native viewport (see
+[Network sidebar](#network-sidebar-hosting-pairing-and-remote-metadata) and
+[Selected native viewport](#selected-native-viewport-interim-display-scope)). Neither
+implies remote control, a second host sharing the same sessions, or any change to how each
 child's own terminal, input, or saved conversations behave.
 
 ### Paired peer transport foundation
@@ -622,11 +624,14 @@ defeat an active interceptor during first pairing. Later key verification protec
 continuity, not the authenticity of that first acceptance. No mandatory QR/code ceremony
 is added. Protected identity/trust storage is described below. The network sidebar
 supplies the explicit pairing controls, saved connection preferences and bounded automatic
-recovery; discovery and clipboard attribution remain unimplemented. The only session-level protocol
-implemented so far is the bounded roster-metadata channel described next; remote session
-content, terminal input, and session operations remain unimplemented. Native
-client-only mobile implementations can use this trust model; ordinary browser WebSockets
-do not expose self-signed certificate pinning and are not claimed supported.
+recovery; discovery and clipboard attribution remain unimplemented. The session-level
+protocols implemented so far are the bounded roster-metadata channel described next and
+the single-row native viewport lane described under
+[Selected native viewport](#selected-native-viewport-interim-display-scope); remote
+terminal input, remote clipboard attribution, and session operations remain
+unimplemented. Native client-only mobile implementations can use this trust model;
+ordinary browser WebSockets do not expose self-signed certificate pinning and are not
+claimed supported.
 
 ### Explicit protected peer-state foundation
 
@@ -717,10 +722,14 @@ unavailable owner — means *not current*, never idle and never zero. No second
 controlling host, separate ACL, exclusive-controller lease, or new revocation lifecycle
 policy is added.
 
-The roster projection stays metadata-only: connecting a destination never adds remote
-terminal content, input, or session operations, and a client cannot create, stop, or close
-an owner session. That is an implemented protocol scope, not a view-only permission kind.
-See the network sidebar's operational behavior and optional manual comparison next.
+The roster projection itself stays metadata-only: connecting a destination adds no
+terminal content, input, or session operations by itself, and a client cannot create,
+stop, or close an owner session. A separate deliberate selection can display one exact
+row's native viewport (see
+[Selected native viewport](#selected-native-viewport-interim-display-scope)); every other
+row stays metadata-only. That is an implemented protocol scope, not a view-only permission
+kind or a controller lease. See the network sidebar's operational behavior and optional
+manual comparison next.
 
 ### Network sidebar: hosting, pairing, and remote metadata
 
@@ -728,8 +737,9 @@ The optional native session host exposes a **Network** entry in its sidebar when
 network UI snapshot is attached. Ordinary Pi sessions and both standalone review-gate
 launchers are unchanged and have no Network entry. The sidebar is a pure display and
 command frontend: one coordinator owned by the host performs every listener, client,
-consent, trust-store, and preference write. Remote rows are metadata only and never
-become local sessions.
+consent, trust-store, and preference write. Remote rows never become local sessions: they
+are typed remote cards, not fabricated local entries, even when an owner-supplied row id
+collides with a local one.
 
 **Fresh start versus saved state.** With no saved network preferences, a fresh host
 creates no peer keys or identity, no preferences or trust document, no listener, and no
@@ -806,17 +816,26 @@ re-adding it requires
 confirming the key again. It never revokes the other host's receiving grant and never
 stops its sessions. Revoke removes only this side's current receiving permission for that
 peer; it does not change the opposite direction, stop a session, or shut down the owning
-host. None of
-Disconnect, Remove, or Revoke stops remote work. A receiving grant has no view-only
-variant: connected metadata is the implemented protocol scope, not a permission kind.
+host. When this host is the viewer, its own Revoke leaves an existing outbound view
+intact: that view uses the owning peer's separate receiving grant. Revocation by the
+owning peer makes the selected display unavailable. None of Disconnect, Remove, or Revoke
+stops remote work. A receiving grant has no view-only
+variant: displaying the selected row's native viewport is part of the same implemented
+display scope, not a separate permission kind. Remote input forwarding remains
+unimplemented at this interim checkpoint.
 
-**Ownership and shutdown.** Several destinations may be connected at once; only a
-selected local native session supplies displayed session content. A remote row is
-a separate typed entry, not a local session row; it shows the owner-side roster facts and
-honest current or stale state, and Enter on it only opens a metadata-only notice and
-leaves native selection and input ownership unchanged. There is no remote terminal
-streaming or input, no remote creation, `SessionSpawn`, Close, stop, or resume, and no
-clipboard attribution. Host shutdown closes only this host's owned local network
+**Ownership and shutdown.** Several destinations may be connected at once. Every
+destination's rows project into the same existing left roster as typed remote cards, and
+exactly one displayed session supplies content for this host's pane: either one selected
+local row or one deliberately selected remote row, never both. A remote card is a
+separate typed entry, not a local session row; it shows the owner-side roster facts and
+honest current or stale state, and Enter or a drawn left click on it selects that row's
+native viewport for display (see
+[Selected native viewport](#selected-native-viewport-interim-display-scope)) without
+changing any local row's process, input ownership, saved state, or the roster. Remote
+keyboard and mouse input, remote creation, `SessionSpawn`, Close, stop, resume, and
+clipboard attribution remain unimplemented at this ordered interim slice. Host shutdown
+closes only this host's owned local network
 resources and waits for that local settlement; an unconfirmed close is reported and
 retains agent-directory ownership. It never waits for a remote receipt or remote work.
 
@@ -843,10 +862,91 @@ identity key
 with the fingerprint the other host shows for approval through an independent channel if
 you need to rule out an active interceptor during first pairing, then confirm the
 server-key dialog on B, approve A's incoming request, and compare B's remote rows with
-A's local roster. Disconnect on B and confirm the rows become stale,
-then remove the destination on B and confirm it forgets only that endpoint and local pin.
+A's local roster. Select one of those remote rows on B and confirm its owner's native
+viewport appears while A keeps running and B's own local sessions are untouched; then
+select a local row on B and confirm the remote stream is released rather than retained.
+Disconnect on B and confirm the rows become stale, then remove the destination on B and
+confirm it forgets only that endpoint and local pin.
 These are optional manual alpha checks, not an installation, support, release, or
 cross-machine readiness claim; CI does not run them.
+
+### Selected native viewport (interim display scope)
+
+The source can also display one deliberately selected remote session's native viewport
+(#389). Remote rows from every connected destination project into the **same existing
+left roster** as typed remote cards — there is no second sidebar, authoritative roster,
+session manager, listener, or daemon. Each card identifies its owner host and row; a
+selection carries the observed owner run, or honestly records that it is unknown.
+Exactly one native content stream is selected
+at a time across all destinations for this viewing sidebar. Local and remote selection
+identities stay separate even when an owner-supplied row id happens to equal a local one,
+and remote metadata never becomes local process, input, or trust authority.
+
+Selecting a remote card (ordinary Enter, or a drawn left click on it) asks that owner for
+the row's native viewport, and the pane then shows that viewport: ordinary visible Pi and
+conversation text with its generated SGR styling, cursor, Unicode cells, and the bounded
+typed Kitty PNG images, placements, and text fallbacks the native surface already
+produces, drawn through the existing compositor, graphics layer, and bounded writer. It is
+deliberately not a transcript, not a raw PTY or terminal-control stream, and it carries no
+separate private configuration, provider/credential, authentication, current-file,
+structured-question, or hidden telemetry records. Rows that are not selected stay
+metadata-only, and the owner
+watches only the subscribed row, so a session nobody selected is neither captured nor
+resized for this viewer. Visible terminal text can itself be sensitive, and displaying the
+deliberately selected row is the intended behavior of this slice. There is no text-only or
+no-graphics shortcut. The 64 KiB bound is one protocol message, not a whole-viewport
+ceiling: a complete viewport is carried as one bounded begin/chunk/end transfer with a
+defensive 64 MiB assembly ceiling.
+
+Transport and authority are unchanged. The viewer opens the additive
+`pi-peer-content-v1` lane on the same TLS/WSS `/app` upgrade as the roster lane, on the
+same listener, with the same exact TLS-proved peer key, the same current remembered pin,
+and the same directional receiving grant. This adds no listener, daemon, manager,
+permission kind, controller lease, or stored state, and it never pairs automatically or
+replaces a changed pin; a sending result still never claims the owner wrote or the viewer
+rendered anything. The owner side is the same owning service over the same single session
+manager that already supplies the roster: it reads that manager's inventory snapshot to
+fence a subscription against the exact observed owner run and row, takes one read-only
+content watch on that row, and registers this endpoint's own independent viewer
+contribution, so the ordinary per-session geometry minima apply and no other session is
+touched.
+
+Selecting a remote row retires only this viewing surface's local participation: it no
+longer displays that local row or contributes its geometry or input, and every
+local and remote child keeps running. `n`/No session, Main focus, and passive behavior
+remain exactly as described elsewhere in this page, and a session with no viewer keeps its
+last canonical size. New session stays local while a remote row is displayed: it never
+redirects creation to the remote owner, and a late completion cannot replace a later
+deliberate selection. A lost connection, Remove, Disconnect, or revocation by the owning
+peer makes the selected display unavailable without stopping remote work. The deliberate
+target stays selected and the pane shows a host-owned status instead of another host's
+content, a local session, or a silent fallback. Replacing one selection with another — remote A,
+remote B, local, or none — first retires the one stream through the coordinator's bounded
+settlement barrier, so streams are never stacked and a retirement never becomes a second
+selection. This confirms only local retirement, not an owner acknowledgement or remote
+settlement; the owning side independently retires its own subscription resources.
+
+Display authority is fenced, not inferred. A published viewport must still match this
+sidebar's own selection generation, destination, owner run, and owner row; it must carry
+the owner's subscription identity, a monotonic publish sequence, the canonical geometry and
+its revision, and the exact native conversation tuple when one is known, and its frame
+must match that geometry. Only the frame the writer actually committed identifies the
+drawn source. A queued, held, superseded, covered, or unchanged candidate for a new
+semantic source cannot authorize a click or copy. Repainting the same accepted frame does
+not invent a new source receipt. Input modes and cursor facts carried with a
+viewport are inert observations for rendering; they grant no input.
+
+This is an ordered interim slice, not a finished remote session surface. Remote keyboard
+and mouse input, remote clipboard attribution, and owner-routed session operations (remote
+creation, `SessionSpawn`, Close, stop, resume) are not implemented and fail closed: while a
+remote viewport is displayed, native-pane keyboard, paste, and mouse packets are not
+forwarded to the remote owner and no local child receives them on that stream's behalf.
+That ordering is an interim implementation bound, not a permanent view-only mode,
+permission kind, or policy. Authenticated local and SSH clipboard copying, ordinary
+standalone Pi, and local host input are unchanged: nothing is broadcast, no remote copy
+request is transported, raw PTY OSC 52 stays denied, and no last-input-origin inference is
+added. Native Pi clipboard-producer coverage keeps the limits the
+[clipboard section](#clipboard-copying-over-ssh) describes.
 
 ## Focus, display, and status
 
@@ -861,7 +961,10 @@ pane returns keyboard focus to the unchanged active Main owner and consumes that
 click, including its release. It does not change the sidebar's visibility or selection,
 activate a row, or change any sibling; subsequent typing goes to the same Main owner.
 This applies only when the visible native pane still belongs to the current live owner
-at the displayed geometry. Forms, confirmations, and the narrow sidebar overlay are not
+at the displayed geometry. A deliberately selected remote viewport is display-only, so a
+click in that pane is dropped instead of becoming a local focus gesture (see
+[Selected native viewport](#selected-native-viewport-interim-display-scope)). Forms,
+confirmations, and the narrow sidebar overlay are not
 native Main click targets. Once Main already has focus, mouse input keeps its existing
 native behavior.
 While a host UI occupies the right-hand pane beside the visible roster, the roster stays
@@ -950,7 +1053,11 @@ system's default ACLs, without a custom-ACL or same-user sandbox guarantee. The 
 uses a bounded temporary file; unsafe, oversized, or failed results are not applied.
 Use the on-screen cues for form actions and quit confirmation. When a native Pi
 frame has focus, input is sent only to the explicitly activated, live child; it is never
-broadcast to hidden or sibling sessions. Native Escape, `q`/`Q`, and Ctrl+C remain Pi's
+broadcast to hidden or sibling sessions. A remotely displayed viewport is not such a
+child: while it is displayed, native-pane input is dropped rather than forwarded to the
+remote owner or reassigned to a local child (see
+[Selected native viewport](#selected-native-viewport-interim-display-scope)).
+Native Escape, `q`/`Q`, and Ctrl+C remain Pi's
 keys whenever the native frame has focus. They cannot be configured as the sidebar
 toggle; conflicting Escape aliases are rejected too. Only the admitted configured
 toggle chord is reserved there, including its repeat and release events. The default
@@ -1106,9 +1213,13 @@ click-to-focus on its own content, and its images, whose layer is bounded by the
 rectangle rather than by the containing pane, with the ordinary text fallback where the terminal
 cannot render them.
 
-This is display sizing inside one host process. It adds no remote viewer, protocol, control
-channel, or stored state, and no session becomes exclusive to one surface: registering or
-closing a viewer never grants, leases, or revokes input or output participation.
+This is display sizing on the host's single session manager. The one selected remote
+viewport described above registers as one more independent viewer of that same manager, so
+its pane size participates in the ordinary per-session minima for the selected row only;
+sessions nobody has selected are not watched, resized, or given a viewer. It adds no control
+channel, permission, stored state, or second manager, and no session becomes exclusive to
+one surface: registering or closing a viewer never grants, leases, or revokes input or
+output participation.
 
 ### Clipboard copying over SSH
 
@@ -1155,7 +1266,10 @@ client verifies delivery. Existing terminal permissions, multiplexers, and nativ
 (Pi 1.3.0 bounds the encoded OSC 52 payload to 100,000 characters). No terminal/SSH
 configuration or multiplexer passthrough is forced. A terminal or multiplexer that
 disables/does not implement clipboard writes may discard the request. There is no
-clipboard read, paste, synchronization, image transfer, or remote-host backend here.
+clipboard read, paste, synchronization, image transfer, or remote-host backend here. The
+same routing follows the actually displayed owner: while a remote viewport is displayed,
+this host has no displayed local owner to copy for, a remote copy request is not
+transported, and nothing is broadcast to a child or a peer.
 
 #### Isolated manual SSH clipboard comparison
 
@@ -1274,7 +1388,10 @@ owner's pane. Child-wide deletion affects that child's graphics state only,
 never sibling images or arbitrary outer-terminal graphics. Switching sessions,
 covering Main with a form or overlay, and changing geometry remove old visible
 placements before drawing replacements. Images do not authorize input, activate
-a sidebar selection, or change session/workspace ownership.
+a sidebar selection, or change session/workspace ownership. A selected remote viewport
+carries that same typed image subset and is drawn through the same compositor, graphics
+layer, and bounded writer with the same fallbacks and cleanup; that lane transfers no
+images outside an accepted viewport.
 
 Unsupported display uses Pi's image-text convention, not a host warning or a new
 configuration prompt. Native unsupported-terminal rendering retains its own image
@@ -1426,9 +1543,12 @@ Pi menu will remain readable.
 The native Main mouse path is cell-based and applies only to the active native frame;
 events outside that frame are dropped before coordinate translation, never clamped to
 the pane edge. Sidebar-target clicks are handled by the host and are not forwarded to a
-native child. The first left click in the visible native pane while the roster owns
-focus is consumed to return focus to that active Main owner; subsequent mouse input is
-forwarded normally. This does not add conversation wheel/trackpad scrolling (#332). On
+native child. For a locally displayed owner, the first left click in the visible native
+pane while the roster owns focus is consumed to return focus to that active Main owner;
+subsequent mouse input is forwarded normally. A deliberately selected remote viewport is
+display-only instead: its packets are dropped rather than focusing a local child or being
+forwarded, and only the frame the writer actually committed decides whether the drawn
+source is remote. This does not add conversation wheel/trackpad scrolling (#332). On
 Windows, bundled-ConPTY protocol observations do not certify physical mouse behavior:
 manual validation has observed clicks working, but pane-confined selection and native
 conversation wheel scrolling still require interactive validation, as described in the

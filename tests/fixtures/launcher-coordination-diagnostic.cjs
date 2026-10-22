@@ -13,6 +13,10 @@
  * - It observes exactly two things: filesystem operations on the fixture's own
  *   synthetic application state directory, and the known native PowerShell
  *   owner-birth probe invocation. Everything else passes through untouched.
+ *   That probe observation wraps the SYNCHRONOUS `execFileSync` query only: the
+ *   cleanup lock's bounded wait asks the same query through one owned
+ *   asynchronous helper, and that helper is outside this preload's scope, so a
+ *   lower `birthProbe.foreign` count alone never means no birth query ran.
  * - Observation only. Each wrapper calls the ORIGINAL function through
  *   `Reflect.apply` with the caller's own receiver, returns that call's exact
  *   value, and rethrows that call's exact error object. No return value,

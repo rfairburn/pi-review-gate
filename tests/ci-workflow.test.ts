@@ -652,6 +652,27 @@ test("windows launcher job runs the native .cmd coverage on every enforced trigg
   }
 });
 
+test("bounded cleanup ownership regressions run natively after the unchanged launcher race tier", () => {
+  const job = blockOf(readWorkflow(), "windows-launcher", 2);
+  const launcherName = "Launcher tests (helper pipeline + native .cmd cases)";
+  const cleanupName = "Bounded cleanup-lock ownership regressions (native Windows)";
+  const launcher = withoutComments(stepOf(job, launcherName));
+  const cleanup = withoutComments(stepOf(job, cleanupName));
+  // These two existing YAML steps use single-line run values, not the block
+  // scalars the sampling helper stepRunOf parses.
+  assert.equal(launcher.match(/^        run: ([^\r\n]+)$/m)?.[1], "node --test dist-test/tests/launcher-cmd.test.js",
+    "the original eight-racer tier keeps its exact command and concurrency");
+  assert.equal(cleanup.match(/^        run: ([^\r\n]+)$/m)?.[1],
+    "node --test --test-concurrency=1 dist-test/tests/prepare-application-cleanup-probe.test.js",
+    "the complete ownership module runs separately and sequentially, without a case filter or retry");
+  assert.ok(job.indexOf(`- name: ${cleanupName}`) > job.indexOf(`- name: ${launcherName}`),
+    "the additional helper probes never precede or warm the original cold-launch tier");
+  assert.doesNotMatch(cleanup, /^\s*if:|continue-on-error|timeout-minutes/m,
+    "native ownership coverage is unconditional and adds no new timeout or error exemption");
+  assert.match(job, /^    timeout-minutes: 20\s*$/m,
+    "the existing Windows job budget is unchanged");
+});
+
 test("native Windows launcher job freshly installs and requires exact Pi 1.3.0 command-path coverage", () => {
   const job = blockOf(readWorkflow(), "windows-launcher", 2);
   const installStart = job.indexOf("      - name: Install fresh locked Pi runtime (native Windows)");

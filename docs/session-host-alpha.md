@@ -628,9 +628,8 @@ recovery; discovery and clipboard attribution remain unimplemented. The session-
 protocols implemented so far are the bounded roster-metadata channel described next and
 the single-row native viewport lane described under
 [Selected native viewport](#selected-native-viewport-interim-display-scope), and the
-[owner Close transport](#owner-close-transport-foundation). Requester Close controls,
-remote terminal input, remote clipboard attribution, and other session operations
-remain unimplemented. Native client-only mobile implementations can use this trust model;
+[owner-routed Close](#owner-close-transport-foundation). Remote terminal input,
+remote clipboard attribution, and the other session operations remain unimplemented. Native client-only mobile implementations can use this trust model;
 ordinary browser WebSockets do not expose self-signed certificate pinning and are not
 claimed supported.
 
@@ -837,8 +836,8 @@ native viewport for display (see
 [Selected native viewport](#selected-native-viewport-interim-display-scope)) without
 changing any local row's process, input ownership, saved state, or the roster. Remote
 keyboard and mouse input, remote creation, `SessionSpawn`, resume, and clipboard
-attribution remain unimplemented at this ordered interim slice. The owner Close
-transport exists, but its requester sidebar controls are not yet wired. Host shutdown
+attribution remain unimplemented at this ordered interim slice. Close uses the
+highlighted remote row and its owner, independently of the displayed stream. Host shutdown
 closes only this host's owned local network
 resources and waits for that local settlement; an unconfirmed close is reported and
 retains agent-directory ownership. It never waits for a remote receipt or remote work.
@@ -942,8 +941,8 @@ viewport are inert observations for rendering; they grant no input.
 
 This is an ordered interim slice, not a finished remote session surface. Remote keyboard
 and mouse input, remote clipboard attribution, remote creation, `SessionSpawn`, and
-resume are not implemented. The Close transport below has no requester sidebar controls
-yet. Native input still fails closed: while a
+resume are not implemented. The owner-routed Close controls are described below.
+Native input still fails closed: while a
 remote viewport is displayed, native-pane keyboard, paste, and mouse packets are not
 forwarded to the remote owner and no local child receives them on that stream's behalf.
 That ordering is an interim implementation bound, not a permanent view-only mode,
@@ -966,8 +965,8 @@ The provider reuses Main's one manager, stop ladder, and roster-removal bookkeep
 It needs no selected content stream, native conversation tuple, viewer, or controller
 lease. Unconfirmed requests recheck positive idle on the owner; busy or unknown activity
 returns `confirmation-required`. Requesters supply the confirmed flag only after explicit
-confirmation; the corresponding sidebar controls are not yet wired. Confirmed requests
-use only the existing bounded stop ladder. Only the manager's actual exit or settled-error removal authority can
+confirmation on the requesting sidebar. Confirmed requests use only the existing
+bounded stop ladder. Only the manager's actual exit or settled-error removal authority can
 remove a row; saved conversations are never deleted. Different rows may close in
 parallel, while a pending close never starts a second ladder for the same row.
 
@@ -978,9 +977,21 @@ attempted, a lost reply or uncertain write remains unknown and is not replayed.
 Disconnect, Remove, Revoke, or dismissing requester UI cannot cancel a stop the owner
 already accepted; network teardown does not establish process settlement.
 
-This is a backend transport foundation: the sidebar's remote Close controls and their
-written-confirmation receipts are not yet wired. It does not enable remote keyboard,
-mouse, creation, resume, or clipboard delivery.
+With the left roster focused, `d`/Delete acts on the remote row the host actually
+wrote as its complete highlight, not a queued logical selection or the displayed
+content stream. Positive idle permits a direct request; busy or unknown activity
+opens the existing left confirmation pane. The exact target, confirmation generation,
+render token and current geometry must have a real writer receipt before confirmation
+can submit once. Held, tiny, clipped, stale or superseded frames authorize nothing;
+a changed native conversation tuple or content epoch is not a Close prerequisite.
+
+If the owner reports `confirmation-required` despite a cached idle card, the next
+deliberate Close opens confirmation; it never opens automatically or replays the
+request. Every still-addressable target retains that reminder until it is acted on or
+positive owner/run/row disappearance or settlement makes it obsolete. An exited or
+settled-error row still sends removal to its owner, not local deletion. Local Close,
+Quit, saved-history deletion and stream selection are unchanged. This does not enable
+remote keyboard, mouse, creation, resume, or clipboard delivery.
 
 ## Focus, display, and status
 
@@ -1304,6 +1315,26 @@ clipboard read, paste, synchronization, image transfer, or remote-host backend h
 same routing follows the actually displayed owner: while a remote viewport is displayed,
 this host has no displayed local owner to copy for, a remote copy request is not
 transported, and nothing is broadcast to a child or a peer.
+
+#### Inert hosted input-origin mode
+
+An internal `nativeInputOriginFraming` option is disabled by default and is not enabled
+by production Main. For future explicitly opted-in hosted native children only, the
+host requests bootstrap mode `1` and waits for authenticated decoder readiness before
+writing either user input or terminal-query responses. There is no raw fallback,
+queued replay, or late reporter-HELLO readiness guess. User input has local origin;
+query replies have non-user origin and cannot authorize a clipboard copy. Unknown
+bootstrap modes and requested bridge-installation failures refuse instead of downgrading.
+
+In that opt-in mode, a cloned native child environment uses Pi's supported static
+`PI_CLIPBOARD_OSC52=1` capture flag. It inherits normally through that hosted process
+tree, including nested Pi; the system environment and standalone launches outside the
+tree stay unchanged. Native owner-side OS clipboard writes are not replaced or
+suppressed. Authenticated local-origin capsules reuse the existing live, current,
+actually-written/uncovered Main-source fences before outer-terminal relay. Viewer-origin
+capsules are denied local fallback; initiating-viewer delivery is not implemented.
+This mode is not a platform or physical clipboard certification, and it does not change
+already-running children or activate remote input/copy transport.
 
 #### Isolated manual SSH clipboard comparison
 

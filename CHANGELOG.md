@@ -22,13 +22,19 @@ dates.
 - A capability-gated owner Close transport on the existing paired roster channel
   (#389). It uses the owning Main's same stop/removal path, current directional
   receiving grant, and exact owner run/row; parallel rows remain independent. Lost
-  replies stay unknown and are never replayed. Requester Close controls are not yet
-  wired. See [Owner Close transport foundation](docs/session-host-alpha.md#owner-close-transport-foundation).
+  replies stay unknown and are never replayed. Sidebar Close acts on the actually
+  written remote highlight, independently of the displayed stream; busy or unknown
+  activity needs an exact written requester confirmation. Exited or settled-error
+  removal stays owner-routed, and saved history is untouched. See
+  [Owner Close transport foundation](docs/session-host-alpha.md#owner-close-transport-foundation).
 - Opt-in authenticated input-origin framing and origin-bearing clipboard capsules
   for the existing owned Node stdio bridge (#389). Payloads and explicit origins are
-  authenticated, and a separate signed readiness signal precedes framed input. No
-  production caller enables this mode yet; local/SSH copying and standalone Pi are
-  unchanged, and remote input/clipboard delivery remains unfinished.
+  authenticated, and a separate signed readiness signal precedes framed input. The
+  internal, default-off host mode gates both user input and non-user terminal replies,
+  refuses unknown bootstrap modes, and sets native capture only for future opt-in
+  hosted children with ordinary descendant inheritance. No production Main caller
+  enables it yet; local/SSH copying and standalone Pi remain unchanged, and remote
+  input/clipboard delivery is unfinished.
 - A TLS/WSS peer-transport foundation with KDE-style explicit device pairing (#475).
   Explicit callers supply generated self-signed identities, consent and trust stores, and
   a listener address; module import alone still enables nothing. Actual TLS peer keys,
@@ -173,6 +179,10 @@ dates.
 - The retired-activity census regression installs its gates before a fresh retired
   uncertainty mark, preventing an automatic refresh from consuming the proof first.
   Test cleanup releases held operations; production activity fences are unchanged.
+- The signal-exit test observer rechecks completed markers when filesystem watch
+  events are missing and captures safe failure facts before cleanup can produce the
+  marker itself. Signal behavior, original assertions and deadlines are unchanged;
+  the historical local timeout's cause remains unproven.
 - Session-host field labels now sit beside the native Editor's first editable body row,
   not its top border (#482). New/Edit, Host shortcuts, and Network editors share the
   same stable anchor; wrapped caret movement leaves the label, drafts, and editing

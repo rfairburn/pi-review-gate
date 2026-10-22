@@ -215,9 +215,9 @@ with the deliberate target preserved, and no local row, sibling destination, or 
 fallback replaces it.
 
 At this ordered interim slice, remote keyboard and mouse input, remote clipboard
-attribution, remote creation, `SessionSpawn`, and resume are unimplemented. The owner
-Close transport exists, but its requester sidebar controls are not wired. Native input
-still fails closed: packets are not forwarded to a remote owner, and no local child
+attribution, remote creation, `SessionSpawn`, and resume are unimplemented. Close is
+owner-routed from the requesting sidebar's actually written highlighted row. Native
+input still fails closed: packets are not forwarded to a remote owner, and no local child
 receives them on that stream's behalf.
 That is an interim ordering bound, not a permanent view-only policy. Authenticated local
 and SSH clipboard copying is unchanged, nothing is broadcast, no remote copy request is
@@ -231,6 +231,14 @@ viewer or controller lease is required. Accepted work remains owned by Main afte
 channel loss or revocation, while unauthorized replies are withheld. A send attempt or
 acknowledgement is not process exit: lost replies remain unknown, no request is replayed,
 and only owner observations remove the projected row. Saved history is never deleted.
+A queued logical highlight grants nothing; direct requests need the current complete
+written highlight. Busy or unknown activity needs the requesting sidebar's exact
+written confirmation target/generation/token/current geometry, synchronously rechecked
+and consumed once. Neither the confirmation nor direct Close relies on the native
+conversation tuple, epoch, selected stream, viewer or controller lease. An owner's
+confirmation-required result arms only the next deliberate Close, never an automatic
+dialog, retry or confirmed request. These reminders are not authorization and are not
+silently evicted for another still-valid target.
 See [Owner Close transport](session-host-alpha.md#owner-close-transport-foundation).
 
 ### Session-host clipboard transport
@@ -252,9 +260,19 @@ An opt-in owned-bridge foundation can authenticate ASCII input fragments, includ
 payload bytes and explicit local, non-user, or opaque viewer origins, and carry that
 immutable origin through asynchronous native copy callbacks in a separate v2 capsule.
 Its signed one-shot readiness statement proves only decoder installation, not input
-permission, a drawn source, or clipboard delivery. No production caller enables this
-mode yet. Origin-bearing copies never enter the legacy local callback implicitly; no
-remote input, forced capture, viewer clipboard egress, or new Pi hook is enabled.
+permission, a drawn source, or clipboard delivery. The internal default-off host mode
+requires that readiness before both local user writes and non-user terminal replies;
+unknown bootstrap modes or requested installation failures refuse without downgrade,
+raw fallback, queue or replay. Non-user input cannot authorize a copy.
+
+Only future explicitly opted-in native children receive a cloned environment with
+Pi's static `PI_CLIPBOARD_OSC52=1` capture flag; normal descendant inheritance stays
+inside that hosted process tree. Native owner OS clipboard writes stay unchanged.
+Local-origin capsules still require existing current/liveness/written/uncovered source
+proof; viewer-origin capsules never fall back to the owner's outer terminal. No
+production Main caller enables this mode, so no forced capture, remote input, viewer
+clipboard egress, native Pi change, system environment change or live retrofit is
+activated by this checkpoint.
 
 The selected text is transient transport data, not a new diagnostic, roster, or clipboard
 history. Source stacks are inspected in memory and not logged. HMAC authenticates but

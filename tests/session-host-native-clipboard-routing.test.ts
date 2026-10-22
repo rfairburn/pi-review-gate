@@ -24,6 +24,165 @@ import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import { skipOrFail } from "./bridge-fakes";
 
 /**
+ * Bounded, pure diagnostic formatting for this file's failure-evidence path.
+ *
+ * These helpers live at module scope so the exclusion guarantees they exist for
+ * - no clipboard capsule, base64 payload, private string sequence, environment,
+ * or known bootstrap-token fragment ever reaches CI stderr - are asserted
+ * directly by a pure test in this same file, without a native run, a new
+ * framework, or an extra file.
+ */
+const SUMMARY_CHAR_LIMIT = 8 * 1024;
+const SUMMARY_LINE_LIMIT = 240;
+const SUMMARY_TAIL_LINES = 24;
+const REDACTED = "<redacted>";
+const ENCODED = "<encoded>";
+/**
+ * Shortest known-token fragment that is always withheld. Registration tokens
+ * are 64 random hex characters, so any run of this many characters inside a
+ * token is secret material; shorter remnants cannot identify a credential and
+ * redacting them would erase unrelated screen text.
+ */
+const MIN_TOKEN_FRAGMENT = 6;
+
+/** Replace whole private string sequences (and truncated partials) and long encoded runs. */
+function stripPrivateSequences(value: string): string {
+  return value
+    // OSC strings - 52;c; clipboard payloads, 777 private capsules, and any
+    // unterminated partial - are consumed through BEL, ST, or end of input.
+    .replace(/(?:\x1b\]|\u009d)[\s\S]*?(?:\x07|\x1b\\|\u009c|$)/g, "<osc>")
+    // The same for DCS/APC/PM strings, which have no bounded length inside the
+    // retained window and must never become printable text when unterminated.
+    .replace(/(?:\x1b[P^_]|[\u0090\u009e\u009f])[\s\S]*?(?:\x1b\\|\u009c|\x07|$)/g, "<string>")
+    // A long encoded run is never evidence: encoded clipboard payloads, base64
+    // blobs, and opaque token blobs are replaced instead of retained.
+    .replace(/[A-Za-z0-9+/=_-]{40,}/g, ENCODED)
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+}
+
+/**
+ * Withhold every fragment of a known token that is long enough to be secret
+ * material, wherever it appears and whatever padding or punctuation surrounds
+ * it. Fixed-width windows catch a fragment that starts mid-token; extending
+ * while the run is still a substring of the token redacts the whole maximal
+ * fragment instead of only a prefix or a suffix.
+ */
+function redactKnownTokenFragments(value: string, tokens: readonly string[]): string {
+  let out = value;
+  for (const token of tokens) {
+    if (token.length < MIN_TOKEN_FRAGMENT) continue;
+    const windows = new Set<string>();
+    for (let index = 0; index + MIN_TOKEN_FRAGMENT <= token.length; index += 1) {
+      windows.add(token.slice(index, index + MIN_TOKEN_FRAGMENT));
+    }
+    let scrubbed = "";
+    let position = 0;
+    while (position < out.length) {
+      const window = out.slice(position, position + MIN_TOKEN_FRAGMENT);
+      if (window.length === MIN_TOKEN_FRAGMENT && windows.has(window)) {
+        let end = position + MIN_TOKEN_FRAGMENT;
+        while (end < out.length && token.includes(out.slice(position, end + 1))) end += 1;
+        scrubbed += REDACTED;
+        position = end;
+        continue;
+      }
+      scrubbed += out[position];
+      position += 1;
+    }
+    out = scrubbed;
+  }
+  return out;
+}
+
+/** Sanitize one diagnostic string against every known registration token. */
+function sanitize(value: string, tokens: readonly string[]): string {
+  return redactKnownTokenFragments(stripPrivateSequences(value), tokens);
+}
+
+/** Bound one diagnostic value, keeping an explicit truncation marker. */
+function clip(value: string, limit: number): string {
+  return value.length <= limit ? value : `${value.slice(0, limit)}…[+${value.length - limit} chars]`;
+}
+
+/**
+ * Sanitize and hard-bound retained diagnostic text. Sanitization runs first so a
+ * replacement (a six-character fragment becomes `<redacted>`) cannot push the
+ * retained text past its bound; cutting the sanitized value cannot restore any
+ * removed private data.
+ */
+function boundDiagnosticText(value: string, tokens: readonly string[], limit: number): string {
+  const safe = sanitize(value, tokens);
+  if (safe.length <= limit) return safe;
+  const marker = `\n…[truncated at ${limit} chars]`;
+  return `${safe.slice(0, Math.max(0, limit - marker.length))}${marker}`;
+}
+
+test("diagnostic formatter withholds private sequences and every substantial token fragment", () => {
+  const token = "0123456789abcdef".repeat(4); // 64 hex characters: the registration token shape
+  const tokens = [token];
+  const fragments = [
+    token, // full token
+    token.slice(0, 24), // prefix fragment followed by punctuation
+    token.slice(-20), // wrapped suffix fragment
+    token.slice(12, 30), // fragment that starts mid-token
+  ];
+  for (const fragment of fragments) {
+    const output = sanitize(`before ${fragment} after`, tokens);
+    assert.equal(output.includes(fragment), false, "the known-token fragment is withheld");
+    assert.equal(output.startsWith("before "), true, "ordinary leading text is preserved");
+    assert.equal(output.endsWith(" after"), true, "ordinary trailing text is preserved");
+    for (let index = 0; index + MIN_TOKEN_FRAGMENT <= token.length; index += 1) {
+      assert.equal(output.includes(token.slice(index, index + MIN_TOKEN_FRAGMENT)), false,
+        "no substantial part of the registration token survives");
+    }
+  }
+  // Padding and punctuation around a fragment neither stop the redaction nor
+  // erase the surrounding text.
+  assert.equal(sanitize(`[${token.slice(0, 12)}]\ttail`, tokens), `[${REDACTED}]\ttail`);
+
+  // OSC 52 base64 clipboard payloads, 777 private capsules, and unterminated
+  // partials of either never survive as printable text.
+  const payload = Buffer.from("SYNTHETIC-CLIPBOARD-PAYLOAD-EXAMPLE-0123456789").toString("base64");
+  assert.ok(payload.length >= 40, "the payload exercises the encoded-run rule");
+  assert.equal(sanitize(`a\x1b]52;c;${payload}\x07b`, []), "a<osc>b");
+  assert.equal(sanitize("a\x1b]777;prg-native-copy-v1;secret\x07b", []), "a<osc>b");
+  assert.equal(sanitize("a\x1b]52;c;QUJD", []), "a<osc>");
+  assert.equal(sanitize("a\u009d52;c;QUJD\u009cb", []), "a<osc>b");
+  assert.equal(sanitize("a\u0090private\u009cb", []), "a<string>b");
+  assert.equal(sanitize("a\u009bb", []), "ab", "C1 controls never reach the outer log terminal");
+  assert.equal(sanitize("a\x1bPprivate", []), "a<string>");
+  assert.equal(sanitize("a\x1b^private", []), "a<string>");
+  assert.equal(sanitize("a\x1b_private\x07b", []), "a<string>b");
+  assert.equal(sanitize(payload, []), ENCODED);
+  // No escape or other control byte can survive the formatter, terminated or not.
+  const combined = sanitize(`a\x1b]52;c;${payload}\x07b\x1bPprivate\x1b`, tokens);
+  assert.equal(combined.includes("\x1b"), false, "no ESC survives sanitization");
+  assert.equal(/[\x00-\x08\x0b-\x1f\x7f]/.test(combined), false, "no control byte survives sanitization");
+
+  // The bound is hard even though sanitization expands text: the fragment below
+  // is replaced before the cut, so the retained text can never grow past it.
+  const straddling = `${"y ".repeat(180)}${token.slice(0, 30)}${"z ".repeat(50)}`;
+  const bounded = boundDiagnosticText(straddling, tokens, 400);
+  assert.ok(bounded.length <= 400, "retained text never exceeds its bound");
+  assert.equal(bounded.includes("[truncated at 400 chars]"), true, "the truncation is explicit");
+  assert.equal(bounded.includes(token.slice(0, MIN_TOKEN_FRAGMENT)), false,
+    "the withheld fragment cannot reappear at the truncation boundary");
+  assert.equal(bounded.includes("y ".repeat(20)), true, "ordinary text before the cut is preserved");
+  assert.equal(boundDiagnosticText("short", tokens, 400), "short", "text inside the bound is unchanged");
+
+  // Redaction can expand six characters into a ten-character placeholder. The
+  // bound applies to the sanitized text, so expansion can never exceed it.
+  const expanding = `${"012345"} `.repeat(2000);
+  for (const limit of [400, SUMMARY_CHAR_LIMIT]) {
+    const output = boundDiagnosticText(expanding, tokens, limit);
+    assert.ok(output.length <= limit, "redaction expansion respects the hard bound");
+    assert.equal(output.includes(token.slice(0, MIN_TOKEN_FRAGMENT)), false,
+      "no fragment survives expansion and truncation");
+    assert.ok(output.endsWith(`[truncated at ${limit} chars]`), "the bound stays explicit");
+  }
+});
+
+/**
  * Real bundled CLI/PTY proof. No physical clipboard is read or written.
  *
  * The last leg additionally runs one explicitly opted-in (`nativeInputOriginFraming:
@@ -115,23 +274,169 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
   let broker: Awaited<ReturnType<typeof createStatusBroker>> | undefined;
   let framedManager: InstanceManager | undefined;
   const surfaces: TerminalSurface[] = [];
+  // ---------------------------------------------------------------------------
+  // Bounded pre-cleanup failure evidence.
+  //
+  // The existing failure dump is written under a bare `mkdtempSync` root that CI
+  // neither prints nor uploads, and it only covered the standalone/Main panes.
+  // Both gaps are observation-only: nothing below changes a launch, an input, an
+  // ordering step, a wait budget, or an assertion, and the unchanged cleanup
+  // `finally` still runs afterwards. CI retains the printed summary on stderr,
+  // hard-bounded to 8192 characters by the pure formatter above, which strips private
+  // string sequences and withholds every substantial fragment of a known
+  // registration token. A fault inside this diagnostics path is contained so it
+  // can never replace the original tester error.
+  // ---------------------------------------------------------------------------
+  type Owned = (typeof owned)[number];
+  let activeLeg = "setup";
+  let activeStage = "setup";
+  let activePane: TerminalSurface | undefined;
+  const paneLabels = new Map<TerminalSurface, string>();
+  const paneOwners = new Map<TerminalSurface, Owned>();
+  const trackPane = (label: string, surface: TerminalSurface, owner?: Owned): void => {
+    surfaces.push(surface);
+    paneLabels.set(surface, label);
+    if (owner) paneOwners.set(surface, owner);
+  };
+  // Tag the active leg/stage on every wait label and on the failure summary, so
+  // the two `remote` loop iterations and the repeated stage names stay distinct.
+  // A call without a pane clears the previous leg's pane, so the summary never
+  // attributes one leg's screen to another leg's failure.
+  const at = (legName: string, stageName: string, pane?: TerminalSurface): string => {
+    activeLeg = legName;
+    activeStage = stageName;
+    activePane = pane;
+    return `${legName}: ${stageName}`;
+  };
+  const knownTokens = (): string[] => owned.flatMap((item) => (item.bootstrap ? [item.bootstrap.token] : []));
+  const digestOf = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex").slice(0, 16);
+  const safeFrame = (surface: TerminalSurface): string => {
+    try { return text(surface); } catch { return "<frame unavailable: surface already disposed>"; }
+  };
+  const marker = (raw: string, needle: string): string => {
+    const count = raw.split(needle).length - 1;
+    return count === 0 ? "0" : `${count}@${raw.indexOf(needle)}`;
+  };
+  const buildFailureSummary = (error: unknown): string => {
+    const tokens = knownTokens();
+    const lines: string[] = [
+      `leg=${activeLeg} stage=${activeStage}`,
+      `error=${JSON.stringify(clip(sanitize(String(error), tokens), 400))}`,
+    ];
+    try {
+      const views = [manager, framedManager].flatMap((instance) => (instance ? instance.list() : []));
+      lines.push(`rows=${views.length}`);
+      for (const view of views) {
+        lines.push(`  row=${view.id} lifecycle=${view.lifecycle} liveProcess=${view.hasLiveProcess}`
+          + ` exitCode=${view.exitCode === undefined ? "none" : view.exitCode}`
+          + ` error=${view.error === undefined ? "none" : JSON.stringify(clip(sanitize(view.error, tokens), 160))}`);
+      }
+    } catch (rowError) {
+      lines.push(`rows=<unavailable: ${clip(sanitize(String(rowError), tokens), 160)}>`);
+    }
+    try {
+      lines.push(`ownedChildren=${owned.length}`);
+      owned.forEach((item, index) => {
+        lines.push(`  child[${index}] pid=${item.handle.pid} exited=${item.exited}`
+          + ` exitCode=${item.exitCode === undefined ? "none" : item.exitCode}`
+          + ` rawChars=${item.raw.length} rawSha256=${digestOf(item.raw)}`
+          + ` bootstrap=${item.bootstrap ? "present" : "none"}`);
+      });
+    } catch (childError) {
+      lines.push(`ownedChildren=<unavailable: ${clip(sanitize(String(childError), tokens), 160)}>`);
+    }
+    try {
+      const records = helperRecords();
+      lines.push(`helperRecords=${records.length} lens=[${records.map((record) => record.length).join(",")}]`
+        + ` sha256=[${records.map((record) => digestOf(record)).join(",")}]`);
+    } catch (helperError) {
+      lines.push(`helperRecords=<unavailable: ${clip(sanitize(String(helperError), tokens), 160)}>`);
+    }
+    // Recorders are reported as counts, lengths and digests only: never the
+    // recorded payload, an encoded clipboard capsule, or the decoded bytes.
+    owned.forEach((item, index) => {
+      try {
+        const recorded = copies(item);
+        lines.push(`clipboardRequests child[${index}]=${recorded.length}`
+          + ` lens=[${recorded.map((value) => value.length).join(",")}]`
+          + ` sha256=[${recorded.map((value) => digestOf(value)).join(",")}]`);
+      } catch (copyError) {
+        lines.push(`clipboardRequests child[${index}]=<unavailable: ${clip(sanitize(String(copyError), tokens), 160)}>`);
+      }
+    });
+    try {
+      if (!activePane) {
+        lines.push("activePane=none");
+      } else {
+        const owner = paneOwners.get(activePane);
+        lines.push(`activePane=${paneLabels.get(activePane) ?? "unlabelled"}`
+          + ` ownerPid=${owner ? owner.handle.pid : "none"}`
+          + ` ownerExited=${owner ? owner.exited : "none"}`);
+        const visible = safeFrame(activePane).split("\n");
+        lines.push(`visibleTail=${Math.min(SUMMARY_TAIL_LINES, visible.length)}/${visible.length} lines`);
+        const markerRows = (needle: string): string => {
+          const rows = visible.flatMap((line, row) => (line.includes(needle) ? [row] : []));
+          return rows.length === 0 ? "0" : `${rows.length}@${rows[0]}`;
+        };
+        lines.push(`visibleMarkers editorEcho=${markerRows("/copy-proof")} displayMessage=${markerRows("copy-proof-")}`
+          + ` clipA=${markerRows("CLIP466-A")} clipB=${markerRows("CLIP466-B")}`
+          + ` unknownCommand=${markerRows("Unknown command")} noApiKey=${markerRows("No API key")}`);
+        for (const line of visible.slice(-SUMMARY_TAIL_LINES)) {
+          lines.push(`  | ${clip(sanitize(line, tokens), SUMMARY_LINE_LIMIT)}`);
+        }
+      }
+    } catch (paneError) {
+      lines.push(`activePane=<unavailable: ${clip(sanitize(String(paneError), tokens), 160)}>`);
+    }
+    // Positions in the owned child's raw stream are the safest remaining signal:
+    // they answer "was the input echoed", "did the fixture command run" and "did
+    // the pane ever hold the marker" without retaining any raw byte.
+    try {
+      const target = (activePane ? paneOwners.get(activePane) : undefined) ?? owned.at(-1);
+      if (!target) {
+        lines.push("probeIndices=none");
+      } else {
+        const raw = target.raw;
+        lines.push(`probeIndices child[${owned.indexOf(target)}]`
+          + ` startupQueries="${marker(raw, "\x1b[?u")}/${marker(raw, "\x1b[>0q")}`
+          + `/${marker(raw, "\x1b[6n")}/${marker(raw, "\x1b]10;?")}"`
+          + ` editorEcho=${marker(raw, "/copy-proof")} displayMessage=${marker(raw, "copy-proof-")}`
+          + ` clipA=${marker(raw, "CLIP466-A")} clipB=${marker(raw, "CLIP466-B")}`
+          + ` unknownCommand=${marker(raw, "Unknown command")} noApiKey=${marker(raw, "No API key")}`
+          + ` osc52Output=${marker(raw, "\x1b]52;c;")} capsule777=${marker(raw, "\x1b]777;")}`);
+      }
+    } catch (probeError) {
+      lines.push(`probeIndices=<unavailable: ${clip(sanitize(String(probeError), tokens), 160)}>`);
+    }
+    return boundDiagnosticText(lines.join("\n"), tokens, SUMMARY_CHAR_LIMIT);
+  };
+  // The manager disposes each exited row's own surface, and the teardown below
+  // still disposes every retained pane. That double teardown stays safe by
+  // construction: `TerminalSurface.dispose()` begins with `if (this.disposed)
+  // return;` (src/session-host/terminal-surface.ts). Verified behaviourally here,
+  // so a future non-idempotent dispose cannot silently break retained evidence.
+  const disposeProbe = new TerminalSurface(4, 2);
+  disposeProbe.dispose();
+  disposeProbe.dispose();
   try {
+    at("standalone", "spawn");
     const direct = spawn(cli, args, common, join(root, "work"));
     const directSurface = new TerminalSurface(80, 30, { onReply: (data) => direct.handle.write(data), onChange: () => signal.notify() });
-    surfaces.push(directSurface);
+    trackPane("standalone", directSurface, direct);
     direct.handle.onData((data) => directSurface.write(data));
-    await signal.waitFor(() => text(directSurface).includes("─".repeat(20)), 20_000, "native editor");
+    await signal.waitFor(() => text(directSurface).includes("─".repeat(20)), 20_000, at("standalone", "native editor", directSurface));
     direct.handle.write("/copy-proof\r");
-    await signal.waitFor(() => text(directSurface).includes("CLIP466-B"), 20_000, "native synthetic text");
+    await signal.waitFor(() => text(directSurface).includes("CLIP466-B"), 20_000, at("standalone", "native synthetic text", directSurface));
     select(directSurface, (data) => direct.handle.write(data));
-    await signal.waitFor(() => copies(direct).length === 1, 20_000, "standalone native clipboard request");
+    await signal.waitFor(() => copies(direct).length === 1, 20_000, at("standalone", "native clipboard request", directSurface));
     assert.equal(helperRecords().length, 1);
     const expected = copies(direct)[0]!;
     assert.equal(Buffer.from(expected, "base64").toString("utf8"), "CLIP466-A αβ café\n CLIP466-B 雪 end");
     direct.handle.write("/proof-exit\r");
-    await signal.waitFor(() => direct.exited, 20_000, "standalone owned exit");
+    await signal.waitFor(() => direct.exited, 20_000, at("standalone", "owned exit", directSurface));
 
     broker = await createStatusBroker({ socketRoot: join(root, "broker") });
+    at("hosted", "spawn");
     const delivered: NativeClipboardEvent[] = [];
     let hosted: (typeof owned)[number] | undefined;
     manager = new InstanceManager({ packageRoot: candidate.root, piExecutable: cli, statusRegistrar: broker,
@@ -141,12 +446,13 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     });
     const id = await manager.create({ workspace: join(root, "work") });
     const surface = manager.surface(id)!;
+    trackPane("hosted", surface, hosted);
     const write = (data: string): void => manager!.write(id, data);
-    await signal.waitFor(() => text(surface).includes("─".repeat(20)), 20_000, "hosted editor");
+    await signal.waitFor(() => text(surface).includes("─".repeat(20)), 20_000, at("hosted", "editor", surface));
     write("/copy-proof\r");
-    await signal.waitFor(() => text(surface).includes("CLIP466-B"), 20_000, "hosted synthetic text");
+    await signal.waitFor(() => text(surface).includes("CLIP466-B"), 20_000, at("hosted", "synthetic text", surface));
     select(surface, write);
-    await signal.waitFor(() => delivered.some((event) => event.kind === "copy"), 20_000, "production parser/manager native request");
+    await signal.waitFor(() => delivered.some((event) => event.kind === "copy"), 20_000, at("hosted", "production parser/manager native request", surface));
     assert.deepEqual(copies(hosted!), [expected]);
     assert.equal(helperRecords().length, 2, "one unchanged local helper call per native copy");
     assert.equal(hosted!.raw.includes("\x1b]52;c;"), false, "no raw clipboard passthrough in hosted output");
@@ -155,24 +461,24 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const refusals = (): number => events(hosted!).filter((event) => event.kind === "unavailable").length
       + hosted!.raw.split(`\x1b]52;c;${decoy}\x07`).length - 1;
     write("/copy-decoy\r");
-    await signal.waitFor(() => refusals() > 0, 20_000, "raw decoy actually emitted and refused");
+    await signal.waitFor(() => refusals() > 0, 20_000, at("hosted", "raw decoy actually emitted and refused", surface));
     await surface.flush();
     assert.deepEqual(copies(hosted!), [expected], "a user-input timing window grants nothing to arbitrary output");
     assert.ok(!text(surface).includes(decoy), "refused raw output is not printable screen text");
     const beforeRender = refusals();
     write("/copy-render-decoy\r");
-    await signal.waitFor(() => refusals() > beforeRender, 20_000, "render-path decoy actually emitted and refused");
+    await signal.waitFor(() => refusals() > beforeRender, 20_000, at("hosted", "render-path decoy actually emitted and refused", surface));
     // Select again with the decoy widget live: source provenance, not first/last
     // write ordering, must preserve the genuine native producer exactly once.
     await surface.flush();
     select(surface, write);
-    await signal.waitFor(() => copies(hosted!).length === 2, 20_000, "genuine native request survives in-scope render decoys");
+    await signal.waitFor(() => copies(hosted!).length === 2, 20_000, at("hosted", "genuine native request survives in-scope render decoys", surface));
     assert.deepEqual(copies(hosted!), [expected, expected]);
     assert.equal(helperRecords().length, 3);
     const shutdown = await manager.shutdown({ graceMs: 8000, killMs: 2000 });
     assert.deepEqual(shutdown.remainingIds, []);
     assert.deepEqual(shutdown.forcedIds, []);
-    await signal.waitFor(() => hosted!.exited, 5000, "hosted owned exit");
+    await signal.waitFor(() => hosted!.exited, 5000, at("hosted", "owned exit", surface));
     await manager.dispose();
     manager = undefined;
 
@@ -181,6 +487,8 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ fullscreenCopyOnSelect: false }), { mode: 0o600 });
     writeFileSync(join(agentDir, "keybindings.json"), JSON.stringify({ "app.message.copy": "f6" }), { mode: 0o600 });
     for (const remote of [true, false]) {
+      const leg = `fresh-native(remote=${remote})`;
+      at(leg, "spawn");
       const env = { ...common };
       if (!remote) delete env.SSH_CONNECTION;
       let child: (typeof owned)[number] | undefined;
@@ -192,40 +500,53 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       });
       const row = await manager.create({ workspace: join(root, "work") });
       const pane = manager.surface(row)!;
+      trackPane(leg, pane, child);
       const input = (data: string): void => manager!.write(row, data);
-      await signal.waitFor(() => text(pane).includes("─".repeat(20)), 20_000, "fresh native editor");
+      await signal.waitFor(() => text(pane).includes("─".repeat(20)), 20_000, at(leg, "fresh native editor", pane));
       input("/copy-proof\r");
-      await signal.waitFor(() => text(pane).includes("CLIP466-B"), 20_000, "fresh native selection text");
+      // The original CLIP466-B condition keeps its unchanged 20 000 ms budget, no
+      // retry, and no added readiness heuristic. Observing an owned child exit or
+      // an error row INSIDE that same wait turns a would-be full-timeout into an
+      // early, distinct failure carrying the liveness facts instead of burning
+      // the budget on a silent row.
+      await signal.waitFor(() => text(pane).includes("CLIP466-B") || child!.exited
+        || manager!.list().find((view) => view.id === row)?.lifecycle === "error",
+        20_000, at(leg, "fresh native selection text", pane));
+      const selectionRow = manager!.list().find((view) => view.id === row);
+      assert.ok(text(pane).includes("CLIP466-B"), `${leg}: fresh native selection text was not observed within the unchanged 20000 ms budget`
+        + ` (childExited=${child!.exited} childExitCode=${child!.exitCode === undefined ? "none" : child!.exitCode}`
+        + ` row=${selectionRow?.lifecycle ?? "unknown"}`
+        + `${selectionRow?.error ? ` rowError=${JSON.stringify(clip(sanitize(selectionRow.error, knownTokens()), 160))}` : ""})`);
       const before = helperRecords().length;
       select(pane, input);
       await signal.waitForQuiet(() => helperRecords().length > before || copies(child!).length > 0, 200,
-        "copy-on-select off leaves the clipboard untouched on release");
+        at(leg, "copy-on-select off leaves the clipboard untouched on release", pane));
       input("\x1b[17~"); // live-remapped app.message.copy, not a hardcoded Ctrl+X
-      await signal.waitFor(() => helperRecords().length === before + 1, 20_000, "configured native copy uses the original helper once");
+      await signal.waitFor(() => helperRecords().length === before + 1, 20_000, at(leg, "configured native copy uses the original helper once", pane));
       if (remote) {
-        await signal.waitFor(() => received.some((event) => event.kind === "copy"), 20_000, "configured key routes native SSH copy");
+        await signal.waitFor(() => received.some((event) => event.kind === "copy"), 20_000, at(leg, "configured key routes native SSH copy", pane));
         assert.deepEqual(copies(child!), [expected]);
         const epoch = manager.list().find((view) => view.id === row)!.nativeSession!.epoch;
         input("/reload\r");
         await signal.waitFor(() => (manager!.list().find((view) => view.id === row)?.nativeSession?.epoch ?? 0) > epoch,
-          20_000, "reload advances the authoritative native epoch");
+          20_000, at(leg, "reload advances the authoritative native epoch", pane));
         input("/copy-proof\r");
-        await signal.waitFor(() => text(pane).includes("copy-proof-2") && text(pane).includes("CLIP466-B"), 20_000, "fresh reloaded native selection frame");
+        await signal.waitFor(() => text(pane).includes("copy-proof-2") && text(pane).includes("CLIP466-B"), 20_000, at(leg, "fresh reloaded native selection frame", pane));
         await pane.flush();
         select(pane, input);
         input("\x1b[17~");
-        await signal.waitFor(() => copies(child!).length === 2, 20_000, "one process-owned bridge survives extension reload");
+        await signal.waitFor(() => copies(child!).length === 2, 20_000, at(leg, "one process-owned bridge survives extension reload", pane));
         assert.deepEqual(copies(child!), [expected, expected]);
         assert.equal(helperRecords().length, before + 2);
       } else {
         await signal.waitForQuiet(() => received.length > 0 || /\x1b\](?:52;c;|777;)/.test(child!.raw), 200,
-          "ordinary local helper-only copy produces no terminal request");
+          at(leg, "ordinary local helper-only copy produces no terminal request", pane));
       }
       assert.equal(helperRecords().at(-1), Buffer.from(expected, "base64").toString("utf8"));
       const stopped = await manager.shutdown({ graceMs: 8000, killMs: 2000 });
       assert.deepEqual(stopped.remainingIds, []);
       assert.deepEqual(stopped.forcedIds, []);
-      await signal.waitFor(() => child!.exited, 5000, "fresh owned child exit");
+      await signal.waitFor(() => child!.exited, 5000, at(leg, "fresh owned child exit", pane));
       await manager.dispose();
       manager = undefined;
     }
@@ -248,6 +569,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     // real terminal emulator, or Windows ConPTY claim is made.
     // -------------------------------------------------------------------------
     const framedEnv: NodeJS.ProcessEnv = { ...common };
+    at("framed", "spawn");
     delete framedEnv.SSH_CONNECTION; // local-only leg: no remote origin is implied
     const framedWrites: string[] = [];
     const framedReceived: NativeClipboardEvent[] = [];
@@ -281,14 +603,15 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     });
     const framedId = await framedManager.create({ workspace: join(root, "work") });
     const framedPane = framedManager.surface(framedId)!;
+    trackPane("framed", framedPane, framedChild);
     const framedInput = (data: string): void => framedManager!.write(framedId, data);
     assert.ok(framedChild && framedChild.bootstrap, "the opted-in row owns its child and bootstrap");
     const framedBootstrap = framedChild.bootstrap;
     assert.equal(framedChild.bootstrap.inputOriginFraming, 1, "the closed mode reached the actual one-shot bootstrap");
     assert.equal(framedSpawnEnv?.PI_CLIPBOARD_OSC52, "1", "only this opted-in launch gained the static capture flag");
-    await signal.waitFor(() => text(framedPane).includes("─".repeat(20)), 20_000, "opted-in native editor");
+    await signal.waitFor(() => text(framedPane).includes("─".repeat(20)), 20_000, at("framed", "opted-in native editor", framedPane));
     await signal.waitFor(() => framedChild!.raw.includes("\x1b]777;prg-native-input-ready-v1;"), 20_000,
-      "the strict child authenticated its decoder installation");
+      at("framed", "the strict child authenticated its decoder installation", framedPane));
     const readyAt = framedChild.raw.indexOf("\x1b]777;prg-native-input-ready-v1;");
     const firstStartupQuery = Math.min(...["\x1b[?u", "\x1b[>0q", "\x1b[6n", "\x1b]10;?"].map((probe) => {
       const at = framedChild!.raw.indexOf(probe);
@@ -324,7 +647,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
 
     // Ordinary input, then the unchanged native copy route and helper.
     framedInput("/copy-proof\r");
-    await signal.waitFor(() => text(framedPane).includes("CLIP466-B"), 20_000, "opted-in synthetic text");
+    await signal.waitFor(() => text(framedPane).includes("CLIP466-B"), 20_000, at("framed", "opted-in synthetic text", framedPane));
     const proofFrames = drainFrames();
     const proofDispatch = proofFrames.at(-1)!;
     assert.deepEqual(proofDispatch.origin, { kind: "local" }, "local user input is classified local");
@@ -335,7 +658,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     select(framedPane, framedInput);
     framedInput("\x1b[17~"); // the configured native copy key, unchanged from the legacy control
     await signal.waitFor(() => framedReceived.some((event) => event.kind === "copy"), 20_000,
-      "a strict row still routes its native copy through the existing host route");
+      at("framed", "a strict row still routes its native copy through the existing host route", framedPane));
     assert.equal(helperRecords().length, framedHelperBefore + 1, "the unchanged native helper ran exactly once");
     assert.equal(helperRecords().at(-1), Buffer.from(expected, "base64").toString("utf8"),
       "the local payload handed to the helper is unchanged");
@@ -345,15 +668,15 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const framedEpoch = framedManager.list().find((view) => view.id === framedId)!.nativeSession!.epoch;
     framedInput("/reload\r");
     await signal.waitFor(() => (framedManager!.list().find((view) => view.id === framedId)?.nativeSession?.epoch ?? 0) > framedEpoch,
-      20_000, "reload advanced the authoritative native epoch");
+      20_000, at("framed", "reload advanced the authoritative native epoch", framedPane));
     framedInput("/copy-proof\r");
     await signal.waitFor(() => text(framedPane).includes("copy-proof-2") && text(framedPane).includes("CLIP466-B"),
-      20_000, "fresh reloaded native selection frame");
+      20_000, at("framed", "fresh reloaded native selection frame", framedPane));
     await framedPane.flush();
     select(framedPane, framedInput);
     framedInput("\x1b[17~");
     await signal.waitFor(() => framedReceived.filter((event) => event.kind === "copy").length === 2, 20_000,
-      "one process-owned bridge and encoder survive extension reload");
+      at("framed", "one process-owned bridge and encoder survive extension reload", framedPane));
     const afterReload = drainFrames();
     assert.ok(afterReload.length > 0, "the reloaded row kept framing input");
     assert.ok(Math.min(...afterReload.map((f) => f.dispatchId)) > proofDispatch.dispatchId,
@@ -371,7 +694,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const unicodeText = "αβ café 雪 — ünïcödé";
     const unicode = `\x1b[200~/input-proof ${unicodeText}\x1b[201~`;
     framedInput(unicode);
-    await signal.waitFor(() => text(framedPane).includes("ünïcödé"), 20_000, "the opted-in child received Unicode input");
+    await signal.waitFor(() => text(framedPane).includes("ünïcödé"), 20_000, at("framed", "the opted-in child received Unicode input", framedPane));
     const unicodeFrames = drainFrames();
     const unicodeDispatch = unicodeFrames.at(-1)!;
     assert.deepEqual(unicodeDispatch.origin, { kind: "local" });
@@ -380,12 +703,12 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     framedInput("\r");
     const unicodeMarker = `INPUT466:${createHash("sha256").update(unicodeText, "utf8").digest("hex")}`;
     await signal.waitFor(() => text(framedPane).replace(/\s/g, "").includes(unicodeMarker), 20_000,
-      "the native command received the complete Unicode payload and cleared the editor");
+      at("framed", "the native command received the complete Unicode payload and cleared the editor", framedPane));
 
     // Geometry stays the manager's own, and the seam keeps framing afterwards.
     assert.ok(framedManager.resizeInstance(framedId, 100, 32), "the opted-in row accepted a geometry change");
     await signal.waitFor(() => framedPane.frame().cols === 100 && framedPane.frame().rows === 32, 20_000,
-      "the opted-in surface reflowed to the admitted geometry");
+      at("framed", "the opted-in surface reflowed to the admitted geometry", framedPane));
     const bigText = "雪".repeat(30_000);
     const big = `\x1b[200~/input-proof ${bigText}\x1b[201~`; // ~90 KiB, above the 32 KiB fragment bound
     framedInput(big);
@@ -401,7 +724,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     framedInput("\r");
     const bigMarker = `INPUT466:${createHash("sha256").update(bigText, "utf8").digest("hex")}`;
     await signal.waitFor(() => text(framedPane).replace(/\s/g, "").includes(bigMarker), 20_000,
-      "the real child received the complete large paste byte-exactly");
+      at("framed", "the real child received the complete large paste byte-exactly", framedPane));
     assert.equal(framedManager.list().find((view) => view.id === framedId)!.lifecycle, "alive",
       "the opted-in row survived framing a large paste");
     assert.ok(framedWrites.every((frame) => frame.startsWith("prg-ni-v1;")),
@@ -430,7 +753,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const framedStop = await framedManager.shutdown({ graceMs: 8000, killMs: 2000 });
     assert.deepEqual(framedStop.remainingIds, []);
     assert.deepEqual(framedStop.forcedIds, []);
-    await signal.waitFor(() => framedChild!.exited, 5000, "opted-in owned exit");
+    await signal.waitFor(() => framedChild!.exited, 5000, at("framed", "opted-in owned exit", framedPane));
     await framedManager.dispose();
     framedManager = undefined;
     // Genuine registered question/notice tools through Pi's faux provider:
@@ -448,27 +771,29 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     // Native input -> child -> authenticated parser -> actual Main display/focus
     // guard -> ProcessTerminal output is exercised end to end, not a mock sink.
     const runner = join(root, "real-main.cjs");
+    at("popup", "spawn");
     writeFileSync(runner, `require(${JSON.stringify(join(candidate.root, "dist", "src", "session-host", "main.js"))}).runSessionHost({packageRoot:${JSON.stringify(candidate.root)},piExecutable:${JSON.stringify(cli)},stateRoot:${JSON.stringify(join(root, "broker"))},toggleKey:'f8',args:JSON.parse(process.env.PRG_COPY_MAIN_ARGS),env:process.env}).then(code=>{process.exitCode=code},()=>{process.exitCode=1});`, { mode: 0o600, flag: "wx" });
     let popupChild: (typeof owned)[number] | undefined;
     const popupPane = new TerminalSurface(120, 40, { onReply: (data) => popupChild?.handle.write(data), onChange: () => signal.notify() });
-    surfaces.push(popupPane);
+    trackPane("popup", popupPane);
     popupPane.write("PRG-COPY-RESTORE");
     popupChild = spawn(process.execPath, [runner], { ...popupEnv, PRG_COPY_MAIN_ARGS: JSON.stringify(popupArgs) }, join(root, "work"), 120, 40);
+    paneOwners.set(popupPane, popupChild);
     popupChild.handle.onData((data) => popupPane.write(data));
     const popupInput = (data: string): void => popupChild!.handle.write(data);
-    await signal.waitFor(() => text(popupPane).includes("New session"), 20_000, "real host welcome");
+    await signal.waitFor(() => text(popupPane).includes("New session"), 20_000, at("popup", "real host welcome", popupPane));
     popupInput("\r");
-    await signal.waitFor(() => text(popupPane).includes("Workspace"), 20_000, "real host New form");
+    await signal.waitFor(() => text(popupPane).includes("Workspace"), 20_000, at("popup", "real host New form", popupPane));
     popupInput(`\x1b[200~${join(root, "work")}\x1b[201~`);
     popupInput("\r");
-    await signal.waitFor(() => text(popupPane).includes("prg-native-question") || text(popupPane).includes("driven"), 30_000, "real native Main");
+    await signal.waitFor(() => text(popupPane).includes("prg-native-question") || text(popupPane).includes("driven"), 30_000, at("popup", "real native Main", popupPane));
     popupInput("populate synthetic clipboard proof\r");
     await signal.waitFor(() => text(popupPane).includes("ASSISTANT466-B 雪 end") && text(popupPane).includes("Pending input"), 30_000,
-      "actual registered question and notice tools finish the synthetic turn");
+      at("popup", "actual registered question and notice tools finish the synthetic turn", popupPane));
     // No mouse selection has yet existed in this fresh child: exercise the
     // native Main fallback without assuming ordinary typing clears selection.
     popupInput("\x1b[17~");
-    await signal.waitFor(() => copies(popupChild!).length === 1, 20_000, "native Main application-copy fallback preserved");
+    await signal.waitFor(() => copies(popupChild!).length === 1, 20_000, at("popup", "native Main application-copy fallback preserved", popupPane));
     assert.equal(Buffer.from(copies(popupChild!)[0]!, "base64").toString("utf8"), "ASSISTANT466-A αβ café\nASSISTANT466-B 雪 end");
     // The faux-provider turn already drew the assistant rows in this fresh Main
     // conversation, so select those visible rows directly. Registering another
@@ -477,7 +802,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     select(popupPane, popupInput, "ASSISTANT466-A", "ASSISTANT466-B");
     popupInput("\x1b[17~");
     await signal.waitFor(() => copies(popupChild!).length === 2, 20_000,
-      "actual Main ProcessTerminal emits exactly one clipboard request per copy gesture");
+      at("popup", "actual Main ProcessTerminal emits exactly one clipboard request per copy gesture", popupPane));
     const mainSelected = Buffer.from(copies(popupChild!)[1]!, "base64").toString("utf8");
     // Native selection slices the rendered rows, so the assistant body's own
     // one-column output padding stays on the continuation row.
@@ -489,7 +814,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const popupBaseline = 2;
     // Leave this live conversation selection in place for the popup-entry fence.
     popupInput("\x1b[1;7A");
-    await signal.waitFor(() => text(popupPane).includes("open question/notice"), 20_000, "shared pending list actually drawn and focused");
+    await signal.waitFor(() => text(popupPane).includes("open question/notice"), 20_000, at("popup", "shared pending list actually drawn and focused", popupPane));
     popupInput("\r");
     const pairs = [["VISIBLE466-A", "VISIBLE466-B"], ["VISIBLE466-Q", "VISIBLE466-R"]] as const;
     const region = (): { top: number; bottom: number; pair: (typeof pairs)[number] } | undefined => {
@@ -508,17 +833,17 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     };
     const shown = new Set<string>();
     for (let index = 0; index < 2; index += 1) {
-      await signal.waitFor(() => region() !== undefined, 20_000, "visible framed question or notice body");
+      await signal.waitFor(() => region() !== undefined, 20_000, at("popup", "visible framed question or notice body", popupPane));
       await popupPane.flush();
       const visible = region()!;
       shown.add(visible.pair[0]);
       const before = helperRecords().length;
       popupInput("\x1b[17~");
       await signal.waitForQuiet(() => helperRecords().length > before || copies(popupChild!).length > index + popupBaseline, 200,
-        "popup entry rejects inherited hidden-conversation selection");
+        at("popup", "popup entry rejects inherited hidden-conversation selection", popupPane));
       select(popupPane, popupInput, visible.pair[0], visible.pair[1], visible.top, visible.bottom);
       popupInput("\x1b[17~");
-      await signal.waitFor(() => copies(popupChild!).length === index + popupBaseline + 1, 20_000, "real visible-popup copy reaches outer terminal");
+      await signal.waitFor(() => copies(popupChild!).length === index + popupBaseline + 1, 20_000, at("popup", "real visible-popup copy reaches outer terminal", popupPane));
       const payload = Buffer.from(copies(popupChild!)[index + popupBaseline]!, "base64").toString("utf8");
       assert.ok(payload.includes(`${visible.pair[0]} αβ café`) && payload.includes(`${visible.pair[1]} 雪 end`));
       assert.ok(!payload.includes("CLIP466") && !payload.includes("ASSISTANT466"), "never copy hidden conversation rows");
@@ -526,23 +851,23 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       assert.equal(payload, helperRecords().at(-1), "exact native producer payload reaches the real outer route unchanged");
       if (index === 0) {
         popupInput("\x1b");
-        await signal.waitFor(() => text(popupPane).includes("open question/notice") && region() === undefined, 20_000, "back to drawn pending list");
+        await signal.waitFor(() => text(popupPane).includes("open question/notice") && region() === undefined, 20_000, at("popup", "back to drawn pending list", popupPane));
         // Re-enter the shared popup so its existing entry fence applies. Do
         // not invent a new selection-reset policy for in-popup view changes.
         popupInput("\x1b");
-        await signal.waitFor(() => !text(popupPane).includes("open question/notice") && region() === undefined, 20_000, "shared popup closed");
+        await signal.waitFor(() => !text(popupPane).includes("open question/notice") && region() === undefined, 20_000, at("popup", "shared popup closed", popupPane));
         popupInput("\x1b[1;7A");
-        await signal.waitFor(() => text(popupPane).includes("open question/notice"), 20_000, "fresh shared popup entry");
+        await signal.waitFor(() => text(popupPane).includes("open question/notice"), 20_000, at("popup", "fresh shared popup entry", popupPane));
         popupInput("\x1b[B"); popupInput("\r");
       }
     }
     assert.equal(shown.size, 2, "both foreground question and notice surfaces exercised");
     popupInput("\x1b[19~"); // host F8: focus roster, not a native copy gesture
     popupInput("q");
-    await signal.waitFor(() => text(popupPane).includes("Quit host?"), 20_000, "real host Quit confirmation");
+    await signal.waitFor(() => text(popupPane).includes("Quit host?"), 20_000, at("popup", "real host Quit confirmation", popupPane));
     popupInput("y");
     await signal.waitFor(() => popupChild!.exited && text(popupPane).includes("PRG-COPY-RESTORE")
-      && popupPane.inputModes().mouseTracking === "none", 20_000, "original real host exits and restores its terminal after owned children settle");
+      && popupPane.inputModes().mouseTracking === "none", 20_000, at("popup", "original real host exits and restores its terminal after owned children settle", popupPane));
     await popupPane.flush();
     assert.ok(!existsSync(hostOwnershipPath(agentDir)), "production ownership release requires child-exit settlement");
     assert.match(text(popupPane), /PRG-COPY-RESTORE/, "original outer terminal screen restored");
@@ -550,18 +875,28 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     assert.ok(owned.every((item) => item.exitCode === 0));
     // Deliberately no assertion about a physical terminal or OS clipboard.
   } catch (error) {
+    const artifact = join(root, "failure.json");
     try {
-      writeFileSync(join(root, "failure.json"), JSON.stringify({ error: String(error), helpers: helperRecords(),
-        frames: surfaces.map(text), outputs: owned.map((item) => ({ exited: item.exited, raw: item.raw.slice(-262144) })) }),
+      writeFileSync(artifact, JSON.stringify({ error: String(error), helpers: helperRecords(),
+        frames: surfaces.map(safeFrame), outputs: owned.map((item) => ({ exited: item.exited, raw: item.raw.slice(-262144) })) }),
       { mode: 0o600, flag: "wx" });
     } catch { /* Preserve the original assertion and still settle owned children. */ }
+    // The artifact root is ephemeral and nothing collects it, so the bounded
+    // summary is what CI actually retains. Each fault here is contained: the
+    // original tester error is rethrown below and cleanup still runs.
+    try {
+      const summary = buildFailureSummary(error);
+      process.stderr.write(`[native-clipboard-routing failure evidence] artifact=${artifact}\n${summary}\n`);
+    } catch {
+      try { process.stderr.write(`[native-clipboard-routing failure evidence] artifact=${artifact} (summary unavailable)\n`); } catch { /* never mask */ }
+    }
     throw error;
   } finally {
     if (manager) await manager.shutdown({ graceMs: 2000, killMs: 2000 });
     for (const item of owned) {
       if (!item.exited) {
         item.handle.kill("SIGTERM");
-        await signal.waitFor(() => item.exited, 5000, "owned fixture cleanup exit");
+        await signal.waitFor(() => item.exited, 5000, at("teardown", "owned fixture cleanup exit"));
       }
     }
     if (manager) await manager.dispose();

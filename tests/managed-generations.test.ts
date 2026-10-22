@@ -1252,8 +1252,16 @@ test("the handoff still acquires the entry after a live-holder release past the 
       // Longer than the 2s producer admission deadline, then settle the entry.
       `const holdUntil = Date.now() + 2600;`,
       `while (Date.now() < holdUntil) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);`,
-      `fs.unlinkSync(lock);`,
-      `if (shape === "empty-record") fs.writeFileSync(lock, "", { mode: 0o600 });`,
+      // Publish the empty fixture atomically: unlink-then-write would expose a
+      // gap in which the handoff can acquire, then truncate its new record. That
+      // tests a destructive fixture writer, not malformed-record recovery.
+      `if (shape === "empty-record") {`,
+      `  const settled = lock + ".fixture-settled";`,
+      `  fs.writeFileSync(settled, "", { mode: 0o600, flag: "wx" });`,
+      `  fs.renameSync(settled, lock);`,
+      `} else {`,
+      `  fs.unlinkSync(lock);`,
+      `}`,
       `process.stdout.write("settled\\n");`,
       ``,
     ].join("\n"), "utf8");
@@ -1265,9 +1273,10 @@ test("the handoff still acquires the entry after a live-holder release past the 
       handoff.stdout!.setEncoding("utf8");
       handoff.stdout!.on("data", (chunk: string) => { output += chunk; });
       const result = await new Promise<{ held: boolean; elapsed: number; owner: string; identity: string; pid: number }>((resolve, reject) => {
-        handoff.once("exit", () => {
+        handoff.once("exit", (code, signal) => {
           const line = output.trim().split("\n").filter((entry) => entry.startsWith("{"))[0];
-          if (!line) reject(new Error(`no handoff result: ${output}`));
+          if (code !== 0) reject(new Error(`handoff did not exit successfully (code=${code}, signal=${signal}): ${output}`));
+          else if (!line) reject(new Error(`no handoff result: ${output}`));
           else resolve(JSON.parse(line!) as { held: boolean; elapsed: number; owner: string; identity: string; pid: number });
         });
       });

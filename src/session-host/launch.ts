@@ -770,6 +770,20 @@ export interface NativeLaunchOptions {
   savedSession?: SavedSessionAdmission;
   /** Environment to clone (defaults to process.env); never mutated. */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Closed internal opt-in (default false) for a FUTURE sidebar-hosted child:
+   * supply the supported static `PI_CLIPBOARD_OSC52=1` capture mode so the
+   * child's native copies reach the host's existing authenticated route instead
+   * of only the local OS helper. Only `nativeSetup: true` launches accept it —
+   * legacy profile mode and every standalone launch outside a hosted process
+   * tree stay untouched, and an already-running child is never retrofitted. The
+   * value is written into the cloned descriptor environment only: the caller's
+   * env object and the host process environment are never modified, an existing
+   * user value is otherwise inherited unchanged, and ordinary descendant
+   * inheritance inside the child's own process tree continues to work normally.
+   * This grants no clipboard, input, or trust authority by itself.
+   */
+  nativeInputOriginFraming?: boolean;
 }
 
 /**
@@ -837,6 +851,15 @@ export interface NativeLaunchOptions {
 export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchDescriptor {
   const platform = process.platform;
   assertSupportedPlatform(platform);
+  // The closed capture opt-in is validated before any filesystem mutation, so a
+  // legacy profile launch or a malformed request never performs setup work.
+  if (options.nativeInputOriginFraming !== undefined && typeof options.nativeInputOriginFraming !== "boolean") {
+    throw new Error("pi-review-gate: nativeInputOriginFraming must be a boolean or absent");
+  }
+  const inputOriginFraming = options.nativeInputOriginFraming === true;
+  if (inputOriginFraming && !options.nativeSetup) {
+    throw new Error("pi-review-gate: native input framing is available only for native setup launches");
+  }
   // Snapshot Windows environment names case-insensitively before either the
   // parent startup preflight or later role/capability checks.
   const env = snapshotNativeEnvironment(options.env ?? process.env, platform);
@@ -938,6 +961,13 @@ export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchD
       env.PI_IMAGE_PROTOCOL = isDirectGhosttyTerminal(env) ? "kitty" : "none";
     }
     if (env.PI_REVIEW_GATE_CODEMODE_DEFAULT === undefined) env.PI_REVIEW_GATE_CODEMODE_DEFAULT = "1";
+    // Opt-in hosted capture mode: the one supported STATIC force flag, written
+    // only into this child's cloned descriptor env (never the caller's env or the
+    // host environment). Ordinary native launches never gain it, a user's
+    // existing value is otherwise inherited untouched, and no per-input or
+    // dynamic env toggling happens here. Approved descendants of this child
+    // inherit it normally; nothing outside this process tree changes.
+    if (inputOriginFraming) env.PI_CLIPBOARD_OSC52 = "1";
   }
 
   // NODE_OPTIONS: the preload require clause is PREPENDED before the user's

@@ -191,6 +191,7 @@ function baseOptions(
     args: string[];
     env: NodeJS.ProcessEnv;
     savedSession: SavedSessionAdmission;
+    nativeInputOriginFraming: boolean;
   }> = {},
 ): Parameters<typeof prepareNativeLaunch>[0] {
   return {
@@ -2013,5 +2014,59 @@ test("the startup options helper resolves only the own compiled package scripts 
   assert.throws(
     () => launchB.prepareNativeLaunch({ packageRoot: pkgB, agentDir: join(pkgB, "missing-agent-dir"), workspace: join(pkgB, "missing-workspace"), piExecutable: join(pkgB, "missing-bin", "pi"), args: ["--session", "/tmp/old.jsonl"] }),
     /startup override is not accepted: --session/,
+  );
+});
+
+test("the native input-framing opt-in supplies the static capture flag to its own launch only", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const nativeEnv: NodeJS.ProcessEnv = {
+    HOME: join(pkg.root, "home"),
+    PATH: process.env.PATH,
+    PI_CODING_AGENT_DIR: pkg.agentDir,
+  };
+  // A caller that already carries a value for the supported variable: the opt-in
+  // replaces it in the launch descriptor it owns, and nowhere else.
+  const callerEnv: NodeJS.ProcessEnv = { ...nativeEnv, PI_CLIPBOARD_OSC52: "caller-owned" };
+  const callerSnapshot = JSON.stringify(callerEnv);
+  const processValueBefore = process.env.PI_CLIPBOARD_OSC52;
+
+  const framed = prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: callerEnv, nativeInputOriginFraming: true }));
+  assert.equal(framed.env.PI_CLIPBOARD_OSC52, "1", "the opted-in native launch carries the supported static flag");
+  assert.equal(JSON.stringify(callerEnv), callerSnapshot, "the caller's env object is never mutated");
+  assert.equal(process.env.PI_CLIPBOARD_OSC52, processValueBefore, "the host process env is never mutated");
+
+  const second = prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: callerEnv, nativeInputOriginFraming: true }));
+  assert.equal(second.env.PI_CLIPBOARD_OSC52, "1");
+  assert.notEqual(second.env, framed.env, "each launch composes its own environment copy");
+
+  // Every path without the opt-in keeps the caller's value exactly as given.
+  const ordinaryNative = prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: callerEnv }));
+  assert.equal(ordinaryNative.env.PI_CLIPBOARD_OSC52, "caller-owned",
+    "an ordinary native launch never gains the flag");
+  const explicitFalse = prepareNativeLaunch(baseOptions(pkg, {
+    nativeSetup: true, env: callerEnv, nativeInputOriginFraming: false,
+  }));
+  assert.equal(explicitFalse.env.PI_CLIPBOARD_OSC52, "caller-owned");
+  const legacy = prepareNativeLaunch(baseOptions(pkg, { env: callerEnv }));
+  assert.equal(legacy.env.PI_CLIPBOARD_OSC52, "caller-owned", "the legacy/private mode never gains the flag");
+  const bareNative = prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeEnv }));
+  assert.equal(Object.hasOwn(bareNative.env, "PI_CLIPBOARD_OSC52"), false,
+    "a caller without the variable does not acquire it without the opt-in");
+  const bareLegacy = prepareNativeLaunch(baseOptions(pkg, { env: nativeEnv }));
+  assert.equal(Object.hasOwn(bareLegacy.env, "PI_CLIPBOARD_OSC52"), false);
+
+  // The opt-in is closed: it requires the native setup and a real boolean.
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { env: callerEnv, nativeInputOriginFraming: true })),
+    /available only for native setup launches/,
+    "the legacy/private mode cannot request input framing",
+  );
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, {
+      nativeSetup: true, env: callerEnv, nativeInputOriginFraming: "yes" as never,
+    })),
+    /must be a boolean or absent/,
+    "a malformed opt-in is refused instead of guessing",
   );
 });

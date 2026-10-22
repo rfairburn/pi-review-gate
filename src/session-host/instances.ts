@@ -15,6 +15,11 @@ import { TerminalSurface } from "./terminal-surface";
 import type { TerminalDiagnosticEvent } from "./terminal-diagnostics";
 import { createNativeClipboardReceiver, type NativeClipboardEvent } from "./native-clipboard";
 import {
+	createNativeInputEncoder,
+	type NativeInputEncoder,
+	type NativeInputOrigin,
+} from "./native-input-origin";
+import {
 	hasCompleteSessionIdle,
 	MAX_SESSION_SPAWN_TITLE_BYTES,
 	isValidNativeSessionId,
@@ -73,6 +78,16 @@ import {
  *   frontend concerns in this module. Stale callbacks (exit/data/status
  *   events from older, released, or disposed records and registrations) are
  *   guarded per instance and can never affect another row.
+ * - Every byte this host writes to a child PTY goes through ONE private
+ *   per-record seam used by exactly its two existing sources (local user input
+ *   and the surface's terminal query replies). A row whose registration
+ *   recorded the closed input-framing mode encodes every such write with that
+ *   registration's single encoder (user input `local`, protocol replies `none`)
+ *   and refuses ALL of them until that same registration's authenticated
+ *   readiness arrives — no raw fallback, no fabricated reply, no queue or
+ *   replay, and no framing text typed into a legacy child. Rows without the
+ *   mode keep forwarding bytes unchanged, and viewer input stays refused with
+ *   no API: an opaque origin is a classification, never a grant.
  * - Exit and disconnect are truthful: the lifecycle badge is the actual
  *   owned child state, the exit code comes only from the owned exit event,
  *   and `busy`/`pendingInput`/owned-work counts collapse to null on exit or
@@ -296,6 +311,12 @@ export interface InstanceStatusBootstrap {
 	readonly generation: string;
 	/** Private host-owned startup payload namespace; absent withholds long-prompt delivery. */
 	readonly payloadDir?: string;
+	/**
+	 * Closed input-framing mode marker actually recorded in THIS registration's
+	 * bootstrap. Absence means legacy; the manager never frames a byte unless the
+	 * bootstrap it received carries exactly mode version 1.
+	 */
+	readonly inputOriginFraming?: 1;
 }
 
 export interface InstanceStatusRegistration {
@@ -318,7 +339,28 @@ export type InstanceActivityRefreshStatus = StatusActivityRefreshResult["status"
  * any wire parser.
  */
 export interface StatusRegistrar {
-	register(instanceId: string, handlers: InstanceStatusHandlers): InstanceStatusRegistration;
+	/**
+	 * Registers one row before its child is spawned. The closed
+	 * {@link InstanceStatusRegistrationOptions} input-framing request is passed
+	 * through to the ACTUAL bootstrap the registrar issues; a registrar that does
+	 * not record the request in that bootstrap makes the opted-in row fail closed
+	 * rather than frame against a legacy child.
+	 */
+	register(
+		instanceId: string,
+		handlers: InstanceStatusHandlers,
+		options?: InstanceStatusRegistrationOptions,
+	): InstanceStatusRegistration;
+}
+
+/** Closed per-registration request the manager may pass to its registrar. */
+export interface InstanceStatusRegistrationOptions {
+	/**
+	 * Request the closed child-side input-framing bootstrap mode (version 1) for
+	 * this registration only. Sent only when the manager was constructed with the
+	 * internal opt-in; absent keeps the legacy bootstrap byte-for-byte.
+	 */
+	readonly inputOriginFraming?: boolean;
 }
 
 /** Immutable, copied view row for one instance (later SidebarItem shape). */
@@ -415,6 +457,19 @@ export interface InstanceManagerOptions {
 	getSidebarTitleColumns?: () => number;
 	/** PTY factory; defaults to the pinned real @lydell/node-pty (lazily loaded). */
 	ptyFactory?: PtyFactory;
+	/**
+	 * Internal opt-in (default false) for the closed native input-framing mode.
+	 * When true, every row's registration requests the closed bootstrap mode, the
+	 * host frames EVERY byte it writes to that child's PTY with one encoder per
+	 * registration, and it refuses to write anything until that exact
+	 * registration's authenticated readiness arrives. Absent/false keeps the
+	 * legacy behavior byte-for-byte: raw bytes forwarded, v1 capsules only, no
+	 * readiness observed. This is not a user setting, a permission, or remote
+	 * input: viewer input stays refused with no API, and an opaque origin alone is
+	 * never a grant. Only native setup may request it — legacy private profiles
+	 * and injected non-native preparers cannot frame by accident.
+	 */
+	nativeInputOriginFraming?: boolean;
 }
 
 export interface ShutdownOptions {
@@ -513,6 +568,23 @@ interface ManagedInstance {
 	rows: number;
 	/** Bumped on every accepted geometry change; stale interaction is fenced on it. */
 	geometryRevision: number;
+	/**
+	 * True only when THIS registration's own bootstrap carries the closed
+	 * input-framing mode. Set once at registration and never again.
+	 */
+	inputFramingRequested: boolean;
+	/**
+	 * Set once, and only by this registration's own verified readiness capsule
+	 * while this exact record still owns a live, unreleased, un-stopping child.
+	 * Never inherited across a restart, release, exit, or another row.
+	 */
+	inputFramingReady: boolean;
+	/**
+	 * One encoder per registration, created from this registration's own
+	 * bootstrap before the child spawned. Never reset on reporter reconnect or
+	 * extension reload; a new child/registration gets a new encoder.
+	 */
+	inputEncoder?: NativeInputEncoder;
 	/** Spawn admission closes while an idle preflight or confirmed Stop is unresolved. */
 	stopAdmissionClosed: boolean;
 	sigtermSent: boolean;
@@ -649,6 +721,20 @@ const PUBLIC_INSTANCE_ERRORS = {
 } as const;
 
 type InstanceErrorCode = keyof typeof PUBLIC_INSTANCE_ERRORS;
+
+/**
+ * The host's own local-user input origin. It is a closed classification of
+ * where an already-admitted dispatch came from, never a permission, a trust
+ * claim, or a viewer grant.
+ */
+const LOCAL_INPUT_ORIGIN: NativeInputOrigin = Object.freeze({ kind: "local" } as const);
+
+/**
+ * TerminalSurface protocol replies (DA/DSR/kitty keyboard) and any other
+ * host-generated child input carry no user origin, so they can never authorize
+ * or label a clipboard copy.
+ */
+const PROTOCOL_INPUT_ORIGIN: NativeInputOrigin = Object.freeze({ kind: "none" } as const);
 
 function publicInstanceError(code: InstanceErrorCode): string {
 	const message = PUBLIC_INSTANCE_ERRORS[code];
@@ -802,6 +888,7 @@ export class InstanceManager {
 	readonly #statusRegistrar: StatusRegistrar;
 	readonly #profilePreparer: ProfilePreparer;
 	readonly #nativeSetup: boolean;
+	readonly #inputOriginFraming: boolean;
 	readonly #args: readonly string[];
 	readonly #env: NodeJS.ProcessEnv;
 	#cols: number;
@@ -853,6 +940,16 @@ export class InstanceManager {
 			throw new Error("session-host: nativeSetup:false requires an explicitly injected legacy setup preparer");
 		}
 		this.#nativeSetup = options.nativeSetup ?? true;
+		if (options.nativeInputOriginFraming !== undefined && typeof options.nativeInputOriginFraming !== "boolean") {
+			throw new Error("session-host: nativeInputOriginFraming must be a boolean or absent");
+		}
+		this.#inputOriginFraming = options.nativeInputOriginFraming === true;
+		// The capture mode is a property of the native launch composition only.
+		// Legacy private profiles and injected preparers can never frame, so a
+		// request there fails at construction instead of being silently ignored.
+		if (this.#inputOriginFraming && !this.#nativeSetup) {
+			throw new Error("session-host: native input framing is available only for native setup launches");
+		}
 		this.#profilePreparer = options.profileRegistry ?? new NativeAgentRegistry({ env: this.#env });
 		this.#getSupportedKeyboardFlags = options.getSupportedKeyboardFlags;
 		this.#graphicsBudget = options.graphicsBudget ?? createTerminalGraphicsBudget();
@@ -1133,6 +1230,8 @@ export class InstanceManager {
 			cols: this.#cols,
 			rows: this.#rows,
 			geometryRevision: 0,
+			inputFramingRequested: false,
+			inputFramingReady: false,
 			savedReservation: savedSession !== undefined
 				? { sessionId: savedSession.sessionId, file: savedSession.file }
 				: undefined,
@@ -1302,7 +1401,10 @@ export class InstanceManager {
 		if (!pty || record.ptyExited || record.lifecycle !== "alive") {
 			throw new Error(`session-host: instance ${id} is not accepting input (lifecycle ${record.lifecycle})`);
 		}
-		pty.write(data);
+		// Local user input only. There is deliberately no origin parameter: a
+		// viewer cannot route input through this seam in this phase, and an opaque
+		// viewer token alone would be no grant.
+		this.#writeChildInput(record, pty, data, LOCAL_INPUT_ORIGIN);
 	}
 
 	/**
@@ -1703,6 +1805,10 @@ export class InstanceManager {
 					: composeFreshSessionSpawnArgs(this.#args, options.initialRequest.title),
 				env: this.#env,
 				...(options.savedSession !== undefined ? { savedSession: options.savedSession } : {}),
+				// Only an opted-in native launch asks for the supported static capture
+				// flag; the descriptor is composed once, before the child exists, and the
+				// manager never mutates its own or the caller's environment.
+				...(this.#inputOriginFraming ? { nativeInputOriginFraming: true } : {}),
 			});
 			record.workspace = descriptor.cwd;
 
@@ -1721,10 +1827,23 @@ export class InstanceManager {
 					}
 					return this.#onSpawnRequest?.(record.id, request) ?? Promise.resolve("failed");
 				},
-			});
+			}, this.#inputOriginFraming ? { inputOriginFraming: true } : undefined);
 			registration.current = handle;
 			record.registration = handle;
 			record.registrationReleased = false;
+			// An opted-in row frames only against a bootstrap that ACTUALLY carries
+			// the closed mode, composed before the child exists. A registrar that
+			// ignored the request fails this launch closed (no child, no raw bytes)
+			// instead of typing framed headers into a legacy Pi. The encoder is
+			// created once here, from this registration's own bootstrap, and is
+			// never rebuilt or reset for this registration.
+			if (this.#inputOriginFraming) {
+				if (handle.bootstrap.inputOriginFraming !== 1) {
+					throw new Error("session-host: the status registrar did not record the requested native input framing mode");
+				}
+				record.inputFramingRequested = true;
+				record.inputEncoder = createNativeInputEncoder(handle.bootstrap);
+			}
 			// The native clipboard receiver (#466) exists only after this row's own
 			// registration actually exists, is built from that registration's own
 			// bootstrap, and is bound to this exact row/registration pair. A row
@@ -1901,7 +2020,12 @@ export class InstanceManager {
 			return;
 		}
 		try {
-			pty.write(data);
+			// TerminalSurface replies (DA/DSR/kitty) are host protocol, never user
+			// input, so they carry the closed `none` origin and can never authorize
+			// a copy. On a framing row that has not confirmed readiness the write is
+			// refused; the row then fails truthfully instead of typing framing text
+			// into a legacy child.
+			this.#writeChildInput(record, pty, data, PROTOCOL_INPUT_ORIGIN);
 		} catch {
 			this.#failRunningInstance(record, "queryReply");
 		}
@@ -2437,21 +2561,57 @@ export class InstanceManager {
 
 	/**
 	 * Build this row's capsule handler from this row's own registration
-	 * bootstrap (#466). Absent a host callback no receiver exists at all, so a
-	 * row keeps its previous behavior of swallowing the capsule OSC entirely.
+	 * bootstrap (#466). Absent a host callback AND absent input framing no
+	 * receiver exists at all, so a row keeps its previous behavior of swallowing
+	 * the capsule OSC entirely.
+	 *
+	 * A framing row always has a receiver, because its readiness signal and its
+	 * v2 copy receipts both arrive on this same ordered stdout stream. Readiness
+	 * is independent of the native conversation tuple (it can and must be
+	 * observed before any session metadata exists), while copy callbacks keep the
+	 * unchanged tuple/live-record fences. A strict row accepts ONLY typed v2
+	 * `local` receipts for local delivery: its own strict bridge emits v2
+	 * capsules only, so an authenticated v1 capsule on such a row is NOT a
+	 * downgrade path and is dropped (its sequence is still consumed, so the same
+	 * authenticated request can never be replayed as v2). A viewer-origin capsule
+	 * is likewise dropped quietly (no owner-terminal fallback, no local delivery,
+	 * no copy diagnostic, even when this row is locally displayed) and is never
+	 * downgraded to a v1 event. Legacy rows observe neither v2 nor readiness at
+	 * all and keep the v1 route exactly as before.
 	 */
 	#nativeClipboardCapsuleHandler(
 		record: ManagedInstance,
 		registration: InstanceStatusRegistration,
 	): ((capsule: string) => void) | undefined {
-		if (this.#onNativeClipboard === undefined) {
+		const framing = record.inputFramingRequested;
+		if (this.#onNativeClipboard === undefined && !framing) {
 			return undefined;
 		}
 		let receiver: (capsule: string) => void;
 		try {
-			receiver = createNativeClipboardReceiver(registration.bootstrap, (event) => {
+			const onCopyEvent = (event: NativeClipboardEvent): void => {
 				this.#forwardNativeClipboard(record, registration, event);
-			});
+			};
+			receiver = framing
+				? createNativeClipboardReceiver(
+					registration.bootstrap,
+					// Strict mode has no v1 local route: this child's own bridge emits v2
+					// capsules only, so an authenticated v1 capsule is a shape this row must
+					// never deliver locally. It is consumed (sequence-consuming inside the
+					// receiver, so it cannot be replayed) and otherwise dropped.
+					() => undefined,
+					(receipt) => {
+						// Viewer-origin copies belong to their initiating viewer only, and no
+						// viewer input or viewer copy route exists in this phase: an
+						// unexpected one is dropped without any local route or diagnostic.
+						if (receipt.origin.kind !== "local") {
+							return;
+						}
+						onCopyEvent(receipt.event);
+					},
+					() => this.#markInputFramingReady(record, registration),
+				)
+				: createNativeClipboardReceiver(registration.bootstrap, onCopyEvent);
 		} catch {
 			// No receiver means no clipboard route for this row; the row itself is
 			// untouched and its capsule OSCs stay denied.
@@ -2503,6 +2663,92 @@ export class InstanceManager {
 			// The host's clipboard route is best effort; a refusal cannot break a
 			// row or escape into the parser.
 		}
+	}
+
+	/**
+	 * The ONE seam through which every byte the host writes to a hosted child's
+	 * PTY passes, for exactly the two existing sources: local user input
+	 * ({@linkcode write}) and TerminalSurface protocol replies
+	 * ({@linkcode #onQueryReply}). There is no raw unframed bypass and no third
+	 * caller.
+	 *
+	 * - Legacy rows (mode absent) forward the bytes exactly as before.
+	 * - Framing rows encode EVERY write with this registration's single encoder:
+	 *   local user input as `local`, protocol replies as `none`. The complete
+	 *   framing string goes out as one write so two dispatches can never
+	 *   interleave.
+	 * - Before this registration's own verified readiness, a framing write is
+	 *   refused: no raw fallback, no fabricated acknowledgement, no queue, no
+	 *   replay, and nothing is ever typed into a legacy child. The caller's own
+	 *   failure path reports it (a thrown refusal for user input, a truthfully
+	 *   failed row for a protocol reply).
+	 * - Readiness is re-checked against CURRENT ownership on EVERY framed write,
+	 *   not only when it was first armed: an in-flight or unconfirmed Stop (and a
+	 *   manager-wide stop or disposal) closes the seam immediately even though the
+	 *   row stays `alive` until its child's actual exit event, and ownership of the
+	 *   still-running child is retained rather than silently dropped.
+	 */
+	#writeChildInput(
+		record: ManagedInstance,
+		pty: InstancePty,
+		data: string | Buffer,
+		origin: NativeInputOrigin,
+	): void {
+		if (!record.inputFramingRequested) {
+			pty.write(data);
+			return;
+		}
+		const encoder = this.#admittedInputEncoder(record, pty);
+		if (encoder === undefined) {
+			throw new Error(
+				`session-host: instance ${record.id} has no admitted native input framing; refusing unframed input`,
+			);
+		}
+		pty.write(encoder.encode(typeof data === "string" ? Buffer.from(data, "utf8") : data, origin));
+	}
+
+	/**
+	 * The framing admission check evaluated immediately before EACH encoded write.
+	 * Arming readiness once is never a standing grant: the row must still be the
+	 * current record for its id, still hold this exact unreleased registration and
+	 * this exact live PTY, must not have exited, must not be inside a stop (an
+	 * idle-preflight or confirmed Stop closes admission while the child is still
+	 * running and unconfirmed), and the manager must not be stopping or disposed.
+	 * `undefined` means "no framed byte may leave now"; the caller never falls back
+	 * to raw input, and the owned child and its registration stay untouched so the
+	 * stop path still settles on the real exit event.
+	 */
+	#admittedInputEncoder(record: ManagedInstance, pty: InstancePty): NativeInputEncoder | undefined {
+		if (this.#disposed || this.#stopping
+			|| this.#records.get(record.id) !== record
+			|| record.registration === undefined || record.registrationReleased
+			|| record.pty !== pty || record.ptyExited
+			|| record.stopAdmissionClosed
+			|| record.lifecycle !== "alive"
+			|| !record.inputFramingRequested || !record.inputFramingReady) {
+			return undefined;
+		}
+		return record.inputEncoder;
+	}
+
+	/**
+	 * Arm one framing row from its own verified readiness capsule only. The
+	 * capsule's identity/HMAC was already verified by this registration's
+	 * receiver; these fences additionally require that the receiver still belongs
+	 * to the current record, its exact unreleased registration, and an owned,
+	 * live, not-stopping child. A foreign or stale bootstrap can never activate
+	 * another row, and readiness never survives an exit, release, stop, or
+	 * disposal.
+	 */
+	#markInputFramingReady(record: ManagedInstance, registration: InstanceStatusRegistration): void {
+		if (this.#disposed || this.#stopping
+			|| this.#records.get(record.id) !== record
+			|| record.registration !== registration || record.registrationReleased
+			|| record.pty === undefined || record.ptyExited || record.stopAdmissionClosed
+			|| !record.inputFramingRequested) {
+			return;
+		}
+		record.inputFramingReady = true;
 	}
 
 	/** Forward one surface's bounded diagnostics; delivery failures stay contained. */

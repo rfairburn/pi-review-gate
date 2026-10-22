@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
@@ -7,15 +8,31 @@ import { createStatusBroker } from "../src/session-host/broker";
 import { hostOwnershipPath } from "../src/session-host/roster-store";
 import { InstanceManager, type InstancePty } from "../src/session-host/instances";
 import { NativeAgentRegistry } from "../src/session-host/profiles";
-import { createNativeClipboardReceiver, type NativeClipboardEvent } from "../src/session-host/native-clipboard";
+import {
+  createNativeClipboardReceiver,
+  type NativeClipboardEvent,
+  type NativeClipboardOriginEvent,
+} from "../src/session-host/native-clipboard";
+import {
+  createNativeInputDecoder,
+  type NativeInputFragment,
+} from "../src/session-host/native-input-origin";
 import { TerminalSurface, stripGeneratedSgr } from "../src/session-host/terminal-surface";
 import type { SessionHostBootstrap } from "../src/session-host/protocol";
 import { ChangeSignal, compileAndStageCandidate, makeNativeAgentRoot } from "./helpers/session-host-native-main-harness";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import { skipOrFail } from "./bridge-fakes";
 
-/** Real bundled CLI/PTY proof. No physical clipboard is read or written. */
-test("real bundled native and hosted clipboard producers preserve selected payload and reject raw output", { timeout: 180_000 }, async (t) => {
+/**
+ * Real bundled CLI/PTY proof. No physical clipboard is read or written.
+ *
+ * The last leg additionally runs one explicitly opted-in (`nativeInputOriginFraming:
+ * true`) LOCAL hosted child, so the parent's native run exercises the real preload
+ * readiness/startup-query ordering, the strict child bridge, and the host's framed
+ * write seam end to end. Recording helpers prevent physical clipboard writes;
+ * this does not certify a real terminal's clipboard permission or delivery.
+ */
+test("real bundled native and hosted clipboard producers preserve selected payload and reject raw output", { timeout: 240_000 }, async (t) => {
   if (process.platform === "win32") { t.skip("native Windows sidebar acceptance remains experimental"); return; }
   if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE) { t.skip("native primary-host proof cannot run in a delegated role"); return; }
   const packageRoot = findInstalledAgentDirs().find((path) => {
@@ -46,6 +63,7 @@ test("real bundled native and hosted clipboard producers preserve selected paylo
   const fixture = join(root, "clipboard-proof.cjs");
   const decoy = Buffer.from("UNSOLICITED-466").toString("base64");
   writeFileSync(fixture, `module.exports=pi=>{
+pi.registerCommand('input-proof',{description:'Verify owned input bytes',handler:async(input)=>pi.sendMessage({customType:'input-proof',content:'INPUT466:'+require('node:crypto').createHash('sha256').update(input,'utf8').digest('hex'),display:true})});
 pi.registerCommand('copy-proof',{description:'Synthetic visible text',handler:async()=>pi.sendMessage({customType:'copy-proof-'+(globalThis[Symbol.for('prg.copy-proof.counter')]=(globalThis[Symbol.for('prg.copy-proof.counter')]||0)+1),content:'CLIP466-A αβ café\\nCLIP466-B 雪 end',display:true})});
 pi.registerCommand('copy-decoy',{description:'Synthetic raw-output refusal',handler:async()=>process.stdout.write('\\x1b]52;c;${decoy}\\x07')});
 pi.registerCommand('copy-render-decoy',{description:'Synthetic render-output refusal',handler:async(_,ctx)=>ctx.ui.setWidget('copy-decoy',()=>({render:()=>{process.stdout.write('\\x1b]52;c;${decoy}\\x07');return[]},invalidate(){}}))});
@@ -95,6 +113,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
   };
   let manager: InstanceManager | undefined;
   let broker: Awaited<ReturnType<typeof createStatusBroker>> | undefined;
+  let framedManager: InstanceManager | undefined;
   const surfaces: TerminalSurface[] = [];
   try {
     const direct = spawn(cli, args, common, join(root, "work"));
@@ -210,6 +229,210 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       await manager.dispose();
       manager = undefined;
     }
+    // -------------------------------------------------------------------------
+    // Opt-in native input framing: one explicitly opted-in LOCAL hosted child
+    // (no SSH, no viewer/remote input anywhere in this phase). Real bundled CLI,
+    // real PTY, real broker, real manager, real preload, and real strict child
+    // bridge. This proves: the child authenticates its decoder installation
+    // BEFORE its own startup queries; the supported static capture flag reaches
+    // only this launch; EVERY host write on both existing sources travels as an
+    // authenticated framed dispatch of this registration (user input `local`,
+    // protocol replies never `local`); Unicode and a paste larger than the
+    // 32 KiB fragment bound survive byte-exactly as one logical dispatch; a
+    // geometry change and an extension reload keep the same per-registration
+    // framing with a monotonic sequence; native copies still reach the unchanged
+    // host route and the unchanged local helper exactly once, with only explicit
+    // `local` receipts; and nothing framing-related, no token, and no raw
+    // clipboard relay ever reaches the screen or the child's output stream. The
+    // earlier legs stay as the untouched legacy controls. No physical clipboard,
+    // real terminal emulator, or Windows ConPTY claim is made.
+    // -------------------------------------------------------------------------
+    const framedEnv: NodeJS.ProcessEnv = { ...common };
+    delete framedEnv.SSH_CONNECTION; // local-only leg: no remote origin is implied
+    const framedWrites: string[] = [];
+    const framedReceived: NativeClipboardEvent[] = [];
+    let framedChild: (typeof owned)[number] | undefined;
+    let framedSpawnEnv: NodeJS.ProcessEnv | undefined;
+    framedManager = new InstanceManager({ packageRoot: candidate.root, piExecutable: cli, statusRegistrar: broker,
+      profileRegistry: new NativeAgentRegistry({ env: framedEnv }), nativeSetup: true, nativeInputOriginFraming: true,
+      env: framedEnv, args, cols: 80, rows: 30,
+      onChange: () => signal.notify(), onNativeClipboard: (_id, event) => { framedReceived.push(event); signal.notify(); },
+      ptyFactory: (descriptor) => {
+        framedSpawnEnv = descriptor.env;
+        framedChild = spawn(descriptor.file, descriptor.args, descriptor.env, descriptor.cwd);
+        const handle = framedChild.handle;
+        // A recording view of the SAME owned handle: the host's own PTY writes are
+        // the wire under test, and nothing else about the child changes.
+        return {
+          get pid(): number { return handle.pid; },
+          get cols(): number { return handle.cols; },
+          get rows(): number { return handle.rows; },
+          onData: (listener) => handle.onData(listener),
+          onExit: (listener) => handle.onExit(listener),
+          on: (event, listener) => handle.on?.(event, listener),
+          removeListener: (event, listener) => handle.removeListener?.(event, listener),
+          write: (data) => { framedWrites.push(typeof data === "string" ? data : data.toString("latin1")); handle.write(data); },
+          resize: (columns, rows) => handle.resize(columns, rows),
+          kill: (sig) => handle.kill(sig),
+          pause: () => handle.pause(),
+          resume: () => handle.resume(),
+        };
+      },
+    });
+    const framedId = await framedManager.create({ workspace: join(root, "work") });
+    const framedPane = framedManager.surface(framedId)!;
+    const framedInput = (data: string): void => framedManager!.write(framedId, data);
+    assert.ok(framedChild && framedChild.bootstrap, "the opted-in row owns its child and bootstrap");
+    const framedBootstrap = framedChild.bootstrap;
+    assert.equal(framedChild.bootstrap.inputOriginFraming, 1, "the closed mode reached the actual one-shot bootstrap");
+    assert.equal(framedSpawnEnv?.PI_CLIPBOARD_OSC52, "1", "only this opted-in launch gained the static capture flag");
+    await signal.waitFor(() => text(framedPane).includes("─".repeat(20)), 20_000, "opted-in native editor");
+    await signal.waitFor(() => framedChild!.raw.includes("\x1b]777;prg-native-input-ready-v1;"), 20_000,
+      "the strict child authenticated its decoder installation");
+    const readyAt = framedChild.raw.indexOf("\x1b]777;prg-native-input-ready-v1;");
+    const firstStartupQuery = Math.min(...["\x1b[?u", "\x1b[>0q", "\x1b[6n", "\x1b]10;?"].map((probe) => {
+      const at = framedChild!.raw.indexOf(probe);
+      return at < 0 ? Number.POSITIVE_INFINITY : at;
+    }));
+    assert.ok(readyAt < firstStartupQuery,
+      "readiness precedes the child's own startup queries, so no protocol reply can be typed unframed");
+    let framedVerifiedReady = 0;
+    const verifyReady = createNativeClipboardReceiver(framedBootstrap, () => undefined, undefined,
+      () => { framedVerifiedReady += 1; });
+    for (const match of framedChild.raw.matchAll(/\x1b\]777;([^\x07]*)\x07/g)) verifyReady(match[1]!);
+    assert.equal(framedVerifiedReady, 1, "exactly one readiness statement verifies against this registration");
+
+    // Every host write is a framed dispatch of THIS registration, decoded here by
+    // an independent decoder built from the same bootstrap.
+    const framedDecoder = createNativeInputDecoder(framedBootstrap);
+    let decodedThrough = 0;
+    const allFrames: NativeInputFragment[] = [];
+    const drainFrames = (): NativeInputFragment[] => {
+      const fragments: NativeInputFragment[] = [];
+      for (; decodedThrough < framedWrites.length; decodedThrough += 1) {
+        const fed = framedDecoder.feed(framedWrites[decodedThrough]!);
+        assert.equal(fed.ok, true, `every host write authenticates against this registration: ${fed.ok ? "" : fed.code}`);
+        fragments.push(...fed.fragments);
+      }
+      allFrames.push(...fragments);
+      return fragments;
+    };
+    const dispatchPayload = (fragments: readonly NativeInputFragment[], dispatchId: number): string =>
+      Buffer.concat(fragments.filter((f) => f.dispatchId === dispatchId).map((f) => f.payload)).toString("utf8");
+    assert.ok(framedWrites.every((frame) => frame.startsWith("prg-ni-v1;")),
+      "no host byte ever reached this child unframed");
+
+    // Ordinary input, then the unchanged native copy route and helper.
+    framedInput("/copy-proof\r");
+    await signal.waitFor(() => text(framedPane).includes("CLIP466-B"), 20_000, "opted-in synthetic text");
+    const proofFrames = drainFrames();
+    const proofDispatch = proofFrames.at(-1)!;
+    assert.deepEqual(proofDispatch.origin, { kind: "local" }, "local user input is classified local");
+    assert.equal(dispatchPayload(proofFrames, proofDispatch.dispatchId), "/copy-proof\r",
+      "the typed payload travels byte-exactly inside the frame");
+    const framedHelperBefore = helperRecords().length;
+    await framedPane.flush();
+    select(framedPane, framedInput);
+    framedInput("\x1b[17~"); // the configured native copy key, unchanged from the legacy control
+    await signal.waitFor(() => framedReceived.some((event) => event.kind === "copy"), 20_000,
+      "a strict row still routes its native copy through the existing host route");
+    assert.equal(helperRecords().length, framedHelperBefore + 1, "the unchanged native helper ran exactly once");
+    assert.equal(helperRecords().at(-1), Buffer.from(expected, "base64").toString("utf8"),
+      "the local payload handed to the helper is unchanged");
+
+    // An extension reload keeps the same per-registration framing: the sequence
+    // continues and copies still route, with no second bridge and no reset.
+    const framedEpoch = framedManager.list().find((view) => view.id === framedId)!.nativeSession!.epoch;
+    framedInput("/reload\r");
+    await signal.waitFor(() => (framedManager!.list().find((view) => view.id === framedId)?.nativeSession?.epoch ?? 0) > framedEpoch,
+      20_000, "reload advanced the authoritative native epoch");
+    framedInput("/copy-proof\r");
+    await signal.waitFor(() => text(framedPane).includes("copy-proof-2") && text(framedPane).includes("CLIP466-B"),
+      20_000, "fresh reloaded native selection frame");
+    await framedPane.flush();
+    select(framedPane, framedInput);
+    framedInput("\x1b[17~");
+    await signal.waitFor(() => framedReceived.filter((event) => event.kind === "copy").length === 2, 20_000,
+      "one process-owned bridge and encoder survive extension reload");
+    const afterReload = drainFrames();
+    assert.ok(afterReload.length > 0, "the reloaded row kept framing input");
+    assert.ok(Math.min(...afterReload.map((f) => f.dispatchId)) > proofDispatch.dispatchId,
+      "the per-registration dispatch id kept increasing across the reload and never restarted");
+    const seenDispatches = allFrames.map((f) => f.dispatchId).filter((id, index, ids) => ids.indexOf(id) === index);
+    assert.deepEqual(seenDispatches, [...seenDispatches].sort((a, b) => a - b),
+      "dispatch ids only ever increase for one registration");
+    assert.equal(helperRecords().length, framedHelperBefore + 2, "the reloaded child still uses the helper once per copy");
+
+    // Unicode input and a paste above the fragment bound stay byte-exact. The
+    // host-side fragment checks prove what the host PUT on the wire; the fixture's
+    // public `/input-proof` command digests what the REAL child RECEIVED, so PTY
+    // truncation, a poisoned child decoder, or discarded paste bytes cannot pass
+    // this case. No producer hook, no Pi change: only the fixture's own command.
+    const unicodeText = "αβ café 雪 — ünïcödé";
+    const unicode = `\x1b[200~/input-proof ${unicodeText}\x1b[201~`;
+    framedInput(unicode);
+    await signal.waitFor(() => text(framedPane).includes("ünïcödé"), 20_000, "the opted-in child received Unicode input");
+    const unicodeFrames = drainFrames();
+    const unicodeDispatch = unicodeFrames.at(-1)!;
+    assert.deepEqual(unicodeDispatch.origin, { kind: "local" });
+    assert.equal(dispatchPayload(unicodeFrames, unicodeDispatch.dispatchId), unicode,
+      "multibyte input is preserved exactly, never re-encoded or split into text");
+    framedInput("\r");
+    const unicodeMarker = `INPUT466:${createHash("sha256").update(unicodeText, "utf8").digest("hex")}`;
+    await signal.waitFor(() => text(framedPane).replace(/\s/g, "").includes(unicodeMarker), 20_000,
+      "the native command received the complete Unicode payload and cleared the editor");
+
+    // Geometry stays the manager's own, and the seam keeps framing afterwards.
+    assert.ok(framedManager.resizeInstance(framedId, 100, 32), "the opted-in row accepted a geometry change");
+    await signal.waitFor(() => framedPane.frame().cols === 100 && framedPane.frame().rows === 32, 20_000,
+      "the opted-in surface reflowed to the admitted geometry");
+    const bigText = "雪".repeat(30_000);
+    const big = `\x1b[200~/input-proof ${bigText}\x1b[201~`; // ~90 KiB, above the 32 KiB fragment bound
+    framedInput(big);
+    const bigFrames = drainFrames();
+    const bigDispatch = bigFrames.at(-1)!;
+    const bigParts = bigFrames.filter((f) => f.dispatchId === bigDispatch.dispatchId);
+    assert.ok(bigParts.length > 2, "a paste above the fragment bound travels as ordered fragments");
+    assert.equal(bigParts[0]!.start, true, "the first fragment opens the dispatch");
+    assert.equal(bigParts.at(-1)!.end, true, "the last fragment closes it");
+    assert.deepEqual(bigParts.map((f) => f.part), bigParts.map((_f, index) => index), "fragments stay in order");
+    assert.equal(dispatchPayload(bigFrames, bigDispatch.dispatchId), big,
+      "the whole paste survives byte-exactly as one logical dispatch");
+    framedInput("\r");
+    const bigMarker = `INPUT466:${createHash("sha256").update(bigText, "utf8").digest("hex")}`;
+    await signal.waitFor(() => text(framedPane).replace(/\s/g, "").includes(bigMarker), 20_000,
+      "the real child received the complete large paste byte-exactly");
+    assert.equal(framedManager.list().find((view) => view.id === framedId)!.lifecycle, "alive",
+      "the opted-in row survived framing a large paste");
+    assert.ok(framedWrites.every((frame) => frame.startsWith("prg-ni-v1;")),
+      "still no unframed host byte after geometry, reload, and paste");
+
+    // Strict mode emits origin-bearing v2 receipts only, and every delivered copy
+    // says explicitly that it came from local input.
+    const framedReceipts: NativeClipboardOriginEvent[] = [];
+    const receiveFramed = createNativeClipboardReceiver(framedBootstrap, () => undefined,
+      (receipt) => { framedReceipts.push(receipt); });
+    for (const match of framedChild.raw.matchAll(/\x1b\]777;([^\x07]*)\x07/g)) receiveFramed(match[1]!);
+    assert.equal(framedReceipts.length, 2, "both native copies arrived as v2 receipts");
+    assert.ok(framedReceipts.every((receipt) => receipt.origin.kind === "local"),
+      "every framed copy receipt is explicitly local");
+    assert.ok(framedChild.raw.includes("prg-native-copy-v2;"), "the opted-in child used the v2 stream");
+    assert.ok(!framedChild.raw.includes("prg-native-copy-v1;"), "a strict row never emits or accepts a v1 capsule");
+    assert.ok(!framedChild.raw.includes("\x1b]52;c;"), "no raw clipboard relay leaves the opted-in child");
+    assert.ok(!text(framedPane).includes("prg-ni-v1") && !text(framedPane).includes("prg-native-"),
+      "framing and readiness never become screen text");
+    assert.ok(!text(framedPane).includes(framedBootstrap.token), "the registration token never reaches the frame");
+    assert.ok(!framedChild.raw.includes(framedBootstrap.token), "the token never returns in the child's output");
+    // Legacy controls stay exactly as the earlier legs left them.
+    assert.ok(hosted!.raw.includes("prg-native-copy-v1;"), "the legacy hosted control child still used v1");
+    assert.ok(!hosted!.raw.includes("prg-native-input-ready-v1;"), "the legacy control never claimed framing readiness");
+
+    const framedStop = await framedManager.shutdown({ graceMs: 8000, killMs: 2000 });
+    assert.deepEqual(framedStop.remainingIds, []);
+    assert.deepEqual(framedStop.forcedIds, []);
+    await signal.waitFor(() => framedChild!.exited, 5000, "opted-in owned exit");
+    await framedManager.dispose();
+    framedManager = undefined;
     // Genuine registered question/notice tools through Pi's faux provider:
     // native agent-loop turns, no credentials or external model requests.
     writeFileSync(join(root, "provider", "turn-script.json"), JSON.stringify({ steps: [
@@ -342,6 +565,8 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       }
     }
     if (manager) await manager.dispose();
+    if (framedManager) await framedManager.shutdown({ graceMs: 2000, killMs: 2000 });
+    if (framedManager) await framedManager.dispose();
     if (broker) await broker.dispose();
     for (const surface of surfaces) surface.dispose();
     // Retain invocation-owned synthetic evidence; never remove unconfirmed or

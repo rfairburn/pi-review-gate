@@ -103,6 +103,16 @@ export interface SessionHostBootstrap {
    * prompt transport.
    */
   payloadDir?: string;
+  /**
+   * Closed opt-in child-side input-framing mode marker. Absence is the legacy
+   * bootstrap exactly; the only admitted value is mode version 1, and any other
+   * value (including a numeric string, `0`, `true`, or a future version) rejects
+   * the whole bootstrap instead of degrading to a half-understood mode. The
+   * marker states that the host registered this child in strict framing mode; it
+   * grants no input, clipboard, trust, or permission, and an older child that
+   * ignores it simply never signals readiness (so the host frames nothing).
+   */
+  inputOriginFraming?: 1;
 }
 
 /** First wire frame after connecting: authenticates the reporter to the host. */
@@ -435,6 +445,13 @@ function parseOwnedCount(value: unknown): number | null {
 }
 
 /**
+ * The only admitted input-framing mode version. Exported so the host records
+ * exactly this marker in a registration bootstrap and nothing else can invent a
+ * mode value.
+ */
+export const INPUT_ORIGIN_FRAMING_MODE = 1 as const;
+
+/**
  * Validates a parsed bootstrap value. Returns undefined (never throws) when
  * any field is missing, unbounded, or malformed.
  */
@@ -454,6 +471,11 @@ export function parseBootstrap(value: unknown): SessionHostBootstrap | undefined
   if (!isValidId(value.instanceId)) return undefined;
   if (!isValidId(value.generation)) return undefined;
   if (value.payloadDir !== undefined && !isValidPayloadDirectory(value.payloadDir)) return undefined;
+  // Closed mode set: an unknown or malformed marker is a protocol-shape failure
+  // for the whole bootstrap, never a silent downgrade to legacy framing.
+  if (value.inputOriginFraming !== undefined && value.inputOriginFraming !== INPUT_ORIGIN_FRAMING_MODE) {
+    return undefined;
+  }
   return {
     version: 1,
     socketPath: value.socketPath,
@@ -461,6 +483,7 @@ export function parseBootstrap(value: unknown): SessionHostBootstrap | undefined
     instanceId: value.instanceId,
     generation: value.generation,
     ...(value.payloadDir === undefined ? {} : { payloadDir: value.payloadDir }),
+    ...(value.inputOriginFraming === undefined ? {} : { inputOriginFraming: INPUT_ORIGIN_FRAMING_MODE }),
   };
 }
 

@@ -91,6 +91,7 @@ import os from "node:os";
 import { isAbsolute, join } from "node:path";
 import {
   ACTIVITY_CENSUS_CAPABILITY,
+  INPUT_ORIGIN_FRAMING_MODE,
   type SessionHostActivityRequest,
   type SessionHostActivityResult,
   type SessionHostBootstrap,
@@ -150,6 +151,24 @@ export interface StatusBrokerStatusHandlers {
   onReconnect?: () => void;
   /** Optional host-side operation invoked only by a valid request on this registration's authenticated connection. */
   onSpawnRequest?: (request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
+}
+
+/**
+ * Closed per-registration options accepted by {@link StatusBroker.register}.
+ * An unknown key or a non-boolean mode request is refused outright; the broker
+ * never guesses at a half-understood option shape.
+ */
+export interface StatusRegistrationOptions {
+  /**
+   * Request the closed child-side input-framing mode (protocol mode version 1)
+   * in this registration's one-shot bootstrap, recorded before the child is
+   * spawned and never mutated afterwards. Absent/false keeps the legacy
+   * bootstrap byte-for-byte. Recording the request grants nothing: the broker
+   * opens no transport, observes no readiness, and trusts no input. The child
+   * still has to install its decoder and signal readiness on this exact
+   * registration before any host may frame a byte.
+   */
+  readonly inputOriginFraming?: boolean;
 }
 
 /** One per-instance registration issued before the native PTY is spawned. */
@@ -228,7 +247,11 @@ export interface StatusBroker {
   /** Random host generation marker shared by every registration. */
   readonly generation: string;
   /** Registers one instance; duplicate active ids fail before any token is overwritten. */
-  register(instanceId: string, handlers: StatusBrokerStatusHandlers): StatusRegistration;
+  register(
+    instanceId: string,
+    handlers: StatusBrokerStatusHandlers,
+    options?: StatusRegistrationOptions,
+  ): StatusRegistration;
   /** Idempotent final cleanup: timers, sockets, own socket file, and own empty directory. */
   dispose(): Promise<void>;
 }
@@ -363,6 +386,27 @@ interface ConnectionState {
   /** At most four bounded rename/shutdown control frames are coalesced per socket write turn. */
   renameWriteQueue: string[];
   renameWriteScheduled: boolean;
+}
+
+/**
+ * Strict parse of {@link StatusRegistrationOptions}. Absence and an explicit
+ * false both mean the legacy bootstrap; anything but a closed boolean request
+ * fails closed before the broker creates any state.
+ */
+function parseRegistrationOptions(options: StatusRegistrationOptions | undefined): boolean {
+  if (options === undefined) return false;
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw new Error("pi-review-gate: the session-host registration options must be a plain object or absent");
+  }
+  const keys = Object.keys(options);
+  if (keys.length > 1 || (keys.length === 1 && keys[0] !== "inputOriginFraming")) {
+    throw new Error("pi-review-gate: the session-host registration options accept only inputOriginFraming");
+  }
+  const requested: unknown = (options as { readonly inputOriginFraming?: unknown }).inputOriginFraming;
+  if (requested !== undefined && typeof requested !== "boolean") {
+    throw new Error("pi-review-gate: the session-host inputOriginFraming registration option must be a boolean");
+  }
+  return requested === true;
 }
 
 /** Verifies two strings are equal without content-dependent timing. */
@@ -748,13 +792,20 @@ class LocalStatusBroker implements StatusBroker {
     }
   }
 
-  register(instanceId: string, handlers: StatusBrokerStatusHandlers): StatusRegistration {
+  register(
+    instanceId: string,
+    handlers: StatusBrokerStatusHandlers,
+    options?: StatusRegistrationOptions,
+  ): StatusRegistration {
     if (this.#disposed) {
       throw new Error("pi-review-gate: the session-host status broker is disposed; no further registrations are accepted");
     }
     if (typeof handlers?.onStatus !== "function" || typeof handlers?.onDisconnect !== "function") {
       throw new Error("pi-review-gate: the session-host registration requires onStatus and onDisconnect callbacks");
     }
+    // Refuse a malformed mode request before any token, namespace, or map entry
+    // exists: an unknown option shape never half-registers a row.
+    const inputOriginFraming = parseRegistrationOptions(options);
     // Reuse the shared bootstrap validator to enforce the admitted instance-id
     // (and bootstrap) shape; the fixture token/generation exist only for that
     // shape check and never authenticate anything.
@@ -813,6 +864,10 @@ class LocalStatusBroker implements StatusBroker {
       instanceId,
       generation: this.generation,
       payloadDir: payloadNamespace.path,
+      // The closed mode marker lives only here: it is composed into the actual
+      // one-shot bootstrap before any child exists, and nothing mutates this
+      // object (or its token/secret fields) after validation.
+      ...(inputOriginFraming ? { inputOriginFraming: INPUT_ORIGIN_FRAMING_MODE } : {}),
     };
     return {
       bootstrap,

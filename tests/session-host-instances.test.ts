@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync as readBytesSync, realpathSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
@@ -24,6 +24,7 @@ import {
   type InstanceSpawnDescriptor,
   type InstanceStatusHandlers,
   type InstanceStatusRegistration,
+  type InstanceStatusRegistrationOptions,
   type InstanceStatusUpdate,
   type NativeInstanceView,
   type PtyFactory,
@@ -36,6 +37,11 @@ import {
   type SavedSessionAdmission,
 } from "../src/session-host/saved-sessions";
 import { SESSION_HOST_BOOTSTRAP_ENV, composeFreshSessionSpawnArgs, prepareNativeLaunch } from "../src/session-host/launch";
+import {
+  createNativeInputDecoder,
+  type NativeInputFragment,
+  type NativeInputOrigin,
+} from "../src/session-host/native-input-origin";
 import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "../src/session-host/startup-request";
 import { readSessionHostPayloadSync } from "../src/session-host/payload";
 import { TerminalSurface } from "../src/session-host/terminal-surface";
@@ -398,6 +404,10 @@ class FakeRegistrar implements StatusRegistrar {
   readonly entries: RegistrarEntry[] = [];
   readonly order: string[] = ["registrar"];
   readonly renameRequests: { instanceId: string; request: StatusRenameRequest }[] = [];
+  /** Every registration request the manager made, in order, for propagation checks. */
+  readonly registrationRequests: Array<{ instanceId: string; options?: InstanceStatusRegistrationOptions }> = [];
+  /** Simulates a registrar predating the closed mode: it ignores the request. */
+  dropFramingMode = false;
   renameHandler?: (entry: RegistrarEntry, request: StatusRenameRequest) => Promise<StatusRenameResult>;
   shutdownHandler?: (entry: RegistrarEntry, options?: { readonly requireIdle?: boolean }) => Promise<StatusShutdownResult>;
   nextToken?: string;
@@ -407,8 +417,14 @@ class FakeRegistrar implements StatusRegistrar {
     this.#payloadRoot = payloadRoot;
   }
 
-  register(instanceId: string, handlers: RegistrarEntry["handlers"]): InstanceStatusRegistration {
+  register(
+    instanceId: string,
+    handlers: RegistrarEntry["handlers"],
+    options?: InstanceStatusRegistrationOptions,
+  ): InstanceStatusRegistration {
     this.order.push(`register ${instanceId}`);
+    this.registrationRequests.push({ instanceId, ...(options === undefined ? {} : { options: { ...options } }) });
+    const framingRequested = options?.inputOriginFraming === true && !this.dropFramingMode;
     let payloadDir: string | undefined;
     let payloadIdentity: { dev: number; ino: number } | undefined;
     if (this.#payloadRoot !== undefined) {
@@ -429,6 +445,7 @@ class FakeRegistrar implements StatusRegistrar {
         instanceId,
         generation: randomUUID(),
         ...(payloadDir === undefined ? {} : { payloadDir }),
+        ...(framingRequested ? { inputOriginFraming: 1 as const } : {}),
       },
     };
     this.nextToken = undefined;
@@ -3784,5 +3801,507 @@ test("status updates publish activity intent independently of the ownership coun
     harness.spawned[0]!.emitExit(0);
   } finally {
     cleanup(harness);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Opt-in native input framing: one host encoder per registration, gated on the
+// child's authenticated readiness, covering BOTH hosted PTY write sources
+// (local user input and TerminalSurface protocol replies).
+//
+// IMPORTANT EVIDENCE SCOPE: these cases use the same synthetic PTYs and
+// synthetic registrar as the rest of this file. They prove the HOST-side
+// contract only — strict mode propagation before spawn, refusal before an
+// authenticated READY on this exact registration, closed origin classification of
+// every framed write, per-registration encoder continuity, lifecycle fences, and
+// that the legacy default stays byte-identical. They make no claim about the real
+// PTY, a real Pi child's decoder installation order, Windows ConPTY, or any
+// physical clipboard; the parent owns the native CLI proof.
+// ---------------------------------------------------------------------------
+
+const FRAMING_READY_PREFIX = "prg-native-input-ready-v1;";
+const FRAMING_READY_DOMAIN = "pi-review-gate/native-input-ready/v1\0";
+const FRAMING_HEX_TOKEN = "ab".repeat(32);
+/**
+ * A fresh valid hex64 registration token per row: the input codec derives its
+ * HMAC key from exactly this production shape, and distinct keys are what make
+ * cross-row readiness refusal mean something.
+ */
+const framingToken = (): string => randomBytes(32).toString("hex");
+/** The private capsule OSC the child bridge writes on the same stdout stream. */
+const capsuleOsc = (capsule: string): string => `\x1b]777;${capsule}\x07`;
+
+type FramingBootstrap = InstanceStatusRegistration["bootstrap"];
+
+/** Independently re-derive the child bridge's readiness wire format. */
+function readyCapsule(
+  bootstrap: FramingBootstrap,
+  overrides: { token?: string; instanceId?: string; generation?: string; body?: Record<string, unknown> } = {},
+): string {
+  const body = JSON.stringify(overrides.body ?? {
+    version: 1,
+    kind: "input-framing-ready",
+    instanceId: overrides.instanceId ?? bootstrap.instanceId,
+    generation: overrides.generation ?? bootstrap.generation,
+  });
+  const encoded = Buffer.from(body, "utf8").toString("base64");
+  const mac = createHmac("sha256", Buffer.from(overrides.token ?? bootstrap.token, "hex"))
+    .update(FRAMING_READY_DOMAIN).update(encoded).digest("hex");
+  return `${FRAMING_READY_PREFIX}${encoded};${mac}`;
+}
+
+/** Verify a framed host write with this registration's own decoder. */
+function decodeFramedWrite(bootstrap: FramingBootstrap, framed: string, decoder = createNativeInputDecoder(bootstrap)): NativeInputFragment[] {
+  assert.equal(typeof framed, "string");
+  assert.notEqual(framed, "", "a framed write carries its framing bytes");
+  const fed = decoder.feed(framed);
+  assert.equal(fed.ok, true, `the framed write authenticates against this registration: ${fed.ok ? "" : fed.code}`);
+  const closed = decoder.finish();
+  assert.equal(closed.ok, true, "one host write is one complete logical dispatch");
+  return [...fed.fragments];
+}
+
+function framedPayload(bootstrap: FramingBootstrap, framed: string): { text: string; origin: NativeInputOrigin } {
+  const fragments = decodeFramedWrite(bootstrap, framed);
+  assert.equal(fragments.length, 1, "short host input travels as one fragment");
+  const first = fragments[0]!;
+  assert.deepEqual([first.start, first.end], [true, true]);
+  return { text: first.payload.toString("utf8"), origin: first.origin };
+}
+
+interface FramingHarness {
+  root: string;
+  workspace: string;
+  packageRoot: string;
+  piExecutable: string;
+  registrar: FakeRegistrar;
+  spawned: FakePty[];
+  manager: InstanceManager;
+  /** The caller's own env object; the manager and launch must never mutate it. */
+  callerEnv: NodeJS.ProcessEnv;
+}
+
+function makeFramingHarness(label: string, options: { framing?: boolean } = {}): FramingHarness {
+  const root = makeTestRoot(label);
+  const pkg = makePackageFixture(root);
+  const home = join(root, "home");
+  const agentDir = join(root, "native-agent");
+  const sessionDir = join(agentDir, "sessions");
+  const workspace = join(root, "workspace");
+  mkdirSync(home, { recursive: true });
+  mkdirSync(join(agentDir, "extensions"), { recursive: true });
+  mkdirSync(sessionDir, { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  const callerEnv: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    HOME: home,
+    PI_CODING_AGENT_DIR: agentDir,
+    PI_CODING_AGENT_SESSION_DIR: sessionDir,
+  };
+  const registrar = new FakeRegistrar();
+  const spawned: FakePty[] = [];
+  const manager = new InstanceManager({
+    packageRoot: pkg.packageRoot,
+    piExecutable: pkg.piExecutable,
+    statusRegistrar: registrar,
+    args: [],
+    // A clone: the harness keeps the original object to prove it stays untouched.
+    env: { ...callerEnv },
+    ptyFactory: (descriptor) => {
+      const pty = new FakePty(descriptor);
+      pty.exitsOnSignal = "SIGTERM";
+      spawned.push(pty);
+      return pty;
+    },
+    ...(options.framing === undefined ? {} : { nativeInputOriginFraming: options.framing }),
+  });
+  return { root, workspace, packageRoot: pkg.packageRoot, piExecutable: pkg.piExecutable, registrar, spawned, manager, callerEnv };
+}
+
+interface FramingRow {
+  id: string;
+  pty: FakePty;
+  bootstrap: FramingBootstrap;
+  entry: RegistrarEntry;
+}
+
+async function createFramingRow(harness: FramingHarness): Promise<FramingRow> {
+  // The codec derives its key from the production hex64 registration token shape,
+  // and every registration gets its OWN token so no row can borrow another's
+  // readiness, framed bytes, or capsules.
+  harness.registrar.nextToken = framingToken();
+  const id = await harness.manager.create({ workspace: harness.workspace });
+  const pty = harness.spawned.at(-1);
+  assert.ok(pty, "creating a row spawns its owned child");
+  const entry = harness.registrar.entries.find((candidate) => candidate.instanceId === id);
+  assert.ok(entry, "creating a row registers it");
+  assert.equal(entry.released, false);
+  return { id, pty, bootstrap: entry.bootstrap, entry };
+}
+
+/**
+ * Deliver this row's readiness capsule on its own stdout stream and wait for the
+ * parse that verifies it: readiness is observed by the terminal parser, so a
+ * later write in the same tick is still honestly refused.
+ */
+async function markReady(harness: FramingHarness, row: FramingRow): Promise<void> {
+  row.pty.emitData(capsuleOsc(readyCapsule(row.bootstrap)));
+  await harness.manager.surface(row.id)?.flush();
+}
+
+/** Deliver bytes and wait for the parse that may produce a query reply. */
+async function deliver(harness: FramingHarness, row: FramingRow, data: string): Promise<void> {
+  row.pty.emitData(data);
+  await harness.manager.surface(row.id)?.flush();
+}
+
+async function disposeFramingHarness(harness: FramingHarness): Promise<void> {
+  for (const pty of harness.spawned) pty.emitExit(0);
+  await harness.manager.dispose();
+  rmSync(harness.root, { recursive: true, force: true });
+}
+
+test("an opted-in native row records the closed mode in its actual bootstrap and spawn env before the child exists", async () => {
+  const harness = makeFramingHarness("framing-propagation", { framing: true });
+  const callerEnvBefore = JSON.stringify(harness.callerEnv);
+  try {
+    const row = await createFramingRow(harness);
+    const request = harness.registrar.registrationRequests.at(-1);
+    assert.deepEqual(request, { instanceId: row.id, options: { inputOriginFraming: true } },
+      "the registration request carries the closed opt-in");
+    assert.equal(row.bootstrap.inputOriginFraming, 1, "the mode lives in the bootstrap the host hands to the child");
+    // The child receives this object only as one-shot JSON env: the marker must
+    // survive serialization into the actual spawn environment.
+    const spawnBootstrap = JSON.parse(row.pty.spawnDescriptor.env[SESSION_HOST_BOOTSTRAP_ENV] as string) as FramingBootstrap;
+    assert.equal(spawnBootstrap.inputOriginFraming, 1, "the mode is present before the child exists");
+    assert.equal(spawnBootstrap.token, row.bootstrap.token);
+    assert.equal(row.pty.spawnDescriptor.env.PI_CLIPBOARD_OSC52, "1",
+      "the supported static capture flag is supplied for this opted-in native launch only");
+    assert.equal(JSON.stringify(harness.callerEnv), callerEnvBefore, "the caller's env object is never mutated");
+    // Exactly one registration carried the request, and the marker reached the
+    // child through the one-shot spawn env (registration strictly precedes spawn).
+    assert.equal(harness.registrar.registrationRequests.length, 1, "one registration per row");
+    // Nothing has been written yet, and nothing may be before readiness.
+    assert.deepEqual(row.pty.writes, [], "no byte reaches a framing child before readiness");
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("the framing opt-in is a closed boolean and never applies to a non-native manager", () => {
+  const harness = makeFramingHarness("framing-opt-in-validation");
+  try {
+    const base = {
+      packageRoot: harness.packageRoot,
+      piExecutable: harness.piExecutable,
+      statusRegistrar: new FakeRegistrar(),
+      args: [],
+      env: { ...harness.callerEnv },
+      ptyFactory: (descriptor: InstanceSpawnDescriptor) => new FakePty(descriptor),
+    };
+    // Constructing these managers spawns nothing; both refusals happen in the
+    // constructor before any registration, launch, or child exists.
+    assert.throws(
+      () => new InstanceManager({ ...base, nativeInputOriginFraming: "yes" as never }),
+      /must be a boolean or absent/,
+      "a malformed opt-in is refused instead of guessing",
+    );
+    assert.throws(
+      () => new InstanceManager({
+        ...base,
+        nativeSetup: false,
+        profileRegistry: new ProfileRegistry({ stateRoot: join(harness.root, "state") }),
+        nativeInputOriginFraming: true,
+      }),
+      /available only for native setup launches/,
+      "a legacy private-profile manager can never frame input",
+    );
+    // The explicit default is the legacy manager, unchanged.
+    const legacy = new InstanceManager({ ...base, nativeInputOriginFraming: false });
+    assert.equal(harness.spawned.length, 0);
+    void legacy.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a default manager keeps legacy PTY bytes and a legacy bootstrap byte-for-byte", async () => {
+  const harness = makeFramingHarness("framing-default-legacy");
+  try {
+    const row = await createFramingRow(harness);
+    assert.equal(Object.hasOwn(row.bootstrap, "inputOriginFraming"), false, "absence is the legacy bootstrap");
+    const spawnBootstrap = JSON.parse(row.pty.spawnDescriptor.env[SESSION_HOST_BOOTSTRAP_ENV] as string) as Record<string, unknown>;
+    assert.equal(Object.hasOwn(spawnBootstrap, "inputOriginFraming"), false);
+    assert.equal(row.pty.spawnDescriptor.env.PI_CLIPBOARD_OSC52, undefined,
+      "an ordinary native launch never gains the capture flag");
+    // Legacy rows forward exactly the bytes they were given, in whatever type.
+    harness.manager.write(row.id, "ls -la\r");
+    harness.manager.write(row.id, Buffer.from([0x1b, 0x5b, 0x41]));
+    assert.deepEqual(row.pty.writes, ["ls -la\r", Buffer.from([0x1b, 0x5b, 0x41])]);
+    // A legacy row also ignores readiness capsules entirely: no mode, no framing.
+    await markReady(harness, row);
+    harness.manager.write(row.id, "after-foreign-ready");
+    assert.deepEqual(row.pty.writes.at(-1), "after-foreign-ready");
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a framing row refuses every write until its own verified readiness, then frames local input", async () => {
+  const harness = makeFramingHarness("framing-readiness", { framing: true });
+  try {
+    const row = await createFramingRow(harness);
+
+    // Refusal before readiness: an honest error and zero bytes, never raw input.
+    assert.throws(() => harness.manager.write(row.id, "typed-before-ready"), /refusing unframed input/);
+    assert.equal(row.pty.writes.length, 0, "a refused framing write puts nothing in the child");
+
+    // A readiness capsule signed by a foreign registration arms nothing.
+    const foreign: FramingBootstrap = { ...row.bootstrap, token: "cd".repeat(32) };
+    await deliver(harness, row, capsuleOsc(readyCapsule(foreign)));
+    assert.throws(() => harness.manager.write(row.id, "still-refused"), /refusing unframed input/);
+
+    // A valid capsule for a different generation, kind, or MAC is refused too.
+    await deliver(harness, row, capsuleOsc(readyCapsule(row.bootstrap, { generation: randomUUID() })));
+    await deliver(harness, row, capsuleOsc(readyCapsule(row.bootstrap, { body: {
+      version: 1, kind: "clipboard-copy-ready",
+      instanceId: row.bootstrap.instanceId, generation: row.bootstrap.generation,
+    } })));
+    const tampered = readyCapsule(row.bootstrap);
+    await deliver(harness, row, capsuleOsc(`${tampered.slice(0, -1)}${tampered.endsWith("0") ? "1" : "0"}`));
+    assert.throws(() => harness.manager.write(row.id, "still-refused"), /refusing unframed input/);
+    assert.equal(row.pty.writes.length, 0, "no refused readiness ever produced a byte");
+
+    // The child's own readiness for THIS registration arms exactly this row.
+    await markReady(harness, row);
+    const text = "ünïcödé ⌨ — αβ\n";
+    harness.manager.write(row.id, text);
+    const framed = row.pty.writes.at(-1);
+    assert.equal(typeof framed, "string");
+    const framedText = framed as string;
+    assert.ok(framedText.startsWith("prg-ni-v1;"), "the write is an authenticated framed dispatch");
+    assert.equal(framedText.includes(text), false, "the user's bytes never travel as raw terminal input");
+    assert.deepEqual(framedPayload(row.bootstrap, framedText), { text, origin: { kind: "local" } });
+
+    // Readiness is consumed at most once per registration; later writes keep
+    // framing under the same encoder and monotonic sequence.
+    await markReady(harness, row);
+    const decoder = createNativeInputDecoder(row.bootstrap);
+    const first = decodeFramedWrite(row.bootstrap, framedText, decoder);
+    harness.manager.write(row.id, "b");
+    const second = decodeFramedWrite(row.bootstrap, row.pty.writes.at(-1) as string, decoder);
+    assert.deepEqual(first.map((fragment) => fragment.dispatchId), [1]);
+    assert.deepEqual(second.map((fragment) => fragment.dispatchId), [2],
+      "one encoder per registration continues its sequence; readiness never resets it");
+
+    // A reporter reconnect (extension reload) never resets this registration's
+    // encoder or revokes its readiness: the sequence stays monotonic.
+    row.entry.handlers.onReconnect?.();
+    harness.manager.write(row.id, "c");
+    const third = decodeFramedWrite(row.bootstrap, row.pty.writes.at(-1) as string, decoder);
+    assert.deepEqual(third.map((fragment) => fragment.dispatchId), [3],
+      "a reconnect reuses the same per-registration encoder instead of starting over");
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a framing row frames terminal protocol replies as none and fails honestly before readiness", async () => {
+  const harness = makeFramingHarness("framing-protocol", { framing: true });
+  try {
+    const row = await createFramingRow(harness);
+    // Before readiness the surface's kitty query reply is refused: no raw reply
+    // is typed into a legacy child, and the row reports the failure truthfully.
+    await deliver(harness, row, "\x1b[>7u\x1b[?u");
+    assert.deepEqual(row.pty.writes, [], "no unframed protocol reply reaches the child");
+    const failedView = viewFor(harness.manager, row.id);
+    assert.equal(failedView.lifecycle, "error");
+    assert.equal(failedView.error, "session-host: instance query reply write failed");
+    await until(() => row.pty.killSignals.length > 0 || row.pty.exited, "the failed framing row stops its owned child");
+
+    // A fresh, ready row answers the same query framed, with the closed `none`
+    // origin: protocol replies can never authorize a copy.
+    const ready = await createFramingRow(harness);
+    await markReady(harness, ready);
+    await deliver(harness, ready, "\x1b[>7u\x1b[?u");
+    const reply = ready.pty.writes.at(-1);
+    assert.equal(typeof reply, "string");
+    const replyText = reply as string;
+    assert.ok(replyText.startsWith("prg-ni-v1;"), "the protocol reply is framed like every other write");
+    const decoded = framedPayload(ready.bootstrap, replyText);
+    assert.deepEqual(decoded.origin, { kind: "none" }, "a protocol reply carries no user origin");
+    assert.match(decoded.text, /^\x1b\[\?\d+u$/, "the unchanged kitty reply payload travels inside the frame");
+    assert.equal(viewFor(harness.manager, ready.id).lifecycle, "alive");
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("readiness is bound to one registration: a sibling's capsule never arms another row", async () => {
+  const harness = makeFramingHarness("framing-cross-row", { framing: true });
+  try {
+    const rowA = await createFramingRow(harness);
+    const rowB = await createFramingRow(harness);
+    assert.notEqual(rowA.bootstrap.token, rowB.bootstrap.token);
+
+    // Each row's own READY delivered to the OTHER row's stdout is rejected by
+    // that row's receiver (identity/HMAC), so both stay unframed.
+    await deliver(harness, rowA, capsuleOsc(readyCapsule(rowB.bootstrap)));
+    await deliver(harness, rowB, capsuleOsc(readyCapsule(rowA.bootstrap)));
+    assert.throws(() => harness.manager.write(rowA.id, "a"), /refusing unframed input/);
+    assert.throws(() => harness.manager.write(rowB.id, "b"), /refusing unframed input/);
+    assert.deepEqual([rowA.pty.writes, rowB.pty.writes], [[], []]);
+
+    await markReady(harness, rowA);
+    harness.manager.write(rowA.id, "armed");
+    assert.equal(typeof rowA.pty.writes.at(-1), "string");
+    assert.ok((rowA.pty.writes.at(-1) as string).startsWith("prg-ni-v1;"));
+    assert.deepEqual(rowB.pty.writes, [], "readiness never crosses rows");
+
+    // After A's child exits, a late readiness capsule cannot revive its row.
+    rowA.pty.emitExit(0);
+    rowA.pty.emitData(capsuleOsc(readyCapsule(rowA.bootstrap)));
+    assert.throws(() => harness.manager.write(rowA.id, "late"), /not accepting input/);
+    assert.equal(rowA.pty.writes.length, 1, "an exited row receives nothing, ready or not");
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a framing row whose registrar ignored the mode fails the launch closed instead of framing a legacy child", async () => {
+  const harness = makeFramingHarness("framing-registrar-drop", { framing: true });
+  try {
+    harness.registrar.dropFramingMode = true;
+    harness.registrar.nextToken = FRAMING_HEX_TOKEN;
+    const id = await harness.manager.create({ workspace: harness.workspace });
+    const view = viewFor(harness.manager, id);
+    assert.equal(view.lifecycle, "error");
+    assert.equal(view.error, "session-host: instance launch preparation failed");
+    assert.equal(harness.spawned.length, 0, "no child ever existed, so no raw byte could be typed into one");
+    const entry = harness.registrar.entries.find((candidate) => candidate.instanceId === id);
+    assert.ok(entry, "the registration was still attempted and then released");
+    assert.equal(entry.released, true, "the refused launch released its registration");
+    assert.throws(() => harness.manager.write(id, "anything"), /not accepting input|unknown instance id/);
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("an unresolved stop closes the framing seam for both write sources while ownership stays retained", async () => {
+  const harness = makeFramingHarness("framing-stop-fence", { framing: true });
+  try {
+    const row = await createFramingRow(harness);
+    // A stubborn child: the owned stop signals it, but no exit event ever arrives,
+    // so the stop stays unconfirmed while the row is still `alive`.
+    row.pty.exitsOnSignal = "none";
+    await markReady(harness, row);
+    harness.manager.write(row.id, "before-stop");
+    const writesBefore = row.pty.writes.length;
+    assert.ok((row.pty.writes.at(-1) as string).startsWith("prg-ni-v1;"), "the row framed while it was running");
+
+    // Fire-and-forget: the confirmed stop signals the child and then waits for the
+    // actual exit this child never sends.
+    void harness.manager.stop(row.id, { confirmed: true }).catch(() => undefined);
+    await until(() => row.pty.killSignals.length > 0, "the owned stop signalled its own child");
+    assert.equal(row.pty.killSignals.at(-1), "SIGTERM", "the stop is the owned graceful signal path");
+    assert.equal(row.entry.released, false, "an unconfirmed stop never releases the registration");
+
+    // Readiness armed earlier is not a standing grant: local user input is refused.
+    assert.throws(() => harness.manager.write(row.id, "during-stop"), /refusing unframed input/);
+    assert.equal(row.pty.writes.length, writesBefore, "no framed byte left during the unresolved stop");
+    assert.equal(viewFor(harness.manager, row.id).lifecycle, "alive",
+      "the row stays alive and owned until its real exit event");
+
+    // The second write source is refused by the same fence, and the refusal is
+    // reported truthfully rather than hidden or retried as raw input.
+    await deliver(harness, row, "\x1b[>7u\x1b[?u");
+    assert.equal(row.pty.writes.length, writesBefore, "no unframed or framed protocol reply left either");
+    const failed = viewFor(harness.manager, row.id);
+    assert.equal(failed.lifecycle, "error");
+    assert.equal(failed.error, "session-host: instance query reply write failed");
+    assert.equal(row.pty.killSignals.length, 1,
+      "the failure joins the existing owned stop instead of starting a second one");
+    assert.equal(row.entry.released, false, "ownership is retained, never silently dropped");
+
+    // The row still settles on the child's actual exit, and nothing arrives after.
+    row.pty.emitExit(0);
+    await until(() => row.entry.released, "the confirmed exit released the registration");
+    // The truthful lifecycle survives the confirmed exit: a row that failed while
+    // stopping keeps reporting its failure instead of pretending a clean stop.
+    assert.equal(viewFor(harness.manager, row.id).lifecycle, "error",
+      "the reported failure is not rewritten by the later exit");
+    assert.equal(row.pty.writes.length, writesBefore, "the row received nothing after the stop began");
+    assert.throws(() => harness.manager.write(row.id, "after-exit"), /not accepting input/);
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a manager-wide shutdown closes the framing seam before any child confirms", async () => {
+  const harness = makeFramingHarness("framing-manager-stop", { framing: true });
+  try {
+    const row = await createFramingRow(harness);
+    row.pty.exitsOnSignal = "none";
+    await markReady(harness, row);
+    harness.manager.write(row.id, "before-shutdown");
+    const writesBefore = row.pty.writes.length;
+    // Shutdown has begun but its child has not confirmed: the seam is already shut.
+    const shutdown = harness.manager.dispose();
+    assert.throws(() => harness.manager.write(row.id, "during-shutdown"), /disposed|refusing unframed input/);
+    assert.equal(row.pty.writes.length, writesBefore, "shutdown wrote nothing new to the child");
+    row.pty.emitExit(0);
+    await shutdown;
+    assert.equal(row.pty.writes.length, writesBefore);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a disposed framing manager refuses input and ignores late readiness", async () => {
+  const harness = makeFramingHarness("framing-dispose", { framing: true });
+  try {
+    const row = await createFramingRow(harness);
+    await markReady(harness, row);
+    harness.manager.write(row.id, "before-dispose");
+    assert.equal(row.pty.writes.length, 1);
+    row.pty.emitExit(0);
+    await harness.manager.dispose();
+    row.pty.emitData(capsuleOsc(readyCapsule(row.bootstrap)));
+    assert.throws(() => harness.manager.write(row.id, "after-dispose"), /disposed|not accepting input/);
+    assert.equal(row.pty.writes.length, 1, "disposal closes the write seam");
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("framing input survives a large paste and multibyte boundaries as one contiguous dispatch", async () => {
+  const harness = makeFramingHarness("framing-large", { framing: true });
+  try {
+    const row = await createFramingRow(harness);
+    await markReady(harness, row);
+    const paste = `\x1b[200~${"雪あα".repeat(40_000)}\x1b[201~`;
+    harness.manager.write(row.id, paste);
+    const framed = row.pty.writes.at(-1) as string;
+    assert.equal(typeof framed, "string");
+    const fragments = decodeFramedWrite(row.bootstrap, framed);
+    assert.ok(fragments.length > 1, "a paste larger than the technical fragment bound splits into ordered fragments");
+    assert.equal(fragments[0]?.start, true);
+    assert.equal(fragments.at(-1)?.end, true);
+    assert.equal(new Set(fragments.map((fragment) => fragment.dispatchId)).size, 1,
+      "one paste is one logical dispatch");
+    assert.deepEqual(fragments.map((fragment, index) => fragment.part), fragments.map((_, index) => index));
+    const rejoined = Buffer.concat(fragments.map((fragment) => fragment.payload)).toString("utf8");
+    assert.equal(rejoined, paste, "payload bytes are preserved exactly across fragment boundaries");
+    assert.deepEqual(fragments[0]?.origin, { kind: "local" });
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
   }
 });

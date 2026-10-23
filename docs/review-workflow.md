@@ -333,7 +333,7 @@ state into it. Execution/review steps require the selected harness to be availab
 and authenticated; menu-only checks need no model call.
 
 1. Open **Reviewers → Evidence methods** and verify the three scope rows default to
-   **Tools + workspace changes**, with the separate **Snapshot-failure fallback** row **Off**.
+   **Tools + workspace changes**, with the separate **Snapshot-failure fallback** row **On**.
    Stage a change, navigate Back/Escape, and verify it has not applied yet. Root
    Escape applies only for this session; reopen and Cancel a different draft to
    confirm the earlier session-only choices survive. Save or nested Ctrl+S persists

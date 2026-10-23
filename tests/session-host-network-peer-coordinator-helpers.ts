@@ -261,6 +261,8 @@ export async function startCoordinator(
 		readonly log?: SnapshotLog;
 		readonly closeOwnedSession?: PeerCoordinatorOptions["closeOwnedSession"];
 		readonly createOwnedSession?: PeerCoordinatorOptions["createOwnedSession"];
+		readonly savedCatalogViewFactory?: PeerCoordinatorOptions["savedCatalogViewFactory"];
+		readonly savedViewer?: PeerCoordinatorOptions["savedViewer"];
 	},
 ): Promise<StartedCoordinator> {
 	const log = options.log ?? createSnapshotLog();
@@ -273,6 +275,10 @@ export async function startCoordinator(
 		...(options.testHooks === undefined ? {} : { testHooks: options.testHooks }),
 		...(options.closeOwnedSession === undefined ? {} : { closeOwnedSession: options.closeOwnedSession }),
 		...(options.createOwnedSession === undefined ? {} : { createOwnedSession: options.createOwnedSession }),
+		...(options.savedCatalogViewFactory === undefined
+			? {}
+			: { savedCatalogViewFactory: options.savedCatalogViewFactory }),
+		...(options.savedViewer === undefined ? {} : { savedViewer: options.savedViewer }),
 	});
 	t.after(async () => {
 		try {

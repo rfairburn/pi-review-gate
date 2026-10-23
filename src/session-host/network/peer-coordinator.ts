@@ -97,8 +97,21 @@
  * anything, never re-negotiates or revokes owner framing, never changes Hosting,
  * Auto, a grant, or another viewer, and never cancels owner work already accepted.
  * The separate owner policy for exposing remote saved-history deletion is a live
- * readable fact here ({@link PeerCoordinatorWithHistoryPolicy}); this coordinator
- * offers no remote history endpoint of its own.
+ * readable fact here ({@link PeerCoordinatorWithHistoryPolicy}).
+ *
+ * The optional Saved catalog exchange (see `peer-saved.ts`) rides the SAME
+ * metadata lane in two independent halves. OWNER serving exists only when the
+ * caller supplies its real Saved catalog view factory: the existing roster
+ * bridge then acknowledges the capability, creates at most one view per channel
+ * binding lazily after an authorized request, and reads this coordinator's live
+ * delete policy at every decision; every actual policy change is pushed to the
+ * existing bindings as a description, never as a roster refresh. REQUESTER use
+ * exists only with the explicit `savedViewer` opt-in: the viewer then offers the
+ * capability, the destination DTO describes support and the owner's (never this
+ * host's) delete exposure, and the one {@link PeerSavedController} rides the
+ * same verified pin, destination epoch, and exact owner run fences as Close and
+ * Create. Neither half is gated by native input/copy, a content selection, or
+ * the other half, and without either option nothing about the lane changes.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -174,6 +187,29 @@ import {
 	type PeerCoordinatorWithCreate,
 } from "./peer-create";
 import {
+	isOwnerSavedIdentifier,
+	isOwnerSavedQuery,
+	isOwnerSavedScalar,
+	type OwnerSavedCatalogViewFactory,
+	type OwnerSavedDeleteFacts,
+	type OwnerSavedDeleteRequest,
+	type OwnerSavedListRequest,
+	type OwnerSavedResumeFacts,
+	type OwnerSavedResumeRequest,
+	type OwnerSavedSearchRequest,
+	type OwnerSavedWindowFacts,
+	type OwnerSavedWindowRequest,
+	type PeerCoordinatorWithSaved,
+	type PeerSavedController,
+	type PeerSavedControllerOptions,
+	type PeerSavedDeleteTarget,
+	type PeerSavedListTarget,
+	type PeerSavedResult,
+	type PeerSavedResumeTarget,
+	type PeerSavedSearchTarget,
+	type PeerSavedWindowTarget,
+} from "./peer-saved";
+import {
 	DEFAULT_PEER_PREFERENCES,
 	MAX_PEER_DESTINATIONS,
 	isValidPeerEndpointHost,
@@ -194,8 +230,17 @@ import {
 	type PeerTransportBounds,
 	type PeerTransportErrorCode,
 } from "./protocol";
-import { isRosterBridgeIdentifier, ROSTER_BRIDGE_CREATE_CAPABILITY } from "./roster-bridge-protocol";
-import { attachRosterBridgeViewer, type RosterBridgeProjection, type RosterBridgeViewer } from "./roster-bridge-client";
+import {
+	isRosterBridgeIdentifier,
+	ROSTER_BRIDGE_CREATE_CAPABILITY,
+	ROSTER_BRIDGE_SAVED_CAPABILITY,
+} from "./roster-bridge-protocol";
+import {
+	attachRosterBridgeViewer,
+	type RosterBridgeProjection,
+	type RosterBridgeSavedViewer,
+	type RosterBridgeViewer,
+} from "./roster-bridge-client";
 import {
 	createRosterBridgeHost,
 	type RosterBridgeHost,
@@ -253,10 +298,11 @@ export function isPeerCoordinatorCloseError(value: unknown): value is PeerCoordi
 /**
  * The OWNER-side remote saved-history deletion exposure policy, read live.
  *
- * This is the one policy fact a later owner-side Saved provider consults on every
- * request; it is not a registry, lease, grant, or receiving permission, it does
- * not gate this host's own local Saved deletion, and it is not a viewer-side
- * toggle. No remote history endpoint exists yet: reading it enables nothing.
+ * This is the one policy fact the owner-side Saved exchange consults on every
+ * delete decision and policy publication (only when the caller supplied a Saved
+ * catalog view factory); it is not a registry, lease, grant, or receiving
+ * permission, it does not gate this host's own local Saved deletion, and it is
+ * not a viewer-side toggle. Reading it enables nothing.
  */
 export interface PeerCoordinatorWithHistoryPolicy {
 	/**
@@ -369,6 +415,27 @@ export interface PeerCoordinatorOptions {
 	 * today.
 	 */
 	readonly createOwnedSession?: OwnerCreateHandler;
+	/**
+	 * OWNER side: the host's real Saved catalog view factory, supplied by Main.
+	 *
+	 * Present means the owner bridge acknowledges the optional Saved capability and
+	 * pairs this factory with this coordinator's LIVE remote-history delete policy
+	 * ({@link PeerCoordinatorWithHistoryPolicy.readRemoteHistoryDeleteEnabled}). The
+	 * factory is never called here: the bridge creates at most one view per channel
+	 * binding, lazily, only after an authorized request. Serving is independent of
+	 * this host's own viewer preferences, `savedViewer`, and content selection.
+	 * Absent keeps the bridge exactly the metadata/close/create host it was.
+	 */
+	readonly savedCatalogViewFactory?: OwnerSavedCatalogViewFactory;
+	/**
+	 * REQUESTER side: explicit opt-in to the Saved catalog exchange on this host's
+	 * outgoing metadata viewers. `true` offers the capability, describes each
+	 * destination's Saved support and owner delete exposure in its DTO, and arms
+	 * {@link PeerCoordinatorWithSaved.ownerSaved}. Absent or `false` is exactly the
+	 * legacy coordinator: nothing new is offered or described, and every controller
+	 * request is `not-sent` with `capability-unsupported`.
+	 */
+	readonly savedViewer?: boolean;
 	readonly onChange: (snapshot: PeerUiSnapshot) => void;
 	/** Advisory, exactly-once-per-new-incoming-handle arrival signal. */
 	readonly onIncomingConsentArrival: (consentId: string) => void;
@@ -667,6 +734,146 @@ function normalizeCreateTarget(value: unknown): PeerCreateTarget | null {
 	if (!isRosterBridgeIdentifier(hostRunId)) return null;
 	if (!isOwnerCreateWorkspace(workspace)) return null;
 	return Object.freeze({ hostId, hostRunId, workspace });
+}
+
+/** The five requester Saved operations, matching the controller's methods. */
+type SavedOperation = "list" | "search" | "window" | "resume" | "remove";
+
+/**
+ * One validated Saved request on its own closed, frozen copy. Only the fields the
+ * owner request names are copied: a UI intent's picker/request ids, paths, or any
+ * other extra field never reach the transport.
+ */
+type NormalizedSavedTarget =
+	| { readonly kind: "list"; readonly hostId: string; readonly request: OwnerSavedListRequest }
+	| { readonly kind: "search"; readonly hostId: string; readonly request: OwnerSavedSearchRequest }
+	| { readonly kind: "window"; readonly hostId: string; readonly request: OwnerSavedWindowRequest }
+	| { readonly kind: "resume"; readonly hostId: string; readonly request: OwnerSavedResumeRequest }
+	| { readonly kind: "remove"; readonly hostId: string; readonly request: OwnerSavedDeleteRequest };
+
+/** A positive, safe window size. The raw viewer applies the lane's own upper bound. */
+function isSavedWindowCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
+
+/**
+ * Validate and copy one requester Saved request. Every field is read exactly once
+ * (a getter cannot hand one value to validation and another to the wire), the
+ * query is preserved verbatim (spaces, Unicode, regex/fuzzy syntax; never trimmed,
+ * normalized, or capped here — the only size bound is the lane frame), and a
+ * request this contract cannot represent is refused rather than repaired.
+ */
+function normalizeSavedTarget(kind: SavedOperation, value: unknown): NormalizedSavedTarget | null {
+	if (!isRecord(value)) return null;
+	const hostId = value.hostId;
+	const hostRunId = value.hostRunId;
+	if (typeof hostId !== "string" || hostId.length === 0) return null;
+	if (!isOwnerSavedIdentifier(hostRunId)) return null;
+	switch (kind) {
+		case "list": {
+			const query = value.query;
+			const offset = value.offset;
+			const count = value.count;
+			if (!isOwnerSavedQuery(query) || !isOwnerSavedScalar(offset) || !isSavedWindowCount(count)) return null;
+			return Object.freeze({ kind, hostId, request: Object.freeze({ hostRunId, query, offset, count }) });
+		}
+		case "search": {
+			const catalogId = value.catalogId;
+			const query = value.query;
+			const offset = value.offset;
+			const count = value.count;
+			if (!isOwnerSavedIdentifier(catalogId)) return null;
+			if (!isOwnerSavedQuery(query) || !isOwnerSavedScalar(offset) || !isSavedWindowCount(count)) return null;
+			return Object.freeze({
+				kind,
+				hostId,
+				request: Object.freeze({ hostRunId, catalogId, query, offset, count }),
+			});
+		}
+		case "window": {
+			const catalogId = value.catalogId;
+			const resultId = value.resultId;
+			const offset = value.offset;
+			const count = value.count;
+			if (!isOwnerSavedIdentifier(catalogId) || !isOwnerSavedIdentifier(resultId)) return null;
+			if (!isOwnerSavedScalar(offset) || !isSavedWindowCount(count)) return null;
+			return Object.freeze({
+				kind,
+				hostId,
+				request: Object.freeze({ hostRunId, catalogId, resultId, offset, count }),
+			});
+		}
+		case "resume": {
+			const catalogId = value.catalogId;
+			const resultId = value.resultId;
+			const entryId = value.entryId;
+			if (!isOwnerSavedIdentifier(catalogId) || !isOwnerSavedIdentifier(resultId)) return null;
+			if (!isOwnerSavedIdentifier(entryId)) return null;
+			return Object.freeze({
+				kind,
+				hostId,
+				request: Object.freeze({ hostRunId, catalogId, resultId, entryId }),
+			});
+		}
+		case "remove": {
+			const catalogId = value.catalogId;
+			const resultId = value.resultId;
+			const entryId = value.entryId;
+			const confirmed = value.confirmed;
+			if (!isOwnerSavedIdentifier(catalogId) || !isOwnerSavedIdentifier(resultId)) return null;
+			if (!isOwnerSavedIdentifier(entryId) || typeof confirmed !== "boolean") return null;
+			return Object.freeze({
+				kind,
+				hostId,
+				request: Object.freeze({ hostRunId, catalogId, resultId, entryId, confirmed }),
+			});
+		}
+		default:
+			return null;
+	}
+}
+
+/**
+ * Whether one owner outcome really answers THIS captured request: a window names
+ * the exact requested owner run and offset (plus the same catalog for a search,
+ * and the same catalog and result for a window) and never holds more entries than
+ * were asked for; a `started` resume names the exact requested run. Anything else
+ * establishes nothing about this request and is reported `unknown`, never
+ * retargeted to another run or result.
+ */
+function savedOutcomeAnswers(target: NormalizedSavedTarget, outcome: unknown): boolean {
+	if (!isRecord(outcome)) return false;
+	const kind = outcome.kind;
+	switch (target.kind) {
+		case "list":
+		case "search":
+		case "window": {
+			if (kind === "refused" || kind === "unavailable" || kind === "unknown") return true;
+			if (kind !== "window") return false;
+			const request = target.request;
+			if (outcome.hostRunId !== request.hostRunId || outcome.offset !== request.offset) return false;
+			if (target.kind !== "list" && outcome.catalogId !== target.request.catalogId) return false;
+			if (target.kind === "window" && outcome.resultId !== target.request.resultId) return false;
+			const entries = outcome.entries;
+			return Array.isArray(entries) && entries.length <= request.count;
+		}
+		case "resume":
+			if (kind === "started") return outcome.hostRunId === target.request.hostRunId;
+			return kind === "refused" || kind === "unconfirmed" || kind === "unknown";
+		case "remove":
+			return kind === "confirmation-required"
+				|| kind === "deleted"
+				|| kind === "refused"
+				|| kind === "unconfirmed"
+				|| kind === "unknown";
+		default:
+			return false;
+	}
+}
+
+/** A read only describes; a resume or delete is a mutation the owner may have performed. */
+function isSavedRead(kind: SavedOperation): boolean {
+	return kind === "list" || kind === "search" || kind === "window";
 }
 
 /**
@@ -969,8 +1176,27 @@ class OwnedPeerCoordinator implements
 	PeerCoordinatorWithContent,
 	PeerCoordinatorWithClose,
 	PeerCoordinatorWithCreate,
+	PeerCoordinatorWithSaved,
 	PeerCoordinatorWithHistoryPolicy {
 	readonly #options: PeerCoordinatorOptions;
+	/**
+	 * Explicit requester-side Saved opt-in, fixed for the lifecycle. False is the
+	 * exact legacy viewer: no capability offer, no DTO description, inert controller.
+	 */
+	readonly #savedViewer: boolean;
+	/**
+	 * The owner's live remote-history delete exposure as last recorded, so only an
+	 * ACTUAL change (including loss of the protected settings or close) is pushed to
+	 * the existing owner bindings as a description.
+	 */
+	#remoteHistoryDeleteEffective = false;
+	/**
+	 * Sticky for the lifecycle: the protected preferences handle was poisoned by a
+	 * publication failure at or after its commit point. Only the owner delete
+	 * exposure consults it (fail closed); every other preference keeps its existing
+	 * persistence semantics.
+	 */
+	#preferencesHandleUnusable = false;
 	readonly #consentWindowMs: number;
 	readonly #autoReconnectDelaysMs: readonly number[];
 	readonly #preferencesPermissions: PeerStatePermissionPolicy;
@@ -1091,6 +1317,23 @@ class OwnedPeerCoordinator implements
 		createSession: (target: PeerCreateTarget, options: PeerCreateOptions): Promise<PeerCreateResult> =>
 			this.#createSession(target, options),
 	};
+	/**
+	 * The ONE requester-side Saved controller: a property of this coordinator rather
+	 * than a second manager, needing no selection, row, native tuple, focus, lease,
+	 * or on-demand connection. The caller's own proof is REQUIRED for every request.
+	 */
+	readonly #ownerSavedController: PeerSavedController = Object.freeze({
+		list: (target: PeerSavedListTarget, options: PeerSavedControllerOptions) =>
+			this.#savedRequest("list", target, options) as Promise<PeerSavedResult<OwnerSavedWindowFacts>>,
+		search: (target: PeerSavedSearchTarget, options: PeerSavedControllerOptions) =>
+			this.#savedRequest("search", target, options) as Promise<PeerSavedResult<OwnerSavedWindowFacts>>,
+		window: (target: PeerSavedWindowTarget, options: PeerSavedControllerOptions) =>
+			this.#savedRequest("window", target, options) as Promise<PeerSavedResult<OwnerSavedWindowFacts>>,
+		resume: (target: PeerSavedResumeTarget, options: PeerSavedControllerOptions) =>
+			this.#savedRequest("resume", target, options) as Promise<PeerSavedResult<OwnerSavedResumeFacts>>,
+		remove: (target: PeerSavedDeleteTarget, options: PeerSavedControllerOptions) =>
+			this.#savedRequest("remove", target, options) as Promise<PeerSavedResult<OwnerSavedDeleteFacts>>,
+	});
 	#host: PeerHost | null = null;
 	#preferences: PeerPreferences | null = null;
 	#preferencesLoaded = false;
@@ -1123,6 +1366,8 @@ class OwnedPeerCoordinator implements
 		this.#nativeIo = options.nativeIo === undefined
 			? null
 			: Object.freeze({ authorizeInput: options.nativeIo.authorizeInput, onCopy: options.nativeIo.onCopy });
+		// Validated at construction admission: only a real `true` opts in.
+		this.#savedViewer = options.savedViewer === true;
 		this.#snapshot = this.#buildSnapshot(0);
 	}
 
@@ -1169,12 +1414,26 @@ class OwnedPeerCoordinator implements
 		return this.#ownerCreateController;
 	}
 
+	/**
+	 * The one requester-side Saved controller. It exists from construction and
+	 * needs nothing selected, focused, or displayed: a request addresses one
+	 * already connected destination by its own saved handle plus the exact owner
+	 * run its last observation named (an empty owner roster is a valid target).
+	 * Without the explicit `savedViewer` opt-in it is inert.
+	 */
+	get ownerSaved(): PeerSavedController {
+		return this.#ownerSavedController;
+	}
+
 	read(): PeerUiSnapshot {
 		return this.#snapshot;
 	}
 
 	readRemoteHistoryDeleteEnabled(): boolean {
 		if (this.#closed || this.#tearingDown) return false;
+		// Protected settings that became unavailable mid-lifecycle (a poisoned
+		// handle) never keep exposing remote deletion from a cached value.
+		if (this.#preferencesHandleUnusable) return false;
 		const preferences = this.#preferences;
 		return preferences !== null && preferences.remoteHistoryDeleteEnabled === true;
 	}
@@ -1283,6 +1542,9 @@ class OwnedPeerCoordinator implements
 		// A closing coordinator forwards nothing: the viewer preference is now
 		// effectively Off, which is an actual change for any in-flight admission.
 		this.#noteViewerInputPolicy();
+		// A closing owner exposes no remote deletion either: the existing bindings
+		// are told before teardown retires them, so no delete proof spans the close.
+		this.#noteRemoteHistoryPolicy();
 		this.#transientNotice = null;
 		this.#closePromise = this.#teardown();
 		return this.#closePromise;
@@ -1335,6 +1597,17 @@ class OwnedPeerCoordinator implements
 				...(this.#options.createOwnedSession === undefined
 					? {}
 					: { createOwnedSession: this.#options.createOwnedSession }),
+				// The owner Saved pair exists only with the caller's REAL view factory:
+				// the factory itself (never wrapped or called here; the bridge creates one
+				// view per binding lazily after an authorized request) plus this
+				// coordinator's live, fail-closed delete policy. There is no no-op provider
+				// and no default permission.
+				...(this.#options.savedCatalogViewFactory === undefined
+					? {}
+					: {
+						savedCatalogView: this.#options.savedCatalogViewFactory,
+						remoteHistoryDeleteExposed: (): boolean => this.readRemoteHistoryDeleteEnabled(),
+					}),
 			});
 		} catch {
 			this.#bridge = null;
@@ -2471,16 +2744,27 @@ class OwnedPeerCoordinator implements
 
 	async #startViewer(runtime: DestinationRuntime, epoch: number, channel: PeerByteChannel): Promise<void> {
 		let viewer: RosterBridgeViewer;
+		// The exact viewer a Saved policy description may come from; assigned right
+		// after attach, before any frame can be handled.
+		let boundViewer: RosterBridgeViewer | null = null;
 		try {
 			viewer = attachRosterBridgeViewer({
 				channel,
 				// This side knows the rowless create exchange and says so explicitly. It is
 				// not part of the viewer's default offers, so nothing about the existing lane
 				// changes for a caller that never asks, and the owner still acknowledges it
-				// only when it really holds a create provider.
-				capabilities: [ROSTER_BRIDGE_CREATE_CAPABILITY],
+				// only when it really holds a create provider. Saved is offered after it
+				// ONLY with the explicit requester opt-in; without it the offer is
+				// byte-for-byte the previous one.
+				capabilities: this.#savedViewer
+					? [ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]
+					: [ROSTER_BRIDGE_CREATE_CAPABILITY],
 				onProjection: (projection) => this.#onProjection(runtime, epoch, projection),
+				...(this.#savedViewer
+					? { onSavedPolicy: (): void => this.#onSavedPolicy(runtime, epoch, boundViewer) }
+					: {}),
 			});
+			boundViewer = viewer;
 		} catch {
 			if (runtime.epoch === epoch) {
 				runtime.message = HOST_MESSAGE.metadataUnavailable;
@@ -2534,6 +2818,21 @@ class OwnedPeerCoordinator implements
 		// back may restore that one selection, and a projection that no longer holds it
 		// stops claiming content. Nothing here connects, retries, pairs, or retargets.
 		this.#reconcileContentWithRoster(runtime.id);
+	}
+
+	/**
+	 * The owner's described Saved delete policy changed on ONE exact viewer. Only
+	 * that viewer, while it is still the current one of the same destination
+	 * runtime and epoch, may publish: a callback from a retired viewer can never
+	 * describe a replacement connection (A -> B -> A included), and nothing here
+	 * refreshes the roster, resubscribes, rebinds, or reconnects. The DTO reads the
+	 * description live, so this only republishes the snapshot.
+	 */
+	#onSavedPolicy(runtime: DestinationRuntime, epoch: number, viewer: RosterBridgeViewer | null): void {
+		if (viewer === null || this.#closed || this.#tearingDown) return;
+		if (runtime.epoch !== epoch || runtime.viewer !== viewer) return;
+		if (this.#runtime.get(runtime.id) !== runtime) return;
+		this.#emit();
 	}
 
 	// ------------------------------------------------------------- owner Close
@@ -2757,6 +3056,187 @@ class OwnedPeerCoordinator implements
 	): boolean {
 		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) return false;
 		return isOwnerCreateRunStillCurrent(runtime.roster.hostRunId, hostRunId);
+	}
+
+	// ------------------------------------------------- owner Saved (requester side)
+
+	/**
+	 * Send one requester Saved request through the destination's EXISTING connected
+	 * metadata viewer, and never throw.
+	 *
+	 * Until the raw Saved API is invoked, every refusal is positive proof that no
+	 * bytes reached the transport (`not-sent`). Once it is invoked, the only honest
+	 * answers are the raw API's own `not-sent` (its write boundary refused), the
+	 * owner's correlated result, or `unknown`; an unexpected fault after invocation
+	 * is `unknown`, never a false `not-sent`.
+	 */
+	async #savedRequest(kind: SavedOperation, target: unknown, options: unknown): Promise<PeerSavedResult<unknown>> {
+		let invoked = false;
+		try {
+			return await this.#savedRequestFenced(kind, target, options, () => {
+				invoked = true;
+			});
+		} catch {
+			return invoked ? { kind: "unknown" } : { kind: "not-sent", reason: "not-ready" };
+		}
+	}
+
+	/**
+	 * The fenced Saved path. Nothing is selected, focused, or required to be
+	 * displayed: no native tuple, content source, canonical geometry, or row is
+	 * involved, and an owner whose current roster is empty is a valid target. The
+	 * request names one local saved destination plus the EXACT owner run this side
+	 * last observed for it, and is copied onto a closed frozen request first.
+	 *
+	 * Fences, all captured BEFORE any callout so an A -> B -> A change inside caller
+	 * code cannot restore them: the destination runtime, its viewer, metadata
+	 * channel, borrowed client, and destination epoch; the remembered pin equal to
+	 * the key that channel proved; this side's current identity equal to the key
+	 * that client proves; and the exact observed owner run. The caller's REQUIRED
+	 * proof runs at admission and again inside the raw write boundary, and these
+	 * fences are re-proved after it returns each time.
+	 *
+	 * This viewer's own native input/copy preference and its own (owner-side)
+	 * remote-history delete setting never gate a Saved request: the owner decides
+	 * its own live policy. Nothing is queued, retried, replayed, reconnected,
+	 * re-granted, or cancelled here, and an ordinary roster publication or revision
+	 * never invalidates a catalog, a result, or an accepted mutation.
+	 */
+	async #savedRequestFenced(
+		kind: SavedOperation,
+		target: unknown,
+		options: unknown,
+		markInvoked: () => void,
+	): Promise<PeerSavedResult<unknown>> {
+		if (this.#closed || this.#tearingDown) return { kind: "not-sent", reason: "not-ready" };
+		let request: NormalizedSavedTarget | null;
+		try {
+			request = normalizeSavedTarget(kind, target);
+		} catch {
+			// A hostile getter or revoked proxy is a malformed request, never a rejection.
+			request = null;
+		}
+		if (request === null) return { kind: "not-sent", reason: "invalid-request" };
+		// The caller's proof is required, not optional: without a real logical-read or
+		// written-mutation fence nothing may be submitted at all.
+		let proofValue: unknown;
+		try {
+			proofValue = isRecord(options) ? options.stillCurrent : undefined;
+		} catch {
+			proofValue = undefined;
+		}
+		if (typeof proofValue !== "function") return { kind: "not-sent", reason: "invalid-request" };
+		const callerProof = proofValue as () => unknown;
+		const callerHolds = (): boolean => {
+			try {
+				return callerProof() === true;
+			} catch {
+				// An unavailable caller proof is no proof at all.
+				return false;
+			}
+		};
+		// Without the explicit requester opt-in this side never offered Saved, so no
+		// Saved frame exists to send at all.
+		if (!this.#savedViewer) return { kind: "not-sent", reason: "capability-unsupported" };
+		const runtime = this.#runtime.get(request.hostId);
+		if (runtime === undefined) return { kind: "not-sent", reason: "target-unavailable" };
+		const viewer = runtime.viewer;
+		const metadata = runtime.channel;
+		const client = runtime.client;
+		const destinationEpoch = runtime.epoch;
+		if (
+			runtime.state !== "connected"
+			|| viewer === null
+			|| metadata === null
+			|| client === null
+		) return { kind: "not-sent", reason: "target-unavailable" };
+		const hostRunId = request.request.hostRunId;
+		if (!this.#savedFenceHolds(runtime, viewer, metadata, client, destinationEpoch, hostRunId)) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		// The owner never acknowledged Saved for this channel: no frame exists.
+		const saved = viewer.saved;
+		if (saved === undefined || saved.supported !== true) {
+			return { kind: "not-sent", reason: "capability-unsupported" };
+		}
+		// Admission: the caller's proof, then every borrowed fact re-proved AFTER it
+		// returns, because it is arbitrary code that may reenter this coordinator.
+		if (!callerHolds()) return { kind: "not-sent", reason: "target-unavailable" };
+		if (!this.#savedFenceHolds(runtime, viewer, metadata, client, destinationEpoch, hostRunId)) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		const sendOptions = Object.freeze({
+			// The last-instant half of the same fence, evaluated synchronously by the
+			// raw viewer immediately before its queued write calls `channel.send`.
+			stillCurrent: (): boolean => {
+				if (!callerHolds()) return false;
+				return this.#savedFenceHolds(runtime, viewer, metadata, client, destinationEpoch, hostRunId);
+			},
+		});
+		markInvoked();
+		const result = await this.#dispatchSaved(saved, request, sendOptions);
+		// The raw API's own positive not-sent stays true regardless of later changes.
+		if (result.kind === "not-sent") return result;
+		if (result.kind !== "owner-result") return { kind: "unknown" };
+		// Correlated to the EXACT captured request: another run, catalog, result, or
+		// offset establishes nothing about this one and is never retargeted.
+		if (!savedOutcomeAnswers(request, result.outcome)) return { kind: "unknown" };
+		// A read is description for the destination it was asked of: one that is no
+		// longer the same live destination and run is not this request's. A resume or
+		// delete the captured request saw completed stays reported exactly as
+		// observed, even when the viewer, the owner policy, or a newer request moved
+		// on afterwards: it is never turned into a refusal or a not-sent.
+		if (
+			isSavedRead(request.kind)
+			&& !this.#savedFenceHolds(runtime, viewer, metadata, client, destinationEpoch, hostRunId)
+		) {
+			return { kind: "unknown" };
+		}
+		return result;
+	}
+
+	/** Hand one validated request to the matching raw Saved operation. */
+	#dispatchSaved(
+		saved: RosterBridgeSavedViewer,
+		request: NormalizedSavedTarget,
+		options: { readonly stillCurrent: () => boolean },
+	): Promise<PeerSavedResult<unknown>> {
+		switch (request.kind) {
+			case "list":
+				return saved.list(request.request, options);
+			case "search":
+				return saved.search(request.request, options);
+			case "window":
+				return saved.window(request.request, options);
+			case "resume":
+				return saved.resume(request.request, options);
+			case "remove":
+				return saved.remove(request.request, options);
+			default:
+				return Promise.resolve({ kind: "unknown" });
+		}
+	}
+
+	/**
+	 * The Saved fence: the requester opt-in, every fact one protected owner request
+	 * borrowed (runtime identity, viewer, channel, client, destination epoch, pin,
+	 * identity), and this side still observing the EXACT requested owner run. It is
+	 * a pure read of current state, so it can be repeated at admission, inside the
+	 * raw write boundary, and after a read completes.
+	 */
+	#savedFenceHolds(
+		runtime: DestinationRuntime,
+		viewer: RosterBridgeViewer,
+		metadata: PeerByteChannel,
+		client: PeerClient,
+		destinationEpoch: number,
+		hostRunId: string,
+	): boolean {
+		if (!this.#savedViewer) return false;
+		if (this.#runtime.get(runtime.id) !== runtime) return false;
+		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) return false;
+		const observed = runtime.roster.hostRunId;
+		return typeof observed === "string" && observed.length > 0 && observed === hostRunId;
 	}
 
 	// ------------------------------------------------------ selected content lane
@@ -3843,7 +4323,8 @@ class OwnedPeerCoordinator implements
 	 * Owner-side policy for exposing remote saved-history deletion to paired
 	 * viewers. Saved like every other preference; it changes no listener, grant,
 	 * connection, local Saved deletion, or viewer input, and it exposes nothing by
-	 * itself — it is the live fact a later owner Saved provider reads.
+	 * itself — it is the live fact the owner Saved exchange reads, and an actual
+	 * change is described to existing bindings by the one preferences apply path.
 	 */
 	#commandRemoteHistoryDelete(command: Record<string, unknown>): void {
 		const enabled = command.enabled;
@@ -4135,6 +4616,30 @@ class OwnedPeerCoordinator implements
 	#applyPreferences(next: PeerPreferences | null): void {
 		this.#preferences = next;
 		this.#noteViewerInputPolicy();
+		this.#noteRemoteHistoryPolicy();
+	}
+
+	/**
+	 * Record an actual effective change of the OWNER's remote-history delete
+	 * exposure — On -> Off, Off -> On, protected settings becoming unavailable, or
+	 * close — and push it to the existing owner bindings as a description through
+	 * the bridge's own notification. This is never a roster refresh, resubscribe, or
+	 * rebind, and it never cancels or rewrites a delete the owner already
+	 * completed: the bridge re-reads the live policy itself at every decision. An
+	 * unchanged value notifies nothing, so an unrelated settings save never
+	 * disturbs an in-flight delete proof.
+	 */
+	#noteRemoteHistoryPolicy(): void {
+		const exposed = this.readRemoteHistoryDeleteEnabled();
+		if (exposed === this.#remoteHistoryDeleteEffective) return;
+		this.#remoteHistoryDeleteEffective = exposed;
+		const bridge = this.#bridge;
+		if (bridge === null) return;
+		try {
+			bridge.notifySavedPolicy?.();
+		} catch {
+			// Description only: every delete is still re-checked against the live policy.
+		}
 	}
 
 	/** Effective viewer-side remote input/copy preference right now (fail closed). */
@@ -4187,17 +4692,39 @@ class OwnedPeerCoordinator implements
 			this.#applyPreferences(value);
 			return true;
 		} catch {
+			// A failure at or after the store's commit point poisons its handle: the
+			// protected settings are then unavailable for this lifecycle, and the owner
+			// remote-history delete exposure fails closed (recorded BEFORE any apply, so
+			// the change-only notification below sees the closed value). A pre-commit
+			// failure leaves the handle usable and changes nothing here.
+			if (!this.#preferencesHandleUsable(store)) this.#preferencesHandleUnusable = true;
 			if (options.applyOnFailure === true) {
 				// A restrictive or history change takes effect for this session even
 				// when it could not be saved; the notice keeps that unsaved.
 				this.#applyPreferences(value);
 			}
+			// Change-only: a usable handle with an unchanged policy notifies nothing.
+			this.#noteRemoteHistoryPolicy();
 			this.#transientNotice = NOTICE.preferencesUnsaved;
 			this.#emit();
 			return false;
 		}
 	}
 
+	/**
+	 * Whether the protected preferences handle can still be used. The store's own
+	 * `read()` is a pure in-memory check that throws once the handle was poisoned
+	 * (a publication failure at or after its commit point) or closed; it performs
+	 * no filesystem access.
+	 */
+	#preferencesHandleUsable(store: PeerPreferencesStore): boolean {
+		try {
+			store.read();
+			return true;
+		} catch {
+			return false;
+		}
+	}
 	#status(): PeerUiSnapshot["status"] {
 		if (!this.#started) return "loading";
 		if (!this.#preferencesLoaded || this.#preferencesStore === null) return "unavailable";
@@ -4294,7 +4821,51 @@ class OwnedPeerCoordinator implements
 				rows: copyRoster(roster.rows),
 				hostRunId: roster.hostRunId,
 			}),
+			// Only with the explicit requester opt-in; otherwise the DTO is exactly the
+			// legacy one and the Saved picker never offers this destination.
+			...(this.#savedViewer ? { saved: this.#savedHostFacts(runtime, pin) } : {}),
 		});
+	}
+
+	/**
+	 * Descriptive Saved facts for one destination; never authority. `supported`
+	 * only while this destination is connected over a live viewer whose owner
+	 * acknowledged Saved, with a CURRENT complete roster observation naming an owner
+	 * run (an empty roster is fine) and a remembered pin equal to the key the live
+	 * channel proved. `deleteExposed` is that OWNER's described live policy, and
+	 * only when it names the run currently observed; anything else is `null`
+	 * (unknown, so Delete stays hidden). This host's own viewer input/copy and
+	 * owner-side history settings are never consulted.
+	 */
+	#savedHostFacts(runtime: DestinationRuntime | undefined, pin: PeerKey | null): PeerUiHost["saved"] {
+		const unavailable = Object.freeze({ supported: false, deleteExposed: null });
+		if (runtime === undefined || this.#closed || this.#tearingDown) return unavailable;
+		const viewer = runtime.viewer;
+		const channel = runtime.channel;
+		if (runtime.state !== "connected" || viewer === null || channel === null || runtime.client === null) {
+			return unavailable;
+		}
+		const roster = runtime.roster;
+		const hostRunId = roster.hostRunId;
+		if (roster.state !== "current" || roster.rows === null || hostRunId === null) return unavailable;
+		if (pin === null || !peerKeysEqual(pin, channel.peerKey)) return unavailable;
+		let saved: RosterBridgeSavedViewer | undefined;
+		let supported = false;
+		let policy: { readonly hostRunId: string; readonly deleteExposed: boolean } | undefined;
+		try {
+			saved = viewer.saved;
+			supported = saved !== undefined && saved.supported === true;
+			policy = supported && saved !== undefined ? saved.policy : undefined;
+		} catch {
+			return unavailable;
+		}
+		if (!supported) return unavailable;
+		const deleteExposed = policy !== undefined
+			&& policy.hostRunId === hostRunId
+			&& typeof policy.deleteExposed === "boolean"
+			? policy.deleteExposed
+			: null;
+		return Object.freeze({ supported: true, deleteExposed });
 	}
 
 	#consentSnapshot(entry: PendingConsent): PeerUiConsent {
@@ -4437,6 +5008,15 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
 		// cannot honour.
 		throw new TypeError("peer coordinator create provider is invalid");
 	}
+	if (options.savedCatalogViewFactory !== undefined && typeof options.savedCatalogViewFactory !== "function") {
+		// No implicit Saved provider: a non-callable value would otherwise look like
+		// owner Saved support this host cannot honour. It is never called here.
+		throw new TypeError("peer coordinator Saved catalog view factory is invalid");
+	}
+	if (options.savedViewer !== undefined && typeof options.savedViewer !== "boolean") {
+		// The requester opt-in is a real boolean or absent; nothing else enables it.
+		throw new TypeError("peer coordinator Saved viewer option is invalid");
+	}
 	if (options.testHooks !== undefined) {
 		const hooks = options.testHooks;
 		if (!isRecord(hooks)) throw new TypeError("peer coordinator test hooks are invalid");
@@ -4495,9 +5075,20 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
  *
  * The owner-side remote history deletion policy is readable live through
  * {@link PeerCoordinatorWithHistoryPolicy.readRemoteHistoryDeleteEnabled}.
+ *
+ * An optional `savedCatalogViewFactory` makes this host SERVE the Saved catalog
+ * exchange (paired with that live policy, every actual change of which is pushed
+ * to the existing bindings as a description), and the independent `savedViewer`
+ * opt-in makes it REQUEST it through {@link PeerCoordinatorWithSaved.ownerSaved}
+ * and describe it in each destination DTO. Omitting both keeps every byte and
+ * behavior of the previous coordinator.
  */
 export function createPeerCoordinator(
 	options: PeerCoordinatorOptions,
-): PeerCoordinatorWithContent & PeerCoordinatorWithClose & PeerCoordinatorWithCreate & PeerCoordinatorWithHistoryPolicy {
+): PeerCoordinatorWithContent
+	& PeerCoordinatorWithClose
+	& PeerCoordinatorWithCreate
+	& PeerCoordinatorWithSaved
+	& PeerCoordinatorWithHistoryPolicy {
 	return new OwnedPeerCoordinator(assertOptions(options));
 }

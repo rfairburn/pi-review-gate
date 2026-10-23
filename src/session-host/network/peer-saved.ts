@@ -42,6 +42,8 @@
  *   description is never delete permission.
  */
 
+import type { PeerCoordinator } from "../peer-ui-protocol";
+
 /**
  * One Saved catalog entry: the opaque operation handle plus exactly the native
  * Saved display data of the owner's local row (`SidebarSavedRow`: id, file,
@@ -296,6 +298,69 @@ export type PeerSavedResult<Outcome> =
 /** The caller's own optional last-instant fence, evaluated at the write boundary. */
 export interface PeerSavedSendOptions {
   readonly stillCurrent?: () => boolean;
+}
+
+// ------------------------------------------------------- requester controller
+
+/**
+ * One requester-side Saved request: this side's local saved-destination handle
+ * plus exactly the owner request it names. `hostId` is a local action handle and
+ * never crosses the wire; every other field is copied verbatim onto a closed,
+ * frozen request (unknown extra fields — UI intent ids, paths, bodies — are never
+ * forwarded). `hostRunId` is REQUIRED input naming the exact owner run and is
+ * never rewritten to a newer one.
+ */
+export type PeerSavedTarget<Request> = { readonly hostId: string } & Request;
+
+export type PeerSavedListTarget = PeerSavedTarget<OwnerSavedListRequest>;
+export type PeerSavedSearchTarget = PeerSavedTarget<OwnerSavedSearchRequest>;
+export type PeerSavedWindowTarget = PeerSavedTarget<OwnerSavedWindowRequest>;
+export type PeerSavedResumeTarget = PeerSavedTarget<OwnerSavedResumeRequest>;
+export type PeerSavedDeleteTarget = PeerSavedTarget<OwnerSavedDeleteRequest>;
+
+/**
+ * The caller's own proof, REQUIRED for every controller request: `true` only
+ * while the caller still owns this exact logical read (or the actually written
+ * mutation frame) it built the request from. It is evaluated at admission and
+ * again synchronously inside the ordered write that is about to call the
+ * transport, with this side's own destination facts re-proved after it returns.
+ * A missing, non-function, `false`, or throwing proof refuses before any write.
+ */
+export interface PeerSavedControllerOptions {
+  readonly stillCurrent: () => boolean;
+}
+
+/**
+ * The one requester-side Saved controller owned by the existing peer
+ * coordinator. It exists from construction and needs no selection, displayed
+ * row, native tuple, focus, controller lease, or on-demand connection: it rides
+ * the destination's existing connected metadata channel under the same verified
+ * pin, destination epoch, and exact owner run as every other owner request.
+ *
+ * Every method never throws and never surfaces a raw error. `not-sent` is
+ * returned only with positive proof that no bytes were handed to the transport;
+ * an `owner-result` is exactly what the captured request observed for its own
+ * exact owner run; anything else is `unknown`, which is never retried, replayed,
+ * or cancelled. There is no queue, retry, cache, or timer here: one Saved
+ * operation is pending per channel, a newer read supersedes an older read, and a
+ * resume or delete is never superseded.
+ */
+export interface PeerSavedController {
+  list(target: PeerSavedListTarget, options: PeerSavedControllerOptions): Promise<PeerSavedResult<OwnerSavedWindowFacts>>;
+  search(target: PeerSavedSearchTarget, options: PeerSavedControllerOptions): Promise<PeerSavedResult<OwnerSavedWindowFacts>>;
+  window(target: PeerSavedWindowTarget, options: PeerSavedControllerOptions): Promise<PeerSavedResult<OwnerSavedWindowFacts>>;
+  resume(target: PeerSavedResumeTarget, options: PeerSavedControllerOptions): Promise<PeerSavedResult<OwnerSavedResumeFacts>>;
+  remove(target: PeerSavedDeleteTarget, options: PeerSavedControllerOptions): Promise<PeerSavedResult<OwnerSavedDeleteFacts>>;
+}
+
+/**
+ * The production coordinator interface for a host that also carries Saved:
+ * every existing promise, plus the one Saved controller. A coordinator built
+ * without the requester opt-in keeps the controller inert (every request is
+ * `not-sent` with `capability-unsupported`) and offers nothing new on the wire.
+ */
+export interface PeerCoordinatorWithSaved extends PeerCoordinator {
+  readonly ownerSaved: PeerSavedController;
 }
 
 // ---------------------------------------------------------------- guards

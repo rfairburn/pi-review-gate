@@ -101,8 +101,8 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     assert.equal(first.scheduling.configuredPoolCapacity, 2);
     assert.equal(first.scheduling.estimatedImmediatelyAvailableSlots, 0);
     assert.deepEqual(first.tasks.map((task) => task.definition.reviewEvidencePolicy), [
-      { toolOnly: false, snapshotFailureFallback: false, scope: "worktree" },
-      { toolOnly: false, snapshotFailureFallback: false, scope: "worktree" },
+      { toolOnly: false, snapshotFailureFallback: true, scope: "worktree" },
+      { toolOnly: false, snapshotFailureFallback: true, scope: "worktree" },
     ]);
     // The gate is still closed: both dispatched workers are running but
     // provably not completed, so start genuinely returned before completion.
@@ -138,8 +138,8 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     }]);
     assert.equal(toppedOff.tasks.length, 3);
     assert.deepEqual(toppedOff.tasks.slice(0, 2).map((task) => task.definition.reviewEvidencePolicy), [
-      { toolOnly: false, snapshotFailureFallback: false, scope: "worktree" },
-      { toolOnly: false, snapshotFailureFallback: false, scope: "worktree" },
+      { toolOnly: false, snapshotFailureFallback: true, scope: "worktree" },
+      { toolOnly: false, snapshotFailureFallback: true, scope: "worktree" },
     ]);
     assert.deepEqual(toppedOff.tasks[2]?.definition.reviewEvidencePolicy, { toolOnly: true, snapshotFailureFallback: true, scope: "worktree" });
     assert.notEqual(toppedOff.tasks[0]?.taskId, toppedOff.tasks[2]?.taskId);

@@ -318,6 +318,16 @@ dates.
 - A single left press on a drawn Network menu row now performs its normal Enter action
   once (#482). Captured row positions and displayed action values fence stale or unwritten
   clicks; opening consent review decides nothing, and host gestures never reach a child.
+- Owned-child input-origin framing is terminal-safe (Refs #389). The framing is versioned
+  `prg-ni-v2` and every frame is printable ASCII end to end, closed by one printable `;`
+  instead of a line feed, so a terminal that re-encodes control characters on the way into
+  the child can no longer rewrite the frame boundary. Only that exact tag and terminator
+  are accepted: the older line-feed-terminated wire, a carriage return, and a
+  terminal-substituted key ending are malformed framing that poisons that decoder, and a
+  host and a child built from different framing versions refuse each other rather than
+  downgrade, queue, replay, or fall back to raw input. Body encoding, origins, fences,
+  sequence, dispatch assembly, bounds, readiness, and every policy are unchanged, and no
+  dual-version decoder or negotiation is added.
 
 ## [0.1.0-dev.192]
 

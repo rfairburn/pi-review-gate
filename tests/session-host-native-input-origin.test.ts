@@ -14,6 +14,7 @@ import {
   parseNativeViewerScopeToken,
   verifyNativeViewerScopeToken,
   type NativeInputDecoder,
+  type NativeInputExpectedFence,
   type NativeInputExpectedTuple,
   type NativeInputFailureCode,
   type NativeInputFragment,
@@ -30,8 +31,29 @@ const bootstrap: SessionHostBootstrap = {
   socketPath: "/synthetic/broker.sock",
 };
 
+/**
+ * One complete v2 frame: tag, magic, decimal body length, base64url body, MAC and
+ * exactly one printable `;` terminator. Sticky so a whole write can be walked.
+ */
+const CANONICAL_FRAME = /prg-ni-v2;[0-9a-f]{16};[1-9][0-9]*;[A-Za-z0-9_-]+;[0-9a-f]{64};/gy;
+
+/**
+ * Split one encoder output into its complete frames at their printable terminators.
+ * Anything that is not a contiguous run of exact v2 frames — a control terminator, a
+ * stray byte between frames, or a truncated tail — fails here rather than being
+ * silently tolerated, so every caller asserts the real wire shape.
+ */
 function fragmentsOf(framed: string): string[] {
-  return framed.split("\n").filter((frame) => frame.length > 0).map((frame) => `${frame}\n`);
+  const frames: string[] = [];
+  CANONICAL_FRAME.lastIndex = 0;
+  let offset = 0;
+  for (let match = CANONICAL_FRAME.exec(framed); match !== null; match = CANONICAL_FRAME.exec(framed)) {
+    assert.equal(match.index, offset, "frames are contiguous with no byte between them");
+    offset = match.index + match[0].length;
+    frames.push(match[0]);
+  }
+  assert.equal(offset, framed.length, "the write is nothing but complete printable v2 frames");
+  return frames;
 }
 
 function reassemble(fragments: readonly NativeInputFragment[]): Buffer {
@@ -108,7 +130,8 @@ test("every origin carries exact payload bytes once, including NUL, controls and
     Buffer.from("plain ASCII text", "utf8"),
     Buffer.from("snow 雪 e\u0301 🧪 bidi \u202e\u202c done", "utf8"),
     Buffer.from([0x00, 0x01, 0x1b, 0x07, 0x9b, 0x7f, 0x80, 0xff, 0x0a, 0x0d]),
-    Buffer.from("\x1b]52;c;QQ==\x07 prg-ni-v1; prg-ni-v1; embedded \x1b[200~paste\x1b[201~", "latin1"),
+    // Old and current framing text as pure payload data: neither is ever re-parsed.
+    Buffer.from("\x1b]52;c;QQ==\x07 prg-ni-v1; prg-ni-v1; prg-ni-v2; embedded \x1b[200~paste\x1b[201~", "latin1"),
   ];
   const origins: NativeInputOrigin[] = [
     { kind: "local" },
@@ -309,7 +332,7 @@ test("tampered, foreign and replayed frames fail closed with fixed codes", () =>
   const rebuild = (mutate: (copy: string[]) => void): string => {
     const copy = [...fields];
     mutate(copy);
-    return `${copy.join(";")}\n`;
+    return `${copy.join(";")};`;
   };
 
   expectRefused(rebuild((copy) => { copy[0] = flipBase64Url(copy[0]!, 0); }), "malformed-frame");
@@ -351,6 +374,89 @@ test("tampered, foreign and replayed frames fail closed with fixed codes", () =>
   assert.equal(skipped.ok, false);
   if (skipped.ok) assert.fail("sequence gap must be rejected");
   assert.equal(skipped.code, "invalid-sequence");
+});
+
+test("every emitted frame is printable ASCII v2 framing ending in one semicolon", () => {
+  const dispatches: readonly (readonly [NativeInputOrigin, NativeInputExpectedFence | undefined])[] = [
+    [{ kind: "local" }, undefined],
+    [{ kind: "none" }, undefined],
+    [{ kind: "viewer", token: "viewer-wire" }, nativeTuple("conversation-wire", 2)],
+    [{ kind: "viewer", token: "nvst1.viewer-1.0123456789abcdef0123456789abcdef" }, { phase: "startup" }],
+  ];
+  const payloads: Buffer[] = [
+    Buffer.alloc(0),
+    Buffer.from("plain keys", "utf8"),
+    // Payload controls remain binary data inside the printable envelope:
+    // NUL, LF, CR, ESC, DEL and high-bit bytes must survive unchanged.
+    Buffer.from("\x00\x0a\x0d\x1b\x7f\x80\xff", "latin1"),
+    Buffer.from("\x1b[200~paste\nwith\x00NUL\r\nand \x1b]52;c;QQ==\x07", "latin1"),
+    Buffer.alloc(NATIVE_INPUT_RAW_FRAGMENT_BYTES * 2 + 5, 0x0a),
+  ];
+  for (const [origin, fence] of dispatches) {
+    for (const payload of payloads) {
+      const framed = createNativeInputEncoder(bootstrap).encode(payload, origin, fence);
+      assert.match(framed, /^[\x20-\x7e]+$/, "the whole wire is printable ASCII with no control byte");
+      assert.equal(framed.includes("\n") || framed.includes("\r"), false,
+        "no LF and no CRLF appears anywhere in an emitted dispatch");
+      const frames = fragmentsOf(framed);
+      assert.equal(frames.length, Math.max(1, Math.ceil(payload.length / NATIVE_INPUT_RAW_FRAGMENT_BYTES)),
+        "one dispatch travels as contiguous complete frames");
+      assert.ok(frames.every((frame) => frame.startsWith("prg-ni-v2;") && frame.endsWith(";")),
+        "every frame carries the v2 tag and exactly one printable terminator");
+      assert.ok(frames.every((frame) => Buffer.byteLength(frame, "latin1") <= NATIVE_INPUT_MAX_ENVELOPE_BYTES));
+      const decoder = createNativeInputDecoder(bootstrap);
+      const result = decoder.feed(framed);
+      assert.equal(result.ok, true, "the exact current wire is accepted");
+      assert.deepEqual(reassemble(result.fragments), payload,
+        "payload bytes — LF, CR, NUL, ESC and high-bit included — survive the decode exactly");
+      assert.equal(decoder.finish().ok, true);
+    }
+  }
+});
+
+test("the retired v1 tag, the LF terminator and a terminal-re-encoded ending are refused and stay poisoned", () => {
+  const framed = createNativeInputEncoder(bootstrap).encode(Buffer.from("printable", "utf8"), { kind: "local" });
+  assert.equal(framed.endsWith(";"), true, "the current frame ends in one printable terminator");
+  const prefix = framed.slice(0, -1);
+  const retiredTag = framed.replace(/^prg-ni-v2;/, "prg-ni-v1;");
+  // The retired wire itself: the same authenticated fields closed by a control byte.
+  const retiredWire = `${prefix}\n`;
+  // The observed incompatibility: a real terminal replaced that trailing LF with a
+  // Kitty keyboard-protocol key event, so the child received this same prefix plus an
+  // 19-byte key-report tail in place of the single terminator byte.
+  const kittyEnding = `${prefix}\x1b[13;5u\x1b[57442;1:3u`;
+  for (const wire of [
+    retiredWire,
+    `${prefix}\r`,
+    retiredTag,
+    `${retiredTag.slice(0, -1)}\n`,
+    kittyEnding,
+    kittyEnding + framed,
+  ]) expectRefused(wire, "malformed-frame");
+
+  // A correctly terminated frame ahead of a retired ending keeps its own delivery —
+  // the refusal starts at the failing frame, and everything after it is refused.
+  const trailing = createNativeInputDecoder(bootstrap);
+  const mixed = trailing.feed(framed + retiredWire);
+  assert.equal(mixed.ok, false);
+  assert.equal(mixed.code, "malformed-frame");
+  assert.equal(mixed.fragments.length, 1,
+    "only the frame that fully authenticated before the bad terminator is delivered");
+  assert.equal(trailing.feed(framed).fragments.length, 0, "nothing after the refusal is ever delivered");
+
+  // Fail closed for the rest of this decoder's lifetime: the substituted ending
+  // poisons it, and the next authentic, correctly terminated frame delivers nothing.
+  const decoder = createNativeInputDecoder(bootstrap);
+  const poisoned = decoder.feed(kittyEnding);
+  assert.equal(poisoned.ok, false);
+  assert.equal(poisoned.code, "malformed-frame");
+  assert.deepEqual(poisoned.fragments, []);
+  const later = decoder.feed(framed);
+  assert.equal(later.ok, false);
+  assert.equal(later.code, "malformed-frame");
+  assert.deepEqual(later.fragments, [], "a poisoned decoder never delivers a later valid frame");
+  assert.equal(decoder.failureCode, "malformed-frame");
+  assert.equal(decoder.finish().ok, false);
 });
 
 test("body identity, sequence, dispatch and origin semantics are enforced after authentication", () => {

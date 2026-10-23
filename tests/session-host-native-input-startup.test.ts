@@ -168,9 +168,24 @@ test("codec: mixed, unknown, and swapped fences are refused by the authenticated
  * Child bridge: the strict framed stdin with the startup phase
  * ------------------------------------------------------------------------- */
 
-/** Split one encoder output into its individual authenticated frames. */
+/** One complete printable v2 frame, closed by exactly one `;` and never a control byte. */
+const CANONICAL_FRAME = /prg-ni-v2;[0-9a-f]{16};[1-9][0-9]*;[A-Za-z0-9_-]+;[0-9a-f]{64};/gy;
+
+/**
+ * Split one encoder output into its individual authenticated frames. The split is by
+ * exact frame shape, not by line: a printable v2 frame has no line break in it.
+ */
 function framesOf(framed: string): string[] {
-  return framed.split("\n").filter((line) => line.length > 0).map((line) => `${line}\n`);
+  CANONICAL_FRAME.lastIndex = 0;
+  const frames: string[] = [];
+  let offset = 0;
+  for (let match = CANONICAL_FRAME.exec(framed); match !== null; match = CANONICAL_FRAME.exec(framed)) {
+    assert.equal(match.index, offset, "one dispatch's frames are contiguous");
+    offset = match.index + match[0].length;
+    frames.push(match[0]);
+  }
+  assert.equal(offset, framed.length, "the dispatch is nothing but complete printable v2 frames");
+  return frames;
 }
 
 const CHILD_TUPLE = Object.freeze({ sessionId: TUPLE.sessionId, sessionEpoch: TUPLE.epoch });

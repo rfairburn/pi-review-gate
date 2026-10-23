@@ -447,7 +447,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
         receipt: receipts,
         facts: () => ({
           nonce, instanceId: id, pid: framedChild.pid, hostWrites: writes.length,
-          unframedWrites: writes.filter((frame) => !frame.startsWith("prg-ni-v1;")).length,
+          unframedWrites: writes.filter((frame) => !frame.startsWith("prg-ni-v2;")).length,
           // Whether this child's own shortcut callback ran and issued its write: the
           // fact that separates "refused" from "never attempted" on an N2 failure.
           shortcutWitness: readShortcutWitness(),
@@ -478,7 +478,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       }));
       assert.ok(Number.isFinite(firstQuery), "the actual native child emitted a startup query");
       assert.ok(readyAt < firstQuery, "readiness precedes this child's own startup queries, so a reply can never be typed unframed");
-      assert.ok(writes.every((frame) => frame.startsWith("prg-ni-v1;")), "no host byte ever reached this child unframed");
+      assert.ok(writes.every((frame) => frame.startsWith("prg-ni-v2;")), "no host byte ever reached this child unframed");
 
       // Pre-copy safety fence: positive per-child attestation that the OS clipboard
       // backend is intercepted in THIS pid and every clipboard command resolves to
@@ -659,7 +659,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       assert.ok(bodies.every((body) => body.version === 2), "a strict row emits v2 capsules only");
       assert.equal(row.child.raw.includes("prg-native-copy-v1;"), false, "a strict row never emits or accepts a v1 capsule");
       assert.equal(row.child.raw.includes("\x1b]52;c;"), false, "no raw clipboard relay leaves the opted-in child");
-      assert.equal(text(row.pane).includes("prg-ni-v1") || text(row.pane).includes("prg-native-"), false,
+      assert.equal(/prg-ni-v[12]/.test(text(row.pane)) || text(row.pane).includes("prg-native-"), false,
         "framing and capsules never become screen text");
       assert.equal(text(row.pane).includes(row.bootstrap.token), false, "the registration token never reaches the frame");
       // After the helper actually ran, this child's OWN pid-scoped record must

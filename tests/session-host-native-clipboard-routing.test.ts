@@ -789,7 +789,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     };
     const dispatchPayload = (fragments: readonly NativeInputFragment[], dispatchId: number): string =>
       Buffer.concat(fragments.filter((f) => f.dispatchId === dispatchId).map((f) => f.payload)).toString("utf8");
-    assert.ok(framedWrites.every((frame) => frame.startsWith("prg-ni-v1;")),
+    assert.ok(framedWrites.every((frame) => frame.startsWith("prg-ni-v2;")),
       "no host byte ever reached this child unframed");
 
     // Ordinary input, then the unchanged native copy route and helper.
@@ -874,7 +874,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       at("framed", "the real child received the complete large paste byte-exactly", framedPane));
     assert.equal(framedManager.list().find((view) => view.id === framedId)!.lifecycle, "alive",
       "the opted-in row survived framing a large paste");
-    assert.ok(framedWrites.every((frame) => frame.startsWith("prg-ni-v1;")),
+    assert.ok(framedWrites.every((frame) => frame.startsWith("prg-ni-v2;")),
       "still no unframed host byte after geometry, reload, and paste");
 
     // Strict mode emits origin-bearing v2 receipts only, and every delivered copy
@@ -889,7 +889,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     assert.ok(framedChild.raw.includes("prg-native-copy-v2;"), "the opted-in child used the v2 stream");
     assert.ok(!framedChild.raw.includes("prg-native-copy-v1;"), "a strict row never emits or accepts a v1 capsule");
     assert.ok(!framedChild.raw.includes("\x1b]52;c;"), "no raw clipboard relay leaves the opted-in child");
-    assert.ok(!text(framedPane).includes("prg-ni-v1") && !text(framedPane).includes("prg-native-"),
+    assert.ok(!/prg-ni-v[12]/.test(text(framedPane)) && !text(framedPane).includes("prg-native-"),
       "framing and readiness never become screen text");
     assert.ok(!text(framedPane).includes(framedBootstrap.token), "the registration token never reaches the frame");
     assert.ok(!framedChild.raw.includes(framedBootstrap.token), "the token never returns in the child's output");

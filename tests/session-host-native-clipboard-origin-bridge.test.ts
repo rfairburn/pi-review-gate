@@ -129,10 +129,24 @@ function otherTexts(report: Report): string[] {
     .filter((text) => !isCopyText(text) && !text.startsWith(READY_TEXT_PREFIX));
 }
 
+/**
+ * One complete printable v2 frame, closed by exactly one `;` and never by a control
+ * byte. Sticky so one dispatch's frames can be walked in order.
+ */
+const CANONICAL_FRAME = /prg-ni-v2;[0-9a-f]{16};[1-9][0-9]*;[A-Za-z0-9_-]+;[0-9a-f]{64};/gy;
+
 /** Split one encoded dispatch into its exact per-part frames (hex, one chunk per frame). */
 function frameChunks(framed: string): string[] {
-  return framed.split("\n").filter((frame) => frame.length > 0)
-    .map((frame) => Buffer.from(`${frame}\n`, "ascii").toString("hex"));
+  CANONICAL_FRAME.lastIndex = 0;
+  const frames: string[] = [];
+  let offset = 0;
+  for (let match = CANONICAL_FRAME.exec(framed); match !== null; match = CANONICAL_FRAME.exec(framed)) {
+    assert.equal(match.index, offset, "one dispatch's frames are contiguous");
+    offset = match.index + match[0].length;
+    frames.push(Buffer.from(match[0], "ascii").toString("hex"));
+  }
+  assert.equal(offset, framed.length, "the dispatch is nothing but complete printable v2 frames");
+  return frames;
 }
 
 const local: NativeInputOrigin = { kind: "local" };
@@ -389,7 +403,7 @@ test("strict framing captures the dispatch tuple/origin once across an epoch upd
   assert.ok(report.payloads.every((payload) => payload.thisIsStdin && payload.argCount === 0));
   assert.ok(copyCapsules(report).every((capsule) => capsule.startsWith("prg-native-copy-v2;")),
     "strict mode emits only v2 origin capsules");
-  assert.equal(copyCapsules(report).some((capsule) => capsule.includes("prg-ni-v1")), false,
+  assert.equal(copyCapsules(report).some((capsule) => /prg-ni-v[12]/.test(capsule)), false,
     "framing headers never reach stdout");
 
   const byText = new Map(receiveOrigin(report).map((receipt): [string, NativeClipboardOriginEvent] =>
@@ -424,7 +438,7 @@ test("strict framing captures the dispatch tuple/origin once across an epoch upd
 test("strict framing preserves exact bytes across splits, coalescing, decoys, large payloads and UTF-8 string mode", () => {
   const encoder = createNativeInputEncoder(bootstrap);
   const decoy = Buffer.from(
-    "paste\x1b[200~prg-ni-v1;prg-native-copy-v1;\x1b]52;c;QQ==\x07\x00\x03\x7f\r\n", "latin1",
+    "paste\x1b[200~prg-ni-v1;prg-ni-v2;prg-native-copy-v1;\x1b]52;c;QQ==\x07\x00\x03\x7f\r\n", "latin1",
   );
   const first = Buffer.from(encoder.encode(decoy, local), "ascii");
   const large = Buffer.from("L".repeat(70_000), "latin1");
@@ -469,8 +483,10 @@ test("strict framing preserves exact bytes across splits, coalescing, decoys, la
     "a viewer dispatch spanning many fragments is emitted exactly once, whole");
   assert.equal(Buffer.concat(buffers.slice(2)).toString("utf8"), "thirdfourth",
     "coalesced frames stay ordered and unframed");
-  assert.ok(buffers.slice(1).every((buffer) => !buffer.toString("latin1").includes("prg-ni-v1;")));
-  assert.equal(buffers[0]!.toString("latin1").includes("prg-ni-v1;"), true,
+  const deliveredText = buffers.map((buffer) => buffer.toString("latin1"));
+  assert.ok(deliveredText.slice(1).every((text) => !text.includes("prg-ni-v1;") && !text.includes("prg-ni-v2;")),
+    "no framing byte of any version reaches a native listener");
+  assert.equal(deliveredText[0]!.includes("prg-ni-v1;") && deliveredText[0]!.includes("prg-ni-v2;"), true,
     "payload text is never re-parsed as framing");
 
   // String mode: the per-dispatch decoder carries a split UTF-8 sequence.
@@ -522,8 +538,11 @@ test("strict framing never turns non-user input or an unavailable tuple into a c
 test("strict framing poisons on tampering and never falls back to raw or legacy input", () => {
   const encoder = createNativeInputEncoder(bootstrap);
   const tampered = encoder.encode(Buffer.from("tampered"), local);
-  const macStart = tampered.lastIndexOf(";") + 1;
+  // The MAC is the field closed by the final printable terminator: flip one of its
+  // hex digits and leave that terminator exactly where the codec put it.
+  const macStart = tampered.slice(0, -1).lastIndexOf(";") + 1;
   const flipped = `${tampered.slice(0, macStart)}${tampered[macStart] === "0" ? "1" : "0"}${tampered.slice(macStart + 1)}`;
+  assert.notEqual(flipped, tampered, "the tamper really changed one MAC digit");
   const valid = frameChunks(encoder.encode(Buffer.from("valid"), local));
   const report = runScenario({
     options: { inputOriginFraming: true },

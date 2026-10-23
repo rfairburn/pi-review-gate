@@ -844,7 +844,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       assert.ok(resumed.epoch >= 1, "the resumed conversation carries a real native epoch");
       // Every host byte this row typed travelled as an authenticated framed dispatch.
       await signal.waitFor(() => child.writes.length > 0, 20_000, "the host wrote the child's own protocol replies");
-      assert.ok(child.writes.every((frame) => frame.startsWith("prg-ni-v1;")), "no host byte ever reached this child unframed");
+      assert.ok(child.writes.every((frame) => frame.startsWith("prg-ni-v2;")), "no host byte ever reached this child unframed");
 
       leg = "real TLS pairing and content subscription";
       const viewerIdentity = await newIdentity("viewer-native");
@@ -1388,7 +1388,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       // Audit the complete write ledger after both child exit and manager retirement,
       // including non-user replies that arrived after the last awaited gesture.
       drain();
-      assert.equal(child.writes.filter((frame) => !frame.startsWith("prg-ni-v1;")).length, 0,
+      assert.equal(child.writes.filter((frame) => !frame.startsWith("prg-ni-v2;")).length, 0,
         "no host byte reached this child unframed at any point in the case");
       // Deliberately no assertion about a physical terminal or OS clipboard.
     } catch (error) {
@@ -1405,7 +1405,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
               exitCode: entry.item.exitCode === undefined ? null : entry.item.exitCode,
               rawChars: entry.item.raw.length, rawSha256: digest(entry.item.raw),
               hostWrites: entry.writes.length,
-              unframedWrites: entry.writes.filter((frame) => !frame.startsWith("prg-ni-v1;")).length,
+              unframedWrites: entry.writes.filter((frame) => !frame.startsWith("prg-ni-v2;")).length,
             })),
             attestation: existsSync(join(attestRoot, `${nonce}.${childPid}.json`))
               ? JSON.parse(readFileSync(join(attestRoot, `${nonce}.${childPid}.json`), "utf8")) as Attestation
@@ -1827,7 +1827,7 @@ module.exports=()=>{};
       assert.equal(rowView()?.nativeSession ?? null, null, "no native conversation tuple exists while the selector is open");
       assert.equal(existsSync(canaryWitness), false, "the untrusted project extension is not loaded before the answer");
       await signal.waitFor(() => child.writes.length > 0, 20_000, "the host wrote the child's own protocol replies");
-      assert.ok(child.writes.every((frame) => frame.startsWith("prg-ni-v1;")), "no host byte ever reached this child unframed");
+      assert.ok(child.writes.every((frame) => frame.startsWith("prg-ni-v2;")), "no host byte ever reached this child unframed");
 
       leg = "real TLS pairing and the selected owner row's content subscription";
       const viewerIdentity = await newIdentity("viewer-native-trust");
@@ -2181,7 +2181,7 @@ module.exports=()=>{};
       assert.deepEqual(stopped.forcedIds, [], "the owned child exited without forced escalation");
       await signal.waitFor(() => child.item.exited, 20_000, "the owned child exit was observed on its own PTY handle");
       dispatchLedger.drain();
-      assert.equal(child.writes.filter((frame) => !frame.startsWith("prg-ni-v1;")).length, 0,
+      assert.equal(child.writes.filter((frame) => !frame.startsWith("prg-ni-v2;")).length, 0,
         "no host byte reached this child unframed at any point in the case");
       // Deliberately no assertion about a physical terminal or OS clipboard.
     } catch (error) {
@@ -2198,7 +2198,7 @@ module.exports=()=>{};
               exitCode: entry.item.exitCode === undefined ? null : entry.item.exitCode,
               rawChars: entry.item.raw.length, rawSha256: digest(entry.item.raw),
               hostWrites: entry.writes.length,
-              unframedWrites: entry.writes.filter((frame) => !frame.startsWith("prg-ni-v1;")).length,
+              unframedWrites: entry.writes.filter((frame) => !frame.startsWith("prg-ni-v2;")).length,
             })),
             attestation: existsSync(join(attestRoot, `${nonce}.${childPid}.json`))
               ? JSON.parse(readFileSync(join(attestRoot, `${nonce}.${childPid}.json`), "utf8")) as Attestation

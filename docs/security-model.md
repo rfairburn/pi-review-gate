@@ -329,6 +329,12 @@ trusted executable extensions with the user's process authority.
 The owned-bridge input framing can authenticate ASCII input fragments, including
 payload bytes and explicit local, non-user, or opaque viewer origins, and carry that
 immutable origin through asynchronous native copy callbacks in a separate v2 capsule.
+Each frame is printable ASCII end to end and ends in one printable `;`, never a control
+byte, so a terminal that rewrites control characters cannot move or erase a frame
+boundary. Only that exact versioned framing is accepted: the older line-feed-terminated
+wire, a carriage return, and a terminal-substituted key ending are malformed framing
+that poisons that decoder, and a host and a child built from different framing versions
+refuse each other rather than downgrade or fall back to raw input.
 Its signed one-shot readiness statement proves only decoder installation, not input
 permission, a drawn source, or clipboard delivery. This host mode is on by default for
 the children normal production Main creates (only a dependency-only explicit-false test

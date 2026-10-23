@@ -4126,7 +4126,7 @@ test("a framing row refuses every write until its own verified readiness, then f
     const framed = row.pty.writes.at(-1);
     assert.equal(typeof framed, "string");
     const framedText = framed as string;
-    assert.ok(framedText.startsWith("prg-ni-v1;"), "the write is an authenticated framed dispatch");
+    assert.ok(framedText.startsWith("prg-ni-v2;"), "the write is an authenticated framed dispatch");
     assert.equal(framedText.includes(text), false, "the user's bytes never travel as raw terminal input");
     assert.deepEqual(framedPayload(row.bootstrap, framedText), { text, origin: { kind: "local" } });
 
@@ -4201,7 +4201,7 @@ test("a live framing row discards early automatic replies without replay, then f
     const decoder = createNativeInputDecoder(row.bootstrap);
     const replies = row.pty.writes.flatMap((reply) => {
       assert.equal(typeof reply, "string");
-      assert.ok((reply as string).startsWith("prg-ni-v1;"), "every future protocol reply is framed");
+      assert.ok((reply as string).startsWith("prg-ni-v2;"), "every future protocol reply is framed");
       return decodeFramedWrite(row.bootstrap, reply as string, decoder);
     });
     assert.deepEqual(replies.map((reply) => reply.payload.toString("utf8")), ["\x1b[?1;2c", "\x1b[?7u"],
@@ -4235,7 +4235,7 @@ test("readiness is bound to one registration: a sibling's capsule never arms ano
     await markReady(harness, rowA);
     harness.manager.write(rowA.id, "armed");
     assert.equal(typeof rowA.pty.writes.at(-1), "string");
-    assert.ok((rowA.pty.writes.at(-1) as string).startsWith("prg-ni-v1;"));
+    assert.ok((rowA.pty.writes.at(-1) as string).startsWith("prg-ni-v2;"));
     assert.deepEqual(rowB.pty.writes, [], "readiness never crosses rows");
 
     // After A's child exits, a late readiness capsule cannot revive its row.
@@ -4279,7 +4279,7 @@ test("an unresolved stop closes the framing seam for both write sources while ow
     await markReady(harness, row);
     harness.manager.write(row.id, "before-stop");
     const writesBefore = row.pty.writes.length;
-    assert.ok((row.pty.writes.at(-1) as string).startsWith("prg-ni-v1;"), "the row framed while it was running");
+    assert.ok((row.pty.writes.at(-1) as string).startsWith("prg-ni-v2;"), "the row framed while it was running");
 
     // Fire-and-forget: the confirmed stop signals the child and then waits for the
     // actual exit this child never sends.
@@ -4551,7 +4551,7 @@ function readViewerFrames(row: FramingRow): readonly NativeInputFragment[] {
   }
   while (stream.next < row.pty.writes.length) {
     const write = row.pty.writes[stream.next++];
-    if (typeof write !== "string" || !write.startsWith("prg-ni-v1;")) continue;
+    if (typeof write !== "string" || !write.startsWith("prg-ni-v2;")) continue;
     const fed = stream.decoder.feed(write);
     assert.equal(fed.ok, true,
       `this registration decodes its own framing in order: ${fed.ok ? "" : fed.code}`);
@@ -5014,7 +5014,9 @@ test("the viewer input seam is closed on a legacy row and never changes local or
     assert.equal(Object.hasOwn(localFrame[0]!, "expectedNativeTuple"), true);
     assert.equal(localFrame[0]!.expectedNativeTuple, undefined,
       "a local dispatch keeps its unchanged body: the fence is viewer-only");
-    assert.equal((row.pty.writes.at(-1) as string).split(";").length, 5, "the frame header shape is unchanged");
+    assert.match(row.pty.writes.at(-1) as string,
+      /^prg-ni-v2;[0-9a-f]{16};[1-9][0-9]*;[A-Za-z0-9_-]+;[0-9a-f]{64};$/,
+      "the printable v2 frame shape is unchanged: five ASCII fields and one semicolon terminator");
 
     await deliver(framing, row, "\x1b[>7u\x1b[?u");
     const reply = readViewerFrames(row);
@@ -5239,7 +5241,7 @@ test("startup input: a ready framed row before its first status admits only star
         { expectedSource: forged, expectedInputModes: modes, data: "x" }),
       { status: "refused", reason: "stale-source" });
     }
-    assert.deepEqual(row.pty.writes.filter((write) => typeof write === "string" && write.startsWith("prg-ni-v1;"))
+    assert.deepEqual(row.pty.writes.filter((write) => typeof write === "string" && write.startsWith("prg-ni-v2;"))
       .length, 0, "no refused startup write reached the child");
 
     // The admitted write carries the startup fence and nothing else.

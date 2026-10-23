@@ -1671,8 +1671,13 @@ without failing the row. They are never queued or replayed; readiness enables on
 framed replies with non-user origin. User input stays refused until ready, and other reply
 failures retain their existing failure paths. Unknown bootstrap modes and requested
 bridge-installation failures refuse without downgrade, raw fallback, queued replay, or a
-late readiness guess. Local-origin and non-user origins keep their existing local-path
-fences; non-user input cannot authorize a copy.
+late readiness guess. Each input frame is printable ASCII end to end and ends in one
+printable `;` rather than a control byte, so a terminal that rewrites control characters
+cannot move or erase a frame boundary. Only that exact versioned framing is accepted: the
+older line-feed-terminated wire and a terminal-substituted key ending are malformed
+framing that poisons the child's decoder, and a host and a child built from different
+framing versions refuse each other instead of downgrading. Local-origin and non-user
+origins keep their existing local-path fences; non-user input cannot authorize a copy.
 
 **Input authority.** Every protected write is measured against the frame the writer
 actually committed: one uncovered, Main-focused remote viewer frame, with the exact

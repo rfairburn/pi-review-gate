@@ -143,7 +143,9 @@ test("structural PTY observation is poisoned by malformed, foreign, replayed, an
   const original = frame();
   const encoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
   encoder.encode(Buffer.from("first"), { kind: "local" });
-  const cases = ["\x1b", "not-a-frame\n", original.slice(0, -2) + (original.at(-2) === "a" ? "b" : "a") + "\n",
+  // The third case flips one MAC hex digit and keeps the printable terminator, so it
+  // stays an authentication failure rather than an accidental terminator change.
+  const cases = ["\x1b", "not-a-frame\n", original.slice(0, -2) + (original.at(-2) === "a" ? "b" : "a") + ";",
     encoder.encode(Buffer.from([27]), { kind: "local" }),
     ...[{ ...observationBootstrap, token: "b".repeat(64) },
       { ...observationBootstrap, instanceId: "33333333-3333-4333-8333-333333333333" },

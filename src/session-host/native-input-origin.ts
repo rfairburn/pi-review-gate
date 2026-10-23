@@ -10,11 +10,24 @@
  * and disabled, and the default unframed bridge stays byte-for-byte unchanged.
  *
  * The codec carries one already-admitted logical dispatch (payload bytes that the
- * caller already holds) as ordered, bounded, ASCII-only fragments. Each fragment
- * is authenticated, together with its payload, before delivery:
+ * caller already holds) as ordered, bounded, printable-ASCII-only fragments. Each
+ * fragment is authenticated, together with its payload, before delivery:
  *
- *   "prg-ni-v1;" <magic:16 hex> ";" <body chars:decimal> ";" <base64url body> ";"
- *   <mac:64 lowercase hex> "\n"
+ *   "prg-ni-v2;" <magic:16 hex> ";" <body chars:decimal> ";" <base64url body> ";"
+ *   <mac:64 lowercase hex> ";"
+ *
+ * Every byte of a frame — tag, fields, delimiters and the final terminator — is a
+ * printable ASCII character, and the frame ends in one printable `;`, never a line
+ * feed or any other control byte. A terminal layer that re-encodes control bytes on
+ * the way into the child (a keyboard-protocol key event standing in for a trailing
+ * LF, for example) therefore cannot rewrite a frame boundary, and a boundary cannot
+ * be silently swallowed. The tag names the framing version, and the decoder accepts
+ * ONLY the exact `prg-ni-v2` tag with the exact `;` terminator: the older
+ * LF-terminated wire, a CR, and any terminal-substituted ending are malformed
+ * framing rather than a legacy dialect to tolerate, so one fixed code is reported
+ * and the decoder stays poisoned. There is no dual-version decoder, no negotiation
+ * and no raw fallback: a host and a child built from different framing versions
+ * simply refuse each other, which is the intended fail-closed mismatch.
  *
  * - <magic> is HMAC-SHA256(key, domain | "frame-magic" | instanceId | NUL |
  *   generation)[0..16]. It is private to one registration, so a foreign identity
@@ -35,9 +48,10 @@
  *   payload. The key is the existing registration token (hex64); this module does
  *   not define a new identity or a broader authority.
  *
- * Frames are ASCII only so an existing Node stdin UTF-8 decoder cannot corrupt
- * split Unicode before the bridge integration. Payload bytes are never decoded to
- * text here; the bridge owns a per-dispatch string decoder.
+ * Frames are printable ASCII only, so an existing Node stdin UTF-8 decoder cannot
+ * corrupt split Unicode before the bridge integration and no frame byte is a control
+ * character an intervening terminal would reinterpret. Payload bytes are never
+ * decoded to text here; the bridge owns a per-dispatch string decoder.
  *
  * A stale `expectedNativeTuple` is an ordinary input REFUSAL, not protocol
  * corruption: the bridge consumes the authenticated frames, delivers none of that
@@ -209,7 +223,14 @@ export const NATIVE_INPUT_MAX_VIEWER_TOKEN_CHARS = 128;
 /** Bound for one host-minted viewer scope token; identical to the origin bound. */
 export const NATIVE_INPUT_VIEWER_SCOPE_TOKEN_CHARS = NATIVE_INPUT_MAX_VIEWER_TOKEN_CHARS;
 
-const FRAME_TAG = "prg-ni-v1;";
+const FRAME_TAG = "prg-ni-v2;";
+/**
+ * The printable frame terminator (`;`). A frame never ends in a control byte, so an
+ * intervening terminal that rewrites control bytes cannot move or erase a frame
+ * boundary; only this exact character terminates a frame.
+ */
+const FRAME_TERMINATOR_CHAR = ";";
+const FRAME_TERMINATOR = FRAME_TERMINATOR_CHAR.charCodeAt(0);
 const MAGIC_CHARS = 16;
 const MAC_CHARS = 64;
 const KEY_DOMAIN = "pi-review-gate/native-input/v1\0";
@@ -368,7 +389,7 @@ function canonicalBodyJson(value: Record<string, unknown>): string {
 
 function frameWithKey(key: Buffer, magic: string, bodyBase64Url: string): string {
   const mac = bodyMac(key, bodyBase64Url).toString("hex");
-  return `${FRAME_TAG}${magic};${bodyBase64Url.length};${bodyBase64Url};${mac}\n`;
+  return `${FRAME_TAG}${magic};${bodyBase64Url.length};${bodyBase64Url};${mac}${FRAME_TERMINATOR_CHAR}`;
 }
 
 /**
@@ -626,7 +647,10 @@ class Decoder implements NativeInputDecoder {
           break;
         }
         case "terminator": {
-          if (bytes[pos] !== 0x0a) return "malformed-frame";
+          // Exactly one printable `;`. A line feed, a carriage return, the older
+          // LF-terminated wire, and a terminal-substituted key ending are all
+          // malformed framing: nothing is skipped, resynchronised, or retried.
+          if (bytes[pos] !== FRAME_TERMINATOR) return "malformed-frame";
           pos += 1;
           const sealed = this.#seal();
           this.#resetFrame();

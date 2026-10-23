@@ -291,6 +291,10 @@ dates.
   [Network sidebar](docs/session-host-alpha.md#network-sidebar-hosting-pairing-and-remote-metadata).
 ### Fixed
 
+- Early automatic terminal-query replies no longer fail an otherwise-live, non-stopping
+  framing child awaiting its own authenticated readiness (Refs #389). These unsent replies
+  are discarded, never queued or replayed; user input still requires readiness, and future
+  replies keep their framed non-user origin and existing failure paths.
 - Cleanup-lock contention keeps trying atomic publication while one owned, targeted
   process-start query runs asynchronously, rather than blocking on that query (#389).
   The existing two-second deadline and 50 ms cadence remain unchanged; only a real

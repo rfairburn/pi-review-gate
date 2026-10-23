@@ -2948,7 +2948,7 @@ export class InstanceManager {
 					}
 				}
 				record.surface = new TerminalSurface(record.cols, record.rows, {
-					onReply: (data) => this.#onQueryReply(record, data),
+					onReply: (data) => this.#onQueryReply(record, handle, data),
 					onChange: () => this.#safeChanged(record.id),
 					onBackpressure: (paused) => this.#onBackpressure(record, paused),
 					onDiagnostic: (event) => this.#safeTerminalDiagnostic(record.id, event),
@@ -3067,7 +3067,7 @@ export class InstanceManager {
 		this.#failRunningInstance(record, "ptyRead");
 	}
 
-	#onQueryReply(record: ManagedInstance, data: string): void {
+	#onQueryReply(record: ManagedInstance, registration: InstanceStatusRegistration, data: string): void {
 		if (this.#records.get(record.id) !== record || this.#disposed) {
 			return;
 		}
@@ -3076,11 +3076,23 @@ export class InstanceManager {
 			return;
 		}
 		try {
+			// Discard only a never-sent automatic reply for an otherwise-admissible
+			// framing child awaiting its OWN readiness. Read only manager-owned facts:
+			// no callback may reenter between these fences and the discard. The mode
+			// and encoder were fixed from this exact registration before spawn.
+			if (!this.#disposed && !this.#stopping
+				&& this.#records.get(record.id) === record
+				&& record.registration === registration && !record.registrationReleased
+				&& record.pty === pty && !record.ptyExited
+				&& !record.stopAdmissionClosed && record.lifecycle === "alive"
+				&& record.inputFramingRequested && record.inputEncoder !== undefined
+				&& !record.inputFramingReady) {
+				return; // No write, encoding, queue, or replay when readiness arrives.
+			}
 			// TerminalSurface replies (DA/DSR/kitty) are host protocol, never user
-			// input, so they carry the closed `none` origin and can never authorize
-			// a copy. On a framing row that has not confirmed readiness the write is
-			// refused; the row then fails truthfully instead of typing framing text
-			// into a legacy child.
+			// input, so future replies after readiness carry the closed `none`
+			// origin and can never authorize a copy. All other refusals and genuine
+			// encoding/write failures keep the existing owned-row failure path.
 			this.#writeChildInput(record, pty, data, PROTOCOL_INPUT_ORIGIN);
 		} catch {
 			this.#failRunningInstance(record, "queryReply");
@@ -3818,9 +3830,10 @@ export class InstanceManager {
 	 *   interleave.
 	 * - Before this registration's own verified readiness, a framing write is
 	 *   refused: no raw fallback, no fabricated acknowledgement, no queue, no
-	 *   replay, and nothing is ever typed into a legacy child. The caller's own
-	 *   failure path reports it (a thrown refusal for user input, a truthfully
-	 *   failed row for a protocol reply).
+	 *   replay, and nothing is ever typed into a legacy child. User input still
+	 *   gets a thrown refusal. Only an otherwise-admissible row's never-sent early
+	 *   automatic protocol reply is discarded by #onQueryReply before this seam;
+	 *   all other protocol-reply failures still fail the owned row truthfully.
 	 * - Readiness is re-checked against CURRENT ownership on EVERY framed write,
 	 *   not only when it was first armed: an in-flight or unconfirmed Stop (and a
 	 *   manager-wide stop or disposal) closes the seam immediately even though the

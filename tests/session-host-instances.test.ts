@@ -3851,6 +3851,8 @@ test("status updates publish activity intent independently of the ownership coun
 const FRAMING_READY_PREFIX = "prg-native-input-ready-v1;";
 const FRAMING_READY_DOMAIN = "pi-review-gate/native-input-ready/v1\0";
 const FRAMING_HEX_TOKEN = "ab".repeat(32);
+// Startup infrastructure output can query DA before the bridge is ready.
+const EARLY_WINDOWS_TERMINAL_PREFIX = "\x1b[1t\x1b[c\x1b[?1004h\x1b[?9001h";
 /**
  * A fresh valid hex64 registration token per row: the input codec derives its
  * HMAC key from exactly this production shape, and distinct keys are what make
@@ -3912,7 +3914,11 @@ interface FramingHarness {
 
 function makeFramingHarness(
   label: string,
-  options: { framing?: boolean; onNativeClipboard?: (instanceId: string, event: NativeClipboardEvent) => void } = {},
+  options: {
+    framing?: boolean;
+    onNativeClipboard?: (instanceId: string, event: NativeClipboardEvent) => void;
+    getSupportedKeyboardFlags?: () => number;
+  } = {},
 ): FramingHarness {
   const root = makeTestRoot(label);
   const pkg = makePackageFixture(root);
@@ -3947,6 +3953,7 @@ function makeFramingHarness(
     },
     ...(options.framing === undefined ? {} : { nativeInputOriginFraming: options.framing }),
     ...(options.onNativeClipboard === undefined ? {} : { onNativeClipboard: options.onNativeClipboard }),
+    ...(options.getSupportedKeyboardFlags === undefined ? {} : { getSupportedKeyboardFlags: options.getSupportedKeyboardFlags }),
   });
   return { root, workspace, packageRoot: pkg.packageRoot, piExecutable: pkg.piExecutable, registrar, spawned, manager, callerEnv };
 }
@@ -4072,6 +4079,11 @@ test("a default manager keeps legacy PTY bytes and a legacy bootstrap byte-for-b
     harness.manager.write(row.id, "ls -la\r");
     harness.manager.write(row.id, Buffer.from([0x1b, 0x5b, 0x41]));
     assert.deepEqual(row.pty.writes, ["ls -la\r", Buffer.from([0x1b, 0x5b, 0x41])]);
+    // Early automatic replies on a legacy row still go out raw, without READY.
+    await deliver(harness, row, EARLY_WINDOWS_TERMINAL_PREFIX);
+    await deliver(harness, row, "\x1b[>7u\x1b[?u");
+    assert.deepEqual(row.pty.writes.slice(2), ["\x1b[?1;2c", "\x1b[?7u"]);
+    assert.equal(viewFor(harness.manager, row.id).lifecycle, "alive");
     // A legacy row also ignores readiness capsules entirely: no mode, no framing.
     await markReady(harness, row);
     harness.manager.write(row.id, "after-foreign-ready");
@@ -4142,32 +4154,63 @@ test("a framing row refuses every write until its own verified readiness, then f
   }
 });
 
-test("a framing row frames terminal protocol replies as none and fails honestly before readiness", async () => {
+test("a live framing row discards early automatic replies without replay, then frames future replies as none", async () => {
   const harness = makeFramingHarness("framing-protocol", { framing: true });
   try {
     const row = await createFramingRow(harness);
-    // Before readiness the surface's kitty query reply is refused: no raw reply
-    // is typed into a legacy child, and the row reports the failure truthfully.
-    await deliver(harness, row, "\x1b[>7u\x1b[?u");
-    assert.deepEqual(row.pty.writes, [], "no unframed protocol reply reaches the child");
-    const failedView = viewFor(harness.manager, row.id);
-    assert.equal(failedView.lifecycle, "error");
-    assert.equal(failedView.error, "session-host: instance query reply write failed");
-    await until(() => row.pty.killSignals.length > 0 || row.pty.exited, "the failed framing row stops its owned child");
+    const assertLiveOwned = (): void => {
+      const view = viewFor(harness.manager, row.id);
+      assert.equal(view.lifecycle, "alive");
+      assert.equal(view.error, undefined, "discarding an unsent reply is not a row error");
+      assert.equal(row.pty.exited, false, "the same child stays alive");
+      assert.deepEqual(row.pty.killSignals, [], "no owned stop was initiated");
+      assert.equal(row.entry.released, false, "the same registration stays owned");
+    };
 
-    // A fresh, ready row answers the same query framed, with the closed `none`
-    // origin: protocol replies can never authorize a copy.
-    const ready = await createFramingRow(harness);
-    await markReady(harness, ready);
-    await deliver(harness, ready, "\x1b[>7u\x1b[?u");
-    const reply = ready.pty.writes.at(-1);
-    assert.equal(typeof reply, "string");
-    const replyText = reply as string;
-    assert.ok(replyText.startsWith("prg-ni-v1;"), "the protocol reply is framed like every other write");
-    const decoded = framedPayload(ready.bootstrap, replyText);
-    assert.deepEqual(decoded.origin, { kind: "none" }, "a protocol reply carries no user origin");
-    assert.match(decoded.text, /^\x1b\[\?\d+u$/, "the unchanged kitty reply payload travels inside the frame");
-    assert.equal(viewFor(harness.manager, ready.id).lifecycle, "alive");
+    // The actual early Windows DA prefix and a kitty query arrive before READY.
+    // Neither raw replies nor HMAC framing bytes may leave, and user input is
+    // still refused rather than queued, downgraded, or mistaken for protocol.
+    await deliver(harness, row, EARLY_WINDOWS_TERMINAL_PREFIX);
+    await deliver(harness, row, "\x1b[>7u\x1b[?u");
+    assert.deepEqual(row.pty.writes, [], "no raw or framed protocol reply reaches the child");
+    assert.throws(() => harness.manager.write(row.id, "typed-before-ready"), /refusing unframed input/);
+    assert.deepEqual(row.pty.writes, [], "refused local input also writes zero bytes");
+    assertLiveOwned();
+
+    // Foreign, wrong-generation, and tampered readiness arm nothing on this row.
+    const tampered = readyCapsule(row.bootstrap);
+    for (const capsule of [
+      readyCapsule({ ...row.bootstrap, token: "cd".repeat(32) }),
+      readyCapsule(row.bootstrap, { generation: randomUUID() }),
+      `${tampered.slice(0, -1)}${tampered.endsWith("0") ? "1" : "0"}`,
+    ]) {
+      await deliver(harness, row, capsuleOsc(capsule));
+      await deliver(harness, row, "\x1b[c\x1b[?u");
+      assert.throws(() => harness.manager.write(row.id, "still-refused"), /refusing unframed input/);
+      assert.deepEqual(row.pty.writes, [], "bad readiness authorizes neither replies nor user input");
+      assertLiveOwned();
+    }
+
+    // This SAME child's own authenticated READY enables only future queries.
+    await markReady(harness, row);
+    assert.deepEqual(row.pty.writes, [], "readiness never replays any previously discarded reply");
+    assertLiveOwned();
+    await deliver(harness, row, EARLY_WINDOWS_TERMINAL_PREFIX);
+    await deliver(harness, row, "\x1b[?u");
+    assert.equal(row.pty.writes.length, 2, "only the two future queries produce writes");
+    const decoder = createNativeInputDecoder(row.bootstrap);
+    const replies = row.pty.writes.flatMap((reply) => {
+      assert.equal(typeof reply, "string");
+      assert.ok((reply as string).startsWith("prg-ni-v1;"), "every future protocol reply is framed");
+      return decodeFramedWrite(row.bootstrap, reply as string, decoder);
+    });
+    assert.deepEqual(replies.map((reply) => reply.payload.toString("utf8")), ["\x1b[?1;2c", "\x1b[?7u"],
+      "the original DA and kitty payloads travel unchanged inside frames");
+    assert.deepEqual(replies.map((reply) => reply.origin), [{ kind: "none" }, { kind: "none" }],
+      "protocol replies carry neither local nor viewer origin");
+    assert.deepEqual(replies.map((reply) => reply.dispatchId), [1, 2],
+      "discarded replies and refused input spent no encoder dispatches");
+    assertLiveOwned();
     await disposeFramingHarness(harness);
   } finally {
     rmSync(harness.root, { recursive: true, force: true });
@@ -4274,6 +4317,78 @@ test("an unresolved stop closes the framing seam for both write sources while ow
     await harness.manager.dispose();
   } finally {
     rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("an unready framing row stopped reentrantly during a query still fails the closed reply seam", async () => {
+  let closeAdmission: (() => void) | undefined;
+  let stopping: ReturnType<InstanceManager["stop"]> | undefined;
+  let shutdownRequests = 0;
+  const harness = makeFramingHarness("framing-unready-stop", {
+    framing: true,
+    getSupportedKeyboardFlags: () => {
+      const close = closeAdmission;
+      closeAdmission = undefined;
+      close?.();
+      return 7;
+    },
+  });
+  // Observe the owned native stop request without depending on OS signal policy.
+  harness.registrar.shutdownHandler = async () => {
+    shutdownRequests += 1;
+    return { requestId: "unready-owned-stop", status: "requested" };
+  };
+  try {
+    const row = await createFramingRow(harness);
+    row.pty.exitsOnSignal = "none";
+    // The surface's supported-flags callback can reenter before onReply. The
+    // discard must inspect CURRENT stop/admission facts, not earlier liveness.
+    closeAdmission = () => { stopping = harness.manager.stop(row.id, { confirmed: true }); };
+    await deliver(harness, row, "\x1b[?u");
+    assert.ok(stopping, "the callback started this row's owned stop before its reply");
+    assert.deepEqual(row.pty.writes, [], "neither a framed nor raw reply leaves the closed seam");
+    assert.equal(viewFor(harness.manager, row.id).lifecycle, "error");
+    assert.equal(viewFor(harness.manager, row.id).error, "session-host: instance query reply write failed");
+    assert.equal(shutdownRequests, 1, "the reply failure joins the existing owned stop");
+    assert.equal(row.pty.exited, false);
+    assert.equal(row.entry.released, false, "the unconfirmed child's registration stays owned");
+    await markReady(harness, row);
+    assert.throws(() => harness.manager.write(row.id, "during-stop"), /not accepting input|refusing unframed input/);
+    assert.deepEqual(row.pty.writes, [], "late readiness cannot reopen stopped admission");
+    row.pty.emitExit(0);
+    await stopping;
+    assert.equal(row.entry.released, true, "only the actual child exit releases ownership");
+    assert.equal(viewFor(harness.manager, row.id).lifecycle, "error");
+  } finally {
+    closeAdmission = undefined;
+    await disposeFramingHarness(harness);
+  }
+});
+
+test("a ready framing row still fails and stops its owned child on a genuine protocol PTY write error", async () => {
+  const harness = makeFramingHarness("framing-protocol-write-error", { framing: true });
+  let shutdownRequests = 0;
+  harness.registrar.shutdownHandler = async () => {
+    shutdownRequests += 1;
+    return { requestId: "failed-query-owned-stop", status: "requested" };
+  };
+  try {
+    const row = await createFramingRow(harness);
+    row.pty.exitsOnSignal = "none";
+    await markReady(harness, row);
+    row.pty.writeError = new Error("synthetic framed query-write failure");
+    await deliver(harness, row, "\x1b[c");
+    assert.deepEqual(row.pty.writes, [], "the failing PTY accepted no write");
+    assert.equal(viewFor(harness.manager, row.id).lifecycle, "error");
+    assert.equal(viewFor(harness.manager, row.id).error, "session-host: instance query reply write failed");
+    assert.equal(shutdownRequests, 1, "the genuine failure initiated the owned native stop");
+    assert.equal(row.pty.exited, false);
+    assert.equal(row.entry.released, false, "ownership is retained until actual exit");
+    row.pty.emitExit(0);
+    await until(() => row.entry.released, "the actual exit released the registration");
+    assert.equal(viewFor(harness.manager, row.id).lifecycle, "error");
+  } finally {
+    await disposeFramingHarness(harness);
   }
 });
 

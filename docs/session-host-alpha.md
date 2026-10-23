@@ -1664,11 +1664,15 @@ optional `native-input-startup-v1` capability depends on it and is never negotia
 without it (see **Startup input** below). The owner side
 binds one viewer to one existing content subscription and states a host-written source;
 the viewer side only describes and submits against that exact source. On the child side,
-the bridge requests bootstrap mode `1` and requires an authenticated readiness statement
-before writing user input or terminal-query responses. Unknown bootstrap modes and
-requested bridge-installation failures refuse without downgrade, raw fallback, queued
-replay, or a late readiness guess. Local-origin and non-user origins keep their existing
-local-path fences; non-user input cannot authorize a copy.
+the bridge requests bootstrap mode `1` and requires its own authenticated readiness
+statement before any child write. Only never-sent automatic terminal-query replies for an
+otherwise-current, live, non-stopping framing child awaiting that readiness are discarded
+without failing the row. They are never queued or replayed; readiness enables only future
+framed replies with non-user origin. User input stays refused until ready, and other reply
+failures retain their existing failure paths. Unknown bootstrap modes and requested
+bridge-installation failures refuse without downgrade, raw fallback, queued replay, or a
+late readiness guess. Local-origin and non-user origins keep their existing local-path
+fences; non-user input cannot authorize a copy.
 
 **Input authority.** Every protected write is measured against the frame the writer
 actually committed: one uncovered, Main-focused remote viewer frame, with the exact

@@ -332,10 +332,14 @@ immutable origin through asynchronous native copy callbacks in a separate v2 cap
 Its signed one-shot readiness statement proves only decoder installation, not input
 permission, a drawn source, or clipboard delivery. This host mode is on by default for
 the children normal production Main creates (only a dependency-only explicit-false test
-seam omits it), and it requires that readiness before both local user writes and non-user
-terminal replies; unknown bootstrap modes or requested installation failures refuse
-without downgrade, raw fallback, queue or replay. Non-user input cannot authorize a copy.
-A viewer's Remote input/copy setting never toggles this owner-side framing.
+seam omits it), and it requires that readiness before any child write, including local
+user input and non-user terminal replies. While an otherwise-current, live, non-stopping
+framing child awaits its own authenticated readiness, only never-sent automatic terminal
+replies are discarded without failing the row; they are not queued or replayed on readiness.
+User input stays refused until ready, and all other reply failures keep their existing
+failure paths. Unknown bootstrap modes or requested installation failures refuse without
+downgrade or raw fallback. Non-user input cannot authorize a copy. A viewer's Remote
+input/copy setting never toggles this owner-side framing.
 
 Native children created with that bridge receive a cloned environment with Pi's static
 `PI_CLIPBOARD_OSC52=1` capture flag; normal descendant inheritance stays inside that

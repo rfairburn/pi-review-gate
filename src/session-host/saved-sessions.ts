@@ -58,6 +58,12 @@ import { isValidNativeSessionFile, isValidNativeSessionId } from "./protocol";
  *   There is no automatic latest-session resume or fallback, no live-process
  *   detection, and no locking: the API caller supplies its owned live native
  *   session ids/files when it wants the duplicate guard.
+ * - Catalog freshness is an ephemeral per-agent-directory query revision. An
+ *   OPTIONAL branded freshness scope (createSavedCatalogFreshnessScope)
+ *   partitions that revision so independent viewers of the same agent
+ *   directory do not make each other's catalogs stale; omitting the scope
+ *   keeps the default local revision domain exactly. A scope is not authority:
+ *   every row, file, header, workspace, and live-binding check still applies.
  * - The admission receipt is an ephemeral branded object; the root launch
  *   (src/session-host/launch.ts) revalidates it against the accepted native
  *   agent directory and file identity BEFORE spawn.
@@ -112,7 +118,11 @@ export interface SavedSessionCatalog {
   agentDir: string;
   /** Canonical sessions root (`<agentDir>/sessions`). */
   sessionsRoot: string;
-  /** Query revision for this agent directory (stale catalogs cannot mint admissions). */
+  /**
+   * Query revision for this agent directory within the catalog's freshness
+   * domain (the default local domain, or the freshness scope it was listed
+   * under). Stale catalogs cannot mint admissions or deletion authority.
+   */
   revision: number;
   rows: SavedSessionRow[];
   /** Bounded retained issues (first {@link MAX_CATALOG_ISSUES}). */
@@ -210,9 +220,27 @@ export interface ListSavedSessionsOptions {
   expectedPiVersion?: string;
   /** Abort the listing; late completions of an aborted query never contribute. */
   signal?: AbortSignal;
+  /**
+   * Optional freshness domain for this listing. When present it must be a
+   * scope minted by {@link createSavedCatalogFreshnessScope} (anything else is
+   * rejected before any SDK or filesystem work); the catalog's revision is
+   * then counted per scope and agent directory, so it neither supersedes nor
+   * is superseded by default (omitted/undefined) or other-scope listings.
+   */
+  readonly freshnessScope?: SavedCatalogFreshnessScope;
+}
+
+/**
+ * An opaque, ephemeral freshness domain for saved catalogs. It only partitions
+ * which listings supersede which catalogs; it grants no admission or deletion
+ * authority and carries no identity beyond its runtime-private brand.
+ */
+export interface SavedCatalogFreshnessScope {
+  readonly kind: "saved-catalog-freshness-scope";
 }
 
 const catalogBrand = new WeakSet<object>();
+const freshnessScopeBrand = new WeakSet<object>();
 const admissionBrand = new WeakSet<object>();
 /**
  * Full native search text is private process-local state, indexed by both the
@@ -251,11 +279,56 @@ export function isSavedSessionAdmission(value: unknown): value is SavedSessionAd
 
 /** Per-agent-directory query revision: a newer list supersedes older catalogs. */
 const catalogRevisions = new Map<string, number>();
+/**
+ * Scoped per-agent-directory query revisions. Keyed weakly by the branded
+ * scope so an abandoned binding's counters are collectable; the inner map
+ * keeps distinct canonical agent directories independent within one scope.
+ */
+const scopedCatalogRevisions = new WeakMap<SavedCatalogFreshnessScope, Map<string, number>>();
+/** The freshness scope each scoped catalog was minted under (absent = default domain). */
+const catalogFreshnessScopes = new WeakMap<SavedSessionCatalog, SavedCatalogFreshnessScope>();
 
-function nextCatalogRevision(agentDir: string): number {
-  const revision = (catalogRevisions.get(agentDir) ?? 0) + 1;
-  catalogRevisions.set(agentDir, revision);
+/**
+ * Mint a new frozen, branded saved-catalog freshness scope. Construction is
+ * pure in-memory state: no filesystem, configuration, key, listener, or timer
+ * action happens here.
+ */
+export function createSavedCatalogFreshnessScope(): SavedCatalogFreshnessScope {
+  const scope: SavedCatalogFreshnessScope = Object.freeze({ kind: "saved-catalog-freshness-scope" as const });
+  freshnessScopeBrand.add(scope);
+  return scope;
+}
+
+function isSavedCatalogFreshnessScope(value: unknown): value is SavedCatalogFreshnessScope {
+  return typeof value === "object" && value !== null && freshnessScopeBrand.has(value);
+}
+
+function nextCatalogRevision(agentDir: string, scope: SavedCatalogFreshnessScope | undefined): number {
+  if (scope === undefined) {
+    const revision = (catalogRevisions.get(agentDir) ?? 0) + 1;
+    catalogRevisions.set(agentDir, revision);
+    return revision;
+  }
+  let revisions = scopedCatalogRevisions.get(scope);
+  if (revisions === undefined) {
+    revisions = new Map<string, number>();
+    scopedCatalogRevisions.set(scope, revisions);
+  }
+  const revision = (revisions.get(agentDir) ?? 0) + 1;
+  revisions.set(agentDir, revision);
   return revision;
+}
+
+/** The current query revision of the freshness domain this branded catalog was minted in. */
+function currentCatalogRevision(catalog: SavedSessionCatalog): number {
+  const scope = catalogFreshnessScopes.get(catalog);
+  if (scope === undefined) return catalogRevisions.get(catalog.agentDir) ?? 0;
+  return scopedCatalogRevisions.get(scope)?.get(catalog.agentDir) ?? 0;
+}
+
+/** Record a minted catalog's freshness domain BEFORE it is branded and published. */
+function rememberCatalogFreshnessScope(catalog: SavedSessionCatalog, scope: SavedCatalogFreshnessScope | undefined): void {
+  if (scope !== undefined) catalogFreshnessScopes.set(catalog, scope);
 }
 
 /**
@@ -573,6 +646,7 @@ function emptyCatalog(
   agentDir: string,
   sessionsRoot: string,
   revision: number,
+  freshnessScope: SavedCatalogFreshnessScope | undefined,
   issues: SavedSessionIssue[] = [],
 ): SavedSessionCatalog {
   const catalog: SavedSessionCatalog = {
@@ -590,6 +664,7 @@ function emptyCatalog(
   Object.freeze(issues);
   Object.freeze(catalog.rows);
   Object.freeze(catalog);
+  rememberCatalogFreshnessScope(catalog, freshnessScope);
   catalogBrand.add(catalog);
   catalogSearchIndexes.set(catalog, new WeakMap<SavedSessionRow, string>());
   return catalog;
@@ -612,6 +687,15 @@ function emptyCatalog(
 export async function listSavedSessions(options: ListSavedSessionsOptions): Promise<SavedSessionCatalog> {
   throwIfAborted(options.signal);
 
+  // A present freshness scope must be a branded one, checked BEFORE any SDK
+  // or filesystem work: a forged, cloned, null, or malformed value never
+  // silently enters (or falls back to) another freshness domain. Only an
+  // omitted or undefined scope selects the default local domain.
+  const freshnessScope = options.freshnessScope;
+  if (freshnessScope !== undefined && !isSavedCatalogFreshnessScope(freshnessScope)) {
+    throw new Error("pi-review-gate: the saved-session catalog freshness scope must be created by createSavedCatalogFreshnessScope");
+  }
+
   const agentDirInput = options.agentDir;
   if (!isAbsolute(agentDirInput)) {
     throw new Error(`pi-review-gate: the saved-session catalog agent directory must be an absolute path: ${agentDirInput}`);
@@ -627,16 +711,16 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
   }
   const agentDir = realpathSync(agentDirInput);
   const sessionsRoot = join(agentDir, SAVED_SESSIONS_DIRNAME);
-  const revision = nextCatalogRevision(agentDir);
+  const revision = nextCatalogRevision(agentDir, freshnessScope);
 
   let rootStats;
   try {
     rootStats = lstatSync(sessionsRoot, { bigint: true });
   } catch {
-    return emptyCatalog(agentDir, sessionsRoot, revision); // missing sessions root: honest empty
+    return emptyCatalog(agentDir, sessionsRoot, revision, freshnessScope); // missing sessions root: honest empty
   }
   if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) {
-    return emptyCatalog(agentDir, sessionsRoot, revision, [
+    return emptyCatalog(agentDir, sessionsRoot, revision, freshnessScope, [
       { projectDir: sessionsRoot, reason: "sessions root is not a real directory" },
     ]);
   }
@@ -801,6 +885,7 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
   for (const row of rows) Object.freeze(row);
   Object.freeze(rows);
   Object.freeze(catalog);
+  rememberCatalogFreshnessScope(catalog, freshnessScope);
   catalogBrand.add(catalog);
   catalogSearchIndexes.set(catalog, searchIndex);
   return catalog;
@@ -849,8 +934,8 @@ export function searchSavedSessions(
  *
  * - The row must be a member of this exact catalog (no caller-fabricated
  *   rows), and the catalog must still hold the current query revision for its
- *   agent directory (a superseded or aborted completion cannot mint an
- *   admission).
+ *   agent directory within its own freshness domain (default or scoped; a
+ *   superseded or aborted completion cannot mint an admission).
  * - The file must still exist at the canonical path as a regular,
  *   non-symlink file inside `<agentDir>/sessions`, with a parseable
  *   first-line header whose id and cwd match the catalog row exactly
@@ -907,7 +992,7 @@ export function admitSavedSession(
   if (!catalog.rows.includes(row)) {
     return { status: "refused", reason: "unknown-row" };
   }
-  const currentRevision = catalogRevisions.get(catalog.agentDir) ?? 0;
+  const currentRevision = currentCatalogRevision(catalog);
   if (currentRevision !== catalog.revision) {
     return { status: "refused", reason: "stale-catalog" };
   }
@@ -998,7 +1083,7 @@ export function validateSavedSessionDeletion(
   options: ValidateSavedSessionDeletionOptions = {},
 ): SavedSessionDeletionRefusalReason | undefined {
   if (!isSavedSessionCatalog(catalog) || !catalog.rows.includes(row)) return "unknown-row";
-  if ((catalogRevisions.get(catalog.agentDir) ?? 0) !== catalog.revision) return "stale-catalog";
+  if (currentCatalogRevision(catalog) !== catalog.revision) return "stale-catalog";
 
   const structureIssue = validateSavedSessionLocation(catalog.agentDir, row.file);
   if (structureIssue !== undefined) return structureIssue === "workspace-unavailable" ? "unknown-row" : structureIssue;

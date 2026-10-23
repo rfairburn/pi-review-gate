@@ -14,10 +14,12 @@ import {
   NO_MESSAGES_CAPTION,
   admitSavedSession,
   canonicalSavedSessionCaption,
+  createSavedCatalogFreshnessScope,
   isSavedSessionAdmission,
   isSavedSessionCatalog,
   listSavedSessions,
   readSavedSessionHeader,
+  type SavedCatalogFreshnessScope,
   SavedSessionCatalog,
   SavedSessionRow,
   searchSavedSessions,
@@ -2025,4 +2027,291 @@ test("branded saved catalog search matches the actual pinned Pi 1.3.0 native mat
         `query ${JSON.stringify(query)} preserves the exact branded row reference`);
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// Saved catalog freshness scopes (optional, branded, ephemeral)
+// ---------------------------------------------------------------------------
+
+interface ScopedCatalogFixture extends CatalogFixture {
+  projectDir: string;
+  file: string;
+}
+
+async function makeScopedCatalogFixture(prefix: string): Promise<ScopedCatalogFixture> {
+  const fixture = await makeCatalogFixture(prefix);
+  const projectDir = join(fixture.sessionsRoot, "scoped-project");
+  await mkdir(projectDir, { recursive: true });
+  const file = await writeSessionFile(projectDir, "scoped.jsonl", "scoped-row", fixture.workspace);
+  return { ...fixture, projectDir, file };
+}
+
+/** The catalog is current in its own freshness domain: both admission and deletion validation pass. */
+function assertCatalogCurrent(catalog: SavedSessionCatalog, label: string): void {
+  const row = catalog.rows.find((candidate) => candidate.id === "scoped-row");
+  assert.ok(row, `${label} lists the scoped row`);
+  assert.equal(admitSavedSession(catalog, row).status, "admitted", `${label} is current for admission`);
+  assert.equal(validateSavedSessionDeletion(catalog, row), undefined, `${label} is current for deletion validation`);
+}
+
+/** The catalog was superseded in its own freshness domain: both admission and deletion refuse as stale. */
+function assertCatalogStale(catalog: SavedSessionCatalog, label: string): void {
+  const row = catalog.rows.find((candidate) => candidate.id === "scoped-row");
+  assert.ok(row, `${label} lists the scoped row`);
+  assert.deepEqual(admitSavedSession(catalog, row), { status: "refused", reason: "stale-catalog" }, `${label} is stale for admission`);
+  assert.equal(validateSavedSessionDeletion(catalog, row), "stale-catalog", `${label} is stale for deletion validation`);
+}
+
+test("saved catalog freshness scopes keep local, scope A, and scope B catalogs independently current", async (t) => {
+  const fixture = await makeScopedCatalogFixture("pi-saved-scope-independent");
+  t.after(() => removeFixtureTree(fixture.root));
+
+  const scopeA = createSavedCatalogFreshnessScope();
+  const scopeB = createSavedCatalogFreshnessScope();
+  assert.notStrictEqual(scopeA, scopeB, "each factory call mints a distinct scope");
+  assert.ok(Object.isFrozen(scopeA) && Object.isFrozen(scopeB), "scopes are frozen");
+  assert.deepEqual(Object.keys(scopeA), ["kind"], "a scope carries no data beyond its kind");
+  assert.equal(scopeA.kind, "saved-catalog-freshness-scope");
+  assert.throws(() => {
+    (scopeA as { kind: string }).kind = "other";
+  }, TypeError, "a scope cannot be rewritten");
+
+  const listAll = makeInjectedListAll();
+  const local1 = await listSavedSessions({ agentDir: fixture.agentDir, listAll });
+  const a1 = await listSavedSessions({ agentDir: fixture.agentDir, listAll, freshnessScope: scopeA });
+  const b1 = await listSavedSessions({ agentDir: fixture.agentDir, listAll, freshnessScope: scopeB });
+  for (const catalog of [local1, a1, b1]) {
+    assert.ok(isSavedSessionCatalog(catalog), "scoped and default catalogs are branded alike");
+    assert.ok(Object.isFrozen(catalog) && Object.isFrozen(catalog.rows));
+    assert.equal(catalog.agentDir, fixture.agentDir);
+    assert.deepEqual(
+      Object.keys(catalog).sort(),
+      ["agentDir", "issueCount", "issues", "revision", "rows", "sessionsRoot"],
+      "the freshness scope is remembered privately, never published on the catalog",
+    );
+  }
+  assert.equal(a1.revision, 1, "a fresh scope counts its own revisions");
+  assert.equal(b1.revision, 1, "another fresh scope counts independently");
+
+  assertCatalogCurrent(local1, "L1 beside A1/B1");
+  assertCatalogCurrent(a1, "A1 beside L1/B1");
+  assertCatalogCurrent(b1, "B1 beside L1/A1");
+
+  // Listing again within scope A supersedes A1 only.
+  const a2 = await listSavedSessions({ agentDir: fixture.agentDir, listAll, freshnessScope: scopeA });
+  assert.ok(a2.revision > a1.revision, "the same scope keeps the existing ordering semantics");
+  assertCatalogStale(a1, "A1 after A2");
+  assertCatalogCurrent(a2, "A2");
+  assertCatalogCurrent(b1, "B1 after A2");
+  assertCatalogCurrent(local1, "L1 after A2");
+
+  // A default listing supersedes L1 exactly as before, without touching A2/B1.
+  const local2 = await listSavedSessions({ agentDir: fixture.agentDir, listAll });
+  assert.ok(local2.revision > local1.revision);
+  assertCatalogStale(local1, "L1 after L2");
+  assertCatalogCurrent(local2, "L2");
+  assertCatalogCurrent(a2, "A2 after L2");
+  assertCatalogCurrent(b1, "B1 after L2");
+
+  // An explicit undefined scope is a legitimate omission: the default domain.
+  const local3 = await listSavedSessions({ agentDir: fixture.agentDir, listAll, freshnessScope: undefined });
+  assertCatalogStale(local2, "L2 after an explicit-undefined listing");
+  assertCatalogCurrent(local3, "L3");
+  assertCatalogCurrent(a2, "A2 after L3");
+  assertCatalogCurrent(b1, "B1 after L3");
+
+  // A scope grants no row authority: rows stay bound to their own catalog.
+  assert.deepEqual(admitSavedSession(a2, local3.rows[0]!), { status: "refused", reason: "unknown-row" });
+  assert.deepEqual(admitSavedSession(local3, b1.rows[0]!), { status: "refused", reason: "unknown-row" });
+  assert.deepEqual(admitSavedSession(b1, a2.rows[0]!), { status: "refused", reason: "unknown-row" });
+  assert.equal(validateSavedSessionDeletion(b1, a2.rows[0]!), "unknown-row");
+  assert.equal(validateSavedSessionDeletion(a2, { ...a2.rows[0]! } as SavedSessionRow), "unknown-row");
+  assert.deepEqual(admitSavedSession({ ...a2 } as SavedSessionCatalog, a2.rows[0]!), { status: "refused", reason: "unknown-row" },
+    "a structural clone of a scoped catalog is not branded");
+});
+
+test("a saved catalog freshness scope reused across agent directories keeps per-directory counters and identities", async (t) => {
+  const fixture = await makeScopedCatalogFixture("pi-saved-scope-dirs");
+  t.after(() => removeFixtureTree(fixture.root));
+  const otherAgentDir = join(fixture.root, "agent-other");
+  const otherProject = join(otherAgentDir, "sessions", "other-project");
+  await mkdir(otherProject, { recursive: true });
+  await writeSessionFile(otherProject, "other.jsonl", "scoped-row", fixture.workspace);
+
+  const scope = createSavedCatalogFreshnessScope();
+  const listAll = makeInjectedListAll();
+  const x1 = await listSavedSessions({ agentDir: fixture.agentDir, listAll, freshnessScope: scope });
+  const y1 = await listSavedSessions({ agentDir: otherAgentDir, listAll, freshnessScope: scope });
+  assert.equal(x1.revision, 1);
+  assert.equal(y1.revision, 1, "each canonical agent directory has its own counter within one scope");
+  assertCatalogCurrent(x1, "X1");
+  assertCatalogCurrent(y1, "Y1");
+
+  const x2 = await listSavedSessions({ agentDir: fixture.agentDir, listAll, freshnessScope: scope });
+  assert.equal(x2.revision, 2);
+  assertCatalogStale(x1, "X1 after X2");
+  assertCatalogCurrent(x2, "X2");
+  assertCatalogCurrent(y1, "Y1 after a same-scope listing of another directory");
+
+  // A default listing of the other directory never supersedes its scoped catalog.
+  await listSavedSessions({ agentDir: otherAgentDir, listAll });
+  assertCatalogCurrent(y1, "Y1 after a default listing of its directory");
+
+  const y2 = await listSavedSessions({ agentDir: otherAgentDir, listAll, freshnessScope: scope });
+  assertCatalogStale(y1, "Y1 after Y2");
+  assertCatalogCurrent(y2, "Y2");
+  assertCatalogCurrent(x2, "X2 after Y2");
+
+  // Identities stay bound to their own directory even under one scope.
+  const xAdmission = admitSavedSession(x2, x2.rows[0]!);
+  const yAdmission = admitSavedSession(y2, y2.rows[0]!);
+  assert.equal(xAdmission.status, "admitted");
+  assert.equal(yAdmission.status, "admitted");
+  if (xAdmission.status !== "admitted" || yAdmission.status !== "admitted") throw new Error("unreachable");
+  assert.equal(xAdmission.admission.agentDir, fixture.agentDir);
+  assert.equal(xAdmission.admission.file, fixture.file);
+  assert.equal(yAdmission.admission.agentDir, otherAgentDir);
+  assert.equal(yAdmission.admission.file, join(otherProject, "other.jsonl"));
+  assert.deepEqual(admitSavedSession(y2, x2.rows[0]!), { status: "refused", reason: "unknown-row" });
+  assert.equal(validateSavedSessionDeletion(x2, y2.rows[0]!), "unknown-row");
+});
+
+test("forged, cloned, null, and malformed freshness scopes are rejected before any SDK or filesystem work", async (t) => {
+  const fixture = await makeScopedCatalogFixture("pi-saved-scope-forged");
+  t.after(() => removeFixtureTree(fixture.root));
+  const scope = createSavedCatalogFreshnessScope();
+  const calls: string[] = [];
+  const listAll = makeInjectedListAll({ calls });
+  const local1 = await listSavedSessions({ agentDir: fixture.agentDir, listAll });
+  const scoped1 = await listSavedSessions({ agentDir: fixture.agentDir, listAll, freshnessScope: scope });
+  calls.length = 0;
+
+  const forgedScopes: Array<[string, unknown]> = [
+    ["structural forgery", { kind: "saved-catalog-freshness-scope" }],
+    ["frozen structural forgery", Object.freeze({ kind: "saved-catalog-freshness-scope" })],
+    ["spread clone", { ...scope }],
+    ["frozen spread clone", Object.freeze({ ...scope })],
+    ["prototype-derived object", Object.create(scope)],
+    ["another branded object", local1],
+    ["null", null],
+    ["string", "saved-catalog-freshness-scope"],
+    ["number", 0],
+    ["boolean", false],
+    ["function", () => scope],
+  ];
+  // A missing or relative agent directory would fail with its own diagnostic
+  // if any filesystem validation ran first; the scope refusal must win.
+  const agentDirs = [fixture.agentDir, join(fixture.root, "no-such-agent"), "relative/agent"];
+  for (const [label, forged] of forgedScopes) {
+    for (const agentDir of agentDirs) {
+      await assert.rejects(
+        listSavedSessions({ agentDir, listAll, freshnessScope: forged as SavedCatalogFreshnessScope }),
+        (error: unknown) => error instanceof Error
+          && /freshness scope must be created by createSavedCatalogFreshnessScope/.test(error.message),
+        `${label} is refused before any agent-directory work (${agentDir})`,
+      );
+    }
+  }
+  assert.deepEqual(calls, [], "no refused listing reaches the SDK");
+
+  // Refused listings never enter or advance any freshness domain.
+  assertCatalogCurrent(local1, "L1 after refused forged scopes");
+  assertCatalogCurrent(scoped1, "S1 after refused forged scopes");
+});
+
+test("scoped early-return catalogs remember their scope and never supersede the default domain", async (t) => {
+  const fixture = await makeScopedCatalogFixture("pi-saved-scope-early-return");
+  t.after(() => removeFixtureTree(fixture.root));
+  const scope = createSavedCatalogFreshnessScope();
+  const listAll = makeInjectedListAll();
+  const heldSessions = join(fixture.root, "sessions-held");
+
+  const local1 = await listSavedSessions({ agentDir: fixture.agentDir, listAll });
+  const scoped1 = await listSavedSessions({ agentDir: fixture.agentDir, listAll, freshnessScope: scope });
+
+  // Missing sessions root within the scope: honest empty, scoped revision.
+  await rename(fixture.sessionsRoot, heldSessions);
+  const scopedEmpty = await listSavedSessions({ agentDir: fixture.agentDir, listAll, freshnessScope: scope });
+  assert.ok(isSavedSessionCatalog(scopedEmpty) && Object.isFrozen(scopedEmpty));
+  assert.deepEqual(scopedEmpty.rows, []);
+  assert.equal(scopedEmpty.issueCount, 0);
+  assert.equal(scopedEmpty.revision, scoped1.revision + 1, "the empty path advances only its scope's counter");
+
+  // Unsafe (symlinked) sessions root within the scope: bounded issue, scoped revision.
+  await symlink(heldSessions, fixture.sessionsRoot);
+  const scopedUnsafe = await listSavedSessions({ agentDir: fixture.agentDir, listAll, freshnessScope: scope });
+  assert.ok(isSavedSessionCatalog(scopedUnsafe) && Object.isFrozen(scopedUnsafe));
+  assert.equal(scopedUnsafe.issueCount, 1);
+  assert.match(scopedUnsafe.issues[0]!.reason, /not a real directory/);
+  assert.equal(scopedUnsafe.revision, scopedEmpty.revision + 1);
+  await rm(fixture.sessionsRoot);
+  await rename(heldSessions, fixture.sessionsRoot);
+
+  assertCatalogStale(scoped1, "S1 after scoped early-return listings");
+  assertCatalogCurrent(local1, "L1 after scoped early-return listings");
+
+  // And the reverse: a default early-return listing never supersedes a scoped catalog.
+  const scoped2 = await listSavedSessions({ agentDir: fixture.agentDir, listAll, freshnessScope: scope });
+  await rename(fixture.sessionsRoot, heldSessions);
+  const localEmpty = await listSavedSessions({ agentDir: fixture.agentDir, listAll });
+  assert.deepEqual(localEmpty.rows, []);
+  assert.equal(localEmpty.revision, local1.revision + 1, "the default empty path advances the default counter as before");
+  await rename(heldSessions, fixture.sessionsRoot);
+  assertCatalogStale(local1, "L1 after a default early-return listing");
+  assertCatalogCurrent(scoped2, "S2 after a default early-return listing");
+});
+
+test("fresh scoped catalogs keep every existing resume and deletion refusal", async (t) => {
+  const fixture = await makeScopedCatalogFixture("pi-saved-scope-refusals");
+  t.after(() => removeFixtureTree(fixture.root));
+  const scope = createSavedCatalogFreshnessScope();
+  const listAll = makeInjectedListAll();
+  const missingWorkspace = join(fixture.root, "no-such-workspace");
+  await writeSessionFile(fixture.projectDir, "missing-workspace.jsonl", "missing-workspace-row", missingWorkspace);
+
+  const scoped = await listSavedSessions({ agentDir: fixture.agentDir, listAll, freshnessScope: scope });
+  const row = scoped.rows.find((candidate) => candidate.id === "scoped-row");
+  const missingRow = scoped.rows.find((candidate) => candidate.id === "missing-workspace-row");
+  assert.ok(row && missingRow);
+
+  // Live-binding and duplicate guards are unchanged.
+  assert.deepEqual(admitSavedSession(scoped, row, { ownedLiveSessions: [{ id: row.id }] }),
+    { status: "refused", reason: "known-owned-duplicate" });
+  assert.deepEqual(admitSavedSession(scoped, row, { ownedLiveSessions: [{ file: row.file }] }),
+    { status: "refused", reason: "known-owned-duplicate" });
+  assert.equal(validateSavedSessionDeletion(scoped, row, { ownedLiveSessions: [{ id: row.id }] }), "unknown-live-binding");
+  assert.equal(validateSavedSessionDeletion(scoped, row, { ownedLiveSessions: [{}] }), "unknown-live-binding");
+  assert.equal(validateSavedSessionDeletion(scoped, row, { ownedLiveSessions: [{ kind: "known-id", id: row.id }] }),
+    "unknown-live-binding");
+  assert.equal(validateSavedSessionDeletion(scoped, row, {
+    ownedLiveSessions: [{ kind: "current", id: "other-live-id", file: row.file }],
+  }), "known-owned-duplicate");
+  assert.equal(validateSavedSessionDeletion(scoped, row, {
+    ownedLiveSessions: [{ kind: "reservation", id: row.id, file: join(fixture.root, "reservation.jsonl") }],
+  }), "known-owned-duplicate");
+
+  // Workspace availability still gates launch admission only.
+  assert.deepEqual(admitSavedSession(scoped, missingRow), { status: "refused", reason: "workspace-unavailable" });
+  assert.equal(validateSavedSessionDeletion(scoped, missingRow), undefined);
+
+  // File identity: replaced and symlinked files refuse; the original restores admission.
+  const held = join(fixture.root, "held-original.jsonl");
+  await rename(fixture.file, held);
+  await writeFile(fixture.file, `${sessionHeaderLine(row.id, fixture.workspace)}\n`, "utf8");
+  assert.deepEqual(admitSavedSession(scoped, row), { status: "refused", reason: "replaced-file" });
+  assert.equal(validateSavedSessionDeletion(scoped, row), "replaced-file");
+  await rm(fixture.file);
+  await symlink(held, fixture.file);
+  assert.deepEqual(admitSavedSession(scoped, row), { status: "refused", reason: "symlink-file" });
+  assert.equal(validateSavedSessionDeletion(scoped, row), "symlink-file");
+  await rm(fixture.file);
+  await rename(held, fixture.file);
+  assertCatalogCurrent(scoped, "the scoped catalog after restoring the original file");
+
+  // Structural location: a project directory moved out and replaced by a symlink.
+  const moved = join(fixture.root, "moved-project");
+  await rename(fixture.projectDir, moved);
+  await symlink(moved, fixture.projectDir);
+  assert.deepEqual(admitSavedSession(scoped, row), { status: "refused", reason: "outside-sessions-root" });
+  assert.equal(validateSavedSessionDeletion(scoped, row), "outside-sessions-root");
 });

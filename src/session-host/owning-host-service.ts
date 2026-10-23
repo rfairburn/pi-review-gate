@@ -6,6 +6,10 @@ import {
 } from "./protocol";
 import type {
   CreateInstanceOptions,
+  GuardedSavedDeletionRefusalReason,
+  GuardedSavedDeletionResult,
+  GuardedSavedResumeRefusalReason,
+  GuardedSavedResumeResult,
   InstanceManager,
   InstanceManagerOptions,
   NativeInstanceView,
@@ -13,6 +17,7 @@ import type {
   NativeViewerClipboardSink,
   NativeViewerInputRequest,
   NativeViewerInputResult,
+  SavedMutationAuthorization,
   SessionGeometry,
   SessionViewerState,
   SessionViewerUpdate,
@@ -96,7 +101,19 @@ export type OwningHostManager = Pick<InstanceManager,
 > & Partial<Pick<InstanceManager, "stop" | "closeError"
   // The strict viewer input seam is an optional manager capability: a manager that
   // does not offer it is simply not an input path, never an inferred one.
-  | "readViewerInputSource" | "writeViewerInput">>;
+  | "readViewerInputSource" | "writeViewerInput"
+  // The guarded saved Resume/Delete primitives are optional the same way: a manager
+  // without them is unavailable for guarded mutation, never served through the
+  // older nonatomic admit/validate/start methods.
+  | "startSavedSession" | "deleteSavedSession">>;
+
+export type {
+  GuardedSavedDeletionRefusalReason,
+  GuardedSavedDeletionResult,
+  GuardedSavedResumeRefusalReason,
+  GuardedSavedResumeResult,
+  SavedMutationAuthorization,
+} from "./instances";
 
 export type {
   NativeViewerAnyInputSource,
@@ -147,6 +164,98 @@ export function savedDeletionOwnedSessions(manager: OwningHostManager): readonly
   return manager.list().some((view) => view.hasLiveProcess && !view.nativeSession)
     ? [...owned, {}]
     : owned;
+}
+
+/** Closed native admission refusal reasons a guarded Resume may report. */
+const SAVED_RESUME_REFUSALS: ReadonlySet<GuardedSavedResumeRefusalReason> = new Set<GuardedSavedResumeRefusalReason>([
+  "stale-catalog", "unknown-row", "missing-file", "not-a-regular-file", "symlink-file",
+  "outside-sessions-root", "replaced-file", "malformed-header", "workspace-unavailable",
+  "known-owned-duplicate", "not-authorized", "unavailable",
+]);
+
+/** Closed native deletion refusal reasons a guarded Delete may report. */
+const SAVED_DELETION_REFUSALS: ReadonlySet<GuardedSavedDeletionRefusalReason> = new Set<GuardedSavedDeletionRefusalReason>([
+  "stale-catalog", "unknown-row", "missing-file", "not-a-regular-file", "symlink-file",
+  "outside-sessions-root", "replaced-file", "malformed-header", "known-owned-duplicate",
+  "unknown-live-binding", "not-authorized", "unavailable",
+]);
+
+/**
+ * Copy one manager Resume result into the closed outcome. Anything that is not
+ * exactly a known shape is `unknown` — never a refusal, because a malformed
+ * answer cannot prove that the create path was not invoked — and no extra field
+ * (such as raw error text) survives the copy.
+ */
+function closedSavedResumeResult(value: unknown): GuardedSavedResumeResult {
+  try {
+    if (typeof value !== "object" || value === null) return { status: "unknown" };
+    const candidate = value as { status?: unknown; reason?: unknown; id?: unknown };
+    switch (candidate.status) {
+      case "refused":
+        return SAVED_RESUME_REFUSALS.has(candidate.reason as GuardedSavedResumeRefusalReason)
+          ? { status: "refused", reason: candidate.reason as GuardedSavedResumeRefusalReason }
+          : { status: "unknown" };
+      case "started":
+        return typeof candidate.id === "string" && candidate.id.length > 0
+          ? { status: "started", id: candidate.id }
+          : { status: "unknown" };
+      case "not-ready":
+        return { status: "not-ready" };
+      case "failed":
+        return { status: "failed" };
+      case "duplicate":
+        return { status: "duplicate" };
+      default:
+        return { status: "unknown" };
+    }
+  } catch {
+    return { status: "unknown" };
+  }
+}
+
+/**
+ * Copy one manager Delete result into the closed outcome. A malformed answer is
+ * `unknown`, never a refusal or a no-op claim, and no raw error text survives.
+ */
+function closedSavedDeletionResult(value: unknown): GuardedSavedDeletionResult {
+  try {
+    if (typeof value !== "object" || value === null) return { status: "unknown" };
+    const candidate = value as {
+      status?: unknown; reason?: unknown; method?: unknown;
+      trashInvoked?: unknown; unlinkInvoked?: unknown; fallbackRefusal?: unknown;
+    };
+    switch (candidate.status) {
+      case "refused":
+        return SAVED_DELETION_REFUSALS.has(candidate.reason as GuardedSavedDeletionRefusalReason)
+          ? { status: "refused", reason: candidate.reason as GuardedSavedDeletionRefusalReason }
+          : { status: "unknown" };
+      case "deleted":
+        if (candidate.method === "trash") return { status: "deleted", method: "trash" };
+        if (candidate.method === "unlink") return { status: "deleted", method: "unlink" };
+        return { status: "unknown" };
+      case "unconfirmed": {
+        const trashInvoked = candidate.trashInvoked;
+        const unlinkInvoked = candidate.unlinkInvoked;
+        const fallbackRefusal = candidate.fallbackRefusal;
+        if (typeof trashInvoked !== "boolean" || typeof unlinkInvoked !== "boolean"
+          || (!trashInvoked && !unlinkInvoked)) return { status: "unknown" };
+        if (fallbackRefusal !== undefined
+          && !SAVED_DELETION_REFUSALS.has(fallbackRefusal as GuardedSavedDeletionRefusalReason)) {
+          return { status: "unknown" };
+        }
+        return {
+          status: "unconfirmed",
+          trashInvoked,
+          unlinkInvoked,
+          ...(fallbackRefusal === undefined ? {} : { fallbackRefusal: fallbackRefusal as GuardedSavedDeletionRefusalReason }),
+        };
+      }
+      default:
+        return { status: "unknown" };
+    }
+  } catch {
+    return { status: "unknown" };
+  }
 }
 
 /** Exact deletion preflight for one catalog row, including owned binding data. */
@@ -529,6 +638,45 @@ export interface OwningHostService {
     row: SavedSessionRow,
   ): SavedSessionDeletionRefusalReason | undefined;
   /**
+   * Guarded saved-conversation Resume through the one manager's atomic primitive
+   * (for a later remote provider; the local admit/start path is unchanged).
+   *
+   * This boundary's own gates — an opened manager, the host teardown latch, a
+   * callable guard, and a manager that offers the primitive — run BEFORE any
+   * authorization. The manager then calls the wrapped guard exactly once: this
+   * service's in-memory manager identity, the caller's `authorize`, and the
+   * identity again. After it returns `true` only the manager's own facts, the
+   * native admission, and the existing native create path run; no listing,
+   * ownership read, teardown callback, or injected validation does.
+   *
+   * `refused` is the only outcome that precedes the create invocation. A create
+   * that completed while the host began tearing down is `unknown` (as with
+   * `startSession`, a child may exist). A manager without the primitive is
+   * `unavailable`; there is no fallback to the nonatomic admit/start methods.
+   */
+  startSavedConversation(
+    catalog: SavedSessionCatalog,
+    row: SavedSessionRow,
+    authorize: SavedMutationAuthorization,
+  ): Promise<GuardedSavedResumeResult>;
+  /**
+   * Guarded saved-conversation Delete through the one manager's atomic primitive
+   * (for a later remote provider; the local deletion path is unchanged).
+   *
+   * The same pre-authorization gates apply. The manager calls the wrapped guard
+   * immediately before EACH native mutation stage (trash, then the unlink
+   * fallback) and follows it only with its own facts and the native deletion
+   * validation. `refused` means no trash or unlink handoff was invoked; `deleted`
+   * is native success and is never suppressed by a later check; `unconfirmed`
+   * says which handoffs may have run; `unknown` means the manager seam itself
+   * could not be observed. There is no fallback to the nonatomic validate method.
+   */
+  deleteSavedConversation(
+    catalog: SavedSessionCatalog,
+    row: SavedSessionRow,
+    authorize: SavedMutationAuthorization,
+  ): GuardedSavedDeletionResult;
+  /**
    * The exact current exited binding of one row, read fresh from the manager:
    * only an actual confirmed exit with no owned process qualifies. The retained
    * last-observed native binding is the restart target; a missing persistence
@@ -835,6 +983,89 @@ class LocalOwningHostService implements OwningHostService {
       return validateOwnedSavedSessionDeletion(manager, catalog, row);
     } catch {
       return "unknown-live-binding";
+    }
+  }
+
+  async startSavedConversation(
+    catalog: SavedSessionCatalog,
+    row: SavedSessionRow,
+    authorize: SavedMutationAuthorization,
+  ): Promise<GuardedSavedResumeResult> {
+    const manager = this.#manager;
+    if (manager === undefined || this.#teardownRequestedOrUnknown()) return { status: "refused", reason: "unavailable" };
+    if (typeof authorize !== "function") return { status: "refused", reason: "not-authorized" };
+    let start: OwningHostManager["startSavedSession"];
+    try {
+      start = manager.startSavedSession;
+    } catch {
+      start = undefined;
+    }
+    if (typeof start !== "function") return { status: "refused", reason: "unavailable" };
+    let result: GuardedSavedResumeResult;
+    try {
+      result = closedSavedResumeResult(await start.call(manager, catalog, row, this.#savedMutationGuard(manager, authorize)));
+    } catch {
+      // The primitive threw somewhere this boundary cannot see: whether the create
+      // path was invoked is unknown, so no refusal is claimed.
+      return { status: "unknown" };
+    }
+    if (result.status === "started" || result.status === "not-ready") {
+      // Read only after the protected invocation, exactly like startSession: a
+      // create interrupted by teardown may own a child that is not observable here.
+      if (this.#manager !== manager || this.#teardownRequestedOrUnknown()) return { status: "unknown" };
+    }
+    return result;
+  }
+
+  deleteSavedConversation(
+    catalog: SavedSessionCatalog,
+    row: SavedSessionRow,
+    authorize: SavedMutationAuthorization,
+  ): GuardedSavedDeletionResult {
+    const manager = this.#manager;
+    if (manager === undefined || this.#teardownRequestedOrUnknown()) return { status: "refused", reason: "unavailable" };
+    if (typeof authorize !== "function") return { status: "refused", reason: "not-authorized" };
+    let remove: OwningHostManager["deleteSavedSession"];
+    try {
+      remove = manager.deleteSavedSession;
+    } catch {
+      remove = undefined;
+    }
+    if (typeof remove !== "function") return { status: "refused", reason: "unavailable" };
+    try {
+      // No post-check: a native deletion that succeeded is reported as such even
+      // if authorization or the host changed afterwards.
+      return closedSavedDeletionResult(remove.call(manager, catalog, row, this.#savedMutationGuard(manager, authorize)));
+    } catch {
+      return { status: "unknown" };
+    }
+  }
+
+  /**
+   * The guard handed to the manager's atomic primitives: this service's own
+   * in-memory manager identity around the caller's final authorization. It calls
+   * no injected dependency (the teardown latch was read before the primitive), and
+   * only an exact `true` from the caller authorizes.
+   */
+  #savedMutationGuard(manager: OwningHostManager, authorize: SavedMutationAuthorization): SavedMutationAuthorization {
+    return (): boolean => {
+      if (this.#manager !== manager) return false;
+      let granted: unknown;
+      try {
+        granted = authorize();
+      } catch {
+        return false;
+      }
+      return granted === true && this.#manager === manager;
+    };
+  }
+
+  /** The host teardown latch for the guarded primitives; an unreadable latch is closing. */
+  #teardownRequestedOrUnknown(): boolean {
+    try {
+      return this.dependencies.teardownRequested();
+    } catch {
+      return true;
     }
   }
 

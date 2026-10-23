@@ -439,6 +439,170 @@ test("deletion and admission preflight refuse instead of guessing when ownership
   assert.equal(unopenedAdmission.status, "refused");
 });
 
+// --- Guarded saved Resume/Delete boundary (manager-owned atomic primitives). ---
+
+const guardedCatalog = { agentDir: "/synthetic/agent", rows: [] } as unknown as SavedSessionCatalog;
+const guardedRow = { id: "conversation-1", file: "/synthetic/agent/sessions/p/x.jsonl" } as unknown as SavedSessionRow;
+
+/** Attach stub guarded primitives to a synthetic manager and record each invocation. */
+function withGuardedPrimitives(
+  manager: SyntheticManager,
+  primitives: {
+    readonly start?: (guard: () => boolean) => unknown;
+    readonly remove?: (guard: () => boolean) => unknown;
+  },
+): { readonly calls: string[] } {
+  const calls: string[] = [];
+  Object.assign(manager, {
+    startSavedSession: async (_catalog: unknown, _row: unknown, guard: () => boolean): Promise<unknown> => {
+      calls.push("start");
+      return primitives.start?.(guard);
+    },
+    deleteSavedSession: (_catalog: unknown, _row: unknown, guard: () => boolean): unknown => {
+      calls.push("delete");
+      return primitives.remove?.(guard);
+    },
+  });
+  return { calls };
+}
+
+test("guarded saved primitives are unavailable without the manager seam and never fall back to the nonatomic methods", async () => {
+  for (const harness of [fixture(), fixture({ open: false })]) {
+    let authorizeCalls = 0;
+    const authorize = (): boolean => {
+      authorizeCalls += 1;
+      return true;
+    };
+    assert.deepEqual(await harness.service.startSavedConversation(guardedCatalog, guardedRow, authorize),
+      { status: "refused", reason: "unavailable" });
+    assert.deepEqual(harness.service.deleteSavedConversation(guardedCatalog, guardedRow, authorize),
+      { status: "refused", reason: "unavailable" });
+    assert.equal(authorizeCalls, 0, "no authorization is consulted for an unavailable seam");
+    assert.deepEqual(harness.manager.createOptions, [], "no fallback to the nonatomic create path");
+    assert.equal(harness.manager.listCalls, 0, "no fallback listing or ownership read");
+  }
+});
+
+test("guarded saved primitives gate host teardown and the guard shape before any authorization", async () => {
+  const manager = new SyntheticManager();
+  const probe = withGuardedPrimitives(manager, {
+    start: () => ({ status: "started", id: "child-1" }),
+    remove: () => ({ status: "deleted", method: "trash" }),
+  });
+  const harness = fixture({ manager });
+  const notCallable = undefined as unknown as () => boolean;
+  assert.deepEqual(await harness.service.startSavedConversation(guardedCatalog, guardedRow, notCallable),
+    { status: "refused", reason: "not-authorized" });
+  assert.deepEqual(harness.service.deleteSavedConversation(guardedCatalog, guardedRow, notCallable),
+    { status: "refused", reason: "not-authorized" });
+
+  harness.beginTeardown();
+  let authorizeCalls = 0;
+  const authorize = (): boolean => {
+    authorizeCalls += 1;
+    return true;
+  };
+  assert.deepEqual(await harness.service.startSavedConversation(guardedCatalog, guardedRow, authorize),
+    { status: "refused", reason: "unavailable" });
+  assert.deepEqual(harness.service.deleteSavedConversation(guardedCatalog, guardedRow, authorize),
+    { status: "refused", reason: "unavailable" });
+  assert.equal(authorizeCalls, 0);
+  assert.deepEqual(probe.calls, [], "neither primitive is invoked before the service's own gates pass");
+});
+
+test("the service guard wraps only its in-memory manager identity around the caller's exact authorization", async () => {
+  const manager = new SyntheticManager();
+  const seen: boolean[] = [];
+  withGuardedPrimitives(manager, {
+    start: (guard) => {
+      seen.push(guard());
+      return { status: "refused", reason: "not-authorized" };
+    },
+    remove: (guard) => {
+      seen.push(guard());
+      return { status: "refused", reason: "not-authorized" };
+    },
+  });
+  const harness = fixture({ manager });
+  await harness.service.startSavedConversation(guardedCatalog, guardedRow, () => true);
+  await harness.service.startSavedConversation(guardedCatalog, guardedRow, () => false);
+  await harness.service.startSavedConversation(guardedCatalog, guardedRow, () => {
+    throw new Error("synthetic guard failure");
+  });
+  await harness.service.startSavedConversation(guardedCatalog, guardedRow, () => 1 as unknown as boolean);
+  harness.service.deleteSavedConversation(guardedCatalog, guardedRow, () => true);
+  harness.service.deleteSavedConversation(guardedCatalog, guardedRow, () => false);
+  assert.deepEqual(seen, [true, false, false, false, true, false], "only an exact true authorizes; a throw refuses");
+  assert.equal(manager.listCalls, 0, "the guard reads no listing or ownership callout");
+  assert.deepEqual(manager.createOptions, []);
+});
+
+test("guarded saved outcomes are closed: malformed or throwing primitives are unknown, never refusals, and raw detail is dropped", async () => {
+  const manager = new SyntheticManager();
+  let nextStart: () => unknown = () => undefined;
+  let nextRemove: () => unknown = () => undefined;
+  withGuardedPrimitives(manager, { start: () => nextStart(), remove: () => nextRemove() });
+  const harness = fixture({ manager });
+  const startCases: readonly (readonly [() => unknown, unknown])[] = [
+    [() => { throw new Error("raw /private/failure"); }, { status: "unknown" }],
+    [() => undefined, { status: "unknown" }],
+    [() => ({ status: "refused", reason: "bogus" }), { status: "unknown" }],
+    [() => ({ status: "refused", reason: "replaced-file", error: "raw /private/path" }),
+      { status: "refused", reason: "replaced-file" }],
+    [() => ({ status: "started" }), { status: "unknown" }],
+    [() => ({ status: "started", id: "child-9", error: "raw" }), { status: "started", id: "child-9" }],
+    [() => ({ status: "duplicate", error: "raw" }), { status: "duplicate" }],
+  ];
+  for (const [result, expected] of startCases) {
+    nextStart = result;
+    assert.deepEqual(await harness.service.startSavedConversation(guardedCatalog, guardedRow, () => true), expected);
+  }
+  const removeCases: readonly (readonly [() => unknown, unknown])[] = [
+    [() => { throw new Error("raw /private/failure"); }, { status: "unknown" }],
+    [() => ({ status: "deleted", method: "rm" }), { status: "unknown" }],
+    [() => ({ status: "deleted", method: "trash", error: "raw" }), { status: "deleted", method: "trash" }],
+    [() => ({ status: "unconfirmed", trashInvoked: false, unlinkInvoked: false }), { status: "unknown" }],
+    [() => ({ status: "unconfirmed", trashInvoked: true, unlinkInvoked: false, fallbackRefusal: "bogus" }),
+      { status: "unknown" }],
+    [() => ({ status: "unconfirmed", trashInvoked: true, unlinkInvoked: false, fallbackRefusal: "not-authorized", error: "raw" }),
+      { status: "unconfirmed", trashInvoked: true, unlinkInvoked: false, fallbackRefusal: "not-authorized" }],
+    [() => ({ status: "refused", reason: "unknown-live-binding", error: "raw" }),
+      { status: "refused", reason: "unknown-live-binding" }],
+  ];
+  for (const [result, expected] of removeCases) {
+    nextRemove = result;
+    assert.deepEqual(harness.service.deleteSavedConversation(guardedCatalog, guardedRow, () => true), expected);
+  }
+});
+
+test("a guarded Resume that started during teardown is unknown, while a guarded deletion is never suppressed", async () => {
+  const startManager = new SyntheticManager();
+  let startHarness!: Fixture;
+  withGuardedPrimitives(startManager, {
+    start: (guard) => {
+      guard();
+      startHarness.beginTeardown();
+      return { status: "started", id: "child-1" };
+    },
+  });
+  startHarness = fixture({ manager: startManager });
+  assert.deepEqual(await startHarness.service.startSavedConversation(guardedCatalog, guardedRow, () => true),
+    { status: "unknown" }, "a create that settled during teardown claims no result, as with startSession");
+
+  const removeManager = new SyntheticManager();
+  let removeHarness!: Fixture;
+  withGuardedPrimitives(removeManager, {
+    remove: (guard) => {
+      guard();
+      removeHarness.beginTeardown();
+      return { status: "deleted", method: "unlink" };
+    },
+  });
+  removeHarness = fixture({ manager: removeManager });
+  assert.deepEqual(removeHarness.service.deleteSavedConversation(guardedCatalog, guardedRow, () => true),
+    { status: "deleted", method: "unlink" }, "a completed native deletion is reported whatever changed afterwards");
+});
+
 test("the exited-row resume target is the exact confirmed exit and retained binding", () => {
   const manager = new SyntheticManager();
   manager.views = [rowView({

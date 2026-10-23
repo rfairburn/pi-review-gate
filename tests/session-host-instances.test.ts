@@ -45,6 +45,18 @@ import {
   listSavedSessions,
   type SavedSessionAdmission,
 } from "../src/session-host/saved-sessions";
+import type {
+  SavedSessionCatalog as GuardedSavedCatalog,
+  SavedSessionRow as GuardedSavedRow,
+} from "../src/session-host/saved-sessions";
+import type { SavedDeletionMutationAdapters } from "../src/session-host/instances";
+import { createLocalOwningHostService as createGuardedOwningHostService } from "../src/session-host/owning-host-service";
+import {
+  existsSync as guardedExistsSync,
+  renameSync as guardedRenameSync,
+  symlinkSync as guardedSymlinkSync,
+  unlinkSync as guardedUnlinkSync,
+} from "node:fs";
 import { SESSION_HOST_BOOTSTRAP_ENV, composeFreshSessionSpawnArgs, prepareNativeLaunch } from "../src/session-host/launch";
 import {
   createNativeInputDecoder,
@@ -5196,5 +5208,521 @@ test("startup input is sticky-closed by disconnect, reconnect, and exit, and a s
     await disposeFramingHarness(harness);
   } finally {
     rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+// --- Guarded saved-conversation Resume/Delete primitives (remote-provider prerequisite). ---
+//
+// Real branded catalogs, the real native admission and deletion validation, the
+// real private create path, and fake PTYs. Deletion never reaches the real
+// `trash` binary: every deletion case installs the narrow test-only mutation
+// adapters, which replace only the protected handoffs themselves.
+
+function guardedRow(catalog: GuardedSavedCatalog, id: string): GuardedSavedRow {
+  const row = catalog.rows.find((candidate) => candidate.id === id);
+  assert.ok(row, `catalog lists ${id}`);
+  return row;
+}
+
+async function guardedCatalog(harness: SavedFixture): Promise<GuardedSavedCatalog> {
+  return listSavedSessions({ agentDir: harness.agentDir, listAll: makeSavedListAll() });
+}
+
+/** Replace a file with identical header bytes and a new inode (both exist before the swap). */
+function replaceWithNewInode(file: string, id: string, cwd: string): void {
+  const staged = writeSavedSessionFile(join(file, ".."), `${basename(file)}.replacement`, id, cwd);
+  guardedRenameSync(staged, file);
+}
+
+function bindLiveRow(harness: Harness, rowId: string, sessionId: string, epoch: number, currentFile: string): void {
+  harness.registrar.emitStatus(harness.registrar.entryFor(rowId), {
+    busy: null,
+    pendingInput: null,
+    inputSurface: false,
+    activity: [],
+    nativeSession: { sessionId, epoch, name: `Live ${sessionId}`, currentFile },
+  });
+}
+
+interface DeletionProbe {
+  readonly trashCalls: string[];
+  readonly unlinkCalls: string[];
+}
+
+/**
+ * Install the test-only trash/unlink handoffs for one body. The default trash
+ * reports a nonzero status without touching the file (so the native unlink
+ * fallback runs), and the default unlink really removes the file.
+ */
+async function withDeletionAdapters<T>(
+  handoffs: { trash?: (file: string) => number | null; unlink?: (file: string) => void },
+  body: (probe: DeletionProbe) => T | Promise<T>,
+): Promise<T> {
+  const probe: DeletionProbe = { trashCalls: [], unlinkCalls: [] };
+  instanceTestSeam.setSavedDeletionAdaptersForTests({
+    spawnSync: ((command: string, args: readonly string[]) => {
+      probe.trashCalls.push(`${command} ${args.join(" ")}`);
+      const status = handoffs.trash ? handoffs.trash(args[0]!) : 1;
+      return { pid: 0, output: [], stdout: "", stderr: "", status, signal: null };
+    }) as unknown as NonNullable<SavedDeletionMutationAdapters["spawnSync"]>,
+    unlink: (path: string) => {
+      probe.unlinkCalls.push(path);
+      (handoffs.unlink ?? guardedUnlinkSync)(path);
+    },
+  });
+  try {
+    return await body(probe);
+  } finally {
+    instanceTestSeam.setSavedDeletionAdaptersForTests(undefined);
+  }
+}
+
+test("guarded saved Resume refuses before any create invocation when the final guard declines, throws, or was revoked earlier", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("guard-resume-refuse");
+  try {
+    writeSavedSessionFile(join(harness.agentDir, "sessions", "proj"), "one.jsonl", "guard-resume-1", harness.workspace);
+    const catalog = await guardedCatalog(harness);
+    const row = guardedRow(catalog, "guard-resume-1");
+    let guardCalls = 0;
+    const counted = (answer: () => boolean) => (): boolean => {
+      guardCalls += 1;
+      return answer();
+    };
+
+    assert.deepEqual(await harness.manager.startSavedSession(catalog, { ...row }, counted(() => true)),
+      { status: "refused", reason: "unknown-row" }, "a copied row is not a minted catalog row");
+    assert.deepEqual(await harness.manager.startSavedSession({ ...catalog }, row, counted(() => true)),
+      { status: "refused", reason: "unknown-row" }, "a copied catalog carries no brand");
+    assert.equal(guardCalls, 0, "forged selections are refused before authorization is consulted");
+
+    assert.deepEqual(await harness.manager.startSavedSession(catalog, row, counted(() => false)),
+      { status: "refused", reason: "not-authorized" });
+    assert.deepEqual(await harness.manager.startSavedSession(catalog, row, counted(() => {
+      throw new Error("synthetic guard failure");
+    })), { status: "refused", reason: "not-authorized" }, "a throwing guard refuses");
+    assert.deepEqual(await harness.manager.startSavedSession(catalog, row, counted(() => "yes" as unknown as boolean)),
+      { status: "refused", reason: "not-authorized" }, "only an exact true authorizes");
+
+    let policyOn = true;
+    const foreignPreflight = (): boolean => {
+      policyOn = false;
+      return true;
+    };
+    assert.equal(foreignPreflight(), true, "an earlier foreign callback revoked the policy and still reported the row valid");
+    assert.deepEqual(await harness.manager.startSavedSession(catalog, row, counted(() => policyOn)),
+      { status: "refused", reason: "not-authorized" }, "the final guard observes the earlier revocation");
+    assert.equal(guardCalls, 4);
+    assert.equal(harness.spawned.length, 0, "no refusal spawned a child");
+    assert.equal(harness.registrar.entries.length, 0, "no refusal registered a status channel");
+    assert.deepEqual(harness.manager.list(), [], "no refusal posted a row");
+    assert.deepEqual(harness.manager.ownedLiveSessions(), [], "no refusal left a reservation");
+
+    // A guard that begins this manager's shutdown is caught by its private stop latch.
+    const stopping = new InstanceManager({
+      packageRoot: harness.packageRoot,
+      piExecutable: harness.piExecutable,
+      statusRegistrar: harness.registrar,
+      env: harness.env,
+      ptyFactory: harness.ptyFactory,
+    });
+    const shutdowns: Promise<unknown>[] = [];
+    assert.deepEqual(await stopping.startSavedSession(catalog, row, () => {
+      shutdowns.push(stopping.shutdown({ graceMs: 0, killMs: 0 }));
+      return true;
+    }), { status: "refused", reason: "unavailable" });
+    await Promise.all(shutdowns);
+    assert.equal(harness.spawned.length, 0, "a stopping manager starts nothing after the guard");
+
+    // The same exact row is still admissible through the guarded path afterwards.
+    let authorized = 0;
+    const started = await harness.manager.startSavedSession(catalog, row, () => {
+      authorized += 1;
+      return true;
+    });
+    assert.equal(started.status, "started");
+    if (started.status !== "started") throw new Error("unreachable");
+    assert.equal(authorized, 1, "Resume consults the final guard exactly once");
+    assert.equal(viewFor(harness.manager, started.id).lifecycle, "alive");
+    assert.deepEqual(harness.spawned[0]?.spawnDescriptor.args.slice(4, 6), ["--session", row.file],
+      "the branded admission reached the existing native create path");
+    assert.equal(harness.spawned[0]?.spawnDescriptor.cwd, realpathSync(harness.workspace));
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("guarded saved Resume re-reads its own file, header, root, workspace, binding, and catalog facts after the guard", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("guard-resume-facts");
+  try {
+    const sessions = join(harness.agentDir, "sessions");
+    const goneWorkspace = join(harness.root, "guard-gone-workspace");
+    mkdirSync(goneWorkspace, { recursive: true });
+    writeSavedSessionFile(join(sessions, "replace"), "r.jsonl", "guard-replace", harness.workspace);
+    writeSavedSessionFile(join(sessions, "header"), "h.jsonl", "guard-header", harness.workspace);
+    writeSavedSessionFile(join(sessions, "root"), "o.jsonl", "guard-root", harness.workspace);
+    writeSavedSessionFile(join(sessions, "workspace"), "w.jsonl", "guard-workspace", goneWorkspace);
+    writeSavedSessionFile(join(sessions, "duplicate"), "d.jsonl", "guard-duplicate", harness.workspace);
+    const catalog = await guardedCatalog(harness);
+
+    const replaced = guardedRow(catalog, "guard-replace");
+    assert.deepEqual(await harness.manager.startSavedSession(catalog, replaced, () => {
+      replaceWithNewInode(replaced.file, replaced.id, replaced.cwd);
+      return true;
+    }), { status: "refused", reason: "replaced-file" }, "a file the guard replaced is caught after it returns");
+
+    const header = guardedRow(catalog, "guard-header");
+    assert.deepEqual(await harness.manager.startSavedSession(catalog, header, () => {
+      writeFileSync(header.file, "not a session header\n", "utf8");
+      return true;
+    }), { status: "refused", reason: "malformed-header" });
+
+    const rooted = guardedRow(catalog, "guard-root");
+    const project = join(sessions, "root");
+    assert.deepEqual(await harness.manager.startSavedSession(catalog, rooted, () => {
+      guardedRenameSync(project, `${project}-moved`);
+      guardedSymlinkSync(`${project}-moved`, project, "dir");
+      return true;
+    }), { status: "refused", reason: "outside-sessions-root" });
+
+    const workspace = guardedRow(catalog, "guard-workspace");
+    assert.deepEqual(await harness.manager.startSavedSession(catalog, workspace, () => {
+      rmSync(goneWorkspace, { recursive: true, force: true });
+      return true;
+    }), { status: "refused", reason: "workspace-unavailable" });
+
+    assert.equal(harness.spawned.length, 0, "no post-guard refusal reached the create path");
+    assert.deepEqual(harness.manager.list(), []);
+
+    const duplicate = guardedRow(catalog, "guard-duplicate");
+    const admitted = admitSavedSession(catalog, duplicate);
+    assert.equal(admitted.status, "admitted");
+    if (admitted.status !== "admitted") throw new Error("unreachable");
+    const admission = admitted.admission;
+    const nested: Promise<string>[] = [];
+    assert.deepEqual(await harness.manager.startSavedSession(catalog, duplicate, () => {
+      nested.push(harness.manager.create({ workspace: admission.workspace, savedSession: admission }));
+      return true;
+    }), { status: "refused", reason: "known-owned-duplicate" }, "a reservation the guard created is in the census read after it");
+    assert.equal(nested.length, 1);
+    await Promise.all(nested);
+    assert.equal(harness.spawned.length, 1, "only the guard's own create spawned; the guarded Resume did not");
+    assert.deepEqual(harness.manager.ownedLiveSessions(), [
+      { kind: "reservation", id: duplicate.id, file: duplicate.file },
+      { kind: "current" },
+    ]);
+
+    // A newer listing supersedes the catalog, so its selections are stale.
+    await guardedCatalog(harness);
+    assert.deepEqual(await harness.manager.startSavedSession(catalog, duplicate, () => true),
+      { status: "refused", reason: "stale-catalog" });
+    assert.equal(harness.spawned.length, 1);
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("guarded saved Resume treats the create invocation as accepted owner work even when authorization is lost inside it", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("guard-resume-accepted");
+  try {
+    writeSavedSessionFile(join(harness.agentDir, "sessions", "proj"), "one.jsonl", "guard-accepted-1", harness.workspace);
+    const catalog = await guardedCatalog(harness);
+    const row = guardedRow(catalog, "guard-accepted-1");
+    let policyOn = true;
+    const policyAtSpawn: boolean[] = [];
+    const manager = new InstanceManager({
+      packageRoot: harness.packageRoot,
+      piExecutable: harness.piExecutable,
+      statusRegistrar: harness.registrar,
+      env: harness.env,
+      // The row post inside the create invocation turns the policy Off.
+      onChange: () => { policyOn = false; },
+      ptyFactory: (descriptor) => {
+        policyAtSpawn.push(policyOn);
+        return harness.ptyFactory(descriptor);
+      },
+    });
+
+    const result = await manager.startSavedSession(catalog, row, () => policyOn);
+    assert.equal(result.status, "started", "losing authorization inside the invocation never becomes a refusal");
+    if (result.status !== "started") throw new Error("unreachable");
+    assert.deepEqual(policyAtSpawn, [false], "the policy was already Off while the accepted create was still running");
+    assert.equal(viewFor(manager, result.id).lifecycle, "alive");
+    assert.deepEqual(harness.spawned[0]?.killSignals, [], "no implicit stop, cancellation, or rollback");
+    assert.deepEqual(manager.ownedLiveSessions(), [
+      { kind: "reservation", id: row.id, file: row.file },
+      { kind: "current" },
+    ], "the accepted reservation stays owned");
+    assert.deepEqual(await manager.startSavedSession(catalog, row, () => true),
+      { status: "refused", reason: "known-owned-duplicate" }, "the duplicate fence still holds afterwards");
+    assert.equal(harness.spawned.length, 1);
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("guarded saved Delete refuses before any trash or unlink when the guard declines or the manager's own facts refuse", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("guard-delete-refuse");
+  try {
+    const sessions = join(harness.agentDir, "sessions");
+    writeSavedSessionFile(join(sessions, "a"), "keep.jsonl", "guard-delete-keep", harness.workspace);
+    writeSavedSessionFile(join(sessions, "b"), "swap.jsonl", "guard-delete-swap", harness.workspace);
+    writeSavedSessionFile(join(sessions, "c"), "bound.jsonl", "guard-delete-bound", harness.workspace);
+    const catalog = await guardedCatalog(harness);
+    const keep = guardedRow(catalog, "guard-delete-keep");
+    const swap = guardedRow(catalog, "guard-delete-swap");
+    const bound = guardedRow(catalog, "guard-delete-bound");
+
+    await withDeletionAdapters({}, async (probe) => {
+      let guardCalls = 0;
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, { ...keep }, () => {
+        guardCalls += 1;
+        return true;
+      }), { status: "refused", reason: "unknown-row" });
+      assert.equal(guardCalls, 0, "a forged row is refused before authorization is consulted");
+
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, keep, () => false),
+        { status: "refused", reason: "not-authorized" });
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, keep, () => {
+        throw new Error("synthetic guard failure");
+      }), { status: "refused", reason: "not-authorized" });
+
+      let policyOn = true;
+      const foreignPreflight = (): boolean => {
+        policyOn = false;
+        return true;
+      };
+      assert.equal(foreignPreflight(), true);
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, keep, () => policyOn),
+        { status: "refused", reason: "not-authorized" }, "an earlier revocation is caught by the final guard");
+
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, swap, () => {
+        replaceWithNewInode(swap.file, swap.id, swap.cwd);
+        return true;
+      }), { status: "refused", reason: "replaced-file" }, "a file the guard replaced is never trashed");
+
+      const liveId = await harness.manager.create({ workspace: harness.workspace });
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, bound, () => true),
+        { status: "refused", reason: "unknown-live-binding" }, "a live child without a current tuple is an unknown binding");
+      bindLiveRow(harness, liveId, "guard-unrelated-live", 1, join(harness.root, "unrelated-live.jsonl"));
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, bound, () => {
+        bindLiveRow(harness, liveId, bound.id, 2, bound.file);
+        return true;
+      }), { status: "refused", reason: "known-owned-duplicate" }, "a binding the guard changed is read after it");
+
+      assert.deepEqual(probe.trashCalls, [], "no refusal invoked trash");
+      assert.deepEqual(probe.unlinkCalls, [], "no refusal invoked unlink");
+      for (const row of [keep, swap, bound]) assert.equal(guardedExistsSync(row.file), true);
+    });
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("guarded saved Delete keeps the local rules: missing workspace deletes; stopping, reservations, and stale catalogs refuse", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("guard-delete-rules");
+  try {
+    const sessions = join(harness.agentDir, "sessions");
+    const goneWorkspace = join(harness.root, "guard-delete-gone-workspace");
+    mkdirSync(goneWorkspace, { recursive: true });
+    writeSavedSessionFile(join(sessions, "gone"), "g.jsonl", "guard-delete-gone", goneWorkspace);
+    writeSavedSessionFile(join(sessions, "reserved"), "r.jsonl", "guard-delete-reserved", harness.workspace);
+    const catalog = await guardedCatalog(harness);
+    const gone = guardedRow(catalog, "guard-delete-gone");
+    const reserved = guardedRow(catalog, "guard-delete-reserved");
+    rmSync(goneWorkspace, { recursive: true, force: true });
+
+    await withDeletionAdapters({}, async (probe) => {
+      const stopping = new InstanceManager({
+        packageRoot: harness.packageRoot,
+        piExecutable: harness.piExecutable,
+        statusRegistrar: harness.registrar,
+        env: harness.env,
+        ptyFactory: harness.ptyFactory,
+      });
+      const shutdowns: Promise<unknown>[] = [];
+      assert.deepEqual(stopping.deleteSavedSession(catalog, gone, () => {
+        shutdowns.push(stopping.shutdown({ graceMs: 0, killMs: 0 }));
+        return true;
+      }), { status: "refused", reason: "unavailable" }, "a guard that stops the manager is caught by its private latch");
+      await Promise.all(shutdowns);
+      assert.deepEqual(probe.trashCalls, []);
+
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, gone, () => true),
+        { status: "deleted", method: "unlink" }, "a missing recorded workspace stays deletable exactly as locally");
+      assert.deepEqual(probe.trashCalls, [`trash ${gone.file}`], "trash is attempted first with the one admitted path");
+      assert.deepEqual(probe.unlinkCalls, [gone.file]);
+      assert.equal(guardedExistsSync(gone.file), false);
+
+      const admitted = admitSavedSession(catalog, reserved);
+      assert.equal(admitted.status, "admitted");
+      if (admitted.status !== "admitted") throw new Error("unreachable");
+      const pendingCreate = harness.manager.create({ workspace: admitted.admission.workspace, savedSession: admitted.admission });
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, reserved, () => true),
+        { status: "refused", reason: "known-owned-duplicate" }, "a pending reservation protects its exact file");
+      await pendingCreate;
+      await guardedCatalog(harness);
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, reserved, () => true),
+        { status: "refused", reason: "stale-catalog" });
+      assert.equal(probe.trashCalls.length, 1);
+      assert.equal(probe.unlinkCalls.length, 1);
+      assert.equal(guardedExistsSync(reserved.file), true);
+    });
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("guarded saved Delete revalidates before the unlink fallback and reports invoked handoffs truthfully", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("guard-delete-stages");
+  try {
+    const sessions = join(harness.agentDir, "sessions");
+    for (const id of ["stage-swap", "stage-revoke", "stage-trash-ok", "stage-unlink-ok", "stage-unlink-fail", "stage-gone"]) {
+      writeSavedSessionFile(join(sessions, id), `${id}.jsonl`, id, harness.workspace);
+    }
+    const catalog = await guardedCatalog(harness);
+
+    const swap = guardedRow(catalog, "stage-swap");
+    let guardCalls = 0;
+    await withDeletionAdapters({
+      trash: (file) => {
+        replaceWithNewInode(file, swap.id, swap.cwd);
+        return 1;
+      },
+    }, (probe) => {
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, swap, () => {
+        guardCalls += 1;
+        return true;
+      }), { status: "unconfirmed", trashInvoked: true, unlinkInvoked: false, fallbackRefusal: "replaced-file" });
+      assert.equal(guardCalls, 2, "the same guard boundary ran before trash and again before the fallback");
+      assert.deepEqual(probe.unlinkCalls, [], "a replacement observed after trash is never unlinked");
+      assert.equal(guardedExistsSync(swap.file), true, "the replacement is preserved");
+    });
+
+    const revoke = guardedRow(catalog, "stage-revoke");
+    let policyOn = true;
+    await withDeletionAdapters({ trash: () => { policyOn = false; return 1; } }, (probe) => {
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, revoke, () => policyOn),
+        { status: "unconfirmed", trashInvoked: true, unlinkInvoked: false, fallbackRefusal: "not-authorized" },
+        "authorization lost inside trash stops the fallback but never claims trash was not invoked");
+      assert.deepEqual(probe.trashCalls, [`trash ${revoke.file}`]);
+      assert.deepEqual(probe.unlinkCalls, []);
+    });
+
+    const trashOk = guardedRow(catalog, "stage-trash-ok");
+    policyOn = true;
+    await withDeletionAdapters({
+      trash: (file) => {
+        policyOn = false;
+        guardedUnlinkSync(file);
+        return 0;
+      },
+    }, () => {
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, trashOk, () => policyOn),
+        { status: "deleted", method: "trash" }, "a native trash success is reported even though the policy turned Off");
+      assert.equal(guardedExistsSync(trashOk.file), false);
+    });
+
+    const unlinkOk = guardedRow(catalog, "stage-unlink-ok");
+    policyOn = true;
+    await withDeletionAdapters({
+      unlink: (file) => {
+        policyOn = false;
+        guardedUnlinkSync(file);
+      },
+    }, (probe) => {
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, unlinkOk, () => policyOn),
+        { status: "deleted", method: "unlink" }, "a returned fallback unlink is reported even though the policy turned Off");
+      assert.deepEqual(probe.unlinkCalls, [unlinkOk.file]);
+      assert.equal(guardedExistsSync(unlinkOk.file), false);
+    });
+
+    const unlinkFail = guardedRow(catalog, "stage-unlink-fail");
+    await withDeletionAdapters({
+      unlink: () => { throw new Error("synthetic EACCES with /private/raw/path"); },
+    }, () => {
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, unlinkFail, () => true),
+        { status: "unconfirmed", trashInvoked: true, unlinkInvoked: true },
+        "a failed fallback is unconfirmed, with no raw error text in the outcome");
+      assert.equal(guardedExistsSync(unlinkFail.file), true);
+    });
+
+    const goneAfterTrash = guardedRow(catalog, "stage-gone");
+    await withDeletionAdapters({
+      trash: (file) => {
+        guardedUnlinkSync(file);
+        return null;
+      },
+    }, (probe) => {
+      assert.deepEqual(harness.manager.deleteSavedSession(catalog, goneAfterTrash, () => true),
+        { status: "deleted", method: "trash" }, "the native gone-file rule is preserved");
+      assert.deepEqual(probe.unlinkCalls, []);
+    });
+    assert.equal(harness.spawned.length, 0, "deletion never starts or stops a child");
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("the owning-host service runs the guarded primitives of its one manager with injected callbacks only before the guard", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("guard-service");
+  try {
+    const sessions = join(harness.agentDir, "sessions");
+    writeSavedSessionFile(join(sessions, "delete"), "d.jsonl", "service-delete", harness.workspace);
+    writeSavedSessionFile(join(sessions, "resume"), "r.jsonl", "service-resume", harness.workspace);
+    const catalog = await guardedCatalog(harness);
+    const deletion = guardedRow(catalog, "service-delete");
+    const resume = guardedRow(catalog, "service-resume");
+    const order: string[] = [];
+    let teardown = false;
+    const service = createGuardedOwningHostService({
+      createManager: () => harness.manager,
+      teardownRequested: () => {
+        order.push("teardown");
+        return teardown;
+      },
+    });
+    service.openManager({} as Parameters<typeof service.openManager>[0]);
+
+    await withDeletionAdapters({
+      trash: () => {
+        order.push("trash");
+        return 1;
+      },
+      unlink: (file) => {
+        order.push("unlink");
+        guardedUnlinkSync(file);
+      },
+    }, () => {
+      assert.deepEqual(service.deleteSavedConversation(catalog, deletion, () => {
+        order.push("guard");
+        return true;
+      }), { status: "deleted", method: "unlink" });
+      assert.deepEqual(order, ["teardown", "guard", "trash", "guard", "unlink"],
+        "the injected teardown latch is read only before authorization; nothing injected runs between a guard and its handoff");
+    });
+
+    order.length = 0;
+    const started = await service.startSavedConversation(catalog, resume, () => {
+      order.push("guard");
+      return true;
+    });
+    assert.equal(started.status, "started");
+    assert.deepEqual(order, ["teardown", "guard", "teardown"],
+      "teardown is read before the guard and again only after the create invocation, for classification");
+
+    teardown = true;
+    order.length = 0;
+    assert.deepEqual(await service.startSavedConversation(catalog, resume, () => {
+      order.push("guard");
+      return true;
+    }), { status: "refused", reason: "unavailable" });
+    assert.deepEqual(service.deleteSavedConversation(catalog, resume, () => {
+      order.push("guard");
+      return true;
+    }), { status: "refused", reason: "unavailable" });
+    assert.deepEqual(order, ["teardown", "teardown"], "host teardown refuses before any guard");
+    assert.equal(harness.spawned.length, 1);
+  } finally {
+    cleanup(harness);
   }
 });

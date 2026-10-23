@@ -1,5 +1,7 @@
 import { Buffer } from "node:buffer";
+import { spawnSync as nodeSpawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import type { IPty } from "@lydell/node-pty";
 
@@ -37,7 +39,20 @@ import {
 	type SessionSpawnInput,
 	type SessionSpawnOutcome,
 } from "./protocol";
-import { isSavedSessionAdmission, type OwnedLiveSession, type SavedSessionAdmission } from "./saved-sessions";
+import {
+	admitSavedSession,
+	isSavedSessionAdmission,
+	isSavedSessionCatalog,
+	validateSavedSessionDeletion,
+	type OwnedLiveSession,
+	type SavedSessionAdmission,
+	type SavedSessionAdmissionResult,
+	type SavedSessionCatalog,
+	type SavedSessionDeletionRefusalReason,
+	type SavedSessionRefusalReason,
+	type SavedSessionRow,
+} from "./saved-sessions";
+import { deleteSavedSessionFile, type SavedSessionDeletionResult } from "./saved-deletion";
 import type {
 	StatusActivityRefreshResult,
 	StatusRenameRequest,
@@ -157,11 +172,107 @@ import {
  *   newer observed binding on native /new or /resume) so duplicate fencing
  *   survives status disconnects; exited and removed rows never block
  *   reopening their saved conversation.
+ * - Guarded saved-conversation Resume and Delete ({@linkcode InstanceManager.startSavedSession},
+ *   {@linkcode InstanceManager.deleteSavedSession}) put the caller's final authorization
+ *   immediately before this manager's OWN facts and the protected invocation: the
+ *   caller's guard runs, then — with no await and no foreign callback in between —
+ *   the manager's private stop/dispose latches, its private census of current
+ *   bindings, exact reservations, and historical ids, and the native saved-session
+ *   file/header/identity/workspace checks, then the existing native create path
+ *   (Resume) or one trash/unlink stage (Delete). No public, overridable, or injected
+ *   listing, ownership read, or validation callback runs after that guard. Once a
+ *   protected invocation began its effect is reported truthfully (started, deleted,
+ *   or unconfirmed), never as a refusal, and nothing is stopped, cancelled, or rolled
+ *   back if the caller's authorization is lost afterwards.
  */
 
 export interface StopInstanceResult {
 	readonly status: "exited" | "confirmation-required" | "unavailable" | "unconfirmed";
 	readonly forced: boolean;
+}
+
+/**
+ * The caller's final authorization for one guarded saved-conversation mutation.
+ * Only an exact `true` return authorizes; `false`, any other value, or a throw
+ * refuses before anything is invoked. It may run more than once for one Delete
+ * (immediately before each mutation stage), and the manager re-reads its own
+ * current facts after every call, so a guard that changes files or bindings is
+ * caught rather than trusted.
+ */
+export type SavedMutationAuthorization = () => boolean;
+
+/**
+ * Why a guarded Resume was refused. Every refusal happens strictly BEFORE the
+ * native create path was invoked: no row, reservation, registration, or child
+ * exists because of the call. Native reasons are the fixed admission reasons.
+ */
+export type GuardedSavedResumeRefusalReason =
+	| SavedSessionRefusalReason
+	/** The caller's final guard returned anything but `true`, or threw. */
+	| "not-authorized"
+	/** No manager/seam, host teardown, or this manager is stopping or disposed. */
+	| "unavailable";
+
+/**
+ * Outcome of one guarded Resume. Only `refused` precedes the create invocation;
+ * every other status means the native create path WAS invoked and owner work may
+ * have started, so none of them may be presented as a refusal:
+ *
+ * - `started`: the exact created row is launch-settled and not errored/starting.
+ * - `not-ready`: create resolved but its row is missing, errored, or still starting.
+ * - `failed`: the create invocation threw (no claim that a child exists).
+ * - `duplicate`: the create path's own synchronous duplicate fence refused it.
+ * - `unknown`: the result cannot be observed (teardown, or an unreadable seam);
+ *   a child may exist.
+ */
+export type GuardedSavedResumeResult =
+	| { readonly status: "refused"; readonly reason: GuardedSavedResumeRefusalReason }
+	| { readonly status: "started"; readonly id: string }
+	| { readonly status: "not-ready" }
+	| { readonly status: "failed" }
+	| { readonly status: "duplicate" }
+	| { readonly status: "unknown" };
+
+/** Why a guarded Delete was refused; always before any trash or unlink invocation. */
+export type GuardedSavedDeletionRefusalReason =
+	| SavedSessionDeletionRefusalReason
+	| "not-authorized"
+	| "unavailable";
+
+/**
+ * Outcome of one guarded Delete.
+ *
+ * - `refused`: no trash and no unlink handoff was ever invoked.
+ * - `deleted`: native success, reported regardless of any later authorization
+ *   loss — trash status zero or a gone file (`method: "trash"`), or a returned
+ *   permanent unlink fallback (`method: "unlink"`).
+ * - `unconfirmed`: at least one mutation handoff MAY have run but success was not
+ *   established. `trashInvoked`/`unlinkInvoked` say exactly which handoffs were
+ *   invoked. `fallbackRefusal` is the pre-unlink revalidation refusal (for example
+ *   a replaced file or lost authorization after trash): the fallback was then never
+ *   invoked, but the trash attempt still was, so this is never a no-op claim.
+ * - `unknown`: the boundary itself could not be observed (service seam only).
+ */
+export type GuardedSavedDeletionResult =
+	| { readonly status: "refused"; readonly reason: GuardedSavedDeletionRefusalReason }
+	| { readonly status: "deleted"; readonly method: "trash" | "unlink" }
+	| {
+		readonly status: "unconfirmed";
+		readonly trashInvoked: boolean;
+		readonly unlinkInvoked: boolean;
+		readonly fallbackRefusal?: GuardedSavedDeletionRefusalReason;
+	}
+	| { readonly status: "unknown" };
+
+/**
+ * Narrow test-only replacements for the two actual deletion mutation handoffs.
+ * Production always uses the native `spawnSync("trash", [file])` and `unlinkSync`.
+ * They replace only the protected invocation itself; the manager's guard and
+ * revalidation before each stage are never replaceable.
+ */
+export interface SavedDeletionMutationAdapters {
+	readonly spawnSync?: typeof nodeSpawnSync;
+	readonly unlink?: (path: string) => void;
 }
 
 /** Default terminal geometry for newly created instances. */
@@ -174,6 +285,9 @@ export const DEFAULT_SHUTDOWN_KILL_MS = 2000;
 
 /** Internal policy seam for synthetic manager tests; production defaults to the actual host platform. */
 let shutdownPlatformForTests: NodeJS.Platform | undefined;
+
+/** Internal mutation-handoff seam for guarded deletion tests; production uses the native imports. */
+let savedDeletionAdaptersForTests: SavedDeletionMutationAdapters | undefined;
 
 /** Upper bound for a single-line instance label (UTF-16 code units). */
 export const MAX_LABEL_CHARS = 80;
@@ -805,6 +919,9 @@ export const __test = Object.freeze({
 		nodePtyLoaderForTests = loader;
 		cachedNodePty = undefined;
 	},
+	setSavedDeletionAdaptersForTests(adapters: SavedDeletionMutationAdapters | undefined): void {
+		savedDeletionAdaptersForTests = adapters === undefined ? undefined : Object.freeze({ ...adapters });
+	},
 });
 
 /**
@@ -1259,6 +1376,20 @@ function validateInitialRequest(value: unknown): { title: string; prompt: string
 	return { title: request.title, prompt: request.prompt };
 }
 
+/** The caller's final guard: only an exact `true` authorizes; a throw refuses. */
+function callerAuthorized(authorize: SavedMutationAuthorization): boolean {
+	try {
+		return authorize() === true;
+	} catch {
+		return false;
+	}
+}
+
+/** True only for this manager's own synchronous known-owned duplicate refusal. */
+function isOwnedDuplicateLaunchError(error: unknown): boolean {
+	return error instanceof Error && error.message.includes("already open in this host");
+}
+
 /**
  * Manager of independently owned native session-host instances. See the
  * module documentation for the ownership, isolation, and shutdown rules.
@@ -1560,7 +1691,16 @@ export class InstanceManager {
 	}
 
 	/** Launch one independently owned instance and resolve with its row id. */
-	async create(options: CreateInstanceOptions): Promise<string> {
+	create(options: CreateInstanceOptions): Promise<string> {
+		return this.#createInstance(options);
+	}
+
+	/**
+	 * The one native create path, shared verbatim by the public {@linkcode create}
+	 * and the guarded saved Resume handoff. Private so a guarded handoff can never be
+	 * redirected through an overridden or injected method.
+	 */
+	async #createInstance(options: CreateInstanceOptions): Promise<string> {
 		if (this.#disposed || this.#stopping) {
 			throw new Error("session-host: the instance manager is shut down; no new instances can be created");
 		}
@@ -1676,6 +1816,16 @@ export class InstanceManager {
 	 * Exited and removed rows contribute nothing.
 	 */
 	ownedLiveSessions(): readonly OwnedLiveSession[] {
+		return this.#ownedSessionCensus();
+	}
+
+	/**
+	 * Private, side-effect-free census behind {@linkcode ownedLiveSessions}: read
+	 * only from this manager's own records, never through a public or overridable
+	 * method, so the guarded saved primitives can consult it after a caller's final
+	 * authorization with no foreign code in between.
+	 */
+	#ownedSessionCensus(): OwnedLiveSession[] {
 		const sessions: OwnedLiveSession[] = [];
 		for (const record of this.#records.values()) {
 			const live = Boolean(record.pty && !record.ptyExited);
@@ -1707,6 +1857,177 @@ export class InstanceManager {
 			}
 		}
 		return sessions;
+	}
+
+	/**
+	 * Deletion-safety census from this manager's own records: the private census
+	 * plus one explicit binding-less entry whenever a live child has no current
+	 * native tuple. This is the same rule as the service's
+	 * `savedDeletionOwnedSessions`, read privately instead of through the public
+	 * `list()`/`ownedLiveSessions()` callouts.
+	 */
+	#savedDeletionCensus(): OwnedLiveSession[] {
+		const sessions = this.#ownedSessionCensus();
+		for (const record of this.#records.values()) {
+			if (record.pty && !record.ptyExited && !record.nativeSession) {
+				sessions.push({});
+				break;
+			}
+		}
+		return sessions;
+	}
+
+	/**
+	 * Guarded native saved-conversation Resume (the primitive a later remote
+	 * provider calls). The existing local admit/create path is unchanged.
+	 *
+	 * Fail-closed order, every step before the create invocation synchronous:
+	 * 1. pure pre-authorization gates — this manager's stop/dispose latches, a
+	 *    callable guard, and membership of the exact row in a branded catalog;
+	 * 2. the caller's final guard, exactly once (only `true` authorizes);
+	 * 3. with no await and no foreign callback from here to the handoff: the
+	 *    stop/dispose latches again, this manager's private census, and the actual
+	 *    native admission (catalog revision, sessions root/project, file type, inode,
+	 *    header id/cwd, existing workspace, known-owned duplicates);
+	 * 4. the protected invocation — the same private native create path `create`
+	 *    uses, with the branded admission and its recorded workspace, so its
+	 *    synchronous reservation and duplicate fence and the launch-time admission
+	 *    revalidation all still apply.
+	 *
+	 * Only step 1–3 can yield `refused`. Once step 4 is invoked the work is accepted
+	 * owner work: it is classified from this manager's own record like
+	 * `startSession` does and is never stopped, cancelled, retried, or reported as
+	 * refused because authorization was lost later.
+	 */
+	async startSavedSession(
+		catalog: SavedSessionCatalog,
+		row: SavedSessionRow,
+		authorize: SavedMutationAuthorization,
+	): Promise<GuardedSavedResumeResult> {
+		if (this.#disposed || this.#stopping) return { status: "refused", reason: "unavailable" };
+		if (typeof authorize !== "function") return { status: "refused", reason: "not-authorized" };
+		if (!isSavedSessionCatalog(catalog) || !catalog.rows.includes(row)) {
+			return { status: "refused", reason: "unknown-row" };
+		}
+		if (!callerAuthorized(authorize)) return { status: "refused", reason: "not-authorized" };
+		// From the guard's return to the handoff: own facts and native checks only.
+		if (this.#disposed || this.#stopping) return { status: "refused", reason: "unavailable" };
+		let admitted: SavedSessionAdmissionResult;
+		try {
+			admitted = admitSavedSession(catalog, row, { ownedLiveSessions: this.#ownedSessionCensus() });
+		} catch {
+			return { status: "refused", reason: "unknown-row" };
+		}
+		if (admitted.status !== "admitted") return { status: "refused", reason: admitted.reason };
+		const admission = admitted.admission;
+		// The protected invocation. Its synchronous prefix posts the row and the
+		// reservation before anything can yield.
+		const launch = this.#createInstance({ workspace: admission.workspace, savedSession: admission });
+		let id: string;
+		try {
+			id = await launch;
+		} catch (error) {
+			return isOwnedDuplicateLaunchError(error) ? { status: "duplicate" } : { status: "failed" };
+		}
+		// A create that settled while this manager began stopping may own a child
+		// that is no longer observable as usable: claim no result.
+		if (this.#disposed || this.#stopping) return { status: "unknown" };
+		const record = this.#records.get(id);
+		if (record === undefined || record.lifecycle === "error" || record.lifecycle === "starting") {
+			return { status: "not-ready" };
+		}
+		return { status: "started", id };
+	}
+
+	/**
+	 * Guarded native saved-conversation Delete (the primitive a later remote
+	 * provider calls). The existing local deletion path is unchanged.
+	 *
+	 * Pure pre-authorization gates (stop/dispose latches, a callable guard, exact
+	 * row membership in a branded catalog) run first. The existing native
+	 * trash-first `deleteSavedSessionFile` then runs with this manager's OWN
+	 * validation, which it calls immediately before EACH mutation stage: the
+	 * caller's guard, then — synchronously, with no foreign callback — the
+	 * stop/dispose latches, this manager's private deletion census (current files,
+	 * exact reservations, historical ids, and an explicit unknown binding for a live
+	 * child without a tuple), and the actual native deletion validation (revision,
+	 * root/project, file type, inode, header). A missing workspace stays deletable
+	 * exactly as locally. A replacement or authorization loss observed after trash
+	 * therefore prevents the unlink fallback.
+	 *
+	 * The manager tracks whether the trash or unlink handoff was ever invoked:
+	 * `refused` only before either, `deleted` for native success whatever happens to
+	 * authorization afterwards, and `unconfirmed` once a handoff may have run.
+	 */
+	deleteSavedSession(
+		catalog: SavedSessionCatalog,
+		row: SavedSessionRow,
+		authorize: SavedMutationAuthorization,
+	): GuardedSavedDeletionResult {
+		if (this.#disposed || this.#stopping) return { status: "refused", reason: "unavailable" };
+		if (typeof authorize !== "function") return { status: "refused", reason: "not-authorized" };
+		if (!isSavedSessionCatalog(catalog) || !catalog.rows.includes(row)) {
+			return { status: "refused", reason: "unknown-row" };
+		}
+		// A minted row is frozen catalog data: reading its path runs no foreign code.
+		const file = row.file;
+		const adapters = savedDeletionAdaptersForTests;
+		const trashHandoff = adapters?.spawnSync ?? nodeSpawnSync;
+		const unlinkHandoff = adapters?.unlink ?? unlinkSync;
+		let trashInvoked = false;
+		let unlinkInvoked = false;
+		let stageRefusal: GuardedSavedDeletionRefusalReason | undefined;
+		const validate = (): string | undefined => {
+			stageRefusal = this.#guardedSavedDeletionRefusal(catalog, row, authorize);
+			return stageRefusal;
+		};
+		// Each wrapper records the handoff BEFORE invoking it: whatever the handoff
+		// then does (including reentering this manager), it may have run.
+		const trash = ((command: string, args: readonly string[], options: SpawnSyncOptionsWithStringEncoding) => {
+			trashInvoked = true;
+			return trashHandoff(command, args, options);
+		}) as unknown as typeof nodeSpawnSync;
+		const unlink = (path: string): void => {
+			unlinkInvoked = true;
+			unlinkHandoff(path);
+		};
+		let result: SavedSessionDeletionResult;
+		try {
+			result = deleteSavedSessionFile(file, { validate, spawnSync: trash, unlink });
+		} catch {
+			return trashInvoked || unlinkInvoked
+				? { status: "unconfirmed", trashInvoked, unlinkInvoked }
+				: { status: "refused", reason: "unavailable" };
+		}
+		if (result.ok === true) return { status: "deleted", method: result.method };
+		if (!trashInvoked && !unlinkInvoked) {
+			return { status: "refused", reason: stageRefusal ?? "unavailable" };
+		}
+		return {
+			status: "unconfirmed",
+			trashInvoked,
+			unlinkInvoked,
+			...(!unlinkInvoked && stageRefusal !== undefined ? { fallbackRefusal: stageRefusal } : {}),
+		};
+	}
+
+	/**
+	 * One guarded deletion stage check: the caller's guard, then only this
+	 * manager's own facts and the native validation, with nothing foreign after the
+	 * guard. Never throws.
+	 */
+	#guardedSavedDeletionRefusal(
+		catalog: SavedSessionCatalog,
+		row: SavedSessionRow,
+		authorize: SavedMutationAuthorization,
+	): GuardedSavedDeletionRefusalReason | undefined {
+		if (!callerAuthorized(authorize)) return "not-authorized";
+		if (this.#disposed || this.#stopping) return "unavailable";
+		try {
+			return validateSavedSessionDeletion(catalog, row, { ownedLiveSessions: this.#savedDeletionCensus() });
+		} catch {
+			return "unknown-live-binding";
+		}
 	}
 
 	/**

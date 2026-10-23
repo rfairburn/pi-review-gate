@@ -54,6 +54,27 @@
  * retires its inventory watch, stops answering the channel, and closes it through the
  * channel's own bounded API, so a viewer can never be left presenting a retired
  * snapshot as current because its terminal frame was unwritable.
+ *
+ * The optional Saved catalog exchange is a THIRD injected owner capability: a
+ * view factory plus a live delete-exposure policy callback, supplied together or
+ * not at all. This binding creates at most ONE ephemeral view, lazily, after the
+ * first authorized Saved request, and disposes it when the binding finishes; it
+ * keeps no catalog registry, history, or queue of its own. Every Saved request is
+ * admitted only on the exact proved peer key with the current receiving grant,
+ * for the EXACT owner run of this binding's live subscription (an empty roster is
+ * fine; no row, selection, focus, or native tuple is needed), and with a fresh
+ * value of the channel's shared monotonic Saved sequence. One Saved operation is
+ * pending per channel: a newer read may supersede an older read, while a resume
+ * or delete is never superseded, cancelled, or replayed. EVERY Saved write —
+ * window frames, the accepted operation's fixed result, refusals, and policy
+ * publications — takes the roster's single send slot, and the Saved family
+ * alternates fairly with roster frames. While the slot is held, Saved control
+ * work is bounded: one accepted result, one waiting refusal (further refusals are
+ * dropped), and one coalesced policy publication read live at dispatch. Delete is
+ * admitted only while the live policy says it is exposed, and the guard handed to
+ * the provider repeats a reentrancy-stable proof of it; a delete that already
+ * completed is reported truthfully under the still-current transport and run
+ * authorization.
  */
 
 import { randomUUID } from "node:crypto";
@@ -76,6 +97,21 @@ import {
   type OwnerCreateHandler,
   type OwnerCreateRequest,
 } from "./peer-create";
+import {
+  isOwnerSavedCatalogView,
+  isOwnerSavedDeleteFacts,
+  isOwnerSavedResumeFacts,
+  isOwnerSavedWindowFacts,
+  type OwnerRemoteHistoryDeletePolicy,
+  type OwnerSavedAuthorizationGuard,
+  type OwnerSavedCatalogView,
+  type OwnerSavedCatalogViewFactory,
+  type OwnerSavedDeleteFacts,
+  type OwnerSavedEntry,
+  type OwnerSavedResumeFacts,
+  type OwnerSavedWindowFacts,
+  type OwnerSavedWindowOutcome,
+} from "./peer-saved";
 import { isRemoteSessionMetadataError, toRemoteSessionMetadata, type RemoteSessionMetadata } from "./roster-metadata";
 import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
@@ -83,7 +119,9 @@ import {
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
+  ROSTER_BRIDGE_SAVED_CAPABILITY,
   ROSTER_BRIDGE_SERVICE,
+  buildRosterBridgeSavedWindowTransfer,
   buildRosterBridgeTransfer,
   decodeRosterBridgeFrame,
   encodeRosterBridgeFrame,
@@ -97,6 +135,7 @@ import {
   type RosterBridgeErrorCode,
   type RosterBridgeFrame,
   type RosterBridgeHelloFrame,
+  type RosterBridgeSavedRequestFrame,
 } from "./roster-bridge-protocol";
 
 /**
@@ -135,7 +174,12 @@ export type RosterBridgeOwnerDiagnosticCode =
   | "close_reply_dropped"
   | "create_accepted"
   | "create_refused"
-  | "create_reply_dropped";
+  | "create_reply_dropped"
+  | "saved_accepted"
+  | "saved_refused"
+  | "saved_reply_dropped"
+  | "saved_window_sent"
+  | "saved_policy_sent";
 
 export interface RosterBridgeOwnerDiagnostic {
   readonly code: RosterBridgeOwnerDiagnosticCode;
@@ -170,8 +214,30 @@ export interface RosterBridgeHostOptions {
    * handed a minimal re-proof for its own last-instant check.
    */
   readonly createOwnedSession?: OwnerCreateHandler;
+  /**
+   * The owner's Saved catalog view factory, supplied by Main together with
+   * {@link RosterBridgeHostOptions.remoteHistoryDeleteExposed}. Supplying exactly
+   * one of the two is refused at construction; supplying neither keeps this host
+   * byte-for-byte a metadata/close/create host that never acknowledges Saved.
+   * The factory is called at most once per channel binding, lazily, after an
+   * authorized Saved request.
+   */
+  readonly savedCatalogView?: OwnerSavedCatalogViewFactory;
+  /**
+   * The owner/server's LIVE remote-history delete exposure. It is read at every
+   * delete decision and policy publication; `false`, a throw, or any non-`true`
+   * value means no delete exposure and no delete acceptance. There is no
+   * permissive default here.
+   */
+  readonly remoteHistoryDeleteExposed?: OwnerRemoteHistoryDeletePolicy;
   readonly bounds?: Partial<RosterBridgeBounds>;
   readonly onDiagnostic?: RosterBridgeOwnerDiagnosticSink;
+}
+
+/** The validated Saved provider pair, captured once at host construction. */
+interface SavedProviders {
+  readonly createView: OwnerSavedCatalogViewFactory;
+  readonly deleteExposed: OwnerRemoteHistoryDeletePolicy;
 }
 
 /** One attached channel. Stopping it ends metadata delivery and nothing else. */
@@ -199,6 +265,39 @@ export interface RosterBridgeHost {
   readonly activeSubscriptionCount: number;
   /** Stop every binding's metadata delivery. Never closes a session. */
   stopAll(): Promise<void>;
+  /**
+   * Re-read the live delete policy and publish it to every existing binding that
+   * negotiated Saved and has a current owner run. Description only: every delete
+   * is still re-checked against the live policy. Optional so hosts and test
+   * doubles without Saved remain representable.
+   */
+  notifySavedPolicy?(): void;
+}
+
+/** What the one pending Saved operation on a channel is. */
+type SavedOpKind = "read" | "resume" | "delete";
+
+interface SavedOp {
+  readonly kind: SavedOpKind;
+  readonly frame: RosterBridgeSavedRequestFrame;
+  /** Fires only when a newer read supersedes this read or the binding goes away. */
+  readonly controller: AbortController | null;
+}
+
+/** One in-flight Saved window transfer sharing the roster's single send slot. */
+interface SavedTransfer {
+  readonly op: SavedOp;
+  readonly hostRunId: string;
+  readonly frames: readonly Buffer[];
+  readonly rows: number;
+  readonly pageCount: number;
+  index: number;
+}
+
+function isSavedRead(frame: RosterBridgeSavedRequestFrame): boolean {
+  return frame.type === "saved_list_request"
+    || frame.type === "saved_search_request"
+    || frame.type === "saved_window_request";
 }
 
 type OwnerState = "awaiting_hello" | "ready" | "subscribed" | "finished";
@@ -256,6 +355,46 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    */
   #inflightCreate: { readonly requestId: string; readonly hostRunId: string } | null = null;
   #createSequence = 0;
+  /** The validated Saved provider pair, or null when this host has none. */
+  readonly #saved: SavedProviders | null;
+  /**
+   * The channel's shared Saved anti-replay high-water. An ADMISSION fence only:
+   * advancing it never cancels or drops an operation already accepted.
+   */
+  #savedSequence = 0;
+  /** The ONE pending Saved operation on this channel, if any. Never a queue. */
+  #savedOp: SavedOp | null = null;
+  /** The one in-flight Saved window transfer, if any. */
+  #savedTransfer: SavedTransfer | null = null;
+  /** Fair interleaving: true when the Saved transfer has the next send-slot turn. */
+  #savedTurn = false;
+  /** This binding's ONE lazily created catalog view, disposed when it finishes. */
+  #savedView: OwnerSavedCatalogView | null = null;
+  #savedViewDisposed = false;
+  /**
+   * The bounded Saved control outbox. Every Saved write takes the roster's ONE
+   * send slot, so nothing here is written while another frame is outstanding:
+   * - `#savedResult`: the accepted operation's own fixed result (at most one,
+   *   because the operation keeps the channel's one Saved slot until its result
+   *   is handed to the transport);
+   * - `#savedRefusal`: at most one pre-invocation refusal; further refusals while
+   *   it waits are dropped (the requester learns `unknown` from its own deadline);
+   * - `#savedPolicyDirty`: a coalesced policy publication, read fresh at dispatch.
+   */
+  #savedResult: {
+    readonly op: SavedOp;
+    readonly hostRunId: string;
+    readonly requireRun: boolean;
+    readonly bytes: Buffer;
+  } | null = null;
+  #savedRefusal: Buffer | null = null;
+  #savedPolicyDirty = false;
+  /** Bumped by each policy dispatch so a stale reentrant read never wins. */
+  #policyGeneration = 0;
+  /** Bumped by every policy notification; a delete proof spanning one fails closed. */
+  #policyEpoch = 0;
+  /** The last policy description handed to the transport for the current run. */
+  #policySent: { readonly hostRunId: string; readonly deleteExposed: boolean } | null = null;
   #installing = false;
   #installUnavailable = false;
   #subscriptionRun: string | null = null;
@@ -275,9 +414,11 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     bounds: RosterBridgeBounds,
     diagnostic: (code: RosterBridgeOwnerDiagnosticCode, extra?: { rows?: number; pages?: number }) => void,
     onFinished: () => void,
+    saved: SavedProviders | null,
   ) {
     this.#channel = channel;
     this.#options = options;
+    this.#saved = saved;
     this.#bounds = bounds;
     this.#diagnostic = diagnostic;
     this.peerKey = channel.peerKey;
@@ -358,6 +499,13 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       case "create_request":
         this.#onCreateRequest(frame);
         return;
+      case "saved_list_request":
+      case "saved_search_request":
+      case "saved_window_request":
+      case "saved_resume_request":
+      case "saved_delete_request":
+        this.#onSavedRequest(frame);
+        return;
       default:
         // A frame this side did not ask for (its own ack, an unknown type, or a
         // second hello) is a protocol violation, answered once.
@@ -397,6 +545,11 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       }
       if (capability === ROSTER_BRIDGE_CREATE_CAPABILITY) {
         return typeof this.#options.createOwnedSession === "function";
+      }
+      if (capability === ROSTER_BRIDGE_SAVED_CAPABILITY) {
+        // Implementation support only: a real view factory AND a live policy
+        // callback. Delete exposure itself is decided per request, live.
+        return this.#saved !== null;
       }
       return false;
     }));
@@ -800,6 +953,697 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     });
   }
 
+  // -------------------------------------------------------------------- saved
+
+  /**
+   * Re-read the live delete policy and publish it for this binding's current run.
+   * Called by the owning host's `notifySavedPolicy()`; it is description only.
+   * The publication is coalesced and dispatched through the shared send slot,
+   * reading the live policy at the moment it is actually written.
+   */
+  notifySavedPolicy(): void {
+    // Any delete proof that spans this notification is no longer stable.
+    this.#policyEpoch += 1;
+    if (!this.#savedNegotiated()) return;
+    this.#savedPolicyDirty = true;
+    this.#drain();
+  }
+
+  #savedNegotiated(): boolean {
+    return this.#saved !== null && this.#capabilities.includes(ROSTER_BRIDGE_SAVED_CAPABILITY);
+  }
+
+  /**
+   * The exact owner run of this binding's LIVE subscription, read fresh. That run
+   * comes from the owner's own inventory watch, so an empty roster qualifies and
+   * no row, selection, focus, or native tuple is ever consulted.
+   */
+  #savedRunCurrent(hostRunId: string): boolean {
+    return this.#state === "subscribed" && !this.#fenced && this.#subscriptionRun === hostRunId;
+  }
+
+  /** Binding live and authorized, re-proved after the injected authorizer callout. */
+  #savedBindingAuthorized(): boolean {
+    if (!this.#createBindingIsLive()) return false;
+    if (!this.#authorized()) return false;
+    return this.#createBindingIsLive();
+  }
+
+  /** Transport, binding, and exact current-run re-proof, repeated after the callout. */
+  #savedStillAuthorized(hostRunId: string): boolean {
+    if (!this.#savedRunCurrent(hostRunId)) return false;
+    if (!this.#savedBindingAuthorized()) return false;
+    return this.#savedRunCurrent(hostRunId);
+  }
+
+  /** The LIVE server delete exposure. Absent, non-`true`, or throwing means OFF. */
+  #readDeleteExposed(): boolean {
+    const saved = this.#saved;
+    if (saved === null) return false;
+    try {
+      return saved.deleteExposed() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The combined delete proof: transport, binding, exact run, AND the live server
+   * delete policy, stable across every callout it makes.
+   *
+   * The authorizer and the policy are both arbitrary owner code and may change
+   * each other. The policy is therefore read both before and after the final
+   * authorizer callout, any policy notification during the whole proof (captured
+   * by the policy epoch) fails it closed, and the binding/run are re-proved last
+   * without another callout. An exposure that turned Off at any point inside the
+   * proof can never yield `true`.
+   */
+  #deleteStillAuthorized(hostRunId: string): boolean {
+    const epoch = this.#policyEpoch;
+    if (!this.#savedStillAuthorized(hostRunId)) return false;
+    if (!this.#readDeleteExposed()) return false;
+    if (!this.#savedStillAuthorized(hostRunId)) return false;
+    if (!this.#readDeleteExposed()) return false;
+    return epoch === this.#policyEpoch && this.#createBindingIsLive() && this.#savedRunCurrent(hostRunId);
+  }
+
+  /**
+   * Admit one Saved request, answer it with a fixed refusal, or say nothing.
+   *
+   * Admission mirrors create: negotiated capability, unfenced post-hello channel,
+   * and the EXACT proved key with the current receiving grant (an unauthorized
+   * request gets no write at all). The shared sequence is then compared and
+   * consumed, so a replay is refused before any provider work. One Saved
+   * operation is pending per channel: a newer read supersedes an older read, and
+   * anything else that collides is refused `busy` without touching the accepted
+   * operation or its eventual result. The request must name the exact run of this
+   * binding's live subscription. A delete additionally needs the live server
+   * policy to say "exposed" right now. Every injected callback (authorizer,
+   * policy, factory, abort listener) is followed by a fresh re-proof.
+   */
+  #onSavedRequest(frame: RosterBridgeSavedRequestFrame): void {
+    if (this.#state === "finished") return;
+    if (!this.#savedNegotiated()) {
+      // Never acknowledged for this channel: outside the negotiated protocol.
+      this.#violation();
+      return;
+    }
+    if (this.#fenced) {
+      this.#refuse();
+      return;
+    }
+    if (this.#state === "awaiting_hello") {
+      this.#violation();
+      return;
+    }
+    if (!this.#savedBindingAuthorized()) {
+      this.#diagnostic("saved_refused");
+      return;
+    }
+    if (frame.sequence <= this.#savedSequence) {
+      // A previous or duplicated attempt number: refused before any provider call,
+      // and the high-water is unchanged.
+      this.#writeSavedRefusal(frame, "duplicate");
+      return;
+    }
+    // Consumed now, whichever answer follows. Admission only: it never cancels or
+    // drops an operation this binding already accepted.
+    this.#savedSequence = frame.sequence;
+    const read = isSavedRead(frame);
+    const hostRunId = frame.hostRunId;
+    if (this.#savedOp !== null && !(read && this.#savedOp.kind === "read")) {
+      this.#writeSavedRefusal(frame, "busy");
+      return;
+    }
+    if (!this.#savedRunCurrent(hostRunId)) {
+      this.#writeSavedRefusal(frame, "stale");
+      return;
+    }
+    if (frame.type === "saved_delete_request") {
+      const exposed = this.#deleteStillAuthorized(hostRunId);
+      // The policy and authorizer callbacks are arbitrary owner code: re-prove the
+      // binding after them before any write, and report the run honestly.
+      if (!this.#savedBindingAuthorized()) {
+        this.#diagnostic("saved_refused");
+        return;
+      }
+      if (!exposed) {
+        // A capability, a stale viewer description, or a confirmation never
+        // overrides the live server policy.
+        this.#writeSavedRefusal(frame, this.#savedRunCurrent(hostRunId) ? "policy" : "stale");
+        return;
+      }
+    }
+    const view = this.#ensureSavedView();
+    // The factory is arbitrary owner code too.
+    if (!this.#savedBindingAuthorized()) {
+      this.#diagnostic("saved_refused");
+      return;
+    }
+    if (view === null) {
+      this.#writeSavedRefusal(frame, "admission");
+      return;
+    }
+    if (this.#savedOp !== null) {
+      if (!read || this.#savedOp.kind !== "read") {
+        this.#writeSavedRefusal(frame, "busy");
+        return;
+      }
+      // A newer read supersedes the older READ only: its signal fires and its
+      // transfer is discarded. Abort listeners are owner code, so re-prove after.
+      this.#abortSavedRead();
+      if (!this.#savedBindingAuthorized()) {
+        this.#diagnostic("saved_refused");
+        return;
+      }
+      if (this.#savedOp !== null) {
+        this.#writeSavedRefusal(frame, "busy");
+        return;
+      }
+    }
+    if (!this.#savedRunCurrent(hostRunId)) {
+      this.#writeSavedRefusal(frame, "stale");
+      return;
+    }
+    const kind: SavedOpKind = read ? "read" : frame.type === "saved_resume_request" ? "resume" : "delete";
+    const op: SavedOp = Object.freeze({ kind, frame, controller: read ? new AbortController() : null });
+    this.#savedOp = op;
+    this.#diagnostic("saved_accepted");
+    // The minimal re-proof handed to EVERY provider operation. For delete it is the
+    // full, reentrancy-stable delete proof, so the provider can re-check before
+    // each trash/unlink and after its own callouts. For a read it also requires
+    // that this read was not superseded. It is a check, never a lease.
+    const guard: OwnerSavedAuthorizationGuard = kind === "delete"
+      ? () => this.#deleteStillAuthorized(hostRunId)
+      : kind === "read"
+        ? () => this.#savedOp === op && this.#savedStillAuthorized(hostRunId) && this.#savedOp === op
+        : () => this.#savedStillAuthorized(hostRunId);
+    void Promise.resolve()
+      .then(() => {
+        // Re-proved inside the detached continuation, immediately before the call.
+        if (this.#savedOp !== op || !guard()) {
+          this.#completeSaved(op, { kind: "unknown" }, false);
+          return undefined;
+        }
+        return this.#invokeSaved(view, op, guard).then(
+          (facts) => this.#completeSaved(op, facts, true),
+          () => this.#completeSaved(op, { kind: "unknown" }, true),
+        );
+      })
+      .catch(() => {
+        // A synchronous provider throw or an unexpected fault still settles the
+        // operation honestly and frees the channel's one Saved slot.
+        this.#completeSaved(op, { kind: "unknown" }, false);
+      });
+  }
+
+  /** Call exactly the provider operation the frame names, with exactly its fields. */
+  #invokeSaved(view: OwnerSavedCatalogView, op: SavedOp, guard: OwnerSavedAuthorizationGuard): Promise<unknown> {
+    const frame = op.frame;
+    const signal = (op.controller ?? new AbortController()).signal;
+    switch (frame.type) {
+      case "saved_list_request":
+        return Promise.resolve(view.list(Object.freeze({
+          hostRunId: frame.hostRunId,
+          query: frame.query,
+          offset: frame.offset,
+          count: frame.count,
+        }), signal, guard));
+      case "saved_search_request":
+        return Promise.resolve(view.search(Object.freeze({
+          hostRunId: frame.hostRunId,
+          catalogId: frame.catalogId,
+          query: frame.query,
+          offset: frame.offset,
+          count: frame.count,
+        }), signal, guard));
+      case "saved_window_request":
+        return Promise.resolve(view.window(Object.freeze({
+          hostRunId: frame.hostRunId,
+          catalogId: frame.catalogId,
+          resultId: frame.resultId,
+          offset: frame.offset,
+          count: frame.count,
+        }), signal, guard));
+      case "saved_resume_request":
+        return Promise.resolve(view.resume(Object.freeze({
+          hostRunId: frame.hostRunId,
+          catalogId: frame.catalogId,
+          resultId: frame.resultId,
+          entryId: frame.entryId,
+        }), guard));
+      case "saved_delete_request":
+        return Promise.resolve(view.remove(Object.freeze({
+          hostRunId: frame.hostRunId,
+          catalogId: frame.catalogId,
+          resultId: frame.resultId,
+          entryId: frame.entryId,
+          confirmed: frame.confirmed,
+        }), guard));
+      default:
+        return Promise.resolve({ kind: "unknown" });
+    }
+  }
+
+  /** Lazily create this binding's ONE view. Null when unavailable or retired. */
+  #ensureSavedView(): OwnerSavedCatalogView | null {
+    if (this.#savedView !== null) return this.#savedView;
+    const saved = this.#saved;
+    // A provider callback can retire this binding reentrantly. Read afresh on
+    // each call rather than carrying TypeScript's pre-callback state narrowing.
+    const isFinished = (): boolean => this.#state === "finished";
+    if (saved === null || this.#savedViewDisposed || isFinished()) return null;
+    let created: unknown;
+    try {
+      created = saved.createView();
+    } catch {
+      return null;
+    }
+    if (!isOwnerSavedCatalogView(created)) return null;
+    if (isFinished() || this.#savedViewDisposed || this.#savedView !== null) {
+      // The binding retired (or a view was installed reentrantly) during the
+      // factory call: this extra view is released and never used.
+      try {
+        created.dispose();
+      } catch {
+        // Disposal is best effort.
+      }
+      return this.#savedViewDisposed || isFinished() ? null : this.#savedView;
+    }
+    this.#savedView = created;
+    return created;
+  }
+
+  /**
+   * Supersede or abandon the pending READ, if any, and discard its transfer.
+   * Never touches a pending resume or delete.
+   */
+  #abortSavedRead(): void {
+    this.#savedTransfer = null;
+    const op = this.#savedOp;
+    if (op === null || op.kind !== "read") return;
+    this.#savedOp = null;
+    // A read's own queued answer is superseded with it; a write's never is.
+    if (this.#savedResult !== null && this.#savedResult.op === op) this.#savedResult = null;
+    try {
+      op.controller?.abort();
+    } catch {
+      // An abort listener's failure changes nothing here.
+    }
+  }
+
+  #completeSaved(op: SavedOp, facts: unknown, providerReturned: boolean): void {
+    // Superseded, abandoned by teardown, or already answered: not this binding's.
+    if (this.#savedOp !== op) return;
+    if (op.kind === "read") this.#completeSavedRead(op, facts, providerReturned);
+    else this.#completeSavedWrite(op, facts, providerReturned);
+  }
+
+  /**
+   * Answer one completed read: a validated, coherent window becomes one bounded
+   * transfer on the shared send slot; anything else becomes one fixed result.
+   */
+  #completeSavedRead(op: SavedOp, facts: unknown, providerReturned: boolean): void {
+    const frame = op.frame;
+    if (this.#state === "finished" || this.#fenced) {
+      this.#savedOp = null;
+      this.#diagnostic("saved_reply_dropped");
+      return;
+    }
+    if (!this.#savedBindingAuthorized()) {
+      if (this.#savedOp === op) this.#savedOp = null;
+      this.#diagnostic(this.#createBindingIsLive() ? "saved_refused" : "saved_reply_dropped");
+      return;
+    }
+    // The authorizer is owner code and may have superseded or retired this read.
+    if (this.#savedOp !== op) return;
+    if (!this.#savedRunCurrent(frame.hostRunId)) {
+      this.#queueSavedWindowResult(op, { kind: "refused", reason: "stale" });
+      return;
+    }
+    if (!providerReturned || !isOwnerSavedWindowFacts(facts)) {
+      this.#queueSavedWindowResult(op, { kind: "unknown" });
+      return;
+    }
+    if (facts.kind !== "window") {
+      this.#queueSavedWindowResult(op, facts);
+      return;
+    }
+    if (!this.#savedWindowCoherent(frame, facts)) {
+      // A window for another run, catalog, result, or offset, or one that silently
+      // returned fewer rows than it had, is never forwarded.
+      this.#queueSavedWindowResult(op, { kind: "unknown" });
+      return;
+    }
+    let built: ReturnType<typeof buildRosterBridgeSavedWindowTransfer>;
+    try {
+      built = buildRosterBridgeSavedWindowTransfer({
+        requestId: frame.requestId,
+        hostRunId: frame.hostRunId,
+        catalogId: facts.catalogId,
+        resultId: facts.resultId,
+        total: facts.total,
+        issueCount: facts.issueCount,
+        offset: facts.offset,
+        // Copied field by field: exactly the closed entry shape, nothing more.
+        entries: facts.entries.map((entry): OwnerSavedEntry => ({
+          entryId: entry.entryId,
+          sessionId: entry.sessionId,
+          file: entry.file,
+          caption: entry.caption,
+          cwd: entry.cwd,
+        })),
+        bounds: this.#bounds,
+      });
+    } catch (error) {
+      this.#queueSavedWindowResult(op,
+        isRosterBridgeProtocolError(error) && error.code === "row_unrepresentable"
+          ? { kind: "refused", reason: "unrepresentable" }
+          : { kind: "unknown" });
+      return;
+    }
+    this.#savedTransfer = {
+      op,
+      hostRunId: frame.hostRunId,
+      frames: built.frames,
+      rows: built.rows,
+      pageCount: built.pageCount,
+      index: 0,
+    };
+    this.#drain();
+  }
+
+  /** The window must describe exactly what this request asked for. */
+  #savedWindowCoherent(
+    frame: RosterBridgeSavedRequestFrame,
+    facts: Extract<OwnerSavedWindowFacts, { readonly kind: "window" }>,
+  ): boolean {
+    if (frame.type === "saved_resume_request" || frame.type === "saved_delete_request") return false;
+    if (facts.hostRunId !== frame.hostRunId) return false;
+    // A search keeps its catalog; a window keeps its catalog AND result.
+    if (frame.type !== "saved_list_request" && facts.catalogId !== frame.catalogId) return false;
+    if (frame.type === "saved_window_request" && facts.resultId !== frame.resultId) return false;
+    if (facts.offset !== frame.offset) return false;
+    return facts.entries.length === Math.min(frame.count, facts.total - facts.offset);
+  }
+
+  /**
+   * Answer one completed resume or delete. Delivery (checked when the result is
+   * actually written) needs the still-current transport, binding, and run
+   * authorization — and NOT the current delete policy: an operation that already
+   * completed is reported truthfully, and is never cancelled, rolled back,
+   * retried, or re-run here.
+   */
+  #completeSavedWrite(op: SavedOp, facts: unknown, providerReturned: boolean): void {
+    const frame = op.frame;
+    if (this.#state === "finished" || this.#fenced) {
+      this.#savedOp = null;
+      this.#diagnostic("saved_reply_dropped");
+      return;
+    }
+    if (frame.type === "saved_resume_request") {
+      let outcome: OwnerSavedResumeFacts = isOwnerSavedResumeFacts(facts) ? facts : { kind: "unknown" };
+      // A start in another run is never reported as this request's.
+      if (outcome.kind === "started" && outcome.hostRunId !== frame.hostRunId) outcome = { kind: "unknown" };
+      if (!providerReturned && outcome.kind !== "unknown") outcome = { kind: "unknown" };
+      this.#queueSavedResult(op, { type: "saved_resume_result", requestId: frame.requestId, outcome });
+      return;
+    }
+    if (frame.type === "saved_delete_request") {
+      let outcome: OwnerSavedDeleteFacts = isOwnerSavedDeleteFacts(facts) ? facts : { kind: "unknown" };
+      if (!providerReturned && outcome.kind !== "unknown") outcome = { kind: "unknown" };
+      this.#queueSavedResult(op, { type: "saved_delete_result", requestId: frame.requestId, outcome });
+      return;
+    }
+    this.#savedOp = null;
+  }
+
+  #queueSavedWindowResult(op: SavedOp, outcome: OwnerSavedWindowOutcome): void {
+    this.#queueSavedResult(op, { type: "saved_window_result", requestId: op.frame.requestId, outcome });
+  }
+
+  /** Encode one Saved control frame, or null (with a diagnostic) when it cannot be. */
+  #encodeSaved(frame: RosterBridgeFrame): Buffer | null {
+    try {
+      return encodeRosterBridgeFrame(frame, this.#bounds);
+    } catch {
+      this.#diagnostic("saved_reply_dropped");
+      return null;
+    }
+  }
+
+  /**
+   * Queue the accepted operation's own fixed result for the shared send slot. The
+   * operation keeps the channel's one Saved slot until this result is handed to
+   * the transport, so at most one such result ever waits and a newer request in
+   * the meantime is refused `busy` rather than accumulating writes.
+   */
+  #queueSavedResult(op: SavedOp, frame: RosterBridgeFrame): void {
+    const bytes = this.#encodeSaved(frame);
+    if (bytes === null) {
+      if (this.#savedOp === op) this.#savedOp = null;
+      this.#drain();
+      return;
+    }
+    // Reads are answered under transport/binding authorization; a resume or
+    // delete result additionally needs its exact run to still be current.
+    this.#savedResult = { op, hostRunId: op.frame.hostRunId, requireRun: op.kind !== "read", bytes };
+    this.#drain();
+  }
+
+  /**
+   * Queue one fixed pre-invocation refusal for exactly this request id. At most
+   * one refusal waits for the shared send slot; while it waits, any further
+   * refusal is dropped (the requester then learns `unknown` from its own finite
+   * deadline), so a flood of rejected requests can never accumulate writes.
+   */
+  #writeSavedRefusal(
+    frame: RosterBridgeSavedRequestFrame,
+    reason: "admission" | "duplicate" | "stale" | "busy" | "policy",
+  ): void {
+    this.#diagnostic("saved_refused");
+    if (this.#savedRefusal !== null) {
+      this.#diagnostic("saved_reply_dropped");
+      return;
+    }
+    let refusal: RosterBridgeFrame;
+    switch (frame.type) {
+      case "saved_resume_request":
+        refusal = { type: "saved_resume_result", requestId: frame.requestId, outcome: { kind: "refused", reason } };
+        break;
+      case "saved_delete_request":
+        refusal = { type: "saved_delete_result", requestId: frame.requestId, outcome: { kind: "refused", reason } };
+        break;
+      default:
+        // Delete policy never applies to a read.
+        refusal = {
+          type: "saved_window_result",
+          requestId: frame.requestId,
+          outcome: { kind: "refused", reason: reason === "policy" ? "admission" : reason },
+        };
+    }
+    const bytes = this.#encodeSaved(refusal);
+    if (bytes === null) return;
+    this.#savedRefusal = bytes;
+    this.#drain();
+  }
+
+  #savedControlPending(): boolean {
+    return this.#savedResult !== null || this.#savedRefusal !== null || this.#savedPolicyDirty;
+  }
+
+  /**
+   * Write the next Saved control frame through the shared send slot: the
+   * accepted operation's result first, then the one waiting refusal, then a
+   * coalesced policy publication. Authorization (and, for a resume/delete
+   * result, the exact run) is re-proved at the actual write; because the
+   * authorizer is owner code, an item that another reentrant pump claimed in the
+   * meantime is left to it.
+   */
+  #pumpSavedControl(): void {
+    const result = this.#savedResult;
+    if (result !== null) {
+      const deliverable = result.requireRun
+        ? this.#savedStillAuthorized(result.hostRunId)
+        : this.#savedBindingAuthorized();
+      if (this.#sending || this.#savedResult !== result) return;
+      this.#savedResult = null;
+      // The operation's slot is released as its result is handed to the transport.
+      if (this.#savedOp === result.op) this.#savedOp = null;
+      if (!deliverable) {
+        this.#diagnostic(this.#createBindingIsLive() ? "saved_refused" : "saved_reply_dropped");
+        void this.#pump();
+        return;
+      }
+      this.#sendSavedControl(result.bytes, () => this.#diagnostic("saved_reply_dropped"));
+      return;
+    }
+    const refusal = this.#savedRefusal;
+    if (refusal !== null) {
+      const deliverable = this.#savedBindingAuthorized();
+      if (this.#sending || this.#savedRefusal !== refusal) return;
+      this.#savedRefusal = null;
+      if (!deliverable) {
+        this.#diagnostic(this.#createBindingIsLive() ? "saved_refused" : "saved_reply_dropped");
+        void this.#pump();
+        return;
+      }
+      this.#sendSavedControl(refusal, () => this.#diagnostic("saved_reply_dropped"));
+      return;
+    }
+    if (this.#savedPolicyDirty) this.#dispatchSavedPolicy();
+  }
+
+  /**
+   * One Saved control write holding the shared send slot. A failed write drops
+   * that one answer — exactly as a Close or Create result write does — and never
+   * claims the operation did not happen; the slot is released either way.
+   */
+  #sendSavedControl(bytes: Buffer, onFailed: () => void): void {
+    this.#sending = true;
+    this.#savedTurn = false;
+    let written: Promise<void>;
+    try {
+      written = this.#channel.send(bytes);
+    } catch {
+      written = Promise.reject(new Error("send rejected"));
+    }
+    void written.then(() => {
+      this.#sending = false;
+      this.#drain();
+    }, () => {
+      this.#sending = false;
+      onFailed();
+      this.#drain();
+    });
+  }
+
+  /**
+   * Send the next frame of the one in-flight Saved window through the roster's
+   * single send slot. The transport, binding, and exact run are re-proved
+   * immediately before EVERY frame; a lost proof discards the rest of this window
+   * silently (no frame is written), and the requester learns `unknown` from its
+   * own finite deadline. The channel's one Saved slot is released once the final
+   * frame is handed to the transport.
+   */
+  #pumpSaved(transfer: SavedTransfer): void {
+    if (transfer.index >= transfer.frames.length) {
+      if (this.#savedTransfer === transfer) this.#savedTransfer = null;
+      void this.#pump();
+      return;
+    }
+    if (!this.#savedStillAuthorized(transfer.hostRunId)) {
+      if (this.#savedTransfer === transfer) {
+        this.#savedTransfer = null;
+        if (this.#savedOp === transfer.op) this.#savedOp = null;
+      }
+      this.#diagnostic("saved_reply_dropped");
+      void this.#pump();
+      return;
+    }
+    // The authorizer is owner code: it may have replaced this transfer or claimed
+    // the send slot. Whoever holds the slot now resumes the work when it settles.
+    if (this.#sending || this.#savedTransfer !== transfer) return;
+    const bytes = transfer.frames[transfer.index];
+    if (transfer.index === transfer.frames.length - 1 && this.#savedOp === transfer.op) this.#savedOp = null;
+    this.#sending = true;
+    this.#savedTurn = false;
+    let written: Promise<void>;
+    try {
+      written = this.#channel.send(bytes);
+    } catch {
+      written = Promise.reject(new Error("send rejected"));
+    }
+    void written.then(() => {
+      this.#sending = false;
+      if (this.#savedTransfer !== transfer) {
+        // Superseded or retired while writing; this write still frees the slot.
+        this.#drain();
+        return;
+      }
+      transfer.index += 1;
+      if (transfer.index >= transfer.frames.length) {
+        this.#savedTransfer = null;
+        this.#diagnostic("saved_window_sent", { rows: transfer.rows, pages: transfer.pageCount });
+      }
+      this.#drain();
+    }, () => {
+      this.#sending = false;
+      if (this.#savedTransfer !== transfer) {
+        this.#drain();
+        return;
+      }
+      this.#savedTransfer = null;
+      if (this.#savedOp === transfer.op) this.#savedOp = null;
+      this.#diagnostic("send_failed");
+      // A failed write breaks ordering for every frame behind it, exactly as for a
+      // roster frame: the channel is closed through its bounded API.
+      this.#terminateSubscription("send_failed", "send_failed", { closeChannel: true });
+    });
+  }
+
+  /**
+   * Dispatch one coalesced policy publication for this binding's current run: only
+   * when Saved was negotiated, the subscription is live, and its run has a
+   * complete published snapshot. The live policy is read HERE, at the actual
+   * write, under a fresh generation: a reentrant notification during that read or
+   * the authorizer callout supersedes this dispatch (it never writes the older
+   * value), and an unchanged value is not re-sent. Description only — the server
+   * re-checks the live policy itself on every delete.
+   */
+  #dispatchSavedPolicy(): void {
+    this.#savedPolicyDirty = false;
+    const hostRunId = this.#subscriptionRun;
+    if (!this.#savedNegotiated()
+      || hostRunId === null
+      || !this.#savedRunCurrent(hostRunId)
+      || this.#publishedRun !== hostRunId) {
+      void this.#pump();
+      return;
+    }
+    this.#policyGeneration += 1;
+    const generation = this.#policyGeneration;
+    const deleteExposed = this.#readDeleteExposed();
+    // A nested dispatch already handled a newer read: this one is obsolete.
+    if (generation !== this.#policyGeneration) return;
+    if (this.#sending) {
+      // Still the current publication, but other work (for example a roster
+      // transfer the policy callback triggered) took the slot meanwhile: keep the
+      // publication queued so it is dispatched, read fresh, once the slot frees.
+      this.#savedPolicyDirty = true;
+      return;
+    }
+    const authorized = this.#savedStillAuthorized(hostRunId) && this.#publishedRun === hostRunId;
+    if (generation !== this.#policyGeneration) return;
+    if (this.#sending) {
+      this.#savedPolicyDirty = true;
+      return;
+    }
+    if (!authorized || this.#savedPolicyDirty) {
+      // Unauthorized: nothing is described. Re-notified meanwhile: the pump
+      // dispatches a fresh read instead of this possibly older one.
+      void this.#pump();
+      return;
+    }
+    const sent = this.#policySent;
+    if (sent !== null && sent.hostRunId === hostRunId && sent.deleteExposed === deleteExposed) {
+      void this.#pump();
+      return;
+    }
+    const bytes = this.#encodeSaved({ type: "saved_policy", hostRunId, deleteExposed });
+    if (bytes === null) {
+      void this.#pump();
+      return;
+    }
+    const record = Object.freeze({ hostRunId, deleteExposed });
+    this.#policySent = record;
+    this.#sendSavedControl(bytes, () => {
+      if (this.#policySent === record) this.#policySent = null;
+      this.#diagnostic("saved_reply_dropped");
+    });
+    this.#diagnostic("saved_policy_sent");
+  }
+
   #onInventory(snapshot: OwningHostInventorySnapshot | undefined): void {
     if (this.#installing) {
       // Nothing is published or sent yet: retain the newest observation (or the
@@ -836,13 +1680,17 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    */
   #drain(): void {
     if (this.#sending) return;
-    if (this.#state !== "subscribed" || this.#fenced) return;
-    if (this.#transfer === null) {
+    if (this.#state === "finished" || this.#fenced) return;
+    if (this.#state === "subscribed" && this.#transfer === null) {
       const pending = this.#pending;
-      if (pending === null) return;
-      this.#pending = null;
-      this.#beginTransfer(pending);
+      if (pending !== null) {
+        this.#pending = null;
+        this.#beginTransfer(pending);
+      }
     }
+    // Always reach the pump: Saved-only work (a window, a fixed result, a policy
+    // publication) must progress even when no roster transfer or snapshot waits.
+    // With no Saved work the pump finds nothing and the roster path is unchanged.
     void this.#pump();
   }
 
@@ -885,23 +1733,47 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     }
   }
 
-  /** Send the next frame of the one in-flight transfer, guarded immediately before it. */
+  /**
+   * Send the next frame of the one in-flight transfer, guarded immediately before
+   * it. The roster transfer and an optional Saved window share this ONE send slot;
+   * when both have frames waiting they alternate one frame at a time, so neither
+   * can starve the other and no second queue exists. With no Saved window the
+   * roster path is exactly what it always was.
+   */
   #pump(): void {
     if (this.#sending) return;
-    if (this.#state !== "subscribed" || this.#fenced) return;
-    const transfer = this.#transfer;
-    if (transfer === null) return;
-    if (transfer.index >= transfer.frames.length) {
+    if (this.#state === "finished" || this.#fenced) return;
+    const subscribed = this.#state === "subscribed";
+    const transfer = subscribed ? this.#transfer : null;
+    if (transfer !== null && transfer.index >= transfer.frames.length) {
       this.#transfer = null;
+      const firstPublication = this.#publishedRun === null;
       this.#publishedRun = transfer.hostRunId;
       this.#publishedRevision = transfer.revision;
       this.#diagnostic("snapshot_published", { rows: transfer.totalRows, pages: transfer.pageCount });
       const pending = this.#pending;
       this.#pending = null;
       if (pending !== null) this.#beginTransfer(pending);
-      if (this.#transfer !== null) void this.#pump();
+      // The first complete snapshot of a subscription is when the viewer learns
+      // the current run, so the Saved policy description for that run follows it
+      // through this same slot. Later roster publications are never Saved
+      // authority and publish nothing.
+      if (firstPublication && this.#savedNegotiated()) this.#savedPolicyDirty = true;
+      void this.#pump();
       return;
     }
+    // The Saved family (its bounded control outbox, then its window transfer)
+    // alternates with the roster transfer one frame at a time. Saved control
+    // frames do not need a subscription (a refusal can answer a request made
+    // before one); a Saved window does.
+    const savedTransfer = subscribed ? this.#savedTransfer : null;
+    const savedControl = this.#savedControlPending();
+    if ((savedControl || savedTransfer !== null) && (transfer === null || this.#savedTurn)) {
+      if (savedControl) this.#pumpSavedControl();
+      else if (savedTransfer !== null) this.#pumpSaved(savedTransfer);
+      return;
+    }
+    if (transfer === null) return;
     // Authorization is re-checked before every protected write, including a
     // page or end frame queued before a revocation.
     if (!this.#authorized()) {
@@ -909,7 +1781,15 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       this.#terminateSubscription("not_authorized", "authorization_refused");
       return;
     }
+    // The authorizer is owner code: it may reenter the pump (for example through
+    // a Saved policy notification) and take the slot, or retire this transfer.
+    // Whoever now owns the slot resumes this work when its write settles.
+    if (this.#sending
+      || this.#state !== "subscribed"
+      || this.#fenced
+      || this.#transfer !== transfer) return;
     this.#sending = true;
+    this.#savedTurn = true;
     let written: Promise<void>;
     try {
       written = this.#channel.send(transfer.frames[transfer.index]);
@@ -962,6 +1842,11 @@ class OwnerBinding implements RosterBridgeChannelBinding {
         // Retirement is best effort and never load-bearing for a session.
       }
     }
+    // Saved reads are tied to the live subscription's run, so they end with it.
+    // An accepted resume or delete is NOT touched: it keeps running under the
+    // owner's own lifecycle. The next subscription republishes its own policy.
+    this.#policySent = null;
+    this.#abortSavedRead();
   }
 
   #terminateSubscription(
@@ -1022,6 +1907,13 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       // reason: an accepted create keeps running under Main's launch lifecycle, and
       // its result is dropped rather than claimed after this binding is gone.
       this.#inflightCreate = null;
+      // Saved bookkeeping is network-delivery bookkeeping too: a pending resume or
+      // delete keeps running under the owner's lifecycle and its result is dropped.
+      this.#savedOp = null;
+      this.#savedTransfer = null;
+      this.#savedResult = null;
+      this.#savedRefusal = null;
+      this.#savedPolicyDirty = false;
       if (this.#state !== "finished") {
         // An owner-initiated stop tells the viewer its observations are no
         // longer current; it never fabricates an empty roster.
@@ -1030,6 +1922,18 @@ class OwnerBinding implements RosterBridgeChannelBinding {
         }
         this.#state = "finished";
         if (reason === "stopped") this.#diagnostic("binding_stopped");
+      }
+      // The binding owns its one view and releases it here. Disposal releases
+      // read/resource state only and never cancels accepted resume/delete work.
+      const view = this.#savedView;
+      this.#savedView = null;
+      this.#savedViewDisposed = true;
+      if (view !== null) {
+        try {
+          view.dispose();
+        } catch {
+          // Disposal is best effort.
+        }
       }
       const detach = this.#detach;
       this.#detach = null;
@@ -1123,6 +2027,17 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
     // No implicit policy: without an explicit authorizer no metadata is written.
     throw new TypeError("roster metadata host requires an explicit peer authorizer");
   }
+  // The Saved pair is all-or-nothing: a view without a live delete policy (or the
+  // reverse) is a partial configuration and is refused rather than defaulted.
+  const savedView = options.savedCatalogView;
+  const savedPolicy = options.remoteHistoryDeleteExposed;
+  let saved: SavedProviders | null = null;
+  if (savedView !== undefined || savedPolicy !== undefined) {
+    if (typeof savedView !== "function" || typeof savedPolicy !== "function") {
+      throw new TypeError("roster metadata host requires a Saved view factory and a live delete policy together");
+    }
+    saved = Object.freeze({ createView: savedView, deleteExposed: savedPolicy });
+  }
   const bounds = resolveRosterBridgeBounds(options.bounds);
   const bindings = new Set<OwnerBinding>();
   let diagnosticsEnabled = true;
@@ -1147,7 +2062,7 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
       }
       const binding = new OwnerBinding(channel, options, bounds, diagnostic, () => {
         bindings.delete(binding);
-      });
+      }, saved);
       bindings.add(binding);
       void binding.closed.then(() => {
         bindings.delete(binding);
@@ -1166,6 +2081,17 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
       const current = [...bindings];
       bindings.clear();
       await Promise.allSettled(current.map((binding) => binding.stop()));
+    },
+    notifySavedPolicy(): void {
+      if (saved === null) return;
+      // The EXISTING bindings only: no registry, observer list, or replay.
+      for (const binding of [...bindings]) {
+        try {
+          binding.notifySavedPolicy();
+        } catch {
+          // One binding's failure never blocks another's publication.
+        }
+      }
     },
   };
   return host;

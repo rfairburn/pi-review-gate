@@ -63,6 +63,23 @@
  * channel and a second is refused rather than queued, evicted, or retargeted; a
  * lost reply or an elapsed deadline is `unknown` and is never retried, replayed,
  * cancelled, or turned into a local row.
+ *
+ * The optional Saved catalog exchange rides the same channel, and only when the
+ * caller explicitly offered and the owner acknowledged
+ * {@link ROSTER_BRIDGE_SAVED_CAPABILITY}. {@link RosterBridgeViewer.saved} names
+ * the exact current owner run of this live subscription (an empty roster is
+ * fine), uses one fresh correlation id and the channel's shared strictly
+ * increasing Saved attempt number, and answers with the same three-way fixed
+ * result union. One Saved operation is pending per channel: a newer read
+ * supersedes an older read (which settles `unknown`), while a resume or delete is
+ * never superseded, and anything else is refused `busy` before submission. A
+ * window is accepted only when it matches this side's own pending request (same
+ * run; same catalog for search; same catalog and result for window; same offset),
+ * states a coherent full total, makes progress, and arrives as an exact
+ * begin/page/end sequence with unique ids inside the existing bounds; anything
+ * else fails closed. The owner's delete policy is only described here
+ * (`saved.policy`), starts unknown, and returns to unknown whenever the
+ * subscription or channel ends; it never grants anything.
  */
 
 import { randomUUID } from "node:crypto";
@@ -74,6 +91,22 @@ import {
   type OwnerCreateRequest,
   type PeerCreateResult,
 } from "./peer-create";
+import {
+  isOwnerSavedQuery,
+  isOwnerSavedScalar,
+  type OwnerSavedDeleteFacts,
+  type OwnerSavedDeleteRequest,
+  type OwnerSavedEntry,
+  type OwnerSavedListRequest,
+  type OwnerSavedPolicy,
+  type OwnerSavedResumeFacts,
+  type OwnerSavedResumeRequest,
+  type OwnerSavedSearchRequest,
+  type OwnerSavedWindowFacts,
+  type OwnerSavedWindowRequest,
+  type PeerSavedResult,
+  type PeerSavedSendOptions,
+} from "./peer-saved";
 import type { RemoteSessionMetadata } from "./roster-metadata";
 import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
@@ -81,8 +114,10 @@ import {
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
+  ROSTER_BRIDGE_SAVED_CAPABILITY,
   ROSTER_BRIDGE_SERVICE,
   decodeRosterBridgeFrame,
+  decodeRosterBridgeSavedEntryText,
   encodeRosterBridgeFrame,
   isRosterBridgeIdentifier,
   resolveRosterBridgeBounds,
@@ -92,6 +127,15 @@ import {
   type RosterBridgeCreateResultFrame,
   type RosterBridgeErrorCode,
   type RosterBridgeFrame,
+  type RosterBridgeSavedDeleteResultFrame,
+  type RosterBridgeSavedPolicyFrame,
+  type RosterBridgeSavedRequestFrame,
+  type RosterBridgeSavedResumeResultFrame,
+  type RosterBridgeSavedWindowBeginFrame,
+  type RosterBridgeSavedWindowEndFrame,
+  type RosterBridgeSavedWindowFragmentFrame,
+  type RosterBridgeSavedWindowPageFrame,
+  type RosterBridgeSavedWindowResultFrame,
 } from "./roster-bridge-protocol";
 
 /** Whether the projected rows are authoritative now, known to be absent, or merely last seen. */
@@ -197,6 +241,36 @@ export interface RosterBridgeViewerOptions {
   readonly capabilities?: readonly string[];
   readonly onProjection?: (projection: RosterBridgeProjection) => void;
   readonly onDiagnostic?: RosterBridgeViewerDiagnosticSink;
+  /**
+   * Notified when the owner's described Saved delete policy changes, including
+   * back to `undefined` (unknown) when the subscription or channel ends. A plain
+   * callback on the existing consumer, never an observer registry, and never
+   * authority: the owner re-checks its live policy on every delete.
+   */
+  readonly onSavedPolicy?: (policy: OwnerSavedPolicy | undefined) => void;
+}
+
+/**
+ * The viewer's optional Saved catalog surface. Every method never throws and
+ * never surfaces a raw error: it answers `owner-result`, a positively `not-sent`
+ * refusal, or `unknown`. `options.stillCurrent` is the caller's own last-instant
+ * fence, evaluated synchronously at the transport write boundary. The two
+ * getters are descriptive only and grant nothing.
+ */
+export interface RosterBridgeSavedViewer {
+  /** True only when this owner acknowledged the optional Saved capability. */
+  readonly supported: boolean;
+  /**
+   * The owner's last described delete exposure for the current run, or
+   * `undefined` while unknown (initially, and after any subscription or channel
+   * end). Unknown means Delete stays hidden.
+   */
+  readonly policy: OwnerSavedPolicy | undefined;
+  list(request: OwnerSavedListRequest, options?: PeerSavedSendOptions): Promise<PeerSavedResult<OwnerSavedWindowFacts>>;
+  search(request: OwnerSavedSearchRequest, options?: PeerSavedSendOptions): Promise<PeerSavedResult<OwnerSavedWindowFacts>>;
+  window(request: OwnerSavedWindowRequest, options?: PeerSavedSendOptions): Promise<PeerSavedResult<OwnerSavedWindowFacts>>;
+  resume(request: OwnerSavedResumeRequest, options?: PeerSavedSendOptions): Promise<PeerSavedResult<OwnerSavedResumeFacts>>;
+  remove(request: OwnerSavedDeleteRequest, options?: PeerSavedSendOptions): Promise<PeerSavedResult<OwnerSavedDeleteFacts>>;
 }
 
 export interface RosterBridgeViewer {
@@ -257,6 +331,12 @@ export interface RosterBridgeViewer {
     request: OwnerCreateRequest,
     options?: { readonly stillCurrent?: () => boolean },
   ): Promise<PeerCreateResult>;
+  /**
+   * The optional Saved catalog surface. Optional on this interface so older or
+   * test viewers without it remain representable; a real viewer always supplies
+   * it, and `saved.supported` says whether this owner acknowledged it.
+   */
+  readonly saved?: RosterBridgeSavedViewer;
   /** Idempotent: unsubscribes, discards any partial transfer, and detaches. */
   stop(): Promise<void>;
   onProjection(listener: (projection: RosterBridgeProjection) => void): () => void;
@@ -294,6 +374,54 @@ interface PendingCreate {
   readonly sequence: number;
   readonly settle: (result: PeerCreateResult) => void;
   timer: NodeJS.Timeout | null;
+}
+
+type SavedRequestKind = "list" | "search" | "window" | "resume" | "delete";
+
+type PeerSavedAnyResult =
+  | PeerSavedResult<OwnerSavedWindowFacts>
+  | PeerSavedResult<OwnerSavedResumeFacts>
+  | PeerSavedResult<OwnerSavedDeleteFacts>;
+
+/** A window being staged for the one pending read; never published partially. */
+interface SavedPartialWindow {
+  readonly hostRunId: string;
+  readonly catalogId: string;
+  readonly resultId: string;
+  readonly total: number;
+  readonly issueCount: number;
+  readonly offset: number;
+  readonly rows: number;
+  readonly pageCount: number;
+  entries: OwnerSavedEntry[];
+  ids: Set<string>;
+  pageIndex: number;
+  bytes: number;
+  /** One oversized entry being reassembled from consecutive fragments, if any. */
+  fragment: { readonly parts: number; next: number; texts: string[]; bytes: number } | null;
+}
+
+/**
+ * The ONE outstanding Saved operation on this channel. `deadlineAt` is checked
+ * directly at the write boundary and on every arriving frame, so a delayed timer
+ * dispatch can never let an expired request be submitted or settled late.
+ */
+interface PendingSaved {
+  readonly requestId: string;
+  readonly kind: SavedRequestKind;
+  readonly hostRunId: string;
+  readonly catalogId: string | null;
+  readonly resultId: string | null;
+  readonly offset: number;
+  readonly count: number;
+  readonly settle: (result: PeerSavedAnyResult) => void;
+  timer: NodeJS.Timeout | null;
+  deadlineAt: number;
+  window: SavedPartialWindow | null;
+}
+
+function isSavedReadKind(kind: SavedRequestKind): boolean {
+  return kind === "list" || kind === "search" || kind === "window";
 }
 
 /** Why a write was refused before it was handed to the transport. */
@@ -454,6 +582,17 @@ class ViewerBinding implements RosterBridgeViewer {
    * channel even after a failed or timed-out attempt. A new channel starts at 0.
    */
   #createSequence = 0;
+  /** The ONE outstanding Saved operation on this channel, if any. */
+  #pendingSaved: PendingSaved | null = null;
+  /**
+   * This channel's shared Saved anti-replay high-water: advanced once per attempt
+   * and never rewound or reused. A new channel starts at 0.
+   */
+  #savedSequence = 0;
+  /** Described owner delete policy for the current run; `undefined` is unknown. */
+  #savedPolicy: OwnerSavedPolicy | undefined = undefined;
+  readonly #onSavedPolicy: ((policy: OwnerSavedPolicy | undefined) => void) | undefined;
+  readonly saved: RosterBridgeSavedViewer;
   #helloSettled = false;
   #lastComplete: { readonly hostRunId: string; readonly revision: number; readonly subscriptionId: string } | null = null;
   #startTimer: NodeJS.Timeout | null = null;
@@ -472,6 +611,26 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#bounds = bounds;
     this.#diagnostic = diagnostic;
     this.peerKey = options.channel.peerKey;
+    this.#onSavedPolicy = typeof options.onSavedPolicy === "function" ? options.onSavedPolicy : undefined;
+    const binding = this;
+    this.saved = Object.freeze({
+      get supported(): boolean {
+        return binding.#savedSupported();
+      },
+      get policy(): OwnerSavedPolicy | undefined {
+        return binding.#savedPolicy;
+      },
+      list: (request: OwnerSavedListRequest, options?: PeerSavedSendOptions) =>
+        binding.#submitSaved<OwnerSavedWindowFacts>("list", request, options),
+      search: (request: OwnerSavedSearchRequest, options?: PeerSavedSendOptions) =>
+        binding.#submitSaved<OwnerSavedWindowFacts>("search", request, options),
+      window: (request: OwnerSavedWindowRequest, options?: PeerSavedSendOptions) =>
+        binding.#submitSaved<OwnerSavedWindowFacts>("window", request, options),
+      resume: (request: OwnerSavedResumeRequest, options?: PeerSavedSendOptions) =>
+        binding.#submitSaved<OwnerSavedResumeFacts>("resume", request, options),
+      remove: (request: OwnerSavedDeleteRequest, options?: PeerSavedSendOptions) =>
+        binding.#submitSaved<OwnerSavedDeleteFacts>("delete", request, options),
+    });
     const extra = options.capabilities === undefined ? [] : [...new Set(options.capabilities)];
     // The required baseline and every capability this implementation knows are
     // offered first, and the list is deduplicated: a caller that repeats one must
@@ -847,6 +1006,486 @@ class ViewerBinding implements RosterBridgeViewer {
     if (pending !== null) this.#settleCreate(pending, { kind: "unknown" });
   }
 
+  // ------------------------------------------------------------------ saved
+
+  #savedSupported(): boolean {
+    return this.#capabilities.includes(ROSTER_BRIDGE_SAVED_CAPABILITY);
+  }
+
+  /**
+   * The exact owner run this side currently observes: a live subscription whose
+   * own complete snapshot (possibly with zero rows) named this run. A run is never
+   * guessed, substituted, or carried across a subscription boundary.
+   */
+  #savedRunCurrent(hostRunId: string): boolean {
+    const last = this.#lastComplete;
+    return this.#state === "subscribed"
+      && this.#subscriptionId !== null
+      && this.#subscriptionRun === hostRunId
+      && last !== null
+      && last.subscriptionId === this.#subscriptionId
+      && last.hostRunId === hostRunId;
+  }
+
+  /**
+   * Strict local validation of one Saved request before anything is encoded.
+   * Identifiers must be carryable opaque ids, the query must be well-formed
+   * Unicode (never trimmed or normalized), offsets are safe non-negative
+   * integers, and a window size is 1..maxSnapshotRows.
+   */
+  #readSavedRequest(kind: SavedRequestKind, request: unknown): RosterBridgeSavedRequestFrame | null {
+    if (typeof request !== "object" || request === null || Array.isArray(request)) return null;
+    const record = request as Record<string, unknown>;
+    const id = (key: string): string | null => {
+      const value = record[key];
+      return isRosterBridgeIdentifier(value, this.#bounds) ? value : null;
+    };
+    const hostRunId = id("hostRunId");
+    if (hostRunId === null) return null;
+    const offset = record.offset;
+    const count = record.count;
+    const windowOk = (): boolean => isOwnerSavedScalar(offset)
+      && typeof count === "number"
+      && Number.isSafeInteger(count)
+      && count >= 1
+      && count <= this.#bounds.maxSnapshotRows;
+    // Placeholder correlation values; the real ones are filled in at submission.
+    const requestId = "pending";
+    const sequence = 1;
+    switch (kind) {
+      case "list": {
+        const query = record.query;
+        if (!isOwnerSavedQuery(query) || !windowOk()) return null;
+        return {
+          type: "saved_list_request", requestId, hostRunId, query,
+          offset: offset as number, count: count as number, sequence,
+        };
+      }
+      case "search": {
+        const catalogId = id("catalogId");
+        const query = record.query;
+        if (catalogId === null || !isOwnerSavedQuery(query) || !windowOk()) return null;
+        return {
+          type: "saved_search_request", requestId, hostRunId, catalogId, query,
+          offset: offset as number, count: count as number, sequence,
+        };
+      }
+      case "window": {
+        const catalogId = id("catalogId");
+        const resultId = id("resultId");
+        if (catalogId === null || resultId === null || !windowOk()) return null;
+        return {
+          type: "saved_window_request", requestId, hostRunId, catalogId, resultId,
+          offset: offset as number, count: count as number, sequence,
+        };
+      }
+      case "resume": {
+        const catalogId = id("catalogId");
+        const resultId = id("resultId");
+        const entryId = id("entryId");
+        if (catalogId === null || resultId === null || entryId === null) return null;
+        return { type: "saved_resume_request", requestId, hostRunId, catalogId, resultId, entryId, sequence };
+      }
+      case "delete": {
+        const catalogId = id("catalogId");
+        const resultId = id("resultId");
+        const entryId = id("entryId");
+        const confirmed = record.confirmed;
+        if (catalogId === null || resultId === null || entryId === null || typeof confirmed !== "boolean") return null;
+        return {
+          type: "saved_delete_request", requestId, hostRunId, catalogId, resultId, entryId, confirmed, sequence,
+        };
+      }
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Submit one Saved request. Every refusal before the transport write is
+   * positively `not-sent`; once `send` was invoked the only honest answers are the
+   * owner's own outcome or `unknown`. A newer read supersedes an older read (which
+   * settles `unknown`); a pending resume or delete is never superseded, so any
+   * colliding request is refused `busy` without being queued. Each attempt takes
+   * the next number from the channel's shared Saved high-water, which is never
+   * rewound, and nothing is ever retried, replayed, or cancelled.
+   */
+  #submitSaved<Outcome>(
+    kind: SavedRequestKind,
+    request: unknown,
+    options: PeerSavedSendOptions | undefined,
+  ): Promise<PeerSavedResult<Outcome>> {
+    if (this.#controlRefusalReason() !== null) return Promise.resolve({ kind: "not-sent", reason: "not-ready" });
+    if (!this.#savedSupported()) return Promise.resolve({ kind: "not-sent", reason: "capability-unsupported" });
+    const shape = this.#readSavedRequest(kind, request);
+    if (shape === null) return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    if (!this.#savedRunCurrent(shape.hostRunId)) return Promise.resolve({ kind: "not-sent", reason: "target-unavailable" });
+    const existing = this.#pendingSaved;
+    if (existing !== null && !(isSavedReadKind(kind) && isSavedReadKind(existing.kind))) {
+      return Promise.resolve({ kind: "not-sent", reason: "busy" });
+    }
+    if (this.#savedSequence >= Number.MAX_SAFE_INTEGER) return Promise.resolve({ kind: "not-sent", reason: "limit" });
+    const sequence = this.#savedSequence + 1;
+    const requestId = randomUUID();
+    const frame: RosterBridgeSavedRequestFrame = { ...shape, requestId, sequence };
+    try {
+      // The ONLY size bound on a query is that this one frame fits the lane.
+      encodeRosterBridgeFrame(frame, this.#bounds);
+    } catch {
+      return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    }
+    // The older read is superseded: it can no longer settle with owner data.
+    if (existing !== null) this.#settleSaved(existing, { kind: "unknown" });
+    // Advanced now and never rewound, whatever happens to this attempt.
+    this.#savedSequence = sequence;
+    const outcome = deferred<PeerSavedResult<Outcome>>();
+    const pending: PendingSaved = {
+      requestId,
+      kind,
+      hostRunId: shape.hostRunId,
+      catalogId: shape.type === "saved_list_request" ? null : shape.catalogId,
+      resultId: shape.type === "saved_list_request" || shape.type === "saved_search_request" ? null : shape.resultId,
+      offset: "offset" in shape ? shape.offset : 0,
+      count: "count" in shape ? shape.count : 0,
+      // The pending kind fixes which outcome shape can reach this settlement.
+      settle: (result) => outcome.resolve(result as unknown as PeerSavedResult<Outcome>),
+      timer: null,
+      deadlineAt: 0,
+      window: null,
+    };
+    this.#pendingSaved = pending;
+    // The same patience class as Create for the first answer; never a retry.
+    this.#armSavedDeadline(pending, this.#bounds.createResultTimeoutMs);
+    const stillCurrent = options?.stillCurrent;
+    const lifetime = (): ViewerSendRefusal | null => {
+      if (this.#stopRequested || this.#state === "detached" || this.#state === "failed") return "not-ready";
+      if (this.#pendingSaved !== pending) return "not-ready";
+      // Checked directly, not only through the timer: a delayed timer dispatch can
+      // never let an expired request reach the transport.
+      if (Date.now() > pending.deadlineAt) return "not-ready";
+      if (!this.#savedRunCurrent(pending.hostRunId)) return "target-unavailable";
+      return null;
+    };
+    const gate: ViewerSendGate = () => {
+      const before = lifetime();
+      if (before !== null) return { allow: false, reason: before };
+      if (stillCurrent !== undefined) {
+        try {
+          if (stillCurrent() !== true) return { allow: false, reason: "target-unavailable" };
+        } catch {
+          return { allow: false, reason: "target-unavailable" };
+        }
+        // The caller's fence is arbitrary code: re-prove this side's own facts after it.
+        const after = lifetime();
+        if (after !== null) return { allow: false, reason: after };
+      }
+      return { allow: true };
+    };
+    void this.#queueSend(frame, gate).then((written) => {
+      if (written.ok) return;
+      if (!written.sent) {
+        this.#settleSaved(pending, { kind: "not-sent", reason: written.reason });
+        return;
+      }
+      // Invoked and then rejected: the owner may still have accepted it.
+      this.#settleSaved(pending, { kind: "unknown" });
+    });
+    return outcome.promise;
+  }
+
+  #armSavedDeadline(pending: PendingSaved, ms: number): void {
+    if (pending.timer !== null) clearTimeout(pending.timer);
+    pending.deadlineAt = Date.now() + ms;
+    pending.timer = this.#arm(null, ms, () => {
+      pending.timer = null;
+      // Requester patience only: the owner's operation is not cancelled, and
+      // nothing is re-sent on its behalf.
+      this.#settleSaved(pending, { kind: "unknown" });
+    });
+  }
+
+  /** Settle the one pending Saved operation exactly once and release its timer. */
+  #settleSaved(pending: PendingSaved, result: PeerSavedAnyResult): void {
+    if (this.#pendingSaved !== pending) return;
+    this.#pendingSaved = null;
+    if (pending.timer !== null) {
+      clearTimeout(pending.timer);
+      pending.timer = null;
+    }
+    pending.window = null;
+    pending.settle(result);
+  }
+
+  /** Lost channels and stops are never replayed: the pending operation is unknown. */
+  #settleAllSaved(): void {
+    const pending = this.#pendingSaved;
+    if (pending !== null) this.#settleSaved(pending, { kind: "unknown" });
+  }
+
+  /**
+   * The live subscription ended: its run is no longer observed, so a pending read
+   * (which the owner abandons with that subscription) is unknown and the policy
+   * description returns to unknown. A pending resume or delete keeps waiting for
+   * its own correlated answer or deadline.
+   */
+  #endSavedObservation(): void {
+    const pending = this.#pendingSaved;
+    if (pending !== null && isSavedReadKind(pending.kind)) this.#settleSaved(pending, { kind: "unknown" });
+    this.#setSavedPolicy(undefined);
+  }
+
+  #setSavedPolicy(policy: OwnerSavedPolicy | undefined): void {
+    const previous = this.#savedPolicy;
+    if (previous === policy) return;
+    if (previous !== undefined
+      && policy !== undefined
+      && previous.hostRunId === policy.hostRunId
+      && previous.deleteExposed === policy.deleteExposed) return;
+    this.#savedPolicy = policy;
+    const listener = this.#onSavedPolicy;
+    if (listener === undefined) return;
+    try {
+      listener(policy);
+    } catch {
+      // A presentation callback is never load-bearing.
+    }
+  }
+
+  /** The pending operation this frame answers, if it is still in its lifetime. */
+  #savedTarget(requestId: string): PendingSaved | null {
+    const pending = this.#pendingSaved;
+    // Unsolicited, foreign, superseded, or already-settled ids resolve nothing.
+    if (pending === null || pending.requestId !== requestId) return null;
+    if (Date.now() > pending.deadlineAt) {
+      // Expired even if its timer has not been dispatched yet.
+      this.#settleSaved(pending, { kind: "unknown" });
+      return null;
+    }
+    return pending;
+  }
+
+  /** Incoherent data for this side's own pending request fails closed. */
+  #savedViolation(pending: PendingSaved): void {
+    this.#settleSaved(pending, { kind: "unknown" });
+    this.#protocolFailure();
+  }
+
+  #onSavedFrame(frame:
+    | RosterBridgeSavedWindowResultFrame
+    | RosterBridgeSavedWindowBeginFrame
+    | RosterBridgeSavedWindowPageFrame
+    | RosterBridgeSavedWindowFragmentFrame
+    | RosterBridgeSavedWindowEndFrame
+    | RosterBridgeSavedResumeResultFrame
+    | RosterBridgeSavedDeleteResultFrame
+    | RosterBridgeSavedPolicyFrame): void {
+    if (frame.type === "saved_policy") {
+      // A description for a run this side does not currently observe is stale
+      // and is dropped; it can never become the current description.
+      if (!this.#savedRunCurrent(frame.hostRunId)) return;
+      this.#setSavedPolicy(Object.freeze({ hostRunId: frame.hostRunId, deleteExposed: frame.deleteExposed }));
+      return;
+    }
+    const pending = this.#savedTarget(frame.requestId);
+    if (pending === null) return;
+    switch (frame.type) {
+      case "saved_window_result":
+        if (!isSavedReadKind(pending.kind)) {
+          this.#savedViolation(pending);
+          return;
+        }
+        // A fixed answer, before or instead of a transfer; nothing staged survives.
+        this.#settleSaved(pending, { kind: "owner-result", outcome: frame.outcome });
+        return;
+      case "saved_window_begin":
+        this.#onSavedWindowBegin(pending, frame);
+        return;
+      case "saved_window_page":
+        this.#onSavedWindowPage(pending, frame);
+        return;
+      case "saved_window_fragment":
+        this.#onSavedWindowFragment(pending, frame);
+        return;
+      case "saved_window_end":
+        this.#onSavedWindowEnd(pending, frame);
+        return;
+      case "saved_resume_result": {
+        if (pending.kind !== "resume") {
+          this.#savedViolation(pending);
+          return;
+        }
+        const facts = frame.outcome;
+        if (facts.kind === "started" && facts.hostRunId !== pending.hostRunId) {
+          // An answer about another run establishes nothing about this request.
+          this.#settleSaved(pending, { kind: "unknown" });
+          return;
+        }
+        this.#settleSaved(pending, { kind: "owner-result", outcome: facts });
+        return;
+      }
+      case "saved_delete_result":
+        if (pending.kind !== "delete") {
+          this.#savedViolation(pending);
+          return;
+        }
+        this.#settleSaved(pending, { kind: "owner-result", outcome: frame.outcome });
+        return;
+      default:
+        return;
+    }
+  }
+
+  #onSavedWindowBegin(pending: PendingSaved, frame: RosterBridgeSavedWindowBeginFrame): void {
+    if (!isSavedReadKind(pending.kind) || pending.window !== null) {
+      this.#savedViolation(pending);
+      return;
+    }
+    if (frame.hostRunId !== pending.hostRunId
+      // A search keeps its catalog; a window keeps its catalog AND result. A list
+      // may legitimately name a fresh catalog and result.
+      || (pending.kind !== "list" && frame.catalogId !== pending.catalogId)
+      || (pending.kind === "window" && frame.resultId !== pending.resultId)
+      || frame.offset !== pending.offset
+      || frame.rows > pending.count
+      // A non-empty remainder must make progress: a response can never present a
+      // non-empty result as an empty window.
+      || (frame.offset < frame.total && frame.rows === 0)) {
+      this.#savedViolation(pending);
+      return;
+    }
+    pending.window = {
+      hostRunId: frame.hostRunId,
+      catalogId: frame.catalogId,
+      resultId: frame.resultId,
+      total: frame.total,
+      issueCount: frame.issueCount,
+      offset: frame.offset,
+      rows: frame.rows,
+      pageCount: frame.pageCount,
+      entries: [],
+      ids: new Set<string>(),
+      pageIndex: 0,
+      bytes: 0,
+      fragment: null,
+    };
+    this.#armSavedDeadline(pending, this.#bounds.transferIdleTimeoutMs);
+  }
+
+  /**
+   * One part of one oversized entry. Parts must arrive consecutively at the next
+   * page index, exactly in order, with no page in between; the assembled text is
+   * bounded by this side's own window byte budget at every part and must decode
+   * to exactly one canonical, valid, not-yet-seen entry. Nothing is published
+   * until the whole window completes.
+   */
+  #onSavedWindowFragment(pending: PendingSaved, frame: RosterBridgeSavedWindowFragmentFrame): void {
+    const window = pending.window;
+    if (window === null || frame.pageIndex !== window.pageIndex || frame.pageIndex >= window.pageCount) {
+      this.#savedViolation(pending);
+      return;
+    }
+    let fragment = window.fragment;
+    if (fragment === null) {
+      if (frame.part !== 0 || window.entries.length >= window.rows) {
+        this.#savedViolation(pending);
+        return;
+      }
+      fragment = { parts: frame.parts, next: 0, texts: [], bytes: 0 };
+    } else if (frame.parts !== fragment.parts || frame.part !== fragment.next) {
+      this.#savedViolation(pending);
+      return;
+    }
+    const bytes = fragment.bytes + Buffer.byteLength(frame.text, "utf8");
+    if (window.bytes + bytes > this.#bounds.maxSnapshotBytes) {
+      // Beyond this side's own window budget: nothing staged is ever used.
+      this.#settleSaved(pending, { kind: "unknown" });
+      return;
+    }
+    fragment.texts.push(frame.text);
+    fragment.bytes = bytes;
+    fragment.next += 1;
+    window.fragment = fragment;
+    window.pageIndex += 1;
+    if (fragment.next === fragment.parts) {
+      window.fragment = null;
+      let entry: OwnerSavedEntry;
+      try {
+        entry = decodeRosterBridgeSavedEntryText(fragment.texts.join(""), this.#bounds);
+      } catch {
+        this.#savedViolation(pending);
+        return;
+      }
+      if (window.ids.has(entry.entryId)) {
+        this.#savedViolation(pending);
+        return;
+      }
+      window.entries.push(entry);
+      window.ids.add(entry.entryId);
+      window.bytes += fragment.bytes;
+    }
+    this.#armSavedDeadline(pending, this.#bounds.transferIdleTimeoutMs);
+  }
+
+  #onSavedWindowPage(pending: PendingSaved, frame: RosterBridgeSavedWindowPageFrame): void {
+    const window = pending.window;
+    if (window === null
+      || window.fragment !== null
+      || frame.pageIndex !== window.pageIndex
+      || frame.pageIndex >= window.pageCount
+      || frame.entries.length === 0) {
+      this.#savedViolation(pending);
+      return;
+    }
+    const fresh = new Set<string>();
+    let bytes = window.bytes;
+    for (const entry of frame.entries) {
+      if (window.entries.length + fresh.size >= window.rows
+        || window.ids.has(entry.entryId)
+        || fresh.has(entry.entryId)) {
+        this.#savedViolation(pending);
+        return;
+      }
+      fresh.add(entry.entryId);
+      bytes += Buffer.byteLength(JSON.stringify(entry), "utf8");
+    }
+    if (bytes > this.#bounds.maxSnapshotBytes) {
+      // Beyond this side's own aggregate bound: nothing staged is ever used.
+      this.#settleSaved(pending, { kind: "unknown" });
+      return;
+    }
+    for (const entry of frame.entries) {
+      window.entries.push(entry);
+      window.ids.add(entry.entryId);
+    }
+    window.bytes = bytes;
+    window.pageIndex += 1;
+    this.#armSavedDeadline(pending, this.#bounds.transferIdleTimeoutMs);
+  }
+
+  #onSavedWindowEnd(pending: PendingSaved, frame: RosterBridgeSavedWindowEndFrame): void {
+    const window = pending.window;
+    if (window === null
+      || window.fragment !== null
+      || frame.rows !== window.rows
+      || frame.pageCount !== window.pageCount
+      || window.pageIndex !== window.pageCount
+      || window.entries.length !== window.rows) {
+      this.#savedViolation(pending);
+      return;
+    }
+    const facts: OwnerSavedWindowFacts = Object.freeze({
+      kind: "window" as const,
+      hostRunId: window.hostRunId,
+      catalogId: window.catalogId,
+      resultId: window.resultId,
+      total: window.total,
+      issueCount: window.issueCount,
+      offset: window.offset,
+      entries: Object.freeze([...window.entries]),
+    });
+    this.#settleSaved(pending, { kind: "owner-result", outcome: facts });
+  }
+
   stop(): Promise<void> {
     if (this.#stopPromise !== null) return this.#stopPromise;
     // Recorded synchronously: a resync already waiting on a retirement cannot
@@ -856,6 +1495,8 @@ class ViewerBinding implements RosterBridgeViewer {
     // stopped viewer cannot observe an owner's answer, and nothing is replayed.
     this.#settleAllCloses();
     this.#settleAllCreates();
+    this.#settleAllSaved();
+    this.#setSavedPolicy(undefined);
     const wasAwaitingAck = this.#state === "awaiting_ack";
     this.#stopPromise = this.#awaitRetirement()
       .then(() => this.#beginRetirement("graceful", undefined, "stopped"))
@@ -951,6 +1592,8 @@ class ViewerBinding implements RosterBridgeViewer {
     failure?: RosterBridgeViewerError,
     reason?: RosterBridgeStalenessReason,
   ): Promise<void> {
+    // Whatever path ends the subscription, its run is no longer observed here.
+    this.#endSavedObservation();
     if (this.#retirement !== null) return this.#retirement;
     if (this.#state !== "subscribed" || this.#subscriptionId === null) {
       this.#transfer = null;
@@ -1067,6 +1710,21 @@ class ViewerBinding implements RosterBridgeViewer {
         return;
       case "create_result":
         this.#onCreateResult(frame);
+        return;
+      case "saved_window_result":
+      case "saved_window_begin":
+      case "saved_window_page":
+      case "saved_window_fragment":
+      case "saved_window_end":
+      case "saved_resume_result":
+      case "saved_delete_result":
+      case "saved_policy":
+        if (!this.#savedSupported()) {
+          // Never acknowledged for this channel: outside the negotiated protocol.
+          this.#protocolFailure();
+          return;
+        }
+        this.#onSavedFrame(frame);
         return;
       default:
         // The viewer sends hello, subscribe, unsubscribe, close, create, and
@@ -1287,6 +1945,8 @@ class ViewerBinding implements RosterBridgeViewer {
     // established, and nothing is replayed or guessed at.
     this.#settleAllCloses();
     this.#settleAllCreates();
+    this.#settleAllSaved();
+    this.#setSavedPolicy(undefined);
     this.#transfer = null;
     this.#subscriptionId = null;
     this.#subscriptionRun = null;
@@ -1522,6 +2182,8 @@ class ViewerBinding implements RosterBridgeViewer {
     // Nor may a close: a detached viewer observes no owner answer.
     this.#settleAllCloses();
     this.#settleAllCreates();
+    this.#settleAllSaved();
+    this.#setSavedPolicy(undefined);
     this.#detachHandler();
   }
 }

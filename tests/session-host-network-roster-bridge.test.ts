@@ -44,6 +44,7 @@ import {
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
+  ROSTER_BRIDGE_SAVED_CAPABILITY,
   ROSTER_BRIDGE_SERVICE,
   RosterBridgeProtocolError,
   buildRosterBridgeTransfer,
@@ -64,9 +65,26 @@ import {
   type RosterBridgeErrorCode,
   type RosterBridgeFrame,
   type RosterBridgeHelloFrame,
+  type RosterBridgeSavedDeleteRequestFrame,
+  type RosterBridgeSavedListRequestFrame,
+  type RosterBridgeSavedResumeRequestFrame,
 } from "../src/session-host/network/roster-bridge-protocol";
 import type { OwnerCloseFacts, OwnerCloseHandler, OwnerCloseRequest } from "../src/session-host/network/peer-close";
 import type { OwnerCreateFacts, OwnerCreateHandler, OwnerCreateRequest } from "../src/session-host/network/peer-create";
+import type {
+  OwnerSavedAuthorizationGuard,
+  OwnerSavedCatalogView,
+  OwnerSavedDeleteFacts,
+  OwnerSavedDeleteRequest,
+  OwnerSavedEntry,
+  OwnerSavedListRequest,
+  OwnerSavedPolicy,
+  OwnerSavedResumeFacts,
+  OwnerSavedResumeRequest,
+  OwnerSavedSearchRequest,
+  OwnerSavedWindowFacts,
+  OwnerSavedWindowRequest,
+} from "../src/session-host/network/peer-saved";
 import { toRemoteSessionMetadata, type RemoteSessionMetadata } from "../src/session-host/network/roster-metadata";
 
 const SECRET_AGENT_DIR = "/Users/owner/.pi/agent";
@@ -635,12 +653,16 @@ function harness(options: {
   close?: OwnerCloseHandler;
   create?: OwnerCreateHandler;
   capabilities?: readonly string[];
+  /** Optional Saved provider; supplied together with `deletePolicy` (default Off). */
+  saved?: FakeSavedProvider;
+  deletePolicy?: () => boolean;
 } = {}) {
   const pair = channelPair();
   const inventory = new FakeInventory();
   inventory.rows = (options.rows ?? ["row-1", "row-2", "row-3"]).map((id) => ownerRow(id));
   const ownerDiagnostics: string[] = [];
   const viewerDiagnostics: string[] = [];
+  const savedPolicies: (OwnerSavedPolicy | undefined)[] = [];
   const authorize = options.authorize ?? (() => true);
   const owner = createRosterBridgeHost({
     inventory,
@@ -648,6 +670,10 @@ function harness(options: {
     bounds: { ...FAST_BOUNDS, ...options.bounds },
     ...(options.close === undefined ? {} : { closeOwnedSession: options.close }),
     ...(options.create === undefined ? {} : { createOwnedSession: options.create }),
+    ...(options.saved === undefined ? {} : {
+      savedCatalogView: options.saved.factory,
+      remoteHistoryDeleteExposed: options.deletePolicy ?? (() => false),
+    }),
     onDiagnostic: (event) => {
       ownerDiagnostics.push(event.code);
     },
@@ -660,6 +686,9 @@ function harness(options: {
     onDiagnostic: (event) => {
       viewerDiagnostics.push(event.code);
     },
+    onSavedPolicy: (policy) => {
+      savedPolicies.push(policy);
+    },
   });
   return {
     pair,
@@ -669,6 +698,7 @@ function harness(options: {
     viewer,
     ownerDiagnostics,
     viewerDiagnostics,
+    savedPolicies,
     async stop(): Promise<void> {
       await viewer.stop();
       await owner.stopAll();
@@ -2152,7 +2182,7 @@ function refusedFrame(frame: unknown): boolean {
 
 test("Close is an optional capability with fixed framing and no version or metadata meaning", () => {
   assert.deepEqual([...ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES],
-    [ROSTER_BRIDGE_CLOSE_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY]);
+    [ROSTER_BRIDGE_CLOSE_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]);
   const decision = negotiateRosterBridgeHello(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CLOSE_CAPABILITY]));
   assert.equal(decision.ok, true);
   assert.deepEqual(decision.ok ? decision.capabilities : null, [ROSTER_BRIDGE_CLOSE_CAPABILITY]);
@@ -3501,5 +3531,1180 @@ test("a retirement queued by the final authorizer cannot land before the provide
     assert.equal(binding?.subscribed, false);
   } finally {
     await owner.stopAll();
+  }
+});
+
+// --- optional Saved catalog windows over the same roster lane -----------------
+
+/** The one explicit opt-in a caller needs to offer the optional Saved exchange. */
+const SAVED_CAPS: readonly string[] = [ROSTER_BRIDGE_SAVED_CAPABILITY];
+
+/** One owner Saved entry carrying exactly what a local Saved picker row shows. */
+function savedEntry(index: number, cwd = `/srv/owner/project ${index}`): OwnerSavedEntry {
+  return {
+    entryId: `entry-${index}`,
+    sessionId: `0190a1b2-0000-7000-8000-${String(index).padStart(12, "0")}`,
+    file: `/srv/owner/agent/sessions/--srv-owner--/2026-10-22T00-00-00-000Z_${index}.jsonl`,
+    caption: `Saved ${index}`,
+    cwd,
+  };
+}
+
+type SavedWindow = Extract<OwnerSavedWindowFacts, { readonly kind: "window" }>;
+
+/**
+ * A thin fake of the owner's Saved view factory. Each view keeps its OWN current
+ * catalog and result, as the real per-binding view must; the provider only
+ * records calls. It reads no file, owns no native row, and grants nothing.
+ */
+class FakeSavedProvider {
+  total = 10;
+  searchTotal = 3;
+  cwdFor: (index: number) => string = (index) => `/srv/owner/project ${index}`;
+  /** The owner's native row at one result position. */
+  entryFor: (index: number) => OwnerSavedEntry = (index) => savedEntry(index, this.cwdFor(index));
+  views = 0;
+  disposed = 0;
+  serial = 0;
+  readonly lists: OwnerSavedListRequest[] = [];
+  readonly searches: OwnerSavedSearchRequest[] = [];
+  readonly windows: OwnerSavedWindowRequest[] = [];
+  readonly resumes: OwnerSavedResumeRequest[] = [];
+  readonly removes: OwnerSavedDeleteRequest[] = [];
+  readonly signals: AbortSignal[] = [];
+  /** When set, every read waits on it before answering. */
+  readGate: Promise<void> | null = null;
+  /** Runs synchronously inside the factory, as arbitrary owner code may. */
+  onCreate: (() => void) | null = null;
+  /** Runs just before a read returns its window. */
+  beforeAnswer: (() => void) | null = null;
+  resume: (request: OwnerSavedResumeRequest, guard: OwnerSavedAuthorizationGuard) => Promise<OwnerSavedResumeFacts> =
+    async (request) => ({ kind: "started", hostRunId: request.hostRunId, rowId: "native-resumed" });
+  remove: (request: OwnerSavedDeleteRequest, guard: OwnerSavedAuthorizationGuard) => Promise<OwnerSavedDeleteFacts> =
+    async (request, guard) => {
+      if (!request.confirmed) return { kind: "confirmation-required" };
+      return guard() ? { kind: "deleted", method: "trash" } : { kind: "refused", reason: "policy" };
+    };
+
+  readonly factory = (): OwnerSavedCatalogView => {
+    this.views += 1;
+    this.onCreate?.();
+    const provider = this;
+    let catalogId: string | null = null;
+    let resultId: string | null = null;
+    let resultTotal = 0;
+    const slice = (hostRunId: string, offset: number, count: number): OwnerSavedWindowFacts => {
+      const catalog = catalogId;
+      const result = resultId;
+      if (catalog === null || result === null) return { kind: "unavailable" };
+      if (offset > resultTotal) return { kind: "refused", reason: "range" };
+      const length = Math.min(count, resultTotal - offset);
+      const entries = Array.from({ length }, (_unused, index) => provider.entryFor(offset + index));
+      provider.beforeAnswer?.();
+      return { kind: "window", hostRunId, catalogId: catalog, resultId: result, total: resultTotal, issueCount: 0, offset, entries };
+    };
+    return {
+      async list(request, signal, guard) {
+        provider.lists.push(request);
+        provider.signals.push(signal);
+        await provider.readGate;
+        if (!guard()) return { kind: "unknown" };
+        provider.serial += 1;
+        catalogId = `cat-${provider.serial}`;
+        resultId = `res-${provider.serial}`;
+        resultTotal = provider.total;
+        return slice(request.hostRunId, request.offset, request.count);
+      },
+      async search(request, signal, guard) {
+        provider.searches.push(request);
+        provider.signals.push(signal);
+        await provider.readGate;
+        if (!guard()) return { kind: "unknown" };
+        if (request.catalogId !== catalogId) return { kind: "refused", reason: "stale" };
+        provider.serial += 1;
+        resultId = `res-${provider.serial}`;
+        resultTotal = provider.searchTotal;
+        return slice(request.hostRunId, request.offset, request.count);
+      },
+      async window(request, signal, guard) {
+        provider.windows.push(request);
+        provider.signals.push(signal);
+        await provider.readGate;
+        if (!guard()) return { kind: "unknown" };
+        if (request.catalogId !== catalogId || request.resultId !== resultId) return { kind: "refused", reason: "stale" };
+        return slice(request.hostRunId, request.offset, request.count);
+      },
+      resume(request, guard) {
+        provider.resumes.push(request);
+        return provider.resume(request, guard);
+      },
+      remove(request, guard) {
+        provider.removes.push(request);
+        return provider.remove(request, guard);
+      },
+      dispose() {
+        provider.disposed += 1;
+      },
+    };
+  };
+}
+
+function savedListFrame(overrides: Partial<RosterBridgeSavedListRequestFrame> = {}): RosterBridgeSavedListRequestFrame {
+  return {
+    type: "saved_list_request", requestId: "saved-list", hostRunId: RUN_A, query: "", offset: 0, count: 10, sequence: 1,
+    ...overrides,
+  };
+}
+
+function savedResumeFrame(overrides: Partial<RosterBridgeSavedResumeRequestFrame> = {}): RosterBridgeSavedResumeRequestFrame {
+  return {
+    type: "saved_resume_request", requestId: "saved-resume", hostRunId: RUN_A,
+    catalogId: "cat-1", resultId: "res-1", entryId: "entry-0", sequence: 1,
+    ...overrides,
+  };
+}
+
+function savedDeleteFrame(overrides: Partial<RosterBridgeSavedDeleteRequestFrame> = {}): RosterBridgeSavedDeleteRequestFrame {
+  return {
+    type: "saved_delete_request", requestId: "saved-delete", hostRunId: RUN_A,
+    catalogId: "cat-1", resultId: "res-1", entryId: "entry-0", confirmed: true, sequence: 1,
+    ...overrides,
+  };
+}
+
+/** Every fixed Saved result the owner wrote, as [requestId, outcome]. */
+function savedResults(pair: Pair): [string, unknown][] {
+  return pair.ownerSide.frames().flatMap((frame): [string, unknown][] => {
+    if (frame.type === "saved_window_result" || frame.type === "saved_resume_result" || frame.type === "saved_delete_result") {
+      return [[frame.requestId, frame.outcome]];
+    }
+    return [];
+  });
+}
+
+/** A real owner with a Saved provider, driven by a scripted viewer that negotiated Saved. */
+async function savedOwnerHarness(provider: FakeSavedProvider, options: {
+  authorize?: () => boolean;
+  deletePolicy?: () => boolean;
+} = {}) {
+  const pair = channelPair();
+  const inventory = new FakeInventory();
+  inventory.rows = [];
+  const ownerDiagnostics: string[] = [];
+  const owner = createRosterBridgeHost({
+    inventory,
+    authorizePeer: options.authorize ?? (() => true),
+    bounds: FAST_BOUNDS,
+    savedCatalogView: provider.factory,
+    remoteHistoryDeleteExposed: options.deletePolicy ?? (() => false),
+    onDiagnostic: (event) => {
+      ownerDiagnostics.push(event.code);
+    },
+  });
+  const binding = owner.attach(pair.ownerSide);
+  const scripted = new ScriptedPeer(pair.viewerSide);
+  scripted.write(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]));
+  await until("the owner acknowledges Saved", () => pair.ownerSide.frames().some((frame) => frame.type === "hello_ack"));
+  const subscribe = async (): Promise<void> => {
+    scripted.write({ type: "subscribe", subscriptionId: "sub-saved" });
+    await until("the owner publishes its roster", () => pair.ownerSide.types().includes("snapshot_end"));
+  };
+  return { pair, inventory, owner, binding, scripted, ownerDiagnostics, subscribe };
+}
+
+/** List through a real viewer and return the window, failing with a named message otherwise. */
+async function listedWindow(viewer: RosterBridgeViewer, hostRunId: string, count = 5): Promise<SavedWindow> {
+  const result = await mustSettle(viewer.saved!.list({ hostRunId, query: "", offset: 0, count }), "a Saved listing");
+  assert.ok(result.kind === "owner-result" && result.outcome.kind === "window",
+    `the listing produced ${JSON.stringify(result).slice(0, 160)}`);
+  return result.outcome;
+}
+
+test("Saved is an optional, explicitly offered capability and a legacy lane is byte-for-byte unchanged", async () => {
+  const legacy = harness();
+  try {
+    await legacy.viewer.hello;
+    assert.equal(legacy.viewer.saved?.supported, false);
+    assert.equal(legacy.viewer.saved?.policy, undefined, "policy starts unknown");
+    assert.deepEqual(await legacy.viewer.saved?.list({ hostRunId: legacy.inventory.hostRunId, query: "", offset: 0, count: 1 }),
+      { kind: "not-sent", reason: "capability-unsupported" });
+    await legacy.viewer.subscribe();
+    assert.deepEqual(legacy.pair.viewerSide.types(), ["hello", "subscribe"], "no Saved frame exists without negotiation");
+    assert.deepEqual(legacy.pair.ownerSide.types(), ["hello_ack", "snapshot_begin", "snapshot_page", "snapshot_end"],
+      "the legacy owner writes exactly its old frames");
+    assert.deepEqual(legacy.savedPolicies, [], "no policy is described on a lane without Saved");
+  } finally {
+    await legacy.stop();
+  }
+
+  // An owner with a provider never acknowledges Saved to a viewer that did not offer it.
+  const provider = new FakeSavedProvider();
+  const unoffered = harness({ saved: provider });
+  try {
+    await unoffered.viewer.hello;
+    assert.equal(unoffered.viewer.saved?.supported, false);
+    assert.deepEqual(unoffered.viewer.capabilities, [ROSTER_BRIDGE_REQUIRED_CAPABILITY]);
+    await unoffered.viewer.subscribe();
+    assert.equal(unoffered.pair.ownerSide.types().includes("saved_policy"), false);
+  } finally {
+    await unoffered.stop();
+  }
+
+  // A provider-less owner acknowledges the baseline only.
+  const providerless = harness({ capabilities: SAVED_CAPS });
+  try {
+    await providerless.viewer.hello;
+    assert.deepEqual(providerless.viewer.capabilities, [ROSTER_BRIDGE_REQUIRED_CAPABILITY]);
+    assert.equal(providerless.viewer.saved?.supported, false);
+  } finally {
+    await providerless.stop();
+  }
+
+  // Both sides: acknowledged, but nothing is created until an authorized request.
+  const both = harness({ capabilities: SAVED_CAPS, saved: provider });
+  try {
+    await both.viewer.hello;
+    assert.deepEqual(both.viewer.capabilities, [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]);
+    assert.equal(both.viewer.saved?.supported, true);
+    assert.equal(provider.views, 0, "the view is created lazily, never at negotiation");
+  } finally {
+    await both.stop();
+  }
+
+  const decision = negotiateRosterBridgeHello(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]));
+  assert.deepEqual(decision.ok ? decision.capabilities : null, [ROSTER_BRIDGE_SAVED_CAPABILITY]);
+});
+
+test("a Saved provider configuration is all-or-nothing and has no permissive default", () => {
+  const inventory = new FakeInventory();
+  const provider = new FakeSavedProvider();
+  assert.throws(() => createRosterBridgeHost({ inventory, authorizePeer: () => true, savedCatalogView: provider.factory }),
+    /together/, "a view without a live delete policy is refused");
+  assert.throws(() => createRosterBridgeHost({ inventory, authorizePeer: () => true, remoteHistoryDeleteExposed: () => true }),
+    /together/, "a policy without a view is refused");
+  assert.throws(() => createRosterBridgeHost({
+    inventory, authorizePeer: () => true, savedCatalogView: provider.factory, remoteHistoryDeleteExposed: true as never,
+  }), /together/, "a non-callable policy is refused rather than defaulted");
+  // A legacy host's notification is a harmless no-op.
+  const legacy = createRosterBridgeHost({ inventory, authorizePeer: () => true });
+  assert.doesNotThrow(() => legacy.notifySavedPolicy?.());
+});
+
+test("a Saved frame on a channel that never negotiated it is refused and reaches no provider", async () => {
+  const provider = new FakeSavedProvider();
+  const pair = channelPair();
+  const inventory = new FakeInventory();
+  const owner = createRosterBridgeHost({
+    inventory, authorizePeer: () => true, bounds: FAST_BOUNDS,
+    savedCatalogView: provider.factory, remoteHistoryDeleteExposed: () => true,
+  });
+  owner.attach(pair.ownerSide);
+  const scripted = new ScriptedPeer(pair.viewerSide);
+  try {
+    scripted.write(helloFrame());
+    await settle();
+    scripted.write(savedListFrame({ hostRunId: inventory.hostRunId }));
+    await settle();
+    assert.ok(pair.ownerSide.frames().some((frame) => frame.type === "error" && frame.code === "bad_frame"));
+    assert.equal(provider.views, 0, "nothing outside the negotiated protocol reaches an owner view");
+    assert.equal(pair.ownerSide.closedCalls, 1, "the violating channel is closed once through its bounded API");
+  } finally {
+    await owner.stopAll();
+  }
+});
+
+test("a catalog larger than one transfer is browsed in full through bounded windows of ONE result", async () => {
+  const provider = new FakeSavedProvider();
+  provider.total = 5_000;
+  // A wider requester patience than FAST_BOUNDS so a 4,096-row transfer never
+  // races the test's own deadline; no protocol default changes.
+  const h = harness({
+    rows: [], capabilities: SAVED_CAPS, saved: provider,
+    bounds: { createResultTimeoutMs: 2_000, transferIdleTimeoutMs: 2_000 },
+  });
+  try {
+    await h.viewer.hello;
+    const snapshot = await h.viewer.subscribe();
+    assert.deepEqual(snapshot.rows, [], "an empty roster with its exact run is a valid Saved target");
+    const run = h.inventory.hostRunId;
+    const saved = h.viewer.saved!;
+    const first = await listedWindow(h.viewer, run, 4_096);
+    assert.equal(first.total, 5_000, "the window states the FULL total, beyond one transfer");
+    assert.equal(first.offset, 0);
+    assert.equal(first.entries.length, 4_096);
+    assert.deepEqual(first.entries[0], savedEntry(0),
+      "the owner's session id, saved file path, caption, and cwd arrive exactly as its local row holds them");
+    const secondResult = await mustSettle(saved.window({
+      hostRunId: run, catalogId: first.catalogId, resultId: first.resultId, offset: 4_096, count: 4_096,
+    }), "the second window");
+    assert.ok(secondResult.kind === "owner-result" && secondResult.outcome.kind === "window");
+    const second = secondResult.outcome;
+    assert.equal(second.total, 5_000);
+    assert.equal(second.offset, 4_096);
+    assert.equal(second.entries.length, 904);
+    assert.equal(second.catalogId, first.catalogId, "a window never remints the catalog");
+    assert.equal(second.resultId, first.resultId, "a window never remints the result");
+    const ids = new Set([...first.entries, ...second.entries].map((entry) => entry.entryId));
+    assert.equal(ids.size, 5_000, "every entry of the full total was reached, none twice");
+    assert.equal(provider.lists.length, 1, "windows never relist");
+    assert.equal(provider.windows.length, 1);
+
+    // Past the end is an honest empty window that still states the full total.
+    const past = await mustSettle(saved.window({
+      hostRunId: run, catalogId: first.catalogId, resultId: first.resultId, offset: 5_000, count: 10,
+    }), "the past-the-end window");
+    assert.ok(past.kind === "owner-result" && past.outcome.kind === "window");
+    assert.equal(past.outcome.entries.length, 0);
+    assert.equal(past.outcome.total, 5_000);
+
+    const pages = h.pair.ownerSide.frames().filter((frame) => frame.type === "saved_window_page");
+    assert.ok(pages.every((frame) => frame.type === "saved_window_page"
+      && frame.entries.length <= DEFAULT_ROSTER_BRIDGE_BOUNDS.maxRowsPerPage), "the existing per-page row bound holds");
+    assert.equal(provider.views, 1, "one lazily created view served every window");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a byte-limited window carries an honest contiguous prefix and browsing continues from it", async () => {
+  const provider = new FakeSavedProvider();
+  provider.total = 40;
+  // Long but legal owner working directories: one window cannot carry all 40.
+  provider.cwdFor = (index) => `/srv/owner/${"w".repeat(4_000)}-${index}`;
+  const h = harness({
+    rows: [], capabilities: SAVED_CAPS, saved: provider,
+    bounds: { maxSnapshotBytes: 65_536, createResultTimeoutMs: 2_000, transferIdleTimeoutMs: 2_000 },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const run = h.inventory.hostRunId;
+    const first = await listedWindow(h.viewer, run, 40);
+    assert.equal(first.total, 40);
+    assert.ok(first.entries.length > 0 && first.entries.length < 40,
+      `the first window is a non-empty prefix (${first.entries.length})`);
+    const seen = [...first.entries];
+    let offset = first.entries.length;
+    let windows = 1;
+    while (offset < 40) {
+      const next = await mustSettle(h.viewer.saved!.window({
+        hostRunId: run, catalogId: first.catalogId, resultId: first.resultId, offset, count: 40,
+      }), `the window at ${offset}`);
+      assert.ok(next.kind === "owner-result" && next.outcome.kind === "window");
+      assert.equal(next.outcome.offset, offset, "every window states its actual offset");
+      assert.equal(next.outcome.total, 40, "and the full total");
+      assert.ok(next.outcome.entries.length > 0, "a non-empty remainder always makes progress");
+      seen.push(...next.outcome.entries);
+      offset += next.outcome.entries.length;
+      windows += 1;
+    }
+    assert.ok(windows >= 3, `several bounded windows were needed (${windows})`);
+    assert.deepEqual(seen.map((entry) => entry.entryId), Array.from({ length: 40 }, (_unused, index) => `entry-${index}`),
+      "no row was omitted or reordered to force a fit");
+    assert.ok(seen.every((entry, index) => entry.cwd === provider.cwdFor(index)), "no path was clipped to force a fit");
+    assert.equal(provider.lists.length, 1, "continuation never relists");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a legal row larger than one frame is carried whole by fragments and published atomically", async () => {
+  const provider = new FakeSavedProvider();
+  provider.total = 3;
+  // Exact native owner data far beyond one 64 KiB frame: a Windows owner path
+  // (displayed as-is on any viewer) and an astral-heavy working directory.
+  const oversized = (index: number): OwnerSavedEntry => ({
+    entryId: `entry-${index}`,
+    sessionId: `session-${index}`,
+    file: `C:\\Users\\owner\\.pi\\agent\\sessions\\${"\\deep \"q\"".repeat(15_000)}\\${index}.jsonl`,
+    caption: `Saved ${index}`,
+    cwd: `/srv/owner/${"\u{1f5c2}".repeat(30_000)}`,
+  });
+  provider.entryFor = (index) => (index === 1 ? oversized(index) : savedEntry(index));
+  const h = harness({
+    rows: [], capabilities: SAVED_CAPS, saved: provider,
+    bounds: { createResultTimeoutMs: 2_000, transferIdleTimeoutMs: 2_000 },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const listed = await listedWindow(h.viewer, h.inventory.hostRunId, 3);
+    assert.equal(listed.entries.length, 3, "no legal row is omitted to force a fit");
+    assert.deepEqual(listed.entries[1], oversized(1), "the oversized row arrives exactly, unclipped");
+    assert.deepEqual(listed.entries[0], savedEntry(0));
+    assert.deepEqual(listed.entries[2], savedEntry(2));
+    const fragments = h.pair.ownerSide.frames().filter((frame) => frame.type === "saved_window_fragment");
+    assert.ok(fragments.length >= 2, `the row needed several fragments (${fragments.length})`);
+    assert.ok(h.pair.ownerSide.sent.every((bytes) => bytes.length <= DEFAULT_ROSTER_BRIDGE_BOUNDS.maxFrameBytes),
+      "every frame still fits the existing frame bound");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a malicious total allocates nothing and an incoherent window fails closed", async () => {
+  const pair = channelPair();
+  const viewer = attachRosterBridgeViewer({
+    channel: pair.viewerSide,
+    bounds: { ...FAST_BOUNDS, createResultTimeoutMs: 800, transferIdleTimeoutMs: 800 },
+    capabilities: SAVED_CAPS,
+  });
+  const scripted = new ScriptedPeer(pair.ownerSide);
+  scripted.autoAck = false;
+  scripted.onHello(() => {
+    scripted.write(helloAck([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]));
+  });
+  try {
+    await mustSettle(viewer.hello, "the handshake");
+    const started = viewer.subscribe();
+    await settle();
+    const subscriptionId = viewer.subscriptionId;
+    assert.ok(subscriptionId);
+    scripted.write(begin(subscriptionId, "t-empty", 1, 0, 0, RUN_A));
+    scripted.write(end(subscriptionId, "t-empty", 1, 0));
+    await started;
+
+    const huge = viewer.saved!.list({ hostRunId: RUN_A, query: "", offset: 0, count: 2 });
+    await until("the list request", () => scripted.received.some((frame) => frame.type === "saved_list_request"));
+    const request = scripted.received.find((frame) => frame.type === "saved_list_request");
+    assert.ok(request !== undefined && request.type === "saved_list_request");
+    scripted.write({
+      type: "saved_window_begin", requestId: request.requestId, hostRunId: RUN_A, catalogId: "cat-1", resultId: "res-1",
+      total: Number.MAX_SAFE_INTEGER, issueCount: Number.MAX_SAFE_INTEGER, offset: 0, rows: 2, pageCount: 1,
+    });
+    scripted.write({ type: "saved_window_page", requestId: request.requestId, pageIndex: 0, entries: [savedEntry(0), savedEntry(1)] });
+    scripted.write({ type: "saved_window_end", requestId: request.requestId, rows: 2, pageCount: 1 });
+    const result = await mustSettle(huge, "the huge-total window");
+    assert.ok(result.kind === "owner-result" && result.outcome.kind === "window");
+    assert.equal(result.outcome.total, Number.MAX_SAFE_INTEGER, "the total is carried as a scalar, never allocated");
+    assert.equal(result.outcome.entries.length, 2);
+
+    // A non-empty result presented as an empty window is incoherent: fail closed.
+    const fake = viewer.saved!.list({ hostRunId: RUN_A, query: "", offset: 0, count: 2 });
+    await until("the second list request", () => scripted.received.filter((frame) => frame.type === "saved_list_request").length === 2);
+    const second = scripted.received.filter((frame) => frame.type === "saved_list_request")[1];
+    assert.ok(second !== undefined && second.type === "saved_list_request");
+    scripted.write({
+      type: "saved_window_begin", requestId: second.requestId, hostRunId: RUN_A, catalogId: "cat-2", resultId: "res-2",
+      total: 5, issueCount: 0, offset: 0, rows: 0, pageCount: 0,
+    });
+    assert.deepEqual(await mustSettle(fake, "the incoherent window"), { kind: "unknown" });
+    assert.equal(pair.viewerSide.closedCalls, 1, "incoherent owner data closes the channel through its bounded API");
+  } finally {
+    await viewer.stop();
+  }
+});
+
+test("Saved names the exact current owner run of a live subscription and nothing else", async () => {
+  const provider = new FakeSavedProvider();
+  const s = await savedOwnerHarness(provider);
+  try {
+    // No live subscription yet: there is no current owner run to name.
+    s.scripted.write(savedListFrame({ requestId: "early", sequence: 1 }));
+    await until("the early refusal", () => savedResults(s.pair).length === 1);
+    await s.subscribe();
+    s.scripted.write(savedListFrame({ requestId: "other-run", hostRunId: RUN_B, sequence: 2 }));
+    await until("the other-run refusal", () => savedResults(s.pair).length === 2);
+    assert.deepEqual(savedResults(s.pair), [
+      ["early", { kind: "refused", reason: "stale" }],
+      ["other-run", { kind: "refused", reason: "stale" }],
+    ]);
+    assert.equal(provider.views, 0, "a refused run never creates a view");
+    // The exact run of an EMPTY roster is a valid target: no row is needed.
+    s.scripted.write(savedListFrame({ requestId: "exact", sequence: 3 }));
+    await until("the exact-run window", () => s.pair.ownerSide.types().includes("saved_window_end"));
+    assert.equal(provider.views, 1);
+    assert.deepEqual(provider.lists, [{ hostRunId: RUN_A, query: "", offset: 0, count: 10 }]);
+  } finally {
+    await s.owner.stopAll();
+  }
+});
+
+test("each binding lazily owns one view, and finishing disposes it without cancelling an accepted resume", async () => {
+  const provider = new FakeSavedProvider();
+  let releaseResume: (facts: OwnerSavedResumeFacts) => void = () => undefined;
+  let resumeSettled = false;
+  provider.resume = () => new Promise<OwnerSavedResumeFacts>((resolve) => {
+    releaseResume = (facts) => {
+      resumeSettled = true;
+      resolve(facts);
+    };
+  });
+  const inventory = new FakeInventory();
+  inventory.rows = [];
+  const owner = createRosterBridgeHost({
+    inventory, authorizePeer: () => true, bounds: FAST_BOUNDS,
+    savedCatalogView: provider.factory, remoteHistoryDeleteExposed: () => false,
+  });
+  const first = channelPair("viewer-key-1", "owner-key-1");
+  const second = channelPair("viewer-key-2", "owner-key-2");
+  const one = attachRosterBridgeViewer({ channel: first.viewerSide, bounds: FAST_BOUNDS, capabilities: SAVED_CAPS });
+  const two = attachRosterBridgeViewer({ channel: second.viewerSide, bounds: FAST_BOUNDS, capabilities: SAVED_CAPS });
+  owner.attach(first.ownerSide);
+  owner.attach(second.ownerSide);
+  try {
+    await Promise.all([one.hello, two.hello]);
+    await one.subscribe();
+    await two.subscribe();
+    assert.equal(provider.views, 0, "no view exists before an authorized request");
+    const run = inventory.hostRunId;
+    const windowOne = await listedWindow(one, run);
+    const windowTwo = await listedWindow(two, run);
+    assert.equal(provider.views, 2, "one independent view per binding");
+    assert.notEqual(windowOne.resultId, windowTwo.resultId);
+    // The first binding's view still holds ITS result after the other listed.
+    const again = await mustSettle(one.saved!.window({
+      hostRunId: run, catalogId: windowOne.catalogId, resultId: windowOne.resultId, offset: 2, count: 2,
+    }), "the first binding's own window");
+    assert.ok(again.kind === "owner-result" && again.outcome.kind === "window");
+    assert.equal(provider.views, 2, "a window reuses the binding's existing view");
+
+    const resumed = one.saved!.resume({
+      hostRunId: run, catalogId: windowOne.catalogId, resultId: windowOne.resultId, entryId: "entry-0",
+    });
+    await until("the resume reaches the owner view", () => provider.resumes.length === 1);
+    await owner.stopAll();
+    assert.equal(provider.disposed, 2, "each binding disposed its one view when it finished");
+    assert.equal(resumeSettled, false, "disposal never cancels or awaits an accepted resume");
+    assert.deepEqual(await mustSettle(resumed, "the requester's patience"), { kind: "unknown" });
+    releaseResume({ kind: "started", hostRunId: run, rowId: "native-9" });
+    await settle();
+    assert.equal(first.ownerSide.frames().some((frame) => frame.type === "saved_resume_result"), false,
+      "a finished binding writes no result for work that outlived it");
+  } finally {
+    await one.stop();
+    await two.stop();
+    await owner.stopAll();
+  }
+});
+
+test("authorization lost between window frames writes nothing further", async () => {
+  let allowed = true;
+  const provider = new FakeSavedProvider();
+  provider.total = 6;
+  const h = harness({
+    rows: [], capabilities: SAVED_CAPS, saved: provider, authorize: () => allowed, bounds: { maxRowsPerPage: 1 },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    await until("the initial policy description", () => h.viewer.saved?.policy !== undefined);
+    await settle();
+    const run = h.inventory.hostRunId;
+    h.pair.ownerSide.hold = true;
+    const pending = h.viewer.saved!.list({ hostRunId: run, query: "", offset: 0, count: 6 });
+    await until("the window begin is written", () => h.pair.ownerSide.types().includes("saved_window_begin"));
+    allowed = false;
+    h.pair.ownerSide.release();
+    assert.deepEqual(await mustSettle(pending, "the interrupted window"), { kind: "unknown" });
+    const types = h.pair.ownerSide.types();
+    assert.equal(types.includes("saved_window_page"), false, "no later page is written after the revoke");
+    assert.equal(types.includes("saved_window_end"), false);
+    assert.ok(h.ownerDiagnostics.includes("saved_reply_dropped"));
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a factory that revokes during creation reaches no provider operation and writes nothing", async () => {
+  let allowed = true;
+  const provider = new FakeSavedProvider();
+  provider.onCreate = () => {
+    allowed = false;
+  };
+  const h = harness({ rows: [], capabilities: SAVED_CAPS, saved: provider, authorize: () => allowed });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const result = await mustSettle(
+      h.viewer.saved!.list({ hostRunId: h.inventory.hostRunId, query: "", offset: 0, count: 5 }),
+      "a list whose factory revoked",
+    );
+    assert.deepEqual(result, { kind: "unknown" }, "an unanswered request is never a fabricated refusal");
+    assert.equal(provider.views, 1);
+    assert.equal(provider.lists.length, 0, "the re-proof after the factory stops the operation");
+    assert.equal(savedResults(h.pair).length, 0);
+    assert.equal(h.pair.ownerSide.types().includes("saved_window_begin"), false);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("the delete policy starts unknown, follows the first snapshot and every notify, and Off always denies", async () => {
+  let exposed = false;
+  let throwing = false;
+  const provider = new FakeSavedProvider();
+  const h = harness({
+    rows: [], capabilities: SAVED_CAPS, saved: provider,
+    deletePolicy: () => {
+      if (throwing) throw new Error("synthetic policy failure");
+      return exposed;
+    },
+  });
+  try {
+    await h.viewer.hello;
+    const saved = h.viewer.saved!;
+    assert.equal(saved.policy, undefined, "unknown before any run is observed: Delete stays hidden");
+    await h.viewer.subscribe();
+    const run = h.inventory.hostRunId;
+    await until("the first policy description", () => saved.policy !== undefined);
+    assert.deepEqual(saved.policy, { hostRunId: run, deleteExposed: false });
+    const listed = await listedWindow(h.viewer, run);
+    const target = { hostRunId: run, catalogId: listed.catalogId, resultId: listed.resultId, entryId: listed.entries[0]!.entryId };
+
+    assert.deepEqual(await saved.remove({ ...target, confirmed: false }),
+      { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } }, "Off denies even a prepare");
+    assert.deepEqual(await saved.remove({ ...target, confirmed: true }),
+      { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } }, "a confirmation never overrides Off");
+    assert.equal(provider.removes.length, 0, "no provider call while delete is not exposed");
+
+    exposed = true;
+    h.owner.notifySavedPolicy?.();
+    await until("the On description", () => saved.policy?.deleteExposed === true);
+    assert.deepEqual(await saved.remove({ ...target, confirmed: false }),
+      { kind: "owner-result", outcome: { kind: "confirmation-required" } });
+    assert.deepEqual(await saved.remove({ ...target, confirmed: true }),
+      { kind: "owner-result", outcome: { kind: "deleted", method: "trash" } });
+    assert.equal(provider.removes.length, 2, "Off -> On needed no disconnect, rebind, or relist");
+
+    exposed = false;
+    h.owner.notifySavedPolicy?.();
+    await until("the Off description", () => saved.policy?.deleteExposed === false);
+    assert.deepEqual(await saved.remove({ ...target, confirmed: true }),
+      { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } },
+      "an earlier On description and confirmation cannot override the live Off");
+
+    // The live server check is the authority, even when the description says On.
+    exposed = true;
+    throwing = true;
+    assert.deepEqual(await saved.remove({ ...target, confirmed: true }),
+      { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } }, "a throwing policy is Off");
+    assert.equal(provider.removes.length, 2);
+    assert.deepEqual(h.savedPolicies.slice(0, 3), [
+      { hostRunId: run, deleteExposed: false },
+      { hostRunId: run, deleteExposed: true },
+      { hostRunId: run, deleteExposed: false },
+    ]);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a reentrant notify cannot let a stale policy read overwrite the newer publication", async () => {
+  let value = false;
+  let reenter = true;
+  let h: ReturnType<typeof harness> | undefined;
+  h = harness({
+    rows: [], capabilities: SAVED_CAPS, saved: new FakeSavedProvider(),
+    deletePolicy: () => {
+      const observed = value;
+      if (reenter && h !== undefined) {
+        // The policy callback is owner code: it changes the policy and notifies
+        // from inside the publication that is reading it.
+        reenter = false;
+        value = true;
+        h.owner.notifySavedPolicy?.();
+      }
+      return observed;
+    },
+  });
+  const live = h;
+  try {
+    await live.viewer.hello;
+    await live.viewer.subscribe();
+    await until("a policy description", () => live.viewer.saved?.policy !== undefined);
+    await settle();
+    const published = live.pair.ownerSide.frames()
+      .flatMap((frame) => (frame.type === "saved_policy" ? [frame.deleteExposed] : []));
+    assert.deepEqual(published, [true], "only the newer publication reaches the wire");
+    assert.deepEqual(live.viewer.saved?.policy, { hostRunId: live.inventory.hostRunId, deleteExposed: true });
+  } finally {
+    await live.stop();
+  }
+});
+
+test("a delete that completed is reported truthfully after the policy turned Off, and the guard repeats the policy", async () => {
+  let exposed = true;
+  let release: () => void = () => undefined;
+  let guardAfterOff: boolean | null = null;
+  const provider = new FakeSavedProvider();
+  provider.remove = (_request, guard) => new Promise<OwnerSavedDeleteFacts>((resolve) => {
+    release = () => {
+      guardAfterOff = guard();
+      // The owner had already completed the removal before its last check.
+      resolve({ kind: "deleted", method: "unlink" });
+    };
+  });
+  const h = harness({ rows: [], capabilities: SAVED_CAPS, saved: provider, deletePolicy: () => exposed });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const run = h.inventory.hostRunId;
+    const listed = await listedWindow(h.viewer, run);
+    const pending = h.viewer.saved!.remove({
+      hostRunId: run, catalogId: listed.catalogId, resultId: listed.resultId, entryId: "entry-1", confirmed: true,
+    });
+    await until("the delete reaches the owner view", () => provider.removes.length === 1);
+    exposed = false;
+    release();
+    assert.equal(guardAfterOff, false, "the provider's guard re-checks the live delete policy");
+    assert.deepEqual(await mustSettle(pending, "the completed delete"),
+      { kind: "owner-result", outcome: { kind: "deleted", method: "unlink" } },
+      "an already-completed delete is reported, never re-gated on the current policy");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("the described policy returns to unknown when the channel is lost", async () => {
+  const h = harness({ rows: [], capabilities: SAVED_CAPS, saved: new FakeSavedProvider(), deletePolicy: () => true });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    await until("the policy description", () => h.viewer.saved?.policy !== undefined);
+    await h.pair.viewerSide.close();
+    await settle();
+    assert.equal(h.viewer.saved?.policy, undefined);
+    assert.equal(h.savedPolicies[h.savedPolicies.length - 1], undefined, "the consumer is told it is unknown again");
+  } finally {
+    await h.owner.stopAll();
+  }
+});
+
+test("busy and replayed requests never drop an older accepted result; a newer read supersedes only a read", async () => {
+  const provider = new FakeSavedProvider();
+  let releaseResume: () => void = () => undefined;
+  provider.resume = (request) => new Promise<OwnerSavedResumeFacts>((resolve) => {
+    releaseResume = () => resolve({ kind: "started", hostRunId: request.hostRunId, rowId: "native-7" });
+  });
+  const s = await savedOwnerHarness(provider, { deletePolicy: () => true });
+  try {
+    await s.subscribe();
+    s.scripted.write(savedListFrame({ requestId: "list-1", sequence: 1 }));
+    await until("the first window", () => s.pair.ownerSide.types().includes("saved_window_end"));
+    const listedBegin = s.pair.ownerSide.frames().find((frame) => frame.type === "saved_window_begin");
+    assert.ok(listedBegin !== undefined && listedBegin.type === "saved_window_begin");
+    const ids = { catalogId: listedBegin.catalogId, resultId: listedBegin.resultId };
+
+    s.scripted.write(savedResumeFrame({ requestId: "resume-2", sequence: 2, ...ids }));
+    await until("the resume reaches the owner view", () => provider.resumes.length === 1);
+    // Each refusal is answered before the next request arrives (the owner keeps at
+    // most one refusal waiting for its single send slot).
+    s.scripted.write(savedListFrame({ requestId: "replay", sequence: 2 }));
+    await until("the replay refusal", () => savedResults(s.pair).length === 1);
+    s.scripted.write(savedListFrame({ requestId: "busy-read", sequence: 3 }));
+    await until("the busy-read refusal", () => savedResults(s.pair).length === 2);
+    s.scripted.write(savedDeleteFrame({ requestId: "busy-delete", sequence: 4, ...ids }));
+    await until("three refusals", () => savedResults(s.pair).length === 3);
+    releaseResume();
+    await until("the accepted resume's result", () => savedResults(s.pair).length === 4);
+    assert.deepEqual(savedResults(s.pair), [
+      ["replay", { kind: "refused", reason: "duplicate" }],
+      ["busy-read", { kind: "refused", reason: "busy" }],
+      ["busy-delete", { kind: "refused", reason: "busy" }],
+      ["resume-2", { kind: "started", hostRunId: RUN_A, rowId: "native-7" }],
+    ], "the older accepted operation still delivers its own correlated result");
+    assert.equal(provider.lists.length, 1, "refused reads reached no provider");
+    assert.equal(provider.removes.length, 0, "a busy delete reached no provider");
+
+    // A newer read supersedes an older READ: its signal fires and it writes nothing.
+    let openGate: () => void = () => undefined;
+    provider.readGate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    s.scripted.write(savedListFrame({ requestId: "slow", sequence: 5 }));
+    await until("the slow read reaches the view", () => provider.lists.length === 2);
+    provider.readGate = null;
+    s.scripted.write(savedListFrame({ requestId: "fast", sequence: 6 }));
+    await until("the fast read completes", () => s.pair.ownerSide.frames()
+      .some((frame) => frame.type === "saved_window_end" && frame.requestId === "fast"));
+    openGate();
+    await settle();
+    assert.equal(provider.signals[1]?.aborted, true, "the superseded read was aborted");
+    assert.equal(provider.signals[2]?.aborted, false);
+    const touched = s.pair.ownerSide.frames().filter((frame) => "requestId" in frame && frame.requestId === "slow");
+    assert.deepEqual(touched, [], "a superseded read writes nothing at all");
+  } finally {
+    await s.owner.stopAll();
+  }
+});
+
+test("the viewer refuses a colliding request before submission and supersedes only an older read", async () => {
+  const provider = new FakeSavedProvider();
+  let releaseResume: () => void = () => undefined;
+  provider.resume = (request) => new Promise<OwnerSavedResumeFacts>((resolve) => {
+    releaseResume = () => resolve({ kind: "started", hostRunId: request.hostRunId, rowId: "native-3" });
+  });
+  const h = harness({ rows: [], capabilities: SAVED_CAPS, saved: provider, deletePolicy: () => true });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const run = h.inventory.hostRunId;
+    const saved = h.viewer.saved!;
+    const listed = await listedWindow(h.viewer, run);
+    const target = { hostRunId: run, catalogId: listed.catalogId, resultId: listed.resultId, entryId: "entry-0" };
+    const resumed = saved.resume(target);
+    await until("the resume reaches the owner view", () => provider.resumes.length === 1);
+    assert.deepEqual(await saved.list({ hostRunId: run, query: "", offset: 0, count: 5 }), { kind: "not-sent", reason: "busy" });
+    assert.deepEqual(await saved.remove({ ...target, confirmed: true }), { kind: "not-sent", reason: "busy" });
+    releaseResume();
+    assert.deepEqual(await mustSettle(resumed, "the resume"),
+      { kind: "owner-result", outcome: { kind: "started", hostRunId: run, rowId: "native-3" } });
+
+    let openGate: () => void = () => undefined;
+    provider.readGate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    const older = saved.list({ hostRunId: run, query: "older", offset: 0, count: 5 });
+    await until("the older read reaches the view", () => provider.lists.length === 2);
+    provider.readGate = null;
+    const newer = saved.list({ hostRunId: run, query: "newer", offset: 0, count: 5 });
+    assert.deepEqual(await mustSettle(older, "the superseded read"), { kind: "unknown" });
+    const fresh = await mustSettle(newer, "the newer read");
+    assert.ok(fresh.kind === "owner-result" && fresh.outcome.kind === "window");
+    openGate();
+    await settle();
+    assert.equal(h.pair.viewerSide.closedCalls, 0, "superseding a read is ordinary, never a violation");
+    const sequences = h.pair.viewerSide.frames().flatMap((frame) =>
+      (frame.type === "saved_list_request" || frame.type === "saved_resume_request" ? [frame.sequence] : []));
+    assert.deepEqual(sequences, [1, 2, 3, 4], "refused-before-submission attempts consume no sequence");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a late owner result after the requester's deadline is dropped and nothing is retried", async () => {
+  const provider = new FakeSavedProvider();
+  let releaseResume: () => void = () => undefined;
+  provider.resume = (request) => new Promise<OwnerSavedResumeFacts>((resolve) => {
+    releaseResume = () => resolve({ kind: "started", hostRunId: request.hostRunId, rowId: "native-late" });
+  });
+  const h = harness({ rows: [], capabilities: SAVED_CAPS, saved: provider });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const run = h.inventory.hostRunId;
+    const listed = await listedWindow(h.viewer, run);
+    const resumed = h.viewer.saved!.resume({ hostRunId: run, catalogId: listed.catalogId, resultId: listed.resultId, entryId: "entry-2" });
+    assert.deepEqual(await mustSettle(resumed, "the requester's deadline"), { kind: "unknown" });
+    releaseResume();
+    await until("the owner still reports its accepted work", () => h.pair.ownerSide.types().includes("saved_resume_result"));
+    await settle();
+    assert.equal(h.pair.viewerSide.frames().filter((frame) => frame.type === "saved_resume_request").length, 1,
+      "nothing is re-sent, replayed, or cancelled for an unanswered resume");
+    assert.equal(provider.resumes.length, 1);
+    assert.equal(h.pair.viewerSide.closedCalls, 0, "a late correlated result is dropped, never a violation");
+    // The channel stays healthy for the next request.
+    await listedWindow(h.viewer, run);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("roster and Saved frames share one send slot and alternate fairly when both are waiting", async () => {
+  const provider = new FakeSavedProvider();
+  provider.total = 6;
+  const rows = ["a", "b", "c", "d", "e", "f"];
+  const h = harness({ rows, capabilities: SAVED_CAPS, saved: provider, bounds: { maxRowsPerPage: 1 } });
+  try {
+    await h.viewer.hello;
+    const first = await h.viewer.subscribe();
+    await until("the initial policy description", () => h.viewer.saved?.policy !== undefined);
+    await settle();
+    const run = h.inventory.hostRunId;
+    const before = h.pair.ownerSide.sent.length;
+    // Hold the slot with a fresh roster transfer, then queue a Saved window behind it.
+    h.pair.ownerSide.hold = true;
+    h.inventory.rows = rows.map((id) => ownerRow(id, { label: `Renamed ${id}` }));
+    h.inventory.emit();
+    const listing = h.viewer.saved!.list({ hostRunId: run, query: "", offset: 0, count: 6 });
+    await until("the owner view answered", () => provider.lists.length === 1);
+    await settle();
+    h.pair.ownerSide.release();
+    const listed = await mustSettle(listing, "the interleaved window");
+    assert.ok(listed.kind === "owner-result" && listed.outcome.kind === "window" && listed.outcome.entries.length === 6);
+    await until("the newer roster", () => (h.viewer.projection.revision ?? 0) > (first.revision ?? 0));
+    const families = h.pair.ownerSide.types().slice(before)
+      .filter((type) => type.startsWith("snapshot_") || type.startsWith("saved_window_"))
+      .map((type) => (type.startsWith("snapshot_") ? "roster" : "saved"));
+    assert.deepEqual(families, Array.from({ length: 16 }, (_unused, index) => (index % 2 === 0 ? "roster" : "saved")),
+      "one frame from each transfer in turn, with no second queue and no starvation");
+    assert.equal(h.viewer.projection.state, "current");
+    assert.equal(h.viewer.projection.rows[0]?.label, "Renamed a");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a Saved frame that cannot be written closes the channel exactly like a roster frame", async () => {
+  const provider = new FakeSavedProvider();
+  const h = harness({ rows: [], capabilities: SAVED_CAPS, saved: provider });
+  provider.beforeAnswer = () => {
+    h.pair.ownerSide.failNextSend = true;
+  };
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const result = await mustSettle(
+      h.viewer.saved!.list({ hostRunId: h.inventory.hostRunId, query: "", offset: 0, count: 5 }),
+      "the unwritable window",
+    );
+    assert.deepEqual(result, { kind: "unknown" });
+    assert.equal(h.pair.ownerSide.closedCalls, 1, "the failed protocol channel is closed through its bounded API");
+    assert.ok(h.ownerDiagnostics.includes("send_failed"));
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a Saved query is exact, unclipped, and bounded only by one representable frame", async () => {
+  const provider = new FakeSavedProvider();
+  const h = harness({ rows: [], capabilities: SAVED_CAPS, saved: provider });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const run = h.inventory.hostRunId;
+    const saved = h.viewer.saved!;
+    for (const query of ["  fix  the build  ", "\u{1f5c2} saved", "", "q".repeat(10_000)]) {
+      const result = await mustSettle(saved.list({ hostRunId: run, query, offset: 0, count: 1 }), "an exact query");
+      assert.equal(result.kind, "owner-result");
+      assert.equal(provider.lists[provider.lists.length - 1]?.query, query, "the owner receives the exact query");
+    }
+    const before = h.pair.viewerSide.frames().length;
+    for (const request of [
+      { hostRunId: run, query: "q".repeat(70_000), offset: 0, count: 1 },
+      { hostRunId: run, query: "\ud800", offset: 0, count: 1 },
+      { hostRunId: run, query: "", offset: -1, count: 1 },
+      { hostRunId: run, query: "", offset: 0, count: 0 },
+      { hostRunId: run, query: "", offset: 0, count: 4_097 },
+      { hostRunId: "-bad", query: "", offset: 0, count: 1 },
+    ]) {
+      assert.deepEqual(await saved.list(request), { kind: "not-sent", reason: "invalid-request" },
+        `${JSON.stringify(request).slice(0, 60)} must be refused before submission`);
+    }
+    assert.deepEqual(await saved.list({ hostRunId: RUN_B, query: "", offset: 0, count: 1 }),
+      { kind: "not-sent", reason: "target-unavailable" }, "another run is never guessed or substituted");
+    assert.equal(h.pair.viewerSide.frames().length, before, "no refused request wrote anything");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a multi-page Saved window completes while the roster stays idle after its first snapshot", async () => {
+  const provider = new FakeSavedProvider();
+  provider.total = 7;
+  const h = harness({ rows: ["row-1"], capabilities: SAVED_CAPS, saved: provider, bounds: { maxRowsPerPage: 1 } });
+  try {
+    await h.viewer.hello;
+    const first = await h.viewer.subscribe();
+    await until("the initial policy description", () => h.viewer.saved?.policy !== undefined);
+    await settle();
+    // No inventory change follows: only Saved work is waiting for the slot.
+    const listed = await listedWindow(h.viewer, h.inventory.hostRunId, 7);
+    assert.equal(listed.entries.length, 7);
+    assert.equal(h.pair.ownerSide.frames().filter((frame) => frame.type === "saved_window_page").length, 7,
+      "every page of the window was written without any roster activity");
+    const again = await mustSettle(h.viewer.saved!.window({
+      hostRunId: h.inventory.hostRunId, catalogId: listed.catalogId, resultId: listed.resultId, offset: 3, count: 4,
+    }), "a second window on the idle lane");
+    assert.ok(again.kind === "owner-result" && again.outcome.kind === "window" && again.outcome.entries.length === 4);
+    assert.equal(h.viewer.projection.revision, first.revision, "no roster change was needed to move Saved work");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("Saved policy publications and refusals wait for the one send slot and stay bounded", async () => {
+  const provider = new FakeSavedProvider();
+  let exposed = false;
+  let releaseResume: () => void = () => undefined;
+  provider.resume = (request) => new Promise<OwnerSavedResumeFacts>((resolve) => {
+    releaseResume = () => resolve({ kind: "started", hostRunId: request.hostRunId, rowId: "native-held" });
+  });
+  const s = await savedOwnerHarness(provider, { deletePolicy: () => exposed });
+  try {
+    await s.subscribe();
+    await until("the initial policy", () => s.pair.ownerSide.types().includes("saved_policy"));
+    await settle();
+    s.scripted.write(savedResumeFrame({ requestId: "accepted", sequence: 1 }));
+    await until("the resume reaches the owner view", () => provider.resumes.length === 1);
+
+    // A roster write that does not drain holds the channel's single send slot.
+    s.pair.ownerSide.hold = true;
+    s.inventory.emit();
+    await until("the roster write holds the slot",
+      () => s.pair.ownerSide.types().filter((type) => type === "snapshot_begin").length === 2);
+    const held = s.pair.ownerSide.sent.length;
+    for (const value of [true, false, true]) {
+      exposed = value;
+      s.owner.notifySavedPolicy?.();
+    }
+    s.scripted.write(savedListFrame({ requestId: "replay", sequence: 1 }));
+    s.scripted.write(savedListFrame({ requestId: "busy-1", sequence: 2 }));
+    s.scripted.write(savedDeleteFrame({ requestId: "busy-2", sequence: 3 }));
+    await settle();
+    assert.equal(s.pair.ownerSide.sent.length, held, "no Saved write bypasses the held slot");
+
+    s.pair.ownerSide.release();
+    await until("the bounded refusal and the coalesced policy", () =>
+      s.pair.ownerSide.frames().filter((frame) => frame.type === "saved_policy").length === 2
+      && savedResults(s.pair).length === 1);
+    await settle();
+    assert.deepEqual(savedResults(s.pair), [["replay", { kind: "refused", reason: "duplicate" }]],
+      "one refusal waited for the slot; the excess was dropped, never accumulated");
+    const policies = s.pair.ownerSide.frames().flatMap((frame) => (frame.type === "saved_policy" ? [frame.deleteExposed] : []));
+    assert.deepEqual(policies, [false, true], "three notifications coalesced into one write of the live value");
+    assert.ok(s.ownerDiagnostics.includes("saved_reply_dropped"));
+
+    // The older accepted operation still delivers its own correlated result.
+    releaseResume();
+    await until("the accepted result", () => savedResults(s.pair).length === 2);
+    assert.deepEqual(savedResults(s.pair)[1], ["accepted", { kind: "started", hostRunId: RUN_A, rowId: "native-held" }]);
+  } finally {
+    await s.owner.stopAll();
+  }
+});
+
+test("a delete guard fails closed when its final authorizer turns exposure Off and notifies", async () => {
+  let exposed = true;
+  let mode: "off" | "off-then-on" | "none" = "off";
+  let armed = false;
+  let armedCalls = 0;
+  const guardResults: boolean[] = [];
+  let h: ReturnType<typeof harness> | undefined;
+  const provider = new FakeSavedProvider();
+  provider.remove = async (_request, guard) => {
+    armed = true;
+    armedCalls = 0;
+    const ok = guard();
+    armed = false;
+    guardResults.push(ok);
+    return ok ? { kind: "deleted", method: "trash" } : { kind: "refused", reason: "policy" };
+  };
+  h = harness({
+    rows: [], capabilities: SAVED_CAPS, saved: provider,
+    deletePolicy: () => exposed,
+    authorize: () => {
+      if (armed) {
+        armedCalls += 1;
+        // The FINAL authorizer callout inside the provider's last-instant guard
+        // switches exposure Off and notifies, while still answering `true`.
+        if (armedCalls === 2 && mode !== "none") {
+          exposed = false;
+          h?.owner.notifySavedPolicy?.();
+          if (mode === "off-then-on") exposed = true;
+        }
+      }
+      return true;
+    },
+  });
+  const live = h;
+  try {
+    await live.viewer.hello;
+    await live.viewer.subscribe();
+    const run = live.inventory.hostRunId;
+    const listed = await listedWindow(live.viewer, run);
+    const target = (entryId: string) => ({
+      hostRunId: run, catalogId: listed.catalogId, resultId: listed.resultId, entryId, confirmed: true,
+    });
+
+    assert.deepEqual(await mustSettle(live.viewer.saved!.remove(target("entry-0")), "an Off-during-proof delete"),
+      { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } });
+    assert.deepEqual(guardResults, [false], "the guard never proves a delete the policy turned Off during");
+
+    // Off and back On inside the same callout: the notification alone invalidates the proof.
+    exposed = true;
+    mode = "off-then-on";
+    assert.deepEqual(await mustSettle(live.viewer.saved!.remove(target("entry-1")), "an Off-then-On delete"),
+      { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } });
+    assert.deepEqual(guardResults, [false, false]);
+
+    // Without interference the same guard proves an exposed delete.
+    exposed = true;
+    mode = "none";
+    assert.deepEqual(await mustSettle(live.viewer.saved!.remove(target("entry-2")), "an undisturbed delete"),
+      { kind: "owner-result", outcome: { kind: "deleted", method: "trash" } });
+    assert.deepEqual(guardResults, [false, false, true]);
+  } finally {
+    await live.stop();
+  }
+});
+
+test("an authorizer that notifies during a roster write never causes a second outstanding write", async () => {
+  let exposed = false;
+  let armed = false;
+  let h: ReturnType<typeof harness> | undefined;
+  h = harness({
+    rows: ["a", "b", "c"], capabilities: SAVED_CAPS, saved: new FakeSavedProvider(),
+    bounds: { maxRowsPerPage: 1 },
+    deletePolicy: () => exposed,
+    authorize: () => {
+      if (armed) {
+        // One-shot: the roster pump's own authorization callout publishes a
+        // policy change, which reenters the pump while the outer pump is mid-check.
+        armed = false;
+        exposed = true;
+        h?.owner.notifySavedPolicy?.();
+      }
+      return true;
+    },
+  });
+  const live = h;
+  try {
+    await live.viewer.hello;
+    const first = await live.viewer.subscribe();
+    await until("the initial policy description", () => live.viewer.saved?.policy !== undefined);
+    await settle();
+    const before = live.pair.ownerSide.sent.length;
+    live.pair.ownerSide.hold = true;
+    armed = true;
+    live.inventory.rows = ["a", "b", "c"].map((id) => ownerRow(id, { label: `Next ${id}` }));
+    live.inventory.emit();
+    await settle();
+    assert.equal(armed, false, "the one-shot authorizer callout ran");
+    assert.equal(live.pair.ownerSide.sent.length, before + 1, "exactly one write is outstanding on the held slot");
+
+    live.pair.ownerSide.release();
+    await until("the newer roster", () => (live.viewer.projection.revision ?? 0) > (first.revision ?? 0));
+    await until("the newer policy", () => live.viewer.saved?.policy?.deleteExposed === true);
+    const roster = live.pair.ownerSide.types().slice(before).filter((type) => type.startsWith("snapshot_"));
+    assert.deepEqual(roster, ["snapshot_begin", "snapshot_page", "snapshot_page", "snapshot_page", "snapshot_end"],
+      "the roster transfer completed once, with no duplicated frame");
+    assert.equal(live.viewer.projection.state, "current");
+    assert.deepEqual(live.viewer.projection.rows.map((row) => row.label), ["Next a", "Next b", "Next c"]);
+    assert.equal(live.pair.viewerSide.closedCalls, 0, "the viewer never saw an incoherent transfer");
+  } finally {
+    await live.stop();
+  }
+});
+
+test("an initial policy whose callback triggers a roster transfer is still published afterwards", async () => {
+  let calls = 0;
+  let h: ReturnType<typeof harness> | undefined;
+  h = harness({
+    rows: ["a"], capabilities: SAVED_CAPS, saved: new FakeSavedProvider(),
+    deletePolicy: () => {
+      calls += 1;
+      if (calls === 1 && h !== undefined) {
+        // The first policy read publishes one newer inventory snapshot, whose
+        // roster write takes the slot before the policy can be written.
+        h.inventory.rows = [ownerRow("a", { label: "Changed" })];
+        h.inventory.emit();
+      }
+      return true;
+    },
+  });
+  const live = h;
+  try {
+    await live.viewer.hello;
+    const first = await live.viewer.subscribe();
+    // No further notification or Saved request: the publication must survive on its own.
+    await until("the current policy after the roster drains", () => live.viewer.saved?.policy?.deleteExposed === true);
+    assert.deepEqual(live.viewer.saved?.policy, { hostRunId: live.inventory.hostRunId, deleteExposed: true });
+    await until("the newer roster", () => (live.viewer.projection.revision ?? 0) > (first.revision ?? 0));
+    assert.equal(live.viewer.projection.rows[0]?.label, "Changed");
+    assert.ok(calls >= 2, "the policy was read again, fresh, when it was finally dispatched");
+  } finally {
+    await live.stop();
   }
 });

@@ -111,11 +111,13 @@ private Windows ACL guarantee.
 ### Session-host peer network (optional)
 
 The optional `pi-review-sessions` host can expose a **Network** sidebar for explicit
-pairing, remote session rows, and one deliberately selected row's native
-viewport. Ordinary Pi sessions and the standalone review-gate launchers are unchanged
+pairing, remote session rows, one deliberately selected row's native viewport with
+native input and copy, owner-routed Close and Create, and one chosen owner's saved
+conversations. Every operation is performed by the owning host on its own children and
+files. Ordinary Pi sessions and the standalone review-gate launchers are unchanged
 and start no peer listener or client. This is an
-optional alpha surface: it does not certify native-Windows UI, physical input, mobile,
-browser, or release readiness.
+optional alpha surface: it does not certify two-machine operation, native-Windows UI,
+physical input, physical clipboard delivery, mobile, browser, or release readiness.
 
 The transport is direct TLS/WSS with generated self-signed certificates. The authority for
 a peer is the exact subject-public-key information proved by its TLS handshake, not a
@@ -186,12 +188,14 @@ Shutdown closes only this host's owned local network resources and retains
 agent-directory ownership when local settlement is unconfirmed; it never waits for or
 claims a remote receipt or remote work outcome.
 
-The connected application channel is a projection of the owner's roster, not remote
-control. Its roster lane carries bounded display facts, including the exact owner-side
-workspace path, and never the native current-file guard, agent/account directories,
-configuration, providers, credentials, prompts, transcripts, question text,
-terminal/output bytes, or image data. A lost projection is stale or unavailable, never
-idle or zero.
+The roster lane is a projection of the owner's roster. By itself it grants no control.
+Control exists only through the separately negotiated native I/O bridge and the
+owner-routed Close, Create, and Saved operations described below, each re-authorized
+and performed by the owner. Roster rows carry bounded display facts, including the exact
+owner-side workspace path, and never the native current-file guard, agent/account
+directories, configuration, providers, credentials, prompts, transcripts, question
+text, terminal/output bytes, or image data. A lost projection is stale or unavailable,
+never idle or zero.
 
 One deliberate local selection may instead display one exact owner row's native
 viewport, on the additive content lane of the same TLS/WSS listener and `/app` path,
@@ -237,13 +241,20 @@ a grant or lease. A whole paste is validated up to exactly 1 MiB of decoded UTF-
 one PTY handoff and is never truncated, and a completed copy reaches only its exact
 initiating viewer. Input submission reports `not-sent` only before any transport-write invocation,
 `submitted` only as local transport completion, and a possibly invoked loss or source change as
-`unknown`, with no replay, retry, or cancellation claim. A network `SessionSpawn`, remote
-saved conversations and resume, and human handoff remain unimplemented. The owner's
-separate remote history-deletion exposure policy (default on, remembered Off) is a live
-readable fact for a future owner-side Saved provider; it is not a viewer-side toggle, does
-not gate local Saved deletion, and no remote history endpoint exists yet. Close remains
-owner-routed from the requesting sidebar's actually written highlighted row, as described
-below.
+`unknown`, with no replay, retry, or cancellation claim. Several viewers may control the
+same owner row independently, and the owner's own Main need not display it.
+
+The optional `native-input-startup-v1` capability, which depends on
+`native-input-copy-v1`, lets an authorized viewer answer a native startup prompt such as
+`Trust project folder?` with ordinary keys before the child has a conversation. Startup
+authority is explicit rather than inferred from a missing tuple. The child arms it only
+after its owned reporter registered the mandatory public hooks, and the first session
+update closes it permanently. The owner's registration closes it at the first accepted
+status, disconnect, or exit. A startup source has no native session field and its own
+token domain. Pi's trust decision and persistence are unchanged, nothing is trusted
+automatically, and copy is unsupported until a real conversation exists. A network
+`SessionSpawn` and human handoff remain unimplemented. Close remains owner-routed from
+the requesting sidebar's actually written highlighted row, as described below.
 
 The optional owner Close capability runs over the existing roster channel, not a new
 listener or permission kind. The current TLS-proved key, pin, and owner's receiving
@@ -262,6 +273,38 @@ confirmation-required result arms only the next deliberate Close, never an autom
 dialog, retry or confirmed request. These reminders are not authorization and are not
 silently evicted for another still-valid target.
 See [Owner Close transport](session-host-alpha.md#owner-close-transport-foundation).
+
+The optional owner Saved capability (`roster-saved-v1`) also rides the existing roster
+channel under the same key, pin, and grant checks; acknowledging it grants nothing. It
+lets a viewer browse and search one chosen owner's full saved-conversation catalog in
+bounded windows, resume a conversation as a new owner-owned child, and delete one saved
+file there. Rows carry the owner's own session id, saved file path, caption, and
+recorded workspace exactly, presented through the Local picker formatter. The chosen
+owner's saved file paths do cross the network as display data. The roster's current-file guard still never does. Displayed
+paths are never request authority. Requests name only opaque owner-issued
+catalog/result/entry handles and the exact owner run, and the requester never resolves,
+opens, stats, or deletes a displayed path locally. No file contents, transcript, search
+index, or history sync crosses, and there are no separate agent- or project-directory
+fields. Directory names that appear inside a displayed saved file path or recorded
+workspace are still visible. Resume uses the owner's
+existing native Saved admission and duplicate-open guards.
+
+Remote deletion is gated by the owner's own **Allow remote history deletion** policy
+(default on, explicit Off remembered). That policy is independent of any viewer's Remote
+input/copy setting and of the owner's own local Saved deletion. The description a viewer
+sees is not a grant. While the policy is unknown or Off, the viewer hides delete and the
+owner refuses both prepare and confirmed requests. At the mutation, the owner re-checks
+its live policy, the channel, and the saved-file facts. Its one session manager then
+performs one guarded native operation: a final caller authorization, a private census of
+its own children, and non-reentrant native filesystem checks before each `trash` or
+unlink handoff. It keeps the existing refusals for live, unknown-binding, current-file,
+or reserved conversations and for canonical-path, header, or file-identity
+replacement. Requests from the viewer need the actually written picker or confirmation
+frame, consumed once and re-proved inside the ordered write. One Saved request is
+pending per channel. Busy mutation requests are not retained for later submission;
+ordered transport writes re-check authority at dispatch. No mutation is replayed or
+retried, and an unconfirmed or unknown outcome stays so. See
+[Saved conversations on a connected owner](session-host-alpha.md#saved-conversations-on-a-connected-owner).
 
 ### Session-host clipboard transport
 
@@ -298,7 +341,8 @@ fall back to the owner's outer terminal or local clipboard callback. A completed
 viewer-origin copy travels only to its exact initiating viewer, with the full native
 encoded payload up to the unchanged 100,000-character producer bound retained whole, and
 that viewer writes it to its own terminal only while its Remote input/copy setting is on.
-No native Pi change or live retrofit is involved. Authenticated local and SSH clipboard
+A copy cannot originate from the pre-conversation startup phase. No native Pi change or
+live retrofit is involved. Authenticated local and SSH clipboard
 copying is unchanged, nothing is broadcast, and raw PTY OSC 52 stays denied.
 
 The selected text is transient transport data, not a new diagnostic, roster, or clipboard

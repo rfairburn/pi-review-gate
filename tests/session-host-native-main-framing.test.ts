@@ -1,9 +1,10 @@
 /**
- * Focused real-native regression for Main's internal input-origin framing
- * opt-in (`MainDependencies.nativeInputOriginFraming`, supplied by local launch
- * helpers through the internal dependency seam).
+ * Focused real-native regression for Main's input-origin framing
+ * (`MainDependencies.nativeInputOriginFraming`). Normal production Main enables
+ * it by default; this case still requests it explicitly through the internal
+ * dependency seam, so the option's forwarding stays pinned.
  *
- * The opted-in flag is a manager registration option, carried through Main's
+ * The framing flag is a manager registration option, carried through Main's
  * production status adapter to the actual broker and recorded in the child's
  * one-shot bootstrap. An adapter that drops it makes the manager refuse the
  * row before any PTY exists: local New then displays a bounded startup error
@@ -18,8 +19,8 @@
  * external editor. The only child journal records are its own native
  * session_start lifecycle.
  *
- * The existing default-off native Main test remains the ordinary-behavior
- * control; the focused Main-adapter test in tests/session-host-main.test.ts
+ * The existing native Main test covers ordinary local behavior; the focused
+ * Main-adapter test in tests/session-host-main.test.ts
  * covers option forwarding, bootstrap mode, registration identity, and
  * callback preservation against the real broker.
  */

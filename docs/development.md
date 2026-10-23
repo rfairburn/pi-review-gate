@@ -299,14 +299,20 @@ for same-terminal standalone/hosted copying and an actual paste **on the client*
 
 ### Network native input and copy (#389)
 
-After `npm run build:test`, the two focused acceptance files are:
+After `npm run build:test`, the focused files are:
 
 ```sh
+node --test dist-test/tests/session-host-native-input-startup.test.js
 node --test dist-test/tests/session-host-network-session-content-integration.test.js
 node --test dist-test/tests/session-host-network-native-input-copy.test.js
 ```
 
-They are different proof levels. Both exercise the native I/O bridge wiring directly
+`session-host-native-input-startup.test.ts` is a pure codec tier. It covers the
+optional `native-input-startup-v1` capability and its dependency on
+`native-input-copy-v1`, the tuple-less startup source, and the separate startup scope
+token domain. It runs no PTY, transport, or native Pi.
+
+The other two are different proof levels. Both exercise the native I/O bridge wiring directly
 (manager framing option and coordinator callbacks) rather than a physical production Main;
 production Main enables that bridge by default, with a per-viewer Remote input/copy
 setting that the coordinator and Main source tests cover separately.
@@ -327,8 +333,13 @@ TLS/pin/grant/service/manager stack, and the full-copy path. Its input legs cove
 and a whole paste of exactly 1 MiB checked by an exact native digest, and its copy leg
 retains the full 100,000-character producer bound across the wire pages. An F7 raw-write
 decoy witness checks that a synchronous public shortcut write is refused as unverified
-provenance instead of becoming a copy. The viewer's actual-written receipt seam is still
-simulated by the case, not a physical Main, terminal, or UI certificate.
+provenance instead of becoming a copy. Its startup leg launches a fresh owned child that
+shows Pi's normal `Trust project folder?` selector before any conversation exists. The
+selector protects task-owned project resources inside an owned workspace, with no
+automatic trust option and no Pi patch. The leg answers it over the negotiated startup
+capability and checks that the phase closes after the first session update. The viewer's
+actual-written receipt seam is still simulated by the case, not a physical Main,
+terminal, or UI certificate.
 
 Before any copy gesture, that real-child file requires a per-child, pid- and
 nonce-scoped attestation. The child's own `session_start` handler imports the exact
@@ -344,9 +355,54 @@ The case never uses a physical clipboard read or write as its probe. The existin
 native clipboard routing and origin fixtures remain separate and are not replaced by
 these two files.
 
-Both files are same-host POSIX evidence. They do not establish cross-machine behavior,
+The two network files are same-host POSIX evidence. They do not establish cross-machine behavior,
 Windows ConPTY, a mobile client, a physical OS clipboard write, a physical Main focus or
 write receipt, operator certification, full-suite or CI success, or release approval.
+
+`tests/session-host-native-clipboard-origin-bridge.test.ts` and
+`tests/session-host-native-main-framing.test.ts` remain the child-bridge framing and
+real-Main local-New framing regressions; the main-framing case requests the framing
+explicitly, which production Main now also does by default.
+
+### Network owner Saved conversations (#389)
+
+After `npm run build:test`, the focused Saved files are:
+
+```sh
+node --test dist-test/tests/session-host-network-peer-saved.test.js
+node --test dist-test/tests/session-host-network-roster-bridge.test.js
+node --test dist-test/tests/session-host-network-peer-coordinator-saved.test.js
+node --test dist-test/tests/session-host-network-native-saved-provider.test.js
+node --test dist-test/tests/peer-saved-sidebar.test.js
+```
+
+They are separate proof levels:
+
+- `session-host-network-peer-saved.test.ts` is pure: the closed Saved request and
+  fact contracts, exact queries and entry text, window facts, and the window packer,
+  including whole-entry fragments. It opens no socket and touches no filesystem.
+- `session-host-network-roster-bridge.test.ts` covers the Saved RPC paths of the roster
+  bridge over an in-memory loopback channel pair, not a real transport.
+- `session-host-network-peer-coordinator-saved.test.ts` runs the real TLS loopback,
+  real pairing and directional grant, real protected stores, the real roster bridge on
+  both sides, and the real coordinator. The owner deliberately starts with an empty
+  roster. Its session manager and Saved catalog view are scripted in-memory stand-ins,
+  so it touches no saved conversation or native Pi.
+
+- `session-host-network-native-saved-provider.test.ts` uses branded native catalogs and
+  owned synthetic Saved files, an injected public-SDK listing, and a guarded host double.
+  It covers scoped freshness, exact native search, stable opaque handles, and mutation
+  authorization without running a native Pi child.
+- `peer-saved-sidebar.test.ts` covers the pure picker: selected-host display, bounded
+  windows, written-frame authority, confirmations, and request lifetimes.
+
+The owner's guarded native resume and delete are also covered by
+`session-host-instances.test.ts` and `session-host-owning-host-service.test.ts`, using
+mock PTYs and owned synthetic Saved-file and filesystem fixtures, not a native Pi child.
+These fixtures cover their named contracts when executed; their presence alone is not a
+passing test result. They are not a whole production Main run with a real owner Saved
+provider, two-machine operation, Windows, or operator acceptance, and they do not imply
+full-suite or CI success.
 
 ## Static checks and docs validation
 

@@ -1,7 +1,8 @@
 /**
- * Focused tests for the inert, opt-in stdin-origin framing mode of the
- * child-side native clipboard bridge, including its one-shot signed readiness
- * statement.
+ * Focused tests for the stdin-origin framing mode of the child-side native
+ * clipboard bridge, including its one-shot signed readiness statement. The mode
+ * is requested explicitly at install; normal production Main requests it by
+ * default for the children it creates.
  *
  * Evidence scope (MOCK, source-only): every bridge case runs in an isolated Node
  * child process whose "native CLI" is a throwaway fake package
@@ -14,8 +15,7 @@
  * emitted chunks into the ACTUAL pinned public `StdinBuffer` from
  * `pi-session-host-tui` (`@earendil-works/pi-tui@1.3.0`), so it does observe real
  * native parser state — but it is not the full native Pi UI, a real native
- * PTY/Windows/SSH child, the broker or viewer plumbing, or any physical clipboard,
- * and no production caller enables the mode.
+ * PTY/Windows/SSH child, the broker or viewer plumbing, or any physical clipboard.
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";

@@ -1,11 +1,17 @@
 # Optional Pi session host (alpha)
 
 `pi-review-sessions` is an optional terminal host for running multiple, independent
-native Pi sessions side by side. It is a separate entry point: it does not replace
-`pi-review-gate`, the normal Pi CLI, or either standalone review-gate launcher. Use
-those existing entry points as before when you want one ordinary Pi session. It is not
-a tmux integration, daemon, remote host, or session-adoption layer: it owns only
-sessions it starts locally.
+native Pi sessions side by side, on one machine or across paired machines. It is a
+separate entry point: it does not replace `pi-review-gate`, the normal Pi CLI, or either
+standalone review-gate launcher, and it changes no native Pi CLI, runtime, version, or
+public SDK. Use those existing entry points as before when you want one ordinary Pi
+session. It is not a tmux integration, daemon, or session-adoption layer: each host owns
+only the children its own session manager started. Through the optional
+[Network sidebar](#network-sidebar-hosting-pairing-and-remote-metadata), a paired
+viewer on another machine can display, type into, copy from, and close one owner's
+sessions, create new ones there, and browse, resume, or delete that owner's
+[saved conversations](#saved-conversations-on-a-connected-owner). It does this without
+adopting, migrating, or synchronizing them: the owning host keeps every process.
 
 This is alpha guidance, not a finished-host compatibility guarantee. The alpha design
 uses Pi's public `ProcessTerminal` input and terminal-negotiation path with custom
@@ -14,7 +20,8 @@ terminal-input, menu, question, editor, and runtime parity remain under integrat
 verification.
 
 Component, mock, or socket tests alone do not prove compatibility with a real native
-Pi wrapper. macOS and Linux are the intended POSIX host platforms; intended platform
+Pi wrapper, and same-host network tests do not establish two-machine, operator, or
+platform readiness for the cross-machine features. macOS and Linux are the intended POSIX host platforms; intended platform
 scope is not evidence that end-to-end runtime compatibility has been proven. Windows
 startup, public named-pipe, and pinned node-pty ConPTY source paths are experimental
 only; they are not Windows runtime support or readiness evidence. Manual Windows
@@ -533,7 +540,11 @@ captions/paths are visibly ellipsized) — never transcripts, tool arguments, qu
 text, or credentials. A small details area below the list shows more of the selected
 caption and its recorded workspace, wrapped within its reserved rows: the full
 workspace is shown only when it fits, otherwise it is explicitly truncated; a missing
-workspace shows as unavailable, never a current-workspace guess. Highlighting a row does nothing to any running session. Deliberately selecting a row
+workspace shows as unavailable, never a current-workspace guess. The picker opens on
+this computer's **Local** catalog every time; choosing a connected owner instead is
+described under
+[Saved conversations on a connected owner](#saved-conversations-on-a-connected-owner),
+and this section describes the Local catalog. Highlighting a row does nothing to any running session. Deliberately selecting a row
 revalidates that exact catalog entry (file identity and first-line header) against the
 live file and starts a new, independently owned child in that conversation's recorded
 workspace with an exact per-child `--session` admission; it never adopts an external
@@ -611,14 +622,18 @@ settling its children at quit — against that one manager rather than against a
 copy of the truth. The sidebar projects the manager's current process/session facts;
 remembered roster slots, their ordering, and the active selection remain separate
 presentation metadata. Those remembered observations never become a second authoritative
-process or status store. This ownership is
-local to one host process on one machine. A connected peer may see a projection of this
-manager's roster metadata and, when this sidebar deliberately selects one row, that row's
-native viewport (see
-[Network sidebar](#network-sidebar-hosting-pairing-and-remote-metadata) and
-[Selected native viewport](#selected-native-viewport-interim-display-scope)). Neither
-implies remote control, a second host sharing the same sessions, or any change to how each
-child's own terminal, input, or saved conversations behave.
+process or status store. This ownership belongs to
+one host process on one machine. A paired viewer on another machine may see a projection
+of this manager's roster metadata, display one deliberately selected row's native
+viewport, forward native input to it and receive its copies, ask this owner to close or
+create a session, and browse, resume, or delete this owner's saved conversations (see
+[Network sidebar](#network-sidebar-hosting-pairing-and-remote-metadata),
+[Selected native viewport](#selected-native-viewport-interim-display-scope), and
+[Saved conversations on a connected owner](#saved-conversations-on-a-connected-owner)).
+Every such operation is performed by this host through this same manager. None of it
+creates a second host sharing the same sessions, moves a process or conversation to the
+viewer, or changes how each child's own terminal, local input, or local saved
+conversations behave.
 
 ### Paired peer transport foundation
 
@@ -656,10 +671,11 @@ lane described under
 [owner-routed Create](#owner-create-transport-foundation) that an explicit New-form Host
 choice uses. The content lane also carries the native input and text-copy bridge that
 normal production Main enables by default, with a per-viewer off setting (see
-[Native input and copy](#native-input-and-copy)).
+[Native input and copy](#native-input-and-copy)), and the roster lane carries the
+optional owner Saved catalog exchange (see
+[Saved conversations on a connected owner](#saved-conversations-on-a-connected-owner)).
 `SessionSpawn` is unchanged: it remains the native, owner-bound tool inside a hosted
-child and is not a network request. Remote saved conversations, resume, catalog/history,
-and human handoff remain unimplemented. Native
+child and is not a network request. Human handoff remains unimplemented. Native
 client-only mobile implementations can use this trust model;
 ordinary browser WebSockets do not expose self-signed certificate pinning and are not
 claimed supported.
@@ -756,8 +772,10 @@ policy is added.
 The roster projection itself stays metadata-only: connecting a destination adds no
 terminal content, input, or session operation by itself. The base `roster-v1` capability
 cannot create, stop, or close an owner session; the separate optional
-[Close capability](#owner-close-transport-foundation) adds an explicit owner-routed
-operation without requiring a content selection. A deliberate selection can display one exact
+[Close](#owner-close-transport-foundation),
+[Create](#owner-create-transport-foundation), and
+[Saved](#saved-conversations-on-a-connected-owner) capabilities each add explicit
+owner-routed operations without requiring a content selection. A deliberate selection can display one exact
 row's native viewport (see
 [Selected native viewport](#selected-native-viewport-interim-display-scope)); every other
 row stays metadata-only. That is an implemented protocol scope, not a view-only permission
@@ -832,7 +850,8 @@ explicit Connect, including across host restarts.
 
 The Network pane also shows **Remote input/copy** (this viewer only; Enter toggles it) and
 **Allow remote history deletion** (this host's owner policy; Enter toggles it), each with
-its saved on/off value; see [Native input and copy](#native-input-and-copy). Like the
+its saved on/off value; see [Native input and copy](#native-input-and-copy) and
+[Saved conversations on a connected owner](#saved-conversations-on-a-connected-owner). Like the
 other toggles, Enter or a click acts only on the state the drawn row displayed (a click
 additionally needs that row's written frame), and an unknown settings value sends nothing.
 
@@ -879,10 +898,12 @@ keyboard, canonical mouse, whole text paste, and text copy travel through the de
 [native I/O bridge](#native-input-and-copy) while this viewer's Remote input/copy
 setting is on. A deliberate New-form Host choice can ask one connected
 destination's owner for one blank child, as described under
-[Owner Create transport foundation](#owner-create-transport-foundation); `SessionSpawn`
-remains the native, owner-bound tool described above, and remote saved conversations,
-resume, catalog/history, and human handoff remain unimplemented
-at this ordered interim slice. Close uses the highlighted remote row and its owner,
+[Owner Create transport foundation](#owner-create-transport-foundation), and the Saved
+picker can browse, resume, and delete one connected owner's saved conversations, as
+described under
+[Saved conversations on a connected owner](#saved-conversations-on-a-connected-owner).
+`SessionSpawn` remains the native, owner-bound tool described above, and human handoff
+remains unimplemented. Close uses the highlighted remote row and its owner,
 independently of the displayed stream. Host shutdown
 closes only this host's owned local network
 resources and waits for that local settlement; an unconfirmed close is reported and
@@ -939,9 +960,12 @@ with the fingerprint the other host shows for approval through an independent ch
 you need to rule out an active interceptor during first pairing, then confirm the
 server-key dialog on B, approve A's incoming request, and compare B's remote rows with
 A's local roster. Select one of those remote rows on B and confirm its owner's native
-viewport appears while A keeps running and B's own local sessions are untouched; then
-select a local row on B and confirm the remote stream is released rather than retained.
-Disconnect on B and confirm the rows become stale, then remove the destination on B and
+viewport appears while A keeps running and B's own local sessions are untouched. With
+B's Remote input/copy on, type a harmless unsent draft into that pane and confirm it
+appears in A's session without changing A's own focus; then select a local row on B and
+confirm the remote stream is released rather than retained. Open Saved on B, change its
+Host line to A, and compare the rows with A's own Local Saved picker without resuming or
+deleting anything you want to keep. Disconnect on B and confirm the rows become stale, then remove the destination on B and
 confirm it forgets only that endpoint and local pin.
 These are optional manual alpha checks, not an installation, support, release, or
 cross-machine readiness claim; CI does not run them.
@@ -1014,8 +1038,7 @@ semantic source cannot authorize a click or copy. Repainting the same accepted f
 not invent a new source receipt. Input modes and cursor facts carried with a
 viewport are inert observations for rendering; they grant no input.
 
-This is an ordered interim slice, not a finished remote session surface. Keyboard,
-canonical mouse, whole text paste, and text copy travel through the
+Keyboard, canonical mouse, whole text paste, and text copy travel through the
 [native I/O bridge](#native-input-and-copy), which normal production Main enables by
 default; this viewer's remembered **Remote input/copy** Network setting can turn
 forwarding off for its own displayed remote pane only. While it is off, native-pane
@@ -1023,10 +1046,12 @@ keyboard, paste, and mouse packets are not forwarded to the remote owner (one br
 notice says nothing was sent), and no local child ever receives them on that stream's
 behalf. That setting is a per-viewer preference, not a permission kind, grant, or
 owner-side policy. A deliberate New-form Host choice can create one blank child through
-the owner-routed Create capability described below; `SessionSpawn` remains the native,
-owner-bound tool described above rather than a network request, and remote saved
-conversations, resume, catalog/history, and human handoff are not implemented. The
-owner-routed Close controls are described below.
+the owner-routed Create capability described below, and the Saved picker can reach one
+connected owner's saved conversations (see
+[Saved conversations on a connected owner](#saved-conversations-on-a-connected-owner)).
+`SessionSpawn` remains the native, owner-bound tool described above rather than a network
+request, and human handoff is not implemented. The owner-routed Close controls are
+described below.
 Authenticated local and SSH clipboard copying, ordinary standalone Pi, and local host
 input are unchanged: nothing is broadcast, a remote copy reaches only its initiating
 viewer, raw PTY OSC 52 stays denied, and no last-input-origin inference is added. Native
@@ -1141,6 +1166,106 @@ editable listen default, and protected identity/pin persistence are unchanged.
 `SessionSpawn` is not replaced: it stays the native, owner-bound tool described above.
 Remote New does not add or require a network `SessionSpawn` RPC.
 
+### Saved conversations on a connected owner
+
+The Saved picker can show the complete saved-conversation catalog of one chosen owner
+host: browse it, search it, resume a conversation there, and, when that owner allows it,
+delete a saved conversation there. It uses an optional `roster-saved-v1` capability on
+that owner's existing paired roster channel: the same listener, TLS/WSS `/app` upgrade,
+TLS-proved peer key, remembered pin, and directional receiving grant as every other
+owner request. The owner acknowledges it only when it really holds its own Saved
+catalog provider and live delete policy; acknowledgement is protocol support, not
+authority. No second daemon, listener, manager, authority registry, history store,
+index, transcript copy, or controller lease is added.
+
+**Choosing a host.** The picker opens on **Local**, meaning the computer running this
+sidebar, never the host of a currently displayed remote row, with a blank query every
+time. While a connected destination can be offered, the picker shows a Host line that
+selects Local or one connected owner. An actual Host change, in either direction, clears the query and
+every result; choosing the same Host again changes nothing, and no per-host query
+history is kept. Opening Saved or changing its Host never resumes anything and never
+changes the displayed or active native row. An owner whose roster is empty is a valid
+choice: Saved needs no displayed row, native conversation tuple, focus, or geometry. A
+connected owner without the capability, such as an older version, is an unsupported
+choice. Choosing it shows one fixed brief notice and requests nothing, with no fallback,
+upgrade, automatic connection, or new grant.
+
+**What a remote row shows.** Each row carries exactly what the owner's own Local picker
+row holds: the native session id, the saved conversation file path, the canonical
+caption, and the recorded workspace. They are the owner's own values, unclipped and
+unredacted, and they are drawn through the same row, details, and confirmation
+formatter as a Local row, so the chosen host's picker looks as it would on that host.
+The full saved file path is shown wherever the Local picker shows it. A Windows owner's
+paths appear verbatim on a POSIX viewer. These values are display data only. Every
+Resume or Delete request names only opaque owner-issued catalog, result, and entry
+handles plus the exact owner run. The requester never resolves, completes, opens,
+stats, or deletes a displayed path on its own filesystem, and the owner maps each handle
+back to its own private row and file identity under its own guards. No file contents,
+transcript, search index, or history sync crosses the network, and there are no
+separate project- or agent-directory fields. Directory names that are part of a
+displayed saved file path or recorded workspace are still visible. The roster's existing boundary is unchanged: a live child's current-file guard
+path still never crosses. Saved file paths of the chosen owner do cross the network as
+picker display data.
+
+**Search and the full catalog.** Search runs on the owner with the owner's native Saved
+search semantics, exactly as its Local picker would: fuzzy tokens, quoted phrases,
+`re:` regular expressions, spaces, and Unicode. The query is forwarded verbatim, with no
+trimming, normalization, or added length cap; its only limit is the technical size of one
+lane frame. The unfiltered catalog and any search result are reachable in full, however
+many rows they have, through bounded windows over one immutable owner result. Each
+window states the full result total. Entry handles stay stable across windows of the
+same result, and fetching another window never relists the catalog or reissues
+handles. Nothing is cut off at a fixed total, refined implicitly, or silently truncated.
+Existing Up/Down wrap navigation, matching, and keys are unchanged, with no new Home,
+Page, or wheel keys. The viewer keeps at most three windows, and a row not yet fetched
+is a non-actionable loading placeholder. A window carries at most 4096 rows or 8 MiB, in
+pages of 32 rows within 64 KiB frames. A legal entry too large for one frame is carried
+whole across fragment frames, never omitted or clipped.
+
+**Resume.** Resume uses the owner's own native Saved admission: the same exact catalog
+entry, recorded workspace, file identity, root, and header checks, and the same refusal
+of a conversation already open or reserved by one of the owner's children. A successful
+Resume starts a new native child owned by the owner's manager in the owner's run. On
+this viewer only, the exact returned owner run and row is selected for display, while
+the same request still owns the picker, even when the owner's row publication arrives
+later. Accepted work that finishes after the picker moved on completes without taking
+over this viewer's pane, focus, or drafts, and without stopping or resizing anything.
+The owner's own local focus, Main owner, and drafts are unchanged.
+
+**Delete.** Remote deletion is governed by the owner's **Allow remote history deletion**
+Network setting. This is the owner host's own exposure policy, on by default, with an
+explicit Off remembered. It is independent of the viewer's Remote input/copy setting.
+It is not a viewer-side delete control, and it does not gate the owner's own Local Saved
+deletion. The policy a viewer sees is a description, not a grant. While it is unknown or
+Off, the viewer hides the delete hint and the owner refuses both the prepare and the
+confirmed request. The viewer uses the same full-file confirmation, warning, fitting,
+and paste guards as a Local delete, labelled with the owner host. At the moment of
+removal, the owner rechecks its live policy, the channel, and its saved-file facts. A
+policy change is reported without waiting for a roster refresh, and a deletion that
+already completed is still reported truthfully if the policy is later turned Off. The
+owner keeps its existing Local deletion behavior. It tries native `trash` first and
+falls back to permanent unlink, and a conversation whose workspace is missing can still
+be deleted. Live, unknown, or current-file conversations owned by the owner's children
+are refused, as are pending reservations and canonical-path, header, or file-identity
+replacements. Every removal is performed only by the owner.
+
+**Fences and outcomes.** Requests come from the picker frame, or confirmation, that the
+writer actually wrote. Resume and delete-prepare need the written picker; a confirmed
+delete needs the written confirmation. Each uses a one-shot proof that is re-proved
+against the current semantic content, geometry, view, cover, and lifetime inside the
+ordered write. An ordinary repaint with the same content does not invalidate it, but a
+real change does, even one that changes back. One Saved request is pending per channel.
+A newer read replaces an older read that was not yet sent, quietly and without leaving
+loading gaps or stray notices. Busy Resume or Delete requests are not kept for later
+submission; an ordered transport write still re-checks authority at dispatch. Accepted
+mutations are not superseded or replayed. `not-sent` is reported only with proof that
+no transport write was invoked.
+A completed send is a transport handoff, not proof that the owner executed anything. A
+loss after a write may have been invoked is `unknown`. Nothing is retried, replayed,
+regranted, reconnected, or claimed cancelled automatically. Refusals and uncertainty
+appear as brief, fixed, non-modal notices without raw errors or payloads, and they
+never steal focus.
+
 ## Focus, display, and status
 
 Host keyboard controls apply only while the corresponding host surface has focus. In
@@ -1229,7 +1354,7 @@ submitted. The Host line uses the single spacer row the form already reserved, s
 editable body keeps its previous row budget. A successful Local submission activates the
 created child as the active Main input owner, while a successful remote submission only
 selects the viewport of the returned owner run and row, and never makes it a local input
-owner or enables native remote input. The submission key's repeat/release is fenced in
+owner; input to it follows the [native I/O bridge](#native-input-and-copy). The submission key's repeat/release is fenced in
 both cases so it is never replayed as native input. In a Local form, if a completion menu
 is open, the first Escape/cancel action dismisses that native menu and keeps the form; the
 next fresh Escape cancels only New and returns to the visible roster without hiding the
@@ -1517,9 +1642,9 @@ Two separate, remembered **Network** menu settings sit on top of that bridge:
   default): whether this host exposes remote saved-history deletion to its paired viewers.
   It is not a viewer-side delete toggle, it does not gate this host's own local Saved
   deletion, and it changes no viewer's input, grant, Hosting, Auto, or connection. An
-  explicit Off is remembered across restarts. The coordinator exposes the live value for
-  the owner's future Saved provider; no remote Saved catalog, search, resume, or delete
-  endpoint exists yet, so today this setting is stored and displayed but exposes nothing.
+  explicit Off is remembered across restarts. The owner reads the live value at every
+  remote delete decision, as described under
+  [Saved conversations on a connected owner](#saved-conversations-on-a-connected-owner).
 
 Both settings are saved like the other Network settings: written before they take
 effect, with no identity, key, or listener created, and an unsaved change reports the
@@ -1528,7 +1653,9 @@ malformed settings are never treated as the default-on values: remote input/copy
 off and the history-deletion policy reports off.
 
 Negotiation is explicit: `native-input-copy-v1` is offered only when Main supplied the
-callbacks, and knowing or acknowledging the identifier grants no authority. The owner side
+callbacks, and knowing or acknowledging the identifier grants no authority. The separate
+optional `native-input-startup-v1` capability depends on it and is never negotiated
+without it (see **Startup input** below). The owner side
 binds one viewer to one existing content subscription and states a host-written source;
 the viewer side only describes and submits against that exact source. On the child side,
 the bridge requests bootstrap mode `1` and requires an authenticated readiness statement
@@ -1540,7 +1667,8 @@ local-path fences; non-user input cannot authorize a copy.
 **Input authority.** Every protected write is measured against the frame the writer
 actually committed: one uncovered, Main-focused remote viewer frame, with the exact
 host-written source (owner run and row, native session id and epoch, viewer revision,
-canonical geometry and revision, and source commitment) and observed input modes.
+canonical geometry and revision, and source commitment) and observed input modes, or
+the explicitly fenced startup source described below.
 The owner independently compares those expected facts with its current source and binds
 the commitment to its current private registration identity and generation; those private
 registration facts are not exported. Current TLS-proved peer key, remembered pin,
@@ -1557,12 +1685,30 @@ when the visible bytes are identical. Keyboard packets, canonical content-coordi
 mouse reports, and whole text pastes are the only input kinds; images and files are not
 expressible. A paste is validated whole as decoded UTF-8 at up to exactly 1,048,576 bytes
 before one PTY handoff, never truncated; bracketed-paste markers are added only when the
-child's current native mode asks for them. The child authenticates an entire viewer
-logical dispatch before any native listener sees it, using a technical assembly bound of
-1,048,588 bytes (the 1 MiB body plus its two six-byte paste markers). Local input,
-non-user terminal-query replies, and legacy streaming keep their unchanged paths. Atomic
-assembly and admission are protocol boundaries, not an operating-system delivery
-guarantee.
+child's current native mode asks for them. The child authenticates and assembles an
+entire viewer logical dispatch before one stdin handoff, so no native listener sees part
+of it. It uses a technical assembly bound of 1,048,588 bytes (the 1 MiB body plus its
+two six-byte paste markers). A phase or conversation-tuple change drops an assembly in
+progress immediately, even when the source later changes back. Mouse bytes, including
+high-bit bytes, are handed over exactly. There is no raw fallback and no downgrade of
+viewer input to local input. Local input, non-user terminal-query replies, and legacy
+streaming keep their unchanged paths. Atomic assembly and admission are protocol
+boundaries, not an operating-system delivery guarantee.
+
+**Startup input.** A child the owner has just started can show a native prompt before
+it has a conversation, such as Pi's `Trust project folder?` selector. When both sides
+negotiated `native-input-startup-v1`, an authorized viewer can answer that prompt with
+ordinary keys. Startup authority is explicit, never inferred from a missing
+conversation tuple. The child's startup phase is armed only after the owned reporter has
+registered its mandatory public hooks. The child's first session update, whatever its
+value, closes the phase for good. On the owner, the registration's first accepted
+status, a disconnect, an exit, or a similar event closes it too. A startup source states
+phase `startup` and carries no native session field, not even a fake or null one, under
+a source token domain separate from conversation sources. All other fences above still
+apply. Pi's native trust decision and its persistence are unchanged: there is no
+automatic trust, no Pi patch, and no new API. Copy is unsupported during startup. An
+asynchronous copy begun during startup can neither become a local copy nor complete as a
+remote one after the phase ends.
 
 **Text copy.** Only the exact initiating viewer receives a completed copy; there is no
 owner outer-terminal or local clipboard fallback, broadcast, raw OSC 52 relay, or
@@ -1571,7 +1717,9 @@ arrives after input B when it is still valid, because copies are ordered by thei
 emission sequence, not by input dispatch id. The full native producer payload is retained:
 up to 100,000 canonical base64 characters, representing at most 75,000 decoded text
 bytes. Small copies may fit inline; paging preserves the complete encoded string as
-ASCII bytes, without reducing the producer bound to a single message.
+ASCII bytes, and the pages are joined before the text is decoded, without reducing the
+producer bound to a single message. Copy delivery is a terminal-write submission on the
+viewer, not proof of a physical OS clipboard write.
 The native producer and OS clipboard writer are unchanged. Each hosted child tree created
 with the bridge receives the static `PI_CLIPBOARD_OSC52=1` capture setting, and it inherits
 only inside that tree; standalone launches and the system environment stay unchanged, and
@@ -1594,10 +1742,12 @@ confirmation, independently of the native tuple, epoch, modes, selected stream, 
 lease. Disconnect, Remove, Revoke, or a lost stream does not stop work the owner already
 accepted; a local receiving-side Revoke does not block this side's outbound view; and
 retiring a viewer may legitimately recompute a row's minimum size, with the last
-canonical size retained at zero viewers. This bridge is not a platform, physical
-clipboard, or native-Windows certification, and it cannot retrofit an already-running
-child. Startup project-trust input for a remote child and remote saved conversations
-(catalog, search, resume, and delete) are separate, still-unimplemented phases.
+canonical size retained at zero viewers. Several viewers may display and control the
+same owner row at once, each with its own geometry contribution and setting, and the
+owner's own Main need not display or focus that row. This bridge is not a platform,
+physical clipboard, or native-Windows certification, and it cannot retrofit an
+already-running child. Remote saved conversations are described under
+[Saved conversations on a connected owner](#saved-conversations-on-a-connected-owner).
 
 #### Isolated manual SSH clipboard comparison
 
@@ -1857,9 +2007,10 @@ and leaves at least 20 columns for the native frame. The New/Edit form
 temporarily replaces that right (native) pane while the roster remains on the left;
 below that width the form is a full-content overlay instead. While the form is open,
 the underlying child keeps running unpaused with its geometry and input ownership
-unchanged; cancelling the form restores the same child frame, while completing New or
-Saved activates the new child as the Main input owner (completing Edit restores the same
-child frame).
+unchanged; cancelling the form restores the same child frame, while completing a Local
+New or Local Saved open activates the new child as the Main input owner (completing Edit
+restores the same child frame; a remote New or Resume only selects the owner's returned
+row for display).
 Below 53 columns the sidebar is a frontend overlay while it has focus; native
 geometry remains full-width and unchanged across focus switches, and returning to
 native focus only removes the overlay. Sidebar hint text wraps across reserved
@@ -1873,10 +2024,11 @@ events outside that frame are dropped before coordinate translation, never clamp
 the pane edge. Sidebar-target clicks are handled by the host and are not forwarded to a
 native child. For a locally displayed owner, the first left click in the visible native
 pane while the roster owns focus is consumed to return focus to that active Main owner;
-subsequent mouse input is forwarded normally. A deliberately selected remote viewport is
-display-only instead: its packets are dropped rather than focusing a local child or being
-forwarded, and only the frame the writer actually committed decides whether the drawn
-source is remote. This does not add conversation wheel/trackpad scrolling (#332). On
+subsequent mouse input is forwarded normally. A deliberately selected remote viewport
+never focuses or feeds a local child. Its canonical mouse packets reach the remote owner
+only through the [native I/O bridge](#native-input-and-copy), under that bridge's
+written-frame and Remote input/copy fences, and are otherwise dropped. Only the frame the
+writer actually committed decides whether the drawn source is remote. This does not add conversation wheel/trackpad scrolling (#332). On
 Windows, bundled-ConPTY protocol observations do not certify physical mouse behavior:
 manual validation has observed clicks working, but pane-confined selection and native
 conversation wheel scrolling still require interactive validation, as described in the

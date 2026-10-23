@@ -58,8 +58,8 @@ dates.
   only a dependency-only explicit-false test seam keeps the legacy call shape, and no
   viewer setting toggles it. Local/SSH copying and standalone Pi remain unchanged, a
   rowless New-form Host choice can ask one connected owner for a blank child,
-  `SessionSpawn` stays the native, owner-bound tool, and remote saved conversations,
-  resume, catalog/history, and human handoff remain unfinished.
+  `SessionSpawn` stays the native, owner-bound tool, and human handoff remains
+  unimplemented.
 - Native input and text copy for the one selected remote viewport, on the existing
   selected-content lane (#389), enabled by default in normal production Main. Main always
   gives the coordinator its native I/O callbacks, so `native-input-copy-v1` negotiation and
@@ -83,17 +83,52 @@ dates.
   the exact initiating viewer. Ordinary output with unchanged semantic source and modes
   does not stall input; source- or mode-only changes still need a real writer boundary.
   Refusals stay brief and non-modal; only a pre-invoke refusal is `not-sent`, and an
-  invoked loss is truthfully unknown without replay. Close behavior, local/SSH copying,
-  and native producers are unchanged. Remote saved conversations, resume,
-  catalog/history, startup project-trust input, and human handoff remain unfinished, and
-  `SessionSpawn` stays the native, owner-bound tool. See
+  invoked loss is truthfully unknown without replay. Several viewers may control one
+  owner row independently. Close behavior, local/SSH copying, and native producers are
+  unchanged; human handoff remains unimplemented, and `SessionSpawn` stays the native,
+  owner-bound tool. See
   [Native input and copy](docs/session-host-alpha.md#native-input-and-copy).
+- Startup input for a remote child before it has a conversation (#389). The optional
+  `native-input-startup-v1` content capability depends on `native-input-copy-v1` and lets
+  an authorized viewer answer native Pi's `Trust project folder?` prompt with ordinary
+  keys. Startup authority is explicit, never inferred from a missing tuple. The child
+  arms it only after its owned reporter registered the mandatory public hooks, and its
+  first session update closes it permanently. The owner's registration closes it at the
+  first accepted status, disconnect, or exit. The startup source carries phase `startup`,
+  no native session field, and its own token domain, under the same written-frame, owner,
+  peer, and setting fences as conversation input; a phase or tuple change drops any
+  partly assembled dispatch. Pi's trust decision and persistence are unchanged, with no
+  automatic trust, Pi patch, or new API, and copy stays unsupported until a real
+  conversation exists. See
+  [Native input and copy](docs/session-host-alpha.md#native-input-and-copy).
+- The Saved picker can now reach one connected owner's complete saved-conversation
+  catalog (#389) through an optional `roster-saved-v1` capability on the existing paired
+  roster channel. It opens on Local with a blank query each time; an actual Host change
+  clears the query and results, the same Host is a no-op, and an owner with an empty
+  roster is a valid choice. Remote rows carry the owner's own session id, saved file
+  path, caption, and workspace exactly, presented through the same formatter as Local rows. These
+  are display data only: requests name only opaque owner-issued handles and the exact
+  owner run, and the requester never acts on a displayed path. Search keeps the owner's
+  native semantics with the exact query. Every row of the unfiltered catalog or a result
+  is reachable through bounded windows over one immutable owner result, with the full
+  total stated and no silent truncation; existing navigation keys are unchanged.
+  Resume uses the owner's native Saved admission and duplicate guards and starts an
+  owner-owned child. Only this viewer selects the returned row, and only while that
+  request still owns the picker. Delete is gated by the owner's live **Allow remote
+  history deletion** policy, the requester's Local-style confirmation, and the owner's
+  existing `trash`-first and file-identity guards, through one guarded native manager operation. Requests need the
+  actually written picker or confirmation frame. One request is pending per channel, and
+  outcomes stay `not-sent`, owner facts, or `unknown`, without retry or replay. A
+  missing capability gets one fixed notice. No new listener, manager, history, index,
+  transcript copy, or lease is added. See
+  [Saved conversations on a connected owner](docs/session-host-alpha.md#saved-conversations-on-a-connected-owner).
 - A separate remembered OWNER-side Network setting, **Allow remote history deletion**
   (#389): whether this host exposes remote saved-history deletion to its paired viewers.
   It is on by default and an explicit Off survives restarts; it is not a viewer-side delete
-  toggle and does not gate this host's own local Saved deletion. The coordinator exposes
-  the live value for the owner's future Saved provider; no remote history endpoint exists
-  yet, so today the setting is stored and displayed only. Both new settings are optional
+  toggle and does not gate this host's own local Saved deletion. The owner reads the live
+  value at every remote Saved delete decision, independently of any viewer's Remote
+  input/copy setting; an Off or unknown policy hides delete on viewers and refuses both
+  prepare and confirmed requests. Both new settings are optional
   fields of the existing version-1 protected preferences document; malformed values or
   unavailable storage are refused untouched and never treated as the default-on values.
 - A TLS/WSS peer-transport foundation with KDE-style explicit device pairing (#475).
@@ -166,9 +201,9 @@ dates.
   (#482); native input/copy for the displayed remote pane is on by default with a
   per-viewer Remote input/copy setting, one deliberately
   selected remote row's native viewport can now be displayed, and a rowless New-form
-  Host choice can now ask one connected owner for a blank child; `SessionSpawn` stays the
-  native, owner-bound tool, while remote saved conversations, resume, catalog/history,
-  and human handoff remain unfinished. See
+  Host choice can now ask one connected owner for a blank child, and the Saved picker can
+  reach one connected owner's saved conversations; `SessionSpawn` stays the native,
+  owner-bound tool, and human handoff remains unimplemented. See
   [Explicit protected peer-state foundation](docs/session-host-alpha.md#explicit-protected-peer-state-foundation).
 - The optional native session host now displays one deliberately selected remote native
   viewport through the existing left roster, compositor, graphics layer, and writer
@@ -182,9 +217,8 @@ dates.
   run, generation, geometry, and written-display fences remain fail closed; 64 KiB bounds
   messages, not whole viewports. Native input, text paste, and copy travel only through
   the default-on native input/copy bridge described above, subject to this viewer's
-  Remote input/copy setting; remote saved conversations, resume, catalog/history, and
-  human handoff remain unfinished at this interim checkpoint, and `SessionSpawn` stays the
-  native, owner-bound tool.
+  Remote input/copy setting; owner Saved conversations are described above, human
+  handoff remains unimplemented, and `SessionSpawn` stays the native, owner-bound tool.
   Ordinary Pi and authenticated local/SSH clipboard are unchanged. See
   [Selected native viewport](docs/session-host-alpha.md#selected-native-viewport-interim-display-scope).
 - The optional native session host now wires a **Network** sidebar over the paired peer
@@ -216,9 +250,10 @@ dates.
   through the default-on bridge and this viewer's Remote input/copy setting, and the
   separate Allow remote history deletion setting is an owner-side policy; a deliberate
   New-form Host choice can ask
-  one connected owner for a blank child, and `SessionSpawn` stays the native, owner-bound
-  tool; remote saved conversations, resume, catalog/history, and human handoff remain
-  unimplemented; no view-only permission kind or controller lease is invented. See
+  one connected owner for a blank child, the Saved picker can reach one connected owner's
+  saved conversations, and `SessionSpawn` stays the native, owner-bound tool; human
+  handoff remains unimplemented; no view-only permission kind or controller lease is
+  invented. See
   [Network sidebar](docs/session-host-alpha.md#network-sidebar-hosting-pairing-and-remote-metadata)
   and [Session-host peer network](docs/security-model.md#session-host-peer-network-optional).
 

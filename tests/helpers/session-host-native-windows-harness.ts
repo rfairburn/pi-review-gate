@@ -33,6 +33,10 @@ import { delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 import {
+  ChangeSignal,
+  DURABLE_JOURNAL_RECHECK_INTERVAL_MS,
+} from "./change-signal";
+import {
   frameHeader,
   frameHeaderMatches,
   isSidebarFocusedFrame,
@@ -317,46 +321,13 @@ export function assertCreatedFileIdentity(path: string): void {
   }
 }
 
-export class ChangeSignal {
-  private readonly listeners = new Set<() => void>();
-
-  notify(): void {
-    for (const listener of [...this.listeners]) listener();
-  }
-
-  waitFor(predicate: () => boolean, timeoutMs: number, description: string, signal?: AbortSignal): Promise<void> {
-    return new Promise<void>((resolvePromise, rejectPromise) => {
-      let settled = false;
-      let timer: NodeJS.Timeout | undefined;
-      const onAbort = (): void => finish(new Error(`${description}: cancelled before completion`));
-      const finish = (error?: Error): void => {
-        if (settled) return;
-        settled = true;
-        if (timer !== undefined) clearTimeout(timer);
-        this.listeners.delete(check);
-        signal?.removeEventListener("abort", onAbort);
-        if (error) rejectPromise(error);
-        else resolvePromise();
-      };
-      const check = (): void => {
-        if (settled) return;
-        try {
-          if (predicate()) finish();
-        } catch {
-          finish(new Error(`${description}: bounded event predicate failed`));
-        }
-      };
-      if (signal?.aborted) {
-        finish(new Error(`${description}: cancelled before completion`));
-        return;
-      }
-      timer = setTimeout(() => finish(new Error(`${description}: deadline exceeded`)), timeoutMs);
-      if (signal) signal.addEventListener("abort", onAbort, { once: true });
-      this.listeners.add(check);
-      check();
-    });
-  }
-}
+// The durable-readiness timing core now lives in one neutral shared module that
+// every real-host harness imports (tests/helpers/change-signal.ts). These names
+// stay exported here so existing harness/launcher imports and the
+// journal-signal regression control resolve unchanged; the cadence, single
+// absolute deadline, notification fast path, abort, predicate-exception, and
+// cleanup behavior are that reviewed core, not a second copy of it.
+export { ChangeSignal, DURABLE_JOURNAL_RECHECK_INTERVAL_MS };
 
 function isWithin(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);

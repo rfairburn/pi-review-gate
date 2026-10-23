@@ -18,6 +18,13 @@
  * adding a terminal listener/writer. It performs no kills and preserves errors. This is authorized test
  * instrumentation of the public API, not a production stub or factory
  * override: production code paths are untouched.
+ *
+ * Internal-opt-in fixture: when PRG_SESSION_HOST_NATIVE_MAIN_INTERNAL_FRAMING
+ * is "1", this runner calls the staged candidate's internal-only
+ * __test.runWithDependencies seam with exactly one MainDependencies override
+ * (`nativeInputOriginFraming: true`). Every other dependency, the broker, the
+ * manager, and every production code path remain the real ones; without the
+ * variable the public runSessionHost(options) entry is used unchanged.
  */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -43,18 +50,42 @@ function installPtyExitObservation(mainEntry, logPath, controlLogPath) {
     const handle = originalSpawn.call(nodePty, file, args, options);
     if (controlLogPath && typeof handle.write === 'function') {
       const originalWrite = handle.write;
+      let observeInput;
+      try {
+        const { HOST_BOOTSTRAP_ENV, parseBootstrap } = productionRequire('./protocol.js');
+        const bootstrap = parseBootstrap(JSON.parse(options.env[HOST_BOOTSTRAP_ENV]));
+        if (bootstrap && bootstrap.inputOriginFraming === 1) {
+          const decoder = productionRequire('./native-input-origin.js').createNativeInputDecoder(bootstrap);
+          const escapes = ['\x1b', '\x1b[27u', '\x1b[27;1u', '\x1b[27;1:1u'].map((key) => Buffer.from(key));
+          observeInput = (data) => {
+            const decoded = decoder.feed(data);
+            if (!decoded.ok) { observeInput = undefined; return []; }
+            return decoded.fragments.flatMap((fragment) => {
+              const encoding = escapes.findIndex((key) => key.equals(fragment.payload));
+              return fragment.start && fragment.end && fragment.part === 0 && encoding !== -1
+                ? [{ encoding: encoding === 0 ? 'legacy' : 'csi-u', framing: 'authenticated', origin: fragment.origin.kind }]
+                : [];
+            });
+          };
+        } else if (bootstrap) {
+          observeInput = (data) => typeof data === 'string'
+            && (data === '\x1b' || /^\x1b\[27(?:;1(?::1)?)?u$/.test(data))
+            ? [{ encoding: data === '\x1b' ? 'legacy' : 'csi-u' }] : [];
+        }
+      } catch { /* missing or unusable owned bootstrap never downgrades to raw observation */ }
       handle.write = function observedWrite(...writeArgs) {
-        const result = originalWrite.apply(this, writeArgs);
-        const data = writeArgs[0];
-        if (typeof data === 'string' && (data === '\x1b' || /^\x1b\[27(?:;1(?::1)?)?u$/.test(data))) {
-          try {
+        let result;
+        try { result = originalWrite.apply(this, writeArgs); }
+        catch (error) { observeInput = undefined; throw error; }
+        try {
+          for (const control of observeInput ? observeInput(writeArgs[0]) : []) {
             fs.appendFileSync(controlLogPath, `${JSON.stringify({
               type: 'pty_control', key: 'escape', pid: handle.pid,
               cwd: options && typeof options.cwd === 'string' ? options.cwd : undefined,
-              encoding: data === '\x1b' ? 'legacy' : 'csi-u',
+              ...control,
             })}\n`, 'utf8');
-          } catch { /* observation never changes the real write outcome */ }
-        }
+          }
+        } catch { observeInput = undefined; /* observation never changes the real write outcome */ }
         return result;
       };
     }
@@ -100,7 +131,11 @@ async function main() {
     installPtyExitObservation(process.env.PRG_SESSION_HOST_NATIVE_MAIN_ENTRY, exitLog,
       process.env.PRG_SESSION_HOST_NATIVE_MAIN_PTY_CONTROL_LOG);
   }
-  const { runSessionHost } = require(process.env.PRG_SESSION_HOST_NATIVE_MAIN_ENTRY);
+  const { runSessionHost, __test } = require(process.env.PRG_SESSION_HOST_NATIVE_MAIN_ENTRY);
+  const internalFraming = process.env.PRG_SESSION_HOST_NATIVE_MAIN_INTERNAL_FRAMING === '1';
+  if (internalFraming && typeof __test?.runWithDependencies !== 'function') {
+    throw new Error('the staged candidate does not expose the internal dependency seam needed for the framing fixture');
+  }
   const before = readControllingTtyState();
   const rawBefore = process.stdin.isRaw;
   const baseline = process.env.PRG_SESSION_HOST_NATIVE_MAIN_BASELINE;
@@ -109,7 +144,9 @@ async function main() {
   let status = 1;
   let threw = false;
   try {
-    status = await runSessionHost(options);
+    status = internalFraming
+      ? await __test.runWithDependencies(options, { nativeInputOriginFraming: true })
+      : await runSessionHost(options);
   } catch {
     threw = true;
   }

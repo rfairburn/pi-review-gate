@@ -30,8 +30,9 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, sep } from "node:path";
 import test from "node:test";
 
-import { SidebarController, type SidebarAction } from "../src/session-host/sidebar";
-import { ROSTER_ACTIONS } from "./helpers/session-host-native-roster-witness";
+import { SidebarController, type SidebarAction, type SidebarItem } from "../src/session-host/sidebar";
+import type { PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
+import { NETWORK_ACTION, ROSTER_ACTIONS } from "./helpers/session-host-native-roster-witness";
 
 import {
   KEYS,
@@ -124,6 +125,58 @@ function entryStatus(entry: RosterEntry | undefined): string | undefined {
 /** Title of a native card, or undefined for an action/absent entry. */
 function renderedTitleOf(entry: RosterEntry | undefined): string | undefined {
   return entry !== undefined && entry.kind === "native" ? entry.title : undefined;
+}
+
+/** The optional settings action the renderer may append after "Quit host". */
+const HOST_SHORTCUTS_ACTION = "Host shortcuts";
+const [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION] = ROSTER_ACTIONS;
+
+/**
+ * Every action tail the production renderer can draw: the three required
+ * actions in their fixed order, the optional Network row only between
+ * "New session" and "Quit host" (a network snapshot is attached to the host),
+ * and the optional settings action only as the final row (settings are
+ * available). A legacy no-snapshot host and a current snapshot-attached host
+ * are both legal, so the witness accepts exactly these four complete
+ * sequences and no other combination of rows.
+ */
+const LEGAL_ROSTER_ACTION_TAILS: readonly (readonly string[])[] = [
+  [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
+  [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, HOST_SHORTCUTS_ACTION],
+  [SAVED_ACTION, NEW_SESSION_ACTION, NETWORK_ACTION, QUIT_HOST_ACTION],
+  [SAVED_ACTION, NEW_SESSION_ACTION, NETWORK_ACTION, QUIT_HOST_ACTION, HOST_SHORTCUTS_ACTION],
+];
+
+/** True only for an exact complete legal tail: same labels, same order, same count. */
+function isLegalRosterActionTail(labels: readonly string[]): boolean {
+  return LEGAL_ROSTER_ACTION_TAILS.some((tail) => tail.length === labels.length
+    && tail.every((label, index) => label === labels[index]));
+}
+
+/**
+ * Fail-closed witness for a rendered roster's action tail. The parsed labels
+ * must equal one complete legal sequence, so a longer tail never passes on
+ * length alone: an unknown, duplicated, misplaced, partially painted, or
+ * missing action fails here instead of widening a count tolerance.
+ */
+function assertLegalRosterActionTail(labels: readonly string[], description: string): void {
+  assert.ok(isLegalRosterActionTail(labels),
+    `${description}: expected exactly one of ${LEGAL_ROSTER_ACTION_TAILS.map((tail) => `[${tail.join(" > ")}]`).join(" or ")}, observed [${labels.join(" > ")}]`);
+}
+
+/** The action rows for one drawn tail, each unselected and one row tall. */
+function actionRows(labels: readonly string[]): string[] {
+  return labels.map((label) => `  ${label}`);
+}
+
+/** One complete five-row native card for the pure tail witness; no process or file. */
+function tailCard(title: string): string[] {
+  return [title, "  agent idle | input none", "  background unknown", "    idle activity", "    idle activity"];
+}
+
+/** A pane-only roster (header on line 0) of two cards followed by the drawn rows. */
+function tailPane(actionLabels: readonly string[]): string {
+  return [" Sessions (2) ", ...tailCard("Tail A"), ...tailCard("Tail B"), ...actionRows(actionLabels)].join("\n");
 }
 
 function sessionStarts(records: readonly SessionRecord[]): SessionRecord[] {
@@ -403,6 +456,134 @@ test("public SidebarController stops a positively idle live row directly without
   "the public controller requests the exact-row stop directly and leaves fresh-idle revalidation to the parent");
 });
 
+test("the action-tail witness accepts only the four complete legal tails and rejects malformed ones", () => {
+  // Regression for the stale count/prefix expectation that assumed "Host
+  // shortcuts" was the only optional row: the same host now also draws the
+  // optional Network row at its own renderer position, so the witness is an
+  // exact complete-sequence match rather than a length tolerance.
+  const legal: readonly (readonly string[])[] = [
+    [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, HOST_SHORTCUTS_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, NETWORK_ACTION, QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, NETWORK_ACTION, QUIT_HOST_ACTION, HOST_SHORTCUTS_ACTION],
+  ];
+  assert.deepEqual(LEGAL_ROSTER_ACTION_TAILS, legal, "the witness lists exactly the four legal tails");
+  for (const tail of legal) {
+    assert.equal(isLegalRosterActionTail(tail), true, `accepts [${tail.join(" > ")}]`);
+    assert.doesNotThrow(() => assertLegalRosterActionTail(tail, `legal tail [${tail.join(" > ")}]`));
+    // The shared strict parser accepts the same drawn rows, so the witness is
+    // anchored on the real grammar and not on a private label list.
+    const parsed = parseRosterFrame(tailPane(tail), 32);
+    assert.equal(parsed.complete, true, `the parser draws a complete roster for [${tail.join(" > ")}]`);
+    assert.deepEqual(parsed.actions.map((entry) => entry.label), [...tail]);
+  }
+
+  // Every rejection is a complete-tail violation, never a mere length change.
+  const malformed: readonly (readonly string[])[] = [
+    [],
+    [SAVED_ACTION, NEW_SESSION_ACTION],
+    [SAVED_ACTION, QUIT_HOST_ACTION],
+    [NEW_SESSION_ACTION, SAVED_ACTION, QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, QUIT_HOST_ACTION],
+    [SAVED_ACTION, SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, NETWORK_ACTION, NETWORK_ACTION, QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, NETWORK_ACTION],
+    [SAVED_ACTION, NETWORK_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
+    [NETWORK_ACTION, SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, HOST_SHORTCUTS_ACTION, NETWORK_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, HOST_SHORTCUTS_ACTION, QUIT_HOST_ACTION],
+    [HOST_SHORTCUTS_ACTION, SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, NETWORK_ACTION, HOST_SHORTCUTS_ACTION, QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, HOST_SHORTCUTS_ACTION, HOST_SHORTCUTS_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, "Peers"],
+    [SAVED_ACTION, NEW_SESSION_ACTION, "network", QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, "Networks", QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, "Networ", QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, "Network (2 requests)", QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, "Quit", QUIT_HOST_ACTION],
+  ];
+  for (const tail of malformed) {
+    assert.equal(isLegalRosterActionTail(tail), false, `rejects [${tail.join(" > ")}]`);
+    assert.throws(() => assertLegalRosterActionTail(tail, "malformed tail"), /expected exactly one of/);
+    // The shared parser is fail-closed on the same drawn rows, so a frame the
+    // witness rejects never exposes entries either.
+    const parsed = parseRosterFrame(tailPane(tail), 32);
+    assert.equal(parsed.complete, false, `the parser refuses [${tail.join(" > ")}]`);
+    assert.deepEqual(parsed.actions, []);
+    assert.deepEqual(parsed.entries, []);
+  }
+});
+
+/** Pure roster row for the action-tail witness; no process, file, or socket. */
+function tailRosterItem(id: string): SidebarItem {
+  return {
+    id,
+    label: `Tail ${id}`,
+    workspace: `/owned/${id}`,
+    agentDir: "/owned/native-agent",
+    lifecycle: "alive",
+    hasLiveProcess: true,
+    busy: false,
+    pendingInput: false,
+    inputSurface: false,
+    backgroundTasks: 0,
+    backgroundShells: 0,
+    activity: [],
+  };
+}
+
+/** Coordinator-shaped display DTO only: attaching it opens nothing. */
+const TAIL_PEER_SNAPSHOT: PeerUiSnapshot = {
+  revision: 1,
+  status: "ready",
+  settings: {
+    hostingEnabled: false,
+    bindHost: "127.0.0.1",
+    bindPort: 8443,
+    autoReconnect: false,
+    bellEnabled: true,
+    viewerNativeInputEnabled: true,
+    remoteHistoryDeleteEnabled: true,
+  },
+  identityFingerprint: "SHA256:local-identity",
+  listener: { state: "off", host: null, port: null, message: null },
+  hosts: [],
+  trustedPeers: [],
+  consents: [],
+  notice: null,
+};
+
+test("the action-tail witness accepts exactly what the public renderer draws for each optional-row combination", () => {
+  for (const settingsAvailable of [false, true]) {
+    for (const withNetwork of [false, true]) {
+      const controller = new SidebarController({
+        toggleKey: "f8",
+        settingsAvailable,
+        legacyToggleOverride: false,
+      });
+      controller.updateItems([tailRosterItem("tail-a"), tailRosterItem("tail-b")]);
+      if (withNetwork) controller.setPeerUiSnapshot(TAIL_PEER_SNAPSHOT);
+      const frame = controller.renderRoster(32, 50).lines.join("\n");
+      const parsed = parseRosterFrame(frame, 32);
+      const flags = `settings=${settingsAvailable}, network=${withNetwork}`;
+      assert.equal(parsed.complete, true, `the public renderer paints a complete roster (${flags})`);
+      assert.equal(parsed.cards.length, 2, `both cards stay parsed (${flags})`);
+      const labels = parsed.actions.map((entry) => entry.label);
+      assertLegalRosterActionTail(labels, `the public renderer's own action tail (${flags})`);
+      assert.deepEqual(labels, [
+        SAVED_ACTION,
+        NEW_SESSION_ACTION,
+        ...(withNetwork ? [NETWORK_ACTION] : []),
+        QUIT_HOST_ACTION,
+        ...(settingsAvailable ? [HOST_SHORTCUTS_ACTION] : []),
+      ], `the exact rendered sequence for ${flags}`);
+      assert.deepEqual(parsed.actions.map((entry) => entry.position),
+        parsed.actions.map((_, index) => parsed.cards.length + index),
+      `every action keeps its real rendered entry position (${flags})`);
+    }
+  }
+});
+
 test("real public Main proves current-binding exited-restart and isolated d-stop row lifecycle", {
   timeout: TEST_TIMEOUT_MS,
 }, async (t) => {
@@ -556,15 +737,11 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
   assert.equal(parsedRosterAfterCreation.cards.length, 2);
   assert.equal(renderedTitleOf(rosterAfterCreation[0]), nameA);
   assert.equal(renderedTitleOf(rosterAfterCreation[1]), nameB);
-  assert.ok(parsedRosterAfterCreation.actions.length === ROSTER_ACTIONS.length
-    || parsedRosterAfterCreation.actions.length === ROSTER_ACTIONS.length + 1,
-  "the rendered roster has the required action tail and at most its optional settings action");
-  assert.deepEqual(parsedRosterAfterCreation.actions.slice(0, ROSTER_ACTIONS.length).map((entry) => entry.label),
-    [...ROSTER_ACTIONS], "the required action tail remains in order");
-  if (parsedRosterAfterCreation.actions.length > ROSTER_ACTIONS.length) {
-    assert.equal(parsedRosterAfterCreation.actions.at(-1)?.label, "Host shortcuts",
-      "the only optional rendered action follows Quit host");
-  }
+  const actionTailAfterCreation = parsedRosterAfterCreation.actions.map((entry) => entry.label);
+  assertLegalRosterActionTail(actionTailAfterCreation,
+    "the rendered roster has one complete legal action tail: required actions in order, optional Network only between New session and Quit host, optional Host shortcuts only last");
+  assert.deepEqual(actionTailAfterCreation.filter((label) => label !== NETWORK_ACTION && label !== HOST_SHORTCUTS_ACTION),
+    [...ROSTER_ACTIONS], "every required action is present once and in order whatever optional rows the host drew");
   assert.deepEqual(parsedRosterAfterCreation.actions.map((entry) => rosterAfterCreation[entry.position]?.label),
     parsedRosterAfterCreation.actions.map((entry) => entry.label),
   "action navigation positions correlate to the actual rendered entry array");

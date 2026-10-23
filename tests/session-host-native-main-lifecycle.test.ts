@@ -79,6 +79,14 @@ const CHOICE_A = "Alpha option";
 const CHOICE_B = "Beta option";
 const INITIAL_PROMPT = "Please ask me which option to use.";
 const ECHO_PREFIX = "Fixture echo of delivered answer: ";
+/**
+ * Controlled faux-provider barrier for the answer turn (fixture `holdMs`).
+ * The delivered answer's scripted request stays in flight, streaming nothing,
+ * for this bounded period, so the sidebar's agent-running state has a real,
+ * deterministic window instead of racing a sub-second canned stream. Bounded
+ * well inside the shared event deadline; it fakes no lifecycle state.
+ */
+const ANSWER_TURN_HOLD_MS = 4_000;
 
 /** CSI for Ctrl+Alt+Up; pi-tui's matchesKey maps this to `ctrl+alt+up`. */
 const KEY_CTRL_ALT_UP = "\x1b[1;7A";
@@ -399,8 +407,9 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
       // Request 2 (tool result): continue without assuming an answer.
       { text: "Question recorded; continuing without assuming an answer." },
       // Request 3 (delivered answer as a user message): echo it back so the
-      // test can prove the UI-delivered answer reached the model context.
-      { echoLastUser: ECHO_PREFIX },
+      // test can prove the UI-delivered answer reached the model context. The
+      // bounded hold keeps the turn running long enough to observe honestly.
+      { echoLastUser: ECHO_PREFIX, holdMs: ANSWER_TURN_HOLD_MS },
     ],
   };
   writeFileSync(join(stateDir, "turn-script.json"), JSON.stringify(turnScript), { mode: 0o600 });
@@ -477,7 +486,7 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
     if (filename === null || filename.toString() === "provider-journal.jsonl") providerSignal.notify();
   });
   state.closeProviderWatch = () => providerWatch.close();
-  await providerSignal.waitFor(
+  await providerSignal.waitForRecheck(
     () => providerJournalRecords(providerJournalFile).filter((record) => record.event === "auto_model_selected").length >= 2,
     EVENT_TIMEOUT_MS,
     "both real native children auto-selected the scripted faux model",
@@ -578,11 +587,23 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
     "A's card status row shows the fresh agent-running state for the answer turn", beforeSubmit)
     .then(() => driver.frameRevision);
   // Second ordinary native agent turn from the UI-delivered answer.
+  const answerRequestIndex = 2;
   const answerStarted = (async () => {
     driver.pty.write(KEYS.enter);
     await driver.waitForRecords((records) => records.filter((record) => record.type === "agent_start"
       && record.pid === sessionA.record.pid).length >= 2,
       "second native agent run start in A from the UI-delivered answer");
+    // The durable provider journal proves that this is the controlled answer
+    // request. Its unchanged predicate/deadline uses the shared durable recheck;
+    // the actual running frame above remains notification-driven and was armed
+    // before submission, so a short turn cannot escape the observation window.
+    await providerSignal.waitForRecheck(() => {
+      const journal = providerJournalRecords(providerJournalFile);
+      return journal.some((record) => record.event === "model_request"
+          && record.requestIndex === answerRequestIndex)
+        && journal.some((record) => record.event === "turn_hold_started"
+          && record.requestIndex === answerRequestIndex);
+    }, EVENT_TIMEOUT_MS, "the UI-delivered answer reaches the third scripted faux request and its controlled hold");
   })();
   const [startedOutcome, runningOutcome] = await Promise.allSettled([answerStarted, answerRunning]);
   if (startedOutcome.status === "rejected") throw startedOutcome.reason;
@@ -637,6 +658,13 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
   assert.ok(answerRequest, "the third request exists for the delivered answer");
   assert.ok(String(answerRequest.lastUserPreview ?? "").includes(`Answer to pending question "${QUESTION_TEXT}": ${CHOICE_A}`),
     "the UI-delivered answer reached A's model context as an ordinary user message");
+  // The barrier opened and closed exactly once for the answer request, and the
+  // real settlement boundary followed it: the running observation above was a
+  // live in-flight turn, never a fixture-synthesized status.
+  const holds = providerJournal.filter((record) => record.requestIndex === answerRequestIndex
+    && (record.event === "turn_hold_started" || record.event === "turn_hold_released"));
+  assert.deepEqual(holds.map((record) => record.event), ["turn_hold_started", "turn_hold_released"],
+    "the answer turn's controlled barrier started once and released once before settlement");
 
   // Orderly completion: close A, then B, then quit the host.
   await driver.closeNativeNormally(sessionA);
@@ -689,9 +717,13 @@ test("confirmed Quit in the real public Main exits both live native children gra
   assert.equal(processIsAlive(setup.sessionB.record.pid), true, "B is still alive before the confirmed Quit");
   await setup.driver.ensureSidebarFocus();
   // The 32-column sidebar truncates the confirmation lines; resize the owned
-  // outer PTY to a narrow overlay width where the full confirmation renders,
-  // and await both native resize observations before confirming.
-  await setup.driver.setOuterSize(52, 50, [setup.sessionA, setup.sessionB], 52, 49);
+  // outer PTY to a narrow overlay width where the full confirmation renders.
+  // Per-session viewer sizing (#474): the row this host displays (B, the last
+  // deliberate New) takes the narrow pane, while the unviewed row A keeps the
+  // pane it last reported. Both facts are awaited before confirming Quit.
+  await setup.driver.setOuterSize(52, 50, { viewed: setup.sessionB, retained: [setup.sessionA] }, 52, 49);
+  assert.deepEqual(setup.driver.paneGeometry(setup.sessionA), { cols: OUTER_COLS - 32 - 1, rows: 49 },
+    "the unviewed row keeps the wide pane it was created with while the displayed row goes narrow");
   await setup.driver.moveRosterTo("Quit host");
   const beforeConfirm = setup.driver.frameRevision;
   setup.driver.pty.write(KEYS.enter);

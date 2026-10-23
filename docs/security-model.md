@@ -16,9 +16,10 @@ accept from an untrusted repository, task, or process environment:
   ([Configuration](configuration.md#config-discovery)), the private non-Git review
   checkpoint records under `sessions/pi-review-gate/`
   ([Review workflow](review-workflow.md#non-git-checkpoint-storage)), and the optional
-  `pi-review-sessions` host's global sidebar roster plus its single-host ownership
-  record under `session-host/`
-  ([Session host](session-host-alpha.md#requirements-and-launch)).
+  `pi-review-sessions` host's global sidebar roster, single-host ownership record,
+  protected network preferences, and peer identity/trust state under `session-host/`
+  ([Session host](session-host-alpha.md#requirements-and-launch),
+  [Session-host peer network](#session-host-peer-network-optional)).
 - `PI_REVIEW_GATE_DISABLED` — the documented kill switch.
 - `PI_REVIEW_GATE_DDGS_VENV`, `XDG_CACHE_HOME` / `HOME` — venv and cache locations for
   the web search bridge. The default venv lives in a user-writable cache by design.
@@ -107,6 +108,209 @@ native-platform validation. This IPC support does not establish Windows host par
 delivery readiness, security equivalence with the POSIX filesystem boundary, or a
 private Windows ACL guarantee.
 
+### Session-host peer network (optional)
+
+The optional `pi-review-sessions` host can expose a **Network** sidebar for explicit
+pairing, remote session rows, one deliberately selected row's native viewport with
+native input and copy, owner-routed Close and Create, and one chosen owner's saved
+conversations. Every operation is performed by the owning host on its own children and
+files. Ordinary Pi sessions and the standalone review-gate launchers are unchanged
+and start no peer listener or client. This is an
+optional alpha surface: it does not certify two-machine operation, native-Windows UI,
+physical input, physical clipboard delivery, mobile, browser, or release readiness.
+
+The transport is direct TLS/WSS with generated self-signed certificates. The authority for
+a peer is the exact subject-public-key information proved by its TLS handshake, not a
+CA-issued certificate, public domain name, SSH identity, or QR/code ceremony; no CA,
+domain, or other certificate-management service is required or consulted. First contact
+accepts an unknown key only through a bounded local human confirmation: accepting that key
+without independently comparing its fingerprint does not defeat an active interceptor
+during the first pairing, and later pin verification protects continuity rather than the
+authenticity of that first acceptance. A remembered key that changed, a missing
+initialized trust document, or a mismatched receiving identity fails closed. An explicit
+Connect does not replace a changed known key; only removing the destination and re-adding
+it starts a fresh confirmation. A key approval, a new incoming request, and a grant are
+separate facts. Directional grants are independent: A approving B does not grant A access
+to B.
+
+Human consent for an incoming request and for a first-use server key is bounded to two
+minutes, which is an approval deadline, not a trust or grant lifetime. The dialog latches
+the exact name, fingerprint, and endpoint captured at arrival (an endpoint that was not
+provided stays unknown), and its controls authorize only after the exact current frame
+was actually written; a resized or semantically changed frame must be written again.
+Incoming arrivals raise a persistent roster alert without stealing focus from the native
+owner, and the default-on bell is one best-effort attempt per arrival with a menu opt-out;
+muting it never hides the visual alert. A hidden or narrow sidebar may show a bounded
+alert band that reserves real rows and can resize or reflow the local child; it offers no
+approval control. Approval applies only to the exact live request and expires with the
+window; closing the view cannot invent a decision.
+
+Trust and preferences are stored separately. The protected trust document holds the local
+identity, accepted peers, directional receiving grants, and remembered outgoing server
+keys; it has no age-based expiry: outgoing pins persist until an explicit Remove of their
+destination, and receiving permission persists until an explicit Revoke. Hosting intent,
+the Auto and bell settings, the viewer-side Remote input/copy setting, the owner-side
+remote history-deletion exposure policy, and saved destinations live in a separate
+protected preferences document, so changing a display setting never creates an identity,
+a peer-key directory, key material, or a listener. The two newer settings are optional
+default-on fields of the same version-1 document: absent is on, an explicit Off is
+remembered, and a present non-boolean value makes the whole document unavailable. Both documents require verified actual operating-system
+protection (owner/private modes and supported ACL checks, or Windows owner/DACL evidence)
+before private or preference bytes are written. They are not encrypted at rest and use no
+OS credential-store service. Unknown, malformed, oversized, unknown-version,
+missing-initialized, or unsafe documents are refused untouched: there is no repair, reset,
+rotation, backup search, sweep, or silent default overwrite. Same-account and
+OS-privileged access remains outside this boundary.
+
+A host with no saved network preferences creates no keys, preferences, trust document,
+listener, or connection at startup. Startup initializes no network state: it reads saved
+state and restores an explicitly saved hosting setting and schedules an eligible
+remembered Auto setting. A listener binds only an address and port the operator actually
+submitted. When nothing is saved yet, the Network pane prefills the editable suggestion
+`*:8088` as a local draft: `*` requests one dual-stack listener (the transport maps it to
+a single `::` listener that is not IPv6-only, so IPv4 and IPv6 share that one handle),
+while an explicit `0.0.0.0` stays an IPv4-only request. A fresh host stays off; showing
+or editing this draft neither persists it nor creates an identity or listener. Enable
+or Apply explicitly submits the listener draft. Unknown, unavailable, or unsafe
+settings are never filled in with that suggestion or enabled. No
+other address or port is ever substituted as a fallback, an address that cannot be bound
+fails with its own error, and the application adds no discovery, SSH, or extra listener.
+Auto reconnect is off by default and
+attempts only previously connected destinations after startup or an unexpected loss, when
+a pin is currently remembered, no explicit suppression applies, and no terminal
+authorization failure has occurred; it never pairs, prompts for an unknown key, or
+replaces a changed pin. Disconnect keeps the association and suppresses automatic attempts
+until an explicit Connect, including across restarts. Remove forgets only this side's
+saved endpoint and remembered pin, and Revoke removes only this side's current receiving
+permission. Neither changes the opposite direction, stops a remote session, or shuts down
+the owning host.
+Shutdown closes only this host's owned local network resources and retains
+agent-directory ownership when local settlement is unconfirmed; it never waits for or
+claims a remote receipt or remote work outcome.
+
+The roster lane is a projection of the owner's roster. By itself it grants no control.
+Control exists only through the separately negotiated native I/O bridge and the
+owner-routed Close, Create, and Saved operations described below, each re-authorized
+and performed by the owner. Roster rows carry bounded display facts, including the exact
+owner-side workspace path, and never the native current-file guard, agent/account
+directories, configuration, providers, credentials, prompts, transcripts, question
+text, terminal/output bytes, or image data. A lost projection is stale or unavailable,
+never idle or zero.
+
+One deliberate local selection may instead display one exact owner row's native
+viewport, on the additive content lane of the same TLS/WSS listener and `/app` path,
+under the same exact TLS-proved peer key, current remembered pin, and directional
+receiving grant. It adds no second listener, daemon, manager, permission kind, controller
+lease, trust document, or stored state. That viewport is the owner's own visible native
+frame — ordinary conversation and terminal text with its generated styling, cursor,
+Unicode cells, and the bounded typed PNG images, placements, and text fallbacks the native
+surface already produces — carried as one complete, bounded, atomically assembled
+transfer. It is not a transcript, a raw PTY or terminal-control stream, and it carries no
+separate private configuration, provider/credential, authentication, current-file,
+structured-question, or hidden telemetry records. Rows that are not selected stay
+metadata-only, and a session
+nobody selected is neither watched nor resized for that viewer. Visible terminal text can
+itself be sensitive, and displaying the deliberately selected row is the intended
+behavior. A published view must still match the current selection generation,
+destination, owner run, and owner row, plus the owner's subscription identity, monotonic
+publish sequence, canonical geometry and revision, and the exact native conversation tuple
+when one is known (an unknown tuple is not guessed);
+only the frame the writer actually committed identifies the drawn source. Carried input
+modes are inert rendering facts. There is no invented view-only permission kind: this
+display is part of the same implemented grant scope, a lost stream is stale or unavailable
+with the deliberate target preserved, and no local row, sibling destination, or silent
+fallback replaces it.
+
+Remote keyboard, canonical mouse, whole text paste, and text-copy transport ride that same
+content lane through a native I/O bridge that normal production Main enables by default;
+there is no CLI, environment, or configuration flag, live-child retrofit, human handoff,
+or system-environment change, and only a dependency-only explicit-false test seam keeps
+the legacy display-only path. Each viewing sidebar has its own remembered Remote
+input/copy setting (default on). Turning it off stops only that viewer's forwarding of
+input and copies for the remote pane it displays; it never disconnects, revokes, changes
+owner framing, Hosting, Auto, or another viewer, and it does not cancel owner work that
+was already accepted. Unavailable or malformed settings are treated as off, never as the
+default. `native-input-copy-v1` negotiation is explicit and fixed for the coordinator's
+lifetime. Every protected write is re-proved against the actually written, uncovered,
+Main-focused viewer frame plus current owner facts, the current TLS-proved peer key,
+remembered pin, directional grant, endpoint, subscription, selection, and the viewer's
+current setting. That dynamic proof runs before every write and is re-checked after
+callback reentry; an actual setting change (including Off and back On) invalidates
+earlier admissions and written receipts, and the source token is descriptive rather than
+a grant or lease. A whole paste is validated up to exactly 1 MiB of decoded UTF-8 before
+one PTY handoff and is never truncated, and a completed copy reaches only its exact
+initiating viewer. Input submission reports `not-sent` only before any transport-write invocation,
+`submitted` only as local transport completion, and a possibly invoked loss or source change as
+`unknown`, with no replay, retry, or cancellation claim. Several viewers may control the
+same owner row independently, and the owner's own Main need not display it.
+
+The optional `native-input-startup-v1` capability, which depends on
+`native-input-copy-v1`, lets an authorized viewer answer a native startup prompt such as
+`Trust project folder?` with ordinary keys before the child has a conversation. Startup
+authority is explicit rather than inferred from a missing tuple. The child arms it only
+after its owned reporter registered the mandatory public hooks, and the first session
+update closes it permanently. The owner's registration closes it at the first accepted
+status, disconnect, or exit. A startup source has no native session field and its own
+token domain. Pi's trust decision and persistence are unchanged, nothing is trusted
+automatically, and copy is unsupported until a real conversation exists. A network
+`SessionSpawn` and human handoff remain unimplemented. Close remains owner-routed from
+the requesting sidebar's actually written highlighted row, as described below.
+
+The optional owner Close capability runs over the existing roster channel, not a new
+listener or permission kind. The current TLS-proved key, pin, and owner's receiving
+grant authorize each request and each result write. Main's same owner provider checks
+the exact run/row and real idle/exit facts; no selected content stream, native tuple,
+viewer or controller lease is required. Accepted work remains owned by Main after
+channel loss or revocation, while unauthorized replies are withheld. A send attempt or
+acknowledgement is not process exit: lost replies remain unknown, no request is replayed,
+and only owner observations remove the projected row. Saved history is never deleted.
+A queued logical highlight grants nothing; direct requests need the current complete
+written highlight. Busy or unknown activity needs the requesting sidebar's exact
+written confirmation target/generation/token/current geometry, synchronously rechecked
+and consumed once. Neither the confirmation nor direct Close relies on the native
+conversation tuple, epoch, selected stream, viewer or controller lease. An owner's
+confirmation-required result arms only the next deliberate Close, never an automatic
+dialog, retry or confirmed request. These reminders are not authorization and are not
+silently evicted for another still-valid target.
+See [Owner Close transport](session-host-alpha.md#owner-close-transport-foundation).
+
+The optional owner Saved capability (`roster-saved-v1`) also rides the existing roster
+channel under the same key, pin, and grant checks; acknowledging it grants nothing. It
+lets a viewer browse and search one chosen owner's full saved-conversation catalog in
+bounded windows, resume a conversation as a new owner-owned child, and delete one saved
+file there. Rows carry the owner's own session id, saved file path, caption, and
+recorded workspace exactly, presented through the Local picker formatter. The chosen
+owner's saved file paths do cross the network as display data. The roster's current-file guard still never does. Displayed
+paths are never request authority. Requests name only opaque owner-issued
+catalog/result/entry handles and the exact owner run, and the requester never resolves,
+opens, stats, or deletes a displayed path locally. No file contents, transcript, search
+index, or history sync crosses, and there are no separate agent- or project-directory
+fields. Directory names that appear inside a displayed saved file path or recorded
+workspace are still visible. Resume uses the owner's
+existing native Saved admission and duplicate-open guards.
+
+Remote deletion is gated by the owner's own **Allow remote history deletion** policy
+(default on, explicit Off remembered). That policy is independent of any viewer's Remote
+input/copy setting and of the owner's own local Saved deletion. The description a viewer
+sees is not a grant. Unknown or Off hides delete and blocks the viewer's prepare/Delete
+at admission and actual queued send. The owner independently reads its own policy once
+at admission of each incoming prepare or confirmed request: Off refuses before provider
+work; On allows that request through the ordinary independent safety checks. Later
+preference changes alone do not revoke it. A transient Off followed by On before sending
+does not invalidate a still-owned target or confirmation; an already-refused attempt is
+never retried or reopened automatically. At mutation the owner still re-checks the
+channel, grant, exact run, and saved-file facts. Its one session manager then
+performs one guarded native operation: a final caller authorization, a private census of
+its own children, and non-reentrant native filesystem checks before each `trash` or
+unlink handoff. It keeps the existing refusals for live, unknown-binding, current-file,
+or reserved conversations and for canonical-path, header, or file-identity
+replacement. Requests from the viewer need the actually written picker or confirmation
+frame, consumed once and re-proved inside the ordered write. One Saved request is
+pending per channel. Busy mutation requests are not retained for later submission;
+ordered transport writes re-check authority at dispatch. No mutation is replayed or
+retried, and an unconfirmed or unknown outcome stays so. See
+[Saved conversations on a connected owner](session-host-alpha.md#saved-conversations-on-a-connected-owner).
+
 ### Session-host clipboard transport
 
 Raw child OSC 52 is still default-denied. On the verified Pi 1.3.0 runtime, the owned
@@ -121,6 +325,40 @@ rejection, exact current tuple, owned-process lifetime, and the host's actually 
 Main input owner all gate the generated outer-terminal request. Missing/changed source
 provenance fails closed. This is an application integration fence, not a sandbox against
 trusted executable extensions with the user's process authority.
+
+The owned-bridge input framing can authenticate ASCII input fragments, including
+payload bytes and explicit local, non-user, or opaque viewer origins, and carry that
+immutable origin through asynchronous native copy callbacks in a separate v2 capsule.
+Each frame is printable ASCII end to end and ends in one printable `;`, never a control
+byte, so a terminal that rewrites control characters cannot move or erase a frame
+boundary. Only that exact versioned framing is accepted: the older line-feed-terminated
+wire, a carriage return, and a terminal-substituted key ending are malformed framing
+that poisons that decoder, and a host and a child built from different framing versions
+refuse each other rather than downgrade or fall back to raw input.
+Its signed one-shot readiness statement proves only decoder installation, not input
+permission, a drawn source, or clipboard delivery. This host mode is on by default for
+the children normal production Main creates (only a dependency-only explicit-false test
+seam omits it), and it requires that readiness before any child write, including local
+user input and non-user terminal replies. While an otherwise-current, live, non-stopping
+framing child awaits its own authenticated readiness, only never-sent automatic terminal
+replies are discarded without failing the row; they are not queued or replayed on readiness.
+User input stays refused until ready, and all other reply failures keep their existing
+failure paths. Unknown bootstrap modes or requested installation failures refuse without
+downgrade or raw fallback. Non-user input cannot authorize a copy. A viewer's Remote
+input/copy setting never toggles this owner-side framing.
+
+Native children created with that bridge receive a cloned environment with Pi's static
+`PI_CLIPBOARD_OSC52=1` capture flag; normal descendant inheritance stays inside that
+hosted process tree, and standalone launches and the system environment are unchanged.
+Native owner OS clipboard writes stay unchanged. Local-origin capsules still require
+existing current/liveness/written/uncovered source proof; viewer-origin capsules never
+fall back to the owner's outer terminal or local clipboard callback. A completed
+viewer-origin copy travels only to its exact initiating viewer, with the full native
+encoded payload up to the unchanged 100,000-character producer bound retained whole, and
+that viewer writes it to its own terminal only while its Remote input/copy setting is on.
+A copy cannot originate from the pre-conversation startup phase. No native Pi change or
+live retrofit is involved. Authenticated local and SSH clipboard
+copying is unchanged, nothing is broadcast, and raw PTY OSC 52 stays denied.
 
 The selected text is transient transport data, not a new diagnostic, roster, or clipboard
 history. Source stacks are inspected in memory and not logged. HMAC authenticates but

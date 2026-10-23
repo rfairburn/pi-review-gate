@@ -1218,8 +1218,9 @@ test("salvage — a salvaged landing survives restart without continuation eligi
       const waveRoot = controller!.inspect(executionId, taskOneId).tasks[0]?.waveRoot;
       if (!waveRoot) return false;
       try {
-        await stat(join(waveRoot, "workers", taskOneId, "salvaged.txt"));
-        return true;
+        const worktree = join(waveRoot, "workers", taskOneId);
+        return await readFile(join(worktree, "salvaged.txt"), "utf8") === "worker salvaged\n"
+          && await readFile(join(worktree, "base.txt"), "utf8") === "worker modified base\n";
       } catch {
         return false;
       }

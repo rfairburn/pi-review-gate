@@ -1,5 +1,7 @@
 import { Buffer } from "node:buffer";
+import { spawnSync as nodeSpawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import type { IPty } from "@lydell/node-pty";
 
@@ -11,9 +13,22 @@ import {
   prepareNativeLaunch,
 } from "./launch";
 import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "./kitty-graphics";
-import { TerminalSurface } from "./terminal-surface";
+import { TerminalSurface, type TerminalInputModes } from "./terminal-surface";
 import type { TerminalDiagnosticEvent } from "./terminal-diagnostics";
-import { createNativeClipboardReceiver, type NativeClipboardEvent } from "./native-clipboard";
+import { createNativeClipboardReceiver, type NativeClipboardEvent, type NativeClipboardOriginEvent } from "./native-clipboard";
+import {
+	createNativeInputEncoder,
+	mintNativeViewerScopeToken,
+	mintNativeViewerStartupScopeToken,
+	parseNativeViewerScopeToken,
+	verifyNativeViewerScopeToken,
+	NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES,
+	type NativeInputEncoder,
+	type NativeInputExpectedFence,
+	type NativeInputOrigin,
+	type NativeViewerScopeFacts,
+	type NativeViewerStartupScopeFacts,
+} from "./native-input-origin";
 import {
 	hasCompleteSessionIdle,
 	MAX_SESSION_SPAWN_TITLE_BYTES,
@@ -24,7 +39,20 @@ import {
 	type SessionSpawnInput,
 	type SessionSpawnOutcome,
 } from "./protocol";
-import { isSavedSessionAdmission, type OwnedLiveSession, type SavedSessionAdmission } from "./saved-sessions";
+import {
+	admitSavedSession,
+	isSavedSessionAdmission,
+	isSavedSessionCatalog,
+	validateSavedSessionDeletion,
+	type OwnedLiveSession,
+	type SavedSessionAdmission,
+	type SavedSessionAdmissionResult,
+	type SavedSessionCatalog,
+	type SavedSessionDeletionRefusalReason,
+	type SavedSessionRefusalReason,
+	type SavedSessionRow,
+} from "./saved-sessions";
+import { deleteSavedSessionFile, type SavedSessionDeletionResult } from "./saved-deletion";
 import type {
 	StatusActivityRefreshResult,
 	StatusRenameRequest,
@@ -73,6 +101,20 @@ import {
  *   frontend concerns in this module. Stale callbacks (exit/data/status
  *   events from older, released, or disposed records and registrations) are
  *   guarded per instance and can never affect another row.
+ * - Every byte this host writes to a child PTY goes through ONE private
+ *   per-record seam used by exactly its two existing sources (local user input
+ *   and the surface's terminal query replies). A row whose registration
+ *   recorded the closed input-framing mode encodes every such write with that
+ *   registration's single encoder (user input `local`, protocol replies `none`)
+ *   and refuses ALL of them until that same registration's authenticated
+ *   readiness arrives — no raw fallback, no fabricated reply, no queue or
+ *   replay, and no framing text typed into a legacy child. Rows without the
+ *   mode keep forwarding bytes unchanged. Viewer input travels only through the
+ *   strict same-manager viewer seam and stays refused by default: an opaque origin
+ *   is a classification, never a grant, and every viewer write is fenced on the
+ *   manager's own current row, registration, native tuple, geometry, revision, and
+ *   input-mode facts. A viewer copy is returned only to that viewer's own bound
+ *   sink, never to the owner's local clipboard route.
  * - Exit and disconnect are truthful: the lifecycle badge is the actual
  *   owned child state, the exit code comes only from the owned exit event,
  *   and `busy`/`pendingInput`/owned-work counts collapse to null on exit or
@@ -104,6 +146,21 @@ import {
  *   current native conversation tuple still match. A released registration, an
  *   exited or stopped row, a replaced row, a sibling's capsule, and every
  *   capsule payload itself never reach the host callback, a log, or a frame.
+ * - Per-session viewing geometry (issue 474): each row owns its canonical content
+ *   geometry, and one or more registered viewers of that row decide it together as
+ *   the independent minimum columns and minimum rows across the viewers that
+ *   contribute dimensions. A geometry change is always addressed to exactly one
+ *   row: siblings and rows nobody is viewing are never resized, a row whose viewer
+ *   set becomes empty keeps its last canonical size, and a row never viewed keeps
+ *   the initial-sizing rule. Viewer records hold only a viewer's own target and
+ *   pane size — never a process, frame, status, or input-lease mirror — and every
+ *   viewer's participation in a row ends when that row's child exits, the row is
+ *   removed, or the manager is disposed. Viewer ids are never reused and each
+ *   accepted change bumps that viewer's revision, so a stale asynchronous writer
+ *   can neither resurrect a detached surface nor overwrite a later selection.
+ *   Nothing here grants or withholds input: input remains addressed-only and every
+ *   existing displayed-owner fence stays where it is.
+ *
  * - Deliberate saved-conversation creation (issue 323) accepts a branded
  *   SavedSessionAdmission, reserves its session id/exact file synchronously
  *   before any await so concurrent deliberate opens cannot spawn duplicates,
@@ -115,11 +172,107 @@ import {
  *   newer observed binding on native /new or /resume) so duplicate fencing
  *   survives status disconnects; exited and removed rows never block
  *   reopening their saved conversation.
+ * - Guarded saved-conversation Resume and Delete ({@linkcode InstanceManager.startSavedSession},
+ *   {@linkcode InstanceManager.deleteSavedSession}) put the caller's final authorization
+ *   immediately before this manager's OWN facts and the protected invocation: the
+ *   caller's guard runs, then — with no await and no foreign callback in between —
+ *   the manager's private stop/dispose latches, its private census of current
+ *   bindings, exact reservations, and historical ids, and the native saved-session
+ *   file/header/identity/workspace checks, then the existing native create path
+ *   (Resume) or one trash/unlink stage (Delete). No public, overridable, or injected
+ *   listing, ownership read, or validation callback runs after that guard. Once a
+ *   protected invocation began its effect is reported truthfully (started, deleted,
+ *   or unconfirmed), never as a refusal, and nothing is stopped, cancelled, or rolled
+ *   back if the caller's authorization is lost afterwards.
  */
 
 export interface StopInstanceResult {
 	readonly status: "exited" | "confirmation-required" | "unavailable" | "unconfirmed";
 	readonly forced: boolean;
+}
+
+/**
+ * The caller's final authorization for one guarded saved-conversation mutation.
+ * Only an exact `true` return authorizes; `false`, any other value, or a throw
+ * refuses before anything is invoked. It may run more than once for one Delete
+ * (immediately before each mutation stage), and the manager re-reads its own
+ * current facts after every call, so a guard that changes files or bindings is
+ * caught rather than trusted.
+ */
+export type SavedMutationAuthorization = () => boolean;
+
+/**
+ * Why a guarded Resume was refused. Every refusal happens strictly BEFORE the
+ * native create path was invoked: no row, reservation, registration, or child
+ * exists because of the call. Native reasons are the fixed admission reasons.
+ */
+export type GuardedSavedResumeRefusalReason =
+	| SavedSessionRefusalReason
+	/** The caller's final guard returned anything but `true`, or threw. */
+	| "not-authorized"
+	/** No manager/seam, host teardown, or this manager is stopping or disposed. */
+	| "unavailable";
+
+/**
+ * Outcome of one guarded Resume. Only `refused` precedes the create invocation;
+ * every other status means the native create path WAS invoked and owner work may
+ * have started, so none of them may be presented as a refusal:
+ *
+ * - `started`: the exact created row is launch-settled and not errored/starting.
+ * - `not-ready`: create resolved but its row is missing, errored, or still starting.
+ * - `failed`: the create invocation threw (no claim that a child exists).
+ * - `duplicate`: the create path's own synchronous duplicate fence refused it.
+ * - `unknown`: the result cannot be observed (teardown, or an unreadable seam);
+ *   a child may exist.
+ */
+export type GuardedSavedResumeResult =
+	| { readonly status: "refused"; readonly reason: GuardedSavedResumeRefusalReason }
+	| { readonly status: "started"; readonly id: string }
+	| { readonly status: "not-ready" }
+	| { readonly status: "failed" }
+	| { readonly status: "duplicate" }
+	| { readonly status: "unknown" };
+
+/** Why a guarded Delete was refused; always before any trash or unlink invocation. */
+export type GuardedSavedDeletionRefusalReason =
+	| SavedSessionDeletionRefusalReason
+	| "not-authorized"
+	| "unavailable";
+
+/**
+ * Outcome of one guarded Delete.
+ *
+ * - `refused`: no trash and no unlink handoff was ever invoked.
+ * - `deleted`: native success, reported regardless of any later authorization
+ *   loss — trash status zero or a gone file (`method: "trash"`), or a returned
+ *   permanent unlink fallback (`method: "unlink"`).
+ * - `unconfirmed`: at least one mutation handoff MAY have run but success was not
+ *   established. `trashInvoked`/`unlinkInvoked` say exactly which handoffs were
+ *   invoked. `fallbackRefusal` is the pre-unlink revalidation refusal (for example
+ *   a replaced file or lost authorization after trash): the fallback was then never
+ *   invoked, but the trash attempt still was, so this is never a no-op claim.
+ * - `unknown`: the boundary itself could not be observed (service seam only).
+ */
+export type GuardedSavedDeletionResult =
+	| { readonly status: "refused"; readonly reason: GuardedSavedDeletionRefusalReason }
+	| { readonly status: "deleted"; readonly method: "trash" | "unlink" }
+	| {
+		readonly status: "unconfirmed";
+		readonly trashInvoked: boolean;
+		readonly unlinkInvoked: boolean;
+		readonly fallbackRefusal?: GuardedSavedDeletionRefusalReason;
+	}
+	| { readonly status: "unknown" };
+
+/**
+ * Narrow test-only replacements for the two actual deletion mutation handoffs.
+ * Production always uses the native `spawnSync("trash", [file])` and `unlinkSync`.
+ * They replace only the protected invocation itself; the manager's guard and
+ * revalidation before each stage are never replaceable.
+ */
+export interface SavedDeletionMutationAdapters {
+	readonly spawnSync?: typeof nodeSpawnSync;
+	readonly unlink?: (path: string) => void;
 }
 
 /** Default terminal geometry for newly created instances. */
@@ -132,6 +285,9 @@ export const DEFAULT_SHUTDOWN_KILL_MS = 2000;
 
 /** Internal policy seam for synthetic manager tests; production defaults to the actual host platform. */
 let shutdownPlatformForTests: NodeJS.Platform | undefined;
+
+/** Internal mutation-handoff seam for guarded deletion tests; production uses the native imports. */
+let savedDeletionAdaptersForTests: SavedDeletionMutationAdapters | undefined;
 
 /** Upper bound for a single-line instance label (UTF-16 code units). */
 export const MAX_LABEL_CHARS = 80;
@@ -151,6 +307,215 @@ export const MAX_INSTANCE_ERROR_CHARS = 240;
 
 /** Lifecycle of one owned instance row; always the process's actual state. */
 export type InstanceLifecycle = "starting" | "alive" | "exited" | "error";
+
+/**
+ * What one viewing surface contributes to the sessions it displays (#474).
+ *
+ * A viewer is a display surface, not a controller: registering one takes no
+ * input lease, and several viewers of the same row may all provide input.
+ * `cols`/`rows` are that surface's own content-pane size; a metadata-only
+ * surface reports neither and contributes no dimensions. `revision` increases
+ * with every accepted change to this viewer, so a writer holding an older
+ * revision is refused instead of overwriting a newer selection.
+ */
+export interface SessionViewerState {
+	readonly viewerId: string;
+	/** The live row this viewer displays, or undefined while it displays none. */
+	readonly sessionId: string | undefined;
+	readonly cols: number | undefined;
+	readonly rows: number | undefined;
+	readonly revision: number;
+}
+
+/**
+ * One viewer change. Omitted fields keep their current value; `sessionId: null`
+ * is the explicit "displays no session" state (the surface stays registered but
+ * contributes neither a target nor a geometry contribution to any row).
+ */
+export interface SessionViewerUpdate {
+	readonly sessionId?: string | null;
+	readonly cols?: number;
+	readonly rows?: number;
+	/** Apply only while this viewer still has exactly this revision. */
+	readonly expectedRevision?: number;
+}
+
+/** Why one viewer change was refused. None of them is a retry instruction. */
+export type SessionViewerRefusal =
+	| "disposed"
+	| "unknown-viewer"
+	| "stale"
+	| "unknown-session"
+	| "invalid-geometry";
+
+export type SessionViewerUpdateResult =
+	| { readonly applied: true; readonly state: SessionViewerState }
+	| { readonly applied: false; readonly reason: SessionViewerRefusal };
+
+/** One row's canonical content geometry and the count of applied changes to it. */
+export interface SessionGeometry {
+	readonly cols: number;
+	readonly rows: number;
+	readonly revision: number;
+}
+
+/** The current native conversation a viewer input scope is admitted against. */
+export interface NativeViewerInputTuple {
+	readonly sessionId: string;
+	readonly epoch: number;
+}
+
+/** The row's canonical geometry as recorded in one viewer input source. */
+export interface NativeViewerInputGeometry {
+	readonly cols: number;
+	readonly rows: number;
+	readonly revision: number;
+}
+
+/**
+ * The host's own immutable description of one viewer's input scope at one instant
+ * (#481 interactive path). Every field is a fact this manager already owns — the
+ * host run that registered the surface, the viewer's identity and revision, the row
+ * it displays, the exact registration and generation, the current native
+ * conversation tuple, and the row's canonical geometry and its revision — plus the
+ * host-minted scope token committing to them.
+ *
+ * It is an expected-value fence, never an authority: a caller reads it, hands it
+ * back unchanged, and the manager compares EVERY field against the current record
+ * immediately before writing. Nothing in it selects a row, a viewer, a child, or a
+ * copy destination, and terminal TEXT changes are deliberately absent — new output
+ * on an unchanged conversation never moves the input owner.
+ */
+export interface NativeViewerInputSource {
+	readonly hostRunId: string;
+	readonly viewerId: string;
+	readonly viewerRevision: number;
+	readonly rowId: string;
+	readonly nativeSession: NativeViewerInputTuple;
+	readonly geometry: NativeViewerInputGeometry;
+	readonly registrationIdentity: string;
+	readonly registrationGeneration: string;
+	/** Descriptive, echoable host-minted token; never a grant by itself. */
+	readonly sourceToken: string;
+}
+
+/**
+ * The host's own immutable description of one viewer's input scope while its row
+ * is in the explicit native STARTUP phase (issue 389): the row's own registration
+ * is framed, ready, and still before its first accepted status, and the manager
+ * has never observed a conversation tuple for it.
+ *
+ * It carries the same run, viewer, row, registration, geometry, and token facts as
+ * {@link NativeViewerInputSource}, an explicit `phase: "startup"`, and NO
+ * `nativeSession` key at all — never a null, empty, or fabricated tuple, and never
+ * a claim that no native conversation exists. Its token lives in a separate
+ * commitment domain, so it can never be read or verified as a conversation-copy
+ * scope. Input-only: no copy receipt ever carries it.
+ */
+export interface NativeViewerStartupInputSource {
+	readonly hostRunId: string;
+	readonly viewerId: string;
+	readonly viewerRevision: number;
+	readonly rowId: string;
+	readonly phase: "startup";
+	readonly geometry: NativeViewerInputGeometry;
+	readonly registrationIdentity: string;
+	readonly registrationGeneration: string;
+	/** Descriptive, echoable host-minted `nvst1` token; never a grant by itself. */
+	readonly sourceToken: string;
+}
+
+/** The input-path union: an unchanged conversation source or a startup source. */
+export type NativeViewerAnyInputSource = NativeViewerInputSource | NativeViewerStartupInputSource;
+
+/** True for the startup variant of an input-path source. */
+export function isNativeViewerStartupInputSource(
+	source: NativeViewerAnyInputSource,
+): source is NativeViewerStartupInputSource {
+	return (source as { readonly phase?: unknown }).phase === "startup";
+}
+
+/**
+ * Why one viewer input was refused. Every refusal happens strictly BEFORE any PTY
+ * write, and none of them is a retry instruction.
+ */
+export type NativeViewerInputRefusal =
+	/** No manager, this host is closing, or the manager offers no viewer input seam. */
+	| "unavailable"
+	/** This manager is stopping or disposed. */
+	| "disposed"
+	/** Never registered, retired by closeViewer, or an unknown id. */
+	| "unknown-viewer"
+	/** Registered without this host's run identity or without a copy sink. */
+	| "no-input-source"
+	/** Displays no row, or its row is gone, finished, stopping, or unregistered. */
+	| "row-unavailable"
+	/** Framing not requested for this registration, or its readiness unverified. */
+	| "input-unready"
+	/** The row's current native conversation is unknown. */
+	| "unknown-native-tuple"
+	/** Any expected fact differs from the current one, including an ABA change. */
+	| "stale-source"
+	/** The row's current input modes differ from the modes the bytes were made for. */
+	| "stale-input-modes"
+	/** The row's input modes cannot be read, so the fence cannot be evaluated. */
+	| "modes-unavailable"
+	/** Malformed request or no bytes to send. */
+	| "invalid-input";
+
+/**
+ * Viewer input outcome. `submitted` means the write was invoked and returned; it is
+ * never an acknowledgement that the child processed anything. `unknown` means the
+ * handoff is genuinely uncertain after the write was invoked. There is no retry,
+ * queue, replay, resize, spawn, or stop on any path.
+ */
+export type NativeViewerInputResult =
+	| { readonly status: "submitted" }
+	| { readonly status: "refused"; readonly reason: NativeViewerInputRefusal }
+	| { readonly status: "unknown" };
+
+/** One strict viewer input request: current facts, current modes, and the bytes. */
+export interface NativeViewerInputRequest {
+	/** The exact current source: a conversation source or, before the first status, a startup source. */
+	readonly expectedSource: NativeViewerAnyInputSource;
+	readonly expectedInputModes: TerminalInputModes;
+	/**
+	 * Native translated bytes; legacy X10 mouse packets must remain byte-oriented.
+	 * One dispatch is bounded, in raw bytes (UTF-8 for a string, `length` for a
+	 * Buffer), by the child's technical whole-dispatch assembly bound — the agreed
+	 * 1 MiB paste body plus its two markers. Larger input is refused as
+	 * `invalid-input` before the PTY, never truncated and never sent unframed.
+	 */
+	readonly data: string | Buffer;
+}
+
+/**
+ * One native copy this exact viewer's own input caused. It travels to that viewer's
+ * bound sink and to nobody else: never the owner's local clipboard callback, never
+ * another viewer, never a broadcast.
+ */
+export interface NativeViewerClipboardReceipt {
+	readonly source: NativeViewerInputSource;
+	readonly event: NativeClipboardEvent;
+	readonly dispatchId: number;
+}
+
+/** One viewer's own copy destination, supplied by the host that owns that surface. */
+export type NativeViewerClipboardSink = (receipt: NativeViewerClipboardReceipt) => void;
+
+/**
+ * Local-only registration options for one viewing surface. Both are immutable for
+ * the life of the viewer and stay in the manager's own viewer record: they never
+ * enter the public viewer state, a roster, or any second store, and neither grants
+ * input. A viewer registered without them keeps every existing behavior and can
+ * never be an input source.
+ */
+export interface ViewerOpenOptions {
+	/** The host run that owns this surface, minted by that host, never by a caller. */
+	readonly hostRunId?: string;
+	/** This surface's own native copy sink; required before it may take input. */
+	readonly nativeClipboardSink?: NativeViewerClipboardSink;
+}
 
 /**
  * The small structural PTY surface the manager needs — the exact public
@@ -230,6 +595,12 @@ export interface InstanceStatusBootstrap {
 	readonly generation: string;
 	/** Private host-owned startup payload namespace; absent withholds long-prompt delivery. */
 	readonly payloadDir?: string;
+	/**
+	 * Closed input-framing mode marker actually recorded in THIS registration's
+	 * bootstrap. Absence means legacy; the manager never frames a byte unless the
+	 * bootstrap it received carries exactly mode version 1.
+	 */
+	readonly inputOriginFraming?: 1;
 }
 
 export interface InstanceStatusRegistration {
@@ -252,7 +623,28 @@ export type InstanceActivityRefreshStatus = StatusActivityRefreshResult["status"
  * any wire parser.
  */
 export interface StatusRegistrar {
-	register(instanceId: string, handlers: InstanceStatusHandlers): InstanceStatusRegistration;
+	/**
+	 * Registers one row before its child is spawned. The closed
+	 * {@link InstanceStatusRegistrationOptions} input-framing request is passed
+	 * through to the ACTUAL bootstrap the registrar issues; a registrar that does
+	 * not record the request in that bootstrap makes the opted-in row fail closed
+	 * rather than frame against a legacy child.
+	 */
+	register(
+		instanceId: string,
+		handlers: InstanceStatusHandlers,
+		options?: InstanceStatusRegistrationOptions,
+	): InstanceStatusRegistration;
+}
+
+/** Closed per-registration request the manager may pass to its registrar. */
+export interface InstanceStatusRegistrationOptions {
+	/**
+	 * Request the closed child-side input-framing bootstrap mode (version 1) for
+	 * this registration only. Sent only when the manager was constructed with the
+	 * internal opt-in; absent keeps the legacy bootstrap byte-for-byte.
+	 */
+	readonly inputOriginFraming?: boolean;
 }
 
 /** Immutable, copied view row for one instance (later SidebarItem shape). */
@@ -349,6 +741,21 @@ export interface InstanceManagerOptions {
 	getSidebarTitleColumns?: () => number;
 	/** PTY factory; defaults to the pinned real @lydell/node-pty (lazily loaded). */
 	ptyFactory?: PtyFactory;
+	/**
+	 * Internal opt-in (default false) for the closed native input-framing mode.
+	 * When true, every row's registration requests the closed bootstrap mode, the
+	 * host frames EVERY byte it writes to that child's PTY with one encoder per
+	 * registration, and it refuses to write anything until that exact
+	 * registration's authenticated readiness arrives. Absent/false keeps the
+	 * legacy behavior byte-for-byte: raw bytes forwarded, v1 capsules only, no
+	 * readiness observed. This is not a user setting, a permission, or remote
+	 * input: viewer input is admitted only through {@linkcode writeViewerInput} on a
+	 * surface this host registered with its own run identity and its own copy sink,
+	 * and an opaque origin alone is never a grant. Only native setup may request it
+	 * — legacy private profiles and injected non-native preparers cannot frame by
+	 * accident.
+	 */
+	nativeInputOriginFraming?: boolean;
 }
 
 export interface ShutdownOptions {
@@ -438,6 +845,41 @@ interface ManagedInstance {
 	surface?: TerminalSurface;
 	pty?: InstancePty;
 	ptyExited: boolean;
+	/**
+	 * Canonical content geometry of this row (#474): the size its PTY and terminal
+	 * surface actually have (or will have at spawn). Only the manager changes it,
+	 * through an addressed per-row change or a host-wide resize.
+	 */
+	cols: number;
+	rows: number;
+	/** Bumped on every accepted geometry change; stale interaction is fenced on it. */
+	geometryRevision: number;
+	/**
+	 * True only when THIS registration's own bootstrap carries the closed
+	 * input-framing mode. Set once at registration and never again.
+	 */
+	inputFramingRequested: boolean;
+	/**
+	 * Set once, and only by this registration's own verified readiness capsule
+	 * while this exact record still owns a live, unreleased, un-stopping child.
+	 * Never inherited across a restart, release, exit, or another row.
+	 */
+	inputFramingReady: boolean;
+	/**
+	 * Sticky per-registration startup-phase fact (issue 389). Set once, only when a
+	 * correctly framed registration is recorded, and cleared for good at this
+	 * registration's first ACCEPTED status (even one with a null tuple), a reporter
+	 * disconnect or reconnect, registration release, a stop that closes admission,
+	 * the child's exit, and manager stop/disposal. It never reopens within one
+	 * process incarnation, and it is never inferred from a missing tuple.
+	 */
+	startupInputOpen: boolean;
+	/**
+	 * One encoder per registration, created from this registration's own
+	 * bootstrap before the child spawned. Never reset on reporter reconnect or
+	 * extension reload; a new child/registration gets a new encoder.
+	 */
+	inputEncoder?: NativeInputEncoder;
 	/** Spawn admission closes while an idle preflight or confirmed Stop is unresolved. */
 	stopAdmissionClosed: boolean;
 	sigtermSent: boolean;
@@ -476,6 +918,9 @@ export const __test = Object.freeze({
 	setNodePtyLoaderForTests(loader: (() => LoadedNodePty) | undefined): void {
 		nodePtyLoaderForTests = loader;
 		cachedNodePty = undefined;
+	},
+	setSavedDeletionAdaptersForTests(adapters: SavedDeletionMutationAdapters | undefined): void {
+		savedDeletionAdaptersForTests = adapters === undefined ? undefined : Object.freeze({ ...adapters });
 	},
 });
 
@@ -521,6 +966,42 @@ function validateShutdownMs(value: number, label: string): void {
 	}
 }
 
+/** Internal viewer record: one surface's facts, its host run identity, and its own sink. */
+interface ManagedViewer {
+	id: string;
+	sessionId: string | undefined;
+	cols: number | undefined;
+	rows: number | undefined;
+	revision: number;
+	/**
+	 * Immutable identity of the host run that registered this surface, supplied by
+	 * that host at registration. Local-only: never published, never chosen by a
+	 * caller of a write, and absent for a surface that took part in no input scope.
+	 */
+	hostRunId?: string;
+	/**
+	 * Immutable copy destination for copies this surface's own input caused. Required
+	 * before the viewer may take input, because this path has no intentional
+	 * permanent copy drop. Retired with the record by closeViewer or disposal.
+	 */
+	nativeClipboardSink?: NativeViewerClipboardSink;
+}
+
+function viewerState(viewer: ManagedViewer): SessionViewerState {
+	return {
+		viewerId: viewer.id,
+		sessionId: viewer.sessionId,
+		cols: viewer.cols,
+		rows: viewer.rows,
+		revision: viewer.revision,
+	};
+}
+
+/** True only for a row a viewer may display: present, launched or launching, and not finished. */
+function isViewableRow(record: ManagedInstance | undefined): boolean {
+	return record !== undefined && !record.ptyExited && record.lifecycle !== "error";
+}
+
 /** Only a well-shaped accepted public response suppresses the POSIX SIGTERM fallback. */
 function validShutdownRequest(value: unknown): boolean {
 	try {
@@ -550,6 +1031,208 @@ const PUBLIC_INSTANCE_ERRORS = {
 } as const;
 
 type InstanceErrorCode = keyof typeof PUBLIC_INSTANCE_ERRORS;
+
+/**
+ * The host's own local-user input origin. It is a closed classification of
+ * where an already-admitted dispatch came from, never a permission, a trust
+ * claim, or a viewer grant.
+ */
+const LOCAL_INPUT_ORIGIN: NativeInputOrigin = Object.freeze({ kind: "local" } as const);
+
+/**
+ * TerminalSurface protocol replies (DA/DSR/kitty keyboard) and any other
+ * host-generated child input carry no user origin, so they can never authorize
+ * or label a clipboard copy.
+ */
+const PROTOCOL_INPUT_ORIGIN: NativeInputOrigin = Object.freeze({ kind: "none" } as const);
+
+/**
+ * The closed child-side fence of a startup-phase viewer dispatch. It names the
+ * child's own explicit startup phase and nothing else: no tuple, id, or epoch.
+ */
+const STARTUP_INPUT_FENCE: NativeInputExpectedFence = Object.freeze({ phase: "startup" } as const);
+
+/** Printable-ASCII bounded identity field shared by every viewer input source fact. */
+const VIEWER_FACT_FIELD = /^[\x21-\x7e]{1,128}$/;
+const VIEWER_MOUSE_TRACKING_MODES = new Set<string>(["none", "x10", "vt200", "drag", "any"]);
+const VIEWER_MOUSE_ENCODINGS = new Set<string>(["default", "sgr", "sgr-pixels"]);
+const VIEWER_INPUT_MODE_KEYS = ["kittyFlags", "applicationCursorKeys", "applicationKeypad",
+  "bracketedPaste", "mouseTracking", "modifyOtherKeys", "mouseEncoding"] as const;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+	const own = Object.keys(value);
+	return own.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function isOrdinal(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Bounded printable-ASCII fact field of an unknown value (never a regex on unknown). */
+function isBoundedFactField(value: unknown): boolean {
+	return typeof value === "string" && VIEWER_FACT_FIELD.test(value);
+}
+
+/** The closed modifyOtherKeys level set, checked without assuming a type. */
+function isModifyOtherKeysLevel(value: unknown): boolean {
+	return typeof value === "number" && (value === 0 || value === 1 || value === 2);
+}
+
+/**
+ * Shape check for an expected source handed back by a caller. It validates the
+ * closed fact shape only — the manager still compares every field against the
+ * current record, so a well-formed forged source is simply stale.
+ */
+function isViewerInputSource(value: unknown): value is NativeViewerInputSource {
+	if (!isPlainRecord(value)
+		|| !hasExactKeys(value, [
+			"hostRunId", "viewerId", "viewerRevision", "rowId", "nativeSession", "geometry",
+			"registrationIdentity", "registrationGeneration", "sourceToken",
+		])) {
+		return false;
+	}
+	if (!isBoundedFactField(value.hostRunId)
+		|| !isBoundedFactField(value.sourceToken)
+		|| !isBoundedFactField(value.rowId)
+		|| !isBoundedFactField(value.registrationIdentity)
+		|| !isBoundedFactField(value.registrationGeneration)
+		|| !isOrdinal(value.viewerRevision)) {
+		return false;
+	}
+	const native = value.nativeSession;
+	const geometry = value.geometry;
+	if (!isPlainRecord(native) || !hasExactKeys(native, ["sessionId", "epoch"])
+		// The conversation identity keeps the protocol's own domain (opaque, bounded in
+		// UTF-8 bytes, path-free, control-free, possibly non-ASCII), so a valid
+		// conversation is never refused an input source by an extra ASCII-only rule.
+		|| !isValidNativeSessionId(native.sessionId)
+		|| typeof native.epoch !== "number" || !Number.isSafeInteger(native.epoch) || native.epoch < 1) {
+		return false;
+	}
+	return isViewerInputGeometry(geometry);
+}
+
+function isViewerInputGeometry(geometry: unknown): boolean {
+	return isPlainRecord(geometry) && hasExactKeys(geometry, ["cols", "rows", "revision"])
+		&& typeof geometry.cols === "number" && Number.isSafeInteger(geometry.cols)
+		&& geometry.cols >= 1 && geometry.cols <= 1000
+		&& typeof geometry.rows === "number" && Number.isSafeInteger(geometry.rows)
+		&& geometry.rows >= 1 && geometry.rows <= 1000
+		&& isOrdinal(geometry.revision);
+}
+
+/**
+ * Closed shape check for a startup source: exactly its own keys, an explicit
+ * `phase: "startup"`, and no `nativeSession` key at all (a null or fake one fails).
+ */
+function isViewerStartupInputSource(value: unknown): value is NativeViewerStartupInputSource {
+	if (!isPlainRecord(value)
+		|| !hasExactKeys(value, [
+			"hostRunId", "viewerId", "viewerRevision", "rowId", "phase", "geometry",
+			"registrationIdentity", "registrationGeneration", "sourceToken",
+		])) {
+		return false;
+	}
+	return value.phase === "startup"
+		&& isBoundedFactField(value.hostRunId)
+		&& isBoundedFactField(value.sourceToken)
+		&& isBoundedFactField(value.rowId)
+		&& isBoundedFactField(value.registrationIdentity)
+		&& isBoundedFactField(value.registrationGeneration)
+		&& isOrdinal(value.viewerRevision)
+		&& isViewerInputGeometry(value.geometry);
+}
+
+/** Variant-aware shape check for an expected input source handed back by a caller. */
+function isAnyViewerInputSource(value: unknown): value is NativeViewerAnyInputSource {
+	if (isPlainRecord(value) && Object.hasOwn(value, "phase")) return isViewerStartupInputSource(value);
+	return isViewerInputSource(value);
+}
+
+/**
+ * Variant-aware exact equality of two input-path sources. A startup source never
+ * equals a conversation source, whatever their other facts say.
+ */
+function sameAnyViewerInputSource(left: NativeViewerAnyInputSource, right: NativeViewerAnyInputSource): boolean {
+	const leftStartup = isNativeViewerStartupInputSource(left);
+	const rightStartup = isNativeViewerStartupInputSource(right);
+	if (leftStartup !== rightStartup) return false;
+	if (leftStartup && rightStartup) {
+		return left.hostRunId === right.hostRunId
+			&& left.viewerId === right.viewerId
+			&& left.viewerRevision === right.viewerRevision
+			&& left.rowId === right.rowId
+			&& left.geometry.cols === right.geometry.cols
+			&& left.geometry.rows === right.geometry.rows
+			&& left.geometry.revision === right.geometry.revision
+			&& left.registrationIdentity === right.registrationIdentity
+			&& left.registrationGeneration === right.registrationGeneration
+			&& left.sourceToken === right.sourceToken;
+	}
+	return sameViewerInputSource(left as NativeViewerInputSource, right as NativeViewerInputSource);
+}
+
+function sameViewerInputSource(left: NativeViewerInputSource, right: NativeViewerInputSource): boolean {
+	return left.hostRunId === right.hostRunId
+		&& left.viewerId === right.viewerId
+		&& left.viewerRevision === right.viewerRevision
+		&& left.rowId === right.rowId
+		&& left.nativeSession.sessionId === right.nativeSession.sessionId
+		&& left.nativeSession.epoch === right.nativeSession.epoch
+		&& left.geometry.cols === right.geometry.cols
+		&& left.geometry.rows === right.geometry.rows
+		&& left.geometry.revision === right.geometry.revision
+		&& left.registrationIdentity === right.registrationIdentity
+		&& left.registrationGeneration === right.registrationGeneration
+		// The token commits to every fact above; comparing it catches a source that
+		// was rebuilt from older facts the individual fields no longer describe.
+		&& left.sourceToken === right.sourceToken;
+}
+
+/** Shape check for the input modes a caller observed (an observation, never authority). */
+function isViewerInputModes(value: unknown): value is TerminalInputModes {
+	if (!isPlainRecord(value) || !hasExactKeys(value, VIEWER_INPUT_MODE_KEYS)) return false;
+	if (!isOrdinal(value.kittyFlags) || value.kittyFlags > 7) return false;
+	for (const key of ["applicationCursorKeys", "applicationKeypad", "bracketedPaste"] as const) {
+		if (typeof value[key] !== "boolean") return false;
+	}
+	if (typeof value.mouseTracking !== "string" || !VIEWER_MOUSE_TRACKING_MODES.has(value.mouseTracking)) return false;
+	if (!isModifyOtherKeysLevel(value.modifyOtherKeys)) return false;
+	return typeof value.mouseEncoding === "string" && VIEWER_MOUSE_ENCODINGS.has(value.mouseEncoding);
+}
+
+function sameViewerInputModes(left: TerminalInputModes, right: TerminalInputModes): boolean {
+	return left.kittyFlags === right.kittyFlags
+		&& left.applicationCursorKeys === right.applicationCursorKeys
+		&& left.applicationKeypad === right.applicationKeypad
+		&& left.bracketedPaste === right.bracketedPaste
+		&& left.mouseTracking === right.mouseTracking
+		&& left.modifyOtherKeys === right.modifyOtherKeys
+		&& left.mouseEncoding === right.mouseEncoding;
+}
+
+/** One strict viewer input request; anything else is refused before any state is read. */
+function invalidViewerInputRequest(request: NativeViewerInputRequest): boolean {
+	if (!isPlainRecord(request)
+		|| !hasExactKeys(request, ["expectedSource", "expectedInputModes", "data"])) return true;
+	if (!isAnyViewerInputSource(request.expectedSource)) return true;
+	if (!isViewerInputModes(request.expectedInputModes)) return true;
+	if ((typeof request.data !== "string" && !Buffer.isBuffer(request.data)) || request.data.length === 0) return true;
+	// The child assembles ONE viewer dispatch whole before any native input listener
+	// sees it, so this seam admits it against the same technical assembly bound the
+	// child enforces, counted in raw native bytes exactly as they will be written.
+	// This is a refusal before the PTY (the existing `invalid-input` reason, no new
+	// wire error), never a paste policy: the 1 MiB wire body bound, the per-fragment
+	// transport bound, and every local or protocol-reply write stay unchanged.
+	const bytes = typeof request.data === "string"
+		? Buffer.byteLength(request.data, "utf8")
+		: request.data.length;
+	return bytes > NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES;
+}
 
 function publicInstanceError(code: InstanceErrorCode): string {
 	const message = PUBLIC_INSTANCE_ERRORS[code];
@@ -693,6 +1376,20 @@ function validateInitialRequest(value: unknown): { title: string; prompt: string
 	return { title: request.title, prompt: request.prompt };
 }
 
+/** The caller's final guard: only an exact `true` authorizes; a throw refuses. */
+function callerAuthorized(authorize: SavedMutationAuthorization): boolean {
+	try {
+		return authorize() === true;
+	} catch {
+		return false;
+	}
+}
+
+/** True only for this manager's own synchronous known-owned duplicate refusal. */
+function isOwnedDuplicateLaunchError(error: unknown): boolean {
+	return error instanceof Error && error.message.includes("already open in this host");
+}
+
 /**
  * Manager of independently owned native session-host instances. See the
  * module documentation for the ownership, isolation, and shutdown rules.
@@ -703,6 +1400,7 @@ export class InstanceManager {
 	readonly #statusRegistrar: StatusRegistrar;
 	readonly #profilePreparer: ProfilePreparer;
 	readonly #nativeSetup: boolean;
+	readonly #inputOriginFraming: boolean;
 	readonly #args: readonly string[];
 	readonly #env: NodeJS.ProcessEnv;
 	#cols: number;
@@ -717,6 +1415,9 @@ export class InstanceManager {
 	readonly #ptyFactory: PtyFactory;
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
+	/** Registered viewing surfaces (#474): the only store of viewer facts. */
+	readonly #viewers = new Map<string, ManagedViewer>();
+	#nextViewerId = 1;
 	readonly #inflightCreates = new Set<Promise<void>>();
 	#stopping = false;
 	#disposed = false;
@@ -751,6 +1452,16 @@ export class InstanceManager {
 			throw new Error("session-host: nativeSetup:false requires an explicitly injected legacy setup preparer");
 		}
 		this.#nativeSetup = options.nativeSetup ?? true;
+		if (options.nativeInputOriginFraming !== undefined && typeof options.nativeInputOriginFraming !== "boolean") {
+			throw new Error("session-host: nativeInputOriginFraming must be a boolean or absent");
+		}
+		this.#inputOriginFraming = options.nativeInputOriginFraming === true;
+		// The capture mode is a property of the native launch composition only.
+		// Legacy private profiles and injected preparers can never frame, so a
+		// request there fails at construction instead of being silently ignored.
+		if (this.#inputOriginFraming && !this.#nativeSetup) {
+			throw new Error("session-host: native input framing is available only for native setup launches");
+		}
 		this.#profilePreparer = options.profileRegistry ?? new NativeAgentRegistry({ env: this.#env });
 		this.#getSupportedKeyboardFlags = options.getSupportedKeyboardFlags;
 		this.#graphicsBudget = options.graphicsBudget ?? createTerminalGraphicsBudget();
@@ -904,6 +1615,8 @@ export class InstanceManager {
 		// any retained resource is disposed, and cannot resurrect or retarget
 		// this row.
 		this.#records.delete(record.id);
+		// No surface may keep displaying (or sizing) a row that is gone.
+		this.#retireViewerTargets(record.id);
 		this.#releaseRegistration(record);
 		this.#disposeDataListener(record);
 		this.#disposeExitListener(record);
@@ -944,6 +1657,8 @@ export class InstanceManager {
 			// shutdown preflight can yield. A positive idle-only rejection below
 			// reopens admission because no stop was actually accepted.
 			record.stopAdmissionClosed = true;
+			// The startup input phase does NOT reopen with admission: it is sticky.
+			this.#closeStartupInput(record, true);
 			// Register before the public request, because it may synchronously exit.
 			// This bounded preflight never sends a fallback signal or force attempt.
 			const exit = this.#waitForExit(record, DEFAULT_SHUTDOWN_GRACE_MS);
@@ -969,13 +1684,23 @@ export class InstanceManager {
 		} else {
 			// Explicit confirmation starts this exact row's terminal stop path.
 			record.stopAdmissionClosed = true;
+			this.#closeStartupInput(record, true);
 		}
 		await this.#gracefulStop(record, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS, alreadyRequested);
 		return outcome();
 	}
 
 	/** Launch one independently owned instance and resolve with its row id. */
-	async create(options: CreateInstanceOptions): Promise<string> {
+	create(options: CreateInstanceOptions): Promise<string> {
+		return this.#createInstance(options);
+	}
+
+	/**
+	 * The one native create path, shared verbatim by the public {@linkcode create}
+	 * and the guarded saved Resume handoff. Private so a guarded handoff can never be
+	 * redirected through an overridden or injected method.
+	 */
+	async #createInstance(options: CreateInstanceOptions): Promise<string> {
 		if (this.#disposed || this.#stopping) {
 			throw new Error("session-host: the instance manager is shut down; no new instances can be created");
 		}
@@ -1026,6 +1751,12 @@ export class InstanceManager {
 			activityRefreshEpisodeOpen: false,
 			statusRevision: 0,
 			activity: [],
+			cols: this.#cols,
+			rows: this.#rows,
+			geometryRevision: 0,
+			inputFramingRequested: false,
+			inputFramingReady: false,
+			startupInputOpen: false,
 			savedReservation: savedSession !== undefined
 				? { sessionId: savedSession.sessionId, file: savedSession.file }
 				: undefined,
@@ -1085,6 +1816,16 @@ export class InstanceManager {
 	 * Exited and removed rows contribute nothing.
 	 */
 	ownedLiveSessions(): readonly OwnedLiveSession[] {
+		return this.#ownedSessionCensus();
+	}
+
+	/**
+	 * Private, side-effect-free census behind {@linkcode ownedLiveSessions}: read
+	 * only from this manager's own records, never through a public or overridable
+	 * method, so the guarded saved primitives can consult it after a caller's final
+	 * authorization with no foreign code in between.
+	 */
+	#ownedSessionCensus(): OwnedLiveSession[] {
 		const sessions: OwnedLiveSession[] = [];
 		for (const record of this.#records.values()) {
 			const live = Boolean(record.pty && !record.ptyExited);
@@ -1116,6 +1857,177 @@ export class InstanceManager {
 			}
 		}
 		return sessions;
+	}
+
+	/**
+	 * Deletion-safety census from this manager's own records: the private census
+	 * plus one explicit binding-less entry whenever a live child has no current
+	 * native tuple. This is the same rule as the service's
+	 * `savedDeletionOwnedSessions`, read privately instead of through the public
+	 * `list()`/`ownedLiveSessions()` callouts.
+	 */
+	#savedDeletionCensus(): OwnedLiveSession[] {
+		const sessions = this.#ownedSessionCensus();
+		for (const record of this.#records.values()) {
+			if (record.pty && !record.ptyExited && !record.nativeSession) {
+				sessions.push({});
+				break;
+			}
+		}
+		return sessions;
+	}
+
+	/**
+	 * Guarded native saved-conversation Resume (the primitive a later remote
+	 * provider calls). The existing local admit/create path is unchanged.
+	 *
+	 * Fail-closed order, every step before the create invocation synchronous:
+	 * 1. pure pre-authorization gates — this manager's stop/dispose latches, a
+	 *    callable guard, and membership of the exact row in a branded catalog;
+	 * 2. the caller's final guard, exactly once (only `true` authorizes);
+	 * 3. with no await and no foreign callback from here to the handoff: the
+	 *    stop/dispose latches again, this manager's private census, and the actual
+	 *    native admission (catalog revision, sessions root/project, file type, inode,
+	 *    header id/cwd, existing workspace, known-owned duplicates);
+	 * 4. the protected invocation — the same private native create path `create`
+	 *    uses, with the branded admission and its recorded workspace, so its
+	 *    synchronous reservation and duplicate fence and the launch-time admission
+	 *    revalidation all still apply.
+	 *
+	 * Only step 1–3 can yield `refused`. Once step 4 is invoked the work is accepted
+	 * owner work: it is classified from this manager's own record like
+	 * `startSession` does and is never stopped, cancelled, retried, or reported as
+	 * refused because authorization was lost later.
+	 */
+	async startSavedSession(
+		catalog: SavedSessionCatalog,
+		row: SavedSessionRow,
+		authorize: SavedMutationAuthorization,
+	): Promise<GuardedSavedResumeResult> {
+		if (this.#disposed || this.#stopping) return { status: "refused", reason: "unavailable" };
+		if (typeof authorize !== "function") return { status: "refused", reason: "not-authorized" };
+		if (!isSavedSessionCatalog(catalog) || !catalog.rows.includes(row)) {
+			return { status: "refused", reason: "unknown-row" };
+		}
+		if (!callerAuthorized(authorize)) return { status: "refused", reason: "not-authorized" };
+		// From the guard's return to the handoff: own facts and native checks only.
+		if (this.#disposed || this.#stopping) return { status: "refused", reason: "unavailable" };
+		let admitted: SavedSessionAdmissionResult;
+		try {
+			admitted = admitSavedSession(catalog, row, { ownedLiveSessions: this.#ownedSessionCensus() });
+		} catch {
+			return { status: "refused", reason: "unknown-row" };
+		}
+		if (admitted.status !== "admitted") return { status: "refused", reason: admitted.reason };
+		const admission = admitted.admission;
+		// The protected invocation. Its synchronous prefix posts the row and the
+		// reservation before anything can yield.
+		const launch = this.#createInstance({ workspace: admission.workspace, savedSession: admission });
+		let id: string;
+		try {
+			id = await launch;
+		} catch (error) {
+			return isOwnedDuplicateLaunchError(error) ? { status: "duplicate" } : { status: "failed" };
+		}
+		// A create that settled while this manager began stopping may own a child
+		// that is no longer observable as usable: claim no result.
+		if (this.#disposed || this.#stopping) return { status: "unknown" };
+		const record = this.#records.get(id);
+		if (record === undefined || record.lifecycle === "error" || record.lifecycle === "starting") {
+			return { status: "not-ready" };
+		}
+		return { status: "started", id };
+	}
+
+	/**
+	 * Guarded native saved-conversation Delete (the primitive a later remote
+	 * provider calls). The existing local deletion path is unchanged.
+	 *
+	 * Pure pre-authorization gates (stop/dispose latches, a callable guard, exact
+	 * row membership in a branded catalog) run first. The existing native
+	 * trash-first `deleteSavedSessionFile` then runs with this manager's OWN
+	 * validation, which it calls immediately before EACH mutation stage: the
+	 * caller's guard, then — synchronously, with no foreign callback — the
+	 * stop/dispose latches, this manager's private deletion census (current files,
+	 * exact reservations, historical ids, and an explicit unknown binding for a live
+	 * child without a tuple), and the actual native deletion validation (revision,
+	 * root/project, file type, inode, header). A missing workspace stays deletable
+	 * exactly as locally. A replacement or authorization loss observed after trash
+	 * therefore prevents the unlink fallback.
+	 *
+	 * The manager tracks whether the trash or unlink handoff was ever invoked:
+	 * `refused` only before either, `deleted` for native success whatever happens to
+	 * authorization afterwards, and `unconfirmed` once a handoff may have run.
+	 */
+	deleteSavedSession(
+		catalog: SavedSessionCatalog,
+		row: SavedSessionRow,
+		authorize: SavedMutationAuthorization,
+	): GuardedSavedDeletionResult {
+		if (this.#disposed || this.#stopping) return { status: "refused", reason: "unavailable" };
+		if (typeof authorize !== "function") return { status: "refused", reason: "not-authorized" };
+		if (!isSavedSessionCatalog(catalog) || !catalog.rows.includes(row)) {
+			return { status: "refused", reason: "unknown-row" };
+		}
+		// A minted row is frozen catalog data: reading its path runs no foreign code.
+		const file = row.file;
+		const adapters = savedDeletionAdaptersForTests;
+		const trashHandoff = adapters?.spawnSync ?? nodeSpawnSync;
+		const unlinkHandoff = adapters?.unlink ?? unlinkSync;
+		let trashInvoked = false;
+		let unlinkInvoked = false;
+		let stageRefusal: GuardedSavedDeletionRefusalReason | undefined;
+		const validate = (): string | undefined => {
+			stageRefusal = this.#guardedSavedDeletionRefusal(catalog, row, authorize);
+			return stageRefusal;
+		};
+		// Each wrapper records the handoff BEFORE invoking it: whatever the handoff
+		// then does (including reentering this manager), it may have run.
+		const trash = ((command: string, args: readonly string[], options: SpawnSyncOptionsWithStringEncoding) => {
+			trashInvoked = true;
+			return trashHandoff(command, args, options);
+		}) as unknown as typeof nodeSpawnSync;
+		const unlink = (path: string): void => {
+			unlinkInvoked = true;
+			unlinkHandoff(path);
+		};
+		let result: SavedSessionDeletionResult;
+		try {
+			result = deleteSavedSessionFile(file, { validate, spawnSync: trash, unlink });
+		} catch {
+			return trashInvoked || unlinkInvoked
+				? { status: "unconfirmed", trashInvoked, unlinkInvoked }
+				: { status: "refused", reason: "unavailable" };
+		}
+		if (result.ok === true) return { status: "deleted", method: result.method };
+		if (!trashInvoked && !unlinkInvoked) {
+			return { status: "refused", reason: stageRefusal ?? "unavailable" };
+		}
+		return {
+			status: "unconfirmed",
+			trashInvoked,
+			unlinkInvoked,
+			...(!unlinkInvoked && stageRefusal !== undefined ? { fallbackRefusal: stageRefusal } : {}),
+		};
+	}
+
+	/**
+	 * One guarded deletion stage check: the caller's guard, then only this
+	 * manager's own facts and the native validation, with nothing foreign after the
+	 * guard. Never throws.
+	 */
+	#guardedSavedDeletionRefusal(
+		catalog: SavedSessionCatalog,
+		row: SavedSessionRow,
+		authorize: SavedMutationAuthorization,
+	): GuardedSavedDeletionRefusalReason | undefined {
+		if (!callerAuthorized(authorize)) return "not-authorized";
+		if (this.#disposed || this.#stopping) return "unavailable";
+		try {
+			return validateSavedSessionDeletion(catalog, row, { ownedLiveSessions: this.#savedDeletionCensus() });
+		} catch {
+			return "unknown-live-binding";
+		}
 	}
 
 	/**
@@ -1195,13 +2107,20 @@ export class InstanceManager {
 		if (!pty || record.ptyExited || record.lifecycle !== "alive") {
 			throw new Error(`session-host: instance ${id} is not accepting input (lifecycle ${record.lifecycle})`);
 		}
-		pty.write(data);
+		// Local user input only. There is deliberately no origin parameter: a
+		// viewer cannot route input through this seam in this phase, and an opaque
+		// viewer token alone would be no grant.
+		this.#writeChildInput(record, pty, data, LOCAL_INPUT_ORIGIN);
 	}
 
 	/**
 	 * Update the geometry of every live instance: both instances the
 	 * frontend shows and hidden ones (hiding or switching is a frontend
-	 * concern; the manager never stops a child for selection or hiding).
+	 * concern; the manager never stops a child for selection or hiding). This is
+	 * the host-wide operation for a host that gives every child one shared
+	 * geometry; a host that sizes each session by its own viewers uses
+	 * {@linkcode resizeInstance} through the viewer seam instead, and rows with no
+	 * viewers of their own keep their last size.
 	 */
 	resize(cols: number, rows: number): void {
 		this.#assertUsable("resize");
@@ -1210,22 +2129,563 @@ export class InstanceManager {
 		this.#cols = cols;
 		this.#rows = rows;
 		for (const record of this.#records.values()) {
-			if (!record.pty || record.ptyExited) {
+			// A finished child keeps its frozen frame; only rows that can still
+			// run (or have not spawned yet) take the new geometry.
+			if (record.ptyExited) {
 				continue;
 			}
+			this.#applyGeometry(record, cols, rows);
+		}
+	}
+
+	/**
+	 * Adopt one host pane size as the initial-sizing rule for rows created from
+	 * now on (#474). Resizes nothing: a row nobody is viewing keeps its last
+	 * canonical size, while a new row that has never been viewed starts at the
+	 * host's current geometry, exactly as before per-session sizing.
+	 */
+	setInitialGeometry(cols: number, rows: number): void {
+		this.#assertUsable("setInitialGeometry");
+		validateDimension(cols, "cols");
+		validateDimension(rows, "rows");
+		this.#cols = cols;
+		this.#rows = rows;
+	}
+
+	/**
+	 * Resize exactly one addressed row (#474). Never touches a sibling: per-row
+	 * geometry is deliberate and addressed, and an unknown, finished, or errored
+	 * row is reported as not resized rather than guessed at. A row that has not
+	 * spawned yet records the geometry its spawn will use.
+	 */
+	resizeInstance(id: string, cols: number, rows: number): boolean {
+		this.#assertUsable("resizeInstance");
+		validateDimension(cols, "cols");
+		validateDimension(rows, "rows");
+		const record = this.#records.get(id);
+		if (!isViewableRow(record)) {
+			return false;
+		}
+		return this.#applyGeometry(record as ManagedInstance, cols, rows);
+	}
+
+	/**
+	 * The canonical content geometry of one row, or undefined for an unknown row.
+	 * This is the manager's own fact (the size its PTY and surface have), so a
+	 * frontend can fence stale hit targets on it without a second geometry store.
+	 */
+	instanceGeometry(id: string): SessionGeometry | undefined {
+		const record = this.#records.get(id);
+		if (record === undefined) {
+			return undefined;
+		}
+		return { cols: record.cols, rows: record.rows, revision: record.geometryRevision };
+	}
+
+	/**
+	 * Register one viewing surface (#474). The registration carries no authority
+	 * over input, lifecycle, or another row; ids are never reused, so a stale
+	 * callback can never address a newer surface. Returns undefined once this
+	 * manager is stopping or disposed.
+	 *
+	 * The optional local-only options bind this surface to its owning host run and
+	 * give it its own native copy sink. Both are stored in this viewer's own record
+	 * and are immutable for its life; the published {@linkcode viewerState} facts and
+	 * the no-argument call are unchanged, and no second viewer store exists. Binding
+	 * them is what makes the surface eligible for {@linkcode readViewerInputSource}
+	 * and {@linkcode writeViewerInput} later — it grants nothing by itself, and a
+	 * callback is never an input authority.
+	 */
+	openViewer(options?: ViewerOpenOptions): SessionViewerState | undefined {
+		if (this.#disposed || this.#stopping) {
+			return undefined;
+		}
+		const viewer: ManagedViewer = {
+			id: `viewer-${this.#nextViewerId++}`,
+			sessionId: undefined,
+			cols: undefined,
+			rows: undefined,
+			revision: 1,
+		};
+		if (options !== undefined) {
+			// A closed, optional options object: only these two facts exist, and both are
+			// immutable for the life of this viewer record.
+			if (!isPlainRecord(options)
+				|| !Object.keys(options).every((key) => key === "hostRunId" || key === "nativeClipboardSink")) {
+				throw new Error("session-host: viewer registration options must be an absent or closed options object");
+			}
+			const hostRunId = options.hostRunId;
+			if (hostRunId !== undefined) {
+				if (typeof hostRunId !== "string" || !VIEWER_FACT_FIELD.test(hostRunId)) {
+					throw new Error("session-host: viewer host run identity must be bounded printable text");
+				}
+				viewer.hostRunId = hostRunId;
+			}
+			const sink = options.nativeClipboardSink;
+			if (sink !== undefined) {
+				if (typeof sink !== "function") {
+					throw new Error("session-host: viewer native clipboard sink must be a function");
+				}
+				viewer.nativeClipboardSink = (receipt) => { sink(receipt); };
+			}
+		}
+		this.#viewers.set(viewer.id, viewer);
+		return viewerState(viewer);
+	}
+
+	/** Current facts of one registered surface, or undefined once it is gone. */
+	viewerState(viewerId: string): SessionViewerState | undefined {
+		const viewer = this.#viewers.get(viewerId);
+		return viewer === undefined ? undefined : viewerState(viewer);
+	}
+
+	/** Every registered surface currently displaying one row (copied facts). */
+	sessionViewers(sessionId: string): SessionViewerState[] {
+		const states: SessionViewerState[] = [];
+		for (const viewer of this.#viewers.values()) {
+			if (viewer.sessionId === sessionId) states.push(viewerState(viewer));
+		}
+		return states;
+	}
+
+	/**
+	 * Change one surface's content target and/or pane size, then recompute only
+	 * the sessions its change could affect: its previous target and its new one.
+	 * A row's canonical geometry becomes the independent minimum columns and
+	 * minimum rows over the surfaces that display it and contribute dimensions;
+	 * with no contributing surface the row keeps its last size. No other row is
+	 * ever resized, and no viewer gets exclusive control of anything.
+	 */
+	updateViewer(viewerId: string, update: SessionViewerUpdate = {}): SessionViewerUpdateResult {
+		if (this.#disposed) {
+			return { applied: false, reason: "disposed" };
+		}
+		const viewer = this.#viewers.get(viewerId);
+		if (viewer === undefined) {
+			return { applied: false, reason: "unknown-viewer" };
+		}
+		if (update.expectedRevision !== undefined && update.expectedRevision !== viewer.revision) {
+			return { applied: false, reason: "stale" };
+		}
+		const target = update.sessionId === null ? undefined : update.sessionId ?? viewer.sessionId;
+		const cols = update.cols === undefined ? viewer.cols : update.cols;
+		const rows = update.rows === undefined ? viewer.rows : update.rows;
+		if ((cols === undefined) !== (rows === undefined)) {
+			return { applied: false, reason: "invalid-geometry" };
+		}
+		if (cols !== undefined) {
 			try {
-				record.pty.resize(cols, rows);
+				validateDimension(cols, "cols");
+				validateDimension(rows as number, "rows");
+			} catch {
+				return { applied: false, reason: "invalid-geometry" };
+			}
+		}
+		if (target !== undefined && !isViewableRow(this.#records.get(target))) {
+			// An unknown, exited, or errored row is never a content target, so a
+			// late completion cannot resurrect a finished view or hold geometry for it.
+			return { applied: false, reason: "unknown-session" };
+		}
+		const previous = viewer.sessionId;
+		viewer.sessionId = target;
+		viewer.cols = cols;
+		viewer.rows = rows;
+		viewer.revision += 1;
+		if (previous !== undefined) this.#recomputeViewerGeometry(previous);
+		if (target !== undefined && target !== previous) this.#recomputeViewerGeometry(target);
+		return { applied: true, state: viewerState(viewer) };
+	}
+
+	/** Retire one surface. Its previous session keeps its last size for any viewer left. */
+	closeViewer(viewerId: string): boolean {
+		const viewer = this.#viewers.get(viewerId);
+		if (viewer === undefined) {
+			return false;
+		}
+		this.#viewers.delete(viewerId);
+		if (viewer.sessionId !== undefined) this.#recomputeViewerGeometry(viewer.sessionId);
+		return true;
+	}
+
+	/**
+	 * The CURRENT immutable input scope of one registered surface, or undefined when
+	 * this surface cannot take viewer input right now: it is unknown or retired, was
+	 * registered without this host's run identity or without its own copy sink, shows
+	 * no row or a row that is gone/finished/stopping, is not a framed row whose own
+	 * readiness was verified, or has no current native conversation. Resolving never
+	 * writes, resizes, queues, spawns, or changes any state, and the returned token
+	 * describes the facts rather than granting anything.
+	 *
+	 * There is no terminal-text field on purpose: the input owner is the surface and
+	 * its conversation, not the newest line on screen.
+	 */
+	readViewerInputSource(viewerId: string): NativeViewerAnyInputSource | undefined {
+		const scope = this.#viewerInputScope(viewerId);
+		return scope.ok ? scope.source : undefined;
+	}
+
+	/**
+	 * Write viewer-origin input to exactly the row this viewer displays.
+	 *
+	 * Fail-closed order, all of it before any possible PTY write and with no await
+	 * anywhere:
+	 * 1. the request shape (a malformed request, empty bytes, or a dispatch larger
+	 *    than the child's technical whole-dispatch assembly bound is refused);
+	 * 2. the CURRENT scope — same manager, live row, exact unreleased registration,
+	 *    framed and ready, known native tuple, and a mintable scope token;
+	 * 3. EVERY expected source fact against the current one, including the canonical
+	 *    geometry revision, this viewer's revision, the native tuple, the
+	 *    registration identity/generation, and the host run — an ABA change (resized
+	 *    away and back, reselected, new run, new registration, new epoch, row exit,
+	 *    stop, release) is a refusal, and nothing is ever inferred from the bytes;
+	 * 4. the CURRENT input modes against the modes the bytes were made for, because
+	 *    the same bytes mean something else in another mode (modes, descriptors, and
+	 *    tokens are freshness evidence, never authority);
+	 * 5. one more core-scope recheck after the modes read, in case a reentrant
+	 *    observer changed the facts in between.
+	 *
+	 * The row's input is then framed with this registration's own encoder under the
+	 * viewer origin, carrying the current native tuple as the child-side fence. A
+	 * refusal never touches the child. Once the write seam was invoked, a throw is
+	 * reported as `unknown` — never retried, queued, replayed, or re-routed.
+	 */
+	writeViewerInput(viewerId: string, request: NativeViewerInputRequest): NativeViewerInputResult {
+		if (invalidViewerInputRequest(request)) {
+			return { status: "refused", reason: "invalid-input" };
+		}
+		const scope = this.#viewerInputScope(viewerId);
+		if (!scope.ok) {
+			return { status: "refused", reason: scope.reason };
+		}
+		if (!sameAnyViewerInputSource(scope.source, request.expectedSource)) {
+			return { status: "refused", reason: "stale-source" };
+		}
+		const modes = this.#readViewerInputModes(scope.record);
+		if (modes === undefined) {
+			return { status: "refused", reason: "modes-unavailable" };
+		}
+		if (!sameViewerInputModes(modes, request.expectedInputModes)) {
+			return { status: "refused", reason: "stale-input-modes" };
+		}
+		const current = this.#viewerInputScope(viewerId);
+		if (!current.ok) {
+			return { status: "refused", reason: current.reason };
+		}
+		if (!sameAnyViewerInputSource(current.source, scope.source)
+			|| current.source.sourceToken !== request.expectedSource.sourceToken) {
+			return { status: "refused", reason: "stale-source" };
+		}
+		const pty = current.record.pty;
+		if (pty === undefined) {
+			return { status: "refused", reason: "row-unavailable" };
+		}
+		let fence: NativeInputExpectedFence;
+		if (isNativeViewerStartupInputSource(current.source)) {
+			// The startup fence is the child's own explicit phase, never a tuple. The
+			// row must STILL be before its first accepted status with no observed
+			// tuple at this exact instant; a once-known or lost tuple never qualifies.
+			if (!current.record.startupInputOpen || current.record.nativeSession !== null) {
+				return { status: "refused", reason: "stale-source" };
+			}
+			fence = STARTUP_INPUT_FENCE;
+		} else {
+			const native = current.record.nativeSession;
+			if (native === null) {
+				return { status: "refused", reason: "row-unavailable" };
+			}
+			fence = Object.freeze({ sessionId: native.sessionId, epoch: native.epoch });
+		}
+		const origin: NativeInputOrigin = Object.freeze({ kind: "viewer" as const, token: current.source.sourceToken });
+		try {
+			this.#writeChildInput(current.record, pty, request.data, origin, fence);
+		} catch {
+			// The seam was open when it was last checked and the write was invoked, so
+			// whether the child received the bytes is genuinely unknown.
+			return { status: "unknown" };
+		}
+		return { status: "submitted" };
+	}
+
+	/**
+	 * One read of the row's own current input modes, or undefined when they cannot be
+	 * observed (no surface, or a throwing read). A refused modes read is never a
+	 * guess: the caller writes nothing rather than send bytes whose meaning it cannot
+	 * check.
+	 */
+	#readViewerInputModes(record: ManagedInstance): TerminalInputModes | undefined {
+		const surface = record.surface;
+		if (surface === undefined) {
+			return undefined;
+		}
+		try {
+			const modes = surface.inputModes();
+			return isViewerInputModes(modes) ? modes : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Resolve one viewer's current input scope and mint its scope token from the
+	 * exact registration this row holds. Every unresolvable case is a truthful
+	 * refusal reason; nothing here mutates a row, a viewer, a surface, or a queue.
+	 */
+	#viewerInputScope(viewerId: string):
+		| { readonly ok: true; readonly viewer: ManagedViewer; readonly record: ManagedInstance; readonly source: NativeViewerAnyInputSource }
+		| { readonly ok: false; readonly reason: NativeViewerInputRefusal } {
+		if (this.#disposed || this.#stopping) {
+			return { ok: false, reason: "disposed" };
+		}
+		const viewer = this.#viewers.get(viewerId);
+		if (viewer === undefined) {
+			return { ok: false, reason: "unknown-viewer" };
+		}
+		if (viewer.hostRunId === undefined || viewer.nativeClipboardSink === undefined) {
+			// No host run identity and no copy destination means no verifiable scope:
+			// this path has no intentional permanent copy drop.
+			return { ok: false, reason: "no-input-source" };
+		}
+		const rowId = viewer.sessionId;
+		if (rowId === undefined) {
+			return { ok: false, reason: "row-unavailable" };
+		}
+		const record = this.#records.get(rowId);
+		if (record === undefined) {
+			return { ok: false, reason: "row-unavailable" };
+		}
+		const registration = record.registration;
+		if (registration === undefined || record.registrationReleased) {
+			return { ok: false, reason: "row-unavailable" };
+		}
+		if (record.pty === undefined || record.ptyExited || record.lifecycle !== "alive" || record.stopAdmissionClosed) {
+			return { ok: false, reason: "row-unavailable" };
+		}
+		if (!record.inputFramingRequested || !record.inputFramingReady || record.inputEncoder === undefined) {
+			return { ok: false, reason: "input-unready" };
+		}
+		if (record.nativeSession === null) {
+			// The ONLY tuple-less source: this exact framed, ready, live registration is
+			// still in its sticky startup phase (before its first accepted status) and
+			// the manager has never observed a conversation for this row. A missing,
+			// cleared, or lost tuple is never reinterpreted as startup.
+			if (!record.startupInputOpen
+				|| record.knownNativeSessionId !== undefined
+				|| record.lastNativeSession !== undefined) {
+				return { ok: false, reason: "unknown-native-tuple" };
+			}
+			const startup = this.#viewerStartupInputSource(viewer, record, registration);
+			if (startup === undefined) {
+				return { ok: false, reason: "no-input-source" };
+			}
+			return { ok: true, viewer, record, source: startup };
+		}
+		const source = this.#viewerInputSource(viewer, record, registration);
+		if (source === undefined) {
+			// The current facts could not be described at all (for example a viewer
+			// identity outside the bounded scope shape): no scope, no input.
+			return { ok: false, reason: "no-input-source" };
+		}
+		return { ok: true, viewer, record, source };
+	}
+
+	/**
+	 * The immutable facts one viewer's scope commits to, read from the CURRENT
+	 * record. Undefined when a fact is missing (no run identity, no sink, no
+	 * registration, or no current native conversation).
+	 */
+	#viewerScopeFacts(
+		viewer: ManagedViewer,
+		record: ManagedInstance,
+		registration: InstanceStatusRegistration,
+	): NativeViewerScopeFacts | undefined {
+		const hostRunId = viewer.hostRunId;
+		const native = record.nativeSession;
+		if (hostRunId === undefined || viewer.nativeClipboardSink === undefined || native === null) {
+			return undefined;
+		}
+		return Object.freeze({
+			hostRunId,
+			viewerId: viewer.id,
+			viewerRevision: viewer.revision,
+			rowId: record.id,
+			registrationIdentity: registration.bootstrap.instanceId,
+			registrationGeneration: registration.bootstrap.generation,
+			nativeSessionId: native.sessionId,
+			nativeSessionEpoch: native.epoch,
+			cols: record.cols,
+			rows: record.rows,
+			geometryRevision: record.geometryRevision,
+		});
+	}
+
+	/**
+	 * Mint one viewer's current input source with its scope token, or undefined when
+	 * the current facts cannot be described. The token is derived from this
+	 * registration's own existing bootstrap key — no new secret, no new state.
+	 */
+	#viewerInputSource(
+		viewer: ManagedViewer,
+		record: ManagedInstance,
+		registration: InstanceStatusRegistration,
+	): NativeViewerInputSource | undefined {
+		const facts = this.#viewerScopeFacts(viewer, record, registration);
+		if (facts === undefined) {
+			return undefined;
+		}
+		const sourceToken = mintNativeViewerScopeToken(registration.bootstrap, facts);
+		if (sourceToken === undefined) {
+			return undefined;
+		}
+		return this.#viewerInputSourceFromFacts(facts, sourceToken);
+	}
+
+	/** Owned, frozen description of already-verified scope facts. */
+	#viewerInputSourceFromFacts(facts: NativeViewerScopeFacts, sourceToken: string): NativeViewerInputSource {
+		return Object.freeze({
+			hostRunId: facts.hostRunId,
+			viewerId: facts.viewerId,
+			viewerRevision: facts.viewerRevision,
+			rowId: facts.rowId,
+			nativeSession: Object.freeze({
+				sessionId: facts.nativeSessionId,
+				epoch: facts.nativeSessionEpoch,
+			}),
+			geometry: Object.freeze({
+				cols: facts.cols,
+				rows: facts.rows,
+				revision: facts.geometryRevision,
+			}),
+			registrationIdentity: facts.registrationIdentity,
+			registrationGeneration: facts.registrationGeneration,
+			sourceToken,
+		});
+	}
+
+	/**
+	 * Mint one viewer's current STARTUP input source, or undefined when the facts
+	 * cannot be described. Its token is minted in the separate `nvst1` startup
+	 * domain from this registration's own existing bootstrap key and commits to the
+	 * same run, viewer and revision, row, registration and generation, and canonical
+	 * geometry and revision — with no conversation field at all.
+	 */
+	#viewerStartupInputSource(
+		viewer: ManagedViewer,
+		record: ManagedInstance,
+		registration: InstanceStatusRegistration,
+	): NativeViewerStartupInputSource | undefined {
+		const hostRunId = viewer.hostRunId;
+		if (hostRunId === undefined || viewer.nativeClipboardSink === undefined) {
+			return undefined;
+		}
+		const facts: NativeViewerStartupScopeFacts = Object.freeze({
+			hostRunId,
+			viewerId: viewer.id,
+			viewerRevision: viewer.revision,
+			rowId: record.id,
+			registrationIdentity: registration.bootstrap.instanceId,
+			registrationGeneration: registration.bootstrap.generation,
+			cols: record.cols,
+			rows: record.rows,
+			geometryRevision: record.geometryRevision,
+		});
+		const sourceToken = mintNativeViewerStartupScopeToken(registration.bootstrap, facts);
+		if (sourceToken === undefined) {
+			return undefined;
+		}
+		return Object.freeze({
+			hostRunId: facts.hostRunId,
+			viewerId: facts.viewerId,
+			viewerRevision: facts.viewerRevision,
+			rowId: facts.rowId,
+			phase: "startup" as const,
+			geometry: Object.freeze({
+				cols: facts.cols,
+				rows: facts.rows,
+				revision: facts.geometryRevision,
+			}),
+			registrationIdentity: facts.registrationIdentity,
+			registrationGeneration: facts.registrationGeneration,
+			sourceToken,
+		});
+	}
+
+	/**
+	 * End this registration's startup phase for good. `notify` publishes a change so
+	 * a published startup source is replaced at a genuine boundary even when no
+	 * other row fact moved; callers that already publish a change pass `false`.
+	 */
+	#closeStartupInput(record: ManagedInstance, notify: boolean): void {
+		if (!record.startupInputOpen) return;
+		record.startupInputOpen = false;
+		if (notify && this.#records.get(record.id) === record) this.#safeChanged(record.id);
+	}
+
+	/**
+	 * Recompute one row's canonical geometry from its viewers. Columns and rows
+	 * take their own minimum (100x40 and 80x50 give 80x40), and a row with no
+	 * contributing viewer is left exactly as it is.
+	 */
+	#recomputeViewerGeometry(sessionId: string): void {
+		const record = this.#records.get(sessionId);
+		if (!isViewableRow(record)) {
+			return;
+		}
+		let cols: number | undefined;
+		let rows: number | undefined;
+		for (const viewer of this.#viewers.values()) {
+			if (viewer.sessionId !== sessionId || viewer.cols === undefined || viewer.rows === undefined) {
+				continue;
+			}
+			if (cols === undefined || viewer.cols < cols) cols = viewer.cols;
+			if (rows === undefined || viewer.rows < rows) rows = viewer.rows;
+		}
+		if (cols === undefined || rows === undefined) {
+			return;
+		}
+		this.#applyGeometry(record as ManagedInstance, cols, rows);
+	}
+
+	/**
+	 * Apply one row's canonical geometry to its own PTY and surface. Failures are
+	 * contained on this row exactly as a host-wide resize contains them.
+	 */
+	#applyGeometry(record: ManagedInstance, cols: number, rows: number): boolean {
+		if (record.cols === cols && record.rows === rows) {
+			return false;
+		}
+		const pty = record.pty;
+		if (pty && !record.ptyExited) {
+			try {
+				pty.resize(cols, rows);
 			} catch {
 				this.#failRunningInstance(record, "ptyResize");
-				continue;
+				return false;
 			}
-			if (record.surface) {
-				try {
-					record.surface.resize(cols, rows);
-				} catch {
-					this.#failRunningInstance(record, "surfaceResize");
-				}
+		}
+		record.cols = cols;
+		record.rows = rows;
+		record.geometryRevision += 1;
+		if (record.surface) {
+			try {
+				record.surface.resize(cols, rows);
+			} catch {
+				this.#failRunningInstance(record, "surfaceResize");
 			}
+		}
+		return true;
+	}
+
+	/**
+	 * End every surface's participation in one row that can no longer be
+	 * displayed (its child exited, the row was removed, or the manager disposed).
+	 * The revision bump makes an in-flight writer for the old view stale, and
+	 * viewer ids are never reused, so nothing can resurrect the finished view.
+	 */
+	#retireViewerTargets(sessionId: string): void {
+		for (const viewer of this.#viewers.values()) {
+			if (viewer.sessionId !== sessionId) continue;
+			viewer.sessionId = undefined;
+			viewer.revision += 1;
 		}
 	}
 
@@ -1263,6 +2723,8 @@ export class InstanceManager {
 		validateShutdownMs(graceMs, "graceMs");
 		validateShutdownMs(killMs, "killMs");
 		this.#stopping = true;
+		// A stopping manager admits no startup input again, in any row.
+		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
 		// Late async creates settle or abort here; none can spawn after stop.
 		await Promise.allSettled([...this.#inflightCreates]);
 		return this.#stopOwnedProcesses(graceMs, killMs);
@@ -1290,6 +2752,7 @@ export class InstanceManager {
 
 	async #runDispose(): Promise<void> {
 		this.#stopping = true;
+		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
 		await Promise.allSettled([...this.#inflightCreates]);
 		try {
 			await this.#stopOwnedProcesses(DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS);
@@ -1297,6 +2760,8 @@ export class InstanceManager {
 			// Contained: disposal proceeds with owned resource cleanup below.
 		}
 		this.#disposed = true;
+		// No surface survives this host's manager: every viewer fact is dropped.
+		this.#viewers.clear();
 		for (const record of this.#records.values()) {
 			record.busy = null;
 			record.pendingInput = null;
@@ -1392,6 +2857,10 @@ export class InstanceManager {
 					: composeFreshSessionSpawnArgs(this.#args, options.initialRequest.title),
 				env: this.#env,
 				...(options.savedSession !== undefined ? { savedSession: options.savedSession } : {}),
+				// Only an opted-in native launch asks for the supported static capture
+				// flag; the descriptor is composed once, before the child exists, and the
+				// manager never mutates its own or the caller's environment.
+				...(this.#inputOriginFraming ? { nativeInputOriginFraming: true } : {}),
 			});
 			record.workspace = descriptor.cwd;
 
@@ -1410,10 +2879,27 @@ export class InstanceManager {
 					}
 					return this.#onSpawnRequest?.(record.id, request) ?? Promise.resolve("failed");
 				},
-			});
+			}, this.#inputOriginFraming ? { inputOriginFraming: true } : undefined);
 			registration.current = handle;
 			record.registration = handle;
 			record.registrationReleased = false;
+			// An opted-in row frames only against a bootstrap that ACTUALLY carries
+			// the closed mode, composed before the child exists. A registrar that
+			// ignored the request fails this launch closed (no child, no raw bytes)
+			// instead of typing framed headers into a legacy Pi. The encoder is
+			// created once here, from this registration's own bootstrap, and is
+			// never rebuilt or reset for this registration.
+			if (this.#inputOriginFraming) {
+				if (handle.bootstrap.inputOriginFraming !== 1) {
+					throw new Error("session-host: the status registrar did not record the requested native input framing mode");
+				}
+				record.inputFramingRequested = true;
+				record.inputEncoder = createNativeInputEncoder(handle.bootstrap);
+				// The startup phase can begin only on this correctly framed
+				// registration; readiness, liveness, and every other fact are still
+				// required separately before any startup input is admitted.
+				record.startupInputOpen = true;
+			}
 			// The native clipboard receiver (#466) exists only after this row's own
 			// registration actually exists, is built from that registration's own
 			// bootstrap, and is bound to this exact row/registration pair. A row
@@ -1447,8 +2933,8 @@ export class InstanceManager {
 					args: descriptor.args,
 					env: spawnEnv,
 					cwd: descriptor.cwd,
-					cols: this.#cols,
-					rows: this.#rows,
+					cols: record.cols,
+					rows: record.rows,
 				});
 				record.pty = pty;
 				record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
@@ -1461,8 +2947,8 @@ export class InstanceManager {
 						return;
 					}
 				}
-				record.surface = new TerminalSurface(this.#cols, this.#rows, {
-					onReply: (data) => this.#onQueryReply(record, data),
+				record.surface = new TerminalSurface(record.cols, record.rows, {
+					onReply: (data) => this.#onQueryReply(record, handle, data),
 					onChange: () => this.#safeChanged(record.id),
 					onBackpressure: (paused) => this.#onBackpressure(record, paused),
 					onDiagnostic: (event) => this.#safeTerminalDiagnostic(record.id, event),
@@ -1581,7 +3067,7 @@ export class InstanceManager {
 		this.#failRunningInstance(record, "ptyRead");
 	}
 
-	#onQueryReply(record: ManagedInstance, data: string): void {
+	#onQueryReply(record: ManagedInstance, registration: InstanceStatusRegistration, data: string): void {
 		if (this.#records.get(record.id) !== record || this.#disposed) {
 			return;
 		}
@@ -1590,7 +3076,24 @@ export class InstanceManager {
 			return;
 		}
 		try {
-			pty.write(data);
+			// Discard only a never-sent automatic reply for an otherwise-admissible
+			// framing child awaiting its OWN readiness. Read only manager-owned facts:
+			// no callback may reenter between these fences and the discard. The mode
+			// and encoder were fixed from this exact registration before spawn.
+			if (!this.#disposed && !this.#stopping
+				&& this.#records.get(record.id) === record
+				&& record.registration === registration && !record.registrationReleased
+				&& record.pty === pty && !record.ptyExited
+				&& !record.stopAdmissionClosed && record.lifecycle === "alive"
+				&& record.inputFramingRequested && record.inputEncoder !== undefined
+				&& !record.inputFramingReady) {
+				return; // No write, encoding, queue, or replay when readiness arrives.
+			}
+			// TerminalSurface replies (DA/DSR/kitty) are host protocol, never user
+			// input, so future replies after readiness carry the closed `none`
+			// origin and can never authorize a copy. All other refusals and genuine
+			// encoding/write failures keep the existing owned-row failure path.
+			this.#writeChildInput(record, pty, data, PROTOCOL_INPUT_ORIGIN);
 		} catch {
 			this.#failRunningInstance(record, "queryReply");
 		}
@@ -1623,6 +3126,11 @@ export class InstanceManager {
 			return; // stale or already-final exit
 		}
 		record.ptyExited = true;
+		// The process incarnation is over, so its startup phase is over for good.
+		this.#closeStartupInput(record, false);
+		// A finished child displays nothing: every surface's participation in this
+		// row ends here, and its retained last frame stays readable until removal.
+		this.#retireViewerTargets(record.id);
 		record.busy = null;
 		record.pendingInput = null;
 		record.inputSurface = false;
@@ -1682,6 +3190,10 @@ export class InstanceManager {
 		if (!this.#currentRegistration(record, registration)) {
 			return; // stale/released/disposed status event, never cross-row
 		}
+		// The first ACCEPTED status of this registration (even one reporting a null
+		// tuple) ends its startup phase for good; the change published below is the
+		// boundary that retires a stated startup source.
+		this.#closeStartupInput(record, false);
 		record.statusRevision += 1;
 		const previousKnownSessionId = record.knownNativeSessionId;
 		record.busy = update && typeof update.busy === "boolean" ? update.busy : null;
@@ -1832,6 +3344,9 @@ export class InstanceManager {
 	/** A valid reconnect is a new episode: discard the exhausted budget and request once. */
 	#onReconnect(record: ManagedInstance, registration: { current?: InstanceStatusRegistration }): void {
 		if (!this.#currentRegistration(record, registration) || record.ptyExited) return;
+		// A reconnect means the child's reporter already installed a session, so the
+		// startup phase is over; it never reopens.
+		this.#closeStartupInput(record, false);
 		// Independently discard cached ephemeral row understanding on transport
 		// replacement: the live client is reachable but its prior observation
 		// may be stale. This is truthfully unknown, never a fabricated zero, and
@@ -1855,6 +3370,7 @@ export class InstanceManager {
 		if (!this.#currentRegistration(record, registration)) {
 			return; // stale/released/disposed disconnect event
 		}
+		this.#closeStartupInput(record, false);
 		// Truthful process telemetry: the reporter is gone, the child may very
 		// well still run. Never an exit, never an inferred "Idle" state; busy
 		// and pending input collapse to null until a fresh reporter reports.
@@ -1903,6 +3419,8 @@ export class InstanceManager {
 	}
 
 	#releaseRegistration(record: ManagedInstance): void {
+		// A released (or never-completed) registration has no startup phase left.
+		this.#closeStartupInput(record, false);
 		// The child may have exited before consuming its initial request. Ownership
 		// is discarded through the exact staged inode before the broker removes
 		// its empty namespace; a foreign replacement is preserved.
@@ -2123,21 +3641,60 @@ export class InstanceManager {
 
 	/**
 	 * Build this row's capsule handler from this row's own registration
-	 * bootstrap (#466). Absent a host callback no receiver exists at all, so a
-	 * row keeps its previous behavior of swallowing the capsule OSC entirely.
+	 * bootstrap (#466). Absent a host callback AND absent input framing no
+	 * receiver exists at all, so a row keeps its previous behavior of swallowing
+	 * the capsule OSC entirely.
+	 *
+	 * A framing row always has a receiver, because its readiness signal and its
+	 * v2 copy receipts both arrive on this same ordered stdout stream. Readiness
+	 * is independent of the native conversation tuple (it can and must be
+	 * observed before any session metadata exists), while copy callbacks keep the
+	 * unchanged tuple/live-record fences. A strict row delivers a typed v2 `local`
+	 * receipt on the owner's local route only: its own strict bridge emits v2
+	 * capsules only, so an authenticated v1 capsule on such a row is NOT a
+	 * downgrade path and is dropped (its sequence is still consumed, so the same
+	 * authenticated request can never be replayed as v2). A viewer-origin capsule is
+	 * routed ONLY to the viewer its token names, and only after that viewer's current
+	 * facts re-commit to exactly that token; anything else about it is dropped
+	 * quietly — no owner-terminal fallback, no local delivery, no sibling viewer, no
+	 * broadcast, and no copy diagnostic — and it is never downgraded to a v1 event.
+	 * Legacy rows observe neither v2 nor readiness at all and keep the v1 route
+	 * exactly as before.
 	 */
 	#nativeClipboardCapsuleHandler(
 		record: ManagedInstance,
 		registration: InstanceStatusRegistration,
 	): ((capsule: string) => void) | undefined {
-		if (this.#onNativeClipboard === undefined) {
+		const framing = record.inputFramingRequested;
+		if (this.#onNativeClipboard === undefined && !framing) {
 			return undefined;
 		}
 		let receiver: (capsule: string) => void;
 		try {
-			receiver = createNativeClipboardReceiver(registration.bootstrap, (event) => {
+			const onCopyEvent = (event: NativeClipboardEvent): void => {
 				this.#forwardNativeClipboard(record, registration, event);
-			});
+			};
+			receiver = framing
+				? createNativeClipboardReceiver(
+					registration.bootstrap,
+					// Strict mode has no v1 local route: this child's own bridge emits v2
+					// capsules only, so an authenticated v1 capsule is a shape this row must
+					// never deliver locally. It is consumed (sequence-consuming inside the
+					// receiver, so it cannot be replayed) and otherwise dropped.
+					() => undefined,
+					(receipt) => {
+						if (receipt.origin.kind === "local") {
+							onCopyEvent(receipt.event);
+							return;
+						}
+						// A viewer-origin copy belongs to the one viewer whose input caused it,
+						// and to nobody else: never the owner's local clipboard route, never a
+						// sibling viewer, never a broadcast, and never a diagnostic.
+						this.#forwardViewerNativeClipboard(record, registration, receipt);
+					},
+					() => this.#markInputFramingReady(record, registration),
+				)
+				: createNativeClipboardReceiver(registration.bootstrap, onCopyEvent);
 		} catch {
 			// No receiver means no clipboard route for this row; the row itself is
 			// untouched and its capsule OSCs stay denied.
@@ -2170,17 +3727,7 @@ export class InstanceManager {
 		if (forward === undefined) {
 			return;
 		}
-		if (this.#disposed || this.#stopping
-			|| this.#records.get(record.id) !== record
-			|| record.registration !== registration || record.registrationReleased
-			|| record.pty === undefined || record.ptyExited
-			|| record.lifecycle !== "alive" || record.stopAdmissionClosed) {
-			return;
-		}
-		const nativeSession = record.nativeSession;
-		if (nativeSession === null
-			|| nativeSession.sessionId !== event.sessionId
-			|| nativeSession.epoch !== event.sessionEpoch) {
+		if (!this.#clipboardEventLive(record, registration, event)) {
 			return;
 		}
 		try {
@@ -2189,6 +3736,182 @@ export class InstanceManager {
 			// The host's clipboard route is best effort; a refusal cannot break a
 			// row or escape into the parser.
 		}
+	}
+
+	/**
+	 * The shared live-source fence for one verified capsule on this row: only the
+	 * row still living in the map under this id, still holding this exact unreleased
+	 * registration, still owning a live unstopped child, and still reporting the
+	 * same current native conversation tuple may route anything. It is the unchanged
+	 * local-route fence, reused for a viewer copy so neither route can weaken the
+	 * other.
+	 */
+	#clipboardEventLive(
+		record: ManagedInstance,
+		registration: InstanceStatusRegistration,
+		event: NativeClipboardEvent,
+	): boolean {
+		if (this.#disposed || this.#stopping
+			|| this.#records.get(record.id) !== record
+			|| record.registration !== registration || record.registrationReleased
+			|| record.pty === undefined || record.ptyExited
+			|| record.lifecycle !== "alive" || record.stopAdmissionClosed) {
+			return false;
+		}
+		const nativeSession = record.nativeSession;
+		return nativeSession !== null
+			&& nativeSession.sessionId === event.sessionId
+			&& nativeSession.epoch === event.sessionEpoch;
+	}
+
+	/**
+	 * Route one authenticated viewer-origin copy to the ONE viewer that caused it.
+	 *
+	 * The token is only a lookup aid: its handle names the viewer record to consult,
+	 * and the copy is delivered only after that record is re-read and its CURRENT
+	 * facts re-commit to exactly the received token under THIS registration's key.
+	 * So a retired or closed viewer, a viewer now showing another row, a replaced row,
+	 * a released registration, a new run, a new native epoch, an ABA geometry change,
+	 * or a newer viewer revision delivers nothing. Nothing is scanned, broadcast, or
+	 * fallen back to the owner's local callback, no copy is attributed to the newest
+	 * input or the highest dispatch id, and a throwing sink is contained: an async
+	 * copy for an earlier dispatch still arrives with that dispatch's own origin.
+	 */
+	#forwardViewerNativeClipboard(
+		record: ManagedInstance,
+		registration: InstanceStatusRegistration,
+		receipt: NativeClipboardOriginEvent,
+	): void {
+		if (!this.#clipboardEventLive(record, registration, receipt.event)) {
+			return;
+		}
+		const origin = receipt.origin;
+		if (origin.kind !== "viewer") {
+			return; // A closed origin shape: only a viewer dispatch routes to a viewer.
+		}
+		const handle = parseNativeViewerScopeToken(origin.token);
+		if (handle === undefined) {
+			return;
+		}
+		const viewer = this.#viewers.get(handle.viewerId);
+		const sink = viewer?.nativeClipboardSink;
+		if (viewer === undefined || sink === undefined || viewer.sessionId !== record.id) {
+			return;
+		}
+		const facts = this.#viewerScopeFacts(viewer, record, registration);
+		if (facts === undefined
+			|| !verifyNativeViewerScopeToken(registration.bootstrap, origin.token, facts)) {
+			return;
+		}
+		const delivered: NativeViewerClipboardReceipt = Object.freeze({
+			source: this.#viewerInputSourceFromFacts(facts, origin.token),
+			event: Object.freeze({ ...receipt.event }),
+			dispatchId: receipt.dispatchId,
+		});
+		try {
+			sink(delivered);
+		} catch {
+			// A viewer's own refusal cannot break a row or escape into the parser.
+		}
+	}
+
+	/**
+	 * The ONE seam through which every byte the host writes to a hosted child's
+	 * PTY passes, for exactly the three admitted sources: local user input
+	 * ({@linkcode write}), TerminalSurface protocol replies
+	 * ({@linkcode #onQueryReply}), and strict viewer-origin input
+	 * ({@linkcode writeViewerInput}). There is no raw unframed bypass and no fourth
+	 * caller.
+	 *
+	 * - Legacy rows (mode absent) forward the bytes exactly as before.
+	 * - Framing rows encode EVERY write with this registration's single encoder:
+	 *   local user input as `local`, protocol replies as `none`. The complete
+	 *   framing string goes out as one write so two dispatches can never
+	 *   interleave.
+	 * - Before this registration's own verified readiness, a framing write is
+	 *   refused: no raw fallback, no fabricated acknowledgement, no queue, no
+	 *   replay, and nothing is ever typed into a legacy child. User input still
+	 *   gets a thrown refusal. Only an otherwise-admissible row's never-sent early
+	 *   automatic protocol reply is discarded by #onQueryReply before this seam;
+	 *   all other protocol-reply failures still fail the owned row truthfully.
+	 * - Readiness is re-checked against CURRENT ownership on EVERY framed write,
+	 *   not only when it was first armed: an in-flight or unconfirmed Stop (and a
+	 *   manager-wide stop or disposal) closes the seam immediately even though the
+	 *   row stays `alive` until its child's actual exit event, and ownership of the
+	 *   still-running child is retained rather than silently dropped.
+	 *
+	 * `expectedFence` accompanies a viewer dispatch only: either the native
+	 * conversation the child must still be in, or the closed startup phase the child
+	 * must still be in, before it delivers any of these bytes. It is authenticated
+	 * inside the frame. Local and protocol-reply dispatches keep their unchanged
+	 * shape and semantics.
+	 */
+	#writeChildInput(
+		record: ManagedInstance,
+		pty: InstancePty,
+		data: string | Buffer,
+		origin: NativeInputOrigin,
+		expectedFence?: NativeInputExpectedFence,
+	): void {
+		if (!record.inputFramingRequested) {
+			pty.write(data);
+			return;
+		}
+		const encoder = this.#admittedInputEncoder(record, pty);
+		if (encoder === undefined) {
+			throw new Error(
+				`session-host: instance ${record.id} has no admitted native input framing; refusing unframed input`,
+			);
+		}
+		pty.write(encoder.encode(
+			typeof data === "string" ? Buffer.from(data, "utf8") : data,
+			origin,
+			expectedFence,
+		));
+	}
+
+	/**
+	 * The framing admission check evaluated immediately before EACH encoded write.
+	 * Arming readiness once is never a standing grant: the row must still be the
+	 * current record for its id, still hold this exact unreleased registration and
+	 * this exact live PTY, must not have exited, must not be inside a stop (an
+	 * idle-preflight or confirmed Stop closes admission while the child is still
+	 * running and unconfirmed), and the manager must not be stopping or disposed.
+	 * `undefined` means "no framed byte may leave now"; the caller never falls back
+	 * to raw input, and the owned child and its registration stay untouched so the
+	 * stop path still settles on the real exit event.
+	 */
+	#admittedInputEncoder(record: ManagedInstance, pty: InstancePty): NativeInputEncoder | undefined {
+		if (this.#disposed || this.#stopping
+			|| this.#records.get(record.id) !== record
+			|| record.registration === undefined || record.registrationReleased
+			|| record.pty !== pty || record.ptyExited
+			|| record.stopAdmissionClosed
+			|| record.lifecycle !== "alive"
+			|| !record.inputFramingRequested || !record.inputFramingReady) {
+			return undefined;
+		}
+		return record.inputEncoder;
+	}
+
+	/**
+	 * Arm one framing row from its own verified readiness capsule only. The
+	 * capsule's identity/HMAC was already verified by this registration's
+	 * receiver; these fences additionally require that the receiver still belongs
+	 * to the current record, its exact unreleased registration, and an owned,
+	 * live, not-stopping child. A foreign or stale bootstrap can never activate
+	 * another row, and readiness never survives an exit, release, stop, or
+	 * disposal.
+	 */
+	#markInputFramingReady(record: ManagedInstance, registration: InstanceStatusRegistration): void {
+		if (this.#disposed || this.#stopping
+			|| this.#records.get(record.id) !== record
+			|| record.registration !== registration || record.registrationReleased
+			|| record.pty === undefined || record.ptyExited || record.stopAdmissionClosed
+			|| !record.inputFramingRequested) {
+			return;
+		}
+		record.inputFramingReady = true;
 	}
 
 	/** Forward one surface's bounded diagnostics; delivery failures stay contained. */

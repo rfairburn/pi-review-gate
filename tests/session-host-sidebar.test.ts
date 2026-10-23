@@ -23,11 +23,14 @@ import {
 } from "pi-session-host-tui";
 import {
   SIDEBAR_GENERATED_SGR_ALLOWLIST,
+  createPlainOwnerWorkspaceField,
   type SidebarAction,
   type SidebarControllerOptions,
   type SidebarItem,
   SidebarController,
 } from "../src/session-host/sidebar";
+import { createSessionHostTextField } from "../src/session-host/field-editor";
+import type { PeerUiHost, PeerUiSettings, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 
 const SGR_PATTERN = /\x1b\[[0-9;]*m/g;
 const ALT_LEFT_LEGACY = "\x1b[1;3D";
@@ -308,6 +311,257 @@ test("draw-derived action-row mouse activation reuses New and Quit behavior", ()
   assert.deepEqual(quitAction.focusedActions(), []);
 });
 
+/**
+ * Draws the wide two-pane frame exactly as Main does — the left roster beside
+ * the right-hand host UI — and returns the plain roster rows with the geometry
+ * that written frame authorizes.
+ */
+function widePanes(harness: Harness, rows = 24): { roster: string[]; rows: number } {
+  const roster = assertPaneSafe(harness.controller.renderRoster(32, rows).lines, 32, rows);
+  void harness.controller.renderForm(47, rows);
+  return { roster, rows };
+}
+
+/** The written roster row that begins the entry containing `text`. */
+function wideRosterRow(roster: readonly string[], text: string): number {
+  const row = roster.findIndex((line) => line.includes(text));
+  assert.ok(row > 0, `the written roster drew no ${JSON.stringify(text)} row: ${JSON.stringify(roster)}`);
+  return row;
+}
+
+/** Plain text of the right-hand pane at the wide geometry. */
+function wideFormText(harness: Harness, rows = 24): string {
+  return assertPaneSafe(harness.controller.renderForm(47, rows).lines, 47, rows).join("\n");
+}
+
+test("a left-roster click beside an open right-hand UI cancels it and activates the clicked row once", () => {
+  // New session with a dirty draft: a different row abandons the form through
+  // its own cancellation route and then performs only the clicked row's action.
+  const newForm = makeRoster(["a"]);
+  newForm.send(ENTER); // the default New row opens its form; the highlight stays on New
+  assert.equal(newForm.controller.focus, "form");
+  newForm.send("/dirty-draft");
+  newForm.baseline = newForm.actions.length;
+  const newView = widePanes(newForm);
+  assert.equal(newForm.controller.activateRosterAt(1, wideRosterRow(newView.roster, "label-a"), 32, newView.rows), true);
+  assert.equal(newForm.controller.focus, "main");
+  assert.deepEqual(newForm.focusedActions(), [{ type: "select", id: "a" }],
+    "the click cancels the form and performs the clicked row's ordinary action exactly once");
+  const reopened = widePanes(newForm);
+  assert.equal(newForm.controller.activateRosterAt(1, wideRosterRow(reopened.roster, "New session"), 32, reopened.rows), true);
+  assert.equal(newForm.controller.focus, "form");
+  assert.ok(wideFormText(newForm).includes("/dirty-draft"), "the abandoned New draft keeps its existing retention");
+  assert.deepEqual(newForm.focusedActions().filter((action) => action.type === "create"), [],
+    "cancelling a form never submits it");
+
+  // A click on the row that already holds the left highlight is a pure no-op:
+  // right pane, dirty draft, focus, selection, and actions all unchanged.
+  const same = makeRoster(["a"]);
+  same.send(ENTER);
+  same.send("/keep-me");
+  same.baseline = same.actions.length;
+  const sameView = widePanes(same);
+  assert.equal(same.controller.activateRosterAt(1, wideRosterRow(sameView.roster, "New session"), 32, sameView.rows), true);
+  assert.deepEqual(same.focusedActions(), [], "the highlighted row neither cancels nor re-activates");
+  assert.equal(same.controller.focus, "form", "the right-hand form stays open");
+  assert.ok(wideFormText(same).includes("/keep-me"), "the dirty draft survives the same-row click");
+
+  // Saved picker: a different row runs the picker's own dismissal first, then
+  // activates the clicked row; the same row keeps the picker open untouched.
+  const saved = savedPaneWith(["a"]);
+  const list = saved.actions.at(-1);
+  assert.ok(list !== undefined && list.type === "saved-list");
+  saved.controller.completeSavedList(list.requestId, [...SAVED_ROWS], 0);
+  saved.baseline = saved.actions.length;
+  const savedView = widePanes(saved);
+  assert.equal(saved.controller.activateRosterAt(1, wideRosterRow(savedView.roster, "label-a"), 32, savedView.rows), true);
+  assert.equal(saved.controller.focus, "main");
+  assert.deepEqual(saved.focusedActions(), [
+    { type: "saved-dismiss", pickerId: list.requestId },
+    { type: "select", id: "a" },
+  ], "the picker's own dismissal runs first, then the clicked row acts once");
+  assert.equal(saved.controller.savedPickerRequestId, undefined, "the dismissed picker owns nothing afterwards");
+
+  const savedSame = savedPaneWith(["a"]);
+  const savedSameList = savedSame.actions.at(-1);
+  assert.ok(savedSameList !== undefined && savedSameList.type === "saved-list");
+  savedSame.controller.completeSavedList(savedSameList.requestId, [...SAVED_ROWS], 0);
+  savedSame.baseline = savedSame.actions.length;
+  const savedSameView = widePanes(savedSame);
+  assert.equal(savedSame.controller.activateRosterAt(
+    1, wideRosterRow(savedSameView.roster, "Saved conversations"), 32, savedSameView.rows), true);
+  assert.deepEqual(savedSame.focusedActions(), [], "a click on the highlighted Saved row emits nothing");
+  assert.equal(savedSame.controller.focus, "form", "the picker stays open under the same-row click");
+  assert.equal(savedSame.controller.savedPickerRequestId, savedSameList.requestId, "the same picker is retained");
+
+  // Host shortcuts: a different row closes the editor through its own cancel
+  // route without saving anything, and the clicked row acts normally.
+  const shortcuts = makeRoster(["a"], { settingsAvailable: true });
+  const shortcutsRoster = assertPaneSafe(shortcuts.controller.renderRoster(32, 24).lines, 32, 24);
+  assert.equal(shortcuts.controller.activateRosterAt(1, wideRosterRow(shortcutsRoster, "Host shortcuts"), 32, 24), true);
+  assert.equal(shortcuts.controller.focus, "form");
+  shortcuts.baseline = shortcuts.actions.length;
+  const shortcutView = widePanes(shortcuts);
+  assert.equal(shortcuts.controller.activateRosterAt(1, wideRosterRow(shortcutView.roster, "label-a"), 32, shortcutView.rows), true);
+  assert.equal(shortcuts.controller.focus, "main");
+  assert.deepEqual(shortcuts.focusedActions(), [{ type: "select", id: "a" }],
+    "the shortcuts editor closes through its cancel route and never saves");
+  const closedShortcuts = wideFormText(shortcuts);
+  assert.equal(closedShortcuts.includes("Host shortcuts"), false,
+    "no hidden shortcuts editor survives the click");
+});
+
+test("a left-roster click cancels nested and divergent right-hand UI without deciding anything", () => {
+  // Nested Saved delete over its picker: the click dismisses BOTH the
+  // confirmation and the picker with their existing routes and never deletes.
+  const nested = savedPaneWith(["a"]);
+  const nestedList = nested.actions.at(-1);
+  assert.ok(nestedList !== undefined && nestedList.type === "saved-list");
+  nested.controller.completeSavedList(nestedList.requestId, [...SAVED_ROWS], 0);
+  savedView(nested, 40, 16);
+  nested.send("\x04"); // native default app.session.delete
+  const prepare = nested.actions.at(-1);
+  assert.ok(prepare !== undefined && prepare.type === "saved-delete-prepare");
+  assert.equal(nested.controller.completeSavedDeleteCheck(prepare.requestId, true), true);
+  assert.equal(nested.controller.focus, "confirm");
+  nested.baseline = nested.actions.length;
+  const nestedRoster = assertPaneSafe(nested.controller.renderRoster(32, 20).lines, 32, 20);
+  void nested.controller.renderSavedDeleteConfirmation(47, 20);
+  assert.equal(nested.controller.activateRosterAt(1, wideRosterRow(nestedRoster, "label-a"), 32, 20), true);
+  assert.equal(nested.controller.focus, "main");
+  assert.deepEqual(nested.focusedActions(), [
+    { type: "saved-dismiss", pickerId: nestedList.requestId },
+    { type: "select", id: "a" },
+  ], "the confirmation and its containing picker both close, then the clicked row acts once");
+  assert.equal(nested.actions.some((action) => action.type === "saved-delete"), false,
+    "a pointer gesture never confirms a deletion");
+  assert.equal(nested.controller.savedDeleteConfirmationActive, false);
+  assert.equal(nested.controller.savedPickerRequestId, undefined, "no hidden picker state survives the click");
+  assert.deepEqual(nested.controller.renderSavedDeleteConfirmation(47, 20).lines, [],
+    "the closed confirmation cannot resurrect itself in the right-hand slot");
+
+  // Edit whose target is NOT the left highlight: the left selection decides.
+  const tupleA = { sessionId: "session-a", epoch: 7, name: "Left card" };
+  const tupleB = { sessionId: "session-b", epoch: 8, name: "Edited card" };
+  const edit = makeRoster(["a", "b"]);
+  edit.controller.updateItems([
+    makeItem({ id: "a", nativeSession: tupleA }),
+    makeItem({ id: "b", nativeSession: tupleB }),
+  ]);
+  assert.equal(edit.controller.openEdit({ id: "b", nativeSession: tupleB, currentName: tupleB.name }), true);
+  assert.equal(edit.controller.selectedId, undefined, "the Edit target is not the left highlight");
+  edit.baseline = edit.actions.length;
+  const editView = widePanes(edit);
+  assert.equal(edit.controller.activateRosterAt(1, wideRosterRow(editView.roster, "New session"), 32, editView.rows), true);
+  assert.deepEqual(edit.focusedActions(), [], "the highlighted row is a pure no-op even when the pane targets another row");
+  assert.equal(edit.controller.focus, "form", "the Edit form stays open under the same-row click");
+  assert.ok(wideFormText(edit).includes("New name:"), "the open Edit form is preserved");
+  const editAgain = widePanes(edit);
+  assert.equal(edit.controller.activateRosterAt(1, wideRosterRow(editAgain.roster, "Left card"), 32, editAgain.rows), true);
+  assert.equal(edit.controller.focus, "main");
+  assert.deepEqual(edit.focusedActions(), [{ type: "select", id: "a" }],
+    "a different row abandons the Edit and activates the clicked row once");
+  assert.equal(edit.actions.some((action) => action.type === "rename"), false,
+    "a pointer gesture never submits a rename");
+  assert.equal(wideFormText(edit).includes("New name:"), false, "no hidden Edit form survives the click");
+
+  // The native Main owner never decides "same": with a live owner elsewhere,
+  // the highlighted row is still a no-op and another row still acts.
+  const owner = makeRoster(["a", "b"]);
+  owner.controller.setActiveMainOwner("a");
+  owner.send(ENTER); // New form opens while owner A keeps native input
+  assert.equal(owner.controller.focus, "form");
+  assert.equal(owner.controller.activeMainOwnerID, "a", "the native owner differs from the highlighted New row");
+  owner.baseline = owner.actions.length;
+  const ownerView = widePanes(owner);
+  assert.equal(owner.controller.activateRosterAt(1, wideRosterRow(ownerView.roster, "New session"), 32, ownerView.rows), true);
+  assert.deepEqual(owner.focusedActions(), [], "a divergent native owner does not turn the highlighted row into an action");
+  assert.equal(owner.controller.focus, "form");
+  const ownerAgain = widePanes(owner);
+  assert.equal(owner.controller.activateRosterAt(1, wideRosterRow(ownerAgain.roster, "label-b"), 32, ownerAgain.rows), true);
+  assert.deepEqual(owner.focusedActions(), [{ type: "select", id: "b" }]);
+  assert.equal(owner.controller.activeMainOwnerID, "a", "the click only selects; Main reassigns ownership on completion");
+
+  // A changed row identity is refused silently, exactly like any stale draw:
+  // nothing is cancelled and the open pane keeps its own state.
+  const stale = savedPaneWith(["a", "b"]);
+  const staleList = stale.actions.at(-1);
+  assert.ok(staleList !== undefined && staleList.type === "saved-list");
+  stale.controller.completeSavedList(staleList.requestId, [...SAVED_ROWS], 0);
+  stale.baseline = stale.actions.length;
+  const staleView = widePanes(stale);
+  const staleRow = wideRosterRow(staleView.roster, "label-b");
+  stale.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "b", lifecycle: "exited" })]);
+  assert.equal(stale.controller.activateRosterAt(1, staleRow, 32, staleView.rows), false,
+    "a row whose activation identity changed after the draw is refused");
+  assert.deepEqual(stale.focusedActions(), [], "a refused click cancels nothing");
+  assert.equal(stale.controller.focus, "form", "the open picker is left to its own rules");
+  assert.equal(stale.controller.savedPickerRequestId, staleList.requestId);
+
+  // Only the roster actually written at this geometry authorizes the click.
+  const unwritten = savedPaneWith(["a"]);
+  const unwrittenList = unwritten.actions.at(-1);
+  assert.ok(unwrittenList !== undefined && unwrittenList.type === "saved-list");
+  unwritten.controller.completeSavedList(unwrittenList.requestId, [...SAVED_ROWS], 0);
+  unwritten.baseline = unwritten.actions.length;
+  const unwrittenView = widePanes(unwritten);
+  const unwrittenRow = wideRosterRow(unwrittenView.roster, "label-a");
+  assert.equal(unwritten.controller.activateRosterAt(1, unwrittenRow, 40, 30), false,
+    "a click at another pane geometry matches no written region");
+  void unwritten.controller.render(40, 16); // the narrow full-pane render replaces the roster
+  assert.equal(unwritten.controller.activateRosterAt(1, unwrittenRow, 32, unwrittenView.rows), false,
+    "a roster that is not actually on screen authorizes nothing");
+  assert.deepEqual(unwritten.focusedActions(), [], "neither refused click cancels the open picker");
+  assert.equal(unwritten.controller.savedPickerRequestId, unwrittenList.requestId);
+
+  // With no right-hand UI open, the ordinary row action is unchanged: even a
+  // click on the highlighted row performs its normal action.
+  const plainRoster = makeRoster(["a"]);
+  plainRoster.baseline = plainRoster.actions.length;
+  const plainView = assertPaneSafe(plainRoster.controller.renderRoster(32, 24).lines, 32, 24);
+  assert.equal(plainRoster.controller.activateRosterAt(1, wideRosterRow(plainView, "New session"), 32, 24), true);
+  assert.equal(plainRoster.controller.focus, "form",
+    "the no-op applies only while a right-hand UI is open");
+});
+
+for (const clicked of ["drawn-highlight", "live-highlight"] as const) {
+  test(`a captured right-pane roster refuses a changed drawn selection (${clicked})`, () => {
+    const harness = savedPaneWith(["a", "b"]);
+    const list = harness.actions.at(-1);
+    assert.ok(list !== undefined && list.type === "saved-list");
+    harness.controller.completeSavedList(list.requestId, [...SAVED_ROWS], 0);
+    const written = widePanes(harness);
+    const capture = harness.controller.captureMousePresentation();
+    const savedRow = wideRosterRow(written.roster, "Saved conversations");
+    const localRow = wideRosterRow(written.roster, "label-a");
+    harness.baseline = harness.actions.length;
+
+    // Exercise the controller's backend-selection seam directly: current Main
+    // does not wire a selection-only change while this picker remains open.
+    harness.controller.select("a");
+    assert.equal(harness.controller.focus, "form");
+    assert.equal(harness.controller.selectedId, "a");
+    const row = clicked === "drawn-highlight" ? savedRow : localRow;
+    assert.equal(capture.activateRosterAt(1, row, 32, written.rows), false,
+      "an old drawn highlight cannot be reinterpreted as cancellation or a no-op");
+    assert.deepEqual(harness.focusedActions(), [], "the stale click cancels and activates nothing");
+    assert.equal(harness.controller.savedPickerRequestId, list.requestId);
+
+    const current = widePanes(harness);
+    const fresh = harness.controller.captureMousePresentation();
+    assert.equal(capture.activateRosterAt(1, row, 32, written.rows), false,
+      "another render cannot update the immutable old presentation's highlight");
+    assert.equal(fresh.activateRosterAt(1, wideRosterRow(current.roster, "label-a"), 32, current.rows), true);
+    assert.deepEqual(harness.focusedActions(), [], "the newly drawn highlight is now a genuine no-op");
+    assert.equal(harness.controller.savedPickerRequestId, list.requestId);
+    assert.equal(fresh.activateRosterAt(1, wideRosterRow(current.roster, "label-b"), 32, current.rows), true);
+    assert.deepEqual(harness.focusedActions(), [
+      { type: "saved-dismiss", pickerId: list.requestId },
+      { type: "select", id: "b" },
+    ], "a different row in the fresh presentation retains ordinary cancel-and-activate behavior");
+  });
+}
+
 test("initialVisible is honored in both directions", () => {
   const hidden = makeController({ initialVisible: false });
   assert.equal(hidden.controller.visible, false);
@@ -443,6 +697,37 @@ test("the configured return chord is consumed in host forms and confirmations", 
   confirmation.send(F9_LEGACY);
   assert.equal(confirmation.controller.focus, "confirm");
   assert.deepEqual(confirmation.focusedActions(), []);
+});
+
+test("both Host shortcuts labels stay beside their real editable body row", () => {
+  const harness = makeController({ settingsAvailable: true });
+  void harness.controller.render(60, 20);
+  harness.send(DOWN);
+  harness.send(DOWN);
+  void harness.controller.render(60, 20);
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "form");
+  for (const [index, prefix, value, inactive] of [
+    [0, "> Toggle (stored): ", "f8", "  Return to Main: "],
+    [1, "> Return to Main: ", "f9", "  Toggle (stored): f8"],
+  ] as const) {
+    if (index === 1) harness.send("\t");
+    harness.send("\x15");
+    harness.send(value);
+    const frame = harness.controller.render(60, 20);
+    const rows = assertPaneSafe(frame.lines, 60, 20);
+    assert.ok(frame.cursor);
+    const { row, column } = frame.cursor;
+    assert.equal(rows[row]?.slice(0, prefix.length), prefix,
+      "the active shortcut label is on the native text row, not its top rule");
+    assert.equal(rows[row]?.slice(prefix.length, column), value);
+    assert.equal(rows[row - 1]?.slice(0, prefix.length), " ".repeat(prefix.length));
+    assert.match(rows[row - 1]?.slice(prefix.length) ?? "", /^─+$/);
+    assert.ok(rows.some((line) => line.startsWith(inactive)),
+      "the inactive sibling keeps its draft beside its own inline label");
+  }
+  harness.send(ESC);
+  assert.deepEqual(harness.focusedActions(), [], "alignment changes commit no settings");
 });
 
 test("host shortcut settings edit configured bindings and Cancel leaves active bindings unchanged", () => {
@@ -1729,9 +2014,13 @@ test("New session has only an explicit workspace field and creates without a man
   assert.ok(texts[0].includes("New session"));
   assert.ok(texts.some((line) => line.includes("Workspace:")));
   assert.ok(!texts.some((line) => /Label:|Profile:/.test(line)));
-  assert.equal(first.cursor?.row, 2, "the native Editor owns a completion viewport above the path cursor");
+  assert.ok(texts.some((line) => line.includes("Host:")), "the New form carries its one Host line");
+  assert.equal(first.cursor?.row, 3, "the New form's Host row sits above the native Editor's completion viewport and path cursor");
   assert.equal(first.cursor?.column, 13);
-  assert.ok(texts[first.cursor!.row]?.startsWith(" ".repeat(13)), "the empty insertion row begins under the workspace field label");
+  assert.equal(texts[first.cursor!.row]?.slice(0, 13), "> Workspace: ",
+    "the label is beside the actual empty insertion row");
+  assert.equal(texts[first.cursor!.row]?.slice(13).trim(), "",
+    "the labelled native body contains no workspace draft yet");
   harness.send("/workspace");
   harness.send(ENTER); // workspace submits directly
   assert.deepEqual(harness.focusedActions(), [
@@ -1962,20 +2251,64 @@ test("exact-width form text reserves a visible end-of-value caret", () => {
   }
   const frame = harness.controller.render(24, 20);
   const texts = assertPaneSafe(frame.lines, 24, 20);
-  assert.ok(texts[2]?.startsWith(" ".repeat(13)), JSON.stringify(texts));
-  assert.ok(texts[2]?.slice(13).trimEnd().endsWith("abcdefghij"), JSON.stringify(texts));
-  assert.ok(texts[3]?.startsWith(" ".repeat(13)), JSON.stringify(texts));
-  assert.ok(texts[3]?.slice(13).trimEnd().endsWith("k"), JSON.stringify(texts));
-  assert.deepEqual(frame.cursor, { column: 14, row: 3 }, "hardware cursor follows the native Editor's wrapped value");
+  assert.ok(texts[3]?.startsWith("> Workspace: "), JSON.stringify(texts));
+  assert.ok(texts[3]?.slice(13).trimEnd().endsWith("abcdefghij"), JSON.stringify(texts));
+  assert.ok(texts[4]?.startsWith(" ".repeat(13)), JSON.stringify(texts));
+  assert.ok(texts[4]?.slice(13).trimEnd().endsWith("k"), JSON.stringify(texts));
+  assert.deepEqual(frame.cursor, { column: 14, row: 4 }, "hardware cursor follows the native Editor's wrapped value");
   assert.equal(texts[frame.cursor!.row]?.slice(13, frame.cursor!.column), "k", "cursor is at the insertion cell after the wrapped character");
+  assert.notEqual(frame.cursor?.row, 3,
+    "the caret wrapped to a later row while the label stayed on the field's first editable row");
 });
 
-test("empty, populated, Unicode, and Edit cursors align with their indented native text rows", () => {
+test("a wrapped value keeps its label on the field's first editable row as the caret moves", () => {
+  const harness = formWith({ cols: 24 });
+  for (const char of "abcdefghijk") {
+    harness.send(char);
+  }
+  // Rows are compared as written text with the generated SGR removed, exactly
+  // as every other pane witness here does; the caret is asserted against the
+  // original frame's cursor DTO.
+  const pane = () => {
+    const frame = harness.controller.render(24, 20);
+    return { rows: assertPaneSafe(frame.lines, 24, 20), cursor: frame.cursor };
+  };
+  const labelRow = (rows: readonly string[]): number =>
+    rows.findIndex((line) => line.startsWith("> Workspace: "));
+
+  const wrapped = pane();
+  const firstLabelRow = labelRow(wrapped.rows);
+  assert.equal(firstLabelRow, 3, "the label sits beside the first editable row, below the Host line and the Editor's own top border");
+  assert.equal(wrapped.rows[firstLabelRow]?.slice(13).trimEnd(), "abcdefghij",
+    "the labelled row carries the field's first wrapped segment, not a border or help row");
+  assert.equal(wrapped.cursor?.row, firstLabelRow + 1, "the caret wrapped to the following row");
+
+  // Home moves the caret onto the labelled row; End moves it away again. Neither
+  // movement may drag the label with the caret.
+  harness.send("\x1b[H");
+  const atHome = pane();
+  assert.equal(labelRow(atHome.rows), firstLabelRow, "Home leaves the label on the same row");
+  assert.equal(atHome.cursor?.row, firstLabelRow, "the caret is now on the labelled row itself");
+  assert.equal(atHome.rows.filter((line) => line.startsWith("> Workspace: ")).length, 1,
+    "the field never gains a second label row");
+
+  harness.send("\x1b[4~");
+  const atEnd = pane();
+  assert.equal(labelRow(atEnd.rows), firstLabelRow, "End leaves the label on the same row");
+  assert.equal(atEnd.cursor?.row, firstLabelRow + 1, "the caret wrapped away again");
+  assert.equal(atEnd.rows[firstLabelRow]?.slice(13).trimEnd(), "abcdefghij",
+    "the labelled row still carries the first wrapped segment of the value");
+  assert.deepEqual(atEnd.cursor, wrapped.cursor,
+    "the native caret geometry is exactly what it was before the round trip");
+});
+
+test("empty, populated, Unicode, and Edit cursors sit on their labelled native text rows", () => {
   const empty = formWith({ cols: 44, rows: 10 });
   const emptyFrame = empty.controller.render(44, 10);
   const emptyRows = assertPaneSafe(emptyFrame.lines, 44, 10);
   assert.ok(emptyFrame.cursor);
-  assert.equal(emptyRows[emptyFrame.cursor.row]?.slice(0, 13), " ".repeat(13));
+  assert.equal(emptyRows[emptyFrame.cursor.row]?.slice(0, 13), "> Workspace: ",
+    "the label sits beside the editable content row, not the Editor's top rule");
   assert.equal(emptyRows[emptyFrame.cursor.row]?.slice(13).trim(), "");
 
   empty.send("/a");
@@ -1989,7 +2322,7 @@ test("empty, populated, Unicode, and Edit cursors align with their indented nati
   const unicodeFrame = unicode.controller.render(44, 10);
   const unicodeRows = assertPaneSafe(unicodeFrame.lines, 44, 10);
   assert.ok(unicodeFrame.cursor);
-  assert.equal(unicodeRows[unicodeFrame.cursor.row]?.slice(0, 13), " ".repeat(13));
+  assert.equal(unicodeRows[unicodeFrame.cursor.row]?.slice(0, 13), "> Workspace: ");
   assert.equal(unicodeRows[unicodeFrame.cursor.row]?.slice(13).trimStart().startsWith("雪"), true);
   assert.equal(visibleWidth(" ".repeat(13) + "雪"), unicodeFrame.cursor.column,
     "the Unicode grapheme occupies two terminal cells before the insertion point");
@@ -2002,7 +2335,7 @@ test("empty, populated, Unicode, and Edit cursors align with their indented nati
   const editFrame = edit.controller.render(48, 12);
   const editRows = assertPaneSafe(editFrame.lines, 48, 12);
   assert.ok(editFrame.cursor);
-  assert.equal(editRows[editFrame.cursor.row]?.slice(0, 12), " ".repeat(12));
+  assert.equal(editRows[editFrame.cursor.row]?.slice(0, 12), "> New name: ");
   assert.equal(editRows[editFrame.cursor.row]?.slice(12).trimStart().startsWith("雪"), true);
   assert.equal(visibleWidth(" ".repeat(12) + "雪"), editFrame.cursor.column,
     "Edit cursor follows the wide Unicode grapheme by terminal cells, not UTF-16 code units");
@@ -2018,7 +2351,7 @@ test("home/end navigate the native path field and scroll horizontally to the cur
   );
   harness.controller.handleInput("\x1b[H"); // home: cursor scrolls back left
   const atHome = harness.controller.render(44, 20);
-  assert.equal(atHome.cursor?.row, 2);
+  assert.equal(atHome.cursor?.row, 3);
   harness.controller.handleInput("\x1b[4~"); // end again
   const atEndAgain = harness.controller.render(44, 20);
   assert.ok((atEndAgain.cursor?.column ?? 0) > 13);
@@ -2694,7 +3027,7 @@ test("wide layout renders roster and form as independent panes", () => {
   const harness = formWith();
   // render() dispatches to the focused pane (the form) with its cursor.
   const formPane = harness.controller.render(47, 23);
-  assert.deepEqual(formPane.cursor, { column: 13, row: 2 });
+  assert.deepEqual(formPane.cursor, { column: 13, row: 3 });
   assert.ok(assertPaneSafe(formPane.lines, 47, 23)[0].includes("New session"));
   // The roster pane is still available beside it on wide terminals; its
   // return type carries no cursor, so it can never claim one.
@@ -2783,7 +3116,7 @@ test("tiny form and confirm geometry falls back to a truthful too-small pane", (
   assert.ok(tooSmallForm.lines.some((line) => line.includes("too small")));
   assert.equal(tooSmallForm.cursor, undefined);
   const fits = form.controller.render(24, 20);
-  assert.deepEqual(fits.cursor, { column: 13, row: 2 });
+  assert.deepEqual(fits.cursor, { column: 13, row: 3 });
   assertPaneSafe(fits.lines, 24, 20);
 
   const confirm = makeRoster(["alive"]);
@@ -3233,4 +3566,784 @@ test("saved picker footer shows the complete keyboard hints with tiny-terminal f
   }
   // Tiny geometry falls back to the truthful too-small pane.
   assert.ok(savedView(harness, 20, 4).some((line) => line.includes("too small")));
+});
+
+test("n detaches only the local content view and leaves every row alone", () => {
+  const harness = makeRoster(["a", "b"]);
+  rosterView(harness.controller, 60, 24);
+  harness.send(UP); // Saved conversations
+  harness.send(UP); // the last session row
+  assert.equal(harness.controller.selectedId, "b");
+  harness.baseline = harness.actions.length;
+
+  harness.send("n");
+  assert.deepEqual(harness.focusedActions(), [{ type: "detach-view" }],
+    "the local detach is its own action: never select, stop, remove, quit, or forwarded child input");
+  assert.equal(harness.controller.focus, "sidebar", "detaching the view keeps the operator in the roster");
+  assert.equal(harness.controller.visible, true, "the roster stays open with every row still listed");
+  assert.equal(harness.controller.selectedId, "b", "the highlighted row is not moved or removed");
+
+  // Displaying a session again is the ordinary row activation: no restart, and
+  // the row the operator picks is the row that comes back.
+  harness.send(ENTER);
+  assert.deepEqual(harness.focusedActions().at(-1), { type: "select", id: "b" });
+  assert.equal(harness.focusedActions().some((action) => action.type === "resume-row"), false,
+    "re-displaying a live session never restarts it");
+});
+
+test("a held n never re-fires the local view detach", () => {
+  const harness = makeRoster(["a"]);
+  rosterView(harness.controller, 60, 24);
+  harness.baseline = harness.actions.length;
+  const previous = isKittyProtocolActive();
+  setKittyProtocolActive(true);
+  try {
+    harness.send("\x1b[110u"); // fresh `n`
+    harness.send("\x1b[110;1:2u"); // held repeat
+    harness.send("\x1b[110;1:3u"); // release
+  } finally {
+    setKittyProtocolActive(previous);
+  }
+  assert.deepEqual(harness.focusedActions(), [{ type: "detach-view" }],
+    "one deliberate press, one detach; a held key and its release are inert");
+});
+
+test("n typed in a text field is content, not a local view detach", () => {
+  const tuple = { sessionId: "session-123", epoch: 7, name: "Observed title" };
+  const harness = makeRoster(["a"]);
+  harness.controller.updateItems([makeItem({ id: "a", nativeSession: tuple, label: "stale row label" })]);
+  assertPaneSafe(harness.controller.renderRoster(48, 14).lines, 48, 14);
+  harness.send(UP); // Saved conversations
+  harness.send(UP); // the session row
+  harness.send("e");
+  assert.equal(harness.controller.openEdit({ id: "a", nativeSession: tuple, currentName: tuple.name }), true);
+  harness.baseline = harness.actions.length;
+
+  harness.send("n");
+  harness.send("o");
+  harness.send(ENTER);
+  assert.deepEqual(harness.focusedActions().at(-1), {
+    type: "rename", requestId: 1, id: "a", expectedSessionId: "session-123",
+    expectedSessionEpoch: 7, name: "no",
+  }, "the field keeps the typed letters");
+  assert.equal(harness.focusedActions().some((action) => action.type === "detach-view"), false,
+    "a detached-view key never fires from inside a text field");
+});
+
+test("detaching the local view cancels an in-flight exited-row restart", () => {
+  const tuple = { sessionId: "session-123", epoch: 1, name: "Nine" };
+  const harness = makeRoster(["a"]);
+  harness.controller.updateItems([makeItem({ id: "a", lifecycle: "exited", hasLiveProcess: false, nativeSession: tuple })]);
+  rosterView(harness.controller, 60, 24);
+  harness.send(UP); // Saved conversations
+  harness.send(UP); // the exited card
+  harness.send(ENTER);
+  assert.deepEqual(harness.sinceActions(), [{ type: "resume-row", requestId: 1, id: "a" }]);
+  harness.baseline = harness.actions.length;
+
+  harness.send("n");
+  assert.deepEqual(harness.sinceActions(), [
+    { type: "resume-row-cancel", requestId: 1 },
+    { type: "detach-view" },
+  ], "the operator's choice wins and the pending restart is cancelled");
+  assert.equal(harness.controller.completeRowResume(1, "a", "late-row"), false,
+    "a late restart completion cannot display itself over the detached view");
+});
+
+// ---------------------------------------------------------------------------
+// New form Host line (requester-side remote create)
+//
+// The New form's ONE Host line names Local until the operator changes it. Its
+// identity is the saved destination handle plus the DTO's exact observed owner
+// run; a label, index, endpoint, or fingerprint is never identity. Every ACTUAL
+// change clears the workspace atomically, the same destination is a no-op, and a
+// remote submission needs the exact drawn-and-written form.
+// ---------------------------------------------------------------------------
+
+/** One destination DTO the Host line can offer. */
+function newFormPeerHost(options: {
+  readonly id: string;
+  readonly label: string;
+  readonly state?: PeerUiHost["state"];
+  readonly hostRunId?: string | null;
+  readonly message?: string | null;
+}): PeerUiHost {
+  const run = options.hostRunId === undefined ? "run-a" : options.hostRunId;
+  return {
+    id: options.id,
+    label: options.label,
+    host: "10.0.0.5",
+    port: 8443,
+    state: options.state ?? "connected",
+    fingerprint: null,
+    message: options.message ?? null,
+    reconnectSuppressed: false,
+    previouslyConnected: true,
+    roster: {
+      state: run === null ? "never" : "current",
+      rows: [],
+      ...(run === null ? {} : { hostRunId: run }),
+    },
+  };
+}
+
+function newFormPeerSnapshot(hosts: readonly PeerUiHost[]): PeerUiSnapshot {
+  return {
+    revision: 1,
+    status: "ready",
+    settings: null,
+    identityFingerprint: null,
+    listener: { state: "off", host: null, port: null, message: null },
+    hosts,
+    trustedPeers: [],
+    consents: [],
+    notice: null,
+  };
+}
+
+/** Column of the drawn Host value (`  Host: ` is eight cells wide). */
+const HOST_VALUE_COLUMN = 9;
+const SHIFT_TAB = "\x1b[Z";
+const TAB = "\t";
+
+interface HostLineHarness extends Harness {
+  render(): { lines: string[]; cursor?: { column: number; row: number } };
+  texts(): string[];
+}
+
+/** Publishes the destinations and draws the whole New form once. */
+function hostLineForm(
+  hosts: readonly PeerUiHost[],
+  geometry: { cols?: number; rows?: number; options?: SidebarControllerOptions } = {},
+): HostLineHarness {
+  const cols = geometry.cols ?? 48;
+  const rows = geometry.rows ?? 14;
+  // The same harness object is extended in place: its action helpers read this
+  // object's own baseline, so a mid-test baseline move still applies.
+  const harness = formWith({
+    cols,
+    rows,
+    ...(geometry.options === undefined ? {} : { options: geometry.options }),
+  }) as Harness & Partial<HostLineHarness>;
+  harness.controller.setPeerUiSnapshot(newFormPeerSnapshot(hosts));
+  const render = (): { lines: string[]; cursor?: { column: number; row: number } } =>
+    harness.controller.render(cols, rows);
+  render();
+  harness.baseline = harness.actions.length;
+  harness.render = render;
+  harness.texts = () => assertPaneSafe(render().lines, cols, rows);
+  return harness as HostLineHarness;
+}
+
+/** The exact `create-on-peer` actions emitted since the baseline. */
+function createsOnPeer(harness: Harness): Extract<SidebarAction, { type: "create-on-peer" }>[] {
+  return harness.focusedActions().filter(
+    (action): action is Extract<SidebarAction, { type: "create-on-peer" }> => action.type === "create-on-peer",
+  );
+}
+
+/** Selects the next Host choice with real host input only. */
+function cycleHost(harness: Harness): void {
+  harness.send(SHIFT_TAB);
+  harness.send(DOWN);
+  harness.send(TAB);
+}
+
+test("the New form opens on Local and its ordinary path submission is unchanged", () => {
+  const harness = hostLineForm([newFormPeerHost({ id: "lab-a", label: "Lab Alpha" })], { cols: 40, rows: 12 });
+  const texts = harness.texts();
+  assert.equal(texts[0]?.includes("New session"), true);
+  assert.equal(texts[1]?.startsWith("  Host: [ Local ]"), true, JSON.stringify(texts));
+  assert.equal(texts[3]?.startsWith("> Workspace: "), true,
+    "the workspace editor keeps its own labelled body row");
+  harness.send("/workspace");
+  harness.send(ENTER);
+  assert.deepEqual(harness.focusedActions(), [
+    { type: "create", requestId: 1, workspace: "/workspace" },
+  ], "a Local submission is exactly the existing local create action");
+  assert.deepEqual(createsOnPeer(harness), []);
+});
+
+test("Shift+Tab reaches the Host line and Tab returns to the workspace", () => {
+  const harness = hostLineForm([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha" }),
+  ], { cols: 48, rows: 14 });
+  harness.send("/draft");
+  assert.equal(harness.render().cursor?.row, 3, "the workspace editor keeps the caret while it has the focus");
+
+  harness.send(SHIFT_TAB);
+  const hostFocused = harness.render();
+  assert.equal(assertPaneSafe(hostFocused.lines, 48, 14)[1]?.startsWith("> Host: [ Local ]"), true,
+    "the drawn Host line takes the form's focus marker");
+  assert.equal(hostFocused.cursor?.row, 1, "the hardware cursor moves to the drawn Host line");
+
+  harness.send(DOWN);
+  const afterTexts = harness.texts();
+  assert.equal(afterTexts[1]?.startsWith("> Host: [ Lab Alpha ]"), true, JSON.stringify(afterTexts));
+  assert.equal(afterTexts[3]?.slice(13).trim(), "", "the actual Host change cleared the workspace value");
+  assert.deepEqual(harness.focusedActions(), [], "cycling a host emits no backend action by itself");
+
+  harness.send(TAB);
+  assert.equal(harness.texts()[1]?.startsWith("  Host: [ Lab Alpha ]"), true,
+    "Tab returns the focus to the workspace editor");
+});
+
+test("every actual Host change clears the workspace and the same destination keeps it", () => {
+  const harness = hostLineForm([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha" }),
+    newFormPeerHost({ id: "lab-b", label: "Lab Beta" }),
+  ], { cols: 48, rows: 14 });
+  const hostLine = (): string => harness.texts()[1] ?? "";
+  const body = (): string => (harness.texts()[3] ?? "").slice(13).trim();
+  /** One deliberate host change: focus the Host line, step once, return to the body. */
+  const step = (): void => {
+    harness.send(SHIFT_TAB);
+    harness.send(DOWN);
+    harness.send(TAB);
+  };
+
+  harness.send("/local-draft");
+  assert.equal(body(), "/local-draft");
+  step(); // Local -> Lab Alpha: an actual change
+  assert.equal(hostLine().includes("[ Lab Alpha ]"), true, JSON.stringify(harness.texts()));
+  assert.equal(body(), "");
+  harness.send("/remote-draft");
+  assert.equal(body(), "/remote-draft");
+
+  // Re-listing the SAME destination (an ordinary roster update) is not a change:
+  // the draft, its caret, and the form stay exactly as the operator left them.
+  const before = harness.render();
+  harness.controller.setPeerUiSnapshot(newFormPeerSnapshot([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", message: "Roster resyncing" }),
+    newFormPeerHost({ id: "lab-b", label: "Lab Beta" }),
+  ]));
+  const after = harness.render();
+  assert.deepEqual(after.cursor, before.cursor, "the caret is unchanged");
+  assert.equal(body(), "/remote-draft", "ordinary snapshot output never clears the field");
+  assert.deepEqual(harness.focusedActions(), [], "no action is emitted by a snapshot update");
+
+  step(); // Lab Alpha -> Lab Beta: another actual change
+  assert.equal(hostLine().includes("[ Lab Beta ]"), true, JSON.stringify(harness.texts()));
+  assert.equal(body(), "");
+  step(); // Lab Beta -> Local: back to the default
+  assert.equal(hostLine().includes("[ Local ]"), true, JSON.stringify(harness.texts()));
+  assert.equal(body(), "");
+  step(); // Local -> Lab Alpha again: no per-host history is restored
+  assert.equal(body(), "", "a returning host starts empty; the previous value is never restored");
+});
+
+test("a remote Host uses a plain owner-path entry, never the local path completer", () => {
+  const kinds: string[] = [];
+  const harness = formWith({
+    options: {
+      createTextField: (options) => {
+        kinds.push(options.kind);
+        const callbacks = {
+          initialText: options.initialText,
+          workspaceBasePath: join(process.cwd(), ".pi-session-host-test-missing-workspace"),
+          onInvalidate: options.onInvalidate,
+          onSubmit: options.onSubmit,
+          onCancel: options.onCancel,
+          onReject: options.onReject,
+        };
+        return {
+          field: options.kind === "plain"
+            ? createPlainOwnerWorkspaceField(callbacks)
+            : options.kind === "path"
+              ? createSessionHostTextField({ ...callbacks, kind: "path" })
+              : createSessionHostTextField({
+                kind: "name",
+                initialText: options.initialText,
+                onInvalidate: options.onInvalidate,
+                onSubmit: options.onSubmit,
+                onCancel: options.onCancel,
+                onReject: options.onReject,
+              }),
+        };
+      },
+    },
+  });
+  harness.controller.setPeerUiSnapshot(newFormPeerSnapshot([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha" }),
+  ]));
+  void harness.controller.render(48, 14);
+  assert.deepEqual(kinds, ["path"], "the default Local New form keeps the native path editor");
+  harness.send(SHIFT_TAB);
+  harness.send(DOWN);
+  assert.deepEqual(kinds, ["path", "plain"],
+    "a remote destination gets plain owner-interpreted entry with no requester filesystem completion");
+  harness.send(TAB);
+  harness.send("C:\\Users\\owner\\My Projects\\pi");
+  assert.equal(assertPaneSafe(harness.controller.render(48, 14).lines, 48, 14)[3]
+    ?.includes("C:\\Users\\owner\\My Projects\\pi"), true, "raw Windows path text is accepted verbatim");
+});
+
+test("the plain owner entry keeps the workspace bound and never reads a local path", async () => {
+  // A rename field's 1024-byte name bound would reject these; the plain owner
+  // entry carries the workspace bound the create contract actually accepts.
+  const longAscii = `/${"a".repeat(1500)}`;
+  const longUnicode = `/${"雪".repeat(600)}`;
+  assert.equal(Buffer.byteLength(longAscii, "utf8") > 1024, true, "the ASCII fixture exceeds the name bound");
+  assert.equal(Buffer.byteLength(longUnicode, "utf8") > 1024, true, "the multibyte fixture exceeds the name bound");
+  for (const value of [longAscii, longUnicode]) {
+    const field = createPlainOwnerWorkspaceField({
+      initialText: "",
+      workspaceBasePath: process.cwd(),
+    });
+    try {
+      assert.equal(field.setText(value), true, "the plain owner entry accepts the workspace bound");
+      assert.equal(field.getValue(), value, "the value is carried verbatim, never normalized");
+    } finally {
+      field.dispose();
+    }
+  }
+
+  // A path prefix inside this repository offers nothing: completion is not merely
+  // dismissed for this field, it has no provider that could ever list anything.
+  const field = createPlainOwnerWorkspaceField({
+    initialText: "",
+    workspaceBasePath: process.cwd(),
+  });
+  try {
+    field.handleInput(join(process.cwd(), "packag"));
+    field.handleInput(TAB);
+    // One real timer tick, past the Editor's completion debounce.
+    await new Promise<void>((resolve) => setTimeout(resolve, 80));
+    assert.equal(field.isShowingAutocomplete(), false,
+      "no local completion list is ever offered for owner-interpreted text");
+    assert.equal(field.getText().endsWith("packag"), true, "the typed text is unchanged");
+  } finally {
+    field.dispose();
+  }
+});
+
+test("a missing owner run or a disconnected destination refuses truthfully", () => {
+  const missingRun = hostLineForm([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: null }),
+  ], { cols: 100, rows: 14 });
+  cycleHost(missingRun);
+  missingRun.send("/srv/owner/project");
+  missingRun.send(ENTER);
+  assert.deepEqual(createsOnPeer(missingRun), [], "an unobserved owner run is never guessed");
+  assert.equal(missingRun.texts().join(" ").includes(
+    "That destination's owner run was not observed; nothing was sent"), true);
+
+  const disconnected = hostLineForm([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha" }),
+  ], { cols: 100, rows: 14 });
+  disconnected.send(SHIFT_TAB);
+  disconnected.send(DOWN);
+  disconnected.controller.setPeerUiSnapshot(newFormPeerSnapshot([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", state: "disconnected" }),
+  ]));
+  disconnected.send(TAB);
+  disconnected.send("/srv/owner/project");
+  disconnected.send(ENTER);
+  assert.deepEqual(createsOnPeer(disconnected), [], "a disconnected destination never falls back to Local");
+  const disconnectedTexts = disconnected.texts();
+  assert.equal(disconnectedTexts[1]?.includes("Lab Alpha"), true,
+    "the chosen destination stays named instead of silently becoming Local");
+  assert.equal(disconnectedTexts.join(" ").includes(
+    "That destination is disconnected or gone; nothing was sent"), true);
+});
+
+test("a remote submission needs the exact drawn and written form", () => {
+  const harness = hostLineForm([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a" }),
+  ], { cols: 100, rows: 14 });
+  cycleHost(harness);
+  harness.send("/srv/owner/project");
+  // The harness's send only routes input: the candidate exists once the pane has
+  // actually been rendered with this value.
+  harness.texts();
+  const presentation = harness.controller.captureCreateFormPresentation();
+  assert.ok(presentation !== undefined, "the complete render drew a candidate");
+  assert.equal(presentation!.hostKind, "remote");
+  assert.equal(presentation!.hostId, "lab-a");
+  assert.equal(presentation!.hostRunId, "run-a");
+  assert.equal(presentation!.workspace, "/srv/owner/project");
+
+  // Not written yet: nothing is sent.
+  harness.send(ENTER);
+  assert.deepEqual(createsOnPeer(harness), []);
+  assert.equal(harness.texts().join(" ").includes(
+    "That New session form is not the displayed form; nothing was sent"), true,
+  "the refusal is the fixed truthful notice");
+
+  // The refusal reopened the field; this render is the candidate that gets the
+  // writer receipt, and it is submitted with NO render in between.
+  harness.texts();
+  const ready = harness.controller.captureCreateFormPresentation();
+  assert.ok(ready !== undefined);
+  assert.equal(harness.controller.settleCreateFormRender(ready!.renderToken), true);
+  harness.send(ENTER);
+  const creates = createsOnPeer(harness);
+  assert.equal(creates.length, 1, "exactly one remote create is emitted");
+  assert.deepEqual(creates[0], {
+    type: "create-on-peer",
+    requestId: creates[0]!.requestId,
+    formGeneration: ready!.formGeneration,
+    renderToken: ready!.renderToken,
+    hostId: "lab-a",
+    hostRunId: "run-a",
+    workspace: "/srv/owner/project",
+  });
+  assert.equal(harness.controller.focus, "form", "the form stays pending while the owner is asked");
+
+  // A different owner run is never selected on this request's behalf.
+  harness.controller.completeCreateOnPeer(creates[0]!.requestId, { hostRunId: "run-b", rowId: "row-a" });
+  assert.equal(harness.focusedActions().some((action) => action.type === "select-remote"), false,
+    "a mismatched returned run is never substituted");
+  assert.equal(harness.texts().join(" ").includes(
+    "The remote host reported a different owner run; nothing was selected"), true);
+});
+
+test("the exact started reply selects the returned run and row, and a late one never steals", () => {
+  const harness = hostLineForm([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a" }),
+  ], { cols: 100, rows: 14 });
+  const submit = (): Extract<SidebarAction, { type: "create-on-peer" }> => {
+    cycleHost(harness);
+    harness.send("/srv/owner/project");
+    harness.texts(); // the drawn candidate exists only after this render
+    const drawn = harness.controller.captureCreateFormPresentation();
+    assert.ok(drawn !== undefined);
+    harness.controller.settleCreateFormRender(drawn!.renderToken);
+    harness.send(ENTER);
+    const emitted = createsOnPeer(harness).at(-1);
+    assert.ok(emitted !== undefined, "the written remote form submits");
+    return emitted!;
+  };
+  const first = submit();
+  harness.controller.completeCreateOnPeer(first.requestId, { hostRunId: "run-a", rowId: "row-a" });
+  assert.deepEqual(harness.focusedActions().at(-1), {
+    type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a",
+  }, "the owner's own started fact selects exactly the returned run and row");
+  assert.equal(harness.controller.focus, "main", "the submitted form hands the view to the selected remote row");
+  assert.equal(harness.focusedActions().some((action) => action.type === "select"), false,
+    "no local row is activated, accepted, or fabricated");
+
+  // Reopening the New form and submitting again: the FIRST request's late reply
+  // is stale and must not steal the newer form.
+  harness.send(ALT_LEFT_LEGACY);
+  assert.equal(harness.controller.focus, "sidebar");
+  rosterView(harness.controller, 40, 20);
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "form");
+  harness.baseline = harness.actions.length;
+  const second = submit();
+  harness.controller.completeCreateOnPeer(first.requestId, { hostRunId: "run-a", rowId: "row-late" });
+  assert.equal(harness.focusedActions().some((action) => action.type === "select-remote"), false,
+    "a superseded request never selects, even with a matching run");
+  assert.equal(harness.controller.focus, "form", "the newer form keeps the focus it owns");
+  harness.controller.completeCreateOnPeer(second.requestId, { hostRunId: "run-a", rowId: "row-b" });
+  assert.deepEqual(harness.focusedActions().at(-1), {
+    type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-b",
+  });
+});
+
+test("the Host line answers only its own drawn geometry and its own option list", () => {
+  const harness = hostLineForm([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha" }),
+    newFormPeerHost({ id: "lab-b", label: "Lab Beta" }),
+  ], { cols: 48, rows: 14 });
+  const shown = harness.controller.captureMousePresentation();
+  assert.equal(shown.activateFormHostAt(HOST_VALUE_COLUMN, 1, 48, 14), true,
+    "a press on the drawn Host value cycles the one selection");
+  assert.equal(harness.texts()[1]?.includes("[ Lab Alpha ]"), true,
+    "the drawn Host line now names the next destination");
+  assert.equal(shown.activateFormHostAt(HOST_VALUE_COLUMN, 2, 48, 14), false,
+    "a press on the row this render drew as the workspace body never touches the Host line");
+  assert.equal(shown.activateFormHostAt(HOST_VALUE_COLUMN, 1, 40, 14), false,
+    "a different pane geometry can never reuse the captured map");
+
+  // A press elsewhere on the drawn row only focuses the control.
+  const focused = harness.controller.captureMousePresentation();
+  assert.equal(focused.activateFormRowAt(1, 1, 48, 14), true);
+  assert.equal(harness.texts()[1]?.startsWith("> Host: "), true);
+
+  // A stale option list is refused as well: same drawn row, changed list.
+  const stale = harness.controller.captureMousePresentation();
+  harness.controller.setPeerUiSnapshot(newFormPeerSnapshot([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", state: "disconnected" }),
+    newFormPeerHost({ id: "lab-b", label: "Lab Beta" }),
+  ]));
+  harness.render();
+  assert.equal(stale.activateFormHostAt(HOST_VALUE_COLUMN, 1, 48, 14), false,
+    "a press captured before the option list changed cannot act on the new list");
+});
+
+test("an identical redraw keeps the earned receipt and a real change needs a new write", () => {
+  const harness = hostLineForm([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha" }),
+  ], { cols: 100, rows: 14 });
+  cycleHost(harness);
+  harness.send("/srv/owner/project");
+  harness.texts();
+  const earned = harness.controller.captureCreateFormPresentation();
+  assert.ok(earned !== undefined);
+  assert.equal(harness.controller.settleCreateFormRender(earned!.renderToken), true);
+
+  // An unrelated roster repaint that draws the identical form keeps the same
+  // candidate, so the receipt it already earned is preserved.
+  harness.controller.setPeerUiSnapshot(newFormPeerSnapshot([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", message: "Roster resyncing" }),
+  ]));
+  harness.texts();
+  const redrawn = harness.controller.captureCreateFormPresentation();
+  assert.equal(redrawn?.renderToken, earned!.renderToken,
+    "an identical complete redraw is the same drawn candidate");
+  harness.send(ENTER);
+  assert.equal(createsOnPeer(harness).length, 1,
+    "the earned receipt survives an unrelated repaint and submits once");
+
+  // A genuinely different source is a new unwritten candidate: identical bytes
+  // can never inherit the previous receipt.
+  const changed = hostLineForm([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a" }),
+  ], { cols: 100, rows: 14 });
+  cycleHost(changed);
+  changed.send("/srv/owner/project");
+  changed.texts();
+  const before = changed.controller.captureCreateFormPresentation();
+  assert.ok(before !== undefined);
+  assert.equal(changed.controller.settleCreateFormRender(before!.renderToken), true);
+  changed.controller.setPeerUiSnapshot(newFormPeerSnapshot([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-b" }),
+  ]));
+  changed.texts();
+  const after = changed.controller.captureCreateFormPresentation();
+  assert.notEqual(after?.renderToken, before!.renderToken,
+    "a changed owner run mints its own candidate");
+  assert.equal(after?.hostRunId, "run-b", "the new candidate names the run it was drawn with");
+  changed.send(ENTER);
+  assert.deepEqual(createsOnPeer(changed), [],
+    "a changed owner run needs its own written frame before anything is sent");
+});
+
+test("a destination run or connection transition retires the drawn receipt for good", () => {
+  const UNCERTAIN = "UNCERTAIN: the remote create may have been handed off; outcome unknown";
+
+  // A -> B -> A BEFORE submission: the transition itself retires, so the
+  // returning run never reuses the receipt written for the earlier one.
+  const runChanged = hostLineForm([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a" }),
+  ], { cols: 100, rows: 14 });
+  cycleHost(runChanged);
+  runChanged.send("/srv/owner/project");
+  runChanged.texts();
+  const written = runChanged.controller.captureCreateFormPresentation();
+  assert.ok(written !== undefined);
+  assert.equal(runChanged.controller.settleCreateFormRender(written!.renderToken), true);
+  runChanged.controller.setPeerUiSnapshot(newFormPeerSnapshot([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-b" }),
+  ]));
+  runChanged.texts();
+  runChanged.controller.setPeerUiSnapshot(newFormPeerSnapshot([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a" }),
+  ]));
+  runChanged.texts();
+  const revived = runChanged.controller.captureCreateFormPresentation();
+  assert.notEqual(revived?.renderToken, written!.renderToken,
+    "run A -> B -> A mints a fresh unwritten candidate");
+  runChanged.send(ENTER);
+  assert.deepEqual(createsOnPeer(runChanged), [],
+    "the retired receipt is never submitted again after the run returns");
+
+  // disconnected -> connected BEFORE submission behaves the same way.
+  const reconnected = hostLineForm([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a" }),
+  ], { cols: 100, rows: 14 });
+  cycleHost(reconnected);
+  reconnected.send("/srv/owner/project");
+  reconnected.texts();
+  const connectedWritten = reconnected.controller.captureCreateFormPresentation();
+  assert.equal(reconnected.controller.settleCreateFormRender(connectedWritten!.renderToken), true);
+  reconnected.controller.setPeerUiSnapshot(newFormPeerSnapshot([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", state: "disconnected" }),
+  ]));
+  reconnected.texts();
+  reconnected.controller.setPeerUiSnapshot(newFormPeerSnapshot([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a" }),
+  ]));
+  reconnected.texts();
+  reconnected.send(ENTER);
+  assert.deepEqual(createsOnPeer(reconnected), [],
+    "a reconnect never reuses the receipt written before the drop");
+
+  // WHILE QUEUED: the pending request loses this side's ownership with truthful
+  // uncertainty, and a late started reply never selects from it.
+  const queued = hostLineForm([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a" }),
+  ], { cols: 100, rows: 14 });
+  cycleHost(queued);
+  queued.send("/srv/owner/project");
+  queued.texts();
+  const queuedCandidate = queued.controller.captureCreateFormPresentation();
+  assert.equal(queued.controller.settleCreateFormRender(queuedCandidate!.renderToken), true);
+  queued.send(ENTER);
+  const submitted = createsOnPeer(queued);
+  assert.equal(submitted.length, 1, "the written form submitted exactly once");
+  assert.equal(queued.controller.createOnPeerStillCurrent(submitted[0]!), true,
+    "the queued proof holds while the destination is unchanged");
+  queued.controller.setPeerUiSnapshot(newFormPeerSnapshot([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-b" }),
+  ]));
+  assert.equal(queued.texts().join(" ").includes(UNCERTAIN), true,
+    "the retirement is stated as uncertainty, never as a cancellation or a failure");
+  queued.controller.setPeerUiSnapshot(newFormPeerSnapshot([
+    newFormPeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a" }),
+  ]));
+  queued.texts();
+  assert.equal(queued.controller.createOnPeerStillCurrent(submitted[0]!), false,
+    "the queued proof stays false after the run returns");
+  queued.send(ENTER);
+  assert.equal(createsOnPeer(queued).length, 1, "a returning run never re-arms the request");
+  queued.controller.completeCreateOnPeer(submitted[0]!.requestId, { hostRunId: "run-a", rowId: "row-a" });
+  assert.equal(queued.focusedActions().some((action) => action.type === "select-remote"), false,
+    "a late started reply never selects from a retired receipt");
+});
+
+// ---------------------------------------------------------------------------
+// Network menu: viewer Remote input/copy and owner remote history deletion
+// ---------------------------------------------------------------------------
+
+const NETWORK_COLS = 100;
+const NETWORK_ROWS = 30;
+
+function networkSettings(overrides: Partial<PeerUiSettings> = {}): PeerUiSettings {
+  return {
+    hostingEnabled: false,
+    bindHost: "",
+    bindPort: null,
+    autoReconnect: false,
+    bellEnabled: true,
+    viewerNativeInputEnabled: true,
+    remoteHistoryDeleteEnabled: true,
+    ...overrides,
+  };
+}
+
+function networkSnapshot(settings: PeerUiSettings | null, revision = 1): PeerUiSnapshot {
+  return {
+    revision,
+    status: "ready",
+    settings,
+    identityFingerprint: null,
+    listener: { state: "off", host: null, port: null, message: null },
+    hosts: [],
+    trustedPeers: [],
+    consents: [],
+    notice: null,
+  };
+}
+
+function networkPane(settings: PeerUiSettings | null): Harness {
+  const harness = makeController();
+  harness.controller.setPeerUiSnapshot(networkSnapshot(settings));
+  harness.controller.openPeerMenu();
+  assert.equal(harness.controller.focus, "form");
+  harness.baseline = harness.actions.length;
+  return harness;
+}
+
+function networkTexts(harness: Harness): string[] {
+  return assertPaneSafe(harness.controller.render(NETWORK_COLS, NETWORK_ROWS).lines, NETWORK_COLS, NETWORK_ROWS);
+}
+
+/** Moves the Network highlight onto the drawn row with this label, using real keys only. */
+function highlightNetworkRow(harness: Harness, label: string): string[] {
+  for (let step = 0; step < 20; step += 1) {
+    const texts = networkTexts(harness);
+    if (texts.find((line) => line.startsWith("> "))?.includes(label)) return texts;
+    harness.send(DOWN);
+  }
+  assert.fail(`the Network pane never drew ${label} as its highlight`);
+}
+
+function peerActions(harness: Harness): SidebarAction[] {
+  return harness.sinceActions().filter((action) => action.type.startsWith("peer-"));
+}
+
+test("Network shows distinct viewer Remote input/copy and owner history-deletion rows after the bell", () => {
+  const harness = networkPane(networkSettings());
+  const texts = networkTexts(harness);
+  const bell = texts.findIndex((line) => line.includes("Incoming bell: on"));
+  const viewer = texts.findIndex((line) => line.includes("Remote input/copy: on (enter to toggle)"));
+  const history = texts.findIndex((line) => line.includes("Allow remote history deletion: on (enter to toggle)"));
+  const add = texts.findIndex((line) => line.includes("Add destination"));
+  assert.ok(bell > 0 && viewer === bell + 1 && history === viewer + 1 && add === history + 1,
+    `unexpected Network row order: ${JSON.stringify(texts)}`);
+
+  highlightNetworkRow(harness, "Remote input/copy");
+  harness.send(ENTER);
+  assert.deepEqual(peerActions(harness), [{ type: "peer-viewer-native-input", enabled: false }],
+    "the viewer row toggles only this viewer's remote input/copy");
+
+  highlightNetworkRow(harness, "Allow remote history deletion");
+  harness.send(ENTER);
+  assert.deepEqual(peerActions(harness), [
+    { type: "peer-viewer-native-input", enabled: false },
+    { type: "peer-remote-history-delete", enabled: false },
+  ], "the owner policy row is a separate action, never a viewer delete toggle");
+  assert.equal(peerActions(harness).some((action) => action.type === "peer-bell"), false);
+});
+
+test("each Network flag row sends the opposite of the drawn saved value", () => {
+  const harness = networkPane(networkSettings({ viewerNativeInputEnabled: false, remoteHistoryDeleteEnabled: false }));
+  const texts = networkTexts(harness);
+  assert.ok(texts.some((line) => line.includes("Remote input/copy: off (enter to toggle)")));
+  assert.ok(texts.some((line) => line.includes("Allow remote history deletion: off (enter to toggle)")));
+  highlightNetworkRow(harness, "Remote input/copy");
+  harness.send(ENTER);
+  highlightNetworkRow(harness, "Allow remote history deletion");
+  harness.send(ENTER);
+  assert.deepEqual(peerActions(harness), [
+    { type: "peer-viewer-native-input", enabled: true },
+    { type: "peer-remote-history-delete", enabled: true },
+  ]);
+});
+
+test("a Network flag toggle whose drawn value changed behind the frame sends nothing", () => {
+  const harness = networkPane(networkSettings());
+  highlightNetworkRow(harness, "Remote input/copy");
+  // The saved value changes after the frame that drew "on", with no new render.
+  harness.controller.setPeerUiSnapshot(networkSnapshot(networkSettings({ viewerNativeInputEnabled: false }), 2));
+  harness.send(ENTER);
+  assert.deepEqual(peerActions(harness), [], "a stale drawn intent never toggles the opposite value");
+  assert.ok(networkTexts(harness).some((line) => line.includes("The network pane changed")));
+
+  // A pointer press captured from the older drawn frame is refused the same way.
+  const history = networkPane(networkSettings());
+  const drawn = networkTexts(history);
+  const row = drawn.findIndex((line) => line.includes("Allow remote history deletion"));
+  assert.ok(row > 0);
+  const presentation = history.controller.captureMousePresentation();
+  history.controller.setPeerUiSnapshot(networkSnapshot(networkSettings({ remoteHistoryDeleteEnabled: false }), 2));
+  assert.equal(presentation.activatePeerAt(2, row, NETWORK_COLS, NETWORK_ROWS), false);
+  assert.deepEqual(peerActions(history), []);
+  // The current written row acts once, through the ordinary Enter routine.
+  const current = networkTexts(history);
+  const currentRow = current.findIndex((line) => line.includes("Allow remote history deletion: off"));
+  assert.ok(currentRow > 0);
+  assert.equal(history.controller.captureMousePresentation().activatePeerAt(2, currentRow, NETWORK_COLS, NETWORK_ROWS), true);
+  assert.deepEqual(peerActions(history), [{ type: "peer-remote-history-delete", enabled: true }]);
+});
+
+test("unknown settings, or settings missing a flag, show unknown and send no flag change", () => {
+  for (const settings of [
+    null,
+    { ...networkSettings(), viewerNativeInputEnabled: undefined } as unknown as PeerUiSettings,
+    { ...networkSettings(), remoteHistoryDeleteEnabled: "true" } as unknown as PeerUiSettings,
+  ]) {
+    const harness = networkPane(settings);
+    const texts = networkTexts(harness);
+    assert.ok(texts.some((line) => line.includes("Remote input/copy: unknown")), JSON.stringify(texts));
+    assert.ok(texts.some((line) => line.includes("Allow remote history deletion: unknown")));
+    highlightNetworkRow(harness, "Remote input/copy");
+    harness.send(ENTER);
+    highlightNetworkRow(harness, "Allow remote history deletion");
+    harness.send(ENTER);
+    assert.deepEqual(peerActions(harness), [], "an unknown setting is never toggled to a guessed value");
+  }
 });

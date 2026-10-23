@@ -330,7 +330,9 @@ function workspaceFieldValue(text: string): string | undefined {
   const index = rows.findIndex((line) => line.includes(marker));
   if (index < 0) return undefined;
   const start = rows[index]!.indexOf(marker) + marker.length + 1;
-  return rows[index + 1]?.slice(start).trim();
+  // The label sits beside the editable content row, so the value is read from
+  // the labelled row itself rather than the Editor's rule above it.
+  return rows[index]!.slice(start).trim();
 }
 
 /**
@@ -698,7 +700,11 @@ export class SavedMainDriver {
     afterOffset = 0,
     timeoutMs = EVENT_TIMEOUT_MS,
   ): Promise<SessionRecord[]> {
-    await this.journalSignal.waitFor(() => predicate(this.records().slice(afterOffset)), timeoutMs, description);
+    // The observer journal is a durable file, so a positive lifecycle fact is
+    // re-read on the shared bounded recheck as well as on every notification.
+    // The predicate, offset, returned records, description, and timeout are
+    // unchanged and the original deadline still bounds the wait.
+    await this.journalSignal.waitForRecheck(() => predicate(this.records().slice(afterOffset)), timeoutMs, description);
     return this.records();
   }
 
@@ -708,7 +714,10 @@ export class SavedMainDriver {
     afterOffset = 0,
     timeoutMs = EVENT_TIMEOUT_MS,
   ): Promise<PtyJournalRecord[]> {
-    await this.ptySignal.waitFor(() => predicate(this.ptyRecords().slice(afterOffset)), timeoutMs, description);
+    // The public PTY journal is a durable file: re-read it on the shared bounded
+    // recheck in addition to notifications, with predicate, offset, returned
+    // records, description, timeout, and the original deadline unchanged.
+    await this.ptySignal.waitForRecheck(() => predicate(this.ptyRecords().slice(afterOffset)), timeoutMs, description);
     return this.ptyRecords();
   }
 
@@ -775,7 +784,10 @@ export class SavedMainDriver {
   }
 
   async waitForRunnerResult(timeoutMs = EVENT_TIMEOUT_MS): Promise<RunnerResult> {
-    await this.ptySignal.waitFor(() => readJsonl<RunnerResult>(this.resultFile).length === 1,
+    // The runner result is a durable file, so re-read it on the shared bounded
+    // recheck; the predicate, description, timeout, and post-wait assertions are
+    // unchanged.
+    await this.ptySignal.waitForRecheck(() => readJsonl<RunnerResult>(this.resultFile).length === 1,
       timeoutMs, "the public runSessionHost return and terminal restoration record");
     const results = readJsonl<RunnerResult>(this.resultFile);
     assert.equal(results.length, 1, "the runner result is one bounded metadata record");
@@ -1021,7 +1033,11 @@ export async function waitForJsonl<T>(
     if (filename === null || filename.toString() === basename(path)) signal.notify();
   });
   try {
-    await signal.waitFor(() => predicate(readJsonl<T>(path)), timeoutMs, description);
+    // This wrapper re-reads the durable JSONL file on every evaluation, so it also
+    // re-reads on the shared bounded recheck. Notification remains the fast path,
+    // the predicate and the caller's original timeout are unchanged, and the
+    // returned records still come from a fresh read.
+    await signal.waitForRecheck(() => predicate(readJsonl<T>(path)), timeoutMs, description);
     return readJsonl<T>(path);
   } finally {
     watcher.close();
@@ -1048,8 +1064,67 @@ export function assertNoForbiddenSessionArgs(args: readonly string[]): void {
     "the real native Pi process receives no forced/resumed/no-session override");
 }
 
+const NEW_FORM_PANE_HEADER = "New session";
+/** The fixed New-form Host line with the default Local destination, unfocused and focused. */
+const NEW_FORM_LOCAL_HOST_ROWS = new Set(["Host: [ Local ]", "> Host: [ Local ]"]);
+const WORKSPACE_FIELD_LABEL = "> Workspace:";
+/** Below this a run of `─` is a transcript divider or decoration, not the field's own border. */
+const MIN_NATIVE_EDITOR_RULE_COLUMNS = 20;
+
+/**
+ * One native Editor border row: the gutter above the field label stays blank and
+ * the row is a pure `─` run from the field's value column on. Returns the rule's
+ * visible width, or undefined when the row is absent, blank, or not a rule.
+ */
+function nativeEditorRuleWidth(row: string | undefined, valueColumn: number): number | undefined {
+  if (row === undefined || valueColumn < 1) return undefined;
+  if (row.slice(0, valueColumn).trim() !== "") return undefined;
+  const rule = row.slice(valueColumn).trimEnd();
+  if (rule.length < MIN_NATIVE_EDITOR_RULE_COLUMNS || !/^─+$/.test(rule)) return undefined;
+  return rule.length;
+}
+
+/**
+ * Positive witness for the completed Local New form exactly as the native host
+ * draws it in the right-hand form pane:
+ *
+ *   New session
+ *     Host: [ Local ]
+ *                ────────────   Editor top rule (blank gutter above the label)
+ *   > Workspace: <draft>        the Editor's own labelled content row
+ *                ────────────   Editor bottom rule, same width
+ *
+ * Every actual New-open wait uses this so a partial incremental paint — header,
+ * Host line, top rule and labelled row with the bottom rule not yet written —
+ * is never mistaken for the open form. A left-roster caption, a lone label, an
+ * open completion menu, a Main-transcript rule, or the Main transcript itself
+ * are never evidence. The body is deliberately not required to be empty: New
+ * retains its Local workspace draft across reopens, and the caller decides what
+ * the body must contain.
+ */
+export function isCompleteLocalNewFormFrame(text: string): boolean {
+  const pane = rightPaneText(text).split("\n");
+  for (let header = 0; header < pane.length; header += 1) {
+    const headerRow: string | undefined = pane[header];
+    if (headerRow?.trim() !== NEW_FORM_PANE_HEADER) continue;
+    const hostRow: string | undefined = pane[header + 1];
+    if (hostRow === undefined || !NEW_FORM_LOCAL_HOST_ROWS.has(hostRow.trim())) continue;
+    const labelledRow: string | undefined = pane[header + 3];
+    if (labelledRow === undefined) continue;
+    const label = labelledRow.indexOf(WORKSPACE_FIELD_LABEL);
+    // The labelled row is the editable body row: the label plus its one-space
+    // gutter must be drawn so a real (possibly empty) content region follows.
+    if (label < 0 || labelledRow[label + WORKSPACE_FIELD_LABEL.length] !== " ") continue;
+    const valueColumn = label + WORKSPACE_FIELD_LABEL.length + 1;
+    const top = nativeEditorRuleWidth(pane[header + 2], valueColumn);
+    const bottom = nativeEditorRuleWidth(pane[header + 4], valueColumn);
+    if (top !== undefined && top === bottom) return true;
+  }
+  return false;
+}
+
 export function workspaceOnlyNewFrame(text: string): boolean {
-  return text.includes("New session") && text.includes("> Workspace:")
+  return isCompleteLocalNewFormFrame(text)
     && !text.includes("Label:") && !text.includes("Profile:");
 }
 

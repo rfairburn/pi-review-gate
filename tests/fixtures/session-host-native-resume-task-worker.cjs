@@ -3,8 +3,9 @@
 /**
  * Deterministic run-as-binary worker for the native Main automatic-resume test.
  * It consumes the real controller prompt and an owned mode plan: hold mode
- * publishes readiness, waits for one test-owned release file through fs.watch,
- * and writes a fixture-only change; executor-failure-held publishes readiness,
+ * publishes readiness, waits for one test-owned release file through fs.watch
+ * plus a bounded reread of that same durable file, and writes a fixture-only
+ * change; executor-failure-held publishes readiness,
  * waits for a distinct release, then exits nonzero so the real controller's
  * stopped recovery-required record can be authenticated. The bounded timer is
  * a failure guard only; it never supplies work or status.
@@ -61,32 +62,75 @@ function assertOwnedPaths() {
 	}
 }
 
-function waitForRelease(targetReleasePath) {
+// The release file is a durable fact owned by the test process, and its only live
+// trigger is an fs.watch notification that can be coalesced or never delivered.
+// Observation therefore keeps the notification fast path and the single original
+// absolute deadline, and adds a bounded reread of that same file plus one final
+// reread at the deadline. Missing bytes stay pending, a malformed payload or any
+// read/watcher error still fails closed, and no timer or notification can
+// manufacture a release that the actual file does not contain.
+const RELEASE_DEADLINE_MS = 240_000;
+const RELEASE_RECHECK_INTERVAL_MS = 25;
+
+function waitForRelease(targetReleasePath, options = {}) {
+	// Fixture-only seam for unit coverage: the entrypoint below never passes
+	// options. A non-positive `recheckIntervalMs` reproduces the pre-change
+	// notification-only shape so the regression control can exercise the same
+	// helper with the same predicate and deadline.
+	const watch = options.watch ?? fs.watch;
+	const recheckIntervalMs = options.recheckIntervalMs ?? RELEASE_RECHECK_INTERVAL_MS;
 	return new Promise((resolve, reject) => {
 		let settled = false;
 		let watcher;
+		let deadline;
+		let recheck;
 		const finish = (error) => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(deadline);
-			try { watcher?.close(); } catch { /* owned fixture watcher */ }
+			if (deadline !== undefined) clearTimeout(deadline);
+			if (recheck !== undefined) clearInterval(recheck);
+			deadline = undefined;
+			recheck = undefined;
+			const ownedWatcher = watcher;
+			watcher = undefined;
+			try { ownedWatcher?.close(); } catch { /* owned fixture watcher */ }
 			if (error) reject(error);
 			else resolve();
 		};
 		const checkRelease = () => {
+			if (settled) return;
 			try {
 				if (!fs.existsSync(targetReleasePath)) return;
 				const release = JSON.parse(fs.readFileSync(targetReleasePath, 'utf8'));
-				if (release.release === true) finish();
+				if (release !== null && typeof release === 'object' && release.release === true) finish();
 				else finish(new Error('native resume fixture release record was malformed'));
 			} catch (error) {
-				finish(error);
+				finish(error instanceof Error ? error : new Error('native resume fixture release read failed'));
 			}
 		};
-		const deadline = setTimeout(() => finish(new Error('native resume fixture release deadline expired')), 240_000);
-		watcher = fs.watch(stateDir, (_event, filename) => {
-			if (filename === null || filename.toString() === path.basename(targetReleasePath)) checkRelease();
-		});
+		// Scheduled once: no observation path resets, extends, or re-arms it.
+		deadline = setTimeout(() => {
+			deadline = undefined;
+			if (recheckIntervalMs > 0) checkRelease();
+			if (!settled) finish(new Error('native resume fixture release deadline expired'));
+		}, RELEASE_DEADLINE_MS);
+		if (recheckIntervalMs > 0) {
+			recheck = setInterval(checkRelease, recheckIntervalMs);
+		}
+		try {
+			watcher = watch(path.dirname(targetReleasePath), (_event, filename) => {
+				if (filename === null || filename.toString() === path.basename(targetReleasePath)) checkRelease();
+			});
+			// A watcher failure is never a release and never worker success.
+			watcher.on('error', (error) => finish(error instanceof Error
+				? new Error(`native resume fixture release watcher failed: ${error.message}`)
+				: new Error('native resume fixture release watcher failed')));
+		} catch (error) {
+			finish(error instanceof Error
+				? new Error(`native resume fixture release watcher failed: ${error.message}`)
+				: new Error('native resume fixture release watcher failed'));
+			return;
+		}
 		// Check after the watcher is installed so an early test-side release is
 		// neither missed nor converted into a sleep/poll loop.
 		checkRelease();
@@ -127,7 +171,11 @@ async function main() {
 	process.stdin.resume();
 }
 
-void main().catch((error) => {
-	process.stderr.write(`native resume fixture worker failed: ${error instanceof Error ? error.message : 'unknown failure'}\n`);
-	process.exitCode = 1;
-});
+if (require.main === module) {
+	void main().catch((error) => {
+		process.stderr.write(`native resume fixture worker failed: ${error instanceof Error ? error.message : 'unknown failure'}\n`);
+		process.exitCode = 1;
+	});
+}
+
+module.exports = { waitForRelease, RELEASE_DEADLINE_MS, RELEASE_RECHECK_INTERVAL_MS };

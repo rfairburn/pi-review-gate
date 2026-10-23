@@ -108,7 +108,14 @@ async function createBackgroundWaitFixture(mode: "root-exits" | "interruptible" 
     "let stateRequests=0;let abortRequested=false;",
     `const handle=(command)=>{if(command.type==='prompt'){out({type:'response',id:command.id,command:'prompt',success:true});out({type:'tool_execution_end',toolName:'ShellStart',result:{content:[{type:'text',text:'Started '+String.fromCharCode(34)+'owned background'+String.fromCharCode(34)+' as job1 (pid '+background.pid+').'}]},isError:false});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'authenticated background result'}]}});out({type:'turn_end'});${initialSettlement}}${stateHandler}${abortHandler}else if(command.type==='get_last_assistant_text'){fs.writeFileSync(${JSON.stringify(finalTextRequestPath)},'requested');}};`,
     "const consume=()=>{if(!holderReady)return;for(;;){const newline=input.indexOf('\\n');if(newline<0)break;const raw=input.slice(0,newline);input=input.slice(newline+1);if(raw.trim())handle(JSON.parse(raw));}};",
-    "holder.on('message',message=>{if(message!=='ready')return;holderReady=true;fs.writeFileSync(" + JSON.stringify(fixture.workerPidPath) + ",String(holder.pid));fs.writeFileSync(" + JSON.stringify(fixture.readyPath) + ",'ready');consume();});",
+    // The worker is the sole publisher of its own PID and ready markers: it
+    // writes its PID, then the ready marker, then signals over IPC. Rewriting
+    // those same files from the parent after the child markers already exist
+    // truncates them a second time, so a reader (waitForFixtureReady) can
+    // observe an empty PID for a live, correctly published descendant. The
+    // parent keeps the IPC 'ready' message as its protocol gate and stays the
+    // sole publisher of the detached background group PID it spawns.
+    "holder.on('message',message=>{if(message!=='ready')return;holderReady=true;consume();});",
     "process.stdin.on('data',chunk=>{input+=chunk;consume()});",
   ].join("\n");
   await writeFile(join(fixture.root, "rpc-background.cjs"), parentScript);
@@ -392,6 +399,65 @@ test("owned fixture cleanup waits for actual exit after a pre-exit stopped marke
   } finally {
     await stopOwnedFixture(fixture, false);
     await within(closed, 5_000, "test-owned fixture stdio to close");
+    await removeOwnedFixtureRoot(fixture.root);
+  }
+});
+
+/** Targets of every `writeFileSync` call whose first argument is a literal path. */
+function literalWriteFileTargets(script: string): string[] {
+  const targets: string[] = [];
+  for (const match of script.matchAll(/writeFileSync\(\s*("(?:[^"\\\n]|\\.)*")/g)) {
+    targets.push(JSON.parse(match[1]) as string);
+  }
+  return targets;
+}
+
+// Publication contract for the owned fixtures: the worker process publishes its
+// own PID and ready marker (PID first), the parent never writes those two files,
+// and the parent still gates the RPC protocol on the worker's IPC 'ready'
+// message. A second parent writer of the same paths is a duplicate publication:
+// its truncate window can expose an empty PID file to waitForFixtureReady while
+// the descendant is alive, which surfaces as an invalid-PID assertion failure
+// rather than a real teardown defect.
+test("owned fixture workers are the sole publishers of their PID and ready markers", async () => {
+  const fixture = await createBackgroundWaitFixture();
+  try {
+    const workerScript = await readFile(join(fixture.root, "worker.cjs"), "utf8");
+    const parentScript = await readFile(join(fixture.root, "rpc-background.cjs"), "utf8");
+
+    const childPidWrite = workerScript.indexOf("fs.writeFileSync(pidPath,String(process.pid))");
+    const childReadyWrite = workerScript.indexOf("fs.writeFileSync(readyPath,'ready')");
+    assert.ok(childPidWrite >= 0, "the worker publishes its own PID");
+    assert.ok(childReadyWrite >= 0, "the worker publishes its own ready marker");
+    assert.ok(childPidWrite < childReadyWrite, "the worker publishes its PID before its ready marker");
+    assert.ok(
+      workerScript.includes("if(process.send)process.send('ready');"),
+      "the worker still announces readiness over IPC after publishing both markers",
+    );
+
+    const holderHandler = parentScript.split("\n").find((line) => line.includes("holder.on('message'"));
+    assert.ok(holderHandler, "the parent waits for the worker's IPC ready message");
+    assert.ok(holderHandler.includes("holderReady=true"), "the IPC ready message still opens the protocol gate");
+    assert.ok(holderHandler.includes("consume()"), "the IPC ready message still releases buffered requests");
+    assert.ok(
+      !holderHandler.includes("writeFileSync"),
+      "the parent ready handler must not publish the worker's PID or ready marker",
+    );
+
+    const parentWrites = literalWriteFileTargets(parentScript);
+    assert.ok(
+      !parentWrites.includes(fixture.workerPidPath),
+      "the parent must never write the worker PID marker owned by the worker",
+    );
+    assert.ok(
+      !parentWrites.includes(fixture.readyPath),
+      "the parent must never write the ready marker owned by the worker",
+    );
+    assert.ok(
+      parentWrites.includes(fixture.backgroundPidPath),
+      "the parent still publishes the background group PID for the detached child it spawns",
+    );
+  } finally {
     await removeOwnedFixtureRoot(fixture.root);
   }
 });

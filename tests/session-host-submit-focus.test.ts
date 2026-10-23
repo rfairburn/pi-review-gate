@@ -31,7 +31,7 @@ import {
   type SidebarFieldFactoryResult,
   type SidebarItem,
 } from "../src/session-host/sidebar";
-import type { SessionHostFieldSubmission, SessionHostTextField } from "../src/session-host/field-editor";
+import type { SessionHostFieldRender, SessionHostFieldSubmission, SessionHostTextField } from "../src/session-host/field-editor";
 
 const ALT_LEFT = "\x1b[1;3D";
 const UP = "\x1b[A";
@@ -111,14 +111,15 @@ class SubmitField {
   }
   getValue(): string { return this.text; }
   dispose(): void { /* owns nothing */ }
-  render(cols: number, _rows: number): {
-    lines: string[];
-    cursor: { column: number; row: number; visible: boolean };
-  } {
+  render(cols: number, _rows: number): SessionHostFieldRender {
+    // The pinned public Editor renders its top border first and its editable
+    // rows after it, so the editable body row — and the caret — are row 1.
     const text = this.text.slice(0, Math.max(0, cols - 1));
+    const body = `${text}${" ".repeat(Math.max(0, cols - text.length))}`;
     return {
-      lines: [`${text}${" ".repeat(Math.max(0, cols - text.length))}`],
-      cursor: { column: text.length, row: 0, visible: true },
+      lines: ["─".repeat(cols), body, "─".repeat(cols)],
+      cursor: { column: text.length, row: 1, visible: true },
+      contentRow: 1,
     };
   }
 }

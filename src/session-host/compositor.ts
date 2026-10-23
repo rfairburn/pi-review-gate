@@ -23,6 +23,8 @@ export interface HostLayout {
 	readonly cols: number;
 	readonly rows: number;
 	readonly headerRows: number;
+	/** Optional host-owned notification band; never native child content. */
+	readonly banner?: HostPaneRect;
 	readonly native: HostPaneRect;
 	readonly sidebar?: HostPaneRect;
 	readonly dividerColumn?: number;
@@ -45,6 +47,8 @@ export interface RenderedSidebar {
 export interface ComposeHostFrameOptions {
 	readonly main?: TerminalFrame;
 	readonly sidebar?: RenderedSidebar;
+	/** Bounded notification rows in layout.banner; this never changes focus. */
+	readonly banner?: RenderedSidebar;
 	/** Host form/picker or explicitly placed Saved-delete confirmation for layout.form. */
 	readonly form?: RenderedSidebar;
 	/** Typed graphics from the actual live native owner; never child escape bytes. */
@@ -79,12 +83,22 @@ export function computeHostLayout(
 		readonly focus: HostFocus;
 		/** Display-only placement; focus remains `confirm` and input stays host-owned. */
 		readonly savedDeleteConfirmation?: boolean;
+		/** Explicit security-sensitive host confirmation, such as peer consent. */
+		readonly hostConfirmation?: boolean;
+		/** Reserve visible notification space without taking the child's input focus. */
+		readonly bannerRows?: number;
 	},
 ): HostLayout {
 	validateDimension(cols, "cols");
 	validateDimension(rows, "rows");
 
-	const headerRows = rows >= 2 ? 1 : 0;
+	const titleRows = rows >= 2 ? 1 : 0;
+	const requestedBannerRows = options.bannerRows ?? 0;
+	if (!Number.isSafeInteger(requestedBannerRows) || requestedBannerRows < 0) {
+		throw new Error("Host banner rows must be a nonnegative safe integer");
+	}
+	const bannerRows = Math.min(requestedBannerRows, Math.max(0, rows - titleRows - 1));
+	const headerRows = titleRows + bannerRows;
 	const contentRows = Math.max(1, rows - headerRows);
 	const sidebarOverlay = options.sidebarVisible && cols < SIDEBAR_WIDTH + DIVIDER_WIDTH + MIN_NATIVE_WIDTH;
 	const native: HostPaneRect = {
@@ -98,12 +112,14 @@ export function computeHostLayout(
 		cols: number;
 		rows: number;
 		headerRows: number;
+		banner?: HostPaneRect;
 		native: HostPaneRect;
 		sidebar?: HostPaneRect;
 		dividerColumn?: number;
 		form?: HostPaneRect;
 		sidebarOverlay: boolean;
 	} = { cols, rows, headerRows, native, sidebarOverlay };
+	if (bannerRows > 0) layout.banner = { column: 0, row: titleRows, cols, rows: bannerRows };
 
 	if (options.sidebarVisible) {
 		if (sidebarOverlay) {
@@ -116,8 +132,8 @@ export function computeHostLayout(
 			layout.sidebar = { column: 0, row: headerRows, cols: SIDEBAR_WIDTH, rows: contentRows };
 			layout.dividerColumn = SIDEBAR_WIDTH;
 			if (options.focus === "form"
-				|| (options.focus === "confirm" && options.savedDeleteConfirmation === true)) {
-				// Forms and only the explicitly selected Saved-delete confirmation
+				|| (options.focus === "confirm" && (options.savedDeleteConfirmation === true || options.hostConfirmation === true))) {
+				// Forms and only an explicitly selected host confirmation
 				// replace the native pane; the roster stays left and the child keeps
 				// its geometry. Placement never changes the actual focused owner.
 				layout.form = { ...native };
@@ -176,6 +192,14 @@ export function composeHostFrame(layout: HostLayout, options: ComposeHostFrameOp
 		lines[outerRow] = panelRow(mainLines[row], layout.native.cols);
 	}
 
+	if (layout.banner !== undefined) {
+		for (let row = 0; row < layout.banner.rows; row += 1) {
+			const outerRow = layout.banner.row + row;
+			if (outerRow < 0 || outerRow >= layout.rows) continue;
+			lines[outerRow] = panelRow(options.banner?.lines[row], layout.banner.cols);
+		}
+	}
+
 	// Geometry produced by computeHostLayout covers every output column and
 	// row. Keep even malformed externally supplied layouts bounded at output.
 	for (let row = 0; row < lines.length; row += 1) {
@@ -217,19 +241,30 @@ export function composeHostFrame(layout: HostLayout, options: ComposeHostFrameOp
 		}
 	}
 
-	const graphics = options.nativeGraphics
+	const graphics = options.nativeGraphics !== undefined
 		&& options.main !== undefined
-		&& options.main.cols === layout.native.cols
-		&& options.main.rows === layout.native.rows
-		&& options.nativeGraphics.pane.column === layout.native.column
-		&& options.nativeGraphics.pane.row === layout.native.row
-		&& options.nativeGraphics.pane.cols === layout.native.cols
-		&& options.nativeGraphics.pane.rows === layout.native.rows
+		&& drawnContentMatchesLayer(options.main, options.nativeGraphics.pane, layout.native)
 		&& layout.form === undefined
 		&& !(layout.sidebarOverlay && layout.sidebar !== undefined && options.focus !== "main")
 		? options.nativeGraphics
 		: undefined;
 	return { lines, cursor, ...(graphics ? { graphics } : {}) };
+}
+
+/**
+ * A graphics layer is projected only into the rectangle its own frame actually
+ * filled. A session smaller than the native pane (#474) is drawn at the pane's
+ * top-left corner and padded, so that content rectangle — not the whole pane —
+ * bounds the layer, its images, and their fallback text. A layer claiming more
+ * than the frame drew, a frame larger than the pane (which composition clips),
+ * or malformed bounds keeps no image owner.
+ */
+function drawnContentMatchesLayer(main: TerminalFrame, layer: HostPaneRect, native: HostPaneRect): boolean {
+	return Number.isSafeInteger(main.cols) && Number.isSafeInteger(main.rows)
+		&& main.cols >= 1 && main.rows >= 1
+		&& main.cols <= native.cols && main.rows <= native.rows
+		&& layer.column === native.column && layer.row === native.row
+		&& layer.cols === main.cols && layer.rows === main.rows;
 }
 
 function validateDimension(value: number, label: "cols" | "rows"): void {

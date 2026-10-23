@@ -631,7 +631,7 @@ function holdAgentDirectory(agentDir) {
 // Canonical per-agent coordination mutex (atomically published, identity-bearing)
 // ---------------------------------------------------------------------------
 const crypto = require("node:crypto");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawn } = require("node:child_process");
 
 const LINUX_BOOT_ID = "/proc/sys/kernel/random/boot_id";
 const LINUX_STAT = "/proc/stat";
@@ -666,6 +666,106 @@ function linuxBootIdentity() {
   return "";
 }
 
+/** The native hard cap of one targeted darwin `ps` query. */
+const DARWIN_QUERY_CAP_MS = 5_000;
+/** The native hard cap of one targeted Windows PowerShell query. */
+const WIN32_QUERY_CAP_MS = 10_000;
+/** The one PowerShell script that renders a `win32:` start token. */
+const WIN32_OWNER_QUERY_SCRIPT = "& { param([int]$OwnerPid) try { $p = Get-Process -Id $OwnerPid -ErrorAction Stop; "
+  + "[Console]::Out.Write('win32:' + $p.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)) } "
+  + "catch { exit 2 } }";
+
+/** `linux:<boot identity>:<starttime ticks>` for one pid, read without any child. */
+function linuxOwnerIdentity(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    // `comm` may contain spaces and parentheses: parse after the last ")".
+    const close = stat.lastIndexOf(")");
+    if (close < 0) return "";
+    const fields = stat.slice(close + 1).trim().split(/\s+/u);
+    const starttime = fields[19];
+    if (!starttime || !/^[0-9]{1,20}$/u.test(starttime)) return "";
+    const boot = linuxBootIdentity();
+    if (!boot) return "";
+    return `linux:${boot}:${starttime}`;
+  } catch {
+    return "";
+  }
+}
+
+/** Render one `ps lstart` output as the exact `darwin:` token, or "" when unusable. */
+function darwinOwnerToken(output) {
+  const token = String(output).replace(/\s+/gu, " ").trim();
+  return token.length > 0 && token.length <= MAX_COORDINATION_BYTES - 48 ? `darwin:${token}` : "";
+}
+
+/** Render one PowerShell output as the exact `win32:` token, or "" when unusable. */
+function win32OwnerToken(output) {
+  const token = String(output).trim();
+  return /^win32:.{4,}$/u.test(token) && token.length <= MAX_COORDINATION_BYTES - 48 ? token : "";
+}
+
+/** The darwin `ps` PATH lookup, kept out of the bounded helper path on purpose. */
+function resolvePsByShell() {
+  try {
+    return execFileSync("sh", ["-c", "command -v ps"], { encoding: "utf8", timeout: DARWIN_QUERY_CAP_MS }).trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The exact per-platform targeted single-pid query for one validated numeric
+ * pid: the same argv, environment, native hard cap, and token validator that
+ * `ownerStartIdentity` runs, so an asynchronous helper can never invent a
+ * different identity format for the same process. `allowShellLookup` keeps the
+ * PATH `ps` lookup out of the bounded helper path, where a synchronous fallback
+ * fork is not allowed. Returns undefined when the platform has no helper command
+ * at all: Linux answers from `/proc` without a child, and an unknown platform
+ * has no query.
+ */
+function ownerIdentityPlan(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  if (process.platform === "darwin") {
+    const ps = standardBinary(["/bin/ps", "/usr/bin/ps"]) || (options.allowShellLookup === true ? resolvePsByShell() : undefined);
+    if (!ps) return undefined;
+    return {
+      command: ps,
+      args: ["-p", String(pid), "-o", "lstart="],
+      // `ps lstart` renders in the caller's timezone and locale. The token is
+      // compared byte for byte across the CJS, TypeScript host, and POSIX
+      // paths and is also the owner-birth evidence, so the query itself is
+      // pinned to UTC and the C locale instead of relying on the caller's.
+      env: { ...process.env, TZ: "UTC0", LC_ALL: "C", LANG: "C" },
+      capMs: DARWIN_QUERY_CAP_MS,
+      windowsHide: false,
+      token: darwinOwnerToken,
+    };
+  }
+  if (process.platform === "win32") {
+    // The existing native Windows PowerShell facility queries exactly one known
+    // numeric pid; the value is validated digits and passed as a fixed argv entry,
+    // so no shell string is ever composed. Bounded and non-interactive.
+    const powershell = standardBinary([
+      `${process.env.SystemRoot || "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+      `${process.env.SystemRoot || "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\pwsh.exe`,
+    ]);
+    if (!powershell) return undefined;
+    return {
+      command: powershell,
+      args: [
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-Command", WIN32_OWNER_QUERY_SCRIPT, String(pid),
+      ],
+      env: undefined,
+      capMs: WIN32_QUERY_CAP_MS,
+      windowsHide: true,
+      token: win32OwnerToken,
+    };
+  }
+  return undefined;
+}
+
 /**
  * Target single-pid process-start token used as the owner-lifetime identity, in
  * one exact per-platform format so a writer and a reader agree byte for byte:
@@ -681,81 +781,28 @@ function linuxBootIdentity() {
  *   its explicit UTC offset.
  * Always exactly one pid, never a process census, and no third-party package.
  * An empty result means the identity genuinely cannot be established.
+ *
+ * This call is synchronous and can take hundreds of milliseconds on a busy
+ * machine, so a caller with a short bounded wait must not run it inline: use
+ * `startOwnerIdentityProbe`, which asks the same query through one owned helper.
  */
 function ownerStartIdentity(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return "";
-  if (process.platform === "linux") {
-    try {
-      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-      // `comm` may contain spaces and parentheses: parse after the last ")".
-      const close = stat.lastIndexOf(")");
-      if (close < 0) return "";
-      const fields = stat.slice(close + 1).trim().split(/\s+/u);
-      const starttime = fields[19];
-      if (!starttime || !/^[0-9]{1,20}$/u.test(starttime)) return "";
-      const boot = linuxBootIdentity();
-      if (!boot) return "";
-      return `linux:${boot}:${starttime}`;
-    } catch {
-      return "";
-    }
+  if (process.platform === "linux") return linuxOwnerIdentity(pid);
+  const plan = ownerIdentityPlan(pid, { allowShellLookup: true });
+  if (plan === undefined) return "";
+  const options = {
+    encoding: "utf8",
+    timeout: plan.capMs,
+    stdio: ["ignore", "pipe", "ignore"],
+    windowsHide: plan.windowsHide === true,
+  };
+  if (plan.env !== undefined) options.env = plan.env;
+  try {
+    return plan.token(execFileSync(plan.command, plan.args, options));
+  } catch {
+    return "";
   }
-  if (process.platform === "darwin") {
-    const ps = standardBinary(["/bin/ps", "/usr/bin/ps"])
-      || (() => {
-        try {
-          return execFileSync("sh", ["-c", "command -v ps"], { encoding: "utf8", timeout: 5_000 }).trim() || undefined;
-        } catch {
-          return undefined;
-        }
-      })();
-    if (!ps) return "";
-    try {
-      const output = execFileSync(ps, ["-p", String(pid), "-o", "lstart="], {
-        encoding: "utf8",
-        timeout: 5_000,
-        stdio: ["ignore", "pipe", "ignore"],
-        // `ps lstart` renders in the caller's timezone and locale. The token is
-        // compared byte for byte across the CJS, TypeScript host, and POSIX
-        // paths and is also the owner-birth evidence, so the query itself is
-        // pinned to UTC and the C locale instead of relying on the caller's.
-        env: { ...process.env, TZ: "UTC0", LC_ALL: "C", LANG: "C" },
-      });
-      const token = String(output).replace(/\s+/gu, " ").trim();
-      return token.length > 0 && token.length <= MAX_COORDINATION_BYTES - 48 ? `darwin:${token}` : "";
-    } catch {
-      return "";
-    }
-  }
-  if (process.platform === "win32") {
-    // The existing native Windows PowerShell facility queries exactly one known
-    // numeric pid; the value is validated digits and passed as a fixed argv entry,
-    // so no shell string is ever composed. Bounded and non-interactive.
-    const powershell = standardBinary([
-      `${process.env.SystemRoot || "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
-      `${process.env.SystemRoot || "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\pwsh.exe`,
-    ]);
-    if (!powershell) return "";
-    const script = "& { param([int]$OwnerPid) try { $p = Get-Process -Id $OwnerPid -ErrorAction Stop; "
-      + "[Console]::Out.Write('win32:' + $p.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)) } "
-      + "catch { exit 2 } }";
-    try {
-      const output = execFileSync(powershell, [
-        "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-        "-Command", script, String(pid),
-      ], {
-        encoding: "utf8",
-        timeout: 10_000,
-        stdio: ["ignore", "pipe", "ignore"],
-        windowsHide: true,
-      });
-      const token = String(output).trim();
-      return /^win32:.{4,}$/u.test(token) && token.length <= MAX_COORDINATION_BYTES - 48 ? token : "";
-    } catch {
-      return "";
-    }
-  }
-  return "";
 }
 
 // This process's own owner identity. The token is immutable once established, so
@@ -779,6 +826,243 @@ function ownOwnerIdentity() {
 }
 // Learn this process's identity once at load; a failure here is retried above.
 OWN_OWNER_IDENTITY_CACHE = ownerStartIdentity(process.pid);
+
+// ---------------------------------------------------------------------------
+// Bounded owned owner-identity probe (asynchronous, one helper at a time)
+// ---------------------------------------------------------------------------
+
+/** Bounded stdout collected from one owned identity helper. */
+const OWNER_PROBE_MAX_BYTES = 4 * 1024;
+/**
+ * Upper bound on the delay between a helper's first signal and the hard kill that
+ * escalates it. The actual escalation is also capped by the caller's absolute
+ * confirmation deadline, so it never lands outside the caller's own budget.
+ */
+const OWNER_PROBE_ESCALATE_MS = 250;
+
+/**
+ * The ONE owned identity helper alive in this process.
+ *
+ * This is owned-process resource accounting and nothing else: not a birth
+ * cache, not a lock registry, not an authority lease, and it holds no trust for
+ * any pid. A busy slot means "make no new allocation" — never "the observed
+ * owner is live" and never "the observed owner is stale". Only the helper's own
+ * positive `close` clears the slot, so a helper whose close cannot be confirmed
+ * stays visible as "unconfirmed" and keeps both new probes and any dependent
+ * lock success refused until the real close lands.
+ */
+let ownerProbeSlot;
+
+/**
+ * "free" | "pending" | "unconfirmed" for the one owned helper slot.
+ *
+ * `unconfirmed` is a reading of the caller's absolute clock, not only of the
+ * confirmation timer's callback: a helper still pending once its stored
+ * confirmation deadline has passed IS unconfirmed even inside the same turn,
+ * before that timer gets dispatched. A busy machine can cross the deadline during
+ * synchronous work, and a caller that asks this question in that same turn must not
+ * be told "pending" and handed a dependent lock success beside a helper whose
+ * confirmation window has closed. The reading is derived and read-only: it clears
+ * nothing, signals nothing, and grants no identity, no deletion authority, and no
+ * new allocation. Only the helper's own real `close` (through `finish`) leaves
+ * this state.
+ */
+function ownerProbeSlotState() {
+  const slot = ownerProbeSlot;
+  if (slot === undefined) return "free";
+  if (slot.state === "pending" && Date.now() >= slot.confirmDeadline) return "unconfirmed";
+  return slot.state;
+}
+
+/**
+ * Start ONE owned, cancellable owner-identity query for exactly one numeric pid
+ * without blocking the caller's wait loop.
+ *
+ * Options are ABSOLUTE `Date.now()` deadlines, because a relative timer started
+ * after the helper spawns cannot enforce a caller's budget: a delayed callback
+ * would silently overrun it.
+ * - `queryDeadlineMs` is when the helper must be signalled and after which its
+ *   answer is rejected even if it arrives. It can only SHORTEN the platform's
+ *   native hard cap (5s darwin, 10s win32); no caller deadline expands it, and a
+ *   deadline that is already spent — or one that cannot cover the query it offers
+ *   alongside a confirmation deadline — allocates nothing and answers unknown
+ *   rather than being stretched to make room.
+ * - `confirmDeadlineMs` is when the caller stops being able to wait at all. The
+ *   helper's SIGKILL escalation and the slot's "unconfirmed" transition both
+ *   happen at or before it, so termination, escalation, and confirmation all fit
+ *   inside the caller's own budget. Timer expiry is never close evidence: the
+ *   slot stays "unconfirmed" until the real `close` event clears it.
+ * - A verdict exists ONLY after that positive close. A canceled, late, expired,
+ *   oversize, nonzero, or unparseable helper is UNKNOWN (`identity: ""`), never
+ *   a stale verdict, because an unverified owner must stay honored.
+ * - `cancel()` signals only this probe's own ChildProcess. The queried pid is
+ *   never signalled, directly or as a process group.
+ *
+ * Returns `{ status: "settled", identity }` when the platform answers without
+ * allocating a child (Linux reads one `/proc` entry) or has no usable query at
+ * all, `{ status: "busy" }` when the single helper slot is already held — make
+ * no new allocation and honor the observed owner — and `{ status: "started",
+ * probe }` otherwise.
+ */
+function startOwnerIdentityProbe(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return { status: "settled", identity: "" };
+  if (ownerProbeSlot !== undefined) return { status: "busy" };
+  const plan = ownerIdentityPlan(pid, { allowShellLookup: false });
+  if (plan === undefined) {
+    // There is no owned helper command for this platform. Linux answers from one
+    // `/proc` entry with no child at all; darwin and win32 without their standard
+    // binary are an UNKNOWN birth. The synchronous `ownerStartIdentity` is
+    // deliberately NOT consulted here: it can fork a shell and a second helper
+    // with native caps far past any bounded wait, which is the inline gating this
+    // probe exists to remove.
+    return { status: "settled", identity: process.platform === "linux" ? linuxOwnerIdentity(pid) : "" };
+  }
+  const startedAt = Date.now();
+  const nativeDeadline = startedAt + plan.capMs;
+  const queryDeadline = Number.isFinite(options.queryDeadlineMs)
+    ? Math.min(options.queryDeadlineMs, nativeDeadline)
+    : nativeDeadline;
+  const confirmDeadline = Number.isFinite(options.confirmDeadlineMs)
+    ? Math.min(options.confirmDeadlineMs, nativeDeadline)
+    : queryDeadline;
+  if (queryDeadline <= startedAt || confirmDeadline < queryDeadline) {
+    // The budget this caller offered is already spent, or it cannot cover the
+    // query it is asking about. No helper is allocated and no deadline is stretched
+    // to make room: an expired budget simply supplies no identity authority.
+    return { status: "settled", identity: "" };
+  }
+  let child;
+  try {
+    child = spawn(plan.command, plan.args, {
+      env: plan.env === undefined ? process.env : plan.env,
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: plan.windowsHide === true,
+    });
+  } catch {
+    // No helper could be created at all: that is an unknown birth, not evidence
+    // of staleness, and nothing was allocated.
+    return { status: "settled", identity: "" };
+  }
+
+  // The slot carries the EFFECTIVE confirmation deadline — the same native-capped
+  // value the confirmation timer is installed with — so the status reading above
+  // and the timer below answer to one absolute clock instead of to dispatch order.
+  const slot = { state: "pending", confirmDeadline };
+  let verdict;
+  let signaled = false;
+  let oversize = false;
+  let failed = false;
+  let capTimer;
+  let confirmTimer;
+  let escalateTimer;
+  let settle;
+  const close = new Promise((resolve) => { settle = resolve; });
+  const chunks = [];
+  let bytes = 0;
+
+  const signalHelper = () => {
+    // Only this probe's own helper is ever signalled: never the queried pid, a
+    // process group, or any historical pid.
+    signaled = true;
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // Already gone.
+    }
+    if (escalateTimer === undefined) {
+      // The hard kill is derived from the caller's absolute confirmation
+      // deadline, never from a fixed delay alone: escalation can never land
+      // outside the budget the caller already committed.
+      const escalateAt = Math.min(Date.now() + OWNER_PROBE_ESCALATE_MS, confirmDeadline);
+      escalateTimer = setTimeout(() => {
+        escalateTimer = undefined;
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }, Math.max(0, escalateAt - Date.now()));
+    }
+  };
+  // The one point at which a verdict exists, and the only thing that frees the slot.
+  const finish = (identity, reason) => {
+    if (verdict !== undefined) return;
+    verdict = { identity, reason };
+    if (capTimer !== undefined) clearTimeout(capTimer);
+    if (confirmTimer !== undefined) clearTimeout(confirmTimer);
+    if (escalateTimer !== undefined) clearTimeout(escalateTimer);
+    slot.state = "closed";
+    if (ownerProbeSlot === slot) ownerProbeSlot = undefined;
+    settle(verdict);
+  };
+  const handle = {
+    get state() { return slot.state; },
+    get verdict() { return verdict; },
+    close,
+    cancel() {
+      if (verdict === undefined) signalHelper();
+    },
+  };
+  ownerProbeSlot = slot;
+  // Delays are computed against the clock at installation, never against the
+  // timestamp captured before `spawn`: setup time must not extend the caller's
+  // absolute deadlines.
+  capTimer = setTimeout(() => {
+    capTimer = undefined;
+    signalHelper();
+  }, Math.max(0, queryDeadline - Date.now()));
+  confirmTimer = setTimeout(() => {
+    confirmTimer = undefined;
+    // Expiry is not close evidence: the helper is escalated and the slot stays
+    // visibly unconfirmed until the real close arrives.
+    if (slot.state === "pending") slot.state = "unconfirmed";
+    signalHelper();
+  }, Math.max(0, confirmDeadline - Date.now()));
+  if (child.stdout !== null) {
+    child.stdout.on("data", (chunk) => {
+      bytes += chunk.length;
+      if (bytes > OWNER_PROBE_MAX_BYTES) {
+        if (!oversize) {
+          oversize = true;
+          signalHelper();
+        }
+        return;
+      }
+      chunks.push(chunk);
+    });
+  }
+  child.on("error", () => {
+    failed = true;
+    if (child.pid === undefined) {
+      // The helper process was never created, so there is nothing to reap: this
+      // is a positive settlement, not an unconfirmed wait.
+      finish("", "failed");
+      return;
+    }
+    signalHelper();
+  });
+  child.on("close", (code, signalName) => {
+    if (Date.now() > queryDeadline) {
+      // An answer that arrives after the effective query deadline is rejected
+      // even when its own timers were delayed: the caller's budget is absolute,
+      // and a late token is not evidence about a record still being waited on.
+      finish("", "late");
+      return;
+    }
+    if (failed || oversize || signaled || code !== 0 || signalName !== null) {
+      finish("", failed ? "failed" : oversize ? "oversize" : signaled ? "canceled" : "exited");
+      return;
+    }
+    let identity = "";
+    try {
+      identity = plan.token(Buffer.concat(chunks).toString("utf8"));
+    } catch {
+      identity = "";
+    }
+    finish(identity, identity === "" ? "unparseable" : "ok");
+  });
+  return { status: "started", probe: handle };
+}
 
 function coordinationRecordBody(pid, identity) {
   return `${pid}\n${identity}\n`;
@@ -1445,6 +1729,14 @@ module.exports = {
     prepareCoordinationCandidate,
     readCoordinationRecord,
     ownerStartIdentity,
+    /**
+     * The bounded owned asynchronous birth probe the cleanup-lock wait uses: at
+     * most one helper alive, a verdict that exists only after that helper's
+     * positive close, and a slot that reads "unconfirmed" until the real close
+     * lands. Resource accounting only — no cache, registry, or authority.
+     */
+    startOwnerIdentityProbe,
+    ownerProbeSlotState,
     ownOwnerIdentity: () => ownOwnerIdentity(),
     /**
      * Narrow seam for the deterministic mutex error-handling regression: replace

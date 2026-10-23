@@ -29,6 +29,12 @@ const DEFAULT_NAME_MAX_BYTES = MAX_RENAME_NAME_BYTES;
 // enclosed grapheme and the following text stay, and everything else still
 // passes through the unchanged fail-closed single-line sanitizer.
 const NATIVE_FAKE_CURSOR_WRAPPERS = nativeFakeCursorWrappers();
+/**
+ * The pinned public Editor renders `render(width)` as: top border, one row per
+ * visible layout line, bottom border, then any autocomplete rows. Its editable
+ * body therefore always starts at row 1, independently of the caret position.
+ */
+const NATIVE_EDITOR_CONTENT_ROW = 1;
 const PATH_MAX_CODE_POINTS = 2048;
 const MAX_PASTE_BYTES = 8192;
 const BRACKETED_PASTE_START = "\x1b[200~";
@@ -105,6 +111,18 @@ export interface SessionHostFieldRender {
   readonly lines: string[];
   /** Zero-based cursor position. It is hidden if the native marker is outside the bounded frame. */
   readonly cursor: { readonly column: number; readonly row: number; readonly visible: boolean };
+  /**
+   * Zero-based index into `lines` where the Editor's editable body starts.
+   *
+   * The pinned public Editor always renders its top border first (a full-width
+   * rule, or a scroll-indicator border when the value has scrolled) and its
+   * editable rows after it, so the body row is stable and never depends on where
+   * the caret currently sits. A host that labels the field places its label
+   * beside this row. The row is present in `lines` only when the bounded frame
+   * had room for it; a frame clipped to the border alone reports a `contentRow`
+   * outside `lines`, which is not a renderable field.
+   */
+  readonly contentRow: number;
 }
 
 /**
@@ -330,7 +348,11 @@ export class SessionHostTextField {
     this.tui.requestRender();
   }
 
-  /** Bounded native render. CURSOR_MARKER is converted to a cursor DTO and never returned in pane text. */
+  /**
+   * Bounded native render. CURSOR_MARKER becomes the cursor DTO and never
+   * appears in pane text; `contentRow` reports the Editor's own editable body
+   * row so a labeling host never has to guess it from the caret.
+   */
   render(cols: number, rows: number): SessionHostFieldRender {
     validateDimension(cols, "cols");
     validateDimension(rows, "rows");
@@ -362,7 +384,7 @@ export class SessionHostTextField {
       const used = Math.min(visibleWidth(clipped), cols);
       lines.push(clipped + " ".repeat(cols - used));
     }
-    return { lines, cursor };
+    return { lines, cursor, contentRow: NATIVE_EDITOR_CONTENT_ROW };
   }
 
   /** Release host redraw and keybinding ownership; no TUI or terminal stop/start is performed. */

@@ -224,7 +224,10 @@ async function waitForPersistedSavedRoster(
     if (filename === null || filename.toString() === basename(path)) signal.notify();
   });
   try {
-    await signal.waitFor(() => {
+    // The roster predicate re-reads the durable roster file, so it is also
+    // re-evaluated on the shared bounded recheck. Predicate, timeout, description,
+    // roster identity checks, and the original deadline are unchanged.
+    await signal.waitForRecheck(() => {
       if (!existsSync(path)) return false;
       const roster = readPersistedRoster(path);
       return roster.version === 1 && roster.activeSlotId !== undefined
@@ -244,7 +247,10 @@ async function waitForOwnedFile(path: string, description: string): Promise<void
     if (filename === null || filename.toString() === basename(path)) signal.notify();
   });
   try {
-    await signal.waitFor(() => existsSync(path), EVENT_TIMEOUT_MS, description);
+    // A landed proof file is a durable fact, so re-check it on the shared bounded
+    // recheck as well as on notification, with the same predicate, timeout, and
+    // original deadline.
+    await signal.waitForRecheck(() => existsSync(path), EVENT_TIMEOUT_MS, description);
   } finally {
     watcher.close();
   }
@@ -257,7 +263,10 @@ async function waitForFixtureJson(path: string, description: string): Promise<Re
     if (filename === null || filename.toString() === basename(path)) signal.notify();
   });
   try {
-    await signal.waitFor(() => existsSync(path), FIXTURE_TIMEOUT_MS, description);
+    // The fixture marker's existence is a durable fact and is re-read on the shared
+    // bounded recheck; the bounded size/type and JSON object checks below, the
+    // fixture timeout, and the original deadline are unchanged.
+    await signal.waitForRecheck(() => existsSync(path), FIXTURE_TIMEOUT_MS, description);
     const stats = lstatSync(path);
     assert.ok(stats.isFile() && !stats.isSymbolicLink() && stats.size <= 4096,
       `${description}: fixture marker is a bounded regular file`);
@@ -312,7 +321,11 @@ async function waitForAuthenticatedStoppedRecoverableTask(
     if (filename === null || filename.toString() === basename(manifestPath)) signal.notify();
   });
   try {
-    await signal.waitFor(() => {
+    // The manifest predicate re-reads and re-parses the durable execution record on
+    // every evaluation, so it also re-reads on the shared bounded recheck. The
+    // bounded size/type checks, state/generation acceptance, timeout, description,
+    // and the original deadline are unchanged.
+    await signal.waitForRecheck(() => {
       try {
         const stats = lstatSync(manifestPath);
         if (!stats.isFile() || stats.isSymbolicLink() || stats.size > 1024 * 1024) return false;

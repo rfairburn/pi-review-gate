@@ -134,6 +134,7 @@ import {
   processIsAlive,
   resolveRuntimePin,
 } from "./helpers/session-host-native-main-harness";
+import { waitForDurableReadyLeaf } from "./helpers/change-signal";
 import { hasFullWidthNativeEditorRule } from "./helpers/session-host-native-saved-main-harness";
 import {
   SIDEBAR_COLUMNS,
@@ -854,7 +855,11 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
   });
   state.closeProviderWatch = () => providerWatch.close();
   const waitForProvider = (predicate: (records: Array<Record<string, unknown>>) => boolean, description: string): Promise<void> =>
-    providerSignal.waitFor(() => predicate(readJsonl(providerJournalFile)), EVENT_TIMEOUT_MS, description);
+    // The scripted provider journal is a durable file appended by the native
+    // child, and this dedicated signal's only live trigger is its directory
+    // `fs.watch`, so readiness uses the shared durable recheck with the same
+    // predicate, deadline, and description.
+    providerSignal.waitForRecheck(() => predicate(readJsonl(providerJournalFile)), EVENT_TIMEOUT_MS, description);
   await waitForProvider((records) => records.some((record) => record.event === "auto_model_selected"),
     "the scripted provider auto-selects its model in the real native child");
 
@@ -909,7 +914,13 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
     // 2. Genuine service corroboration: wait for the listener's own readiness
     // event, inspect the leaf through a bounded readonly descriptor, then make
     // one real bounded loopback client connection and read its answer.
-    await readySignal.waitFor(() => existsSync(readyPath), EVENT_TIMEOUT_MS,
+    // The same `existsSync` predicate, the same EVENT_TIMEOUT_MS deadline, and the
+    // same `fs.watch` fast path, on the shared durable-readiness core: a leaf the
+    // job created but whose watcher event never arrived is still observed, while a
+    // leaf that never appears still fails the original deadline. Everything after
+    // this wait - the bounded leaf inspection, pid/port checks, the real loopback
+    // connection, and the exact-handle ShellStop settlement - is unchanged.
+    await waitForDurableReadyLeaf(readySignal, readyPath, EVENT_TIMEOUT_MS,
       "the owned job listener publishes its readiness leaf");
     const initialInspection = inspectReadinessLeaf(readyPath);
     const readiness = initialInspection.record;
@@ -965,7 +976,13 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
     // callback succeeds. This proves real service-handle completion, not a
     // kernel exit/code claim for an adopted service PID. Public shell `done`
     // after SIGTERM can map a signalled wrapper's null exit code to zero.
-    await readySignal.waitFor(() => existsSync(completionPath), EVENT_TIMEOUT_MS,
+    // The same `existsSync`-shaped leaf fact, the same EVENT_TIMEOUT_MS bound, and
+    // the same description, on the shared durable-leaf core: the completion leaf
+    // is a durable file whose only live trigger is the service-directory
+    // `fs.watch`, so a missed notification cannot strand an already-created leaf.
+    // Everything after this wait (bounded leaf inspection, pid/port identity, and
+    // the retained readiness-leaf checks) is unchanged.
+    await waitForDurableReadyLeaf(readySignal, completionPath, EVENT_TIMEOUT_MS,
       "the original owned service listener positively closes before completion evidence is published");
     const completed = inspectReadinessLeaf(completionPath, "closed");
     assert.equal(completed.record.pid, readiness.pid, "completion belongs to the same original service binding");

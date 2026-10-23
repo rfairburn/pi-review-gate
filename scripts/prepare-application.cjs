@@ -84,6 +84,15 @@ const INPUT_HASH_CHUNK_BYTES = 64 * 1024;
 const PREPARE_LOCK_WAIT_MS = 15 * 60 * 1000;
 const CLEANUP_LOCK_WAIT_MS = 2_000;
 const LOCK_POLL_MS = 100;
+/** The cleanup lock's own poll cadence, unchanged. */
+const CLEANUP_LOCK_POLL_MS = LOCK_POLL_MS / 2;
+/**
+ * The abort/escalation/join reserve held back INSIDE the existing cleanup wait
+ * for the one owned birth probe: two of the cleanup poll ticks above. The probe
+ * can never spend more than the remaining wait minus this reserve, so the wait
+ * always keeps enough of its own budget to take the lock or give up cleanly.
+ */
+const CLEANUP_LOCK_PROBE_RESERVE_MS = CLEANUP_LOCK_POLL_MS * 2;
 const DDGS_VERSION = "9.16.0";
 const MAX_CONSUMER_LEASES = 256;
 
@@ -988,6 +997,57 @@ function ownerRecordIsLive(record) {
 }
 
 /**
+ * One atomic publication attempt of a complete lock record: the body is written
+ * and fsynced in a private candidate, then published with a no-overwrite hard
+ * link. Returns `{ status: "published", identity }` when this process owns the
+ * entry, `{ status: "raced" }` when another record owns it, and
+ * `{ status: "failed" }` for a real filesystem error. Both lock waits share this
+ * one protocol so their ownership semantics cannot drift apart.
+ */
+function publishLockRecord(file, directory, body) {
+  const candidate = path.join(directory, `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(8).toString("hex")}`);
+  try {
+    const fd = fs.openSync(candidate, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, body);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    // Atomic no-overwrite publication. EEXIST means somebody already owns it.
+    fs.linkSync(candidate, file);
+    const candidateStats = fs.lstatSync(candidate, { bigint: true });
+    const publishedStats = fs.lstatSync(file, { bigint: true });
+    if (candidateStats.dev !== publishedStats.dev || candidateStats.ino !== publishedStats.ino) {
+      // The link target was replaced between our link and our check: this
+      // record is not the one at the canonical path, so we do not own it.
+      throw Object.assign(new Error("lock publication raced"), { code: "EEXIST" });
+    }
+    return { status: "published", identity: publishedStats };
+  } catch (error) {
+    if (error !== null && typeof error === "object" && error.code === "EEXIST") return { status: "raced" };
+    return { status: "failed" };
+  } finally {
+    removeQuietly(candidate);
+  }
+}
+
+/**
+ * Ownership of one published record. Release stays guarded by the identity
+ * observed at publication: dev/ino/size/mtime identify this exact record, and
+ * ctime is excluded because publishing the link itself legitimately changes it.
+ */
+function lockHandle(file, identity) {
+  return {
+    file,
+    identity,
+    release() {
+      if (sameObservedFile(file, identity, { ignoreCtime: true })) removeQuietly(file);
+    },
+  };
+}
+
+/**
  * Acquire one exclusive coordination file using the same complete-candidate +
  * atomic no-overwrite publication protocol as the session host's ownership
  * entry: the full `pid` + birth body is written and fsynced in a private
@@ -1004,42 +1064,9 @@ async function acquireLockFile(file, options = {}) {
   const directory = path.dirname(file);
   const body = lockRecord(process.pid, ownerBirthIdentity(process.pid));
   for (;;) {
-    const candidate = path.join(directory, `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(8).toString("hex")}`);
-    let publishedIdentity;
-    try {
-      const fd = fs.openSync(candidate, "wx", 0o600);
-      try {
-        fs.writeFileSync(fd, body);
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
-      }
-      // Atomic no-overwrite publication. EEXIST means somebody already owns it.
-      fs.linkSync(candidate, file);
-      const candidateStats = fs.lstatSync(candidate, { bigint: true });
-      const publishedStats = fs.lstatSync(file, { bigint: true });
-      if (candidateStats.dev !== publishedStats.dev || candidateStats.ino !== publishedStats.ino) {
-        // The link target was replaced between our link and our check: this
-        // record is not the one at the canonical path, so we do not own it.
-        throw Object.assign(new Error("lock publication raced"), { code: "EEXIST" });
-      }
-      publishedIdentity = publishedStats;
-    } catch (error) {
-      if (error.code !== "EEXIST") return null;
-    } finally {
-      removeQuietly(candidate);
-    }
-    if (publishedIdentity !== undefined) {
-      return {
-        file,
-        identity: publishedIdentity,
-        release() {
-          // Comparing dev/ino/size/mtime identifies this exact record; ctime is
-          // excluded because publishing the link itself legitimately changes it.
-          if (sameObservedFile(file, publishedIdentity, { ignoreCtime: true })) removeQuietly(file);
-        },
-      };
-    }
+    const attempt = publishLockRecord(file, directory, body);
+    if (attempt.status === "failed") return null;
+    if (attempt.status === "published") return lockHandle(file, attempt.identity);
     // Somebody owns the entry: reclaim only a provably abandoned record, and
     // only while the canonical path still holds exactly that observed file.
     const observed = observeSmallFile(file, 4096);
@@ -1052,6 +1079,270 @@ async function acquireLockFile(file, options = {}) {
     // Async wait: a same-process caller must never block the event loop (the
     // producer it is waiting for may be an in-process preparation in tests).
     await new Promise((resolve) => { setTimeout(resolve, pollMs); });
+  }
+}
+
+/**
+ * Ask the coordination module for the ONE bounded owned birth probe. The caller's
+ * ABSOLUTE deadlines are handed to the helper so its signal, escalation, and
+ * confirmation all land inside this same wait. A missing or failing seam simply
+ * means no query is available, which is honored exactly like an unavailable
+ * synchronous query: the observed record is preserved, never reclaimed.
+ */
+function startOwnerProbe(pid, queryDeadline, confirmDeadline) {
+  try {
+    const started = generations.coordinationInternals.startOwnerIdentityProbe(pid, {
+      queryDeadlineMs: queryDeadline,
+      confirmDeadlineMs: confirmDeadline,
+    });
+    return started === null || typeof started !== "object" ? { status: "unsupported" } : started;
+  } catch {
+    return { status: "unsupported" };
+  }
+}
+
+/**
+ * True while an owned helper this process started has a close that could not be
+ * confirmed. Lock success is fenced by it: this process never presents itself as
+ * the cleanup owner while a helper it launched may still be running.
+ */
+function ownerProbeUnconfirmed() {
+  try {
+    return generations.coordinationInternals.ownerProbeSlotState() === "unconfirmed";
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Revalidate one observed record — file identity AND content — immediately
+ * before an unlink that only a positively closed birth mismatch authorized, so a
+ * replacement published while the helper was running is never deleted.
+ */
+function observedRecordStillPresent(file, observed, record) {
+  if (sameObservedFile(file, observed.identity) !== true) return false;
+  const current = observeSmallFile(file, 4096);
+  if (current === null) return false;
+  const parsed = parseOwnerRecord(current.buffer);
+  return parsed !== null
+    && parsed.pid === record.pid
+    && parsed.birth === record.birth
+    && parsed.nonce === record.nonce;
+}
+
+/**
+ * The cleanup lock's bounded wait. Same canonical protocol, the same 2s budget
+ * and 50ms cadence, and the same identity-guarded release as `acquireLockFile`,
+ * with one difference: a foreign owner's targeted birth query runs as ONE owned
+ * asynchronous helper instead of gating the retry loop, so a holder that
+ * releases its lock is seen on the next atomic publication attempt rather than
+ * after a multi-hundred-millisecond synchronous `ps`/PowerShell call.
+ *
+ * One absolute deadline governs every branch, a stale reclaim included: no
+ * publication attempt, reclaim, or hand-back of success starts after it. Lock
+ * success is handed back only after EVERY helper this wait started — including one
+ * cancelled because its record was replaced — has positively closed, and an
+ * unknown, busy, late, or unconfirmed answer always preserves the observed record.
+ * A closed verdict is consumed once against the exact record it asked about and
+ * then retired, so a transient unknown can recover while budget remains; helper
+ * allocations remain serial and bounded by the poll cadence and deadline.
+ */
+async function acquireCleanupLockFile(file, options = {}) {
+  const waitMs = Number.isFinite(options.waitMs) ? options.waitMs : CLEANUP_LOCK_WAIT_MS;
+  if (!(waitMs > 0)) {
+    // Nothing can gate a wait that never happens: a zero-budget attempt stays on
+    // the ordinary path, which already answers immediately.
+    return acquireLockFile(file, options);
+  }
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : CLEANUP_LOCK_POLL_MS;
+  const deadline = Date.now() + waitMs;
+  const directory = path.dirname(file);
+  const body = lockRecord(process.pid, ownerBirthIdentity(process.pid));
+  /** The owned helper this wait is currently asking about, bound to one record. */
+  let probe;
+  /**
+   * Every helper this wait started and has not yet seen close. A cancelled helper
+   * stays here: cancelling is not closing, and an owned helper this process is
+   * still responsible for is never dropped on the floor while it is alive.
+   */
+  const openHelpers = new Set();
+
+  const pruneClosedHelpers = () => {
+    for (const handle of openHelpers) {
+      if (handle.state === "closed") openHelpers.delete(handle);
+    }
+  };
+
+  /** Stop depending on our own helpers. They stay owned until their close lands. */
+  const abandonProbe = () => {
+    if (probe !== undefined) {
+      probe.handle.cancel();
+      probe = undefined;
+    }
+    for (const handle of openHelpers) handle.cancel();
+    return null;
+  };
+
+  /**
+   * True only when every helper this wait started has positively closed by the
+   * absolute deadline, and no other helper in this process is unconfirmed.
+   */
+  async function helpersClosedBy(deadlineAt) {
+    pruneClosedHelpers();
+    const open = [...openHelpers];
+    probe = undefined;
+    if (open.length > 0) {
+      for (const handle of open) handle.cancel();
+      const remaining = Math.max(0, deadlineAt - Date.now());
+      // A positive close is the only confirmation; the reserve cannot become a
+      // grace period, because this race stops at the same absolute deadline.
+      // The deadline timer is cleared whichever side wins: `Promise.race` does not
+      // cancel its loser, and a referenced timer left behind after a prompt close
+      // would keep this process alive for the rest of the cleanup budget.
+      let joinTimer;
+      let confirmed;
+      try {
+        confirmed = await Promise.race([
+          Promise.all(open.map((handle) => handle.close)).then(() => true),
+          new Promise((resolveJoin) => {
+            joinTimer = setTimeout(() => resolveJoin(false), remaining);
+          }),
+        ]);
+      } finally {
+        if (joinTimer !== undefined) clearTimeout(joinTimer);
+      }
+      if (confirmed !== true) return false;
+      for (const handle of open) openHelpers.delete(handle);
+    }
+    return ownerProbeUnconfirmed() !== true;
+  }
+
+  /**
+   * The bounded owner decision for one observed record. It mirrors
+   * `ownerRecordIsLive` exactly except for the single case that needs a foreign
+   * birth query, which asks the owned helper instead of running the query
+   * inline: a pending, busy, or unknown answer HONORS the record just as an
+   * unavailable query does, and only a positively closed different birth for
+   * this exact record reports it stale. Never blocks and never queries inline.
+   * Returns "cheap" for the existing reclaim guard, "verified" for a positively
+   * closed mismatch, and "" while the owner may still be current.
+   */
+  function observedRecordIsStale(observed, record) {
+    if (record === null) return "cheap";
+    if (!processIsAlive(record.pid)) return "cheap";
+    // A record without a usable recorded birth is honored exactly as the generic
+    // owner decision honors it, THIS pid included: an unavailable recorded
+    // identity is not a mismatch, and a known identity of one's own never turns it
+    // into evidence of staleness.
+    if (typeof record.birth !== "string" || record.birth.length === 0) return "";
+    if (record.pid === process.pid) {
+      // This process's own record: its identity is memoized and never queried.
+      const own = ownBirthIdentity();
+      return own !== "" && own !== record.birth ? "cheap" : "";
+    }
+    const key = `${observed.identity.dev}:${observed.identity.ino}:${observed.identity.size}`
+      + `:${observed.identity.mtimeNs}:${record.pid}:${record.birth}:${record.nonce}`;
+    if (probe !== undefined && probe.key !== key) {
+      // The record was replaced while the helper was running. That verdict
+      // belongs to a different file and can never be applied here, so the helper
+      // is signalled — and it stays in `openHelpers`, because a cancelled helper
+      // is still an alive helper this process owns until its close lands.
+      probe.handle.cancel();
+      probe = undefined;
+    }
+    if (probe === undefined) {
+      const remaining = deadline - Date.now();
+      // Preserve the reserve inside this wait's absolute deadline.
+      if (remaining <= CLEANUP_LOCK_PROBE_RESERVE_MS) return "";
+      const started = startOwnerProbe(record.pid, deadline - CLEANUP_LOCK_PROBE_RESERVE_MS, deadline);
+      if (started.status === "settled") {
+        const identity = typeof started.identity === "string" ? started.identity : "";
+        if (identity === "") {
+          // Unknown is not stale; a later poll may retry while budget remains.
+          return "";
+        }
+        // A definitive answer obtained without allocating a child (Linux reads one
+        // `/proc` entry): compared against this exact record.
+        return identity !== record.birth ? "verified" : "";
+      }
+      // Busy means the one owned helper is already alive somewhere: make no new
+      // allocation and honor the observed owner.
+      if (started.status !== "started") return "";
+      probe = { handle: started.probe, key };
+      openHelpers.add(started.probe);
+      return "";
+    }
+    if (probe.handle.state !== "closed") return "";
+    // Consume this closed verdict exactly once, for this exact record, and retire
+    // the handle. A closed probe is never a cached answer for the rest of the
+    // wait: an unknown that was only transient must be able to recover on a later
+    // iteration while budget remains.
+    const closed = probe;
+    probe = undefined;
+    openHelpers.delete(closed.handle);
+    const verdict = closed.handle.verdict;
+    const identity = verdict !== undefined && typeof verdict.identity === "string" ? verdict.identity : "";
+    if (identity === "") return "";
+    return identity === record.birth ? "" : "verified";
+  }
+
+  for (;;) {
+    // The same absolute deadline governs every branch below: no attempt, reclaim,
+    // grace period, or final bonus publication happens after it.
+    if (Date.now() >= deadline) return abandonProbe();
+    pruneClosedHelpers();
+    const attempt = publishLockRecord(file, directory, body);
+    if (attempt.status === "failed") return abandonProbe();
+    if (attempt.status === "published") {
+      const handle = lockHandle(file, attempt.identity);
+      if (!(await helpersClosedBy(deadline))) {
+        // A helper this process started is still alive or unconfirmed: release
+        // exactly the record just published, under the ordinary identity guard,
+        // and stay unavailable rather than hand back uncontested ownership.
+        handle.release();
+        return abandonProbe();
+      }
+      if (Date.now() >= deadline) {
+        // Joining the helper consumed the last of the budget. Success is never
+        // handed back past the deadline, so this attempt gives its own record
+        // back and leaves the entry exactly as it found it.
+        handle.release();
+        return abandonProbe();
+      }
+      return handle;
+    }
+    // Somebody owns the entry.
+    const observed = observeSmallFile(file, 4096);
+    if (observed !== null) {
+      const record = parseOwnerRecord(observed.buffer);
+      const stale = observedRecordIsStale(observed, record);
+      if (stale !== "") {
+        // Reclaim only while the canonical path still holds exactly the record
+        // that was judged stale; a verified reclaim re-reads the content too.
+        const stillObserved = stale === "verified"
+          ? observedRecordStillPresent(file, observed, record)
+          : sameObservedFile(file, observed.identity);
+        if (stillObserved) {
+          // A reclaim earns no extra time either: it never starts past the
+          // deadline the wait was given.
+          if (Date.now() >= deadline) return abandonProbe();
+          removeQuietly(file);
+          // The entry is genuinely free now, so retry publication immediately
+          // instead of waiting out another tick.
+          continue;
+        }
+        // Somebody replaced the record between observing and unlinking, so
+        // nothing was reclaimed. Fall through to the ordinary poll tick rather
+        // than spinning publication attempts against a record that keeps moving.
+      }
+    }
+    if (typeof options.onWait === "function") options.onWait();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return abandonProbe();
+    // Async wait: a same-process caller must never block the event loop (the
+    // producer it is waiting for may be an in-process preparation in tests), and
+    // the last tick is trimmed to the deadline instead of sleeping past it.
+    await new Promise((resolve) => { setTimeout(resolve, Math.min(pollMs, remaining)); });
   }
 }
 
@@ -1152,11 +1443,15 @@ function leasedRoots(stateRoot) {
  * Serialize the short state transition (marker publication + lease snapshot)
  * against consumers publishing their leases. It is never held for a long
  * install/compile: the producer holds the separate preparation lock for that.
+ *
+ * This is the only caller of the bounded wait: its 2s budget is short enough
+ * that one synchronous foreign birth query could otherwise consume most of it
+ * and report a busy coordination state while the holder had already released.
  */
 function acquireCleanupLock(stateRoot, options = {}) {
-  return acquireLockFile(path.join(stateRoot, CLEANUP_LOCK_NAME), {
+  return acquireCleanupLockFile(path.join(stateRoot, CLEANUP_LOCK_NAME), {
     waitMs: CLEANUP_LOCK_WAIT_MS,
-    pollMs: LOCK_POLL_MS / 2,
+    pollMs: CLEANUP_LOCK_POLL_MS,
     // Narrow test/diagnostic seam: the wait is otherwise opaque, and a
     // coordination regression needs to observe exactly when a contender is
     // waiting without polling the filesystem.

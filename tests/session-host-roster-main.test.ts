@@ -6,7 +6,17 @@ import type { Writable } from "node:stream";
 import test from "node:test";
 
 import type { ComposedHostFrame } from "../src/session-host/compositor";
-import type { InstanceManagerOptions, NativeInstanceView, ShutdownResult, StopInstanceResult } from "../src/session-host/instances";
+import type {
+  InstanceManagerOptions,
+  NativeInstanceView,
+  SessionGeometry,
+  SessionViewerState,
+  SessionViewerUpdate,
+  SessionViewerUpdateResult,
+  ShutdownResult,
+  StopInstanceResult,
+} from "../src/session-host/instances";
+import { FakeViewerSeam } from "./session-host-viewer-fakes";
 import type { SessionHostFrameWriterOptions } from "../src/session-host/frame-writer";
 import type { StatusBroker } from "../src/session-host/broker";
 import type { ProfilePreparer } from "../src/session-host/profiles";
@@ -274,7 +284,36 @@ class FakeManager {
     return { status: "exited", forced: false };
   }
 
+  // --- #474 per-session viewer seam: viewer facts and per-row geometry only. ---
+  // This fixture's frames are size-independent, so the geometry it reports is its
+  // own record of what the host asked each row to be, never a second process store.
+  readonly geometry = new Map<string, { cols: number; rows: number }>();
+  readonly viewers = new FakeViewerSeam({
+    isViewable: (id) => {
+      const view = this.views.find((candidate) => candidate.id === id);
+      return view !== undefined && view.hasLiveProcess && (view.lifecycle === "alive" || view.lifecycle === "starting");
+    },
+    read: (id) => this.geometry.get(id) ?? { cols: this.options.cols ?? 80, rows: this.options.rows ?? 24 },
+    apply: (id, cols, rows) => { this.geometry.set(id, { cols, rows }); },
+  });
+
   resize(): void {}
+
+  openViewer(): SessionViewerState { return this.viewers.openViewer(); }
+
+  viewerState(viewerId: string): SessionViewerState | undefined { return this.viewers.viewerState(viewerId); }
+
+  sessionViewers(sessionId: string): SessionViewerState[] { return this.viewers.sessionViewers(sessionId); }
+
+  updateViewer(viewerId: string, update: SessionViewerUpdate): SessionViewerUpdateResult {
+    return this.viewers.updateViewer(viewerId, update);
+  }
+
+  closeViewer(viewerId: string): boolean { return this.viewers.closeViewer(viewerId); }
+
+  instanceGeometry(id: string): SessionGeometry | undefined { return this.viewers.instanceGeometry(id); }
+
+  setInitialGeometry(cols: number, rows: number): void { this.viewers.setInitialGeometry(cols, rows); }
 
   hasLiveProcesses(): boolean {
     if (this.brokenStateQueries && this.stopping) throw new Error("synthetic liveness failure");

@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { runInNewContext } from "node:vm";
 import test from "node:test";
+import ts from "typescript";
 
+import * as nativeInputCodec from "../src/session-host/native-input-origin";
+import * as hostProtocol from "../src/session-host/protocol";
 import { SidebarController } from "../src/session-host/sidebar";
 import { stripGeneratedSgr } from "../src/session-host/terminal-surface";
 
@@ -38,6 +42,169 @@ import { frameHeader, frameHeaderMatches, isSidebarFocusedFrame, parseRosterFram
 // not a physical-keyboard or full-CLI test. The question flow and live-child
 // SIGTERM/SIGHUP/quit regressions live in
 // tests/session-host-native-main-lifecycle.test.ts on the same harness.
+
+const observationBootstrap: hostProtocol.SessionHostBootstrap = {
+  version: 1, socketPath: "/owned/test.sock", token: "a".repeat(64),
+  instanceId: "11111111-1111-4111-8111-111111111111",
+  generation: "22222222-2222-4222-8222-222222222222", inputOriginFraming: 1,
+};
+
+/** Exercise the actual runner observer without executing main or loading a native addon. */
+function structuralObservation() {
+  const source = ts.createSourceFile(RUNNER_FIXTURE, readFileSync(RUNNER_FIXTURE, "utf8"),
+    ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const functions = source.statements.filter((node): node is ts.FunctionDeclaration =>
+    ts.isFunctionDeclaration(node) && node.name?.text === "installPtyExitObservation");
+  assert.equal(functions.length, 1);
+  const controls: Array<Record<string, unknown>> = [];
+  const writes: Array<{ receiver: unknown; args: unknown[] }> = [];
+  const result = {};
+  const state: { writeError?: Error; appendError?: Error } = {};
+  let nextPid = 4000;
+  const pty = {
+    spawn(file: string, args: readonly string[], options: { cwd: string; env: Record<string, string> }) {
+      assert.equal(this, pty);
+      assert.equal(file, "owned-pi");
+      assert.deepEqual(args, ["--owned"]);
+      return {
+        pid: nextPid++, options,
+        write(this: unknown, ...values: unknown[]) {
+          writes.push({ receiver: this, args: values });
+          if (state.writeError) { const error = state.writeError; delete state.writeError; throw error; }
+          return result;
+        },
+        onExit() { /* no process is spawned by this public-API double */ },
+      };
+    },
+  };
+  const productionRequire = Object.assign((name: string): unknown => {
+    if (name === "./protocol.js") return hostProtocol;
+    if (name === "./native-input-origin.js") return nativeInputCodec;
+    throw new Error("unexpected production observation dependency");
+  }, { resolve: (name: string) => { assert.equal(name, "@lydell/node-pty"); return "owned-pty-double"; } });
+  runInNewContext(`${functions[0]!.getText(source)}; installPtyExitObservation('/candidate/main.js', 'exit', 'control');`, {
+    Buffer, path: { dirname, join }, createRequire: () => productionRequire,
+    require: (name: string) => { assert.equal(name, "owned-pty-double"); return pty; },
+    fs: { appendFileSync(file: string, data: string) {
+      assert.equal(file, "control");
+      if (state.appendError) throw state.appendError;
+      controls.push(JSON.parse(data) as Record<string, unknown>);
+    } },
+    // An ambient bootstrap must never substitute for the actual spawn's environment.
+    process: { env: { [hostProtocol.HOST_BOOTSTRAP_ENV]: JSON.stringify(observationBootstrap) } },
+  }, { timeout: 1000 });
+  const spawn = (bootstrap: string | null = JSON.stringify(observationBootstrap), cwd = "/owned/workspace") => {
+    const options: { cwd: string; env: Record<string, string> } = {
+      cwd, env: bootstrap === null ? {} : { [hostProtocol.HOST_BOOTSTRAP_ENV]: bootstrap },
+    };
+    const handle = pty.spawn("owned-pi", ["--owned"], options);
+    assert.equal(handle.options, options, "the real spawn receives the identical options object");
+    return handle;
+  };
+  return { spawn, controls, writes, result, state };
+}
+
+test("structural PTY observation retains exact legacy Escape recognition for a valid unframed bootstrap", () => {
+  const fixture = structuralObservation();
+  const { inputOriginFraming: _mode, ...legacy } = observationBootstrap;
+  const handle = fixture.spawn(JSON.stringify(legacy));
+  for (const key of ["\x1b", "\x1b[27u", "\x1b[27;1u", "\x1b[27;1:1u"]) handle.write(key);
+  for (const key of ["x", "x\x1b", "\x1bx", "\x1b[27;2u", Buffer.from([0x9b])]) handle.write(key);
+  assert.equal(fixture.controls.length, 4);
+  assert.deepEqual(fixture.controls.map((record) => [record.pid, record.cwd, record.encoding]),
+    Array.from({ length: 4 }, (_, i) => [handle.pid, "/owned/workspace", i === 0 ? "legacy" : "csi-u"]));
+});
+
+test("structural PTY observation authenticates complete framed Escape including split string and Buffer transport", () => {
+  for (const key of ["\x1b", "\x1b[27u", "\x1b[27;1u", "\x1b[27;1:1u"]) {
+    const fixture = structuralObservation(); const handle = fixture.spawn();
+    const encoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
+    const frame = encoder.encode(Buffer.from(key), { kind: "local" });
+    handle.write(frame.slice(0, 11));
+    assert.equal(fixture.controls.length, 0, "an incomplete authenticated frame is no witness");
+    handle.write(Buffer.from(frame.slice(11)));
+    assert.deepEqual(fixture.controls, [{ type: "pty_control", key: "escape", pid: handle.pid,
+      cwd: "/owned/workspace", encoding: key === "\x1b" ? "legacy" : "csi-u", framing: "authenticated", origin: "local" }]);
+  }
+});
+
+test("structural PTY observation never confuses paste fragments or high-bit bytes with a complete Escape", () => {
+  const fixture = structuralObservation(); const handle = fixture.spawn();
+  const encoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
+  for (const payload of [Buffer.concat([Buffer.alloc(nativeInputCodec.NATIVE_INPUT_RAW_FRAGMENT_BYTES, 97), Buffer.from([27])]),
+    Buffer.from([0x9b]), Buffer.from("x\x1b"), Buffer.from("\x1bx")]) {
+    handle.write(encoder.encode(payload, { kind: "local" }));
+  }
+  assert.deepEqual(fixture.controls, []);
+});
+
+test("structural PTY observation is poisoned by malformed, foreign, replayed, and invalid-sequence frames without raw downgrade", () => {
+  const frame = () => nativeInputCodec.createNativeInputEncoder(observationBootstrap).encode(Buffer.from([27]), { kind: "local" });
+  const original = frame();
+  const encoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
+  encoder.encode(Buffer.from("first"), { kind: "local" });
+  // The third case flips one MAC hex digit and keeps the printable terminator, so it
+  // stays an authentication failure rather than an accidental terminator change.
+  const cases = ["\x1b", "not-a-frame\n", original.slice(0, -2) + (original.at(-2) === "a" ? "b" : "a") + ";",
+    encoder.encode(Buffer.from([27]), { kind: "local" }),
+    ...[{ ...observationBootstrap, token: "b".repeat(64) },
+      { ...observationBootstrap, instanceId: "33333333-3333-4333-8333-333333333333" },
+      { ...observationBootstrap, generation: "44444444-4444-4444-8444-444444444444" }]
+      .map((bootstrap) => nativeInputCodec.createNativeInputEncoder(bootstrap).encode(Buffer.from([27]), { kind: "local" }))];
+  for (const invalid of cases) {
+    const fixture = structuralObservation(); const handle = fixture.spawn();
+    handle.write(invalid); handle.write(original); handle.write("\x1b");
+    assert.deepEqual(fixture.controls, [], "invalid framed input never becomes raw or a later positive");
+  }
+  const fixture = structuralObservation(); const handle = fixture.spawn();
+  handle.write(original); handle.write(original); handle.write(frame());
+  assert.equal(fixture.controls.length, 1, "a replay poisons the per-handle observer");
+});
+
+test("structural PTY observation refuses absent, malformed, and unsupported owned bootstrap even with a valid ambient identity", () => {
+  for (const bootstrap of ["", "{", "null", "{}", ...[0, 2, true, "1"].map((mode) =>
+    JSON.stringify({ ...observationBootstrap, inputOriginFraming: mode }))]) {
+    const fixture = structuralObservation(); const handle = fixture.spawn(bootstrap);
+    handle.write("\x1b"); handle.write(nativeInputCodec.createNativeInputEncoder(observationBootstrap).encode(Buffer.from([27]), { kind: "local" }));
+    assert.deepEqual(fixture.controls, []);
+  }
+  const fixture = structuralObservation(); const handle = fixture.spawn(null);
+  handle.write("\x1b"); assert.deepEqual(fixture.controls, [], "an absent owned bootstrap cannot use the ambient identity");
+});
+
+test("structural PTY observation preserves exact forwarding and error identity and never witnesses a throwing write", () => {
+  const fixture = structuralObservation(); const handle = fixture.spawn();
+  const encoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
+  const bytes = Buffer.from(encoder.encode(Buffer.from([27]), { kind: "local" })); const extra = {};
+  assert.equal(handle.write(bytes, extra), fixture.result);
+  assert.equal(fixture.writes.length, 1); assert.equal(fixture.writes[0]!.receiver, handle);
+  assert.equal(fixture.writes[0]!.args[0], bytes); assert.equal(fixture.writes[0]!.args[1], extra);
+  const error = new Error("owned-write-failure"); fixture.state.writeError = error;
+  const failedFrame = encoder.encode(Buffer.from([27]), { kind: "local" });
+  assert.throws(() => handle.write(failedFrame), (thrown) => thrown === error);
+  handle.write(failedFrame);
+  assert.equal(fixture.controls.length, 1, "uncertain partial effects cannot create or revive observation");
+  const failedObserver = structuralObservation(); const second = failedObserver.spawn();
+  const secondEncoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
+  failedObserver.state.appendError = new Error("owned-observer-failure");
+  assert.equal(second.write(secondEncoder.encode(Buffer.from([27]), { kind: "local" })), failedObserver.result);
+  delete failedObserver.state.appendError;
+  second.write(secondEncoder.encode(Buffer.from([27]), { kind: "local" }));
+  assert.deepEqual(failedObserver.controls, [], "observation failure is sticky but never changes IO forwarding");
+});
+
+test("structural PTY observation isolates actual handle identity and keeps every origin visible to negative guards", () => {
+  const fixture = structuralObservation(); const first = fixture.spawn(); const second = fixture.spawn(JSON.stringify(observationBootstrap), "/owned/other");
+  const encoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
+  first.write(encoder.encode(Buffer.from([27]), { kind: "none" }));
+  first.write(encoder.encode(Buffer.from([27]), { kind: "viewer", token: "owned-viewer" }, { sessionId: "owned-session", epoch: 1 }));
+  second.write(nativeInputCodec.createNativeInputEncoder(observationBootstrap).encode(Buffer.from([27]), { kind: "local" }));
+  assert.deepEqual(fixture.controls.map((record) => [record.pid, record.cwd, record.origin]),
+    [[first.pid, "/owned/workspace", "none"], [first.pid, "/owned/workspace", "viewer"], [second.pid, "/owned/other", "local"]]);
+  const metadata = JSON.stringify(fixture.controls);
+  assert.equal(metadata.includes(observationBootstrap.token), false);
+  assert.equal(metadata.includes("owned-viewer"), false, "scope tokens and payloads are never journaled");
+});
 
 async function settingsSmoke(driver: MainPtyDriver, session: OwnedSession, workspaceEditValue: string, editorMarker: string): Promise<void> {
   assert.equal(driver.focus, "main");
@@ -139,17 +306,21 @@ async function settingsSmoke(driver: MainPtyDriver, session: OwnedSession, works
   assert.equal(entry!.workspace, workspaceEditValue, "the actual Ctrl+G editor's changed value was persisted");
 }
 
-test("ChangeSignal.waitFor rechecks its exact predicate once at the unchanged deadline", async () => {
+test("the Main durable-journal signal rechecks its exact predicate once at the unchanged deadline", async () => {
+  // In-process frame/exit waits retain strict notification-only waitFor.
+  // Durable journals use waitForRecheck; a cadence beyond this unchanged 20ms
+  // deadline isolates its final recheck without any intervening polling tick.
+  const recheckIntervalMs = 1_000;
   let ready = false;
   let calls = 0;
-  const missed = new ChangeSignal().waitFor(() => (calls++, ready), 20, "missed notification");
+  const missed = new ChangeSignal().waitForRecheck(() => (calls++, ready), 20, "missed notification", undefined, recheckIntervalMs);
   queueMicrotask(() => { ready = true; }); // condition becomes true without notify()
   await missed;
   assert.equal(calls, 2, "one initial check plus one deadline recheck; no polling");
-  await assert.rejects(new ChangeSignal().waitFor(() => false, 20, "still false"), /^Error: still false: deadline exceeded$/);
+  await assert.rejects(new ChangeSignal().waitForRecheck(() => false, 20, "still false", undefined, recheckIntervalMs), /^Error: still false: deadline exceeded$/);
   let thrown = 0;
   const throwing = (): boolean => { if (thrown++ > 0) throw new Error("predicate"); return false; };
-  await assert.rejects(new ChangeSignal().waitFor(throwing, 20, "throwing"), /^Error: throwing: bounded event predicate failed$/);
+  await assert.rejects(new ChangeSignal().waitForRecheck(throwing, 20, "throwing", undefined, recheckIntervalMs), /^Error: throwing: bounded event predicate failed$/);
 });
 
 test("the complete restored-native-editor witness rejects stale narrow frames, partial repaints, and altered drafts", () => {
@@ -233,8 +404,196 @@ test("the complete restored-native-editor witness rejects stale narrow frames, p
   "a still-composed wide sidebar frame is rejected while the sidebar must be hidden");
 });
 
+/**
+ * One owned native pane in three paints of the SAME logical frame: a partial
+ * repaint (closing rule not written yet), a complete editor block that still
+ * carries the previous owner's row, and the settled frame. Built from the real
+ * `SidebarController` roster so the footer and entry extent are production
+ * bytes; only the right-pane rows are synthetic.
+ */
+function activationFrameSet(): {
+  readonly ownerLabel: string;
+  readonly draftB: string;
+  readonly staleDraftA: string;
+  readonly nativeWidth: number;
+  readonly options: { readonly ownerLabel: string; readonly draft: string; readonly sidebarColumns: number; readonly nativeWidth: number; readonly focus: "main" };
+  readonly partial: string;
+  readonly transitional: string;
+  readonly settled: string;
+} {
+  const controller = new SidebarController({ toggleKey: "f8" });
+  const ownerLabel = "B-7";
+  const previousOwnerLabel = "A-7";
+  const draftB = "nativeDraftB7";
+  const staleDraftA = "nativeDraftA7";
+  const controllerItem = (id: string, label: string) => ({
+    id, label, workspace: "/owned/workspace", agentDir: "/owned/agent",
+    lifecycle: "alive" as const, busy: false, pendingInput: false, inputSurface: false, activity: [],
+  });
+  controller.updateItems([
+    controllerItem("owned-native-row-a", previousOwnerLabel),
+    controllerItem("owned-native-row-b", ownerLabel),
+  ]);
+  controller.renderRoster(32, 49);
+  controller.handleInput(KEYS.down); // New -> Quit host
+  controller.handleInput(KEYS.down); // Quit host -> A
+  controller.handleInput(KEYS.down); // A -> B
+  controller.handleInput(KEYS.altRight); // Main owns input, as immediately after an Enter activation
+  assert.equal(controller.focus, "main");
+  const roster = controller.renderRoster(32, 49).lines.map((line) => stripGeneratedSgr(line));
+  const nativeWidth = OUTER_COLS - 32 - 1;
+  const rule = "─".repeat(nativeWidth);
+  const rows = Array.from({ length: 49 }, () => "");
+  rows[12] = `                   > ${staleDraftA}`; // the previous owner's not-yet-overwritten row
+  rows[20] = rule;
+  rows[21] = `                   > ${draftB}`;
+  rows[22] = rule;
+  const compose = (main: readonly string[]): string => [ownerLabel,
+    ...roster.map((line, index) => `${line.padEnd(32)}│${main[index] ?? ""}`)].join("\n");
+  const partialRows = [...rows];
+  partialRows[22] = "";
+  const settledRows = [...rows];
+  settledRows[12] = "";
+  return {
+    ownerLabel,
+    draftB,
+    staleDraftA,
+    nativeWidth,
+    options: { ownerLabel, draft: draftB, sidebarColumns: 32, nativeWidth, focus: "main" },
+    partial: compose(partialRows),
+    transitional: compose(rows),
+    settled: compose(settledRows),
+  };
+}
+
+/**
+ * Drive `MainPtyDriver.settledNativeEditorFrame` on a controlled frame-signal
+ * fixture. A real driver requires an owned PTY, so this binds the actual
+ * prototype method to the same state it reads — a live `ChangeSignal`, the frame
+ * text and revision a `refreshFrame()` would have stored, and a journal-free
+ * `sessions()`. The frame already on screen at entry is given directly and each
+ * later frame is delivered on its own timer, exactly as further outer output
+ * arrives; nothing is synthesized about production state.
+ */
+function activationFenceDriver(
+  displayed: string,
+  later: readonly { readonly frame: string; readonly afterMs: number }[],
+): MainPtyDriver {
+  const driver = Object.create(MainPtyDriver.prototype) as MainPtyDriver;
+  Object.assign(driver, {
+    frameSignal: new ChangeSignal(),
+    currentFrame: displayed,
+    frameRevision: 1,
+    parserError: undefined,
+    exitEvent: undefined,
+    sessions: () => [],
+  });
+  later.forEach((delivery) => {
+    setTimeout(() => {
+      Object.assign(driver, { currentFrame: delivery.frame, frameRevision: 2 });
+      driver.frameSignal.notify();
+    }, delivery.afterMs);
+  });
+  return driver;
+}
+
+test("a mid-write activation frame cannot prove isolation while the settled frame can", () => {
+  // `SessionHostFrameWriter` emits only the rows that changed since the frame it
+  // last wrote, with no atomic frame marker, so the owned outer emulator can be
+  // read in the middle of ONE logical frame: the newly activated owner's header
+  // and editor block can already be drawn while rows of the previous owner's
+  // paint are still standing. This test fixes that mechanism so activation
+  // content isolation is judged only on a complete, settled frame — and so a
+  // genuine leak in a settled frame still fails loudly instead of being waited
+  // away. Pure: synthetic controlled rows, no timers and no real child.
+  const frames = activationFrameSet();
+  const { transitional, partial, settled, options, draftB, staleDraftA, ownerLabel } = frames;
+
+  assert.equal(restoredNativeEditorFrame(transitional, options), true,
+    "B's complete editor block is structurally present in the transitional frame");
+  assert.equal(frameHeaderMatches(transitional, ownerLabel) && transitional.includes(draftB), true,
+    "the historical header-plus-substring activation predicate accepts the transitional frame");
+  assert.ok(transitional.includes(staleDraftA),
+    "the transitional frame still carries the previous owner's row, exactly as a mid-write capture does");
+
+  assert.equal(restoredNativeEditorFrame(partial, options), false,
+    "a transitional frame whose closing rule is not written yet is never an activation witness");
+
+  assert.equal(restoredNativeEditorFrame(settled, options), true,
+    "the settled frame draws B's complete native editor at the current pane width");
+  assert.equal(settled.includes(staleDraftA), false,
+    "only the settled frame — every changed row written — may be judged for cross-session isolation");
+});
+
+test("the settled-frame activation fence waits past a mixed frame and still fails a persistent cross-session row", async () => {
+  // Helper-level proof of the fence itself (not only its frame predicates).
+  // A real `MainPtyDriver` needs an owned PTY, so this exercises the actual
+  // prototype method on a controlled frame-signal fixture: the same
+  // `ChangeSignal`, frame-revision, and journal-free `sessions()` state the
+  // fence reads. The delivered sequence reproduces the observed condition — a
+  // partial paint, then a COMPLETE editor block that still carries the previous
+  // owner's row, then the settled frame — and asserts the fence returns only the
+  // last one. The second half shows a leak that never settles is returned
+  // unchanged, so the retained isolation assertion still fails it instead of the
+  // fence waiting it away.
+  const frames = activationFrameSet();
+  const witness = { ownerLabel: frames.ownerLabel, draft: frames.draftB, nativeWidth: frames.nativeWidth,
+    focus: "main" as const, sidebarColumns: 32 };
+
+  const driver = activationFenceDriver(frames.partial, [
+    { frame: frames.transitional, afterMs: 20 },
+    { frame: frames.settled, afterMs: 40 },
+  ]);
+  const settledFrame = await driver.settledNativeEditorFrame(witness);
+  assert.equal(settledFrame, frames.settled,
+    "the fence returns the settled frame, never the partial or mixed frame it passed through");
+  assert.equal(settledFrame.includes(frames.staleDraftA), false,
+    "the returned frame is free of the previous owner's row");
+  assert.deepEqual({
+    looseFrame: driver.lastActivationEvidence?.looseFrame,
+    settledFrame: driver.lastActivationEvidence?.settledFrame,
+    looseFrameWasPartial: driver.lastActivationEvidence?.looseFrameWasPartial,
+  }, {
+    looseFrame: frames.partial,
+    settledFrame: frames.settled,
+    looseFrameWasPartial: true,
+  }, "the fence records that the frame it first saw was pre-settled");
+
+  const leaking = activationFenceDriver(frames.transitional, []);
+  const leakedFrame = await leaking.settledNativeEditorFrame(witness);
+  assert.equal(leakedFrame, frames.transitional,
+    "a frame that keeps carrying the other session's row is returned as observed, never hidden");
+  assert.throws(() => assert.ok(!leakedFrame.includes(frames.staleDraftA), "A's text is not copied into B"),
+    "the retained isolation assertion still fails a persistent cross-session row");
+});
+
 // Guards the immutable startup-option contract as well as this alpha's
 // local-scripted-provider/no-session-override fixture boundary.
+test("roster navigation sends no key when its fresh complete frame already selects the destination", async () => {
+  const frame = ["Session host", ...[
+    " Sessions (0)", "  Saved conversations", "> New session", "  Network", "  Quit host", "  Host shortcuts",
+  ].map((line) => line.padEnd(32) + "│Welcome")].join("\n");
+  let displayed = ""; // The first synchronous probe is still an incomplete paint.
+  let waits = 0;
+  const keys: string[] = [];
+  const driver = Object.create(MainPtyDriver.prototype) as MainPtyDriver;
+  Object.assign(driver, {
+    currentText: () => displayed,
+    sidebarColumnCount: () => 32,
+    sessions: () => [],
+    pty: { write: (key: string) => { keys.push(key); } },
+    waitFrame: async (predicate: (text: string) => boolean) => {
+      waits++;
+      displayed = frame;
+      assert.equal(predicate(displayed), true, "the actual complete highlight satisfies the awaited witness");
+      return displayed;
+    },
+  });
+  await driver.moveRosterTo("New session");
+  assert.equal(waits, 1);
+  assert.deepEqual(keys, [], "a newly observed destination is not navigated away from");
+});
+
 const FORBIDDEN_SESSION_ARGS = new Set([
   "--session", "--session-id", "--sessionID", "--session-dir", "--no-session",
   "--continue", "--resume", "--fork",
@@ -513,7 +872,10 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     "host external-editor handoff does not resize native children");
   assert.equal(processIsAlive(bPid), true, "B remains live after the actual host editor handoff");
 
-  await driver.setOuterSize(52, 30, initialSessions, 52, 29);
+  // Per-session viewer sizing (#474): B is the row this host displays (the New
+  // form replaces its pane but never transfers ownership), so B alone follows
+  // the outer resize and the unviewed A keeps the pane it was created with.
+  await driver.setOuterSize(52, 30, { viewed: sessionB, retained: [sessionA] }, 52, 29);
   const expectedHints = ["enter create", "escape cancel", "tab complete", "ctrl+c clear", "ctrl+g external editor"];
   await driver.waitFrame((text) => expectedHints.every((hint) => text.replace(/\s+/g, " ").includes(hint)),
     "the actual narrow New form finishes painting every wrapped native hint after resize");
@@ -521,10 +883,14 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   for (const hint of expectedHints) {
     assert.ok(wrappedHints.includes(hint), `the narrow New form keeps its wrapped ${hint} hint readable\n${driver.currentText()}`);
   }
-  await driver.setOuterSize(24, 5, initialSessions, 24, 4);
+  await driver.setOuterSize(24, 5, { viewed: sessionB, retained: [sessionA] }, 24, 4);
   await driver.waitFrame((text) => text.includes("too small") && !text.includes("Workspace:"),
     "the real New form paints its bounded tiny-pane message without fabricating a field");
-  await driver.setOuterSize(52, 30, initialSessions, 52, 29);
+  await driver.setOuterSize(52, 30, { viewed: sessionB, retained: [sessionA] }, 52, 29);
+  assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - 32 - 1, rows: 49 },
+    "three outer resizes of the displayed row leave the unviewed A on its original 87x49 pane");
+  assert.deepEqual(driver.paneGeometry(sessionB), { cols: 52, rows: 29 },
+    "the displayed row tracks the current pane exactly");
   await driver.waitFrame((text) => text.includes("Workspace:"), "the New form returns after restoring usable geometry");
   await driver.clearWorkspaceField("the native clear binding empties B's retained workspace before filesystem completion");
   const partialWorkspace = join(scratch, "workspace-new-");
@@ -585,7 +951,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   driver.focus = "main";
   driver.sidebarVisible = true;
   const beforeRestoredNative = driver.frameRevision;
-  await driver.setOuterSize(OUTER_COLS, OUTER_ROWS, initialSessions, OUTER_COLS - 32 - 1, 49);
+  await driver.setOuterSize(OUTER_COLS, OUTER_ROWS, { viewed: sessionB, retained: [sessionA] }, OUTER_COLS - 32 - 1, 49);
   // setOuterSize only observes first outer output and the resize records, so
   // require the COMPLETE restored editor: the exact owner header, the complete
   // roster with its Main-focused footer (no stale sidebar-only hints), a
@@ -620,19 +986,23 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.equal(driver.sidebarVisible, true,
     "the first explicit press focuses the visible sidebar instead of hiding it");
   await driver.toggleSidebar();
-  for (const session of initialSessions) {
-    await driver.waitForRecords((records) => records.slice(recordCountBeforeWideHide).some((record) => record.type === "resize"
-      && record.pid === session.record.pid && record.columns === 120 && record.rows === 49),
-     `hiding the wide sidebar creates a fresh full-width 120x49 resize for ${session.rowProbe}`);
-  }
+  // Only the row this host displays follows the pane (#474): hiding the wide
+  // sidebar reflows B to the full outer width while unviewed A stays put.
+  await driver.waitForRecords((records) => records.slice(recordCountBeforeWideHide).some((record) => record.type === "resize"
+    && record.pid === sessionB.record.pid && record.columns === 120 && record.rows === 49),
+  "hiding the wide sidebar creates a fresh full-width 120x49 resize for the displayed row B");
+  await driver.assertPanesUnchanged([sessionA], recordCountBeforeWideHide,
+    "hiding the wide sidebar does not resize the row this host does not display");
   assert.equal(processIsAlive(bPid), true, "hiding the sidebar does not pause its native owner");
   const recordCountBeforeWideShow = driver.records().length;
   await driver.toggleSidebar();
-  for (const session of initialSessions) {
-    await driver.waitForRecords((records) => records.slice(recordCountBeforeWideShow).some((record) => record.type === "resize"
-      && record.pid === session.record.pid && record.columns === 87 && record.rows === 49),
-     `showing the wide sidebar creates a fresh 87x49 resize for ${session.rowProbe}`);
-  }
+  await driver.waitForRecords((records) => records.slice(recordCountBeforeWideShow).some((record) => record.type === "resize"
+    && record.pid === sessionB.record.pid && record.columns === 87 && record.rows === 49),
+  "showing the wide sidebar creates a fresh 87x49 resize for the displayed row B");
+  await driver.assertPanesUnchanged([sessionA], recordCountBeforeWideShow,
+    "showing the wide sidebar does not resize the row this host does not display");
+  assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - 32 - 1, rows: 49 },
+    "the unviewed row still reports its original 87x49 pane after both hide and show transitions");
   // Reopening reflows B's native child back to the 87-column pane while the
   // sidebar owns focus, so its repaint is asynchronous. Require the complete
   // restored sidebar-focused frame for B before reading the draft, exactly as
@@ -660,6 +1030,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   await driver.waitFrame((text) => frameHeaderMatches(text, labelA)
     && text.includes(draftA) && parseRosterFrame(text, 32).complete,
   "A's exact active header, private draft, and complete roster are drawn before the focus-only press");
+  // The witnessed Enter made A the row this host displays and therefore sizes.
+  driver.noteDisplayedRow(sessionA);
   const resizeCountBeforeFocus = driver.records().filter((record) => record.type === "resize").length;
   const headerBeforeFocus = frameHeader(driver.currentText());
   await driver.toggleSidebar();
@@ -716,11 +1088,27 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   const beforeSelectB = driver.frameRevision;
   driver.pty.write(KEYS.enter);
   driver.focus = "main";
+  // Only an explicit Enter transfers ownership, and its content is read from a
+  // complete settled frame: the frame writer emits changed rows progressively,
+  // so the header and B's editor block can land before A's stale rows are
+  // overwritten. Isolation is asserted on that settled frame, and the frame is
+  // recorded whenever the assertion fails.
   await driver.waitFrame((text) => frameHeaderMatches(text, labelB)
-    && text.includes(draftB) && !text.includes(draftA) && parseRosterFrame(text, 32).complete,
+    && text.includes(draftB) && parseRosterFrame(text, 32).complete,
     "only explicit Enter returns ownership to B with its exact header, private draft, and complete roster", beforeSelectB);
+  const settledSelectB = await driver.settledNativeEditorFrame({
+    ownerLabel: labelB, draft: draftB, nativeWidth: OUTER_COLS - 32 - 1, focus: "main",
+  });
+  assert.ok(settledSelectB.includes(draftB),
+    "only explicit Enter returns ownership to B with its exact private draft on a settled frame");
+  assert.ok(!settledSelectB.includes(draftA),
+    `A's text is not copied into B when B becomes the displayed owner\nActual settled owned Main frame:\n${settledSelectB}`);
+  if (driver.lastActivationEvidence?.looseFrame.includes(draftA) === true) {
+    t.diagnostic("returning ownership to B: the first frame already showing B's draft still carried A's row "
+      + "(row-delta output mid-frame); isolation was judged on the settled frame");
+  }
 
-  await driver.setOuterSize(100, 30, initialSessions, 67, 29);
+  await driver.setOuterSize(100, 30, { viewed: sessionB, retained: [sessionA] }, 67, 29);
   assert.equal(driver.surface.frame().cols, 100, "the real outer PTY and terminal emulator observe the resized outer width");
   // A native resize receipt or first output byte is not a complete outer redraw.
   // Observe B's exact owner and the full roster before capturing the header for F8.
@@ -730,7 +1118,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   // A narrow pane overlays only while the roster owns focus. Establish that
   // state before testing a visible overlay's close/reopen transitions.
   await driver.ensureSidebarFocus();
-  await driver.setOuterSize(52, 20, initialSessions, 52, 19);
+  await driver.setOuterSize(52, 20, { viewed: sessionB, retained: [sessionA] }, 52, 19);
   assert.equal(driver.surface.frame().rows, 20, "the outer frame writer remains bounded to the resized terminal rows");
   const resizeCountsBeforeNarrowFocus = new Map(initialSessions.map((session) => [
     session.record.pid!,
@@ -738,35 +1126,59 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   ]));
   await driver.toggleSidebar(); // the visible narrow overlay closes; native dimensions stay full-width
   await driver.toggleSidebar(); // reopening focuses the narrow overlay, still without native geometry change
+  await driver.assertNoJournalEvent((records) => initialSessions.some((session) => records.filter((record) =>
+    record.type === "resize" && record.pid === session.record.pid).length
+      > (resizeCountsBeforeNarrowFocus.get(session.record.pid!) ?? 0)),
+  "narrow overlay focus changes do not resize any native child");
+  // Deliberately displaying the other row is what starts sizing it (#474): A
+  // takes the 52x19 pane this host shows, and the row this host stops
+  // displaying keeps the pane it last reported instead of being re-flowed.
+  const bPaneBeforeNarrowSelect = driver.paneGeometry(sessionB);
+  assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - 32 - 1, rows: 49 },
+    "A still reports its last wide pane until this host actually displays it");
+  const narrowSelectMarker = driver.recordCount();
   await driver.moveRosterTo(labelA);
   const beforeNarrowSelectA = driver.frameRevision;
   driver.pty.write(KEYS.enter);
   driver.focus = "main";
   await driver.waitFrame((text) => frameHeaderMatches(text, labelA) && !text.includes("New session"),
     "narrow overlay selection returns to Main without changing the native rectangle", beforeNarrowSelectA);
-  await driver.assertNoJournalEvent((records) => initialSessions.some((session) => records.filter((record) =>
-    record.type === "resize" && record.pid === session.record.pid).length
-      > (resizeCountsBeforeNarrowFocus.get(session.record.pid!) ?? 0)),
-  "narrow overlay focus changes do not resize any native child");
-  for (const session of initialSessions) {
-    const latest = driver.records().filter((record) => record.type === "resize" && record.pid === session.record.pid).at(-1);
-    assert.equal(latest?.columns, 52);
-    assert.equal(latest?.rows, 19);
-  }
-  assert.ok(driver.currentText().includes(draftA), "switching to A preserves its private draft after the narrow overlay focus change");
-  assert.ok(!driver.currentText().includes(draftB), "switching to A preserves the separate B draft");
+  await driver.waitForPane(sessionA, 52, 19,
+    "displaying A in the narrow overlay gives only A a fresh 52x19 pane", narrowSelectMarker);
+  await driver.assertPanesUnchanged([sessionB], narrowSelectMarker,
+    "retiring B from view does not resize the row this host no longer displays");
+  assert.deepEqual(driver.paneGeometry(sessionA), { cols: 52, rows: 19 },
+    "the newly displayed row reports the pane this host displays");
+  assert.deepEqual(driver.paneGeometry(sessionB), bPaneBeforeNarrowSelect,
+    "the row this host stopped displaying keeps the pane it last reported");
+  // The settled narrow frame: with the roster overlay gone, A's native editor
+  // is drawn at the full 52-column outer width. Reading A's content from that
+  // settled frame (rather than the first frame whose header flipped) is what
+  // makes the isolation assertion below about real content, not a mid-write
+  // capture that still shows the previous owner's rows.
+  const settledNarrowA = await driver.settledNativeEditorFrame({
+    ownerLabel: labelA, draft: draftA, nativeWidth: 52, focus: "hidden",
+  });
+  assert.ok(settledNarrowA.includes(draftA),
+    "switching to A preserves its private draft after the narrow overlay focus change");
+  assert.ok(!settledNarrowA.includes(draftB),
+    `switching to A preserves the separate B draft\nActual settled owned Main frame:\n${settledNarrowA}`);
 
   // Restore enough width for the real nested gate menu/editor interaction.
+  // A is the displayed row now, so only A takes the restored 87x49 pane; B
+  // stays on the 52x19 pane it last reported (#474).
   const resizeOutputBefore = driver.outputRevision;
   const resizeRecordCountBeforeRestore = driver.records().length;
   driver.pty.resize(OUTER_COLS, OUTER_ROWS);
   driver.surface.resize(OUTER_COLS, OUTER_ROWS);
   await driver.waitForOuterOutput(resizeOutputBefore, "the real Main redraws after restoring wide outer geometry");
-  for (const session of initialSessions) {
-    await driver.waitForRecords((records) => records.slice(resizeRecordCountBeforeRestore).some((record) =>
-      record.type === "resize" && record.pid === session.record.pid && record.columns === 87 && record.rows === 49),
-     `${session.rowProbe} receives a fresh restored 87x49 native geometry record`);
-  }
+  await driver.waitForRecords((records) => records.slice(resizeRecordCountBeforeRestore).some((record) =>
+    record.type === "resize" && record.pid === sessionA.record.pid && record.columns === 87 && record.rows === 49),
+  "A receives a fresh restored 87x49 native geometry record as the displayed row");
+  await driver.assertPanesUnchanged([sessionB], resizeRecordCountBeforeRestore,
+    "restoring the wide outer geometry does not resize the row this host does not display");
+  assert.deepEqual(driver.paneGeometry(sessionB), bPaneBeforeNarrowSelect,
+    "the unviewed row still reports its 52x19 pane after the wide restore");
   assert.equal(driver.focus, "main");
 
   const sharedGateDigestBeforeSettings = sha256(sharedGateConfigA);
@@ -803,17 +1215,38 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     && record.original !== record.value && record.value === workspaceEditValue),
   "the owned editor changed the field through the real Pi Ctrl+G action");
 
-  await driver.activateRoster(labelB, draftB);
-  assert.ok(driver.currentText().includes(draftB), "B's native chat draft survives A's settings/editor interaction");
-  assert.ok(!driver.currentText().includes(draftA), "A's text is not copied into B");
-  await driver.activateRoster(labelA, draftA);
-  assert.ok(driver.currentText().includes(draftA), "A's native draft remains independent after switching back");
+  const settledB = await driver.activateRoster(labelB, draftB, {
+    draft: draftB, nativeWidth: OUTER_COLS - 32 - 1, focus: "main",
+  });
+  // Live evidence of the transitional-paint mechanism: if the first frame that
+  // already showed B's header and draft still carried A's text, the frame writer
+  // had not emitted every changed row yet. Reported, never judged, so the
+  // isolation assertion below stays about the settled frame.
+  if (driver.lastActivationEvidence?.looseFrame.includes(draftA) === true) {
+    t.diagnostic("activating B: the first frame showing B's header and draft still carried A's row "
+      + "(row-delta output mid-frame); isolation was judged on the settled frame");
+  }
+  assert.ok(settledB.includes(draftB), "B's native chat draft survives A's settings/editor interaction");
+  assert.ok(!settledB.includes(draftA),
+    `A's text is not copied into B\nActual settled owned Main frame:\n${settledB}`);
+  const settledA = await driver.activateRoster(labelA, draftA, {
+    draft: draftA, nativeWidth: OUTER_COLS - 32 - 1, focus: "main",
+  });
+  if (driver.lastActivationEvidence?.looseFrame.includes(draftB) === true) {
+    t.diagnostic("activating A: the first frame showing A's header and draft still carried B's row "
+      + "(row-delta output mid-frame); isolation was judged on the settled frame");
+  }
+  assert.ok(settledA.includes(draftA), "A's native draft remains independent after switching back");
+  assert.ok(!settledA.includes(draftB),
+    `B's text is not copied into A\nActual settled owned Main frame:\n${settledA}`);
 
   await driver.closeNativeNormally(sessionA);
   assert.ok(driver.records().some((record) => record.type === "session_shutdown" && record.pid === sessionA.record.pid),
     "the actual public Pi session_shutdown lifecycle ran for A");
-  await driver.activateRoster(labelB, draftB);
-  assert.ok(driver.currentText().includes(draftB), "B's prompt survived A's normal native exit");
+  const settledAfterExit = await driver.activateRoster(labelB, draftB, {
+    draft: draftB, nativeWidth: OUTER_COLS - 32 - 1, focus: "main",
+  });
+  assert.ok(settledAfterExit.includes(draftB), "B's prompt survived A's normal native exit");
   const activeBHeaderBeforeARemoval = driver.currentText().split("\n")[0];
   await driver.removeExitedNativeSession(sessionA);
   assert.equal(driver.currentText().split("\n")[0], activeBHeaderBeforeARemoval,

@@ -8,6 +8,8 @@ import {
   rmdirSync,
   unlinkSync,
   watch,
+  writeFileSync,
+  type Stats,
 } from "node:fs";
 import { basename, join } from "node:path";
 import { describe, it } from "node:test";
@@ -15,6 +17,14 @@ import { expect } from "./helpers/expect";
 
 const POSIX_ONLY = { skip: process.platform === "win32" };
 const SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"] as const;
+// Upper bound for a complete marker file ("caught" is six bytes). Applies to
+// the observer's type/size validation and to the pre-cleanup snapshot's bounded
+// read.
+const MARKER_CONTENT_LIMIT_BYTES = 64;
+// Period of the observer's bounded fallback inspection. Directory watch
+// notifications can be coalesced or dropped by the platform, so the same
+// inspection also runs on this schedule while a wait is pending.
+const MARKER_POLL_INTERVAL_MS = 25;
 
 interface RecordLine {
   type: string;
@@ -29,6 +39,16 @@ interface ChildExit {
 interface MarkerObserver {
   wait(timeoutMs: number): Promise<string>;
   close(): void;
+}
+
+/**
+ * Private seam for this file's deterministic observation controls. No production
+ * module reads it and it is not exported: it only lets a test deliberately drop
+ * filesystem watch notifications for its own owned root and prove that a
+ * completed marker is still observed without any watch delivery.
+ */
+interface MarkerObserverOptions {
+  deliverWatchEvents?: boolean;
 }
 
 interface SignalChild {
@@ -255,20 +275,32 @@ function waitForRecord(
   });
 }
 
-function createMarkerObserver(root: string, marker: string): MarkerObserver {
+function createMarkerObserver(
+  root: string,
+  marker: string,
+  options: MarkerObserverOptions = {},
+): MarkerObserver {
+  const deliverWatchEvents = options.deliverWatchEvents !== false;
   let watcher: ReturnType<typeof watch>;
   let waiter: {
     resolve(content: string): void;
     reject(error: Error): void;
     timer: ReturnType<typeof setTimeout>;
+    poll: ReturnType<typeof setInterval>;
   } | undefined;
   let watcherError: Error | undefined;
   let closed = false;
+  // Every settle path releases both timers, so no inspection schedule can
+  // outlive the wait it belongs to.
+  const releaseTimers = (current: NonNullable<typeof waiter>): void => {
+    clearTimeout(current.timer);
+    clearInterval(current.poll);
+  };
   const fail = (error: Error): void => {
     if (waiter) {
       const current = waiter;
       waiter = undefined;
-      clearTimeout(current.timer);
+      releaseTimers(current);
       current.reject(error);
     } else {
       watcherError = error;
@@ -284,7 +316,7 @@ function createMarkerObserver(root: string, marker: string): MarkerObserver {
       fail(new Error(`cannot inspect owned signal marker ${marker} under ${root}: ${String(error)}`));
       return;
     }
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64) {
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MARKER_CONTENT_LIMIT_BYTES) {
       fail(new Error(`owned signal marker has an unexpected file type or size: ${marker} under ${root}`));
       return;
     }
@@ -305,10 +337,15 @@ function createMarkerObserver(root: string, marker: string): MarkerObserver {
     }
     const current = waiter;
     waiter = undefined;
-    clearTimeout(current.timer);
+    releaseTimers(current);
     current.resolve(content);
   };
-  watcher = watch(root, () => inspect());
+  watcher = watch(root, () => {
+    // Seam-only suppression: when a test disables watch delivery, the periodic
+    // inspection below is the only remaining observation path.
+    if (!deliverWatchEvents) return;
+    inspect();
+  });
   watcher.on("error", (error) => {
     fail(new Error(`filesystem watcher failed for owned signal root ${root}: ${String(error)}`));
   });
@@ -327,15 +364,30 @@ function createMarkerObserver(root: string, marker: string): MarkerObserver {
           reject(new Error(`marker wait is already active for owned signal root ${root}`));
           return;
         }
-        const timer = setTimeout(() => {
+        const deadline = Date.now() + timeoutMs;
+        const expire = (): void => {
           const current = waiter;
           if (!current) return;
+          // Timer delivery alone does not prove this clock's deadline passed.
+          // If it arrived early, retain the same absolute deadline and ownership.
+          const remaining = deadline - Date.now();
+          if (remaining > 0) {
+            current.timer = setTimeout(expire, remaining);
+            return;
+          }
           waiter = undefined;
+          releaseTimers(current);
           current.reject(new Error(
             `complete "caught" marker did not arrive before the deadline: ${marker} under ${root}`,
           ));
-        }, timeoutMs);
-        waiter = { resolve, reject, timer };
+        };
+        const timer = setTimeout(expire, timeoutMs);
+        // Second, equivalent observation path for exactly as long as this wait
+        // is pending: a completed marker must not be missed solely because the
+        // platform coalesced or dropped its watch notification. This never
+        // extends the deadline above; it only re-inspects the same marker.
+        const poll = setInterval(inspect, MARKER_POLL_INTERVAL_MS);
+        waiter = { resolve, reject, timer, poll };
         inspect();
       });
     },
@@ -346,7 +398,7 @@ function createMarkerObserver(root: string, marker: string): MarkerObserver {
       if (waiter) {
         const current = waiter;
         waiter = undefined;
-        clearTimeout(current.timer);
+        releaseTimers(current);
         current.reject(new Error(`filesystem watcher closed before marker completion under ${root}`));
       }
     },
@@ -384,6 +436,67 @@ async function waitForGroupExit(groupPid: number, timeoutMs: number): Promise<bo
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   return !groupIsAlive(groupPid);
+}
+
+interface PreCleanupMarkerFacts {
+  markerExists: boolean;
+  entryType?: "file" | "symlink" | "other";
+  sizeBytes?: number;
+  mtimeIso?: string;
+  contentLength?: number;
+  contentComplete?: boolean;
+  groupPid?: number;
+  groupAlive?: boolean;
+  hostClosed: string;
+  hostRecords: RecordLine[];
+}
+
+/**
+ * Sample the facts that tell "the marker producer ran late" apart from "the
+ * harness missed an already-completed marker".
+ *
+ * This must run before cleanupChild, because cleanup itself signals the owned
+ * group and can therefore create the very marker under observation. For the
+ * previously preserved historical failure this distinction is no longer
+ * recoverable: that run's marker was inspected only after test cleanup, which
+ * could itself have written it, so its original cause stays unknown (late
+ * producer vs. missed watch notification remain indistinguishable there).
+ * Captured here it is decisive only for a future occurrence.
+ *
+ * Only bounded metadata plus an exact-completeness boolean are recorded. The
+ * marker's arbitrary bytes are never retained, stringified, or printed.
+ */
+function capturePreCleanupMarkerFacts(marker: string, state: SignalChild): PreCleanupMarkerFacts {
+  const facts: PreCleanupMarkerFacts = {
+    markerExists: false,
+    hostClosed: state.closed ? JSON.stringify(state.closed) : "no",
+    hostRecords: state.records.slice(),
+  };
+  let stat: Stats | undefined;
+  try {
+    stat = lstatSync(marker);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (stat) {
+    facts.markerExists = true;
+    facts.entryType = stat.isSymbolicLink() ? "symlink" : stat.isFile() ? "file" : "other";
+    facts.sizeBytes = stat.size;
+    facts.mtimeIso = new Date(stat.mtimeMs).toISOString();
+    if (facts.entryType === "file") {
+      facts.contentLength = stat.size;
+      facts.contentComplete =
+        stat.size <= MARKER_CONTENT_LIMIT_BYTES &&
+        readFileSync(marker).equals(Buffer.from("caught", "utf8"));
+    }
+  }
+  // Group liveness is sampled after the marker facts so both describe the same
+  // pre-cleanup moment.
+  if (state.groupPid) {
+    facts.groupPid = state.groupPid;
+    facts.groupAlive = groupIsAlive(state.groupPid);
+  }
+  return facts;
 }
 
 async function cleanupChild(state: SignalChild): Promise<void> {
@@ -443,7 +556,9 @@ async function withSignalChild(
   let markerObserver: MarkerObserver | undefined;
   let state: SignalChild | undefined;
   let failure: unknown;
+  let failureCaptured = false;
   let cleanupFailure: unknown;
+  let cleanupFailed = false;
   try {
     // Install the directory watcher before the isolated process can start the
     // job, become ready, or receive a signal.
@@ -454,25 +569,43 @@ async function withSignalChild(
     await run(state);
   } catch (error) {
     failure = error;
+    failureCaptured = true;
+  }
+  // Capture the marker/group facts before cleanupChild runs: cleanup signals the
+  // owned group itself and can create the marker under observation. Any failure
+  // while sampling is reported alongside the original failure, never in place
+  // of it, and cleanup still runs below.
+  let preCleanup: PreCleanupMarkerFacts | undefined;
+  let preCleanupError: string | undefined;
+  if (failureCaptured && state) {
+    try {
+      preCleanup = capturePreCleanupMarkerFacts(marker, state);
+    } catch (error) {
+      preCleanupError = String(error);
+    }
   }
   try {
     if (state) await cleanupChild(state);
   } catch (error) {
     cleanupFailure = error;
+    cleanupFailed = true;
   } finally {
     markerObserver?.close();
   }
-  if (failure || cleanupFailure) {
+  if (failureCaptured || cleanupFailed) {
     console.error(
       `preserving owned signal-test root ${root}; group=${state?.groupPid ?? "unknown"}; ` +
+        `preCleanup=${preCleanup ? JSON.stringify(preCleanup) : "not-captured"}; ` +
+        `preCleanupError=${preCleanupError ?? "none"}; ` +
         `closed=${state?.closed ? JSON.stringify(state.closed) : "no"}; ` +
         `records=${JSON.stringify(state?.records ?? [])}; stderr=${state?.stderr ?? ""}; ` +
-        `failure=${String(failure ?? "none")}; cleanup=${String(cleanupFailure ?? "none")}`,
+        `failure=${failureCaptured ? String(failure) : "none"}; ` +
+        `cleanup=${cleanupFailed ? String(cleanupFailure) : "none"}`,
     );
-    if (failure && cleanupFailure) {
+    if (failureCaptured && cleanupFailed) {
       throw new AggregateError([failure, cleanupFailure], `signal test and owned cleanup failed; retained ${root}`);
     }
-    throw failure ?? cleanupFailure;
+    throw failureCaptured ? failure : cleanupFailure;
   }
   try {
     removeSuccessfulSignalRoot(root, marker);
@@ -516,4 +649,107 @@ describe("background-shell signal-exit integration", () => {
       });
     });
   }
+});
+
+async function withMarkerObserverRoot(
+  options: MarkerObserverOptions,
+  run: (context: { root: string; marker: string; observer: MarkerObserver }) => Promise<void>,
+): Promise<void> {
+  const scratchParent = join(process.cwd(), "node_modules");
+  const parentStat = lstatSync(scratchParent);
+  if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+    throw new Error(`signal-test scratch parent is not a real owned dependency directory: ${scratchParent}`);
+  }
+  const root = mkdtempSync(join(scratchParent, ".pi-review-gate-signal-"));
+  const marker = join(root, "job-term-observed");
+  const observer = createMarkerObserver(root, marker, options);
+  let failure: unknown;
+  let failed = false;
+  try {
+    await run({ root, marker, observer });
+  } catch (error) {
+    failure = error;
+    failed = true;
+  } finally {
+    observer.close();
+  }
+  if (failed) {
+    console.error(`preserving owned signal-marker observation root ${root}; failure=${String(failure)}`);
+    throw failure;
+  }
+  try {
+    removeSuccessfulSignalRoot(root, marker);
+  } catch (error) {
+    console.error(`preserving owned signal-marker observation root ${root} after cleanup error: ${String(error)}`);
+    throw error;
+  }
+}
+
+// These cases cover only this file's private observation seam. They are
+// deliberately short and self-contained: the integration cases above keep their
+// exact 3000 ms marker budget, and nothing here widens, retries, or replaces a
+// wait deadline.
+describe("background-shell signal marker observation", () => {
+  const SEAM_DEADLINE_MS = 300;
+
+  // Proves the negative direction: while watch delivery is suppressed, a marker
+  // that never completes must reject at the deadline, never resolve before it.
+  const expectDeadlineRejection = async (
+    observer: MarkerObserver,
+    marker: string,
+    description: string,
+  ): Promise<void> => {
+    const started = Date.now();
+    const rejected = await observer.wait(SEAM_DEADLINE_MS).then(() => undefined, (error: unknown) => error);
+    if (!(rejected instanceof Error)) {
+      throw new Error(`${description} must reject at its deadline instead of settling early`);
+    }
+    expect(rejected.message).toContain(
+      `complete "caught" marker did not arrive before the deadline: ${marker}`,
+    );
+    if (Date.now() - started < SEAM_DEADLINE_MS) {
+      throw new Error(`${description} must not settle the wait before its deadline`);
+    }
+  };
+
+  it("observes a completed marker even when every filesystem watch notification is dropped", async () => {
+    await withMarkerObserverRoot({ deliverWatchEvents: false }, async ({ marker, observer }) => {
+      const pending = observer.wait(3000);
+      // wait() already ran its immediate inspection synchronously, so the marker
+      // written below can only be found by a later observation path. Every watch
+      // notification for it is deliberately discarded by the seam.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      writeFileSync(marker, "caught");
+      expect(await pending).toBe("caught");
+    });
+  });
+
+  it("does not report success for an absent marker before the deadline", async () => {
+    await withMarkerObserverRoot({ deliverWatchEvents: false }, async ({ marker, observer }) => {
+      await expectDeadlineRejection(observer, marker, "an absent marker");
+    });
+  });
+
+  it("does not report success for a partial marker before the deadline", async () => {
+    await withMarkerObserverRoot({ deliverWatchEvents: false }, async ({ marker, observer }) => {
+      writeFileSync(marker, "cau");
+      await expectDeadlineRejection(observer, marker, "a partial marker");
+      // The retained partial-content semantics are unchanged: an incomplete
+      // prefix is still pending, never completion, and the file is left alone.
+      expect(readFileSync(marker, "utf8")).toBe("cau");
+    });
+  });
+
+  it("still fails fast on marker content that can never complete", async () => {
+    await withMarkerObserverRoot({}, async ({ marker, observer }) => {
+      writeFileSync(marker, "not-the-marker");
+      const rejected = await observer.wait(3000).then(() => undefined, (error: unknown) => error);
+      if (!(rejected instanceof Error)) {
+        throw new Error("invalid marker content must reject immediately instead of waiting for its deadline");
+      }
+      expect(rejected.message).toContain(
+        `owned signal marker content was not exactly "caught" at ${marker}`,
+      );
+    });
+  });
 });

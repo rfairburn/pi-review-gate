@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { Buffer } from "node:buffer";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
@@ -26,9 +27,84 @@ import {
   type ShutdownResult,
   type StatusRegistrar,
 } from "./instances";
+import type { SessionGeometry } from "./instances";
 import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment, supportsSessionHostKittyGraphics } from "./launch";
 import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
-import { isValidNativeSessionId, type SessionSpawnInput, type SessionSpawnOutcome } from "./protocol";
+import { createPeerCoordinator, type PeerCoordinatorOptions } from "./network/peer-coordinator";
+import type {
+  PeerContentController,
+  PeerContentObservation,
+  PeerCoordinatorWithContent,
+  PeerNativeCopyReceipt,
+  PeerNativeInputRequest,
+  PeerNativeInputTarget,
+  PeerSelectedContent,
+  PeerViewerNativeInputPolicy,
+} from "./network/peer-content";
+import type { NativeInputSendResult } from "./network/session-content-client";
+import {
+  DEFAULT_SESSION_CONTENT_BOUNDS,
+  NATIVE_COPY_MAX_ENCODED_CHARS,
+  NATIVE_IO_MAX_SOURCE_TOKEN_BYTES,
+  NATIVE_TEXT_PASTE_MAX_BYTES,
+  isNativeIoStartupSource,
+  nativeIoSourceEquals,
+  type NativeIoInputKind,
+  type NativeIoInputSource,
+} from "./network/session-content-protocol";
+import {
+  isOwnerCloseFacts,
+  type OwnerCloseFacts,
+  type OwnerCloseRequest,
+  type PeerCloseController,
+  type PeerCloseResult,
+  type PeerCoordinatorWithClose,
+} from "./network/peer-close";
+import {
+  isOwnerCreateFacts,
+  type OwnerCreateFacts,
+  type OwnerCreateRequest,
+  type PeerCoordinatorWithCreate,
+  type PeerCreateController,
+  type PeerCreateResult,
+} from "./network/peer-create";
+import { createNativeSavedCatalogView, type NativeSavedCatalogReadOptions } from "./network/native-saved-provider";
+import {
+  isOwnerSavedDeleteFacts,
+  isOwnerSavedResumeFacts,
+  isOwnerSavedWindowFacts,
+  type OwnerSavedDeleteFacts,
+  type OwnerSavedResumeFacts,
+  type OwnerSavedWindowFacts,
+  type PeerCoordinatorWithSaved,
+  type PeerSavedController,
+  type PeerSavedNotSentReason,
+  type PeerSavedResult,
+} from "./network/peer-saved";
+import type {
+  PeerCoordinator,
+  PeerConsentPresentation,
+  PeerSavedUiDeleteIntent,
+  PeerSavedUiDeletePrepareIntent,
+  PeerSavedUiListIntent,
+  PeerSavedUiResumeIntent,
+  PeerSavedUiSearchIntent,
+  PeerSavedUiWindowIntent,
+  PeerUiCommand,
+  PeerUiSnapshot,
+} from "./peer-ui-protocol";
+import { isValidNativeSessionId } from "./protocol";
+import {
+  createLocalOwningHostService,
+  isDuplicateOwnedLaunchFailure,
+  savedDeletionOwnedSessions,
+  validateOwnedSavedSessionDeletion,
+  type OwningHostInventorySnapshot,
+  type OwningHostManager,
+  type OwningHostService,
+  type OwningHostServiceDependencies,
+  type StartedSessionOutcome,
+} from "./owning-host-service";
 import {
   assertHostShortcutsDistinct,
   DEFAULT_HOST_SHORTCUTS,
@@ -52,28 +128,38 @@ import {
   type RosterEntry,
   type StoredRoster,
 } from "./roster-store";
-import type { NativePersistenceReceipt } from "./native-persistence";
 import {
-  admitSavedSession,
   isSavedSessionCatalog,
   listSavedSessions,
   searchSavedSessions,
-  type SavedSessionAdmissionResult,
+  type ListSavedSessionsOptions,
+  type SavedCatalogFreshnessScope,
   type SavedSessionCatalog,
   type SavedSessionDeletionRefusalReason,
   type SavedSessionRefusalReason,
-  type SavedSessionRow,
-  validateSavedSessionDeletion,
 } from "./saved-sessions";
 import { deleteSavedSessionFile, type SavedSessionDeletionResult } from "./saved-deletion";
 import {
   SidebarController,
+  createPlainOwnerWorkspaceField,
+  CREATE_ON_PEER_OTHER_RUN_NOTICE,
+  CREATE_ON_PEER_UNCERTAIN_NOTICE,
+  CREATE_ON_PEER_UNWRITTEN_NOTICE,
+  REMOTE_SAVED_DELETE_OFF_NOTICE,
+  REMOTE_SAVED_OTHER_RUN_NOTICE,
+  REMOTE_SAVED_UNCERTAIN_NOTICE,
+  REMOTE_SAVED_UNSUPPORTED_NOTICE,
+  REMOTE_SAVED_UNWRITTEN_NOTICE,
   type SidebarAction,
+  type SidebarCreateFormPresentation,
   type SidebarFieldFactoryOptions,
   type SidebarItem,
+  type SidebarMainOwnerKey,
   type SidebarMousePresentation,
+  type SidebarRemoteCloseRow,
+  type SidebarSavedPickerPresentation,
 } from "./sidebar";
-import type { TerminalMouseReportingRequest } from "./terminal-surface";
+import type { TerminalFrame, TerminalInputModes, TerminalMouseReportingRequest } from "./terminal-surface";
 import type { NativeClipboardEvent } from "./native-clipboard";
 import {
   HostClipboardDiagnosticCollector,
@@ -96,11 +182,133 @@ const ROW_RESUME_DUPLICATE = "This conversation is already restarting";
 const SAVED_UNAVAILABLE = "Saved conversations are unavailable in this host";
 const REMOVE_REFUSED_MESSAGE = "Session not removed; it may be live, unconfirmed, or no longer available.";
 const REMOVE_FAILURE_MESSAGE = "Session was not removed; its state could not be confirmed.";
+/** The existing notice for a stop this host will not perform without a deliberate confirmation. */
+const ROW_STOP_CONFIRMATION_MESSAGE = "Activity changed or is unknown. Press d again to confirm stopping this session.";
 const ROSTER_UNAVAILABLE_MESSAGE = "That remembered conversation is unavailable; remove it or open a saved conversation";
+const LOCAL_VIEW_DETACHED_MESSAGE = "No session is displayed. Every session keeps running; press enter on a row to display it.";
+const NO_LOCAL_VIEW_MESSAGE = "No session is displayed already; press enter on a row to display it";
 const ROSTER_SAVE_FAILURE_MESSAGE = "The session roster could not be saved; these rows will not be restored after a restart";
 const ROSTER_OVERFLOW_MESSAGE = "The session roster is larger than this host can save; the saved roster was left unchanged";
 const ROSTER_OWNERSHIP_MESSAGE = "Session host ownership was not confirmed released; a later host will refuse to start until it is resolved.";
 const ROSTER_RETAINED_MESSAGE = "Session host ownership is retained because shutdown did not settle.";
+/** Fixed, bounded display status while a deliberately selected remote viewport is awaited. */
+const REMOTE_CONTENT_WAITING_MESSAGE = "Waiting for the selected remote session's display";
+const REMOTE_CONTENT_UNAVAILABLE_MESSAGE = "The selected remote session's display is unavailable; its session keeps running on its host";
+const REMOTE_CONTENT_UNOBSERVED_MESSAGE = "That remote session's owner run was not observed; nothing is displayed";
+/**
+ * Truthful status while an owner-reported `started` row has not yet appeared in
+ * the requester's own roster observation. The coordinator's existing selection
+ * intent is retained and served by the next roster event, so this is pending —
+ * never an "unavailable" claim about a row the owner just created.
+ */
+const REMOTE_CONTENT_CREATED_WAITING_MESSAGE =
+  "Waiting for the new remote session in its host's roster";
+const REMOTE_CONTENT_UNSUPPORTED_MESSAGE = "Remote display is unavailable in this host; local sessions are unchanged";
+const REMOTE_CONTENT_INVALID_MESSAGE = "That remote row is no longer displayed; select it again from the roster";
+/**
+ * Fixed, bounded, non-modal notices for refused remote native input. They say only
+ * what this side actually knows: a refusal before any submission sent nothing; a
+ * refusal the owner may already have received is labelled UNCERTAIN. The
+ * uncertainty label leads the message because the composed notice surface keeps
+ * one bounded row and clips its tail, so the essential classification survives on
+ * a narrow terminal. No dialog, retry, truncation of input, focus change, payload,
+ * or exception text is involved.
+ */
+const REMOTE_INPUT_NOT_SENT_MESSAGE = "Remote input was refused; nothing was sent to the remote session";
+const REMOTE_INPUT_PASTE_TOO_LARGE_MESSAGE = "That paste is larger than a remote session accepts; nothing was sent";
+const REMOTE_INPUT_UNCERTAIN_MESSAGE =
+  "UNCERTAIN: remote input may have been handed off; outcome unknown";
+/**
+ * This viewer's saved Network-menu preference is Off (or its settings are
+ * unavailable). Nothing was sent, and nothing about the connection, the owner, or
+ * any other viewer changed.
+ */
+const REMOTE_INPUT_VIEWER_OFF_MESSAGE =
+  "Remote input/copy is off for this viewer; nothing was sent to the remote session";
+/** Exact outer brackets of one complete host-delivered bracketed paste packet. */
+const BRACKETED_PASTE_START = "\x1b[200~";
+const BRACKETED_PASTE_END = "\x1b[201~";
+/**
+ * Fixed, bounded notices for one remote Close attempt. They describe only what
+ * this side knows: a close that was never drawn, never addressable, never sent,
+ * or whose owner outcome is a fixed fact. Nothing here claims a local removal,
+ * a saved-conversation change, or a retry, and no path or raw error is shown.
+ */
+const REMOTE_CLOSE_NOT_DRAWN_MESSAGE =
+  "That remote session is not the displayed highlight; nothing was requested";
+const REMOTE_CLOSE_NO_RUN_MESSAGE =
+  "That remote session's owner run was not observed; no close was requested";
+const REMOTE_CLOSE_NO_PROCESS_MESSAGE =
+  "That remote session has no owned process to stop; no close was requested";
+const REMOTE_CLOSE_UNSUPPORTED_MESSAGE =
+  "This host cannot ask another host to close a session";
+const REMOTE_CLOSE_BUSY_MESSAGE =
+  "That remote session already has a close in progress";
+const REMOTE_CLOSE_DIALOG_CHANGED_MESSAGE =
+  "The remote close confirmation changed or is not displayed; review it again";
+const REMOTE_CLOSE_TARGET_GONE_MESSAGE =
+  "That remote session is no longer in its owner's roster; no close was requested";
+/** The content protocol's own viewport bound; a larger owner frame is never claimed. */
+const MAX_CONTENT_DIMENSION = 1000;
+/**
+ * Fixed, bounded notices for one requester-side remote New submission. Each says
+ * only what this side positively knows: a form that was never drawn, a target
+ * that is no longer addressable, a reply-before-observation selection, an owner
+ * fact, or an outcome this side can no longer observe. Nothing here claims a
+ * local creation, a retry, a reconnect, a regrant, or a cancellation, and no
+ * path, error payload, or exception text is ever shown.
+ */
+const CREATE_ON_PEER_UNSUPPORTED_MESSAGE =
+  "This host cannot ask another host to create a session";
+const CREATE_ON_PEER_BUSY_MESSAGE =
+  "Another remote create is already in progress; nothing was sent";
+const CREATE_ON_PEER_GONE_MESSAGE =
+  "That destination or its owner run is no longer observed; nothing was sent";
+const CREATE_ON_PEER_FORM_CHANGED_MESSAGE =
+  "The New session form changed before it was sent; nothing was sent";
+const CREATE_ON_PEER_UNCONFIRMED_MESSAGE =
+  "The remote host could not confirm that the session started; nothing was selected";
+const CREATE_ON_PEER_REFUSED_MESSAGE =
+  "The remote host did not accept that create; nothing was started";
+/** One wording source for uncertainty: the sidebar's own fixed notice. */
+const CREATE_ON_PEER_UNKNOWN_MESSAGE = CREATE_ON_PEER_UNCERTAIN_NOTICE;
+/**
+ * Fixed, bounded notices for the selected-host Saved picker's requests. Each
+ * says only what this side knows: a request that was never sent, an owner fact,
+ * or an outcome this side cannot observe. Nothing claims a local change, a
+ * retry, a cancellation, or a path, and no raw error text is ever shown.
+ */
+const REMOTE_SAVED_CONTROLLER_MISSING_MESSAGE =
+  "This host cannot browse another host's Saved history; nothing was requested";
+const REMOTE_SAVED_BUSY_MESSAGE =
+  "Another Saved request to that host is still in progress; nothing was sent";
+const REMOTE_SAVED_CONFIRMATION_CHANGED_MESSAGE =
+  "The delete confirmation changed or is not displayed; nothing was deleted";
+const REMOTE_SAVED_NOT_SENT_MESSAGE =
+  "That host is not ready or no longer addressable; nothing was sent";
+const REMOTE_SAVED_STALE_MESSAGE =
+  "The remote Saved list changed; edit the query or choose the host again";
+const REMOTE_SAVED_UNAVAILABLE_MESSAGE =
+  "The remote host's Saved history is unavailable right now";
+const REMOTE_SAVED_READ_REFUSED_MESSAGE =
+  "The remote host did not return that part of its Saved list";
+const REMOTE_SAVED_READ_UNKNOWN_MESSAGE =
+  "The remote Saved list reply could not be confirmed; nothing was changed";
+const REMOTE_SAVED_RESUME_REFUSED_MESSAGE =
+  "The remote host did not start that saved conversation";
+const REMOTE_SAVED_RESUME_DUPLICATE_MESSAGE =
+  "That saved conversation is already open on its host";
+const REMOTE_SAVED_RESUME_UNCONFIRMED_MESSAGE =
+  "The remote host could not confirm that the conversation started; nothing was selected";
+const REMOTE_SAVED_RESUME_COMPLETED_MESSAGE = "Remote conversation resumed";
+const REMOTE_SAVED_DELETE_ACTIVE_MESSAGE =
+  "Close the Pi session using this conversation on its host before deleting its saved file";
+const REMOTE_SAVED_DELETE_REFUSED_MESSAGE =
+  "The remote host did not delete that saved file";
+const REMOTE_SAVED_DELETE_UNCONFIRMED_MESSAGE =
+  "UNCERTAIN: the remote host could not confirm the deletion; it was not re-sent";
+const REMOTE_SAVED_DELETE_RECONFIRM_MESSAGE =
+  "The remote host needs a fresh confirmation; nothing was deleted";
 const INPUT_DRAIN_MAX_MS = 250;
 const INPUT_DRAIN_IDLE_MS = 50;
 // One bounded readiness deadline for a just-spawned exited-row replacement:
@@ -122,25 +330,360 @@ export interface SessionHostOptions {
 type MainTerminal = Pick<ProcessTerminal,
   "start" | "stop" | "drainInput" | "write" | "columns" | "rows" | "kittyProtocolActive" | "modifyOtherKeysActive"
 >;
-type MainManager = Pick<InstanceManager,
-  "list" | "surface" | "write" | "resize" | "hasLiveProcesses" | "create" | "rename" | "closeExited" | "shutdown" | "dispose" | "ownedLiveSessions"
-> & Partial<Pick<InstanceManager, "stop" | "closeError">>;
 type MainObserver = Pick<KeyboardCapabilityObserver, "flags" | "wait" | "dispose" | "feed">;
 type MainWriter = Pick<SessionHostFrameWriter, "start" | "submit" | "close">
   & Partial<Pick<SessionHostFrameWriter, "invalidate">>;
+/** The canonical session size and revision a native frame was drawn from (#474). */
+interface CanonicalSessionGeometry {
+  readonly cols: number;
+  readonly rows: number;
+  readonly revision: number;
+}
+
+/**
+ * Immutable receipt of the ONE remote native IO source a frame ACTUALLY drew.
+ *
+ * Every fact is captured with the candidate the writer was handed and becomes a
+ * receipt only when that exact candidate is reported `written`; a queued, held,
+ * or superseded candidate never becomes one. The receipt is what later input and
+ * copy attempts are measured against, so an old written source can never be
+ * retargeted onto a newer owner source (or the reverse).
+ *
+ * It carries no permission by itself: every attempt re-proves the current Main
+ * focus, actual coverage, drawn content rectangle, canonical geometry, the
+ * coordinator's own current selection/endpoint, and (for input) the exact
+ * observed modes before anything is submitted.
+ */
+interface WrittenRemoteNativeInput {
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly rowId: string;
+  readonly selectionGeneration: number;
+  readonly subscriptionId: string;
+  /**
+   * Exact host-written source of the drawn viewport: a conversation source, or the
+   * explicit tuple-less startup source of a publish that named no conversation. A
+   * startup receipt is input-only: a copy (always conversation-sourced) never
+   * matches it.
+   */
+  readonly source: NativeIoInputSource;
+  /** Exact observed input modes of that same drawn publish. */
+  readonly inputModes: TerminalInputModes;
+  /** Canonical size/revision the drawn content came from. */
+  readonly geometry: CanonicalSessionGeometry;
+  /** The rectangle inside the native pane the written frame actually filled. */
+  readonly nativeContent: HostPaneRect;
+  /**
+   * Remote native IO geometry epoch of the frame that was actually written. An
+   * outer resize can reflow the physical screen and return to the same dimensions
+   * before any replacement frame is written, so rectangle equality alone cannot
+   * prove this receipt still belongs to what the operator sees; the current epoch
+   * must equal this one. It gates remote input/copy only — never Close or any
+   * other host UI.
+   */
+  readonly resizeEpoch: number;
+  /**
+   * Viewer remote input/copy preference generation this frame was composed under.
+   * Every actual preference change (including Off -> On) advances the live
+   * generation, so a receipt written before it never authorizes again: enabling
+   * needs a fresh actually-written frame even when its pixels are identical.
+   */
+  readonly policyGeneration: number;
+}
+
 interface MouseFramePresentation {
   readonly layout: HostLayout;
   readonly focus: SidebarController["focus"];
   readonly sidebar: SidebarMousePresentation;
-  /** Current active owner only when its complete native frame matched this layout. */
+  /** Current active LOCAL owner only when its complete native frame matched this layout. */
   readonly nativeOwnerId: string | undefined;
+  /**
+   * The rectangle the owner's frame actually filled inside the native pane (#474).
+   * A session smaller than this pane is drawn at the pane's top-left corner and
+   * padded, so positional authority ends where this rectangle ends.
+   */
+  readonly nativeContent: HostPaneRect | undefined;
+  /** Canonical size/revision the drawn content came from, when the manager reported one. */
+  readonly nativeGeometry: CanonicalSessionGeometry | undefined;
+  /**
+   * Generalized identity of the ONE source this frame actually drew: `local|<row>`
+   * for a live local owner, or the exact remote kind/host/run/row/generation and
+   * native conversation epoch for a selected remote viewport. Undefined when
+   * nothing defensible was drawn. `nativeOwnerId` stays local-only for the
+   * existing positional/clipboard validators; this key is what makes a source
+   * replacement (a different host, row, run, selection, or conversation) a
+   * semantic boundary even when the composed bytes are identical.
+   */
+  readonly contentKey: string | undefined;
+  /**
+   * The full drawn-source receipt descriptor: the content key plus the exact
+   * subscription, publish sequence, canonical geometry revision, and the actual
+   * uncovered rectangle. Only the copy carried by the presentation the writer
+   * reported as `written` is a receipt; a queued, held, or superseded candidate
+   * never becomes one.
+   */
+  readonly contentSource: string | undefined;
+  /**
+   * Geometry epoch of the remote-close highlight receipt. A resize advances the
+   * live epoch, so a presentation written before it can never authorize a Close
+   * after the terminal reflowed — even when the reflow returns to the same size
+   * before anything is repainted, and even if an older in-flight write settles.
+   */
+  readonly remoteCloseEpoch: number;
+  /**
+   * Actual-written remote native IO receipt of THIS frame, only while the frame
+   * drew the selected remote viewport uncovered inside Main. Absent for local
+   * rows, covered panes, and for legacy display-only streams that publish no
+   * host-written source. Never authority: the input and copy paths re-prove every
+   * current fact on each protected attempt.
+   */
+  readonly nativeInput: WrittenRemoteNativeInput | undefined;
 }
+
+/**
+ * The ONE content source Main displays: one local manager row, or one exact
+ * remote owner run/row observed in a connected destination's roster. A remote
+ * opaque id is never a local row id: every local mutator goes through
+ * `localActiveId()`, so a remote selection can never reach a local manager
+ * method even when the ids collide.
+ */
+type MainContentTarget = SidebarMainOwnerKey;
+
+/**
+ * One remote native viewport Main accepted for display. Every fact came from the
+ * coordinator's own complete current view: the tuple it was published on, the
+ * native conversation tuple the owner reported with it, the canonical geometry it
+ * was drawn at, and the frame itself, carried unchanged.
+ */
+interface AcceptedRemoteContent {
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly rowId: string;
+  readonly selectionGeneration: number;
+  readonly subscriptionId: string;
+  readonly sequence: number;
+  readonly nativeSession: { readonly sessionId: string; readonly epoch: number } | null;
+  readonly geometry: CanonicalSessionGeometry;
+  readonly frame: TerminalFrame;
+  /** Stable across frames of one stream; distinct per host/run/row/selection/epoch. */
+  readonly contentKey: string;
+  /** Per-publish receipt descriptor (content key, subscription, sequence, geometry, rect). */
+  readonly sourceKey: string;
+  /** Bounded graphics owner key: never another host's image-id cache. */
+  readonly graphicsOwnerId: string;
+  /**
+   * Immutable host-written native IO source carried by this exact complete
+   * publish, or `undefined` when the owner offered none (or it was not coherent
+   * with this view). Descriptive only: it is never authority, and it is never
+   * re-read from a newer publish on an older viewport's behalf. A startup source
+   * is accepted only for a publish whose native conversation is null.
+   */
+  readonly inputSource: NativeIoInputSource | undefined;
+  /**
+   * Exact observed input modes of that same publish, or `undefined` when absent or
+   * malformed. Both this and {@link inputSource} must be present before any input
+   * may be attempted, so a missing or invalid fact removes the capability rather
+   * than being guessed.
+   */
+  readonly inputModes: TerminalInputModes | undefined;
+}
+
+/** A graphics owner key the writer accepts (nonempty, control-free, <= 256 chars). */
+function boundedOwnerKey(prefix: string, raw: string): string {
+  const key = `${prefix}|${raw}`;
+  if (!/[\x00-\x1f\x7f-\x9f]/.test(key) && key.length <= 200) return key;
+  return `${prefix}|${createHash("sha256").update(raw).digest("hex")}`;
+}
+
+/**
+ * Main's view of the ONE coordinator: everything {@link PeerCoordinator} already
+ * promised, plus the content controller the production factory actually returns
+ * and the rowless create controller the production factory now exposes. These are
+ * typed as optional so a metadata-only or older coordinator keeps satisfying this
+ * view without inventing frames, controllers, or capabilities it does not have.
+ */
+type MainPeerCoordinator = PeerCoordinator
+  & Partial<Pick<PeerCoordinatorWithContent, "content">>
+  & Partial<Pick<PeerCoordinatorWithCreate, "ownerCreate">>
+  & Partial<Pick<PeerCoordinatorWithSaved, "ownerSaved">>;
 
 interface SavedDeleteConfirmationFrame {
   readonly renderToken: number;
   readonly cols: number;
   readonly rows: number;
+  /**
+   * REMOTE Saved delete only: the exact owner target Main itself prepared (never
+   * a file path, caption, or token alone) plus the form-slot pane and Main epochs
+   * this dialog frame was composed under. A Local delete confirmation never
+   * carries it, and the Local delete path never accepts a frame that does.
+   */
+  readonly remote?: RemoteSavedDeleteFrameContext;
   settled: boolean;
+}
+
+/**
+ * The one owner Delete target Main prepared: the exact frozen picker, query
+ * revision, destination, owner run, and owner catalog/result/entry handles of a
+ * Delete-prepare the owner answered with `confirmation-required`. `serial` makes
+ * every new preparation (even of the same entry) a different confirmation source.
+ */
+interface RemoteSavedPrepared {
+  readonly serial: number;
+  readonly pickerId: number;
+  readonly revision: number;
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly catalogId: string;
+  readonly resultId: string;
+  readonly entryId: string;
+}
+
+interface RemoteSavedDeleteFrameContext {
+  readonly prepared: RemoteSavedPrepared;
+  readonly pane: HostPaneRect;
+  readonly epoch: number;
+  /** Semantic source identity of this remote confirmation (never a render token). */
+  readonly sourceKey: string;
+}
+
+/**
+ * One remote Saved picker frame Main handed the writer: the Sidebar's own frozen
+ * presentation (token, view epoch, picker, revision, destination, run, catalog,
+ * result, selection, drawn entry ids, pane size) plus the outer terminal size,
+ * the form-slot pane rectangle, and Main's remote Saved epoch it was composed
+ * under. It becomes a receipt only when the writer reports THIS frame written
+ * (or an unchanged repaint of this same already-settled frame).
+ */
+interface RemoteSavedPickerFrame {
+  readonly presentation: SidebarSavedPickerPresentation;
+  readonly terminalCols: number;
+  readonly terminalRows: number;
+  readonly pane: HostPaneRect;
+  readonly epoch: number;
+  settled: boolean;
+}
+
+/** The three remote Saved entry intents that need an actually-written admission. */
+type RemoteSavedEntryIntent = PeerSavedUiResumeIntent | PeerSavedUiDeletePrepareIntent | PeerSavedUiDeleteIntent;
+
+/** The three remote Saved read intents (latest-unsent-only; never a mutation). */
+type RemoteSavedReadIntent = PeerSavedUiListIntent | PeerSavedUiSearchIntent | PeerSavedUiWindowIntent;
+
+/**
+ * One immutable, ALREADY CONSUMED admission of a remote Saved entry intent. It
+ * was captured synchronously from an exact actually-written receipt and is the
+ * only thing a queued write may re-prove: the frozen intent, the outer terminal
+ * size and form-slot pane it was proved at, and Main's remote Saved epoch.
+ * Nothing here can be minted from a render, a callback, or returned owner facts.
+ */
+interface RemoteSavedAdmission {
+  readonly intent: RemoteSavedEntryIntent;
+  readonly terminalCols: number;
+  readonly terminalRows: number;
+  readonly pane: HostPaneRect;
+  readonly epoch: number;
+}
+
+/** The ONE submitted remote Saved request per destination (the raw channel's one pending). */
+interface RemoteSavedInflight {
+  readonly hostId: string;
+  readonly requestId: number;
+}
+
+interface PeerConsentConfirmationFrame extends PeerConsentPresentation {
+  readonly cols: number;
+  readonly rows: number;
+  settled: boolean;
+}
+
+/**
+ * One frozen remote-close confirmation candidate: the minimal owner target and
+ * the monotonic generation the dialog was opened with, plus the token the
+ * sidebar minted for this exact drawn frame and the terminal geometry it was
+ * composed at. Only a frame the actual writer reported as written (or as an
+ * unchanged repaint of a frame this same candidate already settled) is proof.
+ */
+interface RemoteCloseConfirmationFrame {
+  readonly target: {
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+  };
+  /** Bounded display title of the frozen target. Never part of any identity. */
+  readonly title: string;
+  readonly generation: number;
+  readonly renderToken: number;
+  readonly cols: number;
+  readonly rows: number;
+  settled: boolean;
+}
+
+/**
+ * One frozen New-form frame: exactly what the sidebar drew (host identity, the
+ * DTO's observed owner run, and the canonical workspace the field held), the
+ * OUTER terminal geometry it was composed at, the form PANE rectangle the
+ * sidebar actually rendered into, the geometry epoch it belongs to, and the
+ * monotonic token that names it. Only a frame the actual writer reported as
+ * written (or an unchanged repaint of a candidate this same frame already
+ * settled) is proof that the operator sees this exact form.
+ *
+ * Terminal and pane geometry are deliberately separate facts: the pane is the
+ * layout's form rect (wide) or its overlay rect (narrow), never the terminal
+ * size, and a comparison across the two can never settle.
+ */
+interface CreateFormFrame extends SidebarCreateFormPresentation {
+  /** Outer terminal columns/rows this composition was made at. */
+  readonly terminalCols: number;
+  readonly terminalRows: number;
+  /** Geometry epoch; a resize retires every frame composed before it. */
+  readonly epoch: number;
+  settled: boolean;
+}
+
+/**
+ * One bounded remote New attempt: the exact submitted destination, owner run,
+ * workspace, form generation, and written receipt, plus the terminal AND form
+ * pane geometry and the geometry epoch that receipt belonged to. Every fact was
+ * captured at submission and is never re-derived from a later roster index,
+ * label, selection, or layout; the owner host revalidates its own run.
+ */
+interface CreateOnPeerAttempt {
+  readonly requestId: number;
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly workspace: string;
+  readonly formGeneration: number;
+  readonly renderToken: number;
+  readonly terminalCols: number;
+  readonly terminalRows: number;
+  readonly paneCols: number;
+  readonly paneRows: number;
+  readonly epoch: number;
+}
+
+/** One bounded remote Close attempt, frozen for its notices and its marker. */
+interface RemoteCloseAttempt {
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly rowId: string;
+  /** Bounded display title of the row this attempt was about. */
+  readonly title: string;
+  /** True only for a deliberately confirmed request. */
+  readonly confirmed: boolean;
+  /** True only when this side's drawn facts positively showed complete idleness. */
+  readonly cachedIdle: boolean;
+}
+
+/**
+ * A bounded, ephemeral per-target reminder that the owner reported it was not
+ * idle after an unconfirmed request this side believed was idle. It never
+ * authorizes anything and never sets `confirmed` by itself: the next deliberate
+ * request for the same owner run/row must be confirmed on a WRITTEN dialog.
+ */
+interface RemoteCloseConfirmationMarker {
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly rowId: string;
 }
 
 function sameMouseAuthorization(a: MouseFramePresentation, b: MouseFramePresentation): boolean {
@@ -154,8 +697,55 @@ function sameMouseAuthorization(a: MouseFramePresentation, b: MouseFramePresenta
   if (a.layout.sidebarOverlay !== b.layout.sidebarOverlay
     || pane(a.layout.sidebar)?.join(",") !== pane(b.layout.sidebar)?.join(",")
     || pane(a.layout.form)?.join(",") !== pane(b.layout.form)?.join(",")) return false;
+  // The drawn content rectangle and the canonical size it was drawn from are part
+  // of positional authority (#474). A session that grew or shrank behind a queued
+  // replacement frame crosses the writer's written boundary before newly exposed
+  // padding, or a new size, authorizes anything at all.
+  const rect = (value: HostPaneRect | undefined): string => value === undefined
+    ? ""
+    : `${value.column}:${value.row}:${value.cols}:${value.rows}`;
+  const geometry = (value: CanonicalSessionGeometry | undefined): string => value === undefined
+    ? ""
+    : `${value.cols}x${value.rows}@${value.revision}`;
+  if (rect(a.nativeContent) !== rect(b.nativeContent)
+    || geometry(a.nativeGeometry) !== geometry(b.nativeGeometry)) return false;
+  // The drawn source itself is part of authorization: a different local row, a
+  // different remote host/run/row/selection, or a new native conversation epoch
+  // needs its own written frame before anything is authorized against it, even
+  // when the composed bytes happen to match.
+  if (a.contentKey !== b.contentKey) return false;
   if (a.layout.sidebar === undefined && a.layout.form === undefined) return true;
   return a.sidebar.authorizationKey === b.sidebar.authorizationKey;
+}
+
+/**
+ * Value equality for one written remote-close highlight. Only the minimal owner
+ * target, the drawn row/height, the pane geometry, the focus domain, and the
+ * condensed preflight facts matter: never object identity, never the sidebar's
+ * mouse-authorization key, and never the native conversation tuple, labels, or
+ * content stream. A moved highlight, a reordered/reflowed row, or a changed
+ * idleness/progress observation is a different written frame.
+ */
+function sameRemoteCloseRow(a: SidebarRemoteCloseRow | undefined, b: SidebarRemoteCloseRow | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.hostId === b.hostId
+    && a.hostRunId === b.hostRunId
+    && a.rowId === b.rowId
+    && a.row === b.row
+    && a.height === b.height
+    && a.cols === b.cols
+    && a.rows === b.rows
+    && a.focus === b.focus
+    && a.lifecycle === b.lifecycle
+    && a.hasLiveProcess === b.hasLiveProcess
+    && a.idle === b.idle;
+}
+
+function sameRemoteCloseTarget(
+  a: { readonly hostId: string; readonly hostRunId: string; readonly rowId: string },
+  b: { readonly hostId: string; readonly hostRunId: string; readonly rowId: string },
+): boolean {
+  return a.hostId === b.hostId && a.hostRunId === b.hostRunId && a.rowId === b.rowId;
 }
 
 function samePaneGeometry(a: HostPaneRect | undefined, b: HostPaneRect | undefined): boolean {
@@ -176,6 +766,7 @@ function sameNativePaneGeometry(a: HostLayout, b: HostLayout): boolean {
 function sameNativeMouseTarget(a: MouseFramePresentation, b: MouseFramePresentation): boolean {
   return a.focus === "sidebar" && b.focus === "sidebar"
     && a.nativeOwnerId !== undefined && a.nativeOwnerId === b.nativeOwnerId
+    && samePaneGeometry(a.nativeContent, b.nativeContent)
     && sameNativePaneGeometry(a.layout, b.layout);
 }
 
@@ -206,14 +797,36 @@ interface MainDependencies {
     profileRegistry: ProfilePreparer;
     nativeAgentDir?: string;
   };
-  readonly createManager: (options: InstanceManagerOptions) => MainManager;
+  readonly createManager: (options: InstanceManagerOptions) => OwningHostManager;
+  /**
+   * The presentation-independent owning-session operation boundary (#473): it
+   * opens the host's one authoritative manager and owns the UI-independent row
+   * operations. Focused tests may wrap the production factory to observe the
+   * exact wiring without changing any behavior.
+   */
+  readonly createOwningHostService: (
+    dependencies: OwningHostServiceDependencies,
+  ) => OwningHostService;
   readonly createSidebar: (options: ConstructorParameters<typeof SidebarController>[0]) => SidebarController;
-  /** Read-only listing of the shared native agent root's saved conversations. */
+  /**
+   * Main-owned networking; pure sidebar actions never construct transport or mutate trust.
+   * The production factory returns the composed {@link PeerCoordinatorWithContent};
+   * a metadata-only coordinator (an older fake, or a coordinator built without a
+   * content source) stays valid here and simply has no content controller.
+   */
+  readonly createPeerCoordinator: (options: PeerCoordinatorOptions) => MainPeerCoordinator;
+  /**
+   * Read-only listing of the shared native agent root's saved conversations.
+   * `freshnessScope` is passed ONLY by the owner-side remote Saved view, so its
+   * catalogs never supersede (or are superseded by) the Local picker's; every
+   * Local listing omits it and keeps the default revision domain exactly.
+   */
   readonly listSavedCatalog: (options: {
     agentDir: string;
     piExecutable: string;
     expectedPiVersion: string;
     signal: AbortSignal;
+    freshnessScope?: SavedCatalogFreshnessScope;
   }) => Promise<SavedSessionCatalog>;
   readonly deleteSavedFile: typeof deleteSavedSessionFile;
   /**
@@ -232,6 +845,17 @@ interface MainDependencies {
   readonly createTerminal: () => MainTerminal;
   readonly createObserver: (options: ConstructorParameters<typeof KeyboardCapabilityObserver>[0]) => MainObserver;
   readonly createWriter: (output: Writable, options: Parameters<typeof createSessionHostFrameWriter>[1]) => MainWriter;
+  /**
+   * Dependency-only legacy test seam for the closed native input-framing mode of
+   * this host's owned children plus the native IO bridge of the ONE selected
+   * remote viewport. Absent (production) means ON: children created by this host
+   * get the existing manager framing option and the coordinator gets its dynamic
+   * callbacks. Only an explicit `false` keeps the legacy display-only call shape.
+   * It is not a CLI flag, setting, public option, permission, grant, lease, or
+   * activation, and it is independent of the saved viewer-side remote input/copy
+   * preference, which never changes framing or the owner capability.
+   */
+  readonly nativeInputOriginFraming?: boolean;
   readonly runExternalEditor: typeof runNativeExternalEditor;
   /**
    * Private bounded terminal diagnostics log under the canonical native agent
@@ -274,6 +898,247 @@ type RowResumeReadiness = "ready" | "pending" | "failed";
 function containsHostPoint(rect: HostPaneRect, column: number, row: number): boolean {
   return column >= rect.column && column < rect.column + rect.cols
     && row >= rect.row && row < rect.row + rect.rows;
+}
+
+/**
+ * The rectangle a native frame actually filled inside the native pane (#474).
+ *
+ * A session smaller than the pane is drawn at the pane's top-left corner and
+ * padded, so its content rectangle is smaller than the pane. `undefined` means
+ * nothing defensible was drawn: a missing or malformed frame, or a frame larger
+ * than the pane, which the compositor clips rather than displays whole.
+ */
+function nativeContentRect(pane: HostPaneRect, frame: { cols: number, rows: number } | undefined): HostPaneRect | undefined {
+  if (frame === undefined) return undefined;
+  if (!Number.isSafeInteger(frame.cols) || !Number.isSafeInteger(frame.rows)
+    || frame.cols < 1 || frame.rows < 1
+    || frame.cols > pane.cols || frame.rows > pane.rows) return undefined;
+  if (frame.cols === pane.cols && frame.rows === pane.rows) return pane;
+  return { column: pane.column, row: pane.row, cols: frame.cols, rows: frame.rows };
+}
+
+function sameCanonicalGeometry(a: CanonicalSessionGeometry | undefined, b: CanonicalSessionGeometry | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.cols === b.cols && a.rows === b.rows && a.revision === b.revision;
+}
+
+/**
+ * Outer terminal mouse-reporting mode number for one observed tracking mode; the
+ * same mapping the local child path already uses. `none` requests no capture, and
+ * `sgr-pixels` is never requested because positional input is expressed in cells.
+ */
+function mouseTrackingNumber(tracking: TerminalInputModes["mouseTracking"]): number | undefined {
+  return tracking === "x10" ? 9
+    : tracking === "vt200" ? 1000
+      : tracking === "drag" ? 1002
+        : tracking === "any" ? 1003
+          : undefined;
+}
+
+const NATIVE_IO_MOUSE_TRACKING: ReadonlySet<string> = new Set(["none", "x10", "vt200", "drag", "any"]);
+const NATIVE_IO_MOUSE_ENCODING: ReadonlySet<string> = new Set(["default", "sgr", "sgr-pixels"]);
+const NATIVE_IO_SOURCE_TOKEN = /^[\x21-\x7e]+$/;
+
+/**
+ * Validate and take an immutable copy of the input modes carried by one complete
+ * publish. Only the closed shape the protocol reader admits is accepted; a
+ * missing or malformed fact yields `undefined` (no input capability) instead of a
+ * guess or an inferred default.
+ */
+function readRemoteInputModes(value: unknown): TerminalInputModes | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const modes = value as Record<string, unknown>;
+  const kittyFlags = modes.kittyFlags;
+  if (typeof kittyFlags !== "number" || !Number.isSafeInteger(kittyFlags) || kittyFlags < 0 || kittyFlags > 7) {
+    return undefined;
+  }
+  const modifyOtherKeys = modes.modifyOtherKeys;
+  if (modifyOtherKeys !== 0 && modifyOtherKeys !== 1 && modifyOtherKeys !== 2) return undefined;
+  const applicationCursorKeys = modes.applicationCursorKeys;
+  const applicationKeypad = modes.applicationKeypad;
+  const bracketedPaste = modes.bracketedPaste;
+  if (typeof applicationCursorKeys !== "boolean"
+    || typeof applicationKeypad !== "boolean"
+    || typeof bracketedPaste !== "boolean") return undefined;
+  const mouseTracking = modes.mouseTracking;
+  if (typeof mouseTracking !== "string" || !NATIVE_IO_MOUSE_TRACKING.has(mouseTracking)) return undefined;
+  const mouseEncoding = modes.mouseEncoding;
+  if (typeof mouseEncoding !== "string" || !NATIVE_IO_MOUSE_ENCODING.has(mouseEncoding)) return undefined;
+  return Object.freeze({
+    kittyFlags,
+    applicationCursorKeys,
+    applicationKeypad,
+    bracketedPaste,
+    mouseTracking: mouseTracking as TerminalInputModes["mouseTracking"],
+    modifyOtherKeys,
+    mouseEncoding: mouseEncoding as TerminalInputModes["mouseEncoding"],
+  });
+}
+
+/** Exact semantic equality of one observed mode set. */
+function sameTerminalInputModes(a: TerminalInputModes | undefined, b: TerminalInputModes | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.kittyFlags === b.kittyFlags
+    && a.applicationCursorKeys === b.applicationCursorKeys
+    && a.applicationKeypad === b.applicationKeypad
+    && a.bracketedPaste === b.bracketedPaste
+    && a.mouseTracking === b.mouseTracking
+    && a.modifyOtherKeys === b.modifyOtherKeys
+    && a.mouseEncoding === b.mouseEncoding;
+}
+
+/**
+ * The geometry, viewer revision, and token facts of one remote source, validated
+ * exactly as the conversation branch below validates them and required to match
+ * the publish's own canonical geometry. Undefined when any fact is malformed.
+ */
+function readRemoteSourceFacts(
+  record: Record<string, unknown>,
+  expectedGeometry: CanonicalSessionGeometry,
+): { readonly geometry: CanonicalSessionGeometry; readonly viewerRevision: number; readonly sourceToken: string } | undefined {
+  const geometry = record.geometry;
+  if (geometry === null || typeof geometry !== "object") return undefined;
+  const geometryRecord = geometry as Record<string, unknown>;
+  const cols = geometryRecord.cols;
+  const rows = geometryRecord.rows;
+  const revision = geometryRecord.revision;
+  if (typeof cols !== "number" || !Number.isSafeInteger(cols) || cols < 1
+    || typeof rows !== "number" || !Number.isSafeInteger(rows) || rows < 1
+    || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) return undefined;
+  if (cols !== expectedGeometry.cols || rows !== expectedGeometry.rows
+    || revision !== expectedGeometry.revision) return undefined;
+  const viewerRevision = record.viewerRevision;
+  if (typeof viewerRevision !== "number" || !Number.isSafeInteger(viewerRevision) || viewerRevision < 1) {
+    return undefined;
+  }
+  const sourceToken = record.sourceToken;
+  if (typeof sourceToken !== "string" || sourceToken.length === 0
+    || sourceToken.length > NATIVE_IO_MAX_SOURCE_TOKEN_BYTES || !NATIVE_IO_SOURCE_TOKEN.test(sourceToken)) {
+    return undefined;
+  }
+  return { geometry: Object.freeze({ cols, rows, revision }), viewerRevision, sourceToken };
+}
+
+/**
+ * Validate and take an immutable copy of the host-written native IO source of one
+ * complete accepted publish. It must be coherent with that publish's own owner
+ * run, row, native conversation tuple, and canonical geometry; anything else is
+ * not an input source. Every source field is copied, never retained by reference.
+ */
+function readRemoteNativeIoSource(
+  value: unknown,
+  expected: {
+    readonly hostRunId: string;
+    readonly sessionId: string;
+    readonly nativeSession: { readonly sessionId: string; readonly epoch: number } | null;
+    readonly geometry: CanonicalSessionGeometry;
+  },
+): NativeIoInputSource | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const hostRunId = record.hostRunId;
+  const sessionId = record.sessionId;
+  const maxIdentifier = DEFAULT_SESSION_CONTENT_BOUNDS.maxIdentifierBytes;
+  if (typeof hostRunId !== "string" || hostRunId.length === 0 || hostRunId.length > maxIdentifier) return undefined;
+  if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > maxIdentifier) return undefined;
+  if (hostRunId !== expected.hostRunId || sessionId !== expected.sessionId) return undefined;
+  if (Object.prototype.hasOwnProperty.call(record, "phase")) {
+    // The explicit startup source: coherent only with a publish that names NO
+    // native conversation, and never carrying a tuple key of its own.
+    if (record.phase !== "startup" || expected.nativeSession !== null
+      || Object.prototype.hasOwnProperty.call(record, "nativeSession")) return undefined;
+    const startupFacts = readRemoteSourceFacts(record, expected.geometry);
+    if (startupFacts === undefined) return undefined;
+    return Object.freeze({
+      hostRunId,
+      sessionId,
+      phase: "startup" as const,
+      geometry: startupFacts.geometry,
+      viewerRevision: startupFacts.viewerRevision,
+      sourceToken: startupFacts.sourceToken,
+    });
+  }
+  if (expected.nativeSession === null) return undefined;
+  const native = record.nativeSession;
+  if (native === null || typeof native !== "object") return undefined;
+  const nativeRecord = native as Record<string, unknown>;
+  const nativeSessionId = nativeRecord.sessionId;
+  const epoch = nativeRecord.epoch;
+  if (typeof nativeSessionId !== "string" || nativeSessionId.length === 0 || nativeSessionId.length > maxIdentifier) {
+    return undefined;
+  }
+  if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 1) return undefined;
+  if (nativeSessionId !== expected.nativeSession.sessionId || epoch !== expected.nativeSession.epoch) return undefined;
+  const geometry = record.geometry;
+  if (geometry === null || typeof geometry !== "object") return undefined;
+  const geometryRecord = geometry as Record<string, unknown>;
+  const cols = geometryRecord.cols;
+  const rows = geometryRecord.rows;
+  const revision = geometryRecord.revision;
+  if (typeof cols !== "number" || !Number.isSafeInteger(cols) || cols < 1
+    || typeof rows !== "number" || !Number.isSafeInteger(rows) || rows < 1
+    || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) return undefined;
+  if (cols !== expected.geometry.cols || rows !== expected.geometry.rows
+    || revision !== expected.geometry.revision) return undefined;
+  const viewerRevision = record.viewerRevision;
+  if (typeof viewerRevision !== "number" || !Number.isSafeInteger(viewerRevision) || viewerRevision < 1) {
+    return undefined;
+  }
+  const sourceToken = record.sourceToken;
+  if (typeof sourceToken !== "string" || sourceToken.length === 0
+    || sourceToken.length > NATIVE_IO_MAX_SOURCE_TOKEN_BYTES || !NATIVE_IO_SOURCE_TOKEN.test(sourceToken)) {
+    return undefined;
+  }
+  return Object.freeze({
+    hostRunId,
+    sessionId,
+    nativeSession: Object.freeze({ sessionId: nativeSessionId, epoch }),
+    geometry: Object.freeze({ cols, rows, revision }),
+    viewerRevision,
+    sourceToken,
+  });
+}
+
+/**
+ * Semantic identity of one actual-written remote native IO receipt.
+ *
+ * Two equal keys mean the same written source, native tuple and epoch, canonical
+ * geometric revision, viewer revision, host commitment, observed modes, and drawn
+ * content rectangle — so ordinary terminal text output (which mints fresh
+ * snapshots, frames, and sequences without changing any of these) never forces a
+ * writer boundary or stalls typing. Object identity and publish sequence are
+ * deliberately absent. This key only decides writer-invalidation and the remote IO
+ * proof; it is never part of the shared UI/mouse/Close authorization identity.
+ */
+function nativeIoReceiptKey(receipt: WrittenRemoteNativeInput | undefined): string {
+  if (receipt === undefined) return "";
+  const source = receipt.source;
+  const modes = receipt.inputModes;
+  const rect = receipt.nativeContent;
+  // The phase and the tuple are explicit key facts: a startup receipt and a
+  // conversation receipt can never share a key, so a phase/source-only change is a
+  // genuine writer boundary even when the pixels are identical.
+  const phase = isNativeIoStartupSource(source) ? "startup" : "conversation";
+  const tupleId = isNativeIoStartupSource(source) ? null : source.nativeSession.sessionId;
+  const tupleEpoch = isNativeIoStartupSource(source) ? null : source.nativeSession.epoch;
+  return JSON.stringify([
+    receipt.hostId, receipt.hostRunId, receipt.rowId, receipt.selectionGeneration, receipt.subscriptionId,
+    phase, source.hostRunId, source.sessionId, tupleId, tupleEpoch,
+    source.geometry.cols, source.geometry.rows, source.geometry.revision,
+    source.viewerRevision, source.sourceToken,
+    modes.kittyFlags, modes.applicationCursorKeys, modes.applicationKeypad, modes.bracketedPaste,
+    modes.mouseTracking, modes.modifyOtherKeys, modes.mouseEncoding,
+    rect.column, rect.row, rect.cols, rect.rows,
+    receipt.resizeEpoch,
+    receipt.policyGeneration,
+  ]);
+}
+
+function sameNativeIoReceipt(
+  a: WrittenRemoteNativeInput | undefined,
+  b: WrittenRemoteNativeInput | undefined,
+): boolean {
+  return a === b || nativeIoReceiptKey(a) === nativeIoReceiptKey(b);
 }
 
 function mouseButtonId(mouse: ParsedMouseInput): number | undefined {
@@ -473,23 +1338,6 @@ function savedRefusalNotice(reason: SavedSessionRefusalReason): string {
   }
 }
 
-function savedDeletionOwnedSessions(owner: MainManager): ReturnType<MainManager["ownedLiveSessions"]> {
-  const owned = owner.ownedLiveSessions();
-  // Historical duplicate evidence does not establish the current binding of
-  // a live child whose reporter disconnected or became unavailable.
-  return owner.list().some((view) => view.hasLiveProcess && !view.nativeSession)
-    ? [...owned, {}]
-    : owned;
-}
-
-function validateOwnedSavedSessionDeletion(
-  owner: MainManager,
-  catalog: SavedSessionCatalog,
-  row: SavedSessionRow,
-): SavedSessionDeletionRefusalReason | undefined {
-  return validateSavedSessionDeletion(catalog, row, { ownedLiveSessions: savedDeletionOwnedSessions(owner) });
-}
-
 function savedDeletionRefusalNotice(reason: SavedSessionDeletionRefusalReason): string {
   if (reason === "known-owned-duplicate" || reason === "unknown-live-binding") {
     return "Close the Pi session using this conversation before deleting its saved file";
@@ -516,7 +1364,11 @@ function savedDeletionFailureMessage(result: SavedSessionDeletionResult): string
 
 function statusRegistrar(broker: StatusBroker): StatusRegistrar {
   return {
-    register(instanceId, handlers) {
+    register(instanceId, handlers, options) {
+      // The manager's closed per-registration options are not this adapter's to
+      // interpret: forward the exact object so the ACTUAL broker records the
+      // requested mode in the one-shot bootstrap before any child exists. An
+      // absent request stays absent, preserving the legacy bootstrap.
       const registration = broker.register(instanceId, {
         onStatus: (status) => {
           const update: InstanceStatusUpdate = {
@@ -535,7 +1387,7 @@ function statusRegistrar(broker: StatusBroker): StatusRegistrar {
         onDisconnect: handlers.onDisconnect,
         ...(handlers.onReconnect ? { onReconnect: handlers.onReconnect } : {}),
         ...(handlers.onSpawnRequest ? { onSpawnRequest: handlers.onSpawnRequest } : {}),
-      });
+      }, options);
       // Keep the broker's exact registration closures and their auth/tuple fences.
       return registration satisfies InstanceStatusRegistration;
     },
@@ -590,7 +1442,9 @@ function productionDependencies(): MainDependencies {
       return { nativeSetup: true, profileRegistry: registry, nativeAgentDir: registry.agentDir };
     },
     createManager: (options) => new InstanceManager(options),
+    createOwningHostService: (serviceDependencies) => createLocalOwningHostService(serviceDependencies),
     createSidebar: (options) => new SidebarController(options),
+    createPeerCoordinator,
     listSavedCatalog: listSavedSessions,
     deleteSavedFile: deleteSavedSessionFile,
     openHostState: openProductionHostState,
@@ -647,11 +1501,16 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     nativeAgentDir?: string;
   } | undefined;
   let broker: StatusBroker | undefined;
-  let manager: MainManager | undefined;
+  let manager: OwningHostManager | undefined;
   let terminal: MainTerminal | undefined;
   let observer: MainObserver | undefined;
   let writer: MainWriter | undefined;
   let sidebar: SidebarController | undefined;
+  let peerCoordinator: MainPeerCoordinator | undefined;
+  let peerUiSnapshot: PeerUiSnapshot | undefined;
+  let peerNetworkSettled = true;
+  const peerBellAttempts = new Set<string>();
+  let peerConsentConfirmationFrame: PeerConsentConfirmationFrame | undefined;
   let terminalStartAttempted = false;
   let terminalStarted = false;
   let observerListenerAttached = false;
@@ -664,7 +1523,50 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let effectiveHostShortcuts: HostShortcutBindings = DEFAULT_HOST_SHORTCUTS;
   let hostShortcutAgentDir: string | undefined;
   const legacyToggleOverride = snapshot.toggleKey !== undefined;
-  let activeId: string | undefined;
+  // The ONE content source this host displays (issue #389 display phase): a
+  // local manager row, or one exact remote owner run/row. Every deliberate
+  // selection — local or remote — advances `contentSelectionGeneration`, so a
+  // superseded selection, callback, or late completion never retargets the pane.
+  let contentTarget: MainContentTarget | undefined;
+  let contentSelectionGeneration = 0;
+  /** The accepted remote viewport, dropped the moment it stops being current. */
+  let remoteContentView: AcceptedRemoteContent | undefined;
+  /**
+   * Immutable native IO bridge support for this host's whole lifetime, ON by
+   * default: owned children use strict authenticated input-origin framing, the
+   * one coordinator always gets its dynamic native IO callbacks (so the owner
+   * side's capability never depends on this host's viewer preference), and the
+   * viewer forwarding path exists. Only the explicit dependency-only `false` test
+   * seam keeps the legacy display-only path. Whether THIS viewer actually forwards
+   * input/copy to its displayed remote pane is the separate, mutable, saved viewer
+   * preference, re-read for every protected attempt.
+   */
+  const nativeIoBridgeEnabled = dependencies.nativeInputOriginFraming !== false;
+  /**
+   * Monotonic remote native IO geometry epoch, advanced by every outer resize.
+   *
+   * An outer resize can reflow the physical screen and then return to its original
+   * dimensions before any replacement frame is written (80 -> 70 -> 80). Pane
+   * rectangle equality alone would then let a pre-resize receipt authorize input
+   * and copies again, even though the screen may have been physically reflowed and
+   * the replacement frame was never written. A written receipt carries the epoch
+   * it was composed under; authority additionally requires the current epoch to
+   * match, so a late pre-resize settlement can never revive it. This is a
+   * remote-IO-only fact and adds nothing to Close or ordinary sidebar authority.
+   */
+  let remoteInputEpoch = 0;
+  /**
+   * The ONE brief remote-input notice shown when no sidebar pane is drawn to
+   * carry the sidebar's own notice slot. Set and replaced by the same fixed
+   * messages; no per-input history, and no focus or overlay change.
+   */
+  let remoteInputNotice: string | undefined;
+  /** Truthful display status of the deliberately selected remote stream. */
+  let remoteContentStatus: { state: "waiting" | "unavailable"; message: string } | undefined;
+  /** The one viewport this viewer last asked the selected stream for (deduped). */
+  let lastContentViewport: { generation: number; cols: number; rows: number } | undefined;
+  /** True while Main holds an outstanding selection with the one coordinator. */
+  let contentStreamRequested = false;
   let views: NativeInstanceView[] = [];
   // Successful removals are terminal for this host id. A delayed roster
   // notification must not resurrect a detached row.
@@ -692,7 +1594,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   // that reaches Main, typing) advances this generation. A delayed startup
   // restore applies the remembered active entry only while the generation is
   // unchanged, so a later user action is never overridden even when it left
-  // `activeId` undefined again.
+  // `contentTarget` undefined or moved it to a remote owner.
   let deliberateActionGeneration = 0;
   // Positive evidence that this host's owned-child state settled: a successful
   // manager shutdown result, or a live-state query that actually answered.
@@ -702,9 +1604,68 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let displayedMousePresentation: MouseFramePresentation | undefined;
   let latestMousePresentation: MouseFramePresentation | undefined;
   let savedDeleteConfirmationFrame: SavedDeleteConfirmationFrame | undefined;
+  /** The one frozen remote-close confirmation candidate of the last composition. */
+  let remoteCloseConfirmationFrame: RemoteCloseConfirmationFrame | undefined;
+  /**
+   * The one New-form frame the last composition actually handed the writer, and
+   * the ONLY proof a remote New submission may rely on: it becomes authority
+   * only when that exact candidate is reported written.
+   */
+  let createFormFrame: CreateFormFrame | undefined;
+  /**
+   * Advances on every terminal reflow/geometry retirement. A remote-New receipt
+   * carries the epoch it was composed under, so a resize that returns to the same
+   * dimensions before anything is repainted can never revive a stale receipt.
+   * Ordinary renders, roster updates, and the pending-status repaint of an
+   * already submitted form deliberately do NOT advance it.
+   */
+  let createFormEpoch = 0;
+  /**
+   * The ONE remote New request in flight on this host. It is deliberately not a
+   * queue: a second submission while it is outstanding is refused truthfully
+   * rather than queued, batched, or retargeted, and nothing about it is
+   * re-derived from a later roster observation.
+   */
+  let createOnPeerAttempt: CreateOnPeerAttempt | undefined;
+  /**
+   * One owner-reported `started` row whose requester roster observation has not
+   * arrived yet. It exists only to keep this side truthful while the coordinator's
+   * own selection intent waits for the row: a `roster-unavailable`/`row-unavailable`
+   * fence is then reported as pending, never as "unavailable". The ordinary roster
+   * event (or any later deliberate selection) ends it; it never selects, polls,
+   * replays, or retries anything by itself.
+   */
+  let pendingCreatedRemote:
+    | { readonly hostId: string; readonly hostRunId: string; readonly rowId: string }
+    | undefined;
+  /** Remote targets with a close request already on its way to the owner. */
+  const remoteCloseAttempts = new Set<string>();
+  /**
+   * Per-target owner-confirmation reminders (never authority). The observed
+   * roster/run/host identity bounds this set; there is deliberately no fixed
+   * cap that could evict a still-valid target's reminder.
+   */
+  const remoteCloseMarkers = new Map<string, RemoteCloseConfirmationMarker>();
+  /**
+   * Advances on every terminal geometry change. A remote-close highlight receipt
+   * carries the epoch it was written in, so a reflow (even one that returns to
+   * the previous size) never leaves stale highlight authority behind.
+   */
+  let remoteCloseHighlightEpoch = 0;
   let lastNativeCols: number | undefined;
   let lastNativeRows: number | undefined;
   let resizeInProgress = false;
+  // This host's own local viewing surface (#474). Its content target follows the
+  // local Main owner and its size follows the native pane; the one manager stores
+  // both facts and performs the only resize. `localViewerState` is what this host
+  // last registered — the row it displays and the pane it offered — so a created
+  // row, a new selection, a detach, and any pane change all re-state the fact at
+  // the one owner of geometry, while plain input and unrelated redraws do not.
+  // `localViewerDirty` forces a re-state after a local action that must reach the
+  // manager even when these recorded facts did not visibly move.
+  let localViewerId: string | undefined;
+  let localViewerState: { target: string | undefined; cols: number; rows: number } | undefined;
+  let localViewerDirty = true;
   let rosterSyncInProgress = false;
   let rosterSyncQueued = false;
   let redrawQueued = false;
@@ -724,7 +1685,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let externalEditorAbort: AbortController | undefined;
   let externalEditorTask: Promise<string | undefined> | undefined;
   const createTasks = new Set<Promise<void>>();
-  const rowStopTasks = new Map<string, Promise<void>>();
+  // One close per row: the shared fence for BOTH the local `d`/Delete route and
+  // the owner-side Close provider, and the existing shutdown barrier that awaits
+  // every accepted close.
+  const rowStopTasks = new Map<string, Promise<OwnerCloseFacts>>();
   // Exited-row restart (deliberate Enter): one attempt per old row id, a
   // per-request mapping for cancellation, and every task promise retained for
   // shutdown awaiting. The task map is the duplicate fence; the set is not.
@@ -747,6 +1711,42 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   const savedListControllers = new Map<number, AbortController>();
   const savedOpenTasks = new Set<Promise<void>>();
   const deferredSavedOpens = new Map<number, { readonly file: string; readonly sessionId: string }>();
+  // --- Requester-side remote Saved (the selected owner host's Saved history). ---
+  /**
+   * The ONE submitted remote Saved request per destination, by identity. The raw
+   * metadata channel keeps one Saved operation pending, so Main never hands a
+   * destination a second request while one is outstanding; a different
+   * destination (a new picker) is never blocked by another host's accepted work.
+   */
+  const remoteSavedInflight = new Map<string, RemoteSavedInflight>();
+  /**
+   * The newest UNSENT remote read for the current picker, globally at most one.
+   * A newer read replaces it (the replaced one is retired silently in the
+   * Sidebar); it is never a queue, and a mutation is never parked here.
+   */
+  let remoteSavedQueuedRead: RemoteSavedReadIntent | undefined;
+  /** The remote Saved picker frame the last composition handed the writer. */
+  let remoteSavedPickerFrame: RemoteSavedPickerFrame | undefined;
+  /** The one owner Delete target Main prepared and the Sidebar opened a dialog for. */
+  let remoteSavedPrepared: RemoteSavedPrepared | undefined;
+  let remoteSavedPreparedSerial = 0;
+  /** Source key of the last ACTUALLY WRITTEN remote delete confirmation. */
+  let remoteSavedConfirmSettledKey: string | undefined;
+  /**
+   * Highest Sidebar request id Main has already admitted for a remote Saved
+   * entry intent. Sidebar ids are monotonic, so a duplicate (held Enter, a
+   * replayed DTO) can never be admitted twice.
+   */
+  let remoteSavedLastAdmittedRequestId = 0;
+  /**
+   * Main's remote Saved lifetime epoch. It advances on GENUINE authority
+   * changes only — an outer resize, an external-editor handoff, a visibility
+   * change, a change of the form-slot pane (cover, banner, layout), and teardown —
+   * never on an ordinary identical repaint, so a geometry A -> B -> A return can
+   * never revive a receipt or a queued admission.
+   */
+  let remoteSavedEpoch = 0;
+  let remoteSavedLayoutKey: string | undefined;
   // Terminal parser diagnostics (#428): a host-owned clearable warning plus a
   // private bounded log. Clearing the warning never touches the log.
   const diagnosticsWarning = new TerminalDiagnosticsWarning();
@@ -756,6 +1756,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   // the host adds none.
   const clipboardDiagnostics = new HostClipboardDiagnosticCollector({
     deliver: (instanceId, event) => handleTerminalDiagnostic(instanceId, event),
+  });
+  // The one presentation-independent owning-session boundary (#473). It is
+  // constructed before any listener or teardown path can run, opens the only
+  // manager this host will ever have, and owns the row operations that need no
+  // presentation state. It keeps no session facts of its own: the teardown
+  // latch is read live from this controller, never copied.
+  const hostService = dependencies.createOwningHostService({
+    createManager: dependencies.createManager,
+    teardownRequested: () => shutdownRequested,
   });
   let finishRun!: (status: number) => void;
   const runFinished = new Promise<number>((resolve) => { finishRun = resolve; });
@@ -799,7 +1808,593 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   function findActiveView(): NativeInstanceView | undefined {
-    return activeId === undefined ? undefined : views.find((view) => view.id === activeId);
+    const id = localActiveId();
+    return id === undefined ? undefined : views.find((view) => view.id === id);
+  }
+
+  /**
+   * The local row Main displays, or undefined while a remote owner (or nothing)
+   * is selected. This is the ONLY path from the content target into local row
+   * authority — `manager.surface/write/rename/stop/resume/remove`, the native
+   * clipboard route, and the local viewing surface — so a remote opaque id can
+   * never reach a local manager method, even on an id collision.
+   */
+  function localActiveId(): string | undefined {
+    return contentTarget?.kind === "local" ? contentTarget.id : undefined;
+  }
+
+  /** The one content controller, or undefined for a metadata-only coordinator. */
+  function contentController(): PeerContentController | undefined {
+    const content = peerCoordinator?.content;
+    if (content === undefined) return undefined;
+    return typeof content.selectContent === "function"
+      && typeof content.updateContentViewport === "function"
+      && typeof content.readContent === "function"
+      ? content
+      : undefined;
+  }
+
+  /**
+   * The live viewer-side remote input/copy preference of the ONE coordinator, read
+   * fresh on every call (never cached). `undefined` means no viewer forwarding
+   * exists at all: the legacy explicit-false bridge seam, no coordinator or
+   * content controller, a controller without the policy reader, or a read that
+   * threw or was malformed. `enabled: false` is a known Off (or unavailable saved
+   * settings, which the coordinator reports as Off).
+   */
+  function readViewerInputPolicy(): PeerViewerNativeInputPolicy | undefined {
+    if (!nativeIoBridgeEnabled) return undefined;
+    const content = contentController();
+    if (content === undefined || typeof content.readViewerNativeInputPolicy !== "function") return undefined;
+    try {
+      const policy: unknown = content.readViewerNativeInputPolicy();
+      if (policy === null || typeof policy !== "object") return undefined;
+      const record = policy as Record<string, unknown>;
+      const enabled = record.enabled;
+      const generation = record.generation;
+      if (typeof enabled !== "boolean" || typeof generation !== "number" || !Number.isSafeInteger(generation)) {
+        return undefined;
+      }
+      return { enabled, generation };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The current ENABLED viewer policy, or undefined while forwarding is off/absent. */
+  function enabledViewerInputPolicy(): PeerViewerNativeInputPolicy | undefined {
+    const policy = readViewerInputPolicy();
+    return policy?.enabled === true ? policy : undefined;
+  }
+
+  /** The accepted remote viewport, only while it still matches the deliberate target. */
+  function currentRemoteContentView(): AcceptedRemoteContent | undefined {
+    const view = remoteContentView;
+    const target = contentTarget;
+    if (view === undefined || target === undefined || target.kind !== "remote") return undefined;
+    if (view.selectionGeneration !== contentSelectionGeneration) return undefined;
+    return view.hostId === target.hostId && view.rowId === target.rowId && view.hostRunId === target.hostRunId
+      ? view
+      : undefined;
+  }
+
+  /**
+   * True only when the frame the writer ACTUALLY committed drew a remote source.
+   * A queued, held, or superseded candidate is never a receipt, so an
+   * identical-bytes replacement of a different source cannot inherit authority.
+   */
+  function writtenSourceIsRemote(): boolean {
+    return displayedMousePresentation?.contentSource?.startsWith("remote|") === true;
+  }
+
+  /** Release the single global stream; never a remote stop, retry, or notice. */
+  function releaseSelectedContent(): void {
+    if (!contentStreamRequested) return;
+    contentStreamRequested = false;
+    const content = contentController();
+    if (content === undefined) return;
+    try {
+      content.selectContent(null);
+    } catch {
+      // The coordinator owns its own bounded failure reporting; Main displays
+      // only what its observation says and never retries here.
+    }
+  }
+
+  /** Drop Main's remote display facts (the deliberate target is cleared by the caller). */
+  function clearRemoteContentSelection(): void {
+    remoteContentView = undefined;
+    remoteContentStatus = undefined;
+    lastContentViewport = undefined;
+    remoteInputNotice = undefined;
+    // A later local selection or an explicit detach supersedes any create-awaiting
+    // fact; it never re-selects, retries, or polls on its own.
+    pendingCreatedRemote = undefined;
+    releaseSelectedContent();
+    // Releasing the remote source returns pointer capture to the ordinary host
+    // path; nothing is submitted without a written remote source.
+    if (nativeIoBridgeEnabled) syncOuterMouseModes();
+  }
+
+  /**
+   * Deliberate display of one exact remote owner row. The roster DTO is the only
+   * source of the tuple: `hostRunId === null` honestly means no owner run was
+   * observed, and Main never guesses one, never connects, never prompts for a
+   * key, and never falls back to a local row or another host. Keys, grants, run,
+   * row, generation, and stream retirement stay with the one coordinator.
+   */
+  function selectRemoteContent(hostId: string, hostRunId: string | null, rowId: string): void {
+    const usable = typeof hostId === "string" && hostId.length > 0
+      && typeof rowId === "string" && rowId.length > 0
+      && (hostRunId === null || (typeof hostRunId === "string" && hostRunId.length > 0));
+    if (!usable) {
+      sidebar?.showError(REMOTE_CONTENT_INVALID_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    contentSelectionGeneration += 1;
+    contentTarget = { kind: "remote", hostId, hostRunId, rowId };
+    remoteContentView = undefined;
+    lastContentViewport = undefined;
+    // A new deliberate selection is a new context: the one brief notice belongs
+    // to the previous target and is not carried over.
+    remoteInputNotice = undefined;
+    // Any LATER selection supersedes the freshly created row's awaiting fact. The
+    // selection the create completion itself emits names that exact row, so it is
+    // recognized here by identity — never by a label, index, or ordering.
+    if (pendingCreatedRemote !== undefined
+      && (pendingCreatedRemote.hostId !== hostId
+        || pendingCreatedRemote.hostRunId !== hostRunId
+        || pendingCreatedRemote.rowId !== rowId)) {
+      pendingCreatedRemote = undefined;
+    }
+    const content = contentController();
+    if (hostRunId === null || content === undefined) {
+      // Nothing exact can be named to the coordinator, so nothing is requested.
+      // The deliberate target is retained and reported truthfully as unavailable.
+      releaseSelectedContent();
+      remoteContentStatus = {
+        state: "unavailable",
+        message: hostRunId === null ? REMOTE_CONTENT_UNOBSERVED_MESSAGE : REMOTE_CONTENT_UNSUPPORTED_MESSAGE,
+      };
+      sidebar?.showError(remoteContentStatus.message);
+    } else {
+      const pane = currentHostLayout(clampDimension(terminal?.columns, 80), clampDimension(terminal?.rows, 24)).native;
+      const cols = clampDimension(pane.cols, 80);
+      const rows = clampDimension(pane.rows, 24);
+      const selectionGeneration = contentSelectionGeneration;
+      remoteContentStatus = { state: "waiting", message: REMOTE_CONTENT_WAITING_MESSAGE };
+      lastContentViewport = { generation: selectionGeneration, cols, rows };
+      try {
+        content.selectContent({ hostId, hostRunId, rowId, selectionGeneration, cols, rows });
+        contentStreamRequested = true;
+      } catch {
+        remoteContentStatus = { state: "unavailable", message: REMOTE_CONTENT_UNAVAILABLE_MESSAGE };
+        sidebar?.showError(remoteContentStatus.message);
+      }
+    }
+    // The local viewing surface displays nothing while a remote owner is shown.
+    // Its siblings keep their last canonical size and their children keep
+    // parsing and running; only the previously displayed row stops being shown.
+    localViewerDirty = true;
+    syncRosterAndSchedule();
+    reconcileLayout(true);
+  }
+
+  /**
+   * The one advisory content callback. It contributes display facts only: it
+   * never selects, focuses, connects, retries, or writes, and it is fenced after
+   * teardown. A frame is accepted only against Main's own current deliberate
+   * target and the coordinator's own complete current view, so a superseded
+   * callback, stale generation, different run/row, mixed frame/geometry pair, or
+   * regressed sequence cannot paint another owner or resurrect a retired stream.
+   */
+  function handleContentChange(observation: PeerContentObservation): void {
+    if (shutdownRequested || sidebar === undefined) return;
+    const target = contentTarget;
+    if (target === undefined || target.kind !== "remote") return;
+    const generation = contentSelectionGeneration;
+    const desired = observation.target;
+    if (desired !== null && (desired.selectionGeneration !== generation
+      || desired.hostId !== target.hostId
+      || desired.rowId !== target.rowId
+      || desired.hostRunId !== target.hostRunId)) {
+      // A stale or foreign selection never touches this pane.
+      return;
+    }
+    const view = observation.view;
+    if (observation.state === "current" && view !== undefined && target.hostRunId !== null) {
+      if (acceptRemoteView(view, { hostId: target.hostId, hostRunId: target.hostRunId, rowId: target.rowId }, generation)) {
+        return;
+      }
+      // A published view that fails the tuple/geometry/sequence fences changes
+      // nothing on screen; the current honest status stays as reported.
+      scheduleRedraw();
+      return;
+    }
+    const wasUnavailable = remoteContentStatus?.state === "unavailable";
+    remoteContentView = undefined;
+    // A retired or not-yet-current view stops defining pointer capture, so the
+    // ordinary host path resumes until this owner publishes again.
+    if (nativeIoBridgeEnabled) syncOuterMouseModes();
+    if (observation.state === "connecting" || observation.state === "current") {
+      remoteContentStatus = { state: "waiting", message: REMOTE_CONTENT_WAITING_MESSAGE };
+      scheduleRedraw();
+      return;
+    }
+    // An owner-reported `started` row this side has not observed yet is NOT an
+    // unavailable display: the coordinator's retained selection intent is served
+    // by the next roster event. Only the two availability reasons are treated this
+    // way; a lost connection, changed run, or missing pin stays a real refusal.
+    const awaitingCreatedRow = pendingCreatedRemote !== undefined
+      && pendingCreatedRemote.hostId === target.hostId
+      && pendingCreatedRemote.hostRunId === target.hostRunId
+      && pendingCreatedRemote.rowId === target.rowId
+      && (observation.reason === "roster-unavailable" || observation.reason === "row-unavailable");
+    if (awaitingCreatedRow) {
+      remoteContentStatus = { state: "waiting", message: REMOTE_CONTENT_CREATED_WAITING_MESSAGE };
+      scheduleRedraw();
+      return;
+    }
+    remoteContentStatus = { state: "unavailable", message: REMOTE_CONTENT_UNAVAILABLE_MESSAGE };
+    if (!wasUnavailable) sidebar?.showError(remoteContentStatus.message);
+    scheduleRedraw();
+  }
+
+  /**
+   * Accept one published viewport for display. Every tuple fact comes from the
+   * owner's own transfer metadata — the native conversation tuple is captured
+   * with its source and never derived from screen text — and the coordinator's
+   * current view must still be this exact snapshot. The monotonic sequence fence
+   * runs on a new accept only; the frame already on screen may be repainted.
+   */
+  function acceptRemoteView(
+    view: PeerSelectedContent,
+    target: { readonly hostId: string; readonly hostRunId: string; readonly rowId: string },
+    generation: number,
+  ): boolean {
+    if (view.hostId !== target.hostId || view.selectionGeneration !== generation) return false;
+    const snapshot = view.snapshot;
+    const meta = snapshot.meta;
+    const frame = snapshot.frame;
+    if (!meta || !frame) return false;
+    if (meta.hostRunId !== target.hostRunId || meta.sessionId !== target.rowId) return false;
+    if (typeof meta.subscriptionId !== "string" || meta.subscriptionId.length === 0) return false;
+    if (!Number.isSafeInteger(meta.sequence) || meta.sequence < 1) return false;
+    const geometry = meta.geometry;
+    if (!geometry
+      || !Number.isSafeInteger(geometry.cols) || !Number.isSafeInteger(geometry.rows)
+      || !Number.isSafeInteger(geometry.revision) || geometry.revision < 0
+      || geometry.cols < 1 || geometry.rows < 1
+      || geometry.cols > MAX_CONTENT_DIMENSION || geometry.rows > MAX_CONTENT_DIMENSION) {
+      return false;
+    }
+    // The frame and the canonical geometry it claims must be one observation.
+    if (frame.cols !== geometry.cols || frame.rows !== geometry.rows) return false;
+    const nativeSession = meta.nativeSession === null || typeof meta.nativeSession !== "object"
+      ? null
+      : (typeof meta.nativeSession.sessionId === "string" && meta.nativeSession.sessionId.length > 0
+        && Number.isSafeInteger(meta.nativeSession.epoch) && meta.nativeSession.epoch >= 1
+        ? { sessionId: meta.nativeSession.sessionId, epoch: meta.nativeSession.epoch }
+        : null);
+    const previous = remoteContentView;
+    if (previous !== undefined
+      && previous.selectionGeneration === generation
+      && previous.subscriptionId === meta.subscriptionId
+      && meta.sequence <= previous.sequence) {
+      // A repeated or regressed publish of one stream never replaces the frame
+      // already on screen; the accepted frame may still be repainted.
+      scheduleRedraw();
+      return true;
+    }
+    // Only the coordinator's own complete current view may be painted.
+    let current: PeerContentObservation | undefined;
+    try {
+      current = contentController()?.readContent();
+    } catch {
+      current = undefined;
+    }
+    if (current === undefined || current.view === undefined || current.view.snapshot !== snapshot) {
+      scheduleRedraw();
+      return true;
+    }
+    const epoch = nativeSession === null ? "none" : String(nativeSession.epoch);
+    const contentKey = boundedOwnerKey("remote", [
+      target.hostId, target.hostRunId, target.rowId, String(generation),
+      nativeSession === null ? "none" : nativeSession.sessionId, epoch,
+    ].join("|"));
+    // The host-written native IO source and observed modes are retained from THIS
+    // exact complete publish (never re-read from a newer one on its behalf). Both
+    // are validated, copied, and frozen; a missing, unknown, or incoherent fact
+    // leaves no input capability at all rather than an inferred one.
+    const inputModes = readRemoteInputModes(meta.inputModes);
+    const inputSource = inputModes === undefined ? undefined : readRemoteNativeIoSource(meta.inputSource, {
+      hostRunId: target.hostRunId,
+      sessionId: target.rowId,
+      nativeSession,
+      geometry: { cols: geometry.cols, rows: geometry.rows, revision: geometry.revision },
+    });
+    remoteContentView = {
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      rowId: target.rowId,
+      selectionGeneration: generation,
+      subscriptionId: meta.subscriptionId,
+      sequence: meta.sequence,
+      nativeSession,
+      geometry: { cols: geometry.cols, rows: geometry.rows, revision: geometry.revision },
+      frame,
+      contentKey,
+      sourceKey: contentKey,
+      graphicsOwnerId: contentKey,
+      inputSource,
+      inputModes,
+    };
+    // A positively accepted viewport for this exact row ends any awaiting fact: the
+    // ordinary content path owns it from here, so a later loss is reported honestly.
+    if (pendingCreatedRemote !== undefined
+      && pendingCreatedRemote.hostId === target.hostId
+      && pendingCreatedRemote.hostRunId === target.hostRunId
+      && pendingCreatedRemote.rowId === target.rowId) {
+      pendingCreatedRemote = undefined;
+    }
+    remoteContentStatus = undefined;
+    // A freshly published view's own retained reporting mode (including a
+    // mode-only change) is what the outer capture must follow.
+    if (nativeIoBridgeEnabled) syncOuterMouseModes();
+    // A published viewport is the only reason this frame appears: an arriving
+    // frame repaints on its own, with no keyboard, roster, or resize event.
+    scheduleRedraw();
+    return true;
+  }
+
+  /** The owner's own sanitized roster labels, used only for the title line. */
+  function remoteContentHeader(hostId: string, rowId: string): string {
+    const host = peerUiSnapshot?.hosts?.find((candidate) => candidate.id === hostId);
+    const row = host?.roster.rows?.find((candidate) => candidate.id === rowId);
+    const hostLabel = displayLabel(host?.label);
+    const rowLabel = displayLabel(row?.label);
+    if (hostLabel !== "" && rowLabel !== "") return `${hostLabel} \u00b7 ${rowLabel}`;
+    return hostLabel !== "" ? hostLabel : "Remote session";
+  }
+
+  /** Bounded, control-free display text from an owner-supplied label. */
+  function displayLabel(value: string | undefined): string {
+    if (typeof value !== "string") return "";
+    const clean = value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, "").trim();
+    return clean.length <= 80 ? clean : clean.slice(0, 80);
+  }
+
+  /**
+   * The host-owned truth shown in the native pane while a remote target is
+   * deliberately selected and no authorized viewport is currently available. It
+   * renders no remote content: the pane is the host's until the owner's own
+   * frame is accepted, and it must not claim no session was selected.
+   */
+  function remoteStatusFrame(pane: HostPaneRect): TerminalFrame {
+    const message = remoteContentStatus?.message ?? REMOTE_CONTENT_WAITING_MESSAGE;
+    return {
+      cols: pane.cols,
+      rows: pane.rows,
+      lines: Array.from({ length: pane.rows }, (_unused, index) => index === 0 ? message : ""),
+      cursor: { column: 0, row: 0, visible: false },
+    };
+  }
+
+  /**
+   * Forward ONE deduped newest viewport for the current selection generation.
+   * The pane size is only this viewer's request; the canonical geometry of what
+   * is displayed always comes from the owner's own frame metadata.
+   */
+  function syncRemoteContentViewport(pane: HostPaneRect): void {
+    const target = contentTarget;
+    if (target === undefined || target.kind !== "remote" || target.hostRunId === null) return;
+    const content = contentController();
+    if (content === undefined) return;
+    const cols = clampDimension(pane.cols, 80);
+    const rows = clampDimension(pane.rows, 24);
+    const generation = contentSelectionGeneration;
+    if (lastContentViewport !== undefined
+      && lastContentViewport.generation === generation
+      && lastContentViewport.cols === cols
+      && lastContentViewport.rows === rows) return;
+    lastContentViewport = { generation, cols, rows };
+    try {
+      content.updateContentViewport({ selectionGeneration: generation, cols, rows });
+    } catch {
+      // Latest-only advisory sizing; the coordinator keeps its own one pending
+      // request and its own bounded failure reporting.
+    }
+  }
+
+  function updatePeerUi(snapshot: PeerUiSnapshot): void {
+    if (shutdownRequested) return;
+    try {
+      sidebar?.setPeerUiSnapshot(snapshot);
+    } catch {
+      sidebar?.showError("Network display is unavailable; local sessions are unchanged");
+      scheduleRedraw();
+      return;
+    }
+    peerUiSnapshot = snapshot;
+    // A reminder this host can positively see no longer applies is dropped here;
+    // nothing is opened, retried, or confirmed by this reconciliation.
+    reconcileRemoteCloseMarkers(snapshot);
+    // The freshly created row's own roster event ends its awaiting fact: from here
+    // the coordinator's ordinary roster reconciliation owns the retained
+    // selection. A complete observation without that host/run/row is positive
+    // loss, and an unobserved projection is no evidence either way.
+    const created = pendingCreatedRemote;
+    if (created !== undefined) {
+      const host = snapshot.hosts?.find((candidate) => candidate.id === created.hostId);
+      if (host === undefined) {
+        pendingCreatedRemote = undefined;
+      } else if ((host.roster.hostRunId ?? null) !== created.hostRunId) {
+        pendingCreatedRemote = undefined;
+      } else if (host.roster.rows !== null
+        && host.roster.rows.some((row) => row.id === created.rowId)) {
+        pendingCreatedRemote = undefined;
+      }
+    }
+    // A written dialog for a target the owner no longer lists loses its
+    // authority immediately instead of staying confirmable until a redraw.
+    abandonVanishedRemoteCloseTarget();
+    for (const id of peerBellAttempts) {
+      if (!snapshot.consents.some((consent) => consent.id === id)) peerBellAttempts.delete(id);
+    }
+    const shown = peerConsentConfirmationFrame;
+    if (shown && !isCurrentPeerConsentFrame(shown)) invalidatePeerConsentDisplay();
+    // A hidden/narrow sidebar may need a visible non-focusing alert band. Only
+    // the compositor/one viewer owner changes geometry; this never selects a row.
+    if (!externalEditorActive) reconcileLayout(true);
+    scheduleRedraw();
+  }
+
+  function attemptIncomingPeerBell(id: string): void {
+    if (shutdownRequested || peerBellAttempts.has(id)) return;
+    let current: PeerUiSnapshot | undefined;
+    try { current = peerCoordinator?.read() ?? peerUiSnapshot; } catch { return; }
+    if (!current?.consents.some((consent) => consent.id === id && consent.kind === "incoming")) return;
+    peerBellAttempts.add(id);
+    if (!current.settings?.bellEnabled || !terminalStarted || !terminal) return;
+    try { terminal.write("\x07"); } catch { /* Best-effort attempt only; no retries, fallback, or shutdown. */ }
+  }
+
+  function startPeerNetworking(): void {
+    const agentDir = sessionSetup?.nativeAgentDir;
+    if (shutdownRequested || !hostState || sessionSetup?.nativeSetup !== true
+      || typeof agentDir !== "string" || agentDir === "") return;
+    try {
+      const coordinator = dependencies.createPeerCoordinator({
+        agentDir,
+        inventory: hostService,
+        // The SAME already-acquired owning-host service is the content source:
+        // one manager, one inventory, one viewer registry. This adds no manager,
+        // listener, store, grant, lease, or permission type; the owner-side
+        // endpoint stays unreachable without a listener this coordinator starts.
+        contentSource: hostService,
+        // The owner-side Close provider is handed over at construction only.
+        // This phase enables no remote Close: the coordinator never advertises,
+        // sends, receives, or calls anything with it, so every existing lane,
+        // fake, and frame behaves exactly as before. Main keeps the one close
+        // core; no service, manager, store, registry, or global close API is
+        // added, and `closeViewer` remains a display-surface retirement, never a
+        // session close.
+        closeOwnedSession,
+        // The owner-side rowless Create provider is handed over at construction
+        // only, exactly like Close. It is the same seam the local New action uses
+        // (`hostService.startSession`), so it needs no second manager, no selected
+        // row, no native conversation tuple, no viewer, and no launch/activate
+        // path: the owner's own provider decides, and only a peer that negotiated
+        // the optional capability can ever reach it.
+        createOwnedSession,
+        // OWNER Saved serving: the real native Saved catalog view over the SAME
+        // owning-host service (its guarded Resume/Delete primitives and its
+        // non-mutating delete preparation) and the exact native listing inputs the
+        // Local picker uses, under the view's own freshness scope. The factory is
+        // never called here: the roster bridge creates at most one view per channel
+        // binding, lazily, after an authorized request, and pairs it with the
+        // coordinator's own live server delete policy. No manager, listing, store,
+        // or policy registry is created by handing it over.
+        savedCatalogViewFactory: () => createNativeSavedCatalogView({
+          host: hostService,
+          readCatalogOptions: readNativeSavedCatalogOptions,
+          listCatalog: listNativeSavedCatalog,
+        }),
+        // REQUESTER Saved use: the explicit opt-in that arms the one Saved
+        // controller. Both halves are independent of native input framing and of
+        // this viewer's own remote input/copy preference.
+        savedViewer: true,
+        onChange: updatePeerUi,
+        onIncomingConsentArrival: attemptIncomingPeerBell,
+        onContentChange: handleContentChange,
+        // The bridge is on by default, so these callbacks are always supplied (only
+        // the dependency-only explicit-false seam omits them). They are fixed for the
+        // coordinator's lifetime, which keeps the owner side's inbound capability
+        // independent of this host's own viewer preference. Each one is a DYNAMIC
+        // re-proof of Main's current written/uncovered/focused source AND the
+        // current viewer preference on every protected write or completed copy;
+        // supplying them is not a permission.
+        ...(nativeIoBridgeEnabled ? {
+          nativeIo: {
+            authorizeInput: authorizeRemoteNativeInput,
+            onCopy: handleRemoteNativeCopy,
+          },
+        } : {}),
+      });
+      peerCoordinator = coordinator;
+      peerNetworkSettled = false;
+      updatePeerUi(coordinator.read());
+      void Promise.resolve().then(async () => {
+        if (!shutdownRequested) await coordinator.start();
+      }).catch(() => {
+        if (!shutdownRequested) {
+          sidebar?.showError("Network setup could not be completed; local sessions are unchanged");
+          scheduleRedraw();
+        }
+      });
+    } catch {
+      sidebar?.showError("Network controls are unavailable; local sessions are unchanged");
+      scheduleRedraw();
+    }
+  }
+
+  function performPeerCommand(command: PeerUiCommand): void {
+    const coordinator = peerCoordinator;
+    if (!coordinator) {
+      sidebar?.showError("Network controls are unavailable in this host");
+      scheduleRedraw();
+      return;
+    }
+    void Promise.resolve().then(async () => {
+      if (!shutdownRequested) await coordinator.perform(command);
+    }).catch(() => {
+      if (!shutdownRequested) sidebar?.showError("The network action could not be completed; check the host status");
+    }).finally(() => {
+      if (!shutdownRequested) { reconcileLayout(true); scheduleRedraw(); }
+    });
+  }
+
+  function currentHostLayout(cols: number, rows: number): HostLayout {
+    const options = {
+      sidebarVisible: sidebar?.visible ?? false,
+      focus: sidebar ? sidebarFocus(sidebar.focus) : "main" as HostFocus,
+      savedDeleteConfirmation: sidebar?.savedDeleteConfirmationActive ?? false,
+      hostConfirmation: sidebar?.peerConsentConfirmationActive ?? false,
+    };
+    const basic = computeHostLayout(cols, rows, options);
+    // Match the redraw routes: forms and ordinary confirmations can replace
+    // the roster even when a sidebar rectangle exists. Reserve real rows
+    // whenever its notification is obscured; never probe by rendering or
+    // trade the alert away to preserve a form's minimum height.
+    const rosterShowsNotice = basic.sidebar !== undefined
+      && (basic.form !== undefined || (options.focus !== "form" && options.focus !== "confirm"));
+    return peerUiSnapshot?.consents.length && !rosterShowsNotice
+      ? computeHostLayout(cols, rows, { ...options, bannerRows: 6 })
+      : basic;
+  }
+
+  function invalidatePeerConsentDisplay(): void {
+    peerConsentConfirmationFrame = undefined;
+    sidebar?.invalidatePeerConsentDisplay();
+  }
+
+  function isCurrentPeerConsentFrame(frame: PeerConsentConfirmationFrame): boolean {
+    return !shutdownRequested && terminal !== undefined && terminalStarted && sidebar !== undefined
+      && sidebar.visible && sidebar.peerConsentConfirmationActive
+      && clampDimension(terminal.columns, 80) === frame.cols
+      && clampDimension(terminal.rows, 24) === frame.rows
+      && sidebar.isPeerConsentRenderCurrent(frame.renderToken)
+      && sidebar.capturePeerConsentPresentation()?.consentId === frame.consentId;
+  }
+
+  function hasWrittenPeerConsentFrame(consentId: string, renderToken: number, decision: "approve" | "deny"): boolean {
+    const frame = peerConsentConfirmationFrame;
+    if (!frame || !frame.settled || frame.consentId !== consentId
+      || frame.renderToken !== renderToken || frame.decision !== decision) return false;
+    if (isCurrentPeerConsentFrame(frame)) return true;
+    invalidatePeerConsentDisplay();
+    return false;
   }
 
   function writeOwnedMouseSequence(sequence: string): boolean {
@@ -854,6 +2449,26 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // press cannot receive its matching release; discard that stale owner.
       hostMouseButtons.clear();
     }
+    // A remote-enabled Main displaying a selected remote owner must capture the
+    // pointer for THAT owner's own retained reporting mode: a drag/any gesture,
+    // and every gesture in a narrow or hidden-sidebar Main pane, has to reach the
+    // written-source gate instead of being limited to (or losing) the host's
+    // press-only capture. Only the bridge plus this viewer's CURRENT enabled
+    // preference with a current remote view changes anything; local rows, a
+    // viewer that turned remote input/copy Off, and the legacy display-only path
+    // keep their exact capture, and packet forwarding stays gated per attempt.
+    if (enabledViewerInputPolicy() !== undefined && sidebar.focus === "main") {
+      const remoteModes = currentRemoteContentView()?.inputModes;
+      if (remoteModes !== undefined
+        && remoteModes.mouseTracking !== "none"
+        && remoteModes.mouseEncoding !== "sgr-pixels") {
+        const remoteTracking = mouseTrackingNumber(remoteModes.mouseTracking);
+        if (remoteTracking !== undefined) {
+          desiredTracking = remoteTracking;
+          useSgr = true;
+        }
+      }
+    }
 
     if (mouseTrackingMode !== desiredTracking) {
       if (mouseTrackingMode !== undefined) {
@@ -880,17 +2495,24 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       try {
         const cols = clampDimension(terminal.columns, 80);
         const rows = clampDimension(terminal.rows, 24);
-        const currentLayout = computeHostLayout(cols, rows, {
-          sidebarVisible: sidebar.visible,
-          focus: sidebarFocus(sidebar.focus),
-          savedDeleteConfirmation: sidebar.savedDeleteConfirmationActive,
-        });
+        const currentLayout = currentHostLayout(cols, rows);
         savedDeleteConfirmationFrame = undefined;
         sidebar.invalidateSavedDeleteConfirmationDisplay();
         layout = currentLayout;
+        noteRemoteSavedLayout(currentLayout);
         const view = findActiveView();
         const surface = view ? manager?.surface(view.id) : undefined;
-        let mainFrame = surface?.frame();
+        // Exactly ONE selected source is displayed: the local owner's own surface
+        // frame, or the one accepted remote native viewport carried unchanged. No
+        // scraping, transcript rendering, filtering, or raw bytes are involved —
+        // both go through the same compositor, graphics fallback, and frame writer.
+        const remoteView = currentRemoteContentView();
+        let mainFrame = remoteView !== undefined ? remoteView.frame : surface?.frame();
+        if (mainFrame === undefined && contentTarget?.kind === "remote") {
+          // A deliberate remote target with nothing currently authorized: the host
+          // owns the pane and says what is actually happening.
+          mainFrame = remoteStatusFrame(currentLayout.native);
+        }
         if (mainFrame && view && (!view.hasLiveProcess || view.lifecycle !== "alive")) {
           mainFrame = {
             ...mainFrame,
@@ -908,6 +2530,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           if (focus === "form" && currentLayout.form !== undefined) {
             sidebarFrame = sidebar.renderRoster(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
             formFrame = sidebar.renderForm(currentLayout.form.cols, currentLayout.form.rows);
+          } else if (focus === "confirm" && sidebar.peerConsentConfirmationActive
+            && currentLayout.form !== undefined) {
+            sidebarFrame = sidebar.renderRoster(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
+            formFrame = sidebar.renderForm(currentLayout.form.cols, currentLayout.form.rows);
           } else if (focus === "confirm" && sidebar.savedDeleteConfirmationActive
             && currentLayout.form !== undefined) {
             sidebarFrame = sidebar.renderRoster(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
@@ -916,27 +2542,113 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             sidebarFrame = sidebar.render(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
           }
         }
+        // A session can legitimately be smaller than this pane when another viewer
+        // holds a smaller minimum (#474). Its frame is drawn at the pane's top-left
+        // corner and padded, so the content rectangle — not the containing pane —
+        // is what this row actually displayed, and that rectangle is what image
+        // placement and positional authority are bounded by.
+        const nativeContent = nativeContentRect(currentLayout.native, mainFrame);
+        const nativeGeometry = view?.hasLiveProcess === true && view.lifecycle === "alive"
+          ? canonicalGeometryStamp(view.id)
+          : undefined;
         const nativeOwnerId = view?.hasLiveProcess === true && view.lifecycle === "alive"
           && surface !== undefined
-          && mainFrame !== undefined
-          && mainFrame.cols === currentLayout.native.cols && mainFrame.rows === currentLayout.native.rows
+          && nativeContent !== undefined
           ? view.id
           : undefined;
+        // What the compositor ACTUALLY drew in the native pane. A wide form or
+        // Saved-delete confirmation replaces that pane and a narrow sidebar
+        // overlay covers it, so neither can establish a remote drawn-source
+        // receipt: the deliberate selection stays, its receipt does not.
+        const remoteDrawn = remoteView !== undefined
+          && currentLayout.form === undefined
+          && !(currentLayout.sidebarOverlay === true
+            && currentLayout.sidebar !== undefined
+            && focus !== "main")
+          && nativeContent !== undefined
+          ? { view: remoteView, rect: nativeContent }
+          : undefined;
+        // The accepted publish's own retained native IO facts, if it carried any.
+        // Copied into the candidate receipt below; never re-read from a newer view.
+        const drawnInputSource = remoteDrawn?.view.inputSource;
+        const drawnInputModes = remoteDrawn?.view.inputModes;
+        // A candidate receipt exists only while this viewer's remote input/copy
+        // preference is currently ON, and it carries that preference's generation:
+        // turning it Off retires the receipt at the next frame, and turning it back
+        // On mints a different receipt that needs its own actually-written frame.
+        const inputPolicy = remoteDrawn === undefined ? undefined : enabledViewerInputPolicy();
+        const nativeIoReceipt: WrittenRemoteNativeInput | undefined = inputPolicy !== undefined
+          && remoteDrawn !== undefined && drawnInputSource !== undefined && drawnInputModes !== undefined
+          ? Object.freeze({
+            hostId: remoteDrawn.view.hostId,
+            hostRunId: remoteDrawn.view.hostRunId,
+            rowId: remoteDrawn.view.rowId,
+            selectionGeneration: remoteDrawn.view.selectionGeneration,
+            subscriptionId: remoteDrawn.view.subscriptionId,
+            source: drawnInputSource,
+            inputModes: drawnInputModes,
+            geometry: remoteDrawn.view.geometry,
+            nativeContent: Object.freeze({
+              column: remoteDrawn.rect.column,
+              row: remoteDrawn.rect.row,
+              cols: remoteDrawn.rect.cols,
+              rows: remoteDrawn.rect.rows,
+            }),
+            resizeEpoch: remoteInputEpoch,
+            policyGeneration: inputPolicy.generation,
+          })
+          : undefined;
+        // The graphics layer's owner key distinguishes the actual source. A local
+        // row keeps its exact manager id (unchanged image-id cache); a remote
+        // viewport gets a key carrying its host, run, row, selection, and native
+        // conversation epoch, so another host's image cache is never reused for
+        // these placements.
+        const nativeGraphicsOwnerId = remoteDrawn !== undefined
+          ? remoteDrawn.view.graphicsOwnerId
+          : nativeOwnerId;
         // Graphics follow the real active view/surface pair, never the
-        // sidebar's highlighted row. The compositor removes this layer when
-        // an overlay or form actually covers the native pane.
-        const nativeGraphics = nativeOwnerId !== undefined && mainFrame?.graphics !== undefined
-          ? { ownerId: nativeOwnerId, pane: currentLayout.native, frame: mainFrame.graphics }
+        // sidebar's highlighted row, and are projected only into the validated
+        // content rectangle so a padded session keeps its images and their text
+        // fallback. The compositor removes this layer when an overlay or form
+        // actually covers the native pane.
+        const nativeGraphics = nativeGraphicsOwnerId !== undefined && mainFrame?.graphics !== undefined
+          && nativeContent !== undefined
+          ? { ownerId: nativeGraphicsOwnerId, pane: nativeContent, frame: mainFrame.graphics }
           : undefined;
         const savedDeleteRenderToken = sidebar.savedDeleteConfirmationRenderTokenNumber;
+        // The remote-close dialog replaces the left roster, so its candidate is
+        // captured AFTER that render and before the writer sees this frame.
+        const remoteClosePresentation = sidebar.captureRemoteCloseConfirmationPresentation();
+        // The New form's own drawn candidate (host line + live workspace body)
+        // is captured the same way, so a remote submission can require the
+        // writer's receipt for THIS frame rather than a later render.
+        const createFormPresentation = sidebar.captureCreateFormPresentation();
+        // The remote Saved picker's own drawn frame (Local pickers have none),
+        // captured the same way beside this exact composition.
+        const savedPickerPresentation = sidebar.captureSavedPickerPresentation();
+        const formSlot = currentFormSlotRect(currentLayout);
         // Title only. Lifecycle, activity and input ownership belong below
-        // session-card titles, never on the active conversation's title line.
-        const header = view ? view.label : "Session host";
-        const headerNotice = terminalDiagnosticsHeaderNotice(diagnosticsWarning.view());
+        // session-card titles, never on the active conversation's title line. A
+        // remote owner is identified by its own sanitized roster labels.
+        const header = contentTarget?.kind === "remote"
+          ? remoteContentHeader(contentTarget.hostId, contentTarget.rowId)
+          : view ? view.label : "Session host";
+        // The existing host notice surface. The diagnostics warning keeps its
+        // ordinary priority; the one brief remote-input notice uses the same
+        // header only while no sidebar pane is drawn to carry it, so an ordinary
+        // wide layout still shows it in the roster exactly like every other
+        // sidebar notice.
+        const diagnosticsHeaderNotice = terminalDiagnosticsHeaderNotice(diagnosticsWarning.view());
+        const headerNotice = remoteInputNotice !== undefined && currentLayout.sidebar === undefined
+          ? remoteInputNotice
+          : diagnosticsHeaderNotice;
         const composed = composeHostFrame(currentLayout, {
           main: mainFrame,
           sidebar: sidebarFrame,
           form: formFrame,
+          ...(currentLayout.banner === undefined ? {} : {
+            banner: sidebar.renderPeerAlert(currentLayout.banner.cols, currentLayout.banner.rows),
+          }),
           ...(nativeGraphics ? { nativeGraphics } : {}),
           header,
           ...(headerNotice === undefined ? {} : { headerNotice }),
@@ -947,31 +2659,256 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           focus,
           sidebar: sidebar.captureMousePresentation(),
           nativeOwnerId,
+          nativeContent: nativeOwnerId === undefined ? undefined : nativeContent,
+          nativeGeometry: nativeOwnerId === undefined ? undefined : nativeGeometry,
+          contentKey: remoteView !== undefined
+            ? remoteDrawn?.view.contentKey
+            : nativeOwnerId === undefined ? undefined : `local|${nativeOwnerId}`,
+          contentSource: remoteView === undefined
+            ? (nativeOwnerId === undefined ? undefined : `local|${nativeOwnerId}`)
+            : remoteDrawn === undefined
+              ? undefined
+              : `${remoteDrawn.view.sourceKey}|sub=${remoteDrawn.view.subscriptionId}`
+                + `|seq=${remoteDrawn.view.sequence}`
+                + `|geom=${remoteDrawn.view.geometry.cols}x${remoteDrawn.view.geometry.rows}`
+                + `@${remoteDrawn.view.geometry.revision}`
+                + `|rect=${remoteDrawn.rect.column}:${remoteDrawn.rect.row}`
+                + `:${remoteDrawn.rect.cols}:${remoteDrawn.rect.rows}`,
+          remoteCloseEpoch: remoteCloseHighlightEpoch,
+          // The candidate receipt of the remote native source this frame draws. It
+          // becomes authority only when the writer reports THIS candidate written.
+          nativeInput: nativeIoReceipt,
         };
         // Distinct targets can render identical bytes (for example Saved
         // conversations with matching captions and workspaces). Their maps
         // still need a written boundary before mouse authorization changes.
+        //
+        // The remote-close highlight is its own written value: an ownership
+        // count can take a card from "not idle" to "idle" without changing a
+        // single rendered byte or the mouse authorization identity, so it is
+        // compared separately and invalidates the writer on its own.
         if ((displayedMousePresentation !== undefined
-          && !sameMouseAuthorization(displayedMousePresentation, mousePresentation))
+          && (!sameMouseAuthorization(displayedMousePresentation, mousePresentation)
+            || !sameRemoteCloseRow(
+              displayedMousePresentation.sidebar.remoteClose, mousePresentation.sidebar.remoteClose,
+            )
+            || displayedMousePresentation.remoteCloseEpoch !== mousePresentation.remoteCloseEpoch
+            // A mode- or source-only change can render identical bytes. It is still
+            // a new native IO boundary, so the next frame must be actually written
+            // before it authorizes any input or copy. This is separate from the
+            // shared UI identity above and never becomes a Close prerequisite.
+            || !sameNativeIoReceipt(displayedMousePresentation.nativeInput, mousePresentation.nativeInput)))
           || (latestMousePresentation !== undefined
-            && !sameMouseAuthorization(latestMousePresentation, mousePresentation))) {
+            && (!sameMouseAuthorization(latestMousePresentation, mousePresentation)
+              || !sameRemoteCloseRow(
+                latestMousePresentation.sidebar.remoteClose, mousePresentation.sidebar.remoteClose,
+              )
+              || latestMousePresentation.remoteCloseEpoch !== mousePresentation.remoteCloseEpoch
+              || !sameNativeIoReceipt(latestMousePresentation.nativeInput, mousePresentation.nativeInput)))) {
           writer.invalidate?.();
         }
         latestMousePresentation = mousePresentation;
         const activeSidebar = sidebar;
+        // A REMOTE Saved delete dialog carries the exact owner target Main itself
+        // prepared, the form-slot pane, and Main's epochs. A remote dialog that
+        // matches no prepared target gets no frame at all (it can never settle),
+        // and a Local dialog is exactly the existing frame with no remote context.
+        const remoteSavedDialog = savedDeleteRenderToken !== undefined && sidebar.savedRemoteContext() !== undefined;
+        const preparedTarget = remoteSavedPrepared;
+        const remoteDeleteContext: RemoteSavedDeleteFrameContext | undefined = remoteSavedDialog
+          && preparedTarget !== undefined && formSlot !== undefined
+          && remoteSavedContextMatchesPrepared(preparedTarget)
+          ? Object.freeze({
+            prepared: preparedTarget,
+            pane: Object.freeze({ column: formSlot.column, row: formSlot.row, cols: formSlot.cols, rows: formSlot.rows }),
+            epoch: remoteSavedEpoch,
+            sourceKey: JSON.stringify([
+              preparedTarget.serial, preparedTarget.pickerId, preparedTarget.revision, preparedTarget.hostId,
+              preparedTarget.hostRunId, preparedTarget.catalogId, preparedTarget.resultId, preparedTarget.entryId,
+              cols, rows, formSlot.column, formSlot.row, formSlot.cols, formSlot.rows,
+              remoteSavedEpoch,
+            ]),
+          })
+          : undefined;
+        // Identical bytes are not proof that this exact owner target was written:
+        // until this semantic source has an actual written receipt, every
+        // composition crosses the writer's own boundary.
+        if (remoteDeleteContext !== undefined && remoteDeleteContext.sourceKey !== remoteSavedConfirmSettledKey) {
+          writer.invalidate?.();
+        }
         const confirmationFrame: SavedDeleteConfirmationFrame | undefined = savedDeleteRenderToken === undefined
+          || (remoteSavedDialog && remoteDeleteContext === undefined)
           ? undefined
-          : { renderToken: savedDeleteRenderToken, cols, rows, settled: false };
+          : {
+            renderToken: savedDeleteRenderToken,
+            cols,
+            rows,
+            ...(remoteDeleteContext === undefined ? {} : { remote: remoteDeleteContext }),
+            settled: false,
+          };
         savedDeleteConfirmationFrame = confirmationFrame;
+        const peerPresentation = sidebar.capturePeerConsentPresentation();
+        let peerFrame: PeerConsentConfirmationFrame | undefined;
+        if (peerPresentation !== undefined) {
+          const previous = peerConsentConfirmationFrame;
+          if (previous?.consentId === peerPresentation.consentId && previous.decision === peerPresentation.decision
+            && previous.renderToken === peerPresentation.renderToken && previous.cols === cols && previous.rows === rows) {
+            peerFrame = previous;
+          } else {
+            peerFrame = { ...peerPresentation, cols, rows, settled: false };
+            // Identical rendered text is not proof that a different request or
+            // confirmation choice was written. Force that new semantic boundary.
+            writer.invalidate?.();
+          }
+        }
+        peerConsentConfirmationFrame = peerFrame;
+        let remoteCloseFrame: RemoteCloseConfirmationFrame | undefined;
+        if (remoteClosePresentation !== undefined) {
+          const previous = remoteCloseConfirmationFrame;
+          if (previous !== undefined
+            && previous.generation === remoteClosePresentation.generation
+            && previous.renderToken === remoteClosePresentation.renderToken
+            && sameRemoteCloseTarget(previous.target, remoteClosePresentation.target)
+            && previous.title === remoteClosePresentation.title
+            && previous.cols === cols && previous.rows === rows) {
+            // The identical semantic dialog is being redrawn: keep the receipt
+            // this exact candidate already earned instead of revoking it.
+            remoteCloseFrame = previous;
+          } else {
+            remoteCloseFrame = {
+              target: remoteClosePresentation.target,
+              title: remoteClosePresentation.title,
+              generation: remoteClosePresentation.generation,
+              renderToken: remoteClosePresentation.renderToken,
+              cols,
+              rows,
+              settled: false,
+            };
+            // Identical drawn bytes are not proof that a different frozen target
+            // or a new confirmation generation was written: force the boundary.
+            writer.invalidate?.();
+          }
+        }
+        remoteCloseConfirmationFrame = remoteCloseFrame;
+        let nextCreateFormFrame: CreateFormFrame | undefined;
+        if (createFormPresentation !== undefined) {
+          const previous = createFormFrame;
+          if (previous !== undefined
+            // The identical drawn form, at the same outer geometry, in the same
+            // geometry epoch: keep the receipt this candidate already earned
+            // instead of revoking it. The pane rectangle is part of the drawn
+            // presentation itself.
+            && previous.renderToken === createFormPresentation.renderToken
+            && previous.formGeneration === createFormPresentation.formGeneration
+            && previous.hostKind === createFormPresentation.hostKind
+            && previous.hostId === createFormPresentation.hostId
+            && previous.hostRunId === createFormPresentation.hostRunId
+            && previous.workspace === createFormPresentation.workspace
+            && previous.cols === createFormPresentation.cols
+            && previous.rows === createFormPresentation.rows
+            && previous.terminalCols === cols
+            && previous.terminalRows === rows
+            && previous.epoch === createFormEpoch) {
+            nextCreateFormFrame = previous;
+          } else {
+            nextCreateFormFrame = {
+              ...createFormPresentation,
+              terminalCols: cols,
+              terminalRows: rows,
+              epoch: createFormEpoch,
+              settled: false,
+            };
+            // Identical drawn bytes are not proof that a different host line,
+            // owner run, workspace, or form generation was written: force the
+            // writer's own boundary before anything may be submitted.
+            writer.invalidate?.();
+          }
+        }
+        createFormFrame = nextCreateFormFrame;
+        let nextSavedPickerFrame: RemoteSavedPickerFrame | undefined;
+        if (savedPickerPresentation !== undefined && formSlot !== undefined
+          && formSlot.cols === savedPickerPresentation.cols && formSlot.rows === savedPickerPresentation.rows) {
+          const previous = remoteSavedPickerFrame;
+          if (previous !== undefined
+            // The Sidebar keeps the same token for the identical drawn picker
+            // (same view epoch, picker, query, destination, run, catalog, result,
+            // selection, drawn entries, and pane), so an ordinary repaint at the
+            // same outer geometry and Main epoch keeps the receipt it earned.
+            && previous.presentation.renderToken === savedPickerPresentation.renderToken
+            && previous.terminalCols === cols
+            && previous.terminalRows === rows
+            && previous.epoch === remoteSavedEpoch
+            && samePaneGeometry(previous.pane, formSlot)) {
+            nextSavedPickerFrame = previous;
+          } else {
+            nextSavedPickerFrame = {
+              presentation: savedPickerPresentation,
+              terminalCols: cols,
+              terminalRows: rows,
+              pane: Object.freeze({ column: formSlot.column, row: formSlot.row, cols: formSlot.cols, rows: formSlot.rows }),
+              epoch: remoteSavedEpoch,
+              settled: false,
+            };
+            // A new owner source, host, query, result, selection, entry, or view
+            // epoch can compose identical bytes: force the writer's own boundary
+            // so only an ACTUAL write can become its receipt.
+            writer.invalidate?.();
+          }
+        }
+        remoteSavedPickerFrame = nextSavedPickerFrame;
         writer.submit(composed, cols, rows, (disposition: SessionHostFrameDisposition) => {
-          if (disposition === "written") displayedMousePresentation = mousePresentation;
+          // Retain what ACTUALLY completed writing, even when a newer identical
+          // candidate is already queued: discarding the only real write would
+          // close the pointer/clipboard paths over a screen the operator sees.
+          // Consumers re-read it against the latest candidate by value, and the
+          // remote-close receipt additionally checks its geometry epoch, so a
+          // stale or reflowed write never authorizes anything.
+          if (disposition === "written") {
+            displayedMousePresentation = mousePresentation;
+          }
+          if (peerFrame !== undefined && peerConsentConfirmationFrame === peerFrame
+            && isCurrentPeerConsentFrame(peerFrame)
+            && (disposition === "written" || (disposition === "unchanged" && peerFrame.settled))) {
+            if (activeSidebar.settlePeerConsentRender(peerFrame.renderToken)) peerFrame.settled = true;
+          }
+          if (remoteCloseFrame !== undefined && remoteCloseConfirmationFrame === remoteCloseFrame
+            && isCurrentRemoteCloseConfirmationFrame(remoteCloseFrame)
+            && (disposition === "written" || (disposition === "unchanged" && remoteCloseFrame.settled))) {
+            if (activeSidebar.settleRemoteCloseConfirmationRender(
+              remoteCloseFrame.generation, remoteCloseFrame.renderToken,
+            )) remoteCloseFrame.settled = true;
+          }
+          if (createFormFrame !== undefined && nextCreateFormFrame === createFormFrame
+            && isCurrentCreateFormFrame(createFormFrame)
+            && (disposition === "written" || (disposition === "unchanged" && createFormFrame.settled))) {
+            if (activeSidebar.settleCreateFormRender(createFormFrame.renderToken)) createFormFrame.settled = true;
+          }
+          // The remote Saved picker receipt: ONLY an actual write of this exact
+          // frame, or an unchanged repaint of this same already-settled frame.
+          if (nextSavedPickerFrame !== undefined && remoteSavedPickerFrame === nextSavedPickerFrame
+            && isCurrentRemoteSavedPickerFrame(nextSavedPickerFrame)
+            && (disposition === "written" || (disposition === "unchanged" && nextSavedPickerFrame.settled))) {
+            if (activeSidebar.settleSavedPickerRender(nextSavedPickerFrame.presentation.renderToken)) {
+              nextSavedPickerFrame.settled = true;
+            }
+          }
           if (confirmationFrame === undefined || savedDeleteConfirmationFrame !== confirmationFrame) return;
           if (!isCurrentSavedDeleteConfirmationFrame(confirmationFrame)) {
             invalidateSavedDeleteConfirmationDisplay();
             return;
           }
+          const remoteConfirmation = confirmationFrame.remote;
+          // A remote confirmation settles ONLY on an actual write, or on an
+          // unchanged repaint of the very source that was already actually written.
+          if (remoteConfirmation !== undefined
+            && (!isCurrentRemoteSavedDeleteFrame(remoteConfirmation)
+              || !(disposition === "written"
+                || (disposition === "unchanged" && remoteSavedConfirmSettledKey === remoteConfirmation.sourceKey)))) {
+            return;
+          }
           if (activeSidebar.settleSavedDeleteConfirmationRender(confirmationFrame.renderToken)) {
             confirmationFrame.settled = true;
+            if (remoteConfirmation !== undefined) remoteSavedConfirmSettledKey = remoteConfirmation.sourceKey;
           }
         });
       } catch {
@@ -1001,6 +2938,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       return false;
     }
     return frame.settled;
+  }
+
+  /** The Local delete route's receipt: a settled frame that carries NO remote context. */
+  function hasSettledLocalSavedDeleteConfirmationFrame(): boolean {
+    return hasSettledSavedDeleteConfirmationFrame() && savedDeleteConfirmationFrame?.remote === undefined;
   }
 
   /** Revoke old draw-derived mouse authority before picker rows/query change. */
@@ -1170,7 +3112,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         ...(record.persistence !== undefined ? { persistence: record.persistence } : {}),
       });
     }
-    const activeSlotId = activeId !== undefined ? rowSlots.get(activeId) : rememberedActiveSlot;
+    const localId = localActiveId();
+    const activeSlotId = localId !== undefined ? rowSlots.get(localId) : rememberedActiveSlot;
     const active = activeSlotId !== undefined && entries.some((entry) => entry.slotId === activeSlotId)
       ? { activeSlotId }
       : {};
@@ -1270,7 +3213,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     if (handle.problem !== undefined) return; // surfaced truthfully by persistRoster
     if (stored === undefined || stored.entries.length === 0) return;
     // Automatic activation is fenced by the deliberate-action generation, not by
-    // the current activeId alone: a user who activates and then clears/removes a
+    // the current content target alone: a user who activates and then clears/removes a
     // row during a slow restore must not have the remembered sibling activated
     // afterwards. The startup fence is absolute — any deliberate action at all,
     // including one received while keyboard negotiation is still settling,
@@ -1322,12 +3265,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             ? "This conversation was never saved to disk; it was not restarted"
             : "This conversation is no longer saved to disk; it was not restarted";
       } else {
-        let admitted: SavedSessionAdmissionResult;
-        try {
-          admitted = admitSavedSession(catalog, row, { ownedLiveSessions: activeManager.ownedLiveSessions() });
-        } catch {
-          admitted = { status: "refused", reason: "unknown-row" };
-        }
+        const admitted = hostService.admitSavedConversation(catalog, row);
         if (admitted.status === "refused") {
           reason = `This conversation could not be revalidated: ${savedRefusalNotice(admitted.reason)}`;
         } else if (rememberedWorkspace === undefined || rememberedWorkspace !== admitted.admission.workspace) {
@@ -1350,6 +3288,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       adoptingSlot = decision.entry.slotId;
       let created: Promise<string>;
       try {
+        // Restoration creates on the same single manager the owning-host service
+        // opened: the slot-adoption window has to wrap the synchronous stretch of
+        // the create call itself, so this path cannot use the async start path.
         created = activeManager.create(decision.createOptions);
       } finally {
         adoptingSlot = undefined;
@@ -1371,7 +3312,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       const activeSlot = stored.activeSlotId;
       const activeRecord = activeSlot === undefined ? undefined : rosterRecords.get(activeSlot);
       if (activeRecord?.rowId !== undefined) {
-        activeId = activeRecord.rowId;
+        contentTarget = { kind: "local", id: activeRecord.rowId };
         rememberedActiveSlot = activeRecord.slotId;
         reconcileLayout(true);
       }
@@ -1395,14 +3336,21 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     try {
       views = manager.list().filter((view) => !removedExitedIds.has(view.id));
       adoptRosterViews(views);
-      if (activeId !== undefined && !views.some((view) => view.id === activeId)) {
-        activeId = undefined;
+      const localId = localActiveId();
+      if (localId !== undefined && !views.some((view) => view.id === localId)) {
+        contentTarget = undefined;
+        contentSelectionGeneration += 1;
         rememberedActiveSlot = undefined;
+        // The manager already retired every surface on that row; re-state the
+        // local view so it displays nothing rather than a vanished row. A remote
+        // target is never cleared by local roster activity.
+        localViewerDirty = true;
       }
       // View-only observer: the sidebar's white title highlight follows the
-      // actual active Main owner; clearing it here (owner row gone) prevents a
-      // false sibling highlight. It never changes activation or ownership.
-      sidebar.setActiveMainOwner(activeId);
+      // actual content owner — a local row or one exact remote owner — and is
+      // cleared here when that local owner row is gone, so a sibling is never
+      // falsely highlighted. It never changes activation or ownership.
+      sidebar.setActiveMainOwnerKey(contentTarget);
       sidebar.updateItems(currentRosterItems());
       persistRoster();
       syncOuterMouseModes();
@@ -1414,24 +3362,482 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
   }
 
+  /**
+   * Restate this host's local viewing surface on the one manager (#474): which
+   * session it displays (possibly none) and how wide its native pane is. Only
+   * the addressed session can be resized by this; a background session nobody
+   * displays keeps its last size, and `adoptAsInitialGeometry` alone changes the
+   * initial-sizing rule for sessions created later.
+   */
+  function localViewerNeedsSync(pane: HostPaneRect): boolean {
+    if (localViewerDirty) return true;
+    const localId = localActiveId();
+    if (localViewerState === undefined) return localId !== undefined;
+    return localViewerState.target !== localId
+      || localViewerState.cols !== pane.cols
+      || localViewerState.rows !== pane.rows;
+  }
+
+  function syncLocalViewerGeometry(pane: HostPaneRect, adoptAsInitialGeometry: boolean): void {
+    if (!manager) return;
+    if (adoptAsInitialGeometry) hostService.setInitialGeometry(pane.cols, pane.rows);
+    if (localViewerId === undefined) {
+      const opened = hostService.openViewer();
+      if (opened === undefined) return;
+      localViewerId = opened.viewerId;
+    }
+    const result = hostService.updateViewer(localViewerId, {
+      sessionId: localActiveId() ?? null,
+      cols: pane.cols,
+      rows: pane.rows,
+    });
+    // What this host asked for, whether or not the manager accepted it: an
+    // exited or errored row stays refused rather than retried on every redraw.
+    localViewerState = { target: localActiveId(), cols: pane.cols, rows: pane.rows };
+    if (result.applied) {
+      localViewerDirty = false;
+      return;
+    }
+    if (result.reason === "unknown-viewer") {
+      // The manager no longer has this surface (its row finished or teardown
+      // began). Nothing is retried blindly; a later deliberate selection or
+      // layout change registers a fresh surface.
+      localViewerId = undefined;
+      localViewerState = undefined;
+      localViewerDirty = false;
+      return;
+    }
+    // `unknown-session` is the truthful current answer (the displayed row
+    // exited or errored), and `invalid-geometry` cannot come from a computed
+    // pane. Either way the manager's own facts stand.
+    localViewerDirty = false;
+  }
+
+  /**
+   * The manager's canonical size for one row, or nothing when the row, the
+   * dimensions, or the read itself is unusable (#474). A missing fact is never
+   * replaced with a guessed size.
+   */
+  function canonicalGeometryStamp(id: string): CanonicalSessionGeometry | undefined {
+    const geometry: SessionGeometry | undefined = hostService.readSessionGeometry(id);
+    if (geometry === undefined) return undefined;
+    if (!Number.isSafeInteger(geometry.cols) || !Number.isSafeInteger(geometry.rows)
+      || !Number.isSafeInteger(geometry.revision)
+      || geometry.cols < 1 || geometry.rows < 1) return undefined;
+    return { cols: geometry.cols, rows: geometry.rows, revision: geometry.revision };
+  }
+
+  /**
+   * Positional native input and native clipboard requests are authorized only
+   * against the content the display actually committed for that row (#474):
+   *
+   * - the written frame and the latest render agree on one owner, one native pane,
+   *   and one drawn content rectangle, so nothing is authorized against a frame
+   *   that was never written;
+   * - the manager's current canonical size and revision still match the ones that
+   *   drawn content came from, so a resize queued behind writer backpressure
+   *   authorizes neither its newly exposed padding nor its not-yet-drawn size;
+   * - no form or actually drawn sidebar overlay covers the native pane. An
+   *   overlay-capable layout with Main focused draws no sidebar rectangle, so it
+   *   covers nothing and native input keeps its ordinary path.
+   *
+   * The returned rectangle is the drawn content, never the containing pane: cells
+   * of a padded pane belong to the host, not the child. `undefined` refuses
+   * positional work outright; keyboard and paste input claims no cell and is
+   * unaffected.
+   */
+  function nativeInputAuthority(id: string): HostPaneRect | undefined {
+    const shown = displayedMousePresentation;
+    const latest = latestMousePresentation;
+    if (layout === undefined || shown === undefined || latest === undefined) return undefined;
+    // Coverage, not overlay capability: a narrow layout keeps `sidebarOverlay`
+    // set while Main is focused, but draws no sidebar rectangle there, and Main
+    // owns the whole content pane. Only a layout that actually paints something
+    // over the native pane refuses positional authority — and the written and
+    // latest layouts both count, so uncovering Main cannot authorize input before
+    // its uncovered frame has been written.
+    const covered = (value: HostLayout): boolean => value.form !== undefined
+      || (value.sidebarOverlay && value.sidebar !== undefined);
+    if (covered(layout) || covered(shown.layout) || covered(latest.layout)) return undefined;
+    if (shown.nativeOwnerId !== id || latest.nativeOwnerId !== id) return undefined;
+    if (!samePaneGeometry(shown.layout.native, layout.native)
+      || !samePaneGeometry(latest.layout.native, layout.native)) return undefined;
+    const drawn = shown.nativeContent;
+    if (drawn === undefined || !samePaneGeometry(drawn, latest.nativeContent)) return undefined;
+    const current = canonicalGeometryStamp(id);
+    if (current === undefined
+      || shown.nativeGeometry === undefined || latest.nativeGeometry === undefined
+      || !sameCanonicalGeometry(shown.nativeGeometry, current)
+      || !sameCanonicalGeometry(latest.nativeGeometry, current)) return undefined;
+    return drawn;
+  }
+
+  /**
+   * The ONE actual-written remote native IO receipt, but only while every
+   * independent current fact still proves it.
+   *
+   * Called synchronously for EVERY protected input write (and re-checked by the
+   * coordinator/client after each caller callback), so nothing cached, queued, or
+   * descriptor-shaped can authorize a write. It deliberately re-reads:
+   *
+   * - the started/not-shutting-down/not-handed-off terminal state;
+   * - CURRENT, WRITTEN, and latest-candidate Main focus, and whether each of those
+   *   layouts actually paints a form or sidebar rectangle over the native pane;
+   *   the same native pane geometry and drawn content rectangle must agree, so a
+   *   pending resize, an undrawn layout, or an uncovering frame refuses input until
+   *   its own frame is written;
+   * - the deliberate remote target, which must still be the written receipt's own
+   *   host, owner run, row, and selection generation;
+   * - the caller's expected source (the whole tuple, epoch, geometry revision,
+   *   viewer revision, and host commitment), which must BE the written one;
+   * - the CURRENT accepted viewport, whose retained source must still be that
+   *   exact source (ordinary text output with fresh snapshots and sequences is
+   *   fine), plus the requested input modes when this is an input proof;
+   * - the coordinator's own descriptive target, compared field by field as an
+   *   independent second opinion; it never selects or rewrites anything.
+   *
+   * No manager, owner-local row, `localActiveId`, local clipboard route, native
+   * input authority, last-input/dispatch counter, or history participates.
+   */
+  function currentWrittenRemoteNativeInput(expected: {
+    readonly hostId: string;
+    readonly selectionGeneration: number;
+    readonly subscriptionId: string;
+    readonly source: NativeIoInputSource;
+    readonly inputModes?: TerminalInputModes;
+  }): WrittenRemoteNativeInput | undefined {
+    if (!nativeIoBridgeEnabled || shutdownRequested || externalEditorActive) return undefined;
+    if (terminal === undefined || !terminalStarted || sidebar === undefined) return undefined;
+    if (sidebar.focus !== "main") return undefined;
+    const shown = displayedMousePresentation;
+    const latest = latestMousePresentation;
+    const currentLayout = layout;
+    if (shown === undefined || latest === undefined || currentLayout === undefined) return undefined;
+    const receipt = shown.nativeInput;
+    if (receipt === undefined) return undefined;
+    // A resize (even one that returns to the original dimensions before anything
+    // is repainted) revokes the written receipt until a post-resize frame is
+    // actually written.
+    if (receipt.resizeEpoch !== remoteInputEpoch) return undefined;
+    // This viewer's remote input/copy preference must be ON right now, and still
+    // the exact preference generation the written frame was composed under: Off
+    // refuses, and an Off -> On return never revives a receipt written before it.
+    const policy = enabledViewerInputPolicy();
+    if (policy === undefined || receipt.policyGeneration !== policy.generation) return undefined;
+    // Physical Main focus on the actually written frame AND on the latest candidate.
+    if (shown.focus !== "main" || latest.focus !== "main") return undefined;
+    // Actual coverage, not overlay capability: an overlay-capable layout with Main
+    // focused paints no sidebar rectangle and covers nothing.
+    const covered = (value: HostLayout): boolean => value.form !== undefined
+      || (value.sidebarOverlay && value.sidebar !== undefined);
+    if (covered(currentLayout) || covered(shown.layout) || covered(latest.layout)) return undefined;
+    if (!samePaneGeometry(shown.layout.native, currentLayout.native)
+      || !samePaneGeometry(latest.layout.native, currentLayout.native)) return undefined;
+    // The written receipt's rectangle is exactly what THIS pane draws for that same
+    // canonical geometry, so a moved/resized pane or a new frame size cannot reuse
+    // an old rectangle's coordinates.
+    if (!samePaneGeometry(receipt.nativeContent, {
+      column: currentLayout.native.column,
+      row: currentLayout.native.row,
+      cols: receipt.geometry.cols,
+      rows: receipt.geometry.rows,
+    })) return undefined;
+    // The deliberate target is the written receipt's own target, exactly.
+    const target = contentTarget;
+    if (target === undefined || target.kind !== "remote" || target.hostRunId === null) return undefined;
+    if (target.hostId !== receipt.hostId || target.hostRunId !== receipt.hostRunId
+      || target.rowId !== receipt.rowId) return undefined;
+    if (receipt.selectionGeneration !== contentSelectionGeneration) return undefined;
+    if (shown.contentSource?.startsWith("remote|") !== true) return undefined;
+    // The caller's expected target must BE the written receipt.
+    if (expected.hostId !== receipt.hostId
+      || expected.selectionGeneration !== receipt.selectionGeneration
+      || expected.subscriptionId !== receipt.subscriptionId
+      || !nativeIoSourceEquals(expected.source, receipt.source)) return undefined;
+    if (expected.inputModes !== undefined && !sameTerminalInputModes(expected.inputModes, receipt.inputModes)) {
+      return undefined;
+    }
+    // The currently published view must still carry this exact written source (and
+    // the same modes for input). Its publish sequence and snapshot object are never
+    // compared, so ordinary output never stalls typing or held input.
+    const view = currentRemoteContentView();
+    if (view === undefined || view.inputSource === undefined || view.inputModes === undefined) return undefined;
+    if (view.subscriptionId !== receipt.subscriptionId) return undefined;
+    if (!nativeIoSourceEquals(view.inputSource, receipt.source)) return undefined;
+    if (expected.inputModes !== undefined && !sameTerminalInputModes(view.inputModes, receipt.inputModes)) {
+      return undefined;
+    }
+    // The coordinator's own description is an independent comparison only.
+    const content = contentController();
+    if (content === undefined || typeof content.readNativeInputTarget !== "function") return undefined;
+    const described = content.readNativeInputTarget();
+    if (described === undefined) return undefined;
+    if (described.hostId !== receipt.hostId
+      || described.selectionGeneration !== receipt.selectionGeneration
+      || described.subscriptionId !== receipt.subscriptionId
+      || !nativeIoSourceEquals(described.source, receipt.source)) return undefined;
+    // Modes are freshness evidence for INPUT only; a copy is text, so it never
+    // gains a per-input-mode history or dispatch counter of its own.
+    if (expected.inputModes !== undefined && !sameTerminalInputModes(described.inputModes, receipt.inputModes)) {
+      return undefined;
+    }
+    return receipt;
+  }
+
+  /** The existing sidebar's brief, sanitized, non-modal notice slot. */
+  function showRemoteInputNotice(message: string): void {
+    // One fixed slot, no per-input history, no dialog, no retry, no focus change.
+    // The sidebar carries it whenever its pane is drawn; the composed header
+    // carries the same slot whenever no sidebar pane is drawn (hidden sidebar or
+    // narrow Main), so a refusal is never invisible.
+    remoteInputNotice = message;
+    sidebar?.showError(message);
+    scheduleRedraw();
+  }
+
+  /**
+   * One brief fixed notice when THIS viewer's saved remote input/copy preference
+   * is known Off: nothing is submitted, and nothing about the connection, owner,
+   * Hosting/Auto, or any other viewer changes. True when the attempt was refused.
+   */
+  function refuseWhileViewerInputOff(): boolean {
+    if (readViewerInputPolicy()?.enabled !== false) return false;
+    showRemoteInputNotice(REMOTE_INPUT_VIEWER_OFF_MESSAGE);
+    return true;
+  }
+
+  /**
+   * Submit ONE caller-normalized remote input against the actual-written receipt.
+   *
+   * Only a local refusal (before any submission) may say nothing was sent. Once
+   * the delegate was invoked, a rejection, a malformed result, or an explicit
+   * `unknown` is reported as UNCERTAIN — never as nothing sent, success, or an
+   * executed command. Nothing is retried, replayed, reconnected, re-granted,
+   * queued for a later frame, or handed to a local row.
+   */
+  function submitRemoteNativeInput(kind: NativeIoInputKind, text: string): void {
+    try {
+      if (!nativeIoBridgeEnabled) return;
+      if (refuseWhileViewerInputOff()) return;
+      const written = displayedMousePresentation?.nativeInput;
+      if (written === undefined) {
+        showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+        return;
+      }
+      const expected = {
+        hostId: written.hostId,
+        selectionGeneration: written.selectionGeneration,
+        subscriptionId: written.subscriptionId,
+        source: written.source,
+        inputModes: written.inputModes,
+      };
+      if (currentWrittenRemoteNativeInput(expected) === undefined) {
+        showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+        return;
+      }
+      const content = contentController();
+      if (content === undefined || typeof content.sendNativeInput !== "function") {
+        // An older/display-only controller offers no native capability: a fixed
+        // refusal, never a local fallback.
+        showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+        return;
+      }
+      const request: PeerNativeInputRequest = { ...expected, kind, text };
+      let pending: Promise<NativeInputSendResult> | undefined;
+      try {
+        pending = content.sendNativeInput(request);
+      } catch {
+        // The delegate was invoked and its outcome is unknowable.
+        showRemoteInputNotice(REMOTE_INPUT_UNCERTAIN_MESSAGE);
+        return;
+      }
+      if (pending === undefined) {
+        // A controller that produced no outcome told us nothing about the wire.
+        showRemoteInputNotice(REMOTE_INPUT_UNCERTAIN_MESSAGE);
+        return;
+      }
+      // One truthful settlement: only a fixed `not-sent` may say nothing was sent;
+      // `unknown`, a rejection, or no recognizable outcome stays UNCERTAIN.
+      const settle = (result: NativeInputSendResult | undefined): void => {
+        try {
+          if (result === undefined) {
+            showRemoteInputNotice(REMOTE_INPUT_UNCERTAIN_MESSAGE);
+          } else if (result.status === "submitted") {
+            // Local transport return only: never claimed as processed or executed.
+          } else if (result.status === "not-sent") {
+            showRemoteInputNotice(result.reason === "too-large"
+              ? REMOTE_INPUT_PASTE_TOO_LARGE_MESSAGE
+              : REMOTE_INPUT_NOT_SENT_MESSAGE);
+          } else {
+            showRemoteInputNotice(REMOTE_INPUT_UNCERTAIN_MESSAGE);
+          }
+        } catch {
+          // A notice failure never becomes an unhandled rejection.
+        }
+      };
+      void Promise.resolve(pending).then((result) => settle(result), () => settle(undefined));
+    } catch {
+      // Containment only: routing must never take down the host.
+      showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+    }
+  }
+
+  /**
+   * ONE keyboard or paste packet for the selected remote owner.
+   *
+   * Keyboard text is the existing source normalization under the ACTUAL public
+   * `ProcessTerminal.kittyProtocolActive` value; the owner translates once for its
+   * own native modes. A complete bracketed paste contributes only its exact outer
+   * brackets' TEXTBODY, refused whole above the decoded 1 MiB text bound (never
+   * truncated, and never an image or clipboard payload). An incomplete packet is
+   * never handed to the owner.
+   */
+  function routeRemoteForward(data: string): void {
+    try {
+      if (!nativeIoBridgeEnabled || terminal === undefined) return;
+      if (refuseWhileViewerInputOff()) return;
+      if (data.startsWith(BRACKETED_PASTE_START)) {
+        if (!data.endsWith(BRACKETED_PASTE_END)
+          || data.length < BRACKETED_PASTE_START.length + BRACKETED_PASTE_END.length) return;
+        const body = data.slice(BRACKETED_PASTE_START.length, data.length - BRACKETED_PASTE_END.length);
+        if (Buffer.byteLength(body, "utf8") > NATIVE_TEXT_PASTE_MAX_BYTES) {
+          showRemoteInputNotice(REMOTE_INPUT_PASTE_TOO_LARGE_MESSAGE);
+          return;
+        }
+        submitRemoteNativeInput("paste", body);
+        return;
+      }
+      submitRemoteNativeInput("keyboard", normalizeNativeSourceInput(data, terminal.kittyProtocolActive));
+    } catch {
+      showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+    }
+  }
+
+  /**
+   * ONE native pointer packet for the selected remote owner, mapped from the
+   * screen cell into the written content rectangle's own content coordinates.
+   *
+   * A packet in the pane's padding claims no content cell and is dropped without
+   * a submission. The emitted form is one canonical SGR report with the observed
+   * button/modifiers/release preserved; raw terminal coordinates, raw X10 bytes,
+   * and image payloads are never forwarded. The owner maps this SGR report to its
+   * own actual mouse modes (including legacy X10).
+   */
+  function routeRemoteMouseInput(mouse: ParsedMouseInput): void {
+    try {
+      if (!nativeIoBridgeEnabled) return;
+      if (refuseWhileViewerInputOff()) return;
+      const written = displayedMousePresentation?.nativeInput;
+      if (written === undefined) {
+        showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+        return;
+      }
+      const drawn = written.nativeContent;
+      if (mouse.x < drawn.column || mouse.x >= drawn.column + drawn.cols
+        || mouse.y < drawn.row || mouse.y >= drawn.row + drawn.rows) {
+        // Padding belongs to the host: no content cell was claimed, so nothing is
+        // submitted and no input notice is raised for a mere pointer position.
+        return;
+      }
+      const localX = mouse.x - drawn.column;
+      const localY = mouse.y - drawn.row;
+      submitRemoteNativeInput("mouse",
+        `\x1b[<${mouse.button};${localX + 1};${localY + 1}${mouse.release ? "m" : "M"}`);
+    } catch {
+      showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
+    }
+  }
+
+  /**
+   * The coordinator's dynamic per-write proof. It is deliberately stateless: every
+   * call re-evaluates the current written receipt, focus, coverage, geometry,
+   * source, modes, and the coordinator's own description. Anything but an
+   * independent `true` (including a throw) refuses the write.
+   */
+  function authorizeRemoteNativeInput(target: PeerNativeInputTarget): boolean {
+    try {
+      return currentWrittenRemoteNativeInput({
+        hostId: target.hostId,
+        selectionGeneration: target.selectionGeneration,
+        subscriptionId: target.subscriptionId,
+        source: target.source,
+        inputModes: target.inputModes,
+      }) !== undefined;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The coordinator's copy callback: emit the EXISTING outer OSC 52 form for this
+   * initiating viewer's own written, uncovered, Main-focused remote source only.
+   *
+   * The copy arrives after the coordinator has already proved its current selected
+   * endpoint and exact source; Main independently re-proves the same facts here.
+   * Copies are not input: no input modes, dispatch order, per-input history, or
+   * last-input counter participates, so an asynchronously later copy from an
+   * earlier input is still delivered when it belongs to the same current scope.
+   * Nothing is broadcast, relayed raw, written to the owner/local clipboard route,
+   * or replayed after the source moves. While this viewer's remote input/copy
+   * preference is Off no clipboard write is requested; nothing owner-side is
+   * cancelled by that, and an older copy is not fenced out by a newer dispatch.
+   */
+  function handleRemoteNativeCopy(receipt: PeerNativeCopyReceipt): void {
+    try {
+      if (!nativeIoBridgeEnabled || terminal === undefined) return;
+      const source = receipt.source;
+      const event = receipt.event;
+      // Validate the producer's own native tuple against the source it rode with.
+      if (source === null || typeof source !== "object" || event === null || typeof event !== "object") return;
+      if (event.sessionId !== source.nativeSession.sessionId
+        || event.sessionEpoch !== source.nativeSession.epoch) return;
+      if (currentWrittenRemoteNativeInput({
+        hostId: receipt.hostId,
+        selectionGeneration: receipt.selectionGeneration,
+        subscriptionId: receipt.subscriptionId,
+        source,
+      }) === undefined) return;
+      if (event.kind === "unavailable") {
+        // The eligible owner's own authenticated producer could not forward a
+        // copy. Only a fixed diagnostic code is recorded; no success is claimed.
+        clipboardDiagnostics.note(source.sessionId, event.reason === "unsupported-runtime"
+          ? "clipboard-unsupported-runtime"
+          : "clipboard-provenance-unavailable");
+        return;
+      }
+      const encoded = event.encoded;
+      // The client already validated and assembled the whole encoded payload under
+      // this unchanged producer bound; it is carried here in full, never shrunk.
+      if (typeof encoded !== "string" || encoded.length === 0
+        || encoded.length > NATIVE_COPY_MAX_ENCODED_CHARS) return;
+      try {
+        terminal.write(`\x1b]52;c;${encoded}\x07`);
+      } catch {
+        // Never the exception text, payload, or stack: a fixed code only.
+        clipboardDiagnostics.note(source.sessionId, "clipboard-terminal-write-failed");
+      }
+    } catch {
+      // Containment only; a copy failure never escapes into the coordinator.
+    }
+  }
+
   function reconcileLayout(resizeChildren: boolean): void {
     if (!terminal || !sidebar || shutdownRequested) return;
     try {
       const cols = clampDimension(terminal.columns, 80);
       const rows = clampDimension(terminal.rows, 24);
-      const next = computeHostLayout(cols, rows, {
-        sidebarVisible: sidebar.visible,
-        focus: sidebarFocus(sidebar.focus),
-        savedDeleteConfirmation: sidebar.savedDeleteConfirmationActive,
-      });
+      const next = currentHostLayout(cols, rows);
       layout = next;
+      noteRemoteSavedLayout(next);
       const changed = next.native.cols !== lastNativeCols || next.native.rows !== lastNativeRows;
-      if (resizeChildren && changed && manager && !resizeInProgress) {
+      if (manager && !resizeInProgress && (resizeChildren || localViewerNeedsSync(next.native))) {
         resizeInProgress = true;
         try {
-          manager.resize(next.native.cols, next.native.rows);
-          lastNativeCols = next.native.cols;
-          lastNativeRows = next.native.rows;
+          syncLocalViewerGeometry(next.native, resizeChildren && changed);
+          if (resizeChildren) {
+            lastNativeCols = next.native.cols;
+            lastNativeRows = next.native.rows;
+          }
         } finally {
           resizeInProgress = false;
         }
@@ -1439,6 +3845,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         lastNativeCols = next.native.cols;
         lastNativeRows = next.native.rows;
       }
+      // One deduped newest viewport for the selected remote stream. The pane is
+      // only this viewer's request; what is displayed stays the owner's own
+      // canonical frame geometry.
+      syncRemoteContentViewport(next.native);
       syncOuterMouseModes();
       scheduleRedraw();
     } catch {
@@ -1453,14 +3863,20 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const shown = displayedMousePresentation;
     const latest = latestMousePresentation;
     const ownsVisibleMain = terminal !== undefined && terminalStarted && !shutdownRequested && !externalEditorActive
-      && sidebar?.focus === "main" && activeId === id && layout !== undefined
-      && layout.form === undefined && !layout.sidebarOverlay
+      && sidebar?.focus === "main" && localActiveId() === id && layout !== undefined
+      && layout.form === undefined
       && shown?.focus === "main" && latest?.focus === "main"
       && shown.nativeOwnerId === id && latest.nativeOwnerId === id
-      && shown.layout.form === undefined && !shown.layout.sidebarOverlay
+      && shown.layout.form === undefined
       && shown.layout.cols === layout.cols && shown.layout.rows === layout.rows
       && latest.layout.cols === layout.cols && latest.layout.rows === layout.rows
-      && samePaneGeometry(shown.layout.native, layout.native) && samePaneGeometry(latest.layout.native, layout.native);
+      && samePaneGeometry(shown.layout.native, layout.native) && samePaneGeometry(latest.layout.native, layout.native)
+      // Use the same actual-coverage and written-owner/geometry authority as
+      // positional input. Overlay capability alone does not cover Main: the gate
+      // checks current, shown, and latest layouts so an actual overlay or an
+      // undrawn uncovering/geometry transition cannot authorize a copy (#474).
+      // Padding stays host-owned; valid fully drawn child content stays eligible.
+      && nativeInputAuthority(id) !== undefined;
     // Stale, sibling, hidden, unfocused, covered, form, changed-geometry, and
     // shutting-down requests are ordinary safety refusals: quiet, fail closed.
     if (!ownsVisibleMain) return;
@@ -1489,13 +3905,28 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function routeForward(data: string): void {
     if (!terminal || !sidebar || sidebar.focus !== "main" || shutdownRequested || externalEditorActive) return;
+    // A deliberately selected remote viewport never falls back to a local row.
+    // With the default bridge it routes one caller-normalized native submission to
+    // that exact selected stream while this viewer's preference is on (Off is a
+    // brief fixed refusal); the explicit-false legacy seam keeps the silent drop.
+    if (contentTarget?.kind === "remote") {
+      routeRemoteForward(data);
+      return;
+    }
     const view = findActiveView();
     if (!view || !view.hasLiveProcess || view.lifecycle !== "alive" || !layout || !manager) return;
     const surface = manager.surface(view.id);
     if (!surface) return;
     try {
       const sourceNormalized = normalizeNativeSourceInput(data, terminal.kittyProtocolActive);
-      const translated = translateInput(sourceNormalized, surface.inputModes(), layout.native);
+      const viewport = nativeInputAuthority(view.id);
+      // A mouse packet claims a cell of the displayed content. With no written,
+      // current snapshot for that row there is no defensible viewport, so the
+      // packet is dropped; keyboard and paste packets make no positional claim
+      // (the translator never consults a viewport for them) and keep their
+      // ordinary path.
+      if (viewport === undefined && parseMouseInput(sourceNormalized) !== undefined) return;
+      const translated = translateInput(sourceNormalized, surface.inputModes(), viewport ?? layout.native);
       if (translated !== undefined) manager.write(view.id, translated);
     } catch {
       // The process may have exited between the snapshot and write. Never
@@ -1512,8 +3943,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       || !sidebar.visible || sidebar.focus !== "sidebar"
       || !sameNativeMouseTarget(presentation, latest)
       || !sameNativePaneGeometry(presentation.layout, layout)
-      || !containsHostPoint(presentation.layout.native, mouse.x, mouse.y)
-      || activeId !== presentation.nativeOwnerId) return false;
+      || localActiveId() !== presentation.nativeOwnerId) return false;
+    // A padded cell belongs to the host, not the child: only a click on content
+    // this row actually drew is a focus gesture (#474).
+    const drawn = presentation.nativeContent;
+    if (drawn === undefined || !containsHostPoint(drawn, mouse.x, mouse.y)) return false;
     const view = findActiveView();
     if (!view || view.id !== presentation.nativeOwnerId || !view.hasLiveProcess || view.lifecycle !== "alive") return false;
     try {
@@ -1550,19 +3984,26 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const pane = formPane ?? sidebarPane;
     if (pane !== undefined) {
       if (isMouseButtonPress(mouse) && buttonId !== undefined) hostMouseButtons.add(buttonId);
-      const savedDeleteDialogOwnsPointer = presentation?.focus === "confirm"
-        && presentation.layout.form !== undefined;
-      if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending
-        && !savedDeleteDialogOwnsPointer) {
+      if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending) {
         const previousFocus = sidebar.focus;
         const previousSelection = sidebar.selectedId;
         const previousVisibility = sidebar.visible;
+        // A host confirmation owns the pointer inside its own pane: while
+        // confirm focus the right-hand slot belongs to the dialog, so only the
+        // actually written left roster may act on a press. The Sidebar still
+        // refuses any click whose written frame drew no visible roster.
+        const confirmationOwnsRightPane = presentation.focus === "confirm";
         // Keep the emitted frame's source pane identity and its render-derived
         // maps: a newer coalesced render must never retarget this coordinate.
+        // Inside the form slot the Sidebar dispatches to whichever pane that
+        // captured render actually drew — the Saved picker or the Network menu —
+        // and a Network row's press performs that row's ordinary Enter action
+        // once through the pane's own activation routine.
         const activated = formPane !== undefined
-          ? presentation.sidebar.activateSavedAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
+          ? !confirmationOwnsRightPane
+            && presentation.sidebar.activateFormRowAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
           : hitLayout.sidebarOverlay && presentation.focus === "form"
-            ? presentation.sidebar.activateSavedAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
+            ? presentation.sidebar.activateFormRowAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
             : presentation.sidebar.activateRosterAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows);
         if (activated) {
           if (sidebar.focus !== previousFocus || sidebar.selectedId !== previousSelection
@@ -1576,6 +4017,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // The visible host pane owns every mouse gesture, including releases,
       // motion and wheel input; only an initial left-button press above can
       // activate a draw-derived row.
+      return;
+    }
+    // A written remote viewport is display-only under the explicit-false legacy
+    // seam or while this viewer's remote input/copy preference is Off; otherwise a
+    // Main-focused pointer packet is submitted as one canonical content-space SGR
+    // report for the exact written source. A deliberately selected remote target whose new viewport is not
+    // written yet has no pointer authority either — its packet is refused rather
+    // than reinterpreted as keyboard input or forwarded to a local row. A
+    // roster-focused packet keeps the existing non-activating drop.
+    if (writtenSourceIsRemote() || contentTarget?.kind === "remote") {
+      if (sidebar.focus === "main") routeRemoteMouseInput(mouse);
       return;
     }
     // With the roster focused, a left click in the actually displayed, current
@@ -1639,7 +4091,28 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   function handleTerminalResize(): void {
+    invalidatePeerConsentDisplay();
     invalidateSavedDeleteConfirmationDisplay();
+    // A resize can reflow the terminal before the next coalesced redraw: no
+    // pending remote close may keep a confirmable token at the old geometry,
+    // and no highlight written at the old geometry may authorize a request.
+    invalidateRemoteCloseConfirmationDisplay();
+    remoteCloseHighlightEpoch += 1;
+    // A remote New submission's written form receipt belongs to the geometry it
+    // was written at. Physical reflow retires it (and any in-flight request's
+    // last-instant proof) until a replacement frame in this new epoch is written,
+    // including a resize that returns to the previous size before repainting.
+    createFormEpoch += 1;
+    // Physical reflow revokes every remote native IO receipt until a post-resize
+    // frame is actually written, including a resize that returns to the previous
+    // size before anything is repainted. Remote input/copy only; Close and
+    // ordinary host UI keep their own independent written proofs.
+    remoteInputEpoch += 1;
+    // The remote Saved picker/confirmation receipts and every admitted-but-unsent
+    // remote Saved intent belong to the geometry they were proved at: a reflow
+    // (even one that returns to the same size) retires them for good.
+    remoteSavedEpoch += 1;
+    remoteSavedPickerFrame = undefined;
     // A real outer resize can reflow the physical screen and then return to
     // the same final geometry before the next coalesced redraw (for example
     // 80 -> 40 -> 80). Invalidate the known baseline before recomputing so the
@@ -1655,6 +4128,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       throw new Error("external editor handoff is unavailable");
     }
     externalEditorActive = true;
+    // The handoff retires every geometry-bound receipt: the terminal is handed to
+    // the editor and repainted, so a remote New receipt composed before it is dead.
+    createFormEpoch += 1;
+    remoteSavedEpoch += 1;
+    remoteSavedPickerFrame = undefined;
     hostMouseButtons.clear(); // no terminal gesture ownership survives a tty handoff
     const controller = new AbortController();
     externalEditorAbort = controller;
@@ -1749,19 +4227,23 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     let task!: Promise<void>;
     task = (async () => {
       try {
-        const id = await manager!.create(createOptions);
-        if (shutdownRequested || !sidebar || !manager) return;
-        const row = manager.list().find((candidate) => candidate.id === id);
-        if (!row || row.lifecycle === "error" || row.lifecycle === "starting") {
+        const outcome = await hostService.startSession(createOptions);
+        if (outcome.status === "unavailable" || shutdownRequested || !sidebar) return;
+        if (outcome.status === "failed") {
           sidebar.failCreate(action.requestId, GENERIC_CREATE_FAILURE);
+          scheduleRedraw();
         } else {
-          // A successful New submission activates the created child as the
-          // Main input owner (the sidebar emits select); launch-error rows
-          // never reach this success path.
-          sidebar.completeCreate(action.requestId, id);
+          if (outcome.status === "started") {
+            // A successful New submission activates the created child as the
+            // Main input owner (the sidebar emits select); launch-error rows
+            // never reach this success path.
+            sidebar.completeCreate(action.requestId, outcome.id);
+          } else {
+            sidebar.failCreate(action.requestId, GENERIC_CREATE_FAILURE);
+          }
+          syncRosterAndSchedule();
+          reconcileLayout(true);
         }
-        syncRosterAndSchedule();
-        reconcileLayout(true);
       } catch {
         if (!shutdownRequested && sidebar) {
           sidebar.failCreate(action.requestId, GENERIC_CREATE_FAILURE);
@@ -1772,44 +4254,6 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       }
     })();
     createTasks.add(task);
-  }
-
-  /**
-   * Authenticated child request: add a fresh sibling directly through the
-   * manager. This path intentionally never completes a sidebar form or
-   * activates the created row; manager onChange only refreshes the roster.
-   */
-  async function handleSessionSpawn(parentInstanceId: string, request: SessionSpawnInput): Promise<SessionSpawnOutcome> {
-    const currentManager = manager;
-    if (!currentManager || shutdownRequested) return "failed";
-    let parent: NativeInstanceView | undefined;
-    try {
-      parent = currentManager.list().find((view) => view.id === parentInstanceId);
-    } catch {
-      return "failed";
-    }
-    if (!parent || parent.lifecycle !== "alive" || parent.hasLiveProcess !== true) return "failed";
-
-    let childId: string;
-    try {
-      childId = await currentManager.create({
-        workspace: request.workspace,
-        initialRequest: { title: request.title, prompt: request.prompt },
-      });
-    } catch {
-      return "failed";
-    }
-    // A create interrupted by host teardown may have launched a child that is
-    // no longer observable here. Never report that case as a definite failure.
-    if (currentManager !== manager || shutdownRequested) return "unknown";
-    let child: NativeInstanceView | undefined;
-    try {
-      child = currentManager.list().find((view) => view.id === childId);
-    } catch {
-      return "unknown";
-    }
-    if (!child) return "unknown";
-    return child.hasLiveProcess === true || child.exitCode !== undefined ? "started" : "failed";
   }
 
   /** Snapshot actual title-line columns for the layout with the sidebar shown. */
@@ -1843,39 +4287,41 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       scheduleRedraw();
       return;
     }
-    let result: SavedSessionAdmissionResult;
-    try {
-      result = admitSavedSession(catalog, row, { ownedLiveSessions: manager.ownedLiveSessions() });
-    } catch {
-      result = { status: "refused", reason: "unknown-row" };
-    }
-    if (result.status === "refused") {
-      sidebar.failSavedOpen(requestId, savedRefusalNotice(result.reason));
+    const admission = hostService.admitSavedConversation(catalog, row);
+    if (admission.status === "refused") {
+      sidebar.failSavedOpen(requestId, savedRefusalNotice(admission.reason));
       scheduleRedraw();
       return;
     }
-    const admission = result.admission;
+    const receipt = admission.admission;
     let task!: Promise<void>;
     task = (async () => {
       try {
         // The exact saved header cwd determines the workspace; the manager
         // refuses any conflicting explicit workspace and fences duplicates.
-        const id = await manager!.create({ workspace: admission.workspace, savedSession: admission });
-        if (shutdownRequested || !sidebar || !manager) return;
-        const created = manager.list().find((candidate) => candidate.id === id);
-        if (!created || created.lifecycle === "error" || created.lifecycle === "starting") {
-          sidebar.failSavedOpen(requestId, GENERIC_CREATE_FAILURE);
+        const outcome = await hostService.startSession({ workspace: receipt.workspace, savedSession: receipt });
+        if (outcome.status === "unavailable" || shutdownRequested || !sidebar) return;
+        if (outcome.status === "failed" || outcome.status === "duplicate") {
+          sidebar.failSavedOpen(requestId,
+            outcome.status === "duplicate"
+              ? "That saved conversation is already open in this host"
+              : GENERIC_CREATE_FAILURE);
+          scheduleRedraw();
         } else {
-          // A successful Saved open activates the restored child as the Main
-          // input owner; launch-error rows never reach this success path.
-          sidebar.completeSavedOpen(requestId, id);
+          if (outcome.status === "started") {
+            // A successful Saved open activates the restored child as the Main
+            // input owner; launch-error rows never reach this success path.
+            sidebar.completeSavedOpen(requestId, outcome.id);
+          } else {
+            sidebar.failSavedOpen(requestId, GENERIC_CREATE_FAILURE);
+          }
+          syncRosterAndSchedule();
+          reconcileLayout(true);
         }
-        syncRosterAndSchedule();
-        reconcileLayout(true);
       } catch (error) {
         if (!shutdownRequested && sidebar) {
           sidebar.failSavedOpen(requestId,
-            error instanceof Error && error.message.includes("already open in this host")
+            isDuplicateOwnedLaunchFailure(error)
               ? "That saved conversation is already open in this host"
               : GENERIC_CREATE_FAILURE);
           scheduleRedraw();
@@ -1955,44 +4401,6 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   /**
-   * The exact current exited binding of one row, read fresh from the manager:
-   * only an actual confirmed exit with no owned process qualifies. The retained
-   * last-observed native binding is the restart target; a missing persistence
-   * observation is unknown, never assumed unsaved.
-   */
-  function readExitedResumeTarget(id: string):
-    { readonly workspace: string; readonly binding: NativePersistenceReceipt; readonly epoch: number } | undefined {
-    if (!manager) return undefined;
-    let view: NativeInstanceView | undefined;
-    try {
-      view = manager.list().find((candidate) => candidate.id === id);
-    } catch {
-      return undefined;
-    }
-    if (!view || view.lifecycle !== "exited" || view.hasLiveProcess !== false) return undefined;
-    const retained = view.lastNativeSession;
-    if (!retained || !isValidNativeSessionId(retained.sessionId)
-      || !Number.isSafeInteger(retained.epoch) || retained.epoch < 1) return undefined;
-    const persistence = retained.persistence === "saved" || retained.persistence === "unsaved"
-      ? retained.persistence
-      : "unknown";
-    return { workspace: view.workspace, binding: { sessionId: retained.sessionId, persistence }, epoch: retained.epoch };
-  }
-
-  /**
-   * Current manager row for one replacement child. A listing failure is a
-   * readiness failure, never a success and never a poll.
-   */
-  function readReadinessView(id: string): NativeInstanceView | undefined {
-    if (!manager) return undefined;
-    try {
-      return manager.list().find((candidate) => candidate.id === id);
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
    * Manager onChange fan-out: wake only the readiness waiters for the changed
    * row (each re-reads current state), then run the ordinary roster
    * synchronization. A wake only resolves a promise, so it cannot reenter
@@ -2053,7 +4461,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         }
         let outcome: RowResumeReadiness;
         try {
-          outcome = rowResumeReadiness(readReadinessView(id), expectedSessionId);
+          outcome = rowResumeReadiness(hostService.readRow(id), expectedSessionId);
         } catch {
           // A throwing metadata read is a readiness failure, never a leak: the
           // listener and deadline timer settle through the same path, so no
@@ -2130,7 +4538,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     };
     const controller = record.controller;
     // Capture the exact current exited binding before the read-only listing.
-    const before = readExitedResumeTarget(oldId);
+    const before = hostService.readExitedResumeTarget(oldId);
     if (!before) {
       fail(ROW_RESUME_FAILURE);
       return;
@@ -2159,7 +4567,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     if (controller.signal.aborted || shutdownRequested || manager !== owner) return;
     // Re-read the exited/current binding immediately before any spawn: a row
     // that rebound or was replaced refuses instead of restarting something else.
-    const after = readExitedResumeTarget(oldId);
+    const after = hostService.readExitedResumeTarget(oldId);
     if (!after || after.binding.sessionId !== before.binding.sessionId || after.epoch !== before.epoch) {
       fail(ROW_RESUME_FAILURE);
       return;
@@ -2172,21 +4580,16 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     let createOptions: CreateInstanceOptions;
     let expectedSessionId: string | undefined;
     if (choice.kind === "saved") {
-      let result: SavedSessionAdmissionResult;
-      try {
-        result = admitSavedSession(catalog, choice.row, { ownedLiveSessions: owner.ownedLiveSessions() });
-      } catch {
-        result = { status: "refused", reason: "unknown-row" };
-      }
-      if (result.status === "refused") {
-        fail(savedRefusalNotice(result.reason));
+      const admitted = hostService.admitSavedConversation(catalog, choice.row);
+      if (admitted.status === "refused") {
+        fail(savedRefusalNotice(admitted.reason));
         return;
       }
       // The exact branded admission is passed verbatim; the manager owns the
       // launch-time file revalidation and known-owned duplicate fence. The
       // replacement must report exactly this saved conversation to qualify.
-      expectedSessionId = result.admission.sessionId;
-      createOptions = { workspace: result.admission.workspace, savedSession: result.admission };
+      expectedSessionId = admitted.admission.sessionId;
+      createOptions = { workspace: admitted.admission.workspace, savedSession: admitted.admission };
     } else {
       // Positive known-unsaved binding plus an issue-free, safely absent
       // catalog: a fresh child in the SAME exited owned workspace.
@@ -2207,7 +4610,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     } catch (error) {
       if (shutdownRequested || !sidebar) return;
       sidebar.failRowResume(requestId,
-        error instanceof Error && error.message.includes("already open in this host")
+        isDuplicateOwnedLaunchFailure(error)
           ? "That saved conversation is already open in this host"
           : ROW_RESUME_FAILURE);
       syncRosterAndSchedule();
@@ -2262,6 +4665,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   /**
+   * What one {@link removeExitedRow} call established about THIS host's removal
+   * authority. Only `"removed"` claims anything: `"retained"` is the manager
+   * refusing to settle the row (so the row and whatever it still owns, possibly
+   * a live PTY, stand untouched), and `"failed"` is a manager authority that
+   * threw, leaving its effect unobservable.
+   */
+  type RowRemovalOutcome = "removed" | "retained" | "failed";
+
+  /**
    * Remove one row, optionally completing a confirmed deliberate replacement.
    *
    * A successful replacement transfers its stable roster slot into the old
@@ -2271,10 +4683,25 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * row's removal is confirmed, and synchronous roster synchronization is
    * suppressed across that confirmation so the old slot cannot be dropped
    * before the transfer runs.
+   *
+   * Returns what this host's removal authority established, so the shared close
+   * core can report truthful facts instead of a notice: only `"removed"` is a
+   * positive claim, `"retained"` is an authority refusal (nothing was settled),
+   * and `"failed"` is a thrown authority whose effect is unobservable.
+   * `notify: false` is for the owner-side Close provider: it holds back only
+   * this host's own removal notices. Every other effect — the ghost set, the
+   * roster slot and remembered record, the replacement slot transfer, the
+   * remembered active row, the displayed local content target, the roster
+   * redraw, the roster persist, and the layout reconcile — is unchanged for
+   * every caller.
    */
-  function removeExitedRow(id: string, options?: { readonly replaced?: boolean; readonly replacementId?: string }): void {
-    if (!manager || !sidebar) return;
+  function removeExitedRow(
+    id: string,
+    options?: { readonly replaced?: boolean; readonly replacementId?: string; readonly notify?: boolean },
+  ): RowRemovalOutcome {
+    if (!manager || !sidebar) return "retained";
     const replacing = options?.replaced === true;
+    const notify = options?.notify !== false;
     const replacementId = options?.replacementId;
     const oldSlot = rowSlots.get(id);
     const replacementSlot = replacementId === undefined ? undefined : rowSlots.get(replacementId);
@@ -2288,8 +4715,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
     catch {
       if (replacing) sidebar.clearRowReplacement(id);
-      else { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
-      return;
+      else if (notify) { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
+      return "failed";
     } finally {
       rosterSyncInProgress = wasSyncing;
     }
@@ -2297,15 +4724,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // A settled error row without an owned PTY exit is closed only through
       // the manager's own closeError authority. Resume replacements never get
       // this fallback: they remain closeExited-only.
-      const outcome = tryCloseError(manager, id);
+      const outcome = tryCloseError(manager, id, notify);
       if (outcome === "closed") removed = true;
-      else if (outcome === "failure") return; // generic failure already shown
+      else if (outcome === "failure") return "failed"; // generic failure already shown
     }
     if (!removed) {
       // An already-removed placeholder is tolerated; nothing else is touched.
       if (replacing) sidebar.clearRowReplacement(id);
-      else { sidebar.showError(REMOVE_REFUSED_MESSAGE); scheduleRedraw(); }
-      return;
+      else if (notify) { sidebar.showError(REMOVE_REFUSED_MESSAGE); scheduleRedraw(); }
+      return "retained";
     }
     removedExitedIds.add(id);
     if (replacing && replacementId !== undefined && oldSlot !== undefined
@@ -2319,10 +4746,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       rowSlots.set(replacementId, oldSlot);
       if (rememberedActiveSlot === replacementSlot) rememberedActiveSlot = oldSlot;
     }
-    if (activeId === id) activeId = undefined;
+    if (contentTarget?.kind === "local" && contentTarget.id === id) {
+      contentTarget = undefined;
+      contentSelectionGeneration += 1;
+    }
     // Authoritatively settled removal never activates a sibling or loses its owner.
     syncRosterAndSchedule();
     reconcileLayout(true);
+    return "removed";
   }
 
   /**
@@ -2332,43 +4763,1691 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * the decision to the caller; a thrown closeError reports the generic
    * failure and keeps the row. No signal, sibling, or other fallback.
    */
-  function tryCloseError(owner: MainManager, id: string): "closed" | "not-applicable" | "failure" {
+  function tryCloseError(owner: OwningHostManager, id: string, notify: boolean): "closed" | "not-applicable" | "failure" {
     const closeError = owner.closeError;
     if (typeof closeError !== "function") return "not-applicable";
-    if (readReadinessView(id)?.lifecycle !== "error") return "not-applicable";
+    if (hostService.readRow(id)?.lifecycle !== "error") return "not-applicable";
     try {
       return closeError.call(owner, id) === true ? "closed" : "not-applicable";
     } catch {
-      sidebar?.showError(REMOVE_FAILURE_MESSAGE);
-      scheduleRedraw();
+      if (notify) { sidebar?.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
       return "failure";
     }
   }
 
-  function launchRowStop(id: string, confirmed: boolean): void {
-    if (!manager || !sidebar || rowStopTasks.has(id)) return;
-    const owner = manager;
-    let task!: Promise<void>;
-    task = (async () => {
+  /**
+   * The host's ONE row close: stop one owned row, then remove its row only
+   * after the manager POSITIVELY reports the exit.
+   *
+   * The local `d`/Delete route drives this with `notify: true` and gets exactly
+   * the notices it always got; the owner-side Close provider drives it with
+   * `notify: false` and reads the returned facts instead of writing anything to
+   * this host's screen. Both routes share one per-row `rowStopTasks` fence (so
+   * one row has one stop ladder and a duplicate request never re-signals or
+   * queues a second one), the same authority re-check before the manager is
+   * addressed and after its await, the same {@link removeExitedRow} bookkeeping
+   * (ghost set, roster slot and remembered record, remembered active row,
+   * displayed local content target, roster redraw, roster persist, layout
+   * reconcile), and the same shutdown barrier: teardown already awaits every task
+   * in `rowStopTasks`, so a close accepted here joins it with no second registry
+   * and no new unbounded await.
+   *
+   * The facts say only what this host observed. `confirmed` runs the manager's
+   * existing bounded ladder (graceful request, then TERM, then the owned-handle
+   * kill) and adds no force of its own; nothing here signals a sibling, cancels
+   * an in-flight restart or resume, reports a sent signal or an acknowledgement as
+   * an exit, or deletes a saved conversation. An outcome this host did not
+   * positively settle stays `unknown` instead of becoming a claim that nothing was
+   * submitted.
+   */
+  function startRowClose(
+    owner: OwningHostManager,
+    id: string,
+    confirmed: boolean,
+    notify: boolean,
+  ): Promise<OwnerCloseFacts> {
+    const task = (async (): Promise<OwnerCloseFacts> => {
       // Publish duplicate fencing before even a synchronously throwing adapter.
       await Promise.resolve();
       try {
+        // That yield is the only window in which this row's close is registered and
+        // the adapter has not been addressed. Teardown may have begun or the run
+        // replaced inside it, and the captured manager must not be written to
+        // afterwards, so the host's authority is re-read here rather than after a
+        // stop this host no longer owns. This close signalled nothing, and the row's
+        // fate from here is unobservable, so the same conservative fact as the
+        // post-stop fence applies.
+        if (shutdownRequested || manager !== owner) return { kind: "unknown" };
         const stop = owner.stop;
-        if (typeof stop !== "function") throw new Error("owned row stop unavailable");
+        if (typeof stop !== "function") {
+          // A manager that cannot stop refuses honestly: no signal, no startup
+          // failure, and the local route keeps its existing bounded notice. This is
+          // a positive pre-call proof that nothing was submitted.
+          if (notify && !shutdownRequested && sidebar) { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
+          return { kind: "refused" };
+        }
         const result = await stop.call(owner, id, { confirmed: confirmed === true });
-        if (shutdownRequested || manager !== owner || !sidebar) return;
-        if (result.status === "exited") removeExitedRow(id);
-        else {
+        // Teardown began, or this is no longer the host's manager run: what
+        // happened to the child is unknown, and nothing may be re-sent or
+        // re-signalled on its behalf, so no exit or removal is claimed.
+        if (shutdownRequested || manager !== owner) return { kind: "unknown" };
+        if (result.status === "exited") {
+          // Removal follows a positive exit and nothing else, through the one
+          // path that owns this host's roster bookkeeping. The exit itself was
+          // observed, so a clean refusal to remove truthfully reports a stopped row
+          // this host kept; a removal authority that threw leaves even the row's
+          // presence unobservable.
+          const removal = removeExitedRow(id, { notify });
+          return removal === "removed" ? { kind: "removed" }
+            : removal === "failed" ? { kind: "unknown" }
+              : { kind: "stopped-retained" };
+        }
+        // Every non-exited outcome keeps the row, its registration, this host's
+        // surface, and its ownership exactly as they were; the local route keeps
+        // the notice and the roster restatement it always produced.
+        if (notify && sidebar) {
           sidebar.showError(result.status === "confirmation-required"
-            ? "Activity changed or is unknown. Press d again to confirm stopping this session."
+            ? ROW_STOP_CONFIRMATION_MESSAGE
             : REMOVE_REFUSED_MESSAGE);
           syncRosterAndSchedule();
         }
+        // `unconfirmed` is this manager's own report that its bounded ladder ended
+        // without an exit. `unavailable` is ambiguous: the manager can report it
+        // AFTER accepting the shutdown request, when its record or the manager
+        // itself went away during the await, and another adapter build can report a
+        // status this host does not recognize. Neither proves that nothing was
+        // submitted, so both stay unknown instead of becoming a refusal.
+        return result.status === "confirmation-required"
+          ? { kind: "confirmation-required" }
+          : result.status === "unconfirmed"
+            ? { kind: "unconfirmed" }
+            : { kind: "unknown" };
       } catch {
-        if (!shutdownRequested && sidebar) { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
-      } finally { rowStopTasks.delete(id); }
+        // The manager threw, so whether it signalled anything is unknown. The
+        // local route keeps its existing bounded failure notice; no exit,
+        // removal, or cleanup is ever claimed for either route.
+        if (notify && !shutdownRequested && sidebar) { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
+        return { kind: "unknown" };
+      } finally {
+        rowStopTasks.delete(id);
+      }
     })();
     rowStopTasks.set(id, task);
+    return task;
+  }
+
+  /**
+   * The local `d`/Delete route: the shared close core with this host's notices.
+   * Its preconditions and duplicate handling are exactly what they were before
+   * the core existed — a row with an in-flight close is simply ignored.
+   */
+  function launchRowStop(id: string, confirmed: boolean): void {
+    if (!manager || !sidebar || rowStopTasks.has(id)) return;
+    void startRowClose(manager, id, confirmed, true);
+  }
+
+  /**
+   * The ONE owner-side Close provider. It closes one row of THIS host by reusing
+   * {@link startRowClose} — the exact stop-and-exit-only-removal core the local
+   * route uses, with the same per-row fence and roster bookkeeping — and answers
+   * with fixed facts only.
+   *
+   * Nothing is enabled by this phase: no capability is advertised, no frame
+   * carries a close, and no coordinator code calls this handler. Only a future
+   * owner endpoint behind the current TLS-proved peer key and the current
+   * directional receiving grant can reach it, and that endpoint must reauthorize
+   * before writing any reply.
+   *
+   * The request is resolved ONLY against this owner's authoritative inventory,
+   * never against a viewer's local manager, and it needs no native conversation
+   * tuple, no displayed or selected row, no viewer, no controller lease, and no
+   * local popup or setting. It is notice-free toward this host's operator (the
+   * requester gets the facts instead) while the shared core still performs its
+   * normal roster redraw, status, and persistence-warning paths.
+   *
+   * The facts never overstate what this host saw. `removed` is the manager's own
+   * confirmed removal — after an exit this host actually observed (a row already in
+   * `exited` lifecycle, or a stop that reported one) or under its settled
+   * launch-error removal authority — while `stopped-retained` requires an exit this
+   * host actually observed. An `error` row takes the same route the local
+   * `d`/Delete route takes for that same row: the manager's real stop when it
+   * reports the child live, its own settled-removal authority when it reports the
+   * child settled. A refusal is reserved for authority this host positively
+   * established before any call; an ambiguous result after a stop was addressed,
+   * and any thrown authority, reports `unknown`, which claims neither removal nor
+   * retention.
+   */
+  async function closeOwnedSession(request: OwnerCloseRequest): Promise<OwnerCloseFacts> {
+    // Fence teardown and the one manager run before anything is read or written.
+    const owner = manager;
+    if (owner === undefined || shutdownRequested) return { kind: "refused" };
+    // An inventory that cannot be observed is unknown; a different owner run or
+    // a row this run does not have is refused. None of these reads writes,
+    // signals, stops, or removes anything.
+    let inventory: OwningHostInventorySnapshot | undefined;
+    try {
+      inventory = hostService.readInventorySnapshot();
+    } catch {
+      inventory = undefined;
+    }
+    if (inventory === undefined) return { kind: "unknown" };
+    if (inventory.hostRunId !== request.hostRunId) return { kind: "refused" };
+    const row = inventory.rows.find((candidate) => candidate.id === request.rowId);
+    if (row === undefined) return { kind: "refused" };
+    // One close per row: an in-flight close already owns this row's stop ladder,
+    // and a second request never re-signals or queues behind it.
+    if (rowStopTasks.has(request.rowId)) return { kind: "busy" };
+    // An already exited row is REMOVED, never blindly stopped: it may own no
+    // PTY at all, and only the manager's own removal authority may settle it.
+    // This is the same route local d/Delete takes, and it takes no await, so no
+    // stale authority is possible here. Its lifecycle IS a positive exit, so a
+    // clean refusal still reports the observed stop honestly; a thrown authority
+    // leaves even the row's presence unobservable.
+    if (row.lifecycle === "exited") {
+      const outcome = removeExitedRow(request.rowId, { notify: false });
+      if (outcome === "removed") return { kind: "removed" };
+      return outcome === "failed" ? { kind: "unknown" } : { kind: "stopped-retained" };
+    }
+    // An error lifecycle is NOT a settlement: the manager can keep a live PTY
+    // behind a fatal display or setup error, so the error badge alone is neither
+    // exit nor removal authority. The owner close follows the manager's own read of
+    // the child, exactly like the local `d`/Delete route for that row: a child the
+    // manager reports LIVE goes through the shared core's real idle preflight and
+    // existing bounded ladder (`confirmed` authorizes that ladder only), and only
+    // an exit it then reports may lead to removal. A child the manager reports
+    // SETTLED is removed by the manager's own authorities (`closeExited`, then the
+    // lifecycle-gated `closeError`) and never blindly stopped; a refusal settled
+    // nothing and a thrown authority is unobservable, and neither claims an exit.
+    // Anything else — a live state this host cannot read — is refused without
+    // signalling anything, because no inference from a badge is authority.
+    if (row.lifecycle === "error") {
+      if (row.hasLiveProcess === true) return startRowClose(owner, request.rowId, request.confirmed, false);
+      if (row.hasLiveProcess !== false) return { kind: "refused" };
+      const outcome = removeExitedRow(request.rowId, { notify: false });
+      if (outcome === "removed") return { kind: "removed" };
+      return outcome === "failed" ? { kind: "unknown" } : { kind: "refused" };
+    }
+    // A live row goes through the shared core with the manager's real idle
+    // preflight. `confirmed` authorizes only the existing bounded ladder, never
+    // a force, and the core re-checks teardown and manager identity before the
+    // stop and after its await before removing anything.
+    return startRowClose(owner, request.rowId, request.confirmed, false);
+  }
+
+  /**
+   * The ONE owner-side rowless Create provider. It creates one blank child in THIS
+   * host's exact current run by reusing the very seam the local New action uses —
+   * {@link OwningHostService.startSession} with only the canonical workspace — and
+   * answers with fixed facts only.
+   *
+   * Nothing else about the local New route happens here: no duplicate fence, no
+   * workspace deduplication, no path resolution or cwd substitution, no trimming,
+   * no form bookkeeping, no row selection, and no activation or focus change. The
+   * request is resolved ONLY against this owner's authoritative inventory, which is
+   * read before the create for the exact run and after it for the row that actually
+   * came up, and it needs no native conversation tuple, displayed or selected row,
+   * viewer, controller lease, or local popup or setting. It is notice-free toward
+   * this host's operator (the requester gets the facts instead) while the service's
+   * normal roster redraw and persistence-warning paths still run.
+   *
+   * The facts never overstate what this host saw. `started` requires the row to be
+   * alive with a live process in THIS run's own post-create inventory. `unconfirmed`
+   * is an addressed create that produced nothing usable (a not-ready or failed
+   * create may have left an error row, which this fact neither removes nor
+   * describes). `refused` is reserved for authority or identity this host
+   * positively established before any create was invoked, including the minimal
+   * re-proof checked immediately before that invocation. A throwing manager, an
+   * interrupted run, an unexpected duplicate, or an unrecognized status is
+   * `unknown` and claims neither a child nor its absence.
+   */
+  async function createOwnedSession(
+    request: OwnerCreateRequest,
+    stillAuthorized: () => boolean,
+  ): Promise<OwnerCreateFacts> {
+    // Fence teardown and the one manager run before anything is read or written.
+    if (manager === undefined || shutdownRequested) return { kind: "refused" };
+    // An inventory that cannot be observed is unknown, and another owner run is
+    // refused. Neither read starts, writes, selects, activates, or focuses anything.
+    let before: OwningHostInventorySnapshot | undefined;
+    try {
+      before = hostService.readInventorySnapshot();
+    } catch {
+      before = undefined;
+    }
+    if (before === undefined) return { kind: "unknown" };
+    if (before.hostRunId !== request.hostRunId) return { kind: "refused" };
+    // The owner's minimal re-proof is checked IMMEDIATELY before the create is
+    // invoked — after every callout above — so a Revoke, a replaced grant, or a
+    // retired channel that landed after admission never starts a child.
+    let authorized = false;
+    try {
+      authorized = stillAuthorized() === true;
+    } catch {
+      authorized = false;
+    }
+    if (!authorized || shutdownRequested) return { kind: "refused" };
+    // A blank create has no saved-conversation duplicate fence: the canonical form
+    // text is forwarded verbatim and the manager applies its own existing launch
+    // semantics.
+    let outcome: StartedSessionOutcome;
+    try {
+      outcome = await hostService.startSession({ workspace: request.workspace });
+    } catch {
+      return { kind: "unknown" };
+    }
+    // Not-ready and failed are addressed operations that produced nothing usable.
+    if (outcome.status === "not-ready" || outcome.status === "failed") {
+      return { kind: "unconfirmed" };
+    }
+    // `duplicate` is never a saved-duplicate refusal here, because a blank create
+    // has no duplicate fence at all; an interrupted run and any unrecognized status
+    // are equally unobservable.
+    if (outcome.status !== "started") return { kind: "unknown" };
+    // `started` requires this exact run's own post-create inventory to report the
+    // row alive with a live process. An unreadable inventory, or one belonging to a
+    // different run, cannot establish that nothing usable came up: a live child may
+    // already exist and merely be unobservable, so both stay `unknown`. Only an
+    // observable row that is absent, starting, errored, or exited is `unconfirmed`.
+    let after: OwningHostInventorySnapshot | undefined;
+    try {
+      after = hostService.readInventorySnapshot();
+    } catch {
+      after = undefined;
+    }
+    if (after === undefined) return { kind: "unknown" };
+    if (after.hostRunId !== request.hostRunId) return { kind: "unknown" };
+    const row = after.rows.find((candidate) => candidate.id === outcome.id);
+    if (row === undefined || row.lifecycle !== "alive" || row.hasLiveProcess !== true) {
+      return { kind: "unconfirmed" };
+    }
+    return { kind: "started", hostRunId: after.hostRunId, rowId: outcome.id };
+  }
+
+  // --- Requester-side remote Close (the owner's row, asked over roster metadata) ---
+
+  /**
+   * The optional Close controller of the ONE existing coordinator. It is read
+   * only here, feature-detected every time, and never used to connect, pair,
+   * grant, pin, or advertise anything: an older coordinator or fake simply has
+   * no `ownerClose`, and this host then reports a truthful unsupported notice.
+   */
+  function ownerCloseController(): PeerCloseController | undefined {
+    const coordinator = peerCoordinator as (Partial<PeerCoordinatorWithClose> | undefined);
+    if (coordinator === undefined) return undefined;
+    try {
+      const candidate = coordinator.ownerClose;
+      if (candidate === undefined || typeof candidate.closeSession !== "function") return undefined;
+      return candidate;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function remoteCloseTargetKey(target: {
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+  }): string {
+    return JSON.stringify([target.hostId, target.hostRunId, target.rowId]);
+  }
+
+  /**
+   * The ONE written-highlight gate for a remote Close. It proves, by value, that
+   * the frame the writer actually committed drew this exact owner row as its
+   * complete left-roster highlight, that no newer composition has moved or
+   * changed that highlight, and that the terminal is still at the written
+   * geometry. A held/queued write, a moved highlight, a reordered or clipped
+   * row, a replaced run, or a resize therefore requests nothing at all.
+   */
+  function writtenRemoteCloseRow(
+    target: { readonly hostId: string; readonly hostRunId: string | null; readonly rowId: string },
+  ): SidebarRemoteCloseRow | undefined {
+    if (shutdownRequested || externalEditorActive || !terminal || !terminalStarted || !sidebar) return undefined;
+    if (target.hostRunId === null || target.hostRunId.length === 0) return undefined;
+    if (sidebar.focus !== "sidebar" || !sidebar.visible) return undefined;
+    if (layout === undefined) return undefined;
+    const shown = displayedMousePresentation;
+    const latest = latestMousePresentation;
+    if (shown === undefined || latest === undefined) return undefined;
+    // The written receipt must belong to the CURRENT geometry epoch: a reflow
+    // revokes highlight authority until a replacement frame is actually written.
+    if (shown.remoteCloseEpoch !== remoteCloseHighlightEpoch
+      || latest.remoteCloseEpoch !== remoteCloseHighlightEpoch) return undefined;
+    const drawn = shown.sidebar.remoteClose;
+    if (drawn === undefined || !sameRemoteCloseRow(drawn, latest.sidebar.remoteClose)) return undefined;
+    if (drawn.focus !== "sidebar" || drawn.hostRunId === null) return undefined;
+    // The terminal geometry must still be the geometry that was written.
+    const cols = clampDimension(terminal.columns, 80);
+    const rows = clampDimension(terminal.rows, 24);
+    if (shown.layout.cols !== cols || shown.layout.rows !== rows) return undefined;
+    if (shown.layout.sidebar === undefined
+      || shown.layout.sidebar.cols !== drawn.cols || shown.layout.sidebar.rows !== drawn.rows) return undefined;
+    // The request names exactly the written row: no retarget, no local id
+    // collision, no selection-driven substitution.
+    if (drawn.hostId !== target.hostId || drawn.hostRunId !== target.hostRunId
+      || drawn.rowId !== target.rowId) return undefined;
+    return drawn;
+  }
+
+  /**
+   * Revalidate ONLY the minimal frozen target against the coordinator's current
+   * roster observation: the same destination, the same owner run, and a row that
+   * is still present. Nothing else is read — no native conversation tuple, no
+   * epoch, no viewer, no selection, and no display facts — so a stale-but-present
+   * row is still eligible and a same-target native-epoch change is not a denial.
+   *
+   * `absent` is reserved for positive observations (a complete roster without
+   * that destination, run, or row). `unknown` is no complete observation at all
+   * and is never treated as disappearance; the owner host revalidates anyway.
+   */
+  function remoteCloseTargetPresence(
+    target: { readonly hostId: string; readonly hostRunId: string; readonly rowId: string },
+  ): "present" | "absent" | "unknown" {
+    const hosts = peerUiSnapshot?.hosts;
+    if (hosts === null || hosts === undefined) return "unknown";
+    const host = hosts.find((candidate) => candidate.id === target.hostId);
+    if (host === undefined) return "absent";
+    // The owner-run fence comes FIRST: a reconnect resets the production roster
+    // to `rows: null, hostRunId: null`, and an unavailable row observation must
+    // never carry an obsolete run past this check. A CLEARED run is therefore
+    // `absent` (not "no observation"), while a same-run unavailable row stays
+    // `unknown` and is left to the owner's own revalidation.
+    if ((host.roster.hostRunId ?? null) !== target.hostRunId) return "absent";
+    const rows = host.roster.rows;
+    if (rows === null) return "unknown";
+    return rows.some((row) => row.id === target.rowId) ? "present" : "absent";
+  }
+
+  /**
+   * Drop a pending remote-close dialog whose frozen target this host can
+   * positively see is gone (row removed or owner run replaced). It sends
+   * nothing, confirms nothing, and leaves every other surface untouched.
+   */
+  function abandonVanishedRemoteCloseTarget(): void {
+    const frame = remoteCloseConfirmationFrame;
+    if (frame === undefined) return;
+    if (remoteCloseTargetPresence(frame.target) !== "absent") return;
+    invalidateRemoteCloseConfirmationDisplay();
+    sidebar?.abandonRemoteCloseConfirmation();
+    sidebar?.showError(REMOTE_CLOSE_TARGET_GONE_MESSAGE);
+    reconcileLayout(true);
+    scheduleRedraw();
+  }
+
+  /**
+   * This side's condensed preflight over the SAME drawn card, matching the local
+   * `d`/Delete route: a confirmed exit or a settled error row is an owner
+   * removal, a row without an owned process is refused, and a live row is
+   * requested directly only when complete idleness was positively drawn. The
+   * owner host always revalidates its own row; this only decides whether the
+   * operator must confirm first.
+   */
+  function remoteClosePreflight(
+    drawn: SidebarRemoteCloseRow,
+  ): "direct" | "confirmation" | "refuse" {
+    if (drawn.hostRunId === null || drawn.hostRunId.length === 0) return "refuse";
+    if (drawn.lifecycle === "exited") return "direct";
+    if (drawn.lifecycle === "error" && drawn.hasLiveProcess === false) return "direct";
+    if (drawn.hasLiveProcess !== true) return "refuse";
+    if (!drawn.idle) return "confirmation";
+    // The owner already told this host that this exact row was not idle after an
+    // unconfirmed request this host believed idle, so the cached idle projection
+    // is not enough: the next deliberate request is confirmed on a written dialog.
+    if (remoteCloseMarkers.has(remoteCloseTargetKey({
+      hostId: drawn.hostId,
+      hostRunId: drawn.hostRunId,
+      rowId: drawn.rowId,
+    }))) return "confirmation";
+    return "direct";
+  }
+
+  /** Fixed, truthful notice for one settled owner result (never a retry claim). */
+  function remoteCloseResultNotice(attempt: RemoteCloseAttempt, result: PeerCloseResult): string | undefined {
+    if (result.kind === "owner-result") {
+      const facts: OwnerCloseFacts | undefined = isOwnerCloseFacts(result.facts) ? result.facts : undefined;
+      if (facts === undefined) return remoteCloseUnknownNotice(attempt);
+      switch (facts.kind) {
+        case "removed":
+          return `Remote session removed by its host: ${attempt.title}`;
+        case "stopped-retained":
+          return `Remote session stopped but its host kept the row: ${attempt.title}`;
+        case "confirmation-required":
+          return `The remote host needs confirmation before stopping that session: ${attempt.title}`;
+        case "unconfirmed":
+          return `The remote host could not confirm stopping that session; the row is retained: ${attempt.title}`;
+        case "refused":
+          return `The remote host did not accept that close; nothing was stopped: ${attempt.title}`;
+        case "busy":
+          return `${REMOTE_CLOSE_BUSY_MESSAGE}: ${attempt.title}`;
+        case "unknown":
+          return remoteCloseUnknownNotice(attempt);
+      }
+    }
+    if (result.kind === "not-sent") {
+      switch (result.reason) {
+        case "capability-unsupported":
+          return REMOTE_CLOSE_UNSUPPORTED_MESSAGE;
+        case "not-ready":
+          return `That destination is not ready; no close was sent: ${attempt.title}`;
+        case "invalid-request":
+          return `The close request could not be represented; nothing was sent: ${attempt.title}`;
+        case "target-unavailable":
+          return `That remote session is no longer addressable; no close was sent: ${attempt.title}`;
+        case "busy":
+          return `${REMOTE_CLOSE_BUSY_MESSAGE}: ${attempt.title}`;
+        case "row-limit":
+          return `Too many remote closes are already in progress; no close was sent: ${attempt.title}`;
+      }
+    }
+    return remoteCloseUnknownNotice(attempt);
+  }
+
+  function remoteCloseUnknownNotice(attempt: RemoteCloseAttempt): string {
+    return `The remote close result is unknown; nothing was re-sent: ${attempt.title}`;
+  }
+
+  /**
+   * Records one settled owner fact without touching any local row, manager,
+   * slot, task, or saved conversation. The owner's own roster projection is the
+   * only thing that can remove or retain a remote row, so this only reports and
+   * maintains the bounded confirmation reminder.
+   */
+  function applyRemoteCloseResult(attempt: RemoteCloseAttempt, result: PeerCloseResult): void {
+    const target = { hostId: attempt.hostId, hostRunId: attempt.hostRunId, rowId: attempt.rowId };
+    const facts = result.kind === "owner-result" && isOwnerCloseFacts(result.facts)
+      ? result.facts
+      : undefined;
+    if (facts?.kind === "confirmation-required") {
+      // Only this explicit owner fact, and only after an unconfirmed request this
+      // side believed was idle, arms the next deliberate confirmation. The marker
+      // never confirms anything by itself and never opens a dialog on its own.
+      if (!attempt.confirmed && attempt.cachedIdle) markRemoteCloseConfirmationRequired(target);
+    } else if (facts !== undefined) {
+      clearRemoteCloseMarker(target);
+    }
+    const notice = remoteCloseResultNotice(attempt, result);
+    if (notice !== undefined) sidebar?.showError(notice);
+  }
+
+  function markRemoteCloseConfirmationRequired(target: RemoteCloseConfirmationMarker): void {
+    const key = remoteCloseTargetKey(target);
+    if (remoteCloseMarkers.has(key)) return;
+    remoteCloseMarkers.set(key, {
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      rowId: target.rowId,
+    });
+  }
+
+  function clearRemoteCloseMarker(target: {
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+  }): void {
+    remoteCloseMarkers.delete(remoteCloseTargetKey(target));
+  }
+
+  /**
+   * Drops reminders this host can positively see no longer apply: its owner
+   * host is gone from a complete observation, its owner run was replaced (even
+   * while that run's rows are unavailable), its row is gone from that run, or
+   * the row settled. Positive absence and settlement are the ONLY reasons to
+   * prune; the observed hosts/runs/rows themselves bound the set, so an older
+   * target's still-valid reminder is never silently discarded to make room. An
+   * unobserved roster (null rows) on the SAME run is not evidence either way
+   * and leaves its reminder alone.
+   */
+  function reconcileRemoteCloseMarkers(snapshot: PeerUiSnapshot): void {
+    if (remoteCloseMarkers.size === 0) return;
+    const hosts = snapshot.hosts;
+    if (hosts === null) return;
+    for (const [key, marker] of [...remoteCloseMarkers]) {
+      const host = hosts.find((candidate) => candidate.id === marker.hostId);
+      if (host === undefined) {
+        // A complete observation without this destination: positively gone.
+        remoteCloseMarkers.delete(key);
+        continue;
+      }
+      // The owner-run fence applies even while the rows are unavailable: a
+      // reconnect's `rows: null, hostRunId: null` or a replaced run can never
+      // inherit the previous run's reminder.
+      if ((host.roster.hostRunId ?? null) !== marker.hostRunId) {
+        remoteCloseMarkers.delete(key);
+        continue;
+      }
+      const rows = host.roster.rows;
+      if (rows === null) continue;
+      const row = rows.find((candidate) => candidate.id === marker.rowId);
+      if (row === undefined || row.lifecycle === "exited"
+        || (row.lifecycle === "error" && row.hasLiveProcess === false)) {
+        remoteCloseMarkers.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Sends exactly one request to the owner's existing Close controller for one
+   * frozen attempt, then reports the one fixed result. Nothing is retried,
+   * replayed, cancelled, or retargeted, and a throw after the handoff is an
+   * unknown outcome rather than a not-sent or cancelled claim.
+   */
+  function startRemoteClose(attempt: RemoteCloseAttempt, controller: PeerCloseController): void {
+    const key = remoteCloseTargetKey(attempt);
+    if (remoteCloseAttempts.has(key)) {
+      sidebar?.showError(REMOTE_CLOSE_BUSY_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    remoteCloseAttempts.add(key);
+    void (async () => {
+      let result: PeerCloseResult;
+      try {
+        result = await controller.closeSession({
+          hostId: attempt.hostId,
+          hostRunId: attempt.hostRunId,
+          rowId: attempt.rowId,
+          confirmed: attempt.confirmed,
+        });
+        if (typeof result !== "object" || result === null
+          || (result.kind !== "owner-result" && result.kind !== "not-sent" && result.kind !== "unknown")) {
+          result = { kind: "unknown" };
+        }
+      } catch {
+        result = { kind: "unknown" };
+      }
+      remoteCloseAttempts.delete(key);
+      if (shutdownRequested) return;
+      applyRemoteCloseResult(attempt, result);
+      reconcileLayout(true);
+      scheduleRedraw();
+    })();
+  }
+
+  /** True only while this exact written dialog frame is still the current one. */
+  function isCurrentRemoteCloseConfirmationFrame(frame: RemoteCloseConfirmationFrame): boolean {
+    return terminal !== undefined && sidebar !== undefined && sidebar.visible && sidebar.focus === "confirm"
+      && sidebar.remoteCloseConfirmationActive
+      && clampDimension(terminal.columns, 80) === frame.cols
+      && clampDimension(terminal.rows, 24) === frame.rows
+      && sidebar.isRemoteCloseConfirmationRenderCurrent(frame.generation, frame.renderToken);
+  }
+
+  /** Revoke remote-close confirmation authority before any target/focus invalidation. */
+  function invalidateRemoteCloseConfirmationDisplay(): void {
+    remoteCloseConfirmationFrame = undefined;
+    sidebar?.invalidateRemoteCloseConfirmationDisplay();
+  }
+
+  /** The one deliberately confirmed remote Close, rechecked synchronously. */
+  function confirmRemoteClose(action: {
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+    readonly generation: number;
+    readonly renderToken: number;
+  }): void {
+    const activeSidebar = sidebar;
+    const frame = remoteCloseConfirmationFrame;
+    if (!activeSidebar || frame === undefined) {
+      sidebar?.showError(REMOTE_CLOSE_DIALOG_CHANGED_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    if (!frame.settled
+      || frame.generation !== action.generation
+      || frame.renderToken !== action.renderToken
+      || !sameRemoteCloseTarget(frame.target, action)
+      || !isCurrentRemoteCloseConfirmationFrame(frame)) {
+      // A forged, stale, superseded, resized, queued, held, or unwritten DTO can
+      // never confirm anything: the exact written frame is the only authority.
+      invalidateRemoteCloseConfirmationDisplay();
+      activeSidebar.showError(REMOTE_CLOSE_DIALOG_CHANGED_MESSAGE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    const target = frame.target;
+    if (remoteCloseTargetPresence(target) === "absent") {
+      // The written dialog can outlive its row or its owner run. Submission
+      // revalidates that minimal target, so an obsolete one is never sent.
+      invalidateRemoteCloseConfirmationDisplay();
+      activeSidebar.showError(REMOTE_CLOSE_TARGET_GONE_MESSAGE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    // Consume the one-shot receipt BEFORE dispatch so this same generation can
+    // never be confirmed twice, while a duplicate that arrives later has no
+    // current frame to match.
+    remoteCloseConfirmationFrame = undefined;
+    const controller = ownerCloseController();
+    if (controller === undefined) {
+      activeSidebar.showError(REMOTE_CLOSE_UNSUPPORTED_MESSAGE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    clearRemoteCloseMarker(target);
+    startRemoteClose({
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      rowId: target.rowId,
+      title: frame.title,
+      confirmed: true,
+      cachedIdle: false,
+    }, controller);
+    reconcileLayout(true);
+    scheduleRedraw();
+  }
+
+  /** The one deliberate `d`/Delete on a written remote highlight. */
+  function requestRemoteClose(action: {
+    readonly hostId: string;
+    readonly hostRunId: string | null;
+    readonly rowId: string;
+  }): void {
+    const activeSidebar = sidebar;
+    if (!activeSidebar) return;
+    if (action.hostRunId === null || action.hostRunId.length === 0) {
+      activeSidebar.showError(REMOTE_CLOSE_NO_RUN_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    if (remoteCloseTargetPresence({ hostId: action.hostId, hostRunId: action.hostRunId, rowId: action.rowId })
+      === "absent") {
+      // Positively gone or replaced, even if the last drawn frame still shows it:
+      // nothing is requested for a target the owner no longer lists.
+      activeSidebar.showError(REMOTE_CLOSE_TARGET_GONE_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    const drawn = writtenRemoteCloseRow(action);
+    if (drawn === undefined) {
+      // Not the actually written highlight: request nothing, open nothing.
+      activeSidebar.showError(REMOTE_CLOSE_NOT_DRAWN_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    const plan = remoteClosePreflight(drawn);
+    if (plan === "refuse") {
+      activeSidebar.showError(REMOTE_CLOSE_NO_PROCESS_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    const controller = ownerCloseController();
+    if (controller === undefined) {
+      activeSidebar.showError(REMOTE_CLOSE_UNSUPPORTED_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    const target = { hostId: drawn.hostId, hostRunId: action.hostRunId, rowId: drawn.rowId };
+    if (remoteCloseAttempts.has(remoteCloseTargetKey(target))) {
+      activeSidebar.showError(REMOTE_CLOSE_BUSY_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    const prepared = activeSidebar.prepareRemoteClose(target, { direct: plan === "direct" });
+    if (prepared === "refused") {
+      activeSidebar.showError(REMOTE_CLOSE_NOT_DRAWN_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    if (prepared === "confirmation-opened") {
+      // Busy or unknown: a written dialog decides. No request is sent yet.
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    startRemoteClose({
+      hostId: drawn.hostId,
+      hostRunId: action.hostRunId,
+      rowId: drawn.rowId,
+      title: drawn.title,
+      confirmed: false,
+      cachedIdle: drawn.idle,
+    }, controller);
+  }
+
+  // --- Requester-side remote New (`create-on-peer`). ---
+
+  /**
+   * The optional Create controller of the ONE existing coordinator. It is read
+   * only here, feature-detected every time exactly like Close, and never used to
+   * connect, pair, grant, pin, or advertise anything: an older coordinator or
+   * fake simply has no `ownerCreate`, and this host then reports a truthful
+   * unsupported notice without falling back to a local create.
+   */
+  function ownerCreateController(): PeerCreateController | undefined {
+    const coordinator = peerCoordinator as (Partial<PeerCoordinatorWithCreate> | undefined);
+    if (coordinator === undefined) return undefined;
+    try {
+      const candidate = coordinator.ownerCreate;
+      if (candidate === undefined || typeof candidate.createSession !== "function") return undefined;
+      return candidate;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The form PANE the New form would occupy right now, or `undefined` when that
+   * pane is not drawn at all (hidden sidebar, a covering dialog, or focus away
+   * from the form). It is the layout's form rect on a wide layout and the
+   * overlay rect on a narrow one — never the outer terminal size.
+   */
+  function currentCreateFormPane(
+    terminalCols: number,
+    terminalRows: number,
+  ): { readonly cols: number; readonly rows: number } | undefined {
+    const currentLayout = currentHostLayout(terminalCols, terminalRows);
+    const rect = currentLayout.form
+      ?? (currentLayout.sidebarOverlay ? currentLayout.sidebar : undefined);
+    return rect === undefined ? undefined : { cols: rect.cols, rows: rect.rows };
+  }
+
+  /** True only while this exact drawn New-form frame is still the current one. */
+  function isCurrentCreateFormFrame(frame: CreateFormFrame): boolean {
+    if (shutdownRequested || externalEditorActive || terminal === undefined || !terminalStarted) return false;
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || !activeSidebar.visible) return false;
+    if (activeSidebar.focus !== "form") return false;
+    if (clampDimension(terminal.columns, 80) !== frame.terminalCols
+      || clampDimension(terminal.rows, 24) !== frame.terminalRows) return false;
+    // A pre-reflow frame never authorizes anything until a replacement frame in
+    // the current epoch is actually written, even when the terminal returned to
+    // the same dimensions before anything was repainted.
+    if (frame.epoch !== createFormEpoch) return false;
+    // The pane must be drawn now, at the same pane rectangle it was drawn at.
+    const pane = currentCreateFormPane(frame.terminalCols, frame.terminalRows);
+    if (pane === undefined) return false;
+    if (pane.cols !== frame.cols || pane.rows !== frame.rows) return false;
+    return activeSidebar.isCreateFormRenderCurrent(frame.renderToken);
+  }
+
+  /** The fixed notice for one settled owner/not-sent Create result. */
+  function createOnPeerResultNotice(result: PeerCreateResult): string {
+    if (result.kind === "owner-result") {
+      const facts: OwnerCreateFacts | undefined = isOwnerCreateFacts(result.facts) ? result.facts : undefined;
+      if (facts === undefined) return CREATE_ON_PEER_UNKNOWN_MESSAGE;
+      switch (facts.kind) {
+        case "started":
+          // Handled by the caller; a started fact without an exact run never
+          // reaches this notice.
+          return CREATE_ON_PEER_OTHER_RUN_NOTICE;
+        case "unconfirmed":
+          return CREATE_ON_PEER_UNCONFIRMED_MESSAGE;
+        case "refused":
+          return CREATE_ON_PEER_REFUSED_MESSAGE;
+        case "unknown":
+          return CREATE_ON_PEER_UNKNOWN_MESSAGE;
+      }
+    }
+    if (result.kind === "not-sent") {
+      switch (result.reason) {
+        case "capability-unsupported":
+          return CREATE_ON_PEER_UNSUPPORTED_MESSAGE;
+        case "not-ready":
+        case "target-unavailable":
+          return CREATE_ON_PEER_GONE_MESSAGE;
+        case "invalid-request":
+          return CREATE_ON_PEER_FORM_CHANGED_MESSAGE;
+        case "busy":
+        case "limit":
+          return CREATE_ON_PEER_BUSY_MESSAGE;
+      }
+    }
+    return CREATE_ON_PEER_UNKNOWN_MESSAGE;
+  }
+
+  /**
+   * Record one settled requester-side Create result. The owner's own roster
+   * projection is the only thing that can list the new remote row, so nothing
+   * local is created, selected, activated, or focused here: an exact `started`
+   * fact hands the sidebar the returned run and row (which emits the ordinary
+   * remote display selection only while that exact request still owns the form),
+   * and every other fact is a bounded notice on the same request.
+   */
+  function applyCreateOnPeerResult(attempt: CreateOnPeerAttempt, result: PeerCreateResult): void {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined) return;
+    const facts = result.kind === "owner-result" && isOwnerCreateFacts(result.facts)
+      ? result.facts
+      : undefined;
+    if (facts !== undefined && facts.kind === "started") {
+      // This side's own last-instant ownership proof, re-evaluated at the reply:
+      // a request this host already retired (a destination run/connection/identity
+      // transition, a newer form, or a dismissal) never selects anything and never
+      // installs an awaiting fact — whatever the owner did with the bytes.
+      if (!activeSidebar.createOnPeerStillCurrent(attempt)) return;
+      // The `started` reply can legitimately arrive before this side's own roster
+      // observation of the new row, and an ALREADY observed row must never later be
+      // described as awaiting its first observation. Record the exact row only for
+      // the submitted run and only while it is genuinely unobserved.
+      const rowObserved = peerUiSnapshot?.hosts?.some((host) =>
+        host.id === attempt.hostId
+        && (host.roster.hostRunId ?? null) === facts.hostRunId
+        && host.roster.rows?.some((row) => row.id === facts.rowId) === true) === true;
+      pendingCreatedRemote = facts.hostRunId === attempt.hostRunId && !rowObserved
+        ? { hostId: attempt.hostId, hostRunId: facts.hostRunId, rowId: facts.rowId }
+        : undefined;
+      activeSidebar.completeCreateOnPeer(attempt.requestId, {
+        hostRunId: facts.hostRunId,
+        rowId: facts.rowId,
+      });
+      return;
+    }
+    activeSidebar.failCreateOnPeer(attempt.requestId, createOnPeerResultNotice(result));
+  }
+
+  /**
+   * Submit ONE frozen remote New attempt to the coordinator's existing Create
+   * controller. Nothing is retried, replayed, cancelled, or retargeted: the
+   * caller's `stillCurrent` proof is handed to the backend so it is evaluated
+   * again inside the ordered write that actually calls the transport, and a
+   * throw after that handoff is an unknown outcome rather than a not-sent claim.
+   */
+  function startCreateOnPeer(
+    attempt: CreateOnPeerAttempt,
+    controller: PeerCreateController,
+  ): void {
+    createOnPeerAttempt = attempt;
+    const stillCurrent = (): boolean => {
+      if (shutdownRequested || externalEditorActive) return false;
+      if (createOnPeerAttempt !== attempt) return false;
+      const activeSidebar = sidebar;
+      if (activeSidebar === undefined || terminal === undefined) return false;
+      if (clampDimension(terminal.columns, 80) !== attempt.terminalCols
+        || clampDimension(terminal.rows, 24) !== attempt.terminalRows) return false;
+      // The geometry epoch, not the dimensions alone: a resize that returned to
+      // the submitted size before anything was repainted retires this attempt.
+      if (attempt.epoch !== createFormEpoch) return false;
+      const pane = currentCreateFormPane(attempt.terminalCols, attempt.terminalRows);
+      if (pane === undefined || pane.cols !== attempt.paneCols || pane.rows !== attempt.paneRows) return false;
+      return activeSidebar.createOnPeerStillCurrent({
+        requestId: attempt.requestId,
+        formGeneration: attempt.formGeneration,
+        hostId: attempt.hostId,
+        hostRunId: attempt.hostRunId,
+        workspace: attempt.workspace,
+      });
+    };
+    void (async () => {
+      let result: PeerCreateResult;
+      try {
+        result = await controller.createSession({
+          hostId: attempt.hostId,
+          hostRunId: attempt.hostRunId,
+          workspace: attempt.workspace,
+        }, { stillCurrent });
+        if (typeof result !== "object" || result === null
+          || (result.kind !== "owner-result" && result.kind !== "not-sent" && result.kind !== "unknown")) {
+          result = { kind: "unknown" };
+        }
+      } catch {
+        result = { kind: "unknown" };
+      }
+      if (createOnPeerAttempt === attempt) createOnPeerAttempt = undefined;
+      if (shutdownRequested) return;
+      applyCreateOnPeerResult(attempt, result);
+      reconcileLayout(true);
+      scheduleRedraw();
+    })();
+  }
+
+  /**
+   * One deliberate remote New submission. The sidebar's action DTO carries the
+   * host, the exact owner run, the canonical workspace, the form generation, and
+   * the drawn-frame token it captured; this side proves that exact frame was the
+   * one the writer actually committed, and then freezes it. Nothing is re-derived
+   * from a later list, index, label, or selection, and a local `create` takes the
+   * completely unchanged path above.
+   */
+  function launchCreateOnPeer(action: Extract<SidebarAction, { type: "create-on-peer" }>): void {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested || terminal === undefined) return;
+    const frame = createFormFrame;
+    if (frame === undefined || !frame.settled
+      || frame.renderToken !== action.renderToken
+      || frame.formGeneration !== action.formGeneration
+      || frame.hostKind !== "remote"
+      || frame.hostId !== action.hostId
+      || frame.hostRunId !== action.hostRunId
+      || frame.workspace !== action.workspace
+      || !isCurrentCreateFormFrame(frame)) {
+      // A forged, stale, superseded, resized, queued, held, or unwritten DTO can
+      // never send anything: the exact written form is the only authority.
+      activeSidebar.failCreateOnPeer(action.requestId, CREATE_ON_PEER_UNWRITTEN_NOTICE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    // Consume the one-shot receipt BEFORE dispatch so this same submission can
+    // never be sent twice, while a duplicate that arrives later has no current
+    // frame to match.
+    createFormFrame = undefined;
+    if (createOnPeerAttempt !== undefined) {
+      activeSidebar.failCreateOnPeer(action.requestId, CREATE_ON_PEER_BUSY_MESSAGE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    const controller = ownerCreateController();
+    if (controller === undefined) {
+      activeSidebar.failCreateOnPeer(action.requestId, CREATE_ON_PEER_UNSUPPORTED_MESSAGE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
+    startCreateOnPeer({
+      requestId: action.requestId,
+      hostId: action.hostId,
+      hostRunId: action.hostRunId,
+      workspace: action.workspace,
+      formGeneration: action.formGeneration,
+      renderToken: action.renderToken,
+      terminalCols: frame.terminalCols,
+      terminalRows: frame.terminalRows,
+      paneCols: frame.cols,
+      paneRows: frame.rows,
+      epoch: frame.epoch,
+    }, controller);
+  }
+
+  // --- Remote Saved: the owner provider's native inputs. ---
+
+  /**
+   * The owner-side native Saved view's listing inputs, read at every list. They
+   * are exactly the inputs the Local picker and the exited-row restart use: the
+   * actual native agent directory of this host's session setup, the resolved Pi
+   * executable, and its admitted version, and only while this host's one manager
+   * is open and teardown has not begun. Anything unknown is `undefined`
+   * (unavailable): nothing is repaired, created, or migrated on its behalf.
+   */
+  function readNativeSavedCatalogOptions(): NativeSavedCatalogReadOptions | undefined {
+    if (shutdownRequested || manager === undefined) return undefined;
+    const agentDir = sessionSetup?.nativeAgentDir;
+    const activePi = pi;
+    if (typeof agentDir !== "string" || agentDir === "" || activePi === undefined
+      || typeof activePi.file !== "string" || activePi.file === ""
+      || typeof activePi.version !== "string" || activePi.version === "") return undefined;
+    return { agentDir, piExecutable: activePi.file, expectedPiVersion: activePi.version };
+  }
+
+  /**
+   * The owner view's listing adapter onto this host's ONE listing dependency. It
+   * accepts only the actual native inputs above plus a real abort signal (no
+   * injected `listAll` bypass, no other executable or version) and forwards the
+   * view's own freshness scope, so an owner catalog never supersedes the Local
+   * picker's catalog or the reverse.
+   */
+  function listNativeSavedCatalog(listOptions: ListSavedSessionsOptions): Promise<SavedSessionCatalog> {
+    try {
+      const activePi = pi;
+      const agentDir = listOptions?.agentDir;
+      const piExecutable = listOptions?.piExecutable;
+      const expectedPiVersion = listOptions?.expectedPiVersion;
+      const signal = listOptions?.signal;
+      const freshnessScope = listOptions?.freshnessScope;
+      if (shutdownRequested || manager === undefined || activePi === undefined
+        || listOptions?.listAll !== undefined
+        || typeof agentDir !== "string" || agentDir === "" || agentDir !== sessionSetup?.nativeAgentDir
+        || typeof piExecutable !== "string" || piExecutable !== activePi.file
+        || typeof expectedPiVersion !== "string" || expectedPiVersion !== activePi.version
+        || signal === undefined || signal === null || typeof signal.aborted !== "boolean") {
+        return Promise.reject(new Error("saved catalog listing is unavailable"));
+      }
+      return Promise.resolve(dependencies.listSavedCatalog({
+        agentDir,
+        piExecutable,
+        expectedPiVersion,
+        signal,
+        ...(freshnessScope === undefined ? {} : { freshnessScope }),
+      }));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  // --- Remote Saved: requester-side receipts, admission, and queued fences. ---
+
+  /**
+   * The optional Saved controller of the ONE coordinator, feature-detected every
+   * time like Close and Create. An older coordinator or fake simply has none, and
+   * the picker then reports a fixed notice; nothing ever falls back to Local.
+   */
+  function ownerSavedController(): PeerSavedController | undefined {
+    const coordinator = peerCoordinator as (Partial<PeerCoordinatorWithSaved> | undefined);
+    if (coordinator === undefined) return undefined;
+    try {
+      const candidate = coordinator.ownerSaved;
+      if (candidate === undefined || candidate === null
+        || typeof candidate.list !== "function"
+        || typeof candidate.search !== "function"
+        || typeof candidate.window !== "function"
+        || typeof candidate.resume !== "function"
+        || typeof candidate.remove !== "function") return undefined;
+      return candidate;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The form-slot pane (wide right pane, or the narrow overlay), if one is drawn. */
+  function currentFormSlotRect(value: HostLayout): HostPaneRect | undefined {
+    return value.form ?? (value.sidebarOverlay ? value.sidebar : undefined);
+  }
+
+  /** The live form-slot pane at the current outer geometry. */
+  function liveFormSlotRect(): HostPaneRect | undefined {
+    return currentFormSlotRect(currentHostLayout(clampDimension(terminal?.columns, 80), clampDimension(terminal?.rows, 24)));
+  }
+
+  /**
+   * Advance the remote Saved epoch when the form-slot pane (and the outer size it
+   * sits in) actually changes: a cover, a banner, a layout switch, or a return to
+   * an earlier geometry can never revive anything proved before it.
+   */
+  function noteRemoteSavedLayout(next: HostLayout): void {
+    const rect = currentFormSlotRect(next);
+    const key = JSON.stringify([
+      next.cols, next.rows, next.sidebarOverlay,
+      rect === undefined ? null : [rect.column, rect.row, rect.cols, rect.rows],
+    ]);
+    if (remoteSavedLayoutKey !== undefined && remoteSavedLayoutKey !== key) remoteSavedEpoch += 1;
+    remoteSavedLayoutKey = key;
+  }
+
+  /** True only while this exact remote picker frame is still the current one. */
+  function isCurrentRemoteSavedPickerFrame(frame: RemoteSavedPickerFrame): boolean {
+    if (shutdownRequested || externalEditorActive || terminal === undefined || !terminalStarted) return false;
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || !activeSidebar.visible || activeSidebar.focus !== "form") return false;
+    if (clampDimension(terminal.columns, 80) !== frame.terminalCols
+      || clampDimension(terminal.rows, 24) !== frame.terminalRows) return false;
+    if (frame.epoch !== remoteSavedEpoch) return false;
+    const pane = currentFormSlotRect(currentHostLayout(frame.terminalCols, frame.terminalRows));
+    if (!samePaneGeometry(pane, frame.pane)) return false;
+    if (frame.pane.cols !== frame.presentation.cols || frame.pane.rows !== frame.presentation.rows) return false;
+    return activeSidebar.isSavedPickerRenderCurrent(frame.presentation.renderToken);
+  }
+
+  /** The open remote picker still names exactly the target Main prepared. */
+  function remoteSavedContextMatchesPrepared(prepared: RemoteSavedPrepared): boolean {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || !activeSidebar.savedDeleteConfirmationActive) return false;
+    const context = activeSidebar.savedRemoteContext();
+    return context !== undefined
+      && context.pickerId === prepared.pickerId
+      && context.revision === prepared.revision
+      && context.hostId === prepared.hostId
+      && context.hostRunId === prepared.hostRunId
+      && context.catalogId === prepared.catalogId
+      && context.resultId === prepared.resultId;
+  }
+
+  /** True only while this exact remote confirmation context is still the current one. */
+  function isCurrentRemoteSavedDeleteFrame(remote: RemoteSavedDeleteFrameContext): boolean {
+    if (shutdownRequested || externalEditorActive || terminal === undefined || !terminalStarted) return false;
+    if (remoteSavedPrepared !== remote.prepared) return false;
+    if (remote.epoch !== remoteSavedEpoch) return false;
+    if (!samePaneGeometry(liveFormSlotRect(), remote.pane)) return false;
+    return remoteSavedContextMatchesPrepared(remote.prepared);
+  }
+
+  /** A closed, frozen copy of one entry intent: no extra UI field survives. */
+  function freezeRemoteSavedEntryIntent<T extends RemoteSavedEntryIntent>(intent: T): T {
+    return Object.freeze({
+      type: intent.type,
+      pickerId: intent.pickerId,
+      requestId: intent.requestId,
+      revision: intent.revision,
+      hostId: intent.hostId,
+      hostRunId: intent.hostRunId,
+      catalogId: intent.catalogId,
+      resultId: intent.resultId,
+      entryId: intent.entryId,
+      renderToken: intent.renderToken,
+    }) as unknown as T;
+  }
+
+  /**
+   * Synchronous admission of one Resume or Delete-prepare: the picker frame the
+   * writer ACTUALLY wrote must be this intent's exact frame (token, picker, query
+   * revision, destination, run, catalog, result, and a drawn row holding the
+   * entry), still current at the current outer geometry, form-slot pane, focus,
+   * visibility, and Main epoch, AND the Sidebar's own strict last-instant check
+   * must hold. On success the one-shot receipt is CONSUMED before anything is
+   * handed to the coordinator, so a duplicate or held key can never resend.
+   */
+  function admitRemoteSavedPickerIntent(
+    intent: PeerSavedUiResumeIntent | PeerSavedUiDeletePrepareIntent,
+  ): RemoteSavedAdmission | undefined {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested || externalEditorActive
+      || terminal === undefined || !terminalStarted) return undefined;
+    const frame = remoteSavedPickerFrame;
+    if (frame === undefined || !frame.settled) return undefined;
+    const drawn = frame.presentation;
+    if (drawn.renderToken !== intent.renderToken
+      || drawn.pickerId !== intent.pickerId
+      || drawn.revision !== intent.revision
+      || drawn.hostId !== intent.hostId
+      || drawn.hostRunId !== intent.hostRunId
+      || drawn.catalogId !== intent.catalogId
+      || drawn.resultId !== intent.resultId
+      || !drawn.drawn.some((row) => row.entryId === intent.entryId)) return undefined;
+    if (intent.type === "saved-remote-delete-prepare" && !drawn.deleteExposed) return undefined;
+    if (!isCurrentRemoteSavedPickerFrame(frame)) return undefined;
+    if (!activeSidebar.remoteSavedIntentStillCurrent(intent)) return undefined;
+    remoteSavedPickerFrame = undefined;
+    remoteSavedLastAdmittedRequestId = intent.requestId;
+    return Object.freeze({
+      intent: freezeRemoteSavedEntryIntent(intent),
+      terminalCols: frame.terminalCols,
+      terminalRows: frame.terminalRows,
+      pane: frame.pane,
+      epoch: remoteSavedEpoch,
+    });
+  }
+
+  /**
+   * Synchronous admission of one confirmed Delete: the ACTUALLY written
+   * Local-style confirmation frame must carry the exact remote target Main
+   * itself prepared (picker, query revision, destination, run, catalog, result,
+   * entry), with this intent's token, at the current geometry, form-slot pane,
+   * Main epoch, AND the Sidebar's own strict check must
+   * hold. The frame and the preparation are consumed before any dispatch.
+   */
+  function admitRemoteSavedDeleteIntent(intent: PeerSavedUiDeleteIntent): RemoteSavedAdmission | undefined {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested || externalEditorActive
+      || terminal === undefined || !terminalStarted) return undefined;
+    const frame = savedDeleteConfirmationFrame;
+    const prepared = remoteSavedPrepared;
+    const remote = frame?.remote;
+    if (frame === undefined || !frame.settled || remote === undefined || prepared === undefined
+      || remote.prepared !== prepared || frame.renderToken !== intent.renderToken) return undefined;
+    if (prepared.pickerId !== intent.pickerId || prepared.revision !== intent.revision
+      || prepared.hostId !== intent.hostId || prepared.hostRunId !== intent.hostRunId
+      || prepared.catalogId !== intent.catalogId || prepared.resultId !== intent.resultId
+      || prepared.entryId !== intent.entryId) return undefined;
+    if (!isCurrentSavedDeleteConfirmationFrame(frame) || !isCurrentRemoteSavedDeleteFrame(remote)) return undefined;
+    if (!activeSidebar.remoteSavedIntentStillCurrent(intent)) return undefined;
+    savedDeleteConfirmationFrame = undefined;
+    remoteSavedPrepared = undefined;
+    remoteSavedConfirmSettledKey = undefined;
+    remoteSavedLastAdmittedRequestId = intent.requestId;
+    return Object.freeze({
+      intent: freezeRemoteSavedEntryIntent(intent),
+      terminalCols: frame.cols,
+      terminalRows: frame.rows,
+      pane: remote.pane,
+      epoch: remote.epoch,
+    });
+  }
+
+  /**
+   * The QUEUED-write re-proof of one consumed admission, evaluated by the
+   * coordinator at admission and again inside the ordered write that calls the
+   * transport. It re-proves that THIS attempt still owns the destination's one
+   * in-flight slot, that teardown/editor handoff did not begin, that the outer
+   * size and the form-slot pane are exactly the admitted ones and Main's epoch
+   * never moved (so a resize, cover, or editor handoff — even one returning to
+   * the same geometry — refuses), and that the Sidebar's frozen operation still
+   * owns its full semantic context, including current delete exposure. An
+   * identical harmless repaint changes none of these facts.
+   */
+  function remoteSavedAdmissionStillCurrent(admission: RemoteSavedAdmission, record: RemoteSavedInflight): boolean {
+    if (shutdownRequested || externalEditorActive || terminal === undefined || !terminalStarted) return false;
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined) return false;
+    if (remoteSavedInflight.get(admission.intent.hostId) !== record) return false;
+    if (admission.epoch !== remoteSavedEpoch) return false;
+    const cols = clampDimension(terminal.columns, 80);
+    const rows = clampDimension(terminal.rows, 24);
+    if (cols !== admission.terminalCols || rows !== admission.terminalRows) return false;
+    if (!samePaneGeometry(currentFormSlotRect(currentHostLayout(cols, rows)), admission.pane)) return false;
+    return activeSidebar.remoteSavedAdmittedIntentStillOwned(admission.intent);
+  }
+
+  /** The Sidebar still owns this exact outstanding read for the open remote picker. */
+  function remoteSavedReadOwned(intent: RemoteSavedReadIntent): boolean {
+    if (shutdownRequested) return false;
+    const context = sidebar?.savedRemoteContext();
+    if (context === undefined) return false;
+    if (context.pickerId !== intent.pickerId || context.revision !== intent.revision
+      || context.hostId !== intent.hostId || context.hostRunId !== intent.hostRunId) return false;
+    if (!context.pendingReads.includes(intent.requestId)) return false;
+    if (intent.type === "saved-remote-search" && context.catalogId !== intent.catalogId) return false;
+    if (intent.type === "saved-remote-window"
+      && (context.catalogId !== intent.catalogId || context.resultId !== intent.resultId)) return false;
+    return true;
+  }
+
+  /** Forget one destination's in-flight slot, by identity only. */
+  function releaseRemoteSavedInflight(record: RemoteSavedInflight): void {
+    if (remoteSavedInflight.get(record.hostId) === record) remoteSavedInflight.delete(record.hostId);
+  }
+
+  /** Normalize one controller promise into exactly one fixed result; never throws. */
+  function settleRemoteSavedPromise<T>(
+    invoke: () => Promise<PeerSavedResult<T>>,
+    onResult: (result: PeerSavedResult<T>) => void,
+  ): void {
+    let pending: Promise<PeerSavedResult<T>>;
+    try {
+      pending = invoke();
+    } catch {
+      // The delegate was invoked and its outcome is unknowable.
+      pending = Promise.resolve<PeerSavedResult<T>>({ kind: "unknown" });
+    }
+    const normalize = (value: unknown): PeerSavedResult<T> => {
+      if (typeof value !== "object" || value === null) return { kind: "unknown" };
+      const kind = (value as { kind?: unknown }).kind;
+      return kind === "owner-result" || kind === "not-sent" || kind === "unknown"
+        ? value as PeerSavedResult<T>
+        : { kind: "unknown" };
+    };
+    void Promise.resolve(pending).then(
+      (value) => normalize(value),
+      () => ({ kind: "unknown" }) as PeerSavedResult<T>,
+    ).then((result) => {
+      try {
+        onResult(result);
+      } catch {
+        // A settlement failure never becomes an unhandled rejection.
+      }
+    });
+  }
+
+  /** Fixed notice for one positively-not-sent request. */
+  function remoteSavedNotSentNotice(reason: PeerSavedNotSentReason): string {
+    if (reason === "capability-unsupported") return REMOTE_SAVED_UNSUPPORTED_NOTICE;
+    if (reason === "busy" || reason === "limit") return REMOTE_SAVED_BUSY_MESSAGE;
+    return REMOTE_SAVED_NOT_SENT_MESSAGE;
+  }
+
+  function remoteSavedReadNotice(
+    result: PeerSavedResult<OwnerSavedWindowFacts>,
+    facts: OwnerSavedWindowFacts | undefined,
+  ): string {
+    if (result.kind === "not-sent") return remoteSavedNotSentNotice(result.reason);
+    if (facts === undefined) return REMOTE_SAVED_READ_UNKNOWN_MESSAGE;
+    if (facts.kind === "unavailable") return REMOTE_SAVED_UNAVAILABLE_MESSAGE;
+    if (facts.kind === "refused") return facts.reason === "stale" ? REMOTE_SAVED_STALE_MESSAGE : REMOTE_SAVED_READ_REFUSED_MESSAGE;
+    return REMOTE_SAVED_READ_UNKNOWN_MESSAGE;
+  }
+
+  function remoteSavedResumeNotice(
+    result: PeerSavedResult<OwnerSavedResumeFacts>,
+    facts: OwnerSavedResumeFacts | undefined,
+  ): string {
+    if (result.kind === "not-sent") return remoteSavedNotSentNotice(result.reason);
+    if (facts === undefined) return REMOTE_SAVED_UNCERTAIN_NOTICE;
+    switch (facts.kind) {
+      case "refused":
+        return facts.reason === "duplicate" ? REMOTE_SAVED_RESUME_DUPLICATE_MESSAGE
+          : facts.reason === "stale" ? REMOTE_SAVED_STALE_MESSAGE
+            : REMOTE_SAVED_RESUME_REFUSED_MESSAGE;
+      case "unconfirmed":
+        return REMOTE_SAVED_RESUME_UNCONFIRMED_MESSAGE;
+      default:
+        return REMOTE_SAVED_UNCERTAIN_NOTICE;
+    }
+  }
+
+  function remoteSavedDeleteNotice(
+    result: PeerSavedResult<OwnerSavedDeleteFacts>,
+    facts: OwnerSavedDeleteFacts | undefined,
+  ): string {
+    if (result.kind === "not-sent") return remoteSavedNotSentNotice(result.reason);
+    if (facts === undefined) return REMOTE_SAVED_UNCERTAIN_NOTICE;
+    switch (facts.kind) {
+      case "refused":
+        return facts.reason === "policy" ? REMOTE_SAVED_DELETE_OFF_NOTICE
+          : facts.reason === "active" || facts.reason === "duplicate" ? REMOTE_SAVED_DELETE_ACTIVE_MESSAGE
+            : facts.reason === "stale" ? REMOTE_SAVED_STALE_MESSAGE
+              : REMOTE_SAVED_DELETE_REFUSED_MESSAGE;
+      case "confirmation-required":
+        return REMOTE_SAVED_DELETE_RECONFIRM_MESSAGE;
+      case "unconfirmed":
+        return REMOTE_SAVED_DELETE_UNCONFIRMED_MESSAGE;
+      default:
+        return REMOTE_SAVED_UNCERTAIN_NOTICE;
+    }
+  }
+
+  /**
+   * One remote read intent from the open picker. Only the newest UNSENT read is
+   * kept (a replaced one is retired silently in the Sidebar, never answered or
+   * claimed cancelled); a destination with a request in flight receives nothing
+   * more until that request settles; a read for another destination is never
+   * blocked by this one's accepted work.
+   */
+  function handleRemoteSavedRead(intent: RemoteSavedReadIntent): void {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested) return;
+    if (!remoteSavedReadOwned(intent)) return;
+    const controller = ownerSavedController();
+    if (controller === undefined) {
+      activeSidebar.failRemoteSavedRead(intent.requestId, REMOTE_SAVED_CONTROLLER_MISSING_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    const replaced = remoteSavedQueuedRead;
+    remoteSavedQueuedRead = undefined;
+    if (replaced !== undefined && replaced.requestId !== intent.requestId) {
+      activeSidebar.retireUnsentRemoteSavedRead(replaced.requestId);
+    }
+    if (remoteSavedInflight.has(intent.hostId)) {
+      remoteSavedQueuedRead = intent;
+      return;
+    }
+    dispatchRemoteSavedRead(intent, controller);
+  }
+
+  /** Hand one read to the controller with its logical-ownership proof. */
+  function dispatchRemoteSavedRead(intent: RemoteSavedReadIntent, controller: PeerSavedController): void {
+    const record: RemoteSavedInflight = Object.freeze({ hostId: intent.hostId, requestId: intent.requestId });
+    remoteSavedInflight.set(intent.hostId, record);
+    const options = Object.freeze({
+      stillCurrent: (): boolean => {
+        try {
+          return remoteSavedInflight.get(intent.hostId) === record && remoteSavedReadOwned(intent);
+        } catch {
+          return false;
+        }
+      },
+    });
+    // Each request is a closed, frozen copy of exactly the owner request fields:
+    // the picker/request ids, revision, or any display string never travel.
+    settleRemoteSavedPromise<OwnerSavedWindowFacts>(() => {
+      if (intent.type === "saved-remote-list") {
+        return controller.list(Object.freeze({
+          hostId: intent.hostId, hostRunId: intent.hostRunId,
+          query: intent.query, offset: intent.offset, count: intent.count,
+        }), options);
+      }
+      if (intent.type === "saved-remote-search") {
+        return controller.search(Object.freeze({
+          hostId: intent.hostId, hostRunId: intent.hostRunId, catalogId: intent.catalogId,
+          query: intent.query, offset: intent.offset, count: intent.count,
+        }), options);
+      }
+      return controller.window(Object.freeze({
+        hostId: intent.hostId, hostRunId: intent.hostRunId, catalogId: intent.catalogId,
+        resultId: intent.resultId, offset: intent.offset, count: intent.count,
+      }), options);
+    }, (result) => settleRemoteSavedRead(record, intent, result));
+  }
+
+  /**
+   * One read settled. Main's own in-flight slot is released FIRST (the Sidebar
+   * may synchronously emit a follow-up window or a relist), then the Sidebar
+   * applies or retires exactly this request, then the newest still-owned unsent
+   * read is dispatched once. A failed read is never replayed.
+   */
+  function settleRemoteSavedRead(
+    record: RemoteSavedInflight,
+    intent: RemoteSavedReadIntent,
+    result: PeerSavedResult<OwnerSavedWindowFacts>,
+  ): void {
+    releaseRemoteSavedInflight(record);
+    const activeSidebar = sidebar;
+    if (shutdownRequested || activeSidebar === undefined) return;
+    const facts = result.kind === "owner-result" && isOwnerSavedWindowFacts(result.outcome) ? result.outcome : undefined;
+    if (facts !== undefined && facts.kind === "window") {
+      activeSidebar.completeRemoteSavedWindow(intent.requestId, facts);
+    } else {
+      activeSidebar.failRemoteSavedRead(intent.requestId, remoteSavedReadNotice(result, facts));
+    }
+    dispatchQueuedRemoteSavedRead();
+    scheduleRedraw();
+  }
+
+  /** Dispatch the newest unsent read once, only while the Sidebar still owns it. */
+  function dispatchQueuedRemoteSavedRead(): void {
+    const queued = remoteSavedQueuedRead;
+    if (queued === undefined || shutdownRequested) return;
+    if (!remoteSavedReadOwned(queued)) {
+      remoteSavedQueuedRead = undefined;
+      sidebar?.retireUnsentRemoteSavedRead(queued.requestId);
+      return;
+    }
+    if (remoteSavedInflight.has(queued.hostId)) return;
+    remoteSavedQueuedRead = undefined;
+    const controller = ownerSavedController();
+    if (controller === undefined) {
+      sidebar?.failRemoteSavedRead(queued.requestId, REMOTE_SAVED_CONTROLLER_MISSING_MESSAGE);
+      return;
+    }
+    dispatchRemoteSavedRead(queued, controller);
+  }
+
+  /** A refused entry intent: one fixed notice on that same request, nothing sent. */
+  function refuseRemoteSavedEntry(intent: RemoteSavedEntryIntent, message: string): void {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined) return;
+    try {
+      if (intent.type === "saved-remote-resume") activeSidebar.failRemoteSavedResume(intent.requestId, message);
+      else if (intent.type === "saved-remote-delete-prepare") {
+        activeSidebar.completeRemoteSavedDeletePrepare(intent.requestId, false, message);
+      } else {
+        activeSidebar.completeRemoteSavedDelete(intent.requestId, message, false);
+      }
+    } catch {
+      // A notice failure never escapes into the Sidebar's emit.
+    }
+    scheduleRedraw();
+  }
+
+  /**
+   * One deliberate Resume, Delete-prepare, or confirmed Delete. It is admitted
+   * only from the exact actually-written receipt, consumed one-shot, and sent
+   * only when the destination has no request in flight (never queued for later).
+   */
+  function handleRemoteSavedEntry(intent: RemoteSavedEntryIntent): void {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested) return;
+    // An already admitted request id is a duplicate (a held key or a replayed
+    // DTO): it is ignored without touching that request's legitimate ownership.
+    if (!Number.isSafeInteger(intent.requestId) || intent.requestId <= remoteSavedLastAdmittedRequestId) return;
+    const admission = intent.type === "saved-remote-delete"
+      ? admitRemoteSavedDeleteIntent(intent)
+      : admitRemoteSavedPickerIntent(intent);
+    if (admission === undefined) {
+      refuseRemoteSavedEntry(intent, intent.type === "saved-remote-delete"
+        ? REMOTE_SAVED_CONFIRMATION_CHANGED_MESSAGE
+        : REMOTE_SAVED_UNWRITTEN_NOTICE);
+      return;
+    }
+    const controller = ownerSavedController();
+    if (controller === undefined) {
+      refuseRemoteSavedEntry(intent, REMOTE_SAVED_CONTROLLER_MISSING_MESSAGE);
+      return;
+    }
+    if (remoteSavedInflight.has(intent.hostId)) {
+      refuseRemoteSavedEntry(intent, REMOTE_SAVED_BUSY_MESSAGE);
+      return;
+    }
+    dispatchRemoteSavedEntry(admission, controller);
+  }
+
+  /** Hand one consumed admission to the controller with its queued-write proof. */
+  function dispatchRemoteSavedEntry(admission: RemoteSavedAdmission, controller: PeerSavedController): void {
+    const intent = admission.intent;
+    const record: RemoteSavedInflight = Object.freeze({ hostId: intent.hostId, requestId: intent.requestId });
+    remoteSavedInflight.set(intent.hostId, record);
+    const options = Object.freeze({
+      stillCurrent: (): boolean => {
+        try {
+          return remoteSavedAdmissionStillCurrent(admission, record);
+        } catch {
+          return false;
+        }
+      },
+    });
+    const target = Object.freeze({
+      hostId: intent.hostId,
+      hostRunId: intent.hostRunId,
+      catalogId: intent.catalogId,
+      resultId: intent.resultId,
+      entryId: intent.entryId,
+    });
+    if (intent.type === "saved-remote-resume") {
+      settleRemoteSavedPromise<OwnerSavedResumeFacts>(
+        () => controller.resume(target, options),
+        (result) => applyRemoteSavedResumeResult(admission, record, result),
+      );
+      return;
+    }
+    const confirmed = intent.type === "saved-remote-delete";
+    settleRemoteSavedPromise<OwnerSavedDeleteFacts>(
+      () => controller.remove(Object.freeze({ ...target, confirmed }), options),
+      (result) => confirmed
+        ? applyRemoteSavedDeleteResult(admission, record, result)
+        : applyRemoteSavedDeletePrepareResult(admission, record, result),
+    );
+  }
+
+  /**
+   * One settled Resume. An owner `started` row is staged as awaiting its first
+   * roster observation BEFORE the Sidebar completes (which synchronously emits
+   * the picker dismissal and the ordinary remote selection), so the existing
+   * create-awaiting path reports it truthfully; when the Sidebar refuses a late
+   * or stale completion only this attempt's own staging is undone, and nothing
+   * is selected or focused.
+   */
+  function applyRemoteSavedResumeResult(
+    admission: RemoteSavedAdmission,
+    record: RemoteSavedInflight,
+    result: PeerSavedResult<OwnerSavedResumeFacts>,
+  ): void {
+    releaseRemoteSavedInflight(record);
+    const activeSidebar = sidebar;
+    if (shutdownRequested || activeSidebar === undefined) return;
+    const intent = admission.intent;
+    const facts = result.kind === "owner-result" && isOwnerSavedResumeFacts(result.outcome) ? result.outcome : undefined;
+    if (facts !== undefined && facts.kind === "started") {
+      if (facts.hostRunId !== intent.hostRunId) {
+        if (!activeSidebar.failRemoteSavedResume(intent.requestId, REMOTE_SAVED_OTHER_RUN_NOTICE)) {
+          activeSidebar.showError(REMOTE_SAVED_OTHER_RUN_NOTICE);
+        }
+      } else {
+        const rowObserved = peerUiSnapshot?.hosts?.some((host) =>
+          host.id === intent.hostId
+          && (host.roster.hostRunId ?? null) === facts.hostRunId
+          && host.roster.rows?.some((row) => row.id === facts.rowId) === true) === true;
+        const previous = pendingCreatedRemote;
+        const staged = rowObserved
+          ? undefined
+          : Object.freeze({ hostId: intent.hostId, hostRunId: facts.hostRunId, rowId: facts.rowId });
+        pendingCreatedRemote = staged;
+        let accepted = false;
+        try {
+          accepted = activeSidebar.completeRemoteSavedResume(intent.requestId, {
+            hostRunId: facts.hostRunId,
+            rowId: facts.rowId,
+          });
+        } catch {
+          accepted = false;
+        }
+        if (!accepted) {
+          if (pendingCreatedRemote === staged) pendingCreatedRemote = previous;
+          activeSidebar.showError(REMOTE_SAVED_RESUME_COMPLETED_MESSAGE);
+        }
+      }
+    } else {
+      const message = remoteSavedResumeNotice(result, facts);
+      const accepted = activeSidebar.failRemoteSavedResume(intent.requestId, message);
+      if (!accepted && result.kind !== "not-sent"
+        && (facts === undefined || facts.kind === "unconfirmed" || facts.kind === "unknown")) {
+        activeSidebar.showError(message);
+      }
+    }
+    dispatchQueuedRemoteSavedRead();
+    reconcileLayout(true);
+    scheduleRedraw();
+  }
+
+  /**
+   * One settled Delete-prepare. Only the owner's `confirmation-required` for the
+   * still-owned exact entry opens the Local-style confirmation; Main records the
+   * exact prepared target that dialog's written receipt must carry.
+   */
+  function applyRemoteSavedDeletePrepareResult(
+    admission: RemoteSavedAdmission,
+    record: RemoteSavedInflight,
+    result: PeerSavedResult<OwnerSavedDeleteFacts>,
+  ): void {
+    releaseRemoteSavedInflight(record);
+    const activeSidebar = sidebar;
+    if (shutdownRequested || activeSidebar === undefined) return;
+    const intent = admission.intent;
+    const facts = result.kind === "owner-result" && isOwnerSavedDeleteFacts(result.outcome) ? result.outcome : undefined;
+    if (facts !== undefined && facts.kind === "confirmation-required") {
+      remoteSavedPreparedSerial += 1;
+      const prepared: RemoteSavedPrepared = Object.freeze({
+        serial: remoteSavedPreparedSerial,
+        pickerId: intent.pickerId,
+        revision: intent.revision,
+        hostId: intent.hostId,
+        hostRunId: intent.hostRunId,
+        catalogId: intent.catalogId,
+        resultId: intent.resultId,
+        entryId: intent.entryId,
+      });
+      remoteSavedPrepared = prepared;
+      remoteSavedConfirmSettledKey = undefined;
+      let opened = false;
+      try {
+        opened = activeSidebar.completeRemoteSavedDeletePrepare(intent.requestId, true);
+      } catch {
+        opened = false;
+      }
+      if ((!opened || !activeSidebar.savedDeleteConfirmationActive) && remoteSavedPrepared === prepared) {
+        remoteSavedPrepared = undefined;
+      }
+    } else {
+      activeSidebar.completeRemoteSavedDeletePrepare(intent.requestId, false, remoteSavedDeleteNotice(result, facts));
+    }
+    dispatchQueuedRemoteSavedRead();
+    reconcileLayout(true);
+    scheduleRedraw();
+  }
+
+  /**
+   * One settled confirmed Delete. The owner's actual outcome is reported on the
+   * dialog that sent it; when that dialog no longer owns the pane, a completed
+   * or uncertain outcome is still shown as a notice rather than discarded. A
+   * later owner policy change never turns a completed deletion into a refusal.
+   */
+  function applyRemoteSavedDeleteResult(
+    admission: RemoteSavedAdmission,
+    record: RemoteSavedInflight,
+    result: PeerSavedResult<OwnerSavedDeleteFacts>,
+  ): void {
+    releaseRemoteSavedInflight(record);
+    const activeSidebar = sidebar;
+    if (shutdownRequested || activeSidebar === undefined) return;
+    const facts = result.kind === "owner-result" && isOwnerSavedDeleteFacts(result.outcome) ? result.outcome : undefined;
+    const deleted = facts !== undefined && facts.kind === "deleted";
+    const message = facts !== undefined && facts.kind === "deleted"
+      ? facts.method === "trash" ? "Saved conversation moved to trash" : "Saved conversation permanently deleted"
+      : remoteSavedDeleteNotice(result, facts);
+    let accepted = false;
+    try {
+      accepted = activeSidebar.completeRemoteSavedDelete(admission.intent.requestId, message, deleted);
+    } catch {
+      accepted = false;
+    }
+    if (!accepted && (deleted || result.kind === "unknown" || facts === undefined
+      || facts.kind === "unconfirmed" || facts.kind === "unknown")) {
+      activeSidebar.showError(message);
+    }
+    dispatchQueuedRemoteSavedRead();
+    reconcileLayout(true);
+    scheduleRedraw();
   }
 
   function handleSidebarAction(action: SidebarAction): void {
@@ -2376,6 +6455,40 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // Any deliberate user action invalidates a pending automatic activation.
     deliberateActionGeneration += 1;
     switch (action.type) {
+      case "peer-open":
+        sidebar?.openPeerMenu();
+        reconcileLayout(true);
+        scheduleRedraw();
+        return;
+      case "peer-consent": {
+        if (!hasWrittenPeerConsentFrame(action.consentId, action.renderToken, action.decision)) {
+          sidebar?.showError("Pairing confirmation changed or is not yet displayed; review it again");
+          scheduleRedraw();
+          return;
+        }
+        let confirmed = false;
+        try { confirmed = peerCoordinator?.decideConsent(action.consentId, action.decision) === true; } catch { /* fixed UI status below */ }
+        if (!confirmed) {
+          sidebar?.showError("The pairing decision was not confirmed; check the host status");
+          scheduleRedraw();
+        }
+        return;
+      }
+      case "peer-listener":
+      case "peer-auto-reconnect":
+      case "peer-bell":
+      // Viewer remote input/copy and the owner history-deletion policy are saved
+      // settings like the bell: Main forwards the drawn intent and the coordinator
+      // persists it. Neither restarts, disconnects, or reconnects anything here.
+      case "peer-viewer-native-input":
+      case "peer-remote-history-delete":
+      case "peer-add":
+      case "peer-connect":
+      case "peer-disconnect":
+      case "peer-remove":
+      case "peer-revoke":
+        performPeerCommand(action);
+        return;
       case "forward":
         routeForward(action.data);
         return;
@@ -2389,15 +6502,86 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           scheduleRedraw();
           return;
         }
-        activeId = action.id;
+        // Metadata-only remote rows and stale/malformed UI targets never become
+        // a local input owner. The sidebar's local/remote kinds stay separate;
+        // this independently refuses a target absent from the local inventory.
+        if (!views.some((view) => view.id === action.id) || removedExitedIds.has(action.id)) {
+          sidebar?.showError("That local session is no longer available");
+          scheduleRedraw();
+          return;
+        }
+        contentTarget = { kind: "local", id: action.id };
+        contentSelectionGeneration += 1;
         rememberedActiveSlot = rowSlots.get(action.id);
+        // A local (or passive) selection releases the single global remote
+        // stream: the one content controller is told nothing is selected, the
+        // accepted remote frame and its status are dropped, and the ordinary
+        // local view resumes. No remote row is stopped, retried, or notified.
+        clearRemoteContentSelection();
+        // Selecting is how a session starts being displayed and sized by this
+        // terminal; the manager recomputes only this row's geometry (#474).
+        localViewerDirty = true;
         syncRosterAndSchedule();
         reconcileLayout(true);
+        return;
+      }
+      case "remote-close-request":
+        // A deliberate d/Delete on a remote card. Nothing is sent until this
+        // side's own written-highlight gate, the local preflight, and (when the
+        // owner row is busy or unknown) a written confirmation all agree.
+        requestRemoteClose(action);
+        return;
+      case "remote-close-confirmed":
+        // The one deliberate confirmation of a written dialog frame. It is
+        // rechecked and consumed synchronously, before any await.
+        confirmRemoteClose(action);
+        return;
+      case "select-remote": {
+        // An ordinary Enter/left press on one projected remote roster card. It
+        // selects only the DISPLAYED source: never a local select, resume,
+        // create, stop, remove, rename, quit, consent, connect, or trust change.
+        selectRemoteContent(action.hostId, action.hostRunId, action.rowId);
+        return;
+      }
+      case "detach-view": {
+        // Explicit "display nothing" (#474): this sidebar stops displaying,
+        // feeding, and sizing one session. Owned processes and their work,
+        // status, the roster's remembered entries, saved conversations, and this
+        // host's lifetime are untouched; no child (local or remote) is stopped,
+        // closed, or replaced, and a later Enter on a row displays it again.
+        if (contentTarget === undefined) {
+          sidebar?.showError(NO_LOCAL_VIEW_MESSAGE);
+          scheduleRedraw();
+          return;
+        }
+        const detachingRemote = contentTarget.kind === "remote";
+        contentTarget = undefined;
+        contentSelectionGeneration += 1;
+        if (detachingRemote) {
+          // Releasing a remote display never rewrites the local roster's
+          // remembered active entry.
+          clearRemoteContentSelection();
+        } else {
+          rememberedActiveSlot = undefined;
+        }
+        localViewerDirty = true;
+        syncRosterAndSchedule();
+        reconcileLayout(true);
+        sidebar?.showError(LOCAL_VIEW_DETACHED_MESSAGE);
+        scheduleRedraw();
         return;
       }
       case "create":
         if (negotiationReady) launchCreate(action);
         else deferredCreates.set(action.requestId, action);
+        reconcileLayout(true);
+        scheduleRedraw();
+        return;
+      case "create-on-peer":
+        // A deliberate REMOTE New submission. It is never folded into the local
+        // `create` path: this side proves the exact written form first, and the
+        // owner host performs the one create in its own run.
+        launchCreateOnPeer(action);
         reconcileLayout(true);
         scheduleRedraw();
         return;
@@ -2474,6 +6658,32 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       case "stop-remove":
         launchRowStop(action.id, action.confirmed);
         return;
+      // Remote Saved picker intents for the selected OWNER host. They never reach
+      // the Local catalog, `deleteSavedFile`, or this host's own service: every
+      // request names only opaque owner handles plus the exact owner run, and the
+      // owner performs its own native listing, search, Resume, and Delete.
+      case "saved-remote-list":
+      case "saved-remote-search":
+      case "saved-remote-window":
+        handleRemoteSavedRead(action);
+        return;
+      case "saved-remote-resume":
+      case "saved-remote-delete-prepare":
+      case "saved-remote-delete":
+        handleRemoteSavedEntry(action);
+        return;
+      case "saved-remote-dismiss":
+        // The picker stopped owning the pane. Only Main's own UNSENT read and
+        // private references for it are dropped: accepted owner work is never
+        // cancelled or replayed, and a just-staged owner row awaiting its first
+        // roster observation (a completing Resume) is deliberately kept.
+        if (remoteSavedQueuedRead?.pickerId === action.pickerId) remoteSavedQueuedRead = undefined;
+        if (remoteSavedPrepared?.pickerId === action.pickerId) {
+          remoteSavedPrepared = undefined;
+          remoteSavedConfirmSettledKey = undefined;
+        }
+        if (remoteSavedPickerFrame?.presentation.pickerId === action.pickerId) remoteSavedPickerFrame = undefined;
+        return;
       case "saved-list": {
         if (!sidebar || sidebar.savedPickerRequestId !== action.requestId) return;
         startSavedCatalogList(action.requestId, action.requestId);
@@ -2536,12 +6746,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             && savedCatalogRequestId !== undefined) {
             const row = catalog.rows.find((candidate) => candidate.id === action.id && candidate.file === action.file);
             if (row !== undefined && searchSavedSessions(catalog, activeSidebar.savedQuery).includes(row)) {
-              let refusal: SavedSessionDeletionRefusalReason | undefined;
-              try {
-                refusal = validateOwnedSavedSessionDeletion(owner, catalog, row);
-              } catch {
-                refusal = "unknown-live-binding";
-              }
+              const refusal = hostService.validateSavedConversationDeletion(catalog, row);
               if (refusal === undefined) {
                 allowed = true;
                 message = "";
@@ -2561,7 +6766,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         const catalog = savedCatalog;
         if (!activeSidebar || !owner || !activeSidebar.isSavedDeleteConfirmationCurrent(
           action.requestId, action.pickerId, action.id, action.file, action.revision,
-        ) || !hasSettledSavedDeleteConfirmationFrame()) return;
+        ) || !hasSettledLocalSavedDeleteConfirmationFrame()) return;
         if (!isSavedSessionCatalog(catalog) || savedCatalogPickerId !== action.pickerId
           || savedCatalogRequestId === undefined) {
           activeSidebar.completeSavedDelete(action.requestId, "The saved list changed; no file was deleted", false);
@@ -2580,17 +6785,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             || activeSidebar.savedPickerRequestId !== action.pickerId
             || !activeSidebar.isSavedDeleteConfirmationCurrent(
               action.requestId, action.pickerId, action.id, action.file, action.revision,
-            ) || !hasSettledSavedDeleteConfirmationFrame()
+            ) || !hasSettledLocalSavedDeleteConfirmationFrame()
             || savedCatalog !== catalog || savedCatalogPickerId !== action.pickerId
             || savedCatalogRequestId !== expectedCatalogRequestId
             || !searchSavedSessions(catalog, activeSidebar.savedQuery).includes(row)) {
             return "stale-catalog";
           }
-          try {
-            return validateOwnedSavedSessionDeletion(owner, catalog, row);
-          } catch {
-            return "unknown-live-binding";
-          }
+          return hostService.validateSavedConversationDeletion(catalog, row);
         };
         let result: SavedSessionDeletionResult;
         try {
@@ -2658,6 +6859,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       }
       case "visibility":
         invalidateSavedDeleteConfirmationDisplay();
+        // Showing or hiding the pane is a genuine visibility change for every
+        // remote Saved receipt and admitted-but-unsent remote Saved intent.
+        remoteSavedEpoch += 1;
+        remoteSavedPickerFrame = undefined;
         reconcileLayout(true);
         syncOuterMouseModes();
         scheduleRedraw();
@@ -2687,8 +6892,34 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     savedCatalogPickerId = undefined;
     savedCatalogRequestId = undefined;
     invalidateSavedDeleteConfirmationDisplay();
+    invalidatePeerConsentDisplay();
+    invalidateRemoteCloseConfirmationDisplay();
+    // A drawn New form's receipt and Host line map never survive teardown; an
+    // already-handed remote create is not cancelled or re-sent here.
+    createFormFrame = undefined;
+    pendingCreatedRemote = undefined;
+    sidebar?.invalidateCreateFormPresentation();
+    // Ephemeral per-target reminders never outlive this host run. An in-flight
+    // close already handed to the owner is never re-sent or cancelled here.
+    remoteCloseMarkers.clear();
+    remoteCloseAttempts.clear();
+    // Remote Saved: every receipt, preparation, and unsent read is dropped and the
+    // epoch retires any admitted-but-unsent intent. A request already handed to
+    // the coordinator is never cancelled, re-sent, or claimed stopped here.
+    remoteSavedEpoch += 1;
+    remoteSavedPickerFrame = undefined;
+    remoteSavedPrepared = undefined;
+    remoteSavedConfirmSettledKey = undefined;
+    remoteSavedQueuedRead = undefined;
+    remoteSavedInflight.clear();
     sidebar?.disposeSavedPicker();
     invalidateMouseAuthorization();
+    // Display facts only. The coordinator's own bounded close stays the single
+    // resource barrier (no extra Main await), and its content callback is fenced
+    // above, so no observation can paint or resurrect anything after teardown.
+    remoteContentView = undefined;
+    remoteContentStatus = undefined;
+    contentStreamRequested = false;
     deferredCreates.clear();
     deferredSavedOpens.clear();
     deferredRowResumes.clear();
@@ -2710,6 +6941,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       } catch { /* abort is best-effort */ }
     }
     savedListControllers.clear();
+    let peerShutdownTask: Promise<boolean> | undefined;
+    if (peerCoordinator) {
+      try {
+        // Close latches network admission synchronously, independently of the
+        // one local manager's child settlement. Neither path stops remote work.
+        peerShutdownTask = Promise.resolve(peerCoordinator.close()).then(() => true, () => false);
+      } catch {
+        cleanupFailure = true;
+        peerNetworkSettled = false;
+      }
+    }
     let shutdownTask: Promise<{ result?: ShutdownResult; failed: boolean }> | undefined;
     if (manager) {
       try {
@@ -2804,28 +7046,27 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         } catch {
           cleanupFailure = true;
         }
-        try {
-          const liveViews = manager.list().filter((view) => view.hasLiveProcess);
-          remainingCount = liveViews.length;
-          // A live-state query that actually answered is positive evidence.
-          ownedStateSettled = true;
-        } catch {
-          remainingCount = shutdownResult?.remainingIds.length ?? 0;
-          try {
-            if (remainingCount === 0 && manager.hasLiveProcesses()) remainingCount = 1;
-            // The fallback liveness query answered truthfully.
-            ownedStateSettled = true;
-          } catch {
-            // Both owned-child queries are unavailable: no positive settlement
-            // evidence exists, so exclusive ownership is retained fail closed.
-            cleanupFailure = true;
-          }
-        }
-      } else {
-        // No manager was ever constructed: this host owns no child at all.
-        remainingCount = shutdownResult?.remainingIds.length ?? 0;
-        ownedStateSettled = true;
       }
+      if (peerShutdownTask) {
+        peerNetworkSettled = await peerShutdownTask;
+        if (!peerNetworkSettled) cleanupFailure = true;
+      }
+      // The one coordinator owns accepted network operations and its bounded
+      // close is their settlement barrier. UI/start wrappers already handle
+      // rejection and ignore shutdown callbacks; they own no other resources.
+      // Never turn an unconfirmed barrier into an unbounded second wait for
+      // abandoned work. Retain ownership and report the failed barrier below.
+      if (!peerNetworkSettled) {
+        safeReport(dependencies, "Network cleanup did not settle; agent-directory ownership is retained.");
+      }
+      // Owned-child settlement evidence comes from the one authoritative
+      // manager through the owning-host service: a query that actually answered
+      // is positive evidence, and unknown child state keeps exclusive ownership
+      // held fail closed instead of releasing it.
+      const settlement = hostService.observeOwnedChildSettlement(shutdownResult?.remainingIds.length);
+      remainingCount = settlement.remaining;
+      if (settlement.settled) ownedStateSettled = true;
+      else cleanupFailure = true;
       // Settled rows' surfaces were disposed above (each flushes its pending
       // diagnostics first). Settle the private log's owned IO before
       // reporting; anything an unsettled child emits after this is not
@@ -2859,7 +7100,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // query unavailable) keeps ownership held (fail closed) so a later host
       // refuses instead of racing children that may still be running.
       if (hostState !== undefined) {
-        if (remainingCount === 0 && ownedStateSettled) {
+        if (remainingCount === 0 && ownedStateSettled && peerNetworkSettled) {
           let released = false;
           try {
             released = hostState.release();
@@ -3027,13 +7268,20 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         onReject: options.onReject,
         onExternalEditor: startExternalEditor,
       };
+      // `plain` is a REMOTE New form's workspace: canonical owner text with the
+      // ordinary workspace bound and NO local filesystem completion at all.
       const field = options.kind === "path"
         ? createSessionHostTextField({
           ...common,
           kind: "path",
           workspaceBasePath: snapshot.startupCwd,
         })
-        : createSessionHostTextField({ ...common, kind: "name" });
+        : options.kind === "plain"
+          ? createPlainOwnerWorkspaceField({
+            ...common,
+            workspaceBasePath: snapshot.startupCwd,
+          })
+          : createSessionHostTextField({ ...common, kind: "name" });
       return {
         field,
         matchesCancel: (data: string) =>
@@ -3081,18 +7329,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       onAction: handleSidebarAction,
       onInvalidate: () => {
         invalidateSavedDeleteConfirmationDisplay();
+        invalidateRemoteCloseConfirmationDisplay();
         scheduleRedraw();
       },
     });
-    layout = computeHostLayout(initialCols, initialRows, {
-      sidebarVisible: sidebar.visible,
-      focus: sidebarFocus(sidebar.focus),
-      savedDeleteConfirmation: sidebar.savedDeleteConfirmationActive,
-    });
+    layout = currentHostLayout(initialCols, initialRows);
     lastNativeCols = layout.native.cols;
     lastNativeRows = layout.native.rows;
 
-    manager = dependencies.createManager({
+    manager = hostService.openManager({
       packageRoot,
       piExecutable: pi.file,
       statusRegistrar: statusRegistrar(broker),
@@ -3106,8 +7351,16 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       onChange: (id) => noteManagerChanged(id),
       onTerminalDiagnostic: (id, event) => handleTerminalDiagnostic(id, event),
       onNativeClipboard: routeNativeClipboard,
-      onSpawnRequest: handleSessionSpawn,
+      // Authenticated background child requests are admitted by the owning-host
+      // service. This path never completes a sidebar form and never activates
+      // the created row; manager onChange only refreshes the roster.
+      onSpawnRequest: (parentInstanceId, request) => hostService.spawnRequestedChild(parentInstanceId, request),
       getSidebarTitleColumns: sidebarTitleColumnsSnapshot,
+      // Strict authenticated input-origin framing for every child this host
+      // creates, ON by default and immutable for the host's lifetime. The viewer
+      // preference never toggles it; only the dependency-only explicit-false test
+      // seam keeps the legacy manager call shape.
+      ...(nativeIoBridgeEnabled ? { nativeInputOriginFraming: true } : {}),
     });
     writer = createFrameWriter();
 
@@ -3134,6 +7387,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     syncRosterAndSchedule();
     reconcileLayout(false);
     startupComplete = true;
+    if (!shutdownRequested) startPeerNetworking();
     if (shutdownRequested) beginShutdown();
     else {
       await observer.wait();

@@ -1513,6 +1513,77 @@ test("intentional release closes the active connection without a disconnect call
   await waitFor(() => recorded2.statuses.length === 1);
 });
 
+test("the closed input-framing registration option lands in the actual bootstrap and round-trips the shared parser", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const framed = broker.register(INSTANCE_A, recording().handlers, { inputOriginFraming: true });
+  assert.equal(framed.bootstrap.inputOriginFraming, 1, "the mode is recorded in the bootstrap the host hands to the child");
+  assert.equal(parseBootstrap(framed.bootstrap)?.inputOriginFraming, 1, "the shared parser admits exactly this mode");
+  // The child receives this object only as one-shot JSON env, so the marker must
+  // survive serialization and revalidation unchanged.
+  const revived = parseBootstrap(JSON.parse(JSON.stringify(framed.bootstrap)));
+  assert.deepEqual(revived, framed.bootstrap, "the mode round-trips through the spawn env exactly");
+
+  // An explicit false and an absent option are both the legacy bootstrap: the
+  // marker is simply not present, so an older child sees an unchanged shape.
+  const legacyExplicit = broker.register(INSTANCE_B, recording().handlers, { inputOriginFraming: false });
+  const legacyAbsent = broker.register(INSTANCE_C, recording().handlers);
+  for (const registration of [legacyExplicit, legacyAbsent]) {
+    assert.equal(Object.hasOwn(registration.bootstrap, "inputOriginFraming"), false,
+      "a non-request keeps the legacy bootstrap shape byte-for-byte");
+    assert.deepEqual(parseBootstrap(registration.bootstrap), registration.bootstrap);
+  }
+  await disposeBroker(broker);
+});
+
+test("a malformed input-framing registration option is refused before any token, namespace, or entry exists", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const malformed: unknown[] = [
+    { inputOriginFraming: "yes" },
+    { inputOriginFraming: 1 },
+    { inputOriginFraming: null },
+    { inputOriginFraming: true, extra: true },
+    { unknownMode: true },
+    [],
+    "true",
+    1,
+    null,
+  ];
+  for (const options of malformed) {
+    assert.throws(
+      () => broker.register(INSTANCE_A, recording().handlers, options as never),
+      /session-host/,
+      `refuses the malformed registration option shape: ${JSON.stringify(options)}`,
+    );
+  }
+  // Nothing half-registered: the same id still registers cleanly, and the refusal
+  // never consumed or replaced a token.
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  assert.equal(Object.hasOwn(registration.bootstrap, "inputOriginFraming"), false,
+    "a refused option never records the closed mode");
+  const client = await connectClient(broker.socketPath);
+  client.write(JSON.stringify(helloFrame(registration.bootstrap)) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, { sequence: 1 })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+  await disposeBroker(broker);
+});
+
+test("parseBootstrap refuses every unknown or malformed input-framing mode shape", () => {
+  const base: SessionHostBootstrap = {
+    version: 1,
+    socketPath: "/tmp/prg-broker-bootstrap.sock",
+    token: "a".repeat(64),
+    instanceId: INSTANCE_A,
+    generation: INSTANCE_B,
+  };
+  assert.deepEqual(parseBootstrap({ ...base, inputOriginFraming: 1 }), { ...base, inputOriginFraming: 1 });
+  for (const mode of [0, 2, -1, 1.5, "1", true, false, null, {}, [], "one"]) {
+    assert.equal(parseBootstrap({ ...base, inputOriginFraming: mode }), undefined,
+      `an unknown mode shape rejects the whole bootstrap: ${JSON.stringify(mode)}`);
+  }
+  assert.equal(parseBootstrap(base)?.inputOriginFraming, undefined, "absence stays the legacy bootstrap");
+});
+
 test("duplicate active registration fails before the token is overwritten", async () => {
   const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
   const recorded = recording();

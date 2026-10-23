@@ -668,14 +668,23 @@ for (const mode of ["regular", "fullscreen"] as const) {
     await driver.ensureSidebarFocus();
     const blueBeforeNarrow = onlyImagePlacement(trace, proofFixture.BLUE_PNG_BASE64);
     const narrowWatermark = trace.watermark();
-    await driver.setOuterSize(52, 30, [sessionA, sessionB], 52, 29);
+    // Per-session viewer sizing (#474): B is the row this host displays, so B
+    // alone takes the narrow overlay pane while the unviewed A keeps its last
+    // wide pane. The narrow overlay covers the pane, so no image may stay placed.
+    await driver.setOuterSize(52, 30, { viewed: sessionB, retained: [sessionA] }, 52, 29);
+    assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - 32 - 1, rows: 49 },
+      "the unviewed A keeps its wide pane while the displayed B is resized narrow");
     assert.equal(driver.surface.frame().cols, 52, "the outer terminal is now in the narrow overlay geometry");
     await driver.waitFrame((text) => parseRosterFrame(text, 52).complete && isSidebarFocusedFrame(text, 52),
       "the narrow full-width roster overlay finishes painting");
     await waitForNoPlacedImages(trace, "the narrow sidebar overlay contains no stale native image placement",
       narrowWatermark, blueBeforeNarrow.image.id);
     const wideRestoreWatermark = trace.watermark();
-    await driver.setOuterSize(OUTER_COLS, OUTER_ROWS, [sessionA, sessionB], OUTER_COLS - 32 - 1, 49);
+    await driver.setOuterSize(OUTER_COLS, OUTER_ROWS, { viewed: sessionB, retained: [sessionA] }, OUTER_COLS - 32 - 1, 49);
+    assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - 32 - 1, rows: 49 },
+      "restoring the wide outer geometry resizes only the displayed row; A's pane is untouched");
+    assert.deepEqual(driver.paneGeometry(sessionB), { cols: OUTER_COLS - 32 - 1, rows: 49 },
+      "the displayed row returns to the wide 87x49 pane");
     assert.equal(driver.surface.frame().cols, OUTER_COLS, "the outer terminal returns to wide geometry");
     await waitForOnlyImage(driver, trace, proofFixture.BLUE_PNG_BASE64,
       "Image proof B", SIDEBAR_NATIVE_LEFT, OUTER_COLS - SIDEBAR_NATIVE_LEFT,

@@ -26,6 +26,13 @@
  * standard Node CLI support, not a sandbox: a malicious user custom loader
  * ordered before our flag could still tamper with the environment; that is
  * outside this companion's trust model.
+ *
+ * Clipboard-bridge posture: an ordinary bootstrap keeps its legacy best-effort
+ * install exactly. A bootstrap carrying the closed input-framing marker installs
+ * the strict bridge before native main and refuses to start if that install
+ * fails, so a host that requested framing never meets a silent legacy child. No
+ * environment value is toggled per input and no Pi source, runtime, or version
+ * changes.
  */
 
 import { realpathSync } from "node:fs";
@@ -185,6 +192,24 @@ primeSessionHostStartupMetadata(
   primed !== undefined && process.env.PI_REVIEW_GATE_RUNTIME_ROLE !== "executor",
   primed?.payloadDir,
 );
+/**
+ * A child the host registered in the closed input-framing mode must never
+ * continue as an ordinary legacy child when its strict bridge cannot install:
+ * the host would then refuse every framed write while this process behaved like
+ * a legacy Pi. One fixed, payload-free line on stderr (never the token, the
+ * bootstrap, a path, or a caught error) and a nonzero exit use the preload's
+ * existing pre-main failure posture — the environment is already restored and
+ * the one-shot bootstrap consumed here, so nothing leaks to descendants and the
+ * owned row reports a truthful launch failure.
+ */
+function refuseRequestedInputFraming(): never {
+  try {
+    process.stderr.write("pi-review-gate: the requested native input framing bridge is unavailable; refusing to start\n");
+  } catch {
+    // A closed stderr cannot hide the exit below.
+  }
+  process.exit(1);
+}
 // A valid consumed bootstrap — and the reporter's exact executor role ceiling,
 // not an alias or a stripped marker — opts this process into pure owned-activity
 // observation BEFORE native main and every extension module evaluates. That
@@ -193,11 +218,30 @@ primeSessionHostStartupMetadata(
 // runtime never activates, so standalone and worker runs stay inert. The
 // registry is itself exception-safe and performs no IO; this guard only keeps
 // any unexpected opt-in failure from affecting native startup.
+//
+// The clipboard bridge keeps its exact legacy best-effort behavior unless this
+// authenticated bootstrap explicitly requests the closed input-framing mode.
+// A requested mode is strict: the bridge installs before native main, and an
+// install failure refuses to start rather than continuing as a legacy child.
 if (primed !== undefined && process.env.PI_REVIEW_GATE_RUNTIME_ROLE !== "executor") {
-  try {
-    installNativeClipboardBridge(primed);
-  } catch {
-    // Unsupported provenance never opens raw OSC forwarding or changes native copying.
+  if (primed.inputOriginFraming === 1) {
+    // Requested strict mode: install the framing bridge before native main can
+    // write its startup queries, and never fall back to legacy on failure. The
+    // child emits its own signed readiness capsule only after the decoder is
+    // fully installed, so the host still owes its own live-record checks.
+    let installed = false;
+    try {
+      installed = installNativeClipboardBridge(primed, { inputOriginFraming: true });
+    } catch {
+      installed = false;
+    }
+    if (!installed) refuseRequestedInputFraming();
+  } else {
+    try {
+      installNativeClipboardBridge(primed);
+    } catch {
+      // Unsupported provenance never opens raw OSC forwarding or changes native copying.
+    }
   }
   try {
     activateOwnedActivity();

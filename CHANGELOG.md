@@ -15,6 +15,320 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.193]
+
+### Added
+
+- A capability-gated owner Close transport on the existing paired roster channel
+  (#389). It uses the owning Main's same stop/removal path, current directional
+  receiving grant, and exact owner run/row; parallel rows remain independent. Lost
+  replies stay unknown and are never replayed. Sidebar Close acts on the actually
+  written remote highlight, independently of the displayed stream; busy or unknown
+  activity needs an exact written requester confirmation. Exited or settled-error
+  removal stays owner-routed, and saved history is untouched. See
+  [Owner Close transport foundation](docs/session-host-alpha.md#owner-close-transport-foundation).
+- The New session form now has one **Host** line, naming **Local** each time it opens
+  (#389). Choosing one already-connected saved destination makes the Workspace field
+  plain bounded owner text and submits one rowless create request to that owner's own
+  manager over the existing paired roster channel's optional `roster-create-v1`
+  capability; the owner creates one blank native child in its own run with no initial
+  prompt, and its own local focus, selection, and drafts are untouched. No local row,
+  child, or input owner is created, selected, or focused: only the owner's roster
+  projection lists the new row, and a `started` answer displays that exact returned run
+  and row only while
+  the same request still owns the form. Every actual Host change clears the Workspace
+  value, choosing the same Host is a no-op with no per-host history, and the Local form
+  keeps its native path editor and completion. A request carries the exact owner run, a
+  canonical workspace (2048 code points, derived 8192 UTF-8-byte ceiling), a fresh
+  correlation id, and one monotonic anti-replay attempt number; the current pin,
+  directional grant, destination channel, and the written, uncovered New-form frame are
+  independently re-checked, and the caller's written-form check and the owner facts are
+  re-evaluated inside the ordered write. Fixed facts distinguish started, unconfirmed,
+  refused, and unknown; a lost reply, elapsed requester patience (15 seconds on this
+  side only), or a retired destination is never retried, replayed, or cancelled. A
+  missing capability is refused with a fixed notice and no upgrade or connect. No new
+  listener, manager, registry, permission kind, or stored state is added. See
+  [Owner Create transport foundation](docs/session-host-alpha.md#owner-create-transport-foundation).
+- Authenticated input-origin framing and origin-bearing clipboard capsules for the
+  existing owned Node stdio bridge (#389). Payloads and explicit origins are
+  authenticated, and a separate signed readiness signal precedes framed input. The host
+  mode gates both user input and non-user terminal replies, refuses unknown bootstrap
+  modes, and sets native capture only for the hosted child tree with ordinary descendant
+  inheritance. Normal production Main enables it by default for the children it creates;
+  only a dependency-only explicit-false test seam keeps the legacy call shape, and no
+  viewer setting toggles it. Local/SSH copying and standalone Pi remain unchanged, a
+  rowless New-form Host choice can ask one connected owner for a blank child,
+  `SessionSpawn` stays the native, owner-bound tool, and human handoff remains
+  unimplemented.
+- Native input and text copy for the one selected remote viewport, on the existing
+  selected-content lane (#389), enabled by default in normal production Main. Main always
+  gives the coordinator its native I/O callbacks, so `native-input-copy-v1` negotiation and
+  the owner side's capability are fixed for the host's lifetime and never depend on this
+  host's own viewer setting. A new remembered Network setting, **Remote input/copy**, is
+  this VIEWER's own switch for its displayed remote pane (on for a new installation or an
+  otherwise valid older settings document; an explicit Off survives restarts). Off refuses
+  keyboard, mouse, and paste with one brief fixed notice and writes no completed copy to
+  the clipboard; it never disconnects, revokes, changes Hosting/Auto, stops children,
+  cancels accepted owner work, or affects the owner's local input/copy, other viewers, or
+  the sidebar's New, Close, and Saved actions. Keyboard, canonical mouse, and whole text
+  paste are admitted only against the actually written, uncovered, Main-focused viewer
+  frame and re-proved against current owner facts, the current TLS-proved peer, pin,
+  directional grant, endpoint, subscription, selection, and that setting, before every
+  protected write and after caller callbacks; an actual setting change (including Off and
+  back On) invalidates earlier admissions and written receipts, so turning it back on needs
+  a fresh written frame even when the pixels match. The source token is descriptive, not a
+  grant, and the owner's Main need not display or focus the controlled row. A paste is
+  validated whole up to 1 MiB of decoded UTF-8 before one PTY handoff, and a copy is
+  retained whole up to the unchanged 100,000-character native bound and returned only to
+  the exact initiating viewer. Ordinary output with unchanged semantic source and modes
+  does not stall input; source- or mode-only changes still need a real writer boundary.
+  Refusals stay brief and non-modal; only a pre-invoke refusal is `not-sent`, and an
+  invoked loss is truthfully unknown without replay. Several viewers may control one
+  owner row independently. Close behavior, local/SSH copying, and native producers are
+  unchanged; human handoff remains unimplemented, and `SessionSpawn` stays the native,
+  owner-bound tool. See
+  [Native input and copy](docs/session-host-alpha.md#native-input-and-copy).
+- Startup input for a remote child before it has a conversation (#389). The optional
+  `native-input-startup-v1` content capability depends on `native-input-copy-v1` and lets
+  an authorized viewer answer native Pi's `Trust project folder?` prompt with ordinary
+  keys. Startup authority is explicit, never inferred from a missing tuple. The child
+  arms it only after its owned reporter registered the mandatory public hooks, and its
+  first session update closes it permanently. The owner's registration closes it at the
+  first accepted status, disconnect, or exit. The startup source carries phase `startup`,
+  no native session field, and its own token domain, under the same written-frame, owner,
+  peer, and setting fences as conversation input; a phase or tuple change drops any
+  partly assembled dispatch. Pi's trust decision and persistence are unchanged, with no
+  automatic trust, Pi patch, or new API, and copy stays unsupported until a real
+  conversation exists. See
+  [Native input and copy](docs/session-host-alpha.md#native-input-and-copy).
+- The Saved picker can now reach one connected owner's complete saved-conversation
+  catalog (#389) through an optional `roster-saved-v1` capability on the existing paired
+  roster channel. It opens on Local with a blank query each time; an actual Host change
+  clears the query and results, the same Host is a no-op, and an owner with an empty
+  roster is a valid choice. Remote rows carry the owner's own session id, saved file
+  path, caption, and workspace exactly, presented through the same formatter as Local rows. These
+  are display data only: requests name only opaque owner-issued handles and the exact
+  owner run, and the requester never acts on a displayed path. Search keeps the owner's
+  native semantics with the exact query. Every row of the unfiltered catalog or a result
+  is reachable through bounded windows over one immutable owner result, with the full
+  total stated and no silent truncation; existing navigation keys are unchanged.
+  Resume uses the owner's native Saved admission and duplicate guards and starts an
+  owner-owned child. Only this viewer selects the returned row, and only while that
+  request still owns the picker. Delete is gated by the owner's live **Allow remote
+  history deletion** policy, the requester's Local-style confirmation, and the owner's
+  existing `trash`-first and file-identity guards, through one guarded native manager operation. Requests need the
+  actually written picker or confirmation frame. One request is pending per channel, and
+  outcomes stay `not-sent`, owner facts, or `unknown`, without retry or replay. A
+  missing capability gets one fixed notice. No new listener, manager, history, index,
+  transcript copy, or lease is added. See
+  [Saved conversations on a connected owner](docs/session-host-alpha.md#saved-conversations-on-a-connected-owner).
+- A separate remembered OWNER-side Network setting, **Allow remote history deletion**
+  (#389): whether this host exposes remote saved-history deletion to its paired viewers.
+  It is on by default and an explicit Off survives restarts; it is not a viewer-side delete
+  toggle and does not gate this host's own local Saved deletion. The viewer checks the
+  owner's current positive description at admission and actual queued send. The owner
+  reads its own current value once per incoming prepare or confirmed request, refusing
+  Off or unknown before provider work, independently of any viewer's Remote input/copy
+  setting. Later preference flips alone do not revoke an admitted request, and Off then
+  On before sending preserves a still-owned intent or confirmation without retrying a
+  refused attempt. Independent authorization and file guards remain live. Both new settings are optional
+  fields of the existing version-1 protected preferences document; malformed values or
+  unavailable storage are refused untouched and never treated as the default-on values.
+- A TLS/WSS peer-transport foundation with KDE-style explicit device pairing (#475).
+  Explicit callers supply generated self-signed identities, consent and trust stores, and
+  a listener address; module import alone still enables nothing. Actual TLS peer keys,
+  remembered identity, and separate directional receiving grants gate application
+  channels. No CA-issued certificate or domain setup is required. Bounded pairing
+  metadata, cancellation, backpressure, and owned teardown are covered without adding
+  clipboard synchronization; the optional network sidebar now uses this transport
+  (#482). See [Paired peer transport foundation](docs/session-host-alpha.md#paired-peer-transport-foundation).
+- A metadata-only remote roster foundation projects the local session manager's roster
+  facts over that explicitly constructed paired channel (#478). The owner observes its
+  existing single manager through a coherent snapshot-and-watch seam with a fresh
+  owner-run identity and monotonic observation revisions, and publishes one bounded
+  versioned metadata snapshot plus bounded live updates. A full snapshot is assembled
+  and applied as a whole, fenced to the current subscription, owner run, and observation
+  revision, with authority rechecked against the current accepted peer identity and
+  receiving grant. Rows carry only local-equivalent display facts — stable row id, title,
+  exact owner-side workspace path, lifecycle, live-process/input-surface and
+  busy/pending-input observations, generic activity, canonical native conversation
+  identity, separate ownership and activity-intent counts, a known exit code, and
+  bounded display-safe error text — while unknown observations stay unknown rather than
+  idle or zero. The native current-file guard, agent/account directories, configuration,
+  providers, credentials, prompts, transcripts, question text, terminal/output bytes, and
+  image data never cross, and native session-pane contents are never altered, filtered,
+  or rebuilt. Error text strips terminal-control hazards and recognizable credential
+  patterns with a fixed fallback; it is not an arbitrary-secrets guarantee. Ownership
+  stays with the owner host: a client snapshot is only a projection, its loss means
+  not-current rather than idle, and stopping a subscription or disposing the bridge never
+  shuts down owner sessions. No second controller, separate ACL, or new revocation
+  lifecycle policy is added. Importing this foundation enables no networking, and this
+  foundation adds no remote input, session-operation routing, or clipboard attribution;
+  the optional network sidebar now consumes this projection (#482). See
+  [Remote roster metadata foundation](docs/session-host-alpha.md#remote-roster-metadata-foundation-metadata-only).
+- The session host sizes each session for the surfaces that actually display it, and can
+  display no session at all (#474). Every displayable surface registers as a viewer of one
+  session, and a session's canonical content size is the independent minimum of those widths
+  and the independent minimum of those heights (a 100x40 and an 80x50 surface on one session
+  give it 80x40). Only sessions whose viewer set changed are recomputed and only that
+  session's own child is resized, so a sibling nobody views keeps its size; a session whose
+  last viewer left keeps its last size, a session nobody has ever viewed keeps the existing
+  initial-sizing rule, and a surface with no content size contributes nothing. Those viewer
+  facts live once on the host's single session manager, and a completion carrying an older
+  viewer state is refused instead of resurrecting a detached view, retargeting a finished row,
+  or overwriting a later selection. With the roster focused, `n` displays no session: it
+  retires only this host's local content and input participation, so every session keeps
+  running, the roster, saved conversations, host lifetime, and Quit's child shutdown stay
+  unchanged, and Enter on a row displays that session again without restarting it. A session
+  smaller than its pane is drawn padded at the pane's top-left corner: that padding stays host
+  space, while the drawn content keeps its clipboard copy, click-to-focus, and image ownership,
+  and native positional input is authorized only against the frame actually written. This local
+  geometry change enables no network, remote protocol, daemon, stored state, or exclusive-control
+  lease, and viewing never
+  grants or revokes input. See
+  [Per-session content geometry](docs/session-host-alpha.md#per-session-content-geometry).
+
+- An explicit protected peer-state library retains one per-agent identity, accepted
+  peers, directional grants and separate outgoing host pins (#480). Initialization is
+  explicit; startup creates no identity or fresh trust. Real
+  filesystem protection precedes private-key writes; unsafe, missing initialized,
+  corrupt or key-mismatched state fails closed without permission repair, silent identity
+  rotation or fresh-trust fallback.
+  One-time association remains valid until revoked: reconnects and restarts with the same
+  keys require no repeated approval, and pending consent deadlines never expire grants.
+  Synchronous publication and immutable projections preserve the current store seams;
+  uncertain commits invalidate the handle instead of claiming rollback. The receiving
+  pairing callback also exposes its actual configured deadline and sanitized settlement
+  without changing consent authority or timeout defaults (#475). The optional network
+  sidebar now builds its saved settings, listener, and consent surface on this state
+  (#482); native input/copy for the displayed remote pane is on by default with a
+  per-viewer Remote input/copy setting, one deliberately
+  selected remote row's native viewport can now be displayed, and a rowless New-form
+  Host choice can now ask one connected owner for a blank child, and the Saved picker can
+  reach one connected owner's saved conversations; `SessionSpawn` stays the native,
+  owner-bound tool, and human handoff remains unimplemented. See
+  [Explicit protected peer-state foundation](docs/session-host-alpha.md#explicit-protected-peer-state-foundation).
+- The optional native session host now displays one deliberately selected remote native
+  viewport through the existing left roster, compositor, graphics layer, and writer
+  (#389). Visible Pi/chat text, styling, cursor, Unicode, and bounded typed PNG images and
+  fallbacks are included; visible text can itself be sensitive. Unselected rows stay
+  metadata-only. One selected stream uses the same owning manager, per-session viewer
+  minima, TLS-proved key, remembered pin, and directional grant, without another listener,
+  manager, controller lease, or permission kind. New session starts on Local and a
+  deliberate Host choice can target one connected owner; loss or disconnection never
+  stops remote work or silently selects another row. Exact source,
+  run, generation, geometry, and written-display fences remain fail closed; 64 KiB bounds
+  messages, not whole viewports. Native input, text paste, and copy travel only through
+  the default-on native input/copy bridge described above, subject to this viewer's
+  Remote input/copy setting; owner Saved conversations are described above, human
+  handoff remains unimplemented, and `SessionSpawn` stays the native, owner-bound tool.
+  Ordinary Pi and authenticated local/SSH clipboard are unchanged. See
+  [Selected native viewport](docs/session-host-alpha.md#selected-native-viewport-interim-display-scope).
+- The optional native session host now wires a **Network** sidebar over the paired peer
+  transport (#482). A fresh Network pane prefills the editable local listen draft
+  `*:8088`; `*` requests IPv4/IPv6 dual-stack on one listener, while explicit addresses
+  remain available. Hosting is initially off and remembered, and an enabled saved
+  setting attempts to restore its listener on the next start. Saved destinations, the default-off Auto setting, and the
+  default-on arrival bell are protected preferences kept separately from the
+  identity/trust document, so muting the bell or saving a destination creates no key
+  material. A fresh host with no saved preferences creates no peer keys, network
+  preferences, listener, or connection. The first explicit Enable hosting or Connect
+  initializes an identity only when none exists. First pairing has a two-minute human
+  approval window and a first-use server-key confirmation; the consent dialog's immutable
+  identity latches at arrival, and its controls authorize only after the exact frame was
+  actually written. Changed known pins and unsafe, corrupt, or
+  missing-initialized trust fail closed without repair, rotation, or silent key
+  replacement; explicit Connect is not pin replacement. Incoming requests raise a
+  persistent non-focus-stealing alert and one best-effort bell per arrival, with a
+  reserved alert band when the sidebar is hidden or narrow. Auto recovery is off by
+  default and attempts only previously connected, still-trusted destinations with a
+  remembered pin and no suppression after startup or an unexpected loss. Disconnect
+  persists suppression until an explicit Connect; Remove forgets only this side's
+  endpoint and remembered pin; Revoke removes only this side's current receiving grant.
+  None stops remote work or sessions.
+  Add destination uses independently navigable Name, Host, and Port fields and one
+  explicit Add action, rather than a sequential wizard.
+  Connected rows stay metadata-only until one is deliberately selected. Close is
+  owner-routed as described above; native input, text paste, and copy are reachable only
+  through the default-on bridge and this viewer's Remote input/copy setting, and the
+  separate Allow remote history deletion setting is an owner-side policy; a deliberate
+  New-form Host choice can ask
+  one connected owner for a blank child, the Saved picker can reach one connected owner's
+  saved conversations, and `SessionSpawn` stays the native, owner-bound tool; human
+  handoff remains unimplemented; no view-only permission kind or controller lease is
+  invented. See
+  [Network sidebar](docs/session-host-alpha.md#network-sidebar-hosting-pairing-and-remote-metadata)
+  and [Session-host peer network](docs/security-model.md#session-host-peer-network-optional).
+
+### Changed
+
+- Session-host session operations now run through one presentation-independent local
+  owning-host boundary over the host's single session manager (#473). Starting a session,
+  admitting an authenticated background `SessionSpawn` sibling, resuming an exited row,
+  checking a saved-conversation deletion, and owned-child settlement at quit read and use
+  that one manager's facts, and a host run refuses to open a second manager. The sidebar
+  stays a disposable view of those facts, and delegated children gain no new
+  session-creation authority. No behavior, protocol, control, or setting changes. See
+  [One owning host, one session manager](docs/session-host-alpha.md#one-owning-host-one-session-manager).
+- Left roster rows stay clickable while a right-hand host UI is open beside them (#486).
+  A click on a different left row first closes that UI through its own existing
+  cancellation route — including the nested Saved-delete confirmation together with its
+  picker, so no hidden pane or pending UI ownership survives — and then performs the
+  clicked row's ordinary action exactly once, without confirming, approving, submitting,
+  or deleting anything. Backend work keeps its existing cancellation and request-id
+  fences; dismissing a pane does not guarantee that an operation already submitted to
+  Main stops. A click on the row that already holds the left highlight is a pure no-op that
+  preserves the open pane, its draft, focus, notices, and pending work. Only the roster
+  actually drawn in the written frame authorizes the click, and no keyboard, consent,
+  confirmation, or native-input ownership fence changes. See
+  [Focus, display, and status](docs/session-host-alpha.md#focus-display-and-status).
+- Remote roster cards in the left sidebar now use the same card layout and facts as local
+  rows, with one indented `host <label>` line directly below the title and no workspace
+  path in the card (#482). An unusually long label is clipped on that one line, and the
+  honest stale marker leads it so clipping cannot hide the observation. The exact
+  owner-side workspace path and other roster metadata, Network details, selection, Enter
+  and drawn-click actions, and activity-only collapse are unchanged. See
+  [Network sidebar](docs/session-host-alpha.md#network-sidebar-hosting-pairing-and-remote-metadata).
+### Fixed
+
+- Early automatic terminal-query replies no longer fail an otherwise-live, non-stopping
+  framing child awaiting its own authenticated readiness (Refs #389). These unsent replies
+  are discarded, never queued or replayed; user input still requires readiness, and future
+  replies keep their framed non-user origin and existing failure paths.
+- Cleanup-lock contention keeps trying atomic publication while one owned, targeted
+  process-start query runs asynchronously, rather than blocking on that query (#389).
+  The existing two-second deadline and 50 ms cadence remain unchanged; only a real
+  helper close can settle ownership, and confirmation expiry is re-proved against the
+  absolute clock even before a delayed timer dispatches. Unknown owners and replaced
+  records remain protected, and the original Windows eight-racer checks are unchanged.
+- The Windows bootstrap test fixture now allows 120 seconds for its cold first
+  attempt and records bounded per-launch phase diagnostics; subsequent attempts
+  retain their existing limits and all integrity assertions remain.
+- The retired-activity census regression installs its gates before a fresh retired
+  uncertainty mark, preventing an automatic refresh from consuming the proof first.
+  Test cleanup releases held operations; production activity fences are unchanged.
+- The signal-exit test observer rechecks completed markers when filesystem watch
+  events are missing and captures safe failure facts before cleanup can produce the
+  marker itself. Signal behavior, original assertions and deadlines are unchanged;
+  the historical local timeout's cause remains unproven.
+- Session-host field labels now sit beside the native Editor's first editable body row,
+  not its top border (#482). New/Edit, Host shortcuts, and Network editors share the
+  same stable anchor; wrapped caret movement leaves the label, drafts, and editing
+  behavior unchanged.
+- A single left press on a drawn Network menu row now performs its normal Enter action
+  once (#482). Captured row positions and displayed action values fence stale or unwritten
+  clicks; opening consent review decides nothing, and host gestures never reach a child.
+- Owned-child input-origin framing is terminal-safe (Refs #389). The framing is versioned
+  `prg-ni-v2` and every frame is printable ASCII end to end, closed by one printable `;`
+  instead of a line feed, so a terminal that re-encodes control characters on the way into
+  the child can no longer rewrite the frame boundary. Only that exact tag and terminator
+  are accepted: the older line-feed-terminated wire, a carriage return, and a
+  terminal-substituted key ending are malformed framing that poisons that decoder, and a
+  host and a child built from different framing versions refuse each other rather than
+  downgrade, queue, replay, or fall back to raw input. Body encoding, origins, fences,
+  sequence, dispatch assembly, bounds, readiness, and every policy are unchanged, and no
+  dual-version decoder or negotiation is added.
+
 ## [0.1.0-dev.192]
 
 ### Changed

@@ -8,7 +8,15 @@
  * argument objects unchanged and returns the exact real IPty handle. Its
  * public onExit/kill observations append bounded metadata only; a parent
  * release handshake retains the owner until kernel watchers confirm children.
+ * The handshake reads the durable release request on its bounded cadence as well
+ * as on every watch notification, so a silently missed notification cannot strand
+ * an already-released owner; an explicit watcher failure instead retains this
+ * owner fail closed. Nothing here authorizes an exit by itself.
  * No argv, env, terminal input/output, transcript, or fabricated lifecycle is recorded.
+ *
+ * Running this file as the Node entrypoint is unchanged. Requiring it as a
+ * module exposes only the actual parent-control loop for the focused
+ * release-handshake control; Main is never started by an import.
  */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -165,28 +173,68 @@ function installPtyObservation(mainEntry, journalPath) {
   };
 }
 
+/**
+ * Bounded re-examination cadence for the parent release handshake. `fs.watch`
+ * stays the fast path; this only re-reads the actual validated release request so
+ * a *silently* lost or coalesced notification cannot strand an already-released
+ * owner. It grants no authority of its own: elapsed time, mere file presence, and
+ * any unreadable, malformed, linked, oversized, unknown-action, or stale request
+ * never resolve the wait, and only the watch path consumes `force` requests. An
+ * explicit watcher failure is not a silent miss: it fails this owner closed (see
+ * the error handler), because a broken observation channel is not clean proof.
+ */
+const RELEASE_RECHECK_INTERVAL_MS = 25;
+/** Coarse keep-alive cadence for an owner retained by a failed observation. */
+const FAILED_OBSERVATION_RETENTION_INTERVAL_MS = 30_000;
+
 function startParentControl(controlPath, journalPath, ptyObservation) {
   let lastRequestId = 0;
   let released = false;
+  let disposed = false;
+  let observationFailed = false;
+  let recheckTimer;
+  let retentionTimer;
   let resolveRelease;
   const releasePromise = new Promise((resolve) => { resolveRelease = resolve; });
 
-  const poll = () => {
+  /** The durable control request, or undefined when nothing readable and well-formed exists. */
+  const readValidatedRequest = () => {
     let request;
     try {
       const stats = fs.lstatSync(controlPath);
-      if (!stats.isFile() || stats.isSymbolicLink() || stats.size > 16 * 1024) return;
+      if (!stats.isFile() || stats.isSymbolicLink() || stats.size > 16 * 1024) return undefined;
       const raw = fs.readFileSync(controlPath, 'utf8');
-      if (!raw.trim()) return;
+      if (!raw.trim()) return undefined;
       request = JSON.parse(raw);
     } catch {
-      return;
+      return undefined;
     }
-    if (!request || !Number.isSafeInteger(request.requestId) || request.requestId <= lastRequestId) return;
+    if (!request || !Number.isSafeInteger(request.requestId) || request.requestId <= lastRequestId) return undefined;
+    return request;
+  };
+
+  const stopRecheck = () => {
+    if (recheckTimer === undefined) return;
+    clearTimeout(recheckTimer);
+    recheckTimer = undefined;
+  };
+
+  const acceptRelease = (requestId) => {
+    lastRequestId = requestId;
+    released = true;
+    stopRecheck();
+    resolveRelease();
+  };
+
+  const poll = () => {
+    const request = readValidatedRequest();
+    if (!request) return;
     if (request.action === 'release') {
-      lastRequestId = request.requestId;
-      released = true;
-      resolveRelease();
+      // Fail closed: once this owner has an explicit observation failure, the
+      // notification channel can certify nothing, so even a valid release request
+      // grants no exit authority and the parent's failure path settles this owner.
+      if (observationFailed) return;
+      acceptRelease(request.requestId);
       return;
     }
     if (request.action !== 'force' || !Array.isArray(request.receipts) || request.receipts.length === 0
@@ -196,22 +244,72 @@ function startParentControl(controlPath, journalPath, ptyObservation) {
     for (const receipt of new Set(request.receipts)) ptyObservation.forceExactReceipt(receipt, request.requestId);
   };
 
+  const scheduleRecheck = () => {
+    if (released || disposed || observationFailed || recheckTimer !== undefined) return;
+    recheckTimer = setTimeout(() => {
+      recheckTimer = undefined;
+      if (released || disposed) return;
+      // Notification-independent observation of the release authority only. A
+      // pending force request keeps its exact watch-path receipt accounting and
+      // is never consumed or replayed here, and no elapsed duration releases.
+      const request = readValidatedRequest();
+      if (request && request.action === 'release') {
+        acceptRelease(request.requestId);
+        return;
+      }
+      scheduleRecheck();
+    }, RELEASE_RECHECK_INTERVAL_MS);
+    // A retained owner must not hold the event loop with its own fallback read;
+    // the watch handle and Main's real handles remain the only things holding it.
+    if (typeof recheckTimer.unref === 'function') recheckTimer.unref();
+  };
+
+  /**
+   * Keep a failed owner alive on purpose. Closing or unrefing every handle here
+   * would let Node exit zero with the runner result already published, which
+   * would hide the observation failure - including one that arrives after that
+   * result was written. This handle is ref'd, never cleared, and does no work: it
+   * exists only so the parent's failure path settles the owner.
+   */
+  const retainFailedOwner = () => {
+    if (retentionTimer !== undefined) return;
+    retentionTimer = setInterval(() => { /* retained owner: no authority, no exit */ },
+      FAILED_OBSERVATION_RETENTION_INTERVAL_MS);
+  };
+
   const watcher = fs.watch(path.dirname(controlPath), (_event, filename) => {
     if (filename === null || filename.toString() === path.basename(controlPath)) poll();
   });
   watcher.on('error', () => {
+    // An explicit failure is sticky for the life of this owner and is never
+    // rewritten into a clean release: the durable re-examination stops, the
+    // notification path stops accepting releases (while `force` accounting stays
+    // exactly as before), the failure stays recorded in the durable journal and in
+    // the sticky observation state, and a live handle retains the owner until the
+    // parent's failure path settles it. Only a silent missed notification is what
+    // the bounded re-examination recovers.
+    observationFailed = true;
     ptyObservation.noteObservationFailure();
     appendJournal(journalPath, { type: 'pty_observation_failed', operation: 'parent-control-watch' });
-    // Retain this owner: a broken observation channel grants no exit authority.
+    stopRecheck();
+    retainFailedOwner();
   });
   poll();
   return {
     async waitForRelease() {
       poll();
-      if (!released) await releasePromise;
+      if (!released && !observationFailed) scheduleRecheck();
+      // A failed observation never resolves this wait, so the runner never reaches
+      // its natural exit and never restates an exit status.
+      await releasePromise;
     },
     dispose() {
+      disposed = true;
+      stopRecheck();
       watcher.close();
+      // The failed-observation retention handle is deliberately left running:
+      // dispose is only reachable after a resolved wait, which a failed
+      // observation can never produce.
     },
   };
 }
@@ -277,20 +375,24 @@ async function main() {
   process.exitCode = status;
 }
 
-void main().catch(async () => {
-  try {
-    fs.writeFileSync(process.env.PRG_SESSION_HOST_SAVED_MAIN_RESULT, `${JSON.stringify({
-      status: 1,
-      threw: true,
-      before: null,
-      after: null,
-    })}\n`, { mode: 0o600 });
-  } catch {
-    // The parent reports a missing result through its exact outer PTY handle.
-  }
-  if (parentControl) {
-    try { await parentControl.waitForRelease(); } catch { /* exact parent-control loop only */ }
-    parentControl.dispose();
-  }
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  void main().catch(async () => {
+    try {
+      fs.writeFileSync(process.env.PRG_SESSION_HOST_SAVED_MAIN_RESULT, `${JSON.stringify({
+        status: 1,
+        threw: true,
+        before: null,
+        after: null,
+      })}\n`, { mode: 0o600 });
+    } catch {
+      // The parent reports a missing result through its exact outer PTY handle.
+    }
+    if (parentControl) {
+      try { await parentControl.waitForRelease(); } catch { /* exact parent-control loop only */ }
+      parentControl.dispose();
+    }
+    process.exitCode = 1;
+  });
+} else {
+  module.exports = { startParentControl };
+}

@@ -484,7 +484,11 @@ async function waitForProvider(
   description: string,
   timeoutMs = EVENT_TIMEOUT_MS,
 ): Promise<ProviderJournalRecord[]> {
-  await signal.waitFor(() => predicate(providerJournalRecords(path)), timeoutMs, description);
+  // `providerJournalRecords` re-reads the durable provider journal on every
+  // evaluation, and this dedicated signal's only live trigger is the owned
+  // directory `fs.watch`, so readiness uses the shared durable recheck with the
+  // caller's unchanged predicate, deadline, and description.
+  await signal.waitForRecheck(() => predicate(providerJournalRecords(path)), timeoutMs, description);
   return providerJournalRecords(path);
 }
 
@@ -688,7 +692,7 @@ test("real public Main shares native pending notice/question details and preserv
     assert.ok(session.record.activeTools?.includes("AskUserQuestion"), `${session.rowProbe} admitted the real AskUserQuestion tool`);
   }
 
-  await providerSignal.waitFor(
+  await providerSignal.waitForRecheck(
     () => providerJournalRecords(providerJournalFile).filter((record) => record.event === "auto_model_selected").length >= 2,
     EVENT_TIMEOUT_MS,
     "both independent native sessions selected the local scripted faux model",

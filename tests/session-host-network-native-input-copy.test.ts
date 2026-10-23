@@ -29,6 +29,7 @@ import {
   InstanceManager,
   type InstanceManagerOptions,
   type InstancePty,
+  type NativeViewerInputResult,
 } from "../src/session-host/instances";
 import {
   createNativeClipboardReceiver,
@@ -83,6 +84,7 @@ import type { SessionHostBootstrap } from "../src/session-host/protocol";
 import { admitSavedSession, listSavedSessions, type SavedSessionAdmission } from "../src/session-host/saved-sessions";
 import { stripGeneratedSgr, type TerminalSurface } from "../src/session-host/terminal-surface";
 import { skipOrFail } from "./bridge-fakes";
+import { terminalInputModesAgree } from "./helpers/session-host-input-mode-precondition";
 import { ChangeSignal, compileAndStageCandidate, makeNativeAgentRoot } from "./helpers/session-host-native-main-harness";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import {
@@ -720,6 +722,12 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const ownerDelivered: NativeClipboardEvent[] = [];
     const ownerDiagnostics: SessionContentHostDiagnosticCode[] = [];
     const viewerDiagnostics: string[] = [];
+    // Bounded test-only witness of the first EIGHT closed outcomes this case's own
+    // public owning-host service seam returned for a viewer input attempt, so a
+    // failure can tell an actual manager refusal reason apart from a host refusal
+    // raised before the provider was consulted. Status and refusal reason only: never
+    // a source, token, bytes, payload, frame, or raw error text.
+    const viewerInputOutcomes: NativeViewerInputResult[] = [];
 
     try {
       // ONE owned watcher for the whole case, armed before the owned child starts so
@@ -749,6 +757,23 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
         },
         teardownRequested: () => false,
       });
+      // Test-only interposer on THIS fixture's own service object, installed before
+      // the content endpoint resolves its provider. It keeps the original public
+      // method bound to the same service receiver, forwards the same arguments exactly
+      // once, catches nothing, and returns the original result object unchanged; only
+      // that closed result's status (and refusal reason) is appended, capped at eight.
+      // No manager, surface, or native Pi internals are patched and no extra read,
+      // wait, callback, or budget is introduced.
+      const forwardViewerInput = service.writeViewerInput.bind(service);
+      service.writeViewerInput = (viewerId, request) => {
+        const outcome = forwardViewerInput(viewerId, request);
+        if (viewerInputOutcomes.length < 8) {
+          if (outcome.status === "refused") viewerInputOutcomes.push({ status: "refused", reason: outcome.reason });
+          else if (outcome.status === "submitted") viewerInputOutcomes.push({ status: "submitted" });
+          else viewerInputOutcomes.push({ status: "unknown" });
+        }
+        return outcome;
+      };
       service.openManager({
         packageRoot: candidate.root, piExecutable: cli, statusRegistrar: statusBroker,
       } as InstanceManagerOptions);
@@ -906,13 +931,27 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       await withTimeout(liveViewer.ready, 5_000, "the viewer never received its exact subscribed acknowledgement");
 
       leg = "known native tuple, run, row, geometry, and viewer commitment before any gesture";
+      // A frame opening after publication can withhold live mouse reporting without
+      // changing the source facts. Require mode agreement within this existing
+      // preflight, not just a matching tuple. Also require the fixture's own backend
+      // probe to be present before accepting that observation; retain every separate
+      // clipboard-isolation assertion below. This is fixture setup, not a product
+      // policy or a promise against later changes: stale input is still refused,
+      // never retried, and no wait or deadline is added.
+      const viewerModesMatchOwner = (): boolean => {
+        const snapshot = liveViewer.readSnapshot();
+        return snapshot !== undefined
+          && terminalInputModesAgree(snapshot.meta.inputModes, liveManager.surface(rowId)?.inputModes());
+      };
       await signal.waitFor(() => {
         if (commit === null) return false;
         const current = commit.source;
         return current.hostRunId === hostRunId
           && current.sessionId === rowId
           && current.nativeSession.sessionId === admission.sessionId
-          && current.nativeSession.epoch === resumed.epoch;
+          && current.nativeSession.epoch === resumed.epoch
+          && readBackendProof() !== null
+          && viewerModesMatchOwner();
       }, 20_000, "the owner stated a source for this exact run, row, and resumed native tuple");
       // The commit is written by a publish callback. Read it through a typed accessor so
       // the outer flow never narrows the callback-only assignment to its `null`
@@ -1026,7 +1065,14 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
         assert.ok(snapshot, "the viewer still holds its current viewport");
         return snapshot.meta.inputModes;
       };
-      /** The committed source and modes, proven current against the live owner facts. */
+      /**
+       * The committed source (proven against the endpoint's own current source, the
+       * run, the resumed tuple, and the manager's canonical geometry) and the modes
+       * from the viewer's current published snapshot. The preflight above required the
+       * published modes to equal the live owner's own modes before the first gesture;
+       * a mode change after this read is still caught by the owner's fence, which
+       * refuses rather than accepting the older observation.
+       */
       const gestureSource = (): { source: NativeIoSource; modes: SessionContentSnapshot["meta"]["inputModes"] } => {
         const committed = readCommit();
         assert.ok(committed, "a written snapshot commit exists for the current viewport");
@@ -1420,6 +1466,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
             ownerDelivered: ownerDelivered.map((event) => event.kind),
             ownerDiagnostics,
             viewerDiagnostics,
+            viewerInputOutcomes,
             wireTypes: attachment === undefined ? null
               : attachment.wire.frames.reduce<Record<string, number>>((counts, frame) => {
                 counts[frame.type] = (counts[frame.type] ?? 0) + 1;

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync as readBytesSync, realpathSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import test from "node:test";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   DEFAULT_INSTANCE_COLS,
@@ -33,6 +34,7 @@ import {
   type NativeViewerClipboardSink,
   type NativeViewerInputRefusal,
   type NativeViewerInputRequest,
+  type NativeViewerInputResult,
   type NativeViewerInputSource,
   type PtyFactory,
   type StatusRegistrar,
@@ -72,7 +74,7 @@ import {
 } from "../src/session-host/native-clipboard";
 import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "../src/session-host/startup-request";
 import { readSessionHostPayloadSync } from "../src/session-host/payload";
-import { TerminalSurface } from "../src/session-host/terminal-surface";
+import { TerminalSurface, type TerminalInputModes } from "../src/session-host/terminal-surface";
 import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "../src/session-host/kitty-graphics";
 import type {
   StatusBroker,
@@ -108,6 +110,7 @@ import {
   registerReviewActivitySource,
   __test as reviewActivityTest,
 } from "../src/activation/review-activity";
+import { terminalInputModesAgree } from "./helpers/session-host-input-mode-precondition";
 
 /**
  * Focused component tests for the independent owned-PTY instance lifecycle.
@@ -4857,6 +4860,160 @@ function geometryOf(harness: FramingHarness, row: FramingRow): { cols: number; r
   assert.ok(geometry, "the row still has canonical geometry");
   return geometry;
 }
+
+/** Pi 1.3.0's documented default `app.message.copy` binding (Ctrl+X). */
+const CTRL_X = "\x18";
+/**
+ * One ordinary child VT negotiation of a fully negotiated input-mode state: Kitty
+ * flags 7, mouse tracking `any` with SGR encoding, bracketed paste on. Nothing
+ * here queries, so the negotiation itself writes nothing to the child.
+ */
+const NEGOTIATE_VIEWER_INPUT_MODES = "\x1b[>7u\x1b[?1003h\x1b[?1006h\x1b[?2004h";
+/** Native synchronized output: the child begins, then ends, one held frame. */
+const SYNC_FRAME_BEGIN = "\x1b[?2026h";
+const SYNC_FRAME_END = "\x1b[?2026l";
+/** Exactly what `NEGOTIATE_VIEWER_INPUT_MODES` leaves the row in. */
+const VIEWER_FENCED_MODES: TerminalInputModes = {
+  kittyFlags: 7,
+  applicationCursorKeys: false,
+  applicationKeypad: false,
+  bracketedPaste: true,
+  mouseTracking: "any",
+  modifyOtherKeys: 0,
+  mouseEncoding: "sgr",
+};
+
+test("the input-mode precondition helper compares every field and never accepts an absent observation", () => {
+  // One alternate value per live mode field. A consumer that ignored one field, or
+  // that inverted acceptance for a missing observation, fails here in both
+  // directions, and the completeness assertion below fails if a new mode field ever
+  // goes untested.
+  const mismatches: Array<{ field: keyof TerminalInputModes; override: Partial<TerminalInputModes> }> = [
+    { field: "kittyFlags", override: { kittyFlags: 6 } },
+    { field: "applicationCursorKeys", override: { applicationCursorKeys: true } },
+    { field: "applicationKeypad", override: { applicationKeypad: true } },
+    { field: "bracketedPaste", override: { bracketedPaste: false } },
+    { field: "mouseTracking", override: { mouseTracking: "drag" } },
+    { field: "modifyOtherKeys", override: { modifyOtherKeys: 2 } },
+    { field: "mouseEncoding", override: { mouseEncoding: "default" } },
+  ];
+  assert.deepEqual(mismatches.map((entry) => entry.field).sort(), Object.keys(VIEWER_FENCED_MODES).sort(),
+    "every live input-mode field has a mismatch case");
+  assert.equal(terminalInputModesAgree(VIEWER_FENCED_MODES, { ...VIEWER_FENCED_MODES }), true,
+    "an identical observation is current");
+  for (const { field, override } of mismatches) {
+    const other = { ...VIEWER_FENCED_MODES, ...override };
+    assert.notDeepEqual(other, VIEWER_FENCED_MODES, `the ${field} case really differs in that one field`);
+    assert.equal(terminalInputModesAgree(VIEWER_FENCED_MODES, other), false,
+      `a ${field} difference is never agreement`);
+    assert.equal(terminalInputModesAgree(other, VIEWER_FENCED_MODES), false,
+      `a ${field} difference is never agreement in the other direction either`);
+  }
+  assert.equal(terminalInputModesAgree(VIEWER_FENCED_MODES, undefined), false,
+    "a row with no readable current modes is never agreement");
+  assert.equal(terminalInputModesAgree(undefined, VIEWER_FENCED_MODES), false,
+    "a missing captured observation is never agreement");
+  assert.equal(terminalInputModesAgree(undefined, undefined), false,
+    "two absent observations are not agreement");
+});
+
+test("the input-mode fence alone refuses a no-change held frame that every other viewer precondition still passes", async () => {
+  // IMPORTANT EVIDENCE SCOPE: synthetic PTY and synthetic registrar only, like the
+  // rest of this file. Each leg proves the HOST-side fence on its own fresh row:
+  // a native synchronized frame withholds mouse packet authorization without
+  // changing one fact the observed source describes, so a fixture that only
+  // re-checks the source would still admit the gesture while the manager correctly
+  // refuses it and writes nothing. No real child, native Pi, or physical clipboard
+  // is involved, and no leg proves anything about a mode change after the send.
+  const legs: Array<{
+    name: string;
+    /** Held-frame bytes delivered AFTER this leg captured its observation. */
+    hold: "none" | "begin" | "begin-and-end";
+    /** Whether the captured observation is still current against the live row. */
+    agrees: boolean;
+    /** The live row's mouse packet authorization at the attempt. */
+    mouseTracking: TerminalInputModes["mouseTracking"];
+    expected: NativeViewerInputResult;
+    writes: number;
+  }> = [
+    { name: "baseline", hold: "none", agrees: true, mouseTracking: "any", expected: { status: "submitted" }, writes: 1 },
+    {
+      name: "held", hold: "begin", agrees: false, mouseTracking: "none",
+      expected: { status: "refused", reason: "stale-input-modes" }, writes: 0,
+    },
+    { name: "committed", hold: "begin-and-end", agrees: true, mouseTracking: "any", expected: { status: "submitted" }, writes: 1 },
+  ];
+  for (const leg of legs) {
+    // One fresh fixture per leg, so no leg inherits another leg's frame or refusal.
+    const harness = makeFramingHarness(`viewer-mode-hold-${leg.name}`, { framing: true });
+    try {
+      const row = await createFramingRow(harness);
+      await markReady(harness, row);
+      reportConversation(row, VIEWER_SESSION, 7);
+      const bound = boundSurface(harness.manager);
+      displayRow(harness.manager, bound.viewerId, row.id);
+      await deliver(harness, row, NEGOTIATE_VIEWER_INPUT_MODES);
+      const surface = harness.manager.surface(row.id);
+      assert.ok(surface, "a live row exposes its own terminal surface");
+      const capturedModes = surface.inputModes();
+      assert.deepEqual(capturedModes, VIEWER_FENCED_MODES,
+        `the ${leg.name} leg negotiated exactly the mode state it captured`);
+      const capturedSource = conversationSourceOf(harness.manager, bound.viewerId);
+      assert.ok(capturedSource, "the surface has this row's conversation source");
+      assert.equal(terminalInputModesAgree(capturedModes, surface.inputModes()), true,
+        "the captured observation starts out current against the live row");
+
+      if (leg.hold !== "none") await deliver(harness, row, SYNC_FRAME_BEGIN);
+      if (leg.hold === "begin-and-end") await deliver(harness, row, SYNC_FRAME_END);
+
+      // Every source fact the same fence also checks is untouched by a no-change
+      // frame, so the old tuple/geometry/source precondition still passes here.
+      assert.equal(isDeepStrictEqual(conversationSourceOf(harness.manager, bound.viewerId), capturedSource), true,
+        `a held frame changed no fact the ${leg.name} source describes`);
+      assert.equal(terminalInputModesAgree(capturedModes, surface.inputModes()), leg.agrees,
+        `the live row's modes still match the captured observation (${leg.name})`);
+      assert.equal(surface.inputModes().mouseTracking, leg.mouseTracking,
+        `only mouse packet authorization moved during the ${leg.name} leg`);
+      for (const field of ["kittyFlags", "applicationCursorKeys", "applicationKeypad",
+        "bracketedPaste", "modifyOtherKeys", "mouseEncoding"] as const) {
+        assert.equal(surface.inputModes()[field], capturedModes[field],
+          `the ${field} mode the bytes were made for is unchanged (${leg.name})`);
+      }
+      assert.deepEqual(surface.requestedMouseReporting(), { mouseTracking: "any", mouseEncoding: "sgr" },
+        `the child's requested mouse reporting is unchanged in the ${leg.name} leg`);
+
+      // ONE input attempt per leg, made with this leg's own captured observation.
+      const writesBefore = row.pty.writes.length;
+      assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId, {
+        expectedSource: capturedSource, expectedInputModes: capturedModes, data: CTRL_X,
+      }), leg.expected, `the manager's own fence answers the ${leg.name} leg`);
+      assert.equal(row.pty.writes.length - writesBefore, leg.writes,
+        `exactly the admitted dispatch reaches the child (${leg.name})`);
+      if (leg.writes === 1) {
+        const frame = lastViewerFrame(row);
+        assert.equal(frame.text === CTRL_X, true, "the copy key travelled exactly as sent");
+        assert.equal(frame.origin.kind === "viewer" && frame.origin.token === capturedSource.sourceToken, true,
+          "the dispatch retains this viewer's origin without exposing its token");
+        assert.equal(frame.tuple?.sessionId === VIEWER_SESSION && frame.tuple.epoch === 7, true,
+          "the dispatch retains this conversation fence");
+      }
+      if (leg.hold === "begin") {
+        // Ending the held frame is the only change: the same observation is current
+        // again, which localizes the refusal to the hold itself and not to some mode
+        // the frame bytes negotiated.
+        await deliver(harness, row, SYNC_FRAME_END);
+        assert.equal(terminalInputModesAgree(capturedModes, surface.inputModes()), true,
+          "the refusal was the hold, not any mode the frame changed");
+      }
+    } finally {
+      try {
+        await disposeFramingHarness(harness);
+      } finally {
+        rmSync(harness.root, { recursive: true, force: true });
+      }
+    }
+  }
+});
 
 test("a viewer-origin copy reaches exactly the viewer whose input caused it", async () => {
   const routed: { instanceId: string; event: NativeClipboardEvent }[] = [];

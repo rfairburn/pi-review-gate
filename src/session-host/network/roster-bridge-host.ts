@@ -71,9 +71,9 @@
  * alternates fairly with roster frames. While the slot is held, Saved control
  * work is bounded: one accepted result, one waiting refusal (further refusals are
  * dropped), and one coalesced policy publication read live at dispatch. Delete is
- * admitted only while the live policy says it is exposed, and the guard handed to
- * the provider repeats a reentrancy-stable proof of it; a delete that already
- * completed is reported truthfully under the still-current transport and run
+ * admitted only while the live policy says it is exposed. The provider's guard
+ * repeats independent authorization, not that preference decision; completed
+ * deletion is reported truthfully under the still-current transport and run
  * authorization.
  */
 
@@ -224,9 +224,9 @@ export interface RosterBridgeHostOptions {
    */
   readonly savedCatalogView?: OwnerSavedCatalogViewFactory;
   /**
-   * The owner/server's LIVE remote-history delete exposure. It is read at every
-   * delete decision and policy publication; `false`, a throw, or any non-`true`
-   * value means no delete exposure and no delete acceptance. There is no
+   * The owner/server's LIVE remote-history delete exposure. It is read once at
+   * admission of each delete/prepare, and for policy publication; `false`, a throw,
+   * or any non-`true` value means no delete exposure or acceptance. There is no
    * permissive default here.
    */
   readonly remoteHistoryDeleteExposed?: OwnerRemoteHistoryDeletePolicy;
@@ -267,9 +267,9 @@ export interface RosterBridgeHost {
   stopAll(): Promise<void>;
   /**
    * Re-read the live delete policy and publish it to every existing binding that
-   * negotiated Saved and has a current owner run. Description only: every delete
-   * is still re-checked against the live policy. Optional so hosts and test
-   * doubles without Saved remain representable.
+   * negotiated Saved and has a current owner run. Description only: each new
+   * delete/prepare is independently gated at owner admission. Optional so hosts
+   * and test doubles without Saved remain representable.
    */
   notifySavedPolicy?(): void;
 }
@@ -391,8 +391,6 @@ class OwnerBinding implements RosterBridgeChannelBinding {
   #savedPolicyDirty = false;
   /** Bumped by each policy dispatch so a stale reentrant read never wins. */
   #policyGeneration = 0;
-  /** Bumped by every policy notification; a delete proof spanning one fails closed. */
-  #policyEpoch = 0;
   /** The last policy description handed to the transport for the current run. */
   #policySent: { readonly hostRunId: string; readonly deleteExposed: boolean } | null = null;
   #installing = false;
@@ -962,8 +960,6 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    * reading the live policy at the moment it is actually written.
    */
   notifySavedPolicy(): void {
-    // Any delete proof that spans this notification is no longer stable.
-    this.#policyEpoch += 1;
     if (!this.#savedNegotiated()) return;
     this.#savedPolicyDirty = true;
     this.#drain();
@@ -1008,26 +1004,6 @@ class OwnerBinding implements RosterBridgeChannelBinding {
   }
 
   /**
-   * The combined delete proof: transport, binding, exact run, AND the live server
-   * delete policy, stable across every callout it makes.
-   *
-   * The authorizer and the policy are both arbitrary owner code and may change
-   * each other. The policy is therefore read both before and after the final
-   * authorizer callout, any policy notification during the whole proof (captured
-   * by the policy epoch) fails it closed, and the binding/run are re-proved last
-   * without another callout. An exposure that turned Off at any point inside the
-   * proof can never yield `true`.
-   */
-  #deleteStillAuthorized(hostRunId: string): boolean {
-    const epoch = this.#policyEpoch;
-    if (!this.#savedStillAuthorized(hostRunId)) return false;
-    if (!this.#readDeleteExposed()) return false;
-    if (!this.#savedStillAuthorized(hostRunId)) return false;
-    if (!this.#readDeleteExposed()) return false;
-    return epoch === this.#policyEpoch && this.#createBindingIsLive() && this.#savedRunCurrent(hostRunId);
-  }
-
-  /**
    * Admit one Saved request, answer it with a fixed refusal, or say nothing.
    *
    * Admission mirrors create: negotiated capability, unfenced post-hello channel,
@@ -1037,9 +1013,9 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    * operation is pending per channel: a newer read supersedes an older read, and
    * anything else that collides is refused `busy` without touching the accepted
    * operation or its eventual result. The request must name the exact run of this
-   * binding's live subscription. A delete additionally needs the live server
-   * policy to say "exposed" right now. Every injected callback (authorizer,
-   * policy, factory, abort listener) is followed by a fresh re-proof.
+   * binding's live subscription. Each delete/prepare reads the owner's current
+   * policy once at admission. Later preference changes do not revoke that
+   * request; independent binding, run, and grant proofs remain live after callouts.
    */
   #onSavedRequest(frame: RosterBridgeSavedRequestFrame): void {
     if (this.#state === "finished") return;
@@ -1080,17 +1056,21 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       return;
     }
     if (frame.type === "saved_delete_request") {
-      const exposed = this.#deleteStillAuthorized(hostRunId);
+      const exposed = this.#readDeleteExposed();
       // The policy and authorizer callbacks are arbitrary owner code: re-prove the
       // binding after them before any write, and report the run honestly.
       if (!this.#savedBindingAuthorized()) {
         this.#diagnostic("saved_refused");
         return;
       }
+      if (!this.#savedRunCurrent(hostRunId)) {
+        this.#writeSavedRefusal(frame, "stale");
+        return;
+      }
       if (!exposed) {
         // A capability, a stale viewer description, or a confirmation never
         // overrides the live server policy.
-        this.#writeSavedRefusal(frame, this.#savedRunCurrent(hostRunId) ? "policy" : "stale");
+        this.#writeSavedRefusal(frame, "policy");
         return;
       }
     }
@@ -1129,15 +1109,12 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     const op: SavedOp = Object.freeze({ kind, frame, controller: read ? new AbortController() : null });
     this.#savedOp = op;
     this.#diagnostic("saved_accepted");
-    // The minimal re-proof handed to EVERY provider operation. For delete it is the
-    // full, reentrancy-stable delete proof, so the provider can re-check before
-    // each trash/unlink and after its own callouts. For a read it also requires
-    // that this read was not superseded. It is a check, never a lease.
-    const guard: OwnerSavedAuthorizationGuard = kind === "delete"
-      ? () => this.#deleteStillAuthorized(hostRunId)
-      : kind === "read"
-        ? () => this.#savedOp === op && this.#savedStillAuthorized(hostRunId) && this.#savedOp === op
-        : () => this.#savedStillAuthorized(hostRunId);
+    // Live independent authorization remains required before provider work and
+    // protected effects, including trash/unlink. Delete preference was decided
+    // once above, not leased or re-read here. A read must also not be superseded.
+    const guard: OwnerSavedAuthorizationGuard = kind === "read"
+      ? () => this.#savedOp === op && this.#savedStillAuthorized(hostRunId) && this.#savedOp === op
+      : () => this.#savedStillAuthorized(hostRunId);
     void Promise.resolve()
       .then(() => {
         // Re-proved inside the detached continuation, immediately before the call.

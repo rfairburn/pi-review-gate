@@ -1236,13 +1236,19 @@ The owner's own local focus, Main owner, and drafts are unchanged.
 Network setting. This is the owner host's own exposure policy, on by default, with an
 explicit Off remembered. It is independent of the viewer's Remote input/copy setting.
 It is not a viewer-side delete control, and it does not gate the owner's own Local Saved
-deletion. The policy a viewer sees is a description, not a grant. While it is unknown or
-Off, the viewer hides the delete hint and the owner refuses both the prepare and the
-confirmed request. The viewer uses the same full-file confirmation, warning, fitting,
-and paste guards as a Local delete, labelled with the owner host. At the moment of
-removal, the owner rechecks its live policy, the channel, and its saved-file facts. A
-policy change is reported without waiting for a roster refresh, and a deletion that
-already completed is still reported truthfully if the policy is later turned Off. The
+deletion. The policy a viewer sees is a description, not a grant. Unknown or Off hides
+its delete hint and blocks prepare/Delete at admission and the actual queued send.
+On permits sending only with the normal written target, confirmation, and live guards.
+The owner independently reads its own current policy once when each incoming request
+is admitted: Off refuses before provider work; On allows that request to continue
+through the independent authorization and saved-file checks. Prepare and confirmed
+Delete are separate requests. A later preference change does not revoke an admitted
+request, and Off followed by On wholly before sending does not retire a still-owned
+intent or confirmation. A refused send is never retried or reopened automatically.
+The viewer uses the same full-file confirmation, warning, fitting, and paste guards as
+a Local delete, labelled with the owner host. At removal, the owner still rechecks the
+channel, grant, run, and saved-file facts. Policy changes are described without waiting
+for a roster refresh, and completed deletions are always reported truthfully. The
 owner keeps its existing Local deletion behavior. It tries native `trash` first and
 falls back to permanent unlink, and a conversation whose workspace is missing can still
 be deleted. Live, unknown, or current-file conversations owned by the owner's children

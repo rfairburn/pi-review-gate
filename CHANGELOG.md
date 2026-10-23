@@ -125,10 +125,13 @@ dates.
 - A separate remembered OWNER-side Network setting, **Allow remote history deletion**
   (#389): whether this host exposes remote saved-history deletion to its paired viewers.
   It is on by default and an explicit Off survives restarts; it is not a viewer-side delete
-  toggle and does not gate this host's own local Saved deletion. The owner reads the live
-  value at every remote Saved delete decision, independently of any viewer's Remote
-  input/copy setting; an Off or unknown policy hides delete on viewers and refuses both
-  prepare and confirmed requests. Both new settings are optional
+  toggle and does not gate this host's own local Saved deletion. The viewer checks the
+  owner's current positive description at admission and actual queued send. The owner
+  reads its own current value once per incoming prepare or confirmed request, refusing
+  Off or unknown before provider work, independently of any viewer's Remote input/copy
+  setting. Later preference flips alone do not revoke an admitted request, and Off then
+  On before sending preserves a still-owned intent or confirmation without retrying a
+  refused attempt. Independent authorization and file guards remain live. Both new settings are optional
   fields of the existing version-1 protected preferences document; malformed values or
   unavailable storage are refused untouched and never treated as the default-on values.
 - A TLS/WSS peer-transport foundation with KDE-style explicit device pairing (#475).

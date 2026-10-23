@@ -68,7 +68,31 @@ import {
   type PeerCreateController,
   type PeerCreateResult,
 } from "./network/peer-create";
-import type { PeerCoordinator, PeerConsentPresentation, PeerUiCommand, PeerUiSnapshot } from "./peer-ui-protocol";
+import { createNativeSavedCatalogView, type NativeSavedCatalogReadOptions } from "./network/native-saved-provider";
+import {
+  isOwnerSavedDeleteFacts,
+  isOwnerSavedResumeFacts,
+  isOwnerSavedWindowFacts,
+  type OwnerSavedDeleteFacts,
+  type OwnerSavedResumeFacts,
+  type OwnerSavedWindowFacts,
+  type PeerCoordinatorWithSaved,
+  type PeerSavedController,
+  type PeerSavedNotSentReason,
+  type PeerSavedResult,
+} from "./network/peer-saved";
+import type {
+  PeerCoordinator,
+  PeerConsentPresentation,
+  PeerSavedUiDeleteIntent,
+  PeerSavedUiDeletePrepareIntent,
+  PeerSavedUiListIntent,
+  PeerSavedUiResumeIntent,
+  PeerSavedUiSearchIntent,
+  PeerSavedUiWindowIntent,
+  PeerUiCommand,
+  PeerUiSnapshot,
+} from "./peer-ui-protocol";
 import { isValidNativeSessionId } from "./protocol";
 import {
   createLocalOwningHostService,
@@ -108,6 +132,8 @@ import {
   isSavedSessionCatalog,
   listSavedSessions,
   searchSavedSessions,
+  type ListSavedSessionsOptions,
+  type SavedCatalogFreshnessScope,
   type SavedSessionCatalog,
   type SavedSessionDeletionRefusalReason,
   type SavedSessionRefusalReason,
@@ -119,6 +145,11 @@ import {
   CREATE_ON_PEER_OTHER_RUN_NOTICE,
   CREATE_ON_PEER_UNCERTAIN_NOTICE,
   CREATE_ON_PEER_UNWRITTEN_NOTICE,
+  REMOTE_SAVED_DELETE_OFF_NOTICE,
+  REMOTE_SAVED_OTHER_RUN_NOTICE,
+  REMOTE_SAVED_UNCERTAIN_NOTICE,
+  REMOTE_SAVED_UNSUPPORTED_NOTICE,
+  REMOTE_SAVED_UNWRITTEN_NOTICE,
   type SidebarAction,
   type SidebarCreateFormPresentation,
   type SidebarFieldFactoryOptions,
@@ -126,6 +157,7 @@ import {
   type SidebarMainOwnerKey,
   type SidebarMousePresentation,
   type SidebarRemoteCloseRow,
+  type SidebarSavedPickerPresentation,
 } from "./sidebar";
 import type { TerminalFrame, TerminalInputModes, TerminalMouseReportingRequest } from "./terminal-surface";
 import type { NativeClipboardEvent } from "./native-clipboard";
@@ -240,6 +272,43 @@ const CREATE_ON_PEER_REFUSED_MESSAGE =
   "The remote host did not accept that create; nothing was started";
 /** One wording source for uncertainty: the sidebar's own fixed notice. */
 const CREATE_ON_PEER_UNKNOWN_MESSAGE = CREATE_ON_PEER_UNCERTAIN_NOTICE;
+/**
+ * Fixed, bounded notices for the selected-host Saved picker's requests. Each
+ * says only what this side knows: a request that was never sent, an owner fact,
+ * or an outcome this side cannot observe. Nothing claims a local change, a
+ * retry, a cancellation, or a path, and no raw error text is ever shown.
+ */
+const REMOTE_SAVED_CONTROLLER_MISSING_MESSAGE =
+  "This host cannot browse another host's Saved history; nothing was requested";
+const REMOTE_SAVED_BUSY_MESSAGE =
+  "Another Saved request to that host is still in progress; nothing was sent";
+const REMOTE_SAVED_CONFIRMATION_CHANGED_MESSAGE =
+  "The delete confirmation changed or is not displayed; nothing was deleted";
+const REMOTE_SAVED_NOT_SENT_MESSAGE =
+  "That host is not ready or no longer addressable; nothing was sent";
+const REMOTE_SAVED_STALE_MESSAGE =
+  "The remote Saved list changed; edit the query or choose the host again";
+const REMOTE_SAVED_UNAVAILABLE_MESSAGE =
+  "The remote host's Saved history is unavailable right now";
+const REMOTE_SAVED_READ_REFUSED_MESSAGE =
+  "The remote host did not return that part of its Saved list";
+const REMOTE_SAVED_READ_UNKNOWN_MESSAGE =
+  "The remote Saved list reply could not be confirmed; nothing was changed";
+const REMOTE_SAVED_RESUME_REFUSED_MESSAGE =
+  "The remote host did not start that saved conversation";
+const REMOTE_SAVED_RESUME_DUPLICATE_MESSAGE =
+  "That saved conversation is already open on its host";
+const REMOTE_SAVED_RESUME_UNCONFIRMED_MESSAGE =
+  "The remote host could not confirm that the conversation started; nothing was selected";
+const REMOTE_SAVED_RESUME_COMPLETED_MESSAGE = "Remote conversation resumed";
+const REMOTE_SAVED_DELETE_ACTIVE_MESSAGE =
+  "Close the Pi session using this conversation on its host before deleting its saved file";
+const REMOTE_SAVED_DELETE_REFUSED_MESSAGE =
+  "The remote host did not delete that saved file";
+const REMOTE_SAVED_DELETE_UNCONFIRMED_MESSAGE =
+  "UNCERTAIN: the remote host could not confirm the deletion; it was not re-sent";
+const REMOTE_SAVED_DELETE_RECONFIRM_MESSAGE =
+  "The remote host needs a fresh confirmation; nothing was deleted";
 const INPUT_DRAIN_MAX_MS = 250;
 const INPUT_DRAIN_IDLE_MS = 50;
 // One bounded readiness deadline for a just-spawned exited-row replacement:
@@ -435,13 +504,90 @@ function boundedOwnerKey(prefix: string, raw: string): string {
  */
 type MainPeerCoordinator = PeerCoordinator
   & Partial<Pick<PeerCoordinatorWithContent, "content">>
-  & Partial<Pick<PeerCoordinatorWithCreate, "ownerCreate">>;
+  & Partial<Pick<PeerCoordinatorWithCreate, "ownerCreate">>
+  & Partial<Pick<PeerCoordinatorWithSaved, "ownerSaved">>;
 
 interface SavedDeleteConfirmationFrame {
   readonly renderToken: number;
   readonly cols: number;
   readonly rows: number;
+  /**
+   * REMOTE Saved delete only: the exact owner target Main itself prepared (never
+   * a file path, caption, or token alone) plus the form-slot pane and Main epochs
+   * this dialog frame was composed under. A Local delete confirmation never
+   * carries it, and the Local delete path never accepts a frame that does.
+   */
+  readonly remote?: RemoteSavedDeleteFrameContext;
   settled: boolean;
+}
+
+/**
+ * The one owner Delete target Main prepared: the exact frozen picker, query
+ * revision, destination, owner run, and owner catalog/result/entry handles of a
+ * Delete-prepare the owner answered with `confirmation-required`. `serial` makes
+ * every new preparation (even of the same entry) a different confirmation source.
+ */
+interface RemoteSavedPrepared {
+  readonly serial: number;
+  readonly pickerId: number;
+  readonly revision: number;
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly catalogId: string;
+  readonly resultId: string;
+  readonly entryId: string;
+}
+
+interface RemoteSavedDeleteFrameContext {
+  readonly prepared: RemoteSavedPrepared;
+  readonly pane: HostPaneRect;
+  readonly epoch: number;
+  /** Semantic source identity of this remote confirmation (never a render token). */
+  readonly sourceKey: string;
+}
+
+/**
+ * One remote Saved picker frame Main handed the writer: the Sidebar's own frozen
+ * presentation (token, view epoch, picker, revision, destination, run, catalog,
+ * result, selection, drawn entry ids, pane size) plus the outer terminal size,
+ * the form-slot pane rectangle, and Main's remote Saved epoch it was composed
+ * under. It becomes a receipt only when the writer reports THIS frame written
+ * (or an unchanged repaint of this same already-settled frame).
+ */
+interface RemoteSavedPickerFrame {
+  readonly presentation: SidebarSavedPickerPresentation;
+  readonly terminalCols: number;
+  readonly terminalRows: number;
+  readonly pane: HostPaneRect;
+  readonly epoch: number;
+  settled: boolean;
+}
+
+/** The three remote Saved entry intents that need an actually-written admission. */
+type RemoteSavedEntryIntent = PeerSavedUiResumeIntent | PeerSavedUiDeletePrepareIntent | PeerSavedUiDeleteIntent;
+
+/** The three remote Saved read intents (latest-unsent-only; never a mutation). */
+type RemoteSavedReadIntent = PeerSavedUiListIntent | PeerSavedUiSearchIntent | PeerSavedUiWindowIntent;
+
+/**
+ * One immutable, ALREADY CONSUMED admission of a remote Saved entry intent. It
+ * was captured synchronously from an exact actually-written receipt and is the
+ * only thing a queued write may re-prove: the frozen intent, the outer terminal
+ * size and form-slot pane it was proved at, and Main's remote Saved epoch.
+ * Nothing here can be minted from a render, a callback, or returned owner facts.
+ */
+interface RemoteSavedAdmission {
+  readonly intent: RemoteSavedEntryIntent;
+  readonly terminalCols: number;
+  readonly terminalRows: number;
+  readonly pane: HostPaneRect;
+  readonly epoch: number;
+}
+
+/** The ONE submitted remote Saved request per destination (the raw channel's one pending). */
+interface RemoteSavedInflight {
+  readonly hostId: string;
+  readonly requestId: number;
 }
 
 interface PeerConsentConfirmationFrame extends PeerConsentPresentation {
@@ -669,12 +815,18 @@ interface MainDependencies {
    * content source) stays valid here and simply has no content controller.
    */
   readonly createPeerCoordinator: (options: PeerCoordinatorOptions) => MainPeerCoordinator;
-  /** Read-only listing of the shared native agent root's saved conversations. */
+  /**
+   * Read-only listing of the shared native agent root's saved conversations.
+   * `freshnessScope` is passed ONLY by the owner-side remote Saved view, so its
+   * catalogs never supersede (or are superseded by) the Local picker's; every
+   * Local listing omits it and keeps the default revision domain exactly.
+   */
   readonly listSavedCatalog: (options: {
     agentDir: string;
     piExecutable: string;
     expectedPiVersion: string;
     signal: AbortSignal;
+    freshnessScope?: SavedCatalogFreshnessScope;
   }) => Promise<SavedSessionCatalog>;
   readonly deleteSavedFile: typeof deleteSavedSessionFile;
   /**
@@ -1559,6 +1711,42 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   const savedListControllers = new Map<number, AbortController>();
   const savedOpenTasks = new Set<Promise<void>>();
   const deferredSavedOpens = new Map<number, { readonly file: string; readonly sessionId: string }>();
+  // --- Requester-side remote Saved (the selected owner host's Saved history). ---
+  /**
+   * The ONE submitted remote Saved request per destination, by identity. The raw
+   * metadata channel keeps one Saved operation pending, so Main never hands a
+   * destination a second request while one is outstanding; a different
+   * destination (a new picker) is never blocked by another host's accepted work.
+   */
+  const remoteSavedInflight = new Map<string, RemoteSavedInflight>();
+  /**
+   * The newest UNSENT remote read for the current picker, globally at most one.
+   * A newer read replaces it (the replaced one is retired silently in the
+   * Sidebar); it is never a queue, and a mutation is never parked here.
+   */
+  let remoteSavedQueuedRead: RemoteSavedReadIntent | undefined;
+  /** The remote Saved picker frame the last composition handed the writer. */
+  let remoteSavedPickerFrame: RemoteSavedPickerFrame | undefined;
+  /** The one owner Delete target Main prepared and the Sidebar opened a dialog for. */
+  let remoteSavedPrepared: RemoteSavedPrepared | undefined;
+  let remoteSavedPreparedSerial = 0;
+  /** Source key of the last ACTUALLY WRITTEN remote delete confirmation. */
+  let remoteSavedConfirmSettledKey: string | undefined;
+  /**
+   * Highest Sidebar request id Main has already admitted for a remote Saved
+   * entry intent. Sidebar ids are monotonic, so a duplicate (held Enter, a
+   * replayed DTO) can never be admitted twice.
+   */
+  let remoteSavedLastAdmittedRequestId = 0;
+  /**
+   * Main's remote Saved lifetime epoch. It advances on GENUINE authority
+   * changes only — an outer resize, an external-editor handoff, a visibility
+   * change, a change of the form-slot pane (cover, banner, layout), and teardown —
+   * never on an ordinary identical repaint, so a geometry A -> B -> A return can
+   * never revive a receipt or a queued admission.
+   */
+  let remoteSavedEpoch = 0;
+  let remoteSavedLayoutKey: string | undefined;
   // Terminal parser diagnostics (#428): a host-owned clearable warning plus a
   // private bounded log. Clearing the warning never touches the log.
   const diagnosticsWarning = new TerminalDiagnosticsWarning();
@@ -2100,6 +2288,23 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // path: the owner's own provider decides, and only a peer that negotiated
         // the optional capability can ever reach it.
         createOwnedSession,
+        // OWNER Saved serving: the real native Saved catalog view over the SAME
+        // owning-host service (its guarded Resume/Delete primitives and its
+        // non-mutating delete preparation) and the exact native listing inputs the
+        // Local picker uses, under the view's own freshness scope. The factory is
+        // never called here: the roster bridge creates at most one view per channel
+        // binding, lazily, after an authorized request, and pairs it with the
+        // coordinator's own live server delete policy. No manager, listing, store,
+        // or policy registry is created by handing it over.
+        savedCatalogViewFactory: () => createNativeSavedCatalogView({
+          host: hostService,
+          readCatalogOptions: readNativeSavedCatalogOptions,
+          listCatalog: listNativeSavedCatalog,
+        }),
+        // REQUESTER Saved use: the explicit opt-in that arms the one Saved
+        // controller. Both halves are independent of native input framing and of
+        // this viewer's own remote input/copy preference.
+        savedViewer: true,
         onChange: updatePeerUi,
         onIncomingConsentArrival: attemptIncomingPeerBell,
         onContentChange: handleContentChange,
@@ -2294,6 +2499,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         savedDeleteConfirmationFrame = undefined;
         sidebar.invalidateSavedDeleteConfirmationDisplay();
         layout = currentLayout;
+        noteRemoteSavedLayout(currentLayout);
         const view = findActiveView();
         const surface = view ? manager?.surface(view.id) : undefined;
         // Exactly ONE selected source is displayed: the local owner's own surface
@@ -2417,6 +2623,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // is captured the same way, so a remote submission can require the
         // writer's receipt for THIS frame rather than a later render.
         const createFormPresentation = sidebar.captureCreateFormPresentation();
+        // The remote Saved picker's own drawn frame (Local pickers have none),
+        // captured the same way beside this exact composition.
+        const savedPickerPresentation = sidebar.captureSavedPickerPresentation();
+        const formSlot = currentFormSlotRect(currentLayout);
         // Title only. Lifecycle, activity and input ownership belong below
         // session-card titles, never on the active conversation's title line. A
         // remote owner is identified by its own sanitized roster labels.
@@ -2499,9 +2709,43 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         }
         latestMousePresentation = mousePresentation;
         const activeSidebar = sidebar;
+        // A REMOTE Saved delete dialog carries the exact owner target Main itself
+        // prepared, the form-slot pane, and Main's epochs. A remote dialog that
+        // matches no prepared target gets no frame at all (it can never settle),
+        // and a Local dialog is exactly the existing frame with no remote context.
+        const remoteSavedDialog = savedDeleteRenderToken !== undefined && sidebar.savedRemoteContext() !== undefined;
+        const preparedTarget = remoteSavedPrepared;
+        const remoteDeleteContext: RemoteSavedDeleteFrameContext | undefined = remoteSavedDialog
+          && preparedTarget !== undefined && formSlot !== undefined
+          && remoteSavedContextMatchesPrepared(preparedTarget)
+          ? Object.freeze({
+            prepared: preparedTarget,
+            pane: Object.freeze({ column: formSlot.column, row: formSlot.row, cols: formSlot.cols, rows: formSlot.rows }),
+            epoch: remoteSavedEpoch,
+            sourceKey: JSON.stringify([
+              preparedTarget.serial, preparedTarget.pickerId, preparedTarget.revision, preparedTarget.hostId,
+              preparedTarget.hostRunId, preparedTarget.catalogId, preparedTarget.resultId, preparedTarget.entryId,
+              cols, rows, formSlot.column, formSlot.row, formSlot.cols, formSlot.rows,
+              remoteSavedEpoch,
+            ]),
+          })
+          : undefined;
+        // Identical bytes are not proof that this exact owner target was written:
+        // until this semantic source has an actual written receipt, every
+        // composition crosses the writer's own boundary.
+        if (remoteDeleteContext !== undefined && remoteDeleteContext.sourceKey !== remoteSavedConfirmSettledKey) {
+          writer.invalidate?.();
+        }
         const confirmationFrame: SavedDeleteConfirmationFrame | undefined = savedDeleteRenderToken === undefined
+          || (remoteSavedDialog && remoteDeleteContext === undefined)
           ? undefined
-          : { renderToken: savedDeleteRenderToken, cols, rows, settled: false };
+          : {
+            renderToken: savedDeleteRenderToken,
+            cols,
+            rows,
+            ...(remoteDeleteContext === undefined ? {} : { remote: remoteDeleteContext }),
+            settled: false,
+          };
         savedDeleteConfirmationFrame = confirmationFrame;
         const peerPresentation = sidebar.capturePeerConsentPresentation();
         let peerFrame: PeerConsentConfirmationFrame | undefined;
@@ -2581,6 +2825,37 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           }
         }
         createFormFrame = nextCreateFormFrame;
+        let nextSavedPickerFrame: RemoteSavedPickerFrame | undefined;
+        if (savedPickerPresentation !== undefined && formSlot !== undefined
+          && formSlot.cols === savedPickerPresentation.cols && formSlot.rows === savedPickerPresentation.rows) {
+          const previous = remoteSavedPickerFrame;
+          if (previous !== undefined
+            // The Sidebar keeps the same token for the identical drawn picker
+            // (same view epoch, picker, query, destination, run, catalog, result,
+            // selection, drawn entries, and pane), so an ordinary repaint at the
+            // same outer geometry and Main epoch keeps the receipt it earned.
+            && previous.presentation.renderToken === savedPickerPresentation.renderToken
+            && previous.terminalCols === cols
+            && previous.terminalRows === rows
+            && previous.epoch === remoteSavedEpoch
+            && samePaneGeometry(previous.pane, formSlot)) {
+            nextSavedPickerFrame = previous;
+          } else {
+            nextSavedPickerFrame = {
+              presentation: savedPickerPresentation,
+              terminalCols: cols,
+              terminalRows: rows,
+              pane: Object.freeze({ column: formSlot.column, row: formSlot.row, cols: formSlot.cols, rows: formSlot.rows }),
+              epoch: remoteSavedEpoch,
+              settled: false,
+            };
+            // A new owner source, host, query, result, selection, entry, or view
+            // epoch can compose identical bytes: force the writer's own boundary
+            // so only an ACTUAL write can become its receipt.
+            writer.invalidate?.();
+          }
+        }
+        remoteSavedPickerFrame = nextSavedPickerFrame;
         writer.submit(composed, cols, rows, (disposition: SessionHostFrameDisposition) => {
           // Retain what ACTUALLY completed writing, even when a newer identical
           // candidate is already queued: discarding the only real write would
@@ -2608,13 +2883,32 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             && (disposition === "written" || (disposition === "unchanged" && createFormFrame.settled))) {
             if (activeSidebar.settleCreateFormRender(createFormFrame.renderToken)) createFormFrame.settled = true;
           }
+          // The remote Saved picker receipt: ONLY an actual write of this exact
+          // frame, or an unchanged repaint of this same already-settled frame.
+          if (nextSavedPickerFrame !== undefined && remoteSavedPickerFrame === nextSavedPickerFrame
+            && isCurrentRemoteSavedPickerFrame(nextSavedPickerFrame)
+            && (disposition === "written" || (disposition === "unchanged" && nextSavedPickerFrame.settled))) {
+            if (activeSidebar.settleSavedPickerRender(nextSavedPickerFrame.presentation.renderToken)) {
+              nextSavedPickerFrame.settled = true;
+            }
+          }
           if (confirmationFrame === undefined || savedDeleteConfirmationFrame !== confirmationFrame) return;
           if (!isCurrentSavedDeleteConfirmationFrame(confirmationFrame)) {
             invalidateSavedDeleteConfirmationDisplay();
             return;
           }
+          const remoteConfirmation = confirmationFrame.remote;
+          // A remote confirmation settles ONLY on an actual write, or on an
+          // unchanged repaint of the very source that was already actually written.
+          if (remoteConfirmation !== undefined
+            && (!isCurrentRemoteSavedDeleteFrame(remoteConfirmation)
+              || !(disposition === "written"
+                || (disposition === "unchanged" && remoteSavedConfirmSettledKey === remoteConfirmation.sourceKey)))) {
+            return;
+          }
           if (activeSidebar.settleSavedDeleteConfirmationRender(confirmationFrame.renderToken)) {
             confirmationFrame.settled = true;
+            if (remoteConfirmation !== undefined) remoteSavedConfirmSettledKey = remoteConfirmation.sourceKey;
           }
         });
       } catch {
@@ -2644,6 +2938,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       return false;
     }
     return frame.settled;
+  }
+
+  /** The Local delete route's receipt: a settled frame that carries NO remote context. */
+  function hasSettledLocalSavedDeleteConfirmationFrame(): boolean {
+    return hasSettledSavedDeleteConfirmationFrame() && savedDeleteConfirmationFrame?.remote === undefined;
   }
 
   /** Revoke old draw-derived mouse authority before picker rows/query change. */
@@ -3529,6 +3828,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       const rows = clampDimension(terminal.rows, 24);
       const next = currentHostLayout(cols, rows);
       layout = next;
+      noteRemoteSavedLayout(next);
       const changed = next.native.cols !== lastNativeCols || next.native.rows !== lastNativeRows;
       if (manager && !resizeInProgress && (resizeChildren || localViewerNeedsSync(next.native))) {
         resizeInProgress = true;
@@ -3808,6 +4108,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // size before anything is repainted. Remote input/copy only; Close and
     // ordinary host UI keep their own independent written proofs.
     remoteInputEpoch += 1;
+    // The remote Saved picker/confirmation receipts and every admitted-but-unsent
+    // remote Saved intent belong to the geometry they were proved at: a reflow
+    // (even one that returns to the same size) retires them for good.
+    remoteSavedEpoch += 1;
+    remoteSavedPickerFrame = undefined;
     // A real outer resize can reflow the physical screen and then return to
     // the same final geometry before the next coalesced redraw (for example
     // 80 -> 40 -> 80). Invalidate the known baseline before recomputing so the
@@ -3826,6 +4131,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // The handoff retires every geometry-bound receipt: the terminal is handed to
     // the editor and repainted, so a remote New receipt composed before it is dead.
     createFormEpoch += 1;
+    remoteSavedEpoch += 1;
+    remoteSavedPickerFrame = undefined;
     hostMouseButtons.clear(); // no terminal gesture ownership survives a tty handoff
     const controller = new AbortController();
     externalEditorAbort = controller;
@@ -5446,6 +5753,703 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }, controller);
   }
 
+  // --- Remote Saved: the owner provider's native inputs. ---
+
+  /**
+   * The owner-side native Saved view's listing inputs, read at every list. They
+   * are exactly the inputs the Local picker and the exited-row restart use: the
+   * actual native agent directory of this host's session setup, the resolved Pi
+   * executable, and its admitted version, and only while this host's one manager
+   * is open and teardown has not begun. Anything unknown is `undefined`
+   * (unavailable): nothing is repaired, created, or migrated on its behalf.
+   */
+  function readNativeSavedCatalogOptions(): NativeSavedCatalogReadOptions | undefined {
+    if (shutdownRequested || manager === undefined) return undefined;
+    const agentDir = sessionSetup?.nativeAgentDir;
+    const activePi = pi;
+    if (typeof agentDir !== "string" || agentDir === "" || activePi === undefined
+      || typeof activePi.file !== "string" || activePi.file === ""
+      || typeof activePi.version !== "string" || activePi.version === "") return undefined;
+    return { agentDir, piExecutable: activePi.file, expectedPiVersion: activePi.version };
+  }
+
+  /**
+   * The owner view's listing adapter onto this host's ONE listing dependency. It
+   * accepts only the actual native inputs above plus a real abort signal (no
+   * injected `listAll` bypass, no other executable or version) and forwards the
+   * view's own freshness scope, so an owner catalog never supersedes the Local
+   * picker's catalog or the reverse.
+   */
+  function listNativeSavedCatalog(listOptions: ListSavedSessionsOptions): Promise<SavedSessionCatalog> {
+    try {
+      const activePi = pi;
+      const agentDir = listOptions?.agentDir;
+      const piExecutable = listOptions?.piExecutable;
+      const expectedPiVersion = listOptions?.expectedPiVersion;
+      const signal = listOptions?.signal;
+      const freshnessScope = listOptions?.freshnessScope;
+      if (shutdownRequested || manager === undefined || activePi === undefined
+        || listOptions?.listAll !== undefined
+        || typeof agentDir !== "string" || agentDir === "" || agentDir !== sessionSetup?.nativeAgentDir
+        || typeof piExecutable !== "string" || piExecutable !== activePi.file
+        || typeof expectedPiVersion !== "string" || expectedPiVersion !== activePi.version
+        || signal === undefined || signal === null || typeof signal.aborted !== "boolean") {
+        return Promise.reject(new Error("saved catalog listing is unavailable"));
+      }
+      return Promise.resolve(dependencies.listSavedCatalog({
+        agentDir,
+        piExecutable,
+        expectedPiVersion,
+        signal,
+        ...(freshnessScope === undefined ? {} : { freshnessScope }),
+      }));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  // --- Remote Saved: requester-side receipts, admission, and queued fences. ---
+
+  /**
+   * The optional Saved controller of the ONE coordinator, feature-detected every
+   * time like Close and Create. An older coordinator or fake simply has none, and
+   * the picker then reports a fixed notice; nothing ever falls back to Local.
+   */
+  function ownerSavedController(): PeerSavedController | undefined {
+    const coordinator = peerCoordinator as (Partial<PeerCoordinatorWithSaved> | undefined);
+    if (coordinator === undefined) return undefined;
+    try {
+      const candidate = coordinator.ownerSaved;
+      if (candidate === undefined || candidate === null
+        || typeof candidate.list !== "function"
+        || typeof candidate.search !== "function"
+        || typeof candidate.window !== "function"
+        || typeof candidate.resume !== "function"
+        || typeof candidate.remove !== "function") return undefined;
+      return candidate;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The form-slot pane (wide right pane, or the narrow overlay), if one is drawn. */
+  function currentFormSlotRect(value: HostLayout): HostPaneRect | undefined {
+    return value.form ?? (value.sidebarOverlay ? value.sidebar : undefined);
+  }
+
+  /** The live form-slot pane at the current outer geometry. */
+  function liveFormSlotRect(): HostPaneRect | undefined {
+    return currentFormSlotRect(currentHostLayout(clampDimension(terminal?.columns, 80), clampDimension(terminal?.rows, 24)));
+  }
+
+  /**
+   * Advance the remote Saved epoch when the form-slot pane (and the outer size it
+   * sits in) actually changes: a cover, a banner, a layout switch, or a return to
+   * an earlier geometry can never revive anything proved before it.
+   */
+  function noteRemoteSavedLayout(next: HostLayout): void {
+    const rect = currentFormSlotRect(next);
+    const key = JSON.stringify([
+      next.cols, next.rows, next.sidebarOverlay,
+      rect === undefined ? null : [rect.column, rect.row, rect.cols, rect.rows],
+    ]);
+    if (remoteSavedLayoutKey !== undefined && remoteSavedLayoutKey !== key) remoteSavedEpoch += 1;
+    remoteSavedLayoutKey = key;
+  }
+
+  /** True only while this exact remote picker frame is still the current one. */
+  function isCurrentRemoteSavedPickerFrame(frame: RemoteSavedPickerFrame): boolean {
+    if (shutdownRequested || externalEditorActive || terminal === undefined || !terminalStarted) return false;
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || !activeSidebar.visible || activeSidebar.focus !== "form") return false;
+    if (clampDimension(terminal.columns, 80) !== frame.terminalCols
+      || clampDimension(terminal.rows, 24) !== frame.terminalRows) return false;
+    if (frame.epoch !== remoteSavedEpoch) return false;
+    const pane = currentFormSlotRect(currentHostLayout(frame.terminalCols, frame.terminalRows));
+    if (!samePaneGeometry(pane, frame.pane)) return false;
+    if (frame.pane.cols !== frame.presentation.cols || frame.pane.rows !== frame.presentation.rows) return false;
+    return activeSidebar.isSavedPickerRenderCurrent(frame.presentation.renderToken);
+  }
+
+  /** The open remote picker still names exactly the target Main prepared. */
+  function remoteSavedContextMatchesPrepared(prepared: RemoteSavedPrepared): boolean {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || !activeSidebar.savedDeleteConfirmationActive) return false;
+    const context = activeSidebar.savedRemoteContext();
+    return context !== undefined
+      && context.pickerId === prepared.pickerId
+      && context.revision === prepared.revision
+      && context.hostId === prepared.hostId
+      && context.hostRunId === prepared.hostRunId
+      && context.catalogId === prepared.catalogId
+      && context.resultId === prepared.resultId;
+  }
+
+  /** True only while this exact remote confirmation context is still the current one. */
+  function isCurrentRemoteSavedDeleteFrame(remote: RemoteSavedDeleteFrameContext): boolean {
+    if (shutdownRequested || externalEditorActive || terminal === undefined || !terminalStarted) return false;
+    if (remoteSavedPrepared !== remote.prepared) return false;
+    if (remote.epoch !== remoteSavedEpoch) return false;
+    if (!samePaneGeometry(liveFormSlotRect(), remote.pane)) return false;
+    return remoteSavedContextMatchesPrepared(remote.prepared);
+  }
+
+  /** A closed, frozen copy of one entry intent: no extra UI field survives. */
+  function freezeRemoteSavedEntryIntent<T extends RemoteSavedEntryIntent>(intent: T): T {
+    return Object.freeze({
+      type: intent.type,
+      pickerId: intent.pickerId,
+      requestId: intent.requestId,
+      revision: intent.revision,
+      hostId: intent.hostId,
+      hostRunId: intent.hostRunId,
+      catalogId: intent.catalogId,
+      resultId: intent.resultId,
+      entryId: intent.entryId,
+      renderToken: intent.renderToken,
+    }) as unknown as T;
+  }
+
+  /**
+   * Synchronous admission of one Resume or Delete-prepare: the picker frame the
+   * writer ACTUALLY wrote must be this intent's exact frame (token, picker, query
+   * revision, destination, run, catalog, result, and a drawn row holding the
+   * entry), still current at the current outer geometry, form-slot pane, focus,
+   * visibility, and Main epoch, AND the Sidebar's own strict last-instant check
+   * must hold. On success the one-shot receipt is CONSUMED before anything is
+   * handed to the coordinator, so a duplicate or held key can never resend.
+   */
+  function admitRemoteSavedPickerIntent(
+    intent: PeerSavedUiResumeIntent | PeerSavedUiDeletePrepareIntent,
+  ): RemoteSavedAdmission | undefined {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested || externalEditorActive
+      || terminal === undefined || !terminalStarted) return undefined;
+    const frame = remoteSavedPickerFrame;
+    if (frame === undefined || !frame.settled) return undefined;
+    const drawn = frame.presentation;
+    if (drawn.renderToken !== intent.renderToken
+      || drawn.pickerId !== intent.pickerId
+      || drawn.revision !== intent.revision
+      || drawn.hostId !== intent.hostId
+      || drawn.hostRunId !== intent.hostRunId
+      || drawn.catalogId !== intent.catalogId
+      || drawn.resultId !== intent.resultId
+      || !drawn.drawn.some((row) => row.entryId === intent.entryId)) return undefined;
+    if (intent.type === "saved-remote-delete-prepare" && !drawn.deleteExposed) return undefined;
+    if (!isCurrentRemoteSavedPickerFrame(frame)) return undefined;
+    if (!activeSidebar.remoteSavedIntentStillCurrent(intent)) return undefined;
+    remoteSavedPickerFrame = undefined;
+    remoteSavedLastAdmittedRequestId = intent.requestId;
+    return Object.freeze({
+      intent: freezeRemoteSavedEntryIntent(intent),
+      terminalCols: frame.terminalCols,
+      terminalRows: frame.terminalRows,
+      pane: frame.pane,
+      epoch: remoteSavedEpoch,
+    });
+  }
+
+  /**
+   * Synchronous admission of one confirmed Delete: the ACTUALLY written
+   * Local-style confirmation frame must carry the exact remote target Main
+   * itself prepared (picker, query revision, destination, run, catalog, result,
+   * entry), with this intent's token, at the current geometry, form-slot pane,
+   * Main epoch, AND the Sidebar's own strict check must
+   * hold. The frame and the preparation are consumed before any dispatch.
+   */
+  function admitRemoteSavedDeleteIntent(intent: PeerSavedUiDeleteIntent): RemoteSavedAdmission | undefined {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested || externalEditorActive
+      || terminal === undefined || !terminalStarted) return undefined;
+    const frame = savedDeleteConfirmationFrame;
+    const prepared = remoteSavedPrepared;
+    const remote = frame?.remote;
+    if (frame === undefined || !frame.settled || remote === undefined || prepared === undefined
+      || remote.prepared !== prepared || frame.renderToken !== intent.renderToken) return undefined;
+    if (prepared.pickerId !== intent.pickerId || prepared.revision !== intent.revision
+      || prepared.hostId !== intent.hostId || prepared.hostRunId !== intent.hostRunId
+      || prepared.catalogId !== intent.catalogId || prepared.resultId !== intent.resultId
+      || prepared.entryId !== intent.entryId) return undefined;
+    if (!isCurrentSavedDeleteConfirmationFrame(frame) || !isCurrentRemoteSavedDeleteFrame(remote)) return undefined;
+    if (!activeSidebar.remoteSavedIntentStillCurrent(intent)) return undefined;
+    savedDeleteConfirmationFrame = undefined;
+    remoteSavedPrepared = undefined;
+    remoteSavedConfirmSettledKey = undefined;
+    remoteSavedLastAdmittedRequestId = intent.requestId;
+    return Object.freeze({
+      intent: freezeRemoteSavedEntryIntent(intent),
+      terminalCols: frame.cols,
+      terminalRows: frame.rows,
+      pane: remote.pane,
+      epoch: remote.epoch,
+    });
+  }
+
+  /**
+   * The QUEUED-write re-proof of one consumed admission, evaluated by the
+   * coordinator at admission and again inside the ordered write that calls the
+   * transport. It re-proves that THIS attempt still owns the destination's one
+   * in-flight slot, that teardown/editor handoff did not begin, that the outer
+   * size and the form-slot pane are exactly the admitted ones and Main's epoch
+   * never moved (so a resize, cover, or editor handoff — even one returning to
+   * the same geometry — refuses), and that the Sidebar's frozen operation still
+   * owns its full semantic context, including current delete exposure. An
+   * identical harmless repaint changes none of these facts.
+   */
+  function remoteSavedAdmissionStillCurrent(admission: RemoteSavedAdmission, record: RemoteSavedInflight): boolean {
+    if (shutdownRequested || externalEditorActive || terminal === undefined || !terminalStarted) return false;
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined) return false;
+    if (remoteSavedInflight.get(admission.intent.hostId) !== record) return false;
+    if (admission.epoch !== remoteSavedEpoch) return false;
+    const cols = clampDimension(terminal.columns, 80);
+    const rows = clampDimension(terminal.rows, 24);
+    if (cols !== admission.terminalCols || rows !== admission.terminalRows) return false;
+    if (!samePaneGeometry(currentFormSlotRect(currentHostLayout(cols, rows)), admission.pane)) return false;
+    return activeSidebar.remoteSavedAdmittedIntentStillOwned(admission.intent);
+  }
+
+  /** The Sidebar still owns this exact outstanding read for the open remote picker. */
+  function remoteSavedReadOwned(intent: RemoteSavedReadIntent): boolean {
+    if (shutdownRequested) return false;
+    const context = sidebar?.savedRemoteContext();
+    if (context === undefined) return false;
+    if (context.pickerId !== intent.pickerId || context.revision !== intent.revision
+      || context.hostId !== intent.hostId || context.hostRunId !== intent.hostRunId) return false;
+    if (!context.pendingReads.includes(intent.requestId)) return false;
+    if (intent.type === "saved-remote-search" && context.catalogId !== intent.catalogId) return false;
+    if (intent.type === "saved-remote-window"
+      && (context.catalogId !== intent.catalogId || context.resultId !== intent.resultId)) return false;
+    return true;
+  }
+
+  /** Forget one destination's in-flight slot, by identity only. */
+  function releaseRemoteSavedInflight(record: RemoteSavedInflight): void {
+    if (remoteSavedInflight.get(record.hostId) === record) remoteSavedInflight.delete(record.hostId);
+  }
+
+  /** Normalize one controller promise into exactly one fixed result; never throws. */
+  function settleRemoteSavedPromise<T>(
+    invoke: () => Promise<PeerSavedResult<T>>,
+    onResult: (result: PeerSavedResult<T>) => void,
+  ): void {
+    let pending: Promise<PeerSavedResult<T>>;
+    try {
+      pending = invoke();
+    } catch {
+      // The delegate was invoked and its outcome is unknowable.
+      pending = Promise.resolve<PeerSavedResult<T>>({ kind: "unknown" });
+    }
+    const normalize = (value: unknown): PeerSavedResult<T> => {
+      if (typeof value !== "object" || value === null) return { kind: "unknown" };
+      const kind = (value as { kind?: unknown }).kind;
+      return kind === "owner-result" || kind === "not-sent" || kind === "unknown"
+        ? value as PeerSavedResult<T>
+        : { kind: "unknown" };
+    };
+    void Promise.resolve(pending).then(
+      (value) => normalize(value),
+      () => ({ kind: "unknown" }) as PeerSavedResult<T>,
+    ).then((result) => {
+      try {
+        onResult(result);
+      } catch {
+        // A settlement failure never becomes an unhandled rejection.
+      }
+    });
+  }
+
+  /** Fixed notice for one positively-not-sent request. */
+  function remoteSavedNotSentNotice(reason: PeerSavedNotSentReason): string {
+    if (reason === "capability-unsupported") return REMOTE_SAVED_UNSUPPORTED_NOTICE;
+    if (reason === "busy" || reason === "limit") return REMOTE_SAVED_BUSY_MESSAGE;
+    return REMOTE_SAVED_NOT_SENT_MESSAGE;
+  }
+
+  function remoteSavedReadNotice(
+    result: PeerSavedResult<OwnerSavedWindowFacts>,
+    facts: OwnerSavedWindowFacts | undefined,
+  ): string {
+    if (result.kind === "not-sent") return remoteSavedNotSentNotice(result.reason);
+    if (facts === undefined) return REMOTE_SAVED_READ_UNKNOWN_MESSAGE;
+    if (facts.kind === "unavailable") return REMOTE_SAVED_UNAVAILABLE_MESSAGE;
+    if (facts.kind === "refused") return facts.reason === "stale" ? REMOTE_SAVED_STALE_MESSAGE : REMOTE_SAVED_READ_REFUSED_MESSAGE;
+    return REMOTE_SAVED_READ_UNKNOWN_MESSAGE;
+  }
+
+  function remoteSavedResumeNotice(
+    result: PeerSavedResult<OwnerSavedResumeFacts>,
+    facts: OwnerSavedResumeFacts | undefined,
+  ): string {
+    if (result.kind === "not-sent") return remoteSavedNotSentNotice(result.reason);
+    if (facts === undefined) return REMOTE_SAVED_UNCERTAIN_NOTICE;
+    switch (facts.kind) {
+      case "refused":
+        return facts.reason === "duplicate" ? REMOTE_SAVED_RESUME_DUPLICATE_MESSAGE
+          : facts.reason === "stale" ? REMOTE_SAVED_STALE_MESSAGE
+            : REMOTE_SAVED_RESUME_REFUSED_MESSAGE;
+      case "unconfirmed":
+        return REMOTE_SAVED_RESUME_UNCONFIRMED_MESSAGE;
+      default:
+        return REMOTE_SAVED_UNCERTAIN_NOTICE;
+    }
+  }
+
+  function remoteSavedDeleteNotice(
+    result: PeerSavedResult<OwnerSavedDeleteFacts>,
+    facts: OwnerSavedDeleteFacts | undefined,
+  ): string {
+    if (result.kind === "not-sent") return remoteSavedNotSentNotice(result.reason);
+    if (facts === undefined) return REMOTE_SAVED_UNCERTAIN_NOTICE;
+    switch (facts.kind) {
+      case "refused":
+        return facts.reason === "policy" ? REMOTE_SAVED_DELETE_OFF_NOTICE
+          : facts.reason === "active" || facts.reason === "duplicate" ? REMOTE_SAVED_DELETE_ACTIVE_MESSAGE
+            : facts.reason === "stale" ? REMOTE_SAVED_STALE_MESSAGE
+              : REMOTE_SAVED_DELETE_REFUSED_MESSAGE;
+      case "confirmation-required":
+        return REMOTE_SAVED_DELETE_RECONFIRM_MESSAGE;
+      case "unconfirmed":
+        return REMOTE_SAVED_DELETE_UNCONFIRMED_MESSAGE;
+      default:
+        return REMOTE_SAVED_UNCERTAIN_NOTICE;
+    }
+  }
+
+  /**
+   * One remote read intent from the open picker. Only the newest UNSENT read is
+   * kept (a replaced one is retired silently in the Sidebar, never answered or
+   * claimed cancelled); a destination with a request in flight receives nothing
+   * more until that request settles; a read for another destination is never
+   * blocked by this one's accepted work.
+   */
+  function handleRemoteSavedRead(intent: RemoteSavedReadIntent): void {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested) return;
+    if (!remoteSavedReadOwned(intent)) return;
+    const controller = ownerSavedController();
+    if (controller === undefined) {
+      activeSidebar.failRemoteSavedRead(intent.requestId, REMOTE_SAVED_CONTROLLER_MISSING_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    const replaced = remoteSavedQueuedRead;
+    remoteSavedQueuedRead = undefined;
+    if (replaced !== undefined && replaced.requestId !== intent.requestId) {
+      activeSidebar.retireUnsentRemoteSavedRead(replaced.requestId);
+    }
+    if (remoteSavedInflight.has(intent.hostId)) {
+      remoteSavedQueuedRead = intent;
+      return;
+    }
+    dispatchRemoteSavedRead(intent, controller);
+  }
+
+  /** Hand one read to the controller with its logical-ownership proof. */
+  function dispatchRemoteSavedRead(intent: RemoteSavedReadIntent, controller: PeerSavedController): void {
+    const record: RemoteSavedInflight = Object.freeze({ hostId: intent.hostId, requestId: intent.requestId });
+    remoteSavedInflight.set(intent.hostId, record);
+    const options = Object.freeze({
+      stillCurrent: (): boolean => {
+        try {
+          return remoteSavedInflight.get(intent.hostId) === record && remoteSavedReadOwned(intent);
+        } catch {
+          return false;
+        }
+      },
+    });
+    // Each request is a closed, frozen copy of exactly the owner request fields:
+    // the picker/request ids, revision, or any display string never travel.
+    settleRemoteSavedPromise<OwnerSavedWindowFacts>(() => {
+      if (intent.type === "saved-remote-list") {
+        return controller.list(Object.freeze({
+          hostId: intent.hostId, hostRunId: intent.hostRunId,
+          query: intent.query, offset: intent.offset, count: intent.count,
+        }), options);
+      }
+      if (intent.type === "saved-remote-search") {
+        return controller.search(Object.freeze({
+          hostId: intent.hostId, hostRunId: intent.hostRunId, catalogId: intent.catalogId,
+          query: intent.query, offset: intent.offset, count: intent.count,
+        }), options);
+      }
+      return controller.window(Object.freeze({
+        hostId: intent.hostId, hostRunId: intent.hostRunId, catalogId: intent.catalogId,
+        resultId: intent.resultId, offset: intent.offset, count: intent.count,
+      }), options);
+    }, (result) => settleRemoteSavedRead(record, intent, result));
+  }
+
+  /**
+   * One read settled. Main's own in-flight slot is released FIRST (the Sidebar
+   * may synchronously emit a follow-up window or a relist), then the Sidebar
+   * applies or retires exactly this request, then the newest still-owned unsent
+   * read is dispatched once. A failed read is never replayed.
+   */
+  function settleRemoteSavedRead(
+    record: RemoteSavedInflight,
+    intent: RemoteSavedReadIntent,
+    result: PeerSavedResult<OwnerSavedWindowFacts>,
+  ): void {
+    releaseRemoteSavedInflight(record);
+    const activeSidebar = sidebar;
+    if (shutdownRequested || activeSidebar === undefined) return;
+    const facts = result.kind === "owner-result" && isOwnerSavedWindowFacts(result.outcome) ? result.outcome : undefined;
+    if (facts !== undefined && facts.kind === "window") {
+      activeSidebar.completeRemoteSavedWindow(intent.requestId, facts);
+    } else {
+      activeSidebar.failRemoteSavedRead(intent.requestId, remoteSavedReadNotice(result, facts));
+    }
+    dispatchQueuedRemoteSavedRead();
+    scheduleRedraw();
+  }
+
+  /** Dispatch the newest unsent read once, only while the Sidebar still owns it. */
+  function dispatchQueuedRemoteSavedRead(): void {
+    const queued = remoteSavedQueuedRead;
+    if (queued === undefined || shutdownRequested) return;
+    if (!remoteSavedReadOwned(queued)) {
+      remoteSavedQueuedRead = undefined;
+      sidebar?.retireUnsentRemoteSavedRead(queued.requestId);
+      return;
+    }
+    if (remoteSavedInflight.has(queued.hostId)) return;
+    remoteSavedQueuedRead = undefined;
+    const controller = ownerSavedController();
+    if (controller === undefined) {
+      sidebar?.failRemoteSavedRead(queued.requestId, REMOTE_SAVED_CONTROLLER_MISSING_MESSAGE);
+      return;
+    }
+    dispatchRemoteSavedRead(queued, controller);
+  }
+
+  /** A refused entry intent: one fixed notice on that same request, nothing sent. */
+  function refuseRemoteSavedEntry(intent: RemoteSavedEntryIntent, message: string): void {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined) return;
+    try {
+      if (intent.type === "saved-remote-resume") activeSidebar.failRemoteSavedResume(intent.requestId, message);
+      else if (intent.type === "saved-remote-delete-prepare") {
+        activeSidebar.completeRemoteSavedDeletePrepare(intent.requestId, false, message);
+      } else {
+        activeSidebar.completeRemoteSavedDelete(intent.requestId, message, false);
+      }
+    } catch {
+      // A notice failure never escapes into the Sidebar's emit.
+    }
+    scheduleRedraw();
+  }
+
+  /**
+   * One deliberate Resume, Delete-prepare, or confirmed Delete. It is admitted
+   * only from the exact actually-written receipt, consumed one-shot, and sent
+   * only when the destination has no request in flight (never queued for later).
+   */
+  function handleRemoteSavedEntry(intent: RemoteSavedEntryIntent): void {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested) return;
+    // An already admitted request id is a duplicate (a held key or a replayed
+    // DTO): it is ignored without touching that request's legitimate ownership.
+    if (!Number.isSafeInteger(intent.requestId) || intent.requestId <= remoteSavedLastAdmittedRequestId) return;
+    const admission = intent.type === "saved-remote-delete"
+      ? admitRemoteSavedDeleteIntent(intent)
+      : admitRemoteSavedPickerIntent(intent);
+    if (admission === undefined) {
+      refuseRemoteSavedEntry(intent, intent.type === "saved-remote-delete"
+        ? REMOTE_SAVED_CONFIRMATION_CHANGED_MESSAGE
+        : REMOTE_SAVED_UNWRITTEN_NOTICE);
+      return;
+    }
+    const controller = ownerSavedController();
+    if (controller === undefined) {
+      refuseRemoteSavedEntry(intent, REMOTE_SAVED_CONTROLLER_MISSING_MESSAGE);
+      return;
+    }
+    if (remoteSavedInflight.has(intent.hostId)) {
+      refuseRemoteSavedEntry(intent, REMOTE_SAVED_BUSY_MESSAGE);
+      return;
+    }
+    dispatchRemoteSavedEntry(admission, controller);
+  }
+
+  /** Hand one consumed admission to the controller with its queued-write proof. */
+  function dispatchRemoteSavedEntry(admission: RemoteSavedAdmission, controller: PeerSavedController): void {
+    const intent = admission.intent;
+    const record: RemoteSavedInflight = Object.freeze({ hostId: intent.hostId, requestId: intent.requestId });
+    remoteSavedInflight.set(intent.hostId, record);
+    const options = Object.freeze({
+      stillCurrent: (): boolean => {
+        try {
+          return remoteSavedAdmissionStillCurrent(admission, record);
+        } catch {
+          return false;
+        }
+      },
+    });
+    const target = Object.freeze({
+      hostId: intent.hostId,
+      hostRunId: intent.hostRunId,
+      catalogId: intent.catalogId,
+      resultId: intent.resultId,
+      entryId: intent.entryId,
+    });
+    if (intent.type === "saved-remote-resume") {
+      settleRemoteSavedPromise<OwnerSavedResumeFacts>(
+        () => controller.resume(target, options),
+        (result) => applyRemoteSavedResumeResult(admission, record, result),
+      );
+      return;
+    }
+    const confirmed = intent.type === "saved-remote-delete";
+    settleRemoteSavedPromise<OwnerSavedDeleteFacts>(
+      () => controller.remove(Object.freeze({ ...target, confirmed }), options),
+      (result) => confirmed
+        ? applyRemoteSavedDeleteResult(admission, record, result)
+        : applyRemoteSavedDeletePrepareResult(admission, record, result),
+    );
+  }
+
+  /**
+   * One settled Resume. An owner `started` row is staged as awaiting its first
+   * roster observation BEFORE the Sidebar completes (which synchronously emits
+   * the picker dismissal and the ordinary remote selection), so the existing
+   * create-awaiting path reports it truthfully; when the Sidebar refuses a late
+   * or stale completion only this attempt's own staging is undone, and nothing
+   * is selected or focused.
+   */
+  function applyRemoteSavedResumeResult(
+    admission: RemoteSavedAdmission,
+    record: RemoteSavedInflight,
+    result: PeerSavedResult<OwnerSavedResumeFacts>,
+  ): void {
+    releaseRemoteSavedInflight(record);
+    const activeSidebar = sidebar;
+    if (shutdownRequested || activeSidebar === undefined) return;
+    const intent = admission.intent;
+    const facts = result.kind === "owner-result" && isOwnerSavedResumeFacts(result.outcome) ? result.outcome : undefined;
+    if (facts !== undefined && facts.kind === "started") {
+      if (facts.hostRunId !== intent.hostRunId) {
+        if (!activeSidebar.failRemoteSavedResume(intent.requestId, REMOTE_SAVED_OTHER_RUN_NOTICE)) {
+          activeSidebar.showError(REMOTE_SAVED_OTHER_RUN_NOTICE);
+        }
+      } else {
+        const rowObserved = peerUiSnapshot?.hosts?.some((host) =>
+          host.id === intent.hostId
+          && (host.roster.hostRunId ?? null) === facts.hostRunId
+          && host.roster.rows?.some((row) => row.id === facts.rowId) === true) === true;
+        const previous = pendingCreatedRemote;
+        const staged = rowObserved
+          ? undefined
+          : Object.freeze({ hostId: intent.hostId, hostRunId: facts.hostRunId, rowId: facts.rowId });
+        pendingCreatedRemote = staged;
+        let accepted = false;
+        try {
+          accepted = activeSidebar.completeRemoteSavedResume(intent.requestId, {
+            hostRunId: facts.hostRunId,
+            rowId: facts.rowId,
+          });
+        } catch {
+          accepted = false;
+        }
+        if (!accepted) {
+          if (pendingCreatedRemote === staged) pendingCreatedRemote = previous;
+          activeSidebar.showError(REMOTE_SAVED_RESUME_COMPLETED_MESSAGE);
+        }
+      }
+    } else {
+      const message = remoteSavedResumeNotice(result, facts);
+      const accepted = activeSidebar.failRemoteSavedResume(intent.requestId, message);
+      if (!accepted && result.kind !== "not-sent"
+        && (facts === undefined || facts.kind === "unconfirmed" || facts.kind === "unknown")) {
+        activeSidebar.showError(message);
+      }
+    }
+    dispatchQueuedRemoteSavedRead();
+    reconcileLayout(true);
+    scheduleRedraw();
+  }
+
+  /**
+   * One settled Delete-prepare. Only the owner's `confirmation-required` for the
+   * still-owned exact entry opens the Local-style confirmation; Main records the
+   * exact prepared target that dialog's written receipt must carry.
+   */
+  function applyRemoteSavedDeletePrepareResult(
+    admission: RemoteSavedAdmission,
+    record: RemoteSavedInflight,
+    result: PeerSavedResult<OwnerSavedDeleteFacts>,
+  ): void {
+    releaseRemoteSavedInflight(record);
+    const activeSidebar = sidebar;
+    if (shutdownRequested || activeSidebar === undefined) return;
+    const intent = admission.intent;
+    const facts = result.kind === "owner-result" && isOwnerSavedDeleteFacts(result.outcome) ? result.outcome : undefined;
+    if (facts !== undefined && facts.kind === "confirmation-required") {
+      remoteSavedPreparedSerial += 1;
+      const prepared: RemoteSavedPrepared = Object.freeze({
+        serial: remoteSavedPreparedSerial,
+        pickerId: intent.pickerId,
+        revision: intent.revision,
+        hostId: intent.hostId,
+        hostRunId: intent.hostRunId,
+        catalogId: intent.catalogId,
+        resultId: intent.resultId,
+        entryId: intent.entryId,
+      });
+      remoteSavedPrepared = prepared;
+      remoteSavedConfirmSettledKey = undefined;
+      let opened = false;
+      try {
+        opened = activeSidebar.completeRemoteSavedDeletePrepare(intent.requestId, true);
+      } catch {
+        opened = false;
+      }
+      if ((!opened || !activeSidebar.savedDeleteConfirmationActive) && remoteSavedPrepared === prepared) {
+        remoteSavedPrepared = undefined;
+      }
+    } else {
+      activeSidebar.completeRemoteSavedDeletePrepare(intent.requestId, false, remoteSavedDeleteNotice(result, facts));
+    }
+    dispatchQueuedRemoteSavedRead();
+    reconcileLayout(true);
+    scheduleRedraw();
+  }
+
+  /**
+   * One settled confirmed Delete. The owner's actual outcome is reported on the
+   * dialog that sent it; when that dialog no longer owns the pane, a completed
+   * or uncertain outcome is still shown as a notice rather than discarded. A
+   * later owner policy change never turns a completed deletion into a refusal.
+   */
+  function applyRemoteSavedDeleteResult(
+    admission: RemoteSavedAdmission,
+    record: RemoteSavedInflight,
+    result: PeerSavedResult<OwnerSavedDeleteFacts>,
+  ): void {
+    releaseRemoteSavedInflight(record);
+    const activeSidebar = sidebar;
+    if (shutdownRequested || activeSidebar === undefined) return;
+    const facts = result.kind === "owner-result" && isOwnerSavedDeleteFacts(result.outcome) ? result.outcome : undefined;
+    const deleted = facts !== undefined && facts.kind === "deleted";
+    const message = facts !== undefined && facts.kind === "deleted"
+      ? facts.method === "trash" ? "Saved conversation moved to trash" : "Saved conversation permanently deleted"
+      : remoteSavedDeleteNotice(result, facts);
+    let accepted = false;
+    try {
+      accepted = activeSidebar.completeRemoteSavedDelete(admission.intent.requestId, message, deleted);
+    } catch {
+      accepted = false;
+    }
+    if (!accepted && (deleted || result.kind === "unknown" || facts === undefined
+      || facts.kind === "unconfirmed" || facts.kind === "unknown")) {
+      activeSidebar.showError(message);
+    }
+    dispatchQueuedRemoteSavedRead();
+    reconcileLayout(true);
+    scheduleRedraw();
+  }
+
   function handleSidebarAction(action: SidebarAction): void {
     if (shutdownRequested) return;
     // Any deliberate user action invalidates a pending automatic activation.
@@ -5654,6 +6658,32 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       case "stop-remove":
         launchRowStop(action.id, action.confirmed);
         return;
+      // Remote Saved picker intents for the selected OWNER host. They never reach
+      // the Local catalog, `deleteSavedFile`, or this host's own service: every
+      // request names only opaque owner handles plus the exact owner run, and the
+      // owner performs its own native listing, search, Resume, and Delete.
+      case "saved-remote-list":
+      case "saved-remote-search":
+      case "saved-remote-window":
+        handleRemoteSavedRead(action);
+        return;
+      case "saved-remote-resume":
+      case "saved-remote-delete-prepare":
+      case "saved-remote-delete":
+        handleRemoteSavedEntry(action);
+        return;
+      case "saved-remote-dismiss":
+        // The picker stopped owning the pane. Only Main's own UNSENT read and
+        // private references for it are dropped: accepted owner work is never
+        // cancelled or replayed, and a just-staged owner row awaiting its first
+        // roster observation (a completing Resume) is deliberately kept.
+        if (remoteSavedQueuedRead?.pickerId === action.pickerId) remoteSavedQueuedRead = undefined;
+        if (remoteSavedPrepared?.pickerId === action.pickerId) {
+          remoteSavedPrepared = undefined;
+          remoteSavedConfirmSettledKey = undefined;
+        }
+        if (remoteSavedPickerFrame?.presentation.pickerId === action.pickerId) remoteSavedPickerFrame = undefined;
+        return;
       case "saved-list": {
         if (!sidebar || sidebar.savedPickerRequestId !== action.requestId) return;
         startSavedCatalogList(action.requestId, action.requestId);
@@ -5736,7 +6766,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         const catalog = savedCatalog;
         if (!activeSidebar || !owner || !activeSidebar.isSavedDeleteConfirmationCurrent(
           action.requestId, action.pickerId, action.id, action.file, action.revision,
-        ) || !hasSettledSavedDeleteConfirmationFrame()) return;
+        ) || !hasSettledLocalSavedDeleteConfirmationFrame()) return;
         if (!isSavedSessionCatalog(catalog) || savedCatalogPickerId !== action.pickerId
           || savedCatalogRequestId === undefined) {
           activeSidebar.completeSavedDelete(action.requestId, "The saved list changed; no file was deleted", false);
@@ -5755,7 +6785,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             || activeSidebar.savedPickerRequestId !== action.pickerId
             || !activeSidebar.isSavedDeleteConfirmationCurrent(
               action.requestId, action.pickerId, action.id, action.file, action.revision,
-            ) || !hasSettledSavedDeleteConfirmationFrame()
+            ) || !hasSettledLocalSavedDeleteConfirmationFrame()
             || savedCatalog !== catalog || savedCatalogPickerId !== action.pickerId
             || savedCatalogRequestId !== expectedCatalogRequestId
             || !searchSavedSessions(catalog, activeSidebar.savedQuery).includes(row)) {
@@ -5829,6 +6859,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       }
       case "visibility":
         invalidateSavedDeleteConfirmationDisplay();
+        // Showing or hiding the pane is a genuine visibility change for every
+        // remote Saved receipt and admitted-but-unsent remote Saved intent.
+        remoteSavedEpoch += 1;
+        remoteSavedPickerFrame = undefined;
         reconcileLayout(true);
         syncOuterMouseModes();
         scheduleRedraw();
@@ -5869,6 +6903,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // close already handed to the owner is never re-sent or cancelled here.
     remoteCloseMarkers.clear();
     remoteCloseAttempts.clear();
+    // Remote Saved: every receipt, preparation, and unsent read is dropped and the
+    // epoch retires any admitted-but-unsent intent. A request already handed to
+    // the coordinator is never cancelled, re-sent, or claimed stopped here.
+    remoteSavedEpoch += 1;
+    remoteSavedPickerFrame = undefined;
+    remoteSavedPrepared = undefined;
+    remoteSavedConfirmSettledKey = undefined;
+    remoteSavedQueuedRead = undefined;
+    remoteSavedInflight.clear();
     sidebar?.disposeSavedPicker();
     invalidateMouseAuthorization();
     // Display facts only. The coordinator's own bounded close stays the single

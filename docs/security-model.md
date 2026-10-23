@@ -292,9 +292,14 @@ existing native Saved admission and duplicate-open guards.
 Remote deletion is gated by the owner's own **Allow remote history deletion** policy
 (default on, explicit Off remembered). That policy is independent of any viewer's Remote
 input/copy setting and of the owner's own local Saved deletion. The description a viewer
-sees is not a grant. While the policy is unknown or Off, the viewer hides delete and the
-owner refuses both prepare and confirmed requests. At the mutation, the owner re-checks
-its live policy, the channel, and the saved-file facts. Its one session manager then
+sees is not a grant. Unknown or Off hides delete and blocks the viewer's prepare/Delete
+at admission and actual queued send. The owner independently reads its own policy once
+at admission of each incoming prepare or confirmed request: Off refuses before provider
+work; On allows that request through the ordinary independent safety checks. Later
+preference changes alone do not revoke it. A transient Off followed by On before sending
+does not invalidate a still-owned target or confirmation; an already-refused attempt is
+never retried or reopened automatically. At mutation the owner still re-checks the
+channel, grant, exact run, and saved-file facts. Its one session manager then
 performs one guarded native operation: a final caller authorization, a private census of
 its own children, and non-reentrant native filesystem checks before each `trash` or
 unlink handoff. It keeps the existing refusals for live, unknown-binding, current-file,

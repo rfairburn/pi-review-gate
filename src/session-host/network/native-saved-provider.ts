@@ -32,9 +32,10 @@
  *   every operation and after every injected callback. Ordinary inventory
  *   revisions and row changes are not Saved authority, and nothing reads a
  *   viewer's focus, selection, geometry, or native conversation tuple.
- * - `stillAuthorized` is the bridge's synchronous re-proof (transport, grant,
- *   channel, exact run, and for delete the live server delete policy). Reads
- *   and the delete preparation check it after their callbacks. Resume and
+ * - `stillAuthorized` is the bridge's synchronous re-proof of independent
+ *   authorization (transport, grant, channel, exact run). Delete preference is
+ *   decided once by the bridge at request admission. Reads and the delete
+ *   preparation check authorization after their callbacks. Resume and
  *   confirmed Delete hand ONE authorization closure to the service's guarded
  *   primitive, which calls it as its final caller check and then performs only
  *   its own non-reentrant native identity/live validation and the handoff or
@@ -724,7 +725,7 @@ export function createNativeSavedCatalogView(options: NativeSavedCatalogViewOpti
       if (!sameTarget(target)) return deleteRefused("stale");
       // Those native/run callouts can reenter and revoke authority, so the
       // passed guard is checked once more as the LAST callout, followed only by
-      // in-memory checks: a preparation is never stored while policy is off.
+      // in-memory checks: preparation still requires independent authorization.
       // (A file or binding change made by this guard is caught by the guarded
       // Delete primitive's own native checks at confirmation.)
       const authorizedAtStore = callGuard(guard);

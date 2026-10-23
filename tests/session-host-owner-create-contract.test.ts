@@ -23,6 +23,7 @@ import {
   DEFAULT_ROSTER_BRIDGE_BOUNDS,
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
+  ROSTER_BRIDGE_SAVED_CAPABILITY,
   ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
@@ -162,7 +163,7 @@ test("the workspace bound is the New form's own 2048 code points and 8192 UTF-8 
 
 test("create frames are an optional capability that is never offered by default", () => {
   assert.deepEqual([...ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES],
-    [ROSTER_BRIDGE_CLOSE_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY]);
+    [ROSTER_BRIDGE_CLOSE_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]);
   const decision = negotiateRosterBridgeHello({
     type: "hello",
     service: ROSTER_BRIDGE_SERVICE,

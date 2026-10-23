@@ -16,8 +16,10 @@
  */
 
 import assert from "node:assert/strict";
+import type { spawnSync } from "node:child_process";
 import test from "node:test";
 import type { NativeInstanceView } from "../src/session-host/instances";
+import { deleteSavedSessionFile } from "../src/session-host/saved-deletion";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import type {
   OwningHostInventoryListener,
@@ -4190,6 +4192,88 @@ test("the delete policy starts unknown, follows the first snapshot and every not
   }
 });
 
+test("owner On at request admission survives a preference flip in the factory or detached continuation", async () => {
+  for (const stage of ["factory", "continuation"] as const) {
+    let exposed = true;
+    let armAdmission = false;
+    let admissionReads = 0;
+    const provider = new FakeSavedProvider();
+    let h: ReturnType<typeof harness> | undefined;
+    provider.onCreate = () => {
+      if (stage === "factory") exposed = false;
+    };
+    h = harness({
+      rows: [], capabilities: SAVED_CAPS, saved: provider,
+      deletePolicy: () => {
+        admissionReads += 1;
+        const observed = exposed;
+        if (armAdmission) {
+          armAdmission = false;
+          if (stage === "continuation") queueMicrotask(() => { exposed = false; });
+        }
+        return observed;
+      },
+    });
+    const live = h;
+    try {
+      await live.viewer.hello;
+      await live.viewer.subscribe();
+      await until("the initial On description", () => live.viewer.saved?.policy?.deleteExposed === true);
+      // No notification in these two legs, so publication reads cannot mask a
+      // repeated request-policy read. Notification reentry is covered below.
+      admissionReads = 0;
+      armAdmission = true;
+      const target = {
+        hostRunId: live.inventory.hostRunId, catalogId: "cat-1", resultId: "res-1", entryId: "entry-0", confirmed: true,
+      };
+      // This scripted provider accepts opaque handles without a prior list, so
+      // the first Delete exercises the lazy factory after the owner's decision.
+      assert.deepEqual(await mustSettle(live.viewer.saved!.remove(target), `a delete spanning ${stage}`),
+        { kind: "owner-result", outcome: { kind: "deleted", method: "trash" } });
+      assert.equal(admissionReads, 1);
+      assert.equal(exposed, false);
+      assert.equal(provider.views, 1);
+      assert.equal(provider.removes.length, 1, "the already-admitted request reaches the provider");
+      assert.deepEqual(await mustSettle(live.viewer.saved!.remove({ ...target, confirmed: false }), "a separate Off prepare"),
+        { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } });
+      assert.equal(provider.removes.length, 1, "each later request gets its own current admission decision");
+    } finally {
+      await live.stop();
+    }
+  }
+});
+
+test("owner Off at arrival refuses stale client On before factory work and later On never rescues the attempt", async () => {
+  let exposed = true;
+  const provider = new FakeSavedProvider();
+  const h = harness({ rows: [], capabilities: SAVED_CAPS, saved: provider, deletePolicy: () => exposed });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    await until("the client On description", () => h.viewer.saved?.policy?.deleteExposed === true);
+    exposed = false; // Deliberately do not notify: the requester still describes On.
+    const target = {
+      hostRunId: h.inventory.hostRunId, catalogId: "cat-1", resultId: "res-1", entryId: "entry-0", confirmed: false,
+    };
+    assert.deepEqual(await mustSettle(h.viewer.saved!.remove(target), "an Off-at-arrival prepare"),
+      { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } });
+    assert.equal(provider.views, 0, "owner Off refuses before even creating a view");
+    assert.deepEqual(provider.removes, []);
+    exposed = true;
+    h.owner.notifySavedPolicy?.();
+    await settle();
+    assert.equal(provider.views, 0, "later On never rescues or replays the refused request");
+    assert.deepEqual(await mustSettle(h.viewer.saved!.remove(target), "a new On-at-arrival prepare"),
+      { kind: "owner-result", outcome: { kind: "confirmation-required" } });
+    exposed = false;
+    assert.deepEqual(await mustSettle(h.viewer.saved!.remove({ ...target, confirmed: true }), "a separate Off-at-arrival Delete"),
+      { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } });
+    assert.equal(provider.removes.length, 1, "the earlier prepare does not authorize a separate confirmed Delete");
+  } finally {
+    await h.stop();
+  }
+});
+
 test("a reentrant notify cannot let a stale policy read overwrite the newer publication", async () => {
   let value = false;
   let reenter = true;
@@ -4223,7 +4307,7 @@ test("a reentrant notify cannot let a stale policy read overwrite the newer publ
   }
 });
 
-test("a delete that completed is reported truthfully after the policy turned Off, and the guard repeats the policy", async () => {
+test("an admitted delete keeps its authorization and truthful outcome after the preference turns Off", async () => {
   let exposed = true;
   let release: () => void = () => undefined;
   let guardAfterOff: boolean | null = null;
@@ -4247,12 +4331,60 @@ test("a delete that completed is reported truthfully after the policy turned Off
     await until("the delete reaches the owner view", () => provider.removes.length === 1);
     exposed = false;
     release();
-    assert.equal(guardAfterOff, false, "the provider's guard re-checks the live delete policy");
+    assert.equal(guardAfterOff, true, "policy alone does not revoke the admitted request");
     assert.deepEqual(await mustSettle(pending, "the completed delete"),
       { kind: "owner-result", outcome: { kind: "deleted", method: "unlink" } },
       "an already-completed delete is reported, never re-gated on the current policy");
   } finally {
     await h.stop();
+  }
+});
+
+test("a preference flip during the trash stage does not revoke the admitted request's unlink fallback", async () => {
+  let exposed = true;
+  const guards: boolean[] = [];
+  const stages: string[] = [];
+  const provider = new FakeSavedProvider();
+  let h: ReturnType<typeof harness> | undefined;
+  provider.remove = async (_request, guard) => {
+    // The real deletion primitive, with only its filesystem effects substituted.
+    // File-identity checks are covered separately by the native provider fixtures.
+    const result = deleteSavedSessionFile("/owner/saved/entry-0.jsonl", {
+      validate: () => {
+        const authorized = guard();
+        guards.push(authorized);
+        return authorized ? undefined : "authorization lost";
+      },
+      spawnSync: (() => {
+        stages.push("trash");
+        exposed = false;
+        h?.owner.notifySavedPolicy?.();
+        return { pid: 0, output: [], stdout: "", stderr: "", status: 1, signal: null };
+      }) as unknown as typeof spawnSync,
+      exists: () => true,
+      unlink: () => { stages.push("unlink"); },
+    });
+    return result.ok ? { kind: "deleted", method: result.method } : { kind: "unconfirmed" };
+  };
+  h = harness({ rows: [], capabilities: SAVED_CAPS, saved: provider, deletePolicy: () => exposed });
+  const live = h;
+  try {
+    await live.viewer.hello;
+    await live.viewer.subscribe();
+    const listed = await listedWindow(live.viewer, live.inventory.hostRunId);
+    const target = {
+      hostRunId: live.inventory.hostRunId, catalogId: listed.catalogId,
+      resultId: listed.resultId, entryId: "entry-0", confirmed: true,
+    };
+    assert.deepEqual(await mustSettle(live.viewer.saved!.remove(target), "an admitted trash/unlink delete"),
+      { kind: "owner-result", outcome: { kind: "deleted", method: "unlink" } });
+    assert.deepEqual(stages, ["trash", "unlink"]);
+    assert.deepEqual(guards, [true, true], "independent authorization holds at both protected stages despite preference Off");
+    assert.deepEqual(await mustSettle(live.viewer.saved!.remove(target), "a new Off delete"),
+      { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } });
+    assert.equal(provider.removes.length, 1, "the next request has its own admission decision");
+  } finally {
+    await live.stop();
   }
 });
 
@@ -4565,9 +4697,9 @@ test("Saved policy publications and refusals wait for the one send slot and stay
   }
 });
 
-test("a delete guard fails closed when its final authorizer turns exposure Off and notifies", async () => {
+test("admitted delete guards ignore preference flips but still refuse independent authorization loss", async () => {
   let exposed = true;
-  let mode: "off" | "off-then-on" | "none" = "off";
+  let mode: "off" | "off-then-on" | "none" | "revoke" = "off";
   let armed = false;
   let armedCalls = 0;
   const guardResults: boolean[] = [];
@@ -4587,9 +4719,10 @@ test("a delete guard fails closed when its final authorizer turns exposure Off a
     authorize: () => {
       if (armed) {
         armedCalls += 1;
-        // The FINAL authorizer callout inside the provider's last-instant guard
-        // switches exposure Off and notifies, while still answering `true`.
-        if (armedCalls === 2 && mode !== "none") {
+        // Independent authorization is still live at the provider boundary;
+        // changing only the preference after admission must not revoke it.
+        if (armedCalls === 1 && mode !== "none") {
+          if (mode === "revoke") return false;
           exposed = false;
           h?.owner.notifySavedPolicy?.();
           if (mode === "off-then-on") exposed = true;
@@ -4609,22 +4742,27 @@ test("a delete guard fails closed when its final authorizer turns exposure Off a
     });
 
     assert.deepEqual(await mustSettle(live.viewer.saved!.remove(target("entry-0")), "an Off-during-proof delete"),
-      { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } });
-    assert.deepEqual(guardResults, [false], "the guard never proves a delete the policy turned Off during");
+      { kind: "owner-result", outcome: { kind: "deleted", method: "trash" } });
+    assert.deepEqual(guardResults, [true], "a preference flip after admission leaves independent authorization intact");
 
-    // Off and back On inside the same callout: the notification alone invalidates the proof.
+    // Off and back On inside the same callout likewise has no historical veto.
     exposed = true;
     mode = "off-then-on";
     assert.deepEqual(await mustSettle(live.viewer.saved!.remove(target("entry-1")), "an Off-then-On delete"),
-      { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } });
-    assert.deepEqual(guardResults, [false, false]);
+      { kind: "owner-result", outcome: { kind: "deleted", method: "trash" } });
+    assert.deepEqual(guardResults, [true, true]);
 
     // Without interference the same guard proves an exposed delete.
     exposed = true;
     mode = "none";
     assert.deepEqual(await mustSettle(live.viewer.saved!.remove(target("entry-2")), "an undisturbed delete"),
       { kind: "owner-result", outcome: { kind: "deleted", method: "trash" } });
-    assert.deepEqual(guardResults, [false, false, true]);
+    assert.deepEqual(guardResults, [true, true, true]);
+
+    mode = "revoke";
+    assert.deepEqual(await mustSettle(live.viewer.saved!.remove(target("entry-3")), "an independently revoked delete"),
+      { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } });
+    assert.deepEqual(guardResults, [true, true, true, false], "actual grant loss still refuses at the protected boundary");
   } finally {
     await live.stop();
   }

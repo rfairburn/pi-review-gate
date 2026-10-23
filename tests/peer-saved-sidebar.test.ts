@@ -774,7 +774,7 @@ test("the remote delete dialog reuses the local text, needs its written frame, a
   assert.ok(pane(harness).some((line) => line.includes("Saved conversation moved to trash")));
 });
 
-test("owner policy Off invalidates an unsubmitted confirmation and leaves Local untouched", () => {
+test("transient owner policy Off preserves an unsubmitted confirmation and leaves Local untouched", () => {
   const harness = makeHarness(snapshot([host({ id: "A" })]));
   openRemote(harness, 1, 1);
   settlePicker(harness);
@@ -785,9 +785,19 @@ test("owner policy Off invalidates an unsubmitted confirmation and leaves Local 
   assert.equal(harness.controller.focus, "confirm");
   mark(harness);
   assert.equal(harness.controller.updateRemoteSavedDeleteExposure("A", "run-A", false), true);
-  assert.equal(harness.controller.focus, "form", "the unsubmitted confirmation closed");
+  assert.equal(harness.controller.focus, "confirm", "policy publication alone never discards the confirmation");
   assert.deepEqual(harness.commands(), [], "nothing was sent or cancelled");
-  assert.ok(flat(pane(harness)).includes(REMOTE_SAVED_DELETE_OFF_NOTICE));
+  assert.equal(harness.controller.updateRemoteSavedDeleteExposure("A", "run-A", true), true);
+  void harness.controller.renderSavedDeleteConfirmation(COLS, 20);
+  const token = harness.controller.savedDeleteConfirmationRenderTokenNumber;
+  assert.ok(token !== undefined);
+  assert.equal(harness.controller.settleSavedDeleteConfirmationRender(token), true);
+  harness.send(ENTER);
+  assert.equal(lastOf(harness, "saved-remote-delete")?.entryId, "e-0", "the original prepared target can be confirmed");
+  const remove = lastOf(harness, "saved-remote-delete");
+  assert.ok(remove !== undefined);
+  harness.controller.completeRemoteSavedDelete(remove.requestId, "Not deleted", false);
+  void pane(harness);
 
   // Local Saved actions are unaffected by any owner policy.
   mark(harness);
@@ -798,4 +808,143 @@ test("owner policy Off invalidates an unsubmitted confirmation and leaves Local 
   void pane(harness);
   harness.send(CTRL_D);
   assert.equal(lastOf(harness, "saved-delete-prepare")?.id, "l-1", "the local delete route is unchanged");
+});
+
+test("an outstanding prepare retains its exact target across a policy publication and reply", () => {
+  const harness = makeHarness(snapshot([host({ id: "A" })]));
+  openRemote(harness, 1, 1);
+  settlePicker(harness);
+  harness.send(CTRL_D);
+  const prepare = lastOf(harness, "saved-remote-delete-prepare");
+  assert.ok(prepare !== undefined);
+  mark(harness);
+  harness.controller.updateRemoteSavedDeleteExposure("A", "run-A", false);
+  assert.equal(harness.controller.completeRemoteSavedDeletePrepare(prepare.requestId, true), true);
+  assert.equal(harness.controller.focus, "confirm", "the allowed reply is not discarded solely for current exposure");
+  assert.deepEqual(harness.commands(), [], "the reply never sends a confirmed Delete");
+  harness.controller.updateRemoteSavedDeleteExposure("A", "run-A", true);
+  void harness.controller.renderSavedDeleteConfirmation(COLS, 20);
+  const token = harness.controller.savedDeleteConfirmationRenderTokenNumber;
+  assert.ok(token !== undefined);
+  assert.equal(harness.controller.settleSavedDeleteConfirmationRender(token), true);
+  harness.send(ENTER);
+  assert.equal(lastOf(harness, "saved-remote-delete")?.entryId, prepare.entryId);
+});
+
+test("a confirmation attempted while currently Off is refused once, with no automatic reopen on On", () => {
+  const harness = makeHarness(snapshot([host({ id: "A" })]));
+  openRemote(harness, 1, 1);
+  settlePicker(harness);
+  harness.send(CTRL_D);
+  const prepare = lastOf(harness, "saved-remote-delete-prepare");
+  assert.ok(prepare !== undefined);
+  harness.controller.completeRemoteSavedDeletePrepare(prepare.requestId, true);
+  harness.controller.updateRemoteSavedDeleteExposure("A", "run-A", false);
+  void harness.controller.renderSavedDeleteConfirmation(COLS, 20);
+  const token = harness.controller.savedDeleteConfirmationRenderTokenNumber;
+  assert.ok(token !== undefined);
+  assert.equal(harness.controller.settleSavedDeleteConfirmationRender(token), true);
+  mark(harness);
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), [], "current Off emits no Delete");
+  assert.equal(harness.controller.focus, "form");
+  assert.ok(flat(pane(harness)).includes(REMOTE_SAVED_DELETE_OFF_NOTICE));
+  harness.controller.updateRemoteSavedDeleteExposure("A", "run-A", true);
+  assert.equal(harness.controller.focus, "form", "On never reopens the refused attempt");
+  assert.deepEqual(harness.commands(), []);
+});
+
+// ---------------------------------------------------------------------------
+// Main integration helpers: admitted-intent re-proof and silent read retirement
+// ---------------------------------------------------------------------------
+
+test("Main's admitted-intent re-proof ignores only per-render tokens and never admits on its own", () => {
+  const harness = makeHarness(snapshot([host({ id: "A" })]));
+  openRemote(harness, 3, 3);
+  settlePicker(harness);
+  const drawn = harness.controller.captureSavedPickerPresentation();
+  assert.ok(drawn !== undefined);
+  const forged = {
+    type: "saved-remote-resume" as const, pickerId: drawn.pickerId, requestId: 999_999, revision: drawn.revision,
+    hostId: "A", hostRunId: "run-A", catalogId: "cat-1", resultId: "res-1", entryId: "e-0",
+    renderToken: drawn.renderToken,
+  };
+  assert.equal(harness.controller.remoteSavedAdmittedIntentStillOwned(forged), false,
+    "with no pending operation nothing is ever admitted by this helper");
+
+  harness.send(ENTER);
+  const resume = lastOf(harness, "saved-remote-resume");
+  assert.ok(resume !== undefined);
+  assert.equal(harness.controller.remoteSavedAdmittedIntentStillOwned(resume), true);
+  assert.equal(harness.controller.remoteSavedAdmittedIntentStillOwned({ ...resume, entryId: "e-1" }), false,
+    "another opaque entry handle is never the admitted operation");
+  // A withdrawn and re-minted frame fails the strict receipt check, but the
+  // already-admitted operation still owns exactly the same semantic context.
+  harness.controller.invalidateSavedPickerPresentation();
+  void pane(harness);
+  assert.equal(harness.controller.remoteSavedIntentStillCurrent(resume), false);
+  assert.equal(harness.controller.remoteSavedAdmittedIntentStillOwned(resume), true);
+  harness.send(DOWN);
+  harness.send(UP);
+  assert.equal(harness.controller.remoteSavedAdmittedIntentStillOwned(resume), false,
+    "a selection A -> B -> A retires the admitted operation for good");
+
+  const del = makeHarness(snapshot([host({ id: "A" })]));
+  openRemote(del, 1, 1);
+  settlePicker(del);
+  del.send(CTRL_D);
+  const prepare = lastOf(del, "saved-remote-delete-prepare");
+  assert.ok(prepare !== undefined);
+  assert.equal(del.controller.remoteSavedAdmittedIntentStillOwned(prepare), true);
+  assert.equal(del.controller.completeRemoteSavedDeletePrepare(prepare.requestId, true), true);
+  void del.controller.renderSavedDeleteConfirmation(COLS, 20);
+  const confirmToken = del.controller.savedDeleteConfirmationRenderTokenNumber;
+  assert.ok(confirmToken !== undefined);
+  assert.equal(del.controller.settleSavedDeleteConfirmationRender(confirmToken), true);
+  del.send(ENTER);
+  const remove = lastOf(del, "saved-remote-delete");
+  assert.ok(remove !== undefined);
+  assert.equal(del.controller.remoteSavedAdmittedIntentStillOwned(remove), true);
+  // Every confirmation render re-mints its token: the strict check dies on an
+  // identical repaint, the admitted operation does not.
+  void del.controller.renderSavedDeleteConfirmation(COLS, 20);
+  assert.notEqual(del.controller.savedDeleteConfirmationRenderTokenNumber, confirmToken);
+  assert.equal(del.controller.remoteSavedIntentStillCurrent(remove), false);
+  assert.equal(del.controller.remoteSavedAdmittedIntentStillOwned(remove), true);
+  // The OWNER's current exposure is re-read: Off refuses. On before an actual
+  // send permits the same still-owned intent; no transition history is kept.
+  del.controller.setPeerUiSnapshot(snapshot([host({ id: "A", saved: { supported: true, deleteExposed: false } })],
+    { revision: 2 }));
+  assert.equal(del.controller.remoteSavedAdmittedIntentStillOwned(remove), false);
+  del.controller.setPeerUiSnapshot(snapshot([host({ id: "A" })], { revision: 3 }));
+  assert.equal(del.controller.remoteSavedAdmittedIntentStillOwned(remove), true);
+  // A different owner run retires the operation for good, even after it returns.
+  del.controller.setPeerUiSnapshot(snapshot([host({ id: "A", roster: { state: "current", rows: [], hostRunId: "run-B" } })],
+    { revision: 4 }));
+  del.controller.setPeerUiSnapshot(snapshot([host({ id: "A" })], { revision: 5 }));
+  assert.equal(del.controller.remoteSavedAdmittedIntentStillOwned(remove), false);
+});
+
+test("Main's silent retirement of an unsent read forgets only that request", () => {
+  const harness = makeHarness(snapshot([host({ id: "A" })]));
+  openRemote(harness, 10_000);
+  harness.send(UP); // 0 -> 9999: one window read for the uncached selection
+  const read = lastOf(harness, "saved-remote-window");
+  assert.ok(read !== undefined);
+  const before = pane(harness);
+  mark(harness);
+  assert.equal(harness.controller.retireUnsentRemoteSavedRead(read.requestId), true);
+  assert.deepEqual(harness.commands(), [], "no follow-up read, retry, or other intent is emitted");
+  assert.deepEqual(harness.controller.savedRemoteContext()?.pendingReads, []);
+  assert.deepEqual(pane(harness), before, "no notice or other visible change");
+  assert.equal(harness.controller.retireUnsentRemoteSavedRead(read.requestId), false, "not outstanding: a no-op");
+  assert.equal(harness.controller.completeRemoteSavedWindow(read.requestId, windowFacts(9984, 32, 10_000)), false,
+    "a retired read can never be applied");
+
+  // The range is not a permanent loading hole: the next coverage pass asks again.
+  harness.send(DOWN);
+  harness.send(UP);
+  const again = lastOf(harness, "saved-remote-window");
+  assert.ok(again !== undefined && again.requestId !== read.requestId);
+  assert.equal(again.offset, read.offset);
 });

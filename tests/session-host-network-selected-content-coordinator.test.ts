@@ -924,6 +924,23 @@ test("a stale generation, an unknown row, another run, and an invalid shape chan
 	assert.deepEqual(source.installedRowIds, ["one"]);
 });
 
+test("a newly reachable selected row connects without republishing its stale missing-row refusal", async (t) => {
+	const { viewer, owner, ownerHostId } = await connectViewerToOwner(t, []);
+	const runId = ownerRunOf(viewer, ownerHostId);
+	viewer.coordinator.content.selectContent(targetOf(ownerHostId, runId, "one", 1));
+	await waitForContent(viewer, (observation) => observation.reason === "row-unavailable", "the not-yet-observed row");
+	const start = viewer.observations.length;
+	owner.source.setRows(["one"]);
+	const current = await waitForContent(viewer, (observation) => observation.state === "current", "the new row's viewport");
+	assert.equal(current.target?.rowId, "one");
+	const opening = viewer.observations.slice(start);
+	assert.ok(opening.some((observation) => observation.state === "connecting" && observation.reason === null),
+		"the authorized open reports connecting before its first viewport");
+	assert.equal(opening.some((observation) => observation.state === "unavailable"), false,
+		"the new open never republishes the previous missing-row refusal");
+	assert.deepEqual(owner.source.installedRowIds, ["one"], "one ordinary content attempt, not a retry");
+});
+
 test("losing the selected row clears the view immediately and the same target returns with it", async (t) => {
 	const { viewer, owner, ownerHostId } = await connectViewerToOwner(t, ["one", "two"]);
 	const source = owner.source;

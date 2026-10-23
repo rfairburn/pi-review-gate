@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { runInNewContext } from "node:vm";
 import test from "node:test";
+import ts from "typescript";
 
+import * as nativeInputCodec from "../src/session-host/native-input-origin";
+import * as hostProtocol from "../src/session-host/protocol";
 import { SidebarController } from "../src/session-host/sidebar";
 import { stripGeneratedSgr } from "../src/session-host/terminal-surface";
 
@@ -38,6 +42,167 @@ import { frameHeader, frameHeaderMatches, isSidebarFocusedFrame, parseRosterFram
 // not a physical-keyboard or full-CLI test. The question flow and live-child
 // SIGTERM/SIGHUP/quit regressions live in
 // tests/session-host-native-main-lifecycle.test.ts on the same harness.
+
+const observationBootstrap: hostProtocol.SessionHostBootstrap = {
+  version: 1, socketPath: "/owned/test.sock", token: "a".repeat(64),
+  instanceId: "11111111-1111-4111-8111-111111111111",
+  generation: "22222222-2222-4222-8222-222222222222", inputOriginFraming: 1,
+};
+
+/** Exercise the actual runner observer without executing main or loading a native addon. */
+function structuralObservation() {
+  const source = ts.createSourceFile(RUNNER_FIXTURE, readFileSync(RUNNER_FIXTURE, "utf8"),
+    ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const functions = source.statements.filter((node): node is ts.FunctionDeclaration =>
+    ts.isFunctionDeclaration(node) && node.name?.text === "installPtyExitObservation");
+  assert.equal(functions.length, 1);
+  const controls: Array<Record<string, unknown>> = [];
+  const writes: Array<{ receiver: unknown; args: unknown[] }> = [];
+  const result = {};
+  const state: { writeError?: Error; appendError?: Error } = {};
+  let nextPid = 4000;
+  const pty = {
+    spawn(file: string, args: readonly string[], options: { cwd: string; env: Record<string, string> }) {
+      assert.equal(this, pty);
+      assert.equal(file, "owned-pi");
+      assert.deepEqual(args, ["--owned"]);
+      return {
+        pid: nextPid++, options,
+        write(this: unknown, ...values: unknown[]) {
+          writes.push({ receiver: this, args: values });
+          if (state.writeError) { const error = state.writeError; delete state.writeError; throw error; }
+          return result;
+        },
+        onExit() { /* no process is spawned by this public-API double */ },
+      };
+    },
+  };
+  const productionRequire = Object.assign((name: string): unknown => {
+    if (name === "./protocol.js") return hostProtocol;
+    if (name === "./native-input-origin.js") return nativeInputCodec;
+    throw new Error("unexpected production observation dependency");
+  }, { resolve: (name: string) => { assert.equal(name, "@lydell/node-pty"); return "owned-pty-double"; } });
+  runInNewContext(`${functions[0]!.getText(source)}; installPtyExitObservation('/candidate/main.js', 'exit', 'control');`, {
+    Buffer, path: { dirname, join }, createRequire: () => productionRequire,
+    require: (name: string) => { assert.equal(name, "owned-pty-double"); return pty; },
+    fs: { appendFileSync(file: string, data: string) {
+      assert.equal(file, "control");
+      if (state.appendError) throw state.appendError;
+      controls.push(JSON.parse(data) as Record<string, unknown>);
+    } },
+    // An ambient bootstrap must never substitute for the actual spawn's environment.
+    process: { env: { [hostProtocol.HOST_BOOTSTRAP_ENV]: JSON.stringify(observationBootstrap) } },
+  }, { timeout: 1000 });
+  const spawn = (bootstrap: string | null = JSON.stringify(observationBootstrap), cwd = "/owned/workspace") => {
+    const options: { cwd: string; env: Record<string, string> } = {
+      cwd, env: bootstrap === null ? {} : { [hostProtocol.HOST_BOOTSTRAP_ENV]: bootstrap },
+    };
+    const handle = pty.spawn("owned-pi", ["--owned"], options);
+    assert.equal(handle.options, options, "the real spawn receives the identical options object");
+    return handle;
+  };
+  return { spawn, controls, writes, result, state };
+}
+
+test("structural PTY observation retains exact legacy Escape recognition for a valid unframed bootstrap", () => {
+  const fixture = structuralObservation();
+  const { inputOriginFraming: _mode, ...legacy } = observationBootstrap;
+  const handle = fixture.spawn(JSON.stringify(legacy));
+  for (const key of ["\x1b", "\x1b[27u", "\x1b[27;1u", "\x1b[27;1:1u"]) handle.write(key);
+  for (const key of ["x", "x\x1b", "\x1bx", "\x1b[27;2u", Buffer.from([0x9b])]) handle.write(key);
+  assert.equal(fixture.controls.length, 4);
+  assert.deepEqual(fixture.controls.map((record) => [record.pid, record.cwd, record.encoding]),
+    Array.from({ length: 4 }, (_, i) => [handle.pid, "/owned/workspace", i === 0 ? "legacy" : "csi-u"]));
+});
+
+test("structural PTY observation authenticates complete framed Escape including split string and Buffer transport", () => {
+  for (const key of ["\x1b", "\x1b[27u", "\x1b[27;1u", "\x1b[27;1:1u"]) {
+    const fixture = structuralObservation(); const handle = fixture.spawn();
+    const encoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
+    const frame = encoder.encode(Buffer.from(key), { kind: "local" });
+    handle.write(frame.slice(0, 11));
+    assert.equal(fixture.controls.length, 0, "an incomplete authenticated frame is no witness");
+    handle.write(Buffer.from(frame.slice(11)));
+    assert.deepEqual(fixture.controls, [{ type: "pty_control", key: "escape", pid: handle.pid,
+      cwd: "/owned/workspace", encoding: key === "\x1b" ? "legacy" : "csi-u", framing: "authenticated", origin: "local" }]);
+  }
+});
+
+test("structural PTY observation never confuses paste fragments or high-bit bytes with a complete Escape", () => {
+  const fixture = structuralObservation(); const handle = fixture.spawn();
+  const encoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
+  for (const payload of [Buffer.concat([Buffer.alloc(nativeInputCodec.NATIVE_INPUT_RAW_FRAGMENT_BYTES, 97), Buffer.from([27])]),
+    Buffer.from([0x9b]), Buffer.from("x\x1b"), Buffer.from("\x1bx")]) {
+    handle.write(encoder.encode(payload, { kind: "local" }));
+  }
+  assert.deepEqual(fixture.controls, []);
+});
+
+test("structural PTY observation is poisoned by malformed, foreign, replayed, and invalid-sequence frames without raw downgrade", () => {
+  const frame = () => nativeInputCodec.createNativeInputEncoder(observationBootstrap).encode(Buffer.from([27]), { kind: "local" });
+  const original = frame();
+  const encoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
+  encoder.encode(Buffer.from("first"), { kind: "local" });
+  const cases = ["\x1b", "not-a-frame\n", original.slice(0, -2) + (original.at(-2) === "a" ? "b" : "a") + "\n",
+    encoder.encode(Buffer.from([27]), { kind: "local" }),
+    ...[{ ...observationBootstrap, token: "b".repeat(64) },
+      { ...observationBootstrap, instanceId: "33333333-3333-4333-8333-333333333333" },
+      { ...observationBootstrap, generation: "44444444-4444-4444-8444-444444444444" }]
+      .map((bootstrap) => nativeInputCodec.createNativeInputEncoder(bootstrap).encode(Buffer.from([27]), { kind: "local" }))];
+  for (const invalid of cases) {
+    const fixture = structuralObservation(); const handle = fixture.spawn();
+    handle.write(invalid); handle.write(original); handle.write("\x1b");
+    assert.deepEqual(fixture.controls, [], "invalid framed input never becomes raw or a later positive");
+  }
+  const fixture = structuralObservation(); const handle = fixture.spawn();
+  handle.write(original); handle.write(original); handle.write(frame());
+  assert.equal(fixture.controls.length, 1, "a replay poisons the per-handle observer");
+});
+
+test("structural PTY observation refuses absent, malformed, and unsupported owned bootstrap even with a valid ambient identity", () => {
+  for (const bootstrap of ["", "{", "null", "{}", ...[0, 2, true, "1"].map((mode) =>
+    JSON.stringify({ ...observationBootstrap, inputOriginFraming: mode }))]) {
+    const fixture = structuralObservation(); const handle = fixture.spawn(bootstrap);
+    handle.write("\x1b"); handle.write(nativeInputCodec.createNativeInputEncoder(observationBootstrap).encode(Buffer.from([27]), { kind: "local" }));
+    assert.deepEqual(fixture.controls, []);
+  }
+  const fixture = structuralObservation(); const handle = fixture.spawn(null);
+  handle.write("\x1b"); assert.deepEqual(fixture.controls, [], "an absent owned bootstrap cannot use the ambient identity");
+});
+
+test("structural PTY observation preserves exact forwarding and error identity and never witnesses a throwing write", () => {
+  const fixture = structuralObservation(); const handle = fixture.spawn();
+  const encoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
+  const bytes = Buffer.from(encoder.encode(Buffer.from([27]), { kind: "local" })); const extra = {};
+  assert.equal(handle.write(bytes, extra), fixture.result);
+  assert.equal(fixture.writes.length, 1); assert.equal(fixture.writes[0]!.receiver, handle);
+  assert.equal(fixture.writes[0]!.args[0], bytes); assert.equal(fixture.writes[0]!.args[1], extra);
+  const error = new Error("owned-write-failure"); fixture.state.writeError = error;
+  const failedFrame = encoder.encode(Buffer.from([27]), { kind: "local" });
+  assert.throws(() => handle.write(failedFrame), (thrown) => thrown === error);
+  handle.write(failedFrame);
+  assert.equal(fixture.controls.length, 1, "uncertain partial effects cannot create or revive observation");
+  const failedObserver = structuralObservation(); const second = failedObserver.spawn();
+  const secondEncoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
+  failedObserver.state.appendError = new Error("owned-observer-failure");
+  assert.equal(second.write(secondEncoder.encode(Buffer.from([27]), { kind: "local" })), failedObserver.result);
+  delete failedObserver.state.appendError;
+  second.write(secondEncoder.encode(Buffer.from([27]), { kind: "local" }));
+  assert.deepEqual(failedObserver.controls, [], "observation failure is sticky but never changes IO forwarding");
+});
+
+test("structural PTY observation isolates actual handle identity and keeps every origin visible to negative guards", () => {
+  const fixture = structuralObservation(); const first = fixture.spawn(); const second = fixture.spawn(JSON.stringify(observationBootstrap), "/owned/other");
+  const encoder = nativeInputCodec.createNativeInputEncoder(observationBootstrap);
+  first.write(encoder.encode(Buffer.from([27]), { kind: "none" }));
+  first.write(encoder.encode(Buffer.from([27]), { kind: "viewer", token: "owned-viewer" }, { sessionId: "owned-session", epoch: 1 }));
+  second.write(nativeInputCodec.createNativeInputEncoder(observationBootstrap).encode(Buffer.from([27]), { kind: "local" }));
+  assert.deepEqual(fixture.controls.map((record) => [record.pid, record.cwd, record.origin]),
+    [[first.pid, "/owned/workspace", "none"], [first.pid, "/owned/workspace", "viewer"], [second.pid, "/owned/other", "local"]]);
+  const metadata = JSON.stringify(fixture.controls);
+  assert.equal(metadata.includes(observationBootstrap.token), false);
+  assert.equal(metadata.includes("owned-viewer"), false, "scope tokens and payloads are never journaled");
+});
 
 async function settingsSmoke(driver: MainPtyDriver, session: OwnedSession, workspaceEditValue: string, editorMarker: string): Promise<void> {
   assert.equal(driver.focus, "main");

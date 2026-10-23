@@ -3373,6 +3373,52 @@ test("viewer input/copy and owner history-deletion settings persist independentl
 	assert.equal(second.coordinator.read().hosts?.[0]?.label, "Kept");
 });
 
+test("unavailable protected preferences close viewer native I/O after a post-commit failure", async (t) => {
+	for (const command of [
+		{ type: "peer-viewer-native-input", enabled: false },
+		{ type: "peer-bell", enabled: true },
+	] as const) {
+		const fixture = createOwnedAgentDir(t);
+		const policy = createPosixTestPolicy();
+		const log = createSnapshotLog();
+		const coordinator = createPeerCoordinator({
+			agentDir: fixture.agentDir,
+			inventory: createFakeInventory(),
+			onChange: log.onChange,
+			onIncomingConsentArrival: log.onArrival,
+			testHooks: { ...hooks(), preferencesPermissions: policy },
+			nativeIo: { authorizeInput: () => true, onCopy: () => undefined },
+		});
+		t.after(async () => {
+			try { await coordinator.close(); } catch { /* observed shutdown outcome */ }
+		});
+		await coordinator.start();
+		await coordinator.perform({ type: "peer-bell", enabled: false });
+		const before = coordinator.content.readViewerNativeInputPolicy?.();
+		assert.ok(before !== undefined && before.enabled, "valid protected settings permit viewer input");
+		assert.equal(coordinator.readRemoteHistoryDeleteEnabled(), true);
+
+		// The rename has published bytes before this final protection check fails.
+		// The protected handle is now unusable, not a new default-On document.
+		policy.fail = (call) => call.operation === "assertPrivateFile";
+		await coordinator.perform(command);
+		const after = coordinator.content.readViewerNativeInputPolicy?.();
+		assert.ok(after !== undefined);
+		assert.equal(after.enabled, false, "unavailable protected settings never leave viewer input/copy On");
+		assert.ok(after.generation > before.generation, "storage loss retires existing input admissions");
+		assert.equal(coordinator.readRemoteHistoryDeleteEnabled(), false, "the owner policy also fails closed");
+		assert.equal(coordinator.read().settings?.bellEnabled, false, "legacy unsaved preference semantics stay unchanged");
+		assert.match(coordinator.read().notice ?? "", /could not be saved/);
+		const published = readFileSync(fixture.preferencesPath);
+
+		policy.fail = null;
+		await coordinator.perform({ type: "peer-viewer-native-input", enabled: true });
+		assert.equal(coordinator.content.readViewerNativeInputPolicy?.().enabled, false,
+			"an unusable handle cannot automatically re-enable input/copy");
+		assert.deepEqual(readFileSync(fixture.preferencesPath), published, "no repair or replacement of the unavailable document");
+	}
+});
+
 test("a present malformed flag makes settings unavailable, untouched, and both facts Off", async (t) => {
 	const fixture = createOwnedAgentDir(t);
 	const seed = await startCoordinator(t, { agentDir: fixture.agentDir, testHooks: hooks() });

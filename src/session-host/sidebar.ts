@@ -3166,6 +3166,77 @@ export class SidebarController {
   }
 
   /**
+   * Main's QUEUED-write re-proof for one remote entry intent Main has ALREADY
+   * admitted (and consumed) from its own exact actually-written receipt. It is
+   * read-only and REMOTE-only, and it never admits anything by itself: a caller
+   * that has not proved and consumed a written receipt must use
+   * {@link remoteSavedIntentStillCurrent} instead.
+   *
+   * It re-proves the same semantic ownership as that admission check — the exact
+   * pending operation of this kind with every frozen owner handle, the frame
+   * token it was emitted from, and its view epoch; the open picker; the right
+   * focus and confirmation purpose (and, for Delete, the frozen confirmation
+   * target); the same picker, query revision, destination, usable run, catalog,
+   * result, selection, and cached entry; and for Delete-prepare/Delete the
+   * OWNER's live exposure — and deliberately ignores ONLY the per-render mutable
+   * frame token currency and written flag. Those re-mint on every harmless
+   * repaint (the Delete confirmation mints a new token on every render), so
+   * checking them here would let an identical redraw refuse an already admitted
+   * intent; Main's own geometry and lifetime epochs cover what they would add.
+   */
+  remoteSavedAdmittedIntentStillOwned(
+    intent: Extract<PeerSavedUiAction, {
+      readonly type: "saved-remote-resume" | "saved-remote-delete-prepare" | "saved-remote-delete";
+    }>,
+  ): boolean {
+    const operation = intent.type === "saved-remote-resume"
+      ? this.pendingRemoteSavedResume
+      : intent.type === "saved-remote-delete-prepare"
+        ? this.pendingRemoteSavedDeleteCheck
+        : this.remoteSavedDeleteOperation;
+    if (operation === undefined || operation.requestId !== intent.requestId
+      || operation.pickerId !== intent.pickerId || operation.revision !== intent.revision
+      || operation.hostId !== intent.hostId || operation.hostRunId !== intent.hostRunId
+      || operation.catalogId !== intent.catalogId || operation.resultId !== intent.resultId
+      || operation.entryId !== intent.entryId || operation.renderToken !== intent.renderToken) return false;
+    if (!this._visible || this.formKind !== "saved") return false;
+    if (intent.type === "saved-remote-delete") {
+      const target = this.remoteSavedDeleteTarget;
+      if (target === undefined || this._focus !== "confirm" || this.confirmPurpose !== "saved-delete") return false;
+      // The confirmed operation is the frozen target plus its own request id and
+      // confirmation token: every other frozen fact must still be that target's.
+      if (target.pickerId !== operation.pickerId || target.revision !== operation.revision
+        || target.hostId !== operation.hostId || target.hostRunId !== operation.hostRunId
+        || target.catalogId !== operation.catalogId || target.resultId !== operation.resultId
+        || target.entryId !== operation.entryId || target.index !== operation.index
+        || target.selectedIndex !== operation.selectedIndex || target.viewEpoch !== operation.viewEpoch) return false;
+    } else if (this._focus !== "form") {
+      return false;
+    }
+    if (intent.type !== "saved-remote-resume" && this.currentSavedHostOption()?.deleteExposed !== true) return false;
+    return this.remoteSavedOperationOwned(operation);
+  }
+
+  /**
+   * Main's SILENT retirement of one outstanding remote read it never submitted
+   * (a newer unsent read replaced it before the destination was free). The read
+   * is forgotten exactly like an answered one, so the picker can request that
+   * range again later instead of keeping a permanent loading hole. Nothing else
+   * changes: no notice, redraw request, follow-up read, retry, or cancellation
+   * claim, and a request that is not outstanding here is a no-op (`false`).
+   */
+  retireUnsentRemoteSavedRead(requestId: number): boolean {
+    const state = this.remoteSaved;
+    if (state === undefined) return false;
+    const intent = state.resultRead?.requestId === requestId
+      ? state.resultRead
+      : state.windowReads.find((candidate) => candidate.requestId === requestId);
+    if (intent === undefined) return false;
+    this.retireRemoteSavedRead(state, intent);
+    return true;
+  }
+
+  /**
    * Resolve one remote Resume. The OWNER created/selected its row; this side
    * selects that exact owner run/row ONLY while the exact request still owns the
    * picker (same picker, query, destination, run, catalog, result, entry, and
@@ -3212,9 +3283,8 @@ export class SidebarController {
 
   /**
    * The owner answered one Delete prepare. A prepare is never a confirmation:
-   * only an allowed answer for the still-owned exact row, while the OWNER still
-   * exposes remote delete, opens the same written-confirmation dialog the local
-   * picker uses (annotated with the owner host).
+   * only an allowed answer for the still-owned exact row opens the same written
+   * confirmation dialog the local picker uses (annotated with the owner host).
    */
   completeRemoteSavedDeletePrepare(requestId: number, allowed: boolean, message?: string): boolean {
     const context = this.pendingRemoteSavedDeleteCheck;
@@ -3222,11 +3292,6 @@ export class SidebarController {
     this.pendingRemoteSavedDeleteCheck = undefined;
     if (!this._visible || this._focus !== "form" || this.formKind !== "saved"
       || !this.remoteSavedOperationOwned(context)) return false;
-    if (this.currentSavedHostOption()?.deleteExposed !== true) {
-      this.savedError = REMOTE_SAVED_DELETE_OFF_NOTICE;
-      this.onInvalidate?.();
-      return true;
-    }
     if (allowed !== true) {
       this.savedError = sanitizeBounded(message ?? "Saved conversation is not safe to delete", ERROR_TEXT_MAX_CODEPOINTS);
       this.onInvalidate?.();
@@ -3270,10 +3335,10 @@ export class SidebarController {
   /**
    * Newest live OWNER delete exposure for the selected destination and exact
    * owner run (from a policy fact Main observed). It is a description, never
-   * permission. Off or unknown hides the delete hints, refuses new deletes, and
-   * invalidates an UNSUBMITTED prepare or confirmation; an already emitted
-   * confirmed delete keeps its completion ownership. On restores the hints
-   * without relisting or rebinding anything. A later snapshot that reports a
+   * permission. Off or unknown hides the delete hints and refuses new sends,
+   * without retiring a preparation or confirmation solely for a policy change.
+   * An already emitted confirmed delete keeps its completion ownership. On
+   * restores hints without relisting or rebinding anything. A later snapshot that reports a
    * concrete exposure for that destination replaces this value.
    */
   updateRemoteSavedDeleteExposure(hostId: string, hostRunId: string, deleteExposed: boolean | null): boolean {
@@ -6224,9 +6289,9 @@ export class SidebarController {
   /**
    * The written remote delete confirmation: the same keys and the same written
    * warning fence as the local dialog. Pasted bodies never reach here (routed as
-   * opaque by `handleConfirmInput`). An unsubmitted confirmation whose owner
-   * policy turned Off, or whose run/result changed, closes with a fixed notice;
-   * an emitted delete is never sent twice.
+   * opaque by `handleConfirmInput`). An actual confirmation attempt while the
+   * current owner exposure is Off, or whose run/result changed, closes with a
+   * fixed notice; an emitted delete is never sent twice.
    */
   private handleRemoteSavedDeleteConfirmInput(data: string): void {
     if (this.savedMatches(data, "tui.select.cancel")) {
@@ -6273,9 +6338,8 @@ export class SidebarController {
    * unsupported, or re-run destination retires every fact bound to the old run
    * (catalog, result, windows, reads, drawn frame, unsubmitted prepare or
    * confirmation) and says so; nothing is relisted, retried, reconnected, or
-   * retargeted. The OWNER's live delete exposure turning Off (or unknown)
-   * invalidates an unsubmitted prepare/confirmation only; an emitted delete
-   * keeps its completion ownership. Turning On only restores the hints.
+   * retargeted. The OWNER's live delete exposure only controls current hints
+   * and send preflight; a transient policy change retires no semantic target.
    */
   private reconcileSavedPickerHost(): void {
     if (this.savedPickerId === undefined) return;
@@ -6301,16 +6365,6 @@ export class SidebarController {
       }
       this.remoteSavedNotice = REMOTE_SAVED_HOST_CHANGED_NOTICE;
       return;
-    }
-    if (usable && option !== undefined && option.deleteExposed !== true) {
-      if (this.pendingRemoteSavedDeleteCheck !== undefined) {
-        this.pendingRemoteSavedDeleteCheck = undefined;
-        this.savedError = REMOTE_SAVED_DELETE_OFF_NOTICE;
-      }
-      if (this.remoteSavedDeleteTarget !== undefined && this.remoteSavedDeleteOperation === undefined) {
-        this.cancelSavedDeleteConfirmation();
-        this.savedError = REMOTE_SAVED_DELETE_OFF_NOTICE;
-      }
     }
   }
 

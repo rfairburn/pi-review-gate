@@ -1192,9 +1192,9 @@ class OwnedPeerCoordinator implements
 	#remoteHistoryDeleteEffective = false;
 	/**
 	 * Sticky for the lifecycle: the protected preferences handle was poisoned by a
-	 * publication failure at or after its commit point. Only the owner delete
-	 * exposure consults it (fail closed); every other preference keeps its existing
-	 * persistence semantics.
+	 * publication failure at or after its commit point. The viewer native I/O and
+	 * owner delete policies consult it (fail closed); unrelated preferences keep
+	 * their existing persistence semantics.
 	 */
 	#preferencesHandleUnusable = false;
 	readonly #consentWindowMs: number;
@@ -3097,8 +3097,10 @@ class OwnedPeerCoordinator implements
 	 * fences are re-proved after it returns each time.
 	 *
 	 * This viewer's own native input/copy preference and its own (owner-side)
-	 * remote-history delete setting never gate a Saved request: the owner decides
-	 * its own live policy. Nothing is queued, retried, replayed, reconnected,
+	 * remote-history delete setting never gate a Saved request. Delete/prepare
+	 * requires the owner's current positive description at admission and send;
+	 * the owner independently decides its policy once when admitting the request.
+	 * Nothing is retried, replayed, reconnected,
 	 * re-granted, or cancelled here, and an ordinary roster publication or revision
 	 * never invalidates a catalog, a result, or an accepted mutation.
 	 */
@@ -3165,11 +3167,22 @@ class OwnedPeerCoordinator implements
 		if (!this.#savedFenceHolds(runtime, viewer, metadata, client, destinationEpoch, hostRunId)) {
 			return { kind: "not-sent", reason: "target-unavailable" };
 		}
+		// Current last-advertised owner exposure only: no policy transition history.
+		const deleteExposed = (): boolean =>
+			this.#savedHostFacts(runtime, this.#readPin(runtime.id))?.deleteExposed === true;
+		if (kind === "remove" && (!deleteExposed()
+			|| !this.#savedFenceHolds(runtime, viewer, metadata, client, destinationEpoch, hostRunId))) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
 		const sendOptions = Object.freeze({
 			// The last-instant half of the same fence, evaluated synchronously by the
 			// raw viewer immediately before its queued write calls `channel.send`.
 			stillCurrent: (): boolean => {
 				if (!callerHolds()) return false;
+				if (kind === "remove") {
+					if (!this.#savedFenceHolds(runtime, viewer, metadata, client, destinationEpoch, hostRunId)) return false;
+					if (!deleteExposed()) return false;
+				}
 				return this.#savedFenceHolds(runtime, viewer, metadata, client, destinationEpoch, hostRunId);
 			},
 		});
@@ -3535,6 +3548,11 @@ class OwnedPeerCoordinator implements
 			this.#setContentUnavailable(epoch, "destination-unavailable", true);
 			return;
 		}
+		// A genuinely reachable retained target is opening now. Do not publish a
+		// stale missing-row refusal while its first viewport is still awaited.
+		// This changes no authority, attempt ownership, or retry/rearm decision.
+		selection.state = "connecting";
+		selection.reason = null;
 		const destinationEpoch = runtime.epoch;
 		const abort = new AbortController();
 		this.#contentAbort = abort;
@@ -4644,7 +4662,7 @@ class OwnedPeerCoordinator implements
 
 	/** Effective viewer-side remote input/copy preference right now (fail closed). */
 	#viewerInputEnabledNow(): boolean {
-		if (this.#closed || this.#tearingDown) return false;
+		if (this.#closed || this.#tearingDown || this.#preferencesHandleUnusable) return false;
 		const preferences = this.#preferences;
 		return preferences !== null && preferences.viewerNativeInputEnabled === true;
 	}
@@ -4693,9 +4711,9 @@ class OwnedPeerCoordinator implements
 			return true;
 		} catch {
 			// A failure at or after the store's commit point poisons its handle: the
-			// protected settings are then unavailable for this lifecycle, and the owner
-			// remote-history delete exposure fails closed (recorded BEFORE any apply, so
-			// the change-only notification below sees the closed value). A pre-commit
+			// protected settings are then unavailable for this lifecycle, and both the
+			// viewer native I/O and owner delete policies fail closed (recorded BEFORE
+			// any apply, so the change-only notifications see the closed value). A pre-commit
 			// failure leaves the handle usable and changes nothing here.
 			if (!this.#preferencesHandleUsable(store)) this.#preferencesHandleUnusable = true;
 			if (options.applyOnFailure === true) {
@@ -4704,6 +4722,7 @@ class OwnedPeerCoordinator implements
 				this.#applyPreferences(value);
 			}
 			// Change-only: a usable handle with an unchanged policy notifies nothing.
+			this.#noteViewerInputPolicy();
 			this.#noteRemoteHistoryPolicy();
 			this.#transientNotice = NOTICE.preferencesUnsaved;
 			this.#emit();

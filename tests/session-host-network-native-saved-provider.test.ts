@@ -978,12 +978,14 @@ test("prepare is native validation only and a confirmation spends exactly that p
   assert.deepEqual(refreshed.entries.map((entry) => entry.sessionId), ["id-b", "id-c"]);
 });
 
-test("the live server policy is re-proved before preparation and before every mutation stage", async (t) => {
+test("independent authorization is re-proved before preparation and every mutation stage", async (t) => {
   const fixture = await makeFixture(t);
   await seedThree(fixture);
   const host = new FakeHost();
   const plan = host.plan;
   const view = makeView(host, fixture);
+  // This injected guard models revocable authority, not the owner preference
+  // (which the bridge decides once at request admission).
   const policy = { on: false };
   const deleteGuard: OwnerSavedAuthorizationGuard = () => policy.on;
   let window = await listWindow(view);
@@ -999,7 +1001,7 @@ test("the live server policy is re-proved before preparation and before every mu
   assert.deepEqual(await view.remove({ ...handles, confirmed: true }, deleteGuard), { kind: "refused", reason: "policy" });
   policy.on = true;
 
-  // Policy turns off by the primitive's final authorization: refused before trash.
+  // Authorization is lost at the primitive's final check: refused before trash.
   window = await listWindow(view);
   handles = handlesOf(window, entryOf(window, "id-a"));
   await view.remove({ ...handles, confirmed: false }, allow);
@@ -1012,7 +1014,7 @@ test("the live server policy is re-proved before preparation and before every mu
   assert.equal(plan.deleteCalls, 1, "the guarded primitive was entered");
   assert.deepEqual(plan.trashCalls, [], "and its first-stage authorization refused before trash");
 
-  // Policy turns off after trash failed: the fallback is refused, never reported as no change.
+  // Authorization is lost after trash failed: the fallback is refused, never reported as no change.
   window = await listWindow(view);
   handles = handlesOf(window, entryOf(window, "id-a"));
   await view.remove({ ...handles, confirmed: false }, deleteGuard);
@@ -1021,11 +1023,11 @@ test("the live server policy is re-proved before preparation and before every mu
     return 1;
   };
   assert.deepEqual(await view.remove({ ...handles, confirmed: true }, deleteGuard), { kind: "unconfirmed" });
-  assert.deepEqual(plan.unlinkCalls, [], "no unlink after the policy turned off");
+  assert.deepEqual(plan.unlinkCalls, [], "no unlink after independent authorization was lost");
   assert.ok(readFileSync(join(fixture.projectDir, "id-a.jsonl"), "utf8").includes("id-a"));
   policy.on = true;
 
-  // Policy turns off only after the trash succeeded: the actual outcome is reported.
+  // Authorization is lost only after trash succeeded: the actual outcome is reported.
   window = await listWindow(view);
   handles = handlesOf(window, entryOf(window, "id-a"));
   await view.remove({ ...handles, confirmed: false }, deleteGuard);

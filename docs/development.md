@@ -396,6 +396,13 @@ They are separate proof levels:
 - `peer-saved-sidebar.test.ts` covers the pure picker: selected-host display, bounded
   windows, written-frame authority, confirmations, and request lifetimes.
 
+The Saved policy cases distinguish current client exposure preflight from the owner's
+once-per-request admission decision. They cover current Off blocking send, Off then On
+before queued send preserving the still-owned intent, stale client On with owner Off
+refusing before provider work, and preference changes after owner admission not revoking
+the request. Independent grant, binding, run, and native file guards remain live; native
+input/copy preference generations are separate and unchanged.
+
 The owner's guarded native resume and delete are also covered by
 `session-host-instances.test.ts` and `session-host-owning-host-service.test.ts`, using
 mock PTYs and owned synthetic Saved-file and filesystem fixtures, not a native Pi child.

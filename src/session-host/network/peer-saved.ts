@@ -37,7 +37,8 @@
  *   after an authorized request and disposed with that binding. `dispose()`
  *   releases read state only and never cancels, rolls back, or claims to stop an
  *   accepted resume or delete.
- * - Delete exposure is a live owner/server policy, read at every decision point.
+ * - Delete exposure is an owner/server policy, read once per incoming
+ *   delete/prepare request at admission, independently of later authorization.
  *   A negotiated capability, a requester's confirmation, or a viewer-side policy
  *   description is never delete permission.
  */
@@ -214,9 +215,9 @@ export type OwnerSavedDeleteFacts =
 /**
  * One reusable synchronous re-proof handed to every provider operation: `true`
  * only while the exact proved peer key, the current receiving grant, the live
- * binding, the exact current owner run, and (for delete) the live server delete
- * policy all still hold. It is a check, never a lease; `false` or a throw means
- * the operation must not proceed past that point.
+ * binding, and the exact current owner run all still hold. Delete preference
+ * was decided once at request admission. It is a check, never a lease; `false`
+ * or a throw means the operation must not proceed past that point.
  */
 export type OwnerSavedAuthorizationGuard = () => boolean;
 

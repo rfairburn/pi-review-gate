@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 
 import { createPeerCoordinator, type PeerCoordinatorTestHooks } from "../src/session-host/network/peer-coordinator";
+import { decodeRosterBridgeFrame } from "../src/session-host/network/roster-bridge-protocol";
 import type {
 	OwnerSavedAuthorizationGuard,
 	OwnerSavedCatalogView,
@@ -185,6 +186,7 @@ async function savedPair(
 		readonly savedViewer?: boolean;
 		/** Fixture-only: the owner's preferences protection policy, to inject failures. */
 		readonly ownerPreferencesPolicy?: PeerStateTestPolicy;
+		readonly wrapRequesterChannel?: PeerCoordinatorTestHooks["wrapClientChannel"];
 	},
 ): Promise<SavedPair> {
 	const ownerFixture = createOwnedAgentDir(t);
@@ -201,7 +203,7 @@ async function savedPair(
 	const requester = await startCoordinator(t, {
 		agentDir: requesterFixture.agentDir,
 		inventory: createFakeInventory(),
-		testHooks: hooks(),
+		testHooks: { ...hooks(), ...(options.wrapRequesterChannel === undefined ? {} : { wrapClientChannel: options.wrapRequesterChannel }) },
 		...(options.savedViewer === undefined ? {} : { savedViewer: options.savedViewer }),
 	});
 	await requester.coordinator.perform({ type: "peer-add", label: "Owner host", host: "127.0.0.1", port: String(port) });
@@ -390,8 +392,10 @@ test("the owner delete policy is described live without a roster refresh and Off
 		confirmed: true,
 	};
 	assert.deepEqual(await pair.requester.coordinator.ownerSaved.remove(target, PROVEN), {
-		kind: "owner-result",
-		outcome: { kind: "refused", reason: "policy" },
+		kind: "not-sent", reason: "target-unavailable",
+	});
+	assert.deepEqual(await pair.requester.coordinator.ownerSaved.remove({ ...target, confirmed: false }, PROVEN), {
+		kind: "not-sent", reason: "target-unavailable",
 	});
 	assert.equal(provider.calls.some((call) => call.op === "remove"), false, "Off never reaches the provider");
 
@@ -409,6 +413,73 @@ test("the owner delete policy is described live without a roster refresh and Off
 		entryId: "entry-0",
 		confirmed: true,
 	}]);
+});
+
+test("the coordinator checks current owner exposure at the actual queued Delete write, without policy history", async (t) => {
+	for (const restoreOn of [false, true]) {
+		const provider = savedProvider();
+		let releaseWrite: () => void = () => undefined;
+		let deleteFrames = 0;
+		const pair = await savedPair(t, {
+			factory: provider.factory, savedViewer: true,
+			wrapRequesterChannel: (channel) => ({
+				get peerKey() { return channel.peerKey; },
+				get lane() { return channel.lane; },
+				get label() { return channel.label; },
+				get bufferedAmount() { return channel.bufferedAmount; },
+				get closed() { return channel.closed; },
+				close: () => channel.close(),
+				onMessage: (handler) => channel.onMessage(handler),
+				send: (bytes) => {
+					const frame = decodeRosterBridgeFrame(bytes);
+					if (frame.type === "saved_delete_request") deleteFrames += 1;
+					const sent = channel.send(bytes);
+					if (frame.type !== "saved_list_request") return sent;
+					// The real list reaches the owner and answers normally, but its
+					// send completion holds the viewer's ordered write tail.
+					const gate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+					return sent.then(() => gate);
+				},
+			}),
+		});
+		try {
+			await waitSaved(pair.requester, true, "the initial On description");
+			const listed = await pair.requester.coordinator.ownerSaved.list(
+				{ hostId: pair.hostId, hostRunId: pair.hostRunId, query: "", offset: 0, count: 1 }, PROVEN,
+			);
+			assert.equal(listed.kind, "owner-result");
+			let proofCalls = 0;
+			const target = {
+				hostId: pair.hostId, hostRunId: pair.hostRunId,
+				catalogId: "cat-1", resultId: "res-1", entryId: "entry-0", confirmed: true,
+			};
+			const pending = pair.requester.coordinator.ownerSaved.remove(target, {
+				stillCurrent: () => { proofCalls += 1; return true; },
+			});
+			assert.equal(proofCalls, 1, "admitted On, with its actual write still queued");
+			await pair.owner.coordinator.perform({ type: "peer-remote-history-delete", enabled: false });
+			await waitSaved(pair.requester, false, "Off while the Delete is queued");
+			assert.equal(deleteFrames, 0, "no Delete frame has reached channel.send");
+			if (restoreOn) {
+				await pair.owner.coordinator.perform({ type: "peer-remote-history-delete", enabled: true });
+				await waitSaved(pair.requester, true, "On again before the actual write");
+			}
+			releaseWrite();
+			assert.deepEqual(await pending, restoreOn
+				? { kind: "owner-result", outcome: { kind: "deleted", method: "trash" } }
+				: { kind: "not-sent", reason: "target-unavailable" });
+			assert.ok(proofCalls >= 2, "the raw queued-write proof was evaluated");
+			assert.equal(deleteFrames, restoreOn ? 1 : 0, "only current On permits the actual send");
+			assert.equal(provider.calls.filter((call) => call.op === "remove").length, restoreOn ? 1 : 0);
+			if (!restoreOn) {
+				await pair.owner.coordinator.perform({ type: "peer-remote-history-delete", enabled: true });
+				await waitSaved(pair.requester, true, "On after the refused send");
+				assert.equal(deleteFrames, 0, "later On never replays the refused attempt");
+			}
+		} finally {
+			releaseWrite();
+		}
+	}
 });
 
 test("owner protected settings that become unavailable after publication fail delete exposure closed, live", async (t) => {
@@ -438,14 +509,14 @@ test("owner protected settings that become unavailable after publication fail de
 	assert.equal(pair.owner.inventory.revisions, revisions);
 	assert.equal(pair.owner.inventory.activeWatches, watches);
 
-	// A later delete is refused by the owner before any provider mutation, and an
+	// A later delete is refused at current client preflight before provider work, and an
 	// attempted re-enable on the unusable handle cannot restore exposure.
 	await pair.owner.coordinator.perform({ type: "peer-remote-history-delete", enabled: true });
 	assert.equal(pair.owner.coordinator.readRemoteHistoryDeleteEnabled(), false);
 	assert.deepEqual(await pair.requester.coordinator.ownerSaved.remove(
 		{ hostId: pair.hostId, hostRunId: pair.hostRunId, catalogId: "cat-1", resultId: "res-1", entryId: "entry-0", confirmed: true },
 		PROVEN,
-	), { kind: "owner-result", outcome: { kind: "refused", reason: "policy" } });
+	), { kind: "not-sent", reason: "target-unavailable" });
 	assert.equal(provider.calls.some((call) => call.op === "remove"), false);
 	assert.equal(savedOf(pair.requester.coordinator.read())?.deleteExposed, false);
 });

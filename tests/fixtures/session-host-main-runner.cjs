@@ -50,18 +50,42 @@ function installPtyExitObservation(mainEntry, logPath, controlLogPath) {
     const handle = originalSpawn.call(nodePty, file, args, options);
     if (controlLogPath && typeof handle.write === 'function') {
       const originalWrite = handle.write;
+      let observeInput;
+      try {
+        const { HOST_BOOTSTRAP_ENV, parseBootstrap } = productionRequire('./protocol.js');
+        const bootstrap = parseBootstrap(JSON.parse(options.env[HOST_BOOTSTRAP_ENV]));
+        if (bootstrap && bootstrap.inputOriginFraming === 1) {
+          const decoder = productionRequire('./native-input-origin.js').createNativeInputDecoder(bootstrap);
+          const escapes = ['\x1b', '\x1b[27u', '\x1b[27;1u', '\x1b[27;1:1u'].map((key) => Buffer.from(key));
+          observeInput = (data) => {
+            const decoded = decoder.feed(data);
+            if (!decoded.ok) { observeInput = undefined; return []; }
+            return decoded.fragments.flatMap((fragment) => {
+              const encoding = escapes.findIndex((key) => key.equals(fragment.payload));
+              return fragment.start && fragment.end && fragment.part === 0 && encoding !== -1
+                ? [{ encoding: encoding === 0 ? 'legacy' : 'csi-u', framing: 'authenticated', origin: fragment.origin.kind }]
+                : [];
+            });
+          };
+        } else if (bootstrap) {
+          observeInput = (data) => typeof data === 'string'
+            && (data === '\x1b' || /^\x1b\[27(?:;1(?::1)?)?u$/.test(data))
+            ? [{ encoding: data === '\x1b' ? 'legacy' : 'csi-u' }] : [];
+        }
+      } catch { /* missing or unusable owned bootstrap never downgrades to raw observation */ }
       handle.write = function observedWrite(...writeArgs) {
-        const result = originalWrite.apply(this, writeArgs);
-        const data = writeArgs[0];
-        if (typeof data === 'string' && (data === '\x1b' || /^\x1b\[27(?:;1(?::1)?)?u$/.test(data))) {
-          try {
+        let result;
+        try { result = originalWrite.apply(this, writeArgs); }
+        catch (error) { observeInput = undefined; throw error; }
+        try {
+          for (const control of observeInput ? observeInput(writeArgs[0]) : []) {
             fs.appendFileSync(controlLogPath, `${JSON.stringify({
               type: 'pty_control', key: 'escape', pid: handle.pid,
               cwd: options && typeof options.cwd === 'string' ? options.cwd : undefined,
-              encoding: data === '\x1b' ? 'legacy' : 'csi-u',
+              ...control,
             })}\n`, 'utf8');
-          } catch { /* observation never changes the real write outcome */ }
-        }
+          }
+        } catch { observeInput = undefined; /* observation never changes the real write outcome */ }
         return result;
       };
     }

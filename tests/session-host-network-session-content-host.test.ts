@@ -39,6 +39,7 @@ import type {
 	SessionViewerUpdate,
 	SessionViewerUpdateResult,
 } from "../src/session-host/instances";
+import { isNativeViewerStartupInputSource } from "../src/session-host/instances";
 import { translateInput } from "../src/session-host/input";
 import type { NativeClipboardEvent } from "../src/session-host/native-clipboard";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
@@ -83,6 +84,7 @@ import {
 	createSessionContentTransferAssembler,
 	decodeSessionContentFrame,
 	encodeSessionContentFrame,
+	isNativeIoStartupSource,
 	isSessionContentProtocolError,
 	nativeIoSourceEquals,
 	type NativeIoBuiltTransfer,
@@ -660,7 +662,10 @@ class FakeContentSource implements SessionContentSource {
 		if (this.inputWriteOutcome !== undefined) return this.inputWriteOutcome;
 		const current = this.readViewerInputSource(viewerId);
 		if (current === undefined) return { status: "refused", reason: "no-input-source" };
-		if (!sameScopeFacts(current, request.expectedSource)) return { status: "refused", reason: "stale-source" };
+		// This fake models only conversation scopes, so a startup expectation is stale.
+		const expected = request.expectedSource;
+		if (isNativeViewerStartupInputSource(expected)) return { status: "refused", reason: "stale-source" };
+		if (!sameScopeFacts(current, expected)) return { status: "refused", reason: "stale-source" };
 		if (!sameModesFacts(this.inputModes, request.expectedInputModes)) {
 			return { status: "refused", reason: "stale-input-modes" };
 		}
@@ -1028,7 +1033,12 @@ async function openNativeHello(harness: Harness): Promise<void> {
 function publishedSource(channel: ContentChannel): NativeIoSource | null | undefined {
 	const begin = framesOfType(channel.frames(), "content_begin").at(-1);
 	assert.ok(begin !== undefined, "a viewport must have been published");
-	return begin.inputSource;
+	const stated = begin.inputSource;
+	// This fake publishes tuple-carrying viewports only; a startup source here is a defect.
+	if (stated !== undefined && stated !== null && isNativeIoStartupSource(stated)) {
+		throw new Error("a tuple-carrying publish never states a startup source");
+	}
+	return stated;
 }
 
 /** Subscribe a negotiated binding and return the source this endpoint published. */

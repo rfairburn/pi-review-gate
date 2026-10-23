@@ -17,13 +17,15 @@ import { createNativeClipboardReceiver, type NativeClipboardEvent, type NativeCl
 import {
 	createNativeInputEncoder,
 	mintNativeViewerScopeToken,
+	mintNativeViewerStartupScopeToken,
 	parseNativeViewerScopeToken,
 	verifyNativeViewerScopeToken,
 	NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES,
 	type NativeInputEncoder,
-	type NativeInputExpectedTuple,
+	type NativeInputExpectedFence,
 	type NativeInputOrigin,
 	type NativeViewerScopeFacts,
+	type NativeViewerStartupScopeFacts,
 } from "./native-input-origin";
 import {
 	hasCompleteSessionIdle,
@@ -284,6 +286,42 @@ export interface NativeViewerInputSource {
 }
 
 /**
+ * The host's own immutable description of one viewer's input scope while its row
+ * is in the explicit native STARTUP phase (issue 389): the row's own registration
+ * is framed, ready, and still before its first accepted status, and the manager
+ * has never observed a conversation tuple for it.
+ *
+ * It carries the same run, viewer, row, registration, geometry, and token facts as
+ * {@link NativeViewerInputSource}, an explicit `phase: "startup"`, and NO
+ * `nativeSession` key at all — never a null, empty, or fabricated tuple, and never
+ * a claim that no native conversation exists. Its token lives in a separate
+ * commitment domain, so it can never be read or verified as a conversation-copy
+ * scope. Input-only: no copy receipt ever carries it.
+ */
+export interface NativeViewerStartupInputSource {
+	readonly hostRunId: string;
+	readonly viewerId: string;
+	readonly viewerRevision: number;
+	readonly rowId: string;
+	readonly phase: "startup";
+	readonly geometry: NativeViewerInputGeometry;
+	readonly registrationIdentity: string;
+	readonly registrationGeneration: string;
+	/** Descriptive, echoable host-minted `nvst1` token; never a grant by itself. */
+	readonly sourceToken: string;
+}
+
+/** The input-path union: an unchanged conversation source or a startup source. */
+export type NativeViewerAnyInputSource = NativeViewerInputSource | NativeViewerStartupInputSource;
+
+/** True for the startup variant of an input-path source. */
+export function isNativeViewerStartupInputSource(
+	source: NativeViewerAnyInputSource,
+): source is NativeViewerStartupInputSource {
+	return (source as { readonly phase?: unknown }).phase === "startup";
+}
+
+/**
  * Why one viewer input was refused. Every refusal happens strictly BEFORE any PTY
  * write, and none of them is a retry instruction.
  */
@@ -324,7 +362,8 @@ export type NativeViewerInputResult =
 
 /** One strict viewer input request: current facts, current modes, and the bytes. */
 export interface NativeViewerInputRequest {
-	readonly expectedSource: NativeViewerInputSource;
+	/** The exact current source: a conversation source or, before the first status, a startup source. */
+	readonly expectedSource: NativeViewerAnyInputSource;
 	readonly expectedInputModes: TerminalInputModes;
 	/**
 	 * Native translated bytes; legacy X10 mouse packets must remain byte-oriented.
@@ -713,6 +752,15 @@ interface ManagedInstance {
 	 */
 	inputFramingReady: boolean;
 	/**
+	 * Sticky per-registration startup-phase fact (issue 389). Set once, only when a
+	 * correctly framed registration is recorded, and cleared for good at this
+	 * registration's first ACCEPTED status (even one with a null tuple), a reporter
+	 * disconnect or reconnect, registration release, a stop that closes admission,
+	 * the child's exit, and manager stop/disposal. It never reopens within one
+	 * process incarnation, and it is never inferred from a missing tuple.
+	 */
+	startupInputOpen: boolean;
+	/**
 	 * One encoder per registration, created from this registration's own
 	 * bootstrap before the child spawned. Never reset on reporter reconnect or
 	 * extension reload; a new child/registration gets a new encoder.
@@ -881,6 +929,12 @@ const LOCAL_INPUT_ORIGIN: NativeInputOrigin = Object.freeze({ kind: "local" } as
  */
 const PROTOCOL_INPUT_ORIGIN: NativeInputOrigin = Object.freeze({ kind: "none" } as const);
 
+/**
+ * The closed child-side fence of a startup-phase viewer dispatch. It names the
+ * child's own explicit startup phase and nothing else: no tuple, id, or epoch.
+ */
+const STARTUP_INPUT_FENCE: NativeInputExpectedFence = Object.freeze({ phase: "startup" } as const);
+
 /** Printable-ASCII bounded identity field shared by every viewer input source fact. */
 const VIEWER_FACT_FIELD = /^[\x21-\x7e]{1,128}$/;
 const VIEWER_MOUSE_TRACKING_MODES = new Set<string>(["none", "x10", "vt200", "drag", "any"]);
@@ -942,12 +996,67 @@ function isViewerInputSource(value: unknown): value is NativeViewerInputSource {
 		|| typeof native.epoch !== "number" || !Number.isSafeInteger(native.epoch) || native.epoch < 1) {
 		return false;
 	}
+	return isViewerInputGeometry(geometry);
+}
+
+function isViewerInputGeometry(geometry: unknown): boolean {
 	return isPlainRecord(geometry) && hasExactKeys(geometry, ["cols", "rows", "revision"])
 		&& typeof geometry.cols === "number" && Number.isSafeInteger(geometry.cols)
 		&& geometry.cols >= 1 && geometry.cols <= 1000
 		&& typeof geometry.rows === "number" && Number.isSafeInteger(geometry.rows)
 		&& geometry.rows >= 1 && geometry.rows <= 1000
 		&& isOrdinal(geometry.revision);
+}
+
+/**
+ * Closed shape check for a startup source: exactly its own keys, an explicit
+ * `phase: "startup"`, and no `nativeSession` key at all (a null or fake one fails).
+ */
+function isViewerStartupInputSource(value: unknown): value is NativeViewerStartupInputSource {
+	if (!isPlainRecord(value)
+		|| !hasExactKeys(value, [
+			"hostRunId", "viewerId", "viewerRevision", "rowId", "phase", "geometry",
+			"registrationIdentity", "registrationGeneration", "sourceToken",
+		])) {
+		return false;
+	}
+	return value.phase === "startup"
+		&& isBoundedFactField(value.hostRunId)
+		&& isBoundedFactField(value.sourceToken)
+		&& isBoundedFactField(value.rowId)
+		&& isBoundedFactField(value.registrationIdentity)
+		&& isBoundedFactField(value.registrationGeneration)
+		&& isOrdinal(value.viewerRevision)
+		&& isViewerInputGeometry(value.geometry);
+}
+
+/** Variant-aware shape check for an expected input source handed back by a caller. */
+function isAnyViewerInputSource(value: unknown): value is NativeViewerAnyInputSource {
+	if (isPlainRecord(value) && Object.hasOwn(value, "phase")) return isViewerStartupInputSource(value);
+	return isViewerInputSource(value);
+}
+
+/**
+ * Variant-aware exact equality of two input-path sources. A startup source never
+ * equals a conversation source, whatever their other facts say.
+ */
+function sameAnyViewerInputSource(left: NativeViewerAnyInputSource, right: NativeViewerAnyInputSource): boolean {
+	const leftStartup = isNativeViewerStartupInputSource(left);
+	const rightStartup = isNativeViewerStartupInputSource(right);
+	if (leftStartup !== rightStartup) return false;
+	if (leftStartup && rightStartup) {
+		return left.hostRunId === right.hostRunId
+			&& left.viewerId === right.viewerId
+			&& left.viewerRevision === right.viewerRevision
+			&& left.rowId === right.rowId
+			&& left.geometry.cols === right.geometry.cols
+			&& left.geometry.rows === right.geometry.rows
+			&& left.geometry.revision === right.geometry.revision
+			&& left.registrationIdentity === right.registrationIdentity
+			&& left.registrationGeneration === right.registrationGeneration
+			&& left.sourceToken === right.sourceToken;
+	}
+	return sameViewerInputSource(left as NativeViewerInputSource, right as NativeViewerInputSource);
 }
 
 function sameViewerInputSource(left: NativeViewerInputSource, right: NativeViewerInputSource): boolean {
@@ -993,7 +1102,7 @@ function sameViewerInputModes(left: TerminalInputModes, right: TerminalInputMode
 function invalidViewerInputRequest(request: NativeViewerInputRequest): boolean {
 	if (!isPlainRecord(request)
 		|| !hasExactKeys(request, ["expectedSource", "expectedInputModes", "data"])) return true;
-	if (!isViewerInputSource(request.expectedSource)) return true;
+	if (!isAnyViewerInputSource(request.expectedSource)) return true;
 	if (!isViewerInputModes(request.expectedInputModes)) return true;
 	if ((typeof request.data !== "string" && !Buffer.isBuffer(request.data)) || request.data.length === 0) return true;
 	// The child assembles ONE viewer dispatch whole before any native input listener
@@ -1417,6 +1526,8 @@ export class InstanceManager {
 			// shutdown preflight can yield. A positive idle-only rejection below
 			// reopens admission because no stop was actually accepted.
 			record.stopAdmissionClosed = true;
+			// The startup input phase does NOT reopen with admission: it is sticky.
+			this.#closeStartupInput(record, true);
 			// Register before the public request, because it may synchronously exit.
 			// This bounded preflight never sends a fallback signal or force attempt.
 			const exit = this.#waitForExit(record, DEFAULT_SHUTDOWN_GRACE_MS);
@@ -1442,6 +1553,7 @@ export class InstanceManager {
 		} else {
 			// Explicit confirmation starts this exact row's terminal stop path.
 			record.stopAdmissionClosed = true;
+			this.#closeStartupInput(record, true);
 		}
 		await this.#gracefulStop(record, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS, alreadyRequested);
 		return outcome();
@@ -1504,6 +1616,7 @@ export class InstanceManager {
 			geometryRevision: 0,
 			inputFramingRequested: false,
 			inputFramingReady: false,
+			startupInputOpen: false,
 			savedReservation: savedSession !== undefined
 				? { sessionId: savedSession.sessionId, file: savedSession.file }
 				: undefined,
@@ -1885,7 +1998,7 @@ export class InstanceManager {
 	 * There is no terminal-text field on purpose: the input owner is the surface and
 	 * its conversation, not the newest line on screen.
 	 */
-	readViewerInputSource(viewerId: string): NativeViewerInputSource | undefined {
+	readViewerInputSource(viewerId: string): NativeViewerAnyInputSource | undefined {
 		const scope = this.#viewerInputScope(viewerId);
 		return scope.ok ? scope.source : undefined;
 	}
@@ -1923,7 +2036,7 @@ export class InstanceManager {
 		if (!scope.ok) {
 			return { status: "refused", reason: scope.reason };
 		}
-		if (!sameViewerInputSource(scope.source, request.expectedSource)) {
+		if (!sameAnyViewerInputSource(scope.source, request.expectedSource)) {
 			return { status: "refused", reason: "stale-source" };
 		}
 		const modes = this.#readViewerInputModes(scope.record);
@@ -1937,21 +2050,33 @@ export class InstanceManager {
 		if (!current.ok) {
 			return { status: "refused", reason: current.reason };
 		}
-		if (!sameViewerInputSource(current.source, scope.source)
+		if (!sameAnyViewerInputSource(current.source, scope.source)
 			|| current.source.sourceToken !== request.expectedSource.sourceToken) {
 			return { status: "refused", reason: "stale-source" };
 		}
 		const pty = current.record.pty;
-		const native = current.record.nativeSession;
-		if (pty === undefined || native === null) {
+		if (pty === undefined) {
 			return { status: "refused", reason: "row-unavailable" };
 		}
+		let fence: NativeInputExpectedFence;
+		if (isNativeViewerStartupInputSource(current.source)) {
+			// The startup fence is the child's own explicit phase, never a tuple. The
+			// row must STILL be before its first accepted status with no observed
+			// tuple at this exact instant; a once-known or lost tuple never qualifies.
+			if (!current.record.startupInputOpen || current.record.nativeSession !== null) {
+				return { status: "refused", reason: "stale-source" };
+			}
+			fence = STARTUP_INPUT_FENCE;
+		} else {
+			const native = current.record.nativeSession;
+			if (native === null) {
+				return { status: "refused", reason: "row-unavailable" };
+			}
+			fence = Object.freeze({ sessionId: native.sessionId, epoch: native.epoch });
+		}
 		const origin: NativeInputOrigin = Object.freeze({ kind: "viewer" as const, token: current.source.sourceToken });
-		const expectedNativeTuple: NativeInputExpectedTuple = Object.freeze({
-			sessionId: native.sessionId, epoch: native.epoch,
-		});
 		try {
-			this.#writeChildInput(current.record, pty, request.data, origin, expectedNativeTuple);
+			this.#writeChildInput(current.record, pty, request.data, origin, fence);
 		} catch {
 			// The seam was open when it was last checked and the write was invoked, so
 			// whether the child received the bytes is genuinely unknown.
@@ -1985,7 +2110,7 @@ export class InstanceManager {
 	 * refusal reason; nothing here mutates a row, a viewer, a surface, or a queue.
 	 */
 	#viewerInputScope(viewerId: string):
-		| { readonly ok: true; readonly viewer: ManagedViewer; readonly record: ManagedInstance; readonly source: NativeViewerInputSource }
+		| { readonly ok: true; readonly viewer: ManagedViewer; readonly record: ManagedInstance; readonly source: NativeViewerAnyInputSource }
 		| { readonly ok: false; readonly reason: NativeViewerInputRefusal } {
 		if (this.#disposed || this.#stopping) {
 			return { ok: false, reason: "disposed" };
@@ -2018,7 +2143,20 @@ export class InstanceManager {
 			return { ok: false, reason: "input-unready" };
 		}
 		if (record.nativeSession === null) {
-			return { ok: false, reason: "unknown-native-tuple" };
+			// The ONLY tuple-less source: this exact framed, ready, live registration is
+			// still in its sticky startup phase (before its first accepted status) and
+			// the manager has never observed a conversation for this row. A missing,
+			// cleared, or lost tuple is never reinterpreted as startup.
+			if (!record.startupInputOpen
+				|| record.knownNativeSessionId !== undefined
+				|| record.lastNativeSession !== undefined) {
+				return { ok: false, reason: "unknown-native-tuple" };
+			}
+			const startup = this.#viewerStartupInputSource(viewer, record, registration);
+			if (startup === undefined) {
+				return { ok: false, reason: "no-input-source" };
+			}
+			return { ok: true, viewer, record, source: startup };
 		}
 		const source = this.#viewerInputSource(viewer, record, registration);
 		if (source === undefined) {
@@ -2100,6 +2238,65 @@ export class InstanceManager {
 			registrationGeneration: facts.registrationGeneration,
 			sourceToken,
 		});
+	}
+
+	/**
+	 * Mint one viewer's current STARTUP input source, or undefined when the facts
+	 * cannot be described. Its token is minted in the separate `nvst1` startup
+	 * domain from this registration's own existing bootstrap key and commits to the
+	 * same run, viewer and revision, row, registration and generation, and canonical
+	 * geometry and revision — with no conversation field at all.
+	 */
+	#viewerStartupInputSource(
+		viewer: ManagedViewer,
+		record: ManagedInstance,
+		registration: InstanceStatusRegistration,
+	): NativeViewerStartupInputSource | undefined {
+		const hostRunId = viewer.hostRunId;
+		if (hostRunId === undefined || viewer.nativeClipboardSink === undefined) {
+			return undefined;
+		}
+		const facts: NativeViewerStartupScopeFacts = Object.freeze({
+			hostRunId,
+			viewerId: viewer.id,
+			viewerRevision: viewer.revision,
+			rowId: record.id,
+			registrationIdentity: registration.bootstrap.instanceId,
+			registrationGeneration: registration.bootstrap.generation,
+			cols: record.cols,
+			rows: record.rows,
+			geometryRevision: record.geometryRevision,
+		});
+		const sourceToken = mintNativeViewerStartupScopeToken(registration.bootstrap, facts);
+		if (sourceToken === undefined) {
+			return undefined;
+		}
+		return Object.freeze({
+			hostRunId: facts.hostRunId,
+			viewerId: facts.viewerId,
+			viewerRevision: facts.viewerRevision,
+			rowId: facts.rowId,
+			phase: "startup" as const,
+			geometry: Object.freeze({
+				cols: facts.cols,
+				rows: facts.rows,
+				revision: facts.geometryRevision,
+			}),
+			registrationIdentity: facts.registrationIdentity,
+			registrationGeneration: facts.registrationGeneration,
+			sourceToken,
+		});
+	}
+
+	/**
+	 * End this registration's startup phase for good. `notify` publishes a change so
+	 * a published startup source is replaced at a genuine boundary even when no
+	 * other row fact moved; callers that already publish a change pass `false`.
+	 */
+	#closeStartupInput(record: ManagedInstance, notify: boolean): void {
+		if (!record.startupInputOpen) return;
+		record.startupInputOpen = false;
+		if (notify && this.#records.get(record.id) === record) this.#safeChanged(record.id);
 	}
 
 	/**
@@ -2205,6 +2402,8 @@ export class InstanceManager {
 		validateShutdownMs(graceMs, "graceMs");
 		validateShutdownMs(killMs, "killMs");
 		this.#stopping = true;
+		// A stopping manager admits no startup input again, in any row.
+		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
 		// Late async creates settle or abort here; none can spawn after stop.
 		await Promise.allSettled([...this.#inflightCreates]);
 		return this.#stopOwnedProcesses(graceMs, killMs);
@@ -2232,6 +2431,7 @@ export class InstanceManager {
 
 	async #runDispose(): Promise<void> {
 		this.#stopping = true;
+		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
 		await Promise.allSettled([...this.#inflightCreates]);
 		try {
 			await this.#stopOwnedProcesses(DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS);
@@ -2374,6 +2574,10 @@ export class InstanceManager {
 				}
 				record.inputFramingRequested = true;
 				record.inputEncoder = createNativeInputEncoder(handle.bootstrap);
+				// The startup phase can begin only on this correctly framed
+				// registration; readiness, liveness, and every other fact are still
+				// required separately before any startup input is admitted.
+				record.startupInputOpen = true;
 			}
 			// The native clipboard receiver (#466) exists only after this row's own
 			// registration actually exists, is built from that registration's own
@@ -2589,6 +2793,8 @@ export class InstanceManager {
 			return; // stale or already-final exit
 		}
 		record.ptyExited = true;
+		// The process incarnation is over, so its startup phase is over for good.
+		this.#closeStartupInput(record, false);
 		// A finished child displays nothing: every surface's participation in this
 		// row ends here, and its retained last frame stays readable until removal.
 		this.#retireViewerTargets(record.id);
@@ -2651,6 +2857,10 @@ export class InstanceManager {
 		if (!this.#currentRegistration(record, registration)) {
 			return; // stale/released/disposed status event, never cross-row
 		}
+		// The first ACCEPTED status of this registration (even one reporting a null
+		// tuple) ends its startup phase for good; the change published below is the
+		// boundary that retires a stated startup source.
+		this.#closeStartupInput(record, false);
 		record.statusRevision += 1;
 		const previousKnownSessionId = record.knownNativeSessionId;
 		record.busy = update && typeof update.busy === "boolean" ? update.busy : null;
@@ -2801,6 +3011,9 @@ export class InstanceManager {
 	/** A valid reconnect is a new episode: discard the exhausted budget and request once. */
 	#onReconnect(record: ManagedInstance, registration: { current?: InstanceStatusRegistration }): void {
 		if (!this.#currentRegistration(record, registration) || record.ptyExited) return;
+		// A reconnect means the child's reporter already installed a session, so the
+		// startup phase is over; it never reopens.
+		this.#closeStartupInput(record, false);
 		// Independently discard cached ephemeral row understanding on transport
 		// replacement: the live client is reachable but its prior observation
 		// may be stale. This is truthfully unknown, never a fabricated zero, and
@@ -2824,6 +3037,7 @@ export class InstanceManager {
 		if (!this.#currentRegistration(record, registration)) {
 			return; // stale/released/disposed disconnect event
 		}
+		this.#closeStartupInput(record, false);
 		// Truthful process telemetry: the reporter is gone, the child may very
 		// well still run. Never an exit, never an inferred "Idle" state; busy
 		// and pending input collapse to null until a fresh reporter reports.
@@ -2872,6 +3086,8 @@ export class InstanceManager {
 	}
 
 	#releaseRegistration(record: ManagedInstance): void {
+		// A released (or never-completed) registration has no startup phase left.
+		this.#closeStartupInput(record, false);
 		// The child may have exited before consuming its initial request. Ownership
 		// is discarded through the exact staged inode before the broker removes
 		// its empty namespace; a foreign replacement is preserved.
@@ -3290,17 +3506,18 @@ export class InstanceManager {
 	 *   row stays `alive` until its child's actual exit event, and ownership of the
 	 *   still-running child is retained rather than silently dropped.
 	 *
-	 * `expectedNativeTuple` accompanies a viewer dispatch only: it is the native
-	 * conversation the child must still be in before it delivers any of these bytes,
-	 * and it is authenticated inside the frame. Local and protocol-reply dispatches
-	 * keep their unchanged shape and semantics.
+	 * `expectedFence` accompanies a viewer dispatch only: either the native
+	 * conversation the child must still be in, or the closed startup phase the child
+	 * must still be in, before it delivers any of these bytes. It is authenticated
+	 * inside the frame. Local and protocol-reply dispatches keep their unchanged
+	 * shape and semantics.
 	 */
 	#writeChildInput(
 		record: ManagedInstance,
 		pty: InstancePty,
 		data: string | Buffer,
 		origin: NativeInputOrigin,
-		expectedNativeTuple?: NativeInputExpectedTuple,
+		expectedFence?: NativeInputExpectedFence,
 	): void {
 		if (!record.inputFramingRequested) {
 			pty.write(data);
@@ -3315,7 +3532,7 @@ export class InstanceManager {
 		pty.write(encoder.encode(
 			typeof data === "string" ? Buffer.from(data, "utf8") : data,
 			origin,
-			expectedNativeTuple,
+			expectedFence,
 		));
 	}
 

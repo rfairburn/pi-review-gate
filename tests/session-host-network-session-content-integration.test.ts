@@ -50,6 +50,7 @@ import {
 	DEFAULT_INSTANCE_COLS,
 	DEFAULT_INSTANCE_ROWS,
 	InstanceManager,
+	isNativeViewerStartupInputSource,
 	type InstanceManagerOptions,
 	type InstancePty,
 	type InstanceSpawnDescriptor,
@@ -100,13 +101,16 @@ import {
 	encodeSessionContentViewport,
 	NATIVE_COPY_MAX_ENCODED_CHARS,
 	NATIVE_TEXT_PASTE_MAX_BYTES,
+	isNativeIoStartupSource,
 	nativeIoSourceEquals,
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
 	type NativeIoCompletedCopy,
+	type NativeIoInputSource,
 	type NativeIoSource,
 	type SessionContentBeginFrame,
 	type SessionContentErrorFrame,
@@ -1773,6 +1777,7 @@ interface NativeDispatch {
 	readonly dispatchId: number;
 	readonly origin: NativeInputOrigin;
 	readonly expectedNativeTuple: NativeInputExpectedTuple | undefined;
+	readonly expectedNativePhase: NativeInputFragment["expectedNativePhase"];
 	readonly fragments: readonly NativeInputFragment[];
 	readonly payload: Buffer;
 }
@@ -1803,6 +1808,7 @@ function nativeDispatchReader(
 					dispatchId: first.dispatchId,
 					origin: first.origin,
 					expectedNativeTuple: first.expectedNativeTuple,
+					expectedNativePhase: first.expectedNativePhase,
 					fragments: Object.freeze([...open]),
 					payload: Buffer.concat(open.map((entry) => entry.payload)),
 				}));
@@ -2043,6 +2049,8 @@ interface NativeOwnerFixture {
 	readonly localCopies: { readonly instanceId: string; readonly event: NativeClipboardEvent }[];
 	createRow(label: string): Promise<NativeRow>;
 	setConversation(row: NativeRow, sessionId: string, epoch: number): void;
+	/** Deliver one arbitrary status (for example a null tuple) through the real status path. */
+	emitStatus(row: NativeRow, update: InstanceStatusUpdate): void;
 	/** Deliver this row's own readiness capsule and await the parse that verifies it. */
 	markReady(row: NativeRow): Promise<void>;
 	ptyFor(row: NativeRow): NativePty;
@@ -2249,6 +2257,11 @@ async function startNativeOwner(
 				nativeSession: { sessionId, epoch, name: `conversation ${sessionId}` },
 			});
 		},
+		emitStatus(row, update) {
+			const handlers = statusHandlers.get(row.id);
+			assert.ok(handlers, `row ${row.id} has no live status registration`);
+			handlers.onStatus(update);
+		},
 		async markReady(row) {
 			row.pty.emitData(capsuleOsc(nativeReadyCapsule(row.bootstrap)));
 			// Readiness is observed by the terminal parser, so the parse is the real
@@ -2300,12 +2313,12 @@ interface NativeViewerFixture {
 	readonly inbox: SnapshotInbox;
 	/** Copies delivered to THIS viewer and nobody else. */
 	readonly copies: NativeIoCompletedCopy[];
-	/** Every source the endpoint asked this fixture's guard about. */
-	readonly guardAsks: NativeIoSource[];
+	/** Every source (conversation or startup) the endpoint asked this fixture's guard about. */
+	readonly guardAsks: NativeIoInputSource[];
 	readonly viewerDiagnostics: string[];
 	/** The deliberate commit: the guard proves THIS source, never the newest one. */
-	commit(source: NativeIoSource | undefined): void;
-	/** The next published snapshot that states a native input source. */
+	commit(source: NativeIoInputSource | undefined): void;
+	/** The next published snapshot that states a CONVERSATION native input source. */
 	nextSource(label: string): Promise<NativeIoSource>;
 	/** The next copy delivered to this viewer. */
 	nextCopy(label: string): Promise<NativeIoCompletedCopy>;
@@ -2383,15 +2396,15 @@ async function connectNativeViewer(
 	// derives its answer from whatever source happens to be current, which is
 	// exactly what these cases need to be able to disprove. (It is a simulated
 	// written-source proof, not Main's own physical focus proof.)
-	let committed: NativeIoSource | undefined;
-	const guardAsks: NativeIoSource[] = [];
+	let committed: NativeIoInputSource | undefined;
+	const guardAsks: NativeIoInputSource[] = [];
 	const copies: NativeIoCompletedCopy[] = [];
 	const copyWaiters: Array<(copy: NativeIoCompletedCopy) => void> = [];
 	let copiesConsumed = 0;
 	const nativeIo = options.nativeIo === false
 		? undefined
 		: {
-			authorizeInput: (expected: NativeIoSource): boolean => {
+			authorizeInput: (expected: NativeIoInputSource): boolean => {
 				guardAsks.push(expected);
 				return committed !== undefined && nativeIoSourceEquals(expected, committed);
 			},
@@ -2436,7 +2449,8 @@ async function connectNativeViewer(
 			for (;;) {
 				const snapshot = await inbox.next(label);
 				const source = snapshot.meta.inputSource;
-				if (source !== undefined && source !== null) return source;
+				// Only a conversation source qualifies; a startup source names no tuple.
+				if (source !== undefined && source !== null && !isNativeIoStartupSource(source)) return source;
 			}
 		},
 		nextCopy(label) {
@@ -2571,8 +2585,9 @@ async function openRawNativeSubscription(
  * Native input / text-copy cases
  * ------------------------------------------------------------------------- */
 
-function statedSource(source: NativeIoSource | null | undefined): NativeIoSource {
+function statedSource(source: NativeIoInputSource | null | undefined): NativeIoSource {
 	assert.ok(source !== undefined && source !== null, "this publish states the owner's own native input source");
+	if (isNativeIoStartupSource(source)) throw new Error("this publish was expected to state a conversation source");
 	return source;
 }
 
@@ -2592,7 +2607,8 @@ test("a native viewer's input crosses TLS into the framed child under the owner'
 	await withTimeout(viewer.viewer.ready, 5_000, "the native viewer never became ready");
 	const first = await viewer.nextSource("a published viewport that states a native input source");
 	const lower = owner.service.readViewerInputSource(viewerIdOf(viewer.binding));
-	assert.ok(lower !== undefined, "the manager resolves this binding's own input scope");
+	assert.ok(lower !== undefined && !isNativeViewerStartupInputSource(lower),
+		"the manager resolves this binding's own conversation input scope");
 	// The exact settled schema: one `nativeSession` tuple, the canonical geometry
 	// with its revision, this viewer's revision, and the host-minted token.
 	assert.deepEqual(first, {
@@ -3402,5 +3418,88 @@ test("a revoked grant stops every protected native write, releases only that vie
 	assert.ok(textOf(surviving.frame).includes("revoked view prompt"),
 		"and the row's content is still intact afterwards");
 	assertNativeMessagesInsideBound(small.outbound, small.wire, large.outbound, large.wire, display.outbound);
+	owner.succeeded();
+});
+
+test("startup-phase input crosses TLS before the first status, carries only the startup fence, and retires for good", async (t) => {
+	const owner = await startNativeOwner(t);
+	const row = await owner.createRow("native-startup");
+	// Framed and ready, but no status yet: the row is in its explicit startup phase.
+	await owner.markReady(row);
+	await owner.feed(row, ["\x1b[2J\x1b[H", "Trust project folder?\n"]);
+
+	const viewer = await connectNativeViewer(t, owner, { label: "startup-viewer", sessionId: row.id, cols: 100, rows: 30 });
+	await withTimeout(viewer.viewer.ready, 5_000, "the startup viewer never became ready");
+	const acknowledged = lastFrameOfType(viewer.wire, "hello_ack");
+	assert.ok(acknowledged !== undefined, "the owner acknowledged the hello");
+	assert.deepEqual(acknowledged.capabilities, [
+		SESSION_CONTENT_REQUIRED_CAPABILITY,
+		SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+		SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+	], "startup input is acknowledged beside native IO");
+
+	const startupView = await nextSnapshotMatching(viewer.inbox, "the null-tuple viewport with a startup source",
+		(snapshot) => snapshot.meta.inputSource !== undefined && snapshot.meta.inputSource !== null
+			&& isNativeIoStartupSource(snapshot.meta.inputSource));
+	assert.equal(startupView.meta.nativeSession, null, "the startup publish names no conversation");
+	const startup = startupView.meta.inputSource;
+	assert.ok(startup !== undefined && startup !== null && isNativeIoStartupSource(startup));
+	assert.equal(Object.hasOwn(startup, "nativeSession"), false, "no tuple key at all, never a null or fake one");
+	assert.match(startup.sourceToken, /^nvst1\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.[0-9a-f]{32}$/);
+	const lowerStartup = owner.service.readViewerInputSource(viewerIdOf(viewer.binding));
+	assert.ok(lowerStartup !== undefined && isNativeViewerStartupInputSource(lowerStartup),
+		"the manager states the startup variant for this exact viewer");
+	assert.equal(row.pty.writes.length, 0, "stating a source writes nothing to the child");
+
+	// One authorized keyboard answer, framed with the startup fence and nothing else.
+	viewer.commit(startup);
+	assert.deepEqual(
+		await viewer.viewer.sendInput({ source: startup, inputModes: startupView.meta.inputModes, kind: "keyboard", text: "1" }),
+		{ status: "submitted" },
+		"submitted means transport handoff only",
+	);
+	await row.pty.whenWrites(1, "the startup answer reached the child");
+	const answer = owner.lastDispatch(row);
+	assert.deepEqual(answer.origin, { kind: "viewer", token: startup.sourceToken },
+		"the answer is explicit viewer input, never local");
+	assert.equal(answer.expectedNativeTuple, undefined, "no conversation tuple, real or fabricated");
+	assert.equal(answer.expectedNativePhase, "startup", "the child-side fence is the startup phase");
+	assert.equal(answer.payload.toString("utf8"), "1");
+
+	// A capsule naming the startup token is never a copy: there is no conversation to
+	// attribute it to, so it reaches neither the viewer nor the owner's local route.
+	row.pty.emitData(nativeCopyCapsule(row.bootstrap, 1, copyEventOf("startup copy", "conversation-later", 1),
+		{ kind: "viewer", token: startup.sourceToken }, answer.dispatchId));
+	await owner.surfaceFor(row).flush();
+	assert.equal(viewer.copies.length, 0, "startup confers no copy authority");
+	assert.deepEqual(owner.localCopies, []);
+
+	// The first ACCEPTED status — even one with a null tuple — retires startup for good.
+	owner.emitStatus(row, { busy: false, pendingInput: false, inputSurface: false, activity: [], nativeSession: null });
+	await nextSnapshotMatching(viewer.inbox, "the viewport after the first null-tuple status",
+		(snapshot) => snapshot.meta.inputSource === null && snapshot.meta.nativeSession === null);
+	assert.equal(owner.service.readViewerInputSource(viewerIdOf(viewer.binding)), undefined,
+		"no source while the tuple is unknown after startup closed");
+	const writesBeforeStale = row.pty.writes.length;
+	assert.deepEqual(
+		await viewer.viewer.sendInput({ source: startup, inputModes: startupView.meta.inputModes, kind: "keyboard", text: "late" }),
+		{ status: "not-sent", reason: "stale-source" },
+		"the captured startup authority is refused before any write",
+	);
+	assert.equal(row.pty.writes.length, writesBeforeStale);
+
+	// A real tuple brings the ordinary conversation source back.
+	owner.setConversation(row, "conversation-after-startup", 1);
+	const conversation = await viewer.nextSource("the conversation source after startup");
+	assert.match(conversation.sourceToken, /^nvs1\./);
+	assert.deepEqual(conversation.nativeSession, { sessionId: "conversation-after-startup", epoch: 1 });
+
+	// Losing that tuple again never reopens startup.
+	owner.emitStatus(row, { busy: false, pendingInput: false, inputSurface: false, activity: [], nativeSession: null });
+	await nextSnapshotMatching(viewer.inbox, "the viewport after the tuple was lost",
+		(snapshot) => snapshot.meta.nativeSession === null);
+	assert.equal(owner.service.readViewerInputSource(viewerIdOf(viewer.binding)), undefined,
+		"a once-known, now lost tuple never becomes startup again");
+	assert.deepEqual(owner.localCopies, []);
 	owner.succeeded();
 });

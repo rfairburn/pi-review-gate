@@ -104,6 +104,7 @@
 import { randomUUID } from "node:crypto";
 import { parseMouseInput, translateInput, type InputViewport } from "../input";
 import type {
+	NativeViewerAnyInputSource,
 	NativeViewerClipboardReceipt,
 	NativeViewerClipboardSink,
 	NativeViewerInputRequest,
@@ -124,6 +125,7 @@ import {
 	NATIVE_TEXT_PASTE_MAX_BYTES,
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
@@ -133,6 +135,7 @@ import {
 	createNativeInputAssembler,
 	decodeSessionContentFrame,
 	encodeSessionContentFrame,
+	isNativeIoStartupSource,
 	isSessionContentProtocolError,
 	negotiateSessionContentHello,
 	nativeIoSourceEquals,
@@ -141,6 +144,7 @@ import {
 	type NativeInputAssembler,
 	type NativeIoBuiltTransfer,
 	type NativeIoCompletedInput,
+	type NativeIoInputSource,
 	type NativeIoSource,
 	type SessionContentBounds,
 	type SessionContentBuiltTransfer,
@@ -379,8 +383,8 @@ const MAX_PENDING_CONTROLS = 8;
  * the absence of a fact rather than an inferred one.
  */
 interface NativeIoProvider {
-	/** The manager's CURRENT owner-private input scope for one surface. */
-	readSource(viewerId: string): NativeViewerInputSource | undefined;
+	/** The manager's CURRENT owner-private input scope for one surface (conversation or startup). */
+	readSource(viewerId: string): NativeViewerAnyInputSource | undefined;
 	/** The one strict viewer input handoff: synchronous, never retried or queued. */
 	write(viewerId: string, request: NativeViewerInputRequest): NativeViewerInputResult;
 }
@@ -388,9 +392,9 @@ interface NativeIoProvider {
 /** One native input target proven against the source and modes the peer named. */
 interface NativeInputTarget {
 	/** The CURRENT owner-private scope, handed to the lower fence unchanged. */
-	readonly lower: NativeViewerInputSource;
+	readonly lower: NativeViewerAnyInputSource;
 	/** The same facts in wire shape, never including owner-only identity. */
-	readonly wire: NativeIoSource;
+	readonly wire: NativeIoInputSource;
 	readonly modes: TerminalInputModes;
 }
 
@@ -441,6 +445,8 @@ const SGR_MOUSE_PREFIX = "\u001b[<";
  */
 function toNativeIoSource(lower: NativeViewerInputSource | undefined): NativeIoSource | null {
 	if (!lower) return null;
+	// A startup scope is never a conversation (copy) source, whatever else it says.
+	if (isLowerStartupSource(lower)) return null;
 	if (typeof lower.sourceToken !== "string" || lower.sourceToken.length === 0) return null;
 	if (!Number.isSafeInteger(lower.viewerRevision) || lower.viewerRevision < 1) return null;
 	return Object.freeze({
@@ -450,6 +456,35 @@ function toNativeIoSource(lower: NativeViewerInputSource | undefined): NativeIoS
 			sessionId: lower.nativeSession.sessionId,
 			epoch: lower.nativeSession.epoch,
 		}),
+		geometry: Object.freeze({
+			cols: lower.geometry.cols,
+			rows: lower.geometry.rows,
+			revision: lower.geometry.revision,
+		}),
+		viewerRevision: lower.viewerRevision,
+		sourceToken: lower.sourceToken,
+	});
+}
+
+/** True for the owner-private startup variant of an input-path scope. */
+function isLowerStartupSource(lower: NativeViewerAnyInputSource): boolean {
+	return (lower as { readonly phase?: unknown }).phase === "startup";
+}
+
+/**
+ * Map the owner-private current INPUT scope (conversation or startup) to the exact
+ * wire shape a peer may echo. A startup scope maps to the tuple-less startup wire
+ * source; nothing here fabricates a tuple, and owner-only identity stays private.
+ */
+function toNativeIoInputSource(lower: NativeViewerAnyInputSource | undefined): NativeIoInputSource | null {
+	if (!lower) return null;
+	if (!isLowerStartupSource(lower)) return toNativeIoSource(lower as NativeViewerInputSource);
+	if (typeof lower.sourceToken !== "string" || lower.sourceToken.length === 0) return null;
+	if (!Number.isSafeInteger(lower.viewerRevision) || lower.viewerRevision < 1) return null;
+	return Object.freeze({
+		hostRunId: lower.hostRunId,
+		sessionId: lower.rowId,
+		phase: "startup" as const,
 		geometry: Object.freeze({
 			cols: lower.geometry.cols,
 			rows: lower.geometry.rows,
@@ -509,7 +544,7 @@ function resolveNativeIoProvider(options: SessionContentHostOptions): NativeIoPr
 	const write = source.writeViewerInput;
 	if (typeof read !== "function" || typeof write !== "function") return null;
 	return Object.freeze({
-		readSource: (viewerId: string): NativeViewerInputSource | undefined => {
+		readSource: (viewerId: string): NativeViewerAnyInputSource | undefined => {
 			try {
 				return read.call(source, viewerId);
 			} catch {
@@ -663,6 +698,12 @@ class OwnerBinding implements SessionContentChannelBinding {
 	readonly #provider: NativeIoProvider | null;
 	/** True only when THIS channel negotiated the optional native IO extension. */
 	#nativeIoNegotiated = false;
+	/**
+	 * True only when THIS channel ALSO negotiated startup-phase input (which
+	 * depends on native IO). Without it no startup source is ever published and a
+	 * peer-sent startup source is a protocol violation.
+	 */
+	#startupInputNegotiated = false;
 	/** The one native input assembly belonging to the current subscription. */
 	#inputAssembler: NativeInputAssembler | null = null;
 	/** The open paged paste's identifier, while one is open. */
@@ -673,7 +714,7 @@ class OwnerBinding implements SessionContentChannelBinding {
 	 * a stale paste is freed where the change is observed instead of surviving to
 	 * collide with a later valid packet.
 	 */
-	#inputHeader: { readonly inputId: string; readonly source: NativeIoSource; readonly inputModes: TerminalInputModes } | null = null;
+	#inputHeader: { readonly inputId: string; readonly source: NativeIoInputSource; readonly inputModes: TerminalInputModes } | null = null;
 	/**
 	 * The ONE abandoned input whose remaining pages are dropped rather than treated
 	 * as a fresh input or a protocol failure. A single value, never a history or a
@@ -684,8 +725,8 @@ class OwnerBinding implements SessionContentChannelBinding {
 	#inputTimer: NodeJS.Timeout | null = null;
 	/** The newest input modes this endpoint observed for this subscription. */
 	#inputModes: TerminalInputModes | null = null;
-	/** The native source this endpoint last stated on a publish, or none. */
-	#statedSource: NativeIoSource | null = null;
+	/** The native source (conversation or startup) this endpoint last stated on a publish, or none. */
+	#statedSource: NativeIoInputSource | null = null;
 	/**
 	 * Binding-lifetime native copy emission order, strictly increasing and minted
 	 * here. It is deliberately NOT the native input dispatch order: an asynchronous
@@ -880,6 +921,11 @@ class OwnerBinding implements SessionContentChannelBinding {
 		// channel display-only, with no input source and no copy sink.
 		if (decision.capabilities.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)) {
 			this.#nativeIoNegotiated = true;
+			// Startup input exists only beside native IO; the codec already refuses to
+			// acknowledge it alone.
+			if (decision.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)) {
+				this.#startupInputNegotiated = true;
+			}
 		}
 		this.#state = "ready";
 		this.#diagnostic("hello_accepted");
@@ -1328,7 +1374,14 @@ class OwnerBinding implements SessionContentChannelBinding {
 	 */
 	#nativeIoOffer(): SessionContentNegotiationOptions | undefined {
 		if (this.#provider === null) return undefined;
-		return { supportedOptionalCapabilities: [SESSION_CONTENT_NATIVE_IO_CAPABILITY] };
+		// The strict manager seam implements startup-phase input, so it is offered
+		// beside (and only beside) native IO; an older peer simply never gets it.
+		return {
+			supportedOptionalCapabilities: [
+				SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+				SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+			],
+		};
 	}
 
 	/**
@@ -1344,6 +1397,13 @@ class OwnerBinding implements SessionContentChannelBinding {
 		if (!this.#nativeIoNegotiated || this.#provider === null) {
 			// An extension this channel never negotiated is a frame this side never
 			// receives: a peer cannot quietly begin sending input or claim a copy.
+			this.#violation();
+			return;
+		}
+		if ((frame.type === "input" || frame.type === "input_begin")
+			&& isNativeIoStartupSource(frame.source) && !this.#startupInputNegotiated) {
+			// Startup data on a channel that never negotiated it is not a stale input:
+			// it is a protocol violation, refused without touching any child.
 			this.#violation();
 			return;
 		}
@@ -1511,13 +1571,15 @@ class OwnerBinding implements SessionContentChannelBinding {
 	 * A -> B -> A change, which differs by geometry or viewer revision), and the
 	 * modes the packet was made for must equal the modes last observed.
 	 */
-	#inputTarget(expected: NativeIoSource, expectedModes: TerminalInputModes): NativeInputTarget | null {
+	#inputTarget(expected: NativeIoInputSource, expectedModes: TerminalInputModes): NativeInputTarget | null {
 		const provider = this.#provider;
 		const viewerId = this.#viewerId;
 		if (provider === null || viewerId === null) return null;
 		const lower = provider.readSource(viewerId);
-		const wire = toNativeIoSource(lower);
+		const wire = toNativeIoInputSource(lower);
 		if (lower === undefined || wire === null) return null;
+		// A startup scope is a target only on a channel that negotiated startup input.
+		if (isNativeIoStartupSource(wire) && !this.#startupInputNegotiated) return null;
 		if (lower.hostRunId !== this.#subscriptionRun || lower.rowId !== this.#sessionId) return null;
 		if (!nativeIoSourceEquals(expected, wire)) return null;
 		const modes = this.#inputModes;
@@ -1647,16 +1709,23 @@ class OwnerBinding implements SessionContentChannelBinding {
 	 * viewport that reports no native conversation never carries a live tuple, and a
 	 * newer tuple is never stamped onto an older viewport.
 	 */
-	#snapshotInputSource(snapshot: OwningHostSessionContentSnapshot): NativeIoSource | null {
+	#snapshotInputSource(snapshot: OwningHostSessionContentSnapshot): NativeIoInputSource | null {
 		const provider = this.#provider;
 		const viewerId = this.#viewerId;
 		if (provider === null || !this.#nativeIoNegotiated || viewerId === null) return null;
-		if (snapshot.nativeSession === null) return null;
 		if (snapshot.hostRunId !== this.#subscriptionRun || snapshot.sessionId !== this.#sessionId) return null;
-		const wire = toNativeIoSource(provider.readSource(viewerId));
+		// A publish that names no native conversation may state ONLY a startup source,
+		// and only on a channel that negotiated it; a v1-only peer keeps the exact
+		// tuple-less publish with no source.
+		if (snapshot.nativeSession === null && !this.#startupInputNegotiated) return null;
+		const wire = toNativeIoInputSource(provider.readSource(viewerId));
 		if (wire === null) return null;
 		if (wire.hostRunId !== snapshot.hostRunId || wire.sessionId !== snapshot.sessionId) return null;
-		if (wire.nativeSession.sessionId !== snapshot.nativeSession.sessionId
+		if (isNativeIoStartupSource(wire)) {
+			// Never stamped onto a publish that carries a tuple.
+			if (snapshot.nativeSession !== null) return null;
+		} else if (snapshot.nativeSession === null
+			|| wire.nativeSession.sessionId !== snapshot.nativeSession.sessionId
 			|| wire.nativeSession.epoch !== snapshot.nativeSession.epoch) {
 			return null;
 		}
@@ -1674,7 +1743,7 @@ class OwnerBinding implements SessionContentChannelBinding {
 	 * source unchanged, so they never invalidate an unchanged source; a run, row,
 	 * tuple, geometry-revision, viewer-revision, or token change does.
 	 */
-	#publishInputSource(snapshot: OwningHostSessionContentSnapshot): NativeIoSource | null {
+	#publishInputSource(snapshot: OwningHostSessionContentSnapshot): NativeIoInputSource | null {
 		const mapped = this.#snapshotInputSource(snapshot);
 		const previous = this.#statedSource;
 		const changed = previous === null
@@ -1722,11 +1791,14 @@ class OwnerBinding implements SessionContentChannelBinding {
 		if (subscriptionId === null || hostRunId === null || viewerId === null) return;
 		const generation = this.#generation;
 		if (!this.#authorize()) return;
-		const current = this.#provider.readSource(viewerId);
-		if (current === undefined) {
+		const currentScope = this.#provider.readSource(viewerId);
+		// A startup scope is never a copy scope: no conversation exists to attribute a
+		// copy to, so nothing is routed against it.
+		if (currentScope === undefined || isLowerStartupSource(currentScope)) {
 			this.#diagnostic("copy_dropped");
 			return;
 		}
+		const current = currentScope as NativeViewerInputSource;
 		// The exact initiating surface: same viewer, registration, generation, row,
 		// run, native tuple, geometry, viewer revision, and token as right now.
 		if (!sameNativeViewerScope(current, receipt.source)) {
@@ -1831,7 +1903,8 @@ class OwnerBinding implements SessionContentChannelBinding {
 		const provider = this.#provider;
 		const viewerId = this.#viewerId;
 		if (provider === null || viewerId === null) return false;
-		const wire = toNativeIoSource(provider.readSource(viewerId));
+		// Variant-aware: a current startup scope never equals a conversation copy source.
+		const wire = toNativeIoInputSource(provider.readSource(viewerId));
 		return wire !== null && nativeIoSourceEquals(wire, copy.source);
 	}
 
@@ -2025,7 +2098,7 @@ class OwnerBinding implements SessionContentChannelBinding {
 			return;
 		}
 		if (snapshot.sequence <= this.#publishedSequence) return;
-		let inputSource: NativeIoSource | null | undefined;
+		let inputSource: NativeIoInputSource | null | undefined;
 		if (this.#provider !== null && this.#nativeIoNegotiated) {
 			// What goes on the wire is this publish's own current observation: the modes
 			// the child actually has, and only a source that describes this exact frame.

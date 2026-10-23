@@ -177,6 +177,10 @@ async function main() {
 
     for (const step of scenario.steps || []) {
       switch (step.op) {
+        case "armStartup":
+          // The reporter's one-shot startup arming, through the installed bridge.
+          bridge.armNativeClipboardStartup();
+          break;
         case "session":
           bridge.updateNativeClipboardSession(step.tuple);
           break;

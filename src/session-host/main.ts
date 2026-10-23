@@ -47,9 +47,10 @@ import {
   NATIVE_COPY_MAX_ENCODED_CHARS,
   NATIVE_IO_MAX_SOURCE_TOKEN_BYTES,
   NATIVE_TEXT_PASTE_MAX_BYTES,
+  isNativeIoStartupSource,
   nativeIoSourceEquals,
   type NativeIoInputKind,
-  type NativeIoSource,
+  type NativeIoInputSource,
 } from "./network/session-content-protocol";
 import {
   isOwnerCloseFacts,
@@ -290,8 +291,13 @@ interface WrittenRemoteNativeInput {
   readonly rowId: string;
   readonly selectionGeneration: number;
   readonly subscriptionId: string;
-  /** Exact host-written source of the drawn viewport. */
-  readonly source: NativeIoSource;
+  /**
+   * Exact host-written source of the drawn viewport: a conversation source, or the
+   * explicit tuple-less startup source of a publish that named no conversation. A
+   * startup receipt is input-only: a copy (always conversation-sourced) never
+   * matches it.
+   */
+  readonly source: NativeIoInputSource;
   /** Exact observed input modes of that same drawn publish. */
   readonly inputModes: TerminalInputModes;
   /** Canonical size/revision the drawn content came from. */
@@ -400,9 +406,10 @@ interface AcceptedRemoteContent {
    * Immutable host-written native IO source carried by this exact complete
    * publish, or `undefined` when the owner offered none (or it was not coherent
    * with this view). Descriptive only: it is never authority, and it is never
-   * re-read from a newer publish on an older viewport's behalf.
+   * re-read from a newer publish on an older viewport's behalf. A startup source
+   * is accepted only for a publish whose native conversation is null.
    */
-  readonly inputSource: NativeIoSource | undefined;
+  readonly inputSource: NativeIoInputSource | undefined;
   /**
    * Exact observed input modes of that same publish, or `undefined` when absent or
    * malformed. Both this and {@link inputSource} must be present before any input
@@ -829,6 +836,38 @@ function sameTerminalInputModes(a: TerminalInputModes | undefined, b: TerminalIn
 }
 
 /**
+ * The geometry, viewer revision, and token facts of one remote source, validated
+ * exactly as the conversation branch below validates them and required to match
+ * the publish's own canonical geometry. Undefined when any fact is malformed.
+ */
+function readRemoteSourceFacts(
+  record: Record<string, unknown>,
+  expectedGeometry: CanonicalSessionGeometry,
+): { readonly geometry: CanonicalSessionGeometry; readonly viewerRevision: number; readonly sourceToken: string } | undefined {
+  const geometry = record.geometry;
+  if (geometry === null || typeof geometry !== "object") return undefined;
+  const geometryRecord = geometry as Record<string, unknown>;
+  const cols = geometryRecord.cols;
+  const rows = geometryRecord.rows;
+  const revision = geometryRecord.revision;
+  if (typeof cols !== "number" || !Number.isSafeInteger(cols) || cols < 1
+    || typeof rows !== "number" || !Number.isSafeInteger(rows) || rows < 1
+    || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) return undefined;
+  if (cols !== expectedGeometry.cols || rows !== expectedGeometry.rows
+    || revision !== expectedGeometry.revision) return undefined;
+  const viewerRevision = record.viewerRevision;
+  if (typeof viewerRevision !== "number" || !Number.isSafeInteger(viewerRevision) || viewerRevision < 1) {
+    return undefined;
+  }
+  const sourceToken = record.sourceToken;
+  if (typeof sourceToken !== "string" || sourceToken.length === 0
+    || sourceToken.length > NATIVE_IO_MAX_SOURCE_TOKEN_BYTES || !NATIVE_IO_SOURCE_TOKEN.test(sourceToken)) {
+    return undefined;
+  }
+  return { geometry: Object.freeze({ cols, rows, revision }), viewerRevision, sourceToken };
+}
+
+/**
  * Validate and take an immutable copy of the host-written native IO source of one
  * complete accepted publish. It must be coherent with that publish's own owner
  * run, row, native conversation tuple, and canonical geometry; anything else is
@@ -842,8 +881,8 @@ function readRemoteNativeIoSource(
     readonly nativeSession: { readonly sessionId: string; readonly epoch: number } | null;
     readonly geometry: CanonicalSessionGeometry;
   },
-): NativeIoSource | undefined {
-  if (value === null || typeof value !== "object" || expected.nativeSession === null) return undefined;
+): NativeIoInputSource | undefined {
+  if (value === null || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
   const hostRunId = record.hostRunId;
   const sessionId = record.sessionId;
@@ -851,6 +890,23 @@ function readRemoteNativeIoSource(
   if (typeof hostRunId !== "string" || hostRunId.length === 0 || hostRunId.length > maxIdentifier) return undefined;
   if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > maxIdentifier) return undefined;
   if (hostRunId !== expected.hostRunId || sessionId !== expected.sessionId) return undefined;
+  if (Object.prototype.hasOwnProperty.call(record, "phase")) {
+    // The explicit startup source: coherent only with a publish that names NO
+    // native conversation, and never carrying a tuple key of its own.
+    if (record.phase !== "startup" || expected.nativeSession !== null
+      || Object.prototype.hasOwnProperty.call(record, "nativeSession")) return undefined;
+    const startupFacts = readRemoteSourceFacts(record, expected.geometry);
+    if (startupFacts === undefined) return undefined;
+    return Object.freeze({
+      hostRunId,
+      sessionId,
+      phase: "startup" as const,
+      geometry: startupFacts.geometry,
+      viewerRevision: startupFacts.viewerRevision,
+      sourceToken: startupFacts.sourceToken,
+    });
+  }
+  if (expected.nativeSession === null) return undefined;
   const native = record.nativeSession;
   if (native === null || typeof native !== "object") return undefined;
   const nativeRecord = native as Record<string, unknown>;
@@ -907,9 +963,15 @@ function nativeIoReceiptKey(receipt: WrittenRemoteNativeInput | undefined): stri
   const source = receipt.source;
   const modes = receipt.inputModes;
   const rect = receipt.nativeContent;
+  // The phase and the tuple are explicit key facts: a startup receipt and a
+  // conversation receipt can never share a key, so a phase/source-only change is a
+  // genuine writer boundary even when the pixels are identical.
+  const phase = isNativeIoStartupSource(source) ? "startup" : "conversation";
+  const tupleId = isNativeIoStartupSource(source) ? null : source.nativeSession.sessionId;
+  const tupleEpoch = isNativeIoStartupSource(source) ? null : source.nativeSession.epoch;
   return JSON.stringify([
     receipt.hostId, receipt.hostRunId, receipt.rowId, receipt.selectionGeneration, receipt.subscriptionId,
-    source.hostRunId, source.sessionId, source.nativeSession.sessionId, source.nativeSession.epoch,
+    phase, source.hostRunId, source.sessionId, tupleId, tupleEpoch,
     source.geometry.cols, source.geometry.rows, source.geometry.revision,
     source.viewerRevision, source.sourceToken,
     modes.kittyFlags, modes.applicationCursorKeys, modes.applicationKeypad, modes.bracketedPaste,
@@ -3142,7 +3204,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     readonly hostId: string;
     readonly selectionGeneration: number;
     readonly subscriptionId: string;
-    readonly source: NativeIoSource;
+    readonly source: NativeIoInputSource;
     readonly inputModes?: TerminalInputModes;
   }): WrittenRemoteNativeInput | undefined {
     if (!nativeIoBridgeEnabled || shutdownRequested || externalEditorActive) return undefined;

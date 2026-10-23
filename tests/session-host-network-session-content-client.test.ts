@@ -23,6 +23,7 @@ import {
 	DEFAULT_SESSION_CONTENT_BOUNDS,
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
@@ -35,7 +36,9 @@ import {
 	resolveSessionContentBounds,
 	type NativeIoCompletedCopy,
 	type NativeIoCopyEvent,
+	type NativeIoInputSource,
 	type NativeIoSource,
+	type NativeIoStartupSource,
 	type SessionContentBuiltTransfer,
 	type SessionContentFrame,
 	type SessionContentHelloAckFrame,
@@ -367,6 +370,10 @@ interface OwnerScript {
 	readonly sessionId?: string;
 	/** Acknowledge the optional native IO capability, but only if it was offered. */
 	readonly ackNativeIo?: boolean;
+	/** Also acknowledge startup input beside native IO, but only if both were offered. */
+	readonly ackStartup?: boolean;
+	/** Exact acknowledgement capabilities, overriding the two flags above (hostile owner). */
+	readonly ackCapabilities?: readonly string[];
 }
 
 /** A minimal scripted owner that answers only what the test asks for. */
@@ -380,14 +387,22 @@ function scriptOwner(channel: FakeContentChannel, script: OwnerScript = {}): Scr
 				if (script.autoHelloAck ?? true) {
 					const native = (script.ackNativeIo ?? false)
 						&& frame.capabilities.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY);
+					const startup = native && (script.ackStartup ?? false)
+						&& frame.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY);
 					channel.deliver({
 						type: "hello_ack",
 						service: SESSION_CONTENT_SERVICE,
 						major: SESSION_CONTENT_MAJOR,
 						minor: SESSION_CONTENT_MINOR,
-						capabilities: native
-							? [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY]
-							: [SESSION_CONTENT_REQUIRED_CAPABILITY],
+						capabilities: script.ackCapabilities !== undefined
+							? [...script.ackCapabilities]
+							: native
+								? [
+									SESSION_CONTENT_REQUIRED_CAPABILITY,
+									SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+									...(startup ? [SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY] : []),
+								]
+								: [SESSION_CONTENT_REQUIRED_CAPABILITY],
 					});
 				}
 				return;
@@ -1718,7 +1733,7 @@ test("native input and copies stay unoffered and completely inert without explic
 test("explicit callbacks offer and acknowledge the optional capability, and typed current inputs are submitted", async () => {
 	const channel = new FakeContentChannel();
 	scriptOwner(channel, { ackNativeIo: true });
-	const authorized: NativeIoSource[] = [];
+	const authorized: NativeIoInputSource[] = [];
 	const viewer = viewportViewer(channel, {
 		cols: 12,
 		rows: 3,
@@ -1734,8 +1749,11 @@ test("explicit callbacks offer and acknowledge the optional capability, and type
 	const hello = decodeSessionContentFrame(channel.sent[0], BOUNDS);
 	assert.equal(hello.type, "hello");
 	if (hello.type !== "hello") throw new Error("unreachable");
-	assert.deepEqual(hello.capabilities, [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY],
-		"only explicit callbacks offer the optional capability");
+	assert.deepEqual(hello.capabilities, [
+		SESSION_CONTENT_REQUIRED_CAPABILITY,
+		SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+		SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+	], "only explicit callbacks offer the optional capabilities, startup input only beside native IO");
 
 	const source = nativeSource();
 	assert.equal(viewer.readNativeInputSource(), undefined, "no source before a source-carrying publish");
@@ -2645,4 +2663,114 @@ test("an exact A to B to A published inside the authorization callback is never 
 	assert.equal(prewriteChannel.types().slice(beforePrewrite).filter((type) => type === "input").length, 0,
 		"no input frame reaches the transport");
 	await deadlined(prewriteViewer.stop(), "pre-write stop");
+});
+
+/* ------------------------------------------------------------------------- *
+ * Optional startup-phase input (issue 389)
+ * ------------------------------------------------------------------------- */
+
+/** One explicit tuple-less startup source matching `sampleFrame`'s 12x3 geometry. */
+function startupSource(overrides: Partial<NativeIoStartupSource> = {}): NativeIoStartupSource {
+	return {
+		hostRunId: RUN,
+		sessionId: ROW,
+		phase: "startup",
+		geometry: { cols: 12, rows: 3, revision: 0 },
+		viewerRevision: 1,
+		sourceToken: "nvst1.viewer-1.0123456789abcdef0123456789abcdef",
+		...overrides,
+	};
+}
+
+/** Publish one complete null-tuple viewport carrying an explicit startup source. */
+function publishStartup(
+	channel: FakeContentChannel,
+	viewer: SessionContentViewer,
+	source: NativeIoStartupSource,
+	sequence: number,
+): void {
+	deliverAll(channel, transfer(sampleFrame(), {
+		subscriptionId: viewer.subscriptionId,
+		transferId: `transfer-${sequence}`,
+		sequence,
+		geometry: source.geometry,
+		nativeSession: null,
+		inputSource: source,
+	}));
+}
+
+test("negotiated startup input: a null-tuple startup source is submitted once and goes stale at the tuple", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true, ackStartup: true });
+	const authorized: NativeIoInputSource[] = [];
+	const viewer = viewportViewer(channel, {
+		cols: 12,
+		rows: 3,
+		nativeIo: nativeIoFixture({ authorizeInput: (expected) => { authorized.push(expected); return true; } }),
+	});
+	await deadlined(viewer.ready, "ready");
+	const startup = startupSource();
+	publishStartup(channel, viewer, startup, 1);
+	const current = viewer.readNativeInputSource();
+	assert.deepEqual(current, startup, "the startup source is exposed as published");
+	assert.equal(current !== undefined && Object.hasOwn(current, "nativeSession"), false,
+		"the exposed startup source has no tuple key at all");
+	assert.equal(viewer.readSnapshot()?.meta.nativeSession, null);
+
+	let before = channel.sent.length;
+	assert.deepEqual(
+		await viewer.sendInput({ source: startup, inputModes: INPUT_MODES, kind: "keyboard", text: "\x1b" }),
+		{ status: "submitted" },
+	);
+	const frames = channel.frames().slice(before);
+	assert.equal(frames.length, 1, "one logical startup input is exactly one frame");
+	const keyboard = frames[0];
+	if (keyboard.type !== "input") throw new Error("unreachable");
+	assert.deepEqual(keyboard.source, startup, "the wire carries the exact startup source");
+	assert.ok(authorized.length >= 2, "the guard runs at admission and again immediately before the write");
+	for (const expected of authorized) assert.deepEqual(expected, startup, "the guard saw only the startup source");
+
+	// The first conversation publish replaces the startup lifetime for good.
+	const conversation = nativeSource({ viewerRevision: 2, sourceToken: "nvs1.viewer-1.0123456789abcdef0123456789abcdef" });
+	publishSource(channel, viewer, conversation, 2);
+	before = channel.sent.length;
+	assert.deepEqual(
+		await viewer.sendInput({ source: startup, inputModes: INPUT_MODES, kind: "keyboard", text: "late" }),
+		{ status: "not-sent", reason: "stale-source" },
+		"a captured startup source is refused client-side once a tuple is published",
+	);
+	assert.equal(channel.types().slice(before).filter((type) => type === "input").length, 0,
+		"no stale startup byte reaches the transport");
+	assert.deepEqual(
+		await viewer.sendInput({ source: conversation, inputModes: INPUT_MODES, kind: "keyboard", text: "ok" }),
+		{ status: "submitted" },
+		"the ordinary conversation path is unaffected",
+	);
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("an owner that never acknowledged startup input cannot publish a startup source", async () => {
+	const channel = new FakeContentChannel();
+	// An older owner: acknowledges native IO alone.
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	// The ordinary post-tuple path still works with that older owner.
+	publishSource(channel, viewer, nativeSource(), 1);
+	assert.ok(viewer.readNativeInputSource(), "the older owner's conversation source is usable");
+	publishStartup(channel, viewer, startupSource({ viewerRevision: 2 }), 2);
+	await deadlined(viewer.closed, "closed after unnegotiated startup data");
+	assert.equal(viewer.readSnapshot(), undefined, "the unnegotiated startup publish never became current");
+	assert.equal(channel.closeCalls, 1);
+});
+
+test("an acknowledgement of startup input without native IO is a protocol violation", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, {
+		ackCapabilities: [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY],
+	});
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await assert.rejects(deadlined(viewer.ready, "ready"), "the incoherent acknowledgement never makes the viewer ready");
+	await deadlined(viewer.closed, "closed after an incoherent acknowledgement");
+	assert.equal(viewer.readNativeInputSource(), undefined);
 });

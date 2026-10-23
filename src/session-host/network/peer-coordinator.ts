@@ -131,6 +131,7 @@ import {
 	nativeIoSourceEquals,
 	type NativeIoCompletedCopy,
 	type NativeIoInputKind,
+	type NativeIoInputSource,
 	type NativeIoSource,
 	type SessionContentSnapshot,
 } from "./session-content-protocol";
@@ -844,8 +845,34 @@ function nativeInputTargetChanged(
  * copy. The caller's object is arbitrary code: every field is read once, so a
  * getter cannot hand one value to a comparison and another to a write.
  */
-function readNativeIoSourceValue(value: unknown): NativeIoSource | null {
+function readNativeIoSourceValue(value: unknown): NativeIoInputSource | null {
 	if (!isRecord(value)) return null;
+	if (Object.prototype.hasOwnProperty.call(value, "phase")) {
+		// The startup variant: one legal phase value and no tuple key at all.
+		const phase = value.phase;
+		const startupGeometry = value.geometry;
+		if (phase !== "startup" || Object.prototype.hasOwnProperty.call(value, "nativeSession")) return null;
+		if (!isRecord(startupGeometry)) return null;
+		const startupRunId = value.hostRunId;
+		const startupRowId = value.sessionId;
+		const startupCols = startupGeometry.cols;
+		const startupRows = startupGeometry.rows;
+		const startupRevision = startupGeometry.revision;
+		const startupViewerRevision = value.viewerRevision;
+		const startupToken = value.sourceToken;
+		if (typeof startupRunId !== "string" || typeof startupRowId !== "string") return null;
+		if (typeof startupCols !== "number" || typeof startupRows !== "number"
+			|| typeof startupRevision !== "number") return null;
+		if (typeof startupViewerRevision !== "number" || typeof startupToken !== "string") return null;
+		return Object.freeze({
+			hostRunId: startupRunId,
+			sessionId: startupRowId,
+			phase: "startup" as const,
+			geometry: Object.freeze({ cols: startupCols, rows: startupRows, revision: startupRevision }),
+			viewerRevision: startupViewerRevision,
+			sourceToken: startupToken,
+		});
+	}
 	const native = value.nativeSession;
 	const geometry = value.geometry;
 	if (!isRecord(native) || !isRecord(geometry)) return null;
@@ -862,7 +889,7 @@ function readNativeIoSourceValue(value: unknown): NativeIoSource | null {
 	if (typeof nativeSessionId !== "string" || typeof nativeEpoch !== "number") return null;
 	if (typeof cols !== "number" || typeof rows !== "number" || typeof geometryRevision !== "number") return null;
 	if (typeof viewerRevision !== "number" || typeof sourceToken !== "string") return null;
-	return Object.freeze({
+	const conversation: NativeIoSource = Object.freeze({
 		hostRunId,
 		sessionId,
 		nativeSession: Object.freeze({ sessionId: nativeSessionId, epoch: nativeEpoch }),
@@ -870,6 +897,7 @@ function readNativeIoSourceValue(value: unknown): NativeIoSource | null {
 		viewerRevision,
 		sourceToken,
 	});
+	return conversation;
 }
 
 function isMouseTrackingModeValue(value: unknown): value is TerminalInputModes["mouseTracking"] {
@@ -3135,7 +3163,7 @@ class OwnedPeerCoordinator implements
 					? {}
 					: {
 						nativeIo: {
-							authorizeInput: (expected: NativeIoSource): boolean => (
+							authorizeInput: (expected: NativeIoInputSource): boolean => (
 								live !== null && this.#authorizeNativeInput(live, expected)
 							),
 							onCopy: (copy: NativeIoCompletedCopy): void => {
@@ -3410,7 +3438,7 @@ class OwnedPeerCoordinator implements
 	 * caller's dynamic written-source proof, and re-proves the fences AFTER that
 	 * proof returns because it is arbitrary caller code that may reenter.
 	 */
-	#authorizeNativeInput(endpoint: ContentEndpoint, expected: NativeIoSource): boolean {
+	#authorizeNativeInput(endpoint: ContentEndpoint, expected: NativeIoInputSource): boolean {
 		const nativeIo = this.#nativeIo;
 		if (nativeIo === null) return false;
 		// THIS viewer's current remote input/copy preference, re-proved for every

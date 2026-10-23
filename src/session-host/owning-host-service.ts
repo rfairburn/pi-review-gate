@@ -9,10 +9,10 @@ import type {
   InstanceManager,
   InstanceManagerOptions,
   NativeInstanceView,
+  NativeViewerAnyInputSource,
   NativeViewerClipboardSink,
   NativeViewerInputRequest,
   NativeViewerInputResult,
-  NativeViewerInputSource,
   SessionGeometry,
   SessionViewerState,
   SessionViewerUpdate,
@@ -99,6 +99,7 @@ export type OwningHostManager = Pick<InstanceManager,
   | "readViewerInputSource" | "writeViewerInput">>;
 
 export type {
+  NativeViewerAnyInputSource,
   NativeViewerClipboardReceipt,
   NativeViewerClipboardSink,
   NativeViewerInputGeometry,
@@ -107,6 +108,7 @@ export type {
   NativeViewerInputResult,
   NativeViewerInputSource,
   NativeViewerInputTuple,
+  NativeViewerStartupInputSource,
   SessionGeometry,
   SessionViewerRefusal,
   SessionViewerState,
@@ -567,13 +569,16 @@ export interface OwningHostService {
    * manager, host teardown, a manager without the seam, an unknown or retired
    * surface, a surface with no copy sink or no row, a row that is gone, finished,
    * stopping, or unregistered, a row whose input framing was not requested or whose
-   * readiness was never verified, or an unknown native conversation.
+   * readiness was never verified, or an unknown native conversation outside the
+   * row's explicit, sticky startup phase. During that startup phase (before the
+   * registration's first accepted status) the source is the tuple-less startup
+   * variant; it is input-only and never a copy scope.
    *
    * Reading is a pure fact read: nothing is written, queued, resized, spawned, or
    * armed, and the returned token describes those facts instead of granting
    * anything. Hand it back unchanged to {@linkcode writeViewerInput}.
    */
-  readViewerInputSource(viewerId: string): NativeViewerInputSource | undefined;
+  readViewerInputSource(viewerId: string): NativeViewerAnyInputSource | undefined;
   /**
    * Write viewer-origin input through the one manager, fenced on the CURRENT facts
    * the caller observed. This boundary first requires the expected source to carry
@@ -1244,7 +1249,7 @@ class LocalOwningHostService implements OwningHostService {
     }
   }
 
-  readViewerInputSource(viewerId: string): NativeViewerInputSource | undefined {
+  readViewerInputSource(viewerId: string): NativeViewerAnyInputSource | undefined {
     const manager = this.#manager;
     // A manager without the seam, a throwing read, or a closing host is simply not
     // an input path; nothing is inferred and no provider is fabricated.

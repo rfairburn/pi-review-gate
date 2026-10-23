@@ -21,13 +21,15 @@
  *   cannot even reach body parsing.
  * - <body> is unpadded canonical base64url of the canonical JSON envelope
  *   {"v":1,"instanceId","generation","sequence","dispatchId","part","final",
- *    "origin",["expectedNativeTuple"],"encoded"} where "encoded" is the unpadded
- *   canonical base64url of the raw payload bytes. The optional
- *   "expectedNativeTuple" is {"sessionId","epoch"} and is present exactly for
- *   `viewer` dispatches: it names the native conversation the child must still be
- *   in before ANY fragment of this dispatch may reach a native input listener, and
- *   the signature covers it together with the payload. `local` and `none` bodies
- *   are encoded exactly as before and never carry it.
+ *    "origin",["expectedNativeTuple" | "expectedNativePhase"],"encoded"} where
+ *   "encoded" is the unpadded canonical base64url of the raw payload bytes. A
+ *   `viewer` dispatch carries EXACTLY ONE fence, at the same canonical key
+ *   position: either "expectedNativeTuple" ({"sessionId","epoch"}, the native
+ *   conversation the child must still be in), or "expectedNativePhase":"startup"
+ *   (the child must still be inside its explicit, reporter-armed startup phase,
+ *   before any conversation tuple was ever published to its bridge). The
+ *   signature covers the fence together with the payload. `local` and `none`
+ *   bodies are encoded exactly as before and carry neither.
  * - <mac> is HMAC-SHA256(key, domain | "body-mac" | exact base64url body). The
  *   signature covers the complete body, never a header alone, and therefore the
  *   payload. The key is the existing registration token (hex64); this module does
@@ -87,6 +89,22 @@ export interface NativeInputExpectedTuple {
   readonly epoch: number;
 }
 
+/**
+ * The only native phase a `viewer` dispatch may name instead of a conversation
+ * tuple. It never claims that no conversation exists: it names the child's own
+ * explicit startup phase, which its bridge opens only after the reporter armed it
+ * and closes, for good, at the first published session update of ANY value.
+ */
+export type NativeInputExpectedPhase = "startup";
+
+/** Closed startup fence handed to the encoder in place of a conversation tuple. */
+export interface NativeInputStartupFence {
+  readonly phase: NativeInputExpectedPhase;
+}
+
+/** Exactly one fence a `viewer` dispatch carries: a conversation tuple or the startup phase. */
+export type NativeInputExpectedFence = NativeInputExpectedTuple | NativeInputStartupFence;
+
 /** Fixed failure codes; never carry payload, token, or secret material. */
 export type NativeInputFailureCode =
   | "malformed-frame"
@@ -113,11 +131,18 @@ export interface NativeInputFragment {
   /** Owned payload bytes, exact and independent of the parser's state. */
   readonly payload: Buffer;
   /**
-   * Frozen expected native tuple, present exactly for `viewer` dispatches and
-   * identical for every part of one dispatch. `undefined` for `local` and `none`,
-   * whose existing per-dispatch tuple capture and semantics are unchanged.
+   * Frozen expected native tuple of a conversation-fenced `viewer` dispatch,
+   * identical for every part of one dispatch. `undefined` for a startup-fenced
+   * viewer dispatch and for `local` and `none`, whose existing per-dispatch tuple
+   * capture and semantics are unchanged.
    */
   readonly expectedNativeTuple: NativeInputExpectedTuple | undefined;
+  /**
+   * `"startup"` exactly for a startup-fenced `viewer` dispatch, identical for every
+   * part of it; `undefined` otherwise. A viewer fragment carries exactly one of
+   * this and {@link expectedNativeTuple}.
+   */
+  readonly expectedNativePhase: NativeInputExpectedPhase | undefined;
 }
 
 /**
@@ -151,16 +176,17 @@ export interface NativeInputEncoder {
    * dispatch cannot interleave. Payload bytes are preserved exactly, including
    * NUL, controls, embedded framing text, OSC 52 decoys, and bracketed paste.
    *
-   * `expectedNativeTuple` is required exactly for a `viewer` origin and forbidden
-   * for `local` and `none`, so the closed shape keeps the fence from being claimed
-   * by a dispatch that never admitted one. A malformed tuple, a viewer dispatch
-   * without one, or a non-viewer dispatch carrying one is a caller error that
-   * throws a fixed message never echoing the payload, token, or tuple.
+   * `expectedFence` (a conversation tuple, or the closed `{ phase: "startup" }`
+   * fence) is required exactly for a `viewer` origin and forbidden for `local`
+   * and `none`, so the closed shape keeps a fence from being claimed by a dispatch
+   * that never admitted one. A malformed fence, a viewer dispatch without one, or
+   * a non-viewer dispatch carrying one is a caller error that throws a fixed
+   * message never echoing the payload, token, or fence.
    */
   encode(
     payload: Buffer,
     origin: NativeInputOrigin,
-    expectedNativeTuple?: NativeInputExpectedTuple,
+    expectedFence?: NativeInputExpectedFence,
   ): string;
 }
 
@@ -207,6 +233,10 @@ export const NATIVE_INPUT_MAX_ENVELOPE_BYTES = FRAME_TAG.length + MAGIC_CHARS + 
 const BODY_KEYS = ["v", "instanceId", "generation", "sequence", "dispatchId", "part", "final", "origin", "encoded"] as const;
 const BODY_KEYS_WITH_TUPLE = ["v", "instanceId", "generation", "sequence", "dispatchId", "part", "final",
   "origin", "expectedNativeTuple", "encoded"] as const;
+/** The startup fence occupies the tuple's exact canonical key position. */
+const BODY_KEYS_WITH_PHASE = ["v", "instanceId", "generation", "sequence", "dispatchId", "part", "final",
+  "origin", "expectedNativePhase", "encoded"] as const;
+const STARTUP_PHASE: NativeInputExpectedPhase = "startup";
 const MAGIC_PATTERN = /^[0-9a-f]{16}$/;
 /** Mirrors the existing descriptor's UUID-like bounded identity shape. */
 const IDENTITY_PATTERN = /^[0-9a-f-]{1,128}$/i;
@@ -293,6 +323,11 @@ function isValidExpectedTuple(value: unknown): value is NativeInputExpectedTuple
     && Number.isSafeInteger(value.epoch) && (value.epoch as number) >= 1;
 }
 
+/** The closed `{ phase: "startup" }` encoder fence; nothing else names a phase. */
+function isValidStartupFence(value: unknown): value is NativeInputStartupFence {
+  return isRecord(value) && exactKeys(value, ["phase"]) && value.phase === STARTUP_PHASE;
+}
+
 /** Derives the private per-registration key and frame magic from the existing descriptor. */
 function registrationOf(bootstrap: SessionHostBootstrap): Registration {
   const candidate: unknown = bootstrap;
@@ -367,22 +402,26 @@ export function createNativeInputEncoder(bootstrap: SessionHostBootstrap): Nativ
     encode(
       payload: Buffer,
       origin: NativeInputOrigin,
-      expectedNativeTuple?: NativeInputExpectedTuple,
+      expectedFence?: NativeInputExpectedFence,
     ): string {
       if (!Buffer.isBuffer(payload)) throw new Error("Invalid native input payload");
       if (!isValidNativeInputOrigin(origin)) throw new Error("Invalid native input origin");
-      // Closed expected-tuple shape: exactly one viewer dispatch may carry one.
-      if (expectedNativeTuple !== undefined && !isValidExpectedTuple(expectedNativeTuple)) {
-        throw new Error("Invalid native input expected tuple");
+      // Closed fence shape: exactly one viewer dispatch may carry exactly one fence,
+      // either a conversation tuple or the closed startup phase, never both.
+      let frozenTuple: NativeInputExpectedTuple | undefined;
+      let phase: NativeInputExpectedPhase | undefined;
+      if (expectedFence !== undefined) {
+        if (isValidExpectedTuple(expectedFence)) frozenTuple = freezeExpectedTuple(expectedFence);
+        else if (isValidStartupFence(expectedFence)) phase = STARTUP_PHASE;
+        else throw new Error("Invalid native input expected tuple");
       }
-      if ((origin.kind === "viewer") !== (expectedNativeTuple !== undefined)) {
+      if ((origin.kind === "viewer") !== (frozenTuple !== undefined || phase !== undefined)) {
         throw new Error("Invalid native input expected tuple");
       }
       if (dispatchId >= Number.MAX_SAFE_INTEGER) throw new Error("Native input dispatch ids exhausted");
       const parts = Math.max(1, Math.ceil(payload.length / NATIVE_INPUT_RAW_FRAGMENT_BYTES));
       if (sequence + parts > Number.MAX_SAFE_INTEGER) throw new Error("Native input sequence exhausted");
       const frozen = freezeOrigin(origin);
-      const frozenTuple = expectedNativeTuple === undefined ? undefined : freezeExpectedTuple(expectedNativeTuple);
       const nextDispatch = dispatchId + 1;
       let framed = "";
       for (let part = 0; part < parts; part += 1) {
@@ -397,7 +436,9 @@ export function createNativeInputEncoder(bootstrap: SessionHostBootstrap): Nativ
           part,
           final: part === parts - 1,
           origin: frozen,
-          ...(frozenTuple === undefined ? {} : { expectedNativeTuple: frozenTuple }),
+          ...(frozenTuple !== undefined
+            ? { expectedNativeTuple: frozenTuple }
+            : phase !== undefined ? { expectedNativePhase: phase } : {}),
           encoded: payload.subarray(start, end).toString("base64url"),
         });
         if (Buffer.byteLength(body, "utf8") > MAX_BODY_JSON_BYTES) {
@@ -418,6 +459,7 @@ interface OpenDispatch {
   readonly part: number;
   readonly origin: NativeInputOrigin;
   readonly expectedNativeTuple: NativeInputExpectedTuple | undefined;
+  readonly expectedNativePhase: NativeInputExpectedPhase | undefined;
 }
 
 type SealResult = { readonly fragment: NativeInputFragment } | { readonly code: NativeInputFailureCode };
@@ -623,14 +665,19 @@ class Decoder implements NativeInputDecoder {
     // original canonical shape exactly.
     if (!isRecord(parsed)) return { code: "malformed-frame" };
     const hasExpectedTuple = Object.hasOwn(parsed, "expectedNativeTuple");
-    if (!exactKeys(parsed, BODY_KEYS) && !exactKeys(parsed, BODY_KEYS_WITH_TUPLE)) {
+    const hasExpectedPhase = Object.hasOwn(parsed, "expectedNativePhase");
+    // Exactly one closed key set: no fence, the tuple fence, or the startup fence.
+    // A body naming both fences (or any other key) matches none of them.
+    if (!exactKeys(parsed, BODY_KEYS) && !exactKeys(parsed, BODY_KEYS_WITH_TUPLE)
+      && !exactKeys(parsed, BODY_KEYS_WITH_PHASE)) {
       return { code: "malformed-frame" };
     }
     // Canonical means canonical ORDER as well as canonical content: the key set is
     // exact and the keys appear in the encoder's fixed order, so one authenticated
     // fact set has exactly one byte representation. A body that reorders otherwise
     // perfect fields is a different envelope, not an equivalent spelling.
-    const canonicalOrder = hasExpectedTuple ? BODY_KEYS_WITH_TUPLE : BODY_KEYS;
+    const canonicalOrder = hasExpectedTuple ? BODY_KEYS_WITH_TUPLE
+      : hasExpectedPhase ? BODY_KEYS_WITH_PHASE : BODY_KEYS;
     if (!Object.keys(parsed).every((key, index) => key === canonicalOrder[index])) {
       return { code: "malformed-frame" };
     }
@@ -669,9 +716,18 @@ class Decoder implements NativeInputDecoder {
       if (!isValidExpectedTuple(parsed.expectedNativeTuple)) return { code: "malformed-frame" };
       expectedValue = freezeExpectedTuple(parsed.expectedNativeTuple);
     }
+    // The startup fence has exactly one legal value; anything else (another phase
+    // name, a null, an object) is an unknown fence and therefore malformed.
+    let expectedPhase: NativeInputExpectedPhase | undefined;
+    if (hasExpectedPhase) {
+      if (parsed.expectedNativePhase !== STARTUP_PHASE) return { code: "malformed-frame" };
+      expectedPhase = STARTUP_PHASE;
+    }
     // Closed classification: a viewer dispatch without its fence is an incomplete
     // origin, and a non-viewer dispatch claiming one is a mislabeled origin.
-    if ((origin.kind === "viewer") !== (expectedValue !== undefined)) return { code: "invalid-origin" };
+    if ((origin.kind === "viewer") !== (expectedValue !== undefined || expectedPhase !== undefined)) {
+      return { code: "invalid-origin" };
+    }
     const encodedValue: unknown = parsed.encoded;
     if (!canonicalBase64Url(encodedValue, PAYLOAD_B64_MAX, true)) return { code: "malformed-frame" };
     const payload = Buffer.from(encodedValue, "base64url");
@@ -684,8 +740,10 @@ class Decoder implements NativeInputDecoder {
       if (dispatchId !== open.id) return { code: "invalid-dispatch" };
       if (part !== open.part + 1) return { code: "invalid-dispatch" };
       if (!sameOrigin(open.origin, origin)) return { code: "invalid-origin" };
-      // The native-conversation fence is one immutable fact per logical dispatch.
+      // The native fence (tuple or startup phase) is one immutable fact per logical
+      // dispatch: a fence swap mid-dispatch is never a continuation.
       if (!sameExpectedTuple(open.expectedNativeTuple, expectedValue)) return { code: "invalid-dispatch" };
+      if (open.expectedNativePhase !== expectedPhase) return { code: "invalid-dispatch" };
     } else {
       if (dispatchId <= this.#lastDispatchId) return { code: "invalid-dispatch" };
       if (part !== 0) return { code: "invalid-dispatch" };
@@ -699,12 +757,19 @@ class Decoder implements NativeInputDecoder {
       end: final,
       payload,
       expectedNativeTuple: open === undefined ? expectedValue : open.expectedNativeTuple,
+      expectedNativePhase: open === undefined ? expectedPhase : open.expectedNativePhase,
     });
     this.#nextSequence = sequence + 1;
     this.#lastDispatchId = dispatchId;
     this.#open = final
       ? undefined
-      : { id: dispatchId, part, origin: context.origin, expectedNativeTuple: context.expectedNativeTuple };
+      : {
+        id: dispatchId,
+        part,
+        origin: context.origin,
+        expectedNativeTuple: context.expectedNativeTuple,
+        expectedNativePhase: context.expectedNativePhase,
+      };
     return { fragment: context };
   }
 }
@@ -819,6 +884,20 @@ function scopeCommitment(key: Buffer, facts: NativeViewerScopeFacts): string {
  */
 function scopeKey(bootstrap: SessionHostBootstrap, facts: NativeViewerScopeFacts): Buffer | undefined {
   if (!isValidScopeFacts(facts)) return undefined;
+  return registrationScopeKey(bootstrap, facts.registrationIdentity, facts.registrationGeneration, SCOPE_KEY_DOMAIN);
+}
+
+/**
+ * One registration-derived commitment key under a caller-fixed key domain. The
+ * conversation scope and the startup scope each use their own domain, so the two
+ * commitment families never share key material even for identical facts.
+ */
+function registrationScopeKey(
+  bootstrap: SessionHostBootstrap,
+  registrationIdentity: string,
+  registrationGeneration: string,
+  keyDomain: string,
+): Buffer | undefined {
   let registration: Registration;
   try {
     registration = registrationOf(bootstrap);
@@ -827,10 +906,10 @@ function scopeKey(bootstrap: SessionHostBootstrap, facts: NativeViewerScopeFacts
     // input path and never falls back to another key.
     return undefined;
   }
-  if (facts.registrationIdentity !== registration.instanceId
-    || facts.registrationGeneration !== registration.generation) return undefined;
+  if (registrationIdentity !== registration.instanceId
+    || registrationGeneration !== registration.generation) return undefined;
   return createHmac("sha256", registration.key)
-    .update(KEY_DOMAIN).update(SCOPE_KEY_DOMAIN)
+    .update(KEY_DOMAIN).update(keyDomain)
     .update(registration.instanceId).update("\0").update(registration.generation)
     .digest();
 }
@@ -884,6 +963,127 @@ export function verifyNativeViewerScopeToken(
   const received = (token as string).slice(SCOPE_TAG.length + handle.viewerId.length + 1);
   if (!SCOPE_COMMITMENT_PATTERN.test(received)) return false;
   const expected = Buffer.from(scopeCommitment(key, facts), "latin1");
+  const actual = Buffer.from(received, "latin1");
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Startup-phase viewer scope (separate commitment family)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The immutable facts one STARTUP-phase viewer scope token commits to: the same
+ * host run, viewer identity and revision, row, exact registration and generation,
+ * and canonical geometry and revision as a conversation scope, and NO native
+ * conversation field at all — never a null, empty, or fabricated tuple. The token
+ * is a descriptive commitment, never an independent grant: changing ANY fact
+ * invalidates it, and the host's own live startup-phase fact is still required.
+ */
+export interface NativeViewerStartupScopeFacts {
+  readonly hostRunId: string;
+  readonly viewerId: string;
+  readonly viewerRevision: number;
+  readonly rowId: string;
+  readonly registrationIdentity: string;
+  readonly registrationGeneration: string;
+  readonly cols: number;
+  readonly rows: number;
+  readonly geometryRevision: number;
+}
+
+const STARTUP_SCOPE_TAG = "nvst1.";
+/** One canonical startup scope token; it can never match {@linkcode SCOPE_PATTERN}. */
+const STARTUP_SCOPE_PATTERN = /^nvst1\.([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.([0-9a-f]{32})$/;
+const STARTUP_SCOPE_DOMAIN = "pi-review-gate/native-input-viewer-startup-scope/v1\0";
+/** Separate registration-derived key domain, distinct from {@linkcode SCOPE_KEY_DOMAIN}. */
+const STARTUP_SCOPE_KEY_DOMAIN = "viewer-startup-scope-key\0";
+
+function isValidStartupScopeFacts(value: unknown): value is NativeViewerStartupScopeFacts {
+  if (!isRecord(value) || !exactKeys(value, [
+    "hostRunId", "viewerId", "viewerRevision", "rowId", "registrationIdentity", "registrationGeneration",
+    "cols", "rows", "geometryRevision",
+  ])) {
+    return false;
+  }
+  const viewerId: unknown = value.viewerId;
+  const cols: unknown = value.cols;
+  const rows: unknown = value.rows;
+  return scopeField(value.hostRunId)
+    && typeof viewerId === "string" && SCOPE_HANDLE_PATTERN.test(viewerId)
+    && scopeOrdinal(value.viewerRevision)
+    && scopeField(value.rowId)
+    && scopeField(value.registrationIdentity)
+    && scopeField(value.registrationGeneration)
+    && scopeOrdinal(cols) && cols >= 1
+    && scopeOrdinal(rows) && rows >= 1
+    && scopeOrdinal(value.geometryRevision);
+}
+
+function startupScopeCommitment(key: Buffer, facts: NativeViewerStartupScopeFacts): string {
+  // Every validated field is printable ASCII or a decimal ordinal, so the NUL
+  // separators cannot appear inside a value and the encoding cannot be re-associated.
+  return createHmac("sha256", key)
+    .update(STARTUP_SCOPE_DOMAIN)
+    .update(facts.hostRunId).update("\0")
+    .update(facts.viewerId).update("\0")
+    .update(String(facts.viewerRevision)).update("\0")
+    .update(facts.rowId).update("\0")
+    .update(facts.registrationIdentity).update("\0")
+    .update(facts.registrationGeneration).update("\0")
+    .update(String(facts.cols)).update("\0")
+    .update(String(facts.rows)).update("\0")
+    .update(String(facts.geometryRevision))
+    .digest("hex").slice(0, SCOPE_COMMITMENT_CHARS);
+}
+
+function startupScopeKey(bootstrap: SessionHostBootstrap, facts: NativeViewerStartupScopeFacts): Buffer | undefined {
+  if (!isValidStartupScopeFacts(facts)) return undefined;
+  return registrationScopeKey(
+    bootstrap, facts.registrationIdentity, facts.registrationGeneration, STARTUP_SCOPE_KEY_DOMAIN,
+  );
+}
+
+/**
+ * Mint one host-side STARTUP viewer scope token, `nvst1.<handle>.<32 hex>`, inside
+ * the existing opaque-origin bound, or undefined when the facts are incomplete or
+ * name another registration. It never parses or verifies as an `nvs1` conversation
+ * scope, so it can never select a conversation-copy destination.
+ */
+export function mintNativeViewerStartupScopeToken(
+  bootstrap: SessionHostBootstrap, facts: NativeViewerStartupScopeFacts,
+): string | undefined {
+  if (!isValidStartupScopeFacts(facts)) return undefined;
+  const key = startupScopeKey(bootstrap, facts);
+  if (key === undefined) return undefined;
+  const token = `${STARTUP_SCOPE_TAG}${facts.viewerId}.${startupScopeCommitment(key, facts)}`;
+  return token.length <= NATIVE_INPUT_VIEWER_SCOPE_TOKEN_CHARS ? token : undefined;
+}
+
+/** Canonical parse of one startup scope token; a lookup aid that authenticates nothing. */
+export function parseNativeViewerStartupScopeToken(token: unknown): NativeViewerScopeHandle | undefined {
+  if (typeof token !== "string") return undefined;
+  const match = STARTUP_SCOPE_PATTERN.exec(token);
+  if (match === null) return undefined;
+  return Object.freeze({ viewerId: match[1]! });
+}
+
+/**
+ * Verify a startup scope token against the CURRENT startup facts and THIS
+ * registration's startup key, in constant time. A conversation `nvs1` token, a
+ * different registration, run, row, viewer revision, or geometry revision verifies
+ * to false. True is only evidence these were the facts; it grants nothing.
+ */
+export function verifyNativeViewerStartupScopeToken(
+  bootstrap: SessionHostBootstrap, token: unknown, facts: NativeViewerStartupScopeFacts,
+): boolean {
+  if (!isValidStartupScopeFacts(facts)) return false;
+  const handle = parseNativeViewerStartupScopeToken(token);
+  if (handle === undefined || handle.viewerId !== facts.viewerId) return false;
+  const key = startupScopeKey(bootstrap, facts);
+  if (key === undefined) return false;
+  const received = (token as string).slice(STARTUP_SCOPE_TAG.length + handle.viewerId.length + 1);
+  if (!SCOPE_COMMITMENT_PATTERN.test(received)) return false;
+  const expected = Buffer.from(startupScopeCommitment(key, facts), "latin1");
   const actual = Buffer.from(received, "latin1");
   return expected.length === actual.length && timingSafeEqual(expected, actual);
 }

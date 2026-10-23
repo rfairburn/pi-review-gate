@@ -84,6 +84,7 @@ import { resolveRosterBridgeBounds, type RosterBridgeBounds } from "./roster-bri
 import {
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
@@ -93,6 +94,7 @@ import {
 	createSessionContentTransferAssembler,
 	decodeSessionContentFrame,
 	encodeSessionContentFrame,
+	isNativeIoStartupSource,
 	isSessionContentProtocolError,
 	nativeIoSourceEquals,
 	resolveSessionContentBounds,
@@ -101,6 +103,7 @@ import {
 	type NativeIoBuiltTransfer,
 	type NativeIoCompletedCopy,
 	type NativeIoInputKind,
+	type NativeIoInputSource,
 	type NativeIoSource,
 	type SessionContentBeginFrame,
 	type SessionContentBounds,
@@ -199,9 +202,10 @@ export interface SessionContentViewerNativeIo {
 	 * every protected wire write. Anything but `true` (or a throw) refuses the
 	 * write: this endpoint treats it as a live proof seam supplied by the caller
 	 * that owns the written native source, never as a cached permission, token,
-	 * descriptor, or grant.
+	 * descriptor, or grant. The expected source is a conversation source or, when
+	 * startup input was negotiated, a tuple-less startup source.
 	 */
-	readonly authorizeInput: (expected: NativeIoSource) => boolean;
+	readonly authorizeInput: (expected: NativeIoInputSource) => boolean;
 	/**
 	 * Called at most once per atomically assembled native text copy, and only while
 	 * that copy's exact source is still this endpoint's current published source.
@@ -213,8 +217,8 @@ export interface SessionContentViewerNativeIo {
 
 /** One caller-normalized native input submission against one exact source. */
 export interface SessionContentViewerInputRequest {
-	/** Exact expected source; it must equal this endpoint's current published one. */
-	readonly source: NativeIoSource;
+	/** Exact expected source (conversation or startup); it must equal this endpoint's current published one. */
+	readonly source: NativeIoInputSource;
 	/** Exact expected observed input modes of that same current snapshot. */
 	readonly inputModes: TerminalInputModes;
 	readonly kind: NativeIoInputKind;
@@ -307,9 +311,10 @@ export interface SessionContentViewer {
 	 * `undefined` while the extension is unoffered, unacknowledged, not streaming,
 	 * retired, or that snapshot carries no source. Descriptive facts only: the
 	 * source is never authority to write, and it is never inferred from a newer
-	 * target.
+	 * target. Before the owner's first conversation tuple this may be the explicit
+	 * tuple-less startup source (only when startup input was negotiated).
 	 */
-	readNativeInputSource(): NativeIoSource | undefined;
+	readNativeInputSource(): NativeIoInputSource | undefined;
 	/**
 	 * Submit one typed, caller-normalized native input against the exact source and
 	 * modes of the current published snapshot. The source, endpoint state, and the
@@ -389,7 +394,7 @@ interface PendingInput {
 	/** True once the returned promise settled; no later frame may be written. */
 	settled: boolean;
 	/** The endpoint's own facts this operation's frames were validated against. */
-	readonly source: NativeIoSource;
+	readonly source: NativeIoInputSource;
 	readonly inputModes: TerminalInputModes;
 	/**
 	 * True once a newer publication stopped matching the source/modes this operation
@@ -410,15 +415,20 @@ type InputFrameOutcome =
 	| { readonly outcome: "failed" };
 
 type InputGate =
-	| { readonly ok: true; readonly source: NativeIoSource; readonly inputModes: TerminalInputModes }
+	| { readonly ok: true; readonly source: NativeIoInputSource; readonly inputModes: TerminalInputModes }
 	| { readonly ok: false; readonly reason: NativeInputNotSentReason };
 
-function isNativeIoSourceShape(value: unknown): value is NativeIoSource {
+function isNativeIoSourceShape(value: unknown): value is NativeIoInputSource {
 	if (value === null || typeof value !== "object") return false;
 	const source = value as Record<string, unknown>;
 	const nativeSession = source.nativeSession;
 	const geometry = source.geometry;
-	return nativeSession !== null && typeof nativeSession === "object"
+	// A startup source names its phase and carries no tuple; a conversation source
+	// carries a tuple. Exact equality against the published source decides the rest.
+	const tupleShape = Object.prototype.hasOwnProperty.call(source, "phase")
+		? source.phase === "startup" && !Object.prototype.hasOwnProperty.call(source, "nativeSession")
+		: nativeSession !== null && typeof nativeSession === "object";
+	return tupleShape
 		&& geometry !== null && typeof geometry === "object"
 		&& typeof source.hostRunId === "string"
 		&& typeof source.sessionId === "string"
@@ -516,6 +526,8 @@ class ContentViewerBinding implements SessionContentViewer {
 	readonly #onCopy: SessionContentViewerNativeIo["onCopy"] | null;
 	/** True only after the owner acknowledged the capability this side offered. */
 	#nativeIoNegotiated = false;
+	/** True only after the owner ALSO acknowledged startup input beside native IO. */
+	#startupInputNegotiated = false;
 
 	readonly #assembler: SessionContentTransferAssembler;
 	readonly #copyAssembler: NativeCopyAssembler;
@@ -525,7 +537,7 @@ class ContentViewerBinding implements SessionContentViewer {
 	#copyDiscardId: string | null = null;
 	/** The paged copy whose header was admitted, until its assembly completes. */
 	#copyHeaderId: string | null = null;
-	#copyHeaderSource: NativeIoSource | null = null;
+	#copyHeaderSource: NativeIoSource | null = null; // copy headers are conversation-only
 	/** Ordered logical input operations; one operation's frames never interleave. */
 	#inputTail: Promise<void> = Promise.resolve();
 	readonly #pendingInputs = new Set<PendingInput>();
@@ -590,11 +602,16 @@ class ContentViewerBinding implements SessionContentViewer {
 		this.#diagnostic = diagnostic;
 		this.#authorizeInput = nativeIo === null ? null : nativeIo.authorizeInput;
 		this.#onCopy = nativeIo === null ? null : nativeIo.onCopy;
-		// The optional capability is offered only for explicit, validated callbacks;
-		// the default hello keeps its exact single-capability shape and bytes.
+		// The optional capabilities are offered only for explicit, validated callbacks;
+		// the default hello keeps its exact single-capability shape and bytes. Startup
+		// input is offered only beside the native IO capability it depends on.
 		this.#capabilities = Object.freeze(nativeIo === null
 			? [SESSION_CONTENT_REQUIRED_CAPABILITY]
-			: [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY]);
+			: [
+				SESSION_CONTENT_REQUIRED_CAPABILITY,
+				SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+				SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+			]);
 		this.#requested = { cols: options.cols, rows: options.rows };
 		this.#activeSubscriptionId = subscriptionId;
 		this.#assembler = createSessionContentTransferAssembler(bounds);
@@ -629,7 +646,7 @@ class ContentViewerBinding implements SessionContentViewer {
 		return this.#snapshot;
 	}
 
-	readNativeInputSource(): NativeIoSource | undefined {
+	readNativeInputSource(): NativeIoInputSource | undefined {
 		if (!this.#nativeIoNegotiated || this.#retired || this.#stopRequested) return undefined;
 		if (this.#state !== "streaming" || this.#activeSubscriptionId !== this.subscriptionId) return undefined;
 		const snapshot = this.#snapshot;
@@ -969,6 +986,10 @@ class ContentViewerBinding implements SessionContentViewer {
 		if (this.#authorizeInput !== null
 			&& verdict.capabilities.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)) {
 			this.#nativeIoNegotiated = true;
+			// The ack review already refuses startup without native IO.
+			if (verdict.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)) {
+				this.#startupInputNegotiated = true;
+			}
 		}
 		// The sink is caller code: it can stop the viewer synchronously, and the rest
 		// of the handshake must not run (no subscribe, no timer) after that.
@@ -1037,6 +1058,12 @@ class ContentViewerBinding implements SessionContentViewer {
 		if (frame.inputSource !== undefined && !this.#nativeIoNegotiated) {
 			// A source this side never offered and the owner never acknowledged is not
 			// silently dropped: the extension was not negotiated on this channel.
+			this.#protocolFailure();
+			return;
+		}
+		if (frame.inputSource !== undefined && frame.inputSource !== null
+			&& isNativeIoStartupSource(frame.inputSource) && !this.#startupInputNegotiated) {
+			// Startup data this side never negotiated is not silently dropped either.
 			this.#protocolFailure();
 			return;
 		}
@@ -1205,7 +1232,7 @@ class ContentViewerBinding implements SessionContentViewer {
 	 * endpoint state, or the caller's own guard can change between frames. It
 	 * never caches a verdict, a token, or a permission.
 	 */
-	#inputGate(source: NativeIoSource, inputModes: TerminalInputModes): InputGate {
+	#inputGate(source: NativeIoInputSource, inputModes: TerminalInputModes): InputGate {
 		if (!this.#nativeIoNegotiated || this.#authorizeInput === null) {
 			return { ok: false, reason: "not-negotiated" };
 		}
@@ -1225,7 +1252,7 @@ class ContentViewerBinding implements SessionContentViewer {
 	 * The endpoint's own view of the exact current input target. Separate from the
 	 * caller's guard so it can be proven again after arbitrary caller code ran.
 	 */
-	#currentInputTarget(source: NativeIoSource, inputModes: TerminalInputModes): InputGate {
+	#currentInputTarget(source: NativeIoInputSource, inputModes: TerminalInputModes): InputGate {
 		if (this.#retired || this.#stopRequested || this.#activeSubscriptionId === null) {
 			return { ok: false, reason: "stopped" };
 		}
@@ -1239,6 +1266,10 @@ class ContentViewerBinding implements SessionContentViewer {
 		}
 		const current = snapshot.meta.inputSource;
 		if (current === undefined || current === null) return { ok: false, reason: "stale-source" };
+		// A startup source is usable only on a channel that negotiated startup input.
+		if (isNativeIoStartupSource(current) && !this.#startupInputNegotiated) {
+			return { ok: false, reason: "stale-source" };
+		}
 		// Exact expected source against this endpoint's own current published facts:
 		// token, run, row, native tuple and epoch, geometry revision, viewer revision.
 		if (!nativeIoSourceEquals(source, current)) return { ok: false, reason: "stale-source" };
@@ -1251,7 +1282,7 @@ class ContentViewerBinding implements SessionContentViewer {
 	}
 
 	/** The caller's dynamic proof seam; only an explicit boolean `true` allows a write. */
-	#authorize(expected: NativeIoSource): boolean {
+	#authorize(expected: NativeIoInputSource): boolean {
 		const guard = this.#authorizeInput;
 		if (guard === null) return false;
 		try {

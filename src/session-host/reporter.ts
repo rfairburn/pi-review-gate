@@ -40,7 +40,7 @@
  */
 
 import net from "node:net";
-import { updateNativeClipboardSession } from "./native-clipboard";
+import { armNativeClipboardStartup, updateNativeClipboardSession } from "./native-clipboard";
 import { NativePersistenceTracker, parseNativePersistenceReceipt, readNativePersistence, type NativePersistenceReceipt } from "./native-persistence";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { extractContext, extractToolName, registerHook, type HookHandler } from "../pi";
@@ -2311,7 +2311,7 @@ function createReporter(
     };
   };
 
-  registerHook(pi, "session_start", async (...args) => {
+  const sessionStartHooked = registerHook(pi, "session_start", async (...args) => {
     try {
       const ctx = extractSafeContext(args);
       if (!contextModeIsTui(ctx)) {
@@ -2345,7 +2345,7 @@ function createReporter(
     }
   });
 
-  registerHook(pi, "session_shutdown", safe(() => {
+  const sessionShutdownHooked = registerHook(pi, "session_shutdown", safe(() => {
     deactivate();
     // Terminal shutdown: no later reader can consume an uncertain payload.
     discardOutstandingSpawnPayloads();
@@ -2354,7 +2354,7 @@ function createReporter(
   // Public Pi notification emitted by native /name and setSessionName.
   // It refreshes only the bounded canonical title/identity, never session
   // entries or message text other than the clipped first-user fallback.
-  registerHook(pi, "session_info_changed", safe((...args) => {
+  const sessionInfoHooked = registerHook(pi, "session_info_changed", safe((...args) => {
     if (!active) return;
     const eventContext = extractSafeContext(args);
     const ctx = contextModeIsTui(eventContext) ? eventContext : currentContext;
@@ -2454,6 +2454,21 @@ function createReporter(
   });
   registerHook(pi, "session_compact", reprobesReadiness);
   registerHook(pi, "session_compact_failed", reprobesReadiness);
+
+  // Explicit startup input phase (issue 389): armed ONLY here, at the very end of
+  // this reporter's construction, and only when its mandatory public session hooks
+  // (the ones that publish every later session update to the bridge) actually
+  // registered. Arming is a no-op once any session update of any value was
+  // published (a reload's teardown above already published one), and it never
+  // re-arms a closed phase. It sends no status, claims no conversation is absent,
+  // and pre-answers nothing.
+  if (sessionStartHooked && sessionShutdownHooked && sessionInfoHooked) {
+    try {
+      armNativeClipboardStartup();
+    } catch {
+      // An unavailable bridge simply leaves startup input unarmed (refused).
+    }
+  }
 
   return {
     bootstrap,

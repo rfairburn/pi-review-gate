@@ -14,6 +14,7 @@ import {
   DEFAULT_SHUTDOWN_KILL_MS,
   InstanceManager,
   createDefaultPtyFactory,
+  isNativeViewerStartupInputSource,
   __test as instanceTestSeam,
   MAX_ACTIVITY_ENTRIES,
   MAX_ACTIVITY_ENTRY_CHARS,
@@ -28,6 +29,7 @@ import {
   type InstanceStatusUpdate,
   type NativeInstanceView,
   type NativeViewerClipboardReceipt,
+  type NativeViewerAnyInputSource,
   type NativeViewerClipboardSink,
   type NativeViewerInputRefusal,
   type NativeViewerInputRequest,
@@ -4384,9 +4386,18 @@ function reportConversation(row: FramingRow, sessionId: string, epoch: number): 
   });
 }
 
+/**
+ * The current CONVERSATION source of one surface, or undefined. A startup source
+ * (tuple-less, before a row's first status) is deliberately not one.
+ */
+function conversationSourceOf(manager: InstanceManager, viewerId: string): NativeViewerInputSource | undefined {
+  const source = manager.readViewerInputSource(viewerId);
+  return source === undefined || isNativeViewerStartupInputSource(source) ? undefined : source;
+}
+
 /** A complete, well-formed request built from the caller's own observations. */
 function viewerRequest(
-  manager: InstanceManager, rowId: string, source: NativeViewerInputSource, data: string,
+  manager: InstanceManager, rowId: string, source: NativeViewerAnyInputSource, data: string,
 ): NativeViewerInputRequest {
   const modes = manager.surface(rowId)?.inputModes();
   assert.ok(modes, "a live row exposes its own input modes");
@@ -4480,11 +4491,15 @@ test("a viewer input source exists only for a bound surface on a ready framed ro
     assert.equal(harness.manager.readViewerInputSource(bound.viewerId), undefined,
       "readiness was never verified on this row");
     await markReady(harness, row);
-    assert.equal(harness.manager.readViewerInputSource(bound.viewerId), undefined,
-      "an unknown native conversation is never guessed into a scope");
+    // Before its first accepted status a ready framed row is in its explicit startup
+    // phase: the scope is the tuple-less startup variant, never a guessed conversation.
+    const startupScope = harness.manager.readViewerInputSource(bound.viewerId);
+    assert.ok(startupScope !== undefined && isNativeViewerStartupInputSource(startupScope)
+      && !Object.hasOwn(startupScope, "nativeSession") && /^nvst1\./.test(startupScope.sourceToken),
+    "an unknown native conversation is never guessed into a scope; only the explicit startup source exists");
 
     reportConversation(row, VIEWER_SESSION, 3);
-    const source = harness.manager.readViewerInputSource(bound.viewerId);
+    const source = conversationSourceOf(harness.manager, bound.viewerId);
     assert.ok(source, "a bound surface on a ready framed row with a known conversation has a scope");
     const geometry = harness.manager.instanceGeometry(row.id);
     assert.ok(geometry, "a row with a viewer has canonical geometry");
@@ -4944,7 +4959,7 @@ test("a conversation identity outside ASCII is still a viewer input source and s
       { sessionId: "n".repeat(256), epoch: 2 },
     ]) {
       reportConversation(row, sessionId, epoch);
-      const source = harness.manager.readViewerInputSource(bound.viewerId);
+      const source = conversationSourceOf(harness.manager, bound.viewerId);
       assert.ok(source, `a valid conversation identity describes a scope (${sessionId.length} chars)`);
       assert.deepEqual(source.nativeSession, { sessionId, epoch });
       const modes = harness.manager.surface(row.id)!.inputModes();
@@ -5038,6 +5053,146 @@ test("a viewer dispatch is admitted only up to the child's whole-dispatch assemb
     assert.deepEqual(localFragments[0]!.origin, { kind: "local" });
 
     assert.equal(viewFor(harness.manager, row.id).lifecycle, "alive");
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Startup-phase viewer input (issue 389): a ready framed registration before its
+// first accepted status states an explicit tuple-less startup source whose
+// dispatch carries only the startup fence; the phase is sticky-closed by status,
+// disconnect, reconnect, and exit, and never becomes a copy scope.
+// ---------------------------------------------------------------------------
+
+function startupSourceOf(manager: InstanceManager, viewerId: string): NativeViewerAnyInputSource {
+  const source = manager.readViewerInputSource(viewerId);
+  assert.ok(source !== undefined && isNativeViewerStartupInputSource(source), "the surface states a startup source");
+  return source;
+}
+
+test("startup input: a ready framed row before its first status admits only startup-fenced viewer dispatches", async () => {
+  const routed: { instanceId: string; event: NativeClipboardEvent }[] = [];
+  const harness = makeFramingHarness("viewer-startup", {
+    framing: true,
+    onNativeClipboard: (instanceId, event) => { routed.push({ instanceId, event }); },
+  });
+  try {
+    const row = await createFramingRow(harness);
+    const bound = boundSurface(harness.manager);
+    displayRow(harness.manager, bound.viewerId, row.id);
+    assert.equal(harness.manager.readViewerInputSource(bound.viewerId), undefined,
+      "an unready registration has no startup source either");
+    await markReady(harness, row);
+    const startup = startupSourceOf(harness.manager, bound.viewerId);
+    assert.equal(Object.hasOwn(startup, "nativeSession"), false);
+    assert.match(startup.sourceToken, /^nvst1\./);
+    assert.equal(startup.sourceToken.includes(row.bootstrap.token), false);
+    assert.ok(Object.isFrozen(startup) && Object.isFrozen(startup.geometry));
+    const modes = harness.manager.surface(row.id)!.inputModes();
+
+    // Malformed startup shapes are refused before any fact is read.
+    for (const bad of [
+      { ...startup, phase: "conversation" },
+      { ...startup, nativeSession: null },
+      { ...startup, nativeSession: { sessionId: VIEWER_SESSION, epoch: 1 } },
+    ]) {
+      assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId,
+        { expectedSource: bad, expectedInputModes: modes, data: "x" } as unknown as NativeViewerInputRequest),
+      { status: "refused", reason: "invalid-input" }, `${JSON.stringify(bad)} is not a closed startup source`);
+    }
+    // A well-formed but forged startup source is stale.
+    for (const forged of [
+      { ...startup, viewerRevision: 99 },
+      { ...startup, geometry: { ...startup.geometry, revision: startup.geometry.revision + 1 } },
+      { ...startup, sourceToken: `${startup.sourceToken.slice(0, -1)}${startup.sourceToken.endsWith("0") ? "1" : "0"}` },
+    ]) {
+      assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId,
+        { expectedSource: forged, expectedInputModes: modes, data: "x" }),
+      { status: "refused", reason: "stale-source" });
+    }
+    assert.deepEqual(row.pty.writes.filter((write) => typeof write === "string" && write.startsWith("prg-ni-v1;"))
+      .length, 0, "no refused startup write reached the child");
+
+    // The admitted write carries the startup fence and nothing else.
+    assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId,
+      { expectedSource: startup, expectedInputModes: modes, data: "1" }), { status: "submitted" });
+    const fragments = readViewerFrames(row);
+    assert.equal(fragments.length, 1);
+    assert.deepEqual(fragments[0]!.origin, { kind: "viewer", token: startup.sourceToken });
+    assert.equal(fragments[0]!.expectedNativeTuple, undefined, "no tuple, real or fabricated");
+    assert.equal(fragments[0]!.expectedNativePhase, "startup");
+    assert.equal(fragments[0]!.payload.toString("utf8"), "1");
+
+    // A copy capsule naming the startup token is never routed: startup is no copy scope.
+    await deliver(harness, row, capsuleOsc(originCapsule(row, 1, copyEvent("startup copy", VIEWER_SESSION, 1),
+      { origin: { kind: "viewer", token: startup.sourceToken }, dispatchId: fragments[0]!.dispatchId })));
+    assert.deepEqual(bound.receipts, [], "a startup token never opens a copy sink");
+    assert.deepEqual(routed, [], "and never falls back to the owner's local route");
+
+    // An ABA geometry change retires the old startup commitment; a fresh one works.
+    assert.equal(harness.manager.updateViewer(bound.viewerId, { cols: 90, rows: 30 }).applied, true);
+    assert.equal(harness.manager.updateViewer(bound.viewerId, { cols: 80, rows: 24 }).applied, true);
+    const writesBefore = row.pty.writes.length;
+    assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId,
+      { expectedSource: startup, expectedInputModes: modes, data: "x" }), { status: "refused", reason: "stale-source" });
+    assert.equal(row.pty.writes.length, writesBefore);
+    const fresh = startupSourceOf(harness.manager, bound.viewerId);
+    assert.notEqual(fresh.sourceToken, startup.sourceToken);
+
+    // The first ACCEPTED status — even one with a null tuple — closes startup for good.
+    row.entry.handlers.onStatus({ busy: false, pendingInput: false, inputSurface: false, activity: [], nativeSession: null });
+    assert.equal(harness.manager.readViewerInputSource(bound.viewerId), undefined);
+    assert.deepEqual(harness.manager.writeViewerInput(bound.viewerId,
+      { expectedSource: fresh, expectedInputModes: modes, data: "x" }),
+    { status: "refused", reason: "unknown-native-tuple" }, "a closed startup phase admits nothing");
+    assert.equal(row.pty.writes.length, writesBefore, "nothing reached the child after startup closed");
+
+    // A known tuple then gives the ordinary source; losing it never reopens startup.
+    reportConversation(row, VIEWER_SESSION, 1);
+    assert.ok(conversationSourceOf(harness.manager, bound.viewerId), "a conversation source follows the tuple");
+    row.entry.handlers.onStatus({ busy: false, pendingInput: false, inputSurface: false, activity: [], nativeSession: null });
+    assert.equal(harness.manager.readViewerInputSource(bound.viewerId), undefined,
+      "a once-known, now lost tuple never becomes startup");
+    await disposeFramingHarness(harness);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("startup input is sticky-closed by disconnect, reconnect, and exit, and a status before readiness never opens it", async () => {
+  const harness = makeFramingHarness("viewer-startup-retire", { framing: true });
+  try {
+    const disconnected = await createFramingRow(harness);
+    const reconnected = await createFramingRow(harness);
+    const exited = await createFramingRow(harness);
+    const statusFirst = await createFramingRow(harness);
+    const surfaces = new Map<FramingRow, string>();
+    for (const row of [disconnected, reconnected, exited, statusFirst]) {
+      const bound = boundSurface(harness.manager);
+      displayRow(harness.manager, bound.viewerId, row.id);
+      surfaces.set(row, bound.viewerId);
+    }
+    // A status that lands BEFORE readiness already retired startup on that row.
+    statusFirst.entry.handlers.onStatus({ busy: false, pendingInput: false, inputSurface: false, activity: [], nativeSession: null });
+    for (const row of [disconnected, reconnected, exited, statusFirst]) await markReady(harness, row);
+    assert.equal(harness.manager.readViewerInputSource(surfaces.get(statusFirst)!), undefined,
+      "readiness after the first status never opens startup");
+
+    for (const row of [disconnected, reconnected, exited]) startupSourceOf(harness.manager, surfaces.get(row)!);
+    disconnected.entry.handlers.onDisconnect();
+    assert.equal(harness.manager.readViewerInputSource(surfaces.get(disconnected)!), undefined,
+      "a reporter disconnect closes startup");
+    reconnected.entry.handlers.onReconnect?.();
+    assert.equal(harness.manager.readViewerInputSource(surfaces.get(reconnected)!), undefined,
+      "a reconnect closes startup");
+    exited.pty.emitExit(0);
+    await until(() => exited.entry.released, "the exit released the registration");
+    assert.equal(harness.manager.readViewerInputSource(surfaces.get(exited)!), undefined, "an exit closes startup");
+    for (const row of [disconnected, reconnected, statusFirst]) {
+      assert.equal(viewFor(harness.manager, row.id).lifecycle, "alive", "closing startup never stops a child");
+    }
     await disposeFramingHarness(harness);
   } finally {
     rmSync(harness.root, { recursive: true, force: true });

@@ -6,7 +6,12 @@ import { dirname, isAbsolute, join, relative } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { getCallSites } from "node:util";
-import type { NativeInputDecoder, NativeInputExpectedTuple, NativeInputOrigin } from "./native-input-origin";
+import type {
+  NativeInputDecoder,
+  NativeInputExpectedPhase,
+  NativeInputExpectedTuple,
+  NativeInputOrigin,
+} from "./native-input-origin";
 import { isValidNativeSessionId, type SessionHostBootstrap } from "./protocol";
 
 /** Private authenticated transport, NOT permission to forward raw child OSC 52. */
@@ -376,7 +381,15 @@ export function isNativeClipboardOrigin(
 }
 
 const BRIDGE_STATE = Symbol.for("pi-review-gate.native-clipboard-bridge.v1");
-interface BridgeState { readonly version: 1; readonly setSession: (tuple: SessionTuple | undefined) => void }
+interface BridgeState {
+  readonly version: 1;
+  readonly setSession: (tuple: SessionTuple | undefined) => void;
+  /**
+   * One-shot startup arming. It is a no-op once any session update (of any value)
+   * was published, and it never re-arms a closed startup phase.
+   */
+  readonly armStartup?: () => void;
+}
 function bridgeState(): BridgeState | undefined {
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, BRIDGE_STATE);
   const value: unknown = descriptor && "value" in descriptor ? descriptor.value : undefined;
@@ -384,6 +397,19 @@ function bridgeState(): BridgeState | undefined {
 }
 /** Reporter owns the canonical native session epoch; reloads share one process-owned bridge. */
 export function updateNativeClipboardSession(tuple: SessionTuple | undefined): void { bridgeState()?.setSession(tuple); }
+/**
+ * Arm this process's explicit startup input phase. Called exactly once by the
+ * authenticated reporter at the END of its own construction, after its mandatory
+ * public hooks were registered. It opens startup only when the bridge is still
+ * unarmed (no session update of any value was ever published); otherwise it does
+ * nothing. It claims nothing about whether a native conversation exists, publishes
+ * no status, and grants no copy authority.
+ */
+export function armNativeClipboardStartup(): void {
+  const state = bridgeState();
+  if (state === undefined || typeof state.armStartup !== "function") return;
+  state.armStartup();
+}
 
 /** Captured once at logical dispatch start; later Reporter updates cannot retarget it. */
 interface FramedInputScope {
@@ -396,6 +422,13 @@ interface FramedInputScope {
    * conversation its input actually belonged to, never the newest one.
    */
   readonly expectedNativeTuple: NativeInputExpectedTuple | undefined;
+  /**
+   * `"startup"` only for a viewer dispatch admitted against the explicit startup
+   * phase. Such a dispatch has no conversation tuple, so it can never produce a
+   * conversation copy capsule, an owner-local copy, or a raw clipboard relay, even
+   * from asynchronous work that runs after the phase closed.
+   */
+  readonly expectedNativePhase: NativeInputExpectedPhase | undefined;
 }
 
 /**
@@ -534,6 +567,14 @@ interface FramedStdinHandle {
  * back to raw. Neither a refusal nor the bound latches the decoder: the next
  * dispatch that matches the current conversation is delivered normally, and an
  * A -> B -> A tuple sequence never revives buffered bytes from A.
+ *
+ * A startup-fenced `viewer` dispatch follows exactly the same whole-dispatch
+ * assembly. Its fence is this process's own explicit startup phase, checked at
+ * dispatch start, at EVERY fragment, and immediately before the single emit. The
+ * phase closes for good at the first session update of ANY value (including
+ * `undefined` and reloads), and that update releases a pending startup assembly
+ * at once, so a startup dispatch can never straddle the first published update
+ * and can never poison the next native paste.
  */
 function installFramedStdin(
   stdin: typeof process.stdin,
@@ -541,6 +582,7 @@ function installFramedStdin(
   decoder: NativeInputDecoder,
   framed: AsyncLocalStorage<FramedInputScope>,
   currentTuple: () => SessionTuple | undefined,
+  startupOpen: () => boolean,
   maxViewerPayloadBytes: number,
 ): FramedStdinHandle {
   let poisoned = false;
@@ -550,8 +592,15 @@ function installFramedStdin(
     readonly scope: FramedInputScope;
     readonly text: StringDecoder | undefined;
     readonly expected: NativeInputExpectedTuple | undefined;
+    /** True for a viewer dispatch fenced on the explicit startup phase. */
+    readonly startup: boolean;
+    /** True for any viewer dispatch: it is assembled whole and emitted once. */
+    readonly viewer: boolean;
     suppressed: boolean;
   } | undefined;
+  /** The one fence a viewer dispatch carries, evaluated against the CURRENT facts. */
+  const fenceHolds = (active: { readonly expected: NativeInputExpectedTuple | undefined; readonly startup: boolean }): boolean =>
+    active.startup ? startupOpen() : tupleStillExpected(active.expected, currentTuple());
   const pending = new PendingViewerDispatch();
   stdin.emit = function (event: string | symbol, ...args: unknown[]): boolean {
     if (event !== "data") {
@@ -578,20 +627,26 @@ function installFramedStdin(
       if (fragment.start) {
         const tuple = currentTuple();
         const expected = fragment.expectedNativeTuple;
+        const startup = fragment.expectedNativePhase === "startup";
         // A new logical dispatch never inherits an earlier dispatch's owned bytes.
         pending.clear();
+        const fence = { expected, startup };
         open = {
           scope: Object.freeze({
             tuple: tuple ? Object.freeze({ ...tuple }) : undefined,
             expectedNativeTuple: expected ? Object.freeze({ ...expected }) : undefined,
+            expectedNativePhase: startup ? "startup" as const : undefined,
             origin: fragment.origin,
             dispatchId: fragment.dispatchId,
           }),
           text: encoding === null ? undefined : textDecoder(encoding),
           expected,
-          // A viewer dispatch admitted against another conversation is refused
-          // whole, before a single byte reaches a listener.
-          suppressed: !tupleStillExpected(expected, tuple),
+          startup,
+          viewer: fragment.origin.kind === "viewer",
+          // A viewer dispatch admitted against another conversation, or against a
+          // startup phase that is not open now, is refused whole, before a single
+          // byte reaches a listener.
+          suppressed: !fenceHolds(fence),
         };
       }
       const active = open;
@@ -601,11 +656,12 @@ function installFramedStdin(
         pending.clear();
         return true;
       }
-      if (active.expected !== undefined) {
+      if (active.viewer) {
         // VIEWER: assemble one whole logical dispatch and emit it once at its end.
-        if (!active.suppressed && !tupleStillExpected(active.expected, currentTuple())) {
-          // A session change seen at any fragment: the rest of this dispatch belongs
-          // to no conversation. Consume it, deliver none of it, never re-tag.
+        if (!active.suppressed && !fenceHolds(active)) {
+          // A session change (or a closed startup phase) seen at any fragment: the
+          // rest of this dispatch belongs to nothing. Consume it, deliver none of it,
+          // never re-tag.
           active.suppressed = true;
         }
         if (active.suppressed) {
@@ -631,7 +687,7 @@ function installFramedStdin(
         // Final fragment: release the owned bytes BEFORE the one emit, then recheck
         // the exact captured fence immediately before delivery.
         const assembled = pending.take();
-        const stillCurrent = tupleStillExpected(active.expected, currentTuple());
+        const stillCurrent = fenceHolds(active);
         open = undefined;
         if (!stillCurrent) {
           consumed = true; // The conversation moved on: nothing of this dispatch is delivered.
@@ -693,11 +749,13 @@ function installFramedStdin(
   return {
     onTupleChange: () => {
       const active = open;
-      // Only a pending VIEWER dispatch carries the conversation fence; `local` and
-      // `none` keep their unchanged per-fragment streaming.
-      if (active === undefined || active.expected === undefined) return;
-      // A republished identical tuple is not a change: the dispatch stays intact.
-      if (tupleStillExpected(active.expected, currentTuple())) return;
+      // Only a pending VIEWER dispatch carries a fence; `local` and `none` keep
+      // their unchanged per-fragment streaming.
+      if (active === undefined || !active.viewer) return;
+      // A republished identical tuple is not a change for a conversation-fenced
+      // dispatch. A startup-fenced dispatch never survives: every update closes the
+      // startup phase before this hook runs.
+      if (fenceHolds(active)) return;
       // Release the owned bytes now even when no further stdin ever arrives, and
       // latch the refusal for the rest of this dispatch, so returning to the earlier
       // tuple (A -> B -> A) can never revive buffered bytes from A.
@@ -706,6 +764,62 @@ function installFramedStdin(
     },
   };
 }
+
+/** One payload the strict framed stdin delivered to the original emitter, with its captured scope. */
+export interface FramedStdinTestDelivery {
+  readonly chunk: Buffer | string;
+  readonly origin: NativeInputOrigin | undefined;
+  readonly dispatchId: number | undefined;
+  readonly expectedNativePhase: NativeInputExpectedPhase | undefined;
+  readonly expectedNativeTuple: NativeInputExpectedTuple | undefined;
+  readonly capturedTuple: { readonly sessionId: string; readonly sessionEpoch: number } | undefined;
+}
+
+/**
+ * Test-only seam: drive the exact strict framed-stdin logic over an in-memory
+ * stream, without touching `process.stdin`, `process.stdout`, or the process-wide
+ * bridge state. Production code never calls it.
+ */
+export const __test = Object.freeze({
+  framedStdin(options: {
+    readonly decoder: NativeInputDecoder;
+    readonly currentTuple: () => { readonly sessionId: string; readonly sessionEpoch: number } | undefined;
+    readonly startupOpen: () => boolean;
+    readonly maxViewerPayloadBytes: number;
+  }): {
+    feed(chunk: Buffer | string): boolean;
+    end(): void;
+    onTupleChange(): void;
+    readonly delivered: FramedStdinTestDelivery[];
+  } {
+    const delivered: FramedStdinTestDelivery[] = [];
+    const framed = new AsyncLocalStorage<FramedInputScope>();
+    const original = function (this: typeof process.stdin, event: string | symbol, ...args: unknown[]): boolean {
+      if (event === "data") {
+        const scope = framed.getStore();
+        delivered.push(Object.freeze({
+          chunk: args[0] as Buffer | string,
+          origin: scope?.origin,
+          dispatchId: scope?.dispatchId,
+          expectedNativePhase: scope?.expectedNativePhase,
+          expectedNativeTuple: scope?.expectedNativeTuple,
+          capturedTuple: scope?.tuple,
+        }));
+      }
+      return true;
+    };
+    const fake = { readableEncoding: null, emit: original } as unknown as typeof process.stdin;
+    const handle = installFramedStdin(
+      fake, original, options.decoder, framed, options.currentTuple, options.startupOpen, options.maxViewerPayloadBytes,
+    );
+    return Object.freeze({
+      feed: (chunk: Buffer | string): boolean => fake.emit("data", chunk),
+      end: (): void => { fake.emit("end"); },
+      onTupleChange: (): void => handle.onTupleChange(),
+      delivered,
+    });
+  },
+});
 
 /**
  * Installed only in the authenticated owned child, before native main. Native
@@ -739,13 +853,31 @@ export function installNativeClipboardBridge(
   let current: SessionTuple | undefined;
   let framedInput: FramedStdinHandle | undefined;
   let sequence = 0;
-  const state: BridgeState = Object.freeze({ version: 1, setSession: (tuple: SessionTuple | undefined) => {
-    current = tuple && validTuple(tuple) ? { sessionId: tuple.sessionId, sessionEpoch: tuple.sessionEpoch } : undefined;
-    // A published conversation change reaches the strict bridge immediately, so a
-    // pending viewer dispatch releases its owned bytes and stays refused even if no
-    // further stdin ever arrives. The legacy bridge installs no such handle.
-    framedInput?.onTupleChange();
-  } });
+  /**
+   * Explicit startup phase of THIS process: `unarmed` until the reporter arms it
+   * after registering its mandatory hooks, `open` only between that arming and the
+   * first session update, and `closed` for good after any update of any value.
+   * There is no transition out of `closed`, so a reload, a deactivation, or an
+   * A -> B -> A sequence can never re-open it.
+   */
+  let startup: "unarmed" | "open" | "closed" = "unarmed";
+  const state: BridgeState = Object.freeze({
+    version: 1,
+    setSession: (tuple: SessionTuple | undefined) => {
+      // EVERY call (including `undefined`, deactivation, and reload) ends the
+      // startup phase BEFORE the pending-dispatch hook runs, so a pending startup
+      // assembly is released immediately and can never be delivered.
+      startup = "closed";
+      current = tuple && validTuple(tuple) ? { sessionId: tuple.sessionId, sessionEpoch: tuple.sessionEpoch } : undefined;
+      // A published conversation change reaches the strict bridge immediately, so a
+      // pending viewer dispatch releases its owned bytes and stays refused even if no
+      // further stdin ever arrives. The legacy bridge installs no such handle.
+      framedInput?.onTupleChange();
+    },
+    armStartup: () => {
+      if (startup === "unarmed") startup = "open";
+    },
+  });
   Object.defineProperty(globalThis, BRIDGE_STATE, { value: state });
   const stdin = process.stdin;
   const emit = stdin.emit as (this: typeof stdin, event: string | symbol, ...args: unknown[]) => boolean;
@@ -756,7 +888,9 @@ export function installNativeClipboardBridge(
       return scope.run(snapshot, () => emit.call(this, event, ...args));
     };
   } else {
-    framedInput = installFramedStdin(stdin, emit, inputDecoder!, framed, () => current, viewerPayloadBound);
+    framedInput = installFramedStdin(
+      stdin, emit, inputDecoder!, framed, () => current, () => startup === "open", viewerPayloadBound,
+    );
   }
   const stdout = process.stdout;
   const write = stdout.write as (...args: unknown[]) => boolean;
@@ -791,6 +925,20 @@ export function installNativeClipboardBridge(
     stdout.write = function framedClipboardWrite(this: typeof stdout, ...args: unknown[]): boolean {
       const dispatch = framed.getStore();
       if (dispatch === undefined) return write.apply(this, args);
+      if (dispatch.expectedNativePhase === "startup") {
+        // A startup-phase viewer dispatch has no conversation, so a native copy
+        // attempt it caused (now or from async work after the phase closed) yields
+        // no capsule, no owner-local route, and no raw OSC 52 relay. The write still
+        // completes through the original writer so callback-driven code never waits.
+        const startupChunk = args[0];
+        if (typeof startupChunk === "string" && startupChunk.length <= MAX_ENCODED + 8) {
+          const startupMatch = /^\x1b\]52;c;([A-Za-z0-9+/]*={0,2})\x07$/.exec(startupChunk);
+          if (startupMatch && canonicalBase64(startupMatch[1], MAX_ENCODED)) {
+            return write.call(this, "", ...args.slice(1));
+          }
+        }
+        return write.apply(this, args);
+      }
       const tuple = dispatch.tuple;
       const chunk = args[0];
       if (tuple === undefined || typeof chunk !== "string" || chunk.length > MAX_ENCODED + 8) {

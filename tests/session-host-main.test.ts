@@ -47,7 +47,13 @@ import type {
   PeerSelectedContent,
   PeerViewerNativeInputPolicy,
 } from "../src/session-host/network/peer-content";
-import type { NativeIoSource, SessionContentSnapshot } from "../src/session-host/network/session-content-protocol";
+import {
+  isNativeIoStartupSource,
+  type NativeIoInputSource,
+  type NativeIoSource,
+  type NativeIoStartupSource,
+  type SessionContentSnapshot,
+} from "../src/session-host/network/session-content-protocol";
 import type { NativeInputSendResult } from "../src/session-host/network/session-content-client";
 import type { RemoteSessionMetadata } from "../src/session-host/network/roster-metadata";
 import type { PeerCoordinator, PeerUiCommand, PeerUiConsent, PeerUiHost, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
@@ -7031,7 +7037,7 @@ function remoteViewport(input: {
   nativeSession?: { sessionId: string; epoch: number } | null;
   graphics?: TerminalGraphicsFrame;
   inputModes?: TerminalInputModes;
-  inputSource?: NativeIoSource;
+  inputSource?: NativeIoInputSource;
 }): SessionContentSnapshot {
   return {
     meta: {
@@ -7078,6 +7084,30 @@ function remoteNativeSource(input: {
     geometry: { cols: input.cols, rows: input.rows, revision: input.revision ?? 1 },
     viewerRevision: input.viewerRevision ?? 1,
     sourceToken: input.sourceToken ?? "commit-a",
+  };
+}
+
+/**
+ * The explicit tuple-less startup-phase source an owner publishes before its first
+ * conversation tuple. It carries no `nativeSession` key at all: nothing here is a
+ * fabricated conversation identity, and it is descriptive only, never authority.
+ */
+function remoteStartupSource(input: {
+  hostRunId: string;
+  sessionId: string;
+  cols: number;
+  rows: number;
+  revision?: number;
+  viewerRevision?: number;
+  sourceToken?: string;
+}): NativeIoStartupSource {
+  return {
+    hostRunId: input.hostRunId,
+    sessionId: input.sessionId,
+    phase: "startup",
+    geometry: { cols: input.cols, rows: input.rows, revision: input.revision ?? 1 },
+    viewerRevision: input.viewerRevision ?? 1,
+    sourceToken: input.sourceToken ?? "startup-a",
   };
 }
 
@@ -7344,6 +7374,62 @@ async function remoteNativeInputHarness(
   // Wide layout: 32 sidebar columns plus one divider. The 40x20 frame is drawn at
   // the native pane's top-left corner, so everything past it is host padding.
   return { harness, peer, content, manager, source, generation, rect: { column: 33, row: 1, cols: 40, rows: 20 } };
+}
+
+/**
+ * The same actual-written scenario BEFORE the owner reported any conversation
+ * tuple: the selected remote row publishes a complete viewport whose native
+ * conversation is null, carrying the explicit startup-phase source (for example
+ * while native Pi asks whether to trust the project folder). Nothing here invents
+ * a tuple, sends a status, or trusts anything on the operator's behalf.
+ */
+async function remoteStartupInputHarness(
+  t: { after(callback: () => void): void },
+): Promise<{
+  harness: Harness;
+  peer: FakePeerCoordinatorWithContent;
+  content: FakePeerContentPort;
+  manager: FakeManager;
+  startup: NativeIoStartupSource;
+  generation: number;
+}> {
+  const { harness, peer, content } = await remoteContentMainHarness(t, [
+    remotePeerHost({
+      id: "lab-a",
+      label: "Lab Alpha",
+      hostRunId: "run-a",
+      rows: [remoteRosterRow({ id: "row-a", label: "Alpha remote" })],
+    }),
+  ]);
+  const manager = harnessManager(harness);
+  fillForm(harness.terminal, "/local/workspace");
+  await nextTurn();
+  harness.terminal.emitInput(ALT_LEFT);
+  await nextTurn();
+  await activateRemoteRosterRow(harness, "Lab Alpha");
+  const generation = content.currentTarget().selectionGeneration;
+  const startup = remoteStartupSource({ hostRunId: "run-a", sessionId: "row-a", cols: 40, rows: 20 });
+  content.publish(remoteViewport({
+    subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 1,
+    cols: 40, rows: 20, marker: "REMOTE-STARTUP-TRUST", nativeSession: null, inputSource: startup,
+  }));
+  await nextTurn();
+  assert.equal(harness.sidebar!.focus, "main", "the written startup source owns Main focus");
+  assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-STARTUP-TRUST"),
+    "the tuple-less startup viewport is displayed through the one writer");
+  return { harness, peer, content, manager, startup, generation };
+}
+
+/** The coordinator's dynamic per-write proof Main supplied, for one exact expected source. */
+function remoteInputProof(
+  content: FakePeerContentPort,
+  generation: number,
+  source: NativeIoInputSource,
+  inputModes: TerminalInputModes = REMOTE_INPUT_MODES,
+): boolean {
+  const authorize = content.nativeIo?.authorizeInput;
+  assert.ok(authorize, "the production default supplies the dynamic written-source proof");
+  return authorize({ hostId: "lab-a", selectionGeneration: generation, subscriptionId: "sub-a", source, inputModes });
 }
 
 test("activating a remote roster card displays that owner's native viewport through the one writer", async (t) => {
@@ -10373,6 +10459,168 @@ test("a resize that returns to its original size revokes remote authority until 
     });
     assert.equal(harness.terminal.writes.length, writesBefore + 1,
       "the post-resize copy is delivered exactly once");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a written startup-phase source carries typing before the first tuple, never a copy, and its conversation successor needs its own written frame", async (t) => {
+  const { harness, content, manager, startup, generation } = await remoteStartupInputHarness(t);
+  try {
+    const copyFrom = (source: NativeIoSource, copyId: string, sequence: number, encoded: string): void => {
+      content.deliverCopy({
+        subscriptionId: "sub-a",
+        copyId,
+        sequence,
+        source,
+        dispatchId: sequence,
+        event: {
+          kind: "copy",
+          encoded,
+          sessionId: source.nativeSession.sessionId,
+          sessionEpoch: source.nativeSession.epoch,
+        },
+        hostId: "lab-a",
+        selectionGeneration: generation,
+      });
+    };
+
+    assert.equal(remoteInputProof(content, generation, startup), true,
+      "the actually written startup receipt is the current input authority");
+    harness.terminal.emitInput("1");
+    await nextTurn();
+    assert.equal(content.deliveredInputs.length, 1, "the startup dialog's answer reaches the one delegate once");
+    const answered = content.deliveredInputs[0]!;
+    assert.equal(answered.text, "1");
+    assert.deepEqual(answered.source, startup, "the submission carries the written startup source unchanged");
+    assert.ok(isNativeIoStartupSource(answered.source), "the startup phase is explicit on the request");
+    assert.equal(Object.hasOwn(answered.source, "nativeSession"), false,
+      "no conversation identity is fabricated for the startup phase");
+    assert.equal(manager.writes.length, 0, "startup input never falls back to a local row");
+
+    // A startup receipt is input-only: a copy is always conversation-sourced, so
+    // no copy (not even one naming the startup source's own token) matches it.
+    const conversation = { sessionId: "conversation-a", epoch: 1 };
+    const conversationSource = remoteNativeSource({
+      hostRunId: "run-a", sessionId: "row-a", nativeSession: conversation, cols: 40, rows: 20,
+      sourceToken: "commit-a",
+    });
+    const beforeCopies = harness.terminal.writes.length;
+    copyFrom(conversationSource, "copy-early", 1, "ZWFybHk=");
+    copyFrom({ ...conversationSource, sourceToken: startup.sourceToken }, "copy-token", 2, "dG9rZW4=");
+    assert.equal(harness.terminal.writes.slice(beforeCopies).some((write) => write.includes("]52;")), false,
+      "no OSC 52 is written while the written receipt is the startup phase");
+
+    // The first tuple arrives with identical pixels: a phase/source-only change is
+    // still a writer boundary, and neither source authorizes until it is written.
+    harness.writer.holdWrites = true;
+    const invalidations = harness.writer.invalidateCalls;
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
+      cols: 40, rows: 20, marker: "REMOTE-STARTUP-TRUST", nativeSession: conversation, inputSource: conversationSource,
+    }));
+    await nextTurn();
+    assert.ok(harness.writer.invalidateCalls > invalidations,
+      "a startup -> conversation change forces the real writer boundary with identical visible bytes");
+    assert.equal(remoteInputProof(content, generation, startup), false,
+      "the written startup receipt stops authorizing once the published view names a conversation");
+    assert.equal(remoteInputProof(content, generation, conversationSource), false,
+      "the published-but-unwritten conversation source authorizes nothing yet");
+    harness.terminal.emitInput("2");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 1, "nothing is offered to the delegate across the unwritten boundary");
+    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_NOT_SENT_NOTICE) !== undefined,
+      "the refusal is the existing brief non-modal notice");
+
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    harness.terminal.emitInput("3");
+    await nextTurn();
+    assert.equal(content.deliveredInputs.length, 2, "the conversation frame's own write restores input");
+    assert.deepEqual(content.deliveredInputs[1]!.source, conversationSource,
+      "the submission now carries the written conversation source");
+    assert.equal(remoteInputProof(content, generation, startup), false,
+      "the startup phase never authorizes again after the conversation frame is written");
+
+    const beforeConversationCopy = harness.terminal.writes.length;
+    copyFrom(conversationSource, "copy-conversation", 3, "Y29udg==");
+    assert.deepEqual(harness.terminal.writes.slice(beforeConversationCopy), [`${ESC}]52;c;Y29udg==\x07`],
+      "the written conversation source receives its copy exactly once");
+    assert.equal(manager.writes.length, 0);
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a written startup-phase receipt is refused under roster focus, a resize, an Off -> On return, and a covering overlay", async (t) => {
+  const { harness, peer, content, manager, startup, generation } = await remoteStartupInputHarness(t);
+  try {
+    // Roster focus: the startup receipt follows the same Main-focus rule.
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar");
+    assert.equal(remoteInputProof(content, generation, startup), false,
+      "roster focus refuses the startup receipt");
+    harness.terminal.emitInput(`${ESC}[1;3C`); // Alt+Right: return input ownership to Main.
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main");
+    assert.equal(remoteInputProof(content, generation, startup), true,
+      "a written Main-focused frame of the same startup source authorizes again");
+
+    // 80 -> 70 -> 80 before any replacement frame is written.
+    harness.writer.holdWrites = true;
+    harness.terminal.setSize(70, 24);
+    harness.terminal.setSize(80, 24);
+    await nextTurn();
+    assert.equal(remoteInputProof(content, generation, startup), false,
+      "a pre-resize startup receipt never regains authority when the size returns");
+    const requestsBeforeResize = content.inputRequests.length;
+    harness.terminal.emitInput("x");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, requestsBeforeResize, "nothing is offered across the resize boundary");
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    assert.equal(remoteInputProof(content, generation, startup), true,
+      "only the post-resize written frame restores the startup source");
+
+    // Off, then On while the sink is held: the old receipt is never revived.
+    content.setViewerInput(false);
+    peer.publish({ settings: { ...peer.snapshot.settings!, viewerNativeInputEnabled: false } });
+    await nextTurn();
+    assert.equal(remoteInputProof(content, generation, startup), false, "Off refuses the startup receipt");
+    const requestsWhileOff = content.inputRequests.length;
+    harness.terminal.emitInput("o");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, requestsWhileOff, "nothing is offered while Off");
+    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_VIEWER_OFF_NOTICE) !== undefined,
+      "Off is the one brief fixed notice");
+    harness.writer.holdWrites = true;
+    content.setViewerInput(true);
+    peer.publish({ settings: { ...peer.snapshot.settings!, viewerNativeInputEnabled: true } });
+    await nextTurn();
+    assert.equal(remoteInputProof(content, generation, startup), false,
+      "an Off -> On return needs a fresh actually written frame for the startup source");
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    assert.equal(content.deliveredInputs.at(-1)?.text, "y", "the freshly written frame restores startup input");
+    assert.deepEqual(content.deliveredInputs.at(-1)?.source, startup);
+
+    // Narrow Main: focused Main draws no sidebar rectangle, so the 40x20 startup
+    // frame stays uncovered; a roster overlay drawn over Main refuses it.
+    harness.terminal.setSize(50, 24);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main");
+    assert.equal(remoteInputProof(content, generation, startup), true,
+      "a narrow, uncovered, Main-focused written startup frame still authorizes");
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(remoteInputProof(content, generation, startup), false,
+      "a roster overlay covering Main refuses the startup receipt");
+    assert.equal(manager.writes.length, 0, "no refusal ever falls back to a local row");
   } finally {
     harness.writer.holdWrites = false;
     assert.equal(await closeWithSignal(harness), 0);

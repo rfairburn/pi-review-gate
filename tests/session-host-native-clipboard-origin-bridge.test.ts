@@ -170,6 +170,81 @@ function receiveReadiness(report: Report): number {
   return readyCalls;
 }
 
+test("installed startup phase is unarmed initially and session updates close it permanently", () => {
+  for (const closingTuple of [undefined, conversation("native-startup-next", 1)]) {
+    const encoder = createNativeInputEncoder(bootstrap);
+    const origin = viewer("startup-viewer");
+    const startup = { phase: "startup" as const };
+    const unarmed = frameChunks(encoder.encode(Buffer.from("unarmed"), origin, startup));
+    const payload = Buffer.alloc(70_000, 0x61);
+    const whole = frameChunks(encoder.encode(payload, origin, startup));
+    const partial = frameChunks(encoder.encode(payload, origin, startup));
+    const closed = frameChunks(encoder.encode(Buffer.from("closed"), origin, startup));
+    const next = frameChunks(encoder.encode(Buffer.from("next"), origin, fence("native-startup-next", 1)));
+    const localInput = frameChunks(encoder.encode(Buffer.from("local"), local));
+    const protocolInput = frameChunks(encoder.encode(Buffer.from("none"), none));
+    assert.ok(partial.length > 1, "the partial startup dispatch spans more than one frame");
+    const report = runScenario({
+      options: { inputOriginFraming: true },
+      steps: [
+        // Before the reporter arms it, a startup-fenced dispatch is refused whole.
+        { op: "feed", hex: unarmed[0]! },
+        { op: "armStartup" },
+        ...whole.map((hex) => ({ op: "feed", hex })),
+        // A session update of ANY value (undefined or a tuple) mid-assembly closes
+        // the phase for good: the pending bytes are dropped and re-arming is refused.
+        { op: "feed", hex: partial[0]! },
+        { op: "session", tuple: closingTuple },
+        { op: "armStartup" },
+        ...partial.slice(1).map((hex) => ({ op: "feed", hex })),
+        { op: "feed", hex: closed[0]! },
+        { op: "session", tuple: conversation("native-startup-next", 1) },
+        { op: "feed", hex: next[0]! },
+        { op: "feed", hex: localInput[0]! },
+        { op: "feed", hex: protocolInput[0]! },
+      ],
+    });
+    assert.equal(report.installed, true);
+    assert.deepEqual(report.payloads.map(bytesOf), [payload, Buffer.from("next"), Buffer.from("local"), Buffer.from("none")],
+      "only the complete armed dispatch and subsequent valid inputs reach native listeners");
+    assert.deepEqual(copyCapsules(report), []);
+    assert.deepEqual(otherTexts(report), []);
+  }
+});
+
+test("startup copies remain suppressed after asynchronous work crosses into a conversation", () => {
+  const encoder = createNativeInputEncoder(bootstrap);
+  const startup = { phase: "startup" as const };
+  const sync = frameChunks(encoder.encode(Buffer.from("sync"), viewer("startup-viewer"), startup));
+  const deferred = frameChunks(encoder.encode(Buffer.from("deferred"), viewer("startup-viewer"), startup));
+  const next = frameChunks(encoder.encode(Buffer.from("next"), viewer("conversation-viewer"), fence("native-startup-next", 1)));
+  const report = runScenario({
+    options: { inputOriginFraming: true },
+    writerReturns: false,
+    steps: [
+      { op: "armStartup" },
+      { op: "armCopy", text: "startup-sync", callback: true },
+      { op: "feed", hex: sync[0]! },
+      { op: "armCopy", text: "startup-deferred", callback: true, defer: true },
+      { op: "feed", hex: deferred[0]! },
+      { op: "session", tuple: conversation("native-startup-next", 1) },
+      { op: "armCopy", text: "conversation-copy" },
+      { op: "feed", hex: next[0]! },
+      { op: "wait", ms: 30 },
+    ],
+  });
+  assert.equal(report.payloads.length, 3);
+  assert.deepEqual(report.callbackCompletions, ["startup-sync", "startup-deferred"]);
+  assert.ok(report.copies.every((copy) => copy.value === false), "writer return values are preserved");
+  assert.deepEqual(otherTexts(report), ["", ""], "startup copies produce neither capsules nor raw OSC 52");
+  const receipts = receiveOrigin(report);
+  assert.equal(receipts.length, 1, "only conversation input produces a copy receipt");
+  assert.equal(copiedText(receipts[0]!.event), "conversation-copy");
+  assert.deepEqual(receipts[0]!.origin, viewer("conversation-viewer"));
+  assert.equal(receipts[0]!.event.sessionId, "native-startup-next");
+  assert.equal(receipts[0]!.event.sessionEpoch, 1);
+});
+
 test("default bridge stays legacy: raw keystrokes/strings pass through, no readiness, v1 copies", () => {
   const raw = Buffer.from("abc\x00\x1b[1;2A", "latin1");
   const report = runScenario({

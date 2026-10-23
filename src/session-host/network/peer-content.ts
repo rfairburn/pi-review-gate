@@ -42,7 +42,7 @@ import type { NativeInputSendResult } from "./session-content-client";
 import type {
 	NativeIoCompletedCopy,
 	NativeIoInputKind,
-	NativeIoSource,
+	NativeIoInputSource,
 	SessionContentSnapshot,
 } from "./session-content-protocol";
 
@@ -150,8 +150,12 @@ export interface PeerNativeInputTarget {
 	readonly selectionGeneration: number;
 	/** This endpoint's own subscription id; never chosen by the caller. */
 	readonly subscriptionId: string;
-	/** The exact host-written source of the currently published view. */
-	readonly source: NativeIoSource;
+	/**
+	 * The exact host-written source of the currently published view: a conversation
+	 * source, or the tuple-less startup source before the owner's first tuple. It is
+	 * input-only; copies keep their conversation-only source.
+	 */
+	readonly source: NativeIoInputSource;
 	/** The exact observed input modes of that same published view. */
 	readonly inputModes: TerminalInputModes;
 }

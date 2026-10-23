@@ -104,6 +104,16 @@ export const SESSION_CONTENT_REQUIRED_CAPABILITY = "native-viewport-v1";
  */
 export const SESSION_CONTENT_NATIVE_IO_CAPABILITY = "native-input-copy-v1";
 /**
+ * Optional capability naming startup-phase native INPUT (issue 389): a publish
+ * whose `nativeSession` is null may state a tuple-less startup source, and an
+ * input frame may echo it. It depends on {@link SESSION_CONTENT_NATIVE_IO_CAPABILITY}:
+ * it is offered and acknowledged only together with it, and an acknowledgement
+ * naming it without the native IO capability is a protocol violation. It never
+ * extends copy: copy frames keep their conversation-only source. A peer that
+ * does not negotiate it keeps the exact tuple-less publish with no source.
+ */
+export const SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY = "native-input-startup-v1";
+/**
  * Optional capabilities this lane negotiates without an explicit opt-in. There
  * are none: unlike a purely additive capability, the native IO extension can
  * carry input and clipboard data, so offering or acknowledging it on the
@@ -120,6 +130,7 @@ export const SESSION_CONTENT_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Ob
  */
 export const SESSION_CONTENT_IMPLEMENTABLE_OPTIONAL_CAPABILITIES: readonly string[] = Object.freeze([
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 ]);
 
 /**
@@ -384,8 +395,9 @@ export interface SessionContentBeginFrame {
 	 * capability was negotiated explicitly; null means the owner cannot state
 	 * one. Absent for every legacy publish, so an old view keeps its exact key
 	 * set and shape validation stays separate from any runtime capability gate.
+	 * A startup source is coherent only with a null `nativeSession`.
 	 */
-	readonly inputSource?: NativeIoSource | null;
+	readonly inputSource?: NativeIoInputSource | null;
 	/** Exact decoded payload bytes of the canonical viewport JSON below. */
 	readonly byteLength: number;
 	readonly chunkCount: number;
@@ -432,6 +444,33 @@ export interface NativeIoSource {
 	readonly sourceToken: string;
 }
 
+/**
+ * Exact host-written STARTUP-phase input source (optional
+ * {@link SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY}). It describes one
+ * publish whose `nativeSession` is null while the owner's row is in its explicit
+ * startup phase: the same run, owner row, geometry, viewer revision, and opaque
+ * token facts as {@link NativeIoSource}, an explicit `phase: "startup"`, and NO
+ * `nativeSession` key at all — never a null or fabricated tuple. Input-only: no
+ * copy frame can carry it.
+ */
+export interface NativeIoStartupSource {
+	readonly hostRunId: string;
+	/** Owner row id of the session, never a native conversation id. */
+	readonly sessionId: string;
+	readonly phase: "startup";
+	readonly geometry: SessionContentGeometry;
+	readonly viewerRevision: number;
+	readonly sourceToken: string;
+}
+
+/** Input-path source union. Copy paths keep {@link NativeIoSource} only. */
+export type NativeIoInputSource = NativeIoSource | NativeIoStartupSource;
+
+/** True for the startup variant of an input-path source. */
+export function isNativeIoStartupSource(source: NativeIoInputSource): source is NativeIoStartupSource {
+	return (source as { readonly phase?: unknown }).phase === "startup";
+}
+
 /** Native input payload kinds. Image and file payloads are not expressible. */
 export type NativeIoInputKind = "keyboard" | "paste" | "mouse";
 
@@ -442,7 +481,7 @@ export interface SessionContentInputFrame {
 	readonly inputId: string;
 	/** Positive per-binding dispatch ordinal; never a u32-limited counter. */
 	readonly ordinal: number;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoInputSource;
 	readonly inputModes: TerminalInputModes;
 	readonly kind: NativeIoInputKind;
 	/** Canonical base64 of the UTF-8 payload bytes. */
@@ -455,7 +494,7 @@ export interface SessionContentInputBeginFrame {
 	readonly subscriptionId: string;
 	readonly inputId: string;
 	readonly ordinal: number;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoInputSource;
 	readonly inputModes: TerminalInputModes;
 	/** Only text pastes page; keyboard and mouse packets stay inline. */
 	readonly kind: "paste";
@@ -988,17 +1027,63 @@ function readNativeIoSource(value: unknown, bounds: SessionContentBounds): Nativ
 	});
 }
 
+const NATIVE_IO_STARTUP_SOURCE_KEYS: ReadonlySet<string> = new Set([
+	"hostRunId",
+	"sessionId",
+	"phase",
+	"geometry",
+	"viewerRevision",
+	"sourceToken",
+]);
+
 /**
- * Exact structural equality of two sources. Equal dimensions are never enough:
- * the epoch, the geometry revision, the viewer revision, and the host token must
- * all agree, so an A→B→A viewport change is never treated as the original A.
- * This is a comparison only; it grants and implies no authority.
+ * Validate one exact startup source: closed keys, the one legal phase value, and
+ * no `nativeSession` key at all (a null or fabricated tuple is refused).
  */
-export function nativeIoSourceEquals(left: NativeIoSource, right: NativeIoSource): boolean {
+function readNativeIoStartupSource(value: unknown, bounds: SessionContentBounds): NativeIoStartupSource {
+	if (!isPlainRecord(value)) fail("bad_frame");
+	readExactKeys(value, NATIVE_IO_STARTUP_SOURCE_KEYS, NATIVE_IO_STARTUP_SOURCE_KEYS, "bad_frame");
+	if (ownField(value, "phase") !== "startup") fail("bad_frame");
+	return Object.freeze({
+		hostRunId: readIdentifier(ownField(value, "hostRunId"), bounds.maxIdentifierBytes),
+		sessionId: readIdentifier(ownField(value, "sessionId"), bounds.maxIdentifierBytes),
+		phase: "startup" as const,
+		geometry: readGeometry(ownField(value, "geometry"), bounds),
+		viewerRevision: readInteger(ownField(value, "viewerRevision"), 1, Number.MAX_SAFE_INTEGER),
+		sourceToken: readNativeIoSourceToken(ownField(value, "sourceToken")),
+	});
+}
+
+/**
+ * Validate one input-path source: a startup source when (and only when) the
+ * object names a `phase`, otherwise the unchanged conversation source. Copy paths
+ * never call this, so a startup source is never readable as a copy source.
+ */
+function readNativeIoInputSource(value: unknown, bounds: SessionContentBounds): NativeIoInputSource {
+	if (isPlainRecord(value) && Object.prototype.hasOwnProperty.call(value, "phase")) {
+		return readNativeIoStartupSource(value, bounds);
+	}
+	return readNativeIoSource(value, bounds);
+}
+
+/**
+ * Exact structural, variant-aware equality of two sources. Equal dimensions are
+ * never enough: the epoch, the geometry revision, the viewer revision, and the host
+ * token must all agree, so an A→B→A viewport change is never treated as the
+ * original A, and a startup source never equals a conversation source. This is a
+ * comparison only; it grants and implies no authority.
+ */
+export function nativeIoSourceEquals(left: NativeIoInputSource, right: NativeIoInputSource): boolean {
+	const leftStartup = isNativeIoStartupSource(left);
+	const rightStartup = isNativeIoStartupSource(right);
+	if (leftStartup !== rightStartup) return false;
+	if (!leftStartup && !rightStartup) {
+		const leftTuple = (left as NativeIoSource).nativeSession;
+		const rightTuple = (right as NativeIoSource).nativeSession;
+		if (leftTuple.sessionId !== rightTuple.sessionId || leftTuple.epoch !== rightTuple.epoch) return false;
+	}
 	return left.hostRunId === right.hostRunId
 		&& left.sessionId === right.sessionId
-		&& left.nativeSession.sessionId === right.nativeSession.sessionId
-		&& left.nativeSession.epoch === right.nativeSession.epoch
 		&& left.geometry.cols === right.geometry.cols
 		&& left.geometry.rows === right.geometry.rows
 		&& left.geometry.revision === right.geometry.revision
@@ -1071,12 +1156,25 @@ function readNativeCopyEvent(value: unknown, bounds: SessionContentBounds): Nati
  * This is a coherence check and nothing else: it creates no permission, gate, or
  * lease, and the source token remains non-authoritative.
  */
-function checkInputSourceCoherence(inputSource: NativeIoSource, frame: {
+function checkInputSourceCoherence(inputSource: NativeIoInputSource, frame: {
 	readonly hostRunId: string;
 	readonly sessionId: string;
 	readonly nativeSession: SessionContentNativeSessionRef | null;
 	readonly geometry: SessionContentGeometry;
 }): void {
+	if (isNativeIoStartupSource(inputSource)) {
+		// A startup source describes ONLY a publish that names no native conversation;
+		// a frame with a tuple can never be paired with a startup source.
+		if (frame.nativeSession !== null) fail("bad_frame");
+		if (inputSource.hostRunId !== frame.hostRunId) fail("bad_frame");
+		if (inputSource.sessionId !== frame.sessionId) fail("bad_frame");
+		if (inputSource.geometry.cols !== frame.geometry.cols
+			|| inputSource.geometry.rows !== frame.geometry.rows
+			|| inputSource.geometry.revision !== frame.geometry.revision) {
+			fail("bad_frame");
+		}
+		return;
+	}
 	const nativeSession = frame.nativeSession;
 	// No native session in the frame means there is no tuple a source may claim.
 	if (nativeSession === null) fail("bad_frame");
@@ -1171,7 +1269,7 @@ function validateFrame(frame: SessionContentFrame, bounds: SessionContentBounds)
 				if (frame.inputSource === undefined) fail("invalid_frame");
 				if (frame.inputSource !== null) {
 					checkInputSourceCoherence(
-						readNativeIoSource(frame.inputSource, bounds),
+						readNativeIoInputSource(frame.inputSource, bounds),
 						{ hostRunId, sessionId, nativeSession, geometry },
 					);
 				}
@@ -1195,7 +1293,7 @@ function validateFrame(frame: SessionContentFrame, bounds: SessionContentBounds)
 			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
 			readIdentifier(frame.inputId, bounds.maxIdentifierBytes);
 			readInteger(frame.ordinal, 1, Number.MAX_SAFE_INTEGER);
-			readNativeIoSource(frame.source, bounds);
+			readNativeIoInputSource(frame.source, bounds);
 			readInputModes(frame.inputModes);
 			if (!isNativeIoInputKind(frame.kind)) fail("invalid_frame");
 			readNativeInputData(frame.data, frame.kind, bounds);
@@ -1205,7 +1303,7 @@ function validateFrame(frame: SessionContentFrame, bounds: SessionContentBounds)
 			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
 			readIdentifier(frame.inputId, bounds.maxIdentifierBytes);
 			readInteger(frame.ordinal, 1, Number.MAX_SAFE_INTEGER);
-			readNativeIoSource(frame.source, bounds);
+			readNativeIoInputSource(frame.source, bounds);
 			readInputModes(frame.inputModes);
 			if (frame.kind !== "paste") fail("invalid_frame");
 			const byteLength = readNativePasteByteLength(frame.byteLength, bounds);
@@ -1385,7 +1483,7 @@ function buildFrame(record: Record<string, unknown>, bounds: SessionContentBound
 			const rawInputSource = ownField(record, "inputSource");
 			const inputSource = rawInputSource === undefined
 				? undefined
-				: rawInputSource === null ? null : readNativeIoSource(rawInputSource, bounds);
+				: rawInputSource === null ? null : readNativeIoInputSource(rawInputSource, bounds);
 			if (inputSource !== undefined && inputSource !== null) {
 				// Mixed A-frame / B-source metadata is refused, not merged.
 				checkInputSourceCoherence(inputSource, { hostRunId, sessionId, nativeSession, geometry });
@@ -1435,7 +1533,7 @@ function buildFrame(record: Record<string, unknown>, bounds: SessionContentBound
 				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
 				inputId: readIdentifier(ownField(record, "inputId"), bounds.maxIdentifierBytes),
 				ordinal: readInteger(ownField(record, "ordinal"), 1, Number.MAX_SAFE_INTEGER),
-				source: readNativeIoSource(ownField(record, "source"), bounds),
+				source: readNativeIoInputSource(ownField(record, "source"), bounds),
 				inputModes: readInputModes(ownField(record, "inputModes")),
 				kind,
 				data: payload.toString("base64"),
@@ -1451,7 +1549,7 @@ function buildFrame(record: Record<string, unknown>, bounds: SessionContentBound
 				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
 				inputId: readIdentifier(ownField(record, "inputId"), bounds.maxIdentifierBytes),
 				ordinal: readInteger(ownField(record, "ordinal"), 1, Number.MAX_SAFE_INTEGER),
-				source: readNativeIoSource(ownField(record, "source"), bounds),
+				source: readNativeIoInputSource(ownField(record, "source"), bounds),
 				inputModes: readInputModes(ownField(record, "inputModes")),
 				kind: "paste",
 				byteLength,
@@ -1603,6 +1701,12 @@ function enabledOptionalCapabilities(options: unknown): readonly string[] {
 		if (enabled.includes(entry)) fail("invalid_bounds");
 		enabled.push(entry);
 	}
+	// Startup input depends on the native IO capability: enabling it alone is a
+	// malformed opt-in, refused rather than silently narrowed.
+	if (enabled.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)
+		&& !enabled.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)) {
+		fail("invalid_bounds");
+	}
 	return Object.freeze(enabled);
 }
 
@@ -1626,8 +1730,13 @@ export function negotiateSessionContentHello(
 	if (!hello.capabilities.includes(SESSION_CONTENT_REQUIRED_CAPABILITY)) {
 		return { ok: false, code: "missing_capability" };
 	}
-	const negotiated = hello.capabilities.filter((capability) =>
+	const offeredAndEnabled = hello.capabilities.filter((capability) =>
 		capability !== SESSION_CONTENT_REQUIRED_CAPABILITY && enabled.includes(capability));
+	// Startup input is acknowledged ONLY together with native IO: a peer that offers
+	// startup without native IO simply does not get it (never a partial extension).
+	const negotiated = offeredAndEnabled.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)
+		? offeredAndEnabled
+		: offeredAndEnabled.filter((capability) => capability !== SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY);
 	return Object.freeze({
 		ok: true,
 		major: SESSION_CONTENT_MAJOR,
@@ -1667,6 +1776,12 @@ export function reviewSessionContentHelloAck(
 			return { ok: false, code: "protocol_violation" };
 		}
 		if (!offered.capabilities.includes(capability)) return { ok: false, code: "protocol_violation" };
+	}
+	// An acknowledgement of startup input without the native IO capability it
+	// depends on describes an extension that cannot exist: a protocol violation.
+	if (ack.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)
+		&& !ack.capabilities.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)) {
+		return { ok: false, code: "protocol_violation" };
 	}
 	return Object.freeze({ ok: true, minor: ack.minor, capabilities: Object.freeze([...ack.capabilities]) });
 }
@@ -2241,7 +2356,7 @@ export interface SessionContentTransferMeta {
 	 * host-written source this publish belongs to, or null when unavailable. Never
 	 * set by default, so a legacy snapshot keeps its exact shape.
 	 */
-	readonly inputSource?: NativeIoSource | null;
+	readonly inputSource?: NativeIoInputSource | null;
 	readonly byteLength: number;
 	readonly chunkCount: number;
 }
@@ -2283,9 +2398,10 @@ export function buildSessionContentTransfer(options: {
 	 * Explicit native IO source for this publish. Pass it only when the optional
 	 * native IO capability was negotiated; omit it entirely (the default) so a
 	 * legacy `content_begin` keeps its exact key set. `null` states that the owner
-	 * has no source to report.
+	 * has no source to report. A startup source is coherent only with a null
+	 * `nativeSession`.
 	 */
-	readonly inputSource?: NativeIoSource | null;
+	readonly inputSource?: NativeIoInputSource | null;
 	readonly bounds?: SessionContentBounds;
 }): SessionContentBuiltTransfer {
 	const bounds = options.bounds ?? DEFAULT_SESSION_CONTENT_BOUNDS;
@@ -2302,7 +2418,7 @@ export function buildSessionContentTransfer(options: {
 	const nativeSession = readNativeSession(options.nativeSession, bounds);
 	const inputSource = options.inputSource === undefined
 		? undefined
-		: options.inputSource === null ? null : readNativeIoSource(options.inputSource, bounds);
+		: options.inputSource === null ? null : readNativeIoInputSource(options.inputSource, bounds);
 	const begin: SessionContentBeginFrame = Object.freeze({
 		type: "content_begin",
 		subscriptionId: options.subscriptionId,
@@ -2426,7 +2542,7 @@ export function createSessionContentTransferAssembler(
 				const rawInputSource = frame.inputSource;
 				const inputSource = rawInputSource === undefined
 					? undefined
-					: rawInputSource === null ? null : readNativeIoSource(rawInputSource, bounds);
+					: rawInputSource === null ? null : readNativeIoInputSource(rawInputSource, bounds);
 				if (inputSource !== undefined && inputSource !== null) {
 					// The source must describe this same begin, not a neighbouring snapshot.
 					checkInputSourceCoherence(inputSource, {
@@ -2530,7 +2646,7 @@ export interface NativeIoCompletedInput {
 	readonly subscriptionId: string;
 	readonly inputId: string;
 	readonly ordinal: number;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoInputSource;
 	readonly inputModes: TerminalInputModes;
 	readonly kind: NativeIoInputKind;
 	/**
@@ -2657,7 +2773,7 @@ export function buildNativeInputInline(options: {
 	readonly subscriptionId: string;
 	readonly inputId: string;
 	readonly ordinal: number;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoInputSource;
 	readonly inputModes: TerminalInputModes;
 	readonly kind: NativeIoInputKind;
 	readonly data: string | Uint8Array;
@@ -2699,7 +2815,7 @@ export function buildNativeInputPaste(options: {
 	readonly subscriptionId: string;
 	readonly inputId: string;
 	readonly ordinal: number;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoInputSource;
 	readonly inputModes: TerminalInputModes;
 	readonly text: string | Uint8Array;
 	readonly bounds?: SessionContentBounds;
@@ -2869,7 +2985,7 @@ interface PartialNativeInput {
 	readonly subscriptionId: string;
 	readonly inputId: string;
 	readonly ordinal: number;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoInputSource;
 	readonly inputModes: TerminalInputModes;
 	readonly byteLength: number;
 	readonly chunkCount: number;
@@ -2906,7 +3022,7 @@ export function createNativeInputAssembler(
 		subscriptionId: string,
 		inputId: string,
 		ordinal: number,
-		source: NativeIoSource,
+		source: NativeIoInputSource,
 		inputModes: TerminalInputModes,
 		kind: NativeIoInputKind,
 		data: Buffer,
@@ -2936,7 +3052,7 @@ export function createNativeInputAssembler(
 				const subscriptionId = readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
 				const inputId = readIdentifier(frame.inputId, bounds.maxIdentifierBytes);
 				const ordinal = readInteger(frame.ordinal, 1, Number.MAX_SAFE_INTEGER);
-				const source = readNativeIoSource(frame.source, bounds);
+				const source = readNativeIoInputSource(frame.source, bounds);
 				const inputModes = readInputModes(frame.inputModes);
 				const kind = frame.kind;
 				if (!isNativeIoInputKind(kind)) refuse();
@@ -2954,7 +3070,7 @@ export function createNativeInputAssembler(
 				const subscriptionId = readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
 				const inputId = readIdentifier(frame.inputId, bounds.maxIdentifierBytes);
 				const ordinal = readInteger(frame.ordinal, 1, Number.MAX_SAFE_INTEGER);
-				const source = readNativeIoSource(frame.source, bounds);
+				const source = readNativeIoInputSource(frame.source, bounds);
 				const inputModes = readInputModes(frame.inputModes);
 				if (frame.kind !== "paste") fail("bad_frame");
 				const byteLength = readNativePasteByteLength(frame.byteLength, bounds);

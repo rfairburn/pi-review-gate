@@ -29,6 +29,7 @@ import {
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
 	SessionContentProtocolError,
@@ -1433,7 +1434,10 @@ function decodedFrames(
 
 test("the native IO capability is implementable but never offered or acknowledged by default", () => {
 	assert.deepEqual([...SESSION_CONTENT_KNOWN_OPTIONAL_CAPABILITIES], [], "no optional capability is negotiable on its own");
-	assert.deepEqual([...SESSION_CONTENT_IMPLEMENTABLE_OPTIONAL_CAPABILITIES], [SESSION_CONTENT_NATIVE_IO_CAPABILITY]);
+	assert.deepEqual([...SESSION_CONTENT_IMPLEMENTABLE_OPTIONAL_CAPABILITIES], [
+		SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+		SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+	]);
 	const hello: SessionContentHelloFrame = {
 		type: "hello",
 		service: SESSION_CONTENT_SERVICE,

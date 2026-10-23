@@ -81,11 +81,11 @@ const EVIDENCE_ROWS: ReadonlyArray<[keyof EvidenceValues, string]> = [
   ["snapshotFailureFallback", "Snapshot-failure fallback"],
 ];
 
-const OFF: EvidenceValues = {
+const DEFAULTS: EvidenceValues = {
   primaryToolOnly: false,
   worktreeToolOnly: false,
   inplaceToolOnly: false,
-  snapshotFailureFallback: false,
+  snapshotFailureFallback: true,
 };
 
 async function canonicalFixtureTempRoot(checkoutRoot: string, temporaryRoot: string): Promise<string | undefined> {
@@ -533,9 +533,9 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
   await session.waitForText("operating mode:", 30_000);
 
   // Initial config omits review.evidence. The real selector must show each
-  // scope's default Tools + workspace changes and the separate fallback Off.
+  // scope's default Tools + workspace changes and the separate fallback On.
   let evidenceFrame = await openEvidenceMenu(session);
-  assertEvidenceRows(evidenceFrame, OFF, "fresh config defaults");
+  assertEvidenceRows(evidenceFrame, DEFAULTS, "fresh config defaults");
   assert.equal(await readDiskEvidence(configPath), undefined, "opening the real menu must not materialize defaults on disk");
 
   // A non-Primary scope is staged and applied alone. Its real screen and its
@@ -555,7 +555,7 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
   // Reopening must reflect the applied session-only choice. Applying the
   // unchanged draft again is an observable no-warning/no-disk-write control.
   evidenceFrame = await openEvidenceMenu(session);
-  assertEvidenceRows(evidenceFrame, { ...OFF, inplaceToolOnly: true }, "reopened after session-only apply");
+  assertEvidenceRows(evidenceFrame, { ...DEFAULTS, inplaceToolOnly: true }, "reopened after session-only apply");
   await backToRoot(session);
   frame = await applySessionOnly(session);
   assert.ok(!frame.includes(LIVE_WARNING),
@@ -567,7 +567,7 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
   // No evidence has accumulated in this no-model smoke, so the underlying
   // evidence-window reset effect itself is intentionally not claimed here.
   evidenceFrame = await openEvidenceMenu(session);
-  assertEvidenceRows(evidenceFrame, { ...OFF, inplaceToolOnly: true }, "before Primary transition");
+  assertEvidenceRows(evidenceFrame, { ...DEFAULTS, inplaceToolOnly: true }, "before Primary transition");
   await selectVisibleRow(session, "Primary / top-level", 24, evidenceFrame);
   frame = await session.sendAndWait(KEY_ENTER, LIVE_WARNING, 10_000);
   const warningText = frame.replace(/\s+/g, " "); // native notification text may wrap at the real terminal width
@@ -582,7 +582,7 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
   // The actual reopened screen is the source of truth for live in-memory state;
   // the raw config remains the source of truth for durable state.
   evidenceFrame = await openEvidenceMenu(session);
-  const sessionOnly = { ...OFF, primaryToolOnly: true, inplaceToolOnly: true };
+  const sessionOnly = { ...DEFAULTS, primaryToolOnly: true, inplaceToolOnly: true };
   assertEvidenceRows(evidenceFrame, sessionOnly, "reopened Primary session-only state");
 
   // Stage a Primary Tools only → Tools + workspace changes change plus Worktree/Fallback edits,
@@ -598,7 +598,7 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
   assert.match(frame, /Isolated worktree\s+Tools only/, "the Cancel draft must visibly include an independent Worktree edit");
   await selectVisibleRow(session, "Snapshot-failure fallback");
   frame = await session.sendAndWait(KEY_ENTER, "Snapshot-failure fallback");
-  assert.match(frame, /Snapshot-failure fallback\s+On/, "the Cancel draft must visibly include an independent fallback edit");
+  assert.match(frame, /Snapshot-failure fallback\s+Off/, "the Cancel draft must visibly include an independent fallback edit");
   await backToRoot(session);
   await selectVisibleRow(session, "Cancel");
   await session.press(KEY_ENTER, 180);
@@ -612,11 +612,11 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
   // previously applied session-only Primary/InPlace values.
   await selectVisibleRow(session, "Snapshot-failure fallback");
   frame = await session.sendAndWait(KEY_ENTER, "Snapshot-failure fallback");
-  assert.match(frame, /Snapshot-failure fallback\s+On/, "the explicit-Save draft must visibly enable fallback");
+  assert.match(frame, /Snapshot-failure fallback\s+Off/, "the explicit-Save draft must visibly disable fallback");
   await backToRoot(session);
   await selectVisibleRow(session, "Save changes");
   await session.sendAndWait(KEY_ENTER, "Review settings saved.");
-  const afterExplicitSave = { ...sessionOnly, snapshotFailureFallback: true };
+  const afterExplicitSave = { ...sessionOnly, snapshotFailureFallback: false };
   assertDiskEvidence(await readDiskEvidence(configPath), afterExplicitSave, "explicit Save");
   const savedDocument = JSON.parse(await readFile(configPath, "utf8")) as Record<string, unknown>;
   assert.deepEqual(savedDocument.smokeOnlyUnknownField, { preserve: true }, "Save must preserve unrelated config keys");
@@ -629,16 +629,16 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
   frame = await session.sendAndWait(KEY_ENTER, "Isolated worktree");
   assert.match(frame, /Isolated worktree\s+Tools only/, "the nested Ctrl+S draft must visibly select Tools only for Worktree");
   await session.sendAndWait(KEY_CTRL_S, "Review settings saved.");
-  const allOn: EvidenceValues = {
+  const afterNestedSave: EvidenceValues = {
     primaryToolOnly: true,
     worktreeToolOnly: true,
     inplaceToolOnly: true,
-    snapshotFailureFallback: true,
+    snapshotFailureFallback: false,
   };
-  assertDiskEvidence(await readDiskEvidence(configPath), allOn, "nested Ctrl+S");
+  assertDiskEvidence(await readDiskEvidence(configPath), afterNestedSave, "nested Ctrl+S");
   assert.deepEqual(
     (JSON.parse(await readFile(configPath, "utf8")) as { review?: { evidence?: unknown } }).review?.evidence,
-    allOn,
+    afterNestedSave,
     "the real disk config must independently store all four persisted evidence flags",
   );
 

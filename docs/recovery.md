@@ -110,9 +110,12 @@ silently adopts them.
 
 ## Review evidence failure and fallback
 
-The optional `review.evidence.snapshotFailureFallback` setting defaults **Off**. A
-snapshot capture failure remains blocking unless fallback is explicitly enabled and
-the failed operation qualifies as review-evidence capture only. When eligible, fallback
+The optional `review.evidence.snapshotFailureFallback` setting defaults **On**; an
+explicit `false` stays Off. A snapshot capture failure remains blocking unless the failed
+operation qualifies as review-evidence capture only. With fallback explicitly Off, an
+eligible Primary review-baseline failure warns that review is disabled for that turn
+and the work continues unreviewed, with no Tools only substitute or reviewed result;
+other failures with Off still block. When eligible and On, fallback
 uses retained current tool evidence with a durable, truthful tool-only basis and a
 prominent warning identifying the originating review context (for Primary, a local
 user-only warning that never becomes model input or starts a model turn; for workers,

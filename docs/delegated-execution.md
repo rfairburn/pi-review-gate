@@ -179,7 +179,7 @@ The **Isolated worktree** and **InPlace** rows under `/review-settings` → **Re
 **Tools only**. They select review evidence
 independently of the worker kind, reviewer set, and automatic-review toggles. They
 are stored as `review.evidence.worktreeToolOnly` and `inplaceToolOnly`; the independent
-`snapshotFailureFallback` opt-in also defaults Off. See
+`snapshotFailureFallback` setting defaults On. See
 [Configuration](configuration.md#review-evidence-methods).
 
 Workers capture applicable evidence and fallback policy at firing/queue admission.

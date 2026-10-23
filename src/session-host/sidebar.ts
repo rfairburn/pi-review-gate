@@ -109,6 +109,21 @@
  * resolved or otherwise used), and a stale observation is marked as stale
  * rather than refreshed, reconnected, or guessed.
  *
+ * The Saved picker can also browse ONE selected owner host's Saved history.
+ * It always opens on Local with a blank query; its Host line appears only while
+ * an attached snapshot describes a connected Saved-capable destination, and an
+ * ACTUAL Host change clears the query and every result. A remote choice shows
+ * the owner's exact rows (id, saved file path, caption, workspace) through the
+ * same row/details/confirmation formatter as a local row, reached through
+ * bounded windows (at most three retained) over the owner's FULL result with
+ * absolute wrap navigation; uncached indexes are non-actionable loading
+ * placeholders. Remote rows and actions are a closed, separate family of
+ * intents (`saved-remote-*`) naming only opaque owner catalog/result/entry
+ * handles and the exact owner run; Resume and Delete-prepare require the
+ * actual-written picker frame (`settleSavedPickerRender`) and Delete the
+ * written confirmation. Delete hints and acceptance follow the OWNER's live
+ * delete exposure only. This module still performs no IO: Main transports.
+ *
  * `renderPeerAlert` is the one extra notification surface, for a host-owned
  * alert band that the compositor places when the normal sidebar cannot show a
  * pending request (hidden pane, or narrow layout while Main has focus). It is
@@ -160,13 +175,16 @@ import {
 } from "./terminal-diagnostics";
 import type {
   PeerConsentPresentation,
+  PeerSavedUiAction,
   PeerUiAction,
   PeerUiConsent,
   PeerUiHost,
+  PeerUiHostSaved,
   PeerUiSettings,
   PeerUiSnapshot,
   PeerUiTrustedPeer,
 } from "./peer-ui-protocol";
+import { isOwnerSavedWindowFacts, type OwnerSavedWindowFacts } from "./network/peer-saved";
 
 /** One roster row: a top-level snapshot of one host-owned instance. */
 export interface SidebarItem {
@@ -410,7 +428,90 @@ export type SidebarAction =
    * `renderToken`; Main independently rechecks them, and this module never
    * performs the network or trust work itself.
    */
-  | PeerUiAction;
+  | PeerUiAction
+  /**
+   * Remote Saved picker intents for the selected owner host. They are a closed,
+   * separate family: no remote row or action ever becomes a local `saved-open`,
+   * `saved-delete*`, `saved-search`, or `saved-list`, even when its id, file, or
+   * caption equals a local one.
+   */
+  | PeerSavedUiAction;
+
+/**
+ * The Saved picker's current Host choice, as drawn. Local is the default at
+ * every opening. A remote choice carries the exact observed owner run (or null),
+ * whether the destination is still connected, and the OWNER's descriptive Saved
+ * support and live delete exposure. Display facts only; nothing here is authority.
+ */
+export type SidebarSavedPickerHost =
+  | { readonly kind: "local" }
+  | {
+      readonly kind: "remote";
+      readonly hostId: string;
+      readonly label: string;
+      readonly hostRunId: string | null;
+      readonly connected: boolean;
+      readonly supported: boolean;
+      readonly deleteExposed: boolean | null;
+    };
+
+/**
+ * Read-only description of the remote Saved picker for Main: the exact picker,
+ * query revision and text, selected destination/run, the bound owner
+ * catalog/result (when one completed), the FULL result total, the absolute
+ * selection, the bounded retained windows, and the newest outstanding read
+ * request ids. It is a view, never authority.
+ */
+export interface SidebarRemoteSavedContext {
+  readonly pickerId: number;
+  readonly revision: number;
+  readonly query: string;
+  readonly hostId: string;
+  readonly hostRunId: string | null;
+  readonly catalogId: string | undefined;
+  readonly resultId: string | undefined;
+  readonly total: number | undefined;
+  readonly issueCount: number;
+  readonly selectedIndex: number;
+  readonly windows: readonly { readonly offset: number; readonly length: number }[];
+  readonly pendingReads: readonly number[];
+}
+
+/**
+ * The one remote Saved picker frame the last complete render drew: the exact
+ * picker/revision/host/run/catalog/result, the absolute selection, the pane
+ * geometry, and every completely drawn row's absolute index and opaque owner
+ * entry id (loading placeholders are never drawn rows). Main captures it beside
+ * the composed frame and settles it through `settleSavedPickerRender` ONLY when
+ * its writer reports that exact frame written; until then no Resume or
+ * Delete-prepare can be emitted from it.
+ */
+export interface SidebarSavedPickerPresentation {
+  readonly renderToken: number;
+  /**
+   * Monotonic Saved view epoch this frame was drawn under. Every actual
+   * selection change, new query/result, Host or run change, and eviction of the
+   * selected row advances it, so a frame (or an operation frozen from it) can
+   * never regain authority by returning to identical values.
+   */
+  readonly viewEpoch: number;
+  readonly pickerId: number;
+  readonly revision: number;
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly catalogId: string;
+  readonly resultId: string;
+  readonly total: number;
+  readonly selectedIndex: number;
+  readonly selectedEntryId: string | undefined;
+  readonly deleteExposed: boolean;
+  readonly cols: number;
+  readonly rows: number;
+  readonly drawn: readonly { readonly paneRow: number; readonly index: number; readonly entryId: string }[];
+}
+
+/** The completed owner window facts the sidebar accepts (the wire's `window` fact set). */
+export type SidebarRemoteSavedWindowFacts = Extract<OwnerSavedWindowFacts, { readonly kind: "window" }>;
 
 export interface SidebarControllerOptions {
   /** Canonical native KeyId or a bounded known alternative (e.g. "f8"). */
@@ -723,12 +824,119 @@ interface DisplayedSavedRow {
   readonly paneRow: number;
   readonly index: number;
   readonly entry: SidebarSavedRow;
+  /**
+   * Present ONLY for a row of the selected REMOTE owner: the opaque owner handles
+   * that are its sole operation identity. A local row never carries it, and a
+   * remote row is never matched to anything by its display id, file, or caption.
+   */
+  readonly remote?: RemoteSavedRowIdentity;
 }
 
 interface DisplayedSavedRows {
   readonly cols: number;
   readonly rows: number;
   readonly entries: readonly DisplayedSavedRow[];
+  /** Remote picker frame token of the render that drew these rows (remote only). */
+  readonly renderToken?: number;
+}
+
+/** Opaque owner identity of one remote Saved row. Never a path or a local id. */
+interface RemoteSavedRowIdentity {
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly catalogId: string;
+  readonly resultId: string;
+  readonly entryId: string;
+}
+
+/** One cached owner row: its opaque entry handle plus the exact display row. */
+interface RemoteSavedRow {
+  readonly entryId: string;
+  readonly row: SidebarSavedRow;
+}
+
+/** One bounded contiguous window of ONE owner result, at its absolute offset. */
+interface RemoteSavedWindow {
+  readonly offset: number;
+  readonly rows: readonly RemoteSavedRow[];
+}
+
+/** One read intent this picker emitted and still awaits. */
+interface RemoteSavedReadIntent {
+  readonly requestId: number;
+  readonly kind: "list" | "search" | "window";
+  readonly revision: number;
+  readonly hostRunId: string;
+  readonly catalogId: string | undefined;
+  readonly resultId: string | undefined;
+  readonly offset: number;
+  readonly count: number;
+}
+
+/**
+ * The selected remote host's picker state. Only the CURRENT owner result is
+ * kept, as at most `REMOTE_SAVED_MAX_WINDOWS` bounded windows: nothing
+ * accumulates a whole catalog, a history, or another host's rows.
+ */
+interface RemoteSavedState {
+  readonly hostId: string;
+  /** Owner run the bound catalog (and any outstanding result read) belongs to. */
+  catalog: { readonly hostRunId: string; readonly catalogId: string } | undefined;
+  result: {
+    readonly resultId: string;
+    readonly total: number;
+    readonly issueCount: number;
+  } | undefined;
+  windows: RemoteSavedWindow[];
+  /** Outstanding list/search that defines the next result (newest only). */
+  resultRead: RemoteSavedReadIntent | undefined;
+  /** Outstanding window reads of the current result (bounded, newest last). */
+  windowReads: RemoteSavedReadIntent[];
+}
+
+/**
+ * One frozen remote entry operation (Resume, Delete-prepare, or the Delete it
+ * confirms): the exact picker, query revision, destination, run, owner
+ * catalog/result/entry handles, the absolute index it was drawn at, the drawn
+ * frame token, and the display row the operator saw (text only, never identity).
+ */
+interface RemoteSavedOperation {
+  readonly pickerId: number;
+  readonly requestId: number;
+  readonly revision: number;
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly catalogId: string;
+  readonly resultId: string;
+  readonly entryId: string;
+  /** Absolute result index of the acted-on entry (a press may name a non-selected drawn row). */
+  readonly index: number;
+  /** The selection when the operation was frozen; a press never moves it. */
+  readonly selectedIndex: number;
+  /** Saved view epoch the operation was frozen under; any advance retires it for good. */
+  readonly viewEpoch: number;
+  readonly renderToken: number;
+  readonly row: SidebarSavedRow;
+  readonly hostLabel: string;
+}
+
+/** The current remote picker frame candidate (writer receipt pending until settled). */
+interface SavedPickerCandidate {
+  readonly token: number;
+  readonly identity: string;
+  readonly presentation: SidebarSavedPickerPresentation;
+  written: boolean;
+}
+
+/** One Host choice the Saved picker's Host line can name. */
+interface SavedHostOption {
+  readonly kind: "local" | "remote";
+  readonly hostId: string;
+  readonly label: string;
+  readonly hostRunId: string | null;
+  readonly connected: boolean;
+  readonly supported: boolean;
+  readonly deleteExposed: boolean | null;
 }
 
 interface SavedDeleteContext {
@@ -816,12 +1024,15 @@ export interface SidebarCreateFormPresentation {
  * frame the operator saw.
  */
 interface DisplayedFormHostRow {
+  /** Which form-slot pane drew this Host line: the New form or the Saved picker. */
+  readonly pane: "new" | "saved";
   readonly cols: number;
   readonly rows: number;
   readonly row: number;
   readonly valueStart: number;
   readonly valueEnd: number;
   readonly optionKey: string;
+  /** New-form generation, or the Saved picker id that drew the line. */
   readonly formGeneration: number;
 }
 
@@ -1027,8 +1238,15 @@ function mouseAuthorizationKey(
   return JSON.stringify({
     roster: roster === undefined ? null : [roster.cols, roster.rows,
       [...roster.regions.values()].map((region) => [region.row, region.height, sidebarActivationIdentity(region.entry)])],
+    // Local rows keep their exact identity; a remote row adds its opaque owner
+    // handles and the drawn picker frame token, so equal display text on two
+    // hosts (or on a local and a remote row) can never share authorization.
     saved: saved === undefined ? null : [saved.cols, saved.rows,
-      saved.entries.map(({ paneRow, entry }) => [paneRow, entry.id, entry.file])],
+      saved.entries.map(({ paneRow, entry, remote }) => remote === undefined
+        ? [paneRow, entry.id, entry.file]
+        : [paneRow, entry.id, entry.file, remote.hostId, remote.hostRunId,
+          remote.catalogId, remote.resultId, remote.entryId]),
+      ...(saved.renderToken === undefined ? [] : ["remote", saved.renderToken])],
     // Network-panel targets and the consent dialog's decision geometry are part
     // of the authorization identity: a presentation captured from a frame with
     // different peer/consent targets can never authorize the current one.
@@ -1043,7 +1261,7 @@ function mouseAuthorizationKey(
     // the authorization identity, so a moved or re-labeled control needs its
     // own written boundary.
     formHost: formHost === undefined ? null : [
-      formHost.cols, formHost.rows, formHost.row, formHost.valueStart, formHost.valueEnd,
+      formHost.pane, formHost.cols, formHost.rows, formHost.row, formHost.valueStart, formHost.valueEnd,
       formHost.optionKey, formHost.formGeneration,
     ],
   });
@@ -1113,6 +1331,30 @@ function sanitizeSavedRows(rows: readonly SidebarSavedRow[]): SidebarSavedRow[] 
   return accepted;
 }
 
+/**
+ * The common picker row for one REMOTE owner entry, built by the same copy rule
+ * `sanitizeSavedRows` applies to a local row: the owner's session id becomes the
+ * row id and its saved file path is kept exactly (it is display identity only,
+ * never resolved, opened, or used as authority here), while the caption and
+ * recorded workspace take the same bounded presentation copy. An empty `cwd` is
+ * "unavailable", exactly like a local row without a recorded workspace. Unlike a
+ * local catalog copy, no entry is ever dropped: a remote window is positional, so
+ * every index of the owner result stays aligned.
+ */
+function remoteSavedDisplayRow(entry: {
+  readonly sessionId: string;
+  readonly file: string;
+  readonly caption: string;
+  readonly cwd: string;
+}): SidebarSavedRow {
+  return {
+    id: entry.sessionId,
+    file: entry.file,
+    caption: sanitizeBounded(entry.caption, SAVED_CAPTION_MAX_CODEPOINTS),
+    ...(entry.cwd.length > 0 ? { cwd: sanitizeBounded(entry.cwd, SAVED_WORKSPACE_MAX_CODEPOINTS) } : {}),
+  };
+}
+
 // The pinned matcher knows legacy F1-F12 packets but not parameterized CSI
 // forms. These tables cover only standard function-key codes with no key
 // modifier (Caps/Num Lock bits are ignored, matching public matcher behavior).
@@ -1165,6 +1407,27 @@ export const CREATE_ON_PEER_OTHER_RUN_NOTICE =
   "The remote host reported a different owner run; nothing was selected";
 export const CREATE_ON_PEER_UNCERTAIN_NOTICE =
   "UNCERTAIN: the remote create may have been handed off; outcome unknown";
+/**
+ * Fixed, bounded notices for the selected-host Saved picker. Each states only
+ * what this side knows locally; none claims an owner outcome, a retry, a
+ * reconnect, a cancellation, or a path, and no raw error text is shown.
+ */
+export const REMOTE_SAVED_UNWRITTEN_NOTICE =
+  "That Saved list is not the displayed list; nothing was sent";
+export const REMOTE_SAVED_HOST_CHANGED_NOTICE =
+  "That host disconnected or its owner run changed; its Saved list was cleared and nothing was requested";
+export const REMOTE_SAVED_UNSUPPORTED_NOTICE =
+  "That host does not offer Saved history; nothing was requested";
+export const REMOTE_SAVED_NO_RUN_NOTICE =
+  "That host's owner run was not observed; nothing was requested";
+export const REMOTE_SAVED_DISCONNECTED_NOTICE =
+  "That host is disconnected; nothing was requested";
+export const REMOTE_SAVED_DELETE_OFF_NOTICE =
+  "That host does not allow remote history deletion; nothing was deleted";
+export const REMOTE_SAVED_OTHER_RUN_NOTICE =
+  "The remote host reported a different owner run; nothing was selected";
+export const REMOTE_SAVED_UNCERTAIN_NOTICE =
+  "UNCERTAIN: the remote request may have been handed off; outcome unknown";
 /** The one Host line of the New form names Local until the operator changes it. */
 const NEW_FORM_LOCAL_HOST_LABEL = "Local";
 const NEW_FORM_HOST_PREFIX = "Host: ";
@@ -1182,6 +1445,17 @@ const MAX_SAVED_QUERY_DISPLAY_CODEPOINTS = 4096;
 const SAVED_WORKSPACE_MAX_CODEPOINTS = 4096;
 /** Fixed reserved details-area height between the saved list and the footer. */
 const SAVED_DETAILS_ROWS = 3;
+/**
+ * Remote Saved window sizing reuses the EXISTING metadata-lane bounds instead of
+ * inventing a business limit: a request asks for at least one lane page
+ * (`maxRowsPerPage`, 32) and at most one transfer's row bound
+ * (`maxSnapshotRows`, 4096), otherwise the drawn list height. The owner may
+ * still return a shorter honest prefix when its byte budget is reached.
+ */
+const REMOTE_SAVED_PAGE_ROWS = 32;
+const REMOTE_SAVED_MAX_WINDOW_ROWS = 4096;
+/** At most the current window and its neighbours are retained (no catalog accumulation). */
+const REMOTE_SAVED_MAX_WINDOWS = 3;
 const ITEM_LABEL_INPUT_MAX_CODEPOINTS = 400;
 const ERROR_TEXT_MAX_CODEPOINTS = 300;
 const ROSTER_MIN_COLS = 12;
@@ -1888,6 +2162,16 @@ function copyPeerHost(value: unknown): SidebarPeerHost | null {
   const rosterState = displayText(rosterValue?.state);
   const rowsValue = rosterValue?.rows;
   const rosterRun = displayOptionalText(rosterValue?.hostRunId);
+  // Optional Saved description: kept only when both facts are well formed. A
+  // missing or malformed value is "not supported", never a guessed capability.
+  const savedValue = displayObject(source.saved);
+  const savedSupported = displayBoolean(savedValue?.supported);
+  const savedDeleteExposed = savedValue?.deleteExposed === null
+    ? null
+    : displayBoolean(savedValue?.deleteExposed);
+  const saved: PeerUiHostSaved | undefined = savedSupported !== undefined && savedDeleteExposed !== undefined
+    ? { supported: savedSupported, deleteExposed: savedDeleteExposed }
+    : undefined;
   if (id === undefined || id.length === 0 || label === undefined || host === undefined
     || port === undefined || state === undefined
     || fingerprint === undefined || message === undefined
@@ -1922,6 +2206,7 @@ function copyPeerHost(value: unknown): SidebarPeerHost | null {
       // Preserved only when the coordinator actually reports a nonempty run id.
       ...(typeof rosterRun === "string" && rosterRun.length > 0 ? { hostRunId: rosterRun } : {}),
     },
+    ...(saved === undefined ? {} : { saved }),
   };
 }
 
@@ -2157,6 +2442,44 @@ export class SidebarController {
    * on fallback, dismissal, and catalog replacement.
    */
   private displayedSavedRows: DisplayedSavedRows | undefined;
+  /**
+   * The Saved picker's one Host choice. Local at every opening; an ACTUAL change
+   * re-mints the picker identity and clears the query and every result. `label`
+   * is a bounded display copy kept for a destination a later observation stopped
+   * listing; identity is the saved `hostId` plus the DTO's exact owner run.
+   */
+  private savedHost:
+    | { readonly kind: "local" }
+    | { readonly kind: "remote"; readonly hostId: string; readonly label: string } = { kind: "local" };
+  /** True only while the Saved picker's Host line owns the picker's keyboard focus. */
+  private savedHostFocused = false;
+  /** Present exactly while the Saved Host choice is remote (closed discriminator). */
+  private remoteSaved: RemoteSavedState | undefined;
+  /** Remote picker frame drawn by the last complete render (writer receipt pending). */
+  private savedPickerCandidate: SavedPickerCandidate | undefined;
+  private savedPickerTokenSequence = 1;
+  /**
+   * Monotonic Saved view epoch. It only ever increases, so authority retired by
+   * a selection, query, result, Host, run, or eviction change can never be
+   * revived by values that later compare equal again.
+   */
+  private savedViewEpoch = 0;
+  /** Last drawn Saved list height; sizes remote windows within the existing bounds. */
+  private savedLastListRows = REMOTE_SAVED_PAGE_ROWS;
+  /** Bounded notice for a failed or invalidated remote read (cleared on success). */
+  private remoteSavedNotice: string | undefined;
+  /** Deliberate remote Resume in flight; late results are fenced by the exact request. */
+  private pendingRemoteSavedResume: RemoteSavedOperation | undefined;
+  /** Remote Delete prepare awaiting the owner's answer (never a confirmation). */
+  private pendingRemoteSavedDeleteCheck: RemoteSavedOperation | undefined;
+  /** Frozen remote Delete target while its confirmation is open. */
+  private remoteSavedDeleteTarget: RemoteSavedOperation | undefined;
+  /** The confirmed remote Delete that was emitted and still awaits its outcome. */
+  private remoteSavedDeleteOperation: RemoteSavedOperation | undefined;
+  /** Newest live owner delete exposure Main reported for the selected host/run. */
+  private remoteSavedPolicyOverlay:
+    | { readonly hostId: string; readonly hostRunId: string; readonly deleteExposed: boolean | null }
+    | undefined;
   private editTarget?: { readonly id: string; readonly nativeSession: SessionHostNativeSession; readonly currentName: string };
   private workspaceDraft: string;
   private editDraft = "";
@@ -2509,7 +2832,9 @@ export class SidebarController {
 
   /** Whether a still-current complete warning render is awaiting/has reached writer settlement. */
   isSavedDeleteConfirmationRenderCurrent(token: number): boolean {
-    const target = this.savedDeleteTarget;
+    // The same written-warning fence covers the local target and the frozen
+    // remote owner target; exactly one of them exists while the dialog is open.
+    const target = this.savedDeleteTarget ?? this.remoteSavedDeleteTarget;
     return token === this.savedDeleteConfirmationRenderToken
       && this._visible && this._focus === "confirm" && this.confirmPurpose === "saved-delete"
       && target !== undefined && this.savedPickerId === target.pickerId
@@ -2543,6 +2868,7 @@ export class SidebarController {
   ): boolean {
     const check = this.pendingSavedDeleteCheck;
     return this._visible && this._focus === "form" && this.formKind === "saved"
+      && this.savedHost.kind === "local"
       && this.savedPickerId === pickerId && this.savedQueryRevision === revision
       && check !== undefined && check.requestId === requestId && check.pickerId === pickerId
       && check.id === id && check.file === file && check.revision === revision
@@ -2615,9 +2941,349 @@ export class SidebarController {
 
   private isSavedDeletePreparationStillCurrent(context: SavedDeleteContext): boolean {
     return this._visible && this._focus === "form" && this.formKind === "saved"
+      && this.savedHost.kind === "local"
       && this.savedPickerId === context.pickerId && this.savedQueryRevision === context.revision
       && this.savedRows[this.savedSelectedIndex]?.id === context.id
       && this.savedRows[this.savedSelectedIndex]?.file === context.file;
+  }
+
+  // --- Selected-host Saved picker: pure API for Main (remote owner). ---------
+  //
+  // None of these methods performs IO, sends anything, or grants authority. Main
+  // feeds owner facts in and receives intents out; the owner re-checks its own
+  // run, policy, and file guards on every request.
+
+  /** The Saved picker's current Host choice, as the fresh option list describes it. */
+  get savedPickerHost(): SidebarSavedPickerHost {
+    const chosen = this.savedHost;
+    if (chosen.kind === "local") return Object.freeze({ kind: "local" as const });
+    const option = this.currentSavedHostOption();
+    return Object.freeze({
+      kind: "remote" as const,
+      hostId: chosen.hostId,
+      label: option?.label ?? chosen.label,
+      hostRunId: option?.hostRunId ?? null,
+      connected: option?.connected === true,
+      supported: option?.supported === true,
+      deleteExposed: option?.deleteExposed ?? null,
+    });
+  }
+
+  /** Read-only remote picker context, or undefined unless a remote Saved picker is open. */
+  savedRemoteContext(): SidebarRemoteSavedContext | undefined {
+    const state = this.remoteSaved;
+    const pickerId = this.savedPickerId;
+    if (state === undefined || pickerId === undefined || !this.remoteSavedPickerOpen()) return undefined;
+    const option = this.currentSavedHostOption();
+    return Object.freeze({
+      pickerId,
+      revision: this.savedQueryRevision,
+      query: this.savedQuery,
+      hostId: state.hostId,
+      hostRunId: option?.hostRunId ?? null,
+      catalogId: state.catalog?.catalogId,
+      resultId: state.result?.resultId,
+      total: state.result?.total,
+      issueCount: state.result?.issueCount ?? 0,
+      selectedIndex: this.savedSelectedIndex,
+      windows: Object.freeze(state.windows.map((window) => Object.freeze({
+        offset: window.offset,
+        length: window.rows.length,
+      }))),
+      pendingReads: Object.freeze([
+        ...(state.resultRead === undefined ? [] : [state.resultRead.requestId]),
+        ...state.windowReads.map((read) => read.requestId),
+      ]),
+    });
+  }
+
+  /**
+   * Accept one completed owner window for the EXACT outstanding read it answers:
+   * a `saved-remote-list` (replaces catalog and result), `saved-remote-search`
+   * (same catalog, replaces the result), or `saved-remote-window` (same catalog,
+   * result, and total; never relists). The request must still belong to this
+   * picker, query revision, destination, and owner run. A refused reply retires
+   * its request and changes nothing else; nothing is retried. Only bounded
+   * windows of the current result are retained.
+   */
+  completeRemoteSavedWindow(requestId: number, facts: SidebarRemoteSavedWindowFacts): boolean {
+    const state = this.remoteSaved;
+    if (state === undefined || !this.remoteSavedPickerOpen()) return false;
+    const intent = state.resultRead?.requestId === requestId
+      ? state.resultRead
+      : state.windowReads.find((candidate) => candidate.requestId === requestId);
+    if (intent === undefined || intent.revision !== this.savedQueryRevision) return false;
+    // The request is answered either way: a refused reply is never re-awaited.
+    this.retireRemoteSavedRead(state, intent);
+    if (!isOwnerSavedWindowFacts(facts) || facts.kind !== "window"
+      || facts.entries.length > REMOTE_SAVED_MAX_WINDOW_ROWS) {
+      this.remoteSavedNotice = "The remote Saved list reply was not usable; nothing was changed";
+      this.onInvalidate?.();
+      return false;
+    }
+    if (facts.hostRunId !== intent.hostRunId) {
+      this.remoteSavedNotice = REMOTE_SAVED_OTHER_RUN_NOTICE;
+      this.onInvalidate?.();
+      return false;
+    }
+    const option = this.currentSavedHostOption();
+    if (!this.remoteSavedHostUsable(option) || option.hostRunId !== intent.hostRunId) return false;
+    if (intent.kind === "search" && facts.catalogId !== intent.catalogId) return false;
+    if (intent.kind === "window") {
+      const catalog = state.catalog;
+      const result = state.result;
+      if (catalog === undefined || result === undefined
+        || catalog.catalogId !== intent.catalogId || result.resultId !== intent.resultId
+        || facts.catalogId !== catalog.catalogId || facts.resultId !== result.resultId
+        || facts.total !== result.total) return false;
+    }
+    const rows: RemoteSavedRow[] = facts.entries.map((entry) => Object.freeze({
+      entryId: entry.entryId,
+      row: Object.freeze(remoteSavedDisplayRow(entry)),
+    }));
+    if (intent.kind !== "window") {
+      state.catalog = Object.freeze({ hostRunId: facts.hostRunId, catalogId: facts.catalogId });
+      state.result = Object.freeze({ resultId: facts.resultId, total: facts.total, issueCount: facts.issueCount });
+      state.windows = [];
+      state.windowReads = [];
+      // Existing query behaviour: the absolute selection is kept and only
+      // clamped when the new result is shorter (Host changes reset it to 0).
+      if (this.savedSelectedIndex >= facts.total) this.savedSelectedIndex = Math.max(0, facts.total - 1);
+      // A new owner result is a new view, even if the owner reused handles.
+      this.retireSavedViewAuthority();
+    }
+    if (rows.length > 0) this.addRemoteSavedWindow(state, { offset: facts.offset, rows });
+    this.remoteSavedNotice = undefined;
+    this.displayedSavedRows = undefined;
+    // A positive reply may leave the selection (or the drawn rows) uncached; one
+    // bounded follow-up window is a new read, never a retry of this one.
+    if (rows.length > 0) this.requestRemoteSavedCoverage();
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /** Retire one outstanding remote read with a bounded notice; nothing is retried. */
+  failRemoteSavedRead(requestId: number, message: string): boolean {
+    const state = this.remoteSaved;
+    if (state === undefined || !this.remoteSavedPickerOpen()) return false;
+    const intent = state.resultRead?.requestId === requestId
+      ? state.resultRead
+      : state.windowReads.find((candidate) => candidate.requestId === requestId);
+    if (intent === undefined) return false;
+    this.retireRemoteSavedRead(state, intent);
+    this.remoteSavedNotice = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /**
+   * The remote picker frame the last complete render drew, for Main's writer.
+   * Undefined for a Local picker, a too-small/covered/hidden frame, or a frame
+   * that is no longer current. Capturing authorizes nothing by itself.
+   */
+  captureSavedPickerPresentation(): SidebarSavedPickerPresentation | undefined {
+    const candidate = this.savedPickerCandidate;
+    return candidate !== undefined && this.remoteSavedCandidateCurrent(candidate)
+      ? candidate.presentation
+      : undefined;
+  }
+
+  /** Whether this token is still the current complete remote picker frame. */
+  isSavedPickerRenderCurrent(renderToken: number): boolean {
+    const candidate = this.savedPickerCandidate;
+    return candidate !== undefined && candidate.token === renderToken
+      && this.remoteSavedCandidateCurrent(candidate);
+  }
+
+  /**
+   * Main's ACTUAL-writer receipt for this exact remote picker frame. Until it is
+   * reported no Resume or Delete-prepare may be emitted from that frame; a
+   * queued, held, superseded, resized, covered, or merely rendered frame never
+   * becomes a receipt.
+   */
+  settleSavedPickerRender(renderToken: number): boolean {
+    const candidate = this.savedPickerCandidate;
+    if (candidate === undefined || candidate.token !== renderToken
+      || !this.remoteSavedCandidateCurrent(candidate)) return false;
+    candidate.written = true;
+    return true;
+  }
+
+  /** Forget the drawn remote picker frame (covered, resized, hidden, or replaced). */
+  invalidateSavedPickerPresentation(): void {
+    this.savedPickerCandidate = undefined;
+  }
+
+  /**
+   * Main's last-instant re-proof for one UNSUBMITTED remote entry intent: the
+   * exact pending Resume, Delete-prepare, or confirmed Delete still exists with
+   * every frozen handle and view epoch, still owns this picker/query/selection/
+   * destination/run/result, the CURRENT written receipt it came from still
+   * stands (the same written picker frame, token, and geometry for Resume and
+   * Delete-prepare, which must still draw the entry; the same written
+   * confirmation token for Delete), and for delete the OWNER's live exposure is
+   * still on. Any invalidation, resize, re-minted dialog token, or epoch advance
+   * fails it for good. It never checks a local setting and grants nothing; it
+   * never cancels work the owner already accepted.
+   */
+  remoteSavedIntentStillCurrent(
+    intent: Extract<PeerSavedUiAction, {
+      readonly type: "saved-remote-resume" | "saved-remote-delete-prepare" | "saved-remote-delete";
+    }>,
+  ): boolean {
+    const operation = intent.type === "saved-remote-resume"
+      ? this.pendingRemoteSavedResume
+      : intent.type === "saved-remote-delete-prepare"
+        ? this.pendingRemoteSavedDeleteCheck
+        : this.remoteSavedDeleteOperation;
+    if (operation === undefined || operation.requestId !== intent.requestId
+      || operation.pickerId !== intent.pickerId || operation.revision !== intent.revision
+      || operation.hostId !== intent.hostId || operation.hostRunId !== intent.hostRunId
+      || operation.catalogId !== intent.catalogId || operation.resultId !== intent.resultId
+      || operation.entryId !== intent.entryId || operation.renderToken !== intent.renderToken) return false;
+    if (!this._visible || this.formKind !== "saved") return false;
+    if (intent.type === "saved-remote-delete") {
+      const target = this.remoteSavedDeleteTarget;
+      if (target === undefined || target.entryId !== operation.entryId
+        || this._focus !== "confirm" || this.confirmPurpose !== "saved-delete") return false;
+      // The exact written confirmation frame must still stand: any re-render,
+      // geometry change, or invalidation re-mints or drops its token.
+      if (!this.savedDeleteConfirmationDisplayed
+        || this.savedDeleteConfirmationRenderToken !== intent.renderToken
+        || !this.isSavedDeleteConfirmationRenderCurrent(intent.renderToken)) return false;
+    } else {
+      // The exact written picker frame (token + geometry + epoch) must still be
+      // current and must still draw this exact entry.
+      const candidate = this.savedPickerCandidate;
+      if (this._focus !== "form" || candidate === undefined || !candidate.written
+        || candidate.token !== intent.renderToken
+        || !this.remoteSavedCandidateCurrent(candidate)
+        || !candidate.presentation.drawn.some((row) => row.index === operation.index
+          && row.entryId === operation.entryId)) return false;
+    }
+    if (intent.type !== "saved-remote-resume" && this.currentSavedHostOption()?.deleteExposed !== true) return false;
+    return this.remoteSavedOperationOwned(operation);
+  }
+
+  /**
+   * Resolve one remote Resume. The OWNER created/selected its row; this side
+   * selects that exact owner run/row ONLY while the exact request still owns the
+   * picker (same picker, query, destination, run, catalog, result, entry, and
+   * selection). A late or superseded reply finishes nothing here: it never
+   * steals the pane or focus, never changes a draft or geometry, and never stops
+   * or cancels anything.
+   */
+  completeRemoteSavedResume(requestId: number, facts: { readonly hostRunId: string; readonly rowId: string }): boolean {
+    const pending = this.pendingRemoteSavedResume;
+    if (pending === undefined || pending.requestId !== requestId) return false;
+    this.pendingRemoteSavedResume = undefined;
+    const owned = this._visible && this._focus === "form" && this.formKind === "saved"
+      && this.remoteSavedOperationOwned(pending);
+    if (typeof facts?.hostRunId !== "string" || facts.hostRunId !== pending.hostRunId
+      || typeof facts.rowId !== "string" || facts.rowId.length === 0) {
+      if (owned) {
+        this.savedError = REMOTE_SAVED_OTHER_RUN_NOTICE;
+        this.onInvalidate?.();
+      }
+      return false;
+    }
+    if (!owned) return false;
+    this.emit({ type: "saved-remote-dismiss", pickerId: pending.pickerId, hostId: pending.hostId });
+    this.savedError = undefined;
+    this.clearSavedPickerState();
+    this.displayedSavedRows = undefined;
+    this.disposeFormField();
+    this.formKind = undefined;
+    this._focus = "main";
+    this.emit({ type: "select-remote", hostId: pending.hostId, hostRunId: facts.hostRunId, rowId: facts.rowId });
+    return true;
+  }
+
+  /** Show a bounded Resume refusal/uncertainty only while the request still owns the picker. */
+  failRemoteSavedResume(requestId: number, message: string): boolean {
+    const pending = this.pendingRemoteSavedResume;
+    if (pending === undefined || pending.requestId !== requestId) return false;
+    this.pendingRemoteSavedResume = undefined;
+    if (this._focus !== "form" || this.formKind !== "saved" || this.savedPickerId !== pending.pickerId) return false;
+    this.savedError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /**
+   * The owner answered one Delete prepare. A prepare is never a confirmation:
+   * only an allowed answer for the still-owned exact row, while the OWNER still
+   * exposes remote delete, opens the same written-confirmation dialog the local
+   * picker uses (annotated with the owner host).
+   */
+  completeRemoteSavedDeletePrepare(requestId: number, allowed: boolean, message?: string): boolean {
+    const context = this.pendingRemoteSavedDeleteCheck;
+    if (context === undefined || context.requestId !== requestId) return false;
+    this.pendingRemoteSavedDeleteCheck = undefined;
+    if (!this._visible || this._focus !== "form" || this.formKind !== "saved"
+      || !this.remoteSavedOperationOwned(context)) return false;
+    if (this.currentSavedHostOption()?.deleteExposed !== true) {
+      this.savedError = REMOTE_SAVED_DELETE_OFF_NOTICE;
+      this.onInvalidate?.();
+      return true;
+    }
+    if (allowed !== true) {
+      this.savedError = sanitizeBounded(message ?? "Saved conversation is not safe to delete", ERROR_TEXT_MAX_CODEPOINTS);
+      this.onInvalidate?.();
+      return true;
+    }
+    this.invalidateSavedDeleteConfirmationDisplay();
+    this.invalidateSavedPickerPresentation();
+    this.savedDeleteTarget = undefined;
+    this.remoteSavedDeleteTarget = context;
+    this.remoteSavedDeleteOperation = undefined;
+    this.displayedSavedRows = undefined;
+    this.confirmPurpose = "saved-delete";
+    this._focus = "confirm";
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /**
+   * Complete the one confirmed remote Delete while its dialog still owns the
+   * pane. The OWNER's live policy is deliberately not re-read here: an accepted
+   * delete keeps its truthful completion ownership even if the policy turned Off
+   * meanwhile. A deletion relists the owner's catalog (a new read, never a retry).
+   */
+  completeRemoteSavedDelete(requestId: number, message: string, deleted: boolean): boolean {
+    const operation = this.remoteSavedDeleteOperation;
+    if (operation === undefined || operation.requestId !== requestId) return false;
+    if (this.remoteSavedDeleteTarget === undefined || !this._visible || this._focus !== "confirm"
+      || this.confirmPurpose !== "saved-delete" || this.savedPickerId !== operation.pickerId
+      || this.savedQueryRevision !== operation.revision) return false;
+    this.remoteSavedDeleteOperation = undefined;
+    this.remoteSavedDeleteTarget = undefined;
+    this.invalidateSavedDeleteConfirmationDisplay();
+    this.confirmPurpose = "quit";
+    this._focus = "form";
+    this.savedError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
+    if (deleted === true) this.requestRemoteSavedResult(true);
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /**
+   * Newest live OWNER delete exposure for the selected destination and exact
+   * owner run (from a policy fact Main observed). It is a description, never
+   * permission. Off or unknown hides the delete hints, refuses new deletes, and
+   * invalidates an UNSUBMITTED prepare or confirmation; an already emitted
+   * confirmed delete keeps its completion ownership. On restores the hints
+   * without relisting or rebinding anything. A later snapshot that reports a
+   * concrete exposure for that destination replaces this value.
+   */
+  updateRemoteSavedDeleteExposure(hostId: string, hostRunId: string, deleteExposed: boolean | null): boolean {
+    if (this.savedHost.kind !== "remote" || this.savedHost.hostId !== hostId
+      || typeof hostRunId !== "string" || hostRunId.length === 0
+      || (deleteExposed !== true && deleteExposed !== false && deleteExposed !== null)) return false;
+    this.remoteSavedPolicyOverlay = Object.freeze({ hostId, hostRunId, deleteExposed });
+    this.reconcileSavedPickerHost();
+    this.onInvalidate?.();
+    return true;
   }
 
   /**
@@ -2992,6 +3658,16 @@ export class SidebarController {
         this.failCreateOnPeer(pending.requestId, CREATE_ON_PEER_UNCERTAIN_NOTICE);
       }
     }
+    // A newer snapshot that reports a concrete OWNER delete exposure for the
+    // selected Saved destination supersedes an earlier policy fact Main reported.
+    const policyOverlay = this.remoteSavedPolicyOverlay;
+    if (policyOverlay !== undefined) {
+      const reported = next.hosts?.find((host) => host.id === policyOverlay.hostId)?.saved?.deleteExposed;
+      if (reported === true || reported === false) this.remoteSavedPolicyOverlay = undefined;
+    }
+    // An open Saved picker follows its chosen destination's connection, run, and
+    // live owner policy without relisting, retrying, or retargeting anything.
+    this.reconcileSavedPickerHost();
     if (this.peerBindDirty && next.settings !== null
       && next.settings.bindHost === this.peerBindHostDraft.trim()
       && (next.settings.bindPort === null ? "" : String(next.settings.bindPort)) === this.peerBindPortDraft.trim()) {
@@ -3454,6 +4130,7 @@ export class SidebarController {
     rows: number,
   ): boolean {
     if (shown === undefined) return false;
+    if (shown.pane === "saved") return this.activateSavedHostAtFrom(shown, column, row, cols, rows);
     if (!this._visible || this._focus !== "form" || this.formKind !== "new"
       || this.pendingCreate !== undefined) return false;
     if (!validHitGeometry(column, row, cols, rows)) return false;
@@ -3481,6 +4158,27 @@ export class SidebarController {
     if (shown === undefined || shown.cols !== cols || shown.rows !== rows) return false;
     const displayed = shown.entries.find((candidate) => candidate.paneRow === row);
     if (displayed === undefined) return false;
+    if (shown.renderToken !== undefined || displayed.remote !== undefined) {
+      // A REMOTE drawn row acts only through the exact written picker frame that
+      // drew it, and only on the same opaque owner entry: never by matching a
+      // display id, file, or caption, and never through a local route.
+      const remote = displayed.remote;
+      const candidate = this.savedPickerCandidate;
+      if (remote === undefined || shown.renderToken === undefined || this.savedHost.kind !== "remote"
+        || candidate === undefined || candidate.token !== shown.renderToken || !candidate.written
+        || !this.remoteSavedCandidateCurrent(candidate)) return false;
+      if (this.remoteSavedRowAt(displayed.index)?.entryId !== remote.entryId) return false;
+      if (this.savedHostFocused) {
+        this.savedHostFocused = false;
+        this.onInvalidate?.();
+      }
+      // The press acts on the drawn row of the written frame WITHOUT moving the
+      // selection, so the frame it came from stays the current written receipt
+      // that Main's last-instant re-proof requires.
+      this.activateRemoteSavedRow(displayed.index);
+      return true;
+    }
+    if (this.savedHost.kind !== "local") return false;
     const currentIndex = this.savedRows.findIndex((candidate) => candidate.id === displayed.entry.id
       && candidate.file === displayed.entry.file);
     if (currentIndex < 0) return false;
@@ -3574,6 +4272,7 @@ export class SidebarController {
     if (!this._visible) {
       // A hidden pane draws no form, so nothing of the drawn New form survives it.
       this.invalidateCreateFormPresentation();
+      this.invalidateSavedPickerPresentation();
       this.invalidateSavedDeleteConfirmationDisplay();
       this.invalidateRemoteCloseConfirmationDisplay();
       return { lines: [] };
@@ -3595,7 +4294,10 @@ export class SidebarController {
     // A standalone roster render draws no form pane. The wide layout renders the
     // roster and then the form in one pass, so only a render that is NOT part of
     // a form pass may retire the drawn New form.
-    if (this._focus !== "form") this.invalidateCreateFormPresentation();
+    if (this._focus !== "form") {
+      this.invalidateCreateFormPresentation();
+      this.invalidateSavedPickerPresentation();
+    }
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
       return this.renderRosterTooSmall(cols, rows);
     }
@@ -3617,7 +4319,10 @@ export class SidebarController {
     // Only the network pane owns the displayed peer-row mapping; every other
     // form-slot pane forgets it so a stale map can never authorize an action.
     if (this.formKind !== "peer") this.peerDisplay = undefined;
+    // Likewise only an uncovered Saved picker render may keep its drawn frame.
+    if (this.formKind !== "saved" || this.peerConsentConfirmationActive) this.invalidateSavedPickerPresentation();
     if (cols < FORM_MIN_COLS || rows < FORM_MIN_ROWS) {
+      this.invalidateSavedPickerPresentation();
       // An unshowable form-slot frame forgets the drawn network rows and
       // revokes any consent candidate/proof: nothing off-screen may act, and no
       // earlier receipt may be restored by a later render at the old geometry.
@@ -3668,6 +4373,8 @@ export class SidebarController {
     this.remoteCloseRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
     this.invalidateCreateFormPresentation();
+    // The confirmation covers the picker: its drawn frame is not on screen.
+    this.invalidateSavedPickerPresentation();
     if (!this.savedDeleteConfirmationActive) return { lines: [] };
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) return this.renderTooSmall(cols, rows);
     return this.renderSavedDeleteConfirmPane(cols, rows);
@@ -3688,6 +4395,7 @@ export class SidebarController {
       this.forgetDisplayedRoster();
       // A confirmation replaces the content pane: the New form is not drawn.
       this.invalidateCreateFormPresentation();
+      this.invalidateSavedPickerPresentation();
       if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
         this.stopConfirmDisplayed = false;
         this.peerConfirmDisplayed = false;
@@ -3702,8 +4410,9 @@ export class SidebarController {
     }
     this.invalidateSavedDeleteConfirmationDisplay();
     // Roster-only focus draws no content pane, so nothing of a drawn New form
-    // can be submitted from it.
+    // (or Saved picker frame) can be submitted from it.
     this.invalidateCreateFormPresentation();
+    this.invalidateSavedPickerPresentation();
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
       return this.renderRosterTooSmall(cols, rows);
     }
@@ -4486,21 +5195,59 @@ export class SidebarController {
     this.savedError = undefined;
     this.savedSelectedIndex = 0;
     this.savedListTop = 0;
+    // Every opening shows LOCAL with a blank query; nothing of an earlier
+    // remote choice, its results, or its pending UI ownership survives.
+    this.resetRemoteSavedPicker();
     this._focus = "form";
     this.displayedSavedRows = undefined;
     const requestId = this.nextRequestId++;
     this.savedPickerId = requestId;
     this.savedQueryRevision = 0;
-    let inputNotice: string | undefined;
-    try {
-      this.savedQueryInput = this.createSavedQueryInput?.() ?? createDefaultSavedQueryInput();
-    } catch {
-      this.savedQueryInput = createDefaultSavedQueryInput();
-      inputNotice = "Native query input is unavailable; using Pi's default keys";
-    }
-    this.savedQueryNotice = inputNotice ?? this.savedQueryInput.notice;
+    this.openSavedQueryInput();
     this.pendingSavedList = { requestId };
     this.emit({ type: "saved-list", requestId });
+  }
+
+  /** A fresh native query Input (blank), with the same fallback notice as before. */
+  private openSavedQueryInput(): void {
+    this.disposeSavedQueryInput();
+    let inputNotice: string | undefined;
+    let input: SidebarSavedQueryInput;
+    try {
+      input = this.createSavedQueryInput?.() ?? createDefaultSavedQueryInput();
+    } catch {
+      input = createDefaultSavedQueryInput();
+      inputNotice = "Native query input is unavailable; using Pi's default keys";
+    }
+    this.savedQueryInput = input;
+    this.savedQueryNotice = inputNotice ?? input.notice;
+  }
+
+  /** Drop every remote Saved fact and UI ownership; accepted owner work is never cancelled. */
+  private resetRemoteSavedPicker(): void {
+    this.savedHost = { kind: "local" };
+    this.savedHostFocused = false;
+    this.remoteSaved = undefined;
+    this.remoteSavedNotice = undefined;
+    this.pendingRemoteSavedResume = undefined;
+    this.pendingRemoteSavedDeleteCheck = undefined;
+    this.remoteSavedDeleteTarget = undefined;
+    this.remoteSavedDeleteOperation = undefined;
+    this.remoteSavedPolicyOverlay = undefined;
+    this.retireSavedViewAuthority();
+  }
+
+  /**
+   * Advance the monotonic Saved view epoch: the drawn remote frame and every
+   * frozen remote operation lose their UI authority for good (a later return to
+   * identical values cannot revive them), and an unanswered Delete prepare is
+   * dropped. A pending Resume keeps only its duplicate fence; its late reply can
+   * no longer select anything. Accepted owner work is never cancelled.
+   */
+  private retireSavedViewAuthority(): void {
+    this.savedViewEpoch += 1;
+    this.invalidateSavedPickerPresentation();
+    this.pendingRemoteSavedDeleteCheck = undefined;
   }
 
   /**
@@ -4511,7 +5258,15 @@ export class SidebarController {
    */
   private dismissSavedPane(): void {
     const pickerId = this.savedPickerId;
-    if (pickerId !== undefined) this.emit({ type: "saved-dismiss", pickerId });
+    if (pickerId !== undefined) {
+      // Closed discriminator: a remote picker retires only through its own
+      // remote intent and never reaches Main's local catalog route.
+      if (this.savedHost.kind === "remote") {
+        this.emit({ type: "saved-remote-dismiss", pickerId, hostId: this.savedHost.hostId });
+      } else {
+        this.emit({ type: "saved-dismiss", pickerId });
+      }
+    }
     if (this.pendingSavedList !== undefined) {
       this.emit({ type: "saved-cancel", requestId: this.pendingSavedList.requestId });
       this.pendingSavedList = undefined;
@@ -4525,11 +5280,18 @@ export class SidebarController {
   }
 
   private handleSavedPaneInput(data: string): void {
+    // The Host line (shown only when a remote choice exists) is reached with
+    // standard Shift+Tab, recognized before the bracketed-paste carry exactly as
+    // the New form's Host line is. Nothing is bypassed during a real paste.
+    if (!this.formPasteActive && this.formPasteCarry.length === 0
+      && this.savedHostLineShown() && matchesShiftTab(data)
+      && this.handleSavedHostKey(data)) return;
     // Bracketed paste is opaque in the picker and never activates a row; a
     // streamed body chunk that merely equals a host/native action must not
-    // dismiss or delete. The native Input still owns paste insertion.
+    // dismiss or delete. The native Input still owns paste insertion, except
+    // while the Host line owns focus: a paste never edits a hidden query.
     if (this.routeBracketedPaste(data)) {
-      this.feedSavedQueryInput(data);
+      if (!this.savedHostFocused) this.feedSavedQueryInput(data);
       return;
     }
     // Fence the held Escape that canceled only a host-owned form across focus
@@ -4547,6 +5309,8 @@ export class SidebarController {
       return;
     }
     if (this.consumeSavedActionClaim(data)) return;
+    // While the Host line owns focus only its own selection gestures act.
+    if (this.savedHostFocused && this.handleSavedHostKey(data)) return;
     if (isKeyRelease(data)) return;
     if (this.savedMatches(data, "tui.select.up")) {
       this.moveSavedSelection(-1);
@@ -4568,17 +5332,22 @@ export class SidebarController {
       if (!actionRepeat) this.feedSavedQueryInput(data);
       return;
     }
+    // Local and remote rows take separate routes: a remote row can never reach a
+    // local saved-open/delete action (or the reverse), whatever its id or file.
     if (this.savedMatches(data, "app.session.delete")) {
-      this.beginSavedDeleteCheck("app.session.delete");
+      if (this.savedHost.kind === "remote") this.beginRemoteSavedDeleteCheck("app.session.delete");
+      else this.beginSavedDeleteCheck("app.session.delete");
       return;
     }
     if (this.savedMatches(data, "app.session.deleteNoninvasive")) {
-      if (this.savedQuery.length === 0) this.beginSavedDeleteCheck("app.session.deleteNoninvasive");
-      else this.feedSavedQueryInput(data);
+      if (this.savedQuery.length !== 0) this.feedSavedQueryInput(data);
+      else if (this.savedHost.kind === "remote") this.beginRemoteSavedDeleteCheck("app.session.deleteNoninvasive");
+      else this.beginSavedDeleteCheck("app.session.deleteNoninvasive");
       return;
     }
     if (this.savedMatches(data, "tui.select.confirm")) {
-      this.activateSavedRow();
+      if (this.savedHost.kind === "remote") this.activateRemoteSavedRow(this.savedSelectedIndex);
+      else this.activateSavedRow();
       return;
     }
     if (this.savedMatches(data, "tui.select.cancel")) {
@@ -4607,7 +5376,11 @@ export class SidebarController {
     if (after !== before) {
       this.displayedSavedRows = undefined;
       this.savedQueryRevision += 1;
-      if (this.savedPickerId !== undefined) {
+      if (this.savedHost.kind === "remote") {
+        // The OWNER matches the exact query text; this side never searches,
+        // indexes, or filters anything itself.
+        this.requestRemoteSavedResult(false);
+      } else if (this.savedPickerId !== undefined) {
         this.emit({
           type: "saved-search",
           pickerId: this.savedPickerId,
@@ -4620,6 +5393,7 @@ export class SidebarController {
   }
 
   private beginSavedDeleteCheck(action: "app.session.delete" | "app.session.deleteNoninvasive"): void {
+    if (this.savedHost.kind !== "local") return;
     if (this.pendingSavedList !== undefined || this.pendingSavedOpen !== undefined
       || this.pendingSavedDeleteCheck !== undefined || this.savedDeleteTarget !== undefined) return;
     const row = this.savedRows[this.savedSelectedIndex];
@@ -4686,6 +5460,24 @@ export class SidebarController {
   }
 
   private moveSavedSelection(delta: number): void {
+    if (this.savedHost.kind === "remote") {
+      // Absolute wrap over the FULL owner total (0 -> last and last -> 0); an
+      // uncached target is reached through one bounded window read.
+      const total = this.remoteSaved?.result?.total ?? 0;
+      if (total === 0) return;
+      const current = Math.min(this.savedSelectedIndex, total - 1);
+      const next = delta > 0
+        ? (current + 1 >= total ? 0 : current + 1)
+        : (current === 0 ? total - 1 : current - 1);
+      if (next !== this.savedSelectedIndex) {
+        this.savedSelectedIndex = next;
+        // An actual selection change permanently retires every written frame
+        // and pending UI ownership; moving back never revives them.
+        this.retireSavedViewAuthority();
+      }
+      this.requestRemoteSavedCoverage();
+      return;
+    }
     if (this.savedRows.length === 0) return;
     const current = this.savedSelectedIndex;
     this.savedSelectedIndex = (current + delta + this.savedRows.length) % this.savedRows.length;
@@ -4697,6 +5489,7 @@ export class SidebarController {
    * row is not re-emitted.
    */
   private activateSavedRow(): void {
+    if (this.savedHost.kind !== "local") return;
     if (this.pendingSavedList !== undefined) return;
     const row = this.savedRows[this.savedSelectedIndex];
     if (row === undefined) return;
@@ -4733,6 +5526,7 @@ export class SidebarController {
     pickerId = requestId,
   ): boolean {
     if (this.pendingSavedList?.requestId !== requestId) return false; // stale: ignore
+    if (this.savedHost.kind !== "local") return false;
     if (this.savedPickerId !== pickerId || (this.formKind !== "saved" && this.confirmPurpose !== "saved-delete")) return false;
     this.pendingSavedList = undefined;
     this.savedRows = sanitizeSavedRows(rows);
@@ -4746,7 +5540,8 @@ export class SidebarController {
   /** Replace picker rows only for the exact current private-catalog query revision. */
   completeSavedSearch(pickerId: number, revision: number, rows: readonly SidebarSavedRow[]): boolean {
     if (this.savedPickerId !== pickerId || this.savedQueryRevision !== revision
-      || this.formKind !== "saved" || this.pendingSavedList !== undefined) return false;
+      || this.formKind !== "saved" || this.pendingSavedList !== undefined
+      || this.savedHost.kind !== "local") return false;
     const accepted = sanitizeSavedRows(rows);
     this.displayedSavedRows = undefined;
     this.savedRows = accepted;
@@ -4809,12 +5604,714 @@ export class SidebarController {
     this.savedDeleteOperation = undefined;
     this.invalidateSavedDeleteConfirmationDisplay();
     this.confirmPurpose = "quit";
+    // Remote picker state never outlives its pane. This releases UI ownership
+    // only: accepted owner work is never cancelled, stopped, or replayed.
+    this.resetRemoteSavedPicker();
   }
 
   private disposeSavedQueryInput(): void {
     const input = this.savedQueryInput;
     this.savedQueryInput = undefined;
     try { input?.dispose(); } catch { /* private query text is discarded even if UI cleanup fails */ }
+  }
+
+  // --- Saved picker Host line: Local by default, one host-owned selection. ---
+
+  /**
+   * The Host choices the Saved picker can name: Local first, then every
+   * destination the attached DTO reports connected AND describes with the
+   * optional Saved facts, with its exact observed owner run (an empty roster
+   * still reports one) and the OWNER's descriptive Saved support and delete
+   * exposure. A connected legacy owner described as unsupported stays an honest
+   * unsupported choice; a destination whose DTO carries no Saved description at
+   * all (an older coordinator) is not offered, so a Main without the Saved
+   * provider exposes no remote Saved choice. A destination the operator already
+   * chose stays listed after it disconnects or vanishes, so nothing silently
+   * falls back to Local or retargets another host. This viewer's own network
+   * settings are never consulted.
+   */
+  private savedHostOptions(): SavedHostOption[] {
+    const options: SavedHostOption[] = [{
+      kind: "local", hostId: "", label: NEW_FORM_LOCAL_HOST_LABEL, hostRunId: null,
+      connected: true, supported: true, deleteExposed: null,
+    }];
+    const chosen = this.savedHost;
+    const chosenHostId = chosen.kind === "remote" ? chosen.hostId : undefined;
+    let chosenListed = false;
+    for (const host of this.peerUiSnapshot?.hosts ?? []) {
+      const chosenHere = chosenHostId !== undefined && host.id === chosenHostId;
+      if (!chosenHere && (host.state !== "connected" || host.saved === undefined)) continue;
+      if (chosenHere) chosenListed = true;
+      const hostRunId = peerHostRosterRunId(host);
+      const supported = host.saved?.supported === true;
+      const overlay = this.remoteSavedPolicyOverlay;
+      const exposure = chosenHere && overlay !== undefined && overlay.hostId === host.id
+        && hostRunId !== null && overlay.hostRunId === hostRunId
+        ? overlay.deleteExposed
+        : host.saved?.deleteExposed ?? null;
+      options.push({
+        kind: "remote",
+        hostId: host.id,
+        label: sanitizeBounded(host.label, PEER_LABEL_MAX_CODEPOINTS),
+        hostRunId,
+        connected: host.state === "connected",
+        supported,
+        // An unsupported destination exposes nothing, whatever else it reports.
+        deleteExposed: supported ? exposure : null,
+      });
+    }
+    if (chosen.kind === "remote" && !chosenListed) {
+      options.push({
+        kind: "remote", hostId: chosen.hostId, label: chosen.label, hostRunId: null,
+        connected: false, supported: false, deleteExposed: null,
+      });
+    }
+    return options;
+  }
+
+  /** Stable identity of the Saved Host line's current choice. */
+  private savedHostKey(): string {
+    return newFormHostOptionKey(this.savedHost.kind === "local"
+      ? { kind: "local", hostId: "" }
+      : { kind: "remote", hostId: this.savedHost.hostId });
+  }
+
+  /** The drawn identity of the Saved option list plus its current choice. */
+  private savedHostOptionsKey(): string {
+    return JSON.stringify([
+      this.savedHostOptions().map((option) => [
+        newFormHostOptionKey(option), option.label, option.hostRunId, option.connected,
+        option.supported, option.deleteExposed,
+      ]),
+      this.savedHostKey(),
+    ]);
+  }
+
+  /** The current Saved choice as the fresh option list describes it. */
+  private currentSavedHostOption(): SavedHostOption | undefined {
+    const key = this.savedHostKey();
+    return this.savedHostOptions().find((option) => newFormHostOptionKey(option) === key);
+  }
+
+  /**
+   * The Host line exists only while a peer snapshot is attached AND at least one
+   * connected destination is described as Saved-capable (or a remote choice is
+   * already made); otherwise the picker is exactly the existing Local picker,
+   * row for row, key for key.
+   */
+  private savedHostLineShown(): boolean {
+    if (this.peerUiSnapshot === undefined || this.formKind !== "saved") return false;
+    return this.savedHost.kind === "remote"
+      || this.savedHostOptions().some((option) => option.kind === "remote" && option.supported);
+  }
+
+  /** True only for a connected, Saved-capable destination with an observed owner run. */
+  private remoteSavedHostUsable(
+    option: SavedHostOption | undefined,
+  ): option is SavedHostOption & { readonly kind: "remote"; readonly hostRunId: string } {
+    return option !== undefined && option.kind === "remote" && option.connected && option.supported
+      && typeof option.hostRunId === "string" && option.hostRunId.length > 0;
+  }
+
+  /** Fixed body text for a remote choice that cannot be asked anything. */
+  private remoteSavedUnusableText(option: SavedHostOption | undefined): string | undefined {
+    if (option === undefined || option.kind !== "remote" || !option.connected) return REMOTE_SAVED_DISCONNECTED_NOTICE;
+    if (!option.supported) return REMOTE_SAVED_UNSUPPORTED_NOTICE;
+    if (option.hostRunId === null || option.hostRunId.length === 0) return REMOTE_SAVED_NO_RUN_NOTICE;
+    return undefined;
+  }
+
+  /** A remote Saved picker currently owns the pane (its list or its delete dialog). */
+  private remoteSavedPickerOpen(): boolean {
+    return this.savedPickerId !== undefined && this.savedHost.kind === "remote" && this.remoteSaved !== undefined
+      && (this.formKind === "saved" || this.confirmPurpose === "saved-delete");
+  }
+
+  /** Cycle the one Saved Host selection; never a connect, retry, or retarget. */
+  private cycleSavedHost(direction: 1 | -1): void {
+    if (this.formKind !== "saved") return;
+    const options = this.savedHostOptions();
+    if (options.length < 2) return;
+    const key = this.savedHostKey();
+    const index = options.findIndex((option) => newFormHostOptionKey(option) === key);
+    const next = index < 0
+      ? options[0]
+      : options[((index + direction) % options.length + options.length) % options.length];
+    if (next !== undefined) this.selectSavedHost(next);
+  }
+
+  /**
+   * One ACTUAL Saved Host change. Selecting the same choice is a no-op. A
+   * different choice retires the previous picker identity through its own
+   * existing route (Local: `saved-dismiss` and any pending listing's
+   * `saved-cancel`; remote: `saved-remote-dismiss`), clears the query and every
+   * result, re-mints the picker identity, and lists the new choice: Local through
+   * the unchanged `saved-list`, a remote owner through one `saved-remote-list`
+   * when it can be asked at all. No per-host query history is kept.
+   */
+  private selectSavedHost(option: SavedHostOption): void {
+    const previousPicker = this.savedPickerId;
+    if (this.formKind !== "saved" || this._focus !== "form" || previousPicker === undefined) return;
+    if (newFormHostOptionKey(option) === this.savedHostKey()) return;
+    if (this.savedHost.kind === "local") {
+      this.emit({ type: "saved-dismiss", pickerId: previousPicker });
+      if (this.pendingSavedList !== undefined) {
+        this.emit({ type: "saved-cancel", requestId: this.pendingSavedList.requestId });
+        this.pendingSavedList = undefined;
+      }
+    } else {
+      this.emit({ type: "saved-remote-dismiss", pickerId: previousPicker, hostId: this.savedHost.hostId });
+    }
+    const hostFocused = this.savedHostFocused;
+    this.resetRemoteSavedPicker();
+    this.savedHostFocused = hostFocused;
+    this.savedRows = [];
+    this.savedIssueCount = 0;
+    this.savedError = undefined;
+    this.savedSelectedIndex = 0;
+    this.savedListTop = 0;
+    // A changed Host retires every pending UI ownership of the old choice; the
+    // backend work itself is never cancelled by this.
+    this.pendingSavedOpen = undefined;
+    this.pendingSavedDeleteCheck = undefined;
+    this.savedDeleteTarget = undefined;
+    this.savedDeleteOperation = undefined;
+    this.invalidateSavedDeleteConfirmationDisplay();
+    this.displayedSavedRows = undefined;
+    this.openSavedQueryInput();
+    const pickerId = this.nextRequestId++;
+    this.savedPickerId = pickerId;
+    this.savedQueryRevision = 0;
+    if (option.kind === "local") {
+      this.pendingSavedList = { requestId: pickerId };
+      this.emit({ type: "saved-list", requestId: pickerId });
+    } else {
+      this.savedHost = { kind: "remote", hostId: option.hostId, label: option.label };
+      this.remoteSaved = {
+        hostId: option.hostId,
+        catalog: undefined,
+        result: undefined,
+        windows: [],
+        resultRead: undefined,
+        windowReads: [],
+      };
+      this.requestRemoteSavedResult(true);
+    }
+    this.onInvalidate?.();
+  }
+
+  /**
+   * One key while the Saved picker's Host line is reachable. Shift+Tab focuses
+   * it; while it owns focus, Up/Left and Down/Right cycle the choice, Tab,
+   * Shift+Tab, or one fresh Escape return to the query, and every other key is
+   * consumed so it can never edit the query underneath. Mirrors the New form.
+   */
+  private handleSavedHostKey(data: string): boolean {
+    if (this.formKind !== "saved" || !this.savedHostLineShown()) {
+      this.savedHostFocused = false;
+      return false;
+    }
+    if (!this.savedHostFocused) {
+      if (!matchesShiftTab(data)) return false;
+      if (!isKeyRelease(data) && !isKeyRepeat(data)) {
+        this.savedHostFocused = true;
+        this.onInvalidate?.();
+      }
+      return true;
+    }
+    if (matchesKey(data, "tab") || matchesShiftTab(data)) {
+      if (!isKeyRelease(data) && !isKeyRepeat(data)) {
+        this.savedHostFocused = false;
+        this.onInvalidate?.();
+      }
+      return true;
+    }
+    if (isKeyRelease(data) || isKeyRepeat(data)) return true;
+    if (matchesKey(data, "escape")) {
+      // Leaving the control is the picker's own back gesture: no dismissal, and
+      // the still-held Escape keeps its fence. The Escape was consumed as a key,
+      // so it is not left behind as a possible paste-opener prefix either.
+      this.formEscapeClaimed = true;
+      this.formPasteCarry = "";
+      this.savedHostFocused = false;
+      this.onInvalidate?.();
+      return true;
+    }
+    if (matchesKey(data, "up") || matchesKey(data, "left")) this.cycleSavedHost(-1);
+    else if (matchesKey(data, "down") || matchesKey(data, "right")) this.cycleSavedHost(1);
+    return true;
+  }
+
+  /** Activates only the Saved Host line the captured render actually drew. */
+  private activateSavedHostAtFrom(
+    shown: DisplayedFormHostRow,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    if (!this._visible || this._focus !== "form" || this.formKind !== "saved") return false;
+    if (!validHitGeometry(column, row, cols, rows)) return false;
+    if (shown.cols !== cols || shown.rows !== rows || shown.row !== row) return false;
+    if (this.savedPickerId !== shown.formGeneration) return false;
+    if (!this.savedHostLineShown() || shown.optionKey !== this.savedHostOptionsKey()) return false;
+    if (column >= shown.valueStart && column < shown.valueEnd) {
+      this.cycleSavedHost(1);
+      return true;
+    }
+    this.savedHostFocused = true;
+    this.onInvalidate?.();
+    return true;
+  }
+
+  // --- Remote Saved windows: bounded reads over ONE owner result. ---
+
+  /** One cached owner row at an absolute result index, or undefined (loading). */
+  private remoteSavedRowAt(index: number): RemoteSavedRow | undefined {
+    const state = this.remoteSaved;
+    if (state === undefined) return undefined;
+    for (const window of state.windows) {
+      const relative = index - window.offset;
+      if (relative >= 0 && relative < window.rows.length) return window.rows[relative];
+    }
+    return undefined;
+  }
+
+  /** Window request size: the drawn list height within the lane's existing bounds. */
+  private remoteSavedWindowCount(): number {
+    return Math.min(REMOTE_SAVED_MAX_WINDOW_ROWS, Math.max(REMOTE_SAVED_PAGE_ROWS, this.savedLastListRows));
+  }
+
+  /**
+   * Ask the owner for a new result for the current query: `saved-remote-search`
+   * inside the bound catalog of the same run, otherwise (or when `forceList`) a
+   * fresh `saved-remote-list`. The previous result, its windows, and every
+   * outstanding read are retired first; the newest intent is the first
+   * submission of THAT query, never a retry. Nothing is asked of a destination
+   * that is disconnected, unsupported, or has no observed run.
+   */
+  private requestRemoteSavedResult(forceList: boolean): void {
+    const state = this.remoteSaved;
+    const pickerId = this.savedPickerId;
+    if (state === undefined || pickerId === undefined) return;
+    this.retireSavedViewAuthority();
+    state.result = undefined;
+    state.windows = [];
+    state.windowReads = [];
+    state.resultRead = undefined;
+    this.displayedSavedRows = undefined;
+    const option = this.currentSavedHostOption();
+    if (!this.remoteSavedHostUsable(option)) return;
+    const hostRunId = option.hostRunId;
+    const catalog = !forceList && state.catalog !== undefined && state.catalog.hostRunId === hostRunId
+      ? state.catalog
+      : undefined;
+    if (catalog === undefined) state.catalog = undefined;
+    const requestId = this.nextRequestId++;
+    const count = this.remoteSavedWindowCount();
+    const query = this.savedQuery;
+    const revision = this.savedQueryRevision;
+    state.resultRead = Object.freeze({
+      requestId,
+      kind: catalog === undefined ? "list" as const : "search" as const,
+      revision,
+      hostRunId,
+      catalogId: catalog?.catalogId,
+      resultId: undefined,
+      offset: 0,
+      count,
+    });
+    if (catalog === undefined) {
+      this.emit({
+        type: "saved-remote-list", pickerId, requestId, revision,
+        hostId: state.hostId, hostRunId, query, offset: 0, count,
+      });
+    } else {
+      this.emit({
+        type: "saved-remote-search", pickerId, requestId, revision,
+        hostId: state.hostId, hostRunId, catalogId: catalog.catalogId, query, offset: 0, count,
+      });
+    }
+  }
+
+  /**
+   * Make the selected row (first) and the drawn rows reachable through at most
+   * one new bounded window read. The window is aligned to the request size; if
+   * that aligned start is already cached (an earlier honest prefix was shorter),
+   * the read starts AT the wanted index, so a short prefix can never repeat the
+   * same window forever. Drawn-row reads never evict retained windows and never
+   * stack, so the follow-up chain is bounded; the selection is always reachable.
+   */
+  private requestRemoteSavedCoverage(): void {
+    const state = this.remoteSaved;
+    const pickerId = this.savedPickerId;
+    const result = state?.result;
+    const catalog = state?.catalog;
+    if (state === undefined || pickerId === undefined || result === undefined || catalog === undefined
+      || state.resultRead !== undefined || result.total === 0) return;
+    const option = this.currentSavedHostOption();
+    if (!this.remoteSavedHostUsable(option) || option.hostRunId !== catalog.hostRunId) return;
+    const selected = Math.min(this.savedSelectedIndex, result.total - 1);
+    let target: number | undefined;
+    if (this.remoteSavedRowAt(selected) === undefined) {
+      target = selected;
+    } else if (state.windowReads.length === 0
+      && (state.windows.length < REMOTE_SAVED_MAX_WINDOWS
+        || state.windows.some((window) => !this.remoteSavedWindowDrawn(window)))) {
+      // Drawn-row follow-ups may only displace an OFF-screen window, so the
+      // chain ends once every retained window is on screen: it is bounded.
+      const { first, end } = this.remoteSavedVisibleRange();
+      for (let index = first; index < end; index += 1) {
+        if (this.remoteSavedRowAt(index) === undefined) {
+          target = index;
+          break;
+        }
+      }
+    }
+    if (target === undefined) return;
+    const count = this.remoteSavedWindowCount();
+    const aligned = Math.floor(target / count) * count;
+    const offset = this.remoteSavedRowAt(aligned) === undefined ? aligned : target;
+    if (state.windowReads.some((read) => read.offset === offset)) return;
+    const requestId = this.nextRequestId++;
+    const revision = this.savedQueryRevision;
+    state.windowReads.push(Object.freeze({
+      requestId,
+      kind: "window" as const,
+      revision,
+      hostRunId: catalog.hostRunId,
+      catalogId: catalog.catalogId,
+      resultId: result.resultId,
+      offset,
+      count,
+    }));
+    while (state.windowReads.length > REMOTE_SAVED_MAX_WINDOWS) state.windowReads.shift();
+    this.emit({
+      type: "saved-remote-window", pickerId, requestId, revision,
+      hostId: state.hostId, hostRunId: catalog.hostRunId,
+      catalogId: catalog.catalogId, resultId: result.resultId, offset, count,
+    });
+  }
+
+  /**
+   * The list rows the next render will draw: the last drawn height from the
+   * scroll top `savedScrollWindow` will choose, which always contains the
+   * selection (so a selection that moved since the last render is never treated
+   * as off screen). Pure; it moves nothing.
+   */
+  private remoteSavedVisibleRange(): { readonly first: number; readonly end: number } {
+    const total = this.remoteSaved?.result?.total ?? 0;
+    const listRows = Math.max(1, this.savedLastListRows);
+    let top = Math.min(Math.max(this.savedListTop, 0), Math.max(0, total - 1));
+    const selected = this.savedSelectedIndex;
+    if (selected < top) top = selected;
+    else if (selected >= top + listRows) top = selected - listRows + 1;
+    return { first: top, end: Math.min(total, top + listRows) };
+  }
+
+  /** True when a retained window intersects the rows the next render draws. */
+  private remoteSavedWindowDrawn(window: RemoteSavedWindow): boolean {
+    const { first, end } = this.remoteSavedVisibleRange();
+    return window.offset < end && window.offset + window.rows.length > first;
+  }
+
+  /**
+   * Retain the newest window plus at most two others: windows on screen first,
+   * then those nearest the selection. A window at the same offset, or one the
+   * newest window fully covers, is dropped. No full-catalog allocation is ever
+   * made from the owner's total.
+   */
+  private addRemoteSavedWindow(state: RemoteSavedState, window: RemoteSavedWindow): void {
+    const selected = this.savedSelectedIndex;
+    const windowEnd = window.offset + window.rows.length;
+    const distance = (candidate: RemoteSavedWindow): number => {
+      const last = candidate.offset + candidate.rows.length - 1;
+      if (selected < candidate.offset) return candidate.offset - selected;
+      if (selected > last) return selected - last;
+      return 0;
+    };
+    const rank = (candidate: RemoteSavedWindow): number => (this.remoteSavedWindowDrawn(candidate) ? 0 : 1);
+    const selectedBefore = this.remoteSavedRowAt(selected)?.entryId;
+    const others = state.windows
+      .filter((candidate) => candidate.offset !== window.offset
+        && !(candidate.offset >= window.offset && candidate.offset + candidate.rows.length <= windowEnd))
+      .sort((left, right) => rank(left) - rank(right) || distance(left) - distance(right));
+    state.windows = [window, ...others.slice(0, REMOTE_SAVED_MAX_WINDOWS - 1)];
+    // Merely re-received data is never a grant: losing the selected cached row
+    // retires the view for good, and a drawn frame whose rows were evicted is
+    // dropped instead of becoming current again when they are refetched.
+    if (selectedBefore !== undefined && this.remoteSavedRowAt(selected)?.entryId !== selectedBefore) {
+      this.retireSavedViewAuthority();
+    }
+    const candidate = this.savedPickerCandidate;
+    if (candidate !== undefined && !candidate.presentation.drawn.every((drawn) =>
+      this.remoteSavedRowAt(drawn.index)?.entryId === drawn.entryId)) {
+      this.invalidateSavedPickerPresentation();
+    }
+  }
+
+  /** Forget one answered (or failed) read so it is never re-awaited. */
+  private retireRemoteSavedRead(state: RemoteSavedState, intent: RemoteSavedReadIntent): void {
+    if (state.resultRead === intent) {
+      state.resultRead = undefined;
+      return;
+    }
+    state.windowReads = state.windowReads.filter((candidate) => candidate !== intent);
+  }
+
+  /**
+   * True while a captured remote picker frame still describes the current pane:
+   * it is the newest candidate, the pane is the visible Saved picker, and the
+   * view epoch, picker, query revision, destination, run, live delete exposure,
+   * catalog, result, total, selection, and every drawn row's cached owner entry
+   * are unchanged. Any new Host, query, window replacement, eviction, selection
+   * change (even one later reversed), dismissal, or resize fails it for good.
+   */
+  private remoteSavedCandidateCurrent(candidate: SavedPickerCandidate): boolean {
+    if (candidate !== this.savedPickerCandidate) return false;
+    if (!this._visible || this._focus !== "form" || this.formKind !== "saved") return false;
+    const state = this.remoteSaved;
+    const presentation = candidate.presentation;
+    if (state === undefined || this.savedHost.kind !== "remote"
+      || presentation.viewEpoch !== this.savedViewEpoch
+      || presentation.pickerId !== this.savedPickerId
+      || presentation.revision !== this.savedQueryRevision
+      || presentation.hostId !== state.hostId) return false;
+    const option = this.currentSavedHostOption();
+    if (!this.remoteSavedHostUsable(option) || option.hostRunId !== presentation.hostRunId
+      || (option.deleteExposed === true) !== presentation.deleteExposed) return false;
+    if (state.resultRead !== undefined || state.catalog === undefined || state.result === undefined
+      || state.catalog.hostRunId !== presentation.hostRunId
+      || state.catalog.catalogId !== presentation.catalogId
+      || state.result.resultId !== presentation.resultId
+      || state.result.total !== presentation.total) return false;
+    if (presentation.selectedIndex !== this.savedSelectedIndex) return false;
+    return presentation.drawn.every((drawn) => this.remoteSavedRowAt(drawn.index)?.entryId === drawn.entryId);
+  }
+
+  /**
+   * Freeze one remote entry operation from the ACTUAL-WRITTEN current picker
+   * frame: the selected row (keyboard) or another row that frame drew (a press).
+   * A loading placeholder is never actionable (silently, like an undrawn local
+   * row); an unwritten, superseded, or changed frame refuses with a fixed notice
+   * and sends nothing. File path and caption are display only: the operation
+   * names opaque owner handles and the current view epoch exclusively.
+   */
+  private writtenRemoteSavedOperation(index: number): RemoteSavedOperation | undefined {
+    const cached = this.remoteSavedRowAt(index);
+    if (cached === undefined) return undefined;
+    const candidate = this.savedPickerCandidate;
+    if (candidate === undefined || !candidate.written || !this.remoteSavedCandidateCurrent(candidate)) {
+      this.savedError = REMOTE_SAVED_UNWRITTEN_NOTICE;
+      this.onInvalidate?.();
+      return undefined;
+    }
+    const presentation = candidate.presentation;
+    const drawn = presentation.drawn.find((row) => row.index === index);
+    if (drawn === undefined || drawn.entryId !== cached.entryId) return undefined;
+    const option = this.currentSavedHostOption();
+    return Object.freeze({
+      pickerId: presentation.pickerId,
+      requestId: this.nextRequestId++,
+      revision: presentation.revision,
+      hostId: presentation.hostId,
+      hostRunId: presentation.hostRunId,
+      catalogId: presentation.catalogId,
+      resultId: presentation.resultId,
+      entryId: cached.entryId,
+      index,
+      selectedIndex: this.savedSelectedIndex,
+      viewEpoch: this.savedViewEpoch,
+      renderToken: presentation.renderToken,
+      row: cached.row,
+      hostLabel: option?.label ?? "",
+    });
+  }
+
+  /**
+   * True while a frozen remote operation still owns the picker: the same view
+   * epoch (so no selection, query, result, Host, run, or eviction change has
+   * happened since, even one later reversed), picker, query revision,
+   * destination, usable run, catalog, result, selection, and the same cached
+   * owner entry at its index.
+   */
+  private remoteSavedOperationOwned(operation: RemoteSavedOperation): boolean {
+    const state = this.remoteSaved;
+    if (operation.viewEpoch !== this.savedViewEpoch) return false;
+    if (state === undefined || this.savedHost.kind !== "remote" || state.hostId !== operation.hostId) return false;
+    if (this.savedPickerId !== operation.pickerId || this.savedQueryRevision !== operation.revision) return false;
+    if (state.catalog === undefined || state.result === undefined
+      || state.catalog.hostRunId !== operation.hostRunId || state.catalog.catalogId !== operation.catalogId
+      || state.result.resultId !== operation.resultId) return false;
+    const option = this.currentSavedHostOption();
+    if (!this.remoteSavedHostUsable(option) || option.hostRunId !== operation.hostRunId) return false;
+    if (this.savedSelectedIndex !== operation.selectedIndex) return false;
+    return this.remoteSavedRowAt(operation.index)?.entryId === operation.entryId;
+  }
+
+  /**
+   * Deliberately resume one remote row (Enter on the written selection, or a
+   * press on a written drawn row). Emits exactly one `saved-remote-resume`
+   * intent; the OWNER performs its native resume. Nothing local is opened.
+   */
+  private activateRemoteSavedRow(index: number): void {
+    const state = this.remoteSaved;
+    if (state === undefined || state.resultRead !== undefined
+      || this.pendingRemoteSavedDeleteCheck !== undefined) return;
+    if (this.pendingRemoteSavedResume !== undefined) {
+      this.savedError = "A saved conversation is already starting";
+      this.onInvalidate?.();
+      return;
+    }
+    const operation = this.writtenRemoteSavedOperation(index);
+    if (operation === undefined) return;
+    this.pendingRemoteSavedResume = operation;
+    this.savedError = undefined;
+    // Same held-key fence as a local open: the confirm key's repeat/release
+    // never reaches a later focused pane.
+    const confirmMatcher = this.savedActionMatcher("tui.select.confirm");
+    this.formSubmitClaim = confirmMatcher;
+    this.claimSavedAction(confirmMatcher);
+    this.emit({
+      type: "saved-remote-resume",
+      pickerId: operation.pickerId,
+      requestId: operation.requestId,
+      revision: operation.revision,
+      hostId: operation.hostId,
+      hostRunId: operation.hostRunId,
+      catalogId: operation.catalogId,
+      resultId: operation.resultId,
+      entryId: operation.entryId,
+      renderToken: operation.renderToken,
+    });
+  }
+
+  /**
+   * Remote delete key: refused with a fixed notice unless the OWNER currently
+   * exposes remote delete; otherwise one owner prepare for the written selected
+   * row. A prepare is never a confirmation.
+   */
+  private beginRemoteSavedDeleteCheck(action: "app.session.delete" | "app.session.deleteNoninvasive"): void {
+    const state = this.remoteSaved;
+    if (state === undefined || state.resultRead !== undefined || this.pendingRemoteSavedResume !== undefined
+      || this.pendingRemoteSavedDeleteCheck !== undefined || this.remoteSavedDeleteTarget !== undefined) return;
+    if (this.currentSavedHostOption()?.deleteExposed !== true) {
+      this.claimSavedAction(this.savedActionMatcher(action));
+      this.savedError = REMOTE_SAVED_DELETE_OFF_NOTICE;
+      this.onInvalidate?.();
+      return;
+    }
+    const operation = this.writtenRemoteSavedOperation(this.savedSelectedIndex);
+    if (operation === undefined) return;
+    this.pendingRemoteSavedDeleteCheck = operation;
+    this.displayedSavedRows = undefined;
+    this.savedError = undefined;
+    this.claimSavedAction(this.savedActionMatcher(action));
+    this.emit({
+      type: "saved-remote-delete-prepare",
+      pickerId: operation.pickerId,
+      requestId: operation.requestId,
+      revision: operation.revision,
+      hostId: operation.hostId,
+      hostRunId: operation.hostRunId,
+      catalogId: operation.catalogId,
+      resultId: operation.resultId,
+      entryId: operation.entryId,
+      renderToken: operation.renderToken,
+    });
+  }
+
+  /**
+   * The written remote delete confirmation: the same keys and the same written
+   * warning fence as the local dialog. Pasted bodies never reach here (routed as
+   * opaque by `handleConfirmInput`). An unsubmitted confirmation whose owner
+   * policy turned Off, or whose run/result changed, closes with a fixed notice;
+   * an emitted delete is never sent twice.
+   */
+  private handleRemoteSavedDeleteConfirmInput(data: string): void {
+    if (this.savedMatches(data, "tui.select.cancel")) {
+      this.claimSavedAction(this.savedActionMatcher("tui.select.cancel"));
+      if (matchesKey(data, "escape")) this.formEscapeClaimed = true;
+      this.cancelSavedDeleteConfirmation();
+      return;
+    }
+    if (!this.savedDeleteConfirmationDisplayed || !this.savedMatches(data, "tui.select.confirm")) return;
+    const target = this.remoteSavedDeleteTarget;
+    if (target === undefined || this.remoteSavedDeleteOperation !== undefined
+      || this.savedPickerId !== target.pickerId) return;
+    const exposed = this.currentSavedHostOption()?.deleteExposed === true;
+    if (!exposed || !this.remoteSavedOperationOwned(target)) {
+      this.cancelSavedDeleteConfirmation();
+      this.savedError = exposed ? REMOTE_SAVED_HOST_CHANGED_NOTICE : REMOTE_SAVED_DELETE_OFF_NOTICE;
+      return;
+    }
+    const renderToken = this.savedDeleteConfirmationRenderToken;
+    if (renderToken === undefined) return;
+    const operation: RemoteSavedOperation = Object.freeze({
+      ...target,
+      requestId: this.nextRequestId++,
+      renderToken,
+    });
+    this.remoteSavedDeleteOperation = operation;
+    this.claimSavedAction(this.savedActionMatcher("tui.select.confirm"));
+    this.emit({
+      type: "saved-remote-delete",
+      pickerId: operation.pickerId,
+      requestId: operation.requestId,
+      revision: operation.revision,
+      hostId: operation.hostId,
+      hostRunId: operation.hostRunId,
+      catalogId: operation.catalogId,
+      resultId: operation.resultId,
+      entryId: operation.entryId,
+      renderToken: operation.renderToken,
+    });
+  }
+
+  /**
+   * Apply a destination change to an open remote picker. A disconnected,
+   * unsupported, or re-run destination retires every fact bound to the old run
+   * (catalog, result, windows, reads, drawn frame, unsubmitted prepare or
+   * confirmation) and says so; nothing is relisted, retried, reconnected, or
+   * retargeted. The OWNER's live delete exposure turning Off (or unknown)
+   * invalidates an unsubmitted prepare/confirmation only; an emitted delete
+   * keeps its completion ownership. Turning On only restores the hints.
+   */
+  private reconcileSavedPickerHost(): void {
+    if (this.savedPickerId === undefined) return;
+    if (this.formKind !== "saved" && this.confirmPurpose !== "saved-delete") return;
+    if (this.savedHostFocused && !this.savedHostLineShown()) this.savedHostFocused = false;
+    const state = this.remoteSaved;
+    if (state === undefined || this.savedHost.kind !== "remote") return;
+    const option = this.currentSavedHostOption();
+    const usable = this.remoteSavedHostUsable(option);
+    const boundRun = state.catalog?.hostRunId ?? state.resultRead?.hostRunId;
+    if (boundRun !== undefined && (!usable || option?.hostRunId !== boundRun)) {
+      // A run returning to an earlier value later can never revive anything.
+      this.retireSavedViewAuthority();
+      state.catalog = undefined;
+      state.result = undefined;
+      state.windows = [];
+      state.resultRead = undefined;
+      state.windowReads = [];
+      this.displayedSavedRows = undefined;
+      this.pendingRemoteSavedDeleteCheck = undefined;
+      if (this.remoteSavedDeleteTarget !== undefined && this.remoteSavedDeleteOperation === undefined) {
+        this.cancelSavedDeleteConfirmation();
+      }
+      this.remoteSavedNotice = REMOTE_SAVED_HOST_CHANGED_NOTICE;
+      return;
+    }
+    if (usable && option !== undefined && option.deleteExposed !== true) {
+      if (this.pendingRemoteSavedDeleteCheck !== undefined) {
+        this.pendingRemoteSavedDeleteCheck = undefined;
+        this.savedError = REMOTE_SAVED_DELETE_OFF_NOTICE;
+      }
+      if (this.remoteSavedDeleteTarget !== undefined && this.remoteSavedDeleteOperation === undefined) {
+        this.cancelSavedDeleteConfirmation();
+        this.savedError = REMOTE_SAVED_DELETE_OFF_NOTICE;
+      }
+    }
   }
 
   private openNewForm(): void {
@@ -5473,7 +6970,11 @@ export class SidebarController {
     if ((this.confirmPurpose === "peer-consent"
       || this.confirmPurpose === "peer-remove"
       || this.confirmPurpose === "peer-revoke"
-      || this.confirmPurpose === "remote-close")
+      || this.confirmPurpose === "remote-close"
+      // A REMOTE Saved delete confirmation is equally opaque to pasted bodies:
+      // a pasted Enter/y/Escape can never confirm or cancel it. The local
+      // Saved-delete dialog keeps its existing input semantics unchanged.
+      || (this.confirmPurpose === "saved-delete" && this.remoteSavedDeleteTarget !== undefined))
       && this.routeBracketedPaste(data)) return;
     // Fence the held Escape that canceled only a host-owned form across focus
     // domains until its release or a fresh Escape press.
@@ -5537,6 +7038,12 @@ export class SidebarController {
   private handleSavedDeleteConfirmInput(data: string): void {
     if (this.consumeSavedActionClaim(data)) return;
     if (isKeyRepeat(data) || isKeyRelease(data)) return;
+    // Closed discriminator: a remote owner target has its own confirm route and
+    // never reaches the local `saved-delete` emission below (or the reverse).
+    if (this.remoteSavedDeleteTarget !== undefined) {
+      this.handleRemoteSavedDeleteConfirmInput(data);
+      return;
+    }
     if (this.savedMatches(data, "tui.select.cancel")) {
       this.claimSavedAction(this.savedActionMatcher("tui.select.cancel"));
       if (matchesKey(data, "escape")) this.formEscapeClaimed = true;
@@ -5561,6 +7068,10 @@ export class SidebarController {
   private cancelSavedDeleteConfirmation(): void {
     this.savedDeleteTarget = undefined;
     this.savedDeleteOperation = undefined;
+    // Cancelling releases this dialog's UI ownership only; an already emitted
+    // remote delete is never cancelled on the owner.
+    this.remoteSavedDeleteTarget = undefined;
+    this.remoteSavedDeleteOperation = undefined;
     this.invalidateSavedDeleteConfirmationDisplay();
     this.confirmPurpose = "quit";
     this._focus = "form";
@@ -7388,6 +8899,7 @@ export class SidebarController {
     // geometry so only that drawn control can be clicked.
     this.formHostDisplay = newForm && hostRow !== undefined
       ? Object.freeze({
+        pane: "new" as const,
         cols,
         rows,
         row: hostRow,
@@ -7505,21 +9017,40 @@ export class SidebarController {
     // A fresh render starts with no displayed rows; a too-small fallback never
     // establishes a displayable selection, so the saved-open guard stays closed.
     this.displayedSavedRows = undefined;
+    // Only a complete remote render below may re-establish a picker frame.
+    const previousCandidate = this.savedPickerCandidate;
+    this.savedPickerCandidate = undefined;
+    const remote = this.savedHost.kind === "remote" ? this.remoteSaved : undefined;
+    const remoteOption = remote === undefined ? undefined : this.currentSavedHostOption();
+    // The Host line is part of this picker only when a remote choice exists;
+    // otherwise every row below is exactly the existing Local layout.
+    const hostLine = this.savedHostLineShown();
+    if (!hostLine) this.savedHostFocused = false;
     const header = " Saved conversations ";
-    const queryLine = this.renderSavedQueryLine(cols);
+    const queryRow = hostLine ? 2 : 1;
+    const queryLine = this.renderSavedQueryLine(cols, queryRow);
+    // Delete hints follow the Local picker unchanged, and for a remote choice the
+    // OWNER's live delete exposure only (never this viewer's own settings).
+    const deleteHints = remote === undefined || remoteOption?.deleteExposed === true;
     const footerLines = wrapHintLines(
       [
         `${this.toggleLabel} toggle / ${this.savedKeyHint("tui.select.up", "up")}/${this.savedKeyHint("tui.select.down", "down")} select`,
         `${this.savedKeyHint("tui.select.confirm", "enter")} open / ${this.savedKeyHint("tui.select.cancel", "esc")} back`,
-        `${this.savedKeyHint("app.session.delete", "ctrl+d")} delete / ${this.savedKeyHint("app.session.deleteNoninvasive", "ctrl+backspace")} empty`,
+        ...(deleteHints
+          ? [`${this.savedKeyHint("app.session.delete", "ctrl+d")} delete / ${this.savedKeyHint("app.session.deleteNoninvasive", "ctrl+backspace")} empty`]
+          : []),
+        ...(hostLine ? ["shift+tab host"] : []),
       ],
       cols,
     );
-    const notices = [this.savedError, this.savedQueryNotice]
+    const notices = [this.savedError, ...(remote === undefined ? [] : [this.remoteSavedNotice]), this.savedQueryNotice]
       .filter((message, index, all): message is string => message !== undefined && all.indexOf(message) === index);
     const noticeLines = notices.length === 0 ? [] : wrapHintLines(notices.map((message) => `! ${message}`), cols);
-    const issueLines = this.pendingSavedList === undefined && this.savedIssueCount > 0
-      ? wrapHintLines([`${this.savedIssueCount} catalog issue(s) not shown`], cols)
+    const issueCount = remote === undefined
+      ? (this.pendingSavedList === undefined ? this.savedIssueCount : 0)
+      : remote.result?.issueCount ?? 0;
+    const issueLines = issueCount > 0
+      ? wrapHintLines([`${issueCount} catalog issue(s) not shown`], cols)
       : [];
     if (footerLines === undefined || noticeLines === undefined || issueLines === undefined
       || visibleWidth(header) > cols) {
@@ -7527,15 +9058,48 @@ export class SidebarController {
     }
     // The fixed details area is reserved between the list and the footer so
     // notices can never displace it or make an impossible action look done.
-    const fixedRows = 2 + SAVED_DETAILS_ROWS + noticeLines.length + issueLines.length + footerLines.length;
+    const hostRows = hostLine ? 1 : 0;
+    const fixedRows = hostRows + 2 + SAVED_DETAILS_ROWS + noticeLines.length + issueLines.length + footerLines.length;
     const listRows = rows - fixedRows;
     if (listRows < 1) {
       return this.renderTooSmall(cols, rows);
     }
+    this.savedLastListRows = listRows;
 
-    const lines: string[] = [wrapRow(header, cols, "\x1b[1m"), queryLine.line];
+    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
+    let hostRow: number | undefined;
+    let hostValueEnd = 0;
+    if (hostLine) {
+      // The New form's one Host line, reused: same marker/label style, value
+      // span, clipping, and drawn-geometry pointer target.
+      const hostPrefix = this.savedHostFocused ? `> ${NEW_FORM_HOST_PREFIX}` : `  ${NEW_FORM_HOST_PREFIX}`;
+      const hostPrefixWidth = Math.min(visibleWidth(hostPrefix), cols - 1);
+      const hostAvailable = Math.max(1, cols - hostPrefixWidth);
+      const label = this.savedHost.kind === "local"
+        ? NEW_FORM_LOCAL_HOST_LABEL
+        : remoteOption?.label ?? this.savedHost.label;
+      const hostValue = truncateToWidth(`[ ${label} ]`, hostAvailable, "...", true);
+      hostRow = lines.length;
+      hostValueEnd = hostPrefixWidth + Math.max(1, visibleWidth(hostValue));
+      lines.push(wrapRow(`${hostPrefix}${hostValue}`, cols));
+      if (this.savedPickerId !== undefined) {
+        this.formHostDisplay = Object.freeze({
+          pane: "saved" as const,
+          cols,
+          rows,
+          row: hostRow,
+          valueStart: hostPrefixWidth,
+          valueEnd: hostValueEnd,
+          optionKey: this.savedHostOptionsKey(),
+          formGeneration: this.savedPickerId,
+        });
+      }
+    }
+    lines.push(queryLine.line);
     let y = 0;
-    if (this.pendingSavedList !== undefined) {
+    if (remote !== undefined) {
+      y = this.renderRemoteSavedRows(remote, remoteOption, lines, listRows, cols, rows, previousCandidate);
+    } else if (this.pendingSavedList !== undefined) {
       lines.push(wrapRow(" Loading saved conversations... ", cols));
       y += 1;
     } else if (this.savedRows.length === 0) {
@@ -7550,7 +9114,7 @@ export class SidebarController {
         y += 1;
       }
     } else {
-      const top = this.savedScrollWindow(listRows);
+      const top = this.savedScrollWindow(listRows, this.savedRows.length);
       let index = top;
       const displayed: DisplayedSavedRow[] = [];
       while (index < this.savedRows.length && y < listRows) {
@@ -7570,9 +9134,15 @@ export class SidebarController {
     // Fixed details area for the highlighted row, updated in the same frame as
     // the list highlight. Empty (never a fabricated workspace) while loading,
     // empty, or failed; late listings are fenced by the pending request.
-    const selectedRow = this.pendingSavedList === undefined && this.savedRows.length > 0
-      ? this.savedRows[this.savedSelectedIndex]
-      : undefined;
+    // A remote selection's details stay blank until its actual owner row is
+    // cached; a loading placeholder never fabricates a caption or workspace.
+    const selectedRow = remote !== undefined
+      ? (remote.result !== undefined && remote.resultRead === undefined
+        ? this.remoteSavedRowAt(this.savedSelectedIndex)?.row
+        : undefined)
+      : this.pendingSavedList === undefined && this.savedRows.length > 0
+        ? this.savedRows[this.savedSelectedIndex]
+        : undefined;
     for (const detailLine of this.renderSavedDetails(selectedRow, cols)) {
       lines.push(wrapRow(detailLine, cols));
     }
@@ -7580,10 +9150,138 @@ export class SidebarController {
     for (const issueLine of issueLines) lines.push(wrapRow(issueLine, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
     for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols));
-    return { lines, cursor: queryLine.cursor };
+    return {
+      lines,
+      // While the Host line owns focus the hardware cursor belongs to it.
+      cursor: hostLine && this.savedHostFocused && hostRow !== undefined
+        ? { column: Math.min(hostValueEnd, cols - 1), row: hostRow }
+        : queryLine.cursor,
+    };
   }
 
-  private renderSavedQueryLine(cols: number): { readonly line: string; readonly cursor: { column: number; row: number } } {
+  /**
+   * The remote list body: the honest unusable/loading/empty state, or the drawn
+   * window of the owner result from the absolute scroll top. Each index is the
+   * cached owner row through the SAME row renderer as a local row, or a loading
+   * placeholder that is never a drawn (actionable) row. Empty is claimed only
+   * when the owner's FULL total is zero. A complete remote list with a result
+   * records the frame candidate (kept across identical redraws, so an ordinary
+   * repaint never revokes an earned writer receipt). Returns the rows used.
+   */
+  private renderRemoteSavedRows(
+    remote: RemoteSavedState,
+    option: SavedHostOption | undefined,
+    lines: string[],
+    listRows: number,
+    cols: number,
+    rows: number,
+    previousCandidate: SavedPickerCandidate | undefined,
+  ): number {
+    const result = remote.result;
+    const catalog = remote.catalog;
+    if (result === undefined || catalog === undefined) {
+      const unusable = this.remoteSavedUnusableText(option);
+      if (remote.resultRead !== undefined) {
+        lines.push(wrapRow(" Loading saved conversations... ", cols));
+        return 1;
+      }
+      if (unusable !== undefined) {
+        lines.push(wrapRow(` ${unusable} `, cols));
+        return 1;
+      }
+      if (this.savedError === undefined && this.remoteSavedNotice === undefined) {
+        lines.push(wrapRow(" Not loaded; edit the query or choose the host again ", cols));
+        return 1;
+      }
+      return 0;
+    }
+    if (result.total === 0) {
+      lines.push(wrapRow(
+        this.savedQuery.trim().length > 0 ? " No matching saved conversations "
+          : result.issueCount > 0 ? " No conversations could be listed " : " No saved conversations ",
+        cols,
+      ));
+      return 1;
+    }
+    if (this.savedSelectedIndex >= result.total) {
+      this.savedSelectedIndex = result.total - 1;
+      this.retireSavedViewAuthority();
+    }
+    const selected = this.savedSelectedIndex;
+    const top = this.savedScrollWindow(listRows, result.total);
+    const displayed: DisplayedSavedRow[] = [];
+    const drawn: { readonly paneRow: number; readonly index: number; readonly entryId: string }[] = [];
+    let y = 0;
+    for (let index = top; index < result.total && y < listRows; index += 1) {
+      const cached = this.remoteSavedRowAt(index);
+      if (cached === undefined) {
+        // A placeholder is not a row: no hit target, no details, no authority.
+        lines.push(wrapRow(`${index === selected ? "> " : "  "}loading...`, cols,
+          index === selected ? SGR_SELECTION_BLUE : undefined));
+      } else {
+        const identity: RemoteSavedRowIdentity = Object.freeze({
+          hostId: remote.hostId,
+          hostRunId: catalog.hostRunId,
+          catalogId: catalog.catalogId,
+          resultId: result.resultId,
+          entryId: cached.entryId,
+        });
+        displayed.push({ paneRow: lines.length, index, entry: cached.row, remote: identity });
+        drawn.push(Object.freeze({ paneRow: lines.length, index, entryId: cached.entryId }));
+        lines.push(this.renderSavedRow(cached.row, index === selected, cols));
+      }
+      y += 1;
+    }
+    let candidate: SavedPickerCandidate | undefined;
+    if (this.remoteSavedHostUsable(option) && option.hostRunId === catalog.hostRunId
+      && remote.resultRead === undefined && this.savedPickerId !== undefined) {
+      const deleteExposed = option.deleteExposed === true;
+      const selectedEntryId = this.remoteSavedRowAt(selected)?.entryId;
+      const identity = JSON.stringify([
+        this.savedViewEpoch, this.savedPickerId, this.savedQueryRevision, remote.hostId, catalog.hostRunId,
+        catalog.catalogId, result.resultId, result.total, selected, selectedEntryId ?? null,
+        deleteExposed, cols, rows, drawn.map((row) => [row.paneRow, row.index, row.entryId]),
+      ]);
+      if (previousCandidate !== undefined && previousCandidate.identity === identity) {
+        candidate = previousCandidate;
+      } else {
+        const token = this.savedPickerTokenSequence++;
+        candidate = {
+          token,
+          identity,
+          presentation: Object.freeze({
+            renderToken: token,
+            viewEpoch: this.savedViewEpoch,
+            pickerId: this.savedPickerId,
+            revision: this.savedQueryRevision,
+            hostId: remote.hostId,
+            hostRunId: catalog.hostRunId,
+            catalogId: catalog.catalogId,
+            resultId: result.resultId,
+            total: result.total,
+            selectedIndex: selected,
+            selectedEntryId,
+            deleteExposed,
+            cols,
+            rows,
+            drawn: Object.freeze(drawn),
+          }),
+          written: false,
+        };
+      }
+    }
+    this.savedPickerCandidate = candidate;
+    // Exact draw-derived remote rows, bound to the frame token that drew them.
+    this.displayedSavedRows = candidate === undefined
+      ? { cols, rows, entries: [] }
+      : { cols, rows, entries: displayed, renderToken: candidate.token };
+    return y;
+  }
+
+  private renderSavedQueryLine(
+    cols: number,
+    row = 1,
+  ): { readonly line: string; readonly cursor: { column: number; row: number } } {
     let rendered: string[];
     try { rendered = this.savedQueryInput?.render(cols) ?? []; } catch { rendered = []; }
     const source = rendered[0] ?? "";
@@ -7596,7 +9294,7 @@ export class SidebarController {
       line: wrapRow(safeLine, cols),
       cursor: {
         column: Math.min(visibleWidth(safeBefore), cols - 1),
-        row: 1,
+        row,
       },
     };
   }
@@ -7634,9 +9332,13 @@ export class SidebarController {
     return [...captionLines, ...workspaceLines];
   }
 
-  /** Keeps the keyboard-highlighted saved row visible inside the list window. */
-  private savedScrollWindow(listRows: number): number {
-    const maxTop = Math.max(0, this.savedRows.length - 1);
+  /**
+   * Keeps the keyboard-highlighted saved row visible inside the list window.
+   * `count` is the local row count or the remote owner's FULL result total; the
+   * top is absolute either way.
+   */
+  private savedScrollWindow(listRows: number, count: number): number {
+    const maxTop = Math.max(0, count - 1);
     let top = Math.min(Math.max(this.savedListTop, 0), maxTop);
     if (this.savedSelectedIndex < top) {
       top = this.savedSelectedIndex;
@@ -7720,7 +9422,11 @@ export class SidebarController {
   /** Confirmation is enabled only after the entire exact target and warning fit. */
   private renderSavedDeleteConfirmPane(cols: number, rows: number): { lines: string[] } {
     this.invalidateSavedDeleteConfirmationDisplay();
-    const context = this.savedDeleteTarget;
+    // One dialog for both targets: the local row, or the frozen REMOTE owner row
+    // with the same text, warnings, full-file-path fit, and safety guard, plus one
+    // annotation naming the owner host. Exactly one target exists at a time.
+    const remoteTarget = this.remoteSavedDeleteTarget;
+    const context = this.savedDeleteTarget ?? remoteTarget;
     const header = " Delete saved conversation? ";
     const hints = wrapHintLines([
       `${this.savedKeyHint("tui.select.confirm", "enter")} confirm`,
@@ -7743,7 +9449,16 @@ export class SidebarController {
     const captionWidth = cols - visibleWidth(captionPrefix);
     if (captionWidth < 1) return this.renderTooSmall(cols, rows);
     const visibleCaption = truncateToWidth(caption, captionWidth, "...", true);
-    const targetText = [`${captionPrefix}${visibleCaption}`, `Saved file: ${file}`];
+    const hostPrefix = "Host: ";
+    const hostLabelWidth = cols - visibleWidth(hostPrefix);
+    if (remoteTarget !== undefined && hostLabelWidth < 1) return this.renderTooSmall(cols, rows);
+    const targetText = [
+      `${captionPrefix}${visibleCaption}`,
+      ...(remoteTarget === undefined
+        ? []
+        : [`${hostPrefix}${truncateToWidth(sanitizeBounded(remoteTarget.hostLabel, PEER_LABEL_MAX_CODEPOINTS), hostLabelWidth, "...", true)}`]),
+      `Saved file: ${file}`,
+    ];
     const targetLines: string[] = [];
     const availableTargetRows = rows - 1 - warnings.length - hints.length;
     if (availableTargetRows < targetText.length) return this.renderTooSmall(cols, rows);

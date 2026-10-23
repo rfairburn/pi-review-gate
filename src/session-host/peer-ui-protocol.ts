@@ -12,6 +12,21 @@ export interface PeerUiConsent {
 	readonly expiresAt: number;
 }
 
+/**
+ * Descriptive Saved-history facts the coordinator observed for ONE destination.
+ * `supported` is true only when that owner negotiated the optional Saved catalog
+ * exchange on its current binding; `deleteExposed` is that OWNER's live
+ * remote-history delete exposure (`null` when unknown). Both are display facts
+ * only: they grant nothing, the owner re-checks its real policy and file guards on
+ * every request, and an absent value is never support or delete authority. This is
+ * never this viewer's own `remoteHistoryDeleteEnabled` (an owner setting for OTHER
+ * viewers) nor its `viewerNativeInputEnabled` (native pane input/copy only).
+ */
+export interface PeerUiHostSaved {
+	readonly supported: boolean;
+	readonly deleteExposed: boolean | null;
+}
+
 export interface PeerUiHost {
 	/** Local saved-destination handle. It is never a native instance id or identity. */
 	readonly id: string;
@@ -35,6 +50,14 @@ export interface PeerUiHost {
 		 */
 		readonly hostRunId?: string | null;
 	};
+	/**
+	 * Optional Saved-history capability and live owner delete-exposure description.
+	 * Absent (an older coordinator or fake) means NOT supported and no delete
+	 * exposure: the Saved picker does not offer this destination and requests
+	 * nothing from it. A present `supported: false` (a connected legacy owner) is
+	 * shown as an honest unsupported choice that is likewise never asked anything.
+	 */
+	readonly saved?: PeerUiHostSaved;
 }
 
 export interface PeerUiTrustedPeer {
@@ -110,6 +133,99 @@ export interface PeerConsentPresentation {
 	readonly decision: "approve" | "deny";
 	readonly renderToken: number;
 }
+
+/**
+ * Exact identity shared by every remote Saved picker intent: the open picker
+ * (`pickerId`, re-minted on every actual Host change), this intent's own
+ * `requestId`, the query `revision` it belongs to, the selected destination
+ * handle, and the exact owner run it names. Never a path or a local row id.
+ */
+export interface PeerSavedUiIntentBase {
+	readonly pickerId: number;
+	readonly requestId: number;
+	readonly revision: number;
+	readonly hostId: string;
+	readonly hostRunId: string;
+}
+
+/** Fresh owner listing (replaces the owner's catalog AND result). */
+export interface PeerSavedUiListIntent extends PeerSavedUiIntentBase {
+	readonly type: "saved-remote-list";
+	/** Exact query text; never trimmed or normalized. */
+	readonly query: string;
+	readonly offset: number;
+	readonly count: number;
+}
+
+/** Search inside one exact owner catalog (replaces the owner's result only). */
+export interface PeerSavedUiSearchIntent extends PeerSavedUiIntentBase {
+	readonly type: "saved-remote-search";
+	readonly catalogId: string;
+	readonly query: string;
+	readonly offset: number;
+	readonly count: number;
+}
+
+/** Another bounded window of the SAME owner result; never relists or remints ids. */
+export interface PeerSavedUiWindowIntent extends PeerSavedUiIntentBase {
+	readonly type: "saved-remote-window";
+	readonly catalogId: string;
+	readonly resultId: string;
+	readonly offset: number;
+	readonly count: number;
+}
+
+/**
+ * One deliberate destructive-class intent on one exact owner entry. `renderToken`
+ * is the ACTUAL drawn frame it came from: the picker frame for Resume and
+ * Delete-prepare, the written confirmation frame for Delete. Main must prove its
+ * own writer receipt for that token before anything is sent.
+ */
+export interface PeerSavedUiEntryIntentBase extends PeerSavedUiIntentBase {
+	readonly catalogId: string;
+	readonly resultId: string;
+	readonly entryId: string;
+	readonly renderToken: number;
+}
+
+export interface PeerSavedUiResumeIntent extends PeerSavedUiEntryIntentBase {
+	readonly type: "saved-remote-resume";
+}
+
+/** Owner prepare only (`confirmed: false` on the wire); never a confirmation. */
+export interface PeerSavedUiDeletePrepareIntent extends PeerSavedUiEntryIntentBase {
+	readonly type: "saved-remote-delete-prepare";
+}
+
+/** The one confirmed delete of the frozen, owner-prepared entry. */
+export interface PeerSavedUiDeleteIntent extends PeerSavedUiEntryIntentBase {
+	readonly type: "saved-remote-delete";
+}
+
+/**
+ * The remote picker identity stopped owning the pane (dismissal, an actual Host
+ * change, or a completed Resume). Main drops this picker's UNSENT read intent and
+ * private references only; accepted owner work is never cancelled or replayed.
+ */
+export interface PeerSavedUiDismissIntent {
+	readonly type: "saved-remote-dismiss";
+	readonly pickerId: number;
+	readonly hostId: string;
+}
+
+/**
+ * Remote Saved picker intents. They are intents only: no transport, manager,
+ * callback, or authority crosses this boundary, and none of them is ever a local
+ * `saved-*` action.
+ */
+export type PeerSavedUiAction =
+	| PeerSavedUiListIntent
+	| PeerSavedUiSearchIntent
+	| PeerSavedUiWindowIntent
+	| PeerSavedUiResumeIntent
+	| PeerSavedUiDeletePrepareIntent
+	| PeerSavedUiDeleteIntent
+	| PeerSavedUiDismissIntent;
 
 /** Owned exclusively by Main; no manager or raw transport/consent handle escapes. */
 export interface PeerCoordinator {

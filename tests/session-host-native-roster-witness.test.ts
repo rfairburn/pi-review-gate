@@ -56,6 +56,8 @@ function peerSnapshot(overrides: Partial<PeerUiSnapshot> = {}): PeerUiSnapshot {
       bindPort: 8443,
       autoReconnect: false,
       bellEnabled: true,
+      viewerNativeInputEnabled: true,
+      remoteHistoryDeleteEnabled: true,
     },
     identityFingerprint: "SHA256:local-identity",
     listener: { state: "off", host: null, port: null, message: null },

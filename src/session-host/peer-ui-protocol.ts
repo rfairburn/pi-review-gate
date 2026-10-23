@@ -51,6 +51,19 @@ export interface PeerUiSettings {
 	readonly bindPort: number | null;
 	readonly autoReconnect: boolean;
 	readonly bellEnabled: boolean;
+	/**
+	 * VIEWER side: whether THIS host's sidebar forwards keyboard, mouse, paste, and
+	 * text copies to the remote native pane it displays. Off affects only this
+	 * viewer; it never disconnects, revokes, changes Hosting/Auto, stops or cancels
+	 * owner work, or touches owner-local input/copy or any other viewer.
+	 */
+	readonly viewerNativeInputEnabled: boolean;
+	/**
+	 * OWNER side: whether THIS host exposes remote saved-history deletion to its
+	 * paired viewers. It is an owner policy fact, never a viewer-side delete
+	 * toggle, and it never gates this host's own local Saved deletion.
+	 */
+	readonly remoteHistoryDeleteEnabled: boolean;
 }
 
 export interface PeerUiSnapshot {
@@ -77,6 +90,10 @@ export type PeerUiCommand =
 	| { readonly type: "peer-listener"; readonly enabled: boolean; readonly host: string; readonly port: string }
 	| { readonly type: "peer-auto-reconnect"; readonly enabled: boolean }
 	| { readonly type: "peer-bell"; readonly enabled: boolean }
+	/** Viewer-side remote native input/copy for this sidebar's displayed remote pane. */
+	| { readonly type: "peer-viewer-native-input"; readonly enabled: boolean }
+	/** Owner-side policy: expose remote saved-history deletion to paired viewers. */
+	| { readonly type: "peer-remote-history-delete"; readonly enabled: boolean }
 	| { readonly type: "peer-add"; readonly label: string; readonly host: string; readonly port: string }
 	| { readonly type: "peer-connect"; readonly hostId: string }
 	| { readonly type: "peer-disconnect"; readonly hostId: string }

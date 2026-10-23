@@ -39,6 +39,7 @@ import type {
   PeerNativeInputRequest,
   PeerNativeInputTarget,
   PeerSelectedContent,
+  PeerViewerNativeInputPolicy,
 } from "./network/peer-content";
 import type { NativeInputSendResult } from "./network/session-content-client";
 import {
@@ -184,6 +185,13 @@ const REMOTE_INPUT_NOT_SENT_MESSAGE = "Remote input was refused; nothing was sen
 const REMOTE_INPUT_PASTE_TOO_LARGE_MESSAGE = "That paste is larger than a remote session accepts; nothing was sent";
 const REMOTE_INPUT_UNCERTAIN_MESSAGE =
   "UNCERTAIN: remote input may have been handed off; outcome unknown";
+/**
+ * This viewer's saved Network-menu preference is Off (or its settings are
+ * unavailable). Nothing was sent, and nothing about the connection, the owner, or
+ * any other viewer changed.
+ */
+const REMOTE_INPUT_VIEWER_OFF_MESSAGE =
+  "Remote input/copy is off for this viewer; nothing was sent to the remote session";
 /** Exact outer brackets of one complete host-delivered bracketed paste packet. */
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
@@ -299,6 +307,13 @@ interface WrittenRemoteNativeInput {
    * other host UI.
    */
   readonly resizeEpoch: number;
+  /**
+   * Viewer remote input/copy preference generation this frame was composed under.
+   * Every actual preference change (including Off -> On) advances the live
+   * generation, so a receipt written before it never authorizes again: enabling
+   * needs a fresh actually-written frame even when its pixels are identical.
+   */
+  readonly policyGeneration: number;
 }
 
 interface MouseFramePresentation {
@@ -672,14 +687,14 @@ interface MainDependencies {
   readonly createObserver: (options: ConstructorParameters<typeof KeyboardCapabilityObserver>[0]) => MainObserver;
   readonly createWriter: (output: Writable, options: Parameters<typeof createSessionHostFrameWriter>[1]) => MainWriter;
   /**
-   * Internal, default-off opt-in for the closed native input-framing mode of this
-   * host's owned children, plus the remote native input/text-copy integration for
-   * the ONE selected remote viewport. Only an explicit `true` supplies the
-   * coordinator's dynamic callbacks and forwards the existing manager option to
-   * children created later by this host; the legacy call shape, the display-only
-   * remote path, local input, and the local clipboard route are byte-for-byte
-   * unchanged otherwise. It is not a CLI flag, setting, public option, permission,
-   * grant, lease, or activation.
+   * Dependency-only legacy test seam for the closed native input-framing mode of
+   * this host's owned children plus the native IO bridge of the ONE selected
+   * remote viewport. Absent (production) means ON: children created by this host
+   * get the existing manager framing option and the coordinator gets its dynamic
+   * callbacks. Only an explicit `false` keeps the legacy display-only call shape.
+   * It is not a CLI flag, setting, public option, permission, grant, lease, or
+   * activation, and it is independent of the saved viewer-side remote input/copy
+   * preference, which never changes framing or the owner capability.
    */
   readonly nativeInputOriginFraming?: boolean;
   readonly runExternalEditor: typeof runNativeExternalEditor;
@@ -901,6 +916,7 @@ function nativeIoReceiptKey(receipt: WrittenRemoteNativeInput | undefined): stri
     modes.mouseTracking, modes.modifyOtherKeys, modes.mouseEncoding,
     rect.column, rect.row, rect.cols, rect.rows,
     receipt.resizeEpoch,
+    receipt.policyGeneration,
   ]);
 }
 
@@ -1302,11 +1318,16 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   /** The accepted remote viewport, dropped the moment it stops being current. */
   let remoteContentView: AcceptedRemoteContent | undefined;
   /**
-   * Internal, default-off opt-in for remote native input and text copies. Read once
-   * from the injected dependencies; nothing in this host turns it on, and an
-   * absent/false value keeps the exact legacy display-only path.
+   * Immutable native IO bridge support for this host's whole lifetime, ON by
+   * default: owned children use strict authenticated input-origin framing, the
+   * one coordinator always gets its dynamic native IO callbacks (so the owner
+   * side's capability never depends on this host's viewer preference), and the
+   * viewer forwarding path exists. Only the explicit dependency-only `false` test
+   * seam keeps the legacy display-only path. Whether THIS viewer actually forwards
+   * input/copy to its displayed remote pane is the separate, mutable, saved viewer
+   * preference, re-read for every protected attempt.
    */
-  const remoteNativeInputEnabled = dependencies.nativeInputOriginFraming === true;
+  const nativeIoBridgeEnabled = dependencies.nativeInputOriginFraming !== false;
   /**
    * Monotonic remote native IO geometry epoch, advanced by every outer resize.
    *
@@ -1563,6 +1584,39 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       : undefined;
   }
 
+  /**
+   * The live viewer-side remote input/copy preference of the ONE coordinator, read
+   * fresh on every call (never cached). `undefined` means no viewer forwarding
+   * exists at all: the legacy explicit-false bridge seam, no coordinator or
+   * content controller, a controller without the policy reader, or a read that
+   * threw or was malformed. `enabled: false` is a known Off (or unavailable saved
+   * settings, which the coordinator reports as Off).
+   */
+  function readViewerInputPolicy(): PeerViewerNativeInputPolicy | undefined {
+    if (!nativeIoBridgeEnabled) return undefined;
+    const content = contentController();
+    if (content === undefined || typeof content.readViewerNativeInputPolicy !== "function") return undefined;
+    try {
+      const policy: unknown = content.readViewerNativeInputPolicy();
+      if (policy === null || typeof policy !== "object") return undefined;
+      const record = policy as Record<string, unknown>;
+      const enabled = record.enabled;
+      const generation = record.generation;
+      if (typeof enabled !== "boolean" || typeof generation !== "number" || !Number.isSafeInteger(generation)) {
+        return undefined;
+      }
+      return { enabled, generation };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The current ENABLED viewer policy, or undefined while forwarding is off/absent. */
+  function enabledViewerInputPolicy(): PeerViewerNativeInputPolicy | undefined {
+    const policy = readViewerInputPolicy();
+    return policy?.enabled === true ? policy : undefined;
+  }
+
   /** The accepted remote viewport, only while it still matches the deliberate target. */
   function currentRemoteContentView(): AcceptedRemoteContent | undefined {
     const view = remoteContentView;
@@ -1609,7 +1663,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     releaseSelectedContent();
     // Releasing the remote source returns pointer capture to the ordinary host
     // path; nothing is submitted without a written remote source.
-    if (remoteNativeInputEnabled) syncOuterMouseModes();
+    if (nativeIoBridgeEnabled) syncOuterMouseModes();
   }
 
   /**
@@ -1712,7 +1766,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     remoteContentView = undefined;
     // A retired or not-yet-current view stops defining pointer capture, so the
     // ordinary host path resumes until this owner publishes again.
-    if (remoteNativeInputEnabled) syncOuterMouseModes();
+    if (nativeIoBridgeEnabled) syncOuterMouseModes();
     if (observation.state === "connecting" || observation.state === "current") {
       remoteContentStatus = { state: "waiting", message: REMOTE_CONTENT_WAITING_MESSAGE };
       scheduleRedraw();
@@ -1837,7 +1891,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     remoteContentStatus = undefined;
     // A freshly published view's own retained reporting mode (including a
     // mode-only change) is what the outer capture must follow.
-    if (remoteNativeInputEnabled) syncOuterMouseModes();
+    if (nativeIoBridgeEnabled) syncOuterMouseModes();
     // A published viewport is the only reason this frame appears: an arriving
     // frame repaints on its own, with no keyboard, roster, or resize event.
     scheduleRedraw();
@@ -1987,12 +2041,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         onChange: updatePeerUi,
         onIncomingConsentArrival: attemptIncomingPeerBell,
         onContentChange: handleContentChange,
-        // Only an explicit internal opt-in supplies these callbacks. Each one is a
-        // DYNAMIC re-proof of Main's current written/uncovered/focused source on
-        // every protected write or completed copy; supplying them is not a
-        // permission, and omitting them keeps the exact legacy display-only
-        // coordinator with no native capability offered anywhere.
-        ...(remoteNativeInputEnabled ? {
+        // The bridge is on by default, so these callbacks are always supplied (only
+        // the dependency-only explicit-false seam omits them). They are fixed for the
+        // coordinator's lifetime, which keeps the owner side's inbound capability
+        // independent of this host's own viewer preference. Each one is a DYNAMIC
+        // re-proof of Main's current written/uncovered/focused source AND the
+        // current viewer preference on every protected write or completed copy;
+        // supplying them is not a permission.
+        ...(nativeIoBridgeEnabled ? {
           nativeIo: {
             authorizeInput: authorizeRemoteNativeInput,
             onCopy: handleRemoteNativeCopy,
@@ -2130,10 +2186,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // pointer for THAT owner's own retained reporting mode: a drag/any gesture,
     // and every gesture in a narrow or hidden-sidebar Main pane, has to reach the
     // written-source gate instead of being limited to (or losing) the host's
-    // press-only capture. Only an explicit opt-in with a current remote view
-    // changes anything; local rows and the legacy display-only path keep their
-    // exact capture, and packet forwarding stays gated per attempt.
-    if (remoteNativeInputEnabled && sidebar.focus === "main") {
+    // press-only capture. Only the bridge plus this viewer's CURRENT enabled
+    // preference with a current remote view changes anything; local rows, a
+    // viewer that turned remote input/copy Off, and the legacy display-only path
+    // keep their exact capture, and packet forwarding stays gated per attempt.
+    if (enabledViewerInputPolicy() !== undefined && sidebar.focus === "main") {
       const remoteModes = currentRemoteContentView()?.inputModes;
       if (remoteModes !== undefined
         && remoteModes.mouseTracking !== "none"
@@ -2247,7 +2304,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // Copied into the candidate receipt below; never re-read from a newer view.
         const drawnInputSource = remoteDrawn?.view.inputSource;
         const drawnInputModes = remoteDrawn?.view.inputModes;
-        const nativeIoReceipt: WrittenRemoteNativeInput | undefined = remoteNativeInputEnabled
+        // A candidate receipt exists only while this viewer's remote input/copy
+        // preference is currently ON, and it carries that preference's generation:
+        // turning it Off retires the receipt at the next frame, and turning it back
+        // On mints a different receipt that needs its own actually-written frame.
+        const inputPolicy = remoteDrawn === undefined ? undefined : enabledViewerInputPolicy();
+        const nativeIoReceipt: WrittenRemoteNativeInput | undefined = inputPolicy !== undefined
           && remoteDrawn !== undefined && drawnInputSource !== undefined && drawnInputModes !== undefined
           ? Object.freeze({
             hostId: remoteDrawn.view.hostId,
@@ -2265,6 +2327,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
               rows: remoteDrawn.rect.rows,
             }),
             resizeEpoch: remoteInputEpoch,
+            policyGeneration: inputPolicy.generation,
           })
           : undefined;
         // The graphics layer's owner key distinguishes the actual source. A local
@@ -3082,7 +3145,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     readonly source: NativeIoSource;
     readonly inputModes?: TerminalInputModes;
   }): WrittenRemoteNativeInput | undefined {
-    if (!remoteNativeInputEnabled || shutdownRequested || externalEditorActive) return undefined;
+    if (!nativeIoBridgeEnabled || shutdownRequested || externalEditorActive) return undefined;
     if (terminal === undefined || !terminalStarted || sidebar === undefined) return undefined;
     if (sidebar.focus !== "main") return undefined;
     const shown = displayedMousePresentation;
@@ -3095,6 +3158,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // is repainted) revokes the written receipt until a post-resize frame is
     // actually written.
     if (receipt.resizeEpoch !== remoteInputEpoch) return undefined;
+    // This viewer's remote input/copy preference must be ON right now, and still
+    // the exact preference generation the written frame was composed under: Off
+    // refuses, and an Off -> On return never revives a receipt written before it.
+    const policy = enabledViewerInputPolicy();
+    if (policy === undefined || receipt.policyGeneration !== policy.generation) return undefined;
     // Physical Main focus on the actually written frame AND on the latest candidate.
     if (shown.focus !== "main" || latest.focus !== "main") return undefined;
     // Actual coverage, not overlay capability: an overlay-capable layout with Main
@@ -3167,6 +3235,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   /**
+   * One brief fixed notice when THIS viewer's saved remote input/copy preference
+   * is known Off: nothing is submitted, and nothing about the connection, owner,
+   * Hosting/Auto, or any other viewer changes. True when the attempt was refused.
+   */
+  function refuseWhileViewerInputOff(): boolean {
+    if (readViewerInputPolicy()?.enabled !== false) return false;
+    showRemoteInputNotice(REMOTE_INPUT_VIEWER_OFF_MESSAGE);
+    return true;
+  }
+
+  /**
    * Submit ONE caller-normalized remote input against the actual-written receipt.
    *
    * Only a local refusal (before any submission) may say nothing was sent. Once
@@ -3177,7 +3256,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    */
   function submitRemoteNativeInput(kind: NativeIoInputKind, text: string): void {
     try {
-      if (!remoteNativeInputEnabled) return;
+      if (!nativeIoBridgeEnabled) return;
+      if (refuseWhileViewerInputOff()) return;
       const written = displayedMousePresentation?.nativeInput;
       if (written === undefined) {
         showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
@@ -3253,7 +3333,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    */
   function routeRemoteForward(data: string): void {
     try {
-      if (!remoteNativeInputEnabled || terminal === undefined) return;
+      if (!nativeIoBridgeEnabled || terminal === undefined) return;
+      if (refuseWhileViewerInputOff()) return;
       if (data.startsWith(BRACKETED_PASTE_START)) {
         if (!data.endsWith(BRACKETED_PASTE_END)
           || data.length < BRACKETED_PASTE_START.length + BRACKETED_PASTE_END.length) return;
@@ -3283,7 +3364,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    */
   function routeRemoteMouseInput(mouse: ParsedMouseInput): void {
     try {
-      if (!remoteNativeInputEnabled) return;
+      if (!nativeIoBridgeEnabled) return;
+      if (refuseWhileViewerInputOff()) return;
       const written = displayedMousePresentation?.nativeInput;
       if (written === undefined) {
         showRemoteInputNotice(REMOTE_INPUT_NOT_SENT_MESSAGE);
@@ -3335,11 +3417,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * last-input counter participates, so an asynchronously later copy from an
    * earlier input is still delivered when it belongs to the same current scope.
    * Nothing is broadcast, relayed raw, written to the owner/local clipboard route,
-   * or replayed after the source moves.
+   * or replayed after the source moves. While this viewer's remote input/copy
+   * preference is Off no clipboard write is requested; nothing owner-side is
+   * cancelled by that, and an older copy is not fenced out by a newer dispatch.
    */
   function handleRemoteNativeCopy(receipt: PeerNativeCopyReceipt): void {
     try {
-      if (!remoteNativeInputEnabled || terminal === undefined) return;
+      if (!nativeIoBridgeEnabled || terminal === undefined) return;
       const source = receipt.source;
       const event = receipt.event;
       // Validate the producer's own native tuple against the source it rode with.
@@ -3460,8 +3544,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   function routeForward(data: string): void {
     if (!terminal || !sidebar || sidebar.focus !== "main" || shutdownRequested || externalEditorActive) return;
     // A deliberately selected remote viewport never falls back to a local row.
-    // With the internal opt-in it routes one caller-normalized native submission to
-    // that exact selected stream; without it the legacy display-only drop stands.
+    // With the default bridge it routes one caller-normalized native submission to
+    // that exact selected stream while this viewer's preference is on (Off is a
+    // brief fixed refusal); the explicit-false legacy seam keeps the silent drop.
     if (contentTarget?.kind === "remote") {
       routeRemoteForward(data);
       return;
@@ -3572,10 +3657,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // activate a draw-derived row.
       return;
     }
-    // A written remote viewport is display-only unless the internal native IO
-    // opt-in supplied its dynamic callbacks: then a Main-focused pointer packet is
-    // submitted as one canonical content-space SGR report for the exact written
-    // source. A deliberately selected remote target whose new viewport is not
+    // A written remote viewport is display-only under the explicit-false legacy
+    // seam or while this viewer's remote input/copy preference is Off; otherwise a
+    // Main-focused pointer packet is submitted as one canonical content-space SGR
+    // report for the exact written source. A deliberately selected remote target whose new viewport is not
     // written yet has no pointer authority either — its packet is refused rather
     // than reinterpreted as keyboard input or forwarded to a local row. A
     // roster-focused packet keeps the existing non-activating drop.
@@ -5326,6 +5411,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       case "peer-listener":
       case "peer-auto-reconnect":
       case "peer-bell":
+      // Viewer remote input/copy and the owner history-deletion policy are saved
+      // settings like the bell: Main forwards the drawn intent and the coordinator
+      // persists it. Neither restarts, disconnects, or reconnects anything here.
+      case "peer-viewer-native-input":
+      case "peer-remote-history-delete":
       case "peer-add":
       case "peer-connect":
       case "peer-disconnect":
@@ -6161,9 +6251,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // the created row; manager onChange only refreshes the roster.
       onSpawnRequest: (parentInstanceId, request) => hostService.spawnRequestedChild(parentInstanceId, request),
       getSidebarTitleColumns: sidebarTitleColumnsSnapshot,
-      // Explicit internal opt-in only; the legacy manager call shape (and every
-      // existing child it creates) is unchanged when the option is absent.
-      ...(remoteNativeInputEnabled ? { nativeInputOriginFraming: true } : {}),
+      // Strict authenticated input-origin framing for every child this host
+      // creates, ON by default and immutable for the host's lifetime. The viewer
+      // preference never toggles it; only the dependency-only explicit-false test
+      // seam keeps the legacy manager call shape.
+      ...(nativeIoBridgeEnabled ? { nativeInputOriginFraming: true } : {}),
     });
     writer = createFrameWriter();
 

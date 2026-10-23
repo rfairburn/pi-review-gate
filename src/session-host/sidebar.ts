@@ -849,6 +849,8 @@ type PeerActionRowKind =
   | "apply-hosting"
   | "toggle-auto"
   | "toggle-bell"
+  | "toggle-viewer-input"
+  | "toggle-history-delete"
   | "add-host"
   | "edit-add-label"
   | "edit-add-host"
@@ -1782,11 +1784,24 @@ function copyPeerSettings(value: unknown): PeerUiSettings | null {
   const hostingEnabled = displayBoolean(source.hostingEnabled);
   const autoReconnect = displayBoolean(source.autoReconnect);
   const bellEnabled = displayBoolean(source.bellEnabled);
+  const viewerNativeInputEnabled = displayBoolean(source.viewerNativeInputEnabled);
+  const remoteHistoryDeleteEnabled = displayBoolean(source.remoteHistoryDeleteEnabled);
   const bindHost = displayText(source.bindHost);
   const bindPort = source.bindPort === null ? null : displayPort(source.bindPort);
+  // Every setting is a real boolean or the whole settings fact is unknown: a
+  // missing flag is never displayed (or acted on) as its default.
   if (hostingEnabled === undefined || autoReconnect === undefined || bellEnabled === undefined
+    || viewerNativeInputEnabled === undefined || remoteHistoryDeleteEnabled === undefined
     || bindHost === undefined || bindPort === undefined) return null;
-  return { hostingEnabled, bindHost, bindPort, autoReconnect, bellEnabled };
+  return {
+    hostingEnabled,
+    bindHost,
+    bindPort,
+    autoReconnect,
+    bellEnabled,
+    viewerNativeInputEnabled,
+    remoteHistoryDeleteEnabled,
+  };
 }
 
 function copyPeerRosterRow(value: unknown): PeerRosterRow | null {
@@ -5922,6 +5937,10 @@ export class SidebarController {
         return [kind, known, settings?.autoReconnect ?? null];
       case "toggle-bell":
         return [kind, known, settings?.bellEnabled ?? null];
+      case "toggle-viewer-input":
+        return [kind, known, settings?.viewerNativeInputEnabled ?? null];
+      case "toggle-history-delete":
+        return [kind, known, settings?.remoteHistoryDeleteEnabled ?? null];
       // Opening the menu shows the whole draft, so the whole draft is its intent.
       case "add-host":
       case "apply-add":
@@ -5950,6 +5969,8 @@ export class SidebarController {
       "apply-hosting",
       "toggle-auto",
       "toggle-bell",
+      "toggle-viewer-input",
+      "toggle-history-delete",
       "add-host",
     ] as const).map((kind) => ({ key: kind, kind, intent: this.peerPaneRowIntent(kind) }));
     const snapshot = this.peerUiSnapshot;
@@ -6073,6 +6094,10 @@ export class SidebarController {
         return `Auto reconnect: ${settings === null ? "unknown" : settings.autoReconnect ? "on" : "off"} (enter to toggle)`;
       case "toggle-bell":
         return `Incoming bell: ${settings === null ? "unknown" : settings.bellEnabled ? "on" : "off"} (enter to toggle)`;
+      case "toggle-viewer-input":
+        return `Remote input/copy: ${settings === null ? "unknown" : settings.viewerNativeInputEnabled ? "on" : "off"} (enter to toggle)`;
+      case "toggle-history-delete":
+        return `Allow remote history deletion: ${settings === null ? "unknown" : settings.remoteHistoryDeleteEnabled ? "on" : "off"} (enter to toggle)`;
       case "add-host":
         return "Add destination";
       case "edit-add-label":
@@ -6335,6 +6360,32 @@ export class SidebarController {
       case "toggle-bell":
         this.emit({ type: "peer-bell", enabled: settings?.bellEnabled !== true });
         this.peerPaneNotice = "Bell change requested; the coordinator reports the saved setting";
+        this.peerPaneError = undefined;
+        this.onInvalidate?.();
+        return;
+      case "toggle-viewer-input":
+        // Viewer side only: this sidebar's own remote pane. The drawn known state
+        // is required, so an unknown or unavailable settings fact sends nothing.
+        if (settings === null) {
+          this.peerPaneError = "Network settings are unavailable; no remote input/copy change was sent";
+          this.onInvalidate?.();
+          return;
+        }
+        this.emit({ type: "peer-viewer-native-input", enabled: !settings.viewerNativeInputEnabled });
+        this.peerPaneNotice = "Remote input/copy change requested for this viewer only; the coordinator reports the saved setting";
+        this.peerPaneError = undefined;
+        this.onInvalidate?.();
+        return;
+      case "toggle-history-delete":
+        // Owner side only: what this host exposes to its paired viewers. It never
+        // changes local Saved deletion here.
+        if (settings === null) {
+          this.peerPaneError = "Network settings are unavailable; no history deletion change was sent";
+          this.onInvalidate?.();
+          return;
+        }
+        this.emit({ type: "peer-remote-history-delete", enabled: !settings.remoteHistoryDeleteEnabled });
+        this.peerPaneNotice = "Remote history deletion policy change requested for this host; the coordinator reports the saved setting";
         this.peerPaneError = undefined;
         this.onInvalidate?.();
         return;

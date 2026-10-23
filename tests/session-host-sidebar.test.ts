@@ -30,7 +30,7 @@ import {
   SidebarController,
 } from "../src/session-host/sidebar";
 import { createSessionHostTextField } from "../src/session-host/field-editor";
-import type { PeerUiHost, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
+import type { PeerUiHost, PeerUiSettings, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 
 const SGR_PATTERN = /\x1b\[[0-9;]*m/g;
 const ALT_LEFT_LEGACY = "\x1b[1;3D";
@@ -4202,4 +4202,148 @@ test("a destination run or connection transition retires the drawn receipt for g
   queued.controller.completeCreateOnPeer(submitted[0]!.requestId, { hostRunId: "run-a", rowId: "row-a" });
   assert.equal(queued.focusedActions().some((action) => action.type === "select-remote"), false,
     "a late started reply never selects from a retired receipt");
+});
+
+// ---------------------------------------------------------------------------
+// Network menu: viewer Remote input/copy and owner remote history deletion
+// ---------------------------------------------------------------------------
+
+const NETWORK_COLS = 100;
+const NETWORK_ROWS = 30;
+
+function networkSettings(overrides: Partial<PeerUiSettings> = {}): PeerUiSettings {
+  return {
+    hostingEnabled: false,
+    bindHost: "",
+    bindPort: null,
+    autoReconnect: false,
+    bellEnabled: true,
+    viewerNativeInputEnabled: true,
+    remoteHistoryDeleteEnabled: true,
+    ...overrides,
+  };
+}
+
+function networkSnapshot(settings: PeerUiSettings | null, revision = 1): PeerUiSnapshot {
+  return {
+    revision,
+    status: "ready",
+    settings,
+    identityFingerprint: null,
+    listener: { state: "off", host: null, port: null, message: null },
+    hosts: [],
+    trustedPeers: [],
+    consents: [],
+    notice: null,
+  };
+}
+
+function networkPane(settings: PeerUiSettings | null): Harness {
+  const harness = makeController();
+  harness.controller.setPeerUiSnapshot(networkSnapshot(settings));
+  harness.controller.openPeerMenu();
+  assert.equal(harness.controller.focus, "form");
+  harness.baseline = harness.actions.length;
+  return harness;
+}
+
+function networkTexts(harness: Harness): string[] {
+  return assertPaneSafe(harness.controller.render(NETWORK_COLS, NETWORK_ROWS).lines, NETWORK_COLS, NETWORK_ROWS);
+}
+
+/** Moves the Network highlight onto the drawn row with this label, using real keys only. */
+function highlightNetworkRow(harness: Harness, label: string): string[] {
+  for (let step = 0; step < 20; step += 1) {
+    const texts = networkTexts(harness);
+    if (texts.find((line) => line.startsWith("> "))?.includes(label)) return texts;
+    harness.send(DOWN);
+  }
+  assert.fail(`the Network pane never drew ${label} as its highlight`);
+}
+
+function peerActions(harness: Harness): SidebarAction[] {
+  return harness.sinceActions().filter((action) => action.type.startsWith("peer-"));
+}
+
+test("Network shows distinct viewer Remote input/copy and owner history-deletion rows after the bell", () => {
+  const harness = networkPane(networkSettings());
+  const texts = networkTexts(harness);
+  const bell = texts.findIndex((line) => line.includes("Incoming bell: on"));
+  const viewer = texts.findIndex((line) => line.includes("Remote input/copy: on (enter to toggle)"));
+  const history = texts.findIndex((line) => line.includes("Allow remote history deletion: on (enter to toggle)"));
+  const add = texts.findIndex((line) => line.includes("Add destination"));
+  assert.ok(bell > 0 && viewer === bell + 1 && history === viewer + 1 && add === history + 1,
+    `unexpected Network row order: ${JSON.stringify(texts)}`);
+
+  highlightNetworkRow(harness, "Remote input/copy");
+  harness.send(ENTER);
+  assert.deepEqual(peerActions(harness), [{ type: "peer-viewer-native-input", enabled: false }],
+    "the viewer row toggles only this viewer's remote input/copy");
+
+  highlightNetworkRow(harness, "Allow remote history deletion");
+  harness.send(ENTER);
+  assert.deepEqual(peerActions(harness), [
+    { type: "peer-viewer-native-input", enabled: false },
+    { type: "peer-remote-history-delete", enabled: false },
+  ], "the owner policy row is a separate action, never a viewer delete toggle");
+  assert.equal(peerActions(harness).some((action) => action.type === "peer-bell"), false);
+});
+
+test("each Network flag row sends the opposite of the drawn saved value", () => {
+  const harness = networkPane(networkSettings({ viewerNativeInputEnabled: false, remoteHistoryDeleteEnabled: false }));
+  const texts = networkTexts(harness);
+  assert.ok(texts.some((line) => line.includes("Remote input/copy: off (enter to toggle)")));
+  assert.ok(texts.some((line) => line.includes("Allow remote history deletion: off (enter to toggle)")));
+  highlightNetworkRow(harness, "Remote input/copy");
+  harness.send(ENTER);
+  highlightNetworkRow(harness, "Allow remote history deletion");
+  harness.send(ENTER);
+  assert.deepEqual(peerActions(harness), [
+    { type: "peer-viewer-native-input", enabled: true },
+    { type: "peer-remote-history-delete", enabled: true },
+  ]);
+});
+
+test("a Network flag toggle whose drawn value changed behind the frame sends nothing", () => {
+  const harness = networkPane(networkSettings());
+  highlightNetworkRow(harness, "Remote input/copy");
+  // The saved value changes after the frame that drew "on", with no new render.
+  harness.controller.setPeerUiSnapshot(networkSnapshot(networkSettings({ viewerNativeInputEnabled: false }), 2));
+  harness.send(ENTER);
+  assert.deepEqual(peerActions(harness), [], "a stale drawn intent never toggles the opposite value");
+  assert.ok(networkTexts(harness).some((line) => line.includes("The network pane changed")));
+
+  // A pointer press captured from the older drawn frame is refused the same way.
+  const history = networkPane(networkSettings());
+  const drawn = networkTexts(history);
+  const row = drawn.findIndex((line) => line.includes("Allow remote history deletion"));
+  assert.ok(row > 0);
+  const presentation = history.controller.captureMousePresentation();
+  history.controller.setPeerUiSnapshot(networkSnapshot(networkSettings({ remoteHistoryDeleteEnabled: false }), 2));
+  assert.equal(presentation.activatePeerAt(2, row, NETWORK_COLS, NETWORK_ROWS), false);
+  assert.deepEqual(peerActions(history), []);
+  // The current written row acts once, through the ordinary Enter routine.
+  const current = networkTexts(history);
+  const currentRow = current.findIndex((line) => line.includes("Allow remote history deletion: off"));
+  assert.ok(currentRow > 0);
+  assert.equal(history.controller.captureMousePresentation().activatePeerAt(2, currentRow, NETWORK_COLS, NETWORK_ROWS), true);
+  assert.deepEqual(peerActions(history), [{ type: "peer-remote-history-delete", enabled: true }]);
+});
+
+test("unknown settings, or settings missing a flag, show unknown and send no flag change", () => {
+  for (const settings of [
+    null,
+    { ...networkSettings(), viewerNativeInputEnabled: undefined } as unknown as PeerUiSettings,
+    { ...networkSettings(), remoteHistoryDeleteEnabled: "true" } as unknown as PeerUiSettings,
+  ]) {
+    const harness = networkPane(settings);
+    const texts = networkTexts(harness);
+    assert.ok(texts.some((line) => line.includes("Remote input/copy: unknown")), JSON.stringify(texts));
+    assert.ok(texts.some((line) => line.includes("Allow remote history deletion: unknown")));
+    highlightNetworkRow(harness, "Remote input/copy");
+    harness.send(ENTER);
+    highlightNetworkRow(harness, "Allow remote history deletion");
+    harness.send(ENTER);
+    assert.deepEqual(peerActions(harness), [], "an unknown setting is never toggled to a guessed value");
+  }
 });

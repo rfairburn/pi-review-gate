@@ -58,8 +58,24 @@ function samplePreferences(): PeerPreferences {
 		hosting: { enabled: true, bindHost: "127.0.0.1", bindPort: 40_000 },
 		autoReconnect: true,
 		bellEnabled: false,
+		viewerNativeInputEnabled: true,
+		remoteHistoryDeleteEnabled: true,
 		destinations: [destination("alpha"), destination("beta", { reconnectSuppressed: true })],
 	};
+}
+
+/**
+ * A complete, valid version-1 document exactly as a build from before the two
+ * optional default-on flags existed wrote it: neither flag key is present.
+ */
+function legacyDocumentText(): string {
+	return `${JSON.stringify({
+		version: 1,
+		hosting: { enabled: false, bindHost: "127.0.0.1", bindPort: 40_000 },
+		autoReconnect: true,
+		bellEnabled: false,
+		destinations: [destination("alpha")],
+	})}\n`;
 }
 
 function writeRawDocument(fixture: AgentDirFixture, text: string): string {
@@ -83,12 +99,15 @@ test("an absent document reads as null and creates no directory, file, key, or s
 	store.close();
 });
 
-test("defaults are frozen and off except the bell", () => {
+test("defaults are frozen: hosting and Auto off; bell, remote input/copy, and history deletion on", () => {
 	assert.equal(Object.isFrozen(DEFAULT_PEER_PREFERENCES), true);
 	assert.equal(Object.isFrozen(DEFAULT_PEER_PREFERENCES.hosting), true);
 	assert.equal(DEFAULT_PEER_PREFERENCES.hosting.enabled, false);
 	assert.equal(DEFAULT_PEER_PREFERENCES.autoReconnect, false);
 	assert.equal(DEFAULT_PEER_PREFERENCES.bellEnabled, true);
+	// A genuinely new installation is default ON for both deliberately changed flags.
+	assert.equal(DEFAULT_PEER_PREFERENCES.viewerNativeInputEnabled, true);
+	assert.equal(DEFAULT_PEER_PREFERENCES.remoteHistoryDeleteEnabled, true);
 	const validated = validatePeerPreferences(DEFAULT_PEER_PREFERENCES);
 	assert.notEqual(validated, DEFAULT_PEER_PREFERENCES);
 	assert.equal(Object.isFrozen(validated), true);
@@ -116,6 +135,8 @@ test("a saved document is protected before the first byte and survives a fresh h
 		hosting: { enabled: true, bindHost: "127.0.0.1", bindPort: 40_000 },
 		autoReconnect: true,
 		bellEnabled: false,
+		viewerNativeInputEnabled: true,
+		remoteHistoryDeleteEnabled: true,
 		destinations: [destination("alpha"), destination("beta", { reconnectSuppressed: true })],
 	});
 	assert.equal(Object.isFrozen(read), true);
@@ -192,6 +213,31 @@ test("unknown, malformed, or unsafe documents are refused untouched and never de
 				...samplePreferences(),
 				version: 1,
 				destinations: [{ ...destination("alpha"), authority: "trusted" }],
+			}),
+		},
+		// A PRESENT optional default-on flag must be a real boolean: a malformed value
+		// is never read as "absent" (on) and the document is never repaired.
+		...([null, "false", "true", 0, 1, {}, []] as const).flatMap((value) => [
+			{
+				name: `viewerNativeInputEnabled ${JSON.stringify(value)}`,
+				text: JSON.stringify({ ...samplePreferences(), version: 1, viewerNativeInputEnabled: value }),
+			},
+			{
+				name: `remoteHistoryDeleteEnabled ${JSON.stringify(value)}`,
+				text: JSON.stringify({ ...samplePreferences(), version: 1, remoteHistoryDeleteEnabled: value }),
+			},
+		]),
+		{
+			name: "a flag under an unknown spelling",
+			text: JSON.stringify({ ...samplePreferences(), version: 1, viewerInputEnabled: false }),
+		},
+		{
+			name: "valid flags but an unknown version",
+			text: JSON.stringify({
+				...samplePreferences(),
+				version: 2,
+				viewerNativeInputEnabled: false,
+				remoteHistoryDeleteEnabled: false,
 			}),
 		},
 	];
@@ -303,5 +349,123 @@ test("caller-built values are validated and bounded before any publication", (t)
 	(source.destinations as PeerDestination[]).push(destination("late"));
 	assert.equal(validated.destinations.length, 2);
 	assert.equal(Object.isFrozen(validated.destinations[0]), true);
+	store.close();
+});
+
+/**
+ * Publish a protected document through the real store first, then replace only its
+ * bytes in place (same inode and protection), exactly as an older build left it.
+ */
+function writeProtectedDocumentBytes(fixture: AgentDirFixture, text: string): string {
+	const seed = openStore(fixture);
+	seed.write(samplePreferences());
+	seed.close();
+	const path = preferencesPath(fixture);
+	writeFileSync(path, text);
+	return path;
+}
+
+test("an otherwise valid legacy document without the two flags reads both as on, untouched", (t) => {
+	const fixture = createAgentDirFixture(t);
+	const path = writeProtectedDocumentBytes(fixture, legacyDocumentText());
+	const before = readFileSync(path);
+	const store = openStore(fixture);
+	const read = store.read();
+	assert.ok(read);
+	assert.equal(read.viewerNativeInputEnabled, true, "absent viewer input/copy is the default-on value");
+	assert.equal(read.remoteHistoryDeleteEnabled, true, "absent history-deletion policy is the default-on value");
+	assert.equal(read.bellEnabled, false, "every existing legacy field is preserved");
+	assert.equal(read.autoReconnect, true);
+	assert.deepEqual(read.destinations, [destination("alpha")]);
+	assert.deepEqual(readFileSync(path), before, "reading never repairs or rewrites the legacy document");
+
+	// An unrelated change keeps the sparse version-1 shape: still no flag keys.
+	store.write({ ...read, bellEnabled: true });
+	const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+	assert.equal(raw.version, PEER_PREFERENCES_VERSION);
+	assert.equal(Object.prototype.hasOwnProperty.call(raw, "viewerNativeInputEnabled"), false);
+	assert.equal(Object.prototype.hasOwnProperty.call(raw, "remoteHistoryDeleteEnabled"), false);
+	assert.equal(store.read()?.viewerNativeInputEnabled, true);
+	assert.equal(store.read()?.remoteHistoryDeleteEnabled, true);
+	store.close();
+});
+
+test("an explicit Off for each flag is written, independent, and survives a fresh handle", (t) => {
+	const fixture = createAgentDirFixture(t);
+	const store = openStore(fixture);
+	store.write({ ...samplePreferences(), viewerNativeInputEnabled: false });
+	let raw = JSON.parse(readFileSync(preferencesPath(fixture), "utf8")) as Record<string, unknown>;
+	assert.equal(raw.viewerNativeInputEnabled, false, "only an explicit Off is persisted");
+	assert.equal(Object.prototype.hasOwnProperty.call(raw, "remoteHistoryDeleteEnabled"), false,
+		"the independent owner policy stays at its absent default-on shape");
+	store.close();
+
+	const reopened = openStore(fixture);
+	const restarted = reopened.read();
+	assert.equal(restarted?.viewerNativeInputEnabled, false, "explicit viewer Off is remembered across restarts");
+	assert.equal(restarted?.remoteHistoryDeleteEnabled, true);
+	assert.ok(restarted);
+	reopened.write({ ...restarted, remoteHistoryDeleteEnabled: false });
+	raw = JSON.parse(readFileSync(preferencesPath(fixture), "utf8")) as Record<string, unknown>;
+	assert.equal(raw.viewerNativeInputEnabled, false, "an unrelated owner-policy change keeps the viewer Off");
+	assert.equal(raw.remoteHistoryDeleteEnabled, false);
+	reopened.close();
+
+	const third = openStore(fixture);
+	assert.equal(third.read()?.viewerNativeInputEnabled, false);
+	assert.equal(third.read()?.remoteHistoryDeleteEnabled, false, "explicit owner Off is remembered across restarts");
+	// Turning both back on returns to the sparse shape, still a valid document.
+	const current = third.read();
+	assert.ok(current);
+	third.write({ ...current, viewerNativeInputEnabled: true, remoteHistoryDeleteEnabled: true });
+	raw = JSON.parse(readFileSync(preferencesPath(fixture), "utf8")) as Record<string, unknown>;
+	assert.equal(Object.prototype.hasOwnProperty.call(raw, "viewerNativeInputEnabled"), false);
+	assert.equal(Object.prototype.hasOwnProperty.call(raw, "remoteHistoryDeleteEnabled"), false);
+	third.close();
+});
+
+test("an explicitly written true flag is also valid and on", (t) => {
+	const fixture = createAgentDirFixture(t);
+	writeProtectedDocumentBytes(fixture, JSON.stringify({
+		...samplePreferences(),
+		version: 1,
+		viewerNativeInputEnabled: true,
+		remoteHistoryDeleteEnabled: true,
+	}));
+	const store = openStore(fixture);
+	assert.equal(store.read()?.viewerNativeInputEnabled, true);
+	assert.equal(store.read()?.remoteHistoryDeleteEnabled, true);
+	store.close();
+});
+
+test("a failed replacement never claims an unsaved flag change in memory", (t) => {
+	const fixture = createAgentDirFixture(t);
+	const policy = createPosixTestPolicy();
+	const store = openStore(fixture, policy);
+	store.write(samplePreferences());
+	const committed = readFileSync(preferencesPath(fixture));
+	policy.fail = (call) => call.operation === "protectCreatedFile";
+	assert.throws(() => store.write({ ...samplePreferences(), viewerNativeInputEnabled: false }), isPeerPreferencesError);
+	assert.throws(() => store.write({ ...samplePreferences(), remoteHistoryDeleteEnabled: false }), isPeerPreferencesError);
+	assert.deepEqual(readFileSync(preferencesPath(fixture)), committed);
+	assert.equal(store.read()?.viewerNativeInputEnabled, true);
+	assert.equal(store.read()?.remoteHistoryDeleteEnabled, true);
+	store.close();
+});
+
+test("caller-built values must carry both flags as real booleans", (t) => {
+	const fixture = createAgentDirFixture(t);
+	const store = openStore(fixture);
+	const withoutViewer: Record<string, unknown> = { ...samplePreferences() };
+	delete withoutViewer.viewerNativeInputEnabled;
+	const withoutHistory: Record<string, unknown> = { ...samplePreferences() };
+	delete withoutHistory.remoteHistoryDeleteEnabled;
+	// Absence is a programmer error for an in-memory value, never a silent default.
+	assert.throws(() => validatePeerPreferences(withoutViewer), TypeError);
+	assert.throws(() => validatePeerPreferences(withoutHistory), TypeError);
+	assert.throws(() => validatePeerPreferences({ ...samplePreferences(), viewerNativeInputEnabled: "false" }), TypeError);
+	assert.throws(() => validatePeerPreferences({ ...samplePreferences(), remoteHistoryDeleteEnabled: null }), TypeError);
+	assert.throws(() => store.write(withoutViewer as unknown as PeerPreferences), TypeError);
+	assert.equal(existsSync(preferencesPath(fixture)), false, "invalid input is never published");
 	store.close();
 });

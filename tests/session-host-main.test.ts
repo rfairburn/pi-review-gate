@@ -45,6 +45,7 @@ import type {
   PeerNativeInputTarget,
   PeerNativeIoCallbacks,
   PeerSelectedContent,
+  PeerViewerNativeInputPolicy,
 } from "../src/session-host/network/peer-content";
 import type { NativeIoSource, SessionContentSnapshot } from "../src/session-host/network/session-content-protocol";
 import type { NativeInputSendResult } from "../src/session-host/network/session-content-client";
@@ -761,7 +762,10 @@ class FakePeerCoordinator implements PeerCoordinator {
   now: () => number = Date.now;
   snapshot: PeerUiSnapshot = {
     revision: 1, status: "ready", identityFingerprint: null,
-    settings: { hostingEnabled: false, bindHost: "", bindPort: null, autoReconnect: false, bellEnabled: true },
+    settings: {
+      hostingEnabled: false, bindHost: "", bindPort: null, autoReconnect: false, bellEnabled: true,
+      viewerNativeInputEnabled: true, remoteHistoryDeleteEnabled: true,
+    },
     listener: { state: "off", host: null, port: null, message: null },
     hosts: [], trustedPeers: [], consents: [], notice: null,
   };
@@ -6965,6 +6969,8 @@ const REMOTE_INPUT_NOT_SENT_NOTICE = "Remote input was refused; nothing was sent
 const REMOTE_INPUT_PASTE_TOO_LARGE_NOTICE = "That paste is larger than a remote session accepts; nothing was sent";
 const REMOTE_INPUT_UNCERTAIN_NOTICE =
   "UNCERTAIN: remote input may have been handed off; outcome unknown";
+const REMOTE_INPUT_VIEWER_OFF_NOTICE =
+  "Remote input/copy is off for this viewer; nothing was sent to the remote session";
 
 function remoteRosterRow(overrides: Partial<RemoteSessionMetadata> & { id: string }): RemoteSessionMetadata {
   return {
@@ -7097,7 +7103,23 @@ class FakePeerContentPort implements PeerContentController {
   /** State change between the admission proof and the pre-write re-proof. */
   beforeWrite: (() => void) | undefined;
   readNativeInputTargetCalls = 0;
+  /**
+   * This viewer's live Remote input/copy preference, exactly as the real
+   * coordinator reports it: default ON, and every actual change advances the
+   * generation (including an Off -> On return).
+   */
+  viewerPolicy: PeerViewerNativeInputPolicy = { enabled: true, generation: 1 };
   private changeHandler: ((observation: PeerContentObservation) => void) | undefined;
+
+  readViewerNativeInputPolicy(): PeerViewerNativeInputPolicy {
+    return this.viewerPolicy;
+  }
+
+  /** One actual preference change; a same-value call changes nothing. */
+  setViewerInput(enabled: boolean): void {
+    if (this.viewerPolicy.enabled === enabled) return;
+    this.viewerPolicy = { enabled, generation: this.viewerPolicy.generation + 1 };
+  }
   private observation: PeerContentObservation = { target: null, state: "none", view: undefined, reason: null };
 
   attach(onChange: ((observation: PeerContentObservation) => void) | undefined): void {
@@ -7278,27 +7300,29 @@ async function activateRemoteRosterRow(harness: Harness, hostLabel: string): Pro
  * The actual-written remote native IO scenario: one local row exists (so a local
  * fallback would be observable), one remote card is deliberately activated with
  * real host input, and one complete viewport carrying a coherent host-written
- * source is published and actually written. The internal opt-in is supplied by
- * the caller's own dependency override, exactly like production wiring would.
+ * source is published and actually written. No dependency override is supplied:
+ * the native IO bridge is the production default, and this viewer's Remote
+ * input/copy preference starts On exactly as a new installation's does.
  */
 async function remoteNativeInputHarness(
   t: { after(callback: () => void): void },
 ): Promise<{
   harness: Harness;
+  peer: FakePeerCoordinatorWithContent;
   content: FakePeerContentPort;
   manager: FakeManager;
   source: NativeIoSource;
   generation: number;
   rect: { readonly column: number; readonly row: number; readonly cols: number; readonly rows: number };
 }> {
-  const { harness, content } = await remoteContentMainHarness(t, [
+  const { harness, peer, content } = await remoteContentMainHarness(t, [
     remotePeerHost({
       id: "lab-a",
       label: "Lab Alpha",
       hostRunId: "run-a",
       rows: [remoteRosterRow({ id: "row-a", label: "Alpha remote" })],
     }),
-  ], { nativeInputOriginFraming: true });
+  ]);
   const manager = harnessManager(harness);
   fillForm(harness.terminal, "/local/workspace");
   await nextTurn();
@@ -7319,7 +7343,7 @@ async function remoteNativeInputHarness(
   assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-NATIVE-IO"));
   // Wide layout: 32 sidebar columns plus one divider. The 40x20 frame is drawn at
   // the native pane's top-left corner, so everything past it is host padding.
-  return { harness, content, manager, source, generation, rect: { column: 33, row: 1, cols: 40, rows: 20 } };
+  return { harness, peer, content, manager, source, generation, rect: { column: 33, row: 1, cols: 40, rows: 20 } };
 }
 
 test("activating a remote roster card displays that owner's native viewport through the one writer", async (t) => {
@@ -7616,7 +7640,7 @@ test("a content port that refuses the selection is reported unavailable and chan
   }
 });
 
-test("a displayed remote viewport is display-only for keyboard and pointer input while local rows keep their path", async (t) => {
+test("a displayed remote viewport without a written native source forwards no keyboard or pointer input while local rows keep their path", async (t) => {
   const { harness, content, dispatch } = await remoteContentMainHarness(t, [
     remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
   ]);
@@ -9727,37 +9751,198 @@ test("an actual write publishes its receipt even when a newer identical candidat
 });
 
 // ---------------------------------------------------------------------------
-// Remote native input / text copy: internal opt-in, actual-written authority.
+// Remote native input / text copy: default-on bridge, per-viewer preference,
+// actual-written authority.
 //
 // Every fixture below is a controlled DTO or an owned fake; no real peer,
 // transport, child, PTY, or physical clipboard is involved. A "submitted" result
 // is only ever local transport return, never proof the remote child processed it.
 // ---------------------------------------------------------------------------
 
-test("remote native IO stays inert by default and only an explicit internal opt-in wires it", async (t) => {
+test("production Main wires native IO by default and only the explicit-false legacy seam keeps it inert", async (t) => {
   const hosts = [
     remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
   ];
-  const off = await remoteContentMainHarness(t, hosts);
+  // Absent dependency: the production default, with no injected opt-in at all.
+  const defaulted = await remoteContentMainHarness(t, hosts);
   try {
-    assert.equal(off.peer.options?.nativeIo, undefined,
-      "the default coordinator receives no native input/copy callbacks at all");
-    assert.equal(harnessManager(off.harness).options.nativeInputOriginFraming, undefined,
-      "the default manager call shape is unchanged, so no child is framed by accident");
+    assert.equal(harnessManager(defaulted.harness).options.nativeInputOriginFraming, true,
+      "children created by the production default use strict authenticated framing");
+    assert.equal(typeof defaulted.peer.options?.nativeIo?.authorizeInput, "function",
+      "the default supplies the coordinator's dynamic written-source proof");
+    assert.equal(typeof defaulted.peer.options?.nativeIo?.onCopy, "function",
+      "the default supplies the initiating-viewer copy callback");
   } finally {
-    assert.equal(await closeWithSignal(off.harness), 0);
+    assert.equal(await closeWithSignal(defaulted.harness), 0);
   }
 
-  const on = await remoteContentMainHarness(t, hosts, { nativeInputOriginFraming: true });
+  const explicitOn = await remoteContentMainHarness(t, hosts, { nativeInputOriginFraming: true });
   try {
-    assert.equal(harnessManager(on.harness).options.nativeInputOriginFraming, true,
-      "an explicit opt-in forwards the existing framing option to children created later");
-    assert.equal(typeof on.peer.options?.nativeIo?.authorizeInput, "function",
-      "the opt-in supplies the coordinator's dynamic written-source proof");
-    assert.equal(typeof on.peer.options?.nativeIo?.onCopy, "function",
-      "the opt-in supplies the initiating-viewer copy callback");
+    assert.equal(harnessManager(explicitOn.harness).options.nativeInputOriginFraming, true);
+    assert.equal(typeof explicitOn.peer.options?.nativeIo?.authorizeInput, "function");
   } finally {
-    assert.equal(await closeWithSignal(on.harness), 0);
+    assert.equal(await closeWithSignal(explicitOn.harness), 0);
+  }
+
+  // The dependency-only legacy test seam: explicit false keeps the old shape.
+  const legacy = await remoteContentMainHarness(t, hosts, { nativeInputOriginFraming: false });
+  try {
+    assert.equal(legacy.peer.options?.nativeIo, undefined,
+      "the explicit-false seam gives the coordinator no native input/copy callbacks");
+    assert.equal(harnessManager(legacy.harness).options.nativeInputOriginFraming, undefined,
+      "the explicit-false seam keeps the legacy manager call shape");
+  } finally {
+    assert.equal(await closeWithSignal(legacy.harness), 0);
+  }
+});
+
+test("viewer Remote input/copy Off refuses this viewer's input and copies while owner framing stays on", async (t) => {
+  const { harness, peer, content, manager, source, generation, rect } = await remoteNativeInputHarness(t);
+  try {
+    assert.equal(content.deliveredInputs.length, 0);
+    harness.terminal.emitInput("a");
+    await nextTurn();
+    assert.equal(content.deliveredInputs.length, 1, "the production default forwards typing");
+
+    // Only this viewer's saved preference changes; nothing restarts or reconnects.
+    content.setViewerInput(false);
+    peer.publish({ settings: { ...peer.snapshot.settings!, viewerNativeInputEnabled: false } });
+    await nextTurn();
+    const localWrites = manager.writes.length;
+    const terminalWrites = harness.terminal.writes.length;
+    harness.terminal.emitInput("b");
+    harness.terminal.emitInput(`${ESC}[200~paste${ESC}[201~`);
+    emitMouse(harness.terminal, rect.column + 2, rect.row + 3);
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 1, "nothing is even offered to the delegate while Off");
+    assert.equal(content.deliveredInputs.length, 1);
+    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame),
+      REMOTE_INPUT_VIEWER_OFF_NOTICE) !== undefined,
+    "the refusal is one brief fixed notice, not a dialog or a silent local fallback");
+    assert.equal(harness.sidebar!.focus, "main", "Off never moves focus");
+    assert.equal(manager.writes.length, localWrites, "Off never reroutes input to a local row");
+
+    content.deliverCopy({
+      subscriptionId: "sub-a",
+      copyId: "copy-off",
+      sequence: 1,
+      source,
+      dispatchId: 1,
+      event: {
+        kind: "copy",
+        encoded: "b2Zm",
+        sessionId: source.nativeSession.sessionId,
+        sessionEpoch: source.nativeSession.epoch,
+      },
+      hostId: "lab-a",
+      selectionGeneration: generation,
+    });
+    assert.equal(harness.terminal.writes.includes(`${ESC}]52;c;b2Zm\x07`), false,
+      "a completed copy writes no clipboard request while Off");
+    assert.equal(harness.terminal.writes.slice(terminalWrites).some((write) => write.includes("]52;")), false);
+
+    // The owner-side bridge and the coordinator capability are immutable.
+    assert.equal(manager.options.nativeInputOriginFraming, true, "owner framing is never toggled by the viewer");
+    assert.equal(typeof peer.options?.nativeIo?.authorizeInput, "function");
+    assert.equal(peer.commands.some((command) => command.type === "peer-disconnect"), false);
+    assert.equal(peer.closeCalls, 0, "the coordinator is never restarted to apply the preference");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("Main forwards the two distinct Network setting actions to the one coordinator unchanged", async (t) => {
+  const { harness, peer, dispatch } = await peerMainHarness(t);
+  try {
+    dispatch({ type: "peer-viewer-native-input", enabled: false });
+    dispatch({ type: "peer-remote-history-delete", enabled: false });
+    await nextTurn();
+    assert.deepEqual(peer.commands, [
+      { type: "peer-viewer-native-input", enabled: false },
+      { type: "peer-remote-history-delete", enabled: false },
+    ], "each setting is its own coordinator command, with no implied disconnect or restart");
+    assert.equal(peer.closeCalls, 0);
+    assert.equal(typeof peer.options?.nativeIo?.authorizeInput, "function",
+      "the coordinator's callbacks were fixed at construction and never withdrawn");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("turning Remote input/copy back on needs a fresh actually written frame even when the pixels match", async (t) => {
+  const { harness, peer, content, source, generation } = await remoteNativeInputHarness(t);
+  try {
+    // Nothing newer can be written until the test drains the sink, so the only
+    // written receipt is the one composed under the ORIGINAL preference generation.
+    harness.writer.holdWrites = true;
+    const invalidations = harness.writer.invalidateCalls;
+    content.setViewerInput(false);
+    content.setViewerInput(true);
+    // The settings change repaints identical pixels; it is still a writer
+    // boundary, and the queued candidate is not a receipt.
+    peer.publish({});
+    await nextTurn();
+    assert.ok(harness.writer.invalidateCalls > invalidations,
+      "an actual preference change forces a real writer boundary with identical visible bytes");
+    harness.terminal.emitInput("x");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 0, "an Off -> On return never revives the old written receipt");
+    const copyWrites = harness.terminal.writes.length;
+    content.deliverCopy({
+      subscriptionId: "sub-a",
+      copyId: "copy-aba",
+      sequence: 1,
+      source,
+      dispatchId: 1,
+      event: {
+        kind: "copy",
+        encoded: "YWJh",
+        sessionId: source.nativeSession.sessionId,
+        sessionEpoch: source.nativeSession.epoch,
+      },
+      hostId: "lab-a",
+      selectionGeneration: generation,
+    });
+    assert.equal(harness.terminal.writes.length, copyWrites, "nor does a copy ride the stale receipt");
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 0, "an unwritten candidate authorizes nothing");
+
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    harness.terminal.emitInput("z");
+    await nextTurn();
+    assert.equal(content.deliveredInputs.length, 1, "the freshly written frame restores input");
+    assert.equal(content.deliveredInputs[0]!.text, "z");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a preference Off -> On between admission and the protected write refuses that write", async (t) => {
+  const { harness, content, manager } = await remoteNativeInputHarness(t);
+  try {
+    content.beforeWrite = () => {
+      content.setViewerInput(false);
+      content.setViewerInput(true);
+    };
+    harness.terminal.emitInput("x");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 1, "the admission proof ran");
+    assert.equal(content.deliveredInputs.length, 0,
+      "the re-proof sees a new preference generation and refuses even though it reads On");
+    assert.equal(manager.writes.length, 0);
+    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_NOT_SENT_NOTICE) !== undefined);
+    content.beforeWrite = undefined;
+    // The refused attempt's notice repaint wrote a frame under the CURRENT
+    // generation, so a fresh request is proven against it normally.
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    assert.equal(content.deliveredInputs.length, 1);
+    assert.equal(content.deliveredInputs[0]!.text, "y");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
   }
 });
 
@@ -10249,10 +10434,10 @@ test("remote-enabled Main captures the displayed owner's own mouse reporting mod
   }
 });
 
-test("default-off remote display keeps the host's press-only capture for published mouse modes", async (t) => {
+test("the explicit-false legacy seam keeps the host's press-only capture for published mouse modes", async (t) => {
   const { harness, content, dispatch } = await remoteContentMainHarness(t, [
     remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
-  ]);
+  ], { nativeInputOriginFraming: false });
   try {
     dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
     await nextTurn();
@@ -10269,9 +10454,37 @@ test("default-off remote display keeps the host's press-only capture for publish
     assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-OFF-MOUSE"),
       "the legacy display-only path still paints the published view");
     assert.deepEqual(harness.terminal.writes.slice(before), [],
-      "without the internal opt-in a published mouse mode changes no outer capture");
+      "under the legacy seam a published mouse mode changes no outer capture");
     assert.equal(harness.terminal.writes.includes(`${ESC}[?1002h`), false);
     assert.equal(harness.terminal.writes.includes(`${ESC}[?1003h`), false);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a viewer with Remote input/copy Off keeps press-only capture even with Main focused", async (t) => {
+  const { harness, peer, content, source } = await remoteNativeInputHarness(t);
+  try {
+    content.setViewerInput(false);
+    peer.publish({ settings: { ...peer.snapshot.settings!, viewerNativeInputEnabled: false } });
+    await nextTurn();
+    const before = harness.terminal.writes.length;
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
+      cols: 40, rows: 20, marker: "REMOTE-OFF-DRAG", nativeSession: source.nativeSession, inputSource: source,
+      inputModes: { ...REMOTE_INPUT_MODES, mouseTracking: "drag", mouseEncoding: "sgr" },
+    }));
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main");
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-OFF-DRAG"), "viewing continues while Off");
+    assert.equal(harness.terminal.writes.slice(before).includes(`${ESC}[?1002h`), false,
+      "the owner's drag capture is not requested for a viewer that forwards nothing");
+
+    // Turning it back on resynchronizes capture to the displayed owner's own mode.
+    content.setViewerInput(true);
+    peer.publish({ settings: { ...peer.snapshot.settings!, viewerNativeInputEnabled: true } });
+    await nextTurn();
+    assert.equal(harness.terminal.writes.slice(before).includes(`${ESC}[?1002h`), true);
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
   }

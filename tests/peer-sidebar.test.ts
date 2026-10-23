@@ -48,6 +48,8 @@ const DEFAULT_SETTINGS: PeerUiSettings = {
   bindPort: 8443,
   autoReconnect: false,
   bellEnabled: true,
+  viewerNativeInputEnabled: true,
+  remoteHistoryDeleteEnabled: true,
 };
 
 function makeItem(id: string): SidebarItem {
@@ -1063,8 +1065,8 @@ test("per-host connect, disconnect, remove-confirmation and revoke-confirmation 
   }));
   openNetworkPane(harness);
 
-  // The host row follows the 7 fixed control rows.
-  movePeerRow(harness, 7);
+  // The host row follows the 9 fixed control rows.
+  movePeerRow(harness, 9);
   harness.send("x");
   assert.deepEqual(harness.commands(), [{ type: "peer-disconnect", hostId: "studio" }]);
   harness.baseline = harness.actions.length;
@@ -1092,7 +1094,7 @@ test("per-host connect, disconnect, remove-confirmation and revoke-confirmation 
   // Receiving revocation is independent and separately confirmed.
   harness.baseline = harness.actions.length;
   peerPaneText(harness);
-  // Rows: 7 controls, host, remote row, then the trusted peer.
+  // Rows: 9 controls, host, remote row, then the trusted peer.
   movePeerRow(harness, 2);
   harness.send("v");
   assert.equal(harness.controller.focus, "confirm");
@@ -1147,7 +1149,7 @@ test("remote host rows stay honest metadata and never emit a local session actio
   // changes nothing else.
   const focusBefore = harness.controller.focus;
   const selectedBefore = harness.controller.selectedId;
-  movePeerRow(harness, 8, 40); // host, then the first remote row
+  movePeerRow(harness, 10, 40); // host, then the first remote row
   harness.send(ENTER);
   const after = peerPaneText(harness, 140, 40).join("\n");
   assert.ok(after.includes("Remote session metadata only"));
@@ -1718,7 +1720,7 @@ test("streamed paste cannot confirm network consent, remove, or revoke", () => {
   // Remove destination: pasted confirmation is opaque.
   const remove = makeHarness(makeSnapshot({ hosts: [makeHost({ id: "studio", label: "studio" })] }));
   openNetworkPane(remove);
-  movePeerRow(remove, 7);
+  movePeerRow(remove, 9);
   remove.send("r");
   assert.equal(remove.controller.focus, "confirm");
   confirmText(remove);
@@ -1734,7 +1736,7 @@ test("streamed paste cannot confirm network consent, remove, or revoke", () => {
     trustedPeers: [makeTrustedPeer({ id: "p1", label: "laptop" })],
   }));
   openNetworkPane(revoke);
-  movePeerRow(revoke, 7);
+  movePeerRow(revoke, 9);
   revoke.send("v");
   assert.equal(revoke.controller.focus, "confirm");
   confirmText(revoke);

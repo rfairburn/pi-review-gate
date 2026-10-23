@@ -79,14 +79,26 @@
  * selects and focuses nothing. The owner's own Main provider is the only thing
  * that can start a child, and only from the owner's exact current run.
  *
- * Native input and text copies for that selected stream are optional and
- * default-inert. Without explicit `nativeIo` callbacks this coordinator is exactly
- * the previous display-only one: no native capability is offered, no input or copy
- * callback exists, and both controller primitives stay inert. With them, each
- * protected write is gated by the current selection/peer/pin/run/row/source fences
- * AND the caller's own dynamic written-source proof, re-proved after that proof
- * returns; copies reach only the current initiating endpoint's callback, and this
+ * Native input and text copies for that selected stream exist only with explicit
+ * `nativeIo` callbacks (the production Main supplies them by default). Without
+ * them this coordinator is exactly the previous display-only one: no native
+ * capability is offered, no input or copy callback exists, and both controller
+ * primitives stay inert. With them, the owner-side endpoint's native support and
+ * every outgoing endpoint's negotiation are fixed for the lifecycle, and each
+ * protected write is gated by the current selection/peer/pin/run/row/source
+ * fences, THIS viewer's current remote input/copy preference, AND the caller's own
+ * dynamic written-source proof, with the preference, fences, and change
+ * generations re-proved after that proof returns; copies reach only the current
+ * initiating endpoint's callback while that preference is on, and this
  * coordinator still emits no OSC 52, reads no clipboard, and writes no terminal.
+ *
+ * The viewer preference changes only what THIS host forwards from its own
+ * displayed remote pane. Applying it never restarts, disconnects, or reconnects
+ * anything, never re-negotiates or revokes owner framing, never changes Hosting,
+ * Auto, a grant, or another viewer, and never cancels owner work already accepted.
+ * The separate owner policy for exposing remote saved-history deletion is a live
+ * readable fact here ({@link PeerCoordinatorWithHistoryPolicy}); this coordinator
+ * offers no remote history endpoint of its own.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -147,6 +159,7 @@ import type {
 	PeerNativeInputTarget,
 	PeerNativeIoCallbacks,
 	PeerSelectedContent,
+	PeerViewerNativeInputPolicy,
 } from "./peer-content";
 import type { OwnerCloseHandler, PeerCloseController, PeerCloseResult, PeerCloseTarget, PeerCoordinatorWithClose } from "./peer-close";
 import {
@@ -234,6 +247,24 @@ export class PeerCoordinatorCloseError extends Error {
 
 export function isPeerCoordinatorCloseError(value: unknown): value is PeerCoordinatorCloseError {
 	return value instanceof PeerCoordinatorCloseError;
+}
+
+/**
+ * The OWNER-side remote saved-history deletion exposure policy, read live.
+ *
+ * This is the one policy fact a later owner-side Saved provider consults on every
+ * request; it is not a registry, lease, grant, or receiving permission, it does
+ * not gate this host's own local Saved deletion, and it is not a viewer-side
+ * toggle. No remote history endpoint exists yet: reading it enables nothing.
+ */
+export interface PeerCoordinatorWithHistoryPolicy {
+	/**
+	 * `true` only while this coordinator holds a loaded, valid settings document
+	 * whose effective `remoteHistoryDeleteEnabled` is on (absent in the document is
+	 * on; an explicit saved Off is off). Before start, after close, and while the
+	 * protected settings are unavailable it is `false` (fail closed).
+	 */
+	readRemoteHistoryDeleteEnabled(): boolean;
 }
 
 const NOTICE = Object.freeze({
@@ -906,7 +937,11 @@ function readNativeInputRequest(value: unknown): PeerNativeInputRequest | null {
 	return Object.freeze({ hostId, selectionGeneration, subscriptionId, source, inputModes, kind, text });
 }
 
-class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinatorWithClose, PeerCoordinatorWithCreate {
+class OwnedPeerCoordinator implements
+	PeerCoordinatorWithContent,
+	PeerCoordinatorWithClose,
+	PeerCoordinatorWithCreate,
+	PeerCoordinatorWithHistoryPolicy {
 	readonly #options: PeerCoordinatorOptions;
 	readonly #consentWindowMs: number;
 	readonly #autoReconnectDelaysMs: readonly number[];
@@ -924,10 +959,20 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 	 * Monotonic semantic invalidation of the native input target. It advances only
 	 * when a publication changes the written source or the observed input modes, so
 	 * an exact A -> B -> A change inside caller code is detectable by comparison and
-	 * never revived by present equality. Ordinary output does not advance it, and the
-	 * legacy display-only coordinator never advances it at all.
+	 * never revived by present equality. Ordinary output does not advance it. An
+	 * actual change of this viewer's remote input/copy preference advances it too,
+	 * so a preference Off -> On return inside caller code also never revives an
+	 * admission.
 	 */
 	#nativeInputGeneration = 0;
+	/**
+	 * The effective viewer-side remote input/copy preference last applied, and its
+	 * monotonic change generation. Both move ONLY together, synchronously, at the
+	 * single place this coordinator's preferences or lifecycle change, so every
+	 * actual change — including Off -> On — is a new generation.
+	 */
+	#viewerInputEffective = false;
+	#viewerInputGeneration = 0;
 
 	readonly #runtime = new Map<string, DestinationRuntime>();
 	readonly #consents = new Map<string, PendingConsent>();
@@ -999,6 +1044,7 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		readContent: (): PeerContentObservation => this.#readContent(),
 		readNativeInputTarget: (): PeerNativeInputTarget | undefined => this.#readNativeInputTarget(),
 		sendNativeInput: (request: PeerNativeInputRequest): Promise<NativeInputSendResult> => this.#sendNativeInput(request),
+		readViewerNativeInputPolicy: (): PeerViewerNativeInputPolicy => this.#readViewerNativeInputPolicy(),
 	};
 	/**
 	 * The ONE owner-routed Close controller: a property of this coordinator rather
@@ -1099,6 +1145,12 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		return this.#snapshot;
 	}
 
+	readRemoteHistoryDeleteEnabled(): boolean {
+		if (this.#closed || this.#tearingDown) return false;
+		const preferences = this.#preferences;
+		return preferences !== null && preferences.remoteHistoryDeleteEnabled === true;
+	}
+
 	decideConsent(id: string, decision: "approve" | "deny"): boolean {
 		if (this.#closed || typeof id !== "string") return false;
 		if (decision !== "approve" && decision !== "deny") return false;
@@ -1158,6 +1210,12 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 				case "peer-bell":
 					this.#commandBell(command);
 					return;
+				case "peer-viewer-native-input":
+					this.#commandViewerNativeInput(command);
+					return;
+				case "peer-remote-history-delete":
+					this.#commandRemoteHistoryDelete(command);
+					return;
 				case "peer-add":
 					this.#commandAdd(command);
 					return;
@@ -1194,6 +1252,9 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 	close(): Promise<void> {
 		if (this.#closePromise !== null) return this.#closePromise;
 		this.#closed = true;
+		// A closing coordinator forwards nothing: the viewer preference is now
+		// effectively Off, which is an actual change for any in-flight admission.
+		this.#noteViewerInputPolicy();
 		this.#transientNotice = null;
 		this.#closePromise = this.#teardown();
 		return this.#closePromise;
@@ -1211,11 +1272,15 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 				permissions: this.#preferencesPermissions,
 			});
 			this.#preferencesStore = store;
-			this.#preferences = store.read() ?? DEFAULT_PEER_PREFERENCES;
+			// Only a genuinely absent document is the in-memory defaults (both
+			// default-on flags on); an unreadable or invalid one throws below.
+			this.#applyPreferences(store.read() ?? DEFAULT_PEER_PREFERENCES);
 			this.#preferencesLoaded = true;
 		} catch {
 			this.#preferencesStore = null;
-			this.#preferences = null;
+			// Unavailable settings are never defaults: viewer forwarding and the
+			// owner history policy both stay off.
+			this.#applyPreferences(null);
 			this.#preferencesLoaded = false;
 		}
 
@@ -3348,6 +3413,9 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 	#authorizeNativeInput(endpoint: ContentEndpoint, expected: NativeIoSource): boolean {
 		const nativeIo = this.#nativeIo;
 		if (nativeIo === null) return false;
+		// THIS viewer's current remote input/copy preference, re-proved for every
+		// protected write rather than read once at startup.
+		if (!this.#viewerInputEnabledNow()) return false;
 		if (!this.#nativeIoEndpointCurrent(endpoint)) return false;
 		const before = this.#nativeInputFacts(endpoint);
 		if (before === null) return false;
@@ -3355,7 +3423,8 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		// exact source of this whole target, never a newer or older one.
 		if (!nativeIoSourceEquals(expected, before.target.source)) return false;
 		// Captured before caller code runs: a proof that publishes another source and
-		// restores it (A -> B -> A) must not leave this write looking admitted.
+		// restores it (A -> B -> A), or turns the preference Off and On again, must
+		// not leave this write looking admitted.
 		const generation = this.#nativeInputGeneration;
 		let allowed: boolean;
 		try {
@@ -3365,10 +3434,12 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		}
 		if (!allowed) return false;
 		// The proof may have resized, switched selection or focus, revoked a pin,
-		// replaced the destination, or published a different source and still
-		// returned `true`. Its answer is never trusted: re-prove everything, including
-		// the semantic source and the observed modes, without comparing snapshot
-		// objects or sequences (ordinary output must not block typing).
+		// replaced the destination, changed the preference, or published a different
+		// source and still returned `true`. Its answer is never trusted: re-prove
+		// everything, including the semantic source and the observed modes, without
+		// comparing snapshot objects or sequences (ordinary output must not block
+		// typing).
+		if (!this.#viewerInputEnabledNow()) return false;
 		if (!this.#nativeIoEndpointCurrent(endpoint)) return false;
 		if (generation !== this.#nativeInputGeneration) return false;
 		const after = this.#nativeInputFacts(endpoint);
@@ -3384,6 +3455,8 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 	 */
 	#readNativeInputTarget(): PeerNativeInputTarget | undefined {
 		if (this.#nativeIo === null) return undefined;
+		// While this viewer's remote input/copy is Off there is no target to describe.
+		if (!this.#viewerInputEnabledNow()) return undefined;
 		const endpoint = this.#content.endpoint;
 		if (endpoint === null) return undefined;
 		if (!this.#nativeIoEndpointCurrent(endpoint)) return undefined;
@@ -3412,6 +3485,9 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 			}
 		})();
 		if (expected === null) return nativeInputNotSent("invalid-input");
+		// This viewer's own remote input/copy preference: Off refuses before anything
+		// is handed to the endpoint, without touching the connection or the owner.
+		if (!this.#viewerInputEnabledNow()) return nativeInputNotSent("unauthorized");
 		const endpoint = this.#content.endpoint;
 		// Feature-detect the endpoint's own optional primitives: an older endpoint
 		// keeps its exact display behavior and simply cannot accept input.
@@ -3445,11 +3521,14 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 			return nativeInputNotSent("unauthorized");
 		}
 		if (!allowed) return nativeInputNotSent("unauthorized");
-		// Reentry may have replaced the selection, the source, or the modes while the
-		// caller's proof ran: nothing is handed to the endpoint for facts that moved.
+		// Reentry may have turned this viewer's preference Off, or replaced the
+		// selection, the source, or the modes while the caller's proof ran: nothing is
+		// handed to the endpoint for facts that moved.
+		if (!this.#viewerInputEnabledNow()) return nativeInputNotSent("unauthorized");
 		if (!this.#nativeIoEndpointCurrent(endpoint)) return nativeInputNotSent("stale-source");
-		// A source lifetime that changed at all — including A -> B -> A, which present
-		// equality cannot see — invalidates this admission before anything is written.
+		// A source lifetime or preference that changed at all — including A -> B -> A
+		// or Off -> On, which present equality cannot see — invalidates this admission
+		// before anything is written.
 		if (generation !== this.#nativeInputGeneration) return nativeInputNotSent("stale-source");
 		const after = this.#nativeInputFacts(endpoint);
 		if (after === null) return nativeInputNotSent("not-ready");
@@ -3486,6 +3565,9 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 	#routeNativeCopy(endpoint: ContentEndpoint, copy: NativeIoCompletedCopy): void {
 		const nativeIo = this.#nativeIo;
 		if (nativeIo === null) return;
+		// While this viewer's remote input/copy is Off a completed copy is dropped
+		// here: no clipboard write is requested. Nothing is cancelled on the owner.
+		if (!this.#viewerInputEnabledNow()) return;
 		if (!this.#nativeIoEndpointCurrent(endpoint)) return;
 		if (copy.subscriptionId !== endpoint.viewer.subscriptionId) return;
 		const facts = this.#nativeInputFacts(endpoint);
@@ -3702,6 +3784,53 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		}
 		// A display preference never requires an identity or the key directory.
 		this.#savePreferences({ ...preferences, bellEnabled: enabled });
+		this.#emit();
+	}
+
+	/**
+	 * Viewer-side remote native input/copy for THIS host's displayed remote pane.
+	 * Saved like every other display preference (write before publish, no identity,
+	 * key, listener, or socket); it never disconnects, revokes, reconnects, changes
+	 * Hosting/Auto, re-negotiates the content lane, or touches owner framing. The
+	 * effective change is recorded synchronously by the one preferences apply path.
+	 */
+	#commandViewerNativeInput(command: Record<string, unknown>): void {
+		const enabled = command.enabled;
+		if (typeof enabled !== "boolean") {
+			this.#transientNotice = NOTICE.invalidRequest;
+			this.#emit();
+			return;
+		}
+		const preferences = this.#preferences;
+		if (preferences === null) {
+			this.#transientNotice = NOTICE.preferencesUnavailable;
+			this.#emit();
+			return;
+		}
+		this.#savePreferences({ ...preferences, viewerNativeInputEnabled: enabled });
+		this.#emit();
+	}
+
+	/**
+	 * Owner-side policy for exposing remote saved-history deletion to paired
+	 * viewers. Saved like every other preference; it changes no listener, grant,
+	 * connection, local Saved deletion, or viewer input, and it exposes nothing by
+	 * itself — it is the live fact a later owner Saved provider reads.
+	 */
+	#commandRemoteHistoryDelete(command: Record<string, unknown>): void {
+		const enabled = command.enabled;
+		if (typeof enabled !== "boolean") {
+			this.#transientNotice = NOTICE.invalidRequest;
+			this.#emit();
+			return;
+		}
+		const preferences = this.#preferences;
+		if (preferences === null) {
+			this.#transientNotice = NOTICE.preferencesUnavailable;
+			this.#emit();
+			return;
+		}
+		this.#savePreferences({ ...preferences, remoteHistoryDeleteEnabled: enabled });
 		this.#emit();
 	}
 
@@ -3970,6 +4099,47 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 
 	// --------------------------------------------------------------- snapshots
 
+	/**
+	 * The ONE place the in-memory preferences change. Every caller keeps its own
+	 * existing write-before-publish and apply-on-failure semantics; this only
+	 * records an actual change of the effective viewer preference synchronously.
+	 */
+	#applyPreferences(next: PeerPreferences | null): void {
+		this.#preferences = next;
+		this.#noteViewerInputPolicy();
+	}
+
+	/** Effective viewer-side remote input/copy preference right now (fail closed). */
+	#viewerInputEnabledNow(): boolean {
+		if (this.#closed || this.#tearingDown) return false;
+		const preferences = this.#preferences;
+		return preferences !== null && preferences.viewerNativeInputEnabled === true;
+	}
+
+	/**
+	 * Record an actual effective change of the viewer preference. Each change —
+	 * On -> Off and Off -> On alike — advances its own generation AND the native
+	 * input generation, so an admission captured before it can never complete and
+	 * a later return to the same value never revives it.
+	 */
+	#noteViewerInputPolicy(): void {
+		const enabled = this.#viewerInputEnabledNow();
+		if (enabled === this.#viewerInputEffective) return;
+		this.#viewerInputEffective = enabled;
+		this.#viewerInputGeneration += 1;
+		this.#nativeInputGeneration += 1;
+	}
+
+	#readViewerNativeInputPolicy(): PeerViewerNativeInputPolicy {
+		// Re-derived on every read: a lifecycle latch that has not been recorded yet
+		// still reads Off, and never as a stale On.
+		this.#noteViewerInputPolicy();
+		return Object.freeze({
+			enabled: this.#viewerInputEffective && this.#nativeIo !== null,
+			generation: this.#viewerInputGeneration,
+		});
+	}
+
 	#savePreferences(next: PeerPreferences, options: { applyOnFailure?: boolean } = {}): boolean {
 		const store = this.#preferencesStore;
 		if (store === null) {
@@ -3986,13 +4156,13 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 		}
 		try {
 			store.write(value);
-			this.#preferences = value;
+			this.#applyPreferences(value);
 			return true;
 		} catch {
 			if (options.applyOnFailure === true) {
 				// A restrictive or history change takes effect for this session even
 				// when it could not be saved; the notice keeps that unsaved.
-				this.#preferences = value;
+				this.#applyPreferences(value);
 			}
 			this.#transientNotice = NOTICE.preferencesUnsaved;
 			this.#emit();
@@ -4119,6 +4289,8 @@ class OwnedPeerCoordinator implements PeerCoordinatorWithContent, PeerCoordinato
 			bindPort: preferences.hosting.bindPort,
 			autoReconnect: preferences.autoReconnect,
 			bellEnabled: preferences.bellEnabled,
+			viewerNativeInputEnabled: preferences.viewerNativeInputEnabled,
+			remoteHistoryDeleteEnabled: preferences.remoteHistoryDeleteEnabled,
 		});
 		const consents = [...this.#consents.values()].sort((left, right) => (
 			left.requestedAt === right.requestedAt
@@ -4289,10 +4461,15 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
  * Optional `nativeIo` callbacks add the native input/copy seam for the selected
  * stream and nothing else: they are refused unless both are functions, they never
  * enable anything by themselves, and omitting them keeps every byte and every
- * behavior of the display-only coordinator.
+ * behavior of the display-only coordinator. With them, this viewer's saved remote
+ * input/copy preference (default on) is re-proved for every protected write and
+ * completed copy.
+ *
+ * The owner-side remote history deletion policy is readable live through
+ * {@link PeerCoordinatorWithHistoryPolicy.readRemoteHistoryDeleteEnabled}.
  */
 export function createPeerCoordinator(
 	options: PeerCoordinatorOptions,
-): PeerCoordinatorWithContent & PeerCoordinatorWithClose & PeerCoordinatorWithCreate {
+): PeerCoordinatorWithContent & PeerCoordinatorWithClose & PeerCoordinatorWithCreate & PeerCoordinatorWithHistoryPolicy {
 	return new OwnedPeerCoordinator(assertOptions(options));
 }

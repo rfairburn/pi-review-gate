@@ -49,39 +49,53 @@ dates.
   missing capability is refused with a fixed notice and no upgrade or connect. No new
   listener, manager, registry, permission kind, or stored state is added. See
   [Owner Create transport foundation](docs/session-host-alpha.md#owner-create-transport-foundation).
-- Opt-in authenticated input-origin framing and origin-bearing clipboard capsules
-  for the existing owned Node stdio bridge (#389). Payloads and explicit origins are
-  authenticated, and a separate signed readiness signal precedes framed input. The
-  internal, default-off host mode gates both user input and non-user terminal replies,
-  refuses unknown bootstrap modes, and sets native capture only for the explicitly
-  opted-in hosted child tree with ordinary descendant inheritance. No production Main
-  caller enables it; local/SSH copying and standalone Pi remain unchanged, the network
-  native input/copy extension stays internal and default-off, a rowless New-form Host
-  choice can now ask one connected owner for a blank child, `SessionSpawn` stays the
-  native, owner-bound tool, and remote saved conversations, resume, catalog/history, and
-  human handoff remain unfinished.
-- An internal, explicitly opted-in native input and text-copy extension on the existing
-  selected-content lane (#389). It adds no CLI, environment, configuration, or UI opt-in,
-  and no production Main caller enables it, so normal remote viewing remains
-  display-only with no human handoff. When an explicit host caller supplies the closed
-  internal `nativeInputOriginFraming` dependency seam, `native-input-copy-v1` is
-  negotiated explicitly and default-empty.
-  Keyboard, canonical mouse, and whole text paste are admitted only against the actually
-  written, uncovered, Main-focused viewer frame and re-proved against current owner facts
-  and the current TLS-proved peer, pin, directional grant, endpoint, subscription, and
-  selection; the source token is descriptive, not a grant, and the owner's Main need not
-  display or focus the controlled row. A paste is validated whole up to 1 MiB of decoded
-  UTF-8 before one PTY handoff, and a copy is retained whole up to the unchanged
-  100,000-character native bound and returned only to the exact initiating viewer.
-  Ordinary output with unchanged semantic source and modes does not stall input;
-  source- or mode-only changes still need a
-  real writer boundary. Refusals stay brief and non-modal; only a pre-invoke refusal is
-  `not-sent`, and an invoked loss is truthfully unknown without replay. This extension
-  changes no Close behavior, local/SSH copying, native producers, or production defaults.
-  Remote saved conversations,
-  resume, catalog/history, and human handoff remain unfinished, and `SessionSpawn` stays
-  the native, owner-bound tool. See
-  [Internal default-off native input and copy](docs/session-host-alpha.md#internal-default-off-native-input-and-copy).
+- Authenticated input-origin framing and origin-bearing clipboard capsules for the
+  existing owned Node stdio bridge (#389). Payloads and explicit origins are
+  authenticated, and a separate signed readiness signal precedes framed input. The host
+  mode gates both user input and non-user terminal replies, refuses unknown bootstrap
+  modes, and sets native capture only for the hosted child tree with ordinary descendant
+  inheritance. Normal production Main enables it by default for the children it creates;
+  only a dependency-only explicit-false test seam keeps the legacy call shape, and no
+  viewer setting toggles it. Local/SSH copying and standalone Pi remain unchanged, a
+  rowless New-form Host choice can ask one connected owner for a blank child,
+  `SessionSpawn` stays the native, owner-bound tool, and remote saved conversations,
+  resume, catalog/history, and human handoff remain unfinished.
+- Native input and text copy for the one selected remote viewport, on the existing
+  selected-content lane (#389), enabled by default in normal production Main. Main always
+  gives the coordinator its native I/O callbacks, so `native-input-copy-v1` negotiation and
+  the owner side's capability are fixed for the host's lifetime and never depend on this
+  host's own viewer setting. A new remembered Network setting, **Remote input/copy**, is
+  this VIEWER's own switch for its displayed remote pane (on for a new installation or an
+  otherwise valid older settings document; an explicit Off survives restarts). Off refuses
+  keyboard, mouse, and paste with one brief fixed notice and writes no completed copy to
+  the clipboard; it never disconnects, revokes, changes Hosting/Auto, stops children,
+  cancels accepted owner work, or affects the owner's local input/copy, other viewers, or
+  the sidebar's New, Close, and Saved actions. Keyboard, canonical mouse, and whole text
+  paste are admitted only against the actually written, uncovered, Main-focused viewer
+  frame and re-proved against current owner facts, the current TLS-proved peer, pin,
+  directional grant, endpoint, subscription, selection, and that setting, before every
+  protected write and after caller callbacks; an actual setting change (including Off and
+  back On) invalidates earlier admissions and written receipts, so turning it back on needs
+  a fresh written frame even when the pixels match. The source token is descriptive, not a
+  grant, and the owner's Main need not display or focus the controlled row. A paste is
+  validated whole up to 1 MiB of decoded UTF-8 before one PTY handoff, and a copy is
+  retained whole up to the unchanged 100,000-character native bound and returned only to
+  the exact initiating viewer. Ordinary output with unchanged semantic source and modes
+  does not stall input; source- or mode-only changes still need a real writer boundary.
+  Refusals stay brief and non-modal; only a pre-invoke refusal is `not-sent`, and an
+  invoked loss is truthfully unknown without replay. Close behavior, local/SSH copying,
+  and native producers are unchanged. Remote saved conversations, resume,
+  catalog/history, startup project-trust input, and human handoff remain unfinished, and
+  `SessionSpawn` stays the native, owner-bound tool. See
+  [Native input and copy](docs/session-host-alpha.md#native-input-and-copy).
+- A separate remembered OWNER-side Network setting, **Allow remote history deletion**
+  (#389): whether this host exposes remote saved-history deletion to its paired viewers.
+  It is on by default and an explicit Off survives restarts; it is not a viewer-side delete
+  toggle and does not gate this host's own local Saved deletion. The coordinator exposes
+  the live value for the owner's future Saved provider; no remote history endpoint exists
+  yet, so today the setting is stored and displayed only. Both new settings are optional
+  fields of the existing version-1 protected preferences document; malformed values or
+  unavailable storage are refused untouched and never treated as the default-on values.
 - A TLS/WSS peer-transport foundation with KDE-style explicit device pairing (#475).
   Explicit callers supply generated self-signed identities, consent and trust stores, and
   a listener address; module import alone still enables nothing. Actual TLS peer keys,
@@ -149,7 +163,8 @@ dates.
   pairing callback also exposes its actual configured deadline and sanitized settlement
   without changing consent authority or timeout defaults (#475). The optional network
   sidebar now builds its saved settings, listener, and consent surface on this state
-  (#482); the internal native input/copy extension remains default-off, one deliberately
+  (#482); native input/copy for the displayed remote pane is on by default with a
+  per-viewer Remote input/copy setting, one deliberately
   selected remote row's native viewport can now be displayed, and a rowless New-form
   Host choice can now ask one connected owner for a blank child; `SessionSpawn` stays the
   native, owner-bound tool, while remote saved conversations, resume, catalog/history,
@@ -166,10 +181,10 @@ dates.
   stops remote work or silently selects another row. Exact source,
   run, generation, geometry, and written-display fences remain fail closed; 64 KiB bounds
   messages, not whole viewports. Native input, text paste, and copy travel only through
-  the separate internal, explicitly opted-in extension described above; ordinary
-  operation remains display-only, and remote saved conversations, resume,
-  catalog/history, and human handoff remain unfinished at this interim checkpoint, not a
-  permanent view-only mode; `SessionSpawn` stays the native, owner-bound tool.
+  the default-on native input/copy bridge described above, subject to this viewer's
+  Remote input/copy setting; remote saved conversations, resume, catalog/history, and
+  human handoff remain unfinished at this interim checkpoint, and `SessionSpawn` stays the
+  native, owner-bound tool.
   Ordinary Pi and authenticated local/SSH clipboard are unchanged. See
   [Selected native viewport](docs/session-host-alpha.md#selected-native-viewport-interim-display-scope).
 - The optional native session host now wires a **Network** sidebar over the paired peer
@@ -198,7 +213,9 @@ dates.
   explicit Add action, rather than a sequential wizard.
   Connected rows stay metadata-only until one is deliberately selected. Close is
   owner-routed as described above; native input, text paste, and copy are reachable only
-  through the internal default-off extension; a deliberate New-form Host choice can ask
+  through the default-on bridge and this viewer's Remote input/copy setting, and the
+  separate Allow remote history deletion setting is an owner-side policy; a deliberate
+  New-form Host choice can ask
   one connected owner for a blank child, and `SessionSpawn` stays the native, owner-bound
   tool; remote saved conversations, resume, catalog/history, and human handoff remain
   unimplemented; no view-only permission kind or controller lease is invented. See

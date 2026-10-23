@@ -21,6 +21,16 @@
  *   Nothing here selects a wildcard or a fallback port.
  * - autoReconnect: remembered, off by default.
  * - bellEnabled: remembered, on by default.
+ * - viewerNativeInputEnabled: THIS viewing host's remote native input/copy
+ *   preference for the remote pane it displays. Optional in the document: an
+ *   absent field (a new installation or an otherwise valid older document) is
+ *   on, and only an explicit `false` is written and remembered. It never
+ *   changes hosting, Auto, connections, grants, or this host's own children.
+ * - remoteHistoryDeleteEnabled: THIS owner host's policy for exposing remote
+ *   saved-history deletion to its paired viewers. Optional with the same rule:
+ *   absent is enabled, and only an explicit `false` is written. It is an owner
+ *   policy fact, never a viewer-side delete toggle, and it never gates this
+ *   host's own local Saved deletion.
  * - destinations: opaque local ids with a bounded display alias, endpoint, a
  *   successful-connection history flag, and explicit reconnect suppression.
  *
@@ -33,9 +43,10 @@
  * - A genuinely absent document means "no saved preferences": reads return
  *   `null` and create no file, directory, key, socket, or timer.
  * - An existing dedicated directory without a valid document, an unknown
- *   version, an unknown/missing field, a duplicate id, an out-of-range
- *   endpoint, unsafe path, or unverified protection is refused untouched. It is
- *   never treated as empty and never overwritten with defaults.
+ *   version, an unknown/missing required field, a present optional flag that is
+ *   not a boolean, a duplicate id, an out-of-range endpoint, unsafe path, or
+ *   unverified protection is refused untouched. It is never treated as empty or
+ *   as the default-on flags, and never overwritten with defaults.
  * - Protection is established on the owned, still-empty temporary before any
  *   preference byte is written; a private containing directory is required by
  *   the injected platform policy (Windows ACLs included), not by mode bits here.
@@ -146,6 +157,18 @@ export interface PeerPreferences {
 	readonly hosting: PeerHostingPreferences;
 	readonly autoReconnect: boolean;
 	readonly bellEnabled: boolean;
+	/**
+	 * Effective viewer-side remote native input/copy preference for the remote
+	 * pane THIS host displays. True when the document omits it; only an explicit
+	 * `false` is persisted.
+	 */
+	readonly viewerNativeInputEnabled: boolean;
+	/**
+	 * Effective owner-side policy for exposing remote saved-history deletion to
+	 * paired viewers. True when the document omits it; only an explicit `false`
+	 * is persisted. It never gates local Saved deletion.
+	 */
+	readonly remoteHistoryDeleteEnabled: boolean;
 	readonly destinations: readonly PeerDestination[];
 }
 
@@ -154,8 +177,14 @@ export const DEFAULT_PEER_PREFERENCES: PeerPreferences = Object.freeze({
 	hosting: Object.freeze({ enabled: false, bindHost: null, bindPort: null }),
 	autoReconnect: false,
 	bellEnabled: true,
+	viewerNativeInputEnabled: true,
+	remoteHistoryDeleteEnabled: true,
 	destinations: Object.freeze([]) as readonly PeerDestination[],
 });
+
+/** Optional top-level document fields; absence means the default-on value. */
+const VIEWER_NATIVE_INPUT_FIELD = "viewerNativeInputEnabled";
+const REMOTE_HISTORY_DELETE_FIELD = "remoteHistoryDeleteEnabled";
 
 export interface OpenPeerPreferencesStoreOptions {
 	/** Canonical Pi agent directory; must already exist as a real directory. */
@@ -217,13 +246,36 @@ function isSavedPort(value: unknown, allowZero: boolean): value is number {
 	);
 }
 
+/**
+ * One optional default-on flag. A genuinely absent key is `true`; a present key
+ * must be a real boolean, and anything else (including a present `undefined`,
+ * `null`, a string, or a number) is `undefined`, which refuses the document.
+ */
+function optionalEnabledFlag(record: Record<string, unknown>, key: string): boolean | undefined {
+	if (!Object.prototype.hasOwnProperty.call(record, key)) return true;
+	const flag = record[key];
+	return typeof flag === "boolean" ? flag : undefined;
+}
+
 /** Strict parse of one whole document; any deviation refuses the document. */
 function parsePreferences(value: unknown): PeerPreferences | undefined {
 	if (!isPlainRecord(value)) return undefined;
-	if (!hasOnlyKeys(value, ["version", "hosting", "autoReconnect", "bellEnabled", "destinations"])) return undefined;
+	if (!hasOnlyKeys(value, [
+		"version",
+		"hosting",
+		"autoReconnect",
+		"bellEnabled",
+		VIEWER_NATIVE_INPUT_FIELD,
+		REMOTE_HISTORY_DELETE_FIELD,
+		"destinations",
+	])) return undefined;
 	if (value.version !== PEER_PREFERENCES_VERSION) return undefined;
 	if (typeof value.autoReconnect !== "boolean") return undefined;
 	if (typeof value.bellEnabled !== "boolean") return undefined;
+	const viewerNativeInputEnabled = optionalEnabledFlag(value, VIEWER_NATIVE_INPUT_FIELD);
+	if (viewerNativeInputEnabled === undefined) return undefined;
+	const remoteHistoryDeleteEnabled = optionalEnabledFlag(value, REMOTE_HISTORY_DELETE_FIELD);
+	if (remoteHistoryDeleteEnabled === undefined) return undefined;
 
 	const hosting = value.hosting;
 	if (!isPlainRecord(hosting)) return undefined;
@@ -271,6 +323,8 @@ function parsePreferences(value: unknown): PeerPreferences | undefined {
 		hosting: Object.freeze({ enabled: hosting.enabled, bindHost, bindPort }),
 		autoReconnect: value.autoReconnect,
 		bellEnabled: value.bellEnabled,
+		viewerNativeInputEnabled,
+		remoteHistoryDeleteEnabled,
 		destinations: Object.freeze(destinations),
 	});
 }
@@ -296,6 +350,11 @@ function toDocument(value: unknown): unknown {
 			: hosting,
 		autoReconnect: value.autoReconnect,
 		bellEnabled: value.bellEnabled,
+		// A caller-built value always names both effective flags: these keys are
+		// always present here, so a missing or non-boolean in-memory flag is refused
+		// as a programmer error rather than silently becoming the default-on value.
+		[VIEWER_NATIVE_INPUT_FIELD]: value[VIEWER_NATIVE_INPUT_FIELD],
+		[REMOTE_HISTORY_DELETE_FIELD]: value[REMOTE_HISTORY_DELETE_FIELD],
 		destinations: Array.isArray(destinations)
 			? destinations.map((entry) => {
 				if (!isPlainRecord(entry)) return entry;
@@ -322,6 +381,8 @@ function copyPreferences(value: PeerPreferences): PeerPreferences {
 		}),
 		autoReconnect: value.autoReconnect,
 		bellEnabled: value.bellEnabled,
+		viewerNativeInputEnabled: value.viewerNativeInputEnabled,
+		remoteHistoryDeleteEnabled: value.remoteHistoryDeleteEnabled,
 		destinations: Object.freeze(value.destinations.map((destination) => Object.freeze({
 			id: destination.id,
 			label: destination.label,
@@ -343,6 +404,10 @@ function serializePreferences(value: PeerPreferences): string {
 		},
 		autoReconnect: value.autoReconnect,
 		bellEnabled: value.bellEnabled,
+		// Sparse default-on flags: only an explicit Off is written, so a document
+		// that never turned either flag off keeps the exact version-1 field set.
+		...(value.viewerNativeInputEnabled ? {} : { [VIEWER_NATIVE_INPUT_FIELD]: false }),
+		...(value.remoteHistoryDeleteEnabled ? {} : { [REMOTE_HISTORY_DELETE_FIELD]: false }),
 		destinations: value.destinations.map((destination) => ({
 			id: destination.id,
 			label: destination.label,

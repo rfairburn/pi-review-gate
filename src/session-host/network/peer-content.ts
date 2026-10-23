@@ -186,6 +186,21 @@ export interface PeerNativeCopyReceipt extends NativeIoCompletedCopy {
 }
 
 /**
+ * The live VIEWER-side remote native input/copy preference of this host.
+ *
+ * `enabled` is the current effective value (fail closed: an unavailable,
+ * unloaded, or closing settings document is `false`). `generation` advances on
+ * EVERY actual effective change, including an Off -> On return, so a proof or
+ * written receipt captured under an older generation can never be revived by a
+ * value that merely reads the same again. It grants nothing by itself and is
+ * never a lease, token, or registry entry.
+ */
+export interface PeerViewerNativeInputPolicy {
+	readonly enabled: boolean;
+	readonly generation: number;
+}
+
+/**
  * Optional native input / text-copy callbacks of the ONE coordinator.
  *
  * Both functions are required for the extension to exist at all: omitting the
@@ -242,12 +257,19 @@ export interface PeerContentController {
 	/**
 	 * Descriptive facts of the exact native input target of the currently
 	 * published stream, or `undefined` while no explicit native IO mode is
-	 * configured, nothing is selected, the stream is not current, the endpoint's
-	 * own fences no longer hold, or the publisher offers no source. It never
-	 * invokes the caller's proof callback and never selects or rewrites a target,
-	 * so a caller may read it from inside that callback.
+	 * configured, this viewer's remote input/copy preference is Off, nothing is
+	 * selected, the stream is not current, the endpoint's own fences no longer
+	 * hold, or the publisher offers no source. It never invokes the caller's proof
+	 * callback and never selects or rewrites a target, so a caller may read it from
+	 * inside that callback.
 	 */
 	readNativeInputTarget?(): PeerNativeInputTarget | undefined;
+	/**
+	 * The live viewer-side remote input/copy preference and its change generation.
+	 * Pure description, safe to read from inside the caller's own proof callback.
+	 * A controller without it offers no viewer forwarding at all.
+	 */
+	readViewerNativeInputPolicy?(): PeerViewerNativeInputPolicy;
 	/**
 	 * Submit one caller-normalized native input against the caller's own expected
 	 * target. It re-proves the current selection, peer, run, row, subscription,

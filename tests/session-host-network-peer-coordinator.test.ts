@@ -10,7 +10,7 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import https from "node:https";
 import net from "node:net";
 import test, { type TestContext } from "node:test";
@@ -387,7 +387,11 @@ test("a fresh sidebar reads honest defaults, creates nothing, and saves settings
 		bindPort: null,
 		autoReconnect: false,
 		bellEnabled: true,
+		// A genuinely new installation reports both deliberately default-on flags.
+		viewerNativeInputEnabled: true,
+		remoteHistoryDeleteEnabled: true,
 	});
+	assert.equal(side.coordinator.readRemoteHistoryDeleteEnabled(), true);
 	assert.equal(snapshot.identityFingerprint, null);
 	assert.deepEqual(snapshot.listener, { state: "off", host: null, port: null, message: null });
 	assert.deepEqual(snapshot.hosts, []);
@@ -3145,6 +3149,265 @@ test("source ABA during coordinator admission cannot revive the old request", as
 	}));
 	assert.deepEqual(served, { status: "submitted" });
 	assert.equal(lane.framesOfType("input").length, 1);
+});
+
+test("viewer Remote input/copy Off refuses input and drops copies without touching the connection or lane", async (t) => {
+	const owner = await startContentOwner(t);
+	const lanes = contentLaneFixture();
+	const proofs: PeerNativeInputTarget[] = [];
+	const receipts: PeerNativeCopyReceipt[] = [];
+	const { viewer, hostId, runId, lane } = await selectScriptedContent(t, owner.side, lanes, {
+		authorizeInput: (target) => {
+			proofs.push(target);
+			return true;
+		},
+		onCopy: (receipt) => {
+			receipts.push(receipt);
+		},
+	});
+	const source = inputSourceFixture({ hostRunId: runId });
+	lane.publish({ sequence: 1, source });
+	await waitForScriptedContent(viewer, "the scripted native viewport");
+	const exact = inputRequestFixture({ hostId, subscriptionId: lane.subscriptionId, source });
+	// Production default: a fresh viewer forwards input with no injected opt-in.
+	const initial = viewer.coordinator.content.readViewerNativeInputPolicy?.();
+	assert.equal(initial?.enabled, true);
+	assert.deepEqual(await viewer.coordinator.content.sendNativeInput?.(exact), { status: "submitted" });
+	lane.copy({ sequence: 1, dispatchId: 1, text: "while on", source });
+	assert.equal(receipts.length, 1);
+	const hellos = lane.framesOfType("hello").length;
+	const subscribes = lane.framesOfType("subscribe").length;
+
+	await viewer.coordinator.perform({ type: "peer-viewer-native-input", enabled: false });
+	const off = viewer.coordinator.read();
+	assert.equal(off.settings?.viewerNativeInputEnabled, false);
+	assert.equal(off.settings?.remoteHistoryDeleteEnabled, true, "the owner policy is a separate setting");
+	const offPolicy = viewer.coordinator.content.readViewerNativeInputPolicy?.();
+	assert.equal(offPolicy?.enabled, false);
+	assert.ok(initial !== undefined && offPolicy !== undefined && offPolicy.generation > initial.generation,
+		"an actual change advances the policy generation");
+	// Nothing is described, no proof is consulted, nothing is written, and a
+	// completed copy is dropped instead of reaching the clipboard callback.
+	const proofsBefore = proofs.length;
+	assert.equal(viewer.coordinator.content.readNativeInputTarget?.(), undefined);
+	assert.deepEqual(await viewer.coordinator.content.sendNativeInput?.(exact),
+		{ status: "not-sent", reason: "unauthorized" });
+	assert.equal(proofs.length, proofsBefore, "Off refuses before the caller's proof runs");
+	assert.equal(lane.framesOfType("input").length, 1, "nothing new reached the wire while Off");
+	lane.copy({ sequence: 2, dispatchId: 2, text: "while off", source });
+	assert.equal(receipts.length, 1, "Off suppresses copy delivery");
+	// The viewing connection, the selected stream, the owner, and the content lane
+	// are untouched: no disconnect, revoke, reconnect, or re-negotiation.
+	assert.equal(off.hosts?.[0]?.state, "connected");
+	assert.equal(viewer.coordinator.content.readContent().state, "current");
+	assert.equal(lanes.lanes.length, 1, "no new content lane was opened");
+	assert.equal(lane.framesOfType("hello").length, hellos);
+	assert.equal(lane.framesOfType("subscribe").length, subscribes);
+	assert.equal(lane.framesOfType("unsubscribe").length, 0);
+	assert.equal(owner.side.coordinator.read().listener.state, "listening", "the owner keeps hosting");
+	assert.equal(owner.side.coordinator.read().trustedPeers?.[0]?.hasInboundGrant, true, "no grant is revoked");
+
+	// Back On: the same live stream serves a freshly proven request again.
+	await viewer.coordinator.perform({ type: "peer-viewer-native-input", enabled: true });
+	const onPolicy = viewer.coordinator.content.readViewerNativeInputPolicy?.();
+	assert.equal(onPolicy?.enabled, true);
+	assert.ok(offPolicy !== undefined && onPolicy !== undefined && onPolicy.generation > offPolicy.generation);
+	assert.deepEqual(await viewer.coordinator.content.sendNativeInput?.(exact), { status: "submitted" });
+	assert.equal(lane.framesOfType("input").length, 2);
+	lane.copy({ sequence: 3, dispatchId: 3, text: "on again", source });
+	assert.equal(receipts.length, 2);
+	assert.equal(lanes.lanes.length, 1);
+});
+
+test("a viewer preference Off -> On inside the caller's proof never revives that admission", async (t) => {
+	const owner = await startContentOwner(t);
+	let toggling: ContentSide | undefined;
+	let transition: "off" | "off-on" | undefined;
+	const { viewer, hostId, runId, lane } = await selectScriptedContent(t, owner.side, contentLaneFixture(), {
+		authorizeInput: () => {
+			const action = transition;
+			transition = undefined;
+			if (action !== undefined && toggling !== undefined) {
+				// The caller's own proof is arbitrary code: it changes the saved viewer
+				// preference synchronously and still claims success.
+				void toggling.coordinator.perform({ type: "peer-viewer-native-input", enabled: false });
+				if (action === "off-on") {
+					void toggling.coordinator.perform({ type: "peer-viewer-native-input", enabled: true });
+				}
+			}
+			return true;
+		},
+		onCopy: () => undefined,
+	});
+	toggling = viewer;
+	const source = inputSourceFixture({ hostRunId: runId });
+	lane.publish({ sequence: 1, source });
+	await waitForScriptedContent(viewer, "the scripted native viewport");
+	const exact = inputRequestFixture({ hostId, subscriptionId: lane.subscriptionId, source });
+
+	transition = "off-on";
+	// The preference reads On again after the proof returns, but its generation
+	// moved twice, so this admission can never be written.
+	assert.deepEqual(await viewer.coordinator.content.sendNativeInput?.(exact),
+		{ status: "not-sent", reason: "stale-source" });
+	assert.equal(viewer.coordinator.read().settings?.viewerNativeInputEnabled, true);
+	assert.equal(lane.framesOfType("input").length, 0, "an Off -> On ABA writes nothing for the old admission");
+
+	transition = "off";
+	assert.deepEqual(await viewer.coordinator.content.sendNativeInput?.(exact),
+		{ status: "not-sent", reason: "unauthorized" });
+	assert.equal(lane.framesOfType("input").length, 0);
+	assert.equal(viewer.coordinator.read().settings?.viewerNativeInputEnabled, false);
+
+	// A request proven after the preference settled On again is served normally.
+	await viewer.coordinator.perform({ type: "peer-viewer-native-input", enabled: true });
+	assert.deepEqual(await viewer.coordinator.content.sendNativeInput?.(exact), { status: "submitted" });
+	assert.equal(lane.framesOfType("input").length, 1);
+});
+
+test("an owner host's own viewer preference Off never changes what it serves to another viewer", async (t) => {
+	// The owner host turned its OWN viewer preference Off. Its owner endpoint was
+	// fixed at start from the coordinator's callbacks, so another host's view of it
+	// is served exactly as before, and that other viewer's preference is its own.
+	const owner = await startContentOwner(t, { authorizeInput: () => true, onCopy: () => undefined });
+	await owner.side.coordinator.perform({ type: "peer-viewer-native-input", enabled: false });
+	assert.equal(owner.side.coordinator.read().settings?.viewerNativeInputEnabled, false);
+	const { viewer, observation } = await connectContentStream(t, owner.side, {
+		nativeIo: { authorizeInput: () => true, onCopy: () => undefined },
+	});
+	assert.ok(observation.view, "the remote viewer still receives the stream");
+	assert.equal(observation.view.snapshot.meta.sessionId, CONTENT_ROW);
+	assert.equal(viewer.coordinator.read().settings?.viewerNativeInputEnabled, true,
+		"another viewer's preference is independent");
+	assert.equal(viewer.coordinator.content.readViewerNativeInputPolicy?.().enabled, true);
+	assert.equal(owner.side.coordinator.read().listener.state, "listening");
+	assert.equal(owner.side.coordinator.read().trustedPeers?.[0]?.hasInboundGrant, true);
+});
+
+test("viewer input/copy and owner history-deletion settings persist independently and create no identity", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const preferencesPolicy = createPosixTestPolicy();
+	const open = async (): Promise<{ coordinator: ReturnType<typeof createPeerCoordinator>; log: SnapshotLog }> => {
+		const log = createSnapshotLog();
+		const coordinator = createPeerCoordinator({
+			agentDir: fixture.agentDir,
+			inventory: createFakeInventory(),
+			onChange: log.onChange,
+			onIncomingConsentArrival: log.onArrival,
+			testHooks: { preferencesPermissions: preferencesPolicy, peerStatePermissions: createPosixTestPolicy() },
+			nativeIo: { authorizeInput: () => true, onCopy: () => undefined },
+		});
+		t.after(async () => {
+			try {
+				await coordinator.close();
+			} catch {
+				// A rejected close is an observed outcome, never a hook failure.
+			}
+		});
+		// Before start nothing is loaded, so both facts are fail-closed Off.
+		assert.equal(coordinator.readRemoteHistoryDeleteEnabled(), false);
+		assert.equal(coordinator.content.readViewerNativeInputPolicy?.().enabled, false);
+		await coordinator.start();
+		return { coordinator, log };
+	};
+
+	const first = await open();
+	assert.equal(first.coordinator.read().settings?.viewerNativeInputEnabled, true);
+	assert.equal(first.coordinator.read().settings?.remoteHistoryDeleteEnabled, true);
+	assert.equal(first.coordinator.readRemoteHistoryDeleteEnabled(), true);
+	assert.equal(first.coordinator.content.readViewerNativeInputPolicy?.().enabled, true);
+
+	await first.coordinator.perform({ type: "peer-viewer-native-input", enabled: false });
+	let raw = readPreferencesJson(fixture);
+	assert.equal(raw.viewerNativeInputEnabled, false, "the viewer Off is written before it is published");
+	assert.equal(Object.prototype.hasOwnProperty.call(raw, "remoteHistoryDeleteEnabled"), false);
+	assert.equal(first.coordinator.readRemoteHistoryDeleteEnabled(), true, "viewer Off never changes the owner policy");
+	await first.coordinator.perform({ type: "peer-remote-history-delete", enabled: false });
+	assert.equal(first.coordinator.readRemoteHistoryDeleteEnabled(), false);
+	assert.equal(first.coordinator.read().settings?.remoteHistoryDeleteEnabled, false);
+	assert.equal(first.coordinator.read().settings?.viewerNativeInputEnabled, false);
+	// Settings alone create no identity, key directory, or listener.
+	assert.equal(existsSync(fixture.peersDir), false);
+	assert.equal(existsSync(fixture.statePath), false);
+	assert.equal(first.coordinator.read().identityFingerprint, null);
+	assert.equal(first.coordinator.read().listener.state, "off");
+
+	// Every unrelated command preserves both explicit Offs.
+	await first.coordinator.perform({ type: "peer-bell", enabled: false });
+	await first.coordinator.perform({ type: "peer-auto-reconnect", enabled: true });
+	await first.coordinator.perform({ type: "peer-add", label: "Kept", host: "127.0.0.1", port: "40060" });
+	await first.coordinator.perform({ type: "peer-listener", enabled: false, host: "127.0.0.1", port: "40061" });
+	raw = readPreferencesJson(fixture);
+	assert.equal(raw.viewerNativeInputEnabled, false);
+	assert.equal(raw.remoteHistoryDeleteEnabled, false);
+	assert.equal(raw.bellEnabled, false);
+	assert.equal(raw.autoReconnect, true);
+
+	// A malformed command changes nothing and reports the fixed refusal.
+	await first.coordinator.perform({ type: "peer-viewer-native-input", enabled: "yes" } as never);
+	assert.match(first.coordinator.read().notice ?? "", /ignored/);
+	await first.coordinator.perform({ type: "peer-remote-history-delete" } as never);
+	assert.equal(first.coordinator.read().settings?.viewerNativeInputEnabled, false);
+	assert.equal(first.coordinator.read().settings?.remoteHistoryDeleteEnabled, false);
+
+	// A failed save keeps the existing semantics: nothing unsaved takes effect.
+	preferencesPolicy.fail = (call) => call.operation === "protectCreatedFile";
+	await first.coordinator.perform({ type: "peer-viewer-native-input", enabled: true });
+	await first.coordinator.perform({ type: "peer-remote-history-delete", enabled: true });
+	assert.equal(first.coordinator.read().settings?.viewerNativeInputEnabled, false);
+	assert.equal(first.coordinator.read().settings?.remoteHistoryDeleteEnabled, false);
+	assert.equal(first.coordinator.content.readViewerNativeInputPolicy?.().enabled, false);
+	assert.equal(first.coordinator.readRemoteHistoryDeleteEnabled(), false);
+	assert.match(first.coordinator.read().notice ?? "", /could not be saved/);
+	preferencesPolicy.fail = null;
+
+	// Explicit Offs are remembered across a restart; a closed coordinator is Off.
+	await first.coordinator.close();
+	assert.equal(first.coordinator.readRemoteHistoryDeleteEnabled(), false);
+	assert.equal(first.coordinator.content.readViewerNativeInputPolicy?.().enabled, false);
+	const second = await open();
+	assert.equal(second.coordinator.read().settings?.viewerNativeInputEnabled, false);
+	assert.equal(second.coordinator.read().settings?.remoteHistoryDeleteEnabled, false);
+	assert.equal(second.coordinator.readRemoteHistoryDeleteEnabled(), false);
+	assert.equal(second.coordinator.content.readViewerNativeInputPolicy?.().enabled, false);
+	assert.equal(second.coordinator.read().hosts?.[0]?.label, "Kept");
+});
+
+test("a present malformed flag makes settings unavailable, untouched, and both facts Off", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const seed = await startCoordinator(t, { agentDir: fixture.agentDir, testHooks: hooks() });
+	await seed.coordinator.perform({ type: "peer-bell", enabled: false });
+	await seed.coordinator.close();
+	const document = { ...readPreferencesJson(fixture), viewerNativeInputEnabled: "false" };
+	// Same protected inode, only its bytes replaced, exactly as a damaged file would be.
+	writeFileSync(fixture.preferencesPath, `${JSON.stringify(document)}\n`);
+	const before = readFileSync(fixture.preferencesPath);
+
+	const log = createSnapshotLog();
+	const coordinator = createPeerCoordinator({
+		agentDir: fixture.agentDir,
+		inventory: createFakeInventory(),
+		onChange: log.onChange,
+		onIncomingConsentArrival: log.onArrival,
+		testHooks: hooks(),
+		nativeIo: { authorizeInput: () => true, onCopy: () => undefined },
+	});
+	t.after(async () => {
+		try {
+			await coordinator.close();
+		} catch {
+			// A rejected close is an observed outcome, never a hook failure.
+		}
+	});
+	await coordinator.start();
+	assert.equal(coordinator.read().status, "unavailable");
+	assert.equal(coordinator.read().settings, null, "a malformed flag is never displayed as its default");
+	assert.equal(coordinator.readRemoteHistoryDeleteEnabled(), false);
+	assert.equal(coordinator.content.readViewerNativeInputPolicy?.().enabled, false);
+	await coordinator.perform({ type: "peer-viewer-native-input", enabled: true });
+	await coordinator.perform({ type: "peer-remote-history-delete", enabled: true });
+	assert.match(coordinator.read().notice ?? "", /unavailable/);
+	assert.deepEqual(readFileSync(fixture.preferencesPath), before, "the refused document is never repaired");
 });
 
 test("a throwing request accessor is a malformed-input refusal, not a rejection", async (t) => {

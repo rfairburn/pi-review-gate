@@ -147,9 +147,12 @@ Trust and preferences are stored separately. The protected trust document holds 
 identity, accepted peers, directional receiving grants, and remembered outgoing server
 keys; it has no age-based expiry: outgoing pins persist until an explicit Remove of their
 destination, and receiving permission persists until an explicit Revoke. Hosting intent,
-the Auto and bell settings, and saved destinations live in a separate protected
-preferences document, so changing a display setting never creates an identity, a peer-key
-directory, or key material. Both documents require verified actual operating-system
+the Auto and bell settings, the viewer-side Remote input/copy setting, the owner-side
+remote history-deletion exposure policy, and saved destinations live in a separate
+protected preferences document, so changing a display setting never creates an identity,
+a peer-key directory, key material, or a listener. The two newer settings are optional
+default-on fields of the same version-1 document: absent is on, an explicit Off is
+remembered, and a present non-boolean value makes the whole document unavailable. Both documents require verified actual operating-system
 protection (owner/private modes and supported ACL checks, or Windows owner/DACL evidence)
 before private or preference bytes are written. They are not encrypted at rest and use no
 OS credential-store service. Unknown, malformed, oversized, unknown-version,
@@ -214,26 +217,33 @@ display is part of the same implemented grant scope, a lost stream is stale or u
 with the deliberate target preserved, and no local row, sibling destination, or silent
 fallback replaces it.
 
-Remote keyboard, canonical mouse, whole text paste, and text-copy transport now exist only
-as an internal, explicitly opted-in extension of that same content lane; the production
-Main caller never enables it, and there is no CLI, environment, configuration, or UI
-opt-in, live-child retrofit, human handoff, or system-environment change. Without that
-opt-in, native input still fails closed: packets are not forwarded to a remote owner and
-no local child receives them on that stream's behalf, so ordinary remote viewing
-remains display-only. When an explicit host caller supplies the closed internal seam,
-`native-input-copy-v1` negotiation is explicit and default-empty. Every protected write
-is re-proved against the actually written, uncovered, Main-focused viewer frame plus
-current owner facts, the current TLS-proved peer key, remembered pin, directional
-grant, endpoint, subscription, and selection. That dynamic proof runs before every write
-and is re-checked after callback reentry; the source token is descriptive rather than a
-grant or lease. A whole paste is validated up to exactly 1 MiB of decoded UTF-8 before
+Remote keyboard, canonical mouse, whole text paste, and text-copy transport ride that same
+content lane through a native I/O bridge that normal production Main enables by default;
+there is no CLI, environment, or configuration flag, live-child retrofit, human handoff,
+or system-environment change, and only a dependency-only explicit-false test seam keeps
+the legacy display-only path. Each viewing sidebar has its own remembered Remote
+input/copy setting (default on). Turning it off stops only that viewer's forwarding of
+input and copies for the remote pane it displays; it never disconnects, revokes, changes
+owner framing, Hosting, Auto, or another viewer, and it does not cancel owner work that
+was already accepted. Unavailable or malformed settings are treated as off, never as the
+default. `native-input-copy-v1` negotiation is explicit and fixed for the coordinator's
+lifetime. Every protected write is re-proved against the actually written, uncovered,
+Main-focused viewer frame plus current owner facts, the current TLS-proved peer key,
+remembered pin, directional grant, endpoint, subscription, selection, and the viewer's
+current setting. That dynamic proof runs before every write and is re-checked after
+callback reentry; an actual setting change (including Off and back On) invalidates
+earlier admissions and written receipts, and the source token is descriptive rather than
+a grant or lease. A whole paste is validated up to exactly 1 MiB of decoded UTF-8 before
 one PTY handoff and is never truncated, and a completed copy reaches only its exact
 initiating viewer. Input submission reports `not-sent` only before any transport-write invocation,
 `submitted` only as local transport completion, and a possibly invoked loss or source change as
-`unknown`, with no replay, retry, or cancellation claim. Remote creation, `SessionSpawn`,
-resume, and human handoff remain unimplemented. The default-off state is an interim
-integration boundary, not a permanent view-only policy. Close remains owner-routed from
-the requesting sidebar's actually written highlighted row, as described below.
+`unknown`, with no replay, retry, or cancellation claim. A network `SessionSpawn`, remote
+saved conversations and resume, and human handoff remain unimplemented. The owner's
+separate remote history-deletion exposure policy (default on, remembered Off) is a live
+readable fact for a future owner-side Saved provider; it is not a viewer-side toggle, does
+not gate local Saved deletion, and no remote history endpoint exists yet. Close remains
+owner-routed from the requesting sidebar's actually written highlighted row, as described
+below.
 
 The optional owner Close capability runs over the existing roster channel, not a new
 listener or permission kind. The current TLS-proved key, pin, and owner's receiving
@@ -268,27 +278,28 @@ Main input owner all gate the generated outer-terminal request. Missing/changed 
 provenance fails closed. This is an application integration fence, not a sandbox against
 trusted executable extensions with the user's process authority.
 
-An opt-in owned-bridge foundation can authenticate ASCII input fragments, including
+The owned-bridge input framing can authenticate ASCII input fragments, including
 payload bytes and explicit local, non-user, or opaque viewer origins, and carry that
 immutable origin through asynchronous native copy callbacks in a separate v2 capsule.
 Its signed one-shot readiness statement proves only decoder installation, not input
-permission, a drawn source, or clipboard delivery. The internal default-off host mode
-requires that readiness before both local user writes and non-user terminal replies;
-unknown bootstrap modes or requested installation failures refuse without downgrade,
-raw fallback, queue or replay. Non-user input cannot authorize a copy.
+permission, a drawn source, or clipboard delivery. This host mode is on by default for
+the children normal production Main creates (only a dependency-only explicit-false test
+seam omits it), and it requires that readiness before both local user writes and non-user
+terminal replies; unknown bootstrap modes or requested installation failures refuse
+without downgrade, raw fallback, queue or replay. Non-user input cannot authorize a copy.
+A viewer's Remote input/copy setting never toggles this owner-side framing.
 
-Only explicitly opted-in native children receive a cloned environment with
-Pi's static `PI_CLIPBOARD_OSC52=1` capture flag; normal descendant inheritance stays
-inside that hosted process tree. Native owner OS clipboard writes stay unchanged.
-Local-origin capsules still require existing current/liveness/written/uncovered source
-proof; viewer-origin capsules never fall back to the owner's outer terminal or local
-clipboard callback. Under the same internal host opt-in, a completed viewer-origin copy
-travels only to its exact initiating viewer, with the full native encoded payload up to
-the unchanged 100,000-character producer bound retained whole. No production Main caller
-enables this mode, so no forced capture, native input or copy transport, native Pi change,
-system environment change, or live retrofit is activated by this checkpoint. Authenticated
-local and SSH clipboard copying is unchanged, nothing is broadcast, and raw PTY OSC 52
-stays denied.
+Native children created with that bridge receive a cloned environment with Pi's static
+`PI_CLIPBOARD_OSC52=1` capture flag; normal descendant inheritance stays inside that
+hosted process tree, and standalone launches and the system environment are unchanged.
+Native owner OS clipboard writes stay unchanged. Local-origin capsules still require
+existing current/liveness/written/uncovered source proof; viewer-origin capsules never
+fall back to the owner's outer terminal or local clipboard callback. A completed
+viewer-origin copy travels only to its exact initiating viewer, with the full native
+encoded payload up to the unchanged 100,000-character producer bound retained whole, and
+that viewer writes it to its own terminal only while its Remote input/copy setting is on.
+No native Pi change or live retrofit is involved. Authenticated local and SSH clipboard
+copying is unchanged, nothing is broadcast, and raw PTY OSC 52 stays denied.
 
 The selected text is transient transport data, not a new diagnostic, roster, or clipboard
 history. Source stacks are inspected in memory and not logged. HMAC authenticates but

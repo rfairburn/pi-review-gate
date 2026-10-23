@@ -265,7 +265,7 @@ per-file tool-observation diffs, task/assistant context, and reviewer read acces
 Mandatory construction, checkpoint, and landing verification is unchanged.
 These rows select evidence for that context, not the operating mode, whether review
 runs, or who reviews. **Snapshot-failure fallback** remains a separate **Off** / **On**
-opt-in (default **Off**) for qualifying review-evidence capture failures, not a fourth execution context.
+choice (default **On**) for qualifying review-evidence capture failures, not a fourth execution context.
 The stored fields are documented in
 [Configuration](configuration.md#review-evidence-methods).
 
@@ -298,7 +298,9 @@ retries, and continuations; later Add tasks capture the then-current live choice
 Applying settings does not intercept or reconfigure in-flight tasks. This guarantee
 is specific to evidence policy; it does not freeze all routing or reviewer settings.
 
-Fallback Off leaves capture failure blocking. When On actually substitutes current
+With fallback Off, an eligible Primary baseline failure warns that review is disabled
+and the turn continues unreviewed; other capture failures still block
+([details](review-workflow.md#snapshot-failure-fallback)). When On actually substitutes current
 retained tool evidence for an eligible failed snapshot, a prominent warning identifies
 the originating review context, and the reviewer receives the truthful
 **Tools only (snapshot-failure fallback)** basis. For Primary the warning is a local

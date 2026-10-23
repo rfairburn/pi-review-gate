@@ -129,7 +129,7 @@ test("every alpha action is pinned to an immutable commit SHA matching ci.yml", 
 test("alpha matrix runs windows-latest on both supported Node lines", () => {
   const job = jobBlock(readAlpha());
   assert.match(job, /runs-on: windows-latest/, "the acceptance needs a genuinely native Windows runner");
-  assert.match(job, /node-version: \[22\.19\.0, 24\.x\]/, "both supported Node lines stay in the matrix");
+  assert.match(job, /node-version: \[22\.23\.4, 24\.22\.1\]/, "both supported Node lines stay in the matrix");
   assert.match(job, /fail-fast: false/);
 });
 

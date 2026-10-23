@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.191]
+## [0.1.0-dev.193]
 
 ### Added
 
@@ -259,6 +259,55 @@ dates.
 - A single left press on a drawn Network menu row now performs its normal Enter action
   once (#482). Captured row positions and displayed action values fence stale or unwritten
   clicks; opening consent review decides nothing, and host gestures never reach a child.
+
+## [0.1.0-dev.192]
+
+### Changed
+
+- `review.evidence.snapshotFailureFallback` now defaults On when absent (#491). An
+  explicit `false` stays Off, and the default is never written back to saved settings.
+  Existing On behavior is unchanged: the Tools only (snapshot-failure fallback) warning,
+  retained tool evidence, the session latch, and `/review-clear`.
+- With the fallback explicitly Off, an eligible Primary review-baseline capture failure
+  (for example an over-budget untracked set) no longer blocks the prompt (#491). A
+  prominent local warning says review is disabled for that turn and no snapshot coverage
+  is available. The work then continues unreviewed: no Tools only substitute, no
+  reviewer, and no reviewed or passed result. The decision covers the whole turn:
+  re-arming it before settlement never captures a later baseline. Nothing latches for
+  the session, so the next fresh prompt tries a snapshot again. Capture limits and
+  eligibility are unchanged. These still block:
+  cancellation, a failed warning, ineligible failures, settlement and worker captures,
+  missing or corrupt persisted evidence, reviewer errors, and construction, checkpoint
+  and landing failures.
+
+## [0.1.0-dev.191]
+
+### Security
+
+- Node.js now has a security floor for each release line: 22.23.4 or newer on Node 22,
+  24.22.1 or newer on Node 24, and 26.12.1 or newer on Node 26 (#489). These match the
+  [October 2026 Node.js security releases](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases),
+  which include the eMudhra intermediate-CA compromise fix. The package engine range is
+  `>=22.23.4 <24.0.0 || >=24.22.1 <26.0.0 || >=26.12.1`. Later patches in a line are
+  accepted, and Node 26 is not required. Other majors keep their existing
+  eligibility. The session-host managed fallback stays on Node 22 and now bootstraps
+  the checksum-pinned official Node.js 22.23.4 archive. This release does not update
+  or restart Node.js installations or running processes. Update Node.js yourself,
+  then restart running Pi, review-gate, session-host, and web-tool processes.
+
+### Changed
+
+- CI now selects the exact patched floors (#489). The existing `verify` matrix runs
+  Node 22.23.4, 24.22.1, and 26.12.1 through the same stages, with no extra
+  full-suite stage. Its checks are now named **Verify (Node 22.23.4)**,
+  **Verify (Node 24.22.1)**, and **Verify (Node 26.12.1)**, replacing
+  **Verify (Node 22.19.0)** and **Verify (Node 24.x)**. The Linux full suite, the
+  Windows shell job, and the release builder use Node 24.22.1 and keep their check
+  names. The Windows launcher job uses Node 22.23.4 and is now named
+  **Windows launcher (Node 22.23.4)**. The Windows session-host alpha matrix uses
+  Node 22.23.4 and 24.22.1, which renames its checks to match. Earlier CI runs on
+  Node 22.19.0 and 24.x remain historical evidence, not patched-runtime runs.
+  Separate Node 26 CI work in #401 stays open.
 
 ## [0.1.0-dev.190]
 

@@ -606,9 +606,11 @@ mode, tool authority, reviewer selection, automatic-review enablement, or accept
 rules. Tool-only omits only filesystem/Git review snapshots subject to outside-writer
 contamination; bounded tool/path/content observations, targeted candidate capture, and
 reviewer read-only inspection remain. It neither sandboxes execution nor prohibits file
-reads. The separate snapshot-failure fallback opt-in also defaults Off; failure stays
-blocking unless it
-qualifies as review-evidence-only capture with fallback enabled.
+reads. The separate snapshot-failure fallback defaults On (an explicit `false` stays
+Off). Failure stays blocking unless it qualifies as review-evidence-only capture. With
+fallback explicitly Off, an eligible Primary baseline failure warns that review is
+disabled for that turn and the work continues unreviewed. That is never a Tools only
+substitute or a reviewed or passed result.
 
 An eligible fallback uses retained current tool evidence with a durable, truthful
 basis. This includes an enabled fallback on the first Primary or InPlace review-baseline

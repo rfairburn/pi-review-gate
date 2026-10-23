@@ -33,17 +33,36 @@ test("human evidence method names are distinct from unchanged machine IDs and pr
   assert.match(TOOL_ONLY_HISTORY_NOTICE, /earlier actions and claims are not exact-snapshot certification/);
 });
 
+test("#491 absent snapshot-failure fallback resolves On; an explicit Off stays Off without rewriting saved fields", () => {
+  for (const raw of [{}, { review: {} }, { review: { evidence: {} } }, { review: { evidence: { primaryToolOnly: false } } }]) {
+    const config = normalizeConfig(raw);
+    assert.equal(effectiveReviewEvidenceSettings(config).snapshotFailureFallback, true, JSON.stringify(raw));
+    assert.equal(config.review?.evidence?.snapshotFailureFallback, undefined, "the default is derived, never materialized");
+  }
+  const raw = { review: { evidence: { snapshotFailureFallback: false } } };
+  const off = normalizeConfig(raw);
+  assert.equal(effectiveReviewEvidenceSettings(off).snapshotFailureFallback, false);
+  assert.deepEqual(off.review?.evidence, { snapshotFailureFallback: false });
+  assert.deepEqual(raw, { review: { evidence: { snapshotFailureFallback: false } } }, "the saved record is untouched");
+  assert.equal(effectiveReviewEvidenceSettings(normalizeConfig({ review: { evidence: { snapshotFailureFallback: true } } })).snapshotFailureFallback, true);
+});
+
 test("worker evidence policy uses canonical settings and remains scoped to its task kind", () => {
   const defaults = effectiveReviewEvidenceSettings(normalizeConfig({}));
   assert.deepEqual(captureWorkerReviewEvidencePolicy(defaults, "execute"), {
     toolOnly: false,
-    snapshotFailureFallback: false,
+    snapshotFailureFallback: true,
     scope: "worktree",
   });
   assert.deepEqual(captureWorkerReviewEvidencePolicy(defaults, "inplace"), {
     toolOnly: false,
-    snapshotFailureFallback: false,
+    snapshotFailureFallback: true,
     scope: "inplace",
+  });
+  assert.deepEqual(captureWorkerReviewEvidencePolicy(defaults, "research"), {
+    toolOnly: false,
+    snapshotFailureFallback: false,
+    scope: "worktree",
   });
 
   const config = normalizeConfig({
@@ -122,6 +141,29 @@ test("#465 evidence warnings use only the local warning-level UI notice, never m
   assert.deepEqual(calls, []);
 });
 
+test("#491 mandatory review-disabled warnings reject missing local transports without model-facing fallback", async () => {
+  const { sendPrimaryEvidenceWarning } = await import("../src/activation/primary-evidence");
+  const calls: unknown[][] = [];
+  const modelOnly = {
+    sendMessage: (...args: unknown[]) => calls.push(["sendMessage", ...args]),
+    sendSystemMessage: (...args: unknown[]) => calls.push(["sendSystemMessage", ...args]),
+    sendUserMessage: (...args: unknown[]) => calls.push(["sendUserMessage", ...args]),
+  };
+  for (const target of [undefined, {}, modelOnly]) {
+    await assert.rejects(
+      sendPrimaryEvidenceWarning(target, "WARNING: Review disabled", true),
+      /mandatory local warning transport unavailable/,
+    );
+  }
+  assert.equal(calls.length, 0, "never falls back to a model-facing channel");
+  // Non-required warnings keep their existing silent no-op without a transport.
+  await sendPrimaryEvidenceWarning(modelOnly, "WARNING: optional", false);
+  await sendPrimaryEvidenceWarning(undefined, "WARNING: optional");
+  assert.equal(calls.length, 0);
+  await sendPrimaryEvidenceWarning({ ui: { notify: (...args: unknown[]) => calls.push(["ui.notify", ...args]) } }, "WARNING: Review disabled", true);
+  assert.deepEqual(calls, [["ui.notify", "WARNING: Review disabled", "warning"]]);
+});
+
 test("#465 known read-only observations are not reviewable Primary tool work; mutation-capable ones are", async () => {
   const { isReviewableToolObservation } = await import("../src/review-evidence");
   const event = (toolName: string, extra: Partial<{ candidatePaths: string[]; riskSignals: string[] }> = {}) => ({
@@ -149,7 +191,9 @@ test("#465 session fallback acts as Tools only only while fallback is On and nev
   assert.equal(latched.toolOnly, true);
   assert.equal(latched.sessionFallback, true);
   assert.equal(effectiveReviewEvidenceSettings(on).primaryToolOnly, false, "configuration is unchanged");
-  assert.equal(primaryEvidencePolicy(off, session).toolOnly, false, "fallback Off keeps blocking");
+  assert.equal(primaryEvidencePolicy(off, session).toolOnly, false, "fallback Off never acts as Tools only");
+  assert.equal(primaryEvidencePolicy(off, session).snapshotFailureFallback, false);
+  assert.equal(primaryEvidencePolicy(normalizeConfig({})).snapshotFailureFallback, true, "#491: absent is On");
 });
 
 test("#465 a disabled scheduled entry may keep an unresolvable worker pin; an enabled one still fails config load", () => {

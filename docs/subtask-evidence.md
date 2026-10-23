@@ -11,7 +11,7 @@ continuation, and notifications remain owned by
 
 Worker review evidence defaults to **Tools + workspace changes** (whole-workspace
 snapshot/diff review evidence). Optional **Tools only** and separate snapshot-failure
-fallback (default **Off**) are configured under
+fallback (default **On**) are configured under
 [`review.evidence`](configuration.md#review-evidence-methods); the **Evidence methods**
 menu does not change the `SubtasksInspect` navigation API or turn worker claims into
 observations. Workers pin applicable evidence/fallback policy at firing/queue admission:

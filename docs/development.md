@@ -48,8 +48,16 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
 
 ### Development prerequisites
 
-- **Node.js 22.19.0 or newer and npm.** CI exercises Node 22.19.0 (the supported
-  minimum) and Node 24.
+- **Node.js at or above its release line's security floor, and npm:** 22.23.4 or
+  newer on Node 22, 24.22.1 or newer on Node 24, or 26.12.1 or newer on Node 26 (see
+  [Node.js security floors](getting-started.md#nodejs-security-floors)). The `verify`
+  matrix runs each exact floor through the same stages, as the checks
+  **Verify (Node 22.23.4)**, **Verify (Node 24.22.1)**, and **Verify (Node 26.12.1)**.
+  The Linux full suite, the Windows shell job, and the release builder use Node
+  24.22.1. The Windows launcher job uses Node 22.23.4. The Windows session-host alpha
+  matrix uses Node 22.23.4 and 24.22.1. Do not run checks with a Node below its
+  line's floor, and do not take earlier CI runs on Node 22.19.0 or 24.x as
+  patched-runtime evidence.
 - **TypeScript and type definitions** arrive as ordinary `devDependencies` via
   `npm install`; the runtime dependencies (including Playwright, undici, and the HTML/PDF
   parsing stack) are ordinary npm packages.

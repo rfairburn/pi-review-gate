@@ -506,7 +506,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // background-completion monitor/deferral state, and the triggering-message
   // failure flag. It returns handler bodies and narrow operations; every hook
   // registration stays in this root's manifest.
-  const warnPrimaryEvidence = (message: string): Promise<void> => sendPrimaryEvidenceWarning(localUiTarget, message);
+  const warnPrimaryEvidence = (message: string, required = false): Promise<void> => sendPrimaryEvidenceWarning(localUiTarget, message, required);
   const applyPrimaryEvidenceSettings = createPrimaryEvidenceSettings({
     config, state, cwd: () => currentCwd, persist: () => sessionPersistence.persist(), warn: warnPrimaryEvidence,
     reviewActive: () => reviewCancellation.current() !== undefined,

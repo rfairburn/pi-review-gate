@@ -23,6 +23,7 @@ const OFF: EffectiveReviewEvidenceSettings = {
   inplaceToolOnly: false,
   snapshotFailureFallback: false,
 };
+const DEFAULTS = { ...OFF, snapshotFailureFallback: true };
 const FIELDS = Object.keys(OFF) as Array<keyof EffectiveReviewEvidenceSettings>;
 const LABELS = ["Primary / top-level", "Isolated worktree", "InPlace", "Snapshot-failure fallback"];
 function assertEvidenceOptions(options: string[], evidence: EffectiveReviewEvidenceSettings): void {
@@ -98,12 +99,12 @@ async function fixture(body: Record<string, unknown> = {}) {
 const enterEvidence: Step[] = [pick("Reviewers"), pick("Evidence methods")];
 const backToRoot: Step[] = [escape, escape];
 
-test("review evidence config is optional, defaults false, and does not change effectiveReviewSettings", () => {
+test("review evidence config is optional, defaults to snapshot evidence with fallback On, and does not change effectiveReviewSettings", () => {
   const config = normalizeConfig({});
   const review = effectiveReviewSettings(config);
   assert.equal(config.review, undefined);
-  assert.deepEqual(effectiveReviewEvidenceSettings(config), OFF);
-  assert.deepEqual(effectiveReviewEvidenceSettings(normalizeConfig({ review: { evidence: {} } })), OFF);
+  assert.deepEqual(effectiveReviewEvidenceSettings(config), DEFAULTS);
+  assert.deepEqual(effectiveReviewEvidenceSettings(normalizeConfig({ review: { evidence: {} } })), DEFAULTS);
   const configured = normalizeConfig({ review: { evidence: { primaryToolOnly: true } } });
   assert.deepEqual(configured.review!.evidence, { primaryToolOnly: true });
   assert.deepEqual(effectiveReviewSettings(configured), review, "existing helper shape and semantics are unchanged");
@@ -131,7 +132,7 @@ test("startup recovery independently warns for each invalid field and retains va
       operatingMode: "execute", maxCorrectionCycles: 7,
       review: { primaryEnabled: false, evidence },
     });
-    assert.deepEqual(effectiveReviewEvidenceSettings(config), { ...Object.fromEntries(FIELDS.map((key) => [key, true])), [field]: false });
+    assert.deepEqual(effectiveReviewEvidenceSettings(config), { ...Object.fromEntries(FIELDS.map((key) => [key, true])), [field]: DEFAULTS[field] });
     assert.equal(config.review!.primaryEnabled, false);
     assert.equal(config.maxCorrectionCycles, 7);
     assert.deepEqual(warnings, [`review.evidence.${field} is invalid or unsupported; using its default.`]);
@@ -140,7 +141,7 @@ test("startup recovery independently warns for each invalid field and retains va
   assert.deepEqual(effectiveReviewEvidenceSettings(recovered.config), { ...OFF, worktreeToolOnly: true, snapshotFailureFallback: true });
   assert.equal(recovered.warnings!.length, 2);
   const malformed = recoverConfig({ review: { primaryEnabled: false, evidence: [] } });
-  assert.deepEqual(effectiveReviewEvidenceSettings(malformed.config), OFF);
+  assert.deepEqual(effectiveReviewEvidenceSettings(malformed.config), DEFAULTS);
   assert.equal(malformed.config.review!.primaryEnabled, false);
   assert.deepEqual(malformed.warnings, ["review.evidence is invalid or unsupported; using its default."]);
 });
@@ -167,13 +168,13 @@ test("all independent scope/fallback combinations persist through the real stage
   for (let mask = 0; mask < 16; mask++) {
     const h = await fixture();
     try {
-      const selected = FIELDS.filter((_field, index) => mask & (1 << index));
-      const draft = { ...OFF };
+      const selected = FIELDS.filter((field, index) => Boolean(mask & (1 << index)) !== DEFAULTS[field]);
+      const draft = { ...DEFAULTS };
       await h.run([
         ...enterEvidence,
         ...selected.map((field): Step => (title, options) => {
           assertEvidenceOptions(options, draft);
-          draft[field] = true;
+          draft[field] = !draft[field];
           return pick(LABELS[FIELDS.indexOf(field)]!)(title, options);
         }),
         (_title, options) => { assertEvidenceOptions(options, draft); return undefined; },
@@ -199,7 +200,7 @@ test("root Escape applies once; explicit Cancel preserves prior session-only cho
   } });
   try {
     await h.run([...enterEvidence, pick(LABELS[0]!), pick(LABELS[2]!), ...backToRoot, escape]);
-    const sessionOnly = { ...OFF, primaryToolOnly: true, inplaceToolOnly: true };
+    const sessionOnly = { ...DEFAULTS, primaryToolOnly: true, inplaceToolOnly: true };
     assert.deepEqual(effectiveReviewEvidenceSettings(h.config), sessionOnly);
     assert.equal(await readFile(h.configPath, "utf8"), h.original);
     assert.deepEqual(h.applied, [sessionOnly]);
@@ -264,10 +265,10 @@ test("Ctrl+S inside evidence selector unwinds and persists the same draft via th
       [...down(5), KEY_ENTER], // Review → Evidence methods
       [KEY_ENTER], // Primary Tools + workspace changes → Tools only
       [...down(1), KEY_ENTER], // worktree Tools + workspace changes → Tools only; retained Primary row
-      [...down(2), KEY_ENTER], // fallback Off → On; retained worktree row
+      [...down(2), KEY_ENTER], // fallback On → Off; retained worktree row
       ["\x13"], // save from nested evidence selector, not root Escape
     ]);
-    const expected = { ...OFF, primaryToolOnly: true, worktreeToolOnly: true, snapshotFailureFallback: true };
+    const expected = { ...OFF, primaryToolOnly: true, worktreeToolOnly: true, snapshotFailureFallback: false };
     assert.deepEqual(effectiveReviewEvidenceSettings(h.config), expected);
     const raw = JSON.parse(await readFile(h.configPath, "utf8"));
     assert.deepEqual(raw.review.evidence, expected);

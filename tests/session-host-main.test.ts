@@ -67,6 +67,7 @@ import { sidebarNoticeRows } from "./helpers/session-host-notice-witness";
 import { sidebarPaneLines } from "./helpers/session-host-native-roster-witness";
 import { consentsOf, createFakeInventory, createOwnedAgentDir, delay, startCoordinator } from "./session-host-network-peer-coordinator-helpers";
 import { createPosixTestPolicy } from "./session-host-network-peer-state-fixtures";
+import { NODE_SECURITY_FLOOR_CASES } from "./helpers/node-security-floor";
 
 const ESC = "\x1b";
 const ALT_LEFT = `${ESC}[1;3D`;
@@ -688,7 +689,7 @@ function createHarness(
   let harness!: Harness;
   const result = __test.runWithDependencies(options(overrides), {
     platform: "linux",
-    nodeVersion: "22.19.0",
+    nodeVersion: "22.23.4",
     stdin,
     stdout: stdout as unknown as Writable & EventEmitter & { isTTY?: boolean; columns?: number; rows?: number },
     signals,
@@ -1923,6 +1924,28 @@ test("direct Main preflight rejects role input before native Pi probing", async 
   assert.deepEqual(harness.events, [], "role preflight rejects before Pi entry resolution or resource setup");
   assert.deepEqual(harness.reports, ["Session host preflight failed."]);
   assert.doesNotMatch(harness.reports.join(""), /role-secret/);
+});
+
+test("direct Main preflight enforces stable per-line Node security minimums (issue 489)", async () => {
+  for (const entry of NODE_SECURITY_FLOOR_CASES) {
+    const harness = createHarness({}, { nodeVersion: entry.version });
+    if (entry.main) {
+      const manager = await ready(harness);
+      assert.ok(manager, `${entry.version} (${entry.why}) passes Main preflight`);
+      assert.ok(harness.events.includes("resolve"), `${entry.version} reaches Pi resolution`);
+      assert.deepEqual(harness.reports, [], `${entry.version} reports no preflight failure`);
+      assert.equal(await closeWithSignal(harness), 0, `${entry.version} still settles ownership cleanly`);
+    } else {
+      assert.equal(await harness.result, 1, `${entry.version} (${entry.why}) is refused`);
+      assert.deepEqual(harness.events, [], `${entry.version} is refused before Pi resolution or resource setup`);
+      assert.deepEqual(harness.reports, ["Session host preflight failed."]);
+    }
+  }
+  for (const malformed of ["v22.23.4", "22.23", "22.23.4+build", ""]) {
+    const harness = createHarness({}, { nodeVersion: malformed });
+    assert.equal(await harness.result, 1, `malformed ${JSON.stringify(malformed)} is refused`);
+    assert.deepEqual(harness.events, []);
+  }
 });
 
 test("snapshotted args/env survive caller mutation after startup admission and reach each manager unchanged", async () => {

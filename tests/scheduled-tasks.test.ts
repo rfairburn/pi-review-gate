@@ -873,7 +873,7 @@ for (const evidenceCase of ["omitted defaults", "nondefault choices"] as const) 
         primaryToolOnly: false,
         worktreeToolOnly: false,
         inplaceToolOnly: false,
-        snapshotFailureFallback: false,
+        snapshotFailureFallback: true,
       } };
       assert.deepEqual(saved.review, expectedReview);
       assert.equal(JSON.stringify(saved.review), JSON.stringify(expectedReview));

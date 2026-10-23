@@ -45,7 +45,9 @@ function sessionHostSourceModules(sourceDir) {
 const SESSION_HOST_HELP_MARKERS = [
   ["alpha scope", /alpha/i],
   ["macOS/Linux platforms", /macos\/linux/i],
-  ["Node >=22.19.0 floor", /node\s*>=\s*22\.19\.0/i],
+  ["Node 22 >=22.23.4 security floor", /node\s*>=\s*22\.23\.4/i],
+  ["Node 24 >=24.22.1 security floor", /node\s*24\s*>=\s*24\.22\.1/i],
+  ["Node 26 >=26.12.1 security floor", /node\s*26\s*>=\s*26\.12\.1/i],
   ["Pi >=1.0.4 floor", /pi\s*>=\s*1\.0\.4/i],
   ["positive Node CLI entry guidance", /positively identified node cli entry/i],
   ["empty picker with explicit workspace selection", /empty[\s\S]{0,80}picker/i],

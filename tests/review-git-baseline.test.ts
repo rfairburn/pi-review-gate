@@ -255,7 +255,9 @@ test("/review-continue capture failure preserves capped authorization for retry"
         registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<unknown> }) { commands.set(name, options.handler); },
         sendUserMessage: async (message: string) => { followUps.push(message); },
       },
-      cwd: () => cwd, config, state,
+      cwd: () => cwd,
+      config: { ...config, review: { ...config.review, evidence: { snapshotFailureFallback: false } } },
+      state,
       onStateChanged: () => { saves++; },
     });
     // A sparse file exceeds the raw acquisition cap before any content buffer

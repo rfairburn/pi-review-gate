@@ -63,11 +63,18 @@ terminal-restoration evidence. Green CI does not certify Windows runtime support
 - **Host platform:** same-machine POSIX macOS or Linux remains the documented
   runtime scope. Windows source paths now admit the same-machine host and public
   ConPTY flow for validation, but Windows is not supported/readiness-certified until
-  real Windows Node 22.19 and 24 runtime evidence passes; in the upcoming sidebar
+  real Windows runtime evidence on the patched Node 22 and 24 lines passes. Earlier
+  Windows evidence on Node 22.19.0 and 24.x is historical: it predates the current
+  security floors and is not a patched-runtime run. In the upcoming sidebar
   alpha release that runtime acceptance is deferred under
   https://github.com/rfairburn/pi-review-gate/issues/345. The ordinary standalone
   Windows launcher remains unchanged.
-- **Node.js:** 22.19.0 or newer.
+- **Node.js:** at or above its release line's security floor: 22.23.4 or newer on
+  Node 22, 24.22.1 or newer on Node 24, or 26.12.1 or newer on Node 26 (see
+  [Node.js security floors](getting-started.md#nodejs-security-floors)). The managed
+  fallback runtime is the checksum-pinned official Node.js 22.23.4 archive. Updating
+  this requirement does not update or restart a running host or its sessions. Update
+  Node.js, then restart them.
 - **Pi:** stable Pi 1.0.4 or newer; the provisioned runtime and native UI
   acceptance fixture are pinned to **1.3.0**, with the matching 1.3.0 TUI dependency.
 - An interactive terminal with both stdin and stdout attached.

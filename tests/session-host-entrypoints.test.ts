@@ -4,12 +4,13 @@ import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, mkdte
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import test, { type TestContext } from "node:test";
+import { NODE_SECURITY_FLOOR_CASES } from "./helpers/node-security-floor";
 
 /**
  * One-command session-host entry points (issue 323): scripts/
  * pi-review-sessions.sh (POSIX) and scripts/pi-review-sessions.cmd (native
  * Windows). They retain a supported PATH Node, or bootstrap only the fixed
- * source-pinned official Node 22.19.0 platform archive after verifying its
+ * source-pinned official Node 22.23.4 platform archive after verifying its
  * digest. Tests use synthetic downloader, hasher, and archive-tool fixtures;
  * they never fetch, extract, or execute the real official Node distribution.
  * Windows host-runtime tests are intentionally owned by the parent phase.
@@ -21,12 +22,16 @@ const psPath = resolve("scripts/pi-review-sessions-node.ps1");
 const cjsPath = resolve("scripts/pi-review-sessions.cjs");
 const isWindows = process.platform === "win32";
 
+// Official nodejs.org/dist/v22.23.4/SHASUMS256.txt digests (issue 489).
+const NODE_PIN = "22.23.4";
 const POSIX_PINS: Record<string, string> = {
-  "darwin-arm64": "c59006db713c770d6ec63ae16cb3edc11f49ee093b5c415d667bb4f436c6526d",
-  "darwin-x64": "3cfed4795cd97277559763c5f56e711852d2cc2420bda1cea30c8aa9ac77ce0c",
-  "linux-arm64": "d32817b937219b8f131a28546035183d79e7fd17a86e38ccb8772901a7cd9009",
-  "linux-x64": "d36e56998220085782c0ca965f9d51b7726335aed2f5fc7321c6c0ad233aa96d",
+  "darwin-arm64": "c9e1dbc748b33ed2d14f42445191ecaf14c56259c7a9a26d0042c49ec2b66428",
+  "darwin-x64": "efcc2b0db6f94bf53eddb038fe2b370277a042bd29e4f19b8f8e23598795b819",
+  "linux-arm64": "f7a1e486dbc8b286847815b477d4fb5e9fb963ed4489c3e1588853d685f589f9",
+  "linux-x64": "b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406",
 };
+// The superseded pre-489 linux-x64 pin: a record naming it must never be reused.
+const LEGACY_LINUX_X64_PIN = { version: "22.19.0", sha256: "d36e56998220085782c0ca965f9d51b7726335aed2f5fc7321c6c0ad233aa96d" };
 
 interface EntrypointFixture {
   root: string;
@@ -158,7 +163,7 @@ function writeBootstrapNode(fixture: EntrypointFixture, exitCode = 0): string {
   writeExecutable(file, [
     "#!/bin/bash",
     ". \"$FAKE_BOOTSTRAP_COMMON\"",
-    "if [[ \"${1:-}\" == \"--version\" ]]; then record_phase fallback-node-version; printf '%s\\n' 'v22.19.0'; exit 0; fi",
+    "if [[ \"${1:-}\" == \"--version\" ]]; then record_phase fallback-node-version; printf '%s\\n' 'v22.23.4'; exit 0; fi",
     "record_phase dispatch",
     "for arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$FAKE_NODE_LOG\"; done",
     "printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$PATH\" \"$PWD\" \"${NODE_OPTIONS:-}\" \"${PI_CODING_AGENT_DIR:-}\" \"$(umask)\" >> \"$FAKE_FALLBACK_ENV_LOG\"",
@@ -178,7 +183,7 @@ function writeBootstrapTools(
   const os = options.os ?? "Linux";
   const arch = options.arch ?? "x86_64";
   const digest = options.digest ?? POSIX_PINS["linux-x64"];
-  const rootName = `node-v22.19.0-${os === "Darwin" ? `darwin-${arch === "arm64" || arch === "aarch64" ? "arm64" : "x64"}` : `linux-${arch === "arm64" || arch === "aarch64" ? "arm64" : "x64"}`}`;
+  const rootName = `node-v${NODE_PIN}-${os === "Darwin" ? `darwin-${arch === "arm64" || arch === "aarch64" ? "arm64" : "x64"}` : `linux-${arch === "arm64" || arch === "aarch64" ? "arm64" : "x64"}`}`;
   const listing = options.tarListing ?? [
     `${rootName}/`,
     `${rootName}/bin/`,
@@ -403,7 +408,7 @@ function recordedPhaseEnvs(fixture: EntrypointFixture): Array<{ phase: string; b
 }
 
 function expectedArchiveFor(platform: string): string {
-  return `https://nodejs.org/dist/v22.19.0/node-v22.19.0-${platform}.tar.gz`;
+  return `https://nodejs.org/dist/v${NODE_PIN}/node-v${NODE_PIN}-${platform}.tar.gz`;
 }
 
 // ---------------------------------------------------------------------------
@@ -430,7 +435,7 @@ test(".sh rejects executor role contexts before any probe, download, or extracto
 test(".sh retains supported PATH Node, exact argv, trusted NODE_OPTIONS, and CJS exit status", { skip: isWindows ? "POSIX entry point" : false }, async (t) => {
   const fixture = makeEntrypointFixture(".session-host-entry-sh-dispatch-");
   cleanupFixture(t, fixture);
-  writeFakeNode(fixture.bin, "v22.19.0", fixture.nodeLog, { exitCode: 42 });
+  writeFakeNode(fixture.bin, "v22.23.4", fixture.nodeLog, { exitCode: 42 });
 
   const args = ["--state-root", "./state dir π", "--sidebar-key", "f8", "--", "--scheduler", "雪"];
   const result = runSh(fixture, args, {
@@ -479,7 +484,7 @@ test(".sh automatically bootstraps a missing PATH Node from the fixed pinned arc
   const nodeCacheRoot = join(effectiveAgentDirectory, ".pi-review-gate", "node");
   const workRoot = readdirSync(nodeCacheRoot).find((entry) => entry.startsWith("bootstrap."));
   assert.ok(workRoot);
-  const selectedNodeDirectory = join(nodeCacheRoot, workRoot, "extracted", "node-v22.19.0-linux-x64", "bin");
+  const selectedNodeDirectory = join(nodeCacheRoot, workRoot, "extracted", `node-v${NODE_PIN}-linux-x64`, "bin");
   assert.equal(fallbackEnv[0], `${selectedNodeDirectory}:${fixture.bin}`, "selected distribution bin is prepended and the original PATH retained");
   assert.equal(fallbackEnv[1], process.cwd(), "working directory is preserved");
   assert.equal(fallbackEnv[2], nodeOptions, "NODE_OPTIONS is preserved for actual dispatch");
@@ -489,7 +494,7 @@ test(".sh automatically bootstraps a missing PATH Node from the fixed pinned arc
   const workRoots = readdirSync(nodeCacheRoot).filter((name) => name.startsWith("bootstrap."));
   assert.equal(workRoots.length, 1);
   assert.equal(statSync(join(nodeCacheRoot, workRoots[0]!)).mode & 0o777, 0o700, "fresh POSIX witness is mode 0700");
-  assert.ok(lstatSync(join(nodeCacheRoot, workRoots[0]!, "extracted", "node-v22.19.0-linux-x64", "bin", "node")).isFile());
+  assert.ok(lstatSync(join(nodeCacheRoot, workRoots[0]!, "extracted", `node-v${NODE_PIN}-linux-x64`, "bin", "node")).isFile());
   fixture.markAssertionsPassed();
 });
 
@@ -527,7 +532,7 @@ test(".sh treats a prerelease at the exact minimum as unsupported and uses the s
   const fixture = makeEntrypointFixture(".session-host-entry-sh-prerelease-");
   cleanupFixture(t, fixture);
   writeBootstrapTools(fixture);
-  writeFakeNode(fixture.bin, "v22.19.0-rc.1", fixture.nodeLog);
+  writeFakeNode(fixture.bin, "v22.23.4-rc.1", fixture.nodeLog);
 
   const result = runSh(fixture, ["--help"]);
   assert.equal(result.status, 0, result.stderr);
@@ -540,13 +545,13 @@ test(".sh falls back from an old PATH Node without executing or modifying an unk
   const fixture = makeEntrypointFixture(".session-host-entry-sh-old-cache-");
   cleanupFixture(t, fixture);
   writeBootstrapTools(fixture);
-  writeFakeNode(fixture.bin, "v22.18.9", fixture.nodeLog);
+  writeFakeNode(fixture.bin, "v22.23.3", fixture.nodeLog);
 
-  const nodeCacheDir = join(fixture.agentDir, ".pi-review-gate", "node", "v22.19.0");
+  const nodeCacheDir = join(fixture.agentDir, ".pi-review-gate", "node", "v22.23.4");
   const cachedNodeDir = join(nodeCacheDir, "bin");
   mkdirSync(cachedNodeDir, { recursive: true });
   const cacheLog = join(fixture.root, "cached-node-invocations.txt");
-  writeFakeNode(cachedNodeDir, "v22.19.0", cacheLog);
+  writeFakeNode(cachedNodeDir, "v22.23.4", cacheLog);
   writeFileSync(join(nodeCacheDir, ".provenance"), "self-asserted, untrusted cache metadata\n", "utf8");
   const sentinel = join(nodeCacheDir, "sentinel.txt");
   writeFileSync(sentinel, "preserve me\n", "utf8");
@@ -560,6 +565,28 @@ test(".sh falls back from an old PATH Node without executing or modifying an unk
   assert.equal(readFileSync(join(nodeCacheDir, ".provenance"), "utf8"), "self-asserted, untrusted cache metadata\n");
   assert.deepEqual(recordedPhases(fixture), ["path-node-version", "uname", "uname", "curl", "shasum", "tar-list", "tar-extract", "fallback-node-version", "dispatch"]);
   fixture.markAssertionsPassed();
+});
+
+test(".sh retains a PATH Node only at or above its line's security minimum (issue 489)", { skip: isWindows ? "POSIX entry point" : false }, async (t) => {
+  for (const entry of NODE_SECURITY_FLOOR_CASES) {
+    const fixture = makeEntrypointFixture(`.session-host-entry-sh-floor-${entry.version.replace(/[^0-9A-Za-z]/g, "-")}-`);
+    cleanupFixture(t, fixture);
+    writeBootstrapTools(fixture);
+    writeFakeNode(fixture.bin, `v${entry.version}`, fixture.nodeLog);
+    const result = runSh(fixture, ["--help"]);
+    assert.equal(result.status, 0, `${entry.version}: ${result.stderr}`);
+    assert.deepEqual(recordedDispatch(fixture), [cjsPath, "--help"], `${entry.version} dispatches the shared CJS exactly once`);
+    if (entry.launcher) {
+      assert.deepEqual(recordedPhases(fixture), ["path-node-version", "path-node-dispatch"],
+        `${entry.version} (${entry.why}) keeps the PATH runtime with no download`);
+      assert.ok(!existsSync(fixture.curlLog), `${entry.version} makes no network request`);
+    } else {
+      assert.deepEqual(recordedPhases(fixture), ["path-node-version", "uname", "uname", "curl", "shasum", "tar-list", "tar-extract", "fallback-node-version", "dispatch"],
+        `${entry.version} (${entry.why}) is never executed and the patched fallback is provisioned`);
+      assert.equal(readFileSync(fixture.curlLog, "utf8").trim(), expectedArchiveFor("linux-x64"));
+    }
+    fixture.markAssertionsPassed();
+  }
 });
 
 test(".sh selects each supported POSIX official artifact and its source-pinned digest", { skip: isWindows ? "POSIX entry point" : false }, async (t) => {
@@ -594,14 +621,14 @@ test(".sh rejects a checksum mismatch before tar listing, extraction, or runtime
   const workRoot = readdirSync(nodeCacheRoot).find((name) => name.startsWith("bootstrap."));
   assert.ok(workRoot);
   assert.equal(statSync(join(nodeCacheRoot, workRoot)).mode & 0o777, 0o700);
-  assert.ok(existsSync(join(nodeCacheRoot, workRoot, "node-v22.19.0-linux-x64.tar.gz")), "failed archive remains as evidence");
+  assert.ok(existsSync(join(nodeCacheRoot, workRoot, `node-v${NODE_PIN}-linux-x64.tar.gz`)), "failed archive remains as evidence");
   fixture.markAssertionsPassed();
 });
 
 test(".sh rejects traversal names from a checksum-pinned archive before extraction", { skip: isWindows ? "POSIX entry point" : false }, async (t) => {
   const fixture = makeEntrypointFixture(".session-host-entry-sh-traversal-");
   cleanupFixture(t, fixture);
-  writeBootstrapTools(fixture, { tarListing: ["node-v22.19.0-linux-x64/", "node-v22.19.0-linux-x64/../../escaped"] });
+  writeBootstrapTools(fixture, { tarListing: [`node-v${NODE_PIN}-linux-x64/`, `node-v${NODE_PIN}-linux-x64/../../escaped`] });
 
   const result = runSh(fixture, ["--help"]);
   assert.equal(result.status, 1);
@@ -637,7 +664,7 @@ test(".sh reports unsupported fallback architectures without a network request",
 
   const result = runSh(fixture, ["--help"]);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /no pinned Node\.js 22\.19\.0 archive is available for this platform/);
+  assert.match(result.stderr, /no pinned Node\.js 22\.23\.4 archive is available for this platform/);
   assert.deepEqual(recordedPhases(fixture), ["uname", "uname"]);
   fixture.markAssertionsPassed();
 });
@@ -2023,7 +2050,7 @@ const WINDOWS_NATIVE_PHASE_WITNESS_SPECS: readonly WindowsPhaseWitnessSpec[] = [
   { label: "generation creation", anchor: "$WorkRoot = New-NodeGeneration $cacheRoot $agentDirectory $keepPath", code: "GENERATION-READY" },
   { label: "extraction directory", anchor: "New-ExclusiveDirectory $extractRoot", code: "EXTRACT-DIR-READY" },
   { label: "pre-download identity", anchor: "if (-not (Assert-PathIdentity $cacheRoot $cacheIdentity) -or -not (Assert-PathIdentity $WorkRoot $workIdentity)) { throw 'Bootstrap root identity changed before download.' }", code: "PRE-DOWNLOAD-IDENTITY-OK" },
-  { label: "download preparation", anchor: "$url = 'https://nodejs.org/dist/v22.19.0/' + $NodeArchive", code: "DOWNLOAD-PREP" },
+  { label: "download preparation", anchor: `$url = 'https://nodejs.org/dist/v${NODE_PIN}/' + $NodeArchive`, code: "DOWNLOAD-PREP" },
   { label: "failed preparation", anchor: "[Console]::Error.WriteLine('pi-review-sessions: isolated Node bootstrap failed: unsafe path or download/validation failure.')", code: "BOOTSTRAP-FAILED" },
   { label: "settlement retry", anchor: "Invoke-NodeSettlementCleanup $cacheRoot $agentDirectory $settleKeep", code: "SETTLEMENT-DONE" },
 ];
@@ -3021,7 +3048,7 @@ test(".cmd delegates arguments to the PowerShell Node bootstrap after fail-close
   assert.match(helper, /if \(-not \[string\]::IsNullOrEmpty\(\$env:PI_REVIEW_GATE_RUNTIME_ROLE\)\)/);
   assert.match(helper, /\$env:PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP = \$null/);
   assert.match(helper, /Get-Command -Name 'node\.exe'/);
-  assert.match(helper, /https:\/\/nodejs\.org\/dist\/v22\.19\.0\/' \+ \$NodeArchive/);
+  assert.match(helper, /https:\/\/nodejs\.org\/dist\/v22\.23\.4\/' \+ \$NodeArchive/);
   assert.match(helper, /AllowAutoRedirect = \$false/);
   assert.match(helper, /CreateNew/);
   assert.match(helper, /Get-Sha256 \$archivePath[\s\S]*?if \(\$actualSha256 -cne \$NodeSha256\)[\s\S]*?Expand-VerifiedZip/);
@@ -3054,6 +3081,38 @@ test("Windows PowerShell bootstrap preserves literal directory, ZIP layout, and 
   assert.doesNotMatch(helper, /& \$Executable \$CjsEntry @Arguments|Start-Process/);
 });
 
+test("native Windows Test-NodeFloor from the real helper source enforces per-line minimums (issue 489)", { skip: isWindows ? false : "native Windows PowerShell" }, () => {
+  const source = readFileSync(psPath, "utf8");
+  const floors = /^\$NodeLineFloors = .*$/mu.exec(source)?.[0];
+  assert.ok(floors, "the helper declares its per-line floor table");
+  const start = source.indexOf("function Test-NodeFloor(");
+  const end = /\r?\n\}\r?\n/u.exec(source.slice(start));
+  assert.ok(start >= 0 && end, "the helper defines Test-NodeFloor");
+  const testNodeFloor = source.slice(start, start + end.index + end[0].length);
+  const versions = NODE_SECURITY_FLOOR_CASES.map((entry) => `'v${entry.version}'`).join(", ");
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    floors,
+    testNodeFloor,
+    `foreach ($candidate in @(${versions}, 'v22.23.4.1', '22.23.4')) { [Console]::Out.WriteLine($candidate + '=' + [string](Test-NodeFloor $candidate)) }`,
+  ].join("\n");
+  const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const verdicts = new Map(result.stdout.trim().split(/\r?\n/u).map((line) => {
+    const [version, verdict] = line.split("=");
+    return [version!, verdict] as const;
+  }));
+  for (const entry of NODE_SECURITY_FLOOR_CASES) {
+    assert.equal(verdicts.get(`v${entry.version}`), entry.launcher ? "True" : "False", `${entry.version}: ${entry.why}`);
+  }
+  assert.equal(verdicts.get("v22.23.4.1"), "False", "a malformed version is refused");
+  assert.equal(verdicts.get("22.23.4"), "False", "Node's own v-prefixed --version shape is required");
+});
+
 test("bootstrap source pins every official platform artifact and bounds download/extraction", async () => {
   const posix = readFileSync(shPath, "utf8");
   const windows = readFileSync(psPath, "utf8");
@@ -3061,9 +3120,9 @@ test("bootstrap source pins every official platform artifact and bounds download
     assert.ok(posix.includes(digest), `POSIX source includes fixed pin ${digest}`);
   }
   const windowsArtifacts = [
-    ["node-v22.19.0-win-arm64.zip", "e4a7336010d58ff35b53d9dd5869095c56089c70913cf22508cf8183593e56b2"],
-    ["node-v22.19.0-win-x64.zip", "ea3fad0e67a991d8477d8c01344b56e69c676ccb733f065b22436994b1253f86"],
-    ["node-v22.19.0-win-x86.zip", "708b8a297a19e9ac433e32ac0fc496755757c5e00bd5a0683917e73cae5fe8ea"],
+    ["node-v22.23.4-win-arm64.zip", "a8b8cd79cbbb3062435f449591d98dd63730bbbf30ce2d7cc3a6376c236cb111"],
+    ["node-v22.23.4-win-x64.zip", "cbc74b5e0982c9dbb41525fd8fb5dcd32fbee237863f7829072f4639a1ce5f20"],
+    ["node-v22.23.4-win-x86.zip", "7d6c4dce2ecccca46e3c4b3e43c8bebbd1969bd616fdb4fda1e8269171d9ccea"],
   ];
   for (const [artifact, digest] of windowsArtifacts) {
     assert.ok(windows.includes(artifact), `Windows source selects ${artifact}`);
@@ -3092,7 +3151,7 @@ if (isWindows) {
     assert.match(protection, /\$coordination = Enter-NodeCoordination \$AgentDirectory/u);
     assert.doesNotMatch(protection, /Enter-NodeAdmissionLock/u,
       "consumer publication requires the coordination entry, not admission-lock best effort");
-    assert.match(protection, /Join-Path \(Join-Path \(Join-Path \$GenerationRoot 'extracted'\) \('node-v22\.19\.0-' \+ \$NodePlatform\)\) 'node\.exe'/u,
+    assert.match(protection, /Join-Path \(Join-Path \(Join-Path \$GenerationRoot 'extracted'\) \('node-v22\.23\.4-' \+ \$NodePlatform\)\) 'node\.exe'/u,
       "the executable is checked at its nested location inside the generation");
     assert.match(source, /Protect-CachedFallbackRuntime \$cacheRoot \(Join-Path \$cacheRoot \$currentRuntime\.Generation\) \$agentDirectory/u,
       "the direct-child generation, not the extracted distribution, receives the record");
@@ -3149,8 +3208,8 @@ test(".sh replaces a stale completed-runtime marker after one installation", { s
   const marker = join(cache, "current-node.txt");
   for (const stale of [
     "not a record at all\n",
-    "schema=1\nversion=22.19.0\nplatform=linux-x64\narchive=node-v22.19.0-linux-x64.tar.gz\nsha256=deadbeef\ngeneration=bootstrap.gone\nnode_identity=1:1\n",
-    "schema=1\nversion=99.0.0\nplatform=linux-x64\narchive=node-v22.19.0-linux-x64.tar.gz\nsha256=d36e56998220085782c0ca965f9d51b7726335aed2f5fc7321c6c0ad233aa96d\ngeneration=bootstrap.gone\nnode_identity=1:1\n",
+    `schema=1\nversion=${NODE_PIN}\nplatform=linux-x64\narchive=node-v${NODE_PIN}-linux-x64.tar.gz\nsha256=deadbeef\ngeneration=bootstrap.gone\nnode_identity=1:1\n`,
+    `schema=1\nversion=99.0.0\nplatform=linux-x64\narchive=node-v${NODE_PIN}-linux-x64.tar.gz\nsha256=${POSIX_PINS["linux-x64"]}\ngeneration=bootstrap.gone\nnode_identity=1:1\n`,
   ]) {
     const extractionsBefore = recordedPhases(f).filter((phase) => phase === "tar-extract").length;
     writeFileSync(marker, stale, "utf8");
@@ -3158,7 +3217,7 @@ test(".sh replaces a stale completed-runtime marker after one installation", { s
     assert.equal(first.status, 0, first.stderr);
     assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, extractionsBefore + 1,
       "the stale record forces exactly one installation");
-    assert.match(readFileSync(marker, "utf8"), /^version=22\.19\.0$/mu, "the completed record is published");
+    assert.match(readFileSync(marker, "utf8"), /^version=22\.23\.4$/mu, "the completed record is published");
     const second = runSh(f, ["--help"], env, { reuseCompletedRuntime: true });
     assert.equal(second.status, 0, second.stderr);
     assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, extractionsBefore + 1,
@@ -3225,6 +3284,24 @@ test(".sh replaces a wrong-pin marker that still references an existing runtime"
   assert.equal(reused.status, 0, reused.stderr);
   assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, 2,
     "the replaced record is reused on the next launch");
+
+  // A completed record naming the superseded pre-489 pin (version, archive, and
+  // digest) for an existing generation is never reused as the patched runtime.
+  const current = readFileSync(marker, "utf8");
+  writeFileSync(marker, current
+    .replace(/^version=.*$/mu, `version=${LEGACY_LINUX_X64_PIN.version}`)
+    .replace(/^archive=.*$/mu, `archive=node-v${LEGACY_LINUX_X64_PIN.version}-linux-x64.tar.gz`)
+    .replace(/^sha256=.*$/mu, `sha256=${LEGACY_LINUX_X64_PIN.sha256}`), "utf8");
+  const upgraded = runSh(f, ["--help"], env, { reuseCompletedRuntime: true });
+  assert.equal(upgraded.status, 0, upgraded.stderr);
+  assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, 3,
+    "a legacy-pin record forces exactly one patched installation");
+  const published = readFileSync(marker, "utf8");
+  assert.match(published, /^version=22\.23\.4$/mu);
+  assert.match(published, /^archive=node-v22\.23\.4-linux-x64\.tar\.gz$/mu);
+  assert.match(published, new RegExp(`^sha256=${POSIX_PINS["linux-x64"]}$`, "mu"));
+  assert.equal(readFileSync(f.curlLog, "utf8").trim(), expectedArchiveFor("linux-x64"),
+    "the replacement installation requests the patched official archive");
 });
 
 // ---------------------------------------------------------------------------
@@ -3265,9 +3342,9 @@ function runtimeMarkerRecord(marker: string): Map<string, string> {
 function nodeRuntimeRecord(generation: string, nodeIdentity: string): string {
   return [
     "schema=1",
-    "version=22.19.0",
+    `version=${NODE_PIN}`,
     "platform=linux-x64",
-    "archive=node-v22.19.0-linux-x64.tar.gz",
+    `archive=node-v${NODE_PIN}-linux-x64.tar.gz`,
     `sha256=${POSIX_PINS["linux-x64"]}`,
     `generation=${generation}`,
     `node_identity=${nodeIdentity}`,
@@ -3301,7 +3378,7 @@ function activeNodeGeneration(fixture: EntrypointFixture): ActiveNodeGeneration 
   const version = record.get("version") ?? "";
   const platform = record.get("platform") ?? "";
   const archive = record.get("archive") ?? "";
-  assert.equal(version, "22.19.0", "the record names the source-pinned Node version");
+  assert.equal(version, NODE_PIN, "the record names the source-pinned Node version");
   assert.equal(archive, `node-v${version}-${platform}.tar.gz`, "the record names the pinned archive for its platform");
   assert.equal(record.get("sha256") ?? "", POSIX_PINS[platform], "the record carries the source-pinned digest for that platform");
   const generation = record.get("generation") ?? "";
@@ -3326,7 +3403,7 @@ function activeNodeGeneration(fixture: EntrypointFixture): ActiveNodeGeneration 
 
 /** One controlled generation laid out exactly as the producer publishes one. */
 function seedNodeRuntimeGeneration(root: string, content: string): void {
-  const nodeRoot = join(root, "extracted", "node-v22.19.0-linux-x64");
+  const nodeRoot = join(root, "extracted", `node-v${NODE_PIN}-linux-x64`);
   mkdirSync(join(nodeRoot, "bin"), { recursive: true });
   mkdirSync(join(nodeRoot, "lib", "node_modules", "npm", "bin"), { recursive: true });
   writeFileSync(join(nodeRoot, "bin", "node"), `#!/bin/sh\n${content}\n`, "utf8");
@@ -3346,8 +3423,8 @@ test("the active cached runtime is the published record's generation, not the la
   seedNodeRuntimeGeneration(activeDir, "active runtime");
   seedNodeRuntimeGeneration(staleDir, "stale runtime");
   const marker = join(cache, "current-node.txt");
-  const activeIdentity = pathIdentity(join(activeDir, "extracted", "node-v22.19.0-linux-x64", "bin", "node"));
-  const staleIdentity = pathIdentity(join(staleDir, "extracted", "node-v22.19.0-linux-x64", "bin", "node"));
+  const activeIdentity = pathIdentity(join(activeDir, "extracted", `node-v${NODE_PIN}-linux-x64`, "bin", "node"));
+  const staleIdentity = pathIdentity(join(staleDir, "extracted", `node-v${NODE_PIN}-linux-x64`, "bin", "node"));
   writeFileSync(marker, nodeRuntimeRecord("bootstrap.aaa-active", activeIdentity), "utf8");
 
   const active = activeNodeGeneration(f);
@@ -3369,8 +3446,8 @@ test("the active cached runtime is the published record's generation, not the la
   // order-based guess (which would silently return the lexical-last generation).
   for (const [label, record] of [
     ["a malformed record", "not a record at all\n"],
-    ["a record without a generation key", `schema=1\nversion=22.19.0\nplatform=linux-x64\narchive=node-v22.19.0-linux-x64.tar.gz\nsha256=${POSIX_PINS["linux-x64"]}\nnode_identity=${activeIdentity}\n`],
-    ["a wrong-pin record", `schema=1\nversion=22.19.0\nplatform=linux-x64\narchive=node-v22.19.0-linux-x64.tar.gz\nsha256=${"0".repeat(64)}\ngeneration=bootstrap.aaa-active\nnode_identity=${activeIdentity}\n`],
+    ["a record without a generation key", `schema=1\nversion=${NODE_PIN}\nplatform=linux-x64\narchive=node-v${NODE_PIN}-linux-x64.tar.gz\nsha256=${POSIX_PINS["linux-x64"]}\nnode_identity=${activeIdentity}\n`],
+    ["a wrong-pin record", `schema=1\nversion=${NODE_PIN}\nplatform=linux-x64\narchive=node-v${NODE_PIN}-linux-x64.tar.gz\nsha256=${"0".repeat(64)}\ngeneration=bootstrap.aaa-active\nnode_identity=${activeIdentity}\n`],
     ["a deleted generation", nodeRuntimeRecord("bootstrap.never-created", activeIdentity)],
     ["a parent-escaping path", nodeRuntimeRecord("..", activeIdentity)],
     ["an absolute foreign path", nodeRuntimeRecord("/tmp/foreign-generation", activeIdentity)],
@@ -3428,7 +3505,7 @@ test(".sh rejects a cached runtime whose extracted or npm ancestor is an alias",
     "the alias is rejected before probing or executing the outside Node");
   assert.equal(lstatSync(join(generationDir, "extracted")).isSymbolicLink(), true,
     "the rejected generation keeps its alias; nothing is repaired or deleted through it");
-  assert.equal(pathIdentity(join(nodeRoot, "bin", "node")), pathIdentity(join(outside, "node-v22.19.0-linux-x64", "bin", "node")),
+  assert.equal(pathIdentity(join(nodeRoot, "bin", "node")), pathIdentity(join(outside, `node-v${NODE_PIN}-linux-x64`, "bin", "node")),
     "the aliased leaf still resolves to the outside distribution, so the recorded leaf identity alone cannot catch the alias");
 
   // Aliased deeper npm ancestor inside the generation the replacement published.
@@ -3450,10 +3527,10 @@ test(".sh rejects a cached runtime whose extracted or npm ancestor is an alias",
   assert.equal(aliasedLib.status, 0, aliasedLib.stderr);
   assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, 3,
     "an aliased npm ancestor is rejected before reuse");
-  assert.equal(existsSync(join(outside, "node-v22.19.0-linux-x64", "bin", "node")), true,
+  assert.equal(existsSync(join(outside, `node-v${NODE_PIN}-linux-x64`, "bin", "node")), true,
     "the outside distribution is left in place (never moved or deleted through the alias)");
   assert.equal(existsSync(join(outsideLib, "node_modules", "npm", "bin", "npm-cli.js")), true,
     "the aliased npm tree is left in place too");
-  assert.ok(isRealDirectory(join(unrelated, "extracted", "node-v22.19.0-linux-x64", "lib")),
+  assert.ok(isRealDirectory(join(unrelated, "extracted", `node-v${NODE_PIN}-linux-x64`, "lib")),
     "the generation outside the published record is untouched: the alias targeted the runtime actually in use");
 });

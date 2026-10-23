@@ -69,7 +69,8 @@ const fsModule = createRequire(__filename)("node:fs");
 // requires, without copying the launcher's exact prose.
 const SYNTHETIC_HELP = [
   "Usage: pi-review-sessions (SYNTHETIC) [--help]",
-  "Alpha POSIX macOS/Linux session host. Requires Node >=22.19.0 and Pi >=1.0.4",
+  "Alpha POSIX macOS/Linux session host. Requires Node >=22.23.4 (Node 24 >=24.22.1,",
+  "Node 26 >=26.12.1) and Pi >=1.0.4",
   "with a positively identified Node CLI entry. Starts an empty welcome/sidebar",
   "picker; choose a label, workspace, and profile explicitly in the UI. The",
   "startup working directory is not selected as a workspace. The sidebar toggle",
@@ -227,6 +228,16 @@ test("fails when --help omits semantic guidance", (t) => {
   const f = makeFixture(t);
   const stripped = SYNTHETIC_HELP.replace("defaults to alt+left.", "defaults to another key.");
   assert.throws(() => validate(f, { help: { status: 0, stdout: stripped } }), /alt\+left sidebar toggle/);
+});
+
+test("fails when --help names a superseded or incomplete per-line Node floor (issue 489)", (t) => {
+  const f = makeFixture(t);
+  const legacy = SYNTHETIC_HELP.replace("Node >=22.23.4", "Node >=22.19.0");
+  assert.throws(() => validate(f, { help: { status: 0, stdout: legacy } }), /Node 22 >=22\.23\.4 security floor/);
+  const missing24 = SYNTHETIC_HELP.replace("Node 24 >=24.22.1", "Node 24 >=24.0.0");
+  assert.throws(() => validate(f, { help: { status: 0, stdout: missing24 } }), /Node 24 >=24\.22\.1 security floor/);
+  const missing26 = SYNTHETIC_HELP.replace("Node 26 >=26.12.1", "Node 26 >=26.0.0");
+  assert.throws(() => validate(f, { help: { status: 0, stdout: missing26 } }), /Node 26 >=26\.12\.1 security floor/);
 });
 
 test("fails when a derived compiled module or its declarations are missing", (t) => {

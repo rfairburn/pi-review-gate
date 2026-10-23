@@ -510,14 +510,25 @@ for (const strategy of ["raw", "git"] as const) {
 
 for (const initial of [true, false]) {
   for (const enabled of [false, true]) {
-    test(`${initial ? "initial" : "settlement"} acquisition failure: fallback ${enabled ? "On preserves evidence with durable truthful basis" : "Off blocks"}`, async () => {
+    test(`${initial ? "initial" : "settlement"} acquisition failure: fallback ${enabled ? "On preserves evidence with durable truthful basis" : initial ? "Off warns review disabled and continues unreviewed" : "Off blocks"}`, async () => {
       const f = await fixture({ snapshotFailureFallback: enabled });
       try {
         if (!initial) { await f.start(); await f.writeScript("CURRENT_WORK_SURVIVES\n"); }
         const failure = mock.method(checkpoints, "captureReviewCheckpoint", async () => ({ status: "failed" as const, reason: "patch_too_large" as const, evidenceCaptureFailure: true as const }));
         if (initial && !enabled) {
-          await assert.rejects(f.start(), /baseline capture failed/);
-          assert.equal(f.warnings.length, 0);
+          // #491: explicit Off no longer blocks the prompt. Work continues
+          // honestly unreviewed: no Tools only substitute, reviewer, or pass.
+          await f.start();
+          assert.equal(f.warnings.length, 1);
+          assert.match(f.warnings[0]!, /^WARNING: Review disabled for this turn/);
+          assert.doesNotMatch(f.warnings[0]!, /Tools only \(snapshot-failure fallback\)/);
+          assert.equal((await f.restored())!.state.reviewWindow!.baseline, undefined);
+          await f.writeScript("CURRENT_WORK_SURVIVES\n");
+          await f.end();
+          await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/);
+          assert.equal(f.rt.sent.length, 0);
+          assert.doesNotMatch(f.rt.notices.join("\n"), /review gate: passed/);
+          assert.equal((await f.restored())!.state.reviewWindow, undefined);
           return;
         }
         if (initial) {
@@ -564,6 +575,165 @@ for (const reason of ["aborted", "checkpoint_digest_mismatch", "capture_inconsis
       await assert.rejects(f.end(), /capturing after-checkpoint failed/);
       await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/);
       assert.doesNotMatch(f.rt.notices.join("\n"), /Tools only \(snapshot-failure fallback\)/);
+      assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "checkpoint");
+    } finally { await f.dispose(); }
+  });
+}
+
+// #491: an absent snapshot-failure fallback is On. The eligible initial failure
+// takes the existing Tools only fallback, latch and warning; the absent field is
+// never written back to the saved configuration.
+test("absent snapshot-failure fallback defaults On: eligible initial failure uses the existing Tools only fallback and session latch", async () => {
+  const f = await fixture({});
+  try {
+    const diskBefore = await readFile(f.configPath, "utf8");
+    assert.equal(JSON.parse(diskBefore).review.evidence.snapshotFailureFallback, undefined);
+    const capture = mock.method(checkpoints, "captureReviewCheckpoint", async () => ({
+      status: "failed" as const, reason: "untracked_too_large" as const, detail: "injected eligible failure", evidenceCaptureFailure: true as const,
+    }));
+    await f.start();
+    const baseline = (await f.restored())!.state.reviewWindow!.baseline;
+    assert.ok(baseline?.kind === "tool" && baseline.fallback);
+    assert.equal(f.warnings.filter((warning) => warning.includes("Tools only (snapshot-failure fallback)")).length, 1);
+    assert.doesNotMatch(f.warnings.join("\n"), /Review disabled/);
+    await f.writeScript("DEFAULT_ON_TOOL_WORK\n");
+    await f.end();
+    assert.equal(await readFile(f.calls, "utf8"), "1");
+    assert.match(f.rt.sent[0]!.message, /Tools only \(snapshot-failure fallback\)/);
+    await f.start("later prompt");
+    await f.end();
+    assert.equal(capture.mock.callCount(), 1, "the session latch applies: no capture retry");
+    assert.equal(await readFile(f.configPath, "utf8"), diskBefore, "the default is never written to saved settings");
+  } finally { await f.dispose(); }
+});
+
+// #491: explicit Off keeps its saved value. An eligible baseline failure warns
+// that review is disabled and lets the work continue unreviewed; settlement
+// runs no reviewer and records no verdict, nothing latches, and the next prompt
+// tries a snapshot again.
+test("explicit fallback Off: eligible initial failure warns review disabled, continues unreviewed, never latches, and retries next prompt", async () => {
+  const f = await fixture({ snapshotFailureFallback: false });
+  try {
+    const diskBefore = await readFile(f.configPath, "utf8");
+    let fail = true;
+    const capture = checkpoints.captureReviewCheckpoint;
+    const attempts = mock.method(checkpoints, "captureReviewCheckpoint", async (...args: Parameters<typeof capture>) => fail
+      ? { status: "failed" as const, reason: "untracked_too_large" as const, detail: "injected eligible failure", evidenceCaptureFailure: true as const }
+      : capture(...args));
+    const disabled = () => f.warnings.filter((warning) => warning.startsWith("WARNING: Review disabled for this turn"));
+    await f.start();
+    assert.equal(disabled().length, 1);
+    assert.match(disabled()[0]!, /snapshot-failure fallback is Off/);
+    assert.match(disabled()[0]!, /No snapshot coverage is available/);
+    assert.match(disabled()[0]!, /will not be reviewed or reported as reviewed/);
+    assert.doesNotMatch(disabled()[0]!, REVIEWER_PROSE);
+    assert.doesNotMatch(f.warnings.join("\n"), /Tools only \(snapshot-failure fallback\)/);
+    await f.writeScript("UNREVIEWED_WORK\n");
+    assert.equal(await readFile(join(f.cwd, "SCRIPT"), "utf8"), "UNREVIEWED_WORK\n");
+    await f.end();
+    await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/, "no reviewer runs");
+    assert.equal(f.rt.sent.length, 0, "no review transmission, pass, or follow-up");
+    assert.deepEqual(f.modelInputs, [], "the warning is local only");
+    assert.doesNotMatch(f.rt.notices.join("\n"), /review gate: passed/);
+    assert.equal((await f.restored())!.state.reviewWindow, undefined, "settlement closes the window without a verdict");
+    await f.commands.get("review-now")!("", f.rt.ctx);
+    await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/, "no manual review is fabricated either");
+    // Nothing latches: the next prompt tries a snapshot again and warns again.
+    await f.start("second prompt while capture still fails");
+    assert.equal(attempts.mock.callCount(), 2);
+    assert.equal(disabled().length, 2);
+    await f.end();
+    fail = false;
+    await f.start("after repair");
+    assert.equal(attempts.mock.callCount(), 3);
+    assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "checkpoint");
+    await f.writeScript("REVIEWED_AFTER_REPAIR\n");
+    await f.end();
+    assert.equal(await readFile(f.calls, "utf8"), "1");
+    assert.match(f.rt.sent.at(-1)!.message, /Review evidence method: Tools \+ workspace changes/);
+    assert.equal(disabled().length, 2);
+    assert.equal(await readFile(f.configPath, "utf8"), diskBefore, "explicit Off is preserved without saved-setting writes");
+  } finally { await f.dispose(); }
+});
+
+// #491 review: the warned review-disabled decision is scoped to its window.
+// Re-arming the same turn before settlement (a queued triggering message or a
+// continuation start) must not capture a late baseline that would certify the
+// earlier unreviewed work, even after the capture problem is repaired.
+test("explicit fallback Off: re-arming the review-disabled turn before settlement never captures; the next fresh prompt does", async () => {
+  const f = await fixture({ snapshotFailureFallback: false });
+  try {
+    let fail = true;
+    const capture = checkpoints.captureReviewCheckpoint;
+    const attempts = mock.method(checkpoints, "captureReviewCheckpoint", async (...args: Parameters<typeof capture>) => fail
+      ? { status: "failed" as const, reason: "untracked_too_large" as const, detail: "injected eligible failure", evidenceCaptureFailure: true as const }
+      : capture(...args));
+    const disabled = () => f.warnings.filter((warning) => warning.startsWith("WARNING: Review disabled for this turn"));
+    await trigger(f.rt.hooks, "agent_start", { type: "agent_start" }, f.rt.ctx);
+    await f.start();
+    assert.equal(attempts.mock.callCount(), 1);
+    assert.equal(disabled().length, 1);
+    await f.writeScript("EARLIER_UNREVIEWED_WORK\n");
+    // The agent repairs the capture problem mid-turn.
+    fail = false;
+    // A queued triggering custom message re-arms the same run before settlement.
+    await trigger(f.rt.hooks, "message_start", { type: "message_start",
+      message: { role: "custom", customType: "pi-review-background-ready", content: "background work ready" } }, f.rt.ctx);
+    assert.equal(f.rt.notices.some((notice) => /could not reassert|could not be correlated/.test(notice)), false, "re-arming succeeds");
+    // A continuation start in the same window is idempotent as well.
+    await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
+    assert.equal(attempts.mock.callCount(), 1, "no late capture for the review-disabled window");
+    assert.equal(disabled().length, 1, "no repeated warning within the same turn");
+    await f.writeScript("LATER_WORK_SAME_TURN\n");
+    await f.end();
+    assert.equal(attempts.mock.callCount(), 1, "settlement captures nothing for the disabled window");
+    await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/, "no reviewer runs");
+    assert.equal(f.rt.sent.length, 0, "no review transmission or pass");
+    assert.doesNotMatch(f.rt.notices.join("\n"), /review gate: passed/);
+    assert.equal((await f.restored())!.state.reviewWindow, undefined, "settlement closes the disabled window without a verdict");
+    // The next fresh prompt opens a new window and captures normally.
+    await f.start("fresh prompt after repair");
+    assert.equal(attempts.mock.callCount(), 2);
+    assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "checkpoint");
+    await f.writeScript("REVIEWED_FRESH_WORK\n");
+    await f.end();
+    assert.equal(await readFile(f.calls, "utf8"), "1");
+    assert.match(f.rt.sent.at(-1)!.message, /Review evidence method: Tools \+ workspace changes/);
+    assert.equal(disabled().length, 1);
+  } finally { await f.dispose(); }
+});
+
+for (const boundary of ["warning", "cancelled", "ineligible"] as const) {
+  test(`explicit fallback Off still blocks the prompt on ${boundary === "warning" ? "a failed mandatory warning" : boundary === "cancelled" ? "cancellation" : "an ineligible capture failure"}`, async () => {
+    const f = await fixture({ snapshotFailureFallback: false });
+    try {
+      const controller = new AbortController();
+      mock.method(checkpoints, "captureReviewCheckpoint", async () => {
+        if (boundary === "cancelled") controller.abort(new Error("cancelled during baseline capture"));
+        return boundary === "ineligible"
+          ? { status: "failed" as const, reason: "raw_checkpoint_failed" as const, detail: "injected storage failure" }
+          : { status: "failed" as const, reason: "untracked_too_large" as const, detail: "injected eligible failure", evidenceCaptureFailure: true as const };
+      });
+      if (boundary === "warning") {
+        const notify = f.rt.ctx.ui.notify;
+        mock.method(f.rt.ctx.ui, "notify", (message: string, type?: unknown) => {
+          if (message.startsWith("WARNING: Review disabled")) throw new Error("injected review-disabled warning failure");
+          return (notify as (message: string, type?: unknown) => number)(message, type);
+        });
+      }
+      await trigger(f.rt.hooks, "input", { cwd: f.cwd, source: "user", text: "change SCRIPT" }, f.rt.ctx);
+      await assert.rejects(trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd, signal: controller.signal }, f.rt.ctx),
+        boundary === "warning" ? /injected review-disabled warning failure/
+          : boundary === "cancelled" ? /baseline capture failed \(untracked_too_large\)/
+            : /baseline capture failed \(raw_checkpoint_failed\)/);
+      assert.equal(f.warnings.filter((warning) => warning.startsWith("WARNING: Review disabled")).length, 0);
+      assert.doesNotMatch(f.warnings.join("\n"), /snapshot-failure fallback\)/);
+      assert.equal((await f.restored())!.state.reviewWindow?.baseline, undefined);
+      await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/);
+      // A blocked attempt records no review-disabled decision: once capture is
+      // repaired, the retried start of the same window captures normally.
+      mock.restoreAll();
+      await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
       assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "checkpoint");
     } finally { await f.dispose(); }
   });
@@ -914,7 +1084,8 @@ test("worker acquisition handoff cannot bypass fallback Off, cancellation, or a 
 });
 
 test("Primary Tools only → Tools + workspace changes capture failure names methods and retains evidence fail-closed", async () => {
-  const f = await fixture({ primaryToolOnly: true }, false);
+  // Explicit Off: an absent fallback is On (#491) and would fall back instead.
+  const f = await fixture({ primaryToolOnly: true, snapshotFailureFallback: false }, false);
   try {
     await f.start();
     await f.writeScript("RETAIN_WHEN_SNAPSHOT_FAILS\n");
@@ -1345,7 +1516,7 @@ test("initial fallback notification failure leaves initialization unarmed and re
 for (const shape of ["single", "cumulative"] as const) {
   for (const initial of [true, false]) {
     for (const enabled of [false, true]) {
-      test(`real arm ${shape} untracked over budget at ${initial ? "initial" : "settlement"} capture: fallback ${enabled ? "On reviews retained tool evidence" : "Off blocks"}`, async () => {
+      test(`real arm ${shape} untracked over budget at ${initial ? "initial" : "settlement"} capture: fallback ${enabled ? "On reviews retained tool evidence" : initial ? "Off warns review disabled and continues unreviewed" : "Off blocks"}`, async () => {
         const f = await fixture({ snapshotFailureFallback: enabled }, true, indexTestConfig.maxCorrectionCycles as number, async (stage, owned) => {
           if (stage === "beforeActivation") await initGitRepo(join(owned.root, "workspace"), { SCRIPT: "BEFORE_SCRIPT\n" });
         });
@@ -1388,8 +1559,23 @@ for (const shape of ["single", "cumulative"] as const) {
             assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "checkpoint");
           }
           if (initial && !enabled) {
-            await assert.rejects(f.start(), /baseline capture failed \(untracked_too_large\)/);
-            assert.equal(f.warnings.length, 0);
+            // #491: the reported scenario with explicit Off warns and continues
+            // honestly unreviewed instead of throwing; limits stay enforced.
+            await f.start();
+            assert.equal(f.warnings.length, 1);
+            assert.match(f.warnings[0]!, /^WARNING: Review disabled for this turn/);
+            assert.match(f.warnings[0]!, /No snapshot coverage is available/);
+            await f.writeScript("RETAINED_TOOL_WORK\n");
+            await f.end();
+            await assert.rejects(readFile(f.calls, "utf8"), /ENOENT/, "no reviewer runs");
+            assert.equal(f.rt.sent.length, 0, "no review transmission or pass");
+            assert.deepEqual(f.modelInputs, []);
+            assert.doesNotMatch(`${f.rt.notices.join("\n")}\n${f.warnings.join("\n")}`, /Tools only \(snapshot-failure fallback\)/);
+            assert.equal((await f.restored())!.state.reviewWindow, undefined);
+            assert.equal(outcomes.length, 1);
+            assert.deepEqual([outcomes[0]!.status, outcomes[0]!.reason, outcomes[0]!.evidenceCaptureFailure], ["failed", "untracked_too_large", true]);
+            assert.deepEqual(bigReads, [], "over-budget untracked bytes are never read");
+            assert.deepEqual(largeAllocations, []);
             return;
           }
           if (initial) {

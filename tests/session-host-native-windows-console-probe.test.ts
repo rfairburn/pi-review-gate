@@ -97,10 +97,12 @@ test("trusted PowerShell helper console attachment: direct versus owned outer Co
   const root = createWindowsHarnessRoot();
   const home = createOwnedDirectory(root, "home");
   const temporary = createOwnedDirectory(root, "tmp");
-  probeWindowsPowerShell(runtime, home, temporary);
+  // PowerShell may initialize AppData even for the readiness query. Establish
+  // these owned directories first rather than colliding with its initialization.
   const appData = createOwnedDirectory(home, "AppData");
   const localAppData = createOwnedDirectory(appData, "Local");
   const roamingAppData = createOwnedDirectory(appData, "Roaming");
+  probeWindowsPowerShell(runtime, home, temporary);
 
   // The same minimal environment the Main harness hands its ConPTY runner.
   const systemRoot = process.env.SystemRoot ?? process.env.WINDIR!;

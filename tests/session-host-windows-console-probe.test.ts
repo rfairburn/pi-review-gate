@@ -30,6 +30,20 @@ const probe = createRequire(join(process.cwd(), "package.json"))(
 
 const ENVS = { harness: { PATH: "harness-path" }, profile: { PATH: "harness-path", PSModulePath: "profile" } };
 
+test("the native probe establishes owned AppData before PowerShell can initialize it", () => {
+  const source = readFileSync(join(process.cwd(), "tests", "session-host-native-windows-console-probe.test.ts"), "utf8");
+  const readiness = source.indexOf("  probeWindowsPowerShell(runtime, home, temporary);");
+  assert.ok(readiness > 0);
+  for (const creation of [
+    'const appData = createOwnedDirectory(home, "AppData");',
+    'const localAppData = createOwnedDirectory(appData, "Local");',
+    'const roamingAppData = createOwnedDirectory(appData, "Roaming");',
+  ]) {
+    assert.ok(source.indexOf(creation) >= 0 && source.indexOf(creation) < readiness,
+      "exclusive owned-directory creation precedes PowerShell's first launch");
+  }
+});
+
 function runWith(reply: (call: SpawnCall) => Record<string, unknown>, isAlive: (pid: number) => boolean = () => false) {
   const calls: SpawnCall[] = [];
   let clock = 0;

@@ -726,7 +726,7 @@ test("remediation (macOS): granting ACLs are removed through the held descriptor
 	assert.equal(report.priorExposurePossible, true);
 	assert.ok(Object.values(outcomes(report)).every((outcome) => outcome === "repaired"), JSON.stringify(report.targets));
 	for (const target of fixed) assert.deepEqual(aclEntries(target), [], `${target}: the ACL was removed`);
-	assert.equal(modeOf(stateDir), 0o755, "an acceptable base mode is not changed");
+	assert.equal(modeOf(stateDir), 0o700, "a base whose granting ACL is removed is first made exactly owner-only");
 	assert.equal(modeOf(path.join(stateDir, "peers")), 0o700);
 	assert.equal(modeOf(path.join(stateDir, "peers", "state.json")), 0o600);
 	assert.equal(modeOf(path.join(stateDir, "peer-preferences", "preferences.json")), 0o600);
@@ -1004,51 +1004,113 @@ test("remediation (macOS): an unknown right anywhere in the ACL refuses removal,
 });
 
 test("remediation (macOS): broad mode bits are tightened and verified before an ACL with a deny entry is removed", { skip: ACL_SKIP }, (t) => {
-	const arrange = (): { agentDir: string; document: string } => {
+	interface Case {
+		readonly label: string;
+		readonly target: "peer-state" | "session-host";
+		readonly reason: string;
+		readonly broadMode: number;
+		readonly ownerOnlyMode: number;
+		readonly entries: readonly string[];
+	}
+	const cases: readonly Case[] = [
+		{
+			label: "document",
+			target: "peer-state",
+			reason: "unsafe-permissions",
+			broadMode: 0o666,
+			ownerOnlyMode: 0o600,
+			entries: ["group:everyone deny write", "group:staff allow read"],
+		},
+		{
+			// 0755 alone satisfies the base's owner-controlled requirement, but the
+			// deny entry is what keeps another account out of it; removing the
+			// whole ACL first would hand that account the mode's read/search bits.
+			label: "base",
+			target: "session-host",
+			reason: "extended-acl",
+			broadMode: 0o755,
+			ownerOnlyMode: 0o700,
+			entries: ["user:nobody deny list,search", "user:nobody allow add_file"],
+		},
+	];
+	const arrange = (fixture: Case): { agentDir: string; stateDir: string; object: string; files: Record<string, Buffer> } => {
 		const { agentDir, stateDir } = agentFixture(t);
-		existingLayout(stateDir);
-		const document = path.join(stateDir, "peers", "state.json");
-		chmodSync(document, 0o666);
-		addAcl(document, "group:everyone deny write");
-		addAcl(document, "group:staff allow read");
-		return { agentDir, document };
+		const files = existingLayout(stateDir);
+		const object = fixture.target === "session-host" ? stateDir : path.join(stateDir, "peers", "state.json");
+		chmodSync(object, fixture.broadMode);
+		for (const entry of fixture.entries) addAcl(object, entry);
+		return { agentDir, stateDir, object, files };
 	};
-	// The mode repair fails: the ACL (and its deny entry) is never removed.
-	const failing = arrange();
-	const entries = aclEntries(failing.document);
-	assert.equal(entries.length, 2);
-	let removals = 0;
-	const failed = repairPeerStorageProtection({ agentDir: failing.agentDir }, {
-		fchmod: () => {
-			throw new Error("injected mode failure");
-		},
-		removeExtendedAcl: () => {
-			removals += 1;
-		},
-	});
-	assert.equal(removals, 0, "no ACL removal before the mode is established");
-	assert.equal(failed.outcome, "partial");
-	assert.deepEqual(failed.targets.find((target) => target.target === "peer-state"), { target: "peer-state", outcome: "failed-possibly-changed", reason: "unreadable" });
-	assert.deepEqual(aclEntries(failing.document), entries, "the deny entry still narrows the broad mode");
-	assert.equal(modeOf(failing.document), 0o666);
+	for (const fixture of cases) {
+		// The mode repair fails: the ACL (and its deny entry) is never removed.
+		const failing = arrange(fixture);
+		const entries = aclEntries(failing.object);
+		assert.equal(entries.length, 2, fixture.label);
+		assert.ok(entries.some((entry) => / deny /u.test(entry)), `${fixture.label}: fixture has a deny entry`);
+		const assessed = assessPeerStorageProtection({ agentDir: failing.agentDir });
+		assert.deepEqual(
+			assessed.targets.find((target) => target.target === fixture.target),
+			{ target: fixture.target, status: "repairable", reason: fixture.reason },
+			fixture.label,
+		);
+		assert.equal(assessed.repairable, true, fixture.label);
+		let removals = 0;
+		const failed = repairPeerStorageProtection({ agentDir: failing.agentDir }, {
+			fchmod: () => {
+				throw new Error("injected mode failure");
+			},
+			removeExtendedAcl: () => {
+				removals += 1;
+			},
+		});
+		assert.equal(removals, 0, `${fixture.label}: no ACL removal before the mode is established`);
+		assert.equal(failed.outcome, "partial", fixture.label);
+		assert.deepEqual(failed.targets.find((target) => target.target === fixture.target), { target: fixture.target, outcome: "failed-possibly-changed", reason: "unreadable" }, fixture.label);
+		assert.deepEqual(aclEntries(failing.object), entries, `${fixture.label}: the deny entry still narrows the broad mode`);
+		assert.equal(modeOf(failing.object), fixture.broadMode, fixture.label);
 
-	// The real repair runs mode first, then the descriptor-bound ACL removal.
-	const working = arrange();
-	const order: string[] = [];
-	const repaired = repairPeerStorageProtection({ agentDir: working.agentDir }, {
-		fchmod: (fd, mode) => {
-			order.push(`mode:${modeOf(working.document).toString(8)}`);
-			fchmodSync(fd, mode);
-		},
-		removeExtendedAcl: (fd) => {
-			order.push(`acl:${modeOf(working.document).toString(8)}`);
-			removeThroughDescriptor(fd);
-		},
-	});
-	assert.equal(repaired.outcome, "repaired", JSON.stringify(repaired.targets));
-	assert.deepEqual(order, ["mode:666", "acl:600"]);
-	assert.deepEqual(aclEntries(working.document), []);
-	assert.equal(modeOf(working.document), 0o600);
+		// The real repair runs mode first, then the descriptor-bound ACL removal.
+		const working = arrange(fixture);
+		const identities = Object.fromEntries(Object.keys(working.files).map((relative) => [relative, inode(path.join(working.stateDir, relative))]));
+		const objectIdentity = inode(working.object);
+		const stateIdentity = inode(working.stateDir);
+		const order: string[] = [];
+		const repaired = repairPeerStorageProtection({ agentDir: working.agentDir }, {
+			fchmod: (fd, mode) => {
+				order.push(`mode:${modeOf(working.object).toString(8)}`);
+				fchmodSync(fd, mode);
+			},
+			removeExtendedAcl: (fd) => {
+				order.push(`acl:${modeOf(working.object).toString(8)}`);
+				removeThroughDescriptor(fd);
+			},
+		});
+		assert.equal(repaired.outcome, "repaired", JSON.stringify(repaired.targets));
+		assert.deepEqual(order, [`mode:${fixture.broadMode.toString(8)}`, `acl:${fixture.ownerOnlyMode.toString(8)}`], fixture.label);
+		assert.deepEqual(aclEntries(working.object), [], fixture.label);
+		assert.equal(modeOf(working.object), fixture.ownerOnlyMode, fixture.label);
+		assert.equal(inode(working.object), objectIdentity, `${fixture.label}: identity is preserved`);
+		assert.equal(inode(working.stateDir), stateIdentity, fixture.label);
+		for (const [relative, bytes] of Object.entries(working.files)) {
+			assert.deepEqual(readFileSync(path.join(working.stateDir, relative)), bytes, `${fixture.label}: ${relative} bytes are preserved`);
+			assert.equal(inode(path.join(working.stateDir, relative)), identities[relative], `${fixture.label}: ${relative} identity is preserved`);
+		}
+		assert.equal(modeOf(path.join(working.stateDir, "roster.json")), 0o600, `${fixture.label}: unrelated children are never touched`);
+		assert.deepEqual(aclEntries(path.join(working.stateDir, "roster.json")), [], fixture.label);
+		assert.deepEqual(readdirSync(working.stateDir).sort(), ["host-shortcuts.json", "peer-preferences", "peers", "roster.json", "unknown.bin"], fixture.label);
+		const proof = assessPeerStorageProtection({ agentDir: working.agentDir });
+		assert.ok(proof.targets.every((target) => target.status === "protected"), JSON.stringify(proof.targets));
+		assert.equal(repairPeerStorageProtection({ agentDir: working.agentDir }).outcome, "nothing-to-repair", fixture.label);
+	}
+
+	// Without a granting ACL, an acceptable 0755 base is already safe and never touched.
+	const { agentDir, stateDir } = agentFixture(t);
+	existingLayout(stateDir);
+	chmodSync(stateDir, 0o755);
+	assert.equal(assessPeerStorageProtection({ agentDir }).targets.find((target) => target.target === "session-host")?.status, "protected");
+	assert.equal(repairPeerStorageProtection({ agentDir }).outcome, "nothing-to-repair");
+	assert.equal(modeOf(stateDir), 0o755);
+	createPeerStatePermissionPolicy().assertOwnerControlledDirectory(stateDir);
 });
 
 // ------------------------------------------------- Windows remediation

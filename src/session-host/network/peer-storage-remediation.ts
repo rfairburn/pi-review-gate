@@ -489,8 +489,9 @@ function assessPosixTarget(spec: TargetSpec, platform: NodeJS.Platform, probe: P
 /**
  * Repair one POSIX target: reopen it no-follow, prove the held descriptor is
  * the assessed object and still eligible (including a fresh, complete ACL
- * verdict read by file ID), `fchmod` that descriptor when the mode fails the
- * requirement and verify it, only then remove a granting macOS ACL through the
+ * verdict read by file ID), `fchmod` that descriptor to the exact owner-only
+ * mode when the mode fails the requirement or a granting ACL is to be removed
+ * and verify it, only then remove a granting macOS ACL through the
  * same descriptor and prove by file ID that it is gone, then prove the mode on
  * the descriptor and on the same object at the path, and re-prove the ACL once more.
  */
@@ -531,10 +532,12 @@ function repairPosixTarget(
 		// Only macOS ACLs are classified here; anything else cannot be removed.
 		if (removeAcl && platform !== "darwin") return fail("protection-unsupported");
 		const modeBefore = Number(held.mode) & ALL_MODE_BITS;
-		const chmodNeeded = !modeMeetsRequirement(spec, modeBefore);
 		// Mode first: an ACL deny entry may be the only thing narrowing broad mode
-		// bits, so the ACL is removed only once the owner-only mode is established
-		// and verified on the held descriptor. A mode failure leaves the ACL as it was.
+		// bits, so the ACL is removed only once the exact owner-only mode is
+		// established and verified on the held descriptor — even for the base,
+		// whose owner-controlled requirement alone would also admit group/other
+		// read and search. A mode failure leaves the ACL as it was.
+		const chmodNeeded = !modeMeetsRequirement(spec, modeBefore) || (removeAcl && modeBefore !== desiredMode(spec));
 		if (chmodNeeded) {
 			mutated = true;
 			(probe.fchmod ?? fchmodSync)(fd, desiredMode(spec));

@@ -1993,7 +1993,7 @@ test("a bounded paste pages atomically, preserves Unicode, and refuses one byte 
 	await deadlined(viewer.stop(), "stop");
 });
 
-test("logical inputs are ordered, bounded at 32 pending operations, and never interleave pages", async () => {
+test("logical inputs are ordered, bounded at 128 pending operations, and never interleave pages", async () => {
 	const channel = new FakeContentChannel();
 	scriptOwner(channel, { ackNativeIo: true });
 	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
@@ -2004,12 +2004,12 @@ test("logical inputs are ordered, bounded at 32 pending operations, and never in
 
 	channel.holdSend = true;
 	const paste = "\u4e16\u754c".repeat(20_000);
-	// One paged operation opens the queue, then 30 keyboard packets, then a mouse
-	// packet as the 32nd: operations 5 through 32 are the ones the former bound of
+	// One paged operation opens the queue, then 126 keyboard packets, then a mouse
+	// packet as the 128th: operations 5 through 128 are the ones the former bound of
 	// four refused, and a page never consumes more than its own one slot.
 	const requests: SessionContentViewerInputRequest[] = [
 		{ source, inputModes: INPUT_MODES, kind: "paste", text: paste },
-		...Array.from({ length: 30 }, (_unused, index): SessionContentViewerInputRequest => ({
+		...Array.from({ length: 126 }, (_unused, index): SessionContentViewerInputRequest => ({
 			source,
 			inputModes: INPUT_MODES,
 			kind: "keyboard",
@@ -2017,14 +2017,14 @@ test("logical inputs are ordered, bounded at 32 pending operations, and never in
 		})),
 		{ source, inputModes: INPUT_MODES, kind: "mouse", text: "\x1b[<0;5;3M" },
 	];
-	assert.equal(requests.length, 32);
+	assert.equal(requests.length, 128);
 	const pending = requests.map((request) => viewer.sendInput(request));
 	await settle();
 	const bytesBeforeRefusal = channel.sent.length;
 	assert.deepEqual(
 		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "over-bound" }),
 		{ status: "not-sent", reason: "busy" },
-		"the 33rd logical operation is refused while 32 are pending",
+		"the 129th logical operation is refused while 128 are pending",
 	);
 	assert.equal(channel.sent.length, bytesBeforeRefusal, "the refused operation writes not a single byte");
 	const started = channel.types().slice(before).filter((type) => type === "input_begin" || type === "input");
@@ -2042,7 +2042,7 @@ test("logical inputs are ordered, bounded at 32 pending operations, and never in
 	assert.ok(types.slice(1, endIndex).every((type) => type === "input_chunk"),
 		"the paste's pages are contiguous");
 	const inline = frames.slice(endIndex + 1);
-	assert.equal(inline.length, 31, "each later operation is exactly one inline packet after the paste finished");
+	assert.equal(inline.length, 127, "each later operation is exactly one inline packet after the paste finished");
 	assert.ok(inline.every((frame) => frame.type === "input"),
 		"no later operation's pages interleave with another operation's");
 	inline.forEach((frame, index) => {
@@ -2055,8 +2055,8 @@ test("logical inputs are ordered, bounded at 32 pending operations, and never in
 		assert.equal(frame.subscriptionId, viewer.subscriptionId);
 	});
 	assert.deepEqual(inline.map((frame) => (frame.type === "input" ? frame.ordinal : -1)),
-		Array.from({ length: 31 }, (_unused, index) => index + 2),
-		"the refused 33rd consumed no ordinal and no packet was replayed");
+		Array.from({ length: 127 }, (_unused, index) => index + 2),
+		"the refused 129th consumed no ordinal and no packet was replayed");
 	assert.equal(types.filter((type) => type === "input_end").length, 1, "no page is replayed");
 	assert.equal(types.filter((type) => type === "input_begin").length, 1, "the paste began exactly once");
 	await deadlined(viewer.stop(), "stop");
@@ -2064,12 +2064,15 @@ test("logical inputs are ordered, bounded at 32 pending operations, and never in
 
 /**
  * Mirrors the endpoint's internal queued-send bound, exactly as the threshold case
- * above asserts it: 32 admitted logical operations that have not settled yet,
- * however long each has been outstanding. #500 replaced the first trial's
- * arrival-rate rationale with the two shapes the cases below actually measure.
- * Neither one is an established account of the reported incident.
+ * above asserts it: 128 admitted logical operations that have not settled yet,
+ * however long each has been outstanding. The 128 is the explicitly selected trial size
+ * that replaced the earlier 32 after the live 32 trial did not remove the reported
+ * notice; it is not derived from an event rate and is not an established account of that
+ * incident. #500 replaced the first trial's arrival-rate rationale with the two shapes
+ * the cases below actually measure, and neither shape shows the larger bound fixing
+ * anything.
  */
-const MAX_QUEUED_INPUT_OPERATIONS = 32;
+const MAX_QUEUED_INPUT_OPERATIONS = 128;
 
 /** One canonical content-space wheel report: 11 bytes, the whole logical operation. */
 const WHEEL_REPORT = "\x1b[<64;10;5M";

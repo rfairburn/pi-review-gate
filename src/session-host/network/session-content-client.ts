@@ -336,26 +336,12 @@ export interface SessionContentViewer {
 }
 
 /**
- * Queued control writes: hello, subscribe, resize, unsubscribe, and one error.
- * The same finite bound governs pending logical input operations: 32 admitted
- * operations that have not settled yet, however long each has been outstanding.
- *
- * #500 replaced this constant's first-trial sizing rationale, which read the bound
- * as an allowance over an arrival rate of normalized terminal packets. It is not
- * one. What the existing harnesses measure is narrower. From an empty queue on a
- * transport that never stalls, a synchronous batch of 40 wheel reports admits 32 and
- * refuses 8, because no send can settle while a synchronous batch is still being
- * admitted; when each report's result is awaited before the next is admitted, the
- * queue never grows beyond one. Pending operations are not limited to one batch — a
- * held or stalled send keeps them outstanding across event loop turns and refuses at
- * the same bound — so neither result is an established account of the reported
- * incident. What is measured is that one wheel report stays one operation carrying
- * exactly its own packet: no burst is expanded into per-character or multi-packet
- * operations. Admission stays fail-closed — an operation above the bound is refused
- * as `busy` before anything is queued or written, and a control backlog still refuses
- * further queueing.
+ * Finite bound shared by queued control writes and pending logical input operations.
+ * Counts admitted-but-unsettled operations, not characters or events per second.
+ * Slots release as sends settle; synchronous bursts can fill the bound before any
+ * write runs. Overflow remains refused without replay or relaxed input fences.
  */
-const MAX_QUEUED_CONTROL_SENDS = 32;
+const MAX_QUEUED_CONTROL_SENDS = 128;
 
 type ViewerState = "awaiting_ack" | "subscribing" | "streaming";
 

@@ -670,9 +670,28 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       NODE_OPTIONS: `--require=${preload}`, PRG_COPY_LOG: helperLog, PRG_OWNED_BIN: binDir,
       PRG_CLIP_ATTEST: join(attestRoot, nonce), PRG_CLIP_ATTEST_NONCE: nonce,
     };
+    // A generic non-Node configured editor: accept a fixed synthetic byte count
+    // into Pi's own filename argument, recording the same bytes before exit. No
+    // Node input shim can mask framing leakage, and no editor executable name is
+    // part of the product handoff. Existing test cleanup owns the native child.
+    const externalEditor = join(root, "network-owned-editor");
+    const externalReceipt = join(root, "external-editor-bytes");
+    const externalBody = "NETEDIT499-λ-雪";
+    const externalDraft = `/input-proof ${externalBody}`;
+    const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
+    writeFileSync(externalEditor, `#!/bin/sh
+/bin/stty raw -echo
+printf '\\033[2J\\033[HEDITOR499_READY'
+/bin/dd bs=1 count=${Buffer.byteLength(externalDraft, "utf8")} of="$1" 2>/dev/null
+status=$?
+if [ "$status" -ne 0 ]; then exit "$status"; fi
+/bin/cp "$1" ${shellQuote(externalReceipt)}
+`, { mode: 0o700, flag: "wx" });
     // Pi's own default copy-on-select is pinned off so no mouse gesture can copy
     // anything implicitly; the only copy gestures are keystrokes and the command.
-    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ fullscreenCopyOnSelect: false }), { mode: 0o600 });
+    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
+      fullscreenCopyOnSelect: false, externalEditor,
+    }), { mode: 0o600 });
     const args = ["--offline", "--no-context-files", "--no-skills", "--no-themes", "--no-extensions",
       "--extension", fixture, "--tui-mode", "fullscreen"];
 
@@ -1313,6 +1332,45 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       assert.ok(afterBig);
       assert.equal(nativeIoSourceEquals(afterBig, source), true,
         "the input legs never changed the source this viewer committed");
+
+      /* ------------------------------------------------------------------ *
+       * Generic external editing through this independently authorized viewer.
+       * This is real same-host TLS + PTY evidence, not physical SSH/Main input.
+       * ------------------------------------------------------------------ */
+      leg = "network viewer production Ctrl+G external-editor handoff";
+      const beforeExternal = gestureSource();
+      const externalOpen = await liveViewer.sendInput({
+        source: beforeExternal.source, inputModes: beforeExternal.modes, kind: "keyboard", text: "\x07",
+      });
+      assert.equal(externalOpen.status, "submitted");
+      await signal.waitFor(() => frameText(liveViewer.readSnapshot()!.frame).includes("EDITOR499_READY")
+        && currentModes().bracketedPaste === false, 20_000,
+      "the remote viewport observes the configured non-Node editor and its own input modes");
+      const editorSource = gestureSource();
+      const editorKeys = await liveViewer.sendInput({
+        source: editorSource.source, inputModes: editorSource.modes, kind: "keyboard", text: "/input-proof ",
+      });
+      assert.equal(editorKeys.status, "submitted");
+      await waitForViewerDispatch("/input-proof ", true, "the ordinary editor characters retain their authenticated viewer origin");
+      const editorPaste = await liveViewer.sendInput({
+        source: editorSource.source, inputModes: editorSource.modes, kind: "paste", text: externalBody,
+      });
+      assert.equal(editorPaste.status, "submitted");
+      await waitForViewerDispatch(externalBody, true, "the editor's unbracketed Unicode paste remains a viewer dispatch");
+      await signal.waitFor(() => existsSync(externalReceipt) && text(pane).includes(externalBody)
+        && currentModes().bracketedPaste === true, 20_000,
+      "the configured editor exits and Pi restores the exact returned draft and native input modes");
+      assert.equal(readFileSync(externalReceipt, "utf8"), externalDraft,
+        "the non-Node editor received exactly ordinary characters and paste, never input frames");
+      assert.equal(text(pane).includes("prg-ni-v2;"), false);
+      const afterExternal = gestureSource();
+      const editorSubmit = await liveViewer.sendInput({
+        source: afterExternal.source, inputModes: afterExternal.modes, kind: "keyboard", text: "\r",
+      });
+      assert.equal(editorSubmit.status, "submitted");
+      const externalMarker = `INPUTNET:${createHash("sha256").update(externalBody, "utf8").digest("hex")}`;
+      await signal.waitFor(() => text(pane).replace(/\s/g, "").includes(externalMarker), 20_000,
+        "normal native command input resumes with the exact editor-returned draft");
 
       /* ------------------------------------------------------------------ *
        * The F7 raw-output decoy: a synchronous public shortcut write grants nothing.

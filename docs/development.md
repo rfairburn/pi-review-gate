@@ -297,6 +297,32 @@ reported SSH host's exact environment. Use the
 [isolated manual comparison](session-host-alpha.md#isolated-manual-ssh-clipboard-comparison)
 for same-terminal standalone/hosted copying and an actual paste **on the client**.
 
+### Native external-editor input (#499)
+
+With the explicit installed-Pi pins described above, after `npm run build:test`:
+
+```sh
+node --test dist-test/tests/session-host-native-external-editor.test.js
+```
+
+This case drives public Main with its production default-on framing, creates an
+owned native Pi session, and sends the real Ctrl+G action through the outer PTY.
+The configured editor is a non-Node shell wrapper around real Vim, so a Node input
+shim cannot mask leaked frames. It checks the exact original prefill, ordinary editor
+commands, Unicode bracketed paste, exact saved file bytes, draft return, quit without
+saving, nonzero editor failure, and ordinary Pi input after each return. A subsequent
+editor prefill independently checks Pi's actual returned draft rather than accepting a
+stale rendered match. No model, provider, physical clipboard, or live user draft is
+used. Vim is a test consumer only: production handoff follows Pi's generic configured
+external-editor action, not an editor executable name.
+
+The shared real-Main harness is macOS-only and uses exact owned-process exit
+observation; this case skips on other platforms. It is same-host PTY evidence, not a
+physical terminal, Linux-over-SSH, or remote-viewer certification. Keep those limits
+separate from bridge-level authorization and input-ownership tests. The manual
+[external editing comparison](session-host-alpha.md#native-input-and-copy) covers the
+operator checks for each applicable route.
+
 ### Network native input and copy (#389)
 
 After `npm run build:test`, the focused files are:
@@ -354,6 +380,13 @@ missing module/export/witness, or an unrecorded block fails closed before any co
 The case never uses a physical clipboard read or write as its probe. The existing local
 native clipboard routing and origin fixtures remain separate and are not replaced by
 these two files.
+
+The real-child network case also sends the production Ctrl+G action through the
+viewer to a generic configured non-Node editor (`sh` with a fixed-length byte reader).
+It checks ordinary characters and Unicode paste against an exact byte receipt,
+Pi's returned draft, native input-mode restoration, and the digest of that draft
+submitted through Pi's normal command path. It reuses the existing authenticated
+transport and simulated viewer write receipt; it is not a physical remote Main test.
 
 The two network files are same-host POSIX evidence. They do not establish cross-machine behavior,
 Windows ConPTY, a mobile client, a physical OS clipboard write, a physical Main focus or

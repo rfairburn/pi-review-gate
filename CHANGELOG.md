@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.196]
+
+### Fixed
+
+- Corrected the native Ctrl+G external-editor input handoff (#499). Hosted editors
+  receive ordinary terminal input through an editor-specific PTY relay behind the
+  existing authenticated decoder, instead of reading printable native-input frames
+  directly. The configured editor and Pi's draft-return behavior are preserved;
+  save, quit-without-save, and failure return input to Pi without disabling framing
+  or widening viewer authorization.
+
 ## [0.1.0-dev.195]
 
 ### Added

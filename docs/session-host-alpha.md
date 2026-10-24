@@ -1826,9 +1826,35 @@ of it. It uses a technical assembly bound of 1,048,588 bytes (the 1 MiB body plu
 two six-byte paste markers). A phase or conversation-tuple change drops an assembly in
 progress immediately, even when the source later changes back. Mouse bytes, including
 high-bit bytes, are handed over exactly. There is no raw fallback and no downgrade of
-viewer input to local input. Local input, non-user terminal-query replies, and legacy
-streaming keep their unchanged paths. Atomic assembly and admission are protocol
-boundaries, not an operating-system delivery guarantee.
+viewer input to local input. Local input and non-user terminal-query replies use the
+same authenticated child decoder. Legacy unframed children retain their existing paths. Atomic assembly
+and admission are protocol boundaries, not an operating-system delivery guarantee.
+
+**External editing.** Ctrl+G still opens Pi's configured external editor; it does not
+open a host replacement editor or change the editor setting. On the supported macOS
+and Linux runtime paths, an editor-specific PTY relay in a framing child keeps the
+authenticated decoder in front of that editor:
+ordinary commands, text, and supported paste reach the editor as terminal input, not
+as printable `prg-ni-v2;` records. Pi and the external editor never share an active
+input consumer. Input retained across an ownership transition is discarded rather
+than replayed into the next consumer. Saving returns Pi's edited draft once; quitting
+without saving or an editor failure preserves the draft under Pi's existing rules.
+After the owned editor exits, Pi resumes its normal input and terminal modes. The
+relay does not disable framing, create a raw-input window, or broaden remote input
+permissions; viewer input retains its existing authorization and source fences.
+This correction does not establish native Windows external-editor support.
+
+For manual acceptance in an isolated profile with a synthetic draft, configure your
+chosen editor through Pi's existing editor setting and open a native session in Main. Type a
+recognizable draft, press Ctrl+G, make a small edit (including Unicode/paste supported
+by the terminal), and save/exit. Confirm the exact edited draft returns, with no
+unintended frame records, and ordinary Pi typing still works. Repeat with the editor's
+quit-without-save action and a deliberately failing editor command: the prior draft must
+remain and input must recover without restarting the host. Compare standalone Pi,
+local Main, and SSH to Linux separately; a same-host PTY test is not physical-terminal
+or SSH certification. If using a remote viewer, repeat through that selected remote
+pane with its existing Remote input/copy setting enabled; no new grant is needed or
+implied.
 
 **Startup input.** A child the owner has just started can show a native prompt before
 it has a conversation, such as Pi's `Trust project folder?` selector. When both sides

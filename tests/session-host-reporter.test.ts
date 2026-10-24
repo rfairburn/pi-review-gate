@@ -192,6 +192,8 @@ interface TestServer {
   socketPath: string;
   frames: Frame[];
   connections: number;
+  /** Sockets still connected; reporter retirement closes them. */
+  liveClients(): number;
   waitForFrame(predicate: (frame: Frame) => boolean, timeoutMs?: number, afterIndex?: number): Promise<Frame>;
   sendToClients(data: string): void;
   destroyClients(): void;
@@ -254,6 +256,7 @@ async function startServer(): Promise<TestServer> {
     get connections() {
       return connections;
     },
+    liveClients: () => clients.length,
     waitForFrame,
     sendToClients(data: string) {
       for (const client of clients) if (!client.destroyed) client.write(data);
@@ -1590,6 +1593,249 @@ describe("session-host reporter status frames", () => {
     assert.deepEqual(calls, ["isIdle", "shutdown", "isIdle", "abort"]);
     await reloaded.trigger("session_shutdown", { type: "session_shutdown" }, ctx);
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  /**
+   * Bind a stand-in for the external-editor handoff's awaited settlement slot, exactly
+   * as the handoff binds it: released when the owned editor's own exit ends the wait,
+   * and kept for an editor whose exit could not be witnessed.
+   */
+  function bindEditorSettlementSlot(
+    events: string[],
+    behavior: "settle" | "unwitnessed" | "throws",
+  ): { settleCalls(): number; release(settled: boolean): void } {
+    const slotKey = Symbol.for("pi-review-gate.native-editor-handoff.shutdown.v1");
+    const storage = globalThis as Record<PropertyKey, unknown>;
+    let settleCalls = 0;
+    let release: (settled: boolean) => void = () => { /* replaced by the promise below */ };
+    const settlement = new Promise<boolean>((resolve) => {
+      release = (settled) => {
+        if (behavior === "settle") delete storage[slotKey];
+        resolve(settled);
+      };
+    });
+    storage[slotKey] = {
+      settle: (): Promise<boolean> => {
+        settleCalls += 1;
+        events.push("settle");
+        if (behavior === "throws") return Promise.reject(new Error("the editor left without a witness"));
+        if (behavior === "unwitnessed") return Promise.resolve(false);
+        return settlement;
+      },
+    };
+    return { settleCalls: () => settleCalls, release: (settled) => release(settled) };
+  }
+
+  function clearEditorSettlementSlot(): void {
+    delete (globalThis as Record<PropertyKey, unknown>)[Symbol.for("pi-review-gate.native-editor-handoff.shutdown.v1")];
+  }
+
+  it("settles an owned nested external editor between admission and the shutdown commit", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "editor-shutdown-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    const { testPi, ctx, bootstrap } = await startSession({ server, sessionManager });
+    const events: string[] = [];
+    ctx.isIdle = () => { events.push("isIdle"); return true; };
+    ctx.shutdown = () => { events.push("shutdown"); };
+    ctx.abort = () => { events.push("abort"); };
+    const status = await server.waitForFrame((frame) => frame.message.type === "status");
+    const native = status.message.nativeSession as { sessionId: string; epoch: number };
+    const shutdownAck = async (request: Record<string, unknown>) => {
+      const requestId = String(request.requestId);
+      const before = server.frames.length;
+      server.sendToClients(encodeFrame(request as never));
+      return await server.waitForFrame(
+        (frame) => frame.message.type === "shutdown_result" && frame.message.requestId === requestId,
+        3_000,
+        before - 1,
+      );
+    };
+
+    const editor = bindEditorSettlementSlot(events, "settle");
+    try {
+      const before = server.frames.length;
+      const request = makeShutdownRequest(bootstrap, native.sessionId, native.epoch);
+      const requestId = String(request.requestId);
+      server.sendToClients(encodeFrame(request as never));
+      await sleep(50);
+      assert.equal(editor.settleCalls(), 1, "the admitted request stops the owned editor");
+      assert.equal(events.includes("shutdown"), false, "no public shutdown side effect runs while the editor is open");
+      assert.equal(server.frames.slice(before).some((frame) => frame.message.type === "shutdown_result"), false,
+        "the acknowledgement waits for positive settlement");
+      editor.release(true);
+      const ack = await server.waitForFrame(
+        (frame) => frame.message.type === "shutdown_result" && frame.message.requestId === requestId,
+        3_000,
+        before - 1,
+      );
+      assert.equal(ack.message.outcome, "requested");
+      assert.ok(events.includes("shutdown"), "the public shutdown request runs after the editor settled");
+      assert.ok(events.indexOf("isIdle") < events.indexOf("settle"),
+        "admission is decided before the editor is stopped");
+      assert.ok(events.indexOf("settle") < events.indexOf("shutdown"),
+        "the editor settles before any shutdown side effect");
+      assert.ok(events.lastIndexOf("isIdle") > events.indexOf("settle"),
+        "the admitted session and idleness are established again after the wait");
+    } finally {
+      clearEditorSettlementSlot();
+      await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+    }
+  });
+
+  it("refuses a stale or not-idle shutdown request without stopping the owned editor", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "editor-refused-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    const { testPi, ctx, bootstrap } = await startSession({ server, sessionManager });
+    const events: string[] = [];
+    let shutdownCalls = 0;
+    ctx.isIdle = () => false;
+    ctx.shutdown = () => { shutdownCalls += 1; };
+    ctx.abort = () => undefined;
+    const status = await server.waitForFrame((frame) => frame.message.type === "status");
+    const native = status.message.nativeSession as { sessionId: string; epoch: number };
+    const shutdownAck = async (request: Record<string, unknown>) => {
+      const requestId = String(request.requestId);
+      const before = server.frames.length;
+      server.sendToClients(encodeFrame(request as never));
+      return await server.waitForFrame(
+        (frame) => frame.message.type === "shutdown_result" && frame.message.requestId === requestId,
+        3_000,
+        before - 1,
+      );
+    };
+
+    const editor = bindEditorSettlementSlot(events, "settle");
+    try {
+      const stale = await shutdownAck(makeShutdownRequest(bootstrap, "another-native-session", native.epoch));
+      assert.equal(stale.message.outcome, "rejected");
+      assert.equal(stale.message.reason, "stale-session");
+      const busy = await shutdownAck(makeShutdownRequest(bootstrap, native.sessionId, native.epoch, { requireIdle: true }));
+      assert.equal(busy.message.outcome, "rejected");
+      assert.equal(busy.message.reason, "not-idle");
+      assert.equal(editor.settleCalls(), 0, "a request that was never admitted never reaches the owned editor");
+      assert.equal(shutdownCalls, 0, "and it never shuts the session down either");
+    } finally {
+      clearEditorSettlementSlot();
+      await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+    }
+  });
+
+  it("does not shut down when the owned editor's exit was not positively witnessed", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "editor-unsettled-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    const { testPi, ctx, bootstrap } = await startSession({ server, sessionManager });
+    let shutdownCalls = 0;
+    ctx.isIdle = () => true;
+    ctx.shutdown = () => { shutdownCalls += 1; };
+    ctx.abort = () => undefined;
+    const status = await server.waitForFrame((frame) => frame.message.type === "status");
+    const native = status.message.nativeSession as { sessionId: string; epoch: number };
+    const shutdownAck = async (request: Record<string, unknown>) => {
+      const requestId = String(request.requestId);
+      const before = server.frames.length;
+      server.sendToClients(encodeFrame(request as never));
+      return await server.waitForFrame(
+        (frame) => frame.message.type === "shutdown_result" && frame.message.requestId === requestId,
+        3_000,
+        before - 1,
+      );
+    };
+
+    try {
+      for (const behavior of ["unwitnessed", "throws"] as const) {
+        const events: string[] = [];
+        const editor = bindEditorSettlementSlot(events, behavior);
+        try {
+          const ack = await shutdownAck(makeShutdownRequest(bootstrap, native.sessionId, native.epoch));
+          assert.equal(ack.message.outcome, "rejected", behavior);
+          assert.equal(ack.message.reason, "unavailable", behavior);
+          assert.equal(editor.settleCalls(), 1, `${behavior}: the stop was attempted once`);
+        } finally {
+          clearEditorSettlementSlot();
+        }
+      }
+      assert.equal(shutdownCalls, 0, "an unconfirmed editor exit never invokes the public shutdown");
+      // A truthful refusal is not a terminal state: with no editor owned, the same
+      // process still admits a later shutdown request.
+      const retry = await shutdownAck(makeShutdownRequest(bootstrap, native.sessionId, native.epoch));
+      assert.equal(retry.message.outcome, "requested");
+      assert.equal(shutdownCalls, 1, "only the admitted, unobstructed request shuts the session down");
+    } finally {
+      clearEditorSettlementSlot();
+      await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+    }
+  });
+
+  it("withholds native session_shutdown completion until the owned editor settles", async () => {
+    // The installed runtime awaits `session_shutdown` handlers and awaits disposal on
+    // SIGTERM/SIGHUP before exiting, so this hook is a real settlement point.
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "editor-native-shutdown-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    const { testPi, ctx } = await startSession({ server, sessionManager });
+    ctx.isIdle = () => true;
+    await server.waitForFrame((frame) => frame.message.type === "status");
+    const events: string[] = [];
+    const editor = bindEditorSettlementSlot(events, "settle");
+    try {
+      let completed = false;
+      const disposal = testPi.trigger("session_shutdown", { type: "session_shutdown" }, ctx)
+        .then(() => { completed = true; });
+      await sleep(60);
+      assert.equal(events.includes("settle"), true, "the owned editor is stopped by native disposal");
+      assert.equal(completed, false, "native disposal waits for the editor's own exit");
+      assert.equal(server.liveClients(), 0, "while it waits, reporter retirement has already happened");
+      editor.release(true);
+      await disposal;
+      assert.equal(completed, true, "positive settlement completes native disposal");
+    } finally {
+      clearEditorSettlementSlot();
+      await testPi.trigger("session_shutdown", { type: "session_shutdown" }, ctx);
+    }
+  });
+
+  it("never reports safe session_shutdown completion for an unwitnessed editor exit", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "editor-native-unsettled-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    const { testPi, ctx } = await startSession({ server, sessionManager });
+    ctx.isIdle = () => true;
+    await server.waitForFrame((frame) => frame.message.type === "status");
+    try {
+      for (const behavior of ["unwitnessed", "throws"] as const) {
+        const events: string[] = [];
+        const editor = bindEditorSettlementSlot(events, behavior);
+        let completed = false;
+        const disposal = testPi.trigger("session_shutdown", { type: "session_shutdown" }, ctx)
+          .then(() => { completed = true; });
+        await sleep(120);
+        assert.equal(editor.settleCalls(), 1, `${behavior}: the stop was attempted once`);
+        assert.equal(completed, false,
+          `${behavior}: an unconfirmed editor exit is never reported as safe disposal, even though Pi swallows handler errors`);
+        void disposal; // Pending by design; the host's existing bounded stop is authoritative.
+        clearEditorSettlementSlot();
+      }
+    } finally {
+      clearEditorSettlementSlot();
+    }
   });
 
   it("fails closed for stale, foreign, missing, and throwing public shutdown contexts", async () => {
@@ -4260,6 +4506,7 @@ describe("session-host bootstrap preload", () => {
         { relative: "src/session-host/native-persistence.js", source: join(__dirname, "..", "src/session-host/native-persistence.js") },
         { relative: "src/session-host/owned-activity.js", source: join(__dirname, "..", "src/session-host/owned-activity.js") },
         { relative: "src/session-host/native-clipboard.js", source: join(__dirname, "..", "src/session-host/native-clipboard.js") },
+        { relative: "src/session-host/native-editor-handoff.js", source: join(__dirname, "..", "src/session-host/native-editor-handoff.js") },
         { relative: "src/session-host/spawn-capability.js", source: join(__dirname, "..", "src/session-host/spawn-capability.js") },
         { relative: "src/session-host/startup-request.js", source: join(__dirname, "..", "src/session-host/startup-request.js") },
         { relative: "src/session-host/payload.js", source: join(__dirname, "..", "src/session-host/payload.js") },

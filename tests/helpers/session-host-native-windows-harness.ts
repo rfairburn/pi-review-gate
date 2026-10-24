@@ -126,6 +126,12 @@ const WINDOWS_BASELINE = "SESSION_HOST_NATIVE_WINDOWS_OUTER_RESTORATION_BASELINE
 const ROLE_ENV = "PI_REVIEW_GATE_RUNTIME_ROLE";
 const TOOL_CATALOG_ENV = "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG";
 const CREDENTIAL_NAME = /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD)/i;
+/** Fixed Windows OS runtime names, identical to the console probe's PROFILE_SYSTEM_NAMES. */
+const WINDOWS_OS_ENV_NAMES = [
+  "PSModulePath", "ProgramData", "ALLUSERSPROFILE", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432",
+  "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432", "PUBLIC", "PATHEXT", "ComSpec",
+  "SystemDrive", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "OS", "USERNAME", "USERDOMAIN", "COMPUTERNAME",
+] as const;
 const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const MAX_WITNESS_BYTES = 1024;
 const MAX_CENSUS_REPLY_BYTES = 4 * 1024;
@@ -1002,12 +1008,8 @@ export class WindowsMainPtyDriver {
       TEMP: options.temporary,
       TMP: options.temporary,
       TMPDIR: options.temporary,
-      // Main's trusted PowerShell helpers inherit this env. Only the built-in
-      // Windows PowerShell module root (never the host's PSModulePath) and an
-      // analysis cache inside the owned temporary directory, so cmdlet module
-      // auto-loading does not stall in the stripped harness environment.
-      PSModulePath: join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules"),
-      PSModuleAnalysisCachePath: join(options.temporary, "PSModuleAnalysisCache"),
+      APPDATA: join(options.home, "AppData", "Roaming"),
+      LOCALAPPDATA: join(options.home, "AppData", "Local"),
       NODE_PATH: options.runtime.nodePath,
       TERM: "xterm-256color",
       PRG_SESSION_HOST_WINDOWS_MAIN_ENTRY: mainEntry,
@@ -1025,7 +1027,15 @@ export class WindowsMainPtyDriver {
       PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1",
       ...(process.env.NODE_OPTIONS === undefined ? {} : { NODE_OPTIONS: process.env.NODE_OPTIONS }),
     };
+    // Main's trusted PowerShell helpers inherit this env. Copy only the fixed
+    // Windows OS runtime names of the console probe's passing `profile` control.
+    for (const name of WINDOWS_OS_ENV_NAMES) {
+      const value = process.env[name];
+      if (typeof value === "string" && value.length > 0) hostEnv[name] = value;
+    }
     assertNoRoleOrCatalogMarkers(hostEnv);
+    assert.deepEqual(Object.keys(hostEnv).filter((name) => CREDENTIAL_NAME.test(name)), [],
+      "allowlisted Windows host environment contains no credential-like variable names");
     const logWatcher = watch(options.root);
     const nativeWatcher = watch(dirname(observerFile));
     const providerWatcher = watch(options.fixtureState);

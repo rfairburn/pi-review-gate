@@ -15,6 +15,34 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.197]
+
+### Changed
+
+- Kept the session-content viewer's finite queued-send bound at 32 for remote input
+  (#500) and corrected the rationale the first trial recorded for it. That entry read the
+  bound as an allowance over an arrival rate of normalized terminal packets. It is not one:
+  the bound counts 32 total pending logical input operations, meaning operations that have
+  been admitted and have not settled yet, however long each has been outstanding. Measured
+  with the existing in-memory and real paired-transport harnesses, a viewer that starts with
+  an empty queue and a transport that never stalls admits 32 operations from a synchronous
+  batch of 40 wheel reports and refuses the last 8 as busy, because no send can settle while
+  a synchronous batch is still being admitted; when each report's result is awaited before
+  the next is admitted, the queue never grows beyond one. Synchronous batching is therefore
+  a plausible explanation for the reported notice, not a confirmed diagnosis: a held or
+  stalled send keeps pending operations outstanding across event loop turns and refuses at
+  the same bound, and the operator's environment was not reproduced. What the measurements
+  do establish is narrower: one wheel report stays one logical operation carrying exactly
+  its own packet end to end, so per-event framing inflation is not the cause, and the
+  operator trial of the 4-to-32 change did not remove the notice. #500 stays open. Refusal
+  behaviour is unchanged and stays fail-closed: an operation above the bound is refused as
+  busy with not a single byte written, oversized pastes are still refused as too large, an
+  invoked-but-unsettled write is still reported as unknown, and one operation's pages still
+  never interleave with another's. Added focused endpoint and host cases that pin these two
+  queue shapes, the one-packet-per-operation payload, ordered delivery, and reuse of the
+  queue after the drain. The threshold is internal and carries no documented numeric
+  contract, so no public documentation changes.
+
 ## [0.1.0-dev.196]
 
 ### Fixed

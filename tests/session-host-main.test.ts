@@ -7150,6 +7150,11 @@ class FakePeerContentPort implements PeerContentController {
   readonly deliveredInputs: PeerNativeInputRequest[] = [];
   /** Outcome this fake endpoint reports for one accepted input. */
   sendResult: NativeInputSendResult = { status: "submitted" };
+  /**
+   * Scripted per-request outcomes (#500 burst cases). While entries remain they are
+   * consumed in call order; once exhausted the single `sendResult` above resumes.
+   */
+  sendResults: NativeInputSendResult[] | undefined;
   rejectNextInput = false;
   /** State change between the admission proof and the pre-write re-proof. */
   beforeWrite: (() => void) | undefined;
@@ -7227,6 +7232,11 @@ class FakePeerContentPort implements PeerContentController {
     try { this.beforeWrite?.(); } catch { /* a throwing hook is still just a state change */ }
     if (authorize(target) !== true) {
       return Promise.resolve({ status: "not-sent", reason: "unauthorized" });
+    }
+    if (this.sendResults !== undefined && this.sendResults.length > 0) {
+      const outcome = this.sendResults.shift() as NativeInputSendResult;
+      if (outcome.status !== "not-sent") this.deliveredInputs.push(request);
+      return Promise.resolve(outcome);
     }
     if (this.sendResult.status !== "not-sent") this.deliveredInputs.push(request);
     return Promise.resolve(this.sendResult);
@@ -10113,6 +10123,39 @@ test("one written remote source receives canonical keyboard, paste, and mouse su
     assert.equal(content.deliveredInputs.length, 5, "every admitted packet reached the one delegate exactly once");
     assert.equal(manager.writes.length, localWrites, "no remote attempt ever reaches a local row's PTY");
     assert.equal(harness.sidebar!.focus, "main", "remote input never steals focus");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("one host input batch of wheel reports is one logical operation per event and a refused tail still reports truthfully", async (t) => {
+  const { harness, content, manager, rect } = await remoteNativeInputHarness(t);
+  try {
+    const localWrites = manager.writes.length;
+    // #500 host-boundary case. It pins what the host does with a batch of wheel
+    // reports: each normalized report becomes exactly one request carrying exactly one
+    // canonical report, and a refused outcome is reported truthfully even while other
+    // operations in the same batch were handed off. The 32 admitted / 8 refused split is
+    // scripted on this fake endpoint to mirror the real endpoint's finite pending bound;
+    // it is not a measurement of the reported incident.
+    content.sendResults = [
+      ...Array.from({ length: 32 }, (): NativeInputSendResult => ({ status: "submitted" })),
+      ...Array.from({ length: 8 }, (): NativeInputSendResult => ({ status: "not-sent", reason: "busy" })),
+    ];
+    for (let index = 0; index < 40; index += 1) {
+      emitMouse(harness.terminal, rect.column + 2, rect.row + 3, 64);
+    }
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 40,
+      "one normalized wheel report is exactly one logical operation, never one per character or packet");
+    assert.ok(content.inputRequests.every((request) => request.kind === "mouse"
+      && request.text === `${ESC}[<64;3;4M`),
+      "every request carries its own one canonical content-space SGR report");
+    assert.equal(content.deliveredInputs.length, 32, "the admitted part of the burst was handed off exactly once each");
+    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_NOT_SENT_NOTICE) !== undefined,
+      "the refused tail's notice is shown even while the rest of the burst was submitted");
+    assert.equal(manager.writes.length, localWrites, "a refused remote wheel never reaches a local row");
+    assert.equal(harness.sidebar!.focus, "main", "a remote burst never steals focus");
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
   }

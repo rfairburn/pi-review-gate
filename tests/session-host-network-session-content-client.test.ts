@@ -1993,7 +1993,7 @@ test("a bounded paste pages atomically, preserves Unicode, and refuses one byte 
 	await deadlined(viewer.stop(), "stop");
 });
 
-test("logical inputs are ordered, bounded at four pending operations, and never interleave pages", async () => {
+test("logical inputs are ordered, bounded at 32 pending operations, and never interleave pages", async () => {
 	const channel = new FakeContentChannel();
 	scriptOwner(channel, { ackNativeIo: true });
 	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
@@ -2004,22 +2004,35 @@ test("logical inputs are ordered, bounded at four pending operations, and never 
 
 	channel.holdSend = true;
 	const paste = "\u4e16\u754c".repeat(20_000);
-	const first = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "paste", text: paste });
-	const second = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "b" });
-	const third = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "c" });
-	const fourth = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "d" });
+	// One paged operation opens the queue, then 30 keyboard packets, then a mouse
+	// packet as the 32nd: operations 5 through 32 are the ones the former bound of
+	// four refused, and a page never consumes more than its own one slot.
+	const requests: SessionContentViewerInputRequest[] = [
+		{ source, inputModes: INPUT_MODES, kind: "paste", text: paste },
+		...Array.from({ length: 30 }, (_unused, index): SessionContentViewerInputRequest => ({
+			source,
+			inputModes: INPUT_MODES,
+			kind: "keyboard",
+			text: `q${index}`,
+		})),
+		{ source, inputModes: INPUT_MODES, kind: "mouse", text: "\x1b[<0;5;3M" },
+	];
+	assert.equal(requests.length, 32);
+	const pending = requests.map((request) => viewer.sendInput(request));
 	await settle();
+	const bytesBeforeRefusal = channel.sent.length;
 	assert.deepEqual(
-		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "e" }),
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "over-bound" }),
 		{ status: "not-sent", reason: "busy" },
-		"the fifth logical operation is refused while four are pending",
+		"the 33rd logical operation is refused while 32 are pending",
 	);
+	assert.equal(channel.sent.length, bytesBeforeRefusal, "the refused operation writes not a single byte");
 	const started = channel.types().slice(before).filter((type) => type === "input_begin" || type === "input");
-	assert.equal(started.length, 1, "only the first frame of the first operation reached the transport");
+	assert.deepEqual(started, ["input_begin"], "only the first frame of the first operation reached the transport");
 
 	channel.releaseSends();
-	for (const pending of [first, second, third, fourth]) {
-		assert.deepEqual(await deadlined(pending, "queued input"), { status: "submitted" });
+	for (const [index, operation] of pending.entries()) {
+		assert.deepEqual(await deadlined(operation, `queued input ${index + 1}`), { status: "submitted" });
 	}
 	const frames = channel.frames().slice(before);
 	const types = frames.map((frame) => frame.type);
@@ -2028,9 +2041,113 @@ test("logical inputs are ordered, bounded at four pending operations, and never 
 	assert.equal(types[0], "input_begin");
 	assert.ok(types.slice(1, endIndex).every((type) => type === "input_chunk"),
 		"the paste's pages are contiguous");
-	assert.deepEqual(types.slice(endIndex + 1), ["input", "input", "input"],
-		"each later input is one inline packet after the paste finished, never interleaved");
+	const inline = frames.slice(endIndex + 1);
+	assert.equal(inline.length, 31, "each later operation is exactly one inline packet after the paste finished");
+	assert.ok(inline.every((frame) => frame.type === "input"),
+		"no later operation's pages interleave with another operation's");
+	inline.forEach((frame, index) => {
+		if (frame.type !== "input") throw new Error("unreachable");
+		const expected = requests[index + 1];
+		assert.equal(frame.kind, expected.kind, `packet ${index + 2} keeps its own kind`);
+		assert.deepEqual(Buffer.from(frame.data, "base64").toString("utf8"), expected.text,
+			`packet ${index + 2} keeps its own payload in call order`);
+		assert.equal(frame.ordinal, index + 2, "ordinals stay contiguous and in call order across the whole bound");
+		assert.equal(frame.subscriptionId, viewer.subscriptionId);
+	});
+	assert.deepEqual(inline.map((frame) => (frame.type === "input" ? frame.ordinal : -1)),
+		Array.from({ length: 31 }, (_unused, index) => index + 2),
+		"the refused 33rd consumed no ordinal and no packet was replayed");
 	assert.equal(types.filter((type) => type === "input_end").length, 1, "no page is replayed");
+	assert.equal(types.filter((type) => type === "input_begin").length, 1, "the paste began exactly once");
+	await deadlined(viewer.stop(), "stop");
+});
+
+/**
+ * Mirrors the endpoint's internal queued-send bound, exactly as the threshold case
+ * above asserts it: 32 admitted logical operations that have not settled yet,
+ * however long each has been outstanding. #500 replaced the first trial's
+ * arrival-rate rationale with the two shapes the cases below actually measure.
+ * Neither one is an established account of the reported incident.
+ */
+const MAX_QUEUED_INPUT_OPERATIONS = 32;
+
+/** One canonical content-space wheel report: 11 bytes, the whole logical operation. */
+const WHEEL_REPORT = "\x1b[<64;10;5M";
+
+test("a synchronous burst larger than the bound fills an empty queue before any send settles and refuses only the tail", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+	const before = channel.sent.length;
+	// #500 characterization, with the preconditions stated: the queue starts empty and
+	// this channel never stalls, so any refusal here comes from the burst itself. All
+	// admissions run in one synchronous turn, and a slot frees only after that
+	// operation's own write settles, so the first operations are still pending while the
+	// tail is admitted.
+	const pending = Array.from({ length: MAX_QUEUED_INPUT_OPERATIONS + 8 }, () =>
+		viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "mouse", text: WHEEL_REPORT }));
+	assert.equal(channel.sent.length, before,
+		"no input byte reaches the transport while the synchronous batch is still being admitted");
+	const results = await deadlined(Promise.all(pending), "burst");
+	assert.deepEqual(results.slice(0, MAX_QUEUED_INPUT_OPERATIONS).map((result) => result.status),
+		Array.from({ length: MAX_QUEUED_INPUT_OPERATIONS }, () => "submitted"),
+		"the operations up to the bound are all admitted on an unstalled transport");
+	assert.deepEqual(results.slice(MAX_QUEUED_INPUT_OPERATIONS),
+		Array.from({ length: 8 }, (): { status: string; reason: string } => ({ status: "not-sent", reason: "busy" })),
+		"only the over-bound tail is refused, truthfully as nothing sent");
+	assert.equal(channel.sent.length - before, MAX_QUEUED_INPUT_OPERATIONS, "a refused operation writes not a single byte");
+	const frames = channel.frames().slice(before);
+	assert.ok(frames.every((frame) => frame.type === "input"),
+		"each wheel operation is exactly one inline frame, never a paged transfer");
+	assert.deepEqual(frames.map((frame) => (frame as { ordinal: number }).ordinal),
+		Array.from({ length: MAX_QUEUED_INPUT_OPERATIONS }, (_unused, index) => index + 1),
+		"ordinals stay contiguous and in call order, and the refused tail consumed none");
+	const payloads = frames.map((frame) => Buffer.from((frame as { data: string }).data, "base64"));
+	assert.ok(payloads.every((payload) => payload.equals(Buffer.from(WHEEL_REPORT, "utf8"))),
+		"one logical operation carries exactly its own one-packet terminal report");
+	assert.equal(payloads.reduce((total, payload) => total + payload.length, 0),
+		MAX_QUEUED_INPUT_OPERATIONS * Buffer.byteLength(WHEEL_REPORT, "utf8"),
+		"a burst is never expanded into per-character or multi-packet operations");
+	assert.deepEqual(
+		await deadlined(viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "mouse", text: WHEEL_REPORT }), "after drain"),
+		{ status: "submitted" },
+		"the queue is reusable at full capacity once the admitted operations settle",
+	);
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("the same wheel reports admitted one at a time with each send awaited never queue and are all admitted in call order", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+	const before = channel.sent.length;
+	// The other measured shape, with its precondition stated: every result is awaited
+	// before the next report is admitted, and this channel settles immediately, so one
+	// slot is released before the next call claims one. This shows a sequential awaited
+	// stream does not accumulate. It does not show that reports arriving on separate
+	// turns can never accumulate: a held or stalled send keeps pending operations
+	// outstanding across turns and refuses at this same bound, as the held-send case
+	// above already pins.
+	const results: Array<Awaited<ReturnType<typeof viewer.sendInput>>> = [];
+	for (let index = 0; index < MAX_QUEUED_INPUT_OPERATIONS + 8; index += 1) {
+		results.push(await deadlined(
+			viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "mouse", text: WHEEL_REPORT }), "wheel report",
+		));
+		await settle(1);
+	}
+	assert.ok(results.every((result) => result.status === "submitted"),
+		"reports admitted one at a time with each send awaited are never refused on an unstalled transport");
+	const frames = channel.frames().slice(before);
+	assert.equal(frames.length, MAX_QUEUED_INPUT_OPERATIONS + 8);
+	assert.deepEqual(frames.map((frame) => (frame as { ordinal: number }).ordinal),
+		Array.from({ length: MAX_QUEUED_INPUT_OPERATIONS + 8 }, (_unused, index) => index + 1),
+		"every report crossed exactly once, in per-binding call order");
 	await deadlined(viewer.stop(), "stop");
 });
 

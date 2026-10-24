@@ -969,3 +969,18 @@ test("activation tests keep the default runtime role in CI", () => {
   assert.doesNotMatch(source, /^ *PI_REVIEW_GATE_RUNTIME_ROLE:.*$/m,
     "PI_REVIEW_GATE_RUNTIME_ROLE must stay unset so activation tests observe default behavior");
 });
+
+test("the native Windows storage step also runs the Network storage protection proofs (Refs #494)", () => {
+  const job = blockOf(readWorkflow(), "windows-launcher", 2);
+  const step = stepOf(job, "Protected peer state and native ACL storage (not terminal UI readiness)");
+  assert.match(step, /^        timeout-minutes: 8$/m, "the step keeps its existing cap");
+  const run = step.match(/^        run: (.+)$/m)?.[1] ?? "";
+  for (const file of [
+    "session-host-peer-state-permissions-windows-native",
+    "session-host-network-peer-state-default",
+    "session-host-storage-protection-windows-native",
+  ]) {
+    assert.ok(run.includes(`dist-test/tests/${file}.test.js`), `${file} runs in the native storage step`);
+  }
+  assert.match(run, /--test-concurrency=1 --test-timeout=120000/, "the native storage files stay serialized and bounded");
+});

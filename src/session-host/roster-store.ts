@@ -20,7 +20,7 @@ import {
   type Stats,
 } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { MAX_NATIVE_SESSION_NAME_LENGTH, isValidNativeSessionId } from "./protocol";
@@ -221,11 +221,86 @@ export function hostOwnershipPath(agentDir: string): string {
   return join(sessionHostStateDir(agentDir), HOST_OWNERSHIP_FILENAME);
 }
 
+/** Fixed outcome of one exclusive private creation attempt (Refs #494). */
+export type SessionHostStateDirectoryCreation =
+  | { readonly outcome: "existing" }
+  | { readonly outcome: "created-protected" }
+  | { readonly outcome: "created-unverified"; readonly reason: string }
+  | { readonly outcome: "failed"; readonly reason: string };
+
+type StateDirectoryCreator = (stateDir: string) => unknown;
+
+let stateDirectoryCreator: StateDirectoryCreator | null | undefined;
+
+/**
+ * Lazily load the shared dependency-free creator. Both shipped layouts keep
+ * `scripts/` beside the compiled tree (`<root>/dist/src/session-host` and
+ * `<root>/scripts`), exactly as the launcher resolver in `pi-invocation.ts`
+ * relies on. A missing or malformed module is `null`: callers then keep their
+ * previous plain creation and claim no protection.
+ */
+function loadStateDirectoryCreator(): StateDirectoryCreator | null {
+  if (stateDirectoryCreator !== undefined) return stateDirectoryCreator;
+  let loaded: unknown;
+  try {
+    loaded = require(resolve(__dirname, "../../../scripts/session-host-state-directory.cjs"));
+  } catch {
+    loaded = undefined;
+  }
+  const candidate = typeof loaded === "object" && loaded !== null
+    ? (loaded as Record<string, unknown>).createPrivateStateDirectory
+    : undefined;
+  stateDirectoryCreator = typeof candidate === "function" ? (candidate as StateDirectoryCreator) : null;
+  return stateDirectoryCreator;
+}
+
+/**
+ * Exclusively create `<agentDir>/session-host` with private protection when it
+ * is absent (POSIX `0700` with no extended ACL; Windows a protected DACL for this
+ * account, LocalSystem, and built-in Administrators set at creation).
+ *
+ * An existing object of any kind is `existing` and is never inspected for
+ * repair, chmod'd, re-ACL'd, or re-owned. `created-protected` is claimed only
+ * after real evidence from the created object; `created-unverified` means the
+ * directory now exists but no protection is claimed; `failed` means this call
+ * created nothing. The caller owns the canonical, real agent directory; this
+ * neither creates nor modifies any ancestor. Reasons are fixed strings only.
+ */
+export function createSessionHostStateDirectory(stateDir: string): SessionHostStateDirectoryCreation {
+  const creator = loadStateDirectoryCreator();
+  if (creator === null) return { outcome: "failed", reason: "protection-unsupported" };
+  let raw: unknown;
+  try {
+    raw = creator(stateDir);
+  } catch {
+    raw = undefined;
+  }
+  const record = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
+  const reason = typeof record.reason === "string" ? record.reason : "protection-unsupported";
+  switch (record.outcome) {
+    case "existing":
+      return { outcome: "existing" };
+    case "created-protected":
+      return { outcome: "created-protected" };
+    case "created-unverified":
+      return { outcome: "created-unverified", reason };
+    default:
+      return { outcome: "failed", reason };
+  }
+}
+
 /**
  * Ensure the caller's Pi agent directory is a real directory and its private
- * session-host state directory exists (mode 0700 when created). A symlinked or
- * non-directory agent or state directory refuses: the store is never followed
- * somewhere else.
+ * session-host state directory exists. A symlinked or non-directory agent or
+ * state directory refuses: the store is never followed somewhere else.
+ *
+ * A genuinely absent state directory is created exclusively with private
+ * protection (see {@link createSessionHostStateDirectory}). That protection is
+ * an addition only: when it cannot be established or verified, the previous
+ * plain `mkdir(0700)` behaviour and every local roster, ownership, shortcut and
+ * diagnostics outcome stay exactly as before, and the protected Network stores
+ * refuse the unverified directory on their own checks. An existing directory is
+ * never modified.
  */
 export function ensureHostStateDir(agentDir: string): string {
   if (typeof agentDir !== "string" || agentDir === "" || !isAbsolute(agentDir)) {
@@ -242,6 +317,7 @@ export function ensureHostStateDir(agentDir: string): string {
   }
   const canonical = realpathSync(agentDir);
   const stateDir = join(canonical, HOST_STATE_DIRNAME);
+  createSessionHostStateDirectory(stateDir);
   try {
     mkdirSync(stateDir, { mode: 0o700 });
   } catch (error) {

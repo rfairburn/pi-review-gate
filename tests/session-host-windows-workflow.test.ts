@@ -365,6 +365,8 @@ test("alpha compiles tests directly and runs only explicit focused test files", 
   const mainStep = stepOf(job, "Real public Windows ConPTY Main acceptance (opt-in, fail-closed)");
   assert.match(mainStep, /node --test dist-test\/tests\/session-host-native-windows-main\.test\.js/,
     "the opt-in real Main/ConPTY test must run as an explicit compiled file");
+  assert.match(mainStep, /dist-test\/tests\/session-host-native-windows-network\.test\.js/,
+    "the same-harness Network storage companion runs in the same opt-in Main step");
   assert.match(mainStep, /PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"/,
     "missing Pi/ConPTY/PowerShell prerequisites must hard-fail, never skip");
 

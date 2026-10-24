@@ -2266,3 +2266,197 @@ test("a press acts on the intent its frame drew, never on state the operator nev
   assert.ok(peerPaneFlat(harness).includes("no hosting change was sent"),
     "the refusal names the unavailable settings document");
 });
+
+// ---------------------------------------------------------------------------
+// Storage permission repair confirmation (Refs #494)
+// ---------------------------------------------------------------------------
+
+const REPAIR_OBJECTS = ["session-host", "peers", "peer-state", "peer-preferences", "preferences-document"] as const;
+
+function offeredStorage(generation = 4, platform: "posix" | "windows" = "posix"): NonNullable<PeerUiSnapshot["storage"]> {
+  return {
+    platform,
+    problems: [
+      { store: "settings", reason: "unsafe-permissions", object: "session-host" },
+      { store: "trust", reason: "unsafe-permissions", object: "session-host" },
+    ],
+    repair: {
+      state: "offered",
+      generation,
+      targets: REPAIR_OBJECTS.map((target) => ({
+        target,
+        status: target === "preferences-document" ? "absent" as const : "repairable" as const,
+        reason: target === "preferences-document" ? null : "unsafe-permissions" as const,
+      })),
+    },
+  };
+}
+
+function unavailableSnapshot(storage: PeerUiSnapshot["storage"], revision = 1): PeerUiSnapshot {
+  return makeSnapshot({
+    revision, status: "unavailable", settings: null, identityFingerprint: null, hosts: null, trustedPeers: null,
+    notice: "Network settings are unavailable; saved values could not be read.", storage,
+  });
+}
+
+/** Opens the Network pane, then the repair review through its drawn row. */
+function openRepairReview(harness: Harness, cols = 90, rows = 40): void {
+  openNetworkPane(harness);
+  peerPaneText(harness, cols, rows);
+  assert.ok(peerPaneText(harness, cols, rows).find((line) => line.startsWith("> "))?.includes("Repair Network storage permissions"),
+    "the offered repair row is drawn first");
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "confirm");
+  assert.equal(harness.controller.peerRepairConfirmationActive, true);
+  harness.baseline = harness.actions.length;
+}
+
+/** The repair dialog with wrapped lines rejoined (wrapping only splits at spaces). */
+function repairText(harness: Harness, cols = 90, rows = 40): string {
+  return assertPaneSafe(harness.controller.renderForm(cols, rows).lines, cols, rows).map((line) => line.trimEnd()).join(" ");
+}
+
+test("unavailable storage shows the sanitized why and mitigation and the offered repair row", () => {
+  const harness = makeHarness(unavailableSnapshot(offeredStorage()));
+  openNetworkPane(harness);
+  const pane = peerPaneText(harness, 90, 40).join("\n");
+  // The longer fixed reason may wrap at word boundaries; compare it rejoined.
+  const rejoined = peerPaneText(harness, 90, 40).map((line) => line.trim()).join(" ");
+  assert.ok(rejoined.includes("Network settings are unavailable: session-host does not meet the required access permissions."));
+  assert.ok(pane.includes("Use Repair permissions below"));
+  assert.ok(pane.includes("Repair Network storage permissions... (enter to review)"));
+  assert.ok(pane.includes("hosting: unknown (settings unavailable)"), "no default is substituted");
+
+  // Without an offer there is no repair row, and a blocked case explains why.
+  const blocked = makeHarness(unavailableSnapshot({
+    platform: "windows",
+    problems: [{ store: "trust", reason: "unsafe-permissions", object: "session-host" }],
+    repair: { state: "blocked", target: "peers", reason: "unsafe-object" },
+  }));
+  openNetworkPane(blocked);
+  const blockedPane = peerPaneText(blocked, 90, 40).join("\n");
+  assert.equal(blockedPane.includes("Repair Network storage permissions"), false);
+  assert.ok(blockedPane.includes("Repair is not possible: session-host/peers is a link"));
+  assert.ok(blockedPane.includes("your account, SYSTEM, and Administrators"));
+
+  // A malformed offer is never an offer.
+  const malformed = makeHarness(unavailableSnapshot({
+    ...offeredStorage(),
+    repair: { state: "offered", generation: 1, targets: [] },
+  } as PeerUiSnapshot["storage"]));
+  openNetworkPane(malformed);
+  assert.equal(peerPaneText(malformed, 90, 40).join("\n").includes("Repair Network storage permissions"), false);
+});
+
+test("the repair confirmation describes the fixed scope and requests only after its written Repair frame", () => {
+  const harness = makeHarness(unavailableSnapshot(offeredStorage(4)));
+  openRepairReview(harness);
+  const text = repairText(harness);
+  for (const expected of [
+    "Repair Network storage permissions?",
+    "- session-host: protection will be repaired",
+    "- session-host/peers/state.json: protection will be repaired",
+    "- session-host/peer-preferences/preferences.json: absent, not created",
+    "directories 0700, files 0600",
+    "stay byte for byte",
+    "parent folders",
+    "Repair cannot undo earlier access",
+    "replace the identity key separately",
+    "until you restart Pi",
+    "> Cancel",
+  ]) assert.ok(text.includes(expected), `confirmation shows ${expected}`);
+  assert.equal(harness.controller.capturePeerRepairPresentation(), undefined, "the Cancel choice is never repair authority");
+
+  // Cancel (the default) sends nothing and returns to the pane.
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), []);
+  assert.equal(harness.controller.focus, "form");
+  assert.ok(peerPaneText(harness, 90, 40).join("\n").includes("Repair cancelled; nothing was changed"));
+
+  harness.send(ENTER);
+  assert.equal(harness.controller.peerRepairConfirmationActive, true, "the drawn row reopens the review");
+  harness.baseline = harness.actions.length;
+  repairText(harness);
+  harness.send("y");
+  repairText(harness);
+  const candidate = harness.controller.capturePeerRepairPresentation();
+  assert.ok(candidate && candidate.generation === 4);
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), [], "an unwritten Repair frame requests nothing");
+  repairText(harness);
+  const written = harness.controller.capturePeerRepairPresentation();
+  assert.ok(written);
+  assert.equal(harness.controller.settlePeerRepairRender(written.renderToken + 1), false);
+  assert.equal(harness.controller.settlePeerRepairRender(written.renderToken), true);
+  harness.send(KITTY_ENTER_REPEAT);
+  assert.deepEqual(harness.commands(), [], "a held repeat never applies");
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), [{ type: "peer-storage-repair", generation: 4, renderToken: written.renderToken }]);
+  assert.equal(harness.controller.peerRepairConfirmationActive, false);
+  harness.send(KITTY_ENTER_RELEASE);
+  harness.send(ENTER);
+  assert.equal(harness.commands().filter((action) => action.type === "peer-storage-repair").length, 1);
+});
+
+test("resize, a changed or superseded assessment, a too-small frame, and hiding revoke repair authority", () => {
+  const harness = makeHarness(unavailableSnapshot(offeredStorage(4)));
+  openRepairReview(harness);
+  harness.send("y");
+  repairText(harness);
+  const first = harness.controller.capturePeerRepairPresentation();
+  assert.ok(first && harness.controller.settlePeerRepairRender(first.renderToken));
+
+  // Resize: a different geometry is a different frame.
+  repairText(harness, 80, 40);
+  assert.equal(harness.controller.isPeerRepairRenderCurrent(first.renderToken), false);
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), []);
+
+  // A new assessment generation ends the latch; it is never retargeted.
+  repairText(harness);
+  const second = harness.controller.capturePeerRepairPresentation();
+  assert.ok(second && harness.controller.settlePeerRepairRender(second.renderToken));
+  harness.controller.setPeerUiSnapshot(unavailableSnapshot(offeredStorage(5), 2));
+  assert.equal(harness.controller.isPeerRepairRenderCurrent(second.renderToken), false);
+  assert.ok(repairText(harness).includes("Network storage changed; no repair was requested"));
+  assert.equal(harness.controller.capturePeerRepairPresentation(), undefined);
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), []);
+
+  // A too-small frame mints nothing.
+  harness.send(ESC);
+  assert.equal(harness.controller.focus, "form", "Escape returns to the Network pane");
+  peerPaneText(harness, 90, 40);
+  harness.send(ENTER);
+  assert.equal(harness.controller.peerRepairConfirmationActive, true, "the newer offer opens as a new review");
+  harness.send("y");
+  assert.ok(assertPaneSafe(harness.controller.renderForm(40, 12).lines, 40, 12).join("\n").length > 0);
+  assert.equal(harness.controller.capturePeerRepairPresentation(), undefined);
+
+  // Hiding ends the confirmation entirely.
+  repairText(harness);
+  const third = harness.controller.capturePeerRepairPresentation();
+  assert.ok(third && harness.controller.settlePeerRepairRender(third.renderToken));
+  harness.send("\x1b[1;3D");
+  assert.equal(harness.controller.visible, false);
+  assert.equal(harness.controller.peerRepairConfirmationActive, false);
+  assert.equal(harness.controller.isPeerRepairRenderCurrent(third.renderToken), false);
+  assert.deepEqual(harness.commands().filter((action) => action.type === "peer-storage-repair"), []);
+});
+
+test("restart-required status is persistent and no ordinary command is the repair entry point", () => {
+  const harness = makeHarness(unavailableSnapshot({
+    platform: "posix",
+    problems: [{ store: "trust", reason: "unsafe-permissions", object: "peer-state" }],
+    repair: { state: "restart-required", outcome: "partial", priorExposurePossible: true },
+  }));
+  openNetworkPane(harness);
+  const pane = peerPaneText(harness, 90, 40).map((line) => line.trimEnd()).join(" ");
+  assert.ok(pane.includes("only partly repaired"));
+  assert.ok(pane.includes("until you restart Pi"));
+  assert.ok(pane.includes("replace the identity key separately"));
+  assert.equal(pane.includes("Repair Network storage permissions"), false);
+  // Streamed paste in the pane can never reach a repair.
+  harness.send("\x1b[200~y\r\x1b[201~");
+  assert.deepEqual(harness.commands().filter((action) => action.type === "peer-storage-repair"), []);
+});

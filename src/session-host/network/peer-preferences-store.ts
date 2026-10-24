@@ -82,6 +82,14 @@ import { isAbsolute, join } from "node:path";
 
 import { sessionHostStateDir } from "../roster-store";
 import type { PeerStatePermissionPolicy } from "./peer-state-permission-policy";
+import { ensureNetworkStateDirectory, type StorageReceipt } from "./peer-storage-base";
+import {
+	peerStorageDiagnostic,
+	peerStorageRefusalDetail,
+	withPeerStorageDiagnostic,
+	type PeerStorageObject,
+	type PeerStorageReason,
+} from "./peer-storage-diagnostics";
 import { isValidPeerLabel } from "./protocol";
 
 /** Version of the persisted preferences document; unknown versions are refused. */
@@ -437,12 +445,23 @@ function writeFailed(): PeerPreferencesError {
 	return new PeerPreferencesError("PEER_PREFERENCES_WRITE_FAILED");
 }
 
-function lstatBig(path: string): BigIntStats | undefined {
+/** The fixed unavailable error carrying one fixed storage diagnostic. */
+function unavailableBecause(reason: PeerStorageReason, object: PeerStorageObject): PeerPreferencesError {
+	return withPeerStorageDiagnostic(unavailable(), reason, object);
+}
+
+/** The fixed write failure, keeping only the sanitized diagnostic of `cause`, if any. */
+function writeFailedFrom(cause: unknown): PeerPreferencesError {
+	const diagnostic = peerStorageDiagnostic(cause);
+	return diagnostic === null ? writeFailed() : withPeerStorageDiagnostic(writeFailed(), diagnostic.reason, diagnostic.object);
+}
+
+function lstatBig(path: string, object?: PeerStorageObject): BigIntStats | undefined {
 	try {
 		return lstatSync(path, { bigint: true });
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
-		throw unavailable();
+		throw object === undefined ? unavailable() : unavailableBecause("unreadable", object);
 	}
 }
 
@@ -569,25 +588,29 @@ class PreferencesManager implements PeerPreferencesStore {
 	 * "no saved preferences" and creates nothing.
 	 */
 	load(): void {
-		const stateDirStats = lstatBig(this.#stateDir);
+		const stateDirStats = lstatBig(this.#stateDir, "session-host");
 		if (stateDirStats === undefined) return;
-		if (stateDirStats.isSymbolicLink() || !stateDirStats.isDirectory()) throw unavailable();
-		this.#protect(() => this.#permissions.assertOwnerControlledDirectory(this.#stateDir));
+		if (stateDirStats.isSymbolicLink() || !stateDirStats.isDirectory()) throw unavailableBecause("unsafe-object", "session-host");
+		this.#protect(() => this.#permissions.assertOwnerControlledDirectory(this.#stateDir), "session-host");
 
-		const directoryStats = lstatBig(this.#directory);
+		const directoryStats = lstatBig(this.#directory, "peer-preferences");
 		if (directoryStats === undefined) return;
-		if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) throw unavailable();
-		this.#protect(() => this.#permissions.assertPrivateDirectory(this.#directory));
+		if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) {
+			throw unavailableBecause("unsafe-object", "peer-preferences");
+		}
+		this.#protect(() => this.#permissions.assertPrivateDirectory(this.#directory), "peer-preferences");
 
-		const documentStats = lstatBig(this.#path);
+		const documentStats = lstatBig(this.#path, "preferences-document");
 		// An existing dedicated directory without its document is unavailable: it
 		// is never treated as fresh defaults and nothing is overwritten.
-		if (documentStats === undefined) throw unavailable();
-		if (documentStats.isSymbolicLink() || !documentStats.isFile()) throw unavailable();
-		if (documentStats.size <= 0n || documentStats.size > BigInt(MAX_PEER_PREFERENCES_FILE_BYTES)) {
-			throw unavailable();
+		if (documentStats === undefined) throw unavailableBecause("missing-initialized", "preferences-document");
+		if (documentStats.isSymbolicLink() || !documentStats.isFile()) {
+			throw unavailableBecause("unsafe-object", "preferences-document");
 		}
-		this.#protect(() => this.#permissions.assertPrivateFile(this.#path));
+		if (documentStats.size <= 0n || documentStats.size > BigInt(MAX_PEER_PREFERENCES_FILE_BYTES)) {
+			throw unavailableBecause("malformed", "preferences-document");
+		}
+		this.#protect(() => this.#permissions.assertPrivateFile(this.#path), "preferences-document");
 
 		const model = this.#readExistingDocument(documentStats);
 		this.#model = model;
@@ -601,28 +624,33 @@ class PreferencesManager implements PeerPreferencesStore {
 			fd = openSync(this.#path, fsConstants.O_RDONLY
 				| (fsConstants.O_NONBLOCK ?? 0)
 				| (fsConstants.O_NOFOLLOW ?? 0));
-		} catch {
-			throw unavailable();
+		} catch (error) {
+			throw unavailableBecause(
+				(error as NodeJS.ErrnoException)?.code === "ENOENT" ? "changed" : "unreadable",
+				"preferences-document",
+			);
 		}
 		try {
 			let stats: BigIntStats;
 			try {
 				stats = fstatSync(fd, { bigint: true });
 			} catch {
-				throw unavailable();
+				throw unavailableBecause("unreadable", "preferences-document");
 			}
-			if (!stats.isFile() || !sameReceipt(stats, preStats)) throw unavailable();
-			if (stats.size <= 0n || stats.size > BigInt(MAX_PEER_PREFERENCES_FILE_BYTES)) throw unavailable();
+			if (!stats.isFile() || !sameReceipt(stats, preStats)) throw unavailableBecause("changed", "preferences-document");
+			if (stats.size <= 0n || stats.size > BigInt(MAX_PEER_PREFERENCES_FILE_BYTES)) {
+				throw unavailableBecause("malformed", "preferences-document");
+			}
 			const bytes = readAll(fd, Number(stats.size));
-			if (bytes === undefined) throw unavailable();
+			if (bytes === undefined) throw unavailableBecause("unreadable", "preferences-document");
 			let parsed: unknown;
 			try {
 				parsed = JSON.parse(bytes.toString("utf8"));
 			} catch {
-				throw unavailable();
+				throw unavailableBecause("malformed", "preferences-document");
 			}
 			const model = parsePreferences(parsed);
-			if (model === undefined) throw unavailable();
+			if (model === undefined) throw unavailableBecause("malformed", "preferences-document");
 			return model;
 		} finally {
 			try {
@@ -644,22 +672,26 @@ class PreferencesManager implements PeerPreferencesStore {
 		let stateDirReceipt: FileReceipt;
 		try {
 			stateDirReceipt = this.#ensureOwnerControlledStateDir();
-		} catch {
-			throw writeFailed();
+		} catch (error) {
+			throw writeFailedFrom(error);
 		}
 		const creating = this.#model === null;
 		let directoryReceipt: FileReceipt;
 		if (creating && this.#directoryReceipt === undefined) {
 			try {
 				mkdirSync(this.#directory, { mode: 0o700 });
-			} catch {
+			} catch (error) {
 				// An existing directory is never adopted as a first-save destination.
-				throw writeFailed();
+				throw withPeerStorageDiagnostic(
+					writeFailed(),
+					(error as NodeJS.ErrnoException)?.code === "EEXIST" ? "changed" : "unreadable",
+					"peer-preferences",
+				);
 			}
 			try {
-				this.#protect(() => this.#permissions.protectCreatedDirectory(this.#directory));
-			} catch {
-				throw writeFailed();
+				this.#protect(() => this.#permissions.protectCreatedDirectory(this.#directory), "peer-preferences", "session-host");
+			} catch (error) {
+				throw writeFailedFrom(error);
 			}
 			const created = lstatBig(this.#directory);
 			if (created === undefined || created.isSymbolicLink() || !created.isDirectory()) throw writeFailed();
@@ -682,7 +714,7 @@ class PreferencesManager implements PeerPreferencesStore {
 			const opened = fstatSync(fd, { bigint: true });
 			if (!opened.isFile()) throw writeFailed();
 			temporaryReceipt = { dev: opened.dev, ino: opened.ino };
-			this.#protect(() => this.#permissions.protectCreatedFile(temporaryPath));
+			this.#protect(() => this.#permissions.protectCreatedFile(temporaryPath), "preferences-document", "peer-preferences");
 			this.#assertEmptyOwnedTemporary(temporaryPath, temporaryReceipt);
 
 			writeFileSync(fd, body, "utf8");
@@ -727,11 +759,11 @@ class PreferencesManager implements PeerPreferencesStore {
 				unlinkSync(temporaryPath);
 				temporaryReceipt = undefined;
 			}
-			this.#protect(() => this.#permissions.assertPrivateFile(this.#path));
+			this.#protect(() => this.#permissions.assertPrivateFile(this.#path), "preferences-document");
 			syncDirectoryBestEffort(this.#directory);
 				this.#directoryReceipt = directoryReceipt;
 			this.#fileReceipt = { dev: published.dev, ino: published.ino };
-		} catch {
+		} catch (error) {
 			if (fd !== undefined) {
 				try {
 					closeSync(fd);
@@ -746,26 +778,17 @@ class PreferencesManager implements PeerPreferencesStore {
 			} else {
 				removeOwnedTemporary(temporaryPath, temporaryReceipt);
 			}
-			throw writeFailed();
+			throw writeFailedFrom(error);
 		}
 	}
 
-	#ensureOwnerControlledStateDir(): FileReceipt {
-		const existing = lstatBig(this.#stateDir);
-		if (existing === undefined) {
-			try {
-				mkdirSync(this.#stateDir, { mode: 0o700 });
-			} catch {
-				throw writeFailed();
-			}
-			this.#protect(() => this.#permissions.protectCreatedDirectory(this.#stateDir));
-			const created = lstatBig(this.#stateDir);
-			if (created === undefined || created.isSymbolicLink() || !created.isDirectory()) throw writeFailed();
-			return { dev: created.dev, ino: created.ino };
-		}
-		if (existing.isSymbolicLink() || !existing.isDirectory()) throw writeFailed();
-		this.#protect(() => this.#permissions.assertOwnerControlledDirectory(this.#stateDir));
-		return { dev: existing.dev, ino: existing.ino };
+	#ensureOwnerControlledStateDir(): StorageReceipt {
+		return ensureNetworkStateDirectory({
+			stateDir: this.#stateDir,
+			permissions: this.#permissions,
+			fail: (reason) => withPeerStorageDiagnostic(writeFailed(), reason, "session-host"),
+			protect: (operation) => this.#protect(operation, "session-host"),
+		});
 	}
 
 	#assertOwnedDirectory(): FileReceipt {
@@ -783,9 +806,13 @@ class PreferencesManager implements PeerPreferencesStore {
 		}
 		try {
 			this.#permissions.assertPrivateDirectory(this.#directory);
-		} catch {
+		} catch (error) {
 			this.#poison();
-			throw writeFailed();
+			throw withPeerStorageDiagnostic(
+				writeFailed(),
+				peerStorageRefusalDetail(error)?.reason ?? "protection-unsupported",
+				"peer-preferences",
+			);
 		}
 		return receipt;
 	}
@@ -840,11 +867,17 @@ class PreferencesManager implements PeerPreferencesStore {
 		if (this.#closed || this.#poisoned) throw unavailable();
 	}
 
-	#protect(operation: () => void): void {
+	/**
+	 * Run one permission-policy call; a refusal becomes the fixed unavailable
+	 * error carrying the policy's fixed reason and the named storage object (the
+	 * parent object when the policy refused on the containing directory first).
+	 */
+	#protect(operation: () => void, object: PeerStorageObject, parentObject: PeerStorageObject = object): void {
 		try {
 			operation();
-		} catch {
-			throw unavailable();
+		} catch (error) {
+			const detail = peerStorageRefusalDetail(error);
+			throw unavailableBecause(detail?.reason ?? "protection-unsupported", detail?.scope === "parent" ? parentObject : object);
 		}
 	}
 

@@ -1216,6 +1216,19 @@ export class WindowsMainPtyDriver {
         : "shows and focuses the hidden sidebar"}`, before);
   }
 
+  /**
+   * One deliberate public key write for a focused companion acceptance (for
+   * example the Network pane), awaiting the next frame that satisfies
+   * `predicate`. The caller owns focus bookkeeping: it must return the actual
+   * UI to sidebar focus before using any other driver navigation.
+   */
+  async sendKeys(data: string, description: string, predicate: (frame: string) => boolean,
+    timeoutMs = WINDOWS_EVENT_TIMEOUT_MS): Promise<void> {
+    const before = this.frameRevision;
+    this.pty.write(data);
+    await this.waitFrame(predicate, description, before, timeoutMs);
+  }
+
   async ensureSidebarFocus(): Promise<void> {
     if (this.focus === "sidebar" && this.sidebarVisible) return;
     if (this.focus === "form") {

@@ -158,9 +158,19 @@ remembered, and a present non-boolean value makes the whole document unavailable
 protection (owner/private modes and supported ACL checks, or Windows owner/DACL evidence)
 before private or preference bytes are written. They are not encrypted at rest and use no
 OS credential-store service. Unknown, malformed, oversized, unknown-version,
-missing-initialized, or unsafe documents are refused untouched: there is no repair, reset,
-rotation, backup search, sweep, or silent default overwrite. Same-account and
-OS-privileged access remains outside this boundary.
+missing-initialized, or unsafe documents are refused untouched with a fixed sanitized reason
+and object name: opening, reading, or saving never repairs, resets, or rotates them, and
+there is no backup search, sweep, or silent default overwrite. The one exception is an
+explicit, human-confirmed permission repair of the five fixed existing Network items,
+offered only for an access-permission refusal while Network is inactive and authorized
+only by its actually written confirmation. It changes protection only, never contents,
+keys, owners, the agent directory, its ancestors, or other files, and it reopens nothing:
+Network stays unavailable until a deliberate restart (see
+[Repairing Network storage permissions](session-host-alpha.md#repairing-network-storage-permissions)).
+Same-account and OS-privileged access remains outside this boundary. Repairing protection
+keeps the same key and cannot undo an earlier disclosure; retiring a possibly exposed key is a separate
+manual procedure that discards all pairings, described in
+[Manually replacing the network identity](session-host-alpha.md#manually-replacing-the-network-identity).
 
 A host with no saved network preferences creates no keys, preferences, trust document,
 listener, or connection at startup. Startup initializes no network state: it reads saved

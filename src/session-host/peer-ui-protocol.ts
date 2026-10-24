@@ -89,9 +89,120 @@ export interface PeerUiSettings {
 	readonly remoteHistoryDeleteEnabled: boolean;
 }
 
+/**
+ * Closed sanitized storage vocabulary (Refs #494). These mirror the Network
+ * storage diagnostics: a reason is never a path, errno, mode, SID, or native
+ * output, and an object is a fixed storage name, never a path.
+ */
+export type PeerUiStorageReason =
+	| "unsafe-permissions"
+	| "extended-acl"
+	| "unsafe-object"
+	| "foreign-owner"
+	| "protection-unsupported"
+	| "unreadable"
+	| "malformed"
+	| "missing-initialized"
+	| "changed";
+
+export type PeerUiStorageObject =
+	| "session-host"
+	| "peers"
+	| "peer-state"
+	| "peer-preferences"
+	| "preferences-document";
+
+export const PEER_UI_STORAGE_REASONS: readonly PeerUiStorageReason[] = Object.freeze([
+	"unsafe-permissions",
+	"extended-acl",
+	"unsafe-object",
+	"foreign-owner",
+	"protection-unsupported",
+	"unreadable",
+	"malformed",
+	"missing-initialized",
+	"changed",
+]);
+
+/** Fixed target order of the explicit permission repair (parent first). */
+export const PEER_UI_STORAGE_OBJECTS: readonly PeerUiStorageObject[] = Object.freeze([
+	"session-host",
+	"peers",
+	"peer-state",
+	"peer-preferences",
+	"preferences-document",
+]);
+
+/**
+ * Conventional relative names, below the Pi agent directory, of the fixed
+ * storage objects. They identify an object for a person; they are never a
+ * resolved or private path.
+ */
+export const PEER_UI_STORAGE_OBJECT_NAMES: Readonly<Record<PeerUiStorageObject, string>> = Object.freeze({
+	"session-host": "session-host",
+	peers: "session-host/peers",
+	"peer-state": "session-host/peers/state.json",
+	"peer-preferences": "session-host/peer-preferences",
+	"preferences-document": "session-host/peer-preferences/preferences.json",
+});
+
+/** One protected store that refused, with its sanitized reason when known. */
+export interface PeerUiStorageProblem {
+	/** `settings` is the preferences document; `trust` is the identity/trust document. */
+	readonly store: "settings" | "trust";
+	/** null when the refusal carried no sanitized diagnostic. */
+	readonly reason: PeerUiStorageReason | null;
+	readonly object: PeerUiStorageObject | null;
+}
+
+/** One fixed repair target as the last read-only assessment saw it. */
+export interface PeerUiStorageTarget {
+	readonly target: PeerUiStorageObject;
+	readonly status: "absent" | "protected" | "repairable" | "refused" | "not-assessed";
+	readonly reason: PeerUiStorageReason | null;
+}
+
+/**
+ * Whether the explicit permission repair applies. Display facts only: the
+ * coordinator re-proves eligibility, Network inactivity, and the exact
+ * assessment generation at the actual mutation.
+ *
+ * - `none`: the refusal is not a permission problem the repair can address.
+ * - `unchecked`: eligibility could not be assessed.
+ * - `unsupported`: this platform cannot establish protection.
+ * - `nothing-to-repair`: every present target already meets its protection.
+ * - `blocked`: one target can never be repaired automatically.
+ * - `busy`: Network activity owns state; it must stop before a repair.
+ * - `offered`: a confirmed repair may be requested for exactly this generation.
+ * - `restart-required`: protection changed or may have changed; Network stays
+ *   unavailable until a deliberate host restart.
+ */
+export type PeerUiStorageRepair =
+	| { readonly state: "none" | "unchecked" | "unsupported" | "nothing-to-repair" | "busy" }
+	| { readonly state: "blocked"; readonly target: PeerUiStorageObject; readonly reason: PeerUiStorageReason | null }
+	| { readonly state: "offered"; readonly generation: number; readonly targets: readonly PeerUiStorageTarget[] }
+	| {
+		readonly state: "restart-required";
+		readonly outcome: "repaired" | "partial";
+		readonly priorExposurePossible: boolean;
+	};
+
+export interface PeerUiStorage {
+	/** Selects operating-system-appropriate mitigation text. */
+	readonly platform: "windows" | "posix";
+	readonly problems: readonly PeerUiStorageProblem[];
+	readonly repair: PeerUiStorageRepair;
+}
+
 export interface PeerUiSnapshot {
 	readonly revision: number;
 	readonly status: "loading" | "ready" | "unavailable";
+	/**
+	 * Sanitized Network storage refusal facts and repair eligibility. Absent or
+	 * null means no storage problem was observed in this lifecycle. Optional so an
+	 * older coordinator's DTO stays representable.
+	 */
+	readonly storage?: PeerUiStorage | null;
 	/** null is unavailable/unknown configuration, never silently selected defaults. */
 	readonly settings: PeerUiSettings | null;
 	readonly identityFingerprint: string | null;
@@ -123,15 +234,176 @@ export type PeerUiCommand =
 	| { readonly type: "peer-remove"; readonly hostId: string }
 	| { readonly type: "peer-revoke"; readonly peerId: string };
 
-/** Consent cannot use the ordinary command path: Main must verify its written frame. */
+/**
+ * Consent and the storage permission repair cannot use the ordinary command
+ * path: Main must verify the exact written confirmation frame first.
+ */
 export type PeerUiAction = PeerUiCommand
 	| { readonly type: "peer-open" }
-	| { readonly type: "peer-consent"; readonly consentId: string; readonly decision: "approve" | "deny"; readonly renderToken: number };
+	| { readonly type: "peer-consent"; readonly consentId: string; readonly decision: "approve" | "deny"; readonly renderToken: number }
+	/**
+	 * The one confirmed request to repair the fixed storage targets' protection,
+	 * frozen to the assessment `generation` the written confirmation showed.
+	 */
+	| { readonly type: "peer-storage-repair"; readonly generation: number; readonly renderToken: number };
 
 export interface PeerConsentPresentation {
 	readonly consentId: string;
 	readonly decision: "approve" | "deny";
 	readonly renderToken: number;
+}
+
+/** The current complete storage-repair confirmation candidate (Repair chosen). */
+export interface PeerStorageRepairPresentation {
+	readonly generation: number;
+	readonly renderToken: number;
+}
+
+/**
+ * What a confirmed repair request did. `stale` means the frozen generation or
+ * the fresh eligibility recheck no longer matched; `busy` means Network
+ * activity owned state; `not-run` means nothing could be attempted. In every one
+ * of those nothing was changed. Otherwise the request ran, and the snapshot
+ * carries the truthful outcome.
+ */
+export type PeerUiStorageRepairAdmission = "ran" | "stale" | "busy" | "not-run";
+
+type StorageText = { readonly why: string; readonly mitigation: string };
+
+function storageObjectText(object: PeerUiStorageObject | null): string {
+	return object === null ? "Network storage" : PEER_UI_STORAGE_OBJECT_NAMES[object];
+}
+
+/**
+ * Fixed why/mitigation text for one sanitized refusal. Pure and closed: it never
+ * includes a path beyond the conventional relative object name, an errno, a
+ * mode, a SID, native output, or record content.
+ */
+export function describePeerUiStorageReason(
+	reason: PeerUiStorageReason | null,
+	object: PeerUiStorageObject | null,
+	platform: PeerUiStorage["platform"],
+	repairOffered = false,
+): StorageText {
+	const name = storageObjectText(object);
+	const restart = "then restart Pi.";
+	const offer = repairOffered ? "Use Repair permissions below, or " : "";
+	switch (reason) {
+		case "unsafe-permissions":
+			return {
+				why: `${name} does not meet the required access permissions.`,
+				mitigation: platform === "windows"
+					? `${offer}${repairOffered ? "l" : "L"}imit access yourself to your account, SYSTEM, and Administrators; ${restart}`
+					: `${offer}${repairOffered ? "m" : "M"}ake it owner-only yourself (directories 0700, files 0600); ${restart}`,
+			};
+		case "extended-acl":
+			return {
+				why: `${name} has an extended ACL entry that grants another account access.`,
+				mitigation: `${offer}${repairOffered ? "r" : "R"}emove that ACL entry yourself; ${restart}`,
+			};
+		case "unsafe-object":
+			return {
+				why: `${name} is a link, junction, unexpected type, or has an extra hard link.`,
+				mitigation: `It is never followed or changed. Replace it with a real item you own, ${restart}`,
+			};
+		case "foreign-owner":
+			return {
+				why: `${name} is owned by another account.`,
+				mitigation: `Ownership is never taken over. Have it returned to your account, ${restart}`,
+			};
+		case "protection-unsupported":
+			return {
+				why: `Protection of ${name} cannot be verified on this system.`,
+				mitigation: platform === "windows"
+					? `Make sure Windows PowerShell is available and the access list holds only ordinary entries, ${restart}`
+					: `Network stays unavailable here; nothing is changed. Use a supported local filesystem, ${restart}`,
+			};
+		case "unreadable":
+			return {
+				why: `${name} could not be read (access denied or an I/O error).`,
+				mitigation: `Check that your account can read it and that the disk is healthy, ${restart}`,
+			};
+		case "malformed":
+			return {
+				why: `${name} is damaged, too large, or from an unsupported version.`,
+				mitigation: "It is never reset or overwritten. Restore it from a backup; for the identity document see the manual identity replacement guide.",
+			};
+		case "missing-initialized":
+			return {
+				why: `${name} is missing from an already initialized storage directory.`,
+				mitigation: "Nothing is refilled and no key is created. Restore the document from a backup or see the manual identity replacement guide.",
+			};
+		case "changed":
+			return {
+				why: `${name} changed while it was being checked.`,
+				mitigation: `Make sure nothing else is modifying it, ${restart}`,
+			};
+		default:
+			return {
+				why: `${name} could not be opened.`,
+				mitigation: "Nothing was changed. Restart Pi; see the recovery documentation if it persists.",
+			};
+	}
+}
+
+/**
+ * Bounded display lines for an attached storage fact: one why/mitigation pair
+ * per distinct refusal, then the repair state. Pure; no IO.
+ */
+export function describePeerUiStorage(storage: PeerUiStorage): readonly string[] {
+	const lines: string[] = [];
+	const seen = new Set<string>();
+	for (const problem of storage.problems) {
+		const store = problem.store === "settings"
+			? "Network settings are unavailable"
+			: "Network identity and trust are unavailable";
+		const text = describePeerUiStorageReason(
+			problem.reason, problem.object, storage.platform, storage.repair.state === "offered",
+		);
+		const key = JSON.stringify([problem.reason, problem.object]);
+		if (seen.has(key)) {
+			lines.push(`${store}: same cause as above.`);
+			continue;
+		}
+		seen.add(key);
+		lines.push(`${store}: ${text.why}`);
+		lines.push(text.mitigation);
+	}
+	const repair = storage.repair;
+	switch (repair.state) {
+		case "offered":
+			lines.push("Repair permissions is available below; it changes only protection, after you confirm it.");
+			break;
+		case "blocked": {
+			const text = describePeerUiStorageReason(repair.reason, repair.target, storage.platform);
+			lines.push(`Repair is not possible: ${text.why}`);
+			lines.push(text.mitigation);
+			break;
+		}
+		case "busy":
+			lines.push("Repair is not offered while Network work is active: disable hosting and disconnect first.");
+			break;
+		case "unsupported":
+			lines.push("Repair is not supported on this platform; nothing is changed.");
+			break;
+		case "unchecked":
+			lines.push("Repair eligibility could not be checked; nothing is changed.");
+			break;
+		case "nothing-to-repair":
+			lines.push("Protection now looks correct; restart Pi to reopen Network.");
+			break;
+		case "restart-required":
+			lines.push(repair.outcome === "repaired"
+				? "Permissions were repaired. Network stays unavailable until you restart Pi."
+				: "Permissions were only partly repaired and may have changed. Network stays unavailable until you restart Pi.");
+			if (repair.priorExposurePossible) {
+				lines.push("Repair cannot undo earlier access: if another account could read these files, replace the identity key separately and pair again.");
+			}
+			break;
+		default:
+			break;
+	}
+	return Object.freeze(lines);
 }
 
 /**
@@ -234,5 +506,13 @@ export interface PeerCoordinator {
 	perform(command: PeerUiCommand): Promise<void>;
 	/** Trusted local Main only, after the exact dialog's actual-written fence. */
 	decideConsent(id: string, decision: "approve" | "deny"): boolean;
+	/**
+	 * Trusted local Main only, after the exact written repair confirmation frame.
+	 * Repairs only the protection of the fixed existing storage targets for the
+	 * frozen assessment `generation`; it never hosts, connects, creates keys,
+	 * reopens stores, restores saved intent, or retries. Optional so an older
+	 * coordinator or fake stays representable (Main then refuses).
+	 */
+	repairStorageProtection?(generation: number): Promise<PeerUiStorageRepairAdmission>;
 	close(): Promise<void>;
 }

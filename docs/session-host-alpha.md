@@ -697,7 +697,9 @@ preferences document described below; remote roster observations remain in memor
 The application does not encrypt this file at rest or require an OS credential-store
 service. It verifies owner-only filesystem protection before secret bytes are written:
 POSIX ownership/private modes and supported extended-ACL checks, or actual Windows
-owner/DACL evidence. Existing unsafe files are refused, not permission-repaired. Unknown,
+owner/DACL evidence. The store itself never repairs an existing unsafe file: it is
+refused, and only the separate, human-confirmed
+[permission repair](#repairing-network-storage-permissions) can tighten it. Unknown,
 malformed, oversized, missing initialized state or mismatched certificate/key/receiving
 identity is unavailable, never a fresh identity or empty-trust fallback. Initialization
 cannot silently replace a previously used identity. Fixed errors do not expose private
@@ -831,8 +833,10 @@ rows and may resize or reflow the local child; it renders no approval control.
 
 Association is one-time and persists until revoked, with no age-based expiry. Reopening
 the same identity and trust store needs no repeated approval. A changed key, missing
-initialized trust, or unsafe/corrupt store fails closed: it is reported and never
-re-paired, repaired, rotated, or overwritten, and an explicit Connect does not replace a
+initialized trust, or unsafe/corrupt store fails closed: it is reported with a fixed
+reason and is never re-paired, rotated, or overwritten. Only an unsafe-permission refusal
+can be offered the explicit, confirmed
+[permission repair](#repairing-network-storage-permissions), and an explicit Connect does not replace a
 changed remembered key. Independently verify the intended identity before choosing to
 Remove and re-add a destination to confirm a new key.
 Receiving approval is directional: A approving B lets B connect to A and does not grant A
@@ -943,8 +947,9 @@ identity, a `peers` directory, key material, or a listener. Both documents requi
 verified operating-system protection before private or preference bytes are written;
 they are not encrypted at rest and use no OS credential-store service. Existing unsafe,
 malformed, unknown-version, or missing-initialized documents are refused untouched and
-never repaired, reset, or rotated. Same-account and OS-privileged access remains outside
-this boundary.
+never reset or rotated; opening, reading, or saving never repairs them. The one exception
+is the explicit permission repair described next, which changes only protection.
+Same-account and OS-privileged access remains outside this boundary.
 
 Trust, storage, and consent boundaries are detailed in
 [Session-host peer network](security-model.md#session-host-peer-network-optional).
@@ -969,6 +974,121 @@ deleting anything you want to keep. Disconnect on B and confirm the rows become 
 confirm it forgets only that endpoint and local pin.
 These are optional manual alpha checks, not an installation, support, release, or
 cross-machine readiness claim; CI does not run them.
+
+#### Repairing Network storage permissions
+
+When a protected Network document or one of its fixed directories cannot be used, the
+Network pane says why instead of using defaults: settings, Hosting, Auto, destinations,
+and the identity stay unknown, and nothing is created. Each refusal names one fixed
+reason and one fixed item by its conventional name below the Pi agent directory
+(`session-host`, `session-host/peers`, `session-host/peers/state.json`,
+`session-host/peer-preferences`, or `session-host/peer-preferences/preferences.json`),
+never a resolved path, error number, mode, account identifier, or native output:
+
+| Reason | Meaning | What to do |
+| --- | --- | --- |
+| Access beyond your account | Broad owner/mode bits or Windows access entries | Use **Repair permissions** when offered, or restrict the item yourself, then restart Pi |
+| Extended ACL entry | A macOS ACL grants another account | Use **Repair permissions** when offered; an ACL the repair cannot prove is refused, so remove that entry yourself |
+| Link or unexpected object | A symlink, junction, other type, or extra hard link | Replace it with a real item you own; it is never followed or changed |
+| Another owner | Owned by a different account | Have ownership returned; it is never taken over |
+| Protection not verifiable | The platform or Windows helper cannot prove protection | Nothing is changed; on Windows check that Windows PowerShell is available |
+| Unreadable | Access denied or an I/O error | Check your access and the disk |
+| Damaged | Empty, oversized, unparseable, or an unknown version | Restore from a backup; for the identity see the manual replacement below |
+| Document missing | An initialized directory without its document | Restore it, or follow the manual replacement below; no key is generated |
+| Changed while checked | The item changed during the check | Make sure nothing else modifies it |
+
+Showing a refusal performs at most one read-only eligibility check, and only for an
+access-permission refusal; it never runs while drawing the pane or on a timer. When every
+present fixed item can be tightened and none is refused, the pane offers **Repair Network
+storage permissions**. Otherwise it says why no repair is possible. The repair is offered
+only while Network owns no listener, connection, connection attempt, or unconfirmed
+teardown; disable hosting and disconnect first. Pending automatic retries are cancelled
+without saving any Disconnect intent, and local or remote sessions are not stopped.
+
+The repair always opens a confirmation first, with Cancel selected. It lists the five
+fixed items and what happens to each (repaired, already protected, or absent and not
+created) and the new protection: owner-only access with no other account's ACL entry on
+POSIX systems, or a protected access list for only your account, SYSTEM, and
+Administrators on Windows. It states that contents, the identity key, pins, receiving
+grants, saved settings, and destinations stay byte for byte and that ownership is not
+changed. It also states that the agent directory, its parent folders, and every other
+file are not touched, and that nothing is created, deleted, or swept recursively. It
+warns that repair cannot undo earlier access and recommends separately replacing the
+identity key if another account could have read it, and that Network stays unavailable
+until you restart Pi. Repair acts only from the exact confirmation the terminal actually
+wrote, with Repair chosen. A resize, a changed assessment, a hidden or too-small dialog,
+Cancel, Escape, a repeated key, or pasted text requests nothing. The host re-checks the
+written frame, Network inactivity, and a fresh read-only assessment equal to the one
+shown immediately before changing anything.
+
+The repair never hosts, connects, creates a key, reopens a store, restores saved Hosting
+or Auto, or retries. When protection changed, or may have partly changed, Network stays
+unavailable with a persistent restart status, and every Network action is refused until
+you deliberately restart the host. A refused or unnecessary repair changes nothing. The
+repair cannot revoke handles another process already holds or prove that earlier exposed
+state stayed secret; it never rotates or deletes a key automatically. If exposure was
+possible, follow the manual identity replacement below after the restart.
+
+Creating Network storage is separate. A missing `session-host` directory is created
+private at creation, and a first save creates its private directories and document. When
+that private protection cannot be proven at creation (for example under some inherited
+macOS ACLs), the directory may still be created for local session-host use, but Network
+refuses it as unsafe and claims no protection. It then needs this explicit repair; it is
+not repaired automatically.
+
+These behaviors are covered by focused tests of the real coordinator and storage backend
+on POSIX, sidebar and Main confirmation tests, and an opted-in native-Windows ConPTY
+companion acceptance described in [Development](development.md#network-storage-permission-repair-494).
+
+#### Manually replacing the network identity
+
+Repairing the protection of the trust document never changes its key or bytes: the
+identity, outgoing pins, accepted peers, and receiving grants are kept. Neither a
+permission repair nor a replacement undoes an earlier disclosure: if another account could
+read the document, assume its private key was copied. The application has no automatic
+key rotation, reset, or deletion. Retiring this host's key is a separate manual choice,
+and this is the only supported way to do it. It discards every pairing and leaves this
+host's network unavailable until you pair again.
+
+Do not delete `state.json` alone. A `peers` directory without its document is refused as
+unavailable on every start; it is never treated as a fresh identity, and no key is
+generated.
+
+1. **Coordinate with paired peers.** On each host paired with this one, Revoke this
+   host's receiving permission and Remove the destination for this host. Replacing the
+   key here revokes nothing elsewhere: until each peer does this, a copy of the old key
+   can still authenticate to that peer as this host.
+2. **Turn off saved intent.** In this host's Network pane, disable hosting and turn Auto
+   off, so the next start does not try to restore either one.
+3. **Settle and quit.** Let local sessions and network work finish, then quit normally
+   (see [Quitting and cleanup](#quitting-and-cleanup)); do not force-stop busy work.
+   Continue only after the host has exited and released agent-directory ownership. A
+   running host keeps using the old key from memory.
+4. **Quarantine the whole directory.** Confirm that `<agentDir>/session-host/peers` is
+   the real directory for this agent directory and that it is private and owned by your
+   account. Create a private, owner-only directory outside the agent directory, on the
+   same filesystem, and move the entire `peers` directory into it. Leave
+   `peer-preferences` and every other file in place. If the path or ownership is uncertain,
+   or the quarantine or its parent cannot be made private, stop.
+5. **Restart.** Opening the trust store creates no key. Saved preferences and
+   destinations remain, but outgoing pins, accepted peers, and receiving grants left with
+   the moved document, and Auto skips destinations without a pin.
+6. **Create the replacement deliberately.** Choose Enable hosting or Connect. Only that
+   explicit action generates the new identity; confirm that the shown fingerprint changed.
+7. **Re-pair both directions.** Each direction needs a new approval; compare fingerprints
+   through an independent channel. A peer that still remembers the old key refuses this
+   host with `PEER_KEY_MISMATCH` until it Removes and re-adds the destination; Connect
+   never replaces a changed pin.
+
+**Undoing before step 6.** Settle and quit again, confirm that
+`<agentDir>/session-host/peers` is absent, move the quarantined directory back without
+overwriting anything, and restart. The peers' Revoke and Remove actions from step 1 are
+not undone.
+
+The quarantine still holds the old private key. Keep it private until you deliberately
+destroy it, and note that deleting a file does not guarantee erasure from SSDs, snapshots,
+or backups. Same-account and OS-privileged access remains outside this boundary. This
+sequence has been checked on macOS only; Linux and Windows have not been exercised.
 
 ### Selected native viewport (interim display scope)
 

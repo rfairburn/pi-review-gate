@@ -799,6 +799,12 @@ class FakePeerCoordinator implements PeerCoordinator {
     this.publish({ consents: this.snapshot.consents.filter((consent) => consent.id !== id) });
     return true;
   }
+  readonly repairs: number[] = [];
+  async repairStorageProtection(generation: number): Promise<"ran" | "stale" | "busy" | "not-run"> {
+    this.repairs.push(generation);
+    this.publish({ storage: { ...this.snapshot.storage!, repair: { state: "restart-required", outcome: "repaired", priorExposurePossible: true } } });
+    return "ran";
+  }
   async close(): Promise<void> {
     this.closeCalls++;
     if (this.closeFailure) throw new Error("synthetic unconfirmed network cleanup");
@@ -12626,4 +12632,92 @@ test("a coordinator without the Saved controller refuses remote Saved with a fix
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
   }
+});
+
+
+// ---------------------------------------------------------------------------
+// Storage permission repair: Main's own written-frame fence (Refs #494)
+// ---------------------------------------------------------------------------
+
+function offeredRepairSnapshot(generation: number): Partial<PeerUiSnapshot> {
+  return {
+    status: "unavailable", settings: null, identityFingerprint: null, hosts: null, trustedPeers: null,
+    storage: {
+      platform: "posix",
+      problems: [{ store: "trust", reason: "unsafe-permissions", object: "session-host" }],
+      repair: {
+        state: "offered", generation,
+        targets: (["session-host", "peers", "peer-state", "peer-preferences", "preferences-document"] as const)
+          .map((target) => ({ target, status: target === "session-host" ? "repairable" as const : "absent" as const,
+            reason: target === "session-host" ? "unsafe-permissions" as const : null })),
+      },
+    },
+  };
+}
+
+async function openRepairConfirmation(harness: Harness): Promise<void> {
+  // The complete confirmation needs a real pane; 80x24 is refused as too small.
+  harness.terminal.setSize(120, 50);
+  await nextTurn();
+  harness.sidebar!.openPeerMenu();
+  await nextTurn();
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+  assert.equal(harness.sidebar!.peerRepairConfirmationActive, true, "the drawn repair row opens its review");
+  harness.terminal.emitInput("y");
+  await nextTurn();
+}
+
+test("Main refuses a storage repair until the exact Repair confirmation is actually written", async (t) => {
+  const { harness, peer, dispatch } = await peerMainHarness(t, (fixture) => {
+    fixture.snapshot = { ...fixture.snapshot, ...offeredRepairSnapshot(7) };
+  });
+  try {
+    harness.writer.holdWrites = true;
+    await openRepairConfirmation(harness);
+    const candidate = harness.sidebar!.capturePeerRepairPresentation();
+    assert.ok(candidate && candidate.generation === 7, "the queued dialog has only a candidate token");
+    dispatch({ type: "peer-storage-repair", generation: 7, renderToken: candidate.renderToken });
+    assert.deepEqual(peer.repairs, [], "a rendered but unwritten frame is never repair authority");
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.repairs, [], "the sidebar refuses its own unwritten frame too");
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    const written = harness.sidebar!.capturePeerRepairPresentation();
+    assert.ok(written);
+    dispatch({ type: "peer-storage-repair", generation: 8, renderToken: written.renderToken });
+    assert.deepEqual(peer.repairs, [], "a different generation is not the written frame");
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    await nextTurn();
+    assert.deepEqual(peer.repairs, [7], "exactly one repair for the written frozen generation");
+    assert.deepEqual(peer.commands, [], "the repair never travels the ordinary command path");
+    const frame = harness.writer.frames.at(-1)?.frame;
+    assert.ok(frame?.lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "")).join(" ").includes("restart Pi"),
+      "the persistent restart status is drawn");
+  } finally { harness.writer.holdWrites = false; assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("a resize or a superseded assessment revokes a written storage repair frame in Main", async (t) => {
+  const { harness, peer, dispatch } = await peerMainHarness(t, (fixture) => {
+    fixture.snapshot = { ...fixture.snapshot, ...offeredRepairSnapshot(3) };
+  });
+  try {
+    await openRepairConfirmation(harness);
+    const written = harness.sidebar!.capturePeerRepairPresentation();
+    assert.ok(written && harness.sidebar!.isPeerRepairRenderCurrent(written.renderToken));
+    harness.terminal.setSize(118, 50);
+    await nextTurn();
+    dispatch({ type: "peer-storage-repair", generation: 3, renderToken: written.renderToken });
+    assert.deepEqual(peer.repairs, [], "a frame written at the old geometry authorizes nothing");
+
+    const rewritten = harness.sidebar!.capturePeerRepairPresentation();
+    assert.ok(rewritten);
+    peer.publish(offeredRepairSnapshot(4));
+    await nextTurn();
+    dispatch({ type: "peer-storage-repair", generation: 3, renderToken: rewritten.renderToken });
+    assert.deepEqual(peer.repairs, [], "a superseded assessment is never retargeted");
+    assert.equal(harness.sidebar!.capturePeerRepairPresentation(), undefined);
+  } finally { assert.equal(await closeWithSignal(harness), 0); }
 });

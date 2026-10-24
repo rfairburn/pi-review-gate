@@ -411,6 +411,42 @@ passing test result. They are not a whole production Main run with a real owner 
 provider, two-machine operation, Windows, or operator acceptance, and they do not imply
 full-suite or CI success.
 
+### Network storage permission repair (#494)
+
+After `npm run build:test`, the focused files are:
+
+```sh
+node --test dist-test/tests/session-host-network-storage-repair.test.js
+node --test dist-test/tests/peer-sidebar.test.js
+node --test --test-name-pattern="storage repair" dist-test/tests/session-host-main.test.js
+```
+
+`session-host-network-storage-repair.test.ts` runs the real coordinator with the real
+platform policy and storage backend on owned synthetic agent directories (POSIX only;
+it skips on Windows). It covers unchanged defaults for a fresh profile and a valid
+pre-network roster/keybindings base, an older preferences document without the optional
+flags, explicit Off values, trust and pins across restarts, specific sanitized refusal
+reasons that are never offered a repair, a blocked repair, a busy refusal while hosting,
+and a confirmed repair of all five fixed items that preserves bytes and object identity,
+leaves the agent directory and unrelated files untouched, creates nothing, latches the
+restart status, and reopens normally after a restart with explicit loopback Hosting and
+Connect admission. Its fixture-seam cases cover a changed recheck, a partial report, and
+a throwing backend. `peer-sidebar.test.ts` covers the pure pane text and the written
+confirmation fence; the Main cases cover Main's own writer-receipt fence, resize, and a
+superseded assessment.
+
+`session-host-storage-protection-windows-native.test.ts` (backend, Windows only) runs in
+the existing native Windows storage CI step. The same-harness ConPTY companion
+`session-host-native-windows-network.test.ts` runs in the opted-in Windows alpha Main
+step under `PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST=1`, where a missing prerequisite
+fails instead of skipping. It drives the real public Main against a synthetic profile
+with an inherited ordinary-account Modify grant: the drawn refusal, the written repair
+confirmation, the private result on the fixed items only, a restart with the same key and
+explicit Off values, and explicit loopback Hosting and Connect admission. Outside an
+opted-in Windows run these files skip and prove nothing about NTFS or ConPTY. None of
+these files establishes cross-machine behavior, full-suite or CI success, or release
+approval.
+
 ## Static checks and docs validation
 
 `npm run check:static` runs `tsc --noEmit`, `shellcheck scripts/*.sh`, and

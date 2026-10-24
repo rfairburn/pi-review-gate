@@ -1002,6 +1002,12 @@ export class WindowsMainPtyDriver {
       TEMP: options.temporary,
       TMP: options.temporary,
       TMPDIR: options.temporary,
+      // Main's trusted PowerShell helpers inherit this env. Only the built-in
+      // Windows PowerShell module root (never the host's PSModulePath) and an
+      // analysis cache inside the owned temporary directory, so cmdlet module
+      // auto-loading does not stall in the stripped harness environment.
+      PSModulePath: join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules"),
+      PSModuleAnalysisCachePath: join(options.temporary, "PSModuleAnalysisCache"),
       NODE_PATH: options.runtime.nodePath,
       TERM: "xterm-256color",
       PRG_SESSION_HOST_WINDOWS_MAIN_ENTRY: mainEntry,

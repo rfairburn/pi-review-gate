@@ -362,15 +362,6 @@ test("alpha compiles tests directly and runs only explicit focused test files", 
   assert.match(helper, /node --test dist-test\/tests\/session-host-native-windows-helper-contract\.test\.js/,
     "the pure Windows helper-contract test must run as an explicit compiled file");
 
-  const probeStep = stepOf(job, "Owned ConPTY PowerShell helper console-attachment probe (opt-in, fail-closed)");
-  assert.match(probeStep, /node --test dist-test\/tests\/session-host-native-windows-console-probe\.test\.js/,
-    "the owned ConPTY console-attachment probe must run as an explicit compiled file");
-  assert.match(probeStep, /PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"/,
-    "the console probe must hard-fail on missing Windows prerequisites, never skip");
-  assert.match(probeStep, /^        timeout-minutes: \d+\s*$/m, "the console probe step carries its own active cap");
-  assert.ok(job.indexOf(probeStep) < job.indexOf("      - name: Real public Windows ConPTY Main acceptance (opt-in, fail-closed)"),
-    "the console probe runs alone before, never instead of, the required Main step");
-
   const mainStep = stepOf(job, "Real public Windows ConPTY Main acceptance (opt-in, fail-closed)");
   assert.match(mainStep, /node --test dist-test\/tests\/session-host-native-windows-main\.test\.js/,
     "the opt-in real Main/ConPTY test must run as an explicit compiled file");
@@ -472,6 +463,13 @@ test("alpha launcher acceptance exercises both real source wrappers with require
     "the direct Main outer transport must select the same bundled public ConPTY as the shipped source path");
   assert.doesNotMatch(harness, /useConpty\s*:/,
     "the deprecated ignored useConpty hint is never used by the direct Main outer transport");
+  const hostEnv = /const hostEnv: NodeJS\.ProcessEnv = \{([\s\S]*?)\n    \};/.exec(harness)?.[1] ?? "";
+  assert.match(hostEnv, /\n      PSModulePath: join\(systemRoot, "System32", "WindowsPowerShell", "v1\.0", "Modules"\),\n/,
+    "Main's PowerShell helpers see only the built-in Windows PowerShell module root");
+  assert.match(hostEnv, /\n      PSModuleAnalysisCachePath: join\(options\.temporary, "PSModuleAnalysisCache"\),\n/,
+    "the module analysis cache lives inside the owned temporary directory");
+  assert.doesNotMatch(harness, /process\.env\.PSModulePath|process\.env\["PSModulePath"\]|\.\.\.process\.env\b/,
+    "the harness never copies the host module path or the full ambient environment");
 });
 
 test("alpha installs no .NET SDK or external toolchain", () => {

@@ -476,6 +476,8 @@ test("alpha launcher acceptance exercises both real source wrappers with require
     "only the fixed OS names are copied from the host environment");
   assert.doesNotMatch(harness, /\.\.\.process\.env\b|Object\.assign\([^)]*process\.env/,
     "the harness never copies the full ambient environment");
+  assert.match(harness, /\n    if \(this\.exitEvent\) await closeExitedOwnedConptyReader\(this\.pty\);\n  \}\n\n  get forcedCleanup\(\)/,
+    "the owned ConPTY reader is settled last in settleSubscriptions, and only after the actual outer exit");
 });
 
 test("alpha installs no .NET SDK or external toolchain", () => {

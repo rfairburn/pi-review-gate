@@ -30,6 +30,7 @@ import {
   type FSWatcher,
 } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { Worker } from "node:worker_threads";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 import {
@@ -810,6 +811,24 @@ interface MainResult {
   readonly sameOutputStream: boolean;
   readonly rawBefore: unknown;
   readonly rawAfter: unknown;
+}
+
+/**
+ * Pinned @lydell/node-pty 1.2.0-beta.15 with useConptyDll leaves its owned
+ * conout reader Worker running after a natural exit: kill() disposes it only
+ * on future output, which cannot arrive once onExit fired. After the actual
+ * exit, close the exact PTY through public kill() (native PTY token, no PID
+ * enumeration on the DLL path) and terminate only that reader Worker so the
+ * test file ends naturally. Any other shape fails closed before kill().
+ */
+export async function closeExitedOwnedConptyReader(pty: NativePtyHandle): Promise<void> {
+  const agent = (pty as unknown as { _agent?: { _useConptyDll?: unknown; _conoutSocketWorker?: { _worker?: unknown } } })._agent;
+  const reader = agent?._conoutSocketWorker?._worker;
+  if (agent?._useConptyDll !== true || !(reader instanceof Worker)) {
+    throw new Error("exited outer PTY is not the pinned ConPTY-DLL shape with an owned reader Worker");
+  }
+  pty.kill(); // Exact public outer PTY handle, no signal argument.
+  await reader.terminate();
 }
 
 export class WindowsMainPtyDriver {
@@ -2105,6 +2124,8 @@ export class WindowsMainPtyDriver {
     try { this.logWatcher.close(); } catch { /* task-owned root watch */ }
     try { this.nativeWatcher.close(); } catch { /* task-owned journal watch */ }
     try { this.providerWatcher.close(); } catch { /* task-owned provider fixture watch */ }
+    // Only after the actual outer root exited: never while it may still be live.
+    if (this.exitEvent) await closeExitedOwnedConptyReader(this.pty);
   }
 
   get forcedCleanup(): boolean {

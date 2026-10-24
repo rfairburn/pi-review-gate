@@ -86,6 +86,27 @@ function grantsAuthenticatedUsers(target: string): boolean {
   return observed.evidence.aces.some((ace) => ace.sid === AUTHENTICATED_USERS && ace.aceType === "allow");
 }
 
+/**
+ * Makes this account the owner of exactly the named objects this test just
+ * created, through the fixed system `icacls`, then proves it from the native
+ * helper's own evidence. An elevated runner token's default owner is the
+ * built-in Administrators group, but the affected earlier profile was created
+ * by this ordinary account; owning these fixture objects keeps the broad DACL
+ * the only defect under test. No production ownership rule is changed.
+ */
+function ownFixtureObjects(targets: readonly string[]): void {
+  for (const target of targets) {
+    const before = inspectPeerStateAcl(target);
+    assert.ok(before !== null, "the native helper observes this test's own fixture");
+    if (before.evidence.ownerSid !== before.currentSid) {
+      execFileSync(icacls(), [target, "/setowner", `*${before.currentSid}`], { stdio: "ignore", timeout: 30_000, windowsHide: true });
+    }
+    const after = inspectPeerStateAcl(target);
+    assert.ok(after !== null && after.evidence.ownerSid === after.currentSid,
+      `${target.slice(target.lastIndexOf("session-host"))} is owned by this account before Main starts`);
+  }
+}
+
 function isPrivate(target: string, kind: "dir" | "file"): boolean {
   const observed = inspectPeerStateAcl(target);
   assert.ok(observed !== null);
@@ -216,6 +237,8 @@ test("real public Main shows Windows Network storage refusal, repairs only after
   writeFileSync(join(stateDir, "peers", "state.json"), stateBytes);
   writeFileSync(join(stateDir, "peer-preferences", "preferences.json"), preferenceBytes);
   writeFileSync(join(stateDir, "unrelated.json"), "{}\n");
+  ownFixtureObjects([stateDir, join(stateDir, "peers"), join(stateDir, "peers", "state.json"),
+    join(stateDir, "peer-preferences"), join(stateDir, "peer-preferences", "preferences.json"), join(stateDir, "unrelated.json")]);
   assert.ok(grantsAuthenticatedUsers(stateDir) && grantsAuthenticatedUsers(join(stateDir, "peers", "state.json")),
     "the fixture really is the inherited broad shape");
 

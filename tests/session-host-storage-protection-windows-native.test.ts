@@ -8,6 +8,15 @@
  * removes. Nothing outside that root is inspected or modified. Every case skips
  * on other platforms: a non-Windows run proves nothing about NTFS.
  *
+ * Remediation fixtures model supported upgrade storage, which the current
+ * account owns. An elevated token (the hosted Windows runner) makes the built-in
+ * Administrators alias the default owner of every object it creates, and the
+ * product rightly refuses that as `foreign-owner`. So the repair fixtures
+ * correct only that creation default to the current account on the fixed
+ * objects each case just created (an owner-only write; the broad inherited DACL
+ * is proven unchanged), and a dedicated case proves the Administrators-owned
+ * shape itself stays refused and is never re-owned by the product.
+ *
  * Parent integration command (add to the existing Windows session-host job):
  *   node --test --test-concurrency=1 --test-timeout=120000 dist-test/tests/session-host-storage-protection-windows-native.test.js
  */
@@ -15,7 +24,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import test from "node:test";
 
 import { isPeerPreferencesError, openPeerPreferencesStoreWithPermissions, DEFAULT_PEER_PREFERENCES } from "../src/session-host/network/peer-preferences-store";
@@ -40,6 +49,7 @@ const creator = require(join(process.cwd(), "scripts", "session-host-state-direc
 const IS_WINDOWS = process.platform === "win32";
 const SKIP = IS_WINDOWS ? false : "native NTFS proof requires a Windows host";
 const AUTHENTICATED_USERS = "S-1-5-11";
+const ADMINISTRATORS = "S-1-5-32-544";
 
 function icacls(): string {
 	const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
@@ -70,6 +80,48 @@ function grantsAuthenticatedUsers(evidence: WindowsAclEvidence): boolean {
 function isPrivate(target: string, kind: "dir" | "file"): boolean {
 	const { evidence, currentSid } = observe(target);
 	return verifyPrivateAclEvidence(evidence, currentSid, kind);
+}
+
+/**
+ * Fixed fixture-only owner correction: an existing, non-reparse object of the
+ * named kind owned by the elevated creation default becomes owned by the current
+ * account in an owner-only descriptor write. An object already owned by the
+ * current account is left alone; any other owner exits 5 untouched.
+ */
+const SET_CREATED_FIXTURE_OWNER = [
+	"$ErrorActionPreference = 'Stop'",
+	"if ($env:PRG_KIND -eq 'dir') { $target = New-Object System.IO.DirectoryInfo($env:PRG_TARGET) } else { $target = New-Object System.IO.FileInfo($env:PRG_TARGET) }",
+	"if (-not $target.Exists) { exit 4 }",
+	"if (($target.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { exit 5 }",
+	"$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User",
+	"$security = $target.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Owner)",
+	"$owner = $security.GetOwner([System.Security.Principal.SecurityIdentifier])",
+	"if ($owner.Value -eq $current.Value) { exit 0 }",
+	`if ($owner.Value -ne '${ADMINISTRATORS}') { exit 5 }`,
+	"$security.SetOwner($current)",
+	"$target.SetAccessControl($security)",
+	"exit 0",
+].join("\n");
+
+/**
+ * Make one object this case just created under its own fixture `root` owned by
+ * the current account, as supported storage is. Only the elevated creation
+ * default (Administrators) is ever corrected; any other owner fails the case.
+ * The DACL — including the inherited broad Authenticated Users grant — must be
+ * byte-for-byte the same evidence afterwards.
+ */
+function ownCreatedFixture(root: string, target: string): void {
+	assert.ok(target.startsWith(root + sep), "only this case's own fixture is ever re-owned");
+	const before = observe(target);
+	assert.equal(before.evidence.isReparsePoint, false, "only an ordinary fixture object is ever re-owned");
+	if (before.evidence.ownerSid === before.currentSid) return;
+	assert.equal(before.evidence.ownerSid, ADMINISTRATORS, "a fresh fixture may carry only the elevated creation-default owner");
+	const kind = before.evidence.isDirectory ? "dir" : "file";
+	assert.equal(powershellForTest(SET_CREATED_FIXTURE_OWNER, { PRG_TARGET: target, PRG_KIND: kind }), 0, "fixture owner correction");
+	const after = observe(target);
+	assert.equal(after.currentSid, before.currentSid);
+	assert.equal(after.evidence.ownerSid, after.currentSid, "the fixture is now owned by this account");
+	assert.deepEqual({ ...after.evidence, ownerSid: before.evidence.ownerSid }, before.evidence, "only the owner changed; the broad DACL is intact");
 }
 
 test("native: an absent session-host under a broad parent is created private at creation", { skip: SKIP }, (t) => {
@@ -137,6 +189,7 @@ test("native: remediation repairs only fixed targets and does not propagate to o
 	const stateBytes = Buffer.from("{\"opaque\":\"never decoded by remediation\"}\n");
 	writeFileSync(join(stateDir, "peers", "state.json"), stateBytes);
 	writeFileSync(join(stateDir, "roster.json"), "{\"version\":1,\"entries\":[]}\n");
+	for (const target of [stateDir, join(stateDir, "peers"), join(stateDir, "peers", "state.json")]) ownCreatedFixture(root, target);
 	const rosterBefore = observe(join(stateDir, "roster.json")).evidence;
 	assert.ok(grantsAuthenticatedUsers(rosterBefore));
 
@@ -165,6 +218,7 @@ test("native: remediation refuses a hard-linked document and a junction base wit
 	const stateDir = join(agentDir, "session-host");
 	mkdirSync(join(stateDir, "peers"), { recursive: true });
 	writeFileSync(join(stateDir, "peers", "state.json"), "{}\n");
+	for (const target of [stateDir, join(stateDir, "peers"), join(stateDir, "peers", "state.json")]) ownCreatedFixture(root, target);
 	linkSync(join(stateDir, "peers", "state.json"), join(root, "second-name.json"));
 	const before = observe(stateDir).evidence;
 	const report = repairPeerStorageProtection({ agentDir });
@@ -182,6 +236,55 @@ test("native: remediation refuses a hard-linked document and a junction base wit
 	assert.equal(junction.outcome, "refused");
 	assert.deepEqual(junction.targets[0], { target: "session-host", outcome: "refused", reason: "unsafe-object" });
 	assert.deepEqual(observe(realBase).evidence, realBefore, "a junction is never followed");
+});
+
+test("native: Administrators-owned broad storage is refused as foreign-owner and never re-owned", { skip: SKIP }, (t) => {
+	const root = broadRoot(t);
+	const agentDir = join(root, "agent");
+	const stateDir = join(agentDir, "session-host");
+	const peers = join(stateDir, "peers");
+	const statePath = join(peers, "state.json");
+	mkdirSync(peers, { recursive: true });
+	const stateBytes = Buffer.from("{\"opaque\":true}\n");
+	writeFileSync(statePath, stateBytes);
+	const natural = observe(stateDir);
+	if (natural.evidence.ownerSid !== ADMINISTRATORS) {
+		assert.equal(natural.evidence.ownerSid, natural.currentSid, "a fresh fixture is owned by this account or the elevated default");
+		t.skip("unclaimed native coverage: this token does not create Administrators-owned objects, and no foreign owner is forged");
+		return;
+	}
+	const descriptors = (): WindowsAclEvidence[] => [stateDir, peers, statePath].map((path) => observe(path).evidence);
+	const before = descriptors();
+	assert.ok(before.every((evidence) => evidence.ownerSid === ADMINISTRATORS && grantsAuthenticatedUsers(evidence)), "the whole fixture is Administrators-owned and broad");
+
+	const assessment = assessPeerStorageProtection({ agentDir });
+	assert.deepEqual(assessment.targets.map((target) => [target.target, target.status, target.reason]), [
+		["session-host", "refused", "foreign-owner"],
+		["peers", "not-assessed", null],
+		["peer-state", "not-assessed", null],
+		["peer-preferences", "not-assessed", null],
+		["preferences-document", "not-assessed", null],
+	]);
+	const report = repairPeerStorageProtection({ agentDir });
+	assert.equal(report.outcome, "refused");
+	assert.equal(report.changed, false);
+	assert.deepEqual(report.targets[0], { target: "session-host", outcome: "refused", reason: "foreign-owner" });
+	assert.deepEqual(descriptors(), before, "no ownership takeover and no DACL write");
+
+	// A current-account base does not admit an Administrators-owned private child.
+	ownCreatedFixture(root, stateDir);
+	const mixedBefore = descriptors();
+	assert.deepEqual(mixedBefore.map((evidence) => evidence.ownerSid), [natural.currentSid, ADMINISTRATORS, ADMINISTRATORS]);
+	const mixed = repairPeerStorageProtection({ agentDir });
+	assert.equal(mixed.outcome, "refused");
+	assert.equal(mixed.changed, false);
+	assert.deepEqual(mixed.targets.slice(0, 3), [
+		{ target: "session-host", outcome: "not-attempted", reason: "unsafe-permissions" },
+		{ target: "peers", outcome: "refused", reason: "foreign-owner" },
+		{ target: "peer-state", outcome: "not-assessed", reason: null },
+	]);
+	assert.deepEqual(descriptors(), mixedBefore, "a refused plan changes nothing, including the repairable base");
+	assert.deepEqual(readFileSync(statePath), stateBytes);
 });
 
 test("native: the pre-Node wrapper creates an absent session-host private and leaves an existing one alone", { skip: SKIP }, (t) => {
@@ -239,6 +342,7 @@ function broadTrustLayout(t: { after: (fn: () => void) => void }): { agentDir: s
 	mkdirSync(join(agentDir, "session-host", "peers"), { recursive: true });
 	const statePath = join(agentDir, "session-host", "peers", "state.json");
 	writeFileSync(statePath, "{\"opaque\":true}\n");
+	for (const target of [join(agentDir, "session-host"), join(agentDir, "session-host", "peers"), statePath]) ownCreatedFixture(root, target);
 	return { agentDir, statePath };
 }
 

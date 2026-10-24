@@ -67,6 +67,7 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
+const childProcess = require('node:child_process');
 const { createRequire } = require('node:module');
 const { observePtyModule } = require('./session-host-windows-pty-observer.cjs');
 const {
@@ -88,6 +89,7 @@ const {
   createNativeExchangeGuard,
   isNativeExchangeGuardRequestPayload,
 } = require('./session-host-windows-native-exchange-guard.cjs');
+const { createStartupTrace } = require('./session-host-windows-startup-trace.cjs');
 
 /** The bounded inner-received mode count fields: the producer's fixed DEC set/reset pairs. */
 const RECEIVED_MODE_COUNT_FIELDS = CENSUS_COUNT_FIELDS.filter((field) => field !== 'writeCalls');
@@ -210,7 +212,7 @@ function writeResult(destination, value) {
   fs.writeFileSync(destination, `${JSON.stringify(value)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
 }
 
-async function main() {
+async function main(trace) {
   const optionsPath = process.env.PRG_SESSION_HOST_WINDOWS_OPTIONS;
   const resultPath = process.env.PRG_SESSION_HOST_WINDOWS_RESULT;
   const mainEntry = process.env.PRG_SESSION_HOST_WINDOWS_MAIN_ENTRY;
@@ -226,14 +228,22 @@ async function main() {
     throw new Error('Windows Main runner options are not a bounded regular fixture file');
   }
   const options = JSON.parse(fs.readFileSync(optionsPath, 'utf8'));
+  trace.stage('options-read');
   const inputStream = process.stdin;
   const outputStream = process.stdout;
+  trace.stage('tty-prerequisites', {
+    stdinIsTTY: inputStream.isTTY === true,
+    stdoutIsTTY: outputStream.isTTY === true,
+    rawIsBoolean: typeof inputStream.isRaw === 'boolean',
+  });
   if (!inputStream.isTTY || !outputStream.isTTY || typeof inputStream.isRaw !== 'boolean') {
     throw new Error('actual public Main stdin/stdout TTY and original raw mode are required');
   }
   const rawBefore = inputStream.isRaw;
   const observation = installPtyObservation(mainEntry, expectedPtyModule, ptyJournal);
+  trace.stage('pty-observation-installed');
   outputStream.write(`\x1b[2J\x1b[H${baseline}`);
+  trace.stage('baseline-written');
 
   // Census after the baseline write so the baseline is not counted, and before
   // Main starts so every offered Main/TUI write is observed. The reply service
@@ -241,6 +251,7 @@ async function main() {
   // most one fresh request; it is closed on every return/error path.
   const census = createStdoutModeCensus();
   const censusHandle = installStdoutWriteCensus(outputStream, census);
+  trace.stage('census-installed');
   // Single original-Main-origin native exchange guard: armed exactly once
   // inside the fresh Main census snapshot pass when that pass first constructs
   // a complete actual-owner native binding (before the reply is published),
@@ -376,13 +387,19 @@ async function main() {
     guardService = undefined;
   }
 
+  trace.stage('observers-installed', { censusService: censusService !== undefined, guardService: guardService !== undefined });
   let status = 1;
   let threw = false;
   try {
     const { runSessionHost } = require(mainEntry);
-    status = await runSessionHost(options);
-  } catch {
+    trace.stage('main-required');
+    const running = runSessionHost(options);
+    trace.stage('main-called');
+    status = await running;
+    trace.stage('main-returned', { status: Number.isSafeInteger(status) ? status : null });
+  } catch (error) {
     threw = true;
+    trace.stage('main-threw', { errorName: trace.classifyErrorName(error) });
   } finally {
     // The exact census watcher closure and the exact pane observer restore sit
     // in nested finally blocks so a restoration exception can never bypass
@@ -422,7 +439,17 @@ async function main() {
   process.exitCode = threw ? 1 : status;
 }
 
-void main().catch(() => {
+// Bounded fixed-vocabulary startup trace (diagnosis only): a precreated
+// caller-owned journal, synchronous child-process begin/end observation for the
+// whole runner process (installed before any candidate module loads), and an
+// unref'd event-loop stall observer. Both observations are restored/stopped
+// exactly once when main settles; neither changes Main's behavior.
+const startupTrace = createStartupTrace({ journal: process.env.PRG_SESSION_HOST_WINDOWS_STAGE_JOURNAL, fs });
+startupTrace.stage('runner-start');
+const restoreChildObservation = startupTrace.observeChildProcess(childProcess);
+const stopLoopObservation = startupTrace.observeLoop();
+void main(startupTrace).catch((error) => {
+  startupTrace.stage('main-threw', { errorName: startupTrace.classifyErrorName(error) });
   const resultPath = process.env.PRG_SESSION_HOST_WINDOWS_RESULT;
   if (resultPath) {
     try {
@@ -441,4 +468,7 @@ void main().catch(() => {
     }
   }
   process.exitCode = 1;
+}).finally(() => {
+  stopLoopObservation();
+  restoreChildObservation();
 });

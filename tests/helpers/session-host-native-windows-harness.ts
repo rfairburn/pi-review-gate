@@ -92,6 +92,7 @@ import {
   type NativeExchangeGuardSnapshot,
 } from "./session-host-windows-native-exchange-guard-contract";
 import { NODE_SECURITY_FLOOR_TEXT, stableNodeMeetsSecurityFloor } from "./node-security-floor";
+import { formatWindowsStartupDiagnostic } from "./session-host-windows-startup-trace-contract";
 
 export {
   assertNativeEditorFieldEmpty,
@@ -129,6 +130,8 @@ const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const MAX_WITNESS_BYTES = 1024;
 const MAX_CENSUS_REPLY_BYTES = 4 * 1024;
 const MAX_NATIVE_CENSUS_REPLY_BYTES = 4 * 1024;
+const MAX_STARTUP_TRACE_BYTES = 320 * 1024;
+const MAX_RESULT_BYTES = 16 * 1024;
 const CENSUS_REQUEST_FILENAME = "main-census-request.json";
 const CENSUS_REPLY_FILENAME = "main-census-reply.json";
 const NATIVE_CENSUS_PRELOAD_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-windows-native-stdout-census-preload.cjs");
@@ -817,6 +820,8 @@ export class WindowsMainPtyDriver {
   readonly providerJournal: string;
   readonly ptyJournal: string;
   readonly forceJournal: string;
+  /** Fixed-vocabulary runner startup trace (diagnosis only; see the runner trace fixture). */
+  readonly stageJournal: string;
   readonly surface: TerminalSurface;
   readonly frameSignal = new ChangeSignal();
   readonly outputSignal = new ChangeSignal();
@@ -855,6 +860,12 @@ export class WindowsMainPtyDriver {
   private readonly exitSubscription: { dispose(): void };
   private readonly initialModes: ReturnType<TerminalSurface["inputModes"]>;
   private forced = false;
+  /** Bounded numeric output metadata for the startup diagnostic; never content. */
+  private readonly spawnedAt = performance.now();
+  private dataChunks = 0;
+  private dataChars = 0;
+  private firstDataMs?: number;
+  private lastDataMs?: number;
 
   private constructor(options: {
     pty: NativePtyHandle;
@@ -866,6 +877,7 @@ export class WindowsMainPtyDriver {
     providerJournal: string;
     ptyJournal: string;
     forceJournal: string;
+    stageJournal: string;
     logWatcher: FSWatcher;
     nativeWatcher: FSWatcher;
     providerWatcher: FSWatcher;
@@ -884,6 +896,7 @@ export class WindowsMainPtyDriver {
     this.providerJournal = options.providerJournal;
     this.ptyJournal = options.ptyJournal;
     this.forceJournal = options.forceJournal;
+    this.stageJournal = options.stageJournal;
     this.logWatcher = options.logWatcher;
     this.nativeWatcher = options.nativeWatcher;
     this.providerWatcher = options.providerWatcher;
@@ -934,7 +947,8 @@ export class WindowsMainPtyDriver {
     const providerJournal = join(options.fixtureState, "provider-journal.jsonl");
     const ptyJournal = join(options.root, "pty-events.jsonl");
     const forceJournal = join(options.root, "force-events.jsonl");
-    for (const path of [observerFile, providerJournal, ptyJournal, forceJournal]) writeOwnedFile(path, "");
+    const stageJournal = join(options.root, "runner-stages.jsonl");
+    for (const path of [observerFile, providerJournal, ptyJournal, forceJournal, stageJournal]) writeOwnedFile(path, "");
 
     const args = [
       "--offline", "--no-context-files", "--no-themes", "--no-tools",
@@ -995,6 +1009,7 @@ export class WindowsMainPtyDriver {
       PRG_SESSION_HOST_WINDOWS_RESULT: resultFile,
       PRG_SESSION_HOST_WINDOWS_PTY_JOURNAL: ptyJournal,
       PRG_SESSION_HOST_WINDOWS_FORCE_JOURNAL: forceJournal,
+      PRG_SESSION_HOST_WINDOWS_STAGE_JOURNAL: stageJournal,
       PRG_SESSION_HOST_WINDOWS_PTY_MODULE: options.runtime.ptyModulePath,
       PRG_SESSION_HOST_WINDOWS_BASELINE: WINDOWS_BASELINE,
       PI_REVIEW_GATE_CANDIDATE_ENTRY: options.runtime.candidateEntry,
@@ -1044,6 +1059,7 @@ export class WindowsMainPtyDriver {
         providerJournal,
         ptyJournal,
         forceJournal,
+        stageJournal,
         logWatcher,
         nativeWatcher,
         providerWatcher,
@@ -1071,6 +1087,11 @@ export class WindowsMainPtyDriver {
   }
 
   private onData(data: string): void {
+    const at = performance.now() - this.spawnedAt;
+    this.firstDataMs ??= at;
+    this.lastDataMs = at;
+    this.dataChunks += 1;
+    this.dataChars += data.length;
     this.outputRevision += 1;
     this.outputSignal.notify();
     this.outputTail = (this.outputTail + data).slice(-512 * 1024);
@@ -1151,8 +1172,66 @@ export class WindowsMainPtyDriver {
       return this.frameRevision > after && predicate(this.currentText());
     }, timeoutMs, description).catch((error: unknown) => {
       const tail = this.currentText().split("\n").filter((line) => line.trim()).slice(-12).join(" | ").slice(0, 2_000);
-      throw new Error(`${description}: ${error instanceof Error ? error.message : "bounded frame wait failed"}; frame=${tail}`);
+      throw new Error(`${description}: ${error instanceof Error ? error.message : "bounded frame wait failed"}; frame=${tail}; ${this.startupDiagnostic()}`);
     });
+  }
+
+  /**
+   * Bounded fixed-metadata startup diagnostic (Refs #494): outer exit state,
+   * numeric output/reply counts, the runner's MainResult flags when present,
+   * journal record counts, and the fixed-vocabulary runner startup trace. It
+   * never includes terminal text, argv, environment, paths, or transcripts,
+   * and it asserts no cause. Diagnosis only: it never changes a wait.
+   */
+  startupDiagnostic(): string {
+    try {
+      let result: Record<string, unknown> | undefined | "unreadable";
+      try {
+        const stats = lstatSync(this.resultFile, { bigint: true });
+        if (!stats.isFile() || stats.isSymbolicLink() || stats.size > BigInt(MAX_RESULT_BYTES)) result = "unreadable";
+        else {
+          const parsed: unknown = JSON.parse(readFileSync(this.resultFile, "utf8"));
+          result = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+            ? parsed as Record<string, unknown>
+            : "unreadable";
+        }
+      } catch (error) {
+        result = (error as NodeJS.ErrnoException).code === "ENOENT" ? undefined : "unreadable";
+      }
+      const count = (read: () => readonly unknown[]): number | "unreadable" => {
+        try { return read().length; } catch { return "unreadable"; }
+      };
+      let trace: readonly Record<string, unknown>[] | "unreadable";
+      try {
+        trace = boundedJsonl<Record<string, unknown>>(this.stageJournal, MAX_STARTUP_TRACE_BYTES);
+      } catch {
+        trace = "unreadable";
+      }
+      let pidKnown = false;
+      try { pidKnown = Number.isSafeInteger(Number(this.pty.pid)) && Number(this.pty.pid) > 0; } catch { pidKnown = false; }
+      let baselineVisible = false;
+      try { baselineVisible = frameText(this.surface).includes(WINDOWS_BASELINE); } catch { baselineVisible = false; }
+      return formatWindowsStartupDiagnostic({
+        elapsedMs: performance.now() - this.spawnedAt,
+        outerExit: this.exitEvent,
+        outerPidKnown: pidKnown,
+        dataChunks: this.dataChunks,
+        dataChars: this.dataChars,
+        firstDataMs: this.firstDataMs,
+        lastDataMs: this.lastDataMs,
+        alternateEnter: this.sawAlternateEnter,
+        alternateLeave: this.sawAlternateLeave,
+        baselineVisible,
+        cursorReportReplies: this.replyLog.filter((reply) => /^\x1b\[\d+;\d+R$/u.test(reply)).length,
+        deviceAttributeReplies: this.replyLog.filter((reply) => /^\x1b\[\?[\d;]*c$/u.test(reply)).length,
+        ptySpawnRecords: count(() => this.ptyRecords()),
+        nativeRecords: count(() => this.records()),
+        result,
+        trace,
+      });
+    } catch {
+      return "startup{unavailable}";
+    }
   }
 
   async waitForNative(predicate: (records: NativeJournalRecord[]) => boolean, description: string, timeoutMs = WINDOWS_EVENT_TIMEOUT_MS): Promise<NativeJournalRecord[]> {

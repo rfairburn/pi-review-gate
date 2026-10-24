@@ -362,6 +362,15 @@ test("alpha compiles tests directly and runs only explicit focused test files", 
   assert.match(helper, /node --test dist-test\/tests\/session-host-native-windows-helper-contract\.test\.js/,
     "the pure Windows helper-contract test must run as an explicit compiled file");
 
+  const probeStep = stepOf(job, "Owned ConPTY PowerShell helper console-attachment probe (opt-in, fail-closed)");
+  assert.match(probeStep, /node --test dist-test\/tests\/session-host-native-windows-console-probe\.test\.js/,
+    "the owned ConPTY console-attachment probe must run as an explicit compiled file");
+  assert.match(probeStep, /PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"/,
+    "the console probe must hard-fail on missing Windows prerequisites, never skip");
+  assert.match(probeStep, /^        timeout-minutes: \d+\s*$/m, "the console probe step carries its own active cap");
+  assert.ok(job.indexOf(probeStep) < job.indexOf("      - name: Real public Windows ConPTY Main acceptance (opt-in, fail-closed)"),
+    "the console probe runs alone before, never instead of, the required Main step");
+
   const mainStep = stepOf(job, "Real public Windows ConPTY Main acceptance (opt-in, fail-closed)");
   assert.match(mainStep, /node --test dist-test\/tests\/session-host-native-windows-main\.test\.js/,
     "the opt-in real Main/ConPTY test must run as an explicit compiled file");

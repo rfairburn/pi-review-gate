@@ -168,6 +168,16 @@ jobs:
         # drive-letter and UNC paths on a real Windows host. The macOS/POSIX
         # skip is not Windows proof; this step earns that evidence here.
         run: node --test dist-test/tests/session-host-windows-workspace-completion.test.js
+      - name: Owned ConPTY PowerShell helper console-attachment probe (opt-in, fail-closed)
+        # Diagnosis evidence for Refs #494, never Main acceptance: one fixed
+        # matrix of trusted PowerShell children at the production 10-second cap,
+        # run directly and inside an owned outer ConPTY, with every child settled.
+        # It runs alone, before the Main step, so its timings see no concurrent
+        # ConPTY load; the Main step below stays independently required.
+        timeout-minutes: 6
+        env:
+          PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"
+        run: node --test dist-test/tests/session-host-native-windows-console-probe.test.js
       - name: Real public Windows ConPTY Main acceptance (opt-in, fail-closed)
         # PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST=1 makes every missing
         # Pi/ConPTY/PowerShell prerequisite a hard failure instead of a skip.

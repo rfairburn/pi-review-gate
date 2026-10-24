@@ -1993,7 +1993,7 @@ test("a bounded paste pages atomically, preserves Unicode, and refuses one byte 
 	await deadlined(viewer.stop(), "stop");
 });
 
-test("logical inputs are ordered, bounded at four pending operations, and never interleave pages", async () => {
+test("logical inputs are ordered, bounded at 32 pending operations, and never interleave pages", async () => {
 	const channel = new FakeContentChannel();
 	scriptOwner(channel, { ackNativeIo: true });
 	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
@@ -2004,22 +2004,35 @@ test("logical inputs are ordered, bounded at four pending operations, and never 
 
 	channel.holdSend = true;
 	const paste = "\u4e16\u754c".repeat(20_000);
-	const first = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "paste", text: paste });
-	const second = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "b" });
-	const third = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "c" });
-	const fourth = viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "d" });
+	// One paged operation opens the queue, then 30 keyboard packets, then a mouse
+	// packet as the 32nd: operations 5 through 32 are the ones the former bound of
+	// four refused, and a page never consumes more than its own one slot.
+	const requests: SessionContentViewerInputRequest[] = [
+		{ source, inputModes: INPUT_MODES, kind: "paste", text: paste },
+		...Array.from({ length: 30 }, (_unused, index): SessionContentViewerInputRequest => ({
+			source,
+			inputModes: INPUT_MODES,
+			kind: "keyboard",
+			text: `q${index}`,
+		})),
+		{ source, inputModes: INPUT_MODES, kind: "mouse", text: "\x1b[<0;5;3M" },
+	];
+	assert.equal(requests.length, 32);
+	const pending = requests.map((request) => viewer.sendInput(request));
 	await settle();
+	const bytesBeforeRefusal = channel.sent.length;
 	assert.deepEqual(
-		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "e" }),
+		await viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "keyboard", text: "over-bound" }),
 		{ status: "not-sent", reason: "busy" },
-		"the fifth logical operation is refused while four are pending",
+		"the 33rd logical operation is refused while 32 are pending",
 	);
+	assert.equal(channel.sent.length, bytesBeforeRefusal, "the refused operation writes not a single byte");
 	const started = channel.types().slice(before).filter((type) => type === "input_begin" || type === "input");
-	assert.equal(started.length, 1, "only the first frame of the first operation reached the transport");
+	assert.deepEqual(started, ["input_begin"], "only the first frame of the first operation reached the transport");
 
 	channel.releaseSends();
-	for (const pending of [first, second, third, fourth]) {
-		assert.deepEqual(await deadlined(pending, "queued input"), { status: "submitted" });
+	for (const [index, operation] of pending.entries()) {
+		assert.deepEqual(await deadlined(operation, `queued input ${index + 1}`), { status: "submitted" });
 	}
 	const frames = channel.frames().slice(before);
 	const types = frames.map((frame) => frame.type);
@@ -2028,9 +2041,24 @@ test("logical inputs are ordered, bounded at four pending operations, and never 
 	assert.equal(types[0], "input_begin");
 	assert.ok(types.slice(1, endIndex).every((type) => type === "input_chunk"),
 		"the paste's pages are contiguous");
-	assert.deepEqual(types.slice(endIndex + 1), ["input", "input", "input"],
-		"each later input is one inline packet after the paste finished, never interleaved");
+	const inline = frames.slice(endIndex + 1);
+	assert.equal(inline.length, 31, "each later operation is exactly one inline packet after the paste finished");
+	assert.ok(inline.every((frame) => frame.type === "input"),
+		"no later operation's pages interleave with another operation's");
+	inline.forEach((frame, index) => {
+		if (frame.type !== "input") throw new Error("unreachable");
+		const expected = requests[index + 1];
+		assert.equal(frame.kind, expected.kind, `packet ${index + 2} keeps its own kind`);
+		assert.deepEqual(Buffer.from(frame.data, "base64").toString("utf8"), expected.text,
+			`packet ${index + 2} keeps its own payload in call order`);
+		assert.equal(frame.ordinal, index + 2, "ordinals stay contiguous and in call order across the whole bound");
+		assert.equal(frame.subscriptionId, viewer.subscriptionId);
+	});
+	assert.deepEqual(inline.map((frame) => (frame.type === "input" ? frame.ordinal : -1)),
+		Array.from({ length: 31 }, (_unused, index) => index + 2),
+		"the refused 33rd consumed no ordinal and no packet was replayed");
 	assert.equal(types.filter((type) => type === "input_end").length, 1, "no page is replayed");
+	assert.equal(types.filter((type) => type === "input_begin").length, 1, "the paste began exactly once");
 	await deadlined(viewer.stop(), "stop");
 });
 

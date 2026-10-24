@@ -15,6 +15,27 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.197]
+
+### Changed
+
+- Raised the session-content viewer's finite queued-send bound from 4 to 32 as a first
+  bounded trial for reported remote-input refusals (#500). One shared internal constant
+  bounds both sequential control writes (hello, subscribe, resize, unsubscribe, and one
+  error) and pending logical input operations, so one viewer now admits up to 32 pending
+  operations and 32 queued control writes before refusing. The size is an explicit sizing
+  assumption, not a measured mapping: normalized terminal packets are assumed to arrive at
+  60-120 per second (browser input guidance describes about 100 Hz mouse input, 60-120 Hz
+  touch, and frame-aligned continuous wheel dispatch), which covers roughly 0.27-0.53
+  seconds of arrivals with no drain, and each slot is released as its own send settles.
+  Refusal behaviour is unchanged and stays fail-closed: an operation above the bound is
+  refused as busy with not a single byte written, oversized pastes are still refused as too
+  large, an invoked-but-unsettled write is still reported as unknown, and one operation's
+  pages still never interleave with another's. This is an experimental capacity change
+  under investigation, not a fix: the cause behind #500 is not established here and no
+  incident resolution is claimed. The threshold is internal and carries no documented
+  numeric contract, so no public documentation changes.
+
 ## [0.1.0-dev.196]
 
 ### Fixed

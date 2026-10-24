@@ -335,8 +335,23 @@ export interface SessionContentViewer {
 	stop(): Promise<void>;
 }
 
-/** Queued control writes: hello, subscribe, resize, unsubscribe, and one error. */
-const MAX_QUEUED_CONTROL_SENDS = 4;
+/**
+ * Queued control writes: hello, subscribe, resize, unsubscribe, and one error.
+ * The same finite bound governs pending logical input operations.
+ *
+ * The size is an explicit sizing assumption, not a measured mapping. The browser
+ * input reference (https://developer.chrome.com/blog/aligning-input-events/)
+ * describes mouse input at roughly 100 Hz, touch at 60–120 Hz, and continuous
+ * wheel dispatch aligned to frames; normalized terminal packets are assumed to
+ * arrive at 60–120 per second, so 32 slots cover roughly 0.27–0.53 s of arrivals
+ * with no drain at all, and each slot is released as its own send settles. This
+ * is a capacity choice for one viewer on one binding, not a universal flick
+ * count: the parser forwards one normalized packet per logical operation and
+ * never carries a scroll-delta magnitude. Admission stays fail-closed — an
+ * operation above the bound is refused as `busy` before anything is queued or
+ * written, and a control backlog still refuses further queueing.
+ */
+const MAX_QUEUED_CONTROL_SENDS = 32;
 
 type ViewerState = "awaiting_ack" | "subscribing" | "streaming";
 

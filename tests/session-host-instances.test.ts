@@ -4861,7 +4861,7 @@ function geometryOf(harness: FramingHarness, row: FramingRow): { cols: number; r
   return geometry;
 }
 
-/** Pi 1.3.0's documented default `app.message.copy` binding (Ctrl+X). */
+/** Pi 1.4.0's documented default `app.message.copy` binding (Ctrl+X). */
 const CTRL_X = "\x18";
 /**
  * One ordinary child VT negotiation of a fully negotiated input-mode state: Kitty

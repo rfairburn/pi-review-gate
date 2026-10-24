@@ -83,7 +83,7 @@ export interface FakeHost {
   invokeTool: (name: string, params: Record<string, unknown>, ctx: unknown) => Promise<{ result?: any; decisions: unknown[] }>;
 }
 
-/** Minimal but complete Pi 1.3.0-style host surface used by both extensions. */
+/** Minimal but complete Pi 1.4.0-style host surface used by both extensions. */
 export function createFakeHost(): FakeHost {
   const hooks = new Map<string, Array<(...args: any[]) => unknown>>();
   const tools = new Map<string, FakeHostTool>();

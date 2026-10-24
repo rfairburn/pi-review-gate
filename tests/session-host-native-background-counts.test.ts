@@ -3,7 +3,7 @@
  * orchestrating parent runs this test).
  *
  * This test is intended to prove one complete owned row lifecycle for a real background shell in
- * the real public Main API with a pinned real Pi 1.3.0 runtime and a real
+ * the real public Main API with a pinned real Pi 1.4.0 runtime and a real
  * native child:
  *
  *   known 0 shells  ->  1 live owned shell  ->  0 known shells (settled)

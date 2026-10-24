@@ -3,7 +3,7 @@
  * outer PTY. Ghostty environment markers are controlled protocol evidence
  * only; this test does not claim a physical Ghostty display.
  *
- * Each Pi 1.3.0 regular/fullscreen run creates two independent native children
+ * Each Pi 1.4.0 regular/fullscreen run creates two independent native children
  * and conversations. The pinned `/host-image-proof red|blue` fixture emits a
  * genuine installed pi-tui Image with distinct constant PNG bytes and the same
  * child image ID in both processes. A small test-only trace observes the real

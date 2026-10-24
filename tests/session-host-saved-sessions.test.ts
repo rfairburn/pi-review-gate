@@ -1918,27 +1918,27 @@ test("saved-file deletion matches trash-first status/gone semantics and revalida
 async function loadNativeSessionSelectorSearch(
   t: TestContext,
 ): Promise<NativeSessionSelectorSearch | undefined> {
-  let reason = "no installed Pi 1.3.0 native session-selector search module is available";
+  let reason = "no installed Pi 1.4.0 native session-selector search module is available";
   for (const agentDir of findInstalledAgentDirs()) {
     try {
       const manifest = JSON.parse(await readFile(join(agentDir, "package.json"), "utf8")) as {
         name?: unknown;
         version?: unknown;
       };
-      if (manifest.name !== PI_PACKAGE_NAME || manifest.version !== "1.3.0") continue;
+      if (manifest.name !== PI_PACKAGE_NAME || manifest.version !== "1.4.0") continue;
       const searchModulePath = join(agentDir, "dist", "modes", "interactive", "components", "session-selector-search.js");
       if (!existsSync(searchModulePath)) continue;
       const loaded = createRequire(join(agentDir, "package.json"))(searchModulePath) as Partial<NativeSessionSelectorSearch>;
       if (typeof loaded.filterAndSortSessions === "function") return loaded as NativeSessionSelectorSearch;
     } catch {
-      reason = "the installed Pi 1.3.0 native session-selector search module could not be loaded";
+      reason = "the installed Pi 1.4.0 native session-selector search module could not be loaded";
     }
   }
   skipOrFail(t, reason);
   return undefined;
 }
 
-test("branded saved catalog search matches the actual pinned Pi 1.3.0 native matcher", async (t) => {
+test("branded saved catalog search matches the actual pinned Pi 1.4.0 native matcher", async (t) => {
   const nativeSearch = await loadNativeSessionSelectorSearch(t);
   if (!nativeSearch) return;
 

@@ -85,7 +85,7 @@ import { withTimeout } from "./session-host-network-helpers";
  * - the persisted roster store: the same in-memory synthetic ownership handle
  *   the existing Main remote-create case uses (no roster is restored);
  * - the resolved Pi facts: the exact pinned CLI path and version this case
- *   positively read from the installed 1.3.0 package manifest;
+ *   positively read from the installed 1.4.0 package manifest;
  * - the requester's local PTY factory: it refuses and records any spawn, so a
  *   remote Resume can never hide a requester child;
  * - pass-through recorders around the requester's Local Saved listing and
@@ -100,7 +100,7 @@ import { withTimeout } from "./session-host-network-helpers";
  * OWNER: one real peer coordinator with the real `/app` TLS listener, real
  * identities, pins, and directional receiving grant, over ONE real
  * `createLocalOwningHostService` and its ONE real InstanceManager on a real
- * owned PTY running the installed, unmodified pinned Pi 1.3.0 CLI. Its Saved
+ * owned PTY running the installed, unmodified pinned Pi 1.4.0 CLI. Its Saved
  * provider is the production `createNativeSavedCatalogView` over the owning
  * service and native listing inputs, using its default production
  * `listSavedSessions` and public SDK (not Main's owner-side listing adapter): no injected
@@ -127,7 +127,7 @@ import { withTimeout } from "./session-host-network-helpers";
 const OUTER_COLS = 240;
 const OUTER_ROWS = 48;
 const OWNER_LABEL = "Owner host";
-const PI_VERSION = "1.3.0";
+const PI_VERSION = "1.4.0";
 const REMOTE_DISPLAY_UNAVAILABLE = "The selected remote session's display is unavailable";
 const TRASH_SUCCESS_NOTICE = "Saved conversation moved to trash";
 
@@ -192,7 +192,7 @@ function hasDrawnSavedRow(text: string, caption: string, workspace: string): boo
   });
 }
 
-/** One native-valid saved conversation in the current public Pi 1.3.0 file shape. */
+/** One native-valid saved conversation in the current public Pi 1.4.0 file shape. */
 function writeSavedConversation(
   agentDir: string,
   workspace: string,
@@ -284,7 +284,7 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
     const packageRoot = findInstalledAgentDirs().find((path) => {
       try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === PI_VERSION; } catch { return false; }
     });
-    if (!packageRoot) { skipOrFail(t, "installed native Pi 1.3.0 is required"); return; }
+    if (!packageRoot) { skipOrFail(t, "installed native Pi 1.4.0 is required"); return; }
     const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { bin: { pi: string }; version: string };
     assert.equal(manifest.version, PI_VERSION);
     const cli = realpathSync(join(packageRoot, manifest.bin.pi));

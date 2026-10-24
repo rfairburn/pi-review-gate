@@ -10,7 +10,7 @@ import { NODE_SECURITY_FLOOR_TEXT, stableNodeMeetsSecurityFloor } from "./node-s
 /**
  * Bounded test-only companion for the real native row-lifecycle acceptance
  * (tests/session-host-native-row-lifecycle.test.ts). It carries the POSIX
- * admission gate and the public Pi 1.3.0 pin contract for that one test:
+ * admission gate and the public Pi 1.4.0 pin contract for that one test:
  * macOS and Linux share the same node-pty plus kqueue/pidfd exit-watcher
  * machinery, so Windows is the only platform skipped (ConPTY remains a
  * separate acceptance). The pin resolution mirrors resolveRuntimePin's public
@@ -67,8 +67,8 @@ export function resolveRowLifecycleRuntimePin(t: { skip(message?: string): void 
     admission.skip("explicit installed Pi package, Node CLI, and version pins are required");
     return undefined;
   }
-  if (expectedVersion !== "1.3.0") {
-    admission.skip("this native row-lifecycle phase pins Pi 1.3.0");
+  if (expectedVersion !== "1.4.0") {
+    admission.skip("this native row-lifecycle phase pins Pi 1.4.0");
     return undefined;
   }
 
@@ -82,7 +82,7 @@ export function resolveRowLifecycleRuntimePin(t: { skip(message?: string): void 
     return undefined;
   }
   if (packageInfo.name !== "@earendil-works/pi-coding-agent" || packageInfo.version !== expectedVersion) {
-    admission.skip("the explicit runtime pin is not the expected @earendil-works/pi-coding-agent 1.3.0 package");
+    admission.skip("the explicit runtime pin is not the expected @earendil-works/pi-coding-agent 1.4.0 package");
     return undefined;
   }
 

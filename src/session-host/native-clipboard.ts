@@ -21,7 +21,7 @@ const PREFIX = "prg-native-copy-v1;";
 const PREFIX_V2 = "prg-native-copy-v2;";
 const DOMAIN_V1 = "pi-review-gate/native-copy/v1\0";
 const DOMAIN_V2 = "pi-review-gate/native-copy/v2\0";
-const MAX_ENCODED = 100_000; // Pi 1.3.0's native OSC 52 limit.
+const MAX_ENCODED = 100_000; // Pi 1.3.0 and 1.4.0's native OSC 52 limit.
 const MAX_CAPSULE = 140_000;
 /** Opaque viewer-token bound, identical to the accepted native-input codec's. */
 const MAX_INPUT_ORIGIN_TOKEN_CHARS = 128;
@@ -326,9 +326,14 @@ export function resolveNativeClipboardRuntime(cli: string): NativeClipboardRunti
         try {
           const peerRoot = dirname(dirname(realpathSync(createRequire(entry).resolve("@earendil-works/pi-tui"))));
           const peer = readManifest(join(peerRoot, "package.json"));
-          if (peer?.name === "@earendil-works/pi-tui" && peer.version === "1.3.0") tuiRoot = peerRoot;
+          if (peer?.name === "@earendil-works/pi-tui"
+            && (peer.version === "1.3.0" || peer.version === "1.4.0")) tuiRoot = peerRoot;
         } catch { /* Bundled runtime needs no separate peer. */ }
-        return { root: dir, ...(tuiRoot ? { tuiRoot } : {}), supported: manifest.version === "1.3.0" };
+        return {
+          root: dir,
+          ...(tuiRoot ? { tuiRoot } : {}),
+          supported: manifest.version === "1.3.0" || manifest.version === "1.4.0",
+        };
       }
       const parent = dirname(dir);
       if (parent === dir) break;
@@ -373,7 +378,7 @@ export function isNativeClipboardOrigin(
       return path !== undefined && (nativeSource(runtime, frame.scriptName)
         || (runtime.tuiRoot !== undefined && path === join(runtime.tuiRoot, "dist", "tui-alt-screen.js")));
     });
-  // The shipped 1.3.0 bundle names its self-referencing class _InteractiveMode;
+  // The shipped 1.3.0 and 1.4.0 bundles name their self-referencing class _InteractiveMode;
   // the unbundled public SDK uses InteractiveMode. Both were source-verified.
   const mainCopy = frames.some((frame) => (frame.functionName === "InteractiveMode.handleCopyCommand"
     || frame.functionName === "_InteractiveMode.handleCopyCommand") && nativeSource(runtime, frame.scriptName));

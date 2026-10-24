@@ -2354,6 +2354,117 @@ test("a valid cached runtime is reused without any npm invocation", async (t) =>
   }
 });
 
+// The managed default moved to a new Pi release. A completed discovery written
+// under the older default must not silently keep that older runtime in use,
+// while an explicit selection of that same older generation keeps reusing its
+// completed discovery and nothing is purged.
+const STALE_MANAGED_PI_VERSION = "1.3.0";
+
+/**
+ * Write exactly the record a previous build's writer produced for its own
+ * implicit managed default: the same selection key fields and file identity, and
+ * no identity for the build's provisioned pin.
+ */
+function seedManagedDefaultDiscovery(fixture: RuntimeFixture, env: NodeJS.ProcessEnv, version: string, entry: string, versionRoot: string): string {
+  const stateRoot = join(fixture.agentDir, ".pi-review-gate", "application");
+  mkdirSync(stateRoot, { recursive: true });
+  const stats = lstatSync(entry, { bigint: true });
+  const marker = join(stateRoot, "pi-runtime.json");
+  writeFileSync(marker, JSON.stringify({
+    schema: 1,
+    platform: process.platform,
+    explicit: null,
+    path: String(env.PATH ?? ""),
+    cwd: fixture.root,
+    pathSelection: launcher.__test.findPiOnPath(env) ?? null,
+    file: entry,
+    identity: {
+      dev: stats.dev.toString(),
+      ino: stats.ino.toString(),
+      size: stats.size.toString(),
+      mtimeNs: stats.mtimeNs.toString(),
+    },
+    version,
+    source: "isolated-cache",
+    managedRoot: versionRoot,
+    completedAt: new Date().toISOString(),
+  }), "utf8");
+  return marker;
+}
+
+/**
+ * A managed Pi package whose CLI never answers `--version`. Only a completed
+ * discovery can select it, so a reuse is observed rather than implied.
+ */
+function writeSilentPiPackage(pkgDir: string, version: string): string {
+  const entry = join(pkgDir, "dist", "bundle", "cli.js");
+  mkdirSync(join(pkgDir, "dist", "bundle"), { recursive: true });
+  writeFileSync(join(pkgDir, "package.json"), JSON.stringify({
+    name: launcher.PI_PACKAGE_NAME,
+    version,
+    bin: { pi: "dist/bundle/cli.js" },
+  }), "utf8");
+  writeFileSync(entry, "#!/usr/bin/env node\nprocess.exit(1);\n", "utf8");
+  chmodSync(entry, 0o755);
+  return entry;
+}
+
+test("a stale implicit managed-default discovery never keeps the older pinned runtime", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-pi-discovery-stale-pin-");
+  cleanupFixture(t, fixture);
+  assert.notEqual(STALE_MANAGED_PI_VERSION, launcher.PI_PROVISION_VERSION,
+    "this regression requires the managed default to have moved");
+  const versionRoot = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${STALE_MANAGED_PI_VERSION}`);
+  const staleEntry = writePiPackage(join(versionRoot, "node_modules", "@earendil-works", "pi-coding-agent"), STALE_MANAGED_PI_VERSION);
+  writeFakeNpm(fixture, "install");
+  const env = runtimeEnv(fixture);
+  const marker = seedManagedDefaultDiscovery(fixture, env, STALE_MANAGED_PI_VERSION, staleEntry, versionRoot);
+
+  const result = await launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
+  assert.equal(result.source, "isolated-cache");
+  assert.equal(result.version, launcher.PI_PROVISION_VERSION,
+    "the stale implicit fallback resolves to the current managed default, not the recorded release");
+  assert.notEqual(result.file, staleEntry, "the older managed generation is never silently reused");
+  assert.ok(result.file.startsWith(join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`)));
+  assert.equal(existsSync(staleEntry), true, "the older generation is preserved on disk, never purged");
+
+  const npmLines = () => readFileSync(fixture.npmLog, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { args: string[] });
+  assert.ok(npmLines().some(({ args }) => args[0] === "install"
+    && args.includes(`${launcher.PI_PACKAGE_NAME}@${launcher.PI_PROVISION_VERSION}`)),
+  "the current pin is actually provisioned for the stale implicit selection");
+
+  const record = JSON.parse(readFileSync(marker, "utf8")) as { version: string; source: string };
+  assert.equal(record.source, "isolated-cache");
+  assert.equal(record.version, launcher.PI_PROVISION_VERSION, "the completed discovery was republished for the current pin");
+
+  const beforeWarm = npmLines().length;
+  const warm = await launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
+  assert.equal(warm.file, result.file, "the current pin is a warm reuse");
+  assert.equal(npmLines().length, beforeWarm, "the warm reuse performs no additional npm work");
+});
+
+test("an explicit selection of an older managed runtime still reuses its completed discovery", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-pi-discovery-explicit-old-");
+  cleanupFixture(t, fixture);
+  const versionRoot = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${STALE_MANAGED_PI_VERSION}`);
+  const entry = writeSilentPiPackage(join(versionRoot, "node_modules", "@earendil-works", "pi-coding-agent"), STALE_MANAGED_PI_VERSION);
+  writeFakeNpm(fixture, "install");
+  const env = runtimeEnv(fixture);
+
+  // Without a completed discovery this runtime cannot be selected at all: its
+  // CLI answers no version probe. Anything that resolves it below reuses.
+  await assert.rejects(
+    () => launcher.__test.resolvePiRuntime({ explicit: entry, env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined }),
+    /the pi version probe exited with status/u, "an unrecorded older managed runtime fails its version probe",
+  );
+
+  seedManagedDefaultDiscovery(fixture, env, STALE_MANAGED_PI_VERSION, entry, versionRoot);
+  const resolved = await launcher.__test.resolvePiRuntime({ explicit: entry, env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
+  assert.equal(resolved.file, entry, "the explicitly selected older runtime still resolves");
+  assert.equal(resolved.version, STALE_MANAGED_PI_VERSION, "an explicit older selection is not upgraded");
+  assert.equal(existsSync(fixture.npmLog), false, "an explicit selection runs no npm work at all");
+});
+
 test("an invalid cached runtime is preserved and fails closed", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-badcache-");
   cleanupFixture(t, fixture);

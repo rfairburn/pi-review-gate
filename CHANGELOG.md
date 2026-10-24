@@ -24,7 +24,11 @@ dates.
   existing authenticated decoder, instead of reading printable native-input frames
   directly. The configured editor and Pi's draft-return behavior are preserved;
   save, quit-without-save, and failure return input to Pi without disabling framing
-  or widening viewer authorization.
+  or widening viewer authorization. The handoff is enabled on every operating system,
+  including Windows' shell-based launch through the pinned ConPTY surface; there is no
+  OS allowlist. General enablement tests run in the Windows launcher CI step too. The
+  installed-Pi Windows RPC smoke allows 90 seconds for cold startup (other platforms
+  retain 30 seconds), without changing product shutdown deadlines.
 
 ## [0.1.0-dev.195]
 

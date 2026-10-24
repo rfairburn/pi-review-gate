@@ -29,9 +29,15 @@ import type { SessionHostBootstrap } from "../src/session-host/protocol";
  * Two layers live here. The strict framed stdin's editor ROUTING: exactly one sink
  * per logical dispatch, captured at dispatch start, invalidated across entry and
  * retirement, no raw fallback, and a routing change that never resets the decoder.
- * The spawn ADAPTER: audited launcher provenance only, the exact inherited-stdio
- * shape only, fail-closed refusals before any process exists, and a settlement that
- * only the owned editor's own positive exit may produce.
+ * The spawn ADAPTER: audited launcher provenance only, the exact inherited-stdio shape
+ * for this platform only (the shell shape Pi launches with on Windows, the plain
+ * inherited shape on POSIX), fail-closed refusals before any process exists, and a
+ * settlement that only the owned editor's own positive exit may produce.
+ *
+ * The Windows cases are mocked-platform source regressions: they pin the launch shape,
+ * the interpreter resolution, the command line handed to the owned ConPTY, the byte-for-
+ * byte input write, and the settlement/stop semantics. They run on any host and are not
+ * native Windows runtime evidence.
  *
  * No real PTY, no Pi, and no live `dist/` here; the process-level suite in
  * `session-host-native-editor-handoff-process.test.ts` drives the installed
@@ -361,6 +367,8 @@ test("routing: the same native tuple across entry and retirement still changes t
 interface FakePty {
   pty: EditorPtySurface;
   writes: Buffer[];
+  /** Exactly what the sink handed the surface, so a byte-for-byte write is observable. */
+  raw: Array<Buffer | string>;
   resizes: Array<{ cols: number; rows: number }>;
   kills: Array<string | undefined>;
   emitData(chunk: string): void;
@@ -373,6 +381,7 @@ interface FakePty {
 
 function fakePty(options: { throwOnExit?: boolean; throwOnData?: boolean; noWitness?: boolean } = {}): FakePty {
   const writes: Buffer[] = [];
+  const raw: Array<Buffer | string> = [];
   const resizes: Array<{ cols: number; rows: number }> = [];
   const kills: Array<string | undefined> = [];
   const data: Array<(chunk: string) => void> = [];
@@ -382,7 +391,7 @@ function fakePty(options: { throwOnExit?: boolean; throwOnData?: boolean; noWitn
   const disposable = (): { dispose(): void } => ({ dispose: () => { disposed += 1; } });
   const pty = {
     pid: 4242,
-    write(data: Buffer) { writes.push(Buffer.from(data)); },
+    write(data: Buffer | string) { raw.push(data); writes.push(Buffer.from(data)); },
     resize(cols: number, rows: number) { resizes.push({ cols, rows }); },
     kill(signal?: string) { kills.push(signal); },
     onData(listener: (chunk: string) => void) {
@@ -408,7 +417,7 @@ function fakePty(options: { throwOnExit?: boolean; throwOnData?: boolean; noWitn
     },
   } as unknown as EditorPtySurface;
   return {
-    pty, writes, resizes, kills,
+    pty, writes, raw, resizes, kills,
     emitData: (chunk) => { for (const listener of [...data]) listener(chunk); },
     emitExit: (exitCode, signal) => { for (const listener of [...exits]) listener({ exitCode, signal }); },
     emitError: () => { for (const listener of [...errors]) listener(new Error("pty read")); },
@@ -461,7 +470,7 @@ const childProcess = require("node:child_process") as { spawn: unknown };
 const originalSpawn = childProcess.spawn;
 const nodeModule = require("node:module") as { syncBuiltinESMExports?(): void };
 
-function newHarness(options: { pty?: { throwOnExit?: boolean; throwOnData?: boolean; noWitness?: boolean }; ptyFactoryThrows?: boolean; sinkThrows?: boolean; supported?: boolean } = {}): Harness {
+function newHarness(options: { pty?: { throwOnExit?: boolean; throwOnData?: boolean; noWitness?: boolean }; ptyFactoryThrows?: boolean; sinkThrows?: boolean; supported?: boolean; platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv } = {}): Harness {
   const root = mkdtempSync(join(tmpdir(), "prg-editor-handoff-"));
   mkdirSync(join(root, "dist", "modes", "interactive"), { recursive: true });
   mkdirSync(join(root, "dist", "bundle", "chunks"), { recursive: true });
@@ -523,6 +532,10 @@ export async function editInExternalEditor(command, args, filePath, options) {
     editorActive: () => instance.active(),
     setEditorSink: (sink) => { if (options.sinkThrows) throw new Error("route failed"); sinks.push(sink); },
     writeStdout: (chunk) => { relays.push(typeof chunk === "string" ? chunk : chunk.toString("utf8")); return true; },
+    // Pinned so a POSIX case is a POSIX case and a Windows case is a Windows case on
+    // whatever host the suite runs on; the environment is only ever read here.
+    platform: options.platform ?? "linux",
+    env: options.env ?? process.env,
     stdin: instance.stdin as never,
     stdout: instance.stdout as never,
     stderr: { write: (chunk: string) => { notices.push(chunk); return true; } },
@@ -842,17 +855,212 @@ test("adapter: terminal state is restored to what the launch actually found", as
   assert.equal(harness.stdin.paused, false, "and the stream was already flowing");
 });
 
-test("adapter: not installed on a platform whose launcher shape differs", () => {
+test("adapter: no operating system is excluded — the adapter installs everywhere and the generic path takes the launch over", async (t) => {
+  // Installing is never gated on the operating system. Only launcher provenance, runtime
+  // support, the launch shape Pi itself produces, and the PTY/TTY capability of THIS
+  // process can refuse a launch, and each of those refuses one launch closed.
   childProcess.spawn = originalSpawn;
-  assert.equal(installNativeEditorHandoff({
+  const installed = installNativeEditorHandoff({
     runtime: { root: "/nonexistent", supported: true },
     editorActive: () => false,
     setEditorSink: () => undefined,
     writeStdout: () => true,
-    platform: "win32",
+    platform: "sunos",
     ptyFactory: () => fakePty().pty,
-  }), false);
-  assert.equal(childProcess.spawn, originalSpawn, "child_process.spawn untouched");
+  });
+  t.after(() => {
+    childProcess.spawn = originalSpawn;
+    nodeModule.syncBuiltinESMExports?.();
+  });
+  assert.equal(installed, true, "a platform with no dedicated code path still gets the adapter");
+  assert.notEqual(childProcess.spawn, originalSpawn, "and child_process.spawn is patched there too");
+
+  // That platform takes the generic path: the audited launcher gets its own PTY with its
+  // configured argv verbatim, and no Windows shell wiring appears in its launch.
+  const harness = newHarness({ platform: "sunos" });
+  t.after(harness.cleanup);
+  const editor = await harness.launch("dist/modes/interactive/external-editor.mjs", AUDIT_BODY);
+  const pending = editor.call("/usr/bin/an-editor", ["--flag"], "/tmp/prompt.md");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.real.length, 0, "the inherited launch never reached the real spawn");
+  assert.equal(harness.descriptors.length, 1, "the launch was taken over");
+  assert.equal(harness.descriptors[0]!.file, "/usr/bin/an-editor");
+  assert.deepEqual(harness.descriptors[0]!.args, ["--flag", "/tmp/prompt.md"]);
+  assert.equal(harness.descriptors[0]!.commandLine, undefined, "no shell command line where Pi uses no shell");
+  assert.equal(harness.descriptors[0]!.useConptyDll, undefined, "and no ConPTY option outside Windows");
+  harness.ptys[0]!.emitExit(0);
+  assert.equal(await pending, 0);
+});
+
+/* ------------------------------------------------------------------------- *
+ * Windows: the shell launch Pi actually performs, on the owned PTY
+ * ------------------------------------------------------------------------- */
+
+/** A Windows-shaped environment: the interpreter is configured, never inferred here. */
+const WINDOWS_ENV: NodeJS.ProcessEnv = Object.freeze({
+  ComSpec: "C:\\Windows\\System32\\cmd.exe",
+  SystemRoot: "C:\\Windows",
+  PATH: "C:\\Tools\\bin;C:\\Windows\\System32",
+  TERM: "xterm-256color",
+}) as NodeJS.ProcessEnv;
+
+/** Pi's own result file path on Windows, and the shell launch its code produces. */
+const WIN_FILE = "C:\\Users\\test\\AppData\\Local\\Temp\\pi-editor-Aa1Bb2\\prompt.md";
+const WIN_OPTIONS = { stdio: "inherit", shell: true };
+
+function windowsHarness(env: NodeJS.ProcessEnv = WINDOWS_ENV): Harness {
+  return newHarness({ platform: "win32", env });
+}
+
+test("windows: the shell launch Pi performs there is taken over with Pi's own command line", async (t) => {
+  const harness = windowsHarness();
+  t.after(harness.cleanup);
+  const editor = await harness.launch("dist/modes/interactive/external-editor.mjs", `(() => {
+    const child = spawn(command, [...args, filePath], options ?? { stdio: "inherit", shell: true });
+    globalThis.__prgEditorChild = child;
+    return child;
+  })()`);
+  const pending = editor.call("the-configured-editor", ["--flag", "spaced arg"], WIN_FILE, WIN_OPTIONS) as Promise<unknown>;
+  await new Promise((resolve) => setImmediate(resolve));
+  const child = (globalThis as Record<string, unknown>).__prgEditorChild as {
+    spawnfile: string; spawnargs: string[];
+  };
+
+  assert.equal(harness.real.length, 0, "the inherited shell launch never reached the real spawn");
+  assert.equal(harness.descriptors.length, 1, "the launch was taken over");
+  const descriptor = harness.descriptors[0]!;
+  assert.equal(descriptor.file, "C:\\Windows\\System32\\cmd.exe", "the interpreter Node's shell:true would have run");
+  assert.deepEqual(descriptor.args, [], "the command line is handed over verbatim, not re-quoted as argv");
+  assert.equal(descriptor.commandLine, `/d /s /c "the-configured-editor --flag spaced arg ${WIN_FILE}"`,
+    "the same switches and the same verbatim command join Node hands cmd.exe");
+  assert.equal(descriptor.useConptyDll, true, "the pinned ConPTY transport this package already uses");
+  assert.equal(descriptor.env.PATH, WINDOWS_ENV.PATH, "the configured environment is handed over unchanged");
+  assert.equal(descriptor.env.ComSpec, WINDOWS_ENV.ComSpec);
+  assert.deepEqual(child.spawnfile, "the-configured-editor", "the launcher still sees Pi's own command");
+  assert.deepEqual(child.spawnargs, ["--flag", "spaced arg", WIN_FILE], "and Pi's own arguments including the result file");
+
+  assert.equal(harness.sinks.length, 1, "the route entered exactly once");
+  assert.notEqual(harness.sinks[0], undefined, "and it is the editor that owns verified bytes");
+  assert.equal(harness.stdin.isRaw, true, "this process's own terminal stops echoing and buffering frames");
+  assert.equal(harness.stdout.handlerCount(), 1);
+
+  const fake = harness.ptys[0]!;
+  harness.sinks[0]!.write(Buffer.from("i\rh\u00e9llo\x1b", "utf8"));
+  assert.equal(Buffer.compare(fake.writes[0]!, Buffer.from("i\rh\u00e9llo\x1b", "utf8")), 0);
+  fake.emitData("editor screen\r\n");
+  assert.deepEqual(harness.relays, ["editor screen\r\n"], "editor output relays through the original stdout writer");
+  fake.emitExit(0);
+  assert.equal(await pending, 0, "the shell's exit code reaches the launcher as Pi reads it");
+  assert.deepEqual(harness.sinks[1], undefined, "ownership retired before the launcher resumed");
+  assert.equal(harness.stdin.isRaw, false, "and this process's terminal mode is restored");
+  delete (globalThis as Record<string, unknown>).__prgEditorChild;
+});
+
+test("windows: the configured interpreter is used as configured, and one this module cannot name or locate fails the edit closed", async (t) => {
+  const cases: Array<{ name: string; env: NodeJS.ProcessEnv; expected: string | undefined }> = [
+    { name: "absolute ComSpec", env: { ComSpec: "C:\\Windows\\SysWOW64\\cmd.exe" }, expected: "C:\\Windows\\SysWOW64\\cmd.exe" },
+    { name: "UNC ComSpec", env: { ComSpec: "\\\\buildserver\\tools\\cmd.exe" }, expected: "\\\\buildserver\\tools\\cmd.exe" },
+    { name: "bare ComSpec with SystemRoot", env: { ComSpec: "cmd.exe", SystemRoot: "D:\\Win" }, expected: "D:\\Win\\System32\\cmd.exe" },
+    { name: "bare ComSpec with no extension", env: { ComSpec: "cmd", SystemRoot: "C:\\Windows" }, expected: "C:\\Windows\\System32\\cmd.exe" },
+    { name: "no ComSpec, WINDIR only", env: { WINDIR: "C:\\WINDOWS" }, expected: "C:\\WINDOWS\\System32\\cmd.exe" },
+    { name: "lower-case spellings", env: { comspec: "c:\\windows\\system32\\cmd.exe" }, expected: "c:\\windows\\system32\\cmd.exe" },
+    // Every case below names an interpreter this module cannot name or cannot locate. None
+    // of them may fall back to the system cmd.exe: that would silently run a different
+    // interpreter than the one the user configured.
+    { name: "bare ComSpec with no Windows root", env: { ComSpec: "cmd.exe", PATH: "C:\\Windows\\System32" }, expected: undefined },
+    { name: "relative ComSpec with a directory", env: { ComSpec: ".\\Portable\\cmd.exe", SystemRoot: "C:\\Windows" }, expected: undefined },
+    { name: "relative ComSpec without a leading dot", env: { ComSpec: "Portable\\cmd.exe", SystemRoot: "C:\\Windows" }, expected: undefined },
+    { name: "current-directory ComSpec", env: { ComSpec: ".\\cmd.exe", SystemRoot: "C:\\Windows" }, expected: undefined },
+    { name: "current-directory ComSpec with forward slashes", env: { ComSpec: "./cmd.exe", SystemRoot: "C:\\Windows" }, expected: undefined },
+    { name: "collapsed relative ComSpec", env: { ComSpec: "Portable\\..\\cmd.exe", SystemRoot: "C:\\Windows" }, expected: undefined },
+    { name: "parent-only ComSpec", env: { ComSpec: "..\\cmd.exe", SystemRoot: "C:\\Windows" }, expected: undefined },
+    { name: "parent-relative ComSpec", env: { ComSpec: "..\\Portable\\cmd.exe", SystemRoot: "C:\\Windows" }, expected: undefined },
+    { name: "drive-relative ComSpec", env: { ComSpec: "C:cmd.exe", SystemRoot: "C:\\Windows" }, expected: undefined },
+    { name: "root-only ComSpec with no drive", env: { ComSpec: "\\windows\\system32\\cmd.exe", SystemRoot: "C:\\Windows" }, expected: undefined },
+    { name: "POSIX-shaped interpreter path", env: { ComSpec: "/c/windows/system32/cmd.exe", SystemRoot: "C:\\Windows" }, expected: undefined },
+    { name: "another interpreter", env: { ComSpec: "C:\\Program Files\\Other\\shell.exe", SystemRoot: "C:\\Windows" }, expected: undefined },
+    { name: "no interpreter resolvable", env: { PATH: "C:\\Windows\\System32" }, expected: undefined },
+  ];
+  for (const item of cases) {
+    const harness = windowsHarness(item.env);
+    t.after(harness.cleanup);
+    const editor = await harness.launch("dist/modes/interactive/external-editor.mjs", AUDIT_BODY);
+    if (item.expected === undefined) {
+      await assert.rejects(editor.call("the-configured-editor", [], WIN_FILE, WIN_OPTIONS), /could not be given its own terminal/,
+        `${item.name}: refused`);
+      assert.equal(harness.descriptors.length, 0, `${item.name}: no PTY was created, so no other interpreter was substituted`);
+      assert.equal(harness.sinks.length, 0, `${item.name}: the input route never changed`);
+      assert.equal(harness.stdin.isRaw, false, `${item.name}: this process's terminal mode is untouched`);
+      assert.equal(harness.real.length, 0, `${item.name}: nothing was handed an inherited fd 0 either`);
+      continue;
+    }
+    const pending = editor.call("the-configured-editor", [], WIN_FILE, WIN_OPTIONS);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(harness.descriptors[0]!.file, item.expected, item.name);
+    harness.ptys[0]!.emitExit(0);
+    assert.equal(await pending, 0, item.name);
+  }
+});
+
+test("windows: a launch that is not the shell shape Pi uses there is left exactly as it is", async (t) => {
+  const harness = windowsHarness();
+  t.after(harness.cleanup);
+  const editor = await harness.launch("dist/modes/interactive/external-editor.mjs", AUDIT_BODY);
+  const code = await editor.call(process.execPath, ["-e", "process.exit(0)"], WIN_FILE, { stdio: "inherit", shell: false });
+  assert.equal(code, 0);
+  assert.equal(harness.descriptors.length, 0, "a launch without the audited Windows shell flag is not taken over");
+  assert.equal(harness.real.length, 1, "and it reaches the underlying spawn unchanged");
+  assert.equal(harness.sinks.length, 0);
+});
+
+test("windows: verified bytes reach the owned PTY unchanged and a requested stop is delivered", async (t) => {
+  const harness = windowsHarness();
+  t.after(harness.cleanup);
+  const editor = await harness.launch("dist/modes/interactive/external-editor.mjs", `(() => {
+    const child = spawn(command, [...args, filePath], options ?? { stdio: "inherit", shell: true });
+    globalThis.__prgEditorChild = child;
+    return child;
+  })()`);
+  const pending = editor.call("the-configured-editor", [], WIN_FILE, WIN_OPTIONS);
+  await new Promise((resolve) => setImmediate(resolve));
+  const fake = harness.ptys[0]!;
+
+  // One logical character the host split across two authenticated dispatches must not be
+  // re-encoded into a replacement character on its way to the editor.
+  const rocket = Buffer.from("\u{1F680} \u00e9", "utf8");
+  harness.sinks[0]!.write(rocket.subarray(0, 2));
+  harness.sinks[0]!.write(rocket.subarray(2));
+  assert.deepEqual(fake.raw, [rocket.subarray(0, 2), rocket.subarray(2)], "the bytes are written through as bytes");
+  assert.equal(fake.raw.every((value) => Buffer.isBuffer(value)), true,
+    "nothing was decoded into a string on the way to the owned PTY");
+  assert.equal(Buffer.compare(Buffer.concat(fake.writes), rocket), 0, "and arrive byte-exactly");
+  assert.equal(Buffer.concat(fake.writes).toString("utf8"), "\u{1F680} \u00e9",
+    "the split character reassembles with no replacement character introduced");
+
+  const child = (globalThis as Record<string, unknown>).__prgEditorChild as { kill(signal?: string): boolean };
+  assert.equal(child.kill("SIGTERM"), true, "a stop request on the owned child is delivered");
+  assert.deepEqual(fake.kills, [undefined], "through the one termination the pinned Windows surface supports");
+  assert.equal(harness.sinks.length, 1, "and it is still not a settlement");
+  fake.emitExit(1);
+  assert.equal(await pending, 1, "the shell's non-zero exit is Pi's own failed edit");
+  assert.equal(settleOwnedNativeEditor(), undefined, "an editor that already exited owns no shutdown");
+  clearShutdownSlot();
+  delete (globalThis as Record<string, unknown>).__prgEditorChild;
+});
+
+test("windows: an owned editor settles the awaited shutdown on its own exit", async (t) => {
+  clearShutdownSlot();
+  const harness = windowsHarness();
+  t.after(harness.cleanup);
+  const editor = await harness.launch("dist/modes/interactive/external-editor.mjs", AUDIT_BODY);
+  const pending = editor.call("the-configured-editor", [], WIN_FILE, WIN_OPTIONS);
+  await new Promise((resolve) => setImmediate(resolve));
+  const settling = settleOwnedNativeEditor();
+  assert.ok(settling, "an owned editor gives the shutdown something to wait for");
+  assert.deepEqual(harness.ptys[0]!.kills, [undefined], "the owned editor is asked to leave");
+  harness.ptys[0]!.emitExit(0, 0);
+  assert.equal(await settling, true);
+  assert.equal(await pending, 0, "the launcher still sees its own exit code");
 });
 
 /** The slot key the handoff binds while it owns an editor, cleared for determinism. */

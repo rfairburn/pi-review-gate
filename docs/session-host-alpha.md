@@ -1831,9 +1831,9 @@ same authenticated child decoder. Legacy unframed children retain their existing
 and admission are protocol boundaries, not an operating-system delivery guarantee.
 
 **External editing.** Ctrl+G still opens Pi's configured external editor; it does not
-open a host replacement editor or change the editor setting. On the supported macOS
-and Linux runtime paths, an editor-specific PTY relay in a framing child keeps the
-authenticated decoder in front of that editor:
+open a host replacement editor or change the editor setting. The handoff has no
+operating-system enablement filter: an editor-specific PTY relay in a framing child
+keeps the authenticated decoder in front of that editor:
 ordinary commands, text, and supported paste reach the editor as terminal input, not
 as printable `prg-ni-v2;` records. Pi and the external editor never share an active
 input consumer. Input retained across an ownership transition is discarded rather
@@ -1842,7 +1842,10 @@ without saving or an editor failure preserves the draft under Pi's existing rule
 After the owned editor exits, Pi resumes its normal input and terminal modes. The
 relay does not disable framing, create a raw-input window, or broaden remote input
 permissions; viewer input retains its existing authorization and source fences.
-This correction does not establish native Windows external-editor support.
+Windows retains Pi's shell-based configured-editor launch through the pinned ConPTY
+surface; other platforms retain their native command/argument launch. Missing terminal
+capabilities or unverified launch provenance fail that edit closed, never by exposing
+framed input directly. Enablement tests are separate from physical-terminal acceptance.
 
 For manual acceptance in an isolated profile with a synthetic draft, configure your
 chosen editor through Pi's existing editor setting and open a native session in Main. Type a
@@ -1851,7 +1854,7 @@ by the terminal), and save/exit. Confirm the exact edited draft returns, with no
 unintended frame records, and ordinary Pi typing still works. Repeat with the editor's
 quit-without-save action and a deliberately failing editor command: the prior draft must
 remain and input must recover without restarting the host. Compare standalone Pi,
-local Main, and SSH to Linux separately; a same-host PTY test is not physical-terminal
+local Main, Windows, and SSH to Linux separately; a same-host PTY test is not physical-terminal
 or SSH certification. If using a remote viewer, repeat through that selected remote
 pane with its existing Remote input/copy setting enabled; no new grant is needed or
 implied.

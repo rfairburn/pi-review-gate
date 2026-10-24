@@ -23,14 +23,17 @@
  *   authentication. The bridge only routes each already-decoded logical dispatch's
  *   ordinary payload to the owned editor instead of the native listeners, never to
  *   both, and never an unauthenticated byte.
- * - Any other spawn call — pipes, an fd array, a shell, another launcher, another
- *   caller — is left exactly as it is today. There is no global spawn change, no
- *   raw window, no framing toggle, no second decoder, and no new host-side policy.
- * - If the handoff cannot be established BEFORE an editor exists (unsupported
- *   platform, no PTY support, no TTY, a runtime version this module never audited, or
- *   a launcher whose provenance is not the audited one), the launch fails closed with
- *   a fixed notice. An editor is never
- *   allowed to inherit fd 0, because fd 0 carries framing bytes.
+ * - Any other spawn call — pipes, an fd array, a shell where Pi uses no shell, no shell
+ *   where Pi uses one, another launcher, another caller — is left exactly as it is today.
+ *   There is no global spawn change, no raw window, no framing toggle, no second decoder,
+ *   and no new host-side policy.
+ * - If the handoff cannot be established BEFORE an editor exists (no PTY support, no
+ *   TTY, a runtime version this module never audited, a Windows interpreter this module
+ *   cannot name faithfully, or a launcher whose provenance is not the audited one), the
+ *   launch fails closed with a fixed notice. An editor is never allowed to inherit fd 0,
+ *   because fd 0 carries framing bytes. Nothing here asks which operating system it is
+ *   running on before installing: every failure above is a capability or provenance
+ *   failure, reachable on every platform.
  * - Once an editor process exists, ONLY its own positive exit settles the handoff.
  *   Every later failure unwinds by signalling the owned PTY and waiting for that
  *   same exit, so the launcher never resumes while an editor it no longer owns is
@@ -44,8 +47,29 @@
  * awaits for every handler and awaits again during SIGTERM/SIGHUP disposal before it
  * exits. Where no positive witness exists, neither point reports completion: no timer,
  * deadline, or escalation is invented here, and the host's existing stop bounds stay
- * authoritative. Windows is unsupported: Pi launches the editor through a shell there,
- * so the adapter is not installed at all.
+ * authoritative.
+ *
+ * WINDOWS: the supported runtime launches the SAME generic editor action through a
+ * shell there — `spawn(command, [...args, file], { stdio: "inherit", shell: true })` —
+ * so that exact shape is the launch this module recognizes there. Node resolves
+ * `shell: true` to `process.env.ComSpec || "cmd.exe"` and runs it as
+ * `<shell> /d /s /c "<command joined with spaces>"` with the arguments passed verbatim
+ * (Node sets `windowsVerbatimArguments` for cmd.exe itself). This module reproduces
+ * precisely that invocation on the owned PTY, so a configured editor keeps the shell
+ * semantics it already had — a `.exe`, a `.cmd`/`.bat` shim, spaces and shell special
+ * characters are resolved by cmd.exe exactly as they were when fd 0 was inherited, and
+ * the process Pi owns stays the shell process Pi already owned. Nothing here invents
+ * quoting, an interpreter, or a second command line: the command text is the same
+ * verbatim join Node handed cmd.exe, and a `ComSpec` naming any interpreter other than
+ * cmd.exe, or naming a cmd.exe whose location depends on the current drive and directory,
+ * is refused rather than re-implemented or replaced. The owned PTY is the pinned
+ * implementation's ConPTY surface with the bundled ConPTY DLL, the same Windows
+ * transport this package already uses for its own session children.
+ *
+ * The only platform-dependent facts in this module are those two adaptations: which
+ * launch shape the audited launcher produces, and how the pinned PTY surface expresses
+ * "write these bytes" and "stop this child". There is no operating-system switch that
+ * turns the handoff off.
  *
  * The child's own tty is put into raw mode for the duration so its line discipline
  * neither buffers nor echoes the framed bytes the host is still writing. That is a
@@ -55,7 +79,7 @@ import { EventEmitter } from "node:events";
 import { constants as OS_CONSTANTS } from "node:os";
 import { createRequire } from "node:module";
 import { realpathSync } from "node:fs";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { isAbsolute, join, relative, sep, win32 as PATH_WIN32 } from "node:path";
 import { getCallSites } from "node:util";
 import { fileURLToPath } from "node:url";
 import type { NativeClipboardRuntime } from "./native-clipboard";
@@ -80,7 +104,17 @@ const MAX_PROVENANCE_FRAMES = 16;
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
 
-/** The owned editor sink: verified ordinary bytes, exactly as authenticated. */
+/**
+ * The owned editor sink: verified ordinary bytes, exactly as authenticated.
+ *
+ * The bytes are written to the owned PTY unchanged on every supported platform. In the
+ * pinned implementation the POSIX surface queues the `Buffer` and `fs.write`s it, and
+ * the Windows surface writes it to the ConPTY input pipe (`net.Socket`, whose own
+ * encoding is `utf8` and therefore never re-encodes a `Buffer`). Either way the editor
+ * receives the exact authenticated payload bytes, so a multi-byte character split
+ * across two dispatches is reassembled by the editor's own decoder instead of being
+ * replaced by U+FFFD on the way through this module.
+ */
 export interface EditorHandoffSink {
   write(data: Buffer): void;
 }
@@ -88,7 +122,8 @@ export interface EditorHandoffSink {
 /** The small owned PTY surface the handoff needs; injectable so unit tests load no addon. */
 export interface EditorPtySurface {
   readonly pid: number;
-  write(data: Buffer): void;
+  /** The pinned surface accepts the verified bytes or a decoded string (see the sink note). */
+  write(data: Buffer | string): void;
   resize(columns: number, rows: number): void;
   kill(signal?: string): void;
   onData(listener: (data: string) => void): { dispose(): void };
@@ -98,9 +133,23 @@ export interface EditorPtySurface {
   removeListener?(event: "error" | "exit", listener: (payload: never) => void): unknown;
 }
 
+/**
+ * What the owned PTY is asked to launch.
+ *
+ * POSIX: Pi's configured command and its full argument vector, verbatim.
+ * Windows: the shell Node's `shell: true` would have used, plus that same command line
+ * in the pinned implementation's public pre-escaped `CommandLine` form (a string,
+ * appended after the program path verbatim). The argv form is deliberately NOT used on
+ * Windows: it MSDN-escapes quote characters, and the outer quotes cmd.exe needs are the
+ * quotes Node passed verbatim.
+ */
 export interface EditorPtyDescriptor {
   readonly file: string;
   readonly args: readonly string[];
+  /** Windows only: the verbatim argument text appended after `file`. */
+  readonly commandLine?: string;
+  /** Windows only: prefer the ConPTY DLL bundled with the pinned platform package. */
+  readonly useConptyDll?: true;
   readonly cols: number;
   readonly rows: number;
   readonly env: NodeJS.ProcessEnv;
@@ -135,9 +184,19 @@ export interface NativeEditorHandoffOptions {
    * capsule, and runs under no input dispatch scope.
    */
   writeStdout(chunk: string | Buffer): boolean;
+  /**
+   * This process's own environment, used for the Windows shell resolution and handed to
+   * the owned PTY. Injectable so a focused test never mutates `process.env`.
+   */
+  readonly env?: NodeJS.ProcessEnv;
   readonly stdin?: EditorHandoffTerminal;
   readonly stdout?: EditorHandoffTerminal;
   readonly stderr?: { write(chunk: string): unknown };
+  /**
+   * The platform whose launch shape and pinned PTY API this adapter must reproduce. It
+   * selects an API adaptation, never whether the handoff exists: the adapter installs on
+   * every platform, and defaults to this process's own.
+   */
   readonly platform?: NodeJS.Platform;
   readonly ptyFactory?: EditorPtyFactory;
 }
@@ -240,12 +299,16 @@ interface LaunchShape {
 }
 
 /**
- * The exact launch shape Pi uses: `spawn(command, [...args, file], { stdio:
- * "inherit" })` with no shell wrapper. The configured command and its full argument
- * vector are preserved verbatim; anything else — pipes, an fd array, a shell, a
- * non-string command — is not an editor handoff and is left completely alone.
+ * The exact launch shape Pi uses on this platform: `spawn(command, [...args, file],
+ * { stdio: "inherit" })` with no shell wrapper on POSIX, and the same launch with
+ * `shell: true` on Windows, which is what the supported runtime's own expression
+ * (`shell: process.platform === "win32"`) produces there. The configured command and its
+ * full argument vector are preserved verbatim; anything else — pipes, an fd array, a
+ * shell on POSIX, no shell on Windows, a non-string command, an explicit
+ * `windowsVerbatimArguments` this module never audited — is not an editor handoff and is
+ * left completely alone.
  */
-function launchShape(file: unknown, args: unknown, options: unknown): LaunchShape | undefined {
+function launchShape(platform: NodeJS.Platform, file: unknown, args: unknown, options: unknown): LaunchShape | undefined {
   // Mirror Node's own normalization: a non-array second argument IS the options.
   let rawArgs: unknown = args;
   let rawOptions: unknown = options;
@@ -258,11 +321,128 @@ function launchShape(file: unknown, args: unknown, options: unknown): LaunchShap
   for (const arg of rawArgs) if (typeof arg !== "string" || arg.includes("\0")) return undefined;
   if (!record(rawOptions)) return undefined;
   if (rawOptions.stdio !== "inherit") return undefined;
-  if (rawOptions.shell !== undefined && rawOptions.shell !== false) return undefined;
+  // The shell flag is part of the audited shape, and it differs by platform because
+  // Pi's own launch expression does. Accepting the other platform's spelling would let
+  // a launch this module never audited reach an editor through this adapter.
+  if (platform === "win32" ? rawOptions.shell !== true : (rawOptions.shell !== undefined && rawOptions.shell !== false)) {
+    return undefined;
+  }
   if (rawOptions.windowsVerbatimArguments !== undefined && rawOptions.windowsVerbatimArguments !== false) {
     return undefined;
   }
   return { file, args: [...(rawArgs as string[])] };
+}
+
+/** The only interpreter this module will name for Pi's Windows shell launch. */
+const CMD_BASENAMES: ReadonlySet<string> = new Set(["cmd", "cmd.exe"]);
+/** The switches Node hands cmd.exe for `shell: true`. */
+const CMD_SWITCHES = "/d /s /c";
+
+/**
+ * Environment lookup that does not depend on key casing. `process.env` resolves
+ * case-insensitively on Windows, but the object this module hands to the PTY is a copy,
+ * and a copy is not: the same spelling has to decide the interpreter and the child's
+ * environment, or `ComSpec`/`comspec` could disagree.
+ */
+function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const wanted = name.toLowerCase();
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() !== wanted) continue;
+    const value = env[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+/**
+ * The candidate itself, normalized, when it is absolute under a Windows root this module
+ * can name (a drive root or a two-component UNC root). A root-only path such as
+ * `\\windows\system32\cmd.exe` depends on the current drive, so it has no named root here.
+ */
+function windowsRoot(candidate: string | undefined): string | undefined {
+  if (candidate === undefined || candidate.includes("\0")) return undefined;
+  const normalized = PATH_WIN32.normalize(candidate);
+  if (!PATH_WIN32.isAbsolute(normalized)) return undefined;
+  const root = PATH_WIN32.parse(normalized).root;
+  const qualified = /^[a-z]:\\$/i.test(root)
+    || /^\\\\[^\\]+\\[^\\]+\\$/.test(root)
+    || /^\\\\\?\\[a-z]:\\$/i.test(root)
+    || /^\\\\\?\\UNC\\[^\\]+\\[^\\]+\\$/.test(root);
+  return qualified ? normalized : undefined;
+}
+
+/**
+ * The interpreter Node would have run for Pi's `shell: true` launch, or undefined when
+ * that launch cannot be reproduced faithfully. `ComSpec` names the interpreter, exactly
+ * as Node's default shell does, and only cmd.exe is accepted: another interpreter's
+ * quoting and parsing rules were never audited here, and inventing them would give this
+ * adapter interpreter authority Pi never had.
+ *
+ * Three spellings are reproduced faithfully, and no others are invented:
+ * - a fully qualified absolute path is used exactly as configured, including a cmd.exe
+ *   outside the Windows directory or on a UNC share;
+ * - a bare `cmd`/`cmd.exe` — spelled exactly that way, with no directory, drive, `.` or
+ *   `..` segment — carries no location the user chose, so it resolves to the parent's
+ *   absolute `SystemRoot\System32\cmd.exe`, the validated interpreter location this
+ *   package already uses for its other Windows launches, rather than leaving the
+ *   interpreter to a PATH search of the inherited environment;
+ * - an absent `ComSpec` resolves the same way, which is Node's own default.
+ *
+ * Every other spelling is refused: a path-bearing relative `Portable\cmd.exe`, one whose
+ * directory normalization would erase (`.` prefix or `..` segment), a drive-relative
+ * `C:cmd.exe`, and a root-only `\windows\system32\cmd.exe` all name a file whose location
+ * depends on the current drive and directory rules this module does not reproduce.
+ * Guessing there would run an interpreter the user never configured, so the edit fails
+ * closed BEFORE any editor or PTY exists instead of substituting the system cmd.exe.
+ */
+function windowsCommandShell(env: NodeJS.ProcessEnv): string | undefined {
+  // The location Node's own default shell resolves a location-less interpreter to.
+  const systemShell = (): string | undefined => {
+    const root = windowsRoot(envValue(env, "SystemRoot") ?? envValue(env, "WINDIR"));
+    return root === undefined ? undefined : PATH_WIN32.join(root, "System32", "cmd.exe");
+  };
+  const comspec = envValue(env, "ComSpec");
+  if (comspec === undefined) return systemShell();
+  if (comspec.includes("\0")) return undefined;
+  const configured = PATH_WIN32.parse(PATH_WIN32.normalize(comspec));
+  if (!CMD_BASENAMES.has(configured.base.toLowerCase())) return undefined;
+  // An absolute path is the user's own choice of file, and it is used as configured only
+  // when its root is one this module can name.
+  if (PATH_WIN32.isAbsolute(comspec)) return windowsRoot(comspec);
+  // No directory and no drive in the ORIGINAL spelling: a bare name, whose location is the
+  // system interpreter's. The configured path is not consulted here because normalization
+  // erases the very segments that make a spelling relative — `.\cmd.exe` and
+  // `Portable\..\cmd.exe` both normalize to `cmd.exe` while still naming a file the current
+  // drive and directory locates, which is not the system interpreter's file.
+  return CMD_BASENAMES.has(comspec.toLowerCase()) ? systemShell() : undefined;
+}
+
+/**
+ * The launch the owned PTY performs for one recognized editor dispatch.
+ *
+ * POSIX hands over the configured command and argv unchanged. Windows hands over the
+ * SAME command line Node would have handed cmd.exe: Node joins the command and its
+ * arguments with spaces and passes `/d /s /c "<that text>"` verbatim, so that join and
+ * those quotes are reproduced here character-for-character and nothing else is added.
+ * cmd.exe then resolves the configured editor exactly as it did when the editor inherited
+ * fd 0 — a `.exe`, a `.cmd`/`.bat` shim, a name found through the inherited PATH (a Git
+ * Bash `PATH`, a Visual Studio directory, anything else the user configured), spaces and
+ * shell special characters included — and the process this module owns stays the shell
+ * process Pi already owned, so its exit code and Pi's complete/failed/cancel semantics
+ * stay Pi's own.
+ */
+function ptyLaunch(
+  platform: NodeJS.Platform, shape: LaunchShape, env: NodeJS.ProcessEnv,
+): Pick<EditorPtyDescriptor, "file" | "args" | "commandLine" | "useConptyDll"> | undefined {
+  if (platform !== "win32") return { file: shape.file, args: [...shape.args] };
+  const shell = windowsCommandShell(env);
+  if (shell === undefined) return undefined;
+  return {
+    file: shell,
+    args: [],
+    commandLine: `${CMD_SWITCHES} "${[shape.file, ...shape.args].join(" ")}"`,
+    useConptyDll: true,
+  };
 }
 
 /** This process's own reported size, or the fallback when it reports none. */
@@ -362,13 +542,19 @@ let cachedNodePty: EditorPtyFactory | undefined;
 function defaultEditorPtyFactory(): EditorPtyFactory {
   if (cachedNodePty !== undefined) return cachedNodePty;
   const nodePty = createRequire(__filename)("@lydell/node-pty") as {
-    spawn(file: string, args: string[], options: Record<string, unknown>): EditorPtySurface;
+    spawn(file: string, args: string[] | string, options: Record<string, unknown>): EditorPtySurface;
   };
-  cachedNodePty = (descriptor) => nodePty.spawn(descriptor.file, [...descriptor.args], {
+  cachedNodePty = (descriptor) => nodePty.spawn(descriptor.file, descriptor.commandLine ?? [...descriptor.args], {
     name: typeof descriptor.env.TERM === "string" && descriptor.env.TERM.length > 0 ? descriptor.env.TERM : "xterm-256color",
     cols: descriptor.cols,
     rows: descriptor.rows,
     env: { ...descriptor.env },
+    // Windows-only public option of the pinned implementation: prefer the ConPTY DLL
+    // bundled with the platform package over the host's system ConPTY, which is the
+    // transport this package already validated for its own Windows session children.
+    // POSIX options are unchanged, and the deprecated ignored `useConpty` hint is
+    // never set.
+    ...(descriptor.useConptyDll === true ? { useConptyDll: true } : {}),
   });
   return cachedNodePty;
 }
@@ -489,12 +675,15 @@ function installSpawnAdapter(
  */
 export function installNativeEditorHandoff(options: NativeEditorHandoffOptions): boolean {
   const platform = options.platform ?? process.platform;
-  // Windows Pi launches the editor through a shell, which is not the audited
-  // inherited-stdio shape, so the adapter is not installed there at all.
-  if (platform !== "darwin" && platform !== "linux") return false;
+  // No platform is excluded. Every OS gets the same adapter and the same authentication;
+  // what differs by platform is only the launch Pi itself performs (`shell: true` there,
+  // no shell elsewhere) and the pinned PTY surface's API (see `ptyLaunch` and `kill`). A
+  // platform with no usable PTY, no TTY, or no interpreter this module can name still
+  // fails that one launch closed — a capability failure, never a raw fd 0 fallback.
   const stdin = options.stdin ?? (process.stdin as unknown as EditorHandoffTerminal);
   const stdout = options.stdout ?? (process.stdout as unknown as EditorHandoffTerminal);
   const stderr = options.stderr ?? process.stderr;
+  const env = options.env ?? process.env;
 
   const start = (shape: LaunchShape): HandoffChild => {
     if (options.editorActive()) return refusedChild(REFUSAL_BUSY, shape, stderr);
@@ -513,15 +702,20 @@ export function installNativeEditorHandoff(options: NativeEditorHandoffOptions):
       } catch { /* Same. */ }
     };
 
+    // Resolved BEFORE anything exists: a Windows launch whose interpreter this module
+    // cannot name faithfully fails that one edit closed, exactly like a PTY that cannot
+    // start, and never falls back to an inherited fd 0.
+    const launch = ptyLaunch(platform, shape, env);
+    if (launch === undefined) return refusedChild(REFUSAL_UNAVAILABLE, shape, stderr);
+
     let pty: EditorPtySurface;
     try {
       const factory = ptyLoaderForTests?.() ?? options.ptyFactory ?? defaultEditorPtyFactory();
       pty = factory({
-        file: shape.file,
-        args: shape.args,
+        ...launch,
         cols: dimension(stdout.columns, DEFAULT_COLS),
         rows: dimension(stdout.rows, DEFAULT_ROWS),
-        env: process.env,
+        env,
       });
     } catch {
       // Nothing was created, so nothing is owned and nothing can be left behind.
@@ -653,7 +847,12 @@ export function installNativeEditorHandoff(options: NativeEditorHandoffOptions):
     state.kill = (signal?: string): boolean => {
       if (state.settled) return false;
       try {
-        pty.kill(signal);
+        // The pinned POSIX surface signals the owned process with the requested signal
+        // (or SIGHUP). The pinned Windows surface has exactly one termination mode and
+        // REJECTS a signal argument, so a requested stop is delivered as that one
+        // termination rather than being swallowed here and leaving a live editor holding
+        // the terminal. Same stop request, same single owned child, no new escalation.
+        pty.kill(platform === "win32" ? undefined : signal);
         state.killed = true;
         return true;
       } catch {
@@ -726,6 +925,10 @@ export function installNativeEditorHandoff(options: NativeEditorHandoffOptions):
       options.setEditorSink({
         write: (bytes) => {
           try {
+            // The verified payload bytes go to the owned PTY unchanged on every
+            // supported platform (see EditorHandoffSink): no re-encoding happens here, so
+            // a multi-byte character the host split across dispatches still arrives as the
+            // bytes the editor's own decoder expects.
             pty.write(bytes);
           } catch { /* The owned editor is going away; its exit settles the handoff. */ }
         },
@@ -746,7 +949,7 @@ export function installNativeEditorHandoff(options: NativeEditorHandoffOptions):
   };
 
   return installSpawnAdapter((file, args, options2) => {
-    const shape = launchShape(file, args, options2);
+    const shape = launchShape(platform, file, args, options2);
     // Not an inherited-stdio editor launch: byte-for-byte unchanged behavior.
     if (shape === undefined) return undefined;
     const provenance = launchProvenance(options.runtime, callFrames(MAX_PROVENANCE_FRAMES), OWN_SCRIPT);

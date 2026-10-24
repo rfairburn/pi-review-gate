@@ -697,6 +697,8 @@ test("native Windows launcher job freshly installs and requires exact Pi 1.4.0 c
   const smoke = job.slice(smokeStart, job.indexOf("      - name:", smokeStart + 1));
   assert.match(smoke, /node --test dist-test\/tests\/pi-installed-launch\.test\.js/,
     "the native Windows host must run the actual installed-command RPC/registration smoke");
+  assert.match(smoke, /dist-test\/tests\/session-host-native-editor-handoff\.test\.js/,
+    "the same Windows step must prove universal handoff enablement and the Windows launch adaptation");
   assert.match(smoke, /PI_REVIEW_GATE_INSTALLED_PI_BIN: \$\{\{ runner\.temp \}\}\\pi-ui-runtime\\node_modules\\\.bin/,
     "the Windows smoke must resolve npm's actual installed pi.cmd bin directory");
   assert.match(smoke, /PI_REVIEW_GATE_INSTALLED_AGENT: \$\{\{ runner\.temp \}\}\\pi-ui-runtime\\node_modules\\@earendil-works\\pi-coding-agent/,

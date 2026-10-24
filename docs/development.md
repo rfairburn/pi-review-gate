@@ -299,6 +299,15 @@ for same-terminal standalone/hosted copying and an actual paste **on the client*
 
 ### Native external-editor input (#499)
 
+The handoff is enabled without an operating-system allowlist. The general adapter
+suite (`tests/session-host-native-editor-handoff.test.ts`) checks universal enablement,
+Windows' native shell/ConPTY launch adaptation, unchanged payload bytes, and shared
+ownership/settlement guards. The Windows launcher CI step runs this same suite alongside
+the installed-Pi RPC/registration smoke; it is not an editor- or shell-brand-specific
+reproduction. That smoke allows 90 seconds per RPC request on Windows for cold startup,
+while retaining 30 seconds elsewhere. Its bounded diagnostic fixtures and the product's
+process-stop deadlines are unchanged.
+
 With the explicit installed-Pi pins described above, after `npm run build:test`:
 
 ```sh

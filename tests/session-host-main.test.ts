@@ -10128,17 +10128,19 @@ test("one written remote source receives canonical keyboard, paste, and mouse su
   }
 });
 
-test("one host input batch of wheel reports is one logical operation per event and a refused tail still reports truthfully", async (t) => {
+test("one host input batch of wheel reports is one logical operation per event and a queue-limit tail stays quiet and unsent", async (t) => {
   const { harness, content, manager, rect } = await remoteNativeInputHarness(t);
   try {
     const localWrites = manager.writes.length;
+    const framesBefore = harness.writer.frames.length;
     // #500 host-boundary case. It pins what the host does with a batch of wheel
     // reports: each normalized report becomes exactly one request carrying exactly one
-    // canonical report, and a refused outcome is reported truthfully even while other
-    // operations in the same batch were handed off. The 128 admitted / 8 refused split is
-    // scripted on this fake endpoint to mirror the real endpoint's finite pending bound at
-    // the explicitly selected trial size of 128; it is not a measurement of the reported
-    // incident and claims no operator success.
+    // canonical report. The 128 admitted / 8 refused split is scripted on this fake
+    // endpoint to mirror the real endpoint's finite pending bound at the explicitly
+    // selected trial size of 128; it is not a measurement of the reported incident and
+    // claims no operator success. The refused tail is THIS viewer's own pending-operation
+    // (backpressure) bound, so it is presented quietly: the operations stay unsent, no
+    // success is claimed, and no notice is raised for the tail.
     content.sendResults = [
       ...Array.from({ length: 128 }, (): NativeInputSendResult => ({ status: "submitted" })),
       ...Array.from({ length: 8 }, (): NativeInputSendResult => ({ status: "not-sent", reason: "busy" })),
@@ -10153,8 +10155,14 @@ test("one host input batch of wheel reports is one logical operation per event a
       && request.text === `${ESC}[<64;3;4M`),
       "every request carries its own one canonical content-space SGR report");
     assert.equal(content.deliveredInputs.length, 128, "the admitted part of the burst was handed off exactly once each");
-    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_NOT_SENT_NOTICE) !== undefined,
-      "the refused tail's notice is shown even while the rest of the burst was submitted");
+    const burstFrame = plain(harness.writer.frames.at(-1)?.frame);
+    assert.equal(sidebarNoticeRows(burstFrame, REMOTE_INPUT_NOT_SENT_NOTICE), undefined,
+      "the quiet queue-limit tail raises no refusal notice");
+    assert.equal(sidebarNoticeRows(burstFrame, REMOTE_INPUT_UNCERTAIN_NOTICE), undefined,
+      "a queue-limit refusal is never presented as an uncertain handoff");
+    assert.equal(harness.writer.frames.slice(framesBefore)
+      .every((frame) => sidebarNoticeRows(plain(frame.frame), REMOTE_INPUT_NOT_SENT_NOTICE) === undefined), true,
+      "no repaint of the burst carries a queue-limit refusal notice");
     assert.equal(manager.writes.length, localWrites, "a refused remote wheel never reaches a local row");
     assert.equal(harness.sidebar!.focus, "main", "a remote burst never steals focus");
   } finally {
@@ -10303,8 +10311,12 @@ test("remote input results stay truthful: refusal notices and UNCERTAIN, never a
     content.sendResult = { status: "not-sent", reason: "busy" };
     harness.terminal.emitInput("a");
     await nextTurn();
-    assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_NOT_SENT_NOTICE) !== undefined,
-      "a client-side refusal truthfully says nothing was sent");
+    const quietFrame = plain(harness.writer.frames.at(-1)?.frame);
+    assert.equal(sidebarNoticeRows(quietFrame, REMOTE_INPUT_NOT_SENT_NOTICE), undefined,
+      "this viewer's own queue-limit refusal is presented quietly instead of as a refusal notice");
+    assert.equal(sidebarNoticeRows(quietFrame, REMOTE_INPUT_UNCERTAIN_NOTICE), undefined,
+      "a quiet queue-limit refusal claims no handoff either");
+    assert.equal(content.deliveredInputs.length, 0, "the queue-limited input stayed unsent");
 
     content.sendResult = { status: "unknown" };
     harness.terminal.emitInput("b");
@@ -10319,9 +10331,128 @@ test("remote input results stay truthful: refusal notices and UNCERTAIN, never a
     assert.ok(sidebarNoticeRows(plain(harness.writer.frames.at(-1)?.frame), REMOTE_INPUT_UNCERTAIN_NOTICE) !== undefined,
       "a rejected delegate is uncertain, not unsent");
 
+    // The one quiet reason must never erase a notice that is already visible.
+    content.sendResult = { status: "not-sent", reason: "busy" };
+    harness.terminal.emitInput("d");
+    await nextTurn();
+    const afterQuiet = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(sidebarNoticeRows(afterQuiet, REMOTE_INPUT_UNCERTAIN_NOTICE) !== undefined,
+      "a quiet queue-limit refusal leaves the earlier uncertainty notice exactly as drawn");
+    assert.equal(sidebarNoticeRows(afterQuiet, REMOTE_INPUT_NOT_SENT_NOTICE), undefined,
+      "the quiet refusal still raises no refusal wording of its own");
+
     assert.equal(content.deliveredInputs.length, 1, "only the outcome that may have been written counts as handed over");
-    assert.equal(content.inputRequests.length, 3, "every attempt reached the one delegate once, with no retry");
+    assert.equal(content.inputRequests.length, 4, "every attempt reached the one delegate once, with no retry");
     assert.equal(manager.writes.length, 0, "no outcome routes input to a local row");
+    assert.equal(harness.sidebar!.focus, "main", "no result steals focus");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("only the local queue-limit refusal is quiet: every other remote-input outcome keeps its notice", async (t) => {
+  const { harness, content, manager } = await remoteNativeInputHarness(t);
+  try {
+    const localWrites = manager.writes.length;
+    // Requests the fake delegate actually recorded, so "no retry" stays checkable
+    // across the delegates that never reach it.
+    let calls = 0;
+    // Every reason the endpoint can report besides this viewer's own pending-operation
+    // bound, plus the outcomes whose truthfulness cannot rest on a fixed reason. Each
+    // one keeps its existing visible notice; only `busy` is quiet, and only because the
+    // refusal came from this client's own queue, never from an owner or server limit.
+    const cases: Array<{ readonly label: string; readonly result: NativeInputSendResult; readonly notice: string }> = [
+      { label: "not-negotiated", result: { status: "not-sent", reason: "not-negotiated" }, notice: REMOTE_INPUT_NOT_SENT_NOTICE },
+      { label: "not-ready", result: { status: "not-sent", reason: "not-ready" }, notice: REMOTE_INPUT_NOT_SENT_NOTICE },
+      { label: "stale-source", result: { status: "not-sent", reason: "stale-source" }, notice: REMOTE_INPUT_NOT_SENT_NOTICE },
+      { label: "stale-modes", result: { status: "not-sent", reason: "stale-modes" }, notice: REMOTE_INPUT_NOT_SENT_NOTICE },
+      { label: "unauthorized", result: { status: "not-sent", reason: "unauthorized" }, notice: REMOTE_INPUT_NOT_SENT_NOTICE },
+      { label: "invalid-input", result: { status: "not-sent", reason: "invalid-input" }, notice: REMOTE_INPUT_NOT_SENT_NOTICE },
+      { label: "stopped", result: { status: "not-sent", reason: "stopped" }, notice: REMOTE_INPUT_NOT_SENT_NOTICE },
+      { label: "too-large", result: { status: "not-sent", reason: "too-large" }, notice: REMOTE_INPUT_PASTE_TOO_LARGE_NOTICE },
+      { label: "an unrecognized not-sent reason", result: { status: "not-sent", reason: "throttled" } as unknown as NativeInputSendResult, notice: REMOTE_INPUT_NOT_SENT_NOTICE },
+      { label: "an unrecognized status", result: { status: "refused" } as unknown as NativeInputSendResult, notice: REMOTE_INPUT_UNCERTAIN_NOTICE },
+      { label: "a malformed result", result: {} as unknown as NativeInputSendResult, notice: REMOTE_INPUT_UNCERTAIN_NOTICE },
+      { label: "an unknown outcome", result: { status: "unknown" }, notice: REMOTE_INPUT_UNCERTAIN_NOTICE },
+    ];
+    // Two notices used only to clear the slot, so each case proves it raised its own
+    // notice over a DIFFERENT visible one instead of reading a leftover from the case
+    // before it.
+    const CLEAR_UNCERTAIN: NativeInputSendResult = { status: "unknown" };
+    const CLEAR_REFUSED: NativeInputSendResult = { status: "not-sent", reason: "stale-source" };
+    const notices = [REMOTE_INPUT_NOT_SENT_NOTICE, REMOTE_INPUT_PASTE_TOO_LARGE_NOTICE, REMOTE_INPUT_UNCERTAIN_NOTICE];
+    const drawnNotices = (): string[] => {
+      const frame = plain(harness.writer.frames.at(-1)?.frame);
+      return notices.filter((message) => sidebarNoticeRows(frame, message) !== undefined);
+    };
+    for (const entry of cases) {
+      const clearer = entry.notice === REMOTE_INPUT_UNCERTAIN_NOTICE ? CLEAR_REFUSED : CLEAR_UNCERTAIN;
+      const clearerNotice = entry.notice === REMOTE_INPUT_UNCERTAIN_NOTICE
+        ? REMOTE_INPUT_NOT_SENT_NOTICE
+        : REMOTE_INPUT_UNCERTAIN_NOTICE;
+      content.sendResult = clearer;
+      harness.terminal.emitInput("x");
+      calls += 1;
+      await nextTurn();
+      assert.deepEqual(drawnNotices(), [clearerNotice], `${entry.label}: the clearing notice is the only notice drawn`);
+
+      content.sendResult = entry.result;
+      harness.terminal.emitInput("x");
+      calls += 1;
+      await nextTurn();
+      assert.deepEqual(drawnNotices(), [entry.notice],
+        `${entry.label} replaces the earlier notice with its own rather than dropping silently`);
+      assert.equal(content.inputRequests.length, calls, `${entry.label} was attempted once with no retry`);
+    }
+
+    // A delegate that throws, and one that hands back no outcome at all, both stay
+    // visible uncertainty; the queue-limit quieting never reaches them.
+    const original = content.sendNativeInput.bind(content);
+    try {
+      content.sendResult = CLEAR_REFUSED;
+      harness.terminal.emitInput("p");
+      calls += 1;
+      await nextTurn();
+      assert.deepEqual(drawnNotices(), [REMOTE_INPUT_NOT_SENT_NOTICE], "a refusal notice is visible before the throw");
+
+      (content as unknown as { sendNativeInput: () => NativeInputSendResult }).sendNativeInput = () => {
+        throw new Error("synthetic delegate throw");
+      };
+      harness.terminal.emitInput("y");
+      await nextTurn();
+      assert.deepEqual(drawnNotices(), [REMOTE_INPUT_UNCERTAIN_NOTICE],
+        "a throwing delegate is uncertain, never quiet");
+      assert.equal(content.inputRequests.length, calls,
+        "a synchronous throw reached no delegate at all and was never retried");
+
+      (content as unknown as { sendNativeInput: typeof content.sendNativeInput }).sendNativeInput = original;
+      content.sendResult = CLEAR_REFUSED;
+      harness.terminal.emitInput("p");
+      calls += 1;
+      await nextTurn();
+      assert.deepEqual(drawnNotices(), [REMOTE_INPUT_NOT_SENT_NOTICE], "a refusal notice is visible again before the silence");
+
+      (content as unknown as { sendNativeInput: () => undefined }).sendNativeInput = () => undefined;
+      harness.terminal.emitInput("z");
+      await nextTurn();
+      assert.deepEqual(drawnNotices(), [REMOTE_INPUT_UNCERTAIN_NOTICE],
+        "a delegate that produced no outcome is uncertain, never quiet");
+      assert.equal(content.inputRequests.length, calls,
+        "a delegate with no outcome was never retried either");
+    } finally {
+      (content as unknown as { sendNativeInput: typeof content.sendNativeInput }).sendNativeInput = original;
+    }
+
+    // And the quiet reason still refuses quietly AFTER a visible notice, without
+    // claiming success or handing the input to a local row.
+    content.sendResult = { status: "not-sent", reason: "busy" };
+    harness.terminal.emitInput("q");
+    calls += 1;
+    await nextTurn();
+    assert.deepEqual(drawnNotices(), [REMOTE_INPUT_UNCERTAIN_NOTICE],
+      "the preceding uncertainty notice survives a quiet queue-limit refusal, which adds nothing of its own");
+    assert.equal(content.inputRequests.length, calls, "the quiet refusal was attempted once, never retried");
+    assert.equal(manager.writes.length, localWrites, "no outcome routes input to a local row");
     assert.equal(harness.sidebar!.focus, "main", "no result steals focus");
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
@@ -10866,17 +10997,17 @@ test("a refused remote input notice stays visible when no sidebar pane is drawn"
     content.sendResult = { status: "not-sent", reason: "busy" };
     harness.terminal.emitInput("k");
     await nextTurn();
-    const narrowRefused = plainLine(harness.writer.frames.at(-1)?.frame, 0);
-    assert.ok(narrowRefused.includes("Remote input was refused"),
-      "a narrow Main pane still shows the brief refusal instead of dropping it");
-    assert.equal(narrowRefused.includes("UNCERTAIN"), false,
-      "the newer local refusal replaces the previous uncertainty wording");
+    const narrowQuiet = plainLine(harness.writer.frames.at(-1)?.frame, 0);
+    assert.equal(narrowQuiet.includes("Remote input was refused"), false,
+      "a narrow Main pane raises no notice for this viewer's own queue-limit refusal");
+    assert.ok(narrowQuiet.includes("UNCERTAIN"),
+      "the quiet queue-limit refusal leaves the earlier uncertainty notice visible instead of erasing it");
 
     harness.terminal.emitInput(`${ESC}[200~${"x".repeat(1024 * 1024 + 1)}${ESC}[201~`);
     await nextTurn();
     assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 0)
       .includes("That paste is larger than a remote session"),
-      "a narrow Main pane also shows the oversized-paste refusal");
+      "a narrow Main pane still shows the oversized-paste refusal, which is never quieted");
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
   }

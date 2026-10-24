@@ -3733,6 +3733,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           } else if (result.status === "submitted") {
             // Local transport return only: never claimed as processed or executed.
           } else if (result.status === "not-sent") {
+            // Presentation only, and only for THIS viewer's own pending-operation
+            // (backpressure) bound: the endpoint refused the logical operation before
+            // any transport write, so the input stays unsent, nothing is retried or
+            // replayed, no success is claimed, and no NEW notice is raised. A notice
+            // from an earlier refusal or uncertain handoff is left exactly as drawn.
+            // Every other `not-sent` reason — and any unrecognized reason, unknown
+            // outcome, rejection, or throw — keeps its existing visible notice.
+            if (result.reason === "busy") return;
             showRemoteInputNotice(result.reason === "too-large"
               ? REMOTE_INPUT_PASTE_TOO_LARGE_MESSAGE
               : REMOTE_INPUT_NOT_SENT_MESSAGE);

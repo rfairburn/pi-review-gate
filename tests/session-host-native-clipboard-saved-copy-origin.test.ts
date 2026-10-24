@@ -95,16 +95,16 @@ import { skipOrFail } from "./bridge-fakes";
  * Pi source, runtime, or version change.
  */
 
-/** Pi 1.3.0's documented default `app.message.copy` binding (Ctrl+X). */
+/** Pi 1.4.0's documented default `app.message.copy` binding (Ctrl+X). */
 const CTRL_X = "\x18";
 /**
- * Legacy F7 as Pi 1.3.0's own key table spells it (`pi-tui` `LEGACY_KEY_SEQUENCES.f7`,
+ * Legacy F7 as Pi 1.4.0's own key table spells it (`pi-tui` `LEGACY_KEY_SEQUENCES.f7`,
  * `matchesKey(data, "f7")`). This is the key the fixture's public
  * `pi.registerShortcut("f7")` decoy binds, so the keystroke below is an ordinary
  * local keystroke through the same framed seam as every other input here.
  */
 const F7 = "\x1b[18~";
-/** The clipboard commands Pi 1.3.0 may spawn; all must be owned recorders. */
+/** The clipboard commands Pi 1.4.0 may spawn; all must be owned recorders. */
 const CLIPBOARD_COMMANDS = ["pbcopy", "xclip", "xsel", "wl-copy", "termux-clipboard-set"] as const;
 const ASSISTANT_TEXT = "SAVEDCOPY466-A αβ café 雪\nSAVEDCOPY466-B ünïcödé end";
 const ASSISTED_ID = "0672e0a1-4a1f-7c31-9b2a-1f4c9d000001";
@@ -134,9 +134,9 @@ test("resumed saved-session copy is bound to its own conversation, keystroke, an
     if (process.platform === "win32") { t.skip("native Windows sidebar acceptance remains experimental"); return; }
     if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE) { t.skip("native primary-host proof cannot run in a delegated role"); return; }
     const packageRoot = findInstalledAgentDirs().find((path) => {
-      try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === "1.3.0"; } catch { return false; }
+      try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === "1.4.0"; } catch { return false; }
     });
-    if (!packageRoot) { skipOrFail(t, "installed native Pi 1.3.0 is required"); return; }
+    if (!packageRoot) { skipOrFail(t, "installed native Pi 1.4.0 is required"); return; }
     const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { bin: { pi: string } };
     const cli = realpathSync(join(packageRoot, manifest.bin.pi));
     assert.match(manifest.bin.pi, /dist\/bundle\/cli\.js$/, "exercise the actual package-declared bundled executable");
@@ -226,7 +226,7 @@ write();
       try { return JSON.parse(readFileSync(shortcutWitness, "utf8")) as ShortcutWitness; }
       catch { return { stage: "unreadable" }; }
     };
-    // The decoy is a native Pi extension SHORTCUT, not a command: Pi 1.3.0 calls a
+    // The decoy is a native Pi extension SHORTCUT, not a command: Pi 1.4.0 calls a
     // registered shortcut handler synchronously from the editor's input handling
     // (`CustomEditor.handleInput` -> `onExtensionShortcut` -> `handler(ctx)`), which
     // is inside the framed stdin dispatch for this exact keystroke, so the raw OSC 52
@@ -265,7 +265,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
           message: { role: "user", content: [{ type: "text", text: "synthetic saved prompt" }], timestamp: Date.parse(stamp) } },
       ];
       if (withAssistant) {
-        // A well-formed Pi 1.3.0 assistant message: the copy path reads its last
+        // A well-formed Pi 1.4.0 assistant message: the copy path reads its last
         // text block, and nothing here contacts a model, provider, or network.
         entries.push({ type: "message", id: `${id}-assistant`, parentId: `${id}-user`, timestamp: stamp,
           message: {
@@ -501,7 +501,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
 
     try {
       leg = "owned catalog and admission";
-      const catalog = await listSavedSessions({ agentDir, piExecutable: cli, expectedPiVersion: "1.3.0" });
+      const catalog = await listSavedSessions({ agentDir, piExecutable: cli, expectedPiVersion: "1.4.0" });
       assert.equal(catalog.issueCount, 0, "the owned saved conversations catalog is clean");
       const admit = (file: string, id: string): SavedSessionAdmission => {
         const row = catalog.rows.find((entry) => entry.file === file);

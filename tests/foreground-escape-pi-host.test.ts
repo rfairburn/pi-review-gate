@@ -45,7 +45,7 @@ async function fixture(t: Parameters<typeof skipOrFail>[0], root: string) {
   const agentRoot = findInstalledAgentDirs()[0]!;
   const requireHost = createRequire(join(agentRoot, "package.json"));
   const manifest = requireHost("./package.json");
-  if (manifest.version !== "1.3.0") { skipOrFail(t, "this dispatch regression requires Pi 1.3.0"); return undefined; }
+  if (manifest.version !== "1.4.0") { skipOrFail(t, "this dispatch regression requires Pi 1.4.0"); return undefined; }
   const { InteractiveMode } = requireHost("./dist/modes/interactive/interactive-mode.js");
   const themeModule = requireHost("./dist/modes/interactive/theme/theme.js");
   themeModule.setThemeInstance(REAL_IDENTITY_THEME);

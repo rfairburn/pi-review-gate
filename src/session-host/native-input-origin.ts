@@ -181,6 +181,10 @@ export interface NativeInputDecoder {
   readonly failureCode: NativeInputFailureCode | undefined;
   /** Bounded retained parser bytes (header/body/signature of one frame at most). */
   readonly bufferedBytes: number;
+  /** True after a frame has begun and before its authenticated terminator. Unlike
+   *  `bufferedBytes`, this admits parser states that retain no bytes yet, such as a
+   *  split immediately after the frame tag. */
+  readonly hasPartialFrame: boolean;
 }
 
 export interface NativeInputEncoder {
@@ -515,6 +519,12 @@ class Decoder implements NativeInputDecoder {
 
   get bufferedBytes(): number {
     return this.#field.length + this.#body.length + this.#mac.length;
+  }
+
+  /** The exact truncation test `finish()` applies: a frame is in flight from its first
+   *  byte until its authenticated terminator, even when nothing is retained yet. */
+  get hasPartialFrame(): boolean {
+    return this.#step !== "tag" || this.#field.length !== 0 || this.#body.length !== 0 || this.#mac.length !== 0;
   }
 
   feed(chunk: Buffer | string): NativeInputFeedResult {

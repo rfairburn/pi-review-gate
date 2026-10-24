@@ -40,6 +40,7 @@
  */
 
 import net from "node:net";
+import { settleOwnedNativeEditor } from "./native-editor-handoff";
 import { armNativeClipboardStartup, updateNativeClipboardSession } from "./native-clipboard";
 import { NativePersistenceTracker, parseNativePersistenceReceipt, readNativePersistence, type NativePersistenceReceipt } from "./native-persistence";
 import { randomUUID, timingSafeEqual } from "node:crypto";
@@ -1743,6 +1744,28 @@ function createReporter(
     rememberShutdownRequest(request);
     pendingShutdownRequestIds.add(request.requestId);
     shutdownInProgress = true;
+    // Editor-owned settlement lives inside the request, immediately before its first
+    // consequential side effect, never ahead of its authority checks.
+    void completeShutdownRequest(candidate, generation, request);
+  };
+
+  /**
+   * The public shutdown request. Its identity, session, capability, idleness, and
+   * public-API admission stays byte-for-byte synchronous; the only change is that an
+   * owned nested external editor (issue #499) is stopped and AWAITED between admission
+   * and the terminal-fence commit, so an editor can never survive the native session
+   * that launched it. Editor-specific plumbing only: no new permission, deadline,
+   * timer, escalation, or controller. A refused or stale request never reaches the
+   * editor, a child owning no editor is never deferred, an unsettled editor is never
+   * treated as a safe shutdown, and the host's existing grace window and POSIX
+   * fallback stay the only bounds on the stop.
+   */
+  const completeShutdownRequest = async (
+    candidate: net.Socket,
+    generation: number,
+    request: SessionHostShutdownRequest,
+    revalidated = false,
+  ): Promise<void> => {
     try {
       const ownsTransport = (): boolean => active && !candidate.destroyed
         && generation === sessionGeneration && candidate === socket;
@@ -1880,6 +1903,41 @@ function createReporter(
         const clear = completelyIdleNow();
         if (!ownsTransport() || currentContext !== ctx) return;
         if (!clear) { emit(); reject("not-idle"); return; }
+      }
+
+      // Admitted: this request is now authorized to shut this exact session down.
+      // Only here, immediately before the first consequential side effect, does an
+      // owned nested editor enter the picture — a stale, refused, or not-idle request
+      // above never reaches it. The body above ran synchronously, so nothing was
+      // observable until this point; below, the stop is awaited on the editor's own
+      // exit, and every fact the request was admitted on is established again before
+      // anything is committed.
+      const settlement = settleOwnedNativeEditor();
+      if (settlement !== undefined) {
+        if (revalidated) {
+          // An editor is still owned after revalidation: this process cannot claim a
+          // safe shutdown, and it must not loop stopping editors.
+          reject("unavailable");
+          return;
+        }
+        let settled = false;
+        try {
+          settled = (await settlement) === true;
+        } catch {
+          settled = false;
+        }
+        if (!ownsTransport()) return;
+        if (!settled) {
+          // No positive exit witnessed, so no shutdown is performed. The host's
+          // existing grace window and POSIX fallback remain the stop path.
+          reject("unavailable");
+          return;
+        }
+        // The editor was open while this request waited, so admit the request again on
+        // the current context, native tuple, idleness, and public API rather than on
+        // facts gathered before the wait.
+        await completeShutdownRequest(candidate, generation, request, true);
+        return;
       }
 
       // Commit the terminal fence immediately before invoking the public API.
@@ -2345,11 +2403,33 @@ function createReporter(
     }
   });
 
-  const sessionShutdownHooked = registerHook(pi, "session_shutdown", safe(() => {
-    deactivate();
-    // Terminal shutdown: no later reader can consume an uncertain payload.
-    discardOutstandingSpawnPayloads();
-  }));
+  // Pi AWAITS `session_shutdown` handlers (the installed 1.4.0 extension runner awaits
+  // each handler, and its interactive mode awaits extension disposal on SIGTERM/SIGHUP
+  // before exiting), so this is a real settlement point for native shutdown. Terminal
+  // retirement stays synchronous; only the owned external editor's exit is awaited.
+  // A missing witness must never be reported as safe completion, and throwing is not
+  // enough because Pi swallows extension-handler errors: completion is simply
+  // withheld, and the host's existing bounded stop stays authoritative.
+  const sessionShutdownHooked = registerHook(pi, "session_shutdown", async (...args) => {
+    safe(() => {
+      deactivate();
+      // Terminal shutdown: no later reader can consume an uncertain payload.
+      discardOutstandingSpawnPayloads();
+    })(...args);
+    const settlement = settleOwnedNativeEditor();
+    if (settlement === undefined) return;
+    let settled = false;
+    try {
+      settled = (await settlement) === true;
+    } catch {
+      settled = false;
+    }
+    if (!settled) {
+      // No positive witness that the editor left, so native disposal is not claimed to
+      // be finished. No local timer or escalation is invented here.
+      await new Promise<never>(() => { /* withheld from Pi; the host's stop bounds hold */ });
+    }
+  });
 
   // Public Pi notification emitted by native /name and setSessionName.
   // It refreshes only the bounded canonical title/identity, never session

@@ -293,7 +293,7 @@ jobs:
           PI_REVIEW_GATE_CANDIDATE_ENTRY: ${{ github.workspace }}\dist\src\index.js
           PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"
           PI_REVIEW_GATE_EXPECT_PI_VERSION: "1.4.0"
-        run: node --test dist-test/tests/pi-installed-launch.test.js
+        run: node --test dist-test/tests/pi-installed-launch.test.js dist-test/tests/session-host-native-editor-handoff.test.js
       # Issue #204: alias-independent Pi child launch. On this host the only
       # `pi` PATH entry is npm's pi.cmd shim, and a shell:false spawn of the
       # bare name cannot find an executable; these regressions start real

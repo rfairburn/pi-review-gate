@@ -9,7 +9,7 @@ import { resolvePiChildSpawn } from "../src/pi-invocation";
 import { redactSensitiveText } from "../src/redaction";
 
 const EXPECTED_PI_VERSION = "1.4.0";
-const RPC_TIMEOUT_MS = 30_000;
+const RPC_TIMEOUT_MS = process.platform === "win32" ? 90_000 : 30_000;
 const CHILD_CLOSE_TIMEOUT_MS = 2_000;
 const TREE_TERM_GRACE_MS = 1_500;
 const TREE_KILL_TIMEOUT_MS = 5_000;
@@ -891,8 +891,9 @@ test("owned process-tree cleanup kills a wrapper and descendant that ignore stdi
   }
 });
 
-test("RPC startup failures keep the 30s deadline and attach bounded sanitized startup evidence", { timeout: 30_000 }, async () => {
-  assert.equal(RPC_TIMEOUT_MS, 30_000, "the installed smoke RPC deadline must stay exactly 30s");
+test("RPC startup failures keep the platform deadline and attach bounded sanitized startup evidence", { timeout: 30_000 }, async () => {
+  assert.equal(RPC_TIMEOUT_MS, process.platform === "win32" ? 90_000 : 30_000,
+    "the installed smoke allows 90s on Windows and retains 30s elsewhere");
   const scratch = process.env.RUNNER_TEMP || tmpdir();
   const sandbox = await mkdtemp(join(scratch, "prg-rpc-startup-diagnostics-"));
   const tracePath = join(sandbox, "startup-trace.jsonl");

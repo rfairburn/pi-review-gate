@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join, relative } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { getCallSites } from "node:util";
+import type { EditorHandoffSink } from "./native-editor-handoff";
 import type {
   NativeInputDecoder,
   NativeInputExpectedPhase,
@@ -452,7 +453,8 @@ export interface NativeClipboardBridgeOptions {
    * delivered exactly once at its final fragment, so native Pi's bracketed-paste
    * parser never sees a prefix of a dispatch that a later conversation change
    * would have to abandon. When absent/false nothing changes.
-   * No production caller sets this option; it is inert until a later host phase.
+   * The owned child preload sets this for a bootstrap carrying the closed
+   * input-framing marker; the legacy default stays exactly as it was.
    */
   readonly inputOriginFraming?: boolean;
 }
@@ -538,10 +540,20 @@ class PendingViewerDispatch {
   }
 }
 
-/** The private hook the bridge's session update uses to release pending viewer bytes. */
+/** The private hooks the bridge's session update and editor handoff use. */
 interface FramedStdinHandle {
   /** A published native-conversation change (including an undefined tuple) arrived. */
   onTupleChange(): void;
+  /** True while an owned external editor, not the native TUI, owns verified bytes. */
+  editorActive(): boolean;
+  /**
+   * Enter (a sink) or retire (undefined) the editor route. The choice is made per
+   * LOGICAL DISPATCH, at its start, and never from an editor/process identity: a
+   * dispatch already in flight when the route changes is cut off from BOTH sinks,
+   * even when the native conversation tuple never changed, so no partial input
+   * crosses the boundary into the next owner.
+   */
+  setEditorSink(sink: EditorHandoffSink | undefined): void;
 }
 
 /**
@@ -580,6 +592,17 @@ interface FramedStdinHandle {
  * `undefined` and reloads), and that update releases a pending startup assembly
  * at once, so a startup dispatch can never straddle the first published update
  * and can never poison the next native paste.
+ *
+ * While an owned external editor holds the terminal (see ./native-editor-handoff),
+ * the SAME authenticated dispatches are routed to that editor instead of the native
+ * listeners. The sink is captured per logical dispatch AT ITS START, so exactly one
+ * sink ever receives one dispatch; entering or retiring the editor route cuts off
+ * any dispatch already in flight and releases its held bytes, even when the native
+ * conversation tuple never changed. Editor routing performs no string decoding and
+ * runs in no input dispatch scope, so nothing an editor writes can inherit a copy
+ * origin. Routing is a property of the handoff lifecycle only: it never inspects an
+ * executable, an argument, or a running process, and a routing refusal never
+ * poisons the decoder.
  */
 function installFramedStdin(
   stdin: typeof process.stdin,
@@ -591,6 +614,25 @@ function installFramedStdin(
   maxViewerPayloadBytes: number,
 ): FramedStdinHandle {
   let poisoned = false;
+  /** The owned external editor sink, or undefined while the native TUI owns bytes. */
+  let editorSink: EditorHandoffSink | undefined;
+  /**
+   * True when the route changed while the decoder still held an INCOMPLETE first
+   * frame. The logical dispatch that frame completes was begun for the previous
+   * owner, so it belongs to NEITHER sink: bytes an editor started can never reach
+   * the resumed native TUI, and bytes the native TUI started can never enter a newly
+   * launched editor. Ownership only — the decoder keeps its retained bytes, sequence,
+   * and authentication state exactly as they are, and this refusal never poisons it.
+   */
+  let orphanedFrame = false;
+  /**
+   * Bumped on every input-route change. `decoder.feed()` authenticates the WHOLE chunk
+   * before any native listener runs, and the native launcher can enter the handoff
+   * synchronously from inside a delivery. A dispatch that STARTS after this revision
+   * moved was therefore begun under the previous owner, so it belongs to neither sink.
+   * Ownership only: framing, sequence, and authentication are untouched.
+   */
+  let ownerRevision = 0;
   // The open dispatch survives chunk boundaries: its captured tuple/origin and
   // its string decoder are per LOGICAL DISPATCH, never per chunk or feed.
   let open: {
@@ -601,6 +643,12 @@ function installFramedStdin(
     readonly startup: boolean;
     /** True for any viewer dispatch: it is assembled whole and emitted once. */
     readonly viewer: boolean;
+    /**
+     * The sink this dispatch captured AT ITS START, and the exact sink object it may
+     * write. One dispatch has exactly one sink; a route change never retargets it.
+     */
+    readonly editor: boolean;
+    readonly editorSink: EditorHandoffSink | undefined;
     suppressed: boolean;
   } | undefined;
   /** The one fence a viewer dispatch carries, evaluated against the CURRENT facts. */
@@ -613,6 +661,7 @@ function installFramedStdin(
       // or dispatch, is a truncation rather than a raw fallback.
       if (event === "end") {
         open = undefined;
+        orphanedFrame = false;
         pending.clear();
         if (!poisoned && !decoder.finish().ok) poisoned = true;
       }
@@ -626,6 +675,9 @@ function installFramedStdin(
       pending.clear();
       return true;
     }
+    // Ownership is decided BEFORE decoding: everything in this chunk was read ahead of
+    // any listener that could change the route during it.
+    const feedRevision = ownerRevision;
     const fed = decoder.feed(args[0] as Buffer | string);
     let consumed = fed.fragments.length === 0; // Framing bytes accepted, nothing to deliver yet.
     for (const fragment of fed.fragments) {
@@ -633,10 +685,17 @@ function installFramedStdin(
         const tuple = currentTuple();
         const expected = fragment.expectedNativeTuple;
         const startup = fragment.expectedNativePhase === "startup";
+        // A dispatch whose first frame was already partly inside the decoder when
+        // the route changed belongs to no sink. The fact is consumed exactly once.
+        const orphaned = orphanedFrame;
+        orphanedFrame = false;
         // A new logical dispatch never inherits an earlier dispatch's owned bytes.
         pending.clear();
         const fence = { expected, startup };
+        const sink = editorSink;
         open = {
+          editor: sink !== undefined,
+          editorSink: sink,
           scope: Object.freeze({
             tuple: tuple ? Object.freeze({ ...tuple }) : undefined,
             expectedNativeTuple: expected ? Object.freeze({ ...expected }) : undefined,
@@ -650,8 +709,9 @@ function installFramedStdin(
           viewer: fragment.origin.kind === "viewer",
           // A viewer dispatch admitted against another conversation, or against a
           // startup phase that is not open now, is refused whole, before a single
-          // byte reaches a listener.
-          suppressed: !fenceHolds(fence),
+          // byte reaches a listener. A dispatch read ahead of a route change is
+          // likewise refused whole.
+          suppressed: orphaned || feedRevision !== ownerRevision || !fenceHolds(fence),
         };
       }
       const active = open;
@@ -702,6 +762,14 @@ function installFramedStdin(
           consumed = true;
           continue;
         }
+        if (active.editor) {
+          // The editor is a BYTE consumer: it gets the exact verified payload of this
+          // whole dispatch, outside any input dispatch scope, so nothing an editor
+          // writes can inherit a copy origin or dispatch identity.
+          consumed = true;
+          active.editorSink?.write(assembled);
+          continue;
+        }
         const chunk: Buffer | string = active.text === undefined
           ? assembled
           : `${active.text.write(assembled)}${active.text.end()}`;
@@ -724,6 +792,16 @@ function installFramedStdin(
         continue;
       }
       const payload = fragment.payload;
+      if (active.editor) {
+        // Same rule for a streamed dispatch: verified bytes only, to exactly one
+        // sink, with no string decoding and no dispatch scope.
+        consumed = true;
+        if (payload.length > 0) active.editorSink?.write(payload);
+        // A completed editor dispatch is finished, not open: the next dispatch begun
+        // while the editor is retired belongs to whoever owns input then.
+        if (fragment.end) open = undefined;
+        continue;
+      }
       if (payload.length > 0) {
         const chunk: Buffer | string = active.text === undefined ? payload : active.text.write(payload);
         if (typeof chunk !== "string" || chunk.length > 0) {
@@ -732,13 +810,21 @@ function installFramedStdin(
       } else {
         consumed = true;
       }
-      if (fragment.end && active.text !== undefined) {
+      // If a listener entered or retired the handoff during the delivery above, this
+      // dispatch has just been suppressed: its remaining bytes belong to neither sink.
+      if (fragment.end && !active.suppressed && active.text !== undefined) {
         const tail = active.text.end();
         if (tail.length > 0) {
           consumed = framed.run(active.scope, () => emit.call(this, "data", tail, ...args.slice(1))) || consumed;
         }
       }
       if (fragment.end) open = undefined;
+    }
+    // feed() read ahead through the whole chunk before any native listener could enter
+    // the handoff. A trailing partial FIRST frame must stay orphaned after the batch,
+    // even when another queued dispatch already consumed the marker earlier in it.
+    if (feedRevision !== ownerRevision && open === undefined && decoder.hasPartialFrame) {
+      orphanedFrame = true;
     }
     if (!fed.ok) {
       // Everything authenticated before the failing byte has already been delivered
@@ -767,6 +853,22 @@ function installFramedStdin(
       active.suppressed = true;
       pending.clear();
     },
+    editorActive: () => editorSink !== undefined,
+    setEditorSink: (sink: EditorHandoffSink | undefined) => {
+      if (editorSink === sink) return;
+      editorSink = sink;
+      ownerRevision += 1;
+      // Entering and retiring both cut an in-flight logical dispatch off from the
+      // other sink and release any held bytes, even when the native conversation
+      // tuple is unchanged: a late key never crosses into the next owner, and a
+      // refusal here never poisons the decoder.
+      if (open !== undefined) open.suppressed = true;
+      // A dispatch that already delivered a complete frame is tracked by `open`. A
+      // dispatch whose FIRST frame is still incomplete has no `open` yet, so its
+      // ownership follows the parser state holding those bytes, not a future sink.
+      else orphanedFrame = decoder.hasPartialFrame;
+      pending.clear();
+    },
   };
 }
 
@@ -791,10 +893,17 @@ export const __test = Object.freeze({
     readonly currentTuple: () => { readonly sessionId: string; readonly sessionEpoch: number } | undefined;
     readonly startupOpen: () => boolean;
     readonly maxViewerPayloadBytes: number;
+    /** Runs where a native data listener would, so synchronous route changes are modeled. */
+    readonly onDelivery?: () => void;
+    /** The fake stream's decoding mode; production may run with a non-null encoding. */
+    readonly readableEncoding?: string | null;
   }): {
     feed(chunk: Buffer | string): boolean;
     end(): void;
     onTupleChange(): void;
+    readonly editorActive: () => boolean;
+    /** Enter/retire the owned editor sink exactly as the editor handoff does. */
+    setEditorSink(sink: EditorHandoffSink | undefined): void;
     readonly delivered: FramedStdinTestDelivery[];
   } {
     const delivered: FramedStdinTestDelivery[] = [];
@@ -810,10 +919,11 @@ export const __test = Object.freeze({
           expectedNativeTuple: scope?.expectedNativeTuple,
           capturedTuple: scope?.tuple,
         }));
+        options.onDelivery?.();
       }
       return true;
     };
-    const fake = { readableEncoding: null, emit: original } as unknown as typeof process.stdin;
+    const fake = { readableEncoding: options.readableEncoding ?? null, emit: original } as unknown as typeof process.stdin;
     const handle = installFramedStdin(
       fake, original, options.decoder, framed, options.currentTuple, options.startupOpen, options.maxViewerPayloadBytes,
     );
@@ -821,6 +931,8 @@ export const __test = Object.freeze({
       feed: (chunk: Buffer | string): boolean => fake.emit("data", chunk),
       end: (): void => { fake.emit("end"); },
       onTupleChange: (): void => handle.onTupleChange(),
+      editorActive: (): boolean => handle.editorActive(),
+      setEditorSink: (sink: EditorHandoffSink | undefined): void => handle.setEditorSink(sink),
       delivered,
     });
   },
@@ -983,6 +1095,24 @@ export function installNativeClipboardBridge(
     try {
       write.call(stdout, `\x1b]${NATIVE_CLIPBOARD_OSC};${encodeNativeInputReadyCapsule(bootstrap)}\x07`);
     } catch { /* Withheld readiness leaves the host unframed, never raw. */ }
+    // The owned external-editor handoff (issue #499) is a strict-mode-only adapter,
+    // loaded lazily so the default bridge keeps its exact module graph. It gives
+    // Pi's generic external-editor launch its OWN terminal instead of this process's
+    // fd 0, which carries authenticated frames only. A handoff that cannot be
+    // established fails that one launch closed; it never changes any other spawn,
+    // any input path, or this child's startup. An install failure is not fatal:
+    // ordinary framed input keeps working exactly as before.
+    try {
+      const handoff = require("./native-editor-handoff") as typeof import("./native-editor-handoff");
+      handoff.installNativeEditorHandoff({
+        runtime: runtime!,
+        editorActive: () => framedInput!.editorActive(),
+        setEditorSink: (sink) => framedInput!.setEditorSink(sink),
+        // The editor's output is relayed with the ORIGINAL stdout writer: it gains no
+        // clipboard provenance and never becomes a capsule.
+        writeStdout: (chunk) => write.call(stdout, chunk),
+      });
+    } catch { /* No adapter: an editor launch behaves as it did before this module. */ }
   }
   return true;
 }

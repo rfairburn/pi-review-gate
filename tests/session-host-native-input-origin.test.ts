@@ -581,6 +581,32 @@ test("payload containing a complete frame is never parsed recursively", () => {
   assert.equal(result.fragments[1]!.origin.kind, "local");
 });
 
+test("hasPartialFrame reports every in-flight parser state, including the byte after the tag", () => {
+  const framed = createNativeInputEncoder(bootstrap).encode(Buffer.from("partial states", "utf8"), { kind: "local" });
+  const idle = createNativeInputDecoder(bootstrap);
+  assert.equal(idle.hasPartialFrame, false, "an untouched decoder holds nothing");
+  for (let cut = 1; cut <= framed.length; cut += 1) {
+    const probe = createNativeInputDecoder(bootstrap);
+    assert.equal(probe.feed(framed.slice(0, cut)).ok, true, `cut ${cut} is accepted so far`);
+    // Read the live state BEFORE `finish()`, which poisons and resets on truncation.
+    const partial = probe.hasPartialFrame;
+    const buffered = probe.bufferedBytes;
+    const finished = probe.finish();
+    // The predicate must agree with the verdict `finish()` reaches on that state.
+    assert.equal(partial, !finished.ok && finished.code === "truncated-frame", `cut ${cut}`);
+    if (cut === "prg-ni-v2;".length) {
+      // The state a retained-byte count cannot see: the tag is consumed and nothing
+      // else is buffered, yet a frame is unmistakably in flight.
+      assert.equal(buffered, 0, "nothing is retained immediately after the tag");
+      assert.equal(partial, true, "but the frame is partial");
+    }
+  }
+  const whole = createNativeInputDecoder(bootstrap);
+  assert.equal(whole.feed(framed).ok, true);
+  assert.equal(whole.hasPartialFrame, false, "an authenticated terminator closes the frame");
+  assert.equal(whole.finish().ok, true);
+});
+
 test("finish refuses partial frames and unfinished dispatches, then stays poisoned", () => {
   const framed = createNativeInputEncoder(bootstrap).encode(Buffer.from("truncate me", "utf8"), { kind: "local" });
   for (const cut of [1, Math.floor(framed.length / 2), framed.length - 1]) {

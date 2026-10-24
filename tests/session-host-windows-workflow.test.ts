@@ -365,6 +365,8 @@ test("alpha compiles tests directly and runs only explicit focused test files", 
   const mainStep = stepOf(job, "Real public Windows ConPTY Main acceptance (opt-in, fail-closed)");
   assert.match(mainStep, /node --test dist-test\/tests\/session-host-native-windows-main\.test\.js/,
     "the opt-in real Main/ConPTY test must run as an explicit compiled file");
+  assert.match(mainStep, /dist-test\/tests\/session-host-native-windows-network\.test\.js/,
+    "the same-harness Network storage companion runs in the same opt-in Main step");
   assert.match(mainStep, /PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"/,
     "missing Pi/ConPTY/PowerShell prerequisites must hard-fail, never skip");
 
@@ -461,6 +463,21 @@ test("alpha launcher acceptance exercises both real source wrappers with require
     "the direct Main outer transport must select the same bundled public ConPTY as the shipped source path");
   assert.doesNotMatch(harness, /useConpty\s*:/,
     "the deprecated ignored useConpty hint is never used by the direct Main outer transport");
+  const hostEnv = /const hostEnv: NodeJS\.ProcessEnv = \{([\s\S]*?)\n    \};/.exec(harness)?.[1] ?? "";
+  assert.match(hostEnv, /\n      HOME: options\.home,\n      USERPROFILE: options\.home,\n/, "Main's profile stays the owned home");
+  assert.match(hostEnv, /\n      APPDATA: join\(options\.home, "AppData", "Roaming"\),\n      LOCALAPPDATA: join\(options\.home, "AppData", "Local"\),\n/,
+    "Main's per-user profile folders point inside the owned home, as in the launcher fixture");
+  const osNames = /const WINDOWS_OS_ENV_NAMES = \[([\s\S]*?)\] as const;/.exec(harness)?.[1] ?? "";
+  const probeFixture = join(projectRoot, "tests", "fixtures", "session-host-windows-console-probe.cjs");
+  assert.deepEqual([...osNames.matchAll(/"([^"]+)"/g)].map((match) => match[1]),
+    [...(require(probeFixture) as { PROFILE_SYSTEM_NAMES: readonly string[] }).PROFILE_SYSTEM_NAMES],
+    "Main copies exactly the fixed OS names of the probe's passing profile control");
+  assert.match(harness, /for \(const name of WINDOWS_OS_ENV_NAMES\) \{\n      const value = process\.env\[name\];\n      if \(typeof value === "string" && value\.length > 0\) hostEnv\[name\] = value;\n    \}/,
+    "only the fixed OS names are copied from the host environment");
+  assert.doesNotMatch(harness, /\.\.\.process\.env\b|Object\.assign\([^)]*process\.env/,
+    "the harness never copies the full ambient environment");
+  assert.match(harness, /\n    if \(this\.exitEvent\) await closeExitedOwnedConptyReader\(this\.pty\);\n  \}\n\n  get forcedCleanup\(\)/,
+    "the owned ConPTY reader is settled last in settleSubscriptions, and only after the actual outer exit");
 });
 
 test("alpha installs no .NET SDK or external toolchain", () => {

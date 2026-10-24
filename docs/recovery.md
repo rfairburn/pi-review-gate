@@ -50,6 +50,16 @@ erases a lost owner's retained state, restarts a client, purges a cache, or reco
 arbitrary destroyed source state. See
 [Session host — Sidebar status and activity](session-host-alpha.md#sidebar-status-and-activity).
 
+### Session-host Network storage refusal
+
+An unsafe, unreadable, damaged, or missing-initialized Network document leaves only
+Network unavailable; local sessions and the roster are unaffected. The Network pane shows
+a fixed reason and mitigation, never defaults, and nothing is reset or regenerated. An
+access-permission refusal can be repaired only through the explicit confirmation in
+[Repairing Network storage permissions](session-host-alpha.md#repairing-network-storage-permissions),
+after which the host must be restarted. Retiring a possibly exposed key is the separate
+[manual identity replacement](session-host-alpha.md#manually-replacing-the-network-identity).
+
 ## Session-scoped restart recovery
 
 The extension does not globally scan the filesystem for arbitrary landing manifests at

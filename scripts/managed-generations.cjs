@@ -559,8 +559,19 @@ function activeHostOwnsAgentDirectory(cacheRoot) {
  * symlinked or non-directory `session-host` entry is never written through, and
  * an agent directory this producer cannot prepare simply means cleanup is
  * skipped instead of refusing the start.
+ *
+ * A genuinely absent `session-host` is created exclusively with private
+ * protection by the shared creator (Refs #494); an existing one is never
+ * modified. Protection is additive only: when it cannot be established, the
+ * plain `mkdir(0700)` below keeps this producer's coordination behaviour exactly
+ * as before, and the protected Network stores refuse the unverified directory.
  */
 function ensureCoordinationDirectory(stateDir) {
+  try {
+    require("./session-host-state-directory.cjs").createPrivateStateDirectory(stateDir);
+  } catch {
+    // Creation protection never changes whether coordination can proceed.
+  }
   try {
     fs.mkdirSync(stateDir, { mode: 0o700 });
   } catch (error) {

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
 
 import {
   assertNativeEditorFieldEmpty,
@@ -14,6 +15,7 @@ import {
   validateWindowsExitWitness,
   type WindowsWitnessExpectation,
 } from "./helpers/session-host-native-windows-contracts";
+import { closeExitedOwnedConptyReader, type NativePtyHandle } from "./helpers/session-host-native-windows-harness";
 
 const READY_EXPECTATION: WindowsWitnessExpectation = {
   requestNonce: "nonce_0123456789abcdef01234567",
@@ -259,4 +261,26 @@ test("Windows Quit witness rejects insufficient and invalid confirmation geometr
   const tooSmallFrame = ["Session host", " pane 32x4 too small ", "", "", ""].join("\n");
   assert.equal(windowsQuitConfirmationFrameMatches(tooSmallFrame, 2, 32, 4, 5), false,
     "an actual too-small render is not authority even when every canonical fallback row matches");
+});
+
+test("an exited outer ConPTY-DLL PTY is closed publicly, then only its owned reader Worker is terminated", async () => {
+  const reader = new Worker("setInterval(() => {}, 1000);", { eval: true });
+  const readerExit = new Promise<number>((resolve) => reader.once("exit", resolve));
+  const calls: unknown[][] = [];
+  const pty = { kill: (...args: unknown[]) => { calls.push(args); }, _agent: { _useConptyDll: true, _conoutSocketWorker: { _worker: reader } } };
+  await closeExitedOwnedConptyReader(pty as unknown as NativePtyHandle);
+  assert.deepEqual(calls, [[]], "public kill() with no signal argument, exactly once");
+  assert.equal(typeof await readerExit, "number", "the owned reader Worker actually exited");
+
+  for (const agent of [
+    undefined,
+    { _useConptyDll: false, _conoutSocketWorker: { _worker: reader } },
+    { _useConptyDll: true, _conoutSocketWorker: {} },
+    { _useConptyDll: true, _conoutSocketWorker: { _worker: { terminate: async () => 0 } } },
+  ]) {
+    const killed: unknown[] = [];
+    await assert.rejects(closeExitedOwnedConptyReader({ kill: () => killed.push(1), _agent: agent } as unknown as NativePtyHandle),
+      /not the pinned ConPTY-DLL shape/);
+    assert.deepEqual(killed, [], "an unexpected backend or reader shape fails closed before kill()");
+  }
 });

@@ -124,6 +124,10 @@ import type {
 	PeerUiHost,
 	PeerUiSettings,
 	PeerUiSnapshot,
+	PeerUiStorage,
+	PeerUiStorageProblem,
+	PeerUiStorageRepair,
+	PeerUiStorageRepairAdmission,
 	PeerUiTrustedPeer,
 } from "../peer-ui-protocol";
 import type { PeerByteChannel } from "./channel";
@@ -223,6 +227,14 @@ import { openPeerStateStore } from "./peer-state";
 import { createPeerStatePermissionPolicy } from "./peer-state-permissions";
 import { openPeerStateStoreWithPermissions, type PeerStateStore } from "./peer-state-store";
 import type { PeerStatePermissionPolicy } from "./peer-state-permission-policy";
+import { peerStorageDiagnostic } from "./peer-storage-diagnostics";
+import {
+	assessPeerStorageProtection,
+	repairPeerStorageProtection,
+	type PeerStorageAssessment,
+	type PeerStorageRemediationOptions,
+	type PeerStorageRepairReport,
+} from "./peer-storage-remediation";
 import {
 	isPeerTransportError,
 	isValidPeerLabel,
@@ -246,6 +258,7 @@ import {
 	type RosterBridgeHost,
 } from "./roster-bridge-host";
 import type { RemoteSessionMetadata } from "./roster-metadata";
+import type { AcceptedPeerRecord, DirectionalGrantRecord } from "./trust";
 
 /** Fixed label for an identity this host generates on explicit Enable/Connect. */
 const HOST_IDENTITY_LABEL = "pi-session-host";
@@ -314,6 +327,15 @@ export interface PeerCoordinatorWithHistoryPolicy {
 	readRemoteHistoryDeleteEnabled(): boolean;
 }
 
+/**
+ * The explicit, human-confirmed storage permission repair (Refs #494). Present
+ * on every production coordinator; Main reaches it only after its own written
+ * confirmation fence.
+ */
+export interface PeerCoordinatorWithStorageRepair {
+	repairStorageProtection(generation: number): Promise<PeerUiStorageRepairAdmission>;
+}
+
 const NOTICE = Object.freeze({
 	preferencesUnavailable: "Network settings are unavailable; saved values could not be read.",
 	preferencesUnsaved: "Network settings could not be saved.",
@@ -332,6 +354,11 @@ const NOTICE = Object.freeze({
 	removeUnsaved: "Removal could not be saved.",
 	pinNotCleared: "The saved host key could not be cleared.",
 	revokeFailed: "The receiving permission could not be revoked.",
+	storageRepairStale: "Network storage changed since the repair was shown; nothing was changed. Review it again.",
+	storageRepairBusy: "Network work is active; disable hosting and disconnect before repairing. Nothing was changed.",
+	storageRepairUnavailable: "The permission repair is not available now; nothing was changed.",
+	storageRepairUnchanged: "No permission was changed; see the storage status above.",
+	storageRestartRequired: "Restart Pi to reopen Network; no Network action runs before that.",
 });
 
 const HOST_MESSAGE = Object.freeze({
@@ -373,6 +400,15 @@ export interface PeerCoordinatorTestHooks {
 	 * pass it.
 	 */
 	readonly wrapClientChannel?: (channel: PeerByteChannel) => PeerByteChannel;
+	/**
+	 * Fixture-only replacements for the explicit storage remediation backend, so a
+	 * test can drive a partial, refused, or throwing outcome deterministically.
+	 * Production uses the real read-only assessment and repair entry points.
+	 */
+	readonly storageRemediation?: {
+		readonly assess?: (options: PeerStorageRemediationOptions) => PeerStorageAssessment;
+		readonly repair?: (options: PeerStorageRemediationOptions) => PeerStorageRepairReport;
+	};
 }
 
 export interface PeerCoordinatorOptions {
@@ -1177,7 +1213,8 @@ class OwnedPeerCoordinator implements
 	PeerCoordinatorWithClose,
 	PeerCoordinatorWithCreate,
 	PeerCoordinatorWithSaved,
-	PeerCoordinatorWithHistoryPolicy {
+	PeerCoordinatorWithHistoryPolicy,
+	PeerCoordinatorWithStorageRepair {
 	readonly #options: PeerCoordinatorOptions;
 	/**
 	 * Explicit requester-side Saved opt-in, fixed for the lifecycle. False is the
@@ -1197,6 +1234,40 @@ class OwnedPeerCoordinator implements
 	 * their existing persistence semantics.
 	 */
 	#preferencesHandleUnusable = false;
+	/**
+	 * Sanitized storage refusals observed in this lifecycle (Refs #494): which
+	 * protected store refused, plus the fixed reason/object its original error
+	 * carried. Closed vocabulary only; never a path, errno, SID, or native output.
+	 */
+	readonly #storageProblems: PeerUiStorageProblem[] = [];
+	/**
+	 * The last read-only eligibility assessment of the fixed storage targets, run
+	 * only on a permission refusal or an explicit repair request (never at render
+	 * time or on a timer). `#storageGeneration` advances with every assessment so
+	 * a confirmation shown for one assessment can never authorize a later one.
+	 */
+	#storageAssessment: PeerStorageAssessment | null = null;
+	#storageAssessmentFailed = false;
+	#storageGeneration = 0;
+	/** True only while the one synchronous repair call is running. */
+	#storageRepairing = false;
+	/**
+	 * Every outgoing-destination or inbound-binding retirement that has started
+	 * but not settled. It is registered synchronously, BEFORE the runtime or
+	 * binding references are cleared, so a storage repair can never treat a
+	 * connection that is still closing as inactive Network.
+	 */
+	readonly #pendingNetworkRetirements = new Set<Promise<void>>();
+	/**
+	 * Sticky for the lifecycle: a confirmed repair changed, or may have changed,
+	 * protection. Network then stays unavailable until a deliberate host restart:
+	 * no store is reopened, no saved intent is restored, and no command runs.
+	 */
+	#storageRestart: { readonly outcome: "repaired" | "partial"; readonly priorExposurePossible: boolean } | null = null;
+	/** Set once `#start` has fully returned (not merely flagged started). */
+	#startSettled = false;
+	readonly #storageAssess: (options: PeerStorageRemediationOptions) => PeerStorageAssessment;
+	readonly #storageRepair: (options: PeerStorageRemediationOptions) => PeerStorageRepairReport;
 	readonly #consentWindowMs: number;
 	readonly #autoReconnectDelaysMs: readonly number[];
 	readonly #preferencesPermissions: PeerStatePermissionPolicy;
@@ -1361,6 +1432,10 @@ class OwnedPeerCoordinator implements
 		this.#peerStatePermissions = hooks.peerStatePermissions;
 		this.#hostBounds = hooks.hostBounds ?? {};
 		this.#clientBounds = hooks.clientBounds ?? {};
+		this.#storageAssess = hooks.storageRemediation?.assess
+			?? ((remediation) => assessPeerStorageProtection(remediation));
+		this.#storageRepair = hooks.storageRemediation?.repair
+			?? ((remediation) => repairPeerStorageProtection(remediation));
 		// Both callbacks were validated together at construction admission; a missing
 		// option keeps the exact legacy display-only coordinator.
 		this.#nativeIo = options.nativeIo === undefined
@@ -1430,7 +1505,7 @@ class OwnedPeerCoordinator implements
 	}
 
 	readRemoteHistoryDeleteEnabled(): boolean {
-		if (this.#closed || this.#tearingDown) return false;
+		if (this.#closed || this.#tearingDown || this.#storageRestart !== null) return false;
 		// Protected settings that became unavailable mid-lifecycle (a poisoned
 		// handle) never keep exposing remote deletion from a cached value.
 		if (this.#preferencesHandleUnusable) return false;
@@ -1486,6 +1561,13 @@ class OwnedPeerCoordinator implements
 			return;
 		}
 		this.#transientNotice = null;
+		if (this.#storageRestart !== null) {
+			// After a repair that changed (or may have changed) protection, nothing
+			// runs before a deliberate restart: no store reopens and no intent applies.
+			this.#transientNotice = NOTICE.storageRestartRequired;
+			this.#emit();
+			return;
+		}
 		try {
 			switch (command.type) {
 				case "peer-listener":
@@ -1566,7 +1648,10 @@ class OwnedPeerCoordinator implements
 			// default-on flags on); an unreadable or invalid one throws below.
 			this.#applyPreferences(store.read() ?? DEFAULT_PEER_PREFERENCES);
 			this.#preferencesLoaded = true;
-		} catch {
+		} catch (error) {
+			// The original refusal keeps its own sanitized diagnostic: why it was
+			// refused and which fixed object, never a default.
+			this.#noteStorageRefusal("settings", error, false);
 			this.#preferencesStore = null;
 			// Unavailable settings are never defaults: viewer forwarding and the
 			// owner history policy both stay off.
@@ -1583,9 +1668,12 @@ class OwnedPeerCoordinator implements
 					agentDir: this.#options.agentDir,
 					permissions: this.#peerStatePermissions,
 				});
-		} catch {
+		} catch (error) {
+			this.#noteStorageRefusal("trust", error, false);
 			this.#trustStore = null;
 		}
+		// One read-only eligibility assessment, only for a permission refusal.
+		this.#assessStorageIfApplicable();
 
 		try {
 			this.#bridge = createRosterBridgeHost({
@@ -1640,12 +1728,16 @@ class OwnedPeerCoordinator implements
 		this.#started = true;
 		this.#emit();
 
-		const preferences = this.#preferences;
-		if (preferences !== null && preferences.hosting.enabled) await this.#restoreListener();
-		// Close may have latched while starting; owned roles are never applied then.
-		if (this.#closed) return;
-		if (preferences !== null && preferences.autoReconnect) this.#scheduleEligibleAutoAttempts();
-		this.#emit();
+		try {
+			const preferences = this.#preferences;
+			if (preferences !== null && preferences.hosting.enabled) await this.#restoreListener();
+			// Close may have latched while starting; owned roles are never applied then.
+			if (this.#closed) return;
+			if (preferences !== null && preferences.autoReconnect) this.#scheduleEligibleAutoAttempts();
+			this.#emit();
+		} finally {
+			this.#startSettled = true;
+		}
 	}
 
 	async #teardown(): Promise<void> {
@@ -1892,8 +1984,33 @@ class OwnedPeerCoordinator implements
 		try {
 			hostInstance = createPeerHost({
 				identity,
-				acceptedPeers: store.acceptedPeers,
-				grants: store.grants,
+				// The transport answers a receiving-side write failure with its own
+				// fixed pairing failure, so the ORIGINAL refusal's sanitized diagnostic
+				// is recorded at the write itself and the same error is rethrown.
+				acceptedPeers: {
+					get: (keyId: string) => store.acceptedPeers.get(keyId),
+					set: (record: AcceptedPeerRecord) => {
+						try {
+							store.acceptedPeers.set(record);
+						} catch (error) {
+							this.#noteStorageRefusal("trust", error, true);
+							throw error;
+						}
+					},
+					delete: (keyId: string) => store.acceptedPeers.delete(keyId),
+				},
+				grants: {
+					get: (peerKeyId: string) => store.grants.get(peerKeyId),
+					set: (record: DirectionalGrantRecord) => {
+						try {
+							store.grants.set(record);
+						} catch (error) {
+							this.#noteStorageRefusal("trust", error, true);
+							throw error;
+						}
+					},
+					delete: (peerKeyId: string) => store.grants.delete(peerKeyId),
+				},
 				onPairingRequest: (request) => this.#onPairingRequest(request),
 				onAppChannel: (channel) => this.#onAppChannel(channel),
 				...(contentHost === null
@@ -2375,8 +2492,9 @@ class OwnedPeerCoordinator implements
 		}
 		try {
 			return await store.initializeIdentity(HOST_IDENTITY_LABEL);
-		} catch {
+		} catch (error) {
 			this.#transientNotice = NOTICE.identityUnavailable;
+			this.#noteStorageRefusal("trust", error, true);
 			this.#emit();
 			return null;
 		}
@@ -2399,7 +2517,7 @@ class OwnedPeerCoordinator implements
 	}
 
 	#autoEligible(id: string): boolean {
-		if (this.#closed) return false;
+		if (this.#closed || this.#storageRestart !== null) return false;
 		const preferences = this.#preferences;
 		if (preferences === null || !preferences.autoReconnect) return false;
 		const destination = preferences.destinations.find((entry) => entry.id === id);
@@ -2556,7 +2674,22 @@ class OwnedPeerCoordinator implements
 				}
 			}
 		})();
-		void this.#track(cleanup);
+		this.#trackNetworkRetirement(cleanup);
+	}
+
+	/**
+	 * Track one owned retirement both for shutdown settlement and as a storage
+	 * repair barrier. Its settlement re-publishes the snapshot so a repair that
+	 * was busy only because of it can be offered again.
+	 */
+	#trackNetworkRetirement(retirement: Promise<void>): void {
+		const settled = retirement.then(() => undefined, () => undefined);
+		this.#pendingNetworkRetirements.add(settled);
+		void settled.then(() => {
+			this.#pendingNetworkRetirements.delete(settled);
+			this.#emit();
+		});
+		void this.#track(retirement);
 	}
 
 	#retireAllDestinations(): void {
@@ -2564,7 +2697,7 @@ class OwnedPeerCoordinator implements
 	}
 
 	async #connectDestination(id: string, mode: "explicit" | "auto"): Promise<void> {
-		if (this.#closed) return;
+		if (this.#closed || this.#storageRestart !== null) return;
 		const destination = this.#destination(id);
 		if (destination === undefined) return;
 		if (this.#preferences === null) return;
@@ -2612,9 +2745,24 @@ class OwnedPeerCoordinator implements
 				});
 				return;
 			}
+			// The transport replaces a pin-write failure with its own fixed error, so
+			// the ORIGINAL refusal's sanitized diagnostic is recorded here, at the
+			// write itself, before it is rethrown unchanged.
+			const remembered = trustStore.rememberedFor(id);
 			client = createPeerClient({
 				identity,
-				remembered: trustStore.rememberedFor(id),
+				remembered: {
+					read: () => remembered.read(),
+					write: (key: PeerKey) => {
+						try {
+							remembered.write(key);
+						} catch (error) {
+							this.#noteStorageRefusal("trust", error, true);
+							throw error;
+						}
+					},
+					clear: () => remembered.clear(),
+				},
 				bounds: {
 					consentTimeoutMs: this.#consentWindowMs,
 					pairingResponseTimeoutMs: this.#consentWindowMs + PEER_UI_PAIRING_RESPONSE_OVERHEAD_MS,
@@ -2689,6 +2837,9 @@ class OwnedPeerCoordinator implements
 			await this.#startViewer(runtime, epoch, channel);
 		} catch (error) {
 			if (runtime.epoch !== epoch || this.#closed) return;
+			// A trust-store refusal during pinning keeps its sanitized diagnostic;
+			// any error without one records nothing here.
+			this.#noteStorageRefusal("trust", error, true);
 			this.#failAttempt(runtime, epoch, describePeerFailure(error));
 		} finally {
 			if (!connected && client !== null) {
@@ -2700,6 +2851,10 @@ class OwnedPeerCoordinator implements
 				if (!connected) runtime.abort = null;
 			}
 			this.#releaseAttemptConsents(id, epoch);
+			// The attempt's client is released only here, after the failure was
+			// published: re-publish so a recorded storage refusal's repair state
+			// reflects the now-settled attempt instead of a stale "busy".
+			if (!connected && this.#storageProblems.length > 0) this.#emit();
 		}
 	}
 
@@ -4513,8 +4668,10 @@ class OwnedPeerCoordinator implements
 		if (store !== null) {
 			try {
 				store.rememberedFor(hostId).clear();
-			} catch {
+			} catch (error) {
 				this.#transientNotice = NOTICE.pinNotCleared;
+				// The original refusal keeps its sanitized reason and fixed object.
+				this.#noteStorageRefusal("trust", error, true);
 			}
 		}
 		const preferences = this.#preferences;
@@ -4589,14 +4746,16 @@ class OwnedPeerCoordinator implements
 		let failed = false;
 		try {
 			store.grants.delete(target);
-		} catch {
+		} catch (error) {
 			failed = true;
+			this.#noteStorageRefusal("trust", error, true);
 		}
 		if (!failed) {
 			try {
 				store.acceptedPeers.delete(target);
-			} catch {
+			} catch (error) {
 				failed = true;
+				this.#noteStorageRefusal("trust", error, true);
 			}
 		}
 		if (failed) this.#transientNotice = NOTICE.revokeFailed;
@@ -4621,7 +4780,7 @@ class OwnedPeerCoordinator implements
 			this.#retainInboundBindings(retained);
 			this.#emit();
 		})();
-		void this.#track(retirement);
+		this.#trackNetworkRetirement(retirement);
 	}
 
 	// --------------------------------------------------------------- snapshots
@@ -4663,6 +4822,7 @@ class OwnedPeerCoordinator implements
 	/** Effective viewer-side remote input/copy preference right now (fail closed). */
 	#viewerInputEnabledNow(): boolean {
 		if (this.#closed || this.#tearingDown || this.#preferencesHandleUnusable) return false;
+		if (this.#storageRestart !== null) return false;
 		const preferences = this.#preferences;
 		return preferences !== null && preferences.viewerNativeInputEnabled === true;
 	}
@@ -4709,7 +4869,8 @@ class OwnedPeerCoordinator implements
 			store.write(value);
 			this.#applyPreferences(value);
 			return true;
-		} catch {
+		} catch (error) {
+			this.#noteStorageRefusal("settings", error, true);
 			// A failure at or after the store's commit point poisons its handle: the
 			// protected settings are then unavailable for this lifecycle, and both the
 			// viewer native I/O and owner delete policies fail closed (recorded BEFORE
@@ -4744,8 +4905,221 @@ class OwnedPeerCoordinator implements
 			return false;
 		}
 	}
+	// ------------------------------------------------- storage refusal/repair
+
+	/**
+	 * Record one protected-store refusal with the sanitized diagnostic its
+	 * ORIGINAL error carried (Refs #494). The error itself is never displayed or
+	 * kept; only the closed reason/object is. `assessNow` runs the one read-only
+	 * eligibility assessment immediately for a refusal after startup.
+	 */
+	#noteStorageRefusal(store: PeerUiStorageProblem["store"], error: unknown, assessNow: boolean): void {
+		const diagnostic = peerStorageDiagnostic(error);
+		// A refusal without a sanitized storage diagnostic during an ordinary
+		// command (for example an invalid argument) is not a storage problem.
+		if (diagnostic === null && assessNow) return;
+		const reason = diagnostic?.reason ?? null;
+		const object = diagnostic?.object ?? null;
+		if (!this.#storageProblems.some((problem) => problem.store === store
+			&& problem.reason === reason && problem.object === object)) {
+			this.#storageProblems.push(Object.freeze({ store, reason, object }));
+		}
+		if (assessNow) this.#assessStorageIfApplicable();
+	}
+
+	/**
+	 * Run the read-only assessment only when a recorded refusal is a permission
+	 * problem the explicit repair could address (broad mode/DACL bits or a
+	 * supported granting extended ACL). Other reasons (malformed,
+	 * missing-initialized, foreign owner, ...) are explained, never assessed or
+	 * offered a repair. This never changes anything on disk.
+	 */
+	#assessStorageIfApplicable(): void {
+		if (this.#storageRestart !== null) return;
+		if (!this.#storageProblems.some((problem) => problem.reason === "unsafe-permissions"
+			|| problem.reason === "extended-acl")) return;
+		this.#assessStorage();
+	}
+
+	#assessStorage(): void {
+		this.#storageGeneration += 1;
+		try {
+			this.#storageAssessment = this.#storageAssess({ agentDir: this.#options.agentDir });
+			this.#storageAssessmentFailed = false;
+		} catch {
+			this.#storageAssessment = null;
+			this.#storageAssessmentFailed = true;
+		}
+	}
+
+	/**
+	 * True only when no Network work owns state that a protection change could
+	 * race: no listener (bound, starting, or retiring), no outgoing attempt,
+	 * client, channel, or viewer, no content endpoint or retirement, and no
+	 * unconfirmed teardown. Pending automatic retry TIMERS do not own state and
+	 * may be cancelled; everything else refuses the repair instead.
+	 */
+	#networkQuiescent(): boolean {
+		if (this.#host !== null || this.#listener.state === "listening" || this.#listener.state === "starting") return false;
+		if (this.#listenerRetirements.size > 0 || this.#listenerRetirementUnconfirmed) return false;
+		// A connection or inbound binding that is still closing owns state too.
+		if (this.#pendingNetworkRetirements.size > 0) return false;
+		if (this.#resourceCleanupFailed || this.#contentCleanupUnconfirmed) return false;
+		if (this.#content.endpoint !== null || this.#content.retirement !== null || this.#contentAbort !== null) return false;
+		for (const runtime of this.#runtime.values()) {
+			if (runtime.abort !== null || runtime.client !== null || runtime.channel !== null || runtime.viewer !== null) {
+				return false;
+			}
+			if (runtime.state === "connected" || runtime.state === "connecting" || runtime.state === "pairing") return false;
+		}
+		for (const bindings of this.#inboundBindings.values()) if (bindings.length > 0) return false;
+		return true;
+	}
+
+	/**
+	 * Cancel owned waits that hold no connection: automatic retry timers and any
+	 * remaining consent handles. No suppression intent is written, no session is
+	 * stopped, and saved preferences are untouched.
+	 */
+	#cancelOwnedNetworkWaits(): void {
+		for (const entry of [...this.#consents.values()]) entry.release();
+		this.#consents.clear();
+		for (const runtime of this.#runtime.values()) {
+			if (runtime.retryTimer !== null) {
+				clearTimeout(runtime.retryTimer);
+				runtime.retryTimer = null;
+			}
+			runtime.epoch += 1;
+			runtime.mode = null;
+			if (runtime.state === "retrying") {
+				runtime.state = "disconnected";
+				runtime.message = null;
+			}
+		}
+	}
+
+	#storageRepairState(): PeerUiStorageRepair {
+		const restart = this.#storageRestart;
+		if (restart !== null) {
+			return Object.freeze({
+				state: "restart-required",
+				outcome: restart.outcome,
+				priorExposurePossible: restart.priorExposurePossible,
+			});
+		}
+		if (this.#storageAssessmentFailed) return Object.freeze({ state: "unchecked" });
+		const assessment = this.#storageAssessment;
+		if (assessment === null) return Object.freeze({ state: "none" });
+		if (!assessment.supported) return Object.freeze({ state: "unsupported" });
+		const blocked = assessment.blocked;
+		if (blocked !== null) {
+			return Object.freeze({ state: "blocked", target: blocked.target, reason: blocked.reason });
+		}
+		if (!assessment.repairable) return Object.freeze({ state: "nothing-to-repair" });
+		if (!this.#networkQuiescent()) return Object.freeze({ state: "busy" });
+		return Object.freeze({
+			state: "offered",
+			generation: this.#storageGeneration,
+			targets: Object.freeze(assessment.targets.map((target) => Object.freeze({
+				target: target.target,
+				status: target.status,
+				reason: target.reason,
+			}))),
+		});
+	}
+
+	#storageSnapshot(): PeerUiStorage | null {
+		if (this.#storageProblems.length === 0 && this.#storageRestart === null) return null;
+		return Object.freeze({
+			platform: process.platform === "win32" ? "windows" : "posix",
+			problems: Object.freeze([...this.#storageProblems]),
+			repair: this.#storageRepairState(),
+		});
+	}
+
+	/**
+	 * The one explicit, human-confirmed permission repair (Refs #494). Main calls
+	 * it only after proving its own written confirmation frame; this method still
+	 * re-proves everything that frame could not: the frozen assessment
+	 * generation, a fresh read-only eligibility assessment equal to the one shown,
+	 * and an inactive Network that owns no listener, connection, or uncertain
+	 * teardown. It never hosts, connects, creates keys, reopens stores, restores
+	 * saved intent, or retries, and a changed or possibly changed result latches
+	 * Network unavailable until a deliberate restart.
+	 */
+	repairStorageProtection(generation: number): Promise<PeerUiStorageRepairAdmission> {
+		if (this.#closed) return Promise.resolve("not-run");
+		return this.#track(this.#repairStorage(generation));
+	}
+
+	async #repairStorage(generation: number): Promise<PeerUiStorageRepairAdmission> {
+		if (this.#closed || this.#tearingDown || !this.#startSettled || this.#storageRepairing
+			|| this.#storageRestart !== null) {
+			if (!this.#closed && !this.#tearingDown) {
+				this.#transientNotice = this.#storageRestart !== null
+					? NOTICE.storageRestartRequired
+					: NOTICE.storageRepairUnavailable;
+				this.#emit();
+			}
+			return "not-run";
+		}
+		const shown = this.#storageRepairState();
+		if (!Number.isSafeInteger(generation) || shown.state !== "offered" || shown.generation !== generation) {
+			this.#transientNotice = shown.state === "busy" ? NOTICE.storageRepairBusy : NOTICE.storageRepairStale;
+			this.#emit();
+			return shown.state === "busy" ? "busy" : "stale";
+		}
+		if (!this.#networkQuiescent()) {
+			this.#transientNotice = NOTICE.storageRepairBusy;
+			this.#emit();
+			return "busy";
+		}
+		// Owned waits that hold no connection are settled first, without writing
+		// any suppression intent or stopping a local or remote session.
+		this.#cancelOwnedNetworkWaits();
+		// Eligibility is re-proved at the actual mutation: a fresh read-only
+		// assessment must still describe exactly the targets the operator saw.
+		this.#assessStorage();
+		const fresh = this.#storageRepairState();
+		if (fresh.state !== "offered" || JSON.stringify(fresh.targets) !== JSON.stringify(shown.targets)) {
+			this.#transientNotice = fresh.state === "busy" ? NOTICE.storageRepairBusy : NOTICE.storageRepairStale;
+			this.#emit();
+			return fresh.state === "busy" ? "busy" : "stale";
+		}
+		this.#storageRepairing = true;
+		let report: PeerStorageRepairReport | null = null;
+		try {
+			report = this.#storageRepair({ agentDir: this.#options.agentDir });
+		} catch {
+			report = null;
+		} finally {
+			this.#storageRepairing = false;
+		}
+		if (report === null || report.changed || report.restartRequired) {
+			// A thrown backend call cannot prove that nothing changed: fail closed.
+			this.#storageRestart = Object.freeze({
+				outcome: report !== null && report.outcome === "repaired" ? "repaired" : "partial",
+				priorExposurePossible: report === null ? true : report.priorExposurePossible,
+			});
+			this.#storageAssessment = null;
+			this.#storageAssessmentFailed = false;
+			this.#transientNotice = null;
+			// Network is unavailable from here on: both live policies fail closed.
+			this.#noteViewerInputPolicy();
+			this.#noteRemoteHistoryPolicy();
+		} else {
+			// Nothing was changed (refused or nothing to repair): show what is
+			// true now, from one more read-only assessment.
+			this.#assessStorage();
+			this.#transientNotice = NOTICE.storageRepairUnchanged;
+		}
+		this.#emit();
+		return "ran";
+	}
+
 	#status(): PeerUiSnapshot["status"] {
 		if (!this.#started) return "loading";
+		if (this.#storageRestart !== null) return "unavailable";
 		if (!this.#preferencesLoaded || this.#preferencesStore === null) return "unavailable";
 		const store = this.#trustStore;
 		if (store === null) return "unavailable";
@@ -4761,6 +5135,7 @@ class OwnedPeerCoordinator implements
 		// Before start the coordinator has not opened anything: it is loading, not
 		// unavailable, so the inert constructor snapshot carries no error notice.
 		if (!this.#started) return null;
+		if (this.#storageRestart !== null) return NOTICE.storageRestartRequired;
 		if (!this.#preferencesLoaded) return NOTICE.preferencesUnavailable;
 		const store = this.#trustStore;
 		if (store === null) return NOTICE.trustUnavailable;
@@ -4900,7 +5275,10 @@ class OwnedPeerCoordinator implements
 	}
 
 	#buildSnapshot(revision: number): PeerUiSnapshot {
-		const preferences = this.#preferences;
+		// After a repair changed (or may have changed) protection, the loaded
+		// configuration is not authority until a restart: it is shown as unknown.
+		const latched = this.#storageRestart !== null;
+		const preferences = latched ? null : this.#preferences;
 		const settings: PeerUiSettings | null = preferences === null ? null : Object.freeze({
 			hostingEnabled: preferences.hosting.enabled,
 			bindHost: preferences.hosting.bindHost ?? "",
@@ -4915,18 +5293,20 @@ class OwnedPeerCoordinator implements
 				? left.id.localeCompare(right.id)
 				: left.requestedAt - right.requestedAt
 		));
+		const storage = this.#storageSnapshot();
 		return Object.freeze({
 			revision,
 			status: this.#status(),
 			settings,
-			identityFingerprint: this.#identityFingerprint(),
+			identityFingerprint: latched ? null : this.#identityFingerprint(),
 			listener: Object.freeze({ ...this.#listener }),
 			hosts: preferences === null
 				? null
 				: Object.freeze(preferences.destinations.map((destination) => this.#hostSnapshot(destination))),
-			trustedPeers: this.#trustedPeers(),
+			trustedPeers: latched ? null : this.#trustedPeers(),
 			consents: Object.freeze(consents.map((entry) => this.#consentSnapshot(entry))),
 			notice: this.#transientNotice ?? this.#persistentNotice(),
+			...(storage === null ? {} : { storage }),
 		});
 	}
 
@@ -5058,6 +5438,14 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
 				throw new TypeError("peer coordinator test consent window is invalid");
 			}
 		}
+		if (hooks.storageRemediation !== undefined) {
+			const remediation = hooks.storageRemediation;
+			if (!isRecord(remediation)
+				|| (remediation.assess !== undefined && typeof remediation.assess !== "function")
+				|| (remediation.repair !== undefined && typeof remediation.repair !== "function")) {
+				throw new TypeError("peer coordinator storage remediation fixture seam is invalid");
+			}
+		}
 	}
 	return options as unknown as PeerCoordinatorOptions;
 }
@@ -5108,6 +5496,7 @@ export function createPeerCoordinator(
 	& PeerCoordinatorWithClose
 	& PeerCoordinatorWithCreate
 	& PeerCoordinatorWithSaved
-	& PeerCoordinatorWithHistoryPolicy {
+	& PeerCoordinatorWithHistoryPolicy
+	& PeerCoordinatorWithStorageRepair {
 	return new OwnedPeerCoordinator(assertOptions(options));
 }

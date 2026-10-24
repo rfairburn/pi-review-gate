@@ -15,6 +15,32 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.195]
+
+### Added
+
+- The Network pane now explains why Network storage is unavailable (#494): each refusal
+  shows one fixed reason and mitigation for one fixed item named by its conventional
+  name below the Pi agent directory, with Windows- or POSIX-appropriate advice and no
+  path, error number, account identifier, or native output; unsafe settings are never
+  shown as defaults. For an access-permission refusal while Network is inactive, an
+  explicit **Repair Network storage permissions** confirmation tightens only the
+  protection of the five fixed existing items and keeps their contents, the identity key,
+  pins, grants, explicit Off values, and saved destinations byte for byte. It acts only
+  from the actually written confirmation with a frozen assessment that is re-checked
+  immediately before any change. It never hosts, connects, creates or rotates keys,
+  reopens stores, or retries, and a changed or possibly changed result keeps Network
+  unavailable until a deliberate restart. Its warning recommends separately replacing a
+  possibly exposed identity key. Defaults are unchanged. A missing `session-host`
+  directory is now created exclusively with private protection at creation (on Windows a
+  protected access list for only your account, SYSTEM, and Administrators; on POSIX
+  `0700`), and that protection is claimed only after the created directory itself is
+  verified on Windows or a supported POSIX system. An existing directory is never changed
+  automatically. When protection cannot be verified at creation (for example under some
+  inherited macOS ACLs), the directory may still be created for local use, but Network
+  refuses it as unsafe until the explicit repair above is confirmed. See
+  [Repairing Network storage permissions](docs/session-host-alpha.md#repairing-network-storage-permissions).
+
 ## [0.1.0-dev.194]
 
 ### Changed

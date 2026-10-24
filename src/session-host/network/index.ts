@@ -34,3 +34,5 @@ export * from "./roster-bridge-host";
 export * from "./roster-bridge-client";
 export * from "./peer-content";
 export * from "./session-content-protocol";
+export * from "./peer-storage-diagnostics";
+export * from "./peer-storage-remediation";

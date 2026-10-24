@@ -84,6 +84,7 @@ import {
 import type {
   PeerCoordinator,
   PeerConsentPresentation,
+  PeerStorageRepairPresentation,
   PeerSavedUiDeleteIntent,
   PeerSavedUiDeletePrepareIntent,
   PeerSavedUiListIntent,
@@ -591,6 +592,19 @@ interface RemoteSavedInflight {
 }
 
 interface PeerConsentConfirmationFrame extends PeerConsentPresentation {
+  readonly cols: number;
+  readonly rows: number;
+  settled: boolean;
+}
+
+/**
+ * One storage-repair confirmation candidate (Refs #494): the frozen assessment
+ * generation and the sidebar's token for this exact drawn Repair frame, plus the
+ * terminal geometry it was composed at. Only a frame the actual writer reported
+ * as written (or an unchanged repaint of this already-settled candidate) is
+ * repair authority; the coordinator still re-proves eligibility itself.
+ */
+interface PeerRepairConfirmationFrame extends PeerStorageRepairPresentation {
   readonly cols: number;
   readonly rows: number;
   settled: boolean;
@@ -1511,6 +1525,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let peerNetworkSettled = true;
   const peerBellAttempts = new Set<string>();
   let peerConsentConfirmationFrame: PeerConsentConfirmationFrame | undefined;
+  let peerRepairConfirmationFrame: PeerRepairConfirmationFrame | undefined;
   let terminalStartAttempted = false;
   let terminalStarted = false;
   let observerListenerAttached = false;
@@ -2244,6 +2259,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
     const shown = peerConsentConfirmationFrame;
     if (shown && !isCurrentPeerConsentFrame(shown)) invalidatePeerConsentDisplay();
+    const shownRepair = peerRepairConfirmationFrame;
+    if (shownRepair && !isCurrentPeerRepairFrame(shownRepair)) invalidatePeerRepairDisplay();
     // A hidden/narrow sidebar may need a visible non-focusing alert band. Only
     // the compositor/one viewer owner changes geometry; this never selects a row.
     if (!externalEditorActive) reconcileLayout(true);
@@ -2360,7 +2377,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       sidebarVisible: sidebar?.visible ?? false,
       focus: sidebar ? sidebarFocus(sidebar.focus) : "main" as HostFocus,
       savedDeleteConfirmation: sidebar?.savedDeleteConfirmationActive ?? false,
-      hostConfirmation: sidebar?.peerConsentConfirmationActive ?? false,
+      hostConfirmation: (sidebar?.peerConsentConfirmationActive ?? false)
+        || (sidebar?.peerRepairConfirmationActive ?? false),
     };
     const basic = computeHostLayout(cols, rows, options);
     // Match the redraw routes: forms and ordinary confirmations can replace
@@ -2386,6 +2404,35 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       && clampDimension(terminal.rows, 24) === frame.rows
       && sidebar.isPeerConsentRenderCurrent(frame.renderToken)
       && sidebar.capturePeerConsentPresentation()?.consentId === frame.consentId;
+  }
+
+  function invalidatePeerRepairDisplay(): void {
+    peerRepairConfirmationFrame = undefined;
+    sidebar?.invalidatePeerRepairDisplay();
+  }
+
+  function isCurrentPeerRepairFrame(frame: PeerRepairConfirmationFrame): boolean {
+    if (shutdownRequested || terminal === undefined || !terminalStarted || sidebar === undefined) return false;
+    if (!sidebar.visible || !sidebar.peerRepairConfirmationActive) return false;
+    if (clampDimension(terminal.columns, 80) !== frame.cols || clampDimension(terminal.rows, 24) !== frame.rows) {
+      return false;
+    }
+    if (!sidebar.isPeerRepairRenderCurrent(frame.renderToken)) return false;
+    const current = sidebar.capturePeerRepairPresentation();
+    return current?.renderToken === frame.renderToken && current.generation === frame.generation;
+  }
+
+  /**
+   * Main's own written-frame fence for the storage repair, independent of the
+   * sidebar's: the exact frozen generation and token must name a frame the
+   * actual writer settled, at the current geometry, still drawn and uncovered.
+   */
+  function hasWrittenPeerRepairFrame(generation: number, renderToken: number): boolean {
+    const frame = peerRepairConfirmationFrame;
+    if (!frame || !frame.settled || frame.generation !== generation || frame.renderToken !== renderToken) return false;
+    if (isCurrentPeerRepairFrame(frame)) return true;
+    invalidatePeerRepairDisplay();
+    return false;
   }
 
   function hasWrittenPeerConsentFrame(consentId: string, renderToken: number, decision: "approve" | "deny"): boolean {
@@ -2530,7 +2577,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           if (focus === "form" && currentLayout.form !== undefined) {
             sidebarFrame = sidebar.renderRoster(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
             formFrame = sidebar.renderForm(currentLayout.form.cols, currentLayout.form.rows);
-          } else if (focus === "confirm" && sidebar.peerConsentConfirmationActive
+          } else if (focus === "confirm"
+            && (sidebar.peerConsentConfirmationActive || sidebar.peerRepairConfirmationActive)
             && currentLayout.form !== undefined) {
             sidebarFrame = sidebar.renderRoster(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
             formFrame = sidebar.renderForm(currentLayout.form.cols, currentLayout.form.rows);
@@ -2762,6 +2810,21 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           }
         }
         peerConsentConfirmationFrame = peerFrame;
+        const repairPresentation = sidebar.capturePeerRepairPresentation();
+        let repairFrame: PeerRepairConfirmationFrame | undefined;
+        if (repairPresentation !== undefined) {
+          const previous = peerRepairConfirmationFrame;
+          if (previous?.generation === repairPresentation.generation
+            && previous.renderToken === repairPresentation.renderToken && previous.cols === cols && previous.rows === rows) {
+            repairFrame = previous;
+          } else {
+            repairFrame = { ...repairPresentation, cols, rows, settled: false };
+            // Identical rendered text is not proof that this frozen assessment
+            // and Repair choice were written: force that semantic boundary.
+            writer.invalidate?.();
+          }
+        }
+        peerRepairConfirmationFrame = repairFrame;
         let remoteCloseFrame: RemoteCloseConfirmationFrame | undefined;
         if (remoteClosePresentation !== undefined) {
           const previous = remoteCloseConfirmationFrame;
@@ -2870,6 +2933,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             && isCurrentPeerConsentFrame(peerFrame)
             && (disposition === "written" || (disposition === "unchanged" && peerFrame.settled))) {
             if (activeSidebar.settlePeerConsentRender(peerFrame.renderToken)) peerFrame.settled = true;
+          }
+          if (repairFrame !== undefined && peerRepairConfirmationFrame === repairFrame
+            && isCurrentPeerRepairFrame(repairFrame)
+            && (disposition === "written" || (disposition === "unchanged" && repairFrame.settled))) {
+            if (activeSidebar.settlePeerRepairRender(repairFrame.renderToken)) repairFrame.settled = true;
           }
           if (remoteCloseFrame !== undefined && remoteCloseConfirmationFrame === remoteCloseFrame
             && isCurrentRemoteCloseConfirmationFrame(remoteCloseFrame)
@@ -4092,6 +4160,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function handleTerminalResize(): void {
     invalidatePeerConsentDisplay();
+    invalidatePeerRepairDisplay();
     invalidateSavedDeleteConfirmationDisplay();
     // A resize can reflow the terminal before the next coalesced redraw: no
     // pending remote close may keep a confirmable token at the old geometry,
@@ -6474,6 +6543,36 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         }
         return;
       }
+      case "peer-storage-repair": {
+        // A distinct entry point, never the ordinary command path: Main proves its
+        // own actual-written confirmation frame for the frozen generation first.
+        if (!hasWrittenPeerRepairFrame(action.generation, action.renderToken)) {
+          sidebar?.showError("The repair confirmation changed or is not yet displayed; review it again");
+          scheduleRedraw();
+          return;
+        }
+        invalidatePeerRepairDisplay();
+        const coordinator = peerCoordinator;
+        const repair = coordinator?.repairStorageProtection;
+        if (!coordinator || typeof repair !== "function") {
+          sidebar?.showError("The permission repair is unavailable in this host; nothing was changed");
+          scheduleRedraw();
+          return;
+        }
+        void Promise.resolve().then(async () => {
+          if (shutdownRequested) return "not-run" as const;
+          return await repair.call(coordinator, action.generation);
+        }).then((admission) => {
+          if (!shutdownRequested && admission === "not-run") {
+            sidebar?.showError("The permission repair did not run; nothing was changed");
+          }
+        }).catch(() => {
+          if (!shutdownRequested) sidebar?.showError("The permission repair outcome is unknown; restart Pi before using Network");
+        }).finally(() => {
+          if (!shutdownRequested) { reconcileLayout(true); scheduleRedraw(); }
+        });
+        return;
+      }
       case "peer-listener":
       case "peer-auto-reconnect":
       case "peer-bell":
@@ -6893,6 +6992,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     savedCatalogRequestId = undefined;
     invalidateSavedDeleteConfirmationDisplay();
     invalidatePeerConsentDisplay();
+    invalidatePeerRepairDisplay();
     invalidateRemoteCloseConfirmationDisplay();
     // A drawn New form's receipt and Host line map never survive teardown; an
     // already-handed remote create is not cancelled or re-sent here.

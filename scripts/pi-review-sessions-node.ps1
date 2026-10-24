@@ -206,7 +206,9 @@ function Initialize-IdentityType {
     # Atomic no-overwrite publication of the canonical coordination record: the
     # complete record is written to a private candidate and hard-linked into
     # place, which fails when another holder already published.
-    @('CreateHardLinkW', [bool], [Type[]]@([string], [string], [IntPtr]))
+    @('CreateHardLinkW', [bool], [Type[]]@([string], [string], [IntPtr])),
+    # Exclusive secure-at-creation directory (session-host state, Refs #494).
+    @('CreateDirectoryW', [bool], [Type[]]@([string], [IntPtr]))
   )
   foreach ($definition in $methods) {
     $method = $builder.DefinePInvokeMethod($definition[0], 'kernel32.dll', $attributes, [Reflection.CallingConventions]::Standard, $definition[1], $definition[2], [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
@@ -886,6 +888,37 @@ function Remove-NodeCoordinationEntry([string]$Path, [string]$ExpectedIdentity) 
   } catch { return $false }
 }
 
+function New-PrivateStateDirectory([string]$Path) {
+  # A genuinely absent session-host state directory is created exclusively with
+  # a secure-at-creation descriptor (Refs #494): owned by this account, with a
+  # protected DACL granting full control only to this account, LocalSystem, and
+  # the built-in Administrators alias, so it never carries broad inherited
+  # grants. CreateDirectoryW fails for any existing name, and an existing entry
+  # is never inspected for repair, re-ACL'd, or re-owned. Any failure leaves the
+  # caller's ordinary creation path below unchanged; the Network stores prove
+  # protection themselves and refuse an unverified directory.
+  if ($null -ne (Get-ExistingAttributes $Path)) { return }
+  $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $descriptor = New-Object Security.AccessControl.RawSecurityDescriptor ('O:' + $sid + 'D:P(A;OICI;FA;;;' + $sid + ')(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)')
+  $bytes = New-Object byte[] $descriptor.BinaryLength
+  $descriptor.GetBinaryForm($bytes, 0)
+  $saSize = 12
+  if ([IntPtr]::Size -eq 8) { $saSize = 24 }
+  $sd = [Runtime.InteropServices.Marshal]::AllocHGlobal($bytes.Length)
+  $sa = [Runtime.InteropServices.Marshal]::AllocHGlobal($saSize)
+  try {
+    [Runtime.InteropServices.Marshal]::Copy($bytes, 0, $sd, $bytes.Length)
+    # SECURITY_ATTRIBUTES { DWORD nLength; LPVOID lpSecurityDescriptor; BOOL bInheritHandle; }
+    [Runtime.InteropServices.Marshal]::WriteInt32($sa, 0, $saSize)
+    [Runtime.InteropServices.Marshal]::WriteIntPtr($sa, [IntPtr]::Size, $sd)
+    [Runtime.InteropServices.Marshal]::WriteInt32($sa, 2 * [IntPtr]::Size, 0)
+    [void]$script:IdentityType::CreateDirectoryW($Path, $sa)
+  } finally {
+    [Runtime.InteropServices.Marshal]::FreeHGlobal($sa)
+    [Runtime.InteropServices.Marshal]::FreeHGlobal($sd)
+  }
+}
+
 function Enter-NodeCoordination([string]$AgentDirectory) {
   # The one canonical per-agent mutex that host ownership acquisition also takes,
   # so destructive reclamation and a host becoming the owner are mutually
@@ -894,6 +927,11 @@ function Enter-NodeCoordination([string]$AgentDirectory) {
   # stale/dead/reused-pid/malformed metadata is reclaimed.
   if ([string]::IsNullOrEmpty($AgentDirectory)) { return $null }
   $stateDirectory = Join-Path $AgentDirectory 'session-host'
+  # Creation protection is additive: it never changes whether coordination proceeds.
+  try {
+    $agentFullPath = Ensure-DirectoryTree $AgentDirectory
+    New-PrivateStateDirectory (Join-Path $agentFullPath 'session-host')
+  } catch { }
   try { Ensure-DirectoryTree $stateDirectory | Out-Null } catch { return $null }
   $path = Join-Path $stateDirectory 'host-coordination.lock'
   $malformed = 0

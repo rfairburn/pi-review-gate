@@ -173,16 +173,27 @@ import {
   terminalDiagnosticsFailurePhrase,
   type TerminalDiagnosticsWarningView,
 } from "./terminal-diagnostics";
-import type {
-  PeerConsentPresentation,
-  PeerSavedUiAction,
-  PeerUiAction,
-  PeerUiConsent,
-  PeerUiHost,
-  PeerUiHostSaved,
-  PeerUiSettings,
-  PeerUiSnapshot,
-  PeerUiTrustedPeer,
+import {
+  PEER_UI_STORAGE_OBJECT_NAMES,
+  PEER_UI_STORAGE_OBJECTS,
+  PEER_UI_STORAGE_REASONS,
+  describePeerUiStorage,
+  type PeerConsentPresentation,
+  type PeerSavedUiAction,
+  type PeerStorageRepairPresentation,
+  type PeerUiAction,
+  type PeerUiConsent,
+  type PeerUiHost,
+  type PeerUiHostSaved,
+  type PeerUiSettings,
+  type PeerUiSnapshot,
+  type PeerUiStorage,
+  type PeerUiStorageObject,
+  type PeerUiStorageProblem,
+  type PeerUiStorageReason,
+  type PeerUiStorageRepair,
+  type PeerUiStorageTarget,
+  type PeerUiTrustedPeer,
 } from "./peer-ui-protocol";
 import { isOwnerSavedWindowFacts, type OwnerSavedWindowFacts } from "./network/peer-saved";
 
@@ -1062,6 +1073,7 @@ type PeerActionRowKind =
   | "toggle-bell"
   | "toggle-viewer-input"
   | "toggle-history-delete"
+  | "repair-storage"
   | "add-host"
   | "edit-add-label"
   | "edit-add-host"
@@ -1151,6 +1163,30 @@ interface DisplayedPeerConsent {
   readonly rows: number;
   readonly approveRow: number;
   readonly denyRow: number;
+}
+
+/**
+ * Frozen storage-repair confirmation target (Refs #494): the exact assessment
+ * generation, platform, and fixed target statuses the dialog shows. A later
+ * snapshot never retargets it; any difference ends it.
+ */
+interface PeerRepairLatch {
+  readonly generation: number;
+  readonly platform: PeerUiStorage["platform"];
+  readonly targets: readonly PeerUiStorageTarget[];
+}
+
+/** The exact repair-confirmation candidate frame (same shape as consent). */
+interface DisplayedPeerRepair {
+  readonly identity: string;
+  readonly key: string;
+  readonly token: number;
+  readonly generation: number;
+  readonly choice: "repair" | "cancel";
+  readonly cols: number;
+  readonly rows: number;
+  readonly repairRow: number;
+  readonly cancelRow: number;
 }
 
 /**
@@ -2238,6 +2274,92 @@ function copyPeerConsent(value: unknown): PeerUiConsent | null {
   return { id, kind, label, fingerprint, endpoint, requestedAt, expiresAt };
 }
 
+function displayStorageReason(value: unknown): PeerUiStorageReason | null | undefined {
+  if (value === null) return null;
+  return typeof value === "string" && (PEER_UI_STORAGE_REASONS as readonly string[]).includes(value)
+    ? value as PeerUiStorageReason
+    : undefined;
+}
+
+function displayStorageObject(value: unknown): PeerUiStorageObject | null | undefined {
+  if (value === null) return null;
+  return typeof value === "string" && (PEER_UI_STORAGE_OBJECTS as readonly string[]).includes(value)
+    ? value as PeerUiStorageObject
+    : undefined;
+}
+
+/**
+ * Validates the optional storage fact. Every field is a closed vocabulary: a
+ * malformed repair description is never an offer, and a malformed fact is
+ * dropped as a whole rather than half-shown.
+ */
+function copyPeerStorage(value: unknown): PeerUiStorage | null {
+  const source = displayObject(value);
+  if (source === undefined) return null;
+  const platform = source.platform === "windows" || source.platform === "posix" ? source.platform : undefined;
+  if (platform === undefined || !Array.isArray(source.problems)) return null;
+  const problems: PeerUiStorageProblem[] = [];
+  for (const candidate of source.problems.slice(0, 8)) {
+    const problem = displayObject(candidate);
+    const store = problem?.store === "settings" || problem?.store === "trust" ? problem.store : undefined;
+    const reason = displayStorageReason(problem?.reason);
+    const object = displayStorageObject(problem?.object);
+    if (store === undefined || reason === undefined || object === undefined) return null;
+    problems.push({ store, reason, object });
+  }
+  const repairSource = displayObject(source.repair);
+  const state = displayText(repairSource?.state);
+  let repair: PeerUiStorageRepair;
+  switch (state) {
+    case "none":
+    case "unchecked":
+    case "unsupported":
+    case "nothing-to-repair":
+    case "busy":
+      repair = { state };
+      break;
+    case "blocked": {
+      const target = displayStorageObject(repairSource?.target);
+      const reason = displayStorageReason(repairSource?.reason);
+      if (target === undefined || target === null || reason === undefined) return null;
+      repair = { state, target, reason };
+      break;
+    }
+    case "offered": {
+      const generation = repairSource?.generation;
+      const targetsValue = repairSource?.targets;
+      if (typeof generation !== "number" || !Number.isSafeInteger(generation) || !Array.isArray(targetsValue)
+        || targetsValue.length !== PEER_UI_STORAGE_OBJECTS.length) return null;
+      const targets: PeerUiStorageTarget[] = [];
+      for (const [index, candidate] of targetsValue.entries()) {
+        const entry = displayObject(candidate);
+        const target = displayStorageObject(entry?.target);
+        const status = entry?.status;
+        const reason = displayStorageReason(entry?.reason);
+        // The fixed parent-first order is part of what the confirmation shows.
+        if (target !== PEER_UI_STORAGE_OBJECTS[index] || reason === undefined
+          || (status !== "absent" && status !== "protected" && status !== "repairable"
+            && status !== "refused" && status !== "not-assessed")) return null;
+        targets.push({ target, status, reason });
+      }
+      if (!targets.some((target) => target.status === "repairable")
+        || targets.some((target) => target.status === "refused")) return null;
+      repair = { state, generation, targets };
+      break;
+    }
+    case "restart-required": {
+      const outcome = repairSource?.outcome;
+      const prior = displayBoolean(repairSource?.priorExposurePossible);
+      if ((outcome !== "repaired" && outcome !== "partial") || prior === undefined) return null;
+      repair = { state, outcome, priorExposurePossible: prior };
+      break;
+    }
+    default:
+      return null;
+  }
+  return { platform, problems, repair };
+}
+
 function copyPeerList<T>(value: unknown, max: number, copy: (entry: unknown) => T | null): readonly T[] | null {
   if (value === null || value === undefined) return null;
   if (!Array.isArray(value)) return null;
@@ -2281,9 +2403,11 @@ function copyPeerSnapshot(value: PeerUiSnapshot): PeerUiSnapshot {
     || identityFingerprint === undefined || notice === undefined) {
     throw new Error("SidebarController.setPeerUiSnapshot expects a complete PeerUiSnapshot");
   }
+  const storage = source.storage === null || source.storage === undefined ? null : copyPeerStorage(source.storage);
   return {
     revision,
     status,
+    ...(storage === null ? {} : { storage }),
     settings: copyPeerSettings(source.settings),
     identityFingerprint,
     listener: {
@@ -2377,6 +2501,17 @@ export class SidebarController {
   private peerConsentTokenSequence = 1;
   /** Bounded local notice shown inside the consent dialog (never a decision). */
   private peerConsentLocalNotice: string | undefined;
+  /** Frozen storage-repair confirmation target; never retargeted in place. */
+  private peerRepairLatch: PeerRepairLatch | undefined;
+  private peerRepairChoice: "repair" | "cancel" = "cancel";
+  /** Current candidate repair frame (latch + choice + geometry + control rows). */
+  private peerRepairDisplay: DisplayedPeerRepair | undefined;
+  /** True only while the last render drew this exact complete repair dialog. */
+  private peerRepairRendered = false;
+  /** Token Main reported as actually written; the ONLY repair authority. */
+  private peerRepairWrittenToken: number | undefined;
+  private peerRepairTokenSequence = 1;
+  private peerRepairLocalNotice: string | undefined;
   private savedQueryInput?: SidebarSavedQueryInput;
   private formField?: SessionHostTextField;
   private formMatchesCancel: (data: string) => boolean = (data) => matchesKey(data, "escape");
@@ -2545,6 +2680,7 @@ export class SidebarController {
     | "peer-consent"
     | "peer-remove"
     | "peer-revoke"
+    | "peer-repair"
     | "remote-close" = "quit";
   /** Frozen stop target id; later navigation never retargets the confirmation. */
   private stopRemoveTargetId: string | undefined;
@@ -2710,6 +2846,16 @@ export class SidebarController {
   get peerConsentConfirmationActive(): boolean {
     return this._visible && this._focus === "confirm" && this.confirmPurpose === "peer-consent"
       && this.peerConsentLatch !== undefined;
+  }
+
+  /**
+   * True while the frozen storage-repair confirmation owns confirm focus. Like
+   * the consent getter it is only a placement signal for the wide right-hand
+   * confirmation slot; it never authorizes a repair.
+   */
+  get peerRepairConfirmationActive(): boolean {
+    return this._visible && this._focus === "confirm" && this.confirmPurpose === "peer-repair"
+      && this.peerRepairLatch !== undefined;
   }
 
   /** Opaque token for the last fully rendered Saved-delete warning candidate. */
@@ -3753,6 +3899,12 @@ export class SidebarController {
       this.invalidatePeerConsentDisplay();
       this.peerConsentLocalNotice = "This request is no longer pending; no decision was sent";
     }
+    // A frozen repair confirmation whose assessment is no longer the one offered
+    // loses its frame and written proof; it is never retargeted to the new one.
+    if (this.peerRepairLatch !== undefined && !this.peerRepairStillOffered(this.peerRepairLatch)) {
+      this.invalidatePeerRepairDisplay();
+      this.peerRepairLocalNotice = "Network storage changed; no repair was requested. Close this and review it again";
+    }
     this.rebuildEntries();
     if (this.selectedEntryKey === ENTRY_PEER_KEY && this.currentEntry() === undefined) {
       this.selectedEntryKey = undefined;
@@ -3790,6 +3942,9 @@ export class SidebarController {
     this.invalidatePeerConsentDisplay();
     this.peerConsentLatch = undefined;
     this.peerConsentLocalNotice = undefined;
+    this.peerRepairLatch = undefined;
+    this.peerRepairLocalNotice = undefined;
+    this.invalidatePeerRepairDisplay();
     this.remoteCloseTarget = undefined;
     this.remoteCloseNotice = undefined;
     this.invalidateRemoteCloseConfirmationDisplay();
@@ -3855,6 +4010,52 @@ export class SidebarController {
     this.peerConsentDisplay = undefined;
     this.peerConsentRendered = false;
     this.peerConsentWrittenToken = undefined;
+  }
+
+  /**
+   * Captures the exact current complete storage-repair candidate for Main's
+   * frame writer, only while Repair (not Cancel) is the drawn choice and the
+   * frozen assessment is still the one the coordinator offers. Capturing
+   * authorizes nothing by itself.
+   */
+  capturePeerRepairPresentation(): PeerStorageRepairPresentation | undefined {
+    const display = this.peerRepairDisplay;
+    if (display === undefined || display.choice !== "repair" || !this.isPeerRepairRenderCurrent(display.token)) {
+      return undefined;
+    }
+    return { generation: display.generation, renderToken: display.token };
+  }
+
+  /**
+   * Whether this token still names the CURRENT complete repair frame: same
+   * frozen assessment, same choice, same geometry and control rows, still open
+   * and still offered by the latest snapshot.
+   */
+  isPeerRepairRenderCurrent(token: number): boolean {
+    const display = this.peerRepairDisplay;
+    const latch = this.peerRepairLatch;
+    if (display === undefined || latch === undefined) return false;
+    if (token !== display.token || !this.peerRepairRendered) return false;
+    if (!this._visible || this._focus !== "confirm" || this.confirmPurpose !== "peer-repair") return false;
+    if (!this.peerRepairStillOffered(latch)) return false;
+    if (display.generation !== latch.generation || display.choice !== this.peerRepairChoice) return false;
+    return display.identity === this.peerRepairFrameIdentity(
+      latch, this.peerRepairChoice, display.cols, display.rows, display.repairRow, display.cancelRow,
+    );
+  }
+
+  /** Trusted Main-only settlement of an actually written repair frame. */
+  settlePeerRepairRender(token: number): boolean {
+    if (!this.isPeerRepairRenderCurrent(token)) return false;
+    this.peerRepairWrittenToken = token;
+    return true;
+  }
+
+  /** Revokes the repair candidate frame and any written proof. */
+  invalidatePeerRepairDisplay(): void {
+    this.peerRepairDisplay = undefined;
+    this.peerRepairRendered = false;
+    this.peerRepairWrittenToken = undefined;
   }
 
   /**
@@ -4101,7 +4302,8 @@ export class SidebarController {
     if (!this._visible) return false;
     if (this._focus === "form") return this.formKind !== undefined;
     if (this._focus === "confirm") {
-      return this.savedDeleteConfirmationActive || this.peerConsentConfirmationActive;
+      return this.savedDeleteConfirmationActive || this.peerConsentConfirmationActive
+        || this.peerRepairConfirmationActive;
     }
     return false;
   }
@@ -4131,6 +4333,11 @@ export class SidebarController {
       // Main's snapshot and its alert band.
       if (this.confirmPurpose === "peer-consent") {
         this.dismissPeerConsentReview();
+        return true;
+      }
+      // Cancelling, never requesting: the whole Network pane closes with it.
+      if (this.confirmPurpose === "peer-repair") {
+        this.dismissPeerRepairReview(false, undefined);
         return true;
       }
       return false;
@@ -4331,6 +4538,7 @@ export class SidebarController {
     // A fresh frame starts with no settled consent-dialog authority; only a
     // complete render of the exact dialog can re-establish a candidate token.
     this.peerConsentRendered = false;
+    this.peerRepairRendered = false;
     // The remote-close dialog's written proof is re-established the same way:
     // only a complete render of the exact frozen target can mint/keep its token.
     this.remoteCloseRendered = false;
@@ -4354,6 +4562,7 @@ export class SidebarController {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
     this.peerConsentRendered = false;
+    this.peerRepairRendered = false;
     this.remoteCloseRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
     // A standalone roster render draws no form pane. The wide layout renders the
@@ -4378,6 +4587,7 @@ export class SidebarController {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
     this.peerConsentRendered = false;
+    this.peerRepairRendered = false;
     this.remoteCloseRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
     this.displayedSavedRows = undefined;
@@ -4385,7 +4595,9 @@ export class SidebarController {
     // form-slot pane forgets it so a stale map can never authorize an action.
     if (this.formKind !== "peer") this.peerDisplay = undefined;
     // Likewise only an uncovered Saved picker render may keep its drawn frame.
-    if (this.formKind !== "saved" || this.peerConsentConfirmationActive) this.invalidateSavedPickerPresentation();
+    if (this.formKind !== "saved" || this.peerConsentConfirmationActive || this.peerRepairConfirmationActive) {
+      this.invalidateSavedPickerPresentation();
+    }
     if (cols < FORM_MIN_COLS || rows < FORM_MIN_ROWS) {
       this.invalidateSavedPickerPresentation();
       // An unshowable form-slot frame forgets the drawn network rows and
@@ -4393,6 +4605,7 @@ export class SidebarController {
       // earlier receipt may be restored by a later render at the old geometry.
       this.peerDisplay = undefined;
       this.invalidatePeerConsentDisplay();
+      this.invalidatePeerRepairDisplay();
       // An unshowable New form is not on screen at all.
       this.invalidateCreateFormPresentation();
       return this.renderTooSmall(cols, rows);
@@ -4404,6 +4617,11 @@ export class SidebarController {
       // A covering dialog means the New form is not the displayed pane.
       this.invalidateCreateFormPresentation();
       return this.renderPeerConsentPane(cols, rows);
+    }
+    if (this.peerRepairConfirmationActive) {
+      // The same wide hostConfirmation slot holds the storage-repair dialog.
+      this.invalidateCreateFormPresentation();
+      return this.renderPeerRepairPane(cols, rows);
     }
     if (this.formKind === "peer") {
       this.invalidateCreateFormPresentation();
@@ -4435,6 +4653,7 @@ export class SidebarController {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
     this.peerConsentRendered = false;
+    this.peerRepairRendered = false;
     this.remoteCloseRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
     this.invalidateCreateFormPresentation();
@@ -4466,6 +4685,7 @@ export class SidebarController {
         this.peerConfirmDisplayed = false;
         this.invalidateSavedDeleteConfirmationDisplay();
         this.invalidatePeerConsentDisplay();
+        this.invalidatePeerRepairDisplay();
         // An unshowable confirmation proves nothing: no pending remote close
         // keeps a written receipt or a confirmable token at this geometry.
         this.invalidateRemoteCloseConfirmationDisplay();
@@ -7022,6 +7242,7 @@ export class SidebarController {
     // network confirmations take this route; existing confirmation semantics
     // are unchanged.
     if ((this.confirmPurpose === "peer-consent"
+      || this.confirmPurpose === "peer-repair"
       || this.confirmPurpose === "peer-remove"
       || this.confirmPurpose === "peer-revoke"
       || this.confirmPurpose === "remote-close"
@@ -7055,6 +7276,10 @@ export class SidebarController {
     }
     if (this.confirmPurpose === "peer-consent") {
       this.handlePeerConsentInput(data);
+      return;
+    }
+    if (this.confirmPurpose === "peer-repair") {
+      this.handlePeerRepairInput(data);
       return;
     }
     if (this.confirmPurpose === "peer-remove" || this.confirmPurpose === "peer-revoke") {
@@ -7476,6 +7701,255 @@ export class SidebarController {
     return (candidate) => printable !== undefined && printableOf(candidate) === printable;
   }
 
+  // --- Storage permission repair confirmation (Refs #494). ---
+
+  /**
+   * Whether the latest snapshot still offers exactly the frozen assessment:
+   * same generation, platform, and fixed target statuses. Anything else ends
+   * the latch; it is never retargeted to a newer offer.
+   */
+  private peerRepairStillOffered(latch: PeerRepairLatch): boolean {
+    const storage = this.peerUiSnapshot?.storage;
+    if (storage === undefined || storage === null) return false;
+    const repair = storage.repair;
+    return repair.state === "offered" && repair.generation === latch.generation
+      && storage.platform === latch.platform
+      && JSON.stringify(repair.targets) === JSON.stringify(latch.targets);
+  }
+
+  private peerRepairFrameIdentity(
+    latch: PeerRepairLatch,
+    choice: "repair" | "cancel",
+    cols: number,
+    rows: number,
+    repairRow: number,
+    cancelRow: number,
+  ): string {
+    return JSON.stringify([
+      latch.generation, latch.platform, JSON.stringify(latch.targets), choice, cols, rows, repairRow, cancelRow,
+    ]);
+  }
+
+  /** Latches the offered assessment and opens its confirmation; sends nothing. */
+  private openPeerRepairReview(): void {
+    const storage = this.peerUiSnapshot?.storage;
+    if (storage === undefined || storage === null || storage.repair.state !== "offered") {
+      this.peerPaneError = "The permission repair is not offered now; nothing was sent";
+      this.onInvalidate?.();
+      return;
+    }
+    const repair = storage.repair;
+    this.forgetDisplayedRoster();
+    this.disposeFormField();
+    this.formKind = undefined;
+    this.peerDisplay = undefined;
+    this.peerConfirmDisplayed = false;
+    this.peerRemoveTarget = undefined;
+    this.peerRevokeTarget = undefined;
+    this.peerRepairLatch = Object.freeze({
+      generation: repair.generation,
+      platform: storage.platform,
+      targets: Object.freeze(repair.targets.map((target) => Object.freeze({ ...target }))),
+    });
+    this.peerRepairChoice = "cancel";
+    this.peerRepairLocalNotice = undefined;
+    this.invalidatePeerRepairDisplay();
+    this.confirmPurpose = "peer-repair";
+    this._focus = "confirm";
+    this.onInvalidate?.();
+  }
+
+  /**
+   * Closes the confirmation without requesting anything. `returnToPane` keeps
+   * the Network pane open (keyboard cancel); otherwise the whole pane closes.
+   */
+  private dismissPeerRepairReview(returnToPane: boolean, notice: string | undefined): void {
+    this.peerRepairLatch = undefined;
+    this.peerRepairLocalNotice = undefined;
+    this.invalidatePeerRepairDisplay();
+    this.confirmPurpose = "quit";
+    if (returnToPane && this.peerUiSnapshot !== undefined) {
+      this.formKind = "peer";
+      this._focus = "form";
+      this.peerPaneError = undefined;
+      this.peerPaneNotice = notice;
+    } else {
+      this.closePeerPane();
+      this._focus = "sidebar";
+    }
+    this.onInvalidate?.();
+  }
+
+  private peerRepairTargetText(target: PeerUiStorageTarget): string {
+    const name = PEER_UI_STORAGE_OBJECT_NAMES[target.target];
+    switch (target.status) {
+      case "repairable":
+        return target.reason === "extended-acl"
+          ? `- ${name}: granting ACL entry will be removed`
+          : `- ${name}: protection will be repaired`;
+      case "protected":
+        return `- ${name}: already protected, left unchanged`;
+      case "absent":
+        return `- ${name}: absent, not created`;
+      case "not-assessed":
+        return `- ${name}: not checked, left unchanged`;
+      default:
+        return `- ${name}: refused`;
+    }
+  }
+
+  /**
+   * The complete repair confirmation: fixed targets, protection rule, what is
+   * preserved and excluded, the prior-access warning, and the deliberate
+   * restart, plus Repair/Cancel. Nothing is ellipsized: a frame that cannot show
+   * all of it mints no token, so nothing partial can authorize a repair.
+   */
+  private renderPeerRepairPane(cols: number, rows: number): { lines: string[] } {
+    const tooSmall = (): { lines: string[] } => {
+      this.invalidatePeerRepairDisplay();
+      return this.renderTooSmall(cols, rows);
+    };
+    const latch = this.peerRepairLatch;
+    if (latch === undefined) return tooSmall();
+    const header = " Repair Network storage permissions? ";
+    const targetLines: string[] = [];
+    for (const target of latch.targets) {
+      const wrapped = wrapExactField(this.peerRepairTargetText(target), cols, 4);
+      if (wrapped === undefined) return tooSmall();
+      targetLines.push(...wrapped);
+    }
+    const intro = wrapSentenceLines([
+      "Only the protection of these existing items in the Pi agent directory changes:",
+    ], cols);
+    const body = wrapSentenceLines([
+      latch.platform === "windows"
+        ? "New protection: a protected access list for only your account, SYSTEM, and Administrators."
+        : "New protection: owner-only access for your account (directories 0700, files 0600) with no ACL entry granting another account.",
+      "Contents, the identity key, pins, receiving grants, saved settings, and destinations stay byte for byte; ownership is not changed.",
+      "The agent directory, its parent folders, and every other file are not touched; nothing is created, deleted, or swept.",
+      "Repair cannot undo earlier access: if another account could read these files, replace the identity key separately (see the manual identity replacement guide) and pair again.",
+      "Afterwards Network stays unavailable until you restart Pi; nothing hosts or connects by itself.",
+    ], cols);
+    const hintLines = wrapHintLines(["up/down choose", "enter apply", "esc cancel"], cols);
+    if (intro === undefined || body === undefined || hintLines === undefined || visibleWidth(header) > cols) {
+      return tooSmall();
+    }
+    const noticeLines = this.peerRepairLocalNotice === undefined
+      ? []
+      : wrapHintLines([`! ${this.peerRepairLocalNotice}`], cols) ?? [];
+    const bodyRows = 1 + intro.length + targetLines.length + body.length + noticeLines.length + 2 + hintLines.length;
+    if (bodyRows > rows) return tooSmall();
+
+    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
+    for (const line of intro) lines.push(wrapRow(line, cols));
+    for (const line of targetLines) lines.push(wrapRow(line, cols));
+    for (const line of body) lines.push(wrapRow(line, cols));
+    for (const line of noticeLines) lines.push(wrapRow(line, cols));
+    const repairRow = lines.length;
+    lines.push(wrapRow(`${this.peerRepairChoice === "repair" ? "> " : "  "}Repair permissions`, cols,
+      this.peerRepairChoice === "repair" ? SGR_SELECTION_BLUE : undefined));
+    const cancelRow = lines.length;
+    lines.push(wrapRow(`${this.peerRepairChoice === "cancel" ? "> " : "  "}Cancel`, cols,
+      this.peerRepairChoice === "cancel" ? SGR_SELECTION_BLUE : undefined));
+    lines.push(...blankLines(Math.max(0, rows - lines.length - hintLines.length)));
+    for (const line of hintLines) lines.push(wrapRow(line, cols));
+
+    if (!this.peerRepairStillOffered(latch)) {
+      // A frozen assessment the coordinator no longer offers names no token.
+      this.invalidatePeerRepairDisplay();
+      return { lines };
+    }
+    const frameIdentity = this.peerRepairFrameIdentity(latch, this.peerRepairChoice, cols, rows, repairRow, cancelRow);
+    const key = `${frameIdentity}\n${lines.join("\n")}`;
+    if (this.peerRepairDisplay !== undefined && this.peerRepairDisplay.key === key) {
+      this.peerRepairRendered = true;
+      return { lines };
+    }
+    const token = this.peerRepairTokenSequence++;
+    this.peerRepairDisplay = {
+      identity: frameIdentity,
+      key,
+      token,
+      generation: latch.generation,
+      choice: this.peerRepairChoice,
+      cols,
+      rows,
+      repairRow,
+      cancelRow,
+    };
+    this.peerRepairWrittenToken = undefined;
+    this.peerRepairRendered = true;
+    return { lines };
+  }
+
+  private handlePeerRepairInput(data: string): void {
+    if (this.consumeSavedActionClaim(data)) return;
+    // Only deliberate initial presses act; held repeats/releases never do.
+    if (isKeyRelease(data) || isKeyRepeat(data)) return;
+    if (matchesKey(data, "escape")) {
+      this.formEscapeClaimed = true;
+      this.dismissPeerRepairReview(true, "Repair cancelled; nothing was changed");
+      return;
+    }
+    if (matchesKey(data, "up") || matchesKey(data, "down") || matchesKey(data, "tab")) {
+      this.setPeerRepairChoice(this.peerRepairChoice === "repair" ? "cancel" : "repair");
+      return;
+    }
+    if (matchesKey(data, "enter")) {
+      this.applyPeerRepairChoice(data);
+      return;
+    }
+    const printable = printableOf(data);
+    if (printable === "y" || printable === "Y") {
+      this.setPeerRepairChoice("repair");
+      return;
+    }
+    if (printable === "n" || printable === "N") this.setPeerRepairChoice("cancel");
+  }
+
+  private setPeerRepairChoice(choice: "repair" | "cancel"): void {
+    if (this.peerRepairChoice === choice) return;
+    this.peerRepairChoice = choice;
+    this.invalidatePeerRepairDisplay();
+    this.peerRepairLocalNotice = choice === "repair"
+      ? "Repair chosen; apply becomes available once this frame is written"
+      : undefined;
+    this.onInvalidate?.();
+  }
+
+  /**
+   * Cancel closes the dialog and sends nothing. Repair emits one request only
+   * for the exact CURRENT frame Main already settled with an actual writer
+   * receipt; the held key is fenced so a repeat/release cannot send twice.
+   */
+  private applyPeerRepairChoice(data: string): void {
+    if (this.peerRepairChoice === "cancel") {
+      this.dismissPeerRepairReview(true, "Repair cancelled; nothing was changed");
+      return;
+    }
+    const display = this.peerRepairDisplay;
+    const latch = this.peerRepairLatch;
+    if (display === undefined || latch === undefined || !this.isPeerRepairRenderCurrent(display.token)) {
+      this.peerRepairLocalNotice = "No current dialog frame; no repair was requested";
+      this.onInvalidate?.();
+      return;
+    }
+    if (this.peerRepairWrittenToken !== display.token) {
+      this.peerRepairLocalNotice = "No written receipt for this frame yet; no repair was requested";
+      this.onInvalidate?.();
+      return;
+    }
+    const generation = latch.generation;
+    const renderToken = display.token;
+    this.claimHeldAction(this.peerConsentActionMatcher(data));
+    // Dispatch while this exact frame is still current: Main's synchronous
+    // guard rechecks the written frame during its onAction handling.
+    this.emit({ type: "peer-storage-repair", generation, renderToken });
+    if (this.peerRepairLatch === latch) {
+      this.dismissPeerRepairReview(true, "Repair requested; the coordinator reports the outcome");
+    }
+  }
+
   /**
    * The semantic intent one actionable network row acts on, read at the moment
    * the row is built. Toggles flip the opposite of the drawn state and Apply rows
@@ -7506,6 +7980,13 @@ export class SidebarController {
         return [kind, known, settings?.viewerNativeInputEnabled ?? null];
       case "toggle-history-delete":
         return [kind, known, settings?.remoteHistoryDeleteEnabled ?? null];
+      case "repair-storage": {
+        // The row opens a review of exactly the offered assessment it drew.
+        const repair = this.peerUiSnapshot?.storage?.repair;
+        return repair?.state === "offered"
+          ? [kind, repair.generation, JSON.stringify(repair.targets)]
+          : [kind, null, null];
+      }
       // Opening the menu shows the whole draft, so the whole draft is its intent.
       case "add-host":
       case "apply-add":
@@ -7527,7 +8008,12 @@ export class SidebarController {
       return (["edit-add-label", "edit-add-host", "edit-add-port", "apply-add"] as const)
         .map((kind) => ({ key: kind, kind, intent: this.peerPaneRowIntent(kind) }));
     }
-    const rows: PeerPaneRow[] = ([
+    const rows: PeerPaneRow[] = [];
+    // The storage repair row exists only while the coordinator offers it.
+    if (this.peerUiSnapshot?.storage?.repair.state === "offered") {
+      rows.push({ key: "repair-storage", kind: "repair-storage", intent: this.peerPaneRowIntent("repair-storage") });
+    }
+    rows.push(...([
       "toggle-hosting",
       "edit-bind-host",
       "edit-bind-port",
@@ -7537,7 +8023,7 @@ export class SidebarController {
       "toggle-viewer-input",
       "toggle-history-delete",
       "add-host",
-    ] as const).map((kind) => ({ key: kind, kind, intent: this.peerPaneRowIntent(kind) }));
+    ] as const).map((kind) => ({ key: kind, kind, intent: this.peerPaneRowIntent(kind) })));
     const snapshot = this.peerUiSnapshot;
     if (snapshot === undefined) return rows;
     for (const host of snapshot.hosts ?? []) {
@@ -7663,6 +8149,8 @@ export class SidebarController {
         return `Remote input/copy: ${settings === null ? "unknown" : settings.viewerNativeInputEnabled ? "on" : "off"} (enter to toggle)`;
       case "toggle-history-delete":
         return `Allow remote history deletion: ${settings === null ? "unknown" : settings.remoteHistoryDeleteEnabled ? "on" : "off"} (enter to toggle)`;
+      case "repair-storage":
+        return "Repair Network storage permissions... (enter to review)";
       case "add-host":
         return "Add destination";
       case "edit-add-label":
@@ -7733,6 +8221,10 @@ export class SidebarController {
     const header = addMenu ? " Add destination " : " Network ";
     const statusLines = wrapHintLines(this.peerStatusSegments(snapshot), cols);
     const identityLines = wrapBoundedField(this.peerIdentityText(snapshot), cols, 2);
+    // Sanitized storage why/mitigation lines: fixed text from closed facts only.
+    const storageLines = addMenu || snapshot.storage === undefined || snapshot.storage === null
+      ? []
+      : wrapSentenceLines(describePeerUiStorage(snapshot.storage), cols) ?? [];
     const notices = [snapshot.notice, this.peerPaneError, this.peerPaneNotice]
       .filter((message): message is string => typeof message === "string" && message.trim().length > 0)
       .map((message) => `! ${sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS)}`);
@@ -7755,7 +8247,8 @@ export class SidebarController {
         "esc back",
       ], cols);
     if (statusLines === undefined || footerLines === undefined) return this.renderTooSmall(cols, rows);
-    const fixedRows = 1 + statusLines.length + identityLines.length + noticeLines.length + footerLines.length;
+    const fixedRows = 1 + statusLines.length + identityLines.length + storageLines.length + noticeLines.length
+      + footerLines.length;
     const listRows = rows - fixedRows;
     if (listRows < 1) return this.renderTooSmall(cols, rows);
     const paneRows = this.buildPeerPaneRows();
@@ -7764,6 +8257,7 @@ export class SidebarController {
     const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
     for (const line of statusLines) lines.push(wrapRow(line, cols));
     for (const line of identityLines) lines.push(wrapRow(line, cols));
+    for (const line of storageLines) lines.push(wrapRow(line, cols));
     for (const line of noticeLines) lines.push(wrapRow(line, cols));
     const drawn: DisplayedPeerRow[] = [];
     for (let index = top; index < paneRows.length && drawn.length < listRows; index += 1) {
@@ -7953,6 +8447,9 @@ export class SidebarController {
         this.peerPaneNotice = "Remote history deletion policy change requested for this host; the coordinator reports the saved setting";
         this.peerPaneError = undefined;
         this.onInvalidate?.();
+        return;
+      case "repair-storage":
+        this.openPeerRepairReview();
         return;
       case "add-host":
         this.openPeerAddMenu();
@@ -8455,6 +8952,9 @@ export class SidebarController {
     this.peerConsentLatch = undefined;
     this.peerConsentLocalNotice = undefined;
     this.invalidatePeerConsentDisplay();
+    this.peerRepairLatch = undefined;
+    this.peerRepairLocalNotice = undefined;
+    this.invalidatePeerRepairDisplay();
     this.peerConfirmDisplayed = false;
     this.peerRemoveTarget = undefined;
     this.peerRevokeTarget = undefined;
@@ -9431,8 +9931,12 @@ export class SidebarController {
 
   private renderConfirmPane(cols: number, rows: number): { lines: string[] } {
     this.peerConsentRendered = false;
+    this.peerRepairRendered = false;
     if (this.confirmPurpose === "peer-consent") {
       return this.renderPeerConsentPane(cols, rows);
+    }
+    if (this.confirmPurpose === "peer-repair") {
+      return this.renderPeerRepairPane(cols, rows);
     }
     if (this.confirmPurpose === "peer-remove") {
       return this.renderPeerRemoveConfirmPane(cols, rows);
@@ -9665,6 +10169,17 @@ export class SidebarController {
  * dropping text.
  */
 const detailGraphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** Word-wraps each sentence onto its own lines; undefined when a word cannot fit. */
+function wrapSentenceLines(sentences: readonly string[], cols: number): string[] | undefined {
+  const lines: string[] = [];
+  for (const sentence of sentences) {
+    const wrapped = wrapHintLines([sentence], cols);
+    if (wrapped === undefined) return undefined;
+    lines.push(...wrapped);
+  }
+  return lines;
+}
 
 function wrapBoundedField(text: string, cols: number, maxLines: number): string[] {
   const lines: string[] = [];

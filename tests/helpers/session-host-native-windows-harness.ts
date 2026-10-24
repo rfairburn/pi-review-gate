@@ -30,6 +30,7 @@ import {
   type FSWatcher,
 } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { Worker } from "node:worker_threads";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 import {
@@ -92,6 +93,7 @@ import {
   type NativeExchangeGuardSnapshot,
 } from "./session-host-windows-native-exchange-guard-contract";
 import { NODE_SECURITY_FLOOR_TEXT, stableNodeMeetsSecurityFloor } from "./node-security-floor";
+import { formatWindowsStartupDiagnostic } from "./session-host-windows-startup-trace-contract";
 
 export {
   assertNativeEditorFieldEmpty,
@@ -125,10 +127,18 @@ const WINDOWS_BASELINE = "SESSION_HOST_NATIVE_WINDOWS_OUTER_RESTORATION_BASELINE
 const ROLE_ENV = "PI_REVIEW_GATE_RUNTIME_ROLE";
 const TOOL_CATALOG_ENV = "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG";
 const CREDENTIAL_NAME = /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD)/i;
+/** Fixed Windows OS runtime names, identical to the console probe's PROFILE_SYSTEM_NAMES. */
+const WINDOWS_OS_ENV_NAMES = [
+  "PSModulePath", "ProgramData", "ALLUSERSPROFILE", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432",
+  "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432", "PUBLIC", "PATHEXT", "ComSpec",
+  "SystemDrive", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "OS", "USERNAME", "USERDOMAIN", "COMPUTERNAME",
+] as const;
 const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const MAX_WITNESS_BYTES = 1024;
 const MAX_CENSUS_REPLY_BYTES = 4 * 1024;
 const MAX_NATIVE_CENSUS_REPLY_BYTES = 4 * 1024;
+const MAX_STARTUP_TRACE_BYTES = 320 * 1024;
+const MAX_RESULT_BYTES = 16 * 1024;
 const CENSUS_REQUEST_FILENAME = "main-census-request.json";
 const CENSUS_REPLY_FILENAME = "main-census-reply.json";
 const NATIVE_CENSUS_PRELOAD_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-windows-native-stdout-census-preload.cjs");
@@ -803,6 +813,24 @@ interface MainResult {
   readonly rawAfter: unknown;
 }
 
+/**
+ * Pinned @lydell/node-pty 1.2.0-beta.15 with useConptyDll leaves its owned
+ * conout reader Worker running after a natural exit: kill() disposes it only
+ * on future output, which cannot arrive once onExit fired. After the actual
+ * exit, close the exact PTY through public kill() (native PTY token, no PID
+ * enumeration on the DLL path) and terminate only that reader Worker so the
+ * test file ends naturally. Any other shape fails closed before kill().
+ */
+export async function closeExitedOwnedConptyReader(pty: NativePtyHandle): Promise<void> {
+  const agent = (pty as unknown as { _agent?: { _useConptyDll?: unknown; _conoutSocketWorker?: { _worker?: unknown } } })._agent;
+  const reader = agent?._conoutSocketWorker?._worker;
+  if (agent?._useConptyDll !== true || !(reader instanceof Worker)) {
+    throw new Error("exited outer PTY is not the pinned ConPTY-DLL shape with an owned reader Worker");
+  }
+  pty.kill(); // Exact public outer PTY handle, no signal argument.
+  await reader.terminate();
+}
+
 export class WindowsMainPtyDriver {
   readonly pty: NativePtyHandle;
   /**
@@ -817,6 +845,8 @@ export class WindowsMainPtyDriver {
   readonly providerJournal: string;
   readonly ptyJournal: string;
   readonly forceJournal: string;
+  /** Fixed-vocabulary runner startup trace (diagnosis only; see the runner trace fixture). */
+  readonly stageJournal: string;
   readonly surface: TerminalSurface;
   readonly frameSignal = new ChangeSignal();
   readonly outputSignal = new ChangeSignal();
@@ -855,6 +885,12 @@ export class WindowsMainPtyDriver {
   private readonly exitSubscription: { dispose(): void };
   private readonly initialModes: ReturnType<TerminalSurface["inputModes"]>;
   private forced = false;
+  /** Bounded numeric output metadata for the startup diagnostic; never content. */
+  private readonly spawnedAt = performance.now();
+  private dataChunks = 0;
+  private dataChars = 0;
+  private firstDataMs?: number;
+  private lastDataMs?: number;
 
   private constructor(options: {
     pty: NativePtyHandle;
@@ -866,6 +902,7 @@ export class WindowsMainPtyDriver {
     providerJournal: string;
     ptyJournal: string;
     forceJournal: string;
+    stageJournal: string;
     logWatcher: FSWatcher;
     nativeWatcher: FSWatcher;
     providerWatcher: FSWatcher;
@@ -884,6 +921,7 @@ export class WindowsMainPtyDriver {
     this.providerJournal = options.providerJournal;
     this.ptyJournal = options.ptyJournal;
     this.forceJournal = options.forceJournal;
+    this.stageJournal = options.stageJournal;
     this.logWatcher = options.logWatcher;
     this.nativeWatcher = options.nativeWatcher;
     this.providerWatcher = options.providerWatcher;
@@ -934,7 +972,8 @@ export class WindowsMainPtyDriver {
     const providerJournal = join(options.fixtureState, "provider-journal.jsonl");
     const ptyJournal = join(options.root, "pty-events.jsonl");
     const forceJournal = join(options.root, "force-events.jsonl");
-    for (const path of [observerFile, providerJournal, ptyJournal, forceJournal]) writeOwnedFile(path, "");
+    const stageJournal = join(options.root, "runner-stages.jsonl");
+    for (const path of [observerFile, providerJournal, ptyJournal, forceJournal, stageJournal]) writeOwnedFile(path, "");
 
     const args = [
       "--offline", "--no-context-files", "--no-themes", "--no-tools",
@@ -988,6 +1027,8 @@ export class WindowsMainPtyDriver {
       TEMP: options.temporary,
       TMP: options.temporary,
       TMPDIR: options.temporary,
+      APPDATA: join(options.home, "AppData", "Roaming"),
+      LOCALAPPDATA: join(options.home, "AppData", "Local"),
       NODE_PATH: options.runtime.nodePath,
       TERM: "xterm-256color",
       PRG_SESSION_HOST_WINDOWS_MAIN_ENTRY: mainEntry,
@@ -995,6 +1036,7 @@ export class WindowsMainPtyDriver {
       PRG_SESSION_HOST_WINDOWS_RESULT: resultFile,
       PRG_SESSION_HOST_WINDOWS_PTY_JOURNAL: ptyJournal,
       PRG_SESSION_HOST_WINDOWS_FORCE_JOURNAL: forceJournal,
+      PRG_SESSION_HOST_WINDOWS_STAGE_JOURNAL: stageJournal,
       PRG_SESSION_HOST_WINDOWS_PTY_MODULE: options.runtime.ptyModulePath,
       PRG_SESSION_HOST_WINDOWS_BASELINE: WINDOWS_BASELINE,
       PI_REVIEW_GATE_CANDIDATE_ENTRY: options.runtime.candidateEntry,
@@ -1004,7 +1046,15 @@ export class WindowsMainPtyDriver {
       PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1",
       ...(process.env.NODE_OPTIONS === undefined ? {} : { NODE_OPTIONS: process.env.NODE_OPTIONS }),
     };
+    // Main's trusted PowerShell helpers inherit this env. Copy only the fixed
+    // Windows OS runtime names of the console probe's passing `profile` control.
+    for (const name of WINDOWS_OS_ENV_NAMES) {
+      const value = process.env[name];
+      if (typeof value === "string" && value.length > 0) hostEnv[name] = value;
+    }
     assertNoRoleOrCatalogMarkers(hostEnv);
+    assert.deepEqual(Object.keys(hostEnv).filter((name) => CREDENTIAL_NAME.test(name)), [],
+      "allowlisted Windows host environment contains no credential-like variable names");
     const logWatcher = watch(options.root);
     const nativeWatcher = watch(dirname(observerFile));
     const providerWatcher = watch(options.fixtureState);
@@ -1044,6 +1094,7 @@ export class WindowsMainPtyDriver {
         providerJournal,
         ptyJournal,
         forceJournal,
+        stageJournal,
         logWatcher,
         nativeWatcher,
         providerWatcher,
@@ -1071,6 +1122,11 @@ export class WindowsMainPtyDriver {
   }
 
   private onData(data: string): void {
+    const at = performance.now() - this.spawnedAt;
+    this.firstDataMs ??= at;
+    this.lastDataMs = at;
+    this.dataChunks += 1;
+    this.dataChars += data.length;
     this.outputRevision += 1;
     this.outputSignal.notify();
     this.outputTail = (this.outputTail + data).slice(-512 * 1024);
@@ -1151,8 +1207,66 @@ export class WindowsMainPtyDriver {
       return this.frameRevision > after && predicate(this.currentText());
     }, timeoutMs, description).catch((error: unknown) => {
       const tail = this.currentText().split("\n").filter((line) => line.trim()).slice(-12).join(" | ").slice(0, 2_000);
-      throw new Error(`${description}: ${error instanceof Error ? error.message : "bounded frame wait failed"}; frame=${tail}`);
+      throw new Error(`${description}: ${error instanceof Error ? error.message : "bounded frame wait failed"}; frame=${tail}; ${this.startupDiagnostic()}`);
     });
+  }
+
+  /**
+   * Bounded fixed-metadata startup diagnostic (Refs #494): outer exit state,
+   * numeric output/reply counts, the runner's MainResult flags when present,
+   * journal record counts, and the fixed-vocabulary runner startup trace. It
+   * never includes terminal text, argv, environment, paths, or transcripts,
+   * and it asserts no cause. Diagnosis only: it never changes a wait.
+   */
+  startupDiagnostic(): string {
+    try {
+      let result: Record<string, unknown> | undefined | "unreadable";
+      try {
+        const stats = lstatSync(this.resultFile, { bigint: true });
+        if (!stats.isFile() || stats.isSymbolicLink() || stats.size > BigInt(MAX_RESULT_BYTES)) result = "unreadable";
+        else {
+          const parsed: unknown = JSON.parse(readFileSync(this.resultFile, "utf8"));
+          result = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+            ? parsed as Record<string, unknown>
+            : "unreadable";
+        }
+      } catch (error) {
+        result = (error as NodeJS.ErrnoException).code === "ENOENT" ? undefined : "unreadable";
+      }
+      const count = (read: () => readonly unknown[]): number | "unreadable" => {
+        try { return read().length; } catch { return "unreadable"; }
+      };
+      let trace: readonly Record<string, unknown>[] | "unreadable";
+      try {
+        trace = boundedJsonl<Record<string, unknown>>(this.stageJournal, MAX_STARTUP_TRACE_BYTES);
+      } catch {
+        trace = "unreadable";
+      }
+      let pidKnown = false;
+      try { pidKnown = Number.isSafeInteger(Number(this.pty.pid)) && Number(this.pty.pid) > 0; } catch { pidKnown = false; }
+      let baselineVisible = false;
+      try { baselineVisible = frameText(this.surface).includes(WINDOWS_BASELINE); } catch { baselineVisible = false; }
+      return formatWindowsStartupDiagnostic({
+        elapsedMs: performance.now() - this.spawnedAt,
+        outerExit: this.exitEvent,
+        outerPidKnown: pidKnown,
+        dataChunks: this.dataChunks,
+        dataChars: this.dataChars,
+        firstDataMs: this.firstDataMs,
+        lastDataMs: this.lastDataMs,
+        alternateEnter: this.sawAlternateEnter,
+        alternateLeave: this.sawAlternateLeave,
+        baselineVisible,
+        cursorReportReplies: this.replyLog.filter((reply) => /^\x1b\[\d+;\d+R$/u.test(reply)).length,
+        deviceAttributeReplies: this.replyLog.filter((reply) => /^\x1b\[\?[\d;]*c$/u.test(reply)).length,
+        ptySpawnRecords: count(() => this.ptyRecords()),
+        nativeRecords: count(() => this.records()),
+        result,
+        trace,
+      });
+    } catch {
+      return "startup{unavailable}";
+    }
   }
 
   async waitForNative(predicate: (records: NativeJournalRecord[]) => boolean, description: string, timeoutMs = WINDOWS_EVENT_TIMEOUT_MS): Promise<NativeJournalRecord[]> {
@@ -1214,6 +1328,19 @@ export class WindowsMainPtyDriver {
       : wasVisible
         ? "focuses the visible sidebar without hiding or resizing it"
         : "shows and focuses the hidden sidebar"}`, before);
+  }
+
+  /**
+   * One deliberate public key write for a focused companion acceptance (for
+   * example the Network pane), awaiting the next frame that satisfies
+   * `predicate`. The caller owns focus bookkeeping: it must return the actual
+   * UI to sidebar focus before using any other driver navigation.
+   */
+  async sendKeys(data: string, description: string, predicate: (frame: string) => boolean,
+    timeoutMs = WINDOWS_EVENT_TIMEOUT_MS): Promise<void> {
+    const before = this.frameRevision;
+    this.pty.write(data);
+    await this.waitFrame(predicate, description, before, timeoutMs);
   }
 
   async ensureSidebarFocus(): Promise<void> {
@@ -1997,6 +2124,8 @@ export class WindowsMainPtyDriver {
     try { this.logWatcher.close(); } catch { /* task-owned root watch */ }
     try { this.nativeWatcher.close(); } catch { /* task-owned journal watch */ }
     try { this.providerWatcher.close(); } catch { /* task-owned provider fixture watch */ }
+    // Only after the actual outer root exited: never while it may still be live.
+    if (this.exitEvent) await closeExitedOwnedConptyReader(this.pty);
   }
 
   get forcedCleanup(): boolean {

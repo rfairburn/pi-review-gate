@@ -97,6 +97,14 @@ import {
 	type PeerTransportError,
 } from "./protocol";
 import type { PeerStatePermissionPolicy } from "./peer-state-permission-policy";
+import { ensureNetworkStateDirectory } from "./peer-storage-base";
+import {
+	peerStorageDiagnostic,
+	peerStorageRefusalDetail,
+	withPeerStorageDiagnostic,
+	type PeerStorageObject,
+	type PeerStorageReason,
+} from "./peer-storage-diagnostics";
 import type {
 	AcceptedPeerRecord,
 	AcceptedPeerStore,
@@ -180,6 +188,24 @@ function trustError(): PeerTransportError {
 	return peerError("TRUST_STORE_FAILED");
 }
 
+/** The fixed trust-store error carrying one fixed storage diagnostic. */
+function storageError(reason: PeerStorageReason, object: PeerStorageObject): PeerTransportError {
+	return withPeerStorageDiagnostic(trustError(), reason, object);
+}
+
+/** A fresh fixed error that keeps only the sanitized diagnostic of `error`, if any. */
+function carriedError(error: unknown): PeerTransportError {
+	const diagnostic = peerStorageDiagnostic(error);
+	return diagnostic === null
+		? trustError()
+		: withPeerStorageDiagnostic(trustError(), diagnostic.reason, diagnostic.object);
+}
+
+/** Fixed reason for a failed open/read of an existing object. */
+function accessReason(error: unknown): PeerStorageReason {
+	return (error as NodeJS.ErrnoException)?.code === "ENOENT" ? "changed" : "unreadable";
+}
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -247,12 +273,12 @@ function projectIdentity(identity: OwnedPeerIdentity): OwnedPeerIdentity {
  * failure (permissions, IO, type resolution) is an unavailable store and is
  * reported as a fixed error instead of being mistaken for fresh state.
  */
-function lstatBig(path: string): BigIntStats | undefined {
+function lstatBig(path: string, object?: PeerStorageObject): BigIntStats | undefined {
 	try {
 		return lstatSync(path, { bigint: true });
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
-		throw trustError();
+		throw object === undefined ? trustError() : storageError("unreadable", object);
 	}
 }
 
@@ -586,24 +612,26 @@ class PeerStateManager implements PeerStateStore {
 
 	/** Read the fixed existing document; absence of the dedicated directory is uninitialized. */
 	load(): void {
-		const stateDirStats = lstatBig(this.stateDir);
+		const stateDirStats = lstatBig(this.stateDir, "session-host");
 		if (stateDirStats === undefined) return;
-		if (stateDirStats.isSymbolicLink() || !stateDirStats.isDirectory()) throw trustError();
-		this.protect(() => this.permissions.assertOwnerControlledDirectory(this.stateDir));
+		if (stateDirStats.isSymbolicLink() || !stateDirStats.isDirectory()) throw storageError("unsafe-object", "session-host");
+		this.protect(() => this.permissions.assertOwnerControlledDirectory(this.stateDir), "session-host");
 		const stateDirReceipt = { dev: stateDirStats.dev, ino: stateDirStats.ino };
 
-		const peersStats = lstatBig(this.peersDir);
+		const peersStats = lstatBig(this.peersDir, "peers");
 		if (peersStats === undefined) return;
-		if (peersStats.isSymbolicLink() || !peersStats.isDirectory()) throw trustError();
-		this.protect(() => this.permissions.assertPrivateDirectory(this.peersDir));
+		if (peersStats.isSymbolicLink() || !peersStats.isDirectory()) throw storageError("unsafe-object", "peers");
+		this.protect(() => this.permissions.assertPrivateDirectory(this.peersDir), "peers");
 
-		const documentStats = lstatBig(this.statePath);
+		const documentStats = lstatBig(this.statePath, "peer-state");
 		// An existing dedicated directory without state.json is unavailable: it is
 		// never treated as a fresh identity and nothing is regenerated.
-		if (documentStats === undefined) throw trustError();
-		if (documentStats.isSymbolicLink() || !documentStats.isFile()) throw trustError();
-		if (documentStats.size <= 0n || documentStats.size > BigInt(MAX_PEER_STATE_FILE_BYTES)) throw trustError();
-		this.protect(() => this.permissions.assertPrivateFile(this.statePath));
+		if (documentStats === undefined) throw storageError("missing-initialized", "peer-state");
+		if (documentStats.isSymbolicLink() || !documentStats.isFile()) throw storageError("unsafe-object", "peer-state");
+		if (documentStats.size <= 0n || documentStats.size > BigInt(MAX_PEER_STATE_FILE_BYTES)) {
+			throw storageError("malformed", "peer-state");
+		}
+		this.protect(() => this.permissions.assertPrivateFile(this.statePath), "peer-state");
 
 		const model = this.readExistingDocument(documentStats);
 		this.claimAuthority();
@@ -619,28 +647,28 @@ class PeerStateManager implements PeerStateStore {
 			fd = openSync(this.statePath, fsConstants.O_RDONLY
 				| (fsConstants.O_NONBLOCK ?? 0)
 				| (fsConstants.O_NOFOLLOW ?? 0));
-		} catch {
-			throw trustError();
+		} catch (error) {
+			throw storageError(accessReason(error), "peer-state");
 		}
 		try {
 			let stats: BigIntStats;
 			try {
 				stats = fstatSync(fd, { bigint: true });
 			} catch {
-				throw trustError();
+				throw storageError("unreadable", "peer-state");
 			}
-			if (!stats.isFile() || !sameReceipt(stats, preStats)) throw trustError();
-			if (stats.size <= 0n || stats.size > BigInt(MAX_PEER_STATE_FILE_BYTES)) throw trustError();
+			if (!stats.isFile() || !sameReceipt(stats, preStats)) throw storageError("changed", "peer-state");
+			if (stats.size <= 0n || stats.size > BigInt(MAX_PEER_STATE_FILE_BYTES)) throw storageError("malformed", "peer-state");
 			const bytes = readAll(fd, Number(stats.size));
-			if (bytes === undefined) throw trustError();
+			if (bytes === undefined) throw storageError("unreadable", "peer-state");
 			let parsed: unknown;
 			try {
 				parsed = JSON.parse(bytes.toString("utf8"));
 			} catch {
-				throw trustError();
+				throw storageError("malformed", "peer-state");
 			}
 			const model = parsePeerStateDocument(parsed);
-			if (model === undefined) throw trustError();
+			if (model === undefined) throw storageError("malformed", "peer-state");
 			return model;
 		} finally {
 			try {
@@ -663,10 +691,10 @@ class PeerStateManager implements PeerStateStore {
 			// than adopted, scanned, or repaired.
 			try {
 				mkdirSync(this.peersDir, { mode: 0o700 });
-			} catch {
-				throw trustError();
+			} catch (error) {
+				throw storageError((error as NodeJS.ErrnoException)?.code === "EEXIST" ? "changed" : "unreadable", "peers");
 			}
-			this.protect(() => this.permissions.protectCreatedDirectory(this.peersDir));
+			this.protect(() => this.permissions.protectCreatedDirectory(this.peersDir), "peers", "session-host");
 			const peersStats = lstatBig(this.peersDir);
 			if (peersStats === undefined || peersStats.isSymbolicLink() || !peersStats.isDirectory()) {
 				throw trustError();
@@ -679,12 +707,12 @@ class PeerStateManager implements PeerStateStore {
 			try {
 				fd = openSync(tempPath, "wx", 0o600);
 			} catch {
-				throw trustError();
+				throw storageError("unreadable", "peers");
 			}
 			const opened = fstatSync(fd, { bigint: true });
 			if (!opened.isFile()) throw trustError();
 			temporaryReceipt = { dev: opened.dev, ino: opened.ino };
-			this.protect(() => this.permissions.protectCreatedFile(tempPath));
+			this.protect(() => this.permissions.protectCreatedFile(tempPath), "peer-state", "peers");
 			this.assertEmptyOwnedTemporary(tempPath, temporaryReceipt);
 
 			const identity = await generateIdentity(label);
@@ -738,7 +766,7 @@ class PeerStateManager implements PeerStateStore {
 			unlinkSync(tempPath);
 			temporaryReceipt = undefined;
 			temporaryPath = undefined;
-			this.protect(() => this.permissions.assertPrivateFile(this.statePath));
+			this.protect(() => this.permissions.assertPrivateFile(this.statePath), "peer-state");
 			syncDirectoryBestEffort(this.peersDir);
 
 			this.claimAuthority();
@@ -749,7 +777,7 @@ class PeerStateManager implements PeerStateStore {
 			// The caller never receives the internal identity object: a projection
 			// cannot mutate the authority the model retains.
 			return projectIdentity(identity);
-		} catch {
+		} catch (error) {
 			// Any initialization failure leaves this handle without authority: the
 			// caller must reopen instead of retrying on a half-established directory.
 			this.poison();
@@ -761,26 +789,17 @@ class PeerStateManager implements PeerStateStore {
 				}
 			}
 			if (temporaryPath !== undefined) removeOwnedTemporary(temporaryPath, temporaryReceipt);
-			throw trustError();
+			throw carriedError(error);
 		}
 	}
 
 	private ensureOwnerControlledStateDir(): FileReceipt {
-		const existing = lstatBig(this.stateDir);
-		if (existing === undefined) {
-			try {
-				mkdirSync(this.stateDir, { mode: 0o700 });
-			} catch {
-				throw trustError();
-			}
-			this.protect(() => this.permissions.protectCreatedDirectory(this.stateDir));
-			const created = lstatBig(this.stateDir);
-			if (created === undefined || created.isSymbolicLink() || !created.isDirectory()) throw trustError();
-			return { dev: created.dev, ino: created.ino };
-		}
-		if (existing.isSymbolicLink() || !existing.isDirectory()) throw trustError();
-		this.protect(() => this.permissions.assertOwnerControlledDirectory(this.stateDir));
-		return { dev: existing.dev, ino: existing.ino };
+		return ensureNetworkStateDirectory({
+			stateDir: this.stateDir,
+			permissions: this.permissions,
+			fail: (reason) => storageError(reason, "session-host"),
+			protect: (operation) => this.protect(operation, "session-host"),
+		});
 	}
 
 	private assertEmptyOwnedTemporary(path: string, receipt: FileReceipt): void {
@@ -828,7 +847,7 @@ class PeerStateManager implements PeerStateStore {
 			const opened = fstatSync(fd, { bigint: true });
 			if (!opened.isFile()) throw trustError();
 			temporaryReceipt = { dev: opened.dev, ino: opened.ino };
-			this.protect(() => this.permissions.protectCreatedFile(temporaryPath));
+			this.protect(() => this.permissions.protectCreatedFile(temporaryPath), "peer-state", "peers");
 			this.assertEmptyOwnedTemporary(temporaryPath, temporaryReceipt);
 
 			writeFileSync(fd, body, "utf8");
@@ -852,10 +871,10 @@ class PeerStateManager implements PeerStateStore {
 				|| published.size !== BigInt(Buffer.byteLength(body))) {
 				throw trustError();
 			}
-			this.protect(() => this.permissions.assertPrivateFile(this.statePath));
+			this.protect(() => this.permissions.assertPrivateFile(this.statePath), "peer-state");
 			syncDirectoryBestEffort(this.peersDir);
 			this.stateReceipt = { dev: published.dev, ino: published.ino };
-		} catch {
+		} catch (error) {
 			if (fd !== undefined) {
 				try {
 					closeSync(fd);
@@ -869,7 +888,7 @@ class PeerStateManager implements PeerStateStore {
 			} else {
 				removeOwnedTemporary(temporaryPath, temporaryReceipt);
 			}
-			throw trustError();
+			throw carriedError(error);
 		}
 	}
 
@@ -902,9 +921,9 @@ class PeerStateManager implements PeerStateStore {
 		}
 		try {
 			this.permissions.assertPrivateDirectory(this.peersDir);
-		} catch {
+		} catch (error) {
 			this.poison();
-			throw trustError();
+			throw storageError(peerStorageRefusalDetail(error)?.reason ?? "protection-unsupported", "peers");
 		}
 	}
 
@@ -1077,11 +1096,17 @@ class PeerStateManager implements PeerStateStore {
 		this.commit(next);
 	}
 
-	private protect(operation: () => void): void {
+	/**
+	 * Run one permission-policy call. A refusal becomes the fixed trust error
+	 * carrying the policy's fixed reason and the named storage object (the parent
+	 * object when the policy refused on the containing directory it checked first).
+	 */
+	private protect(operation: () => void, object: PeerStorageObject, parentObject: PeerStorageObject = object): void {
 		try {
 			operation();
-		} catch {
-			throw trustError();
+		} catch (error) {
+			const detail = peerStorageRefusalDetail(error);
+			throw storageError(detail?.reason ?? "protection-unsupported", detail?.scope === "parent" ? parentObject : object);
 		}
 	}
 

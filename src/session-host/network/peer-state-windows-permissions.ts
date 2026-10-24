@@ -63,6 +63,11 @@ import { statSync } from "node:fs";
 import { dirname, isAbsolute, join, win32 } from "node:path";
 import { peerError } from "./protocol";
 import type { PeerStatePermissionPolicy } from "./peer-state-permission-policy";
+import {
+	withPeerStorageDiagnostic,
+	type PeerStorageReason,
+	type PeerStorageScope,
+} from "./peer-storage-diagnostics";
 
 /** Fixed helper protocol version carried in every request and response. */
 const ACL_HELPER_PROTOCOL = 1;
@@ -117,7 +122,7 @@ const RIGHT = {
  * than silently ignored authority. Everything is bounded to 32 bits: wider
  * values are rejected during evidence parsing.
  */
-const KNOWN_ACCESS_MASK
+export const KNOWN_ACCESS_MASK
 	= RIGHT.readData
 	| RIGHT.writeData
 	| RIGHT.appendData
@@ -450,6 +455,16 @@ try {
 	[Console]::Out.Flush()
 	exit 0
 } catch {
+	# Fixed exit classes only, never the exception text: 4 = the object is gone,
+	# 6 = the operating system refused access or an IO failure occurred, 3 =
+	# anything else (unprovable). PowerShell wraps .NET failures, so the inner
+	# chain is walked.
+	$failure = $_.Exception
+	while ($null -ne $failure) {
+		if ($failure -is [System.IO.FileNotFoundException] -or $failure -is [System.IO.DirectoryNotFoundException]) { exit 4 }
+		if ($failure -is [System.UnauthorizedAccessException] -or $failure -is [System.Security.AccessControl.PrivilegeNotHeldException] -or $failure -is [System.IO.IOException]) { exit 6 }
+		$failure = $failure.InnerException
+	}
 	exit 3
 }
 `;
@@ -457,7 +472,8 @@ try {
 /** Base64 UTF-16LE form of the fixed script; computed once, with no IO. */
 const ACL_HELPER_ENCODED_COMMAND = Buffer.from(ACL_HELPER_SCRIPT, "utf16le").toString("base64");
 
-const productionExecutor: WindowsAclExecutor = (file, args, options) => {
+/** The production bounded helper child (shared with the remediation helper). */
+export const productionWindowsAclExecutor: WindowsAclExecutor = (file, args, options) => {
 	const result = spawnSync(file, [...args], {
 		input: options.input,
 		encoding: "utf8",
@@ -542,7 +558,7 @@ function parseAce(value: unknown): WindowsAclAceEvidence | null {
 }
 
 /** Strict shape check for one helper evidence record; anything unknown fails closed. */
-function parseEvidence(value: unknown): WindowsAclEvidence | null {
+export function parseWindowsAclEvidence(value: unknown): WindowsAclEvidence | null {
 	if (typeof value !== "object" || value === null) return null;
 	const record = value as Record<string, unknown>;
 	if (!isBoolean(record.isDirectory) || !isBoolean(record.isReparsePoint)) return null;
@@ -606,7 +622,7 @@ function parseHelperResponse(stdout: string): { evidence: WindowsAclEvidence; cu
 	if (record.v !== ACL_HELPER_PROTOCOL || record.ok !== true) return null;
 	if (!isSid(record.currentSid)) return null;
 	const currentSid = (record.currentSid as string).toUpperCase();
-	const evidence = parseEvidence(record.evidence);
+	const evidence = parseWindowsAclEvidence(record.evidence);
 	return evidence === null ? null : { evidence, currentSid };
 }
 
@@ -652,6 +668,18 @@ function aclEnumerationIsComplete(evidence: WindowsAclEvidence): boolean {
 }
 
 /**
+ * True only when every DACL entry is a plain allow/deny ACE that the evidence
+ * fully enumerates and every mask uses documented bits. Anything else is an ACL
+ * this module cannot model, which the remediation backend refuses rather than
+ * overwrites.
+ */
+export function isModelledWindowsAcl(evidence: WindowsAclEvidence): boolean {
+	if (!evidence.daclPresent) return true;
+	if (!aclEnumerationIsComplete(evidence)) return false;
+	return evidence.aces.every((ace) => isKnownAccessMask(ace.rights));
+}
+
+/**
  * Prove an owner-controlled parent from real descriptor evidence: a real
  * non-reparse directory, owned by the current account or an OS-privileged
  * account, with a present DACL whose untrusted ACEs — inherited or inherit-only
@@ -665,18 +693,31 @@ function aclEnumerationIsComplete(evidence: WindowsAclEvidence): boolean {
  * already holds open on it.
  */
 export function verifyOwnerControlledAclEvidence(evidence: WindowsAclEvidence, currentSid: string): boolean {
-	if (!evidence.isDirectory || evidence.isReparsePoint) return false;
-	if (!evidence.daclPresent || evidence.aces.length === 0) return false;
-	if (!aclEnumerationIsComplete(evidence)) return false;
-	if (!trustedSid(evidence.ownerSid, currentSid)) return false;
+	return classifyOwnerControlledAclEvidence(evidence, currentSid) === null;
+}
+
+/**
+ * The same owner-controlled proof as {@link verifyOwnerControlledAclEvidence},
+ * returning the fixed reason of the first failed check, or `null` on success.
+ * The order of checks is the order of the boolean proof; the reason never
+ * changes whether the descriptor passes.
+ */
+export function classifyOwnerControlledAclEvidence(
+	evidence: WindowsAclEvidence,
+	currentSid: string,
+): PeerStorageReason | null {
+	if (!evidence.isDirectory || evidence.isReparsePoint) return "unsafe-object";
+	if (!evidence.daclPresent || evidence.aces.length === 0) return "unsafe-permissions";
+	if (!aclEnumerationIsComplete(evidence)) return "protection-unsupported";
+	if (!trustedSid(evidence.ownerSid, currentSid)) return "foreign-owner";
 	let ownerAuthority = false;
 	for (const ace of evidence.aces) {
 		// Unknown bits never pass, whichever principal holds them.
-		if (!isKnownAccessMask(ace.rights)) return false;
-		if (ace.aceType !== "allow") return false;
+		if (!isKnownAccessMask(ace.rights)) return "protection-unsupported";
+		if (ace.aceType !== "allow") return "unsafe-permissions";
 		if (!trustedSid(ace.sid, currentSid)) {
 			// Inherit-only grants are evaluated too: they land on children.
-			if (!untrustedRightsPermissible(ace.rights)) return false;
+			if (!untrustedRightsPermissible(ace.rights)) return "unsafe-permissions";
 			continue;
 		}
 		if (ace.sid === currentSid
@@ -687,7 +728,7 @@ export function verifyOwnerControlledAclEvidence(evidence: WindowsAclEvidence, c
 	}
 	// An OS-privileged owner, or an account grant that applies only to
 	// descendants, is not proof that this account can manage this directory.
-	return ownerAuthority;
+	return ownerAuthority ? null : "unsafe-permissions";
 }
 
 /**
@@ -704,26 +745,39 @@ export function verifyPrivateAclEvidence(
 	currentSid: string,
 	kind: "dir" | "file",
 ): boolean {
+	return classifyPrivateAclEvidence(evidence, currentSid, kind) === null;
+}
+
+/**
+ * The same private proof as {@link verifyPrivateAclEvidence}, returning the
+ * fixed reason of the first failed check, or `null` on success.
+ */
+export function classifyPrivateAclEvidence(
+	evidence: WindowsAclEvidence,
+	currentSid: string,
+	kind: "dir" | "file",
+): PeerStorageReason | null {
 	if (kind === "dir") {
-		if (!evidence.isDirectory || evidence.entryCount < 0) return false;
+		if (!evidence.isDirectory || evidence.entryCount < 0) return "unsafe-object";
 	} else if (evidence.isDirectory || evidence.fileLength < 0) {
-		return false;
+		return "unsafe-object";
 	}
-	if (evidence.isReparsePoint || evidence.parentIsReparsePoint || !evidence.parentExists) return false;
-	if (!evidence.daclPresent || !evidence.daclProtected) return false;
-	if (evidence.aces.length === 0 || evidence.ownerSid !== currentSid) return false;
-	if (!aclEnumerationIsComplete(evidence)) return false;
+	if (evidence.isReparsePoint || evidence.parentIsReparsePoint || !evidence.parentExists) return "unsafe-object";
+	if (!evidence.daclPresent || !evidence.daclProtected) return "unsafe-permissions";
+	if (evidence.aces.length === 0) return "unsafe-permissions";
+	if (evidence.ownerSid !== currentSid) return "foreign-owner";
+	if (!aclEnumerationIsComplete(evidence)) return "protection-unsupported";
 	const required = kind === "dir" ? PRIVATE_DIRECTORY_REQUIRED_RIGHTS : PRIVATE_FILE_REQUIRED_RIGHTS;
 	let accountRights = false;
 	for (const ace of evidence.aces) {
-		if (!isKnownAccessMask(ace.rights)) return false;
-		if (ace.aceType !== "allow") return false;
-		if (!trustedSid(ace.sid, currentSid)) return false;
+		if (!isKnownAccessMask(ace.rights)) return "protection-unsupported";
+		if (ace.aceType !== "allow") return "unsafe-permissions";
+		if (!trustedSid(ace.sid, currentSid)) return "unsafe-permissions";
 		if (ace.sid === currentSid
 			&& (ace.propagate & PROPAGATE_INHERIT_ONLY) === 0
 			&& rightsSatisfy(ace.rights, required)) accountRights = true;
 	}
-	return accountRights;
+	return accountRights ? null : "unsafe-permissions";
 }
 
 /**
@@ -759,7 +813,7 @@ export function verifyCreatedObjectEligibility(
  * pure ASCII and still round-trips through `JSON.parse` (and PowerShell's
  * `ConvertFrom-Json`) to the exact original string.
  */
-function encodeHelperRequest(request: Record<string, unknown>): string | null {
+export function encodeWindowsHelperRequest(request: Record<string, unknown>): string | null {
 	let plain: string;
 	try {
 		plain = JSON.stringify(request);
@@ -781,14 +835,45 @@ function runAclHelper(
 	request: { op: "inspect" | "protect"; path: string; kind?: "dir" | "file" },
 	probe: WindowsPeerStatePermissionProbe,
 ): { evidence: WindowsAclEvidence; currentSid: string } | null {
-	if (typeof request.path !== "string" || request.path.length === 0) return null;
-	if (request.path.length > ACL_HELPER_MAX_PATH_LENGTH || !isWindowsAbsolutePath(request.path)) return null;
+	const outcome = runAclHelperDetailed(request, probe);
+	return outcome.ok ? { evidence: outcome.evidence, currentSid: outcome.currentSid } : null;
+}
+
+/** One helper round trip with a fixed refusal class; never a raw native diagnostic. */
+type AclHelperOutcome =
+	| { readonly ok: true; readonly evidence: WindowsAclEvidence; readonly currentSid: string }
+	| { readonly ok: false; readonly reason: PeerStorageReason };
+
+/**
+ * The fixed helper exit classes: 4 means the object disappeared (the caller had
+ * just observed it), 5 means a protect target is no longer the eligible created
+ * object, 6 means the operating system refused access or an IO
+ * failure occurred. Every other failure — a missing or failing interpreter,
+ * malformed output, or unprovable evidence — is `protection-unsupported`.
+ */
+function refusalForHelperStatus(status: number | null): PeerStorageReason {
+	if (status === 6) return "unreadable";
+	// 4: the object is gone; 5: protect found it is no longer the empty created
+	// object of the expected kind or owner. Both mean it changed under the caller.
+	if (status === 4 || status === 5) return "changed";
+	return "protection-unsupported";
+}
+
+function runAclHelperDetailed(
+	request: { op: "inspect" | "protect"; path: string; kind?: "dir" | "file" },
+	probe: WindowsPeerStatePermissionProbe,
+): AclHelperOutcome {
+	const unsupported: AclHelperOutcome = { ok: false, reason: "protection-unsupported" };
+	if (typeof request.path !== "string" || request.path.length === 0) return { ok: false, reason: "unsafe-object" };
+	if (request.path.length > ACL_HELPER_MAX_PATH_LENGTH || !isWindowsAbsolutePath(request.path)) {
+		return { ok: false, reason: "unsafe-object" };
+	}
 	const executable = (probe.resolveExecutable ?? resolveTrustedSystemPowerShell)();
-	if (typeof executable !== "string" || executable.length === 0 || !isAbsolute(executable)) return null;
-	const input = encodeHelperRequest({ v: ACL_HELPER_PROTOCOL, ...request });
-	if (input === null || input.length > 8192) return null;
+	if (typeof executable !== "string" || executable.length === 0 || !isAbsolute(executable)) return unsupported;
+	const input = encodeWindowsHelperRequest({ v: ACL_HELPER_PROTOCOL, ...request });
+	if (input === null || input.length > 8192) return unsupported;
 	try {
-		const child = (probe.execute ?? productionExecutor)(
+		const child = (probe.execute ?? productionWindowsAclExecutor)(
 			executable,
 			["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", ACL_HELPER_ENCODED_COMMAND],
 			{
@@ -801,12 +886,13 @@ function runAclHelper(
 				env: { ...process.env, POWERSHELL_TELEMETRY_OPTOUT: "1" },
 			},
 		);
-		if (child === null || typeof child !== "object") return null;
-		if (child.status !== 0) return null;
-		return parseHelperResponse(child.stdout);
+		if (child === null || typeof child !== "object") return unsupported;
+		if (child.status !== 0) return { ok: false, reason: refusalForHelperStatus(child.status) };
+		const parsed = parseHelperResponse(child.stdout);
+		return parsed === null ? unsupported : { ok: true, evidence: parsed.evidence, currentSid: parsed.currentSid };
 	} catch {
 		// No spawn, no output, or an interpreter error: fixed refusal only.
-		return null;
+		return unsupported;
 	}
 }
 
@@ -822,6 +908,11 @@ export function inspectPeerStateAcl(
 	return runAclHelper({ op: "inspect", path: target }, probe);
 }
 
+/** The fixed Windows refusal, carrying one fixed reason (see `peer-storage-diagnostics.ts`). */
+function refuseWindows(reason: PeerStorageReason, scope: PeerStorageScope = "target"): never {
+	throw withPeerStorageDiagnostic(peerError("TRUST_STORE_FAILED"), reason, null, scope);
+}
+
 /**
  * Windows policy built on the fixed trusted helper. Every method performs its
  * own real descriptor inspection; nothing is cached, assumed, or inferred from
@@ -830,15 +921,20 @@ export function inspectPeerStateAcl(
 export function createWindowsPeerStatePermissions(
 	probe: WindowsPeerStatePermissionProbe = {},
 ): PeerStatePermissionPolicy {
-	const inspect = (path: string): { evidence: WindowsAclEvidence; currentSid: string } | null =>
-		runAclHelper({ op: "inspect", path }, probe);
+	const inspect = (path: string): AclHelperOutcome => runAclHelperDetailed({ op: "inspect", path }, probe);
 
 	const assertFromEvidence = (
 		path: string,
-		check: (evidence: WindowsAclEvidence, currentSid: string) => boolean,
+		classify: (evidence: WindowsAclEvidence, currentSid: string) => PeerStorageReason | null,
+		scope: PeerStorageScope = "target",
 	): void => {
 		const observed = inspect(path);
-		if (observed === null || !check(observed.evidence, observed.currentSid)) throw peerError("TRUST_STORE_FAILED");
+		// No helper evidence: the object was unreadable (access/IO), vanished, or
+		// the trusted helper is unavailable or could not prove anything — each a
+		// distinct fixed reason.
+		if (!observed.ok) refuseWindows(observed.reason, scope);
+		const reason = classify(observed.evidence, observed.currentSid);
+		if (reason !== null) refuseWindows(reason, scope);
 	};
 
 	/**
@@ -851,23 +947,22 @@ export function createWindowsPeerStatePermissions(
 	 * the caller writes no private byte until this returns.
 	 */
 	const protect = (path: string, kind: "dir" | "file"): void => {
-		const observed = runAclHelper({ op: "protect", path, kind }, probe);
-		if (observed === null
-			|| !verifyPrivateAclEvidence(observed.evidence, observed.currentSid, kind)
-			|| !verifyCreatedObjectEligibility(observed.evidence, kind)) {
-			throw peerError("TRUST_STORE_FAILED");
-		}
+		const observed = runAclHelperDetailed({ op: "protect", path, kind }, probe);
+		if (!observed.ok) refuseWindows(observed.reason);
+		const reason = classifyPrivateAclEvidence(observed.evidence, observed.currentSid, kind);
+		if (reason !== null) refuseWindows(reason);
+		if (!verifyCreatedObjectEligibility(observed.evidence, kind)) refuseWindows("changed");
 	};
 
 	return {
 		assertOwnerControlledDirectory(path) {
-			assertFromEvidence(path, verifyOwnerControlledAclEvidence);
+			assertFromEvidence(path, classifyOwnerControlledAclEvidence);
 		},
 		assertPrivateDirectory(path) {
-			assertFromEvidence(path, (evidence, currentSid) => verifyPrivateAclEvidence(evidence, currentSid, "dir"));
+			assertFromEvidence(path, (evidence, currentSid) => classifyPrivateAclEvidence(evidence, currentSid, "dir"));
 		},
 		assertPrivateFile(path) {
-			assertFromEvidence(path, (evidence, currentSid) => verifyPrivateAclEvidence(evidence, currentSid, "file"));
+			assertFromEvidence(path, (evidence, currentSid) => classifyPrivateAclEvidence(evidence, currentSid, "file"));
 		},
 		protectCreatedDirectory(path) {
 			// Parent first: an unsafe parent leaves an untrusted write, delete, or
@@ -875,18 +970,12 @@ export function createWindowsPeerStatePermissions(
 			// The child itself is never touched, and no secret may be written until
 			// the verification below proves the private DACL was really established.
 			const parent = parentPath(path);
-			const observedParent = inspect(parent);
-			if (observedParent === null || !verifyOwnerControlledAclEvidence(observedParent.evidence, observedParent.currentSid)) {
-				throw peerError("TRUST_STORE_FAILED");
-			}
+			assertFromEvidence(parent, classifyOwnerControlledAclEvidence, "parent");
 			protect(path, "dir");
 		},
 		protectCreatedFile(path) {
 			const parent = parentPath(path);
-			const observedParent = inspect(parent);
-			if (observedParent === null || !verifyPrivateAclEvidence(observedParent.evidence, observedParent.currentSid, "dir")) {
-				throw peerError("TRUST_STORE_FAILED");
-			}
+			assertFromEvidence(parent, (evidence, currentSid) => classifyPrivateAclEvidence(evidence, currentSid, "dir"), "parent");
 			protect(path, "file");
 		},
 	};
@@ -903,18 +992,18 @@ export function createWindowsPeerStatePermissions(
  * a root-relative path have no parent this module can prove, so they refuse.
  */
 function parentPath(target: string): string {
-	if (!isWindowsAbsolutePath(target)) throw peerError("TRUST_STORE_FAILED");
+	if (!isWindowsAbsolutePath(target)) refuseWindows("unsafe-object", "parent");
 	const trimmed = target.replace(/[\\/]+$/u, "");
-	if (trimmed.replace(/^[\\/]+/u, "").length === 0) throw peerError("TRUST_STORE_FAILED");
+	if (trimmed.replace(/^[\\/]+/u, "").length === 0) refuseWindows("unsafe-object", "parent");
 	const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
-	if (index < 0) throw peerError("TRUST_STORE_FAILED");
+	if (index < 0) refuseWindows("unsafe-object", "parent");
 	const candidate = trimmed.slice(0, index);
 	// A bare drive letter is drive-relative; the real parent of `C:\peers` is `C:\`.
 	if (/^[A-Za-z]:$/u.test(candidate)) return `${candidate}\\`;
-	if (candidate.length === 0) throw peerError("TRUST_STORE_FAILED");
+	if (candidate.length === 0) refuseWindows("unsafe-object", "parent");
 	// `\\server` on its own is not a share root, so nothing above it is provable.
 	if (/^[\\/]{2}/u.test(candidate) && !/[\\/]/u.test(candidate.replace(/^[\\/]+/u, ""))) {
-		throw peerError("TRUST_STORE_FAILED");
+		refuseWindows("unsafe-object", "parent");
 	}
 	return candidate;
 }

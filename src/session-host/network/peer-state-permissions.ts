@@ -59,6 +59,12 @@ import { userInfo } from "node:os";
 import { isAbsolute } from "node:path";
 import type { PeerStatePermissionPolicy } from "./peer-state-permission-policy";
 import { peerError } from "./protocol";
+import {
+	peerStorageRefusalDetail,
+	withPeerStorageDiagnostic,
+	type PeerStorageReason,
+	type PeerStorageScope,
+} from "./peer-storage-diagnostics";
 import { createWindowsPeerStatePermissions, type WindowsPeerStatePermissionProbe } from "./peer-state-windows-permissions";
 
 /** The only directory mode accepted as genuinely private. */
@@ -336,11 +342,15 @@ export function proveExtendedAcl(
 		return parsed.aclMarker ? "unprovable" : "no-acl";
 	}
 	const account = (probe.accountName ?? currentAccountName)();
+	// A token this module does not know is unclassifiable, whoever holds it. Every
+	// entry is checked before any is classified, so a recognisable grant earlier
+	// in the list never stands in for a complete understanding of the whole ACL.
 	for (const entry of parsed.entries) {
-		// A token this module does not know is unclassifiable, whoever holds it.
 		for (const token of entry.rights) {
 			if (!ACL_KNOWN_RIGHTS.has(token) && !ACL_INHERIT_FLAGS.has(token)) return "unprovable";
 		}
+	}
+	for (const entry of parsed.entries) {
 		if (entry.grant === "deny") continue;
 		const rights = entry.rights.filter((token) => ACL_KNOWN_RIGHTS.has(token));
 		if (rights.length === 0) continue;
@@ -364,8 +374,22 @@ interface PosixObservation {
 	ino: number;
 }
 
-function refuse(): never {
-	throw peerError("TRUST_STORE_FAILED");
+/**
+ * The fixed refusal. Its code and message never vary; the attached reason is a
+ * fixed vocabulary word chosen by the exact check that refused (see
+ * `peer-storage-diagnostics.ts`), never a path, errno, or mode.
+ */
+function refuse(reason: PeerStorageReason = "protection-unsupported", scope: PeerStorageScope = "target"): never {
+	throw withPeerStorageDiagnostic(peerError("TRUST_STORE_FAILED"), reason, null, scope);
+}
+
+/** Run a containing-directory check, recording that a refusal concerned the parent. */
+function asParent(check: () => void): void {
+	try {
+		check();
+	} catch (error) {
+		refuse(peerStorageRefusalDetail(error)?.reason ?? "protection-unsupported", "parent");
+	}
 }
 
 function isUsablePath(path: string): boolean {
@@ -373,7 +397,7 @@ function isUsablePath(path: string): boolean {
 }
 
 function currentAccountUid(): number {
-	if (typeof process.getuid !== "function") refuse();
+	if (typeof process.getuid !== "function") refuse("protection-unsupported");
 	return process.getuid();
 }
 
@@ -386,13 +410,15 @@ function observe(path: string, kind: "dir" | "file"): PosixObservation {
 	let stat: Stats | undefined;
 	try {
 		stat = lstatSync(path);
-	} catch {
-		refuse();
+	} catch (error) {
+		// The caller observed this object a moment ago: absence now is a change,
+		// anything else is an access or IO failure.
+		refuse((error as NodeJS.ErrnoException)?.code === "ENOENT" ? "changed" : "unreadable");
 	}
-	if (stat === undefined) refuse();
+	if (stat === undefined) refuse("unreadable");
 	const observed: Stats = stat;
-	if (observed.isSymbolicLink()) refuse();
-	if (kind === "dir" ? !observed.isDirectory() : !observed.isFile()) refuse();
+	if (observed.isSymbolicLink()) refuse("unsafe-object");
+	if (kind === "dir" ? !observed.isDirectory() : !observed.isFile()) refuse("unsafe-object");
 	return {
 		uid: observed.uid,
 		mode: observed.mode & ALL_MODE_BITS,
@@ -406,10 +432,10 @@ function observe(path: string, kind: "dir" | "file"): PosixObservation {
 /** Re-observe and prove the same inode still carries the exact expected mode. */
 function verifyUnchangedIdentity(path: string, kind: "dir" | "file", expected: PosixObservation, mode: number): void {
 	const after = observe(path, kind);
-	if (after.dev !== expected.dev || after.ino !== expected.ino) refuse();
-	if (after.uid !== currentAccountUid()) refuse();
-	if (after.mode !== mode) refuse();
-	if (kind === "file" && (after.nlink !== 1 || after.size !== 0)) refuse();
+	if (after.dev !== expected.dev || after.ino !== expected.ino) refuse("changed");
+	if (after.uid !== currentAccountUid()) refuse("foreign-owner");
+	if (after.mode !== mode) refuse("unsafe-permissions");
+	if (kind === "file" && (after.nlink !== 1 || after.size !== 0)) refuse("changed");
 }
 
 /**
@@ -424,12 +450,12 @@ function establishMode(path: string, kind: "dir" | "file", expected: PosixObserv
 		const flags = constants.O_RDONLY | constants.O_NOFOLLOW | (kind === "dir" ? constants.O_DIRECTORY : 0);
 		fd = openSync(path, flags);
 		const opened = fstatSync(fd);
-		if (opened.dev !== expected.dev || opened.ino !== expected.ino) refuse();
-		if (opened.uid !== currentAccountUid()) refuse();
-		if (kind === "file" && (opened.nlink !== 1 || opened.size !== 0)) refuse();
+		if (opened.dev !== expected.dev || opened.ino !== expected.ino) refuse("changed");
+		if (opened.uid !== currentAccountUid()) refuse("foreign-owner");
+		if (kind === "file" && (opened.nlink !== 1 || opened.size !== 0)) refuse("changed");
 		fchmodSync(fd, mode);
-	} catch {
-		refuse();
+	} catch (error) {
+		refuse(peerStorageRefusalDetail(error)?.reason ?? "changed");
 	} finally {
 		if (fd >= 0) {
 			try {
@@ -453,15 +479,15 @@ function assertDirectoryIsEmpty(path: string): void {
 	try {
 		entries = readdirSync(path);
 	} catch {
-		refuse();
+		refuse("unreadable");
 	}
-	if (entries === undefined || entries.length !== 0) refuse();
+	if (entries === undefined || entries.length !== 0) refuse("changed");
 }
 
 function parentOf(path: string): string {
 	const trimmed = path.endsWith("/") && path.length > 1 ? path.slice(0, -1) : path;
 	const index = trimmed.lastIndexOf("/");
-	if (index <= 0) refuse();
+	if (index <= 0) refuse("unsafe-object");
 	return trimmed.slice(0, index);
 }
 
@@ -476,37 +502,38 @@ function createPosixPeerStatePermissions(
 	 */
 	const assertAclCannotGrantMore = (path: string, purpose: ExtendedAclPurpose): void => {
 		const verdict = proveExtendedAcl(path, purpose, platform, aclProbe);
-		if (verdict === "untrusted" || verdict === "unprovable") refuse();
+		if (verdict === "untrusted") refuse("extended-acl");
+		if (verdict === "unprovable") refuse("protection-unsupported");
 	};
 
 	const assertOwnerControlledDirectory = (path: string): void => {
-		if (!isUsablePath(path)) refuse();
+		if (!isUsablePath(path)) refuse("unsafe-object");
 		const uid = currentAccountUid();
 		const observed = observe(path, "dir");
 		// The current account, or the OS-privileged account, must own the parent.
-		if (observed.uid !== uid && observed.uid !== TRUSTED_OS_PRIVILEGED_UID) refuse();
-		if ((observed.mode & PARENT_FORBIDDEN_MODE_BITS) !== 0) refuse();
-		if ((observed.mode & PARENT_REQUIRED_MODE_BITS) === 0) refuse();
+		if (observed.uid !== uid && observed.uid !== TRUSTED_OS_PRIVILEGED_UID) refuse("foreign-owner");
+		if ((observed.mode & PARENT_FORBIDDEN_MODE_BITS) !== 0) refuse("unsafe-permissions");
+		if ((observed.mode & PARENT_REQUIRED_MODE_BITS) === 0) refuse("unsafe-permissions");
 		assertAclCannotGrantMore(path, "parent");
 	};
 
 	const assertPrivateDirectory = (path: string): void => {
-		if (!isUsablePath(path)) refuse();
+		if (!isUsablePath(path)) refuse("unsafe-object");
 		const uid = currentAccountUid();
 		const observed = observe(path, "dir");
-		if (observed.uid !== uid) refuse();
-		if (observed.mode !== PRIVATE_DIRECTORY_MODE) refuse();
+		if (observed.uid !== uid) refuse("foreign-owner");
+		if (observed.mode !== PRIVATE_DIRECTORY_MODE) refuse("unsafe-permissions");
 		assertAclCannotGrantMore(path, "private-dir");
 	};
 
 	const assertPrivateFile = (path: string): void => {
-		if (!isUsablePath(path)) refuse();
+		if (!isUsablePath(path)) refuse("unsafe-object");
 		const uid = currentAccountUid();
 		const observed = observe(path, "file");
-		if (observed.uid !== uid) refuse();
+		if (observed.uid !== uid) refuse("foreign-owner");
 		// A second link means another name can carry different protection.
-		if (observed.nlink !== 1) refuse();
-		if (observed.mode !== PRIVATE_FILE_MODE) refuse();
+		if (observed.nlink !== 1) refuse("unsafe-object");
+		if (observed.mode !== PRIVATE_FILE_MODE) refuse("unsafe-permissions");
 		assertAclCannotGrantMore(path, "private-file");
 	};
 
@@ -518,11 +545,11 @@ function createPosixPeerStatePermissions(
 			// Parent first: an unsafe parent keeps an untrusted write or
 			// delete-child window open across the child's protection, so the
 			// whole operation is refused before the new object is touched.
-			assertOwnerControlledDirectory(parentOf(path));
-			if (!isUsablePath(path)) refuse();
+			asParent(() => assertOwnerControlledDirectory(parentOf(path)));
+			if (!isUsablePath(path)) refuse("unsafe-object");
 			const uid = currentAccountUid();
 			const observed = observe(path, "dir");
-			if (observed.uid !== uid) refuse();
+			if (observed.uid !== uid) refuse("foreign-owner");
 			assertDirectoryIsEmpty(path);
 			// Refuse a foreign ACL before touching anything: `chmod` does not remove
 			// an extended ACL, so a fresh object carrying one is not protectable.
@@ -534,14 +561,14 @@ function createPosixPeerStatePermissions(
 			// The containing peers directory must already be private, otherwise
 			// key bytes would sit in a broadly readable location regardless of
 			// the file's own mode.
-			assertPrivateDirectory(parentOf(path));
-			if (!isUsablePath(path)) refuse();
+			asParent(() => assertPrivateDirectory(parentOf(path)));
+			if (!isUsablePath(path)) refuse("unsafe-object");
 			const uid = currentAccountUid();
 			const observed = observe(path, "file");
-			if (observed.uid !== uid) refuse();
+			if (observed.uid !== uid) refuse("foreign-owner");
 			// A created-but-unused file is empty with exactly one link; anything
 			// else is treated as a pre-existing object and left untouched.
-			if (observed.nlink !== 1 || observed.size !== 0) refuse();
+			if (observed.nlink !== 1 || observed.size !== 0) refuse("changed");
 			assertAclCannotGrantMore(path, "private-file");
 			if (observed.mode !== PRIVATE_FILE_MODE) establishMode(path, "file", observed, PRIVATE_FILE_MODE);
 			else assertPrivateFile(path);
@@ -553,19 +580,19 @@ function createPosixPeerStatePermissions(
 function createRefusingPeerStatePermissions(): PeerStatePermissionPolicy {
 	return {
 		assertOwnerControlledDirectory() {
-			refuse();
+			refuse("protection-unsupported");
 		},
 		assertPrivateDirectory() {
-			refuse();
+			refuse("protection-unsupported");
 		},
 		assertPrivateFile() {
-			refuse();
+			refuse("protection-unsupported");
 		},
 		protectCreatedDirectory() {
-			refuse();
+			refuse("protection-unsupported");
 		},
 		protectCreatedFile() {
-			refuse();
+			refuse("protection-unsupported");
 		},
 	};
 }

@@ -2062,6 +2062,95 @@ test("logical inputs are ordered, bounded at 32 pending operations, and never in
 	await deadlined(viewer.stop(), "stop");
 });
 
+/**
+ * Mirrors the endpoint's internal queued-send bound, exactly as the threshold case
+ * above asserts it: 32 admitted logical operations that have not settled yet,
+ * however long each has been outstanding. #500 replaced the first trial's
+ * arrival-rate rationale with the two shapes the cases below actually measure.
+ * Neither one is an established account of the reported incident.
+ */
+const MAX_QUEUED_INPUT_OPERATIONS = 32;
+
+/** One canonical content-space wheel report: 11 bytes, the whole logical operation. */
+const WHEEL_REPORT = "\x1b[<64;10;5M";
+
+test("a synchronous burst larger than the bound fills an empty queue before any send settles and refuses only the tail", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+	const before = channel.sent.length;
+	// #500 characterization, with the preconditions stated: the queue starts empty and
+	// this channel never stalls, so any refusal here comes from the burst itself. All
+	// admissions run in one synchronous turn, and a slot frees only after that
+	// operation's own write settles, so the first operations are still pending while the
+	// tail is admitted.
+	const pending = Array.from({ length: MAX_QUEUED_INPUT_OPERATIONS + 8 }, () =>
+		viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "mouse", text: WHEEL_REPORT }));
+	assert.equal(channel.sent.length, before,
+		"no input byte reaches the transport while the synchronous batch is still being admitted");
+	const results = await deadlined(Promise.all(pending), "burst");
+	assert.deepEqual(results.slice(0, MAX_QUEUED_INPUT_OPERATIONS).map((result) => result.status),
+		Array.from({ length: MAX_QUEUED_INPUT_OPERATIONS }, () => "submitted"),
+		"the operations up to the bound are all admitted on an unstalled transport");
+	assert.deepEqual(results.slice(MAX_QUEUED_INPUT_OPERATIONS),
+		Array.from({ length: 8 }, (): { status: string; reason: string } => ({ status: "not-sent", reason: "busy" })),
+		"only the over-bound tail is refused, truthfully as nothing sent");
+	assert.equal(channel.sent.length - before, MAX_QUEUED_INPUT_OPERATIONS, "a refused operation writes not a single byte");
+	const frames = channel.frames().slice(before);
+	assert.ok(frames.every((frame) => frame.type === "input"),
+		"each wheel operation is exactly one inline frame, never a paged transfer");
+	assert.deepEqual(frames.map((frame) => (frame as { ordinal: number }).ordinal),
+		Array.from({ length: MAX_QUEUED_INPUT_OPERATIONS }, (_unused, index) => index + 1),
+		"ordinals stay contiguous and in call order, and the refused tail consumed none");
+	const payloads = frames.map((frame) => Buffer.from((frame as { data: string }).data, "base64"));
+	assert.ok(payloads.every((payload) => payload.equals(Buffer.from(WHEEL_REPORT, "utf8"))),
+		"one logical operation carries exactly its own one-packet terminal report");
+	assert.equal(payloads.reduce((total, payload) => total + payload.length, 0),
+		MAX_QUEUED_INPUT_OPERATIONS * Buffer.byteLength(WHEEL_REPORT, "utf8"),
+		"a burst is never expanded into per-character or multi-packet operations");
+	assert.deepEqual(
+		await deadlined(viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "mouse", text: WHEEL_REPORT }), "after drain"),
+		{ status: "submitted" },
+		"the queue is reusable at full capacity once the admitted operations settle",
+	);
+	await deadlined(viewer.stop(), "stop");
+});
+
+test("the same wheel reports admitted one at a time with each send awaited never queue and are all admitted in call order", async () => {
+	const channel = new FakeContentChannel();
+	scriptOwner(channel, { ackNativeIo: true });
+	const viewer = viewportViewer(channel, { cols: 12, rows: 3, nativeIo: nativeIoFixture() });
+	await deadlined(viewer.ready, "ready");
+	const source = nativeSource();
+	publishSource(channel, viewer, source, 1);
+	const before = channel.sent.length;
+	// The other measured shape, with its precondition stated: every result is awaited
+	// before the next report is admitted, and this channel settles immediately, so one
+	// slot is released before the next call claims one. This shows a sequential awaited
+	// stream does not accumulate. It does not show that reports arriving on separate
+	// turns can never accumulate: a held or stalled send keeps pending operations
+	// outstanding across turns and refuses at this same bound, as the held-send case
+	// above already pins.
+	const results: Array<Awaited<ReturnType<typeof viewer.sendInput>>> = [];
+	for (let index = 0; index < MAX_QUEUED_INPUT_OPERATIONS + 8; index += 1) {
+		results.push(await deadlined(
+			viewer.sendInput({ source, inputModes: INPUT_MODES, kind: "mouse", text: WHEEL_REPORT }), "wheel report",
+		));
+		await settle(1);
+	}
+	assert.ok(results.every((result) => result.status === "submitted"),
+		"reports admitted one at a time with each send awaited are never refused on an unstalled transport");
+	const frames = channel.frames().slice(before);
+	assert.equal(frames.length, MAX_QUEUED_INPUT_OPERATIONS + 8);
+	assert.deepEqual(frames.map((frame) => (frame as { ordinal: number }).ordinal),
+		Array.from({ length: MAX_QUEUED_INPUT_OPERATIONS + 8 }, (_unused, index) => index + 1),
+		"every report crossed exactly once, in per-binding call order");
+	await deadlined(viewer.stop(), "stop");
+});
+
 test("a source change between pages, a rejected write, and a stop never become a false not-sent", async () => {
 	// A source change between the pages of one paste is unknown, not unsent.
 	const channel = new FakeContentChannel();

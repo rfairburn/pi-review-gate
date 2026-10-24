@@ -323,7 +323,7 @@ retried, and an unconfirmed or unknown outcome stays so. See
 
 ### Session-host clipboard transport
 
-Raw child OSC 52 is still default-denied. On the verified Pi 1.3.0 runtime, the owned
+Raw child OSC 52 is still default-denied. On the audited Pi 1.3.0 and 1.4.0 runtimes, the owned
 Node stdio adapter distinguishes native clipboard-producer/copy-surface provenance
 from arbitrary rendered or PTY output, without changing Pi's selection or copy
 callbacks. Input delivery captures the reporter's current native session tuple; an

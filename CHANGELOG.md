@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.194]
+## [0.1.0-dev.195]
 
 ### Added
 
@@ -40,6 +40,27 @@ dates.
   inherited macOS ACLs), the directory may still be created for local use, but Network
   refuses it as unsafe until the explicit repair above is confirmed. See
   [Repairing Network storage permissions](docs/session-host-alpha.md#repairing-network-storage-permissions).
+
+## [0.1.0-dev.194]
+
+### Changed
+
+- The sidebar's managed Pi fallback and the pinned verification fixtures now resolve
+  the exact public Pi **1.4.0** release (#487). With no supported global or `PATH`
+  installation, `pi-review-sessions` provisions an isolated
+  `@earendil-works/pi-coding-agent@1.4.0` runtime, the shipped `pi-session-host-tui`
+  alias pins `@earendil-works/pi-tui@1.4.0`, and the test-only CI runtimes pin
+  `@earendil-works/pi-coding-agent@1.4.0` and `@earendil-works/pi-agent-core@1.4.0`.
+  A completed discovery of the managed default now carries that pin, so a stale
+  implicit selection recorded under an older default revalidates, provisions the
+  current release, and republishes its record instead of silently keeping the older
+  runtime. Nothing is purged, and explicit `--pi-executable`, npm-global, and `PATH`
+  selections keep their own cached identity and precedence, so an explicitly chosen
+  older runtime still reuses. The stable Pi `1.0.4` floor, the per-line Node security
+  minimums, and standalone launcher behavior are unchanged.
+- Native clipboard provenance also recognizes the audited Pi 1.4.0 producer while
+  retaining Pi 1.3.0 recognition and the existing source, origin, size, and
+  authentication guards. Other versions remain unverified and fail closed (#487).
 
 ## [0.1.0-dev.193]
 

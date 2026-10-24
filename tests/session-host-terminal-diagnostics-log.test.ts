@@ -91,7 +91,7 @@ test("nothing is created until a diagnostic is recorded; then a private structur
 
 		const log = new TerminalDiagnosticsLog({
 			agentDir: dir,
-			identity: collectTerminalDiagnosticsIdentity({ packageRoot: process.cwd(), piVersion: "1.3.0" }),
+			identity: collectTerminalDiagnosticsIdentity({ packageRoot: process.cwd(), piVersion: "1.4.0" }),
 		});
 		log.appendDiagnostic("instance-1", record());
 		log.noteSuppressed(4);
@@ -109,10 +109,10 @@ test("nothing is created until a diagnostic is recorded; then a private structur
 		}
 		const identity = entries[0]!.identity as Record<string, string>;
 		assert.equal(identity.packageName, "pi-review-gate");
-		assert.equal(identity.piVersion, "1.3.0");
+		assert.equal(identity.piVersion, "1.4.0");
 		assert.equal(identity.xtermHeadless, "6.0.0");
 		assert.equal(identity.xtermAddonUnicode11, "0.9.0");
-		assert.equal(identity.piTui, "1.3.0");
+		assert.equal(identity.piTui, "1.4.0");
 		assert.equal(identity.node, process.versions.node);
 		assert.equal(entries[1]!.instance, "instance-1");
 		assert.equal(entries[1]!.seq, 1);
@@ -157,7 +157,7 @@ test("rotation keeps exactly active + .1 + .2, each within the bound, oldest rem
 	const dir = agentDir();
 	try {
 		const maxFileBytes = 2048;
-		const identity = collectTerminalDiagnosticsIdentity({ packageRoot: process.cwd(), piVersion: "1.3.0" });
+		const identity = collectTerminalDiagnosticsIdentity({ packageRoot: process.cwd(), piVersion: "1.4.0" });
 		const log = new TerminalDiagnosticsLog({ agentDir: dir, maxFileBytes, maxLineBytes: 1024, identity });
 		for (let index = 0; index < 60; index += 1) log.appendDiagnostic(`row-${index}`, record());
 		assert.equal((await log.close()).settled, true);

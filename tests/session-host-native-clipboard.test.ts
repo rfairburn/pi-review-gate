@@ -65,7 +65,7 @@ test("native clipboard schema rejects queries, noncanonical/binary/oversized pay
   assert.throws(() => encodeNativeClipboardCapsule(bootstrap, 1, { ...event, sessionEpoch: 0 }));
 });
 
-test("clipboard provenance resolves only the actual bounded official CLI package and refuses unsafe boundaries", () => {
+test("clipboard provenance resolves only the exact audited CLI and peer TUI versions", () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-copy-runtime-")));
   const entryDir = join(root, "dist", "bundle");
   mkdirSync(entryDir, { recursive: true, mode: 0o700 });
@@ -74,11 +74,36 @@ test("clipboard provenance resolves only the actual bounded official CLI package
   const manifest = { name: "@earendil-works/pi-coding-agent", version: "1.3.0", bin: { pi: "dist/bundle/cli.js" } };
   const file = join(root, "package.json");
   writeFileSync(file, JSON.stringify(manifest), { mode: 0o600, flag: "wx" });
-  assert.equal(resolveNativeClipboardRuntime(cli)?.root, root);
-  assert.equal(resolveNativeClipboardRuntime(cli)?.supported, true);
+
+  const peerRoot = join(root, "node_modules", "@earendil-works", "pi-tui");
+  const peerDist = join(peerRoot, "dist");
+  mkdirSync(peerDist, { recursive: true, mode: 0o700 });
+  writeFileSync(join(peerDist, "tui-alt-screen.js"), "// synthetic peer identity fixture\n", { mode: 0o600, flag: "wx" });
+  const peerManifest = join(peerRoot, "package.json");
+  const writePeerManifest = (version: string): void => writeFileSync(peerManifest,
+    JSON.stringify({ name: "@earendil-works/pi-tui", version, main: "dist/tui-alt-screen.js" }));
+
+  for (const version of ["1.3.0", "1.4.0"]) {
+    writeFileSync(file, JSON.stringify({ ...manifest, version }));
+    writePeerManifest(version);
+    const runtime = resolveNativeClipboardRuntime(cli);
+    assert.equal(runtime?.root, root);
+    assert.equal(runtime?.supported, true, `exact audited Pi ${version} is supported`);
+    assert.equal(runtime?.tuiRoot, peerRoot, `exact audited pi-tui ${version} source is recognized`);
+  }
+  for (const version of ["1.4.1", "1.5.0", "2.0.0"]) {
+    writeFileSync(file, JSON.stringify({ ...manifest, version }));
+    assert.equal(resolveNativeClipboardRuntime(cli)?.supported, false, `Pi ${version} is not silently certified`);
+  }
+
   writeFileSync(file, JSON.stringify({ ...manifest, version: "1.4.0" }));
-  assert.equal(resolveNativeClipboardRuntime(cli)?.supported, false, "future runtime is not silently certified");
-  writeFileSync(file, JSON.stringify(manifest));
+  writePeerManifest("1.4.1");
+  const unsupportedPeer = resolveNativeClipboardRuntime(cli);
+  assert.equal(unsupportedPeer?.supported, true, "an unknown peer does not invalidate the exact supported Pi package");
+  assert.equal(unsupportedPeer?.tuiRoot, undefined, "an unknown peer source is not added to native-source provenance");
+
+  writeFileSync(file, JSON.stringify({ ...manifest, version: "1.3.0" }));
+  writePeerManifest("1.3.0");
   writeFileSync(join(root, "dist", "package.json"), "not JSON", { mode: 0o600, flag: "wx" });
   assert.equal(resolveNativeClipboardRuntime(cli), undefined, "invalid nearer boundary cannot be attributed to the outer package");
 });
@@ -95,7 +120,7 @@ test("native producer provenance accepts actual native selection and Main copy p
     `Error\n    at async InteractiveMode.handleCopyCommand (${nativeFile}:40:10)`), true);
   assert.equal(isNativeClipboardOrigin(runtime, sites,
     `Error\n    at async _InteractiveMode.handleCopyCommand (${nativeFile}:40:10)`), true,
-    "actual bundled Pi 1.3.0 Main class alias is source-verified");
+    "actual bundled Pi 1.3.0 and 1.4.0 Main class alias is source-verified");
   const unbundled = selectionStack.replace(/TuiAltScreen.copyTextToClipboard \(.+?:30:10\)/,
     `TuiAltScreen.copyTextToClipboard (${pathToFileURL(join(runtime.tuiRoot!, "dist", "tui-alt-screen.js")).href}:30:10)`);
   assert.equal(isNativeClipboardOrigin(runtime, sites, unbundled), true);

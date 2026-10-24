@@ -59,7 +59,7 @@
     "@peculiar/x509": "2.2.0",
     "@xterm/addon-unicode11": "0.9.0",
     "@xterm/headless": "6.0.0",
-    "pi-session-host-tui": "npm:@earendil-works/pi-tui@1.3.0",
+    "pi-session-host-tui": "npm:@earendil-works/pi-tui@1.4.0",
     "@mozilla/readability": "^0.6.0",
     "linkedom": "^0.18.13",
     "pdf-parse": "^2.4.5",

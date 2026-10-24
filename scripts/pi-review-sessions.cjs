@@ -32,7 +32,7 @@
  *   global package root's declared bin entry is validated (package name,
  *   stable version floor, bin containment, regular readable positive Node
  *   entry), then a PATH `pi` that resolves into such a package. When no
- *   supported installation exists, an isolated Pi 1.3.0 runtime is
+ *   supported installation exists, an isolated Pi 1.4.0 runtime is
  *   provisioned under the native Pi agent directory's cache
  *   (<agent-dir>/.pi-review-gate/pi-runtime) with npm --ignore-scripts and
  *   re-validated before publication. Global installs and existing user
@@ -101,7 +101,7 @@ with the per-line security minimums Node 24 >=24.22.1 and Node 26 >=26.12.1, and
 Pi >=1.0.4 with a positively identified Node CLI entry. Without --pi-executable the
 launcher resolves the public @earendil-works/pi-coding-agent installation
 (npm global root, then PATH) and, when none is supported, provisions an
-isolated Pi 1.3.0 runtime cache under the native Pi agent directory; no
+isolated Pi 1.4.0 runtime cache under the native Pi agent directory; no
 manual Pi CLI path is needed. Starts an empty welcome/sidebar picker; choose
 a workspace explicitly in the UI.
 The startup working directory is not selected as a workspace.
@@ -151,7 +151,10 @@ const NODE_FLOOR_REQUIREMENT = "Node >=22.23.4 (Node 24 >=24.22.1, Node 26 >=26.
 // src/session-host/launch.ts (Pi 1.0.4 minimum).
 const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const PI_MIN_VERSION = [1, 0, 4];
-const PI_PROVISION_VERSION = "1.3.0";
+const PI_PROVISION_VERSION = "1.4.0";
+// Discovery identity of the provisioned default (see validatePiDiscovery): the
+// source a managed-default selection is recorded under.
+const PI_MANAGED_DEFAULT_SOURCE = "isolated-cache";
 const RUNTIME_CACHE_DIRNAME = ".pi-review-gate";
 const PI_RUNTIME_DIRNAME = "pi-runtime";
 
@@ -826,7 +829,7 @@ async function validateCachedPiRuntime(versionRoot, targetPkgDir, env, expectedI
   } catch {
     throw new PiRuntimeError(`the cached pi runtime at ${versionRoot} is partial or unsafe; preserving it`);
   }
-  return { ...validated, source: "isolated-cache" };
+  return { ...validated, source: PI_MANAGED_DEFAULT_SOURCE };
 }
 
 async function provisionPiRuntime(options) {
@@ -1050,7 +1053,7 @@ async function provisionPiRuntime(options) {
       const lease = await leaseManagedPiRuntime(versionRoot, { leasePid: options.leasePid, warn });
       writeError(`pi-review-sessions: installed isolated Pi ${version} runtime at ${runtimeRoot}\n`);
       published = true;
-      return { ...result, source: "isolated-cache", lease, managedRoot: versionRoot };
+      return { ...result, source: PI_MANAGED_DEFAULT_SOURCE, lease, managedRoot: versionRoot };
     } finally {
       if (!published) {
         // Retained incomplete setup is disposable by location and is reclaimed by
@@ -1069,6 +1072,9 @@ async function provisionPiRuntime(options) {
 // Completed Pi discovery (issue 344): a current launch must not run `npm root
 // -g`, a `pi --version` probe, or a managed-runtime cleanup. The completed
 // selection is cached with bounded package/path metadata and validated cheaply.
+// A managed-default record additionally carries this build's provisioned pin
+// (validatePiDiscovery), so moving the default invalidates only that stale
+// implicit fallback and never an explicit, global, or PATH selection.
 // ---------------------------------------------------------------------------
 
 const PI_DISCOVERY_MARKER = "pi-runtime.json";
@@ -1136,7 +1142,15 @@ function validatePiDiscovery(value, key) {
     && value.version.length <= 64
     && typeof value.source === "string"
     && isRecord(value.identity)
-    && (value.managedRoot === undefined || (typeof value.managedRoot === "string" && path.isAbsolute(value.managedRoot)));
+    && (value.managedRoot === undefined || (typeof value.managedRoot === "string" && path.isAbsolute(value.managedRoot)))
+    // A completed managed-default discovery stands for this build's own
+    // provisioned pin, so its version is part of its identity: a record written
+    // under an older default must not silently keep launching that older
+    // runtime. Explicit, npm-global, and PATH records are user-owned selections
+    // and keep their own cached identity, so a valid older explicit selection
+    // still reuses. Nothing is purged: the next launch revalidates, provisions
+    // the current pin, and republishes the record.
+    && (value.source !== PI_MANAGED_DEFAULT_SOURCE || value.version === PI_PROVISION_VERSION);
 }
 
 /**

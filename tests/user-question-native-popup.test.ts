@@ -4,8 +4,8 @@
  * Drives the production extension registration (activate → the registered
  * Ctrl+Alt+Up shortcut handler → the shared custom overlay factory) over a
  * REAL pinned pi-tui `TuiAltScreen` (`pi-session-host-tui`, the exact pi-tui
- * 1.3.0 release this package depends on). The test's `ctx.ui.custom` mirrors
- * Pi 1.3.0's public `showExtensionCustom`: it invokes the factory with the
+ * 1.4.0 release this package depends on). The test's `ctx.ui.custom` mirrors
+ * Pi 1.4.0's public `showExtensionCustom`: it invokes the factory with the
  * live TUI, shows the returned component through the public
  * `tui.showOverlay(component, overlayOptions)`, and hides that overlay when
  * the factory's completion callback runs. Every keyboard byte sequence (and
@@ -189,7 +189,7 @@ test("native fullscreen: the compact popup keeps its natural size over the live 
     let openCount = 0;
     const open = async (): Promise<{ closed: Promise<unknown> }> => {
       const bridge = createBridgeUi({ keybindings: getKeybindings(), draft: "chat draft", drivers: [] });
-      // Mirror Pi 1.3.0 InteractiveMode.showExtensionCustom for overlays.
+      // Mirror Pi 1.4.0 InteractiveMode.showExtensionCustom for overlays.
       const custom = (factory: (...args: unknown[]) => unknown, options?: {
         overlay?: boolean;
         overlayOptions?: OverlayOptions;

@@ -110,7 +110,7 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Install pinned Pi agent-core runtime
         # tests/browser-native-error.test.ts drives the real agentLoop from an
-        # installed Pi agent-core build. 1.3.0 is verified against the current
+        # installed Pi agent-core build. 1.4.0 is verified against the current
         # extension sources (and itself needs Node >=22.19.0, below this
         # project's patched per-line security floors).
         # The test skips itself when PI_BROWSER_AGENT_RUNTIME is unset; this job
@@ -146,7 +146,7 @@ jobs:
         # tier in tests/native-editor-bridge.test.ts) drive the real Pi TUI
         # surface — CustomEditor, pi-tui components, and the pi CLI entry from
         # @earendil-works/pi-coding-agent. Keep this full UI fixture at Pi
-        # 1.3.0, above the alpha's minimum stable version (1.0.4) for its
+        # 1.4.0, above the alpha's minimum stable version (1.0.4) for its
         # native CLI helper; this does not claim native Windows coverage for
         # that helper. Install
         # the locked tree into runner temp as a test-only install, never a
@@ -166,7 +166,7 @@ jobs:
           echo "PI_REVIEW_GATE_INSTALLED_AGENT=$RUNNER_TEMP/pi-ui-runtime/node_modules/@earendil-works/pi-coding-agent" >> "$GITHUB_ENV"
           echo "PI_REVIEW_GATE_INSTALLED_PI_BIN=$RUNNER_TEMP/pi-ui-runtime/node_modules/.bin" >> "$GITHUB_ENV"
           echo "PI_REVIEW_GATE_REQUIRE_PI_HOST=1" >> "$GITHUB_ENV"
-          echo "PI_REVIEW_GATE_EXPECT_PI_VERSION=1.3.0" >> "$GITHUB_ENV"
+          echo "PI_REVIEW_GATE_EXPECT_PI_VERSION=1.4.0" >> "$GITHUB_ENV"
       - name: Build review-gate candidate extension into scratch (never live dist)
         # The TUI smoke launches the built extension through pi's public
         # --no-extensions --extension seam. The candidate is compiled into the
@@ -285,21 +285,21 @@ jobs:
         # Resolve `pi` through src/pi-invocation, run npm's actual installed
         # Windows command shim, and prove RPC + candidate registration without
         # a provider/model call. Missing prerequisites are fatal, not skipped.
-        # The locked Pi 1.3.0 fixture covers this existing standalone CLI smoke,
+        # The locked Pi 1.4.0 fixture covers this existing standalone CLI smoke,
         # not the alpha helper on native Windows.
         env:
           PI_REVIEW_GATE_INSTALLED_PI_BIN: ${{ runner.temp }}\pi-ui-runtime\node_modules\.bin
           PI_REVIEW_GATE_INSTALLED_AGENT: ${{ runner.temp }}\pi-ui-runtime\node_modules\@earendil-works\pi-coding-agent
           PI_REVIEW_GATE_CANDIDATE_ENTRY: ${{ github.workspace }}\dist\src\index.js
           PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"
-          PI_REVIEW_GATE_EXPECT_PI_VERSION: "1.3.0"
+          PI_REVIEW_GATE_EXPECT_PI_VERSION: "1.4.0"
         run: node --test dist-test/tests/pi-installed-launch.test.js
       # Issue #204: alias-independent Pi child launch. On this host the only
       # `pi` PATH entry is npm's pi.cmd shim, and a shell:false spawn of the
       # bare name cannot find an executable; these regressions start real
       # child processes through the shared resolver (reviewer prompt, delegated
       # RPC executor, compaction recovery) plus cross-platform resolver/argv
-      # safety cases. Require the same installed Pi 1.3.0 host for both real
+      # safety cases. Require the same installed Pi 1.4.0 host for both real
       # registration cases; missing prerequisites must not silently skip them.
       - name: Pi child launch tests (alias-independent, native Windows)
         env:
@@ -307,7 +307,7 @@ jobs:
           PI_REVIEW_GATE_INSTALLED_AGENT: ${{ runner.temp }}\pi-ui-runtime\node_modules\@earendil-works\pi-coding-agent
           PI_REVIEW_GATE_CANDIDATE_ENTRY: ${{ github.workspace }}\dist\src\index.js
           PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"
-          PI_REVIEW_GATE_EXPECT_PI_VERSION: "1.3.0"
+          PI_REVIEW_GATE_EXPECT_PI_VERSION: "1.4.0"
         # Include bounded teardown when an exited root leaves inherited pipes
         # open in reviewer, RPC executor, and compaction recovery paths, plus the
         # #335 settlement-lineage diagnostics suite: its win32-only cases run the
@@ -332,7 +332,7 @@ jobs:
       # every sample's exit code is collected: any nonzero exit fails the step.
       # The case, its assertions, and its fixtures stay untouched (disposable fake
       # pi bin, no provider/model call), the environment is exactly the pinned Pi
-      # 1.3.0 runtime env of the child-launch step above, and no process, lineage,
+      # 1.4.0 runtime env of the child-launch step above, and no process, lineage,
       # or job deadline is extended — only this step carries its own finite cap
       # inside the job's existing 20-minute budget. Five greens are five more
       # samples: they prove no cause and apply no correction.
@@ -346,7 +346,7 @@ jobs:
           PI_REVIEW_GATE_INSTALLED_AGENT: ${{ runner.temp }}\pi-ui-runtime\node_modules\@earendil-works\pi-coding-agent
           PI_REVIEW_GATE_CANDIDATE_ENTRY: ${{ github.workspace }}\dist\src\index.js
           PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"
-          PI_REVIEW_GATE_EXPECT_PI_VERSION: "1.3.0"
+          PI_REVIEW_GATE_EXPECT_PI_VERSION: "1.4.0"
         run: |
           $title = 'executor compaction recovery launches the default pi child through the same resolver'
           $pattern = '^' + $title + '$'

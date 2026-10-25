@@ -315,7 +315,9 @@ arrows select · Enter confirm · Esc back
   as in the main editor, and so do its completions: **Tab** completes paths,
   subpaths, and `~/`; **@** opens the fd-backed file picker; **Ctrl+G** edits
   the draft in your external editor; **Ctrl+V** pastes an image from the
-  clipboard into the draft as a temp-file path. Slash commands never execute
+  clipboard into the draft as a temp-file path. Once Pi completes the
+  asynchronous paste, that inserted path appears in the popup without another
+  keystroke. Slash commands never execute
   from the field: Enter submits the whole answer to the question — never a
   chat message or command — and there is no length cap, so a long paste or
   typed draft is kept in full with embedded newlines preserved and only the

@@ -231,6 +231,8 @@ export interface BridgeUiOptions {
   appHandlers?: Record<string, (editor: FakeBridgeEditor) => () => void>;
   /** The host's onPasteImage wiring (its terminal act on the instance). */
   onPasteImage?: (editor: FakeBridgeEditor) => () => void;
+  /** Optional host onChange wiring, for asserting callback chaining/ownership. */
+  onChange?: (editor: FakeBridgeEditor) => FakeBridgeEditor["onChange"];
   /** One driver per custom() call, in order. */
   drivers: Array<(component: BridgeComponent) => void | Promise<void>>;
 }
@@ -288,7 +290,7 @@ export function createBridgeUi(options: BridgeUiOptions): { ui: NativeEditorFiel
       editor.onSubmit = (text) => {
         state.chatSubmits.push(text);
       };
-      editor.onChange = (): void => {};
+      editor.onChange = options.onChange?.(editor) ?? (() => {});
       // Copy text from the previous editor.
       editor.setText(currentText);
       if (options.provider !== undefined) editor.setAutocompleteProvider(options.provider);

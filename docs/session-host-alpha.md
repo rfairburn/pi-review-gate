@@ -1896,14 +1896,9 @@ whole-viewport assembly bound is unchanged.
 `submitted` means only that local transport writes returned, never that the owner or
 child executed anything. If a transport write may have been invoked, loss, rejection,
 malformed results, or source changes leave the handoff `unknown`, with no replay, retry,
-or cancellation claim. Refusals and an oversize paste use one brief non-modal notice;
-they never open a dialog, steal focus, or truncate input. The one quiet refusal is this
-viewer's own pending-operation bound — the viewer's finite queue of outstanding logical
-input operations, a local backpressure limit and not a server limit or a rate limit: an
-over-bound operation stays unsent, is never retried or replayed, claims no success, and
-raises no notice, while an earlier refusal or uncertainty notice stays exactly as drawn.
-Every other `not-sent` reason, an unrecognized reason, and an unknown outcome keep their
-existing notice.
+or cancellation claim. Refusals, an oversize paste, or a full or
+busy queue use one brief non-modal notice; they never open a dialog, steal focus, or
+truncate input.
 
 Close, Disconnect, Remove, Revoke, and stream loss keep their existing boundaries. Close
 is authorized only by the highlighted host/run/row plus its actual written receipt or

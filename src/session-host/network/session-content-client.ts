@@ -335,13 +335,8 @@ export interface SessionContentViewer {
 	stop(): Promise<void>;
 }
 
-/**
- * Finite bound shared by queued control writes and pending logical input operations.
- * Counts admitted-but-unsettled operations, not characters or events per second.
- * Slots release as sends settle; synchronous bursts can fill the bound before any
- * write runs. Overflow remains refused without replay or relaxed input fences.
- */
-const MAX_QUEUED_CONTROL_SENDS = 128;
+/** Queued control writes: hello, subscribe, resize, unsubscribe, and one error. */
+const MAX_QUEUED_CONTROL_SENDS = 4;
 
 type ViewerState = "awaiting_ack" | "subscribing" | "streaming";
 

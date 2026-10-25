@@ -15,24 +15,12 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.197]
+## [0.1.0-dev.198]
 
-### Changed
+### Reverted
 
-- Increased the session-content viewer's shared finite queue bound to 128 pending
-  logical input operations and queued control writes (#500). This remains an experimental
-  scrolling-capacity change, not a confirmed fix. Existing tests cover 128 admitted
-  operations with the 129th refused, a synchronous 136-report burst admitting 128 and
-  refusing 8, ordered drain, contiguous paste pages, and slot reuse. Input fences,
-  too-large guards, truthful not-sent/unknown outcomes, and no-replay behavior are unchanged.
-- Remote input notices now present only this viewer's own queue-limit refusal quietly
-  (#500). When the viewer's finite pending-operation bound (a local backpressure limit,
-  not a server limit or a rate limit) refuses an operation before any transport write,
-  the input still stays unsent, nothing is retried or replayed, no success is claimed,
-  no new notice appears, and an earlier refusal or uncertainty notice stays visible.
-  Every other refusal reason, an unrecognized reason, an oversize paste, and an unknown
-  or failed handoff keep their existing visible notice, and the 128-operation bound
-  itself is unchanged.
+- Reverted b197's remote-input queue-capacity and quiet local-queue notice changes
+  (#500), restoring the pre-b197 implementation, tests, and documented feedback.
 
 ## [0.1.0-dev.196]
 

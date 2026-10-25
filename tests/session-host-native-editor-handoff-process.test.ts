@@ -276,6 +276,25 @@ function result(output: string, index: number): { status: string; content?: stri
   return JSON.parse(match[1]!) as { status: string; content?: string };
 }
 
+function shellQuote(value: string): string {
+  return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
+// The shell waits for foreground tee, then reports and propagates tee's exact status.
+function createTeeEditor(sinkRoot: string, out: string): { command: string; statusFile: string } {
+  const command = join(sinkRoot, "tee-editor.sh");
+  const statusFile = join(sinkRoot, "tee.status");
+  writeFileSync(command, [
+    "#!/bin/sh",
+    `tee ${shellQuote(out)} "$@"`,
+    "tee_status=$?",
+    `printf '%s' "$tee_status" > ${shellQuote(statusFile)}`,
+    "exit \"$tee_status\"",
+    "",
+  ].join("\n"), { mode: 0o700 });
+  return { command, statusFile };
+}
+
 /** PIDs of processes whose command line contains `marker`, excluding this test. */
 function pidsMatching(marker: string): number[] {
   const found = spawnSync("pgrep", ["-f", marker], { encoding: "utf8" });
@@ -322,7 +341,8 @@ test("handoff: a non-Node program receives the verified bytes, not the framing t
   const out = join(sinkRoot, "bytes.bin");
   // A canonical-mode-safe payload: no CR, no INTR/SUSP/EOF byte, terminated by LF.
   const payload = Buffer.from("x\x1b[200~héllo — 🚀\x1b[201~ ok\n", "utf8");
-  const child = await startChild(runtime!, [{ command: `tee ${out}` }]);
+  const editor = createTeeEditor(sinkRoot, out);
+  const child = await startChild(runtime!, [{ command: editor.command }]);
   t.after(() => child.dispose());
   await child.waitFor("the strict readiness capsule", (value) => value.includes(READY_MARKER));
   await child.settle("Launching external editor");
@@ -334,6 +354,7 @@ test("handoff: a non-Node program receives the verified bytes, not the framing t
   assert.equal(readFileSync(out).includes("prg-ni-v2"), false, "no framing text ever entered the program");
   assert.deepEqual(result(done, 1), { status: "complete", content: payload.toString("utf8").replace(/\n$/, "") },
     "the same bytes reached Pi's own result file, and Pi's content semantics are untouched");
+  assert.equal(readFileSync(editor.statusFile, "utf8"), "0", "the real tee process exited normally");
 });
 
 test("handoff: a configured editor that changes the draft and dies by signal is a failed edit", { skip }, async (t) => {
@@ -356,9 +377,11 @@ test("handoff: a configured editor that changes the draft and dies by signal is 
 test("handoff: a failing edit and a later edit both settle", { skip }, async (t) => {
   const sinkRoot = mkdtempSync(join(tmpdir(), "prg-editor-sink-"));
   t.after(() => rmSync(sinkRoot, { recursive: true, force: true }));
+  const out = join(sinkRoot, "second.bin");
+  const editor = createTeeEditor(sinkRoot, out);
   const child = await startChild(runtime!, [
     { command: "this-editor-does-not-exist-499" },
-    { command: `tee ${join(sinkRoot, "second.bin")}` },
+    { command: editor.command },
   ]);
   t.after(() => child.dispose());
   await child.waitFor("the strict readiness capsule", (value) => value.includes(READY_MARKER));
@@ -370,7 +393,8 @@ test("handoff: a failing edit and a later edit both settle", { skip }, async (t)
   const second = await child.waitFor("the later edit", (value) => value.includes("PRG_RESULT 2 "));
   assert.deepEqual(result(second, 2), { status: "complete", content: "abc" },
     `a later edit still works after a failed one: ${tail(second)}`);
-  assert.equal(readFileSync(join(sinkRoot, "second.bin")).toString(), "abc\n", "and it still owns its own terminal");
+  assert.equal(readFileSync(out).toString(), "abc\n", "and it still owns its own terminal");
+  assert.equal(readFileSync(editor.statusFile, "utf8"), "0", "the later edit's real tee process exited normally");
   await child.waitFor("the driver finishing", (value) => value.includes("PRG_DRIVER_DONE"));
 });
 

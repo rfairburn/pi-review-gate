@@ -30,6 +30,15 @@ dates.
   unchanged. A focused guard keeps the selected direct minimum and the committed
   baseline floors in step with the root lock (#506).
 
+### Fixed
+
+- The Linux external-editor process regressions now wait for the real non-Node
+  byte consumer to exit and assert its actual status before accepting successful
+  completion (#511). Exact input and Pi-result assertions remain, as does the
+  genuine-signal failure control. The existing tests still run once each; no
+  repeated-trial suite, polling delay, deadline increase, or production handoff
+  change is added.
+
 ## [0.1.0-dev.200]
 
 ### Changed

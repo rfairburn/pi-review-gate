@@ -15,6 +15,30 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.201]
+
+### Changed
+
+- Routine dependency maintenance: the direct `undici` dependency now requires
+  `^6.29.1`, and the committed lock refreshes the affected compatible transitive
+  resolutions (`body-parser`, `fast-uri`, `ip-address`, `qs`, `zod`) to what a clean
+  install resolves. A clean `npm install` and `npm ci` both complete with the audit
+  enabled, report no known vulnerabilities, and leave the committed lock byte-identical.
+  Nothing else moves: other direct, development, and optional dependencies keep their
+  existing ranges and pins, and the supported Node floors, the pinned Pi TUI target,
+  optional native platform coverage, product behaviour, and dependency policy are
+  unchanged. A focused guard keeps the selected direct minimum and the committed
+  baseline floors in step with the root lock (#506).
+
+### Fixed
+
+- The Linux external-editor process regressions now wait for the real non-Node
+  byte consumer to exit and assert its actual status before accepting successful
+  completion (#511). Exact input and Pi-result assertions remain, as does the
+  genuine-signal failure control. The existing tests still run once each; no
+  repeated-trial suite, polling delay, deadline increase, or production handoff
+  change is added.
+
 ## [0.1.0-dev.200]
 
 ### Changed

@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.200]
+## [0.1.0-dev.201]
 
 ### Changed
 
@@ -29,6 +29,31 @@ dates.
   optional native platform coverage, product behaviour, and dependency policy are
   unchanged. A focused guard keeps the selected direct minimum and the committed
   baseline floors in step with the root lock (#506).
+
+## [0.1.0-dev.200]
+
+### Changed
+
+- Numbered prerelease publication now also depends on the native Windows session-host
+  acceptance matrix (#211): CI calls `.github/workflows/session-host-alpha.yml` as a
+  read-only reusable workflow on every enforced trigger (pull request, `main` push, and
+  manual dispatch), so the eight real verification legs — the three `Verify` Node floors,
+  the full suite, the two native Windows jobs, and the matrix's Node 22.23.4 and 24.22.1
+  legs — sit upstream of the publish job, which keeps its implicit `success()` guard and
+  its original push/`refs/heads/main`/repository conditions. The matrix no longer starts
+  on its own `pull_request`/`push` triggers, so the automatic Windows matrix runs exactly
+  once per CI run; targeted `workflow_dispatch` stays available for one commit, and its
+  concurrency group keeps a fixed prefix with cancellation off, so it never cancels the
+  calling CI run or a `main` publication run. The same test files, commands, fail-closed
+  prerequisite gates, pinned actions and Node floors, and job, step, and test deadlines
+  run as before, and the native Main case plus both cold hosted-source wrapper legs stay
+  deferred under #345, so a green matrix job is not Windows runtime-support proof.
+- CI's six existing check names are unchanged. Which contexts the called matrix
+  contributes, and the repository protection that requires them, are coordinated with the
+  live repository configuration rather than set from this source tree; the workflow
+  contract tests here pin only that source contract. Proof for an exact merged commit
+  comes from an authorized merge and that commit's own post-merge CI run, independently of
+  any ruleset change.
 
 ## [0.1.0-dev.199]
 

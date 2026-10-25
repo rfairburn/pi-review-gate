@@ -38,6 +38,17 @@ https://github.com/rfairburn/pi-review-gate/issues/345: the real native Main cas
 and both cold hosted-source wrapper legs (cmd and direct PowerShell) are retained in
 the suite but explicitly skipped, so green CI does not certify Windows runtime
 support; the Windows sidebar/host remains optional experimental.
+CI now calls the separate session-host alpha matrix workflow read-only on every enforced
+trigger and requires its results before publishing a numbered prerelease. That reuse
+changes no deferral: the genuine native Main case and both cold hosted-source wrapper
+legs above are registered with an unconditional skip, so they stay deferred under #345
+even inside that matrix, and a green matrix job is not proof that those cases executed.
+What the matrix does run on native Windows runners is its non-deferred tiers — the
+named-pipe broker/reporter/protocol components, the pure Windows helper contracts, the
+real pinned-provider workspace completion case, the Network storage real-Main cases, and
+the launcher witness/deadline regressions — with every missing prerequisite a hard
+failure for those tiers. The unresolved shutdown and physical-input limitations below are
+unchanged.
 
 ## Known limitation: Windows runtime acceptance
 

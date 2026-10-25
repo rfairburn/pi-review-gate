@@ -2,7 +2,19 @@
 
 This page owns the build, test, static-check, and packaging workflows plus launcher
 internals. CI lives in the repository's `.github/workflows/ci.yml` (present only in
-the checkout, not shipped in the npm package).
+the checkout, not shipped in the npm package), alongside two reusable workflows it
+calls: `.github/workflows/release.yml` (the numbered prerelease builder) and
+`.github/workflows/session-host-alpha.yml` (the native Windows session-host acceptance
+matrix). `release.yml` is `workflow_call`-only — there is deliberately no manual publish
+path — while `session-host-alpha.yml` is `workflow_call` plus a targeted
+`workflow_dispatch` for one commit. Neither declares an automatic `pull_request` or
+`push` trigger, so neither starts a second automatic matrix or publish path beside CI;
+CI's publish job needs the session-host
+matrix, and its eight verification legs therefore gate publication. Those reuse and
+dependency contracts are pinned by the source-level workflow contract tests
+(`tests/ci-workflow.test.ts`, `tests/session-host-windows-workflow.test.ts`); which
+required contexts a called matrix contributes, and the repository ruleset that requires
+them, are confirmed from a live run and the live ruleset rather than from these tests.
 
 ## Repository layout
 

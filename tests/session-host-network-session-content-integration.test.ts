@@ -2933,6 +2933,200 @@ test("a native viewer's input crosses TLS into the framed child under the owner'
 	owner.succeeded();
 });
 
+test("input held for a native redraw wakes for the whole parsed chunk, and a packet whose facts moved never reaches the child", async (t) => {
+	// #500 on the real pipeline: surface, service, endpoint, manager, provider, framed
+	// PTY. The child ends its synchronized redraw and THEN changes input modes in the
+	// same chunk, with a graphics APC between them — the barrier that splits one chunk
+	// into several parser writes. A wake-up delivered between those writes reports a
+	// state the child never displayed, and the waiting click would cross as bytes the
+	// child can no longer interpret. Zero PTY invocations is the only acceptable result.
+	const owner = await startNativeOwner(t);
+	const row = await owner.createRow("native-defer");
+	owner.setConversation(row, "conversation-native-defer", 7);
+	await owner.markReady(row);
+	await owner.feed(row, ["\x1b[2J\x1b[H", "\x1b[?1003h\x1b[?1006h\x1b[?2004h", "prompt\n"]);
+
+	const viewer = await connectNativeViewer(t, owner, {
+		label: "native-defer-viewer", sessionId: row.id, cols: 240, rows: 200,
+	});
+	await withTimeout(viewer.viewer.ready, 5_000, "the native viewer never became ready");
+	const first = await viewer.nextSource("a published viewport that states a native input source");
+	viewer.commit(first);
+
+	// The child opens a redraw and is still painting when the viewer's click completes.
+	await owner.feed(row, ["\x1b[?2026h\x1b[2J\x1b[Hmid-redraw"]);
+	const surface = owner.surfaceFor(row);
+	assert.equal(surface.redrawState(), "held", "the child's redraw is genuinely in flight");
+	const modes = viewer.viewer.readSnapshot()?.meta.inputModes;
+	assert.ok(modes !== undefined, "the viewer holds the committed frame's input modes");
+	assert.equal(modes.mouseTracking, "any", "the viewer holds the committed frame's mouse facts");
+	assert.deepEqual(
+		await viewer.viewer.sendInput({ source: first, inputModes: modes, kind: "mouse", text: "\x1b[<0;12;7M" }),
+		{ status: "submitted" },
+	);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(row.pty.writes.length, 0,
+		"a completed packet waits BEFORE the first provider write while the owner is mid-redraw");
+
+	// End marker, graphics APC, then mouse tracking and bracketed paste go OFF.
+	await owner.feed(row, ["\x1b[?2026l\x1b_Ga=d\x1b\\\x1b[?1003l\x1b[?1006l\x1b[?2004l"]);
+	await owner.whenDiagnostic("input_refused");
+	assert.equal(row.pty.writes.length, 0,
+		"the stale click is discarded: no provider, manager, or PTY invocation at all");
+
+	// The refusal is about those facts, not the lane: the committed frame's own modes
+	// are published, and current input on them still crosses once.
+	const settled = await nextSnapshotMatching(viewer.inbox, "the viewport after the redraw committed",
+		(snapshot) => snapshot.meta.inputModes.mouseTracking === "none");
+	assert.equal(settled.meta.inputModes.mouseTracking, "none");
+	assert.equal(settled.meta.inputModes.bracketedPaste, false);
+	const current = statedSource(settled.meta.inputSource);
+	viewer.commit(current);
+	assert.deepEqual(
+		await viewer.viewer.sendInput({ source: current, inputModes: settled.meta.inputModes, kind: "keyboard", text: "now\r" }),
+		{ status: "submitted" },
+	);
+	await row.pty.whenWrites(1, "current input on current facts still crosses");
+	assert.equal(row.pty.writes.length, 1, "exactly one byte sequence ever reached this child");
+	assert.equal(owner.lastDispatch(row).payload.toString("utf8"), "now\r",
+		"and it is the current packet, not the discarded click");
+});
+
+test("input admitted between the parser parts of a graphics-split chunk never outruns the chunk it landed in", async (t) => {
+	// Suppressing the wake-up is only half of it: readiness is also POLLED, by the next
+	// input that arrives. One child chunk that ends a synchronized redraw, contains a
+	// Kitty graphics APC (a splitter barrier — this chunk reaches the parser as three
+	// separate writes), and then turns mouse tracking off, leaves a real interval in
+	// which the end marker has parsed and the mode change has not. Input admitted there
+	// must still wait: otherwise it drains work parked under the frame's own facts and
+	// hands bytes to a child that had already turned that reporting off.
+	const owner = await startNativeOwner(t);
+	const row = await owner.createRow("native-mid-chunk");
+	owner.setConversation(row, "conversation-native-mid-chunk", 7);
+	await owner.markReady(row);
+	await owner.feed(row, ["\x1b[2J\x1b[H", "\x1b[?1003h\x1b[?1006h\x1b[?2004h", "prompt\n"]);
+	const viewer = await connectNativeViewer(t, owner, {
+		label: "native-mid-chunk-viewer", sessionId: row.id, cols: 240, rows: 200,
+	});
+	await withTimeout(viewer.viewer.ready, 5_000, "the native viewer never became ready");
+	const first = await viewer.nextSource("a published viewport that states a native input source");
+	viewer.commit(first);
+	const modes = viewer.viewer.readSnapshot()?.meta.inputModes;
+	assert.ok(modes !== undefined, "the viewer holds the committed frame's input modes");
+	assert.equal(modes.mouseTracking, "any");
+
+	// A completed click parked behind an unfinished redraw.
+	await owner.feed(row, ["\x1b[?2026h\x1b[2J\x1b[Hmid-redraw"]);
+	const surface = owner.surfaceFor(row);
+	assert.equal(surface.redrawState(), "held", "the child is mid-redraw");
+	assert.deepEqual(
+		await viewer.viewer.sendInput({ source: first, inputModes: modes, kind: "mouse", text: "\x1b[<0;12;7M" }),
+		{ status: "submitted" },
+	);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(row.pty.writes.length, 0, "the click waits before its first owner write");
+
+	// Admit a second click in the interval itself, from inside the parser pipeline.
+	const terminal = (surface as unknown as { terminal: { write: (data: string, cb?: () => void) => void } }).terminal;
+	const realWrite = terminal.write.bind(terminal);
+	const parts: string[] = [];
+	let admittedInInterval = false;
+	terminal.write = (data: string, cb?: () => void): void => {
+		parts.push(data);
+		if (!admittedInInterval && data.includes("?1003l")) {
+			admittedInInterval = true;
+			// What this interval really looks like: the hold is gone, the mode change is
+			// not parsed or observed yet. Neither half of that is permission to write.
+			assert.equal(surface.redrawState(), "held",
+				"an end marker whose chunk is still parsing is not readiness");
+			assert.equal(surface.publishedInputModes().mouseTracking, "any",
+				"the mode change has not been observed at this point");
+			void viewer.viewer.sendInput({ source: first, inputModes: modes, kind: "mouse", text: "\x1b[<0;13;8M" });
+			assert.equal(row.pty.writes.length, 0,
+				"admitting input here touches no provider — neither the new click nor the parked one");
+		}
+		realWrite(data, cb);
+	};
+	try {
+		await owner.feed(row, ["\x1b[?2026l\x1b_Ga=d\x1b\\\x1b[?1003l\x1b[?1006l\x1b[?2004l"]);
+	} finally {
+		terminal.write = realWrite;
+	}
+	assert.ok(admittedInInterval, "the mode change really is a later parser write");
+	assert.ok(parts.some((part) => part.includes("?2026l") && !part.includes("?1003l")),
+		"the end marker parsed as its own part of the chunk");
+	await owner.whenDiagnostic("input_refused");
+	assert.equal(row.pty.writes.length, 0,
+		"neither the parked click nor the interval click ever reached the child");
+
+	// The lane is intact: the committed frame's own facts still take current input.
+	const settled = await nextSnapshotMatching(viewer.inbox, "the viewport after the mode change",
+		(snapshot) => snapshot.meta.inputModes.mouseTracking === "none");
+	const current = statedSource(settled.meta.inputSource);
+	viewer.commit(current);
+	assert.deepEqual(
+		await viewer.viewer.sendInput({ source: current, inputModes: settled.meta.inputModes, kind: "keyboard", text: "now\r" }),
+		{ status: "submitted" },
+	);
+	await row.pty.whenWrites(1, "current input on the committed frame still crosses");
+	assert.equal(row.pty.writes.length, 1, "exactly one byte sequence ever reached this child");
+	assert.equal(owner.lastDispatch(row).payload.toString("utf8"), "now\r");
+});
+
+test("a native parse failure cancels input held for its redraw and receives no byte, then refuses later input too", async (t) => {
+	// A grounded pipeline is not a healthy surface with nothing in flight. The waiting
+	// packet is cancelled, and the next packet is refused rather than written into a
+	// parser whose behaviour after failure is undefined.
+	const owner = await startNativeOwner(t);
+	const row = await owner.createRow("native-parse-failure");
+	owner.setConversation(row, "conversation-native-parse-failure", 7);
+	await owner.markReady(row);
+	await owner.feed(row, ["\x1b[2J\x1b[H", "\x1b[?2004h", "prompt\n"]);
+	const viewer = await connectNativeViewer(t, owner, {
+		label: "native-parse-failure-viewer", sessionId: row.id, cols: 240, rows: 200,
+	});
+	await withTimeout(viewer.viewer.ready, 5_000, "the native viewer never became ready");
+	const first = await viewer.nextSource("a published viewport that states a native input source");
+	viewer.commit(first);
+	await owner.feed(row, ["\x1b[?2026h\x1b[2J\x1b[Hpainting"]);
+	const surface = owner.surfaceFor(row);
+	assert.equal(surface.redrawState(), "held", "the redraw is in flight");
+	const modes = viewer.viewer.readSnapshot()?.meta.inputModes;
+	assert.ok(modes !== undefined, "the viewer holds the committed frame's input modes");
+	assert.deepEqual(
+		await viewer.viewer.sendInput({ source: first, inputModes: modes, kind: "keyboard", text: "held\r" }),
+		{ status: "submitted" },
+	);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(row.pty.writes.length, 0, "the packet is waiting for the frame");
+
+	// The parse pipeline fails while the packet waits.
+	(surface as unknown as { terminal: { write: () => void } }).terminal.write = () => {
+		throw new Error("synthetic parse pipeline failure");
+	};
+	owner.ptyFor(row).emitData("\x1b[?2026l");
+	let failed = false;
+	try {
+		await surface.flush();
+	} catch {
+		failed = true;
+	}
+	assert.ok(failed, "the parse failure is reported to its owner, not swallowed");
+	assert.equal(surface.redrawState(), "unavailable",
+		"a failed pipeline is unavailable, never 'clear' with nothing in flight");
+	await owner.whenDiagnostic("input_refused");
+	assert.equal(row.pty.writes.length, 0, "the waiting packet never reached the child");
+
+	// And the next packet is refused on the same ground rather than written anyway.
+	assert.deepEqual(
+		await viewer.viewer.sendInput({ source: first, inputModes: modes, kind: "keyboard", text: "later\r" }),
+		{ status: "submitted" },
+	);
+	await owner.whenDiagnostic("input_refused");
+	assert.equal(row.pty.writes.length, 0,
+		"a grounded pipeline takes no input at all, now or afterwards");
+});
+
 test("a native copy reaches only the viewer whose own input caused it, whole, in native emission order", async (t) => {
 	const owner = await startNativeOwner(t);
 	const row = await owner.createRow("native-copy");

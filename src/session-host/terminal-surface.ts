@@ -67,7 +67,15 @@
  *   live; mouse reporting is withheld (`none`) from `inputModes()` while any
  *   frame is held (outer capture instead follows `requestedMouseReporting()`,
  *   the committed frame's request, so it stays stable mid-frame), and
- *   colon sub-parameter forms of 2026 are not frame markers.
+ *   colon sub-parameter forms of 2026 are not frame markers. Facts published
+ *   alongside a frame come from `publishedInputModes()`, which pairs the last
+ *   complete committed frame with its own modes instead of exporting that
+ *   temporary withholding; `redrawState()` plus `onRedrawSettled()` let an owner
+ *   hold input until a redraw ends, including one that changes nothing visible.
+ *   A pipeline that failed a parse reports `"unavailable"`, which is not
+ *   `"clear"`: work waiting on it is cancelled, never written.
+ *   A pipeline that failed a parse reports `redrawState() === "unavailable"`,
+ *   which is not `"clear"`: work waiting on it is cancelled, never written.
  * - xterm's logger diagnostics never reach the host console (#428). Each
  *   surface hands xterm a private `ILogger` (see terminal-diagnostics.ts)
  *   instead of the default `console`, so a malformed child sequence such as
@@ -205,6 +213,12 @@ export interface TerminalMouseReportingRequest {
 	readonly mouseTracking: TerminalInputModes["mouseTracking"];
 	readonly mouseEncoding: TerminalInputModes["mouseEncoding"];
 }
+
+/**
+ * What {@linkcode TerminalSurface.redrawState} reports about a synchronized
+ * redraw: see that method.
+ */
+export type TerminalRedrawState = "clear" | "held" | "unavailable";
 
 export interface TerminalSurfaceOptions {
 	/** Called with replies this instance generates for its child (owner only). */
@@ -566,6 +580,15 @@ export class TerminalSurface {
 	private parseFailed = false;
 	private lastInvalidateKey = "";
 	private syncFrame?: SyncFrame;
+	/** Observers of the end of a held synchronized frame (#500). */
+	private readonly redrawObservers = new Set<() => void>();
+	/**
+	 * A held frame ended during a parse. The wake-up is latched here and drained
+	 * only from a post-parse, post-observation point, never from inside a parser
+	 * hook, so a mode change, RIS, or reset later in the same chunk is always
+	 * observed before a waiter re-reads the surface.
+	 */
+	private redrawSettledPending = false;
 
 	constructor(cols: number, rows: number, options: TerminalSurfaceOptions = {}) {
 		validateDimension(cols, "cols");
@@ -642,6 +665,13 @@ export class TerminalSurface {
 			this.applyPendingAlternateGraphicsInvalidation();
 			if (!this.processingWrite) {
 				this.invalidate();
+				// Readiness follows the SAME ownership rule as invalidation. While a
+				// batch is in flight this parser callback fires before the awaiting
+				// continuation publishes the observation, and a graphics-sensitive chunk
+				// reaches it between its several `writeToTerminal` parts. Delivering from
+				// here would expose a state whose rest of the chunk is unparsed, so the
+				// whole-chunk completion path owns the delivery instead.
+				this.settleRedrawObservation();
 			}
 		}));
 
@@ -869,6 +899,7 @@ export class TerminalSurface {
 		// Resize invalidates geometry deterministically: the underlying resize
 		// is synchronous and buffers are reflowed immediately.
 		this.invalidate();
+		this.settleRedrawObservation();
 	}
 
 	/**
@@ -989,6 +1020,95 @@ export class TerminalSurface {
 	}
 
 	/**
+	 * Input-mode facts that belong with the last COMPLETE committed frame —
+	 * what an observer publishing this surface's content must pair with
+	 * `frame()` (#500). While a synchronized frame is held this is the state
+	 * captured when the hold opened, exactly like `frame()`, so a mid-frame
+	 * mode change is never published beside the frame the viewer is still
+	 * being shown, and the temporary mouse withholding of `inputModes()` is
+	 * never exported as a mode fact. Outside a hold this is the live parsed
+	 * state, which IS the committed frame's state. The returned object is a
+	 * fresh copy the caller may keep.
+	 *
+	 * This is not a per-packet input authorization: local packet routing
+	 * keeps using `inputModes()`, which withholds mouse reporting for the
+	 * whole time a frame is held.
+	 */
+	publishedInputModes(): TerminalInputModes {
+		this.assertNotDisposed();
+		const held = this.syncFrame;
+		if (held !== undefined) {
+			return { ...held.committedModes };
+		}
+		return this.inputModesState();
+	}
+
+	/**
+	 * The surface's synchronized-redraw state for an owner that must not hand
+	 * input to a half-drawn screen ({@linkcode onRedrawSettled}): `"held"` while
+	 * a frame is in flight OR its completion is still owed to an owner (a parsed
+	 * end marker whose chunk has not finished parsing and been observed),
+	 * `"clear"` only when the parsed state IS the committed frame, and
+	 * `"unavailable"` when this pipeline can no longer be trusted about anything
+	 * — a failed parse (sticky here) or disposal. Unavailable is deliberately NOT
+	 * clear: bytes handed to a grounded parser have no defined effect, so an
+	 * owner cancels waiting work and refuses new work instead.
+	 *
+	 * Never a per-packet authorization; readiness only orders a redraw. Unlike
+	 * the other accessors this never throws after disposal, because a waiter has
+	 * to be able to learn that the surface is gone.
+	 */
+	redrawState(): TerminalRedrawState {
+		if (this.disposed || this.parseFailed) {
+			// A grounded pipeline is not a healthy surface with no hold: whatever was
+			// waiting for it must be cancelled, not written.
+			return "unavailable";
+		}
+		// A parsed end marker is not readiness on its own. Until the whole-chunk
+		// completion path has delivered its observation, the rest of the child's chunk
+		// may not have parsed at all — a graphics-split chunk reaches this point between
+		// its separate parser writes — so an owner polling here must still wait.
+		return this.syncFrame === undefined && !this.redrawSettledPending ? "clear" : "held";
+	}
+
+	/**
+	 * Observe the end of every held native synchronized frame. The listener
+	 * fires when a hold ends for ANY reason — a parsed end marker, a bound
+	 * (time/bytes/chunks), DECSTR, a buffer switch or RIS discard, and
+	 * disposal — and it fires even when the completed frame is visually and
+	 * mode-identical to the committed one, which the change notification
+	 * alone would not report. It is a wake-up only: it carries no facts, and
+	 * the listener re-reads `redrawState()` and `publishedInputModes()`.
+	 *
+	 * The returned unsubscribe is idempotent, a retired observer is never
+	 * called again, and one throwing observer never reaches another observer or
+	 * the parser. Disposal wakes every observer once — a waiter must learn that
+	 * no hold can outlive this surface — and releases them, with no invocation
+	 * afterwards.
+	 *
+	 * The wake-up is delivered from the surface's post-parse, post-observation
+	 * path, never from inside a parser hook: a frame that ends and is followed in
+	 * the SAME chunk by a mode change, a reset, or a new frame is reported with
+	 * the state the whole chunk left behind, so a waiter never reads an
+	 * intermediate state the child never displayed.
+	 */
+	onRedrawSettled(listener: () => void): () => void {
+		this.assertNotDisposed();
+		if (typeof listener !== "function") {
+			throw new TypeError("TerminalSurface.onRedrawSettled requires a listener function");
+		}
+		this.redrawObservers.add(listener);
+		let active = true;
+		return () => {
+			if (!active) {
+				return;
+			}
+			active = false;
+			this.redrawObservers.delete(listener);
+		};
+	}
+
+	/**
 	 * Mouse reporting the child requested, for outer-terminal capture only
 	 * (see `TerminalMouseReportingRequest`). Never use this to forward a
 	 * mouse packet: `inputModes()` is the per-packet authorization. While a
@@ -1023,6 +1143,13 @@ export class TerminalSurface {
 		this.diagnostics.dispose();
 		this.activeTerminalWriteResolve?.();
 		this.cancelSyncFrame();
+		// Release redraw observers too: a waiter must learn that no hold can
+		// outlive this surface, whether or not a frame was held at disposal.
+		// Nothing re-subscribes afterwards (the surface is disposed), and no
+		// observer is invoked after this point.
+		this.redrawSettledPending = false;
+		this.notifyRedrawSettled();
+		this.redrawObservers.clear();
 		this.graphicsSplitter.dispose();
 		this.graphicsPreflightState = "ground";
 		this.graphics.dispose();
@@ -1295,6 +1422,7 @@ export class TerminalSurface {
 						this.completePendingWrites([pending]);
 						if (!this.disposed) {
 							this.invalidate();
+							this.settleRedrawObservation();
 						}
 						// Potential graphics chunks are batch boundaries, including
 						// incomplete prefixes and payload continuations. The next chunk
@@ -1328,6 +1456,11 @@ export class TerminalSurface {
 			}
 			this.pendingBytes = 0;
 			this.updateBackpressure();
+			// The surface is grounded (parse failed, hold cancelled, graphics
+			// discarded) before any waiter is woken, so a failed parse releases
+			// waiting input as `redrawState() === "unavailable"` — cancelled, never
+			// written — rather than as a healthy surface with no hold in flight.
+			this.settleRedrawObservation();
 		} finally {
 			this.processingWrite = false;
 			this.drainingWrites = false;
@@ -1356,6 +1489,9 @@ export class TerminalSurface {
 		if (!this.disposed && parts.length > 0) {
 			this.invalidate();
 		}
+		// One batch is one parse: a synchronized frame that ended anywhere in it,
+		// and anything that followed it in the same chunk, is settled here.
+		this.settleRedrawObservation();
 	}
 
 	private afterTerminalWrite(): void {
@@ -1486,6 +1622,44 @@ export class TerminalSurface {
 			this.graphics.validateAlternateScreen(textAt, false);
 		}
 		this.graphics.releasePublished();
+		// A hold ending is a lifecycle fact even when nothing visible changed:
+		// the change notification dedupes on the committed key, so waiters get
+		// their own wake-up (never inferred from a delay or a frame). It is
+		// latched, not delivered: the caller's post-parse path delivers it after
+		// the rest of the chunk has parsed and the committed state is observed.
+		this.redrawSettledPending = true;
+	}
+
+	/**
+	 * Wake every redraw observer. Each is isolated like the other peer
+	 * callbacks: one throw reaches neither the parser nor another observer.
+	 */
+	private notifyRedrawSettled(): void {
+		if (this.redrawObservers.size === 0) {
+			return;
+		}
+		for (const listener of [...this.redrawObservers]) {
+			this.safePeerInvoke(listener);
+		}
+	}
+
+	/**
+	 * Deliver a latched "the held frame ended" wake-up. Call this only after the
+	 * parse of the chunk that ended the frame is finished and the resulting state
+	 * has been observed (`invalidate()`), including a frame that completed with
+	 * nothing visually changed. Never call it from a parser hook: an intermediate
+	 * end marker followed by another mode change in the same chunk would expose a
+	 * state the child never displayed.
+	 */
+	private settleRedrawObservation(): void {
+		if (!this.redrawSettledPending) {
+			return;
+		}
+		this.redrawSettledPending = false;
+		if (this.disposed) {
+			return;
+		}
+		this.notifyRedrawSettled();
 	}
 
 	/** Drop a held frame without anchoring (resize, parse failure, disposal). */
@@ -1504,6 +1678,7 @@ export class TerminalSurface {
 		this.endSyncFrame("abort");
 		if (!this.processingWrite) {
 			this.invalidate();
+			this.settleRedrawObservation();
 		}
 	}
 

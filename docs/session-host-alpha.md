@@ -1896,9 +1896,17 @@ whole-viewport assembly bound is unchanged.
 `submitted` means only that local transport writes returned, never that the owner or
 child executed anything. If a transport write may have been invoked, loss, rejection,
 malformed results, or source changes leave the handoff `unknown`, with no replay, retry,
-or cancellation claim. Refusals, an oversize paste, or a full or
-busy queue use one brief non-modal notice; they never open a dialog, steal focus, or
-truncate input.
+or cancellation claim. Refusals and an oversize paste use one brief non-modal notice;
+they never open a dialog, steal focus, or truncate input. The one quiet refusal is this
+viewer's own pending-operation bound — the viewer's finite queue of outstanding logical
+input operations, a local backpressure limit and not a server limit or a rate limit: an
+over-bound operation stays unsent, is never retried or replayed, claims no success, and
+raises no notice, while an earlier refusal or uncertainty notice stays exactly as drawn.
+Every other `not-sent` reason, an unrecognized reason, and an unknown outcome keep their
+existing notice.
+The same pending-operation bound covers operations waiting for an unfinished owner
+redraw, and a refusal because that bound is full behaves exactly like any other: zero
+bytes written, nothing already waiting is replayed, and no success is claimed.
 
 Close, Disconnect, Remove, Revoke, and stream loss keep their existing boundaries. Close
 is authorized only by the highlighted host/run/row plus its actual written receipt or
@@ -2079,6 +2087,27 @@ authorizing clicks against stale contents. Outer terminal mouse capture follows 
 last committed reporting request during the hold, avoiding off/on churn or stuck
 reporting after a no-change commit. No setting or redraw-rate cap is added.
 These changes preserve row-diff/coalescing; they do not promise a physical frame rate.
+
+The input-mode facts published with a frame are that frame's committed facts, so the
+brief mouse withholding above is never presented as a mode of the frame you are looking
+at. A completed remote input that arrives during an incomplete redraw waits on the owner
+until that redraw settles and is then handed over in arrival order, once, instead of
+being written into a half-drawn screen. A redraw counts as unfinished until the whole
+chunk that ended it has been parsed and observed, so input arriving in the middle of that
+chunk waits with it; waiting work whose scope, modes, geometry, or
+subscription moved meanwhile is discarded rather than retargeted. Every completed
+operation takes its place in line, and its retained bytes, before the owner is consulted
+about it, so input admitted from inside an authorization or a scope read still arrives
+later and crosses later. Ownership is proved again after the owner's readiness answer,
+because that answer is owner code too: a callback that ends the subscription, replaces the
+owner run, or moves the observed facts and puts them back while reporting readiness
+releases nothing. A source with no such redraw observation keeps the previous
+direct handoff. An observation that cannot answer — a retired watch, a surface or a
+pipeline that cannot be looked up or read, a parse pipeline that has failed, a surface
+being disposed — is never
+treated as readiness: waiting input is freed as `input_refused` with zero provider
+invocations, and later input is refused on the same ground instead of written into a
+pipeline that can no longer be trusted.
 
 Source, unit, and controlled-PTY tests establish parsing, placement commands,
 identity fences, and cleanup ordering; they do **not** prove pixels appeared in a

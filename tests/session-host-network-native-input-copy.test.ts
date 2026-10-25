@@ -172,6 +172,8 @@ import {
 const CTRL_X = "\x18";
 /** Legacy F7 as Pi 1.4.0's own key table spells it. */
 const F7 = "\x1b[18~";
+/** Read-only owned shortcut proving Pi's editor is handling input after Ctrl+G. */
+const EDITOR_READY_KEY = "\x1b[19~";
 /** The documented copy command, as one already-normalized keyboard packet. */
 const COPY_COMMAND = "/copy\r";
 /** The public registered command this fixture adds for an independent digest. */
@@ -584,6 +586,50 @@ test("network viewer native input and copy stay bound to the pinned native child
     // never reached a handler at all; with it, the typed refusal asserted below can
     // only be a refusal of a write that was actually issued.
     const shortcutWitness = join(root, "shortcut-witness.json");
+    const editorReadyWitness = join(root, "editor-ready.json");
+    const commandWitness = join(root, "input-command-receipts.jsonl");
+    type CommandReceipt = { pid: number; digest: string; bytes: number };
+    /**
+     * Split the receipt witness into records. An append the parent caught mid-write is
+     * reported as `complete: false` rather than thrown, so a poll can never turn a
+     * torn last line into an unrelated JSON error that masks the real failure.
+     */
+    const parseReceipts = (text: string): { receipts: CommandReceipt[]; complete: boolean } => {
+      const receipts: CommandReceipt[] = [];
+      let complete = true;
+      for (const line of text.split("\n")) {
+        if (line.length === 0) continue;
+        try { receipts.push(JSON.parse(line) as CommandReceipt); }
+        catch { complete = false; }
+      }
+      return { receipts, complete };
+    };
+    /** Polling read: an in-progress append is simply "not yet", never an exception. */
+    const commandReceipts = (): CommandReceipt[] => existsSync(commandWitness)
+      ? parseReceipts(readFileSync(commandWitness, "utf8")).receipts
+      : [];
+    /**
+     * Final audit, taken once the owned child has shut down: every byte the witness
+     * holds must be a complete record. A torn or corrupt record fails here instead of
+     * being silently dropped from the ordered audit.
+     */
+    const commandReceiptAudit = (): CommandReceipt[] => {
+      assert.ok(existsSync(commandWitness), "the command receipt witness exists at all");
+      const { receipts, complete } = parseReceipts(readFileSync(commandWitness, "utf8"));
+      assert.ok(complete, "every command receipt in the witness is a complete record");
+      return receipts;
+    };
+    /**
+     * The editor-readiness receipt, or `undefined` while it is absent or not yet
+     * completely visible. The child publishes it by rename, so a partial record should
+     * never exist; if one somehow persists, the bounded wait expires and says so
+     * instead of an unreadable-file assertion.
+     */
+    const readEditorReady = (): unknown => {
+      if (!existsSync(editorReadyWitness)) return undefined;
+      try { return JSON.parse(readFileSync(editorReadyWitness, "utf8")) as unknown; }
+      catch { return undefined; }
+    };
     const readShortcutWitness = (): ShortcutWitness | null => {
       if (!existsSync(shortcutWitness)) return null;
       try { return JSON.parse(readFileSync(shortcutWitness, "utf8")) as ShortcutWitness; }
@@ -602,6 +648,8 @@ test("network viewer native input and copy stay bound to the pinned native child
     const fixture = join(root, "network-native-proof.cjs");
     writeFileSync(fixture, `const fs=require('node:fs');
 const witness=${JSON.stringify(shortcutWitness)};
+const editorReady=${JSON.stringify(editorReadyWitness)};
+const commandWitness=${JSON.stringify(commandWitness)};
 const backendProof=${JSON.stringify(backendProofStem)};
 const backendModule=${JSON.stringify(nativeTuiUrl)};
 const backendNonce=${JSON.stringify(nonce)};
@@ -629,7 +677,20 @@ let failure;
 try{process.stdout.write('\\x1b]52;c;${decoy}\\x07');}catch(error){failure=String(error&&error.message||error);}
 fs.writeFileSync(witness,JSON.stringify(failure===undefined?{pid:process.pid,stage:'wrote'}:{pid:process.pid,stage:'threw',failure}));
 }});
-pi.registerCommand('input-proof',{description:'Digest the owned input bytes',handler:async(input)=>pi.sendMessage({customType:'input-proof',content:'INPUTNET:'+require('node:crypto').createHash('sha256').update(input,'utf8').digest('hex'),display:true})});
+pi.registerShortcut('f8',{description:'Observe the returned native editor without modifying it',handler:(ctx)=>{
+const draft=ctx.ui.getEditorText();
+const record={pid:process.pid,nonce:backendNonce,digest:require('node:crypto').createHash('sha256').update(draft,'utf8').digest('hex'),bytes:Buffer.byteLength(draft,'utf8')};
+// Published by rename from a unique owned staging sibling: the parent's watcher can see
+// this path the instant it is created, so a half-written receipt must never be visible.
+const staging=editorReady+'.'+process.pid+'.staging';
+fs.writeFileSync(staging,JSON.stringify(record),{mode:0o600});
+fs.renameSync(staging,editorReady);
+}});
+pi.registerCommand('input-proof',{description:'Digest the owned input bytes',handler:async(input)=>{
+const digest=require('node:crypto').createHash('sha256').update(input,'utf8').digest('hex');
+fs.appendFileSync(commandWitness,JSON.stringify({pid:process.pid,digest,bytes:Buffer.byteLength(input,'utf8')})+'\\n',{mode:0o600});
+pi.sendMessage({customType:'input-proof',content:'INPUTNET:'+digest,display:true});
+}});
 pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(_,ctx)=>ctx.shutdown()});
 };`, { mode: 0o600, flag: "wx" });
 
@@ -1358,19 +1419,56 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       assert.equal(editorPaste.status, "submitted");
       await waitForViewerDispatch(externalBody, true, "the editor's unbracketed Unicode paste remains a viewer dispatch");
       await signal.waitFor(() => existsSync(externalReceipt) && text(pane).includes(externalBody)
-        && currentModes().bracketedPaste === true, 20_000,
-      "the configured editor exits and Pi restores the exact returned draft and native input modes");
+        && currentModes().bracketedPaste === true && viewerModesMatchOwner(), 20_000,
+      "the configured editor exits and its restored input modes agree at both endpoints");
       assert.equal(readFileSync(externalReceipt, "utf8"), externalDraft,
         "the non-Node editor received exactly ordinary characters and paste, never input frames");
       assert.equal(text(pane).includes("prg-ni-v2;"), false);
+      // A restored frame is not proof that Pi's input handler has resumed. One
+      // read-only shortcut observes the actual native editor through the public API;
+      // it neither edits the draft nor retries any input whose outcome is unknown.
+      const readySource = gestureSource();
+      const ready = await liveViewer.sendInput({
+        source: readySource.source, inputModes: readySource.modes, kind: "keyboard", text: EDITOR_READY_KEY,
+      });
+      assert.notEqual(ready.status, "not-sent", "the editor-readiness gesture was not locally refused");
+      // The child publishes by rename, so a visible file is a whole file; the wait still
+      // requires a parseable record so a corrupt witness reports itself, and a wait that
+      // never sees one fails with this message rather than a JSON error.
+      let editorProof: unknown;
+      await signal.waitFor(() => {
+        const record = readEditorReady();
+        if (record === undefined) return false;
+        editorProof = record;
+        return true;
+      }, 20_000, "the real native editor handles the read-only post-editor shortcut and publishes a complete receipt");
+      assert.deepEqual(editorProof, {
+        pid: child.item.pid, nonce,
+        digest: createHash("sha256").update(externalDraft, "utf8").digest("hex"),
+        bytes: Buffer.byteLength(externalDraft, "utf8"),
+      }, "the child itself observes the exact returned draft, not a stale viewport");
+      await signal.waitFor(viewerModesMatchOwner, 20_000, "the written viewer modes agree before the one submit");
       const afterExternal = gestureSource();
+      const priorEnters = new Set(viewerDispatchesOf(Buffer.from("\r", "utf8")));
+      const priorCommands = commandReceipts().length;
       const editorSubmit = await liveViewer.sendInput({
         source: afterExternal.source, inputModes: afterExternal.modes, kind: "keyboard", text: "\r",
       });
-      assert.equal(editorSubmit.status, "submitted");
-      const externalMarker = `INPUTNET:${createHash("sha256").update(externalBody, "utf8").digest("hex")}`;
-      await signal.waitFor(() => text(pane).replace(/\s/g, "").includes(externalMarker), 20_000,
-        "normal native command input resumes with the exact editor-returned draft");
+      assert.notEqual(editorSubmit.status, "not-sent", "the one submit was not locally refused");
+      // `unknown` after invocation is not success. Prove both one authenticated
+      // dispatch and the actual child's command digest independently below.
+      const newEnters = (): number[] => viewerDispatchesOf(Buffer.from("\r", "utf8"))
+        .filter((id) => !priorEnters.has(id));
+      await signal.waitFor(() => newEnters().length > 0, 20_000,
+        "the owner writes one new authenticated submit dispatch after the editor return");
+      assert.equal(newEnters().length, 1, "the submit is never retried or replayed");
+      await signal.waitFor(() => commandReceipts().length > priorCommands, 20_000,
+        "the actual native command consumes the editor-returned draft");
+      assert.deepEqual(commandReceipts().slice(priorCommands), [{
+        pid: child.item.pid,
+        digest: createHash("sha256").update(externalBody, "utf8").digest("hex"),
+        bytes: Buffer.byteLength(externalBody, "utf8"),
+      }], "exactly one real command receives the complete returned text, independently of viewport scrolling");
 
       /* ------------------------------------------------------------------ *
        * The F7 raw-output decoy: a synchronous public shortcut write grants nothing.
@@ -1494,6 +1592,13 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       drain();
       assert.equal(child.writes.filter((frame) => !frame.startsWith("prg-ni-v2;")).length, 0,
         "no host byte reached this child unframed at any point in the case");
+      // The child is proven exited here, so this is the strict ordered audit: a torn or
+      // unreadable record fails the case instead of vanishing from the ledger.
+      assert.deepEqual(commandReceiptAudit(), [UNICODE_TEXT, BIG_PAYLOAD, externalBody].map((body) => ({
+        pid: child.item.pid,
+        digest: createHash("sha256").update(body, "utf8").digest("hex"),
+        bytes: Buffer.byteLength(body, "utf8"),
+      })), "the positively settled child handled each exact proof body once, in order, with no late replay");
       // Deliberately no assertion about a physical terminal or OS clipboard.
     } catch (error) {
       failureCaptured = true;
@@ -1515,6 +1620,8 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
               ? JSON.parse(readFileSync(join(attestRoot, `${nonce}.${childPid}.json`), "utf8")) as Attestation
               : null,
             shortcutWitness: readShortcutWitness(),
+            editorReady: readEditorReady(),
+            commandReceipts: commandReceipts(),
             helpers: helperRecords().length,
             copies: copies.map((copy) => ({
               kind: copy.event.kind,

@@ -732,3 +732,176 @@ test("retained snapshot payload stays charged until released, and dispose/failur
 	surface.dispose();
 	assert.equal(counted.active().total, 0);
 });
+
+test("a redraw wake-up reports only the state the whole parsed chunk left behind", async () => {
+	// #500: an owner waiting to forward remote input wakes from `onRedrawSettled` and
+	// re-reads the surface. The wake-up is therefore a post-parse, post-observation
+	// fact. Delivered from inside the parser instead, an end marker followed in the
+	// SAME chunk by a mode change, a reset, or another frame would hand the waiter an
+	// intermediate state the child never displayed — and stale input would cross.
+	const surface = new TerminalSurface(COLS, ROWS);
+	const wakes: Array<{ state: string; mouse: string; cursorKeys: boolean; paste: boolean }> = [];
+	const stop = surface.onRedrawSettled(() => {
+		const modes = surface.publishedInputModes();
+		wakes.push({
+			state: surface.redrawState(),
+			mouse: modes.mouseTracking,
+			cursorKeys: modes.applicationCursorKeys,
+			paste: modes.bracketedPaste,
+		});
+	});
+	try {
+		// End marker, then mouse tracking on: the wake-up must carry the tracking state.
+		surface.write(`${BEGIN}first${END}${ESC}[?1003h${ESC}[?2004h`);
+		await surface.flush();
+		assert.equal(wakes.length, 1, "one completed hold is one wake-up");
+		assert.deepEqual(
+			wakes[0],
+			{ state: "clear", mouse: "any", cursorKeys: false, paste: true },
+			"the wake-up reports the modes parsed AFTER the end marker in the same chunk",
+		);
+
+		// End marker, then a new frame opens: that is not readiness, and a waiter that
+		// wrote here would land its bytes inside the redraw that just started.
+		wakes.length = 0;
+		surface.write(`${BEGIN}second${END}${BEGIN}third`);
+		await surface.flush();
+		assert.equal(wakes.length, 1, "the completed hold still woke the waiter once");
+		assert.equal(wakes[0]?.state, "held", "a frame that ends straight into a new frame is still not ready");
+
+		// End marker, then a reset: the reset is observed before the wake-up too.
+		wakes.length = 0;
+		surface.write(`${END}${ESC}c`);
+		await surface.flush();
+		assert.deepEqual(
+			wakes,
+			[{ state: "clear", mouse: "none", cursorKeys: false, paste: false }],
+			"a reset after the end marker is part of the same observation",
+		);
+
+		// End marker, then a Kitty graphics APC — a splitter barrier that makes this one
+		// child chunk several separate xterm writes with parser callbacks between them —
+		// and only then a mode change. Waking between those writes would report a state
+		// whose rest of the chunk has not parsed yet, which is exactly how held input
+		// gets written against facts the child already replaced.
+		wakes.length = 0;
+		surface.write(`${BEGIN}fourth${END}${ESC}_Ga=d${ST}${ESC}[?1003l${ESC}[?2004l`);
+		await surface.flush();
+		assert.deepEqual(
+			wakes,
+			[{ state: "clear", mouse: "none", cursorKeys: false, paste: false }],
+			"a graphics-splitter barrier in the same chunk cannot deliver a mid-chunk wake-up",
+		);
+
+		// The same chunk read the other way: readiness is also POLLED by whoever asks,
+		// so the interval between the parser parts of one chunk must answer "held" too,
+		// and only become clear once the chunk is over.
+		const polled: Array<{ part: string; before: string; after: string }> = [];
+		const polledSurface = new TerminalSurface(COLS, ROWS);
+		const polledTerminal = (polledSurface as unknown as {
+			terminal: { write: (data: string, cb?: () => void) => void };
+		}).terminal;
+		const realPolledWrite = polledTerminal.write.bind(polledTerminal);
+		polledTerminal.write = (data: string, cb?: () => void): void => {
+			const before = polledSurface.redrawState();
+			realPolledWrite(data, () => {
+				polled.push({ part: data, before, after: polledSurface.redrawState() });
+				cb?.();
+			});
+		};
+		try {
+			polledSurface.write(`${BEGIN}fifth${END}${ESC}_Ga=d${ST}${ESC}[?1003l`);
+			await polledSurface.flush();
+		} finally {
+			polledTerminal.write = realPolledWrite;
+		}
+		const endPart = polled.findIndex((entry) => entry.part.includes(END));
+		const modePart = polled.findIndex((entry) => entry.part.includes("[?1003l"));
+		assert.ok(endPart >= 0 && modePart > endPart, "the chunk really did reach the parser in parts");
+		assert.equal(polled[endPart]?.after, "held", "the part that ended the frame is not readiness");
+		assert.equal(polled[modePart]?.before, "held",
+			"an owner polling between the parser parts still sees the redraw unfinished");
+		assert.equal(polledSurface.redrawState(), "clear", "the finished chunk is what makes it clear");
+		polledSurface.dispose();
+	} finally {
+		stop();
+		surface.dispose();
+	}
+
+	// A failed parse is a grounded pipeline, not a healthy surface with nothing in
+	// flight. The waiter is released once, after the hold is cancelled and the
+	// retained snapshot is gone, and it reads "unavailable" — never a permission to
+	// hand bytes to a parser that can no longer be trusted.
+	const failing = new TerminalSurface(COLS, ROWS);
+	const failureWakes: string[] = [];
+	failing.onRedrawSettled(() => failureWakes.push(failing.redrawState()));
+	try {
+		failing.write(`${BEGIN}partial`);
+		await failing.flush();
+		(failing as unknown as { terminal: { write: () => void } }).terminal.write = () => {
+			throw new Error("synthetic parser failure");
+		};
+		failing.write("more");
+		await assert.rejects(failing.flush(), /parse pipeline failed/);
+		assert.deepEqual(failureWakes, ["unavailable"],
+			"the failed parse wakes the waiter once and reports itself unavailable, not clear");
+		assert.equal(failing.redrawState(), "unavailable", "and it stays unavailable afterwards");
+	} finally {
+		failing.dispose();
+	}
+});
+
+test("published mode facts stay with the committed frame while mouse routing is withheld", async () => {
+	// #500: the temporary mid-frame mouse withholding is routing state, not a mode of
+	// the frame a viewer is looking at. An owner publishing this surface's content
+	// pairs `frame()` with `publishedInputModes()`, so it must never export the
+	// withheld state — or an in-frame request the child has not committed — as fact.
+	const surface = new TerminalSurface(COLS, ROWS);
+	const wakes: string[] = [];
+	const stop = surface.onRedrawSettled(() => {
+		wakes.push(surface.publishedInputModes().mouseTracking);
+	});
+	try {
+		surface.write(`${ESC}[?1003h${ESC}[?2004h`);
+		await surface.flush();
+		assert.equal(surface.redrawState(), "clear", "no frame is in flight yet");
+		assert.deepEqual(surface.publishedInputModes(), surface.inputModes(),
+			"outside a hold the published facts are the live committed facts");
+		const committed = surface.publishedInputModes();
+		assert.equal(committed.mouseTracking, "any");
+		assert.equal(committed.bracketedPaste, true);
+
+		// The child opens a frame and turns reporting and paste off inside it.
+		surface.write(`${BEGIN}redraw in flight${ESC}[?1003l${ESC}[?2004l`);
+		await surface.flush();
+		assert.equal(surface.redrawState(), "held", "the frame is still incomplete");
+		assert.equal(surface.inputModes().mouseTracking, "none",
+			"local packet routing still withholds mouse reporting for the whole hold");
+		assert.deepEqual(surface.publishedInputModes(), committed,
+			"the facts published with the frame the viewer is still shown are unchanged");
+		assert.equal(surface.requestedMouseReporting().mouseTracking, "any",
+			"outer capture follows the committed request, so an in-frame change is not churn");
+		assert.deepEqual(wakes, [], "an incomplete frame never reports a settled redraw");
+
+		const first = surface.publishedInputModes();
+		assert.notEqual(first, surface.publishedInputModes(), "each call returns a fresh copy");
+		assert.deepEqual(first, committed, "and the copy is not a live alias");
+
+		// The frame commits: the new state is both live and publishable.
+		surface.write(END);
+		await surface.flush();
+		assert.equal(surface.redrawState(), "clear", "the hold ended");
+		assert.deepEqual(surface.publishedInputModes(), surface.inputModes(),
+			"after the commit the published facts are the newly committed facts");
+		assert.equal(surface.publishedInputModes().mouseTracking, "none");
+		assert.equal(surface.requestedMouseReporting().mouseTracking, "none",
+			"the in-frame request applies when the frame ends");
+		assert.deepEqual(wakes, ["none"], "the commit is what woke the waiter, once");
+	} finally {
+		// Disposal is reported the same way a failed parse is: a waiter must learn that
+		// nothing can be handed to this surface any more, not that it is ready.
+		stop();
+		surface.dispose();
+	}
+	assert.equal(surface.redrawState(), "unavailable", "a disposed surface is unavailable, never clear");
+});

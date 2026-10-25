@@ -17,10 +17,53 @@ dates.
 
 ## [0.1.0-dev.198]
 
-### Reverted
+### Fixed
 
-- Reverted b197's remote-input queue-capacity and quiet local-queue notice changes
-  (#500), restoring the pre-b197 implementation, tests, and documented feedback.
+- Remote input no longer crosses into an unfinished native redraw on the owner (#500).
+  A completed remote operation now waits before its first owner write while the owner's
+  synchronized redraw is still in flight, then crosses in arrival order — mouse,
+  keyboard, and paste share one queue — exactly once when the redraw settles, including
+  a frame that completes with nothing visually changed. Every original fact is proven
+  again immediately before that single write (scope, conversation tuple, geometry
+  revision, source token, observed input modes, subscription, and authorization) and again
+  after the owner's readiness answer, which is itself owner code, so an answer given while
+  the subscription is being retired or the observed facts are moved and restored releases
+  nothing.
+  Work whose facts moved — including a change that lands back on the original values —
+  is discarded rather than retargeted or replayed, and a refused or uncertain handoff
+  stays terminal. Waiting work is bounded by the existing viewer limits (128 outstanding
+  logical operations, retained payload within the existing content transfer-byte budget)
+  and an over-bound operation is refused with zero bytes written and no replay. Close,
+  retirement, transport loss, protocol failure, and a replaced run release waiting work
+  with no late write. Each completed operation takes its place in that queue, and its
+  retained bytes, before the owner is consulted about it, so input admitted from inside an
+  authorization or a scope read still arrives later and crosses later. The mode facts
+  published with a frame are now that frame's committed facts, so the brief mid-redraw mouse withholding is never presented as a
+  mode of the frame a viewer is looking at. A content source that offers no redraw
+  observation keeps the existing direct handoff unchanged; a source that offers one and
+  cannot answer it fails closed — waiting work is cancelled and new input refused —
+  instead of writing unchecked; a parse pipeline that has failed and a surface being
+  disposed are reported as unavailable rather than as nothing in flight. No setting, wire capability, retry path, or timing guess
+  is added.
+
+## [0.1.0-dev.197]
+
+### Changed
+
+- Increased the session-content viewer's shared finite queue bound to 128 pending
+  logical input operations and queued control writes (#500). This remains an experimental
+  scrolling-capacity change, not a confirmed fix. Existing tests cover 128 admitted
+  operations with the 129th refused, a synchronous 136-report burst admitting 128 and
+  refusing 8, ordered drain, contiguous paste pages, and slot reuse. Input fences,
+  too-large guards, truthful not-sent/unknown outcomes, and no-replay behavior are unchanged.
+- Remote input notices now present only this viewer's own queue-limit refusal quietly
+  (#500). When the viewer's finite pending-operation bound (a local backpressure limit,
+  not a server limit or a rate limit) refuses an operation before any transport write,
+  the input still stays unsent, nothing is retried or replayed, no success is claimed,
+  no new notice appears, and an earlier refusal or uncertainty notice stays visible.
+  Every other refusal reason, an unrecognized reason, an oversize paste, and an unknown
+  or failed handoff keep their existing visible notice, and the 128-operation bound
+  itself is unchanged.
 
 ## [0.1.0-dev.196]
 

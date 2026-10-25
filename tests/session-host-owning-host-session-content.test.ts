@@ -122,10 +122,26 @@ function inputModes(overrides: Partial<TerminalInputModes> = {}): TerminalInputM
 class ContentSurface {
   frameValue: TerminalFrame;
   modes: TerminalInputModes;
+  /**
+   * Set while a native synchronized frame is held. `inputModes()` then withholds
+   * mouse reporting exactly as the real surface does, while `publishedInputModes()`
+   * reports the facts captured with the committed frame (#500).
+   */
+  committed: TerminalInputModes | undefined;
   frameCalls = 0;
   modesCalls = 0;
   frameThrows = false;
   modesThrows = false;
+  /** Model a surface whose redraw observer cannot be installed, and one that cannot answer. */
+  throwOnRedrawObserver = false;
+  throwOnRedrawHeld = false;
+  /**
+   * Models a grounded pipeline (failed parse or disposal): the real surface answers
+   * `"unavailable"`, which an owner must treat as cancel-everything, never as ready.
+   */
+  grounded = false;
+  /** Observers of the end of a held frame, as the real surface keeps them. */
+  readonly redrawObservers = new Set<() => void>();
 
   constructor(frameValue: TerminalFrame, modes: TerminalInputModes = inputModes()) {
     this.frameValue = frameValue;
@@ -143,7 +159,44 @@ class ContentSurface {
   inputModes(): TerminalInputModes {
     this.modesCalls += 1;
     if (this.modesThrows) throw new Error("synthetic input-mode failure");
+    if (this.committed !== undefined) return { ...this.modes, mouseTracking: "none" };
     return this.modes;
+  }
+
+  /** The mode facts that belong with the last complete committed frame. */
+  publishedInputModes(): TerminalInputModes {
+    this.modesCalls += 1;
+    if (this.modesThrows) throw new Error("synthetic input-mode failure");
+    return this.committed !== undefined ? { ...this.committed } : { ...this.modes };
+  }
+
+  redrawState(): "clear" | "held" | "unavailable" {
+    if (this.throwOnRedrawHeld) throw new Error("synthetic redraw-state failure");
+    if (this.grounded) return "unavailable";
+    return this.committed !== undefined ? "held" : "clear";
+  }
+
+  onRedrawSettled(listener: () => void): () => void {
+    if (this.throwOnRedrawObserver) throw new Error("synthetic redraw-observer failure");
+    this.redrawObservers.add(listener);
+    return () => this.redrawObservers.delete(listener);
+  }
+
+  /** Model the child opening a synchronized frame over `committed` frame facts. */
+  beginRedraw(committed: TerminalInputModes): void {
+    this.committed = committed;
+  }
+
+  /**
+   * Model a hold ending for any reason. `settled` is the child's live state after
+   * the frame; omitting it ends the frame with nothing visually or mode-wise
+   * changed, which is the case a change notification alone never reports.
+   */
+  endRedraw(settled?: TerminalInputModes): void {
+    if (this.committed === undefined) return;
+    this.committed = undefined;
+    if (settled !== undefined) this.modes = settled;
+    for (const listener of [...this.redrawObservers]) listener();
   }
 }
 
@@ -835,4 +888,163 @@ test("a non-callable content listener is refused instead of silently watching no
   assert.deepEqual(h.manager.surfaceReads, [], "the refusal captures nothing");
   assert.deepEqual(h.manager.geometryReads, []);
   assert.ok(h.service.watchInventory(() => { /* a real inventory watch still installs */ }));
+});
+
+test("a published snapshot pairs the committed frame's modes, never the mid-frame withholding", () => {
+  const h = harness();
+  const { surface } = seed(h.manager, "row-1", 9, 4, "committed frame");
+  const committed = inputModes({ mouseTracking: "any" });
+  surface.modes = committed;
+  const delivered: OwningHostSessionContentSnapshot[] = [];
+  const watch = h.service.watchSessionContent("row-1", (snapshot) => {
+    if (snapshot !== undefined) delivered.push(snapshot);
+  });
+  assert.ok(watch);
+  assert.deepEqual(watch.snapshot.inputModes, committed, "an idle surface publishes its live modes");
+
+  // The child opens a synchronized redraw. Its live request now differs, and the
+  // surface withholds mouse routing locally, while the screen still shows the
+  // committed frame. What is published beside that frame must be the frame's own
+  // facts, not a mode the viewer was never shown (#500).
+  surface.beginRedraw(committed);
+  surface.modes = inputModes({ mouseTracking: "none", modifyOtherKeys: 0 });
+  assert.equal(surface.inputModes().mouseTracking, "none",
+    "local packet routing still withholds mouse reporting while a frame is incomplete");
+  h.manager.emitChange("row-1");
+  const published = delivered.at(-1);
+  assert.ok(published, "the row change was delivered");
+  assert.deepEqual(published.inputModes, committed,
+    "the mode facts published beside a frame are that frame's committed facts");
+  assert.equal(published.inputModes.mouseTracking, "any",
+    "a temporary mid-frame withholding is never exported as a published mode fact");
+
+  // The published object is a copy: later surface movement cannot rewrite it.
+  surface.modes = inputModes({ mouseTracking: "x10" });
+  assert.deepEqual(published.inputModes, committed, "a published snapshot is never a live alias");
+
+  // Once the frame commits, the new state is what the next snapshot carries.
+  surface.endRedraw(inputModes({ mouseTracking: "any", modifyOtherKeys: 1 }));
+  h.manager.emitChange("row-1");
+  const settled = delivered.at(-1);
+  assert.ok(settled);
+  assert.notEqual(settled, published, "the settled frame is a newer observation");
+  assert.deepEqual(settled.inputModes, inputModes({ mouseTracking: "any", modifyOtherKeys: 1 }),
+    "after the commit the live parsed modes are the committed frame's modes");
+  assert.deepEqual(h.manager.mutatorCalls, [], "observation still never mutates a row");
+});
+
+test("the input-readiness seam reports a held redraw and settles it even when nothing changed", () => {
+  const h = harness();
+  const { surface } = seed(h.manager, "row-1", 9, 4, "unchanged frame");
+  const notifications: boolean[] = [];
+  const seam = h.service.watchInputReadiness?.("row-1", (ready) => {
+    notifications.push(ready);
+  });
+  assert.ok(seam, "a row with a parse pipeline offers an input-readiness observation");
+  assert.equal(seam.isReady(), true, "no redraw is in flight when the watch installs");
+  assert.deepEqual(notifications, [], "installing never fabricates a notification");
+
+  surface.beginRedraw(inputModes());
+  assert.equal(seam.isReady(), false, "a redraw in flight is reported as held, however it is read");
+
+  // The frame completes with nothing visually or mode-wise changed. The ordinary
+  // change notification dedupes that away, so the wake-up has to be its own fact.
+  surface.endRedraw();
+  assert.deepEqual(notifications, [true], "an unchanged frame end still wakes the waiter");
+  assert.equal(seam.isReady(), true, "and the read agrees");
+
+  // A hold ending with real movement wakes it once as well, and never twice.
+  notifications.length = 0;
+  surface.beginRedraw(inputModes());
+  surface.endRedraw(inputModes({ modifyOtherKeys: 1 }));
+  assert.deepEqual(notifications, [true], "one hold end is one wake-up");
+
+  // A retired watch is silent and can never answer for a live subscription.
+  notifications.length = 0;
+  surface.beginRedraw(inputModes());
+  seam.unsubscribe();
+  surface.endRedraw();
+  assert.deepEqual(notifications, [], "a retired watch is never notified again");
+  assert.throws(() => seam.isReady(), /readiness observation is unavailable/,
+    "a retired watch never reports readiness");
+  seam.unsubscribe();
+  assert.equal(surface.redrawObservers.size, 0, "retirement releases the surface observer");
+
+  // A row with no surface has no redraw in flight: that is the seam answering.
+  const other = h.service.watchInputReadiness?.("row-3", () => { /* no fixture row */ });
+  assert.ok(other);
+  assert.equal(other.isReady(), true, "an unobservable row answers honestly instead of blocking forever");
+});
+
+test("a readiness observation that cannot attach or answer fails closed instead of reporting ready", () => {
+  const h = harness();
+  const { surface } = seed(h.manager, "row-1", 9, 4, "held frame");
+  surface.throwOnRedrawObserver = true;
+  const seam = h.service.watchInputReadiness?.("row-1", () => { /* waiter cannot be woken */ });
+  assert.ok(seam);
+  assert.throws(() => seam.isReady(), /readiness observation is unavailable/,
+    "an observation that can never report is never read as ready");
+
+  // A surface that stops answering mid-watch fails the same way, rather than
+  // silently granting permission to write into a state nobody observed.
+  surface.throwOnRedrawObserver = false;
+  surface.throwOnRedrawHeld = true;
+  const live = h.service.watchInputReadiness?.("row-1", () => { /* second watch */ });
+  assert.ok(live);
+  assert.throws(() => live.isReady(), /synthetic redraw-state failure/,
+    "a surface that cannot answer propagates instead of guessing");
+  assert.doesNotThrow(() => h.manager.emitChange("row-1"),
+    "an unanswerable observation is contained for the row and its other watchers");
+
+  // A grounded pipeline (a failed parse, or a surface being disposed) is not a healthy
+  // surface with nothing in flight: work waiting there must be cancelled, never handed
+  // to a parser whose behaviour after failure is undefined.
+  const held = h.service.watchInputReadiness?.("row-1", () => { /* waiter */ });
+  assert.ok(held);
+  surface.throwOnRedrawHeld = false;
+  surface.grounded = true;
+  assert.throws(() => held.isReady(), /readiness observation is unavailable/,
+    "a failed pipeline is reported unavailable, never ready");
+  surface.grounded = false;
+  assert.equal(held.isReady(), true, "the same watch reads a surface that is grounded no more");
+
+  // When the row's pipeline comes back, the same watch reads it again.
+  surface.throwOnRedrawHeld = false;
+  h.manager.surfaces.set("row-1", new ContentSurface(frame(9, 4, "new pipeline")));
+  h.manager.emitChange("row-1");
+  assert.equal(live.isReady(), true, "a re-attached watch reads the current surface");
+});
+
+test("a readiness watch whose surface lookup starts failing stops answering, releases its observer, and never grants a write", () => {
+  const h = harness();
+  const { surface } = seed(h.manager, "row-1", 9, 4, "held frame");
+  const seam = h.service.watchInputReadiness?.("row-1", () => { /* waiter */ });
+  assert.ok(seam);
+  surface.beginRedraw(surface.modes);
+  assert.equal(seam.isReady(), false, "a working watch reports the hold, which is what keeps input waiting");
+  assert.equal(surface.redrawObservers.size, 1, "and it is observing that hold");
+
+  // The manager can no longer say which surface this row has. That is NOT the same fact
+  // as "this row has no pipeline": reporting `undefined` here would be reported as
+  // readiness and the endpoint would write. The watch stops answering, and it lets go of
+  // an observer on an identity it can no longer confirm instead of leaking it.
+  h.manager.surfaceThrows = true;
+  assert.throws(() => seam.isReady(), /readiness observation is unavailable/,
+    "a lookup that cannot be answered is unavailable, never ready");
+  assert.equal(surface.redrawObservers.size, 0, "the failed watch released its observer");
+  assert.doesNotThrow(() => h.manager.emitChange("row-1"),
+    "the failure stays in the watch record instead of leaking out of a registered watch");
+  assert.throws(() => seam.isReady(), /readiness observation is unavailable/,
+    "and it keeps refusing to answer while the lookup is broken");
+
+  // A row whose surface is genuinely absent is a different fact and stays readable,
+  // which is what keeps a display-only or pipeline-less source on the direct handoff.
+  h.manager.surfaceThrows = false;
+  assert.equal(seam.isReady(), false, "the same watch reads the hold again once the lookup answers");
+  surface.endRedraw();
+  assert.equal(seam.isReady(), true, "and it reports the settled frame normally");
+  assert.equal(surface.redrawObservers.size, 1, "the recovered watch observes again");
+  h.manager.surfaces.delete("row-1");
+  assert.equal(seam.isReady(), true,
+    "an absent surface is the seam answering honestly: no pipeline, nothing in flight");
 });

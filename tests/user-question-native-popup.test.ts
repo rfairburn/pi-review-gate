@@ -26,7 +26,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach } from "node:test";
@@ -37,7 +37,17 @@ import { setHostKeybindingLoader } from "../src/host-keybindings";
 import { __resetActiveNativeEditorFieldForTest, setNativeEditorHost } from "../src/native-editor-bridge";
 import { questionShortcutLabel } from "../src/user-question/index";
 import { setUserQuestionTuiHost } from "../src/user-question/pi-tui-host";
-import { createBridgeUi, fakeHost, type FakeBridgeEditor } from "./bridge-fakes";
+import {
+  createBridgeUi,
+  createRealKeybindingsManager,
+  fakeHost,
+  loadRealBridgeHost,
+  realHostAfter,
+  REAL_IDENTITY_THEME,
+  skipOrFail,
+  SHIFT_ENTER,
+  type FakeBridgeEditor,
+} from "./bridge-fakes";
 
 const COLUMNS = 80;
 const ROWS = 24;
@@ -445,6 +455,293 @@ test("native fullscreen: the compact popup keeps its natural size over the live 
     await reopened;
     assert.equal(openCount, 4);
     assert.equal(sent.length, 1, "only the confirmed answer reached the model");
+  } finally {
+    tui.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("native fullscreen: async native image pastes redraw the popup and preserve the native draft", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
+    return;
+  }
+  setNativeEditorHost(loaded.host);
+  realHostAfter(t);
+
+  previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+  previousRuntimeRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
+  delete process.env.PI_REVIEW_GATE_DISABLED;
+  delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
+
+  // Keep every fixture write inside this worker-owned workspace. No system
+  // clipboard or user session is consulted; the clipboard callback below is
+  // an explicitly released async seam carrying synthetic PNG bytes.
+  const dir = await mkdtemp(join(process.cwd(), ".user-question-native-paste-"));
+  const terminal = new VirtualTerminal(COLUMNS, ROWS);
+  const tui = new TuiAltScreen(terminal);
+  const keybindings = createRealKeybindingsManager(loaded.tui);
+  const instances: FakeBridgeEditor[] = [];
+  const hostChanges: Array<{ editor: FakeBridgeEditor; receiver: unknown; text: string; args: unknown[] }> = [];
+  const hostChangeCallbacks: Array<{
+    editor: FakeBridgeEditor;
+    callback: NonNullable<FakeBridgeEditor["onChange"]>;
+  }> = [];
+  const pendingPastes: Array<{ path: string; release(): void }> = [];
+  const pasteErrors: unknown[] = [];
+  const pngBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/aHcAAAAASUVORK5CYII=",
+    "base64",
+  );
+  let requestRenderCount = 0;
+  const nativeRequestRender = tui.requestRender.bind(tui);
+  tui.requestRender = (force?: boolean): void => {
+    requestRenderCount += 1;
+    nativeRequestRender(force);
+  };
+
+  try {
+    assert.equal(tui.mode, "fullscreen", "the regression uses the real pinned pi-tui alternate screen");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      enabled: true,
+      maxCorrectionCycles: 3,
+      implementationGuidanceAfterCorrectionAttempts: 1,
+      maxPatchBytes: 200_000,
+      maxFileBytes: 1_048_576,
+      maxSnapshotBytes: 52_428_800,
+      retainBundles: "never",
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const tools = new Map<string, any>();
+    const shortcuts = new Map<string, { handler: (ctx: unknown) => unknown }>();
+    const sent: string[] = [];
+    await activate({
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      registerCommand() {},
+      registerShortcut(shortcut: string, options: { handler: (ctx: unknown) => unknown }) {
+        shortcuts.set(shortcut, options);
+      },
+      notify() {},
+      sendUserMessage(message: string) { sent.push(message); return Promise.resolve(); },
+      ui: { setStatus() {} },
+    });
+
+    setUserQuestionTuiHost({ matchesKey, visibleWidth, truncateToWidth, wrapTextWithAnsi });
+    const sessionManager = { id: "native-paste-session" };
+    const sessionContext = (identity: object) => ({
+      cwd: dir,
+      ui: { setWidget() {} },
+      sessionManager: identity,
+      mode: "tui",
+    });
+    for (const handler of hooks.get("session_start") ?? []) {
+      await handler({ cwd: dir }, sessionContext(sessionManager));
+    }
+
+    tui.addChild(new Text("Native paste regression transcript", 0, 0));
+    tui.start();
+    const screen = (): string[] => tui.getScreenLines().map(stripAnsi);
+    const waitForScreen = async (needle: string): Promise<void> => {
+      await until(() => screen().some((line) => line.includes(needle)), 3000);
+    };
+    await waitForScreen("Native paste regression transcript");
+
+    const theme = {
+      fg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+      bg: (_color: string, text: string) => `${SURFACE_BG}${text}\x1b[49m`,
+    };
+    const overlays: OverlayHandle[] = [];
+    const open = async (identity: object): Promise<{ closed: Promise<unknown> }> => {
+      const bridge = createBridgeUi({
+        keybindings,
+        theme: REAL_IDENTITY_THEME,
+        draft: "independent chat draft",
+        customTheme: theme,
+        onChange: (editor) => {
+          if (!instances.includes(editor)) instances.push(editor);
+          const callback = function (this: unknown, ...args: [string]): void {
+            hostChanges.push({ editor, receiver: this, text: args[0]!, args: [...args] });
+          };
+          hostChangeCallbacks.push({ editor, callback });
+          return callback;
+        },
+        onPasteImage: (editor) => () => {
+          const number = pendingPastes.length + 1;
+          const path = join(dir, `pi-clipboard-488-${number}.png`);
+          let resolveClipboard!: (value: { path: string; bytes: Buffer }) => void;
+          const clipboardRead = new Promise<{ path: string; bytes: Buffer }>((resolve) => {
+            resolveClipboard = resolve;
+          });
+          pendingPastes.push({
+            path,
+            release: () => resolveClipboard({ path, bytes: pngBytes }),
+          });
+          void clipboardRead.then(async (image) => {
+            await writeFile(image.path, image.bytes);
+            editor.insertTextAtCursor(image.path);
+            // Pi 1.4's native async paste path requests its ordinary coalesced
+            // render immediately after inserting the selected path.
+            tui.requestRender();
+          }).catch((error: unknown) => pasteErrors.push(error));
+        },
+        drivers: [],
+      });
+      const before = overlays.length;
+      const custom = (factory: (...args: unknown[]) => unknown, options?: {
+        overlay?: boolean;
+        overlayOptions?: OverlayOptions;
+        onHandle?: (handle: OverlayHandle) => void;
+      }) => new Promise((resolve) => {
+        let handle: OverlayHandle | undefined;
+        let closed = false;
+        const done = (result: unknown) => {
+          if (closed) return;
+          closed = true;
+          handle?.hide();
+          resolve(result);
+        };
+        Promise.resolve(factory(tui, theme, keybindings, done)).then((component) => {
+          if (closed) return;
+          assert.equal(options?.overlay, true);
+          handle = tui.showOverlay(component as never, options?.overlayOptions);
+          overlays.push(handle);
+          options?.onHandle?.(handle);
+        });
+      });
+      const opening = shortcuts.get("ctrl+alt+up")!.handler({
+        ui: { ...bridge.ui, custom },
+        sessionManager: identity,
+        isIdle: () => true,
+      }) as Promise<unknown>;
+      await until(() => overlays.length > before);
+      return { closed: opening };
+    };
+    const ask = async (id: string, identity: object): Promise<void> => {
+      await tools.get("AskUserQuestion")!.execute(
+        id,
+        { question: `Paste answer ${id}?`, choices: ["Use the text"] },
+        undefined,
+        undefined,
+        { sessionManager: identity },
+      );
+    };
+
+    await ask("q1", sessionManager);
+    const firstPopup = await open(sessionManager);
+    await waitForScreen("q1: Paste answer q1?");
+    terminal.send(ENTER);
+    await waitForScreen("Type something…");
+    terminal.send(DOWN);
+    terminal.send(ENTER);
+    await waitForScreen(EDITING_HINT);
+
+    const field = instances.at(-1)! as FakeBridgeEditor & {
+      getCursor?(): { line: number; col: number };
+    };
+    assert.equal(field.getText(), "", "the native answer field starts empty");
+    const paste = async (index: number): Promise<string> => {
+      terminal.send("\x16"); // Ctrl+V through the actual installed CustomEditor.
+      await until(() => pendingPastes.length === index, 2000);
+      // Let the paste key's first native render settle before releasing the
+      // clipboard promise. This wait does not render or invalidate the popup.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const pending = pendingPastes[index - 1]!;
+      const name = pending.path.slice(pending.path.lastIndexOf("/") + 1);
+      assert.ok(!screen().some((line) => line.includes(name)), "the async path is not inserted before clipboard completion");
+      const requestsBeforeCompletion = requestRenderCount;
+      pending.release();
+      await waitForScreen(name);
+      assert.ok(requestRenderCount > requestsBeforeCompletion, "the rendered path arrived through ordinary coalesced render requests");
+      assert.deepEqual(await readFile(pending.path), pngBytes, "only the synthetic PNG fixture was supplied");
+      assert.deepEqual(pasteErrors, []);
+      return pending.path;
+    };
+
+    const firstPath = await paste(1);
+    assert.equal(field.getText(), firstPath, "the first paste remains the native field's only draft");
+    const firstCursor = field.getCursor?.();
+    assert.ok(firstCursor);
+    assert.deepEqual(firstCursor, { line: 0, col: firstPath.length });
+    assert.deepEqual(field.getCursor?.(), firstCursor, "the normal popup redraw preserves the native cursor");
+    const firstHostChange = hostChanges.filter((change) => change.text === firstPath);
+    assert.equal(firstHostChange.length, 1, "the host onChange callback is chained once for the native insertion");
+    assert.equal(firstHostChange[0]!.editor, field);
+    assert.equal(firstHostChange[0]!.receiver, field, "the host callback receiver is preserved");
+    assert.deepEqual(firstHostChange[0]!.args, [firstPath], "the host callback arguments are preserved");
+
+    // Keep existing text and a multiline draft, then perform independent
+    // native pastes at the current cursor. No paste is replayed or duplicated.
+    terminal.send(SHIFT_ENTER);
+    for (const character of "retained text") terminal.send(character);
+    await waitForScreen("retained text");
+    const secondPath = await paste(2);
+    terminal.send(SHIFT_ENTER);
+    const thirdPath = await paste(3);
+    const expectedAnswer = `${firstPath}\nretained text${secondPath}\n${thirdPath}`;
+    assert.equal(field.getText(), expectedAnswer, "multiline content and repeated native paths stay exact");
+    const finalCursor = field.getCursor?.();
+    assert.ok(finalCursor);
+    assert.deepEqual(finalCursor, { line: 2, col: thirdPath.length });
+    assert.deepEqual(field.getCursor?.(), finalCursor, "rendering does not replace or move the native cursor");
+    assert.equal(hostChanges.filter((change) => change.text === expectedAnswer).length, 1);
+
+    terminal.send(ENTER);
+    await until(() => sent.length === 1);
+    assert.deepEqual(sent, [`Answer to pending question \"Paste answer q1?\": ${expectedAnswer}`],
+      "submission contains each native path and typed line exactly once, with the existing question context");
+    assert.deepEqual((await readFile(firstPath)), pngBytes);
+    assert.deepEqual((await readFile(secondPath)), pngBytes);
+    assert.deepEqual((await readFile(thirdPath)), pngBytes);
+
+    const ownedObserver = field.onChange!;
+    const originalHostCallback = hostChangeCallbacks.find((entry) => entry.editor === field)!.callback;
+    terminal.send(CTRL_ALT_UP);
+    await firstPopup.closed;
+    assert.equal(field.onChange, originalHostCallback, "closing restores only the callback this popup owned");
+    assert.equal(instances.at(-1)!.getText(), "independent chat draft", "the separate chat draft is restored unchanged");
+    const afterCloseRequests = requestRenderCount;
+    (ownedObserver as unknown as (this: FakeBridgeEditor, ...args: unknown[]) => void).call(
+      field,
+      "late notification after close",
+      { source: "synthetic-late-callback" },
+    );
+    assert.equal(requestRenderCount, afterCloseRequests, "a retained callback cannot request a render after close");
+    assert.deepEqual(hostChanges.at(-1)?.args, ["late notification after close", { source: "synthetic-late-callback" }],
+      "the original host callback receives every argument after close too");
+
+    // A session replacement makes an open popup stale before a former field
+    // can notify it. The callback still reaches the host handler, but cannot
+    // invalidate or resurrect the old popup.
+    await ask("q2", sessionManager);
+    const stalePopup = await open(sessionManager);
+    await waitForScreen("q2: Paste answer q2?");
+    const staleField = instances.at(-1)!;
+    const staleObserver = staleField.onChange!;
+    const staleHostCallback = hostChangeCallbacks.find((entry) => entry.editor === staleField)!.callback;
+    const replacedSession = { id: "replaced-again" };
+    for (const handler of hooks.get("session_start") ?? []) {
+      await handler({ cwd: dir }, sessionContext(replacedSession));
+    }
+    const afterReplacementRequests = requestRenderCount;
+    staleObserver.call(staleField, "late notification after replacement");
+    assert.equal(requestRenderCount, afterReplacementRequests, "a stale field notification is inert for the popup");
+    assert.equal(hostChanges.at(-1)?.editor, staleField);
+    assert.equal(hostChanges.at(-1)?.receiver, staleField);
+    assert.equal(hostChanges.at(-1)?.text, "late notification after replacement");
+    if (tui.hasOverlay()) terminal.send(ESCAPE);
+    await stalePopup.closed;
+    assert.equal(staleField.onChange, staleHostCallback);
+    assert.equal(tui.hasOverlay(), false, "the replaced session's popup is closed");
   } finally {
     tui.stop();
     await rm(dir, { recursive: true, force: true });

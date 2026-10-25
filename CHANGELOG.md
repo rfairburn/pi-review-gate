@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.198]
+## [0.1.0-dev.199]
 
 ### Fixed
 
@@ -45,6 +45,16 @@ dates.
   instead of writing unchecked; a parse pipeline that has failed and a surface being
   disposed are reported as unavailable rather than as nothing in flight. No setting, wire capability, retry path, or timing guess
   is added.
+
+## [0.1.0-dev.198]
+
+### Fixed
+
+- AskUserQuestion now refreshes its cached popup rows when Pi's native editor
+  reports an asynchronous change, so an image-paste path appears on the next
+  ordinary coalesced render without another input. The host callback and the
+  single native draft/cursor remain authoritative; clipboard routing and answer
+  behavior are unchanged (#488).
 
 ## [0.1.0-dev.197]
 

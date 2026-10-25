@@ -332,6 +332,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   let lastRenderedWidth: number | undefined;
   let lastMaxScrollOffset: number | undefined;
   let editing = false;
+  let handlingNativeFieldInput = false;
   let closed = false;
   let cachedContent: { width: number; content: PopupContent } | undefined;
   // Item ranges recorded by the active list/answer/notice renderer, in its
@@ -370,6 +371,36 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     options.requestRender?.();
   };
 
+  // The native field remains the sole draft/cursor owner. Pi can change it
+  // asynchronously (notably after an image paste), outside handleEditingInput;
+  // observe that public boundary so the popup's width-cached rows are rebuilt.
+  const nativeField = options.nativeField;
+  const previousFieldOnChange = nativeField?.onChange;
+  let observedFieldOnChange: FieldEditorInstance["onChange"];
+  if (nativeField) {
+    observedFieldOnChange = function (this: FieldEditorInstance, ...args: [string]): void {
+      try {
+        if (previousFieldOnChange) Reflect.apply(previousFieldOnChange, this, args);
+      } finally {
+        // A closed or rebound popup owns no render notifications. Only refresh
+        // while the native field is actually visible in the answer view.
+        if (!closed && !isStale() && mode === "answer" && editing && !handlingNativeFieldInput) {
+          focusPending = true;
+          invalidateContent();
+          options.requestRender?.();
+        }
+      }
+    };
+    nativeField.onChange = observedFieldOnChange;
+  }
+  const restoreFieldOnChange = (): void => {
+    // The host or another owner may have replaced this callback while the
+    // popup was open; restore only while this observer still owns the slot.
+    if (nativeField && observedFieldOnChange && nativeField.onChange === observedFieldOnChange) {
+      nativeField.onChange = previousFieldOnChange;
+    }
+  };
+
   // Live questions (registered while the list is open) must refresh the view;
   // the list keeps its live selection visible as entries come and go.
   const unsubscribeState = controller.addStateListener(() => {
@@ -380,6 +411,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   const close = (result?: SubmitResult | { kind: "notice-details"; noticeId: string; expectedNotice: PendingNotice }) => {
     if (closed) return;
     closed = true;
+    restoreFieldOnChange();
     // A closed popup owns no pointer gesture or item geometry.
     clearMouseGesture();
     lastFrame = undefined;
@@ -698,7 +730,12 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     // undo, newlines, paste, Ctrl+C clear, Ctrl+G external editing — all
     // through the live KeybindingsManager, exactly as in the main chat.
     field.focused = true;
-    field.handleInput(data);
+    handlingNativeFieldInput = true;
+    try {
+      field.handleInput(data);
+    } finally {
+      handlingNativeFieldInput = false;
+    }
     // Editing input keeps the native cursor row in view.
     if (editing && mode === "answer") focusPending = true;
     invalidate();

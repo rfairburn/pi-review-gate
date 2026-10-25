@@ -15,6 +15,37 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.199]
+
+### Fixed
+
+- Remote input no longer crosses into an unfinished native redraw on the owner (#500).
+  A completed remote operation now waits before its first owner write while the owner's
+  synchronized redraw is still in flight, then crosses in arrival order — mouse,
+  keyboard, and paste share one queue — exactly once when the redraw settles, including
+  a frame that completes with nothing visually changed. Every original fact is proven
+  again immediately before that single write (scope, conversation tuple, geometry
+  revision, source token, observed input modes, subscription, and authorization) and again
+  after the owner's readiness answer, which is itself owner code, so an answer given while
+  the subscription is being retired or the observed facts are moved and restored releases
+  nothing.
+  Work whose facts moved — including a change that lands back on the original values —
+  is discarded rather than retargeted or replayed, and a refused or uncertain handoff
+  stays terminal. Waiting work is bounded by the existing viewer limits (128 outstanding
+  logical operations, retained payload within the existing content transfer-byte budget)
+  and an over-bound operation is refused with zero bytes written and no replay. Close,
+  retirement, transport loss, protocol failure, and a replaced run release waiting work
+  with no late write. Each completed operation takes its place in that queue, and its
+  retained bytes, before the owner is consulted about it, so input admitted from inside an
+  authorization or a scope read still arrives later and crosses later. The mode facts
+  published with a frame are now that frame's committed facts, so the brief mid-redraw mouse withholding is never presented as a
+  mode of the frame a viewer is looking at. A content source that offers no redraw
+  observation keeps the existing direct handoff unchanged; a source that offers one and
+  cannot answer it fails closed — waiting work is cancelled and new input refused —
+  instead of writing unchecked; a parse pipeline that has failed and a surface being
+  disposed are reported as unavailable rather than as nothing in flight. No setting, wire capability, retry path, or timing guess
+  is added.
+
 ## [0.1.0-dev.198]
 
 ### Fixed

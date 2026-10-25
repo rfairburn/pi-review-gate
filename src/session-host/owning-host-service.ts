@@ -400,10 +400,69 @@ interface SessionContentWatchRecord {
   active: boolean;
 }
 
+/**
+ * Notification from one input-readiness watch (#500). `ready` is false only
+ * while this row's surface holds a native synchronized redraw: the child has
+ * begun a frame the viewer has not been shown yet. It is a wake-up carrying no
+ * facts — the observer re-reads {@linkcode OwningHostInputReadinessWatch.isReady}
+ * and its own fences. Receiving `true` grants no input, write, or session
+ * authority.
+ */
+export type OwningHostInputReadinessListener = (ready: boolean) => void;
+
+/**
+ * One live input-readiness observation of one row's native redraw state.
+ * Owner-local only: it never crosses a wire, grants nothing, and mutates
+ * nothing. `isReady()` is a live read of the surface's current hold state, so
+ * an observer never acts on a stale cached fact. A row with no surface answers
+ * honestly — there is no redraw in flight to wait for — but an observation that
+ * CANNOT answer (a retired watch, a surface whose hold state cannot be read, or
+ * one whose wake-up observer could not be attached) THROWS instead of reporting
+ * readiness: an unanswerable observation is never permission to skip the
+ * deferral, and the endpoint fails closed on it. Readiness is never
+ * authorization, and every real write still re-proves its own fences.
+ * `unsubscribe()` is idempotent and a retired watch never notifies again.
+ */
+export interface OwningHostInputReadinessWatch {
+  /**
+   * `false` while a native redraw is held, `true` when the row has no surface to
+   * wait on, and a THROW when this observation cannot answer at all.
+   */
+  isReady(): boolean;
+  unsubscribe(): void;
+}
+
 /** The watches already selected for one affected row in one delivery pass. */
 interface SessionContentDelivery {
   readonly sessionId: string;
   readonly watches: readonly SessionContentWatchRecord[];
+}
+
+/**
+ * One live input-readiness watch record. `release` retires the surface observer
+ * this watch installed for the surface it is currently attached to; a surface
+ * swap (a row that lost its parse pipeline and got a new one) re-attaches.
+ */
+interface InputReadinessWatchRecord {
+  readonly id: number;
+  readonly sessionId: string;
+  readonly listener: OwningHostInputReadinessListener;
+  active: boolean;
+  surface: TerminalSurface | undefined;
+  release: (() => void) | undefined;
+  /**
+   * True while this watch's surface exists but its redraw-settled observer could not
+   * be attached. A watch that can never be woken is an unanswerable observation, not a
+   * ready one: reading it throws so the endpoint fails closed (#500).
+   */
+  observerFailed: boolean;
+  /**
+   * True while the manager cannot say which surface this row has at all (no manager,
+   * teardown started, or a failing lookup). Kept apart from `observerFailed` so a
+   * lookup that answers again clears only its own failure, and never erases a
+   * still-broken observer (#500).
+   */
+  lookupFailed: boolean;
 }
 
 /**
@@ -615,6 +674,28 @@ export interface OwningHostService {
     listener: OwningHostSessionContentListener,
   ): OwningHostSessionContentWatch | undefined;
   /**
+   * Observe one row's native synchronized-redraw state so an owner can hold
+   * completed input before its FIRST write instead of writing into a half-drawn
+   * screen (#500). Optional: an implementation without this seam keeps today's
+   * direct-write behavior.
+   *
+   * The watch carries a live readiness read and one wake-up per hold end,
+   * including a hold that ends without changing anything visible (which a
+   * content watch never reports). It is an owner-local observation only: it
+   * crosses no wire, grants no authority, writes nothing, and never changes a
+   * session, a viewer, or a surface. Returns undefined and installs nothing when
+   * no manager is open or the host is closing; a retired watch never notifies.
+   * An offered watch that cannot answer throws — see
+   * {@linkcode OwningHostInputReadinessWatch.isReady} — and the endpoint treats
+   * that as an unanswerable observation and refuses input.
+   *
+   * Throws only on a non-callable listener, which is a programmer error.
+   */
+  watchInputReadiness?(
+    sessionId: string,
+    listener: OwningHostInputReadinessListener,
+  ): OwningHostInputReadinessWatch | undefined;
+  /**
    * Start one session through the manager and classify the row that actually
    * came up. Never activates, focuses, or notifies anything: presentation reads
    * the outcome.
@@ -760,6 +841,8 @@ class LocalOwningHostService implements OwningHostService {
   #inventoryRevision = 0;
   readonly #inventoryWatches = new Map<number, InventoryWatchRecord>();
   readonly #contentWatches = new Map<number, SessionContentWatchRecord>();
+  /** Live input-readiness watches, keyed by this service's own watch id. */
+  readonly #readinessWatches = new Map<number, InputReadinessWatchRecord>();
   #nextWatchId = 1;
   /** Highest content sequence this run has issued; strictly increasing, never reused. */
   #contentSequence = 0;
@@ -902,6 +985,205 @@ class LocalOwningHostService implements OwningHostService {
         if (this.#contentWatches.get(watch.id) === watch) this.#contentWatches.delete(watch.id);
       },
     });
+  }
+
+  watchInputReadiness(
+    sessionId: string,
+    listener: OwningHostInputReadinessListener,
+  ): OwningHostInputReadinessWatch | undefined {
+    if (typeof listener !== "function") {
+      throw new TypeError("session-host: watchInputReadiness requires a listener function");
+    }
+    if (this.#manager === undefined || this.dependencies.teardownRequested()) return undefined;
+    const record: InputReadinessWatchRecord = {
+      id: this.#nextWatchId++,
+      sessionId,
+      listener,
+      active: true,
+      surface: undefined,
+      release: undefined,
+    observerFailed: false,
+    lookupFailed: false,
+    };
+    this.#readinessWatches.set(record.id, record);
+    // Attach now so a hold that opened before this call is already observed, and
+    // so no hold can end unnoticed between the read and the subscription.
+    this.#attachReadinessSurface(record);
+    return Object.freeze({
+      isReady: (): boolean => {
+        if (!record.active) {
+          // A retired watch cannot answer for a live subscription. Reporting
+          // "ready" here would be a guess, and a guess is not permission to write.
+          throw new Error("session-host: input readiness observation is unavailable");
+        }
+        this.#attachReadinessSurface(record);
+        return this.#readinessIsReady(record);
+      },
+      unsubscribe: (): void => {
+        if (!record.active) return;
+        record.active = false;
+        if (this.#readinessWatches.get(record.id) === record) this.#readinessWatches.delete(record.id);
+        this.#detachReadinessSurface(record);
+      },
+    });
+  }
+
+  /**
+   * The watched row's current surface. `undefined` is the seam ANSWERING "this row has
+   * no parse pipeline". A read that cannot be answered at all — the manager is gone,
+   * teardown has started, or the manager itself refused the lookup — THROWS: "I cannot
+   * tell" is not the same fact as "there is nothing to wait for", and turning one into
+   * the other would make a broken observation into permission to write.
+   */
+  #readinessSurface(record: InputReadinessWatchRecord): TerminalSurface | undefined {
+    const manager = this.#manager;
+    if (manager === undefined || this.dependencies.teardownRequested()) {
+      throw new Error("session-host: input readiness observation is unavailable");
+    }
+    return manager.surface(record.sessionId);
+  }
+
+  /**
+   * Keep one watch attached to the surface its row actually has right now. A row
+   * that lost or replaced its parse pipeline is re-attached (the old observer is
+   * released first). A row with no surface has no redraw in flight to wait for, which
+   * is the seam ANSWERING, not a failure. A surface whose observer cannot be attached
+   * is a failure: the watch stays marked and every read of it throws, because an
+   * observation that can never report is never permission to skip the deferral.
+   */
+  #attachReadinessSurface(record: InputReadinessWatchRecord): void {
+    if (!record.active) return;
+    let surface: TerminalSurface | undefined;
+    try {
+      surface = this.#readinessSurface(record);
+    } catch {
+      // The lookup itself failed. Release whatever observer this watch still holds —
+      // an observer on a surface the service can no longer confirm is worthless — and
+      // mark the watch failed, so every read of it throws until a lookup answers again.
+      // Contained here: a registered watch never leaks its exception to the caller that
+      // is only trying to keep it attached.
+      this.#detachReadinessSurface(record);
+      record.lookupFailed = true;
+      return;
+    }
+    // The lookup answered, so the lookup failure no longer stands. Nothing else is
+    // cleared here: an observer that could not be attached stays a failure until the
+    // watch is re-attached to a surface, which the identity change below performs.
+    record.lookupFailed = false;
+    if (record.surface !== surface) {
+      const release = record.release;
+      record.surface = surface;
+      record.release = undefined;
+      try {
+        release?.();
+      } catch {
+        // Contained: releasing an observation is never load-bearing for a row.
+      }
+      if (surface !== undefined) {
+        try {
+          const attach = surface.onRedrawSettled(() => this.#notifyReadinessWatch(record));
+          record.release = typeof attach === "function" ? attach : undefined;
+          record.observerFailed = typeof attach !== "function";
+        } catch {
+          record.release = undefined;
+          record.observerFailed = true;
+        }
+      } else {
+        // Nothing to observe on a row without a parse pipeline: an honest answer.
+        record.observerFailed = false;
+      }
+    }
+  }
+
+  #detachReadinessSurface(record: InputReadinessWatchRecord): void {
+    const release = record.release;
+    record.surface = undefined;
+    record.release = undefined;
+    if (release === undefined) return;
+    try {
+      release();
+    } catch {
+      // Contained, exactly like a watch unsubscribe failure elsewhere here.
+    }
+  }
+
+  /**
+   * Live readiness of one watch: `false` only while its surface holds a redraw. A row
+   * with no surface answers `true` — there is no redraw in flight to wait for. A
+   * surface that reports `"unavailable"` (a failed parse or a disposed surface) and a
+   * watch that cannot answer at all — a failed observer, or a manager whose surface
+   * lookup cannot be answered — both THROW instead of guessing: an ungrounded pipeline
+   * is never reported as a healthy surface with nothing in flight, so the endpoint
+   * cancels what waits there rather than writing it.
+   */
+  #readinessIsReady(record: InputReadinessWatchRecord): boolean {
+    if (record.observerFailed || record.lookupFailed) {
+      throw new Error("session-host: input readiness observation is unavailable");
+    }
+    const surface = record.surface ?? this.#readinessSurface(record);
+    if (surface === undefined) return true;
+    // A failed or disposed pipeline and a surface that cannot answer both
+    // propagate: ungroundable is never "ready".
+    const state = surface.redrawState();
+    if (state === "unavailable") {
+      throw new Error("session-host: input readiness observation is unavailable");
+    }
+    return state === "clear";
+  }
+
+  /**
+   * Whether one watch's hold is unchanged for the purpose of skipping a duplicate
+   * notification. An unanswerable observation is NOT treated as "still held": the
+   * caller notifies instead, and the endpoint fails closed on its own re-read.
+   */
+  #readinessStillHeld(record: InputReadinessWatchRecord): boolean {
+    try {
+      return this.#readinessIsReady(record) === false;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Deliver one readiness change to one live watch; listener failures stay contained. */
+  #notifyReadinessWatch(record: InputReadinessWatchRecord): void {
+    if (!record.active) return;
+    let ready: boolean;
+    try {
+      ready = this.#readinessIsReady(record);
+    } catch {
+      // Wake anyway: the listener re-reads the seam itself and fails closed there,
+      // so an unanswerable observation strands nothing.
+      ready = false;
+    }
+    try {
+      record.listener(ready);
+    } catch {
+      // Contained: readiness observation is never load-bearing for a row, a
+      // session, or another watcher.
+    }
+  }
+
+  /**
+   * Re-attach and notify the readiness watches of changed rows. A manager change
+   * is where a row's surface can appear, disappear, or change identity, and it is
+   * also a fresh moment whose readiness must be reported even when the surface's
+   * own hold-end observer cannot fire (for example a row that lost its pipeline
+   * mid-hold). A watch whose surface is unchanged and still holding stays quiet:
+   * the hold itself has not ended.
+   */
+  #notifyReadinessWatches(changedIds: readonly string[]): void {
+    if (this.#readinessWatches.size === 0) return;
+    for (const sessionId of changedIds) {
+      for (const record of [...this.#readinessWatches.values()]) {
+        if (!record.active || record.sessionId !== sessionId) continue;
+        const previous = record.surface;
+        this.#attachReadinessSurface(record);
+        if (record.surface !== undefined && record.surface === previous && this.#readinessStillHeld(record)) {
+          continue;
+        }
+        this.#notifyReadinessWatch(record);
+      }
+    }
   }
 
   async startSession(createOptions: CreateInstanceOptions): Promise<StartedSessionOutcome> {
@@ -1233,7 +1515,12 @@ class LocalOwningHostService implements OwningHostService {
 
       let observed: { readonly frame: TerminalFrame; readonly inputModes: TerminalInputModes } | undefined;
       try {
-        observed = { frame: surface.frame(), inputModes: surface.inputModes() };
+        // Mode facts are read from the same committed frame as `frame()`. Reading
+        // `inputModes()` here would publish this surface's temporary mid-frame
+        // mouse withholding as a mode fact of a frame that still shows mouse
+        // reporting, which is exactly what made a live viewer refuse input it
+        // should have been allowed to send (#500).
+        observed = { frame: surface.frame(), inputModes: surface.publishedInputModes() };
       } catch {
         return { status: "unavailable" };
       }
@@ -1333,9 +1620,13 @@ class LocalOwningHostService implements OwningHostService {
   #deliverChangedRows(changedIds: readonly string[]): void {
     const inventoryWatched = this.#inventoryWatches.size > 0;
     const planned = this.#planContentDeliveries(changedIds);
-    if (!inventoryWatched && planned.length === 0) return;
+    const readinessWatched = this.#readinessWatches.size > 0;
+    if (!inventoryWatched && planned.length === 0 && !readinessWatched) return;
     if (inventoryWatched) this.#notifyInventory(this.#captureInventory());
     this.#deliverSessionContent(planned);
+    // Last, so a woken observer re-reads the newest observation rather than a
+    // fact the same change is about to replace.
+    if (readinessWatched) this.#notifyReadinessWatches(changedIds);
   }
 
   /**

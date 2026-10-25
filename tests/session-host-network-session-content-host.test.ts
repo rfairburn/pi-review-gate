@@ -50,6 +50,7 @@ import type {
 	NativeViewerInputResult,
 	NativeViewerInputSource,
 	OwningHostInventorySnapshot,
+	OwningHostInputReadinessWatch,
 	OwningHostSessionContentListener,
 	OwningHostSessionContentSnapshot,
 	OwningHostSessionContentWatch,
@@ -465,7 +466,43 @@ class FakeContentSource implements SessionContentSource {
 	inputUnavailable = false;
 	/** Force every handoff outcome, as a manager that refuses or loses track would. */
 	inputWriteOutcome: NativeViewerInputResult | undefined;
+	/** Runs after a handoff was recorded, as a peer frame arriving mid-write would. */
+	inputWriteHook: (() => void) | undefined;
+	/**
+	 * Runs ONCE at the next owner source read, as owner code that admits other input
+	 * while the endpoint is reading this surface's scope really can.
+	 */
+	inputReadHook: (() => void) | undefined;
+	/** Throws at the owner boundary, as an owner that cannot answer at all does. */
+	throwOnWrite = false;
 	inputReads = 0;
+	/**
+	 * The optional owner-local redraw-readiness seam (#500), held as an OWN property
+	 * so a source that offers no seam is modeled the only way the interface allows:
+	 * the method is absent (`source.watchInputReadiness = undefined`). Rows in
+	 * `redrawHeldRows` have an unfinished native synchronized frame.
+	 *
+	 * A seam that IS offered and cannot answer is a different case, modeled by the
+	 * flags below: it must fail closed, never fall back to a direct write.
+	 */
+	readonly readinessWatches: Array<{
+		readonly rowId: string;
+		readonly listener: (ready: boolean) => void;
+		unsubscribed: boolean;
+	}> = [];
+	readonly redrawHeldRows = new Set<string>();
+	/** The seam was offered and its watch cannot be installed. */
+	readinessInstallFails = false;
+	/** The seam was offered and installed, but reading it throws. */
+	readinessThrowsOnRead = false;
+	/**
+	 * Runs ONCE at the next readiness read, before the seam answers. `isReady()` is
+	 * synchronous OWNER code: this is how a test makes it retire the binding, publish an
+	 * observation, or replace the run on its way past a pre-write check.
+	 */
+	readinessReadHook: (() => void) | undefined;
+	readinessReads = 0;
+	readinessUnsubscribes = 0;
 	#nextViewerId = 1;
 	#sequence = 0;
 	#inventoryRevision = 0;
@@ -636,6 +673,11 @@ class FakeContentSource implements SessionContentSource {
 	/** The CURRENT owner-private input scope of one surface, or undefined. */
 	readViewerInputSource(viewerId: string): NativeViewerInputSource | undefined {
 		this.inputReads += 1;
+		const readHook = this.inputReadHook;
+		if (readHook !== undefined) {
+			this.inputReadHook = undefined;
+			readHook();
+		}
 		if (this.inputUnavailable) return undefined;
 		const viewer = this.viewers.get(viewerId);
 		if (viewer === undefined || viewer.sessionId === undefined) return undefined;
@@ -659,6 +701,14 @@ class FakeContentSource implements SessionContentSource {
 	/** The one handoff: every current fact is re-checked before it is "submitted". */
 	writeViewerInput(viewerId: string, request: NativeViewerInputRequest): NativeViewerInputResult {
 		this.inputWrites.push({ viewerId, data: request.data });
+		const hook = this.inputWriteHook;
+		if (hook !== undefined) {
+			// One-shot: an endpoint that re-invoked a settled handoff would run this
+			// twice, and the tests below read that as a replay.
+			this.inputWriteHook = undefined;
+			hook();
+		}
+		if (this.throwOnWrite) throw new Error("synthetic owner-boundary failure");
 		if (this.inputWriteOutcome !== undefined) return this.inputWriteOutcome;
 		const current = this.readViewerInputSource(viewerId);
 		if (current === undefined) return { status: "refused", reason: "no-input-source" };
@@ -671,6 +721,68 @@ class FakeContentSource implements SessionContentSource {
 		}
 		if (request.data.length === 0) return { status: "refused", reason: "invalid-input" };
 		return { status: "submitted" };
+	}
+
+	/* --------------------------------------------------------------------- *
+	 * Owner-local redraw readiness seam (#500), modeled the way the service exposes it
+	 * --------------------------------------------------------------------- */
+
+	/** Install one readiness watch; absent entirely on a source with no seam. */
+	watchInputReadiness: SessionContentSource["watchInputReadiness"] = (rowId, listener) => {
+		if (this.readinessInstallFails) throw new Error("synthetic readiness-seam install failure");
+		const record = { rowId, listener, unsubscribed: false };
+		this.readinessWatches.push(record);
+		return Object.freeze({
+			isReady: (): boolean => {
+				this.readinessReads += 1;
+			const hook = this.readinessReadHook;
+			if (hook !== undefined) {
+				this.readinessReadHook = undefined;
+				hook();
+			}
+				if (this.readinessThrowsOnRead) throw new Error("synthetic readiness-read failure");
+				return record.unsubscribed ? true : !this.redrawHeldRows.has(rowId);
+			},
+			unsubscribe: (): void => {
+				if (record.unsubscribed) return;
+				record.unsubscribed = true;
+				this.readinessUnsubscribes += 1;
+			},
+		});
+	};
+
+	/** The child opened a synchronized redraw: input must now be held. */
+	beginRedraw(rowId: string): void {
+		this.redrawHeldRows.add(rowId);
+	}
+
+	/**
+	 * The redraw ended with nothing else published — the visually unchanged case a
+	 * content watch never reports. Only live watches are notified, as the service does.
+	 */
+	settleRedraw(rowId: string): void {
+		if (!this.redrawHeldRows.delete(rowId)) return;
+		for (const watch of this.readinessWatches) {
+			if (watch.rowId !== rowId || watch.unsubscribed) continue;
+			watch.listener(true);
+		}
+	}
+
+	/**
+	 * One parsed chunk that ends the frame AND moves the child's input modes. The real
+	 * surface delivers this order and no other: the whole chunk parses, the resulting
+	 * state is observed and published with the committed frame, and only then is a
+	 * redraw waiter woken. A wake-up sent before the observation is exactly the
+	 * premature-parser-hook behavior #500 removed.
+	 */
+	settleRedrawWithModes(rowId: string, modes: TerminalInputModes): void {
+		const wasHeld = this.redrawHeldRows.delete(rowId);
+		this.inputModes = modes;
+		if (wasHeld) this.emit(rowId);
+		for (const watch of [...this.readinessWatches]) {
+			if (watch.rowId !== rowId || watch.unsubscribed) continue;
+			watch.listener(true);
+		}
 	}
 
 	/** Deliver a native copy on one surface's own bound sink, as the manager would. */
@@ -3345,6 +3457,418 @@ test("an explicit opt-in acknowledges only an offering peer, on one viewer with 
 	}
 });
 
+test("a refused, uncertain, or thrown handoff of held input is one invocation and is never replayed", async () => {
+	const outcomes: Array<{
+		readonly name: string;
+		readonly diagnostic: SessionContentHostDiagnosticCode;
+		readonly outcome?: NativeViewerInputResult;
+		readonly throws?: boolean;
+	}> = [
+		{ name: "refused", diagnostic: "input_refused", outcome: { status: "refused", reason: "input-unready" } },
+		{ name: "uncertain", diagnostic: "input_uncertain", outcome: { status: "unknown" } },
+		{ name: "thrown", diagnostic: "input_uncertain", throws: true },
+	];
+	for (const entry of outcomes) {
+		const { source, harness, published } = await openRedrawCase();
+		try {
+			source.beginRedraw("row-a");
+			sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "held", ordinal: 1 });
+			await settle();
+			// The result is armed only after admission: a held packet is never handed
+			// to the owner at all, so this cannot be the ordinary direct-write case.
+			if (entry.throws === true) source.throwOnWrite = true;
+			else source.inputWriteOutcome = entry.outcome;
+			source.settleRedraw("row-a");
+			await settle();
+			assert.equal(source.inputWrites.length, 1, `${entry.name}: the held operation was invoked exactly once`);
+			assert.ok(harness.diagnostics.includes(entry.diagnostic), `${entry.name}: ${entry.diagnostic} is diagnosed`);
+			assert.equal(harness.binding.subscribed, true, `${entry.name}: a settled handoff is not fatal`);
+			source.settleRedraw("row-a");
+			await settle();
+			assert.equal(source.inputWrites.length, 1, `${entry.name}: a settled operation is never replayed`);
+			const viewerId = harness.binding.viewerId;
+			assert.ok(viewerId !== null);
+			source.throwOnWrite = false;
+			source.inputWriteOutcome = undefined;
+			sendNativeInput(harness.channel, {
+				source: wireSourceOf(source, viewerId), kind: "keyboard", data: "next", ordinal: 2,
+			});
+			await settle();
+			assert.deepEqual(
+				handedAllText(source),
+				["held", "next"],
+				`${entry.name}: a later operation is admitted on its own fences`,
+			);
+		} finally {
+			source.throwOnWrite = false;
+			source.inputWriteOutcome = undefined;
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+});
+
+test("cancellation, teardown, parse failure, and a run change release held work with no late write", async () => {
+	const endings: Array<{
+		readonly name: string;
+		readonly end: (context: { source: FakeContentSource; harness: Harness }) => void | Promise<void>;
+	}> = [
+		{
+			name: "the peer unsubscribed",
+			end: ({ harness }) => {
+				harness.channel.deliver({ type: "unsubscribe", subscriptionId: "sub-1" });
+			},
+		},
+		{ name: "the binding stopped", end: ({ harness }) => harness.binding.stop() },
+		{
+			name: "the channel was lost",
+			end: ({ harness }) => {
+				harness.channel.lose();
+			},
+		},
+		{
+			name: "a frame this endpoint cannot decode arrived",
+			end: ({ harness }) => {
+				harness.channel.deliverBytes(Buffer.from("definitely not a session content frame"));
+			},
+		},
+		{
+			name: "the run this subscription served was replaced",
+			end: ({ source }) => {
+				source.emitRun("row-a", OTHER_RUN);
+			},
+		},
+	];
+	for (const ending of endings) {
+		const { source, harness, published } = await openRedrawCase();
+		try {
+			source.beginRedraw("row-a");
+			sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "held", ordinal: 1 });
+			await settle();
+			assert.equal(source.inputWrites.length, 0, `${ending.name}: the input is genuinely held`);
+			await ending.end({ source, harness });
+			await settle();
+			assert.equal(
+				source.readinessUnsubscribes,
+				1,
+				`${ending.name}: the readiness watch is released once, not leaked or released twice`,
+			);
+			// The redraw finishing afterwards must not resurrect the abandoned work.
+			source.settleRedraw("row-a");
+			await settle();
+			assert.equal(source.inputWrites.length, 0, `${ending.name}: no late write follows the release`);
+			assert.equal(harness.binding.subscribed, false, `${ending.name}: the subscription is over`);
+		} finally {
+			source.inputWriteHook = undefined;
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+});
+
+test("a drain that loses ownership inside a handoff stops there and never consumes a newer subscription's queue", async () => {
+	const { source, harness, published } = await openRedrawCase();
+	try {
+		source.beginRedraw("row-a");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "first", ordinal: 1 });
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "second", ordinal: 2 });
+		await settle();
+		assert.deepEqual(handedAllText(source), [], "both operations wait behind the held redraw");
+		// The peer tears this subscription down, resubscribes, and queues new held
+		// input while the owner is still inside the FIRST handoff. The pass returning
+		// from that write owns nothing any more.
+		source.inputWriteHook = () => {
+			harness.channel.deliver({ type: "unsubscribe", subscriptionId: "sub-1" });
+			harness.channel.deliver(subscribeFrame(source));
+			source.beginRedraw("row-a");
+			sendNativeInput(harness.channel, {
+				source: wireSourceOf(source, harness.binding.viewerId ?? ""),
+				kind: "keyboard",
+				data: "mine",
+				ordinal: 1,
+			});
+		};
+		source.settleRedraw("row-a");
+		await settle();
+		assert.deepEqual(handedAllText(source), ["first"], "the old pass stops where its ownership ended");
+		assert.equal(source.readinessWatches.length, 2, "the new subscription installed its own watch");
+		assert.equal(source.readinessUnsubscribes, 1, "and the retired subscription released its own");
+		source.settleRedraw("row-a");
+		await settle();
+		assert.deepEqual(
+			handedAllText(source),
+			["first", "mine"],
+			"the new subscription drains its OWN held work, once, on its own fences",
+		);
+	} finally {
+		source.inputWriteHook = undefined;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a readiness callback that ends the subscription on the last pre-write read produces no provider invocation", async () => {
+	// `isReady()` is the FINAL owner callback before the byte, and it may answer
+	// anything. Here it ends this very binding and still reports readiness (the seam's
+	// retired-watch branch answers true, the friendliest possible lie). Ownership is
+	// re-proved after that callback, so the captured target never reaches the provider.
+	const { source, harness, published } = await openRedrawCase();
+	try {
+		source.beginRedraw("row-a");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "late", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "the operation waits behind the redraw");
+		// The scope read is the handoff's first owner callback, so arming there pins the
+		// readiness read to the one immediately before the write.
+		source.inputReadHook = () => {
+			source.readinessReadHook = () => {
+				harness.channel.deliver({ type: "unsubscribe", subscriptionId: "sub-1" });
+			};
+		};
+		source.settleRedraw("row-a");
+		await settle();
+		assert.equal(source.inputWrites.length, 0,
+			"a callback that ends the subscription cannot reach the provider, however it answers");
+		assert.ok(harness.diagnostics.includes("input_refused"), "the packet is refused where it stands");
+		assert.equal(harness.binding.subscribed, false, "the teardown stands");
+		source.settleRedraw("row-a");
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "and no later wake-up resurrects it");
+	} finally {
+		source.inputReadHook = undefined;
+		source.readinessReadHook = undefined;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a readiness callback that publishes an A -> B -> A observation on the last pre-write read writes nothing", async () => {
+	// The same callback moving the facts and landing them back on the original values is
+	// the classic A -> B -> A: the captured target and the packet's own stated modes both
+	// still LOOK current, and the seam answers ready. The observation revision moved, and
+	// that is what stops the byte.
+	const { source, harness, published } = await openRedrawCase();
+	try {
+		source.beginRedraw("row-a");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "late", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "the operation waits behind the redraw");
+		source.inputReadHook = () => {
+			source.readinessReadHook = () => {
+				source.inputModes = { ...INPUT_MODES, bracketedPaste: false };
+				source.emit("row-a");
+				source.inputModes = INPUT_MODES;
+				source.emit("row-a");
+			};
+		};
+		source.settleRedraw("row-a");
+		await settle();
+		assert.equal(source.inputWrites.length, 0,
+			"facts that moved under the readiness read cannot be written, even back where they started");
+		assert.ok(harness.diagnostics.includes("input_refused"), "the stale packet is freed once");
+		// The lane is intact: input admitted on the CURRENT observation still crosses.
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		sendNativeInput(harness.channel, {
+			source: wireSourceOf(source, viewerId), kind: "keyboard", data: "now", ordinal: 2,
+		});
+		await settle();
+		assert.deepEqual(handedAllText(source), ["now"], "current input still works, exactly once");
+	} finally {
+		source.inputReadHook = undefined;
+		source.readinessReadHook = undefined;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("teardown and reinstallation during the drain's readiness read leave the replacement's work queued and it crosses once", async () => {
+	// The pass-level readiness read is owner code too. If it replaces this run, the pass
+	// must stop before it interprets the answer: otherwise its next queue action is
+	// performed on a NEWER subscription's backlog and frees work it never admitted.
+	const { source, harness, published } = await openRedrawCase();
+	try {
+		source.beginRedraw("row-a");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "old", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "the old subscription's work waits");
+		source.readinessReadHook = () => {
+			harness.channel.deliver({ type: "unsubscribe", subscriptionId: "sub-1" });
+			harness.channel.deliver(subscribeFrame(source));
+			sendNativeInput(harness.channel, {
+				source: wireSourceOf(source, harness.binding.viewerId ?? ""), kind: "keyboard", data: "mine", ordinal: 1,
+			});
+		};
+		source.settleRedraw("row-a");
+		await settle();
+		assert.equal(source.readinessWatches.length, 2, "the replacement installed its own readiness watch");
+		assert.deepEqual(handedAllText(source), ["mine"],
+			"the replacement's work survives the old pass and crosses once");
+		assert.equal(source.inputWrites.length, 1, "exactly one provider invocation, and none of it stale");
+	} finally {
+		source.readinessReadHook = undefined;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("held input whose facts moved is discarded rather than retargeted, while current input still works", async () => {
+	const mutations: Array<{
+		readonly name: string;
+		/** The modes a later operation must name to be current again. */
+		readonly currentModes: TerminalInputModes;
+		/** Move the owner facts this held input was admitted against. */
+		readonly mutate: (source: FakeContentSource, viewerId: string) => void;
+	}> = [
+		{
+			name: "input modes moved",
+			currentModes: { ...INPUT_MODES, bracketedPaste: false },
+			mutate: (source) => {
+				source.inputModes = { ...INPUT_MODES, bracketedPaste: false };
+				source.emit("row-a");
+			},
+		},
+		{
+			// The values land back where they started; the held packet is still stale,
+			// exactly like an open paste freed by the same A -> B -> A observation.
+			name: "input modes moved A -> B -> A",
+			currentModes: INPUT_MODES,
+			mutate: (source) => {
+				source.inputModes = { ...INPUT_MODES, bracketedPaste: false };
+				source.emit("row-a");
+				source.inputModes = INPUT_MODES;
+				source.emit("row-a");
+			},
+		},
+		{
+			name: "canonical geometry revision moved",
+			currentModes: INPUT_MODES,
+			mutate: (source) => {
+				const row = source.rows.get("row-a");
+				assert.ok(row !== undefined);
+				row.revision += 1;
+				source.emit("row-a");
+			},
+		},
+		{
+			name: "native conversation tuple moved",
+			currentModes: INPUT_MODES,
+			mutate: (source) => {
+				source.rotateNativeSession("row-a");
+				source.emit("row-a");
+			},
+		},
+		{
+			name: "viewer revision moved",
+			currentModes: INPUT_MODES,
+			mutate: (source, viewerId) => {
+				source.bumpViewerRevision(viewerId);
+				source.emit("row-a");
+			},
+		},
+		{
+			name: "host-minted source token moved",
+			currentModes: INPUT_MODES,
+			mutate: (source, viewerId) => {
+				source.rotateSourceToken(viewerId);
+				source.emit("row-a");
+			},
+		},
+	];
+	for (const mutation of mutations) {
+		const { source, harness, published } = await openRedrawCase();
+		try {
+			const viewerId = harness.binding.viewerId;
+			assert.ok(viewerId !== null, `${mutation.name}: the endpoint registered its own viewer`);
+			source.beginRedraw("row-a");
+			sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "held", ordinal: 1 });
+			await settle();
+			assert.equal(source.inputWrites.length, 0, `${mutation.name}: the input really is held`);
+			mutation.mutate(source, viewerId);
+			await settle();
+			source.settleRedraw("row-a");
+			await settle();
+			assert.equal(
+				source.inputWrites.length,
+				0,
+				`${mutation.name}: stale held work is never written against facts it was not made for`,
+			);
+			assert.ok(harness.diagnostics.includes("input_refused"), `${mutation.name}: the discard is diagnosed`);
+			assert.equal(
+				harness.binding.subscribed,
+				true,
+				`${mutation.name}: discarding stale work never retires the subscription`,
+			);
+			sendNativeInput(harness.channel, {
+				source: wireSourceOf(source, viewerId),
+				kind: "keyboard",
+				data: "current",
+				ordinal: 2,
+				inputModes: mutation.currentModes,
+			});
+			await settle();
+			assert.deepEqual(
+				handedAllText(source),
+				["current"],
+				`${mutation.name}: a later operation naming the CURRENT facts is admitted on its own fences`,
+			);
+		} finally {
+			source.inputModes = INPUT_MODES;
+			await harness.host.stopAll().catch(() => undefined);
+		}
+	}
+});
+
+test("the held backlog accepts exactly 128 operations and refuses the next one with zero bytes", async () => {
+	const { source, harness, published } = await openRedrawCase();
+	try {
+		source.beginRedraw("row-a");
+		for (let ordinal = 1; ordinal <= 128; ordinal += 1) {
+			sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: `k${ordinal}`, ordinal });
+		}
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "every admitted operation waits before its first owner write");
+		assert.equal(harness.diagnostics.includes("input_refused"), false, "the 128th operation still fit the bound");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "over", ordinal: 129 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "the 129th is refused before any write");
+		assert.ok(harness.diagnostics.includes("input_refused"), "the bound is diagnosed as an ordinary refusal");
+		assert.equal(harness.binding.subscribed, true, "a bound refusal never retires the subscription");
+		assert.equal(framesOfType(harness.channel.frames(), "error").length, 0, "and never becomes a protocol failure");
+		source.settleRedraw("row-a");
+		await settle();
+		const handed = handedAllText(source);
+		assert.equal(handed.length, 128, "exactly the held operations drain, once each");
+		assert.deepEqual(
+			handed,
+			Array.from({ length: 128 }, (_unused, index) => `k${index + 1}`),
+			"the whole backlog keeps arrival order",
+		);
+		assert.equal(handed.includes("over"), false, "the refused operation is never replayed later");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("aggregate retained payload is bounded by the existing content transfer-byte budget", async () => {
+	// The smallest legal budget: one chunk's worth of retained payload in total.
+	const { source, harness, published } = await openRedrawCase(INPUT_MODES, {
+		maxTransferBytes: DEFAULT_SESSION_CONTENT_BOUNDS.maxChunkPayloadBytes,
+	});
+	try {
+		const body = "x".repeat(20_000);
+		source.beginRedraw("row-a");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: body, ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "the first payload is held, not written");
+		assert.equal(harness.diagnostics.includes("input_refused"), false, "the first payload fit the byte budget");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: body, ordinal: 2 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "the second payload is refused before any write");
+		assert.ok(harness.diagnostics.includes("input_refused"), "the aggregate byte budget is diagnosed");
+		source.settleRedraw("row-a");
+		await settle();
+		assert.equal(source.inputWrites.length, 1, "exactly the retained payload crossed, once");
+		assert.equal(handedAllText(source)[0]?.length, body.length, "and it crossed whole");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
 test("input admission re-proves every echoed source fact against the CURRENT owner facts", async () => {
 	const mutations: Array<{ readonly name: string; readonly mutate: (published: NativeIoSource) => NativeIoSource }> = [
 		{ name: "another host run", mutate: (published) => ({ ...published, hostRunId: OTHER_RUN }) },
@@ -4576,6 +5100,400 @@ test("a resize whose watch replacement cannot be retired ends the subscription a
 		await assert.rejects(harness.binding.stop(), isCloseFailure, "unproven cleanup never settles green");
 	} finally {
 		source.throwOnUnsubscribe = false;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+/* ------------------------------------------------------------------------- *
+ * Completed input held across a native synchronized redraw (#500)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A live native IO subscription on a row whose owner can report an unfinished
+ * synchronized redraw. The returned source starts WITH the readiness seam; a
+ * caller models a source without one by removing `watchInputReadiness` before
+ * subscribing.
+ */
+async function openRedrawCase(
+	modes: TerminalInputModes = INPUT_MODES,
+	bounds: Partial<SessionContentBounds> = {},
+	authorizePeer?: (peerKey: PeerKey) => boolean,
+): Promise<{
+	readonly source: FakeContentSource;
+	readonly harness: Harness;
+	readonly published: NativeIoSource;
+}> {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	source.inputModes = modes;
+	const harness = createHarness({
+		source,
+		nativeIo: true,
+		bounds,
+		...(authorizePeer === undefined ? {} : { authorizePeer }),
+	});
+	await openNativeHello(harness);
+	const published = await subscribeNative(harness, { cols: 80, rows: 24 });
+	return { source, harness, published };
+}
+
+/** Every byte bundle this endpoint handed to the child, as text, in order. */
+function handedAllText(source: FakeContentSource): string[] {
+	return source.inputWrites.map((write) => (typeof write.data === "string"
+		? write.data
+		: Buffer.from(write.data).toString("utf8")));
+}
+
+test("completed input is held before its first owner write while a synchronized redraw is in flight", async () => {
+	const { source, harness, published } = await openRedrawCase();
+	try {
+		assert.equal(source.readinessWatches.length, 1, "a negotiated subscription installs one readiness watch");
+		const publishedBefore = source.builtSnapshots.length;
+		source.beginRedraw("row-a");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "a", ordinal: 1 });
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "b", ordinal: 2 });
+		await settle();
+		assert.ok(source.readinessReads > 0, "admission asked the owner whether its redraw had settled");
+		assert.equal(source.inputWrites.length, 0, "an unfinished redraw means zero owner bytes");
+		assert.equal(harness.binding.subscribed, true, "holding is not a refusal and never retires the subscription");
+		assert.equal(framesOfType(harness.channel.frames(), "error").length, 0, "holding is never a protocol failure");
+		assert.equal(harness.diagnostics.includes("input_refused"), false, "a held input was not dropped");
+		// Nothing was observed while held: an unchanged frame end publishes no viewport,
+		// so the wake-up below cannot be attributed to a content observation.
+		assert.equal(source.builtSnapshots.length, publishedBefore, "no viewport was published during the hold");
+		source.settleRedraw("row-a");
+		await settle();
+		assert.deepEqual(handedAllText(source), ["a", "b"], "the held backlog drains once each, in arrival order");
+		// Ready now, so a later operation goes straight through with no extra wait.
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		sendNativeInput(harness.channel, { source: wireSourceOf(source, viewerId), kind: "keyboard", data: "c", ordinal: 3 });
+		await settle();
+		assert.deepEqual(handedAllText(source), ["a", "b", "c"], "the wake-up did not disarm later admission");
+		assert.equal(harness.diagnostics.includes("input_refused"), false);
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a held mouse report is never overtaken by a later keyboard packet or paste", async () => {
+	const { source, harness, published } = await openRedrawCase(SGR_MOUSE_MODES);
+	try {
+		source.beginRedraw("row-a");
+		sendNativeInput(harness.channel, {
+			source: published, kind: "mouse", data: "\u001b[<0;5;3M", ordinal: 1, inputModes: SGR_MOUSE_MODES,
+		});
+		sendNativeInput(harness.channel, {
+			source: published, kind: "keyboard", data: "x", ordinal: 2, inputModes: SGR_MOUSE_MODES,
+		});
+		deliverBuilt(harness.channel, buildPaste({ source: published, ordinal: 3, text: "pasted body", inputModes: SGR_MOUSE_MODES }));
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "every input kind waits behind the held redraw, in one queue");
+		source.settleRedraw("row-a");
+		await settle();
+		assert.deepEqual(handedAllText(source), [
+			"\u001b[<0;5;3M",
+			"x",
+			"\u001b[200~pasted body\u001b[201~",
+		], "the shared FIFO drains mouse, key, then paste, exactly once each");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("input admitted reentrantly during another packet's handoff still queues behind it", async () => {
+	let reenter: (() => void) | undefined;
+	const { source, harness, published } = await openRedrawCase(INPUT_MODES, {}, () => {
+		// The authorizer is arbitrary owner code: it can admit other work on its way
+		// past. One-shot, so only the held packet's handoff is disturbed.
+		const hook = reenter;
+		reenter = undefined;
+		hook?.();
+		return true;
+	});
+	try {
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		source.beginRedraw("row-a");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "first", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "the first packet is held");
+		reenter = () => {
+			sendNativeInput(harness.channel, {
+				source: wireSourceOf(source, viewerId), kind: "keyboard", data: "second", ordinal: 2,
+			});
+		};
+		source.settleRedraw("row-a");
+		await settle();
+		assert.deepEqual(
+			handedAllText(source),
+			["first", "second"],
+			"a packet admitted by the authorizer never overtakes the one still inside its handoff",
+		);
+		assert.equal(harness.diagnostics.includes("input_refused"), false, "nothing was dropped on the way");
+	} finally {
+		reenter = undefined;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("input admitted reentrantly on the ready path still queues behind the operation being handed off", async () => {
+	// No redraw is in flight anywhere here: both operations are ready. FIFO still has to
+	// hold, which it can only do if the operation being admitted reserves its place and
+	// its bytes BEFORE the authorizer, the source read, and the readiness read run.
+	let reenter: (() => void) | undefined;
+	let authorizations = 0;
+	const authorizer = (): boolean => {
+		// The endpoint authorizes a peer both at frame entry and again inside the
+		// handoff. Only the second call is "arbitrary owner code running mid-write", so
+		// the counter is re-armed for each packet right before it is sent.
+		authorizations += 1;
+		if (authorizations >= 2) {
+			const hook = reenter;
+			reenter = undefined;
+			hook?.();
+		}
+		return true;
+	};
+	const { source, harness, published } = await openRedrawCase(INPUT_MODES, {}, authorizer);
+	try {
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		assert.equal(source.redrawHeldRows.size, 0, "nothing is being redrawn");
+		reenter = () => {
+			sendNativeInput(harness.channel, {
+				source: wireSourceOf(source, viewerId), kind: "keyboard", data: "second", ordinal: 2,
+			});
+		};
+		authorizations = 0;
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "first", ordinal: 1 });
+		await settle();
+		assert.ok(authorizations >= 2, "the handoff re-authorized this peer, and the hook ran there");
+		assert.deepEqual(handedAllText(source), ["first", "second"],
+			"the ready path cannot be overtaken by input its own authorizer admitted");
+		assert.equal(harness.diagnostics.includes("input_refused"), false, "nothing was dropped on the way");
+		assert.equal(source.inputWrites.length, 2, "each crossed exactly once");
+	} finally {
+		reenter = undefined;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("input admitted during the owner's source read still queues behind the reader", async () => {
+	// The source read is the other arbitrary owner callback in this path: an operation
+	// admitted from inside it was admitted LATER and must cross LATER.
+	const { source, harness, published } = await openRedrawCase();
+	try {
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		source.inputReadHook = () => {
+			sendNativeInput(harness.channel, {
+				source: wireSourceOf(source, viewerId), kind: "keyboard", data: "second", ordinal: 2,
+			});
+		};
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "first", ordinal: 1 });
+		await settle();
+		assert.deepEqual(handedAllText(source), ["first", "second"],
+			"a reentrant admission seen during the scope read waits its turn");
+		assert.equal(harness.diagnostics.includes("input_refused"), false);
+	} finally {
+		source.inputReadHook = undefined;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("an operation inside its own handoff on the ready path also occupies the retained-payload budget", async () => {
+	let reentrant: (() => void) | undefined;
+	let budgetAuthorizations = 0;
+	// One chunk of retained payload in total, and no redraw in flight: the packet inside
+	// its handoff is outstanding retained work even when nothing was ever held.
+	const midWriteAuthorizer = (): boolean => {
+		budgetAuthorizations += 1;
+		if (budgetAuthorizations >= 2) {
+			const hook = reentrant;
+			reentrant = undefined;
+			hook?.();
+		}
+		return true;
+	};
+	const readyHarness = await openRedrawCase(
+		INPUT_MODES,
+		{ maxTransferBytes: DEFAULT_SESSION_CONTENT_BOUNDS.maxChunkPayloadBytes },
+		midWriteAuthorizer,
+	);
+	const { source, harness, published } = readyHarness;
+	try {
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		assert.equal(source.redrawHeldRows.size, 0, "nothing is being redrawn");
+		const body = "x".repeat(20_000);
+		reentrant = () => {
+			sendNativeInput(harness.channel, {
+				source: wireSourceOf(source, viewerId), kind: "keyboard", data: body, ordinal: 2,
+			});
+		};
+		budgetAuthorizations = 0;
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: body, ordinal: 1 });
+		await settle();
+		assert.ok(budgetAuthorizations >= 2, "the reentrant admission ran inside the handoff");
+		assert.equal(source.inputWrites.length, 1, "only the packet already inside its handoff crossed");
+		assert.ok(
+			harness.diagnostics.includes("input_refused"),
+			"the second packet is refused whole because the in-flight bytes are still retained",
+		);
+		assert.equal(handedAllText(source)[0]?.length, body.length, "and the first crossed whole, once");
+	} finally {
+		reentrant = undefined;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("an operation inside its own handoff keeps occupying the retained-payload budget", async () => {
+	let reentrant: (() => void) | undefined;
+	// One chunk of retained payload in total: the packet inside its handoff is still
+	// held work, so its bytes are still counted against the budget.
+	const reentrantHarness = await openRedrawCase(
+		INPUT_MODES,
+		{ maxTransferBytes: DEFAULT_SESSION_CONTENT_BOUNDS.maxChunkPayloadBytes },
+		() => {
+			const hook = reentrant;
+			reentrant = undefined;
+			hook?.();
+			return true;
+		},
+	);
+	const { source, harness, published } = reentrantHarness;
+	try {
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		const body = "x".repeat(20_000);
+		source.beginRedraw("row-a");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: body, ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "the first payload is held");
+		reentrant = () => {
+			sendNativeInput(harness.channel, {
+				source: wireSourceOf(source, viewerId), kind: "keyboard", data: body, ordinal: 2,
+			});
+		};
+		source.settleRedraw("row-a");
+		await settle();
+		assert.equal(source.inputWrites.length, 1, "only the packet already inside its handoff crossed");
+		assert.ok(
+			harness.diagnostics.includes("input_refused"),
+			"the reentrant packet is refused whole because the in-flight bytes are still retained",
+		);
+		assert.equal(handedAllText(source)[0]?.length, body.length, "and it crossed whole, once");
+	} finally {
+		reentrant = undefined;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a source without the optional readiness seam keeps writing input directly", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	// A source that never offers the seam: no watch is installed and no wait happens.
+	source.watchInputReadiness = undefined;
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		const published = await subscribeNative(harness, { cols: 80, rows: 24 });
+		assert.equal(source.readinessWatches.length, 0, "an absent seam is never invented");
+		source.redrawHeldRows.add("row-a");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "a", ordinal: 1 });
+		await settle();
+		assert.deepEqual(handedAllText(source), ["a"], "compatibility is the existing direct handoff, unchanged");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a source that offers the seam but cannot install it fails closed instead of writing", async () => {
+	const source = new FakeContentSource();
+	source.addRow("row-a", 80, 24);
+	// Offered, and it gives no watch. This is NOT the "no seam" case above.
+	source.readinessInstallFails = true;
+	const harness = createHarness({ source, nativeIo: true });
+	try {
+		await openNativeHello(harness);
+		const published = await subscribeNative(harness, { cols: 80, rows: 24 });
+		assert.equal(source.readinessWatches.length, 0, "the offered seam produced nothing to read");
+		// Nothing is redraw-held, so only a fail-closed reading can keep this unwritten.
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "a", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "an offered-but-unanswerable seam never authorizes a write");
+		assert.ok(harness.diagnostics.includes("input_refused"), "the cancellation is reported");
+		assert.equal(harness.binding.subscribed, true, "and it stays an ordinary refusal, not a disconnect");
+		assert.equal(framesOfType(harness.channel.frames(), "error").length, 0, "and never a protocol failure");
+	} finally {
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a readiness seam that stops answering cancels held input instead of writing it", async () => {
+	// The same ground from the endpoint's side, whatever broke underneath it: an owner
+	// whose readiness cannot be answered — including a manager whose surface lookup
+	// started failing behind the seam — never turns into permission to write.
+	const { source, harness, published } = await openRedrawCase();
+	try {
+		source.beginRedraw("row-a");
+		sendNativeInput(harness.channel, { source: published, kind: "keyboard", data: "held", ordinal: 1 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "the input is held");
+		source.readinessThrowsOnRead = true;
+		// The wake-up arrives, and the read behind it can no longer answer.
+		source.settleRedraw("row-a");
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "an unanswerable read cancels the held work, never writes it");
+		assert.ok(harness.diagnostics.includes("input_refused"), "the cancellation is reported");
+		assert.equal(harness.binding.subscribed, true, "the view keeps working with input refused");
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		sendNativeInput(harness.channel, { source: wireSourceOf(source, viewerId), kind: "keyboard", data: "next", ordinal: 2 });
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "no later operation is rescued by the broken seam");
+	} finally {
+		source.readinessThrowsOnRead = false;
+		await harness.host.stopAll().catch(() => undefined);
+	}
+});
+
+test("a redraw ending in the same chunk as a mode change discards held input instead of writing it", async () => {
+	const modesWithoutMouse: TerminalInputModes = Object.freeze({ ...SGR_MOUSE_MODES, mouseTracking: "none" });
+	const { source, harness, published } = await openRedrawCase(SGR_MOUSE_MODES);
+	try {
+		source.beginRedraw("row-a");
+		sendNativeInput(harness.channel, {
+			source: published, kind: "mouse", data: "\u001b[<0;5;3M", ordinal: 1, inputModes: SGR_MOUSE_MODES,
+		});
+		sendNativeInput(harness.channel, {
+			source: published, kind: "keyboard", data: "k", ordinal: 2, inputModes: SGR_MOUSE_MODES,
+		});
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "both operations wait for the redraw");
+
+		// One chunk ends the frame and turns mouse reporting off. The surface publishes
+		// the state the WHOLE chunk left behind, and only then wakes the waiter, so the
+		// wake-up can never be read as "the facts this input was approved under still
+		// hold". Writing here would hand a click to a child that no longer asks for one.
+		source.settleRedrawWithModes("row-a", modesWithoutMouse);
+		await settle();
+		assert.equal(source.inputWrites.length, 0, "input admitted under the old modes is never written");
+		assert.ok(harness.diagnostics.includes("input_refused"), "each discard is reported");
+		assert.equal(framesOfType(harness.channel.frames(), "error").length, 0, "a discard is never a protocol failure");
+		assert.equal(harness.binding.subscribed, true, "and it never retires the view");
+
+		// The wake-up did not poison admission: current input on current modes works now.
+		const viewerId = harness.binding.viewerId;
+		assert.ok(viewerId !== null);
+		sendNativeInput(harness.channel, {
+			source: wireSourceOf(source, viewerId), kind: "keyboard", data: "now", ordinal: 3, inputModes: modesWithoutMouse,
+		});
+		await settle();
+		assert.deepEqual(handedAllText(source), ["now"], "only the current operation crosses, once");
+	} finally {
+		source.inputModes = INPUT_MODES;
 		await harness.host.stopAll().catch(() => undefined);
 	}
 });

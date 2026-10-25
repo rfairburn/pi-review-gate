@@ -94,7 +94,17 @@
  * sibling viewer, or a PTY write. Every packet is translated exactly once with the
  * owner's existing translator, and a whole text paste of up to exactly 1 MiB is
  * assembled before any handoff, so an incomplete or stale input writes zero bytes
- * and poisons nothing that follows it. A native copy shares the ONE serialized
+ * and poisons nothing that follows it. While the owner's native synchronized redraw
+ * is still in flight a completed input is held BEFORE its first owner write and
+ * written in arrival order once the redraw settles (#500): held plus in-flight work
+ * is bounded at 128 logical operations with retained payload bounded by the existing
+ * content transfer-byte budget, and every fence is re-proved immediately before the
+ * one write, so anything that moved (an A -> B -> A included) is discarded rather
+ * than retargeted. A source without the owner-local readiness seam keeps the
+ * existing direct-write behavior; a source that DOES offer that seam and cannot
+ * answer it fails closed — held work is cancelled and new input refused — because
+ * a broken seam is never permission to write into an unfinished redraw. A native
+ * copy shares the ONE serialized
  * writer and the existing bounded backlog, and an unsendable copy fails closed
  * rather than being dropped while claiming delivery. No input lease, focus rule,
  * receipt store, retry queue, second viewer, second writer, or session lifecycle
@@ -111,6 +121,7 @@ import type {
 	NativeViewerInputResult,
 	NativeViewerInputSource,
 	OwningHostInventorySnapshot,
+	OwningHostInputReadinessWatch,
 	OwningHostService,
 	OwningHostSessionContentSnapshot,
 	OwningHostSessionContentWatch,
@@ -175,7 +186,7 @@ import {
 export type SessionContentSource = Pick<
 	OwningHostService,
 	"watchSessionContent" | "readInventorySnapshot" | "openViewer" | "readViewer" | "updateViewer" | "closeViewer"
-> & Partial<Pick<OwningHostService, "readViewerInputSource" | "writeViewerInput">>;
+> & Partial<Pick<OwningHostService, "readViewerInputSource" | "writeViewerInput" | "watchInputReadiness">>;
 
 /**
  * Trusted synchronous authorization decision for one exact verified peer key.
@@ -377,6 +388,19 @@ type TimeoutOverrides = Partial<Pick<RosterBridgeBounds, (typeof TIMEOUT_KEYS)[n
 const MAX_PENDING_CONTROLS = 8;
 
 /**
+ * Bound on completed native inputs held BEFORE their first owner write because
+ * the owner's synchronized redraw had not settled (#500). It counts held
+ * logical operations, not characters or events per second, and the operation
+ * being admitted right now counts in it: exactly this many may be outstanding
+ * and the next one is refused where it stands, with zero bytes written, nothing
+ * already held replayed, and no retry. Held operations release their slot as
+ * soon as they are written or discarded, and retirement releases the whole
+ * backlog. Aggregate retained payload bytes are bounded separately by the
+ * existing content transfer-byte budget (`bounds.maxTransferBytes`).
+ */
+const MAX_DEFERRED_INPUTS = 128;
+
+/**
  * The resolved native input seam, or `null` when this host is display-only. It is
  * built once from the injected source so the endpoint never reaches for a method
  * that the source does not have, and every failure of a seam call is turned into
@@ -397,6 +421,38 @@ interface NativeInputTarget {
 	readonly wire: NativeIoInputSource;
 	readonly modes: TerminalInputModes;
 }
+
+/**
+ * One completed input held before its first owner write. It keeps the facts it
+ * was made for (`completed` carries its own source and modes) and is NEVER
+ * retargeted or retranslated against newer facts: if anything it names has moved
+ * — including an A -> B -> A change — it is discarded, not adapted. `generation`
+ * and `admissionEpoch` fence it against retirement and reinstallation, and
+ * `factsRevision` is the input-facts revision observed when it was admitted.
+ */
+interface DeferredNativeInput {
+	readonly completed: NativeIoCompletedInput;
+	readonly subscriptionId: string;
+	readonly generation: number;
+	readonly admissionEpoch: number;
+	readonly factsRevision: number;
+	readonly retainedBytes: number;
+	/**
+	 * Set while THIS entry is inside its single terminal handoff. It stays in the
+	 * queue and stays counted the whole time, so an operation admitted reentrantly
+	 * by authorizer or source-read code cannot see an empty queue and jump ahead of
+	 * it, and pressure accounting never drops an operation that has not been
+	 * written yet.
+	 */
+	inFlight: boolean;
+}
+
+/**
+ * What the owner's redraw-readiness seam can say at this instant: settled, still
+ * drawing, or unable to answer. Only the first admits a write, and the last is
+ * never read as the first (#500).
+ */
+type InputReadiness = "ready" | "held" | "unavailable";
 
 /**
  * One queued native copy: every encoded frame of one atomic emission, in wire
@@ -725,6 +781,40 @@ class OwnerBinding implements SessionContentChannelBinding {
 	#inputTimer: NodeJS.Timeout | null = null;
 	/** The newest input modes this endpoint observed for this subscription. */
 	#inputModes: TerminalInputModes | null = null;
+	/**
+	 * Completed inputs held before their first owner write because the owner's
+	 * synchronized redraw had not settled (#500). Arrival order is input order:
+	 * every kind (keyboard, mouse, paste) shares this ONE FIFO, so a later packet
+	 * never overtakes a held earlier one.
+	 */
+	#deferredInputs: DeferredNativeInput[] = [];
+	/** Aggregate retained payload bytes of {@linkcode #deferredInputs}. */
+	#deferredBytes = 0;
+	/** This binding's owner-local redraw-readiness seam, while a subscription owns it. */
+	#readiness: OwningHostInputReadinessWatch | null = null;
+	/**
+	 * Whether the source offered a readiness seam at all when this subscription was
+	 * adopted. Absence is the only legacy direct-write case; a seam that was
+	 * offered and cannot answer is never read as readiness (#500).
+	 */
+	#readinessOffered = false;
+	/**
+	 * Ownership token of the deferred-input drain pass in flight. A retirement or
+	 * reinstallation during a pass means the pass no longer owns anything: it must
+	 * not consume the new subscription's entries, and its `finally` must not clear
+	 * the new pass's state.
+	 */
+	#inputDrainToken: object | null = null;
+	/** Monotonic counter bumped whenever held input work is released; fences held entries. */
+	#inputAdmissionEpoch = 0;
+	/**
+	 * Monotonic revision of the input facts this endpoint admits on (its stated
+	 * source and observed modes). It moves on EVERY observed change, so an
+	 * A -> B -> A sequence that lands the original values back still moves it
+	 * twice: work admitted under an older revision is stale even though the values
+	 * now compare equal.
+	 */
+	#inputFactsRevision = 0;
 	/** The native source (conversation or startup) this endpoint last stated on a publish, or none. */
 	#statedSource: NativeIoInputSource | null = null;
 	/**
@@ -1201,6 +1291,10 @@ class OwnerBinding implements SessionContentChannelBinding {
 			// manager owns every scope fact, and a refusal inside one subscription frees
 			// buffered bytes without ever reviving a completed ordinal.
 			this.#resetInputAssembler();
+			// The owner-local redraw seam is installed with the rest of this
+			// subscription's observations and retired with them. A source without the
+			// seam leaves this alone and input keeps its direct-write behavior (#500).
+			this.#installReadinessWatch(frame.sessionId, generation);
 		}
 		this.#state = "subscribed";
 		return "installed";
@@ -1493,24 +1587,60 @@ class OwnerBinding implements SessionContentChannelBinding {
 	}
 
 	/**
-	 * Admit one atomically assembled input packet. The current target is proven, the
-	 * packet is translated exactly once with the owner's existing translator, then
-	 * the grant and the target are proven again immediately before the one
-	 * synchronous handoff. Every refusal writes zero bytes, retries nothing, and
-	 * leaves the subscription usable.
+	 * Admit one atomically assembled input packet (#500). Every completed operation
+	 * first RESERVES its place in the one queue, with its retained payload counted,
+	 * BEFORE any owner code runs: the target read, the authorizer, the readiness read,
+	 * and the handoff are all arbitrary owner callbacks that can admit other input on
+	 * their way past, and an operation that had not reserved would let that newer
+	 * input see a momentarily empty queue and cross first. The drain pass below then
+	 * writes from the front, so arrival order is the only order an owner ever sees,
+	 * whether or not a redraw happened to be in flight.
+	 *
+	 * A source that offers no redraw observation is not special-cased here: its
+	 * readiness reads "ready", so this same call writes its one packet synchronously,
+	 * exactly as before. Every refusal writes zero bytes, retries nothing, and leaves
+	 * the subscription usable.
 	 */
 	#admitInput(completed: NativeIoCompletedInput): void {
+		if (this.#provider === null) {
+			this.#diagnostic("input_refused");
+			return;
+		}
+		// Reservation only: nothing is read from the owner, translated, authorized,
+		// or written here, so a stale or over-bound packet is refused with zero bytes
+		// exactly as it was when this check ran before the seam existed.
+		if (!this.#deferInput(completed)) {
+			this.#diagnostic("input_refused");
+			return;
+		}
+		// A call that reenters an in-flight handoff returns immediately, so an
+		// operation admitted during another packet's callbacks stays behind it.
+		this.#drainDeferredInputs();
+	}
+
+	/**
+	 * The one synchronous handoff of one queued input, reached only from the drain pass
+	 * that owns the entry. The packet is translated
+	 * exactly once with the owner's existing translator, then the grant and the
+	 * target are proven again immediately before the write. The whole holding fence is
+	 * re-proven at that same instant, AFTER arbitrary
+	 * authorizer and source-read code has run, so a change that happened during
+	 * those callbacks — including an A -> B -> A that lands the original values
+	 * back — stops the write instead of resurrecting it. The provider is invoked at
+	 * most once per operation and a refused or uncertain result is terminal.
+	 */
+	#writeCompletedInput(completed: NativeIoCompletedInput, held: DeferredNativeInput): "settled" | "pending" {
 		const provider = this.#provider;
 		if (provider === null) {
 			this.#diagnostic("input_refused");
-			return;
+			return "settled";
 		}
 		const admitted = this.#inputTarget(completed.source, completed.inputModes);
 		if (admitted === null) {
 			// Stale, foreign, incomplete, or mode-mismatched: no owner-private fact is
 			// consulted and no byte is produced.
 			this.#diagnostic("input_refused");
-			return;
+			return "settled";
 		}
 		const data = this.#translateNativeInput(completed, admitted.modes, {
 			// Canonical content geometry: this endpoint publishes one whole viewport, so
@@ -1524,11 +1654,11 @@ class OwnerBinding implements SessionContentChannelBinding {
 			// Nothing the owner cannot translate reaches a child. This is a quiet refusal,
 			// not a protocol failure: no dialog, no retry, no disconnect.
 			this.#diagnostic("input_refused");
-			return;
+			return "settled";
 		}
 		if (!this.#authorize()) {
 			this.#refuseUnauthorized(this.#subscriptionId ?? undefined);
-			return;
+			return "settled";
 		}
 		// Re-proved after arbitrary authorizer code and immediately before the single
 		// write: these bytes were made for THIS scope and THESE modes, and only the
@@ -1536,7 +1666,40 @@ class OwnerBinding implements SessionContentChannelBinding {
 		const target = this.#inputTarget(completed.source, completed.inputModes);
 		if (target === null) {
 			this.#diagnostic("input_refused");
-			return;
+			return "settled";
+		}
+		if (!this.#heldWorkStillOwns(held)) {
+			// The source read above (or the authorizer) moved the facts this held packet
+			// was admitted under, or its subscription is gone. Discard it: never
+			// retarget, never retranslate against new facts, never write it late.
+			this.#diagnostic("input_refused");
+			return "settled";
+		}
+		// Readiness is proven last of all, immediately before the one write, because
+		// the authorizer and source-read above are arbitrary owner code that can start
+		// a redraw on its way past. A held packet stays queued, counted, and unwritten
+		// and its pass stops; a packet that had not needed holding is put at the front
+		// of the queue for the next wake-up, or refused whole if the backlog is full.
+		const readiness = this.#inputReadiness();
+		// `isReady()` is synchronous OWNER code, so it is the last arbitrary callback
+		// before the byte: it can retire this subscription, replace the run, or publish
+		// an A -> B -> A observation on its way past and still answer "ready". Ownership
+		// is therefore re-proved immediately AFTER that callback and before its answer is
+		// acted on. Nothing that lost its own subscription reaches the provider, and an
+		// old pass never cancels or consumes a replacement subscription's work.
+		if (!this.#heldWorkStillOwns(held)) {
+			this.#diagnostic("input_refused");
+			return "settled";
+		}
+		if (readiness !== "ready") {
+			if (readiness === "unavailable") {
+				this.#cancelUnreadyInput();
+				return "settled";
+			}
+			// A redraw started during the callbacks above. This operation stays queued,
+			// counted, unwritten, and at the FRONT of the queue for the next wake-up:
+			// never dropped, never reordered, never written into the new frame.
+			return "pending";
 		}
 		let outcome: NativeViewerInputResult;
 		try {
@@ -1555,14 +1718,263 @@ class OwnerBinding implements SessionContentChannelBinding {
 			// A refusal before any write is ordinary staleness. Nothing here stops an
 			// owner view, opens a dialog, retries, or disconnects.
 			this.#diagnostic("input_refused");
-			return;
+			return "settled";
 		}
 		if (outcome.status === "unknown") {
 			// The handoff was invoked and its result is genuinely uncertain. It is never
 			// retried and never reported as either delivered or definitely not sent.
 			this.#diagnostic("input_uncertain");
 		}
+		return "settled";
 	}
+
+	/**
+	 * Whether the owner's surface may take input right now.
+	 *
+	 * - `"ready"` — no synchronized redraw is outstanding, or the source offers no
+	 *   seam at all, which keeps the exact direct-write behavior this endpoint had
+	 *   before (#500 compatibility is for sources that never offered the seam).
+	 * - `"held"` — a redraw is in flight; completed input waits before its first
+	 *   owner write.
+	 * - `"unavailable"` — the source DOES offer a seam and this subscription cannot
+	 *   read an answer from it (no watch installed, or the read threw). Never
+	 *   treated as readiness: a broken seam must not become permission to skip the
+	 *   deferral, so the affected work is cancelled and reported instead.
+	 *
+	 * Readiness only orders a redraw; it never authorizes a write, and every write
+	 * still re-proves its own fences.
+	 */
+	#inputReadiness(): InputReadiness {
+		if (!this.#readinessOffered) return "ready";
+		const readiness = this.#readiness;
+		if (readiness === null) return "unavailable";
+		try {
+			return readiness.isReady() ? "ready" : "held";
+		} catch {
+			return "unavailable";
+		}
+	}
+
+	/**
+	 * Fail closed for a seam that was offered but cannot answer: release every held
+	 * operation with no write and refuse the operation being admitted. Both are
+	 * ordinary `input_refused` diagnostics, so the subscription, the owner view, and
+	 * the strict lower manager write gate all stay exactly as they are.
+	 */
+	#cancelUnreadyInput(): void {
+		this.#discardDeferredInputs();
+		this.#diagnostic("input_refused");
+	}
+
+	/**
+	 * Reserve one completed operation in the single FIFO backlog and count its retained
+	 * payload. The two shared bounds — at most {@linkcode MAX_DEFERRED_INPUTS}
+	 * operations, and at most the existing content transfer-byte budget of retained
+	 * payload — govern work that has to WAIT: an operation arriving while something
+	 * else is queued or inside its own handoff is refused whole, zero bytes, when the
+	 * aggregate would cross either bound, and nothing already held changes. An
+	 * operation arriving to an empty backlog is never refused for pressure — it is
+	 * about to be written, not retained.
+	 */
+	#deferInput(completed: NativeIoCompletedInput): boolean {
+		const subscriptionId = this.#subscriptionId;
+		if (subscriptionId === null) return false;
+		const retainedBytes = completed.byteLength;
+		if (!Number.isSafeInteger(retainedBytes) || retainedBytes <= 0) return false;
+		if (this.#deferredInputs.length > 0) {
+			if (this.#deferredInputs.length + 1 > MAX_DEFERRED_INPUTS) return false;
+			if (this.#deferredBytes + retainedBytes > this.#bounds.maxTransferBytes) return false;
+		}
+		this.#deferredInputs.push({
+			completed,
+			subscriptionId,
+			generation: this.#generation,
+			admissionEpoch: this.#inputAdmissionEpoch,
+			factsRevision: this.#inputFactsRevision,
+			retainedBytes,
+			inFlight: false,
+		});
+		this.#deferredBytes += retainedBytes;
+		return true;
+	}
+
+	/**
+	 * True while one held operation may still be written: only from inside the
+	 * drain pass that owns it, on a LIVE and unfenced subscription that is still the
+	 * one that admitted it, under the input facts it was admitted under. Checked both
+	 * before and after every arbitrary owner callback in the write path — including the
+	 * final readiness read — because a callback can end this subscription, replace the
+	 * run, or move the facts (an A -> B -> A included) and still answer helpfully.
+	 */
+	#heldWorkStillOwns(held: DeferredNativeInput): boolean {
+		return this.#state === "subscribed" && !this.#fenced
+			&& this.#inputDrainToken !== null
+			&& held.generation === this.#generation
+			&& held.admissionEpoch === this.#inputAdmissionEpoch
+			&& held.subscriptionId === this.#subscriptionId
+			&& held.factsRevision === this.#inputFactsRevision;
+	}
+
+	/** Take one entry out of the backlog and its byte total, if still queued. */
+	#releaseDeferred(entry: DeferredNativeInput): void {
+		entry.inFlight = false;
+		const index = this.#deferredInputs.indexOf(entry);
+		if (index < 0) return;
+		this.#deferredInputs.splice(index, 1);
+		this.#deferredBytes -= entry.retainedBytes;
+	}
+
+	/**
+	 * Write the held backlog in arrival order once the redraw has settled.
+	 *
+	 * One pass at a time, at most one owner write per operation. The head stays in
+	 * the queue and stays counted while its handoff runs, so an operation admitted
+	 * reentrantly by authorizer or source-read code queues BEHIND it instead of
+	 * seeing a momentarily empty queue and jumping ahead. The pass owns its loop only
+	 * while its generation and admission epoch still match: a retirement or
+	 * reinstallation mid-pass stops it, and its `finally` never clears a newer pass's
+	 * state or consumes the new subscription's entries. A still-held screen stops the
+	 * pass with its backlog intact for the next wake-up; a stale operation is
+	 * discarded, never retargeted; a seam that stops answering cancels the backlog.
+	 * Work that outlives this pass because ownership moved under it is driven once
+	 * more from a clean turn, so a new subscription is never left stranded.
+	 */
+	#drainDeferredInputs(): void {
+		if (this.#deferredInputs.length === 0 || this.#inputDrainToken !== null) return;
+		const generation = this.#generation;
+		const admissionEpoch = this.#inputAdmissionEpoch;
+		const token = {};
+		this.#inputDrainToken = token;
+		let ownershipMoved = false;
+		try {
+			while (this.#deferredInputs.length > 0) {
+				if (this.#inputDrainToken !== token || generation !== this.#generation
+					|| admissionEpoch !== this.#inputAdmissionEpoch) {
+					ownershipMoved = true;
+					return;
+				}
+				if (this.#state !== "subscribed" || this.#fenced) {
+					this.#discardDeferredInputs();
+					return;
+				}
+				const readiness = this.#inputReadiness();
+				// Same rule one level up: the readiness read is owner code, and what it
+				// did must be known before this pass touches its queue on the answer's
+				// strength. A callback that retired or replaced this run stops the pass
+				// here rather than letting it discard or reorder the new pass's entries.
+				if (this.#inputDrainToken !== token || generation !== this.#generation
+					|| admissionEpoch !== this.#inputAdmissionEpoch) {
+					ownershipMoved = true;
+					return;
+				}
+				if (readiness === "unavailable") {
+					this.#cancelUnreadyInput();
+					return;
+				}
+				if (readiness === "held") return;
+				const next = this.#deferredInputs[0];
+				if (next === undefined || next.inFlight) return;
+				if (next.generation !== generation
+					|| next.admissionEpoch !== this.#inputAdmissionEpoch
+					|| next.subscriptionId !== this.#subscriptionId
+					|| next.factsRevision !== this.#inputFactsRevision) {
+					// Source, tuple, geometry, token, mode, or lifecycle moved (an
+					// A -> B -> A included): stale work is dropped where it stands.
+					this.#releaseDeferred(next);
+					this.#diagnostic("input_refused");
+					continue;
+				}
+				// Marked, not removed: this operation is owned, queued, and counted for
+				// its whole handoff, so nothing can overtake it and nothing can write it
+				// twice.
+				next.inFlight = true;
+				const outcome = this.#writeCompletedInput(next.completed, next);
+				if (outcome === "pending") {
+					// A redraw started during the callbacks above: this packet stays
+					// queued, unwritten, and at the front for the next wake-up.
+					next.inFlight = false;
+					return;
+				}
+				this.#releaseDeferred(next);
+			}
+		} finally {
+			if (this.#inputDrainToken === token) {
+				this.#inputDrainToken = null;
+				if (ownershipMoved && this.#deferredInputs.length > 0) {
+					// This pass lost ownership inside a handoff and left a newer
+					// subscription's work queued. Drive it once from a clean turn; the
+					// fresh pass re-proves its own fences and writes nothing it cannot
+					// prove.
+					queueMicrotask(() => this.#drainDeferredInputs());
+				}
+			}
+		}
+	}
+
+	/** Release the held backlog: no late write, no delivery claim, no retry. */
+	#discardDeferredInputs(): void {
+		if (this.#deferredInputs.length === 0 && this.#deferredBytes === 0) return;
+		this.#inputAdmissionEpoch += 1;
+		this.#deferredInputs = [];
+		this.#deferredBytes = 0;
+	}
+
+	/**
+	 * Install this subscription's owner-local redraw-readiness seam.
+	 *
+	 * Absence of the seam is ordinary and keeps the endpoint's direct-write path.
+	 * A seam that IS offered and cannot be installed does not: this subscription
+	 * records that it was offered and then fails closed, so a broken seam can never
+	 * become permission to write into an unfinished redraw.
+	 */
+	#installReadinessWatch(sessionId: string, generation: number): void {
+		if (this.#readiness !== null) return;
+		const watchInputReadiness = this.#options.source.watchInputReadiness;
+		if (typeof watchInputReadiness !== "function") {
+			this.#readinessOffered = false;
+			return;
+		}
+		this.#readinessOffered = true;
+		let watch: OwningHostInputReadinessWatch | undefined;
+		try {
+			watch = watchInputReadiness.call(this.#options.source, sessionId, () => {
+				// A wake-up carrying no authority: a seam whose subscription retired
+				// wakes nothing, and the drain re-proves every fence before any write.
+				if (generation !== this.#generation) return;
+				this.#drainDeferredInputs();
+			});
+		} catch {
+			watch = undefined;
+		}
+		// No watch: the seam was offered and gave nothing to read. Held input is
+		// cancelled and new input refused, never written unchecked.
+		if (watch === undefined) return;
+		if (generation !== this.#generation) {
+			// A reentrant stop owns this install now: adopt nothing, and do not leave
+			// the seam it cannot retire behind.
+			this.#unsubscribeReadiness(watch);
+			return;
+		}
+		this.#readiness = watch;
+	}
+
+	#unsubscribeReadiness(watch: OwningHostInputReadinessWatch): void {
+		try {
+			watch.unsubscribe();
+		} catch {
+			// Contained: this seam observes a redraw and owns no session, viewer, or
+			// transport resource, so its release is never retirement evidence.
+		}
+	}
+
+	/** Retire this binding's readiness seam. Idempotent; a late wake-up is fenced. */
+	#retireReadinessWatch(): void {
+		const watch = this.#readiness;
+		if (watch === null) return;
+		this.#readiness = null;
+		this.#unsubscribeReadiness(watch);
+	}
+
 
 	/**
 	 * The owner's CURRENT input target for one echoed wire source, or null. Every
@@ -1657,6 +2069,11 @@ class OwnerBinding implements SessionContentChannelBinding {
 		this.#ignoredInputId = null;
 		this.#statedSource = null;
 		this.#inputModes = null;
+		// Held work belongs to this subscription: it is released here, never written
+		// afterwards, never claimed as delivered, and never carried into a replacement
+		// subscription. The seam that would have woken it goes too.
+		this.#discardDeferredInputs();
+		this.#retireReadinessWatch();
 	}
 
 	/**
@@ -1763,11 +2180,21 @@ class OwnerBinding implements SessionContentChannelBinding {
 	#noteInputObservation(snapshot: OwningHostSessionContentSnapshot): void {
 		if (this.#provider === null || !this.#nativeIoNegotiated) return;
 		const previousModes = this.#inputModes;
+		const previousSource = this.#statedSource;
 		this.#inputModes = snapshot.inputModes;
-		if (previousModes !== null && !sameInputModes(previousModes, snapshot.inputModes)) {
-			this.#abandonInputAssembly();
-		}
+		const modesChanged = previousModes !== null && !sameInputModes(previousModes, snapshot.inputModes);
+		if (modesChanged) this.#abandonInputAssembly();
 		this.#publishInputSource(snapshot);
+		const sourceChanged = previousSource === null
+			? this.#statedSource !== null
+			: this.#statedSource === null || !nativeIoSourceEquals(previousSource, this.#statedSource);
+		// Every observed move of the facts input admission is proven against counts, so
+		// an A -> B -> A that lands the original values back is still a change, and
+		// work held under the older facts is stale (#500).
+		if (modesChanged || sourceChanged) this.#inputFactsRevision += 1;
+		// A fresh observation is also a moment to settle the held backlog: a redraw can
+		// end without any other wake-up reaching this endpoint.
+		this.#drainDeferredInputs();
 	}
 
 	/* --------------------------------------------------------------------- *

@@ -12,6 +12,7 @@ import test from "node:test";
 const projectRoot = join(dirname(__dirname), "..");
 const workflowPath = join(projectRoot, ".github", "workflows", "ci.yml");
 const releaseWorkflowPath = join(projectRoot, ".github", "workflows", "release.yml");
+const sessionHostWorkflowPath = join(projectRoot, ".github", "workflows", "session-host-alpha.yml");
 
 function readWorkflow(): string {
   return readFileSync(workflowPath, "utf8");
@@ -19,6 +20,10 @@ function readWorkflow(): string {
 
 function readReleaseWorkflow(): string {
   return readFileSync(releaseWorkflowPath, "utf8");
+}
+
+function readSessionHostWorkflow(): string {
+  return readFileSync(sessionHostWorkflowPath, "utf8");
 }
 
 /** Collapse whitespace/newlines so folded YAML block scalars compare as one line. */
@@ -518,8 +523,8 @@ function callerReleaseConditions(): void {
 function callerRunsOnlyAfterAllRequiredChecks(): void {
   const source = readWorkflow();
   const release = releaseJobBlock();
-  assert.match(release, /needs: \[verify, full-tests, windows-launcher, windows-shell\]/,
-    "the publisher must need Linux verification and both native Windows check jobs");
+  assert.match(release, /needs: \[verify, full-tests, windows-launcher, windows-shell, windows-session-host\]/,
+    "the publisher must need Linux verification, both native Windows check jobs, and the native session-host alpha matrix");
   assert.match(source, /^  verify:$/m);
   assert.match(source, /^  full-tests:$/m);
   assert.match(source, /^  windows-shell:$/m);
@@ -528,7 +533,7 @@ function callerRunsOnlyAfterAllRequiredChecks(): void {
   // only as long as the condition is not overridden.
   assert.doesNotMatch(release, /always\(\)|failure\(\)|cancelled\(\)/,
     "overriding the implicit success() guard would let failed or skipped checks publish");
-  for (const neededJob of ["verify", "full-tests", "windows-launcher", "windows-shell"]) {
+  for (const neededJob of ["verify", "full-tests", "windows-launcher", "windows-shell", "windows-session-host"]) {
     const job = blockOf(source, neededJob, 2);
     assert.doesNotMatch(job, /continue-on-error/,
       `a continue-on-error step or job in ${neededJob} would convert failure into success upstream of the publisher`);
@@ -615,6 +620,208 @@ test("release caller passes no secrets and carries the only write grant", () => 
 
 test("reusable release builder independently enforces the same trust boundary", () => {
   reusableReleaseWorkflowMirrorsTheBoundary();
+});
+
+// --- Native Windows session-host alpha matrix caller (issue #211) ----------
+// ci.yml calls .github/workflows/session-host-alpha.yml as a read-only reusable
+// workflow so the native Windows session-host legs become an enforced publication
+// dependency instead of a parallel automatic matrix. These are source-level DAG
+// and trust-boundary contracts. They are NOT proof of live GitHub state: the
+// required-context names a called matrix actually produces, and the repository
+// ruleset that requires them, can only be confirmed from a live run and the live
+// ruleset, neither of which these tests can observe. They also do not claim that
+// a required-context list alone rejects a fabricated skipped conclusion — the
+// design instead keeps every automatic verification path unconditional.
+
+const SESSION_HOST_CALLER_JOB = "windows-session-host";
+
+function sessionHostCallerBlock(): string {
+  return blockOf(readWorkflow(), SESSION_HOST_CALLER_JOB, 2);
+}
+
+/** Evaluate any workflow's top-level concurrency group template for a context. */
+function evaluateConcurrencyGroup(source: string, context: EventContext): string {
+  const start = source.indexOf("\nconcurrency:");
+  assert.ok(start !== -1, "expected a top-level concurrency block");
+  const concurrency = source.slice(start, source.indexOf("\njobs:"));
+  const match = concurrency.match(/^  group: (.+)$/m);
+  assert.ok(match, "expected a concurrency group line");
+  return match[1].replace(/\$\{\{ (.+?) \}\}/g, (_, expression: string) => evaluateGroupExpression(expression, context));
+}
+
+test("ci calls the session-host alpha matrix as an unconditional read-only reusable job", () => {
+  const source = readWorkflow();
+  assert.ok(existsSync(sessionHostWorkflowPath),
+    "the called matrix workflow must exist in the checkout: a missing callee fails closed at workflow-parse time, and a caller pointing at an absent file must never be tolerated");
+  assert.match(source, new RegExp(`^  ${SESSION_HOST_CALLER_JOB}:$`, "m"),
+    "the caller job id must stay stable for the publisher's needs list");
+  const job = sessionHostCallerBlock();
+  assert.match(job, /uses: \.\/\.github\/workflows\/session-host-alpha\.yml$/m,
+    "the caller must invoke the local reusable matrix workflow by relative path");
+  // Unconditional on every enforced trigger path: an `if:` here would be a way
+  // to skip the native legs out of the publisher's dependency set, and a
+  // `needs:` here would let an earlier failure skip the matrix instead of
+  // reporting it.
+  assert.doesNotMatch(job, /^ {4}(if|needs):/m,
+    "the caller must carry no if:/needs: so the matrix runs on every enforced trigger path and can never be skipped out of the publisher's dependency set");
+  assert.match(jobPermissions(job) ?? "", /^      contents:\s*read$/m,
+    "the caller-side grant must stay read-only so the effective token cannot widen");
+  assert.doesNotMatch(job, /^ {4}(secrets|with):/m,
+    "no secret or input may be passed to the read-only verification matrix");
+  assert.doesNotMatch(job, /runs-on:|steps:/,
+    "a reusable-workflow job carries no runner or steps of its own");
+  assert.doesNotMatch(job, /continue-on-error/,
+    "the caller must not tolerate a failed matrix leg");
+  // The caller itself must never be able to publish.
+  assert.doesNotMatch(job, /contents:\s*write|gh release|uses: \.\/\.github\/workflows\/release\.yml/,
+    "the verification caller must carry no publish path");
+});
+
+test("publication depends on all eight verification legs and the Windows matrix still runs once", () => {
+  const source = readWorkflow();
+  const alpha = readSessionHostWorkflow();
+  const alphaOn = alpha.slice(alpha.indexOf("\non:"));
+  // The matrix no longer starts on its own: ci.yml is the only automatic path,
+  // so exactly one automatic Windows session-host matrix runs per CI run.
+  assert.match(alphaOn.slice(0, alphaOn.indexOf("\npermissions:")), /^  workflow_call:$/m,
+    "the matrix must stay callable by ci.yml");
+  assert.doesNotMatch(alphaOn.slice(0, alphaOn.indexOf("\npermissions:")), /^  (pull_request|push):/m,
+    "an independent pull_request/push trigger would run a duplicate automatic Windows matrix beside the caller");
+  assert.match(alphaOn, /^  workflow_dispatch:$/m,
+    "the targeted single-commit host run must remain available");
+
+  // Eight real verification legs gate publication: three Verify floors, the full
+  // suite, the two native Windows jobs, and the matrix's two Node lines.
+  const verifyMatrix = blockOf(source, "verify", 2).match(/node-version: \[([^\]]+)\]/);
+  assert.ok(verifyMatrix, "the verify matrix must stay declared");
+  const verifyLegs = verifyMatrix![1].split(",").map((entry) => entry.trim());
+  assert.deepEqual(verifyLegs, ["22.23.4", "24.22.1", "26.12.1"], "three Verify legs at the exact patched floors");
+  const alphaMatrix = alpha.match(/node-version: \[([^\]]+)\]/);
+  assert.ok(alphaMatrix, "the alpha matrix must stay declared");
+  const alphaLegs = alphaMatrix![1].split(",").map((entry) => entry.trim());
+  assert.deepEqual(alphaLegs, ["22.23.4", "24.22.1"], "the matrix contributes exactly two native legs");
+  assert.equal(verifyLegs.length + 1 + 2 + alphaLegs.length, 8,
+    "verify legs + full suite + two native Windows jobs + two native session-host legs = eight verification legs");
+  const release = releaseJobBlock();
+  for (const needed of ["verify", "full-tests", "windows-launcher", "windows-shell", SESSION_HOST_CALLER_JOB]) {
+    assert.ok(release.includes(needed), `the publisher must still need ${needed}`);
+  }
+  // No duplicated full suite or Windows matrix inside the callee: it runs its
+  // own focused native tiers only.
+  assert.doesNotMatch(alpha, /npm run test:run|npm run test:integration|dist-test\/tests\/\*\.test\.js/,
+    "the called matrix must stay focused; the full suite stays in full-tests");
+  assert.equal((source.match(/runs-on: windows-latest/g) ?? []).length, 2,
+    "ci.yml itself keeps exactly two automatic Windows jobs; the third native matrix arrives only through the callee");
+});
+
+test("matrix keeps its fail-closed prerequisites, pins, and deadlines while reused", () => {
+  const alpha = readSessionHostWorkflow();
+  assert.equal((alpha.match(/PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"/g) ?? []).length, 2,
+    "both opt-in fail-closed native acceptance steps must survive the reuse conversion");
+  for (const required of [
+    "Real public Windows ConPTY Main acceptance (opt-in, fail-closed)",
+    "Real source launcher acceptance (cmd and direct PowerShell, opt-in, fail-closed)",
+    "Named-pipe broker/reporter/protocol component tests",
+    "Pure Windows helper-contract tests",
+    "Real pinned-provider Windows workspace completion regression",
+  ]) {
+    assert.ok(alpha.includes(`- name: ${required}`), `the reused matrix must retain the ${required} step`);
+  }
+  // Unchanged finite bounds and read-only posture.
+  assert.match(alpha, /^    timeout-minutes: 45$/m, "the job budget must stay unchanged");
+  assert.match(alpha, /timeout-minutes: 10\n/, "the Main acceptance step cap must stay unchanged");
+  assert.match(alpha, /timeout-minutes: 20\n/, "the launcher acceptance step cap must stay unchanged");
+  assert.doesNotMatch(alpha, /continue-on-error/, "no step may tolerate a missing prerequisite");
+  assert.doesNotMatch(alpha, /^ *if:/m, "no condition may skip an enforced native leg");
+  assert.match(alpha, /^permissions:\n  contents: read$/m, "the reused matrix stays read-only");
+  assert.doesNotMatch(alpha, /contents:\s*write|secrets:|workflows:/,
+    "reuse must not add a write grant or any secret surface");
+  const alphaPins = pinnedActions(alpha);
+  const ciPins = pinnedActions(readWorkflow());
+  for (const reference of alphaPins) {
+    assert.ok(ciPins.has(reference), `${reference} must stay pinned identically to ci.yml`);
+  }
+  assert.ok(alphaPins.size >= 2, "checkout and setup-node must stay SHA-pinned");
+});
+
+test("matrix concurrency can never cancel the caller, another PR head, or a main publication run", () => {
+  const source = readWorkflow();
+  const alpha = readSessionHostWorkflow();
+  const mainSha = "a".repeat(40);
+  const contexts: EventContext[] = [
+    { eventName: "push", sha: mainSha },
+    { eventName: "workflow_dispatch", sha: mainSha },
+    { eventName: "pull_request", sha: "c".repeat(40), headRef: "feature-x", pullRequestNumber: 7 },
+  ];
+  for (const context of contexts) {
+    const caller = evaluateConcurrencyGroup(source, context);
+    const callee = evaluateConcurrencyGroup(alpha, context);
+    assert.notEqual(callee, caller,
+      `the matrix must never share the caller's pending slot (${context.eventName})`);
+    assert.ok(callee.startsWith("session-host-alpha-"), `unexpected matrix group: ${callee}`);
+    assert.ok(caller.startsWith("ci-"), `unexpected caller group: ${caller}`);
+  }
+  // A matrix run of one event can never replace another event's run, and a
+  // targeted dispatch can never cancel the main push that publishes.
+  assert.notEqual(
+    evaluateConcurrencyGroup(alpha, { eventName: "push", sha: mainSha }),
+    evaluateConcurrencyGroup(alpha, { eventName: "workflow_dispatch", sha: mainSha }),
+    "a manual matrix dispatch must not share the main push group"
+  );
+  assert.notEqual(
+    evaluateConcurrencyGroup(alpha, { eventName: "pull_request", sha: "d".repeat(40), pullRequestNumber: 1 }),
+    evaluateConcurrencyGroup(alpha, { eventName: "pull_request", sha: "e".repeat(40), pullRequestNumber: 2 }),
+    "distinct PRs must not share a matrix group"
+  );
+  assert.match(alpha, /^  cancel-in-progress: false$/m,
+    "the matrix must never cancel a run: PR supersession belongs to the caller's own PR-only cancellation");
+  assert.doesNotMatch(withoutComments(source), /cancel-in-progress: *true/,
+    "ci.yml cancellation must stay event-conditional so a main push is never cancelled");
+});
+
+test("failed, skipped, cancelled, missing, and stale matrix outcomes keep publication blocked", () => {
+  const source = readWorkflow();
+  const release = releaseJobBlock();
+  const job = sessionHostCallerBlock();
+  // Failed or cancelled matrix leg: the caller job's conclusion is derived from
+  // the called workflow's jobs, and the publisher keeps GitHub's implicit
+  // success() guard, so it cannot run on a failed or cancelled dependency.
+  assert.doesNotMatch(release, /always\(\)|failure\(\)|cancelled\(\)|!cancelled\(\)/,
+    "overriding the implicit success() guard would let a failed, cancelled, or skipped matrix publish");
+  // Skipped: nothing on the enforced path may skip the matrix, so a skipped
+  // dependency can only come from a real problem, which the implicit guard blocks.
+  assert.doesNotMatch(job, /^ {4}if:/m, "a conditional caller could be skipped out of the dependency set");
+  assert.doesNotMatch(readSessionHostWorkflow(), /^ *if:/m, "a conditional matrix job or step could be skipped out of the dependency set");
+  assert.doesNotMatch(withoutComments(source), /secrets:\s*inherit/, "reuse must not widen the secret blast radius");
+  // Missing: the callee must exist and stay read-only, or the whole run fails to
+  // parse rather than publishing unverified.
+  assert.ok(existsSync(sessionHostWorkflowPath), "the callee workflow must exist");
+  // Stale: reuse adds no second publish path and no event that could publish a
+  // commit other than the exact merged main SHA the publisher re-validates.
+  assert.equal(flattened(releaseJobCondition()), RELEASE_IF,
+    "the publisher condition must stay pinned to the original push/main/repository even with the extra dependency");
+  assert.doesNotMatch(readSessionHostWorkflow(), /gh (release|pr merge|workflow run|repo deploy)|make release|npm publish/,
+    "the reused matrix must not gain a publish path");
+});
+
+test("the six original CI check names stay stable and the new caller name is distinct", () => {
+  const source = readWorkflow();
+  const stableNames = [
+    "name: Verify (Node ${{ matrix.node-version }})",
+    "name: Full suite (Node 24)",
+    "name: Windows launcher (Node 22.23.4)",
+    "name: Windows shell (Node 24)",
+    "name: Publish numbered prerelease",
+  ];
+  for (const name of stableNames) {
+    assert.ok(source.includes(name), `existing check name must stay byte-identical: ${name}`);
+  }
+  const callerName = sessionHostCallerBlock().match(/^    name: (.+)$/m);
+  assert.ok(callerName, "the caller job must carry an explicit stable name");
+  assert.doesNotMatch(callerName![1], /Verify|Full suite|Windows launcher|Windows shell|Publish/,
+    "the new caller's check name must not shadow an existing required-check name");
+  // What the live contexts actually are (including the names the called matrix
+  // contributes) is confirmed from a live run plus the ruleset, not from here.
 });
 
 test("windows launcher job runs the native .cmd coverage on every enforced trigger path", () => {

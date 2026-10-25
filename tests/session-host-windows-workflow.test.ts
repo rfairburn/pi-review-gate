@@ -72,17 +72,27 @@ function stepOf(job: string, name: string): string {
   return nextStep === -1 ? after : after.slice(0, nextStep);
 }
 
-test("alpha workflow triggers cover pull requests, main pushes, and manual dispatch", () => {
+test("alpha workflow is reusable-call plus manual dispatch only, with no independent automatic trigger", () => {
   const source = readAlpha();
   const on = onBlock(source);
-  assert.match(on, /^  pull_request:$/m, "pull_request must be enabled and unrestricted");
-  assert.match(on, /^  workflow_dispatch:$/m, "manual dispatch must be enabled");
-  assert.match(on, /^  push:$/m, "push must be enabled");
-  const push = on.slice(on.indexOf("  push:"));
-  assert.match(push, /^    branches:$/m);
-  assert.match(push, /^      - main$/m, "push must be limited to main");
+  assert.match(on, /^  workflow_call:$/m,
+    "ci.yml must be able to call this matrix as a reusable workflow");
+  assert.match(on, /^  workflow_dispatch:$/m,
+    "the targeted single-commit host run must stay available");
+  // Removing the independent pull_request/push triggers is what keeps the
+  // automatic Windows matrix running exactly once per CI run (through ci.yml)
+  // instead of twice. Nothing here may quietly re-add an automatic path.
+  assert.doesNotMatch(on, /^  pull_request:/m,
+    "an independent pull_request trigger would run a second automatic Windows matrix beside the ci.yml caller");
+  assert.doesNotMatch(on, /^  push:/m,
+    "an independent push trigger would duplicate the main-push matrix the ci.yml caller already provides");
   assert.doesNotMatch(source, /pull_request_target|workflow_run|schedule:/,
     "no alternate trigger path may reach the alpha matrix");
+  // The reusable entry point takes no inputs and no secrets: the matrix reads
+  // only the event's own read-only token.
+  assert.doesNotMatch(on, /^\s+(inputs|secrets):/m,
+    "the reusable interface must stay empty: no inputs and no callable secret surface");
+  assert.equal((source.match(/^on:$/gm) ?? []).length, 1, "exactly one on: block");
 });
 
 test("alpha workflow keeps least-privilege read-only permissions", () => {
@@ -94,15 +104,47 @@ test("alpha workflow keeps least-privilege read-only permissions", () => {
     "no write-scoped permission or inherited secret is allowed");
 });
 
-test("alpha concurrency groups never collide across event types or distinct PRs", () => {
+function alphaConcurrency(source: string): string {
+  return source.slice(source.indexOf("concurrency:"), source.indexOf("\njobs:"));
+}
+
+function groupLine(concurrency: string): string {
+  const match = concurrency.match(/^  group: (.+)$/m);
+  assert.ok(match, "expected a concurrency group line");
+  return match[1];
+}
+
+test("alpha concurrency namespace is a fixed prefix that can never collide with ci.yml and never cancels another run", () => {
   const source = readAlpha();
-  const concurrency = source.slice(source.indexOf("concurrency:"), source.indexOf("\njobs:"));
+  const concurrency = alphaConcurrency(source);
   assert.match(concurrency,
-    /group: session-host-alpha-\$\{\{ github\.workflow \}\}-\$\{\{ github\.event_name \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.sha \}\}/,
-    "groups must be separated by event type and keyed by PR number for pull requests, falling back to the commit SHA");
-  assert.match(concurrency, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/);
-  assert.doesNotMatch(source, /cancel-in-progress: *true/, "cancellation must stay limited to pull_request events");
+    /group: session-host-alpha-\$\{\{ github\.event_name \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.sha \}\}/,
+    "groups must keep the event separator and the PR-number/SHA key, under a fixed literal prefix");
+  // `github.workflow` is the CALLER's name inside a reusable workflow, so
+  // interpolating it here would namespace this group by whoever called it and
+  // could put the matrix in ci.yml's own namespace.
+  assert.doesNotMatch(concurrency, /github\.workflow/,
+    "a called workflow inherits the caller's github.workflow: the group prefix must stay a fixed literal so the matrix can never land in the caller's pending slot");
+  assert.equal(groupLine(concurrency).split("-")[0], "session",
+    "the fixed prefix keeps its own namespace");
+  assert.match(concurrency, /^  cancel-in-progress: false$/m,
+    "a called or dispatched matrix run must never cancel the caller's run, another PR head's run, or a main-push publication run");
+  assert.doesNotMatch(source, /cancel-in-progress: *(true|\$\{)/,
+    "no conditional or unconditional cancellation may return to this workflow");
   assert.doesNotMatch(concurrency, /github\.head_ref/, "grouping by head branch name lets same-named fork branches cancel each other's runs");
+
+  // Disjoint namespaces: the alpha prefix can never equal ci.yml's prefix for
+  // any event/key combination, so the two workflows never share a pending slot.
+  const ciConcurrency = readCi().slice(readCi().indexOf("concurrency:"), readCi().indexOf("\njobs:"));
+  const ciPrefix = groupLine(ciConcurrency).slice(0, groupLine(ciConcurrency).indexOf("${{"));
+  const alphaPrefix = groupLine(concurrency).slice(0, groupLine(concurrency).indexOf("${{"));
+  assert.notEqual(alphaPrefix, ciPrefix, "the matrix and CI must not share a concurrency namespace");
+  assert.ok(ciPrefix.startsWith("ci-") && alphaPrefix.startsWith("session-host-alpha-"),
+    `unexpected concurrency prefixes: ci=${ciPrefix} alpha=${alphaPrefix}`);
+  // ci.yml keeps the PR-only cancellation that supersedes a stale PR head
+  // (which tears down that head's matrix legs as children of the caller run).
+  assert.match(ciConcurrency, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/,
+    "PR-head supersession must stay where it cannot cancel another workflow's run: in the caller");
 });
 
 test("every alpha action is pinned to an immutable commit SHA matching ci.yml", () => {

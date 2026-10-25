@@ -28,7 +28,13 @@ closed before any write:
   workflow-level conditions and the scripts re-validate the environment, so
   `workflow_dispatch`, forks, and other refs are refused. CI additionally invokes the
   builder only after all verification dependencies (`verify`, `full-tests`,
-  `windows-launcher`, and `windows-shell`) succeeded. The `verify` matrix runs the
+  `windows-launcher`, `windows-shell`, and `windows-session-host`) succeeded. The
+  `windows-session-host` dependency is CI's read-only reusable call of the native Windows
+  session-host acceptance matrix, so the matrix's two Node legs gate publication; that
+  matrix no longer triggers on its own `pull_request`/`push` events and therefore runs
+  exactly once per CI run, while its targeted `workflow_dispatch` path stays available.
+  Its concurrency group uses a fixed prefix with cancellation disabled, so it can never
+  cancel the calling CI run or a `main` publication run. The `verify` matrix runs the
   exact per-line Node security floors 22.23.4, 24.22.1, and 26.12.1 (see
   [Node.js security floors](getting-started.md#nodejs-security-floors)). The full suite
   and the Windows shell job run on Node 24.22.1, and the Windows launcher job runs on
@@ -37,6 +43,12 @@ closed before any write:
   failed or was skipped. There is no `workflow_run`
   privilege chain, no custom PAT, and no GitHub App; the only write permission anywhere
   is `contents: write` on the single publish job.
+  Eight verification legs sit upstream of that guard in total. The dependency is enforced
+  by keeping every automatic verification path unconditional (no job-level `if:` on the
+  matrix or its caller, no `continue-on-error`, no `always()`/`failure()`/`cancelled()`
+  override) rather than by counting required contexts: GitHub's required-status-check
+  configuration itself does not reject a skipped or neutral conclusion, and the merge gate
+  is exact-head while publication is re-validated against the exact merged commit.
 - The target SHA is the exact `merge_commit_sha` of a merged pull request against
   `main` of this repository. The commit-to-pull-request association endpoint returns
   simplified items without the detailed merge flag, so every associated candidate is

@@ -1,41 +1,54 @@
-# Separate alpha-runtime CI matrix for the native Windows session host.
+# Reusable alpha-runtime CI matrix for the native Windows session host.
 #
-# This workflow is deliberately separate from ci.yml: it adds a read-only
-# windows-latest acceptance job (pull requests, pushes to main, and manual
-# dispatch) that runs the opt-in real public Main/ConPTY test, the opt-in real
-# source-launcher acceptance for BOTH shipped Windows wrappers, plus the
-# focused named-pipe broker/reporter/protocol component tests and the pure
-# Windows helper-contract regressions. It never publishes, merges, or deploys;
-# it grants no write permission anywhere; and it changes nothing in the
-# ordinary CI or release policy. Under the opt-in gate every missing
+# This workflow is deliberately separate from ci.yml: it owns a read-only
+# windows-latest acceptance matrix that runs the opt-in real public Main/ConPTY
+# test, the opt-in real source-launcher acceptance for BOTH shipped Windows
+# wrappers, plus the focused named-pipe broker/reporter/protocol component tests
+# and the pure Windows helper-contract regressions. It is invoked as a reusable
+# workflow by ci.yml on every enforced CI trigger (pull requests, pushes to main,
+# and manual dispatch), so the automatic matrix runs exactly once per CI run and
+# ci.yml's publish job can require it. The matrix no longer starts independently
+# on pull_request/push: a second automatic Windows matrix would duplicate the
+# same legs. The targeted workflow_dispatch path below stays available for
+# investigating one commit without a PR.
+#
+# It never publishes, merges, or deploys; it grants no write permission anywhere;
+# it receives no secrets and no broadened token permissions; and it changes
+# nothing in the ordinary release policy. Under the opt-in gate every missing
 # prerequisite (pinned Pi runtime, ConPTY/node-pty, PowerShell, Python 3) is a
-# hard failure, never a skip, on every enforced trigger path.
+# hard failure, never a skip, on every enforced trigger path. Every existing job,
+# step, and test deadline is unchanged by this reuse conversion.
 
 name: Session host alpha (Windows)
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
+  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Same event-separated concurrency safety as ci.yml, under its own group
-# prefix so this alpha matrix can never cancel or replace an ordinary CI run
-# (or vice versa). PR runs group per PR number; push/dispatch runs group per
-# unique commit SHA.
+# Concurrency groups are repository-wide rather than private to the workflow
+# that declares one, so this group keeps a fixed `session-host-alpha-` prefix
+# that can never equal ci.yml's `ci-` prefix, is separated by event type, and is
+# keyed by PR number for pull requests with the commit SHA as fallback, exactly
+# like ci.yml's grouping. Cancellation is deliberately off: superseded PR heads
+# are cancelled by ci.yml's pull-request-only cancellation of the caller run,
+# which already tears down the matrix legs of that superseded head, so this
+# workflow needs none of its own. Repeated manual dispatches of one SHA
+# therefore serialize, and neither a called matrix nor a targeted dispatch
+# cancels a main-push run that is publishing.
 concurrency:
-  group: session-host-alpha-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: session-host-alpha-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: false
 
 jobs:
   windows-acceptance:
-    # Stable check name for optional required-check configuration. This
-    # workflow does not configure branch protection; renaming could break
-    # a separately configured required-check setting.
+    # Stable check name: this job name is the emitted check name, coordinated
+    # with the qualified caller contexts actually produced and the live
+    # protection configuration. This workflow does not configure branch protection
+    # and does not state which contexts are required today; renaming means
+    # checking that live configuration first.
     name: Windows session host alpha (Node ${{ matrix.node-version }})
     runs-on: windows-latest
     # Finite job budget: the opt-in Main acceptance is bounded by its own

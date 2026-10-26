@@ -18,11 +18,13 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { visibleWidth } from "pi-session-host-tui";
 import { normalizeConfig } from "../src/config";
 import { registerReviewSettings } from "../src/settings/command";
 import { setMenuTuiHost } from "../src/settings/menu";
 import {
   __resetActiveNativeEditorFieldForTest,
+  NATIVE_EDITOR_FIELD_HINT,
   setNativeEditorHost,
   setNativeEditorHostEntryProvider as setNativeEditorHostEntryProviderForTest,
 } from "../src/native-editor-bridge";
@@ -502,6 +504,8 @@ test("in the interactive TUI a text field opens through the native editor bridge
   const registered = commandHarness();
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
+  const rewrittenInstructions = "Rewritten instructions ".repeat(10).trimEnd();
+  const fieldFrames: Array<{ width: number; lines: string[] }> = [];
   // Interactive TUI context: menus render through ui.custom (fake host) and
   // the instructions field opens through the host-wired native editor bridge
   // — the same embedded host editor every other text field uses. The public
@@ -511,10 +515,13 @@ test("in the interactive TUI a text field opens through the native editor bridge
     tuiKeys(KEY_ENTER), // list → task entry (row 0)
     tuiKeys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
     async (component) => {
-      const frame = component.render!(80).join("\n");
-      assert.ok(frame.includes("Check the docs for staleness"), `the current instructions are the field prefill: ${frame}`);
+      for (const width of [100, 140]) {
+        const frame = component.render!(width);
+        assert.ok(frame.join("\n").includes("Check the docs for staleness"), "the current instructions are the field prefill");
+        fieldFrames.push({ width, lines: frame });
+      }
       component.handleInput?.(CTRL_U); // clear the prefill
-      typeText(component, "Rewritten instructions");
+      typeText(component, rewrittenInstructions);
       component.handleInput?.(ENTER); // submit through the bridge
     },
     tuiKeys(...Array(8).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 12)
@@ -524,12 +531,17 @@ test("in the interactive TUI a text field opens through the native editor bridge
 
   await registered.handler("", harness.ctx);
 
+  for (const { width, lines } of fieldFrames) {
+    assert.ok(visibleWidth(lines[0]!) <= width, "settings title fits the available cells");
+    assert.ok(visibleWidth(lines.at(-1)!) <= width, "settings hint fits the available cells");
+    if (width === 140) assert.equal(lines.at(-1), NATIVE_EDITOR_FIELD_HINT, "fitting default hint is unchanged");
+  }
   assert.equal(instances.length, 1, "exactly one embedded host editor instance for the field");
   assert.equal(harness.editorCalls.length, 0, "the public editor chain is not used in the interactive TUI");
   assert.equal(harness.customCount(), 7, "six menus plus the bridge field surface");
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.equal(saved.scheduledTasks["task-abcdef12"].instructions, "Rewritten instructions");
+  assert.equal(saved.scheduledTasks["task-abcdef12"].instructions, rewrittenInstructions, "Save retains the full value, longer than either render width");
 });
 
 test("an interactive TUI without the native editor seams fails closed: error notice, nothing staged", async (t) => {

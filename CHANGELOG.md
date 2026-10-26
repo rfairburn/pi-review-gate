@@ -15,6 +15,14 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.204]
+
+### Fixed
+
+- Native settings text-field titles and key hints now truncate to the available
+  terminal-cell width, including ANSI-styled and wide text (#212). Fitting display
+  text and the full editable value remain unchanged.
+
 ## [0.1.0-dev.203]
 
 ### Changed

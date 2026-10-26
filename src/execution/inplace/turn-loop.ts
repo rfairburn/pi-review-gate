@@ -1,7 +1,10 @@
 import { DEFAULT_EXECUTION_RETRY_POLICY, executorAgentFingerprint, type ReviewGateConfig } from "../../config";
-import { recordObservedToolEventEvidence, type EvidenceState } from "../../evidence";
+import { compareFileSnapshots, createPathSnapshot, withoutSnapshotContent, type FileSnapshot, type SnapshotOptions } from "../../capture";
+import { recordObservedToolEventEvidence, isObservablePathAddress, type EvidenceEvent, type EvidenceState } from "../../evidence";
+import { expandHomePath } from "../../apply-patch/paths";
+import { resolve } from "node:path";
 import { isReviewableToolObservation } from "../../review-evidence";
-import type { ExecutorAdapter, ExecutorLiveControl, ExecutorSession, ExecutorTurn, SubtaskDispatchRecord, SubtaskProgressUpdate } from "../types";
+import type { ExecutorAdapter, ExecutorLiveControl, ExecutorSession, ExecutorToolObservation, ExecutorTurn, SubtaskDispatchRecord, SubtaskProgressUpdate } from "../types";
 import type { WaveWorkerTask } from "../wave-worker";
 import type { ExecutorPoolAssignment } from "../executor-pool";
 import {
@@ -39,6 +42,35 @@ interface InPlaceChildProcessSettlement {
   pid: number;
   processGroupId?: number;
   exitedAt?: string;
+}
+
+/** One reviewable observation offered to the caller's same-pass eligibility
+ * classification. `paths` are the recorder's original usable spellings; they
+ * are transient classification input and are never displayed or persisted. */
+export interface InPlaceObservationActivity {
+  event: EvidenceEvent;
+  paths: string[];
+  /** Present only when the same candidate identities had a captured boundary
+   * change. Boundary delivery may race the child mutation, so this is
+   * best-effort effect evidence, not a verified prestate, authorship proof, or
+   * a diff. Incomplete or unpaired boundaries are simply not affirmative. */
+  capturedEffect?: true;
+}
+
+/** Compare candidate observations from one operation's boundaries by normalized
+ * absolute identity. Each matching identity is evaluated independently: an
+ * unavailable, missing, or unpaired candidate contributes no evidence, but it
+ * must not veto a known change to another candidate. Incomplete capture alone
+ * still cannot fabricate activity. */
+function boundaryChanged(
+  pre: Map<string, FileSnapshot | undefined>, post: Map<string, FileSnapshot | undefined>,
+): boolean {
+  for (const [identity, before] of pre) {
+    const after = post.get(identity);
+    if (!before || !after || (before.exists && before.sha256 === null) || (after.exists && after.sha256 === null)) continue;
+    if (compareFileSnapshots(before, after)) return true;
+  }
+  return false;
 }
 
 /** Local failure classifier for in-place turns: same taxonomy, no checkpoint stage. */
@@ -201,7 +233,11 @@ export async function runInplaceTurnLoop(input: {
   onUpdate?: (update: SubtaskProgressUpdate) => void;
   onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
   /** Called once per observation the shared classification counts as reviewable work. */
-  onQualifyingObservation?: () => void;
+  onQualifyingObservation?: (observation: InPlaceObservationActivity) => void;
+  /** Same-pass confirmation narrows eligibility to reported operation effects,
+   * so capture the canonical pre/post candidate observations at the tool-event
+   * boundaries. Other windows keep their existing reviewable-call rule. */
+  trackObservationEffects?: boolean;
 }): Promise<RecoveredInPlaceRun> {
   const retryPolicy = input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY;
   const incidents: ExecutionIncident[] = [];
@@ -247,6 +283,55 @@ export async function runInplaceTurnLoop(input: {
 
       let turn: ExecutorTurn | undefined;
       let thrown: unknown;
+      // Per-attempt transient boundary evidence. It is derived from the same
+      // bounded candidate snapshots used elsewhere, never persisted, and never
+      // a second event or review ledger. Paths that cannot be observed safely
+      // (redacted, truncated, marker-bearing) supply no comparison at all, so
+      // eligibility stays affirmative rather than guessing.
+      const observationStarts = new Map<string, { pre: Map<string, Promise<FileSnapshot | undefined>> }>();
+      const pendingObservationEffects: Array<{
+        event: EvidenceEvent;
+        paths: string[];
+        pre?: Map<string, Promise<FileSnapshot | undefined>>;
+        post: Map<string, Promise<FileSnapshot | undefined>>;
+      }> = [];
+      const snapshotOptions: SnapshotOptions = {
+        maxFileBytes: input.config.maxFileBytes,
+        maxSnapshotBytes: input.config.maxSnapshotBytes,
+        ...(input.signal ? { signal: input.signal } : {}),
+      };
+      // Boundary snapshots are keyed by normalized absolute identity, never by
+      // array position: a supported observation may list the same candidates in
+      // a different order at each stage, and different files must never be
+      // compared as one pair.
+      const boundaryObservations = (paths: string[]): Map<string, Promise<FileSnapshot | undefined>> => {
+        const snapshots = new Map<string, Promise<FileSnapshot | undefined>>();
+        for (const path of paths.filter(isObservablePathAddress)) {
+          const identity = resolve(input.workspaceRoot, expandHomePath(path));
+          if (!snapshots.has(identity)) {
+            snapshots.set(identity, createPathSnapshot(input.workspaceRoot, identity, snapshotOptions)
+              .then(withoutSnapshotContent).catch(() => undefined));
+          }
+        }
+        return snapshots;
+      };
+      const observationKey = (event: ExecutorToolObservation) => event.observationId ?? event.toolName;
+      const settleObservationEffects = async (): Promise<void> => {
+        while (pendingObservationEffects.length > 0) {
+          const batch = pendingObservationEffects.splice(0);
+          for (const pending of batch) {
+            const pre = pending.pre
+              ? new Map(await Promise.all([...pending.pre].map(async ([identity, snapshot]) => [identity, await snapshot] as const)))
+              : undefined;
+            const post = new Map(await Promise.all([...pending.post].map(async ([identity, snapshot]) => [identity, await snapshot] as const)));
+            input.onQualifyingObservation?.({
+              event: pending.event,
+              paths: pending.paths,
+              ...(pre && boundaryChanged(pre, post) ? { capturedEffect: true as const } : {}),
+            });
+          }
+        }
+      };
       const warning = input.evidence.reviewEvidenceNotes?.filter((note) => note.startsWith("WARNING: InPlace")).at(-1);
       if (warning && !prompt.includes(warning)) prompt = `${warning}\n\n${prompt}`;
       try {
@@ -269,8 +354,7 @@ export async function runInplaceTurnLoop(input: {
           }),
           onLiveControl: input.onLiveControl,
           onToolObservation: (event) => {
-            const retained = input.evidence.events.length;
-            recordObservedToolEventEvidence({
+            const { event: observation, observedPaths } = recordObservedToolEventEvidence({
               state: input.evidence,
               cwd: input.workspaceRoot,
               selectedRoot: input.baseline.workspaceRoot,
@@ -283,18 +367,32 @@ export async function runInplaceTurnLoop(input: {
               isError: event.isError,
             });
             // Classify every observation, including ones a full bounded ledger
-            // no longer retains, with the shared reviewable-work classification.
-            // Overflowed observations are classified by metadata only, never by
-            // re-reading raw tool input: non-read-only names qualify by name.
-            const recorded = input.evidence.events.length > retained ? input.evidence.events.at(-1) : undefined;
-            if (isReviewableToolObservation(recorded ?? {
-              sequence: 0,
-              phase: event.stage === "start" ? "tool_call" : "tool_result",
-              toolName: event.toolName || "unknown",
-              summary: "",
-              candidatePaths: [],
-              riskSignals: event.isError && event.stage === "end" ? ["tool_result_error"] : [],
-            })) input.onQualifyingObservation?.();
+            // no longer retains, from the recorder's canonical projection.
+            const reviewable = isReviewableToolObservation(observation);
+            const tracking = input.trackObservationEffects === true;
+            if (event.stage === "start") {
+              const pre = tracking ? boundaryObservations(observedPaths) : undefined;
+              if (pre) observationStarts.set(observationKey(event), { pre });
+              // A call can still establish observed outside-root scope, but not
+              // an effect; call-only in-root activity stays non-qualifying here.
+              if (reviewable) input.onQualifyingObservation?.({ event: observation, paths: observedPaths });
+              // Returning the pending boundary capture lets a caller that owns
+              // the operation (or a test fixture) align its mutation with the
+              // observation, while ordinary adapters keep their existing flow.
+              return pre ? Promise.all(pre.values()).then(() => undefined) : undefined;
+            }
+            if (!reviewable) return;
+            if (!tracking) {
+              input.onQualifyingObservation?.({ event: observation, paths: observedPaths });
+              return;
+            }
+            const startKey = observationKey(event);
+            const start = observationStarts.get(startKey);
+            observationStarts.delete(startKey);
+            const post = boundaryObservations(observedPaths);
+            pendingObservationEffects.push({ event: observation, paths: observedPaths, ...(start ? { pre: start.pre } : {}),
+              post });
+            return Promise.all(post.values()).then(() => undefined);
           },
           // #93: the authoritative dispatch capture fires at the transport
           // delivery boundary. In-place dispatches name the in-place workspace
@@ -363,6 +461,7 @@ export async function runInplaceTurnLoop(input: {
       } catch (error) {
         thrown = error;
       } finally {
+        await settleObservationEffects();
         input.onLiveControl?.(undefined);
       }
 

@@ -1,4 +1,5 @@
 import { join, resolve } from "node:path";
+import { isOutsideObservedPath } from "../../review-evidence";
 import { DEFAULT_EXECUTION_RETRY_POLICY, type ReviewGateConfig } from "../../config";
 import { captureObservedToolPathAfterStates, recordToolEventObservability, type EvidenceState } from "../../evidence";
 import { createExecutorAdapter } from "../adapters/factory";
@@ -59,6 +60,8 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
   priorSession?: ExecutorSession;
   evidence: EvidenceState;
   baseline: InPlaceBasis;
+  /** Only this run's pass response uses captured activity, not a call alone. */
+  passResponse?: { isCurrent?: () => boolean };
 }): Promise<InPlaceWorkerResult> {
   const { taskId, task, config } = input;
   normalizeExecutorToolCatalog(task);
@@ -213,7 +216,25 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
         assignment,
         onUpdate: input.onUpdate,
         onLiveControl: input.onLiveControl,
-        onQualifyingObservation: () => { qualifyingObservations += 1; },
+        trackObservationEffects: Boolean(input.passResponse),
+        onQualifyingObservation: ({ event, paths, capturedEffect }) => {
+          if (!input.passResponse || input.passResponse.isCurrent?.() === false) {
+            qualifyingObservations += 1;
+            return;
+          }
+          // A relevant observed outside-root candidate qualifies without a
+          // verified external diff; redacted/truncated display spellings are
+          // never resolved, only the recorder's usable identities.
+          if (paths.some((path) => isOutsideObservedPath(path, input.workspaceRoot))) {
+            qualifyingObservations += 1;
+            return;
+          }
+          // In-root activity needs affirmative captured effect evidence from the
+          // same operation's boundaries. A call alone, a no-op, or an
+          // unavailable/unpaired boundary never qualifies merely by being
+          // incomplete; uncertainty is disclosed without fabricating activity.
+          if (event.phase === "tool_result" && capturedEffect === true) qualifyingObservations += 1;
+        },
       });
     } finally {
       assignmentRecord.endedAt = new Date().toISOString();

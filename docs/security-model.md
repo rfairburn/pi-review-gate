@@ -712,6 +712,15 @@ and landing requirements, integrity failures, and recovery gates stay fail-close
 Shared isolated stages may remain blocking where checkpoint/landing needs them;
 tool history cannot substitute for durability.
 
+In the same passing-review confirmation/follow-up loop, both Primary and every InPlace
+adapter require new originating-session/task captured reviewable activity, not a qualifying
+call alone paired with workspace drift. Workspace-only or checkpoint-only churn retains
+the identifiable prior pass with an explicit attribution warning: it covers previously
+reviewed evidence only; later unattributed changes are not approved, and the current
+workspace is not certified. The [post-pass contract](review-workflow.md#passing-review-confirmations-and-follow-ups)
+preserves best-effort capture limits without a snapshot-only fallback trigger or new
+blocker, and leaves existing initial/correction and integrity requirements unchanged.
+
 Tool-only observation is not proof of perfect authorship or universal side-effect
 coverage. Supported `SCRIPT` tool edits can remain reviewable without attributing an
 independent generator's `REPORT` additions to the agent; those report additions alone

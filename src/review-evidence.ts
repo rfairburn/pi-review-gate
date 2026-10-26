@@ -1,9 +1,10 @@
 import { effectiveReviewEvidenceSettings, type ReviewGateConfig } from "./config";
-import { compareFileSnapshots, createPathSnapshot, createWorkspaceSnapshot, type WorkspaceSnapshot, type ChangedFile } from "./capture";
+import { compareFileSnapshots, createPathSnapshot, createWorkspaceSnapshot, withoutSnapshotContent, type FileSnapshot, type WorkspaceSnapshot, type ChangedFile } from "./capture";
 import { stat } from "node:fs/promises";
-import { extractCandidatePaths, type EvidenceState } from "./evidence";
+import { realpathSync } from "node:fs";
+import { extractCandidatePaths, isObservablePathAddress, isUsableObservedPathIdentity, type EvidenceState } from "./evidence";
 import { expandHomePath } from "./apply-patch/paths";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { redactSensitiveText } from "./redaction";
 import type { EvidenceEvent } from "./evidence";
 
@@ -77,6 +78,122 @@ export function isReviewableToolObservation(event: EvidenceEvent): boolean {
   return !KNOWN_READ_ONLY_TOOLS.has(event.toolName.trim().toLowerCase())
     || event.candidatePaths.length > 0
     || event.riskSignals.some((signal) => signal !== "tool_result_error");
+}
+
+/** Resolve one observed spelling against the session cwd and decide whether it
+ * lies outside the review root. Resolution and review scope are deliberately
+ * separate: a subdirectory cwd can still resolve inside an enclosing repository
+ * root. A canonicalized review root (for example a repository realpath) can
+ * differ from the selected cwd's spelling; only the directory identities are
+ * canonicalized, never the candidate path itself, so an absent outside target
+ * is still classified without being read. */
+export function isOutsideObservedPath(path: string, cwd: string, reviewRoot = cwd): boolean {
+  const expanded = expandHomePath(path);
+  const outside = (candidate: string, root: string): boolean => {
+    const within = relative(resolve(root), resolve(candidate));
+    return within === ".." || within.startsWith(`..${sep}`) || isAbsolute(within);
+  };
+  if (!outside(resolve(cwd, expanded), resolve(reviewRoot))) return false;
+  // Identical directory spellings cannot differ by canonicalization.
+  if (resolve(cwd) === resolve(reviewRoot)) return true;
+  try {
+    return outside(resolve(realpathSync(cwd), expanded), resolve(realpathSync(reviewRoot)));
+  } catch {
+    return true;
+  }
+}
+
+/** An observed outside-root mutation candidate remains reviewable even when
+ * no actual file delta can be established. Read-only/unknown events and raw
+ * retention-revision movement alone do not establish such a candidate.
+ * Redacted/truncated display spellings are never resolved as identities. */
+export function hasObservedOutsideCandidate(event: EvidenceEvent, cwd: string, reviewRoot = cwd): boolean {
+  return isReviewableToolObservation(event) && event.candidatePaths.some((path) =>
+    isUsableObservedPathIdentity(path) && isOutsideObservedPath(path, cwd, reviewRoot));
+}
+
+/** Runtime-only per-operation boundary evidence for Primary's same-pass
+ * eligibility check. A prestate is retained only between a matching tool-call
+ * and tool-result hook and is deleted once compared; only the derived result
+ * sequences remain, in memory. It is never serialized, restored, or displayed,
+ * and it is not a second candidate, baseline, or event ledger. */
+interface PrimaryOperationBoundaries {
+  prestates: Map<string, Map<string, FileSnapshot | undefined>>;
+  changedResults: Set<number>;
+}
+const primaryOperationBoundaries = new WeakMap<EvidenceState, PrimaryOperationBoundaries>();
+
+function primaryBoundaryState(state: EvidenceState): PrimaryOperationBoundaries {
+  let boundaries = primaryOperationBoundaries.get(state);
+  if (!boundaries) {
+    boundaries = { prestates: new Map(), changedResults: new Set() };
+    primaryOperationBoundaries.set(state, boundaries);
+  }
+  return boundaries;
+}
+
+/** Capture the pre-operation candidate states at the Primary tool-call boundary.
+ * Delivery is in-process before execution, but capture failures remain unknown
+ * rather than affirmative evidence. */
+export async function capturePrimaryOperationBoundary(input: {
+  state: EvidenceState; cwd: string; toolName: string; toolCallId?: string; exchangeSequence?: number;
+  toolInput?: Record<string, unknown>; config: ReviewGateConfig;
+}): Promise<void> {
+  const boundaries = primaryBoundaryState(input.state);
+  // Hosts provide a tool-call id. A legacy/synthetic host without one falls back
+  // to the tool name; sequential calls still pair correctly, while real parallel
+  // calls always carry the host id.
+  const key = input.toolCallId ?? `exchange:${input.exchangeSequence ?? "?"}:tool:${input.toolName}`;
+  const identities = new Set<string>();
+  for (const { path } of extractCandidatePaths(input.toolName, input.toolInput).paths) {
+    if (isObservablePathAddress(path)) identities.add(resolve(input.cwd, expandHomePath(path)));
+  }
+  if (identities.size === 0) return;
+  const snapshots = new Map<string, FileSnapshot | undefined>();
+  for (const identity of identities) {
+    snapshots.set(identity, await createPathSnapshot(input.cwd, identity, {
+      maxFileBytes: input.config.maxFileBytes, maxSnapshotBytes: input.config.maxSnapshotBytes,
+    }).then(withoutSnapshotContent).catch(() => undefined));
+  }
+  boundaries.prestates.set(key, snapshots);
+}
+
+/** Compare the same candidate identities after the operation and record only an
+ * affirmative change for the upcoming result event. Unavailable, unpaired, or
+ * unreadable boundaries never count as activity. */
+export async function settlePrimaryOperationBoundary(input: {
+  state: EvidenceState; cwd: string; toolName: string; toolCallId?: string; exchangeSequence?: number;
+  resultSequence: number; config: ReviewGateConfig;
+}): Promise<void> {
+  const boundaries = primaryBoundaryState(input.state);
+  const key = input.toolCallId ?? `exchange:${input.exchangeSequence ?? "?"}:tool:${input.toolName}`;
+  const pre = boundaries.prestates.get(key);
+  if (!pre) return;
+  boundaries.prestates.delete(key);
+  for (const [identity, before] of pre) {
+    if (!before || (before.exists && before.sha256 === null)) continue;
+    const after = await createPathSnapshot(input.cwd, identity, {
+      maxFileBytes: input.config.maxFileBytes, maxSnapshotBytes: input.config.maxSnapshotBytes,
+    }).then(withoutSnapshotContent).catch(() => undefined);
+    if (!after || (after.exists && after.sha256 === null)) continue;
+    if (compareFileSnapshots(before, after)) {
+      boundaries.changedResults.add(input.resultSequence);
+      return;
+    }
+  }
+}
+
+/** Same-pass Primary eligibility consumes per-operation captured effects and
+ * canonical observed outside-root candidates, never settlement-time workspace
+ * changes or a stale exchange baseline. Paths resolve against `cwd`; outside-root
+ * scope is classified against the independent review root. */
+export function hasCapturedPrimaryActivity(
+  evidence: EvidenceState | undefined, events: EvidenceEvent[], cwd: string, reviewRoot: string, exchangeSequence: number,
+): boolean {
+  if (events.some((event) => hasObservedOutsideCandidate(event, cwd, reviewRoot))) return true;
+  const changed = evidence ? primaryOperationBoundaries.get(evidence)?.changedResults : undefined;
+  return changed !== undefined && events.some((event) => event.phase === "tool_result"
+    && event.exchangeSequence === exchangeSequence && changed.has(event.sequence));
 }
 
 /** Raised only by acquisition stages, never baseline verification/comparison/cleanup. */

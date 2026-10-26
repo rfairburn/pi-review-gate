@@ -831,7 +831,7 @@ async function runWithPoolFailover(input: {
         }),
         onLiveControl: input.worker.onLiveControl,
         onToolObservation: input.worker.evidence
-          ? (event) => recordObservedToolEventEvidence({
+          ? (event) => { recordObservedToolEventEvidence({
             state: input.worker.evidence!,
             cwd: input.worker.worktree.effectiveCwd,
             selectedRoot: input.worker.worktree.worktreeRoot,
@@ -842,7 +842,7 @@ async function runWithPoolFailover(input: {
             toolInput: event.toolInput,
             result: event.result,
             isError: event.isError,
-          })
+          }); }
           : undefined,
       },
       prompt,

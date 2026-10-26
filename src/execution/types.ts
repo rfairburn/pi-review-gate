@@ -55,7 +55,7 @@ export interface ExecutorRequest {
     compactBeforePrompt?: boolean;
   };
   onUpdate?: (text: string) => void;
-  /** Optional structured adapter event stream; observational only, not a pre-write acknowledgement. */
+  /** Optional structured adapter event stream; observational only, not a pre-write acknowledgement. A return value is ignored, but a caller that needs an observation-boundary action to finish may await the call. */
   onToolObservation?: (event: ExecutorToolObservation) => void;
   onProcessStart?: (process: { pid: number; processGroupId?: number }) => void | Promise<void>;
   onProcessExit?: (process: { pid: number; processGroupId?: number; code: number | null; signal: NodeJS.Signals | null }) => void | Promise<void>;

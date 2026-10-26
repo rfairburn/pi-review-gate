@@ -52,7 +52,8 @@ export interface InPlaceWorkerResult {
   failoverExhausted?: boolean;
   /** True only when every executor adapter that ran this turn declared a structured tool-event stream. */
   structuredToolEvents?: boolean;
-  /** Observations in this turn that the shared classification counts as reviewable work (counted before ledger bounds). */
+  /** Qualifying observations before ledger bounds; within a same-pass response,
+   * narrowed to fresh captured edits or observed outside-root candidates. */
   qualifyingObservations?: number;
 }
 

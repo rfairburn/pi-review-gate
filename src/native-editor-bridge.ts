@@ -112,11 +112,12 @@
  *
  * No private Pi member is touched: every attachment point is a public seam —
  * setEditorComponent, getEditorComponent, custom, and the editor's public
- * methods. The agent package and pi-tui are host-provided peers loaded
- * through the shared loader (src/host-peer-loader.ts), never hard
- * dependencies.
+ * methods. The editor and live keybindings are loaded from host-provided
+ * peers through the shared loader (src/host-peer-loader.ts). Display-only
+ * width fitting uses the existing pinned TUI alias.
  */
 
+import { truncateToWidth } from "pi-session-host-tui";
 import { loadHostPeerModule } from "./host-peer-loader";
 import { pointHostEditorModuleAtLiveKeybindings, type HostEditorProvider } from "./host-editor";
 import { isRecord } from "./record-guard";
@@ -1142,7 +1143,12 @@ function buildFieldComponent(
     },
     render(width: number): string[] {
       const w = Math.max(1, width);
-      return [...titleLines, ...captured.render(w), ...hintLine];
+      // Fit only bridge-owned display rows; the native editor owns its value and layout.
+      return [
+        ...titleLines.map((line) => truncateToWidth(line, w, "…")),
+        ...captured.render(w),
+        ...hintLine.map((line) => truncateToWidth(line, w, "…")),
+      ];
     },
     handleInput(data: string): void {
       if (!session.settled) captured.handleInput(data);

@@ -28,10 +28,13 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
+import { stripVTControlCharacters } from "node:util";
+import { visibleWidth } from "pi-session-host-tui";
 import {
   abortActiveNativeEditorField,
   acquireNativeEditorField,
   editTextWithNativeEditor,
+  NATIVE_EDITOR_FIELD_HINT,
   setNativeEditorHost,
   setNativeEditorHostEntryProvider as setNativeEditorHostEntryProviderForTest,
 } from "../src/native-editor-bridge";
@@ -89,6 +92,58 @@ test("prefill applies after the host's draft capture; Enter submits the edited f
   assert.equal(state.draft, "my chat draft", "chat draft survives the round trip");
   assert.deepEqual(state.chatSubmits, [], "no chat message was sent");
 });
+
+for (const styled of [false, true]) {
+  test(`field title/hint fit terminal cells at 100 and remain exact at 140 (${styled ? "ANSI/wide" : "plain/default hint"})`, async (t) => {
+    const instances: FakeBridgeEditor[] = [];
+    setNativeEditorHost(fakeHost(instances));
+    realHostAfter(t);
+    const title = styled ? `Field: ${"界".repeat(55)}\nShort title` : "Field title ".repeat(10).trimEnd();
+    const hint = styled ? `Hints: ${"🧪e\u0301".repeat(36)}` : NATIVE_EDITOR_FIELD_HINT;
+    const fg = (_color: string, text: string): string => styled ? `\x1b[36m${text}\x1b[39m` : text;
+    const bold = (text: string): string => styled ? `\x1b[1m${text}\x1b[22m` : text;
+    const expectedTitles = title.split("\n").map((line) => fg("accent", bold(line)));
+    const expectedHint = fg("dim", hint);
+    const prefill = `Full editable value ${"界🧪e\u0301".repeat(60)}\nsecond line`;
+    const renders: Array<{ width: number; frame: string[]; nativeRows: string[]; value: string }> = [];
+    const { ui, state } = createBridgeUi({
+      keybindings: fakeKeybindingsManager(),
+      customTheme: { fg, bold },
+      draft: "independent chat draft",
+      drivers: [(component) => {
+        const editor = instances[0]!;
+        // Resize in both directions: truncation must never replace the source text.
+        for (const width of [140, 100, 140]) {
+          renders.push({ width, frame: component.render!(width), nativeRows: editor.render(width), value: editor.getText() });
+        }
+        typeText(component, "-edited");
+        component.handleInput?.(ENTER);
+      }],
+    });
+
+    const result = await editTextWithNativeEditor(ui, { title, prefill, ...(styled ? { hint } : {}) });
+    assert.deepEqual(result, { kind: "value", value: `${prefill}-edited` });
+    for (const { width, frame, nativeRows, value } of renders) {
+      const titles = frame.slice(0, expectedTitles.length);
+      const renderedHint = frame.at(-1)!;
+      for (const line of [...titles, renderedHint]) {
+        assert.ok(visibleWidth(line) <= width, `display row uses ${visibleWidth(line)} cells at width ${width}`);
+      }
+      if (width === 140) {
+        assert.deepEqual(titles, expectedTitles, "fitting titles retain exact text and ANSI styling");
+        assert.equal(renderedHint, expectedHint, "fitting hint retains exact text and ANSI styling");
+      } else {
+        assert.ok(stripVTControlCharacters(titles[0]!).endsWith("…"), "oversized title is visibly truncated");
+        assert.ok(stripVTControlCharacters(renderedHint).endsWith("…"), "oversized hint is visibly truncated");
+      }
+      assert.deepEqual(frame.slice(expectedTitles.length, -1), nativeRows, "native editor rows pass through unchanged");
+      assert.equal(value, prefill, "display truncation never changes the full editable value");
+    }
+    assert.equal(state.draft, "independent chat draft");
+    assert.equal(state.slotFactory, undefined);
+    assert.deepEqual(state.chatSubmits, []);
+  });
+}
 
 test("an embedded answer suppresses ordinary editor rendering without displacing Pi's active editor", async () => {
   const instances: FakeBridgeEditor[] = [];

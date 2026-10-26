@@ -169,6 +169,9 @@ Escape makes the same validated copies but leaves the configuration file untouch
 so the session-only instructions keep working. Cancel copies nothing. There is no
 second editor or clipboard surface; recognition for this persistence stays bounded to
 Pi's clipboard temp naming and this config's own managed store root.
+Field titles and key hints truncate to the available terminal-cell width,
+including styled and wide text; fitting text stays unchanged. This affects only
+those display rows, never the full editable value.
 Enter submits the field's own text (never a chat message); Esc first dismisses a
 visible completion list, then cancels the field, leaving the staged value
 unchanged. Every editable field shares the same native absolute-path behavior

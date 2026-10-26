@@ -3254,10 +3254,13 @@ export class BackgroundExecutionController {
     actor: "model" | "user";
     /** Turn-interrupt steering (issue #63): interrupt the active turn before delivery. */
     interrupt?: boolean;
-  }): Promise<BackgroundInspection> {
+  }, options?: { actionNoticeGate?: Promise<void> }): Promise<BackgroundInspection> {
     const { group, task } = this.resolveTask(input.executionId, input.taskId);
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
     if (duplicate) return this.inspect(group.executionId, task.taskId);
+    // Human command notices must precede even an immediate transport-driven
+    // outcome. Install before persistence or live steering can yield control.
+    if (options?.actionNoticeGate) this.wakes.setLaunchNoticeGate(group.executionId, options.actionNoticeGate);
     const command: BackgroundCommandRecord = {
       instructionId: input.instructionId,
       action: "steer",

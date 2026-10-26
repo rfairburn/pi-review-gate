@@ -59,8 +59,8 @@ export interface WakeDeliveryEnv {
 export class WakeDelivery {
   /**
    * Issue #222: pending launch-notice gates by execution id. Set only by a
-   * non-model-initiated start/add (human command or scheduler) that carries
-   * the shared notice; process-local and never persisted, cleared when the
+   * non-model-initiated start/add (human command or scheduler), or human steer,
+   * that carries a notice; process-local and never persisted, cleared when the
    * group retires or the controller detaches. A restored group never
    * resurrects its gate — restarts deliver the ordinary notifications without
    * one.
@@ -73,7 +73,11 @@ export class WakeDelivery {
   constructor(private readonly env: WakeDeliveryEnv) {}
 
   setLaunchNoticeGate(executionId: string, gate: Promise<void>): void {
-    this.launchNoticeGates.set(executionId, gate);
+    const prior = this.launchNoticeGates.get(executionId);
+    // Concurrent add/steer requests share this one ordering lane; none may
+    // replace another pending notice and release its dependent outcomes early.
+    const pending = prior ? Promise.all([prior, gate]).then(() => undefined) : gate;
+    this.launchNoticeGates.set(executionId, pending);
   }
 
   clearLaunchNoticeGate(executionId: string): void {
@@ -235,7 +239,13 @@ export class WakeDelivery {
     // Issue #222: every result notification for a non-model-initiated launch
     // waits behind that launch's notice first (auto-resolving bounded gate),
     // so a fast completion can never precede the notice that names the task.
-    await this.launchNoticeGateOf(eventOwner ?? owner);
+    let pending: Promise<void> | undefined;
+    do {
+      pending = this.launchNoticeGateOf(eventOwner ?? owner);
+      await pending;
+      // A new human action may install its gate while this wake awaits an
+      // earlier notice. Recheck the same canonical lane before sending.
+    } while (pending !== this.launchNoticeGateOf(eventOwner ?? owner));
     const pi = env.pi();
     if (!isRecord(pi) || typeof pi.sendMessage !== "function") {
       await env.notify?.(deliveredContent);

@@ -943,6 +943,15 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     popupInput("\x1b[17~");
     await signal.waitFor(() => copies(popupChild!).length === 1, 20_000, at("popup", "native Main application-copy fallback preserved", popupPane));
     assert.equal(Buffer.from(copies(popupChild!)[0]!, "base64").toString("utf8"), "ASSISTANT466-A αβ café\nASSISTANT466-B 雪 end");
+    // This fixture's own agent-root review-gate.json enables the gate with no
+    // resolvable reviewer, so the same turn ends with one more rendered message:
+    // the deferred-review notice. It appends below the assistant rows and scrolls
+    // the bottom-anchored conversation by its full height, so the absolute mouse
+    // rows measured below have to come from the post-notice frame. The host
+    // rewrites changed outer rows in ascending row order, so a visible notice row
+    // means every changed row above it — the scrolled assistant rows — is drawn.
+    await signal.waitFor(() => text(popupPane).includes("review gate: automatic review deferred"), 30_000,
+      at("popup", "the turn's terminal review-gate deferred notice finished rendering and scrolling", popupPane));
     // The faux-provider turn already drew the assistant rows in this fresh Main
     // conversation, so select those visible rows directly. Registering another
     // slash command here would exercise native autocomplete and a second model

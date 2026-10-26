@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.209]
+
+### Changed
+
+- The Linux full-suite CI job now carries a 30-minute job deadline, up from 20 (#523).
+  The suite and its setup are unchanged: the `Full test suite` step keeps its own
+  15-minute cap, 300-second per-test bound, `dist-test/tests/*.test.js` glob,
+  four-file concurrency, and spec plus progress reporters, and every other job or
+  step deadline stays as it was. The added job budget is provisioning headroom: setup
+  that takes around fifteen minutes previously left the suite only five minutes despite
+  its 15-minute step allowance, while the whole job remains bounded at 30 minutes. No
+  retry, cache, mirror, skipped test, or wider failure tolerance was added.
+
 ## [0.1.0-dev.208]
 
 ### Fixed

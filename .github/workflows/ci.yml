@@ -85,12 +85,17 @@ jobs:
     runs-on: ubuntu-latest
     # Deliberately bounded: a runaway Linux full-suite run must fail instead of
     # occupying the runner for close to an hour. The complete, unfiltered suite
-    # now needs roughly ten minutes of runner time on this tree, so a 10-minute
-    # suite step aborted an all-green run; the step below carries a 15-minute
-    # cap that leaves bounded headroom without touching coverage, and the job
-    # keeps one provisioning allowance on top of it. Raise these only alongside
-    # the focused workflow contract test that asserts both limits.
-    timeout-minutes: 20
+    # needs roughly ten minutes of runner time, but this job provisions first
+    # (Chromium with Linux OS dependencies, the pinned Pi runtimes, the test
+    # bundle), and that setup can consume a large share of a 20-minute job cap:
+    # about fifteen minutes of setup left the suite only five minutes of its
+    # own 15-minute step allowance. The 30-minute job cap gives provisioning
+    # that headroom, so the suite can use its full 15-minute step cap while the
+    # job still fails the run overall at 30 minutes. This is job provisioning
+    # headroom only: coverage, the step cap, and every other job or step
+    # deadline are unchanged. Raise these only alongside the focused workflow
+    # contract test that asserts both limits.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -191,7 +196,7 @@ jobs:
       - name: Build test bundle
         run: npm run build:test
       - name: Full test suite
-        # Step-level cap inside the 20-minute job cap above: a hung suite step
+        # Step-level cap inside the 30-minute job cap above: a hung suite step
         # fails here at 15 minutes instead of consuming the whole job budget.
         # The suite coverage is exactly the local `npm run test:run` command —
         # same dist-test/tests/*.test.js glob, same four-file concurrency — with

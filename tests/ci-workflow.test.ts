@@ -217,8 +217,8 @@ test("full-tests job runs for pull requests, default-branch pushes, and manual d
     "the condition must run the suite on every enforced trigger path with no hidden push-only skip",
   );
   assert.match(full, /name: Full suite \(Node 24\)/);
-  assert.match(full, /^    timeout-minutes: 20\s*$/m,
-    "the Linux full-suite job must keep an active, job-scoped 20-minute runtime cap (a commented-out value or a 20 on a prerequisite step must not pass)");
+  assert.match(full, /^    timeout-minutes: 30\s*$/m,
+    "the Linux full-suite job must keep an active, job-scoped 30-minute runtime cap (a commented-out value or a 30 on a prerequisite step must not pass)");
   assert.match(full, /^          node-version: 24\.22\.1$/m,
     "the full suite must select the exact patched Node 24 security floor, never a floating 24.x that a stale runner tool cache could satisfy");
   assert.doesNotMatch(full, /node-version: 24\.x/);
@@ -293,10 +293,10 @@ test("full-suite runtime is bounded by independent job and step timeouts", () =>
   const full = blockOf(source, "full-tests", 2);
 
   // Job-level cap: the exact active job property line at the 4-space YAML
-  // mapping indent. Commented-out caps and a 20 scoped to a prerequisite
+  // mapping indent. Commented-out caps and a 30 scoped to a prerequisite
   // step's own timeout property must not satisfy the job guard.
-  assert.match(full, /^    timeout-minutes: 20\s*$/m,
-    "the Linux full-suite job must carry an active, job-scoped 20-minute cap");
+  assert.match(full, /^    timeout-minutes: 30\s*$/m,
+    "the Linux full-suite job must carry an active, job-scoped 30-minute cap");
   assert.doesNotMatch(full, /^ *timeout-minutes: 45\s*$/m,
     "the over-generous 45-minute cap must not return at job or step level");
 

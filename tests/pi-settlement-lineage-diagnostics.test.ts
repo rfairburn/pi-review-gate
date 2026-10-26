@@ -27,7 +27,16 @@ import {
   type WindowsLineageQueryChild,
   type WindowsLineageQueryExecutor,
   type WindowsLineageQueryOptions,
+  type WindowsLineageVerification,
 } from "../src/execution/windows-process-lineage";
+import {
+  WINDOWS_LINEAGE_DIAGNOSTIC_MAX_CHARS,
+  WINDOWS_LINEAGE_PHASES,
+  createWindowsLineagePhaseProbe,
+  formatWindowsLineagePhaseDiagnostic,
+  instrumentWindowsLineageScript,
+  parseWindowsLineagePhaseMarker,
+} from "./helpers/windows-lineage-phase-diagnostics";
 
 /**
  * Issue #335 diagnosis: the ORIGINAL Windows lineage verification invocation
@@ -987,6 +996,230 @@ test("the receipt signature is authenticated before the lineage verifier runs", 
 });
 
 // ---------------------------------------------------------------------------
+// Test-only native query phase diagnostics (Refs #446)
+// ---------------------------------------------------------------------------
+
+/**
+ * Diagnosis for the one required Windows run that reported `query-timeout` for a
+ * genuine descendant: the probe below observes that same single bounded query
+ * child from outside the production module so a future native run can say WHERE
+ * the five seconds went. These cross-platform cases pin the wrapper's own bounds,
+ * privacy, and non-interference; the win32-only cases below exercise it natively.
+ * Phase timestamps are when THIS process noticed an event, so they locate a delay
+ * boundary and never by themselves establish a root cause.
+ */
+
+/** Exactly one inserted marker line matches; no production line may. */
+const PHASE_MARKER_LINE = /^\s*(?:if \(\$step -lt \d+\) \{ )?\[Console\]::Error\.WriteLine\('PRG-LINEAGE-PHASE:[a-z][a-z0-9-]*'\)(?: \})?$/;
+
+/** The script-side phases the diagnostics must be able to bracket. */
+const INSTRUMENTED_PHASES = [
+  "script-entry", "initial-query-start", "initial-query-end", "walk-start",
+  "ancestor-lookup", "snapshot-start", "snapshot-end", "evidence-written", "walk-depth-limit",
+] as const;
+
+/** Occurrences of a fixed substring — used to prove nothing is duplicated or added. */
+function occurrences(haystack: string, needle: string): number {
+  return allIndexes(haystack, needle).length;
+}
+
+test("the diagnostic script wrapper adds stderr-only markers and changes no production decision", async () => {
+  const { script } = await captureLineageScript();
+  const outcome = instrumentWindowsLineageScript(script);
+  assert.ok(outcome.instrumented, "the production script still carries every fixed marker anchor");
+  if (!outcome.instrumented) return;
+
+  const original = script.split("\n");
+  const instrumented = outcome.script.split("\n");
+  assert.ok(outcome.markers >= INSTRUMENTED_PHASES.length && outcome.markers <= 12,
+    `the marker count stays bounded, got ${outcome.markers}`);
+  assert.equal(instrumented.length, original.length + outcome.markers,
+    "markers are whole added lines, never edits to a production line");
+  const added = instrumented.filter((line) => PHASE_MARKER_LINE.test(line));
+  assert.equal(added.length, outcome.markers, "every added line is one fixed marker line");
+  assert.deepEqual(instrumented.filter((line) => !PHASE_MARKER_LINE.test(line)), original,
+    "removing the marker lines yields the production script line for line, in order");
+  assert.ok(added.every((line) => line.includes("[Console]::Error.WriteLine(")), "markers are written to stderr only");
+  assert.equal(occurrences(outcome.script, "[Console]::Out"), occurrences(script, "[Console]::Out"),
+    "the stdout proof bytes are still written from exactly the same places");
+  assert.equal(occurrences(outcome.script, "Get-CimInstance"), 3, "the three bounded CIM requests are unchanged");
+  assert.equal(initialLookupFilter(outcome.script), initialLookupFilter(script), "the initial filter is unchanged");
+  assert.ok(outcome.script.includes("for ($step = 0; $step -lt 64; $step++)"), "the 64-hop walk bound is unchanged");
+  for (const phase of INSTRUMENTED_PHASES) {
+    assert.ok(outcome.script.includes(`PRG-LINEAGE-PHASE:${phase}`), `${phase} stays observable`);
+  }
+  const ancestor = added.filter((line) => line.includes("ancestor-lookup"));
+  assert.equal(ancestor.length, 1, "the per-hop marker is one line, never one line per hop");
+  assert.ok(ancestor[0]?.includes("if ($step -lt 2)"),
+    "the per-hop marker is step-guarded, so stderr stays bounded for any chain length");
+});
+
+test("diagnostic script instrumentation fails closed to the untouched script", async () => {
+  const foreign = "$ErrorActionPreference = 'Stop'\nWrite-Output 'not the lineage script'\n";
+  assert.deepEqual(instrumentWindowsLineageScript(foreign), { instrumented: false, script: foreign, reason: "anchors-missing" },
+    "an unrecognized script is handed to the query completely untouched");
+
+  const { script } = await captureLineageScript();
+  const initialLine = script.split("\n").find((line) => line.startsWith("$initial = @(Get-CimInstance"))!;
+  const ambiguous = script.replace(`${initialLine}\n`, () => `${initialLine}\n${initialLine}\n`);
+  assert.deepEqual(instrumentWindowsLineageScript(ambiguous), { instrumented: false, script: ambiguous, reason: "anchors-missing" },
+    "an ambiguous anchor is refused rather than guessed at");
+});
+
+test("only allowlisted phase names are markers and no other stderr text is ever interpretable", () => {
+  for (const phase of WINDOWS_LINEAGE_PHASES) {
+    assert.equal(parseWindowsLineagePhaseMarker(`PRG-LINEAGE-PHASE:${phase}\r`), phase);
+  }
+  for (const line of [
+    "", "\r", "PRG-LINEAGE-PHASE", "PRG-LINEAGE-PHASE:", "PRG-LINEAGE-PHASE:Not-A-Phase",
+    `PRG-LINEAGE-PHASE:${FAKE_PRIVATE_PATH}`, "PRG-LINEAGE-PHASE:chain-cycle;extra",
+    "  PRG-LINEAGE-PHASE:script-entry", `Get-CimInstance PRG-LINEAGE-PHASE:snapshot-end`,
+    "PRG-LINEAGE-PHASE:query-timeout", `PRG-LINEAGE-PHASE:${FAKE_SECRET}`,
+  ]) {
+    assert.equal(parseWindowsLineagePhaseMarker(line), undefined, `${JSON.stringify(line)} is not a phase`);
+  }
+});
+
+test("the phase probe observes one native query without changing its proof or leaking anything", async () => {
+  const { script } = await captureLineageScript();
+  const seen: Array<{ file: string; args: string[]; options: WindowsLineageQueryOptions }> = [];
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  const child = new EventEmitter();
+  Object.assign(child, { kill: () => true, stdout, stderr });
+  let callback: ((error: ExecFileException | null, stdout: string, stderr: string) => void) | undefined;
+  const probe = createWindowsLineagePhaseProbe((file, args, options, cb) => {
+    seen.push({ file, args, options });
+    callback = cb;
+    return child as unknown as WindowsLineageQueryChild;
+  });
+
+  const armed = withSystemRoot("/fake-windows", () =>
+    verifyWindowsProcessLineage(fakeOwnedRoot(), CANDIDATE_PID, { platform: "win32", execute: probe.execute }));
+  await flushAsync();
+
+  assert.equal(seen.length, 1, "the probe never adds a query child or a retry");
+  assert.equal(seen[0].file, join("/fake-windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    "the probe delegates to the production executable");
+  assert.equal(seen[0].args.length, 5, "only the script argument may be substituted");
+  assert.deepEqual(seen[0].args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
+    "the production argument vector is passed through unchanged");
+  assert.deepEqual(seen[0].options, { encoding: "utf8", maxBuffer: MAX_QUERY_OUTPUT_BYTES, windowsHide: true },
+    "the 4KiB per-stream bound, encoding, and hidden window are passed through untouched");
+  assert.ok(!("timeout" in seen[0].options), "the probe never takes over the owned 5s deadline");
+  assert.ok(seen[0].args[4].includes("PRG-LINEAGE-PHASE:snapshot-start"), "the script argument is the instrumented copy");
+
+  // The delegate has already returned its child object, and that alone is not spawn
+  // evidence: until the child emits its own `spawn` event, an ENOENT or other
+  // asynchronous spawn failure looks identical from here. The result token below is
+  // only a render input while the query is still in flight; the ledger is the point.
+  const inFlight = probe.timeline("positive-proof", { verified: false, reason: "query-failed" });
+  assert.equal(inFlight.calls, 1, "the one query child started and has not settled");
+  assert.equal(inFlight.callbacks, 0, "no completion callback has been witnessed yet");
+  assert.ok(!inFlight.phases.some((phase) => phase.phase === "child-spawn"),
+    "a returned child object is never recorded as a spawn");
+  child.emit("spawn");
+
+  stderr.emit("data", "PRG-LINEAGE-PHASE:script-entry\r\nPRG-LINEAGE-PHASE:initial-query-start\r\n");
+  stderr.emit("data", `Get-CimInstance failed at ${FAKE_PRIVATE_PATH} token=${FAKE_SECRET} pid=987654321\r\n`);
+  stderr.emit("data", "PRG-LINEAGE-PHASE:initial-query-end\r\nPRG-LINEAGE-PHASE:ancestor-lookup\r\n"
+    + "PRG-LINEAGE-PHASE:ancestor-lookup\r\nPRG-LINEAGE-PHASE:ancestor-lookup\r\n");
+  stdout.emit("data", VALID_EVIDENCE);
+  child.emit("exit", 0, null);
+  child.emit("close", 0, null);
+  callback?.(null, VALID_EVIDENCE, "");
+  const result = await armed;
+  assert.deepEqual(result, { verified: true }, "forwarding the callback verbatim keeps the real acceptance decision intact");
+
+  const line = probe.diagnostic("positive-proof", result);
+  assert.ok(line.length <= WINDOWS_LINEAGE_DIAGNOSTIC_MAX_CHARS, `the diagnostic stays bounded: ${line.length}`);
+  assert.ok(!line.includes(FAKE_SECRET) && !line.includes("vic") && !line.includes("987654321")
+    && !line.includes("C:\\") && !line.includes("Get-CimInstance") && !line.includes("PRG-LINEAGE-PHASE"),
+  `the diagnostic carries no stderr text, path, PID, script, or marker prefix: ${line}`);
+  assert.match(line, /result=verified delegation=production instrument=ok calls=1 callbacks=1/);
+  assert.match(line, /unrecognized=1 scanTruncated=false/);
+  assert.match(line, /ancestor-lookup@\d+x3/, "repeated observations aggregate into the one canonical record");
+  assert.equal(occurrences(line, "ancestor-lookup"), 1, "one phase is never printed twice");
+  assert.equal(occurrences(line, "child-spawn"), 1,
+    "the one `spawn` notification is recorded once, and only because it was emitted");
+  const order = ["child-spawn", "script-entry", "initial-query-start", "initial-query-end",
+    "ancestor-lookup", "stdout-first", "stderr-first", "child-exit", "child-close", "query-callback"];
+  const positions = order.map((phase) => line.indexOf(phase));
+  assert.ok(positions.every((at) => at >= 0), `every observed phase is reported: ${line}`);
+  assert.deepEqual(positions, [...positions].sort((left, right) => left - right),
+    "phases print in the canonical fixed order, not in arrival order");
+  const canonical = probe.timeline("positive-proof", result);
+  assert.equal(new Set(canonical.phases.map((record) => record.phase)).size, canonical.phases.length,
+    "the canonical record keeps one entry per phase, never a second event or status ledger");
+
+  // The status token is honest: a query that is not production's own shape is
+  // reported as changed instead of being presented as native proof evidence.
+  const altered = createWindowsLineagePhaseProbe(() => child as unknown as WindowsLineageQueryChild);
+  altered.execute(join("/fake-windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+    { encoding: "utf8", maxBuffer: MAX_QUERY_OUTPUT_BYTES, windowsHide: true, timeout: 5_000 } as unknown as WindowsLineageQueryOptions,
+    () => undefined);
+  assert.match(altered.diagnostic("negative-proof", { verified: false, reason: "query-timeout" }),
+    /delegation=changed instrument=ok calls=1 callbacks=0/);
+});
+
+test("a query child that never notifies spawn leaves no spawn evidence behind", () => {
+  // The real shape of an asynchronous spawn failure: the executor returns a child
+  // object, the child never emits `spawn`, and the completion callback settles with a
+  // spawn errno. The diagnosis may report the callback it really witnessed, never a
+  // process creation it did not witness.
+  const child = new EventEmitter();
+  Object.assign(child, { kill: () => true, stdout: new EventEmitter(), stderr: new EventEmitter() });
+  let settle: ((error: ExecFileException | null, stdout: string, stderr: string) => void) | undefined;
+  const probe = createWindowsLineagePhaseProbe((_file, _args, _options, callback) => {
+    settle = callback;
+    return child as unknown as WindowsLineageQueryChild;
+  });
+  probe.execute(join("/fake-windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Write-Output 'proof'"],
+    { encoding: "utf8", maxBuffer: MAX_QUERY_OUTPUT_BYTES, windowsHide: true },
+    () => undefined);
+
+  const started = probe.diagnostic("spawn-failure", { verified: false, reason: "query-spawn-failed" });
+  assert.match(started, /calls=1 callbacks=0/, "the delegate returned its child, and nothing settled");
+  assert.ok(!started.includes("child-spawn"), `no spawn event means no spawn phase: ${started}`);
+
+  settle?.(Object.assign(new Error(`spawn ${FAKE_PRIVATE_PATH} ENOENT`), { code: "ENOENT" }) as ExecFileException, "", "");
+  const failed = probe.diagnostic("spawn-failure", { verified: false, reason: "query-spawn-failed" });
+  assert.match(failed, /callbacks=1/, "the completion callback the wrapper actually witnessed is reported");
+  assert.match(failed, /query-callback@\d+/);
+  assert.ok(!failed.includes("child-spawn"), `a spawn failure never claims a spawn: ${failed}`);
+  assert.ok(!failed.includes("child-exit") && !failed.includes("child-close"),
+    `an unobserved lifecycle is not reported: ${failed}`);
+});
+
+test("the phase diagnostic cannot exceed its bound or report an unvalidated value", () => {
+  const widest = formatWindowsLineagePhaseDiagnostic({
+    label: `x${FAKE_SECRET}`.repeat(200),
+    result: { verified: false, reason: "not-a-stage" } as unknown as WindowsLineageVerification,
+    elapsedMs: 2 ** 31,
+    calls: 2 ** 40,
+    callbacks: -5,
+    instrument: "ok",
+    delegation: "production",
+    unrecognizedMarkers: 2 ** 40,
+    scanTruncated: true,
+    phases: [
+      ...WINDOWS_LINEAGE_PHASES.map((phase) => ({ phase, elapsedMs: 2 ** 31 - 1, count: 999 })),
+      { phase: "child-spawn", elapsedMs: 1, count: 2 },
+      { phase: "made-up-phase" as (typeof WINDOWS_LINEAGE_PHASES)[number], elapsedMs: 3, count: 1 },
+    ],
+  });
+  assert.ok(widest.length <= WINDOWS_LINEAGE_DIAGNOSTIC_MAX_CHARS, `bounded by construction: ${widest}`);
+  assert.ok(!widest.includes(FAKE_SECRET) && !widest.includes("xxxx"), `no caller text: ${widest}`);
+  assert.ok(!widest.includes("made-up-phase"), "a phase outside the closed vocabulary is never printed");
+  assert.equal(occurrences(widest, "child-spawn"), 1, "a duplicated phase collapses into the one canonical record");
+  assert.match(widest, /label=\? result=unknown/);
+  assert.match(widest, /calls=\? callbacks=\? unrecognized=\? scanTruncated=true elapsedMs=\?/);
+  assert.match(widest, /child-spawn@2147483647x999/, "only bounded integers print");
+});
+
+// ---------------------------------------------------------------------------
 // Owned-process identity handshake (cross-platform; used by the win32 fixture)
 // ---------------------------------------------------------------------------
 
@@ -1537,7 +1770,7 @@ if (process.platform === "win32") {
     }
   }
 
-  test("native Windows lineage proof accepts a real descendant and refuses an unrelated PID", async () => {
+  test("native Windows lineage proof accepts a real descendant and refuses an unrelated PID", async (t) => {
     const fixtureDir = await mkdtemp(join(tmpdir(), "prg-lineage-native-"));
     // Two independent ownership channels: the root records the PID it saw, and
     // the descendant reports its own PID as its first action. Teardown uses every
@@ -1590,11 +1823,29 @@ if (process.platform === "win32") {
       if (descendantPid === undefined) {
         throw new Error(`the owned root did not report a validated descendant PID (${handshake.failure ?? "no frame"})`);
       }
-      assert.deepEqual(await verifyWindowsProcessLineage(ownedRoot, descendantPid), { verified: true },
+      // Refs #446 diagnosis: the same single bounded native query child, observed
+      // from outside the production module through the existing `execute` seam. The
+      // probe delegates to the real native `execFile` with the production executable,
+      // arguments, and options (it only adds read-only listeners and stderr marker
+      // observation, and reports `delegation=production` when that stayed true), so the
+      // proofs below are still the real native proofs with the same 5s deadline, 4KiB
+      // bound, and one child. The printed phase timings are when this process NOTICED
+      // each event — `child-spawn` only ever from the child's own `spawn` notification, so
+      // a spawn failure cannot fabricate one. They are perturbed by stream delivery and by
+      // the markers themselves, so they locate a delay boundary for further investigation
+      // and never establish a root cause.
+      const positiveProbe = createWindowsLineagePhaseProbe();
+      const positive = await verifyWindowsProcessLineage(ownedRoot, descendantPid, { execute: positiveProbe.execute });
+      // Printed before the assertion so the evidence survives the very failure it is
+      // here to explain; it never replaces the assertion or accepts anything.
+      t.diagnostic(positiveProbe.diagnostic("positive-proof", positive));
+      assert.deepEqual(positive, { verified: true },
         "the real bounded native query must still prove a genuine descendant");
 
       assert.ok(unrelated.pid, "the unrelated fixture process must exist");
-      const outsider = await verifyWindowsProcessLineage(ownedRoot, unrelated.pid);
+      const negativeProbe = createWindowsLineagePhaseProbe();
+      const outsider = await verifyWindowsProcessLineage(ownedRoot, unrelated.pid, { execute: negativeProbe.execute });
+      t.diagnostic(negativeProbe.diagnostic("negative-proof", outsider));
       assert.equal(outsider.verified, false, "a process outside the owned tree never verifies");
       assert.ok(outsider.verified === false && isWindowsLineageRefusalReason(outsider.reason),
         "the native refusal reports a fixed stage");
@@ -1809,6 +2060,67 @@ if (process.platform === "win32") {
       assert.equal(verdict.verified === false && verdict.reason, testCase.stage, testCase.name);
       assert.ok((WINDOWS_LINEAGE_NATIVE_SENTINEL_REASONS as readonly string[]).includes(testCase.stage ?? ""),
         `${testCase.name} refuses on an existing native sentinel stage, not a new one`);
+    }
+  });
+
+  /**
+   * The diagnostics wrapper is only usable as evidence if the instrumented script
+   * still decides exactly what the production script decides. Both scripts run on
+   * the real PowerShell host against the same stubbed CIM source, and the stdout
+   * proof bytes, exit status, and CIM request sequence must be identical, with the
+   * new markers visible only on stderr and only where control actually reached.
+   * This validates the diagnostic instrument; the native ancestry proof is the
+   * separate case above, and nothing here measures real CIM timing.
+   */
+  test("the instrumented lineage script keeps proof bytes, decisions, and CIM requests identical on the real host", async () => {
+    if (!existsSync(powershellHost)) {
+      throw new Error("the win32 suite must be able to locate Windows PowerShell to exercise the instrumented script");
+    }
+    const { script } = await captureLineageScript();
+    const outcome = instrumentWindowsLineageScript(script);
+    assert.ok(outcome.instrumented, "the production script still carries every fixed marker anchor");
+    if (!outcome.instrumented) return;
+
+    const cases: Array<{
+      name: string;
+      responses: StubRow[][];
+      accepted: boolean;
+      stage?: string;
+      filters: string[];
+      phases: readonly string[];
+    }> = [
+      {
+        name: "an accepted direct chain",
+        responses: [[CANDIDATE_DIRECT, ROOT_RECORD], [CANDIDATE_DIRECT, ROOT_RECORD]],
+        accepted: true, filters: [INITIAL_FILTER, DIRECT_SNAPSHOT_FILTER],
+        phases: ["script-entry", "initial-query-start", "initial-query-end", "walk-start",
+          "snapshot-start", "snapshot-end", "evidence-written"],
+      },
+      {
+        name: "a walk that loses an intermediate ancestor",
+        responses: [[CANDIDATE_VIA_MID, ROOT_RECORD, ROOT_RECORD], []],
+        accepted: false, stage: "chain-ancestor-record-missing", filters: [INITIAL_FILTER, MID_FILTER],
+        phases: ["script-entry", "initial-query-start", "initial-query-end", "walk-start", "ancestor-lookup"],
+      },
+    ];
+    for (const testCase of cases) {
+      const baseline = await runEmittedLineageScript(script, testCase.responses);
+      const instrumented = await runEmittedLineageScript(outcome.script, testCase.responses);
+      assert.equal(instrumented.stdout, baseline.stdout, `${testCase.name}: stdout proof bytes are unchanged`);
+      assert.equal(instrumented.status, baseline.status, `${testCase.name}: the exit status is unchanged`);
+      assert.deepEqual(instrumented.filters, testCase.filters, `${testCase.name}: the CIM requests are unchanged`);
+      const verdict = classifyWindowsAncestryEvidence(instrumented.stdout, CANDIDATE_PID, OWNED_ROOT_PID);
+      if (testCase.accepted) {
+        assert.deepEqual(verdict, { verified: true }, `${testCase.name} still verifies`);
+      } else {
+        assert.equal(instrumented.stdout, `PI_REVIEW_GATE_LINEAGE_NO:${testCase.stage}`, testCase.name);
+        assert.equal(verdict.verified === false && verdict.reason, testCase.stage,
+          `${testCase.name} still refuses on the same native stage`);
+      }
+      const observed = WINDOWS_LINEAGE_PHASES.filter((phase) => instrumented.stderr.includes(`PRG-LINEAGE-PHASE:${phase}`));
+      assert.deepEqual(observed, testCase.phases, `${testCase.name}: markers follow the control flow actually taken`);
+      assert.ok(occurrences(instrumented.stderr, "PRG-LINEAGE-PHASE:") <= 12,
+        `${testCase.name}: stderr markers stay bounded`);
     }
   });
 }

@@ -202,6 +202,18 @@ standalone example configs and the runnable JSON blocks in the documentation thr
 production strict validator and check intended reviewer selections/resolution and worker
 routes using hermetic fixtures, without invoking providers or reviewer/executor commands.
 
+### Human subtask action notices (#215)
+
+After `npm run build:test`, `tests/human-action-notices.test.ts` covers the registered
+human add/steer command paths with real controller persistence and worker completion,
+recording the host send boundary (not a native model observation). The separate
+`tests/pi-native-human-actions.test.ts`, with the installed-Pi and scratch candidate
+environment above, drives actual slash commands over native RPC. Its local scripted
+provider observes immediate-add idle wake and busy-parent add, explicit steer, and
+picker/input steer in model contexts before natural stop, with an in-flight command
+finishing normally. It uses no provider credentials or external model; this POSIX
+headless evidence is not a physical-terminal, live-provider, or Windows result.
+
 ### SessionSpawn long-prompt acceptance (#447)
 
 The focused cases in `tests/session-host-spawn-tool.test.ts` and

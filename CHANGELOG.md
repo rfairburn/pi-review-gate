@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.206]
+
+### Fixed
+
+- Human `/subtask-steer` commands now give the originating model one bounded,
+  redacted acceptance notice before dependent outcomes, distinguishing queued or
+  acknowledged requests from applied instructions or completed work. Cancelled and
+  failed requests send no success notice; model-facing steering and worker controls
+  are unchanged (#215).
+- Immediate human `/subtask-add` launch notices redact before deriving their short
+  title, preventing a clipped credential fragment from escaping redaction while
+  preserving the worker instructions and existing UI title (#215).
+
 ## [0.1.0-dev.204]
 
 ### Fixed

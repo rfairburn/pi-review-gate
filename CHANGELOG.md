@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.206]
+## [0.1.0-dev.207]
 
 ### Fixed
 
@@ -27,6 +27,15 @@ dates.
 - Immediate human `/subtask-add` launch notices redact before deriving their short
   title, preventing a clipped credential fragment from escaping redaction while
   preserving the worker instructions and existing UI title (#215).
+
+## [0.1.0-dev.206]
+
+### Fixed
+
+- Sidebar-managed native editors preserve legacy Ctrl+J as Ctrl+J rather than
+  converting it to Enter, preventing premature draft submission in local and
+  networked panes (#518). Ordinary Enter, Shift+Enter, and the native editor's
+  configured keybindings retain their existing semantics.
 
 ## [0.1.0-dev.205]
 

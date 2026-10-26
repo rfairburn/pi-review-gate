@@ -189,8 +189,38 @@ interface NativeWindowsPiFixture extends OwnedDescendantFixture {
   backgroundStoppedPath?: string;
 }
 
-async function createNativeWindowsPiFixture(mode: "rpc" | "rpc-background" | "compaction"): Promise<NativeWindowsPiFixture> {
-  const root = await mkdtemp(join(tmpdir(), `pi-child-teardown-win-${mode}-`));
+type NativeWindowsPiMode = "rpc" | "rpc-background" | "compaction";
+
+interface NativeWindowsPiSources {
+  root: string;
+  workerPath: string;
+  entryPath: string;
+  workerPidPath: string;
+  readyPath: string;
+  stopPath: string;
+  stoppedPath: string;
+  backgroundPath: string;
+  backgroundPidPath: string;
+  backgroundStopPath: string;
+  backgroundStoppedPath: string;
+  workerScript: string;
+  backgroundScript: string;
+  entryScript: string;
+}
+
+/**
+ * Renders the native Windows fixture sources. The spawned worker is the sole
+ * publisher of its own PID and ready markers: it writes its PID, then the ready
+ * marker, then announces readiness over IPC. A parent handler that rewrites
+ * those same files after the child already published them truncates them a
+ * second time, so waitForFixtureReady can read an empty PID for a live,
+ * correctly published descendant. The parent keeps only the background group
+ * PID it spawns, plus the IPC ready signal that bounds the compaction entry's
+ * exit. Rendering is platform-independent so publication ownership stays
+ * assertable on any host; only the platform-gated tests exercise native Windows
+ * process behavior.
+ */
+function nativeWindowsPiFixtureSources(root: string, mode: NativeWindowsPiMode): NativeWindowsPiSources {
   const workerPath = join(root, "pipe-descendant.cjs");
   const entryPath = join(root, "pi-fixture.cjs");
   const workerPidPath = join(root, "worker.pid");
@@ -201,21 +231,20 @@ async function createNativeWindowsPiFixture(mode: "rpc" | "rpc-background" | "co
   const backgroundPidPath = join(root, "background.pid");
   const backgroundStopPath = join(root, "background.stop");
   const backgroundStoppedPath = join(root, "background.stopped");
-  await writeFile(workerPath, [
+  const workerScript = [
     "const fs=require('node:fs');const [pidPath,readyPath,stopPath,stoppedPath]=process.argv.slice(2);",
     "fs.writeFileSync(pidPath,String(process.pid));fs.writeFileSync(readyPath,'ready');",
     "process.on('exit',()=>{try{fs.writeFileSync(stoppedPath,'stopped')}catch{}});",
     "setInterval(()=>{if(fs.existsSync(stopPath)){fs.writeFileSync(stoppedPath,'stopped');process.exit(0)}},20);",
     "if(process.send)process.send('ready');",
-  ].join("\n"));
-  await writeFile(backgroundPath, [
+  ].join("\n");
+  const backgroundScript = [
     "const fs=require('node:fs');const [stopPath,stoppedPath]=process.argv.slice(2);",
     "setInterval(()=>{if(fs.existsSync(stopPath)){fs.writeFileSync(stoppedPath,'stopped');process.exit(0)}},20);",
-  ].join("\n"));
+  ].join("\n");
   const commonRunner = [
-    "const fs=require('node:fs');const {spawn}=require('node:child_process');",
+    "const {spawn}=require('node:child_process');",
     `const holder=spawn(process.execPath,[${JSON.stringify(workerPath)},${JSON.stringify(workerPidPath)},${JSON.stringify(readyPath)},${JSON.stringify(stopPath)},${JSON.stringify(stoppedPath)}],${inheritedPipeHolderOptions});`,
-    "holder.on('message',message=>{if(message==='ready'){fs.writeFileSync(" + JSON.stringify(workerPidPath) + ",String(holder.pid));fs.writeFileSync(" + JSON.stringify(readyPath) + ",'ready');}});",
   ];
   let entryLines: string[];
   if (mode === "rpc" || mode === "rpc-background") {
@@ -230,7 +259,6 @@ async function createNativeWindowsPiFixture(mode: "rpc" | "rpc-background" | "co
       "const settlementSession=process.env.PI_REVIEW_GATE_SETTLEMENT_SESSION;const settlementChild=process.env.PI_REVIEW_GATE_SETTLEMENT_CHILD;const settlementSecret=process.env.PI_REVIEW_GATE_SETTLEMENT_SECRET;const settlementPath=process.env.PI_REVIEW_GATE_SETTLEMENT_PATH;",
       "for(const key of ['PI_REVIEW_GATE_SETTLEMENT_SESSION','PI_REVIEW_GATE_SETTLEMENT_CHILD','PI_REVIEW_GATE_SETTLEMENT_SECRET','PI_REVIEW_GATE_SETTLEMENT_PATH'])delete process.env[key];",
       `const holder=spawn(process.execPath,[${JSON.stringify(workerPath)},${JSON.stringify(workerPidPath)},${JSON.stringify(readyPath)},${JSON.stringify(stopPath)},${JSON.stringify(stoppedPath)}],${inheritedPipeHolderOptions});`,
-      "holder.on('message',message=>{if(message==='ready'){fs.writeFileSync(" + JSON.stringify(workerPidPath) + ",String(holder.pid));fs.writeFileSync(" + JSON.stringify(readyPath) + ",'ready');}});",
       backgroundRunner,
       "const ack=()=>{const settlement=1;const pid=process.pid;const version=2;const oneShot=crypto.createHmac('sha256',settlementSecret).update('pi-review-gate-live-browser-settlement-key:v2:'+settlement).digest();const mac=crypto.createHmac('sha256',oneShot).update(JSON.stringify([version,settlementSession,settlementChild,settlement,pid])).digest('base64url');const receipt={version,sessionId:settlementSession,childId:settlementChild,settlement,pid,mac};fs.mkdirSync(path.dirname(settlementPath),{recursive:true,mode:0o700});const temporary=settlementPath+'.tmp.'+crypto.randomUUID();fs.writeFileSync(temporary,JSON.stringify(receipt)+'\\n',{mode:0o600});fs.renameSync(temporary,settlementPath);};",
       "const out=(value)=>process.stdout.write(JSON.stringify(value)+'\\n');let input='';process.stdin.setEncoding('utf8');",
@@ -242,7 +270,40 @@ async function createNativeWindowsPiFixture(mode: "rpc" | "rpc-background" | "co
       "holder.once('message',message=>{if(message==='ready')setTimeout(()=>process.exit(0),100)});",
     ];
   }
-  await writeFile(entryPath, entryLines.join("\n"));
+  return {
+    root,
+    workerPath,
+    entryPath,
+    workerPidPath,
+    readyPath,
+    stopPath,
+    stoppedPath,
+    backgroundPath,
+    backgroundPidPath,
+    backgroundStopPath,
+    backgroundStoppedPath,
+    workerScript,
+    backgroundScript,
+    entryScript: entryLines.join("\n"),
+  };
+}
+
+async function createNativeWindowsPiFixture(mode: NativeWindowsPiMode): Promise<NativeWindowsPiFixture> {
+  const root = await mkdtemp(join(tmpdir(), `pi-child-teardown-win-${mode}-`));
+  const sources = nativeWindowsPiFixtureSources(root, mode);
+  await writeFile(sources.workerPath, sources.workerScript);
+  await writeFile(sources.backgroundPath, sources.backgroundScript);
+  await writeFile(sources.entryPath, sources.entryScript);
+  const {
+    entryPath,
+    workerPidPath,
+    readyPath,
+    stopPath,
+    stoppedPath,
+    backgroundPidPath,
+    backgroundStopPath,
+    backgroundStoppedPath,
+  } = sources;
   const bin = join(root, "pi-bin");
   await mkdir(bin);
   const shim = join(bin, "pi.cmd");
@@ -459,6 +520,65 @@ test("owned fixture workers are the sole publishers of their PID and ready marke
     );
   } finally {
     await removeOwnedFixtureRoot(fixture.root);
+  }
+});
+
+// The generated native Windows entry scripts follow the same publication
+// contract as the POSIX fixtures above. Inspecting rendered sources runs on any
+// host, but it is evidence about generated scripts only: it does not demonstrate
+// native Windows process timing, which the platform-gated native tests cover on
+// Windows CI.
+test("generated native Windows fixture scripts keep the worker the sole PID and ready publisher", () => {
+  for (const mode of ["rpc", "rpc-background", "compaction"] as const) {
+    const sources = nativeWindowsPiFixtureSources(join(tmpdir(), `pi-child-teardown-win-${mode}-source-inspection`), mode);
+
+    const childPidWrite = sources.workerScript.indexOf("fs.writeFileSync(pidPath,String(process.pid))");
+    const childReadyWrite = sources.workerScript.indexOf("fs.writeFileSync(readyPath,'ready')");
+    const childIpcReady = sources.workerScript.indexOf("if(process.send)process.send('ready');");
+    assert.ok(childPidWrite >= 0, `${mode}: the worker publishes its own PID`);
+    assert.ok(childReadyWrite >= 0, `${mode}: the worker publishes its own ready marker`);
+    assert.ok(childIpcReady >= 0, `${mode}: the worker still announces readiness over IPC`);
+    assert.ok(childPidWrite < childReadyWrite, `${mode}: the worker publishes its PID before its ready marker`);
+    assert.ok(childReadyWrite < childIpcReady, `${mode}: the worker publishes its ready marker before its IPC announcement`);
+
+    const parentWrites = literalWriteFileTargets(sources.entryScript);
+    assert.equal(
+      parentWrites.filter((target) => target === sources.workerPidPath).length,
+      0,
+      `${mode}: the parent must never write the worker PID marker owned by the worker`,
+    );
+    assert.equal(
+      parentWrites.filter((target) => target === sources.readyPath).length,
+      0,
+      `${mode}: the parent must never write the ready marker owned by the worker`,
+    );
+    for (const handler of sources.entryScript.split("\n").filter((line) => /holder\.(on|once)\('message'/.test(line))) {
+      assert.ok(!handler.includes("writeFileSync"), `${mode}: the parent IPC ready handler must not publish worker markers`);
+    }
+
+    assert.equal(
+      parentWrites.filter((target) => target === sources.backgroundPidPath).length,
+      mode === "rpc-background" ? 1 : 0,
+      mode === "rpc-background"
+        ? `${mode}: the parent still publishes the background group PID for the detached child it spawns`
+        : `${mode}: this mode spawns no detached background group`,
+    );
+
+    if (mode === "compaction") {
+      assert.ok(
+        sources.entryScript.includes("holder.once('message',message=>{if(message==='ready')setTimeout(()=>process.exit(0),100)});"),
+        `${mode}: the IPC ready message still bounds the parent's exit after 100ms`,
+      );
+    } else {
+      assert.ok(
+        sources.entryScript.includes("setTimeout(()=>process.exit(0),50)"),
+        `${mode}: the get_state response still bounds the parent's exit after 50ms`,
+      );
+      assert.ok(
+        !/holder\.(on|once)\('message'/.test(sources.entryScript),
+        `${mode}: the parent keeps no redundant IPC-ready publication handler`,
+      );
+    }
   }
 });
 

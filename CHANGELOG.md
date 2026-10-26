@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.203]
+
+### Changed
+
+- The native MCP TUI tests compile their candidate package once per test-file
+  process and reuse it across both real-Pi scenarios. Each scenario retains its
+  own synthetic home, workspace, MCP state, and Pi process; candidate cleanup
+  waits until both tests finish.
+
 ## [0.1.0-dev.202]
 
 ### Changed

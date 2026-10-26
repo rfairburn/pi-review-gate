@@ -6,7 +6,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import {
   DEFAULT_SERVER_NAME,
   REGISTERED_EXPOSURE_FOR_CODENAME_SERVER,
@@ -20,6 +20,8 @@ import { skipOrFail } from "./bridge-fakes";
 const projectRoot = join(dirname(__dirname), "..");
 const DRIVER_OVERALL_TIMEOUT_MS = 7 * 60_000;
 const TEST_TIMEOUT_MS = 10 * 60_000;
+let candidatePackageRoot: string | undefined;
+let candidateEntryPromise: Promise<string> | undefined;
 
 type DriverStep = { index: number; type?: string; ok: boolean; detail?: string; screen?: string; error?: string };
 type DriverResult = {
@@ -96,6 +98,22 @@ async function createCandidatePackage(candidateRoot: string, compiler: string): 
   await symlink(nodeModules, join(candidateRoot, "node_modules"), process.platform === "win32" ? "junction" : "dir");
   return compileCandidate(candidateRoot, compiler);
 }
+
+async function getCandidateEntry(compiler: string): Promise<string> {
+  // The compiled package is shared read-only input; all mutable TUI state stays
+  // in each test's separately owned sandbox and each Pi session is a new process.
+  candidateEntryPromise ??= (async () => {
+    candidatePackageRoot = await mkdtemp(join(tmpdir(), "prg-native-mcp-tui-candidate-"));
+    return await createCandidatePackage(candidatePackageRoot, compiler);
+  })();
+  return await candidateEntryPromise;
+}
+
+// Keep the shared candidate alive across both TUI tests, then remove it even if
+// either test or candidate creation fails.
+after(async () => {
+  if (candidatePackageRoot) await rm(candidatePackageRoot, { recursive: true, force: true });
+});
 
 function observerExtensionSource(): string {
   return String.raw`'use strict';
@@ -507,8 +525,7 @@ async function prepareTuiSandbox(
   const agentDir = join(home, ".pi", "agent");
   const workspace = join(sandbox, "workspace");
   const stateDir = join(sandbox, "fixture-state");
-  const candidateRoot = join(sandbox, "candidate-package");
-  const candidateEntry = await createCandidatePackage(candidateRoot, compiler);
+  const candidateEntry = await getCandidateEntry(compiler);
   const probeEntry = join(projectRoot, "tests", "fixtures", "pi-native-mcp-probe.cjs");
   const serverEntry = join(projectRoot, "tests", "fixtures", "pi-native-mcp-server.cjs");
   const observerEntry = join(sandbox, "observe-tool-results.cjs");

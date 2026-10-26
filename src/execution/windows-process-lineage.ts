@@ -144,6 +144,19 @@ const productionQueryExecutor: WindowsLineageQueryExecutor = (file, args, option
  * snapshot stability and rejects a parent created after its child, preventing a
  * recycled ancestor PID from satisfying proof. Exactly one bounded query child
  * runs per verification: no retry, cache, or polling.
+ *
+ * The two PIDs this verification already knows before querying anything — the
+ * candidate and the owned root — are observed in the script's single initial
+ * request, which saves one CIM round trip per proof. That response is accepted as
+ * usable evidence only when its membership is exactly one candidate row, at most
+ * one owned-root row, and no row for any other PID; a duplicated, ambiguous, or
+ * unexpected row refuses on an existing fixed stage instead of silently selecting
+ * one of the conflicting rows. The initial root record is only a candidate
+ * observation for this verification: it is appended to the chain only after the
+ * parent walk actually reaches the root, and the fresh full-chain snapshot still
+ * re-reads every chain member and re-validates its creation identity, so an earlier
+ * observation can never substitute for the ancestry walk or for the independent
+ * liveness check.
  */
 export async function verifyWindowsProcessLineage(
   ownedRoot: ChildProcess,
@@ -304,8 +317,35 @@ function buildLineageScript(candidatePid: number, rootPid: number): string {
     "$ProgressPreference = 'SilentlyContinue'",
     `$targetPid = ${candidatePid}`,
     `$rootPid = ${rootPid}`,
-    '$current = Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate -Filter "ProcessId = $targetPid"',
+    // One initial request for the only two PIDs known before any walking. The
+    // filter lists exactly those PIDs and nothing else, so the request can never
+    // enumerate the host; the same three properties are read as by every later
+    // lookup. The response is itself a bounded live snapshot, so its membership is
+    // validated before any record is used: exactly one candidate row, at most one
+    // owned-root row, and no row for any other PID. Records are bucketed and counted
+    // in plain language — no extra cmdlet is resolved — so a duplicated, ambiguous,
+    // or unexpected row can never be silently discarded in favour of a later row.
+    '$initial = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate -Filter "ProcessId = $targetPid OR ProcessId = $rootPid")',
+    '$current = $null',
+    '$initialRoot = $null',
+    '$candidateRows = 0',
+    '$rootRows = 0',
+    '$unexpectedRows = 0',
+    'foreach ($initialRecord in $initial) {',
+    '  $observedPid = [long]$initialRecord.ProcessId',
+    '  if ($observedPid -eq $targetPid) { $candidateRows += 1; $current = $initialRecord }',
+    '  elseif ($observedPid -eq $rootPid) { $rootRows += 1; $initialRoot = $initialRecord }',
+    '  else { $unexpectedRows += 1 }',
+    '}',
+    // A missing candidate keeps its original stage and stays ahead of every other
+    // initial-batch refusal, so an unrelated or vanished candidate is reported
+    // exactly as it was before this request was batched.
     `if ($null -eq $current) { ${fail("chain-candidate-record-missing")}; exit 0 }`,
+    // A second candidate row or any row outside the two requested PIDs means this
+    // snapshot is not the one the proof was built on. It is refused with the same
+    // existing membership stage the fresh full-chain snapshot uses, never with a new
+    // stage family, and never by quietly selecting one of the conflicting rows.
+    `if ($candidateRows -gt 1 -or $unexpectedRows -gt 0) { ${fail("snapshot-count-mismatch")}; exit 0 }`,
     "$chain = New-Object System.Collections.ArrayList",
     "[void]$chain.Add([long]$targetPid)",
     "$records = New-Object System.Collections.ArrayList",
@@ -317,8 +357,17 @@ function buildLineageScript(candidatePid: number, rootPid: number): string {
     `  if ($parent -le 0) { ${fail("chain-parent-absent")}; exit 0 }`,
     `  if ($seen.ContainsKey([string]$parent)) { ${fail("chain-cycle")}; exit 0 }`,
     "  if ($parent -eq $rootPid) {",
-    '    $root = Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate -Filter "ProcessId = $rootPid"',
-    `    if ($null -eq $root) { ${fail("chain-owned-root-record-missing")}; exit 0 }`,
+    // The walk reached the owned root, so this verification's own initial root
+    // observation becomes usable now — never before. It is usable only when that
+    // observation was a single unambiguous row: no row, or more than one, refuses
+    // here on the existing owned-root stage, so an ambiguous root never falls through
+    // to the snapshot and an unrelated chain still keeps its own walk stages.
+    // The record then goes through the unchanged fresh snapshot below, which
+    // re-reads the root PID and compares its creation identity: a root that
+    // exited or had its PID reused between the initial request and this moment
+    // is refused there, and never accepted on the strength of the earlier row.
+    `    if ($rootRows -ne 1) { ${fail("chain-owned-root-record-missing")}; exit 0 }`,
+    "    $root = $initialRoot",
     "    [void]$chain.Add($rootPid)",
     "    [void]$records.Add($root)",
     "    $filter = ($chain | ForEach-Object { \"ProcessId = $_\" }) -join ' OR '",

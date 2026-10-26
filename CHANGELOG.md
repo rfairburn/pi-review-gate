@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.209]
+
+### Fixed
+
+- Native Windows teardown fixtures now let their spawned worker be the sole publisher
+  of its own PID and ready markers, in PID-then-ready-then-IPC order, instead of having
+  the parent entry script rewrite the same two files after the worker had already
+  published them. The redundant parent truncation window could expose an empty PID
+  marker to the readiness check and surface as an invalid-PID assertion for a live,
+  correctly published descendant (the duplicate-publication race tracked in #416). The parent
+  entry still publishes the detached background group PID it spawns, and the
+  fixture assertions, deadlines, IPC readiness timing, and cleanup safeguards are
+  unchanged. Test fixtures only: production behavior and CI workflows are unchanged.
+
 ## [0.1.0-dev.208]
 
 ### Fixed

@@ -24,6 +24,7 @@ export interface InputViewport {
 const ESC = "\x1b";
 const CSI = `${ESC}[`;
 const KITTY_SHIFT_ENTER = `${CSI}13;2u`;
+const KITTY_CTRL_J = `${CSI}106;5u`;
 const SS3 = `${ESC}O`;
 const KITTY_SHIFT = 1;
 const KITTY_ALT = 2;
@@ -787,9 +788,10 @@ export function translateInput(
  */
 export function normalizeNativeSourceInput(data: string, sourceKittyProtocolActive: boolean): string {
 	if (sourceKittyProtocolActive && (data === `${ESC}\r` || data === "\n")) return KITTY_SHIFT_ENTER;
-	// In legacy source mode LF is plain Enter; CR is the unambiguous spelling
-	// when forwarding it to a Kitty-active child.
-	if (!sourceKittyProtocolActive && data === "\n") return "\r";
+	// Native Editor handles legacy Ctrl+J/LF as newline before submit, even
+	// though parseKey reports Enter. Preserve Ctrl+J identity for Kitty children;
+	// the target translator restores LF without enhanced reporting, not submit CR.
+	if (!sourceKittyProtocolActive && data === "\n") return KITTY_CTRL_J;
 	return data;
 }
 

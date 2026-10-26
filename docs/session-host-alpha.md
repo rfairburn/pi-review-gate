@@ -1841,6 +1841,22 @@ viewer input to local input. Local input and non-user terminal-query replies use
 same authenticated child decoder. Legacy unframed children retain their existing paths. Atomic assembly
 and admission are protocol boundaries, not an operating-system delivery guarantee.
 
+**Native chat editing.** Local and remote panes preserve Pi's native editor
+keybindings: with the defaults, Ctrl+J and Shift+Enter insert a draft newline without
+submitting, and ordinary Enter submits. Legacy LF input retains Ctrl+J identity
+instead of being converted to Enter; source Kitty-protocol newline aliases retain
+their native Shift+Enter meaning. The child editor still decides the action from its
+configured bindings; the sidebar adds no keyboard mode or binding override.
+
+For manual acceptance on Windows, use an isolated profile and synthetic draft.
+Compare standalone Pi, a local sidebar pane, and a selected remote pane separately:
+type `first line`, press Ctrl+J, and confirm a newline appears without submission.
+Type `second line`, then press ordinary Enter and confirm exactly one intact
+`first line`/`second line` multiline message is submitted. Repeat using Shift+Enter,
+and confirm unselected sessions receive no text. Record the Windows, terminal,
+Node/Pi and application build versions; headless editor or protocol tests do not
+establish which bytes a physical terminal emits or certify the complete pane route.
+
 **External editing.** Ctrl+G still opens Pi's configured external editor; it does not
 open a host replacement editor or change the editor setting. The handoff has no
 operating-system enablement filter: an editor-specific PTY relay in a framing child

@@ -28,6 +28,25 @@ dates.
   title, preventing a clipped credential fragment from escaping redaction while
   preserving the worker instructions and existing UI title (#215).
 
+## [0.1.0-dev.205]
+
+### Changed
+
+- The Windows lineage proof now observes the two process IDs it already knows before
+  querying anything — the settlement candidate and the owned command root — in one
+  filtered CIM request instead of two separate ones, so a verified chain performs one
+  fewer sequential round trip (Refs #194). That response is usable only when it
+  holds exactly one candidate row, at most one owned-root row, and no row for any
+  other PID, so a duplicated, ambiguous, or unexpected row refuses on the existing
+  fixed stages instead of silently selecting one of the conflicting rows. The initial
+  root record is used only once the parent walk actually reaches that PID, and the
+  unchanged fresh full-chain snapshot
+  still re-reads every chain member and re-validates its creation identity, so
+  ancestry walking, PID-reuse and root-liveness refusal, the 64-hop bound, the 4 KiB
+  output bound, and the 5 s single-child deadline are unchanged. No deadline, retry,
+  warm-up, or host skip was added, and no cause is claimed for the still-unreproduced
+  cold-runner query timeout.
+
 ## [0.1.0-dev.204]
 
 ### Fixed

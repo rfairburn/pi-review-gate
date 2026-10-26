@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.205]
+## [0.1.0-dev.207]
 
 ### Fixed
 
@@ -33,6 +33,34 @@ dates.
   Initial/new-window reviews, `needs_changes` corrections, existing capture/integrity
   failures, manual review, isolated `execute`, and the run-as-binary final-response
   behavior remain unchanged.
+
+## [0.1.0-dev.206]
+
+### Fixed
+
+- Sidebar-managed native editors preserve legacy Ctrl+J as Ctrl+J rather than
+  converting it to Enter, preventing premature draft submission in local and
+  networked panes (#518). Ordinary Enter, Shift+Enter, and the native editor's
+  configured keybindings retain their existing semantics.
+
+## [0.1.0-dev.205]
+
+### Changed
+
+- The Windows lineage proof now observes the two process IDs it already knows before
+  querying anything — the settlement candidate and the owned command root — in one
+  filtered CIM request instead of two separate ones, so a verified chain performs one
+  fewer sequential round trip (Refs #194). That response is usable only when it
+  holds exactly one candidate row, at most one owned-root row, and no row for any
+  other PID, so a duplicated, ambiguous, or unexpected row refuses on the existing
+  fixed stages instead of silently selecting one of the conflicting rows. The initial
+  root record is used only once the parent walk actually reaches that PID, and the
+  unchanged fresh full-chain snapshot
+  still re-reads every chain member and re-validates its creation identity, so
+  ancestry walking, PID-reuse and root-liveness refusal, the 64-hop bound, the 4 KiB
+  output bound, and the 5 s single-child deadline are unchanged. No deadline, retry,
+  warm-up, or host skip was added, and no cause is claimed for the still-unreproduced
+  cold-runner query timeout.
 
 ## [0.1.0-dev.204]
 

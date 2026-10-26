@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import test from "node:test";
-import { Key, matchesKey, parseKey, setKittyProtocolActive, StdinBuffer } from "pi-session-host-tui";
+import { Editor, getKeybindings, isKittyProtocolActive, Key, KeybindingsManager, matchesKey, parseKey, setKeybindings, setKittyProtocolActive, StdinBuffer, TUI_KEYBINDINGS, type EditorTheme, type TUI } from "pi-session-host-tui";
 import {
 	InputTargetModes,
 	InputViewport,
@@ -183,7 +183,7 @@ test("native source Kitty state normalizes only the exact Enter aliases before c
 		assert.equal(parseKey(escCr), Key.alt("enter"));
 		assert.equal(parseKey(lf), Key.enter);
 		assert.equal(normalizeNativeSourceInput(escCr, false), escCr, "legacy ESC-CR remains Alt+Enter for the translator");
-		assert.equal(normalizeNativeSourceInput(lf, false), cr, "legacy LF becomes unambiguous Enter for a Kitty child");
+		assert.equal(normalizeNativeSourceInput(lf, false), `${CSI}106;5u`, "legacy LF retains Ctrl+J identity for the target translator");
 
 		setKittyProtocolActive(true);
 		assert.equal(parseKey(escCr), Key.shift("enter"));
@@ -204,10 +204,13 @@ test("native source Kitty state normalizes only the exact Enter aliases before c
 		assert.equal(translated(nativeShift, { kittyFlags: 7 }), shiftEnter);
 		assert.equal(matchesKey(translated(nativeShift, { kittyFlags: 7 }) as string, Key.shift("enter")), true);
 
-		const nativeEnter = normalizeNativeSourceInput(lf, false);
+		const nativeLf = normalizeNativeSourceInput(lf, false);
 		setKittyProtocolActive(true);
-		assert.equal(translated(nativeEnter, { kittyFlags: 7 }), cr);
-		assert.equal(matchesKey(translated(nativeEnter, { kittyFlags: 7 }) as string, Key.enter), true);
+		assert.equal(translated(nativeLf, { kittyFlags: 7 }), `${CSI}106;5u`);
+		assert.equal(matchesKey(translated(nativeLf, { kittyFlags: 7 }) as string, Key.ctrl("j")), true);
+		assert.equal(matchesKey(translated(nativeLf, { kittyFlags: 7 }) as string, Key.shift("enter")), false);
+		assert.equal(translated(nativeLf), lf, "legacy targets retain native LF newline precedence");
+		assert.equal(normalizeNativeSourceInput(cr, false), cr, "ordinary Enter remains submit");
 
 		setKittyProtocolActive(false);
 		const nativeAlt = normalizeNativeSourceInput(escCr, false);
@@ -227,6 +230,86 @@ test("native source Kitty state normalizes only the exact Enter aliases before c
 		assert.equal(matchesKey(translated(legacyShift, { modifyOtherKeys: 2 }) as string, Key.shift("enter")), true);
 	} finally {
 		setKittyProtocolActive(false);
+	}
+});
+
+test("native editor newline precedence survives source normalization and target translation", () => {
+	const previousBindings = getKeybindings();
+	const previousKitty = isKittyProtocolActive();
+	const theme: EditorTheme = {
+		borderColor: (text) => text,
+		selectList: {
+			selectedPrefix: (text) => text, selectedText: (text) => text,
+			description: (text) => text, scrollInfo: (text) => text, noMatch: (text) => text,
+		},
+	};
+	const createEditor = () => new Editor({ requestRender() {} } as TUI, theme);
+	try {
+		setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
+		const cases = [
+			{ sourceKitty: false, packet: "\n" }, // legacy Ctrl+J / LF, not physical-terminal evidence
+			{ sourceKitty: false, packet: `${CSI}106;5u` },
+			{ sourceKitty: false, packet: `${CSI}27;5;106~` },
+			{ sourceKitty: false, packet: `${CSI}13;2u` },
+			{ sourceKitty: false, packet: `${CSI}27;2;13~` },
+			{ sourceKitty: true, packet: "\n" }, // native Kitty-source Shift+Enter alias
+			{ sourceKitty: true, packet: `${ESC}\r` },
+			{ sourceKitty: true, packet: `${CSI}106;5u` },
+			{ sourceKitty: true, packet: `${CSI}13;2u` },
+		];
+		for (const { sourceKitty, packet } of cases) {
+			for (const kittyFlags of [0, 1, 7]) {
+				for (const modifyOtherKeys of [0, 1, 2] as const) {
+					const label = JSON.stringify({ sourceKitty, packet, kittyFlags, modifyOtherKeys });
+					const direct = createEditor();
+					const routed = createEditor();
+					const submits: string[] = [];
+					routed.onSubmit = (text) => submits.push(text);
+					setKittyProtocolActive(sourceKitty);
+					direct.handleInput("first line");
+					direct.handleInput(packet);
+					const output = translated(normalizeNativeSourceInput(packet, sourceKitty), { kittyFlags, modifyOtherKeys });
+					assert.equal(typeof output, "string", label);
+					setKittyProtocolActive((kittyFlags & 1) !== 0);
+					routed.handleInput("first line");
+					routed.handleInput(output as string);
+					assert.equal(direct.getText(), "first line\n", `native baseline: ${label}`);
+					assert.equal(routed.getText(), direct.getText(), label);
+					assert.deepEqual(submits, [], `no early submit: ${label}`);
+					routed.handleInput("second line");
+					assert.equal(routed.getText(), "first line\nsecond line", label);
+					assert.deepEqual(submits, [], label);
+					routed.handleInput(translated(normalizeNativeSourceInput("\r", sourceKitty), { kittyFlags, modifyOtherKeys }) as string);
+					assert.deepEqual(submits, ["first line\nsecond line"], `deliberate Enter: ${label}`);
+				}
+			}
+		}
+
+		// Native configured editing actions precede newline/submit. Ctrl+J must
+		// not become Shift+Enter (raw LF aliases both in Kitty mode).
+		setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {
+			"tui.editor.cursorLineStart": "ctrl+j", "tui.input.newLine": "shift+enter",
+			"tui.input.submit": "ctrl+s",
+		}));
+		for (const kittyFlags of [0, 7]) {
+			setKittyProtocolActive(kittyFlags !== 0);
+			const editor = createEditor();
+			const submits: string[] = [];
+			editor.onSubmit = (text) => submits.push(text);
+			editor.handleInput("ab");
+			editor.handleInput(translated(normalizeNativeSourceInput("\n", false), { kittyFlags }) as string);
+			editor.handleInput("X");
+			assert.equal(editor.getText(), "Xab", "configured native Ctrl+J action, not Shift+Enter");
+			editor.handleInput(translated(`${CSI}13;2u`, { kittyFlags }) as string);
+			assert.equal(editor.getText(), "X\nab", "Shift+Enter keeps its separate native binding");
+			editor.handleInput("\r");
+			assert.deepEqual(submits, [], "ordinary Enter is not forced to submit over native configuration");
+			editor.handleInput(translated(`${CSI}115;5u`, { kittyFlags }) as string);
+			assert.deepEqual(submits, ["X\nab"], "configured native submit still works");
+		}
+	} finally {
+		setKeybindings(previousBindings);
+		setKittyProtocolActive(previousKitty);
 	}
 });
 

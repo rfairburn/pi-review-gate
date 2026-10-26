@@ -38,6 +38,8 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync 
 import { join, resolve } from "node:path";
 import test, { type TestContext } from "node:test";
 import { deflateSync } from "node:zlib";
+import { normalizeNativeSourceInput } from "../src/session-host/input";
+import { createRealKeybindingsManager, GEOMETRY_TUI, loadRealBridgeHost, REAL_IDENTITY_THEME, skipOrFail } from "./bridge-fakes";
 
 import {
 	createInMemoryDirectionalGrantStore,
@@ -2589,6 +2591,81 @@ function statedSource(source: NativeIoInputSource | null | undefined): NativeIoS
 	assert.ok(source !== undefined && source !== null, "this publish states the owner's own native input source");
 	if (isNativeIoStartupSource(source)) throw new Error("this publish was expected to state a conversation source");
 	return source;
+}
+
+for (const kittyFlags of [0, 7]) {
+	test(`network Ctrl+J reaches the native editor without early submit (owner Kitty flags ${kittyFlags})`, async (t) => {
+		const real = await loadRealBridgeHost();
+		if (!real) return skipOrFail(t, "no installed Pi for network native editor input");
+		const nativeKitty = real.tui.setKittyProtocolActive as (active: boolean) => void;
+		const previousKitty = (real.tui.isKittyProtocolActive as () => boolean)();
+		const previousBindings = real.host.tuiGetKeybindings?.();
+		t.after(() => {
+			nativeKitty(previousKitty);
+			real.host.tuiSetKeybindings?.(previousBindings);
+		});
+		const bindings = createRealKeybindingsManager(real.tui);
+		nativeKitty(kittyFlags !== 0);
+		const editor = new real.host.CustomEditor(GEOMETRY_TUI, REAL_IDENTITY_THEME, bindings);
+		const siblingEditor = new real.host.CustomEditor(GEOMETRY_TUI, REAL_IDENTITY_THEME, bindings);
+		siblingEditor.setText("independent sibling draft");
+		const submits: string[] = [];
+		editor.onSubmit = (text) => submits.push(text);
+		siblingEditor.onSubmit = () => assert.fail("nonselected owner must not submit");
+		const owner = await startNativeOwner(t);
+		const sibling = await owner.createRow("unselected-newline-owner");
+		const row = await owner.createRow("selected-newline-owner");
+		owner.setConversation(row, "newline-conversation", 1);
+		await owner.markReady(row);
+		await owner.feed(row, [`\x1b[=0;1u\x1b[=${kittyFlags};1u`, "native prompt"]);
+		const viewer = await connectNativeViewer(t, owner, {
+			label: "newline-viewer", sessionId: row.id, cols: 80, rows: 24,
+		});
+		await withTimeout(viewer.viewer.ready, 5_000, "newline viewer ready");
+		const source = await viewer.nextSource("newline owner input source");
+		const inputModes = viewer.viewer.readSnapshot()!.meta.inputModes;
+		assert.equal(inputModes.kittyFlags, kittyFlags);
+		const sourceKitty = false;
+		const send = async (packet: string): Promise<string> => {
+			const count = row.pty.writes.length;
+			assert.deepEqual(await viewer.viewer.sendInput({
+				source, inputModes, kind: "keyboard",
+				text: normalizeNativeSourceInput(packet, sourceKitty),
+			}), { status: "submitted" });
+			await row.pty.whenWrites(count + 1, "newline input reached its exact owner");
+			const dispatch = owner.lastDispatch(row);
+			assert.deepEqual(dispatch.origin, { kind: "viewer", token: source.sourceToken });
+			assert.deepEqual(dispatch.expectedNativeTuple, { sessionId: "newline-conversation", epoch: 1 });
+			const text = dispatch.payload.toString("utf8");
+			// Actual authenticated owner bytes enter the real CustomEditor. The PTY
+			// itself is synthetic; this is TLS/protocol + headless editor evidence.
+			editor.handleInput(text);
+			return text;
+		};
+		// A current source is insufficient without the caller's committed proof.
+		assert.deepEqual(await viewer.viewer.sendInput({
+			source, inputModes, kind: "keyboard", text: normalizeNativeSourceInput("\n", false),
+		}), { status: "not-sent", reason: "unauthorized" });
+		assert.equal(row.pty.writes.length, 0);
+		viewer.commit(source);
+		for (const newline of ["\n", "\x1b[106;5u", "\x1b[13;2u"]) {
+			editor.setText("");
+			const count = submits.length;
+			await send("first line");
+			const newlineBytes = await send(newline);
+			if (newline === "\n") assert.equal(newlineBytes, kittyFlags === 0 ? "\n" : "\x1b[106;5u");
+			assert.equal(editor.getText(), "first line\n");
+			assert.equal(submits.length, count, "no send callback at newline");
+			await send("second line");
+			assert.equal(editor.getText(), "first line\nsecond line");
+			assert.equal(submits.length, count);
+			assert.equal(await send("\r"), "\r");
+			assert.deepEqual(submits.slice(count), ["first line\nsecond line"]);
+			assert.equal(sibling.pty.writes.length, 0, "no input framing reaches a nonselected owner");
+			assert.equal(siblingEditor.getText(), "independent sibling draft");
+		}
+		owner.succeeded();
+	});
 }
 
 test("a native viewer's input crosses TLS into the framed child under the owner's current source, modes, and paste bound", async (t) => {

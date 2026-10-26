@@ -90,6 +90,7 @@ import { sidebarPaneLines } from "./helpers/session-host-native-roster-witness";
 import { consentsOf, createFakeInventory, createOwnedAgentDir, delay, startCoordinator } from "./session-host-network-peer-coordinator-helpers";
 import { createPosixTestPolicy } from "./session-host-network-peer-state-fixtures";
 import { NODE_SECURITY_FLOOR_CASES } from "./helpers/node-security-floor";
+import { createRealKeybindingsManager, GEOMETRY_TUI, loadRealBridgeHost, REAL_IDENTITY_THEME, skipOrFail } from "./bridge-fakes";
 
 const ESC = "\x1b";
 const ALT_LEFT = `${ESC}[1;3D`;
@@ -5082,8 +5083,77 @@ test("outer source normalization uses ProcessTerminal.kittyProtocolActive, never
   harness.terminal.kittyProtocolActive = false;
   harness.observer.setFlags(5);
   harness.terminal.emitInput("\n");
-  assert.equal(manager.writes.at(-1)?.data, "\r", "passive capability observation does not override actual source mode");
+  assert.equal(manager.writes.at(-1)?.data, "\x1b[106;5u", "legacy LF retains Ctrl+J identity; passive observation does not override actual source mode");
   assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("Main routes Ctrl+J and Shift+Enter into the installed native editor without early submit or sibling edits", async (t) => {
+  const real = await loadRealBridgeHost();
+  if (!real) return skipOrFail(t, "no installed Pi for Main native editor input");
+  const nativeKitty = real.tui.setKittyProtocolActive as (active: boolean) => void;
+  const previousKitty = (real.tui.isKittyProtocolActive as () => boolean)();
+  const previousBindings = real.host.tuiGetKeybindings?.();
+  const harness = createHarness();
+  const manager = await startTwoSessions(harness);
+  try {
+    const bindings = createRealKeybindingsManager(real.tui);
+    const a = new real.host.CustomEditor(GEOMETRY_TUI, REAL_IDENTITY_THEME, bindings);
+    const b = new real.host.CustomEditor(GEOMETRY_TUI, REAL_IDENTITY_THEME, bindings);
+    const submits: Array<{ id: string; text: string }> = [];
+    a.onSubmit = (text) => submits.push({ id: "native-1", text });
+    b.onSubmit = (text) => submits.push({ id: "native-2", text });
+    // Only the manager's production write seam enters an editor, addressed by
+    // the ID Main actually chose. No alternate draft or newline implementation.
+    manager.write = (id, data) => {
+      manager.writes.push({ id, data });
+      assert.ok(id === "native-1" || id === "native-2");
+      (id === "native-1" ? a : b).handleInput(String(data));
+    };
+    a.setText("independent A draft");
+    harness.terminal.emitInput(ENTER); // activate highlighted B
+    await nextTurn();
+    for (const kittyFlags of [0, 7]) {
+      const surface = manager.surface("native-2")!;
+      surface.modes = { ...surface.modes, kittyFlags };
+      nativeKitty(kittyFlags !== 0);
+      for (const packet of ["\n", `${ESC}[106;5u`, `${ESC}[13;2u`, `${ESC}[27;2;13~`]) {
+        harness.terminal.kittyProtocolActive = false;
+        b.setText("");
+        const before = submits.length;
+        harness.terminal.emitInput("first line");
+        harness.terminal.emitInput(packet);
+        assert.equal(b.getText(), "first line\n", JSON.stringify({ kittyFlags, packet }));
+        assert.equal(submits.length, before, "no send callback before deliberate Enter");
+        harness.terminal.emitInput("second line");
+        assert.equal(b.getText(), "first line\nsecond line");
+        assert.equal(submits.length, before);
+        harness.terminal.emitInput(ENTER);
+        assert.deepEqual(submits.slice(before), [{ id: "native-2", text: "first line\nsecond line" }]);
+        assert.equal(a.getText(), "independent A draft", "nonselected editor remains untouched");
+        assert.equal(harness.sidebar?.focus, "main");
+        assert.equal(harness.sidebar?.activeMainOwnerID, "native-2");
+      }
+    }
+    // The CustomEditor's live app actions precede Editor's newline/submit.
+    // Retain that configurable native behavior instead of forcing a newline.
+    const configured = createRealKeybindingsManager(real.tui, { "app.message.copy": "shift+enter" });
+    const custom = new real.host.CustomEditor(GEOMETRY_TUI, REAL_IDENTITY_THEME, configured);
+    let actions = 0;
+    (custom as typeof custom & { onAction(id: string, handler: () => void): void }).onAction("app.message.copy", () => actions++);
+    custom.setText("configured native draft");
+    custom.onSubmit = () => assert.fail("Ctrl+J must not become submit");
+    manager.write = (_id, data) => custom.handleInput(String(data));
+    harness.terminal.emitInput("\n");
+    assert.equal(actions, 0, "Ctrl+J must not invoke the configured Shift+Enter app action");
+    assert.equal(custom.getText(), "configured native draft\n");
+    harness.terminal.emitInput(`${ESC}[13;2u`);
+    assert.equal(actions, 1, "configured native Shift+Enter action retains precedence");
+    assert.equal(custom.getText(), "configured native draft\n");
+  } finally {
+    nativeKitty(previousKitty);
+    real.host.tuiSetKeybindings?.(previousBindings);
+    assert.equal(await closeWithSignal(harness), 0);
+  }
 });
 
 test("confirmed Quit is the only sidebar path that shuts down owned children", async () => {
@@ -10123,6 +10193,36 @@ test("one written remote source receives canonical keyboard, paste, and mouse su
     assert.equal(content.deliveredInputs.length, 5, "every admitted packet reached the one delegate exactly once");
     assert.equal(manager.writes.length, localWrites, "no remote attempt ever reaches a local row's PTY");
     assert.equal(harness.sidebar!.focus, "main", "remote input never steals focus");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("remote Main forwards legacy LF as Ctrl+J with the exact written owner and no local fallback", async (t) => {
+  const { harness, content, manager, source, generation } = await remoteNativeInputHarness(t);
+  try {
+    harness.terminal.kittyProtocolActive = false;
+    harness.observer.setFlags(7);
+    for (const text of ["first line", "\n", "second line", ENTER, `${ESC}[13;2u`]) {
+      harness.terminal.emitInput(text);
+      await nextTurn();
+    }
+    assert.deepEqual(content.deliveredInputs.map((request) => request.text),
+      ["first line", `${ESC}[106;5u`, "second line", ENTER, `${ESC}[13;2u`]);
+    for (const request of content.deliveredInputs) {
+      assert.equal(request.kind, "keyboard");
+      assert.equal(request.hostId, "lab-a");
+      assert.equal(request.selectionGeneration, generation);
+      assert.equal(request.subscriptionId, "sub-a");
+      assert.deepEqual(request.source, source);
+    }
+    assert.equal(manager.writes.length, 0, "remote input never edits a local sibling");
+    assert.equal(harness.sidebar?.focus, "main");
+    const before = content.inputRequests.length;
+    content.setViewerInput(false);
+    harness.terminal.emitInput("\n");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, before, "viewer Off still refuses before delegation");
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
   }

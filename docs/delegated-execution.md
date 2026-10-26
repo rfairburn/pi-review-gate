@@ -172,6 +172,11 @@ items, so a nonexistent token lists nothing and no command is offered or
 executed. On non-interactive hosts the public multi-line editor (with the legacy
 single-line input behind it) is used unchanged.
 
+Successful human submissions share the scheduler's bounded, redacted model launch
+notice, ordered before dependent outcomes. Immediate submissions redact the original
+instructions before deriving the notice's short title; the worker instructions and
+existing UI title are unchanged. No full instruction dump is added to launch notices.
+
 ## Worker review evidence selection
 
 The **Isolated worktree** and **InPlace** rows under `/review-settings` → **Reviewers** →
@@ -812,6 +817,18 @@ host's own main-prompt editor in the interactive Pi TUI — including the native
 filesystem suggestions for first-line leading-`/` tokens, never slash-command
 items — and the established single-line input first, editor behind a cancelled
 input, on non-interactive hosts.
+
+A successful human steer (explicit or interactive) also sends one bounded, redacted
+acceptance notice to its originating session's model with the execution/task/request
+ids, submitted instruction excerpt, and durable request status. Queued or transport-
+acknowledged is not proof that the worker has applied the instruction or completed
+work. The notice uses non-aborting steering delivery: a busy parent receives it at
+its next supported boundary; an idle parent wakes. Dependent outcome notifications
+wait for the notice delivery attempt. Cancelled, empty, rejected, or failed requests
+send no success notice, and retired-session notices are suppressed. An unavailable
+or unacknowledged model channel is reported best-effort without undoing an accepted
+request. Model-facing `SubtasksSteer`, worker controls, and ordinary quiet/noisy
+lifecycle policy remain unchanged.
 
 `SubtasksSteer` accepts an optional `interrupt` boolean (omitted or `false` preserves
 the behavior above). When `true` on a live executor turn, the adapter first aborts the

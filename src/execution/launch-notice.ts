@@ -187,18 +187,26 @@ export async function deliverSubtaskLaunchNotice(
   notice: SubtaskLaunchNotice,
   options?: { timeoutMs?: number },
 ): Promise<"delivered" | "unavailable" | "uncertain"> {
+  try {
+    return deliverSubtaskNotice(pi, {
+      customType: "pi-review-subtask-launch",
+      ...formatSubtaskLaunchNotice(notice),
+      display: true,
+    } satisfies SubtaskLaunchMessage, options);
+  } catch {
+    return "unavailable";
+  }
+}
+
+/** Shared bounded, non-aborting delivery for human action and launch notices. */
+export async function deliverSubtaskNotice(
+  pi: unknown,
+  message: { customType: string; content: string; display: true; details: Record<string, unknown> },
+  options?: { timeoutMs?: number },
+): Promise<"delivered" | "unavailable" | "uncertain"> {
   if (!isRecord(pi) || typeof pi.sendMessage !== "function") return "unavailable";
   try {
-    const { content, details } = formatSubtaskLaunchNotice(notice);
-    const sent = pi.sendMessage(
-      {
-        customType: "pi-review-subtask-launch",
-        content,
-        display: true,
-        details,
-      } satisfies SubtaskLaunchMessage,
-      { deliverAs: "steer", triggerTurn: true },
-    );
+    const sent = pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true });
     // A synchronous void send is accepted immediately; a host that returns a
     // promise for the send participates in the bounded delivery attempt, so
     // a wedged message channel can never hold result notifications forever.

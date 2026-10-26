@@ -33,6 +33,7 @@ import {
   nodeFloorSatisfied,
   resolvePiHost,
   type PiHostResolution,
+  type FixtureUiResponder,
 } from "./pi-native-mcp-fixture";
 
 export const BG_SHELL_WAKE_PROVIDER_ID = "prg-fixture";
@@ -68,6 +69,8 @@ export interface BgShellWakeFixtureOptions {
 	gateConfig?: object | null;
 	/** Parent dir for the scratch tree. Default os.tmpdir() (outside the repo). */
 	scratchParent?: string;
+	/** Drive real registered human commands through native RPC dialogs. */
+	uiResponder?: FixtureUiResponder;
 	timeouts?: {
 		/** Per-RPC-request and startup wait budget. Default 30 s. */
 		requestMs?: number;
@@ -230,6 +233,13 @@ export class BgShellWakeFixture {
 					parsed = JSON.parse(line);
 				} catch {
 					continue; // non-JSON noise
+				}
+				const event = parsed as Record<string, unknown>;
+				if (event.type === "extension_ui_request" && typeof event.id === "string"
+					&& ["select", "confirm", "input", "editor"].includes(String(event.method)) && this.options.uiResponder) {
+					const answer = this.options.uiResponder(event);
+					child.stdin?.write(`${JSON.stringify({ type: "extension_ui_response", id: event.id, ...(answer ?? { cancelled: true }) })}\n`);
+					continue;
 				}
 				const response = parsed as { id?: string; success?: boolean; error?: string; data?: unknown };
 				if (typeof response.id !== "string") continue;

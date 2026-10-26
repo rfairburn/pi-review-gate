@@ -15,6 +15,25 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.207]
+
+### Fixed
+
+- Human `/subtask-steer` commands now give the originating model one bounded,
+  redacted acceptance notice before dependent outcomes, distinguishing queued or
+  acknowledged requests from applied instructions or completed work. Cancelled and
+  failed requests send no success notice; model-facing steering and worker controls
+  are unchanged (#215).
+- Immediate human `/subtask-add` launch notices redact before deriving their short
+  title, preventing a clipped credential fragment from escaping redaction while
+  preserving the worker instructions and existing UI title (#215).
+- The native clipboard routing test now measures its real-Main selection only after
+  the turn's terminal review-gate deferred notice has rendered, so that notice can
+  no longer scroll the conversation between measurement and copy and select the
+  wrong rows. Exact payload, padding, helper-byte, and clipboard-request-count
+  assertions, the fallback-copy timing, and the other fixture legs are unchanged;
+  production behavior is unchanged (#521).
+
 ## [0.1.0-dev.206]
 
 ### Fixed

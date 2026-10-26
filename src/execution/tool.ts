@@ -3,7 +3,7 @@ import { editNativeTextField } from "../native-text-field";
 import type { NativeEditorCustomFactory, NativeEditorFactory } from "../native-editor-bridge";
 import type { ReviewGateState } from "../state";
 import { scopedModelChoices } from "../settings/models";
-import type { ExecutionAssociationsSnapshot } from "../session-state";
+import { sessionPersistenceIdentity, type ExecutionAssociationsSnapshot } from "../session-state";
 import {
   BackgroundExecutionController,
   isActiveTaskState,
@@ -17,7 +17,8 @@ import {
   type ParentCheckpointSaveResult,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
-import { deliverSubtaskLaunchNotice, launchNoticeGate, type LaunchNoticeGate, type SubtaskLaunchNotice } from "./launch-notice";
+import { deliverSubtaskLaunchNotice, deliverSubtaskNotice, launchNoticeGate, type LaunchNoticeGate, type SubtaskLaunchNotice } from "./launch-notice";
+import { formatHumanSteerNotice } from "./steer-notice";
 import {
   deliverInterruptFeedback,
   formatInterruptSettlementForTool,
@@ -228,8 +229,8 @@ interface NormalizedInput {
 export class ExecutionToolManager {
   private registered = false;
   private commandsRegistered = false;
-  /** Issue #191: bumped when this manager's session retires, so feedback for an
-   *  in-flight /subtask-interrupt is never queued after its owner session ended. */
+  /** Bumped when this manager's session retires, so in-flight human command
+   * feedback is never queued after its owner session ended. */
   private ownerGeneration = 0;
   private launchAllowedExecutionTools: Set<string> | undefined;
   /**
@@ -314,6 +315,8 @@ export class ExecutionToolManager {
     kind: Parameters<BackgroundExecutionController["start"]>[1],
     workspace: string | undefined,
     options: { startCallFingerprint?: string },
+    originIsCurrent: () => boolean,
+    noticeTitle: (definition: BackgroundTaskDefinition) => string = (definition) => definition.title,
   ): Promise<BackgroundInspection> {
     const gate = launchNoticeGate();
     let inspection: BackgroundInspection;
@@ -327,8 +330,8 @@ export class ExecutionToolManager {
       origin: "human-command",
       executionId: inspection.executionId,
       kind: inspection.kind,
-      tasks: inspection.tasks.map((task) => ({ taskId: task.taskId, title: task.definition.title })),
-    });
+      tasks: inspection.tasks.map((task) => ({ taskId: task.taskId, title: noticeTitle(task.definition) })),
+    }, originIsCurrent);
     return inspection;
   }
 
@@ -336,6 +339,7 @@ export class ExecutionToolManager {
   private async addWithSharedLaunchNotice(
     executionId: string | undefined,
     tasks: Parameters<BackgroundExecutionController["add"]>[1],
+    originIsCurrent: () => boolean,
   ): Promise<BackgroundInspection> {
     const gate = launchNoticeGate();
     let inspection: BackgroundInspection;
@@ -353,7 +357,7 @@ export class ExecutionToolManager {
       kind: inspection.kind,
       tasks: addedTasks.map((task) => ({ taskId: task.taskId, title: task.definition.title })),
       addedTaskIds: addedTaskIds,
-    });
+    }, originIsCurrent);
     return inspection;
   }
 
@@ -363,8 +367,9 @@ export class ExecutionToolManager {
    * an unavailable model channel is reported best-effort (the admission
    * itself still succeeded and its ordinary notifications stay active).
    */
-  private async deliverSharedLaunchNotice(gate: LaunchNoticeGate, notice: SubtaskLaunchNotice): Promise<void> {
+  private async deliverSharedLaunchNotice(gate: LaunchNoticeGate, notice: SubtaskLaunchNotice, originIsCurrent: () => boolean): Promise<void> {
     try {
+      if (!originIsCurrent()) return;
       const outcome = await deliverSubtaskLaunchNotice(this.input.pi, notice);
       if (outcome === "unavailable") {
         console.warn(`review gate: ${notice.origin === "scheduled" ? "scheduled" : "/subtask-add"} launch notice could not be delivered to the model; execution ${notice.executionId} was admitted and its ordinary notifications remain active`);
@@ -418,15 +423,32 @@ export class ExecutionToolManager {
     }
   }
 
+  private commandOriginGuard(ctx: unknown): () => boolean {
+    const owner = this.ownerGeneration;
+    const identity = () => JSON.stringify(sessionPersistenceIdentity(ctx, this.input.cwd()));
+    try {
+      const origin = identity();
+      return () => {
+        if (owner !== this.ownerGeneration) return false;
+        try { return origin === identity(); } catch { return false; }
+      };
+    } catch {
+      // A retired native context may refuse identity reads. No notice may use
+      // it, but that must not change the command's actual acceptance result.
+      return () => false;
+    }
+  }
+
   private registerUserCommands(): void {
     if (!isRecord(this.input.pi) || typeof this.input.pi.registerCommand !== "function") return;
     const pi = this.input.pi;
-    const register = (name: string, description: string, handler: (args: string, ctx: unknown) => Promise<unknown | undefined>) => {
+    const register = (name: string, description: string, handler: (args: string, ctx: unknown, originIsCurrent: () => boolean) => Promise<unknown | undefined>) => {
       pi.registerCommand(name, {
         description,
         handler: async (args: string, ctx: unknown) => {
+          const originIsCurrent = this.commandOriginGuard(ctx);
           try {
-            const value = await handler(args, ctx);
+            const value = await handler(args, ctx, originIsCurrent);
             if (value !== undefined) await notifyUserCommand(ctx, this.input.notify, formatUserCommandResult(value), "info");
           } catch (error) {
             await notifyUserCommand(ctx, this.input.notify, `review gate: /${name} failed: ${messageOf(error)}`, "error");
@@ -445,12 +467,12 @@ export class ExecutionToolManager {
       const selected = await selectTask(this.controller, ctx, "Inspect background subtask");
       return selected ? this.controller.inspectTask(selected.executionId, selected.taskId) : undefined;
     });
-    register("subtask-add", "Submit a subtask: the plain text argument is the raw instructions of one task in one new group immediately; no arguments opens the staged task form with an explicit submission step.", async (args, ctx) => {
+    register("subtask-add", "Submit a subtask: the plain text argument is the raw instructions of one task in one new group immediately; no arguments opens the staged task form with an explicit submission step.", async (args, ctx, originIsCurrent) => {
       const trimmed = args.trim();
       // #120: no arguments opens the staged multi-field submission form
       // (new or existing group). This replaces the former pick-an-execution
       // flow, which only existed for the JSON path.
-      if (!trimmed) return await this.subtaskAddForm(ctx);
+      if (!trimmed) return await this.subtaskAddForm(ctx, originIsCurrent);
       // #120 (correction): every nonblank argument is the raw task
       // instructions of exactly one task in one new default execution group —
       // including text that begins with an existing execution id, JSON-only
@@ -465,9 +487,13 @@ export class ExecutionToolManager {
         "execute",
         undefined,
         { startCallFingerprint: toolCallFingerprint("SubtasksStart", { tasks: [definition] }) },
+        originIsCurrent,
+        // Derive the model-only title from canonical, uncut instructions:
+        // redact BEFORE the existing 80-character title bound can cut a token.
+        (task) => clipPlain(redactSensitiveText(task.instructions), 80),
       );
     });
-    register("subtask-steer", "Pick and steer a queued, active, or reviewing task; explicit arguments remain optional.", async (args, ctx) => {
+    register("subtask-steer", "Pick and steer a queued, active, or reviewing task; explicit arguments remain optional.", async (args, ctx, originIsCurrent) => {
       const explicit = args.trim().length > 0;
       let executionId: string | undefined;
       let taskId: string | undefined;
@@ -503,14 +529,32 @@ export class ExecutionToolManager {
         instruction = (await editNativeTextField(ui, "Steering instruction", "", { preferInputFirst: true })) ?? "";
         if (!instruction.trim()) return undefined;
       }
-      return this.controller.steer({
-        executionId,
-        taskId,
-        instructions: instruction,
-        instructionId: `user-steer-${randomUUID()}`,
-        actor: "user",
-        ...(interrupt === undefined ? {} : { interrupt }),
-      });
+      const gate = launchNoticeGate();
+      const instructionId = `user-steer-${randomUUID()}`;
+      try {
+        const inspection = await this.controller.steer({
+          executionId,
+          taskId,
+          instructions: instruction,
+          instructionId,
+          actor: "user",
+          ...(interrupt === undefined ? {} : { interrupt }),
+        }, { actionNoticeGate: gate.pending });
+        const task = inspection.tasks.find((candidate) => candidate.taskId === taskId);
+        const command = task?.commands.find((candidate) => candidate.instructionId === instructionId);
+        const notice = command && task ? formatHumanSteerNotice(inspection.executionId, task.taskId, command) : undefined;
+        if (notice && originIsCurrent()) {
+          const outcome = await deliverSubtaskNotice(this.input.pi, notice);
+          if (outcome === "unavailable") {
+            console.warn("review gate: /subtask-steer notice could not be delivered to the model; the accepted request is unaffected");
+          } else if (outcome === "uncertain") {
+            console.warn("review gate: /subtask-steer notice was not acknowledged within its bounded window; whether it was enqueued is UNKNOWN and it may still arrive; the accepted request is unaffected");
+          }
+        }
+        return inspection;
+      } finally {
+        gate.resolve();
+      }
     });
     register("subtask-interrupt", "Pick a queued or active task to interrupt; explicit arguments remain optional.", async (args, ctx) => {
       let [executionId, taskId, mode] = words(args);
@@ -643,7 +687,7 @@ export class ExecutionToolManager {
    * inherit without retargeting. Submission routes through the same controller
    * Start/Add behavior and role routing the model tools use.
    */
-  private async subtaskAddForm(ctx: unknown): Promise<BackgroundInspection | undefined> {
+  private async subtaskAddForm(ctx: unknown, originIsCurrent: () => boolean): Promise<BackgroundInspection | undefined> {
     await this.prepareCommandDispatch(ctx);
     const ui = commandUi(ctx);
     if (!ui || (!ui.input && !ui.editor)) {
@@ -680,7 +724,7 @@ export class ExecutionToolManager {
         task,
       });
       if (!confirmed) return undefined;
-      return await this.addWithSharedLaunchNotice(target.executionId, this.withParentTools([task], target.kind));
+      return await this.addWithSharedLaunchNotice(target.executionId, this.withParentTools([task], target.kind), originIsCurrent);
     }
 
     const task = await this.formTaskFields(ui);
@@ -714,6 +758,7 @@ export class ExecutionToolManager {
       resolvedKind,
       resolvedWorkspace ? resolvedWorkspace : undefined,
       { startCallFingerprint: toolCallFingerprint("SubtasksStart", nativeInput) },
+      originIsCurrent,
     );
   }
 

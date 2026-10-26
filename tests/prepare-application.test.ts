@@ -152,8 +152,8 @@ function writeFakeNpm(binDir: string, callsFile: string): void {
 function writeDdgsDistribution(venv: string): void {
   const sitePackages = join(venv, "lib", "python3.14", "site-packages");
   mkdirSync(join(sitePackages, "ddgs"), { recursive: true });
-  mkdirSync(join(sitePackages, "ddgs-9.16.0.dist-info"), { recursive: true });
-  writeFileSync(join(sitePackages, "ddgs-9.16.0.dist-info", "METADATA"), "Name: ddgs\nVersion: 9.16.0\n", "utf8");
+  mkdirSync(join(sitePackages, "ddgs-9.16.1.dist-info"), { recursive: true });
+  writeFileSync(join(sitePackages, "ddgs-9.16.1.dist-info", "METADATA"), "Name: ddgs\nVersion: 9.16.1\n", "utf8");
 }
 
 function writeExecutable(file: string, content: string): void {
@@ -513,11 +513,22 @@ test("DDGS readiness is marker-gated: validation runs only when the environment 
   assert.equal(warm.provisioned, false, "a completed environment is reused without starting Python");
   assert.equal(provisions, 1);
 
+  // An older pin's completed marker cannot authorize current-version reuse,
+  // even with unchanged interpreter and component identities.
+  const markerPath = join(stateRoot, "ddgs.json");
+  const marker = JSON.parse(readFileSync(markerPath, "utf8"));
+  marker.version = "9.16.0";
+  writeFileSync(markerPath, JSON.stringify(marker), "utf8");
+  assert.equal((await prepare.ensureDdgsReady(options)).provisioned, true);
+  assert.equal(provisions, 2, "the previous pin must trigger validation/repair");
+  assert.equal((await prepare.ensureDdgsReady(options)).provisioned, false);
+  assert.equal(provisions, 2, "the newly recorded environment remains reusable");
+
   // A replaced interpreter path invalidates the marker.
   rmSync(python);
   writeExecutable(python, "#!/bin/sh\nexit 0\n");
   await prepare.ensureDdgsReady(options);
-  assert.equal(provisions, 2);
+  assert.equal(provisions, 3);
 
   // An explicit venv selection must be the one that is ready.
   const otherVenv = join(root, "other-venv");
@@ -525,7 +536,7 @@ test("DDGS readiness is marker-gated: validation runs only when the environment 
   writeExecutable(join(otherVenv, "bin", "python"), "#!/bin/sh\nexit 0\n");
   writeDdgsDistribution(otherVenv);
   await prepare.ensureDdgsReady({ ...options, env: { ...environment, PI_REVIEW_GATE_DDGS_VENV: otherVenv } });
-  assert.equal(provisions, 3);
+  assert.equal(provisions, 4);
 
   // A provisioned interpreter may legitimately be a virtual-environment symlink.
   const linkVenv = join(root, "link-venv");
@@ -1349,8 +1360,8 @@ test("deleting the installed DDGS package invalidates the component marker", asy
   const venv = prepare.ddgsVenvPath(homeDir, environment);
   const sitePackages = join(venv, "lib", "python3.14", "site-packages");
   mkdirSync(join(sitePackages, "ddgs"), { recursive: true });
-  mkdirSync(join(sitePackages, "ddgs-9.16.0.dist-info"), { recursive: true });
-  writeFileSync(join(sitePackages, "ddgs-9.16.0.dist-info", "METADATA"), "Name: ddgs\nVersion: 9.16.0\n", "utf8");
+  mkdirSync(join(sitePackages, "ddgs-9.16.1.dist-info"), { recursive: true });
+  writeFileSync(join(sitePackages, "ddgs-9.16.1.dist-info", "METADATA"), "Name: ddgs\nVersion: 9.16.1\n", "utf8");
   mkdirSync(join(venv, "bin"), { recursive: true });
   const python = join(venv, "bin", "python");
   writeExecutable(python, "#!/bin/sh\nexit 0\n");

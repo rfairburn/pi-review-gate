@@ -387,7 +387,7 @@ function smokeInstalledWebLauncher(installed) {
     fs.writeFileSync(python, [
       "#!/bin/bash",
       "{ printf '%s\\t' \"$@\"; printf '\\n'; } >> \"$CAPTURE_DIR/python-calls\"",
-      '[[ "$1" == "-I" && "$2" == "-c" && "$4" == "9.16.0" ]] && exit 0',
+      '[[ "$1" == "-I" && "$2" == "-c" && "$4" == "9.16.1" ]] && exit 0',
       '[[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" && "$4" == "check" ]] && exit 0',
       "exit 97",
       "",
@@ -463,7 +463,7 @@ function smokeInstalledWebLauncher(installed) {
     // (issue 344): a revalidation pair is not run again on the same launch.
     assert.equal(pythonCalls.length, 2, "the actual helper runs one validation pass and its pip check");
     assert.ok(pythonCalls.every((call) => call[0] === "-I"), "all packaged helper invocations must use isolated mode");
-    assert.equal(pythonCalls.filter((call) => call[1] === "-c" && call[3] === "9.16.0").length, 1, "the DDGS validation retains the version pin");
+    assert.equal(pythonCalls.filter((call) => call[1] === "-c" && call[3] === "9.16.1").length, 1, "the DDGS validation retains the version pin");
     assert.equal(pythonCalls.filter((call) => call[1] === "-m" && call[2] === "pip" && call[3] === "check").length, 1);
   } finally {
     fs.rmSync(fixture, { recursive: true, force: true });
@@ -495,7 +495,7 @@ function smokeInstalledGateLauncher(installed) {
     fs.writeFileSync(python, [
       "#!/bin/bash",
       "{ printf '%s\\t' \"$@\"; printf '\\n'; } >> \"$CAPTURE_DIR/python-calls\"",
-      'if [[ "$1" == "-I" && "$2" == "-c" && "$4" == "9.16.0" ]]; then exit 0; fi',
+      'if [[ "$1" == "-I" && "$2" == "-c" && "$4" == "9.16.1" ]]; then exit 0; fi',
       'if [[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" && "$4" == "check" ]]; then exit 0; fi',
       "exit 97",
       "",

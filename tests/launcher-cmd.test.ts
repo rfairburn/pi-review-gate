@@ -1847,6 +1847,11 @@ async function stageDdgsStubScenario(fixture: Fixture, scenario: DdgsStubScenari
   await chmod(venvPythonPath, 0o755);
 }
 
+test("shell and native provisioning select the same DDGS version", async () => {
+  const script = await readFile(resolve("scripts/ensure-ddgs.sh"), "utf8");
+  assert.equal(/^DDGS_VERSION="([^"]+)"/m.exec(script)?.[1], helperModule.DDGS_VERSION);
+});
+
 test("helper validates a valid cached DDGS venv exactly once without provisioning", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
   const fixture = await makeFixture("pi-review-cmd-ddgs-cached-");
   await mkdir(fixture.agentDir, { recursive: true });
@@ -1935,6 +1940,9 @@ test("helper repairs an invalid cached venv and revalidates the full contract", 
   for (const flag of ["--only-binary=:all:", "--no-cache-dir", "--no-input", "--disable-pip-version-check"]) {
     assert.ok(install.args.includes(flag), `the pinned resolver flags must be unchanged: missing ${flag}`);
   }
+  assert.ok(install.args.includes("--upgrade"), "repair must upgrade the selected dependency graph");
+  assert.equal(install.args[install.args.indexOf("--upgrade-strategy") + 1], "eager",
+    "repair must eagerly resolve compatible transitive upgrades");
   assertIsolatedPythonCalls(calls);
   assert.equal(await launchStarted(fixture), true, "a repaired venv must let the launch continue");
   assert.equal((await capturedLaunch(fixture)).ddgsEnv, join(fixture.ddgsVenv, "bin", "python"));
@@ -2092,7 +2100,7 @@ test("helper fails closed when no isolated-mode Python interpreter is available"
   const result = await runHelperExpectingFailure([], fixtureEnv(fixture));
 
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /Python 3 is required to provision the DDGS web-search dependency/);
+  assert.match(result.stderr, /Python 3 is required to provision the DDGS web-search dependency \(install Python 3\.10 or newer/);
   assert.equal(await launchStarted(fixture), false);
 });
 
@@ -2398,12 +2406,12 @@ test("launcher initialization rejects a destination occupied by a directory", as
 
 test("helper ddgs python path follows the platform venv layout", () => {
   assert.equal(
-    helperModule.ddgsPythonPath("C:\\cache\\ddgs-9.16.0", "win32"),
-    "C:\\cache\\ddgs-9.16.0\\Scripts\\python.exe",
+    helperModule.ddgsPythonPath("C:\\cache\\ddgs-9.16.1", "win32"),
+    "C:\\cache\\ddgs-9.16.1\\Scripts\\python.exe",
   );
   assert.equal(
-    helperModule.ddgsPythonPath("/home/r/.cache/ddgs-9.16.0", "linux"),
-    "/home/r/.cache/ddgs-9.16.0/bin/python",
+    helperModule.ddgsPythonPath("/home/r/.cache/ddgs-9.16.1", "linux"),
+    "/home/r/.cache/ddgs-9.16.1/bin/python",
   );
 });
 
@@ -2859,7 +2867,7 @@ if (isWindows) {
       );
 
       assert.equal(outcome.status, 1);
-      assert.match(outcome.stderr, /Python 3 is required to provision the DDGS web-search dependency/);
+      assert.match(outcome.stderr, /Python 3 is required to provision the DDGS web-search dependency \(install Python 3\.10 or newer/);
       assert.deepEqual((await readFile(join(fixture.capture, "refused-python"), "utf8")).trim().split("\n"),
         ["python3", "python", "py"], "every supported Windows Python probe was refused");
       assert.equal(await launchStarted(fixture), false, "a missing interpreter must stop the launch");

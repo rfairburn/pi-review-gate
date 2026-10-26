@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.202]
+
+### Changed
+
+- Upgrade the managed WebSearch dependency to `ddgs==9.16.1`, requiring Python
+  3.10 or newer (#513). Shell and native provisioning retain eager dependency
+  resolution, binary-only isolated installation, pinned-version validation, and
+  `pip check`; current-environment reuse and the local search bridge contract are
+  unchanged. This inherits upstream Google-engine disabling and narrower Startpage
+  extraction/filtering, without changing local provider or ranking policy.
+
 ## [0.1.0-dev.201]
 
 ### Changed

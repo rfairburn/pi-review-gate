@@ -93,7 +93,7 @@ const CLEANUP_LOCK_POLL_MS = LOCK_POLL_MS / 2;
  * always keeps enough of its own budget to take the lock or give up cleanly.
  */
 const CLEANUP_LOCK_PROBE_RESERVE_MS = CLEANUP_LOCK_POLL_MS * 2;
-const DDGS_VERSION = "9.16.0";
+const DDGS_VERSION = "9.16.1";
 const MAX_CONSUMER_LEASES = 256;
 
 function out(text) {
@@ -2171,7 +2171,7 @@ function ensureDdgs(homeDir, env, platform = process.platform) {
     }
     const interpreter = findPythonInterpreter();
     if (!interpreter) {
-      note("pi-review-gate: Python 3 is required to provision the DDGS web-search dependency (install Python 3.9 or newer and put it on PATH)\n");
+      note("pi-review-gate: Python 3 is required to provision the DDGS web-search dependency (install Python 3.10 or newer and put it on PATH)\n");
       return { ok: false, exitCode: 1 };
     }
     const created = spawnSync(interpreter.file, [...interpreter.prefixArgs, "-I", "-m", "venv", venv], { stdio: "inherit" });

@@ -41,7 +41,7 @@ Behavioral detail lives in the linked pages.
     repository). Review-only use without Git still works; with Git, ignored files are
     excluded from capture by Git's own enumeration.
 
-- **Python 3, for `WebSearch`** — user-installed with the standard `venv`/`pip`
+- **Python 3.10 or newer, for `WebSearch`** — user-installed with the standard `venv`/`pip`
   tooling (`python3` on macOS/Linux; Windows also supports `python` and the
   existing `py -3` launcher); the pinned DDGS environment is created and managed
   automatically below. No other runtime feature uses Python.
@@ -70,7 +70,7 @@ engine declaration; do not interpret that absence as verification of every versi
 
 - **The `WebSearch` DDGS environment** — the launcher and the `pi-review-web.sh`
   wrapper automatically create, validate, and repair a per-user venv containing the
-  pinned `ddgs==9.16.0` (the Windows launcher performs equivalent native provisioning
+  pinned `ddgs==9.16.1` (the Windows launcher performs equivalent native provisioning
   with a `Scripts\\python.exe` venv; the `.sh` helpers use `bin/python`). The cache is
   `~/.cache/pi-review-gate` by default, relocatable via
   `PI_REVIEW_GATE_DDGS_VENV` and `XDG_CACHE_HOME`. Creating or repairing that venv

@@ -1233,6 +1233,9 @@ test("ensure-ddgs repairs an invalid environment and revalidates the full contra
   for (const flag of ["--only-binary=:all:", "--no-cache-dir", "--no-input", "--disable-pip-version-check"]) {
     assert.ok(install.args.includes(flag), `the pinned resolver flags must be unchanged: missing ${flag}`);
   }
+  assert.ok(install.args.includes("--upgrade"), "repair must upgrade the selected dependency graph");
+  assert.equal(install.args[install.args.indexOf("--upgrade-strategy") + 1], "eager",
+    "repair must eagerly resolve compatible transitive upgrades");
   assertIsolatedEnsureDdgsCalls(calls);
 });
 
@@ -1547,7 +1550,7 @@ async function makeInstalledBinFixture(
   const ddgsPython = join(ddgsVenv, "bin", "python");
   await writeFile(ddgsPython, [
     "#!/bin/bash",
-    'if [[ "$1" == "-I" && "$2" == "-c" && "$4" == "9.16.0" ]]; then exit 0; fi',
+    'if [[ "$1" == "-I" && "$2" == "-c" && "$4" == "9.16.1" ]]; then exit 0; fi',
     'if [[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" && "$4" == "check" ]]; then exit 0; fi',
     "exit 93",
     "",

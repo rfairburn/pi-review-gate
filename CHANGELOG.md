@@ -15,6 +15,25 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.208]
+
+### Fixed
+
+- Primary and every InPlace adapter now re-enter automatic review within the same
+  passing-review confirmation/follow-up loop only for new originating-session/task
+  captured reviewable activity (#316). A qualifying call alone plus workspace drift,
+  unchanged confirmations, repeated finals, and already-reviewed evidence do not
+  retrigger review. Workspace-only or checkpoint-only churn retains the identifiable
+  prior pass with an explicit warning that it covers previously reviewed evidence
+  only: later unattributed changes are not approved, and the current workspace is not
+  certified. Genuine new captured own reviewable edits and relevant observed outside-root
+  mutation candidates still require review, without proof of an external file diff.
+  Missing, unsupported, or incomplete tool capture remains best effort with disclosed
+  limits, not proof of no effects, a snapshot-only fallback trigger, or a new blocker.
+  Initial/new-window reviews, `needs_changes` corrections, existing capture/integrity
+  failures, manual review, isolated `execute`, and the run-as-binary final-response
+  behavior remain unchanged.
+
 ## [0.1.0-dev.207]
 
 ### Fixed

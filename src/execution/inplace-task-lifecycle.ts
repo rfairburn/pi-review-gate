@@ -457,8 +457,8 @@ export function inPlaceExternalLine(result: {
  * The concise factual completion lines for a settled in-place task (#220/PR226):
  * identity/workspace plus the actual review disposition, then the recorded
  * delta and the observed external paths as separate named categories. No
- * rollback/attribution/observability narrative; the detailed evidence stays
- * durable in result.json, the review cycle records, and the reviewer request.
+ * rollback narrative; same-pass attribution warnings remain visible here.
+ * Detailed evidence stays durable in result.json, cycle records and requests.
  */
 export function buildInPlaceCompletionLines(result: InPlaceLifecycleResult): string[] {
   const externalLine = inPlaceExternalLine(result);
@@ -466,6 +466,7 @@ export function buildInPlaceCompletionLines(result: InPlaceLifecycleResult): str
     `In-place task ${result.taskId} finished in place in ${result.workspaceRoot}. Review: ${inPlaceReviewDisposition(result)}.`,
     inPlaceChangedLine(result),
     ...(externalLine ? [externalLine] : []),
+    ...(result.status === "reviewed" && result.automaticReviewNotArmed ? [result.automaticReviewNotArmed] : []),
     ...inPlaceLimitLines(result),
   ];
 }

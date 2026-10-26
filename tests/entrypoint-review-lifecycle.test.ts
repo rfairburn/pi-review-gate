@@ -13,7 +13,8 @@ import { activate } from "../src/index";
 import { reapAll } from "../src/background-shell";
 import { SessionStateStore } from "../src/session-state";
 import { normalizeConfig } from "../src/config";
-import { recordToolCallEvidence } from "../src/evidence";
+import { recordToolCallEvidence, recordToolResultEvidence } from "../src/evidence";
+import { capturePrimaryOperationBoundary, retainPrimaryToolAfter, settlePrimaryOperationBoundary } from "../src/review-evidence";
 import { runReview } from "../src/review";
 import { beginAgentRun, buildRequestContext, getCorrectionAttemptCount } from "../src/state";
 import { agentCatalog } from "./helpers";
@@ -2091,6 +2092,7 @@ review: { activeReviewers: [
 
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "follow-up implementation\n", "utf8");
+    await trigger(hooks, "tool_result", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") }, result: "written" });
     await triggerAgentEnd(hooks, { cwd: dir });
 
     assert.equal(await readFile(alphaCount, "utf8"), "2");
@@ -2180,7 +2182,7 @@ test("#461 automatic review requires a new qualifying tool call; filesystem-only
 });
 
 /** #461 persisted Primary session: real sidecar persistence plus every command. */
-async function primaryToolPrerequisiteSession(root: string) {
+async function primaryToolPrerequisiteSession(root: string, primaryToolOnly = false) {
   const ws = join(root, "ws");
   const count = join(root, "reviews.txt");
   await mkdir(ws, { recursive: true });
@@ -2188,7 +2190,7 @@ async function primaryToolPrerequisiteSession(root: string) {
   await writeFile(join(root, "review-gate.json"), JSON.stringify({
     ...indexTestConfig,
     externalAgents: agentCatalog(countingPassReviewer("counting", count)),
-    review: { activeReviewers: [{ source: "external", id: "counting" }] },
+    review: { activeReviewers: [{ source: "external", id: "counting" }], evidence: { primaryToolOnly } },
   }), "utf8");
   process.env.PI_REVIEW_GATE_CONFIG = join(root, "review-gate.json");
   delete process.env.PI_REVIEW_GATE_DISABLED;
@@ -2199,21 +2201,147 @@ async function primaryToolPrerequisiteSession(root: string) {
     await activate({ ...s.pi, registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) { commands.set(name, options.handler); } }, testActivation());
     await trigger(s.hooks, "session_start", { type: "session_start", reason }, s.ctx);
     const call = (toolName: string, input: Record<string, unknown>) => trigger(s.hooks, "tool_call", { cwd: ws, toolName, input }, s.ctx);
-    const turn = async (act: () => Promise<unknown> = async () => {}) => {
-      await trigger(s.hooks, "input", { cwd: ws, text: "turn", source: "user" }, s.ctx);
+    const respond = async (act: () => Promise<unknown> = async () => {}) => {
       await trigger(s.hooks, "before_agent_start", { cwd: ws }, s.ctx);
       await act();
       await triggerAgentEnd(s.hooks, { cwd: ws, messages: [{ role: "assistant", content: "turn done" }] }, s.ctx);
     };
+    const turn = async (act: () => Promise<unknown> = async () => {}) => {
+      await trigger(s.hooks, "input", { cwd: ws, text: "turn", source: "user" }, s.ctx);
+      await respond(act);
+    };
+    const result = (toolName: string, input: Record<string, unknown>) => trigger(s.hooks, "tool_result", { cwd: ws, toolName, input, result: "completed" }, s.ctx);
     const command = (name: string) => commands.get(name)!("", s.ctx);
     const close = () => trigger(s.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, s.ctx);
-    return { ...s, call, turn, command, close };
+    return { ...s, call, result, turn, respond, command, close };
   };
   const reviews = async () => Number(await readFile(count, "utf8").catch(() => "0"));
   const edit = (content: string) => writeFile(join(ws, "index.ts"), content, "utf8");
   const sidecar = new SessionStateStore({ sessionId: "tool-prerequisite", sessionFile, cwd: ws }).path;
   return { ws, open, reviews, edit, sidecar };
 }
+
+for (const toolOnly of [false, true]) for (const scenario of ["sibling", "process", "call-only", "candidate-call-only", "completed-noop", "failed-local", "checkpoint", "restored", "unchanged", "already-reviewed", "read-only", "missing", "unsupported", "incomplete"] as const) {
+  test(`Primary ${toolOnly ? "tool" : "snapshot"} same-pass ${scenario} retains its identifiable pass and warns without another review`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "primary-pass-activity-"));
+    try {
+      const f = await primaryToolPrerequisiteSession(root, toolOnly);
+      const s = await f.open("startup");
+      await s.turn(async () => {
+        await s.call("write", { path: join(f.ws, "index.ts") });
+        await f.edit("reviewed implementation\n");
+        await s.result("write", { path: join(f.ws, "index.ts") });
+      });
+      assert.equal(await f.reviews(), 1);
+      const transmission = s.sent[0]!.message;
+      const bundleDir = extractBundleDir(transmission, 1);
+      const artifact = join(bundleDir, "reviews", "0001", "implementing-model-transmission.md");
+      const originalPass = await readFile(artifact, "utf8");
+      await s.respond(async () => {
+        if (scenario === "call-only" || scenario === "completed-noop") {
+          await s.call("bash", { command: "echo no mutation" });
+          if (scenario === "completed-noop") await s.result("bash", { command: "echo no mutation" });
+        }
+        if (scenario === "candidate-call-only") await s.call("write", { path: join(f.ws, "index.ts") });
+        if (scenario === "failed-local") {
+          const input = { path: join(f.ws, "MISSING") };
+          await s.call("write", input);
+          await trigger(s.hooks, "tool_result", { cwd: f.ws, toolName: "write", input, result: "failed before mutation", isError: true }, s.ctx);
+        }
+        if (scenario === "unsupported") await s.call("unknown", {});
+        if (scenario === "incomplete") await s.call("write", { path: "x".repeat(100000) });
+        if (scenario === "read-only") await s.call("read", { path: join(f.ws, "index.ts") });
+        if (scenario === "already-reviewed") {
+          await s.call("write", { path: join(f.ws, "index.ts") });
+          await f.edit("reviewed implementation\n");
+          await s.result("write", { path: join(f.ws, "index.ts") });
+        }
+        if (scenario === "checkpoint") {
+          const checkpointDir = join(f.ws, ".pi-review-gate", "checkpoints", "arbitrary-synthetic");
+          await mkdir(checkpointDir, { recursive: true });
+          await writeFile(join(checkpointDir, "state"), "runtime checkpoint churn\n");
+        } else if (scenario === "restored") await f.edit("before\n");
+        else if (scenario === "process") execFileSync(process.execPath, ["-e", "require('node:fs').writeFileSync('index.ts','unattributed process edit\\n')"], { cwd: f.ws, timeout: 5000 });
+        else if (scenario === "sibling" || scenario === "call-only" || scenario === "candidate-call-only" || scenario === "completed-noop") await f.edit("unattributed shared-root edit\n");
+        else if (scenario !== "unchanged" && scenario !== "already-reviewed" && scenario !== "read-only") {
+          await writeFile(join(f.ws, "REPORT"), "sibling/process change\n");
+        }
+      });
+      if (scenario === "checkpoint" && !toolOnly) {
+        assert.match(await readFile(join(bundleDir, "exchanges", "0002", "submitted.patch"), "utf8"), /\.pi-review-gate\/checkpoints\/arbitrary-synthetic\/state/,
+          "checkpoint churn is captured, not hidden by relocation or an exclusion");
+      }
+      await triggerAgentEnd(s.hooks, { cwd: f.ws, messages: [{ role: "assistant", content: "repeated final" }] }, s.ctx); // No new run or activity.
+      assert.equal(await f.reviews(), 1);
+      assert.equal(s.sent.length, 1, "only the actual pass was transmitted");
+      assert.equal(await readFile(artifact, "utf8"), originalPass, "prior pass artifact is not rewritten as a new approval");
+      assert.match(s.notices.join("\n"), /review 1 passed only its earlier captured evidence/);
+      assert.ok(s.notices.some((notice) => notice.includes(bundleDir)), "warning identifies the actual pass artifact");
+      assert.match(s.notices.join("\n"), /Later unattributed workspace changes are NOT approved/);
+      assert.match(s.notices.join("\n"), /not certified as unchanged or fully reviewed/);
+      assert.match(s.notices.join("\n"), /best effort: missing, unsupported or incomplete observations are not proof/);
+      await s.close();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+}
+
+for (const toolOnly of [false, true]) for (const activity of ["own-edit", "own-new-file", "own-restoration", "outside-candidate-no-diff"] as const) {
+  test(`Primary ${toolOnly ? "tool" : "snapshot"} same-pass ${activity} invokes a fresh actual review`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "primary-fresh-pass-activity-"));
+    try {
+      const f = await primaryToolPrerequisiteSession(root, toolOnly);
+      const s = await f.open("startup");
+      await s.turn(async () => {
+        await s.call("write", { path: join(f.ws, "index.ts") });
+        await f.edit("reviewed implementation\n");
+        await s.result("write", { path: join(f.ws, "index.ts") });
+      });
+      const first = extractBundleDir(s.sent[0]!.message, 1);
+      await s.respond(async () => {
+        const path = activity === "outside-candidate-no-diff" ? join(root, "outside-candidate")
+          : join(f.ws, activity === "own-new-file" ? "NEW" : "index.ts");
+        await s.call("write", { path });
+        if (activity !== "outside-candidate-no-diff") {
+          await writeFile(path, activity === "own-restoration" ? "before\n" : "new captured own work\n");
+          await s.result("write", { path });
+        }
+      });
+      assert.equal(await f.reviews(), 2);
+      assert.equal(s.sent.length, 2);
+      assert.equal(extractBundleDir(s.sent[1]!.message, 2), first, "same canonical review window");
+      assert.match(s.sent[1]!.message, /Gate verdict: pass/);
+      await access(join(first, "reviews", "0002", "implementing-model-transmission.md"));
+      await s.respond();
+      assert.equal(await f.reviews(), 2, "the new activity is reviewed only once");
+      await s.close();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+}
+
+test("Primary post-pass drift remains manually reviewable and a new prompt gets a fresh initial window", async () => {
+  const root = await mkdtemp(join(tmpdir(), "primary-pass-boundaries-"));
+  try {
+    const f = await primaryToolPrerequisiteSession(root);
+    const s = await f.open("startup");
+    await s.turn(async () => {
+      await s.call("write", { path: join(f.ws, "index.ts") });
+      await f.edit("first own work\n");
+      await s.result("write", { path: join(f.ws, "index.ts") });
+    });
+    await s.respond(() => f.edit("unattributed drift\n"));
+    assert.equal(await f.reviews(), 1);
+    await s.command("review-now");
+    assert.equal(await f.reviews(), 2, "explicit review still reviews current drift without the automatic prerequisite");
+    await s.respond();
+    await s.turn(async () => {
+      await s.call("bash", { command: "echo initial-window prerequisite" });
+      await f.edit("new task workspace delta\n");
+    });
+    assert.equal(await f.reviews(), 3, "initial-window eligibility remains unchanged, not the post-pass capture policy");
+    assert.notEqual(extractBundleDir(s.sent[2]!.message, 1), extractBundleDir(s.sent[0]!.message, 1));
+    await s.close();
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test("#461 a latched truncation flag never rearms automatic Primary review; a new qualifying call still does", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-gate-tool-prerequisite-truncated-"));
@@ -2241,20 +2369,31 @@ test("#461 a latched truncation flag never rearms automatic Primary review; a ne
       return runReview({ cwd: f.ws, request: buildRequestContext(state), before: window.baseline!, config, evidence: window.evidence,
         correctionAttemptCount: getCorrectionAttemptCount(window), window, checkpointScope: scope, requireNewToolActivity: true });
     };
-    const call = (toolName: string, toolInput: Record<string, unknown>) => recordToolCallEvidence({ state: window.evidence, cwd: f.ws, toolName, toolInput,
-      snapshotOptions: { maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes }, exchangeSequence: window.activeExchange!.sequence });
+    let callSequence = 0;
+    const call = async (toolName: string, toolInput: Record<string, unknown>) => {
+      const toolCallId = `manual-call-${++callSequence}`;
+      await recordToolCallEvidence({ state: window.evidence, cwd: f.ws, toolName, toolInput,
+        snapshotOptions: { maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes }, exchangeSequence: window.activeExchange!.sequence });
+      await capturePrimaryOperationBoundary({ state: window.evidence, cwd: f.ws, toolName, toolCallId, toolInput, config });
+      return toolCallId;
+    };
     for (const act of [async () => {}, () => f.edit("external writer\n"), async () => {
       await call("GitRead", { args: ["status"] });
       await f.edit("external writer two\n");
     }]) {
       const skipped = await review(act);
-      assert.equal(skipped.noReviewReason, "no_new_tool_activity", "the truncation flag is not a new qualifying call");
+      assert.equal(skipped.noReviewReason, "no_new_reviewable_activity", "the truncation flag is not fresh captured reviewable activity");
     }
     assert.equal(await f.reviews(), 1);
     assert.equal(window.reviewHistory.at(-1)!.verdict, "pass");
     const reviewed = await review(async () => {
-      await call("write", { path: join(f.ws, "index.ts") });
+      const toolInput = { path: join(f.ws, "index.ts") };
+      const toolCallId = await call("write", toolInput);
       await f.edit("second implementation\n");
+      await retainPrimaryToolAfter({ state: window.evidence, cwd: f.ws, toolName: "write", toolInput, config });
+      await settlePrimaryOperationBoundary({ state: window.evidence, cwd: f.ws, toolName: "write", toolCallId,
+        resultSequence: window.evidence.nextSequence, config });
+      recordToolResultEvidence({ state: window.evidence, toolName: "write", toolInput, result: "written", exchangeSequence: window.activeExchange!.sequence });
     });
     await reviewed.releaseReviewedBaseline?.();
     assert.equal(reviewed.result?.verdict, "pass");
@@ -2636,3 +2775,41 @@ test("settings replace the mode prompt on the next run in the same conversation"
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+for (const toolOnly of [false, true]) for (const scenario of ["sibling-noop", "sibling-restore"] as const) {
+  test(`Primary ${toolOnly ? "tool" : "snapshot"} same-pass ${scenario} compares each operation's own prestate`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "primary-operation-prestate-"));
+    try {
+      const f = await primaryToolPrerequisiteSession(root, toolOnly);
+      const s = await f.open("startup");
+      const path = join(f.ws, "index.ts");
+      await s.turn(async () => {
+        await s.call("write", { path });
+        await f.edit("reviewed implementation\n");
+        await s.result("write", { path });
+      });
+      assert.equal(await f.reviews(), 1, "the first implementation passed once");
+      await s.respond(async () => {
+        // First own operation is a no-op on the reviewed content.
+        await s.call("write", { path });
+        await s.result("write", { path });
+        // Sibling drift to B after that operation's boundary.
+        await f.edit("sibling drift\n");
+        // Second own operation: no-op on B, or a genuine restore to A.
+        await s.call("write", { path });
+        if (scenario === "sibling-restore") await f.edit("reviewed implementation\n");
+        await s.result("write", { path });
+      });
+      assert.equal(await f.reviews(), scenario === "sibling-noop" ? 1 : 2,
+        scenario === "sibling-noop" ? "a completed no-op is not fresh captured activity" : "a genuine restore is");
+      assert.equal(s.sent.length, scenario === "sibling-noop" ? 1 : 2, "exact reviewer transmissions");
+      if (scenario === "sibling-noop") {
+        assert.match(s.notices.join("\n"), /review 1 passed only its earlier captured evidence/);
+        assert.match(s.notices.join("\n"), /Later unattributed workspace changes are NOT approved/);
+      } else {
+        assert.match(s.sent[1]!.message, /Gate verdict: pass/);
+      }
+      await s.close();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+}

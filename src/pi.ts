@@ -291,6 +291,18 @@ export function extractToolArgs(args: unknown[]): Record<string, unknown> | unde
   return undefined;
 }
 
+/** Host-issued identity for one tool call, shared by its admission and result hooks.
+ * `callId` is the older Pi hook alias for the same identity. */
+export function extractToolCallId(args: unknown[]): string | undefined {
+  for (const arg of args) {
+    if (!isRecord(arg)) continue;
+    for (const key of ["toolCallId", "tool_call_id", "callId"]) {
+      if (typeof arg[key] === "string" && arg[key]) return arg[key] as string;
+    }
+  }
+  return undefined;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }

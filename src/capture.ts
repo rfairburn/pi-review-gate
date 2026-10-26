@@ -513,6 +513,15 @@ function isHiddenByUnreadableDirectory(snapshot: WorkspaceSnapshot, path: string
   return false;
 }
 
+/** Drop retained display content when a snapshot exists only for metadata/hash
+ * comparison, so boundary evidence never keeps a second raw body. All fields
+ * `compareFileSnapshots` reads are preserved. */
+export function withoutSnapshotContent(snapshot: FileSnapshot): FileSnapshot {
+  if (snapshot.content === undefined) return snapshot;
+  const { content: _content, ...metadata } = snapshot;
+  return metadata;
+}
+
 export function compareFileSnapshots(before: FileSnapshot, after: FileSnapshot): ChangedFile | null {
   if (!before.exists && after.exists) {
     return fileChange(after.relativePath, "added", undefined, after);

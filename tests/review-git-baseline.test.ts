@@ -9,10 +9,11 @@ import test from "node:test";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { registerCommands } from "../src/commands";
 import { captureReviewCheckpoint, loadReviewCheckpoint, releaseReviewCheckpoint } from "../src/review-checkpoint";
-import { createEvidenceState, recordToolCallEvidence } from "../src/evidence";
+import { createEvidenceState, recordToolCallEvidence, recordToolResultEvidence } from "../src/evidence";
 import { armGitCheckpoint, type GitCheckpointDescriptor } from "../src/git-checkpoint";
 import { collectPausedReviewExchange, runAskReviewer, runReview } from "../src/review";
-import { beginAgentRun, createState, recordReviewerFeedback, recordReviewerFeedbackAndArmExchange, type ReviewBaseline } from "../src/state";
+import { beginAgentRun, createState, recordReviewerFeedback, recordReviewerFeedbackAndArmExchange, armReviewResponseExchange, type ReviewBaseline } from "../src/state";
+import { hasCapturedPrimaryActivity, hasObservedOutsideCandidate } from "../src/review-evidence";
 import { fakeNeedsChangesConfig } from "./helpers";
 import { disposableAgentDir, testCheckpointScope } from "./checkpoint-scope-helpers";
 
@@ -899,4 +900,109 @@ test("ask-reviewer evidence failure after settlement releases the ephemeral afte
   } finally {
     await rm(repo, { recursive: true, force: true });
   }
+});
+
+/** Primary same-pass review-root and identity classification (#316 review). */
+test("Primary outside-root scope uses the enclosing Git review root independently of the path-resolution cwd", async () => {
+  const repo = await initRepo();
+  const packageA = join(repo, "package-a");
+  try {
+    await mkdir(packageA);
+    await mkdir(join(repo, "package-b"));
+    await writeFile(join(packageA, "index.ts"), "package a\n");
+    await writeFile(join(repo, "package-b", "file.ts"), "package b\n");
+    await git(repo, "add", ".");
+    await git(repo, "commit", "-q", "-m", "two packages");
+    // A raw checkpoint captured from the subdirectory is rooted at the
+    // enclosing repository top level, exactly like the integrated review path.
+    const captured = await captureReviewCheckpoint(packageA, "post-pass-root", { scope: checkpointScope });
+    assert.equal(captured.status, "ok", JSON.stringify(captured));
+    if (captured.status !== "ok") return;
+    const passBaseline: ReviewBaseline = {
+      kind: "checkpoint", descriptor: captured.value, cwd: packageA, capturedAt: new Date().toISOString(),
+    };
+    const calls = join(repo, "review-calls.txt");
+    const config: ReturnType<typeof fakeNeedsChangesConfig> = {
+      ...fakeNeedsChangesConfig(),
+      externalAgents: {
+        reviewing: {
+          adapter: "generic-cli",
+          command: process.execPath,
+          review: {
+            args: ["-e", [
+              "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');",
+              "process.stdin.on('data',c=>prompt+=c);",
+              "process.stdin.on('end',()=>{fs.appendFileSync(" + JSON.stringify(calls) + ",JSON.stringify(prompt)+'\\n');process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewed passed',findings:[]}));});",
+            ].join("")],
+            timeoutMs: 15_000,
+          },
+        },
+      },
+      review: { activeReviewers: [{ source: "external", id: "reviewing" }] },
+    };
+    const reviewCandidate = async (candidate: string) => {
+      const state = createState();
+      beginAgentRun(state);
+      state.reviewWindow!.baseline = passBaseline;
+      state.reviewWindow!.activeExchange!.baseline = passBaseline;
+      recordReviewerFeedback(state, {
+        result: { verdict: "pass", summary: "prior pass", findings: [], reviewerId: "reviewing" },
+        source: "automatic",
+        disposition: "sent_for_observation",
+      });
+      armReviewResponseExchange(state, passBaseline);
+      const evidence = state.reviewWindow!.evidence;
+      const toolInput = { path: candidate };
+      await recordToolCallEvidence({
+        state: evidence, cwd: packageA, toolName: "write", toolInput,
+        snapshotOptions: { maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes },
+        exchangeSequence: state.reviewWindow!.activeExchange!.sequence,
+      });
+      return runReview({
+        cwd: packageA, request: "confirm the passing review", before: passBaseline,
+        config, evidence, window: state.reviewWindow, correctionAttemptCount: 0,
+        requireNewToolActivity: true, checkpointScope,
+      });
+    };
+
+    const inside = await reviewCandidate("../package-b/file.ts");
+    await inside.releaseReviewedBaseline?.();
+    assert.equal(inside.noReviewReason, "no_new_reviewable_activity",
+      "a sibling package inside the enclosing review root is not an outside-root candidate");
+    assert.equal(await readFile(calls, "utf8").catch(() => ""), "", "no reviewer process was invoked");
+
+    const outside = await reviewCandidate("../../outside-candidate.ts");
+    await outside.releaseReviewedBaseline?.();
+    assert.equal(outside.result?.verdict, "pass");
+    assert.equal((await readFile(calls, "utf8")).trim().split("\n").length, 1,
+      "a true outside-root identity still invokes exactly one reviewer");
+  } finally { await rm(repo, { recursive: true, force: true }); }
+});
+
+test("Primary activity classification never resolves a redacted display spelling as an original identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-gate-redacted-identity-"));
+  try {
+    const packageA = join(root, "repo", "package-a");
+    await mkdir(packageA, { recursive: true });
+    const evidence = createEvidenceState();
+    const toolInput = { path: "../token=value/../package-a/index.ts" };
+    await recordToolCallEvidence({
+      state: evidence, cwd: packageA, toolName: "write", toolInput,
+      snapshotOptions: { maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes },
+      exchangeSequence: 1,
+    });
+    recordToolResultEvidence({ state: evidence, toolName: "write", toolInput, result: "written", exchangeSequence: 1 });
+    const events = evidence.events;
+    // The original spelling normalizes inside the resolution root; the retained
+    // display projection would redact the sensitive segment into a marker.
+    assert.equal(hasCapturedPrimaryActivity(evidence, events, packageA, packageA, 1), false,
+      "the unchanged identity stays in-root");
+    const displayOnly: typeof events = [{
+      sequence: 9, phase: "tool_result", toolName: "write", summary: "",
+      candidatePaths: ["../token=[REDACTED]"], riskSignals: [], isError: false,
+    }];
+    assert.equal(hasObservedOutsideCandidate(displayOnly[0]!, packageA, join(root, "repo")), false,
+      "a redacted marker is never resolved as a file identity");
+    assert.equal(hasCapturedPrimaryActivity(evidence, displayOnly, packageA, packageA, 1), false);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

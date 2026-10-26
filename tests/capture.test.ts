@@ -9,6 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import {
   BINARY_SAMPLE_BYTES,
+  compareFileSnapshots,
   compareSnapshots,
   createPathSnapshot,
   createWorkspaceSnapshot,
@@ -18,6 +19,7 @@ import {
   MAX_SNAPSHOT_OMISSIONS,
   parseGitDirectoryWarnings,
   recordSnapshotOmission,
+  withoutSnapshotContent,
   type FileSnapshot,
   type SnapshotOmission,
   type WorkspaceSnapshot,
@@ -52,6 +54,30 @@ test("snapshot comparison detects added, modified, and deleted files", async () 
         ["modified.txt", "modified"],
       ],
     );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("metadata-only snapshots drop retained content without changing change detection", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-boundary-metadata-"));
+  try {
+    const path = join(dir, "boundary.txt");
+    await writeFile(path, "before boundary\n", "utf8");
+    const before = withoutSnapshotContent(await createPathSnapshot(dir, path, snapshotOptions));
+    assert.equal(before.content, undefined, "boundary evidence retains no raw body");
+    assert.notEqual(before.sha256, null, "the comparison hash is retained");
+
+    assert.equal(compareFileSnapshots(before, before), null, "identical metadata is not a change");
+    assert.equal(compareFileSnapshots(before, withoutSnapshotContent(before)), null, "stripping content alone changes nothing");
+
+    await writeFile(path, "after boundary\n", "utf8");
+    const after = withoutSnapshotContent(await createPathSnapshot(dir, path, snapshotOptions));
+    assert.equal(after.content, undefined, "post-boundary evidence retains no raw body");
+    const change = compareFileSnapshots(before, after);
+    assert.equal(change?.status, "modified", "metadata/hash comparison still detects the change");
+    assert.equal(change?.path, "boundary.txt");
+    assert.equal(change?.newContent, undefined, "no content is reconstructed from stripped snapshots");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

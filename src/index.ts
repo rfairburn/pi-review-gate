@@ -17,10 +17,11 @@ import {
   shouldRecordToolCallEvidence,
   shouldRecordToolResultEvidence,
 } from "./evidence";
-import { registerHook, captureSessionNotice, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolName, sendLocalWarning, sendNotice, setStatus, type HookHandler } from "./pi";
+import { registerHook, captureSessionNotice, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolCallId, extractToolName, sendLocalWarning, sendNotice, setStatus, type HookHandler } from "./pi";
 import { createReviewCancellationCoordinator } from "./review-cancellation";
 import {
   beginAgentRun,
+  closeReviewWindow,
   createState,
   freezeReviewWindowConfig,
   reconcileRestoredReviewWindows,
@@ -28,6 +29,7 @@ import {
   rememberUserRequest,
   rememberUserRequestVerbatim,
   setReviewWindowCheckpointBaseline,
+  type ActiveReviewExchange,
   type ReviewGateState,
 } from "./state";
 import { registerReviewSettings } from "./settings/command";
@@ -51,7 +53,7 @@ import { buildCompletionGuidancePrompt, resolveCompletionSkillPath } from "./act
 import { recoverPendingModelDeliveries, releaseQueuedUserInputs } from "./activation/pending-delivery";
 import { createReviewTurnCoordinator, isToolError } from "./activation/review-turn";
 import { createPrimaryEvidenceSettings, sendPrimaryEvidenceWarning } from "./activation/primary-evidence";
-import { primaryEvidencePolicy, retainPrimaryToolAfter } from "./review-evidence";
+import { capturePrimaryOperationBoundary, primaryEvidencePolicy, retainPrimaryToolAfter, settlePrimaryOperationBoundary } from "./review-evidence";
 import { registerApplyPatchTool } from "./apply-patch/tool";
 import { registerGitReadTool, type GitReadHost } from "./git-read/tool";
 import { WebToolManager, type PiWebHost } from "./web/tools";
@@ -111,6 +113,12 @@ interface ActivationDependencies {
   initialCheckpointScope?: ReviewCheckpointScope;
   /** Deterministically suspends session-start setup in lifecycle tests; absent in production. */
   sessionStartInitializationTestBarrier?: () => Promise<void>;
+}
+
+/** The only exchange where Primary narrows automatic eligibility to newly
+ * captured originating activity after an actual passing review. */
+function isPrimaryPassResponseExchange(active: ActiveReviewExchange | undefined): boolean {
+  return active?.causedByReviewVerdict === "pass" && active.reviewResponseMode === "observation";
 }
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
@@ -954,6 +962,15 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       await sessionPersistence.persist();
       return { action: "handled" };
     }
+    const window = state.reviewWindow;
+    const lastReview = window?.reviewHistory.at(-1);
+    const response = window?.exchanges.at(-1);
+    if (text.trim() && window && !window.activeExchange && lastReview?.verdict === "pass"
+      && response?.causedByReviewSequence === lastReview.sequence && response.reviewResponseMode === "observation") {
+      // A finished same-pass loop can remain available for explicit review of
+      // unattributed drift, but never supplies approval/context to a new task.
+      closeReviewWindow(state, true);
+    }
     const expiredQuestionWindow = state.reviewWindow ? undefined : state.lastQuestionWindow;
     rememberUserRequest(state, text);
     await removeTransientWindowBundle(expiredQuestionWindow);
@@ -1080,6 +1097,15 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
           },
           exchangeSequence: window.activeExchange?.sequence,
         }));
+        if (isPrimaryPassResponseExchange(window.activeExchange)) {
+          // Same-pass eligibility needs this operation's own prestate; it lives
+          // transiently only until the matching result hook.
+          await capturePrimaryOperationBoundary({
+            state: window.evidence, cwd: currentCwd, toolName: name,
+            toolCallId: extractToolCallId(args), exchangeSequence: window.activeExchange?.sequence,
+            toolInput: toolArgs, config,
+          });
+        }
       } catch (error) {
         if (!decision) throw error;
       }
@@ -1101,19 +1127,33 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       return;
     }
     const evidencePolicy = primaryEvidencePolicy(config, state);
-    if (evidencePolicy.toolOnly || evidencePolicy.snapshotFailureFallback || window.baseline?.kind === "tool") {
+    if (evidencePolicy.toolOnly || evidencePolicy.snapshotFailureFallback || window.baseline?.kind === "tool"
+      || isPrimaryPassResponseExchange(window.activeExchange)) {
       await reviewTurn.trackEvidenceCapture(retainPrimaryToolAfter({
         state: window.evidence, cwd: currentCwd, toolName: name, toolInput: toolArgs, config,
       }));
     }
+    const samePassResponse = isPrimaryPassResponseExchange(window.activeExchange);
+    const exchangeSequence = window.activeExchange?.sequence;
+    const toolCallId = extractToolCallId(args);
+    // Recording is synchronous, so the sequence cannot move between these two
+    // statements even when another tool runs concurrently. Only an affirmative
+    // captured effect for this exact result is retained.
+    const resultSequence = window.evidence.nextSequence;
     recordToolResultEvidence({
       state: window.evidence,
       toolName: name,
       toolInput: toolArgs,
       result: args[0],
       isError: toolError,
-      exchangeSequence: window.activeExchange?.sequence,
+      exchangeSequence,
     });
+    if (samePassResponse) {
+      await settlePrimaryOperationBoundary({
+        state: window.evidence, cwd: currentCwd, toolName: name, toolCallId,
+        exchangeSequence, resultSequence, config,
+      });
+    }
   });
 
   registerHook(pi, "agent_end", (...args) => reviewTurn.onAgentEnd(args));

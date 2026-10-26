@@ -392,7 +392,7 @@ export function recordObservedToolEventEvidence(input: {
   toolInput?: Record<string, unknown>;
   result?: unknown;
   isError?: boolean;
-}): void {
+}): { event: EvidenceEvent; observedPaths: string[] } {
   const boundedInput = boundObservedInput(input.toolInput);
   const inputDetail = detailedToolInput(input.toolName, boundedInput.displayInput, boundedInput.hasGenericData);
   // Generic fields can still overflow the serialized detail cap. Preserve the
@@ -438,13 +438,9 @@ export function recordObservedToolEventEvidence(input: {
     if (revision < MAX_TOOL_OBSERVATION_REVISION) input.state.toolObservationRevision = revision + 1;
     else input.state.toolObservationsTruncated = true;
   }
-  if (eventWindowFull) {
-    input.state.toolObservationsTruncated = true;
-    input.state.requiresReview = true;
-    return;
-  }
-
-  const boundedResult = redactLargeValues(redactSensitiveValue(input.result));
+  // Overflow still exposes bounded classification metadata to the caller, but
+  // never starts retaining/serializing an otherwise discarded result payload.
+  const boundedResult = eventWindowFull ? undefined : redactLargeValues(redactSensitiveValue(input.result));
   const observedPaths = extracted.paths.slice(0, MAX_OBSERVED_PATHS_PER_EVENT);
   const usableObservedPaths = observedPaths.filter(({ path }) => path.length <= MAX_OBSERVED_PATH_LENGTH);
   if (extracted.paths.length > observedPaths.length || usableObservedPaths.length !== observedPaths.length) {
@@ -453,21 +449,28 @@ export function recordObservedToolEventEvidence(input: {
   }
   const candidatePaths = unique(observedPaths.map(({ path }) => truncate(redactSensitiveText(path), MAX_OBSERVED_PATH_LENGTH)));
   const event: EvidenceEvent = {
-    sequence: input.state.nextSequence++,
+    sequence: eventWindowFull ? input.state.nextSequence : input.state.nextSequence++,
     phase: input.stage === "start" ? "tool_call" : "tool_result",
     toolName: truncate(redactSensitiveText(input.toolName || "unknown"), 200),
     adapter: truncate(redactSensitiveText(input.adapter), 100),
     ...(input.observationId ? { observationId: truncate(redactSensitiveText(input.observationId), 200) } : {}),
-    summary: input.stage === "start"
+    summary: eventWindowFull ? "" : input.stage === "start"
       ? summarizeToolInput(input.toolName, boundedInput.displayInput, boundedInput.hasGenericData)
       : summarizeToolResult(boundedResult, input.isError),
-    detail: input.stage === "start"
+    detail: eventWindowFull ? undefined : input.stage === "start"
       ? inputDetail
       : detailedToolResult(boundedResult),
     candidatePaths,
     riskSignals: unique([...extracted.riskSignals, ...(input.isError && input.stage === "end" ? ["tool_result_error"] : [])]),
     ...(input.stage === "end" ? { isError: input.isError } : {}),
   };
+  if (eventWindowFull) {
+    input.state.toolObservationsTruncated = true;
+    input.state.requiresReview = true;
+    // Return this bounded observation for immediate eligibility classification,
+    // without retaining a second event ledger or losing overflow activity.
+    return { event, observedPaths: unique(usableObservedPaths.map(({ path }) => path)) };
+  }
   input.state.events.push(event);
 
   for (const candidate of usableObservedPaths) {
@@ -511,6 +514,10 @@ export function recordObservedToolEventEvidence(input: {
     // no-op eligibility. Tool-method review consumes them independently.
     input.state.requiresReview ||= isOutside || input.state.toolObservationsTruncated === true;
   }
+  // Original usable spellings are returned transiently for eligibility
+  // classification. They are never persisted or displayed by this path; the
+  // retained event keeps its redacted/truncated display projection.
+  return { event, observedPaths: unique(usableObservedPaths.map(({ path }) => path)) };
 }
 
 /** Capture exact candidate paths only after the executor turn; never infer a diff from this snapshot. */
@@ -1492,9 +1499,19 @@ function boundObservedDisplayValue(
   }
 }
 
-function isObservablePathAddress(path: string): boolean {
+/** Whether a retained spelling can still address the original file. Redacted,
+ * truncated, or marker-bearing display text is never resolved as an identity. */
+export function isObservablePathAddress(path: string): boolean {
   return path.length <= MAX_OBSERVED_PATH_LENGTH
     && redactSensitiveText(path) === path
+    && !/\[(?:REDACTED|[^\]]*truncated[^\]]*)\]/i.test(path);
+}
+
+/** Whether an observed spelling still names an exact identity. Unlike a display
+ * address, a raw tool identity may contain sensitive text; only a display
+ * marker or retention truncation makes it unusable. */
+export function isUsableObservedPathIdentity(path: string): boolean {
+  return path.length <= MAX_OBSERVED_PATH_LENGTH
     && !/\[(?:REDACTED|[^\]]*truncated[^\]]*)\]/i.test(path);
 }
 

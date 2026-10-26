@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { captureSessionNotice, extractInputSource, extractInputText, extractSignal, isEscapeTerminalInput, onTerminalInput } from "../src/pi";
+import { captureSessionNotice, extractInputSource, extractInputText, extractSignal, extractToolCallId, isEscapeTerminalInput, onTerminalInput } from "../src/pi";
 import { createState, rememberUserRequest } from "../src/state";
 
 test("extractInputSource reads pi input event source", () => {
@@ -14,6 +14,17 @@ test("extractSignal reads pi event context signal", () => {
   const controller = new AbortController();
   assert.equal(extractSignal([{ cwd: process.cwd(), signal: controller.signal }]), controller.signal);
   assert.equal(extractSignal([{ ctx: { signal: controller.signal } }]), controller.signal);
+});
+
+test("extractToolCallId pairs hooks through the legacy callId alias", () => {
+  const call = [{ toolName: "write", callId: "call-7" }];
+  const result = [{ toolName: "write", callId: "call-7", result: "ok" }];
+  assert.equal(extractToolCallId(call), "call-7", "the call hook carries the alias");
+  assert.equal(extractToolCallId(result), "call-7", "the result hook pairs through the same alias");
+  assert.equal(extractToolCallId(call), extractToolCallId(result), "both hooks resolve one identity");
+  assert.equal(extractToolCallId([{ toolCallId: "primary", callId: "alias" }]), "primary", "toolCallId stays authoritative");
+  assert.equal(extractToolCallId([{ tool_call_id: "snake", callId: "alias" }]), "snake", "tool_call_id is still accepted");
+  assert.equal(extractToolCallId([{ toolName: "write" }, { callId: "" }]), undefined, "an empty alias is not an identity");
 });
 
 test("isEscapeTerminalInput recognizes supported terminal event shapes", () => {

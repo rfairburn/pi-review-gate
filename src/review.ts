@@ -26,7 +26,7 @@ import type { ModelAdapter, ReviewerSession } from "./adapters/types";
 import type { TokenUsage } from "./usage";
 import { completeActiveExchange, hasUnresolvedReview, isReviewBaseline, snapshotOfReviewBaseline, type GitCheckpointBaseline, type UnifiedReviewBaseline, type ReviewBaseline, type ReviewWindow } from "./state";
 import { aggregateReviewDisposition } from "./review-report";
-import { acquireReviewWorkspaceSnapshot, primaryEvidencePolicy, evidenceMethodNotice, retainedToolChanges, isEligibleReviewCaptureFailure, isReviewableToolObservation, latchPrimarySnapshotFallback, primaryFallbackUserWarning, ReviewEvidenceCaptureFailure, PRIMARY_SNAPSHOT_RECOVERED_USER_NOTE, PRIMARY_TOOLS_ONLY_USER_WARNING, TOOL_ONLY_HISTORY_NOTICE, type ReviewEvidencePolicy, type ReviewEvidenceMethod } from "./review-evidence";
+import { acquireReviewWorkspaceSnapshot, primaryEvidencePolicy, evidenceMethodNotice, retainedToolChanges, isEligibleReviewCaptureFailure, isReviewableToolObservation, latchPrimarySnapshotFallback, primaryFallbackUserWarning, hasCapturedPrimaryActivity, ReviewEvidenceCaptureFailure, PRIMARY_SNAPSHOT_RECOVERED_USER_NOTE, PRIMARY_TOOLS_ONLY_USER_WARNING, TOOL_ONLY_HISTORY_NOTICE, type ReviewEvidencePolicy, type ReviewEvidenceMethod } from "./review-evidence";
 
 export interface ReviewRunInput {
   evidencePolicy?: ReviewEvidencePolicy;
@@ -57,10 +57,13 @@ export interface ReviewRunInput {
   window?: ReviewWindow;
   /** Trusted live-session scope that locates raw (non-Git) checkpoint records. */
   checkpointScope?: ReviewCheckpointScope;
-  /** Automatic Primary settlement only (#461): additionally require a new
-   * qualifying tool call since the window's last recorded review. Narrows the
-   * existing eligibility; explicit reviews and other callers never set it. */
+  /** Automatic Primary settlement only: require a qualifying call initially
+   * and fresh captured reviewable activity within a passing review's response
+   * loop. Explicit reviews and other callers never set it. */
   requireNewToolActivity?: boolean;
+  /** InPlace same-pass response only: caller established fresh captured
+   * activity. Allows review of a return to the launch state, not snapshot drift. */
+  capturedPassActivity?: boolean;
 }
 
 /** Exact Git-derived change data for a normalized candidate commit. */
@@ -80,7 +83,7 @@ export interface ReviewRunOutput {
   evidenceCoverageNotice?: string;
   changed: boolean;
   changes: ChangedFile[];
-  noReviewReason?: "no_initial_changes" | "unchanged_review_response" | "unchanged_deferred_response" | "no_new_tool_activity";
+  noReviewReason?: "no_initial_changes" | "unchanged_review_response" | "unchanged_deferred_response" | "no_new_tool_activity" | "no_new_reviewable_activity";
   result?: ReviewResult;
   reviewerResults?: ReviewResult[];
   reviewerDisplayLabels?: Record<string, string>;
@@ -271,7 +274,23 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
       });
     }
   };
-  if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges) {
+  // A pass response is not a new task. Neither another writer's delta nor
+  // a call without captured reviewable activity invalidates that actual pass.
+  // Use the completed exchange: completion deliberately clears activeExchange.
+  const lastReview = input.window?.reviewHistory.at(-1);
+  const responseExchange = completedExchange ?? input.window?.exchanges.at(-1);
+  const passResponse = lastReview?.verdict === "pass"
+    && responseExchange?.causedByReviewSequence === lastReview.sequence
+    && responseExchange.causedByReviewVerdict === "pass"
+    && responseExchange.reviewResponseMode === "observation"
+    && responseExchange.userRequests.length === 0;
+  const capturedPassActivity = input.capturedPassActivity === true || (input.requireNewToolActivity === true && passResponse
+    && hasCapturedPrimaryActivity(input.evidence, responseExchange.evidenceEvents, input.cwd, settled.evidenceRoot ?? input.cwd, responseExchange.sequence));
+  if (input.requireNewToolActivity === true && passResponse && !capturedPassActivity) {
+    await syncUnreviewedExchangeArtifacts();
+    return { changed: false, changes, noReviewReason: "no_new_reviewable_activity" };
+  }
+  if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges && !capturedPassActivity) {
     await syncUnreviewedExchangeArtifacts();
     return {
       changed: false,
@@ -282,14 +301,14 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     };
   }
   const isCorrectionValidation = hasUnresolvedReview(input.window) || correctionAttemptCount > 0;
-  if (settled.evidenceMethod === "snapshot" && changes.length === 0 && !isCorrectionValidation && !hasExactChanges && input.evidence?.requiresReview !== true) {
+  if (settled.evidenceMethod === "snapshot" && changes.length === 0 && !isCorrectionValidation && !hasExactChanges && !capturedPassActivity && input.evidence?.requiresReview !== true) {
     return { changed: false, changes, noReviewReason: "no_initial_changes" };
   }
   // #465: an evidence method, its warning, an assistant summary, or known
   // read-only observations are not work. Primary Tools only review needs
   // retained changes, a mutation-capable/uncertain observation, or an
   // outstanding correction — the same no-change rule snapshots apply.
-  if (settled.primaryToolChangeGate && changes.length === 0 && sideEffectChanges.length === 0 && !isCorrectionValidation
+  if (settled.primaryToolChangeGate && changes.length === 0 && sideEffectChanges.length === 0 && !isCorrectionValidation && !capturedPassActivity
     && input.evidence?.requiresReview !== true && !(input.evidence?.events ?? []).some(isReviewableToolObservation)) {
     return { changed: false, changes, noReviewReason: "no_initial_changes" };
   }
@@ -298,7 +317,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
   // changes alone (runtime, external or background writers) never start or
   // retrigger it, and a call is a prerequisite, not proof of authorship. The
   // window, its evidence and any unresolved feedback stay open, unreviewed.
-  if (input.requireNewToolActivity === true && !hasNewQualifyingToolCall(input.window)) {
+  if (input.requireNewToolActivity === true && !capturedPassActivity && !hasNewQualifyingToolCall(input.window)) {
     await syncUnreviewedExchangeArtifacts();
     return { changed: false, changes, noReviewReason: "no_new_tool_activity" };
   }

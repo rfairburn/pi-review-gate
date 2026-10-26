@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import test, { type TestContext } from "node:test";
 import * as capture from "../src/capture";
+import * as executorAdapters from "../src/execution/adapters/factory";
 import { normalizeConfig, resolvedExecutorPool } from "../src/config";
 import { MAX_OBSERVED_TOOL_EVENTS } from "../src/evidence";
 import { runInplaceLifecycle, type InPlaceLifecycleInput, type InPlaceLifecycleResult } from "../src/execution/inplace-worker";
@@ -84,9 +85,10 @@ async function fixture(t: TestContext, options: { toolOnly?: boolean; fallback?:
     if (n === 1) await edit(request, scriptContent);
   };
   async function edit(request: ExecutorRequest, body: string) {
-    request.onToolObservation?.({ stage: "start", toolName: "write", toolInput: { path: join(workspaceRoot, "SCRIPT") } });
+    const toolInput = { path: join(workspaceRoot, "SCRIPT"), content: body };
+    await request.onToolObservation?.({ stage: "start", toolName: "write", toolInput });
     await writeFile(join(workspaceRoot, "SCRIPT"), body);
-    request.onToolObservation?.({ stage: "end", toolName: "write", toolInput: { path: join(workspaceRoot, "SCRIPT") }, result: "written" });
+    await request.onToolObservation?.({ stage: "end", toolName: "write", toolInput, result: "written", isError: false });
   }
   const kind = options.opaque ? "run-as-binary" : "pi-model";
   const adapter: ExecutorAdapter = { kind, toolEventObservability: options.opaque
@@ -165,7 +167,7 @@ test("same-path observed SCRIPT rewrite requires a new review even after the bou
   f.setAction(async (request, n) => {
     if (n === 1) {
       await f.edit(request, scriptContent);
-      for (let i = 0; i < MAX_OBSERVED_TOOL_EVENTS + 2; i++) request.onToolObservation?.({ stage: "start", toolName: "read", toolInput: {} });
+      for (let i = 0; i < MAX_OBSERVED_TOOL_EVENTS + 2; i++) await request.onToolObservation?.({ stage: "start", toolName: "read", toolInput: {} });
     }
     if (n === 2) await f.edit(request, "new SCRIPT after first pass\n");
     await writeFile(join(f.workspaceRoot, `REPORT-${n}`), "independent");
@@ -177,7 +179,7 @@ test("same-path observed SCRIPT rewrite requires a new review even after the bou
   assert.ok((await f.captured())[1]!.includes("new SCRIPT after first pass"), "new same-path content reaches the second reviewer despite event retention overflow");
 });
 
-test("path-free observed shell rewrite during confirmation reaches a second ordinary review with updated SCRIPT content", async (t) => {
+test("path-free shell confirmation retains observations but cannot attribute recaptured old candidates to a new review", async (t) => {
   const f = await fixture(t);
   t.mock.method(capture, "createWorkspaceSnapshot", async () => { throw new Error("tool-only whole-root capture forbidden"); });
   const code = "require('fs').writeFileSync('SCRIPT','changed by path-free command')";
@@ -185,28 +187,26 @@ test("path-free observed shell rewrite during confirmation reaches a second ordi
   f.setAction(async (request, n) => {
     if (n === 1) await f.edit(request, scriptContent);
     if (n === 2) {
-      request.onToolObservation?.({ stage: "start", toolName: "bash", toolInput: { command } });
+      await request.onToolObservation?.({ stage: "start", toolName: "bash", toolInput: { command } });
       execFileSync(process.execPath, ["-e", code], { cwd: f.workspaceRoot, timeout: 5000 });
-      request.onToolObservation?.({ stage: "end", toolName: "bash", toolInput: { command }, result: "completed" });
+      await request.onToolObservation?.({ stage: "end", toolName: "bash", toolInput: { command }, result: "completed" });
     }
   });
   const result = await runInplaceLifecycle(f.input);
   assert.equal(result.status, "reviewed", result.error);
-  assert.equal(result.reviewCycles.length, 2);
-  assert.equal(result.reviewCycles[0]!.toolObservationRevision, result.reviewCycles[1]!.toolObservationRevision, "the shell command has no extracted mutation path");
-  assert.equal(result.reviewCycles[0]!.externalObservationRevision, result.reviewCycles[1]!.externalObservationRevision);
-  const secondPrompt = (await f.captured())[1]!;
-  assert.ok(secondPrompt.includes("writeFileSync"), "new observed command reaches the second reviewer");
-  assert.ok(secondPrompt.includes("changed by path-free command"));
-  const evidence = JSON.parse(await readFile(join(result.reviewCycles[1]!.reviewOutput.invocationDir!, "evidence.json"), "utf8"));
-  assert.ok(evidence.candidates.some((candidate: { afterSnapshot?: { content?: string } }) => candidate.afterSnapshot?.content === "changed by path-free command"), "after-content capture was not suppressed by unchanged path revisions");
+  assert.equal(result.reviewCycles.length, 1);
+  assert.equal((await f.captured()).length, 1, "the path-free call/result does not establish a fresh originating mutation candidate");
+  assert.match(result.summary, /Later unattributed changes are NOT approved/);
+  assert.match(result.summary, /missing, unsupported or incomplete observations are not proof/);
+  const evidence = JSON.parse(await readFile(join(f.artifactDir, "observed-tool-evidence.json"), "utf8"));
+  assert.ok(evidence.candidates.some((candidate: { afterSnapshot?: { content?: string } }) => candidate.afterSnapshot?.content === "changed by path-free command"), "retained observations remain available without a fabricated follow-up approval");
 });
 
 test("known read-only confirmation observations alone do not churn a tool-only pass", async (t) => {
   const f = await fixture(t);
   f.setAction(async (request, n) => {
     if (n === 1) await f.edit(request, scriptContent);
-    else request.onToolObservation?.({ stage: "end", toolName: "read", toolInput: { path: "SCRIPT" }, result: scriptContent });
+    else await request.onToolObservation?.({ stage: "end", toolName: "read", toolInput: { path: "SCRIPT" }, result: scriptContent });
   });
   const result = await runInplaceLifecycle(f.input);
   assert.equal(result.status, "reviewed", result.error);
@@ -218,9 +218,9 @@ test("read-only confirmation calls after the bounded ledger fills do not rearm r
   f.setAction(async (request, n) => {
     if (n === 1) {
       await f.edit(request, scriptContent);
-      for (let i = 0; i < MAX_OBSERVED_TOOL_EVENTS + 2; i++) request.onToolObservation?.({ stage: "start", toolName: "read", toolInput: {} });
+      for (let i = 0; i < MAX_OBSERVED_TOOL_EVENTS + 2; i++) await request.onToolObservation?.({ stage: "start", toolName: "read", toolInput: {} });
     } else {
-      for (let i = 0; i < 3; i++) request.onToolObservation?.({ stage: "end", toolName: "read", toolInput: { path: "SCRIPT" }, result: scriptContent });
+      for (let i = 0; i < 3; i++) await request.onToolObservation?.({ stage: "end", toolName: "read", toolInput: { path: "SCRIPT" }, result: scriptContent });
     }
   });
   const result = await runInplaceLifecycle(f.input);
@@ -240,7 +240,7 @@ test("read-only confirmation calls that first cross the retention limit after a 
         if (n === 1) await f.edit(request, scriptContent);
         if (n === 2) {
           if (!toolOnly) await writeFile(join(f.workspaceRoot, "REPORT"), "independent report writer\n");
-          for (let i = 0; i < MAX_OBSERVED_TOOL_EVENTS + 2; i++) request.onToolObservation?.({ stage: "end", toolName: "read", toolInput: { path: "SCRIPT" }, result: scriptContent });
+          for (let i = 0; i < MAX_OBSERVED_TOOL_EVENTS + 2; i++) await request.onToolObservation?.({ stage: "end", toolName: "read", toolInput: { path: "SCRIPT" }, result: scriptContent });
           if (qualifying) await f.edit(request, "rewritten after overflow\n");
         }
       });
@@ -250,7 +250,7 @@ test("read-only confirmation calls that first cross the retention limit after a 
       assert.equal(result.reviewCycles.length, qualifying ? 2 : 1, label);
       assert.equal((await f.captured()).length, qualifying ? 2 : 1, `${label}: exact reviewer invocations`);
       assert.equal(f.requests.length, qualifying ? 3 : 2, `${label}: bounded executor turns`);
-      if (qualifying) assert.equal(result.automaticReviewNotArmed, undefined, label);
+      if (qualifying) assert.match(result.automaticReviewNotArmed ?? "", /Later unattributed changes are NOT approved/, label);
       else assert.match(result.automaticReviewNotArmed ?? "", /known read-only calls do not qualify/, label);
       if (!qualifying && !toolOnly) assert.match(result.summary, /captured but NOT reviewed: added REPORT/, label);
     }
@@ -368,40 +368,44 @@ test("missing retained evidence refuses a boundary-trusting continuation and a n
   assert.equal(existsSync(join(g.artifactDir, "result.json")), false, "no not-armed settlement is published without its evidence");
 });
 
-test("overflow classification never reads raw tool input; a non-read-only call still qualifies by name", async (t) => {
+test("overflow classification never reads raw tool input; a call alone cannot rearm a passing review", async (t) => {
   const f = await fixture(t);
   let getterCalls = 0;
   f.setAction(async (request, n) => {
     if (n === 1) {
       await f.edit(request, scriptContent);
-      for (let i = 0; i < MAX_OBSERVED_TOOL_EVENTS + 2; i++) request.onToolObservation?.({ stage: "start", toolName: "read", toolInput: {} });
+      for (let i = 0; i < MAX_OBSERVED_TOOL_EVENTS + 2; i++) await request.onToolObservation?.({ stage: "start", toolName: "read", toolInput: {} });
     }
     if (n === 2) {
       const toolInput = {} as Record<string, unknown>;
       Object.defineProperty(toolInput, "command", { enumerable: true, get() { getterCalls++; throw new Error("raw command getter invoked"); } });
-      request.onToolObservation?.({ stage: "start", toolName: "bash", toolInput });
+      await request.onToolObservation?.({ stage: "start", toolName: "bash", toolInput });
     }
   });
   const result = await runInplaceLifecycle(f.input);
   assert.equal(getterCalls, 0);
   assert.equal(result.status, "reviewed", result.error);
-  assert.equal(result.reviewCycles.length, 2, "the overflowed bash call qualifies and reaches a new review");
-  assert.equal(f.requests.length, 3);
+  assert.equal(result.reviewCycles.length, 1, "the overflowed call supplies no new captured reviewable activity");
+  assert.equal((await f.captured()).length, 1);
+  assert.equal(f.requests.length, 2);
+  assert.match(result.summary, /best effort: missing, unsupported or incomplete observations/);
 });
 
-test("unknown scope advances external revision beyond a full event ledger and invalidates a tool-only pass", async (t) => {
+test("unknown scope beyond a full event ledger is disclosed without snapshot-only post-pass review", async (t) => {
   const f = await fixture(t);
   f.setAction(async (request, n) => {
     if (n === 1) {
       await f.edit(request, scriptContent);
-      for (let i = 0; i < MAX_OBSERVED_TOOL_EVENTS + 1; i++) request.onToolObservation?.({ stage: "start", toolName: "read", toolInput: {} });
+      for (let i = 0; i < MAX_OBSERVED_TOOL_EVENTS + 1; i++) await request.onToolObservation?.({ stage: "start", toolName: "read", toolInput: {} });
     }
-    if (n === 2) request.onToolObservation?.({ stage: "start", toolName: "write", toolInput: { path: "x".repeat(100000) } });
+    if (n === 2) await request.onToolObservation?.({ stage: "start", toolName: "write", toolInput: { path: "x".repeat(100000) } });
   });
   const result = await runInplaceLifecycle(f.input);
   assert.equal(result.status, "reviewed", result.error);
-  assert.equal(result.reviewCycles.length, 2);
-  assert.ok(result.reviewCycles[1]!.externalObservationRevision! > result.reviewCycles[0]!.externalObservationRevision!);
+  assert.equal(result.reviewCycles.length, 1);
+  assert.equal((await f.captured()).length, 1);
+  assert.equal(result.toolObservationsTruncated, true);
+  assert.match(result.summary, /Later unattributed changes are NOT approved/);
 });
 
 test("valid empty structured event stream arms no automatic review and settles honestly unreviewed, never no_changes", async (t) => {
@@ -421,7 +425,7 @@ test("structured snapshot FS-only and read-only activity arms no review; a later
   const f = await fixture(t, { toolOnly: false });
   f.setAction(async (request) => {
     await writeFile(join(f.workspaceRoot, "SCRIPT"), "unobserved SCRIPT rewrite\n");
-    request.onToolObservation?.({ stage: "end", toolName: "read", toolInput: { path: "SCRIPT" }, result: "old script" });
+    await request.onToolObservation?.({ stage: "end", toolName: "read", toolInput: { path: "SCRIPT" }, result: "old script" });
   });
   const result = await runInplaceLifecycle(f.input);
   assert.equal(result.status, "unreviewed", result.error);
@@ -435,7 +439,7 @@ test("structured snapshot FS-only and read-only activity arms no review; a later
   const reviewed = await runInplaceLifecycle(g.input);
   assert.equal(reviewed.status, "reviewed", reviewed.error);
   assert.equal((await g.captured()).length, 1);
-  assert.equal(reviewed.automaticReviewNotArmed, undefined);
+  assert.match(reviewed.automaticReviewNotArmed ?? "", /Later unattributed changes are NOT approved/);
 });
 
 test("structured correction without qualifying activity keeps findings unresolved instead of re-reviewing or accepting", async (t) => {
@@ -467,7 +471,7 @@ test("run-as-binary keeps needs_changes corrections, then reports its final pass
   assert.ok(result.changedSinceLaunch.some((change) => change.path === "FINAL-NOTE"), "final delta is reported");
   assert.match(result.summary, /^Worker claim turn 3/, "final turn text reaches the parent");
   assert.match(result.summary, /captured but NOT reviewed: added FINAL-NOTE/);
-  assert.match(result.summary, /run-as-binary final pass-response turn/);
+  assert.match(result.summary, /No new originating-task captured reviewable activity was observed in the final pass-response turn/);
   assert.match(result.summary, /not certified by that pass/);
   const durable = JSON.parse(await readFile(join(f.artifactDir, "result.json"), "utf8"));
   assert.match(durable.automaticReviewNotArmed, /added FINAL-NOTE/);
@@ -521,6 +525,45 @@ test("default-Off first acquisition failure blocks before executor work", async 
   t.mock.method(capture, "createWorkspaceSnapshot", async () => { throw new Error("injected acquisition fault"); });
   await assert.rejects(runInplaceLifecycle(f.input), ReviewEvidenceCaptureFailure);
   assert.equal(f.requests.length, 0); assert.equal(f.warnings.length, 0);
+});
+
+test("production tool-only completion notification retains earlier-pass attribution after unobserved sibling writes", async (t) => {
+  const f = await fixture(t);
+  f.input.config.review!.evidence!.inplaceToolOnly = true;
+  f.setAction(async (request, turn) => {
+    if (turn === 1) await f.edit(request, scriptContent);
+    if (turn === 2) await writeFile(join(f.workspaceRoot, "SCRIPT"), "unobserved sibling after pass\n");
+  });
+  t.mock.method(executorAdapters, "createExecutorAdapter", (...args: Parameters<typeof executorAdapters.createExecutorAdapter>) => {
+    assert.ok(args[1]);
+    return f.input.adapterFactory!(args[0], args[1]);
+  });
+  const notices: string[] = [];
+  let complete!: () => void;
+  const completed = new Promise<void>((resolve) => { complete = resolve; });
+  const controller = new BackgroundExecutionController({
+    pi: { sendMessage: (message: { content: unknown }) => {
+      const text = typeof message.content === "string" ? message.content : JSON.stringify(message.content);
+      notices.push(text);
+      if (text.includes("finished in place")) complete();
+    } }, config: f.input.config, state: createState(), cwd: () => f.workspaceRoot, notify() {},
+  });
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const started = await controller.start([{ title: "SCRIPT", instructions: "Update SCRIPT", acceptanceCriteria: ["SCRIPT updated"] }], "inplace");
+    await Promise.race([completed, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("completion deadline")), 20000); })]);
+    const task = controller.inspect(started.executionId).tasks[0]!;
+    assert.equal(task.state, "reported");
+    assert.equal((await f.captured()).length, 1);
+    const notification = notices.find((notice) => notice.includes("finished in place"))!;
+    assert.match(notification, /Review: passed for the earlier reviewed delta only/);
+    assert.match(notification, /Later unattributed changes are NOT approved by the earlier pass/);
+    assert.doesNotMatch(notification, /Review: passed\./);
+    assert.match(task.summary!, /Later unattributed changes are NOT approved/);
+  } finally {
+    if (timer) clearTimeout(timer);
+    await controller.shutdown(); await controller.detach();
+  }
 });
 
 test("production controller fallback warns through originating UI/outcome for success and errors with quiet notifications and YouShouldKnow Off", async (t) => {

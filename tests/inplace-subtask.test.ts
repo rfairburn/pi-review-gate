@@ -1076,7 +1076,7 @@ test("an in-place task reviews through the subtask reviewer configuration and se
     assert.deepEqual(resultJson.changedSinceLaunch, [{ status: "added", path: "reviewed.txt" }]);
     // The settled summary reports the actual review disposition and names the
     // recorded delta (#220/PR226) — no repeated attribution narrative.
-    assert.match(task.summary ?? "", / Review: passed\./);
+    assert.match(task.summary ?? "", / Review: passed for the earlier reviewed delta only; later turns were not reviewed\./);
     assert.match(task.summary ?? "", /^Workspace changes since launch: added reviewed\.txt$/m);
     for (const rejected of REJECTED_COMPLETION_NARRATIVE) {
       assert.doesNotMatch(task.summary ?? "", new RegExp(rejected, "i"), `routine completion carries no rejected narrative: ${rejected}`);
@@ -1118,14 +1118,14 @@ test("in-place completion names the root delta and reports the actual review dis
     assert.equal(await readFile(join(workspace, "hello.txt"), "utf8"), "written in place\n");
     // The durable summary is the concise factual shape: identity/workspace,
     // actual review disposition, and the named recorded delta.
-    assert.match(settled.summary ?? "", new RegExp(`^In-place task ${escapeForRegex(settled.taskId)} finished in place in .*\. Review: passed\.$`, "m"));
+    assert.match(settled.summary ?? "", new RegExp(`^In-place task ${escapeForRegex(settled.taskId)} finished in place in .*\\. Review: passed for the earlier reviewed delta only; later turns were not reviewed\\.$`, "m"));
     assert.match(settled.summary ?? "", /^Workspace changes since launch: added hello\.txt$/m);
     for (const rejected of REJECTED_COMPLETION_NARRATIVE) {
       assert.doesNotMatch(settled.summary ?? "", new RegExp(rejected, "i"), `routine completion carries no rejected narrative: ${rejected}`);
     }
     // The completion wake adds the concise group aggregate, nothing more.
     const completion = await waitForValue(() => messages.find((message) => message.includes(settled.taskId) && /finished in/.test(message)), 10_000);
-    assert.match(completion!, / Review: passed\./);
+    assert.match(completion!, / Review: passed for the earlier reviewed delta only; later turns were not reviewed\./);
     assert.match(completion!, /^Workspace changes since launch: added hello\.txt$/m);
     assert.match(completion!, new RegExp(`In-place ${escapeForRegex(started.executionId)} COMPLETE: 1/1 tasks settled in place\\.`));
     assert.doesNotMatch(completion!, /All requested in-place work settled/, "the group result is one line");

@@ -156,14 +156,14 @@ exactly restores the original baseline, the next reviewer sees the inverse excha
 diff and validates the correction. A passing review is transmitted to the implementing
 model as a final review turn with every reviewer's official notes. The pass applies to
 the reviewed evidence basis: in snapshot mode, the exact reviewed workspace snapshot;
-tool-only review never claims full snapshot coverage. A response that does not introduce
-new changes under the selected evidence method closes the window at settlement while
-retaining it for an immediate `/ask-reviewer` follow-up. If the implementing model makes
-another reviewable change after seeing the passing observations, that response becomes
-a new exchange in the same window and triggers another review, subject to the
-[automatic review trigger](#automatic-review-trigger). Later ordinary work
-starts a fresh window under the selected method and does not re-review changes that
-already passed.
+tool-only review never claims full snapshot coverage. During the same passing-review
+confirmation/follow-up loop, only new captured reviewable activity from the originating
+session or task can trigger another automatic review. Otherwise the window closes at
+settlement while retaining the identifiable prior pass for an immediate `/ask-reviewer`
+follow-up, with an attribution warning if later workspace changes remain unreviewed.
+See [Passing-review confirmations and follow-ups](#passing-review-confirmations-and-follow-ups).
+Later ordinary work starts a fresh window under the selected method and does not
+re-review changes that already passed.
 
 At cutover, an active pre-checkpoint review window starts fresh with the existing
 workspace edits as its new baseline; no earlier verdict is migrated or represented as
@@ -174,8 +174,9 @@ passed. A fresh baseline cannot retroactively certify those earlier edits.
 
 ### Automatic review trigger
 
-Automatic Primary review, and automatic review of InPlace workers whose adapter
-reports structured tool events, runs only when the existing eligibility rules hold
+For initial/new-window reviews and `needs_changes` corrections, automatic Primary
+review, and automatic review of InPlace workers whose adapter reports structured tool
+events, runs only when the existing eligibility rules hold
 **and** the agent made a new qualifying tool call since the preceding review. Calls the
 existing read-only classification already knows (`read`, `grep`, `find`, `ls`,
 `GitRead`, web fetch/search) do not qualify. Filesystem changes alone — runtime,
@@ -191,6 +192,31 @@ An unknown retained review boundary cannot certify completion. There is no new s
 evidence, not complete history or authorship: a tool call does not prove that the agent
 caused every captured change. InPlace specifics, including the run-as-binary final
 pass response, are in [Delegated execution](delegated-execution.md#in-place-subtask-kind).
+
+### Passing-review confirmations and follow-ups
+
+Within the **same passing-review confirmation/follow-up loop**, both Primary and every
+InPlace adapter require new originating-session/task **captured reviewable activity**
+to re-enter automatic review, under either evidence method. A qualifying call alone
+paired with sibling, process, or other workspace drift is not enough. Unchanged
+confirmations, repeated finals, read-only or nonreviewable calls, and already-reviewed
+evidence do not start another review.
+
+Workspace-only drift, including churn confined to `.pi-review-gate/checkpoints/`, keeps
+the identifiable prior pass with an explicit attribution warning: **the pass covers
+previously reviewed evidence only; later unattributed changes are not approved, and
+the current workspace is not certified**. This is not a path exclusion or a claim that
+those files cannot need review. A genuine new captured reviewable edit by the same
+session/task still requires review. So does a relevant new observed outside-root
+mutation candidate; no proof of an external file diff is required.
+
+Tool capture remains best effort. Missing, unsupported, or incomplete observations
+are not proof that no activity or effects occurred: retain the available evidence and
+disclose its limits. They introduce neither a snapshot-only fallback trigger nor a new
+blocking requirement for this post-pass rule. This tightening does not change initial
+or new-window reviews, `needs_changes` corrections, existing capture/integrity failures,
+manual review commands, or isolated `execute` review and landing. It adds no setting,
+cap, serialization, storage relocation, or requirement to make a no-op tool call.
 
 ## Review evidence methods
 
@@ -411,8 +437,9 @@ retained artifacts, not an additional file-evidence producer.
   after-turn content under the existing in-place policy. Generic adapter arguments
   remain bounded and redacted evidence, not inferred filesystem targets. Omitted
   fields, values, nested data, or unsupported reflection are explicitly incomplete
-  and require review. New incomplete observations advance the existing observation
-  revision so a prior pass or no-progress comparison cannot cover later unknown scope.
+  evidence. Initial/correction review and observation-revision handling remain unchanged;
+  the [post-pass rule](#passing-review-confirmations-and-follow-ups) does not turn
+  capture incompleteness alone into new reviewable activity or proof of no effects.
 - Failed calls remain evidence. ApplyPatch can successfully edit one file before a
   later operation fails; the earlier file change must survive review capture. An
   overall error is neither proof of no effects nor proof that every requested target

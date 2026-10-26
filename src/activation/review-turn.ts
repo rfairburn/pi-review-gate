@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { effectiveReviewSettings, type ReviewGateConfig } from "../config";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "../correction-feedback";
 import { rememberFinalAssistantSummary } from "../evidence";
-import { primaryEvidencePolicy, evidenceMethodNotice, isEligibleReviewCaptureFailure, latchPrimarySnapshotFallback, primaryFallbackUserWarning, PRIMARY_REVIEW_DISABLED_USER_WARNING } from "../review-evidence";
+import { primaryEvidencePolicy, evidenceMethodNotice, isReviewableToolObservation, isEligibleReviewCaptureFailure, latchPrimarySnapshotFallback, primaryFallbackUserWarning, PRIMARY_REVIEW_DISABLED_USER_WARNING } from "../review-evidence";
 import { BackgroundProcessReadiness } from "../background-process-readiness";
 import { type BackgroundShellController, type BackgroundShellLifecycleEvent } from "../background-shell";
 import {
@@ -769,6 +769,25 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       }
 
       if (!output.changed) {
+        if (output.noReviewReason === "no_new_reviewable_activity") {
+          // Keep the actual review identity/artifacts, not a fabricated verdict
+          // over the later workspace. Unsupported/missing hooks are best effort.
+          const pass = window.reviewHistory.at(-1)!;
+          await sendNoticeWhileSessionActive(
+            noticeTarget,
+            `WARNING: review gate: review ${pass.sequence} passed only its earlier captured evidence${window.bundleDir ? ` (${window.bundleDir})` : ""}. No new originating-session captured reviewable activity was observed; no additional review ran. Later unattributed workspace changes are NOT approved by that pass; the current workspace is not certified as unchanged or fully reviewed. Tool capture is best effort: missing, unsupported or incomplete observations are not proof that no effects occurred.`,
+            () => deps.isSessionActive(),
+          );
+          const exchange = window.exchanges.at(-1);
+          if (exchange && exchange.workspaceChanges.length === 0 && exchange.sideEffectChanges.length === 0
+            && !exchange.evidenceEvents.some(isReviewableToolObservation)) {
+            // Preserve ordinary unchanged-response ownership. Drift or fresh
+            // incomplete observations stay available for explicit review.
+            closeReviewWindow(deps.state, true);
+          }
+          await releaseQueuedUserInputs(deps.pi, deps.state, () => deps.isSessionActive(), () => deps.persist());
+          return;
+        }
         if (output.noReviewReason === "unchanged_deferred_response") {
           await releaseQueuedUserInputs(deps.pi, deps.state, () => deps.isSessionActive(), () => deps.persist());
           return;

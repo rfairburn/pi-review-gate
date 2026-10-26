@@ -318,7 +318,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
   let lastReview: InPlaceReviewActivity["lastReview"] = activityKnown ? restoredActivity?.lastReview : undefined;
   let unobservedSinceReview = restoredActivity?.unobservedSinceReview === true;
   let qualifyingSinceReview = restoredActivity?.qualifyingSinceReview === true;
-  let binaryPassFinal = false;
+  let passResponseFinal = false;
   const saveActivity = (inFlight: boolean) => persistInPlaceReviewActivity(resolvedArtifactDir, {
     version: 1, taskId,
     // Finishing a turn cannot reconstruct a lost boundary: it stays unknown
@@ -709,14 +709,14 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
           });
         }
         currentResult = resumed;
-        binaryPassFinal = false; // Newer instructions are new work, not the final pass response.
+        passResponseFinal = false; // Newer instructions are new work, not the final pass response.
         attribution = await baselineFor();
       }
     }
 
     const changedPaths = attribution.changes.map((change) => ({ status: change.status, path: change.path }));
     const currentDeltaIdentity = inPlaceDeltaIdentity(attribution);
-    if (method === "snapshot" && correctionCount === 0 && changedPaths.length === 0 && !window.evidence.requiresReview
+    if (!passResponseFinal && method === "snapshot" && correctionCount === 0 && changedPaths.length === 0 && !window.evidence.requiresReview
       && !snapshotBasis?.toolOnlyHistory && baseline.mode !== "tool") {
       // The empty-delta upper bound still invokes no reviewer, but restored
       // unresolved findings are never reported as a successful no_changes.
@@ -820,7 +820,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
     // Retention/uncertainty flags (a full ledger, clipped inputs) are disclosed
     // but are not new calls: qualifying calls are counted per observation
     // before any ledger discard.
-    if ((binaryPassFinal || !unobservedSinceReview) && !qualifyingSinceReview) {
+    if ((passResponseFinal || !unobservedSinceReview) && !qualifyingSinceReview) {
       // Not armed: settle honestly from the last completed review, never as a new verdict.
       const unknownBoundary = !activityKnown && reviewCycles.length === 0;
       const since = lastReview ? `since review cycle ${lastReview.cycle}` : input.continuation ? "in this continuation" : "since launch";
@@ -836,13 +836,13 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         : unreviewed.length === 0
           ? "No workspace delta change was recorded after that point."
           : `Workspace changes recorded after that point were captured but NOT reviewed: ${unreviewed.slice(0, 10).join(", ")}${unreviewed.length > 10 ? ` (+${unreviewed.length - 10} more)` : ""}.`;
-      const trigger = binaryPassFinal
-        ? "The run-as-binary final pass-response turn ran and is reported as evidence without another review (that protocol forwards no tool calls; none are claimed)."
+      const trigger = passResponseFinal
+        ? "No new originating-task captured reviewable activity was observed in the final pass-response turn (known read-only calls do not qualify); filesystem changes or tool calls alone do not arm another review."
         : `No new qualifying structured tool activity was observed ${since} (known read-only calls do not qualify); filesystem changes alone do not arm automatic InPlace review.`;
-      const notArmed = `${trigger} ${scope} Missing observations are not proof that no effects occurred.`;
+      const notArmed = `${trigger} ${scope}${passResponseFinal ? " Later unattributed changes are NOT approved by the earlier pass." : ""} Tool capture is best effort: missing, unsupported or incomplete observations are not proof that no effects occurred.`;
       // Only a pass reviewed in THIS run settles as reviewed; an earlier run's
       // pass never certifies a continuation's new instructions.
-      const passedCycle = lastReview?.verdict === "pass"
+      const passedCycle = passResponseFinal && lastReview?.verdict === "pass"
         ? reviewCycles.find((cycle) => cycle.cycle === lastReview!.cycle && cycle.verdict === "pass")
         : undefined;
       return await settleInPlace(input, {
@@ -934,6 +934,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
           evidence: window.evidence,
           window,
           correctionAttemptCount: correctionCount,
+          capturedPassActivity: passResponseFinal && qualifyingSinceReview,
           signal: reviewSignal,
           onUpdate: (message: string) => {
             if (message) {
@@ -1046,7 +1047,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         });
       }
       currentResult = steered;
-      binaryPassFinal = false;
+      passResponseFinal = false;
       attribution = await baselineFor();
       continue;
     }
@@ -1120,7 +1121,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
       lastReview = { cycle: reviewCycle, verdict, ...inPlaceUnknownEvidenceMark(window.evidence), identity: currentDeltaIdentity, changedSinceLaunch: changedPaths };
       unobservedSinceReview = false;
       qualifyingSinceReview = false;
-      binaryPassFinal = false;
+      passResponseFinal = false;
     }
     await saveActivity(false);
 
@@ -1262,8 +1263,8 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
     reportLifecycleProgress(input, {
       phase: "confirming",
       message: method === "snapshot"
-        ? "review passed — confirming the workspace delta is unchanged"
-        : "review passed — confirming no new observed evidence",
+        ? "review passed — observing follow-up activity and later workspace attribution"
+        : "review passed — observing follow-up tool evidence",
       artifactDir: resolvedArtifactDir,
     });
     if (signal?.aborted) {
@@ -1285,11 +1286,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         session: currentResult.session,
       });
     }
-    const passedDeltaIdentity = currentDeltaIdentity;
-    const passedExternalRevision = window.evidence.externalObservationRevision ?? 0;
-    const passedToolRevision = window.evidence.toolObservationRevision ?? 0;
     const passedMethod = method;
-    const passedObservationsTruncated = window.evidence.toolObservationsTruncated === true;
     const passFeedback = await buildReviewTransmission(
       reviewOutput,
       reviewOutput.invocationDir ?? join(resolvedArtifactDir, "invocations"),
@@ -1297,12 +1294,23 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
       window.nextReviewSequence - 1,
       "passed",
     );
+    passResponseFinal = true;
     const confirmed = await runTurn({
       ...input,
+      onLiveControl: (control) => input.onLiveControl?.(control ? {
+        ...control,
+        interrupt: () => control.interrupt(),
+        steer: async (...args) => {
+          const acknowledgement = await control.steer(...args);
+          if (acknowledgement.status === "acknowledged") passResponseFinal = false;
+          return acknowledgement;
+        },
+      } : undefined),
       mode: "continuation",
       startingTurn: lastExecutorTurn + 1,
       feedback: passFeedback,
       priorSession: currentResult.session,
+      passResponse: { isCurrent: () => passResponseFinal },
     });
     lastExecutorTurn = confirmed.lastExecutorTurn ?? lastExecutorTurn + 1;
     if (confirmed.status === "cancelled" || signal?.aborted) {
@@ -1345,69 +1353,16 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         session: confirmed.session,
       });
     }
-    // Confirm against the actual reviewed method; unrelated filesystem writers
-    // cannot turn a tool-only pass response into another snapshot review.
+    // Keep workspace attribution for disclosure, not as activity eligibility.
+    // The turn's existing qualifying counter now measures captured activity
+    // for this same-pass response; missing hooks cannot reopen snapshot review.
     const confirmAttribution = passedMethod === "snapshot" ? await baselineFor() : toolAttribution();
-    if (inPlaceDeltaIdentity(confirmAttribution) === passedDeltaIdentity
-      && (window.evidence.externalObservationRevision ?? 0) === passedExternalRevision
-      && (passedMethod === "snapshot" || (window.evidence.toolObservationRevision ?? 0) === passedToolRevision)
-      && (window.evidence.toolObservationsTruncated === true) === passedObservationsTruncated) {
-      // The pass is tied to the exact reviewed workspace delta and the same
-      // bounded external-observation state; neither new root changes nor new
-      // external observations appeared during confirmation.
-      const passedCycle = reviewCycles[reviewCycles.length - 1];
-      if (!passedCycle || passedCycle.cycle !== reviewCycle) {
-        return await settleInPlace(input, {
-          status: "review_error",
-          taskId,
-          title: task.title,
-          summary: "The passing review cycle could not be identified for settlement.",
-          adapter: confirmed.adapter,
-          model: confirmed.model,
-          error: "pass cycle identity missing",
-          workspaceRoot,
-          baseline,
-          changedSinceLaunch: changedPaths,
-          reviewCycles,
-          artifactDir: resolvedArtifactDir,
-          operationRecord: confirmed.operationRecord,
-          lastExecutorTurn,
-          session: confirmed.session,
-        });
-      }
-      const withWarnings = hasPartialReviewerFailure(reviewOutput.reviewerResults);
-      return await settleInPlace(input, {
-        status: "reviewed",
-        taskId,
-        title: task.title,
-        summary: passedMethod === "snapshot"
-          ? withWarnings
-            ? `${confirmed.summary}\n\nReview passed with reviewer infrastructure warnings. The reviewed workspace delta is unchanged since the passed review; the changes remain in place.`
-            : `${confirmed.summary}\n\nReview passed and the reviewed workspace delta is unchanged since the passed review; the changes remain in place.`
-          : `${confirmed.summary}\n\nInPlace review passed${withWarnings ? " with reviewer infrastructure warnings" : ""} on retained tool evidence; no new observed mutation or unknown scope was recorded during confirmation. This is not exact-snapshot certification; writes remain in place.`,
-        adapter: confirmed.adapter,
-        model: confirmed.model,
-        usage: confirmed.usage,
-        workspaceRoot,
-        baseline,
-        changedSinceLaunch: changedPaths,
-        reviewCycles,
-        artifactDir: resolvedArtifactDir,
-        operationRecord: confirmed.operationRecord,
-        lastExecutorTurn,
-        session: confirmed.session,
-      });
-    }
     // The workspace changed after the pass: the old pass does not cover the
     // new delta. The loop's qualifying-activity gate decides whether it is
     // reviewed or reported as unreviewed evidence (the review verdict is
     // post-hoc; the writes were already performed either way).
     currentResult = confirmed;
-    // The user's run-as-binary contract: its final pass-response turn is
-    // captured and reported as evidence; its unobserved changes alone never
-    // arm another review (actual qualifying activity still can).
-    binaryPassFinal = confirmed.adapter === "run-as-binary";
-    attribution = passedMethod === "snapshot" ? confirmAttribution : await baselineFor();
+    attribution = passedMethod === "snapshot" || (passResponseFinal && !qualifyingSinceReview) ? confirmAttribution : await baselineFor();
     continue;
   }
 }

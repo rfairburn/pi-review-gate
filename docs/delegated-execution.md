@@ -295,8 +295,8 @@ Attribution and review:
   of an already-changed path is always observable, no-progress detection cannot be
   fooled by a same-path content rewrite. A passing verdict is bound to the reviewed
   content plus the bounded external-observation revision and truncation state; a pass
-  confirmation that changes reviewed contents or records a new outside-root observation
-  re-enters review only through the automatic review trigger below. For no-progress
+  confirmation re-enters review only for new originating-task captured reviewable
+  activity under the post-pass rule below, not for workspace drift alone. For no-progress
   detection, a new external observation also distinguishes correction cycles when the
   workspace delta is unchanged; it is evidence of an observed path, not proof of a particular external content change. The observation revision detects
   new evidence, not a verified file diff. Each durable cycle record carries the reviewed
@@ -305,20 +305,34 @@ Attribution and review:
   never recycles a settled cycle number, and publication of a genuinely new cycle never
   silently accepts an existing record: a numbered collision fails the task closed as a
   review error.
-- Automatic InPlace review (initial, correction, or post-pass) follows the
-  [automatic review trigger](review-workflow.md#automatic-review-trigger): when every turn
-  since the preceding review ran on a structured tool-event stream, it also needs new
-  qualifying tool activity, so filesystem changes alone settle without a new review —
-  unreviewed before any review, unresolved after `needs_changes`, or the earlier pass
-  with later changes disclosed as not reviewed. Turns without structured events keep the
+- Initial/new-window automatic InPlace reviews and `needs_changes` corrections retain
+  the [automatic review trigger](review-workflow.md#automatic-review-trigger): when every
+  turn since the preceding review ran on a structured tool-event stream, they also need
+  new qualifying tool activity. Filesystem changes alone settle unreviewed before any
+  review or unresolved after `needs_changes`. Turns without structured events keep the
   existing eligibility and correction caps, and an unknown retained review boundary
-  never settles as clean or accepted. One exception applies to user-selected
-  `run-as-binary` InPlace executors, which forward no tool calls (none are inferred):
-  after a pass, the final pass-response turn still runs and its result is returned to
-  the orchestrator as final **unreviewed** evidence, but its filesystem changes do not
-  start another review. The pass covers only the delta it reviewed, not the latest
-  workspace state; newer steering or continuation instructions are new work. Isolated
-  workers gain no new rule, and no other adapter gets this exception.
+  never settles as clean or accepted.
+- Within the same passing-review confirmation/follow-up loop, **every InPlace adapter**
+  follows the same [post-pass rule as Primary](review-workflow.md#passing-review-confirmations-and-follow-ups):
+  only new originating-task captured reviewable activity re-enters review. A qualifying
+  call alone plus sibling/process/workspace drift is insufficient. Unchanged
+  confirmations, repeated finals, read-only/nonreviewable calls, and already-reviewed
+  evidence do not retrigger review. Workspace-only or `.pi-review-gate/checkpoints/`-only
+  churn retains the identifiable earlier pass with an explicit attribution warning:
+  **the pass covers previously reviewed evidence only; later unattributed changes are
+  not approved, and the current workspace is not certified**. A genuine new captured
+  own reviewable edit or relevant new observed outside-root mutation candidate still
+  re-enters review; the latter needs no proof of an external file diff. Missing,
+  unsupported, or incomplete capture remains best effort with disclosed limits, not
+  proof of no activity, a snapshot-only fallback trigger, or a new blocker. Existing
+  capture/integrity failures remain blocking under their ordinary rules.
+- User-selected `run-as-binary` InPlace executors still forward no structured tool calls
+  (none are inferred). After a pass, the final pass-response turn still runs and its
+  result is returned to the orchestrator as final **unreviewed** evidence, but its
+  filesystem changes do not start another review. The pass covers only the delta it
+  reviewed, not the latest workspace state. Newer steering or continuation instructions
+  are new work. Initial/correction eligibility, manual review, and isolated `execute`
+  review and landing are unchanged.
 - The recorded delta is a change-since-launch record, not proof of authorship: changes
   by concurrent writers appear indistinguishably from the worker's own. Reviewers are
   instructed not to credit unattributable changes to the worker, not to present unrelated

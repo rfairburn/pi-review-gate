@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -218,6 +219,49 @@ function flushAsync(): Promise<void> {
   return new Promise((resolvePromise) => setImmediate(resolvePromise));
 }
 
+/**
+ * Drive one mocked win32 verification and return the exact PowerShell script the production
+ * module handed to its single bounded query child, plus what that verification decided. These
+ * guards pin the shape of the script that the win32-only native case then really executes; they
+ * are not a substitute for that native proof, and no claim here is that a mocked executor
+ * validates PowerShell behaviour itself.
+ */
+async function captureLineageScript(
+  ownedRoot: ChildProcess = fakeOwnedRoot(),
+  candidatePid: number = CANDIDATE_PID,
+): Promise<{ script: string; result: Awaited<ReturnType<typeof verifyWithMockedQuery>> }> {
+  const query = fakeQuery({ kind: "output", output: VALID_EVIDENCE });
+  const result = await withSystemRoot("/fake-windows", () => verifyWithMockedQuery(query, ownedRoot, candidatePid));
+  assert.equal(query.calls.length, 1, "batching the initial lookup never adds a query child or a retry");
+  return { script: query.calls[0].args[4], result };
+}
+
+/** Every index at which `needle` occurs in `haystack`. */
+function allIndexes(haystack: string, needle: string): number[] {
+  const indexes: number[] = [];
+  for (let at = haystack.indexOf(needle); at >= 0; at = haystack.indexOf(needle, at + 1)) indexes.push(at);
+  return indexes;
+}
+
+/** The `Verb-Noun` cmdlet names the script asks PowerShell to resolve. */
+function cmdletNames(script: string): string[] {
+  return [...new Set(script.match(/\b[A-Z][A-Za-z]+-[A-Z][A-Za-z]+\b/g) ?? [])].sort();
+}
+
+/** The `-Filter` literal of the script's single initial CIM request. */
+function initialLookupFilter(script: string): string | undefined {
+  const line = script.split("\n").find((candidate) => candidate.startsWith("$initial = @(Get-CimInstance"));
+  return line === undefined ? undefined : /-Filter "([^"]*)"/.exec(line)?.[1];
+}
+
+/** The decimal PID literals the script assigns to its two known-PID variables. */
+function knownPidLiterals(script: string): Array<[string, string | undefined]> {
+  return ["$targetPid", "$rootPid"].map((name) => [
+    name,
+    new RegExp(`^\\${name} = (\\d+)$`, "m").exec(script)?.[1],
+  ]) as Array<[string, string | undefined]>;
+}
+
 /** Drive the production verifier on a mocked win32 host with a mocked query child. */
 async function verifyWithMockedQuery(
   query: FakeQuery,
@@ -301,6 +345,114 @@ test("the original acceptance conditions are unchanged and report no refusal sta
     "the bounded query still inspects no command lines, paths, or shim contents");
   assert.equal(isVerifiedWindowsAncestryEvidence(VALID_EVIDENCE, CANDIDATE_PID, OWNED_ROOT_PID), true,
     "the boolean acceptance view agrees with the typed result");
+});
+
+test("the initial lookup batches exactly the two known PIDs and saves one CIM round trip", async () => {
+  const { script, result } = await captureLineageScript();
+  assert.deepEqual(result, { verified: true }, "the scripted proof still accepts authentic evidence");
+
+  // Three bounded CIM requests remain: the batched initial lookup, the one
+  // per-ancestor walk lookup, and the independent fresh full-chain snapshot. The
+  // separate owned-root-only lookup is the request the batch replaced, so a valid
+  // proof now costs two round trips instead of three at the shortest chain.
+  assert.equal(script.split("Get-CimInstance").length - 1, 3,
+    "one initial batch, one ancestor hop, one fresh snapshot: no separate owned-root lookup");
+
+  const initial = script.split("\n").find((line) => line.startsWith("$initial = @(Get-CimInstance"));
+  assert.ok(initial !== undefined, "the candidate and the owned root are observed by one initial request");
+  assert.equal(initialLookupFilter(script), "ProcessId = $targetPid OR ProcessId = $rootPid",
+    "the initial filter lists only the two PIDs under verification, so it can never enumerate the host");
+  assert.deepEqual(knownPidLiterals(script), [["$targetPid", String(CANDIDATE_PID)], ["$rootPid", String(OWNED_ROOT_PID)]],
+    "both PIDs enter the script only as the already-validated decimal literals");
+  assert.ok(initial.includes("-Property ProcessId,ParentProcessId,CreationDate"),
+    "the batched request reads the same three properties as every later lookup");
+  assert.ok(script.indexOf("$initial = @(Get-CimInstance") < script.indexOf("for ($step = 0"),
+    "the batched lookup happens before the parent walk starts");
+  assert.ok(script.indexOf("chain-candidate-record-missing") < script.indexOf("for ($step = 0"),
+    "a missing candidate is still refused at the original stage, before any walking");
+  for (const line of script.split("\n")) {
+    if (line.includes("Get-CimInstance")) {
+      assert.ok(line.includes("-Filter "), `every CIM request stays filtered, found: ${line}`);
+    }
+  }
+  assert.deepEqual(cmdletNames(script), ["ForEach-Object", "Get-CimInstance", "New-Object"],
+    "selecting and counting the records by PID adds no new cmdlet for the host to resolve");
+  assert.ok(script.includes("$candidateRows = 0") && script.includes("$rootRows = 0") && script.includes("$unexpectedRows = 0"),
+    "every initial row is counted, so a duplicate or unexpected row cannot be silently discarded");
+  const membershipGuard = script.indexOf("if ($candidateRows -gt 1 -or $unexpectedRows -gt 0)");
+  assert.ok(membershipGuard > 0 && membershipGuard < script.indexOf("for ($step = 0"),
+    "a duplicated candidate or an unrequested PID is refused before any walking, on an existing fixed stage");
+  assert.ok(script.includes("if ($candidateRows -gt 1 -or $unexpectedRows -gt 0) { [Console]::Out.WriteLine('PI_REVIEW_GATE_LINEAGE_NO:snapshot-count-mismatch')"),
+    "the initial membership refusal reuses the existing snapshot-count stage rather than a new one");
+
+  // The batch is scoped to the identity actually under verification, never to a
+  // collected or cached value.
+  const other = (await captureLineageScript(fakeOwnedRoot(999), 55555)).script;
+  assert.equal(initialLookupFilter(other), "ProcessId = $targetPid OR ProcessId = $rootPid",
+    "the filter shape does not widen for another identity");
+  assert.deepEqual(knownPidLiterals(other), [["$targetPid", "55555"], ["$rootPid", "999"]],
+    "the batch follows the candidate and root actually under verification");
+});
+
+test("the batched initial root observation cannot shorten the walk or replace the fresh snapshot", async () => {
+  const { script } = await captureLineageScript();
+  const loopStart = script.indexOf("for ($step = 0");
+  const rootBranch = script.indexOf("  if ($parent -eq $rootPid) {");
+  const afterRootBranch = script.indexOf("  $seen[[string]$parent] = $true");
+  assert.ok(loopStart > 0 && rootBranch > loopStart && afterRootBranch > rootBranch,
+    "the walk still reaches the owned root through its parent links");
+
+  assert.ok(script.includes('  $current = Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate -Filter "ProcessId = $parent"'),
+    "every intermediate ancestor is still its own bounded lookup, never skipped or inferred");
+  assert.ok(script.indexOf("chain-ancestor-record-missing") > afterRootBranch,
+    "a missing intermediate ancestor is still refused by the walk itself");
+
+  // The initial root row is only ever read before the walk, and inside the branch where
+  // the walk positively reached the root, so it can never satisfy a hop or append the
+  // root early. A chain that wanders elsewhere never touches it at all.
+  const initialRootUses = allIndexes(script, "$initialRoot");
+  assert.equal(initialRootUses.length, 3, "the initial root is initialised, selected once, and used once");
+  for (const at of initialRootUses) {
+    assert.ok(at < loopStart || (at > rootBranch && at < afterRootBranch),
+      "the initial root observation stays inside this verification's root-reached branch");
+  }
+  const rootUniqueness = script.indexOf("if ($rootRows -ne 1)");
+  assert.ok(rootUniqueness > rootBranch && rootUniqueness < afterRootBranch,
+    "a missing or duplicated owned root is refused only on the root-reached branch, so unrelated chains keep their own refusal stages");
+  assert.ok(script.indexOf("[void]$chain.Add($rootPid)") > rootUniqueness,
+    "the root only joins the chain after the walk reached it and its record was proven unambiguous");
+
+  // Acceptance still comes only from the unchanged independent fresh snapshot of the
+  // whole chain: it re-reads every observed PID, re-checks each observed creation date,
+  // counts records, and re-checks parent coherence, so a root that exited or had its
+  // PID reused since the initial batch is refused there rather than accepted.
+  const snapshot = script.slice(rootBranch, afterRootBranch);
+  for (const required of [
+    "$filter = ($chain | ForEach-Object { \"ProcessId = $_\" }) -join ' OR '",
+    "$liveProcesses = @(Get-CimInstance",
+    "if ($liveProcesses.Count -ne $chain.Count) {",
+    "$record.CreationDate -ne $observed.CreationDate",
+    "$stage = 'snapshot-record-missing'",
+    "$stage = 'snapshot-parent-incoherent'",
+    "PI_REVIEW_GATE_LINEAGE_NO:$",
+  ]) {
+    assert.ok(snapshot.includes(required), `the fresh full-chain check still performs: ${required}`);
+  }
+  for (const stage of ["snapshot-count-mismatch", "snapshot-record-missing", "snapshot-creation-mismatch", "snapshot-parent-incoherent"]) {
+    assert.ok(snapshot.includes(stage), `${stage} is still a fail-closed fresh-snapshot stage`);
+  }
+  assert.equal((snapshot.match(/\[Console\]::Out\.WriteLine\(\(\$evidence/g) ?? []).length, 1,
+    "accepting evidence is emitted from exactly one place: the fresh-snapshot branch");
+  assert.ok(snapshot.indexOf("[Console]::Out.WriteLine(($evidence") > snapshot.indexOf("$record.CreationDate -ne $observed.CreationDate"),
+    "evidence is emitted only after every observed creation date was re-checked");
+
+  // Every fail-closed chain stage that batching could have displaced is still emitted.
+  for (const stage of [
+    "chain-candidate-record-missing", "chain-owned-root-record-missing", "chain-ancestor-record-missing",
+    "chain-parent-absent", "chain-cycle", "chain-depth-limit",
+  ]) {
+    assert.ok(script.includes(`PI_REVIEW_GATE_LINEAGE_NO:${stage}`), `${stage} is still a native refusal`);
+  }
 });
 
 test("preflight refusals are fixed stages and never start a query child", async () => {
@@ -1482,5 +1634,181 @@ if (process.platform === "win32") {
     }
     if (bodyError !== undefined) throw bodyError;
     if (problems.length > 0) throw new Error(`owned fixture cleanup incomplete: ${problems.join("; ")}`);
+  });
+
+  // -------------------------------------------------------------------------
+  // CONTROLLED CIM/POWERSHELL FLOW TESTS (win32 only) — not real native ancestry proof.
+  // The emitted lineage script is executed by a real PowerShell host with only the CIM
+  // data source substituted. A PowerShell function shadows the cmdlet of the same name
+  // (command precedence: alias > function > cmdlet), so the script text under test is
+  // byte-identical to what the production module hands to the real query child while
+  // every response is a fixed synthetic row set. That makes the duplicated, ambiguous,
+  // and unexpected-response paths deterministically testable, which a mocked executor
+  // cannot do: the shipped script's own control flow really runs here. It contacts no
+  // CIM, no network, and no real processes, and `-EncodedCommand` is only transport for
+  // the same script bytes (no shell quoting), not a different program. The real-CIM
+  // proof stays in the native case above.
+  // -------------------------------------------------------------------------
+
+  const powershellHost = join(process.env.SystemRoot ?? process.env.WINDIR ?? "",
+    "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const MID_PID = 54321;
+  const ROOT_TICKS = 1_000;
+  const MID_TICKS = 2_000;
+  const CANDIDATE_TICKS = 3_000;
+  const INITIAL_FILTER = `ProcessId = ${CANDIDATE_PID} OR ProcessId = ${OWNED_ROOT_PID}`;
+  const DIRECT_SNAPSHOT_FILTER = INITIAL_FILTER;
+  const MID_FILTER = `ProcessId = ${MID_PID}`;
+  const MULTI_SNAPSHOT_FILTER = `ProcessId = ${CANDIDATE_PID} OR ProcessId = ${MID_PID} OR ProcessId = ${OWNED_ROOT_PID}`;
+
+  interface StubRow { pid: number; parent: number; ticks: number | null }
+
+  const stubRow = (pid: number, parent: number, ticks: number | null = CANDIDATE_TICKS): StubRow => ({ pid, parent, ticks });
+  const CANDIDATE_DIRECT = stubRow(CANDIDATE_PID, OWNED_ROOT_PID);
+  const CANDIDATE_VIA_MID = stubRow(CANDIDATE_PID, MID_PID);
+  const MID_RECORD = stubRow(MID_PID, OWNED_ROOT_PID, MID_TICKS);
+  const ROOT_RECORD = stubRow(OWNED_ROOT_PID, 4, ROOT_TICKS);
+  const REUSED_ROOT_RECORD = stubRow(OWNED_ROOT_PID, 4, ROOT_TICKS + 5_000);
+  const UNRELATED_RECORD = stubRow(999, 4, ROOT_TICKS);
+
+  function stubRowText(stub: StubRow): string {
+    return stub.ticks === null
+      ? `(New-PiRowWithoutCreationDate ${stub.pid} ${stub.parent})`
+      : `(New-PiRow ${stub.pid} ${stub.parent} ${stub.ticks})`;
+  }
+
+  /** Prelude that shadows `Get-CimInstance` with one fixed response per call. */
+  function powershellStubPrelude(responses: StubRow[][], logPath: string): string {
+    return [
+      "$ErrorActionPreference = 'Stop'",
+      "function New-PiRow { param([long]$ProcessIdValue, [long]$ParentProcessIdValue, [long]$TicksValue) "
+        + "[pscustomobject]@{ ProcessId = $ProcessIdValue; ParentProcessId = $ParentProcessIdValue; "
+        + "CreationDate = [DateTime]::new($TicksValue, [DateTimeKind]::Utc) } }",
+      "function New-PiRowWithoutCreationDate { param([long]$ProcessIdValue, [long]$ParentProcessIdValue) "
+        + "[pscustomobject]@{ ProcessId = $ProcessIdValue; ParentProcessId = $ParentProcessIdValue; CreationDate = $null } }",
+      "$global:__piResponses = @{}",
+      "$global:__piCall = 0",
+      `$global:__piLog = '${logPath.replace(/'/g, "''")}'`,
+      "function Get-CimInstance { param([string]$ClassName, [string[]]$Property, [string]$Filter) "
+        + "Add-Content -LiteralPath $global:__piLog -Value $Filter; "
+        + "$rows = $global:__piResponses[[int]$global:__piCall]; "
+        + "$global:__piCall = $global:__piCall + 1; "
+        + "if ($null -eq $rows) { return }; foreach ($row in $rows) { $row } }",
+      ...responses.map((rows, index) => `$global:__piResponses[${index}] = @(${rows.map(stubRowText).join(", ")})`),
+    ].join("\n");
+  }
+
+  /** Run the emitted script on the host PowerShell and report stdout, exit, and CIM filters. */
+  async function runEmittedLineageScript(script: string, responses: StubRow[][]): Promise<{
+    stdout: string; stderr: string; status: number | null; filters: string[];
+  }> {
+    const dir = await mkdtemp(join(tmpdir(), "prg-lineage-pwsh-"));
+    try {
+      const logPath = join(dir, "cim-filters.txt");
+      const command = `${powershellStubPrelude(responses, logPath)}\n${script}`;
+      const encoded = Buffer.from(command, "utf16le").toString("base64");
+      const result = spawnSync(powershellHost,
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        { encoding: "utf8", windowsHide: true, timeout: 60_000, maxBuffer: 1024 * 1024 });
+      let filters: string[] = [];
+      try {
+        filters = (await readFile(logPath, "utf8")).split(/\r?\n/).filter((line) => line.length > 0);
+      } catch {
+        filters = [];
+      }
+      return {
+        stdout: (result.stdout ?? "").trim(),
+        stderr: (result.stderr ?? "").trim(),
+        status: result.status,
+        filters,
+      };
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("PowerShell running the emitted script with a stubbed CIM source refuses duplicated, ambiguous, and unexpected initial rows", async () => {
+    if (!existsSync(powershellHost)) {
+      throw new Error("the win32 suite must be able to locate Windows PowerShell to exercise the emitted script");
+    }
+    const { script } = await captureLineageScript();
+    const cases: Array<{
+      name: string; responses: StubRow[][]; accepted: boolean; stage?: string; filters: string[];
+    }> = [
+      {
+        name: "a valid direct chain (two CIM calls, one of them the batched initial lookup)",
+        responses: [[CANDIDATE_DIRECT, ROOT_RECORD], [CANDIDATE_DIRECT, ROOT_RECORD]],
+        accepted: true,
+        filters: [INITIAL_FILTER, DIRECT_SNAPSHOT_FILTER],
+      },
+      {
+        name: "a valid two-hop chain, with each intermediate ancestor queried once on its own",
+        responses: [[CANDIDATE_VIA_MID, ROOT_RECORD], [MID_RECORD], [CANDIDATE_VIA_MID, MID_RECORD, ROOT_RECORD]],
+        accepted: true,
+        filters: [INITIAL_FILTER, MID_FILTER, MULTI_SNAPSHOT_FILTER],
+      },
+      {
+        name: "a duplicated candidate row cannot be accepted even when the later snapshot is consistent",
+        responses: [[CANDIDATE_DIRECT, CANDIDATE_DIRECT, ROOT_RECORD], [CANDIDATE_DIRECT, ROOT_RECORD]],
+        accepted: false, stage: "snapshot-count-mismatch", filters: [INITIAL_FILTER],
+      },
+      {
+        name: "a row for a PID that was never requested cannot be accepted",
+        responses: [[CANDIDATE_DIRECT, ROOT_RECORD, UNRELATED_RECORD], [CANDIDATE_DIRECT, ROOT_RECORD]],
+        accepted: false, stage: "snapshot-count-mismatch", filters: [INITIAL_FILTER],
+      },
+      {
+        name: "a duplicated owned-root row is refused once the walk reaches the root",
+        responses: [[CANDIDATE_DIRECT, ROOT_RECORD, ROOT_RECORD], [CANDIDATE_DIRECT, ROOT_RECORD]],
+        accepted: false, stage: "chain-owned-root-record-missing", filters: [INITIAL_FILTER],
+      },
+      {
+        name: "a chain that never reaches the root keeps its own walk stage despite a duplicated owned-root row",
+        responses: [[CANDIDATE_VIA_MID, ROOT_RECORD, ROOT_RECORD], []],
+        accepted: false, stage: "chain-ancestor-record-missing", filters: [INITIAL_FILTER, MID_FILTER],
+      },
+      {
+        name: "a missing owned-root record is refused at the root-reached branch",
+        responses: [[CANDIDATE_DIRECT], [CANDIDATE_DIRECT]],
+        accepted: false, stage: "chain-owned-root-record-missing", filters: [INITIAL_FILTER],
+      },
+      {
+        name: "an owned-root PID reused after the initial batch is refused by the fresh snapshot",
+        responses: [[CANDIDATE_DIRECT, ROOT_RECORD], [CANDIDATE_DIRECT, REUSED_ROOT_RECORD]],
+        accepted: false, stage: "snapshot-creation-mismatch", filters: [INITIAL_FILTER, DIRECT_SNAPSHOT_FILTER],
+      },
+      {
+        name: "an initial owned-root row without a creation date can never be accepted",
+        responses: [[CANDIDATE_DIRECT, stubRow(OWNED_ROOT_PID, 4, null)], [CANDIDATE_DIRECT, ROOT_RECORD]],
+        accepted: false, stage: "snapshot-creation-mismatch", filters: [INITIAL_FILTER, DIRECT_SNAPSHOT_FILTER],
+      },
+      {
+        name: "the missing-candidate stage stays ahead of every other initial-batch anomaly",
+        responses: [[UNRELATED_RECORD]],
+        accepted: false, stage: "chain-candidate-record-missing", filters: [INITIAL_FILTER],
+      },
+      {
+        name: "an empty initial response is the original missing-candidate refusal",
+        responses: [[]],
+        accepted: false, stage: "chain-candidate-record-missing", filters: [INITIAL_FILTER],
+      },
+    ];
+
+    for (const testCase of cases) {
+      const run = await runEmittedLineageScript(script, testCase.responses);
+      assert.equal(run.status, 0, `${testCase.name}: the script always exits 0, got ${run.status} / ${run.stderr}`);
+      assert.deepEqual(run.filters, testCase.filters, `${testCase.name}: observed CIM filters ${JSON.stringify(run.filters)}`);
+      const verdict = classifyWindowsAncestryEvidence(run.stdout, CANDIDATE_PID, OWNED_ROOT_PID);
+      if (testCase.accepted) {
+        assert.deepEqual(verdict, { verified: true },
+          `${testCase.name} must verify, got ${JSON.stringify(verdict)} from ${JSON.stringify(run.stdout)}`);
+        continue;
+      }
+      assert.equal(run.stdout, `PI_REVIEW_GATE_LINEAGE_NO:${testCase.stage}`, testCase.name);
+      assert.equal(verdict.verified, false, `${testCase.name} must never be accepted`);
+      assert.equal(verdict.verified === false && verdict.reason, testCase.stage, testCase.name);
+      assert.ok((WINDOWS_LINEAGE_NATIVE_SENTINEL_REASONS as readonly string[]).includes(testCase.stage ?? ""),
+        `${testCase.name} refuses on an existing native sentinel stage, not a new one`);
+    }
   });
 }

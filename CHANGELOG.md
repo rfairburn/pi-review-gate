@@ -15,6 +15,24 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.211]
+
+### Changed
+
+- The malformed-lock reclamation test now seeds its five completed fallback-runtime
+  generations with the real producer's post-success on-disk layout instead of
+  performing five preparatory wrapper launches for each of its six admission-lock
+  shapes (Refs #194). The directory, symlink, device-target, FIFO-target, oversized,
+  and unreadable cases still run exactly one real wrapper launch each and keep their
+  existing startup, download, checksum, listing, extraction, version-probe, dispatch,
+  pruning, lock-recovery, and outside-bytes assertions. Seeded generations are real
+  private directories in each fixture's own cache carrying this fixture's synthetic
+  Node program, the internal relative npm link, and a nonempty representative payload,
+  with no fabricated liveness, lifetime, or current-runtime records. This makes the
+  repeated test setup cheaper without weakening its checks; measured CI timing remains
+  for the actual pull request run. Test fixtures only: production behavior, other
+  tests, deadlines, and CI workflows are unchanged.
+
 ## [0.1.0-dev.210]
 
 ### Fixed

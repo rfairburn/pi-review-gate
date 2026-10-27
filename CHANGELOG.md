@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.212]
+
+### Fixed
+
+- Primary's post-pass attribution warning now appears only for detected changes after
+  the previous passing review, not unchanged confirmations or already-reviewed changes
+  (#527). It states that those changes could not be attributed to the running model
+  and were not subject to further review. Review eligibility and outcomes are unchanged.
+
 ## [0.1.0-dev.211]
 
 ### Changed

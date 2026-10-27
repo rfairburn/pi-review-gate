@@ -2221,8 +2221,11 @@ async function primaryToolPrerequisiteSession(root: string, primaryToolOnly = fa
   return { ws, open, reviews, edit, sidecar };
 }
 
+const POST_PASS_UNATTRIBUTED_WARNING = /WARNING: review gate: Unattributed changes were detected after review 1 passed\. They could not be attributed to the running model and were not subject to further review\./;
+const RETIRED_POST_PASS_WARNING_LANGUAGE = /passed only its earlier captured evidence|not certified as unchanged or fully reviewed|best effort: missing, unsupported or incomplete observations/;
+
 for (const toolOnly of [false, true]) for (const scenario of ["sibling", "process", "call-only", "candidate-call-only", "completed-noop", "failed-local", "checkpoint", "restored", "unchanged", "already-reviewed", "read-only", "missing", "unsupported", "incomplete"] as const) {
-  test(`Primary ${toolOnly ? "tool" : "snapshot"} same-pass ${scenario} retains its identifiable pass and warns without another review`, async () => {
+  test(`Primary ${toolOnly ? "tool" : "snapshot"} same-pass ${scenario} retains its identifiable pass without another review`, async () => {
     const root = await mkdtemp(join(tmpdir(), "primary-pass-activity-"));
     try {
       const f = await primaryToolPrerequisiteSession(root, toolOnly);
@@ -2275,11 +2278,19 @@ for (const toolOnly of [false, true]) for (const scenario of ["sibling", "proces
       assert.equal(await f.reviews(), 1);
       assert.equal(s.sent.length, 1, "only the actual pass was transmitted");
       assert.equal(await readFile(artifact, "utf8"), originalPass, "prior pass artifact is not rewritten as a new approval");
-      assert.match(s.notices.join("\n"), /review 1 passed only its earlier captured evidence/);
-      assert.ok(s.notices.some((notice) => notice.includes(bundleDir)), "warning identifies the actual pass artifact");
-      assert.match(s.notices.join("\n"), /Later unattributed workspace changes are NOT approved/);
-      assert.match(s.notices.join("\n"), /not certified as unchanged or fully reviewed/);
-      assert.match(s.notices.join("\n"), /best effort: missing, unsupported or incomplete observations are not proof/);
+      // Snapshot settlement detects the completed response exchange's post-pass
+      // delta. Tools-only retains effects only from observed candidate tool
+      // results, so these synthetic external edits are not a detected delta.
+      const detectedPostPassDelta = !toolOnly
+        && scenario !== "unchanged" && scenario !== "already-reviewed" && scenario !== "read-only";
+      if (detectedPostPassDelta) {
+        assert.match(s.notices.join("\n"), POST_PASS_UNATTRIBUTED_WARNING);
+      } else {
+        assert.doesNotMatch(s.notices.join("\n"), /Unattributed changes were detected after review/,
+          "an unchanged, read-only, already-reviewed, or undetected Tools-only turn produces no attribution warning");
+      }
+      assert.doesNotMatch(s.notices.join("\n"), RETIRED_POST_PASS_WARNING_LANGUAGE,
+        "the corrected warning no longer carries the workspace-certification/capture disclaimer");
       await s.close();
     } finally { await rm(root, { recursive: true, force: true }); }
   });
@@ -2804,8 +2815,8 @@ for (const toolOnly of [false, true]) for (const scenario of ["sibling-noop", "s
         scenario === "sibling-noop" ? "a completed no-op is not fresh captured activity" : "a genuine restore is");
       assert.equal(s.sent.length, scenario === "sibling-noop" ? 1 : 2, "exact reviewer transmissions");
       if (scenario === "sibling-noop") {
-        assert.match(s.notices.join("\n"), /review 1 passed only its earlier captured evidence/);
-        assert.match(s.notices.join("\n"), /Later unattributed workspace changes are NOT approved/);
+        assert.match(s.notices.join("\n"), POST_PASS_UNATTRIBUTED_WARNING);
+        assert.doesNotMatch(s.notices.join("\n"), RETIRED_POST_PASS_WARNING_LANGUAGE);
       } else {
         assert.match(s.sent[1]!.message, /Gate verdict: pass/);
       }

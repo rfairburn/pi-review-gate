@@ -715,9 +715,10 @@ tool history cannot substitute for durability.
 In the same passing-review confirmation/follow-up loop, both Primary and every InPlace
 adapter require new originating-session/task captured reviewable activity, not a qualifying
 call alone paired with workspace drift. Workspace-only or checkpoint-only churn retains
-the identifiable prior pass with an explicit attribution warning: it covers previously
-reviewed evidence only; later unattributed changes are not approved, and the current
-workspace is not certified. The [post-pass contract](review-workflow.md#passing-review-confirmations-and-follow-ups)
+the identifiable prior pass. Primary warns only when post-pass changes are detected:
+they could not be attributed to the running model and were not subject to further
+review. Unchanged confirmations and already-reviewed changes alone do not produce this
+warning. The [post-pass contract](review-workflow.md#passing-review-confirmations-and-follow-ups)
 preserves best-effort capture limits without a snapshot-only fallback trigger or new
 blocker, and leaves existing initial/correction and integrity requirements unchanged.
 

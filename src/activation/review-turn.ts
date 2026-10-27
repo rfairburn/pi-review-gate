@@ -771,14 +771,21 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       if (!output.changed) {
         if (output.noReviewReason === "no_new_reviewable_activity") {
           // Keep the actual review identity/artifacts, not a fabricated verdict
-          // over the later workspace. Unsupported/missing hooks are best effort.
+          // over the later workspace. Warn only when the completed response
+          // exchange detected a post-pass delta; an unchanged confirmation is
+          // not itself a new safety problem. The exchange delta is the
+          // post-pass comparison, never the window's cumulative workspace diff.
           const pass = window.reviewHistory.at(-1)!;
-          await sendNoticeWhileSessionActive(
-            noticeTarget,
-            `WARNING: review gate: review ${pass.sequence} passed only its earlier captured evidence${window.bundleDir ? ` (${window.bundleDir})` : ""}. No new originating-session captured reviewable activity was observed; no additional review ran. Later unattributed workspace changes are NOT approved by that pass; the current workspace is not certified as unchanged or fully reviewed. Tool capture is best effort: missing, unsupported or incomplete observations are not proof that no effects occurred.`,
-            () => deps.isSessionActive(),
-          );
           const exchange = window.exchanges.at(-1);
+          const unattributedChanges = Boolean(exchange
+            && (exchange.workspaceChanges.length > 0 || exchange.sideEffectChanges.length > 0));
+          if (unattributedChanges) {
+            await sendNoticeWhileSessionActive(
+              noticeTarget,
+              `WARNING: review gate: Unattributed changes were detected after review ${pass.sequence} passed. They could not be attributed to the running model and were not subject to further review.`,
+              () => deps.isSessionActive(),
+            );
+          }
           if (exchange && exchange.workspaceChanges.length === 0 && exchange.sideEffectChanges.length === 0
             && !exchange.evidenceEvents.some(isReviewableToolObservation)) {
             // Preserve ordinary unchanged-response ownership. Drift or fresh

@@ -1285,7 +1285,10 @@ test(".sh five existing artifacts never refuse the next launch and stale locks a
   cleanupFixture(t, f);
   writeBootstrapTools(f);
   const env = { PI_CODING_AGENT_DIR: f.agentDir };
-  for (let i = 0; i < 5; i++) assert.equal(runSh(f, ["--help"], env).status, 0);
+  // Five completed generations with the real producer's post-success shape are
+  // seeded directly instead of by five preparatory wrapper launches; the two
+  // runSh calls below are the real launches this case observes.
+  seedCompletedNodeGenerations(f);
   const before = nodeRoots(f);
   assert.equal(before.length, 5);
   // A dead owner's lock, and an empty one, are not permanent stop conditions.
@@ -1297,7 +1300,8 @@ test(".sh five existing artifacts never refuse the next launch and stale locks a
   assert.ok(before.some((root) => !existsSync(root)), "an existing generation was actually reclaimed");
   writeFileSync(join(nodeCache(f), ".admission.lock"), "", { mode: 0o600 });
   assert.equal(runSh(f, ["--help"], env).status, 0);
-  assert.ok(recordedPhases(f).filter((p) => p === "curl").length >= 7);
+  // Only the two real launches download; the five seeded generations never did.
+  assert.ok(recordedPhases(f).filter((p) => p === "curl").length >= 2);
   f.markAssertionsPassed();
 });
 
@@ -1392,7 +1396,10 @@ test(".sh never deletes another producer's live lock that replaced malformed met
   cleanupFixture(t, f);
   writeBootstrapTools(f);
   const env = { PI_CODING_AGENT_DIR: f.agentDir };
-  for (let i = 0; i < 5; i++) assert.equal(runSh(f, ["--help"], env).status, 0);
+  // Five completed generations with the real producer's post-success shape are
+  // seeded directly instead of by five preparatory wrapper launches; the single
+  // runSh below is the one real launch this case observes.
+  seedCompletedNodeGenerations(f);
   const before = nodeRoots(f);
   assert.equal(before.length, 5);
   const lock = join(nodeCache(f), ".admission.lock");

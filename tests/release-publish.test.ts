@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { loadReleaseModule, projectRoot } from "./helpers/release-scripts";
 import type { ChangelogModule, Eligibility, PackagingModule, PublishModule, PublishSummary } from "./helpers/release-scripts";
@@ -1607,16 +1607,100 @@ test("the production artifact build smoke-verifies the exact tarball before retu
   }
 });
 
+// A small but genuinely valid package project used ONLY as the source checkout
+// of the failing-install-smoke case below. It carries the same identity fields,
+// `files` allowlist shape, lockfile layout, and TypeScript project the real
+// checkout provides, so the real staging build still runs every step it runs
+// in production on this input: copy the packaged inputs, compile TypeScript
+// output into the staging tree, `npm pack` the stage, extract the tarball and
+// verify it against the derived allowlist plus the fixed required-entry list.
+// Only the size of the repository input differs; nothing before the install
+// gate is stubbed, cached, or injected, and the gate itself stays the untouched
+// throwing `verifyInstalledTarball` stub. `types: []` keeps the compile
+// independent of any `@types` package near the scratch directory.
+const FIXTURE_PROJECT_FILES: Record<string, string> = {
+  "package.json": `${JSON.stringify({
+    name: "pi-review-gate",
+    version: "0.1.0",
+    description: "Minimal valid package project for the release install-smoke gate case.",
+    license: "MIT",
+    type: "commonjs",
+    main: "dist/src/index.js",
+    types: "dist/src/index.d.ts",
+    files: ["dist/src", "scripts", "skills", "README.md", "LICENSE"],
+  }, null, 2)}\n`,
+  // The staging build rewrites only the root identity fields, so the lock must
+  // carry the package name and the `packages[""]` root entry.
+  "package-lock.json": `${JSON.stringify({
+    name: "pi-review-gate",
+    version: "0.1.0",
+    lockfileVersion: 3,
+    requires: true,
+    packages: { "": { name: "pi-review-gate", version: "0.1.0", license: "MIT" } },
+  }, null, 2)}\n`,
+  // rootDir "." with sources under src/ is what makes the compile emit the
+  // required dist/src/index.js and dist/src/index.d.ts into the staging tree.
+  "tsconfig.json": `${JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "CommonJS",
+      moduleResolution: "Node",
+      lib: ["ES2022"],
+      types: [],
+      rootDir: ".",
+      outDir: "dist",
+      strict: true,
+      declaration: true,
+      esModuleInterop: true,
+      forceConsistentCasingInFileNames: true,
+      skipLibCheck: true,
+    },
+    include: ["src/**/*.ts"],
+  }, null, 2)}\n`,
+  "src/index.ts": "export function activate(): void {}\n",
+  "README.md": "# pi-review-gate\n\nFixture package project for the release install-smoke gate case.\n",
+  LICENSE: "MIT License (fixture)\n",
+  "scripts/pi-review-gate.sh": "#!/bin/sh\nexit 0\n",
+  "scripts/pi-review-gate.cmd": "@echo off\r\nexit /b 0\r\n",
+  "scripts/pi-review-gate-launcher.cjs": "process.exit(0);\n",
+  "skills/pi-review-gate-orchestrator/SKILL.md": "# pi-review-gate-orchestrator\n\nFixture skill document.\n",
+  "skills/pi-review-gate-orchestrator/references/recovery.md": "# Recovery\n\nFixture reference document.\n",
+  "skills/pi-review-gate-execution/SKILL.md": "# pi-review-gate-execution\n\nFixture skill document.\n",
+  "skills/pi-review-gate-research/SKILL.md": "# pi-review-gate-research\n\nFixture skill document.\n",
+};
+
+function fixtureProjectRoot(parent: string): string {
+  const root = join(parent, "fixture-project");
+  for (const [relativePath, content] of Object.entries(FIXTURE_PROJECT_FILES)) {
+    const target = join(root, relativePath);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, content);
+  }
+  return root;
+}
+
 test("a failing install smoke prevents the artifact build from returning publishable assets", { timeout: 300_000 }, async () => {
   const scratch = mkdtempSync(join(tmpdir(), "release-build-smoke-fail-"));
+  // Witness that THIS stub produced the rejection. The asserted message prefix
+  // is not attribution on its own: the tiny project would also make the real
+  // install gate fail with `install smoke verification failed` (its bins and
+  // docs checker are absent), so the case could pass while the stub was never
+  // reached. The flag proves the real staging build ran all the way to the gate.
+  let reachedInstallSmoke = false;
   const original = stubInstallSmoke(() => {
+    reachedInstallSmoke = true;
     throw new Error("install smoke verification failed: simulated gate failure");
   });
   try {
+    // The real artifact builder stages, compiles, packs, and tarball-verifies
+    // this small valid project, then reaches the install gate. The gate's
+    // failure must reject the build so no publishable asset is ever returned.
+    const projectRoot = fixtureProjectRoot(scratch);
     await assert.rejects(
-      publish.buildReleaseArtifacts({ eligibility: buildEligibility("0.1.0-dev.1"), projectRoot: REAL_ROOT, scratch }),
+      publish.buildReleaseArtifacts({ eligibility: buildEligibility("0.1.0-dev.1"), projectRoot, scratch }),
       /install smoke verification failed/,
     );
+    assert.equal(reachedInstallSmoke, true, "the build must fail at the install smoke gate itself, not before it");
   } finally {
     packaging.verifyInstalledTarball = original;
     rmSync(scratch, { recursive: true, force: true });

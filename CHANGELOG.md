@@ -15,6 +15,30 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.214]
+
+### Changed
+
+- The release artifact build's failing-install-smoke case now builds its
+  tarball from a small valid package project created inside its own scratch
+  directory instead of staging the whole repository (Refs #194). The case still
+  calls the real artifact builder, so the real staging build copies the packaged
+  inputs, compiles TypeScript output into the staging tree, packs the stage, and
+  extracts and verifies the generated tarball before the gate is reached; the
+  gate itself stays the same throwing install-smoke stub whose rejection must
+  keep the build from returning publishable assets. The case also witnesses that
+  this run reached that stub, because the asserted `install smoke verification
+  failed` message prefix alone would match the real gate failing on the small
+  project too: the passing case now proves the intended gate was reached rather
+  than the build stopping earlier or failing for an incidental reason. Only that
+  one case's source input size and its own stub witness changed. The smoke case
+  that verifies the exact tarball built from the real checkout, the real
+  pack/verify/install coverage in `release-package.test.ts`, the refusal to
+  publish after a failed artifact build, every other release gate, all
+  assertions, deadlines, and CI workflows are unchanged, and #194 stays open
+  with its remaining scope. Measured timing for the change comes from the pull
+  request's own CI run rather than a local benchmark campaign.
+
 ## [0.1.0-dev.213]
 
 ### Changed

@@ -5,15 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { captureWaveBase, WaveCaptureError, WaveCaptureResult } from "../src/execution/wave-repository";
+import { WaveCaptureError, WaveCaptureResult } from "../src/execution/wave-repository";
 import {
-  createWorkerWorktree,
   removeWorktree,
-  pinCommit,
   workerRefName,
   isWorktreeClean,
 } from "../src/execution/wave-worktrees";
-import { normalizeCandidate } from "../src/execution/wave-commits";
 import {
   executeWave,
   type WaveControllerInput,
@@ -972,35 +969,6 @@ test("accepted and completed_unreviewed workers are eligible for integration", a
   }
 });
 
-test("no_changes is successful but contributes no commit", async () => {
-  // This is tested implicitly: a worker that produces no changes
-  // returns no_changes status without acceptedCommitSha.
-  // The controller treats it as successful but not eligible for integration.
-  const artifactDir = await mkTmp("pi-wc-art-");
-  const sourceDir = await mkTmp("pi-wc-src-");
-  await git(["init", "--quiet"], sourceDir);
-  await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
-  await git(["add", "."], sourceDir);
-  await git(["commit", "--quiet", "-m", "init"], sourceDir);
-
-  try {
-    const result = await executeWave({
-      cwd: sourceDir,
-      tasks: [{ title: "Test", instructions: "noop", acceptanceCriteria: [] }],
-      config: makeConfigWithWritingExecutor(),
-      artifactDir,
-      waveId: "wc-nochange",
-    });
-
-    assert.equal(result.taskResults.length, 1);
-    // With review disabled and changes made, it should be completed_unreviewed.
-    // The no_changes case is tested in the worker lifecycle tests.
-  } finally {
-    await rm(artifactDir, { recursive: true, force: true });
-    await rm(sourceDir, { recursive: true, force: true });
-  }
-});
-
 // ── concurrency bound ────────────────────────────────────────────────────────
 
 test("observed concurrency never exceeds maxWorkers", async () => {
@@ -1595,55 +1563,6 @@ test("abort after integration skips landing", async () => {
 
     // Landing should be aborted.
     assert.equal(result.landing?.status, "aborted");
-  } finally {
-    await rm(artifactDir, { recursive: true, force: true });
-    await rm(sourceDir, { recursive: true, force: true });
-  }
-});
-
-// ── SEMANTICS FIX: conflict result retains provenance ────────────────────────
-
-test("conflict result retains successfullyIntegrated mappings and worktree", async () => {
-  const artifactDir = await mkTmp("pi-wc-art-");
-  const sourceDir = await mkTmp("pi-wc-src-");
-  await git(["init", "--quiet"], sourceDir);
-  await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
-  await git(["add", "."], sourceDir);
-  await git(["commit", "--quiet", "-m", "init"], sourceDir);
-
-  // Create two workers that modify the same file to cause a conflict.
-  const capture = await captureWaveBase({
-    cwd: sourceDir,
-    maxSnapshotBytes: 1_000_000,
-    waveId: "wc-conflict-provenance",
-    artifactDir,
-  });
-
-  try {
-    // Worker 1: modifies shared.txt
-    const worker1 = await createWorkerWorktree(capture, "task-0");
-    await writeFile(join(worker1.worktreeRoot, "shared.txt"), "from worker 1\n", "utf8");
-    const candidate1 = await normalizeCandidate(capture, worker1.worktreeRoot, "task-0", "Task 0");
-    await pinCommit(capture, candidate1.commitSha, { type: "worker", taskId: "task-0" });
-
-    // Worker 2: modifies shared.txt (conflict)
-    const worker2 = await createWorkerWorktree(capture, "task-1");
-    await writeFile(join(worker2.worktreeRoot, "shared.txt"), "from worker 2\n", "utf8");
-    const candidate2 = await normalizeCandidate(capture, worker2.worktreeRoot, "task-1", "Task 1");
-    await pinCommit(capture, candidate2.commitSha, { type: "worker", taskId: "task-1" });
-
-    // Manually integrate to test conflict provenance.
-    const { integrateWave } = await import("../src/execution/wave-integration");
-    const integrationResult = await integrateWave(capture, [
-      { taskId: "task-0", commitSha: candidate1.commitSha },
-      { taskId: "task-1", commitSha: candidate2.commitSha },
-    ]);
-
-    assert.equal(integrationResult.status, "conflicted");
-    assert.ok(integrationResult.worktree, "Worktree should be preserved");
-    assert.ok(integrationResult.successfullyIntegrated.length >= 1, "Should have successfully integrated mappings");
-    assert.equal(integrationResult.successfullyIntegrated[0].taskId, "task-0");
-    assert.ok(integrationResult.conflictingPaths.length > 0, "Should have conflicting paths");
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });

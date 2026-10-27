@@ -842,11 +842,12 @@ test("plain notice fallback visibly encodes hostile controls once and keeps comp
 });
 
 function assertNoRawTerminalControls(text: string): void {
+  const diagnostic = `unexpected raw terminal control in ${JSON.stringify(text)}`;
   for (const character of text) {
     const code = character.codePointAt(0) ?? 0;
     assert.ok(
       character === "\n" || character === "\t" || !(code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)),
-      `unexpected raw terminal control in ${JSON.stringify(text)}`,
+      diagnostic,
     );
   }
 }

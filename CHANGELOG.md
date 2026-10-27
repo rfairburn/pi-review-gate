@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.216]
+
+### Changed
+
+- `assertNoRawTerminalControls` in the YouShouldKnow test suite now builds its
+  full-frame diagnostic string once before the character loop instead of once per
+  character (Refs #194). Character iteration, the code-point fallback, the control
+  predicate, the assertion call, and the exact diagnostic message contents are
+  unchanged, as are all call sites, fixtures, viewport dimensions, and other test
+  behavior. No production code, workflows, or other tests changed; #194 stays open
+  with its remaining scope.
+
 ## [0.1.0-dev.215]
 
 ### Changed

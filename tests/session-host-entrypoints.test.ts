@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import test, { type TestContext } from "node:test";
@@ -703,6 +703,54 @@ function nodeCache(fixture: EntrypointFixture): string {
   return join(fixture.agentDir, ".pi-review-gate", "node");
 }
 
+/**
+ * Five completed fallback-runtime generations built directly in this fixture's
+ * own cache, instead of five preparatory wrapper launches. Each generation has
+ * the real producer's post-success layout: the inert downloaded archive and
+ * verified member listing, the fresh extraction of this fixture's own synthetic
+ * Node program, its internal relative npm link, and a nonempty representative
+ * payload. The producer writes no lifetime record and removes its producer
+ * marker on completion, so nothing here fabricates identity or liveness evidence.
+ */
+function seedCompletedNodeGenerations(fixture: EntrypointFixture, total = generations_LIMIT()): string[] {
+  const syntheticNode = fixtureSetupEnv.get(fixture.root)?.FAKE_BOOTSTRAP_NODE;
+  assert.ok(syntheticNode, "the fixture's synthetic Node program exists before seeding generations");
+  // writeBootstrapTools defaults the wrapper's fake platform to Linux/x86_64.
+  const distribution = `node-v${NODE_PIN}-linux-x64`;
+  const listing = [
+    `${distribution}/`,
+    `${distribution}/bin/`,
+    `${distribution}/bin/node`,
+    `${distribution}/bin/npm`,
+    `${distribution}/lib/`,
+    `${distribution}/lib/node_modules/`,
+    `${distribution}/lib/node_modules/npm/`,
+    `${distribution}/lib/node_modules/npm/bin/`,
+    `${distribution}/lib/node_modules/npm/bin/npm-cli.js`,
+  ];
+  const cache = nodeCache(fixture);
+  mkdirSync(cache, { recursive: true });
+  const roots: string[] = [];
+  for (let index = 0; index < total; index += 1) {
+    const root = join(cache, `bootstrap.0-seeded-${index}`);
+    const distributionRoot = join(root, "extracted", distribution);
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    writeFileSync(join(root, `${distribution}.tar.gz`), "synthetic archive fixture\n", "utf8");
+    writeFileSync(join(root, "archive-members.txt"), `${listing.join("\n")}\n`, "utf8");
+    mkdirSync(join(distributionRoot, "bin"), { recursive: true });
+    mkdirSync(join(distributionRoot, "lib", "node_modules", "npm", "bin"), { recursive: true });
+    copyFileSync(syntheticNode, join(distributionRoot, "bin", "node"));
+    chmodSync(join(distributionRoot, "bin", "node"), 0o755);
+    writeFileSync(join(distributionRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js"), "#!/bin/sh\n", "utf8");
+    symlinkSync("../lib/node_modules/npm/bin/npm-cli.js", join(distributionRoot, "bin", "npm"));
+    mkdirSync(join(distributionRoot, "lib", "payload"), { recursive: true });
+    writeFileSync(join(distributionRoot, "lib", "payload", "README.txt"), "representative extracted content\n", "utf8");
+    chmodSync(root, 0o700);
+    roots.push(root);
+  }
+  return roots;
+}
+
 /** Physical remaining entries (files, dirs, links) inside one disposable tree. */
 function countTreeEntries(root: string): number {
   let total = 0;
@@ -1259,9 +1307,40 @@ test(".sh reclaims directory, linked (including device and FIFO targets), oversi
     cleanupFixture(t, f);
     writeBootstrapTools(f);
     const env = { PI_CODING_AGENT_DIR: f.agentDir };
-    for (let i = 0; i < 5; i++) assert.equal(runSh(f, ["--help"], env).status, 0);
+    // Five completed generations with the real producer's post-success shape are
+    // seeded directly instead of by five preparatory wrapper launches; the single
+    // runSh below is the one real action this case observes.
+    const seeded = seedCompletedNodeGenerations(f);
+    const syntheticNodeBytes = readFileSync(fixtureSetupEnv.get(f.root)!.FAKE_BOOTSTRAP_NODE!);
+    const distribution = join("extracted", `node-v${NODE_PIN}-linux-x64`);
+    const seededPayloads = new Map<string, Buffer>();
+    assert.equal(seeded.length, 5, "five completed generations are seeded");
+    for (const root of seeded) {
+      const rootStat = lstatSync(root);
+      assert.equal(rootStat.isDirectory() && !rootStat.isSymbolicLink(), true, `${root}: a real generation directory`);
+      assert.ok(readdirSync(root).length > 0, `${root}: a completed generation is nonempty`);
+      const nodeBin = join(root, distribution, "bin", "node");
+      const nodeStat = lstatSync(nodeBin);
+      assert.equal(nodeStat.isFile() && !nodeStat.isSymbolicLink(), true, `${root}: a regular Node entry`);
+      assert.equal(readFileSync(nodeBin).equals(syntheticNodeBytes), true,
+        `${root}: the synthetic Node program is the producer's own copy`);
+      assert.equal(lstatSync(join(root, distribution, "lib", "node_modules", "npm", "bin", "npm-cli.js")).isFile(), true,
+        `${root}: the npm CLI is a regular script`);
+      assert.equal(readlinkSync(join(root, distribution, "bin", "npm")), "../lib/node_modules/npm/bin/npm-cli.js",
+        `${root}: the internal npm link is relative`);
+      assert.deepEqual(
+        readdirSync(root).filter((name) => name === ".producer-active" || name === ".node-lifetime" || name.startsWith(".consumer-")),
+        [],
+        `${root}: no fabricated liveness, lifetime, or consumer record`,
+      );
+      seededPayloads.set(root, readFileSync(join(root, distribution, "lib", "payload", "README.txt")));
+    }
+    assert.equal(existsSync(join(nodeCache(f), "current-node.txt")), false,
+      "seeded completed generations carry no current-runtime record");
     const before = nodeRoots(f);
     assert.equal(before.length, 5);
+    assert.deepEqual([...before].sort(), [...seeded].sort(),
+      "the seed roots are exactly the five generations the action starts from");
     const outside = join(f.root, "outside-lock-target");
     writeFileSync(outside, "outside lock target");
     const lock = join(nodeCache(f), ".admission.lock");
@@ -1288,6 +1367,22 @@ test(".sh reclaims directory, linked (including device and FIFO targets), oversi
     assert.equal(nodeRoots(f).length, 5, `${shape}: the cache actually pruned to the target`);
     assert.ok(before.some((root) => !existsSync(root)), `${shape}: an existing generation was actually reclaimed`);
     assert.equal(readFileSync(outside, "utf8"), "outside lock target", `${shape}: nothing outside the lock entry is touched`);
+    // The real action created exactly one fresh generation and reclaimed exactly
+    // one seeded generation; surviving seeded content is byte-identical.
+    const after = nodeRoots(f);
+    const fresh = after.filter((root) => !seeded.includes(root));
+    assert.equal(fresh.length, 1, `${shape}: the one real launch created exactly one fresh generation`);
+    assert.equal(seeded.filter((root) => existsSync(root)).length, 4, `${shape}: exactly one seeded generation was reclaimed`);
+    assert.deepEqual(
+      readdirSync(fresh[0]!).filter((name) => name === ".producer-active" || name === ".node-lifetime" || name.startsWith(".consumer-")),
+      [],
+      `${shape}: the fresh generation settled without leftover control records`,
+    );
+    for (const root of seeded) {
+      if (!existsSync(root)) continue;
+      assert.equal(readFileSync(join(root, distribution, "lib", "payload", "README.txt")).equals(seededPayloads.get(root)!), true,
+        `${shape}: a surviving seeded generation keeps its representative content`);
+    }
     f.markAssertionsPassed();
   }
 });

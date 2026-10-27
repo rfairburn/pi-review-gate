@@ -15,6 +15,23 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.213]
+
+### Changed
+
+- Two redundant wave-controller test cases were removed (Refs #194). A case titled
+  `no_changes is successful but contributes no commit` used a writing executor and
+  asserted only the task-result count, so it never exercised `no_changes`; the real
+  no-op controller case (`no_changes contributes no commit and integration is
+  no_changes`) and the worker-lifecycle `no_changes` case remain. The controller's
+  copy of the conflict-provenance case called `integrateWave` directly instead of
+  `executeWave` and duplicated the identical real-setup, two-worktree, pinned-commit,
+  conflicting-path, and retained-worktree assertions in the wave-semantics suite;
+  that semantics case and the controller's `executeWave` error-provenance cases
+  remain unchanged, and only the conflict-fixture imports that no remaining case
+  used were dropped with it. This removes only duplicate or ineffective test
+  executions: production behavior, deadlines, and CI workflows are unchanged.
+
 ## [0.1.0-dev.212]
 
 ### Fixed

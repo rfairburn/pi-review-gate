@@ -15,6 +15,29 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.215]
+
+### Changed
+
+- Two more fallback-Node cache tests now seed their five completed fallback-runtime
+  generations with the real producer's post-success on-disk layout instead of making
+  ten preparatory wrapper launches (Refs #194). `five existing artifacts never refuse
+  the next launch and stale locks are reclaimed` keeps both of its real launches and
+  its dead-owner and empty-lock reclamation, startup, no-capacity-refusal,
+  five-generation-target, and reclaimed-existing-generation checks; its recorded
+  download lower bound drops from seven to two because the five removed setup launches
+  no longer download. `never deletes another producer's live lock that replaced
+  malformed metadata` keeps its one real launch and every safety check: the
+  stat-wrapper lock swap, the observation counter, the byte-for-byte survival of the
+  replacement live lock, the busy-cleanup warning, the retained prior generations, and
+  the fresh sixth generation. Seeded generations are real private directories in each
+  fixture's own cache carrying that fixture's synthetic Node program, the internal
+  relative npm link, and a nonempty representative payload, with no fabricated
+  liveness, lifetime, ownership, or current-runtime records. The shared seeding helper
+  is unchanged, and no production code, other tests, deadlines, or CI workflows
+  changed; measured CI timing remains for the actual pull request run. #194 stays open
+  with its remaining scope.
+
 ## [0.1.0-dev.214]
 
 ### Changed

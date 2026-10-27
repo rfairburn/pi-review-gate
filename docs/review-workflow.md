@@ -203,10 +203,11 @@ confirmations, repeated finals, read-only or nonreviewable calls, and already-re
 evidence do not start another review.
 
 Workspace-only drift, including churn confined to `.pi-review-gate/checkpoints/`, keeps
-the identifiable prior pass with an explicit attribution warning: **the pass covers
-previously reviewed evidence only; later unattributed changes are not approved, and
-the current workspace is not certified**. This is not a path exclusion or a claim that
-those files cannot need review. A genuine new captured reviewable edit by the same
+the identifiable prior pass. Primary emits an attribution warning only when changes
+are detected after that pass: they could not be attributed to the running model and
+were not subject to further review. An unchanged confirmation or already-reviewed
+changes alone produce no attribution warning. This is not a path exclusion or a claim
+that those files cannot need review. A genuine new captured reviewable edit by the same
 session/task still requires review. So does a relevant new observed outside-root
 mutation candidate; no proof of an external file diff is required.
 

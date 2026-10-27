@@ -182,6 +182,19 @@ function inPlaceRetryPrompt(failureMessage: string, compaction: boolean): string
   ].join("\n");
 }
 
+/**
+ * #533: fresh-session fallback for an in-place retry. When the recorded native
+ * session cannot be reopened, the adapter delivers the full-task handoff
+ * instead of the resumed retry text, so that handoff must carry exactly what
+ * the resumed retry carried: this attempt's current retry instructions and
+ * incident, on top of the unchanged caller handoff. In-place execution has no
+ * checkpoint (nothing is invented here) and the workspace is the same one, so
+ * the retry prose keeps its existing no-checkpoint, no-rollback wording.
+ */
+function inPlaceRetryHandoff(failureMessage: string, compaction: boolean, handoff: string): string {
+  return [inPlaceRetryPrompt(failureMessage, compaction), "", handoff].join("\n");
+}
+
 async function inPlaceRetryDelay(
   base: number,
   max: number,
@@ -225,6 +238,16 @@ export async function runInplaceTurnLoop(input: {
   task: WaveWorkerTask;
   taskId: string;
   prompt: string;
+  /**
+   * #533: the caller's full-task handoff for this run. The caller's `prompt`
+   * can be continuation- or retry-only text that assumes the previous session's
+   * task, acceptance criteria, acknowledged updates, and current instructions
+   * are still in the executor's history. An adapter that cannot reopen that
+   * native session delivers THIS prompt to its fresh session instead, so an
+   * unverifiable session never leaves the worker with correction text and no
+   * task. It is constant for the run and never carries prior-transcript replay.
+   */
+  handoffPrompt?: string;
   startingTurn: number;
   session?: ExecutorSession;
   signal?: AbortSignal;
@@ -245,6 +268,8 @@ export async function runInplaceTurnLoop(input: {
   let genericRetries = 0;
   let compactionRecoveries = 0;
   let prompt = input.prompt;
+  const originalHandoffPrompt = input.handoffPrompt;
+  let handoffPrompt = input.handoffPrompt;
   let session = input.session;
   let recovery: Parameters<ExecutorAdapter["run"]>[0]["recovery"];
   let lastDispatchedPrompt: string | undefined;
@@ -338,6 +363,7 @@ export async function runInplaceTurnLoop(input: {
         turn = await input.adapter.run({
           cwd: input.workspaceRoot,
           prompt,
+          ...(handoffPrompt === undefined ? {} : { handoffPrompt }),
           artifactDir: input.artifactDir,
           turn: turnNumber,
           workspaceAccess: "workspace-write",
@@ -549,6 +575,9 @@ export async function runInplaceTurnLoop(input: {
         }
       }
       prompt = inPlaceRetryPrompt(failure.message, compactionIncident);
+      if (originalHandoffPrompt !== undefined) {
+        handoffPrompt = inPlaceRetryHandoff(failure.message, compactionIncident, originalHandoffPrompt);
+      }
       recovery = {
         kind: compactionIncident ? "compaction" : "retry",
         compactBeforePrompt: compactionIncident,

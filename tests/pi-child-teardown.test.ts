@@ -3,12 +3,14 @@ import { ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { runPromptProcess, PROCESS_TREE_CLEANUP_GRACE_MS } from "../src/adapters/process";
 import { BackgroundProcessReadiness } from "../src/background-process-readiness";
 import { PiExecutorAdapter, PiRpc } from "../src/execution/adapters/pi-model";
 import type { ExecutorLiveControl } from "../src/execution/types";
+import { PI_SESSION_REFERENCE_DIRNAME } from "../src/pi-session-reference";
+import { readSavedSessionHeader } from "../src/session-header";
 
 // Node's Windows child job ordinarily terminates non-detached children when
 // their spawning Node exits. These fixtures deliberately need a surviving pipe
@@ -22,6 +24,64 @@ interface OwnedDescendantFixture {
   readyPath: string;
   stopPath: string;
   stoppedPath: string;
+}
+
+/** Fixture-owned directory holding this fixture's synthetic native session files. */
+const NATIVE_SESSION_DIRNAME = "native-sessions";
+
+/** Native session id reported by the POSIX RPC background fixture. */
+const TEARDOWN_BACKGROUND_SESSION_ID = "teardown-background-session";
+
+/** Native session id the POSIX compaction recovery turn resumes. */
+const COMPACTION_RECOVERY_SESSION_ID = "teardown-test-session";
+
+/** Native session id the native Windows compaction recovery fixture resumes. */
+const NATIVE_WINDOWS_COMPACTION_SESSION_ID = "native-cmd-teardown-session";
+
+interface FixtureNativeSession {
+  id: string;
+  file: string;
+  cwd: string;
+  artifactDir: string;
+  referencePath: string;
+}
+
+/**
+ * Plan one fixture-owned synthetic native Pi session (#533).
+ *
+ * The session file and its canonical `pi-sessions/<id>.json` reference live
+ * strictly inside the fixture's own isolated root, so a fixture never touches a
+ * real agent/session store and no real provider is involved. Nothing here is
+ * shared between fixtures: every fixture root is a fresh `mkdtemp` directory.
+ */
+function fixtureNativeSession(root: string, id: string, artifactDir = join(root, "artifacts")): FixtureNativeSession {
+  return {
+    id,
+    file: join(root, NATIVE_SESSION_DIRNAME, `${id}.jsonl`),
+    cwd: root,
+    artifactDir,
+    referencePath: join(artifactDir, PI_SESSION_REFERENCE_DIRNAME, `${id}.json`),
+  };
+}
+
+/**
+ * Materialize a planned fixture-owned native session: Pi's public first-line
+ * `SessionHeader` plus, for a RESUMED fixture, the canonical `{id,file,cwd}`
+ * owner reference that the #533 preflight resolves and header-verifies. Both
+ * paths are absolute and normalized, exactly as a recorded reference must be.
+ *
+ * A freshly launched fixture reports its identity instead and the adapter
+ * records the reference itself, exactly as it does for a real new session.
+ */
+async function materializeFixtureNativeSession(
+  session: FixtureNativeSession,
+  options: { reference?: boolean } = {},
+): Promise<void> {
+  await mkdir(dirname(session.file), { recursive: true });
+  await writeFile(session.file, `${JSON.stringify({ type: "session", id: session.id, cwd: session.cwd })}\n`);
+  if (options.reference === false) return;
+  await mkdir(dirname(session.referencePath), { recursive: true });
+  await writeFile(session.referencePath, `${JSON.stringify({ id: session.id, file: session.file, cwd: session.cwd }, null, 2)}\n`);
 }
 
 interface InheritedPipeFixture extends OwnedDescendantFixture {
@@ -80,16 +140,26 @@ async function createBackgroundWaitFixture(mode: "root-exits" | "interruptible" 
   const rootStoppedPath = join(fixture.root, "root.stopped");
   const finalTextRequestPath = join(fixture.root, "final-text.requested");
   const abortRequestPath = join(fixture.root, "abort.requested");
+  const nativeSession = fixtureNativeSession(fixture.root, TEARDOWN_BACKGROUND_SESSION_ID);
+  // A freshly launched RPC fixture owns its session file and reports that
+  // identity; the adapter records the reference from the child's own report.
+  await materializeFixtureNativeSession(nativeSession, { reference: false });
   const backgroundScript = [
     "const fs=require('node:fs');const [stopPath,stoppedPath]=process.argv.slice(1);",
     "setInterval(()=>{if(fs.existsSync(stopPath)){fs.writeFileSync(stoppedPath,'stopped');process.exit(0)}},20);",
   ].join("\n");
   const initialSettlement = mode === "abort-ignored" ? "" : "ack(1);out({type:'agent_end'});";
+  // #533: the adapter asks this child for its native session identity with a
+  // `get_state` BEFORE it delivers the prompt. The fixture reports its own
+  // owned synthetic identity and keeps every post-prompt effect (root exit,
+  // streaming counter) gated on actual prompt receipt, so the identity
+  // preflight cannot consume the fixture's first-turn state.
+  const nativeIdentity = `sessionId:${JSON.stringify(nativeSession.id)},sessionFile:${JSON.stringify(nativeSession.file)}`;
   const stateHandler = mode === "interruptible"
-    ? "else if(command.type==='get_state'){const isStreaming=stateRequests++>0&&!abortRequested;out({type:'response',id:command.id,command:'get_state',success:true,data:{isStreaming,pendingMessageCount:0}});}"
+    ? `else if(command.type==='get_state'){const isStreaming=prompted&&stateRequests++>0&&!abortRequested;out({type:'response',id:command.id,command:'get_state',success:true,data:{isStreaming,pendingMessageCount:0,${nativeIdentity}}});}`
     : mode === "root-exits"
-      ? "else if(command.type==='get_state'){out({type:'response',id:command.id,command:'get_state',success:true,data:{isStreaming:false,pendingMessageCount:0}});setTimeout(()=>process.exit(0),100);}"
-      : "else if(command.type==='get_state'){out({type:'response',id:command.id,command:'get_state',success:true,data:{isStreaming:false,pendingMessageCount:0}});}";
+      ? `else if(command.type==='get_state'){out({type:'response',id:command.id,command:'get_state',success:true,data:{isStreaming:false,pendingMessageCount:0,${nativeIdentity}}});if(prompted)setTimeout(()=>process.exit(0),100);}`
+      : `else if(command.type==='get_state'){out({type:'response',id:command.id,command:'get_state',success:true,data:{isStreaming:false,pendingMessageCount:0,${nativeIdentity}}});}`;
   const abortHandler = mode === "interruptible"
     ? "else if(command.type==='abort'){abortRequested=true;out({type:'response',id:command.id,command:'abort',success:true});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'interrupted background turn'}]}});out({type:'turn_end'});ack(2);out({type:'agent_end'});}"
     : mode === "abort-ignored"
@@ -105,8 +175,8 @@ async function createBackgroundWaitFixture(mode: "root-exits" | "interruptible" 
     "const out=(value)=>process.stdout.write(JSON.stringify(value)+'\\n');",
     "let holderReady=false;let input='';process.stdin.setEncoding('utf8');",
     "const ack=(settlement)=>{const pid=process.pid;const version=2;const oneShot=crypto.createHmac('sha256',settlementSecret).update('pi-review-gate-live-browser-settlement-key:v2:'+settlement).digest();const mac=crypto.createHmac('sha256',oneShot).update(JSON.stringify([version,settlementSession,settlementChild,settlement,pid])).digest('base64url');const receipt={version,sessionId:settlementSession,childId:settlementChild,settlement,pid,mac};fs.mkdirSync(path.dirname(settlementPath),{recursive:true,mode:0o700});const temporary=settlementPath+'.tmp.'+crypto.randomUUID();fs.writeFileSync(temporary,JSON.stringify(receipt)+'\\n',{mode:0o600});fs.renameSync(temporary,settlementPath);};",
-    "let stateRequests=0;let abortRequested=false;",
-    `const handle=(command)=>{if(command.type==='prompt'){out({type:'response',id:command.id,command:'prompt',success:true});out({type:'tool_execution_end',toolName:'ShellStart',result:{content:[{type:'text',text:'Started '+String.fromCharCode(34)+'owned background'+String.fromCharCode(34)+' as job1 (pid '+background.pid+').'}]},isError:false});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'authenticated background result'}]}});out({type:'turn_end'});${initialSettlement}}${stateHandler}${abortHandler}else if(command.type==='get_last_assistant_text'){fs.writeFileSync(${JSON.stringify(finalTextRequestPath)},'requested');}};`,
+    "let stateRequests=0;let abortRequested=false;let prompted=false;",
+    `const handle=(command)=>{if(command.type==='prompt'){prompted=true;out({type:'response',id:command.id,command:'prompt',success:true});out({type:'tool_execution_end',toolName:'ShellStart',result:{content:[{type:'text',text:'Started '+String.fromCharCode(34)+'owned background'+String.fromCharCode(34)+' as job1 (pid '+background.pid+').'}]},isError:false});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'authenticated background result'}]}});out({type:'turn_end'});${initialSettlement}}${stateHandler}${abortHandler}else if(command.type==='get_last_assistant_text'){fs.writeFileSync(${JSON.stringify(finalTextRequestPath)},'requested');}};`,
     "const consume=()=>{if(!holderReady)return;for(;;){const newline=input.indexOf('\\n');if(newline<0)break;const raw=input.slice(0,newline);input=input.slice(newline+1);if(raw.trim())handle(JSON.parse(raw));}};",
     // The worker is the sole publisher of its own PID and ready markers: it
     // writes its PID, then the ready marker, then signals over IPC. Rewriting
@@ -206,6 +276,8 @@ interface NativeWindowsPiSources {
   workerScript: string;
   backgroundScript: string;
   entryScript: string;
+  /** Fixture-owned synthetic native session the entry reports or resumes. */
+  nativeSession: FixtureNativeSession;
 }
 
 /**
@@ -218,7 +290,9 @@ interface NativeWindowsPiSources {
  * PID it spawns, plus the IPC ready signal that bounds the compaction entry's
  * exit. Rendering is platform-independent so publication ownership stays
  * assertable on any host; only the platform-gated tests exercise native Windows
- * process behavior.
+ * process behavior. Each mode also renders an owned synthetic native session
+ * identity (#533): the RPC entries report it from `get_state`, and the
+ * compaction entry is resumed from that session's pre-recorded reference.
  */
 function nativeWindowsPiFixtureSources(root: string, mode: NativeWindowsPiMode): NativeWindowsPiSources {
   const workerPath = join(root, "pipe-descendant.cjs");
@@ -231,6 +305,15 @@ function nativeWindowsPiFixtureSources(root: string, mode: NativeWindowsPiMode):
   const backgroundPidPath = join(root, "background.pid");
   const backgroundStopPath = join(root, "background.stop");
   const backgroundStoppedPath = join(root, "background.stopped");
+  // #533: every mode owns one synthetic native session inside its own fixture
+  // root. The RPC modes report this exact identity from `get_state` (the
+  // adapter records the reference); the compaction mode is RESUMED, so its
+  // canonical reference is pre-recorded and header-verified by the preflight
+  // before the compaction child is spawned.
+  const nativeSession = fixtureNativeSession(
+    root,
+    mode === "compaction" ? NATIVE_WINDOWS_COMPACTION_SESSION_ID : `native-windows-${mode}-session`,
+  );
   const workerScript = [
     "const fs=require('node:fs');const [pidPath,readyPath,stopPath,stoppedPath]=process.argv.slice(2);",
     "fs.writeFileSync(pidPath,String(process.pid));fs.writeFileSync(readyPath,'ready');",
@@ -261,8 +344,8 @@ function nativeWindowsPiFixtureSources(root: string, mode: NativeWindowsPiMode):
       `const holder=spawn(process.execPath,[${JSON.stringify(workerPath)},${JSON.stringify(workerPidPath)},${JSON.stringify(readyPath)},${JSON.stringify(stopPath)},${JSON.stringify(stoppedPath)}],${inheritedPipeHolderOptions});`,
       backgroundRunner,
       "const ack=()=>{const settlement=1;const pid=process.pid;const version=2;const oneShot=crypto.createHmac('sha256',settlementSecret).update('pi-review-gate-live-browser-settlement-key:v2:'+settlement).digest();const mac=crypto.createHmac('sha256',oneShot).update(JSON.stringify([version,settlementSession,settlementChild,settlement,pid])).digest('base64url');const receipt={version,sessionId:settlementSession,childId:settlementChild,settlement,pid,mac};fs.mkdirSync(path.dirname(settlementPath),{recursive:true,mode:0o700});const temporary=settlementPath+'.tmp.'+crypto.randomUUID();fs.writeFileSync(temporary,JSON.stringify(receipt)+'\\n',{mode:0o600});fs.renameSync(temporary,settlementPath);};",
-      "const out=(value)=>process.stdout.write(JSON.stringify(value)+'\\n');let input='';process.stdin.setEncoding('utf8');",
-      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const newline=input.indexOf('\\n');if(newline<0)break;const raw=input.slice(0,newline);input=input.slice(newline+1);if(!raw.trim())continue;const command=JSON.parse(raw);if(command.type==='prompt'){out({type:'response',id:command.id,command:'prompt',success:true});" + backgroundResult + "out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'native Windows teardown fixture'}]}});out({type:'turn_end'});ack();out({type:'agent_end'});}else if(command.type==='get_state'){out({type:'response',id:command.id,command:'get_state',success:true,data:{isStreaming:false,pendingMessageCount:0}});setTimeout(()=>process.exit(0),50);}}});",
+      "const out=(value)=>process.stdout.write(JSON.stringify(value)+'\\n');let input='';let prompted=false;process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const newline=input.indexOf('\\n');if(newline<0)break;const raw=input.slice(0,newline);input=input.slice(newline+1);if(!raw.trim())continue;const command=JSON.parse(raw);if(command.type==='prompt'){prompted=true;out({type:'response',id:command.id,command:'prompt',success:true});" + backgroundResult + "out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'native Windows teardown fixture'}]}});out({type:'turn_end'});ack();out({type:'agent_end'});}else if(command.type==='get_state'){out({type:'response',id:command.id,command:'get_state',success:true,data:{isStreaming:false,pendingMessageCount:0,sessionId:" + JSON.stringify(nativeSession.id) + ",sessionFile:" + JSON.stringify(nativeSession.file) + "}});if(prompted)setTimeout(()=>process.exit(0),50);}}});",
     ];
   } else {
     entryLines = [
@@ -285,6 +368,7 @@ function nativeWindowsPiFixtureSources(root: string, mode: NativeWindowsPiMode):
     workerScript,
     backgroundScript,
     entryScript: entryLines.join("\n"),
+    nativeSession,
   };
 }
 
@@ -294,6 +378,10 @@ async function createNativeWindowsPiFixture(mode: NativeWindowsPiMode): Promise<
   await writeFile(sources.workerPath, sources.workerScript);
   await writeFile(sources.backgroundPath, sources.backgroundScript);
   await writeFile(sources.entryPath, sources.entryScript);
+  // The compaction mode resumes this session, so its reference must already
+  // exist and be header-verified; the RPC modes only own the session file and
+  // let the adapter record the reference from the reported identity.
+  await materializeFixtureNativeSession(sources.nativeSession, { reference: mode === "compaction" });
   const {
     entryPath,
     workerPidPath,
@@ -518,6 +606,24 @@ test("owned fixture workers are the sole publishers of their PID and ready marke
       parentWrites.includes(fixture.backgroundPidPath),
       "the parent still publishes the background group PID for the detached child it spawns",
     );
+
+    // #533: the adapter asks this child for its native session identity with a
+    // `get_state` BEFORE the prompt. The fixture therefore reports its owned
+    // synthetic identity, and its post-prompt root-exit effect waits for an
+    // actual prompt instead of firing on that identity preflight.
+    assert.ok(
+      parentScript.includes(`sessionId:${JSON.stringify(TEARDOWN_BACKGROUND_SESSION_ID)}`),
+      "the get_state response reports this fixture's owned native session id",
+    );
+    assert.ok(
+      parentScript.includes(`sessionFile:${JSON.stringify(join(fixture.root, NATIVE_SESSION_DIRNAME, `${TEARDOWN_BACKGROUND_SESSION_ID}.jsonl`))}`),
+      "the get_state response reports the fixture-owned native session file",
+    );
+    assert.ok(parentScript.includes("let prompted=false;"), "the fixture tracks actual prompt receipt");
+    assert.ok(
+      parentScript.includes("if(prompted)setTimeout(()=>process.exit(0),100);"),
+      "the post-prompt root exit cannot be triggered by the identity preflight",
+    );
   } finally {
     await removeOwnedFixtureRoot(fixture.root);
   }
@@ -578,7 +684,62 @@ test("generated native Windows fixture scripts keep the worker the sole PID and 
         !/holder\.(on|once)\('message'/.test(sources.entryScript),
         `${mode}: the parent keeps no redundant IPC-ready publication handler`,
       );
+      assert.ok(
+        sources.entryScript.includes(`sessionId:${JSON.stringify(sources.nativeSession.id)}`)
+          && sources.entryScript.includes(`sessionFile:${JSON.stringify(sources.nativeSession.file)}`),
+        `${mode}: the get_state response reports this fixture's owned native session identity`,
+      );
+      assert.ok(
+        sources.entryScript.includes("let prompted=false;")
+          && sources.entryScript.includes("if(command.type==='prompt'){prompted=true;")
+          && sources.entryScript.includes("if(prompted)setTimeout(()=>process.exit(0),50)"),
+        `${mode}: the post-prompt root exit cannot be triggered by the identity preflight`,
+      );
     }
+  }
+});
+
+// #533 verified-history preflight: every fixture mode owns one synthetic native
+// session inside its own isolated root. The RESUMED modes (both compaction
+// fixtures) must already carry the canonical reference the preflight resolves
+// and header-verifies, while the freshly launched RPC fixtures report the same
+// identity for the adapter to record. This runs on any host because it only
+// renders and materializes fixture-owned files: no real agent/session store and
+// no provider is involved.
+test("fixture-owned native sessions carry canonical references with matching native headers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-child-teardown-native-session-"));
+  try {
+    const plans = [
+      fixtureNativeSession(root, TEARDOWN_BACKGROUND_SESSION_ID),
+      fixtureNativeSession(root, COMPACTION_RECOVERY_SESSION_ID),
+      ...(["rpc", "rpc-background", "compaction"] as const).map(
+        (mode) => nativeWindowsPiFixtureSources(root, mode).nativeSession,
+      ),
+    ];
+    assert.equal(new Set(plans.map((plan) => plan.id)).size, plans.length, "each fixture mode owns a distinct native session");
+    for (const plan of plans) {
+      await materializeFixtureNativeSession(plan);
+      assert.equal(
+        plan.referencePath,
+        join(root, "artifacts", PI_SESSION_REFERENCE_DIRNAME, `${plan.id}.json`),
+        `${plan.id}: the reference lives in this fixture's own owner artifact`,
+      );
+      assert.equal(plan.file.startsWith(join(root, NATIVE_SESSION_DIRNAME)), true, `${plan.id}: the session file stays inside the fixture root`);
+      assert.deepEqual(
+        JSON.parse(await readFile(plan.referencePath, "utf8")),
+        { id: plan.id, file: plan.file, cwd: plan.cwd },
+        `${plan.id}: the reference records the exact synthetic native identity`,
+      );
+      assert.equal(resolve(plan.file), plan.file, `${plan.id}: the referenced session file is absolute and normalized`);
+      assert.equal(resolve(plan.cwd), plan.cwd, `${plan.id}: the referenced workspace is absolute and normalized`);
+      assert.deepEqual(
+        readSavedSessionHeader(plan.file),
+        { id: plan.id, cwd: plan.cwd },
+        `${plan.id}: the native session header matches the reference`,
+      );
+    }
+  } finally {
+    await removeOwnedFixtureRoot(root);
   }
 });
 
@@ -994,6 +1155,11 @@ test("compaction recovery bounds cleanup after root exit and rejects unconfirmed
   const fixture = await createInheritedPipeFixture();
   const artifactDir = join(fixture.root, "artifacts");
   await mkdir(artifactDir);
+  // #533: an interrupted compaction is only launched once the turn's native
+  // session is PROVEN, so this fixture owns one synthetic native session file
+  // and its canonical reference inside its own isolated root. The resumed
+  // launch then reaches the same compaction teardown path this test asserts.
+  await materializeFixtureNativeSession(fixtureNativeSession(fixture.root, COMPACTION_RECOVERY_SESSION_ID, artifactDir));
   let rootPid: number | undefined;
   let rootExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   const adapter = new PiExecutorAdapter({
@@ -1007,7 +1173,7 @@ test("compaction recovery bounds cleanup after root exit and rejects unconfirmed
     prompt: "resume after compaction",
     artifactDir,
     turn: 2,
-    session: { adapter: "pi-model", id: "teardown-test-session" },
+    session: { adapter: "pi-model", id: COMPACTION_RECOVERY_SESSION_ID },
     recovery: { kind: "compaction", compactBeforePrompt: true },
     executorToolCatalog: { allowedToolCatalog: ["read"], initialActiveTools: ["read"] },
     onProcessStart: ({ pid }) => { rootPid = pid; },
@@ -1406,7 +1572,7 @@ test("native Windows compaction recovery rejects uncertain cleanup after its CMD
     prompt: "resume after native Windows compaction recovery",
     artifactDir: join(fixture.root, "artifacts"),
     turn: 5,
-    session: { adapter: "pi-model", id: "native-cmd-teardown-session" },
+    session: { adapter: "pi-model", id: NATIVE_WINDOWS_COMPACTION_SESSION_ID },
     recovery: { kind: "compaction", compactBeforePrompt: true },
     executorToolCatalog: { allowedToolCatalog: ["read"], initialActiveTools: ["read"] },
     onProcessStart: ({ pid }) => {

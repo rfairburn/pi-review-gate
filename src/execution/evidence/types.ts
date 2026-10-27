@@ -77,7 +77,14 @@ export type SubtaskEvidenceUnavailableReason =
   | "records_omitted"
   | "retention_budget"
   | "path_escape"
-  | "non_regular_file";
+  | "non_regular_file"
+  /**
+   * A canonical native session reference (`pi-sessions/<id>.json`) exists but
+   * the native session file it names could not be verified as this session's
+   * regular-file history (#533). Reported instead of silently re-resolving or
+   * scanning the shared session store.
+   */
+  | "reference_unverified";
 
 export interface SubtaskEvidenceUnavailable {
   source?: string;

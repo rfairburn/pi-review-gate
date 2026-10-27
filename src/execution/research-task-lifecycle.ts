@@ -92,6 +92,7 @@ export async function runResearchFresh(
       cwd: group.cwd,
       maxSnapshotBytes: deps.config.base().maxSnapshotBytes,
       artifactTtlMs: deps.config.base().retainBundles === "always" ? 0 : deps.config.base().waveArtifactTtlMs,
+      deleteSpawnedPiSessionsOnCleanup: deps.config.base().deleteSpawnedPiSessionsOnCleanup === true,
       signal: abort.signal,
     });
   } finally {

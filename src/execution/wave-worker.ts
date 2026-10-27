@@ -819,6 +819,10 @@ async function runWithPoolFailover(input: {
       request: {
         cwd: input.worker.worktree.effectiveCwd,
         artifactDir: input.resolvedArtifactDir,
+        // #533: the adapter must be able to select the full-task handoff when
+        // the requested native resume cannot be honored, instead of delivering
+        // continuation-only text into a session that never reopened.
+        handoffPrompt: input.handoffPrompt,
         workspaceAccess: input.worker.task.backgroundKind === "research" ? "read-only" : "workspace-write",
         executorToolCatalog,
         signal: input.worker.signal,

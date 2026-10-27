@@ -53,7 +53,15 @@ export async function runExecutorWithRecovery(input: {
   onDispatch?: (record: SubtaskDispatchRecord) => void;
 }): Promise<RecoveredExecutorRun> {
   const originalPrompt = input.prompt;
+  const originalHandoffPrompt = input.request.handoffPrompt;
   let prompt = input.prompt;
+  // #533: the full-task handoff for this attempt. The caller supplies one; a
+  // recovery retry also carries that retry's current recovery instructions,
+  // incident, and checkpoint locator, because an adapter that cannot reopen the
+  // recorded native session delivers THIS text to its fresh session instead of
+  // `prompt`. Without a caller handoff there is nothing truthful to add, so
+  // the existing refusal behavior is preserved.
+  let handoffPrompt = originalHandoffPrompt;
   let session = input.session;
   let genericRetries = 0;
   let compactionRecoveries = 0;
@@ -111,6 +119,7 @@ export async function runExecutorWithRecovery(input: {
       turn = await input.adapter.run({
         ...input.request,
         prompt,
+        ...(handoffPrompt === undefined ? {} : { handoffPrompt }),
         turn: turnNumber,
         session,
         recovery,
@@ -305,6 +314,17 @@ export async function runExecutorWithRecovery(input: {
       }
     }
     prompt = recoveryPrompt(failure.message, compactionIncident, checkpoint, originalPrompt);
+    if (originalHandoffPrompt !== undefined) {
+      // #533: the same construction composes the caller's exact full task with
+      // this retry's current recovery instructions, incident, and checkpoint
+      // locator, so a fresh-session fallback receives everything the resumed
+      // session was told instead of only the original caller handoff. This
+      // applies to both caller shapes: an initial dispatch supplies equal
+      // prompt/handoff text, and the composed handoff is then equal to the
+      // composed prompt — the adapter honors an explicitly supplied handoff
+      // either way, so no recovery text is dropped.
+      handoffPrompt = recoveryPrompt(failure.message, compactionIncident, checkpoint, originalHandoffPrompt);
+    }
     recovery = {
       kind: compactionIncident ? "compaction" : "retry",
       compactBeforePrompt: compactionIncident,

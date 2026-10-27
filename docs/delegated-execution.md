@@ -1252,3 +1252,27 @@ disables collection). Conflict, integration-error, and recovery-required roots a
 removed by this GC, and `retainBundles: "always"` disables age-based wave GC while the
 application is running. Application shutdown still removes settled artifacts;
 recoverable unlanded checkpoints remain protected (see [Recovery](recovery.md)).
+
+Newly spawned Pi workers (execute, research, and in-place) and reviewers keep their
+complete native JSONL histories in Pi's standard resolved session store, alongside
+primary sessions. Native agent/session environment overrides and `sessionDir` settings
+remain effective. Artifact metadata holds exact session references, not synchronized
+transcript copies. Native records retain prompts, responses, tool arguments/results,
+identity, and provider-reported token/cost and compaction usage where Pi records them;
+no missing provider usage is invented. Existing bounded artifact usage summaries are
+not substitutes for these histories, nor a guarantee of third-party usage aggregation.
+
+Compatible Pi continuation and interrupted compaction reopen the exact retained native
+session; a session ID alone is not used to guess a history in another workspace.
+Changing executor keeps the existing fresh-session handoff and preserved
+workspace/checkpoint, without converting or replaying another harness's transcript.
+Reviewer passes remain fresh. Audit retention does not add native reviewer/peer
+transcripts to immutable review evidence or inject them into model context.
+
+`deleteSpawnedPiSessionsOnCleanup` defaults to `false`, including in older configs.
+Off preserves these native histories after artifact cleanup. On deletes only exact
+associated spawned sessions when their artifacts are already selected by existing
+cleanup, at the same lifecycle points. It adds no sweep, timer, age policy, backfill,
+shared-store scan, or unrelated primary-session deletion; enabling it deletes nothing.
+The toggle and unchanged Bundle retention control share the **Retention** submenu in
+`/review-settings`. Historical artifacts and non-Pi native formats are unchanged.

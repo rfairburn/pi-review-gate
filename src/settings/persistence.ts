@@ -68,6 +68,12 @@ export interface ReviewSettingsSelection {
   maxCorrectionCycles: number;
   implementationGuidanceAfterCorrectionAttempts: number;
   retainBundles: RetainBundles;
+  /**
+   * Default-off spawned-session cleanup selection (#533). Toggling stages
+   * the value only; persistence and session-only apply write it beside
+   * `retainBundles`, and no cleanup runs from this menu.
+   */
+  deleteSpawnedPiSessionsOnCleanup: boolean;
   maxWorkers: number;
   retryPolicy: ExecutionRetryPolicy;
   subtaskNotifications: SubtaskNotificationMode;
@@ -193,6 +199,7 @@ function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: 
   parsed.maxCorrectionCycles = selection.maxCorrectionCycles;
   parsed.implementationGuidanceAfterCorrectionAttempts = selection.implementationGuidanceAfterCorrectionAttempts;
   parsed.retainBundles = selection.retainBundles;
+  parsed.deleteSpawnedPiSessionsOnCleanup = selection.deleteSpawnedPiSessionsOnCleanup;
   const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
   ui.subtasksViewExpanded = selection.subtasksViewExpanded;
   parsed.ui = ui;

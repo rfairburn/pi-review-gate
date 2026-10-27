@@ -581,6 +581,12 @@ export interface ReviewGateConfig {
   /** Age after which completed, non-recovery wave roots may be garbage-collected. Zero disables GC. */
   waveArtifactTtlMs?: number;
   retainBundles: RetainBundles;
+  /**
+   * Default-off (#533): delete the Pi sessions this gate spawned when their
+   * review or execution artifacts are cleaned up. This only selects what
+   * cleanup does; changing it never deletes anything by itself.
+   */
+  deleteSpawnedPiSessionsOnCleanup: boolean;
   review?: ReviewSelectionConfig;
   externalAgents?: ExternalAgentCatalog;
   execution?: ExecutionConfig;
@@ -615,6 +621,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   maxSnapshotBytes: 52_428_800,
   waveArtifactTtlMs: 30 * 24 * 60 * 60 * 1000,
   retainBundles: "on-failure",
+  deleteSpawnedPiSessionsOnCleanup: false,
   youShouldKnow: { enabled: true, completionGuidance: true },
   web: {
     enabled: true,
@@ -771,6 +778,11 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
   if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
     throw new Error("enabled must be a boolean");
   }
+  // Absent stays default-off for older configs; only a real boolean is
+  // accepted, so a coercible string can never enable session deletion.
+  if (value.deleteSpawnedPiSessionsOnCleanup !== undefined && typeof value.deleteSpawnedPiSessionsOnCleanup !== "boolean") {
+    throw new Error("deleteSpawnedPiSessionsOnCleanup must be a boolean");
+  }
   rejectLegacyReviewFields(value);
   if (isRecord(value.execution)) {
     rejectLegacyExecutionFields(value.execution);
@@ -797,6 +809,7 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
       "waveArtifactTtlMs",
     ),
     retainBundles: normalizeRetainBundles(value.retainBundles),
+    deleteSpawnedPiSessionsOnCleanup: value.deleteSpawnedPiSessionsOnCleanup ?? DEFAULT_CONFIG.deleteSpawnedPiSessionsOnCleanup,
     review: value.review === undefined ? undefined : normalizeReviewSelection(value.review),
     externalAgents: value.externalAgents === undefined ? undefined : normalizeExternalAgents(value.externalAgents),
     execution: value.execution === undefined ? undefined : normalizeExecution(value.execution),

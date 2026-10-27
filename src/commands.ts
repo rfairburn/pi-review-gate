@@ -125,7 +125,9 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const windows = [input.state.reviewWindow, input.state.lastQuestionWindow];
       clearReviewState(input.state);
-      await Promise.all(windows.map((window) => removeTransientWindowBundle(window)));
+      await Promise.all(windows.map((window) => removeTransientWindowBundle(window, {
+        deleteSpawnedPiSessions: currentConfig().deleteSpawnedPiSessionsOnCleanup === true,
+      })));
       await sendCommandNotice(
         ctx,
         `review gate: cleared; the next prompt will start fresh from the current workspace; bundle retention remains governed by retainBundles=${currentConfig().retainBundles}; reviewer sessions from the cleared window will not be reused`,

@@ -378,6 +378,19 @@ review: { activeReviewers: [
   }), /implementationGuidanceAfterCorrectionAttempts/);
 });
 
+test("spawned-session cleanup defaults off and accepts only a real boolean", () => {
+  assert.equal(normalizeConfig({}).deleteSpawnedPiSessionsOnCleanup, false);
+  assert.equal(normalizeConfig({ retainBundles: "on-failure" }).deleteSpawnedPiSessionsOnCleanup, false);
+  assert.equal(normalizeConfig({ deleteSpawnedPiSessionsOnCleanup: true }).deleteSpawnedPiSessionsOnCleanup, true);
+  assert.equal(normalizeConfig({ deleteSpawnedPiSessionsOnCleanup: false }).deleteSpawnedPiSessionsOnCleanup, false);
+  for (const invalid of ["true", 1, null, {}]) {
+    assert.throws(
+      () => normalizeConfig({ deleteSpawnedPiSessionsOnCleanup: invalid }),
+      /deleteSpawnedPiSessionsOnCleanup must be a boolean/,
+    );
+  }
+});
+
 test("normalizeConfig rejects coercible booleans and invalid retention values", () => {
   assert.throws(() => normalizeConfig({ enabled: "false" }), /enabled must be a boolean/);
   assert.throws(() => normalizeConfig({ retainBundles: "sometimes" }), /retainBundles/);

@@ -112,6 +112,7 @@ function baseSelection(overrides: Partial<ReviewSettingsSelection> = {}): Review
     maxCorrectionCycles: 1,
     implementationGuidanceAfterCorrectionAttempts: 1,
     retainBundles: "on-failure",
+    deleteSpawnedPiSessionsOnCleanup: false,
     maxWorkers: 2,
     retryPolicy: {
       maxRetries: 2,
@@ -520,7 +521,7 @@ const ROOT_SETTING_LABELS = [
   "Reviewers",
   "Timeouts",
   "Review policy",
-  "Bundle retention",
+  "Retention",
   "Global concurrency",
   "Retry policy",
   "Subtask notifications",

@@ -87,6 +87,58 @@ export async function selectBundleRetention(ui: UiContext, current: RetainBundle
   return rows.find((row) => selected === `${row.label}${row.value === current ? "  current" : ""}`)?.value ?? current;
 }
 
+/** Staged state of the Retention submenu (#533); draft-only until Save or root Escape. */
+export interface RetentionSectionState {
+  retainBundles: RetainBundles;
+  deleteSpawnedPiSessionsOnCleanup: boolean;
+}
+
+export function spawnedSessionCleanupLabel(value: boolean): string {
+  return value ? "On" : "Off";
+}
+
+/**
+ * The Retention submenu (#533): groups the unchanged bundle-retention picker
+ * with the default-off spawned-session cleanup toggle. The toggle only
+ * stages a selection; it performs no deletion, sweep, or I/O of its own, and
+ * the root Save/root-Escape/Cancel transaction decides when it takes effect.
+ */
+export async function selectRetentionSettings(
+  ui: UiContext,
+  initial: RetentionSectionState,
+): Promise<RetentionSectionState> {
+  const state: RetentionSectionState = { ...initial };
+  await notify(
+    ui,
+    "Bundle retention keeps review bundles exactly as before. Deleting spawned Pi sessions during cleanup only selects what later cleanup removes; changing it here deletes nothing and applies after Save, or for this session after a root Escape apply.",
+    "info",
+  );
+  // Caller-local last selection for this loop only (issue #140).
+  let lastKey: string | undefined;
+  while (true) {
+    const [bundleRow, spawnedSessionsRow] = alignedSettingsRows([
+      ["Bundle retention", retentionLabel(state.retainBundles)],
+      ["Delete spawned Pi sessions during cleanup", spawnedSessionCleanupLabel(state.deleteSpawnedPiSessionsOnCleanup)],
+    ]);
+    const choice = await retainedSelect(ui, {
+      title: "Retention",
+      rows: [
+        { key: "bundleRetention", label: bundleRow },
+        { key: "deleteSpawnedSessions", label: spawnedSessionsRow },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return state;
+    lastKey = choice;
+    if (choice === "bundleRetention") {
+      state.retainBundles = await selectBundleRetention(ui, state.retainBundles);
+      continue;
+    }
+    state.deleteSpawnedPiSessionsOnCleanup = !state.deleteSpawnedPiSessionsOnCleanup;
+  }
+}
+
 export async function selectMaxWorkers(ui: UiContext, current: number): Promise<number> {
   const options = Array.from({ length: MAX_EXECUTION_WORKERS }, (_, index) => String(index + 1))
     .map((v) => `${v}${v === String(current) ? "  current" : ""}`);

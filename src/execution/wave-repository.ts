@@ -6,6 +6,12 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { coreFilemodeOverrideFor } from "../git-checkpoint";
 import { atomicWrite } from "./durable-write";
+import {
+  deleteOwnedRootPiSessions,
+  throwPiSessionDeletionFailures,
+  type PiSessionDeletionFailure,
+  type SpawnedPiSessionCleanupOptions,
+} from "../pi-session-cleanup";
 import { encodeSourceIdentityComponent, isSourceIdentity, sourceIdentitiesEqual, type SourceIdentity } from "./source-identity";
 export type { SourceIdentity } from "./source-identity";
 import { GIT_NO_LOCKS_ENV as GIT_ENV, isAbortError, validateSafeId } from "./wave-validation";
@@ -538,6 +544,11 @@ export interface WaveCaptureOptions {
   maxCaptureAttempts?: number;
   /** Garbage-collect completed non-recovery wave roots older than this age. Zero disables GC. */
   artifactTtlMs?: number;
+  /**
+   * #533 opt-in: when GC removes an expired wave root, also delete the exact
+   * native Pi sessions its own task artifacts reference. Off by default.
+   */
+  deleteSpawnedPiSessionsOnCleanup?: boolean;
   /** Abort signal used to cancel discovery, staging, verification, and checkout preparation. */
   signal?: AbortSignal;
   /** @internal Per-invocation capture fault hooks used by regression tests. */
@@ -654,6 +665,7 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
     artifactDir,
     maxCaptureAttempts: givenMaxAttempts,
     artifactTtlMs = 30 * 24 * 60 * 60 * 1000,
+    deleteSpawnedPiSessionsOnCleanup = false,
     signal,
     hooks,
   } = options;
@@ -703,7 +715,9 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
     artifactParent = await fs.realpath(resolve(tmpdir()));
   }
   throwIfAborted(signal);
-  await pruneCompletedWaveRoots(artifactParent, artifactTtlMs, Date.now(), signal);
+  await pruneCompletedWaveRoots(artifactParent, artifactTtlMs, Date.now(), signal, {
+    deleteSpawnedPiSessions: deleteSpawnedPiSessionsOnCleanup,
+  });
 
   // 4. Retry loop with torn-snapshot detection.
   //    Discovery and path enumeration happen inside the loop so each retry
@@ -913,12 +927,14 @@ export async function pruneCompletedWaveRoots(
   ttlMs: number,
   nowMs = Date.now(),
   signal?: AbortSignal,
+  options: SpawnedPiSessionCleanupOptions = {},
 ): Promise<string[]> {
   if (ttlMs === 0) return [];
   if (!Number.isSafeInteger(ttlMs) || ttlMs < 0) {
     throw new Error("ttlMs must be a non-negative safe integer");
   }
   const removed: string[] = [];
+  const sessionFailures: PiSessionDeletionFailure[] = [];
   const entries = await fs.readdir(artifactParent, { withFileTypes: true }).catch(() => []);
   for (const entry of entries) {
     throwIfAborted(signal);
@@ -940,9 +956,20 @@ export async function pruneCompletedWaveRoots(
     if (manifest.landingStatus === "recovery_required" || manifest.landingStatus === "conflicted") continue;
     if (manifest.integrationStatus === "conflicted" || manifest.integrationStatus === "error") continue;
     if (await hasProtectedOperation(root, manifest.landingStatus === "landed")) continue;
+    // #533: the SAME selected root, at the SAME TTL removal, with no extra
+    // eligibility. A root whose associated sessions cannot all be deleted is
+    // retained (references stay intact) and the failure is reported below.
+    if (options.deleteSpawnedPiSessions) {
+      const report = await deleteOwnedRootPiSessions(root);
+      if (report.failures.length > 0) {
+        sessionFailures.push(...report.failures);
+        continue;
+      }
+    }
     await fs.rm(root, { recursive: true, force: true });
     removed.push(root);
   }
+  throwPiSessionDeletionFailures(sessionFailures, `expired wave roots under ${artifactParent}`);
   return removed;
 }
 

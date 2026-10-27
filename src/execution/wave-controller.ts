@@ -775,6 +775,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
         cwd,
         maxSnapshotBytes: config.maxSnapshotBytes,
         artifactTtlMs: config.retainBundles === "always" ? 0 : config.waveArtifactTtlMs,
+        deleteSpawnedPiSessionsOnCleanup: config.deleteSpawnedPiSessionsOnCleanup === true,
         hooks: input.captureHooks,
         waveId,
         artifactDir,

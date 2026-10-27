@@ -26,6 +26,11 @@ import { readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ScheduledTaskReviewOverride } from "../config";
+import {
+  deleteOwnedRootPiSessions,
+  throwPiSessionDeletionFailures,
+  type SpawnedPiSessionCleanupOptions,
+} from "../pi-session-cleanup";
 import { atomicWrite } from "./durable-write";
 import { normalizeWorkerReviewEvidencePolicy, workerReviewEvidenceScope } from "./review-evidence-policy";
 import {
@@ -632,16 +637,23 @@ export async function readTaskArchiveIndex(
   return parsed;
 }
 
-export async function removeOwnedWaveRoot(root: string): Promise<void> {
+export async function removeOwnedWaveRoot(
+  root: string,
+  options: SpawnedPiSessionCleanupOptions = {},
+): Promise<void> {
   const resolved = resolve(root);
   const temporaryRoot = await realpath(resolve(tmpdir()));
   if (!basename(resolved).startsWith("wave-") || dirname(resolved) !== temporaryRoot) {
     throw new Error(`Refusing to remove unrecognized wave root: ${resolved}`);
   }
-  await rm(resolved, { recursive: true, force: true });
+  await removeOwnedRootWithSpawnedPiSessions(resolved, options);
 }
 
-export async function removeOwnedExecutionRoot(root: string, tempBase?: string): Promise<void> {
+export async function removeOwnedExecutionRoot(
+  root: string,
+  tempBase?: string,
+  options: SpawnedPiSessionCleanupOptions = {},
+): Promise<void> {
   const resolved = await realpath(resolve(root)).catch(() => resolve(root));
   const temporaryRoot = await realpath(resolve(tmpdir()));
   const resolvedBase = dirname(resolved);
@@ -655,5 +667,25 @@ export async function removeOwnedExecutionRoot(root: string, tempBase?: string):
     || (resolvedBase !== temporaryRoot && (allowedBase === undefined || resolvedBase !== allowedBase))) {
     throw new Error(`Refusing to remove unrecognized execution root: ${resolved}`);
   }
-  await rm(resolved, { recursive: true, force: true });
+  await removeOwnedRootWithSpawnedPiSessions(resolved, options);
+}
+
+/**
+ * #533: the ownership check above already selected this root; the opt-in
+ * session cleanup removes only the EXACT native sessions that root's own task
+ * artifact references record, and only at this removal. A root whose sessions
+ * cannot all be deleted is kept, with the `PiSessionCleanupError` surfaced to
+ * the caller (which may disclose it instead of aborting its own finalization).
+ */
+async function removeOwnedRootWithSpawnedPiSessions(
+  resolvedRoot: string,
+  options: SpawnedPiSessionCleanupOptions,
+): Promise<void> {
+  if (options.deleteSpawnedPiSessions) {
+    throwPiSessionDeletionFailures(
+      (await deleteOwnedRootPiSessions(resolvedRoot)).failures,
+      `owned root ${resolvedRoot}`,
+    );
+  }
+  await rm(resolvedRoot, { recursive: true, force: true });
 }

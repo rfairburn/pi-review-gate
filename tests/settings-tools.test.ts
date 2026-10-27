@@ -238,6 +238,7 @@ const baseSelection = {
   maxCorrectionCycles: 1,
   implementationGuidanceAfterCorrectionAttempts: 1,
   retainBundles: "on-failure" as const,
+  deleteSpawnedPiSessionsOnCleanup: false,
   maxWorkers: 2,
   retryPolicy: { maxRetries: 2, baseDelayMs: 1_000, maxDelayMs: 30_000, maxSameIncidentRepeats: 2, jitter: false },
   subtaskNotifications: "quiet" as const,

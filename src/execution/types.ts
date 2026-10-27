@@ -3,6 +3,16 @@ import type { PiLifecycleSummary } from "../usage";
 import type { ExecutorSelection } from "../config";
 import type { ExecutorToolCatalog } from "./tool-catalog";
 
+/**
+ * Executor session identity: adapter plus native session id.
+ *
+ * #533: the native transcript path and its workspace are recorded ONCE, in the
+ * session owner's canonical reference
+ * (`<ownerArtifactDir>/pi-sessions/<id>.json`). A continuation resolves that
+ * reference and verifies the native header it names; this struct is the
+ * reference key carried by requests, turns, and durable operation records, and
+ * it never holds a second copy of the path state.
+ */
 export interface ExecutorSession {
   adapter: string;
   id: string;
@@ -41,6 +51,14 @@ export type ExecutorToolEventObservability =
 export interface ExecutorRequest {
   cwd: string;
   prompt: string;
+  /**
+   * #533: the caller's full-task handoff prompt for this turn. An adapter that
+   * cannot honor a requested session resume MUST deliver this prompt instead
+   * of `prompt`, because `prompt` may assume the prior session's history
+   * (task, acceptance criteria, acknowledged updates) is still present. The
+   * refusal is raised before any prompt is delivered.
+   */
+  handoffPrompt?: string;
   artifactDir: string;
   turn: number;
   /** Filesystem capability assigned by the parent worker role. Defaults to workspace-write. */

@@ -22,6 +22,7 @@ export function fakeNeedsChangesConfig(overrides: Partial<ReviewGateConfig> = {}
     maxFileBytes: 1_048_576,
     maxSnapshotBytes: 52_428_800,
     retainBundles: "never",
+    deleteSpawnedPiSessionsOnCleanup: false,
     externalAgents: {
       "fake": {
         adapter: "generic-cli",

@@ -681,6 +681,12 @@ isolated under each invocation's `reviewers/<id>/` directory. A canceled numbere
 invocation contains `CANCELED.md` and `canceled.json` (including process settlement and
 any termination diagnostic) rather than reviewer results.
 
-Retention itself is governed by `retainBundles`; see
-[Configuration](configuration.md#top-level-fields). Shutdown behavior and what survives
-a restart are owned by [Recovery](recovery.md).
+Bundle retention itself is governed by `retainBundles`; see
+[Configuration](configuration.md#top-level-fields). Each newly spawned Pi reviewer
+keeps a fresh native session in Pi's standard resolved store; bundle metadata holds
+its exact reference, not a copy of the mutable native transcript. Reviewer and peer
+native histories are not added to review evidence. Native audit history survives
+bundle cleanup unless `deleteSpawnedPiSessionsOnCleanup` is explicitly On, which
+only deletes associated spawned sessions when existing cleanup removes the bundle.
+Both controls are under `/review-settings` → **Retention**. Shutdown behavior and what
+survives a restart are owned by [Recovery](recovery.md).

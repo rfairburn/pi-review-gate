@@ -9,6 +9,12 @@ import { consumeOneShotExecution } from "./scheduling/one-shot";
 import { deliverSubtaskLaunchNotice, type SubtaskLaunchNotice } from "./execution/launch-notice";
 import { getSchedulerRuntime } from "./scheduling/runtime";
 import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
+import {
+  describePiSessionDeletionFailures,
+  removeArtifactRetainingOnSessionCleanupFailure,
+  type PiSessionDeletionFailure,
+  type SpawnedPiSessionCleanupOptions,
+} from "./pi-session-cleanup";
 import { captureReviewCheckpoint, reviewCheckpointScopeFromContext, type ReviewCheckpointScope } from "./review-checkpoint";
 import { registerCommands } from "./commands";
 import {
@@ -657,7 +663,17 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     orchestratorTurnTracker.resetSession();
     await executionTools.shutdown();
     await webTools?.cleanup();
-    await cleanupReviewBundles(state);
+    await cleanupReviewBundles(
+      state,
+      {
+        deleteSpawnedPiSessions: config.deleteSpawnedPiSessionsOnCleanup === true,
+      },
+      // #533: a spawned-session cleanup failure is disclosed here instead of
+      // escaping this handler, whose remaining persistence and finalization
+      // steps below are required. The bundle it could not finish stays retained
+      // with its references, and every other bundle is still removed.
+      (message) => sendNoticeUnlessItThrows(extractContext(args) ?? pi, message),
+    );
     await reviewTurn.drainEvidenceCaptures();
     await sessionPersistence.persist(true);
     await sessionPersistence.drain();
@@ -973,7 +989,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     }
     const expiredQuestionWindow = state.reviewWindow ? undefined : state.lastQuestionWindow;
     rememberUserRequest(state, text);
-    await removeTransientWindowBundle(expiredQuestionWindow);
+    await removeTransientWindowBundle(expiredQuestionWindow, {
+      deleteSpawnedPiSessions: config.deleteSpawnedPiSessionsOnCleanup === true,
+    });
     await sessionPersistence.persist();
     return undefined;
   });
@@ -1368,17 +1386,42 @@ export default activate;
 module.exports = activate;
 Object.assign(module.exports as Record<string, unknown>, { activate });
 
-async function cleanupReviewBundles(state: ReviewGateState): Promise<void> {
+async function cleanupReviewBundles(
+  state: ReviewGateState,
+  options: SpawnedPiSessionCleanupOptions,
+  onCleanupFailure?: (message: string) => Promise<void>,
+): Promise<void> {
   const windows = [state.reviewWindow, state.lastQuestionWindow].filter((window) => window !== undefined);
   const directories = [...new Set([
     ...state.ownedBundleDirs,
     ...windows.map((window) => window.bundleDir).filter((value): value is string => Boolean(value)),
   ])];
-  await Promise.all(directories.map((directory) => removeReviewBundle(directory)));
-  state.ownedBundleDirs.clear();
+  // #533: each selected bundle is removed independently, so a bundle whose
+  // spawned Pi session could not be deleted blocks neither the other selected
+  // bundles nor the shutdown handler that called this. The retained bundle keeps
+  // its owner pointer (its references must survive for a later attempt) while
+  // every other bookkeeping reset happens exactly as before; any other removal
+  // error still propagates through this call site unchanged.
+  const failures: PiSessionDeletionFailure[] = [];
+  const retained = new Set<string>();
+  await Promise.all(directories.map(async (directory) => {
+    const removed = await removeArtifactRetainingOnSessionCleanupFailure(
+      () => removeReviewBundle(directory, options),
+      (error) => {
+        failures.push(...error.failures);
+      },
+    );
+    if (!removed) retained.add(directory);
+  }));
+  for (const directory of directories) {
+    if (!retained.has(directory)) state.ownedBundleDirs.delete(directory);
+  }
   for (const window of windows) {
-    window.bundleDir = undefined;
+    if (window.bundleDir === undefined || !retained.has(window.bundleDir)) window.bundleDir = undefined;
     window.retainBundleAfterClose = false;
+  }
+  if (failures.length > 0 && onCleanupFailure) {
+    await onCleanupFailure(`review gate: ${describePiSessionDeletionFailures(failures, `${retained.size} retained review bundle(s)`)}`);
   }
 }
 

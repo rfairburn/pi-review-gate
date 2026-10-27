@@ -11,11 +11,22 @@ import { ClaudeExecutorAdapter } from "../src/execution/adapters/claude-cli";
 import { PiExecutorAdapter, PiRpc } from "../src/execution/adapters/pi-model";
 import { BackgroundProcessReadiness } from "../src/background-process-readiness";
 import type { ExecutorLiveControl, ExecutorRequest } from "../src/execution/types";
+import { writePiSessionReference } from "../src/pi-session-reference";
 
-// Minimal stand-in for the trusted child extension in fake RPC fixtures. Real
-// Pi children publish this only from agent_settled, with a LIVE browser.
-// These protocol fixtures have no extension host.
+// Native identity in these RPC doubles points only at owned fixture files.
+// Like real Pi, get_state reports identity before the first prompt and exact
+// --session continuation reopens that file.
+const fakePiSessionIdentity = [
+  "const nativeSessionId=process.env.PI_REVIEW_GATE_SETTLEMENT_SESSION;",
+  "const nativeSessionFile=process.argv.includes('--session')?process.argv[process.argv.indexOf('--session')+1]:require('node:path').join(__dirname,'fixture-sessions',nativeSessionId+'.jsonl');",
+  "fs.mkdirSync(require('node:path').dirname(nativeSessionFile),{recursive:true});if(!fs.existsSync(nativeSessionFile))fs.writeFileSync(nativeSessionFile,JSON.stringify({type:'session',version:3,id:nativeSessionId,cwd:process.cwd(),timestamp:new Date().toISOString()})+'\\n');",
+  "const nativeSessionIdentity={sessionId:nativeSessionId,sessionFile:nativeSessionFile};",
+];
+
+// Stand-in for the trusted child extension's agent_settled receipt. These
+// protocol fixtures have no extension host.
 const fakePiSettlementReceipt = [
+  ...fakePiSessionIdentity,
   "const crypto=require('node:crypto');let ackGeneration=0;",
   "const ack=()=>{ackGeneration++;const sessionId=process.env.PI_REVIEW_GATE_SETTLEMENT_SESSION;const childId=process.env.PI_REVIEW_GATE_SETTLEMENT_CHILD;const secret=process.env.PI_REVIEW_GATE_SETTLEMENT_SECRET;const target=process.env.PI_REVIEW_GATE_SETTLEMENT_PATH;const pid=process.pid;const version=2;const oneShot=crypto.createHmac('sha256',secret).update('pi-review-gate-live-browser-settlement-key:v2:'+ackGeneration).digest();const mac=crypto.createHmac('sha256',oneShot).update(JSON.stringify([version,sessionId,childId,ackGeneration,pid])).digest('base64url');const receipt={version,sessionId,childId,settlement:ackGeneration,pid,mac};fs.mkdirSync(require('node:path').dirname(target),{recursive:true,mode:0o700});const temporary=target+'.tmp.'+crypto.randomUUID();fs.writeFileSync(temporary,JSON.stringify(receipt)+'\\n',{mode:0o600});fs.renameSync(temporary,target);};",
 ];
@@ -133,7 +144,7 @@ test("Pi executor child loads the review-gate extension in executor role without
       "const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'research complete'}]}});out({type:'turn_end'});ack();out({type:'agent_end'});}",
-      "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:false,pendingMessageCount:0}});",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:0}});",
       "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'research complete'}});",
       "else if(c.type==='abort'){out({type:'response',id:c.id,command:c.type,success:true});ack();out({type:'agent_end'});}",
       "}});",
@@ -214,7 +225,7 @@ test("Pi executor launches research workers with authorized native discovery act
       "const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'research complete'}]}});out({type:'turn_end'});ack();out({type:'agent_end'});}",
-      "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:false,pendingMessageCount:0}});",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:0}});",
       "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'research complete'}});",
       "}});",
     ].join("\n"), "utf8");
@@ -254,9 +265,12 @@ test("Pi executor fails closed when agent_end and process lifetime provide no tr
     await mkdir(artifactDir);
     await writeFile(command, [
       "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      ...fakePiSessionIdentity,
       "let input='';process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});out({type:'agent_end'});}",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,success:true,data:{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:0}});",
       "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,success:true,data:{text:'untrusted completion claim'}});",
       "}});",
     ].join("\n"), "utf8");
@@ -299,6 +313,7 @@ test("Pi executor does not turn child termination into successful completion", {
       "let input='';process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});setImmediate(()=>process.kill(process.pid,'SIGTERM'));}",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,success:true,data:{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:0}});",
       "}});",
     ].join("\n"), "utf8");
     await chmod(command, 0o755);
@@ -345,6 +360,7 @@ test("Pi executor contains a late RPC write after the child closed its stdin and
       // until the adapter's SIGTERM so the exit is an actual signal,
       // not a benign race the fixture could mask.
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();fs.closeSync(0);setImmediate(()=>out({type:'agent_end'}));}",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,success:true,data:{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:0}});",
       "}});",
       "setInterval(()=>{},1000);",
     ].join("\n"), "utf8");
@@ -443,6 +459,8 @@ test("Pi executor fails the shutdown/settlement race when the child exits zero b
     await mkdir(artifactDir);
     await writeFile(command, [
       "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      ...fakePiSessionIdentity,
       "let input='';process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       // Acknowledge the prompt, then exit zero without agent_end or a
@@ -451,6 +469,7 @@ test("Pi executor fails the shutdown/settlement race when the child exits zero b
       // truthful protocol failure, not as success and not via the executor
       // timeout.
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});process.exit(0);}",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,success:true,data:{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:0}});",
       "}});",
     ].join("\n"), "utf8");
     await chmod(command, 0o755);
@@ -495,15 +514,15 @@ test("Pi executor fails a final-response/shutdown race when the child exits zero
       "#!/usr/bin/env node",
       "const fs=require('node:fs');",
       ...fakePiSettlementReceipt,
-      "let input='';const out=(v)=>console.log(JSON.stringify(v));process.stdin.setEncoding('utf8');",
+      "let input='',prompted=false;const out=(v)=>console.log(JSON.stringify(v));process.stdin.setEncoding('utf8');",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       // Complete the whole protocol (response, receipt, agent_end, clean
       // get_state), then hard-close the stdin read side and exit zero before
       // the parent's final get_last_assistant_text write: that write lands on
       // a dead transport while every response already arrived. The run must
       // still fail as a protocol error instead of reporting success.
-      "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});}",
-      "else if(c.type==='get_state'){out({type:'response',id:c.id,success:true,data:{isStreaming:false,pendingMessageCount:0}});fs.closeSync(0);process.exit(0);}",
+      "if(c.type==='prompt'){prompted=true;out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});}",
+      "else if(c.type==='get_state'){out({type:'response',id:c.id,success:true,data:{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:0}});if(prompted){fs.closeSync(0);process.exit(0);}}",
       "}});",
     ].join("\n"), "utf8");
     await chmod(command, 0o755);
@@ -717,6 +736,11 @@ test("Pi compaction rejects an argumentless startup failure without prompting th
     const exitPath = join(root, "compaction-exit");
     const promptPath = join(root, "resumed-prompt");
     await mkdir(artifactDir);
+    const sessionId = "falsy-start-rejection-session";
+    const sessionFile = join(root, `${sessionId}.jsonl`);
+    await writeFile(sessionFile, JSON.stringify({ type: "session", version: 3, id: sessionId, cwd: root }) + "\n");
+    const recorded = await writePiSessionReference(artifactDir, { id: sessionId, file: sessionFile, cwd: root });
+    assert.equal(recorded.ok, true);
     await writeFile(command, [
       "#!/usr/bin/env node",
       "const fs=require('node:fs');",
@@ -735,7 +759,7 @@ test("Pi compaction rejects an argumentless startup failure without prompting th
       prompt: "must not be delivered without successful compaction",
       artifactDir,
       turn: 2,
-      session: { adapter: "pi-model", id: "falsy-start-rejection-session" },
+      session: { adapter: "pi-model", id: sessionId },
       recovery: { kind: "compaction", compactBeforePrompt: true },
       executorToolCatalog: { allowedToolCatalog: ["read"], initialActiveTools: ["read"] },
       onProcessStart: async () => {
@@ -1058,7 +1082,7 @@ test("Pi executor does not mask a terminal cleanup hook error behind a valid liv
       "let input='';const out=v=>console.log(JSON.stringify(v));process.stdin.setEncoding('utf8');",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const c=JSON.parse(input.slice(0,n));input=input.slice(n+1);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});}",
-      "else out({type:'response',id:c.id,success:true,data:c.type==='get_state'?{isStreaming:false,pendingMessageCount:0}:{text:'done'}});}});",
+      "else out({type:'response',id:c.id,success:true,data:c.type==='get_state'?{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:0}:{text:'done'}});}});",
       "process.stdin.on('end',()=>out({type:'extension_error',event:'session_shutdown',error:'closure unconfirmed'}));",
     ].join("\n"));
     await chmod(command, 0o755);
@@ -1090,7 +1114,7 @@ test("Pi executor bounds a never-settling terminal exit callback and does not re
       "let input='';const out=v=>console.log(JSON.stringify(v));process.stdin.setEncoding('utf8');",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const c=JSON.parse(input.slice(0,n));input=input.slice(n+1);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});}",
-      "else out({type:'response',id:c.id,success:true,data:c.type==='get_state'?{isStreaming:false,pendingMessageCount:0}:{text:'done'}});}});",
+      "else out({type:'response',id:c.id,success:true,data:c.type==='get_state'?{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:0}:{text:'done'}});}});",
       "process.stdin.on('end',()=>process.exit(0));",
     ].join("\n"));
     await chmod(command, 0o755);
@@ -1145,7 +1169,7 @@ for (const cleanup of ["delayed", "stalled"] as const) {
         "let input='';const out=v=>console.log(JSON.stringify(v));process.stdin.setEncoding('utf8');",
         "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const c=JSON.parse(input.slice(0,n));input=input.slice(n+1);",
         "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});}",
-        "else out({type:'response',id:c.id,success:true,data:c.type==='get_state'?{isStreaming:false,pendingMessageCount:0}:{text:'done'}});}});",
+        "else out({type:'response',id:c.id,success:true,data:c.type==='get_state'?{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:0}:{text:'done'}});}});",
         "process.stdin.on('end',()=>{cleanupStarted=Date.now();",
         cleanup === "delayed"
           ? "setTimeout(()=>fs.writeFileSync(marker,JSON.stringify({state:'complete',elapsed:Date.now()-cleanupStarted})),2500);"
@@ -1193,7 +1217,7 @@ test("Pi executor waits from agent_end through delayed child agent_settled ackno
       "let input='';let settled=false;process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});out({type:'agent_end'});setTimeout(()=>{ack();settled=true;},150);}",
-      "else if(c.type==='get_state')out({type:'response',id:c.id,success:true,data:{isStreaming:!settled,pendingMessageCount:0}});",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,success:true,data:{...nativeSessionIdentity,isStreaming:!settled,pendingMessageCount:0}});",
       "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,success:true,data:{text:'settled after cleanup'}});",
       "}});",
     ].join("\n"), "utf8");
@@ -1230,7 +1254,7 @@ test("Pi executor does not count retry agent_end events as settlement generation
       "let input='';let settled=false;process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});out({type:'agent_end'});setTimeout(()=>{out({type:'agent_end'});setTimeout(()=>{settled=true;ack();},40);},40);}",
-      "else if(c.type==='get_state')out({type:'response',id:c.id,success:true,data:{isStreaming:!settled,pendingMessageCount:0}});",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,success:true,data:{...nativeSessionIdentity,isStreaming:!settled,pendingMessageCount:0}});",
       "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,success:true,data:{text:'retry settled once'}});",
       "}});",
     ].join("\n"), "utf8");
@@ -1265,7 +1289,7 @@ test("Pi executor follows trusted generations across an autonomous settlement", 
       "let input='';let pending=true;let autoScheduled=false;process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});}",
-      "else if(c.type==='get_state'){out({type:'response',id:c.id,success:true,data:{isStreaming:false,pendingMessageCount:pending?1:0}});if(pending&&!autoScheduled){autoScheduled=true;setTimeout(()=>{pending=false;ack();out({type:'agent_end'});},25);}}",
+      "else if(c.type==='get_state'){out({type:'response',id:c.id,success:true,data:{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:pending?1:0}});if(pending&&!autoScheduled){autoScheduled=true;setTimeout(()=>{pending=false;ack();out({type:'agent_end'});},25);}}",
       "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,success:true,data:{text:'autonomous final settlement'}});",
       "}});",
     ].join("\n"), "utf8");
@@ -1303,7 +1327,7 @@ test("Pi executor uses acknowledged RPC steering and a durable session", async (
       "let input='';let streaming=false; process.stdin.setEncoding('utf8');",
       "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){streaming=true;console.log(JSON.stringify({type:'response',id:c.id,command:'prompt',success:true}));console.log(JSON.stringify({type:'turn_start'}));}",
-      "else if(c.type==='get_state')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:streaming,pendingMessageCount:0}}));",
+      "else if(c.type==='get_state')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{...nativeSessionIdentity,isStreaming:streaming,pendingMessageCount:0}}));",
       "else if(c.type==='steer'){streaming=false;console.log(JSON.stringify({type:'response',id:c.id,command:'steer',success:true}));console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'pi complete'}]}}));console.log(JSON.stringify({type:'turn_end'}));ack();console.log(JSON.stringify({type:'agent_end'}));}",
       "else if(c.type==='get_last_assistant_text')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{text:'pi complete'}}));",
       "else if(c.type==='abort'){streaming=false;console.log(JSON.stringify({type:'response',id:c.id,command:'abort',success:true}));ack();console.log(JSON.stringify({type:'agent_end'}));}",
@@ -1384,7 +1408,7 @@ test("Pi stays alive for ShellStart work and accepts steering while its agent is
       "const settle=(text)=>{out({type:'message_end',message:{role:'assistant',content:[{type:'text',text}]}});out({type:'turn_end'});ack();out({type:'agent_end'});};",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){prompts++;fs.appendFileSync(capture,JSON.stringify(c.message)+'\\n');out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});if(prompts===1){bg=spawn(process.execPath,['-e','setTimeout(()=>{},5000)'],{detached:true,stdio:'ignore'});bg.unref();out({type:'tool_execution_end',toolName:'ShellStart',result:{content:[{type:'text',text:'Started \"long test\" as job1 (pid '+bg.pid+').\\nWaking you on: exit.'}]},isError:false});settle('background started');}else{if(bg){try{process.kill(-bg.pid,'SIGTERM')}catch{}}settle(prompts===2?'steering applied':'final inspection complete');}}",
-      "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:false,pendingMessageCount:0}});",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:0}});",
       "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'final inspection complete'}});",
       "else if(c.type==='abort'){out({type:'response',id:c.id,command:c.type,success:true});ack();out({type:'agent_end'});}",
       "}});",
@@ -1445,7 +1469,7 @@ test("Pi executor interrupts the active turn and delivers steering to the same s
       `const capture=${JSON.stringify(capture)};const commands=${JSON.stringify(commands)};`,
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);fs.appendFileSync(commands,c.type+'\\n');",
       "if(c.type==='prompt'){prompts++;streaming=true;fs.appendFileSync(capture,JSON.stringify(c.message)+'\\n');console.log(JSON.stringify({type:'response',id:c.id,command:'prompt',success:true}));console.log(JSON.stringify({type:'turn_start'}));if(prompts>1){streaming=false;lastText='steered complete';console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:lastText}]}}));console.log(JSON.stringify({type:'turn_end'}));ack();console.log(JSON.stringify({type:'agent_end'}));}}",
-      "else if(c.type==='get_state')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:streaming,pendingMessageCount:0}}));",
+      "else if(c.type==='get_state')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{...nativeSessionIdentity,isStreaming:streaming,pendingMessageCount:0}}));",
       "else if(c.type==='get_last_assistant_text')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{text:lastText}}));",
       "else if(c.type==='abort'){streaming=false;console.log(JSON.stringify({type:'response',id:c.id,command:'abort',success:true}));ack();console.log(JSON.stringify({type:'agent_end'}));}",
       "}});",
@@ -1507,7 +1531,7 @@ test("Pi executor acknowledges interrupt steering before the replacement settles
       `const capture=${JSON.stringify(capture)};const commands=${JSON.stringify(commands)};`,
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);fs.appendFileSync(commands,c.type+'\\n');",
       "if(c.type==='prompt'){prompts++;streaming=true;fs.appendFileSync(capture,JSON.stringify(c.message)+'\\n');console.log(JSON.stringify({type:'response',id:c.id,command:'prompt',success:true}));console.log(JSON.stringify({type:'turn_start'}));if(prompts===3){setTimeout(()=>{streaming=false;lastText='second steer complete';console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:lastText}]}}));console.log(JSON.stringify({type:'turn_end'}));ack();console.log(JSON.stringify({type:'agent_end'}));},50);}}",
-      "else if(c.type==='get_state')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:streaming,pendingMessageCount:0}}));",
+      "else if(c.type==='get_state')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{...nativeSessionIdentity,isStreaming:streaming,pendingMessageCount:0}}));",
       "else if(c.type==='steer')console.log(JSON.stringify({type:'response',id:c.id,command:'steer',success:true}));",
       "else if(c.type==='get_last_assistant_text')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{text:lastText}}));",
       "else if(c.type==='abort'){streaming=false;console.log(JSON.stringify({type:'response',id:c.id,command:'abort',success:true}));ack();console.log(JSON.stringify({type:'agent_end'}));}",
@@ -1587,7 +1611,7 @@ test("Pi executor interrupt steering without an active turn reports no interrupt
       "const settle=(text)=>{out({type:'message_end',message:{role:'assistant',content:[{type:'text',text}]}});out({type:'turn_end'});ack();out({type:'agent_end'});};",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);fs.appendFileSync(commands,c.type+'\\n');",
       "if(c.type==='prompt'){prompts++;fs.appendFileSync(capture,JSON.stringify(c.message)+'\\n');out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});if(prompts===1){bg=spawn(process.execPath,['-e','setTimeout(()=>{},1500)'],{detached:true,stdio:'ignore'});bg.unref();out({type:'tool_execution_end',toolName:'ShellStart',result:{content:[{type:'text',text:'Started \"idle test\" as job1 (pid '+bg.pid+').\\nWaking you on: exit.'}]},isError:false});settle('background started');}else if(prompts===2){settle('steered complete');}else{if(bg){try{process.kill(-bg.pid,'SIGTERM')}catch{}}settle('final inspection complete');}}",
-      "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:false,pendingMessageCount:0}});",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{...nativeSessionIdentity,isStreaming:false,pendingMessageCount:0}});",
       "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'final inspection complete'}});",
       "else if(c.type==='abort'){out({type:'response',id:c.id,command:'abort',success:true});ack();out({type:'agent_end'});}",
       "}});",

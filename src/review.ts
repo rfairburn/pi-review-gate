@@ -16,6 +16,13 @@ import {
   type GitCheckpointDescriptor,
 } from "./git-checkpoint";
 import { buildGitReviewDelta } from "./git-review-delta";
+import {
+  deleteAbandonedReviewerSetPiSessions,
+  deleteReviewerStagingPiSessions,
+  describePiSessionDeletionFailures,
+  type PiSessionDeletionFailure,
+  type SpawnedPiSessionCleanupOptions,
+} from "./pi-session-cleanup";
 import type { ChangeIdentity, ReviewResult } from "./schema";
 import { validateChangeIdentity } from "./schema";
 import { GenericCliAdapter } from "./adapters/generic-cli";
@@ -754,9 +761,20 @@ async function executeReviewerInvocation(input: {
     return result;
   }));
   const stagedResults = stagedReviewers.map((reviewer) => reviewer.result);
+  const cleanupOptions = {
+    deleteSpawnedPiSessions: input.config.deleteSpawnedPiSessionsOnCleanup === true,
+  };
   if (reviewWasAborted(input.signal, stagedResults)) {
     const result = abortedResult(stagedResults);
-    await cleanupStagedReviewers(stagedReviewers);
+    // A canceled pass genuinely discards its staged review artifacts, so the
+    // opt-in session deletion rides that existing cleanup. Cancellation itself
+    // is never blocked by it: a failure is disclosed on the canceled record.
+    const stagingFailures = await cleanupStagedReviewers(stagedReviewers, cleanupOptions);
+    if (stagingFailures.length > 0) {
+      result.diagnostic = [result.diagnostic, describePiSessionDeletionFailures(stagingFailures, "cancelled reviewer staging")]
+        .filter(Boolean)
+        .join("\n");
+    }
     await recordCanceledInvocation(
       input.bundle.invocationDir,
       input.window,
@@ -780,17 +798,22 @@ async function executeReviewerInvocation(input: {
       stagedReviewers,
       input.bundle.invocationDir,
       reviewerDisplayLabels(input.reviewers),
+      cleanupOptions,
     );
   } catch (error) {
-    await cleanupStagedReviewers(stagedReviewers);
+    // The unpublished set is abandoned; its staged sessions go with it.
+    const stagingFailures = await cleanupStagedReviewers(stagedReviewers, cleanupOptions);
     const message = error instanceof Error ? error.message : "Reviewer artifact publication failed.";
+    const cleanupDiagnostic = stagingFailures.length > 0
+      ? describePiSessionDeletionFailures(stagingFailures, "reviewer staging after a failed publication")
+      : undefined;
     const publicationFailure: ReviewResult = {
       reviewerId: "gate",
       verdict: "error",
       summary: "Reviewer results could not be published atomically.",
       findings: [],
       error: "artifact_publication_failed",
-      diagnostic: [message, reviewerDiagnostics(stagedResults)].filter(Boolean).join("\n"),
+      diagnostic: [message, cleanupDiagnostic, reviewerDiagnostics(stagedResults)].filter(Boolean).join("\n"),
       processSettlement: aggregateProcessSettlement(stagedResults),
     };
     if (input.window) input.window.retainBundleAfterClose = true;
@@ -832,7 +855,7 @@ async function executeReviewerInvocation(input: {
   if (input.window) {
     input.window.retainBundleAfterClose ||= bundleRetained;
   } else if (!bundleRetained) {
-    await removeReviewBundle(input.bundle.dir);
+    await removeReviewBundle(input.bundle.dir, cleanupOptions);
   }
   return { aborted: false, result, reviewerResults, bundleRetained };
 }
@@ -893,9 +916,10 @@ async function runSingleReviewer(input: {
     result.rawOutputPath = join(finalReviewerDir, basename(result.rawOutputPath));
   }
   try {
-    // Review passes are fresh, so runtime session history is neither needed for
-    // continuation nor valid evidence for this or later reviewers.
-    await rm(join(reviewerDir, "session"), { recursive: true, force: true });
+    // #533: the pass's native transcript lives in Pi's standard session store,
+    // so there is no artifact-local session directory to purge here. Only the
+    // canonical reference under `pi-sessions/` is staged, and it publishes with
+    // the rest of this reviewer's private staging directory.
     await Promise.all([
       writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
       writeFile(join(reviewerDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
@@ -938,6 +962,7 @@ async function publishStagedReviewerSet(
   stagedReviewers: StagedReviewerResult[],
   invocationDir: string,
   displayLabels: Record<string, string>,
+  cleanupOptions: SpawnedPiSessionCleanupOptions,
 ): Promise<void> {
   const incomplete = stagedReviewers.filter((reviewer) => reviewer.artifactError);
   if (incomplete.length > 0) {
@@ -961,14 +986,32 @@ async function publishStagedReviewerSet(
     await rm(finalRoot, { recursive: true, force: true });
     await rename(stagedRoot, finalRoot);
   } catch (error) {
+    // The private `.reviewers-*` set staged here is abandoned by this failure;
+    // anything already published is untouched, and the same failure is rethrown.
+    const cleanupFailures = await deleteAbandonedReviewerSetPiSessions(stagedRoot, cleanupOptions);
     await rm(stagedRoot, { recursive: true, force: true });
+    if (cleanupFailures.length > 0) {
+      throw new Error([
+        error instanceof Error ? error.message : String(error),
+        describePiSessionDeletionFailures(cleanupFailures, "abandoned reviewer publication staging"),
+      ].join("\n"));
+    }
     throw error;
   }
 }
 
-async function cleanupStagedReviewers(stagedReviewers: StagedReviewerResult[]): Promise<void> {
+async function cleanupStagedReviewers(
+  stagedReviewers: StagedReviewerResult[],
+  cleanupOptions: SpawnedPiSessionCleanupOptions,
+): Promise<PiSessionDeletionFailure[]> {
+  // The exact associated native sessions are deleted BEFORE the staging
+  // directory removal that discards their references, so nothing is lost
+  // before deletion and the existing cleanup timing is unchanged.
+  const reports = await Promise.all(stagedReviewers.map(async (staged) =>
+    await deleteReviewerStagingPiSessions(staged.stagingDir, cleanupOptions)));
   await Promise.all(stagedReviewers.map((staged) =>
     rm(staged.stagingDir, { recursive: true, force: true })));
+  return reports.flat();
 }
 
 function isCrossDeviceRename(error: unknown): boolean {

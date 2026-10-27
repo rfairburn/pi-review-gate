@@ -1903,6 +1903,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   const compiledLaunch = join(process.cwd(), "dist-test", "src", "session-host", "launch.js");
   const compiledConfigPath = join(process.cwd(), "dist-test", "src", "config-path.js");
   const compiledRecordGuard = join(process.cwd(), "dist-test", "src", "record-guard.js");
+  const compiledSessionHeader = join(process.cwd(), "dist-test", "src", "session-header.js");
   const compiledSavedSessions = join(process.cwd(), "dist-test", "src", "session-host", "saved-sessions.js");
   const compiledSavedSearch = join(process.cwd(), "dist-test", "src", "session-host", "saved-search.js");
   const compiledNativeSessionSdk = join(process.cwd(), "dist-test", "src", "session-host", "native-session-sdk.js");
@@ -1912,6 +1913,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   assert.ok(existsSync(compiledLaunch), "the compiled launch module under test must exist");
   assert.ok(existsSync(compiledConfigPath), "the compiled native config-path helper must exist");
   assert.ok(existsSync(compiledRecordGuard), "the compiled record guard must exist");
+  assert.ok(existsSync(compiledSessionHeader), "the compiled native session-header helper must exist");
   assert.ok(existsSync(compiledSavedSessions), "the compiled saved-session catalog module must exist");
   assert.ok(existsSync(compiledSavedSearch), "the compiled shared saved-session search module must exist");
   assert.ok(existsSync(compiledNativeSessionSdk), "the compiled public SDK loader module must exist");
@@ -1933,6 +1935,7 @@ test("the startup options helper resolves only the own compiled package scripts 
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "payload.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "protocol.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "config-path.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-header.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "record-guard.js"),
     join(rootA, "scripts", "session-host-startup-options.cjs"),
     markerA,
@@ -1956,6 +1959,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   await cp(compiledPayload, join(distA, "payload.js"));
   await cp(compiledProtocol, join(distA, "protocol.js"));
   await cp(compiledConfigPath, join(pkgA, "dist", "src", "config-path.js"));
+  await cp(compiledSessionHeader, join(pkgA, "dist", "src", "session-header.js"));
   await cp(compiledRecordGuard, join(pkgA, "dist", "src", "record-guard.js"));
   await mkdir(join(rootA, "scripts"), { recursive: true });
   await writeFile(
@@ -1985,6 +1989,7 @@ test("the startup options helper resolves only the own compiled package scripts 
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "payload.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "protocol.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "config-path.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-header.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "record-guard.js"),
     join(rootB, "node_modules", "pi-review-gate", "scripts", "session-host-startup-options.cjs"),
   ], [
@@ -2007,6 +2012,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   await cp(compiledPayload, join(distB, "payload.js"));
   await cp(compiledProtocol, join(distB, "protocol.js"));
   await cp(compiledConfigPath, join(pkgB, "dist", "src", "config-path.js"));
+  await cp(compiledSessionHeader, join(pkgB, "dist", "src", "session-header.js"));
   await cp(compiledRecordGuard, join(pkgB, "dist", "src", "record-guard.js"));
   await mkdir(join(pkgB, "scripts"), { recursive: true });
   await cp(join(process.cwd(), "scripts", "session-host-startup-options.cjs"), join(pkgB, "scripts", "session-host-startup-options.cjs"));

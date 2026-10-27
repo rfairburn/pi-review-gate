@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { readdir } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import {
   PROCESS_TREE_CLEANUP_GRACE_MS,
@@ -40,6 +40,15 @@ import {
   type PiSettlementBootstrap,
 } from "../pi-settlement-receipt";
 import { isRecord } from "../../record-guard";
+import {
+  canonicalPiSessionReference,
+  piSessionPathsMatch,
+  resolveVerifiedPiSessionFile,
+  verifyPiSessionReference,
+  writePiSessionReference,
+  type PiSessionReference,
+} from "../../pi-session-reference";
+import type { ExecutorSession } from "../types";
 
 export interface PiExecutorOptions {
   model: string;
@@ -70,6 +79,55 @@ export class PiExecutorAdapter implements ExecutorAdapter {
   }
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
+    // #533: a native resume the adapter cannot honor must never receive the
+    // continuation-only prompt. Every refusal is raised BEFORE any prompt is
+    // delivered, and the caller's own full-task handoff prompt is then used
+    // for the fresh session, so an unusable or replaced session can never
+    // leave the worker with correction text and no task, acceptance criteria,
+    // or acknowledged updates.
+    const resume: { refusal?: string } = {};
+    // Child ownership is only settled once the caller's own lifecycle
+    // callbacks have completed for every process this turn started. An
+    // unsettled exit callback means the parent still cannot prove the refused
+    // child is gone, so no replacement may be launched.
+    const outstandingProcesses = new Set<number>();
+    const turn = await this.runTurn({
+      ...request,
+      onProcessStart: async (identity) => {
+        outstandingProcesses.add(identity.pid);
+        await request.onProcessStart?.(identity);
+      },
+      onProcessExit: async (identity) => {
+        await request.onProcessExit?.(identity);
+        outstandingProcesses.delete(identity.pid);
+      },
+    }, resume);
+    if (!resume.refusal) return turn;
+    // The replacement launch is an adapter-internal retry, so it must honor the
+    // same refusals the recovery layer applies: uncertain process cleanup, an
+    // unsettled lifecycle callback, a timeout, or a cancellation. Those
+    // failures stay observable to the caller instead of being masked by a new
+    // child.
+    if (outstandingProcesses.size > 0
+      || turn.failure?.category === "process"
+      || turn.timedOut
+      || turn.aborted
+      || request.signal?.aborted) return turn;
+    const handoff = request.handoffPrompt;
+    // A supplied handoff remains valid even when equal to the current prompt:
+    // recovery can compose the same complete incident/checkpoint text for both.
+    // The fresh run has no session, so this cannot loop through resume fallback.
+    if (!handoff) return turn;
+    request.onUpdate?.(
+      `${resume.refusal}; this turn is retried as a new native Pi session carrying the full task handoff, and no prompt was delivered to the unusable session`,
+    );
+    return await this.runTurn(
+      { ...request, session: undefined, prompt: handoff, handoffPrompt: undefined },
+      {},
+    );
+  }
+
+  private async runTurn(request: ExecutorRequest, resume: { refusal?: string }): Promise<ExecutorTurn> {
     assertNoPiToolPolicyArgs(this.options.args ?? [], "Pi executor arguments");
     rejectPreCutoverRequestFields(request);
     const thinkingLevel = this.options.thinkingLevel ?? "high";
@@ -86,12 +144,38 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     // the extension receives the validated initial subset through a private
     // child environment bootstrap.
     const launchTools = [...new Set([...toolCatalog.allowedToolCatalog, DEFERRED_TOOL_SEARCH_NAME])];
-    const sessionId = request.session?.id ?? randomUUID();
-    const sessionDir = join(request.artifactDir, "executor-sessions");
-    await mkdir(sessionDir, { recursive: true });
+    // #533: spawned Pi sessions live in Pi's own standard native store — no
+    // per-role `--session-dir` and no artifact-local session directory. The
+    // owner artifact keeps exactly one canonical reference per session, and a
+    // continuation reopens the VERIFIED ABSOLUTE session path. Reusing a bare
+    // `--session-id` from a different cwd is never a resume: Pi answers it with
+    // a second file carrying the same id and no history, exit 0.
+    const launch = await resolvePiSessionLaunch({
+      kind: this.kind,
+      artifactDir: request.artifactDir,
+      prior: request.session,
+      cwd: request.cwd,
+    });
+    let sessionId = launch.sessionId;
+    if (launch.mode === "resume") {
+      request.onUpdate?.(`reopening native Pi session ${sessionId} from its recorded session file`);
+    } else if (launch.reason) {
+      request.onUpdate?.(launch.reason);
+    }
+    // A continuation whose session could not be verified starts a fresh
+    // session, so it must carry the caller's full-task handoff rather than the
+    // rewritten feedback that assumes the prior history survived.
+    let prompt = request.prompt;
+    if (request.session && launch.mode === "fresh" && request.handoffPrompt && request.handoffPrompt !== request.prompt) {
+      prompt = request.handoffPrompt;
+      request.onUpdate?.("because the previous session could not be reopened, this turn starts a new session from the full task handoff instead of continuation-only text");
+    }
     if (request.recovery?.compactBeforePrompt) {
-      if (!request.session) {
-        throw new Error("Cannot compact an interrupted executor without its durable session id.");
+      if (!request.session || launch.mode !== "resume" || !launch.file) {
+        throw new ExecutorLifecycleError(
+          "compaction",
+          `Cannot compact an interrupted executor without a verified native session reference: ${launch.reason ?? "the session has no verified native session file"}`,
+        );
       }
       request.onUpdate?.("reopening executor session for context compaction");
       try {
@@ -100,7 +184,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
           model: this.options.model,
           thinkingLevel,
           sessionId,
-          sessionDir,
+          sessionFile: launch.file,
           cwd: request.cwd,
           args: childArgs(this.options.args ?? [], launchTools),
           timeoutMs: Math.min(this.options.timeoutMs ?? 1_800_000, 300_000),
@@ -119,14 +203,29 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       }
       request.onUpdate?.("context compaction completed; resuming executor");
     }
+    // #533: a compatible continuation whose native history cannot be verified
+    // has nowhere truthful to go without the caller's full-task handoff. The
+    // continuation-only prompt assumes the prior history survived, so this
+    // refuses BEFORE spawning rather than delivering it into empty history.
+    // (An interrupted compaction above already refuses the same shape with its
+    // own recovery-specific reason; compaction cannot proceed on an
+    // unverifiable session at all.)
+    if (request.session?.adapter === this.kind && launch.mode === "fresh" && !request.handoffPrompt) {
+      throw new ExecutorLifecycleError(
+        "protocol",
+        `Cannot continue the prior Pi session without its verified history or a full-task handoff: ${launch.reason ?? "the recorded session could not be verified"}`,
+      );
+    }
     const extractor = new PiJsonlReviewExtractor();
     const activity = new PiJsonlActivityExtractor((message) => request.onUpdate?.(message));
     const args = [
       "--model", this.options.model,
       "--mode", "rpc",
       "--thinking", thinkingLevel,
-      "--session-id", sessionId,
-      "--session-dir", sessionDir,
+      // A verified continuation always passes the exact absolute session path
+      // (never `--session-id`, never `--continue`); only a genuinely new
+      // session supplies an id for Pi to create.
+      ...(launch.mode === "resume" ? ["--session", launch.file!] : ["--session-id", sessionId]),
       ...childArgs(this.options.args ?? [], launchTools),
     ];
     const timeoutMs = this.options.timeoutMs ?? 1_800_000;
@@ -216,6 +315,59 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     let cleanupFailure: string | undefined;
     let finalText = "";
     let timeoutDeadline = Date.now() + timeoutMs;
+    // #533: the child's authoritative native session identity, recorded from its
+    // own `get_state` (Pi may report a RELATIVE sessionFile when the effective
+    // sessionDir is relative, so it is canonicalized against the child cwd
+    // before it is ever recorded or resumed). A run that never obtained one is
+    // reported explicitly instead of quietly losing canonical session evidence.
+    let nativeSessionReference: PiSessionReference | undefined;
+    let nativeSessionReferenceFailure: string | undefined;
+    const recordNativeSessionReference = async (
+      options: { enforceResumedIdentity?: boolean } = {},
+    ): Promise<string | undefined> => {
+      if (nativeSessionReference) return undefined;
+      let state: Record<string, unknown>;
+      try {
+        state = rpcData(await rpc.request("get_state", {}));
+      } catch (error) {
+        nativeSessionReferenceFailure = `The executor child did not report its native session identity: ${messageOf(error)}`;
+        return nativeSessionReferenceFailure;
+      }
+      // A resumed launch must be PROVABLY the recorded session before anything
+      // is delivered into it. The child's own report is compared with the
+      // verified launch identity, and a replacement session — a different id,
+      // or any file other than the exact path that was reopened — is refused
+      // instead of adopted, so a continuation prompt can never be delivered
+      // into different history.
+      if (options.enforceResumedIdentity && launch.mode === "resume" && launch.file) {
+        const reportedId = typeof state.sessionId === "string" ? state.sessionId : "";
+        const reportedFile = typeof state.sessionFile === "string" && state.sessionFile !== ""
+          ? canonicalChildPath(request.cwd, state.sessionFile)
+          : "";
+        if (reportedId !== sessionId) {
+          return `The Pi executor child opened session ${reportedId || "<unnamed>"} instead of the recorded session ${sessionId}`;
+        }
+        if (!reportedFile || !piSessionPathsMatch(reportedFile, launch.file)) {
+          return `The Pi executor child opened ${reportedFile || "no session file"} instead of the recorded session file ${launch.file}`;
+        }
+      }
+      const recorded = await recordExecutorSessionReference({
+        artifactDir: request.artifactDir,
+        cwd: request.cwd,
+        launchedSessionId: sessionId,
+        state,
+      });
+      if (recorded.ok) {
+        nativeSessionReference = recorded.reference;
+        // Pi is authoritative for the identity of the session it actually opened.
+        sessionId = recorded.reference.id;
+        nativeSessionReferenceFailure = undefined;
+        if (recorded.mismatch) request.onUpdate?.(recorded.mismatch);
+      } else {
+        nativeSessionReferenceFailure = recorded.message;
+      }
+      return undefined;
+    };
     let receiptGeneration = 0;
     // Highest settlement generation run() has authenticated as a clean state.
     // New waits anchor after it so an already-settled steered replacement is
@@ -244,6 +396,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
               request.signal,
             );
             const state = rpcState(await rpc.request("get_state", {}));
+            if (!nativeSessionReference) await recordNativeSessionReference();
             if (!state.isStreaming && state.pendingMessageCount === 0) {
               lastSettlementAcknowledged = true;
               return;
@@ -320,13 +473,19 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     // Keep a bounded startup stop out of the RPC failure path without wrapping
     // the existing prompt/settlement state machine in an additional scope.
     const startupSkipped = Symbol("Pi executor startup did not complete");
+    const resumeSkipped = Symbol("Pi executor resumed session identity was refused before the prompt");
     try {
       if (!startupReady) throw startupSkipped;
       let settledGeneration = rpc.settledGeneration;
-      await rpc.request("prompt", { message: request.prompt });
+      const identityRefusal = await recordNativeSessionReference({ enforceResumedIdentity: true });
+      if (identityRefusal) {
+        resume.refusal = identityRefusal;
+        throw resumeSkipped;
+      }
+      await rpc.request("prompt", { message: prompt });
       // #93: the RPC transport accepted the prompt — the actual delivery
       // boundary for this prompt.
-      request.onPromptDelivery?.({ prompt: request.prompt });
+      request.onPromptDelivery?.({ prompt });
       request.onLiveControl?.({
         adapter: this.kind,
         generation: request.turn,
@@ -486,7 +645,15 @@ export class PiExecutorAdapter implements ExecutorAdapter {
         throw new Error("Pi executor completion lacks an acknowledgement for its final settlement.");
       }
     } catch (error) {
-      if (error !== startupSkipped && !timedOut && !aborted && !interruptedByControl) protocolFailure = messageOf(error);
+      if (error !== startupSkipped && error !== resumeSkipped && !timedOut && !aborted && !interruptedByControl) {
+        protocolFailure = messageOf(error);
+      }
+      // A refused resumed identity fails closed on its own terms: the prompt
+      // was never delivered, and the caller either retries with its full-task
+      // handoff or receives this refusal as the turn's failure.
+      if (error === resumeSkipped) {
+        protocolFailure ??= `Pi executor resumed session identity was refused before the prompt: ${resume.refusal ?? "the child did not report the recorded session identity"}`;
+      }
     } finally {
       clearInterval(timer);
       request.signal?.removeEventListener("abort", onAbort);
@@ -612,6 +779,15 @@ export class PiExecutorAdapter implements ExecutorAdapter {
         ].filter(Boolean).join(" ");
       }
     }
+    if (!nativeSessionReference && !protocolFailure && !cleanupFailure && !terminationFailure
+      && !timedOut && !aborted && !interruptedByControl && !rpc.terminationWasRequested && exit.code === 0) {
+      // A clean exit with no canonical session reference means the owner keeps
+      // no way to locate this turn's native history. Say so instead of
+      // downgrading the turn to stdout-only evidence.
+      appendProtocolFailure(
+        `Pi executor recorded no canonical native session reference${nativeSessionReferenceFailure ? `: ${nativeSessionReferenceFailure}` : ""}; the native session history for this turn is not locatable from the task artifacts.`,
+      );
+    }
     const failureMessage = [protocolFailure, cleanupFailure, terminationFailure].filter(Boolean).join(" ") || undefined;
     const processCleanupFailure = cleanupFailure
       ?? (terminationFailure && /descendants may remain live|owned cleanup is uncertain/.test(terminationFailure)
@@ -635,6 +811,10 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     });
     return {
       text,
+      // #533: identity only. The native transcript path and workspace live in
+      // this artifact's canonical reference (`pi-sessions/<id>.json`), which a
+      // continuation resolves and verifies; the session struct never carries a
+      // second copy of them.
       session: { adapter: this.kind, id: sessionId },
       usage: extracted.usage,
       ...artifacts,
@@ -992,7 +1172,7 @@ async function compactInterruptedSession(input: {
   model: string;
   thinkingLevel: ThinkingLevel;
   sessionId: string;
-  sessionDir: string;
+  sessionFile: string;
   cwd: string;
   args: string[];
   timeoutMs: number;
@@ -1006,8 +1186,9 @@ async function compactInterruptedSession(input: {
     "--model", input.model,
     "--mode", "rpc",
     "--thinking", input.thinkingLevel,
-    "--session-id", input.sessionId,
-    "--session-dir", input.sessionDir,
+    // An interrupted compaction reopens the EXACT absolute session path: the
+    // history being compacted is the one this artifact already recorded.
+    "--session", input.sessionFile,
     ...input.args,
   ];
 
@@ -1183,6 +1364,15 @@ async function compactInterruptedSession(input: {
           if (data?.sessionId !== input.sessionId) {
             return fail(`Executor RPC reopened session ${String(data?.sessionId)}, expected ${input.sessionId}.`);
           }
+          // The reopened file must be the recorded one. `sessionFile` can be
+          // relative (relative effective sessionDir), so it is canonicalized
+          // against this child's cwd before comparison.
+          if (typeof data.sessionFile !== "string" || data.sessionFile.length === 0) {
+            return fail("Executor RPC reported no usable session file; interrupted compaction requires the recorded native history.");
+          }
+          if (!piSessionPathsMatch(canonicalChildPath(input.cwd, data.sessionFile), input.sessionFile)) {
+            return fail(`Executor RPC reopened session file ${canonicalChildPath(input.cwd, data.sessionFile)}, expected ${input.sessionFile}.`);
+          }
           phase = "compact";
           send({ id: "review-gate-compact", type: "compact", customInstructions: recoveryCompactionInstructions });
         } else if (phase === "compact" && event.id === "review-gate-compact") {
@@ -1252,6 +1442,138 @@ function rpcState(response: Record<string, unknown>): { isStreaming: boolean; pe
   return {
     isStreaming: data.isStreaming === true,
     pendingMessageCount: typeof data.pendingMessageCount === "number" ? data.pendingMessageCount : 0,
+  };
+}
+
+function rpcData(response: Record<string, unknown>): Record<string, unknown> {
+  return isRecord(response.data) ? response.data : {};
+}
+
+/**
+ * Canonicalize a path a CHILD reported against its own cwd. `resolve` is
+ * shadowed by Promise executors inside this module's helpers, so path work in
+ * those helpers goes through this module-level function.
+ */
+function canonicalChildPath(cwd: string, reported: string): string {
+  return isAbsolute(reported) ? resolve(reported) : resolve(cwd, reported);
+}
+
+/**
+ * Record the child's authoritative native session identity as this owner's one
+ * canonical reference (#533).
+ *
+ * `get_state` is authoritative but its `sessionFile` can be RELATIVE whenever
+ * the effective `sessionDir` is relative; the child resolves it against ITS own
+ * cwd, so it is canonicalized against the request workspace and never the gate
+ * process cwd. A relative or unusable identity is refused rather than recorded.
+ */
+async function recordExecutorSessionReference(input: {
+  artifactDir: string;
+  cwd: string;
+  launchedSessionId: string;
+  state: Record<string, unknown>;
+}): Promise<{ ok: true; reference: PiSessionReference; mismatch?: string } | { ok: false; message: string }> {
+  const reportedId = typeof input.state.sessionId === "string" ? input.state.sessionId : undefined;
+  const reportedFile = typeof input.state.sessionFile === "string" ? input.state.sessionFile : undefined;
+  if (!reportedId || !reportedFile) {
+    return {
+      ok: false,
+      message: `The executor child's get_state reported no usable native session identity (sessionId ${String(reportedId)}, sessionFile ${String(reportedFile)}).`,
+    };
+  }
+  const canonical = canonicalPiSessionReference({
+    id: reportedId,
+    file: reportedFile,
+    cwd: input.cwd,
+    relativeTo: input.cwd,
+  });
+  if (!canonical.ok) return { ok: false, message: canonical.message };
+  const written = await writePiSessionReference(input.artifactDir, canonical.value);
+  if (!written.ok) return { ok: false, message: written.message };
+  return {
+    ok: true,
+    reference: canonical.value,
+    ...(reportedId !== input.launchedSessionId
+      ? { mismatch: `the executor child opened native session ${reportedId} although ${input.launchedSessionId} was requested` }
+      : {}),
+  };
+}
+
+/**
+ * Pre-#533 artifacts kept the native session inside the task's own
+ * `executor-sessions/` directory. Existing records keep resuming from there:
+ * a bounded lookup of this artifact's own directory, header-verified, with no
+ * migration, no copy, and no shared-store scan.
+ */
+const LEGACY_SESSION_DIRNAME = "executor-sessions";
+const MAX_LEGACY_SESSION_LOOKUP = 256;
+
+async function findLegacyArtifactSessionFile(input: {
+  artifactDir: string;
+  sessionId: string;
+  cwd: string;
+}): Promise<string | undefined> {
+  const dir = join(input.artifactDir, LEGACY_SESSION_DIRNAME);
+  let names: string[];
+  try {
+    names = (await readdir(dir)).filter((name) => name.endsWith(".jsonl")).sort();
+  } catch {
+    return undefined;
+  }
+  for (const name of names.slice(0, MAX_LEGACY_SESSION_LOOKUP)) {
+    const file = resolve(dir, name);
+    const verified = verifyPiSessionReference(
+      { id: input.sessionId, file, cwd: input.cwd },
+      { id: input.sessionId, cwd: input.cwd },
+    );
+    if (verified.ok) return file;
+  }
+  return undefined;
+}
+
+/**
+ * Decide how this turn attaches to a native Pi session.
+ *
+ * Resume requires a verified absolute session file: the owner's canonical
+ * reference (or, for a pre-#533 artifact, this artifact's own legacy session
+ * file) whose native header proves this session id AND the intended workspace.
+ * Everything else takes a NEW session id: re-passing a bare `--session-id`
+ * whose id already exists under a different cwd makes Pi create a second
+ * same-id session with no history and exit 0, which is the silent context loss
+ * this decision exists to prevent.
+ */
+async function resolvePiSessionLaunch(input: {
+  kind: string;
+  artifactDir: string;
+  prior?: ExecutorSession;
+  cwd: string;
+}): Promise<
+  | { mode: "resume"; sessionId: string; file: string; reason?: undefined }
+  | { mode: "fresh"; sessionId: string; reason: string }
+> {
+  if (!input.prior || input.prior.adapter !== input.kind || !input.prior.id) {
+    return { mode: "fresh", sessionId: randomUUID(), reason: "" };
+  }
+  const canonical = await resolveVerifiedPiSessionFile({
+    ownerArtifactDir: input.artifactDir,
+    sessionId: input.prior.id,
+    cwd: input.cwd,
+  });
+  if (canonical.ok) {
+    return { mode: "resume", sessionId: canonical.reference.id, file: canonical.reference.file };
+  }
+  const legacyFile = await findLegacyArtifactSessionFile({
+    artifactDir: input.artifactDir,
+    sessionId: input.prior.id,
+    cwd: input.cwd,
+  });
+  if (legacyFile) {
+    return { mode: "resume", sessionId: input.prior.id, file: legacyFile };
+  }
+  return {
+    mode: "fresh",
+    sessionId: randomUUID(),
+    reason: `the prior Pi session ${input.prior.id} has no verified native session file (${canonical.message}), so this turn starts a new native session instead of reusing an unverifiable session id`,
   };
 }
 

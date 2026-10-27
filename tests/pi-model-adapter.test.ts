@@ -75,10 +75,48 @@ test("PiModelAdapter uses one native --tools allowlist and reports missing final
     assert.equal(argv.includes("--no-session"), false);
     const sessionId = argv[argv.indexOf("--session-id") + 1];
     assert.equal(typeof sessionId, "string");
-    assert.equal(resumedArgv[resumedArgv.indexOf("--session-id") + 1], sessionId);
     assert.equal(resumedArgv[resumedArgv.indexOf("--thinking") + 1], "max");
-    assert.equal(argv[argv.indexOf("--session-dir") + 1], join(dir, "session"));
-    assert.deepEqual(JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")).stdoutTruncated, false);
+    // #533: the reviewer pass runs in Pi's own standard native session store, so
+    // no per-role session directory is ever passed.
+    assert.ok(!argv.includes("--session-dir"), "the reviewer must not redirect the native session store per role");
+    assert.ok(!resumedArgv.includes("--session-dir"), "a later reviewer pass must not redirect the native session store per role");
+    // The reviewer reports its authoritative identity through the gate-owned
+    // reporter extension, and discovery stays off.
+    assert.ok(argv.includes("--no-extensions"), "reviewer extension discovery must stay off");
+    const extension = argv[argv.indexOf("--extension") + 1];
+    assert.equal(typeof extension, "string", "the reviewer loads exactly one explicit reporter extension");
+    assert.match(extension, /pi-session-reference-reporter\.js$/);
+    assert.equal(argv.filter((entry: string) => entry === "--extension").length, 1);
+    // #533: EVERY reviewer pass is a fresh native session. A supplied prior is
+    // identity context only — the adapter never reopens a reviewer conversation,
+    // because Pi answers a bare `--session-id` it cannot find with an EMPTY
+    // same-id session, and no reviewer continuation was ever approved.
+    const resumedSessionId = resumedArgv[resumedArgv.indexOf("--session-id") + 1];
+    assert.equal(typeof resumedSessionId, "string");
+    assert.notEqual(resumedSessionId, sessionId, "a reviewer pass never reuses a prior session id");
+    assert.ok(!argv.includes("--session") && !resumedArgv.includes("--session"),
+      "a reviewer pass never reopens a session by path");
+    assert.ok(!resumedArgv.includes("--continue") && !resumedArgv.includes("--resume"),
+      "a reviewer pass never reopens an ambient session");
+    // #533: the pass records MINIMAL session metadata — status, id, and the
+    // locator of the canonical reference — never a second copy of the session
+    // file or workspace, which live only in `pi-sessions/<id>.json`.
+    const processResult = JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")) as {
+      stdoutTruncated: boolean;
+      sessionReference?: Record<string, unknown>;
+    };
+    assert.equal(processResult.stdoutTruncated, false);
+    assert.ok(processResult.sessionReference, "the pass discloses what it learned about its native session");
+    assert.equal(processResult.sessionReference.status, "unavailable",
+      "a pass whose child reported no identity is recorded explicitly, never guessed");
+    assert.equal(processResult.sessionReference.reference, `pi-sessions/${resumedSessionId}.json`,
+      "the metadata points at the canonical reference instead of copying its paths");
+    assert.ok(!("file" in processResult.sessionReference) && !("cwd" in processResult.sessionReference),
+      `pass metadata carries no duplicate path state: ${JSON.stringify(processResult.sessionReference)}`);
+    // The callback hands back identity only; the transcript path is never handed
+    // to the caller as a second copy of canonical state.
+    assert.deepEqual(Object.keys(session ?? {}).sort(), ["adapter", "id"],
+      `a reviewer session callback reports identity only: ${JSON.stringify(session)}`);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

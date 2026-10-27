@@ -97,15 +97,18 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
         "Current continuation instructions:",
         input.feedback,
       ].join("\n")
-      : [
-        buildInPlacePrompt(task, input.workspaceRoot),
-        "",
-        buildInPlaceContinuationDisclosure(false),
-        "",
-        "Current continuation instructions:",
-        input.feedback,
-      ].join("\n"))
+      : inPlaceFullTaskHandoff(task, input.workspaceRoot, input.feedback))
     : buildInPlacePrompt(task, input.workspaceRoot);
+  // #533: the full-task handoff this run can fall back to. A Pi turn whose
+  // native session cannot be reopened must not receive the continuation-only
+  // text above (it assumes the prior history survived), so the turn loop is
+  // given the SAME complete construction the existing fresh-session in-place
+  // path already sends — task, acceptance criteria, relevant context,
+  // acknowledged updates, the in-place workspace, and the current continuation
+  // instructions — with no prior-transcript replay and no added payload.
+  let handoffPrompt = input.mode === "continuation" && input.feedback
+    ? inPlaceFullTaskHandoff(task, input.workspaceRoot, input.feedback)
+    : prompt;
 
   let assignment = initialAssignment;
   let session = input.priorSession;
@@ -180,6 +183,9 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
       session = undefined;
       startingTurn = Math.max(startingTurn, operation.attempts.length + 1);
       prompt = inPlaceFailoverPrompt(task, input.workspaceRoot, input.mode, input.feedback, message);
+      // The failover prompt is itself a complete task handoff, so a replacement
+      // that cannot reopen a session still receives the whole task.
+      handoffPrompt = prompt;
       reason = "failover";
       await writeOperationRecord(operation);
       continue;
@@ -209,6 +215,7 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
         task,
         taskId,
         prompt,
+        handoffPrompt,
         startingTurn,
         session,
         signal: input.signal,
@@ -290,6 +297,7 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
           session = undefined;
           startingTurn = run.lastTurnNumber + 1;
           prompt = inPlaceFailoverPrompt(task, input.workspaceRoot, input.mode, input.feedback, run.error ?? "executor failure");
+          handoffPrompt = prompt;
           reason = "failover";
           await writeOperationRecord(operation);
           continue;
@@ -351,6 +359,26 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
     });
     return { ...common, status: "completed", summary: run.turn.text, session: run.turn.session };
   }
+}
+
+/**
+ * The existing in-place full-task handoff: the complete in-place worker prompt
+ * plus the truthful fresh-session continuation disclosure and the current
+ * continuation instructions. #533 reuses this one construction for the
+ * fresh-session fallback a Pi turn takes when its native session cannot be
+ * reopened, so a fallback never loses the task, acceptance criteria, relevant
+ * context, acknowledged updates, workspace, or current instructions, and never
+ * replays the prior transcript.
+ */
+function inPlaceFullTaskHandoff(task: WaveWorkerTask, workspaceRoot: string, feedback: string): string {
+  return [
+    buildInPlacePrompt(task, workspaceRoot),
+    "",
+    buildInPlaceContinuationDisclosure(false),
+    "",
+    "Current continuation instructions:",
+    feedback,
+  ].join("\n");
 }
 
 function inPlaceFailoverPrompt(

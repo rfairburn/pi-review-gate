@@ -952,6 +952,37 @@ async function recordDurableNativeSession(input: {
   return sessionFile;
 }
 
+test("legacy artifact recovery finds its exact history beyond 256 other sessions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-child-legacy-history-"));
+  const promptCapture = join(root, "prompts.jsonl");
+  const fixture = await createFakePiBinIn(root, rpcEntryBody(join(root, "capture.jsonl"), promptCapture));
+  try {
+    const artifactDir = join(fixture.root, "artifacts");
+    const legacyDir = join(artifactDir, "executor-sessions");
+    await mkdir(legacyDir, { recursive: true });
+    await Promise.all(Array.from({ length: 257 }, (_, index) => writeFile(
+      join(legacyDir, `0000-other-${index}.jsonl`),
+      JSON.stringify({ type: "session", version: 3, id: `other-${index}`, cwd: fixture.root }) + "\n",
+    )));
+    const id = "zzzz-legacy-session";
+    const legacyFile = join(legacyDir, `${id}.jsonl`);
+    await writeFile(legacyFile, JSON.stringify({ type: "session", version: 3, id, cwd: fixture.root }) + "\n");
+    const observed = await runContinuationTurn({
+      bin: fixture.bin, root: fixture.root, artifactDir,
+      session: { adapter: "pi-model", id },
+    });
+    assert.equal(observed.failure, undefined);
+    assert.deepEqual(observed.delivered, [CONTINUATION_PROMPT], "the existing history, not a fresh handoff, is used");
+    const launches = await readCaptureLines(fixture.captureFile);
+    assert.equal(launches.length, 1);
+    const argv = launches[0].argv as string[];
+    assert.equal(argv[argv.indexOf("--session") + 1], legacyFile);
+    assert.equal((await readPiSessionReference(artifactDir, id))?.file, legacyFile, "legacy history is referenced in place, never migrated");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 const CONTINUATION_PROMPT = "CORRECTION-ONLY: address the second finding";
 const HANDOFF_PROMPT = [
   "FULL TASK HANDOFF",

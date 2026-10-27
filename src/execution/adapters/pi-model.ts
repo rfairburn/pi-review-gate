@@ -1502,11 +1502,10 @@ async function recordExecutorSessionReference(input: {
 /**
  * Pre-#533 artifacts kept the native session inside the task's own
  * `executor-sessions/` directory. Existing records keep resuming from there:
- * a bounded lookup of this artifact's own directory, header-verified, with no
+ * an artifact-scoped lookup of this task's own directory, header-verified, with no
  * migration, no copy, and no shared-store scan.
  */
 const LEGACY_SESSION_DIRNAME = "executor-sessions";
-const MAX_LEGACY_SESSION_LOOKUP = 256;
 
 async function findLegacyArtifactSessionFile(input: {
   artifactDir: string;
@@ -1520,7 +1519,7 @@ async function findLegacyArtifactSessionFile(input: {
   } catch {
     return undefined;
   }
-  for (const name of names.slice(0, MAX_LEGACY_SESSION_LOOKUP)) {
+  for (const name of names) {
     const file = resolve(dir, name);
     const verified = verifyPiSessionReference(
       { id: input.sessionId, file, cwd: input.cwd },

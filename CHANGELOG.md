@@ -22,6 +22,8 @@ dates.
 - Spawned Pi sessions use Pi's environment-resolved native store, with exact file
   references in existing task/reviewer metadata for continuation and evidence (#533).
   Reviewers remain fresh; no historical session migration or conversion is performed.
+  Continuing subtasks started before this update is not supported. Allow active
+  subtasks to land before upgrading.
 - **Retention** groups Bundle retention with default-off
   `deleteSpawnedPiSessionsOnCleanup`. When enabled, existing cleanup points also unlink
   their recorded Pi files after bounded header identification; cleanup scope and timing

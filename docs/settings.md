@@ -10,7 +10,7 @@ semantics are documented on [Scheduled tasks](scheduled-tasks.md#scheduled-task-
 
 `/review-settings` opens one staged settings transaction with sixteen ordinary rows —
 Operating mode, Mode cycle hotkey, Worker resources, External workers, Execution
-priority, Research priority, Reviewers, Timeouts, Review policy, Bundle retention,
+priority, Research priority, Reviewers, Timeouts, Review policy, Retention,
 Global concurrency, Retry policy, Subtask notifications, Tools, Subtasks view, and
 Scheduled tasks — plus a conditional **Scheduler runtime** row when the host runtime
 supplies the live switch (the ordinary extension entry point always does):
@@ -88,7 +88,12 @@ supplies the live switch (the ordinary extension entry point always does):
   override these defaults for that external harness role.
 - **Review policy** edits `maxCorrectionCycles` and
   `implementationGuidanceAfterCorrectionAttempts` as non-negative whole numbers.
-- **Bundle retention** selects `never`, `on-failure`, or `always`.
+- **Retention** groups **Bundle retention** (`never`, `on-failure`, or `always`,
+  unchanged) with **Spawned Pi sessions** (**Retained** by default; select
+  **Deleted on cleanup** to enable deletion). The toggle uses the same
+  Save/Ctrl+S, root-Escape apply, and Cancel transaction;
+  switching it On does not itself delete anything. See
+  [Configuration](configuration.md#top-level-fields).
 - **Global concurrency** sets `execution.maxWorkers` (1–128, default 4). This is the
   session-wide worker ceiling shared by every group; each worker resource also has its
   own shared `maxConcurrent` capacity (1–128). These bound how many workers run at

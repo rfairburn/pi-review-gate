@@ -19,6 +19,7 @@ import { buildGitReviewDelta } from "./git-review-delta";
 import type { ChangeIdentity, ReviewResult } from "./schema";
 import { validateChangeIdentity } from "./schema";
 import { GenericCliAdapter } from "./adapters/generic-cli";
+import { deleteRecordedNativeSession } from "./execution/native-session-refs";
 import { CodexCliAdapter } from "./adapters/codex-cli";
 import { ClaudeCliAdapter } from "./adapters/claude-cli";
 import { PiModelAdapter } from "./adapters/pi-model";
@@ -741,6 +742,7 @@ async function executeReviewerInvocation(input: {
       invocationDir: input.bundle.invocationDir,
       window: input.window,
       signal: input.signal,
+      deleteNativeSession: input.config.deleteSpawnedPiSessionsOnCleanup === true,
       onUpdate: (message) => input.onUpdate?.(`${label} · ${message}`),
     });
     // Snapshot the identity of the configuration that actually ran this
@@ -846,6 +848,8 @@ async function runSingleReviewer(input: {
   invocationDir: string;
   window?: ReviewWindow;
   signal?: AbortSignal;
+  /** Opt-in: delete this pass's own native Pi session once it is finished with it. */
+  deleteNativeSession?: boolean;
   onUpdate?: (message: string) => void;
 }): Promise<StagedReviewerResult> {
   const finalReviewerDir = join(input.invocationDir, "reviewers", safePathSegment(input.reviewer.id));
@@ -895,7 +899,12 @@ async function runSingleReviewer(input: {
   try {
     // Review passes are fresh, so runtime session history is neither needed for
     // continuation nor valid evidence for this or later reviewers.
-    await rm(join(reviewerDir, "session"), { recursive: true, force: true });
+    if (input.deleteNativeSession === true && session !== undefined) {
+      const cleanup = await deleteRecordedNativeSession(session);
+      if (cleanup.refusal !== undefined) {
+        input.onUpdate?.(`the spawned Pi session was retained, not deleted: ${cleanup.refusal}`);
+      }
+    }
     await Promise.all([
       writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
       writeFile(join(reviewerDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),

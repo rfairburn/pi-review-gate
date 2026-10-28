@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { realpathSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import {
   PROCESS_TREE_CLEANUP_GRACE_MS,
@@ -40,6 +41,7 @@ import {
   type PiSettlementBootstrap,
 } from "../pi-settlement-receipt";
 import { isRecord } from "../../record-guard";
+import { isValidNativeSessionFile } from "../../session-host/protocol";
 
 export interface PiExecutorOptions {
   model: string;
@@ -87,11 +89,13 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     // child environment bootstrap.
     const launchTools = [...new Set([...toolCatalog.allowedToolCatalog, DEFERRED_TOOL_SEARCH_NAME])];
     const sessionId = request.session?.id ?? randomUUID();
-    const sessionDir = join(request.artifactDir, "executor-sessions");
-    await mkdir(sessionDir, { recursive: true });
+    // Pi resolves fresh sessions; continuation uses the child's recorded file.
+    const resumeSessionFile = request.session === undefined
+      ? undefined
+      : nativeSessionPath(request.session.file, request.cwd, request.session.id);
     if (request.recovery?.compactBeforePrompt) {
-      if (!request.session) {
-        throw new Error("Cannot compact an interrupted executor without its durable session id.");
+      if (resumeSessionFile === undefined) {
+        throw new Error("Cannot compact an interrupted executor without its durable session id and native session file.");
       }
       request.onUpdate?.("reopening executor session for context compaction");
       try {
@@ -100,7 +104,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
           model: this.options.model,
           thinkingLevel,
           sessionId,
-          sessionDir,
+          sessionFile: resumeSessionFile,
           cwd: request.cwd,
           args: childArgs(this.options.args ?? [], launchTools),
           timeoutMs: Math.min(this.options.timeoutMs ?? 1_800_000, 300_000),
@@ -125,8 +129,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       "--model", this.options.model,
       "--mode", "rpc",
       "--thinking", thinkingLevel,
-      "--session-id", sessionId,
-      "--session-dir", sessionDir,
+      ...(resumeSessionFile !== undefined ? ["--session", resumeSessionFile] : ["--session-id", sessionId]),
       ...childArgs(this.options.args ?? [], launchTools),
     ];
     const timeoutMs = this.options.timeoutMs ?? 1_800_000;
@@ -320,9 +323,23 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     // Keep a bounded startup stop out of the RPC failure path without wrapping
     // the existing prompt/settlement state machine in an additional scope.
     const startupSkipped = Symbol("Pi executor startup did not complete");
+    // Capture before prompting so interrupted turns retain the native reference.
+    let nativeSessionFile = resumeSessionFile;
     try {
       if (!startupReady) throw startupSkipped;
       let settledGeneration = rpc.settledGeneration;
+      // Refuse a wrong identity before delivering any prompt.
+      nativeSessionFile = nativeSessionIdentity(
+        await rpc.request("get_state", {}),
+        sessionId,
+        request.cwd,
+        resumeSessionFile,
+      );
+      const turnDir = join(request.artifactDir, "executor", String(request.turn).padStart(4, "0"));
+      await mkdir(turnDir, { recursive: true });
+      await writeFile(join(turnDir, "process-result.json"), JSON.stringify({
+        adapter: this.kind, sessionId, sessionFile: nativeSessionFile,
+      }), "utf8");
       await rpc.request("prompt", { message: request.prompt });
       // #93: the RPC transport accepted the prompt — the actual delivery
       // boundary for this prompt.
@@ -631,11 +648,16 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       text,
       usage: extracted.usage,
       sessionId,
+      sessionFile: nativeSessionFile,
       adapter: this.kind,
     });
     return {
       text,
-      session: { adapter: this.kind, id: sessionId },
+      session: {
+        adapter: this.kind,
+        id: sessionId,
+        ...(nativeSessionFile === undefined ? {} : { file: nativeSessionFile }),
+      },
       usage: extracted.usage,
       ...artifacts,
       code: failureMessage ? 1 : output.code,
@@ -992,7 +1014,7 @@ async function compactInterruptedSession(input: {
   model: string;
   thinkingLevel: ThinkingLevel;
   sessionId: string;
-  sessionDir: string;
+  sessionFile: string;
   cwd: string;
   args: string[];
   timeoutMs: number;
@@ -1006,8 +1028,7 @@ async function compactInterruptedSession(input: {
     "--model", input.model,
     "--mode", "rpc",
     "--thinking", input.thinkingLevel,
-    "--session-id", input.sessionId,
-    "--session-dir", input.sessionDir,
+    "--session", input.sessionFile,
     ...input.args,
   ];
 
@@ -1179,9 +1200,12 @@ async function compactInterruptedSession(input: {
         if (event.type !== "response") continue;
         if (phase === "state" && event.id === "review-gate-state") {
           if (event.success !== true) return fail(`Could not reopen executor session: ${rpcError(event)}`);
-          const data = event.data as Record<string, unknown> | undefined;
-          if (data?.sessionId !== input.sessionId) {
-            return fail(`Executor RPC reopened session ${String(data?.sessionId)}, expected ${input.sessionId}.`);
+          // The reopened session must be exactly the recorded one before any
+          // compaction is written into it.
+          try {
+            nativeSessionIdentity({ data: event.data }, input.sessionId, input.cwd, input.sessionFile);
+          } catch (error) {
+            return fail(messageOf(error));
           }
           phase = "compact";
           send({ id: "review-gate-compact", type: "compact", customInstructions: recoveryCompactionInstructions });
@@ -1253,6 +1277,39 @@ function rpcState(response: Record<string, unknown>): { isStreaming: boolean; pe
     isStreaming: data.isStreaming === true,
     pendingMessageCount: typeof data.pendingMessageCount === "number" ? data.pendingMessageCount : 0,
   };
+}
+
+/** Normalize native paths without reading the transcript or requiring a fresh file to exist. */
+function nativeSessionPath(value: string | undefined, childCwd: string, sessionId: string): string {
+  const absolute = typeof value === "string" && value.length > 0
+    ? (isAbsolute(value) ? value : resolve(childCwd, value))
+    : "";
+  if (!isValidNativeSessionFile(absolute)) {
+    throw new Error(`Executor session ${sessionId} has no valid recorded native session file.`);
+  }
+  try {
+    return join(realpathSync(dirname(absolute)), basename(absolute));
+  } catch {
+    return absolute;
+  }
+}
+
+/** Require the requested native id and, on resume, its exact recorded file. */
+function nativeSessionIdentity(
+  response: Record<string, unknown>,
+  sessionId: string,
+  childCwd: string,
+  expectedFile: string | undefined,
+): string {
+  const data = isRecord(response.data) ? response.data : {};
+  if (data.sessionId !== sessionId) {
+    throw new Error(`Pi executor reported session ${String(data.sessionId)}, expected ${sessionId}.`);
+  }
+  const file = nativeSessionPath(typeof data.sessionFile === "string" ? data.sessionFile : undefined, childCwd, sessionId);
+  if (expectedFile !== undefined && file !== expectedFile) {
+    throw new Error(`Pi executor reopened ${file}, expected the recorded session file ${expectedFile}.`);
+  }
+  return file;
 }
 
 function rpcError(event: Record<string, unknown>): string {

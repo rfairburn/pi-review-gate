@@ -29,6 +29,12 @@ interface InheritedPipeFixture extends OwnedDescendantFixture {
   parentScript: string;
 }
 
+async function recordedNativeSession(root: string, id: string): Promise<string> {
+  const file = join(root, `${id}.jsonl`);
+  await writeFile(file, JSON.stringify({ type: "session", version: 3, id, cwd: root }) + "\n");
+  return file;
+}
+
 async function createInheritedPipeFixture(): Promise<InheritedPipeFixture> {
   const root = await mkdtemp(join(tmpdir(), "pi-child-teardown-"));
   const workerPath = join(root, "worker.cjs");
@@ -86,10 +92,10 @@ async function createBackgroundWaitFixture(mode: "root-exits" | "interruptible" 
   ].join("\n");
   const initialSettlement = mode === "abort-ignored" ? "" : "ack(1);out({type:'agent_end'});";
   const stateHandler = mode === "interruptible"
-    ? "else if(command.type==='get_state'){const isStreaming=stateRequests++>0&&!abortRequested;out({type:'response',id:command.id,command:'get_state',success:true,data:{isStreaming,pendingMessageCount:0}});}"
+    ? "else if(command.type==='get_state'){const isStreaming=prompted&&stateRequests++>0&&!abortRequested;out({type:'response',id:command.id,command:'get_state',success:true,data:{sessionId:settlementSession,sessionFile:path.join(process.cwd(),settlementSession+'.jsonl'),isStreaming,pendingMessageCount:0}});}"
     : mode === "root-exits"
-      ? "else if(command.type==='get_state'){out({type:'response',id:command.id,command:'get_state',success:true,data:{isStreaming:false,pendingMessageCount:0}});setTimeout(()=>process.exit(0),100);}"
-      : "else if(command.type==='get_state'){out({type:'response',id:command.id,command:'get_state',success:true,data:{isStreaming:false,pendingMessageCount:0}});}";
+      ? "else if(command.type==='get_state'){out({type:'response',id:command.id,command:'get_state',success:true,data:{sessionId:settlementSession,sessionFile:path.join(process.cwd(),settlementSession+'.jsonl'),isStreaming:false,pendingMessageCount:0}});if(prompted)setTimeout(()=>process.exit(0),100);}"
+      : "else if(command.type==='get_state'){out({type:'response',id:command.id,command:'get_state',success:true,data:{sessionId:settlementSession,sessionFile:path.join(process.cwd(),settlementSession+'.jsonl'),isStreaming:false,pendingMessageCount:0}});}";
   const abortHandler = mode === "interruptible"
     ? "else if(command.type==='abort'){abortRequested=true;out({type:'response',id:command.id,command:'abort',success:true});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'interrupted background turn'}]}});out({type:'turn_end'});ack(2);out({type:'agent_end'});}"
     : mode === "abort-ignored"
@@ -105,8 +111,8 @@ async function createBackgroundWaitFixture(mode: "root-exits" | "interruptible" 
     "const out=(value)=>process.stdout.write(JSON.stringify(value)+'\\n');",
     "let holderReady=false;let input='';process.stdin.setEncoding('utf8');",
     "const ack=(settlement)=>{const pid=process.pid;const version=2;const oneShot=crypto.createHmac('sha256',settlementSecret).update('pi-review-gate-live-browser-settlement-key:v2:'+settlement).digest();const mac=crypto.createHmac('sha256',oneShot).update(JSON.stringify([version,settlementSession,settlementChild,settlement,pid])).digest('base64url');const receipt={version,sessionId:settlementSession,childId:settlementChild,settlement,pid,mac};fs.mkdirSync(path.dirname(settlementPath),{recursive:true,mode:0o700});const temporary=settlementPath+'.tmp.'+crypto.randomUUID();fs.writeFileSync(temporary,JSON.stringify(receipt)+'\\n',{mode:0o600});fs.renameSync(temporary,settlementPath);};",
-    "let stateRequests=0;let abortRequested=false;",
-    `const handle=(command)=>{if(command.type==='prompt'){out({type:'response',id:command.id,command:'prompt',success:true});out({type:'tool_execution_end',toolName:'ShellStart',result:{content:[{type:'text',text:'Started '+String.fromCharCode(34)+'owned background'+String.fromCharCode(34)+' as job1 (pid '+background.pid+').'}]},isError:false});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'authenticated background result'}]}});out({type:'turn_end'});${initialSettlement}}${stateHandler}${abortHandler}else if(command.type==='get_last_assistant_text'){fs.writeFileSync(${JSON.stringify(finalTextRequestPath)},'requested');}};`,
+    "let stateRequests=0;let abortRequested=false;let prompted=false;",
+    `const handle=(command)=>{if(command.type==='prompt'){prompted=true;out({type:'response',id:command.id,command:'prompt',success:true});out({type:'tool_execution_end',toolName:'ShellStart',result:{content:[{type:'text',text:'Started '+String.fromCharCode(34)+'owned background'+String.fromCharCode(34)+' as job1 (pid '+background.pid+').'}]},isError:false});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'authenticated background result'}]}});out({type:'turn_end'});${initialSettlement}}${stateHandler}${abortHandler}else if(command.type==='get_last_assistant_text'){fs.writeFileSync(${JSON.stringify(finalTextRequestPath)},'requested');}};`,
     "const consume=()=>{if(!holderReady)return;for(;;){const newline=input.indexOf('\\n');if(newline<0)break;const raw=input.slice(0,newline);input=input.slice(newline+1);if(raw.trim())handle(JSON.parse(raw));}};",
     // The worker is the sole publisher of its own PID and ready markers: it
     // writes its PID, then the ready marker, then signals over IPC. Rewriting
@@ -261,8 +267,8 @@ function nativeWindowsPiFixtureSources(root: string, mode: NativeWindowsPiMode):
       `const holder=spawn(process.execPath,[${JSON.stringify(workerPath)},${JSON.stringify(workerPidPath)},${JSON.stringify(readyPath)},${JSON.stringify(stopPath)},${JSON.stringify(stoppedPath)}],${inheritedPipeHolderOptions});`,
       backgroundRunner,
       "const ack=()=>{const settlement=1;const pid=process.pid;const version=2;const oneShot=crypto.createHmac('sha256',settlementSecret).update('pi-review-gate-live-browser-settlement-key:v2:'+settlement).digest();const mac=crypto.createHmac('sha256',oneShot).update(JSON.stringify([version,settlementSession,settlementChild,settlement,pid])).digest('base64url');const receipt={version,sessionId:settlementSession,childId:settlementChild,settlement,pid,mac};fs.mkdirSync(path.dirname(settlementPath),{recursive:true,mode:0o700});const temporary=settlementPath+'.tmp.'+crypto.randomUUID();fs.writeFileSync(temporary,JSON.stringify(receipt)+'\\n',{mode:0o600});fs.renameSync(temporary,settlementPath);};",
-      "const out=(value)=>process.stdout.write(JSON.stringify(value)+'\\n');let input='';process.stdin.setEncoding('utf8');",
-      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const newline=input.indexOf('\\n');if(newline<0)break;const raw=input.slice(0,newline);input=input.slice(newline+1);if(!raw.trim())continue;const command=JSON.parse(raw);if(command.type==='prompt'){out({type:'response',id:command.id,command:'prompt',success:true});" + backgroundResult + "out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'native Windows teardown fixture'}]}});out({type:'turn_end'});ack();out({type:'agent_end'});}else if(command.type==='get_state'){out({type:'response',id:command.id,command:'get_state',success:true,data:{isStreaming:false,pendingMessageCount:0}});setTimeout(()=>process.exit(0),50);}}});",
+      "const out=(value)=>process.stdout.write(JSON.stringify(value)+'\\n');let input='';let prompted=false;process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const newline=input.indexOf('\\n');if(newline<0)break;const raw=input.slice(0,newline);input=input.slice(newline+1);if(!raw.trim())continue;const command=JSON.parse(raw);if(command.type==='prompt'){prompted=true;out({type:'response',id:command.id,command:'prompt',success:true});" + backgroundResult + "out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'native Windows teardown fixture'}]}});out({type:'turn_end'});ack();out({type:'agent_end'});}else if(command.type==='get_state'){out({type:'response',id:command.id,command:'get_state',success:true,data:{sessionId:settlementSession,sessionFile:path.join(process.cwd(),settlementSession+'.jsonl'),isStreaming:false,pendingMessageCount:0}});if(prompted)setTimeout(()=>process.exit(0),50);}}});",
     ];
   } else {
     entryLines = [
@@ -1007,7 +1013,7 @@ test("compaction recovery bounds cleanup after root exit and rejects unconfirmed
     prompt: "resume after compaction",
     artifactDir,
     turn: 2,
-    session: { adapter: "pi-model", id: "teardown-test-session" },
+    session: { adapter: "pi-model", id: "teardown-test-session", file: await recordedNativeSession(fixture.root, "teardown-test-session") },
     recovery: { kind: "compaction", compactBeforePrompt: true },
     executorToolCatalog: { allowedToolCatalog: ["read"], initialActiveTools: ["read"] },
     onProcessStart: ({ pid }) => { rootPid = pid; },
@@ -1406,7 +1412,7 @@ test("native Windows compaction recovery rejects uncertain cleanup after its CMD
     prompt: "resume after native Windows compaction recovery",
     artifactDir: join(fixture.root, "artifacts"),
     turn: 5,
-    session: { adapter: "pi-model", id: "native-cmd-teardown-session" },
+    session: { adapter: "pi-model", id: "native-cmd-teardown-session", file: await recordedNativeSession(fixture.root, "native-cmd-teardown-session") },
     recovery: { kind: "compaction", compactBeforePrompt: true },
     executorToolCatalog: { allowedToolCatalog: ["read"], initialActiveTools: ["read"] },
     onProcessStart: ({ pid }) => {

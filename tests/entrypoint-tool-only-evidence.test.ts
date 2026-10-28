@@ -1820,7 +1820,7 @@ test("execution controller notices are bound to the native warning UI target, ne
     await f.commands.get("subtasks")!("", {});
     assert.match(f.warnings.at(-1) ?? "", /^review gate subtasks/);
     // After a settings apply the target is that settings UI context.
-    await f.settings(["Bundle retention", undefined, undefined]);
+    await f.settings(["Retention", undefined, undefined]);
     const before = f.warnings.length;
     await f.commands.get("subtasks")!("", {});
     assert.equal(f.warnings.length, before + 1);

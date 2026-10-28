@@ -603,9 +603,23 @@ const REVIEW_JSON_TEXT = JSON.stringify({
   error: null,
 });
 
+function nativeSessionFixture(captureFile: string): string[] {
+  return [
+    "const nativePath=require('node:path');const nativeArgs=process.argv.slice(2);",
+    "const resumedFile=nativeArgs.includes('--session')?nativeArgs[nativeArgs.indexOf('--session')+1]:undefined;",
+    "const sessionId=resumedFile?nativePath.basename(resumedFile,'.jsonl'):nativeArgs[nativeArgs.indexOf('--session-id')+1];",
+    `const sessionFile=resumedFile??nativePath.join(${JSON.stringify(dirname(captureFile))},'native',sessionId+'.jsonl');`,
+    "fs.mkdirSync(nativePath.dirname(sessionFile),{recursive:true});",
+    "if(!fs.existsSync(sessionFile))fs.writeFileSync(sessionFile,JSON.stringify({type:'session',version:3,id:sessionId,cwd:process.cwd()})+'\\n');",
+    "const receipt=process.env.PI_REVIEW_GATE_REVIEWER_SESSION_RECEIPT;",
+    "if(receipt)fs.writeFileSync(receipt,JSON.stringify({sessionId,sessionFile}));",
+  ];
+}
+
 function reviewerEntryBody(captureFile: string): string[] {
   return [
     "const fs=require('node:fs');",
+    ...nativeSessionFixture(captureFile),
     "let input='';process.stdin.setEncoding('utf8');",
     "process.stdin.on('data',chunk=>{input+=chunk;});",
     "process.stdin.on('end',()=>{",
@@ -650,7 +664,8 @@ test("Pi reviewer launches the default pi child alias-independently (real shim +
     // Reviewer read-only flags stay exactly as configured.
     assert.ok(argv.includes("--no-extensions"));
     assert.equal(argv[argv.indexOf("--tools") + 1], "read,grep,find,ls");
-    assert.ok(!argv.includes("--extension"), "the reviewer keeps no implicit extension");
+    assert.equal(argv.filter((arg) => arg === "--extension").length, 1);
+    assert.ok(argv[argv.indexOf("--extension") + 1].endsWith("session-ref-reporter.js"), "only the explicit metadata companion is loaded");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -690,14 +705,14 @@ test("Pi reviewer translates a missing default pi CLI into the actionable diagno
 function rpcEntryBody(captureFile: string): string[] {
   return [
     "const fs=require('node:fs');",
+    ...nativeSessionFixture(captureFile),
     ...fakePiSettlementReceipt,
     `fs.appendFileSync(${JSON.stringify(captureFile)}, JSON.stringify({ argv: process.argv.slice(2), pid: process.pid })+'\\n');`,
     "let input='';process.stdin.setEncoding('utf8');",
     "const out=(v)=>console.log(JSON.stringify(v));",
-    "const sessionId=process.argv[process.argv.indexOf('--session-id')+1];",
     "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
     "if(c.type==='prompt'){out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'research complete'}]}});out({type:'turn_end'});ack();out({type:'agent_end'});}",
-    "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{sessionId,isStreaming:false,pendingMessageCount:0}});",
+    "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{sessionId,sessionFile,isStreaming:false,pendingMessageCount:0}});" ,
     "else if(c.type==='compact')out({type:'response',id:c.id,command:c.type,success:true,data:{summary:'compacted'}});",
     "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'research complete'}});",
     "}});",
@@ -826,6 +841,9 @@ test("executor compaction recovery launches the default pi child through the sam
   try {
     const artifactDir = join(fixture.root, "artifacts");
     await mkdir(artifactDir);
+    const sessionFile = join(fixture.root, "native", "durable-session-1.jsonl");
+    await mkdir(dirname(sessionFile), { recursive: true });
+    await writeFile(sessionFile, JSON.stringify({ type: "session", version: 3, id: "durable-session-1", cwd: fixture.root }) + "\n");
     await withPrependedPath(fixture.bin, async () => {
       const adapter = new PiExecutorAdapter({ model: "provider/model", timeoutMs: 60_000, settlementTimeoutMs: 15_000 });
       const result = await adapter.run({
@@ -833,7 +851,7 @@ test("executor compaction recovery launches the default pi child through the sam
         prompt: "continue after compaction",
         artifactDir,
         turn: 2,
-        session: { adapter: "pi-model", id: "durable-session-1" },
+        session: { adapter: "pi-model", id: "durable-session-1", file: sessionFile },
         recovery: { kind: "compaction", compactBeforePrompt: true },
         executorToolCatalog,
       });
@@ -847,7 +865,8 @@ test("executor compaction recovery launches the default pi child through the sam
     assert.equal(launches.length, 2, "compaction recovery must launch its own real child before the resumed turn");
     for (const launch of launches) {
       const argv = launch.argv as string[];
-      assert.equal(argv[argv.indexOf("--session-id") + 1], "durable-session-1", "both children reopen the durable session");
+      assert.ok(!argv.includes("--session-id"));
+      assert.ok(argv[argv.indexOf("--session") + 1].endsWith("durable-session-1.jsonl"), "both children reopen the exact durable file");
       assert.equal(argv[argv.indexOf("--mode") + 1], "rpc");
     }
   } finally {

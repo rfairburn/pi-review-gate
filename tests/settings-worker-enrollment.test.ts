@@ -559,7 +559,7 @@ const ROOT_SETTING_LABELS = [
   "Reviewers",
   "Timeouts",
   "Review policy",
-  "Bundle retention",
+  "Retention",
   "Global concurrency",
   "Retry policy",
   "Subtask notifications",

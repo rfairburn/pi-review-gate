@@ -27,6 +27,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ScheduledTaskReviewOverride } from "../config";
 import { atomicWrite } from "./durable-write";
+import { deleteRecordedNativeSessions, nothingCleaned, type NativeSessionCleanup } from "./native-session-refs";
 import { normalizeWorkerReviewEvidencePolicy, workerReviewEvidenceScope } from "./review-evidence-policy";
 import {
   clipActivity,
@@ -632,16 +633,28 @@ export async function readTaskArchiveIndex(
   return parsed;
 }
 
-export async function removeOwnedWaveRoot(root: string): Promise<void> {
+/**
+ * Remove one wave root only after the existing ownership guard accepts it.
+ * Opt-in (#533): when `deleteNativeSessions` is on, the sessions this root
+ * recorded are unlinked after the guard passes and before the root is removed,
+ * so a refused foreign root can never delete sessions outside itself.
+ */
+export async function removeOwnedWaveRoot(root: string, deleteNativeSessions = false): Promise<NativeSessionCleanup> {
   const resolved = resolve(root);
   const temporaryRoot = await realpath(resolve(tmpdir()));
   if (!basename(resolved).startsWith("wave-") || dirname(resolved) !== temporaryRoot) {
     throw new Error(`Refusing to remove unrecognized wave root: ${resolved}`);
   }
+  const cleanup = deleteNativeSessions ? await deleteRecordedNativeSessions(resolved) : nothingCleaned();
   await rm(resolved, { recursive: true, force: true });
+  return cleanup;
 }
 
-export async function removeOwnedExecutionRoot(root: string, tempBase?: string): Promise<void> {
+export async function removeOwnedExecutionRoot(
+  root: string,
+  tempBase?: string,
+  deleteNativeSessions = false,
+): Promise<NativeSessionCleanup> {
   const resolved = await realpath(resolve(root)).catch(() => resolve(root));
   const temporaryRoot = await realpath(resolve(tmpdir()));
   const resolvedBase = dirname(resolved);
@@ -655,5 +668,7 @@ export async function removeOwnedExecutionRoot(root: string, tempBase?: string):
     || (resolvedBase !== temporaryRoot && (allowedBase === undefined || resolvedBase !== allowedBase))) {
     throw new Error(`Refusing to remove unrecognized execution root: ${resolved}`);
   }
+  const cleanup = deleteNativeSessions ? await deleteRecordedNativeSessions(resolved) : nothingCleaned();
   await rm(resolved, { recursive: true, force: true });
+  return cleanup;
 }

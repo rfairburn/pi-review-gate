@@ -39,6 +39,7 @@ import { assertScheduledImagesPresent, managedScheduledImageRoot } from "./setti
 import { registerStreamFailureReporting } from "./stream-failure-report";
 import { ExecutionToolManager } from "./execution/tool";
 import { acknowledgeOwnerRetiringSave } from "./execution/background-controller";
+import { deleteRecordedNativeSessions } from "./execution/native-session-refs";
 import { NativeToolCallPreflight } from "./tool-call-preflight";
 import { queueModelDelivery } from "./durable-delivery";
 import { replaceReviewGateState, sessionPersistenceIdentity, SessionStateCwdMismatchError, SessionStateStore } from "./session-state";
@@ -657,7 +658,11 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     orchestratorTurnTracker.resetSession();
     await executionTools.shutdown();
     await webTools?.cleanup();
-    await cleanupReviewBundles(state);
+    await cleanupReviewBundles(
+      state,
+      config.deleteSpawnedPiSessionsOnCleanup === true,
+      (message) => void sendNotice(pi, message),
+    );
     await reviewTurn.drainEvidenceCaptures();
     await sessionPersistence.persist(true);
     await sessionPersistence.drain();
@@ -1368,12 +1373,27 @@ export default activate;
 module.exports = activate;
 Object.assign(module.exports as Record<string, unknown>, { activate });
 
-async function cleanupReviewBundles(state: ReviewGateState): Promise<void> {
+async function cleanupReviewBundles(
+  state: ReviewGateState,
+  deleteNativeSessions = false,
+  notice?: (message: string) => void,
+): Promise<void> {
   const windows = [state.reviewWindow, state.lastQuestionWindow].filter((window) => window !== undefined);
   const directories = [...new Set([
     ...state.ownedBundleDirs,
     ...windows.map((window) => window.bundleDir).filter((value): value is string => Boolean(value)),
   ])];
+  if (deleteNativeSessions) {
+    // A retained bundle is the last durable record of its reviewer passes, so
+    // removing it is this session's own cleanup point for those sessions
+    // (#533, opt-in). Refusals are disclosed rather than dropped with the ref.
+    for (const directory of directories) {
+      const cleanup = await deleteRecordedNativeSessions(directory);
+      if (cleanup.refused.length > 0) {
+        notice?.(`review gate: ${cleanup.refused.length} spawned Pi session(s) were retained, not deleted: ${cleanup.refused.join("; ")}`);
+      }
+    }
+  }
   await Promise.all(directories.map((directory) => removeReviewBundle(directory)));
   state.ownedBundleDirs.clear();
   for (const window of windows) {

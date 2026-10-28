@@ -581,6 +581,12 @@ export interface ReviewGateConfig {
   /** Age after which completed, non-recovery wave roots may be garbage-collected. Zero disables GC. */
   waveArtifactTtlMs?: number;
   retainBundles: RetainBundles;
+  /**
+   * Delete the native Pi sessions this extension spawned when the artifact root
+   * or review pass that recorded them is already being cleaned up. Off (the
+   * default) retains every spawned session in Pi's own store.
+   */
+  deleteSpawnedPiSessionsOnCleanup?: boolean;
   review?: ReviewSelectionConfig;
   externalAgents?: ExternalAgentCatalog;
   execution?: ExecutionConfig;
@@ -615,6 +621,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   maxSnapshotBytes: 52_428_800,
   waveArtifactTtlMs: 30 * 24 * 60 * 60 * 1000,
   retainBundles: "on-failure",
+  deleteSpawnedPiSessionsOnCleanup: false,
   youShouldKnow: { enabled: true, completionGuidance: true },
   web: {
     enabled: true,
@@ -797,6 +804,7 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
       "waveArtifactTtlMs",
     ),
     retainBundles: normalizeRetainBundles(value.retainBundles),
+    deleteSpawnedPiSessionsOnCleanup: normalizeDeleteSpawnedPiSessions(value.deleteSpawnedPiSessionsOnCleanup),
     review: value.review === undefined ? undefined : normalizeReviewSelection(value.review),
     externalAgents: value.externalAgents === undefined ? undefined : normalizeExternalAgents(value.externalAgents),
     execution: value.execution === undefined ? undefined : normalizeExecution(value.execution),
@@ -2155,6 +2163,12 @@ function normalizeRetainBundles(value: unknown): RetainBundles {
   if (value === undefined) return DEFAULT_CONFIG.retainBundles;
   if (value === "never" || value === "always" || value === "on-failure") return value;
   throw new Error("retainBundles must be one of: never, on-failure, always");
+}
+
+function normalizeDeleteSpawnedPiSessions(value: unknown): boolean {
+  if (value === undefined) return DEFAULT_CONFIG.deleteSpawnedPiSessionsOnCleanup === true;
+  if (typeof value === "boolean") return value;
+  throw new Error("deleteSpawnedPiSessionsOnCleanup must be a boolean");
 }
 
 function normalizeOptionalThinkingLevel(value: unknown, field: string): ThinkingLevel | undefined {

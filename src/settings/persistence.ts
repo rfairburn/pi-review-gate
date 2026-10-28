@@ -68,6 +68,8 @@ export interface ReviewSettingsSelection {
   maxCorrectionCycles: number;
   implementationGuidanceAfterCorrectionAttempts: number;
   retainBundles: RetainBundles;
+  /** Opt-in deletion of the native Pi sessions this extension spawned. */
+  deleteSpawnedPiSessionsOnCleanup?: boolean;
   maxWorkers: number;
   retryPolicy: ExecutionRetryPolicy;
   subtaskNotifications: SubtaskNotificationMode;
@@ -193,6 +195,9 @@ function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: 
   parsed.maxCorrectionCycles = selection.maxCorrectionCycles;
   parsed.implementationGuidanceAfterCorrectionAttempts = selection.implementationGuidanceAfterCorrectionAttempts;
   parsed.retainBundles = selection.retainBundles;
+  if (selection.deleteSpawnedPiSessionsOnCleanup !== undefined) {
+    parsed.deleteSpawnedPiSessionsOnCleanup = selection.deleteSpawnedPiSessionsOnCleanup;
+  }
   const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
   ui.subtasksViewExpanded = selection.subtasksViewExpanded;
   parsed.ui = ui;

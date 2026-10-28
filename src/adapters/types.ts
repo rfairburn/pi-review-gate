@@ -16,6 +16,8 @@ export interface ModelAdapterRequest {
 export interface ReviewerSession {
   adapter: string;
   id: string;
+  /** Native Pi file reported by this fresh reviewer. */
+  file?: string;
 }
 
 export interface ModelAdapter {

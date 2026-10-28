@@ -184,8 +184,13 @@ test("evidence selector failures are concise and task-scoped; no unrelated execu
   // Target group: one task with real evidence artifacts.
   const waveRoot = join(base, "wave-target");
   const artifactDir = join(waveRoot, "artifacts", "task-target61");
-  await mkdir(join(artifactDir, "executor-sessions"), { recursive: true });
-  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(...piSessionEntries()));
+  // Pi keeps a spawned session in its own store, outside the artifact root;
+  // the per-turn record is the only reference to it (#533).
+  const sessionFile = join(base, "native-pi-store", `${SESSION_ID}.jsonl`);
+  await mkdir(join(base, "native-pi-store"), { recursive: true });
+  await mkdir(join(artifactDir, "executor", "0001"), { recursive: true });
+  await writeFile(join(artifactDir, "executor", "0001", "process-result.json"), JSON.stringify({ adapter: "pi-model", code: 0, sessionId: SESSION_ID, sessionFile }));
+  await writeFile(sessionFile, jsonlLines(...piSessionEntries()));
 
   const specs: GroupSpec[] = [
     {
@@ -247,8 +252,13 @@ test("adjacent selector failures (callId, cursor, range) are scoped the same way
   await mkdir(sourceRoot, { recursive: true });
   const waveRoot = join(base, "wave-target");
   const artifactDir = join(waveRoot, "artifacts", "task-target61");
-  await mkdir(join(artifactDir, "executor-sessions"), { recursive: true });
-  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(...piSessionEntries()));
+  // Pi keeps a spawned session in its own store, outside the artifact root;
+  // the per-turn record is the only reference to it (#533).
+  const sessionFile = join(base, "native-pi-store", `${SESSION_ID}.jsonl`);
+  await mkdir(join(base, "native-pi-store"), { recursive: true });
+  await mkdir(join(artifactDir, "executor", "0001"), { recursive: true });
+  await writeFile(join(artifactDir, "executor", "0001", "process-result.json"), JSON.stringify({ adapter: "pi-model", code: 0, sessionId: SESSION_ID, sessionFile }));
+  await writeFile(sessionFile, jsonlLines(...piSessionEntries()));
   const specs: GroupSpec[] = [
     { executionId: "exec-target61", tasks: [{ taskId: "task-target61", state: "failed", title: "target task with evidence", waveRoot }] },
     { executionId: "exec-unrelated-a61", tasks: [{ taskId: "task-interrupted-a1", state: "interrupted", title: "UNRELATED-INTERRUPTED-TITLE-A" }] },
@@ -293,8 +303,13 @@ test("a correct entryId deep read still succeeds and an invalid read does not mu
   await mkdir(sourceRoot, { recursive: true });
   const waveRoot = join(base, "wave-target");
   const artifactDir = join(waveRoot, "artifacts", "task-target61");
-  await mkdir(join(artifactDir, "executor-sessions"), { recursive: true });
-  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(...piSessionEntries()));
+  // Pi keeps a spawned session in its own store, outside the artifact root;
+  // the per-turn record is the only reference to it (#533).
+  const sessionFile = join(base, "native-pi-store", `${SESSION_ID}.jsonl`);
+  await mkdir(join(base, "native-pi-store"), { recursive: true });
+  await mkdir(join(artifactDir, "executor", "0001"), { recursive: true });
+  await writeFile(join(artifactDir, "executor", "0001", "process-result.json"), JSON.stringify({ adapter: "pi-model", code: 0, sessionId: SESSION_ID, sessionFile }));
+  await writeFile(sessionFile, jsonlLines(...piSessionEntries()));
   const specs: GroupSpec[] = [
     { executionId: "exec-target61", tasks: [{ taskId: "task-target61", state: "failed", title: "target task with evidence", waveRoot }] },
     { executionId: "exec-unrelated-a61", tasks: [{ taskId: "task-interrupted-a1", state: "interrupted", title: "UNRELATED-INTERRUPTED-TITLE-A" }] },
@@ -343,8 +358,13 @@ test("genuine failures (unknown task/execution) keep their full group diagnostic
   await mkdir(sourceRoot, { recursive: true });
   const waveRoot = join(base, "wave-target");
   const artifactDir = join(waveRoot, "artifacts", "task-target61");
-  await mkdir(join(artifactDir, "executor-sessions"), { recursive: true });
-  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(...piSessionEntries()));
+  // Pi keeps a spawned session in its own store, outside the artifact root;
+  // the per-turn record is the only reference to it (#533).
+  const sessionFile = join(base, "native-pi-store", `${SESSION_ID}.jsonl`);
+  await mkdir(join(base, "native-pi-store"), { recursive: true });
+  await mkdir(join(artifactDir, "executor", "0001"), { recursive: true });
+  await writeFile(join(artifactDir, "executor", "0001", "process-result.json"), JSON.stringify({ adapter: "pi-model", code: 0, sessionId: SESSION_ID, sessionFile }));
+  await writeFile(sessionFile, jsonlLines(...piSessionEntries()));
   const specs: GroupSpec[] = [
     { executionId: "exec-target61", tasks: [{ taskId: "task-target61", state: "failed", title: "target task with evidence", waveRoot }] },
     { executionId: "exec-unrelated-a61", tasks: [{ taskId: "task-interrupted-a1", state: "interrupted", title: "UNRELATED-INTERRUPTED-TITLE-A" }] },
@@ -376,8 +396,10 @@ test("a source change around recovery cannot surface a selector error after the 
   await mkdir(sourceRoot, { recursive: true });
   const waveRoot = join(base, "wave-target");
   const artifactDir = join(waveRoot, "artifacts", "task-target61");
-  await mkdir(join(artifactDir, "executor-sessions"), { recursive: true });
-  const sessionFile = join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`);
+  const sessionFile = join(base, "native-pi-store", `${SESSION_ID}.jsonl`);
+  await mkdir(join(base, "native-pi-store"), { recursive: true });
+  await mkdir(join(artifactDir, "executor", "0001"), { recursive: true });
+  await writeFile(join(artifactDir, "executor", "0001", "process-result.json"), JSON.stringify({ adapter: "pi-model", code: 0, sessionId: SESSION_ID, sessionFile }));
   await writeFile(sessionFile, jsonlLines(...piSessionEntries()));
   // `failed` + waveRoot with no operation record: every inspection runs the
   // checkpoint-backfill recovery path (refused here) and durably saves the
@@ -433,9 +455,10 @@ test("a source change around recovery cannot surface a selector error after the 
     assert.ok(!replacementArmed, "the controlled replacement must have fired between preflight and recovery");
 
     // The returned read is exactly the validated one: it still carries the
-    // pre-replacement snapshot (3 entries), not the replaced source's 1 entry.
+    // pre-replacement snapshot (session records plus the turn's own process
+    // outcome), not the replaced source's 1 entry.
     const summary = continued.details.evidence.snapshot;
-    assert.equal(summary.totalEntries, 3, "the returned read must be the validated pre-replacement snapshot");
+    assert.equal(summary.totalEntries, 4, "the returned read must be the validated pre-replacement snapshot");
     const sessionSource = summary.sources.find((source: { sourceId: string }) => source.sourceId.startsWith("session:"));
     assert.ok(sessionSource && sessionSource.records === 3, "the validated snapshot's session source is unchanged in the response");
 
@@ -454,7 +477,8 @@ test("a source change around recovery cannot surface a selector error after the 
     // Nothing is cached or hidden: the follow-up read observes the replaced source.
     const after = await execute("window-after", { executionId: "exec-target61", taskId: "task-target61", evidence: { index: 0, limit: 50 } });
     assert.equal(after.isError, false);
-    assert.equal(after.details.evidence.snapshot.totalEntries, 1, "the follow-up read reflects the replaced source");
+    // The replaced session plus this turn's own process outcome.
+    assert.equal(after.details.evidence.snapshot.totalEntries, 2, "the follow-up read reflects the replaced source");
   } finally {
     await manager.shutdown();
     await rm(base, { recursive: true, force: true });

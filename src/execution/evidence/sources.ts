@@ -2,18 +2,18 @@
  * Evidence source discovery and indexing (#33).
  *
  * Sources are derived exclusively from the task's durable artifact directory
- * (never from caller-supplied paths): Pi session files under
- * `executor-sessions/`, per-turn directories under `executor/NNNN/`, durable
- * completed review cycle records and publication-failure markers (see
+ * (never from caller-supplied paths): per-turn directories under
+ * `executor/NNNN/`, durable completed review cycle records and
+ * publication-failure markers (see
  * `./review-cycles.ts`), and the durable review report. Pi turns are indexed
- * from their session file as the
- * single source of truth; a pi turn whose session file is missing falls back
+ * from the native Pi session file recorded for that turn as the
+ * single source of truth; a pi turn whose session history is unavailable falls back
  * to its RPC stdout stream explicitly (never both, so no evidence is
  * double-counted). Unknown adapter shapes are reported unavailable — never
  * dumped raw.
  */
-import { opendir, realpath, stat } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { lstat, opendir, realpath, stat } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { OperationRecord } from "../operation-record";
 import { EvidenceRefusalError, capped, evidenceErrorMessage, finalizeSource, omittedNote, readBoundedJson, resolveReadableArtifact, resolveReadableDirectory, sha256HexOf, streamJsonlBounded } from "./artifacts";
 import { REVIEW_CYCLE_MARKER_NAME, REVIEW_CYCLE_RECORD_NAME, indexReviewCycleSource, indexReviewCycleUnpublishedSource } from "./review-cycles";
@@ -21,6 +21,8 @@ import { readBoundedTextFile } from "../../bounded-file";
 import { utf8Prefix } from "../../jsonl";
 import { redactSensitiveText } from "../../redaction";
 import { compactJson, isRecord, parseBinaryStreamLines, parseClaudeStreamLines, parseCodexStreamLines, parsePiSessionLines, parsePiStdoutLines, piSessionRecordOrdinals, streamRecordOrdinals } from "./parsers";
+import { isValidNativeSessionFile } from "../../session-host/protocol";
+import { readSavedSessionHeader } from "../../session-host/saved-sessions";
 import {
   EVIDENCE_ENTRY_CONTENT_BYTES,
   EVIDENCE_MAX_ENTRIES,
@@ -68,11 +70,13 @@ export function sourceUnavailable(sourceId: string, streamed: { tornTail: boolea
   return out;
 }
 
-async function indexSessionSource(artifactRoot: string, fileName: string, mtimeMs: number, budget: RawRetentionBudget): Promise<IndexedSource | undefined> {
-  const sourceId = `session:${fileName}`;
-  const file = join("executor-sessions", fileName);
-  const path = await resolveReadableArtifact(artifactRoot, join(artifactRoot, file));
-  if (!path) return undefined;
+/**
+ * Indexes one verified native Pi session file. `path` is the location this
+ * task's own durable per-turn record reported (identity-checked by the caller,
+ * outside the artifact root by design); `file` is the bounded display name, so
+ * the user's store location never enters an evidence view.
+ */
+async function indexSessionSource(sourceId: string, path: string, file: string, mtimeMs: number, budget: RawRetentionBudget): Promise<IndexedSource> {
   const streamed = await streamJsonlBounded(path, EVIDENCE_MAX_ENTRIES, { budget });
   const parsed = parsePiSessionLines(streamed.lines);
   const digests = new Map<string, string>();
@@ -90,6 +94,54 @@ async function indexSessionSource(artifactRoot: string, fileName: string, mtimeM
     unavailable: [...sourceUnavailable(sourceId, streamed), ...omittedNote(sourceId, streamed.recordsOmitted)],
     stats: { recordsScanned: streamed.lines.length, oversizedRecords: streamed.oversizedRecords, skippedRecords: parsed.skippedRecords, ...(streamed.recordsOmitted > 0 ? { recordsOmitted: streamed.recordsOmitted } : {}), ...(streamed.budgetOmitted > 0 ? { budgetOmitted: streamed.budgetOmitted } : {}) },
   });
+}
+
+/** Index only recorded worker files, with bounded header checks and explicit stdout fallback. */
+async function indexNativeSessionSources(
+  artifactRoot: string,
+  turnNames: readonly string[],
+  unavailable: SubtaskEvidenceUnavailable[],
+  budget: RawRetentionBudget,
+): Promise<{ sources: IndexedSource[]; turnsWithSession: Set<string> }> {
+  const sources: IndexedSource[] = [];
+  const turnsWithSession = new Set<string>();
+  const seenPaths = new Set<string>();
+  for (const turnName of turnNames) {
+    let sourceId = `session:${turnName}`;
+    try {
+      const real = await resolveReadableArtifact(artifactRoot, join(artifactRoot, "executor", turnName, "process-result.json"));
+      const record = real ? await readBoundedJson(real, 64 * 1024) : undefined;
+      const file = str(record?.sessionFile);
+      if (record?.adapter !== "pi-model" || file === undefined) continue;
+      if (!isValidNativeSessionFile(file)) {
+        throw new EvidenceRefusalError("path_escape", "The recorded session path is not a bounded absolute path; it was not read.");
+      }
+      const name = basename(file);
+      sourceId = `session:${name}`;
+      if (sources.length >= EVIDENCE_MAX_SOURCES && !seenPaths.has(file)) {
+        unavailable.push({ source: sourceId, reason: "source_budget", detail: `Source limit ${EVIDENCE_MAX_SOURCES} reached; remaining sources are not indexed.` });
+        continue;
+      }
+      const info = await lstat(file);
+      if (!info.isFile()) {
+        throw new EvidenceRefusalError("non_regular_file", "The recorded session path is not a regular file; it was not read.");
+      }
+      const header = readSavedSessionHeader(file);
+      if (!header || header.id !== str(record.sessionId)) {
+        throw new EvidenceRefusalError("unreadable", "The recorded session identity does not verify; its history is unavailable and the turn falls back to the RPC stdout stream.");
+      }
+      const canonical = await realpath(file);
+      if (!seenPaths.has(canonical)) {
+        sources.push(await indexSessionSource(sourceId, file, name, info.mtimeMs, budget));
+        seenPaths.add(canonical);
+        seenPaths.add(file);
+      }
+      turnsWithSession.add(turnName);
+    } catch (error) {
+      unavailable.push({ source: sourceId, reason: error instanceof EvidenceRefusalError ? error.reason : "unreadable", detail: evidenceErrorMessage(error) });
+    }
+  }
+  return { sources, turnsWithSession };
 }
 
 /**
@@ -175,7 +227,7 @@ function resolveTurnAdapter(operation: OperationRecord | undefined, turnName: st
  * which later reassignments and failovers overwrite. It is producer-recorded
  * identity only; without it the stream stays explicitly unindexed (#69).
  */
-async function indexTurnSource(artifactRoot: string, turnName: string, mtimeMs: number, sessionFileNames: ReadonlySet<string>, budget: RawRetentionBudget, operation?: OperationRecord): Promise<IndexedSource> {
+async function indexTurnSource(artifactRoot: string, turnName: string, mtimeMs: number, sessionTurns: ReadonlySet<string>, budget: RawRetentionBudget, operation?: OperationRecord): Promise<IndexedSource> {
   const sourceId = `turn:${turnName}`;
   const dirRel = join("executor", turnName);
   const unavailable: SubtaskEvidenceUnavailable[] = [];
@@ -216,16 +268,15 @@ async function indexTurnSource(artifactRoot: string, turnName: string, mtimeMs: 
   };
 
   if (adapter === "pi-model") {
-    // Pi turns are indexed from their session file (single source of truth).
-    // When the session file is missing for this turn, fall back to the RPC
-    // stdout stream explicitly instead of double-counting both.
+    // Pi turns are indexed from their native session file (single source of
+    // truth). When that history is unavailable for this turn, fall back to the
+    // RPC stdout stream explicitly instead of double-counting both.
     const sessionId = str(processResult?.sessionId);
-    const hasSessionFile = sessionId !== undefined
-      && [...sessionFileNames].some((name) => name === `${sessionId}.jsonl` || name.endsWith(`_${sessionId}.jsonl`));
+    const hasSessionFile = sessionTurns.has(turnName);
     if (!hasSessionFile) {
       try {
         await indexStream(parsePiStdoutLines);
-        if (hasStream) unavailable.push({ source: sourceId, reason: "missing_stream", detail: `Session file for ${sessionId ?? "this turn"} not found; RPC stdout stream indexed as fallback.` });
+        if (hasStream) unavailable.push({ source: sourceId, reason: "missing_stream", detail: `Session history for ${sessionId ?? "this turn"} is unavailable; RPC stdout stream indexed as fallback.` });
       } catch (error) {
         if (error instanceof EvidenceRefusalError) unavailable.push({ source: sourceId, reason: error.reason, detail: evidenceErrorMessage(error) });
         else throw error;
@@ -432,32 +483,13 @@ async function enumerateNames(dir: string, dirLabel: string, pattern: (name: str
 export async function discoverAndIndexSources(taskId: string, artifactRoot: string, unavailable: SubtaskEvidenceUnavailable[], budget: RawRetentionBudget, operation?: OperationRecord): Promise<IndexedSource[]> {
   const sources: IndexedSource[] = [];
 
-  const sessionsDir = await resolveReadableDirectory(artifactRoot, join(artifactRoot, "executor-sessions"));
-  const sessionNames = sessionsDir
-    ? await enumerateNames(sessionsDir, "executor-sessions/", (name) => name.endsWith(".jsonl"), unavailable)
-    : [];
-
   const executorDir = await resolveReadableDirectory(artifactRoot, join(artifactRoot, "executor"));
   const turnNames = executorDir
     ? await enumerateNames(executorDir, "executor/", (name) => /^\d{4}$/.test(name), unavailable)
     : [];
 
-  const sessionSet = new Set(sessionNames);
-  for (const name of sessionNames) {
-    if (sources.length >= EVIDENCE_MAX_SOURCES) {
-      unavailable.push({ source: `session:${name}`, reason: "source_budget", detail: `Source limit ${EVIDENCE_MAX_SOURCES} reached; remaining sources are not indexed.` });
-      continue;
-    }
-    try {
-      const mtime = (await stat(join(sessionsDir!, name))).mtimeMs;
-      const source = await indexSessionSource(artifactRoot, name, mtime, budget);
-      if (source) sources.push(source);
-      else unavailable.push({ source: `session:${name}`, reason: "unreadable", detail: "Session file disappeared or is unreadable." });
-    } catch (error) {
-      if (error instanceof EvidenceRefusalError) unavailable.push({ source: `session:${name}`, reason: error.reason, detail: evidenceErrorMessage(error) });
-      else throw error;
-    }
-  }
+  const sessionSources = await indexNativeSessionSources(artifactRoot, turnNames, unavailable, budget);
+  sources.push(...sessionSources.sources);
   for (const name of turnNames) {
     if (sources.length >= EVIDENCE_MAX_SOURCES) {
       unavailable.push({ source: `turn:${name}`, reason: "source_budget", detail: `Source limit ${EVIDENCE_MAX_SOURCES} reached; remaining sources are not indexed.` });
@@ -465,7 +497,7 @@ export async function discoverAndIndexSources(taskId: string, artifactRoot: stri
     }
     try {
       const mtime = (await stat(join(executorDir!, name))).mtimeMs;
-      sources.push(await indexTurnSource(artifactRoot, name, mtime, sessionSet, budget, operation));
+      sources.push(await indexTurnSource(artifactRoot, name, mtime, sessionSources.turnsWithSession, budget, operation));
     } catch (error) {
       if (error instanceof EvidenceRefusalError) unavailable.push({ source: `turn:${name}`, reason: error.reason, detail: evidenceErrorMessage(error) });
       else throw error;

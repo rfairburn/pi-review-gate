@@ -114,6 +114,7 @@ import {
 import { notifyDispatchCards } from "./dispatch-cards";
 import type { ExecutorInteractionAcknowledgement, ExecutorLiveControl, SubtaskDispatchRecord } from "./types";
 import { readWaveCaptureRecord, waveCaptureEntryRejectionOf } from "./wave-repository";
+import { MAX_CLEANUP_REFUSALS } from "./native-session-refs";
 import { executeWaveLanding, planWaveLanding } from "./wave-landing";
 import { waveLineageOf } from "./wave-commits";
 import { pinCommit } from "./wave-worktrees";
@@ -3992,6 +3993,12 @@ export class BackgroundExecutionController {
   }
 
   async cleanupSettledArtifacts(): Promise<void> {
+    // Opt-in only: with the setting Off, every spawned native Pi session stays
+    // in Pi's own store. On, a session is deleted only as part of the existing
+    // removal of the artifact root that recorded it, and only after that root
+    // passed its existing ownership guard (a refused root deletes nothing).
+    const deleteNativeSessions = this.input.config.deleteSpawnedPiSessionsOnCleanup === true;
+    const nativeSessionRefusals: string[] = [];
     for (const [executionId, group] of [...this.groups]) {
       const settled = group.tasks.filter((task) => task.state === "landed" || task.state === "reported");
       for (const task of settled) {
@@ -4000,7 +4007,9 @@ export class BackgroundExecutionController {
         // path names — survive cleanup and restart. Truly resolved work is
         // cleaned exactly as before.
         const retain = salvageEvidenceRequiresRetention(task);
-        if (task.waveRoot && !retain) await removeOwnedWaveRoot(task.waveRoot);
+        if (task.waveRoot && !retain) {
+          nativeSessionRefusals.push(...(await removeOwnedWaveRoot(task.waveRoot, deleteNativeSessions)).refused);
+        }
         if (!retain) task.waveRoot = undefined;
         task.bundle = undefined;
         task.updatedAt = new Date().toISOString();
@@ -4028,7 +4037,10 @@ export class BackgroundExecutionController {
               archivedRetention = true;
               continue;
             }
-            if (archived.waveRoot) await removeOwnedWaveRoot(archived.waveRoot).catch(() => undefined);
+            if (archived.waveRoot) {
+              const cleanup = await removeOwnedWaveRoot(archived.waveRoot, deleteNativeSessions).catch(() => undefined);
+              if (cleanup) nativeSessionRefusals.push(...cleanup.refused);
+            }
           } catch {
             // Never act destructively on malformed, tampered, or foreign
             // archive contents. The execution root cleanup below remains
@@ -4037,7 +4049,7 @@ export class BackgroundExecutionController {
         }
       }
       if (settled.length === group.tasks.length && !archivedRetention) {
-        await removeOwnedExecutionRoot(group.root, group.tempBase);
+        nativeSessionRefusals.push(...(await removeOwnedExecutionRoot(group.root, group.tempBase, deleteNativeSessions)).refused);
         // Every task is terminal: release its owned-activity token before the
         // group bookkeeping is dropped so retirement cannot leave a stale
         // positive outstanding.
@@ -4067,6 +4079,22 @@ export class BackgroundExecutionController {
         }
       } else if (settled.length > 0) {
         await this.save(group);
+      }
+    }
+    // A session this cleanup could not verify stays in Pi's store along with
+    // the reason. Never a shutdown failure and never silent: the owning
+    // artifact records are about to be removed, so the notice is the only
+    // remaining trace that the session was deliberately retained.
+    if (nativeSessionRefusals.length > 0) {
+      const shown = nativeSessionRefusals.slice(0, MAX_CLEANUP_REFUSALS).join("; ");
+      const more = nativeSessionRefusals.length > MAX_CLEANUP_REFUSALS ? ` (+${nativeSessionRefusals.length - MAX_CLEANUP_REFUSALS} more)` : "";
+      try {
+        await this.input.notify?.(
+          `review gate: ${nativeSessionRefusals.length} spawned Pi session(s) were retained, not deleted: ${shown}${more}`,
+        );
+      } catch {
+        // A notice is best-effort; it can never hold up the shutdown
+        // persistence and association publishing that still follow below.
       }
     }
     await this.publishAssociations();

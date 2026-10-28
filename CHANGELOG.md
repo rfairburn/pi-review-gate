@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.217]
+
+### Changed
+
+- Spawned Pi sessions use Pi's environment-resolved native store, with exact file
+  references in existing task/reviewer metadata for continuation and evidence (#533).
+  Reviewers remain fresh; no historical session migration or conversion is performed.
+  Continuing subtasks started before this update is not supported. Allow active
+  subtasks to land before upgrading.
+- **Retention** groups Bundle retention with default-off
+  `deleteSpawnedPiSessionsOnCleanup`. When enabled, existing cleanup points also unlink
+  their recorded Pi files after bounded header identification; cleanup scope and timing
+  are unchanged.
+
 ## [0.1.0-dev.216]
 
 ### Changed

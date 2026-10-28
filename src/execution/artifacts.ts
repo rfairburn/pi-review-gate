@@ -10,6 +10,8 @@ export async function writeExecutorArtifacts(input: {
   text: string;
   usage?: TokenUsage;
   sessionId?: string;
+  /** Native Pi session file the child reported, when captured. */
+  sessionFile?: string;
   adapter: string;
 }): Promise<{ stdoutPath: string; stderrPath: string }> {
   const dir = join(input.artifactDir, "executor", String(input.turn).padStart(4, "0"));
@@ -24,6 +26,7 @@ export async function writeExecutorArtifacts(input: {
     writeFile(join(dir, "process-result.json"), JSON.stringify({
       adapter: input.adapter,
       sessionId: input.sessionId,
+      sessionFile: input.sessionFile,
       code: input.output.code,
       timedOut: input.output.timedOut,
       aborted: input.output.aborted,

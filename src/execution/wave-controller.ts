@@ -775,6 +775,16 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
         cwd,
         maxSnapshotBytes: config.maxSnapshotBytes,
         artifactTtlMs: config.retainBundles === "always" ? 0 : config.waveArtifactTtlMs,
+        deleteNativeSessions: config.deleteSpawnedPiSessionsOnCleanup === true,
+        // Existing progress channel: a session that opt-in cleanup refused to
+        // delete is disclosed instead of disappearing with its root.
+        onNativeSessionRefusal: (message) => emitProgress(onProgress, "capturing", message, undefined, {
+          waveId,
+          maxWorkers,
+          counts: computeCounts(taskItems, results, activeSlots, taskPhases),
+          taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
+          activity: [message],
+        }),
         hooks: input.captureHooks,
         waveId,
         artifactDir,

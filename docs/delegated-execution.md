@@ -1243,6 +1243,13 @@ Enforcement details are owned by
 
 ## Artifacts
 
+Pi workers keep their complete native histories in Pi's own environment-resolved
+session store, not these temporary artifacts. Existing per-turn `process-result.json`
+records contain `sessionId` and `sessionFile`; durable Pi session records also carry
+`file` for exact continuation/compaction. Evidence reads those files in place with its
+existing bounds. Native token/cost and compaction records remain Pi-owned. Ordinary
+Pi session browsing/resume applies, including its working-directory filters.
+
 Each task produces a `waveRoot` containing its operation record, bounded
 executor/reviewer protocol streams, worktree/checkpoint metadata, manifest, and stable
 refs. Its execution group has a separate integrity-checked manifest and is associated

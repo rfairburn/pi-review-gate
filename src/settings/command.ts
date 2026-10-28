@@ -46,8 +46,8 @@ import {
 } from "./workers";
 import { materializeReviewerThinking, selectReviewSection } from "./review";
 import {
-  retentionLabel,
-  selectBundleRetention,
+  retentionSummary,
+  selectRetention,
   selectMaxWorkers,
   selectModeCycleShortcut,
   selectOperatingMode,
@@ -197,6 +197,7 @@ async function runSettingsMenu(
   let maxCorrectionCycles = input.config.maxCorrectionCycles;
   let guidanceThreshold = input.config.implementationGuidanceAfterCorrectionAttempts;
   let retainBundles = input.config.retainBundles;
+  let deleteSpawnedPiSessions = input.config.deleteSpawnedPiSessionsOnCleanup === true;
   let maxWorkers = input.config.execution?.maxWorkers ?? DEFAULT_MAX_WORKERS;
   let retryPolicy = { ...(input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY) };
   let subtaskNotifications = input.config.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE;
@@ -407,6 +408,7 @@ async function runSettingsMenu(
     maxCorrectionCycles,
     implementationGuidanceAfterCorrectionAttempts: guidanceThreshold,
     retainBundles,
+    deleteSpawnedPiSessionsOnCleanup: deleteSpawnedPiSessions,
     maxWorkers,
     retryPolicy,
     subtaskNotifications,
@@ -463,7 +465,7 @@ async function runSettingsMenu(
       { key: "reviewers", label: "Reviewers", value: `primary ${layerSummary(primaryEnabled, primaryReviewers)} · subtask ${layerSummary(subtaskEnabled, subtaskReviewers)}${reviewStatus}` },
       { key: "timeouts", label: "Timeouts", value: `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}` },
       { key: "policy", label: "Review policy", value: `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}` },
-      { key: "retention", label: "Bundle retention", value: retentionLabel(retainBundles) },
+      { key: "retention", label: "Retention", value: retentionSummary(retainBundles, deleteSpawnedPiSessions) },
       { key: "workers", label: "Global concurrency", value: String(maxWorkers) },
       { key: "retry", label: "Retry policy", value: `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base` },
       { key: "notifications", label: "Subtask notifications", value: subtaskNotifications === "quiet" ? "Quiet" : "Noisy" },
@@ -601,7 +603,11 @@ async function runSettingsMenu(
       continue;
     }
     if (choice === "retention") {
-      retainBundles = await selectBundleRetention(input.ui, retainBundles);
+      ({ retainBundles, deleteSpawnedPiSessions } = await selectRetention(
+        input.ui,
+        retainBundles,
+        deleteSpawnedPiSessions,
+      ));
       continue;
     }
     if (choice === "workers") {

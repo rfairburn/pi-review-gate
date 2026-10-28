@@ -87,6 +87,44 @@ export async function selectBundleRetention(ui: UiContext, current: RetainBundle
   return rows.find((row) => selected === `${row.label}${row.value === current ? "  current" : ""}`)?.value ?? current;
 }
 
+/**
+ * The Retention submenu: the existing bundle-retention choice plus the opt-in
+ * deletion of the native Pi sessions this extension spawned (issue #533).
+ * Both edits return only when the caller leaves the submenu.
+ */
+export async function selectRetention(
+  ui: UiContext,
+  initialRetention: RetainBundles,
+  initialDeleteSessions: boolean,
+): Promise<{ retainBundles: RetainBundles; deleteSpawnedPiSessions: boolean }> {
+  let retainBundles = initialRetention;
+  let deleteSpawnedPiSessions = initialDeleteSessions;
+  // Caller-local last selection for this loop only (issue #140).
+  let lastKey: string | undefined;
+  while (true) {
+    const [bundlesRow, sessionsRow] = alignedSettingsRows([
+      ["Bundle retention", retentionLabel(retainBundles)],
+      ["Spawned Pi sessions", deleteSpawnedPiSessions ? "Deleted on cleanup" : "Retained"],
+    ]);
+    const choice = await retainedSelect(ui, {
+      title: "Retention",
+      rows: [
+        { key: "bundles", label: bundlesRow },
+        { key: "sessions", label: sessionsRow },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return { retainBundles, deleteSpawnedPiSessions };
+    lastKey = choice;
+    if (choice === "bundles") {
+      retainBundles = await selectBundleRetention(ui, retainBundles);
+      continue;
+    }
+    deleteSpawnedPiSessions = !deleteSpawnedPiSessions;
+  }
+}
+
 export async function selectMaxWorkers(ui: UiContext, current: number): Promise<number> {
   const options = Array.from({ length: MAX_EXECUTION_WORKERS }, (_, index) => String(index + 1))
     .map((v) => `${v}${v === String(current) ? "  current" : ""}`);
@@ -162,6 +200,11 @@ export function retentionLabel(value: RetainBundles): string {
   if (value === "on-failure") return "On failure";
   if (value === "always") return "Always";
   return "Never";
+}
+
+/** Root-row summary; unchanged wording while session deletion stays Off. */
+export function retentionSummary(retainBundles: RetainBundles, deleteSpawnedPiSessions: boolean): string {
+  return deleteSpawnedPiSessions ? `${retentionLabel(retainBundles)} · sessions deleted` : retentionLabel(retainBundles);
 }
 
 export async function selectReviewPolicy(

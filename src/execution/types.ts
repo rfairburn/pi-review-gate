@@ -6,6 +6,8 @@ import type { ExecutorToolCatalog } from "./tool-catalog";
 export interface ExecutorSession {
   adapter: string;
   id: string;
+  /** Native Pi file, required for Pi continuation/compaction; absent for other adapters. */
+  file?: string;
 }
 
 export interface ExecutorTurn {

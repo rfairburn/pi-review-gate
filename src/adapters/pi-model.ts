@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import type { PiDeciderConfig } from "../config";
 import { parseReviewResult, type ReviewResult } from "../schema";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../usage";
@@ -16,6 +16,10 @@ import {
 } from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
 import { assertNoPiToolPolicyArgs } from "../pi-tool-policy";
+import { readBoundedTextFile } from "../bounded-file";
+import { isRecord } from "../record-guard";
+import { isValidNativeSessionFile } from "../session-host/protocol";
+import { REVIEWER_SESSION_RECEIPT_ENV } from "./session-ref-reporter";
 
 export class PiModelAdapter implements ModelAdapter {
   readonly kind = "pi-model";
@@ -30,11 +34,10 @@ export class PiModelAdapter implements ModelAdapter {
     const thinkingLevel = this.config.thinkingLevel ?? "high";
     const artifacts = reviewerArtifactPaths(req.bundleDir);
     const rawStreamPath = join(req.bundleDir, "raw-stream.jsonl");
-    const sessionId = req.session?.id ?? randomUUID();
-    // Keep runtime session history with the private reviewer staging directory,
-    // never in the evidence bundle where this or a sibling reviewer can inspect it.
-    const sessionDir = join(req.bundleDir, "session");
-    await mkdir(sessionDir, { recursive: true });
+    const sessionId = randomUUID();
+    // Capture this fresh reviewer's native file outside immutable evidence.
+    const receiptPath = join(req.bundleDir, "session-ref.json");
+    await mkdir(req.bundleDir, { recursive: true });
     req.onSession?.({ adapter: this.kind, id: sessionId });
     const streamExtractor = new PiJsonlReviewExtractor();
     const activity = new PiJsonlActivityExtractor(
@@ -50,14 +53,13 @@ export class PiModelAdapter implements ModelAdapter {
       "--thinking",
       thinkingLevel,
       ...(this.config.args ?? []),
-      "--session-id",
-      sessionId,
-      "--session-dir",
-      sessionDir,
+      "--session-id", sessionId,
       "--tools",
       "read,grep,find,ls",
       "--no-skills",
       "--no-extensions",
+      "--extension",
+      resolve(__dirname, "session-ref-reporter.js"),
       "--no-prompt-templates",
       "--no-themes",
       "--system-prompt",
@@ -74,7 +76,10 @@ export class PiModelAdapter implements ModelAdapter {
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,
-      env: reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir),
+      env: reviewerEnv(
+        { ...process.env, ...this.config.env, [REVIEWER_SESSION_RECEIPT_ENV]: receiptPath },
+        req.evidenceBundleDir,
+      ),
       signal: req.signal,
       onStdoutChunk: (chunk) => {
         streamExtractor.push(chunk);
@@ -82,6 +87,10 @@ export class PiModelAdapter implements ModelAdapter {
       },
     });
     activity.finish();
+    // Read the one bounded receipt now that the child settled, then remove it:
+    // the published artifacts keep a single session reference (invocation.json).
+    const sessionFile = await readReviewerSessionFile(receiptPath, sessionId);
+    if (sessionFile !== undefined) req.onSession?.({ adapter: this.kind, id: sessionId, file: sessionFile });
     const streamExtracted = streamExtractor.finish();
     const extracted = streamExtracted.text.trim() ? streamExtracted : extractReviewTextFromPiJsonl(output.stdout);
     const rawOutputText = extracted.text.trim()
@@ -105,6 +114,7 @@ export class PiModelAdapter implements ModelAdapter {
           stdoutBytesCaptured: Buffer.byteLength(output.stdout),
           rawOutputContainsStream: false,
           rawStreamPath: "raw-stream.jsonl",
+          sessionRefCaptured: sessionFile !== undefined,
         },
       }),
     ]);
@@ -142,6 +152,21 @@ export class PiModelAdapter implements ModelAdapter {
         artifacts.rawOutput,
         output.stdoutTruncated ? "output_truncated" : "missing_final_text",
         extracted.usage,
+        ),
+        telemetry: processTelemetry(output),
+        processSettlement: output.processSettlement,
+        diagnostic: output.terminationError,
+      };
+    }
+    // A successful review must leave its native reference in the pass metadata.
+    if (sessionFile === undefined) {
+      return {
+        ...reviewerErrorResult(
+          req.id,
+          "Reviewer did not report its own native session reference, so the pass was not accepted.",
+          artifacts.rawOutput,
+          "session_reference_missing",
+          extracted.usage,
         ),
         telemetry: processTelemetry(output),
         processSettlement: output.processSettlement,
@@ -187,6 +212,18 @@ function providerFailureDiagnostic(error: string, output: {
     `timedOut: ${output.timedOut}`,
     `aborted: ${output.aborted}`,
   ].join("\n");
+}
+
+async function readReviewerSessionFile(path: string, sessionId: string): Promise<string | undefined> {
+  try {
+    const parsed: unknown = JSON.parse((await readBoundedTextFile(path, 64 * 1024)).text);
+    return isRecord(parsed) && parsed.sessionId === sessionId && isValidNativeSessionFile(parsed.sessionFile)
+      ? parsed.sessionFile : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    await unlink(path).catch(() => undefined);
+  }
 }
 
 function readOnlyReviewerSystemPrompt(): string {

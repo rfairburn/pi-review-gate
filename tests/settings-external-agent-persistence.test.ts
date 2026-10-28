@@ -13,7 +13,7 @@ function selection(config: ReviewGateConfig, opening: ReviewGateConfig, operatio
     workerResources: config.execution!.workerResources!, executeRoute: config.execution!.routes?.execute, researchRoute: config.execution!.routes?.research,
     ...review, reviewerTimeoutMs: config.reviewerTimeoutMs, executorTimeoutMs: config.executorTimeoutMs,
     maxCorrectionCycles: config.maxCorrectionCycles, implementationGuidanceAfterCorrectionAttempts: config.implementationGuidanceAfterCorrectionAttempts,
-    retainBundles: config.retainBundles, deleteSpawnedPiSessionsOnCleanup: config.deleteSpawnedPiSessionsOnCleanup, maxWorkers: config.execution!.maxWorkers!, retryPolicy: config.execution!.retryPolicy!, subtaskNotifications: config.execution!.subtaskNotifications!, subtasksViewExpanded: false,
+    retainBundles: config.retainBundles, maxWorkers: config.execution!.maxWorkers!, retryPolicy: config.execution!.retryPolicy!, subtaskNotifications: config.execution!.subtaskNotifications!, subtasksViewExpanded: false,
     scheduledTasks: config.scheduledTasks ?? {}, scheduledTasksStagedFrom: Object.keys(opening.scheduledTasks ?? {}),
     externalAgentOperations: operations, externalAgentOpening: opening,
   };

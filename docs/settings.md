@@ -88,12 +88,12 @@ supplies the live switch (the ordinary extension entry point always does):
   override these defaults for that external harness role.
 - **Review policy** edits `maxCorrectionCycles` and
   `implementationGuidanceAfterCorrectionAttempts` as non-negative whole numbers.
-- **Retention** groups **Bundle retention** (`never`, `on-failure`, or `always`, with
-  unchanged semantics) and **Delete spawned Pi sessions during cleanup** (default
-  **Off**). Off preserves native audit histories when artifacts are removed. On deletes
-  only the associated spawned Pi sessions when existing cleanup already removes their
-  artifacts; it adds no cleanup targets or timing and enabling it deletes nothing.
-  Both controls use the same staged Save, root-Escape apply, and Cancel conventions.
+- **Retention** groups **Bundle retention** (`never`, `on-failure`, or `always`,
+  unchanged) with **Spawned Pi sessions** (**Retained** by default; select
+  **Deleted on cleanup** to enable deletion). The toggle uses the same
+  Save/Ctrl+S, root-Escape apply, and Cancel transaction;
+  switching it On does not itself delete anything. See
+  [Configuration](configuration.md#top-level-fields).
 - **Global concurrency** sets `execution.maxWorkers` (1–128, default 4). This is the
   session-wide worker ceiling shared by every group; each worker resource also has its
   own shared `maxConcurrent` capacity (1–128). These bound how many workers run at

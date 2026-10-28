@@ -19,17 +19,13 @@ dates.
 
 ### Changed
 
-- Newly spawned Pi reviewers and execute/research/in-place workers retain their
-  complete native sessions in Pi's standard resolved store for auditing (#533).
-  Exact native references preserve compatible continuation, interrupted compaction,
-  and worker evidence lookup without transcript mirrors or reviewer/peer evidence
-  injection. Changed-executor handoff remains fresh, and reviewer passes remain
-  independent fresh sessions; non-Pi formats and historical artifacts are unchanged.
-- `/review-settings` groups Bundle retention and a new **Delete spawned Pi sessions
-  during cleanup** toggle under **Retention**. The toggle defaults Off, including
-  absent old config. On deletes only exact associated spawned sessions for artifacts
-  already selected at existing cleanup points, without new cleanup targets, timing,
-  sweeps, backfill, or deletion merely from enabling it.
+- Spawned Pi sessions use Pi's environment-resolved native store, with exact file
+  references in existing task/reviewer metadata for continuation and evidence (#533).
+  Reviewers remain fresh; no historical session migration or conversion is performed.
+- **Retention** groups Bundle retention with default-off
+  `deleteSpawnedPiSessionsOnCleanup`. When enabled, existing cleanup points also unlink
+  their recorded Pi files after bounded header identification; cleanup scope and timing
+  are unchanged.
 
 ## [0.1.0-dev.216]
 

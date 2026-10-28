@@ -1,18 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { PiDeciderConfig } from "../config";
 import { parseReviewResult, type ReviewResult } from "../schema";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../usage";
 import { PiJsonlActivityExtractor } from "../execution/progress";
-import {
-  PI_SESSION_REFERENCE_ENV,
-} from "../pi-session-reference-reporter";
-import {
-  PI_SESSION_REFERENCE_DIRNAME,
-  readPiSessionReferenceAt,
-  verifyPiSessionReference,
-} from "../pi-session-reference";
 import {
   processFailureResult,
   processTelemetry,
@@ -24,13 +16,10 @@ import {
 } from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
 import { assertNoPiToolPolicyArgs } from "../pi-tool-policy";
-
-/**
- * Compiled path of the gate-owned session reference reporter (#533). Reviewers
- * run `--no-extensions` (discovery off) and load ONLY this explicit file, so
- * the child gains no discovered, configured, or built-in extension.
- */
-const SESSION_REPORTER_EXTENSION = resolve(__dirname, "..", "pi-session-reference-reporter.js");
+import { readBoundedTextFile } from "../bounded-file";
+import { isRecord } from "../record-guard";
+import { isValidNativeSessionFile } from "../session-host/protocol";
+import { REVIEWER_SESSION_RECEIPT_ENV } from "./session-ref-reporter";
 
 export class PiModelAdapter implements ModelAdapter {
   readonly kind = "pi-model";
@@ -45,18 +34,10 @@ export class PiModelAdapter implements ModelAdapter {
     const thinkingLevel = this.config.thinkingLevel ?? "high";
     const artifacts = reviewerArtifactPaths(req.bundleDir);
     const rawStreamPath = join(req.bundleDir, "raw-stream.jsonl");
-    // #533: EVERY reviewer pass is a fresh native session. The review pipeline
-    // never resumes a prior reviewer conversation, and a bare `--session-id`
-    // that Pi cannot find under the current cwd silently starts an EMPTY session
-    // with the same id, so reviewer identity is never treated as a continuation
-    // handle anywhere in this adapter.
     const sessionId = randomUUID();
-    // #533: the pass runs in Pi's own standard native session store — no
-    // per-role `--session-dir`, so native `--session-dir`/env/setting/default
-    // precedence applies untouched. Only the canonical reference (below) is
-    // kept beside the private reviewer staging directory; the transcript itself
-    // never enters the evidence bundle this or a sibling reviewer can read.
-    const referencePath = join(req.bundleDir, PI_SESSION_REFERENCE_DIRNAME, `${sessionId}.json`);
+    // Capture this fresh reviewer's native file outside immutable evidence.
+    const receiptPath = join(req.bundleDir, "session-ref.json");
+    await mkdir(req.bundleDir, { recursive: true });
     req.onSession?.({ adapter: this.kind, id: sessionId });
     const streamExtractor = new PiJsonlReviewExtractor();
     const activity = new PiJsonlActivityExtractor(
@@ -72,24 +53,19 @@ export class PiModelAdapter implements ModelAdapter {
       "--thinking",
       thinkingLevel,
       ...(this.config.args ?? []),
-      "--session-id",
-      sessionId,
+      "--session-id", sessionId,
       "--tools",
       "read,grep,find,ls",
       "--no-skills",
-      // Explicit single-extension load keeps discovery off while still
-      // reporting this pass's authoritative native session identity.
-      "--extension",
-      SESSION_REPORTER_EXTENSION,
       "--no-extensions",
+      "--extension",
+      resolve(__dirname, "session-ref-reporter.js"),
       "--no-prompt-templates",
       "--no-themes",
       "--system-prompt",
       readOnlyReviewerSystemPrompt(),
     ];
 
-    const childEnv = reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir);
-    childEnv[PI_SESSION_REFERENCE_ENV] = referencePath;
     const output = await (this.dependencies.runPromptProcess ?? runPromptProcess)({
       command: this.config.command ?? "pi",
       args,
@@ -100,7 +76,10 @@ export class PiModelAdapter implements ModelAdapter {
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,
-      env: childEnv,
+      env: reviewerEnv(
+        { ...process.env, ...this.config.env, [REVIEWER_SESSION_RECEIPT_ENV]: receiptPath },
+        req.evidenceBundleDir,
+      ),
       signal: req.signal,
       onStdoutChunk: (chunk) => {
         streamExtractor.push(chunk);
@@ -108,7 +87,10 @@ export class PiModelAdapter implements ModelAdapter {
       },
     });
     activity.finish();
-    const sessionReference = await reviewerSessionReference({ path: referencePath, sessionId, cwd: req.cwd });
+    // Read the one bounded receipt now that the child settled, then remove it:
+    // the published artifacts keep a single session reference (invocation.json).
+    const sessionFile = await readReviewerSessionFile(receiptPath, sessionId);
+    if (sessionFile !== undefined) req.onSession?.({ adapter: this.kind, id: sessionId, file: sessionFile });
     const streamExtracted = streamExtractor.finish();
     const extracted = streamExtracted.text.trim() ? streamExtracted : extractReviewTextFromPiJsonl(output.stdout);
     const rawOutputText = extracted.text.trim()
@@ -132,7 +114,7 @@ export class PiModelAdapter implements ModelAdapter {
           stdoutBytesCaptured: Buffer.byteLength(output.stdout),
           rawOutputContainsStream: false,
           rawStreamPath: "raw-stream.jsonl",
-          sessionReference: sessionReference.metadata,
+          sessionRefCaptured: sessionFile !== undefined,
         },
       }),
     ]);
@@ -176,6 +158,21 @@ export class PiModelAdapter implements ModelAdapter {
         diagnostic: output.terminationError,
       };
     }
+    // A successful review must leave its native reference in the pass metadata.
+    if (sessionFile === undefined) {
+      return {
+        ...reviewerErrorResult(
+          req.id,
+          "Reviewer did not report its own native session reference, so the pass was not accepted.",
+          artifacts.rawOutput,
+          "session_reference_missing",
+          extracted.usage,
+        ),
+        telemetry: processTelemetry(output),
+        processSettlement: output.processSettlement,
+        diagnostic: output.terminationError,
+      };
+    }
 
     const result = parseReviewResult(req.id, extracted.text, artifacts.rawOutput);
     result.usage = extracted.usage;
@@ -184,50 +181,6 @@ export class PiModelAdapter implements ModelAdapter {
     result.diagnostic = output.terminationError;
     return result;
   }
-}
-
-/**
- * Read the canonical native session reference this reviewer pass reported and
- * reduce it to MINIMAL pass metadata.
- *
- * The reporter extension is the ONLY source: there is no store re-resolution,
- * `findById`, or directory scan behind this. The pass artifacts record status,
- * the session id, and the locator of the canonical reference — never a second
- * copy of the session file or workspace, which live only in the reference
- * itself. A missing or unverifiable reference is recorded explicitly instead of
- * being silently replaced with a guessed path.
- */
-async function reviewerSessionReference(input: {
-  path: string;
-  sessionId: string;
-  cwd: string;
-}): Promise<{ metadata: Record<string, unknown> }> {
-  const locator = `${PI_SESSION_REFERENCE_DIRNAME}/${input.sessionId}.json`;
-  const reference = await readPiSessionReferenceAt(input.path).catch(() => undefined);
-  if (!reference) {
-    return {
-      metadata: {
-        status: "unavailable",
-        id: input.sessionId,
-        reference: locator,
-        detail: `The reviewer pass reported no canonical native session reference at ${input.path}; the native session file for this pass is not recorded.`,
-      },
-    };
-  }
-  const verified = verifyPiSessionReference(reference, { id: input.sessionId, cwd: input.cwd });
-  if (!verified.ok) {
-    return {
-      metadata: {
-        status: "unverified",
-        id: input.sessionId,
-        reference: locator,
-        detail: verified.message,
-      },
-    };
-  }
-  return {
-    metadata: { status: "recorded", id: reference.id, reference: locator },
-  };
 }
 
 function missingFinalTextDiagnostic(output: {
@@ -259,6 +212,18 @@ function providerFailureDiagnostic(error: string, output: {
     `timedOut: ${output.timedOut}`,
     `aborted: ${output.aborted}`,
   ].join("\n");
+}
+
+async function readReviewerSessionFile(path: string, sessionId: string): Promise<string | undefined> {
+  try {
+    const parsed: unknown = JSON.parse((await readBoundedTextFile(path, 64 * 1024)).text);
+    return isRecord(parsed) && parsed.sessionId === sessionId && isValidNativeSessionFile(parsed.sessionFile)
+      ? parsed.sessionFile : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    await unlink(path).catch(() => undefined);
+  }
 }
 
 function readOnlyReviewerSystemPrompt(): string {

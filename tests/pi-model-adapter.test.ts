@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { PiModelAdapter } from "../src/adapters/pi-model";
+import type { ReviewerSession } from "../src/adapters/types";
 import { runPromptProcess } from "../src/adapters/process";
 
 const ONE_MEGABYTE_RETAINED_PROCESS = (input: Parameters<typeof runPromptProcess>[0]) => runPromptProcess({
@@ -16,12 +18,24 @@ test("PiModelAdapter uses one native --tools allowlist and reports missing final
   try {
     const argvPath = join(dir, "argv.json");
     const commandPath = join(dir, "fake-pi.mjs");
+    // The fake stands in for pi plus the reviewer session-ref companion: it
+    // keeps the session in a store outside the bundle and reports the exact
+    // native id and file through the receipt path the adapter provided.
     await writeFile(commandPath, [
       "#!/usr/bin/env node",
-      "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
+      "import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';",
+      "import { basename, dirname, join } from 'node:path';",
       `const argvPath=${JSON.stringify(argvPath)};`,
+      `const store=${JSON.stringify(join(dir, "native-store"))};`,
       "const history=existsSync(argvPath)?JSON.parse(readFileSync(argvPath,'utf8')):[];",
       "history.push({argv:process.argv.slice(2)});writeFileSync(argvPath,JSON.stringify(history));",
+      "const a=process.argv.slice(2);",
+      "const sid=a[a.indexOf('--session-id')+1];",
+      "const file=join(store,`${sid}.jsonl`);",
+      "mkdirSync(dirname(file),{recursive:true});",
+      "if(!existsSync(file))writeFileSync(file,JSON.stringify({type:'session',version:3,id:basename(file,'.jsonl'),timestamp:new Date().toISOString(),cwd:process.cwd()})+'\\n');",
+      "const receipt=process.env.PI_REVIEW_GATE_REVIEWER_SESSION_RECEIPT;",
+      "if(receipt)writeFileSync(receipt,JSON.stringify({sessionId:basename(file,'.jsonl'),sessionFile:file}));",
       "process.stdin.resume();",
       "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({type:'message',message:{role:'assistant',content:[{type:'thinking',thinking:'still thinking'}]}})+'\\n'));",
     ].join("\n"), "utf8");
@@ -36,7 +50,7 @@ test("PiModelAdapter uses one native --tools allowlist and reports missing final
       timeoutMs: 15000,
     });
 
-    let session;
+    let session: ReviewerSession | undefined;
     const result = await adapter.run({
       id: "glm",
       cwd: process.cwd(),
@@ -57,9 +71,9 @@ test("PiModelAdapter uses one native --tools allowlist and reports missing final
     assert.equal(result.verdict, "error");
     assert.equal(result.error, "missing_final_text");
     assert.equal(result.summary, "Reviewer did not produce final assistant text.");
-    const [firstRun, resumedRun] = JSON.parse(await readFile(argvPath, "utf8"));
+    const [firstRun, secondRun] = JSON.parse(await readFile(argvPath, "utf8"));
     const argv = firstRun.argv;
-    const resumedArgv = resumedRun.argv;
+    const secondArgv = secondRun.argv;
     assert.deepEqual(argv.includes("--no-tools"), false);
     assert.deepEqual(argv.includes("--tools"), true);
     assert.equal(argv[argv.indexOf("--tools") + 1], "read,grep,find,ls");
@@ -75,48 +89,17 @@ test("PiModelAdapter uses one native --tools allowlist and reports missing final
     assert.equal(argv.includes("--no-session"), false);
     const sessionId = argv[argv.indexOf("--session-id") + 1];
     assert.equal(typeof sessionId, "string");
-    assert.equal(resumedArgv[resumedArgv.indexOf("--thinking") + 1], "max");
-    // #533: the reviewer pass runs in Pi's own standard native session store, so
-    // no per-role session directory is ever passed.
-    assert.ok(!argv.includes("--session-dir"), "the reviewer must not redirect the native session store per role");
-    assert.ok(!resumedArgv.includes("--session-dir"), "a later reviewer pass must not redirect the native session store per role");
-    // The reviewer reports its authoritative identity through the gate-owned
-    // reporter extension, and discovery stays off.
-    assert.ok(argv.includes("--no-extensions"), "reviewer extension discovery must stay off");
-    const extension = argv[argv.indexOf("--extension") + 1];
-    assert.equal(typeof extension, "string", "the reviewer loads exactly one explicit reporter extension");
-    assert.match(extension, /pi-session-reference-reporter\.js$/);
-    assert.equal(argv.filter((entry: string) => entry === "--extension").length, 1);
-    // #533: EVERY reviewer pass is a fresh native session. A supplied prior is
-    // identity context only — the adapter never reopens a reviewer conversation,
-    // because Pi answers a bare `--session-id` it cannot find with an EMPTY
-    // same-id session, and no reviewer continuation was ever approved.
-    const resumedSessionId = resumedArgv[resumedArgv.indexOf("--session-id") + 1];
-    assert.equal(typeof resumedSessionId, "string");
-    assert.notEqual(resumedSessionId, sessionId, "a reviewer pass never reuses a prior session id");
-    assert.ok(!argv.includes("--session") && !resumedArgv.includes("--session"),
-      "a reviewer pass never reopens a session by path");
-    assert.ok(!resumedArgv.includes("--continue") && !resumedArgv.includes("--resume"),
-      "a reviewer pass never reopens an ambient session");
-    // #533: the pass records MINIMAL session metadata — status, id, and the
-    // locator of the canonical reference — never a second copy of the session
-    // file or workspace, which live only in `pi-sessions/<id>.json`.
-    const processResult = JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")) as {
-      stdoutTruncated: boolean;
-      sessionReference?: Record<string, unknown>;
-    };
-    assert.equal(processResult.stdoutTruncated, false);
-    assert.ok(processResult.sessionReference, "the pass discloses what it learned about its native session");
-    assert.equal(processResult.sessionReference.status, "unavailable",
-      "a pass whose child reported no identity is recorded explicitly, never guessed");
-    assert.equal(processResult.sessionReference.reference, `pi-sessions/${resumedSessionId}.json`,
-      "the metadata points at the canonical reference instead of copying its paths");
-    assert.ok(!("file" in processResult.sessionReference) && !("cwd" in processResult.sessionReference),
-      `pass metadata carries no duplicate path state: ${JSON.stringify(processResult.sessionReference)}`);
-    // The callback hands back identity only; the transcript path is never handed
-    // to the caller as a second copy of canonical state.
-    assert.deepEqual(Object.keys(session ?? {}).sort(), ["adapter", "id"],
-      `a reviewer session callback reports identity only: ${JSON.stringify(session)}`);
+    assert.equal(argv.includes("--session-dir"), false);
+    assert.equal(secondArgv.includes("--session-dir"), false);
+    assert.equal(secondArgv.includes("--session"), false);
+    assert.equal(secondArgv.includes("--session-id"), true);
+    assert.notEqual(secondArgv[secondArgv.indexOf("--session-id") + 1], sessionId, "reviewer passes stay fresh even when given a prior session");
+    assert.equal(session?.file, join(dir, "native-store", `${sessionId}.jsonl`));
+    // The temporary receipt is consumed, so the published pass keeps only the
+    // single session reference in its own metadata.
+    assert.equal(existsSync(join(dir, "session-ref.json")), false);
+    assert.equal(secondArgv[secondArgv.indexOf("--thinking") + 1], "max");
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")).stdoutTruncated, false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -209,6 +192,15 @@ test("PiModelAdapter captures final assistant text after retained stdout cap", a
     const reviewJson = JSON.stringify({ verdict: "pass", summary: "final response captured", findings: [] });
     await writeFile(commandPath, [
       "#!/usr/bin/env node",
+      "import { existsSync, mkdirSync, writeFileSync } from 'node:fs';",
+      "import { basename, dirname, join } from 'node:path';",
+      `const store=${JSON.stringify(join(dir, "native-store"))};`,
+      // A real reviewer pass reports its own native session, so this fake does too.
+      "const a=process.argv.slice(2);const sid=a[a.indexOf('--session-id')+1];const file=join(store,`${sid}.jsonl`);",
+      "mkdirSync(dirname(file),{recursive:true});",
+      "if(!existsSync(file))writeFileSync(file,JSON.stringify({type:'session',version:3,id:basename(file,'.jsonl'),timestamp:new Date().toISOString(),cwd:process.cwd()})+'\\n');",
+      "const receipt=process.env.PI_REVIEW_GATE_REVIEWER_SESSION_RECEIPT;",
+      "if(receipt)writeFileSync(receipt,JSON.stringify({sessionId:sid,sessionFile:file}));",
       "const noise = 'x'.repeat(2000);",
       "process.stdin.resume();",
       "process.stdin.on('end',()=>{",
@@ -239,11 +231,78 @@ test("PiModelAdapter captures final assistant text after retained stdout cap", a
     assert.equal(result.verdict, "pass");
     assert.equal(result.summary, "final response captured");
     assert.equal(result.usage?.totalTokens, 3);
+    assert.equal(result.error, undefined);
     const processResult = JSON.parse(await readFile(join(dir, "process-result.json"), "utf8"));
     assert.deepEqual(processResult.stdoutTruncated, true);
     assert.deepEqual(processResult.rawOutputContainsStream, false);
+    assert.deepEqual(processResult.sessionRefCaptured, true);
     assert.equal(await readFile(join(dir, "raw-output.txt"), "utf8"), reviewJson);
     assert.equal((await readFile(join(dir, "raw-stream.jsonl"), "utf8")).length, 1000000);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/** A completed review must leave its native session reference in the pass metadata. */
+test("PiModelAdapter refuses a passing review whose child reported no session receipt", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-pi-no-receipt-"));
+  try {
+    const commandPath = join(dir, "fake-pi-no-receipt.mjs");
+    const reviewJson = JSON.stringify({ verdict: "pass", summary: "verdict without a session reference", findings: [] });
+    const finalTextFrame = JSON.stringify(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: reviewJson }] } }) + "\n");
+    await writeFile(commandPath, [
+      "#!/usr/bin/env node",
+      "process.stdin.resume();",
+      `process.stdin.on('end',()=>process.stdout.write(${finalTextFrame}));`,
+    ].join("\n"), "utf8");
+    await chmod(commandPath, 0o755);
+
+    let session: ReviewerSession | undefined;
+    const result = await new PiModelAdapter({
+      id: "glm", adapter: "pi-model", model: "ollama/glm-5.2", command: commandPath, timeoutMs: 15000,
+    }).run({ id: "glm", cwd: process.cwd(), prompt: "review", bundleDir: dir, timeoutMs: 15000, onSession(value) { session = value; } });
+
+    assert.equal(result.verdict, "error");
+    assert.equal(result.error, "session_reference_missing");
+    assert.match(result.summary, /did not report its own native session reference/);
+    assert.equal(session?.file, undefined);
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")).sessionRefCaptured, false);
+    // The pass artifacts remain published so the refusal is diagnosable.
+    assert.match(await readFile(join(dir, "raw-output.txt"), "utf8"), /verdict without a session reference/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("PiModelAdapter refuses a passing review whose receipt names another session", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-pi-wrong-receipt-"));
+  try {
+    const commandPath = join(dir, "fake-pi-wrong-receipt.mjs");
+    const reviewJson = JSON.stringify({ verdict: "pass", summary: "verdict with a foreign session", findings: [] });
+    const finalTextFrame = JSON.stringify(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: reviewJson }] } }) + "\n");
+    await writeFile(commandPath, [
+      "#!/usr/bin/env node",
+      "import { writeFileSync } from 'node:fs';",
+      "import { join } from 'node:path';",
+      // A foreign or corrupted receipt is never adopted, even though the
+      // reviewer's own verdict parsed cleanly.
+      "const receipt=process.env.PI_REVIEW_GATE_REVIEWER_SESSION_RECEIPT;",
+      `if(receipt)writeFileSync(receipt,JSON.stringify({sessionId:'another-session',sessionFile:join(process.env.HOME??'/tmp','.pi','sessions','another-session.jsonl')}));`,
+      "process.stdin.resume();",
+      `process.stdin.on('end',()=>process.stdout.write(${finalTextFrame}));`,
+    ].join("\n"), "utf8");
+    await chmod(commandPath, 0o755);
+
+    let session: ReviewerSession | undefined;
+    const result = await new PiModelAdapter({
+      id: "glm", adapter: "pi-model", model: "ollama/glm-5.2", command: commandPath, timeoutMs: 15000,
+    }).run({ id: "glm", cwd: process.cwd(), prompt: "review", bundleDir: dir, timeoutMs: 15000, onSession(value) { session = value; } });
+
+    assert.equal(result.verdict, "error");
+    assert.equal(result.error, "session_reference_missing");
+    assert.equal(session?.file, undefined);
+    // The temporary receipt is consumed rather than left beside the pass metadata.
+    assert.equal(existsSync(join(dir, "session-ref.json")), false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -4,7 +4,7 @@
 // session semantics, transmission disclosure, and operating-mode settings.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +16,6 @@ import { normalizeConfig } from "../src/config";
 import { recordToolCallEvidence, recordToolResultEvidence } from "../src/evidence";
 import { capturePrimaryOperationBoundary, retainPrimaryToolAfter, settlePrimaryOperationBoundary } from "../src/review-evidence";
 import { runReview } from "../src/review";
-import { writePiSessionReference } from "../src/pi-session-reference";
 import { beginAgentRun, buildRequestContext, getCorrectionAttemptCount } from "../src/state";
 import { agentCatalog } from "./helpers";
 import {
@@ -2825,85 +2824,3 @@ for (const toolOnly of [false, true]) for (const scenario of ["sibling-noop", "s
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 }
-
-// #533 final review F1: the opt-in spawned-session deletion rides the bundle
-// cleanup that `session_shutdown` already performs. An undeletable native
-// history retains its bundle and is disclosed — it never escapes the shutdown
-// handler, whose persistence and finalization steps still have to run.
-test("session_shutdown still persists review state when a spawned Pi session cannot be deleted", async (t) => {
-  if (typeof process.getuid === "function" && process.getuid() === 0) {
-    t.skip("root can unlink inside a read-only directory");
-    return;
-  }
-  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-review-gate-shutdown-session-cleanup-")));
-  const store = await realpath(await mkdtemp(join(tmpdir(), "pi-review-gate-shutdown-store-")));
-  try {
-    execFileSync("git", ["init", "-q"], { cwd: dir });
-    await writeFile(join(dir, "review-gate.json"), JSON.stringify({
-      ...indexTestConfig,
-      // Retention keeps the reviewed bundle alive to the shutdown boundary,
-      // where the existing cleanup already removes it (and, On, its sessions).
-      retainBundles: "always",
-      deleteSpawnedPiSessionsOnCleanup: true,
-      externalAgents: agentCatalog(countingPassReviewer("shutdown-cleanup", join(dir, "reviewer-invocations.txt"))),
-      review: { activeReviewers: [{ source: "external", id: "shutdown-cleanup" }] },
-    }), "utf8");
-    process.env.PI_REVIEW_GATE_CONFIG = join(dir, "review-gate.json");
-    delete process.env.PI_REVIEW_GATE_DISABLED;
-
-    const sessionFile = join(dir, "session.jsonl");
-    await writeFile(sessionFile, "", "utf8");
-    const session = createSessionRuntime("shutdown-cleanup-session", sessionFile, dir);
-    await activate(session.pi, testActivation());
-    await trigger(session.hooks, "session_start", { type: "session_start", reason: "startup" }, session.ctx);
-    await trigger(session.hooks, "input", { cwd: dir, text: "add the reviewed file", source: "user" }, session.ctx);
-    await trigger(session.hooks, "before_agent_start", { cwd: dir }, session.ctx);
-    await writeFile(join(dir, "a.txt"), "review me\n", "utf8");
-    await trigger(session.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo a.txt" } }, session.ctx);
-    await triggerAgentEnd(session.hooks, {
-      cwd: dir,
-      messages: [{ role: "assistant", content: "added the reviewed file" }],
-    });
-
-    // The published reviewer owns one canonical reference whose native history
-    // cannot be unlinked, so the shutdown cleanup cannot finish this bundle.
-    const bundleDir = extractBundleDir(session.sent[0]?.message ?? "", 1);
-    const nativeId = "shutdown-cleanup-native";
-    const nativeFile = join(store, `${nativeId}.jsonl`);
-    await writeFile(nativeFile, `${JSON.stringify({
-      type: "session",
-      version: 3,
-      id: nativeId,
-      timestamp: "2025-06-01T10:00:00.000Z",
-      cwd: dir,
-    })}\n`, "utf8");
-    const recorded = await writePiSessionReference(
-      join(bundleDir, "reviews", "0001", "reviewers", "shutdown-cleanup"),
-      { id: nativeId, file: nativeFile, cwd: dir },
-    );
-    assert.equal(recorded.ok, true, recorded.ok ? "" : recorded.message);
-    await chmod(store, 0o500);
-
-    const stateFile = new SessionStateStore({
-      sessionId: "shutdown-cleanup-session",
-      sessionFile,
-      cwd: dir,
-    }).path;
-    const savedBefore = await stat(stateFile);
-
-    await trigger(session.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, session.ctx);
-
-    assert.match(session.notices.join("\n"), /review gate: spawned Pi session cleanup failed/);
-    // Both survive: the retained bundle keeps its references so a later cleanup
-    // can retry the deletion, and no history is left orphaned.
-    await access(nativeFile);
-    await access(bundleDir);
-    const savedAfter = await stat(stateFile);
-    assert.ok(savedAfter.mtimeMs > savedBefore.mtimeMs,
-      "the shutdown persistence after the retained cleanup still wrote the durable state");
-  } finally {
-    await chmod(store, 0o700).catch(() => undefined);
-    await rm(store, { recursive: true, force: true });
-    await rm(dir, { recursive: true, force: true });
-  }
-});

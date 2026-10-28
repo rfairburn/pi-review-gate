@@ -20,7 +20,6 @@ executorTimeoutMs: 1_800_000,
 maxCorrectionCycles: 3,
 implementationGuidanceAfterCorrectionAttempts: 1,
 retainBundles: "on-failure",
-deleteSpawnedPiSessionsOnCleanup: false,
 maxWorkers: 2,
 retryPolicy: {
     maxRetries: 2,
@@ -190,43 +189,6 @@ test("persistReviewSettings preserves restrictive configuration permissions", as
     await chmod(configPath, 0o644);
     await persistReviewSettings(configPath, selection);
     assert.equal((await stat(configPath)).mode & 0o777, 0o600);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("spawned-session cleanup persists beside bundle retention and defaults off for older files", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-review-cleanup-persistence-"));
-  const configPath = join(dir, "config.json");
-  try {
-    // An older file without the key resolves to default-off.
-    await writeFile(configPath, JSON.stringify({ enabled: true, retainBundles: "always" }), "utf8");
-    assert.equal(normalizeConfig(JSON.parse(await readFile(configPath, "utf8"))).deleteSpawnedPiSessionsOnCleanup, false);
-
-    // A valid staged boolean round-trips beside the unchanged retention value.
-    const enabled = await persistReviewSettings(configPath, {
-      ...selection,
-      retainBundles: "never",
-      deleteSpawnedPiSessionsOnCleanup: true,
-    });
-    assert.equal(enabled.retainBundles, "never");
-    assert.equal(enabled.deleteSpawnedPiSessionsOnCleanup, true);
-    const enabledSaved = JSON.parse(await readFile(configPath, "utf8"));
-    assert.equal(enabledSaved.retainBundles, "never");
-    assert.equal(enabledSaved.deleteSpawnedPiSessionsOnCleanup, true);
-
-    // Save materializes an explicit false rather than omitting the key.
-    await persistReviewSettings(configPath, { ...selection, deleteSpawnedPiSessionsOnCleanup: false });
-    assert.equal(JSON.parse(await readFile(configPath, "utf8")).deleteSpawnedPiSessionsOnCleanup, false);
-
-    // Strict validation rejects a coercible non-boolean before any write.
-    const before = await readFile(configPath, "utf8");
-    await assert.rejects(
-      persistReviewSettings(configPath, { ...selection, deleteSpawnedPiSessionsOnCleanup: "true" as never }),
-      /deleteSpawnedPiSessionsOnCleanup must be a boolean/,
-    );
-    assert.equal(await readFile(configPath, "utf8"), before);
-    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

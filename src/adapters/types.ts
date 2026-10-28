@@ -13,18 +13,11 @@ export interface ModelAdapterRequest {
   onUpdate?: (message: string) => void;
 }
 
-/**
- * Reviewer pass identity: adapter plus session id only.
- *
- * #533: a pass's native session file and workspace live in exactly one place —
- * the canonical reference this owner records at
- * `<bundleDir>/pi-sessions/<id>.json`. Reviewer passes are always fresh, so
- * this struct is an identity reference for artifacts, never a continuation
- * handle, and it deliberately carries no second copy of the path state.
- */
 export interface ReviewerSession {
   adapter: string;
   id: string;
+  /** Native Pi file reported by this fresh reviewer. */
+  file?: string;
 }
 
 export interface ModelAdapter {

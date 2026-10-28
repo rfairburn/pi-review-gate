@@ -478,6 +478,12 @@ shutdown/replacement/reload still closes browser resources. See
 
 ## Reviewer execution
 
+Pi reviewer histories also live in Pi's native session store. Each pass records its
+native `session.file` in `reviewers/<id>/invocation.json`; histories are never copied
+into immutable evidence or reused by another reviewer. They survive cleanup by default.
+With `deleteSpawnedPiSessionsOnCleanup` On, existing cleanup points also delete their
+associated native files; a retained bundle may then reference an already-cleaned file.
+
 Every built-in Codex, Claude, and Pi review pass starts a fresh CLI session. Correction
 context comes from the stable evidence bundle rather than accumulated model/tool
 history, avoiding reviewer compaction across passes. Correction reviewers begin with the
@@ -681,12 +687,6 @@ isolated under each invocation's `reviewers/<id>/` directory. A canceled numbere
 invocation contains `CANCELED.md` and `canceled.json` (including process settlement and
 any termination diagnostic) rather than reviewer results.
 
-Bundle retention itself is governed by `retainBundles`; see
-[Configuration](configuration.md#top-level-fields). Each newly spawned Pi reviewer
-keeps a fresh native session in Pi's standard resolved store; bundle metadata holds
-its exact reference, not a copy of the mutable native transcript. Reviewer and peer
-native histories are not added to review evidence. Native audit history survives
-bundle cleanup unless `deleteSpawnedPiSessionsOnCleanup` is explicitly On, which
-only deletes associated spawned sessions when existing cleanup removes the bundle.
-Both controls are under `/review-settings` → **Retention**. Shutdown behavior and what
-survives a restart are owned by [Recovery](recovery.md).
+Retention itself is governed by `retainBundles`; see
+[Configuration](configuration.md#top-level-fields). Shutdown behavior and what survives
+a restart are owned by [Recovery](recovery.md).

@@ -29,7 +29,6 @@ const baseSelection: ReviewSettingsSelection = {
   maxCorrectionCycles: 1,
   implementationGuidanceAfterCorrectionAttempts: 1,
   retainBundles: "on-failure",
-  deleteSpawnedPiSessionsOnCleanup: false,
   maxWorkers: 4,
   retryPolicy: { ...DEFAULT_EXECUTION_RETRY_POLICY },
   subtaskNotifications: "quiet",

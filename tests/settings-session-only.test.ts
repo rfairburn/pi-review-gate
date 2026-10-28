@@ -123,15 +123,6 @@ function rootSettingsRow(label: typeof ROOT_SETTING_LABELS[number], value: strin
   return alignedTestRow(label, value, ROOT_SETTING_LABELS);
 }
 
-const RETENTION_SETTING_LABELS = [
-  "Bundle retention",
-  "Delete spawned Pi sessions during cleanup",
-] as const;
-
-function retentionSettingsRow(label: typeof RETENTION_SETTING_LABELS[number], value: string): string {
-  return alignedTestRow(label, value, RETENTION_SETTING_LABELS);
-}
-
 function scheduledEditorRow(label: string, value: string): string {
   return alignedTestRow(label, value, SCHEDULED_EDITOR_LABELS);
 }
@@ -234,47 +225,6 @@ test("YouShouldKnow controls apply on Escape, cancel transactionally, and persis
     enabled: true,
     completionGuidance: false,
   });
-});
-
-test("spawned-session cleanup applies on root Escape, cancels transactionally, and persists on Save", async () => {
-  const h = await sessionWorkspace({
-    enabled: false,
-    retainBundles: "on-failure",
-  });
-
-  await h.run([
-    rootSettingsRow("Retention", "On failure"),
-    retentionSettingsRow("Delete spawned Pi sessions during cleanup", "Off"),
-    "Back",
-    undefined,
-  ]);
-  assertNoErrors(h);
-  assert.equal(h.config.deleteSpawnedPiSessionsOnCleanup, true, "root Escape applies the cleanup toggle to this session");
-  assert.equal(h.config.retainBundles, "on-failure", "the bundle-retention choice is unchanged");
-  assert.equal(await readFile(h.configPath, "utf8"), h.original, "session-only changes do not write the file");
-
-  await h.run([
-    rootSettingsRow("Retention", "On failure"),
-    retentionSettingsRow("Delete spawned Pi sessions during cleanup", "On"),
-    "Back",
-    "Cancel",
-  ]);
-  assertNoErrors(h);
-  assert.equal(h.config.deleteSpawnedPiSessionsOnCleanup, true, "Cancel preserves the previously applied session state");
-  assert.equal(await readFile(h.configPath, "utf8"), h.original, "Cancel writes nothing");
-
-  await h.run([
-    rootSettingsRow("Retention", "On failure"),
-    retentionSettingsRow("Delete spawned Pi sessions during cleanup", "On"),
-    "Back",
-    "Save changes",
-  ]);
-  assertNoErrors(h);
-  assert.equal(h.config.deleteSpawnedPiSessionsOnCleanup, false);
-  assert.equal(h.config.retainBundles, "on-failure");
-  const saved = JSON.parse(await readFile(h.configPath, "utf8"));
-  assert.equal(saved.deleteSpawnedPiSessionsOnCleanup, false);
-  assert.equal(saved.retainBundles, "on-failure");
 });
 
 test("root Escape applies the staged executor switch session-only; Cancel after a further edit keeps it", async () => {
@@ -514,7 +464,6 @@ test("assembleStagedSelectionConfig stages over the live base without touching t
     maxCorrectionCycles: 1,
     implementationGuidanceAfterCorrectionAttempts: 1,
     retainBundles: "always",
-    deleteSpawnedPiSessionsOnCleanup: true,
     maxWorkers: 2,
     retryPolicy: { maxRetries: 3, baseDelayMs: 500, maxDelayMs: 15000, jitter: true, maxSameIncidentRepeats: 2 },
     subtaskNotifications: "noisy",
@@ -530,7 +479,6 @@ test("assembleStagedSelectionConfig stages over the live base without touching t
   assert.equal(next.operatingMode, "execute");
   assert.equal(next.review!.subtaskEnabled, false);
   assert.equal(next.retainBundles, "always");
-  assert.equal(next.deleteSpawnedPiSessionsOnCleanup, true);
   assert.equal(next.execution!.deferredPiTools, false);
   assert.deepEqual(Object.keys(next.externalAgents!), ["replaced"], "the supplied catalog replaces the base's");
   assert.equal(next.enabled, true, "non-staged base fields survive");

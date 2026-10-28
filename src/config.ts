@@ -582,11 +582,11 @@ export interface ReviewGateConfig {
   waveArtifactTtlMs?: number;
   retainBundles: RetainBundles;
   /**
-   * Default-off (#533): delete the Pi sessions this gate spawned when their
-   * review or execution artifacts are cleaned up. This only selects what
-   * cleanup does; changing it never deletes anything by itself.
+   * Delete the native Pi sessions this extension spawned when the artifact root
+   * or review pass that recorded them is already being cleaned up. Off (the
+   * default) retains every spawned session in Pi's own store.
    */
-  deleteSpawnedPiSessionsOnCleanup: boolean;
+  deleteSpawnedPiSessionsOnCleanup?: boolean;
   review?: ReviewSelectionConfig;
   externalAgents?: ExternalAgentCatalog;
   execution?: ExecutionConfig;
@@ -778,11 +778,6 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
   if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
     throw new Error("enabled must be a boolean");
   }
-  // Absent stays default-off for older configs; only a real boolean is
-  // accepted, so a coercible string can never enable session deletion.
-  if (value.deleteSpawnedPiSessionsOnCleanup !== undefined && typeof value.deleteSpawnedPiSessionsOnCleanup !== "boolean") {
-    throw new Error("deleteSpawnedPiSessionsOnCleanup must be a boolean");
-  }
   rejectLegacyReviewFields(value);
   if (isRecord(value.execution)) {
     rejectLegacyExecutionFields(value.execution);
@@ -809,7 +804,7 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
       "waveArtifactTtlMs",
     ),
     retainBundles: normalizeRetainBundles(value.retainBundles),
-    deleteSpawnedPiSessionsOnCleanup: value.deleteSpawnedPiSessionsOnCleanup ?? DEFAULT_CONFIG.deleteSpawnedPiSessionsOnCleanup,
+    deleteSpawnedPiSessionsOnCleanup: normalizeDeleteSpawnedPiSessions(value.deleteSpawnedPiSessionsOnCleanup),
     review: value.review === undefined ? undefined : normalizeReviewSelection(value.review),
     externalAgents: value.externalAgents === undefined ? undefined : normalizeExternalAgents(value.externalAgents),
     execution: value.execution === undefined ? undefined : normalizeExecution(value.execution),
@@ -2168,6 +2163,12 @@ function normalizeRetainBundles(value: unknown): RetainBundles {
   if (value === undefined) return DEFAULT_CONFIG.retainBundles;
   if (value === "never" || value === "always" || value === "on-failure") return value;
   throw new Error("retainBundles must be one of: never, on-failure, always");
+}
+
+function normalizeDeleteSpawnedPiSessions(value: unknown): boolean {
+  if (value === undefined) return DEFAULT_CONFIG.deleteSpawnedPiSessionsOnCleanup === true;
+  if (typeof value === "boolean") return value;
+  throw new Error("deleteSpawnedPiSessionsOnCleanup must be a boolean");
 }
 
 function normalizeOptionalThinkingLevel(value: unknown, field: string): ThinkingLevel | undefined {

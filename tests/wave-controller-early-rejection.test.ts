@@ -41,7 +41,6 @@ function makeBlockingExecutorConfig(): ReviewGateConfig {
     maxFileBytes: 1_048_576,
     maxSnapshotBytes: 52_428_800,
     retainBundles: "never",
-    deleteSpawnedPiSessionsOnCleanup: false,
     execution: {
       workerResources: { "default": { selection: { source: "external", id: "fake-blocked" }, maxConcurrent: 1 } },
       routes: { execute: [{ resourceId: "default" }], research: [] },

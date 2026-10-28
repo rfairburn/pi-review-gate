@@ -189,10 +189,13 @@ before(async () => {
   // process outcome, operation record, review report with a secret to redact).
   const waveRoot = join(base, "wave-1");
   const artifactDir = join(waveRoot, "artifacts", "task-ev");
-  await mkdir(join(artifactDir, "executor-sessions"), { recursive: true });
   await mkdir(join(artifactDir, "executor", "0001"), { recursive: true });
 
-  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), [
+  // Pi keeps the spawned session in its own store, outside the artifact root;
+  // the per-turn record is the only reference to it (#533).
+  const sessionFile = join(base, "native-pi-store", `${SESSION_ID}.jsonl`);
+  await mkdir(join(base, "native-pi-store"), { recursive: true });
+  await writeFile(sessionFile, [
     JSON.stringify({ type: "session", version: 3, id: SESSION_ID, timestamp: "2025-06-01T10:00:00.000Z", cwd: "/tmp/wt" }),
     JSON.stringify({
       type: "message", id: "m-1", parentId: null, timestamp: "2025-06-01T10:00:01.000Z",
@@ -218,7 +221,7 @@ before(async () => {
     }),
   ].join("\n") + "\n");
 
-  await writeFile(join(artifactDir, "executor", "0001", "process-result.json"), JSON.stringify({ adapter: "pi-model", code: 1, sessionId: SESSION_ID }));
+  await writeFile(join(artifactDir, "executor", "0001", "process-result.json"), JSON.stringify({ adapter: "pi-model", code: 1, sessionId: SESSION_ID, sessionFile }));
   // The worker claim is multi-line with significant whitespace: the expanded
   // deep read must preserve it verbatim.
   await writeFile(
@@ -289,7 +292,6 @@ before(async () => {
   // disclose the gaps explicitly.
   const emptyWaveRoot = join(base, "wave-2");
   const emptyArtifactDir = join(emptyWaveRoot, "artifacts", "task-empty");
-  await mkdir(join(emptyArtifactDir, "executor-sessions"), { recursive: true });
   await mkdir(join(emptyArtifactDir, "executor", "0001"), { recursive: true });
   const emptyTask = newTask({ title: "EMPTY-EVIDENCE-WORK", instructions: "work", acceptanceCriteria: ["done"] });
   emptyTask.taskId = "task-empty";

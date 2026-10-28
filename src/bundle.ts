@@ -8,11 +8,6 @@ import type { ChangeIdentity } from "./schema";
 import { summarizeReviewChanges } from "./change-context";
 import { normalizeEvidenceEventPaths, type EvidenceBundle, type EvidencePathRoots } from "./evidence";
 import {
-  deleteReviewBundlePiSessions,
-  throwPiSessionDeletionFailures,
-  type SpawnedPiSessionCleanupOptions,
-} from "./pi-session-cleanup";
-import {
   buildReviewerPrompt,
   buildReviewerQuestionPrompt,
   buildReviewerInstructions,
@@ -158,31 +153,13 @@ async function initializeBundle(input: CreateBundleInput, dir: string, work: Bun
   };
 }
 
-export async function removeReviewBundle(
-  dir: string,
-  options: SpawnedPiSessionCleanupOptions = {},
-): Promise<void> {
-  // #533: the opt-in session deletion is bound to the removal that is already
-  // happening — same artifact, same lifecycle point, no extra eligibility. A
-  // bundle whose sessions cannot all be deleted is retained so its references
-  // survive the failure and the caller reports it through its existing path. The
-  // failure is a `PiSessionCleanupError`, which a shutdown-bound caller can
-  // disclose without aborting its own finalization.
-  if (options.deleteSpawnedPiSessions) {
-    throwPiSessionDeletionFailures(
-      (await deleteReviewBundlePiSessions(dir)).failures,
-      `review bundle ${dir}`,
-    );
-  }
+export async function removeReviewBundle(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
 }
 
-export async function removeTransientWindowBundle(
-  window: ReviewExchangeBundleOwner | undefined,
-  options: SpawnedPiSessionCleanupOptions = {},
-): Promise<void> {
+export async function removeTransientWindowBundle(window: ReviewExchangeBundleOwner | undefined): Promise<void> {
   if (window?.bundleDir && !window.retainBundleAfterClose) {
-    await removeReviewBundle(window.bundleDir, options);
+    await removeReviewBundle(window.bundleDir);
     window.bundleDir = undefined;
   }
 }

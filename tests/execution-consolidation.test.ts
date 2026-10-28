@@ -64,7 +64,6 @@ executorTimeoutMs: 1800000,
 maxCorrectionCycles: 1,
 implementationGuidanceAfterCorrectionAttempts: 1,
 retainBundles: "on-failure",
-deleteSpawnedPiSessionsOnCleanup: false,
 maxWorkers: 12,
 retryPolicy: {
       maxRetries: 3,

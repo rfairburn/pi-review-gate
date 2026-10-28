@@ -123,9 +123,14 @@ async function managerWithEvidenceTask(executionId: string, taskId: string, sess
   const artifactDir = join(waveRoot, "artifacts", taskId);
   const groupRoot = join(base, `pi-review-execution-${executionId}`);
   await mkdir(sourceRoot, { recursive: true });
-  await mkdir(join(artifactDir, "executor-sessions"), { recursive: true });
   await mkdir(groupRoot, { recursive: true });
-  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(...sessionLines));
+  // Pi keeps the spawned session in its own store, outside the artifact root;
+  // the per-turn record is the only reference to it (#533).
+  const sessionFile = join(base, "native-pi-store", `${SESSION_ID}.jsonl`);
+  await mkdir(join(base, "native-pi-store"), { recursive: true });
+  await mkdir(join(artifactDir, "executor", "0001"), { recursive: true });
+  await writeFile(join(artifactDir, "executor", "0001", "process-result.json"), JSON.stringify({ adapter: "pi-model", code: 0, sessionId: SESSION_ID, sessionFile }));
+  await writeFile(sessionFile, jsonlLines(...sessionLines));
 
   const now = new Date().toISOString();
   const record = newTask({ title: "deep read fixture", instructions: "do bounded work", acceptanceCriteria: ["done"] });

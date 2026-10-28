@@ -26,12 +26,8 @@ import { readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ScheduledTaskReviewOverride } from "../config";
-import {
-  deleteOwnedRootPiSessions,
-  throwPiSessionDeletionFailures,
-  type SpawnedPiSessionCleanupOptions,
-} from "../pi-session-cleanup";
 import { atomicWrite } from "./durable-write";
+import { deleteRecordedNativeSessions, nothingCleaned, type NativeSessionCleanup } from "./native-session-refs";
 import { normalizeWorkerReviewEvidencePolicy, workerReviewEvidenceScope } from "./review-evidence-policy";
 import {
   clipActivity,
@@ -637,23 +633,28 @@ export async function readTaskArchiveIndex(
   return parsed;
 }
 
-export async function removeOwnedWaveRoot(
-  root: string,
-  options: SpawnedPiSessionCleanupOptions = {},
-): Promise<void> {
+/**
+ * Remove one wave root only after the existing ownership guard accepts it.
+ * Opt-in (#533): when `deleteNativeSessions` is on, the sessions this root
+ * recorded are unlinked after the guard passes and before the root is removed,
+ * so a refused foreign root can never delete sessions outside itself.
+ */
+export async function removeOwnedWaveRoot(root: string, deleteNativeSessions = false): Promise<NativeSessionCleanup> {
   const resolved = resolve(root);
   const temporaryRoot = await realpath(resolve(tmpdir()));
   if (!basename(resolved).startsWith("wave-") || dirname(resolved) !== temporaryRoot) {
     throw new Error(`Refusing to remove unrecognized wave root: ${resolved}`);
   }
-  await removeOwnedRootWithSpawnedPiSessions(resolved, options);
+  const cleanup = deleteNativeSessions ? await deleteRecordedNativeSessions(resolved) : nothingCleaned();
+  await rm(resolved, { recursive: true, force: true });
+  return cleanup;
 }
 
 export async function removeOwnedExecutionRoot(
   root: string,
   tempBase?: string,
-  options: SpawnedPiSessionCleanupOptions = {},
-): Promise<void> {
+  deleteNativeSessions = false,
+): Promise<NativeSessionCleanup> {
   const resolved = await realpath(resolve(root)).catch(() => resolve(root));
   const temporaryRoot = await realpath(resolve(tmpdir()));
   const resolvedBase = dirname(resolved);
@@ -667,25 +668,7 @@ export async function removeOwnedExecutionRoot(
     || (resolvedBase !== temporaryRoot && (allowedBase === undefined || resolvedBase !== allowedBase))) {
     throw new Error(`Refusing to remove unrecognized execution root: ${resolved}`);
   }
-  await removeOwnedRootWithSpawnedPiSessions(resolved, options);
-}
-
-/**
- * #533: the ownership check above already selected this root; the opt-in
- * session cleanup removes only the EXACT native sessions that root's own task
- * artifact references record, and only at this removal. A root whose sessions
- * cannot all be deleted is kept, with the `PiSessionCleanupError` surfaced to
- * the caller (which may disclose it instead of aborting its own finalization).
- */
-async function removeOwnedRootWithSpawnedPiSessions(
-  resolvedRoot: string,
-  options: SpawnedPiSessionCleanupOptions,
-): Promise<void> {
-  if (options.deleteSpawnedPiSessions) {
-    throwPiSessionDeletionFailures(
-      (await deleteOwnedRootPiSessions(resolvedRoot)).failures,
-      `owned root ${resolvedRoot}`,
-    );
-  }
-  await rm(resolvedRoot, { recursive: true, force: true });
+  const cleanup = deleteNativeSessions ? await deleteRecordedNativeSessions(resolved) : nothingCleaned();
+  await rm(resolved, { recursive: true, force: true });
+  return cleanup;
 }

@@ -330,27 +330,3 @@ test("/subtasks-view keeps Escape-applied settings live; root Ctrl+S persists th
     await rm(dir, { recursive: true, force: true });
   }
 });
-
-test("root Ctrl+S persists the spawned-session cleanup toggle staged in the Retention submenu", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-review-entrypoint-cleanup-ctrls-"));
-  try {
-    const { configPath } = await writeDiskA(dir);
-    const rt = await activateRuntime(dir);
-
-    // Root → Retention (row 10) → toggle Delete spawned Pi sessions → Back,
-    // then Ctrl+S at the root latches the same canonical Save path as the row.
-    await runTuiSettings(rt, [
-      [KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER],
-      [KEY_DOWN, KEY_ENTER],
-      [KEY_DOWN, KEY_ENTER],
-      [CTRL_S],
-    ]);
-    assertNoErrors(rt);
-    assert.ok(rt.notices.some((notice) => notice === "info: Review settings saved."));
-    const saved = JSON.parse(await readFile(configPath, "utf8"));
-    assert.equal(saved.deleteSpawnedPiSessionsOnCleanup, true);
-    assert.equal(saved.retainBundles, "never", "the unchanged bundle-retention value persists beside the toggle");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});

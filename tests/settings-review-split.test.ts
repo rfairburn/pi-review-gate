@@ -112,7 +112,6 @@ function baseSelection(overrides: Partial<ReviewSettingsSelection> = {}): Review
     maxCorrectionCycles: 1,
     implementationGuidanceAfterCorrectionAttempts: 1,
     retainBundles: "on-failure",
-    deleteSpawnedPiSessionsOnCleanup: false,
     maxWorkers: 2,
     retryPolicy: {
       maxRetries: 2,

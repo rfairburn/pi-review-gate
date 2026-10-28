@@ -829,7 +829,6 @@ const baseSelection: ReviewSettingsSelection = {
   maxCorrectionCycles: 3,
   implementationGuidanceAfterCorrectionAttempts: 1,
   retainBundles: "on-failure",
-  deleteSpawnedPiSessionsOnCleanup: false,
   maxWorkers: 2,
   retryPolicy: {
     maxRetries: 2,

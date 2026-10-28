@@ -267,9 +267,8 @@ review: { activeReviewers: [
 
   await registered.handler("", contextWithSelections([
     rootSettingsRow("Retention", "On failure"),
-    retentionSettingsRow("Bundle retention", "On failure"),
+    retentionSubmenuRow("Bundle retention", "On failure"),
     "Always",
-    "Back",
     undefined,
   ]));
 
@@ -468,7 +467,7 @@ test("bundle retention is staged and saved from review settings", async () => {
 
   await registered.handler("", contextWithSelections([
     rootSettingsRow("Retention", "On failure"),
-    retentionSettingsRow("Bundle retention", "On failure"),
+    retentionSubmenuRow("Bundle retention", "On failure"),
     "Always",
     "Back",
     "Save changes",
@@ -476,13 +475,11 @@ test("bundle retention is staged and saved from review settings", async () => {
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
   assert.equal(saved.retainBundles, "always");
-  assert.equal(saved.deleteSpawnedPiSessionsOnCleanup, false);
   assert.equal(config.retainBundles, "always");
-  assert.equal(config.deleteSpawnedPiSessionsOnCleanup, false);
 });
 
-test("retention submenu groups bundle retention with the default-off spawned-session cleanup", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-retention-submenu-"));
+test("spawned Pi session deletion is Off by default, staged on save, and untouched on cancel", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-session-cleanup-"));
   const configPath = join(dir, "review-gate.json");
   const original = JSON.stringify({
     enabled: true,
@@ -490,33 +487,30 @@ test("retention submenu groups bundle retention with the default-off spawned-ses
     review: { activeReviewers: [] },
   });
   await writeFile(configPath, original, "utf8");
-  const config = normalizeConfig(JSON.parse(original));
+  const config: ReviewGateConfig = normalizeConfig(JSON.parse(original));
   const registered = commandHarness();
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
-  // The toggle only stages: Cancel leaves both the file and the live config
-  // exactly as they were.
+  // The Retention submenu opens on the default and cancelling writes nothing.
   await registered.handler("", contextWithSelections([
     rootSettingsRow("Retention", "On failure"),
-    retentionSettingsRow("Delete spawned Pi sessions during cleanup", "Off"),
     "Back",
-    "Cancel",
+    undefined,
   ]));
-  assert.equal(await readFile(configPath, "utf8"), original);
-  assert.equal(config.deleteSpawnedPiSessionsOnCleanup, false);
+  assert.equal(await readFile(configPath, "utf8"), original, "cancel must not write the settings file");
 
-  // Save persists the toggle beside the unchanged bundle-retention value and
-  // materializes the boolean even though the opening file omitted it.
-  await registered.handler("", contextWithSelections([
+  // The opt-in is explicit: toggling it On and saving persists the change.
+  const savedConfig: ReviewGateConfig = normalizeConfig(JSON.parse(original));
+  const savedHarness = commandHarness();
+  registerReviewSettings({ pi: savedHarness.pi, config: savedConfig, configPath });
+  await savedHarness.handler("", contextWithSelections([
     rootSettingsRow("Retention", "On failure"),
-    retentionSettingsRow("Delete spawned Pi sessions during cleanup", "Off"),
+    retentionSubmenuRow("Spawned Pi sessions", "Retained"),
     "Back",
     "Save changes",
   ]));
-  const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.equal(saved.retainBundles, "on-failure");
-  assert.equal(saved.deleteSpawnedPiSessionsOnCleanup, true);
-  assert.equal(config.deleteSpawnedPiSessionsOnCleanup, true);
+  assert.equal(JSON.parse(await readFile(configPath, "utf8")).deleteSpawnedPiSessionsOnCleanup, true);
+  assert.equal(savedConfig.deleteSpawnedPiSessionsOnCleanup, true);
 });
 
 test("subtasks view is staged and saved as a global review setting", async () => {
@@ -2021,15 +2015,6 @@ function rootSettingsRow(label: typeof ROOT_SETTING_LABELS[number], value: strin
   return alignedTestRow(label, value, ROOT_SETTING_LABELS);
 }
 
-const RETENTION_SETTING_LABELS = [
-  "Bundle retention",
-  "Delete spawned Pi sessions during cleanup",
-] as const;
-
-function retentionSettingsRow(label: typeof RETENTION_SETTING_LABELS[number], value: string): string {
-  return alignedTestRow(label, value, RETENTION_SETTING_LABELS);
-}
-
 function retrySettingsRow(label: typeof RETRY_SETTING_LABELS[number], value: string): string {
   return alignedTestRow(label, value, RETRY_SETTING_LABELS);
 }
@@ -2040,6 +2025,12 @@ function webSettingsRow(label: typeof WEB_SETTING_LABELS[number], value: string)
 
 function browserPermissionsRow(label: typeof BROWSER_PERMISSION_LABELS[number], value: string): string {
   return alignedTestRow(label, value, BROWSER_PERMISSION_LABELS);
+}
+
+const RETENTION_SUBMENU_LABELS = ["Bundle retention", "Spawned Pi sessions"] as const;
+
+function retentionSubmenuRow(label: typeof RETENTION_SUBMENU_LABELS[number], value: string): string {
+  return alignedTestRow(label, value, RETENTION_SUBMENU_LABELS);
 }
 
 function alignedTestRow(label: string, value: string, labels: readonly string[]): string {

@@ -87,55 +87,41 @@ export async function selectBundleRetention(ui: UiContext, current: RetainBundle
   return rows.find((row) => selected === `${row.label}${row.value === current ? "  current" : ""}`)?.value ?? current;
 }
 
-/** Staged state of the Retention submenu (#533); draft-only until Save or root Escape. */
-export interface RetentionSectionState {
-  retainBundles: RetainBundles;
-  deleteSpawnedPiSessionsOnCleanup: boolean;
-}
-
-export function spawnedSessionCleanupLabel(value: boolean): string {
-  return value ? "On" : "Off";
-}
-
 /**
- * The Retention submenu (#533): groups the unchanged bundle-retention picker
- * with the default-off spawned-session cleanup toggle. The toggle only
- * stages a selection; it performs no deletion, sweep, or I/O of its own, and
- * the root Save/root-Escape/Cancel transaction decides when it takes effect.
+ * The Retention submenu: the existing bundle-retention choice plus the opt-in
+ * deletion of the native Pi sessions this extension spawned (issue #533).
+ * Both edits return only when the caller leaves the submenu.
  */
-export async function selectRetentionSettings(
+export async function selectRetention(
   ui: UiContext,
-  initial: RetentionSectionState,
-): Promise<RetentionSectionState> {
-  const state: RetentionSectionState = { ...initial };
-  await notify(
-    ui,
-    "Bundle retention keeps review bundles exactly as before. Deleting spawned Pi sessions during cleanup only selects what later cleanup removes; changing it here deletes nothing and applies after Save, or for this session after a root Escape apply.",
-    "info",
-  );
+  initialRetention: RetainBundles,
+  initialDeleteSessions: boolean,
+): Promise<{ retainBundles: RetainBundles; deleteSpawnedPiSessions: boolean }> {
+  let retainBundles = initialRetention;
+  let deleteSpawnedPiSessions = initialDeleteSessions;
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   while (true) {
-    const [bundleRow, spawnedSessionsRow] = alignedSettingsRows([
-      ["Bundle retention", retentionLabel(state.retainBundles)],
-      ["Delete spawned Pi sessions during cleanup", spawnedSessionCleanupLabel(state.deleteSpawnedPiSessionsOnCleanup)],
+    const [bundlesRow, sessionsRow] = alignedSettingsRows([
+      ["Bundle retention", retentionLabel(retainBundles)],
+      ["Spawned Pi sessions", deleteSpawnedPiSessions ? "Deleted on cleanup" : "Retained"],
     ]);
     const choice = await retainedSelect(ui, {
       title: "Retention",
       rows: [
-        { key: "bundleRetention", label: bundleRow },
-        { key: "deleteSpawnedSessions", label: spawnedSessionsRow },
+        { key: "bundles", label: bundlesRow },
+        { key: "sessions", label: sessionsRow },
         { key: "back", label: "Back" },
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return state;
+    if (!choice || choice === "back") return { retainBundles, deleteSpawnedPiSessions };
     lastKey = choice;
-    if (choice === "bundleRetention") {
-      state.retainBundles = await selectBundleRetention(ui, state.retainBundles);
+    if (choice === "bundles") {
+      retainBundles = await selectBundleRetention(ui, retainBundles);
       continue;
     }
-    state.deleteSpawnedPiSessionsOnCleanup = !state.deleteSpawnedPiSessionsOnCleanup;
+    deleteSpawnedPiSessions = !deleteSpawnedPiSessions;
   }
 }
 
@@ -214,6 +200,11 @@ export function retentionLabel(value: RetainBundles): string {
   if (value === "on-failure") return "On failure";
   if (value === "always") return "Always";
   return "Never";
+}
+
+/** Root-row summary; unchanged wording while session deletion stays Off. */
+export function retentionSummary(retainBundles: RetainBundles, deleteSpawnedPiSessions: boolean): string {
+  return deleteSpawnedPiSessions ? `${retentionLabel(retainBundles)} · sessions deleted` : retentionLabel(retainBundles);
 }
 
 export async function selectReviewPolicy(

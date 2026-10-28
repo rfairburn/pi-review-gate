@@ -316,14 +316,6 @@ genuinely unlanded recovery checkpoints are preserved for exact-session restart.
 worktrees are removed after completion; dirty or conflicted worktrees are preserved for
 diagnosis ([Delegated execution](delegated-execution.md#landing-and-source-preservation)).
 
-Native histories of newly spawned Pi workers and reviewers are separate from those
-artifacts and survive cleanup by default. The default-off
-`deleteSpawnedPiSessionsOnCleanup` setting opts into deleting only the exact associated
-spawned sessions at those same existing artifact cleanup points; it does not change
-which artifacts qualify or trigger a purge when enabled. Retained native history is
-for audit and compatible exact-session continuation, not cross-harness transcript
-replay or reviewer-visible evidence ([Artifacts](delegated-execution.md#artifacts)).
-
 ## Explicit salvage of worker work without a checkpoint
 
 Some failed tasks never produce an ordinary verified checkpoint: the executor left the

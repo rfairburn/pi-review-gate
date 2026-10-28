@@ -26,9 +26,39 @@ after(async () => {
 async function makeTaskArtifacts(name: string, taskId = "task-1"): Promise<{ waveRoot: string; artifactDir: string }> {
   const waveRoot = join(root, name);
   const artifactDir = join(waveRoot, "artifacts", taskId);
-  await mkdir(join(artifactDir, "executor-sessions"), { recursive: true });
   await mkdir(join(artifactDir, "executor", "0001"), { recursive: true });
   return { waveRoot, artifactDir };
+}
+
+// Pi keeps a spawned session in its own store, outside every artifact root
+// (#533). Fixtures model that: the fake store sits beside the wave root and is
+// referenced only by the durable per-turn process-result.json record.
+
+/** The fake native Pi session store for one fixture. */
+function nativeStore(name: string): string {
+  return join(root, `${name}-native-store`);
+}
+
+/** Where Pi keeps the session file one fixture records. */
+function nativeSessionFile(name: string, sessionId: string): string {
+  return join(nativeStore(name), `${sessionId}.jsonl`);
+}
+
+/**
+ * The bounded public first line of a native Pi session file. Its timestamp is
+ * part of the fixture's ordering (a source is ordered by its first record), so
+ * fixtures that compare source order pass the time they need.
+ */
+function sessionHeader(id: string, timestamp = "2025-06-02T09:00:00.000Z"): string {
+  return JSON.stringify({ type: "session", version: 3, id, timestamp, cwd: "/tmp/wt" });
+}
+
+/** The durable per-turn record a completed Pi turn leaves for its session. */
+async function recordPiSession(artifactDir: string, sessionFile: string, sessionId: string, turn = "0001"): Promise<void> {
+  await mkdir(dirname(sessionFile), { recursive: true });
+  const dir = join(artifactDir, "executor", turn);
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "process-result.json"), JSON.stringify({ adapter: "pi-model", code: 0, sessionId, sessionFile }), "utf8");
 }
 
 function jsonlLines(...entries: unknown[]): string {
@@ -94,10 +124,13 @@ function piSessionEntries(): unknown[] {
 
 test("pi session: paired call/result, privacy exclusion, redaction, find, range", async () => {
   const { artifactDir } = await makeTaskArtifacts("pi-basic");
-  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(...piSessionEntries()));
+  const sessionPath = nativeSessionFile("pi-basic", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
+  await writeFile(sessionPath, jsonlLines(...piSessionEntries()));
   const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: join(root, "pi-basic"), artifactDir });
 
-  assert.equal(bundle.snapshot.totalEntries, 4);
+  // The session header, three records, and the turn's own process outcome.
+  assert.equal(bundle.snapshot.totalEntries, 5);
   const call = bundle.snapshot.entries.find((entry) => entry.kind === "tool_call")!;
   const result = bundle.snapshot.entries.find((entry) => entry.kind === "tool_result")!;
   assert.ok(call && result);
@@ -151,7 +184,9 @@ test("github actions id-token permission survives find/preview/deep views while 
   ].join("\n");
 
   const { artifactDir } = await makeTaskArtifacts("pi-idtoken");
-  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(
+  const sessionPath = nativeSessionFile("pi-idtoken", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
+  await writeFile(sessionPath, jsonlLines(
     { type: "session", version: 3, id: SESSION_ID, timestamp: "2025-06-01T10:00:00.000Z", cwd: "/tmp/wt" },
     {
       type: "message", id: "m-user-1", parentId: null, timestamp: "2025-06-01T10:00:01.000Z",
@@ -201,7 +236,8 @@ test("github actions id-token permission survives find/preview/deep views while 
 
 test("#55: cursor continuation after appending the result preserves the id-token: write declaration and never exposes the synthetic credential", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("pi-idtoken-cursor");
-  const sessionPath = join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`);
+  const sessionPath = nativeSessionFile("pi-idtoken-cursor", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
   await writeFile(sessionPath, jsonlLines(...piSessionEntries()));
 
   const bundle1 = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
@@ -249,7 +285,8 @@ test("#55: cursor continuation after appending the result preserves the id-token
 
 test("cursor: incremental continuation across appends without duplicates", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("pi-cursor");
-  const sessionPath = join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`);
+  const sessionPath = nativeSessionFile("pi-cursor", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
   await writeFile(sessionPath, jsonlLines(...piSessionEntries()));
 
   const bundle1 = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
@@ -271,7 +308,7 @@ test("cursor: incremental continuation across appends without duplicates", async
   ));
 
   const bundle2 = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
-  assert.equal(bundle2.snapshot.totalEntries, 6);
+  assert.equal(bundle2.snapshot.totalEntries, 7);
   const continued = readSubtaskEvidence(bundle2, { cursor: first.cursor! });
   assert.equal(continued.mode, "cursor");
   const continuedIds = (continued.entries ?? []).map((entry) => entry.entryId);
@@ -280,6 +317,7 @@ test("cursor: incremental continuation across appends without duplicates", async
     bundle2.snapshot.entries[3].entryId,
     bundle2.snapshot.entries[4].entryId,
     bundle2.snapshot.entries[5].entryId,
+    bundle2.snapshot.entries[6].entryId,
   ]);
   // No duplicates of the first page.
   assert.deepEqual(continuedIds.filter((id) => firstIds.includes(id)), []);
@@ -292,7 +330,8 @@ test("cursor: incremental continuation across appends without duplicates", async
 
 test("cursor: expired sources and replaced records are rejected explicitly", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("pi-cursor-expired");
-  const sessionPath = join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`);
+  const sessionPath = nativeSessionFile("pi-cursor-expired", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
   await writeFile(sessionPath, jsonlLines(...piSessionEntries()));
   const bundle1 = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   const cursor = readSubtaskEvidence(bundle1, { index: 0, limit: 2 }).cursor!;
@@ -366,7 +405,9 @@ test("pi turn with missing session file falls back to stdout stream explicitly",
 test("pi turn with session file is never double-counted from stdout", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("pi-nodup");
   const sessionId = "99999999-8888-7777-6666-555555555555";
-  await writeFile(join(artifactDir, "executor-sessions", `${sessionId}.jsonl`), jsonlLines(
+  const sessionPath = nativeSessionFile("pi-nodup", sessionId);
+  await recordPiSession(artifactDir, sessionPath, sessionId);
+  await writeFile(sessionPath, jsonlLines(
     { type: "session", version: 3, id: sessionId, timestamp: "2025-06-01T11:00:00.000Z", cwd: "/tmp/wt" },
     {
       type: "message", id: "m-asst-9", parentId: null, timestamp: "2025-06-01T11:00:01.000Z",
@@ -377,7 +418,9 @@ test("pi turn with session file is never double-counted from stdout", async () =
   await writeTurn(artifactDir, "0001", "pi-model", [
     { type: "tool_execution_start", toolCallId: "dup-1", toolName: "bash", args: { command: "echo once" }, timestamp: "2025-06-01T11:00:01.000Z" },
     { type: "tool_execution_end", toolCallId: "dup-1", toolName: "bash", isError: false, result: { content: [{ type: "text", text: "once" }] }, timestamp: "2025-06-01T11:00:02.000Z" },
-  ], { sessionId });
+  // The turn record carries the native session reference; the stdout stream
+  // below carries the same tool events and must not be indexed as well.
+  ], { sessionId, sessionFile: sessionPath });
 
   const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   const calls = bundle.snapshot.entries.filter((entry) => entry.kind === "tool_call");
@@ -462,22 +505,25 @@ test("binary protocol: claims only, tool evidence explicitly unavailable", async
 
 test("torn tail and oversized records are reported, not indexed", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("pi-torn");
-  const sessionPath = join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`);
+  const sessionPath = nativeSessionFile("pi-torn", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
   // Valid line followed by an unterminated (torn) final line.
   const goodLine = JSON.stringify({ type: "session", version: 3, id: SESSION_ID, timestamp: "2025-06-01T10:00:00.000Z", cwd: "/tmp/wt" });
   const tornLine = '{"type":"message","id":"m-torn","parentId":null,"timestamp":"2025-06-01T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"torn-call","name":"bash","arguments":{"command":"never complete"}}]}}';
   await writeFile(sessionPath, `${goodLine}\n${tornLine}`);
   const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
-  assert.equal(bundle.snapshot.totalEntries, 1, "the torn line must not be indexed as a record");
+  assert.equal(bundle.snapshot.totalEntries, 2, "the torn line must not be indexed as a record");
   assert.ok(bundle.snapshot.unavailable.some((item) => item.reason === "torn_tail"));
 
   // Oversized record beyond the 16 MiB decoder limit.
   const { waveRoot: w2, artifactDir: a2 } = await makeTaskArtifacts("pi-oversized");
   const bigLine = JSON.stringify({ type: "session", version: 3, id: SESSION_ID, timestamp: "2025-06-01T10:00:00.000Z", cwd: "x".repeat(17 * 1024 * 1024) });
   const okLine = JSON.stringify({ type: "compaction", id: "c-ok", parentId: null, timestamp: "2025-06-01T10:00:01.000Z", tokensBefore: 1 });
-  await writeFile(join(a2, "executor-sessions", `${SESSION_ID}.jsonl`), `${bigLine}\n${okLine}\n`);
+  const oversizedSessionPath = nativeSessionFile("pi-oversized", SESSION_ID);
+  await recordPiSession(a2, oversizedSessionPath, SESSION_ID);
+  await writeFile(oversizedSessionPath, `${sessionHeader(SESSION_ID)}\n${bigLine}\n${okLine}\n`);
   const bundle2 = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: w2, artifactDir: a2 });
-  assert.equal(bundle2.snapshot.totalEntries, 1);
+  assert.equal(bundle2.snapshot.totalEntries, 3);
   assert.ok(bundle2.snapshot.unavailable.some((item) => item.reason === "oversized_records"));
 });
 
@@ -488,7 +534,9 @@ test("torn tail and oversized records are reported, not indexed", async () => {
 test("deep read: bounded chunks with honest continuation for large records", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("pi-deep");
   const bigOutput = `OUTPUT-MARKER-${"A".repeat(300 * 1024)}`; // 300 KiB result content
-  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(
+  const sessionPath = nativeSessionFile("pi-deep", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
+  await writeFile(sessionPath, jsonlLines(
     { type: "session", version: 3, id: SESSION_ID, timestamp: "2025-06-01T10:00:00.000Z", cwd: "/tmp/wt" },
     {
       type: "message", id: "m-asst-d", parentId: null, timestamp: "2025-06-01T10:00:01.000Z",
@@ -535,9 +583,12 @@ test("confinement: symlinks and escaping artifact roots are refused", async () =
   await writeFile(join(outside, "leak.jsonl"), jsonlLines({ type: "session", version: 3, id: "evil", timestamp: "2025-06-01T10:00:00.000Z", cwd: "/tmp/x" }));
 
   const { waveRoot, artifactDir } = await makeTaskArtifacts("pi-symlink");
-  await symlink(join(outside, "leak.jsonl"), join(artifactDir, "executor-sessions", "evil.jsonl"));
+  // A recorded reference that resolves to a symlink is refused without being read.
+  const sessionPath = nativeSessionFile("pi-symlink", "evil");
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
+  await symlink(join(outside, "leak.jsonl"), sessionPath);
   const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
-  assert.equal(bundle.snapshot.totalEntries, 0, "symlinked session files must not be read");
+  assert.equal(bundle.snapshot.sources.filter((source) => source.sourceId.startsWith("session:")).length, 0, "symlinked session files must not be read");
   assert.ok(
     bundle.snapshot.unavailable.some((item) => item.reason === "non_regular_file" || item.reason === "path_escape"),
     "the refusal must be explicit",
@@ -578,7 +629,9 @@ test("missing sources and unsupported adapters are explicit, never invented", as
 
 test("unpaired calls stay in_flight; unattributed results stay standalone", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("pi-unpaired");
-  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(
+  const sessionPath = nativeSessionFile("pi-unpaired", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
+  await writeFile(sessionPath, jsonlLines(
     { type: "session", version: 3, id: SESSION_ID, timestamp: "2025-06-01T10:00:00.000Z", cwd: "/tmp/wt" },
     {
       type: "message", id: "m-a", parentId: null, timestamp: "2025-06-01T10:00:01.000Z",
@@ -601,7 +654,9 @@ test("unpaired calls stay in_flight; unattributed results stay standalone", asyn
 
 test("context: assignments, attempts, steering, changed files, review", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("ctx");
-  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(...piSessionEntries()));
+  const sessionPath = nativeSessionFile("ctx", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
+  await writeFile(sessionPath, jsonlLines(...piSessionEntries()));
   const operation = {
     version: 1, revision: 3, operationId: "op-1", waveId: "wave-1", taskId: "task-1", title: "t",
     state: "reviewing" as const, worktreeRoot: "/tmp/wt", effectiveCwd: "/tmp/wt", artifactDir,
@@ -736,12 +791,13 @@ test("end-to-end: registered SubtasksInspect serves bounded evidence navigation"
   const groupRoot = join(base, "pi-review-execution-e2e");
   const waveRoot = join(base, "wave-1");
   const artifactDir = join(waveRoot, "artifacts", "task-e2e");
-  await mkdir(join(artifactDir, "executor-sessions"), { recursive: true });
   await mkdir(join(artifactDir, "executor", "0001"), { recursive: true });
 
   // Pi session: a failed test command with a distinctive marker; private thinking must stay out.
   const e2eSessionId = "e2e-session-0001";
-  await writeFile(join(artifactDir, "executor-sessions", `${e2eSessionId}.jsonl`), jsonlLines(
+  const sessionPath = nativeSessionFile("e2e", e2eSessionId);
+  await recordPiSession(artifactDir, sessionPath, e2eSessionId);
+  await writeFile(sessionPath, jsonlLines(
     { type: "session", version: 3, id: e2eSessionId, timestamp: "2025-06-02T09:00:00.000Z", cwd: "/tmp/wt" },
     {
       type: "message", id: "m-e1", parentId: null, timestamp: "2025-06-02T09:00:01.000Z",
@@ -765,7 +821,7 @@ test("end-to-end: registered SubtasksInspect serves bounded evidence navigation"
     },
   ));
   // Turn artifacts: observed process outcome + worker claim (never verification).
-  await writeFile(join(artifactDir, "executor", "0001", "process-result.json"), JSON.stringify({ adapter: "pi-model", code: 1, sessionId: e2eSessionId }));
+  await writeFile(join(artifactDir, "executor", "0001", "process-result.json"), JSON.stringify({ adapter: "pi-model", code: 1, sessionId: e2eSessionId, sessionFile: sessionPath }));
   await writeFile(join(artifactDir, "executor", "0001", "final-response.md"), "I fixed the failing tests; all suites pass now.\n");
   // Durable operation record with assignment history and a checkpoint.
   const now = new Date().toISOString();
@@ -915,11 +971,12 @@ function tsAt(i: number): string {
 
 test("cursor: covered-prefix integrity rejects rewrites and replacements preserving the watermark", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("cursor-prefix");
-  const sessionPath = join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`);
+  const sessionPath = nativeSessionFile("cursor-prefix", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
   const line1 = piResultLine("m1", "c1", "first result OK", tsAt(1));
   const line2 = piResultLine("m2", "c2", "middle result OK", tsAt(2));
   const line3 = piResultLine("m3", "c3", "last result stays identical", tsAt(3));
-  await writeFile(sessionPath, `${line1}\n${line2}\n${line3}\n`);
+  await writeFile(sessionPath, `${sessionHeader(SESSION_ID)}\n${line1}\n${line2}\n${line3}\n`);
 
   const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   const read = readSubtaskEvidence(bundle, { index: 0, limit: 50 });
@@ -927,7 +984,7 @@ test("cursor: covered-prefix integrity rejects rewrites and replacements preserv
   const cursor = read.cursor!;
 
   // (a) Rewrite an earlier covered record; the watermark record is byte-identical.
-  await writeFile(sessionPath, `${piResultLine("m1", "c1", "first result CHANGED by rewrite", tsAt(1))}\n${line2}\n${line3}\n`);
+  await writeFile(sessionPath, `${sessionHeader(SESSION_ID)}\n${piResultLine("m1", "c1", "first result CHANGED by rewrite", tsAt(1))}\n${line2}\n${line3}\n`);
   const afterRewrite = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   assert.throws(
     () => readSubtaskEvidence(afterRewrite, { cursor }),
@@ -935,7 +992,7 @@ test("cursor: covered-prefix integrity rejects rewrites and replacements preserv
   );
 
   // (b) Atomic replacement of the whole file preserving only the final record.
-  await writeFile(sessionPath, `${piResultLine("m1", "c1", "replacement first line", tsAt(9))}\n${piResultLine("m2", "c2", "replacement middle line", tsAt(10))}\n${line3}\n`);
+  await writeFile(sessionPath, `${sessionHeader(SESSION_ID)}\n${piResultLine("m1", "c1", "replacement first line", tsAt(9))}\n${piResultLine("m2", "c2", "replacement middle line", tsAt(10))}\n${line3}\n`);
   const afterReplace = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   assert.throws(
     () => readSubtaskEvidence(afterReplace, { cursor }),
@@ -943,11 +1000,11 @@ test("cursor: covered-prefix integrity rejects rewrites and replacements preserv
   );
 
   // Honest continuation still works for a pure append against the original file.
-  await writeFile(sessionPath, `${line1}\n${line2}\n${line3}\n`);
+  await writeFile(sessionPath, `${sessionHeader(SESSION_ID)}\n${line1}\n${line2}\n${line3}\n`);
   const restored = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   const continued = readSubtaskEvidence(restored, { cursor });
   assert.deepEqual(continued.entries ?? [], [], "no new evidence yet");
-  await writeFile(sessionPath, `${line1}\n${line2}\n${line3}\n${piResultLine("m4", "c4", "appended after cursor", tsAt(4))}\n`);
+  await writeFile(sessionPath, `${sessionHeader(SESSION_ID)}\n${line1}\n${line2}\n${line3}\n${piResultLine("m4", "c4", "appended after cursor", tsAt(4))}\n`);
   const appended = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   const next = readSubtaskEvidence(appended, { cursor });
   assert.equal(next.entries?.length, 1, "append is returned exactly once");
@@ -955,18 +1012,21 @@ test("cursor: covered-prefix integrity rejects rewrites and replacements preserv
 
 test("rolling window: records beyond the per-source cap stay reachable from the tail and omissions are disclosed", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("window");
-  const sessionPath = join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`);
+  const sessionPath = nativeSessionFile("window", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
   const total = EVIDENCE_MAX_ENTRIES + 50;
   const lines: string[] = [];
   for (let i = 0; i < total; i += 1) {
     const text = i === 0 ? "WINDOW-HEAD-MARKER early record" : i === total - 1 ? "WINDOW-TAIL-MARKER latest record" : `record ${i}`;
     lines.push(piResultLine(`m${i}`, `c${i}`, text, tsAt(i)));
   }
-  await writeFile(sessionPath, `${lines.join("\n")}\n`);
+  await writeFile(sessionPath, `${sessionHeader(SESSION_ID)}\n${lines.join("\n")}\n`);
 
   const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   assert.equal(bundle.snapshot.totalEntries, EVIDENCE_MAX_ENTRIES, "snapshot is bounded to the window");
-  assert.equal(bundle.snapshot.diagnostics.recordsOmitted, 50, "omitted head records are counted");
+  // The bounded public session header is itself a record, so one more head
+  // record falls outside the window than the fixture's result lines alone.
+  assert.equal(bundle.snapshot.diagnostics.recordsOmitted, 51, "omitted head records are counted");
   assert.ok(
     bundle.snapshot.unavailable.some((item) => item.reason === "records_omitted"),
     "record omission must be disclosed as unavailable",
@@ -979,7 +1039,9 @@ test("rolling window: records beyond the per-source cap stay reachable from the 
 
 test("tail byte window: a failure appended beyond the per-source byte cap stays findable; earlier bytes are disclosed", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("scan-cap");
-  const sessionPath = join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`);
+  const sessionPath = nativeSessionFile("scan-cap", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
+  await writeFile(sessionPath, `${sessionHeader(SESSION_ID)}\n`);
   let written = 0;
   let n = 0;
   const lineFor = (text: string): string => {
@@ -1028,16 +1090,19 @@ test("shared raw retention budget is enforced across multiple sources before ass
     for (let i = 0; i < 400; i += 1) {
       lines.push(piResultLine(`m${i}`, `c${i}`, bigText, tsAt(i + fileIndex * 10_000)));
     }
-    await writeFile(join(artifactDir, "executor-sessions", `s${fileIndex + 1}.jsonl`), `${lines.join("\n")}\n`);
+    const sessionId = `s${fileIndex + 1}`;
+    const sessionPath = nativeSessionFile("raw-budget", sessionId);
+    await recordPiSession(artifactDir, sessionPath, sessionId, `000${fileIndex + 1}`);
+    await writeFile(sessionPath, `${sessionHeader(sessionId)}\n${lines.join("\n")}\n`);
   }
 
   const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   assert.equal(bundle.snapshot.diagnostics.rawRetentionExhausted, true, "shared budget exhaustion must be diagnosed");
   const bySource = new Map(bundle.snapshot.sources.map((source) => [source.sourceId, source.records]));
-  assert.equal(bySource.get("session:s1.jsonl"), 400, "first source fully retained before exhaustion");
-  assert.equal(bySource.get("session:s2.jsonl"), 400, "second source fully retained before exhaustion");
+  assert.equal(bySource.get("session:s1.jsonl"), 401, "first source fully retained before exhaustion");
+  assert.equal(bySource.get("session:s2.jsonl"), 401, "second source fully retained before exhaustion");
   const third = bySource.get("session:s3.jsonl") ?? 999;
-  assert.ok(third < 400, `third source must be truncated by the shared budget (kept ${third})`);
+  assert.ok(third < 401, `third source must be truncated by the shared budget (kept ${third})`);
   assert.ok((bundle.snapshot.diagnostics.recordsOmitted ?? 0) > 0, "omitted records are counted");
   assert.ok(
     bundle.snapshot.unavailable.some((item) => item.reason === "records_omitted" && item.source === "session:s3.jsonl"),
@@ -1159,19 +1224,22 @@ workerResources: { "default": { selection: { source: "pi", model: "model-x" }, m
 
 test("global entry window retains the newest entries across sources", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("global-tail");
-  const sessionsDir = join(artifactDir, "executor-sessions");
+  const store = nativeStore("global-tail");
+  await mkdir(store, { recursive: true });
   // Older source: 1,500 records; its first record carries the old marker.
   const oldLines: string[] = [];
   for (let i = 0; i < 1_500; i += 1) {
     oldLines.push(piResultLine(`o${i}`, `oc${i}`, i === 0 ? "GLOBAL-OLD-MARKER oldest entry" : `old record ${i}`, tsAt(i)));
   }
-  await writeFile(join(sessionsDir, "s-old.jsonl"), `${oldLines.join("\n")}\n`);
+  await recordPiSession(artifactDir, join(store, "s-old.jsonl"), "s-old", "0001");
+  await writeFile(join(store, "s-old.jsonl"), `${sessionHeader("s-old", tsAt(0))}\n${oldLines.join("\n")}\n`);
   // Newer source: 1,200 records (later timestamps); its last record carries the new marker.
   const newLines: string[] = [];
   for (let i = 0; i < 1_200; i += 1) {
     newLines.push(piResultLine(`n${i}`, `nc${i}`, i === 1_199 ? "GLOBAL-NEW-MARKER newest entry" : `new record ${i}`, tsAt(10_000 + i)));
   }
-  await writeFile(join(sessionsDir, "s-new.jsonl"), `${newLines.join("\n")}\n`);
+  await recordPiSession(artifactDir, join(store, "s-new.jsonl"), "s-new", "0002");
+  await writeFile(join(store, "s-new.jsonl"), `${sessionHeader("s-new", tsAt(10_000))}\n${newLines.join("\n")}\n`);
 
   const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   assert.equal(bundle.snapshot.totalEntries, EVIDENCE_MAX_ENTRIES, "the global window is bounded");
@@ -1188,11 +1256,12 @@ test("global entry window retains the newest entries across sources", async () =
 
 test("cursor: atomic replacement via rename is rejected even when covered bytes are identical", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("cursor-rename");
-  const sessionPath = join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`);
+  const sessionPath = nativeSessionFile("cursor-rename", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
   const line1 = piResultLine("m1", "c1", "first result OK", tsAt(1));
   const line2 = piResultLine("m2", "c2", "middle result OK", tsAt(2));
   const line3 = piResultLine("m3", "c3", "last result stays identical", tsAt(3));
-  await writeFile(sessionPath, `${line1}\n${line2}\n${line3}\n`);
+  await writeFile(sessionPath, `${sessionHeader(SESSION_ID)}\n${line1}\n${line2}\n${line3}\n`);
 
   const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   const read = readSubtaskEvidence(bundle, { index: 0, limit: 50 });
@@ -1201,8 +1270,8 @@ test("cursor: atomic replacement via rename is rejected even when covered bytes 
 
   // Build a replacement whose covered prefix is byte-identical plus one new record,
   // then atomically rename it over the original path (new inode/generation).
-  const replacementPath = join(artifactDir, "executor-sessions", `${SESSION_ID}.replacement.jsonl`);
-  await writeFile(replacementPath, `${line1}\n${line2}\n${line3}\n${piResultLine("m4", "c4", "appended in the replacement", tsAt(4))}\n`);
+  const replacementPath = join(nativeStore("cursor-rename"), "replacement.jsonl");
+  await writeFile(replacementPath, `${sessionHeader(SESSION_ID)}\n${line1}\n${line2}\n${line3}\n${piResultLine("m4", "c4", "appended in the replacement", tsAt(4))}\n`);
   await rename(replacementPath, sessionPath);
 
   const after = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
@@ -1215,10 +1284,11 @@ test("cursor: atomic replacement via rename is rejected even when covered bytes 
 
 test("cursor: appendFile on the original file preserves generation and continues exactly once", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("cursor-append");
-  const sessionPath = join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`);
+  const sessionPath = nativeSessionFile("cursor-append", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
   const line1 = piResultLine("m1", "c1", "first result OK", tsAt(1));
   const line2 = piResultLine("m2", "c2", "second result OK", tsAt(2));
-  await writeFile(sessionPath, `${line1}\n${line2}\n`);
+  await writeFile(sessionPath, `${sessionHeader(SESSION_ID)}\n${line1}\n${line2}\n`);
 
   const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   const read = readSubtaskEvidence(bundle, { index: 0, limit: 50 });
@@ -1234,15 +1304,17 @@ test("cursor: appendFile on the original file preserves generation and continues
 
 test("directory enumeration applies its bound during iteration and discloses overflow", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("enum-cap");
-  const sessionsDir = join(artifactDir, "executor-sessions");
   const cap = EVIDENCE_MAX_ENUMERATED_ENTRIES;
   const oneLine = `${piResultLine("m1", "c1", "record", tsAt(1))}\n`;
   for (let i = 0; i < cap + 5; i += 1) {
-    await writeFile(join(sessionsDir, `s${String(i).padStart(4, "0")}.jsonl`), oneLine);
+    const dir = join(artifactDir, "executor", String(i).padStart(4, "0"));
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "process-result.json"), JSON.stringify({ adapter: "codex-cli", code: 0 }));
+    await writeFile(join(dir, "raw-stream.txt"), oneLine);
   }
   // Non-matching names consume enumeration budget too.
   for (let i = 0; i < 3; i += 1) {
-    await writeFile(join(sessionsDir, `notes-${i}.txt`), "not evidence");
+    await writeFile(join(artifactDir, "executor", `notes-${i}.txt`), "not evidence");
   }
 
   const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
@@ -1250,9 +1322,9 @@ test("directory enumeration applies its bound during iteration and discloses ove
     bundle.snapshot.unavailable.some((item) => item.reason === "source_budget" && /enumeration budget/.test(item.detail)),
     "enumeration overflow must be disclosed explicitly",
   );
-  const sessionSources = bundle.snapshot.sources.filter((source) => source.sourceId.startsWith("session:"));
-  assert.ok(sessionSources.length > 0, "matching sources before the bound are still indexed");
-  assert.ok(sessionSources.length <= cap, "no more than the enumeration budget is indexed");
+  const turnSources = bundle.snapshot.sources.filter((source) => source.sourceId.startsWith("turn:"));
+  assert.ok(turnSources.length > 0, "matching directories before the bound are still indexed");
+  assert.ok(turnSources.length <= cap, "no more than the enumeration budget is indexed");
 });
 
 test("controller: artifact root escaping the wave root is refused before any context read", async () => {
@@ -1773,7 +1845,9 @@ test("regression #50: malformed or foreign publication-failure markers are expli
 
 test("active correction: a newly completed review cycle is discoverable through an existing cursor", async () => {
   const { waveRoot, artifactDir } = await makeTaskArtifacts("review-cursor");
-  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(...piSessionEntries()), "utf8");
+  const sessionPath = nativeSessionFile("review-cursor", SESSION_ID);
+  await recordPiSession(artifactDir, sessionPath, SESSION_ID);
+  await writeFile(sessionPath, jsonlLines(...piSessionEntries()), "utf8");
   const bundle1 = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
   const first = readSubtaskEvidence(bundle1, { index: 0, limit: 50 });
   assert.ok(first.cursor, "unfiltered ranged reads must issue a cursor");

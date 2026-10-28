@@ -30,7 +30,6 @@ import {
   type BackgroundExecutionGroup,
   type PriorArchiveRecord,
 } from "./background-group-store";
-import { isPiSessionCleanupError, removeArtifactRetainingOnSessionCleanupFailure } from "../pi-session-cleanup";
 import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
 import { captureWorkerReviewEvidencePolicy } from "./review-evidence-policy";
 import { inspectOperation, readVerifiedAcceptedResult, verifyInPlaceContinuation, verifyRecoveryCheckpoint } from "./operation-actions";
@@ -115,6 +114,7 @@ import {
 import { notifyDispatchCards } from "./dispatch-cards";
 import type { ExecutorInteractionAcknowledgement, ExecutorLiveControl, SubtaskDispatchRecord } from "./types";
 import { readWaveCaptureRecord, waveCaptureEntryRejectionOf } from "./wave-repository";
+import { MAX_CLEANUP_REFUSALS } from "./native-session-refs";
 import { executeWaveLanding, planWaveLanding } from "./wave-landing";
 import { waveLineageOf } from "./wave-commits";
 import { pinCommit } from "./wave-worktrees";
@@ -3993,20 +3993,13 @@ export class BackgroundExecutionController {
   }
 
   async cleanupSettledArtifacts(): Promise<void> {
-    // #533: the opt-in session deletion rides the removals this cleanup already
-    // performs, reading the live setting at the existing lifecycle point only.
-    const cleanupOptions = {
-      deleteSpawnedPiSessions: this.input.config.deleteSpawnedPiSessionsOnCleanup === true,
-    };
-    // #533: a spawned Pi session that cannot be deleted retains its own root and
-    // is disclosed at the end of this cleanup. It never aborts the shutdown
-    // sequence that awaits this method, whose persistence, indicator, and
-    // detach steps still have to run. Every other removal error (ownership
-    // refusal, artifact `rm` failure) still propagates exactly as before.
-    const sessionCleanupFailures: string[] = [];
+    // Opt-in only: with the setting Off, every spawned native Pi session stays
+    // in Pi's own store. On, a session is deleted only as part of the existing
+    // removal of the artifact root that recorded it, and only after that root
+    // passed its existing ownership guard (a refused root deletes nothing).
+    const deleteNativeSessions = this.input.config.deleteSpawnedPiSessionsOnCleanup === true;
+    const nativeSessionRefusals: string[] = [];
     for (const [executionId, group] of [...this.groups]) {
-      // Set while this group's own cleanup retains a wave root for its sessions.
-      let sessionRetention = false;
       const settled = group.tasks.filter((task) => task.state === "landed" || task.state === "reported");
       for (const task of settled) {
         // #126 correction: a landed salvage whose provenance names untransferred
@@ -4014,21 +4007,10 @@ export class BackgroundExecutionController {
         // path names — survive cleanup and restart. Truly resolved work is
         // cleaned exactly as before.
         const retain = salvageEvidenceRequiresRetention(task);
-        const waveRoot = task.waveRoot;
-        let retainedForSessions = false;
-        if (waveRoot !== undefined && !retain) {
-          retainedForSessions = !(await removeArtifactRetainingOnSessionCleanupFailure(
-            () => removeOwnedWaveRoot(waveRoot, cleanupOptions),
-            (error) => {
-              sessionCleanupFailures.push(error.message);
-            },
-          ));
+        if (task.waveRoot && !retain) {
+          nativeSessionRefusals.push(...(await removeOwnedWaveRoot(task.waveRoot, deleteNativeSessions)).refused);
         }
-        // A root kept by a session cleanup failure retains its recorded pointer
-        // exactly like the salvage retention above, so a later cleanup or restore
-        // still owns it and its references.
-        if (!retain && !retainedForSessions) task.waveRoot = undefined;
-        if (retainedForSessions) sessionRetention = true;
+        if (!retain) task.waveRoot = undefined;
         task.bundle = undefined;
         task.updatedAt = new Date().toISOString();
       }
@@ -4036,8 +4018,6 @@ export class BackgroundExecutionController {
       // archived) still anchors retained source evidence: removing the
       // execution root would destroy the durable reference to it.
       let archivedRetention = false;
-      // Set while an archived task's wave root survives its own session cleanup.
-      let archivedSessionRetention = false;
       if (settled.length === group.tasks.length) {
         // Recover the wave roots recorded in the (evicted) task archives once,
         // shutdown-only, before the root is removed so sequential top-offs do
@@ -4058,17 +4038,8 @@ export class BackgroundExecutionController {
               continue;
             }
             if (archived.waveRoot) {
-              // This top-off stays best-effort for every unrelated archive or
-              // removal error, exactly as before. A native-session failure is
-              // different: the claimed root survives, so its failure is disclosed
-              // and whole-group retirement is deferred to keep the authenticated
-              // archive that owns the pointer, leaving a retryable cleanup rather
-              // than an orphaned root and a leaked history.
-              await removeOwnedWaveRoot(archived.waveRoot, cleanupOptions).catch((error: unknown) => {
-                if (!isPiSessionCleanupError(error)) return;
-                sessionCleanupFailures.push(error.message);
-                archivedSessionRetention = true;
-              });
+              const cleanup = await removeOwnedWaveRoot(archived.waveRoot, deleteNativeSessions).catch(() => undefined);
+              if (cleanup) nativeSessionRefusals.push(...cleanup.refused);
             }
           } catch {
             // Never act destructively on malformed, tampered, or foreign
@@ -4077,23 +4048,8 @@ export class BackgroundExecutionController {
           }
         }
       }
-      let retired = false;
-      // Whole-group retirement is also deferred while any wave root — inline or
-      // archived — was retained by a session cleanup failure: removing the
-      // execution root would drop the durable record that owns that root.
-      if (settled.length === group.tasks.length && !archivedRetention && !sessionRetention && !archivedSessionRetention) {
-        // A retained execution root skips the retirement bookkeeping below: the
-        // group, its archives, its retained-census reference, and its
-        // associations all stay in place so the still-existing root keeps its
-        // ownership evidence and a later cleanup can finish the deletion.
-        retired = await removeArtifactRetainingOnSessionCleanupFailure(
-          () => removeOwnedExecutionRoot(group.root, group.tempBase, cleanupOptions),
-          (error) => {
-            sessionCleanupFailures.push(error.message);
-          },
-        );
-      }
-      if (retired) {
+      if (settled.length === group.tasks.length && !archivedRetention) {
+        nativeSessionRefusals.push(...(await removeOwnedExecutionRoot(group.root, group.tempBase, deleteNativeSessions)).refused);
         // Every task is terminal: release its owned-activity token before the
         // group bookkeeping is dropped so retirement cannot leave a stale
         // positive outstanding.
@@ -4122,23 +4078,27 @@ export class BackgroundExecutionController {
           }
         }
       } else if (settled.length > 0) {
-        // Includes the group whose execution root was retained by a session
-        // cleanup failure: its task bookkeeping above stays durable while the
-        // root, archives, census reference, and associations remain in place.
         await this.save(group);
+      }
+    }
+    // A session this cleanup could not verify stays in Pi's store along with
+    // the reason. Never a shutdown failure and never silent: the owning
+    // artifact records are about to be removed, so the notice is the only
+    // remaining trace that the session was deliberately retained.
+    if (nativeSessionRefusals.length > 0) {
+      const shown = nativeSessionRefusals.slice(0, MAX_CLEANUP_REFUSALS).join("; ");
+      const more = nativeSessionRefusals.length > MAX_CLEANUP_REFUSALS ? ` (+${nativeSessionRefusals.length - MAX_CLEANUP_REFUSALS} more)` : "";
+      try {
+        await this.input.notify?.(
+          `review gate: ${nativeSessionRefusals.length} spawned Pi session(s) were retained, not deleted: ${shown}${more}`,
+        );
+      } catch {
+        // A notice is best-effort; it can never hold up the shutdown
+        // persistence and association publishing that still follow below.
       }
     }
     await this.publishAssociations();
     this.signalActivityReadiness();
-    // Disclosure of the retained roots, through the controller's existing notice
-    // sink. A broken sink never undoes the cleanup or the shutdown that follows.
-    for (const message of sessionCleanupFailures) {
-      try {
-        await this.input.notify?.(`review gate: ${message}`);
-      } catch {
-        // Best effort: the retained artifact and its references are the record.
-      }
-    }
   }
 
   async detach(): Promise<void> {

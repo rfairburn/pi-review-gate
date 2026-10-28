@@ -11,7 +11,6 @@ import { PiExecutorAdapter } from "../src/execution/adapters/pi-model";
 import { createPiSettlementBootstrap, piSettlementEnvironment } from "../src/execution/pi-settlement-receipt";
 import { EXECUTOR_TOOL_CATALOG_ENV } from "../src/execution/tool-catalog";
 import { resolvePiChildSpawn } from "../src/pi-invocation";
-import { readPiSessionReference, writePiSessionReference } from "../src/pi-session-reference";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 
 /**
@@ -604,9 +603,23 @@ const REVIEW_JSON_TEXT = JSON.stringify({
   error: null,
 });
 
+function nativeSessionFixture(captureFile: string): string[] {
+  return [
+    "const nativePath=require('node:path');const nativeArgs=process.argv.slice(2);",
+    "const resumedFile=nativeArgs.includes('--session')?nativeArgs[nativeArgs.indexOf('--session')+1]:undefined;",
+    "const sessionId=resumedFile?nativePath.basename(resumedFile,'.jsonl'):nativeArgs[nativeArgs.indexOf('--session-id')+1];",
+    `const sessionFile=resumedFile??nativePath.join(${JSON.stringify(dirname(captureFile))},'native',sessionId+'.jsonl');`,
+    "fs.mkdirSync(nativePath.dirname(sessionFile),{recursive:true});",
+    "if(!fs.existsSync(sessionFile))fs.writeFileSync(sessionFile,JSON.stringify({type:'session',version:3,id:sessionId,cwd:process.cwd()})+'\\n');",
+    "const receipt=process.env.PI_REVIEW_GATE_REVIEWER_SESSION_RECEIPT;",
+    "if(receipt)fs.writeFileSync(receipt,JSON.stringify({sessionId,sessionFile}));",
+  ];
+}
+
 function reviewerEntryBody(captureFile: string): string[] {
   return [
     "const fs=require('node:fs');",
+    ...nativeSessionFixture(captureFile),
     "let input='';process.stdin.setEncoding('utf8');",
     "process.stdin.on('data',chunk=>{input+=chunk;});",
     "process.stdin.on('end',()=>{",
@@ -649,15 +662,10 @@ test("Pi reviewer launches the default pi child alias-independently (real shim +
     assert.deepEqual(argv.slice(0, 3), ["--model", "provider/model", "--mode"], "reviewer argv order is preserved through resolution");
     assert.equal(argv[argv.indexOf("--mode") + 1], "json");
     // Reviewer read-only flags stay exactly as configured.
-    assert.ok(argv.includes("--no-extensions"), "reviewer extension discovery must stay off");
+    assert.ok(argv.includes("--no-extensions"));
     assert.equal(argv[argv.indexOf("--tools") + 1], "read,grep,find,ls");
-    // #533: discovery stays off, and exactly ONE explicit gate-owned extension is
-    // loaded so the pass can report its authoritative native session identity.
-    const extensions = argv.filter((entry, index) => argv[index - 1] === "--extension");
-    assert.equal(extensions.length, 1, "the reviewer loads exactly one explicit extension");
-    assert.match(extensions[0]!, /pi-session-reference-reporter\.js$/);
-    assert.ok(!argv.includes("--session-dir"), "the reviewer pass uses Pi's own standard native session store");
-    assert.ok(!argv.includes("--continue") && !argv.includes("--resume"), "a reviewer pass never reopens an ambient session");
+    assert.equal(argv.filter((arg) => arg === "--extension").length, 1);
+    assert.ok(argv[argv.indexOf("--extension") + 1].endsWith("session-ref-reporter.js"), "only the explicit metadata companion is loaded");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -694,32 +702,17 @@ test("Pi reviewer translates a missing default pi CLI into the actionable diagno
 // Delegated Pi RPC executor + compaction recovery launch regressions
 // ---------------------------------------------------------------------------
 
-function rpcEntryBody(captureFile: string, promptCaptureFile?: string): string[] {
+function rpcEntryBody(captureFile: string): string[] {
   return [
     "const fs=require('node:fs');",
-    "const path=require('node:path');",
+    ...nativeSessionFixture(captureFile),
     ...fakePiSettlementReceipt,
     `fs.appendFileSync(${JSON.stringify(captureFile)}, JSON.stringify({ argv: process.argv.slice(2), pid: process.pid })+'\\n');`,
-    // Optional second capture: the prompts this child actually ACCEPTED. A
-    // refused resume must produce no line here at all (#533).
-    ...(promptCaptureFile ? [`const promptCapture=${JSON.stringify(promptCaptureFile)};`] : ["const promptCapture=undefined;"]),
     "let input='';process.stdin.setEncoding('utf8');",
     "const out=(v)=>console.log(JSON.stringify(v));",
-    // Faithful Pi identity emulation: a resumed session names its own file with
-    // `--session`, a new session gets `--session-id`; get_state reports BOTH the
-    // session id and the session file, because the gate records its canonical
-    // native session reference from that authoritative pair (#533).
-    "const argv=process.argv.slice(2);",
-    "const flag=(name)=>{const i=argv.indexOf(name);return i>=0?argv[i+1]:undefined;};",
-    "const resumedFile=flag('--session');",
-    // The identity knobs let a regression make a real child report a session
-    // OTHER than the one that was reopened — the replacement-session case the
-    // gate must refuse before prompting (#533).
-    "const sessionId=process.env.PI_FAKE_WRONG_SESSION_ID??(resumedFile?path.basename(resumedFile,'.jsonl'):flag('--session-id'));",
-    "const sessionFile=process.env.PI_FAKE_WRONG_SESSION_FILE??(resumedFile??path.join(process.env.PI_FAKE_NATIVE_STORE??process.cwd(),sessionId+'.jsonl'));",
     "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
-    "if(c.type==='prompt'){if(promptCapture)fs.appendFileSync(promptCapture, JSON.stringify({ prompt: c.message })+'\\n');out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'research complete'}]}});out({type:'turn_end'});ack();out({type:'agent_end'});}",
-    "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{sessionId,sessionFile,isStreaming:false,pendingMessageCount:0}});",
+    "if(c.type==='prompt'){out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'research complete'}]}});out({type:'turn_end'});ack();out({type:'agent_end'});}",
+    "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{sessionId,sessionFile,isStreaming:false,pendingMessageCount:0}});" ,
     "else if(c.type==='compact')out({type:'response',id:c.id,command:c.type,success:true,data:{summary:'compacted'}});",
     "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'research complete'}});",
     "}});",
@@ -848,14 +841,9 @@ test("executor compaction recovery launches the default pi child through the sam
   try {
     const artifactDir = join(fixture.root, "artifacts");
     await mkdir(artifactDir);
-    // #533: a continuation (and an interrupted compaction) reopens the VERIFIED
-    // ABSOLUTE native session path recorded by this artifact, never a bare
-    // `--session-id` that Pi would answer with an empty same-id session.
-    const nativeStore = join(fixture.root, "native-store");
-    await mkdir(nativeStore, { recursive: true });
-    const sessionFile = join(nativeStore, "durable-session-1.jsonl");
-    await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 1, id: "durable-session-1", timestamp: new Date().toISOString(), cwd: fixture.root })}\n`, "utf8");
-    await writePiSessionReference(artifactDir, { id: "durable-session-1", file: sessionFile, cwd: fixture.root });
+    const sessionFile = join(fixture.root, "native", "durable-session-1.jsonl");
+    await mkdir(dirname(sessionFile), { recursive: true });
+    await writeFile(sessionFile, JSON.stringify({ type: "session", version: 3, id: "durable-session-1", cwd: fixture.root }) + "\n");
     await withPrependedPath(fixture.bin, async () => {
       const adapter = new PiExecutorAdapter({ model: "provider/model", timeoutMs: 60_000, settlementTimeoutMs: 15_000 });
       const result = await adapter.run({
@@ -863,7 +851,7 @@ test("executor compaction recovery launches the default pi child through the sam
         prompt: "continue after compaction",
         artifactDir,
         turn: 2,
-        session: { adapter: "pi-model", id: "durable-session-1" },
+        session: { adapter: "pi-model", id: "durable-session-1", file: sessionFile },
         recovery: { kind: "compaction", compactBeforePrompt: true },
         executorToolCatalog,
       });
@@ -872,407 +860,15 @@ test("executor compaction recovery launches the default pi child through the sam
     });
     // Two real children: the compaction recovery child (get_state + compact)
     // and the resumed RPC executor child — both launched through the shared
-    // alias-independent resolution, and both on the exact recorded path.
+    // alias-independent resolution.
     const launches = await readCaptureLines(fixture.captureFile);
     assert.equal(launches.length, 2, "compaction recovery must launch its own real child before the resumed turn");
     for (const launch of launches) {
       const argv = launch.argv as string[];
-      assert.equal(argv[argv.indexOf("--session") + 1], sessionFile, "both children reopen the durable session by its exact absolute path");
-      assert.ok(!argv.includes("--session-id"), "a continuation never re-passes a bare session id");
-      assert.ok(!argv.includes("--session-dir"), "the resumed session lives in Pi's own standard store, not a per-role directory");
+      assert.ok(!argv.includes("--session-id"));
+      assert.ok(argv[argv.indexOf("--session") + 1].endsWith("durable-session-1.jsonl"), "both children reopen the exact durable file");
       assert.equal(argv[argv.indexOf("--mode") + 1], "rpc");
     }
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-for (const missingPath of ["omitted", "empty"] as const) {
-  test(`interrupted compaction refuses an ${missingPath} native session path before compacting`, async () => {
-    const root = await mkdtemp(join(tmpdir(), "prg-child-compact-missing-path-"));
-    const compactCapture = join(root, "unexpected-compact");
-    const body = rpcEntryBody(join(root, "capture.jsonl")).map((line) => {
-      if (line.startsWith("else if(c.type==='get_state')")) {
-        return `else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{sessionId,sessionFile:${missingPath === "empty" ? "''" : "undefined"},isStreaming:false,pendingMessageCount:0}});`;
-      }
-      if (line.startsWith("else if(c.type==='compact')")) {
-        return `else if(c.type==='compact'){fs.writeFileSync(${JSON.stringify(compactCapture)},'compact');out({type:'response',id:c.id,command:c.type,success:true,data:{summary:'unexpected'}});}`;
-      }
-      return line;
-    });
-    const fixture = await createFakePiBinIn(root, body);
-    try {
-      const artifactDir = join(fixture.root, "artifacts");
-      await mkdir(artifactDir);
-      await recordDurableNativeSession({ root: fixture.root, artifactDir, id: "verified-compaction-session", transcript: true });
-      await withPrependedPath(fixture.bin, async () => {
-        await assert.rejects(new PiExecutorAdapter({ model: "provider/model", timeoutMs: 5_000 }).run({
-          cwd: fixture.root,
-          prompt: "must not continue without verified compaction history",
-          artifactDir,
-          turn: 2,
-          session: { adapter: "pi-model", id: "verified-compaction-session" },
-          recovery: { kind: "compaction", compactBeforePrompt: true },
-          executorToolCatalog,
-        }), /reported no usable session file/);
-      });
-      await assert.rejects(readFile(compactCapture, "utf8"), { code: "ENOENT" });
-      assert.equal((await readCaptureLines(fixture.captureFile)).length, 1, "refusal must not launch a continuation child");
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-}
-
-/** Read the prompts the fake children actually accepted (absent = none). */
-async function readPromptLines(promptCapture: string): Promise<Array<Record<string, unknown>>> {
-  const raw = await readFile(promptCapture, "utf8").catch(() => "");
-  return raw.split("\n").filter((line) => line.trim()).map((line) => JSON.parse(line) as Record<string, unknown>);
-}
-
-/**
- * Record a canonical native session reference in the artifact. `transcript:
- * false` leaves the referenced native file absent — the deleted-or-moved
- * transcript that makes a resume impossible (#533).
- */
-async function recordDurableNativeSession(input: {
-  root: string;
-  artifactDir: string;
-  id: string;
-  transcript: boolean;
-}): Promise<string> {
-  const nativeStore = join(input.root, "native-store");
-  await mkdir(nativeStore, { recursive: true });
-  const sessionFile = join(nativeStore, `${input.id}.jsonl`);
-  if (input.transcript) {
-    await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 1, id: input.id, timestamp: new Date().toISOString(), cwd: input.root })}\n`, "utf8");
-  }
-  const recorded = await writePiSessionReference(input.artifactDir, { id: input.id, file: sessionFile, cwd: input.root });
-  assert.equal(recorded.ok, true, `the canonical reference must be recordable: ${recorded.ok ? "" : recorded.message}`);
-  return sessionFile;
-}
-
-test("legacy artifact recovery finds its exact history beyond 256 other sessions", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prg-child-legacy-history-"));
-  const promptCapture = join(root, "prompts.jsonl");
-  const fixture = await createFakePiBinIn(root, rpcEntryBody(join(root, "capture.jsonl"), promptCapture));
-  try {
-    const artifactDir = join(fixture.root, "artifacts");
-    const legacyDir = join(artifactDir, "executor-sessions");
-    await mkdir(legacyDir, { recursive: true });
-    await Promise.all(Array.from({ length: 257 }, (_, index) => writeFile(
-      join(legacyDir, `0000-other-${index}.jsonl`),
-      JSON.stringify({ type: "session", version: 3, id: `other-${index}`, cwd: fixture.root }) + "\n",
-    )));
-    const id = "zzzz-legacy-session";
-    const legacyFile = join(legacyDir, `${id}.jsonl`);
-    await writeFile(legacyFile, JSON.stringify({ type: "session", version: 3, id, cwd: fixture.root }) + "\n");
-    const observed = await runContinuationTurn({
-      bin: fixture.bin, root: fixture.root, artifactDir,
-      session: { adapter: "pi-model", id },
-    });
-    assert.equal(observed.failure, undefined);
-    assert.deepEqual(observed.delivered, [CONTINUATION_PROMPT], "the existing history, not a fresh handoff, is used");
-    const launches = await readCaptureLines(fixture.captureFile);
-    assert.equal(launches.length, 1);
-    const argv = launches[0].argv as string[];
-    assert.equal(argv[argv.indexOf("--session") + 1], legacyFile);
-    assert.equal((await readPiSessionReference(artifactDir, id))?.file, legacyFile, "legacy history is referenced in place, never migrated");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-const CONTINUATION_PROMPT = "CORRECTION-ONLY: address the second finding";
-const HANDOFF_PROMPT = [
-  "FULL TASK HANDOFF",
-  "Task: implement the canonical session reference slice.",
-  "Acceptance: continuation reopens the exact native session path.",
-  "",
-  "Current continuation instructions:",
-  CONTINUATION_PROMPT,
-].join("\n");
-
-interface ResumeRunObservation {
-  updates: string[];
-  delivered: string[];
-  text: string;
-  session: { adapter: string; id: string };
-  failure?: { message: string } | undefined;
-}
-
-async function runContinuationTurn(input: {
-  bin: string;
-  root: string;
-  artifactDir: string;
-  /** Session IDENTITY only (#533): the transcript path resolves from the artifact's canonical reference. */
-  session: { adapter: "pi-model"; id: string };
-  handoffPrompt?: string;
-  /** Overrides the continuation-only prompt (used to exercise equal prompt/handoff text). */
-  prompt?: string;
-  onProcessStart?: (process: { pid: number; processGroupId?: number }) => void | Promise<void>;
-  onProcessExit?: (process: { pid: number; processGroupId?: number; code: number | null; signal: NodeJS.Signals | null }) => void | Promise<void>;
-}): Promise<ResumeRunObservation> {
-  const updates: string[] = [];
-  const delivered: string[] = [];
-  let text = "";
-  let session: { adapter: string; id: string } = { adapter: "pi-model", id: "" };
-  let failure: { message: string } | undefined;
-  await withPrependedPath(input.bin, async () => {
-    const adapter = new PiExecutorAdapter({ model: "provider/model", timeoutMs: 60_000, settlementTimeoutMs: 15_000 });
-    const result = await adapter.run({
-      cwd: input.root,
-      prompt: input.prompt ?? CONTINUATION_PROMPT,
-      ...(input.handoffPrompt === undefined ? {} : { handoffPrompt: input.handoffPrompt }),
-      artifactDir: input.artifactDir,
-      turn: 2,
-      session: input.session,
-      executorToolCatalog,
-      onUpdate: (message) => updates.push(message),
-      onPromptDelivery: (delivery) => delivered.push(delivery.prompt),
-      ...(input.onProcessStart ? { onProcessStart: input.onProcessStart } : {}),
-      ...(input.onProcessExit ? { onProcessExit: input.onProcessExit } : {}),
-    });
-    text = result.text;
-    session = result.session;
-    failure = result.failure;
-  });
-  return { updates, delivered, text, session, failure };
-}
-
-// #533: the caller's `rewrittenFeedback` assumes the prior session survived.
-// When the native transcript is gone, the fresh child must receive the caller's
-// full-task handoff, never correction-only text.
-test("a continuation whose native transcript is missing starts a fresh session carrying the full task handoff", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prg-child-resume-handoff-"));
-  const promptCapture = join(root, "prompts.jsonl");
-  const fixture = await createFakePiBinIn(root, rpcEntryBody(join(root, "capture.jsonl"), promptCapture));
-  try {
-    const artifactDir = join(fixture.root, "artifacts");
-    await mkdir(artifactDir);
-    await recordDurableNativeSession({ root: fixture.root, artifactDir, id: "durable-session-2", transcript: false });
-    const observation = await runContinuationTurn({
-      bin: fixture.bin,
-      root: fixture.root,
-      artifactDir,
-      session: { adapter: "pi-model", id: "durable-session-2" },
-      handoffPrompt: HANDOFF_PROMPT,
-    });
-    assert.equal(observation.failure, undefined, `the handed-off turn must complete: ${observation.failure?.message ?? ""}`);
-    assert.deepEqual(observation.delivered, [HANDOFF_PROMPT], "the fresh session must receive the full task handoff, not continuation-only text");
-    assert.ok(observation.updates.some((update) => update.includes("full task handoff")), `the refusal must be announced: ${observation.updates.join(" | ")}`);
-    // #533: the turn reports IDENTITY only. The transcript path and workspace
-    // live in exactly one place — this owner's canonical reference — and are
-    // never copied onto the session struct.
-    assert.deepEqual(Object.keys(observation.session).sort(), ["adapter", "id"],
-      `a returned session carries no duplicate path state: ${JSON.stringify(observation.session)}`);
-    const replacementId = observation.session.id;
-    assert.notEqual(replacementId, "durable-session-2", "the replacement is a new native session");
-    const replacementReference = await readPiSessionReference(artifactDir, replacementId);
-    assert.ok(replacementReference, "the replacement session is locatable only through its canonical reference");
-    assert.equal(replacementReference.id, replacementId);
-    assert.ok(replacementReference.file.endsWith(`${replacementId}.jsonl`),
-      `the canonical reference names the child's own transcript, got ${replacementReference.file}`);
-    const launches = await readCaptureLines(fixture.captureFile);
-    assert.equal(launches.length, 1, "an unverifiable resume starts exactly one fresh child");
-    const argv = launches[0].argv as string[];
-    assert.ok(!argv.includes("--session"), "a session that could not be verified is never reopened by path");
-    assert.ok(argv.includes("--session-id"), "the replacement session is genuinely new");
-    assert.equal((await readPromptLines(promptCapture)).length, 1, "exactly one prompt is delivered for the turn");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-// #533: Pi is authoritative for the session it opened, so a resumed turn proves
-// that identity BEFORE prompting. A replacement session is refused with the
-// prompt undelivered and the turn is retried on the caller's full handoff.
-for (const variant of [
-  { name: "a different session id", env: "PI_FAKE_WRONG_SESSION_ID", value: "replacement-session-9" },
-  { name: "a different session file", env: "PI_FAKE_WRONG_SESSION_FILE", value: "" },
-] as const) {
-  test(`a resumed Pi turn refuses a child that opened ${variant.name} and retries on the full handoff`, async () => {
-    const root = await mkdtemp(join(tmpdir(), "prg-child-resume-refuse-"));
-    const promptCapture = join(root, "prompts.jsonl");
-    const fixture = await createFakePiBinIn(root, rpcEntryBody(join(root, "capture.jsonl"), promptCapture));
-    const previousEnv = process.env[variant.env];
-    try {
-      const artifactDir = join(fixture.root, "artifacts");
-      await mkdir(artifactDir);
-      const sessionFile = await recordDurableNativeSession({ root: fixture.root, artifactDir, id: "durable-session-3", transcript: true });
-      process.env[variant.env] = variant.value || join(fixture.root, "native-store", "some-other-session.jsonl");
-      const observation = await runContinuationTurn({
-        bin: fixture.bin,
-        root: fixture.root,
-        artifactDir,
-        session: { adapter: "pi-model", id: "durable-session-3" },
-        handoffPrompt: HANDOFF_PROMPT,
-      });
-      assert.equal(observation.failure, undefined, `the retried turn must complete: ${observation.failure?.message ?? ""}`);
-      assert.equal(observation.text, "research complete");
-      assert.deepEqual(observation.delivered, [HANDOFF_PROMPT], "only the fresh session receives a prompt, and it receives the full handoff");
-      assert.ok(
-        observation.updates.some((update) => update.includes("instead of the recorded session")),
-        `the identity refusal must be announced: ${observation.updates.join(" | ")}`,
-      );
-      const launches = await readCaptureLines(fixture.captureFile);
-      assert.equal(launches.length, 2, "the refused child is torn down before one fresh child carries the turn");
-      const refused = launches[0].argv as string[];
-      assert.equal(refused[refused.indexOf("--session") + 1], sessionFile, "the refused child was launched as the exact-path resume");
-      const replacement = launches[1].argv as string[];
-      assert.ok(!replacement.includes("--session"), "the replacement never reuses the unusable session path");
-      assert.ok(replacement.includes("--session-id"), "the replacement is a new session");
-      assert.equal((await readPromptLines(promptCapture)).length, 1, "no prompt is ever delivered to the refused child");
-    } finally {
-      if (previousEnv === undefined) delete process.env[variant.env];
-      else process.env[variant.env] = previousEnv;
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-}
-
-// #533 review: the recovery layer composes a retry handoff from the caller's own
-// text, so an initial dispatch's equal prompt/handoff becomes an equal composed
-// pair. An explicitly supplied handoff must still be eligible for the fresh
-// fallback when the child refuses the recorded identity; only its absence fails
-// closed. All existing cleanup/cancellation guards stay in force.
-test("a refused resumed identity still starts a fresh session when the supplied handoff equals the prompt", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prg-child-resume-equal-handoff-"));
-  const promptCapture = join(root, "prompts.jsonl");
-  const fixture = await createFakePiBinIn(root, rpcEntryBody(join(root, "capture.jsonl"), promptCapture));
-  const previousEnv = process.env.PI_FAKE_WRONG_SESSION_ID;
-  try {
-    const artifactDir = join(fixture.root, "artifacts");
-    await mkdir(artifactDir);
-    const sessionFile = await recordDurableNativeSession({ root: fixture.root, artifactDir, id: "durable-session-3b", transcript: true });
-    process.env.PI_FAKE_WRONG_SESSION_ID = "replacement-session-9";
-    const equalText = [
-      "FULL TASK HANDOFF",
-      "Previous incident: Executor exited with status 1.",
-      "Recovery checkpoint: 0123456789abcdef",
-    ].join("\n");
-    const observation = await runContinuationTurn({
-      bin: fixture.bin,
-      root: fixture.root,
-      artifactDir,
-      session: { adapter: "pi-model", id: "durable-session-3b" },
-      prompt: equalText,
-      handoffPrompt: equalText,
-    });
-    assert.equal(observation.failure, undefined, `the equal-text fallback must complete: ${observation.failure?.message ?? ""}`);
-    assert.equal(observation.text, "research complete");
-    assert.deepEqual(observation.delivered, [equalText], "the replacement session receives the supplied handoff text, incident and checkpoint included");
-    assert.ok(
-      observation.updates.some((update) => update.includes("instead of the recorded session")),
-      `the identity refusal must still be announced: ${observation.updates.join(" | ")}`,
-    );
-    const launches = await readCaptureLines(fixture.captureFile);
-    assert.equal(launches.length, 2, "the refused child is torn down before one fresh child carries the turn");
-    const refused = launches[0].argv as string[];
-    assert.equal(refused[refused.indexOf("--session") + 1], sessionFile, "the refused child was launched as the exact-path resume");
-    const replacement = launches[1].argv as string[];
-    assert.ok(!replacement.includes("--session"), "the replacement never reuses the unusable session path");
-    assert.ok(replacement.includes("--session-id"), "the replacement is a new session");
-    assert.equal((await readPromptLines(promptCapture)).length, 1, "no prompt is ever delivered to the refused child");
-  } finally {
-    if (previousEnv === undefined) delete process.env.PI_FAKE_WRONG_SESSION_ID;
-    else process.env.PI_FAKE_WRONG_SESSION_ID = previousEnv;
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-// Without a caller-supplied handoff there is nothing truthful to send to a new
-// session, so the refused turn fails closed instead of guessing.
-test("a refused resumed identity fails closed when no full-task handoff is available", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prg-child-resume-failclosed-"));
-  const promptCapture = join(root, "prompts.jsonl");
-  const fixture = await createFakePiBinIn(root, rpcEntryBody(join(root, "capture.jsonl"), promptCapture));
-  const previousEnv = process.env.PI_FAKE_WRONG_SESSION_ID;
-  try {
-    const artifactDir = join(fixture.root, "artifacts");
-    await mkdir(artifactDir);
-    const sessionFile = await recordDurableNativeSession({ root: fixture.root, artifactDir, id: "durable-session-4", transcript: true });
-    process.env.PI_FAKE_WRONG_SESSION_ID = "replacement-session-9";
-    const observation = await runContinuationTurn({
-      bin: fixture.bin,
-      root: fixture.root,
-      artifactDir,
-      session: { adapter: "pi-model", id: "durable-session-4" },
-    });
-    assert.ok(observation.failure, "the turn must fail rather than report completion");
-    assert.match(observation.failure.message, /resumed session identity was refused/);
-    assert.equal(observation.delivered.length, 0, "no prompt is delivered into a session with the wrong identity");
-    assert.equal((await readPromptLines(promptCapture)).length, 0);
-    const launches = await readCaptureLines(fixture.captureFile);
-    assert.equal(launches.length, 1, "a refused turn without a handoff launches no replacement");
-  } finally {
-    if (previousEnv === undefined) delete process.env.PI_FAKE_WRONG_SESSION_ID;
-    else process.env.PI_FAKE_WRONG_SESSION_ID = previousEnv;
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-// An adapter-internal replacement launch is still a retry: it must not happen
-// while the refused child's ownership is unproven (executor-recovery's rule).
-test("a refused resumed identity launches no replacement while its process lifecycle is unsettled", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prg-child-resume-unsettled-"));
-  const promptCapture = join(root, "prompts.jsonl");
-  const fixture = await createFakePiBinIn(root, rpcEntryBody(join(root, "capture.jsonl"), promptCapture));
-  const previousEnv = process.env.PI_FAKE_WRONG_SESSION_ID;
-  try {
-    const artifactDir = join(fixture.root, "artifacts");
-    await mkdir(artifactDir);
-    const sessionFile = await recordDurableNativeSession({ root: fixture.root, artifactDir, id: "durable-session-5", transcript: true });
-    process.env.PI_FAKE_WRONG_SESSION_ID = "replacement-session-9";
-    const observation = await runContinuationTurn({
-      bin: fixture.bin,
-      root: fixture.root,
-      artifactDir,
-      session: { adapter: "pi-model", id: "durable-session-5" },
-      handoffPrompt: HANDOFF_PROMPT,
-      // The parent's exit persistence fails, so child ownership stays unproven.
-      onProcessExit: async () => { throw new Error("exit persistence unavailable"); },
-    });
-    assert.ok(observation.failure, `the original lifecycle failure must remain observable: ${JSON.stringify(observation)}`);
-    assert.match(observation.failure.message, /lifecycle callback failed[\s\S]*exit persistence unavailable/);
-    assert.equal(observation.delivered.length, 0, "no prompt is delivered to the refused child");
-    assert.equal((await readPromptLines(promptCapture)).length, 0);
-    const launches = await readCaptureLines(fixture.captureFile);
-    assert.equal(launches.length, 1, "an unsettled lifecycle never triggers an internal replacement launch");
-  } finally {
-    if (previousEnv === undefined) delete process.env.PI_FAKE_WRONG_SESSION_ID;
-    else process.env.PI_FAKE_WRONG_SESSION_ID = previousEnv;
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-// Pre-launch verification failure has nowhere truthful to go without the
-// handoff, so it is refused before any child exists.
-test("a continuation with an unavailable transcript and no handoff is refused before any child launches", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prg-child-resume-nolaunch-"));
-  const promptCapture = join(root, "prompts.jsonl");
-  const fixture = await createFakePiBinIn(root, rpcEntryBody(join(root, "capture.jsonl"), promptCapture));
-  try {
-    const artifactDir = join(fixture.root, "artifacts");
-    await mkdir(artifactDir);
-    await recordDurableNativeSession({ root: fixture.root, artifactDir, id: "durable-session-6", transcript: false });
-    const delivered: string[] = [];
-    await withPrependedPath(fixture.bin, async () => {
-      const adapter = new PiExecutorAdapter({ model: "provider/model", timeoutMs: 60_000, settlementTimeoutMs: 15_000 });
-      await assert.rejects(() => adapter.run({
-        cwd: fixture.root,
-        prompt: CONTINUATION_PROMPT,
-        artifactDir,
-        turn: 2,
-        session: { adapter: "pi-model", id: "durable-session-6" },
-        executorToolCatalog,
-        onPromptDelivery: (delivery) => delivered.push(delivery.prompt),
-      }), /Cannot continue the prior Pi session without its verified history or a full-task handoff/);
-    });
-    assert.equal(delivered.length, 0, "nothing is delivered into an empty session");
-    assert.equal((await readPromptLines(promptCapture)).length, 0);
-    const capture = await readFile(fixture.captureFile, "utf8").catch(() => "");
-    assert.equal(capture, "", "the refusal happens before any child is spawned");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

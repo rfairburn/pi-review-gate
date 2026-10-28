@@ -67,7 +67,7 @@ described only briefly here is owned by the linked page.
 | `maxSnapshotBytes` | `52428800` | Bounds cumulative non-ignored untracked file bytes in private task capture (50 MiB) and textual content retained for parent review diffs; it does not truncate durable checkpoint content (see [Review workflow](review-workflow.md#review-windows-and-evidence)). |
 | `waveArtifactTtlMs` | `2592000000` (30 days) | Age after which completed non-recovery wave artifact roots are garbage-collected; `0` disables collection. |
 | `retainBundles` | `"on-failure"` | Review-bundle retention policy: `never`, `on-failure`, or `always`. `always` disables age-based wave GC while the application is running. |
-| `deleteSpawnedPiSessionsOnCleanup` | `false` | Delete only associated spawned Pi sessions when existing cleanup removes their artifacts. Off (including an absent field) preserves native histories. Enabling it does not trigger deletion or change cleanup eligibility, targets, or timing. Both retention controls are under `/review-settings` → **Retention**. |
+| `deleteSpawnedPiSessionsOnCleanup` | `false` | Also unlink recorded spawned Pi sessions at existing cleanup points when On. Missing means Off; enabling it does not trigger a purge or change cleanup eligibility/timing. Identity checks read only the bounded first header, not the transcript. |
 | `tools` | `{ "topLevelDeny": [], "executorDeny": [] }` | Exact-name top-level and executor tool denials; see [Tool denial fields](#tool-denial-fields). |
 
 ## Tool denial fields
@@ -232,7 +232,6 @@ Multi-reviewer example:
   "maxCorrectionCycles": 3,
   "implementationGuidanceAfterCorrectionAttempts": 1,
   "retainBundles": "on-failure",
-  "deleteSpawnedPiSessionsOnCleanup": false,
   "externalAgents": {
     "codex": {
       "adapter": "codex-cli",

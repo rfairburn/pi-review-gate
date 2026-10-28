@@ -6,12 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { coreFilemodeOverrideFor } from "../git-checkpoint";
 import { atomicWrite } from "./durable-write";
-import {
-  deleteOwnedRootPiSessions,
-  throwPiSessionDeletionFailures,
-  type PiSessionDeletionFailure,
-  type SpawnedPiSessionCleanupOptions,
-} from "../pi-session-cleanup";
+import { deleteRecordedNativeSessions } from "./native-session-refs";
 import { encodeSourceIdentityComponent, isSourceIdentity, sourceIdentitiesEqual, type SourceIdentity } from "./source-identity";
 export type { SourceIdentity } from "./source-identity";
 import { GIT_NO_LOCKS_ENV as GIT_ENV, isAbortError, validateSafeId } from "./wave-validation";
@@ -544,15 +539,18 @@ export interface WaveCaptureOptions {
   maxCaptureAttempts?: number;
   /** Garbage-collect completed non-recovery wave roots older than this age. Zero disables GC. */
   artifactTtlMs?: number;
-  /**
-   * #533 opt-in: when GC removes an expired wave root, also delete the exact
-   * native Pi sessions its own task artifacts reference. Off by default.
-   */
-  deleteSpawnedPiSessionsOnCleanup?: boolean;
+  /** Delete the native Pi sessions recorded under a wave root this GC already decided to remove. */
+  deleteNativeSessions?: boolean;
   /** Abort signal used to cancel discovery, staging, verification, and checkout preparation. */
   signal?: AbortSignal;
   /** @internal Per-invocation capture fault hooks used by regression tests. */
   hooks?: WaveCaptureHooks;
+  /**
+   * Existing caller notice channel, used only to disclose a native Pi session
+   * that opt-in cleanup (#533) refused to delete while its recording root was
+   * removed. Never invoked when the setting is Off or nothing was refused.
+   */
+  onNativeSessionRefusal?: (message: string) => void;
 }
 
 /** @internal Per-invocation capture fault hooks used by regression tests. */
@@ -665,9 +663,10 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
     artifactDir,
     maxCaptureAttempts: givenMaxAttempts,
     artifactTtlMs = 30 * 24 * 60 * 60 * 1000,
-    deleteSpawnedPiSessionsOnCleanup = false,
+    deleteNativeSessions = false,
     signal,
     hooks,
+    onNativeSessionRefusal,
   } = options;
   if (signal?.aborted) {
     throw new WaveCaptureError("Wave capture cancelled.", "cancelled", givenWaveId, "capturing");
@@ -715,9 +714,7 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
     artifactParent = await fs.realpath(resolve(tmpdir()));
   }
   throwIfAborted(signal);
-  await pruneCompletedWaveRoots(artifactParent, artifactTtlMs, Date.now(), signal, {
-    deleteSpawnedPiSessions: deleteSpawnedPiSessionsOnCleanup,
-  });
+  await pruneCompletedWaveRoots(artifactParent, artifactTtlMs, Date.now(), signal, deleteNativeSessions, onNativeSessionRefusal);
 
   // 4. Retry loop with torn-snapshot detection.
   //    Discovery and path enumeration happen inside the loop so each retry
@@ -927,14 +924,16 @@ export async function pruneCompletedWaveRoots(
   ttlMs: number,
   nowMs = Date.now(),
   signal?: AbortSignal,
-  options: SpawnedPiSessionCleanupOptions = {},
+  /** Opt-in: delete the native Pi sessions a removed root recorded (issue #533). */
+  deleteNativeSessions = false,
+  /** Discloses a session that stayed behind; see `WaveCaptureOptions`. */
+  onNativeSessionRefusal?: (message: string) => void,
 ): Promise<string[]> {
   if (ttlMs === 0) return [];
   if (!Number.isSafeInteger(ttlMs) || ttlMs < 0) {
     throw new Error("ttlMs must be a non-negative safe integer");
   }
   const removed: string[] = [];
-  const sessionFailures: PiSessionDeletionFailure[] = [];
   const entries = await fs.readdir(artifactParent, { withFileTypes: true }).catch(() => []);
   for (const entry of entries) {
     throwIfAborted(signal);
@@ -956,20 +955,19 @@ export async function pruneCompletedWaveRoots(
     if (manifest.landingStatus === "recovery_required" || manifest.landingStatus === "conflicted") continue;
     if (manifest.integrationStatus === "conflicted" || manifest.integrationStatus === "error") continue;
     if (await hasProtectedOperation(root, manifest.landingStatus === "landed")) continue;
-    // #533: the SAME selected root, at the SAME TTL removal, with no extra
-    // eligibility. A root whose associated sessions cannot all be deleted is
-    // retained (references stay intact) and the failure is reported below.
-    if (options.deleteSpawnedPiSessions) {
-      const report = await deleteOwnedRootPiSessions(root);
-      if (report.failures.length > 0) {
-        sessionFailures.push(...report.failures);
-        continue;
+    // Existing eligibility and timing are unchanged; this only adds the
+    // opt-in deletion of the sessions this root itself recorded.
+    if (deleteNativeSessions) {
+      const cleanup = await deleteRecordedNativeSessions(root);
+      if (cleanup.refused.length > 0) {
+        onNativeSessionRefusal?.(
+          `review gate: ${cleanup.refused.length} spawned Pi session(s) in ${root} were retained, not deleted: ${cleanup.refused.join("; ")}`,
+        );
       }
     }
     await fs.rm(root, { recursive: true, force: true });
     removed.push(root);
   }
-  throwPiSessionDeletionFailures(sessionFailures, `expired wave roots under ${artifactParent}`);
   return removed;
 }
 

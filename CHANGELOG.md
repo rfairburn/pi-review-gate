@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.222]
+
+### Changed
+
+- Native network-input tests share one file-local production compilation (Refs #194).
+  Each case still stages a fresh candidate package and uses independent native state;
+  existing copier protections and other callers' per-case compilation are unchanged.
+  Broader CI-turnaround work remains open under #194.
+
 ## [0.1.0-dev.221]
 
 ### Fixed

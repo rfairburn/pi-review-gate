@@ -41,6 +41,7 @@ import {
   readFileSync,
   readSync,
   realpathSync,
+  rmSync,
   statSync,
   writeFileSync,
   writeSync,
@@ -1093,26 +1094,12 @@ export function readCandidateManifestForTest(path: string, options?: CandidateMa
   return readBoundedManifest(path, io).manifest.byteLength;
 }
 
-export function compileAndStageCandidate(root: string): CandidatePackage {
-  const projectRoot = resolve(process.cwd());
-  const requireFromProject = createRequire(join(projectRoot, "package.json"));
-  const compiler = requireFromProject.resolve("typescript/bin/tsc");
-  // The caller passes a canonical scratch root (createOwnedScratchRoot realpaths
-  // it); this staging path verifies it is real but never re-resolves or follows
-  // it, so it makes no link-following containment claim for the root.
-  const rootStats = lstatSync(root, { bigint: true });
-  if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) {
-    throw new Error("owned candidate staging requires a real, non-linked scratch root");
-  }
-  const scratchReceipt: OwnedDirectory = { path: root, dev: rootStats.dev, ino: rootStats.ino };
-  const projectRootStats = lstatSync(projectRoot, { bigint: true });
-  if (projectRootStats.isSymbolicLink() || !projectRootStats.isDirectory()) {
-    throw new Error("owned candidate staging requires a real, non-linked project root");
-  }
-  const projectReceipt: OwnedDirectory = {
-    path: projectRoot, dev: projectRootStats.dev, ino: projectRootStats.ino,
-  };
-  const compiledRoot = join(root, "compiled");
+/**
+ * Run the production TypeScript compile: the project's own `tsconfig.json` into
+ * `compiledRoot`, with the unchanged cwd, flags, deadline, buffer, and failure
+ * text. The default staging path and the shared compile both call this.
+ */
+function runProductionCompile(projectRoot: string, compiler: string, compiledRoot: string): void {
   const build = spawnSync(process.execPath, [
     compiler,
     "-p",
@@ -1133,10 +1120,48 @@ export function compileAndStageCandidate(root: string): CandidatePackage {
       + `${build.stdout ?? ""}\n${build.stderr ?? ""}\n${String(build.error ?? "")}`,
     );
   }
-  // The scratch root must still be the same real directory after the compiler
-  // ran; a swap during compilation fails closed before any staging write.
-  verifySourceDirectories([scratchReceipt]);
+}
 
+/**
+ * Capture the caller's case scratch root. The caller passes a canonical root
+ * (createOwnedScratchRoot realpaths it); this staging path verifies it is real
+ * but never re-resolves or follows it, so it makes no link-following
+ * containment claim for the root. The receipt is captured BEFORE any compile so
+ * the same identity stays authoritative through staging.
+ */
+function caseScratchRootReceipt(root: string): OwnedDirectory {
+  const stats = lstatSync(root, { bigint: true });
+  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+    throw new Error("owned candidate staging requires a real, non-linked scratch root");
+  }
+  return { path: root, dev: stats.dev, ino: stats.ino };
+}
+
+/** Capture the project source root receipt used by every staged candidate. */
+function projectSourceRootReceipt(projectRoot: string): OwnedDirectory {
+  const stats = lstatSync(projectRoot, { bigint: true });
+  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+    throw new Error("owned candidate staging requires a real, non-linked project root");
+  }
+  return { path: projectRoot, dev: stats.dev, ino: stats.ino };
+}
+
+/**
+ * Stage one fresh exclusive candidate package from an already-produced compiled
+ * `src` tree. `scratchReceipt` is the ORIGINAL case-root receipt taken before
+ * the compile; it is re-verified before any candidate write, so a case root
+ * replaced during the compile fails closed instead of becoming a new baseline.
+ * Every destination, manifest, allowlist, no-follow, receipt, and bounds check
+ * below is the unchanged per-case staging path.
+ */
+function stageCandidateFromCompiledSource(
+  root: string,
+  scratchReceipt: OwnedDirectory,
+  projectRoot: string,
+  projectReceipt: OwnedDirectory,
+  compiledSrcRoot: string,
+  compiledSrcBase: OwnedDirectory,
+): CandidatePackage {
   const candidateRoot = join(root, "candidate-package");
   // The destination package root is created exclusively: a pre-existing entry
   // (regular, linked, or special) fails closed rather than being reused.
@@ -1166,7 +1191,7 @@ export function compileAndStageCandidate(root: string): CandidatePackage {
     ]),
     directories: 0,
   };
-  const compiledSrcChain = sourceDirectoryChain(join(compiledRoot, "src"), scratchReceipt);
+  const compiledSrcChain = sourceDirectoryChain(compiledSrcRoot, compiledSrcBase);
   copyBoundedTree(compiledSrcChain, join(candidateRoot, "dist", "src"), ctx);
 
   // The shipped-file list and the package.json later staged come from the same
@@ -1208,6 +1233,112 @@ export function compileAndStageCandidate(root: string): CandidatePackage {
   assert.ok(existsSync(join(candidateRoot, "dist", "src", "session-host", "reporter.js")));
   assert.ok(existsSync(join(candidateRoot, "dist", "src", "session-host", "bootstrap-preload.js")));
   return { root: candidateRoot, entry };
+}
+
+/**
+ * The default native-candidate staging path, unchanged: this case's own scratch
+ * build, this case's own destination root, and every existing manifest,
+ * allowlist, no-follow, receipt, and bounds check.
+ */
+export function compileAndStageCandidate(root: string): CandidatePackage {
+  const projectRoot = resolve(process.cwd());
+  const compiler = createRequire(join(projectRoot, "package.json")).resolve("typescript/bin/tsc");
+  const scratchReceipt = caseScratchRootReceipt(root);
+  const projectReceipt = projectSourceRootReceipt(projectRoot);
+  const compiledRoot = join(root, "compiled");
+  runProductionCompile(projectRoot, compiler, compiledRoot);
+  // The scratch root must still be the same real directory after the compiler
+  // ran; a swap during compilation fails closed before any staging write.
+  verifySourceDirectories([scratchReceipt]);
+  return stageCandidateFromCompiledSource(root, scratchReceipt, projectRoot, projectReceipt,
+    join(compiledRoot, "src"), scratchReceipt);
+}
+
+/**
+ * One lazily created production compile shared by explicit cases in one file.
+ *
+ * Cases that need byte-identical immutable compiled code can share this one
+ * real production compile, while each still exclusively stages a fresh
+ * candidate package from its own case root with the unchanged copier. The
+ * compiled code lives in its own owned scratch root, never in a case root or
+ * `dist/`. Construction performs no I/O, so a run whose cases both skip creates
+ * no root, and a failed compile is never retried.
+ */
+export interface SharedProductionCompile {
+  /** Stage this case's fresh candidate package from the shared compiled source. */
+  stageCandidate(caseRoot: string): CandidatePackage;
+  /** Production compiles run by this handle: 0 before first use, then exactly 1. */
+  readonly builds: number;
+  /** Remove the owned compiled-code root; true only when it was removed. */
+  dispose(): boolean;
+}
+
+/**
+ * `compile` is a test seam that replaces ONLY the tsc process, so a synthetic
+ * stand-in can exercise staging without a real build.
+ */
+export function createSharedProductionCompile(
+  compile?: (compiledRoot: string) => void,
+): SharedProductionCompile {
+  let cacheRoot: string | undefined;
+  let cacheReceipt: OwnedDirectory | undefined;
+  let failure: Error | undefined;
+  let builds = 0;
+  let disposed = false;
+
+  const compiledSourceRoot = (): string => {
+    if (failure !== undefined) {
+      throw new Error(`owned shared compile failed earlier and is never retried: ${failure.message}`);
+    }
+    if (cacheRoot !== undefined) {
+      verifySourceDirectories([cacheReceipt!]);
+      return join(cacheRoot, "compiled", "src");
+    }
+    try {
+      const projectRoot = resolve(process.cwd());
+      const compiler = createRequire(join(projectRoot, "package.json")).resolve("typescript/bin/tsc");
+      const created = createOwnedScratchRoot();
+      cacheRoot = created;
+      cacheReceipt = realDirectoryReceipt(created);
+      const compiledRoot = join(created, "compiled");
+      if (compile) compile(compiledRoot);
+      else runProductionCompile(projectRoot, compiler, compiledRoot);
+      // The owned code root must still be the same real directory after the
+      // compiler ran; a swap during compilation fails closed before any staging.
+      verifySourceDirectories([cacheReceipt]);
+      builds = 1;
+      return join(compiledRoot, "src");
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error));
+      throw failure;
+    }
+  };
+
+  return {
+    stageCandidate(caseRoot: string): CandidatePackage {
+      if (disposed) throw new Error("owned shared compile is disposed and cannot be reused");
+      const projectRoot = resolve(process.cwd());
+      // Both receipts are captured BEFORE the first compile, exactly as the
+      // default per-case path captures them before its own tsc run.
+      const scratchReceipt = caseScratchRootReceipt(caseRoot);
+      const projectReceipt = projectSourceRootReceipt(projectRoot);
+      const compiledSrcRoot = compiledSourceRoot();
+      return stageCandidateFromCompiledSource(caseRoot, scratchReceipt, projectRoot,
+        projectReceipt, compiledSrcRoot, cacheReceipt!);
+    },
+    get builds() { return builds; },
+    dispose(): boolean {
+      if (disposed || cacheRoot === undefined || cacheReceipt === undefined) return false;
+      disposed = true;
+      try {
+        verifySourceDirectories([cacheReceipt]);
+      } catch {
+        return false;
+      }
+      rmSync(cacheRoot, { recursive: true, force: false });
+      return true;
+    },
+  };
 }
 
 function makeSafePath(): string {

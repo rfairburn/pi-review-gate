@@ -41,6 +41,13 @@ import { ExecutionToolManager } from "./execution/tool";
 import { acknowledgeOwnerRetiringSave } from "./execution/background-controller";
 import { deleteRecordedNativeSessions } from "./execution/native-session-refs";
 import { NativeToolCallPreflight } from "./tool-call-preflight";
+import {
+  captureToolProtectionBootstrap,
+  clearToolProtectionLoadError,
+  createToolProtectionCoordinator,
+  noteToolProtectionLoadError,
+  type ToolProtectionLaunchPin,
+} from "./tool-protection/coordinator";
 import { queueModelDelivery } from "./durable-delivery";
 import { replaceReviewGateState, sessionPersistenceIdentity, SessionStateCwdMismatchError, SessionStateStore } from "./session-state";
 import {
@@ -136,6 +143,8 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   let currentCwd = process.cwd();
   let executorSettlementBootstrap: PiSettlementBootstrap | undefined;
   let executorSettlementBootstrapError: Error | undefined;
+  let executorToolProtectionPin: ToolProtectionLaunchPin | undefined;
+  let executorToolProtectionPinError: string | undefined;
   if (executorRole) {
     try {
       // Capture and erase the signing bootstrap before the first await, tool
@@ -143,6 +152,15 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       executorSettlementBootstrap = capturePiSettlementBootstrap();
     } catch (error) {
       executorSettlementBootstrapError = error instanceof Error ? error : new Error("Pi executor settlement bootstrap failed.");
+    }
+    try {
+      // One-shot parent-issued protection pin, captured and erased beside the
+      // settlement bootstrap so no later model/tool await can observe it in the
+      // environment. A malformed pin blocks protected admissions; it never
+      // falls back to the ambient configuration file.
+      executorToolProtectionPin = captureToolProtectionBootstrap();
+    } catch (error) {
+      executorToolProtectionPinError = error instanceof Error ? error.message : "Pi executor tool-protection bootstrap failed.";
     }
   }
   const loaded = loadConfig();
@@ -170,6 +188,37 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     await sendNotice(pi, `review gate: disabled (${loaded.disabledReason ?? "environment kill switch"})`);
     return;
   }
+
+  // The pre-execution tool-protection gate (#536). One shared level and one
+  // coordinated admission owner per activated runtime. A malformed stored
+  // block is a derived load error, not an implicit Off: admissions stay blocked
+  // until an explicit valid settings apply clears it.
+  let toolProtectionLoadError = loaded.toolProtectionError;
+  // Monotonic policy revision: an explicit settings apply bumps it even when
+  // the resulting values equal the previous snapshot (Off → On → Off while an
+  // auditor waits must invalidate the in-flight decision).
+  let toolProtectionRevision = 0;
+  noteToolProtectionLoadError(toolProtectionLoadError);
+  // The never-audited discovery-loader treatment belongs only to the loader THIS
+  // extension registered. The deferred-tool manager answers ownership from the
+  // registration identity it holds, so a definition that took over the reserved
+  // `tool_search` name is audited like any other tool. Until a manager exists
+  // nothing is owned, and the exemption is never the default.
+  let discoveryLoaderOwner: (() => boolean) | undefined;
+  const toolProtection = createToolProtectionCoordinator({
+    config: () => config,
+    cwd: () => currentCwd,
+    role: executorRole ? "executor" : "primary",
+    loadError: () => toolProtectionLoadError,
+    revision: () => toolProtectionRevision,
+    pinned: () => executorToolProtectionPin,
+    pinnedError: () => executorToolProtectionPinError,
+    discoveryLoaderOwned: () => discoveryLoaderOwner?.() === true,
+  });
+  // Live-ingress provenance must be captured before the review gate's own
+  // input handler can consume an event with action: "handled" (queued user
+  // input during review). Presentation stays registered last.
+  toolProtection.registerEvidenceHooks(pi);
 
   // Install the native Pi preflight before registering any extension tools.
   // The native batch event and execution lifecycle seams are required; without
@@ -229,6 +278,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     }
     const deferredTools = new DeferredToolManager(pi);
     registerDeferredToolLifecycleHooks(pi, deferredTools);
+    discoveryLoaderOwner = () => deferredTools.ownsDiscoveryLoader();
     // Issue #434: a tool outside this executor's captured catalog is absent from
     // its declarations, so a direct attempt takes Pi's early unknown-tool path
     // before the tool_call hook can run. This handler explains that outcome from
@@ -245,13 +295,22 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       ?? (!executorSettlementBootstrap || terminal ? new Error(
         "Pi executor settlement bootstrap is unavailable or retired. Executor reload/replacement is unsupported; restart this worker with a fresh parent-issued identity.",
       ) : undefined);
-    toolCallObserver = (...args) => {
+    toolCallObserver = async (...args) => {
       const failure = acknowledgementFailure();
       if (failure) return { block: true, reason: failure.message };
       const name = extractToolName(args);
       const nested = hasNestedToolCallParent(args);
       if (!deferredTools.toolCallAllowed(name, nested)) return executorToolAuthorizationBlock(name, nested, deferredTools.executorToolAuthorizationReason(name, nested));
-      return nativeToolPreflight.preflight(args);
+      const decision = nativeToolPreflight.preflight(args);
+      if (decision) return decision;
+      // The gate adds one restriction after every existing guard admitted the
+      // call. Off returns immediately and leaves the native result untouched.
+      const protectionDecision = await toolProtection.admitToolCall(args);
+      if (protectionDecision) {
+        nativeToolPreflight.markPolicyBlocked(extractToolCallId(args) ?? "", name, protectionDecision.reason);
+        return protectionDecision;
+      }
+      return undefined;
     };
     if (!isDeferredToolHost(pi)) {
       // This reduced executor has no bootstrap hooks below, so reset the
@@ -263,6 +322,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       // register the bridge after the background shell's own lifecycle hooks
       // so its shutdown reset can never be dispatched ahead of the reaper.
       registerStreamFailureReporting(pi);
+      toolProtection.registerPresentationHooks(pi);
       return;
     }
     const serializedToolCatalog = process.env[EXECUTOR_TOOL_CATALOG_ENV];
@@ -330,6 +390,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // lifecycle hook so its session_shutdown reset can never be dispatched
     // ahead of settlement retirement or the background shell's own reaper.
     registerStreamFailureReporting(pi);
+    toolProtection.registerPresentationHooks(pi);
     return;
   }
 
@@ -367,6 +428,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     (name) => config.tools?.topLevelDeny?.includes(name) === true,
   );
   registerDeferredToolLifecycleHooks(pi, deferredTools);
+  discoveryLoaderOwner = () => deferredTools.ownsDiscoveryLoader();
   // Issue #434: a top-level denied tool is removed from the model-visible
   // declarations, so Pi's own early tool lookup answers a direct attempt with
   // `Tool <name> not found` before the tool_call blocking hook can run. Pi's
@@ -1115,7 +1177,17 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         if (!decision) throw error;
       }
     }
-    return decision;
+    if (decision) return decision;
+    // One shared protection level for top-level and delegated calls. The audit
+    // is held at this admission seam; Off returns without touching the native
+    // result, and a refusal is recorded as a policy block (not an execution
+    // error) so same-batch reservations and adjacent duplicate rules hold.
+    const protectionDecision = await toolProtection.admitToolCall(args);
+    if (protectionDecision) {
+      nativeToolPreflight.markPolicyBlocked(extractToolCallId(args) ?? "", name, protectionDecision.reason);
+      return protectionDecision;
+    }
+    return undefined;
   };
 
   registerHook(pi, "tool_result", async (...args) => {
@@ -1224,10 +1296,21 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // checked row stays reversible and an executor-only denial never hides a
     // row from the primary picker.
     getToolChoices: () => deferredTools.toolDenyChoices(),
+    // Issue #536: the tool-protection audit-name picker reads the SAME live
+    // inventory with the reserved discovery loader kept, because an audited
+    // name may be any exact name and auditing the loader is meaningful. It is
+    // offered only when the runtime genuinely has it; the deny pickers above
+    // stay loader-free, and neither read activates or authorizes anything.
+    getAuditedToolChoices: () => deferredTools.toolAuditChoices(),
     // Issue #26: the live process-local switch; the menu flips it through
     // setEnabled, which stops or starts the timers immediately.
     schedulerRuntime: schedulerSwitch,
     onSaved: async (_saved, previousMode, context) => {
+      // An explicit valid apply is the only thing that clears a derived
+      // malformed-block load error; protected admissions resume from here.
+      toolProtectionLoadError = undefined;
+      toolProtectionRevision += 1;
+      clearToolProtectionLoadError();
       localUiTarget = context ?? pi;
       await reviewTurn.drainEvidenceCaptures();
       await applyPrimaryEvidenceSettings();
@@ -1366,6 +1449,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       ? "host-lifecycle-hooks"
       : "unavailable",
   );
+  // Inline presentation/evidence/lifecycle hooks are registered last so this
+  // gate's tool_result annotation runs after the existing result transforms and
+  // evidence capture. Off makes every one of them a no-op.
+  toolProtection.registerPresentationHooks(pi);
 }
 
 export default activate;

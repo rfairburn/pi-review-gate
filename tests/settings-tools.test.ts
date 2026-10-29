@@ -32,8 +32,8 @@ const down = (count: number): string[] => Array.from({ length: count }, () => KE
 
 /** Root row index of the Tools subsection (after Subtask notifications). */
 const ROOT_TOOLS = 13;
-/** Tools submenu row indices. */
-const TOOLS = { topLevel: 0, executor: 1, deferred: 2, notices: 3, guidance: 4, web: 5, back: 6 } as const;
+/** Tools submenu row indices (issue #536 added Tool protection between Web and Back). */
+const TOOLS = { topLevel: 0, executor: 1, deferred: 2, notices: 3, guidance: 4, web: 5, toolProtection: 6, back: 7 } as const;
 
 async function tempConfig(body: Record<string, unknown>): Promise<{ dir: string; configPath: string; original: string; config: ReviewGateConfig }> {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-tools-"));

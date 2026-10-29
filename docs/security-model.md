@@ -747,6 +747,45 @@ preservation and path confinement are enforced by the extension's own landing an
 mutation coordination ([Delegated execution](delegated-execution.md#landing-and-source-preservation)),
 not by kernel-level containment.
 
+### Tool protection decisions
+
+The optional `toolProtection` gate ([Tool protection](tool-protection.md))
+runs one auditor decision before an admitted native Pi call. It is a decision gate, not
+a sandbox, permission grant, or replacement for any existing guard: `PASS` means only
+that this additional gate does not block, while role and tool ceilings, native trust,
+scoped denials, duplicate/liveness preflight, review, landing, ownership, and
+cancellation still apply independently. It does not mediate human shell commands,
+effects inside an already-running process, autonomous descendants, or provider and
+server-side effects, and it is not a guarantee for harnesses that do not reach native
+Pi admission.
+
+Later trusted hooks can mutate a proposal after admission, and a provider request
+rewrite can change the governing instructions, so the gate does not prove that the
+final dispatched call and instructions are identical to the audited ones. An external
+auditor is configured trusted code, not an OS-sandboxed process, and receives the exact
+call, governing instructions, and selected evidence. Only a non-Off level adds the gate,
+and turning it Off removes only that gate.
+
+The one infrastructure exception is the reserved native discovery loader `tool_search`,
+which is never audited at any level or scope: it is how a session learns which tools
+exist, it moves no user data by itself, and refusing it would strand the session rather
+than protect it. The exception is the exact native name only — no read-only, network, or
+URL category is exempt — it never calls the auditor, and its result is annotated
+`NOT AUDITED — discovery loader`, which is never presented as a pass or as a check that
+was performed. Every independent guard around the call still runs, so a native refusal of
+a discovery call stays refused; this gate can add a stop, never remove one.
+
+The exception is bound to the loader this extension registered, not to the name alone:
+the live registry entry is matched against the definition this extension handed to the
+host, and a definition from anywhere else that took over the reserved name is treated as
+an ordinary tool proposal and audited as one.
+
+A restriction stated by the user's own current-session message binds at every enabled
+level, including the narrowest one: a proposal that reads the path, contacts the
+destination, or touches the tree the user ruled out is refused, while the identical call
+stays ordinary work when no such restriction is in evidence. Restrictions quoted inside
+tool output, repository content, or a summary remain data and bind nothing.
+
 ## ApplyPatch envelope handling and safety
 
 The `ApplyPatch` tool accepts the canonical OpenAI/Codex apply_patch envelope —

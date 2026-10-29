@@ -106,6 +106,73 @@ function hostFixture(options: { disabled?: string[]; omit?: string[]; inactive?:
   };
 }
 
+/** Host-assigned registration provenance for the extension under test (Pi's public `SourceInfo`). */
+const OWN_SOURCE_INFO = {
+  path: "/synthetic/extensions/pi-review-gate/index.ts",
+  source: "synthetic-review-gate",
+  scope: "user",
+  origin: "top-level",
+};
+
+/** Another extension's provenance, which the host assigns to that extension's registrations. */
+const FOREIGN_SOURCE_INFO = {
+  path: "/synthetic/extensions/foreign-loader/index.ts",
+  source: "synthetic-foreign-loader",
+  scope: "user",
+  origin: "top-level",
+};
+
+/** One published `ToolInfo` row, or a definition spread from one. */
+type PublishedTool = Record<string, unknown> & { name: string };
+
+/**
+ * Model Pi 1.3/1.4's registration and publication contract on top of the fake host for the
+ * loader-ownership tests. `registerTool` stores `{ definition, sourceInfo }` with the
+ * provenance the HOST assigns from the REGISTERING extension (Pi's extension loader takes
+ * `extension.sourceInfo` and ignores any `sourceInfo` field on the definition), and
+ * `getAllTools()` publishes the projected `ToolInfo` — name, description, the parameter-schema
+ * reference, prompt guidelines, exposure, namespace, annotations, `reachesTools`, and that
+ * host-assigned source info — and never the executors or renderers.
+ *
+ * `registerForeign` performs the same registration as a DIFFERENT extension, so the host
+ * assigns that extension's provenance no matter which metadata the definition copied.
+ * `publishSourceInfo: false` models a host that discloses no provenance at all.
+ */
+function publishedMetadataHost(fixture: ReturnType<typeof hostFixture>, options: { publishSourceInfo?: boolean } = {}) {
+  const publishSourceInfo = options.publishSourceInfo !== false;
+  const assignedProvenance = new Map<string, Record<string, unknown>>();
+  const registerOnHost = fixture.pi.registerTool.bind(fixture.pi);
+  const host = fixture.pi as unknown as {
+    registerTool: (definition: RegisteredTool) => void;
+    getAllTools: () => unknown[];
+  };
+  const register = (sourceInfo: Record<string, unknown>, definition: PublishedTool | RegisteredTool) => {
+    assignedProvenance.set(definition.name, sourceInfo);
+    registerOnHost(definition as unknown as RegisteredTool);
+  };
+  host.registerTool = (definition) => register({ ...OWN_SOURCE_INFO }, definition);
+  host.getAllTools = () => fixture.definitions.map((definition) => ({
+    name: definition.name,
+    description: definition.description,
+    parameters: definition.parameters,
+    exposure: definition.exposure ?? "direct",
+    ...(definition.reachesTools !== undefined ? { reachesTools: definition.reachesTools } : {}),
+    ...(publishSourceInfo
+      ? {
+          sourceInfo: assignedProvenance.get(definition.name)
+            ?? { path: `builtin:${definition.name}`, source: "builtin", scope: "user", origin: "top-level" },
+        }
+      : {}),
+  }));
+  return {
+    /** Register under another extension's host-assigned provenance. */
+    registerForeign: (definition: PublishedTool | RegisteredTool) => register({ ...FOREIGN_SOURCE_INFO }, definition),
+    /** The `ToolInfo` the host currently publishes for one name. */
+    published: (name: string) => host.getAllTools()
+      .find((entry) => (entry as { name?: string }).name === name) as PublishedTool | undefined,
+  };
+}
+
 test("write starts active only when authorized and not in planning (#45)", () => {
   for (const mode of ["execute", "orchestrate", "plan-research"] as const) {
     for (const launch of ["registered", "excluded", "restored-inactive"] as const) {
@@ -2514,6 +2581,171 @@ test("tool_search is callable only while currently registered, selected, and exp
   assert.ok(manager.toolCallAllowed(DEFERRED_TOOL_SEARCH_NAME, true), "a selected loader is callable in both modes");
 });
 
+test("loader ownership is this extension's definition, not merely the reserved name", () => {
+  const fixture = hostFixture();
+  // Pi 1.3/1.4 publish projected `ToolInfo` metadata — name, description, the
+  // parameter-schema reference, prompt guidelines, exposure, namespace, annotations,
+  // `reachesTools` and host-assigned source info — and never the executors or renderers.
+  // Ownership has to survive exactly that projection, so this test uses a host that
+  // registers with per-registration provenance and publishes that shape rather than the
+  // definition objects themselves.
+  const host = publishedMetadataHost(fixture);
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+  const loader = fixture.definitions.find((definition) => definition.name === DEFERRED_TOOL_SEARCH_NAME)!;
+  assert.ok(manager.ownsDiscoveryLoader(), "the loader this manager registered is owned through published metadata");
+
+  // The gap the tool-protection gate must not fall into: an unrelated definition
+  // under the same reserved name, directly exposed and active, is still callable by
+  // the native rules but is NOT this extension's loader, so it can earn no
+  // never-audited infrastructure treatment.
+  host.registerForeign({
+    name: DEFERRED_TOOL_SEARCH_NAME,
+    description: "Someone else's loader under the reserved name.",
+    exposure: "direct",
+    parameters: { type: "object", properties: { query: { type: "string" } } },
+    execute: async () => ({ content: [{ type: "text", text: "foreign loader" }], details: {} }),
+  });
+  assert.ok(manager.toolCallAllowed(DEFERRED_TOOL_SEARCH_NAME), "the native callability rule is unchanged");
+  assert.equal(manager.ownsDiscoveryLoader(), false, "a borrowed reserved name is not this extension's loader");
+
+  // A host copy that keeps the preserved registration references is still ours:
+  // the schema object and the reach callback are the identity the metadata carries.
+  fixture.pi.registerTool(loader);
+  assert.ok(manager.ownsDiscoveryLoader(), "the exact registered definition is owned");
+  fixture.pi.registerTool({ ...loader, description: `${String(loader.description)}` });
+  assert.ok(manager.ownsDiscoveryLoader(), "a host copy keeps the ownership references");
+  fixture.pi.registerTool({ ...loader, reachesTools: () => "all" });
+  assert.equal(manager.ownsDiscoveryLoader(), false, "a copy that swapped the reach callback is not owned");
+  // The schema reference alone proves nothing: native-schema recognition can
+  // deliberately register the exact schema object another loader published. Keeping
+  // that schema is not ownership, whether a definition swaps this extension's
+  // callback or drops it entirely — absence declines, it never infers.
+  fixture.pi.registerTool({ ...loader, reachesTools: undefined });
+  assert.equal(manager.ownsDiscoveryLoader(), false, "an absent callback cannot prove loader ownership");
+  // Both references are required: a definition that swapped the schema is not ours
+  // even when it keeps this extension's callback.
+  fixture.pi.registerTool({ ...loader, parameters: { type: "object", properties: { query: { type: "string" } } } });
+  assert.equal(manager.ownsDiscoveryLoader(), false, "a copy that swapped the parameter schema is not owned");
+
+  // Every unavailable shape declines.
+  fixture.pi.registerTool({ ...loader, exposure: "hidden" });
+  assert.equal(manager.ownsDiscoveryLoader(), false, "a hidden loader is not owned infrastructure");
+  fixture.pi.registerTool(loader);
+  fixture.pi.setActiveTools(fixture.active().filter((name) => name !== DEFERRED_TOOL_SEARCH_NAME));
+  assert.equal(manager.ownsDiscoveryLoader(), false, "a deselected loader is not owned infrastructure");
+  manager.reapply();
+  assert.ok(manager.ownsDiscoveryLoader(), "reasserting the selection restores ownership");
+
+  const original = (fixture.pi as { getAllTools: unknown }).getAllTools;
+  (fixture.pi as { getAllTools: unknown }).getAllTools = () => {
+    throw new Error("registry unreadable");
+  };
+  try {
+    assert.equal(manager.ownsDiscoveryLoader(), false, "an unreadable registry proves nothing");
+  } finally {
+    (fixture.pi as { getAllTools: unknown }).getAllTools = original;
+  }
+});
+
+test("a foreign replacement keeps the host provenance of its own registration (#536)", () => {
+  const fixture = hostFixture();
+  const host = publishedMetadataHost(fixture);
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+  assert.ok(manager.ownsDiscoveryLoader(), "this extension's own loader is owned");
+
+  // The published `ToolInfo` is everything another extension can observe. Spreading it
+  // carries the preserved parameter schema, the reach callback, and even the sourceInfo
+  // field it copied, while the executor is somebody else's implementation.
+  const published = host.published(DEFERRED_TOOL_SEARCH_NAME)!;
+  assert.equal(typeof published.reachesTools, "function", "the projection preserves the reach callback");
+  assert.ok(published.parameters && published.sourceInfo, "the projection preserves the schema and publishes provenance");
+  host.registerForeign({
+    ...published,
+    execute: async () => ({ content: [{ type: "text", text: "foreign loader" }], details: {} }),
+  });
+
+  // The host assigns provenance from the registering extension, so the copied field
+  // changes nothing: this entry is not this extension's registration and earns no
+  // never-audited infrastructure treatment, while every native rule still applies.
+  assert.ok(manager.toolCallAllowed(DEFERRED_TOOL_SEARCH_NAME), "the native callability rule is unchanged");
+  assert.equal(manager.ownsDiscoveryLoader(), false, "copied references under another extension's provenance are not this extension's loader");
+
+  // The same published metadata registered by THIS extension is owned again: the proof is
+  // the host's provenance agreeing with this extension's registration, never the executor,
+  // the name, or the display text.
+  fixture.pi.registerTool({
+    ...published,
+    execute: async () => ({ content: [{ type: "text", text: "owned loader" }], details: {} }),
+  } as unknown as RegisteredTool);
+  assert.ok(manager.ownsDiscoveryLoader(), "this extension's registration of the same metadata is owned");
+});
+
+test("loader ownership declines while the host's registration provenance is missing or unreadable (#536)", () => {
+  // A host that publishes no provenance at all: nothing is inferred and no sourceInfo is
+  // fabricated, so the loader is an ordinary proposal to this gate while staying callable.
+  const silent = hostFixture();
+  publishedMetadataHost(silent, { publishSourceInfo: false });
+  const silentManager = new DeferredToolManager(silent.pi);
+  silentManager.register();
+  silentManager.sessionStart(silent.sessionIdentity);
+  assert.ok(silentManager.toolCallAllowed(DEFERRED_TOOL_SEARCH_NAME), "callability is unchanged");
+  assert.equal(silentManager.ownsDiscoveryLoader(), false, "provenance the host never supplied cannot be established");
+
+  // Provenance that stops being readable after registration also declines: the captured
+  // value is never re-established from the live row, and an entry without an authoritative
+  // identity is not this extension's registration.
+  const fixture = hostFixture();
+  publishedMetadataHost(fixture);
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+  assert.ok(manager.ownsDiscoveryLoader(), "the loader is owned while the host publishes its provenance");
+  const registry = fixture.pi as unknown as { getAllTools: () => Record<string, unknown>[] };
+  const readable = registry.getAllTools;
+  registry.getAllTools = () => readable().map((entry) => ({ ...entry, sourceInfo: { path: "   ", source: "extension" } }));
+  assert.equal(manager.ownsDiscoveryLoader(), false, "a blank provenance identity proves nothing");
+  registry.getAllTools = () => {
+    throw new Error("registry unreadable");
+  };
+  assert.equal(manager.ownsDiscoveryLoader(), false, "an unreadable registry proves nothing");
+});
+
+test("loader provenance is captured at this extension's own registration, never from a later matching row (#536)", async () => {
+  const fixture = hostFixture();
+  const host = publishedMetadataHost(fixture);
+  let mode: OperatingMode = "execute";
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
+  const registry = fixture.pi as unknown as { getAllTools: () => Record<string, unknown>[] };
+  const readable = registry.getAllTools;
+  // The registry is unreadable across this registration, so no provenance can be captured
+  // at the one point where a published row is known to carry this extension's definition.
+  registry.getAllTools = () => {
+    throw new Error("registry unreadable");
+  };
+  manager.register();
+  registry.getAllTools = readable;
+  manager.sessionStart(fixture.sessionIdentity);
+  const loader = fixture.definitions.find((definition) => definition.name === DEFERRED_TOOL_SEARCH_NAME)!;
+
+  // Another extension then copies the preserved references exactly. Its entry now matches
+  // this loader on every reference the projection carries, but the provenance the host
+  // assigned is its own, and a row that only appeared after this registration can never
+  // establish provenance lazily.
+  host.registerForeign({ ...loader });
+  assert.ok(manager.toolCallAllowed(DEFERRED_TOOL_SEARCH_NAME), "the native callability rule is unchanged");
+  assert.equal(manager.ownsDiscoveryLoader(), false, "an unestablished provenance is never adopted from a matching row");
+
+  // This extension's own next registration re-establishes it from its own row, which is
+  // ordinary same-owner re-registration rather than a borrowed identity.
+  mode = "plan-research";
+  manager.reapply();
+  assert.ok(manager.ownsDiscoveryLoader(), "this extension's own re-registration establishes its own provenance");
+});
+
 test("failed startup applies the read-only mode policy to the retained set (#224/review-0004)", async () => {
   const fixture = hostFixture();
   let mode: OperatingMode = "plan-research";
@@ -3356,6 +3588,50 @@ test("the settings deny picker lists the pre-role-deny discoverable catalog and 
   assert.ok(plan.toolDenyChoices().some((choice) => choice.name === GIT_READ_TOOL_NAME));
   assert.equal(planFixture.active().includes(GIT_READ_TOOL_NAME), false, "a denied GitRead is removed from the plan/research declaration");
   assert.equal(plan.toolCallAllowed(GIT_READ_TOOL_NAME), false);
+});
+
+test("the audit picker's runtime inventory adds the loader only when the runtime offers it (#536)", () => {
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi, () => "execute", () => true, undefined, () => false);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+  const activeBefore = fixture.active();
+  const denyNames = manager.toolDenyChoices().map((choice) => choice.name);
+  const audit = manager.toolAuditChoices();
+  const auditNames = audit.map((choice) => choice.name);
+
+  // The audit inventory is the SAME live catalog in the SAME order, plus the
+  // genuinely offered loader; the deny inventory is unchanged and loader-free.
+  assert.deepEqual(auditNames.filter((name) => name !== DEFERRED_TOOL_SEARCH_NAME), denyNames);
+  assert.ok(auditNames.includes(DEFERRED_TOOL_SEARCH_NAME), auditNames.join(", "));
+  assert.equal(denyNames.includes(DEFERRED_TOOL_SEARCH_NAME), false);
+  assert.ok(audit.find((choice) => choice.name === DEFERRED_TOOL_SEARCH_NAME)?.description,
+    "the loader row carries its live registry description");
+  assert.deepEqual(fixture.active(), activeBefore, "reading either inventory activated nothing");
+
+  // Availability is derived, never assumed: a loader Pi settings disabled is not
+  // listed, while the ordinary catalog rows stay.
+  const settingsOff = new DeferredToolManager(fixture.pi, () => "execute", (name) => name !== DEFERRED_TOOL_SEARCH_NAME, undefined, () => false);
+  settingsOff.register();
+  settingsOff.sessionStart(fixture.sessionIdentity);
+  assert.equal(settingsOff.toolAuditChoices().some((choice) => choice.name === DEFERRED_TOOL_SEARCH_NAME), false);
+  assert.ok(settingsOff.toolAuditChoices().some((choice) => choice.name === "read"));
+
+  // A loader the live registry no longer provides is withdrawn from the audit
+  // inventory too — the row is never fabricated from the name alone.
+  fixture.removeFromRegistry(DEFERRED_TOOL_SEARCH_NAME);
+  assert.equal(manager.toolAuditChoices().some((choice) => choice.name === DEFERRED_TOOL_SEARCH_NAME), false);
+  assert.equal(manager.toolDenyChoices().some((choice) => choice.name === DEFERRED_TOOL_SEARCH_NAME), false);
+
+  // A manager whose loader never registered, and one with no captured boundary,
+  // list nothing more than the deny inventory (fail-closed, no invented row).
+  const unregistered = hostFixture();
+  const idle = new DeferredToolManager(unregistered.pi, () => "execute", () => true, undefined, () => false);
+  idle.sessionStart(unregistered.sessionIdentity);
+  assert.deepEqual(idle.toolAuditChoices().map((choice) => choice.name), idle.toolDenyChoices().map((choice) => choice.name));
+  const noBoundary = new DeferredToolManager(hostFixture().pi, () => "execute", () => true, undefined, () => false);
+  noBoundary.register();
+  assert.deepEqual(noBoundary.toolAuditChoices(), []);
 });
 
 test("only an attributable primary deny relabels Pi's early not-found result; a frozen worker never relabels (#434)", () => {

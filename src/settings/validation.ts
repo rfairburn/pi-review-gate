@@ -24,6 +24,76 @@ import {
 } from "../config";
 import type { ScopedModelChoice } from "./models";
 import { reviewerKey } from "./review";
+import type { ToolProtectionConfig } from "../tool-protection/config";
+
+/**
+ * Save/apply-time result for the tool-protection block (#536).
+ * `error` blocks the apply or Save; `warnings` are shown after it succeeds.
+ */
+export interface ToolProtectionValidation {
+  error?: string;
+  warnings: string[];
+}
+
+/**
+ * The narrow tool-protection validation the staged transaction needs (#536).
+ * Core owns the schema, so this only states core's two hard rules where the
+ * user can still act on them, and reports an unavailable auditor as a warning
+ * rather than an error: a selection that does not resolve today is saved as
+ * the unresolved selection the user chose to keep, and the runtime says the
+ * auditor is unavailable instead of reading the gate as Off or substituting
+ * another resource. Nothing here turns protection Off, rewrites the selection,
+ * or adds a second validity rule.
+ */
+export function validateToolProtectionSelection(
+  staged: ToolProtectionConfig,
+  config: ReviewGateConfig,
+  scoped: ScopedModelChoice[],
+): ToolProtectionValidation {
+  const warnings: string[] = [];
+  if (staged.level !== "off" && staged.auditor === null) {
+    return {
+      error: `Tool protection level "${staged.level}" requires an auditor. Choose an auditor, or set the Protection level to Off to stop the added gate deliberately. Nothing was applied and protection was not silently turned Off.`,
+      warnings,
+    };
+  }
+  if (staged.scope === "selected" && staged.toolNames.length === 0) {
+    return {
+      error: "Audit scope \"Selected tool names\" requires at least one exact tool name, because an empty list would audit nothing. Name at least one tool exactly, or set the audit scope back to All calls. Nothing was applied.",
+      warnings,
+    };
+  }
+  if (staged.level !== "off" && staged.auditor !== null) {
+    const auditor = staged.auditor;
+    if (auditor.source === "pi") {
+      const choice = scoped.find((candidate) => candidate.model === auditor.model);
+      if (!choice) {
+        warnings.push(`Tool protection auditor ${auditor.model} is not currently scoped. Its selection is retained; availability is checked against the host model registry when an audit runs.`);
+      } else if (auditor.thinkingLevel && !choice.supportedThinkingLevels.includes(auditor.thinkingLevel)) {
+        warnings.push(`Tool protection reasoning ${auditor.thinkingLevel} is unsupported for ${auditor.model}. Choose a supported reasoning level; the runner does not silently replace this selection.`);
+      }
+    } else {
+      const agent = resolvedExternalAgent(config, auditor.id);
+      if (!agent) {
+        warnings.push(`Tool protection auditor ${auditor.id} is not a configured external worker, so it was kept as an unresolved selection at Protection level "${staged.level}". Protected calls stay blocked until you choose an available auditor.`);
+      } else if (!agent.execution && !agent.review) {
+        warnings.push(`Tool protection auditor ${agent.id} has no configured role, so an audited call would fail until it does.`);
+      } else if (agent.adapter === "codex-cli") {
+        warnings.push(`Tool protection auditor ${agent.id} uses the Codex CLI, whose decision-only no-tools route is unproven, so an audited call fails closed instead of running with tools.`);
+      } else if (agent.adapter === "claude-cli") {
+        // Mirrors the runner, which starts no process for a Claude auditor at
+        // all until invocation-local API retry disabling is established.
+        warnings.push(`Tool protection auditor ${agent.id} uses the Claude CLI, whose auditor route is unsupported: invocation-local API retry disabling has not been established, so every audited call is blocked and no process is started. The choice is kept as selected rather than switched to another worker.`);
+      }
+    }
+  }
+  if (staged.scope === "selected") {
+    // The ordinary reduced-coverage statement: `selected` audits exactly the
+    // configured exact names and nothing else.
+    warnings.push(`Tool protection audits only these exact tool names: ${staged.toolNames.join(", ")}. Every other tool is NOT AUDITED, and an unaudited call is never a pass.`);
+  }
+  return { warnings };
+}
 
 export interface SettingsValidationPolicy {
   /** Settings Save only; runtime and other callers remain strict by default. */

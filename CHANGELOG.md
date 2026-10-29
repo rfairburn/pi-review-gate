@@ -15,6 +15,58 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.218]
+
+### Added
+
+- **Tool protection** (#536): one optional `toolProtection` block
+  configures a pre-execution decision gate at `off` (the default), `dangerous`,
+  `aligned`, or `workspace`, with one shared level and auditor for the primary agent
+  and newly launched Pi executors. An `all` or exact-name `selected` audit scope, a
+  10-second decision deadline, and a 128,000-character context budget are the shipped
+  defaults; the code-owned policy, bounded provenance-labelled context, strict
+  `PASS`/`FAIL` format, and in-process Pi auditor are additional restrictions, not a
+  sandbox or an all-harness guarantee. Claude/Codex CLI auditor routes fail closed as
+  unsupported, while external binaries use the documented JSON decision protocol. See
+  [Tool protection](docs/tool-protection.md).
+- **Tool protection floor and the discovery loader** (#536): the `dangerous` level now
+  states its floor as catastrophic irreversible loss or unauthorized sensitive
+  disclosure, and says outright that it is not a working-directory sandbox, not a
+  task-alignment test, and not a per-call human approval of the exact path, command, or
+  destination, so ordinary reads (including outside the working directory), disposable
+  and operating-system temporary fixtures, and build, test, dependency-install, and
+  version-control work are not gated there, while a restriction stated by the user's own
+  current message is respected at every level; `aligned` and `workspace` keep their own
+  added rules and never leak into the floor. The policy revision is a neutral
+  identifier recorded with each decision, and the submenu, notices, and docs drop the
+  experimental wording while keeping every level, reason, timing, and limitation claim.
+  The reserved `tool_search` discovery loader is the single infrastructure exception:
+  never audited at any level or scope, never presented as a pass, annotated
+  `NOT AUDITED — discovery loader`, never offered as an audited name, and still bound by
+  every native authorization, permission, and liveness guard. The exception is bound to
+  the loader this extension registered — the live registry entry is matched against the
+  registration references this extension's published metadata preserves, and configured
+  scope matching stays a plain name lookup, so a definition that took over the reserved
+  name is audited like any other tool instead of borrowing the exemption.
+- **Optional auditor-session retention** (#536): `toolProtection.retainAuditorSessions`
+  (**Save auditor sessions**, Off by default, and Off for any block or parent launch pin
+  that predates the field) saves each actual auditor invocation as its own ordinary saved
+  Pi session, so the exact request, the terminal reply or captured external-binary output,
+  and the recorded verdict can be browsed later. Records are written through Pi's own
+  session writer, never read back into a later decision, and never grant a tool or
+  authority when opened; an external binary's record says plainly that it is host process
+  input and program output rather than a provider exchange. Nothing is written while the
+  setting is Off, and a call the auditor was never asked about records nothing. A recording
+  failure leaves the auditor's verdict untouched and is disclosed inline instead of
+  silently dropping the record.
+
+### Changed
+
+- **Reasonless auditor denials** (#536): a top-level `FAIL` carrying no reason now blocks
+  with `Tool protection: FAIL — the auditor denied this <tool> call. The call did not run.`,
+  without the appended host-status clause. A reason the auditor did supply is still passed
+  through verbatim, and annotations on calls that already ran keep their existing wording.
+
 ## [0.1.0-dev.217]
 
 ### Changed

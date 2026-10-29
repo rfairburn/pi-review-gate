@@ -4,6 +4,7 @@ import {
   type ReviewGateConfig,
 } from "../../config";
 import type { ExecutorAdapter } from "../types";
+import { executorProtectionAdmission } from "../../tool-protection/coordinator";
 import { ClaudeExecutorAdapter } from "./claude-cli";
 import { CodexExecutorAdapter } from "./codex-cli";
 import { PiExecutorAdapter } from "./pi-model";
@@ -14,11 +15,21 @@ export function createExecutorAdapter(config: ReviewGateConfig, selection?: Exec
   if (!active) {
     throw new Error("delegated execution is disabled; choose an executor with /review-settings");
   }
+  // The shared Protection level travels with the launch, never from task text
+  // or an ambient child configuration: a Pi executor receives the parent's
+  // current pinned snapshot, and an external acting executor (which has no
+  // proven pre-effect tool seam) is refused before it starts while the added
+  // gate is enabled. Off (or no block) changes nothing else about the launch.
+  const protection = executorProtectionAdmission(config, active);
+  if ("blocked" in protection) {
+    throw new Error(`review gate: ${protection.reason}`);
+  }
   if (active.source === "pi") {
     return new PiExecutorAdapter({
       model: active.model,
       thinkingLevel: active.thinkingLevel,
       timeoutMs: config.executorTimeoutMs,
+      toolProtection: protection.pin,
     });
   }
   const external = activeExternalExecutor(config, active);

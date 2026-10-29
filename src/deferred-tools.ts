@@ -248,6 +248,30 @@ export class DeferredToolManager {
   private lastSearchDescription: string | undefined;
   private lastSearchSnippet: string | undefined;
   /**
+   * The exact definition object this manager last handed to `registerTool` for
+   * `tool_search`. Registration identity is not retained anywhere else: registry
+   * metadata keeps name and exposure and discards it. The loader-ownership check
+   * (`ownsDiscoveryLoader`) compares the live entry against this reference.
+   */
+  private registeredSearchDefinition: Record<string, unknown> | undefined;
+  /**
+   * Host-assigned registration provenance for this manager's own loader registration,
+   * normalized from the `sourceInfo` the host published on the entry that carries the
+   * definition handed to `registerTool` (issue #536).
+   *
+   * Pi stores each registration as `{ definition, sourceInfo }` and takes `sourceInfo`
+   * from the REGISTERING EXTENSION (`registerTool` in the extension loader, refreshed by
+   * `applyExtensionSourceInfo`), never from the definition, so the provenance
+   * `getAllTools()` reports is the host's own answer about who registered the entry.
+   * Public metadata is copyable — a definition that spreads another loader's published
+   * `ToolInfo` keeps its parameter schema and reach callback, and any `sourceInfo` field
+   * it copied is discarded by the host — so this host-assigned value, captured at this
+   * extension's own registration, is what a foreign replacement cannot carry over.
+   * Undefined until a registration read establishes it; while missing, ownership is
+   * declined.
+   */
+  private searchRegistrationProvenance: string | undefined;
+  /**
    * The exact host-native tool_search parameter schema reference, resolved
    * once at late registration and reused by every descriptor re-registration
    * (never cloned or mutated); undefined keeps the local fallback schema.
@@ -536,13 +560,55 @@ export class DeferredToolManager {
    * enumerated.
    */
   toolDenyChoices(): { name: string; description?: string }[] {
+    return this.discoverableChoices(false);
+  }
+
+  /**
+   * Issue #536: the loader-INCLUSIVE display inventory for the tool-protection
+   * audit-name picker. Every rule is the same as `toolDenyChoices()` — the same
+   * live reconciled catalog, the same mode/feature/role-deny-inclusive ceiling,
+   * the same exact-name ordering, and the same fail-closed empty cases (no
+   * boundary, unreadable registry) — with ONE difference: the reserved
+   * `tool_search` loader is included when the runtime genuinely offers it, so a
+   * name that can be audited can also be chosen for auditing. Auditing the
+   * loader is meaningful; denying it is not, and this difference never reaches
+   * a deny list: the deny selectors keep calling `toolDenyChoices()`, and
+   * canonical config validation still rejects the loader in either list.
+   * Display-only: reading it activates and authorizes nothing.
+   */
+  toolAuditChoices(): { name: string; description?: string }[] {
+    return this.discoverableChoices(true);
+  }
+
+  /**
+   * One authoritative display-only inventory read for both settings pickers.
+   * The loader row is appended only when the existing live metadata offers it:
+   * startup registered this loader, a boundary is captured, the latest
+   * authoritative registry read succeeded, the loader's own entry is present
+   * and not hidden, and Pi settings have not disabled it — the same
+   * presence/hidden/settings rules the loader's own call gate applies. A
+   * removed, hidden, replaced, deselected, or settings-disabled loader is
+   * therefore NOT listed; nothing about availability is assumed.
+   */
+  private discoverableChoices(includeReservedLoader: boolean): { name: string; description?: string }[] {
     this.reconcile();
     if (!this.boundary || this.registryUnreadable) return [];
     const visible = this.modeVisibleAuthorizedNames(true);
-    return this.boundary.catalog
+    const choices = this.boundary.catalog
       .filter((tool) => tool.name !== DEFERRED_TOOL_SEARCH_NAME && visible.has(tool.name))
-      .sort((left, right) => compareToolNames(left.name, right.name))
       .map((tool) => (tool.description ? { name: tool.name, description: tool.description } : { name: tool.name }));
+    const loader = includeReservedLoader ? this.auditableLoaderChoice() : undefined;
+    if (loader !== undefined) choices.push(loader);
+    return choices.sort((left, right) => compareToolNames(left.name, right.name));
+  }
+
+  /** The loader's own row from live registry metadata, or undefined when unavailable. */
+  private auditableLoaderChoice(): { name: string; description?: string } | undefined {
+    if (!this.registered || !this.boundary || this.registryUnreadable) return undefined;
+    if (!this.settingAllowsTool(DEFERRED_TOOL_SEARCH_NAME)) return undefined;
+    const entry = this.boundary.registryEntries.get(DEFERRED_TOOL_SEARCH_NAME);
+    if (!entry || entry.exposure === "hidden") return undefined;
+    return entry.description ? { name: entry.name, description: entry.description } : { name: entry.name };
   }
 
   private nativePowerShellHostSupported(): boolean {
@@ -565,7 +631,9 @@ export class DeferredToolManager {
     this.lastSearchDescription = definition.description;
     this.lastSearchSnippet = definition.promptSnippet;
     this.pi.registerTool(definition);
+    this.registeredSearchDefinition = definition;
     this.registered = true;
+    this.captureSearchRegistrationProvenance(definition);
     return true;
   }
 
@@ -1061,7 +1129,38 @@ export class DeferredToolManager {
     if (this.lastSearchDescription === description && this.lastSearchSnippet === snippet) return;
     this.lastSearchDescription = description;
     this.lastSearchSnippet = snippet;
-    this.pi.registerTool(this.buildSearchToolDefinition());
+    const definition = this.buildSearchToolDefinition();
+    this.pi.registerTool(definition);
+    this.registeredSearchDefinition = definition;
+    this.captureSearchRegistrationProvenance(definition);
+  }
+
+  /**
+   * Record the host-assigned provenance of the entry that carries the definition just
+   * handed to `registerTool`. Called synchronously from this manager's own registration
+   * and re-registration paths only — never lazily from a later ownership check, because a
+   * row read back at check time is exactly what a foreign definition can influence.
+   *
+   * The entry must carry the references this manager supplied (the definition object
+   * itself, or the parameter-schema and reach-callback references the metadata
+   * projection preserves), so a row built from anyone else's definition is never adopted
+   * as this extension's original registration. An established value is never replaced:
+   * the provenance the host assigned to this extension cannot change during one manager
+   * incarnation, while a later read could in principle observe a row that copied the
+   * preserved references.
+   *
+   * A capture that cannot be made (unreadable registry, no entry, references that do not
+   * match, or a host that publishes no provenance) records nothing and leaves ownership
+   * declined; nothing is inferred and no provenance is fabricated.
+   */
+  private captureSearchRegistrationProvenance(definition: Record<string, unknown>): void {
+    if (this.searchRegistrationProvenance !== undefined) return;
+    const entries = this.liveRegistryEntries();
+    if (!entries) return;
+    const entry = entries.find((candidate) => candidate.name === DEFERRED_TOOL_SEARCH_NAME);
+    if (!entry || !carriesRegistrationReferences(definition, entry)) return;
+    const provenance = hostRegistrationProvenance(entry);
+    if (provenance !== undefined) this.searchRegistrationProvenance = provenance;
   }
 
   /**
@@ -1153,6 +1252,76 @@ export class DeferredToolManager {
     if (!entry || entry.exposure === "hidden") return false;
     if (entry.exposure === "model-only" && nested) return false;
     return activeToolNamesOf(this.pi).includes(name);
+  }
+
+  /**
+   * Does the `tool_search` entry in the live registry belong to THIS manager's
+   * loader, rather than to an unrelated definition registered under the same
+   * reserved name?
+   *
+   * `toolCallAllowed` proves the loader is callable; it cannot prove WHOSE
+   * implementation is callable, because registry metadata keeps name and exposure
+   * and discards registration identity. The tool-protection gate needs the
+   * stronger answer, because only this extension's own loader may be treated as
+   * never-audited discovery infrastructure. The proof uses what the host actually
+   * surfaces: the live entry is compared with the exact object handed to
+   * `registerTool`, and — because hosts publish projected metadata rather than the
+   * definition (Pi 1.4's `getAllTools()` builds a `ToolInfo` of name, description,
+   * parameter schema, prompt guidelines, exposure, namespace, annotations,
+   * `reachesTools` and source info, and never the executors or renderers) — with the
+   * registration references that projection preserves.
+   *
+   * Public metadata is copyable, so the references alone are not enough (#536): a foreign
+   * definition can spread this loader's published `ToolInfo` and keep the parameter schema
+   * and reach callback it copied, changing only the executor. The host assigns `sourceInfo`
+   * from the registering extension rather than the definition, so the exemption also
+   * requires the live entry's host-assigned provenance to equal the provenance the host
+   * assigned at this extension's own registration.
+   *
+   * Every unknown shape answers false: an unreadable registry, an unregistered,
+   * hidden, deselected, or setting/deny-excluded loader, a foreign definition, an entry
+   * whose preserved references are not this extension's, and an entry whose provenance is
+   * missing, unreadable, or not the one this extension registered. Provenance never
+   * substitutes for the references and the references never substitute for it: object
+   * identity is one way to prove the entry carries this extension's definition, not a way
+   * to skip the provenance requirement. Declining only removes the infrastructure
+   * treatment, leaving the call to be handled like any other tool proposal; nothing here
+   * grants, removes, or widens authority.
+   */
+  ownsDiscoveryLoader(): boolean {
+    // Same convention as `toolCallAllowed`: the live rules are evaluated against a
+    // freshly reconciled view, so a replacement that hid or displaced the loader
+    // since the last reconciliation cannot still look owned.
+    this.reconcile();
+    if (!this.registered || !this.boundary || this.registryUnreadable) return false;
+    if (!this.settingAllowsTool(DEFERRED_TOOL_SEARCH_NAME) || this.primaryRoleDeniesTool(DEFERRED_TOOL_SEARCH_NAME)) return false;
+    if (!this.registryEntryGate(DEFERRED_TOOL_SEARCH_NAME, false)) return false;
+    const owned = this.registeredSearchDefinition;
+    if (!owned) return false;
+    // Registration references without host provenance is a copy, and provenance without
+    // the references is somebody else's registration under our name. Both are required,
+    // and neither is established from public name, schema, callbacks, or display text.
+    const provenance = this.searchRegistrationProvenance;
+    if (provenance === undefined) return false;
+    const entries = this.liveRegistryEntries();
+    if (!entries) return false;
+    const live = entries.find((entry) => entry.name === DEFERRED_TOOL_SEARCH_NAME);
+    if (!live) return false;
+    return carriesRegistrationReferences(owned, live)
+      && hostRegistrationProvenance(live) === provenance;
+  }
+
+  /** The live registry entries as published by the host, or undefined when unreadable. */
+  private liveRegistryEntries(): Record<string, unknown>[] | undefined {
+    if (!isDeferredToolHost(this.pi)) return undefined;
+    let tools: unknown;
+    try {
+      tools = this.pi.getAllTools();
+    } catch {
+      return undefined;
+    }
+    if (!Array.isArray(tools)) return undefined;
+    return tools.filter(isRecord);
   }
 
   /** Narrow fail-closed authority: the conservative retained set under the live mode policy. */
@@ -1802,6 +1971,51 @@ function toolMetadata(value: unknown): ToolMetadata[] {
     });
   }
   return result;
+}
+
+/**
+ * Does one published entry carry the registration references this manager supplied?
+ * A host that publishes the definition itself answers by object identity; Pi 1.3/1.4
+ * publish a `ToolInfo` projection of name, description, parameter schema, prompt
+ * guidelines, exposure, namespace, annotations, `reachesTools`, and source info, and
+ * never the executors or renderers, so the preserved references answer there. Both are
+ * required and neither absence nor a schema alone is enough: public metadata preserves
+ * the reach callback and the parameter schema and nothing executable, and the schema
+ * cannot establish identity by itself — native-schema recognition deliberately registers
+ * the exact schema object another loader published. The callback this extension created
+ * (refreshed in step with the retained definition on every re-registration, and absent
+ * from any definition that did not declare it) is what distinguishes our loader from a
+ * definition that merely kept the shared schema.
+ */
+function carriesRegistrationReferences(owned: Record<string, unknown>, live: Record<string, unknown>): boolean {
+  if (live === owned) return true;
+  return typeof owned.reachesTools === "function"
+    && live.reachesTools === owned.reachesTools
+    && isRecord(owned.parameters)
+    && live.parameters === owned.parameters;
+}
+
+/**
+ * The authoritative registration identity from the `sourceInfo` the host assigned to one
+ * published entry (`SourceInfo` in Pi's public types): `path` names the registering
+ * source — an extension file path, or a synthetic `builtin:<name>`, `<sdk:<name>>`, or
+ * `<inline:<name>>` source — and `source` names where that path came from. The host
+ * derives both from the registering extension, never from the definition, so copying an
+ * entry's published metadata copies no provenance. `scope`, `origin`, and `baseDir`
+ * describe where that same source came from and are re-derived by a host resource
+ * refresh without any change of owner, so they are not part of the identity.
+ *
+ * An entry whose provenance the host did not publish, or whose identity fields are not
+ * non-empty strings, yields undefined: absence proves nothing, nothing is inferred from
+ * name, schema, callbacks, or display text, and no provenance is fabricated.
+ */
+function hostRegistrationProvenance(entry: Record<string, unknown>): string | undefined {
+  const sourceInfo = entry.sourceInfo;
+  if (!isRecord(sourceInfo)) return undefined;
+  const path = typeof sourceInfo.path === "string" ? sourceInfo.path.trim() : "";
+  const source = typeof sourceInfo.source === "string" ? sourceInfo.source.trim() : "";
+  if (path === "" || source === "") return undefined;
+  return `${source}\u0000${path}`;
 }
 
 function resolveExposure(value: unknown): string {

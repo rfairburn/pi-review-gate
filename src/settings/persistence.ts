@@ -30,6 +30,8 @@ import {
   type SubtaskNotificationMode,
 } from "../config";
 import { isRecord } from "../record-guard";
+import { toolProtectionStagedWriteNeeded } from "./tool-protection";
+import type { ToolProtectionConfig } from "../tool-protection/config";
 
 export interface ReviewSettingsSelection {
   /** New definitions only; merged into the latest disk catalog at Save. */
@@ -111,6 +113,16 @@ export interface ReviewSettingsSelection {
    * to newly captured executors, and the two lists are independent.
    */
   tools?: ReviewGateToolsConfig;
+  /**
+   * The complete `toolProtection` block (#536), owned field by
+   * field so any unrelated key a user placed inside the block survives a Save
+   * verbatim. An unchanged block (or an unchanged default over no block) is
+   * never written, so saving never invents a protection block an older record
+   * never had; any real difference — including turning an enabled stored block
+   * back to Off — is always written, because silently keeping protection
+   * enabled after the user turned it Off would be the worse failure.
+   */
+  toolProtection?: ToolProtectionConfig;
 }
 
 const configUpdateTails = new Map<string, Promise<void>>();
@@ -189,6 +201,26 @@ function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: 
     if (rawTools !== undefined || topLevelDeny.length > 0 || executorDeny.length > 0) {
       parsed.tools = { ...(rawTools ?? {}), topLevelDeny, executorDeny };
     }
+  }
+  if (selection.toolProtection !== undefined && toolProtectionStagedWriteNeeded(parsed.toolProtection, selection.toolProtection)) {
+    const rawBlock = isRecord(parsed.toolProtection) ? parsed.toolProtection : undefined;
+    const staged = selection.toolProtection;
+    // Merge only the owned fields, so an unrelated key inside the block (and
+    // everywhere else in the record) survives. `auditor: null` is written
+    // explicitly while Off: an omitted field would leave a stale stored
+    // selection in place, and a stored id that does not resolve today stays
+    // stored so the runtime can say the auditor is unavailable rather than
+    // reading the gate as Off.
+    parsed.toolProtection = {
+      ...(rawBlock ?? {}),
+      level: staged.level,
+      auditor: staged.auditor === null ? null : { ...staged.auditor },
+      scope: staged.scope,
+      toolNames: [...staged.toolNames],
+      timeoutMs: staged.timeoutMs,
+      maxContextChars: staged.maxContextChars,
+      retainAuditorSessions: staged.retainAuditorSessions,
+    };
   }
   parsed.reviewerTimeoutMs = selection.reviewerTimeoutMs;
   parsed.executorTimeoutMs = selection.executorTimeoutMs;
@@ -281,6 +313,11 @@ export async function persistReviewSettings(
       // Foreign schedules remain unvalidated, but their structured references
       // must still participate in optimistic cascade safety.
       latest.scheduledTasks = (isRecord(parsed.scheduledTasks) ? parsed.scheduledTasks : {}) as ScheduledTaskCatalog;
+      // #536: the tool-protection auditor participates in the same reference
+      // guard. The reference projection reads only the auditor identity, so the
+      // raw stored block is carried here unvalidated purely for that
+      // comparison; it is never read back, written, or normalized.
+      latest.toolProtection = parsed.toolProtection as ReviewGateConfig["toolProtection"];
       // Include latest resource identities, not only the opening snapshot:
       // preserved foreign schedules may pin resources appended meanwhile.
       const touchedIds = new Set(selection.externalAgentOperations.flatMap((operation) => [operation.id, ...(operation.nextId ? [operation.nextId] : [])]));

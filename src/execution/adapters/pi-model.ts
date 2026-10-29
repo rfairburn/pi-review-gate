@@ -42,6 +42,11 @@ import {
 } from "../pi-settlement-receipt";
 import { isRecord } from "../../record-guard";
 import { isValidNativeSessionFile } from "../../session-host/protocol";
+import {
+  createToolProtectionBootstrap,
+  TOOL_PROTECTION_BOOTSTRAP_ENV,
+  type ToolProtectionLaunchPin,
+} from "../../tool-protection/coordinator";
 
 export interface PiExecutorOptions {
   model: string;
@@ -51,6 +56,12 @@ export interface PiExecutorOptions {
   timeoutMs?: number;
   /** Test/embedding override; otherwise bounded by the remaining executor deadline. */
   settlementTimeoutMs?: number;
+  /**
+   * Parent-pinned tool-protection snapshot. Absent only for a direct embedding
+   * or test construction that did not go through the executor factory; real
+   * delegated Pi launches always carry it (including an explicit Off pin).
+   */
+  toolProtection?: ToolProtectionLaunchPin;
 }
 
 // Successful settlement leaves a live browser. Terminal cleanup gets its
@@ -108,7 +119,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
           cwd: request.cwd,
           args: childArgs(this.options.args ?? [], launchTools),
           timeoutMs: Math.min(this.options.timeoutMs ?? 1_800_000, 300_000),
-          env: executorEnv(toolCatalog),
+          env: executorEnv(toolCatalog, this.options.toolProtection),
           signal: request.signal,
           onProcessStart: request.onProcessStart,
           onProcessExit: request.onProcessExit,
@@ -139,7 +150,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     await removePiSettlementReceipt(settlementBootstrap);
     // #204: alias-independent default `pi` launch; Windows npm pi.cmd is
     // invoked through the shared cmd.exe spec without inspecting its contents.
-    const childEnv = executorEnv(toolCatalog, settlementBootstrap);
+    const childEnv = executorEnv(toolCatalog, this.options.toolProtection, settlementBootstrap);
     const invocation = resolvePiChildSpawn(this.options.command ?? "pi", args, childEnv);
     if (!invocation.ok) throw new Error(invocation.error);
     // Only the POSIX pass-through keeps the bare `pi` name; a missing default
@@ -1335,7 +1346,11 @@ function childArgs(args: readonly string[], allowedTools: readonly string[]): st
   ];
 }
 
-function executorEnv(toolCatalog: ExecutorToolCatalog, settlement?: PiSettlementBootstrap): NodeJS.ProcessEnv {
+function executorEnv(
+  toolCatalog: ExecutorToolCatalog,
+  protection?: ToolProtectionLaunchPin,
+  settlement?: PiSettlementBootstrap,
+): NodeJS.ProcessEnv {
   const next = { ...process.env };
   // The child must load the review-gate extension in its executor role so the
   // already-designed registration of web tools and background shell runs.
@@ -1352,6 +1367,12 @@ function executorEnv(toolCatalog: ExecutorToolCatalog, settlement?: PiSettlement
   for (const suffix of ["SECRET", "PATH", "SESSION", "CHILD"]) delete next[`PI_REVIEW_GATE_QUIESCENCE_${suffix}`];
   next.PI_REVIEW_GATE_RUNTIME_ROLE = "executor";
   next[EXECUTOR_TOOL_CATALOG_ENV] = JSON.stringify(toolCatalog);
+  // One-shot trusted parent-issued pin. It carries only the shared protection
+  // fields and selected external auditor definition, when applicable. Its
+  // configured environment can be sensitive; the child captures and erases the
+  // bootstrap before its first await. This is not a same-user OS sandbox.
+  if (protection) next[TOOL_PROTECTION_BOOTSTRAP_ENV] = createToolProtectionBootstrap(protection);
+  else delete next[TOOL_PROTECTION_BOOTSTRAP_ENV];
   if (settlement) Object.assign(next, piSettlementEnvironment(settlement));
   return next;
 }

@@ -585,14 +585,23 @@ test("session_shutdown runs review cleanup before the #84 diagnostic reset", asy
     // session hooks. Anchor the bridge to its exclusive session_tree
     // registration, then identify the review hooks by exclusion rather than
     // relying on handler-array positions.
-    const sessionTree = (hooks.get("session_tree") ?? []).at(-1);
+    // Identify the #84 bridge by its exclusive anchor: its session_tree
+    // registration is immediately followed by its session_shutdown reset. The
+    // tool-protection coordinator has a similar pair later in the manifest, so
+    // choose the earliest matching pair (the bridge) rather than the last
+    // session_tree handler.
+    const sessionTree = (hooks.get("session_tree") ?? []).find((handler) =>
+      shutdownHandlers.some((candidate) => sequence(candidate) === sequence(handler) + 1));
     assert.ok(sessionTree, "the #84 bridge must register session_tree");
     const diagnosticShutdown = shutdownHandlers.find((handler) => sequence(handler) === sequence(sessionTree!) + 1);
     const diagnosticSessionStart = sessionStartHandlers.find((handler) => sequence(handler) === sequence(sessionTree!) - 1);
     assert.ok(diagnosticShutdown, "the bridge's shutdown reset must follow its session_tree registration");
     assert.ok(diagnosticSessionStart, "the bridge's session_start rebuild must precede its session_tree registration");
-    assert.equal(shutdownHandlers.length, 2, "review shutdown + diagnostic reset");
-    assert.equal(sessionStartHandlers.length, 2, "review session_start + diagnostic rebuild");
+    // The tool-protection coordinator also owns a bounded current-session
+    // state reset and an evidence seed; both are registered after the review
+    // lifecycle and #84 bridge so they can never run ahead of review cleanup.
+    assert.equal(shutdownHandlers.length, 3, "review shutdown + diagnostic reset + tool-protection reset");
+    assert.equal(sessionStartHandlers.length, 3, "review session_start + diagnostic rebuild + tool-protection seed");
     const reviewShutdown = shutdownHandlers.find((handler) => handler !== diagnosticShutdown);
     const mainSessionStart = sessionStartHandlers.find((handler) => handler !== diagnosticSessionStart);
     assert.ok(reviewShutdown, "the review shutdown handler must remain distinct from the diagnostic reset");
@@ -601,6 +610,9 @@ test("session_shutdown runs review cleanup before the #84 diagnostic reset", asy
     assert.ok(sequence(mainSessionStart!) < sequence(diagnosticShutdown!), "diagnostic bridge must register after the critical lifecycle hooks");
     assert.ok(sequence(reviewShutdown!) < sequence(diagnosticShutdown!), "review cleanup must be dispatched before the diagnostic shutdown reset");
     assert.ok(sequence(diagnosticSessionStart!) < sequence(diagnosticShutdown!), "diagnostic bridge registers its own hooks before its shutdown reset");
+    const protectionShutdown = shutdownHandlers.find((handler) => handler !== reviewShutdown && handler !== diagnosticShutdown);
+    assert.ok(protectionShutdown, "the tool-protection reset must have its own shutdown handler");
+    assert.ok(sequence(diagnosticShutdown!) < sequence(protectionShutdown!), "the tool-protection reset registers after the #84 bridge");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

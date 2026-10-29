@@ -1,10 +1,14 @@
 /**
  * Tools settings submenu (issue #434): the two exact-name deny selectors and
  * the tool-related controls that live under one root Tools section — Deferred
- * Pi tools, YouShouldKnow notices, Completion guidance, and the existing
- * Web/browser subtree. Everything here is staged into the root menu's single
- * Save/Cancel transaction; this module never persists, applies, or activates
- * anything.
+ * Pi tools, YouShouldKnow notices, Completion guidance, the existing
+ * Web/browser subtree, and the Tool protection gate (#536).
+ * Everything here is staged into the root menu's single Save/Cancel
+ * transaction; this module never persists, applies, or activates anything.
+ * The two deny selectors and the protection audit subset are different
+ * features with different rules: a DENIED name may never be the reserved
+ * discovery loader, while an AUDITED name may be any exact name including
+ * that loader.
  *
  * The deny selectors reuse the established retained multi-select mechanism
  * (the same {@link retainedSelect} toggle loop the reviewer picker uses):
@@ -20,6 +24,14 @@
  * the staged denial set, and a denial hidden by the query stays denied and
  * stays in the saved configuration. It is transient UI state, it belongs to
  * one picker alone, and it is never persisted or staged.
+ *
+ * The audit subset (#536) uses the SAME searchable multi-select mechanism and
+ * the same candidate inventory: one row per tool, Enter toggles it, and a checked
+ * row means the tool is AUDITED. The two features stay separate in what they
+ * filter: the audit inventory keeps the reserved discovery loader in view (as an
+ * explicit never-audited infrastructure row, because this gate exempts it), while
+ * both deny selectors keep excluding it outright, and a saved audit name is never
+ * dropped by the deny-only validation.
  *
  * The candidate inventory comes from the runtime through the
  * `getToolChoices` callback — the authoritative, otherwise-discoverable
@@ -41,6 +53,13 @@ import { alignedSettingsRows, formatByteSize, type UiContext } from "./ui";
 import { retainedSelect } from "./menu";
 import { retainedDenySelect, type DenyPickerRow } from "./deny-picker";
 import { selectWebSettings } from "./web";
+import {
+  selectToolProtection,
+  toolProtectionSummary,
+  type AuditedToolNameSources,
+  type ToolProtectionAuditorSources,
+  type ToolProtectionSettingsState,
+} from "./tool-protection";
 
 /** One candidate tool from the runtime-supplied pre-deny inventory. */
 export interface ToolChoice {
@@ -84,6 +103,8 @@ export interface ToolSettingsState {
   deferredPiTools: boolean;
   youShouldKnow: YouShouldKnowConfig;
   web: ToolSettingsWebState;
+  /** The staged canonical `toolProtection` block (#536), never a copy of it. */
+  toolProtection: ToolProtectionSettingsState;
 }
 
 /**
@@ -102,15 +123,38 @@ export interface RetainedToolDenials {
   executorDeny: readonly string[];
 }
 
+/** How one inventory read treats the reserved discovery loader. */
+export interface ReadToolChoicesOptions {
+  /**
+   * Keep the reserved `tool_search` loader in the list when the runtime offers
+   * it.
+   *
+   * The DENY selectors must never present it — canonical config validation
+   * rejects it in either deny list — so they read the inventory without this
+   * option. The tool-protection audit picker reads WITH it, so the loader is
+   * visible instead of silently missing: it renders as an explicit
+   * never-audited infrastructure row, because this gate exempts discovery
+   * activation at every scope. This is a display difference only: it grants
+   * nothing, activates nothing, never turns the loader deniable, and never
+   * presents the loader as an audited candidate.
+   */
+  includeReservedDiscoveryLoader?: boolean;
+}
+
 /**
  * Defensive read of the runtime-supplied candidate inventory. Only exact,
  * non-empty, whitespace-consistent names are rendered; duplicates collapse to
  * their first occurrence and order is preserved. A missing, throwing, or
  * malformed provider yields an empty inventory — never a fabricated or
  * pattern-expanded one, and never an authorization.
+ *
+ * By default the reserved discovery loader is omitted (the deny-rule
+ * invariant); see {@link ReadToolChoicesOptions} for the audit picker's
+ * loader-inclusive read.
  */
 export function readToolChoices(
   provider: (() => readonly { name: string; description?: string }[]) | undefined,
+  options: ReadToolChoicesOptions = {},
 ): ToolChoice[] {
   if (typeof provider !== "function") return [];
   let raw: unknown;
@@ -126,7 +170,7 @@ export function readToolChoices(
     if (typeof entry !== "object" || entry === null) continue;
     const name = (entry as { name?: unknown }).name;
     if (typeof name !== "string" || name.length === 0 || name.trim() !== name || seen.has(name)) continue;
-    if (!isDeniableToolName(name)) continue;
+    if (options.includeReservedDiscoveryLoader !== true && !isDeniableToolName(name)) continue;
     const description = (entry as { description?: unknown }).description;
     seen.add(name);
     choices.push(typeof description === "string" ? { name, description } : { name });
@@ -168,6 +212,9 @@ export function toolsRootSummary(state: {
  * Rows are keyed by the literal tool name (prefixed so a tool named `back`
  * cannot collide with the Back row), which keeps the toggled row highlighted
  * across the checked/unchecked re-show.
+ *
+ * The picker is the same searchable multi-select the tool-protection audit
+ * picker reuses (#536), with the opposite checked meaning.
  *
  * The picker also carries a live NAME search field (issue #463): a native
  * single-line query above the result list, the same saved-conversation search
@@ -247,13 +294,21 @@ async function selectDeniedTools(
  * those locals and remains the sole owner of the Save/Cancel transaction.
  * `retained` carries the transaction-opening deny names so the two deny
  * pickers keep every unavailable saved name as a reversible display-only row
- * for the whole menu session.
+ * for the whole menu session. `protection` supplies the existing configuration
+ * the auditor picker lists (every external definition and the scoped models); it
+ * is read for display and reference resolution only and never mutated here.
+ * `auditedNames` supplies the same display-only inventory for the audit subset
+ * (reserved loader kept when offered) plus the transaction-opening audit names,
+ * retained by the same rule as the deny rows and never filtered by the deny
+ * rules.
  */
 export async function selectToolSettings(
   ui: UiContext,
   initial: ToolSettingsState,
   choices: readonly ToolChoice[],
   retained: RetainedToolDenials,
+  protection: ToolProtectionAuditorSources,
+  auditedNames: AuditedToolNameSources,
 ): Promise<ToolSettingsState> {
   const state: ToolSettingsState = {
     topLevelDeny: deniableToolNames(initial.topLevelDeny),
@@ -261,17 +316,25 @@ export async function selectToolSettings(
     deferredPiTools: initial.deferredPiTools,
     youShouldKnow: { ...initial.youShouldKnow },
     web: { ...initial.web, browserPermissions: { ...initial.web.browserPermissions } },
+    toolProtection: {
+      ...initial.toolProtection,
+      auditor: initial.toolProtection.auditor === null ? null : { ...initial.toolProtection.auditor },
+      toolNames: [...initial.toolProtection.toolNames],
+    },
   };
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   while (true) {
-    const [topLevelRow, executorRow, deferredRow, noticesRow, guidanceRow, webRow] = alignedSettingsRows([
+    const [topLevelRow, executorRow, deferredRow, noticesRow, guidanceRow, webRow, protectionRow] = alignedSettingsRows([
       ["Top-level tools", `${state.topLevelDeny.length} denied`],
       ["Executor tools", `${state.executorDeny.length} denied`],
       ["Deferred Pi tools", `${state.deferredPiTools ? "On" : "Off"} · local now, new subtasks`],
       ["YouShouldKnow notices", state.youShouldKnow.enabled ? "On" : "Off"],
       ["Completion guidance", state.youShouldKnow.completionGuidance ? "On" : "Off"],
       ["Web", webToolSummary(state.web)],
+      // The label stays short ("Tool protection") so this section's established
+      // label alignment is unchanged.
+      ["Tool protection", toolProtectionSummary(state.toolProtection, protection)],
     ]);
     const choice = await retainedSelect(ui, {
       title: "Tools",
@@ -282,6 +345,7 @@ export async function selectToolSettings(
         { key: "youShouldKnow", label: noticesRow },
         { key: "completionGuidance", label: guidanceRow },
         { key: "web", label: webRow },
+        { key: "toolProtection", label: protectionRow },
         { key: "back", label: "Back" },
       ],
       initialKey: lastKey,
@@ -306,6 +370,12 @@ export async function selectToolSettings(
     }
     if (choice === "completionGuidance") {
       state.youShouldKnow = { ...state.youShouldKnow, completionGuidance: !state.youShouldKnow.completionGuidance };
+      continue;
+    }
+    if (choice === "toolProtection") {
+      // Issue #536: the pre-effect gate. Only the canonical block
+      // is staged; the auditor, level, scope, and budgets stay in core's shape.
+      state.toolProtection = await selectToolProtection(ui, state.toolProtection, protection, auditedNames);
       continue;
     }
     // choice === "web": the existing Web/browser subtree, unchanged, staged

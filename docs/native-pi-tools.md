@@ -280,6 +280,21 @@ To probe whether tool metadata or a call surfaced, read the JSONL log the fixtur
 (`PRG_TOOL_DENIAL_LOG`) and the `/tool-denial-dump` inventory dump; a denied call leaves
 no log line, and an allowed one leaves exactly one.
 
+## Tool protection admission
+
+The `toolProtection` gate adds one pre-effect decision step at native Pi
+admission for the primary agent and newly launched Pi executors. Direct calls, admitted
+codemode and nested calls, and MCP tool invocations that reach Pi's native hooks are
+audited under the same shared level and auditor. The decision and any supplied reason
+travel inline with the same tool result for the user and model; a PASS preserves native
+output and nested return values and is not a claim that execution succeeded. This is not
+coverage for arbitrary wrappers or other harnesses, and unsupported external acting
+executors are refused before they start under a non-Off level. The reserved discovery
+loader `tool_search` is the single infrastructure exception: it is never audited, its
+calls carry `NOT AUDITED — discovery loader`, and every native authorization, permission,
+and liveness guard still applies to them. See
+[Tool protection](tool-protection.md).
+
 ## Codemode calls inside the gate
 
 A script's `tools.<name>(...)` call is a native Pi tool call through the same

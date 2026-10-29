@@ -170,12 +170,16 @@ test("executor role registers web tools and background shell without orchestrati
     // shell's observed-injection listener (#281: exit wakes are tracked until
     // their custom message enters the transcript). Background shell no longer
     // registers agent_start just to hold routine wakes until settlement. Orchestrator
-    // review machinery (before_agent_start, input) and its command surface
-    // must stay out of executor children.
+    // review machinery (before_agent_start and the orchestrator's input
+    // handler) and its command surface must stay out of executor children.
+    // The tool-protection coordinator contributes `input` only to label
+    // live-ingress evidence sources and `tool_execution_end` to retire its
+    // bounded annotation state; neither is the orchestrator review path.
     assert.deepEqual([...captured.hooks.keys()].sort(), [
       "agent_end",
       "agent_settled",
       "context",
+      "input",
       "mcp_servers_change",
       "message_end",
       "message_start",
@@ -183,6 +187,7 @@ test("executor role registers web tools and background shell without orchestrati
       "session_start",
       "session_tree",
       "tool_call",
+      "tool_execution_end",
       "tool_execution_start",
       "tool_result",
       "turn_start",
@@ -254,19 +259,24 @@ test("executor role defers to the durable initial subset and activates authorize
         return value;
       };
       const shutdownHandlers = hooks.get("session_shutdown")!;
-      assert.equal(shutdownHandlers.length, 4, "web tools + background shell reaper + settlement retirement + diagnostic reset");
-      // The bridge owns session_tree exclusively (only the #84 reporting
-      // registers it) and registers it immediately before its shutdown reset,
-      // so anchor the bridge's identity on that rather than assuming index 3.
-      const sessionTree = (hooks.get("session_tree") ?? []).at(-1);
+      assert.equal(shutdownHandlers.length, 5, "web tools + background shell reaper + settlement retirement + diagnostic reset + tool-protection reset");
+      // The bridge registers its session_tree immediately before its shutdown
+      // reset. The tool-protection coordinator has a later pair of the same
+      // shape, so anchor on the earliest matching pair (the bridge) rather than
+      // the last session_tree handler.
+      const sessionTree = (hooks.get("session_tree") ?? []).find((handler) =>
+        shutdownHandlers.some((candidate) => sequence(candidate) === sequence(handler) + 1));
       assert.ok(sessionTree, "the #84 bridge must register session_tree");
       const bridgeShutdown = shutdownHandlers.find((handler) => sequence(handler) === sequence(sessionTree!) + 1);
       assert.ok(bridgeShutdown, "the bridge's session_shutdown must directly follow its session_tree registration");
+      const protectionReset = shutdownHandlers.at(-1);
+      assert.ok(protectionReset && protectionReset !== bridgeShutdown, "the tool-protection reset is the last shutdown handler");
       assert.ok(shutdownHandlers.every((handler) =>
-        handler === bridgeShutdown || sequence(handler) < sequence(bridgeShutdown!),
+        handler === bridgeShutdown || handler === protectionReset || sequence(handler) < sequence(bridgeShutdown!),
       ), "diagnostic bridge must be registered after web, shell, and settlement shutdown handlers");
       const latestSequence = Math.max(...[...hooks.values()].flat().map(sequence));
-      assert.equal(sequence(bridgeShutdown!), latestSequence, "the diagnostic bridge is the last thing the full executor branch registers");
+      assert.equal(sequence(protectionReset!), latestSequence, "the tool-protection reset is the last thing the full executor branch registers");
+      assert.ok(sequence(bridgeShutdown!) < sequence(protectionReset!), "the diagnostic reset still precedes the tool-protection reset");
     }
 
     const ctx = { cwd: dir, ui: {}, sessionManager: {} };

@@ -56,7 +56,8 @@ import {
   selectSubtaskNotifications,
   selectTimeouts,
 } from "./controls";
-import { collectExternalAgentAvailabilityWarnings, validateSelection, type SettingsValidationPolicy } from "./validation";
+import { stagedToolProtectionSettings } from "./tool-protection";
+import { collectExternalAgentAvailabilityWarnings, validateSelection, validateToolProtectionSelection, type SettingsValidationPolicy } from "./validation";
 
 interface RegisterSettingsInput {
   pi: unknown;
@@ -77,13 +78,25 @@ interface RegisterSettingsInput {
    */
   schedulerRuntime?: { enabled: boolean; setEnabled(next: boolean): void };
   /**
-   * Authoritative pre-role-deny candidate tools for the Tools deny selectors
-   * (issue #434), supplied by the runtime from the host's otherwise-discoverable
-   * inventory. Reading it never activates or authorizes a tool; it only labels
-   * the choices. When absent or malformed the selectors still render every
-   * saved denied name, so no saved denial is lost or silently granted.
+   * Authoritative pre-role-deny candidate tools for the Tools pickers
+   * (issue #434, and the #536 audit-name picker), supplied by the runtime from
+   * the host's otherwise-discoverable inventory. Reading it never activates or
+   * authorizes a tool; it only labels the choices. When absent or malformed the
+   * selectors still render every saved name, so nothing staged is lost or
+   * silently granted. The deny selectors drop the reserved `tool_search` loader
+   * from this inventory; the audit picker keeps it when the runtime offers it.
    */
   getToolChoices?: () => readonly { name: string; description?: string }[];
+  /**
+   * Loader-INCLUSIVE live inventory for the tool-protection audit-name picker
+   * (issue #536). The audit subset may name any exact tool, the reserved
+   * discovery loader included, so it cannot read the deny-shaped list — that
+   * one drops the loader before the settings menu ever sees it. Availability
+   * comes from the runtime's own metadata, and reading it activates nothing.
+   * When absent, the audit picker falls back to `getToolChoices` and a saved
+   * loader name simply stays a reversible unavailable row.
+   */
+  getAuditedToolChoices?: () => readonly { name: string; description?: string }[];
 }
 
 export function registerReviewSettings(input: RegisterSettingsInput): void {
@@ -208,6 +221,12 @@ async function runSettingsMenu(
   // raw programmatic config from ever staging or persisting it.
   let topLevelDeny = deniableToolNames(input.config.tools?.topLevelDeny ?? []);
   let executorDeny = deniableToolNames(input.config.tools?.executorDeny ?? []);
+  // Issue #536: the tool-protection block staged as the canonical
+  // shape itself (no second enable flag, no per-scope level). An absent stored
+  // block opens on the core defaults, which is also what an explicit Off and a
+  // block rejected at startup display — this menu never claims the stored
+  // configuration said Off.
+  let toolProtection = stagedToolProtectionSettings(input.config);
   // Issue #434 review pass 1: the transaction-opening deny names are UI-only
   // row identities retained for this whole menu session, independent of the
   // staged checkbox state, so a saved name the live inventory no longer offers
@@ -218,6 +237,13 @@ async function runSettingsMenu(
     topLevelDeny: deniableToolNames(input.config.tools?.topLevelDeny ?? []),
     executorDeny: deniableToolNames(input.config.tools?.executorDeny ?? []),
   };
+  // Issue #536: the transaction-opening audit names, retained by the same
+  // UI-only rule so the audit picker keeps every unavailable saved name as a
+  // reversible row for this menu session. They are deliberately NOT passed
+  // through the deny filter: an audited name may be any exact name — the
+  // reserved discovery loader included — and a configured name is retained
+  // rather than silently dropped. Never persisted, never staged.
+  const retainedAuditedToolNames: readonly string[] = [...toolProtection.toolNames];
   let youShouldKnow = { ...(input.config.youShouldKnow ?? DEFAULT_CONFIG.youShouldKnow!) };
   let subtasksViewExpanded = input.config.ui?.subtasksViewExpanded === true;
   let webMaxDownloadBytes = input.config.web!.fetch.maxDownloadBytes;
@@ -284,6 +310,7 @@ async function runSettingsMenu(
     warnings: Set<string>;
     validationPolicy: SettingsValidationPolicy;
     scheduleDisableWarnings: string[];
+    toolProtectionWarnings: string[];
   } | undefined> => {
     // Expand a leading `~`/`~/...` — entered above or hand-edited into the
     // config file — against the user's home before validation and persistence.
@@ -302,6 +329,16 @@ async function runSettingsMenu(
       ?? (await validateScheduledTasks(unservable.catalog, workerResources, draftConfig, input.scoped, input.ui.cwd, validationPolicy));
     if (error) {
       await notify(input.ui, error, "error");
+      return undefined;
+    }
+    // #536: core's strict rules (an enabled level needs an auditor; a selected
+    // audit scope needs at least one exact name) stop the apply here so the
+    // user can fix them, instead of failing later with an unusable block or
+    // quietly dropping protection. An auditor that merely does not resolve
+    // today is a warning: the unresolved selection is saved as chosen.
+    const toolProtectionCheck = validateToolProtectionSelection(toolProtection, draftConfig, input.scoped);
+    if (toolProtectionCheck.error) {
+      await notify(input.ui, toolProtectionCheck.error, "error");
       return undefined;
     }
     // The Save-time transaction for images pasted through the native host
@@ -323,7 +360,7 @@ async function runSettingsMenu(
       await notify(input.ui, `review gate: ${error instanceof Error ? error.message : String(error)}`, "error");
       return undefined;
     }
-    return { prepared, catalogForApply, warnings, validationPolicy, scheduleDisableWarnings: unservable.warnings };
+    return { prepared, catalogForApply, warnings, validationPolicy, scheduleDisableWarnings: unservable.warnings, toolProtectionWarnings: toolProtectionCheck.warnings };
   };
 
   // Issue #294: the root-Escape session-only apply: assemble the staged
@@ -339,6 +376,7 @@ async function runSettingsMenu(
     warnings: Set<string>;
     validationPolicy: SettingsValidationPolicy;
     scheduleDisableWarnings: string[];
+    toolProtectionWarnings: string[];
   }): Promise<boolean> => {
     let next: ReviewGateConfig;
     try {
@@ -378,6 +416,7 @@ async function runSettingsMenu(
     await notify(input.ui, "Review settings applied for this session (not saved to disk).", "info");
     for (const warning of staged.warnings) await notify(input.ui, warning, "warning");
     for (const warning of staged.scheduleDisableWarnings) await notify(input.ui, warning, "warning");
+    for (const warning of staged.toolProtectionWarnings) await notify(input.ui, warning, "warning");
     // The hotkey binding itself is captured by Pi at extension load, so a
     // changed key needs the documented /reload (same as keybindings.json).
     if (modeCycleShortcut !== previousModeCycleShortcut) {
@@ -415,6 +454,11 @@ async function runSettingsMenu(
     deferredPiTools,
     youShouldKnow,
     tools: { topLevelDeny: [...topLevelDeny], executorDeny: [...executorDeny] },
+    toolProtection: {
+      ...toolProtection,
+      auditor: toolProtection.auditor === null ? null : { ...toolProtection.auditor },
+      toolNames: [...toolProtection.toolNames],
+    },
     subtasksViewExpanded,
     scheduledTasks: catalogForApply,
     scheduledTasksStagedFrom,
@@ -439,6 +483,9 @@ async function runSettingsMenu(
     draftConfig.execution = { ...draftConfig.execution, workerResources, routes: { execute: executeRoute, research: researchRoute } };
     draftConfig.review = { ...draftConfig.review, primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges, evidence };
     draftConfig.scheduledTasks = scheduledTasks;
+    // Keep the draft's protection block aligned with the staged local so an
+    // external-worker rename cascade reaches the auditor the user just chose.
+    draftConfig.toolProtection = { ...toolProtection, auditor: toolProtection.auditor === null ? null : { ...toolProtection.auditor }, toolNames: [...toolProtection.toolNames] };
     const agents = externalAgentCatalog(draftConfig);
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
     const layerSummary = (enabled: boolean, reviewers: ActiveReviewerSelection[]): string =>
@@ -539,6 +586,11 @@ async function runSettingsMenu(
         primaryReviewers = draftConfig.review!.primaryReviewers!;
         subtaskReviewers = draftConfig.review!.subtaskReviewers!;
         scheduledTasks = draftConfig.scheduledTasks!;
+        // #536: a rename carries the auditor reference; a deletion keeps the
+        // unresolved selection and the Protection level and warns, rather than
+        // turning the gate Off or choosing another auditor on the user's
+        // behalf.
+        if (draftConfig.toolProtection) toolProtection = stagedToolProtectionSettings(draftConfig);
         // Issue #294: capture the pre-transaction reference baseline for a
         // newly staged operation from this session's OPENING snapshot — never
         // from the already-cascaded draft, whose references reflect this
@@ -550,6 +602,7 @@ async function runSettingsMenu(
           agentReferenceBaselines.set(operation.id, captureExternalAgentReferenceBaseline(externalAgentOpening, operation.id));
         }
         for (const notice of changed.notices) await notify(input.ui, notice, "info");
+        for (const warning of changed.warnings) await notify(input.ui, warning, "warning");
       });
       continue;
     }
@@ -627,14 +680,16 @@ async function runSettingsMenu(
       // YouShouldKnow notices, Completion guidance, and Web/browser subtree are
       // edited here through their existing controls and keep their previous
       // selection keys; the two deny selectors are independent and checked
-      // means strictly denied. All values stay staged until the root
-      // Save/root-Escape/Cancel transaction decides. The candidate inventory is
-      // display-only: it is read here, never activated.
+      // means strictly denied (the #536 audit picker reuses this same
+      // searchable list with checked meaning AUDITED). All values stay staged
+      // until the root Save/root-Escape/Cancel transaction decides. The
+      // candidate inventory is display-only: it is read here, never activated.
       const tools = await selectToolSettings(input.ui, {
         topLevelDeny,
         executorDeny,
         deferredPiTools,
         youShouldKnow,
+        toolProtection: { ...toolProtection, auditor: toolProtection.auditor === null ? null : { ...toolProtection.auditor }, toolNames: [...toolProtection.toolNames] },
         web: {
           maxDownloadBytes: webMaxDownloadBytes,
           browserInteractionApproval,
@@ -643,11 +698,21 @@ async function runSettingsMenu(
           browserVisible,
           browserPermissions,
         },
-      }, readToolChoices(input.getToolChoices), retainedToolDenials);
+      }, readToolChoices(input.getToolChoices), retainedToolDenials, { config: draftConfig, agents, scoped: input.scoped }, {
+        // The audit subset reads the same display-only inventory WITHOUT the
+        // deny-only loader filter, from the runtime's loader-inclusive read
+        // (falling back to the shared inventory when a host cannot supply one),
+        // so the reserved `tool_search` loader is an auditable row whenever the
+        // runtime offers it — and stays a reversible unavailable row when it
+        // does not.
+        choices: readToolChoices(input.getAuditedToolChoices ?? input.getToolChoices, { includeReservedDiscoveryLoader: true }),
+        retainedNames: retainedAuditedToolNames,
+      });
       topLevelDeny = tools.topLevelDeny;
       executorDeny = tools.executorDeny;
       deferredPiTools = tools.deferredPiTools;
       youShouldKnow = tools.youShouldKnow;
+      toolProtection = tools.toolProtection;
       webMaxDownloadBytes = tools.web.maxDownloadBytes;
       browserInteractionApproval = tools.web.browserInteractionApproval;
       browserIdleExpiryMinutes = tools.web.browserIdleExpiryMinutes;
@@ -743,6 +808,7 @@ async function runSettingsMenu(
     await notify(input.ui, "Review settings saved.", "info");
     for (const warning of staged.warnings) await notify(input.ui, warning, "warning");
     for (const warning of staged.scheduleDisableWarnings) await notify(input.ui, warning, "warning");
+    for (const warning of staged.toolProtectionWarnings) await notify(input.ui, warning, "warning");
     // The hotkey binding itself is captured by Pi at extension load, so a
     // changed key needs the documented /reload (same as keybindings.json);
     // the persisted mode change itself never needs a reload.

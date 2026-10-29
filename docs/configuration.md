@@ -42,7 +42,8 @@ described only briefly here is owned by the linked page.
   switch: it disables the whole extension, including delegated execution. The launcher
   warns loudly when it is set instead of silently swallowing it.
 - Top-level `enabled: false` is the automatic-review master switch only. It does **not**
-  disable configured worker routes.
+  disable configured worker routes or the optional `toolProtection` gate, which is
+  controlled only by its own `level`.
 - Clearing every reviewer for a review layer in `/review-settings` disables that layer's
   automatic review without disabling delegated execution. The preserved review window
   stays open (deferring each review with a notice) until reviewers are configured again
@@ -69,6 +70,7 @@ described only briefly here is owned by the linked page.
 | `retainBundles` | `"on-failure"` | Review-bundle retention policy: `never`, `on-failure`, or `always`. `always` disables age-based wave GC while the application is running. |
 | `deleteSpawnedPiSessionsOnCleanup` | `false` | Also unlink recorded spawned Pi sessions at existing cleanup points when On. Missing means Off; enabling it does not trigger a purge or change cleanup eligibility/timing. Identity checks read only the bounded first header, not the transcript. |
 | `tools` | `{ "topLevelDeny": [], "executorDeny": [] }` | Exact-name top-level and executor tool denials; see [Tool denial fields](#tool-denial-fields). |
+| `toolProtection` | absent (**Off**) | Optional pre-execution decision gate; see [Tool protection fields](#tool-protection-fields). |
 
 ## Tool denial fields
 
@@ -116,6 +118,34 @@ Escape applies them to the current session without writing the file, Cancel disc
 the staged edits, and Save persists them. Top-level denials take effect at the next
 applicable model set write, without interrupting an in-flight run or reloading;
 executor denials apply to new admissions only.
+
+## Tool protection fields
+
+`toolProtection` is one optional top-level block for the pre-execution
+decision gate ([Tool protection](tool-protection.md)). Absence of the block is **Off**
+for every configuration that predates it; there is no separate enable flag, and one
+shared level applies to the primary agent and newly launched Pi executors. A present
+block must state `level`. `off` is a level, not a toggle: it removes only this added
+gate.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `level` | Absent block is `"off"`; required when the block is present | `off`, `dangerous`, `aligned`, or `workspace`. |
+| `auditor` | `null` | One existing Pi or external reviewer selection; required for every non-Off level. Use `{"source":"pi","model":"provider/model","thinkingLevel":"low"}` or `{"source":"external","id":"agent-id"}`. Pi reasoning is scoped to the auditor. External ids use only letters, numbers, underscores, periods, and hyphens. An external id that does not resolve stays stored and is reported unavailable. |
+| `scope` | `"all"` | `all` audits every proposed tool name; `selected` audits exactly `toolNames`. The reserved `tool_search` discovery loader is never audited under either scope. |
+| `toolNames` | `[]` | Exact, case-sensitive names for `selected`; must contain at least one name when `selected`. Duplicates collapse, and an unlisted call is NOT AUDITED, never a pass. |
+| `timeoutMs` | `10000` | Decision deadline in whole milliseconds, 1000–120000. |
+| `maxContextChars` | `128000` | Assembled auditor-context budget in UTF-16 code units, 4000–2000000. Governing instructions, the exact call, and causal evidence are never truncated; if they do not fit, the call does not run. |
+| `retainAuditorSessions` | `false` | Optional, opt-in saving of each actual auditor invocation as an ordinary saved Pi session you can browse; see [Keeping auditor sessions](tool-protection.md#keeping-auditor-sessions-optional). An absent field is Off, so a block or a parent launch pin that predates it keeps the previous behavior. Only the JSON booleans `true`/`false` are accepted — `"true"`, `1`, and `null` are rejected. It changes no decision input, no permission, and no verdict, and a saved audit is never read back into a later decision. |
+
+Explicit writes validate strictly: a non-Off level without an auditor, a `selected`
+scope with no names, a non-whole or out-of-range number, or an unknown level or scope is
+rejected. Unknown keys inside the block are ignored. An absent block and an explicit
+`{"level":"off"}` both mean Off.
+
+A malformed stored block is not recovered as an implicit Off. Startup reports a warning
+and keeps the derived `toolProtectionError`; protected calls stay blocked until a valid
+configuration is saved, while other settings still load. The file is never rewritten.
 
 ## YouShouldKnow settings
 

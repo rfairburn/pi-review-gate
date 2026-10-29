@@ -437,6 +437,34 @@ export class NativeToolCallPreflight {
     return isToolCallFingerprint(member.fingerprint) ? member.fingerprint : undefined;
   }
 
+  /**
+   * Record a pre-execution policy refusal for a call this guard already
+   * admitted, before its callback could run. This is deliberately not an
+   * execution error and not `observeReturnedError`: a refused call earned no
+   * retry entitlement, and its same-batch fingerprint reservation stays in
+   * place. The member's admission becomes `blocked`, so a later identical
+   * proposal is treated as following a blocked request (adjacent duplicates are
+   * not cleared by a user message) rather than as a failed execution.
+   *
+   * Returns the native block decision for the composed `tool_call` observer, or
+   * `undefined` when this guard has no matching admitted record (the caller
+   * still returns its own block; this method never grants permission).
+   */
+  markPolicyBlocked(toolCallId: string, toolName: string, reason: string): { block: true; reason: string } | undefined {
+    if (!toolCallId || !toolName) return undefined;
+    const member = this.membersById.get(toolCallId);
+    if (member && member.id === toolCallId && member.name === toolName && member.admission === "allowed") {
+      this.markBlocked(member);
+      return { block: true, reason };
+    }
+    const record = this.nestedById.get(toolCallId);
+    if (record && record.name === toolName && record.admission === "allowed") {
+      this.markBlocked(record);
+      return { block: true, reason };
+    }
+    return undefined;
+  }
+
   /** Record an explicit isError:true returned by an admitted owned native tool. */
   observeReturnedError(toolCallId: string, toolName: string): void {
     if (!toolCallId || !OWNED_NATIVE_TOOL_NAMES.has(toolName)) return;

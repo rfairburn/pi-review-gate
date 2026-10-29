@@ -108,9 +108,9 @@ supplies the live switch (the ordinary extension entry point always does):
   multi-selectors (**Top-level tools** and **Executor tools**, checked = denied) over
   the runtime's pre-deny candidate inventory, each with a live tool-name search field,
   plus the moved **Deferred Pi tools**,
-  **YouShouldKnow notices**, **Completion guidance**, and **Web** controls. Denials only
-  narrow existing authority, and the two lists never cascade to each other. See
-  [Tools subsection](#tools-subsection).
+  **YouShouldKnow notices**, **Completion guidance**, and **Web** controls, and the
+  **Tool protection** group. Denials only narrow existing authority, and
+  the two lists never cascade to each other. See [Tools subsection](#tools-subsection).
 - **Subtasks view** stores the expanded/collapsed live-panel preference globally.
 - **Scheduled tasks** opens the scheduled-task submenu (issue #26): one staged entry
   per independent scheduled task, keyed by its stable identity, with name,
@@ -329,13 +329,16 @@ eligibility and failures that must remain blocking.
 
 The **Tools** row opens one submenu that owns the scoped deny selectors and the four
 controls moved out of the root — **Deferred Pi tools**, **YouShouldKnow notices**,
-**Completion guidance**, and **Web** — plus each control's existing submenus. It
-introduces no second menu, state, or save path: everything here is staged into the same
-`/review-settings` transaction. **Save changes** and Ctrl+S persist the whole draft
-atomically, **Cancel** discards it, and root Escape applies it to the running session
-only, exactly as for every other row. In the TUI, Enter opens the highlighted row;
-Enter in a deny picker toggles the highlighted tool; **Back** and Escape return to the
-Tools root; Escape from the Tools root returns to the `/review-settings` root.
+**Completion guidance**, and **Web** — plus each control's existing submenus and the
+**Tool protection** group. It introduces no second menu, state, or save
+path: everything here is staged into the same `/review-settings` transaction. **Save
+changes** and Ctrl+S persist the whole draft atomically, **Cancel** discards it, and
+root Escape applies it to the running session only, exactly as for every other row. In
+the TUI, Enter opens the highlighted row; Enter in a tool picker — either deny selector
+or the audit-name selector — toggles the highlighted tool; **Back** and Escape return to
+the immediate parent (the Tools root from a deny selector, the Tool protection submenu
+from the audit-name selector); Escape from the Tools root returns to the
+`/review-settings` root.
 
 ### Scoped tool denial
 
@@ -405,6 +408,49 @@ rejection that leaves no recorded invocation — codemode's own proxy refusing a
 non-callable direct-exposure member before `ctx.executeTool` runs, for example — keeps
 Pi's own truthful error instead, with no settings attribution and still no executed side
 effect.
+
+### Tool protection
+
+- **Tool protection** opens the controls for the pre-execution decision gate: one
+  shared Protection level (**Off**, **Dangerous**, **Aligned**, or **Workspace**), one
+  auditor selection from the same Pi and external sources, an `all` or exact-name
+  `selected` audit scope, the decision timeout, and the context budget. Off is the
+  default and removes only this added gate; there is no separate enable toggle. See
+  [Tool protection](tool-protection.md) and the raw
+  [field reference](configuration.md#tool-protection-fields).
+- **Save auditor sessions** is Off by default and controls only whether each auditor
+  invocation is also saved as an ordinary Pi session you can browse later. Turning it on
+  asks for confirmation first, because it starts writing records that contain the exact
+  auditor request; turning it off needs no confirmation. Nothing is written while it is
+  Off. See [Keeping auditor sessions](tool-protection.md#keeping-auditor-sessions-optional).
+- **Selected tool names** is chosen in the same searchable multi-select as the deny
+  pickers, with the opposite checked meaning: a tool-name query sits above the rows, one
+  row is one tool, Enter toggles it, and a checked row means **audited** — never denied.
+  Only tool names are searched, a query hides rows without changing what is audited, and
+  each picker keeps its own transient query. The list is exact names only: there is no
+  typed or comma-separated name entry, so a raw configured name is retained rather than
+  silently dropped. The reserved `tool_search` loader is never an audited candidate — it
+  is the discovery infrastructure this gate never audits, so its row states
+  `· never audited — discovery loader`, cannot be checked, and is excluded from the
+  audited count, while the deny pickers still never offer it at all. An audit name the
+  live inventory does not offer stays a reversible `[not currently available]` row.
+  Entering this scope with no established audit list starts with **every** currently
+  offered auditable name checked, so you uncheck the exemptions instead of checking each
+  tool, while a saved or previously chosen subset is never re-checked for you. Leaving
+  the picker with nothing auditable checked changes nothing: `selected` requires at least
+  one exact name, and **All calls** or **Off** stay the ways to widen or stop the gate.
+- The group uses this page's staged transaction: root Escape applies session-only,
+  **Save changes**/Ctrl+S persists, and **Cancel** discards. Opening it and changing
+  values invokes no provider and launches no auditor; a saved selection is not a
+  connection test.
+- Enabling a non-Off level or changing the auditor warns that the selected boundary
+  will receive the exact proposed tool arguments, the governing system instructions for
+  the acting call, and the selected session evidence.
+- An external auditor reference that no longer resolves is preserved and reported as
+  unavailable; the menu does not silently rewrite it to Off or choose another auditor.
+- Under a non-Off level, unsupported external acting executors are refused before they
+  start, regardless of the auditor selection. The gate is not an OS sandbox and does not
+  cover other harnesses; see [Limits and non-goals](tool-protection.md#limits-and-non-goals).
 
 ### Moved controls
 

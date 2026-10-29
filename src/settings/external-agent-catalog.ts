@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import { cloneExternalAgentCatalog, effectiveReviewSettings, normalizeConfig, resolvedExternalAgent, resolvedWorkerCatalog, type ExternalAgentValue, type ReviewGateConfig } from "../config";
+import { isRecord } from "../record-guard";
 import { selectExternalAgentCreation, selectExternalAgentEdit } from "./external-agents";
 import { retainedSelect } from "./menu";
 import type { UiContext } from "./ui";
@@ -38,7 +39,7 @@ export function stageExternalAgentOperation(operations: ExternalAgentOperation[]
 }
 
 /** One isolated draft transaction, touching structured references only. */
-export function changeExternalAgent(config: ReviewGateConfig, id: string, nextId?: string, definition?: ExternalAgentValue): { config: ReviewGateConfig; notices: string[] } {
+export function changeExternalAgent(config: ReviewGateConfig, id: string, nextId?: string, definition?: ExternalAgentValue): { config: ReviewGateConfig; notices: string[]; warnings: string[] } {
   if (!Object.hasOwn(config.externalAgents ?? {}, id)) throw new Error("Worker no longer exists in this draft.");
   if (nextId !== undefined && nextId !== id && Object.hasOwn(config.externalAgents ?? {}, nextId)) throw new Error("Worker ID already exists in this draft.");
   if (nextId !== undefined) normalizeConfig({ externalAgents: Object.fromEntries([[nextId, definition]]) });
@@ -62,6 +63,9 @@ export function changeExternalAgent(config: ReviewGateConfig, id: string, nextId
       if (route) next.execution.routes![role] = route.filter((entry) => !removed.has(entry.resourceId));
     }
   }
+  // #536: catalog-side consequences the user must weigh, kept apart from the
+  // informational cascade notices so the caller can present them as warnings.
+  const warnings: string[] = [];
   const updateReviewers = (reviewers: ReturnType<typeof effectiveReviewSettings>["primaryReviewers"], label: string) => reviewers.flatMap((reviewer) => {
     if (reviewer.source !== "external" || reviewer.id !== id) return [reviewer];
     if (nextId !== undefined) return [{ ...reviewer, id: nextId }];
@@ -70,6 +74,20 @@ export function changeExternalAgent(config: ReviewGateConfig, id: string, nextId
   const review = effectiveReviewSettings(next);
   next.review = { ...next.review, primaryReviewers: updateReviewers(review.primaryReviewers, "primary layer"), subtaskReviewers: updateReviewers(review.subtaskReviewers, "subtask layer") };
   delete next.review.activeReviewers;
+  // Issue #536: the tool-protection auditor follows a rename, and a deletion
+  // keeps BOTH the unresolved selection and the Protection level with an
+  // explicit warning. Silently switching the gate Off would remove a
+  // protection the user enabled, and picking a substitute auditor would send
+  // the audited context somewhere the user never chose; neither happens.
+  const protection = next.toolProtection;
+  if (protection?.auditor?.source === "external" && protection.auditor.id === id) {
+    if (nextId !== undefined) {
+      next.toolProtection = { ...protection, auditor: { source: "external", id: nextId } };
+      notices.push(`Tool protection auditor reference updated to ${nextId}.`);
+    } else {
+      warnings.push(`Tool protection still selects the deleted worker ${id} at Protection level "${protection.level}". Save keeps that unresolved selection and level; audited calls stay blocked until you choose an available auditor, and Off is the only way to stop the added gate.`);
+    }
+  }
   for (const [taskId, task] of Object.entries(next.scheduledTasks ?? {})) {
     let disabled = false;
     if (task.workerResourceId && removed.has(task.workerResourceId)) {
@@ -85,7 +103,27 @@ export function changeExternalAgent(config: ReviewGateConfig, id: string, nextId
     }
     if (disabled) { task.enabled = false; notices.push(`Task ${taskId} disabled. Later enabling uses configured defaults for reset references.`); }
   }
-  return { config: next, notices };
+  return { config: next, notices, warnings };
+}
+
+/**
+ * The tool-protection auditor identity as one stable string, so it can join
+ * the optimistic external-agent reference guard (#536): `"absent"` when no
+ * block is stored, `"none"` for an explicit null auditor, otherwise the exact
+ * `pi:<model>` / `external:<id>` selection. A block this projection cannot read
+ * yields `"unreadable"`, which conflicts conservatively instead of passing.
+ * Raw and normalized blocks project identically, which is what lets Save
+ * compare the stored record against the menu's opening snapshot.
+ */
+export function toolProtectionAuditorReference(value: unknown): string {
+  if (value === undefined) return "absent";
+  if (!isRecord(value)) return "unreadable";
+  const auditor = value.auditor;
+  if (auditor === undefined || auditor === null) return "none";
+  if (!isRecord(auditor)) return "unreadable";
+  if (auditor.source === "external") return typeof auditor.id === "string" ? `external:${auditor.id}` : "unreadable";
+  if (auditor.source === "pi") return typeof auditor.model === "string" ? `pi:${auditor.model}` : "unreadable";
+  return "unreadable";
 }
 
 /** A narrowly scoped optimistic guard, including dormant and foreign schedules. */
@@ -94,6 +132,7 @@ export function externalAgentReferences(config: ReviewGateConfig, id: string, ex
   const affected = new Set([...extraResources, ...Object.entries(resources).filter(([, r]) => r.selection.source === "external" && r.selection.id === id).map(([key]) => key)]);
   const review = effectiveReviewSettings(config);
   const contains = (reviewers: typeof review.primaryReviewers) => Array.isArray(reviewers) && reviewers.some((r) => r && r.source === "external" && r.id === id);
+  const protectionAuditor = toolProtectionAuditorReference(config.toolProtection);
   return {
     resources: Object.entries(resources).filter(([key]) => affected.has(key)),
     routes: ["execute", "research"].map((role) => (config.execution?.routes?.[role as "execute" | "research"] ?? []).map((entry, index) => ({ entry, index })).filter(({ entry }) => affected.has(entry.resourceId))),
@@ -109,6 +148,12 @@ export function externalAgentReferences(config: ReviewGateConfig, id: string, ex
       } else if (task.review?.mode === "off") reviewReference = { mode: "off" };
       return [key, { workerResourceId: typeof task.workerResourceId === "string" ? task.workerResourceId.trim() : undefined, review: reviewReference, enabled: task.enabled ?? true }];
     }),
+    // #536: the tool-protection auditor is an external reference like any
+    // other, so a concurrent change to it conflicts the rename/delete
+    // transaction instead of being overwritten by this draft.
+    toolProtection: protectionAuditor === `external:${id}` || protectionAuditor === "unreadable"
+      ? protectionAuditor
+      : undefined,
   };
 }
 

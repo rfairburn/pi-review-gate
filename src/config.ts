@@ -7,6 +7,10 @@ import { parseCronExpression } from "./scheduling/cron";
 import { isNativeReasoningEffort, nativeReasoningArgs, type NativeReasoningEffort } from "./external-agent-reasoning";
 import { DEFERRED_TOOL_SEARCH_NAME } from "./tool-inventory";
 import { isRecord } from "./record-guard";
+import {
+  normalizeToolProtectionConfig,
+  type ToolProtectionConfig,
+} from "./tool-protection/config";
 
 export type RetainBundles = "never" | "on-failure" | "always";
 /**
@@ -597,6 +601,13 @@ export interface ReviewGateConfig {
   youShouldKnow?: YouShouldKnowConfig;
   /** Exact-name top-level and executor tool denials (#434). */
   tools?: ReviewGateToolsConfig;
+  /**
+   * Pre-execution tool protection (#536): the one canonical copy of
+   * the gate settings. Absence is `off` for configurations that predate the
+   * block, so loading never activates the gate; there is no second enable flag
+   * and no per-scope override. Off removes only this added gate.
+   */
+  toolProtection?: ToolProtectionConfig;
   web?: WebConfig;
 }
 
@@ -606,6 +617,15 @@ export interface LoadedConfig {
   disabledReason?: string;
   globallyDisabled?: boolean;
   warnings?: string[];
+  /**
+   * Derived at load time only, never stored: the stored `toolProtection` block
+   * was present but invalid, so its normalized value is unavailable. A safety
+   * gate must not acquire an explicitly configured protection by silently
+   * reading a malformed block as `off`, so runtime admission fails closed on a
+   * non-empty value until an explicit valid settings apply. Every other setting
+   * still loads normally, and the file is never rewritten.
+   */
+  toolProtectionError?: string;
 }
 
 export const DEFAULT_CONFIG: ReviewGateConfig = {
@@ -688,7 +708,7 @@ export function loadConfig(
 }
 
 /** Startup recovery only. Explicit configuration writes still validate strictly. */
-export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "warnings"> {
+export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "warnings" | "toolProtectionError"> {
   try {
     return { config: normalizeConfig(value) };
   } catch {
@@ -696,6 +716,7 @@ export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "wa
   }
   const candidate: Record<string, unknown> = Object.create(null);
   const warnings: string[] = [];
+  let toolProtectionError: string | undefined;
   // Only these objects contain independently defaultable settings. Selections,
   // agent definitions and route/resource entries remain atomic: never invent
   // a model, reasoning pair, command or authorization reference to repair one.
@@ -715,6 +736,10 @@ export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "wa
         return false;
       }
     };
+    if (path === "toolProtection") {
+      recoverToolProtection(key, input);
+      return;
+    }
     if (attempt(input)) return;
     if (containers.has(path) && isRecord(input)) {
       const object: Record<string, unknown> = Object.create(null);
@@ -739,6 +764,47 @@ export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "wa
     }
     warnings.push(`${path} is invalid or unsupported; using its default.`);
   };
+  /**
+   * A malformed `toolProtection` block never recovers into an implicit Off.
+   * Every other setting still recovers under the established per-key contract,
+   * but the derived `toolProtectionError` stays set so runtime admission fails
+   * closed until an explicit valid settings apply. The stored document is never
+   * rewritten, and no policy, level, or auditor is invented to repair one. An
+   * auditor that simply does not resolve today is not an error here: the
+   * selection stays stored so the runtime can explain that it is unavailable.
+   */
+  const recoverToolProtection = (key: string, input: unknown): void => {
+    // Capture the prior state before overwriting it, so a failed attempt puts
+    // back exactly what was there (usually: nothing).
+    const previous = Object.getOwnPropertyDescriptor(candidate, key);
+    const restore = (): void => {
+      if (previous) Object.defineProperty(candidate, key, previous);
+      else delete candidate[key];
+    };
+    Object.defineProperty(candidate, key, { value: input, configurable: true, enumerable: true, writable: true });
+    let detail = "invalid value";
+    try {
+      normalizeConfig(candidate);
+      return;
+    } catch (error) {
+      detail = error instanceof Error ? error.message : detail;
+      restore();
+    }
+    let attributable = true;
+    try {
+      // With the block removed the rest must normalize; if it still fails, the
+      // fault is a cross-key combination and the block simply cannot be
+      // validated. Either way the safe answer is the same derived error.
+      normalizeConfig(candidate);
+    } catch {
+      attributable = false;
+    }
+    toolProtectionError = attributable
+      ? `toolProtection is invalid, so tool protection is unavailable and protected calls stay blocked until a valid configuration is saved: ${detail}`
+      : "toolProtection could not be validated together with the rest of the stored configuration, so tool protection is unavailable and protected calls stay blocked until a valid configuration is saved.";
+    warnings.push(toolProtectionError);
+  };
+
   const recoverObject = (target: Record<string, unknown>, input: Record<string, unknown>, prefix: string): void => {
     // Resources must precede routes; the scheduled-task catalog must follow
     // execution and externalAgents, so its worker-resource cross-references
@@ -765,7 +831,10 @@ export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "wa
   };
   if (isRecord(value)) recoverObject(candidate, value, "");
   else warnings.push("Configuration must be an object; using built-in defaults.");
-  return { config: normalizeConfig(candidate), warnings };
+  const recovered = normalizeConfig(candidate);
+  return toolProtectionError === undefined
+    ? { config: recovered, warnings }
+    : { config: recovered, warnings, toolProtectionError };
 }
 
 export function normalizeConfig(value: unknown): ReviewGateConfig {
@@ -812,6 +881,11 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     ui: value.ui === undefined ? undefined : normalizeUi(value.ui),
     youShouldKnow: normalizeYouShouldKnow(value.youShouldKnow),
     tools: value.tools === undefined ? undefined : normalizeTools(value.tools),
+    // Absent stays absent rather than materializing a default on every load, so
+    // no save ever writes an implied protection block into an older record.
+    toolProtection: value.toolProtection === undefined
+      ? undefined
+      : normalizeToolProtectionConfig(value.toolProtection),
     web: normalizeWeb(value.web),
   };
 

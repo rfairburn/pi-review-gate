@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.218]
+
+### Changed
+
+- Reduce repeated setup work in the session-host entrypoint tests (Refs #194):
+  lazily resolve five native tool paths once per test process while still writing
+  every fixture's wrappers, and reuse each tree count in three assertion
+  diagnostics. Real launches, fixture volumes, assertion thresholds, and deliberate
+  before/after measurements are unchanged. Production code and native compilation
+  tests are unchanged; #194 remains open for further CI improvements.
+
 ## [0.1.0-dev.217]
 
 ### Changed

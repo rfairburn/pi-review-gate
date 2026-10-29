@@ -176,6 +176,10 @@ function writeBootstrapNode(fixture: EntrypointFixture, exitCode = 0): string {
   return file;
 }
 
+// Native tool locations resolved lazily, once per test process, at the point where the
+// first fixture needs them; every fixture still receives its own identical wrappers.
+const nativeBootstrapTools = new Map<string, string>();
+
 function writeBootstrapTools(
   fixture: EntrypointFixture,
   options: { os?: string; arch?: string; digest?: string; httpStatus?: string; curlExit?: number; exitCode?: number; tarListing?: string[] } = {},
@@ -218,7 +222,11 @@ function writeBootstrapTools(
   // The canonical coordination record is published with an atomic hard link, and
   // its owner identity is one targeted `ps` query for a single pid.
   for (const tool of ["unlink", "rmdir", "mv", "ln", "ps"]) {
-    const native = spawnSync("/bin/bash", ["-c", `type -P ${tool}`], { encoding: "utf8" }).stdout.trim();
+    let native = nativeBootstrapTools.get(tool);
+    if (native === undefined) {
+      native = spawnSync("/bin/bash", ["-c", `type -P ${tool}`], { encoding: "utf8" }).stdout.trim();
+      nativeBootstrapTools.set(tool, native);
+    }
     writeExecutable(join(fixture.bin, tool), `#!/bin/bash\nexec "${native}" "$@"\n`);
   }
   writeExecutable(join(fixture.bin, "wc"), "#!/bin/bash\nexec /usr/bin/wc \"$@\"\n");
@@ -990,7 +998,8 @@ test(".sh converges to five with thousands of extracted entries in every fresh g
     const populated = current.filter((root) => existsSync(join(root, "extracted")) ? readdirSync(join(root, "extracted")).length > 0 : false);
     assert.ok(populated.length > 0, "the fresh generation really contains controlled extraction output");
     for (const root of populated) {
-      assert.ok(countTreeEntries(root) > 2_000, `a populated fresh root holds thousands of entries: ${countTreeEntries(root)}`);
+      const entries = countTreeEntries(root);
+      assert.ok(entries > 2_000, `a populated fresh root holds thousands of entries: ${entries}`);
     }
   }
   assert.equal(nodeRoots(f).length, 5, "the cache converges to its five-generation target");
@@ -1256,7 +1265,8 @@ test(".sh directory-heavy generations make real progress and converge to five", 
   const surviving = nodeRoots(f).filter((root) => existsSync(join(root, "d0")));
   assert.ok(surviving.length >= 2, `fresh generations keep their real content: ${surviving.length}`);
   for (const root of surviving) {
-    assert.ok(countTreeEntries(root) > 1_000, `a surviving fresh generation still holds thousands of entries: ${countTreeEntries(root)}`);
+    const entries = countTreeEntries(root);
+    assert.ok(entries > 1_000, `a surviving fresh generation still holds thousands of entries: ${entries}`);
   }
   f.markAssertionsPassed();
 });
@@ -2687,7 +2697,8 @@ test("native Windows deletes a populated Node generation and recovers a reused-p
   fillNodeGeneration(big, 10_000, 400);
   mkdirSync(join(big, "nested-cache"), { recursive: true });
   writeFileSync(join(big, "nested-cache", "sentinel"), "ordinary nested content");
-  assert.ok(countTreeEntries(big) > 10_000, `the fixture holds a representative volume: ${countTreeEntries(big)}`);
+  const bigEntries = countTreeEntries(big);
+  assert.ok(bigEntries > 10_000, `the fixture holds a representative volume: ${bigEntries}`);
   const reused = join(cache, "bootstrap.1-reused");
   mkdirSync(reused, { recursive: true });
   writeFileSync(join(reused, "content.txt"), "reclaimable");

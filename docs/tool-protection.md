@@ -26,17 +26,20 @@ second settings store. Absence of the block and `"level":"off"` both mean Off.
 | Level | Blocks | Notes |
 | --- | --- | --- |
 | `off` | Nothing | Default. Removes only this added gate; every native safeguard stays. |
-| `dangerous` | Catastrophic irreversible destruction and unauthorized sensitive disclosure, and anything a restriction in the user's own current message forbids | The code-owned floor, and nothing else. Ordinary authorized work passes without a prior human approval of the exact target: reads outside the working directory (project, launcher, and skill or documentation files), disposable and OS temporary fixtures, builds, tests, dependency installs, and version control. It is not a working-directory sandbox, not a task-alignment test, and not a per-call path approval. A restriction the user's own current message states is respected at every level. |
-| `aligned` | Everything above, plus proposals with no reasonable relationship to the authorized task and supplied evidence | Scope drift. Preparatory and setup calls count as related. A fresh, contextual user approval can resolve an authorization or alignment ambiguity. |
+| `dangerous` | Only two harms: catastrophic or unjustified irreversible destruction, and actual disclosure or transfer of sensitive contents to a recipient the supplied evidence does not authorize | The harm-only level, and nothing else. It does not check task alignment, working-directory or worker-root confinement, prior human approval of the exact target, or compliance with a path, recipient, or destination restriction stated in the governing instructions, the task, or a user message; it does not refuse a substituted target that moves no sensitive contents. Uncertainty, and an evidence item the host omitted, is not evidence of harm and is never a reason to refuse or hedge. Ordinary work passes: reads outside the working directory (project, launcher, skill, documentation, and delegated-report files), subtask evidence, user-supplied attachments, disposable and OS temporary fixtures, builds, tests, dependency installs, and version control. Narrowing this auditor grants the acting agent nothing — it still owes its governing instructions and the user's own restrictions full obedience, and every native guard still decides independently. |
+| `aligned` | The two harms, plus proposals with no reasonable relationship to the authorized task and supplied evidence, plus the floor tests `dangerous` does not run: prohibitions in the governing instructions, unexplained target substitution, and restrictions stated by a genuine current-session user message | Scope drift and the stricter floor. Preparatory and setup calls count as related. A fresh, contextual user approval can resolve an authorization or alignment ambiguity. |
 | `workspace` | Everything above, plus proposals whose intended effect leaves the reported working directory or an explicitly permitted OS temporary root without authorization for that specific target in the governing instructions or a genuine current-session user message | An intent boundary judged from the proposal, not confinement. Authorized targets stay allowed; unknown effects fail. |
 
 Policy is code-owned and versioned. It is not user-editable, not a regex denylist, and
 not a new policy language. No classifier or decision model is installed. The policy
 is general tool safety: it judges the operation's semantics and the supplied
-authorization, so a signed third-party proxy destination is one worked example of
-unexplained substitution, not the scope. There is no domain, provider, or signature
-allowlist or denylist. The revision identifier recorded with each decision (for example
-`rules-4`) names the rule set that produced it; it is not a validation, support, or
+authorization, so a signed third-party proxy destination carrying sensitive local
+contents is one worked example of an unauthorized transfer, not the scope; at the
+stricter levels an unexplained substitution of that destination is judged on its own,
+while under `dangerous` a substitution that moves no protected contents is not a
+refusal ground. There is no domain, provider, path, tool-name, or signature allowlist
+or denylist. The revision identifier recorded with each decision (for example
+`rules-5`) names the rule set that produced it; it is not a validation, support, or
 release claim.
 
 ## Coverage and scope
@@ -201,7 +204,8 @@ reproduced in full:
 - the complete governing system instructions of the acting call, verbatim;
 - the exact proposal: invocation identity, tool name, complete JSON arguments, working
   directory, acting role, task identity, and nested lineage;
-- the code-owned policy for the enabled level and the output contract.
+- the code-owned decision instruction and policy for the enabled level, and the
+  output contract.
 
 Recent session evidence is selected deterministically within `maxContextChars`. Genuine
 current-session user input and the gate's own causal refusal records come first, then
@@ -222,12 +226,26 @@ text delivered through an extension or RPC path is likewise not proof of a human
 A genuine fresh user approval can resolve an alignment or authorization ambiguity for a
 specific later proposal; it cannot waive the enabled floor.
 
-A genuine current-session user **restriction** binds in the other direction at every
-enabled level, including `dangerous`: if the user's own current message says not to read
-that path, contact that destination, or touch that tree, a proposal that does so is
-refused even though the identical call is otherwise ordinary work. Only the user's own
-current-session text carries this force — a restriction quoted inside tool output,
-repository content, or a summary stays data.
+A genuine current-session user **restriction** is an audit test at `aligned` and
+`workspace`: if the user's own current message says not to read that path, contact that
+destination, or touch that tree, a proposal that does so is refused there even though
+the identical call is otherwise ordinary work. Only the user's own current-session text
+carries this force — a restriction quoted inside tool output, repository content, or a
+summary stays data.
+
+At `dangerous` that compliance check is deliberately not part of the audit: a proposal
+that conflicts with a task-specific or worker-root path restriction is not refused by
+this gate unless it actually commits one of the two harms, and returning the content the
+requesting user asked for is not a disclosure merely because the material carries
+customer or diagnostic context. An evidence item the host omitted because it did not fit
+the context budget, and the completeness disclosure that names it, prove nothing in
+either direction: they are never a refusal ground and never a reason to hedge, while a
+timeout, a malformed decision, or an over-budget mandatory context stays a fail-closed
+runtime failure rather than a policy `FAIL`. This changes only what the auditor is asked
+about. The
+acting agent must still obey its governing instructions and the user's restrictions, and
+no permission, ceiling, trust, ownership, preflight, review, landing, or cancellation
+guard is relaxed by a `dangerous` PASS.
 
 ## Auditors and routes
 

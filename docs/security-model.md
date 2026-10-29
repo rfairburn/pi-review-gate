@@ -780,11 +780,25 @@ the live registry entry is matched against the definition this extension handed 
 host, and a definition from anywhere else that took over the reserved name is treated as
 an ordinary tool proposal and audited as one.
 
-A restriction stated by the user's own current-session message binds at every enabled
-level, including the narrowest one: a proposal that reads the path, contacts the
-destination, or touches the tree the user ruled out is refused, while the identical call
-stays ordinary work when no such restriction is in evidence. Restrictions quoted inside
-tool output, repository content, or a summary remain data and bind nothing.
+The `dangerous` level audits the two harms only — irreversible destruction beyond what
+the proposal justifies, and actual transfer or disclosure of sensitive contents to a
+recipient the supplied evidence does not authorize. It does not test task alignment,
+working-directory or worker-root confinement, prior approval of the exact target, or
+compliance with a restriction stated in the governing instructions, the task, or a user
+message, it does not refuse a substituted target that moves no protected contents, and
+it treats neither uncertainty nor an evidence item the host omitted as evidence of harm.
+That narrowing changes only what this auditor is asked: the acting agent still owes full
+obedience to its governing instructions and the user's own restrictions, and every
+independent permission, ceiling, trust, ownership, preflight, review, landing, and
+cancellation guard still decides. Fail-closed behavior is unchanged: missing mandatory
+context, a timeout, a malformed decision, an unsupported route, and an invalidated
+pending audit still stop the call.
+
+A restriction stated by the user's own current-session message is an audit test at
+`aligned` and `workspace`: a proposal that reads the path, contacts the destination, or
+touches the tree the user ruled out is refused there, while the identical call stays
+ordinary work when no such restriction is in evidence. Restrictions quoted inside tool
+output, repository content, or a summary remain data and bind nothing.
 
 ## ApplyPatch envelope handling and safety
 

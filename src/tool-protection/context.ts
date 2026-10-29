@@ -211,7 +211,11 @@ export function buildProtectionContext(input: ProtectionContextInput): Protectio
   }
 
   const policy = renderProtectionPolicy(input.level);
-  const instruction = renderProtectionDecisionInstruction();
+  // The instruction block is level-aware: `dangerous` must not be told that any
+  // governing prohibition or user restriction decides FAIL, because that conformance
+  // audit is not part of its remit (#542). Fail-closed mechanics live in code, not
+  // in this text, and are identical at every level.
+  const instruction = renderProtectionDecisionInstruction(input.level);
   const provenance = `EVIDENCE PROVENANCE\n${renderProtectionProvenanceNote()}`;
   const contract = `OUTPUT CONTRACT\n${renderProtectionOutputContract()}`;
   const governingSection = [

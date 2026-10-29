@@ -15,6 +15,47 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.219]
+
+### Changed
+
+- **Dangerous protection is a harm-only audit** (#542): the tests printed for the
+  `dangerous` level are now the two harms alone — concrete catastrophic or unjustified
+  irreversible destruction, or an actual disclosure or transfer of sensitive contents to
+  a recipient the supplied evidence does not authorize. The prompt states outright that
+  this level does not audit task alignment, working-directory or worker-root confinement,
+  prior human approval of the exact path, command, or destination, compliance with a
+  path, recipient, or destination restriction stated in the governing instructions, the
+  task, or a user message, or a substituted target that moves no protected contents, and
+  that neither uncertainty nor an evidence item the host omitted is evidence of harm or a
+  reason to hedge. The conformance tests it previously shared with the stricter levels —
+  a real prohibition in the governing instructions, unexplained target substitution, and
+  a restriction stated by a genuine current-session user message — are no longer printed
+  here and no longer decide `FAIL` here. Returning the content the requesting user asked
+  for — in the conversation or its user-facing notice — is not an unauthorized transfer
+  merely because that content carries customer or diagnostic context, and reading a
+  user-supplied attachment is not refused on a prohibition inferred from a complaint about
+  earlier blocking. Quoted approval still authorizes no recipient, and the two real harms
+  stay blocked.
+- **Level-aware auditor instruction and revision `rules-5`** (#542): the instruction
+  block now matches the enabled level, because the single shared wording told every
+  level that a governing prohibition or a user restriction decides `FAIL` — the
+  conformance audit `dangerous` no longer runs. `aligned` and `workspace` keep their
+  existing rules, worked examples, instruction, provenance, and output-contract text
+  unchanged apart from the neutral revision token in the header, so their stricter
+  checks, including F5 governing prohibitions, F7 target substitution, and F8 genuine
+  current-session user restrictions, still apply there. Nothing else moved: Off and the
+  defaults, coverage and scope, the discovery-loader exemption, optional auditor-session
+  retention, inline annotations, bounded evidence selection and provenance, and every
+  fail-closed runtime path (missing mandatory context, context capacity, timeout,
+  malformed or invalidated decision, unsupported route, cancellation) are unchanged, with
+  no retry, replay, cache, or fallback, and a runtime failure is still reported as one
+  rather than as a policy `FAIL`. A `dangerous` PASS grants no authority: the acting
+  agent still obeys its governing instructions and the user's restrictions, and native
+  permissions, role and tool ceilings, trust, ownership, preflight, review, landing, and
+  cancellation still decide independently. There is no tool-name, path, or domain
+  allowlist. See [Tool protection](docs/tool-protection.md).
+
 ## [0.1.0-dev.218]
 
 ### Added

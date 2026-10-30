@@ -106,12 +106,22 @@ import { computeRetryDelay } from "./retry-delay";
 
 // ── types ────────────────────────────────────────────────────────────────────
 
-/** Status of a complete wave worker lifecycle. */
+/**
+ * Status of a complete wave worker lifecycle.
+ *
+ * Correction-loop accounting is exact (#538): `correction_cap` reports ONLY
+ * numeric `maxCorrectionCycles` exhaustion; `no_progress` reports a stopped
+ * loop in which a completed review assessed the same contribution again, and
+ * stays paused/recoverable and integration-ineligible; `no_changes` remains
+ * the outcome with no file delta to land. No stopped status ever carries an
+ * accepted ref.
+ */
 export type WaveWorkerLifecycleStatus =
   | "accepted"
   | "accepted_with_warnings"
   | "completed_unreviewed"
   | "no_changes"
+  | "no_progress"
   | "review_error"
   | "correction_cap"
   | "executor_error"
@@ -619,6 +629,50 @@ async function persistReviewCycleRecord(artifactDir: string, record: ReviewCycle
   }
 }
 
+/**
+ * Canonical identity of one reviewed contribution (#538).
+ *
+ * A correction can satisfy a review finding without changing the candidate
+ * tree: a revised report claim, new verification observations, or a refreshed
+ * external deliverable are all assessable content a reviewer must see. This
+ * basis therefore combines the identity the completed review actually assessed
+ * — the verified candidate tree for a snapshot assessment, the retained
+ * observation identity for a tool-method assessment — with the canonical
+ * retained observation ledger and the latest retained report claim.
+ *
+ * An identical tree, an unchanged observation revision counter, or an
+ * unchanged pass response alone is never proof that no useful correction
+ * occurred. Reports are claims a configured reviewer assesses; a new claim is
+ * a new contribution, not an approval.
+ *
+ * This is one transient comparison value, not a result field, counter, or
+ * second synchronized copy of review state.
+ */
+function reviewedContributionBasis(
+  evidence: EvidenceState,
+  candidate: CandidateCommit,
+  evidenceMethod: ReviewRunOutput["evidenceMethod"],
+): string {
+  const toolMethod = evidenceMethod === "tool-only" || evidenceMethod === "tool-only-fallback";
+  return createHash("sha256").update(JSON.stringify({
+    // A snapshot verdict certifies the reviewed tree; a tool verdict certifies
+    // only the retained observed identity, so an unobserved tree change is not
+    // progress for a tool-method review.
+    candidate: toolMethod ? "retained-tool-observations" : candidate.treeSha,
+    observations: workerToolReviewIdentity(evidence),
+    // Checks-only observations change what the reviewer assessed without
+    // moving an observation revision counter, so the bounded retained ledger
+    // (and its revisions) is part of the assessed contribution.
+    events: evidence.events,
+    revisions: {
+      tool: evidence.toolObservationRevision ?? 0,
+      external: evidence.externalObservationRevision ?? 0,
+      truncated: evidence.toolObservationsTruncated === true,
+    },
+    report: evidence.finalAssistantSummaries.at(-1) ?? "",
+  })).digest("hex");
+}
+
 // The canonical observations are the sole tool-review identity source. Do not
 // bind to full-root filesystem differences or invent a second observation
 // counter. Include unknown-scope revisions even when no path was extractable.
@@ -788,7 +842,11 @@ function executionMetadata(result: WaveWorkerResult): Pick<
  * 4. For a changed candidate with review enabled, verifies its identity and
  *    calls runReview with either its exact patch or retained tool evidence.
  * 5. On needs_changes, resumes the same executor session via resumeWaveWorker with correction feedback.
- * 6. Honors maxCorrectionCycles and no-progress detection.
+ * 6. Honors maxCorrectionCycles: only numeric exhaustion reports
+ *    `correction_cap`. A completed review that assessed the same reviewed
+ *    contribution again stops as `no_progress` (paused/recoverable, never
+ *    integration-eligible), and a corrective turn with no file delta stays
+ *    reviewable instead of stopping early.
  * 7. On pass, transmits the actual evidence method and resumes once. New
  *    reviewable evidence re-enters review. Otherwise pins the independently
  *    verified landing candidate under workers/<task-id>; a tool-method pass
@@ -1151,8 +1209,11 @@ export async function runWaveWorkerLifecycle(
   // immutable cycle alias number, so steered re-reviews never collide with a
   // prior attempt's create-once alias.
   let nextReviewCycleNumber = 1;
-  let lastCandidateTreeSha: string | undefined;
-  let lastObservedIdentity: string | undefined;
+  // One transient comparison key for what the previous completed review
+  // actually assessed (#538). It is derived from canonical identities, is not
+  // a result field or a counter, and is replaced wholesale whenever a fresh
+  // review basis is established.
+  let lastReviewedBasis: string | undefined;
   // Monotonic executor turn counter was initialized after the first turn and
   // includes any deferred-steering handoff completed before review.
 
@@ -1384,8 +1445,10 @@ export async function runWaveWorkerLifecycle(
       nextExecutorTurn = (steeredResult.lastExecutorTurn ?? nextExecutorTurn) + 1;
       if (["executor_error", "timeout", "cancelled"].includes(steeredResult.status)
         || (steeredResult.status === "no_changes" && !(evidencePolicy.toolOnly && window.evidence.requiresReview))) {
+        // A steered turn with no file delta is the canonical no-file outcome,
+        // never a correction-budget claim (#538).
         const status: WaveWorkerLifecycleStatus = steeredResult.status === "no_changes"
-          ? "correction_cap"
+          ? "no_changes"
           : steeredResult.status === "executor_error"
             ? "executor_error"
             : steeredResult.status === "timeout"
@@ -1411,7 +1474,7 @@ export async function runWaveWorkerLifecycle(
       rememberFinalAssistantSummaryText(window.evidence, steeredResult.summary);
       currentResult = steeredResult;
       currentCandidate = steeredResult.candidate!;
-      lastCandidateTreeSha = undefined;
+      lastReviewedBasis = undefined;
       continue;
     }
 
@@ -1545,18 +1608,21 @@ export async function runWaveWorkerLifecycle(
         return result;
       }
 
-      // No-progress follows the actual reviewed basis. REPORT-only candidate
-      // changes are not progress under a tool-method review.
-      const observedIdentity = workerToolReviewIdentity(window.evidence);
-      const toolReview = reviewOutput.evidenceMethod === "tool-only" || reviewOutput.evidenceMethod === "tool-only-fallback";
-      if (toolReview ? lastObservedIdentity === observedIdentity : lastCandidateTreeSha === currentCandidate.treeSha) {
+      // No-progress is measured against what the previous review actually
+      // assessed (#538): the reviewed candidate identity (tree or retained
+      // observations for the method that ran), the canonical retained
+      // observation ledger, and the retained report claim. A repeat of that
+      // whole contribution stops the loop as a recoverable no-progress pause;
+      // it is never reported as numeric-budget exhaustion, and the configured
+      // budget is disclosed as not exhausted. No new retry threshold, backoff,
+      // or model policy is introduced.
+      const reviewedBasis = reviewedContributionBasis(window.evidence, currentCandidate, reviewOutput.evidenceMethod);
+      if (lastReviewedBasis !== undefined && lastReviewedBasis === reviewedBasis) {
         const result: WaveWorkerLifecycleResult = {
-          status: "correction_cap",
+          status: "no_progress",
           taskId,
           title: task.title,
-          summary: toolReview
-            ? "No progress: retained observed-tool evidence unchanged after correction."
-            : "No progress: candidate tree unchanged after correction.",
+          summary: `No progress: review ${reviewCycle} assessed the same contribution as the previous review (reviewed candidate identity, retained observations, and report claim unchanged) after ${correctionCount} correction(s). Correction budget not exhausted: ${correctionCount}/${maxCorrectionCycles} used.`,
           adapter: currentResult.adapter,
           model: currentResult.model,
           error: "No progress detected.",
@@ -1566,8 +1632,7 @@ export async function runWaveWorkerLifecycle(
         await writeResult(resolvedArtifactDir, result);
         return result;
       }
-      lastCandidateTreeSha = currentCandidate.treeSha;
-      lastObservedIdentity = observedIdentity;
+      lastReviewedBasis = reviewedBasis;
 
       // Build complete correction transmission and resume executor.
       const invocationDir = reviewOutput.invocationDir ?? join(resolvedArtifactDir, "invocations");
@@ -1697,23 +1762,13 @@ export async function runWaveWorkerLifecycle(
         return result;
       }
 
-      if (correctionResult.status === "no_changes" && !toolReview) {
-        // The correction produced no changes relative to base — treat as no progress.
-        const result: WaveWorkerLifecycleResult = {
-          status: "correction_cap",
-          taskId,
-          title: task.title,
-          summary: "Correction produced no changes relative to base.",
-          adapter: correctionResult.adapter,
-          model: correctionResult.model,
-          error: "No changes after correction.",
-          reviewCycles,
-          artifactDir: resolvedArtifactDir,
-          ...executionMetadata(correctionResult),
-        };
-        await writeResult(resolvedArtifactDir, result);
-        return result;
-      }
+      // A corrective turn with no file delta is NOT terminal (#538): a revised
+      // report, new verification observations, or a refreshed external
+      // deliverable can satisfy a finding without touching the candidate tree.
+      // Keep its summary as the retained report claim, verify its normalized
+      // candidate normally, and review the replacement even when the tree is
+      // unchanged; the reviewed-basis check above stops a genuine repeat only
+      // after an actual review.
 
       // Normalize the replacement candidate and continue review loop.
       rememberFinalAssistantSummaryText(window.evidence, correctionResult.summary);
@@ -1984,7 +2039,7 @@ export async function runWaveWorkerLifecycle(
     }
     currentResult = confirmResult;
     currentCandidate = confirmCandidate;
-    lastCandidateTreeSha = undefined; // reset no-progress tracking
+    lastReviewedBasis = undefined; // a new assessment starts a fresh reviewed basis
     continue;
   }
 }

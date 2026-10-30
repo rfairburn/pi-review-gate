@@ -4,7 +4,7 @@
  * exfiltration, browser or network operation is executed anywhere here.
  */
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -395,6 +395,36 @@ test("malformed, erroring, timed-out and empty auditor results never dispatch an
     assert.match(decision!.reason, item.expect, item.name);
     assert.match(decision!.reason, /not run/);
     assert.equal(calls.length, 1, `${item.name} is not retried`);
+  }
+});
+
+test("only a confirmed auditor timeout marks a refusal for duplicate accounting", async () => {
+  const timedOut = coordinatorHarness({ results: [{ error: "Auditor timed out after 5000ms.", timedOut: true }] });
+  const timeoutRefusal = await timedOut.coordinator.admitToolCall(callArgs("call-timeout-marker", "bash", { command: "echo hi" }));
+  assert.equal(timeoutRefusal?.block, true);
+  assert.match(timeoutRefusal?.reason ?? "", /audit unavailable — Auditor timed out after 5000ms\./);
+  assert.equal(timeoutRefusal?.auditTimeout, true, "the composed seam is told this attempt started nothing");
+
+  // A nested child carries the same signal on its own refusal, while the refusal
+  // is still aggregated onto its root for presentation.
+  const nestedHarness = coordinatorHarness({ results: [{ error: "Auditor timed out after 5000ms.", timedOut: true }] });
+  const nestedRefusal = await nestedHarness.coordinator.admitToolCall(
+    callArgs("call-nested-timeout-marker", "bash", { command: "echo hi" }, hostContext(), "script-call"),
+  );
+  assert.equal(nestedRefusal?.block, true);
+  assert.equal(nestedRefusal?.auditTimeout, true, "a nested timed-out audit carries the same signal");
+
+  for (const [name, result] of [
+    ["launch", { error: "Auditor launch failed: the configured auditor program could not be started (spawn ENOENT). Its command, arguments, and environment are not reported." }],
+    ["cancelled", { error: "Auditor was aborted." }],
+    ["unconfirmed", { error: "Auditor process settlement is unconfirmed.", settlement: "unconfirmed" as const }],
+    ["malformed", { output: "PASS please proceed" }],
+    ["fail", { output: '{"decision":"FAIL","reason":"denied"}' }],
+  ] as const) {
+    const harness = coordinatorHarness({ results: [result] });
+    const refusal = await harness.coordinator.admitToolCall(callArgs(`call-${name}-marker`, "bash", { command: "echo hi" }));
+    assert.equal(refusal?.block, true, `${name} blocks before execution`);
+    assert.equal(refusal?.auditTimeout, undefined, `${name} is not a confirmed pre-execution timeout`);
   }
 });
 
@@ -1624,6 +1654,11 @@ class ActivationRuntime {
   readonly pi: Record<string, unknown>;
   /** Session UI state the activated coordinator asked this fake host to append. */
   readonly entries: Array<{ customType: string; data: unknown }> = [];
+  /**
+   * Every call this host actually ran through its counted inert tool callback, in
+   * dispatch order. Only a call that survived every gate reaches it.
+   */
+  readonly executed: string[] = [];
   private active: string[];
   private initialized = false;
 
@@ -1741,7 +1776,146 @@ class ActivationRuntime {
     return results.find((value) => (value as { block?: boolean }).block === true) as
       { block?: boolean; reason?: string } | undefined;
   }
+
+  /**
+   * The host's own execution cycle for one assistant batch. After the hook
+   * sequence, only a call that no gate blocked reaches this host's counted inert
+   * tool callback; that callback produces the synthetic result the host then
+   * reports through `tool_result` and `tool_execution_end`. A blocked call never
+   * reaches the callback — Pi's documented ordering — so `executed` and the
+   * returned per-call records prove what really ran instead of restating what a
+   * hook returned. The callbacks are inert: they touch no file, process, or
+   * network, and only record that the host dispatched the call.
+   */
+  async dispatchBatch(
+    calls: Array<{
+      callId: string;
+      input: Record<string, unknown>;
+      toolName?: string;
+      outcome?: ActivationToolOutcome;
+    }>,
+  ): Promise<ActivationDispatch[]> {
+    await this.fire("message_end", {
+      message: {
+        role: "assistant",
+        content: calls.map((call) => ({
+          type: "toolCall",
+          id: call.callId,
+          name: call.toolName ?? "bash",
+          arguments: call.input,
+        })),
+      },
+    }, this.context);
+    return await this.dispatchMembers(calls);
+  }
+
+  /** One model-issued call through the full host cycle. */
+  async dispatch(
+    callId: string,
+    input: Record<string, unknown>,
+    options: { toolName?: string; outcome?: ActivationToolOutcome } = {},
+  ): Promise<ActivationDispatch> {
+    return (await this.dispatchBatch([{ callId, input, ...options }]))[0]!;
+  }
+
+  /** One nested call issued by a running tool through `ctx.executeTool()`. */
+  async dispatchNested(
+    parentCallId: string,
+    callId: string,
+    input: Record<string, unknown>,
+    options: { toolName?: string; outcome?: ActivationToolOutcome } = {},
+  ): Promise<ActivationDispatch> {
+    const toolName = options.toolName ?? "bash";
+    await this.fire("tool_execution_start", {
+      toolCallId: callId, toolName, args: input, parentToolCallId: parentCallId,
+    }, this.context);
+    const results = await this.fire("tool_call", {
+      toolCallId: callId, toolName, input, parentToolCallId: parentCallId,
+    }, this.context);
+    const blocked = results.find((value) => (value as { block?: boolean }).block === true) as
+      { block?: boolean; reason?: string } | undefined;
+    if (blocked) {
+      return { callId, blocked: true, executed: false, ...(blocked.reason ? { reason: blocked.reason } : {}) };
+    }
+    this.executed.push(callId);
+    await this.reportResult(callId, toolName, input, options.outcome ?? "success", parentCallId);
+    return { callId, blocked: false, executed: true };
+  }
+
+  /** Preflight each member, then run only the members no gate blocked. */
+  private async dispatchMembers(
+    calls: Array<{
+      callId: string;
+      input: Record<string, unknown>;
+      toolName?: string;
+      outcome?: ActivationToolOutcome;
+    }>,
+  ): Promise<ActivationDispatch[]> {
+    const decisions: ActivationDispatch[] = [];
+    const admitted: typeof calls = [];
+    for (const call of calls) {
+      const toolName = call.toolName ?? "bash";
+      await this.fire("tool_execution_start", { toolCallId: call.callId, toolName, args: call.input }, this.context);
+      const results = await this.fire("tool_call", { toolCallId: call.callId, toolName, input: call.input }, this.context);
+      const blocked = results.find((value) => (value as { block?: boolean }).block === true) as
+        { block?: boolean; reason?: string } | undefined;
+      if (blocked) {
+        decisions.push({ callId: call.callId, blocked: true, executed: false, ...(blocked.reason ? { reason: blocked.reason } : {}) });
+        continue;
+      }
+      decisions.push({ callId: call.callId, blocked: false, executed: true });
+      admitted.push(call);
+    }
+    for (const call of admitted) {
+      this.executed.push(call.callId);
+      await this.reportResult(call.callId, call.toolName ?? "bash", call.input, call.outcome ?? "success");
+    }
+    return decisions;
+  }
+
+  /** The host's reported result for a call its inert callback actually ran. */
+  private async reportResult(
+    callId: string,
+    toolName: string,
+    input: Record<string, unknown>,
+    outcome: ActivationToolOutcome,
+    parentToolCallId?: string,
+  ): Promise<void> {
+    if (outcome === "pending") return;
+    await this.fire("tool_result", {
+      toolCallId: callId,
+      toolName,
+      input,
+      content: [{
+        type: "text",
+        text: outcome === "success" ? "inert tool result" : "Error: the inert tool operation did not complete",
+      }],
+      details: {},
+      ...(outcome === "unobserved" ? {} : { isError: outcome === "error" }),
+      ...(parentToolCallId ? { parentToolCallId } : {}),
+    }, this.context);
+    if (outcome === "unobserved") return;
+    await this.fire("tool_execution_end", {
+      toolCallId: callId,
+      toolName,
+      isError: outcome === "error",
+      ...(parentToolCallId ? { parentToolCallId } : {}),
+    }, this.context);
+  }
 }
+
+/** What one dispatched call did: blocked before execution, or run by the host. */
+interface ActivationDispatch {
+  callId: string;
+  blocked: boolean;
+  executed: boolean;
+  reason?: string;
+}
+
+/** The result an inert host callback produces for a dispatched call. `pending`
+ * means the callback is still running — a script host whose nested calls have
+ * not finished yet — so no result event is reported. */
+type ActivationToolOutcome = "success" | "error" | "unobserved" | "pending";
 
 /** Synthetic external decision-only auditor used by the activation test. */
 function auditorConfig(decision: "PASS" | "FAIL"): Record<string, unknown> {
@@ -4040,5 +4214,393 @@ test("a partial render before publication never hides that call\u2019s final dia
       undefined,
       `the entry surface draws nothing for this call (debug ${debug})`,
     );
+  }
+});
+
+/**
+ * Issue #557 through the real activation path.
+ *
+ * These suites activate the shipped extension (`activate()`), drive the host's
+ * own `message_end` / `tool_execution_start` / `tool_call` / `tool_result`
+ * sequence, and let the shipped runner launch a real external decision-only
+ * auditor process. A `hang` attempt never writes and never exits, so the timeout
+ * is produced by the shipped transport's own deadline rather than simulated in
+ * the test. The auditor is inert: it inspects only its own stdin envelope and one
+ * scratch state file inside the suite's temp directory, and the proposed tools
+ * are synthetic — nothing here runs a destructive, network, or browser operation.
+ */
+type SequencedAttempt = "hang" | "pass" | "fail";
+
+function sequencedAuditorConfig(
+  stateFile: string,
+  sequence: SequencedAttempt[] | Partial<Record<string, SequencedAttempt[]>>,
+  timeoutMs: number,
+): Record<string, unknown> {
+  const script = [
+    "let body='';",
+    "process.stdin.on('data',(chunk)=>{body+=chunk;});",
+    "process.stdin.on('end',()=>{",
+    "const fs=require('fs');",
+    "let key='call';",
+    "let toolName='';",
+    "try{",
+    "const envelope=JSON.parse(body);",
+    "const invocation=(envelope.input&&envelope.input.invocation)||{};",
+    "toolName=String(invocation.toolName||'');",
+    "key=toolName+'::'+JSON.stringify(invocation.args===undefined?null:invocation.args);",
+    "}catch{}",
+    "const file=process.env.SYNTHETIC_AUDIT_STATE;",
+    "let counts={};",
+    "try{counts=JSON.parse(fs.readFileSync(file,'utf8'));}catch{}",
+    "const attempt=(counts[key]||0)+1;counts[key]=attempt;",
+    "fs.writeFileSync(file,JSON.stringify(counts));",
+    "const plan=JSON.parse(process.env.SYNTHETIC_AUDIT_SEQUENCE);",
+    // A plain array plans every proposal; an object plans per tool name, so a
+    // script host can pass while its nested proposal times out.
+    "const modes=Array.isArray(plan)?plan:(plan[toolName]||[]);",
+    "const mode=modes[Math.min(attempt-1,modes.length-1)];",
+    // A timed-out attempt stays alive until the runner's own deadline kills it.
+    "if(mode==='hang'){setInterval(()=>{},1000000);return;}",
+    "if(mode==='fail'){process.stdout.write(JSON.stringify({decision:'FAIL',reason:'synthetic refusal'}));return;}",
+    "process.stdout.write(JSON.stringify({decision:'PASS'}));",
+    "});",
+  ].join("");
+  return {
+    enabled: true,
+    maxCorrectionCycles: 3,
+    implementationGuidanceAfterCorrectionAttempts: 1,
+    maxPatchBytes: 200_000,
+    maxFileBytes: 1_048_576,
+    maxSnapshotBytes: 52_428_800,
+    retainBundles: "never",
+    externalAgents: {
+      "sequenced-auditor": {
+        adapter: "generic-cli",
+        command: process.execPath,
+        review: { args: ["-e", script], timeoutMs: 30_000 },
+        env: {
+          SYNTHETIC_AUDIT_STATE: stateFile,
+          SYNTHETIC_AUDIT_SEQUENCE: JSON.stringify(sequence),
+        },
+      },
+    },
+    toolProtection: {
+      level: "aligned",
+      auditor: { source: "external", id: "sequenced-auditor" },
+      scope: "all",
+      timeoutMs,
+      maxContextChars: 200_000,
+    },
+  };
+}
+
+/** How many times the real auditor process was actually launched for one proposal. */
+async function auditedAttempts(stateFile: string, toolName: string, args: Record<string, unknown>): Promise<number> {
+  let counts: Record<string, number> = {};
+  try {
+    counts = JSON.parse(await readFile(stateFile, "utf8")) as Record<string, number>;
+  } catch {
+    counts = {};
+  }
+  return counts[`${toolName}::${JSON.stringify(args)}`] ?? 0;
+}
+
+/**
+ * Issue #557 through the real activation path.
+ *
+ * Every suite below activates the shipped extension (`activate()`), drives the
+ * host's own `message_end` / `tool_execution_start` / `tool_call` / `tool_result`
+ * sequence, and lets the shipped runner launch a real external decision-only
+ * auditor process. A `hang` attempt never writes and never exits, so the timeout
+ * comes from the shipped transport's own deadline rather than a simulated one.
+ *
+ * Execution is counted, not asserted: the fake host dispatches a call only when
+ * no gate blocked it, runs a counted inert callback for it, and reports that
+ * callback's own result. So `runtime.executed` is the number of times the
+ * proposed operation really ran, and `auditedAttempts` is the number of times the
+ * real auditor process was launched for that exact proposal. The auditor and the
+ * tools are inert: nothing here touches a file, process, network, or browser
+ * beyond the auditor's own scratch state file inside the suite's temp directory.
+ */
+test("activate: a timed-out pre-execution audit runs nothing and the identical retry executes once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-audit-timeout-adjacent-"));
+  const stateFile = join(root, "audit-state.json");
+  try {
+    await withActivationEnvironment(root, async (configPath) => {
+      await writeFile(configPath, JSON.stringify(sequencedAuditorConfig(stateFile, ["hang", "pass"], 2_000)));
+      const runtime = new ActivationRuntime(root, "at-adjacent");
+      await runtime.start();
+      const input = { command: "echo synthetic timeout probe" };
+
+      const timedOut = await runtime.dispatch("at-1", input);
+      assert.equal(timedOut.blocked, true, "a timed-out audit still blocks the proposed call");
+      assert.match(timedOut.reason ?? "", /audit unavailable — Auditor timed out after 2000ms\./);
+      assert.deepEqual(runtime.executed, [], "the timed-out audit dispatched no tool callback");
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 1, "one audit really ran");
+      const refusalRow = activationDisplay(runtime, "at-1");
+      assert.ok(refusalRow, "the timed-out audit keeps a user-visible refusal row");
+      assert.equal(refusalRow.records[0]?.kind, "blocked", "the timeout stays recorded for the user");
+      assert.match(refusalRow.rootRefusalText ?? "", /Auditor timed out after 2000ms/, "the refusal evidence survives");
+
+      const retry = await runtime.dispatch("at-2", input);
+      assert.equal(retry.blocked, false, "the identical retry reaches a fresh audit");
+      assert.deepEqual(runtime.executed, ["at-2"], "the retry really executed");
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 2, "the retry really reached the auditor again");
+
+      const third = await runtime.dispatch("at-3", input);
+      assert.equal(third.blocked, true, "the executed call still earns duplicate protection");
+      assert.match(third.reason ?? "", /Duplicate bash blocked: member 1 \(bash\) of 1 matches an identical request in the immediately preceding native tool group/);
+      assert.deepEqual(runtime.executed, ["at-2"], "exactly one execution across the whole sequence");
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 2, "a duplicate block needs no third audit");
+
+      await runtime.fire("session_shutdown", { type: "session_shutdown" }, runtime.context);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("activate: the timed-out refusal handed to the host is exactly the native block action", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-audit-timeout-action-"));
+  const stateFile = join(root, "audit-state.json");
+  try {
+    await withActivationEnvironment(root, async (configPath) => {
+      await writeFile(configPath, JSON.stringify(sequencedAuditorConfig(stateFile, ["hang"], 2_000)));
+      const runtime = new ActivationRuntime(root, "at-action");
+      await runtime.start();
+      const raw = await runtime.submit("act-1", { command: "echo synthetic timeout action probe" });
+      assert.deepEqual(Object.keys(raw ?? {}).sort(), ["block", "reason"],
+        "the audit-timeout marker stays internal to this extension and never reaches the host");
+      assert.deepEqual(runtime.executed, []);
+      await runtime.fire("session_shutdown", { type: "session_shutdown" }, runtime.context);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("activate: repeated pre-execution audit timeouts run nothing and the first passing audit executes once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-audit-timeout-repeat-"));
+  const stateFile = join(root, "audit-state.json");
+  try {
+    await withActivationEnvironment(root, async (configPath) => {
+      await writeFile(configPath, JSON.stringify(sequencedAuditorConfig(stateFile, ["hang", "hang", "hang", "pass"], 2_000)));
+      const runtime = new ActivationRuntime(root, "at-repeat");
+      await runtime.start();
+      const input = { command: "echo synthetic repeated timeout probe" };
+      for (const callId of ["rt-1", "rt-2", "rt-3"]) {
+        const attempt = await runtime.dispatch(callId, input);
+        assert.equal(attempt.blocked, true, `${callId} stays blocked by its own timed-out audit`);
+        assert.equal(attempt.executed, false);
+      }
+      assert.deepEqual(runtime.executed, [], "three timed-out audits dispatched nothing");
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 3, "three audits really ran");
+
+      const passing = await runtime.dispatch("rt-4", input);
+      assert.equal(passing.blocked, false, "the first passing audit still dispatches");
+      assert.deepEqual(runtime.executed, ["rt-4"]);
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 4);
+
+      const after = await runtime.dispatch("rt-5", input);
+      assert.equal(after.blocked, true, "the one real execution is still duplicate-protected");
+      assert.deepEqual(runtime.executed, ["rt-4"], "and it stayed the only one");
+      await runtime.fire("session_shutdown", { type: "session_shutdown" }, runtime.context);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("activate: a same-batch sibling is re-audited and executes once after the first member times out", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-audit-timeout-batch-"));
+  const stateFile = join(root, "audit-state.json");
+  try {
+    await withActivationEnvironment(root, async (configPath) => {
+      await writeFile(configPath, JSON.stringify(sequencedAuditorConfig(stateFile, ["hang", "pass"], 2_000)));
+      const runtime = new ActivationRuntime(root, "at-batch");
+      await runtime.start();
+      const input = { command: "echo synthetic same batch probe" };
+      const decisions = await runtime.dispatchBatch([
+        { callId: "bt-1", input },
+        { callId: "bt-2", input },
+      ]);
+      assert.equal(decisions[0]?.blocked, true, "the first member's timed-out audit blocks it");
+      assert.equal(decisions[1]?.blocked, false, "the identical sibling is admitted for a fresh audit");
+      assert.deepEqual(runtime.executed, ["bt-2"], "exactly one member of the batch ran");
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 2, "both members reached the auditor");
+      await runtime.fire("session_shutdown", { type: "session_shutdown" }, runtime.context);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("activate: a same-batch timeout followed by a real denial still blocks the next identical call", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-audit-timeout-batch-denial-"));
+  const stateFile = join(root, "audit-state.json");
+  try {
+    await withActivationEnvironment(root, async (configPath) => {
+      // The first attempt of this exact proposal times out, the second is denied.
+      await writeFile(configPath, JSON.stringify(sequencedAuditorConfig(stateFile, ["hang", "fail"], 2_000)));
+      const runtime = new ActivationRuntime(root, "at-batch-denial");
+      await runtime.start();
+      const input = { command: "echo synthetic batch denial probe" };
+      const decisions = await runtime.dispatchBatch([
+        { callId: "bd-1", input },
+        { callId: "bd-2", input },
+      ]);
+      assert.deepEqual(decisions.map((decision) => decision.blocked), [true, true]);
+      assert.match(decisions[1]?.reason ?? "", /^Tool protection: FAIL — synthetic refusal/);
+      assert.deepEqual(runtime.executed, [], "nothing in the batch ran");
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 2);
+
+      const next = await runtime.dispatch("bd-3", input);
+      assert.equal(next.blocked, true, "the real denial is not shadowed by the timed-out sibling");
+      assert.match(next.reason ?? "", /follows an identical request that was blocked before execution/);
+      assert.deepEqual(runtime.executed, []);
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 2, "the blocked repeat never reaches the auditor");
+      await runtime.fire("session_shutdown", { type: "session_shutdown" }, runtime.context);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("activate: a real failure plus an intervening audit timeout still blocks after two actual failures", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-audit-timeout-failure-chain-"));
+  const stateFile = join(root, "audit-state.json");
+  try {
+    await withActivationEnvironment(root, async (configPath) => {
+      // pass, hang, pass: the granted retry's audit times out, and the next
+      // proposal is re-audited and fails for real.
+      await writeFile(configPath, JSON.stringify(sequencedAuditorConfig(stateFile, ["pass", "hang", "pass"], 2_000)));
+      const runtime = new ActivationRuntime(root, "at-failure-chain");
+      await runtime.start();
+      const input = { command: "echo synthetic failing command" };
+
+      const first = await runtime.dispatch("fc-1", input, { outcome: "error" });
+      assert.equal(first.executed, true, "the first attempt really executed and failed");
+
+      const retry = await runtime.dispatch("fc-2", input);
+      assert.equal(retry.blocked, true, "the granted retry is blocked only by its own timed-out audit");
+      assert.equal(retry.executed, false);
+      assert.deepEqual(runtime.executed, ["fc-1"], "the timed-out retry executed nothing");
+
+      const second = await runtime.dispatch("fc-3", input, { outcome: "error" });
+      assert.equal(second.blocked, false, "the timeout did not consume the single retry the real failure earned");
+      assert.deepEqual(runtime.executed, ["fc-1", "fc-3"], "two real executions, no more");
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 3, "two passing audits and one timed-out audit ran");
+
+      const third = await runtime.dispatch("fc-4", input);
+      assert.equal(third.blocked, true, "two actual failures still exhaust the allowance");
+      assert.match(third.reason ?? "", /Duplicate bash blocked after repeated failures: member 1 \(bash\) of 1 follows two identical executions that failed/);
+      assert.deepEqual(runtime.executed, ["fc-1", "fc-3"], "and the ceiling stops a third execution");
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 3, "the ceiling is reached without another audit");
+      await runtime.fire("session_shutdown", { type: "session_shutdown" }, runtime.context);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("activate: a genuine audit denial keeps its existing duplicate accounting", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-audit-denial-"));
+  const stateFile = join(root, "audit-state.json");
+  try {
+    await withActivationEnvironment(root, async (configPath) => {
+      await writeFile(configPath, JSON.stringify(sequencedAuditorConfig(stateFile, ["fail"], 2_000)));
+      const runtime = new ActivationRuntime(root, "at-denied");
+      await runtime.start();
+      const input = { command: "echo synthetic denied command" };
+      const refusal = await runtime.dispatch("dn-1", input);
+      assert.equal(refusal.blocked, true);
+      assert.match(refusal.reason ?? "", /^Tool protection: FAIL — synthetic refusal/);
+      assert.deepEqual(runtime.executed, []);
+      const retry = await runtime.dispatch("dn-2", input);
+      assert.equal(retry.blocked, true, "a denial before execution still blocks an adjacent repeat");
+      assert.match(retry.reason ?? "", /follows an identical request that was blocked before execution/);
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 1, "the blocked repeat never reaches the auditor");
+      await runtime.fire("session_shutdown", { type: "session_shutdown" }, runtime.context);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("activate: a started call with an unobserved outcome is not treated as a pre-execution timeout", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-audit-uncertain-"));
+  const stateFile = join(root, "audit-state.json");
+  try {
+    await withActivationEnvironment(root, async (configPath) => {
+      await writeFile(configPath, JSON.stringify(sequencedAuditorConfig(stateFile, ["pass"], 2_000)));
+      const runtime = new ActivationRuntime(root, "at-uncertain");
+      await runtime.start();
+      const input = { command: "echo synthetic unobserved outcome" };
+      const first = await runtime.dispatch("un-1", input, { outcome: "unobserved" });
+      assert.equal(first.executed, true, "the audited call really ran");
+      // Its result carried no structured failure, so the outcome stays uncertain:
+      // it is never reclassified as a harmless pre-execution timeout.
+      const retry = await runtime.dispatch("un-2", input);
+      assert.equal(retry.blocked, true, "an uncertain executed outcome keeps blocking an identical repeat");
+      assert.match(retry.reason ?? "", /matches an adjacent request whose execution outcome was not observed/);
+      assert.deepEqual(runtime.executed, ["un-1"]);
+      await runtime.fire("session_shutdown", { type: "session_shutdown" }, runtime.context);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("activate: a nested pre-execution audit timeout runs nothing and the script's retry executes once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-audit-timeout-nested-"));
+  const stateFile = join(root, "audit-state.json");
+  try {
+    await withActivationEnvironment(root, async (configPath) => {
+      await writeFile(configPath, JSON.stringify(sequencedAuditorConfig(stateFile, { codemode: ["pass"], bash: ["hang", "pass"] }, 2_000)));
+      const runtime = new ActivationRuntime(root, "at-nested");
+      // The host, not this extension, provides the script host.
+      runtime.registerForeignTool({
+        name: "codemode",
+        description: "synthetic script host",
+        exposure: "codemode",
+        reachesTools: () => "all",
+      });
+      await runtime.start();
+      // A real primary session never declares codemode in its baseline: the
+      // extension's own loader activates it.
+      const loader = runtime.definitions.get("tool_search") as
+        { execute?: (callId: string, params: unknown) => Promise<unknown> } | undefined;
+      assert.ok(loader?.execute, "the activated extension registered its own discovery loader");
+      const loaded = await loader.execute("load-codemode", { query: "codemode" });
+      assert.match(JSON.stringify(loaded), /codemode/, "the loader activated the script host");
+
+      const script = "await tools.bash({ command: 'echo synthetic nested probe' });";
+      const parent = await runtime.dispatch("cm-1", { code: script }, { toolName: "codemode", outcome: "pending" });
+      assert.equal(parent.blocked, false, `the script host call must be audited and dispatched, got: ${parent.reason}`);
+      assert.deepEqual(runtime.executed, ["cm-1"]);
+
+      const input = { command: "echo synthetic nested probe" };
+      const timedOut = await runtime.dispatchNested("cm-1", "cm-1/1", input);
+      assert.equal(timedOut.blocked, true, "the nested call is blocked by its own timed-out audit");
+      assert.match(timedOut.reason ?? "", /Auditor timed out after 2000ms/);
+      assert.deepEqual(runtime.executed, ["cm-1"], "the timed-out nested call ran nothing");
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 1);
+
+      const retry = await runtime.dispatchNested("cm-1", "cm-1/2", input);
+      assert.equal(retry.blocked, false, "the script's identical retry is admitted for a fresh audit");
+      assert.deepEqual(runtime.executed, ["cm-1", "cm-1/2"]);
+      assert.equal(await auditedAttempts(stateFile, "bash", input), 2);
+
+      const third = await runtime.dispatchNested("cm-1", "cm-1/3", input);
+      assert.equal(third.blocked, true, "a duplicate of the call that really ran stays blocked");
+      assert.match(third.reason ?? "", /Duplicate bash blocked: nested call 3 \(bash\) in this codemode script/);
+      assert.deepEqual(runtime.executed, ["cm-1", "cm-1/2"], "the nested tool ran exactly once");
+      // The script host settles last, after its nested calls.
+      await runtime.fire("tool_result", resultEvent("cm-1", "codemode", { input: { code: script } }), runtime.context);
+      await runtime.fire("tool_execution_end", { toolCallId: "cm-1", toolName: "codemode", isError: false }, runtime.context);
+      await runtime.fire("session_shutdown", { type: "session_shutdown" }, runtime.context);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

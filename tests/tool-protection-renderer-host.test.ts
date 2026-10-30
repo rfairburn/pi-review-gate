@@ -1218,7 +1218,7 @@ if (!host) {
     const admission = await coordinator.admitToolCall(callArgs(callId, spec.toolName, spec.args));
     let content = spec.content as Array<Record<string, unknown>>;
     if (refused) {
-      assert.ok(admission && (admission as Record<string, unknown>).block === true,
+      assert.ok(admission && (admission as { block?: boolean }).block === true,
         `${family}: the refused call was blocked before execution for ${spec.toolName}`);
       content = [{ type: "text", text: (admission as { reason: string }).reason }];
     } else {

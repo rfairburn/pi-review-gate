@@ -473,6 +473,22 @@ interface CausalChain {
   userId?: string;
 }
 
+/**
+ * One pre-execution refusal handed back from the composed `tool_call` seam.
+ *
+ * `block`/`reason` are exactly the native Pi block action. `auditTimeout` is
+ * internal to this extension: it states that this refusal ended a confirmed
+ * auditor decision deadline, which the native duplicate guard needs in order to
+ * keep a proposal that never started from spending the tool's repeated-use
+ * allowance. It grants nothing, and the entrypoint hands the host only the
+ * `{block,reason}` action.
+ */
+export interface ToolProtectionRefusal {
+  block: true;
+  reason: string;
+  auditTimeout?: true;
+}
+
 interface NestedAggregate {
   decisions: AnnotationRecord[];
   /** Total decisions observed, including records no longer retained. */
@@ -754,10 +770,12 @@ export class ToolProtectionCoordinator {
    *
    * Returns `undefined` when the native callback may run (Off, outside a
    * `selected` scope with a NOT AUDITED annotation recorded, or a current valid
-   * PASS) and a native `{block:true,reason}` otherwise. This method never
-   * throws: every internal failure blocks the proposed call.
+   * PASS) and a native `{block:true,reason}` otherwise, carrying the internal
+   * `auditTimeout` marker only when the refusal ended a confirmed auditor
+   * timeout. This method never throws: every internal failure blocks the
+   * proposed call.
    */
-  async admitToolCall(args: unknown[]): Promise<{ block: true; reason: string } | undefined> {
+  async admitToolCall(args: unknown[]): Promise<ToolProtectionRefusal | undefined> {
     let event: ToolCallShape | undefined;
     try {
       event = readToolCall(args);
@@ -805,8 +823,8 @@ export class ToolProtectionCoordinator {
       // `disclosure` accompanies the refusal for the user only. It is never part
       // of the refusal evidence supplied to a later audit, and it never changes
       // the verdict or the reason the call was refused.
-      const refuse = (reason: string, disclosure?: string): { block: true; reason: string } =>
-        this.refuseCall(call, reason, disclosure);
+      const refuse = (reason: string, disclosure?: string, auditTimeout?: true): ToolProtectionRefusal =>
+        this.refuseCall(call, reason, disclosure, auditTimeout);
       if (loadError !== undefined) {
         return refuse(
           `Tool protection: unavailable — ${loadError} The proposed ${event.toolName} call was not run.`,
@@ -971,9 +989,14 @@ export class ToolProtectionCoordinator {
           ...recordRequest,
           outcome: transportRecordOutcome(result.error),
         });
+        // The refusal, its evidence, and the reported transport facts are
+        // unchanged. The marker only records that this attempt ended on the
+        // auditor's own deadline, so the admission seam can keep a call that
+        // never started out of the tool's duplicate-execution accounting.
         return refuse(
           `Tool protection: audit unavailable — ${result.error} The proposed ${event.toolName} call was not run.`,
           warning,
+          result.timedOut === true ? true : undefined,
         );
       }
       let decision;
@@ -1079,8 +1102,16 @@ export class ToolProtectionCoordinator {
    * admission decision, and a tool result this gate has no provenance for is
    * never rewritten.
    */
-  private refuseCall(call: ToolCallShape, reason: string, disclosure?: string): { block: true; reason: string } {
+  private refuseCall(
+    call: ToolCallShape,
+    reason: string,
+    disclosure?: string,
+    auditTimeout?: true,
+  ): ToolProtectionRefusal {
     const refusal = block(disclosure === undefined ? reason : `${reason}\n${disclosure}`);
+    const action: ToolProtectionRefusal = auditTimeout === true
+      ? { block: true, reason: refusal.reason, auditTimeout: true }
+      : refusal;
     const level = this.currentState().settings.level;
     if (call.parentToolCallId) {
       this.recordDecision(call, rootCallId(call.parentToolCallId), {
@@ -1091,7 +1122,7 @@ export class ToolProtectionCoordinator {
         level,
         invocationId: call.callId,
       });
-      return refusal;
+      return action;
     }
     const toolName = clampAuditDisplayText(call.toolName, 120) || "tool";
     this.display.publish({
@@ -1106,7 +1137,7 @@ export class ToolProtectionCoordinator {
       rootRefusalText: refusal.reason,
       records: [{ kind: "blocked", toolName, level, nested: false }],
     });
-    return refusal;
+    return action;
   }
 
   /** The live protection state for this runtime (pinned child or ambient parent). */

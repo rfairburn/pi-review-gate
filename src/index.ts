@@ -307,8 +307,15 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       // call. Off returns immediately and leaves the native result untouched.
       const protectionDecision = await toolProtection.admitToolCall(args);
       if (protectionDecision) {
-        nativeToolPreflight.markPolicyBlocked(extractToolCallId(args) ?? "", name, protectionDecision.reason);
-        return protectionDecision;
+        nativeToolPreflight.markPolicyBlocked(
+          extractToolCallId(args) ?? "",
+          name,
+          protectionDecision.reason,
+          protectionDecision.auditTimeout === true,
+        );
+        // The host action stays exactly `{block, reason}`: the audit-timeout
+        // marker is this extension's own accounting signal, never host input.
+        return { block: true as const, reason: protectionDecision.reason };
       }
       return undefined;
     };
@@ -1181,11 +1188,21 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // One shared protection level for top-level and delegated calls. The audit
     // is held at this admission seam; Off returns without touching the native
     // result, and a refusal is recorded as a policy block (not an execution
-    // error) so same-batch reservations and adjacent duplicate rules hold.
+    // error) so same-batch reservations and adjacent duplicate rules hold. A
+    // confirmed auditor timeout is recorded as a refusal that started nothing, so
+    // it spends no repeated-use allowance while every other refusal stays as it
+    // was (#557).
     const protectionDecision = await toolProtection.admitToolCall(args);
     if (protectionDecision) {
-      nativeToolPreflight.markPolicyBlocked(extractToolCallId(args) ?? "", name, protectionDecision.reason);
-      return protectionDecision;
+      nativeToolPreflight.markPolicyBlocked(
+        extractToolCallId(args) ?? "",
+        name,
+        protectionDecision.reason,
+        protectionDecision.auditTimeout === true,
+      );
+      // The host action stays exactly `{block, reason}`: the audit-timeout
+      // marker is this extension's own accounting signal, never host input.
+      return { block: true as const, reason: protectionDecision.reason };
     }
     return undefined;
   };

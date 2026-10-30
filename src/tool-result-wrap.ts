@@ -1,5 +1,11 @@
 /** Shared text wrapping for the ApplyPatch and tool-discovery result views. */
 
+import { visibleLineWidth, wrapAnsiAwareRows } from "./presentation-hints";
+
+/**
+ * Code-point width count kept for {@link wrapPreserving}, whose ApplyPatch and
+ * tool-discovery callers keep their existing behaviour unchanged.
+ */
 function displayWidth(value: string): number {
   let width = 0;
   for (const character of value) {
@@ -33,6 +39,17 @@ function displayWidth(value: string): number {
  * to the start of the next row, exactly like the host's own wrapping, so no
  * row exceeds the width; leading indentation of the line itself is preserved.
  *
+ * Cells, not code points: the per-token measurement and the accumulated row
+ * width both use the shared host-aware {@link visibleLineWidth} (the running
+ * Pi host's own pi-tui `visibleWidth`, with the shared conservative count only
+ * when no host measurement is resolvable), and an oversized token is split
+ * with the shared {@link wrapAnsiAwareRows} (the host's own ANSI-aware and
+ * grapheme-aware `wrapTextWithAnsi`). The rows produced here are measured and
+ * padded downstream by the same host helpers, so a wide-emoji auditor reason —
+ * one `✅` counts one cell in a code-point count and two cells in the host —
+ * can never emit a row wider than the card and trip the host's width guard.
+ * No second width algorithm is introduced.
+ *
  * Only the tool-protection display rows use this. The ApplyPatch and
  * tool-discovery result views keep {@link wrapPreserving} unchanged.
  */
@@ -49,7 +66,7 @@ export function wrapAtWordBoundaries(value: string, width: number): string[] {
   };
   for (const token of value.split(/(\s+)/)) {
     if (token.length === 0) continue;
-    const tokenWidth = displayWidth(token);
+    const tokenWidth = visibleLineWidth(token);
     if (tokenWidth === 0) {
       // Zero-width run (combining marks only): keep it attached to the row.
       current += token;
@@ -65,10 +82,13 @@ export function wrapAtWordBoundaries(value: string, width: number): string[] {
     }
     if (tokenWidth > width) {
       if (currentWidth > 0) endRow();
-      const pieces = wrapPreserving(token, width);
+      // The host's own ANSI-aware, grapheme-aware splitter: its pieces fit the
+      // width by the host's own measurement, and a multi-code-point emoji
+      // grapheme is never broken apart.
+      const pieces = wrapAnsiAwareRows(token, width);
       for (let index = 0; index < pieces.length - 1; index += 1) rows.push(pieces[index]!);
       current = pieces[pieces.length - 1]!;
-      currentWidth = displayWidth(current);
+      currentWidth = visibleLineWidth(current);
       continue;
     }
     if (currentWidth > 0 && currentWidth + tokenWidth > width) endRow();

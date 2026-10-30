@@ -850,7 +850,7 @@ if (!host) {
   async function auditedCard(
     family: CardFamily,
     cwd: string,
-    options: { details?: Record<string, unknown>; decision?: string; scope?: ReviewGateConfig } = {},
+    options: { details?: Record<string, unknown>; decision?: string; scope?: ReviewGateConfig; reason?: string } = {},
   ): Promise<AuditedCard> {
     const spec = family === "bash"
       ? { toolName: "bash", args: { command: "echo synthetic" }, definition: nativeBashDefinition, content: [{ type: "text", text: BASH_OUTPUT }] }
@@ -861,7 +861,7 @@ if (!host) {
     const callId = `${family}-call`;
     const pi = fakePiHost();
     const { coordinator } = coordinatorFor(
-      [JSON.stringify({ decision: options.decision ?? "PASS", reason: AUDIT_REASON })],
+      [JSON.stringify({ decision: options.decision ?? "PASS", reason: options.reason ?? AUDIT_REASON })],
       { cwd, ...(options.scope === undefined ? {} : { config: options.scope }) },
     );
     coordinator.registerHooks(pi.pi);
@@ -1118,48 +1118,55 @@ if (!host) {
   test("real host: native bash, native edit, and renderer-less notice cards each show one word-wrapped audit status", async () => {
     await withEditFixture(async (cwd) => {
       const settled = await computeEditsDiff("fixture.txt", [{ oldText: OLD_TEXT, newText: "alpha\nBETA-CHANGED\ngamma\ndelta\n" }], cwd);
-      for (const family of ["bash", "edit", "notice"] as CardFamily[]) {
-        for (const width of [120, 46]) {
-          const details = family === "edit"
-            ? { diff: settled.diff, firstChangedLine: settled.firstChangedLine }
-            : family === "bash" ? {} : { status: "pending" };
-          const card = await auditedCard(family, cwd, { details });
-          const collapsed = family === "edit" ? await renderWithPreview(card.component, width) : card.component.render(width);
-          const label = `${family} collapsed width ${width}`;
-          assertAuditRowsRendered(collapsed, card.annotationText, width - 2, "success", label);
-          for (const marker of FAMILY_MARKERS[family]) {
-            assert.ok(stripAnsi(collapsed.join("\n")).includes(marker), `${label}: the native ${JSON.stringify(marker)} row is retained`);
-          }
+      // The audit rows are measured with the installed host's own cell widths,
+      // which is the measurement a real Pi session uses and under which the
+      // annotation's em dash is one cell. Without the alias the decoration runs
+      // on its deliberately conservative non-ASCII count, which is not this
+      // card's rendering path.
+      await withInstalledHostWidths(async () => {
+        for (const family of ["bash", "edit", "notice"] as CardFamily[]) {
+          for (const width of [120, 46]) {
+            const details = family === "edit"
+              ? { diff: settled.diff, firstChangedLine: settled.firstChangedLine }
+              : family === "bash" ? {} : { status: "pending" };
+            const card = await auditedCard(family, cwd, { details });
+            const collapsed = family === "edit" ? await renderWithPreview(card.component, width) : card.component.render(width);
+            const label = `${family} collapsed width ${width}`;
+            assertAuditRowsRendered(collapsed, card.annotationText, width - 2, "success", label);
+            for (const marker of FAMILY_MARKERS[family]) {
+              assert.ok(stripAnsi(collapsed.join("\n")).includes(marker), `${label}: the native ${JSON.stringify(marker)} row is retained`);
+            }
 
-          card.component.setExpanded(true);
-          const expanded = card.component.render(width);
-          const expandedLabel = `${family} expanded width ${width}`;
-          assertAuditRowsRendered(expanded, card.annotationText, width - 2, "success", expandedLabel);
-          for (const marker of FAMILY_MARKERS[family]) {
-            assert.ok(stripAnsi(expanded.join("\n")).includes(marker), `${expandedLabel}: the native ${JSON.stringify(marker)} row is retained`);
-          }
+            card.component.setExpanded(true);
+            const expanded = card.component.render(width);
+            const expandedLabel = `${family} expanded width ${width}`;
+            assertAuditRowsRendered(expanded, card.annotationText, width - 2, "success", expandedLabel);
+            for (const marker of FAMILY_MARKERS[family]) {
+              assert.ok(stripAnsi(expanded.join("\n")).includes(marker), `${expandedLabel}: the native ${JSON.stringify(marker)} row is retained`);
+            }
 
-          card.component.setExpanded(false);
-          assert.deepEqual(card.component.render(width), collapsed,
-            `${family} width ${width}: collapsing again reproduces the collapsed card exactly`);
-          assert.equal(card.annotationText, (card.annotated.content as Array<Record<string, unknown>>)[0]!.text,
-            `${family} width ${width}: rendering never rewrites the model-visible annotation`);
-          // The model-visible result is never rewritten by the decoration, checked
-          // after the whole collapsed/expanded/re-collapse sequence against
-          // snapshots that share no object graph with the pipeline.
-          assert.notEqual(card.annotated.content, card.event.content,
-            `${family} width ${width}: the annotated payload is not the emitted array itself`);
-          assert.deepEqual(card.event.content, card.originalContent,
-            `${family} width ${width}: the emitted tool_result content is never mutated`);
-          assert.deepEqual((card.annotated.content as Array<Record<string, unknown>>).slice(1), card.originalContent,
-            `${family} width ${width}: the native result payload is preserved after the annotation`);
-          assert.equal(card.annotated.isError, false, `${family} width ${width}: the native result flag is preserved`);
-          if (card.snapshotDetails !== undefined) {
-            assert.deepEqual(card.annotated.details, card.snapshotDetails,
-              `${family} width ${width}: the native structured details are preserved`);
+            card.component.setExpanded(false);
+            assert.deepEqual(card.component.render(width), collapsed,
+              `${family} width ${width}: collapsing again reproduces the collapsed card exactly`);
+            assert.equal(card.annotationText, (card.annotated.content as Array<Record<string, unknown>>)[0]!.text,
+              `${family} width ${width}: rendering never rewrites the model-visible annotation`);
+            // The model-visible result is never rewritten by the decoration, checked
+            // after the whole collapsed/expanded/re-collapse sequence against
+            // snapshots that share no object graph with the pipeline.
+            assert.notEqual(card.annotated.content, card.event.content,
+              `${family} width ${width}: the annotated payload is not the emitted array itself`);
+            assert.deepEqual(card.event.content, card.originalContent,
+              `${family} width ${width}: the emitted tool_result content is never mutated`);
+            assert.deepEqual((card.annotated.content as Array<Record<string, unknown>>).slice(1), card.originalContent,
+              `${family} width ${width}: the native result payload is preserved after the annotation`);
+            assert.equal(card.annotated.isError, false, `${family} width ${width}: the native result flag is preserved`);
+            if (card.snapshotDetails !== undefined) {
+              assert.deepEqual(card.annotated.details, card.snapshotDetails,
+                `${family} width ${width}: the native structured details are preserved`);
+            }
           }
         }
-      }
+      });
     });
   });
 
@@ -1287,6 +1294,147 @@ if (!host) {
         await assertEveryCardCellBackground(noticeLines, 46, successBg, "unaudited notice card");
         assertAuditCellsForeground(await cardCells(noticeLines, 46), noticeStart,
           expectedAuditRowTexts(notice.annotationText, 44), 46, "warning", "unaudited notice card");
+      });
+    });
+  });
+
+  // ── Wide-emoji audit reasons measured in host cells, not code units ─────
+
+  const CHECK_MARK = "\u2705";
+  const FAMILY_GRAPHEME = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}";
+  const VS16_HEART = "\u2764\uFE0F";
+  /** Every one is two host cells per grapheme and appears thirty times. */
+  const WIDE_TOKENS = [CHECK_MARK, FAMILY_GRAPHEME, VS16_HEART] as const;
+
+  /**
+   * The reported shape: an auditor reason built of three whitespace-free
+   * tokens of thirty wide graphemes each. The installed host measures each
+   * token at 60 cells — wider than the 44-cell content area of a 46-column
+   * card — while a code-point count sees 30 and happily emits a single row the
+   * installed TUI rejects outright (`Rendered line N exceeds terminal width`).
+   * Each token is oversized, so the ZWJ family and the variation-selector heart
+   * go through the oversized-token split itself rather than riding a row whole:
+   * a code-point splitter breaks exactly those graphemes in half, which the
+   * row-by-row whole-grapheme counts below catch even if only the splitter
+   * regresses.
+   */
+  const WIDE_EMOJI_REASON = `synthetic call stays inside the owned fixture ${CHECK_MARK.repeat(30)} ${FAMILY_GRAPHEME.repeat(30)} ${VS16_HEART.repeat(30)} approved`;
+
+  /**
+   * The check the installed host itself performs, run over EVERY emitted row of
+   * the card with the installed pi-tui's own `visibleWidth` — never a string
+   * length, and never the production wrapper's own measurement.
+   */
+  function assertInstalledCellWidths(lines: string[], width: number, label: string): void {
+    assert.ok(tui && typeof tui.visibleWidth === "function", "the installed pi-tui measures the host's own cell widths");
+    const measure = tui!.visibleWidth;
+    for (const [index, line] of lines.entries()) {
+      const cells = measure(line);
+      assert.ok(cells <= width,
+        `${label}: installed TUI visibleWidth row ${index + 1} is ${cells} cells for a ${width}-column card: ${JSON.stringify(stripAnsi(line))}`);
+    }
+  }
+
+  /** Every character of the canonical annotation, in order, across all rows. */
+  function assertReasonRetained(lines: string[], annotationText: string, label: string): void {
+    const emitted = stripAnsi(lines.join("")).replace(/\s+/g, "");
+    assert.ok(emitted.includes(annotationText.replace(/\s+/g, "")),
+      `${label}: the audit reason is truncated, dropped, or reordered across the wrapped rows`);
+    for (const grapheme of WIDE_TOKENS) {
+      const shown = stripAnsi(lines.join("")).split(grapheme).length - 1;
+      assert.ok(shown >= 30, `${label}: only ${shown} of the 30 ${JSON.stringify(grapheme)} graphemes reach the display`);
+    }
+  }
+
+  /**
+   * Whole-grapheme occurrences counted row by row. A row that ends half way
+   * into a ZWJ sequence or a variation-selector grapheme contributes nothing,
+   * so a splitter that breaks graphemes fails here even when the total
+   * character count still looks right.
+   */
+  function assertWholeGraphemesPerRow(lines: string[], grapheme: string, expected: number, label: string): void {
+    let whole = 0;
+    for (const line of lines) whole += stripAnsi(line).split(grapheme).length - 1;
+    assert.equal(whole, expected,
+      `${label}: ${whole} whole ${JSON.stringify(grapheme)} graphemes were emitted across the rows, expected ${expected}`);
+  }
+
+  /** A row that ends inside an emoji grapheme fails the host's own segmentation. */
+  function assertNoBrokenGraphemes(lines: string[], label: string): void {
+    for (const [index, line] of lines.entries()) {
+      const plain = stripAnsi(line);
+      for (const character of plain) {
+        const code = character.codePointAt(0)!;
+        assert.ok(code < 0xd800 || code > 0xdfff,
+          `${label}: row ${index + 1} holds a lone surrogate half — an emoji grapheme was split`);
+      }
+      assert.ok(!plain.endsWith("\u200d"), `${label}: row ${index + 1} ends inside a ZWJ sequence`);
+      assert.ok(!/[\u0300-\u036f\uFE0F]$/.test(plain),
+        `${label}: row ${index + 1} carries a combining mark or variation selector separated from its base`);
+    }
+  }
+
+  test("real host: a wide-emoji audit reason stays inside the installed cell widths at every card width", async () => {
+    await withEditFixture(async (cwd) => {
+      const settled = await computeEditsDiff("fixture.txt", [{ oldText: OLD_TEXT, newText: "alpha\nBETA-CHANGED\ngamma\ndelta\n" }], cwd);
+      await withInstalledHostWidths(async () => {
+        const successBg = theme.getBgAnsi("toolSuccessBg");
+        for (const family of ["bash", "edit", "notice"] as CardFamily[]) {
+          const details = family === "edit"
+            ? { diff: settled.diff, firstChangedLine: settled.firstChangedLine }
+            : family === "bash" ? {} : { status: "pending" };
+          for (const width of [120, 46]) {
+            const card = await auditedCard(family, cwd, { details, reason: WIDE_EMOJI_REASON });
+            const collapsed = family === "edit" ? await renderWithPreview(card.component, width) : card.component.render(width);
+            const label = `${family} collapsed width ${width} wide-emoji reason`;
+
+            // The host's own guard, asserted on every row before anything else.
+            assertInstalledCellWidths(collapsed, width, label);
+            assertContinuousBackground(collapsed, successBg, 1, label);
+            assertNoBrokenGraphemes(collapsed, label);
+
+            const auditStart = collapsed.findIndex((line) => stripAnsi(line).includes("Tool protection: PASS"));
+            assert.ok(auditStart > 0, `${label}: the audit rows are displayed`);
+            assert.ok(collapsed[auditStart]!.includes(nativeTheme.getFgAnsi("success")),
+              `${label}: the wide-emoji audit rows keep the success foreground`);
+            assertReasonRetained(collapsed, card.annotationText, label);
+            for (const grapheme of WIDE_TOKENS) {
+              assertWholeGraphemesPerRow(collapsed, grapheme, 30, label);
+            }
+            const rowsHolding = (grapheme: string) => collapsed.filter((line) => stripAnsi(line).includes(grapheme)).length;
+            // Background coverage here is row-level (assertContinuousBackground)
+            // rather than cell-by-cell: the pinned headless VT counts `\u2705` as
+            // one column unless the repository's own Unicode-11 addon is attached
+            // to it, so the existing cell-index helper would measure the harness's
+            // width model rather than the card's. Emoji cell coverage is left to
+            // the unchanged ASCII card-cell test above.
+            if (width === 46) {
+              for (const grapheme of WIDE_TOKENS) {
+                assert.ok(rowsHolding(grapheme) >= 2,
+                  `${label}: the oversized ${JSON.stringify(grapheme)} token is not split across rows but overflows the card`);
+              }
+            }
+
+            card.component.setExpanded(true);
+            const expanded = card.component.render(width);
+            const expandedLabel = `${family} expanded width ${width} wide-emoji reason`;
+            assertInstalledCellWidths(expanded, width, expandedLabel);
+            assertContinuousBackground(expanded, successBg, 1, expandedLabel);
+            assertNoBrokenGraphemes(expanded, expandedLabel);
+            assertReasonRetained(expanded, card.annotationText, expandedLabel);
+            for (const grapheme of WIDE_TOKENS) {
+              assertWholeGraphemesPerRow(expanded, grapheme, 30, expandedLabel);
+            }
+
+            // The canonical, model-visible annotation is never rewritten by the
+            // display wrap, before or after rendering.
+            const canonical = (card.annotated.content as Array<Record<string, unknown>>)[0]!.text as string;
+            assert.equal(canonical, card.annotationText, `${label}: rendering never rewrites the canonical annotation`);
+            assert.ok(canonical.includes(WIDE_EMOJI_REASON), `${label}: the canonical reason keeps every emoji code point`);
+            assert.deepEqual(card.event.content, card.originalContent,
+              `${label}: the emitted tool_result content is never mutated`);
+          }
+        }
       });
     });
   });

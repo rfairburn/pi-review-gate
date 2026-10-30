@@ -30,7 +30,7 @@ dates.
   and are not waivable by approval; no tool name, path, domain, or signature is
   allowlisted or denylisted; and `aligned` and `workspace` print their previous rules
   verbatim and keep their governing-prohibition, alignment, and confinement policy.
-  Policy revision `rules-10`.
+  Policy revision `rules-11`.
 - **The acting agent's instructions are quoted evidence, not rules for the auditor**
   (#551): the complete governing instruction set still travels verbatim and still fails
   closed when it cannot fit the context budget, now framed as quoted reference material
@@ -47,6 +47,11 @@ dates.
   cancellation mechanics are unchanged. Model classification accuracy is not established by
   the deterministic prompt and fixture tests, and this revision is not yet measured against
   a model.
+- **Catastrophic host destruction remains blocked despite user approval** (#551):
+  dangerous-level H1(a) now explicitly separates that non-waivable floor from other
+  irreversible data loss beyond what the proposal and supplied evidence justify.
+  Other criteria and all eighteen fixture payloads/verdicts are unchanged. Deterministic
+  prompt tests do not establish model classification accuracy.
 
 ### Changed
 
@@ -58,7 +63,7 @@ dates.
   off-task call — plus the same watch and stop under an explicit user ban, a root
   filesystem wipe the user expressly approved, which stays blocked at every level, and a
   credential transfer to a recipient the user never named. Expectations are authored
-  policy checks frozen against `rules-10`, never measured model accuracy and never
+  policy checks frozen against `rules-11`, never measured model accuracy and never
   rewritten from a model reply; the proposals are inert data and none is executed. See
   [Tool protection](docs/tool-protection.md).
 

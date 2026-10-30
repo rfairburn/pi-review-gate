@@ -1295,7 +1295,17 @@ test("lifecycle: a report-only revised report reaches a real second review witho
     // Report-only task: the deliverable is the report text, written outside the
     // candidate worktree. The candidate tree stays identical to base.
     const reportPath = join(root, "report.md");
+    // A report-only turn must never need a dummy workspace edit, and a report
+    // claim must never approve itself: each turn records the worktree state and
+    // whether any worker landing ref exists yet.
+    const worktreeStateBeforeEachTurn: string[] = [];
+    const landingRefBeforeEachTurn: string[] = [];
     const adapter = installLifecycleAdapter(async (request, turn) => {
+      worktreeStateBeforeEachTurn.push(await git(["status", "--porcelain", "--untracked-files=all"], request.cwd));
+      landingRefBeforeEachTurn.push(await gitInRepo(
+        ["rev-parse", "--verify", "--quiet", workerRefName(capture.waveId, "task-report-only")],
+        capture.repositoryPath,
+      ).catch(() => ""));
       if (turn === 1) {
         request.onToolObservation?.({ stage: "start", toolName: "write", toolInput: { path: reportPath, content: "Draft report v1\n" } });
         await writeFile(reportPath, "Draft report v1\n", "utf8");
@@ -1304,11 +1314,16 @@ test("lifecycle: a report-only revised report reaches a real second review witho
       }
       if (turn === 2) {
         // The reviewer asked for a revised report, not source edits.
-        return "Revised report: the blocking finding is addressed and no source change was needed.";
+        return "Revised report v2: the blocking finding is answered by re-checking the read-only analysis; no source change was needed.";
+      }
+      if (turn === 3) {
+        // The reviewer is still blocking the first revision, so a further
+        // revised report is the corrective contribution — still with no write.
+        return "Revised report v3: the second blocking finding is answered with the added comparison table; still no source change.";
       }
       return "Acknowledged the reviewed report.";
     });
-    const config = buildConfig(process.execPath, "fake-exec", [scriptedReviewer(root, ["needs_changes", "pass"])], [{ source: "external", id: "scripted" }]);
+    const config = buildConfig(process.execPath, "fake-exec", [scriptedReviewer(root, ["needs_changes", "needs_changes", "pass"])], [{ source: "external", id: "scripted" }]);
     config.maxCorrectionCycles = 30;
 
     const result = await runWaveWorkerLifecycle({
@@ -1321,26 +1336,49 @@ test("lifecycle: a report-only revised report reaches a real second review witho
       config,
     });
 
-    assert.deepEqual(result.reviewCycles.map((cycle) => cycle.verdict), ["needs_changes", "pass"],
-      `expected a reviewed revised report, got ${result.status}: ${result.error}`);
-    assert.equal(adapter.turns(), 3, "initial turn, corrective turn, and one pass confirmation");
+    assert.deepEqual(result.reviewCycles.map((cycle) => cycle.verdict), ["needs_changes", "needs_changes", "pass"],
+      `expected two real blocking verdicts and a real pass, got ${result.status}: ${result.error}`);
+    assert.equal(adapter.turns(), 4, "initial turn, two corrective report turns, and one pass confirmation");
+    // A blocking verdict stays blocking and lands nothing: the executor's own
+    // report claim never became an approval.
+    assert.equal(adapter.feedback.length, 4);
+    assert.doesNotMatch(adapter.feedback[0]!, /Gate verdict:/);
+    assert.match(adapter.feedback[1]!, /Gate verdict: needs_changes/);
+    assert.match(adapter.feedback[1]!, /the corrected result still needs revision/);
+    assert.match(adapter.feedback[2]!, /Gate verdict: needs_changes/);
+    assert.match(adapter.feedback[3]!, /Gate verdict: pass/);
     // A file-free reviewed result settles without a fabricated commit or ref.
     assert.equal(result.status, "no_changes", `expected the canonical no-file outcome, got ${result.status}`);
     assert.equal(result.acceptedRef, undefined);
     assert.equal(result.acceptedCommitSha, undefined);
-    assert.equal(await git(["status", "--porcelain", "--untracked-files=all"], worker.worktreeRoot), "",
+    assert.deepEqual(worktreeStateBeforeEachTurn, ["", "", "", ""],
       "no dummy workspace edit may be required to reach review");
-    // The second review actually received the revised report claim.
+    assert.deepEqual(landingRefBeforeEachTurn, ["", "", "", ""],
+      "no landing ref may exist while review is still asking for changes");
+    assert.equal(await git(["status", "--porcelain", "--untracked-files=all"], worker.worktreeRoot), "",
+      "the worktree is still untouched after settlement");
+    assert.equal(await gitInRepo(
+      ["rev-parse", "--verify", "--quiet", workerRefName(capture.waveId, "task-report-only")],
+      capture.repositoryPath,
+    ).catch(() => ""), "", "a file-free result never pins a landing ref");
+    // Every assessed contribution carried the same unchanged candidate tree,
+    // so only the revised report claim distinguished it.
+    assert.equal(new Set(result.reviewCycles.map((cycle) => cycle.candidateTreeSha)).size, 1,
+      "each revised report was reviewed against the identical unchanged tree");
+    // Each review actually received the report claim it judged.
     const proofs = await reviewerProof(root);
-    assert.equal(proofs.length, 2, "a real second reviewer invocation must assess the revised report");
-    assert.match(proofs[1]!.evidence.finalAssistantSummaries.join("\n"), /Revised report: the blocking finding is addressed/);
-    assert.match(proofs[1]!.markdown, /Revised report: the blocking finding is addressed/);
+    assert.equal(proofs.length, 3, "each revised report must reach a real reviewer invocation");
+    assert.match(proofs[0]!.evidence.finalAssistantSummaries.join("\n"), /Draft report delivered/);
+    assert.match(proofs[1]!.evidence.finalAssistantSummaries.join("\n"), /Revised report v2/);
+    assert.match(proofs[1]!.markdown, /Revised report v2/);
+    assert.match(proofs[2]!.evidence.finalAssistantSummaries.join("\n"), /Revised report v3/);
+    assert.match(proofs[2]!.markdown, /Revised report v3/);
     // The report is an external side-effect candidate, never an in-root delta.
-    assert.equal(proofs[1]!.evidence.candidates.some((candidate) => candidate.path.endsWith("report.md") && candidate.externalSideEffect === true), true,
+    assert.equal(proofs[2]!.evidence.candidates.some((candidate) => candidate.path.endsWith("report.md") && candidate.externalSideEffect === true), true,
       "the external report must remain an observed outside-root side effect");
-    assert.equal(proofs[1]!.evidence.changedCandidatePaths.some((path) => path.includes("report.md")), false,
+    assert.equal(proofs[2]!.evidence.changedCandidatePaths.some((path) => path.includes("report.md")), false,
       "the external report must not be treated as an in-workspace changed path");
-    assert.doesNotMatch(proofs[1]!.patch, /report\.md/);
+    assert.doesNotMatch(proofs[2]!.patch, /report\.md/);
 
     await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
   } finally {
@@ -1357,7 +1395,14 @@ test("lifecycle: checks-only progress with an unchanged tree and unchanged obser
     const artifactDir = join(capture.waveRoot, "artifacts", "task-checks-only");
     await mkdir(artifactDir, { recursive: true });
 
+    // Every turn below runs before acceptance, so each turn also records
+    // whether any worker landing ref exists yet.
+    const landingRefBeforeEachTurn: string[] = [];
     const adapter = installLifecycleAdapter(async (request, turn) => {
+      landingRefBeforeEachTurn.push(await gitInRepo(
+        ["rev-parse", "--verify", "--quiet", workerRefName(capture.waveId, "task-checks-only")],
+        capture.repositoryPath,
+      ).catch(() => ""));
       if (turn === 1) {
         await observedWorktreeWrite(request, "SCRIPT", "checkable\n");
         return "SCRIPT updated.";
@@ -1368,11 +1413,18 @@ test("lifecycle: checks-only progress with an unchanged tree and unchanged obser
         request.onToolObservation?.({ stage: "start", toolName: "bash", toolInput: { command: "npm run check:static" } });
         request.onToolObservation?.({ stage: "end", toolName: "bash", toolInput: { command: "npm run check:static" }, result: "checks passed" });
       }
+      if (turn === 3) {
+        // The reviewer is still blocking the checks-only correction, so this
+        // next handoff contributes a further real check and still no delta.
+        request.onToolObservation?.({ stage: "start", toolName: "bash", toolInput: { command: "npm run build:test" } });
+        request.onToolObservation?.({ stage: "end", toolName: "bash", toolInput: { command: "npm run build:test" }, result: "focused tests passed" });
+      }
       return "SCRIPT updated.";
     });
-    const config = buildConfig(process.execPath, "fake-exec", [scriptedReviewer(root, ["needs_changes", "pass"])], [{ source: "external", id: "scripted" }]);
+    const config = buildConfig(process.execPath, "fake-exec", [scriptedReviewer(root, ["needs_changes", "needs_changes", "pass"])], [{ source: "external", id: "scripted" }]);
     config.maxCorrectionCycles = 30;
 
+    const updates: Array<{ phase: string; message: string }> = [];
     const result = await runWaveWorkerLifecycle({
       sourceRoot: capture.discovery.captureRoot,
       taskId: "task-checks-only",
@@ -1381,23 +1433,66 @@ test("lifecycle: checks-only progress with an unchanged tree and unchanged obser
       worktree: worker,
       artifactDir,
       config,
+      onUpdate: (update) => updates.push(update),
     });
 
-    assert.equal(result.status, "accepted", `expected accepted after the checked correction, got ${result.status}: ${result.error}`);
-    assert.deepEqual(result.reviewCycles.map((cycle) => cycle.verdict), ["needs_changes", "pass"]);
-    assert.equal(adapter.turns(), 3);
-    const [first, second] = result.reviewCycles;
+    assert.equal(result.status, "accepted", `expected accepted after two reviewed corrections, got ${result.status}: ${result.error}`);
+    assert.deepEqual(result.reviewCycles.map((cycle) => cycle.verdict), ["needs_changes", "needs_changes", "pass"],
+      "a second blocking verdict must stay blocking and the next corrective handoff must be allowed");
+    assert.equal(adapter.turns(), 4, "initial turn, two corrective handoffs, and one pass acknowledgement");
+    assert.deepEqual(landingRefBeforeEachTurn, ["", "", "", ""],
+      "no unapproved landing ref may exist before the passing review");
+
+    // Exact executor/reviewer sequence: each corrective turn received the
+    // blocking verdict it had to answer, and the last turn received the pass.
+    assert.equal(adapter.feedback.length, 4);
+    assert.doesNotMatch(adapter.feedback[0]!, /Gate verdict:/);
+    assert.match(adapter.feedback[1]!, /Gate verdict: needs_changes/);
+    assert.match(adapter.feedback[1]!, /the corrected result still needs revision/);
+    assert.match(adapter.feedback[2]!, /Gate verdict: needs_changes/);
+    assert.match(adapter.feedback[3]!, /Gate verdict: pass/);
+    const progress = updates.map((update) => `${update.phase}:${update.message}`);
+    for (const expected of [
+      "reviewing:review cycle 1",
+      "correcting:correction 1/30",
+      "reviewing:review cycle 2",
+      "correcting:correction 2/30",
+      "reviewing:review cycle 3",
+      "confirming:review passed — confirming unchanged tree",
+    ]) {
+      assert.ok(progress.includes(expected), `expected progress ${expected}, got ${JSON.stringify(progress)}`);
+    }
+    assert.ok(!updates.some((update) => /No progress|Correction cap/.test(update.message)),
+      "the loop stops for neither a repeated contribution nor the numeric budget");
+
+    const [first, second, third] = result.reviewCycles;
     assert.equal(second!.candidateTreeSha, first!.candidateTreeSha, "the candidate tree is unchanged");
-    assert.equal(second!.toolObservationRevision, first!.toolObservationRevision,
-      "a checks-only observation does not move the mutation-path revision");
-    assert.equal(second!.externalObservationRevision, first!.externalObservationRevision,
-      "an in-workspace check is not external scope");
-    // The second reviewer actually saw the checks that justified new review.
+    assert.equal(third!.candidateTreeSha, first!.candidateTreeSha, "the second correction also changes no file");
+    for (const cycle of result.reviewCycles) {
+      assert.equal(cycle.toolObservationRevision, first!.toolObservationRevision,
+        "a checks-only observation does not move the mutation-path revision");
+      assert.equal(cycle.externalObservationRevision, first!.externalObservationRevision,
+        "an in-workspace check is not external scope");
+    }
+    // Every review actually assessed the checks that justified further review.
     const proofs = await reviewerProof(root);
-    assert.equal(proofs.length, 2);
+    assert.equal(proofs.length, 3, "each correction must reach a real subsequent reviewer invocation");
+    assert.deepEqual(proofs.map((proof) => proof.evidence.finalAssistantSummaries.at(-1)),
+      ["SCRIPT updated.", "SCRIPT updated.", "SCRIPT updated."],
+      "the retained report claim is identical for every assessed contribution");
+    assert.ok(!proofs[0]!.evidence.events.some((event) => event.toolName === "bash"),
+      "the initial review had no check observation to assess");
     assert.match(proofs[1]!.markdown, /npm run check:static/);
     assert.ok(proofs[1]!.evidence.events.some((event) => event.toolName === "bash"),
       "the real check events must be retained evidence for the subsequent review");
+    assert.match(proofs[2]!.markdown, /npm run check:static/);
+    assert.match(proofs[2]!.markdown, /npm run build:test/);
+    assert.deepEqual(proofs[2]!.evidence.changedCandidatePaths, proofs[0]!.evidence.changedCandidatePaths,
+      "the corrections added no workspace change for the passing review to land");
+    // Acceptance pins exactly the candidate that passed the final review.
+    assert.equal(result.acceptedRef, workerRefName(capture.waveId, "task-checks-only"));
+    assert.equal(result.acceptedCommitSha, result.reviewCycles.at(-1)!.candidateCommit,
+      "the pinned ref is the candidate the passing review assessed");
 
     await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
   } finally {

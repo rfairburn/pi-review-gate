@@ -96,8 +96,9 @@ import {
 import { extractContext, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolCallId, extractToolName, registerHook } from "../pi";
 import { isToolCallFingerprint, toolCallFingerprint } from "../tool-call-fingerprint";
 import { isRecord } from "../record-guard";
-import { wrapPreserving } from "../tool-result-wrap";
+import { wrapAtWordBoundaries } from "../tool-result-wrap";
 import { visibleTerminalText } from "../tool-result-text";
+import { expansionHint, nativeImageDisclosure, visibleLineWidth, wrapAnsiAwareRows } from "../presentation-hints";
 
 /** Private one-shot transport for the parent-pinned delegated Pi executor gate. */
 export const TOOL_PROTECTION_BOOTSTRAP_ENV = "PI_REVIEW_GATE_TOOL_PROTECTION";
@@ -1449,14 +1450,25 @@ export class ToolProtectionCoordinator {
     try {
       register((_toolName, next) => {
         const base = next();
-        if (!isRecord(base) || typeof base.renderResult !== "function") return base;
-        const baseRender = base.renderResult.bind(base) as (...callArgs: any[]) => unknown;
+        if (!isRecord(base)) return base;
+        const baseRender = typeof base.renderResult === "function"
+          ? base.renderResult.bind(base) as (...callArgs: any[]) => unknown
+          : undefined;
+        // Pi picks the row shell from the resolved renderers
+        // (tool-execution.js getRenderShell). `"self"` — the native edit tool —
+        // means the tool draws its own framing and the host paints nothing
+        // around it, so this decoration has to paint its own rows and the body
+        // rows it emits; `"default"` means the host's Box pads and paints every
+        // row of its children, including these, so the decoration must not add
+        // a second padding or background layer.
+        const selfShell = base.renderShell === "self";
         return {
           ...base,
           // Thin decoration only: draw the safely encoded gate lines above the
           // remaining renderer, and give that renderer an immutable copy without
           // the same lines so native result content is not shown twice. Display
-          // spacing and theme styling only — no model-visible text changes here.
+          // spacing, wrapping and theme styling only — no model-visible text
+          // changes here.
           renderResult: (...callArgs: any[]) => {
             const result = callArgs[0];
             const annotation = annotationDisplayFromResult(result);
@@ -1471,33 +1483,50 @@ export class ToolProtectionCoordinator {
             const state = isRecord(context) && isRecord(context.state)
               ? context.state as Record<string | symbol, unknown>
               : undefined;
-            const baseArgs = callArgs.slice(1);
-            if (state !== undefined && baseArgs.length >= 3) {
-              baseArgs[2] = { ...context, lastComponent: state[ANNOTATION_DISPLAY_INNER] };
+            let inner: AnnotationDisplayComponent | undefined;
+            if (baseRender !== undefined) {
+              const baseArgs = callArgs.slice(1);
+              if (state !== undefined && baseArgs.length >= 3) {
+                baseArgs[2] = { ...context, lastComponent: state[ANNOTATION_DISPLAY_INNER] };
+              }
+              const component = baseRender(annotation ? annotation.view : result, ...baseArgs);
+              if (state !== undefined) state[ANNOTATION_DISPLAY_INNER] = component;
+              if (!annotation || !isRecord(component) || typeof component.render !== "function") return component;
+              inner = component as unknown as AnnotationDisplayComponent;
+            } else if (annotation === undefined) {
+              // A definition with no result renderer (the host's own text
+              // fallback draws the row): an unannotated result keeps the host's
+              // presentation exactly. Pi catches a renderer failure and renders
+              // its native fallback, so handing the row back beats reproducing
+              // that fallback here and cannot drift from it.
+              throw new Error("pi-review-gate: the native result fallback owns this unannotated result");
             }
-            const component = baseRender(annotation ? annotation.view : result, ...baseArgs);
-            if (state !== undefined) state[ANNOTATION_DISPLAY_INNER] = component;
-            if (!annotation || !isRecord(component) || typeof component.render !== "function") return component;
             // Pi's native renderResult signature is (result, options, theme,
             // context); the collapsed view is everything that is not explicitly
             // expanded.
             const expanded = isRecord(callArgs[1]) && callArgs[1].expanded === true;
-            const inner = component as unknown as {
-              render(width: number): string[];
-              invalidate?(): void;
-              handleInput?(data: string): void;
-            };
+            // Pi hands the live theme to renderResult as its third argument.
+            // Use its ordinary semantic tokens so the audit rows read like
+            // native status text; a lightweight host/mock without a theme keeps
+            // the plain rows. The verdict comes from the annotation line itself,
+            // so a nested FAIL, a NOT AUDITED row, or a recording warning is
+            // never shown as success merely because the tool returned normally.
+            const theme = annotationDisplayTheme(callArgs[2]);
+            // A self-shell row is painted by whoever draws it, so the gate rows
+            // and the body rows below them use the host's own semantic row
+            // background — pending while the tool runs, error for a failed
+            // result, success otherwise — exactly the tokens
+            // ToolExecutionComponent picks for its default shell.
+            const background = selfShell ? annotationDisplayBackground(theme, callArgs[1], context) : undefined;
+            const padding = background === undefined ? 0 : annotationDisplayPadding(context);
             return {
               render(width: number): string[] {
-                // Pi hands the live theme to renderResult as its third argument.
-                // Use its ordinary semantic tokens so the audit rows read like
-                // native status text; a lightweight host/mock without a theme
-                // keeps the plain rows. The verdict comes from the annotation
-                // line itself, so a nested FAIL, a NOT AUDITED row, or a
-                // recording warning is never shown as success merely because
-                // the tool returned normally.
-                const theme = annotationDisplayTheme(callArgs[2]);
-                return [
+                // The card's own horizontal inset, and the width the text has
+                // to fit in: the host's Box already shrank the width for its
+                // default shell, a self-shell row owns its own padding.
+                const pad = Math.min(padding, Math.max(0, Math.floor((width - 1) / 2)));
+                const contentWidth = Math.max(1, width - pad * 2);
+                const auditRows = [
                   // Collapsed only: one blank line so the gate status does not
                   // start on the row directly under the tool-call/argument
                   // preview above. An expanded render keeps its existing spacing,
@@ -1508,17 +1537,26 @@ export class ToolProtectionCoordinator {
                   // text and order are unchanged.
                   ...annotation.lines.flatMap((line) => {
                     const color = annotationDisplayColor(line);
-                    return wrapPreserving(visibleTerminalText(line), width)
-                      .map((chunk) => theme === undefined ? chunk : theme.fg(color, chunk));
+                    return wrapAtWordBoundaries(visibleTerminalText(line), contentWidth)
+                      .map((chunk) => `${" ".repeat(pad)}${theme === undefined ? chunk : theme.fg(color, chunk)}`);
                   }),
-                  ...inner.render(width),
                 ];
+                const bodyRows = inner !== undefined
+                  ? inner.render(width)
+                  : annotationFallbackRows(annotation.view, theme, expanded, context, contentWidth, pad);
+                const rows = [...auditRows, ...bodyRows];
+                // A self-shell row otherwise sits on the terminal's own
+                // background, which breaks the card apart: paint every emitted
+                // row — audit rows, the blank separator, and the body rows the
+                // inner renderer emits — to the full row width so the themed
+                // card stays continuous including its gaps.
+                return background === undefined ? rows : rows.map((row) => paintAnnotationRow(row, width, background));
               },
               invalidate(): void {
-                inner.invalidate?.();
+                inner?.invalidate?.();
               },
-              ...(typeof inner.handleInput === "function"
-                ? { handleInput: (data: string) => inner.handleInput!(data) }
+              ...(typeof inner?.handleInput === "function"
+                ? { handleInput: (data: string) => inner!.handleInput!(data) }
                 : {}),
             };
           },
@@ -1782,8 +1820,19 @@ const SAVE_WARNING_PATTERN = /Tool protection: the auditor session (?:could not 
 /** Theme subset the audit-status rows use; matches Pi's `theme.fg()` contract. */
 type AnnotationDisplayColor = "accent" | "error" | "muted" | "success" | "warning";
 
+/** Row backgrounds Pi's own tool row uses; matches `theme.bg()` tokens. */
+type AnnotationDisplayBackground = "toolErrorBg" | "toolPendingBg" | "toolSuccessBg";
+
 interface AnnotationDisplayTheme {
   fg(color: AnnotationDisplayColor, text: string): string;
+  bg?(color: AnnotationDisplayBackground, text: string): string;
+}
+
+/** The structural component shape this decoration wraps or replaces. */
+interface AnnotationDisplayComponent {
+  render(width: number): string[];
+  invalidate?(): void;
+  handleInput?(data: string): void;
 }
 
 /**
@@ -1822,6 +1871,163 @@ function annotationDisplayColor(line: string): AnnotationDisplayColor {
   if (/^- RETENTION LOSS:/.test(line)) return "warning";
   if (/^- \d+ earlier nested decision\(s\) omitted/.test(line)) return "muted";
   return "accent";
+}
+
+/**
+ * The row background for a tool that draws its own shell. These are the same
+ * semantic tokens `ToolExecutionComponent.updateDisplay()` chooses for the
+ * default shell — pending while the tool is still producing output, error for a
+ * failed result, success otherwise — so the gate rows continue the card instead
+ * of sitting on the terminal's own background. `PASS` still means the audit
+ * decision, never that the tool succeeded: a failed tool keeps the error row
+ * background while its `Tool protection: PASS` line keeps the success token.
+ */
+function annotationDisplayBackground(
+  theme: AnnotationDisplayTheme | undefined,
+  options: unknown,
+  context: unknown,
+): ((text: string) => string) | undefined {
+  if (theme === undefined || typeof theme.bg !== "function") return undefined;
+  const color: AnnotationDisplayBackground = isRecord(options) && options.isPartial === true
+    ? "toolPendingBg"
+    : isRecord(context) && context.isError === true
+      ? "toolErrorBg"
+      : "toolSuccessBg";
+  try {
+    const sample = theme.bg(color, "");
+    if (typeof sample !== "string") return undefined;
+  } catch {
+    // A theme that cannot supply the token leaves the rows unpainted rather
+    // than breaking the host's render path.
+    return undefined;
+  }
+  return (text) => theme.bg!(color, text);
+}
+
+/**
+ * The card's own horizontal inset, taken from the host's `outputPad` render
+ * context (the same value the native edit header and body use). Rows are
+ * painted to the full width, so only the leading inset is added here.
+ */
+function annotationDisplayPadding(context: unknown): number {
+  const pad = isRecord(context) ? context.outputPad : undefined;
+  return typeof pad === "number" && Number.isInteger(pad) && pad > 0 ? pad : 0;
+}
+
+/**
+ * Pads one rendered row to the full row width and paints the row background
+ * over the whole line, including the gap rows, the way Pi's own `Box` does.
+ * Width is measured with the host's cell-width helper, so theme escapes and
+ * wide glyphs never count as padding.
+ */
+function paintAnnotationRow(row: string, width: number, background: (text: string) => string): string {
+  const cells = visibleLineWidth(row);
+  const filler = Math.max(0, width - (Number.isFinite(cells) ? cells : row.length));
+  return background(`${row}${" ".repeat(filler)}`);
+}
+
+/**
+ * Pi's collapsed fallback preview height for a tool without a result renderer
+ * (`tool-execution.js createResultFallback`). Mirrored, not imported: the agent
+ * package does not export the fallback, and the bound is part of the
+ * presentation this decoration has to match.
+ */
+const NATIVE_FALLBACK_PREVIEW_LINES = 10;
+
+/**
+ * The display rows for an audited result whose tool declares no result
+ * renderer (the extension-owned `YouShouldKnow` notice is the shipped case).
+ * Without a renderer here the host's own fallback would paint the whole text
+ * block — including the gate's status line — as ordinary tool output, so the
+ * decoration supplies the same native conventions itself: sanitized text in the
+ * tool-output colour, the collapsed ten-line preview with its omission hint, the
+ * complete text when expanded, nothing for empty output, and Pi's image
+ * indicator when inline images are turned off. Only the gate's own lines are
+ * re-styled with their semantic tokens; every other row keeps the native
+ * colour, and the model-visible result is never touched.
+ */
+function annotationFallbackRows(
+  view: unknown,
+  theme: AnnotationDisplayTheme | undefined,
+  expanded: boolean,
+  context: unknown,
+  width: number,
+  pad: number,
+): string[] {
+  if (!isRecord(view) || !Array.isArray(view.content)) return [];
+  const indent = " ".repeat(pad);
+  const style = (color: AnnotationDisplayColor | "toolOutput", line: string): string => {
+    if (theme === undefined) return line;
+    try {
+      return theme.fg(color as AnnotationDisplayColor, line);
+    } catch {
+      return line;
+    }
+  };
+  const textBlocks = view.content.filter((item) => isRecord(item) && item.type === "text" && typeof item.text === "string");
+  // Image blocks the host will not draw are named inside the text output, the
+  // way Pi's own text output does (capability and toggle both considered).
+  const imageIndicators = annotationImageIndicators(view, context);
+  const rows: string[] = [];
+  const text = [
+    // The same display encoding the gate rows use: control bytes stay visible
+    // as inert notation instead of reaching the terminal, and tabs are widened
+    // the way the host's own text component widens them.
+    ...textBlocks.map((item) => visibleTerminalText((item as { text: string }).text).replace(/\t/g, "   ")),
+    ...imageIndicators,
+  ].join("\n");
+  if (text.length > 0) {
+    const lines = text.split("\n");
+    const shown = expanded ? lines : lines.slice(0, NATIVE_FALLBACK_PREVIEW_LINES);
+    for (const line of shown) {
+      for (const chunk of wrapAtWordBoundaries(line, width)) rows.push(`${indent}${style("toolOutput", chunk)}`);
+    }
+    const omitted = lines.length - shown.length;
+    if (omitted > 0) {
+      // One matching parenthesis pair, and the complete styled row wrapped
+      // through the host's own ANSI-aware wrapper: a long configured expansion
+      // binding can never emit a row wider than the card, and no dangling
+      // parenthesis is left when the hint is unavailable.
+      const hint = theme === undefined
+        ? undefined
+        : expansionHint(false, (color, hintText) => theme.fg(color as AnnotationDisplayColor, hintText));
+      const label = style("muted", `... (${omitted} more lines)`);
+      const hintRow = hint === undefined ? label : `${label} ${hint}`;
+      for (const chunk of wrapAnsiAwareRows(hintRow, width)) rows.push(`${indent}${chunk}`);
+    }
+  }
+  return rows;
+}
+
+/**
+ * The image blocks this fallback has to name. Pi's own text output adds one
+ * indicator per image block when the terminal cannot draw images at all or
+ * inline images are turned off, and the host then draws nothing for them. Both
+ * conditions come from the running host, and the indicator text is the host's
+ * own (with the dimensions it can decode). Without a resolvable host peer the
+ * capability is genuinely unknown, so only the toggle the host hands us applies
+ * and the mime type alone is named — an audited image is never dropped from the
+ * human view silently.
+ */
+function annotationImageIndicators(view: unknown, context: unknown): string[] {
+  if (!isRecord(view) || !Array.isArray(view.content)) return [];
+  const content = view.content as unknown[];
+  const blocks = content.filter((item) => isRecord(item) && item.type === "image");
+  if (blocks.length === 0) return [];
+  const showImages = !(isRecord(context) && context.showImages === false);
+  const disclosure = nativeImageDisclosure();
+  if (disclosure === undefined) {
+    return showImages ? [] : blocks.map((item) => `[Image: [${annotationImageMimeType(item)}]]`);
+  }
+  if (disclosure.imagesSupported && showImages) return [];
+  return blocks.map((item) => disclosure.indicator(
+    annotationImageMimeType(item),
+    isRecord(item) && typeof item.data === "string" ? item.data : undefined,
+  ));
+}
+
+function annotationImageMimeType(item: unknown): string {
+  return isRecord(item) && typeof item.mimeType === "string" ? item.mimeType : "image/unknown";
 }
 
 /**

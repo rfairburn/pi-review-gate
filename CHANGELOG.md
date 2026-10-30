@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.224]
+
+### Fixed
+
+- **Integrated tool-protection audit cards** (#547): native edit audit rows continue
+  the themed result background beneath the native title and diff. Extension-owned
+  tools receive the same semantic audit foreground styling, and audit text wraps at
+  word boundaries within the result width. Canonical results, supplied reasons,
+  audit decisions, error semantics, and unaudited output are unchanged.
+
 ## [0.1.0-dev.223]
 
 ### Fixed

@@ -38,7 +38,8 @@ import type {
   AuditorRecordWriteResult,
 } from "../src/tool-protection/session-record";
 import { createExecutorAdapter } from "../src/execution/adapters/factory";
-import { wrapPreserving } from "../src/tool-result-wrap";
+import { wrapAtWordBoundaries } from "../src/tool-result-wrap";
+import { setNativeExpansionHost } from "../src/presentation-hints";
 import { visibleTerminalText } from "../src/tool-result-text";
 
 type HookHandler = (...args: unknown[]) => unknown;
@@ -958,11 +959,26 @@ test("audit status rows use the supplied theme's existing semantic tokens", () =
   const wrapped = renderText(longLine, theme, width);
   const rows = wrapped.slice(1, -1);
   assert.ok(rows.length > 1, "the long annotation wraps into several styled rows");
+  const plainRows = rows.map((row) => row.replace(/^<warning>/, "").replace(/<\/warning>$/, ""));
   assert.deepEqual(
-    rows.map((row) => row.replace(/^<warning>/, "").replace(/<\/warning>$/, "")),
-    wrapPreserving(visibleTerminalText(longLine), width),
+    plainRows,
+    wrapAtWordBoundaries(visibleTerminalText(longLine), width),
     "wrapping uses the sanitized plain text, not the styled string",
   );
+  // The annotation is a sentence, not a blob: it reflows at word boundaries
+  // like the native tool rows around it, and never splits a word.
+  assert.equal(plainRows.join(" "), visibleTerminalText(longLine),
+    "word-boundary wrapping keeps every word and drops only the space it broke on");
+  for (const [index, row] of plainRows.entries()) {
+    assert.ok(row.length <= width, `wrapped row ${index + 1} fits the render width`);
+    if (index + 1 < plainRows.length) assert.notEqual(row.at(-1), " ", "a wrapped row carries no trailing break space");
+  }
+  const longToken = `Tool protection: PASS — ${"unbreakable".repeat(12)} reason`;
+  const tokenRows = renderText(longToken, theme, width).slice(1, -1).map((row) => row.replace(/^<success>/, "").replace(/<\/success>$/, ""));
+  assert.ok(tokenRows.every((row) => row.length <= width),
+    "a token wider than the width is still broken so no row exceeds the terminal");
+  assert.equal(tokenRows.join("").replace(/\s+/g, ""), visibleTerminalText(longToken).replace(/\s+/g, ""),
+    "the unavoidable long-token break never drops a non-space character");
   for (const row of rows) assert.match(row, /^<warning>.*<\/warning>$/,
     "every wrapped physical row carries the semantic token");
 
@@ -977,6 +993,154 @@ test("audit status rows use the supplied theme's existing semantic tokens", () =
   render(original, theme);
   assert.deepEqual(original.content, [{ type: "text", text: passText }],
     "the annotation text handed to the renderer is never rewritten");
+});
+
+/** A self-shell double: `bg()` marks the row, `fg()` marks the text. */
+function paintedTheme() {
+  return {
+    fg(color: string, text: string): string { return `<${color}>${text}</${color}>`; },
+    bg(color: string, text: string): string { return `[${color}]${text}[/${color}]`; },
+  };
+}
+
+test("a self-shell card paints every emitted row to the full width", () => {
+  const host = fakeHost({ rendererRegistry: true });
+  const { coordinator } = coordinatorHarness();
+  coordinator.registerHooks(host.pi);
+  const resolver = host.pi.__rendererResolver as (
+    toolName: string,
+    next: () => unknown,
+  ) => { renderResult?: (...args: unknown[]) => { render(width: number): string[] } };
+  const nativeBody = ["native result body", ""];
+  const decorated = resolver("edit", () => ({
+    renderShell: "self",
+    renderResult: () => ({ render: () => nativeBody }),
+  }));
+  assert.ok(decorated?.renderResult);
+  const theme = paintedTheme();
+  const passText = "Tool protection: PASS — synthetic approval with a long enough reason to wrap at a narrow width.";
+  const annotated = { content: [{ type: "text" as const, text: passText }] };
+  const rows = decorated.renderResult!(
+    annotated,
+    { expanded: false, isPartial: false },
+    theme,
+    { expanded: false, isError: false, outputPad: 1, showImages: true },
+  ).render(30);
+  assert.ok(rows.length > 4, "the card emits separator, audit and body rows");
+  const innerOf = (row: string) => row.replace(/^\[toolSuccessBg\]/, "").replace(/\[\/toolSuccessBg\]$/, "");
+  for (const row of rows) {
+    assert.match(row, /^\[toolSuccessBg\].*\[\/toolSuccessBg\]$/,
+      "every emitted row carries the row background, so the themed card has no ordinary-background holes");
+    assert.ok(innerOf(row).length >= 30,
+      "every row — audit rows, the blank gap row, and the native body rows — is padded to the full row width");
+  }
+  const auditRow = rows.find((row) => row.includes("PASS"))!;
+  assert.match(auditRow, /^\[toolSuccessBg\] <success>/, "the audit row keeps its own foreground inside the painted row");
+  assert.ok(rows.some((row) => row.includes("[toolSuccessBg] <success>")) && rows.some((row) => row.includes("native result body")),
+    "the native body rows are still emitted after the audit rows");
+  const errorRows = decorated.renderResult!(
+    annotated,
+    { expanded: false, isPartial: false },
+    theme,
+    { expanded: false, isError: true, outputPad: 1, showImages: true },
+  ).render(30);
+  assert.ok(errorRows.every((row) => row.startsWith("[toolErrorBg]")),
+    "a failed tool paints the error row background while the PASS line keeps its success token");
+  assert.ok(errorRows.some((row) => row.includes("<success>Tool protection: PASS")));
+  const partialRows = decorated.renderResult!(
+    annotated,
+    { expanded: false, isPartial: true },
+    theme,
+    { expanded: false, isError: false, outputPad: 1, showImages: true },
+  ).render(30);
+  assert.ok(partialRows.every((row) => row.startsWith("[toolPendingBg]")), "a running tool uses the pending row background");
+  // A default-shell row is painted and padded by the host's own Box; the
+  // decoration must not add a second layer.
+  const defaultShell = resolver("read", () => ({ renderResult: () => ({ render: () => nativeBody }) }));
+  const defaultRows = defaultShell!.renderResult!(
+    annotated,
+    { expanded: false, isPartial: false },
+    theme,
+    { expanded: false, isError: false, outputPad: 1, showImages: true },
+  ).render(30);
+  assert.ok(defaultRows.every((row) => !row.includes("toolSuccessBg")),
+    "the default shell keeps the host's own background and padding untouched");
+});
+
+test("an audited tool without a result renderer keeps native fallback conventions", () => {
+  const host = fakeHost({ rendererRegistry: true });
+  const { coordinator } = coordinatorHarness();
+  coordinator.registerHooks(host.pi);
+  const resolver = host.pi.__rendererResolver as (
+    toolName: string,
+    next: () => unknown,
+  ) => { renderResult?: (...args: unknown[]) => { render(width: number): string[] } };
+  const decorated = resolver("YouShouldKnow", () => ({ name: "YouShouldKnow" }));
+  assert.ok(decorated?.renderResult, "the decoration supplies the missing result renderer for audited rows");
+  const theme = paintedTheme();
+  const render = (result: unknown, context: Record<string, unknown> = {}) => decorated!.renderResult!(
+    result,
+    { expanded: false, isPartial: false },
+    theme,
+    { expanded: false, isError: false, showImages: true, ...context },
+  ).render(200);
+
+  // No annotation: the host's own fallback owns the row, unchanged.
+  assert.throws(() => render({ content: [{ type: "text", text: "ordinary notice output" }] }),
+    "an unannotated renderer-less result is handed back to Pi's native fallback rather than redrawn here");
+
+  const annotation = "Tool protection: PASS — synthetic approval.";
+  const notice = `Notice registered as n-1: \"Deployed\". It stays pending until the user closes it.`;
+  const rows = render({ content: [{ type: "text", text: annotation }, { type: "text", text: notice }] });
+  assert.equal(rows[0], "", "the collapsed separator row is kept");
+  assert.match(rows[1]!, /^<success>Tool protection: PASS/, "the audit row uses its own semantic colour, not tool output");
+  assert.ok(rows.some((row) => /^<toolOutput>Notice registered as n-1/.test(row)),
+    "the tool's own content keeps the native tool-output colour");
+  assert.equal(rows.filter((row) => row.includes("Tool protection: PASS")).length, 1,
+    "the annotation is displayed exactly once");
+
+  // The native ten-line collapsed preview and its omission hint.
+  setNativeExpansionHost({ keyHint: () => "ctrl+o to expand", keyText: () => "ctrl+o" });
+  try {
+    const many = Array.from({ length: 14 }, (_unused, index) => `line ${index + 1}`).join("\n");
+    const preview = render({ content: [{ type: "text", text: annotation }, { type: "text", text: many }] });
+    const content = preview.slice(2);
+    assert.equal(content.filter((row) => /^<toolOutput>line /.test(row)).length, 10,
+      "the collapsed fallback preview keeps Pi's ten-line bound");
+    const hint = content.at(-1)!;
+    assert.match(
+      hint,
+      /^<muted>\.\.\. \(4 more lines\)<\/muted> <muted>\(<\/muted>ctrl\+o to expand<muted>\)<\/muted>$/,
+      "the omission line keeps one matching parenthesis pair and names the configured key",
+    );
+    assert.equal(hint.split("(").length, hint.split(")").length, "the omission line has no unmatched parenthesis");
+    const expandedRows = decorated!.renderResult!(
+      { content: [{ type: "text", text: annotation }, { type: "text", text: many }] },
+      { expanded: true, isPartial: false },
+      theme,
+      { expanded: true, isError: false, showImages: true },
+    ).render(200);
+    assert.equal(expandedRows.filter((row) => /^<toolOutput>line /.test(row)).length, 14,
+      "expanding shows the complete retained text with no preview cut");
+  } finally {
+    setNativeExpansionHost(undefined);
+  }
+
+  // Empty content beyond the annotation renders no content rows, as the native
+  // fallback does; images are only named when inline images are off.
+  assert.deepEqual(render({ content: [{ type: "text", text: annotation }] }), ["", `<success>${annotation}</success>`]);
+  const imageRows = render(
+    { content: [{ type: "text", text: annotation }, { type: "image", mimeType: "image/png", data: "AAAA" }] },
+    { showImages: false },
+  );
+  assert.ok(imageRows.some((row) => /^<toolOutput>\[Image: \[image\/png\]\]<\/toolOutput>$/.test(row)),
+    "a hidden image block keeps its native indicator");
+  const shownImageRows = render(
+    { content: [{ type: "text", text: annotation }, { type: "image", mimeType: "image/png", data: "AAAA" }] },
+    { showImages: true },
+  );
+  assert.ok(!shownImageRows.some((row) => row.includes("[Image:")),
+    "the host draws the image itself, so the fallback does not name it twice");
 });
 
 test("a native renderer gets its own lastComponent, never the decoration wrapper", () => {

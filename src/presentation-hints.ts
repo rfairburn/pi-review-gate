@@ -88,6 +88,16 @@ export interface NativeExpansionHost {
    * configured bindings, degenerate widths) so every fallback row fits.
    */
   wrapTextWithAnsi?: (text: string, width: number) => string[];
+  /**
+   * Host pi-tui `getCapabilities()`: `images` names a protocol only when the
+   * terminal can actually draw inline images (undefined/null when it cannot).
+   * A renderer-less result's image disclosure depends on it.
+   */
+  getCapabilities?: () => { images?: string | null };
+  /** Host pi-tui `getImageDimensions(base64, mimeType)`; null when undecidable. */
+  getImageDimensions?: (data: string, mimeType: string) => { widthPx: number; heightPx: number } | null;
+  /** Host pi-tui `imageFallback(mimeType, dimensions)`: its indicator text. */
+  imageFallback?: (mimeType: string, dimensions?: { widthPx: number; heightPx: number }) => string;
 }
 
 let hostOverride: NativeExpansionHost | undefined;
@@ -160,6 +170,17 @@ async function loadSharedNativeExpansionHost(): Promise<NativeExpansionHost | un
       host.visibleWidth = (line) => visibleWidth(line);
       host.wrapTextWithAnsi = (text, width) => wrapTextWithAnsi(text, width);
     }
+    // The image-disclosure helpers are independent of the width helpers: a
+    // result rendered without the tool's own renderer has to name the image
+    // blocks the terminal will not draw, in the host's own indicator text.
+    const getCapabilities = hostFnOf<() => { images?: string | null }>(tui, "getCapabilities");
+    const imageFallback = hostFnOf<(mimeType: string, dimensions?: { widthPx: number; heightPx: number }) => string>(tui, "imageFallback");
+    const getImageDimensions = hostFnOf<(data: string, mimeType: string) => { widthPx: number; heightPx: number } | null>(tui, "getImageDimensions");
+    if (getCapabilities && imageFallback) {
+      host.getCapabilities = () => getCapabilities();
+      host.imageFallback = (mimeType, dimensions) => imageFallback(mimeType, dimensions);
+      if (getImageDimensions) host.getImageDimensions = (data, mimeType) => getImageDimensions(data, mimeType);
+    }
   } catch {
     // A host without the pi-tui peer degrades to the conservative helpers below.
   }
@@ -170,6 +191,51 @@ async function loadSharedNativeExpansionHost(): Promise<NativeExpansionHost | un
 function resolveNativeHost(): NativeExpansionHost | undefined {
   if (hostOverride !== undefined) return hostOverride;
   return warmedHost;
+}
+
+/**
+ * The running host's image-disclosure answer, read from the same resolved peer
+ * record the width and hint helpers use: whether this terminal can draw inline
+ * images at all, and the host's own indicator text (with the dimensions it can
+ * decode) for a block it cannot draw. `undefined` means the peer is not
+ * resolvable, i.e. the capability is genuinely unknown outside a Pi host.
+ */
+export function nativeImageDisclosure(): {
+  imagesSupported: boolean;
+  indicator(mimeType: string, data?: string): string;
+} | undefined {
+  const host = resolveNativeHost();
+  if (!host || typeof host.getCapabilities !== "function" || typeof host.imageFallback !== "function") return undefined;
+  const getCapabilities = host.getCapabilities;
+  const imageFallback = host.imageFallback;
+  const getImageDimensions = typeof host.getImageDimensions === "function" ? host.getImageDimensions : undefined;
+  let imagesSupported = false;
+  try {
+    imagesSupported = Boolean(getCapabilities().images);
+  } catch {
+    // An unusable capability record counts as "cannot draw images": naming the
+    // block discloses it, staying silent would drop it from the human view.
+    imagesSupported = false;
+  }
+  return {
+    imagesSupported,
+    indicator: (mimeType, data) => {
+      let dimensions: { widthPx: number; heightPx: number } | undefined;
+      if (getImageDimensions !== undefined && typeof data === "string" && data.length > 0) {
+        try {
+          const decoded = getImageDimensions(data, mimeType);
+          if (decoded && Number.isFinite(decoded.widthPx) && Number.isFinite(decoded.heightPx)) dimensions = decoded;
+        } catch {
+          // Undecodable bytes: the host's own indicator omits dimensions.
+        }
+      }
+      try {
+        return imageFallback(mimeType, dimensions);
+      } catch {
+        return `[Image: [${mimeType}]]`;
+      }
+    },
+  };
 }
 
 /** The running host's agent keybinding config (dist-relative, no absolute path). */
@@ -501,6 +567,18 @@ function wrappedHintRows(hint: string, width: number): string[] {
   }
   if (current.length > 0) rows.push(current);
   return rows;
+}
+
+/**
+ * Wraps one already-styled line through the host's own ANSI-aware
+ * `wrapTextWithAnsi` (styling tracked and re-applied across the split), with
+ * the conservative cell-measured splitter as the degradation when the host
+ * function is unavailable. Exported so any renderer-owned hint or label row
+ * fits the width without inventing a second width algorithm.
+ */
+export function wrapAnsiAwareRows(line: string, width: number): string[] {
+  if (width <= 0) return [line];
+  return hardWrapHintToken(line, width);
 }
 
 /**

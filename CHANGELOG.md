@@ -15,6 +15,27 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.223]
+
+### Fixed
+
+- **Correction-loop stop causes are distinguishable** (#538): an isolated
+  `execute` correction loop reports the guard that actually stopped it.
+  Exhaustion of the configured numeric correction budget stays `correction_cap`;
+  a no-progress pause is reported as `no_progress` instead of a false
+  exhausted-attempt count, and `no_changes` is only the no-file-delta outcome,
+  never proof that no useful correction evidence exists. A corrected report,
+  meaningful checks-only evidence, or a refreshed external deliverable can reach
+  the configured review with no candidate-tree change, so a report-only
+  correction no longer needs an artificial file edit to be assessed. Reports and
+  claims never self-approve: blocking, no-progress, and exhausted results do not
+  authorize landing. No-progress protection, review, candidate-verification,
+  writer-ownership, and landing gates remain unchanged. Assistant text that
+  merely resembles a tool call is not executed. Initial review eligibility,
+  summary-only pass acknowledgement, InPlace behavior, retry and model policy,
+  and explicit continuation are unchanged. See
+  [Delegated execution](docs/delegated-execution.md#landing-and-source-preservation).
+
 ## [0.1.0-dev.222]
 
 ### Changed

@@ -684,6 +684,23 @@ reviewed at the primary model's normal idle settlement. A landing that already
 completed a successful subtask review keeps the existing checkpoint/bypass handling.
 Landings into a foreign workspace target never enter the parent review window.
 
+**Bounded correction outcomes** (#538): an isolated `execute` task names the
+guard that actually ended its correction loop. Only exhaustion of the configured
+numeric correction budget (`maxCorrectionCycles`) reports `correction_cap`. A
+no-progress pause reports `no_progress` instead of implying that the configured
+attempts were used up, and `no_changes` continues to mean only that no file
+delta was produced against the captured base — it is not evidence that no useful
+correction happened. A revised report, a meaningful checks-only result, or a
+refreshed external deliverable can therefore reach the configured reviewer with
+an unchanged candidate tree: review assesses the retained evidence, not a file
+diff alone. Blocking, no-progress, and exhausted results do not approve or
+authorize landing, and no report or claim self-approves. The no-progress guard
+still stops a stalled loop; review, candidate-verification, writer-ownership,
+and landing gates remain unchanged. Assistant text that merely resembles a tool
+call is not executed. Initial review eligibility, summary-only pass
+acknowledgement, InPlace behavior, retry and model policy, and explicit in-place
+continuation are unchanged.
+
 **Source preservation**: Landing never changes source HEAD, index, staging state, or
 stash. Final filesystem mutations are serialized and rollback-protected. Absolute
 source-workspace paths in task and correction text are remapped to the worker worktree,

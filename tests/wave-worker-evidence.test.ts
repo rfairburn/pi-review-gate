@@ -229,12 +229,19 @@ for (const newUnknownObservation of [false, true]) {
         await exec(process.execPath, ["-e", "require('fs').appendFileSync('REPORT','independent\\n')"], { cwd: request.cwd });
       });
       const result = await runWaveWorkerLifecycle({ ...f, sourceRoot: f.source, taskId: "observed", task: { ...task, reviewEvidencePolicy: { scope: "worktree", toolOnly: true, snapshotFailureFallback: false } }, config: cfg, maxCorrectionCycles: 3 });
-      assert.equal(result.status, newUnknownObservation ? "accepted" : "correction_cap");
+      assert.equal(result.status, newUnknownObservation ? "accepted" : "no_progress");
       assert.equal(result.reviewCycles.length, newUnknownObservation ? 3 : 2);
       if (newUnknownObservation) {
         assert.notEqual(result.reviewCycles[0]!.toolReviewIdentity, result.reviewCycles[1]!.toolReviewIdentity);
         assert.ok(result.reviewCycles[1]!.externalObservationRevision! > result.reviewCycles[0]!.externalObservationRevision!);
-      } else assert.match(result.summary, /No progress: retained observed-tool evidence unchanged/);
+      } else {
+        // #538: the tool-method repeat is a recoverable no-progress pause with
+        // the configured budget disclosed as not exhausted, never a cap claim.
+        assert.equal(result.error, "No progress detected.");
+        assert.match(result.summary, /assessed the same contribution as the previous review/);
+        assert.match(result.summary, /Correction budget not exhausted: 1\/3 used/);
+        assert.equal(result.acceptedRef, undefined);
+      }
     } finally { mock.restoreAll(); await rm(f.root, { recursive: true, force: true }); }
   });
 }

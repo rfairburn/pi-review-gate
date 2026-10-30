@@ -391,6 +391,15 @@ never retried, replayed, routed to a fallback, or answered from a cache.
   PASS cannot revive it.
 - A `FAIL` is a gate refusal, not a tool execution failure. It does not create an
   execution-retry entitlement, and existing duplicate/liveness behavior is unchanged.
+- A confirmed auditor timeout is also not a tool execution failure, and it is the one
+  refusal that does not consume the proposed tool's duplicate/repeated-use allowance:
+  the call never started, so an identical retry is admitted for a fresh audit under the
+  unchanged authorization and liveness checks, and repeated timeouts never exhaust that
+  allowance. Nothing retries on its own. Once a call actually runs, ordinary duplicate
+  protection covers it, including its existing treatment of real tool failures, and a
+  `FAIL`, a malformed decision, an unavailable auditor, and a cancelled or invalidated
+  audit keep their existing accounting. The timeout itself stays reported to you and to
+  the acting model, and its audit evidence is retained as usual.
 - A `FAIL` with no supplied reason stops the call exactly like one with a reason: the
   refusal is reported to you and to the acting model, and nothing is invented to fill the
   gap.

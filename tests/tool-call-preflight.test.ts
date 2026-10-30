@@ -10,7 +10,12 @@ import { NativeToolCallPreflight } from "../src/tool-call-preflight";
 import { toolCallFingerprint } from "../src/tool-call-fingerprint";
 
 type Call = { id: string; name: string; input: Record<string, unknown> };
-type AttemptOutcome = "success" | "error" | "returned-error" | "text-error" | "unknown" | "policy-blocked";
+type AttemptOutcome =
+  | "success" | "error" | "returned-error" | "text-error" | "unknown"
+  /** Refused by another policy after this guard admitted the call, unrecorded. */
+  | "policy-blocked"
+  /** The composed protection seam refuses the admitted call (#557). */
+  | "policy-refusal" | "policy-malformed" | "policy-timeout";
 type StartLiveness = "active" | "unknown" | "inactive";
 type NativeBatchResult = {
   decisions: Array<{ block: boolean; reason?: string }>;
@@ -61,6 +66,15 @@ function nativePiHarness(options: {
     observeReturnedError(toolCallId: string, toolName: string): void {
       preflight.observeReturnedError(toolCallId, toolName);
     },
+    /**
+     * The composed entrypoint seam: the tool-protection authority refuses a call
+     * this guard already admitted, before its callback could run. `auditTimeout`
+     * is what the entrypoint passes for a confirmed pre-execution auditor
+     * timeout (#557).
+     */
+    markPolicyBlocked(toolCallId: string, toolName: string, reason: string, auditTimeout = false) {
+      return preflight.markPolicyBlocked(toolCallId, toolName, reason, auditTimeout);
+    },
     /** Simulates pi 1.0's nested seam: tool_execution_start then tool_call, each carrying parentToolCallId. */
     async emitNestedCall(
       parentToolCallId: string,
@@ -110,11 +124,19 @@ function nativePiHarness(options: {
 /** Simulates Pi 0.87.1's native batch seam: message_end, then for each member
  * tool_execution_start BEFORE tool_call preflight for each member, with ALL
  * member preflights before any execution. Pi's validated hook input drops
- * optional nulls; blocked calls produce no extension tool_result. */
+ * optional nulls; blocked calls produce no extension tool_result.
+ *
+ * `refuseDuringPreflight` models the composed entrypoint seam instead: the
+ * protection authority's refusal for a member lands inside that member's
+ * `tool_call` handling, before the next member's preflight is dispatched. That is
+ * the only ordering in which a same-batch sibling can observe an earlier
+ * member's audit outcome (#557); the default keeps the batch-wide ordering every
+ * other suite relies on. */
 async function dispatchNativeBatch(
   runtime: ReturnType<typeof nativePiHarness>,
   calls: Array<Call | { id: string; name: string; input?: Record<string, unknown> }>,
   outcomes: AttemptOutcome[] = [],
+  options: { refuseDuringPreflight?: boolean } = {},
 ): Promise<NativeBatchResult> {
   const resultsBefore = runtime.toolResultCount();
   await runtime.emit("message_end", {
@@ -127,6 +149,7 @@ async function dispatchNativeBatch(
   const decisions: Array<{ block: boolean; reason?: string }> = [];
   const ran: Call[] = [];
   const nativeToolResults: Array<Record<string, unknown>> = [];
+  const refusedDuringPreflight = new Set<number>();
   for (let index = 0; index < calls.length; index += 1) {
     const call = calls[index]!;
     const input = call.input
@@ -140,16 +163,18 @@ async function dispatchNativeBatch(
     });
     const result = results.find((candidate) => candidate !== undefined) as { block?: boolean; reason?: string } | undefined;
     decisions.push({ block: result?.block === true, ...(result?.reason ? { reason: result.reason } : {}) });
+    if (!options.refuseDuringPreflight || result?.block === true || !call.input) continue;
+    if (composePolicyRefusal(runtime, call as Call, outcomes[index] ?? "success")) refusedDuringPreflight.add(index);
   }
   // Pi completes the entire native batch preflight before running any member.
   // A same-batch duplicate cannot claim an earlier result at block time.
   for (let index = 0; index < calls.length; index += 1) {
     const call = calls[index]!;
-    if (decisions[index]!.block || !call.input) continue;
+    if (decisions[index]!.block || refusedDuringPreflight.has(index) || !call.input) continue;
     const outcome = outcomes[index] ?? "success";
     // Another policy can block after this guard admits the call. It has no
     // observed result, so it earns no retry entitlement.
-    if (outcome === "policy-blocked") continue;
+    if (composePolicyRefusal(runtime, call as Call, outcome)) continue;
     ran.push(call as Call);
     const resultDetails = outcome === "returned-error"
       ? { diagnostic: "the extension returned a structured error" }
@@ -175,6 +200,31 @@ async function dispatchNativeBatch(
 
 function call(id: string, name: string, input: Record<string, unknown>): Call {
   return { id, name, input };
+}
+
+/**
+ * Compose one post-admission policy refusal the way the entrypoint's `tool_call`
+ * observer does: the refusal is recorded on this guard's own admitted record, and
+ * the call never runs. A confirmed pre-execution auditor timeout is recorded as a
+ * refusal that started nothing; every other refusal keeps the ordinary blocked
+ * accounting. Returns true when the call must be treated as not executed.
+ */
+function composePolicyRefusal(
+  runtime: ReturnType<typeof nativePiHarness>,
+  call: Call,
+  outcome: AttemptOutcome,
+): boolean {
+  if (outcome === "policy-blocked") return true;
+  if (outcome !== "policy-refusal" && outcome !== "policy-malformed" && outcome !== "policy-timeout") return false;
+  const auditTimeout = outcome === "policy-timeout";
+  const reason = auditTimeout
+    ? `Tool protection: audit unavailable — Auditor timed out after 10000ms. The proposed ${call.name} call was not run.`
+    : outcome === "policy-malformed"
+      ? `Tool protection: invalid auditor response — tool protection decision payload is empty. The proposed ${call.name} call was not run.`
+      : `Tool protection: FAIL — the auditor denied this ${call.name} call. The call did not run.`;
+  const recorded = runtime.markPolicyBlocked(call.id, call.name, reason, auditTimeout);
+  assert.ok(recorded, `the composed seam records the refusal on admitted call ${call.id}`);
+  return true;
 }
 
 function onlyDecisionBatch(
@@ -922,7 +972,7 @@ async function dispatchCodemodeParent(
     childDecisions.push(decision);
     if (decision.block) continue;
     const outcome = child.outcome ?? "success";
-    if (outcome === "policy-blocked") continue;
+    if (composePolicyRefusal(runtime, child.call, outcome)) continue;
     childResults.push(await runtime.emitNestedToolResult(child.parentToolCallId ?? options.parent.id, child.call, outcome));
   }
 
@@ -1494,4 +1544,187 @@ test("an inactive liveness status still permits exactly one nested retry of a fa
       `Duplicate ${tool} blocked after repeated failures: nested call 3 (${tool}) in this codemode script follows two identical executions that failed; this call did not run.`,
     );
   }
+});
+
+/**
+ * Issue #557: a CONFIRMED pre-execution auditor timeout means the proposed
+ * operation never started, so it must not spend the tool's repeated-use
+ * allowance. Every case below runs the composed seam the entrypoint uses —
+ * preflight admits the call, then the protection authority refuses it and the
+ * refusal is recorded on this guard's own record — and asserts counts and exact
+ * block reasons, not just substrings.
+ */
+test("a pre-execution audit timeout leaves the identical adjacent retry admissible for a fresh audit", async () => {
+  const runtime = nativePiHarness();
+  const a = (id: string) => call(id, "bash", { command: "run the bounded synthetic probe" });
+  const timedOut = await dispatchNativeBatch(runtime, [a("timeout-1")], ["policy-timeout"]);
+  assert.deepEqual(timedOut.decisions.map((decision) => decision.block), [false], "the guard admitted the call before the audit");
+  assert.equal(timedOut.ran.length, 0, "a timed-out audit dispatches nothing");
+  assert.equal(timedOut.toolResults, 0, "no tool result is invented for the timed-out call");
+
+  const retry = await dispatchNativeBatch(runtime, [a("retry-1")], ["success"]);
+  assert.deepEqual(retry.decisions.map((decision) => decision.block), [false], "the identical retry is admitted for a fresh audit");
+  assert.equal(retry.ran.length, 1, "the retry runs exactly once");
+
+  const third = await onlyDecisionBatch(runtime, [a("third-1")]);
+  assert.deepEqual(third.decisions.map((decision) => decision.block), [true], "the executed call still earns duplicate protection");
+  assert.equal(
+    third.decisions[0]?.reason,
+    "Duplicate bash blocked: member 1 (bash) of 1 matches an identical request in the immediately preceding native tool group; this member did not run. Review any existing command result and the current workspace state.",
+  );
+});
+
+test("repeated pre-execution audit timeouts never exhaust the allowance and the first passing audit executes once", async () => {
+  const runtime = nativePiHarness();
+  const a = (id: string) => call(id, "bash", { command: "run the same bounded probe again" });
+  let executed = 0;
+  for (const id of ["timeout-a", "timeout-b", "timeout-c"]) {
+    const attempt = await dispatchNativeBatch(runtime, [a(id)], ["policy-timeout"]);
+    assert.deepEqual(attempt.decisions.map((decision) => decision.block), [false], `${id} stays admissible through its own audit`);
+    executed += attempt.ran.length;
+  }
+  assert.equal(executed, 0, "three timed-out audits executed nothing");
+  const passing = await dispatchNativeBatch(runtime, [a("passing")], ["success"]);
+  assert.deepEqual(passing.decisions.map((decision) => decision.block), [false], "a later passing audit still dispatches once");
+  assert.equal(passing.ran.length, 1);
+  const after = await onlyDecisionBatch(runtime, [a("after")]);
+  assert.deepEqual(after.decisions.map((decision) => decision.block), [true], "the real execution is still protected");
+});
+
+test("a pre-execution audit timeout releases the same-batch reservation while a refusal keeps it", async () => {
+  const timedOut = await dispatchNativeBatch(
+    nativePiHarness(),
+    [call("same-1", "bash", { command: "probe once" }), call("same-2", "bash", { command: "probe once" })],
+    ["policy-timeout", "success"],
+    { refuseDuringPreflight: true },
+  );
+  assert.deepEqual(timedOut.decisions.map((decision) => decision.block), [false, false], "the second member is re-audited, not duplicate-blocked");
+  assert.equal(timedOut.ran.length, 1, "exactly one member of the batch actually ran");
+  assert.equal(timedOut.toolResults, 1);
+
+  const refused = await dispatchNativeBatch(
+    nativePiHarness(),
+    [call("refused-1", "bash", { command: "probe once" }), call("refused-2", "bash", { command: "probe once" })],
+    ["policy-refusal", "success"],
+    { refuseDuringPreflight: true },
+  );
+  assert.deepEqual(refused.decisions.map((decision) => decision.block), [false, true], "a genuine refusal still blocks the same-batch duplicate");
+  assert.equal(
+    refused.decisions[1]?.reason,
+    "Duplicate bash blocked: member 2 (bash) of 2 matches an earlier identical request in this native batch; this member did not run. Review any existing command result and the current workspace state.",
+  );
+  assert.equal(refused.ran.length, 0);
+});
+
+test("an audit timeout inside a retry chain still blocks after two actual failures", async () => {
+  const runtime = nativePiHarness();
+  const a = (id: string) => call(id, "bash", { command: "run the failing synthetic command" });
+  const first = await dispatchNativeBatch(runtime, [a("failed-1")], ["error"]);
+  assert.equal(first.ran.length, 1, "the first attempt really executed and failed");
+  const timedOutRetry = await dispatchNativeBatch(runtime, [a("retry-timeout")], ["policy-timeout"]);
+  assert.deepEqual(timedOutRetry.decisions.map((decision) => decision.block), [false], "the granted retry is re-audited after its timeout");
+  assert.equal(timedOutRetry.ran.length, 0, "the timed-out retry executed nothing");
+  const second = await dispatchNativeBatch(runtime, [a("failed-2")], ["error"]);
+  assert.deepEqual(second.decisions.map((decision) => decision.block), [false], "the timeout did not consume the single retry");
+  assert.equal(second.ran.length, 1, "the retry lineage survived, so this is the second real failure");
+  const third = await onlyDecisionBatch(runtime, [a("failed-3")]);
+  assert.deepEqual(third.decisions.map((decision) => decision.block), [true], "two actual failures still exhaust the allowance");
+  assert.equal(
+    third.decisions[0]?.reason,
+    "Duplicate bash blocked after repeated failures: member 1 (bash) of 1 follows two identical executions that failed; this member did not run. Review any existing command result and the current workspace state.",
+  );
+});
+
+test("a genuine audit refusal still consumes the adjacent duplicate allowance", async () => {
+  const runtime = nativePiHarness();
+  const a = (id: string) => call(id, "bash", { command: "propose the denied command" });
+  const denied = await dispatchNativeBatch(runtime, [a("denied-1")], ["policy-refusal"]);
+  assert.deepEqual(denied.decisions.map((decision) => decision.block), [false]);
+  assert.equal(denied.ran.length, 0);
+  const retry = await dispatchNativeBatch(runtime, [a("denied-2")], ["success"]);
+  assert.deepEqual(retry.decisions.map((decision) => decision.block), [true], "a denial before execution still blocks an adjacent repeat");
+  assert.equal(
+    retry.decisions[0]?.reason,
+    "Duplicate bash blocked: member 1 (bash) of 1 follows an identical request that was blocked before execution; this member did not run. Review any existing command result and the current workspace state.",
+  );
+});
+
+test("a same-batch timeout followed by a genuine refusal still blocks the next identical proposal", async () => {
+  for (const refusalOutcome of ["policy-refusal", "policy-malformed"] as const) {
+    const runtime = nativePiHarness();
+    const probe = { command: "probe once then refuse" };
+    const batch = await dispatchNativeBatch(
+      runtime,
+      [call("mix-1", "bash", probe), call("mix-2", "bash", probe)],
+      ["policy-timeout", refusalOutcome],
+      { refuseDuringPreflight: true },
+    );
+    assert.deepEqual(batch.decisions.map((decision) => decision.block), [false, false], `${refusalOutcome}: both members reached their own audit`);
+    assert.equal(batch.ran.length, 0, `${refusalOutcome}: nothing executed in the batch`);
+
+    const next = await onlyDecisionBatch(runtime, [call("mix-3", "bash", probe)]);
+    assert.equal(next.decisions[0]?.block, true, `${refusalOutcome}: the real refusal still blocks the next identical proposal`);
+    assert.equal(
+      next.decisions[0]?.reason,
+      "Duplicate bash blocked: member 1 (bash) of 1 follows an identical request that was blocked before execution; this member did not run. Review any existing command result and the current workspace state.",
+    );
+  }
+});
+
+test("a nested timeout followed by a genuine refusal still blocks the script's next identical call", async () => {
+  const runtime = nativePiHarness();
+  const probe = { command: "run the nested probe then refuse" };
+  const result = await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-557-c", "await tools.bash({ command: 'run the nested probe then refuse' });"),
+    children: [
+      { call: call("cm-557-c/1", "bash", probe), outcome: "policy-timeout" },
+      { call: call("cm-557-c/2", "bash", probe), outcome: "policy-refusal" },
+      { call: call("cm-557-c/3", "bash", probe) },
+    ],
+  });
+  assert.deepEqual(result.childDecisions.map((decision) => decision.block), [false, false, true]);
+  assert.equal(result.childResults.length, 0, "nothing in the script executed");
+  assert.equal(
+    result.childDecisions[2]?.reason,
+    "Duplicate bash blocked: nested call 3 (bash) in this codemode script follows an identical request that was blocked before execution; this call did not run. Review any existing command result and the current workspace state.",
+  );
+});
+
+test("a nested pre-execution audit timeout admits the script's identical retry and later duplicates stay blocked", async () => {
+  const runtime = nativePiHarness();
+  const probe = { command: "run the bounded nested probe" };
+  const result = await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-557-a", "await tools.bash({ command: 'run the bounded nested probe' });"),
+    children: [
+      { call: call("cm-557-a/1", "bash", probe), outcome: "policy-timeout" },
+      { call: call("cm-557-a/2", "bash", probe), outcome: "success" },
+      { call: call("cm-557-a/3", "bash", probe) },
+    ],
+  });
+  assert.deepEqual(result.childDecisions.map((decision) => decision.block), [false, false, true]);
+  assert.equal(result.childResults.length, 1, "the timed-out nested call ran nothing and the retry ran once");
+  assert.match(
+    result.childDecisions[2]?.reason ?? "",
+    /^Duplicate bash blocked: nested call 3 \(bash\) in this codemode script matches an earlier identical request in this script; this call did not run\./,
+  );
+});
+
+test("a nested audit timeout inside a retry chain still blocks after two actual nested failures", async () => {
+  const runtime = nativePiHarness();
+  const probe = { command: "run the failing nested command" };
+  const result = await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-557-b", "await tools.bash({ command: 'run the failing nested command' });"),
+    children: [
+      { call: call("cm-557-b/1", "bash", probe), outcome: "error" },
+      { call: call("cm-557-b/2", "bash", probe), outcome: "policy-timeout" },
+      { call: call("cm-557-b/3", "bash", probe), outcome: "error" },
+      { call: call("cm-557-b/4", "bash", probe) },
+    ],
+  });
+  assert.deepEqual(result.childDecisions.map((decision) => decision.block), [false, false, false, true]);
+  assert.equal(result.childResults.length, 2, "only the two real executions ran");
+  assert.equal(
+    result.childDecisions[3]?.reason,
+    "Duplicate bash blocked after repeated failures: nested call 4 (bash) in this codemode script follows two identical executions that failed; this call did not run. Review any existing command result and the current workspace state.",
+  );
 });

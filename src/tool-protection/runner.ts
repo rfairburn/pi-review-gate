@@ -85,6 +85,17 @@ export interface ProtectionAuditorResult {
   durationMs: number;
   /** Present only when an owned process was launched. */
   settlement?: "confirmed" | "unconfirmed";
+  /**
+   * Positive evidence that this attempt ended on the auditor's own decision
+   * deadline: the in-process wait's deadline won the race, or the owned-process
+   * primitive reported its own timeout and was not aborted. It is never inferred
+   * from error wording, and it is absent for a launch failure, an abort, an
+   * unsupported route, malformed output, or a returned decision. The admission
+   * seam uses it to tell a timed-out audit attempt apart from every other audit
+   * failure; it changes nothing about the refusal, the record, or the reported
+   * transport facts, which stay exactly as they were.
+   */
+  timedOut?: true;
 }
 
 interface ProtectionAuditorEnvelope {
@@ -437,7 +448,7 @@ async function runPiInProcessDecision(
   if (outcome.kind === "aborted") return observed(failure("Auditor was aborted.", startedAt));
   if (outcome.kind === "timeout") {
     controller.abort();
-    return observed(failure(`Auditor timed out after ${request.timeoutMs}ms.`, startedAt));
+    return observed(timeoutFailure(`Auditor timed out after ${request.timeoutMs}ms.`, startedAt));
   }
   if (outcome.kind === "error") {
     controller.abort();
@@ -731,7 +742,16 @@ async function runProcessDecision(
   const text = output.stdout.trim();
   if (text.length === 0) problems.push("Auditor produced no output.");
   if (problems.length > 0) {
-    return observed({ error: problems.join(" "), durationMs: Date.now() - startedAt, settlement });
+    // The primitive's own deadline firing is the timeout evidence. An abort is a
+    // separate, uncertain end (the caller cancelled), so a run that was aborted —
+    // even one that also passed its deadline — reports no confirmed timeout.
+    const confirmedTimeout = output.timedOut && !output.aborted;
+    return observed({
+      error: problems.join(" "),
+      durationMs: Date.now() - startedAt,
+      settlement,
+      ...(confirmedTimeout ? { timedOut: true as const } : {}),
+    });
   }
   if (input.signal?.aborted) {
     return observed({ error: "Auditor was aborted.", durationMs: Date.now() - startedAt, settlement });
@@ -762,4 +782,9 @@ function failure(error: string, startedAt: number, settlement?: "confirmed" | "u
     durationMs: Date.now() - startedAt,
     ...(settlement ? { settlement } : {}),
   };
+}
+
+/** A failure the transport itself ended on its decision deadline. */
+function timeoutFailure(error: string, startedAt: number, settlement?: "confirmed" | "unconfirmed"): ProtectionAuditorResult {
+  return { ...failure(error, startedAt, settlement), timedOut: true };
 }

@@ -342,6 +342,8 @@ test("Pi in-process auditor timeout and abort return errors without a decision",
   const timedOut = await runProtectionAuditor(request({ modelRegistry: timeoutRegistry, timeoutMs: 25 }));
   assert.match(timedOut.error ?? "", /timed out after 25ms/);
   assert.equal(timedOut.output, undefined);
+  // Positive timeout evidence: the in-process deadline itself won the race.
+  assert.equal(timedOut.timedOut, true);
 
   const abortRegistry = fakePiRegistry(syntheticPiModels, [], undefined, true);
   const controller = new AbortController();
@@ -350,6 +352,8 @@ test("Pi in-process auditor timeout and abort return errors without a decision",
   const aborted = await run;
   assert.match(aborted.error ?? "", /aborted/);
   assert.equal(aborted.output, undefined);
+  // A cancellation is not a confirmed deadline, so no timeout evidence is claimed.
+  assert.equal(aborted.timedOut, undefined);
 });
 
 test("generic-cli auditor sends the versioned request on stdin and returns raw decision text", async () => {
@@ -535,14 +539,19 @@ test("process route returns timeout, abort, nonzero, missing-output, stdin, sett
     output: ProcessRunResult;
     expected: RegExp;
     settlement?: "confirmed" | "unconfirmed";
+    /** Expected positive timeout evidence for this transport result. */
+    timedOut?: true;
   }> = [
-    { name: "timeout", output: processResult({ timedOut: true, code: null }), expected: /timed out after 5000ms/, settlement: "confirmed" },
+    { name: "timeout", output: processResult({ timedOut: true, code: null }), expected: /timed out after 5000ms/, settlement: "confirmed", timedOut: true },
     { name: "abort", output: processResult({ aborted: true, code: null }), expected: /aborted/, settlement: "confirmed" },
     { name: "nonzero", output: processResult({ code: 2 }), expected: /exited with status 2/, settlement: "confirmed" },
     { name: "missing", output: processResult({ stdout: " \n" }), expected: /produced no output/, settlement: "confirmed" },
     { name: "truncated", output: processResult({ stdoutTruncated: true }), expected: /output was truncated/, settlement: "confirmed" },
     { name: "stdin", output: processResult({ stdinError: "synthetic stdin failure" }), expected: /could not receive its request/, settlement: "confirmed" },
     { name: "settlement", output: processResult({ processSettlement: "unconfirmed" }), expected: /settlement is unconfirmed/, settlement: "unconfirmed" },
+    // A cancelled run whose deadline also passed stays an uncertain end: the
+    // deadline is not reported as confirmed timeout evidence.
+    { name: "timeout then abort", output: processResult({ timedOut: true, aborted: true, code: null }), expected: /aborted/, settlement: "confirmed" },
   ];
   for (const scenario of scenarios) {
     let calls = 0;
@@ -560,6 +569,7 @@ test("process route returns timeout, abort, nonzero, missing-output, stdin, sett
     assert.match(result.error ?? "", scenario.expected, scenario.name);
     assert.equal(result.output, undefined, scenario.name);
     assert.equal(result.settlement, scenario.settlement, scenario.name);
+    assert.equal(result.timedOut, scenario.timedOut, `${scenario.name} timeout evidence`);
   }
 });
 
@@ -808,6 +818,9 @@ test("external-binary observation keeps host failure facts and an unreported set
     observe: (value) => { observation = value; },
   }), dependencies);
   assert.match(result.error ?? "", /timed out/);
+  // An unconfirmed auditor-process settlement does not erase the deadline the
+  // transport itself reported; the record fields below stay exactly as they were.
+  assert.equal(result.timedOut, true);
   const external = observation!.external!;
   assert.equal(external.timedOut, true);
   assert.equal(external.exitCode, null);

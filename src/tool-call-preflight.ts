@@ -18,7 +18,13 @@ interface NestedCallRecord {
   fingerprint: string;
   position: number;
   admission?: "allowed" | "blocked";
-  outcome: "unknown" | "success" | "error" | "blocked";
+  /**
+   * `audit-timeout` is a refusal whose audit attempt ended on the auditor's own
+   * decision deadline, so the proposed operation is known never to have started
+   * (#557). It is still a refusal — admission stays `blocked` — but it is not an
+   * executed attempt and it does not spend the identity's repeated-use allowance.
+   */
+  outcome: "unknown" | "success" | "error" | "blocked" | "audit-timeout";
   started: boolean;
   returnedErrorObserved: boolean;
   executionStartObserved: boolean;
@@ -45,7 +51,8 @@ interface ToolCallMember {
   fingerprint?: string;
   position: number;
   admission?: "allowed" | "blocked";
-  outcome: "unknown" | "success" | "error" | "blocked";
+  /** See `NestedCallRecord.outcome`: `audit-timeout` ran nothing (#557). */
+  outcome: "unknown" | "success" | "error" | "blocked" | "audit-timeout";
   started: boolean;
   returnedErrorObserved: boolean;
   retryAttempt: boolean;
@@ -187,7 +194,11 @@ export class NativeToolCallPreflight {
 
     const duplicateInBatch = group.seenFingerprints.has(member.fingerprint);
     group.seenFingerprints.add(member.fingerprint);
-    if (duplicateInBatch) {
+    // The batch reservation itself is never erased: what an identity did or did
+    // not do stays readable from the recorded members of this batch. The most
+    // recent earlier member carrying this identity is the one that holds it.
+    const precedingInBatch = duplicateInBatch ? precedingSameBatchMember(group, member) : undefined;
+    if (duplicateInBatch && precedingInBatch?.outcome !== "audit-timeout") {
       this.markBlocked(member);
       const earlierResultObserved = group.members.some((candidate) =>
         candidate.position < member.position
@@ -209,8 +220,20 @@ export class NativeToolCallPreflight {
       };
     }
 
-    const preceding = this.findPreviousMember(member.fingerprint);
+    const preceding = precedingInBatch ?? this.findPreviousMember(member.fingerprint);
     if (preceding) {
+      if (preceding.outcome === "audit-timeout") {
+        // A confirmed pre-execution auditor timeout started nothing, so it neither
+        // spends this identity's repeated-use allowance nor earns a retry
+        // entitlement: the proposal is admitted for a fresh audit under the
+        // liveness checks that already ran above. The retry lineage the timed-out
+        // attempt carried stays attached here, so an earlier executed failure
+        // still counts toward the existing two-failures ceiling instead of being
+        // reset by the timeout.
+        member.retryAttempt = preceding.retryAttempt;
+        this.markAllowed(member);
+        return undefined;
+      }
       if (preceding.outcome === "error" && preceding.started && !preceding.retryAttempt) {
         member.retryAttempt = true;
         this.markAllowed(member);
@@ -303,6 +326,15 @@ export class NativeToolCallPreflight {
         };
       }
       const predecessor = precedingNestedRecord(tree, record);
+      if (predecessor?.outcome === "audit-timeout") {
+        // Same contract as the direct path (#557): the timed-out nested call ran
+        // nothing, so it spends no repeated-use allowance and earns no retry
+        // entitlement, while the retry lineage it carried stays attached so an
+        // earlier executed nested failure keeps counting.
+        record.retryAttempt = predecessor.retryAttempt;
+        this.markAllowed(record);
+        return undefined;
+      }
       if (predecessor && predecessor.outcome === "error" && predecessor.started && !predecessor.retryAttempt) {
         record.retryAttempt = true;
         this.markAllowed(record);
@@ -446,20 +478,34 @@ export class NativeToolCallPreflight {
    * proposal is treated as following a blocked request (adjacent duplicates are
    * not cleared by a user message) rather than as a failed execution.
    *
+   * `auditTimeout` marks the refusal as ending on the auditor's own decision
+   * deadline (#557): the proposed operation is known never to have started, so
+   * the recorded outcome becomes `audit-timeout` and a later identical proposal
+   * is re-audited instead of being blocked as repeated use. Every other refusal
+   * — a `FAIL`, a malformed or unavailable auditor, cancellation, an invalidated
+   * audit — keeps the ordinary blocked accounting, and no refusal here grants
+   * execution or earns a retry entitlement.
+   *
    * Returns the native block decision for the composed `tool_call` observer, or
    * `undefined` when this guard has no matching admitted record (the caller
    * still returns its own block; this method never grants permission).
    */
-  markPolicyBlocked(toolCallId: string, toolName: string, reason: string): { block: true; reason: string } | undefined {
+  markPolicyBlocked(
+    toolCallId: string,
+    toolName: string,
+    reason: string,
+    auditTimeout = false,
+  ): { block: true; reason: string } | undefined {
     if (!toolCallId || !toolName) return undefined;
+    const outcome = auditTimeout ? "audit-timeout" : "blocked";
     const member = this.membersById.get(toolCallId);
     if (member && member.id === toolCallId && member.name === toolName && member.admission === "allowed") {
-      this.markBlocked(member);
+      this.markBlocked(member, outcome);
       return { block: true, reason };
     }
     const record = this.nestedById.get(toolCallId);
     if (record && record.name === toolName && record.admission === "allowed") {
-      this.markBlocked(record);
+      this.markBlocked(record, outcome);
       return { block: true, reason };
     }
     return undefined;
@@ -636,9 +682,12 @@ export class NativeToolCallPreflight {
     return group.members[group.fallbackPosition] ?? group.members.find((member) => !member.preflighted);
   }
 
-  private markBlocked(call: { admission?: "allowed" | "blocked"; outcome: "unknown" | "success" | "error" | "blocked"; started: boolean }): void {
+  private markBlocked(
+    call: { admission?: "allowed" | "blocked"; outcome: "unknown" | "success" | "error" | "blocked" | "audit-timeout"; started: boolean },
+    outcome: "blocked" | "audit-timeout" = "blocked",
+  ): void {
     call.admission = "blocked";
-    call.outcome = "blocked";
+    call.outcome = outcome;
     call.started = false;
   }
 
@@ -652,8 +701,15 @@ export class NativeToolCallPreflight {
       member.fingerprint === fingerprint && !member.fallbackBlocked,
     ) ?? [];
     // If an identical member was actually admitted, prefer its observed result
-    // over any later same-batch member that the guard itself blocked.
-    return matching.find((member) => member.admission === "allowed") ?? matching[0];
+    // over any later same-batch member that the guard itself blocked. A timed-out
+    // audit attempt is preferred last for the same reason in reverse: it carries no
+    // executed or refused-result evidence, so it represents this identity only when
+    // nothing else about it was accounted for (#557). A genuine denial, a malformed
+    // or unavailable auditor, or a guard block in the same group must never be
+    // shadowed by a timed-out sibling.
+    return matching.find((member) => member.admission === "allowed")
+      ?? matching.find((member) => member.outcome !== "audit-timeout")
+      ?? matching[0];
   }
 
   private startLiveness(name: string, fingerprint: string): StartLiveness {
@@ -803,11 +859,37 @@ function isCodemodeScriptCall(member: ToolCallMember): boolean {
 }
 
 function precedingNestedRecord(tree: NestedTree, record: NestedCallRecord): NestedCallRecord | undefined {
+  let timedOutCandidate: NestedCallRecord | undefined;
   for (let index = tree.children.length - 2; index >= 0; index -= 1) {
     const candidate = tree.children[index]!;
-    if (candidate.fingerprint === record.fingerprint) return candidate;
+    if (candidate.fingerprint !== record.fingerprint) continue;
+    // Same selection rule as the direct path (#557): an executed or refused
+    // sibling carries the accounting; a timed-out attempt only speaks for the
+    // identity when nothing else does.
+    if (candidate.outcome !== "audit-timeout") return candidate;
+    timedOutCandidate ??= candidate;
   }
-  return undefined;
+  return timedOutCandidate;
+}
+
+/**
+ * The earlier member of one native batch that holds this batch's duplicate
+ * reservation for the member's identity: the most recent one that carries
+ * accounting (an executed result, a refusal, or a guard block), and otherwise the
+ * most recent timed-out audit attempt. The reservation is never erased, so the
+ * repeated-use decision reads what actually happened to the identity instead of
+ * discarding the batch's recorded history (#557).
+ */
+function precedingSameBatchMember(group: ToolCallGroup, member: ToolCallMember): ToolCallMember | undefined {
+  let timedOutCandidate: ToolCallMember | undefined;
+  for (let index = group.members.length - 1; index >= 0; index -= 1) {
+    const candidate = group.members[index]!;
+    if (candidate.position >= member.position) continue;
+    if (candidate.fingerprint !== member.fingerprint) continue;
+    if (candidate.outcome !== "audit-timeout") return candidate;
+    timedOutCandidate ??= candidate;
+  }
+  return timedOutCandidate;
 }
 
 /** Bounded, printable display for an observed parent call id in feedback. */

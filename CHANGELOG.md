@@ -15,6 +15,31 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.227]
+
+### Fixed
+
+- **Pre-execution audit timeouts no longer consume repeated-use allowance** (#557): an
+  auditor that times out before the proposed tool runs is a failed audit attempt, not a
+  completed invocation, so it no longer counts as repeated tool use. The refusal is still
+  returned to the acting model and recorded for you exactly as before — the call does not
+  run, nothing retries on its own, and no timeout is reinterpreted from error wording: only
+  the auditor transport's own deadline (the in-process decision wait or the owned-process
+  primitive, and never a cancelled run) is treated as a confirmed timeout. An identical
+  retry of the same call is then admitted for a fresh audit under the unchanged native
+  authorization, background-start liveness, and duplicate guards, on both the direct native
+  batch path and calls issued inside a running script, and repeated timeouts never exhaust
+  the underlying tool's allowance; the first call whose audit and normal guards pass still
+  executes exactly once and is duplicate-protected afterwards, and a timed-out attempt never
+  shadows the accounting of another refusal of the same call in the same batch. A `FAIL`, a
+  malformed decision, an unavailable auditor, and a cancelled or invalidated audit keep their
+  existing duplicate accounting, as does a call that actually started — including a real tool
+  failure whose single retry entitlement, two-failure ceiling, and uncertain-outcome handling a
+  timed-out audit attempt cannot reset. No global reset, blanket failed-call exemption,
+  automatic retry or backoff, longer auditor timeout, new exemption list, or permission,
+  profile, or policy change is involved. See
+  [Tool protection](docs/tool-protection.md#failure-cancellation-and-approvals).
+
 ## [0.1.0-dev.226]
 
 ### Fixed

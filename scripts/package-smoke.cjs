@@ -588,6 +588,67 @@ function smokeInstalledGateLauncher(installed) {
   }
 }
 
+/**
+ * Exercise the installed inert tool-auditor tester's credential-free surfaces. The
+ * packed bin must list and help without resolving a saved config, a model, auth,
+ * or an installed Pi package, and `--json --list` must be valid JSON. These runs
+ * make no provider request and execute no proposal.
+ */
+function smokeInstalledToolAuditorTester(installed) {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "pi-review-tool-test-package-bin-"));
+  try {
+    const home = path.join(fixture, "home");
+    const agent = path.join(fixture, "agent");
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(agent, { recursive: true });
+    const testerBin = installedBinShim(installed, "pi-review-tool-test", "scripts/pi-review-tool-test.cjs");
+    assert.match(
+      fs.readFileSync(path.join(installed, "scripts", "pi-review-tool-test.cjs"), "utf8").split(/\r?\n/, 1)[0],
+      /^#!.*node/,
+      "tool tester bin target must carry a Node shebang",
+    );
+    const env = {
+      ...process.env,
+      HOME: home,
+      TMPDIR: fixture,
+      PI_CODING_AGENT_DIR: agent,
+      PI_REVIEW_GATE_CONFIG: path.join(fixture, "absent-review-gate.json"),
+      PI_REVIEW_GATE_INSTALLED_AGENT: path.join(fixture, "absent-pi-package"),
+    };
+    const run = (args) => spawnSync(testerBin, args, {
+      cwd: fixture,
+      env,
+      encoding: "utf8",
+      timeout: 20_000,
+      maxBuffer: 2 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let result = run(["--help"]);
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, `packaged tool tester --help failed: ${result.stderr}`);
+    assert.match(result.stdout, /proposals are DATA and NEVER EXECUTE/);
+    assert.match(result.stdout, /--case ID\|NUMBER\|all/);
+    assert.match(result.stdout, /Pi-backed auditors only/);
+
+    result = run(["--list"]);
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, `packaged tool tester --list failed: ${result.stderr}`);
+    assert.match(result.stdout, /n08-user-prohibited-read\s+\[FAIL\/FAIL\/FAIL\]/);
+    assert.match(result.stdout, /No request was sent/);
+
+    result = run(["--json", "--list"]);
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, `packaged tool tester --json --list failed: ${result.stderr}`);
+    const listed = JSON.parse(result.stdout);
+    assert.equal(listed.mode, "auditor-test-list");
+    assert.equal(listed.policyVersion, "rules-6");
+    assert.equal(listed.cases.length, 10);
+    assert.deepEqual(listed.cases[7].expected, { dangerous: "FAIL", aligned: "FAIL", workspace: "FAIL" });
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
 function runPackageSmoke(scratch) {
   const cache = path.join(scratch, "npm-cache");
   // Stage the packaged inputs in scratch so the smoke never depends on (or
@@ -668,6 +729,9 @@ function runPackageSmoke(scratch) {
     "scripts/ensure-ddgs.sh",
     "scripts/ddgs-search.py",
     "scripts/pi-review-web.sh",
+    "scripts/pi-review-tool-test.cjs",
+    "dist/src/tool-protection/test-cli.js",
+    "dist/src/tool-protection/test-fixtures.js",
     "scripts/orchestrator-system-prompt.md",
     "scripts/execution-system-prompt.md",
     "scripts/planning-system-prompt.md",
@@ -733,10 +797,17 @@ function runPackageSmoke(scratch) {
   fs.accessSync(path.join(consumer, "node_modules", ".bin", "pi-review-gate"), fs.constants.X_OK);
   fs.accessSync(path.join(consumer, "node_modules", ".bin", "pi-review-gate-cmd"), fs.constants.X_OK);
   fs.accessSync(path.join(consumer, "node_modules", ".bin", "pi-review-web"), fs.constants.X_OK);
+  fs.accessSync(path.join(consumer, "node_modules", ".bin", "pi-review-tool-test"), fs.constants.X_OK);
   const installedManifest = JSON.parse(fs.readFileSync(path.join(installed, "package.json"), "utf8"));
   assert.equal(installedManifest.bin && installedManifest.bin["pi-review-web"], "scripts/pi-review-web.sh");
+  assert.equal(
+    installedManifest.bin && installedManifest.bin["pi-review-tool-test"],
+    "scripts/pi-review-tool-test.cjs",
+    "installed bin metadata for pi-review-tool-test must point exactly at scripts/pi-review-tool-test.cjs",
+  );
   smokeInstalledWebLauncher(installed);
   smokeInstalledGateLauncher(installed);
+  smokeInstalledToolAuditorTester(installed);
   // Optional session host (#323): exact bin metadata, executable consumer
   // shim, side-effect-free --help, derived compiled-module shipment, and
   // fresh-consumer runtime loads with a lazy optional PTY. No normal host

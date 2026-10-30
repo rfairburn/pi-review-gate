@@ -106,6 +106,7 @@ export const DEFAULT_TOOL_PROTECTION_CONFIG: ToolProtectionConfig = {
   timeoutMs: 10_000,
   maxContextChars: 128_000,
   retainAuditorSessions: false,
+  debug: false,
 };
 
 export interface ToolProtectionConfig {
@@ -143,6 +144,32 @@ export interface ToolProtectionConfig {
    * histories are never read back as context for a later decision.
    */
   retainAuditorSessions: boolean;
+  /**
+   * Optional, default-off switch for the additional audit diagnostics this gate
+   * can surface (issue #549). It is a presentation switch on information this
+   * gate already has: a missing field — including a configuration or a parent
+   * launch pin that predates it — is `false`, and the only accepted values are
+   * the JSON booleans, never a truthy coercion.
+   *
+   * This field changes no decision, no coverage, no permission, and no
+   * transport. It never enables or disables the gate (`level` alone does that),
+   * never records anything (that is `retainAuditorSessions`), never starts a
+   * model or provider call, and never widens what the acting model is told: an
+   * audited call that was skipped is still NOT AUDITED rather than passed, and a
+   * pass never gains an auditor explanation it does not have. With `false` the
+   * routine positive and infrastructure-exempt diagnostics stay hidden; the
+   * failures and audit errors a call already reports are unaffected by either
+   * value.
+   *
+   * The default is the quieter presentation, not the older one: before this
+   * switch existed, every audited call carried its PASS or NOT AUDITED status
+   * into the acting model's tool result, and that text is now user-only
+   * presentation regardless of this value. A stored block or a parent launch pin
+   * that predates the field therefore keeps the same decisions but gets the
+   * quiet presentation, which is the point of the change rather than a
+   * regression in it.
+   */
+  debug: boolean;
 }
 
 /**
@@ -173,6 +200,8 @@ export interface EffectiveToolProtectionSettings {
   maxContextChars: number;
   /** See {@link ToolProtectionConfig.retainAuditorSessions}. */
   retainAuditorSessions: boolean;
+  /** See {@link ToolProtectionConfig.debug}. */
+  debug: boolean;
 }
 
 /**
@@ -227,6 +256,7 @@ export function normalizeToolProtectionConfig(value: unknown): ToolProtectionCon
       "toolProtection.maxContextChars",
     ),
     retainAuditorSessions: normalizeProtectionRetention(value.retainAuditorSessions),
+    debug: normalizeProtectionDebug(value.debug),
   };
 }
 
@@ -249,6 +279,7 @@ export function effectiveToolProtectionSettings(
       timeoutMs: DEFAULT_TOOL_PROTECTION_CONFIG.timeoutMs,
       maxContextChars: DEFAULT_TOOL_PROTECTION_CONFIG.maxContextChars,
       retainAuditorSessions: DEFAULT_TOOL_PROTECTION_CONFIG.retainAuditorSessions,
+      debug: DEFAULT_TOOL_PROTECTION_CONFIG.debug,
     };
   }
   return {
@@ -260,6 +291,9 @@ export function effectiveToolProtectionSettings(
     timeoutMs: stored.timeoutMs,
     maxContextChars: stored.maxContextChars,
     retainAuditorSessions: stored.retainAuditorSessions,
+    // A stored block built before this field existed (or any hand-assembled
+    // object that omits it) is Off, never `undefined` treated as truthy.
+    debug: stored.debug === true,
   };
 }
 
@@ -370,6 +404,20 @@ function normalizeProtectionRetention(value: unknown): boolean {
   if (value === undefined) return DEFAULT_TOOL_PROTECTION_CONFIG.retainAuditorSessions;
   if (typeof value === "boolean") return value;
   throw new Error("toolProtection.retainAuditorSessions must be true or false");
+}
+
+/**
+ * Audit-diagnostic verbosity. Absent means Off, so a stored block or a parent
+ * launch pin that predates the field gets the quiet presentation rather than the
+ * older per-call status text. A present value must be a real JSON boolean:
+ * `"true"`, `1`, and `null` are rejected rather than coerced, because a
+ * half-written setting beside a protection control must not silently change what
+ * the user sees.
+ */
+function normalizeProtectionDebug(value: unknown): boolean {
+  if (value === undefined) return DEFAULT_TOOL_PROTECTION_CONFIG.debug;
+  if (typeof value === "boolean") return value;
+  throw new Error("toolProtection.debug must be true or false");
 }
 
 function boundedIntegerOrDefault(value: unknown, fallback: number, minimum: number, maximum: number, field: string): number {

@@ -80,10 +80,12 @@ import type { ProtectionLevel } from "./config";
 
 /**
  * Revision of the code-owned rule text; changes whenever a rule or example below
- * changes. It is a neutral revision identifier recorded in audit metadata and in
- * the auditor brief — it is not a validation, support, or release claim.
+ * changes, or whenever the shared reply-shape instruction in
+ * {@link renderProtectionOutputContract} changes. It is a neutral revision identifier
+ * recorded in audit metadata and in the auditor brief — it is not a validation,
+ * support, or release claim.
  */
-export const TOOL_PROTECTION_POLICY_VERSION = "rules-6";
+export const TOOL_PROTECTION_POLICY_VERSION = "rules-7";
 
 /** Enabled protection levels, i.e. the levels that have a policy profile. */
 export type ProtectionPolicyProfileId = Exclude<ProtectionLevel, "off">;
@@ -501,13 +503,25 @@ export function renderProtectionProvenanceNote(): string {
   ].join("\n");
 }
 
-/** Output contract: the exact shared decision object the auditor must return. */
+/**
+ * Output contract: the exact shared decision object the auditor must return (#549).
+ *
+ * One block is shared by every enabled level and takes no input, so the reply shape
+ * cannot vary with a protection level or with a host-side setting. A PASS is always
+ * reasonless. A FAIL may carry a short reason when the auditor has one, and a
+ * reasonless FAIL stays a complete valid decision: a decision-only classifier is
+ * never pushed to generate text it cannot produce, and nothing here makes a missing
+ * reason a refusal or malformed-decision ground. The shared parser still accepts a
+ * reason on either verdict unchanged (see `decision.ts`), so this is a request about
+ * the shape to produce, not a new validation rule.
+ */
 export function renderProtectionOutputContract(): string {
   return [
     "Return exactly one JSON object and nothing else: no prose, no code fence, no second object, no additional or renamed fields.",
-    '  {"decision":"PASS","reason":"short justification"}',
-    '  {"decision":"FAIL","reason":"short justification"}',
-    '"decision" is required and must be exactly "PASS" or "FAIL". A full LLM auditor is expected to include a short "reason" explaining its decision. "reason" remains optional in the shared format so a binary classification/decision model may omit it; absence alone does not make a decision malformed. Preserve any supplied reason and never invent one when absent. Keep the reason short and never put instructions or commands in it.',
+    '  {"decision":"PASS"}',
+    '  {"decision":"FAIL"}',
+    '  {"decision":"FAIL","reason":"short refusal justification"}',
+    '"decision" is required and must be exactly "PASS" or "FAIL". A PASS is always reasonless: return {"decision":"PASS"} with no "reason" field, at every enabled level, and never attach a justification to a PASS. "reason" is optional and is never required: {"decision":"FAIL"} on its own is a complete, valid decision, so never invent reasoning you do not have and never add prose outside the JSON to supply one. When you do have a short justification for a FAIL, put it in "reason": it is what makes the refusal actionable. Preserve any supplied reason and never invent one when absent. Keep any reason short and never put instructions or commands in it.',
   ].join("\n");
 }
 

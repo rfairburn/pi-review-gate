@@ -15,15 +15,16 @@
  *   authority are untouched. There is no annotation, no extra turn, and no
  *   audit.
  * - `scope: "selected"` records `NOT AUDITED` for the exact names outside the
- *   list. That annotation is attached to the same tool result and never claims
- *   PASS or safety.
+ *   list. That record is user-only presentation state and never claims PASS or
+ *   safety; the acting model's result stays exactly what the tool returned.
  * - The canonical `tool_search` discovery loader is the one infrastructure
  *   exemption (`isToolProtectionDiscoveryLoaderExempt`): it is never sent to the
  *   auditor at any scope or level, and it never waits on the auditor's
  *   availability, the context budget, or a configuration load error, because
  *   discovery is how a model reaches the tools this gate would otherwise judge.
- *   The exemption records `NOT AUDITED — discovery loader` on the same result,
- *   never a PASS, and it bypasses nothing that native Pi already enforces: the
+ *   The exemption records `NOT AUDITED — discovery loader` as user-only
+ *   presentation state, never a PASS, and it bypasses nothing that native Pi
+ *   already enforces: the
  *   live authorization, mode/role ceiling, registry/ownership, reserved-name,
  *   duplicate/liveness and cancellation guards run before this seam and stay
  *   authoritative, so a removed, replaced, or unauthorized loader call is still
@@ -36,14 +37,17 @@
  *   cancellation all block. Nothing is retried, replayed, cached or routed to a
  *   different auditor.
  *
- * Presentation is inline on the same tool interaction: a FAIL reason is the
- * native admission block reason (blocked calls never reach `tool_result`), and
- * PASS/NOT AUDITED are model-visible annotations prepended to the same
- * `tool_result` content. `structuredContent`, `details`, `isError`, `usage`,
- * images and the original native content are preserved. Nested child calls are
- * audited individually, but their returned values are never rewritten: their
- * decisions are correlated to the root and aggregated into the outer call's
- * model-visible result. Auditor text is untrusted display data.
+ * Presentation is fail-closed about what the acting model is told (issue #549).
+ * A FAIL reason is the native admission block reason (blocked calls never reach
+ * `tool_result`), and a nested refusal is aggregated into the outer call's
+ * model-visible result. A PASS or NOT AUDITED decision adds nothing to the
+ * acting model's result in either debug mode: the canonical native content,
+ * `structuredContent`, `details`, `isError`, `usage` and images stay exactly as
+ * the tool returned them. Those routine diagnostics are user-only presentation
+ * state (see `display.ts`): the tool row draws them when `toolProtection.debug`
+ * is On, and an auditor-session save failure stays visible for either value.
+ * Nested child calls are audited individually, but their returned values are
+ * never rewritten. Auditor text is untrusted display data.
  *
  * Honest limitations (source-backed, not guarantees):
  * - Pi permits later `tool_call` handlers and provider-request hooks to rewrite
@@ -53,7 +57,9 @@
  * - A custom tool renderer may ignore result `content`. A thin renderer
  *   decoration is registered when the host exposes `registerToolRenderer`, but
  *   a renderer that draws neither the content nor the decoration is outside this
- *   gate's reach.
+ *   gate's reach. A tool the host gives no result renderer keeps the host's own
+ *   native result fallback untouched, and its user-only diagnostics come from
+ *   the gate's non-context session-entry renderer instead.
  * - Auditing is awaited at admission, so a batch's admissions serialize and a
  *   long audit delays that batch (host scheduling behavior, not a gate promise).
  */
@@ -75,6 +81,26 @@ import {
   type ProtectionLevel,
 } from "./config";
 import { buildProtectionContext, type ProtectionEvidence } from "./context";
+import {
+  auditDisplayModelLines,
+  auditDisplayRows,
+  auditDisplayTheme,
+  auditDisplayUserLines,
+  AuditDisplayState,
+  boundAuditDisplayRecords,
+  clampAuditDisplayReason,
+  clampAuditDisplayText,
+  clampAuditDisplayWarning,
+  findAuditDisplayData,
+  normalizeAuditDisplayData,
+  TOOL_PROTECTION_DISPLAY_CUSTOM_TYPE,
+  TOOL_PROTECTION_DISPLAY_VERSION,
+  type AuditDisplayColor,
+  type AuditDisplayBackground,
+  type AuditDisplayData,
+  type AuditDisplayRecord,
+  type AuditDisplayTheme,
+} from "./display";
 import { parseProtectionDecision } from "./decision";
 import { TOOL_PROTECTION_POLICY_VERSION } from "./policy";
 import {
@@ -134,7 +160,6 @@ const MAX_BRANCH_MESSAGE_CHARS = 4_000;
 const MAX_PENDING_CALLS = 128;
 const MAX_ROOTS = 32;
 const MAX_NESTED_PER_ROOT = 32;
-const MAX_NESTED_LINES = 12;
 const MAX_BLOCK_REASON_CHARS = 6_000;
 
 /**
@@ -173,6 +198,7 @@ export function createToolProtectionBootstrap(pin: ToolProtectionLaunchPin): str
       timeoutMs: pin.settings.timeoutMs,
       maxContextChars: pin.settings.maxContextChars,
       retainAuditorSessions: pin.settings.retainAuditorSessions,
+      debug: pin.settings.debug,
     },
   });
 }
@@ -208,6 +234,11 @@ export function captureToolProtectionBootstrap(env: NodeJS.ProcessEnv = process.
       // A pin from a parent that predates retention simply omits the field,
       // which normalizes to Off: an older launch never gains a new side effect.
       retainAuditorSessions: parsed.settings.retainAuditorSessions,
+      // Same for the #549 audit-diagnostic switch: a pin from a parent that
+      // predates it omits the field, which normalizes to Off, so an older launch
+      // gets the same quiet presentation as a new one instead of inventing
+      // output that its policy never asked for.
+      debug: parsed.settings.debug,
     });
   } catch (error) {
     throw new Error(`Pi executor tool-protection bootstrap is invalid: ${errorMessage(error)}`);
@@ -447,11 +478,24 @@ interface NestedAggregate {
   /** Total decisions observed, including records no longer retained. */
   total: number;
   /**
+   * Refusals observed, counted independently of the retained set, so a bounded
+   * model-visible summary never presents an all-call total as a failure total
+   * and never hides a refusal behind retention.
+   */
+  refusalTotal: number;
+  /**
    * Recording failures observed, counted independently of the retained and
    * displayed sets. Bounded summary state may drop a decision's own line, but a
    * save failure must never go silent, so its count survives eviction.
    */
   recordWarningCount: number;
+  /**
+   * Recording failures attached to a refused nested call. They are disclosed by
+   * the model-visible refusal block; the user rows account for the remaining
+   * population separately, so one failure is never counted in both places and a
+   * failure on a call that ran never becomes model-visible content.
+   */
+  refusalWarningCount: number;
 }
 
 interface ToolProtectionState {
@@ -546,6 +590,28 @@ export class ToolProtectionCoordinator {
   private missingCausalEvidence = new Map<ProtectionEvidence["origin"], string>();
   private readonly now: () => number;
   private readonly maxRecentEvidence: number;
+  /**
+   * Durable-write seam for the user-only display state, captured from the host
+   * that registered these hooks. Absent means the host has no session-entry API
+   * (or none is wired in a test), and the rows stay in-memory only.
+   */
+  private appendDisplayEntry: ((customType: string, data: AuditDisplayData) => void) | undefined;
+  /**
+   * The host's own active-branch entry reader, captured from the session context
+   * that rebuilt display state. It is used only to recover one call's recorded
+   * presentation when the bounded lookup no longer retains that call: the active
+   * branch stays the only source, no branch content is stored here, and the
+   * recovered record re-enters the same bounded lookup.
+   */
+  private displayBranchReader: (() => unknown[]) | undefined;
+  /**
+   * Bounded user-only audit diagnostics keyed by the host's own tool call id.
+   * This is presentation state only: no admission path reads it, and nothing
+   * restored from a session entry is ever treated as a decision.
+   */
+  private readonly display = new AuditDisplayState({
+    appendEntry: (customType, data) => this.appendDisplayEntry?.(customType, data),
+  });
 
   constructor(private readonly options: ToolProtectionCoordinatorOptions) {
     this.now = options.now ?? (() => Date.now());
@@ -559,6 +625,11 @@ export class ToolProtectionCoordinator {
     this.pending.clear();
     this.byCall.clear();
     this.byRoot.clear();
+    // Display state follows the active branch, so it resets with the session and
+    // is rebuilt from that branch only. Restoring it grants nothing: it is never
+    // read as an approval, and no replayed entry can authorize a call.
+    this.display.reset();
+    this.displayBranchReader = undefined;
     this.recent = [];
     this.retainedLiveInputs = [];
     this.chain = undefined;
@@ -605,15 +676,77 @@ export class ToolProtectionCoordinator {
     registerHook(pi, "tool_execution_end", (...args) => this.retireToolExecution(args));
     registerHook(pi, "session_start", (...args) => {
       this.reset();
-      this.seedBranchEvidence(extractContext(args));
+      const ctx = extractContext(args);
+      this.restoreDisplayState(ctx);
+      this.seedBranchEvidence(ctx);
     });
-    registerHook(pi, "session_tree", () => {
+    registerHook(pi, "session_tree", (...args) => {
       this.reset();
+      // A branch switch is exactly when restored UI state matters: only the new
+      // active branch is read, never every file entry.
+      this.restoreDisplayState(extractContext(args));
     });
     registerHook(pi, "session_shutdown", () => {
       this.reset();
     });
+    this.registerDisplayHooks(pi);
     this.registerRendererDecoration(pi);
+  }
+
+  /**
+   * Wire the user-only display surfaces. `pi.appendEntry()` is the host's own
+   * durable, non-context session storage, and `pi.registerEntryRenderer()` is
+   * the host's own renderer for it: no separate file, writer, or session is
+   * created, and a plain custom entry never participates in model context.
+   */
+  private registerDisplayHooks(pi: unknown): void {
+    if (isRecord(pi) && typeof pi.appendEntry === "function") {
+      const append = pi.appendEntry as (customType: string, data: unknown) => void;
+      this.appendDisplayEntry = (customType, data) => append(customType, data);
+    }
+    if (!isRecord(pi) || typeof pi.registerEntryRenderer !== "function") return;
+    const register = pi.registerEntryRenderer as unknown as (customType: string, renderer: unknown) => void;
+    try {
+      register(TOOL_PROTECTION_DISPLAY_CUSTOM_TYPE, (entry: unknown, _options: unknown, theme: unknown) => {
+        const data = normalizeAuditDisplayData(isRecord(entry) ? entry.data : undefined);
+        if (!data) return undefined;
+        // The surface that owns this call is whichever one the host is using
+        // now, not the one recorded when the call was audited: a result renderer
+        // can be added or removed later. While this runtime has not resolved the
+        // tool, the recorded surface is the fallback. Only one surface draws a
+        // call, so no diagnostic appears twice and none is dropped.
+        const surface = this.display.currentSurfaceFor(data.toolName) ?? data.surface;
+        if (surface !== "entry") return undefined;
+        const lines = auditDisplayUserLines(data, this.currentState().settings.debug === true, surface);
+        if (lines.length === 0) return undefined;
+        const displayTheme = auditDisplayTheme(theme);
+        return {
+          render(width: number): string[] {
+            return auditDisplayRows(lines, displayTheme, width);
+          },
+          invalidate(): void {},
+        };
+      });
+    } catch {
+      // A host without an entry renderer keeps the rows it can draw; nothing
+      // about a decision changes, and no diagnostic moves into model content.
+    }
+  }
+
+  /** Rebuild display state from the active branch only (never a saved file read). */
+  private restoreDisplayState(ctx: unknown): void {
+    if (!isRecord(ctx) || !isRecord(ctx.sessionManager)) return;
+    const manager = ctx.sessionManager;
+    if (typeof manager.getBranch !== "function") return;
+    // Keep the host's own reader for later on-demand recovery: the active branch
+    // is re-read through the host each time, never copied into this gate.
+    this.displayBranchReader = (manager.getBranch as () => unknown[]).bind(manager);
+    try {
+      const entries = (manager.getBranch as () => unknown)();
+      if (Array.isArray(entries)) this.display.restore(entries);
+    } catch {
+      // Restored presentation is optional; a host that cannot answer stays quiet.
+    }
   }
 
   /**
@@ -672,19 +805,8 @@ export class ToolProtectionCoordinator {
       // `disclosure` accompanies the refusal for the user only. It is never part
       // of the refusal evidence supplied to a later audit, and it never changes
       // the verdict or the reason the call was refused.
-      const refuse = (reason: string, disclosure?: string): { block: true; reason: string } => {
-        if (call.parentToolCallId) {
-          this.recordDecision(call, rootId, {
-            kind: "blocked",
-            toolName: call.toolName,
-            reason,
-            ...(disclosure === undefined ? {} : { recordWarning: disclosure }),
-            level: this.currentState().settings.level,
-            invocationId: call.callId,
-          });
-        }
-        return block(disclosure === undefined ? reason : `${reason}\n${disclosure}`);
-      };
+      const refuse = (reason: string, disclosure?: string): { block: true; reason: string } =>
+        this.refuseCall(call, reason, disclosure);
       if (loadError !== undefined) {
         return refuse(
           `Tool protection: unavailable — ${loadError} The proposed ${event.toolName} call was not run.`,
@@ -937,11 +1059,54 @@ export class ToolProtectionCoordinator {
     } catch (error) {
       // Fail closed on any unexpected coordinator defect. Never dispatch a call
       // this layer could not evaluate.
-      if (event) this.pending.delete(event.callId);
-      return block(
-        `Tool protection: audit unavailable — the gate could not evaluate this proposal (${errorMessage(error)}). The proposed call was not run.`,
-      );
+      const reason = `Tool protection: audit unavailable — the gate could not evaluate this proposal (${errorMessage(error)}). The proposed call was not run.`;
+      if (!event) return block(reason);
+      this.pending.delete(event.callId);
+      return this.refuseCall(event, reason);
     }
+  }
+
+  /**
+   * Refuse one bound call, and record how that refusal is presented.
+   *
+   * A nested refusal is aggregated onto its root, because a child's own returned
+   * value must stay untouched. A root refusal never reaches a `tool_result` hook
+   * at all, so a result renderer that ignores content would otherwise hide the
+   * gate's diagnostic from the user: the exact text handed to the host is
+   * recorded against the host's own call id, and the row decoration draws that
+   * recorded text and removes it from the renderer's copy only when the content
+   * carries it byte-for-byte. Recorded presentation is never read back as an
+   * admission decision, and a tool result this gate has no provenance for is
+   * never rewritten.
+   */
+  private refuseCall(call: ToolCallShape, reason: string, disclosure?: string): { block: true; reason: string } {
+    const refusal = block(disclosure === undefined ? reason : `${reason}\n${disclosure}`);
+    const level = this.currentState().settings.level;
+    if (call.parentToolCallId) {
+      this.recordDecision(call, rootCallId(call.parentToolCallId), {
+        kind: "blocked",
+        toolName: call.toolName,
+        reason,
+        ...(disclosure === undefined ? {} : { recordWarning: disclosure }),
+        level,
+        invocationId: call.callId,
+      });
+      return refusal;
+    }
+    const toolName = clampAuditDisplayText(call.toolName, 120) || "tool";
+    this.display.publish({
+      version: TOOL_PROTECTION_DISPLAY_VERSION,
+      callId: call.callId,
+      toolName,
+      surface: this.display.surfaceFor(call.toolName),
+      nestedTotal: 0,
+      refusalTotal: 1,
+      nestedWarningCount: 0,
+      nestedRefusalWarningCount: 0,
+      rootRefusalText: refusal.reason,
+      records: [{ kind: "blocked", toolName, level, nested: false }],
+    });
+    return refusal;
   }
 
   /** The live protection state for this runtime (pinned child or ambient parent). */
@@ -1151,11 +1316,16 @@ export class ToolProtectionCoordinator {
     if (event.parentToolCallId) {
       // Nested decisions never rewrite the child's returned value; they are
       // aggregated into the outer call's model-visible result instead.
-      const aggregate = this.byRoot.get(rootId) ?? { decisions: [], total: 0, recordWarningCount: 0 };
+      const aggregate = this.byRoot.get(rootId)
+        ?? { decisions: [], total: 0, refusalTotal: 0, recordWarningCount: 0, refusalWarningCount: 0 };
       aggregate.total += 1;
+      if (record.kind === "blocked") aggregate.refusalTotal += 1;
       // Counted before any retention limit, so a dropped or undisplayed line still
       // leaves its save failure visible in the outer annotation.
-      if (record.recordWarning !== undefined) aggregate.recordWarningCount += 1;
+      if (record.recordWarning !== undefined) {
+        aggregate.recordWarningCount += 1;
+        if (record.kind === "blocked") aggregate.refusalWarningCount += 1;
+      }
       aggregate.decisions.push(record);
       if (aggregate.decisions.length > MAX_NESTED_PER_ROOT) {
         // Retention loss is disclosed in the outer annotation; prefer keeping
@@ -1191,7 +1361,15 @@ export class ToolProtectionCoordinator {
     }
   }
 
-  /** Attach the decision to the same tool result; never rewrite nested values. */
+  /**
+   * Publish this call's user-only diagnostics, and add the model-visible half.
+   *
+   * The model-visible half is only ever a nested refusal: a PASS, a NOT AUDITED
+   * record, or a save failure on either of them adds nothing to the acting
+   * model's result, which stays byte-identical to what the tool returned. Never
+   * a nested value rewrite: nested results are programmatic input to their
+   * caller, so their text and structured value stay untouched.
+   */
   private annotateToolResult(args: unknown[]): { content: unknown[] } & Record<string, unknown> | undefined {
     try {
       const event = args[0];
@@ -1208,14 +1386,36 @@ export class ToolProtectionCoordinator {
       if (!own && !nested) return undefined;
       this.byCall.delete(callId);
       this.byRoot.delete(callId);
-      const text = [own ? statusLine(own) : undefined, nested && nested.total > 0 ? nestedLines(nested.decisions, nested.total, nested.recordWarningCount) : undefined]
-        .filter((value): value is string => typeof value === "string" && value.length > 0)
-        .join("\n");
-      if (text.length === 0) return undefined;
+      const toolName = typeof event.toolName === "string" && event.toolName.length > 0
+        ? event.toolName
+        : own?.toolName ?? "tool";
+      const records: AuditDisplayRecord[] = [];
+      if (own) records.push(displayRecord(own, false));
+      for (const record of nested?.decisions ?? []) records.push(displayRecord(record, true));
+      const data: AuditDisplayData = {
+        version: TOOL_PROTECTION_DISPLAY_VERSION,
+        callId,
+        toolName,
+        surface: this.display.surfaceFor(toolName),
+        nestedTotal: nested?.total ?? 0,
+        refusalTotal: nested?.refusalTotal ?? 0,
+        nestedWarningCount: nested?.recordWarningCount ?? 0,
+        nestedRefusalWarningCount: nested?.refusalWarningCount ?? 0,
+        records: boundAuditDisplayRecords(
+          records.find((record) => !record.nested),
+          records.filter((record) => record.nested),
+        ),
+      };
+      // Durable UI state first: the rows survive a reload or branch switch, and
+      // a restored entry is never read back as a decision.
+      this.display.publish(data);
+      const lines = auditDisplayModelLines(data);
+      if (lines.length === 0) return undefined;
+      const text = lines.join("\n");
       const existing = Array.isArray(event.content) ? event.content : [];
       const result: Record<string, unknown> = {
-        // The model-visible content carries the annotation; images and any
-        // native text are preserved in order after it.
+        // Only a refusal block is prepended; images and any native text are
+        // preserved in order after it.
         content: [{ type: "text", text }, ...existing],
         isError: event.isError === true,
       };
@@ -1448,8 +1648,22 @@ export class ToolProtectionCoordinator {
       resolver: (toolName: string, next: () => unknown) => unknown,
     ) => void;
     try {
-      register((_toolName, next) => {
+      register((toolName, next) => {
         const base = next();
+        // Capability probe, learned from the host's own renderer resolution: is
+        // this gate's row decoration the surface that draws this tool's rows?
+        // With the current decoration the answer is every definition the host
+        // resolves: the wrapper installed here draws the gate rows for any call
+        // this gate has provenance for, including a definition with no result
+        // renderer of its own, whose body this decoration draws through the
+        // host's own native-fallback conventions (#547). Only a definition the
+        // host does not resolve at all leaves the whole row to the host's
+        // fallback with no gate rows, and its user-only rows then come from the
+        // entry renderer instead. The probe records the effective row owner
+        // rather than whether the original definition happened to carry a
+        // method, so exactly one surface draws a call: neither a duplicate nor a
+        // hidden refusal.
+        this.display.noteToolRenderer(toolName, isRecord(base));
         if (!isRecord(base)) return base;
         const baseRender = typeof base.renderResult === "function"
           ? base.renderResult.bind(base) as (...callArgs: any[]) => unknown
@@ -1464,14 +1678,15 @@ export class ToolProtectionCoordinator {
         const selfShell = base.renderShell === "self";
         return {
           ...base,
-          // Thin decoration only: draw the safely encoded gate lines above the
+          // Thin decoration only: draw the safely encoded gate rows above the
           // remaining renderer, and give that renderer an immutable copy without
           // the same lines so native result content is not shown twice. Display
           // spacing, wrapping and theme styling only — no model-visible text
           // changes here.
           renderResult: (...callArgs: any[]) => {
             const result = callArgs[0];
-            const annotation = annotationDisplayFromResult(result);
+            const context = callArgs[3];
+            const annotation = this.displayForRender(result, context);
             // Pi reuses the component a renderer returned last time as
             // `context.lastComponent`. Hand the native renderer its own
             // component rather than this decoration wrapper, so the native
@@ -1479,7 +1694,6 @@ export class ToolProtectionCoordinator {
             // the gate rows are never nested or duplicated across redraws. A
             // lightweight context without a per-row state keeps the previous
             // pass-through behavior.
-            const context = callArgs[3];
             const state = isRecord(context) && isRecord(context.state)
               ? context.state as Record<string | symbol, unknown>
               : undefined;
@@ -1508,10 +1722,10 @@ export class ToolProtectionCoordinator {
             // Pi hands the live theme to renderResult as its third argument.
             // Use its ordinary semantic tokens so the audit rows read like
             // native status text; a lightweight host/mock without a theme keeps
-            // the plain rows. The verdict comes from the annotation line itself,
-            // so a nested FAIL, a NOT AUDITED row, or a recording warning is
+            // the plain rows. The verdict comes from the gate's own row text,
+            // so a nested refusal, a NOT AUDITED row, or a recording warning is
             // never shown as success merely because the tool returned normally.
-            const theme = annotationDisplayTheme(callArgs[2]);
+            const theme = auditDisplayTheme(callArgs[2]);
             // A self-shell row is painted by whoever draws it, so the gate rows
             // and the body rows below them use the host's own semantic row
             // background — pending while the tool runs, error for a failed
@@ -1535,11 +1749,7 @@ export class ToolProtectionCoordinator {
                   // Sanitize and wrap first, then style each physical row: theme
                   // escapes are never counted as printable width, and the row
                   // text and order are unchanged.
-                  ...annotation.lines.flatMap((line) => {
-                    const color = annotationDisplayColor(line);
-                    return wrapAtWordBoundaries(visibleTerminalText(line), contentWidth)
-                      .map((chunk) => `${" ".repeat(pad)}${theme === undefined ? chunk : theme.fg(color, chunk)}`);
-                  }),
+                  ...auditDisplayRows(annotation.lines, theme, contentWidth, pad),
                 ];
                 const bodyRows = inner !== undefined
                   ? inner.render(width)
@@ -1564,7 +1774,81 @@ export class ToolProtectionCoordinator {
       });
     } catch {
       // A host without a usable renderer registry keeps the native fallback;
-      // model-visible content still carries every decision.
+      // model-visible content still carries every refusal this gate reports.
+    }
+  }
+
+  /**
+   * Draw a call's presentation from call-bound provenance only.
+   *
+   * Display state is keyed by the host's public `toolCallId`. A result this gate
+   * has no provenance for — an older session, a tool whose own output happens to
+   * look like an audit line, or a row that never drew these rows — is handed to
+   * the renderer exactly as the tool returned it, and nothing is drawn above it.
+   * Text is removed from the renderer's copy only when it is byte-for-byte one
+   * of the blocks this gate recorded for this call.
+   *
+   * Provenance is call-bound and bounded: this gate's bounded display lookup
+   * while it retains the call, then the provenance this very row already drew.
+   * Pi keeps one `context.state` object per tool row, so an older row keeps
+   * drawing its own rows after the bounded lookup evicts the call — on an
+   * expansion, a redraw, or a later pass — without a wider cache, a second
+   * writer, an extra audit, or any guess from the tool's own text. It stays
+   * presentation only: restored or stashed state is never an approval.
+   */
+  private displayForRender(result: unknown, context: unknown): AnnotationDisplay | undefined {
+    const callId = isRecord(context) && typeof context.toolCallId === "string" ? context.toolCallId : undefined;
+    if (callId === undefined) return undefined;
+    const rowState = isRecord(context) && isRecord(context.state)
+      ? context.state as Record<symbol, unknown>
+      : undefined;
+    const canRecover = this.displayBranchReader !== undefined && this.display.publishedAny;
+    const data = this.display.dataFor(callId)
+      ?? stashedDisplayProvenance(rowState, callId)
+      ?? (canRecover ? this.recoverDisplayProvenance(callId) : undefined);
+    if (!data) return undefined;
+    if (rowState !== undefined) rowState[ANNOTATION_DISPLAY_PROVENANCE] = data;
+    // This decoration is the row surface: it only wraps a tool the host resolved
+    // with a result renderer, so these rows are the route drawing this call now,
+    // whatever surface was recorded when the call was audited.
+    const userOnly = auditDisplayUserLines(data, this.currentState().settings.debug === true, "row");
+    const carried = auditDisplayModelLines(data);
+    const recorded = data.rootRefusalText === undefined ? [] : [data.rootRefusalText];
+    const blocks = [...(carried.length === 0 ? [] : [carried.join("\n")]), ...recorded];
+    if (blocks.length === 0) {
+      return userOnly.length === 0 ? undefined : { lines: userOnly, view: result };
+    }
+    const stripped = stripRecordedBlocks(result, blocks);
+    if (stripped === undefined || stripped.stripped === 0) {
+      // None of this call's recorded blocks is in the content this renderer was
+      // handed, so the content is left untouched and only the rows are drawn.
+      return userOnly.length === 0 ? undefined : { lines: userOnly, view: result };
+    }
+    return { lines: [...userOnly, ...carried], view: stripped.view };
+  }
+
+  /**
+   * Recover one call's recorded presentation from the entries the host reports
+   * for the ACTIVE branch, when the bounded lookup no longer retains the call.
+   * The record is found by the host's own call id among this gate's own entry
+   * type: no tool text is pattern-matched, nothing is cached beyond the same
+   * bounded lookup, no second writer or audit is added, and only the branch the
+   * user is looking at is read. A recovered record is presentation only and can
+   * never authorize a call.
+   */
+  private recoverDisplayProvenance(callId: string): AuditDisplayData | undefined {
+    const readBranch = this.displayBranchReader;
+    if (readBranch === undefined) return undefined;
+    try {
+      const entries = readBranch();
+      if (!Array.isArray(entries)) return undefined;
+      const data = findAuditDisplayData(entries, callId);
+      if (data) this.display.remember(data);
+      return data;
+    } catch {
+      // A host that cannot answer keeps the presentation quiet; no decision and
+      // no model-visible content changes.
+      return undefined;
     }
   }
 }
@@ -1730,69 +2014,28 @@ function lineageOf(parentToolCallId: string): string[] {
   return lineage;
 }
 
-function statusLine(record: AnnotationRecord): string {
-  if (record.kind === "not-audited-discovery") {
-    return `Tool protection: NOT AUDITED — ${record.toolName} is the tool-discovery loader, which this gate never audits. No auditor was consulted and no audit approval was needed for this call; the existing native authorization, permission, and liveness guards still applied and could still refuse it. This is not a pass.`;
-  }
-  if (record.kind === "not-audited") {
-    return `Tool protection: NOT AUDITED — ${record.toolName} is outside the configured toolProtection.scope "selected" audit subset, so the auditor did not evaluate it. The gate did not check this call; only the existing native guards applied.`;
-  }
-  const warning = record.recordWarning === undefined ? "" : ` ${record.recordWarning}`;
-  if (record.kind === "blocked") {
-    return `Tool protection: FAIL — ${record.reason ?? `${record.toolName} was refused before execution`}${warning}`;
-  }
-  const timing = record.durationMs !== undefined ? `, ${record.durationMs} ms` : "";
-  const head = `Tool protection: PASS — the auditor approved this ${record.toolName} call before execution (level "${record.level}"${timing}). This is an audit decision, not a claim that the tool succeeded.`;
-  const body = record.reason !== undefined
-    ? `${head} Auditor reason: ${record.reason}`
-    : `${head} The auditor supplied no reason (host status, not auditor reasoning).`;
-  return `${body}${warning}`;
-}
-
-function nestedLines(records: AnnotationRecord[], total: number, recordWarningCount: number): string {
-  // Keep every retained refusal visible even when the summary line budget is
-  // smaller than the retained set; an earlier denial must not be hidden behind
-  // later passes.
-  const blocked = records.filter((record) => record.kind === "blocked");
-  const passBudget = Math.max(0, MAX_NESTED_LINES - blocked.length);
-  const shownSet = new Set<AnnotationRecord>([
-    ...blocked.slice(0, MAX_NESTED_LINES),
-    ...(passBudget > 0 ? records.filter((record) => record.kind !== "blocked").slice(-passBudget) : []),
-  ]);
-  const shown = records.filter((record) => shownSet.has(record));
-  // A save failure whose own decision line is omitted or evicted is disclosed on the
-  // summary header instead of disappearing with the line. The decision summary bounds
-  // and the verdicts themselves are unchanged.
-  const hiddenRecordWarnings = recordWarningCount - shown.filter((record) => record.recordWarning !== undefined).length;
-  const saveWarning = hiddenRecordWarnings > 0
-    ? ` WARNING: ${hiddenRecordWarnings} auditor session(s) could not be fully saved; their decision lines are omitted here. The gate decisions are unchanged.`
-    : "";
-  const lines = [
-    `Tool protection: ${total} nested call decision(s) in this tool's execution:${saveWarning}`,
-    ...shown.map((record) => {
-      if (record.kind === "not-audited") {
-        return `- nested ${record.toolName}: NOT AUDITED — outside the configured audit subset; not checked by the gate.`;
-      }
-      if (record.kind === "not-audited-discovery") {
-        return `- nested ${record.toolName}: NOT AUDITED — discovery loader, never audited by this gate; native guards still applied.`;
-      }
-      const warning = record.recordWarning === undefined ? "" : ` ${record.recordWarning}`;
-      if (record.kind === "blocked") {
-        return `- nested ${record.toolName}: FAIL/BLOCKED before execution — ${record.reason ?? "no reason supplied"}${warning}`;
-      }
-      const reason = record.reason !== undefined
-        ? `auditor reason: ${record.reason}`
-        : "the auditor supplied no reason (host status, not auditor reasoning)";
-      return `- nested ${record.toolName}: PASS — approved before execution; ${reason}${warning}`;
-    }),
-  ];
-  if (records.length > shown.length) {
-    lines.push(`- ${records.length - shown.length} earlier nested decision(s) omitted from this summary.`);
-  }
-  if (total > records.length) {
-    lines.push(`- RETENTION LOSS: ${total - records.length} nested decision record(s) are not retained in this summary (bounded runtime state). Refusals are retained preferentially; this count is disclosed rather than presented as complete.`);
-  }
-  return lines.join("\n");
+/**
+ * One admission record as bounded user-only display metadata. A PASS or NOT
+ * AUDITED record keeps no reason at all; only a refusal keeps its reason,
+ * because that refusal is already model-visible in the outer call's result. The
+ * reason is stored as supplied — the display path never trims it or cuts it
+ * shorter than the auditor's own bound, and an empty supplied reason stays an
+ * empty supplied reason.
+ */
+function displayRecord(record: AnnotationRecord, nested: boolean): AuditDisplayRecord {
+  return {
+    kind: record.kind,
+    toolName: clampAuditDisplayText(record.toolName, 120) || "tool",
+    level: record.level,
+    nested,
+    ...(record.durationMs === undefined ? {} : { durationMs: record.durationMs }),
+    ...(record.kind === "blocked" && record.reason !== undefined
+      ? { reason: clampAuditDisplayReason(record.reason) }
+      : {}),
+    ...(record.recordWarning === undefined
+      ? {}
+      : { recordWarning: clampAuditDisplayWarning(record.recordWarning) }),
+  };
 }
 
 /**
@@ -1812,21 +2055,11 @@ interface AnnotationDisplay {
 const ANNOTATION_DISPLAY_INNER = Symbol("pi-review-gate.annotation-display-inner");
 
 /**
- * The gate's own auditor-session recording failures, in each form they take: a
- * per-call warning, and the bounded nested summary's aggregate count.
+ * Per-row slot holding the call-bound display provenance this row already drew.
+ * Pi keeps one render-context `state` object per tool row, so this is bounded by
+ * the rows on screen and never becomes a wider presentation cache.
  */
-const SAVE_WARNING_PATTERN = /Tool protection: the auditor session (?:could not be saved|was only partially saved)|WARNING: \d+ auditor session\(s\) could not be fully saved/;
-
-/** Theme subset the audit-status rows use; matches Pi's `theme.fg()` contract. */
-type AnnotationDisplayColor = "accent" | "error" | "muted" | "success" | "warning";
-
-/** Row backgrounds Pi's own tool row uses; matches `theme.bg()` tokens. */
-type AnnotationDisplayBackground = "toolErrorBg" | "toolPendingBg" | "toolSuccessBg";
-
-interface AnnotationDisplayTheme {
-  fg(color: AnnotationDisplayColor, text: string): string;
-  bg?(color: AnnotationDisplayBackground, text: string): string;
-}
+const ANNOTATION_DISPLAY_PROVENANCE = Symbol("pi-review-gate.annotation-display-provenance");
 
 /** The structural component shape this decoration wraps or replaces. */
 interface AnnotationDisplayComponent {
@@ -1836,41 +2069,19 @@ interface AnnotationDisplayComponent {
 }
 
 /**
- * The theme Pi passes to `renderResult`, when the host supplies one. Lightweight
- * compatibility mocks without a theme keep the existing plain rows.
+ * The provenance this row already drew, accepted only when it is this gate's own
+ * record for this exact call id. Anything else — a hand-edited context, another
+ * call's record — is no provenance at all.
  */
-function annotationDisplayTheme(value: unknown): AnnotationDisplayTheme | undefined {
-  if (!isRecord(value) || typeof value.fg !== "function") return undefined;
-  return value as unknown as AnnotationDisplayTheme;
-}
-
-/**
- * A nested decision row's verdict token. The tool name is matched up to the
- * first `: ` (Pi tool names carry no whitespace or colon) and the verdict must
- * be the token immediately after it, so verdict-shaped text inside the
- * auditor's reason cannot change the row's tone. The alternation is ordered so
- * the earliest token wins when a reason quotes another verdict.
- */
-const NESTED_VERDICT_PATTERN = /^- nested [^\s:]+: (NOT AUDITED|FAIL\/BLOCKED before execution|PASS)\b/;
-
-/**
- * Semantic tone of one gate display row, read from the gate's own line text.
- * The verdict always comes from the annotation itself — never from the tool's
- * completion — so a nested FAIL, a NOT AUDITED row, or a recording warning is
- * never presented as success merely because the tool returned normally.
- */
-function annotationDisplayColor(line: string): AnnotationDisplayColor {
-  const nestedVerdict = NESTED_VERDICT_PATTERN.exec(line)?.[1];
-  // A verdict outranks a recording warning appended to the same line.
-  if (/^Tool protection: FAIL\b/.test(line) || nestedVerdict === "FAIL/BLOCKED before execution") {
-    return "error";
-  }
-  if (SAVE_WARNING_PATTERN.test(line)) return "warning";
-  if (/^Tool protection: NOT AUDITED\b/.test(line) || nestedVerdict === "NOT AUDITED") return "warning";
-  if (/^Tool protection: PASS\b/.test(line) || nestedVerdict === "PASS") return "success";
-  if (/^- RETENTION LOSS:/.test(line)) return "warning";
-  if (/^- \d+ earlier nested decision\(s\) omitted/.test(line)) return "muted";
-  return "accent";
+function stashedDisplayProvenance(
+  state: Record<symbol, unknown> | undefined,
+  callId: string,
+): AuditDisplayData | undefined {
+  const stashed = state === undefined ? undefined : state[ANNOTATION_DISPLAY_PROVENANCE];
+  if (!isRecord(stashed)) return undefined;
+  if (stashed.version !== TOOL_PROTECTION_DISPLAY_VERSION) return undefined;
+  if (stashed.callId !== callId || !Array.isArray(stashed.records)) return undefined;
+  return stashed as unknown as AuditDisplayData;
 }
 
 /**
@@ -1883,12 +2094,12 @@ function annotationDisplayColor(line: string): AnnotationDisplayColor {
  * background while its `Tool protection: PASS` line keeps the success token.
  */
 function annotationDisplayBackground(
-  theme: AnnotationDisplayTheme | undefined,
+  theme: AuditDisplayTheme | undefined,
   options: unknown,
   context: unknown,
 ): ((text: string) => string) | undefined {
   if (theme === undefined || typeof theme.bg !== "function") return undefined;
-  const color: AnnotationDisplayBackground = isRecord(options) && options.isPartial === true
+  const color: AuditDisplayBackground = isRecord(options) && options.isPartial === true
     ? "toolPendingBg"
     : isRecord(context) && context.isError === true
       ? "toolErrorBg"
@@ -1948,7 +2159,7 @@ const NATIVE_FALLBACK_PREVIEW_LINES = 10;
  */
 function annotationFallbackRows(
   view: unknown,
-  theme: AnnotationDisplayTheme | undefined,
+  theme: AuditDisplayTheme | undefined,
   expanded: boolean,
   context: unknown,
   width: number,
@@ -1956,10 +2167,10 @@ function annotationFallbackRows(
 ): string[] {
   if (!isRecord(view) || !Array.isArray(view.content)) return [];
   const indent = " ".repeat(pad);
-  const style = (color: AnnotationDisplayColor | "toolOutput", line: string): string => {
+  const style = (color: AuditDisplayColor | "toolOutput", line: string): string => {
     if (theme === undefined) return line;
     try {
-      return theme.fg(color as AnnotationDisplayColor, line);
+      return theme.fg(color as AuditDisplayColor, line);
     } catch {
       return line;
     }
@@ -1990,7 +2201,7 @@ function annotationFallbackRows(
       // parenthesis is left when the hint is unavailable.
       const hint = theme === undefined
         ? undefined
-        : expansionHint(false, (color, hintText) => theme.fg(color as AnnotationDisplayColor, hintText));
+        : expansionHint(false, (color, hintText) => theme.fg(color as AuditDisplayColor, hintText));
       const label = style("muted", `... (${omitted} more lines)`);
       const hintRow = hint === undefined ? label : `${label} ${hint}`;
       for (const chunk of wrapAnsiAwareRows(hintRow, width)) rows.push(`${indent}${chunk}`);
@@ -2031,41 +2242,38 @@ function annotationImageMimeType(item: unknown): string {
 }
 
 /**
- * Extract this gate's own annotation from an already-annotated result, for the
- * thin renderer decoration. The base renderer receives a copy without the
- * drawn lines so a native renderer does not show the same refusal or status
- * twice, while a custom renderer that ignores `content` still gets the lines
- * above its own output. The original result is left untouched.
+ * Remove exactly the blocks this gate recorded for this call, each identified by
+ * the text this gate itself handed the host rather than by any text that merely
+ * starts like an audit prefix. A content block that does not carry one of those
+ * exact blocks is returned untouched, so a tool's own output is never rewritten
+ * or hidden because it resembles a gate line.
  */
-function annotationDisplayFromResult(result: unknown): AnnotationDisplay | undefined {
+function stripRecordedBlocks(
+  result: unknown,
+  blocks: readonly string[],
+): { view: unknown; stripped: number } | undefined {
   if (!isRecord(result) || !Array.isArray(result.content)) return undefined;
-  for (let index = 0; index < result.content.length; index += 1) {
-    const item = result.content[index];
-    if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string" || !item.text.startsWith("Tool protection:")) continue;
-    const text = item.text;
-    // A recording failure must stay visible even when a custom renderer ignores
-    // the content left outside this decoration's ordinary display budget. Ordinary
-    // annotations keep the existing line and character limits; a warning-bearing
-    // annotation is drawn whole, and the removal logic below then prevents any
-    // duplicate from the native block.
-    const lines = SAVE_WARNING_PATTERN.test(text)
-      ? text.split("\n")
-      : text
-        .slice(0, MAX_RETAINED_EVIDENCE_TEXT)
-        .split("\n")
-        .slice(0, MAX_NESTED_LINES + 1);
-    const drawn = lines.join("\n");
-    // Remove only whole lines this decoration draws. A retention truncation
-    // that cut a line in half cannot be reproduced by the header, so in that
-    // case the native block stays intact rather than losing visible text.
-    if (text !== drawn && !text.startsWith(`${drawn}\n`)) return { lines, view: result };
-    const remainder = text === drawn ? "" : text.slice(drawn.length + 1);
-    const content = remainder.length === 0
-      ? result.content.filter((_block, blockIndex) => blockIndex !== index)
-      : result.content.map((block, blockIndex) => blockIndex === index ? { ...item, text: remainder } : block);
-    return { lines, view: { ...result, content } };
+  let content = result.content as unknown[];
+  let stripped = 0;
+  for (const block of blocks) {
+    if (block.length === 0) continue;
+    for (let index = 0; index < content.length; index += 1) {
+      const item = content[index];
+      if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") continue;
+      const text = item.text;
+      if (text !== block && !text.startsWith(`${block}\n`)) continue;
+      const remainder = text === block ? "" : text.slice(block.length + 1);
+      content = remainder.length === 0
+        ? content.filter((_block, blockIndex) => blockIndex !== index)
+        : content.map((blockItem, blockIndex) => (blockIndex === index
+          ? { ...(blockItem as Record<string, unknown>), text: remainder }
+          : blockItem));
+      stripped += 1;
+      break;
+    }
   }
-  return undefined;
+  if (stripped === 0) return { view: result, stripped: 0 };
+  return { view: { ...result, content }, stripped };
 }
 
 function auditorWireInput(

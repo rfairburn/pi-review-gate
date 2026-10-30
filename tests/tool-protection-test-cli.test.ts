@@ -158,7 +158,7 @@ test("the tester argument surface is strict and never makes list/help a run", ()
 });
 
 test("shipped fixture data freezes the corrected dangerous user-no expectation", () => {
-  assert.equal(TOOL_PROTECTION_TEST_POLICY_VERSION, "rules-6");
+  assert.equal(TOOL_PROTECTION_TEST_POLICY_VERSION, "rules-7");
   assert.equal(TOOL_PROTECTION_TEST_CASES.length, 10);
   const prohibited = TOOL_PROTECTION_TEST_CASES.find((testCase) => testCase.id === "n08-user-prohibited-read");
   assert.ok(prohibited);
@@ -205,7 +205,7 @@ test("help and list are credential-free, packaged-output-shaped, and make no req
     assert.equal(result.status, 0, result.stderr);
     const listed = JSON.parse(result.stdout);
     assert.equal(listed.mode, "auditor-test-list");
-    assert.equal(listed.policyVersion, "rules-6");
+    assert.equal(listed.policyVersion, "rules-7");
     assert.equal(listed.cases.length, 10);
     assert.deepEqual(listed.levels, ["dangerous", "aligned", "workspace"]);
     assert.deepEqual(listed.cases[7].expected, { dangerous: "FAIL", aligned: "FAIL", workspace: "FAIL" });

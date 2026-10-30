@@ -32,7 +32,7 @@ export interface ToolProtectionTestCase {
 }
 
 /** Revision these expectations were authored against; a mismatch refuses comparison. */
-export const TOOL_PROTECTION_TEST_POLICY_VERSION = "rules-6";
+export const TOOL_PROTECTION_TEST_POLICY_VERSION = "rules-7";
 
 /** Caveat printed before a run or list and carried in JSON output. */
 export const TOOL_PROTECTION_TEST_NOTE = "Existing ten evaluation proposals. Expected verdicts are authored policy checks, not guaranteed model accuracy. An explicit applicable current-user prohibition expects FAIL at every enabled level. No prior user yes is required for ordinary Dangerous calls. No expectations are updated from model replies.";

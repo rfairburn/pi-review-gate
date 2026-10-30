@@ -45,6 +45,9 @@ test("an absent block stays Off, stores no second enable flag, and audits nothin
     maxContextChars: 128_000,
     // Retention is default-off and part of the same block: no second enable flag.
     retainAuditorSessions: false,
+    // Debug output is default-off and part of the same block: also not a second
+    // enable flag, and never a second store.
+    debug: false,
   });
   assert.deepEqual([...PROTECTION_LEVELS], ["off", "dangerous", "aligned", "workspace"]);
   assert.equal(toolProtectionAppliesTo(settings, "bash"), false);
@@ -62,6 +65,7 @@ test("optional fields default and an unresolved auditor selection is preserved",
     timeoutMs: DEFAULT_TOOL_PROTECTION_CONFIG.timeoutMs,
     maxContextChars: DEFAULT_TOOL_PROTECTION_CONFIG.maxContextChars,
     retainAuditorSessions: false,
+    debug: false,
   });
 
   const pi = normalizeToolProtectionConfig({
@@ -222,6 +226,7 @@ test("recovery keeps a valid block and never discards an unresolvable auditor re
     timeoutMs: DEFAULT_TOOL_PROTECTION_CONFIG.timeoutMs,
     maxContextChars: DEFAULT_TOOL_PROTECTION_CONFIG.maxContextChars,
     retainAuditorSessions: false,
+    debug: false,
   });
   assert.equal(mixed.config.maxPatchBytes, DEFAULT_CONFIG.maxPatchBytes);
   assert.deepEqual(mixed.warnings, ["maxPatchBytes is invalid or unsupported; using its default."]);
@@ -335,6 +340,101 @@ test("a stored file without the retention field loads as Off and an explicit On 
     assert.equal(await readFile(onPath, "utf8"), JSON.stringify({
       toolProtection: { level: "dangerous", auditor: { source: "external", id: "a" }, retainAuditorSessions: true },
     }), "loading never rewrites the stored document");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #549: the optional audit-diagnostic switch
+// ---------------------------------------------------------------------------
+
+test("audit debug output is default-off, strict, and changes no decision input", () => {
+  // Absent means Off, so a stored block, a parent launch pin, or a build that
+  // predates the field keeps the pre-#549 presentation exactly.
+  assert.equal(DEFAULT_TOOL_PROTECTION_CONFIG.debug, false);
+  assert.equal(Object.hasOwn(DEFAULT_TOOL_PROTECTION_CONFIG, "enabled"), false,
+    "debug is not a second enable flag");
+  assert.equal(normalizeToolProtectionConfig({ ...enabled }).debug, false);
+  assert.equal(effectiveToolProtectionSettings(normalizeConfig({ toolProtection: { ...enabled } })).debug, false);
+
+  const on = normalizeToolProtectionConfig({ ...enabled, debug: true });
+  assert.equal(on.debug, true);
+  assert.deepEqual(normalizeToolProtectionConfig(on), on, "a normalized block normalizes to itself");
+  assert.equal(normalizeConfig({ toolProtection: { ...enabled, debug: true } }).toolProtection?.debug, true);
+  assert.equal(normalizeToolProtectionConfig({ ...enabled, debug: false }).debug, false);
+
+  // Only the JSON booleans are accepted: a half-written setting beside a
+  // protection control must not silently change what the user sees by coercion.
+  for (const value of ["true", "false", 1, 0, null, [], {}, "yes"]) {
+    assert.throws(() => normalizeToolProtectionConfig({ ...enabled, debug: value }), Error, JSON.stringify(value));
+    assert.throws(() => normalizeConfig({ toolProtection: { ...enabled, debug: value } }), Error, JSON.stringify(value));
+  }
+  // An explicit `undefined` is indistinguishable from an absent key: Off.
+  assert.equal(normalizeToolProtectionConfig({ ...enabled, debug: undefined }).debug, false);
+
+  // An unintelligible stored value is the same fail-closed load error every
+  // other field in this block gets — never a silent default, never an implicit
+  // Off, and the rest of the configuration still loads.
+  const recovered = recoverConfig({
+    web: { enabled: false },
+    toolProtection: { ...enabled, debug: "true" },
+  });
+  assert.match(recovered.toolProtectionError ?? '', /toolProtection\.debug must be true or false/);
+  assert.equal(recovered.config.toolProtection, undefined);
+  assert.equal(recovered.config.web?.enabled, false);
+
+  // The switch changes no decision input: the same block with it On audits
+  // exactly the same calls under the same scope, and never enables the gate.
+  const offSettings = effectiveToolProtectionSettings(normalizeConfig({ toolProtection: { ...enabled, scope: "selected", toolNames: ["bash"] } }));
+  const onSettings = effectiveToolProtectionSettings(normalizeConfig({ toolProtection: { ...enabled, scope: "selected", toolNames: ["bash"], debug: true } }));
+  for (const name of ["bash", "read", "anything-else"]) {
+    assert.equal(toolProtectionAppliesTo(offSettings, name), toolProtectionAppliesTo(onSettings, name), name);
+  }
+  assert.deepEqual({ ...offSettings, debug: true }, onSettings);
+  assert.equal(onSettings.enabled, offSettings.enabled, "debug never enables or disables the gate");
+
+  // `Off` stays the only way to stop the gate: debug On over an Off block
+  // audits nothing and invents no auditor requirement.
+  const offLevel = effectiveToolProtectionSettings(normalizeConfig({ toolProtection: { level: "off", auditor: null, debug: true } }));
+  assert.equal(offLevel.enabled, false);
+  assert.equal(offLevel.debug, true);
+  assert.equal(toolProtectionAppliesTo(offLevel, "bash"), false, "debug On over Off still audits nothing");
+});
+
+test("a stored file without the debug field loads as Off and an explicit On survives reload", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-debug-"));
+  try {
+    const legacyPath = join(dir, "legacy.json");
+    await writeFile(legacyPath, JSON.stringify({
+      toolProtection: { level: "dangerous", auditor: { source: "external", id: "a" }, timeoutMs: 20_000 },
+    }), "utf8");
+    const legacy = loadConfig({ PI_REVIEW_GATE_CONFIG: legacyPath });
+    assert.equal(legacy.toolProtectionError, undefined);
+    assert.equal(effectiveToolProtectionSettings(legacy.config).debug, false);
+    assert.equal(await readFile(legacyPath, "utf8"), JSON.stringify({
+      toolProtection: { level: "dangerous", auditor: { source: "external", id: "a" }, timeoutMs: 20_000 },
+    }), "loading a legacy block never backfills the field");
+
+    const onPath = join(dir, "on.json");
+    await writeFile(onPath, JSON.stringify({
+      toolProtection: { level: "dangerous", auditor: { source: "external", id: "a" }, debug: true },
+    }), "utf8");
+    const on = loadConfig({ PI_REVIEW_GATE_CONFIG: onPath });
+    assert.equal(on.toolProtectionError, undefined);
+    assert.equal(effectiveToolProtectionSettings(on.config).debug, true);
+    assert.equal(await readFile(onPath, "utf8"), JSON.stringify({
+      toolProtection: { level: "dangerous", auditor: { source: "external", id: "a" }, debug: true },
+    }), "loading never rewrites the stored document");
+
+    // A configuration with no protection block at all still stores none: the
+    // default-off derived value is never invented into the record.
+    const emptyPath = join(dir, "empty.json");
+    await writeFile(emptyPath, JSON.stringify({ web: { enabled: false } }), "utf8");
+    const empty = loadConfig({ PI_REVIEW_GATE_CONFIG: emptyPath });
+    assert.equal(empty.config.toolProtection, undefined);
+    assert.equal(effectiveToolProtectionSettings(empty.config).debug, false);
+    assert.equal(await readFile(emptyPath, "utf8"), JSON.stringify({ web: { enabled: false } }));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

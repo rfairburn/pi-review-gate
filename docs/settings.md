@@ -414,8 +414,9 @@ effect.
 - **Tool protection** opens the controls for the pre-execution decision gate: one
   shared Protection level (**Off**, **Dangerous**, **Aligned**, or **Workspace**), one
   auditor selection from the same Pi and external sources, an `all` or exact-name
-  `selected` audit scope, the decision timeout, and the context budget. Off is the
-  default and removes only this added gate; there is no separate enable toggle. See
+  `selected` audit scope, the decision timeout, the context budget, and **Debug audit
+  output**. Off is the default and removes only this added gate; there is no separate
+  enable toggle. See
   [Tool protection](tool-protection.md) and the raw
   [field reference](configuration.md#tool-protection-fields).
 - **Save auditor sessions** is Off by default and controls only whether each auditor
@@ -423,6 +424,17 @@ effect.
   asks for confirmation first, because it starts writing records that contain the exact
   auditor request; turning it off needs no confirmation. Nothing is written while it is
   Off. See [Keeping auditor sessions](tool-protection.md#keeping-auditor-sessions-optional).
+- **Debug audit output** is Off by default and changes only whether this gate's routine
+  `PASS` and `NOT AUDITED` audit lines are shown to you. With it On you get the themed
+  status line, with the level and audit elapsed time for a `PASS` but no PASS reason;
+  `NOT AUDITED` keeps its exemption diagnostic without an invented audit duration. It adds nothing to what the acting model receives for a
+  call the gate did not stop, records nothing, contacts no model or provider, and changes
+  no level, scope, or decision; a `FAIL`, an audit error, and a nested refusal stay
+  reported at either value, and an auditor-session save warning stays visible to you. It
+  is independent of **Save
+  auditor sessions** and is staged by this page's transaction like every other row, then
+  pinned for newly launched Pi executors with the rest of the settings. See
+  [What each call reports](tool-protection.md#what-each-call-reports).
 - **Selected tool names** is chosen in the same searchable multi-select as the deny
   pickers, with the opposite checked meaning: a tool-name query sits above the rows, one
   row is one tool, Enter toggles it, and a checked row means **audited** — never denied.

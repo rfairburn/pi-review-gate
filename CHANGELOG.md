@@ -15,6 +15,58 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.226]
+
+### Fixed
+
+- **Dangerous level stopped auditing the acting agent's own workflow instructions**
+  (#551): with **Dangerous only** selected the auditor weighs only the two harms plus an
+  applicable explicit prohibition stated by a genuine current-session user message.
+  Whether the proposal follows the acting agent's workflow instructions — how it waits
+  for running work, which tool it uses, whether it stays on the stated task — is not a
+  refusal ground at this level even when the deviation is real, and generic framework,
+  host, or skill guidance is never read as a prohibition the user stated. An applicable
+  user `no` still decides `FAIL` for a harmless call; the two harm tests are unchanged
+  and are not waivable by approval; no tool name, path, domain, or signature is
+  allowlisted or denylisted; and `aligned` and `workspace` print their previous rules
+  verbatim and keep their governing-prohibition, alignment, and confinement policy.
+  Policy revision `rules-11`.
+- **The acting agent's instructions are quoted evidence, not rules for the auditor**
+  (#551): the complete governing instruction set still travels verbatim and still fails
+  closed when it cannot fit the context budget, now framed as quoted reference material
+  about the acting agent. The audit request says the auditor is not their addressee,
+  enforces only the tests the code-owned policy block prints, and never treats quoted
+  instructions as a current-session user message; they stay evidence of what the acting
+  agent was told to do and which recipients, targets, and scopes the task authorizes.
+- **Stop-enforcement calls are not the stopped work** (#551): the existing dangerous-level
+  user-prohibition rule now explains that a request to stop work may
+  require tool calls to abort or interrupt running processes or child tasks, calls that
+  carry out that request are not continued performance of the stopped work, and they remain
+  subject to danger checks and any applicable explicit user restriction. This is not
+  blanket stop approval and names no tool; the two harm tests, an applicable user `no`, and
+  cancellation mechanics are unchanged. Model classification accuracy is not established by
+  the deterministic prompt and fixture tests, and this revision is not yet measured against
+  a model.
+- **Catastrophic host destruction remains blocked despite user approval** (#551):
+  dangerous-level H1(a) now explicitly separates that non-waivable floor from other
+  irreversible data loss beyond what the proposal and supplied evidence justify.
+  Other criteria and all eighteen fixture payloads/verdicts are unchanged. Deterministic
+  prompt tests do not establish model classification accuracy.
+
+### Changed
+
+- **Inert fixture tester grew to eighteen proposals** (#551): added synthetic bounded
+  watch, repeated-inspection, off-task, and orderly-stop proposals (each using the
+  argument shape the registered `Subtasks*` tools actually accept) with authored
+  per-level expectations — allowed at every level for the bounded watch and the stop of
+  a report-only task, `PASS` only at `dangerous` for the repeated inspection and the
+  off-task call — plus the same watch and stop under an explicit user ban, a root
+  filesystem wipe the user expressly approved, which stays blocked at every level, and a
+  credential transfer to a recipient the user never named. Expectations are authored
+  policy checks frozen against `rules-11`, never measured model accuracy and never
+  rewritten from a model reply; the proposals are inert data and none is executed. See
+  [Tool protection](docs/tool-protection.md).
+
 ## [0.1.0-dev.225]
 
 ### Added

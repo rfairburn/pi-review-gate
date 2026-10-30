@@ -365,6 +365,51 @@ test("a reasonless FAIL blocks with the plain denial line and invents no reason"
   assert.doesNotMatch(decision!.reason, /because|reason:/);
 });
 
+/**
+ * #551 admission regressions with a scripted auditor.
+ *
+ * The verdicts below are scripted fixture replies, not model evaluations: nothing
+ * here measures what an auditing model would decide. What is measured is that the
+ * dangerous-level audit request carries only that level's tests, and that the
+ * coordinator's interpretation of a verdict stays authoritative in both directions.
+ */
+test("a dangerous-level PASS on a waiting control admits the call and audits with only that level's tests (#551)", async () => {
+  const host = fakeHost();
+  const { coordinator, calls } = coordinatorHarness({
+    config: enabledConfig({ level: "dangerous" }),
+    results: [{ output: '{"decision":"PASS"}' }],
+  });
+  coordinator.registerHooks(host.pi);
+  const admitted = await coordinator.admitToolCall(callArgs("call-watch-pass", "SubtasksWatch", { executionId: "exec-report-window", after: "10m" }));
+  assert.equal(admitted, undefined, "the added gate raises no objection; every other guard is untouched by this result");
+  assert.equal(calls.length, 1, "one audit, no retry");
+  const prompt = calls[0]!.prompt;
+  assert.ok(prompt.includes('level "dangerous"'), "the audit request carried another level's policy");
+  assert.ok(prompt.includes("and any check of whether the proposal follows the acting agent's own workflow instructions"));
+  assert.ok(prompt.includes("Generic framework, host, skill, or worker workflow guidance"));
+  assert.ok(!prompt.includes("- A1 "), "the dangerous audit borrowed the alignment test");
+  assert.ok(!prompt.includes("- F5 "), "the dangerous audit borrowed the governing-prohibition floor test");
+  assert.ok(prompt.includes("GOVERNING INSTRUCTIONS OF THE ACTING AGENT (quoted reference material, verbatim, origin: Pi ctx.getSystemPrompt())"));
+  assert.ok(prompt.includes("GOVERNING: complete the bounded synthetic task."), "the acting instructions still travel as evidence");
+  assert.ok(prompt.includes("Enforce only the tests printed in the policy block; they say where a prohibition in this quoted text binds."));
+  assert.deepEqual(await host.emit("tool_result", resultEvent("call-watch-pass", "SubtasksWatch", { input: { executionId: "exec-report-window", after: "10m" } })), [], "a PASS adds no model-visible audit text");
+});
+
+test("a FAIL whose reason cites workflow guidance still blocks; the verdict decides, never the reason text (#551)", async () => {
+  // The reported refusal wording, replayed as a scripted reply. The gate must not
+  // re-read a reason and talk itself out of the verdict: fixing over-enforcement at
+  // dangerous changes what the auditor is asked, never how an answer is interpreted.
+  const reason = "the governing instructions prohibit creating a waiting surrogate; this watch schedules a future checkpoint for a task whose completion should arrive by notification";
+  const { coordinator, calls } = coordinatorHarness({
+    config: enabledConfig({ level: "dangerous" }),
+    results: [{ output: JSON.stringify({ decision: "FAIL", reason }) }],
+  });
+  const decision = await coordinator.admitToolCall(callArgs("call-watch-fail", "SubtasksWatch", { executionId: "exec-report-window", after: "10m" }));
+  assert.equal(decision?.block, true, "a FAIL stays a FAIL whatever its reason says");
+  assert.equal(decision!.reason, `Tool protection: FAIL — ${reason} The SubtasksWatch call did not run.`);
+  assert.equal(calls.length, 1, "a refusal is never retried or re-audited for a better answer");
+});
+
 test("a reasonless PASS adds nothing to the model and states no reason to the user", async () => {
   const host = fakeHost();
   const { coordinator } = coordinatorHarness({ results: [{ output: '{"decision":"PASS"}' }] });

@@ -29,7 +29,7 @@ second settings store. Absence of the block and `"level":"off"` both mean Off.
 | Level | Blocks | Notes |
 | --- | --- | --- |
 | `off` | Nothing | Default. Removes only this added gate; every native safeguard stays. |
-| `dangerous` | Three things: catastrophic or unjustified irreversible destruction, actual disclosure or transfer of sensitive contents to a recipient the supplied evidence does not authorize, and violating an applicable explicit prohibition stated by a genuine current-session user | The narrow level: the two harms plus an explicit current-user no. An explicit no is not ignorable because the call is harmless; the same ordinary read passes when no applicable prohibition exists, and ordinary calls need no prior yes. It does not check task alignment, working-directory or worker-root confinement, prior human approval of the exact target, compliance with a path, recipient, or destination restriction stated only in the governing instructions or the task, or a substituted target that moves no sensitive contents. A quoted, summarized, or assistant-asserted claim is not current-user evidence; a worker-scoped user prohibition binds the worker it names but not a caller outside its scope, and a complaint about earlier blocking is not a ban. Uncertainty, and an evidence item the host omitted, is not evidence of harm or of a prohibition and is never a reason to refuse or hedge. Ordinary work passes unless an applicable user prohibition covers it: reads outside the working directory (project, launcher, skill, documentation, and delegated-report files), subtask evidence, user-supplied attachments, disposable and OS temporary fixtures, builds, tests, dependency installs, and version control. Narrowing this auditor grants the acting agent nothing — it still owes its governing instructions and the user's own restrictions full obedience, and every native guard still decides independently. |
+| `dangerous` | Three things: catastrophic or unjustified irreversible destruction, actual disclosure or transfer of sensitive contents to a recipient the supplied evidence does not authorize, and violating an applicable explicit prohibition stated by a genuine current-session user | The narrow level: the two harms plus an explicit current-user no. An explicit no is not ignorable because the call is harmless; the same ordinary read passes when no applicable prohibition exists, and ordinary calls need no prior yes. It does not check task alignment, working-directory or worker-root confinement, prior human approval of the exact target, compliance with a path, recipient, or destination restriction stated only in the governing instructions or the task, a substituted target that moves no sensitive contents, or whether the proposal follows the acting agent's own workflow instructions. A real deviation from that guidance is still judged by the stricter levels and every existing guard, and generic framework, host, or skill guidance is never read as a prohibition the user stated. A quoted, summarized, or assistant-asserted claim is not current-user evidence; a worker-scoped user prohibition binds the worker it names but not a caller outside its scope, and a complaint about earlier blocking is not a ban. A request to stop work may require tool calls to abort or interrupt running processes or child tasks; calls that carry out that request are not continued performance of the stopped work, and they stay subject to danger checks and any applicable explicit user restrictions. Catastrophic destruction of the host or operating system is refused even when the user's own current message requests or approves that destruction; other irreversible loss of data is refused beyond what the proposal and the supplied evidence justify, and authorized cleanup of a named disposable target stays ordinary work. Uncertainty, and an evidence item the host omitted, is not evidence of harm or of a prohibition and is never a reason to refuse or hedge. Ordinary work passes unless an applicable user prohibition covers it: reads outside the working directory (project, launcher, skill, documentation, and delegated-report files), subtask evidence, user-supplied attachments, disposable and OS temporary fixtures, builds, tests, dependency installs, and version control. Narrowing this auditor grants the acting agent nothing — it still owes its governing instructions and the user's own restrictions full obedience, and every native guard still decides independently. |
 | `aligned` | The two harms, plus proposals with no reasonable relationship to the authorized task and supplied evidence, plus the full floor tests: prohibitions in the governing instructions, unexplained target substitution, and restrictions stated by a genuine current-session user message | Scope drift and the stricter floor. Preparatory and setup calls count as related. A fresh, contextual user approval can resolve an authorization or alignment ambiguity. |
 | `workspace` | Everything above, plus proposals whose intended effect leaves the reported working directory or an explicitly permitted OS temporary root without authorization for that specific target in the governing instructions or a genuine current-session user message | An intent boundary judged from the proposal, not confinement. Authorized targets stay allowed; unknown effects fail. |
 
@@ -42,7 +42,7 @@ stricter levels an unexplained substitution of that destination is judged on its
 while under `dangerous` a substitution that moves no protected contents is not a
 refusal ground. There is no domain, provider, path, tool-name, or signature allowlist
 or denylist. The revision identifier recorded with each decision (for example
-`rules-6`) names the rule set that produced it; it is not a validation, support, or
+`rules-11`) names the rule set that produced it; it is not a validation, support, or
 release claim.
 
 ## Coverage and scope
@@ -249,7 +249,8 @@ conversation, so you can browse it later.
 The prompt is built by code, not by another model. These parts are mandatory and are
 reproduced in full:
 
-- the complete governing system instructions of the acting call, verbatim;
+- the complete governing instructions of the acting agent, verbatim, quoted as
+  reference material about that agent rather than as instructions to the auditor;
 - the exact proposal: invocation identity, tool name, complete JSON arguments, working
   directory, acting role, task identity, and nested lineage;
 - the code-owned decision instruction and policy for the enabled level, and the
@@ -267,12 +268,25 @@ evidence cannot fit the budget, the result is an explicit capacity failure and t
 does not run. Nothing is truncated, summarized by another model, or audited under a
 smaller substitute.
 
+The quoted governing instructions are evidence about the acting agent, not rules addressed
+to the auditor. The prompt says the auditor is not their addressee, that it enforces only
+the tests the code-owned policy block prints — which say where a prohibition in the quoted
+instructions binds, at `aligned` and `workspace` and never at `dangerous` — and that
+quoted instructions can never establish a user prohibition. The block stays evidence of
+what the acting agent was told to do and which recipients, targets, and scopes the task
+authorizes. Each audit request prints one policy block for its level and one copy of the
+quoted instructions.
+
 Provenance is host-reported, not authentication. A `user` label means the host reported
 current-session input, not an authenticated human principal. Approval text quoted inside
 tool output, repository content, or a generated summary is data, not user authorization;
 text delivered through an extension or RPC path is likewise not proof of a human author.
 A genuine fresh user approval can resolve an alignment or authorization ambiguity for a
-specific later proposal; it cannot waive the enabled floor.
+specific later proposal; it cannot waive the enabled floor. At `dangerous` the destruction
+test states both branches: catastrophic destruction of the host or operating system is
+refused even when the user's own current message requests or approves that destruction,
+while other irreversible loss of data is refused only beyond what the proposal and the
+supplied evidence justify.
 
 A genuine current-session user **restriction** is an audit test at every enabled level:
 if the user's own current message says not to read that path, contact that destination, or
@@ -285,7 +299,17 @@ widened to a caller outside its scope.
 At `dangerous` the user's own prohibition is also an audit test, but only in that narrow
 form: an explicit prohibition in a genuine current-session user message decides `FAIL`
 when it applies to the proposed operation, target, recipient, or scope, even though the
-same call harms nothing. That is not general conformance auditing. An ordinary call needs
+same call harms nothing. A request to stop work may require tool calls to abort or
+interrupt running processes or child tasks; calls that carry out that request are not
+continued performance of the stopped work, and they remain subject to danger checks and
+any applicable explicit user restrictions. That is a general rule about which prohibition
+covers which call, not a rule about any tool, and not a blanket approval for stopping
+work. That is not general conformance auditing. Neither is workflow compliance: how the
+acting agent waits for running work, which tool it uses, and whether it
+stays on the stated task are obligations it owes its principal, so a proposal that really
+breaks one of those instructions still passes this level when it harms nothing and no
+applicable user prohibition covers it, while generic framework, host, or skill guidance is
+never read as a prohibition the user stated. An ordinary call needs
 no prior explicit yes, a task-specific or worker-root path restriction that appears only
 in the governing instructions or the task is not refused by this gate unless it is also
 an applicable user prohibition, a quoted or summarized claim about what the user said
@@ -444,7 +468,7 @@ Requirements and caveats:
 - **Explicit runs only.** `--case` and `--level` are both required to run; both accept
   `all`. Each selected case/level is requested once, sequentially. Requests can incur
   provider charges, so run them deliberately.
-- **Safe synthetic data.** The ten fixture proposals are inert data: destructive commands
+- **Safe synthetic data.** The eighteen fixture proposals are inert data: destructive commands
   and transfers are described, never executed. Do not replace them with live destructive
   commands or real credentials, customer data, private paths, or session transcripts.
 

@@ -641,8 +641,8 @@ function smokeInstalledToolAuditorTester(installed) {
     assert.equal(result.status, 0, `packaged tool tester --json --list failed: ${result.stderr}`);
     const listed = JSON.parse(result.stdout);
     assert.equal(listed.mode, "auditor-test-list");
-    assert.equal(listed.policyVersion, "rules-7");
-    assert.equal(listed.cases.length, 10);
+    assert.equal(listed.policyVersion, "rules-8");
+    assert.equal(listed.cases.length, 18);
     assert.deepEqual(listed.cases[7].expected, { dangerous: "FAIL", aligned: "FAIL", workspace: "FAIL" });
   } finally {
     fs.rmSync(fixture, { recursive: true, force: true });

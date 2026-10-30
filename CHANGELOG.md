@@ -30,7 +30,7 @@ dates.
   and are not waivable by approval; no tool name, path, domain, or signature is
   allowlisted or denylisted; and `aligned` and `workspace` print their previous rules
   verbatim and keep their governing-prohibition, alignment, and confinement policy.
-  Policy revision `rules-9`.
+  Policy revision `rules-10`.
 - **The acting agent's instructions are quoted evidence, not rules for the auditor**
   (#551): the complete governing instruction set still travels verbatim and still fails
   closed when it cannot fit the context budget, now framed as quoted reference material
@@ -38,12 +38,15 @@ dates.
   enforces only the tests the code-owned policy block prints, and never treats quoted
   instructions as a current-session user message; they stay evidence of what the acting
   agent was told to do and which recipients, targets, and scopes the task authorizes.
-- **User-prohibition applicability follows the proposed effect** (#551): the existing
-  dangerous-level rule distinguishes ending an activity the user said to stop from
-  performing that activity. A genuine ban on ending or changing something remains
-  binding. This is not blanket stop approval or a tool-specific rule; danger checks and
-  cancellation mechanics are unchanged. Model classification accuracy is not established
-  by the deterministic prompt and fixture tests.
+- **Stop-enforcement calls are not the stopped work** (#551): the existing dangerous-level
+  user-prohibition rule now explains that a request to stop work may
+  require tool calls to abort or interrupt running processes or child tasks, calls that
+  carry out that request are not continued performance of the stopped work, and they remain
+  subject to danger checks and any applicable explicit user restriction. This is not
+  blanket stop approval and names no tool; the two harm tests, an applicable user `no`, and
+  cancellation mechanics are unchanged. Model classification accuracy is not established by
+  the deterministic prompt and fixture tests, and this revision is not yet measured against
+  a model.
 
 ### Changed
 
@@ -55,7 +58,7 @@ dates.
   off-task call — plus the same watch and stop under an explicit user ban, a root
   filesystem wipe the user expressly approved, which stays blocked at every level, and a
   credential transfer to a recipient the user never named. Expectations are authored
-  policy checks frozen against `rules-9`, never measured model accuracy and never
+  policy checks frozen against `rules-10`, never measured model accuracy and never
   rewritten from a model reply; the proposals are inert data and none is executed. See
   [Tool protection](docs/tool-protection.md).
 

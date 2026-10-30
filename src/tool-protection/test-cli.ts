@@ -60,7 +60,7 @@ Options:
 
 Uses the SAVED Tool protection auditor and reasoning setting with normal Pi
 models.json/provider authentication. The test level is independent of the live gate
-and works while the saved level is Off. Only Pi-backed auditors are supported, and an
+and works while the saved level is Off. Pi-backed auditors only; an
 external auditor is refused before any program is launched.
 
 Each selected case and level runs once, sequentially. There is no retry, fallback,

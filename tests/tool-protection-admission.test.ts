@@ -38,6 +38,8 @@ import type {
   AuditorRecordWriteResult,
 } from "../src/tool-protection/session-record";
 import { createExecutorAdapter } from "../src/execution/adapters/factory";
+import { wrapPreserving } from "../src/tool-result-wrap";
+import { visibleTerminalText } from "../src/tool-result-text";
 
 type HookHandler = (...args: unknown[]) => unknown;
 
@@ -859,6 +861,157 @@ test("the collapsed audit status gets one blank separator line while expanded ke
   );
   assert.equal(annotated.content[0].text, status, "the model-visible annotation is never rewritten");
   assert.equal(annotated.content[1].text, "native tool output", "the model-visible result content is unchanged");
+});
+
+/** Reversible theme double: records the semantic token and marks the text. */
+function semanticMarkerTheme() {
+  const used: Array<{ color: string; text: string }> = [];
+  return {
+    used,
+    theme: {
+      fg(color: string, text: string): string {
+        used.push({ color, text });
+        return `<${color}>${text}</${color}>`;
+      },
+    },
+  };
+}
+
+test("audit status rows use the supplied theme's existing semantic tokens", () => {
+  const host = fakeHost({ rendererRegistry: true });
+  const { coordinator } = coordinatorHarness();
+  coordinator.registerHooks(host.pi);
+  const resolver = host.pi.__rendererResolver as (
+    toolName: string,
+    next: () => unknown,
+  ) => { renderResult?: (...args: unknown[]) => { render(width: number): string[] } };
+  const decorated = resolver("read", () => ({
+    renderResult: () => ({ render: () => ["native body"] }),
+  }));
+  assert.ok(decorated?.renderResult);
+  const render = (result: unknown, theme: unknown, width = 400, expanded = false) =>
+    decorated!.renderResult!(result, { expanded, isPartial: false }, theme, { expanded }).render(width);
+  const renderText = (text: string, theme: unknown, width = 400) =>
+    render({ content: [{ type: "text", text }] }, theme, width);
+
+  const { used, theme } = semanticMarkerTheme();
+  const passText = "Tool protection: PASS — synthetic approval.";
+  assert.deepEqual(renderText(passText, theme), ["", `<success>${passText}</success>`, "native body"],
+    "a PASS row uses the theme's success token and keeps the existing separator and order");
+  assert.deepEqual(used, [{ color: "success", text: passText }]);
+
+  const failText = "Tool protection: FAIL — synthetic denial. The read call did not run.";
+  assert.deepEqual(renderText(failText, theme)[1], `<error>${failText}</error>`,
+    "a FAIL row uses the theme's error token");
+  const notAuditedText = "Tool protection: NOT AUDITED — synthetic call is outside the audit subset.";
+  assert.deepEqual(renderText(notAuditedText, theme)[1], `<warning>${notAuditedText}</warning>`,
+    "a NOT AUDITED row is a non-success warning row");
+
+  const nested = [
+    "Tool protection: 7 nested call decision(s) in this tool's execution:",
+    "- nested read: PASS — approved before execution; auditor reason: synthetic",
+    "- nested write: PASS — approved before execution; auditor reason: diagnostic: FAIL/BLOCKED before execution, so this call passed",
+    "- nested web: PASS — approved before execution; auditor reason: diagnostic: NOT AUDITED quoted from another row",
+    "- nested bash: FAIL/BLOCKED before execution — synthetic denial",
+    "- nested edit: FAIL/BLOCKED before execution — synthetic denial; the reason quotes PASS for another call",
+    "- nested codemode: NOT AUDITED — outside the configured audit subset; not checked by the gate.",
+    "- nested grep: NOT AUDITED — outside the configured audit subset; another row said PASS.",
+    "- 1 earlier nested decision(s) omitted from this summary.",
+    "- RETENTION LOSS: 1 nested decision record(s) are not retained in this summary (bounded runtime state).",
+  ].join("\n");
+  assert.deepEqual(renderText(nested, theme).slice(1, -1), [
+    "<accent>Tool protection: 7 nested call decision(s) in this tool's execution:</accent>",
+    "<success>- nested read: PASS — approved before execution; auditor reason: synthetic</success>",
+    "<success>- nested write: PASS — approved before execution; auditor reason: diagnostic: FAIL/BLOCKED before execution, so this call passed</success>",
+    "<success>- nested web: PASS — approved before execution; auditor reason: diagnostic: NOT AUDITED quoted from another row</success>",
+    "<error>- nested bash: FAIL/BLOCKED before execution — synthetic denial</error>",
+    "<error>- nested edit: FAIL/BLOCKED before execution — synthetic denial; the reason quotes PASS for another call</error>",
+    "<warning>- nested codemode: NOT AUDITED — outside the configured audit subset; not checked by the gate.</warning>",
+    "<warning>- nested grep: NOT AUDITED — outside the configured audit subset; another row said PASS.</warning>",
+    "<muted>- 1 earlier nested decision(s) omitted from this summary.</muted>",
+    "<warning>- RETENTION LOSS: 1 nested decision record(s) are not retained in this summary (bounded runtime state).</warning>",
+  ], "each nested row carries the tone of its own verdict rather than the tool's completion");
+
+  const passWithWarning = `${passText} Tool protection: the auditor session could not be saved (synthetic), so this audit is not in your saved sessions. The gate decision is unchanged.`;
+  assert.match(renderText(passWithWarning, theme)[1]!, /^<warning>/,
+    "a PASS that also failed to record is not presented as success");
+  const headerWithWarning = "Tool protection: 2 nested call decision(s) in this tool's execution: WARNING: 2 auditor session(s) could not be fully saved; their decision lines are omitted here. The gate decisions are unchanged.";
+  assert.match(renderText(headerWithWarning, theme)[1]!, /^<warning>/,
+    "a nested summary header carrying a recording warning is a warning row");
+  const failWithWarning = `${failText} Tool protection: the auditor session was only partially saved (synthetic); the saved session may be missing its later entries. The gate decision is unchanged.`;
+  assert.match(renderText(failWithWarning, theme)[1]!, /^<error>/,
+    "a FAIL keeps its error tone when recording also warned");
+  const standaloneWarning = "Tool protection: the auditor session could not be saved (synthetic), so this audit is not in your saved sessions. The gate decision is unchanged.";
+  assert.match(renderText(standaloneWarning, theme)[1]!, /^<warning>/,
+    "a standalone recording failure is a warning row, never success");
+
+  const plainLines = ["", passText, "native body"];
+  assert.deepEqual(renderText(passText, {}), plainLines,
+    "a theme-less compatibility host keeps the existing plain rows");
+  assert.deepEqual(renderText(passText, undefined), plainLines,
+    "a missing theme keeps the existing plain rows");
+
+  // Styling is applied after sanitization and wrapping, so theme markers are
+  // never counted as printable width and the row text is unchanged.
+  const longLine = `Tool protection: NOT AUDITED — ${"outside the configured audit subset; ".repeat(6)}done.`;
+  const width = 40;
+  const wrapped = renderText(longLine, theme, width);
+  const rows = wrapped.slice(1, -1);
+  assert.ok(rows.length > 1, "the long annotation wraps into several styled rows");
+  assert.deepEqual(
+    rows.map((row) => row.replace(/^<warning>/, "").replace(/<\/warning>$/, "")),
+    wrapPreserving(visibleTerminalText(longLine), width),
+    "wrapping uses the sanitized plain text, not the styled string",
+  );
+  for (const row of rows) assert.match(row, /^<warning>.*<\/warning>$/,
+    "every wrapped physical row carries the semantic token");
+
+  const control = "Tool protection: PASS — synthetic \u001b]52;c;NOT-A-COPY\u0007 reason";
+  const styledControl = renderText(control, theme).join("\n");
+  assert.doesNotMatch(styledControl, /[\u001b\u0007]/,
+    "styling never reintroduces the annotation's terminal control bytes");
+  assert.match(styledControl, /\\u001b\]52;c;NOT-A-COPY\\u0007/,
+    "the sanitized control bytes stay visible as inert notation");
+
+  const original = { content: [{ type: "text" as const, text: passText }] };
+  render(original, theme);
+  assert.deepEqual(original.content, [{ type: "text", text: passText }],
+    "the annotation text handed to the renderer is never rewritten");
+});
+
+test("a native renderer gets its own lastComponent, never the decoration wrapper", () => {
+  const host = fakeHost({ rendererRegistry: true });
+  const { coordinator } = coordinatorHarness();
+  coordinator.registerHooks(host.pi);
+  const resolver = host.pi.__rendererResolver as (
+    toolName: string,
+    next: () => unknown,
+  ) => { renderResult?: (...args: unknown[]) => { render(width: number): string[] } };
+  const observed: unknown[] = [];
+  const native = {
+    text: "",
+    setText(text: string) { this.text = text; },
+    render() { return [this.text]; },
+  };
+  const decorated = resolver("read", () => ({
+    // Native-style reuse of the host-provided previous component.
+    renderResult: (_result: unknown, _options: unknown, _theme: unknown, context: unknown) => {
+      const lastComponent = (context as { lastComponent?: unknown }).lastComponent;
+      observed.push(lastComponent);
+      const component = (lastComponent ?? native) as typeof native;
+      component.setText("native body");
+      return component;
+    },
+  }));
+  assert.ok(decorated?.renderResult);
+  const annotated = { content: [{ type: "text", text: "Tool protection: PASS — synthetic approval." }] };
+  const state = {};
+  const first = decorated.renderResult!(annotated, { expanded: false }, {}, { state }).render(200);
+  const second = decorated.renderResult!(annotated, { expanded: false }, {}, { state }).render(200);
+  assert.equal(observed[0], undefined, "the first pass has no previous component");
+  assert.equal(observed[1], native, "the second pass receives the native component, not the decoration wrapper");
+  assert.deepEqual(second, first, "a native incremental redraw is not nested or duplicated");
+  assert.equal(first.filter((line) => line.includes("Tool protection:")).length, 1);
 });
 
 test("a native-like renderer's own blocked refusal is shown once in collapsed and expanded views", () => {

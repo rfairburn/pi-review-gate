@@ -1456,11 +1456,27 @@ export class ToolProtectionCoordinator {
           // Thin decoration only: draw the safely encoded gate lines above the
           // remaining renderer, and give that renderer an immutable copy without
           // the same lines so native result content is not shown twice. Display
-          // spacing only — no model-visible text changes here.
+          // spacing and theme styling only — no model-visible text changes here.
           renderResult: (...callArgs: any[]) => {
             const result = callArgs[0];
             const annotation = annotationDisplayFromResult(result);
-            const component = baseRender(annotation ? annotation.view : result, ...callArgs.slice(1));
+            // Pi reuses the component a renderer returned last time as
+            // `context.lastComponent`. Hand the native renderer its own
+            // component rather than this decoration wrapper, so the native
+            // incremental rendering (clear/setText/addChild) keeps working and
+            // the gate rows are never nested or duplicated across redraws. A
+            // lightweight context without a per-row state keeps the previous
+            // pass-through behavior.
+            const context = callArgs[3];
+            const state = isRecord(context) && isRecord(context.state)
+              ? context.state as Record<string | symbol, unknown>
+              : undefined;
+            const baseArgs = callArgs.slice(1);
+            if (state !== undefined && baseArgs.length >= 3) {
+              baseArgs[2] = { ...context, lastComponent: state[ANNOTATION_DISPLAY_INNER] };
+            }
+            const component = baseRender(annotation ? annotation.view : result, ...baseArgs);
+            if (state !== undefined) state[ANNOTATION_DISPLAY_INNER] = component;
             if (!annotation || !isRecord(component) || typeof component.render !== "function") return component;
             // Pi's native renderResult signature is (result, options, theme,
             // context); the collapsed view is everything that is not explicitly
@@ -1473,13 +1489,28 @@ export class ToolProtectionCoordinator {
             };
             return {
               render(width: number): string[] {
+                // Pi hands the live theme to renderResult as its third argument.
+                // Use its ordinary semantic tokens so the audit rows read like
+                // native status text; a lightweight host/mock without a theme
+                // keeps the plain rows. The verdict comes from the annotation
+                // line itself, so a nested FAIL, a NOT AUDITED row, or a
+                // recording warning is never shown as success merely because
+                // the tool returned normally.
+                const theme = annotationDisplayTheme(callArgs[2]);
                 return [
                   // Collapsed only: one blank line so the gate status does not
                   // start on the row directly under the tool-call/argument
                   // preview above. An expanded render keeps its existing spacing,
                   // and an unannotated result never gets this separator.
                   ...(expanded ? [] : [""]),
-                  ...annotation.lines.flatMap((line) => wrapPreserving(visibleTerminalText(line), width)),
+                  // Sanitize and wrap first, then style each physical row: theme
+                  // escapes are never counted as printable width, and the row
+                  // text and order are unchanged.
+                  ...annotation.lines.flatMap((line) => {
+                    const color = annotationDisplayColor(line);
+                    return wrapPreserving(visibleTerminalText(line), width)
+                      .map((chunk) => theme === undefined ? chunk : theme.fg(color, chunk));
+                  }),
                   ...inner.render(width),
                 ];
               },
@@ -1737,10 +1768,61 @@ interface AnnotationDisplay {
 }
 
 /**
+ * Per-row slot holding the native component this decoration last returned, so
+ * the native renderer is given its own `lastComponent` instead of the wrapper.
+ */
+const ANNOTATION_DISPLAY_INNER = Symbol("pi-review-gate.annotation-display-inner");
+
+/**
  * The gate's own auditor-session recording failures, in each form they take: a
  * per-call warning, and the bounded nested summary's aggregate count.
  */
 const SAVE_WARNING_PATTERN = /Tool protection: the auditor session (?:could not be saved|was only partially saved)|WARNING: \d+ auditor session\(s\) could not be fully saved/;
+
+/** Theme subset the audit-status rows use; matches Pi's `theme.fg()` contract. */
+type AnnotationDisplayColor = "accent" | "error" | "muted" | "success" | "warning";
+
+interface AnnotationDisplayTheme {
+  fg(color: AnnotationDisplayColor, text: string): string;
+}
+
+/**
+ * The theme Pi passes to `renderResult`, when the host supplies one. Lightweight
+ * compatibility mocks without a theme keep the existing plain rows.
+ */
+function annotationDisplayTheme(value: unknown): AnnotationDisplayTheme | undefined {
+  if (!isRecord(value) || typeof value.fg !== "function") return undefined;
+  return value as unknown as AnnotationDisplayTheme;
+}
+
+/**
+ * A nested decision row's verdict token. The tool name is matched up to the
+ * first `: ` (Pi tool names carry no whitespace or colon) and the verdict must
+ * be the token immediately after it, so verdict-shaped text inside the
+ * auditor's reason cannot change the row's tone. The alternation is ordered so
+ * the earliest token wins when a reason quotes another verdict.
+ */
+const NESTED_VERDICT_PATTERN = /^- nested [^\s:]+: (NOT AUDITED|FAIL\/BLOCKED before execution|PASS)\b/;
+
+/**
+ * Semantic tone of one gate display row, read from the gate's own line text.
+ * The verdict always comes from the annotation itself — never from the tool's
+ * completion — so a nested FAIL, a NOT AUDITED row, or a recording warning is
+ * never presented as success merely because the tool returned normally.
+ */
+function annotationDisplayColor(line: string): AnnotationDisplayColor {
+  const nestedVerdict = NESTED_VERDICT_PATTERN.exec(line)?.[1];
+  // A verdict outranks a recording warning appended to the same line.
+  if (/^Tool protection: FAIL\b/.test(line) || nestedVerdict === "FAIL/BLOCKED before execution") {
+    return "error";
+  }
+  if (SAVE_WARNING_PATTERN.test(line)) return "warning";
+  if (/^Tool protection: NOT AUDITED\b/.test(line) || nestedVerdict === "NOT AUDITED") return "warning";
+  if (/^Tool protection: PASS\b/.test(line) || nestedVerdict === "PASS") return "success";
+  if (/^- RETENTION LOSS:/.test(line)) return "warning";
+  if (/^- \d+ earlier nested decision\(s\) omitted/.test(line)) return "muted";
+  return "accent";
+}
 
 /**
  * Extract this gate's own annotation from an already-annotated result, for the

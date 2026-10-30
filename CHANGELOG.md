@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.221]
+
+### Fixed
+
+- **Tool-protection status rendering on native edit results** (#547): audit rows use
+  Pi's existing theme colors for PASS, FAIL, and NOT AUDITED while retaining the native
+  colored edit diff, audit text, and spacing. The decoration returns the native
+  renderer's own previous component on redraw and expansion instead of its wrapper,
+  avoiding rendering fallback and duplicate audit rows. Model-visible results,
+  protection policy, and audit decisions are unchanged.
+
 ## [0.1.0-dev.220]
 
 ### Changed

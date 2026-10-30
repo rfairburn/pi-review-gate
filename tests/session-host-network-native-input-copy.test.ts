@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { createRequire } from "node:module";
 import { delimiter, dirname, join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
@@ -85,7 +85,7 @@ import { admitSavedSession, listSavedSessions, type SavedSessionAdmission } from
 import { stripGeneratedSgr, type TerminalSurface } from "../src/session-host/terminal-surface";
 import { skipOrFail } from "./bridge-fakes";
 import { terminalInputModesAgree } from "./helpers/session-host-input-mode-precondition";
-import { ChangeSignal, compileAndStageCandidate, makeNativeAgentRoot } from "./helpers/session-host-native-main-harness";
+import { ChangeSignal, createSharedProductionCompile, makeNativeAgentRoot } from "./helpers/session-host-native-main-harness";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import {
   deferred,
@@ -96,6 +96,19 @@ import {
   type Deferred,
   type HostFixture,
 } from "./session-host-network-helpers";
+
+/**
+ * ONE lazily created production compile shared by the TWO pinned native cases in
+ * this file and nothing else. Each case still exclusively stages a fresh
+ * candidate package from its own case root with the unchanged copier, and
+ * creating this handle performs no I/O, so a run in which both cases skip creates
+ * no root.
+ */
+const sharedCompile = createSharedProductionCompile();
+
+after(() => {
+  sharedCompile.dispose();
+});
 
 /**
  * Network native input and copy proof over the real TLS content lane.
@@ -568,7 +581,7 @@ test("network viewer native input and copy stay bound to the pinned native child
     assert.equal(Buffer.byteLength(BIG_BODY, "utf8"), NATIVE_TEXT_PASTE_MAX_BYTES);
 
     const root = realpathSync(mkdtempSync("/tmp/prg-net-native-"));
-    const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
+    const candidate = sharedCompile.stageCandidate(root); // inactive build; never live dist/
     const binDir = join(root, "bin");
     const attestRoot = join(root, "attest");
     const workDir = join(root, "work");
@@ -1815,7 +1828,9 @@ test("network viewer input answers the real native startup project-trust selecto
     const pty = requireHere("@lydell/node-pty") as OwnedPtyModule;
 
     const root = realpathSync(mkdtempSync("/tmp/prg-net-trust-"));
-    const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
+    const candidate = sharedCompile.stageCandidate(root); // inactive build; never live dist/
+    assert.equal(sharedCompile.builds, 1,
+      "one owned production compile served both pinned native cases in this file");
     const binDir = join(root, "bin");
     const attestRoot = join(root, "attest");
     const workDir = join(root, "work");

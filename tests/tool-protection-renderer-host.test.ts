@@ -32,6 +32,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { Terminal } from "@xterm/headless";
 import { DEFAULT_CONFIG, type ReviewGateConfig } from "../src/config";
 import { createToolProtectionCoordinator } from "../src/tool-protection/coordinator";
 import { setNativeExpansionHost } from "../src/presentation-hints";
@@ -152,6 +153,16 @@ if (!host) {
       })
     : undefined;
   const { computeEditsDiff } = h.req(path.join(h.agentDir, "dist", "core", "tools", "edit-diff.js"));
+  // The installed shell renderers. The shipped bash tool definition spreads
+  // `createShellRenderers(config.prompt)` with the bash prompt "$" and declares
+  // no `renderShell`, so the host's own `Box` (padding plus row background)
+  // frames this family — the other half of the #547 card shape.
+  const nativeBashDefinition = {
+    name: "bash",
+    ...(h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "bash.js")) as {
+      createShellRenderers(prompt: string): Record<string, unknown>;
+    }).createShellRenderers("$"),
+  };
   const ui = { requestRender() {} };
 
   // ── Production annotation fixtures (fake host + injected auditor) ──────
@@ -793,6 +804,490 @@ if (!host) {
         editRow(cwd, nativeEditDefinition, nativeResult),
       );
       assert.deepEqual(decorated, plain, "without an annotation the decoration is byte-identical to the native row");
+    });
+  });
+
+  // ── Shared fixtures for the three native card families ────────────────
+
+  type CardFamily = "bash" | "edit" | "notice";
+  type CardRow = InstanceType<HostBundle["agent"]["ToolExecutionComponent"]>;
+  /** The real native Theme, held in a local the helpers below can name directly. */
+  const nativeTheme = theme!;
+
+  const AUDIT_REASON = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango";
+  const BASH_OUTPUT = [
+    "synthetic line one", "synthetic line two", "synthetic line three",
+    "synthetic line four", "synthetic line five", "synthetic line six", "synthetic line seven",
+  ].join("\n");
+  const NOTICE_TEXT = [
+    "Notice registered as n-1: \"Deployed\". It stays pending until the user closes it.",
+    "notice body line one", "notice body line two", "notice body line three",
+    "notice body line four", "notice body line five", "notice body line six", "notice body line seven",
+  ].join("\n");
+  /** Single-cell markers each family's own native rows have to keep. */
+  const FAMILY_MARKERS: Record<CardFamily, string[]> = {
+    bash: ["$ echo synthetic", "synthetic line seven"],
+    edit: ["edit fixture.txt", "BETA-CHANGED", "delta"],
+    notice: ["YouShouldKnow", "Notice registered as n-1", "notice body line seven"],
+  };
+
+  interface AuditedCard {
+    component: CardRow;
+    annotationText: string;
+    annotated: Record<string, unknown>;
+    originalContent: Array<Record<string, unknown>>;
+    snapshotDetails?: Record<string, unknown>;
+    event: Record<string, unknown>;
+  }
+
+  /**
+   * One audited card per family, built entirely by the installed host and the
+   * production coordinator: real renderers, real row layout, real annotation
+   * text. Nothing here runs a shell command, model call, or provider request —
+   * the bash fixture is an inert synthetic result handed to the installed shell
+   * renderers, and the notice fixture is the project-owned renderer-less tool.
+   */
+  async function auditedCard(
+    family: CardFamily,
+    cwd: string,
+    options: { details?: Record<string, unknown>; decision?: string; scope?: ReviewGateConfig } = {},
+  ): Promise<AuditedCard> {
+    const spec = family === "bash"
+      ? { toolName: "bash", args: { command: "echo synthetic" }, definition: nativeBashDefinition, content: [{ type: "text", text: BASH_OUTPUT }] }
+      : family === "edit"
+        ? { toolName: "edit", args: EDIT_ARGS, definition: nativeEditDefinition, content: [{ type: "text", text: "Successfully edited fixture.txt" }] }
+        : { toolName: "YouShouldKnow", args: { title: "Deployed", body: "shipped" }, definition: { name: "YouShouldKnow" }, content: [{ type: "text", text: NOTICE_TEXT }] };
+    const details = options.details ?? (family === "edit" ? undefined : family === "bash" ? {} : { status: "pending" });
+    const callId = `${family}-call`;
+    const pi = fakePiHost();
+    const { coordinator } = coordinatorFor(
+      [JSON.stringify({ decision: options.decision ?? "PASS", reason: AUDIT_REASON })],
+      { cwd, ...(options.scope === undefined ? {} : { config: options.scope }) },
+    );
+    coordinator.registerHooks(pi.pi);
+    assert.equal(await coordinator.admitToolCall(callArgs(callId, spec.toolName, spec.args)), undefined,
+      `${family}: the synthetic call was admitted for ${spec.toolName}`);
+    // Independent deep snapshots. Nothing handed to the pipeline aliases them,
+    // so an in-place mutation of the event array, one of its text blocks, or the
+    // structured details changes the actual value only and is caught.
+    const snapshotContent = structuredClone(spec.content) as Array<Record<string, unknown>>;
+    const snapshotDetails = details === undefined ? undefined : structuredClone(details) as Record<string, unknown>;
+    const event: Record<string, unknown> = {
+      toolCallId: callId,
+      toolName: spec.toolName,
+      input: structuredClone(spec.args),
+      content: structuredClone(snapshotContent),
+      isError: false,
+    };
+    if (snapshotDetails !== undefined) event.details = structuredClone(snapshotDetails);
+    const [annotated] = await pi.emit("tool_result", event) as Array<Record<string, unknown>>;
+    assert.ok(annotated, `${family}: the production coordinator annotated the tool result`);
+    const decorated = (pi.pi.__rendererResolver as RendererResolver)(spec.toolName, () => spec.definition);
+    assert.ok(decorated?.renderResult, `${family}: the production resolver decorated this tool`);
+    const component = new h.agent.ToolExecutionComponent(
+      spec.toolName, callId, spec.args, {}, { ...spec.definition, ...decorated }, ui, cwd,
+    );
+    component.setArgsComplete();
+    component.updateResult(annotated, false);
+    const annotationText = (annotated.content as Array<Record<string, unknown>>)[0]!.text as string;
+    return { component, annotationText, annotated, originalContent: snapshotContent, snapshotDetails, event };
+  }
+
+  /**
+   * The installed host aliases its own pi-tui width helpers; the decoration's
+   * row padding measures with them. Without that alias the decoration falls back
+   * to a deliberately conservative non-ASCII count, which is not the rendering
+   * path a real Pi session uses, so the card assertions install the installed
+   * host's own helpers for their duration.
+   */
+  async function withInstalledHostWidths(run: () => Promise<void>): Promise<void> {
+    assert.ok(tui, "the installed pi-tui peer supplies the host's own cell-width helpers");
+    const peer = tui!;
+    setNativeExpansionHost({
+      visibleWidth: (line) => peer.visibleWidth(line),
+      wrapTextWithAnsi: (text, width) => peer.wrapTextWithAnsi(text, width),
+      getCapabilities: () => peer.getCapabilities(),
+      getImageDimensions: (data, mimeType) => peer.getImageDimensions(data, mimeType),
+      imageFallback: (mimeType, dimensions) => peer.imageFallback(mimeType, dimensions),
+    });
+    try {
+      await run();
+    } finally {
+      setNativeExpansionHost(undefined);
+    }
+  }
+
+  /**
+   * Expected audit rows, computed WITHOUT the production wrapper under test: a
+   * plain greedy fill that breaks only at spaces, never exceeds the content
+   * width, never starts a continuation row with whitespace, and drops nothing.
+   * The fixture text is single-cell, so its length is its cell width.
+   */
+  function expectedAuditRowTexts(value: string, width: number): string[] {
+    const rows: string[] = [];
+    let current = "";
+    for (const word of value.split(" ")) {
+      assert.ok(word.length <= width, `the fixture token ${JSON.stringify(word)} fits the ${width}-column audit width`);
+      if (current.length === 0) current = word;
+      else if (current.length + 1 + word.length <= width) current += ` ${word}`;
+      else { rows.push(current); current = word; }
+    }
+    if (current.length > 0) rows.push(current);
+    return rows;
+  }
+
+  /** The rendered audit rows must equal those independent rows, styled by the gate's own token. */
+  function assertAuditRowsRendered(
+    lines: string[],
+    annotationText: string,
+    contentWidth: number,
+    token: "success" | "warning" | "error",
+    label: string,
+  ): number {
+    assert.ok(!annotationText.includes("\n"), `${label}: the annotation is one logical line`);
+    const expected = expectedAuditRowTexts(annotationText, contentWidth);
+    assert.ok(expected.length > 1, `${label}: the audit text is long enough to wrap at ${contentWidth} columns`);
+    const visible = lines.map((line) => stripAnsi(line).trim());
+    assert.equal(visible.filter((row) => row === expected[0]!.trim()).length, 1,
+      `${label}: the first audit row appears exactly once`);
+    const start = visible.indexOf(expected[0]!.trim());
+    for (let index = 0; index < expected.length; index += 1) {
+      assert.ok(expected[index]!.length <= contentWidth, `${label}: audit row ${index + 1} fits the ${contentWidth}-column content width`);
+      assert.equal(visible[start + index], expected[index]!.trim(),
+        `${label}: audit row ${index + 1} reflows at word boundaries`);
+      const styled = lines[start + index]!;
+      assert.ok(styled.includes(nativeTheme.getFgAnsi(token)), `${label}: audit row ${index + 1} carries the ${token} token`);
+      // The #547 failure mode was the gate's own line drawn in the ordinary
+      // tool-output colour. (The dark theme maps the diff tokens to the same
+      // RGB as the verdict tokens, so the distinction asserted here is the
+      // semantic one the card actually has to keep.)
+      assert.ok(!styled.includes(nativeTheme.getFgAnsi("toolOutput")),
+        `${label}: audit row ${index + 1} is not drawn in the ordinary tool-output colour`);
+    }
+    assert.equal(stripAnsi(lines.join("\n")).split("Tool protection:").length - 1, 1,
+      `${label}: the audit status and reason are displayed exactly once`);
+    return start;
+  }
+
+  // ── Cell-level background coverage through the pinned headless VT ─────
+
+  /** xterm 6 color-mode flags, as the repository's own TerminalSurface reads them. */
+  const VT_RGB = 50331648;
+  const VT_PALETTE = [16777216, 33554432];
+
+  interface VtCell {
+    readonly chars: string;
+    readonly fgMode: number;
+    readonly fgValue: number;
+    readonly bgMode: number;
+    readonly bgValue: number;
+  }
+
+  type PackedColor = { kind: "rgb"; value: number } | { kind: "palette"; value: number };
+
+  /** The concrete colour behind one of the real theme's own escape sequences. */
+  function packedColor(ansi: string, kind: "fg" | "bg"): PackedColor {
+    const code = kind === "bg" ? 48 : 38;
+    const match = new RegExp(`\\x1b\\[${code};(2|5);(\\d+)(?:;(\\d+);(\\d+))?m`).exec(ansi);
+    assert.ok(match, `${kind} token ${JSON.stringify(ansi)} is an extended colour the VT can compare`);
+    if (match[1] === "2") {
+      return { kind: "rgb", value: (Number(match[2]) << 16) | (Number(match[3]) << 8) | Number(match[4]) };
+    }
+    return { kind: "palette", value: Number(match[2]) };
+  }
+
+  function cellColor(cell: VtCell, kind: "fg" | "bg"): { mode: number; value: number } {
+    return kind === "fg" ? { mode: cell.fgMode, value: cell.fgValue } : { mode: cell.bgMode, value: cell.bgValue };
+  }
+
+  function cellHasColor(cell: VtCell, kind: "fg" | "bg", color: PackedColor): boolean {
+    const actual = cellColor(cell, kind);
+    if (color.kind === "rgb") return actual.mode === VT_RGB && actual.value === color.value;
+    return VT_PALETTE.includes(actual.mode) && actual.value === color.value;
+  }
+
+  /**
+   * Feed the rendered card rows to the pinned @xterm/headless terminal (the same
+   * VT the repository's own TerminalSurface wraps, configured the same way) and
+   * read back every cell of every row, so background coverage is asserted on
+   * actual cells rather than on the presence of an escape sequence in a row.
+   */
+  async function cardCells(lines: string[], width: number): Promise<VtCell[][]> {
+    // cols is one wider than the card: a row of exactly `width` cells would arm
+    // the VT's deferred wrap and shift later buffer rows out of alignment with
+    // the rendered rows. Columns 0..width-1 are unaffected by that guard.
+    const terminal = new Terminal({ cols: width + 1, rows: lines.length + 2, scrollback: 0, allowProposedApi: true });
+    try {
+      // The headless VT parses writes asynchronously; the callback lands only
+      // once every row is in the buffer.
+      await new Promise<void>((resolve) => { terminal.write(lines.join("\r\n"), () => resolve()); });
+      const buffer = terminal.buffer.active;
+      const rows: VtCell[][] = [];
+      for (let row = 0; row < lines.length; row += 1) {
+        const line = buffer.getLine(row);
+        const cells: VtCell[] = [];
+        const nullCell = buffer.getNullCell();
+        for (let column = 0; column < width; column += 1) {
+          const cell = (line?.getCell(column, nullCell)) ?? nullCell;
+          cells.push({ chars: cell.getChars(), fgMode: cell.getFgColorMode(), fgValue: cell.getFgColor(), bgMode: cell.getBgColorMode(), bgValue: cell.getBgColor() });
+        }
+        rows.push(cells);
+      }
+      return rows;
+    } finally {
+      terminal.dispose();
+    }
+  }
+
+  /** Every cell of every card row (below the host's own blank row above it). */
+  async function assertEveryCardCellBackground(lines: string[], width: number, backgroundAnsi: string, label: string): Promise<void> {
+    const expected = packedColor(backgroundAnsi, "bg");
+    const cells = await cardCells(lines, width);
+    assert.equal(cells.length, lines.length, `${label}: the VT received every rendered card row`);
+    for (let row = 1; row < lines.length; row += 1) {
+      for (let column = 0; column < width; column += 1) {
+        const cell = cells[row]![column]!;
+        assert.ok(cell.bgMode !== 0,
+          `${label}: cell ${column} of card row ${row + 1} has no background — an ordinary terminal-background hole inside the card`);
+        assert.ok(cellHasColor(cell, "bg", expected),
+          `${label}: cell ${column} of card row ${row + 1} is not painted with the themed row background`);
+      }
+    }
+  }
+
+  /** Foreground assertions on the same cells: the gate's own text, and the native rows' own colours. */
+  function assertCellForeground(rows: VtCell[][], row: number, width: number, token: string, label: string): void {
+    const color = packedColor(nativeTheme.getFgAnsi(token), "fg");
+    const painted = rows[row]!.filter((cell, column) => column < width && cellHasColor(cell!, "fg", color)).length;
+    assert.ok(painted > 0, `${label}: card row ${row + 1} carries no ${token} cell`);
+  }
+
+  function assertNoCellForeground(rows: VtCell[][], row: number, tokens: string[], label: string): void {
+    for (const token of tokens) {
+      const color = packedColor(nativeTheme.getFgAnsi(token), "fg");
+      assert.ok(!rows[row]!.some((cell) => cellHasColor(cell!, "fg", color)),
+        `${label}: card row ${row + 1} must not use the ${token} colour`);
+    }
+  }
+
+  /** The glyphs the VT actually holds for one row, for alignment checks. */
+  function rowGlyphs(cells: VtCell[]): string {
+    return cells.map((cell) => cell.chars).join("");
+  }
+
+  /**
+   * The gate's own audit text, cell by cell: every non-blank cell of every
+   * independently expected audit row, including wrapped continuations, has to
+   * carry the semantic foreground token. A row that paints one cell and leaves
+   * the rest default-coloured fails here, which the weaker helpers above
+   * (kept for intentionally multicoloured native rows) would not catch.
+   */
+  function assertAuditCellsForeground(
+    rows: VtCell[][],
+    auditStart: number,
+    expectedRows: string[],
+    width: number,
+    token: "success" | "warning" | "error",
+    label: string,
+  ): void {
+    const color = packedColor(nativeTheme.getFgAnsi(token), "fg");
+    for (let index = 0; index < expectedRows.length; index += 1) {
+      const row = auditStart + index;
+      assert.equal(rowGlyphs(rows[row]!).trim(), expectedRows[index]!.trim(),
+        `${label}: VT buffer row ${row + 1} does not hold audit row ${index + 1}`);
+      let textCells = 0;
+      let unpainted = 0;
+      for (let column = 0; column < width; column += 1) {
+        const cell = rows[row]![column]!;
+        if (cell.chars.length === 0 || cell.chars === " ") continue;
+        textCells += 1;
+        if (!cellHasColor(cell, "fg", color)) unpainted += 1;
+      }
+      // Blank cells carry the row background but no glyph, so the count that has
+      // to match is the expected row's non-space characters.
+      const expectedGlyphs = expectedRows[index]!.replace(/ /g, "").length;
+      assert.equal(textCells, expectedGlyphs,
+        `${label}: audit row ${index + 1} renders ${textCells} text cells for ${expectedGlyphs} expected glyphs`);
+      assert.equal(unpainted, 0,
+        `${label}: ${unpainted} of ${textCells} audit text cells in row ${index + 1} are not drawn with the ${token} foreground`);
+    }
+  }
+
+  // ── The three families: status once, independent wrap, native body kept ──
+
+  test("real host: native bash, native edit, and renderer-less notice cards each show one word-wrapped audit status", async () => {
+    await withEditFixture(async (cwd) => {
+      const settled = await computeEditsDiff("fixture.txt", [{ oldText: OLD_TEXT, newText: "alpha\nBETA-CHANGED\ngamma\ndelta\n" }], cwd);
+      for (const family of ["bash", "edit", "notice"] as CardFamily[]) {
+        for (const width of [120, 46]) {
+          const details = family === "edit"
+            ? { diff: settled.diff, firstChangedLine: settled.firstChangedLine }
+            : family === "bash" ? {} : { status: "pending" };
+          const card = await auditedCard(family, cwd, { details });
+          const collapsed = family === "edit" ? await renderWithPreview(card.component, width) : card.component.render(width);
+          const label = `${family} collapsed width ${width}`;
+          assertAuditRowsRendered(collapsed, card.annotationText, width - 2, "success", label);
+          for (const marker of FAMILY_MARKERS[family]) {
+            assert.ok(stripAnsi(collapsed.join("\n")).includes(marker), `${label}: the native ${JSON.stringify(marker)} row is retained`);
+          }
+
+          card.component.setExpanded(true);
+          const expanded = card.component.render(width);
+          const expandedLabel = `${family} expanded width ${width}`;
+          assertAuditRowsRendered(expanded, card.annotationText, width - 2, "success", expandedLabel);
+          for (const marker of FAMILY_MARKERS[family]) {
+            assert.ok(stripAnsi(expanded.join("\n")).includes(marker), `${expandedLabel}: the native ${JSON.stringify(marker)} row is retained`);
+          }
+
+          card.component.setExpanded(false);
+          assert.deepEqual(card.component.render(width), collapsed,
+            `${family} width ${width}: collapsing again reproduces the collapsed card exactly`);
+          assert.equal(card.annotationText, (card.annotated.content as Array<Record<string, unknown>>)[0]!.text,
+            `${family} width ${width}: rendering never rewrites the model-visible annotation`);
+          // The model-visible result is never rewritten by the decoration, checked
+          // after the whole collapsed/expanded/re-collapse sequence against
+          // snapshots that share no object graph with the pipeline.
+          assert.notEqual(card.annotated.content, card.event.content,
+            `${family} width ${width}: the annotated payload is not the emitted array itself`);
+          assert.deepEqual(card.event.content, card.originalContent,
+            `${family} width ${width}: the emitted tool_result content is never mutated`);
+          assert.deepEqual((card.annotated.content as Array<Record<string, unknown>>).slice(1), card.originalContent,
+            `${family} width ${width}: the native result payload is preserved after the annotation`);
+          assert.equal(card.annotated.isError, false, `${family} width ${width}: the native result flag is preserved`);
+          if (card.snapshotDetails !== undefined) {
+            assert.deepEqual(card.annotated.details, card.snapshotDetails,
+              `${family} width ${width}: the native structured details are preserved`);
+          }
+        }
+      }
+    });
+  });
+
+  // ── Whole-card cell coverage: no ordinary-background hole anywhere ─────
+
+  test("real host: every cell of the integrated audit card keeps the themed row background", async () => {
+    await withEditFixture(async (cwd) => {
+      const settled = await computeEditsDiff("fixture.txt", [{ oldText: OLD_TEXT, newText: "alpha\nBETA-CHANGED\ngamma\ndelta\n" }], cwd);
+      await withInstalledHostWidths(async () => {
+        const successBg = theme.getBgAnsi("toolSuccessBg");
+        for (const family of ["bash", "edit", "notice"] as CardFamily[]) {
+          for (const width of [120, 46]) {
+            for (const expanded of [false, true]) {
+              const details = family === "edit"
+                ? { diff: settled.diff, firstChangedLine: settled.firstChangedLine }
+                : family === "bash" ? {} : { status: "pending" };
+              const card = await auditedCard(family, cwd, { details });
+              let lines = family === "edit" ? await renderWithPreview(card.component, width) : card.component.render(width);
+              if (expanded) {
+                card.component.setExpanded(true);
+                lines = card.component.render(width);
+              }
+              const label = `${family} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+              // Cell level, not "the row contains the escape sequence": title,
+              // diff/body, audit, gap and padded right-edge cells alike. This runs
+              // first so a background hole is reported as a background hole.
+              await assertEveryCardCellBackground(lines, width, successBg, label);
+              const auditStart = assertAuditRowsRendered(lines, card.annotationText, width - 2, "success", label);
+              const cells = await cardCells(lines, width);
+              const auditRows = expectedAuditRowTexts(card.annotationText, width - 2);
+              assertAuditCellsForeground(cells, auditStart, auditRows, width, "success", label);
+              for (let index = 0; index < auditRows.length; index += 1) {
+                assertNoCellForeground(cells, auditStart + index, ["toolOutput"], label);
+              }
+              if (family === "edit") {
+                const added = lines.findIndex((line) => stripAnsi(line).includes("BETA-CHANGED"));
+                const removed = lines.findIndex((line) => stripAnsi(line).includes("beta"));
+                assert.ok(added > 0 && removed > 0, `${label}: the native diff rows are present`);
+                assertCellForeground(cells, added, width, "toolDiffAdded", label);
+                assertCellForeground(cells, removed, width, "toolDiffRemoved", label);
+                assertCellForeground(cells, lines.findIndex((line) => stripAnsi(line).includes("fixture.txt")), width, "toolTitle", label);
+              }
+            }
+          }
+        }
+      });
+    });
+  });
+
+  // ── Failed and unaudited cards: row background and text colour differ ──
+
+  test("real host: a failed card keeps gate cells on the error background with success text, and an unaudited card warns", async () => {
+    await withEditFixture(async (cwd) => {
+      await withInstalledHostWidths(async () => {
+        const errorBg = theme.getBgAnsi("toolErrorBg");
+        const successBg = theme.getBgAnsi("toolSuccessBg");
+        const pi = fakePiHost();
+        const { coordinator } = coordinatorFor([JSON.stringify({ decision: "PASS", reason: AUDIT_REASON })], { cwd });
+        coordinator.registerHooks(pi.pi);
+        assert.equal(await coordinator.admitToolCall(callArgs("edit-failed", "edit", EDIT_ARGS)), undefined);
+        const originalContent = [{ type: "text", text: "synthetic edit failure" }];
+        const [annotated] = await pi.emit(
+          "tool_result",
+          resultEvent("edit-failed", "edit", originalContent, { isError: true, details: {} }),
+        ) as Array<Record<string, unknown>>;
+        const decorated = (pi.pi.__rendererResolver as RendererResolver)("edit", () => nativeEditDefinition);
+        assert.ok(decorated?.renderResult);
+        const component = new h.agent.ToolExecutionComponent("edit", "edit-failed", EDIT_ARGS, {}, { ...nativeEditDefinition, ...decorated }, ui, cwd);
+        component.setArgsComplete();
+        component.updateResult(annotated, false);
+        const lines = await renderWithPreview(component);
+        const width = 120;
+        const annotationText = (annotated.content as Array<Record<string, unknown>>)[0]!.text as string;
+        const auditStart = assertAuditRowsRendered(lines, annotationText, width - 2, "success", "failed edit card");
+        const cells = await cardCells(lines, width);
+        const headerBg = packedColor(successBg, "bg");
+        const expectedErrorBg = packedColor(errorBg, "bg");
+        // No ordinary-background hole anywhere on the failed card, and only the
+        // two semantic row backgrounds the host knows about.
+        for (let row = 1; row < lines.length; row += 1) {
+          for (let column = 0; column < width; column += 1) {
+            const cell = cells[row]![column]!;
+            assert.ok(cell.bgMode !== 0, `failed edit card: cell ${column} of row ${row + 1} is an ordinary-background hole`);
+            assert.ok(cellHasColor(cell, "bg", headerBg) || cellHasColor(cell, "bg", expectedErrorBg),
+              `failed edit card: cell ${column} of row ${row + 1} is on neither the preview nor the error row background`);
+          }
+        }
+        // Documented host nuance, asserted per cell rather than changed: the
+        // native edit header keeps its own preview-derived background even
+        // though the settled result failed, while the gate-owned rows from the
+        // collapsed separator down are on the error background.
+        const titleRow = lines.findIndex((line) => stripAnsi(line).includes("fixture.txt"));
+        assert.ok(titleRow > 0 && titleRow < auditStart, "the native edit title row sits above the audit rows");
+        for (let column = 0; column < width; column += 1) {
+          assert.ok(cellHasColor(cells[titleRow]![column]!, "bg", headerBg),
+            `failed edit card: native header cell ${column} keeps its own preview background`);
+        }
+        const gateOwnedAbove = cells.slice(1, auditStart).filter((row) => cellHasColor(row[0]!, "bg", expectedErrorBg)).length;
+        assert.ok(gateOwnedAbove > 0, "the gate-owned rows above the audit text already use the error background");
+        for (let row = auditStart; row < lines.length; row += 1) {
+          for (let column = 0; column < width; column += 1) {
+            const cell = cells[row]![column]!;
+            assert.ok(cell.bgMode !== 0, `failed edit card: cell ${column} of row ${row + 1} is an ordinary-background hole`);
+            assert.ok(cellHasColor(cell, "bg", expectedErrorBg),
+              `failed edit card: cell ${column} of row ${row + 1} is not on the error row background`);
+          }
+        }
+        assertCellForeground(cells, auditStart, width, "success", "failed edit card");
+        const auditRows = expectedAuditRowTexts(annotationText, width - 2);
+        assertAuditCellsForeground(cells, auditStart, auditRows, width, "success", "failed edit card");
+        for (let index = 0; index < auditRows.length; index += 1) {
+          assertNoCellForeground(cells, auditStart + index, ["error"], `failed edit card: audit row ${index + 1}`);
+        }
+        const errorRow = lines.findIndex((line) => stripAnsi(line).includes("synthetic edit failure"));
+        assert.ok(errorRow > auditStart, "the native error body row sits below the audit rows");
+        assertCellForeground(cells, errorRow, width, "error", "failed edit card");
+
+        // An unaudited card is a warning, never success, on the same painted card.
+        const notice = await auditedCard("notice", cwd, {
+          details: { status: "pending" },
+          scope: protectionConfig({ scope: "selected", toolNames: ["bash"] }),
+        });
+        const noticeLines = notice.component.render(46);
+        const noticeStart = assertAuditRowsRendered(noticeLines, notice.annotationText, 44, "warning", "unaudited notice card");
+        await assertEveryCardCellBackground(noticeLines, 46, successBg, "unaudited notice card");
+        assertAuditCellsForeground(await cardCells(noticeLines, 46), noticeStart,
+          expectedAuditRowTexts(notice.annotationText, 44), 46, "warning", "unaudited notice card");
+      });
     });
   });
 }

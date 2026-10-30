@@ -181,6 +181,7 @@ export function stagedToolProtectionSettings(config: Pick<ReviewGateConfig, "too
     timeoutMs: settings.timeoutMs,
     maxContextChars: settings.maxContextChars,
     retainAuditorSessions: settings.retainAuditorSessions,
+    debug: settings.debug,
   };
 }
 
@@ -213,7 +214,8 @@ export function toolProtectionStagedWriteNeeded(raw: unknown, staged: ToolProtec
     || JSON.stringify(stored.toolNames) !== JSON.stringify(staged.toolNames)
     || stored.timeoutMs !== staged.timeoutMs
     || stored.maxContextChars !== staged.maxContextChars
-    || stored.retainAuditorSessions !== staged.retainAuditorSessions;
+    || stored.retainAuditorSessions !== staged.retainAuditorSessions
+    || stored.debug !== staged.debug;
 }
 
 /** True when the staged block equals the core defaults an absent block yields. */
@@ -224,7 +226,8 @@ function toolProtectionBlockIsDefault(staged: ToolProtectionSettingsState): bool
     && staged.toolNames.length === 0
     && staged.timeoutMs === DEFAULT_TOOL_PROTECTION_CONFIG.timeoutMs
     && staged.maxContextChars === DEFAULT_TOOL_PROTECTION_CONFIG.maxContextChars
-    && staged.retainAuditorSessions === DEFAULT_TOOL_PROTECTION_CONFIG.retainAuditorSessions;
+    && staged.retainAuditorSessions === DEFAULT_TOOL_PROTECTION_CONFIG.retainAuditorSessions
+    && staged.debug === DEFAULT_TOOL_PROTECTION_CONFIG.debug;
 }
 
 /** The Tools-row / submenu label for one level, taken from the core profiles. */
@@ -363,6 +366,13 @@ export async function selectToolProtection(
         ? "On — each audit is saved as a session you can browse"
         : "Off — audits are not saved",
     });
+    rows.push({
+      key: "debug",
+      label: "Debug audit output",
+      value: state.debug
+        ? "On — audit diagnostics are shown to you"
+        : "Off — only what a call already reports is shown",
+    });
     const aligned = alignedSettingsRows(rows.map((row) => [row.label, row.value] as const));
     const choice = await retainedSelect(ui, {
       title: "Tool protection",
@@ -448,6 +458,21 @@ export async function selectToolProtection(
         state.retainAuditorSessions = true;
       } else {
         state.retainAuditorSessions = false;
+      }
+      continue;
+    }
+    if (choice === "debug") {
+      // Presentation only: this row changes what this gate tells YOU about an
+      // audit it already performed. Toggling it here starts no model or provider
+      // call, records nothing, changes no level, scope, or decision, and never
+      // grants a PASS an auditor reason it does not have. Turning it Off is
+      // silent, exactly like turning retention Off.
+      if (!state.debug) {
+        await notify(ui, "Debug audit output staged as On: this switch controls whether audit diagnostics this gate already has — how long a decision took and why a call was not audited — are shown to you. It changes nothing else: it does not enable or disable protection, does not audit or skip anything, does not save auditor sessions, does not contact a model or provider, and does not send the acting model anything about a call that passed or was not audited. Failures and audit errors are reported either way, and saving audit sessions stays a separate choice. Nothing applies until root Escape (this session) or Save/Ctrl+S (disk).",
+          "info");
+        state.debug = true;
+      } else {
+        state.debug = false;
       }
       continue;
     }

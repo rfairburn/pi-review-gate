@@ -137,11 +137,13 @@ gate.
 | `timeoutMs` | `10000` | Decision deadline in whole milliseconds, 1000–120000. |
 | `maxContextChars` | `128000` | Assembled auditor-context budget in UTF-16 code units, 4000–2000000. Governing instructions, the exact call, and causal evidence are never truncated; if they do not fit, the call does not run. |
 | `retainAuditorSessions` | `false` | Optional, opt-in saving of each actual auditor invocation as an ordinary saved Pi session you can browse; see [Keeping auditor sessions](tool-protection.md#keeping-auditor-sessions-optional). An absent field is Off, so a block or a parent launch pin that predates it keeps the previous behavior. Only the JSON booleans `true`/`false` are accepted — `"true"`, `1`, and `null` are rejected. It changes no decision input, no permission, and no verdict, and a saved audit is never read back into a later decision. |
+| `debug` | `false` | Optional, default-off presentation switch for this gate's own audit output; see [What each call reports](tool-protection.md#what-each-call-reports). An absent field defaults to Off, including in a stored block or a parent launch pin that predates the field, so routine `PASS` and `NOT AUDITED` audit lines use the new quiet presentation rather than the former always-visible annotations. Only the JSON booleans `true`/`false` are accepted — `"true"`, `1`, and `null` are rejected. Off hides the routine `PASS` and `NOT AUDITED` audit lines; On shows them to you only, and a `PASS` line carries no auditor reason because a `PASS` reply is reasonless. It is never model-facing, records nothing, starts no model or provider call, and changes no level, scope, decision, timeout, or context budget; auditor sessions stay governed by `retainAuditorSessions`. A `FAIL`, an audit error, and a nested refusal stay reported at either value, and an auditor-session save warning stays visible to you. |
 
 Explicit writes validate strictly: a non-Off level without an auditor, a `selected`
-scope with no names, a non-whole or out-of-range number, or an unknown level or scope is
-rejected. Unknown keys inside the block are ignored. An absent block and an explicit
-`{"level":"off"}` both mean Off.
+scope with no names, a non-whole or out-of-range number, a non-boolean
+`retainAuditorSessions` or `debug`, or an unknown level or scope is rejected. Unknown
+keys inside the block are ignored. An absent block and an explicit `{"level":"off"}` both
+mean Off.
 
 A malformed stored block is not recovered as an implicit Off. Startup reports a warning
 and keeps the derived `toolProtectionError`; protected calls stay blocked until a valid

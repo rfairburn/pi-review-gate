@@ -766,6 +766,16 @@ auditor is configured trusted code, not an OS-sandboxed process, and receives th
 call, governing instructions, and selected evidence. Only a non-Off level adds the gate,
 and turning it Off removes only that gate.
 
+What the gate prints about a call is presentation, not authority. A `FAIL`, an audit
+error, and a nested refusal are reported to you and to the acting model, and an
+auditor-session save warning is always visible to you without changing a verdict. A
+routine `PASS` or `NOT AUDITED` result adds no audit text to what the
+acting model receives, and whether it is also shown to you is the user-only
+`toolProtection.debug` switch, Off by default; it records nothing, starts no model call,
+and changes no decision, level, or coverage. Silence is not a grant and not evidence that
+the gate was consulted: a skipped call stays NOT AUDITED, a `PASS` still means only that
+this added gate did not block, and no failure path is hidden at either `debug` value.
+
 The one infrastructure exception is the reserved native discovery loader `tool_search`,
 which is never audited at any level or scope: it is how a session learns which tools
 exist, it moves no user data by itself, and refusing it would strand the session rather

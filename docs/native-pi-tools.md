@@ -285,13 +285,15 @@ no log line, and an allowed one leaves exactly one.
 The `toolProtection` gate adds one pre-effect decision step at native Pi
 admission for the primary agent and newly launched Pi executors. Direct calls, admitted
 codemode and nested calls, and MCP tool invocations that reach Pi's native hooks are
-audited under the same shared level and auditor. The decision and any supplied reason
-travel inline with the same tool result for the user and model; a PASS preserves native
-output and nested return values and is not a claim that execution succeeded. This is not
-coverage for arbitrary wrappers or other harnesses, and unsupported external acting
+audited under the same shared level and auditor. A refusal and an audit error are
+reported to you and to the acting model; a routine `PASS` or `NOT AUDITED` result adds no
+audit text to what the acting model receives, and its audit line is shown to you only
+when `toolProtection.debug` is On. A PASS preserves native output and nested return
+values and is not a claim that execution succeeded. This is not coverage for arbitrary
+wrappers or other harnesses, and unsupported external acting
 executors are refused before they start under a non-Off level. The reserved discovery
 loader `tool_search` is the single infrastructure exception: it is never audited, its
-calls carry `NOT AUDITED — discovery loader`, and every native authorization, permission,
+user-only debug diagnostic is `NOT AUDITED — discovery loader`, and every native authorization, permission,
 and liveness guard still applies to them. See
 [Tool protection](tool-protection.md).
 

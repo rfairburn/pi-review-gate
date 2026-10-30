@@ -11,7 +11,10 @@ ceilings, native permissions and trust, scoped tool denials, duplicate/liveness
 preflight, review, landing, ownership, and cancellation safeguards still decide
 independently. `PASS` means only that this added gate does not block; it is not proof
 that the tool ran or succeeded. `toolProtection.level` is the only switch for this gate:
-top-level `enabled` controls automatic post-execution review, not this feature.
+top-level `enabled` controls automatic post-execution review, not this feature. By default
+the gate says nothing about a call it does not stop; `toolProtection.debug` is the
+optional, user-only switch that also shows you those routine positive results. See
+[What each call reports](#what-each-call-reports).
 
 This page describes the gate's own limits, not a general-availability sandbox or an
 all-harness guarantee. It requires a build that contains these native admission hooks; do
@@ -77,31 +80,62 @@ The intended native coverage is:
 - admitted codemode and nested calls;
 - MCP tool invocations that reach Pi's native hooks.
 
-Each decision is attached inline to the same tool result for both the user and the
-acting model; there is no separate audit-only turn. Native output, structured content,
-and nested return values are preserved, and nested decisions are aggregated on the
-parent. A PASS annotation is not execution success.
+Each decision belongs to the tool result of the call it governs; reporting it creates no
+separate audit-only turn. Saving a separate auditor session remains an independent opt-in. Native output, structured
+content, and nested return values are preserved, and nested decisions are aggregated on
+the parent. A PASS annotation is not execution success. Who sees each verdict is covered
+by [What each call reports](#what-each-call-reports).
 
 That aggregation on the parent is a bounded digest, not a complete log, and it discloses
 its own bounds: at most 32 nested decision records are retained for one outer call (a
 refusal is dropped last, so an earlier denial is not the record lost) and at most 12
 summary lines are rendered. A long script can therefore carry `N earlier nested
 decision(s) omitted from this summary`, and when records were dropped at all it adds a
-`RETENTION LOSS: N nested decision record(s) are not retained` count. The outer call's
-own decision and any reason it supplied are always present; an individual nested auditor
-reason is not guaranteed visible. No omission here is silent.
+`RETENTION LOSS: N nested decision record(s) are not retained` count. These retention
+bounds do not depend on `toolProtection.debug`: a refusal is still dropped last and a
+disclosed count is still disclosed, while routine positive rows follow
+[What each call reports](#what-each-call-reports). An individual nested auditor reason is
+not guaranteed visible. No retention loss here is silent.
 
 Under a non-Off level, unsupported external acting executors are refused before they
 start, regardless of which auditor is selected. The gate does not mediate human shell
 use, effects inside an already-running process, autonomous descendants, or
 provider/server-side effects. See [Limits and non-goals](#limits-and-non-goals).
 
+## What each call reports
+
+The audit's output is presentation, not authority, and the gate is quiet about the calls
+it does not stop.
+
+- A `FAIL`, an audit error (timeout, malformed decision, unavailable auditor, context
+  capacity, an invalidated pending decision, an unsupported acting executor), and a
+  nested refusal are reported to you and to the acting model at either
+  `toolProtection.debug` value. A native tool error that follows a `PASS` stays a native
+  tool error; this gate never restates it as an audit `FAIL`.
+- An auditor-session save warning is always shown to you and never changes a verdict: a
+  recording problem does not turn a `PASS` into a `FAIL` or hide a decision that was made.
+- A routine `PASS` and a `NOT AUDITED` result add no audit text to what the acting model
+  receives, at either `debug` value. The call's own native tool result, and the normal
+  parent-session record and display for it, stay authoritative; the gate adds no
+  model-facing notice about a call it did not stop.
+- Whether those routine `PASS` and `NOT AUDITED` lines are also shown to you is
+  `toolProtection.debug` (Off by default). Off hides them. On shows the themed status
+  line, including the level and audit elapsed time for a `PASS`, but never a PASS reason.
+  `NOT AUDITED` keeps its exemption diagnostic; no audit duration is invented for a call
+  that was not audited. The switch is user-only: it sends the acting
+  model nothing it would not already receive, records nothing, contacts no model or
+  provider, and changes no level, scope, decision, timeout, or context budget.
+- Silence grants nothing and does not prove that the auditor was consulted. A `PASS`
+  still means only that this added gate did not block, and a `NOT AUDITED` call is still
+  unchecked by the gate. Neither grants native permission, trust, ownership, or landing
+  authority. No failure or audit error is hidden by either `debug` value.
+
 ## Settings
 
 `/review-settings` → **Tools** → **Tool protection** exposes the controls: the shared
 level, one auditor selection, the audit scope and the exact names (toggled in the same
 searchable tool-name picker as the deny selectors, where checked means audited), the
-decision timeout, and the context budget.
+decision timeout, the context budget, and **Debug audit output**.
 
 - Entering the exact-name scope with no established list checks every tool name the
   runtime currently offers that this gate can audit, so you uncheck the exemptions instead
@@ -123,6 +157,11 @@ decision timeout, and the context budget.
   because it starts writing records that contain the exact auditor request; turning it
   back off needs no confirmation. See
   [Keeping auditor sessions](#keeping-auditor-sessions-optional).
+- **Debug audit output** is Off by default and decides only whether this gate's routine
+  `PASS` and `NOT AUDITED` lines are shown to you. It records nothing, contacts no model
+  or provider, and changes no decision, level, or coverage; failures and audit errors are
+  reported at either value. It is independent of **Save auditor sessions**. See
+  [What each call reports](#what-each-call-reports).
 
 ## Configuration
 
@@ -155,9 +194,12 @@ rewritten.
 
 ## Keeping auditor sessions (optional)
 
-By default an audit leaves nothing behind: the decision is shown inline and the generated
-request and reply are not stored anywhere. `toolProtection.retainAuditorSessions` (Off by
-default, **Save auditor sessions** in the menu) is an explicit opt-in to keep each audit as
+By default no separate saved auditor session is created. Display-only decision metadata
+can remain in the normal parent-session history instead of model-facing tool content;
+the parent's existing persistence settings, including `--no-session`, still apply. This
+is not retention of the full auditor request and raw reply.
+`toolProtection.retainAuditorSessions` (Off by default, **Save auditor sessions** in the
+menu) is an explicit opt-in to keep each audit as
 an ordinary saved Pi session, in the same session store and format as any other
 conversation, so you can browse it later.
 
@@ -195,6 +237,12 @@ conversation, so you can browse it later.
 - An ephemeral parent (`--no-session`) stays ephemeral. If retention is opted in, the audit
   record is still its own separate saved session, and the acting session is neither created
   nor reopened by recording.
+- `toolProtection.debug` is not a recording switch and opens no file or session of its
+  own: it changes only what the acting session shows you. It rewrites no existing saved
+  auditor session and no earlier session content, and it adds no migration step. Whether a
+  record exists at all
+  is decided by **Save auditor sessions** alone, and a record still reproduces the request
+  that was sent and the reply that actually came back rather than a tidied version of it.
 
 ## What the auditor receives
 
@@ -286,16 +334,24 @@ The auditor process receives one JSON envelope on stdin and
 It writes exactly one decision object to stdout and nothing else:
 
 ```text
-{"decision":"PASS","reason":"short justification"}
+{"decision":"PASS"}
 {"decision":"FAIL"}
+{"decision":"FAIL","reason":"short refusal justification"}
 ```
 
-`decision` is required and must be exactly `PASS` or `FAIL`. Full LLM auditors are
-expected to supply a brief reason; `reason` is optional in the shared format so decision
-binaries may omit it. A reason up to 4000 characters is preserved verbatim; an oversized one is malformed rather
-than truncated. An omitted reason stays absent and may be labelled by the host, but no
-rationale is invented. Surrounding prose, extra fields, a non-string or oversized
-reason, and any other decision value are malformed.
+`decision` is required and must be exactly `PASS` or `FAIL`. The auditor is asked for a
+reasonless `PASS` — `{"decision":"PASS"}` with no `reason` field is the expected positive
+reply at every enabled level, on both routes. `reason` is optional and belongs to a
+`FAIL`: `{"decision":"FAIL"}` on its own is a complete, valid decision, and that refusal
+is then reported in generic wording rather than with an invented justification. A supplied
+reason up to 4000 characters is preserved verbatim and is what makes the refusal
+actionable; an oversized one is malformed rather than truncated. An omitted reason stays
+absent and may be labelled by the host, but no rationale is invented. Surrounding prose,
+extra fields, a non-string or oversized reason, and any other decision value are
+malformed. The parser is unchanged, so a reply that still attaches a `reason` to a `PASS`
+remains a valid decision; that unexpected reason is not shown to you and is not forwarded
+to the acting model, while a retained auditor record and the fixture tester report the
+reply that actually came back.
 
 A nonzero exit, timeout, empty or truncated output, unconfirmed process settlement,
 malformed decision, or unavailable auditor fails closed: the proposed call does not run.
@@ -311,6 +367,9 @@ never retried, replayed, routed to a fallback, or answered from a cache.
   PASS cannot revive it.
 - A `FAIL` is a gate refusal, not a tool execution failure. It does not create an
   execution-retry entitlement, and existing duplicate/liveness behavior is unchanged.
+- A `FAIL` with no supplied reason stops the call exactly like one with a reason: the
+  refusal is reported to you and to the acting model, and nothing is invented to fill the
+  gap.
 - A fresh, contextual user approval can address alignment or authorization ambiguity for
   a specific proposal. It is not a standing grant, does not replay a refused call, and
   cannot waive the minimum floor while a level is enabled. Only a human setting the level
@@ -454,14 +513,25 @@ Do not use `scripts/pi-review-gate.sh` for this test: the launcher re-resolves
 - **Off baseline.** Set `level` to `off` (or remove the block) and repeat a harmless
   scratch `read` or `write`. Expect ordinary behavior with no audit annotation.
 - **Dangerous plus a fast Pi auditor.** Set `level` to `dangerous`, restart, and run a
-  harmless scratch `read` or `write`. Expect the decision and any supplied reason inline
-  on the same tool result. Record elapsed time for information only.
+  harmless scratch `read` or `write`. Expect the call to run with its ordinary native
+  result and, at the default **Debug audit output** Off, no audit line for the PASS and no
+  audit text added for the acting model. Then turn **Debug audit output** On (root Escape
+  applies it to this scratch session) and repeat: expect the themed
+  `Tool protection: PASS` line with the level and elapsed time and no auditor reason,
+  because a PASS is reasonless. Record elapsed time for information only.
+- **Quiet output never hides a failure.** With **Debug audit output** Off and the inert
+  FAIL stub below, expect the refusal to reach you and the acting model anyway, with
+  either a supplied reason or the generic wording when none was supplied. A native tool
+  error after a PASS stays a native tool error, not an audit `FAIL`.
 - **Selected coverage.** Set `scope` to `selected` with
-  `"toolNames":["write"]` (use the exact native name your build exposes). A `read` should
-  show NOT AUDITED, while `write` is audited. Restore `all` afterward.
+  `"toolNames":["write"]` (use the exact native name your build exposes). A `read` is not
+  audited and is never treated as a pass: with **Debug audit output** On it shows
+  `NOT AUDITED`, and with it Off nothing extra is shown about it, while `write` is
+  audited either way. Restore `all` afterward.
 - **Discovery loader.** With any non-Off level, ask for a tool that is not yet active so
-  `tool_search` runs. Expect it to work with no auditor call and a `NOT AUDITED —
-  discovery loader` annotation, and expect a native refusal to stay refused.
+  `tool_search` runs. Expect it to work with no auditor call; with **Debug audit output**
+  On the result carries the `NOT AUDITED — discovery loader` line, which is never a pass.
+  Expect a native refusal to stay refused.
 - **Budget and timeout.** Set `maxContextChars` to `4000` and run a harmless call. If the
   mandatory context exceeds that budget, expect an explicit capacity diagnostic and no
   execution, with nothing silently truncated; a small call can fit and pass. For a
@@ -488,8 +558,11 @@ process.stdin.on("end", () => {
   JSON.parse(raw);
   const delayMs = Number(process.env.FAKE_AUDITOR_DELAY_MS || 0);
   setTimeout(() => {
-    const decision = process.env.FAKE_AUDITOR_DECISION === "PASS" ? "PASS" : "FAIL";
-    process.stdout.write(JSON.stringify({ decision, reason: "synthetic fixture decision" }));
+    const isPass = process.env.FAKE_AUDITOR_DECISION === "PASS";
+    // A PASS is reasonless; a FAIL may carry a short reason.
+    process.stdout.write(JSON.stringify(isPass
+      ? { decision: "PASS" }
+      : { decision: "FAIL", reason: "synthetic fixture decision" }));
   }, Number.isFinite(delayMs) ? delayMs : 0);
 });
 JS
@@ -515,8 +588,10 @@ JS
 
 Replace the argument with the real absolute path to the scratch file; JSON does not
 expand `$scratch`. With `FAKE_AUDITOR_DECISION` unset or set to any value other than
-`PASS`, the stub returns FAIL. Set `FAKE_AUDITOR_DECISION=PASS` in the launching shell
-for the PASS path. Set `FAKE_AUDITOR_DELAY_MS` to a value longer than `toolProtection`'s
+`PASS`, the stub returns a `FAIL` with a short reason; drop the `reason` field from its
+reply to exercise a decision-only `FAIL`, which is still a complete valid decision. Set
+`FAKE_AUDITOR_DECISION=PASS` in the launching shell for the PASS path. Set
+`FAKE_AUDITOR_DELAY_MS` to a value longer than `toolProtection`'s
 `timeoutMs` (for example 5000 with `timeoutMs: 1000`) to exercise the deadline
 deterministically; the delay is a local timer and performs no other work. Use a harmless
 scratch `read` or `write` as the proposal; this exercises the refusal, pass, and timeout

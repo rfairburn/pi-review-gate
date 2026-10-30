@@ -220,6 +220,7 @@ function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: 
       timeoutMs: staged.timeoutMs,
       maxContextChars: staged.maxContextChars,
       retainAuditorSessions: staged.retainAuditorSessions,
+      debug: staged.debug,
     };
   }
   parsed.reviewerTimeoutMs = selection.reviewerTimeoutMs;

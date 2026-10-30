@@ -15,6 +15,47 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.225]
+
+### Added
+
+- **Optional debug audit output** (#549): `toolProtection.debug` (optional strict JSON
+  boolean, default `false`; **Debug audit output** under `/review-settings` → **Tools** →
+  **Tool protection**) decides only whether this gate's routine `PASS` and `NOT AUDITED`
+  audit lines are shown to you. With the default Off they are hidden; with On you see the
+  themed status line, including the level and audit elapsed time for a `PASS`, but never
+  a PASS reason. `NOT AUDITED` keeps its exemption diagnostic without an invented audit
+  duration. The switch is user-only: it sends the acting model nothing new, records
+  nothing, opens no file or session of its own, contacts no model or provider, and changes
+  no level, scope, decision, timeout, or context budget; auditor-session retention stays a
+  separate **Save auditor sessions** choice. It is staged by the existing transaction
+  (root Escape applies the session draft, **Save changes**/Ctrl+S persists, **Cancel**
+  discards) and is pinned for newly launched Pi executors with the rest of the settings,
+  while an absent field — including in a stored block or a parent launch pin that predates
+  it — defaults to `false`, so an existing configuration gets the new quiet presentation
+  rather than the former always-visible annotations.
+
+### Changed
+
+- **Quiet audit feedback by default** (#549): a routine `PASS` or `NOT AUDITED` result no
+  longer adds acting-model-facing audit text, and by default it is not shown to you
+  either; the call's own native tool result and the session's normal record for it stay
+  authoritative. The auditor is now asked for a reasonless `PASS` (`{"decision":"PASS"}`)
+  and a `FAIL` reason stays optional: `{"decision":"FAIL"}` alone is a complete valid
+  decision and is reported with a generic refusal, while a supplied reason is preserved
+  verbatim and shown. The shared decision parser is unchanged, so an existing reply that
+  attaches a `reason` to a `PASS` is still valid; that unexpected reason is not displayed
+  to you and is not forwarded to the acting model, while retained auditor records and the
+  inert fixture tester still report the reply that actually came back. A `FAIL`, an audit
+  error, and a nested refusal stay reported to you and to the acting model at either
+  `debug` value, an auditor-session save warning stays visible to you without changing a
+  verdict, and a native tool error after a `PASS` stays a
+  native tool error rather than an audit `FAIL`. Quiet output grants nothing and does not
+  prove the auditor was consulted for an unchecked call. The neutral policy revision
+  (`rules-7`) carries only the new output instruction: the harm, alignment, and intent
+  criteria, the policy examples, and the ten fixture cases and their expected verdicts are
+  unchanged. See [Tool protection](docs/tool-protection.md).
+
 ## [0.1.0-dev.224]
 
 ### Fixed

@@ -14,7 +14,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -156,6 +156,7 @@ test("Tools offers Tool protection and a config without the block opens on the e
           "Decision timeout 10s (entered in seconds)",
           "Context budget 128000 characters",
           "Save auditor sessions Off — audits are not saved",
+          "Debug audit output Off — only what a call already reports is shown",
           "Back",
         ]);
         return back(title, options);
@@ -253,6 +254,9 @@ test("enabling a level and choosing an external auditor persists the canonical b
       // Retention is an owned field of the block, so an explicit apply writes
       // it alongside the rest instead of leaving a stale stored value.
       retainAuditorSessions: false,
+      // So is the #549 debug switch: the staged effective value is written with
+      // the rest of the owned fields rather than left ambiguous.
+      debug: false,
     });
     assert.equal(saved.customFutureKey, "keep");
     assert.deepEqual(config.toolProtection?.auditor, { source: "external", id: "generic-auditor" });
@@ -709,7 +713,7 @@ test("a worker rename follows the auditor id while a delete keeps the unresolved
     toolProtection: { level: "workspace", auditor: { source: "external", id: "aud" } },
   });
   const renamed = changeExternalAgent(opening, "aud", "aud2", opening.externalAgents!.aud);
-  assert.deepEqual(renamed.config.toolProtection, { level: "workspace", auditor: { source: "external", id: "aud2" }, scope: "all", toolNames: [], timeoutMs: 10_000, maxContextChars: 128_000, retainAuditorSessions: false });
+  assert.deepEqual(renamed.config.toolProtection, { level: "workspace", auditor: { source: "external", id: "aud2" }, scope: "all", toolNames: [], timeoutMs: 10_000, maxContextChars: 128_000, retainAuditorSessions: false, debug: false });
   assert.deepEqual(renamed.warnings, []);
   assert.ok(renamed.notices.some((notice) => notice.includes("Tool protection auditor reference updated to aud2")), JSON.stringify(renamed.notices));
 
@@ -1097,4 +1101,190 @@ test("retention is an owned field of the stored block for change detection", () 
   // the legacy block intact.
   const legacy = { level: "dangerous", auditor: { source: "external", id: "auditor-1" } };
   assert.equal(recoverConfig({ toolProtection: legacy }).config.toolProtection?.retainAuditorSessions, false);
+});
+
+// ---------------------------------------------------------------------------
+// Optional audit debug output (#549)
+// ---------------------------------------------------------------------------
+
+/**
+ * A stored block with an enabled level and a resolving auditor. `debug: undefined`
+ * stores a block that predates the field, exactly as an older configuration does.
+ */
+function debugBody(debug: boolean | undefined): Record<string, unknown> {
+  const toolProtection: Record<string, unknown> = {
+    level: "dangerous",
+    auditor: { source: "external", id: "auditor-1" },
+    scope: "all",
+    toolNames: [],
+    timeoutMs: 10_000,
+    maxContextChars: 128_000,
+    retainAuditorSessions: false,
+  };
+  if (debug !== undefined) toolProtection.debug = debug;
+  return {
+    enabled: false,
+    review: { activeReviewers: [] },
+    externalAgents: { "auditor-1": { adapter: "generic-cli", command: "audit-bin", review: {} } },
+    toolProtection,
+    customFutureKey: "keep",
+  };
+}
+
+test("Debug audit output toggles in the existing submenu, discloses its limits, and persists only that field", async () => {
+  const { dir, configPath, config } = await tempConfig(debugBody(false));
+  try {
+    const registered = commandHarness();
+    registerReviewSettings({ pi: registered.pi, config, configPath });
+    const { context, notices, confirmations } = scripted([
+      ...intoProtection,
+      (title, options) => {
+        assert.ok(flat(options).includes("Debug audit output Off — only what a call already reports is shown"), flat(options).join(" | "));
+        return pick("Debug audit output")(title, options);
+      },
+      (title, options) => {
+        assert.ok(flat(options).includes("Debug audit output On — audit diagnostics are shown to you"), flat(options).join(" | "));
+        return back(title, options);
+      },
+      back,
+      save,
+    ], { confirm: true });
+    await registered.handler("", context);
+
+    assert.deepEqual(confirmations, [], "a display-only switch is never blocked by a confirmation");
+    assert.ok(!notices.some((notice) => notice.type === "error"), JSON.stringify(notices));
+    const disclosure = notices.find((notice) => notice.message.includes("Debug audit output staged as On"));
+    assert.ok(disclosure, JSON.stringify(notices));
+    for (const phrase of [
+      "does not enable or disable protection",
+      "does not audit or skip anything",
+      "does not save auditor sessions",
+      "does not contact a model or provider",
+      "does not send the acting model anything about a call that passed or was not audited",
+      "Failures and audit errors are reported either way",
+      "Nothing applies until root Escape (this session) or Save/Ctrl+S (disk)",
+    ]) {
+      assert.ok(disclosure.message.includes(phrase), `disclosure is missing "${phrase}": ${disclosure.message}`);
+    }
+
+    const saved = JSON.parse(await readFile(configPath, "utf8")) as { toolProtection: Record<string, unknown>; customFutureKey?: string };
+    assert.equal(saved.toolProtection.debug, true);
+    assert.equal(saved.toolProtection.level, "dangerous", "no other owned field changed");
+    assert.equal(saved.toolProtection.retainAuditorSessions, false, "retention stays a separate choice");
+    assert.equal(saved.customFutureKey, "keep", "unrelated raw JSON survives");
+    assert.equal(config.toolProtection?.debug, true);
+    assert.deepEqual(await readdir(dir), ["review-gate.json"], "toggling debug recorded nothing anywhere in the config directory");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stored block without the debug field displays Off and saving it is a real change", async () => {
+  const { dir, configPath, config } = await tempConfig(debugBody(undefined));
+  try {
+    const registered = commandHarness();
+    registerReviewSettings({ pi: registered.pi, config, configPath });
+    const { context } = scripted([
+      ...intoProtection,
+      (title, options) => {
+        assert.ok(flat(options).includes("Debug audit output Off — only what a call already reports is shown"), flat(options).join(" | "));
+        return pick("Debug audit output")(title, options);
+      },
+      back,
+      back,
+      save,
+    ]);
+    await registered.handler("", context);
+    const saved = JSON.parse(await readFile(configPath, "utf8")) as { toolProtection: Record<string, unknown> };
+    assert.equal(saved.toolProtection.debug, true, "the legacy block gains the field only when the user changes it");
+    assert.equal(saved.toolProtection.retainAuditorSessions, false, "and every other stored field is preserved");
+    assert.equal(config.toolProtection?.debug, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("turning debug back Off needs no confirmation and is written as a real change", async () => {
+  const { dir, configPath, config } = await tempConfig(debugBody(true));
+  try {
+    const registered = commandHarness();
+    registerReviewSettings({ pi: registered.pi, config, configPath });
+    const { context, confirmations } = scripted([
+      ...intoProtection,
+      (title, options) => {
+        assert.ok(flat(options).includes("Debug audit output On — audit diagnostics are shown to you"), flat(options).join(" | "));
+        return pick("Debug audit output")(title, options);
+      },
+      back,
+      back,
+      save,
+    ], { confirm: true });
+    await registered.handler("", context);
+    assert.deepEqual(confirmations, [], "stopping extra output is never blocked by a confirmation");
+    const saved = JSON.parse(await readFile(configPath, "utf8")) as { toolProtection: Record<string, unknown> };
+    assert.equal(saved.toolProtection.debug, false);
+    assert.equal(config.toolProtection?.debug, false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("root Escape applies debug for the session only and leaves the stored file untouched", async () => {
+  const { dir, configPath, original, config } = await tempConfig(debugBody(false));
+  try {
+    const registered = commandHarness();
+    registerReviewSettings({ pi: registered.pi, config, configPath });
+    const { context } = scripted([
+      ...intoProtection,
+      pick("Debug audit output"),
+      back,
+      back,
+      () => undefined,
+    ]);
+    await registered.handler("", context);
+    assert.equal(config.toolProtection?.debug, true, "Escape applies the staged choice for this session");
+    assert.equal(await readFile(configPath, "utf8"), original, "Escape never writes to disk");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Cancel discards a staged debug change without applying or writing it", async () => {
+  const { dir, configPath, original, config } = await tempConfig(debugBody(false));
+  try {
+    const registered = commandHarness();
+    registerReviewSettings({ pi: registered.pi, config, configPath });
+    const { context } = scripted([
+      ...intoProtection,
+      pick("Debug audit output"),
+      back,
+      back,
+      cancel,
+    ]);
+    await registered.handler("", context);
+    assert.equal(config.toolProtection?.debug, false, "Cancel leaves the live configuration unchanged");
+    assert.equal(await readFile(configPath, "utf8"), original, "and the stored file byte for byte");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("debug is an owned field of the stored block for change detection", () => {
+  const defaults = stagedToolProtectionSettings(normalizeConfig({}));
+  assert.equal(defaults.debug, false);
+  assert.equal(toolProtectionStagedWriteNeeded(undefined, defaults), false, "an absent block stays absent");
+  assert.equal(toolProtectionStagedWriteNeeded(undefined, { ...defaults, debug: true }), true,
+    "turning debug on over an absent block is a real change");
+  const stored = debugBody(false).toolProtection as Record<string, unknown>;
+  assert.equal(toolProtectionStagedWriteNeeded(stored, { ...defaults, level: "dangerous", auditor: { source: "external", id: "auditor-1" }, debug: true }), true);
+  assert.equal(toolProtectionStagedWriteNeeded(debugBody(true).toolProtection as Record<string, unknown>, {
+    ...defaults, level: "dangerous", auditor: { source: "external", id: "auditor-1" }, debug: true,
+  }), false, "an identical stored block is untouched");
+  // A stored block that predates the field differs from the staged default only
+  // by normalization, so an unchanged menu never rewrites it, and recovery keeps
+  // the legacy block intact with debug Off.
+  const legacy = { level: "dangerous", auditor: { source: "external", id: "auditor-1" } };
+  assert.equal(recoverConfig({ toolProtection: legacy }).config.toolProtection?.debug, false);
+  assert.equal(toolProtectionStagedWriteNeeded(legacy, { ...defaults, level: "dangerous", auditor: { source: "external", id: "auditor-1" } }), false,
+    "an unchanged legacy block is not rewritten just to add the field");
 });

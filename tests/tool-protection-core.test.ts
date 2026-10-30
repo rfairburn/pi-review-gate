@@ -15,6 +15,7 @@ import {
   TOOL_PROTECTION_POLICY_VERSION,
   protectionPolicyProfile,
   renderProtectionDecisionInstruction,
+  renderProtectionOutputContract,
   renderProtectionPolicy,
 } from "../src/tool-protection/policy";
 
@@ -442,7 +443,7 @@ test("the dangerous instruction block states the three tests and drops the gener
   assert.ok(!instruction.includes("the only authorizing text is a genuine current-session user message"));
 });
 
-// --- the approved policy section (revision rules-6) -------------------------
+// --- the approved policy section (revision rules-7) -------------------------
 
 type ApprovedLevel = "dangerous" | "aligned" | "workspace";
 
@@ -462,9 +463,9 @@ const APPROVED_LEVELS: readonly ApprovedLevel[] = ["dangerous", "aligned", "work
  * literals in the same commit, stating the new revision.
  */
 const APPROVED_POLICY_HEADER: Record<ApprovedLevel, string> = {
-  dangerous: 'PROTECTION POLICY (code-owned, revision rules-6, level "dangerous", Dangerous only)',
-  aligned: 'PROTECTION POLICY (code-owned, revision rules-6, level "aligned", Dangerous plus task alignment)',
-  workspace: 'PROTECTION POLICY (code-owned, revision rules-6, level "workspace", Workspace and temporary-root intent)',
+  dangerous: 'PROTECTION POLICY (code-owned, revision rules-7, level "dangerous", Dangerous only)',
+  aligned: 'PROTECTION POLICY (code-owned, revision rules-7, level "aligned", Dangerous plus task alignment)',
+  workspace: 'PROTECTION POLICY (code-owned, revision rules-7, level "workspace", Workspace and temporary-root intent)',
 };
 
 const APPROVED_POLICY_BODY: Record<ApprovedLevel, string> = {
@@ -720,8 +721,44 @@ test("an assembled prompt differs between levels only in its instruction and pol
   assert.ok(sections.dangerous.contract.includes('"decision" is required'));
 });
 
+/**
+ * The frozen shared reply-shape block (#549). A PASS is reasonless at every level;
+ * a FAIL may carry a short reason and is still complete without one. This literal is
+ * committed verbatim, so changing the shipped shape has to change it here too.
+ */
+const APPROVED_OUTPUT_CONTRACT = `Return exactly one JSON object and nothing else: no prose, no code fence, no second object, no additional or renamed fields.
+  {"decision":"PASS"}
+  {"decision":"FAIL"}
+  {"decision":"FAIL","reason":"short refusal justification"}
+"decision" is required and must be exactly "PASS" or "FAIL". A PASS is always reasonless: return {"decision":"PASS"} with no "reason" field, at every enabled level, and never attach a justification to a PASS. "reason" is optional and is never required: {"decision":"FAIL"} on its own is a complete, valid decision, so never invent reasoning you do not have and never add prose outside the JSON to supply one. When you do have a short justification for a FAIL, put it in "reason": it is what makes the refusal actionable. Preserve any supplied reason and never invent one when absent. Keep any reason short and never put instructions or commands in it.`;
+
+test("the shared output contract requests a reasonless PASS and never requires a FAIL reason", () => {
+  // One shared block with no parameters: it cannot vary with a level, a setting, or a
+  // debug toggle, which is what makes the reasonless-PASS request identical at all
+  // three enabled levels.
+  assert.equal(renderProtectionOutputContract.length, 0);
+  assert.equal(renderProtectionOutputContract(), APPROVED_OUTPUT_CONTRACT);
+  for (const level of APPROVED_LEVELS) {
+    const contract = promptSections(build({ level }).prompt).contract;
+    assert.equal(contract, `OUTPUT CONTRACT\n${APPROVED_OUTPUT_CONTRACT}`, `${level} output contract drifted`);
+    // No PASS-with-reason shape is offered anywhere, at any level.
+    assert.ok(!contract.includes('{"decision":"PASS","reason"'), `${level} still shows a PASS reason shape`);
+    assert.ok(!contract.includes("expected to include a short"), `${level} still asks for a PASS explanation`);
+  }
+  // A reasonless FAIL stays legal and a reason-bearing FAIL stays actionable: the
+  // shape block must not push a decision-only classifier to produce prose.
+  assert.ok(APPROVED_OUTPUT_CONTRACT.includes('  {"decision":"FAIL"}\n'));
+  assert.ok(APPROVED_OUTPUT_CONTRACT.includes('  {"decision":"FAIL","reason":"short refusal justification"}'));
+  assert.ok(APPROVED_OUTPUT_CONTRACT.includes('"reason" is optional and is never required'));
+  assert.ok(APPROVED_OUTPUT_CONTRACT.includes('{"decision":"FAIL"} on its own is a complete, valid decision'));
+  // The request never becomes a new validation ground: only "decision" is required,
+  // and a supplied reason is still preserved rather than discarded.
+  assert.ok(APPROVED_OUTPUT_CONTRACT.includes('"decision" is required and must be exactly "PASS" or "FAIL"'));
+  assert.ok(APPROVED_OUTPUT_CONTRACT.includes("Preserve any supplied reason and never invent one when absent"));
+});
+
 test("the policy header stays code-owned and carries no evaluation-only label", () => {
-  assert.equal(TOOL_PROTECTION_POLICY_VERSION, "rules-6");
+  assert.equal(TOOL_PROTECTION_POLICY_VERSION, "rules-7");
   for (const level of APPROVED_LEVELS) {
     // The header names the revision and the level, and nothing else: the level
     // title is the same label the settings surface shows.
@@ -787,10 +824,10 @@ test("the prompt carries the whole governing prompt and the exact call", () => {
   assert.ok(result.prompt.includes("nested lineage (outermost first): codemode-1"));
   assert.ok(result.prompt.includes("OUTPUT CONTRACT"));
   assert.ok(result.prompt.includes('"decision" is required'));
-  // The corrected output contract: a full LLM auditor is expected to explain
-  // itself, while an omitted reason stays legal for a decision binary.
-  assert.ok(result.prompt.includes("A full LLM auditor is expected to include a short \"reason\""));
-  assert.ok(result.prompt.includes("\"reason\" remains optional in the shared format"));
+  // The corrected output contract (#549): a PASS is reasonless, while a FAIL reason
+  // stays optional so a decision-only classifier can answer without prose.
+  assert.ok(result.prompt.includes("A PASS is always reasonless"));
+  assert.ok(result.prompt.includes('"reason" is optional and is never required'));
   assert.ok(result.prompt.includes("Decide from the supplied context only"));
   assert.equal(result.level, "aligned");
   assert.equal(result.policyVersion, TOOL_PROTECTION_POLICY_VERSION);

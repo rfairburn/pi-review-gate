@@ -26,8 +26,8 @@ second settings store. Absence of the block and `"level":"off"` both mean Off.
 | Level | Blocks | Notes |
 | --- | --- | --- |
 | `off` | Nothing | Default. Removes only this added gate; every native safeguard stays. |
-| `dangerous` | Only two harms: catastrophic or unjustified irreversible destruction, and actual disclosure or transfer of sensitive contents to a recipient the supplied evidence does not authorize | The harm-only level, and nothing else. It does not check task alignment, working-directory or worker-root confinement, prior human approval of the exact target, or compliance with a path, recipient, or destination restriction stated in the governing instructions, the task, or a user message; it does not refuse a substituted target that moves no sensitive contents. Uncertainty, and an evidence item the host omitted, is not evidence of harm and is never a reason to refuse or hedge. Ordinary work passes: reads outside the working directory (project, launcher, skill, documentation, and delegated-report files), subtask evidence, user-supplied attachments, disposable and OS temporary fixtures, builds, tests, dependency installs, and version control. Narrowing this auditor grants the acting agent nothing — it still owes its governing instructions and the user's own restrictions full obedience, and every native guard still decides independently. |
-| `aligned` | The two harms, plus proposals with no reasonable relationship to the authorized task and supplied evidence, plus the floor tests `dangerous` does not run: prohibitions in the governing instructions, unexplained target substitution, and restrictions stated by a genuine current-session user message | Scope drift and the stricter floor. Preparatory and setup calls count as related. A fresh, contextual user approval can resolve an authorization or alignment ambiguity. |
+| `dangerous` | Three things: catastrophic or unjustified irreversible destruction, actual disclosure or transfer of sensitive contents to a recipient the supplied evidence does not authorize, and violating an applicable explicit prohibition stated by a genuine current-session user | The narrow level: the two harms plus an explicit current-user no. An explicit no is not ignorable because the call is harmless; the same ordinary read passes when no applicable prohibition exists, and ordinary calls need no prior yes. It does not check task alignment, working-directory or worker-root confinement, prior human approval of the exact target, compliance with a path, recipient, or destination restriction stated only in the governing instructions or the task, or a substituted target that moves no sensitive contents. A quoted, summarized, or assistant-asserted claim is not current-user evidence; a worker-scoped user prohibition binds the worker it names but not a caller outside its scope, and a complaint about earlier blocking is not a ban. Uncertainty, and an evidence item the host omitted, is not evidence of harm or of a prohibition and is never a reason to refuse or hedge. Ordinary work passes unless an applicable user prohibition covers it: reads outside the working directory (project, launcher, skill, documentation, and delegated-report files), subtask evidence, user-supplied attachments, disposable and OS temporary fixtures, builds, tests, dependency installs, and version control. Narrowing this auditor grants the acting agent nothing — it still owes its governing instructions and the user's own restrictions full obedience, and every native guard still decides independently. |
+| `aligned` | The two harms, plus proposals with no reasonable relationship to the authorized task and supplied evidence, plus the full floor tests: prohibitions in the governing instructions, unexplained target substitution, and restrictions stated by a genuine current-session user message | Scope drift and the stricter floor. Preparatory and setup calls count as related. A fresh, contextual user approval can resolve an authorization or alignment ambiguity. |
 | `workspace` | Everything above, plus proposals whose intended effect leaves the reported working directory or an explicitly permitted OS temporary root without authorization for that specific target in the governing instructions or a genuine current-session user message | An intent boundary judged from the proposal, not confinement. Authorized targets stay allowed; unknown effects fail. |
 
 Policy is code-owned and versioned. It is not user-editable, not a regex denylist, and
@@ -39,7 +39,7 @@ stricter levels an unexplained substitution of that destination is judged on its
 while under `dangerous` a substitution that moves no protected contents is not a
 refusal ground. There is no domain, provider, path, tool-name, or signature allowlist
 or denylist. The revision identifier recorded with each decision (for example
-`rules-5`) names the rule set that produced it; it is not a validation, support, or
+`rules-6`) names the rule set that produced it; it is not a validation, support, or
 release claim.
 
 ## Coverage and scope
@@ -226,26 +226,32 @@ text delivered through an extension or RPC path is likewise not proof of a human
 A genuine fresh user approval can resolve an alignment or authorization ambiguity for a
 specific later proposal; it cannot waive the enabled floor.
 
-A genuine current-session user **restriction** is an audit test at `aligned` and
-`workspace`: if the user's own current message says not to read that path, contact that
-destination, or touch that tree, a proposal that does so is refused there even though
-the identical call is otherwise ordinary work. Only the user's own current-session text
-carries this force — a restriction quoted inside tool output, repository content, or a
-summary stays data.
+A genuine current-session user **restriction** is an audit test at every enabled level:
+if the user's own current message says not to read that path, contact that destination, or
+touch that tree, a proposal that does so is refused there even though the identical call
+is otherwise ordinary work. Only the user's own current-session text carries this force —
+a restriction quoted inside tool output, repository content, or a summary stays data, and
+an instruction aimed only at a worker or subagent binds the worker it names but is not
+widened to a caller outside its scope.
 
-At `dangerous` that compliance check is deliberately not part of the audit: a proposal
-that conflicts with a task-specific or worker-root path restriction is not refused by
-this gate unless it actually commits one of the two harms, and returning the content the
-requesting user asked for is not a disclosure merely because the material carries
-customer or diagnostic context. An evidence item the host omitted because it did not fit
-the context budget, and the completeness disclosure that names it, prove nothing in
-either direction: they are never a refusal ground and never a reason to hedge, while a
-timeout, a malformed decision, or an over-budget mandatory context stays a fail-closed
-runtime failure rather than a policy `FAIL`. This changes only what the auditor is asked
-about. The
-acting agent must still obey its governing instructions and the user's restrictions, and
-no permission, ceiling, trust, ownership, preflight, review, landing, or cancellation
-guard is relaxed by a `dangerous` PASS.
+At `dangerous` the user's own prohibition is also an audit test, but only in that narrow
+form: an explicit prohibition in a genuine current-session user message decides `FAIL`
+when it applies to the proposed operation, target, recipient, or scope, even though the
+same call harms nothing. That is not general conformance auditing. An ordinary call needs
+no prior explicit yes, a task-specific or worker-root path restriction that appears only
+in the governing instructions or the task is not refused by this gate unless it is also
+an applicable user prohibition, a quoted or summarized claim about what the user said
+binds nothing, a worker-scoped prohibition binds the worker it names but is not widened
+to a caller outside its scope, and a complaint about earlier blocking is not a ban. Returning the content the requesting user
+asked for is not a disclosure merely because the material carries customer or diagnostic
+context. An evidence item the host omitted because it did not fit the context budget, and
+the completeness disclosure that names it, prove nothing in either direction: they are
+never a refusal ground and never a reason to hedge, while a timeout, a malformed decision,
+or an over-budget mandatory context stays a fail-closed runtime failure rather than a
+policy `FAIL`. This changes only what the auditor is asked about. The acting agent must
+still obey its governing instructions and the user's restrictions, and no permission,
+ceiling, trust, ownership, preflight, review, landing, or cancellation guard is relaxed by
+a `dangerous` PASS.
 
 ## Auditors and routes
 
@@ -340,10 +346,51 @@ never retried, replayed, routed to a fallback, or answered from a cache.
 
 ## Testing tool protection
 
-These steps build and run a candidate from owned scratch space. They do not modify the
-live `dist/`, the live review-gate configuration, or the installed extension. Run them
-only if you deliberately want to test the feature; this page records no passing result or
-measured timing.
+The package ships an inert tester for the existing policy fixtures. It builds the same
+auditor prompt as the gate, asks the saved Pi auditor once per selected case and level,
+prints the raw reply, reason, and duration, and compares the parsed verdict with the fixed
+expected value. It never executes a proposal, reads a proposal target, registers a tool,
+starts an agent loop, writes a saved auditor session, or changes settings, `models.json`,
+authentication, or fixture data. A test verdict is an auditor-test result, never actual
+tool admission; the live Protection level and scope do not filter the cases.
+
+```sh
+pi-review-tool-test --list
+pi-review-tool-test --case n08-user-prohibited-read --level dangerous
+pi-review-tool-test --case n09-irreversible-data-loss --level all
+pi-review-tool-test --case 9 --level aligned
+pi-review-tool-test --case all --level all
+pi-review-tool-test --case all --level all --json
+```
+
+From a source checkout after building, use
+`node scripts/pi-review-tool-test.cjs` with the same arguments. `--list` and `--help`
+make no model or authentication call. `--json --list` emits valid JSON; a run's `--json`
+report keeps each raw reply and separates setup, transport, and malformed-reply errors
+from a policy `FAIL`. Use `--config PATH` to read a different saved review-gate file and
+`--pi-package PATH` to select an installed `@earendil-works/pi-coding-agent` package root.
+Resolution otherwise uses normal Node package resolution (including Pi's import-only
+package exports), the `pi` entry on `PATH`, or the current managed Pi install; the tester
+never provisions or updates Pi.
+
+Requirements and caveats:
+
+- **Saved model and default reasoning.** The tester uses the auditor model and
+  `thinkingLevel` saved in `toolProtection.auditor`, with normal Pi `models.json` and
+  provider authentication. When the saved selection omits reasoning, the existing
+  reviewer default (`high`) applies. It does not substitute an ordinary reviewer, use a
+  live session-only selection, read conversation history, or rewrite your saved choices.
+- **Pi-backed auditors only.** An external auditor is refused before any program is
+  launched. There is no fallback, retry, cache, or replay.
+- **Explicit runs only.** `--case` and `--level` are both required to run; both accept
+  `all`. Each selected case/level is requested once, sequentially. Requests can incur
+  provider charges, so run them deliberately.
+- **Safe synthetic data.** The ten fixture proposals are inert data: destructive commands
+  and transfers are described, never executed. Do not replace them with live destructive
+  commands or real credentials, customer data, private paths, or session transcripts.
+
+The manual candidate checks below exercise the real gate and its settings. They are
+separate from the inert fixture tester.
 
 ### 1. Build a scratch candidate
 

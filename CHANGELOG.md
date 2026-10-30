@@ -15,6 +15,49 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.220]
+
+### Changed
+
+- **Dangerous protection refuses an explicit current-user prohibition** (#545): the
+  `dangerous` level keeps its narrow audit but restores one test that #542 removed by
+  mistake. The two harms remain — catastrophic or unjustified irreversible destruction,
+  and actual disclosure or transfer of sensitive contents to a recipient the supplied
+  evidence does not authorize — and an explicit prohibition in a genuine current-session
+  user message now also decides `FAIL` when it applies to the proposed operation, target,
+  recipient, or scope. An explicit no is not ignorable because the call is harmless; the
+  same ordinary read passes when no applicable prohibition is in evidence, and ordinary
+  calls need no prior explicit yes. A quoted, summarized, or assistant-asserted claim is not
+  current-user evidence; a worker-scoped user prohibition binds the worker it names but is
+  not widened to a caller outside its scope. A complaint about earlier blocking is not a
+  prohibition, and the level still does not audit task alignment, working-directory or
+  worker-root confinement, compliance with a restriction stated only in the governing
+  instructions or the task, prior approval of the exact target, or harmless target
+  substitution. `aligned` and `workspace` keep their existing rules, examples, and
+  instruction semantics apart from the neutral policy revision (`rules-6`). Existing
+  fail-closed context, timeout, malformed-decision, unsupported-route, and cancellation
+  behavior is unchanged; a `dangerous` PASS still grants no authority and every native
+  guard still decides. See [Tool protection](docs/tool-protection.md).
+
+### Added
+
+- **Inert tool-auditor tester** (#544): `pi-review-tool-test` runs the existing policy
+  cases through the saved Pi auditor using the same code-owned prompt builder, runner, and
+  decision parser as the gate. `--list` and `--help` make no model or authentication call;
+  a run requires an explicit `--case` and `--level`, accepts `all`, runs each case/level
+  once sequentially, and prints the raw reply, reason, duration, and fixed expectation or a
+  separate setup/transport/malformed-reply error. `--json` produces one machine-readable
+  report, while `--json --list` emits valid JSON. The tester uses the saved auditor model,
+  reasoning, normal Pi `models.json`, and provider authentication; the live Protection level
+  and scope do not filter test cases. It refuses external auditors before launching a
+  program, never executes a proposal or reads its target, registers no tools, starts no
+  agent loop, writes no auditor session, and does not rewrite settings, authentication, or
+  fixture data. Normal SDK discovery validates the exact installed Pi package root through
+  Node's bounded module search locations, including Pi's import-only package export shape,
+  without provisioning a runtime. The sanitized ten-case payload uses revision `rules-6`, keeps the existing
+  expectations, and now expects the genuine user-prohibited read to fail at all levels.
+  Usage and caveats are in [Testing tool protection](docs/tool-protection.md#testing-tool-protection).
+
 ## [0.1.0-dev.219]
 
 ### Changed

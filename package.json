@@ -10,7 +10,8 @@
     "pi-review-gate": "scripts/pi-review-gate.sh",
     "pi-review-gate-cmd": "scripts/pi-review-gate.cmd",
     "pi-review-web": "scripts/pi-review-web.sh",
-    "pi-review-sessions": "scripts/pi-review-sessions.cjs"
+    "pi-review-sessions": "scripts/pi-review-sessions.cjs",
+    "pi-review-tool-test": "scripts/pi-review-tool-test.cjs"
   },
   "files": [
     "dist/src",

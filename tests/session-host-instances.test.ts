@@ -612,6 +612,19 @@ function cleanup(harness: Harness): void {
   rmSync(harness.root, { recursive: true, force: true });
 }
 
+/**
+ * Remove a harness fixture only on positive evidence that its manager no
+ * longer owns a live child. dispose() intentionally retains an unconfirmed
+ * child's owner and surface, so deleting the fixture root underneath it would
+ * destroy a real child's cwd. The fixture is preserved for inspection instead.
+ * Returns whether the fixture was removed.
+ */
+function cleanupIfSettled(harness: Harness, manager: InstanceManager): boolean {
+  if (manager.hasLiveProcesses()) return false;
+  cleanup(harness);
+  return true;
+}
+
 function viewFor(manager: InstanceManager, id: string): NativeInstanceView {
   const view = manager.list().find((row) => row.id === id);
   assert.ok(view, "row must exist");
@@ -2642,6 +2655,39 @@ test("prepareNativeLaunch parity: the manager reuses the landed contract unchang
   }
 });
 
+// Synthetic companion to the pinned native-addon case below: it proves the
+// fixture-retention rule itself through the existing FakePty/InstanceManager
+// seam. dispose() never confirms an unsettled child's exit, so the root must
+// survive until the owned exit event; only then may cleanup remove it. This is
+// not real-Pi or native-addon evidence.
+test("fixture cleanup waits for confirmed child exit: dispose alone preserves the root while the child remains live", async () => {
+  const harness = makeHarness("fixture-settlement");
+  try {
+    const id = await harness.manager.create({ workspace: harness.workspace });
+    const pty = harness.spawned[0];
+    assert.ok(pty);
+    // Bound the stop ladder first; dispose reuses this row's existing stop
+    // promise, so the intentionally unconfirmed child stays fast to exercise.
+    const stopped = await harness.manager.shutdown({ graceMs: 10, killMs: 10 });
+    assert.deepEqual(stopped, { forcedIds: [id], remainingIds: [id] }, "the child is intentionally unsettled");
+    await harness.manager.dispose();
+    assert.equal(harness.manager.hasLiveProcesses(), true, "dispose retains the unconfirmed child");
+    assert.equal(cleanupIfSettled(harness, harness.manager), false, "no confirmed settlement means no cleanup");
+    assert.equal(guardedExistsSync(harness.root), true, "the fixture root stays intact while the child remains owned");
+
+    pty.emitExit(0, 15);
+    assert.equal(harness.manager.hasLiveProcesses(), false, "the owned exit settles the child");
+    assert.equal(cleanupIfSettled(harness, harness.manager), true, "confirmed exit permits fixture cleanup");
+    assert.equal(guardedExistsSync(harness.root), false, "the settled fixture is removed");
+  } finally {
+    // FakePty owns no OS process: settle any handle left open by an earlier
+    // failed assertion so this synthetic fixture cannot leak.
+    for (const pty of harness.spawned) if (!pty.exited) pty.emitExit(0, 15);
+    await harness.manager.dispose().catch(() => undefined);
+    cleanupIfSettled(harness, harness.manager);
+  }
+});
+
 /**
  * REAL pinned native-addon fixture (POSIX; skipped when @lydell/node-pty
  * cannot load). This exercises native PTY cwd/env/geometry/input/shutdown
@@ -2717,7 +2763,7 @@ test("pinned native addon: independent PTYs with an owned Node shim, explicit cw
     assert.equal(viewFor(realManager, idB).lifecycle, "exited");
   } finally {
     await realManager.dispose().catch(() => undefined);
-    cleanup(harness);
+    cleanupIfSettled(harness, realManager);
   }
 });
 // --- Deliberate saved-conversation creation (issue 323). ---

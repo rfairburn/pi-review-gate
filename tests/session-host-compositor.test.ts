@@ -583,16 +583,63 @@ test("header and pane reject OSC, CSI, C0/C1, and non-SGR terminal control injec
 	assert.equal(result.lines[1].includes("https://example.test"), false);
 });
 
-test("stale and missing frames are clipped or padded, while unsafe or stale cursors stay hidden", () => {
+test("a valid smaller padded frame keeps clipped display, padding, and its own cursor; invalid geometry stays hidden", () => {
 	const layout = computeHostLayout(10, 3, { sidebarVisible: false, focus: "main" });
-	const stale = mainFrame(5, 1, [`${ESC}[31m123456789012345`, "extra"], { column: 4, row: 0, visible: true });
-	const original = structuredClone(stale);
-	const result = composeHostFrame(layout, { main: stale, header: "h", focus: "main" });
+	assert.deepEqual(layout.native, { column: 0, row: 1, cols: 10, rows: 2 });
+	// A 5x1 frame in a 10x2 pane is a session smaller than the native pane: it is
+	// drawn at the pane's top-left corner and the rest of the pane stays padding.
+	const padded = mainFrame(5, 1, [`${ESC}[31m123456789012345`, "extra"], { column: 4, row: 0, visible: true });
+	const original = structuredClone(padded);
+	const result = composeHostFrame(layout, { main: padded, header: "h", focus: "main" });
 	assertBounded(result.lines, 10, 3);
-	assert.ok(plain(result.lines[1]).startsWith("1234567890"));
+	noUnsafeControls(result.lines);
+	assert.ok(plain(result.lines[1]).startsWith("1234567890"), "a longer row is still clipped to the pane width");
+	assert.ok(result.lines[1].includes(`${ESC}[31m`), "the retained SGR grammar is unchanged by padding");
 	assert.equal(plain(result.lines[2]), " ".repeat(10), "missing source rows are padded");
-	assert.deepEqual(result.cursor, { column: 0, row: 0, visible: false }, "stale dimensions invalidate cursor geometry");
-	assert.deepEqual(stale, original, "stale frame remains unchanged");
+	assert.deepEqual(result.cursor, { column: 4, row: 1, visible: true },
+		"#553: a frame smaller than the pane keeps its cursor at the pane origin plus its own coordinates");
+	assert.deepEqual(padded, original, "the padded frame is never mutated by composition");
+
+	// The frame's own drawn rectangle bounds the cursor, not the padded pane.
+	assert.equal(composeHostFrame(layout, {
+		main: mainFrame(5, 1, ["12345"], { column: 0, row: 1, visible: true }),
+		header: "h", focus: "main",
+	}).cursor.visible, false, "a row below the drawn content is host padding, not a cursor position");
+	assert.deepEqual(composeHostFrame(layout, {
+		main: mainFrame(5, 2, ["12345", "67890"], { column: 5, row: 1, visible: true }),
+		header: "h", focus: "main",
+	}).cursor, { column: 4, row: 2, visible: true }, "wrap-pending is clamped to the frame's own last drawn column");
+	assert.equal(composeHostFrame(layout, {
+		main: mainFrame(5, 2, ["12345", "67890"], { column: 6, row: 0, visible: true }),
+		header: "h", focus: "main",
+	}).cursor.visible, false, "a column beyond the frame's width is not projected into host padding");
+	assert.equal(composeHostFrame(layout, {
+		main: mainFrame(5, 2, ["12345", "67890"], { column: 2, row: 0, visible: false }),
+		header: "h", focus: "main",
+	}).cursor.visible, false, "the child's own hidden cursor is never forced visible in a padded frame");
+
+	// A frame the pane cannot show whole is clipped for display and keeps no
+	// positional claim.
+	for (const oversized of [{ cols: 11, rows: 2 }, { cols: 10, rows: 3 }]) {
+		const clipped = composeHostFrame(layout, {
+			main: mainFrame(oversized.cols, oversized.rows, ["1234567890", "abcdefghij"], { column: 4, row: 0, visible: true }),
+			header: "h", focus: "main",
+		});
+		assertBounded(clipped.lines, 10, 3);
+		assert.ok(plain(clipped.lines[1]).startsWith("1234567890"), "an oversized frame is still clipped for display");
+		assert.equal(clipped.cursor.visible, false, `a frame larger than the pane (${oversized.cols}x${oversized.rows}) claims no cursor`);
+	}
+	for (const malformed of [
+		{ cols: 0, rows: 2 }, { cols: 10, rows: 0 }, { cols: -1, rows: 2 },
+		{ cols: Number.NaN, rows: 2 }, { cols: 10, rows: 1.5 }, { cols: Number.POSITIVE_INFINITY, rows: 2 },
+	]) {
+		const composed = composeHostFrame(layout, {
+			main: mainFrame(malformed.cols, malformed.rows, ["1234567890", "abcdefghij"], { column: 4, row: 0, visible: true }),
+			header: "h", focus: "main",
+		});
+		assertBounded(composed.lines, 10, 3);
+		assert.equal(composed.cursor.visible, false, `malformed frame dimensions ${JSON.stringify(malformed)} authorize no cursor`);
+	}
 
 	const missing = composeHostFrame(layout, { header: "h", focus: "main" });
 	assertBounded(missing.lines, 10, 3);
@@ -612,6 +659,78 @@ test("stale and missing frames are clipped or padded, while unsafe or stale curs
 		focus: "main",
 	});
 	assert.deepEqual(wrapPending.cursor, { column: 9, row: 2, visible: true }, "wrap-pending column is clamped within its pane");
+});
+
+test("a padded native owner in the wide layout projects its cursor from the native pane origin across focus handoffs", () => {
+	const mainLayout = computeHostLayout(80, 12, { sidebarVisible: true, focus: "main" });
+	assert.deepEqual(mainLayout.native, { column: 33, row: 1, cols: 47, rows: 11 });
+	// A 30x8 session displayed in the 47x11 native pane (#474 geometry).
+	const padded = mainFrame(30, 8, Array.from({ length: 8 }, (unused, row) => `native row ${row}`), { column: 12, row: 7, visible: true });
+	const roster: RenderedSidebar = { lines: ["Sessions (1)", "> padded owner"], cursor: { column: 3, row: 1 } };
+
+	const mainResult = composeHostFrame(mainLayout, { main: padded, sidebar: roster, header: "host", focus: "main" });
+	assertBounded(mainResult.lines, 80, 12);
+	assert.ok(plain(mainResult.lines[1]).slice(33).startsWith("native row 0"), "the padded owner draws at the pane's top-left corner");
+	assert.ok(plain(mainResult.lines[1])[32] === "│", "the roster divider stays host-owned beside a padded session");
+	assert.equal(plain(mainResult.lines[1 + 8]).slice(33).trim(), "", "rows below the drawn content stay blank host padding");
+	assert.deepEqual(mainResult.cursor, { column: 33 + 12, row: 1 + 7, visible: true },
+		"the padded cursor offsets from the native pane origin, not from the pane's far edge");
+
+	const rosterLayout = computeHostLayout(80, 12, { sidebarVisible: true, focus: "sidebar" });
+	assert.deepEqual(mainLayout.native, rosterLayout.native, "the handoff never changes the child's geometry");
+	const rosterResult = composeHostFrame(rosterLayout, { main: padded, sidebar: roster, header: "host", focus: "sidebar" });
+	assert.deepEqual(rosterResult.cursor, { column: 3, row: 2, visible: true }, "only the focused pane claims the cursor");
+	assert.ok(plain(rosterResult.lines[1]).slice(33).startsWith("native row 0"), "the padded frame stays displayed while the roster is focused");
+
+	const back = composeHostFrame(mainLayout, { main: padded, sidebar: roster, header: "host", focus: "main" });
+	assert.deepEqual(back.cursor, mainResult.cursor, "returning to Main restores the same padded native cursor");
+	assert.deepEqual(back.lines, mainResult.lines, "and identical composed bytes");
+});
+
+test("a real padded VT editor stream keeps its cursor visible, moving, hidden, and restored through composition", async () => {
+	const layout = computeHostLayout(80, 12, { sidebarVisible: true, focus: "main" });
+	const surface = new TerminalSurface(30, 8); // smaller than the 47x11 native pane
+	const compose = (frame: TerminalFrame, focus: "main" | "sidebar" = "main") => composeHostFrame(
+		computeHostLayout(80, 12, { sidebarVisible: true, focus }),
+		{ main: frame, sidebar: { lines: ["Sessions (1)", "> draft owner"], cursor: { column: 3, row: 1 } }, header: "host", focus },
+	);
+	try {
+		// Generic VT editor entry: show the cursor, clear, home, then type.
+		surface.write(`${ESC}[?25h${ESC}[2J${ESC}[HDraft note`);
+		await surface.flush();
+		const entered = surface.frame();
+		assert.ok(entered.cols < layout.native.cols && entered.rows < layout.native.rows, "the fixture really is padded");
+		const entry = compose(entered);
+		assert.ok(plain(entry.lines[1]).slice(33).startsWith("Draft note"), "the draft content stays visible");
+		assert.deepEqual(entry.cursor, { column: 33 + 10, row: 1, visible: true },
+			"the native caret projects at its real position inside the padded frame");
+
+		// Cursor movement inside the padded frame follows the child, not the pane.
+		surface.write(`${ESC}[3;5H`);
+		await surface.flush();
+		assert.deepEqual(compose(surface.frame()).cursor, { column: 33 + 4, row: 1 + 2, visible: true },
+			"a cursor move re-projects at the new native coordinates");
+
+		// The child hides its own cursor; composition never forces it visible.
+		surface.write(`${ESC}[?25l`);
+		await surface.flush();
+		assert.equal(compose(surface.frame()).cursor.visible, false, "an editor-hidden cursor stays hidden");
+
+		// Returning to the editor restores visibility where the child left the cursor.
+		surface.write(`${ESC}[?25h${ESC}[5;9H`);
+		await surface.flush();
+		const restored = compose(surface.frame());
+		assert.deepEqual(restored.cursor, { column: 33 + 8, row: 1 + 4, visible: true },
+			"the returning editor's cursor is restored at its actual position");
+
+		// A focus handoff to the roster and back keeps the same native cursor.
+		assert.deepEqual(compose(surface.frame(), "sidebar").cursor, { column: 3, row: 2, visible: true },
+			"the focused host pane owns the cursor while the editor is in the background");
+		assert.deepEqual(compose(surface.frame(), "main").cursor, restored.cursor,
+			"handing focus back to Main restores the padded editor cursor unchanged");
+	} finally {
+		surface.dispose();
+	}
 });
 
 test("focus handoff chooses only the focused pane cursor; exited frames remain last-frame text", async () => {

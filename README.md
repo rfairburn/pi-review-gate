@@ -5,7 +5,7 @@ after an agent turn and sends the complete classified review pass back to the
 implementing model.
 
 Use the [session sidebar](docs/session-host-alpha.md) to manage multiple native Pi
-sessions in one terminal—our recommended daily-use workflow. Direct standalone
+sessions in one terminal — our recommended daily-use workflow. Direct standalone
 Pi + review-gate remains fully maintained and supported.
 
 Every completed agent turn is captured as numbered evidence in a review window. One or
@@ -212,7 +212,7 @@ skipped under [#345](https://github.com/rfairburn/pi-review-gate/issues/345), so
 Windows matrix job is not Windows runtime evidence. Earlier Windows CI evidence on Node
 22.19.0 and 24.x is historical: it predates the current security floors and is not a
 patched-runtime run. Native startup latency on Windows stays tracked separately under
-#344.
+[#344](https://github.com/rfairburn/pi-review-gate/issues/344).
 
 Host requirements, options, session and roster semantics, and the physical-terminal limits
 are owned by the [session host guide](docs/session-host-alpha.md), which also covers the

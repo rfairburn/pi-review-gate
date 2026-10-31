@@ -1527,7 +1527,24 @@ id/epoch. A stale or unavailable tuple is rejected, and a failed rename leaves t
 session name unconfirmed. Escape in the Edit form cancels only that form in the same local
 way and returns to the visible roster; a held Escape repeat does not bubble into the
 roster hide, but a fresh roster Escape still hides. Editing never activates the
-row, routes input to it, pauses or stops its child, or changes the active input owner. Both forms show the effective native
+row, routes input to it, pauses or stops its child, or changes the active input owner.
+
+The same `e` interaction is available on an authorized remote session row when its
+owner supports remote renaming and its current native identity is observed. It shows
+the owner's current name for reference and uses the same separate **New name** field
+and submit/cancel keys. The request names that exact destination, owner run, row, and
+native session id/epoch. Only the owning host invokes and verifies its normal native
+name operation; the sidebar and other current roster observers receive the result
+through authoritative metadata, never a viewer-local alias or optimistic name update.
+Unsupported, stale, disconnected, revoked, or replaced targets cannot fall back to a
+local row. An unconfirmed result stays uncertain and is never automatically replayed;
+verify the owner's current name before deliberately trying again. Cancelling the form
+before submission changes no name. Abandoning a submitted form does not roll back owner
+work, and its late reply cannot take over another form or change selection or focus.
+Renaming does not recreate, resume, restart, or move the session or change its workspace,
+conversation identity, or active work.
+
+Both forms show the effective native
 keybindings; the external-editor action temporarily hands the real terminal to the
 shared native Pi agent directory's `settings.json` `externalEditor` command when it is a
 nonempty string, otherwise to `VISUAL`, then `EDITOR`, then Pi's native platform

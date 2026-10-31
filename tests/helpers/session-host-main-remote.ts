@@ -136,6 +136,7 @@ export function remoteViewport(input: {
   graphics?: TerminalGraphicsFrame;
   inputModes?: TerminalInputModes;
   inputSource?: NativeIoInputSource;
+  cursor?: { column: number; row: number; visible: boolean };
 }): SessionContentSnapshot {
   return {
     meta: {
@@ -155,7 +156,7 @@ export function remoteViewport(input: {
       cols: input.cols,
       rows: input.rows,
       lines: Array.from({ length: input.rows }, (_unused, row) => row === 0 ? input.marker : ""),
-      cursor: { column: 0, row: 0, visible: true },
+      cursor: input.cursor ?? { column: 0, row: 0, visible: true },
       ...(input.graphics === undefined ? {} : { graphics: input.graphics }),
     },
   };

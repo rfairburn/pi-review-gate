@@ -260,11 +260,30 @@ export function composeHostFrame(layout: HostLayout, options: ComposeHostFrameOp
  * or malformed bounds keeps no image owner.
  */
 function drawnContentMatchesLayer(main: TerminalFrame, layer: HostPaneRect, native: HostPaneRect): boolean {
-	return Number.isSafeInteger(main.cols) && Number.isSafeInteger(main.rows)
-		&& main.cols >= 1 && main.rows >= 1
-		&& main.cols <= native.cols && main.rows <= native.rows
+	const drawn = drawnContentRect(main, native);
+	return drawn !== undefined
 		&& layer.column === native.column && layer.row === native.row
-		&& layer.cols === main.cols && layer.rows === main.rows;
+		&& layer.cols === drawn.cols && layer.rows === drawn.rows;
+}
+
+/**
+ * The one rectangle a native frame actually drew inside the native pane: the
+ * pane itself when the frame fills it, otherwise the frame's own drawn size at
+ * the pane's top-left corner, whose remaining cells stay host-owned padding
+ * (#474). The cursor and any image layer are both bounded by this same fact;
+ * it is never a second copy of the child's size. A frame larger than the pane
+ * (composition clips it) or malformed dimensions describe no trustworthy
+ * drawn geometry and return undefined.
+ */
+function drawnContentRect(
+	frame: { readonly cols: number; readonly rows: number },
+	native: HostPaneRect,
+): HostPaneRect | undefined {
+	if (!Number.isSafeInteger(frame.cols) || !Number.isSafeInteger(frame.rows)) return undefined;
+	if (frame.cols < 1 || frame.rows < 1) return undefined;
+	if (frame.cols > native.cols || frame.rows > native.rows) return undefined;
+	if (frame.cols === native.cols && frame.rows === native.rows) return native;
+	return { column: native.column, row: native.row, cols: frame.cols, rows: frame.rows };
 }
 
 function validateDimension(value: number, label: "cols" | "rows"): void {
@@ -394,10 +413,15 @@ function isControl(code: number): boolean {
 }
 
 function cursorInFrame(frame: TerminalFrame, rect: HostPaneRect): { column: number; row: number } | undefined {
-	// A resized or otherwise stale frame may still be clipped and padded for
-	// display, but its cursor coordinates are not trusted for the new geometry.
-	if (frame.cols !== rect.cols || frame.rows !== rect.rows || !frame.cursor?.visible) return undefined;
-	return cursorInRect(frame.cursor, rect, true);
+	// The cursor is projected from the rectangle this frame actually drew, so a
+	// session smaller than the pane keeps its native cursor at its real position
+	// instead of being hidden by the pane's padding (#553). A frame larger than
+	// the pane, malformed dimensions, or an explicitly hidden cursor project
+	// nothing; the frame's own drawn width still carries the wrap-pending cell.
+	if (!frame.cursor?.visible) return undefined;
+	const drawn = drawnContentRect(frame, rect);
+	if (drawn === undefined) return undefined;
+	return cursorInRect(frame.cursor, drawn, true);
 }
 
 function cursorInRect(

@@ -4171,6 +4171,62 @@ test("a fully drawn padded session keeps copying, click-to-focus, and its image 
   }
 });
 
+// #553: the same padded geometry must not hide the owner's own native cursor.
+// The host composes the smaller frame at the native pane's top-left corner, so
+// the cursor the child reports inside that frame stays the one hardware cursor
+// claim, and Main's focus/input ownership is untouched.
+test("a padded local owner keeps its native cursor visible while Main focus and input ownership stay unchanged", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "padded native cursor owner");
+  await nextTurn();
+  const surface = manager.surface("native-1");
+  assert.ok(surface);
+  surface.writesAsFrame.splice(0, surface.writesAsFrame.length, "padded native draft");
+  assert.equal(harness.sidebar?.focus, "main", "the completed New child owns Main focus");
+
+  // A second surface with a smaller pane makes this session smaller than the
+  // local 47x23 native pane: its frame is drawn padded, exactly as in #474.
+  const other = manager.viewers.openViewer();
+  manager.viewers.updateViewer(other.viewerId, { sessionId: "native-1", cols: 30, rows: 20 });
+  manager.notify("native-1");
+  await nextTurn();
+  assert.deepEqual({ cols: surface.cols, rows: surface.rows }, { cols: 30, rows: 20 });
+
+  const frame = harness.writer.frames.at(-1)?.frame;
+  assert.ok(frame, "the padded session still renders a host frame");
+  assert.ok(plain(frame).includes("padded native draft"), "the drawn content stays visible");
+  // The fixture's surface reports its cursor at column 2, row 0 of its own frame.
+  assert.deepEqual(frame!.cursor, { column: 35, row: 1, visible: true },
+    "#553: the padded owner's native cursor projects at the native pane origin plus its own position");
+  const paddedRow = plainLine(frame, 1 + 20).slice(33);
+  assert.equal(paddedRow.trim(), "", "the first padded row below the drawn content stays blank host space");
+
+  // Main keeps routing input to the owning child, padded pane or not.
+  const writesBefore = manager.writes.length;
+  harness.terminal.emitInput("x");
+  await nextTurn();
+  assert.deepEqual(manager.writes.slice(writesBefore).map((entry) => [entry.id, entry.data]), [["native-1", "x"]],
+    "a padded pane keeps Main input with the owning child");
+
+  // A roster handoff takes the cursor away from Main and gives it back intact.
+  harness.terminal.emitInput(ALT_LEFT);
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  const rosterFrame = harness.writer.frames.at(-1)?.frame;
+  assert.ok(plain(rosterFrame).includes("padded native draft"), "the padded frame stays displayed behind the roster");
+  assert.deepEqual(rosterFrame!.cursor, { column: 0, row: 0, visible: false },
+    "roster focus claims nothing for the native cursor");
+  harness.terminal.emitInput("\x1b[1;3C"); // Alt+Right returns input ownership to Main, roster still visible
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.deepEqual(harness.writer.frames.at(-1)?.frame.cursor, { column: 35, row: 1, visible: true },
+    "returning to Main restores the padded native cursor at the same padded position");
+
+  assert.equal(manager.viewers.closeViewer(other.viewerId), true);
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
 test("n displays no session without stopping, creating, or feeding anything", async () => {
   const harness = createHarness();
   const manager = await startTwoSessions(harness);
@@ -6759,6 +6815,74 @@ test("remote graphics keep their own owner key and an oversized owner frame keep
     assert.equal(clipped?.graphics, undefined, "a frame larger than the pane keeps no image owner");
     assert.ok(clipped !== undefined && clipped.lines.every((line) => visibleWidthOf(line) <= harness.terminal.columns),
       "clipped remote content never spills past the terminal width");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+// #553: a deliberately selected remote session whose owner publishes a viewport
+// smaller than this pane is displayed padded. The owner's own cursor is the one
+// cursor claim for that frame, so it projects at the native pane origin instead
+// of disappearing; a frame the pane cannot show whole, and an owner-hidden
+// cursor, still claim nothing.
+test("a selected remote viewport smaller than the pane keeps its own cursor at the padded position", async (t) => {
+  const { harness, content, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
+  ]);
+  const nativeCursor = (column: number, row: number, visible = true) => ({ column, row, visible });
+  try {
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    await nextTurn();
+
+    // The owner's 40x20 viewport inside this host's 47x23 native pane.
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 1,
+      cols: 40, rows: 20, marker: "REMOTE-PADDED-DRAFT", cursor: nativeCursor(12, 7),
+    }));
+    await nextTurn();
+    const displayed = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(displayed).includes("REMOTE-PADDED-DRAFT"), "the padded remote viewport is the displayed source");
+    assert.equal(displayed!.cursor.visible, false, "while the roster is focused the remote owner claims no cursor");
+
+    harness.terminal.emitInput("\x1b[1;3C"); // Alt+Right returns input ownership to Main, roster still visible
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "main");
+    const padded = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(padded).includes("REMOTE-PADDED-DRAFT"), "the deliberate remote selection stays displayed");
+    assert.deepEqual(padded!.cursor, { column: 33 + 12, row: 1 + 7, visible: true },
+      "#553: the remote owner's cursor projects at the native pane origin plus its own coordinates");
+    assert.equal(plainLine(padded, 1 + 20).slice(33).trim(), "",
+      "the first padded row below the drawn content stays blank host space");
+
+    // A cursor position the owner's own frame does not draw keeps no claim even
+    // though the padded pane has room for it.
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
+      cols: 40, rows: 20, marker: "REMOTE-PADDED-OUTSIDE", cursor: nativeCursor(39, 20),
+    }));
+    await nextTurn();
+    assert.equal(harness.writer.frames.at(-1)?.frame.cursor.visible, false,
+      "a cursor outside the owner's drawn rows is host padding, not a cursor position");
+
+    // The owner hiding its own cursor is respected, never forced visible.
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 3,
+      cols: 40, rows: 20, marker: "REMOTE-PADDED-HIDDEN", cursor: nativeCursor(12, 7, false),
+    }));
+    await nextTurn();
+    const hidden = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(hidden).includes("REMOTE-PADDED-HIDDEN"), "the padded content stays displayed");
+    assert.equal(hidden!.cursor.visible, false, "the owner's hidden cursor is never forced visible");
+
+    // A frame larger than this pane is clipped for display and claims nothing.
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 4,
+      cols: 100, rows: 30, marker: "REMOTE-PADDED-CLIPPED", cursor: nativeCursor(12, 7),
+    }));
+    await nextTurn();
+    const clipped = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(clipped).includes("REMOTE-PADDED-CLIPPED"), "the pane still shows the owner's content");
+    assert.equal(clipped!.cursor.visible, false, "a remote frame larger than the pane claims no cursor position");
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
   }

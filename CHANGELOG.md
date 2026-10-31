@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.229]
+## [0.1.0-dev.230]
 
 ### Changed
 
@@ -29,6 +29,18 @@ dates.
 - **Native PTY test fixture preservation** (#502): retain the owned fixture when child
   exit remains unconfirmed instead of removing it after disposal alone. Existing native
   input and shutdown assertions remain in place.
+
+## [0.1.0-dev.229]
+
+### Fixed
+
+- **Native cursors survive padded sidebar viewports** (#553): a session smaller than
+  its local or remote viewing pane no longer loses its native terminal cursor merely
+  because the pane is larger. The compositor follows the existing viewport's cursor
+  position and visibility within the drawn session rectangle, rather than suppressing
+  native cursor state from configured external editors opened with Ctrl+G. Editor
+  input, draft return, transport permissions, and native Pi
+  behavior are unchanged; no editor-specific cursor or configuration workaround is used.
 
 ## [0.1.0-dev.228]
 

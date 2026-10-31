@@ -1867,7 +1867,10 @@ input consumer. Input retained across an ownership transition is discarded rathe
 than replayed into the next consumer. Saving returns Pi's edited draft once; quitting
 without saving or an editor failure preserves the draft under Pi's existing rules.
 After the owned editor exits, Pi resumes its normal input and terminal modes. The
-relay does not disable framing, create a raw-input window, or broaden remote input
+local or selected remote pane follows the native cursor's position and visibility,
+including when a smaller session viewport is padded inside a larger pane. It does
+not draw an editor-specific substitute or force a cursor the editor has hidden.
+The relay does not disable framing, create a raw-input window, or broaden remote input
 permissions; viewer input retains its existing authorization and source fences.
 Windows retains Pi's shell-based configured-editor launch through the pinned ConPTY
 surface; other platforms retain their native command/argument launch. Missing terminal
@@ -1884,7 +1887,14 @@ remain and input must recover without restarting the host. Compare standalone Pi
 local Main, Windows, and SSH to Linux separately; a same-host PTY test is not physical-terminal
 or SSH certification. If using a remote viewer, repeat through that selected remote
 pane with its existing Remote input/copy setting enabled; no new grant is needed or
-implied.
+implied. For the macOS-owner/Windows-viewer cursor check, record both application
+builds, Node/Pi and editor versions, Windows version and terminal identity. Use
+unequal pane sizes so the selected viewport is padded in the larger viewer. During
+Ctrl+G, confirm the native cursor marks the actual edit position and follows
+horizontal and vertical navigation; if the editor deliberately hides it, confirm
+that intent is preserved. Save/exit and confirm the exact draft and ordinary chat
+cursor behavior return. Repeat with equal pane sizes and the standalone/local
+controls; protocol or same-host PTY results alone do not verify this paired setup.
 
 **Startup input.** A child the owner has just started can show a native prompt before
 it has a conversation, such as Pi's `Trust project folder?` selector. When both sides

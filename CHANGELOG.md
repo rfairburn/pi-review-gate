@@ -15,6 +15,22 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.231]
+
+### Tests
+
+- **Saved-deletion fixture waits for its current result before deleting** (#502): the
+  confirmed Saved-deletion test now filters by the fixture's indexed session identity
+  instead of the displayed caption, which this fixture's SDK listing does not expose as
+  search text. It records the owning picker, query revision, and written-frame count
+  before typing; requires the typed query to advance exactly one revision and a newer
+  written frame to retain the same picker and current revision; and checks that the
+  selected caption is actually rendered with the sibling excluded, rather than treating
+  the query line or an empty placeholder as the selected result. The speculative retry
+  loop is replaced by the normal next-turn wait. All existing deletion, shell-free trash
+  fallback, sibling isolation, Main-owner, cancellation, no-input, native-viewport, and
+  shutdown assertions are preserved; production behavior is unchanged.
+
 ## [0.1.0-dev.230]
 
 ### Changed

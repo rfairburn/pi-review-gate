@@ -5132,16 +5132,32 @@ test("confirmed Saved deletion uses shell-free trash fallback for only the displ
     assert.equal(harness.sidebar?.focus, "form");
     assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Sibling conversati"), JSON.stringify(plain(harness.writer.frames.at(-1)?.frame)));
     const selectionBefore = harness.sidebar?.selectedId;
-    const savedQuery: string = "First conversation delete-confirmed";
+    const pickerBeforeQuery = harness.sidebar?.savedPickerRequestId;
+    const revisionBeforeQuery = harness.sidebar?.savedQueryRevisionNumber;
+    const framesBeforeQuery = harness.writer.frames.length;
+    assert.ok(pickerBeforeQuery !== undefined, "the Saved picker owns the pane before filtering");
+    assert.ok(revisionBeforeQuery !== undefined);
+    // This fixture's SDK listing supplies firstMessage for display, but no
+    // allMessages search text, so filter by its indexed identity. The query
+    // line itself starts with "> "; require a rendered result row rather than
+    // mistaking that query-line marker for the current selected result.
+    const savedQuery: string = fixture.sessionId;
     harness.terminal.emitInput(savedQuery);
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      await nextTurn();
-      const frame = harness.writer.frames.at(-1)?.frame;
-      if (plain(frame).includes(savedQuery) && plain(frame).includes("> First convers")
-        && !plain(frame).includes("Sibling conversation stays")) break;
-    }
+    const revisionAfterQuery = harness.sidebar?.savedQueryRevisionNumber;
+    assert.equal(revisionAfterQuery, revisionBeforeQuery + 1, "typing advances the one current query revision");
+    await nextTurn();
+    assert.ok(harness.writer.frames.length > framesBeforeQuery, "filtering produced a newer written picker frame");
+    assert.equal(harness.sidebar?.savedPickerRequestId, pickerBeforeQuery, "the filtered result still belongs to the same picker");
+    assert.equal(harness.sidebar?.savedQueryRevisionNumber, revisionAfterQuery, "the written frame belongs to the current query revision");
     assert.equal(harness.sidebar?.savedQuery, savedQuery);
-    assertSavedPickerRightPanel(harness.writer.frames.at(-1)!.frame, savedQuery, "First convers");
+    const filteredFrame = harness.writer.frames.at(-1)!.frame;
+    assertSavedPickerRightPanel(filteredFrame, savedQuery, "First convers");
+    const filteredText = plain(filteredFrame);
+    assert.ok(filteredText.includes("> First convers"), "the selected saved row is actually drawn in the filtered list");
+    assert.equal(filteredText.includes("No matching saved conversations"), false,
+      "the written frame is a filtered result, not a loading or empty placeholder");
+    assert.equal(filteredText.includes("Sibling conversation stays"), false,
+      "the sibling row is excluded by the current query before deleting");
     const pickerBeforeCancel = harness.sidebar?.savedPickerRequestId;
     const surface = manager.surface(ownerBefore!);
     assert.ok(surface);

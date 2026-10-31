@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.236]
+## [0.1.0-dev.237]
 
 ### Fixed
 
@@ -44,6 +44,18 @@ dates.
   full closure: an already-triggered wake cannot be withdrawn through the public
   extension API, so a suppressed checkpoint still costs one model turn. Issue #456
   (default `ShellStart` check-in callbacks/period) is independent and untouched here.
+
+## [0.1.0-dev.236]
+
+### Changed
+
+- **Sidebar-first documentation** (#454): the README and onboarding recommend the
+  existing `pi-review-sessions` workflow and retain fully maintained standalone
+  Pi + review-gate instructions. Current documentation no longer positions the sidebar
+  as alpha; known platform and terminal limitations remain explicit. Documentation
+  accuracy fixes cover launch preparation, settings, review/execution, and tool guidance.
+  Launcher names, package mappings, application help/UI, runtime behavior, and the
+  numbered-prerelease policy are unchanged.
 
 ## [0.1.0-dev.235]
 

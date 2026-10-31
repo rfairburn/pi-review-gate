@@ -7,7 +7,7 @@ steps for the live gate live in
 
 ## Session-host roster recovery
 
-The optional `pi-review-sessions` host keeps one ordered sidebar roster in the canonical
+The `pi-review-sessions` session host keeps one ordered sidebar roster in the canonical
 Pi agent directory (`PI_CODING_AGENT_DIR`, otherwise Pi's ordinary `~/.pi/agent`) and
 restores it automatically at startup from any launch directory. Restoration is not
 process recovery: no existing or detached process is discovered, adopted, or revived.

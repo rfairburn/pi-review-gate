@@ -44,6 +44,44 @@ underlying behavior.
   from an installed package whose compiled output is incomplete or absent. Reinstall the
   package; a source checkout prepares automatically and needs no manual build.
 
+## Session host
+
+- **`pi-review-sessions: an interactive stdin and stdout are required.`** The host needs a
+  real terminal with both stdin and stdout attached; it refuses a piped, redirected, or
+  otherwise non-interactive launch. Run it from an interactive terminal
+  (`./scripts/pi-review-sessions.sh`, `scripts\pi-review-sessions.cmd`, or the installed
+  `pi-review-sessions` command). See
+  [Requirements and launch](session-host-alpha.md#requirements-and-launch).
+- **`pi-review-sessions: Node <version> is below the <floor> security minimum for its
+  release line`.** The installed `pi-review-sessions` command runs the shared launcher with
+  the Node that invoked it, so it needs a supported Node already on `PATH`. Upgrade Node on
+  `PATH`, or use the source `.sh`/`.cmd` entry points, which retain a supported `PATH` Node
+  or bootstrap the checksum-pinned official Node 22.23.4 archive into an isolated per-agent
+  cache. Either way, update Node yourself and restart already-running hosts and sessions.
+  See [Requirements and launch](session-host-alpha.md#requirements-and-launch).
+- **A second host refuses to start because one host already owns that Pi agent directory.**
+  One host owns a given agent directory at a time through the exclusive ownership record
+  under `<agentDir>/session-host/`; the diagnostic names the agent directory and the
+  ownership record, and ownership is never stolen, verified around, or repaired. Close the
+  other host, or run the second host against a different `PI_CODING_AGENT_DIR`. See
+  [One owning host, one session manager](session-host-alpha.md#one-owning-host-one-session-manager).
+- **The host rejects a startup option such as `--continue`, `--resume`, `--session`, or
+  `--fork`.** Parent startup arguments that would attach a new instance to an existing
+  conversation or storage root are rejected before any setup, and the diagnostic names the
+  option, never its value. Launch the host without them and resume a conversation through
+  the host's own Saved picker instead. See
+  [Requirements and launch](session-host-alpha.md#requirements-and-launch) and
+  [Saved conversations on a connected owner](session-host-alpha.md#saved-conversations-on-a-connected-owner).
+- **`pi-review-sessions: unsupported role context (PI_REVIEW_GATE_RUNTIME_ROLE)`.** The host
+  refuses to start inside a review-gate worker or executor role context. Launch it from an
+  ordinary terminal rather than from a gate-managed session.
+- **The host exits with `the alpha session host supports macOS/Linux and Windows source
+  admission only.`** That is the launcher's current (unchanged) diagnostic wording. It means
+  the host ran on a platform outside macOS/Linux plus the Windows source-admission path.
+  macOS and Linux remain the supported host platforms, and the Windows paths stay validation
+  paths rather than a support claim. See
+  [Known limitation: Windows runtime acceptance](session-host-alpha.md#known-limitation-windows-runtime-acceptance).
+
 ## Reviews
 
 - **Escape does not cancel a running review.** If terminal input interception cannot be

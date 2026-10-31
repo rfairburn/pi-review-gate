@@ -1057,7 +1057,7 @@ boundaries are owned by [Web tools](web-tools.md) and
 ## `/review-settings`
 
 The staged settings menu is documented on the [Settings menu](settings.md#review-settings)
-page: its nineteen ordinary rows, the conditional **Scheduler runtime** row,
+page: its sixteen ordinary rows, the conditional **Scheduler runtime** row,
 Escape/Cancel/Save/Ctrl+S apply and persistence semantics, and the shared native
 text-field behavior. Raw field values and defaults stay in this reference — see
 [Top-level fields](#top-level-fields),

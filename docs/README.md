@@ -2,8 +2,10 @@
 
 `pi-review-gate` is an external [pi](https://github.com/badlogic/pi-mono) extension that
 reviews code changes after an agent turn and sends the complete classified review pass
-back to the implementing model. The project also provides delegated background execution,
-native web research tools, durable evidence bundles, and crash recovery.
+back to the implementing model. The project also runs several independent native Pi
+sessions side by side in one terminal through the recommended `pi-review-sessions` session
+host, and provides delegated background execution, native web research tools, durable
+evidence bundles, and crash recovery.
 
 Start at the root [README](../README.md) for a product overview, prerequisites, and a
 minimal setup. Each page below is the single canonical owner of its topic; pages link to
@@ -14,6 +16,8 @@ each other instead of duplicating detail.
 | Page | Owns |
 | --- | --- |
 | [Getting started](getting-started.md) | Prerequisites, installation, first configuration, launch paths, first review walkthrough. |
+| [Session host](session-host-alpha.md) | The recommended `pi-review-sessions` sidebar host: requirements and launch entry points, roster and session lifecycle, network pairing, saved conversations, shortcuts, and platform/input limits. |
+| [Native Pi tools](native-pi-tools.md) | Pi's native MCP and codemode surfaces: role-based loading and the deferred-tools toggle, live registry reconciliation, the delegated-worker ceiling, and scoped tool denial. |
 | [Configuration](configuration.md) | Config discovery, core JSON fields and defaults, operating modes, reviewer catalogs/layers, legacy compatibility, and web settings. |
 | [Settings menu](settings.md) | `/review-settings` sections, staged edits, Escape/Cancel/Save/Ctrl+S apply and persistence semantics, reload requirements, and separate live runtime actions. |
 | [Tool protection](tool-protection.md) | The optional pre-execution auditor, policy levels and limits, saved auditor settings, and the inert fixture tester. |
@@ -35,6 +39,9 @@ each other instead of duplicating detail.
 
 - **Evaluate the project:** root [README](../README.md), then
   [Getting started](getting-started.md).
+- **Launch and run Pi sessions:** [Getting started](getting-started.md#launching) for the
+  entry points, then [Session host](session-host-alpha.md) for the recommended sidebar
+  host and its limits.
 - **Configure reviews day to day:** [Settings menu](settings.md),
   [Configuration](configuration.md) for raw fields, then [Review workflow](review-workflow.md).
 - **Run background workers:** [Delegated execution](delegated-execution.md),
@@ -55,8 +62,9 @@ each other instead of duplicating detail.
   and [LICENSES/](../LICENSES).
 - The shipped skills provisioned with the package:
   [skills/pi-review-gate-orchestrator/SKILL.md](../skills/pi-review-gate-orchestrator/SKILL.md),
-  [skills/pi-review-gate-execution/SKILL.md](../skills/pi-review-gate-execution/SKILL.md), and
-  [skills/pi-review-gate-research/SKILL.md](../skills/pi-review-gate-research/SKILL.md).
+  [skills/pi-review-gate-execution/SKILL.md](../skills/pi-review-gate-execution/SKILL.md),
+  [skills/pi-review-gate-research/SKILL.md](../skills/pi-review-gate-research/SKILL.md), and
+  [skills/pi-review-gate-completion/SKILL.md](../skills/pi-review-gate-completion/SKILL.md).
 
 ## Governance and contribution
 

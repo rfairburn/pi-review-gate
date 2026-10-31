@@ -164,6 +164,7 @@ import {
   type SidebarMousePresentation,
   type SidebarRemoteCloseRow,
   type SidebarSavedPickerPresentation,
+  type SidebarScrollDirection,
 } from "./sidebar";
 import type { TerminalFrame, TerminalInputModes, TerminalMouseReportingRequest } from "./terminal-surface";
 import type { NativeClipboardEvent } from "./native-clipboard";
@@ -909,6 +910,17 @@ function isMouseButtonPress(mouse: ParsedMouseInput): boolean {
 
 function isLeftMousePress(mouse: ParsedMouseInput): boolean {
   return isMouseButtonPress(mouse) && mouse.button === 0;
+}
+
+/**
+ * Wheel notch direction of one parsed report: -1 up, +1 down, undefined for a
+ * horizontal notch. SGR and X10 encode the notch in the two low button bits
+ * (0 up, 1 down, 2 right, 3 left); motion and modifier bits sit above them.
+ */
+function wheelNotchDirection(mouse: ParsedMouseInput): SidebarScrollDirection | undefined {
+  if (!mouse.wheel) return undefined;
+  const notch = mouse.button & 3;
+  return notch === 0 ? -1 : notch === 1 ? 1 : undefined;
 }
 
 /**
@@ -3802,6 +3814,27 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const pane = formPane ?? sidebarPane;
     if (pane !== undefined) {
       if (isMouseButtonPress(mouse) && buttonId !== undefined) hostMouseButtons.add(buttonId);
+      if (mouse.wheel) {
+        // A wheel report inside a visible host pane is host-owned and never
+        // reaches the child, so scrolling the sidebar can never scroll Main as
+        // well. Over the LEFT roster it scrolls that pane's own viewport (#439):
+        // it activates no row, moves no highlight, and changes no focus,
+        // visibility, or Main content owner, and it is fenced to the roster the
+        // current written frame actually drew at this geometry. The form slot
+        // keeps its existing consumed-no-op behavior.
+        const direction = wheelNotchDirection(mouse);
+        if (formPane === undefined && presentation !== undefined && direction !== undefined
+          && presentation.sidebar.scrollRosterAt(
+            mouse.x - pane.column,
+            mouse.y - pane.row,
+            pane.cols,
+            pane.rows,
+            direction,
+          )) {
+          scheduleRedraw();
+        }
+        return;
+      }
       if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending) {
         const previousFocus = sidebar.focus;
         const previousSelection = sidebar.selectedId;

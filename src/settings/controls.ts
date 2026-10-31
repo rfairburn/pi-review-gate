@@ -241,7 +241,7 @@ export async function selectReviewPolicy(
     );
     if (entered === undefined) continue;
     const parsed = Number(entered.trim());
-    if (!Number.isInteger(parsed) || parsed < 0) {
+    if (!Number.isSafeInteger(parsed) || parsed < 0) {
       await notify(ui, "Enter a non-negative whole number.", "error");
       continue;
     }

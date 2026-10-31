@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.237]
+
+### Fixed
+
+- **Review-policy prompts reject unsafe integers** (#577): both **Automatic
+  correction attempts** and **Concrete guidance after** use the same
+  non-negative safe-integer boundary that strict configuration normalization
+  already applies. Entries such as `1e20` or `9007199254740992` are refused with
+  the existing notice and leave the previously staged value unchanged, while
+  `0`, ordinary safe integers, and `Number.MAX_SAFE_INTEGER` are accepted.
+  Cancellation, blank/whitespace input, existing number grammar, defaults,
+  fallback/persistence behavior, and other numeric prompts are unchanged.
+
 ## [0.1.0-dev.236]
 
 ### Changed

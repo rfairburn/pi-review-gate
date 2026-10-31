@@ -18,6 +18,23 @@ const fixture = `<!doctype html><html><head><title>Population fixture</title></h
 <tbody><tr><td>New York</td><td>8,804,190</td><td>8,584,629</td></tr><tr><td>Los Angeles</td><td>3,898,747</td><td>3,869,089</td></tr></tbody></table>
 <nav class="pagination"><a rel="next" href="/page/2">Next</a></nav></body></html>`;
 
+// Fixed synthetic stand-in for the reported Wikipedia-shaped table (#534): header
+// labels carry bracketed reference markers, so a column error must keep the
+// copyable selector value visibly separate from the header label.
+const projectionFixture = `<html><body><h1>Cities by population</h1>
+<table><tr><th>City[a]</th><th>Country</th><th>UN 2025 population estimates[12]</th></tr>
+<tr><td>Tokyo</td><td>Japan</td><td>37,100,000</td></tr>
+<tr><td>Delhi</td><td>India</td><td>33,300,000</td></tr></table></body></html>`;
+
+function thrownBy(thunk: () => unknown): Error {
+  try {
+    thunk();
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+  throw new Error("expected the call to throw");
+}
+
 function pdfFixture(pages: string[], title = "Population report"): Uint8Array {
   const objects: string[] = [];
   const pageObjectNumbers = pages.map((_, index) => 3 + index * 2);
@@ -112,12 +129,68 @@ test("table reads project semantic columns and retain numeric fallback for ambig
     "https://example.com/areas",
   );
   const duplicateIndex = duplicatePage.tables[0]!.index;
-  assert.throws(() => renderWebPage(duplicatePage, duplicateIndex, 4_000, ["Area"]), /ambiguous.*#1 Area; #2 Area/);
+  assert.throws(() => renderWebPage(duplicatePage, duplicateIndex, 4_000, ["Area"]), /ambiguous.*"#1" for header "Area"; "#2" for header "Area"/);
   const secondArea = renderWebPage(duplicatePage, duplicateIndex, 4_000, ["#2"]);
   assert.match(secondArea.content, /\| 20 \|/);
   assert.doesNotMatch(secondArea.content, /\| 10 \|/);
   assert.throws(() => renderWebPage(page, 0, 4_000, ["City"]), /index points directly to a table block/);
-  assert.throws(() => renderWebPage(page, tableIndex, 4_000, ["Unknown"]), /unknown column selector.*#1 City/);
+  assert.throws(() => renderWebPage(page, tableIndex, 4_000, ["Unknown"]), /unknown column selector.*"#1" for header "City"/);
+});
+
+// Component coverage (no registered tools): the selector diagnostics themselves.
+test("column-selection errors advertise copyable selector values separate from header labels", () => {
+  const page = extractWebPage(projectionFixture, "https://example.com/cities-by-population");
+  const tableIndex = page.tables[0]!.index;
+  assert.deepEqual(page.tables[0]!.headers, ["City[a]", "Country", "UN 2025 population estimates[12]"]);
+
+  const failure = thrownBy(() => renderWebPage(page, tableIndex, 4_000, [
+    "#1 City[a]",
+    "#2 Country",
+    "#3 UN 2025 population estimates[12]",
+  ]));
+  assert.match(failure.message, /unknown column selector "#1 City\[a\]"/);
+  assert.match(failure.message, /"#1" for header "City\[a\]"/);
+  assert.match(failure.message, /"#3" for header "UN 2025 population estimates\[12\]"/);
+  assert.match(failure.message, /standalone "#N" ordinal or the exact header text/);
+  assert.match(failure.message, /combined is not a selector/);
+
+  const advertised = [...failure.message.matchAll(/"(#\d+)"/g)].map((match) => match[1]!);
+  assert.deepEqual(advertised, ["#1", "#2", "#3"], "every advertised value must be a standalone ordinal");
+  const copied = renderWebPage(page, tableIndex, 4_000, advertised);
+  assert.deepEqual(copied.projectedColumns, ["City[a]", "Country", "UN 2025 population estimates[12]"]);
+  assert.match(copied.content, /Tokyo/);
+
+  const corrected = renderWebPage(page, tableIndex, 4_000, ["#1", "#2", "#3"]);
+  assert.deepEqual(corrected.projectedColumns, ["City[a]", "Country", "UN 2025 population estimates[12]"]);
+  assert.match(corrected.content, /37,100,000/);
+
+  const byHeader = renderWebPage(page, tableIndex, 4_000, ["country", "City[a]"]);
+  assert.deepEqual(byHeader.projectedColumns, ["Country", "City[a]"], "exact case-insensitive headers keep the requested order");
+  assert.match(byHeader.content, /Japan/);
+
+  for (const combined of ["#1 City[a]", "#2 Country", "#3 UN 2025 population estimates[12]"]) {
+    assert.match(thrownBy(() => renderWebPage(page, tableIndex, 4_000, [combined])).message, /unknown column selector/, `${combined} stays rejected`);
+  }
+  assert.match(thrownBy(() => renderWebPage(page, tableIndex, 4_000, ["#4"])).message, /beyond the final column #3\. Available columns: "#1" for header "City\[a\]"/);
+  assert.match(thrownBy(() => renderWebPage(page, tableIndex, 4_000, ["#1", "City[a]"])).message, /same table column more than once/);
+});
+
+test("ambiguous header diagnostics keep numbered alternatives whose advertised values project", () => {
+  const page = extractWebPage(
+    `<html><body><h1>Reference markers</h1><table><tr><th>Population[a]</th><th>Population[a]</th></tr>`
+      + `<tr><td>10</td><td>20</td></tr><tr><td>30</td><td>40</td></tr></table></body></html>`,
+    "https://example.com/ambiguous-markers",
+  );
+  const tableIndex = page.tables[0]!.index;
+  const failure = thrownBy(() => renderWebPage(page, tableIndex, 4_000, ["Population[a]"]));
+  assert.match(failure.message, /ambiguous; use a numbered selector/);
+  assert.match(failure.message, /"#1" for header "Population\[a\]"; "#2" for header "Population\[a\]"/);
+  const advertised = [...failure.message.matchAll(/"(#\d+)"/g)].map((match) => match[1]!);
+  assert.deepEqual(advertised, ["#1", "#2"]);
+  assert.deepEqual(renderWebPage(page, tableIndex, 4_000, advertised).projectedColumns, ["Population[a]", "Population[a]"]);
+  const second = renderWebPage(page, tableIndex, 4_000, ["#2"]);
+  assert.match(second.content, /\| 20 \|/);
+  assert.doesNotMatch(second.content, /\| 10 \|/);
 });
 
 test("dynamic-content suspicion is explicit for script-heavy empty application shells", () => {
@@ -917,6 +990,116 @@ test("adversarial table truncation surfaces through the formatted table inventor
   assert.ok(response.tables[0]?.truncationNotes!.includes("colspan clamped to 1000"));
   assert.match(result.content[0].text as string, /truncated: .*colspan clamped to 1000/);
   await manager.cleanup();
+});
+
+// Registered-tool coverage (WebFetch/BrowserExtract through WebToolManager with a
+// synthetic cached document): recovery guidance at the tool error seam (#534).
+test("registered WebFetch column errors recover through columns and keep acquisition guidance for real failures", async () => {
+  const config = normalizeConfig({});
+  const url = "https://example.com/cities-by-population";
+  let downloads = 0;
+  const cache = new WebPageCache(config.web!.fetch, async (requested) => {
+    downloads += 1;
+    return {
+      requestedUrl: requested,
+      finalUrl: requested,
+      contentType: "text/html",
+      text: projectionFixture,
+      bytes: Buffer.byteLength(projectionFixture),
+      fetchedAt: "2026-08-23T00:00:00.000Z",
+    };
+  });
+  const tools = new Map<string, any>();
+  const manager = new WebToolManager({ registerTool: (tool) => tools.set(tool.name, tool) }, config, cache, cache);
+  manager.register();
+
+  const inventoried = await tools.get("WebFetch").execute("inventory", { url });
+  assert.equal(inventoried.isError, false);
+  const tableIndex = (inventoried.details.response as { tables: Array<{ index: number }> }).tables[0]!.index;
+
+  const malformed = await tools.get("WebFetch").execute("malformed", {
+    url,
+    index: tableIndex,
+    columns: ["#1 City[a]", "#2 Country", "#3 UN 2025 population estimates[12]"],
+  });
+  assert.equal(malformed.isError, true);
+  const malformedText = malformed.content[0].text as string;
+  assert.match(malformedText, /unknown column selector "#1 City\[a\]"/);
+  assert.match(malformedText, /"#1" for header "City\[a\]"/);
+  assert.match(malformedText, /Correct the columns argument/);
+  assert.doesNotMatch(malformedText, /plausibly requires rendered JavaScript/);
+  assert.doesNotMatch(malformedText, /choose another source/);
+
+  const corrected = await tools.get("WebFetch").execute("corrected", { url, index: tableIndex, columns: ["#1", "#2", "#3"] });
+  assert.equal(corrected.isError, false);
+  const correctedText = corrected.content[0].text as string;
+  assert.match(correctedText, /Projected columns: City\[a\] \| Country \| UN 2025 population estimates\[12\]/);
+  assert.match(correctedText, /Tokyo/);
+
+  // Preflight `columns` validation fails before any acquisition and must still be
+  // corrected as a columns argument, not as a source or rendering problem.
+  for (const [name, columns] of [["blank-selector", [" "]], ["empty-array", []]] as const) {
+    const preflight = await tools.get("WebFetch").execute(name, { url, index: tableIndex, columns });
+    assert.equal(preflight.isError, true, `${name} must error`);
+    const preflightText = preflight.content[0].text as string;
+    assert.match(preflightText, /WebFetch failed: columns must/, name);
+    assert.match(preflightText, /Correct the columns argument/, name);
+    assert.doesNotMatch(preflightText, /plausibly requires rendered JavaScript/, name);
+    assert.doesNotMatch(preflightText, /choose another source/, name);
+  }
+  assert.equal(downloads, 1, "preflight column validation never starts an acquisition");
+
+  const wrongIndex = await tools.get("WebFetch").execute("wrong-index", { url, index: 0, columns: ["#1"] });
+  assert.equal(wrongIndex.isError, true);
+  assert.match(wrongIndex.content[0].text as string, /index points directly to a table block/);
+  assert.match(wrongIndex.content[0].text as string, /Correct the columns argument/);
+  assert.doesNotMatch(wrongIndex.content[0].text as string, /plausibly requires rendered JavaScript/);
+
+  const findConflict = await tools.get("WebFetch").execute("find-conflict", { url, find: "Tokyo", columns: ["#1"] });
+  assert.equal(findConflict.isError, true);
+  assert.match(findConflict.content[0].text as string, /find and columns cannot be used together/);
+  assert.match(findConflict.content[0].text as string, /Correct the columns argument/);
+  assert.doesNotMatch(findConflict.content[0].text as string, /plausibly requires rendered JavaScript/);
+
+  // BrowserExtract shares the same projection diagnostics, so it reports the same
+  // copyable alternatives without a second implementation.
+  const browserFailure = await tools.get("BrowserExtract").execute("browser-columns", { url, index: tableIndex, columns: ["#1 City[a]"] });
+  assert.equal(browserFailure.isError, true);
+  assert.match(browserFailure.content[0].text as string, /BrowserExtract failed: unknown column selector "#1 City\[a\]"/);
+  assert.match(browserFailure.content[0].text as string, /"#1" for header "City\[a\]"/);
+  await manager.cleanup();
+
+  const pdf = pdfFixture(["A PDF page with population evidence."], "PDF projection");
+  const pdfCache = new WebPageCache(config.web!.fetch, async (requested) => ({
+    requestedUrl: requested,
+    finalUrl: requested,
+    contentType: "application/pdf",
+    text: new TextDecoder("latin1").decode(pdf),
+    data: pdf,
+    bytes: pdf.byteLength,
+    fetchedAt: "2026-08-23T00:00:00.000Z",
+  }));
+  const pdfTools = new Map<string, any>();
+  const pdfManager = new WebToolManager({ registerTool: (tool) => pdfTools.set(tool.name, tool) }, config, pdfCache);
+  pdfManager.register();
+  const pdfColumns = await pdfTools.get("WebFetch").execute("pdf-columns", { url: "https://example.com/report.pdf", columns: ["#1"] });
+  assert.equal(pdfColumns.isError, true);
+  assert.match(pdfColumns.content[0].text as string, /columns are not available for PDF documents/);
+  assert.match(pdfColumns.content[0].text as string, /Correct the columns argument/);
+  assert.doesNotMatch(pdfColumns.content[0].text as string, /plausibly requires rendered JavaScript/);
+  await pdfManager.cleanup();
+
+  // A genuine acquisition failure keeps the existing browser guidance even when
+  // columns was supplied.
+  const failingCache = new WebPageCache(config.web!.fetch, async () => { throw new Error("connection reset by peer"); });
+  const failingTools = new Map<string, any>();
+  const failingManager = new WebToolManager({ registerTool: (tool) => failingTools.set(tool.name, tool) }, config, failingCache);
+  failingManager.register();
+  const acquisition = await failingTools.get("WebFetch").execute("acquisition", { url: "https://example.com/broken", columns: ["#1"] });
+  assert.equal(acquisition.isError, true);
+  assert.match(acquisition.content[0].text as string, /connection reset by peer/);
+  assert.match(acquisition.content[0].text as string, /Use BrowserExtract only if this failure plausibly requires rendered JavaScript/);
+  await failingManager.cleanup();
 });
 
 test("ordinary tables with modest spans keep full extraction without a truncation signal", () => {

@@ -82,7 +82,13 @@ when little or no text can be extracted.
   document and therefore a new fetch.
 - When reading a table index, `columns` projects exact case-insensitive header names in
   the requested order; `#N` selects a 1-based column when headers are duplicated or
-  inconvenient.
+  inconvenient. Each selector is one copyable value — a standalone ordinal such as `#1`,
+  or the exact header text such as `City[a]` — and the two are never combined into one
+  selector. A rejected selector lists every available column as `"#1" for header
+  "City[a]"`, so the ordinal value and the header label can be told apart and copied
+  directly, and the failure points at correcting `columns` for the requested document:
+  a rejected selector is not evidence that the page needs BrowserExtract or a different
+  source.
 - PDFs use the same `url`, `find`, `index`, `nextIndex`, `maxChars`, and `refresh`
   flow; table-column projection is currently HTML-only. PDF detection uses both the
   HTTP content type and file magic, and password-protected, corrupt, or oversized

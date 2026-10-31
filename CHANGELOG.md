@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.237]
+## [0.1.0-dev.239]
 
 ### Tests
 
@@ -28,6 +28,35 @@ dates.
   the same flush and requires the exact visible editor cursor afterward. All existing
   save, cancel, failure, Unicode, prefill, no-model/tool, and process/TTY restoration
   assertions are unchanged; production and general harness behavior are unchanged.
+
+## [0.1.0-dev.238]
+
+### Added
+
+- **Remote session name editing** (#512): E on an authorized networked-session row
+  uses the existing name editor and asks the exact owning host to apply and verify
+  its normal native rename. Authoritative roster metadata updates current observers;
+  no local alias, optimistic name, session restart, or workspace change is introduced.
+  Owner run, row, native identity, capability, and authorization fences preserve
+  local rename behavior and keep stale or unconfirmed results from retargeting work.
+
+## [0.1.0-dev.237]
+
+### Added
+
+- **Left session list wheel scrolling** (#439): a mouse-wheel notch inside the
+  session host's left session list now scrolls that list's own visible window —
+  later entries come into view on the way down, earlier entries on the way up —
+  whenever the roster is longer than the visible page. The gesture is host-owned:
+  it activates no row, moves no highlight, takes no keyboard focus, never changes
+  the observed Main content owner, and never scrolls the hosted conversation
+  beside the list. Arrow-key navigation keeps its existing behavior before and
+  after wheeling, including moving the highlight to entries that are off-screen
+  and bringing them into view, and one-page lists, boundary pages, terminal
+  resizes, and roster changes stay valid and usable. No new preference,
+  shortcut, acceleration model, smooth-scrolling mode, or rows-per-notch value
+  is introduced or promised; hosted-conversation and popup scrolling are
+  unchanged.
 
 ## [0.1.0-dev.236]
 

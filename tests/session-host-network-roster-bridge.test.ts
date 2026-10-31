@@ -45,6 +45,7 @@ import {
   ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
+  ROSTER_BRIDGE_RENAME_CAPABILITY,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
   ROSTER_BRIDGE_SAVED_CAPABILITY,
   ROSTER_BRIDGE_SERVICE,
@@ -73,6 +74,7 @@ import {
 } from "../src/session-host/network/roster-bridge-protocol";
 import type { OwnerCloseFacts, OwnerCloseHandler, OwnerCloseRequest } from "../src/session-host/network/peer-close";
 import type { OwnerCreateFacts, OwnerCreateHandler, OwnerCreateRequest } from "../src/session-host/network/peer-create";
+import type { OwnerRenameHandler, OwnerRenameRequest } from "../src/session-host/network/peer-rename";
 import type {
   OwnerSavedAuthorizationGuard,
   OwnerSavedCatalogView,
@@ -654,6 +656,7 @@ function harness(options: {
   rows?: readonly string[];
   close?: OwnerCloseHandler;
   create?: OwnerCreateHandler;
+  rename?: OwnerRenameHandler;
   capabilities?: readonly string[];
   /** Optional Saved provider; supplied together with `deletePolicy` (default Off). */
   saved?: FakeSavedProvider;
@@ -672,6 +675,7 @@ function harness(options: {
     bounds: { ...FAST_BOUNDS, ...options.bounds },
     ...(options.close === undefined ? {} : { closeOwnedSession: options.close }),
     ...(options.create === undefined ? {} : { createOwnedSession: options.create }),
+    ...(options.rename === undefined ? {} : { renameOwnedSession: options.rename }),
     ...(options.saved === undefined ? {} : {
       savedCatalogView: options.saved.factory,
       remoteHistoryDeleteExposed: options.deletePolicy ?? (() => false),
@@ -2184,7 +2188,8 @@ function refusedFrame(frame: unknown): boolean {
 
 test("Close is an optional capability with fixed framing and no version or metadata meaning", () => {
   assert.deepEqual([...ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES],
-    [ROSTER_BRIDGE_CLOSE_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]);
+    [ROSTER_BRIDGE_CLOSE_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY,
+      ROSTER_BRIDGE_RENAME_CAPABILITY]);
   const decision = negotiateRosterBridgeHello(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CLOSE_CAPABILITY]));
   assert.equal(decision.ok, true);
   assert.deepEqual(decision.ok ? decision.capabilities : null, [ROSTER_BRIDGE_CLOSE_CAPABILITY]);
@@ -4845,4 +4850,88 @@ test("an initial policy whose callback triggers a roster transfer is still publi
   } finally {
     await live.stop();
   }
+});
+
+const RENAME_CAPS = [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_RENAME_CAPABILITY];
+
+function renameRequest(hostRunId: string, rowId = "row-1"): OwnerRenameRequest {
+  return { hostRunId, rowId, expectedSessionId: `conversation-${rowId}`, expectedSessionEpoch: 2, name: "New owner name" };
+}
+
+test("rename support is optional and only owner metadata changes the projection", async () => {
+  let calls = 0;
+  const h = harness({ capabilities: RENAME_CAPS, rename: async () => { calls++; return { kind: "renamed" }; } });
+  const legacy = harness({ capabilities: RENAME_CAPS });
+  try {
+    await Promise.all([h.viewer.hello, legacy.viewer.hello]);
+    await Promise.all([h.viewer.subscribe(), legacy.viewer.subscribe()]);
+    assert.equal(h.viewer.supportsRename, true);
+    assert.equal(legacy.viewer.supportsRename, false);
+    assert.deepEqual(await legacy.viewer.renameSession(renameRequest(legacy.inventory.hostRunId)),
+      { kind: "not-sent", reason: "capability-unsupported" });
+    const request = renameRequest(h.inventory.hostRunId);
+    assert.deepEqual(await h.viewer.renameSession(request), { kind: "owner-result", facts: { kind: "renamed" } });
+    assert.equal(calls, 1);
+    assert.equal(h.viewer.projection.rows[0]!.nativeSession!.name, "Conversation row-1",
+      "even a successful reply is not an optimistic label or native-name write");
+    h.inventory.rows[0] = ownerRow("row-1", { label: request.name, nativeSession: { ...nativeSession("row-1"), name: request.name } });
+    h.inventory.emit();
+    await until("authoritative renamed row", () => h.viewer.projection.rows[0]?.nativeSession?.name === request.name);
+    assert.equal(h.viewer.projection.rows[0]!.label, request.name);
+    assert.equal(h.viewer.projection.rows[1]!.nativeSession!.name, "Conversation row-2");
+  } finally { await h.stop(); await legacy.stop(); }
+});
+
+test("rename fences stale tuples and queued caller reentry before sending", async () => {
+  let calls = 0;
+  const h = harness({ capabilities: RENAME_CAPS, rename: async () => { calls++; return { kind: "renamed" }; } });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const request = renameRequest(h.inventory.hostRunId);
+    assert.deepEqual(await h.viewer.renameSession({ ...request, expectedSessionEpoch: 3 }),
+      { kind: "not-sent", reason: "target-unavailable" });
+    const result = await h.viewer.renameSession(request, { stillCurrent: () => {
+      void h.viewer.stop();
+      return true;
+    } });
+    assert.notEqual(result.kind, "owner-result");
+    assert.equal(calls, 0);
+    assert.equal(h.pair.viewerSide.types().filter((type) => type === "rename_request").length, 0);
+  } finally { await h.stop(); }
+});
+
+test("rename admission rejects replay, preserves accepted work, and never retries lost replies", async () => {
+  let calls = 0;
+  let finish!: () => void;
+  const gate = new Promise<void>((resolve) => { finish = resolve; });
+  let allowed = true;
+  const h = harness({ capabilities: RENAME_CAPS, bounds: { renameResultTimeoutMs: 80 },
+    authorize: () => allowed,
+    rename: async (_request, stillAuthorized) => {
+      assert.equal(stillAuthorized(), true);
+      calls++;
+      await gate;
+      return { kind: "renamed" };
+    },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    const pending = h.viewer.renameSession(renameRequest(h.inventory.hostRunId));
+    await until("accepted rename", () => calls === 1);
+    const sent = h.pair.viewerSide.sent.map((bytes) => decodeRosterBridgeFrame(bytes)).find((frame) => frame.type === "rename_request")!;
+    assert.equal(sent.type, "rename_request");
+    await h.pair.viewerSide.send(encodeRosterBridgeFrame(sent));
+    await h.pair.viewerSide.send(encodeRosterBridgeFrame({ ...sent, requestId: "replayed-request" }));
+    await settle();
+    assert.equal(calls, 1, "an older sequence cannot call the provider again");
+    allowed = false;
+    finish();
+    assert.deepEqual(await mustSettle(pending, "unknown rename result"), { kind: "unknown" });
+    assert.ok(h.ownerDiagnostics.includes("rename_reply_dropped"));
+    assert.equal(calls, 1);
+    assert.equal(h.pair.viewerSide.types().filter((type) => type === "rename_request").length, 3,
+      "only the deliberate original and two test-injected replays exist, never an automatic retry");
+  } finally { allowed = true; finish(); await h.stop(); }
 });

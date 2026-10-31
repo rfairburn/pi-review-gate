@@ -5138,10 +5138,13 @@ test("confirmed Saved deletion uses shell-free trash fallback for only the displ
     assert.ok(pickerBeforeQuery !== undefined, "the Saved picker owns the pane before filtering");
     assert.ok(revisionBeforeQuery !== undefined);
     // This fixture's SDK listing supplies firstMessage for display, but no
-    // allMessages search text, so filter by its indexed identity. The query
-    // line itself starts with "> "; require a rendered result row rather than
-    // mistaking that query-line marker for the current selected result.
-    const savedQuery: string = fixture.sessionId;
+    // allMessages search text, so filter by its indexed identity. The ID is
+    // quoted because the native exact-phrase grammar only matches that literal
+    // identity, while a raw fuzzy query can also match a sibling row through
+    // the fixture directories' shared cwd path. The query line itself starts
+    // with "> "; require a rendered result row rather than mistaking that
+    // query-line marker for the current selected result.
+    const savedQuery: string = `"${fixture.sessionId}"`;
     harness.terminal.emitInput(savedQuery);
     const revisionAfterQuery = harness.sidebar?.savedQueryRevisionNumber;
     assert.equal(revisionAfterQuery, revisionBeforeQuery + 1, "typing advances the one current query revision");
@@ -5156,8 +5159,8 @@ test("confirmed Saved deletion uses shell-free trash fallback for only the displ
     assert.ok(filteredText.includes("> First convers"), "the selected saved row is actually drawn in the filtered list");
     assert.equal(filteredText.includes("No matching saved conversations"), false,
       "the written frame is a filtered result, not a loading or empty placeholder");
-    assert.equal(filteredText.includes("Sibling conversation stays"), false,
-      "the sibling row is excluded by the current query before deleting");
+    assert.equal(filteredText.includes("Sibling conversati"), false,
+      "the sibling row's rendered text, witnessed before filtering, is excluded by the current query before deleting");
     const pickerBeforeCancel = harness.sidebar?.savedPickerRequestId;
     const surface = manager.surface(ownerBefore!);
     assert.ok(surface);

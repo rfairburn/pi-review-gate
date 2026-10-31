@@ -40,7 +40,16 @@
  *   the too-small pane, and selection-targeted keys (Enter, edit,
  *   stop/remove) act only on an entry the last roster render completely
  *   drew at its current height and order; hiding or overlaying the roster
- *   forgets it.
+ *   forgets it. One wheel notch inside the roster pane a written frame actually
+ *   drew moves ONLY that pane's single viewport position (#439): the current
+ *   implementation steps it by one entry, which is an internal unit rather
+ *   than a public rows-per-notch promise. The scroll never activates a row,
+ *   moves the highlight, changes focus or visibility, or touches Main's
+ *   content owner, and the keep-the-highlight visible rule re-engages whenever
+ *   anything other than that deliberate scroll changed the drawn layout (a
+ *   different highlighted entry, a changed roster projection, a different pane
+ *   size or available list height, or a different rendered height for the
+ *   highlighted card).
  * - `d` and Delete stop/remove the highlighted session row: an exited row
  *   removes immediately; a settled
  *   error row without a live process requests the same deliberate removal
@@ -574,6 +583,24 @@ export interface SidebarMousePresentation {
   readonly remoteClose: SidebarRemoteCloseRow | undefined;
   /** Activates only entries captured by the exact sidebar render this token represents. */
   activateRosterAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Scrolls ONLY the left roster viewport in `direction` (-1 up, +1 down) for a
+   * wheel report inside the roster pane this render actually drew (#439). The
+   * current implementation steps the viewport by one entry per call; that step
+   * unit is internal, not a public rows-per-notch promise. It moves no
+   * highlight, focus, visibility, activation target, or Main content owner,
+   * and never activates anything: the roster's single viewport position is the
+   * only state it changes, and the render pass owns every clamp, so a list that
+   * fits, a boundary, or a since-changed/hidden roster leaves the visible rows
+   * exactly as they were.
+   */
+  scrollRosterAt(
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+    direction: SidebarScrollDirection,
+  ): boolean;
   /** Activates only saved rows captured by the exact sidebar render this token represents. */
   activateSavedAt(column: number, row: number, cols: number, rows: number): boolean;
   /**
@@ -670,6 +697,9 @@ export interface SidebarFieldFactoryResult {
 }
 
 export type SidebarFocus = "main" | "sidebar" | "form" | "confirm";
+
+/** One wheel notch: -1 reveals earlier entries, +1 reveals later ones. */
+export type SidebarScrollDirection = -1 | 1;
 
 /**
  * The no-completion provider installed on a plain owner-entry field. Text the
@@ -965,6 +995,8 @@ interface DisplayedRoster {
   readonly regions: ReadonlyMap<string, DisplayedRosterRegion>;
   readonly cols: number;
   readonly rows: number;
+  /** Entry rows the render actually had available between header and footer. */
+  readonly listRows: number;
   readonly focus: SidebarFocus;
   readonly selectedKey: string | undefined;
 }
@@ -4136,6 +4168,8 @@ export class SidebarController {
       remoteClose: this.remoteCloseRowFrom(displayedRoster),
       activateRosterAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateRosterAtFrom(displayedRoster, column, row, cols, rows, false),
+      scrollRosterAt: (column: number, row: number, cols: number, rows: number, direction: SidebarScrollDirection): boolean =>
+        this.scrollRosterViewFrom(displayedRoster, column, row, cols, rows, direction),
       activateSavedAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows),
       activatePeerAt: (column: number, row: number, cols: number, rows: number): boolean =>
@@ -4286,6 +4320,62 @@ export class SidebarController {
       this._focus = "sidebar";
     }
     this.activateEntry(clicked);
+    return true;
+  }
+
+  /**
+   * One wheel notch over the roster pane a written frame actually drew (#439).
+   * The current implementation steps the viewport by one entry index; that unit
+   * is internal, not a documented rows-per-notch value.
+   * The same drawn-pane fence as roster activation decides the target: the
+   * roster must still be visible, still carry the current projection, and
+   * still be the pane drawn at exactly this geometry, so a hidden, replaced,
+   * too-small, or since-changed roster is refused rather than scrolled blind.
+   * `listTop` remains the only viewport position (an entry index), and the
+   * clamp mirrors what the render's own tail rule lands on, so a wheel at the
+   * first/last page or over a list that fits one page changes nothing at all.
+   * A destination whose first entry cannot fit the available list rows is
+   * refused too: the renderer draws only whole entries, so committing it would
+   * leave a usable window blank and (with no drawn region) disable every later
+   * wheel report until some other change rescued the pane.
+   * The highlighted entry, focus, visibility, and every activation target stay
+   * exactly as they were.
+   */
+  private scrollRosterViewFrom(
+    shown: DisplayedRoster | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+    direction: SidebarScrollDirection,
+  ): boolean {
+    if (direction !== -1 && direction !== 1) return false;
+    if (!this._visible || !validHitGeometry(column, row, cols, rows)) return false;
+    if (shown === undefined || shown.signature !== this.rosterSignature()) return false;
+    if (shown.cols !== cols || shown.rows !== rows) return false;
+    // The too-small fallback drew no entry, and a list whose every entry
+    // already fits the available rows has nothing off-screen to reveal.
+    if (shown.regions.size === 0) return false;
+    let total = 0;
+    for (const entry of this.entries) total += this.entryHeight(entry);
+    if (total <= shown.listRows) return false;
+    // The largest entry index the render's own tail rule can land on: the
+    // topmost window whose complete tail still fits the available rows.
+    let lastTop = 0;
+    let tail = 0;
+    for (let index = this.entries.length - 1; index >= 0; index -= 1) {
+      const height = this.entryHeight(this.entries[index]);
+      if (tail + height > shown.listRows) break;
+      tail += height;
+      lastTop = index;
+    }
+    const next = Math.min(Math.max(this.listTop + direction, 0), lastTop);
+    if (next === this.listTop) return false;
+    // The renderer stops at the first entry that does not fit, so a destination
+    // entry taller than the available list rows would draw nothing at all. Stay
+    // on the current usable window instead of blanking it.
+    if (this.entryHeight(this.entries[next]) > shown.listRows) return false;
+    this.listTop = next;
     return true;
   }
 
@@ -9140,7 +9230,7 @@ export class SidebarController {
     }
     const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
     lines.push(...alertLines);
-    const top = this.scrollWindow(selectedIndex, listRows);
+    const top = this.scrollWindow(selectedIndex, listRows, cols, rows);
     const displayed = new Map<string, number>();
     const regions = new Map<string, DisplayedRosterRegion>();
     let y = 0;
@@ -9163,6 +9253,7 @@ export class SidebarController {
       regions,
       cols,
       rows,
+      listRows,
       focus: this._focus,
       selectedKey: this.selectedEntryKey,
     };
@@ -9189,6 +9280,8 @@ export class SidebarController {
       regions: new Map(),
       cols,
       rows,
+      // Nothing was showable, so no entry-row window exists at this geometry.
+      listRows: 0,
       focus: this._focus,
       selectedKey: undefined,
     };
@@ -9200,12 +9293,37 @@ export class SidebarController {
    * Variable-height scroll: keeps the complete highlighted entry inside the
    * list window, moves the top only when needed, and pulls the window back
    * up when the whole tail fits (e.g. after a card collapses).
+   *
+   * `listTop` is the roster's ONE viewport position (an entry index), and this
+   * method is the only place that normalizes it, so no second scroll position
+   * or mirror field exists to keep in sync.
    */
-  private scrollWindow(selectedIndex: number, listRows: number): number {
+  private scrollWindow(selectedIndex: number, listRows: number, cols: number, rows: number): number {
     const heights = this.entries.map((entry) => this.entryHeight(entry));
     const maxTop = Math.max(0, this.entries.length - 1);
     let top = Math.min(Math.max(this.listTop, 0), maxTop);
-    if (selectedIndex >= 0) {
+    const selectedKey = selectedIndex >= 0 ? this.entries[selectedIndex]?.key : undefined;
+    const shown = this.displayedRoster;
+    // A wheel notch over the drawn roster moves this viewport away from the
+    // highlighted entry on purpose (#439). The selection-following rules below
+    // therefore re-engage only when something OTHER than that deliberate
+    // scroll changed the drawn layout: a different highlighted entry (every
+    // keyboard step), a changed roster projection (a reorder can move the
+    // highlighted entry to a place the retained window would not draw), a pane
+    // size or available list height the previous roster render did not draw, or
+    // a different rendered height for the highlighted card. Nothing else may
+    // silently undo an operator's scroll.
+    const followsSelection = shown === undefined
+      || shown.selectedKey !== selectedKey
+      || shown.signature !== this.rosterSignature()
+      || shown.cols !== cols
+      || shown.rows !== rows
+      || shown.listRows !== listRows
+      || (selectedKey !== undefined
+        && shown.selectedKey === selectedKey
+        && shown.heights.get(selectedKey) !== undefined
+        && shown.heights.get(selectedKey) !== heights[selectedIndex]);
+    if (followsSelection && selectedIndex >= 0) {
       if (selectedIndex < top) {
         top = selectedIndex;
       }

@@ -1097,9 +1097,10 @@ test("a held superseded-start retirement starts its own deadline and never repor
 	t.after(async () => {
 		await listenerClose.restore();
 	});
-	// The bounded wait below is the existing ownership deadline; this referenced
-	// witness keeps the event loop alive long enough for that timer to fire.
-	const keepAlive = delay(12_000);
+	// The bounded wait below is the existing ownership deadline; this owned
+	// referenced timer keeps the event loop alive for that whole timer and for
+	// the owned teardown below, and is cleared only after that teardown ends.
+	const keepAlive = setTimeout(() => {}, 12_000);
 	try {
 		const log = createSnapshotLog();
 		let superseded = false;
@@ -1152,9 +1153,13 @@ test("a held superseded-start retirement starts its own deadline and never repor
 		assert.equal((readPreferencesJson(fixture).hosting as { enabled: boolean }).enabled, false);
 		const error = await coordinator.close().then(() => null, (cause: unknown) => cause);
 		assert.equal(isPeerCoordinatorCloseError(error), true);
-		await keepAlive;
 	} finally {
-		await listenerClose.restore();
+		try {
+			await listenerClose.restore();
+		} finally {
+			// Cleared only once owned teardown finishes or fails.
+			clearTimeout(keepAlive);
+		}
 	}
 });
 
@@ -1221,9 +1226,10 @@ test("a listener close callback that never arrives is bounded, keeps the off int
 		await listenerClose.restore();
 	});
 	// The deadline under test is the existing owned-settlement deadline. This
-	// explicitly referenced witness keeps the event loop alive long enough for
-	// that production timer to fire; it widens nothing.
-	const keepAlive = delay(12_000);
+	// owned referenced timer keeps the event loop alive for that whole timer
+	// and for the owned teardown below; it widens nothing and is cleared only
+	// once that teardown ends.
+	const keepAlive = setTimeout(() => {}, 12_000);
 	try {
 		const side = await startCoordinator(t, { agentDir: fixture.agentDir, testHooks: hooks() });
 		await side.coordinator.perform({ type: "peer-listener", enabled: true, host: "127.0.0.1", port: "0" });
@@ -1250,9 +1256,13 @@ test("a listener close callback that never arrives is bounded, keeps the off int
 		const error = await side.coordinator.close().then(() => null, (cause: unknown) => cause);
 		assert.equal(isPeerCoordinatorCloseError(error), true);
 		assert.ok(Date.now() - closingAt < 9_000, "shutdown rejects from the sticky record instead of waiting again");
-		await keepAlive;
 	} finally {
-		await listenerClose.restore();
+		try {
+			await listenerClose.restore();
+		} finally {
+			// Cleared only once owned teardown finishes or fails.
+			clearTimeout(keepAlive);
+		}
 	}
 });
 

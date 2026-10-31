@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
 	chmodSync,
+	chownSync,
 	readdirSync,
 	lstatSync,
 	mkdirSync,
@@ -107,6 +108,15 @@ function fixtureRoot(t: { after: (fn: () => void) => void }): string {
 	t.after(() => {
 		rmSync(root, { recursive: true, force: true });
 	});
+	if (POSIX_HOST) {
+		// A temp root can inherit a group this account does not belong to
+		// (macOS /private/tmp is root:wheel). chmod then silently drops setgid
+		// on the fixture, so move only this synthetic root to the account's
+		// primary group before creating any fixture directory beneath it.
+		const primaryGid = process.getgid?.();
+		assert.ok(primaryGid !== undefined, "a POSIX fixture needs the account's primary group");
+		chownSync(root, -1, primaryGid);
+	}
 	return root;
 }
 
@@ -195,6 +205,7 @@ test("POSIX: owner-controlled parent accepts private or public-read modes and re
 	const setgid = path.join(root, "setgid");
 	mkdirSync(setgid, { mode: 0o755 });
 	chmodSync(setgid, 0o2755);
+	assert.equal(modeOf(setgid), 0o2755, "fixture setup must establish the setgid mode before policy refusal");
 	assert.throws(() => policy.assertOwnerControlledDirectory(setgid), (error) => isFixedFailure(error, root));
 	assert.equal(modeOf(setgid), 0o2755);
 
@@ -227,6 +238,7 @@ test("POSIX: private directory requires exactly 0700 owned by this account, and 
 		const dir = path.join(root, `peers-${name}`);
 		mkdirSync(dir, { mode: 0o700 });
 		chmodSync(dir, mode);
+		assert.equal(modeOf(dir), mode, `${name}: fixture setup must establish the requested mode`);
 		assert.throws(() => policy.assertPrivateDirectory(dir), (error) => isFixedFailure(error, root), name);
 		assert.equal(modeOf(dir), mode, `${name}: refused directory must keep its mode`);
 	}

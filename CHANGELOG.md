@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.233]
+
+### Fixed
+
+- **POSIX permission fixtures establish their requested setgid modes** (#502): the
+  fixture root now takes the account's primary group before any directory is created,
+  so a root that inherited a foreign group cannot silently strip setgid from a
+  requested mode. Fixture setup also asserts that the real setgid and private-directory
+  modes were established before invoking the production guard. All existing production
+  refusal and no-repair assertions, content, link, ACL, and platform/skip coverage, and
+  the production permission policy remain unchanged.
+
 ## [0.1.0-dev.232]
 
 ### Tests

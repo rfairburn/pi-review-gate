@@ -15,6 +15,45 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.237]
+
+### Fixed
+
+- **Obsolete subtask watch checkpoints no longer assert active work at consumption**
+  (Refs #452): a `SubtasksWatch` checkpoint was previously only freshness-checked when
+  its deadline fired. A checkpoint that was still valid at that moment could go
+  obsolete before the parent session's model read it — the last active task settled, a
+  rearm replaced the generation, an actionable notification retired it while a sibling
+  stayed active, or Pi drained the queued notification into an aborted run's teardown
+  with no provider request at all. Each queued checkpoint now carries an opaque
+  per-execution generation identity from the existing watch lifecycle store (no second
+  registry, no task mirror), is re-decided against canonical state on every model
+  request, and is withheld from that request when obsolete; Pi's append-only
+  `context_edit` then omits the never-consumed entry from future context while the raw
+  session entry, rendering, and exports keep their original text. Checkpoints the model
+  actually consumed, every other notification type, watch admission and cancellation,
+  the steering delivery lane, and quiet/noisy policy are unchanged; an unverifiable
+  pending checkpoint of this type fails closed to omission, while a demonstrably
+  consumed checkpoint persisted before the generation identity existed stays as
+  history. A durable omission can be strengthened later (partial projection then
+  full omission) against the same entry, and an already-applied projection is not
+  re-proposed. A pre-identity checkpoint with no stamped generation is targeted by
+  its exact native session entry (Pi's projection provenance), never by rendered
+  text, so an identical consumed checkpoint is never edited and each identical
+  pending checkpoint gets its own omission. A real user steering message that Pi
+  drains in the SAME native run as a due checkpoint (`steeringMode: "all"`) is no
+  longer mistaken for a new turn: the still-valid checkpoint keeps its content in
+  that request and in every later request that shows it as consumed history, and
+  gets no omission. The host's own `agent_start` and `message_start` boundaries
+  now supply the watch store's originating-run evidence, so only the first
+  following assistant response decides consumption: an aborted or errored
+  following response, a payload first injected by a run that never consumed it,
+  or a payload the host never showed being injected stays withheld even while the
+  watched work is still active. This is the #452 residual, not its
+  full closure: an already-triggered wake cannot be withdrawn through the public
+  extension API, so a suppressed checkpoint still costs one model turn. Issue #456
+  (default `ShellStart` check-in callbacks/period) is independent and untouched here.
+
 ## [0.1.0-dev.236]
 
 ### Changed

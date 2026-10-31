@@ -141,6 +141,14 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // Live session working directory. The top-level branch keeps it updated from
   // hook context; a Pi executor worker's cwd is its stable worktree root.
   let currentCwd = process.cwd();
+  /**
+   * Issue #452 residual: the exact session-persistence identity of the live
+   * top-level session (`sessionPersistenceIdentity`, the same identity the
+   * human-command origin guard and the state store bind to). One-shot watch
+   * checkpoints are bound to it, so a queued checkpoint from a retired origin
+   * can never assert active work in another session.
+   */
+  let liveSessionOriginId: string | undefined;
   let executorSettlementBootstrap: PiSettlementBootstrap | undefined;
   let executorSettlementBootstrapError: Error | undefined;
   let executorToolProtectionPin: ToolProtectionLaunchPin | undefined;
@@ -536,6 +544,99 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       config.ui = { ...config.ui, subtasksViewExpanded: expanded };
     },
     onScheduledDispatchRecorded: consumeOneShot,
+    sessionOriginId: () => liveSessionOriginId,
+  });
+
+  /**
+   * Issue #452 residual: consumption-time freshness for one-shot subtask watch
+   * checkpoints. The existing cancellation and the fire-time active-task check
+   * already cover a checkpoint whose work settled BEFORE the deadline; they
+   * cannot cover a checkpoint that was still valid when it was steered and
+   * then became obsolete before the owning session's model read it (task
+   * settled, watch rearmed, actionable wake retired it, or Pi drained it into
+   * an aborted run's teardown with no provider request at all). These top-level
+   * hooks decide each queued payload's exact generation against the
+   * controller's one canonical watch lifecycle store, and use Pi's public
+   * append-only `context_edit` boundary draft so a suppression cannot heal in a
+   * later request. They only ever REDUCE an obsolete active-work claim:
+   * nothing here arms, sends, settles, or cancels anything, no other
+   * notification type is touched, and raw session history, UI, and exports
+   * stay unchanged. The run/message-start pair below supplies the store's
+   * supported originating-run evidence: a built request and an injection are
+   * not consumption, and a user message queued behind a still-valid checkpoint
+   * in the SAME native run (`steeringMode: "all"`) is ordinary steering rather
+   * than a new turn, so eligibility is decided by which run actually injected
+   * the payload, not by message-role adjacency. Executor runtimes send no
+   * watch checkpoint, so the hooks stay top-level only.
+   */
+  const watchContextBranchEntries = (args: unknown[]): readonly unknown[] => {
+    const carrier = args.find((arg) => typeof arg === "object" && arg !== null
+      && typeof (arg as { sessionManager?: unknown }).sessionManager === "object") as {
+      sessionManager?: { getBranch?: () => unknown[] };
+    } | undefined;
+    const branch = carrier?.sessionManager?.getBranch?.();
+    return Array.isArray(branch) ? branch : [];
+  };
+  /** Pi's supported projection provenance: each model-visible message paired
+   * with the raw append-only entry that owns it (#452 residual). */
+  const watchContextProjectionEntries = (args: unknown[]): readonly unknown[] => {
+    const carrier = args.find((arg) => typeof arg === "object" && arg !== null
+      && typeof (arg as { sessionManager?: unknown }).sessionManager === "object") as {
+      sessionManager?: { buildSessionProjection?: () => { entries?: unknown[] } };
+    } | undefined;
+    const projection = carrier?.sessionManager?.buildSessionProjection?.();
+    return Array.isArray(projection?.entries) ? projection.entries : [];
+  };
+  registerHook(pi, "context", (...args) => {
+    const event = args[0];
+    const messages = typeof event === "object" && event !== null && Array.isArray((event as { messages?: unknown }).messages)
+      ? (event as { messages: unknown[] }).messages
+      : undefined;
+    if (!messages) return undefined;
+    try {
+      const filtered = executionTools.watchConsumptionFilter(messages, watchContextProjectionEntries(args));
+      return filtered.messages ? { messages: filtered.messages } : undefined;
+    } catch {
+      // Fail closed on the stale claim, never open: if the guard itself cannot
+      // decide, this session's own checkpoint content is withheld from the
+      // request instead of asserting work it can no longer substantiate. Other
+      // messages stay exactly as they are, and nothing is re-sent.
+      return { messages: messages.filter((message) => !(typeof message === "object" && message !== null
+        && (message as { customType?: unknown }).customType === "pi-review-subtask-watch")) };
+    }
+  });
+  const watchBoundaryEdits = (args: unknown[]): { entries: Array<{ type: "context_edit"; targetId: string; replacement: { content: string } | null }> } | undefined => {
+    const drafts = executionTools.watchContextEditDrafts(watchContextBranchEntries(args));
+    return drafts.length > 0 ? { entries: drafts } : undefined;
+  };
+  registerHook(pi, "turn_end", (...args) => watchBoundaryEdits(args));
+  registerHook(pi, "agent_before_settle", (...args) => watchBoundaryEdits(args));
+  // #452: the host's own native-run and injection boundaries, recorded on the
+  // SAME canonical watch store. `agent_start` opens one native run whose opaque
+  // token stays stable across every turn of that run — the window in which Pi's
+  // steering queue can drain a due checkpoint and a user message into the same
+  // request — and `message_start` for one of this gate's checkpoint payloads
+  // stamps the exact run that first injected it. A later run replaying that
+  // payload has no matching evidence and fails closed to omission.
+  try {
+    registerHook(pi, "agent_start", () => { executionTools.beginWatchRun(); });
+    registerHook(pi, "message_start", (...args) => {
+      const message = (args[0] as { message?: unknown } | undefined)?.message;
+      if (message !== undefined) executionTools.observeWatchInjection(message);
+    });
+  } catch {
+    // A host without these observation hooks cannot substantiate a pending
+    // checkpoint's injection, so its request-time guard fails closed. Do not
+    // prevent activation: other features retain their own capability gates.
+  }
+  // An aborted run consumed nothing: retire every fired-but-unconsumed
+  // checkpoint immediately, so a later run cannot inherit an active-work claim
+  // even while sibling tasks are still active.
+  registerHook(pi, "agent_settled", (...args) => {
+    const event = args[0];
+    if (typeof event === "object" && event !== null && (event as { aborted?: unknown }).aborted === true) {
+      executionTools.retireUnconsumedWatchGenerations();
+    }
   });
 
   // Issue #26: process-local scheduled-execution runtime. The live On/Off
@@ -817,6 +918,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     userQuestions?.noteContext(context);
     userQuestions?.syncPanel();
     const identity = sessionPersistenceIdentity(context, currentCwd);
+    liveSessionOriginId = identity
+      ? JSON.stringify([identity.sessionId, identity.sessionFile, identity.cwd])
+      : undefined;
     const activityRestoreOptions = identity
       ? { sessionOwner: JSON.stringify([identity.sessionId, identity.sessionFile, identity.cwd]) }
       : {};

@@ -1012,15 +1012,20 @@ test("#117 a suppressed model force-merge cancels the group's armed watch instea
       // checkpoint snapshot are gone.
       assert.equal(arm.wasCleared(), true, "production cancelWatch cleared the armed timer handle");
       // #237: watch/launch-notice state lives in ./wake-delivery; read the
-      // owning module's live state through the wake-delivery seam.
+      // owning module's live state through the wake-delivery seam. #452: the
+      // canonical store keeps the retired generation (exact pending identity)
+      // with its timer cleared instead of deleting the entry, so consumption
+      // can still tell this checkpoint from a later rearm.
       const internals = (controller as unknown as {
         wakes: {
-          watches: Map<string, unknown>;
+          watches: Map<string, { phase: string; timer?: unknown }>;
           pendingWatchInspections: Array<{ executionId: string }>;
           watchDeliveryTimer?: unknown;
         };
       }).wakes;
-      assert.equal(internals.watches.has(started.executionId), false, "the armed watch subscription was retired");
+      const retiredWatch = internals.watches.get(started.executionId);
+      assert.equal(retiredWatch?.phase, "retired", "the armed watch subscription was retired in the canonical store");
+      assert.equal(retiredWatch?.timer, undefined, "the retired generation keeps no timer");
       assert.ok(!internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "no queued checkpoint snapshot survives the suppressed completion");
 
       // Advance/release the would-be deadline past its original schedule.
@@ -1074,15 +1079,20 @@ test("#117 a suppressed model mark-clean cancels the group's armed watch instead
       // checkpoint snapshot are gone.
       assert.equal(arm.wasCleared(), true, "production cancelWatch cleared the armed timer handle");
       // #237: watch/launch-notice state lives in ./wake-delivery; read the
-      // owning module's live state through the wake-delivery seam.
+      // owning module's live state through the wake-delivery seam. #452: the
+      // retired generation stays in the canonical store with its timer
+      // cleared, so an active sibling's later checkpoint stays distinguishable
+      // from this one.
       const internals = (controller as unknown as {
         wakes: {
-          watches: Map<string, unknown>;
+          watches: Map<string, { phase: string; timer?: unknown }>;
           pendingWatchInspections: Array<{ executionId: string }>;
           watchDeliveryTimer?: unknown;
         };
       }).wakes;
-      assert.equal(internals.watches.has(started.executionId), false, "the armed watch subscription was retired");
+      const retiredMarkCleanWatch = internals.watches.get(started.executionId);
+      assert.equal(retiredMarkCleanWatch?.phase, "retired", "the armed watch subscription was retired in the canonical store");
+      assert.equal(retiredMarkCleanWatch?.timer, undefined, "the retired generation keeps no timer");
       assert.ok(!internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "no queued checkpoint snapshot survives the suppressed completion");
 
       // Advance/release the would-be deadline past its original schedule.
@@ -1128,8 +1138,8 @@ test("#160 a checkpoint released before the suppressed landing is a legitimate p
       assert.ok(checkpoint.content.includes(taskB), "the checkpoint reports the still-active sibling");
       // #237: watch state lives in ./wake-delivery; read the owning
       // module's live state through the wake-delivery seam.
-      const internals = (controller as unknown as { wakes: { watches: Map<string, unknown> } }).wakes;
-      assert.equal(internals.watches.has(started.executionId), false, "the one-shot subscription was consumed by its own firing");
+      const internals = (controller as unknown as { wakes: { watches: Map<string, { phase: string }> } }).wakes;
+      assert.equal(internals.watches.get(started.executionId)?.phase, "fired", "the one-shot subscription was consumed by its own firing");
       assert.equal(arm.wasCleared(), false, "the pre-completion firing was a legitimate delivery, not a cancellation");
       // A second release is inert: the consumed subscription cannot fire
       // again and cannot be resurrected by a later landing.
@@ -1180,12 +1190,13 @@ test("#160 a queued checkpoint snapshot is retired by the suppressed completion 
       // owning module's live state through the wake-delivery seam.
       const internals = (controller as unknown as {
         wakes: {
-          watches: Map<string, unknown>;
+          watches: Map<string, { phase: string; timer?: unknown }>;
           pendingWatchInspections: Array<{ executionId: string }>;
           watchDeliveryTimer?: unknown;
         };
       }).wakes;
-      assert.equal(internals.watches.has(started.executionId), false, "the firing consumed the one-shot subscription");
+      assert.equal(internals.watches.get(started.executionId)?.phase, "fired", "the firing consumed the one-shot subscription");
+      assert.equal(internals.watches.get(started.executionId)?.timer, undefined, "the fired generation keeps no timer");
       assert.ok(internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "a checkpoint snapshot is genuinely queued before the landing");
       assert.equal(internals.watchDeliveryTimer, arm.deliveryTimers[0]!.handle, "the captured delivery window is the production watchDeliveryTimer");
 

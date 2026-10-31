@@ -139,7 +139,13 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
   The precise limit is the wake itself: once the notification has been queued to the
   parent session, Pi owns the triggered turn, and no extension API dequeues it. A
   suppressed checkpoint therefore still costs one model turn; what is guaranteed is
-  that the turn never sees an obsolete active-work claim.
+  that an eligible request-time guard withholds obsolete pending content. Durability
+  also has a boundary: if the process exits after a suppressed request succeeds but
+  before Pi applies its next boundary context edit, the unchanged raw entry can be
+  mistaken for consumed history on resume, particularly after rearm or session
+  replacement discards its process-local omission marker. Hosts without the supported
+  context/boundary hooks cannot provide this guard. These limits remain open under
+  #452; the extension does not add a second durable receipt store to mask them.
 
 User analogs are available as `/subtasks` and the `/subtask-*` commands for inspect,
 add, steer, interrupt, force-merge, and mark-clean. The commands that accept explicit

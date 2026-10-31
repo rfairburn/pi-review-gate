@@ -15,6 +15,21 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.228]
+
+### Changed
+
+- **Session-host remote-input code and test ownership** (#502): isolate Main's pure
+  remote native-input validation and written-receipt comparison, and group its remote
+  input/copy regression cases in a dedicated suite using shared fixtures. Input authority,
+  receipt identity, lifecycle ownership, and supported behavior remain unchanged.
+
+### Fixed
+
+- **Native PTY test fixture preservation** (#502): retain the owned fixture when child
+  exit remains unconfirmed instead of removing it after disposal alone. Existing native
+  input and shutdown assertions remain in place.
+
 ## [0.1.0-dev.227]
 
 ### Fixed

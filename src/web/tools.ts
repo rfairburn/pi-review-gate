@@ -57,7 +57,7 @@ import {
   renderWebFetchResult,
   renderWebSearchResult,
 } from "./result-renderer";
-import { mediaTypeOf } from "./page";
+import { ColumnProjectionError, mediaTypeOf } from "./page";
 import { browserRenderResult } from "./browser-renderer";
 import { searchDdgs, type SearchResponse } from "./network";
 import type { BrowserClickButton } from "./browser-interaction-policy";
@@ -224,7 +224,7 @@ export class WebToolManager {
           const maxChars = boundedInteger(params.maxChars, 1_000, this.webConfig.fetch.maxOutputChars, this.webConfig.fetch.maxOutputChars, "maxChars");
           const refresh = optionalBoolean(params.refresh, false, "refresh");
           const find = optionalString(params.find);
-          const columns = optionalStringArray(params.columns, "columns");
+          const columns = columnsArgumentOf(params);
           requestDetails = {
             url,
             index,
@@ -253,7 +253,7 @@ export class WebToolManager {
         } catch (error) {
           return textResult([
             `WebFetch failed: ${messageOf(error)}`,
-            "Use BrowserExtract only if this failure plausibly requires rendered JavaScript, browser-managed cookies, or browser-style delivery; otherwise correct the URL or choose another source.",
+            webFetchRecoveryGuidance(error),
           ].join("\n"), { error: messageOf(error), ...(requestDetails ? { request: requestDetails } : {}) }, true);
         }
       },
@@ -281,7 +281,7 @@ export class WebToolManager {
           const maxChars = boundedInteger(params.maxChars, 1_000, this.webConfig.fetch.maxOutputChars, this.webConfig.fetch.maxOutputChars, "maxChars");
           const refresh = optionalBoolean(params.refresh, false, "refresh");
           const find = optionalString(params.find);
-          const columns = optionalStringArray(params.columns, "columns");
+          const columns = columnsArgumentOf(params);
           requestDetails = {
             url,
             index,
@@ -1037,6 +1037,19 @@ export function formatSearch(response: SearchResponse): string {
   return lines.join("\n").trim();
 }
 
+/**
+ * Recovery guidance for a failed WebFetch (issue #534). A rejected `columns`
+ * argument is an argument-validation failure against the already-cached
+ * document, so it must never read as evidence that the source needs a browser or
+ * a different URL; every other failure keeps the existing acquisition guidance.
+ */
+function webFetchRecoveryGuidance(error: unknown): string {
+  if (error instanceof ColumnProjectionError) {
+    return 'Correct the columns argument — a standalone "#N" ordinal or the exact header text, copied from the available columns when they are listed. The URL and the requested source do not need to change; this failure is not evidence that the page needs browser rendering.';
+  }
+  return "Use BrowserExtract only if this failure plausibly requires rendered JavaScript, browser-managed cookies, or browser-style delivery; otherwise correct the URL or choose another source.";
+}
+
 function formatPage(value: WebFetchResult, toolName: "WebFetch" | "BrowserExtract", acquisition: "Fetched" | "Rendered"): string {
   const lines = [
     `${documentLabel(value)}: ${value.title}`,
@@ -1740,6 +1753,20 @@ function optionalStringArray(value: unknown, field: string): string[] | undefine
     throw new Error(`${field} must be an array containing 1-64 strings.`);
   }
   return value.map((item) => requiredString(item, field));
+}
+
+/**
+ * Preflight `columns` validation (issue #534): the shared array validator stays the
+ * single implementation, so only the failure identity is specialized. That lets the
+ * tool error seam treat a malformed columns argument as a columns problem rather than
+ * a source or rendering problem, before any acquisition starts.
+ */
+function columnsArgumentOf(params: Record<string, unknown>): string[] | undefined {
+  try {
+    return optionalStringArray(params.columns, "columns");
+  } catch (error) {
+    throw new ColumnProjectionError(messageOf(error));
+  }
 }
 
 function boundedInteger(value: unknown, min: number, max: number, fallback: number, field: string): number {

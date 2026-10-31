@@ -36,6 +36,36 @@ import {
   testAgentDir,
 } from "./entrypoint-harness";
 
+// Fixture-local settlement proof for the Escape-cancellation case. This is
+// synthetic test bookkeeping, not native process coverage: one captured
+// reviewer child may authorize fixture removal only after its own passive exit
+// and close observations report the same positive terminal state that matches
+// the child's own exitCode/signalCode. A missing capture, an unobserved child,
+// and non-positive or inconsistent close evidence all remain unknown.
+type ReviewerTerminalState = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+};
+
+type ReviewerChildTerminalState = Pick<ChildProcess, "exitCode" | "signalCode">;
+
+type OwnedReviewer<Child extends ReviewerChildTerminalState = ReviewerChildTerminalState> = {
+  child: Child;
+  exit?: ReviewerTerminalState;
+  close?: ReviewerTerminalState;
+};
+
+function hasPositiveReviewerSettlement(record: OwnedReviewer | undefined): boolean {
+  // A missing capture is unknown ownership and settlement, never permission to
+  // delete the fixture root.
+  if (record === undefined) return false;
+  const { exit, close } = record;
+  if (exit === undefined || close === undefined) return false;
+  if (close.code === null && close.signal === null) return false;
+  if (close.code !== record.child.exitCode || close.signal !== record.child.signalCode) return false;
+  return exit.code === close.code && exit.signal === close.signal;
+}
+
 test("ordinary prompt in an initialized empty Git repository reaches normal review settlement", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-unborn-review-"));
   const configPath = join(tmpdir(), `pi-review-gate-unborn-config-${process.pid}-${Date.now()}.json`);
@@ -761,11 +791,7 @@ review: { activeReviewers: [
 
 test("kitty CSI-u escape aborts an active reviewer process; release and modified escape do not", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-escape-csi-u-"));
-  let reviewerProcess: {
-    child: ChildProcess;
-    exit?: { code: number | null; signal: NodeJS.Signals | null };
-    close?: { code: number | null; signal: NodeJS.Signals | null };
-  } | undefined;
+  let reviewerProcess: OwnedReviewer<ChildProcess> | undefined;
   type ReviewerProcessRecord = NonNullable<typeof reviewerProcess>;
   let restoreSpawn: (() => void) | undefined;
 
@@ -934,7 +960,7 @@ review: { activeReviewers: [
     assert.doesNotMatch(notices.join("\n"), /reviewer processes stopped/);
     await reviewPromise;
 
-    await waitForCondition(() => reviewer.close !== undefined);
+    await waitForCondition(() => hasPositiveReviewerSettlement(reviewer));
     const closeEvent = reviewer.close;
     assert.ok(closeEvent, "the exact reviewer child must report close");
     assert.ok(
@@ -971,31 +997,85 @@ review: { activeReviewers: [
     reapAll();
     // If an assertion failed while our exact fixture child was still live,
     // stop only that owned child through the product's owned-process seam and
-    // require positive close before deleting the fixture. Unknown settlement
-    // preserves the fixture instead of guessing.
+    // give its already-attached observers the existing bounded window to prove
+    // positive settlement. A missing capture, an unobserved child, or unknown
+    // settlement preserves the fixture instead of guessing, because an
+    // unobserved child may still be live.
     const ownedReviewer = reviewerProcess;
-    let reviewerSettled = ownedReviewer === undefined || ownedReviewer.close !== undefined;
-    if (ownedReviewer && ownedReviewer.close === undefined) {
+    if (ownedReviewer !== undefined && !hasPositiveReviewerSettlement(ownedReviewer)) {
       // Signal only while the exact child is still live. An exited child whose
       // close is still pending must never be identified again by numeric PID or
-      // process group; only its already-attached close observer may settle it.
-      const reviewerChildStillLive = ownedReviewer.child.exitCode === null
-        && ownedReviewer.child.signalCode === null
-        && ownedReviewer.exit === undefined;
+      // process group; only its already-attached observers may settle it.
+      const reviewerChildStillLive = ownedReviewer.exit === undefined
+        && ownedReviewer.close === undefined
+        && ownedReviewer.child.exitCode === null
+        && ownedReviewer.child.signalCode === null;
       if (reviewerChildStillLive) {
         terminateProcessTree(ownedReviewer.child, "SIGTERM");
       }
       try {
-        await waitForCondition(() => ownedReviewer.close !== undefined);
-        reviewerSettled = true;
+        await waitForCondition(() => hasPositiveReviewerSettlement(ownedReviewer));
       } catch {
-        reviewerSettled = false;
+        // Unknown settlement: preserve the fixture for inspection.
       }
     }
-    if (reviewerSettled) {
+    if (hasPositiveReviewerSettlement(ownedReviewer)) {
       await rm(dir, { recursive: true, force: true });
     }
   }
+});
+
+test("synthetic reviewer settlement proof fails closed on unknown or non-positive close evidence", () => {
+  // Synthetic control records only: this test never spawns, signals, or
+  // observes a real process. It proves the cleanup gate's decision rules, not
+  // native child-process behavior.
+  const terminal = (code: number | null, signal: NodeJS.Signals | null): ReviewerTerminalState => ({ code, signal });
+  const childState = (
+    exitCode: number | null,
+    signalCode: NodeJS.Signals | null,
+  ): ReviewerChildTerminalState => ({ exitCode, signalCode });
+  const reviewer = (
+    child: ReviewerChildTerminalState,
+    exit?: ReviewerTerminalState,
+    close?: ReviewerTerminalState,
+  ): OwnedReviewer => ({ child, exit, close });
+
+  assert.equal(hasPositiveReviewerSettlement(undefined), false, "a missing capture must never authorize fixture removal");
+  assert.equal(
+    hasPositiveReviewerSettlement(reviewer(childState(0, null))),
+    false,
+    "an unobserved child must never authorize fixture removal",
+  );
+  assert.equal(
+    hasPositiveReviewerSettlement(reviewer(childState(0, null), undefined, terminal(0, null))),
+    false,
+    "a close without a matching exit observation must never authorize fixture removal",
+  );
+  assert.equal(
+    hasPositiveReviewerSettlement(reviewer(childState(null, null), terminal(null, null), terminal(null, null))),
+    false,
+    "a non-positive close must never authorize fixture removal",
+  );
+  assert.equal(
+    hasPositiveReviewerSettlement(reviewer(childState(null, null), terminal(null, null), terminal(0, null))),
+    false,
+    "a close that disagrees with the child's terminal state must never authorize fixture removal",
+  );
+  assert.equal(
+    hasPositiveReviewerSettlement(reviewer(childState(null, "SIGTERM"), terminal(0, null), terminal(null, "SIGTERM"))),
+    false,
+    "an exit that disagrees with close must never authorize fixture removal",
+  );
+  assert.equal(
+    hasPositiveReviewerSettlement(reviewer(childState(0, null), terminal(0, null), terminal(0, null))),
+    true,
+    "a matching positive exit-code close must authorize fixture removal",
+  );
+  assert.equal(
+    hasPositiveReviewerSettlement(reviewer(childState(null, "SIGTERM"), terminal(null, "SIGTERM"), terminal(null, "SIGTERM"))),
+    true,
+    "a matching positive signal close must authorize fixture removal",
+  );
 });
 
 test("/review-cancel stops an active automatic review and reports when no review is active", async () => {

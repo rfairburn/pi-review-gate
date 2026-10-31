@@ -24,9 +24,14 @@ dates.
   its spawn matcher, captures the first matching `process.execPath -e <script>` child,
   and requires the published PID file to contain that child's complete positive integer
   PID rather than checking numeric-PID liveness alone. Cancellation liveness and
-  settlement are read from the owned child's own exit and close events, and fixture
-  cleanup signals only that child while it is still live and removes the fixture only
-  after positive close. Reviewer acknowledgement and completion notice ordering,
+  settlement are read from the owned child's own exit and close events. One canonical
+  positive-settlement proof — matching positive exit-code or signal close evidence
+  against that child's own terminal state and observed exit — gates both the
+  post-cancellation wait and fixture cleanup, so a missing capture or unknown,
+  non-positive, or inconsistent close preserves the fixture rather than authorizing
+  its removal; cleanup signals only the exact child while it is still live. A small
+  synthetic control covers those positive and negative settlement decisions without
+  spawning a process. Reviewer acknowledgement and completion notice ordering,
   release/modified-Escape non-cancellation, cancellation tombstone and resumption
   assertions, and product cancellation, ownership, and settlement contracts are
   unchanged; this is a test-only change.

@@ -123,6 +123,24 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
   recovery notification cancels the watch; another checkpoint must be explicitly
   rearmed, so this never becomes a polling loop or recurring heartbeat.
 
+  A checkpoint is also re-checked when the parent session's model actually reads it,
+  not only when its deadline fires (#452). A checkpoint that was still valid when it
+  was queued can become obsolete before it is consumed: the last active task settles,
+  a new `SubtasksWatch` replaces that generation, an actionable notification retires
+  it while a sibling is still active, or Pi drains the queued notification into an
+  aborted run's teardown without any provider request. In each of those cases the
+  obsolete "work remains active" content is withheld from the model request instead of
+  being presented as current, and Pi's append-only context edit records the omission
+  for future context only: the stored notification entry keeps its original text, and
+  the transcript, rendering, and exports are unchanged. A checkpoint the model did
+  read stays in history untouched, other notifications are never altered, and an
+  unverifiable checkpoint of this type fails closed to omission rather than assertion.
+
+  The precise limit is the wake itself: once the notification has been queued to the
+  parent session, Pi owns the triggered turn, and no extension API dequeues it. A
+  suppressed checkpoint therefore still costs one model turn; what is guaranteed is
+  that the turn never sees an obsolete active-work claim.
+
 User analogs are available as `/subtasks` and the `/subtask-*` commands for inspect,
 add, steer, interrupt, force-merge, and mark-clean. The commands that accept explicit
 handles (inspect, steer, interrupt, and force-merge) also open interactive pickers when

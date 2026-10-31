@@ -474,6 +474,129 @@ export function formatWatchEvent(inspections: SubtaskWatchInspectionSnapshot[], 
   return lines.join("\n");
 }
 
+// ── Watch-checkpoint consumption identity and content projection (#452) ─────
+
+/** The custom message type of every one-shot watch checkpoint delivery. */
+export const SUBTASK_WATCH_CUSTOM_TYPE = "pi-review-subtask-watch";
+
+/**
+ * Issue #452 residual: the model-invisible identity stamped on one watch
+ * checkpoint delivery, one entry per coalesced execution. `watchId` is an
+ * opaque id unique per arm (never a timestamp, so millisecond collisions
+ * cannot confuse two generations), and `originToken` is the owning watch
+ * store's opaque origin, rotated at the actual detach/reset boundary. Pi never
+ * sends `details` to the model, so this identity costs the model nothing while
+ * it makes one queued checkpoint's exact generation decidable at consumption
+ * time — the window the fire-time `activeCount === 0` check cannot cover.
+ */
+export interface SubtaskWatchDeliveryIdentity {
+  executionId: string;
+  watchId: string;
+  originId: string;
+  originToken: string;
+  armedAt: string;
+  dueAt: string;
+}
+
+/**
+ * The per-execution identities carried by a built-context watch message or a
+ * persisted `custom_message` entry (both hold the same `details`). Returns
+ * undefined when the carrier is not a well-formed watch payload; callers must
+ * then treat their own checkpoint type as unverifiable rather than guess.
+ */
+export function subtaskWatchIdentitiesOf(carrier: unknown): SubtaskWatchDeliveryIdentity[] | undefined {
+  if (!isWatchRecord(carrier) || carrier.customType !== SUBTASK_WATCH_CUSTOM_TYPE) return undefined;
+  const details = isWatchRecord(carrier.details) ? carrier.details : undefined;
+  const watches = details?.watches;
+  if (!Array.isArray(watches) || watches.length === 0) return undefined;
+  const identities = watches.filter(isWatchIdentityRecord);
+  return identities.length === watches.length ? identities : undefined;
+}
+
+/** True for a message of this gate's watch checkpoint type (identity or not). */
+export function isSubtaskWatchMessage(message: unknown): boolean {
+  return isWatchRecord(message) && message.customType === SUBTASK_WATCH_CUSTOM_TYPE;
+}
+
+/** One parsed per-execution block of a rendered checkpoint. */
+export interface SubtaskWatchContentBlock {
+  executionId: string;
+  lines: string[];
+}
+
+/**
+ * Split the deliberate checkpoint text into its preamble and its
+ * per-execution blocks, using this module's own block header shape. Returns
+ * undefined when the text is not this formatter's own render, so a caller
+ * omits the whole message instead of guessing at foreign text.
+ */
+export function splitSubtaskWatchContent(content: string): { preamble: string[]; blocks: SubtaskWatchContentBlock[] } | undefined {
+  if (!content.includes("[pi-review-subtask-watch]")) return undefined;
+  const lines = content.split("\n");
+  const starts: number[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (WATCH_BLOCK_HEADER.test(lines[index]!)) starts.push(index);
+  }
+  if (starts.length === 0) return undefined;
+  const blocks: SubtaskWatchContentBlock[] = [];
+  const executionIds = new Set<string>();
+  for (let position = 0; position < starts.length; position += 1) {
+    const from = starts[position]!;
+    const to = position + 1 < starts.length ? starts[position + 1]! : lines.length;
+    const header = WATCH_BLOCK_HEADER.exec(lines[from]!);
+    // Task titles/activity can contain newlines. A header-shaped line inside
+    // an obsolete block must not masquerade as another retained execution.
+    if (!header || executionIds.has(header[1]!)) return undefined;
+    executionIds.add(header[1]!);
+    blocks.push({ executionId: header[1]!, lines: lines.slice(from, to) });
+  }
+  return { preamble: lines.slice(0, starts[0]!), blocks };
+}
+
+/**
+ * Rebuild a coalesced checkpoint with only the still-valid per-execution
+ * blocks, reusing the original rendered snapshot verbatim and this formatter's
+ * own leading sentences for the retained count. Keeping every block returns
+ * the original text byte for byte, so the projection is idempotent across
+ * repeated context builds. Returns undefined when nothing is retained.
+ */
+export function retainSubtaskWatchExecutions(content: string, keptExecutionIds: readonly string[]): string | undefined {
+  const split = splitSubtaskWatchContent(content);
+  if (!split) return undefined;
+  const kept = split.blocks.filter((block) => keptExecutionIds.includes(block.executionId));
+  if (kept.length === 0) return undefined;
+  if (kept.length === split.blocks.length) return content;
+  const preamble = split.preamble.slice();
+  while (preamble.length > 0 && preamble[preamble.length - 1] === "") preamble.pop();
+  if (preamble.length >= 2) {
+    preamble[1] = kept.length === 1
+      ? `The requested one-shot checkpoint for execution ${kept[0]!.executionId} is due while work remains active.`
+      : `${kept.length} requested one-shot subtask checkpoints became due together while work remains active.`;
+  }
+  const body: string[] = [];
+  for (const block of kept) {
+    body.push("");
+    body.push(...block.lines);
+  }
+  return [...preamble, ...body].join("\n");
+}
+
+const WATCH_BLOCK_HEADER = /^(?:Research|In-place|Execution) (\S+): \d+ active task\(s\), revision /;
+
+function isWatchIdentityRecord(value: unknown): value is SubtaskWatchDeliveryIdentity {
+  if (!isWatchRecord(value)) return false;
+  return typeof value.executionId === "string" && value.executionId.length > 0
+    && typeof value.watchId === "string" && value.watchId.length > 0
+    && typeof value.originId === "string" && value.originId.length > 0
+    && typeof value.originToken === "string" && value.originToken.length > 0
+    && typeof value.armedAt === "string"
+    && typeof value.dueAt === "string";
+}
+
+function isWatchRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function formatElapsed(milliseconds: number): string {
   const seconds = Math.max(0, Math.round(milliseconds / 1000));
   if (seconds < 60) return `${seconds}s`;

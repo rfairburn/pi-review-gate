@@ -183,6 +183,8 @@ interface ExecutionToolManagerInput {
   submittedFingerprintFor?: SubmittedToolCallFingerprint;
   /** Internal outcome signal for explicit returned errors from owned native tools. */
   onNativeToolError?: (toolCallId: string, toolName: string) => void;
+  /** #452 residual: live exact session-persistence identity of the owning session. */
+  sessionOriginId?: () => string | undefined;
 }
 
 interface CommandUi {
@@ -384,6 +386,20 @@ export class ExecutionToolManager {
   /** Issue #26: unsettled scheduled runs of one entry (overlap detection). */
   scheduledRuns(scheduledTaskId: string): ReturnType<BackgroundExecutionController["scheduledRuns"]> {
     return this.controller.scheduledRuns(scheduledTaskId);
+  }
+
+  /** #452 residual: read-only watch-consumption projections of the controller's
+   * single canonical watch lifecycle store, for the top-level session hooks. */
+  watchConsumptionFilter(messages: readonly unknown[], projectionEntries: readonly unknown[] = []): { messages?: unknown[] } {
+    return this.controller.watchConsumptionFilter(messages, projectionEntries);
+  }
+
+  watchContextEditDrafts(branchEntries: readonly unknown[]): Array<{ type: "context_edit"; targetId: string; replacement: { content: string } | null }> {
+    return this.controller.watchContextEditDrafts(branchEntries);
+  }
+
+  retireUnconsumedWatchGenerations(): void {
+    this.controller.retireUnconsumedWatchGenerations();
   }
 
   startLiveness(fingerprint: string): StartLiveness {

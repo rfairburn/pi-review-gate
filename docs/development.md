@@ -214,6 +214,45 @@ picker/input steer in model contexts before natural stop, with an in-flight comm
 finishing normally. It uses no provider credentials or external model; this POSIX
 headless evidence is not a physical-terminal, live-provider, or Windows result.
 
+### Subtask watch checkpoint consumption (#452)
+
+`tests/watch-consumption-guard.test.ts` (after `npm run build:test`) covers the
+consume-side freshness decision against the single canonical watch lifecycle store:
+one opaque generation identity per execution on a coalesced delivery, withholding
+when the work settled, when an actionable wake retired the generation while a
+sibling stayed active, when a rearm superseded it, and when the session/origin
+binding no longer matches; retention of a genuinely consumed checkpoint; untouched
+unrelated notification types; fail-closed omission for an unverifiable payload of
+this type, with its durable omission targeted by the exact native session entry
+captured from Pi's session projection provenance rather than by rendered text
+(identical consumed and pending checkpoints are therefore handled independently,
+and each identical pending entry gets its own edit); idempotent per-execution
+content projection; retention of a pending
+pre-identity checkpoint's consumed history with a durable omission for its
+unverifiable pending form; and the exactly-once append-only boundary draft, which
+a later stronger edit can strengthen (partial projection then full omission)
+instead of being frozen by the first edit. It also asserts the unchanged delivery
+lane and the unchanged checkpoint text, so a blanket-suppressing change fails here.
+
+With the installed-Pi and scratch candidate environment described above,
+`tests/pi-native-watch-consumption.test.ts` drives a real `pi --mode rpc` agent
+loop with three real admitted subtasks (local `run-as-binary` executors held and
+released per worker, no provider credentials) and a scripted provider that journals
+every model request. It proves the checkpoint reaching a provider request while work
+is active; that a checkpoint whose work canonically settled while the steered
+content was still queued never re-asserts active work in the drain request that
+carries its completion notification; that a notification drained into an aborted
+run's teardown (no provider request) never re-asserts active work in the recovery
+run's model contexts, with the held worker proving the work stayed active; and that
+the raw `custom_message` entries keep their original text while only the
+never-consumed entries are omitted from future context by a `context_edit` with
+`replacement: null`, leaving the consumed entry intact. Running the same file
+against the unpatched base candidate reproduces both stale assertions, so neither
+native scenario is vacuous. This is POSIX headless evidence on the installed Pi
+1.x runtime; it is not a physical-terminal, live-provider, or Windows result, and
+it does not claim the already-triggered wake itself was withdrawn — that turn still
+runs, because no public extension API dequeues a queued notification.
+
 ### SessionSpawn long-prompt acceptance (#447)
 
 The focused cases in `tests/session-host-spawn-tool.test.ts` and

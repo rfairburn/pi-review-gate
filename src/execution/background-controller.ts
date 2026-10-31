@@ -362,6 +362,14 @@ interface BackgroundControllerInput {
    * non-scheduled groups or for failures before delivery.
    */
   onScheduledDispatchRecorded?: (scheduledTaskId: string) => void;
+  /**
+   * Issue #452 residual: the live exact session-persistence identity of the
+   * owning session, evaluated per use (never captured), exactly like the
+   * human-command origin guard reads it. An armed watch binds to it; an
+   * unavailable identity suppresses this origin's own pending checkpoint
+   * instead of falling back across sessions.
+   */
+  sessionOriginId?: () => string | undefined;
   faults?: BackgroundFaultHooks;
   /**
    * Deterministic test seam: when set, `launch` invokes this runner instead of
@@ -474,6 +482,16 @@ export interface BackgroundWatchSubscription {
   armedAt: string;
   dueAt: string;
   replaced: boolean;
+  /**
+   * Issue #452 residual: opaque id unique to this arm, carried on the
+   * delivered checkpoint so consumption-time freshness can be decided against
+   * the canonical watch store without a second registry. `originId` is the
+   * exact session-persistence identity of the arming session and `originToken`
+   * the store's opaque origin, rotated at the real detach/reset boundary.
+   */
+  watchId: string;
+  originId: string;
+  originToken: string;
 }
 
 export interface BackgroundReviewReadinessTask {
@@ -715,6 +733,7 @@ export class BackgroundExecutionController {
       schedulingSnapshot: (group, releasingTask) => this.schedulingSnapshot(group, releasingTask),
       inspect: (executionId) => this.inspect(executionId),
       gateForTask: (executionId, taskId) => this.gateForTask(executionId, taskId),
+      sessionOriginId: () => this.input.sessionOriginId?.(),
     });
     // Narrow per-kind lifecycle capabilities (no host bag): the extracted
     // runners receive exactly the members their deps interfaces declare,
@@ -2683,6 +2702,30 @@ export class BackgroundExecutionController {
     // The armed subscription, its timer, and queued checkpoint inspections
     // live in ./wake-delivery (Issue #222 sequencing owned there).
     return this.wakes.armWatch(group.executionId, afterMs);
+  }
+
+  /**
+   * Issue #452 residual (read-only projections of the ONE canonical watch
+   * lifecycle store in ./wake-delivery; this controller keeps admission and
+   * every authoritative record):
+   *
+   * `watchConsumptionFilter` re-decides each queued watch checkpoint of one
+   * built model request against canonical state at consumption time;
+   * `watchContextEditDrafts` returns Pi's supported append-only boundary
+   * drafts that make a suppression durable for FUTURE context while raw
+   * history, UI, and exports stay unchanged; `retireUnconsumedWatchGenerations`
+   * retires fired-but-unconsumed checkpoints when a run ended aborted.
+   */
+  watchConsumptionFilter(messages: readonly unknown[], projectionEntries: readonly unknown[] = []): { messages?: unknown[] } {
+    return this.wakes.filterWatchCheckpointsForConsumption(messages, projectionEntries);
+  }
+
+  watchContextEditDrafts(branchEntries: readonly unknown[]): Array<{ type: "context_edit"; targetId: string; replacement: { content: string } | null }> {
+    return this.wakes.watchOmissionEntryDrafts(branchEntries);
+  }
+
+  retireUnconsumedWatchGenerations(): void {
+    this.wakes.retireUnconsumedWatchGenerations();
   }
 
   reviewReadiness(): BackgroundReviewReadinessTask[] {

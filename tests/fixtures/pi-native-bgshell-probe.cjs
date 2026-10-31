@@ -166,6 +166,10 @@ module.exports = async function (pi) {
 			requestIndex: index,
 			stepsAvailable: steps.length,
 			transcriptTail: context.messages.slice(-4).map(previewMessage),
+			// A wider window for consumers of model context: several
+			// notifications can drain in one batch, pushing the entries that
+			// matter outside the last four messages.
+			transcriptPreview: context.messages.slice(-16).map(previewMessage),
 		});
 		return stepToMessage(steps[index], index);
 	}

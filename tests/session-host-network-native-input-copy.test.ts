@@ -20,6 +20,7 @@ import { delimiter, dirname, join } from "node:path";
 import test, { after } from "node:test";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import { visibleWidth } from "pi-session-host-tui";
 
 import { createStatusBroker } from "../src/session-host/broker";
 import { translateInput } from "../src/session-host/input";
@@ -194,6 +195,24 @@ const PROOF_PREFIX = "/input-proof ";
 /** The clipboard commands Pi 1.4.0 may spawn; all must be owned recorders. */
 const CLIPBOARD_COMMANDS = ["pbcopy", "xclip", "xsel", "wl-copy", "termux-clipboard-set"] as const;
 const SAVED_SESSION_ID = "0672e0a1-4a1f-7c31-9b2a-1f4c9d0000c1";
+
+/**
+ * Where a drawn text run ENDS, in viewport frame cells.
+ *
+ * The native frame serializer emits a wide cell as one character and skips its
+ * zero-width continuation, so a string index is not a frame column; both
+ * offsets are measured with `visibleWidth`. The expectation comes from the
+ * frame that actually shows the text, never from an assumed editor layout, so a
+ * stale or invented cursor position cannot satisfy it.
+ */
+function drawnTextEnd(lines: readonly string[], text: string): { column: number; row: number } | undefined {
+  for (let row = 0; row < lines.length; row += 1) {
+    const index = lines[row]!.indexOf(text);
+    if (index < 0) continue;
+    return { column: visibleWidth(lines[row]!.slice(0, index)) + visibleWidth(text), row };
+  }
+  return undefined;
+}
 
 /**
  * Exactly 75,000 ASCII bytes of curated assistant text: a 13-byte head marker,
@@ -753,9 +772,26 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const externalBody = "NETEDIT499-λ-雪";
     const externalDraft = `/input-proof ${externalBody}`;
     const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
+    /*
+     * Generic cursor evidence for the configured non-Vim editor. Absolute CUP
+     * placement and DECTCEM cursor-show are ordinary VT sequences ANY configured
+     * editor may emit, so the remote display-seam cursor observations below never
+     * depend on editor-specific strings. The gate leaf only lets this test choose
+     * WHEN the editor performs its own cursor navigation; it never changes the
+     * bytes the editor consumes or writes back, and the host never forces a
+     * cursor visible or draws a substitute for one.
+     */
+    const externalCursorGate = join(root, "network-editor-cursor-gate");
+    const editorCursorHome = { column: 4, row: 2 };
+    const editorCursorMoved = { column: 8, row: 5 };
     writeFileSync(externalEditor, `#!/bin/sh
 /bin/stty raw -echo
-printf '\\033[2J\\033[HEDITOR499_READY'
+printf '\\033[2J\\033[H\\033[?25hEDITOR499_READY'
+printf '\\033[3;5H'
+waited=0
+while [ ! -f ${shellQuote(externalCursorGate)} ] && [ "$waited" -lt 200 ]; do /bin/sleep 0.1; waited=$((waited+1)); done
+if [ ! -f ${shellQuote(externalCursorGate)} ]; then exit 18; fi
+printf '\\033[6;9H'
 /bin/dd bs=1 count=${Buffer.byteLength(externalDraft, "utf8")} of="$1" 2>/dev/null
 status=$?
 if [ "$status" -ne 0 ]; then exit "$status"; fi
@@ -1412,6 +1448,12 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
        * This is real same-host TLS + PTY evidence, not physical SSH/Main input.
        * ------------------------------------------------------------------ */
       leg = "network viewer production Ctrl+G external-editor handoff";
+      // Pi's own native cursor before the handoff, read from the same viewport
+      // frame the viewer renders. `TerminalFrame.cursor` is the only cursor the
+      // viewer is shown, and this test keeps no parallel copy of it.
+      const beforeHandoffSnapshot = liveViewer.readSnapshot();
+      assert.ok(beforeHandoffSnapshot, "the viewer holds a viewport before the editor handoff");
+      const beforeHandoffCursor = beforeHandoffSnapshot.frame.cursor;
       const beforeExternal = gestureSource();
       const externalOpen = await liveViewer.sendInput({
         source: beforeExternal.source, inputModes: beforeExternal.modes, kind: "keyboard", text: "\x07",
@@ -1420,6 +1462,60 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       await signal.waitFor(() => frameText(liveViewer.readSnapshot()!.frame).includes("EDITOR499_READY")
         && currentModes().bracketedPaste === false, 20_000,
       "the remote viewport observes the configured non-Node editor and its own input modes");
+      /* -------------------------------------------------------------- *
+       * Native cursor ENTRY for a generic configured editor.
+       *
+       * The observations below read the SAME `TerminalFrame.cursor` the
+       * product protocol carries to the viewer — the editor's own DECTCEM and
+       * CUP state, without a viewer compositor at this seam. No Vim-specific string,
+       * no forced visibility, and no second cursor representation exists here:
+       * the viewport frame carries exactly one cursor field.
+       * -------------------------------------------------------------- */
+      await signal.waitFor(() => {
+        const snapshot = liveViewer.readSnapshot();
+        return snapshot !== undefined && snapshot.frame.cursor.visible
+          && snapshot.frame.cursor.column === editorCursorHome.column
+          && snapshot.frame.cursor.row === editorCursorHome.row;
+      }, 20_000, "the configured editor's own cursor sequences reach the remote viewport as its native cursor");
+      const editorSnapshot = liveViewer.readSnapshot();
+      assert.ok(editorSnapshot, "the viewer holds the editor's viewport");
+      assert.deepEqual(Object.keys(editorSnapshot.frame).filter((key) => key.toLowerCase().includes("cursor")), ["cursor"],
+        "the viewport frame carries one cursor authority, never parallel cursor state");
+      assert.deepEqual({
+        column: editorSnapshot.frame.cursor.column,
+        row: editorSnapshot.frame.cursor.row,
+        visible: editorSnapshot.frame.cursor.visible,
+      }, { column: editorCursorHome.column, row: editorCursorHome.row, visible: true },
+        `the generic editor's native cursor sits at its own edit position (Pi's was ${JSON.stringify(beforeHandoffCursor)})\nActual remote viewport:\n${frameText(editorSnapshot.frame)}`);
+      // The published viewport carries the owner's own cursor, not a second one
+      // the host maintains. The editor is blocked reading its input here, so the
+      // owner's surface cannot move between the two reads.
+      const ownerSurface = liveManager.surface(rowId);
+      assert.ok(ownerSurface, "the owner still holds this row's native surface");
+      assert.deepEqual({
+        column: editorSnapshot.frame.cursor.column,
+        row: editorSnapshot.frame.cursor.row,
+        visible: editorSnapshot.frame.cursor.visible,
+      }, {
+        column: ownerSurface.frame().cursor.column,
+        row: ownerSurface.frame().cursor.row,
+        visible: ownerSurface.frame().cursor.visible,
+      }, "the remote viewport shows exactly the owner's native cursor state, with no host-side cursor of its own");
+      assert.equal(frameText(editorSnapshot.frame).includes("EDITOR499_READY"), true,
+        "the cursor belongs to the frame that actually shows the configured editor");
+      // The gate releases the editor's OWN navigation, so the next cursor
+      // position is observed while the editor still owns the terminal.
+      writeFileSync(externalCursorGate, "move", { mode: 0o600, flag: "wx" });
+      await signal.waitFor(() => {
+        const snapshot = liveViewer.readSnapshot();
+        return snapshot !== undefined && snapshot.frame.cursor.visible
+          && snapshot.frame.cursor.column === editorCursorMoved.column
+          && snapshot.frame.cursor.row === editorCursorMoved.row;
+      }, 20_000, "the configured editor's own cursor navigation moves the native cursor the remote viewport shows");
+      const navigatedSnapshot = liveViewer.readSnapshot();
+      assert.ok(navigatedSnapshot, "the viewer holds the navigated editor viewport");
+      assert.equal(frameText(navigatedSnapshot.frame).includes("EDITOR499_READY"), true,
+        "the navigated cursor stays inside the configured editor's own viewport");
       const editorSource = gestureSource();
       const editorKeys = await liveViewer.sendInput({
         source: editorSource.source, inputModes: editorSource.modes, kind: "keyboard", text: "/input-proof ",
@@ -1460,6 +1556,18 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
         digest: createHash("sha256").update(externalDraft, "utf8").digest("hex"),
         bytes: Buffer.byteLength(externalDraft, "utf8"),
       }, "the child itself observes the exact returned draft, not a stale viewport");
+      // Modes can recover before Pi's redraw is published. Read the cursor only
+      // after both native input readiness and a viewport drawing the returned draft.
+      await signal.waitFor(() => {
+        const snapshot = liveViewer.readSnapshot();
+        return snapshot !== undefined && drawnTextEnd(snapshot.frame.lines, externalBody) !== undefined
+          && !snapshot.frame.cursor.visible;
+      }, 20_000, "the returned native editor publishes its restored draft and own hidden cursor");
+      const returnedSnapshot = liveViewer.readSnapshot()!;
+      const returnedDraftEnd = drawnTextEnd(returnedSnapshot.frame.lines, externalBody)!;
+      assert.deepEqual(returnedSnapshot.frame.cursor,
+        { column: returnedDraftEnd.column, row: returnedDraftEnd.row, visible: false },
+        "the viewport carries Pi's native cursor at the returned draft, not the exiting editor's cursor");
       await signal.waitFor(viewerModesMatchOwner, 20_000, "the written viewer modes agree before the one submit");
       const afterExternal = gestureSource();
       const priorEnters = new Set(viewerDispatchesOf(Buffer.from("\r", "utf8")));

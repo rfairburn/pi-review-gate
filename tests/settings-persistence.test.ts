@@ -3,7 +3,12 @@ import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { DEFAULT_BROWSER_PERMISSIONS, normalizeConfig } from "../src/config";
+import {
+  DEFAULT_BROWSER_PERMISSIONS,
+  normalizeConfig,
+  type ScheduledTaskCatalog,
+  type WorkerResourceCatalog,
+} from "../src/config";
 import { persistReviewSettings, persistSubtasksViewPreference, updateReviewGateConfig, type ReviewSettingsSelection } from "../src/settings/persistence";
 
 const selection: ReviewSettingsSelection = {
@@ -260,6 +265,119 @@ test("a non-catalog preference save persists keyed catalogs in normalized canoni
     assert.deepEqual(saved.customFutureKey, { keep: true });
     assert.equal(saved.ui.subtasksViewExpanded, true);
     assert.deepEqual(normalizeConfig(saved), normalized);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a disabled scheduled research entry saves with a removed worker pin", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-scheduled-research-off-"));
+  const configPath = join(dir, "config.json");
+  try {
+    await writeFile(configPath, '{"enabled":true}\n', "utf8");
+    const disabledResearch: ScheduledTaskCatalog = {
+      "task-research-off": {
+        name: "Disabled research",
+        cron: "0 9 * * *",
+        enabled: false,
+        kind: "research",
+        instructions: "Summarize the release notes",
+        workspace: dir,
+        workerResourceId: "removed-worker",
+      },
+    };
+    const saved = await persistReviewSettings(configPath, { ...selection, scheduledTasks: disabledResearch });
+    assert.deepEqual(saved.scheduledTasks, disabledResearch);
+    const persisted = JSON.parse(await readFile(configPath, "utf8"));
+    assert.deepEqual(persisted.scheduledTasks, disabledResearch);
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("enabled scheduled research entries still refuse missing or incapable worker pins without writing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-scheduled-research-enabled-"));
+  const configPath = join(dir, "config.json");
+  const workerResources: WorkerResourceCatalog = {
+    "binary-worker": { selection: { source: "external", id: "binary-only" }, maxConcurrent: 1 },
+  };
+  try {
+    await writeFile(configPath, JSON.stringify({
+      enabled: true,
+      externalAgents: {
+        "binary-only": {
+          adapter: "run-as-binary",
+          command: "runner",
+          execution: { protocol: "pi-review-executor-jsonl-v1" },
+        },
+      },
+      execution: { workerResources },
+    }));
+    const before = await readFile(configPath, "utf8");
+    const research: ScheduledTaskCatalog[string] = {
+      name: "Enabled research",
+      cron: "0 9 * * *",
+      enabled: true,
+      kind: "research",
+      instructions: "Summarize the release notes",
+      workspace: dir,
+      workerResourceId: "removed-worker",
+    };
+    await assert.rejects(
+      persistReviewSettings(configPath, { ...selection, scheduledTasks: { task: research } }),
+      /scheduledTasks\.task references unknown worker resource removed-worker/,
+    );
+    assert.equal(await readFile(configPath, "utf8"), before);
+
+    const { enabled: _enabled, ...withoutEnabled } = research;
+    await assert.rejects(
+      persistReviewSettings(configPath, { ...selection, scheduledTasks: { task: withoutEnabled as ScheduledTaskCatalog[string] } }),
+      /scheduledTasks\.task references unknown worker resource removed-worker/,
+    );
+    assert.equal(await readFile(configPath, "utf8"), before);
+
+    await assert.rejects(
+      persistReviewSettings(configPath, {
+        ...selection,
+        workerResources,
+        scheduledTasks: { task: { ...research, workerResourceId: "binary-worker" } },
+      }),
+      /scheduledTasks\.task worker resource is not research-capable: binary-worker/,
+    );
+    assert.equal(await readFile(configPath, "utf8"), before);
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a disabled scheduled entry still refuses an invalid selected external reviewer", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-scheduled-reviewer-off-"));
+  const configPath = join(dir, "config.json");
+  try {
+    await writeFile(configPath, '{"enabled":true}\n', "utf8");
+    const before = await readFile(configPath, "utf8");
+    await assert.rejects(
+      persistReviewSettings(configPath, {
+        ...selection,
+        scheduledTasks: {
+          "task-review-off": {
+            name: "Disabled reviewed research",
+            cron: "0 9 * * *",
+            enabled: false,
+            kind: "research",
+            instructions: "Summarize the release notes",
+            workspace: dir,
+            workerResourceId: "removed-worker",
+            review: { mode: "selected", reviewers: [{ source: "external", id: "missing-reviewer" }] },
+          },
+        },
+      }),
+      /A selected external reviewer no longer supports review on disk/,
+    );
+    assert.equal(await readFile(configPath, "utf8"), before);
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

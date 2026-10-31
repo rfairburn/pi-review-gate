@@ -363,10 +363,23 @@ export function extractWebPage(html: string, url: string): ExtractedWebPage {
   };
 }
 
+/**
+ * Canonical identity for a rejected `columns` argument (issue #534): selector
+ * syntax, the projection target, unsupported document types, and duplicate
+ * selection are argument-validation failures, never acquisition failures. Tool
+ * recovery guidance keys off this class instead of re-reading diagnostic text.
+ */
+export class ColumnProjectionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ColumnProjectionError";
+  }
+}
+
 export function renderWebPage(page: ExtractedWebPage, index: number, maxChars: number, columns?: string[]): RenderedWebPage {
   if (!Number.isInteger(index) || index < 0) throw new Error("index must be a non-negative integer.");
   if (page.blocks.length === 0) {
-    if (columns) throw new Error("columns can only be used when index points directly to a table block.");
+    if (columns) throw new ColumnProjectionError("columns can only be used when index points directly to a table block.");
     if (index !== 0) throw new Error("This page has no readable block at the requested index.");
     return { content: "", startIndex: 0, endIndex: 0, totalBlocks: 0 };
   }
@@ -408,11 +421,11 @@ interface ResolvedColumnProjection {
 
 function resolveColumnProjection(block: WebPageBlock, selectors: string[]): ResolvedColumnProjection {
   if (block.kind !== "table" || !block.tableId || !block.tableHeaders || !block.tableRows) {
-    throw new Error("columns can only be used when index points directly to a table block.");
+    throw new ColumnProjectionError("columns can only be used when index points directly to a table block.");
   }
-  if (selectors.length === 0) throw new Error("columns must contain at least one selector.");
+  if (selectors.length === 0) throw new ColumnProjectionError("columns must contain at least one selector.");
   const indexes = selectors.map((selector) => resolveColumnSelector(block.tableHeaders!, selector));
-  if (new Set(indexes).size !== indexes.length) throw new Error("columns must not select the same table column more than once.");
+  if (new Set(indexes).size !== indexes.length) throw new ColumnProjectionError("columns must not select the same table column more than once.");
   return {
     tableId: block.tableId,
     tableLabel: block.tableLabel ?? block.tableId,
@@ -423,11 +436,11 @@ function resolveColumnProjection(block: WebPageBlock, selectors: string[]): Reso
 
 function resolveColumnSelector(headers: string[], rawSelector: string): number {
   const selector = rawSelector.trim();
-  if (!selector) throw new Error("column selectors must be non-empty strings.");
+  if (!selector) throw new ColumnProjectionError("column selectors must be non-empty strings.");
   const ordinal = /^#([1-9]\d*)$/.exec(selector);
   if (ordinal) {
     const index = Number(ordinal[1]) - 1;
-    if (index >= headers.length) throw new Error(`column selector ${JSON.stringify(selector)} is beyond the final column #${headers.length}.`);
+    if (index >= headers.length) throw new ColumnProjectionError(`column selector ${JSON.stringify(selector)} is beyond the final column #${headers.length}. ${describeColumnSelectors(headers)}`);
     return index;
   }
   const normalized = normalizeHeader(selector);
@@ -435,11 +448,21 @@ function resolveColumnSelector(headers: string[], rawSelector: string): number {
     .map((header, index) => normalizeHeader(header) === normalized ? index : -1)
     .filter((index) => index >= 0);
   if (matches.length === 1) return matches[0]!;
-  const available = headers.map((header, index) => `#${index + 1} ${header}`).join("; ");
   if (matches.length > 1) {
-    throw new Error(`column selector ${JSON.stringify(selector)} is ambiguous; use a numbered selector. Available columns: ${available}`);
+    throw new ColumnProjectionError(`column selector ${JSON.stringify(selector)} is ambiguous; use a numbered selector. ${describeColumnSelectors(headers)}`);
   }
-  throw new Error(`unknown column selector ${JSON.stringify(selector)}. Available columns: ${available}`);
+  throw new ColumnProjectionError(`unknown column selector ${JSON.stringify(selector)}. ${describeColumnSelectors(headers)}`);
+}
+
+/**
+ * The one rendering of the selectable columns used by every column-selection
+ * error. The copyable selector value is quoted apart from the header label it
+ * selects, because `#1 City[a]` reads like a single option but is not a selector
+ * the grammar accepts (issue #534).
+ */
+function describeColumnSelectors(headers: string[]): string {
+  const alternatives = headers.map((header, index) => `"#${index + 1}" for header ${JSON.stringify(header)}`).join("; ");
+  return `Available columns: ${alternatives}. Copy one value exactly — a standalone "#N" ordinal or the exact header text; an ordinal and its header combined is not a selector.`;
 }
 
 function normalizeHeader(value: string): string {

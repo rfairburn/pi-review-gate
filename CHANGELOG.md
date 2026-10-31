@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.228]
+## [0.1.0-dev.229]
 
 ### Changed
 
@@ -29,6 +29,28 @@ dates.
 - **Native PTY test fixture preservation** (#502): retain the owned fixture when child
   exit remains unconfirmed instead of removing it after disposal alone. Existing native
   input and shutdown assertions remain in place.
+
+## [0.1.0-dev.228]
+
+### Fixed
+
+- **Table-column errors advertise selector values that can actually be copied** (#534): a
+  rejected `columns` selector listed the available columns as `#1 City[a]`, which is not a
+  selector the tool accepts, so copying a displayed option produced another invalid
+  request. Column-selection errors now keep the copyable value visibly separate from the
+  label — each alternative reads `"#1" for header "City[a]"` — and state the supported
+  grammar: a standalone `#N` ordinal or the exact header text, never the two combined. The
+  same shared diagnostic backs the unknown-selector, ambiguous-header, and
+  beyond-the-final-column messages, so tables with duplicated or reference-marked headers
+  keep numbered alternatives that work when copied. A rejected `columns` argument at the
+  `WebFetch` error seam now directs recovery to correcting `columns` for the requested
+  document — malformed argument shapes are caught before any acquisition and selector
+  problems after it — instead of suggesting a different source or BrowserExtract, because an
+  argument failure is not evidence that the page needs browser rendering; real acquisition
+  failures keep their existing browser-rendering guidance unchanged, including when
+  `columns` was supplied. Selector grammar, case-insensitive exact-header matching,
+  requested column order, duplicate-selection rejection, and table projection semantics are
+  unchanged, and no combined ordinal/header syntax was added.
 
 ## [0.1.0-dev.227]
 

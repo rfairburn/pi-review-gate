@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { WebFetchConfig } from "../config";
 import type { BrowserOmissions } from "./network";
 import { downloadText } from "./network";
-import { extractFetchedDocument, findInWebPage, renderWebPage, type ExtractedWebPage, type RenderedWebPage, type WebPageFindResult } from "./page";
+import { ColumnProjectionError, extractFetchedDocument, findInWebPage, renderWebPage, type ExtractedWebPage, type RenderedWebPage, type WebPageFindResult } from "./page";
 import { extractPdfDocument, isPdfResponse } from "./pdf";
 
 interface CacheEntry {
@@ -83,9 +83,9 @@ export class WebPageCache {
     entry.lastAccessedAt = Date.now();
     const maxChars = Math.max(1_000, Math.min(input.maxChars ?? this.config.maxOutputChars, this.config.maxOutputChars));
     const requestedIndex = input.index ?? 0;
-    if (input.find && input.columns) throw new Error("find and columns cannot be used together; find the table first, then fetch its index with columns.");
+    if (input.find && input.columns) throw new ColumnProjectionError("find and columns cannot be used together; find the table first, then fetch its index with columns.");
     if (input.columns && entry.page.documentType === "pdf") {
-      throw new Error("columns are not available for PDF documents; use find and index to locate and read page-aware text blocks.");
+      throw new ColumnProjectionError("columns are not available for PDF documents; use find and index to locate and read page-aware text blocks.");
     }
     const found = input.find ? findInWebPage(entry.page, input.find, requestedIndex) : undefined;
     const rendered = found

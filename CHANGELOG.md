@@ -15,6 +15,22 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.231]
+
+### Changed
+
+- **Escape-cancellation regression case observes its exact reviewer child** (#502): the
+  fixture now uses one canonical reviewer script for both the configured reviewer and
+  its spawn matcher, captures the first matching `process.execPath -e <script>` child,
+  and requires the published PID file to contain that child's complete positive integer
+  PID rather than checking numeric-PID liveness alone. Cancellation liveness and
+  settlement are read from the owned child's own exit and close events, and fixture
+  cleanup signals only that child while it is still live and removes the fixture only
+  after positive close. Reviewer acknowledgement and completion notice ordering,
+  release/modified-Escape non-cancellation, cancellation tombstone and resumption
+  assertions, and product cancellation, ownership, and settlement contracts are
+  unchanged; this is a test-only change.
+
 ## [0.1.0-dev.230]
 
 ### Changed

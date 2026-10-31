@@ -3,13 +3,15 @@
 // /review-cancel), review window checkpointing and continuation, reviewer
 // session semantics, transmission disclosure, and operating-mode settings.
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, type ChildProcess } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { activate } from "../src/index";
+import { terminateProcessTree } from "../src/adapters/process";
 import { reapAll } from "../src/background-shell";
 import { SessionStateStore } from "../src/session-state";
 import { normalizeConfig } from "../src/config";
@@ -759,12 +761,46 @@ review: { activeReviewers: [
 
 test("kitty CSI-u escape aborts an active reviewer process; release and modified escape do not", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-escape-csi-u-"));
+  let reviewerProcess: {
+    child: ChildProcess;
+    exit?: { code: number | null; signal: NodeJS.Signals | null };
+    close?: { code: number | null; signal: NodeJS.Signals | null };
+  } | undefined;
+  type ReviewerProcessRecord = NonNullable<typeof reviewerProcess>;
+  let restoreSpawn: (() => void) | undefined;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const pidPath = join(dir, "reviewer-pid.txt");
     const invocationPath = join(dir, "review-invocations.txt");
     const configPath = join(dir, "review-gate.json");
+    // One canonical script string configures the reviewer and recognizes its
+    // exact argv. Raw path substrings are not stable here because
+    // JSON.stringify escapes native path separators in the script source.
+    const reviewerScript = [
+      "const fs=require('node:fs');",
+      `const pidPath=${JSON.stringify(pidPath)};`,
+      `const invocationPath=${JSON.stringify(invocationPath)};`,
+      "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+      "fs.writeFileSync(invocationPath,String(count+1));",
+      "fs.writeFileSync(pidPath,String(process.pid));",
+      "if(count===0){setInterval(()=>{},1000);}",
+      "else {",
+      "process.stdin.resume();",
+      "let input='';",
+      "process.stdin.on('data',chunk=>input+=chunk);",
+      "process.stdin.on('end',()=>{",
+      "const ok=input.includes('Initial user request:')",
+      "&& input.includes('change index')",
+      "&& input.includes('redirect after cancelling review')",
+      "&& input.includes('-before')",
+      "&& input.includes('+after redirected');",
+      "process.stdout.write(JSON.stringify(ok",
+      "?{verdict:'pass',summary:'kept cancelled review context',findings:[]}",
+      ":{verdict:'needs_changes',summary:'lost cancelled review context',findings:[{severity:'blocking',file:'session',line:null,issue:'missing cancelled review context',recommendation:'preserve baseline and request history across review cancellation'}]}));",
+      "});",
+      "}",
+    ].join("");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
 externalAgents: {
@@ -773,33 +809,7 @@ externalAgents: {
     command: process.execPath,
     args: [],
     review: {
-      args: [
-        "-e",
-        [
-          "const fs=require('node:fs');",
-          `const pidPath=${JSON.stringify(pidPath)};`,
-          `const invocationPath=${JSON.stringify(invocationPath)};`,
-          "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
-          "fs.writeFileSync(invocationPath,String(count+1));",
-          "fs.writeFileSync(pidPath,String(process.pid));",
-          "if(count===0){setInterval(()=>{},1000);}",
-          "else {",
-          "process.stdin.resume();",
-          "let input='';",
-          "process.stdin.on('data',chunk=>input+=chunk);",
-          "process.stdin.on('end',()=>{",
-          "const ok=input.includes('Initial user request:')",
-          "&& input.includes('change index')",
-          "&& input.includes('redirect after cancelling review')",
-          "&& input.includes('-before')",
-          "&& input.includes('+after redirected');",
-          "process.stdout.write(JSON.stringify(ok",
-          "?{verdict:'pass',summary:'kept cancelled review context',findings:[]}",
-          ":{verdict:'needs_changes',summary:'lost cancelled review context',findings:[{severity:'blocking',file:'session',line:null,issue:'missing cancelled review context',recommendation:'preserve baseline and request history across review cancellation'}]}));",
-          "});",
-          "}",
-        ].join(""),
-        ],
+      args: ["-e", reviewerScript],
           timeoutMs: 300000,
         }
         }
@@ -843,19 +853,75 @@ review: { activeReviewers: [
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: join(dir, "index.ts") } });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
+    // The PID file alone is only a number: an empty/partial read becomes 0
+    // (which addresses the caller's process group), and a numeric PID may be
+    // reused by an unrelated process after the owned child closed. Bind this
+    // case to the exact ChildProcess the fixture spawns instead.
+    type Spawn = typeof import("node:child_process").spawn;
+    const childProcessModule = require("node:child_process") as { spawn: Spawn };
+    const originalSpawn = childProcessModule.spawn;
+    childProcessModule.spawn = ((...spawnArgs: Parameters<Spawn>) => {
+      const child = originalSpawn(...spawnArgs);
+      const [command, args] = spawnArgs;
+      if (
+        reviewerProcess === undefined
+        && command === process.execPath
+        && Array.isArray(args)
+        && args.length === 2
+        && args[0] === "-e"
+        && args[1] === reviewerScript
+      ) {
+        const record: ReviewerProcessRecord = { child };
+        reviewerProcess = record;
+        // Attach passively at spawn time, before the caller can lose an early
+        // event. Later resumption spawns and unmatched spawns pass through.
+        child.once("exit", (code, signal) => {
+          record.exit = { code, signal };
+        });
+        child.once("close", (code, signal) => {
+          record.close = { code, signal };
+        });
+      }
+      return child;
+    }) as Spawn;
+    restoreSpawn = () => {
+      childProcessModule.spawn = originalSpawn;
+    };
+
     await trigger(hooks, "agent_end", { cwd: dir, ui: pi.ui });
     const reviewPromise = trigger(hooks, "agent_settled", { cwd: dir, ui: pi.ui });
-    await waitForFile(pidPath);
+    await waitForCondition(() => {
+      const reviewerPid = reviewerProcess?.child.pid;
+      if (reviewerPid === undefined) return false;
+      try {
+        const published = readFileSync(pidPath, "utf8");
+        return /^[1-9][0-9]*$/.test(published) && Number(published) === reviewerPid;
+      } catch {
+        return false;
+      }
+    });
 
     assert.equal(terminalHandlers.length, 1);
-    const reviewerPid = Number(await readFile(pidPath, "utf8"));
-    assert.doesNotThrow(() => process.kill(reviewerPid, 0), "reviewer child should be running before cancellation");
+    const reviewer = reviewerProcess;
+    assert.ok(reviewer, "the fixture reviewer spawn must be captured");
+    const reviewerPid = reviewer.child.pid;
+    assert.ok(
+      typeof reviewerPid === "number" && Number.isSafeInteger(reviewerPid) && reviewerPid > 0,
+      "the captured reviewer child must have a positive integer pid",
+    );
+    const assertReviewerChildLive = (when: string) => {
+      assert.equal(reviewer.child.exitCode, null, `${when}: the exact reviewer child must not have exited`);
+      assert.equal(reviewer.child.signalCode, null, `${when}: the exact reviewer child must not have been signaled`);
+      assert.equal(reviewer.exit, undefined, `${when}: no reviewer child exit may have been observed`);
+      assert.equal(reviewer.close, undefined, `${when}: no reviewer child close may have been observed`);
+    };
+    assertReviewerChildLive("before cancellation");
 
     // Key-release and modified Escape sequences must not cancel the review.
     assert.deepEqual(terminalHandlers[0]?.("\x1b[27;1:3u"), undefined);
     assert.deepEqual(terminalHandlers[0]?.("\x1b[27;5u"), undefined);
     await new Promise((resolve) => setTimeout(resolve, 250));
-    assert.doesNotThrow(() => process.kill(reviewerPid, 0), "release/modified escape must not stop the reviewer");
+    assertReviewerChildLive("after release/modified escape");
     assert.doesNotMatch(notices.join("\n"), /review cancelled/);
 
     // Unmodified Escape in Kitty CSI-u form must cancel it.
@@ -868,14 +934,17 @@ review: { activeReviewers: [
     assert.doesNotMatch(notices.join("\n"), /reviewer processes stopped/);
     await reviewPromise;
 
-    await waitForCondition(() => {
-      try {
-        process.kill(reviewerPid, 0);
-        return false;
-      } catch {
-        return true;
-      }
-    });
+    await waitForCondition(() => reviewer.close !== undefined);
+    const closeEvent = reviewer.close;
+    assert.ok(closeEvent, "the exact reviewer child must report close");
+    assert.ok(
+      closeEvent.code !== null || closeEvent.signal !== null,
+      "the reviewer child close must report terminal exit or signal evidence",
+    );
+    assert.equal(closeEvent.code, reviewer.child.exitCode, "close code must match the exact reviewer child");
+    assert.equal(closeEvent.signal, reviewer.child.signalCode, "close signal must match the exact reviewer child");
+    assert.ok(reviewer.exit, "the exact reviewer child must report exit before close");
+    assert.deepEqual(reviewer.exit, closeEvent, "exit and close must report the same terminal state");
     assert.match(notices.join("\n"), /review gate: review cancelled; reviewer processes stopped/);
     assert.equal(terminalHandlers.length, 0);
     // No input was queued during the review, so no dropped-input notice may
@@ -898,8 +967,34 @@ review: { activeReviewers: [
     );
     assert.equal(terminalHandlers.length, 0);
   } finally {
+    restoreSpawn?.();
     reapAll();
-    await rm(dir, { recursive: true, force: true });
+    // If an assertion failed while our exact fixture child was still live,
+    // stop only that owned child through the product's owned-process seam and
+    // require positive close before deleting the fixture. Unknown settlement
+    // preserves the fixture instead of guessing.
+    const ownedReviewer = reviewerProcess;
+    let reviewerSettled = ownedReviewer === undefined || ownedReviewer.close !== undefined;
+    if (ownedReviewer && ownedReviewer.close === undefined) {
+      // Signal only while the exact child is still live. An exited child whose
+      // close is still pending must never be identified again by numeric PID or
+      // process group; only its already-attached close observer may settle it.
+      const reviewerChildStillLive = ownedReviewer.child.exitCode === null
+        && ownedReviewer.child.signalCode === null
+        && ownedReviewer.exit === undefined;
+      if (reviewerChildStillLive) {
+        terminateProcessTree(ownedReviewer.child, "SIGTERM");
+      }
+      try {
+        await waitForCondition(() => ownedReviewer.close !== undefined);
+        reviewerSettled = true;
+      } catch {
+        reviewerSettled = false;
+      }
+    }
+    if (reviewerSettled) {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 });
 

@@ -482,8 +482,9 @@ broker cleanup, and it is safe to repeat.
 Interactive Browser failures throw bounded, sanitized errors so Pi's native outer
 `toolResult.isError` is true. They contain text only, never screenshots or raw page/
 Playwright exceptions. Manager-owned failures carry a structured failure phase
-(`url_validation`, `broker_admission`, `chromium_startup`, `context_creation`, or
-`navigation`) and a safe category such as `dns_resolution_failed`,
+(`url_validation`, `broker_admission`, `broker_startup`, `chromium_startup`,
+`context_creation`, `navigation`, or `teardown`) and a safe category such as
+`dns_resolution_failed`,
 `non_public_address_denied`, `budget_exhausted`, or `browser_process_failure`; browser
 tool errors report them as fixed text like `phase=...; category=...` with bounded
 per-category guidance. This keeps a distinct-host budget exhaustion on a content-rich
@@ -492,7 +493,9 @@ claims a proven authorization denial. `BrowserExtract` and `WebFetch` keep their
 result contract.
 The real-runtime regression in `tests/browser-native-error.test.ts` accepts
 `PI_BROWSER_AGENT_RUNTIME` pointing to an installed Pi agent-core `dist/index.js`
-(tested with 1.0.0); its model stream is entirely mocked, with no live model calls.
+(1.0.0 or newer; CI installs the exact `@earendil-works/pi-agent-core@1.4.0` pinned
+under `scripts/ci/pi-agent-runtime`); its model stream is entirely mocked, with no
+live model calls.
 Without that runtime path the optional contract test is explicitly skipped.
 
 The interactive tools are registered only through the Pi extension surface and are
@@ -501,11 +504,16 @@ with the exact tool name to load one. `BrowserScreenshot` checks the current Pi 
 input contract before capture; when image input is unavailable (or the host does not
 provide a model capability contract), it returns a clear error and directs the caller
 back to `BrowserSnapshot` rather than creating bytes Pi cannot deliver. Top-level and
-execute Pi roles receive `BrowserConsole`, `BrowserNetwork`, `BrowserInspect`,
-`BrowserHover`, `BrowserClick`, `BrowserFill`, `BrowserType`,
-`BrowserSelect`, `BrowserPress`, `BrowserUpload`, `BrowserDownloadSave`, and
-`BrowserClipboard`; research Pi roles receive observational
-`BrowserConsole`, `BrowserNetwork`, `BrowserInspect`, and `BrowserHover` but none of the click/form-action tools. Authorized names appear in each
+execute Pi roles receive the observational set — `BrowserOpen`, `BrowserNavigate`,
+`BrowserSnapshot`, `BrowserConsole`, `BrowserNetwork`, `BrowserInspect`,
+`BrowserScreenshot`, `BrowserScroll`, `BrowserHover`, `BrowserWait`, `BrowserHistory`,
+`BrowserTabs`, and `BrowserClose` — plus the consequential set `BrowserClick`,
+`BrowserFill`, `BrowserType`, `BrowserSelect`, `BrowserPress`, `BrowserUpload`,
+`BrowserDownloadSave`, and `BrowserClipboard`. Research Pi roles receive only the
+observational set, including `BrowserConsole`, `BrowserNetwork`, `BrowserInspect`,
+`BrowserHover`, and `BrowserScreenshot`, and never a click/form-action, file-transfer,
+or clipboard tool; at the top level, entering plan/research hides the same
+consequential tools while the observational set stays visible. Authorized names appear in each
 role's startup system-prompt inventory — each deferred-authorized name with a tiny
 purpose summary — and in the `tool_search` tool description at live permissions,
 while schemas remain deferred until activation. The discovery set is each role's

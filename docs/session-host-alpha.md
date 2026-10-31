@@ -1,11 +1,13 @@
-# Optional Pi session host (alpha)
+# Pi session host (sidebar)
 
-`pi-review-sessions` is an optional terminal host for running multiple, independent
-native Pi sessions side by side, on one machine or across paired machines. It is a
-separate entry point: it does not replace `pi-review-gate`, the normal Pi CLI, or either
-standalone review-gate launcher, and it changes no native Pi CLI, runtime, version, or
-public SDK. Use those existing entry points as before when you want one ordinary Pi
-session. It is not a tmux integration, daemon, or session-adoption layer: each host owns
+`pi-review-sessions` is this project's recommended terminal host for running multiple,
+independent native Pi sessions side by side, on one machine or across paired machines. It
+is a separate entry point: it does not replace `pi-review-gate`, the normal Pi CLI, or
+either standalone review-gate launcher, and it changes no native Pi CLI, runtime, version,
+or public SDK. The recommendation is documentation guidance only: installing the package
+still maps its default `pi-review-gate` and `pi-review-gate-cmd` commands to the
+standalone launchers, and you can keep using those entry points unchanged for one ordinary
+Pi session. It is not a tmux integration, daemon, or session-adoption layer: each host owns
 only the children its own session manager started. Through the optional
 [Network sidebar](#network-sidebar-hosting-pairing-and-remote-metadata), a paired
 viewer on another machine can display, type into, copy from, and close one owner's
@@ -13,8 +15,8 @@ sessions, create new ones there, and browse, resume, or delete that owner's
 [saved conversations](#saved-conversations-on-a-connected-owner). It does this without
 adopting, migrating, or synchronizing them: the owning host keeps every process.
 
-This is alpha guidance, not a finished-host compatibility guarantee. The alpha design
-uses Pi's public `ProcessTerminal` input and terminal-negotiation path with custom
+This page documents the host as it ships, not a blanket compatibility guarantee. The host
+design uses Pi's public `ProcessTerminal` input and terminal-negotiation path with custom
 generated frame composition; it is not a `TuiAltScreen` renderer. Native wrapper,
 terminal-input, menu, question, editor, and runtime parity remain under integration
 verification.
@@ -23,7 +25,7 @@ Component, mock, or socket tests alone do not prove compatibility with a real na
 Pi wrapper, and same-host network tests do not establish two-machine, operator, or
 platform readiness for the cross-machine features. macOS and Linux are the intended POSIX host platforms; intended platform
 scope is not evidence that end-to-end runtime compatibility has been proven. Windows
-startup, public named-pipe, and pinned node-pty ConPTY source paths are experimental
+startup, public named-pipe, and pinned node-pty ConPTY source paths are validation paths
 only; they are not Windows runtime support or readiness evidence. Manual Windows
 validation has observed mouse clicks working, but that observation does not certify
 sidebar single-click activation, native Main click-to-focus, other physical input, or
@@ -31,14 +33,17 @@ complete host-process shutdown (see below).
 Device-attributes negotiation also requires complete runtime acceptance; its narrow
 witness investigation is tracked in
 https://github.com/rfairburn/pi-review-gate/issues/337 under the broader #334
-Windows-host follow-up. The sidebar alpha release defers all remaining Windows
-sidebar/host runtime acceptance to
+Windows-host follow-up. All remaining Windows sidebar/host runtime acceptance stays
+deferred to
 https://github.com/rfairburn/pi-review-gate/issues/345: the real native Main case
 (startup, public Quit confirmation, original-process/kernel settlement/restoration)
 and both cold hosted-source wrapper legs (cmd and direct PowerShell) are retained in
 the suite but explicitly skipped, so green CI does not certify Windows runtime
-support; the Windows sidebar/host remains optional experimental.
-CI now calls the separate session-host alpha matrix workflow read-only on every enforced
+support; the Windows sidebar/host remains an unsupported validation target.
+CI now calls the separate session-host acceptance matrix in
+`.github/workflows/session-host-alpha.yml` — emitting the stable check names
+**Windows session host alpha (Node 22.23.4)** and **Windows session host alpha
+(Node 24.22.1)** — read-only on every enforced
 trigger and requires its results before publishing a numbered prerelease. That reuse
 changes no deferral: the genuine native Main case and both cold hosted-source wrapper
 legs above are registered with an unconditional skip, so they stay deferred under #345
@@ -83,8 +88,8 @@ terminal-restoration evidence. Green CI does not certify Windows runtime support
   ConPTY flow for validation, but Windows is not supported/readiness-certified until
   real Windows runtime evidence on the patched Node 22 and 24 lines passes. Earlier
   Windows evidence on Node 22.19.0 and 24.x is historical: it predates the current
-  security floors and is not a patched-runtime run. In the upcoming sidebar
-  alpha release that runtime acceptance is deferred under
+  security floors and is not a patched-runtime run. That runtime acceptance stays
+  deferred under
   https://github.com/rfairburn/pi-review-gate/issues/345. The ordinary standalone
   Windows launcher remains unchanged.
 - **Node.js:** at or above its release line's security floor: 22.23.4 or newer on
@@ -96,6 +101,17 @@ terminal-restoration evidence. Green CI does not certify Windows runtime support
 - **Pi:** stable Pi 1.0.4 or newer; the provisioned runtime and native UI
   acceptance fixture are pinned to **1.4.0**, with the matching 1.4.0 TUI dependency.
 - An interactive terminal with both stdin and stdout attached.
+
+Start the host with the shipped one-command entry points: `./scripts/pi-review-sessions.sh`
+(macOS/Linux source checkout), `scripts\pi-review-sessions.cmd` (native Windows source
+checkout from cmd.exe or PowerShell), or the installed `pi-review-sessions` package
+command. The `.sh` and `.cmd` entry points retain a supported Node on `PATH` or bootstrap
+the source-pinned official Node.js 22.23.4 archive under an isolated per-agent cache; the
+installed `pi-review-sessions` command runs the shared launcher
+(`scripts/pi-review-sessions.cjs`) directly and requires a supported Node already on
+`PATH`. These entry points are additional rather than replacements: the package's default
+`pi-review-gate` and `pi-review-gate-cmd` commands still run the standalone launchers with
+unchanged behavior.
 
 The Windows session-host source path selects the Microsoft ConPTY implementation
 bundled with the pinned `@lydell/node-pty` package through its public
@@ -265,7 +281,7 @@ tree bindings may be intercepted while their corresponding host action is active
 terminal and operating system must deliver a chord for the host to match it; in
 particular, Super chords require a terminal/platform combination that sends them.
 
-Parent startup arguments apply to **every new instance**. The alpha rejects
+Parent startup arguments apply to **every new instance**. The host rejects
 `--continue`/`-c`, `--resume`/`-r`, `--session`, `--session-id`, `--fork`,
 `--session-dir`, and `--no-session`, including attached-value spellings, so children
 cannot attach to the parent's or another selected conversation. Rejection happens
@@ -965,9 +981,9 @@ Same-account and OS-privileged access remains outside this boundary.
 Trust, storage, and consent boundaries are detailed in
 [Session-host peer network](security-model.md#session-host-peer-network-optional).
 This sidebar changes no Windows, native-mobile, browser, or physical-input certification
-claim; the alpha platform limitations above still apply.
+claim; the platform limitations above still apply.
 
-**Optional two-host comparison.** To check the current alpha by hand on two machines,
+**Optional two-host comparison.** To check the host by hand on two machines,
 run the optional `pi-review-sessions` host on each. On host A, open **Network**, review or
 edit the prefilled listen address and port, apply, and start hosting; on host B, add a
 destination for A's address and port and press Connect. Compare each host's displayed
@@ -983,7 +999,7 @@ confirm the remote stream is released rather than retained. Open Saved on B, cha
 Host line to A, and compare the rows with A's own Local Saved picker without resuming or
 deleting anything you want to keep. Disconnect on B and confirm the rows become stale, then remove the destination on B and
 confirm it forgets only that endpoint and local pin.
-These are optional manual alpha checks, not an installation, support, release, or
+These are optional manual checks, not an installation, support, release, or
 cross-machine readiness claim; CI does not run them.
 
 #### Repairing Network storage permissions
@@ -1520,8 +1536,8 @@ those fallbacks; malformed, unsafe, or unavailable settings fail before the edit
 child starts rather than silently guessing. Workspace/project `.pi/settings.json` overrides are deliberately
 not loaded, so this adds no project-code or trust grant. The command is parsed as literal
 arguments and run as a directly owned, shell-free child; Windows `.cmd`/batch and
-command-shell shims are unsupported. This editor-command support does not make the alpha
-host Windows-supported: Windows temporary-file privacy follows Node and the operating
+command-shell shims are unsupported. This editor-command support does not make the host
+Windows-supported: Windows temporary-file privacy follows Node and the operating
 system's default ACLs, without a custom-ACL or same-user sandbox guarantee. The editor
 uses a bounded temporary file; unsafe, oversized, or failed results are not applied.
 Use the on-screen cues for form actions and quit confirmation. When a native Pi

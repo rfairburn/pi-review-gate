@@ -269,7 +269,22 @@ execution. See [Configuration](configuration.md#kill-switches) for the full list
 
 ## Launching
 
-For normal use, use the persistent launcher:
+The recommended way to run Pi with the gate is the session-host sidebar: one terminal, one
+left sidebar roster of your sessions, and the review gate plus the same shared
+configuration in every session the host starts. Launch it from a source checkout with
+`./scripts/pi-review-sessions.sh` (macOS/Linux) or `scripts\pi-review-sessions.cmd` (native
+cmd.exe or PowerShell), or from an installed package with the `pi-review-sessions`
+command. The host needs an interactive terminal and stable Pi 1.0.4 or newer; macOS and
+Linux are the supported host platforms, and the Windows host paths are native-validation
+paths rather than a Windows support claim (the genuine native Windows runtime cases stay
+skipped under #345, so a green Windows matrix job is not Windows runtime evidence). Host
+requirements, options, session and roster semantics, saved conversations, and the
+physical-terminal limits are documented in
+[Session host](session-host-alpha.md).
+
+That recommendation is guidance only: it does not change what the package installs, its
+command mapping, or its argument routing. The direct launchers below remain fully
+supported entry points with unchanged behavior:
 
 ```bash
 ./scripts/pi-review-gate.sh
@@ -282,11 +297,16 @@ Bash or WSL):
 scripts\pi-review-gate.cmd
 ```
 
-From an npm installation on Windows, the command is `pi-review-gate-cmd`. The Windows
-entry pairs a thin `.cmd` file with a Node helper that mirrors the POSIX launcher's
-behavior, including its DDGS provisioning (natively, in a `Scripts\python.exe` virtual
-environment) and the same exit codes; the POSIX launcher remains the macOS/Linux entry.
-Other portable launchers are not completed.
+The package's default launcher commands are unchanged: `pi-review-gate` runs
+`scripts/pi-review-gate.sh`, `pi-review-gate-cmd` runs `scripts/pi-review-gate.cmd`, and
+the separate `pi-review-sessions` command runs the shared session-host launcher
+`scripts/pi-review-sessions.cjs`. From an npm installation on Windows, the launcher
+command is `pi-review-gate-cmd`. The Windows entry pairs a thin `.cmd` file with a Node
+helper that mirrors the POSIX launcher's behavior, including its DDGS provisioning
+(natively, in a `Scripts\python.exe` virtual environment) and the same exit codes; the
+POSIX launcher remains the macOS/Linux entry. The supported entry points are the POSIX
+launcher, the native Windows launcher, the `pi-review-web.sh` web wrapper, and the
+session-host entry points; no other launcher ports exist.
 
 The launcher selects the first existing
 config — `review-gate.json` in the Pi agent directory (`~/.pi/agent/review-gate.json`,
@@ -304,8 +324,9 @@ The four shipped skills live under
 `~/.agents/skills/` (pi-review-gate-orchestrator — including its recovery runbook —
 pi-review-gate-execution, pi-review-gate-research, and pi-review-gate-completion).
 The launcher then executes the installed `pi` with the prepared extension. The
-session-host sidebar launchers (`scripts/pi-review-sessions.sh` on macOS/Linux,
-`scripts\pi-review-sessions.cmd` on Windows) use the same preparation and skill
+session-host entry points (`scripts/pi-review-sessions.sh`,
+`scripts\pi-review-sessions.cmd`, and the installed `pi-review-sessions` command) use the
+same preparation and skill
 readiness state before starting the host, so a direct sidebar
 launch needs no wrapper prerequisite. The completion-guidance setting
 controls only whether the extension supplies its automatic pointer; manual skill
@@ -348,5 +369,7 @@ Background subtask execution is optional and configured separately; see
 
 - Reviewer commands and the correction lifecycle:
   [Review workflow](review-workflow.md).
+- Running several Pi sessions in one terminal, network roster access, and saved
+  conversations: [Session host](session-host-alpha.md).
 - Web research tools: [Web tools](web-tools.md).
 - Something not working: [Troubleshooting](troubleshooting.md).

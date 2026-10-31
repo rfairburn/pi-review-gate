@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.232]
+
+### Changed
+
+- **Sidebar-first documentation** (#454): the README and onboarding recommend the
+  existing `pi-review-sessions` workflow and retain fully maintained standalone
+  Pi + review-gate instructions. Current documentation no longer positions the sidebar
+  as alpha; known platform and terminal limitations remain explicit. Documentation
+  accuracy fixes cover launch preparation, settings, review/execution, and tool guidance.
+  Launcher names, package mappings, application help/UI, runtime behavior, and the
+  numbered-prerelease policy are unchanged.
+
 ## [0.1.0-dev.231]
 
 ### Changed

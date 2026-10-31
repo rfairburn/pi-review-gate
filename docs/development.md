@@ -66,8 +66,10 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   matrix runs each exact floor through the same stages, as the checks
   **Verify (Node 22.23.4)**, **Verify (Node 24.22.1)**, and **Verify (Node 26.12.1)**.
   The Linux full suite, the Windows shell job, and the release builder use Node
-  24.22.1. The Windows launcher job uses Node 22.23.4. The Windows session-host alpha
-  matrix uses Node 22.23.4 and 24.22.1. Do not run checks with a Node below its
+  24.22.1. The Windows launcher job uses Node 22.23.4. The Windows session-host
+  acceptance matrix (`session-host-alpha.yml`) emits the stable check names
+  **Windows session host alpha (Node 22.23.4)** and **Windows session host alpha
+  (Node 24.22.1)** and runs those two Node versions. Do not run checks with a Node below its
   line's floor, and do not take earlier CI runs on Node 22.19.0 or 24.x as
   patched-runtime evidence.
 - **TypeScript and type definitions** arrive as ordinary `devDependencies` via
@@ -107,8 +109,8 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
 - **Test-only explicit paths (never shipped, never user-specific in tracked files):**
   Linux's full suite and the native Windows launcher job freshly install a locked
   `@earendil-works/pi-coding-agent@1.4.0` full runtime (manifests:
-  `scripts/ci/pi-ui-runtime/`) into runner temp. This sits above the alpha
-  helper's minimum stable Pi CLI version (1.0.4); the Windows tier still
+  `scripts/ci/pi-ui-runtime/`) into runner temp. This sits above the session host's
+  minimum stable Pi CLI version (1.0.4); the Windows tier still
   covers its existing standalone command/RPC and child-launch behavior, not
   that helper. They export
   `PI_REVIEW_GATE_INSTALLED_AGENT` (the package root),
@@ -503,7 +505,8 @@ superseded assessment.
 
 `session-host-storage-protection-windows-native.test.ts` (backend, Windows only) runs in
 the existing native Windows storage CI step. The same-harness ConPTY companion
-`session-host-native-windows-network.test.ts` runs in the opted-in Windows alpha Main
+`session-host-native-windows-network.test.ts` runs in the opted-in
+**Real public Windows ConPTY Main acceptance**
 step under `PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST=1`, where a missing prerequisite
 fails instead of skipping. It drives the real public Main against a synthetic profile
 with an inherited ordinary-account Modify grant: the drawn refusal, the written repair
@@ -561,8 +564,8 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
 
 `scripts/pi-review-gate.sh`:
 
-- Delegates Pi package management verbs (`update|install|remove|uninstall|list|config|auth`)
-  directly to `pi`.
+- Delegates Pi package management verbs
+  (`update|install|remove|uninstall|list|config|auth|mcp`) directly to `pi`.
 - Unsets any inherited `PI_REVIEW_GATE_CONFIG` and re-resolves the persistent config so
   a parent pi session cannot silently redirect the gate; it deliberately does **not**
   unset `PI_REVIEW_GATE_DISABLED`, the documented kill switch, and warns when it is set.
@@ -592,6 +595,23 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
 `scripts/pi-review-web.sh` uses the same shared preparation authority: it runs the
 prepared root's `dist/src/web/cli.js` with the ready DDGS interpreter, and performs no
 build, staging, Python probe, or cleanup when the prepared state is current.
+
+The session-host entry points share that same preparation authority and carry no separate
+build, DDGS, or skill algorithm. `scripts/pi-review-sessions.sh` keeps a supported Node on
+`PATH` or bootstraps the source-pinned official Node.js 22.23.4 archive (macOS x64/arm64,
+Linux x64/arm64) into an isolated per-agent cache before invoking the shared launcher
+`scripts/pi-review-sessions.cjs`; `scripts\pi-review-sessions.cmd` delegates the same
+pinned-Node bootstrap (Windows x64/arm64/x86) to
+`scripts/pi-review-sessions-node.ps1`, which then invokes that launcher unchanged. The
+installed `pi-review-sessions` package command runs the launcher directly, so it requires a
+supported Node already on `PATH` and refuses a Node below its line's floor.
+`scripts/session-host-startup-options.cjs` owns the parent startup-option rejection shared
+by that launcher. The documented sidebar recommendation changes no package mapping or
+default routing: the package bins stay `pi-review-gate` → `scripts/pi-review-gate.sh`,
+`pi-review-gate-cmd` → `scripts/pi-review-gate.cmd`, `pi-review-web` →
+`scripts/pi-review-web.sh`, and `pi-review-sessions` → `scripts/pi-review-sessions.cjs`.
+Host behavior, requirements, and platform limitations remain owned by
+[Session host](session-host-alpha.md).
 
 `scripts/pi-review-gate.cmd` + `scripts/pi-review-gate-launcher.cjs` (issue 108) are the
 native Windows counterparts of the persistent launcher: the thin `.cmd` passes its raw

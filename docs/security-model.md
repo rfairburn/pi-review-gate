@@ -115,8 +115,8 @@ pairing, remote session rows, one deliberately selected row's native viewport wi
 native input and copy, owner-routed Close and Create, and one chosen owner's saved
 conversations. Every operation is performed by the owning host on its own children and
 files. Ordinary Pi sessions and the standalone review-gate launchers are unchanged
-and start no peer listener or client. This is an
-optional alpha surface: it does not certify two-machine operation, native-Windows UI,
+and start no peer listener or client. This optional surface carries no readiness
+certification: it does not certify two-machine operation, native-Windows UI,
 physical input, physical clipboard delivery, mobile, browser, or release readiness.
 
 The transport is direct TLS/WSS with generated self-signed certificates. The authority for

@@ -75,6 +75,45 @@ function wheel(direction: "up" | "down", x: number, y: number): string {
 const stripAnsi = (text: string): string =>
   text.replace(/\x1b\[[0-9;?]*[A-Za-z]/gu, "").replace(/\x1b_[^\x07]*\x07/gu, "").replace(/\x1b\][^\x07]*\x07/gu, "");
 
+/**
+ * Witness one exact value in a single frame's rendered rows. A native editor
+ * wraps a long value at its row width without inserting a separator, so the
+ * value may begin after other row content and continue through adjacent rows.
+ * A wrapped run may cross a row boundary only after whitespace padding, and
+ * every row in the run must contribute at least one character; rows are never
+ * reordered or combined with another frame. This is a terminal-rendering
+ * witness, not a substitute for the field's text API.
+ */
+function renderedRowsContainWrapped(rows: readonly string[], expected: string): boolean {
+  const first = expected[0];
+  if (first === undefined) return false;
+  for (let startRow = 0; startRow < rows.length; startRow += 1) {
+    const row = rows[startRow]!;
+    for (let start = 0; start < row.length; start += 1) {
+      if (row[start] !== first) continue;
+      let rowIndex = startRow;
+      let column = start;
+      let offset = 0;
+      while (rowIndex < rows.length) {
+        const line = rows[rowIndex]!;
+        const before = offset;
+        while (column < line.length && offset < expected.length && line[column] === expected[offset]) {
+          column += 1;
+          offset += 1;
+        }
+        if (offset === expected.length) return true;
+        // Every row in a wrapped run must contribute at least one character;
+        // a blank row cannot bridge separated fragments.
+        if (offset === before || !/^ *$/u.test(line.slice(column))) break;
+        rowIndex += 1;
+        if (rowIndex === rows.length) break;
+        column = /^ */u.exec(rows[rowIndex]!)?.[0].length ?? 0;
+      }
+    }
+  }
+  return false;
+}
+
 class VirtualTerminal implements Terminal {
   private onInput?: (data: string) => void;
   private onResize?: () => void;
@@ -132,6 +171,32 @@ async function until(predicate: () => boolean, ms = 2000): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
+
+test("synthetic popup wrap witness: one contiguous rendered run carries the wrapped path", () => {
+  // Synthetic rows only: this pins the frame-witness helper, not a native host
+  // rendering result.
+  const path = "/tmp/pi-clipboard-488-1.png";
+  const basename = "pi-clipboard-488-1.png";
+  const split = path.indexOf("488-1.png");
+  const prefix = path.slice(0, split);
+  const suffix = path.slice(split);
+  const wrapped = [`  ${prefix}`, `  ${suffix}  `];
+
+  assert.equal(renderedRowsContainWrapped(wrapped, path), true,
+    "the complete path is recognized across adjacent wrapped rows");
+  assert.equal(renderedRowsContainWrapped(wrapped, basename), true,
+    "the complete basename is recognized across the same wrap");
+  assert.equal(renderedRowsContainWrapped([`  ${path}  `], path), true,
+    "an ordinary unwrapped row still carries the path");
+  assert.equal(renderedRowsContainWrapped([`  ${prefix}`, "  an unrelated popup row", `  ${suffix}`], path), false,
+    "a non-contiguous occurrence is not joined across an unrelated row");
+  assert.equal(renderedRowsContainWrapped([`  ${prefix}`, "  ", `  ${suffix}`], path), false,
+    "a blank row is not skipped to join separated fragments");
+  assert.equal(renderedRowsContainWrapped([`  ${prefix}`, `  ${suffix.slice(1)}`], path), false,
+    "a missing character is not hidden by wrapping");
+  assert.equal(renderedRowsContainWrapped([`  ${suffix}`, `  ${prefix}`], path), false,
+    "rows are not reordered to manufacture the path");
+});
 
 test("native fullscreen: the compact popup keeps its natural size over the live transcript and scrolls by keyboard only", async () => {
   previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
@@ -561,6 +626,24 @@ test("native fullscreen: async native image pastes redraw the popup and preserve
       bg: (_color: string, text: string) => `${SURFACE_BG}${text}\x1b[49m`,
     };
     const overlays: OverlayHandle[] = [];
+    /** Plain rows inside the current popup rectangle from one actual frame. */
+    const popupRows = (): string[] => {
+      const bounds = overlays.at(-1)?.getBounds();
+      assert.ok(bounds, "the open popup reports its rendered rectangle");
+      const lines = screen();
+      assert.ok(bounds.row >= 0 && bounds.height >= 2 && bounds.row + bounds.height <= lines.length,
+        "the popup rectangle lies inside the current rendered terminal frame");
+      return lines.slice(bounds.row + 1, bounds.row + bounds.height - 1)
+        .map((line) => line.slice(1).trimEnd());
+    };
+    const waitForPopupText = async (needle: string): Promise<string[]> => {
+      let rows: string[] = [];
+      await until(() => {
+        rows = popupRows();
+        return renderedRowsContainWrapped(rows, needle);
+      }, 3000);
+      return rows;
+    };
     const open = async (identity: object): Promise<{ closed: Promise<unknown> }> => {
       const bridge = createBridgeUi({
         keybindings,
@@ -657,10 +740,12 @@ test("native fullscreen: async native image pastes redraw the popup and preserve
       await new Promise((resolve) => setTimeout(resolve, 30));
       const pending = pendingPastes[index - 1]!;
       const name = pending.path.slice(pending.path.lastIndexOf("/") + 1);
-      assert.ok(!screen().some((line) => line.includes(name)), "the async path is not inserted before clipboard completion");
+      assert.ok(!renderedRowsContainWrapped(popupRows(), name), "the async path is not inserted before clipboard completion");
       const requestsBeforeCompletion = requestRenderCount;
       pending.release();
-      await waitForScreen(name);
+      const pastedRows = await waitForPopupText(pending.path);
+      assert.ok(renderedRowsContainWrapped(pastedRows, name),
+        "the full basename is visible in the same post-paste popup frame, including across native wrapping");
       assert.ok(requestRenderCount > requestsBeforeCompletion, "the rendered path arrived through ordinary coalesced render requests");
       assert.deepEqual(await readFile(pending.path), pngBytes, "only the synthetic PNG fixture was supplied");
       assert.deepEqual(pasteErrors, []);

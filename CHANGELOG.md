@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.232]
+## [0.1.0-dev.234]
 
 ### Changed
 
@@ -35,6 +35,39 @@ dates.
   release/modified-Escape non-cancellation, cancellation tombstone and resumption
   assertions, and product cancellation, ownership, and settlement contracts are
   unchanged; this is a test-only change.
+
+## [0.1.0-dev.233]
+
+### Fixed
+
+- **POSIX permission fixtures establish their requested setgid modes** (#502): the
+  fixture root now takes the account's primary group before any directory is created,
+  so a root that inherited a foreign group cannot silently strip setgid from a
+  requested mode. Fixture setup also asserts that the real setgid and private-directory
+  modes were established before invoking the production guard. All existing production
+  refusal and no-repair assertions, content, link, ACL, and platform/skip coverage, and
+  the production permission policy remain unchanged.
+
+## [0.1.0-dev.232]
+
+### Tests
+
+- **Saved-deletion fixture waits for its current result before deleting** (#502): the
+  confirmed Saved-deletion test now filters by the fixture's quoted indexed session
+  identity instead of the displayed caption, which this fixture's SDK listing does
+  not expose as search text. Quoting selects the native exact-phrase grammar so only
+  the literal identity matches; a raw fuzzy query could also match the sibling row
+  through the fixture directories' shared working-directory path. The test records
+  the owning picker, query revision, and written-frame count before typing; requires
+  the typed query to advance exactly one revision and a newer written frame to retain
+  the same picker and current revision; witnesses the sibling's rendered row prefix
+  before filtering; and checks that prefix is absent while the selected caption is
+  actually rendered, rather than treating the query line or an empty placeholder as
+  the selected result or comparing a caption the pane truncates. The speculative
+  retry loop is replaced by the normal next-turn wait. All existing deletion,
+  shell-free trash fallback, sibling isolation, Main-owner, cancellation, no-input,
+  native-viewport, and shutdown assertions are preserved; production behavior is
+  unchanged.
 
 ## [0.1.0-dev.231]
 

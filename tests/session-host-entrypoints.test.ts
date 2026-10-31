@@ -1943,7 +1943,11 @@ test(".sh concurrent download/extraction producers both start; a held lock only 
   cleanupFixture(t, f);
   writeBootstrapTools(f);
   const env = { PI_CODING_AGENT_DIR: f.agentDir };
-  for (let i = 0; i < 4; i++) assert.equal(runSh(f, ["--help"], env).status, 0);
+  // Four completed generations with the real producer's post-success shape are
+  // seeded directly instead of by four preparatory wrapper launches; the held
+  // download, the contending launch and the converging launch below are the three
+  // real install actions this case observes.
+  seedCompletedNodeGenerations(f, 4);
   // This producer is spawned directly (not through runSh), so clear the completed
   // runtime marker explicitly: it must genuinely install and reach the download.
   rmSync(join(nodeCache(f), "current-node.txt"), { force: true });

@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.231]
+## [0.1.0-dev.232]
 
 ### Changed
 
@@ -35,6 +35,37 @@ dates.
   release/modified-Escape non-cancellation, cancellation tombstone and resumption
   assertions, and product cancellation, ownership, and settlement contracts are
   unchanged; this is a test-only change.
+
+## [0.1.0-dev.231]
+
+### Changed
+
+- **The concurrent bootstrap fixture stopped re-running its own setup** (Refs #194):
+  the concurrent bootstrap case `.sh concurrent download/extraction producers both start; a
+  held lock only skips cleanup` now seeds its four completed fallback-runtime
+  generations with the existing shared seeding helper — real private directories in that
+  fixture's own cache carrying this fixture's synthetic Node program, the internal
+  relative npm link, and a nonempty representative payload — instead of performing four
+  preparatory wrapper launches first. The case still observes three real install actions:
+  the directly spawned producer that holds the download, the contending launch that must
+  not be refused, and the converging launch that brings the cache back to five. Its
+  five-generation observation, no-capacity-refusal and busy-cleanup-lock assertions,
+  concurrent-creation bound and convergence assertion are unchanged, as is the
+  shared helper itself.
+- **Two peer-coordinator shutdown cases stopped waiting out their own liveness timer**
+  (Refs #194): in `a held superseded-start retirement starts its own deadline and never
+  reports a settled off` and `a listener close callback that never arrives is bounded,
+  keeps the off intent, and rejects close`, the 12-second referenced timer that keeps the
+  event loop alive for the production deadline under test is now cleared once that real
+  settlement and the case's owned listener-close teardown have finished, instead of being
+  awaited after them. The timer still covers the whole deadline it witnesses and widens
+  nothing: the existing ownership and owned-settlement bounds, the stuck-shutdown,
+  re-entry, sticky-record, and stored-preference assertions, the bound that shutdown
+  rejects from the sticky record rather than waiting again, and the teardown ordering are
+  unchanged.
+  Test fixtures only: production code, production deadlines, other tests, and CI
+  workflows are unchanged, and no speedup is claimed here — measured CI timing remains
+  for the actual pull request run. #194 stays open with its remaining scope.
 
 ## [0.1.0-dev.230]
 

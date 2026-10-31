@@ -15,6 +15,21 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.237]
+
+### Changed
+
+- **Atomic native-resume release publication** (#579): the native automatic-resume
+  fixture now publishes every test-owned worker release record with the existing
+  durable exclusive writer, so the complete `{ "release": true }` JSON is staged and
+  fsynced in an owned private temp file inside the fixture's own state directory
+  before the final release pathname exists. A worker can no longer parse an empty or
+  truncated release record, and an existing release file or symlink is refused rather
+  than overwritten or adopted. Added deterministic controls for the old
+  create-before-write failure, the commit boundary, and publication exclusivity.
+  Test fixture only; the fixture worker's strict release reader, retry budget,
+  absolute deadline, watcher handling, and production behavior are unchanged.
+
 ## [0.1.0-dev.236]
 
 ### Changed

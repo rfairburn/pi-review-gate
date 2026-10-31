@@ -1439,6 +1439,17 @@ gesture (see
 confirmations, and the narrow sidebar overlay are not
 native Main click targets. Once Main already has focus, mouse input keeps its existing
 native behavior.
+A mouse wheel (or the equivalent terminal wheel report) inside the left session list
+scrolls that list's own window: later entries come into view downward and earlier
+entries upward whenever the roster is longer than the visible page. The host handles
+that gesture and never forwards it to a child, so scrolling the list never scrolls the
+hosted conversation beside it; it activates no row, leaves the highlighted entry,
+keyboard focus, sidebar visibility, and the active Main owner unchanged, and a list that
+already fits one page does not move. Arrow keys keep their existing behavior before and
+after wheeling, including moving the highlight to an entry that is off-screen and
+bringing it into view. No wheel preference, acceleration, smooth-scrolling mode, or
+rows-per-notch setting is added, and hosted-conversation and popup scrolling are
+unchanged.
 While a host UI occupies the right-hand pane beside the visible roster, the roster stays
 clickable. A single left click on a *different* left row first closes that right-hand UI
 through its own cancellation route — the same route its keyboard cancel uses, so an

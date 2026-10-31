@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.235]
+
+### Changed
+
+- **Popup image-paste regression recognizes native wrapping** (#502): the native
+  fullscreen test now matches the complete pasted path across the actual adjacent
+  wrapped popup-editor rows in one rendered frame, while still requiring the
+  post-paste popup redraw and unchanged native draft. Added synthetic coverage for
+  wrapped, unwrapped, and non-contiguous rows. Test fixture only; production behavior
+  is unchanged.
+
 ## [0.1.0-dev.234]
 
 ### Changed

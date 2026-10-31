@@ -442,6 +442,7 @@ node --test dist-test/tests/session-host-network-roster-bridge.test.js
 node --test dist-test/tests/session-host-network-peer-coordinator-saved.test.js
 node --test dist-test/tests/session-host-network-native-saved-provider.test.js
 node --test dist-test/tests/peer-saved-sidebar.test.js
+node --test dist-test/tests/session-host-main-network-saved.test.js
 ```
 
 They are separate proof levels:
@@ -463,6 +464,13 @@ They are separate proof levels:
   authorization without running a native Pi child.
 - `peer-saved-sidebar.test.ts` covers the pure picker: selected-host display, bounded
   windows, written-frame authority, confirmations, and request lifetimes.
+- `session-host-main-network-saved.test.ts` covers Main's own remote Saved wiring on
+  the shared Main harness fakes and controlled owner DTOs: the owner Saved view Main
+  hands its coordinator, actually-written-frame admission, owner delete-exposure
+  decisions at the queued write, and one-request-per-owner reads. Main's local Saved
+  cases and their shared local Saved fixtures stay in `session-host-main.test.ts`. This
+  file is synthetic Main wiring proof, not a real peer, native Pi child, saved
+  conversation file, two-machine owner operation, or operator acceptance.
 
 The Saved policy cases distinguish current client exposure preflight from the owner's
 once-per-request admission decision. They cover current Off blocking send, Off then On

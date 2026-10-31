@@ -65,6 +65,7 @@ import {
   type PeerCreateController,
   type PeerCreateResult,
 } from "./network/peer-create";
+import { isOwnerRenameFacts, type OwnerRenameFacts, type OwnerRenameRequest, type PeerCoordinatorWithRename, type PeerRenameResult } from "./network/peer-rename";
 import { createNativeSavedCatalogView, type NativeSavedCatalogReadOptions } from "./network/native-saved-provider";
 import {
   isOwnerSavedDeleteFacts,
@@ -151,6 +152,10 @@ import {
   CREATE_ON_PEER_OTHER_RUN_NOTICE,
   CREATE_ON_PEER_UNCERTAIN_NOTICE,
   CREATE_ON_PEER_UNWRITTEN_NOTICE,
+  REMOTE_EDIT_NOT_DRAWN_NOTICE,
+  REMOTE_EDIT_TARGET_CHANGED_NOTICE,
+  REMOTE_EDIT_UNSUPPORTED_NOTICE,
+  REMOTE_EDIT_UNWRITTEN_NOTICE,
   REMOTE_SAVED_DELETE_OFF_NOTICE,
   REMOTE_SAVED_OTHER_RUN_NOTICE,
   REMOTE_SAVED_UNCERTAIN_NOTICE,
@@ -158,11 +163,13 @@ import {
   REMOTE_SAVED_UNWRITTEN_NOTICE,
   type SidebarAction,
   type SidebarCreateFormPresentation,
+  type SidebarEditFormPresentation,
   type SidebarFieldFactoryOptions,
   type SidebarItem,
   type SidebarMainOwnerKey,
   type SidebarMousePresentation,
   type SidebarRemoteCloseRow,
+  type SidebarRemoteEditRow,
   type SidebarSavedPickerPresentation,
   type SidebarScrollDirection,
 } from "./sidebar";
@@ -581,6 +588,14 @@ interface RemoteCloseConfirmationFrame {
   settled: boolean;
 }
 
+/** One remote Edit frame and the outer geometry of its actual writer receipt. */
+interface EditFormFrame extends SidebarEditFormPresentation {
+  readonly terminalCols: number;
+  readonly terminalRows: number;
+  readonly epoch: number;
+  settled: boolean;
+}
+
 /**
  * One frozen New-form frame: exactly what the sidebar drew (host identity, the
  * DTO's observed owner run, and the canonical workspace the field held), the
@@ -679,6 +694,16 @@ function sameMouseAuthorization(a: MouseFramePresentation, b: MouseFramePresenta
   if (a.contentKey !== b.contentKey) return false;
   if (a.layout.sidebar === undefined && a.layout.form === undefined) return true;
   return a.sidebar.authorizationKey === b.sidebar.authorizationKey;
+}
+
+/** Native tuple and owner labels are part of the written Edit intent. */
+function sameRemoteEditRow(a: SidebarRemoteEditRow | undefined, b: SidebarRemoteEditRow | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.hostId === b.hostId && a.hostRunId === b.hostRunId && a.rowId === b.rowId
+    && a.nativeSessionId === b.nativeSessionId && a.nativeSessionEpoch === b.nativeSessionEpoch
+    && a.row === b.row && a.height === b.height && a.cols === b.cols && a.rows === b.rows
+    && a.focus === b.focus
+    && a.title === b.title && a.hostLabel === b.hostLabel;
 }
 
 /**
@@ -1381,6 +1406,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * only when that exact candidate is reported written.
    */
   let createFormFrame: CreateFormFrame | undefined;
+  let editFormFrame: EditFormFrame | undefined;
+  /** Consumed UI frame tokens never authorize another send, including redraws. */
+  let consumedRemoteRenameToken = 0;
   /**
    * Advances on every terminal reflow/geometry retirement. A remote-New receipt
    * carries the epoch it was composed under, so a resize that returns to the same
@@ -2059,6 +2087,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // path: the owner's own provider decides, and only a peer that negotiated
         // the optional capability can ever reach it.
         createOwnedSession,
+        // Rename uses this same host's existing verified native-name operation.
+        renameOwnedSession,
         // OWNER Saved serving: the real native Saved catalog view over the SAME
         // owning-host service (its guarded Resume/Delete primitives and its
         // non-mutating delete preparation) and the exact native listing inputs the
@@ -2425,6 +2455,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // is captured the same way, so a remote submission can require the
         // writer's receipt for THIS frame rather than a later render.
         const createFormPresentation = sidebar.captureCreateFormPresentation();
+        const editFormPresentation = sidebar.captureEditFormPresentation();
         // The remote Saved picker's own drawn frame (Local pickers have none),
         // captured the same way beside this exact composition.
         const savedPickerPresentation = sidebar.captureSavedPickerPresentation();
@@ -2494,6 +2525,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             || !sameRemoteCloseRow(
               displayedMousePresentation.sidebar.remoteClose, mousePresentation.sidebar.remoteClose,
             )
+            || !sameRemoteEditRow(displayedMousePresentation.sidebar.remoteEdit, mousePresentation.sidebar.remoteEdit)
             || displayedMousePresentation.remoteCloseEpoch !== mousePresentation.remoteCloseEpoch
             // A mode- or source-only change can render identical bytes. It is still
             // a new native IO boundary, so the next frame must be actually written
@@ -2505,6 +2537,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
               || !sameRemoteCloseRow(
                 latestMousePresentation.sidebar.remoteClose, mousePresentation.sidebar.remoteClose,
               )
+              || !sameRemoteEditRow(latestMousePresentation.sidebar.remoteEdit, mousePresentation.sidebar.remoteEdit)
               || latestMousePresentation.remoteCloseEpoch !== mousePresentation.remoteCloseEpoch
               || !sameNativeIoReceipt(latestMousePresentation.nativeInput, mousePresentation.nativeInput)))) {
           writer.invalidate?.();
@@ -2642,6 +2675,20 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           }
         }
         createFormFrame = nextCreateFormFrame;
+        let nextEditFormFrame: EditFormFrame | undefined;
+        if (editFormPresentation !== undefined) {
+          const previous = editFormFrame;
+          if (previous !== undefined && previous.renderToken === editFormPresentation.renderToken
+            && previous.terminalCols === cols && previous.terminalRows === rows
+            && previous.epoch === createFormEpoch) {
+            nextEditFormFrame = previous;
+          } else {
+            nextEditFormFrame = { ...editFormPresentation, terminalCols: cols, terminalRows: rows,
+              epoch: createFormEpoch, settled: false };
+            writer.invalidate?.();
+          }
+        }
+        editFormFrame = nextEditFormFrame;
         let nextSavedPickerFrame: RemoteSavedPickerFrame | undefined;
         if (savedPickerPresentation !== undefined && formSlot !== undefined
           && formSlot.cols === savedPickerPresentation.cols && formSlot.rows === savedPickerPresentation.rows) {
@@ -2704,6 +2751,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             && isCurrentCreateFormFrame(createFormFrame)
             && (disposition === "written" || (disposition === "unchanged" && createFormFrame.settled))) {
             if (activeSidebar.settleCreateFormRender(createFormFrame.renderToken)) createFormFrame.settled = true;
+          }
+          if (nextEditFormFrame !== undefined && editFormFrame === nextEditFormFrame
+            && isCurrentEditFormFrame(nextEditFormFrame)
+            && (disposition === "written" || (disposition === "unchanged" && nextEditFormFrame.settled))) {
+            if (activeSidebar.settleEditFormRender(nextEditFormFrame.renderToken)) nextEditFormFrame.settled = true;
           }
           // The remote Saved picker receipt: ONLY an actual write of this exact
           // frame, or an unchanged repaint of this same already-settled frame.
@@ -4915,6 +4967,43 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     return { kind: "started", hostRunId: after.hostRunId, rowId: outcome.id };
   }
 
+  /** Rename only this run's exact native conversation through the local seam. */
+  async function renameOwnedSession(
+    request: OwnerRenameRequest,
+    stillAuthorized: () => boolean,
+  ): Promise<OwnerRenameFacts> {
+    const owner = manager;
+    if (owner === undefined || shutdownRequested) return { kind: "refused" };
+    let before: OwningHostInventorySnapshot | undefined;
+    try { before = hostService.readInventorySnapshot(); } catch { return { kind: "unknown" }; }
+    if (before === undefined) return { kind: "unknown" };
+    if (before.hostRunId !== request.hostRunId) return { kind: "refused" };
+    const row = before.rows.find((candidate) => candidate.id === request.rowId);
+    if (row === undefined) return { kind: "refused" };
+    if (row.nativeSession?.sessionId !== request.expectedSessionId
+      || row.nativeSession.epoch !== request.expectedSessionEpoch) return { kind: "stale-session" };
+    let authorized = false;
+    try { authorized = stillAuthorized() === true; } catch { /* No admission authority. */ }
+    if (!authorized || shutdownRequested || manager !== owner) return { kind: "refused" };
+    try {
+      // The manager repeats the native tuple and registration fences before and
+      // after the authenticated broker/reporter round trip. No name is written here.
+      const result = await owner.rename(request.rowId, {
+        expectedSessionId: request.expectedSessionId,
+        expectedSessionEpoch: request.expectedSessionEpoch,
+        name: request.name,
+      });
+      if (shutdownRequested || manager !== owner) return { kind: "unknown" };
+      if (result.status === "renamed") return { kind: "renamed" };
+      if (result.status === "busy") return { kind: "busy" };
+      // A stale tuple, timeout, setter failure, or disconnect AFTER invocation
+      // cannot prove the name was left unchanged. Do not invite automatic replay.
+      return { kind: "unknown" };
+    } catch {
+      return { kind: "unknown" };
+    }
+  }
+
   // --- Requester-side remote Close (the owner's row, asked over roster metadata) ---
 
   /**
@@ -5358,6 +5447,104 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       confirmed: false,
       cachedIdle: drawn.idle,
     }, controller);
+  }
+
+  // --- Remote Edit: the written row and the one existing name editor. ---
+
+  function openRemoteNameEdit(action: Extract<SidebarAction, { type: "edit-remote" }>): void {
+    if (sidebar === undefined) return;
+    const shown = displayedMousePresentation?.sidebar.remoteEdit;
+    const latest = latestMousePresentation?.sidebar.remoteEdit;
+    if (writtenRemoteCloseRow(action) === undefined || shown === undefined
+      || !sameRemoteEditRow(shown, latest)
+      || shown.hostId !== action.hostId || shown.hostRunId !== action.hostRunId || shown.rowId !== action.rowId
+      || shown.nativeSessionId !== action.nativeSessionId || shown.nativeSessionEpoch !== action.nativeSessionEpoch) {
+      sidebar.showError(REMOTE_EDIT_NOT_DRAWN_NOTICE);
+      scheduleRedraw();
+      return;
+    }
+    const host = peerUiSnapshot?.hosts?.find((candidate) => candidate.id === action.hostId);
+    const row = host?.roster.rows?.find((candidate) => candidate.id === action.rowId);
+    if (host?.state !== "connected" || host.renameSupported !== true || host.roster.state !== "current"
+      || host.roster.hostRunId !== action.hostRunId || row?.nativeSession?.sessionId !== action.nativeSessionId
+      || row.nativeSession.epoch !== action.nativeSessionEpoch
+      || !sidebar.openRemoteEdit({ hostId: action.hostId, hostRunId: action.hostRunId, rowId: action.rowId,
+        nativeSession: row.nativeSession, currentName: row.nativeSession.name })) {
+      sidebar.showError(REMOTE_EDIT_TARGET_CHANGED_NOTICE);
+    }
+    reconcileLayout(true);
+    scheduleRedraw();
+  }
+
+  function isCurrentEditFormFrame(frame: EditFormFrame): boolean {
+    if (shutdownRequested || externalEditorActive || terminal === undefined || !terminalStarted
+      || sidebar === undefined || !sidebar.visible || sidebar.focus !== "form") return false;
+    if (clampDimension(terminal.columns, 80) !== frame.terminalCols
+      || clampDimension(terminal.rows, 24) !== frame.terminalRows || frame.epoch !== createFormEpoch) return false;
+    const pane = currentCreateFormPane(frame.terminalCols, frame.terminalRows);
+    return pane !== undefined && pane.cols === frame.cols && pane.rows === frame.rows
+      && sidebar.isEditFormRenderCurrent(frame.renderToken);
+  }
+
+  function remoteRenameNotice(result: PeerRenameResult): string {
+    if (result.kind === "not-sent") {
+      if (result.reason === "capability-unsupported") return REMOTE_EDIT_UNSUPPORTED_NOTICE;
+      if (result.reason === "busy" || result.reason === "limit") return "A remote rename is already pending or unavailable; nothing was sent";
+      return "Remote rename was refused before sending; reopen Edit from the current row";
+    }
+    if (result.kind === "owner-result" && isOwnerRenameFacts(result.facts)) {
+      if (result.facts.kind === "refused") return "The owner refused this rename; no name change was made for this request";
+      if (result.facts.kind === "busy") return "The owner is already renaming; this request was not applied";
+      if (result.facts.kind === "stale-session") return "The native session changed; the requested name is unconfirmed";
+    }
+    return "UNCERTAIN: the owner may have renamed the session; verify its current name before retrying";
+  }
+
+  function launchRemoteRename(action: Extract<SidebarAction, { type: "rename-remote" }>): void {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested) return;
+    if (action.renderToken <= consumedRemoteRenameToken) return; // No duplicate send or draft mutation.
+    const frame = editFormFrame;
+    if (frame === undefined || !frame.settled || frame.renderToken !== action.renderToken
+      || frame.formGeneration !== action.formGeneration || frame.hostId !== action.hostId
+      || frame.hostRunId !== action.hostRunId || frame.rowId !== action.rowId
+      || frame.nativeSessionId !== action.nativeSessionId || frame.nativeSessionEpoch !== action.nativeSessionEpoch
+      || frame.name !== action.name || !isCurrentEditFormFrame(frame)
+      || !activeSidebar.renameOnPeerStillCurrent(action)) {
+      activeSidebar.failRename(action.requestId, REMOTE_EDIT_UNWRITTEN_NOTICE);
+      scheduleRedraw();
+      return;
+    }
+    consumedRemoteRenameToken = action.renderToken;
+    editFormFrame = undefined;
+    let controller: Partial<PeerCoordinatorWithRename>["ownerRename"];
+    try { controller = (peerCoordinator as Partial<PeerCoordinatorWithRename> | undefined)?.ownerRename; }
+    catch { controller = undefined; }
+    if (controller === undefined || typeof controller.renameSession !== "function") {
+      activeSidebar.failRename(action.requestId, REMOTE_EDIT_UNSUPPORTED_NOTICE);
+      scheduleRedraw();
+      return;
+    }
+    const stillCurrent = (): boolean => isCurrentEditFormFrame(frame) && activeSidebar === sidebar
+      && activeSidebar.renameOnPeerStillCurrent(action);
+    void (async () => {
+      let result: PeerRenameResult;
+      try {
+        result = await controller.renameSession({ hostId: action.hostId, hostRunId: action.hostRunId, rowId: action.rowId,
+          expectedSessionId: action.nativeSessionId, expectedSessionEpoch: action.nativeSessionEpoch, name: action.name },
+        { stillCurrent });
+      } catch { result = { kind: "unknown" }; }
+      if (shutdownRequested || sidebar !== activeSidebar) return;
+      if (result.kind === "owner-result" && isOwnerRenameFacts(result.facts) && result.facts.kind === "renamed"
+        && activeSidebar.renameOnPeerStillCurrent(action)) {
+        activeSidebar.completeRename(action.requestId, "renamed");
+      } else {
+        // requestId alone owns error delivery; a later form ignores this entirely.
+        activeSidebar.failRename(action.requestId, remoteRenameNotice(result));
+      }
+      reconcileLayout(true);
+      scheduleRedraw();
+    })();
   }
 
   // --- Requester-side remote New (`create-on-peer`). ---
@@ -6467,6 +6654,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         reconcileLayout(true);
         scheduleRedraw();
         return;
+      case "edit-remote":
+        openRemoteNameEdit(action);
+        return;
+      case "rename-remote":
+        launchRemoteRename(action);
+        return;
       case "edit": {
         if (!sidebar) return;
         const row = views.find((candidate) => candidate.id === action.id);
@@ -6782,6 +6975,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     createFormFrame = undefined;
     pendingCreatedRemote = undefined;
     sidebar?.invalidateCreateFormPresentation();
+    editFormFrame = undefined;
+    sidebar?.invalidateEditFormPresentation();
     // Ephemeral per-target reminders never outlive this host run. An in-flight
     // close already handed to the owner is never re-sent or cancelled here.
     remoteCloseMarkers.clear();

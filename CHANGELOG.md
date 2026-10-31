@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.230]
+## [0.1.0-dev.236]
 
 ### Fixed
 
@@ -44,6 +44,117 @@ dates.
   full closure: an already-triggered wake cannot be withdrawn through the public
   extension API, so a suppressed checkpoint still costs one model turn. Issue #456
   (default `ShellStart` check-in callbacks/period) is independent and untouched here.
+
+## [0.1.0-dev.235]
+
+### Changed
+
+- **Popup image-paste regression recognizes native wrapping** (#502): the native
+  fullscreen test now matches the complete pasted path across the actual adjacent
+  wrapped popup-editor rows in one rendered frame, while still requiring the
+  post-paste popup redraw and unchanged native draft. Added synthetic coverage for
+  wrapped, unwrapped, and non-contiguous rows. Test fixture only; production behavior
+  is unchanged.
+
+## [0.1.0-dev.234]
+
+### Changed
+
+- **Escape-cancellation regression case observes its exact reviewer child** (#502): the
+  fixture now uses one canonical reviewer script for both the configured reviewer and
+  its spawn matcher, captures the first matching `process.execPath -e <script>` child,
+  and requires the published PID file to contain that child's complete positive integer
+  PID rather than checking numeric-PID liveness alone. Cancellation liveness and
+  settlement are read from the owned child's own exit and close events. One canonical
+  positive-settlement proof — matching positive exit-code or signal close evidence
+  against that child's own terminal state and observed exit — gates both the
+  post-cancellation wait and fixture cleanup, so a missing capture or unknown,
+  non-positive, or inconsistent close preserves the fixture rather than authorizing
+  its removal; cleanup signals only the exact child while it is still live. A small
+  synthetic control covers those positive and negative settlement decisions without
+  spawning a process. Reviewer acknowledgement and completion notice ordering,
+  release/modified-Escape non-cancellation, cancellation tombstone and resumption
+  assertions, and product cancellation, ownership, and settlement contracts are
+  unchanged; this is a test-only change.
+
+## [0.1.0-dev.233]
+
+### Fixed
+
+- **POSIX permission fixtures establish their requested setgid modes** (#502): the
+  fixture root now takes the account's primary group before any directory is created,
+  so a root that inherited a foreign group cannot silently strip setgid from a
+  requested mode. Fixture setup also asserts that the real setgid and private-directory
+  modes were established before invoking the production guard. All existing production
+  refusal and no-repair assertions, content, link, ACL, and platform/skip coverage, and
+  the production permission policy remain unchanged.
+
+## [0.1.0-dev.232]
+
+### Tests
+
+- **Saved-deletion fixture waits for its current result before deleting** (#502): the
+  confirmed Saved-deletion test now filters by the fixture's quoted indexed session
+  identity instead of the displayed caption, which this fixture's SDK listing does
+  not expose as search text. Quoting selects the native exact-phrase grammar so only
+  the literal identity matches; a raw fuzzy query could also match the sibling row
+  through the fixture directories' shared working-directory path. The test records
+  the owning picker, query revision, and written-frame count before typing; requires
+  the typed query to advance exactly one revision and a newer written frame to retain
+  the same picker and current revision; witnesses the sibling's rendered row prefix
+  before filtering; and checks that prefix is absent while the selected caption is
+  actually rendered, rather than treating the query line or an empty placeholder as
+  the selected result or comparing a caption the pane truncates. The speculative
+  retry loop is replaced by the normal next-turn wait. All existing deletion,
+  shell-free trash fallback, sibling isolation, Main-owner, cancellation, no-input,
+  native-viewport, and shutdown assertions are preserved; production behavior is
+  unchanged.
+
+## [0.1.0-dev.231]
+
+### Changed
+
+- **The concurrent bootstrap fixture stopped re-running its own setup** (Refs #194):
+  the concurrent bootstrap case `.sh concurrent download/extraction producers both start; a
+  held lock only skips cleanup` now seeds its four completed fallback-runtime
+  generations with the existing shared seeding helper — real private directories in that
+  fixture's own cache carrying this fixture's synthetic Node program, the internal
+  relative npm link, and a nonempty representative payload — instead of performing four
+  preparatory wrapper launches first. The case still observes three real install actions:
+  the directly spawned producer that holds the download, the contending launch that must
+  not be refused, and the converging launch that brings the cache back to five. Its
+  five-generation observation, no-capacity-refusal and busy-cleanup-lock assertions,
+  concurrent-creation bound and convergence assertion are unchanged, as is the
+  shared helper itself.
+- **Two peer-coordinator shutdown cases stopped waiting out their own liveness timer**
+  (Refs #194): in `a held superseded-start retirement starts its own deadline and never
+  reports a settled off` and `a listener close callback that never arrives is bounded,
+  keeps the off intent, and rejects close`, the 12-second referenced timer that keeps the
+  event loop alive for the production deadline under test is now cleared once that real
+  settlement and the case's owned listener-close teardown have finished, instead of being
+  awaited after them. The timer still covers the whole deadline it witnesses and widens
+  nothing: the existing ownership and owned-settlement bounds, the stuck-shutdown,
+  re-entry, sticky-record, and stored-preference assertions, the bound that shutdown
+  rejects from the sticky record rather than waiting again, and the teardown ordering are
+  unchanged.
+  Test fixtures only: production code, production deadlines, other tests, and CI
+  workflows are unchanged, and no speedup is claimed here — measured CI timing remains
+  for the actual pull request run. #194 stays open with its remaining scope.
+
+## [0.1.0-dev.230]
+
+### Changed
+
+- **Session-host remote-input code and test ownership** (#502): isolate Main's pure
+  remote native-input validation and written-receipt comparison, and group its remote
+  input/copy regression cases in a dedicated suite using shared fixtures. Input authority,
+  receipt identity, lifecycle ownership, and supported behavior remain unchanged.
+
+### Fixed
+
+- **Native PTY test fixture preservation** (#502): retain the owned fixture when child
+  exit remains unconfirmed instead of removing it after disposal alone. Existing native
+  input and shutdown assertions remain in place.
 
 ## [0.1.0-dev.229]
 

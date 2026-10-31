@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.232]
+## [0.1.0-dev.235]
 
 ### Changed
 
@@ -25,6 +25,60 @@ dates.
   post-paste popup redraw and unchanged native draft. Added synthetic coverage for
   wrapped, unwrapped, and non-contiguous rows. Test fixture only; production behavior
   is unchanged.
+
+## [0.1.0-dev.234]
+
+### Changed
+
+- **Escape-cancellation regression case observes its exact reviewer child** (#502): the
+  fixture now uses one canonical reviewer script for both the configured reviewer and
+  its spawn matcher, captures the first matching `process.execPath -e <script>` child,
+  and requires the published PID file to contain that child's complete positive integer
+  PID rather than checking numeric-PID liveness alone. Cancellation liveness and
+  settlement are read from the owned child's own exit and close events. One canonical
+  positive-settlement proof — matching positive exit-code or signal close evidence
+  against that child's own terminal state and observed exit — gates both the
+  post-cancellation wait and fixture cleanup, so a missing capture or unknown,
+  non-positive, or inconsistent close preserves the fixture rather than authorizing
+  its removal; cleanup signals only the exact child while it is still live. A small
+  synthetic control covers those positive and negative settlement decisions without
+  spawning a process. Reviewer acknowledgement and completion notice ordering,
+  release/modified-Escape non-cancellation, cancellation tombstone and resumption
+  assertions, and product cancellation, ownership, and settlement contracts are
+  unchanged; this is a test-only change.
+
+## [0.1.0-dev.233]
+
+### Fixed
+
+- **POSIX permission fixtures establish their requested setgid modes** (#502): the
+  fixture root now takes the account's primary group before any directory is created,
+  so a root that inherited a foreign group cannot silently strip setgid from a
+  requested mode. Fixture setup also asserts that the real setgid and private-directory
+  modes were established before invoking the production guard. All existing production
+  refusal and no-repair assertions, content, link, ACL, and platform/skip coverage, and
+  the production permission policy remain unchanged.
+
+## [0.1.0-dev.232]
+
+### Tests
+
+- **Saved-deletion fixture waits for its current result before deleting** (#502): the
+  confirmed Saved-deletion test now filters by the fixture's quoted indexed session
+  identity instead of the displayed caption, which this fixture's SDK listing does
+  not expose as search text. Quoting selects the native exact-phrase grammar so only
+  the literal identity matches; a raw fuzzy query could also match the sibling row
+  through the fixture directories' shared working-directory path. The test records
+  the owning picker, query revision, and written-frame count before typing; requires
+  the typed query to advance exactly one revision and a newer written frame to retain
+  the same picker and current revision; witnesses the sibling's rendered row prefix
+  before filtering; and checks that prefix is absent while the selected caption is
+  actually rendered, rather than treating the query line or an empty placeholder as
+  the selected result or comparing a caption the pane truncates. The speculative
+  retry loop is replaced by the normal next-turn wait. All existing deletion,
+  shell-free trash fallback, sibling isolation, Main-owner, cancellation, no-input,
+  native-viewport, and shutdown assertions are preserved; production behavior is
+  unchanged.
 
 ## [0.1.0-dev.231]
 

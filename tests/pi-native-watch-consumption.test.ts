@@ -24,7 +24,16 @@
  *    provider contexts must never carry that execution's active-work
  *    assertion. A no-guard candidate reproduces it (verified against the
  *    unpatched base build in the phase evidence).
- * 4. raw history stays: every persisted `custom_message` checkpoint entry keeps
+ * 4. the same-drain user steer (the official finding): with the host's public
+ *    `set_steering_mode` mode `all`, a checkpoint fires while a foreground tool
+ *    is still busy and a real USER steering message is queued after the
+ *    checkpoint fired but before the tool finishes. Both drain in the SAME
+ *    turn, and one provider request must carry the valid checkpoint AND the
+ *    user content before the run's natural stop, with the foreground command
+ *    completing normally and that checkpoint's entry receiving NO context edit.
+ *    An adjacency-only guard reproduces the false retirement here (verified
+ *    against the unpatched base build in the phase evidence).
+ * 5. raw history stays: every persisted `custom_message` checkpoint entry keeps
  *    its original text, and each suppression lands as Pi's append-only
  *    `context_edit` with `replacement: null` — future model context only.
  *
@@ -46,6 +55,7 @@ import { createBgShellWakeFixture, type BgShellWakeFixture } from "./pi-native-b
 import { skipOrFail } from "./bridge-fakes";
 
 const WATCH_ASSERTION = "is due while work remains active";
+const SAME_DRAIN_STEER = "NATIVE-WATCH-SAME-DRAIN-STEER";
 
 function checkPrerequisites(t: { skip(message?: string): void }): boolean {
   const candidate = process.env.PI_REVIEW_GATE_CANDIDATE_ENTRY;
@@ -321,6 +331,95 @@ const timer=setInterval(()=>{if(mine&&fs.existsSync(mine+'.release')){clearInter
     "a successful recovery must not rehabilitate the omitted checkpoint in a later run");
   }
 
+  // ── Scenario 4: a real user steer drains in the SAME turn as the checkpoint ─
+  // Pi's supported queue mode (`set_steering_mode` mode `all`) releases a due
+  // checkpoint and a queued user message together at the turn boundary. The
+  // user message is same-drain traffic, not a new turn, so withholding the
+  // still-valid checkpoint and editing its entry out of future context is the
+  // failure this regression pins.
+  const executionD = await addExecution("NATIVE-WATCH-SAME-DRAIN", 4);
+  await fixture.rpc("set_steering_mode", { mode: "all" });
+  const sameDrainDelayMs = 6_000;
+  await armWatch(executionD, "6s");
+  // The arm completed no later than this instant, so the checkpoint's deadline
+  // is at most `sameDrainDelayMs` ahead of it. The busy run below starts
+  // immediately and its foreground command outlives that deadline by a wide
+  // margin, so the checkpoint is genuinely QUEUED (never yet injected or read)
+  // when the user steering message is sent behind it.
+  const armedNoLaterThan = Date.now();
+  const drainBegin = fixture.journal().length;
+  await fixture.setTurnScript([
+    { toolCalls: [{ toolName: "bash", arguments: { command: "sleep 14; echo busy-d" } }] },
+    ...stopSteps(12, "native-watch-same-drain-ack"),
+  ]);
+  await fixture.prompt("run a long tool while the checkpoint is pending");
+  assert.ok(await fixture.waitFor(() => fixture.journal().slice(drainBegin).some((entry) => entry.event === "message_end"
+    && entry.role === "assistant" && /toolCall:bash/.test(entry.preview ?? "")), 60_000),
+  `the long tool call never started; journal=${JSON.stringify(fixture.journal().slice(drainBegin))}\n${fixture.stderr}`);
+  // Past the deadline, still inside the foreground command: queue the real USER
+  // steering message AFTER the checkpoint fired and BEFORE the tool finishes.
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, armedNoLaterThan + sameDrainDelayMs + 2_000 - Date.now())));
+  const steerDisposition = await fixture.rpc("steer", { message: `${SAME_DRAIN_STEER} use the other flag` });
+  assert.match(JSON.stringify(steerDisposition), /queued/, `the user steering message was not queued: ${JSON.stringify(steerDisposition)}\n${fixture.stderr}`);
+  // The drain is journalled in quick succession — the checkpoint injection,
+  // the user steering behind it, then the provider request they both feed — so
+  // wait for the whole boundary before snapshotting. A poll that lands inside
+  // that batch must not read a half-written run; the content assertions below
+  // stay exactly as they are, so the unpatched control still fails for
+  // withholding the still-valid checkpoint.
+  let drainBoundary: { run: ReturnType<typeof fixture.journal>; watchStart: number; userStart: number } | undefined;
+  assert.ok(await fixture.waitFor(() => {
+    const run = fixture.journal().slice(drainBegin);
+    const watch = run.findIndex((entry) => entry.event === "message_start"
+      && entry.customType === "pi-review-subtask-watch");
+    const steer = run.findIndex((entry) => entry.event === "message_start" && entry.role === "user"
+      && (entry.preview ?? "").includes(SAME_DRAIN_STEER));
+    if (watch < 0 || steer <= watch || !run.slice(steer + 1).some((entry) => entry.event === "model_request")) return false;
+    drainBoundary = { run, watchStart: watch, userStart: steer };
+    return true;
+  }, 90_000),
+  `the due checkpoint and the queued user steering were never drained into one provider request; journal=${JSON.stringify(fixture.journal().slice(drainBegin))}\n${fixture.stderr}`);
+  const { run: drainRun, watchStart, userStart } = drainBoundary!;
+  // The checkpoint was still pending through every earlier request of this run:
+  // none of them carried it, so the drain request is genuinely its first.
+  const carriesCheckpoint = (entry: { transcriptPreview?: Array<{ preview?: string }> }) => (entry.transcriptPreview ?? [])
+    .some((message) => (message.preview ?? "").includes(`${executionD} ${WATCH_ASSERTION}`));
+  const beforeDrain = drainRun.slice(0, watchStart).filter((entry) => entry.event === "model_request");
+  assert.ok(beforeDrain.length >= 1, "the busy run made no provider request before the checkpoint drained");
+  for (const request of beforeDrain) {
+    assert.ok(!carriesCheckpoint(request), `the still-queued checkpoint reached an earlier request: ${JSON.stringify(request)}`);
+  }
+  // One turn drained both messages: no assistant response separates them, and
+  // the drain request itself carries the valid checkpoint AND the user content.
+  const drainRequestOffset = drainRun.slice(userStart).findIndex((entry) => entry.event === "model_request");
+  assert.ok(drainRequestOffset >= 0, `no provider request followed the drain: ${JSON.stringify(drainRun.slice(userStart))}\n${fixture.stderr}`);
+  assert.ok(!drainRun.slice(watchStart, userStart + drainRequestOffset).some((entry) => entry.event === "message_end" && entry.role === "assistant"),
+    "the checkpoint and the user steering drained in the SAME turn, with no response between them");
+  const drainRequest = drainRun[userStart + drainRequestOffset]!;
+  assert.ok(carriesCheckpoint(drainRequest),
+    `the same-drain request withheld a still-valid checkpoint: ${JSON.stringify(drainRequest)}\n${fixture.stderr}`);
+  assert.ok((drainRequest.transcriptPreview ?? []).some((message) => (message.preview ?? "").includes(SAME_DRAIN_STEER)),
+    `the same-drain request lost the queued user steering: ${JSON.stringify(drainRequest)}\n${fixture.stderr}`);
+  // The probe indexes scripted steps from the newest user message, so the drain
+  // itself re-reads step zero; rewrite the script now that the drain is proven.
+  await fixture.setTurnScript(stopSteps(12, "native-watch-same-drain-ack"));
+  // The in-flight command completed normally into context, and nothing in the
+  // drain run was aborted or errored: this is a clean same-drain delivery.
+  assert.ok(await fixture.waitFor(() => fixture.journal().slice(drainBegin).some((entry) => entry.event === "model_request"
+    && (entry.transcriptPreview ?? []).some((message) => message.role === "toolResult"
+      && (message.preview ?? "").includes("busy-d"))), 90_000),
+  `the foreground command never completed into context; ${fixture.stderr}`);
+  assert.ok(!fixture.journal().slice(drainBegin).some((entry) => entry.stopReason === "aborted" || entry.stopReason === "error"),
+    `the same-drain run aborted or failed: ${JSON.stringify(fixture.journal().slice(drainBegin))}\n${fixture.stderr}`);
+  assert.ok(drainRun.slice(0, watchStart).some((entry) => entry.event === "message_end" && entry.role === "toolResult"),
+    "both messages drained after the completed foreground tool result");
+  await fixture.setTurnScript(stopSteps(10, "native-watch-same-drain-ack"));
+  releaseWorker(4);
+  assert.ok(await fixture.waitFor(() => fixture.journal().some((entry) => entry.event === "message_start"
+    && entry.customType === "pi-review-subtask-event"
+    && (entry.preview ?? "").includes(executionD)), 90_000), `the fourth execution never settled; ${fixture.stderr}`);
+  assert.ok(await waitIdle(fixture), `the settlement run for ${executionD} never settled; ${fixture.stderr}`);
+
   // ── Raw history: unchanged entries, append-only context edits only ─────────
   const { readFile, readdir } = await import("node:fs/promises");
   const sessionFiles = await readdir(fixture.paths.sessionsDir);
@@ -351,11 +450,13 @@ const timer=setInterval(()=>{if(mine&&fs.existsSync(mine+'.release')){clearInter
   const entryA = watchEntries.find((entry) => entry.executionIds.includes(executionA));
   const entryC = watchEntries.find((entry) => entry.executionIds.includes(executionC));
   const entryB = watchEntries.find((entry) => entry.executionIds.includes(executionB));
-  assert.ok(entryA && entryB && entryC, `all three checkpoint entries must stay in raw history; saw ${JSON.stringify(watchEntries.map((entry) => entry.executionIds))}`);
-  for (const entry of [entryA!, entryB!, entryC!]) {
+  const entryD = watchEntries.find((entry) => entry.executionIds.includes(executionD));
+  assert.ok(entryA && entryB && entryC && entryD, `all four checkpoint entries must stay in raw history; saw ${JSON.stringify(watchEntries.map((entry) => entry.executionIds))}`);
+  for (const entry of [entryA!, entryB!, entryC!, entryD!]) {
     assert.ok(entry.content.includes(WATCH_ASSERTION), "raw checkpoint history must keep its original text verbatim");
   }
   assert.ok(edits.get(entryB!.id) === null, "the never-consumed aborted-run checkpoint was not omitted from future context by an append-only context_edit");
   assert.ok(edits.get(entryC!.id) === null, "the never-consumed settled checkpoint was not omitted from future context by an append-only context_edit");
   assert.ok(!edits.has(entryA!.id), "the consumed checkpoint's history must stay in future model context");
+  assert.ok(!edits.has(entryD!.id), "the valid checkpoint drained beside a user steer must never be edited out of future context");
 });

@@ -2714,7 +2714,11 @@ export class BackgroundExecutionController {
    * `watchContextEditDrafts` returns Pi's supported append-only boundary
    * drafts that make a suppression durable for FUTURE context while raw
    * history, UI, and exports stay unchanged; `retireUnconsumedWatchGenerations`
-   * retires fired-but-unconsumed checkpoints when a run ended aborted.
+   * retires fired-but-unconsumed checkpoints when a run ended aborted;
+   * `beginWatchRun`/`observeWatchInjection` carry the host's own run and
+   * message-start boundaries to the same store so a still-unconsumed
+   * checkpoint's eligibility is decided by its exact originating run instead
+   * of by which message roles happen to follow it.
    */
   watchConsumptionFilter(messages: readonly unknown[], projectionEntries: readonly unknown[] = []): { messages?: unknown[] } {
     return this.wakes.filterWatchCheckpointsForConsumption(messages, projectionEntries);
@@ -2726,6 +2730,14 @@ export class BackgroundExecutionController {
 
   retireUnconsumedWatchGenerations(): void {
     this.wakes.retireUnconsumedWatchGenerations();
+  }
+
+  beginWatchRun(): void {
+    this.wakes.beginWatchRun();
+  }
+
+  observeWatchInjection(message: unknown): void {
+    this.wakes.observeWatchInjection(message);
   }
 
   reviewReadiness(): BackgroundReviewReadinessTask[] {

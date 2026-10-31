@@ -59,6 +59,10 @@ interface Harness {
   armAndDeliver(executionId: string): Promise<BackgroundWatchSubscription>;
   /** The delivered checkpoint as Pi would place it in a built request. */
   deliveredMessage(index?: number): Record<string, any>;
+  /** The host's `message_start` for that payload: the exact injection point. */
+  inject(message: Record<string, any>): Record<string, any>;
+  /** The host's `agent_start`: one new native run with its own identity. */
+  beginRun(): void;
 }
 
 function harness(options: { origin?: string | undefined } = {}): Harness {
@@ -98,12 +102,27 @@ function harness(options: { origin?: string | undefined } = {}): Harness {
         ...delivered.message,
       } as Record<string, any>;
     },
+    inject: (message) => {
+      wakes.observeWatchInjection(message);
+      return message;
+    },
+    beginRun: () => wakes.beginWatchRun(),
   };
   return h;
 }
 
+/** An ordinary USER steering message, as Pi's queue holds it (#452 finding). */
+function userSteering(text = "also rename the flag"): Record<string, any> {
+  return { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+}
+
 function assistant(stopReason: string): Record<string, any> {
   return { role: "assistant", content: [{ type: "text", text: "acknowledged" }], stopReason, timestamp: Date.now() };
+}
+
+/** A delivered payload shaped as the model-visible message Pi holds. */
+function modelMessageOf(payload: Record<string, any>): Record<string, any> {
+  return { role: "custom", timestamp: Date.now(), ...payload };
 }
 
 function delay(ms: number): Promise<void> {
@@ -187,7 +206,7 @@ test("a still-valid checkpoint reaches the model untouched (base control for the
 test("a valid watch survives sibling custom notifications in the same native drain", async () => {
   const h = harness();
   await h.armAndDeliver("exec-a");
-  const message = h.deliveredMessage();
+  const message = h.inject(h.deliveredMessage());
   // The context hook receives AgentMessages before convertToLlm changes
   // custom messages into provider-facing user messages (Pi agent-loop).
   const sibling = { role: "custom", customType: "pi-review-bg-shell", content: "job exited", timestamp: Date.now() };
@@ -196,6 +215,85 @@ test("a valid watch survives sibling custom notifications in the same native dra
   assert.deepEqual(h.wakes.watchOmissionEntryDrafts([
     { type: "custom_message", id: "valid-with-sibling", customType: SUBTASK_WATCH_CUSTOM_TYPE, content: message.content, details: message.details },
   ]), []);
+});
+
+test("a user steering message drained in the SAME native run keeps a valid checkpoint in the request", async () => {
+  // The official #452 finding: Pi's supported `steeringMode: "all"` queue
+  // releases a due checkpoint and a real user steering message together while
+  // the foreground tool is still running. User-role adjacency is not a new
+  // turn, so the still-valid generation must keep its content, must not be
+  // retired, and must never receive a durable omission — in this request or in
+  // any later request that shows it as consumed history.
+  const h = harness();
+  await h.armAndDeliver("exec-a");
+  const message = h.inject(h.deliveredMessage());
+  const branch = [{ type: "custom_message", id: "entry-same-drain", customType: SUBTASK_WATCH_CUSTOM_TYPE, content: message.content, details: message.details }];
+
+  const sameDrain = [message, userSteering()];
+  assert.equal(h.wakes.filterWatchCheckpointsForConsumption(sameDrain).messages, undefined,
+    "a valid checkpoint is not withheld just because a user message drained beside it");
+  assert.deepEqual(h.wakes.watchOmissionEntryDrafts(branch), [], "the same-drain request proposes no context edit");
+
+  // The first following completing response is the consumption proof: the
+  // historical payload stays in every later request, untouched.
+  const historical = [message, userSteering(), assistant("stop")];
+  assert.equal(h.wakes.filterWatchCheckpointsForConsumption(historical).messages, undefined,
+    "the response after the watch and its same-drain user steer consumed it");
+  h.beginRun();
+  assert.equal(h.wakes.filterWatchCheckpointsForConsumption(historical).messages, undefined,
+    "consumed history is still preserved in a later run");
+  assert.deepEqual(h.wakes.watchOmissionEntryDrafts(branch), [],
+    "a later history request still gets no context edit for the valid checkpoint");
+});
+
+test("a live checkpoint is withheld from a later run that never injected it, and the retirement is canonical", async () => {
+  // The counterpart to the same-drain control: the run identity decides, not
+  // the message roles. A checkpoint injected by one run and replayed beside a
+  // LATER run's own user turn has no originating-run evidence in that run, so
+  // it cannot assert active work even while the watched task is still active.
+  const h = harness();
+  await h.armAndDeliver("exec-a");
+  const message = h.inject(h.deliveredMessage());
+  const runOfInjection = h.wakes.watchRunId;
+  assert.equal(h.wakes.filterWatchCheckpointsForConsumption([message, userSteering()]).messages, undefined,
+    "the injection run itself keeps the valid checkpoint");
+
+  h.beginRun();
+  assert.notEqual(h.wakes.watchRunId, runOfInjection, "the store's run identity follows the host's run boundary");
+  const replay = h.wakes.filterWatchCheckpointsForConsumption([message, userSteering()]);
+  assert.deepEqual(replay.messages!.map((entry) => (entry as Record<string, unknown>).role), ["user"],
+    "a prior run's injection never asserts active work in a later run");
+  assert.deepEqual(
+    h.wakes.watchOmissionEntryDrafts([{ type: "custom_message", id: "entry-replay", customType: SUBTASK_WATCH_CUSTOM_TYPE, content: message.content, details: message.details }]),
+    [{ type: "context_edit", targetId: "entry-replay", replacement: null }],
+    "the prior-run claim gets the same durable omission",
+  );
+  // The retirement happened in the canonical store, so a further run stays
+  // withheld instead of re-deciding from the same stale payload.
+  h.beginRun();
+  assert.deepEqual(h.wakes.filterWatchCheckpointsForConsumption([message, userSteering()]).messages!.map((entry) => (entry as Record<string, unknown>).role), ["user"]);
+});
+
+test("an aborted same-drain teardown and a checkpoint with no injection evidence both fail closed", async () => {
+  const h = harness();
+  await h.armAndDeliver("exec-a");
+  const message = h.inject(h.deliveredMessage());
+  // Pi drained the steer during teardown: the first following response is
+  // non-completing, so the user beside it does not turn that into consumption.
+  const tornDown = [message, userSteering(), assistant("aborted")];
+  assert.deepEqual(h.wakes.filterWatchCheckpointsForConsumption(tornDown).messages!.map((entry) => (entry as Record<string, unknown>).role), ["user", "assistant"],
+    "a non-completing following response proves nothing was consumed");
+  h.beginRun();
+  assert.deepEqual(h.wakes.filterWatchCheckpointsForConsumption([message, userSteering(), assistant("aborted")]).messages!.map((entry) => (entry as Record<string, unknown>).role), ["user", "assistant"],
+    "the replayed aborted-run payload stays withheld");
+
+  // A fired generation the host never showed being injected has no originating
+  // run at all: an unattributable live claim is withheld rather than asserted.
+  const h2 = harness();
+  await h2.armAndDeliver("exec-b");
+  const unobserved = h2.deliveredMessage();
+  assert.deepEqual(h2.wakes.filterWatchCheckpointsForConsumption([unobserved, userSteering()]).messages!.map((entry) => (entry as Record<string, unknown>).role), ["user"],
+    "no injection evidence, no active-work claim");
 });
 
 test("an actionable wake retires a fired checkpoint while a sibling stays active, and a rearm supersedes the older generation", async () => {
@@ -301,7 +399,8 @@ test("a coalesced payload keeps only the still-valid execution's original block,
 
   // exec-b settles after the send; exec-a stays active.
   active.set("exec-b", false);
-  const message = { role: "custom", timestamp: Date.now(), ...payload };
+  const message = modelMessageOf(payload);
+  wakes.observeWatchInjection(message);
   const filtered = wakes.filterWatchCheckpointsForConsumption([message]);
   const retained = filtered.messages![0] as Record<string, any>;
   assert.ok(typeof retained.content === "string");
@@ -465,7 +564,8 @@ test("a partial projection can be strengthened to a full omission, and repeated 
   await delay(120);
   const payload = sent[0]!;
   const entry = { type: "custom_message", id: "entry-coal", customType: SUBTASK_WATCH_CUSTOM_TYPE, content: payload.content, details: payload.details };
-  const message = { role: "custom", timestamp: Date.now(), ...payload };
+  const message = modelMessageOf(payload);
+  wakes.observeWatchInjection(message);
 
   // Step 1: only exec-b is obsolete → a content-subset edit lands.
   active.set("exec-b", false);

@@ -136,6 +136,16 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
   read stays in history untouched, other notifications are never altered, and an
   unverifiable checkpoint of this type fails closed to omission rather than assertion.
 
+  What counts as "not yet read" is decided by the host's own run boundaries, not by
+  which messages happen to sit next to the notification. A steering message you send
+  while the parent session is busy can drain in the SAME native run as a due
+  checkpoint (Pi's `all` steering mode delivers the whole queue in one turn), and that
+  is ordinary steering: the still-valid checkpoint reaches the model beside your
+  message, and the run's first completing response consumes it. Only the first
+  following assistant response proves consumption, so a notification first injected by
+  a run that ended without reading it, or one no current run injected at all, stays
+  withheld even while the watched work is still active.
+
   The precise limit is the wake itself: once the notification has been queued to the
   parent session, Pi owns the triggered turn, and no extension API dequeues it. A
   suppressed checkpoint therefore still costs one model turn; what is guaranteed is

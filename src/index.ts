@@ -554,15 +554,20 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
    * cannot cover a checkpoint that was still valid when it was steered and
    * then became obsolete before the owning session's model read it (task
    * settled, watch rearmed, actionable wake retired it, or Pi drained it into
-   * an aborted run's teardown with no provider request at all). These three
-   * top-level hooks decide each queued payload's exact generation against the
+   * an aborted run's teardown with no provider request at all). These top-level
+   * hooks decide each queued payload's exact generation against the
    * controller's one canonical watch lifecycle store, and use Pi's public
-   * append-only `context_edit` boundary draft so a suppression cannot heal in
-   * a later request. They only ever REDUCE an obsolete active-work claim:
+   * append-only `context_edit` boundary draft so a suppression cannot heal in a
+   * later request. They only ever REDUCE an obsolete active-work claim:
    * nothing here arms, sends, settles, or cancels anything, no other
    * notification type is touched, and raw session history, UI, and exports
-   * stay unchanged. Executor runtimes send no watch checkpoint, so the hooks
-   * stay top-level only.
+   * stay unchanged. The run/message-start pair below supplies the store's
+   * supported originating-run evidence: a built request and an injection are
+   * not consumption, and a user message queued behind a still-valid checkpoint
+   * in the SAME native run (`steeringMode: "all"`) is ordinary steering rather
+   * than a new turn, so eligibility is decided by which run actually injected
+   * the payload, not by message-role adjacency. Executor runtimes send no
+   * watch checkpoint, so the hooks stay top-level only.
    */
   const watchContextBranchEntries = (args: unknown[]): readonly unknown[] => {
     const carrier = args.find((arg) => typeof arg === "object" && arg !== null
@@ -606,6 +611,24 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   };
   registerHook(pi, "turn_end", (...args) => watchBoundaryEdits(args));
   registerHook(pi, "agent_before_settle", (...args) => watchBoundaryEdits(args));
+  // #452: the host's own native-run and injection boundaries, recorded on the
+  // SAME canonical watch store. `agent_start` opens one native run whose opaque
+  // token stays stable across every turn of that run — the window in which Pi's
+  // steering queue can drain a due checkpoint and a user message into the same
+  // request — and `message_start` for one of this gate's checkpoint payloads
+  // stamps the exact run that first injected it. A later run replaying that
+  // payload has no matching evidence and fails closed to omission.
+  try {
+    registerHook(pi, "agent_start", () => { executionTools.beginWatchRun(); });
+    registerHook(pi, "message_start", (...args) => {
+      const message = (args[0] as { message?: unknown } | undefined)?.message;
+      if (message !== undefined) executionTools.observeWatchInjection(message);
+    });
+  } catch {
+    // A host without these observation hooks cannot substantiate a pending
+    // checkpoint's injection, so its request-time guard fails closed. Do not
+    // prevent activation: other features retain their own capability gates.
+  }
   // An aborted run consumed nothing: retire every fired-but-unconsumed
   // checkpoint immediately, so a later run cannot inherit an active-work claim
   // even while sibling tasks are still active.

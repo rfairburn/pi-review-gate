@@ -402,6 +402,16 @@ export class ExecutionToolManager {
     this.controller.retireUnconsumedWatchGenerations();
   }
 
+  /** #452: the host's run/message-start boundaries behind the same canonical
+   * watch store's originating-run evidence. */
+  beginWatchRun(): void {
+    this.controller.beginWatchRun();
+  }
+
+  observeWatchInjection(message: unknown): void {
+    this.controller.observeWatchInjection(message);
+  }
+
   startLiveness(fingerprint: string): StartLiveness {
     return this.controller.startLiveness(fingerprint);
   }

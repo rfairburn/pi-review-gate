@@ -40,7 +40,16 @@ dates.
   re-proposed. A pre-identity checkpoint with no stamped generation is targeted by
   its exact native session entry (Pi's projection provenance), never by rendered
   text, so an identical consumed checkpoint is never edited and each identical
-  pending checkpoint gets its own omission. This is the #452 residual, not its
+  pending checkpoint gets its own omission. A real user steering message that Pi
+  drains in the SAME native run as a due checkpoint (`steeringMode: "all"`) is no
+  longer mistaken for a new turn: the still-valid checkpoint keeps its content in
+  that request and in every later request that shows it as consumed history, and
+  gets no omission. The host's own `agent_start` and `message_start` boundaries
+  now supply the watch store's originating-run evidence, so only the first
+  following assistant response decides consumption: an aborted or errored
+  following response, a payload first injected by a run that never consumed it,
+  or a payload the host never showed being injected stays withheld even while the
+  watched work is still active. This is the #452 residual, not its
   full closure: an already-triggered wake cannot be withdrawn through the public
   extension API, so a suppressed checkpoint still costs one model turn. Issue #456
   (default `ShellStart` check-in callbacks/period) is independent and untouched here.

@@ -85,6 +85,17 @@ export interface WatchRecord {
    * shape would otherwise read as a consumed historical checkpoint.
    */
   omissionProposed?: boolean;
+  /**
+   * The opaque token of the ONE native agent run in which the host's own
+   * `message_start` first observed this generation's payload being injected
+   * (#452). Stamped from that exact supported observation, never inferred from
+   * which message roles follow the payload: Pi's `steeringMode: "all"` drains
+   * a still-valid checkpoint and a user steering message in the SAME run, so
+   * user-role adjacency proves nothing. The run identity is what separates
+   * same-drain steering (this run is still consuming) from a later run
+   * replaying a checkpoint its own run never injected (fail closed).
+   */
+  injectedRunId?: string;
 }
 
 /**
@@ -170,6 +181,44 @@ export class WakeDelivery {
     return this.watchOriginTokenValue;
   }
 
+  /**
+   * The opaque identity of the current native agent run (#452). It is rotated
+   * only at the host's own run boundary (`agent_start`) and at the same
+   * detach/reset boundary that rotates the origin, so within one run it is
+   * stable across every turn — which is exactly the window in which Pi's
+   * steering queue can drain a watch checkpoint and a user message together.
+   * Nothing here mirrors a run counter or another owner's lifecycle state.
+   */
+  private watchRunIdValue = randomUUID();
+
+  get watchRunId(): string {
+    return this.watchRunIdValue;
+  }
+
+  /** The host started a new native agent run (`agent_start`). */
+  beginWatchRun(): void {
+    this.watchRunIdValue = randomUUID();
+  }
+
+  /**
+   * The host's `message_start` observed a checkpoint payload being injected
+   * into the current run: stamp the exact first-injected run on the matching
+   * canonical record only (origin, session, execution, and watch identity all
+   * have to agree). A payload the store cannot attribute to one of its own
+   * generations is ignored here and fails closed at consumption time.
+   */
+  observeWatchInjection(message: unknown): void {
+    const identities = subtaskWatchIdentitiesOf(message);
+    if (!identities) return;
+    for (const identity of identities) {
+      const record = this.watches.get(identity.executionId);
+      if (!record || record.subscription.watchId !== identity.watchId
+        || record.subscription.originId !== identity.originId
+        || record.subscription.originToken !== identity.originToken) continue;
+      if (record.injectedRunId === undefined) record.injectedRunId = this.watchRunIdValue;
+    }
+  }
+
   /** Arm a one-shot watch checkpoint subscription for an inspected execution.
    * The controller has already resolved the admission identity/active checks. */
   armWatch(executionId: string, afterMs: number): BackgroundWatchSubscription {
@@ -216,6 +265,7 @@ export class WakeDelivery {
     // origin's queued or persisted checkpoint content undecidable-as-fresh in
     // the new one; nothing here mirrors a session or manager generation.
     this.watchOriginTokenValue = randomUUID();
+    this.watchRunIdValue = randomUUID();
     if (this.watchDeliveryTimer) clearTimeout(this.watchDeliveryTimer);
     this.watchDeliveryTimer = undefined;
   }
@@ -407,20 +457,35 @@ export class WakeDelivery {
     const originBound = typeof currentOrigin === "string" && currentOrigin.length > 0
       && currentOrigin === identity.originId
       && identity.originToken === this.watchOriginTokenValue;
-    const liveBacking = matches && originBound
+    // Supported originating-run evidence (#452): the host's own message_start
+    // stamped this generation's first injection, and that injection belongs to
+    // the run now building the request. A user message sitting after the
+    // payload is NOT a run boundary — with `steeringMode: "all"` Pi drains the
+    // checkpoint and the user steering into the same request — so the run
+    // identity, never message adjacency, decides whether this run is the one
+    // the checkpoint was injected into.
+    const runBound = matches && record.injectedRunId !== undefined && record.injectedRunId === this.watchRunIdValue;
+    const liveBacking = matches && originBound && runBound
       && record.phase === "fired"
       && this.watchWorkStillActive(identity.executionId) === true;
     if (evidence === "consuming") {
       // This request is the content's only consumption opportunity so far, so
       // the canonical lifecycle decides: a generation that already settled,
-      // was retired by an actionable wake, was superseded by a rearm, or lost
-      // its session/origin binding cannot assert active work.
-      return liveBacking ? "keep" : "omit";
+      // was retired by an actionable wake, was superseded by a rearm, lost its
+      // session/origin binding, or was never injected by THIS run cannot
+      // assert active work.
+      if (liveBacking) return "keep";
+      // Injected into an earlier run that ended without ever consuming it: the
+      // generation's window is over even though the deadline passed and a
+      // sibling task is still active, so retire it in the SAME store.
+      if (matches && originBound && record.phase === "fired" && !runBound) record.phase = "retired";
+      return "omit";
     }
-    // Injected into an earlier request that never consumed it (aborted or
-    // errored teardown, or an intervening new turn): retire the generation in
-    // the SAME canonical store so no later run can present it as fresh work,
-    // even while sibling tasks stay active.
+    // The first following response was non-completing (an aborted or errored
+    // teardown): that run consumed nothing, so retire the generation in the
+    // SAME canonical store and let no later run present it as fresh work,
+    // even while sibling tasks stay active and the payload is still replayed
+    // beside that run's own user turn.
     if (matches) record.phase = "retired";
     return "omit";
   }
@@ -443,18 +508,33 @@ export class WakeDelivery {
    * convertToLlm: this hook sees custom AgentMessages, not the user messages
    * that coding-agent/messages.convertToLlm later supplies to the provider.
    *
-   * - "consuming": nothing but same-drain custom messages follows, so this
-   *   very request is the content's first chance to be read.
+   * Only the first FOLLOWING assistant response decides: a request build and
+   * an injection are not consumption, so the scan looks past the same-drain
+   * traffic that Pi legitimately queues behind a still-valid checkpoint.
+   *
+   * - "consuming": no following response yet, so this very request is the
+   *   content's first chance to be read. Whether THIS run is the one the
+   *   payload was injected into is decided by the canonical record's
+   *   first-injected-run identity, not by message roles.
    * - "consumed": the first following response completed (`stop`, `toolUse`,
    *   or `length`), so the owning model read the content.
-   * - "unconsumed": the following response was non-completing, or a new user
-   *   turn intervened before any response.
+   * - "unconsumed": the first following response was non-completing (an
+   *   aborted or errored teardown), so that run consumed nothing.
+   *
+   * A following `user` message is deliberately not evidence of anything: Pi's
+   * supported steering queue drains a user message in the SAME native run as
+   * the checkpoint (`steeringMode: "all"`), which is a legitimate same-drain
+   * steer and not a new turn, while a later run's own user turn is caught by
+   * the originating-run check above. A `toolResult` still fails closed: no
+   * supported drain puts a tool result directly behind a queued checkpoint
+   * without an intervening response, so that shape cannot be attributed.
    */
   private watchConsumptionEvidence(messages: readonly unknown[], index: number): "consuming" | "consumed" | "unconsumed" {
     for (let position = index + 1; position < messages.length; position += 1) {
       const message = messages[position];
       if (!isRecord(message)) continue;
       if (message.role === "custom") continue;
+      if (message.role === "user") continue;
       if (message.role === "assistant") {
         return message.stopReason === "stop" || message.stopReason === "toolUse" || message.stopReason === "length"
           ? "consumed"

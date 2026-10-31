@@ -124,10 +124,13 @@ infers a tool list from the transcript.
   authorizes it, regardless of the restored loadout; both shells keep parity when both
   are authorized. Activity never decides admission or auto-loading.
 - Pi registers its builtin `powershell` on every platform, but Pi can run it only on
-  Windows, using `pwsh.exe` or else `powershell.exe` from PATH. Review-gate identifies
+  Windows: its executor resolves `pwsh.exe` or else `powershell.exe` on PATH, and
+  current Pi additionally probes the `PowerShell\7\pwsh.exe` install location under
+  `%ProgramFiles%` and the System32 Windows PowerShell executable. Review-gate identifies
   the builtin from the public provenance Pi reports for each registered tool
   (`builtin:powershell`) and authorizes it only on Windows when one of those
-  executables resolves; elsewhere it is withheld from the baseline, discovery,
+  executables resolves on PATH; elsewhere, and where only a non-PATH install location
+  exists, it is withheld from the baseline, discovery,
   `tool_search`, and new worker catalogs. Host support is checked at session start and
   on operating-mode changes, never on every reconciliation, so an interpreter installed
   or removed mid-session is noticed at the next of those points. The check proves that

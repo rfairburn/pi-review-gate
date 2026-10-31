@@ -4,6 +4,10 @@ External [pi](https://github.com/badlogic/pi-mono) extension that reviews code c
 after an agent turn and sends the complete classified review pass back to the
 implementing model.
 
+Use the [session sidebar](docs/session-host-alpha.md) to manage multiple native Pi
+sessions in one terminal — our recommended daily-use workflow. Direct standalone
+Pi + review-gate remains fully maintained and supported.
+
 Every completed agent turn is captured as numbered evidence in a review window. One or
 more reviewers run read-only against that evidence and return a structured verdict; the
 gate transmits every result — passing, non-blocking, guidance, and errors — to the
@@ -49,6 +53,10 @@ receipts of exactly what the model was told.
 - **Durable evidence and recovery** — stable evidence bundles, integrity-checked
   execution manifests, landing-manifest crash recovery, and exact-session restart
   restoration ([Recovery](docs/recovery.md)).
+- **Session host sidebar** — manage multiple independent native Pi sessions from one
+  terminal's left sidebar roster, each row an ordinary native Pi session that
+  carries the review gate with its own workspace, conversation, and lifecycle
+  ([Session host](docs/session-host-alpha.md)).
 - **`ApplyPatch` tool** — the canonical OpenAI/Codex apply_patch envelope as its only
   request format (multi-file create/update/rename/delete with sequential application and
   explicit partial-failure reporting), native edit/write path access, atomic staged
@@ -165,6 +173,58 @@ when relevant inputs have changed.
 
 ## Minimal configuration and launch
 
+### Recommended entry point: the session-host sidebar
+
+For day-to-day use, start Pi through the `pi-review-sessions` session host: one terminal,
+one left sidebar roster of your sessions, and the review gate plus the same shared
+configuration in every session the host starts. Each sidebar row is an ordinary native Pi
+session with its own workspace, conversation, and lifecycle. This is the documented
+recommendation for how to launch the gate, not a different review setup, and it changes
+nothing native in Pi. The host is a separate entry point: it does not replace either
+launcher or the ordinary Pi CLI, and it does not attach to already-running standalone
+processes. Start it from a source checkout:
+
+```bash
+./scripts/pi-review-sessions.sh   # macOS/Linux source checkout
+```
+
+```bat
+scripts\pi-review-sessions.cmd    # native Windows source entry point
+```
+
+An installed package exposes the `pi-review-sessions` command. The `.sh` and `.cmd`
+entry points retain a supported Node on PATH or bootstrap the source-pinned official
+Node.js 22.23.4 archive under an isolated per-agent cache when Node is missing or below
+its release line's security floor (macOS/Linux x64 or arm64; Windows x64, arm64, or x86).
+The pinned archive digest is verified and freshly extracted on installation/update; a
+previously completed fallback runtime is reused when it is still current, so later
+fallback launches do not download or extract again. This does not replace a global Node
+install or change normal user configuration. The host launcher also resolves (or
+provisions) the public Pi runtime automatically — no manual Pi CLI path is needed; its
+minimum is stable Pi 1.0.4. The `.cmd` entry point performs the Node bootstrap, while the
+installed `pi-review-sessions` command runs the shared launcher directly and requires a
+supported Node already on `PATH`.
+
+macOS and Linux are the supported host platforms. The same-machine Windows host source
+paths are prepared for native validation only: they establish no Windows support, parity,
+or readiness, and the genuine native Windows runtime cases stay retained but explicitly
+skipped under [#345](https://github.com/rfairburn/pi-review-gate/issues/345), so a green
+Windows matrix job is not Windows runtime evidence. Earlier Windows CI evidence on Node
+22.19.0 and 24.x is historical: it predates the current security floors and is not a
+patched-runtime run. Native startup latency on Windows stays tracked separately under
+[#344](https://github.com/rfairburn/pi-review-gate/issues/344).
+
+Host requirements, options, session and roster semantics, and the physical-terminal limits
+are owned by the [session host guide](docs/session-host-alpha.md), which also covers the
+host-only shortcut configuration/editor.
+
+That recommendation is documentation guidance only. It does not change the package's
+command mapping, default routing, or argument handling: the installed
+`pi-review-gate`/`pi-review-gate-cmd` commands and the source launchers below remain
+fully supported entry points and behave exactly as before.
+
+### Standalone launcher (unchanged and fully supported)
+
 Launch the installed entry point on macOS/Linux:
 
 ```bash
@@ -180,37 +240,6 @@ new-inactive-install\node_modules\.bin\pi-review-gate-cmd.cmd
 Source-checkout equivalents are `./scripts/pi-review-gate.sh` and
 `scripts\pi-review-gate.cmd`; both use the same shared current/preparation state as
 the sidebar and web launchers.
-
-An optional, separate session-host alpha can run multiple independent native Pi sessions
-in one terminal on macOS/Linux. It does not replace either launcher; see the
-[session-host alpha guide](docs/session-host-alpha.md) for requirements, limitations,
-and the host-only shortcut configuration/editor.
-Launch it with the one-command entry points. They retain a supported Node on PATH or
-bootstrap the source-pinned official Node.js 22.23.4 archive under an isolated per-agent
-cache when Node is missing or below its release line's security floor (macOS/Linux x64 or
-arm64; Windows x64, arm64, or x86). The pinned archive digest is verified and freshly
-extracted on installation/update; a previously completed fallback runtime is reused when
-it is still current, so later fallback launches do not download or extract again. This
-does not replace a global Node install or
-change normal user configuration. The launcher also resolves (or provisions) the public
-Pi runtime automatically — no manual Pi CLI path is needed. The `.cmd` entry point
-performs the Node bootstrap. Experimental same-machine Windows source paths for the
-native session-host backend are prepared for validation only: they do not establish
-Windows support, parity, or readiness, and real Windows native runtime validation on
-the patched Node 22 and 24 lines remains required. Earlier Windows CI evidence on Node
-22.19.0 and 24.x is historical: it predates these floors and is not a patched-runtime
-run. POSIX macOS/Linux remains the supported alpha
-host scope:
-
-```bash
-./scripts/pi-review-sessions.sh   # macOS/Linux source checkout
-```
-
-```bat
-scripts\pi-review-sessions.cmd    # native Windows entry point (experimental validation paths only; no Windows readiness claim)
-```
-
-An installed package exposes the `pi-review-sessions` command.
 
 The persistent launcher selects the Pi agent directory's `review-gate.json`
 (`~/.pi/agent/review-gate.json` by default, following `PI_CODING_AGENT_DIR`), then
@@ -314,6 +343,7 @@ Start with the guide for your task:
 | Task | Guides |
 | --- | --- |
 | Install and configure | [Getting started](docs/getting-started.md), [Configuration](docs/configuration.md), [Settings](docs/settings.md) |
+| Launch and host sessions | [Session host](docs/session-host-alpha.md), [Native Pi tools](docs/native-pi-tools.md) |
 | Review and delegate | [Review workflow](docs/review-workflow.md), [Delegated execution](docs/delegated-execution.md), [Scheduled tasks](docs/scheduled-tasks.md) |
 | Research and browse | [Web tools](docs/web-tools.md), [Browser guide](docs/browser.md), [Browser permissions](docs/browser-permissions.md) |
 | Inspect and recover | [Subtask evidence](docs/subtask-evidence.md), [Recovery](docs/recovery.md), [Troubleshooting](docs/troubleshooting.md) |

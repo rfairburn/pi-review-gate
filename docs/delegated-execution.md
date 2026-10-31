@@ -1006,15 +1006,17 @@ records — is owned by [Subtask evidence](subtask-evidence.md).
 ## Notifications and UI
 
 The default **Quiet** notification mode keeps ordinary running and reviewing transitions
-in passive UI telemetry while still notifying for every task landing, failure, conflict,
-or recovery requirement, except synchronous landings confirmed by the orchestrator's own
-tool result (see below). **Noisy** additionally starts turns for running and reviewing
-transitions. In quiet mode, each failed, conflicted, or recovery-required task wakes the
-orchestrator, as does each `LANDED` task other than the synchronous tool-confirmed
-landings described below, while ordinary `RUNNING` and `REVIEWING` transitions remain
-passive UI telemetry; noisy mode additionally wakes on those two interactive states.
+in passive UI telemetry while still notifying for every task completion (a landing or a
+report), failure, conflict, or recovery requirement, except synchronous landings confirmed
+by the orchestrator's own tool result (see below). **Noisy** additionally starts turns for
+running and reviewing transitions. In quiet mode, each failed, conflicted, or
+recovery-required task wakes the orchestrator, as does each completed task — `LANDED` for
+execute tasks and `REPORTED` for research tasks and in-place tasks that settled in place —
+other than the synchronous tool-confirmed landings described below, while ordinary
+`RUNNING` and `REVIEWING` transitions remain passive UI telemetry; noisy mode additionally
+wakes on those two interactive states.
 
-Every task landing is reported immediately with its still-active siblings so the
+Every task completion is reported immediately with its still-active siblings so the
 orchestrator can top off freed capacity without waiting for the entire execution. The one
 exception is a synchronous landing triggered by the orchestrator itself — `SubtasksForceMerge`,
 `SubtasksInterrupt` with `interrupt_with_merge`, or a gate cleared by `SubtasksMarkClean`:

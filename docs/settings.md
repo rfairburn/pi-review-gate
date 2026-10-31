@@ -100,8 +100,10 @@ supplies the live switch (the ordinary extension entry point always does):
   once, not how many tasks one `SubtasksStart`/`SubtasksAdd` call may submit or how
   many unsettled tasks an execution may hold — see
   [Worker resources, routes, and concurrency](delegated-execution.md#worker-resources-routes-and-concurrency).
-- **Retry policy** configures bounded executor/reviewer recovery: retry count,
-  exponential-backoff bounds, jitter, and the repeated-incident guard.
+- **Retry policy** (the menu titles this section **Executor retry policy**) configures
+  bounded executor and worker candidate-review recovery: retry count, exponential-backoff
+  bounds, jitter, and the repeated-incident guard. It governs executor retries and failover
+  plus review-error retries for execute and in-place workers.
 - **Subtask notifications** defaults to **Quiet**. See
   [Delegated execution](delegated-execution.md#notifications-and-ui).
 - **Tools** opens the **Tools** submenu: two independent exact-name deny

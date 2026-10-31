@@ -506,9 +506,11 @@ when a model emits an actionable non-passing result with unescaped multiline Mar
 A passing verdict is never accepted through repair. Sandbox startup failures remain
 explicit reviewer errors rather than being mislabeled as verdict-schema failures.
 
-Reviewer/executor stdout and stderr are retained up to 100 MiB per stream for
-diagnostics; JSONL protocols are decoded incrementally with separate bounded records, so
-protocol correctness does not depend on display capture truncation.
+Reviewer passes and `run-as-binary` executor runs retain stdout and stderr up to 100 MiB
+per stream for diagnostics; the Pi, Claude, and Codex executor adapters retain stdout up to
+100 MiB but cap retained stderr at 16 MiB. JSONL protocols are decoded incrementally with
+separate bounded records, so protocol correctness does not depend on display capture
+truncation.
 
 ## Reviewer direction policy
 
@@ -643,6 +645,9 @@ content or private paths into the completion notice. With no review running,
   unavailable while reviews are paused.
 - `/review-cancel` — see [Cancellation](#cancellation).
 - `/review-continue` — see [Corrections](#corrections-guidance-and-the-correction-cap).
+- `/review-gate-ping` is a read-only load check: it reports that the extension is loaded,
+  the resolved reviewer set (or `none`), and whether reviews are currently paused. It
+  changes no setting, captures nothing, and runs no reviewer.
 - `/ask-reviewer <question>` asks the configured reviewer or reviewers an ad hoc
   question about the current work. It includes the current request context, changed
   files and patch when available, and the session evidence digest, including read-only

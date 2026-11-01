@@ -9,6 +9,8 @@ import test from "node:test";
 
 import { visibleWidth } from "pi-session-host-tui";
 
+import { TerminalSurface } from "../src/session-host/terminal-surface";
+
 import {
   KEYS, MainPtyDriver, OUTER_COLS, OUTER_ROWS, TEST_TIMEOUT_MS,
   compileAndStageCandidate, createEditorLog, createOwnedScratchRoot, makeNativeAgentRoot,
@@ -58,6 +60,43 @@ function drawnTextStart(lines: readonly string[], text: string): { column: numbe
   }
   return undefined;
 }
+
+test("the surface parse barrier exposes Vim's cursor only after its queued show/CUP suffix is drained", async () => {
+  const editorText = "PRG581-editor-draft";
+  const statuslineText = "PRG581-VIM";
+  const surface = new TerminalSurface(120, 50);
+  try {
+    // A completed editor screen and statusline, with Vim's hardware cursor
+    // hidden and still resting at its old cell: the text predicate is true here.
+    surface.write(`\x1b[2J\x1b[H${editorText}\r\n${statuslineText}\x1b[49;100H\x1b[?25l`);
+    await surface.flush();
+    const completed = surface.frame();
+    assert.deepEqual({ cols: completed.cols, rows: completed.rows }, { cols: 120, rows: 50 });
+    assert.ok(completed.lines.join("\n").includes(editorText), "the editor text is drawn before entry completes");
+    assert.ok(completed.lines.join("\n").includes(statuslineText), "the editor statusline is drawn before entry completes");
+    assert.deepEqual(completed.cursor, { column: 99, row: 48, visible: false },
+      "the completed text still carries the previous hidden cursor");
+
+    // Vim's actual completion suffix: show the hardware cursor and place it at
+    // its edit cell. Nothing is parsed yet, so the text predicate stays true
+    // while the old cursor remains current.
+    surface.write("\x1b[?25h\x1b[2;34H");
+    const queued = surface.frame();
+    assert.ok(queued.lines.join("\n").includes(editorText) && queued.lines.join("\n").includes(statuslineText),
+      "the original editor/statusline text predicate is already true before the suffix parses");
+    assert.deepEqual(queued.lines, completed.lines, "queueing the suffix does not change the drawn text");
+    assert.deepEqual(queued.cursor, { column: 99, row: 48, visible: false },
+      "the old hidden cursor remains current before the queued suffix is parsed");
+
+    await surface.flush();
+    const drained = surface.frame();
+    assert.deepEqual(drained.lines, completed.lines, "draining the suffix preserves the matching text predicate");
+    assert.deepEqual(drained.cursor, { column: 33, row: 1, visible: true },
+      "draining exposes the exact editor cursor from the queued show/CUP suffix");
+  } finally {
+    surface.dispose();
+  }
+});
 
 test("production Main Ctrl+G edits through real Vim and restores the native draft after save, cancel and failure", {
   timeout: TEST_TIMEOUT_MS,
@@ -178,6 +217,10 @@ exit "$status"
   assertHostHidesNoSubstituteCursor("the framed Pi editor owns the terminal before any handoff");
   const piCursorBeforeHandoff = observedCursor();
   await active.writeAndWait("\x07", (text) => text.includes("PRG499-VIM"), "actual Ctrl+G opens configured real Vim");
+  // The statusline text can become visible while Vim's cursor-show/CUP suffix is
+  // still queued. Drain every write Main had already forwarded before the first
+  // frame/cursor-entry pair is read; this is the surface's own parse barrier.
+  await active.surface.flush();
   assert.equal(readFileSync(join(scratch, "before-save"), "utf8"), original, "Pi's own launcher prefills the exact draft");
   // Cursor ENTRY: the outer terminal's cursor is now Vim's own cursor, still
   // visible, still inside the composed native pane, and on the row where Vim

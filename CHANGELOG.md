@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.244]
+## [0.1.0-dev.246]
 
 ### Added
 
@@ -36,6 +36,36 @@ dates.
   routing, ongoing work, lifecycle, and each owner's authority over its own roster are
   unchanged. The roster writes one version-2 mixed sequence and accepts valid version-1
   local rosters; older hosts refuse version 2 without overwriting it.
+
+## [0.1.0-dev.245]
+
+### Changed
+
+- **Remote Saved Main cases have a dedicated suite** (#574): Main's contiguous
+  remote Saved section — its 14 test declarations and the section-local Saved
+  controller, coordinator, host, picker-opening, and run-id helpers — moved
+  verbatim into `tests/session-host-main-network-saved.test.ts`, which imports the
+  existing canonical Main harness and remote-content helpers instead of adding a
+  second harness or duplicated fixture algorithm. Test titles, assertions, options,
+  skips, budgets, and the loop-generated cases inside those tests are unchanged, and
+  the complete pre-change Main test multiset is preserved across the two files.
+  Main keeps its local Saved cases and the shared local Saved fixture family, and the
+  native Saved and other focused Saved tiers are untouched. Test organization only;
+  production behavior, private fields, APIs, and policy are unchanged.
+
+## [0.1.0-dev.244]
+
+### Fixed
+
+- **Disabled scheduled research entries save with an unusable worker pin** (#576): a
+  settings Save of an Off research task that still pins a worker resource that was
+  removed or is no longer research-capable now persists the entry and its pin, matching
+  the existing load, menu, and scheduler policy that a disabled entry never dispatches.
+  Enabled entries — including entries with no stored `enabled` field, which default to
+  on — keep their strict missing-resource and research-capability refusals, and the
+  independent task-local reviewer check still validates selected external reviewers on
+  disabled entries. No auto-disable, re-enable, migration, fallback, or role/permission
+  behavior changes.
 
 ## [0.1.0-dev.243]
 

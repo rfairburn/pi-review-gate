@@ -472,7 +472,11 @@ export async function persistReviewSettings(
       for (const task of Object.values(selection.scheduledTasks ?? {})) {
         if ((task.destination ?? "subtask") !== "subtask") continue;
         if (task.review?.mode === "selected") checkReviewers(task.review.reviewers);
-        if (task.kind === "research" && task.workerResourceId !== undefined) {
+        // #576: a disabled entry never dispatches, so it may keep a pin that
+        // no longer resolves or is no longer research-capable, matching config
+        // loading and the settings menu. Missing `enabled` still means on.
+        // The task-local reviewer check above stays active for disabled entries.
+        if (task.enabled !== false && task.kind === "research" && task.workerResourceId !== undefined) {
           const resource = selection.workerResources[task.workerResourceId];
           if (!resource || !workerResourceSupportsResearch(normalized, resource.selection)) {
             throw new Error("A scheduled research worker is no longer research-capable on disk. Reopen settings and select a research-capable worker.");

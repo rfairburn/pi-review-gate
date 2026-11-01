@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.240]
+## [0.1.0-dev.241]
 
 ### Changed
 
@@ -29,6 +29,25 @@ dates.
   create-before-write failure, the commit boundary, and publication exclusivity.
   Test fixture only; the fixture worker's strict release reader, retry budget,
   absolute deadline, watcher handling, and production behavior are unchanged.
+
+## [0.1.0-dev.240]
+
+### Changed
+
+- **One canonical Saved-picker Host identity** (#573): the sidebar's remote Saved
+  picker state no longer stores its own copy of the chosen Host. Its request,
+  context, render, and ownership reads now take identity from the picker's single
+  canonical `savedHost` choice, captured at the same synchronous operation or
+  render boundary as the picker state it belongs to, so a reentrant render can
+  never pair a captured frame with a later Host choice. Frozen remote
+  operations, actual-written frame presentations, and owner delete-exposure
+  policy facts keep their own historical identity snapshots, and the New form's
+  separate Host selection is untouched. Maintenance consolidation of redundant
+  internal state — no observed defect or security change; existing request
+  payloads, current-run and view-epoch fences, render tokens and earned writer
+  receipts, delete/resume authorization, cancellation behavior, and stale-reply
+  handling are unchanged. No public API, protocol, configuration, default,
+  permission, fallback, retry, or retention change.
 
 ## [0.1.0-dev.239]
 

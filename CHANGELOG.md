@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.240]
+## [0.1.0-dev.242]
 
 ### Changed
 
@@ -35,6 +35,40 @@ dates.
   owns is removed. Added deterministic publication, pre-commit preparation
   revalidation, no-clobber, and retired create-before-write controls. Test
   fixture only; production behavior is unchanged.
+
+## [0.1.0-dev.241]
+
+### Changed
+
+- **Atomic native-resume release publication** (#579): the native automatic-resume
+  fixture now publishes every test-owned worker release record with the existing
+  durable exclusive writer, so the complete `{ "release": true }` JSON is staged and
+  fsynced in an owned private temp file inside the fixture's own state directory
+  before the final release pathname exists. A worker can no longer parse an empty or
+  truncated release record, and an existing release file or symlink is refused rather
+  than overwritten or adopted. Added deterministic controls for the old
+  create-before-write failure, the commit boundary, and publication exclusivity.
+  Test fixture only; the fixture worker's strict release reader, retry budget,
+  absolute deadline, watcher handling, and production behavior are unchanged.
+
+## [0.1.0-dev.240]
+
+### Changed
+
+- **One canonical Saved-picker Host identity** (#573): the sidebar's remote Saved
+  picker state no longer stores its own copy of the chosen Host. Its request,
+  context, render, and ownership reads now take identity from the picker's single
+  canonical `savedHost` choice, captured at the same synchronous operation or
+  render boundary as the picker state it belongs to, so a reentrant render can
+  never pair a captured frame with a later Host choice. Frozen remote
+  operations, actual-written frame presentations, and owner delete-exposure
+  policy facts keep their own historical identity snapshots, and the New form's
+  separate Host selection is untouched. Maintenance consolidation of redundant
+  internal state — no observed defect or security change; existing request
+  payloads, current-run and view-epoch fences, render tokens and earned writer
+  receipts, delete/resume authorization, cancellation behavior, and stale-reply
+  handling are unchanged. No public API, protocol, configuration, default,
+  permission, fallback, retry, or retention change.
 
 ## [0.1.0-dev.239]
 

@@ -42,6 +42,7 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 
 import { readGroup } from "../src/execution/background-group-store";
+import { atomicWriteExclusive } from "../src/execution/durable-write";
 import { operationOwnershipStatus, operationRecordPath, readOperationRecord } from "../src/execution/operation-record";
 import { SessionStateStore } from "../src/session-state";
 import { rosterStorePath } from "../src/session-host/roster-store";
@@ -728,17 +729,24 @@ test("real native Main restores a saved conversation with known-zero current act
 
   const drivers = new Set<SavedMainDriver>();
   let assertionsCompleted = false;
-  const releaseFixtureWorker = (started: string, release: string): void => {
+  // Every test-owned release record is published complete-before-visible with the
+  // same durable exclusive writer production records use: the full bytes are staged
+  // and fsynced in an owned private temp file in the fixture state directory, then
+  // hard-linked onto the final name. A reader can therefore never observe an empty
+  // or half-written release file, and an existing release stays somebody else's
+  // claim. The staged name carries the final name plus a `.tmp.<id>` suffix, which
+  // the worker's basename-filtered release watcher never treats as a release.
+  const releaseFixtureWorker = async (started: string, release: string): Promise<void> => {
     if (!existsSync(started) || existsSync(release)) return;
-    try { writeFileSync(release, '{"release":true}\n', { flag: "wx", mode: 0o600 }); } catch { /* preserve uncertain fixture state */ }
+    try { await atomicWriteExclusive(release, '{"release":true}\n'); } catch { /* preserve uncertain fixture state */ }
   };
-  const releaseWorkerForFailureCleanup = (): void => {
-    releaseFixtureWorker(workerStarted, workerRelease);
-    releaseFixtureWorker(stoppedRecoverableWorkerStarted, stoppedRecoverableWorkerRelease);
-    releaseFixtureWorker(recoveryWorkerStarted, recoveryWorkerRelease);
+  const releaseWorkerForFailureCleanup = async (): Promise<void> => {
+    await releaseFixtureWorker(workerStarted, workerRelease);
+    await releaseFixtureWorker(stoppedRecoverableWorkerStarted, stoppedRecoverableWorkerRelease);
+    await releaseFixtureWorker(recoveryWorkerStarted, recoveryWorkerRelease);
   };
   t.after(async () => {
-    releaseWorkerForFailureCleanup();
+    await releaseWorkerForFailureCleanup();
     for (const driver of drivers) {
       let safeToDispose = driver.exitEvent !== undefined
         && driver.ledger.all().every((entry) => entry.exitWatcher.observedExit);
@@ -989,7 +997,7 @@ test("real native Main restores a saved conversation with known-zero current act
     "the actual held worker is one live intent while the resumed foreground agent is idle");
 
   const completionWakeSnapshot = afterDriver.snapshot();
-  writeFileSync(workerRelease, '{"release":true}\n', { flag: "wx", mode: 0o600 });
+  await atomicWriteExclusive(workerRelease, '{"release":true}\n');
   const completedRecord = await waitForFixtureJson(workerCompleted,
     "the same deterministic worker receives ordinary release and completes its run-as-binary response");
   assert.equal(completedRecord.completed, true);
@@ -1046,7 +1054,7 @@ test("real native Main restores a saved conversation with known-zero current act
     "the fixture-plan-controlled executor starts and waits for its test-owned release")).started, true);
   assert.equal(existsSync(executorFailure), false,
     "the held executor failure cannot wake the owner before its foreground prompt settles");
-  writeFileSync(stoppedRecoverableWorkerRelease, '{"release":true}\n', { flag: "wx", mode: 0o600 });
+  await atomicWriteExclusive(stoppedRecoverableWorkerRelease, '{"release":true}\n');
   assert.equal((await waitForFixtureJson(executorFailure,
     "the released fixture executor exits nonzero through the real execute adapter")).executorFailure, true);
   await waitForSameOwnerTurns(afterDriver, resumedProcess, resumedBinding, stoppedRecoverablePromptSnapshot.observerOffset, 2,
@@ -1374,7 +1382,7 @@ test("real native Main restores a saved conversation with known-zero current act
   });
 
   const recoveryReleaseSnapshot = recoveryDriver.snapshot();
-  writeFileSync(recoveryWorkerRelease, '{"release":true}\n', { flag: "wx", mode: 0o600 });
+  await atomicWriteExclusive(recoveryWorkerRelease, '{"release":true}\n');
   assert.equal((await waitForFixtureJson(recoveryWorkerCompleted,
     "the recovery worker completes through its ordinary release and executor lifecycle")).completed, true);
   // The recovered task is real current work, so its completion delivers one

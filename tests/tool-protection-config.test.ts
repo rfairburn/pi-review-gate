@@ -85,6 +85,7 @@ test("optional fields default and an unresolved auditor selection is preserved",
 });
 
 test("strict validation rejects partial, coercible, and unusable protection blocks", () => {
+  assert.equal(TOOL_PROTECTION_CONTEXT_MIN_CHARS, 1_000);
   const rejected: unknown[] = [
     null, "off", 5, [], true,
     {},

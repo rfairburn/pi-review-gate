@@ -2321,16 +2321,59 @@ function auditorWireInput(
   includedEvidenceIds: readonly string[],
   omittedEvidenceIds: readonly string[],
 ): unknown {
+  const invocation = {
+    invocationId: proposedCall.invocationId,
+    toolName: proposedCall.toolName,
+    args: boundedWireArguments(proposedCall.args, settings.maxContextChars),
+    cwd: boundedWireString(proposedCall.cwd, 512),
+    role: boundedWireString(proposedCall.role, 256),
+    ...(proposedCall.taskId === undefined ? {} : { taskId: boundedWireString(proposedCall.taskId, 256) }),
+    ...(proposedCall.lineage === undefined ? {} : { lineage: proposedCall.lineage.map((value) => boundedWireString(value, 256)) }),
+  };
   return {
     version: "pi-tool-protection-input-v1",
     policyVersion: TOOL_PROTECTION_POLICY_VERSION,
     level: settings.level,
-    invocation: proposedCall,
+    invocation,
     context: {
       includedEvidenceIds: [...includedEvidenceIds],
       omittedEvidenceIds: [...omittedEvidenceIds],
     },
   };
+}
+
+/**
+ * The structured binary input is secondary to the generated prompt. Keep its
+ * convenience copy bounded too, so an external auditor cannot recover an
+ * oversized original argument from a second unbounded field.
+ */
+function boundedWireArguments(value: unknown, maxContextChars: number): unknown {
+  let encoded: string | undefined;
+  try {
+    encoded = value === undefined ? undefined : JSON.stringify(value);
+  } catch {
+    return { bounded: true, unserialisable: true };
+  }
+  if (encoded === undefined || encoded.length <= maxContextChars) return value;
+  const previewBudget = Math.max(0, maxContextChars - 128);
+  return {
+    bounded: true,
+    originalType: value === null ? "null" : typeof value,
+    preview: `${safeUtf16Prefix(encoded, previewBudget)}\n[arguments bounded]`,
+  };
+}
+
+function boundedWireString(value: string, maxChars: number): string {
+  return value.length <= maxChars ? value : `${safeUtf16Prefix(value, maxChars)}[bounded]`;
+}
+
+function safeUtf16Prefix(value: string, maxUnits: number): string {
+  const limit = Math.max(0, Math.min(value.length, Math.floor(maxUnits)));
+  if (limit === 0) return "";
+  let end = limit;
+  const code = value.charCodeAt(end - 1);
+  if (end < value.length && code >= 0xD800 && code <= 0xDBFF) end -= 1;
+  return value.slice(0, end);
 }
 
 function errorMessage(error: unknown): string {

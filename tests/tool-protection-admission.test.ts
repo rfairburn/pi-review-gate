@@ -389,9 +389,9 @@ test("a dangerous-level PASS on a waiting control admits the call and audits wit
   assert.ok(prompt.includes("Generic framework, host, skill, or worker workflow guidance"));
   assert.ok(!prompt.includes("- A1 "), "the dangerous audit borrowed the alignment test");
   assert.ok(!prompt.includes("- F5 "), "the dangerous audit borrowed the governing-prohibition floor test");
-  assert.ok(prompt.includes("GOVERNING INSTRUCTIONS OF THE ACTING AGENT (quoted reference material, verbatim, origin: Pi ctx.getSystemPrompt())"));
+  assert.ok(prompt.includes("GOVERNING INSTRUCTIONS OF THE ACTING AGENT (quoted reference material, origin: Pi ctx.getSystemPrompt())"));
   assert.ok(prompt.includes("GOVERNING: complete the bounded synthetic task."), "the acting instructions still travel as evidence");
-  assert.ok(prompt.includes("Enforce only the tests printed in the policy block; they say where a prohibition in this quoted text binds."));
+  assert.ok(prompt.includes("Apply only the tests printed in the policy block."));
   assert.deepEqual(await host.emit("tool_result", resultEvent("call-watch-pass", "SubtasksWatch", { input: { executionId: "exec-report-window", after: "10m" } })), [], "a PASS adds no model-visible audit text");
 });
 
@@ -577,17 +577,17 @@ test("discovery never waits on the auditor, the context budget, or a configurati
   assert.equal(noAuditor.calls.length, 0);
   assert.equal((await noAuditor.coordinator.admitToolCall(callArgs("call-bash-noauditor", "bash", { command: "echo hi" })))?.block, true);
 
-  // A context budget too small for a fair audit blocks protected calls; the
-  // loader assembles no context, so it is unaffected.
+  // A small context budget still reaches the auditor with bounded variable
+  // context; the loader assembles no context, so it is unaffected.
   const tiny = coordinatorHarness({
     config: enabledConfig({ maxContextChars: 4_000 }),
     discoveryLoaderOwned: () => true,
   });
   assert.equal(await tiny.coordinator.admitToolCall(callArgs("call-loader-tiny", "tool_search", { query: "BrowserClick" })), undefined);
   assert.equal(tiny.calls.length, 0);
-  const capacity = await tiny.coordinator.admitToolCall(callArgs("call-bash-tiny", "bash", { command: "echo hi" }));
-  assert.equal(capacity?.block, true);
-  assert.match(capacity!.reason, /could not build a fair audit|maxContextChars/);
+  assert.equal(await tiny.coordinator.admitToolCall(callArgs("call-bash-tiny", "bash", { command: "echo hi" })), undefined);
+  assert.equal(tiny.calls.length, 1, "the protected call still reaches the auditor");
+  assert.ok(tiny.calls[0]!.prompt.length > 4_000, "fixed instructions remain outside the variable budget");
 
   // Off still records nothing at all: the exemption is not a way to annotate a
   // session whose gate is Off.
@@ -599,6 +599,28 @@ test("discovery never waits on the auditor, the context budget, or a configurati
   off.coordinator.registerHooks(offHost.pi);
   assert.equal(await off.coordinator.admitToolCall(callArgs("call-loader-off", "tool_search", { query: "BrowserClick" })), undefined);
   assert.deepEqual(await offHost.emit("tool_result", resultEvent("call-loader-off", "tool_search")), []);
+});
+
+test("the real admission path sends bounded prompt context and a bounded binary-input mirror", async () => {
+  const host = fakeHost();
+  const { coordinator, calls } = coordinatorHarness({
+    config: enabledConfig({ maxContextChars: 1_000 }),
+    results: [{ output: '{"decision":"PASS"}' }],
+  });
+  coordinator.registerHooks(host.pi);
+  const tail = "TAIL-DO-NOT-LEAK";
+  const command = `${"x".repeat(5_000)}${tail}`;
+  assert.equal(await coordinator.admitToolCall(callArgs("call-bounded", "bash", { command })), undefined);
+  assert.equal(calls.length, 1);
+  const request = calls[0]!;
+  assert.ok(request.prompt.length > 1_000, "fixed instructions are sent outside the variable budget");
+  assert.ok(request.prompt.includes("[proposed call context bounded]"));
+  assert.ok(!request.prompt.includes(tail), "the prompt did not include the oversized argument tail");
+  const wire = request.input as { invocation?: { args?: unknown } };
+  const wireText = JSON.stringify(wire);
+  assert.ok(wire.invocation?.args && typeof wire.invocation.args === "object");
+  assert.ok(wireText.includes("arguments bounded"));
+  assert.ok(!wireText.includes(tail), "the secondary structured input did not leak the original tail");
 });
 
 test("a nested discovery-loader call is aggregated as NOT AUDITED infrastructure", async () => {

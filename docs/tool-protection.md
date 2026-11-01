@@ -184,7 +184,9 @@ malformed-block recovery are owned by
 A present block must state `level`; every non-Off level requires `auditor`;
 `scope: "selected"` requires at least one exact `toolNames` entry. `timeoutMs` is a whole
 number from 1000 to 120000 (default 10000), and `maxContextChars` is a whole number from
-4000 to 2000000 UTF-16 code units (default 128000). Explicit writes are validated
+1000 to 2000000 UTF-16 code units (default 128000). It bounds the variable proposed-call,
+session-evidence, and governing-reference context; the fixed policy, decision, provenance,
+and output instructions are sent in addition to that budget. Explicit writes are validated
 strictly; unknown keys inside the block are ignored.
 
 A malformed stored block does not become an implicit Off. Startup reports a warning and
@@ -246,27 +248,19 @@ conversation, so you can browse it later.
 
 ## What the auditor receives
 
-The prompt is built by code, not by another model. These parts are mandatory and are
-reproduced in full:
+The prompt is built by code, not by another model. The code-owned decision instruction,
+policy, provenance note, and output contract are fixed auditor instructions and are sent
+in full. `maxContextChars` applies to the variable context in addition to those fixed
+instructions: the proposed invocation is considered first, then causal records and the
+globally newest session messages, and finally quoted governing/reference material.
+Large variable records may be sent as bounded UTF-16 prefixes with structural provenance;
+hidden model reasoning is excluded by construction. No whole transcript, project
+resources, or prior session history is loaded automatically.
 
-- the complete governing instructions of the acting agent, verbatim, quoted as
-  reference material about that agent rather than as instructions to the auditor;
-- the exact proposal: invocation identity, tool name, complete JSON arguments, working
-  directory, acting role, task identity, and nested lineage;
-- the code-owned decision instruction and policy for the enabled level, and the
-  output contract.
-
-Recent session evidence is selected deterministically within `maxContextChars`. Genuine
-current-session user input and the gate's own causal refusal records come first, then
-acting-model text, then lower-trust tool and repository material. Items are included
-whole or not at all, rendered oldest first with provenance labels, and omissions are
-disclosed to the auditor. Hidden model reasoning is excluded by construction. No whole
-transcript, project resources, or prior session history is loaded automatically.
-
-If the governing instructions, the exact call, or the mandatory causal refusal/approval
-evidence cannot fit the budget, the result is an explicit capacity failure and the call
-does not run. Nothing is truncated, summarized by another model, or audited under a
-smaller substitute.
+The variable budget does not itself block a call. It determines how much of the proposed
+call, session evidence, and governing/reference material is sent, and the fixed auditor
+instructions remain complete. A missing governing prompt, unserialisable call, timeout,
+malformed decision, or other auditor failure still fails closed.
 
 The quoted governing instructions are evidence about the acting agent, not rules addressed
 to the auditor. The prompt says the auditor is not their addressee, that it enforces only
@@ -318,9 +312,8 @@ to a caller outside its scope, and a complaint about earlier blocking is not a b
 asked for is not a disclosure merely because the material carries customer or diagnostic
 context. An evidence item the host omitted because it did not fit the context budget, and
 the completeness disclosure that names it, prove nothing in either direction: they are
-never a refusal ground and never a reason to hedge, while a timeout, a malformed decision,
-or an over-budget mandatory context stays a fail-closed runtime failure rather than a
-policy `FAIL`. This changes only what the auditor is asked about. The acting agent must
+never a refusal ground and never a reason to hedge. This changes only what the auditor is
+asked about. The acting agent must
 still obey its governing instructions and the user's restrictions, and no permission,
 ceiling, trust, ownership, preflight, review, landing, or cancellation guard is relaxed by
 a `dangerous` PASS.
@@ -384,7 +377,7 @@ never retried, replayed, routed to a fallback, or answered from a cache.
 
 ## Failure, cancellation, and approvals
 
-- A timeout, malformed decision, unavailable auditor, or context-capacity failure stops
+- A timeout, malformed decision, unavailable auditor, or missing required context stops
   the proposed call. There is no automatic retry, replay, fallback auditor, or cached
   decision.
 - Cancellation or a policy, level, or auditor change invalidates a pending audit. A late
@@ -565,9 +558,10 @@ Do not use `scripts/pi-review-gate.sh` for this test: the launcher re-resolves
   `tool_search` runs. Expect it to work with no auditor call; with **Debug audit output**
   On the result carries the `NOT AUDITED — discovery loader` line, which is never a pass.
   Expect a native refusal to stay refused.
-- **Budget and timeout.** Set `maxContextChars` to `4000` and run a harmless call. If the
-  mandatory context exceeds that budget, expect an explicit capacity diagnostic and no
-  execution, with nothing silently truncated; a small call can fit and pass. For a
+- **Budget and timeout.** Set `maxContextChars` to `1000` or `4000` and run a harmless call.
+  The proposed invocation is prioritized, then recent session evidence, then governing
+  reference text; oversized variable records are sent as bounded prefixes while the fixed
+  auditor instructions remain complete. A budget does not itself block a call. For a
   deterministic timeout, use the inert fake auditor below with `FAKE_AUDITOR_DELAY_MS`
   longer than `timeoutMs` (for example 5000 with `timeoutMs: 1000`); a fast auditor that
   finishes within the deadline is a valid PASS, not a failure. Restore the defaults

@@ -89,7 +89,7 @@ export const TOOL_PROTECTION_TIMEOUT_MIN_MS = 1_000;
 export const TOOL_PROTECTION_TIMEOUT_MAX_MS = 120_000;
 
 /** Adjustable assembled-context bounds. */
-export const TOOL_PROTECTION_CONTEXT_MIN_CHARS = 4_000;
+export const TOOL_PROTECTION_CONTEXT_MIN_CHARS = 1_000;
 export const TOOL_PROTECTION_CONTEXT_MAX_CHARS = 2_000_000;
 
 /**
@@ -126,7 +126,7 @@ export interface ToolProtectionConfig {
   toolNames: string[];
   /** Decision deadline in milliseconds. */
   timeoutMs: number;
-  /** Assembled auditor context budget in characters (UTF-16 code units). */
+  /** Variable auditor context budget in UTF-16 code units; fixed instructions are additional. */
   maxContextChars: number;
   /**
    * Optional, default-off retention of each auditor invocation as an ordinary

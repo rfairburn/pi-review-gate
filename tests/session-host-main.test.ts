@@ -3115,8 +3115,11 @@ test("visible roster mouse activates a clicked live owner; host gestures stay fe
   assert.equal(harness.sidebar?.focus, initialFocus);
 
   emitMouse(harness.terminal, 1, aRow);
+  assert.equal(harness.sidebar?.focus, initialFocus, "a session-card press is held: it activates nothing");
+  assert.notEqual(harness.sidebar?.selectedId, "native-1", "the held press does not even move the highlight");
+  emitMouse(harness.terminal, 1, aRow, 0, "m");
   assert.equal(harness.sidebar?.focus, "main");
-  assert.equal(harness.sidebar?.selectedId, "native-1", "the clicked A row becomes Main owner");
+  assert.equal(harness.sidebar?.selectedId, "native-1", "the release over the same card activates the clicked A row");
   assert.equal(manager.views[1]?.hasLiveProcess, true, "B remains live after A activation");
   // The newly activated owner must be drawn before its cells carry positional
   // authority (#474): the host renders and writes the owner's frame first, then
@@ -3132,9 +3135,11 @@ test("visible roster mouse activates a clicked live owner; host gestures stay fe
     ["native-1", "\x1b[<1;2;2m"],
   ], "independently started native buttons are not hidden by the host-left fence");
   const beforeHostDrag = manager.writes.length;
-  emitMouse(harness.terminal, 33, 1, 32); // host press followed by Main-pane drag motion
-  emitMouse(harness.terminal, 34, 2, 0, "m"); // release also lands over Main
+  emitMouse(harness.terminal, 1, aRow); // a fresh session-card press is held by the host
+  emitMouse(harness.terminal, 33, 1, 32); // its drag motion leaves the roster and lands over Main
+  emitMouse(harness.terminal, 34, 2, 0, "m"); // its release also lands over Main
   assert.equal(manager.writes.length, beforeHostDrag, "host-originated motion and release never leak to A");
+  assert.equal(harness.sidebar?.selectedId, "native-1", "a release outside the session cards cancels without activating anything");
   harness.terminal.emitInput("a-input");
   assert.equal(manager.writes.at(-1)?.id, "native-1");
 
@@ -3143,9 +3148,11 @@ test("visible roster mouse activates a clicked live owner; host gestures stay fe
   const bVisibleRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "Native native-2");
   assert.ok(bVisibleRow > 0);
   emitMouse(harness.terminal, 1, bVisibleRow);
+  assert.equal(harness.sidebar?.focus, initialFocus, "the press on B stays pending");
+  assert.equal(harness.sidebar?.selectedId, "native-1", "the held press has not moved the owner yet");
+  emitMouse(harness.terminal, 1, bVisibleRow, 0, "m"); // the release over the same card decides
   assert.equal(harness.sidebar?.focus, "main");
   assert.equal(harness.sidebar?.selectedId, "native-2", "one click activates B");
-  emitMouse(harness.terminal, 1, bVisibleRow, 0, "m"); // finish the host-owned click
   const surface = manager.surface("native-2");
   assert.ok(surface);
   surface.modes = { ...surface.modes, mouseTracking: "any", mouseEncoding: "sgr" };
@@ -3174,12 +3181,14 @@ test("clicking an exited row from Main transfers only the recovery intent and ac
     const harness = createHarness({}, overrides);
     const manager = await startTwoSessions(harness);
     await nextTurn();
-
+    const initialFocusBeforeExit = harness.sidebar?.focus;
+    assert.equal(initialFocusBeforeExit, "sidebar", "the roster owns the pointer gesture's starting focus");
     const firstRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "Native native-1");
     emitMouse(harness.terminal, 1, firstRow);
-    assert.equal(harness.sidebar?.focus, "main");
-    assert.equal(harness.sidebar?.selectedId, "native-1", "A owns Main before B exits");
+    assert.equal(harness.sidebar?.focus, initialFocusBeforeExit, "the session-card press is held, not activated");
     emitMouse(harness.terminal, 1, firstRow, 0, "m");
+    assert.equal(harness.sidebar?.focus, "main");
+    assert.equal(harness.sidebar?.selectedId, "native-1", "the release activates A as Main owner before B exits");
 
     const bIndex = manager.views.findIndex((view) => view.id === "native-2");
     const b = manager.views[bIndex];
@@ -3201,6 +3210,8 @@ test("clicking an exited row from Main transfers only the recovery intent and ac
     const exitedRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "Native native-2");
     assert.ok(exitedRow > 0);
     emitMouse(harness.terminal, 1, exitedRow);
+    assert.equal(harness.sidebar?.focus, "main", "the exited-row press is held like any other session card");
+    emitMouse(harness.terminal, 1, exitedRow, 0, "m");
     assert.equal(harness.sidebar?.focus, "sidebar", "the exited-row restart is a sidebar-owned intent");
     assert.equal(harness.sidebar?.selectedId, "native-2");
 

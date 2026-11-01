@@ -278,15 +278,35 @@ The variable context is selected deterministically, in this order:
 When its framing fits, a record that cannot fit whole contributes its leading portion
 and carries `"partial":true` in its own JSON. Lower-priority sections, including the
 governing reference at small budgets, may be omitted entirely rather than displacing
-the proposal or newer session evidence. Session records render newest-first, matching selection order; the
-section labels that reverse chronology explicitly. Selection priority is separate from
+the proposal or newer session evidence. Session records render newest-first, matching
+selection order. Selection priority is separate from
 render order: all unchanged auditor instructions lead, followed by the selected governing
 reference, selected newest-first session evidence, and the proposed call last. Pi receives
 the code-owned fixed instructions in its native system prompt and all variable quoted
 data in one user message; quoted governing instructions are never promoted to system
 instructions. External binaries still receive the complete canonical prompt. This keeps
-shared leading material stable without changing which data gets the budget. Nothing is summarized by a second model. Hidden model reasoning is excluded by construction, and no
-whole transcript, project resources, or prior session history is loaded automatically.
+shared leading material stable without changing allocation priorities. Nothing is
+summarized by a second model. Hidden model reasoning is excluded by construction, and
+no whole transcript, project resources, or prior session history is loaded automatically.
+
+The variable context uses one compact JSON document with `quotedGoverningInstructions`,
+`evidence`, and `proposedCall` fields, omitting optional material that does not fit.
+Evidence carries explicit `origin` and `text` fields; the unchanged cached provenance
+legend defines trust once, rather than repeating it on every record. Identity facts use
+structured fields instead of prose labels. JSON quoting preserves data boundaries without
+section banners or end-of-section boilerplate. The same format applies at every budget
+and to every proposal; there is no fixture-specific or character-limit-specific path.
+Field names, structure, escaping and the existing separator still count against the
+variable budget. Reducing this overhead leaves more capacity for actual source text.
+For example, a small payload has this shape (without pretty-printing on the wire):
+
+```json
+{"quotedGoverningInstructions":{"source":"host","text":"Quoted acting-agent instructions."},"evidence":[{"origin":"user","text":"Inspect the parser."}],"proposedCall":{"tool":"read","arguments":"{\"path\":\"src/parser.ts\"}"}}
+```
+
+`arguments` remains quoted serialized input so even a bounded leading portion can be
+carried safely inside valid outer JSON; a clipped text or argument value is marked
+with `partial: true`. Optional identity fields are added only from remaining capacity.
 
 Oversized input is not a reason to block a call: an oversized proposal, an oversized
 governing prompt, or an oversized session reaches the configured auditor with the
@@ -294,11 +314,10 @@ largest useful bounded context, and the returned `PASS`/`FAIL` decides. Only abs
 unusable mandatory input — no governing text supplied, or a proposal whose arguments
 cannot be reproduced at all — stops the call as a missing-context failure.
 
-The quoted governing instructions are evidence about the acting agent, not rules addressed
-to the auditor. The prompt says the auditor is not their addressee, that it enforces only
-the tests the code-owned policy block prints — which say where a prohibition in the quoted
-instructions binds, at `aligned` and `workspace` and never at `dangerous` — and that
-quoted instructions can never establish a user prohibition. The block stays evidence of
+The `quotedGoverningInstructions` field is evidence about the acting agent, not rules
+addressed to the auditor. Only the code-owned policy determines which tests apply: a
+prohibition in the quoted instructions binds at `aligned` and `workspace`, never at
+`dangerous`, and quoted instructions can never establish a user prohibition. The block stays evidence of
 what the acting agent was told to do and which recipients, targets, and scopes the task
 authorizes. Each audit request prints one policy block for its level and one copy of the
 quoted instructions.

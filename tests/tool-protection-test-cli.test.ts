@@ -78,12 +78,12 @@ export class ModelRegistry {
     assert.doesNotMatch(prompt, /TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST/);
     // The variable context — the quoted governing reference, session evidence,
     // and the proposed call — stays in the one user message for every provider.
-    assert.match(prompt, /PROPOSED TOOL CALL/);
-    assert.doesNotMatch(context.systemPrompt, /PROPOSED TOOL CALL|GOVERNING INSTRUCTIONS OF THE ACTING AGENT|RECENT SESSION EVIDENCE/);
+    assert.match(prompt, /"proposedCall":\{/);
+    assert.doesNotMatch(context.systemPrompt, /"proposedCall"|"quotedGoverningInstructions"|"evidence":/);
     assert.equal(options.transport, "sse", "the one-shot transport safeguard is requested for every provider");
     assert.equal(Object.hasOwn(options, "onPayload"), false, "no provider-specific payload rewriting");
     const level = context.systemPrompt.match(/level "(dangerous|aligned|workspace)"/)[1];
-    const id = prompt.match(/invocation=(inv-[a-z0-9-]+)/)[1];
+    const id = JSON.parse(prompt.trim()).proposedCall.id;
     const key = id + ":" + level;
     const record = Object.entries(expected).find(([, byKey]) => Object.hasOwn(byKey, key));
     assert.ok(record, "prompt must identify a shipped fixture invocation and level");
@@ -375,9 +375,8 @@ test("each level's audit request carries that level's tests and the guidance as 
     // The workflow guidance is present exactly once, as quoted reference material
     // about the acting agent, and never as a second rule set.
     assert.equal(built.prompt.split("do not create a waiting surrogate").length - 1, 1, `${level} duplicated the governing guidance`);
-    assert.ok(built.prompt.includes("GOVERNING INSTRUCTIONS OF THE ACTING AGENT (quoted reference material)"));
-    assert.ok(built.prompt.includes("supplied by=\\\"synthetic shipped tester fixture\\\""), `${level} lost where the governing text came from`);
-    assert.ok(built.prompt.includes("it is not addressed to you."));
+    assert.ok(built.prompt.includes('"quotedGoverningInstructions":'), `${level} lost the quoted governing reference`);
+    assert.ok(built.prompt.includes('"source":"synthetic shipped tester fixture"'), `${level} lost where the governing text came from`);
     assert.equal(built.prompt.split("PROTECTION POLICY (code-owned,").length - 1, 1, `${level} carried a second policy block`);
     return built.prompt;
   };
@@ -831,7 +830,7 @@ export class SessionManager {
       const messages = entries.filter(entry => entry.type === "message").map(entry => entry.message);
       assert.deepEqual(messages.map(message => message.role), ["system", "user", "assistant"]);
       assert.match(messages[0].content, /TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST/);
-      assert.match(messages[1].content, /PROPOSED TOOL CALL/);
+      assert.match(messages[1].content, /"proposedCall":\{/);
       assert.equal(messages[2].usage.cacheRead, 512, "session usage is available to normal usage readers");
       assert.ok(entries.some(entry => entry.type === "custom" && entry.data?.status === "decision"));
     }

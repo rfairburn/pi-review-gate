@@ -33,6 +33,11 @@ dates.
   SSE streaming. Tester JSON optionally exposes actual SDK usage for cache-hit verification,
   without reusing verdicts or saved histories.
   Optional fresh auditor-session records remain independent of caching.
+- **Compact auditor context** (#590): one compact JSON document replaces repeated
+  trust prose, section banners and verbose identity labels across all inputs and
+  context budgets. Explicit origins, quoted data, partial markers, selection priority
+  and exact escaped/framed accounting remain intact; cached fixed instructions and
+  policy wording are unchanged.
 - **Tester auditor-session retention** (#590): the built-in fixture tester now honors
   **Save auditor sessions**, using the live gate's recorder for one fresh session per
   invoked case/level, including actual SDK usage for session-based cache accounting.

@@ -271,32 +271,61 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 /**
  * The variable context exactly as the runner placed it in the sent request: the
- * suffix starting at the earliest actually rendered variable section header. The
- * unchanged fixed blocks are all printed ahead of it and the proposed call is
- * rendered last, so this suffix is the quantity the context budget bounds.
- * Quoted variable data is JSON-escaped, so audited text cannot print one of
- * these headers ahead of the real one.
+ * one minified JSON object the request ends with, including the blank line that
+ * attaches it. The unchanged fixed blocks are all printed ahead of it, and
+ * quoted variable data is JSON-escaped, so audited text cannot print a second
+ * top-level object or move this boundary.
  */
 function sentVariable(prompt: string): string {
-  const starts = [
-    "\n\nGOVERNING INSTRUCTIONS OF THE ACTING AGENT",
-    "\n\nRECENT SESSION EVIDENCE",
-    "\n\nPROPOSED TOOL CALL",
-  ].map((marker) => prompt.indexOf(marker)).filter((position) => position >= 0);
-  assert.ok(starts.length > 0, "the request lost its variable context");
-  return prompt.slice(Math.min(...starts));
+  const boundary = prompt.lastIndexOf("\n\n");
+  const variable = prompt.slice(boundary + 2);
+  assert.ok(variable.startsWith("{") && !variable.includes("\n"), "the request lost its one JSON variable context");
+  return prompt.slice(boundary);
+}
+
+type SentEvidenceRecord = {
+  origin: string;
+  text: string;
+  partial?: true;
+  id?: string;
+  causal?: true;
+  invocationId?: string;
+  createdAt?: number;
+};
+type SentCallRecord = {
+  tool: string;
+  arguments: string;
+  id?: string;
+  cwd?: string;
+  role?: string;
+  task?: string;
+  lineage?: string[];
+  partial?: true;
+};
+type SentDocument = {
+  quotedGoverningInstructions?: { source: string; text: string; partial?: true };
+  evidence?: SentEvidenceRecord[];
+  proposedCall: SentCallRecord;
+};
+
+/** The one variable object, parsed back out of the sent request. */
+function sentDocument(prompt: string): SentDocument {
+  return JSON.parse(sentVariable(prompt).slice(2)) as SentDocument;
+}
+
+/** The rendered session records quoting a token of the supplied text. */
+function recordsQuoting(prompt: string, token: string): SentEvidenceRecord[] {
+  return (sentDocument(prompt).evidence ?? []).filter((record) => record.text.includes(token));
 }
 
 /**
- * The proposal's own record line: the one variable record whose mandatory
- * metadata names the proposed operation. Evidence records carry their own
- * `invocation=` facts about other calls, so a first-match search of the whole
- * request would read an evidence record's id instead of the proposal's.
+ * The proposal's own block: the mandatory `proposedCall` of the one variable
+ * object. Evidence records carry their own `invocationId` facts about other
+ * calls, so a first-match search of the whole request would read an evidence
+ * record's id instead of the proposal's.
  */
-function proposalRecordLine(prompt: string): string {
-  const line = sentVariable(prompt).split("\n").find((value) => value.startsWith('{"metadata":"tool='));
-  assert.ok(line, "the request lost its proposed-call record");
-  return line;
+function proposalRecord(prompt: string): SentCallRecord {
+  return sentDocument(prompt).proposedCall;
 }
 
 test("auditor cache identity follows the native conversation without requiring saved sessions", async () => {
@@ -359,8 +388,8 @@ test("the coordinator hands the auditor the assembled request's own fixed-instru
       assert.ok(fixedPrefix.includes(marker), `${marker} is missing from the supplied prefix`);
       assert.ok(!variableSuffix.includes(marker), `${marker} leaked into the variable suffix`);
     }
-    assert.ok(variableSuffix.startsWith("\n\nGOVERNING INSTRUCTIONS OF THE ACTING AGENT"), "the suffix starts at the first variable section");
-    assert.ok(variableSuffix.includes("\n\nPROPOSED TOOL CALL"), "the proposal stays in the variable suffix");
+    assert.ok(variableSuffix.startsWith("\n\n{"), "the suffix is the one JSON variable context");
+    assert.ok(variableSuffix.includes('"proposedCall":'), "the proposal stays in the variable suffix");
     assert.ok(variableSuffix.includes(invocation), "this call's own proposal travels in the user-role suffix");
     assert.ok(!fixedPrefix.includes(invocation), "quoted variable data is not part of the fixed prefix");
     assert.equal(fixedPrefix.length + variableSuffix.length, call.prompt.length, "prefix and suffix are the whole generated request");
@@ -412,11 +441,11 @@ test("a PASS holds admission until a current decision exists and leaves the nati
   assert.equal(request.modelRegistry, fakeRegistry, "live host model registry is supplied in-process");
   assert.equal(request.timeoutMs, 5_000);
   assert.match(request.prompt, /GOVERNING: complete the bounded synthetic task\./);
-  assert.match(request.prompt, /tool=read/);
-  assert.match(request.prompt, /invocation=call-pass/);
+  assert.match(request.prompt, /"tool":"read"/);
+  assert.match(request.prompt, /"id":"call-pass"/);
   assert.match(request.prompt, /\\"path\\":\\"fixture\.txt\\"/);
-  assert.match(request.prompt, /working directory=\\"\/work\\"/);
-  assert.match(request.prompt, /acting role=\\"primary\\"/);
+  assert.match(request.prompt, /"cwd":"\/work"/);
+  assert.match(request.prompt, /"role":"primary"/);
 
   const emitted = await host.emit("tool_result", event);
   assert.deepEqual(emitted, [], "a PASS adds nothing to the acting model's tool result in either debug mode");
@@ -494,10 +523,10 @@ test("a dangerous-level PASS on a waiting control admits the call and audits wit
   assert.ok(prompt.includes("Generic framework, host, skill, or worker workflow guidance"));
   assert.ok(!prompt.includes("- A1 "), "the dangerous audit borrowed the alignment test");
   assert.ok(!prompt.includes("- F5 "), "the dangerous audit borrowed the governing-prohibition floor test");
-  assert.ok(prompt.includes("GOVERNING INSTRUCTIONS OF THE ACTING AGENT (quoted reference material)"));
-  assert.ok(prompt.includes("supplied by=\\\"Pi ctx.getSystemPrompt()\\\""), "the audit request records where the governing text came from");
+  assert.ok(prompt.includes('"quotedGoverningInstructions":'), "the audit request lost the quoted governing reference");
+  assert.ok(prompt.includes('"source":"Pi ctx.getSystemPrompt()"'), "the audit request records where the governing text came from");
   assert.ok(prompt.includes("GOVERNING: complete the bounded synthetic task."), "the acting instructions still travel as evidence");
-  assert.ok(prompt.includes("Enforce only the tests printed in the policy block; they say where a prohibition in this quoted text binds."));
+  assert.ok(prompt.includes("Only the tests printed here are in force at this level."), "the audit request stopped limiting the auditor to the printed tests");
   assert.deepEqual(await host.emit("tool_result", resultEvent("call-watch-pass", "SubtasksWatch", { input: { executionId: "exec-report-window", after: "10m" } })), [], "a PASS adds no model-visible audit text");
 });
 
@@ -784,7 +813,7 @@ test("refusal → assistant inability → genuine user approval reaches a fresh 
   assert.match(prompt, /approval for this operation is not yet established/);
   assert.match(prompt, /I cannot proceed because tool protection refused the call\./);
   assert.match(prompt, /Approved to use, try again/);
-  assert.equal((prompt.match(/causal=yes/g) ?? []).length >= 3, true, "refusal, inability and approval are marked causal");
+  assert.ok((prompt.match(/"causal":true/g) ?? []).length >= 3, "refusal, inability and approval are marked causal");
 
   // Spoof control: the same words delivered through an extension path are not
   // authenticated approval and are labelled as extension data.
@@ -801,10 +830,10 @@ test("refusal → assistant inability → genuine user approval reaches a fresh 
   await spoofHost.emit("input", { text: "Approved to use, try again", source: "extension" }, hostContext());
   await spoof.coordinator.admitToolCall(callArgs("spoof-b", "bash", { command: "echo hi" }));
   const spoofPrompt = spoof.calls[1]!.prompt;
-  const approvalLine = spoofPrompt.split("\n").find((line) => line.includes("Approved to use, try again"));
-  assert.ok(approvalLine, "extension text is still available as evidence");
-  assert.match(approvalLine!, /origin=extension/);
-  assert.doesNotMatch(approvalLine!, /causal=yes/);
+  const approvalRecord = (sentDocument(spoofPrompt).evidence ?? []).find((record) => record.text.includes("Approved to use, try again"));
+  assert.ok(approvalRecord, "extension text is still available as evidence");
+  assert.equal(approvalRecord!.origin, "extension", "the host-recorded origin labels the delivered text");
+  assert.equal(approvalRecord!.causal, undefined, "extension-delivered text never takes the genuine-user causal slot");
 });
 
 test("a policy change or session reset during the wait invalidates a late PASS", async () => {
@@ -868,8 +897,8 @@ test("nested decisions are correlated to the root, aggregated outward and never 
   const nestedBlocked = await coordinator.admitToolCall(callArgs("root-call/2", "write", { path: "a" }, hostContext(), "root-call"));
   assert.equal(nestedBlocked?.block, true);
   assert.equal(calls.length, 3, "each mediated child gets its own decision");
-  assert.match(calls[1]!.prompt, /nested lineage \(outermost first\)=\\"root-call/);
-  assert.match(calls[2]!.prompt, /tool=write/);
+  assert.match(calls[1]!.prompt, /"lineage":\["root-call/);
+  assert.match(calls[2]!.prompt, /"tool":"write"/);
 
   // A nested result is programmatic input to its caller and is left untouched.
   assert.deepEqual(await host.emit("tool_result", resultEvent("root-call/1", "read", { structuredContent: { a: 1 } }, "root-call")), []);
@@ -2447,7 +2476,7 @@ test("oversized causal evidence is retained bounded and still reaches the audit 
   // The retained records keep their mandatory provenance; their record ids and
   // causal markings are optional facts, and this budget spent that capacity on
   // the quoted text instead (#590).
-  assert.ok((prompt.match(/"metadata":"origin=/g) ?? []).length >= 2, "both retained records keep their origin and trust labels");
+  assert.ok((prompt.match(/"origin":"/g) ?? []).length >= 2, "both retained records keep their recorded origin");
   // The variable context the runner was actually handed respects the budget,
   // while the unchanged fixed blocks sit outside it.
   const variable = sentVariable(prompt);
@@ -2547,9 +2576,10 @@ test("an oversized branch summary is carried as a bounded portion the same way (
   assert.ok(prompt.includes("SUMMARY-HEAD"), "the oversized branch summary reached the audit as a leading portion");
   assert.ok(prompt.includes("s".repeat(500)), "the carried portion is useful");
   assert.ok(!prompt.includes("SUMMARY-TAIL"), "the oversized summary tail stayed bounded");
-  const summaryLine = prompt.split("\n").find((line) => line.includes("SUMMARY-HEAD"));
-  assert.ok(summaryLine !== undefined && summaryLine.includes('origin=summary'), "the summary keeps its provenance label");
-  assert.ok(summaryLine !== undefined && summaryLine.includes('"partial":true'), "and says it is a leading portion");
+  const summaryRecord = (sentDocument(prompt).evidence ?? []).find((record) => record.text.includes("SUMMARY-HEAD"));
+  assert.ok(summaryRecord !== undefined, "the summary record is missing from the request");
+  assert.equal(summaryRecord!.origin, "summary", "the summary keeps its recorded origin label");
+  assert.equal(summaryRecord!.partial, true, "and says it is a leading portion");
 });
 
 test("an oversized live input and the branch's identical copy stay one user-origin record (#590)", async () => {
@@ -2579,11 +2609,11 @@ test("an oversized live input and the branch's identical copy stay one user-orig
       "the oversized instruction is audited rather than refused for its size");
     assert.equal(calls.length, 1, "one audit, and the scripted verdict decides the call");
     const prompt = calls[0]!.prompt;
-    const records = prompt.split("\n").filter((line) => line.includes("OVERSIZE-HEAD"));
+    const records = recordsQuoting(prompt, "OVERSIZE-HEAD");
     assert.equal(records.length, 1, `the same oversized message reached the auditor ${records.length} times at a ${maxContextChars} budget`);
-    assert.ok(records[0]!.includes('"metadata":"origin=user |'),
+    assert.equal(records[0]!.origin, "user",
       "the one record is the live record with its user provenance, not the branch's unknown-origin copy");
-    assert.ok(records[0]!.includes('"partial":true'), "and it says structurally that only its leading portion is carried");
+    assert.equal(records[0]!.partial, true, "and it says structurally that only its leading portion is carried");
     assert.ok(!prompt.includes("OVERSIZE-TAIL"), "the oversized tail stayed bounded");
     const variable = sentVariable(prompt);
     assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
@@ -2615,12 +2645,12 @@ test("a branch message sharing an oversized prefix but differing later is never 
     assert.equal(await coordinator.admitToolCall(callArgs(`oversize-lookalike-${maxContextChars}`, "bash", { command: "echo hi" }, ctx)), undefined);
     assert.equal(calls.length, 1);
     const prompt = calls[0]!.prompt;
-    const records = prompt.split("\n").filter((line) => line.includes("LOOKALIKE-HEAD"));
+    const records = recordsQuoting(prompt, "LOOKALIKE-HEAD");
     assert.equal(records.length, 1, `the budget carried ${records.length} copies of the lookalike prefix at a ${maxContextChars} budget`);
-    assert.ok(records[0]!.includes('"metadata":"origin=unknown |'),
+    assert.equal(records[0]!.origin, "unknown",
       "the distinct branch message stays its own unknown-origin record instead of being deduped into the live user record");
-    assert.ok(records[0]!.includes('"partial":true'), "and it is marked as a leading portion, never a complete statement");
-    assert.ok(!prompt.includes('"metadata":"origin=user |'),
+    assert.equal(records[0]!.partial, true, "and it is marked as a leading portion, never a complete statement");
+    assert.ok((sentDocument(prompt).evidence ?? []).every((record) => record.origin !== "user"),
       "no user-labelled record carries the distinct branch text");
     const variable = sentVariable(prompt);
     assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
@@ -2651,11 +2681,11 @@ test("an oversized original with boundary whitespace and its identical branch co
     assert.equal(await coordinator.admitToolCall(callArgs(`oversize-boundary-same-${maxContextChars}`, "bash", { command: "echo hi" }, ctx)), undefined);
     assert.equal(calls.length, 1);
     const prompt = calls[0]!.prompt;
-    const records = prompt.split("\n").filter((line) => line.includes("NEWWIDTH-HEAD"));
+    const records = recordsQuoting(prompt, "NEWWIDTH-HEAD");
     assert.equal(records.length, 1, `the same oversized original reached the auditor ${records.length} times at a ${maxContextChars} budget`);
-    assert.ok(records[0]!.includes('"metadata":"origin=user |'),
+    assert.equal(records[0]!.origin, "user",
       "the one record keeps the live user provenance instead of the branch's unknown-origin copy");
-    assert.ok(records[0]!.includes('"partial":true'), "and it says structurally that only its leading portion is carried");
+    assert.equal(records[0]!.partial, true, "and it says structurally that only its leading portion is carried");
     const variable = sentVariable(prompt);
     assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
   }
@@ -2684,11 +2714,11 @@ test("oversized originals differing only in boundary whitespace are never merged
     assert.equal(await coordinator.admitToolCall(callArgs(`oversize-boundary-different-${maxContextChars}`, "bash", { command: "echo hi" }, ctx)), undefined);
     assert.equal(calls.length, 1);
     const prompt = calls[0]!.prompt;
-    const records = prompt.split("\n").filter((line) => line.includes("WSLOOKALIKE-HEAD"));
+    const records = recordsQuoting(prompt, "WSLOOKALIKE-HEAD");
     assert.equal(records.length, 1, `the budget carried ${records.length} records for the boundary-whitespace lookalike at a ${maxContextChars} budget`);
-    assert.ok(records[0]!.includes('"metadata":"origin=unknown |'),
+    assert.equal(records[0]!.origin, "unknown",
       "the distinct branch message stays its own unknown-origin record instead of being merged into the live user record");
-    assert.ok(!prompt.includes('"metadata":"origin=user |'),
+    assert.ok((sentDocument(prompt).evidence ?? []).every((record) => record.origin !== "user"),
       "no user-labelled record carries the distinct branch text");
     const variable = sentVariable(prompt);
     assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
@@ -2726,22 +2756,22 @@ test("equal capture clocks rank live evidence by capture sequence, not by retent
       "the retry is audited on the real seam instead of refused for the size of its evidence");
     assert.equal(calls.length, 2, "the retry reached the configured auditor, whose verdict decides it");
     const prompt = calls[1]!.prompt;
-    const evidenceStart = prompt.indexOf("RECENT SESSION EVIDENCE (newest first)");
-    assert.ok(evidenceStart >= 0, "the evidence section is rendered with its header");
-    // The header is two lines, so the line after it is the first quoted record.
-    const firstRecord = prompt.slice(evidenceStart).split("\n")[2] ?? "";
+    const records = sentDocument(prompt).evidence ?? [];
+    assert.ok(records.length > 0, "the request carries its session evidence");
+    // The array is rendered newest first, so the first record is the newest one
+    // the budget carried.
     assert.ok(prompt.includes("NEWEST-INPUT proceed with the approved export"),
       `the newest input reached the audit at a ${maxContextChars} budget`);
-    assert.ok(firstRecord.includes("NEWEST-INPUT proceed with the approved export"),
+    assert.ok(records[0]!.text.includes("NEWEST-INPUT proceed with the approved export"),
       `the newest input is the first quoted record at a ${maxContextChars} budget, not an older retained causal record`);
-    const approvalLine = prompt.split("\n").find((line) => line.includes("APPROVAL-ONE"));
-    if (approvalLine !== undefined) {
-      assert.ok(approvalLine.includes('"metadata":"origin=user |'), "a retained causal record keeps its mandatory provenance while its optional record facts yield to quoted text");
+    const approval = records.find((record) => record.text.includes("APPROVAL-ONE"));
+    if (approval !== undefined) {
+      assert.equal(approval.origin, "user", "a retained causal record keeps its recorded origin while its optional record facts yield to quoted text");
       assert.ok(prompt.indexOf("NEWEST-INPUT") < prompt.indexOf("APPROVAL-ONE"),
         "an older retained causal approval never outranks the newest input in the rendered chronology");
     }
-    const inabilityLine = prompt.split("\n").find((line) => line.includes("INABILITY-HEAD"));
-    if (inabilityLine !== undefined) {
+    const inability = records.find((record) => record.text.includes("INABILITY-HEAD"));
+    if (inability !== undefined) {
       assert.ok(prompt.indexOf("NEWEST-INPUT") < prompt.indexOf("INABILITY-HEAD"),
         "the oversized older causal record is quoted after the newest input, not ahead of it");
     }
@@ -2770,7 +2800,8 @@ test("the real auditor seam receives a bounded context for an oversized proposal
     assert.ok(variable.length <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
     assert.ok(prompt.length > maxContextChars, "the unchanged fixed instruction blocks are additional to the context budget");
     assert.ok(prompt.includes("SEND-FIRST-TOKEN"), "the leading submitted operation data is what the budget protects");
-    assert.ok(prompt.indexOf("tool=bash") < prompt.indexOf("SEND-FIRST-TOKEN"));
+    assert.ok(prompt.indexOf('"tool":"bash"') < prompt.indexOf("SEND-FIRST-TOKEN"),
+      "the proposed operation is quoted ahead of its own arguments");
     assert.ok(!prompt.includes("SEND-LAST-TOKEN"), "the oversized argument tail did not leak through");
     assert.ok(!prompt.includes("GOV-TAIL"), "the oversized governing copy did not leak through");
     assert.ok(!prompt.includes("g".repeat(2_000)), "no long run of the oversized governing copy survived");
@@ -2918,10 +2949,9 @@ test("an external audit at the default budget keeps a 100,000-character proposal
   assert.equal(drafts.length, 1);
   const { prompt, contribution } = externalContribution(drafts);
   assert.ok(contribution <= 128_000, `the transmitted variable data was ${contribution} at a 128000 budget`);
-  const callLine = prompt.split("\n").find((line) => line.startsWith("{") && line.includes("tool=bash"))!;
-  const record = JSON.parse(callLine) as { text: string; partial?: boolean };
-  assert.ok(record.text.includes("WHOLE-LAST-TOKEN"), "a proposal that fits the budget reaches the auditor whole");
-  assert.notEqual(record.partial, true, "a proposal that fits the budget is not clipped by the metadata reservation");
+  const callRecord = sentDocument(prompt).proposedCall;
+  assert.ok(callRecord.arguments.includes("WHOLE-LAST-TOKEN"), "a proposal that fits the budget reaches the auditor whole");
+  assert.notEqual(callRecord.partial, true, "a proposal that fits the budget is not clipped by the metadata reservation");
   assert.ok(prompt.includes("NEWEST-USER approved to run the export"), "the newest session message still fits");
 });
 
@@ -2937,7 +2967,7 @@ test("an external audit at a small budget keeps a short call and the newest mess
     assert.equal(drafts.length, 1);
     const { prompt, contribution } = externalContribution(drafts);
     assert.ok(contribution <= maxContextChars, `the transmitted variable data was ${contribution} at a ${maxContextChars} budget`);
-    assert.ok(prompt.includes("tool=bash"), "the proposed operation is present");
+    assert.ok(prompt.includes('"tool":"bash"'), "the proposed operation is present");
     assert.ok(prompt.includes(token), `the newest session message was not evicted at a ${maxContextChars} budget`);
     assert.ok(!prompt.includes("GOV-TAIL"), "the oversized governing copy stayed bounded");
   }
@@ -2967,7 +2997,7 @@ test("causal refusal and approval survive ordinary history eviction", async () =
   assert.match(prompt, /approval is not yet established/);
   assert.match(prompt, /I cannot proceed because the gate refused the call\./);
   assert.match(prompt, /Approved to use, try again/);
-  assert.equal((prompt.match(/causal=yes/g) ?? []).length >= 3, true, "the causal chain is retained and marked");
+  assert.ok((prompt.match(/"causal":true/g) ?? []).length >= 3, "the causal chain is retained and marked");
 });
 
 test("interactive input provenance is captured before a handled short-circuit", async () => {
@@ -2996,10 +3026,10 @@ test("interactive input provenance is captured before a handled short-circuit", 
   await emitInput({ text: "Approved to use, try again", source: "interactive" }, ctx);
 
   assert.equal(await coordinator.admitToolCall(callArgs("handled-b", "bash", { command: "echo hi" })), undefined);
-  const approvalLine = calls[1]!.prompt.split("\n").find((line) => line.includes("Approved to use, try again"));
-  assert.ok(approvalLine, "the queued interactive approval is still evidence");
-  assert.match(approvalLine!, /origin=user/);
-  assert.match(approvalLine!, /causal=yes/);
+  const approvalRecord = (sentDocument(calls[1]!.prompt).evidence ?? []).find((record) => record.text.includes("Approved to use, try again"));
+  assert.ok(approvalRecord, "the queued interactive approval is still evidence");
+  assert.equal(approvalRecord!.origin, "user", "interactive input keeps its recorded user origin");
+  assert.equal(approvalRecord!.causal, true, "and the host's causal marking travels with it");
 });
 
 test("a monotonic policy revision invalidates Off → On → Off during a pending audit", async () => {
@@ -3132,7 +3162,7 @@ test("captured tool results supply URL provenance as untrusted evidence without 
     url: "https://storage.example.invalid/document?signature=SYNTHETIC",
   })), undefined);
   assert.ok(calls[0]!.prompt.includes(source));
-  assert.match(calls[0]!.prompt, /"metadata":"origin=tool-result \|/);
+  assert.match(calls[0]!.prompt, /"origin":"tool-result"/);
   assert.doesNotMatch(calls[0]!.prompt, /HIDDEN-REASONING-MUST-NOT-BE-SENT/);
 });
 
@@ -3149,12 +3179,11 @@ test("an oversized live tool result contributes its prefix instead of an omissio
     }));
     assert.equal(await coordinator.admitToolCall(callArgs(`next-${maxContextChars}`, "read", { path: "fixture" })), undefined);
     const prompt = calls[0]!.prompt;
-    const line = prompt.split("\n").find((value) => value.startsWith("{") && value.includes("TOOL-RESULT-HEAD"));
-    assert.ok(line, `the leading tool evidence is retained at ${maxContextChars}`);
-    const record = JSON.parse(line) as { metadata: string; text: string; partial?: boolean };
-    assert.match(record.metadata, /^origin=tool-result \|/);
-    assert.ok(record.text.startsWith("Native read result (call large-result):\nTOOL-RESULT-HEAD "));
-    assert.equal(record.partial, true);
+    const record = (sentDocument(prompt).evidence ?? []).find((value) => value.text.includes("TOOL-RESULT-HEAD"));
+    assert.ok(record, `the leading tool evidence is retained at ${maxContextChars}`);
+    assert.equal(record!.origin, "tool-result", "the captured result keeps its recorded origin");
+    assert.ok(record!.text.startsWith("Native read result (call large-result):\nTOOL-RESULT-HEAD "));
+    assert.equal(record!.partial, true);
     assert.doesNotMatch(prompt, /TOOL-RESULT-TAIL|Host omission|HIDDEN-REASONING-MUST-NOT-BE-SENT/);
     const variable = sentVariable(prompt);
     assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars);
@@ -3173,7 +3202,7 @@ test("active-branch tool results remain lower-trust evidence after restore", asy
   });
   assert.equal(await coordinator.admitToolCall(callArgs("restored-source", "read", { path: "fixture" }, ctx)), undefined);
   assert.match(calls[0]!.prompt, /RESTORED-TOOL-SOURCE/);
-  assert.match(calls[0]!.prompt, /"metadata":"origin=tool-result \|/);
+  assert.match(calls[0]!.prompt, /"origin":"tool-result"/);
 });
 
 /**
@@ -3204,14 +3233,14 @@ test("the genuine user task survives more than a ring of captured tool results",
 
   assert.equal(await coordinator.admitToolCall(callArgs("after-fillers", "write", { path: "fixture.txt" })), undefined);
   assert.equal(calls.length, 1);
-  const lines = calls[0]!.prompt.split("\n");
-  const taskLines = lines.filter((line) => line.includes(TASK));
-  const approvalLines = lines.filter((line) => line.includes(APPROVAL));
-  assert.equal(taskLines.length, 1, "the current-session task was lost or duplicated in the auditor context");
-  assert.equal(approvalLines.length, 1, "the later genuine user input was lost or duplicated");
+  const records = sentDocument(calls[0]!.prompt).evidence ?? [];
+  const taskRecords = records.filter((record) => record.text.includes(TASK));
+  const approvalRecords = records.filter((record) => record.text.includes(APPROVAL));
+  assert.equal(taskRecords.length, 1, "the current-session task was lost or duplicated in the auditor context");
+  assert.equal(approvalRecords.length, 1, "the later genuine user input was lost or duplicated");
   // Retention reuses the real evidence records, so genuine provenance survives.
-  assert.match(taskLines[0]!, /"metadata":"origin=user \|/);
-  assert.match(approvalLines[0]!, /"metadata":"origin=user \|/);
+  assert.equal(taskRecords[0]!.origin, "user", "the retained task lost its recorded user origin");
+  assert.equal(approvalRecords[0]!.origin, "user", "the retained approval lost its recorded user origin");
   // The most recent captured tool evidence is still supplied alongside them.
   assert.ok(calls[0]!.prompt.includes("inert captured result 19"));
   assert.ok(calls[0]!.prompt.includes("inert captured result 18"));
@@ -3253,14 +3282,14 @@ test("an RPC-delivered worker task survives more than a ring of captured tool re
 
   assert.equal(await coordinator.admitToolCall(callArgs("after-rpc-fillers", "write", { path: "fixture.txt" })), undefined);
   assert.equal(calls.length, 1);
-  const lines = calls[0]!.prompt.split("\n");
-  const taskLines = lines.filter((line) => line.includes(TASK));
-  assert.equal(taskLines.length, 1, "the RPC-delivered task was lost from or duplicated in the auditor context");
+  const records = sentDocument(calls[0]!.prompt).evidence ?? [];
+  const taskRecords = records.filter((record) => record.text.includes(TASK));
+  assert.equal(taskRecords.length, 1, "the RPC-delivered task was lost from or duplicated in the auditor context");
   // Retention reuses the captured record, so the host-recorded provenance
   // survives unchanged: extension, never a promoted user message.
-  assert.match(taskLines[0]!, /"metadata":"origin=extension \|/);
-  assert.doesNotMatch(taskLines[0]!, /origin=user/);
-  assert.doesNotMatch(taskLines[0]!, /causal=yes/);
+  assert.equal(taskRecords[0]!.origin, "extension", "the RPC-delivered task lost its recorded extension origin");
+  assert.ok(records.every((record) => record.origin !== "user"), "extension input never becomes a user message");
+  assert.equal(taskRecords[0]!.causal, undefined, "extension input never takes a causal slot");
   // The most recent captured tool evidence is still supplied alongside it.
   assert.ok(calls[0]!.prompt.includes("inert captured result 14"));
   assert.ok(calls[0]!.prompt.includes("inert captured result 13"));
@@ -3285,14 +3314,14 @@ test("an RPC-delivered approval stays extension evidence and never fills the gen
   const second = await coordinator.admitToolCall(callArgs("rpc-after-approval", "bash", { command: "echo hi" }));
   assert.equal(second, undefined, "a fresh audit still decides from the supplied context");
   assert.equal(calls.length, 2, "approval text never auto-passes");
-  const lines = calls[1]!.prompt.split("\n");
-  const approvalLine = lines.find((line) => line.includes("Approved to use, try again"));
-  assert.ok(approvalLine, "the RPC text stays available as untrusted evidence");
-  assert.match(approvalLine!, /origin=extension/);
-  assert.doesNotMatch(approvalLine!, /causal=yes/);
+  const records = sentDocument(calls[1]!.prompt).evidence ?? [];
+  const approvalRecord = records.find((record) => record.text.includes("Approved to use, try again"));
+  assert.ok(approvalRecord, "the RPC text stays available as untrusted evidence");
+  assert.equal(approvalRecord!.origin, "extension", "the delivered approval keeps its recorded extension origin");
+  assert.equal(approvalRecord!.causal, undefined, "the delivered approval never takes a causal slot");
   // Only the gate refusal and the assistant inability hold causal slots; the
   // genuine-user slot stayed unfilled.
-  assert.equal((calls[1]!.prompt.match(/causal=yes/g) ?? []).length, 2);
+  assert.equal((calls[1]!.prompt.match(/"causal":true/g) ?? []).length, 2);
 });
 
 test("a session reset drops the retained RPC input and its branch copy never duplicates it", async () => {
@@ -3307,9 +3336,9 @@ test("a session reset drops the retained RPC input and its branch copy never dup
     sessionManager: { buildContextEntries: () => [{ type: "message", message: { role: "user", content: TASK } }] },
   });
   assert.equal(await coordinator.admitToolCall(callArgs("rpc-before-reset", "read", { path: "a" }, ctx)), undefined);
-  const lines = calls[0]!.prompt.split("\n").filter((line) => line.includes(TASK));
-  assert.equal(lines.length, 1, "the retained RPC task was duplicated by its branch copy");
-  assert.match(lines[0]!, /origin=extension/);
+  const retained = recordsQuoting(calls[0]!.prompt, TASK);
+  assert.equal(retained.length, 1, "the retained RPC task was duplicated by its branch copy");
+  assert.equal(retained[0]!.origin, "extension", "the retained record keeps the live extension provenance");
   await host.emit("session_start", hostContext());
   assert.equal(await coordinator.admitToolCall(callArgs("rpc-after-reset", "read", { path: "b" })), undefined);
   assert.equal(calls.length, 2);
@@ -4631,11 +4660,10 @@ test("a reload past the row bound recovers every older refusal and save warning 
         // scripted queue cannot run out and repeat the wrong verdict.
         (request: ProtectionAuditorRequest) => {
           // The envelope side field carries only bounded host identity, so this
-          // scripted auditor reads the invocation id out of the proposal record
-          // in the request text it was actually sent: the proposal's own record,
-          // never an evidence record naming some other invocation.
-          const match = /invocation=([A-Za-z0-9-]+)/.exec(proposalRecordLine(request.prompt));
-          const callId = match?.[1] ?? "";
+          // scripted auditor reads the invocation id out of the proposal block in
+          // the request text it was actually sent: the proposal's own block, never
+          // an evidence record naming some other invocation.
+          const callId = proposalRecord(request.prompt).id ?? "";
           const admitted = callId.startsWith("wide-pass-") || callId === "wide-warn-0";
           return Promise.resolve({
             durationMs: 1,

@@ -261,6 +261,7 @@ export async function startCoordinator(
 		readonly log?: SnapshotLog;
 		readonly closeOwnedSession?: PeerCoordinatorOptions["closeOwnedSession"];
 		readonly createOwnedSession?: PeerCoordinatorOptions["createOwnedSession"];
+		readonly renameOwnedSession?: PeerCoordinatorOptions["renameOwnedSession"];
 		readonly savedCatalogViewFactory?: PeerCoordinatorOptions["savedCatalogViewFactory"];
 		readonly savedViewer?: PeerCoordinatorOptions["savedViewer"];
 	},
@@ -275,6 +276,7 @@ export async function startCoordinator(
 		...(options.testHooks === undefined ? {} : { testHooks: options.testHooks }),
 		...(options.closeOwnedSession === undefined ? {} : { closeOwnedSession: options.closeOwnedSession }),
 		...(options.createOwnedSession === undefined ? {} : { createOwnedSession: options.createOwnedSession }),
+		...(options.renameOwnedSession === undefined ? {} : { renameOwnedSession: options.renameOwnedSession }),
 		...(options.savedCatalogViewFactory === undefined
 			? {}
 			: { savedCatalogViewFactory: options.savedCatalogViewFactory }),

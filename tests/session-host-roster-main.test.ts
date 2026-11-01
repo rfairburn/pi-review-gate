@@ -1704,6 +1704,59 @@ test("a committed keyboard reorder interleaves local and remote cards, and the m
   }
 });
 
+test("a refused network rebuild does not spend a new remote identity's first observation; the accepted one persists it once", async () => {
+  const root = makeRoot("refused-observation");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  try {
+    const peer = new FakePeerCoordinator();
+    const harness = createHarness(agentDir, () => emptyCatalog(agentDir), {}, {
+      createPeerCoordinator: (coordinatorOptions) => {
+        peer.options = coordinatorOptions;
+        return peer as never;
+      },
+    });
+    await ready(harness);
+    const sidebar = harness.sidebar;
+    assert.ok(sidebar);
+    // The sidebar's own rebuild can refuse a snapshot (a thrown projection). The
+    // host restores the previous display for that case; what it must NOT do is
+    // claim the identity as already observed, because then the identical
+    // snapshot accepted afterwards would draw the card without ever saving it.
+    const accept = sidebar.setPeerUiSnapshot.bind(sidebar);
+    let refused = 0;
+    sidebar.setPeerUiSnapshot = (snapshot: PeerUiSnapshot): void => {
+      if (refused === 0 && (snapshot.hosts?.length ?? 0) > 0) {
+        refused += 1;
+        throw new Error("synthetic sidebar rebuild failure");
+      }
+      accept(snapshot);
+    };
+    const hosts = [
+      peerHost({ id: "h1", hostRunId: "run-1", rows: [remoteCard({ rowId: "rb", workspace: "/remote/ws/b", conversation: "conv-b", rosterSlotId: "slot-b" })] }),
+    ];
+    peer.publish(hosts);
+    await nextTurn();
+    assert.equal(refused, 1, "the first rebuild really was refused");
+    assert.equal(readRosterStore(agentDir).status, "absent",
+      "a refused snapshot publishes no order and spends no first observation");
+
+    // The SAME observation accepted afterwards is still a first observation: it
+    // is remembered and published exactly once, with no local session and no
+    // reorder action behind it.
+    peer.publish(hosts);
+    await nextTurn();
+    assert.deepEqual(persistedSequence(agentDir), ["remote:h1:slot:slot-b"],
+      "the accepted snapshot persists the new identity once, with no extra or missing entry");
+    assert.deepEqual(drawnOrder(sidebar, ["Name conv-b"]), ["Name conv-b"],
+      "the accepted card sits where the source order places it, as it did before the observation");
+    assert.equal(harness.manager?.views.length, 0, "the observation created no local session");
+    assert.equal(await quit(harness), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a remote card that disappears keeps its remembered position and returns to it without a duplicate card", async () => {
   const root = makeRoot("mixed-absence");
   const agentDir = join(root, "agent");

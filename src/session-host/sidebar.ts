@@ -40,7 +40,16 @@
  *   the too-small pane, and selection-targeted keys (Enter, edit,
  *   stop/remove) act only on an entry the last roster render completely
  *   drew at its current height and order; hiding or overlaying the roster
- *   forgets it.
+ *   forgets it. One wheel notch inside the roster pane a written frame actually
+ *   drew moves ONLY that pane's single viewport position (#439): the current
+ *   implementation steps it by one entry, which is an internal unit rather
+ *   than a public rows-per-notch promise. The scroll never activates a row,
+ *   moves the highlight, changes focus or visibility, or touches Main's
+ *   content owner, and the keep-the-highlight visible rule re-engages whenever
+ *   anything other than that deliberate scroll changed the drawn layout (a
+ *   different highlighted entry, a changed roster projection, a different pane
+ *   size or available list height, or a different rendered height for the
+ *   highlighted card).
  * - `d` and Delete stop/remove the highlighted session row: an exited row
  *   removes immediately; a settled
  *   error row without a live process requests the same deliberate removal
@@ -108,6 +117,25 @@
  * Their workspace path is exact display-only owner data (sanitized, never
  * resolved or otherwise used), and a stale observation is marked as stale
  * rather than refreshed, reconnected, or guessed.
+ *
+ * Remote name editing (issue #512, pure frontend) extends the SAME Edit seam:
+ * `E` on a completely drawn remote card whose owner currently reports rename
+ * support, whose roster observation is current, and whose native conversation
+ * tuple was observed emits exactly one `edit-remote` DTO naming the exact owner
+ * target plus that native tuple — never a local `edit`/`rename`, even when an
+ * opaque remote row id collides with a local item id. Main then opens the one
+ * existing editor through `openRemoteEdit`; it shows the frozen current name as
+ * a reference row and keeps the separate EMPTY replacement field, exactly as
+ * local Edit does. There is no second editor, no second pending-request slot,
+ * and no second copy of a remote name: the owner's roster metadata is the only
+ * source of an updated name, and this module never patches one. A remote
+ * submission requires the writer's own receipt for the exact drawn Edit frame
+ * (`captureEditFormPresentation`/`settleEditFormRender`/`isEditFormRenderCurrent`
+ * /`invalidateEditFormPresentation`) and stays fenced by `renameOnPeerStillCurrent`
+ * on the frozen target, native tuple, and draft. Unknown, unsupported, stale,
+ * disconnected, or native-unobserved peers show a truthful no-request notice and
+ * never fall back to a local rename, a reconnect, or another row. Cancel returns
+ * to the visible roster with the existing Escape fence and emits nothing.
  *
  * The Saved picker can also browse ONE selected owner host's Saved history.
  * It always opens on Local with a blank query; its Host line appears only while
@@ -384,6 +412,22 @@ export type SidebarAction =
       readonly generation: number;
       readonly renderToken: number;
     }
+  /**
+   * Ordinary `E` on one remote card the last roster render drew whole, only
+   * while its owner currently reports rename support, the roster observation is
+   * current, and the row's native conversation tuple was observed. It names the
+   * exact owner target plus that native tuple and nothing else: it is never a
+   * local `edit`, never carries a local item id, and grants no authority. Main
+   * independently proves the written highlight before it opens the editor.
+   */
+  | {
+      readonly type: "edit-remote";
+      readonly hostId: string;
+      readonly hostRunId: string;
+      readonly rowId: string;
+      readonly nativeSessionId: string;
+      readonly nativeSessionEpoch: number;
+    }
   | { readonly type: "resume-row"; readonly requestId: number; readonly id: string }
   | { readonly type: "resume-row-cancel"; readonly requestId: number }
   /**
@@ -438,6 +482,25 @@ export type SidebarAction =
       readonly id: string;
       readonly expectedSessionId: string;
       readonly expectedSessionEpoch: number;
+      readonly name: string;
+    }
+  /**
+   * One deliberate REMOTE rename of the OWNER's session name. It names exactly
+   * the frozen owner target and native tuple this Edit form opened on, the
+   * operator's complete replacement name, and the frozen id of the Edit frame
+   * the writer actually wrote. It is never a local `rename`, never a local item
+   * id, and Main never re-derives any of it from a later roster index or label.
+   */
+  | {
+      readonly type: "rename-remote";
+      readonly requestId: number;
+      readonly formGeneration: number;
+      readonly renderToken: number;
+      readonly hostId: string;
+      readonly hostRunId: string;
+      readonly rowId: string;
+      readonly nativeSessionId: string;
+      readonly nativeSessionEpoch: number;
       readonly name: string;
     }
   | { readonly type: "quit" }
@@ -604,8 +667,35 @@ export interface SidebarMousePresentation {
    * any Close is requested, and the owner host revalidates its own row.
    */
   readonly remoteClose: SidebarRemoteCloseRow | undefined;
+  /**
+   * The same drawn highlight when it is eligible for a name edit: a completely
+   * drawn remote card whose owner is connected and currently reports rename
+   * support, whose observation is current with an exact owner run, and whose
+   * native conversation tuple was observed. Undefined otherwise. Optional so an
+   * older captured presentation stays representable. Like `remoteClose` it
+   * grants nothing: Main needs its own written receipt for this exact value.
+   */
+  readonly remoteEdit?: SidebarRemoteEditRow;
   /** Activates only entries captured by the exact sidebar render this token represents. */
   activateRosterAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Scrolls ONLY the left roster viewport in `direction` (-1 up, +1 down) for a
+   * wheel report inside the roster pane this render actually drew (#439). The
+   * current implementation steps the viewport by one entry per call; that step
+   * unit is internal, not a public rows-per-notch promise. It moves no
+   * highlight, focus, visibility, activation target, or Main content owner,
+   * and never activates anything: the roster's single viewport position is the
+   * only state it changes, and the render pass owns every clamp, so a list that
+   * fits, a boundary, or a since-changed/hidden roster leaves the visible rows
+   * exactly as they were.
+   */
+  scrollRosterAt(
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+    direction: SidebarScrollDirection,
+  ): boolean;
   /** Activates only saved rows captured by the exact sidebar render this token represents. */
   activateSavedAt(column: number, row: number, cols: number, rows: number): boolean;
   /**
@@ -722,6 +812,34 @@ export interface SidebarRemoteCloseRow {
   readonly hostLabel: string;
 }
 
+/**
+ * One completely drawn remote highlight eligible for a name edit, captured at
+ * render time: the minimal owner target, the row's OBSERVED native conversation
+ * tuple, and the drawn row/geometry. Nothing here is authority — the owner
+ * revalidates its own row and tuple — and no local id is ever present.
+ */
+export interface SidebarRemoteEditRow {
+  readonly hostId: string;
+  /** Exact observed owner run; empty/absent runs never produce this record. */
+  readonly hostRunId: string;
+  readonly rowId: string;
+  /** Observed native conversation tuple of that same drawn row. */
+  readonly nativeSessionId: string;
+  readonly nativeSessionEpoch: number;
+  /** Pane row and complete card height this render actually drew. */
+  readonly row: number;
+  readonly height: number;
+  /** Pane geometry the card was drawn in. */
+  readonly cols: number;
+  readonly rows: number;
+  /** Focus domain of that render; only a roster-owned highlight can act. */
+  readonly focus: SidebarFocus;
+  /** Drawn title of this same row (UI text only, never identity). */
+  readonly title: string;
+  /** Bounded owner host label (UI text only). */
+  readonly hostLabel: string;
+}
+
 export interface SidebarFieldFactoryOptions {
   /**
    * `plain` is bounded OWNER text: the ordinary workspace field bound (the same
@@ -759,6 +877,9 @@ export interface SidebarFieldFactoryResult {
 }
 
 export type SidebarFocus = "main" | "sidebar" | "form" | "confirm";
+
+/** One wheel notch: -1 reveals earlier entries, +1 reveals later ones. */
+export type SidebarScrollDirection = -1 | 1;
 
 /**
  * The no-completion provider installed on a plain owner-entry field. Text the
@@ -1100,10 +1221,10 @@ interface RemoteSavedReadIntent {
 /**
  * The selected remote host's picker state. Only the CURRENT owner result is
  * kept, as at most `REMOTE_SAVED_MAX_WINDOWS` bounded windows: nothing
- * accumulates a whole catalog, a history, or another host's rows.
+ * accumulates a whole catalog, a history, or another host's rows. Host identity
+ * is never copied here: it stays the picker's one canonical `savedHost` choice.
  */
 interface RemoteSavedState {
-  readonly hostId: string;
   /** Owner run the bound catalog (and any outstanding result read) belongs to. */
   catalog: { readonly hostRunId: string; readonly catalogId: string } | undefined;
   result: {
@@ -1178,17 +1299,21 @@ interface DisplayedRoster {
   readonly regions: ReadonlyMap<string, DisplayedRosterRegion>;
   readonly cols: number;
   readonly rows: number;
+  /** Entry rows the render actually had available between header and footer. */
+  readonly listRows: number;
   readonly focus: SidebarFocus;
   readonly selectedKey: string | undefined;
+  /** The selected entry's index in THIS render's projection, off-screen included. */
+  readonly selectedIndex: number;
   /**
    * The list window this render actually drew: the pane row the window starts
    * at, its row budget, and the entry index it begins from. A session drag may
    * only move the window of a map that still describes the window currently
    * drawn, so a held, refused, or superseded frame can never scroll against
-   * geometry that was never written.
+   * geometry that was never written. `listRows` is the SAME available-row
+   * budget the render had between header and footer.
    */
   readonly listStart: number;
-  readonly listRows: number;
   readonly listTop: number;
 }
 
@@ -1236,6 +1361,70 @@ interface CreateFormCandidate {
   readonly cols: number;
   readonly rows: number;
   written: boolean;
+}
+
+/**
+ * The one open Edit target: a single discriminated record, never parallel local
+ * and remote copies of the same editor state. `currentName` is a reference-only
+ * display snapshot taken when the form opened; the roster metadata stays the
+ * sole source of an updated name and this module never patches or re-derives
+ * it. The remote branch carries the frozen exact owner target and the observed
+ * native tuple it was opened on, never a local item id.
+ */
+type EditFormTarget =
+  | {
+      readonly kind: "local";
+      readonly id: string;
+      readonly nativeSession: SessionHostNativeSession;
+      readonly currentName: string;
+    }
+  | {
+      readonly kind: "remote";
+      readonly hostId: string;
+      readonly hostRunId: string;
+      readonly rowId: string;
+      /** Observed native conversation identity, frozen at open. */
+      readonly nativeSession: { readonly sessionId: string; readonly epoch: number };
+      readonly currentName: string;
+      /** Frozen bounded owner label drawn by the form (UI text only). */
+      readonly hostLabel: string;
+    };
+
+/**
+ * The exact REMOTE Edit frame one render actually drew, retained so a remote
+ * rename can require the writer's own receipt for it instead of relying on any
+ * later render, DTO, or selection. `written` becomes true only when Main's
+ * frame writer reports THIS candidate as written. `name` is the drawn
+ * replacement draft, so a draft-only change still mints a new candidate needing
+ * its own written boundary. Local Edit has no candidate at all.
+ */
+interface EditFormCandidate {
+  readonly token: number;
+  readonly formGeneration: number;
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly rowId: string;
+  readonly nativeSessionId: string;
+  readonly nativeSessionEpoch: number;
+  readonly name: string;
+  readonly cols: number;
+  readonly rows: number;
+  written: boolean;
+}
+
+/** The frozen public description of one drawn REMOTE Edit-form candidate. */
+export interface SidebarEditFormPresentation {
+  readonly formGeneration: number;
+  readonly renderToken: number;
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly rowId: string;
+  readonly nativeSessionId: string;
+  readonly nativeSessionEpoch: number;
+  /** The replacement name draft that frame actually displayed. */
+  readonly name: string;
+  readonly cols: number;
+  readonly rows: number;
 }
 
 /** The frozen public description of one drawn New-form candidate. */
@@ -1666,6 +1855,30 @@ export const CREATE_ON_PEER_OTHER_RUN_NOTICE =
   "The remote host reported a different owner run; nothing was selected";
 export const CREATE_ON_PEER_UNCERTAIN_NOTICE =
   "UNCERTAIN: the remote create may have been handed off; outcome unknown";
+/**
+ * Fixed, bounded notices for a remote name edit this side refuses BEFORE
+ * anything is sent: a row that is not the completely drawn current highlight,
+ * an owner that does not offer renaming, a stale or run-replaced observation, a
+ * row whose native conversation was never observed, and a form frame the writer
+ * never reported written. None claims an owner outcome, a retry, a reconnect, a
+ * fallback rename, or a path.
+ */
+export const REMOTE_EDIT_NOT_DRAWN_NOTICE =
+  "Highlight a completely displayed remote session row to edit its name";
+export const REMOTE_EDIT_UNSUPPORTED_NOTICE =
+  "That owner does not offer remote session renaming; no rename was requested";
+export const REMOTE_EDIT_TARGET_CHANGED_NOTICE =
+  "That remote session is disconnected, stale, or changed; no rename was requested";
+export const REMOTE_EDIT_NO_RUN_NOTICE =
+  "That remote session's owner run was not observed; no rename was requested";
+export const REMOTE_EDIT_NO_NATIVE_NOTICE =
+  "That remote session's native conversation was not observed; no rename was requested";
+export const REMOTE_EDIT_STALE_NOTICE =
+  "That remote session's roster is stale; no rename was requested";
+export const REMOTE_EDIT_UNWRITTEN_NOTICE =
+  "That rename form is not the displayed form; nothing was sent";
+export const REMOTE_EDIT_CHANGED_NOTICE =
+  "That remote session changed; reopen Edit before renaming";
 /**
  * Fixed, bounded notices for the selected-host Saved picker. Each states only
  * what this side knows locally; none claims an owner outcome, a retry, a
@@ -2431,6 +2644,7 @@ function copyPeerHost(value: unknown): SidebarPeerHost | null {
   const message = displayOptionalText(source.message);
   const reconnectSuppressed = displayBoolean(source.reconnectSuppressed);
   const previouslyConnected = displayBoolean(source.previouslyConnected);
+  const renameSupported = displayBoolean(source.renameSupported);
   const rosterValue = displayObject(source.roster);
   const rosterState = displayText(rosterValue?.state);
   const rowsValue = rosterValue?.rows;
@@ -2480,6 +2694,7 @@ function copyPeerHost(value: unknown): SidebarPeerHost | null {
       ...(typeof rosterRun === "string" && rosterRun.length > 0 ? { hostRunId: rosterRun } : {}),
     },
     ...(saved === undefined ? {} : { saved }),
+    ...(renameSupported === undefined ? {} : { renameSupported }),
   };
 }
 
@@ -2783,6 +2998,9 @@ export class SidebarController {
   /** The New-form frame the last complete render drew (writer receipt pending). */
   private createFormCandidate: CreateFormCandidate | undefined;
   private createFormTokenSequence = 1;
+  /** The REMOTE Edit frame the last complete render drew (writer receipt pending). */
+  private editFormCandidate: EditFormCandidate | undefined;
+  private editFormTokenSequence = 1;
   private shortcutDraft: { toggle: string; returnToMain: string } = { ...DEFAULT_HOST_SHORTCUTS };
   private shortcutFieldIndex: 0 | 1 = 0;
   private pendingShortcutSave: { readonly requestId: number } | undefined;
@@ -2852,7 +3070,7 @@ export class SidebarController {
   private remoteSavedPolicyOverlay:
     | { readonly hostId: string; readonly hostRunId: string; readonly deleteExposed: boolean | null }
     | undefined;
-  private editTarget?: { readonly id: string; readonly nativeSession: SessionHostNativeSession; readonly currentName: string };
+  private editTarget?: EditFormTarget;
   private workspaceDraft: string;
   private editDraft = "";
   private rowStore: SidebarItem[] = [];
@@ -2908,6 +3126,13 @@ export class SidebarController {
         };
       }
     | undefined;
+  /**
+   * The one outstanding rename request. A REMOTE rename adds no parallel copy of
+   * the target, native tuple, frame ids, or name: remote-ness comes from
+   * `editTarget.kind`, the drawn frame is the existing receipt candidate, and
+   * Main holds the immutable submitted action it compares against the current
+   * canonical state through `renameOnPeerStillCurrent`.
+   */
   private pendingRename: { readonly requestId: number } | undefined;
   /** Explicit confirmation purpose: quit the host or stop one owned session. */
   private confirmPurpose:
@@ -3374,13 +3599,17 @@ export class SidebarController {
   savedRemoteContext(): SidebarRemoteSavedContext | undefined {
     const state = this.remoteSaved;
     const pickerId = this.savedPickerId;
-    if (state === undefined || pickerId === undefined || !this.remoteSavedPickerOpen()) return undefined;
+    const chosen = this.savedHost;
+    // The `kind` test only re-narrows the canonical choice for the compiler:
+    // `remoteSavedPickerOpen()` already means a remote choice owns the pane.
+    if (state === undefined || pickerId === undefined || chosen.kind !== "remote"
+      || !this.remoteSavedPickerOpen()) return undefined;
     const option = this.currentSavedHostOption();
     return Object.freeze({
       pickerId,
       revision: this.savedQueryRevision,
       query: this.savedQuery,
-      hostId: state.hostId,
+      hostId: chosen.hostId,
       hostRunId: option?.hostRunId ?? null,
       catalogId: state.catalog?.catalogId,
       resultId: state.result?.resultId,
@@ -3944,16 +4173,65 @@ export class SidebarController {
       || !isValidNativeSessionId(target.nativeSession.sessionId)
       || !Number.isSafeInteger(target.nativeSession.epoch) || target.nativeSession.epoch < 1
       || !isValidRenameName(target.nativeSession.name)) return false;
+    return this.openEditForm({
+      kind: "local",
+      id: target.id,
+      nativeSession: { ...target.nativeSession },
+      currentName: sanitizeBounded(target.currentName, 256),
+    });
+  }
+
+  /**
+   * Open the SAME Edit editor for one exact remote owner row, without selecting
+   * it. The caller names the frozen target and the observed native tuple; the
+   * CURRENT projection must still describe that exact row on that exact run with
+   * that same native tuple, and the owner must still be connected and report
+   * rename support. Otherwise nothing opens: no sibling row, no older run, no
+   * local fallback, and no reconnect. `currentName` is only the reference
+   * display snapshot; the owner's metadata remains the sole updated-name source.
+   */
+  openRemoteEdit(target: {
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+    readonly nativeSession: { readonly sessionId: string; readonly epoch: number };
+    readonly currentName: string;
+  }): boolean {
+    if (!this._visible || this._focus !== "sidebar") return false;
+    if (typeof target.hostId !== "string" || target.hostId.length === 0) return false;
+    if (typeof target.hostRunId !== "string" || target.hostRunId.length === 0) return false;
+    if (typeof target.rowId !== "string" || target.rowId.length === 0) return false;
+    const native = target.nativeSession;
+    if (native === undefined || native === null
+      || !isValidNativeSessionId(native.sessionId)
+      || !Number.isSafeInteger(native.epoch) || native.epoch < 1) return false;
+    if (typeof target.currentName !== "string") return false;
+    const entry = this.findRemoteEntry(target.hostId, target.rowId);
+    const remote = entry?.remote;
+    if (remote === undefined || remote.rosterState !== "current") return false;
+    if (remote.hostRunId !== target.hostRunId) return false;
+    if (this.remoteRenameHost(target.hostId, target.hostRunId) === undefined) return false;
+    if (!this.remoteEditRowStillProjected(target)) return false;
+    return this.openEditForm({
+      kind: "remote",
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      rowId: target.rowId,
+      nativeSession: { sessionId: native.sessionId, epoch: native.epoch },
+      currentName: sanitizeBounded(target.currentName, 256),
+      hostLabel: remote.hostLabel,
+    });
+  }
+
+  /** The single Edit-open seam shared by local and remote targets: no second editor. */
+  private openEditForm(target: EditFormTarget): boolean {
     this.forgetDisplayedRoster(); // narrow layouts overlay the roster
     this.disposeFormField();
     this.pendingCreate = undefined;
     this.pendingRename = undefined;
     this.formKind = "edit";
-    this.editTarget = {
-      id: target.id,
-      nativeSession: { ...target.nativeSession },
-      currentName: sanitizeBounded(target.currentName, 256),
-    };
+    if (target.kind === "remote") this.formGeneration += 1;
+    this.editTarget = target;
     this.editDraft = "";
     this.formError = undefined;
     this.noticeError = undefined;
@@ -3983,6 +4261,9 @@ export class SidebarController {
   /** Shows a bounded error when Main rejects an edit before broker admission. */
   failRename(requestId: number, message: string): void {
     if (this.pendingRename?.requestId !== requestId || this.formKind !== "edit") return;
+    // A settled refusal/unknown leaves the draft, not its consumed send receipt.
+    // Only this request's form is retired; an older reply cannot touch a new one.
+    if (this.editTarget?.kind === "remote") this.invalidateEditFormPresentation();
     this.pendingRename = undefined;
     if (this.formField) this.editDraft = this.formField.getValue();
     this.disposeFormField();
@@ -4115,7 +4396,7 @@ export class SidebarController {
       // never revive a receipt that was written before the transition. Retire the
       // drawn New-form receipt synchronously, so a queued or held write can never
       // be submitted again on this side.
-      this.invalidateCreateFormPresentation();
+      this.invalidateFormPanePresentations();
       const pending = this.pendingCreate;
       if (pending !== undefined && pending.peer !== undefined) {
         // Dispatch may already have happened, so only uncertainty is claimed. This
@@ -4389,8 +4670,11 @@ export class SidebarController {
         displayedFormHost,
       ),
       remoteClose: this.remoteCloseRowFrom(displayedRoster),
+      remoteEdit: this.remoteEditRowFrom(displayedRoster),
       activateRosterAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateRosterAtFrom(displayedRoster, column, row, cols, rows, false),
+      scrollRosterAt: (column: number, row: number, cols: number, rows: number, direction: SidebarScrollDirection): boolean =>
+        this.scrollRosterViewFrom(displayedRoster, column, row, cols, rows, direction),
       activateSavedAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows),
       activatePeerAt: (column: number, row: number, cols: number, rows: number): boolean =>
@@ -4937,6 +5221,24 @@ export class SidebarController {
   }
 
   /**
+   * The selected entry's exact index in the projection the RETAINED render drew
+   * (its own render receipt), or `undefined` when that render highlighted a
+   * different entry. A partial window cannot identify which full permutation
+   * produced it — after a previewed `B,A,C,D,…` a window starting at `C` matches
+   * both the committed and the previewed order — so the index is recorded at
+   * render time instead of guessed from the drawn regions. This is how a step of
+   * an in-progress move is recognized even when a wheel scroll had already moved
+   * the window past the card being moved, while a further wheel notch (same
+   * projected index) is never mistaken for one.
+   */
+  private drawnIndexOfKey(
+    shown: DisplayedRoster,
+    key: string | undefined,
+  ): number | undefined {
+    return key !== undefined && shown.selectedKey === key ? shown.selectedIndex : undefined;
+  }
+
+  /**
    * One entry of edge scrolling for a session drag, so a position that is
    * currently offscreen becomes reachable. Only a map that still describes the
    * window the controller draws may move it, so a held, refused, or superseded
@@ -4980,6 +5282,69 @@ export class SidebarController {
   /** Drops an unfinished pointer preview only; the interaction itself is untouched. */
   private clearPointerPreview(): void {
     if (this.sessionMove?.via === "pointer") this.sessionMove = undefined;
+  }
+
+  /**
+   * One wheel notch over the roster pane a written frame actually drew (#439).
+   * The current implementation steps the viewport by one entry index; that unit
+   * is internal, not a documented rows-per-notch value.
+   * The same drawn-pane fence as roster activation decides the target: the
+   * roster must still be visible, still carry the current projection, and
+   * still be the pane drawn at exactly this geometry, so a hidden, replaced,
+   * too-small, or since-changed roster is refused rather than scrolled blind.
+   * `listTop` remains the only viewport position (an entry index), and the
+   * clamp mirrors what the render's own tail rule lands on, so a wheel at the
+   * first/last page or over a list that fits one page changes nothing at all.
+   * A destination whose first entry cannot fit the available list rows is
+   * refused too: the renderer draws only whole entries, so committing it would
+   * leave a usable window blank and (with no drawn region) disable every later
+   * wheel report until some other change rescued the pane.
+   * The highlighted entry, focus, visibility, and every activation target stay
+   * exactly as they were.
+   */
+  private scrollRosterViewFrom(
+    shown: DisplayedRoster | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+    direction: SidebarScrollDirection,
+  ): boolean {
+    if (direction !== -1 && direction !== 1) return false;
+    if (!this._visible || !validHitGeometry(column, row, cols, rows)) return false;
+    if (shown === undefined || shown.signature !== this.rosterSignature()) return false;
+    if (shown.cols !== cols || shown.rows !== rows) return false;
+    // The too-small fallback drew no entry, and a list whose every entry
+    // already fits the available rows has nothing off-screen to reveal.
+    if (shown.regions.size === 0) return false;
+    // The notch clamps against the SAME projection this render draws: the
+    // committed order, or the committed order with at most one unfinished move
+    // applied (#477). A move preview is a permutation of the same cards, so a
+    // clamp taken from the committed order alone could aim the window at a card
+    // the drawn preview would not fit, and the renderer (whole cards only) would
+    // then draw an empty window and refuse every later notch.
+    const entries = this.previewRosterEntries();
+    let total = 0;
+    for (const entry of entries) total += this.entryHeight(entry);
+    if (total <= shown.listRows) return false;
+    // The largest entry index the render's own tail rule can land on: the
+    // topmost window whose complete tail still fits the available rows.
+    let lastTop = 0;
+    let tail = 0;
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const height = this.entryHeight(entries[index]);
+      if (tail + height > shown.listRows) break;
+      tail += height;
+      lastTop = index;
+    }
+    const next = Math.min(Math.max(this.listTop + direction, 0), lastTop);
+    if (next === this.listTop) return false;
+    // The renderer stops at the first entry that does not fit, so a destination
+    // entry taller than the available list rows would draw nothing at all. Stay
+    // on the current usable window instead of blanking it.
+    if (this.entryHeight(entries[next]) > shown.listRows) return false;
+    this.listTop = next;
+    return true;
   }
 
   /**
@@ -5237,7 +5602,7 @@ export class SidebarController {
     this.remoteCloseRendered = false;
     if (!this._visible) {
       // A hidden pane draws no form, so nothing of the drawn New form survives it.
-      this.invalidateCreateFormPresentation();
+      this.invalidateFormPanePresentations();
       this.invalidateSavedPickerPresentation();
       this.invalidateSavedDeleteConfirmationDisplay();
       this.invalidateRemoteCloseConfirmationDisplay();
@@ -5262,7 +5627,7 @@ export class SidebarController {
     // roster and then the form in one pass, so only a render that is NOT part of
     // a form pass may retire the drawn New form.
     if (this._focus !== "form") {
-      this.invalidateCreateFormPresentation();
+      this.invalidateFormPanePresentations();
       this.invalidateSavedPickerPresentation();
     }
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
@@ -5300,7 +5665,7 @@ export class SidebarController {
       this.invalidatePeerConsentDisplay();
       this.invalidatePeerRepairDisplay();
       // An unshowable New form is not on screen at all.
-      this.invalidateCreateFormPresentation();
+      this.invalidateFormPanePresentations();
       return this.renderTooSmall(cols, rows);
     }
     if (this.peerConsentConfirmationActive) {
@@ -5308,28 +5673,28 @@ export class SidebarController {
       // placed in the right-hand pane while confirm focus is unchanged. The
       // roster render stays independent for the left-hand notice/rows.
       // A covering dialog means the New form is not the displayed pane.
-      this.invalidateCreateFormPresentation();
+      this.invalidateFormPanePresentations();
       return this.renderPeerConsentPane(cols, rows);
     }
     if (this.peerRepairConfirmationActive) {
       // The same wide hostConfirmation slot holds the storage-repair dialog.
-      this.invalidateCreateFormPresentation();
+      this.invalidateFormPanePresentations();
       return this.renderPeerRepairPane(cols, rows);
     }
     if (this.formKind === "peer") {
-      this.invalidateCreateFormPresentation();
+      this.invalidateFormPanePresentations();
       return this.renderPeerPane(cols, rows);
     }
     if (this.formKind === "peer-field") {
-      this.invalidateCreateFormPresentation();
+      this.invalidateFormPanePresentations();
       return this.renderPeerFieldPane(cols, rows);
     }
     if (this.formKind === "saved") {
-      this.invalidateCreateFormPresentation();
+      this.invalidateFormPanePresentations();
       return this.renderSavedPane(cols, rows);
     }
     if (this.formKind === "shortcuts") {
-      this.invalidateCreateFormPresentation();
+      this.invalidateFormPanePresentations();
       return this.renderHostShortcutPane(cols, rows);
     }
     // The New/Edit pane is the only render that re-establishes (or, for an
@@ -5349,7 +5714,7 @@ export class SidebarController {
     this.peerRepairRendered = false;
     this.remoteCloseRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
-    this.invalidateCreateFormPresentation();
+    this.invalidateFormPanePresentations();
     // The confirmation covers the picker: its drawn frame is not on screen.
     this.invalidateSavedPickerPresentation();
     if (!this.savedDeleteConfirmationActive) return { lines: [] };
@@ -5371,7 +5736,7 @@ export class SidebarController {
     if (this._focus === "confirm") {
       this.forgetDisplayedRoster();
       // A confirmation replaces the content pane: the New form is not drawn.
-      this.invalidateCreateFormPresentation();
+      this.invalidateFormPanePresentations();
       this.invalidateSavedPickerPresentation();
       if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
         this.stopConfirmDisplayed = false;
@@ -5389,7 +5754,7 @@ export class SidebarController {
     this.invalidateSavedDeleteConfirmationDisplay();
     // Roster-only focus draws no content pane, so nothing of a drawn New form
     // (or Saved picker frame) can be submitted from it.
-    this.invalidateCreateFormPresentation();
+    this.invalidateFormPanePresentations();
     this.invalidateSavedPickerPresentation();
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
       return this.renderRosterTooSmall(cols, rows);
@@ -5977,6 +6342,12 @@ export class SidebarController {
 
   private editSelectedEntry(): void {
     const entry = this.currentEntry();
+    if (entry?.kind === "remote") {
+      // A remote card is never a local row: this asks about the OWNER's session
+      // through its own typed intent, and no local id is ever emitted.
+      this.requestRemoteEdit();
+      return;
+    }
     if (entry?.kind !== "item" || !entry.item) {
       this.noticeError = "Select a session row to edit its native name";
       return;
@@ -6117,6 +6488,135 @@ export class SidebarController {
       hostRunId: drawn.hostRunId,
       rowId: drawn.rowId,
     });
+  }
+
+  /**
+   * One deliberate `E` on a remote card. It emits the drawn exact owner target
+   * plus that row's OBSERVED native tuple and nothing else: no local id, no
+   * rename, no confirmation, no guess. Main independently proves the written
+   * highlight and the owner revalidates its own row and tuple.
+   */
+  private requestRemoteEdit(): void {
+    const shown = this.displayedRoster;
+    const drawn = shown !== undefined && shown.selectedKey !== undefined
+      && shown.selectedKey === this.selectedEntryKey
+      ? this.remoteEditRowFrom(shown)
+      : undefined;
+    if (drawn === undefined) {
+      const entry = this.currentEntry();
+      this.noticeError = this.remoteEditRefusalNotice(entry?.remote);
+      return;
+    }
+    this.noticeError = undefined;
+    this.emit({
+      type: "edit-remote",
+      hostId: drawn.hostId,
+      hostRunId: drawn.hostRunId,
+      rowId: drawn.rowId,
+      nativeSessionId: drawn.nativeSessionId,
+      nativeSessionEpoch: drawn.nativeSessionEpoch,
+    });
+  }
+
+  /**
+   * The remote name-edit highlight of one roster render record, or undefined
+   * when that render did not draw a complete eligible remote card as its
+   * highlight. Eligibility reads the DRAWN card plus the CURRENT snapshot's
+   * description of its owner: a stale observation, an absent or empty owner run,
+   * an unobserved native tuple, a disconnected destination, a replaced owner run,
+   * and an owner that does not report rename support each produce undefined.
+   */
+  private remoteEditRowFrom(shown: DisplayedRoster | undefined): SidebarRemoteEditRow | undefined {
+    // The DRAWN highlight decides, never the logical selection alone.
+    const key = shown?.selectedKey;
+    if (shown === undefined || key === undefined) return undefined;
+    if (shown.focus !== "sidebar" || shown.signature !== this.rosterSignature()) return undefined;
+    const region = shown.regions.get(key);
+    const entry = region?.entry;
+    if (region === undefined || entry === undefined) return undefined;
+    if (entry.kind !== "remote" || entry.remote === undefined) return undefined;
+    if (region.height !== this.entryHeight(entry)) return undefined;
+    const remote = entry.remote;
+    if (remote.rosterState !== "current") return undefined;
+    if (typeof remote.hostRunId !== "string" || remote.hostRunId.length === 0) return undefined;
+    const native = remote.row.nativeSession;
+    if (native === null || !isValidNativeSessionId(native.sessionId)
+      || !Number.isSafeInteger(native.epoch) || native.epoch < 1) return undefined;
+    if (this.remoteRenameHost(remote.hostId, remote.hostRunId) === undefined) return undefined;
+    return Object.freeze({
+      hostId: remote.hostId,
+      hostRunId: remote.hostRunId,
+      rowId: remote.row.id,
+      nativeSessionId: native.sessionId,
+      nativeSessionEpoch: native.epoch,
+      row: region.row,
+      height: region.height,
+      cols: shown.cols,
+      rows: shown.rows,
+      focus: shown.focus,
+      title: cardTitle(remote.row),
+      hostLabel: sanitizeBounded(remote.hostLabel, PEER_LABEL_MAX_CODEPOINTS),
+    });
+  }
+
+  /** The truthful bounded notice for a remote name edit this side refuses. */
+  private remoteEditRefusalNotice(remote: SidebarRemoteEntry | undefined): string {
+    if (remote === undefined) return REMOTE_EDIT_NOT_DRAWN_NOTICE;
+    if (remote.rosterState !== "current") return REMOTE_EDIT_STALE_NOTICE;
+    if (typeof remote.hostRunId !== "string" || remote.hostRunId.length === 0) {
+      return REMOTE_EDIT_NO_RUN_NOTICE;
+    }
+    if (remote.row.nativeSession === null) return REMOTE_EDIT_NO_NATIVE_NOTICE;
+    const host = (this.peerUiSnapshot?.hosts ?? []).find((candidate) => candidate.id === remote.hostId);
+    if (host === undefined || host.state !== "connected") return REMOTE_EDIT_TARGET_CHANGED_NOTICE;
+    if (host.renameSupported !== true) return REMOTE_EDIT_UNSUPPORTED_NOTICE;
+    if (host.roster.state !== "current" || host.roster.hostRunId !== remote.hostRunId) {
+      return REMOTE_EDIT_TARGET_CHANGED_NOTICE;
+    }
+    return REMOTE_EDIT_NOT_DRAWN_NOTICE;
+  }
+
+  /** The current projection of one exact owner row, when it is still listed. */
+  private findRemoteEntry(hostId: string, rowId: string): SidebarEntry | undefined {
+    const key = remoteRosterEntryKey(hostId, rowId);
+    return this.entries.find((entry) => entry.key === key);
+  }
+
+  /**
+   * The CURRENT snapshot's description of one owner host for a name edit. Only a
+   * connected destination whose current complete observation carries this exact
+   * run and reports rename support qualifies. An absent snapshot, an older DTO
+   * that carries no run or no capability, and a `renameSupported: false` owner
+   * never do: support is never inferred from a label, endpoint, or past success.
+   */
+  private remoteRenameHost(hostId: string, hostRunId: string): PeerUiHost | undefined {
+    const host = (this.peerUiSnapshot?.hosts ?? []).find((candidate) => candidate.id === hostId);
+    if (host === undefined || host.state !== "connected") return undefined;
+    if (host.renameSupported !== true) return undefined;
+    if (host.roster.state !== "current") return undefined;
+    if (host.roster.hostRunId !== hostRunId) return undefined;
+    return host;
+  }
+
+  /**
+   * Whether the CURRENT projection still names this exact row, owner run, and
+   * native conversation tuple. A removed or replaced row, a new owner run, a
+   * stale observation, and a changed native tuple all refuse; the open form is
+   * never silently retargeted to a sibling or a newer row of the same label.
+   */
+  private remoteEditRowStillProjected(
+    target: Pick<Extract<EditFormTarget, { readonly kind: "remote" }>, "hostId" | "hostRunId" | "rowId" | "nativeSession">,
+  ): boolean {
+    const host = this.remoteRenameHost(target.hostId, target.hostRunId);
+    if (host === undefined) return false;
+    const rows = host.roster.rows;
+    if (rows === null) return false;
+    const row = rows.find((candidate) => candidate.id === target.rowId);
+    if (row === undefined) return false;
+    const native = row.nativeSession;
+    return native !== null
+      && native.sessionId === target.nativeSession.sessionId
+      && native.epoch === target.nativeSession.epoch;
   }
 
   /**
@@ -6951,7 +7451,6 @@ export class SidebarController {
     } else {
       this.savedHost = { kind: "remote", hostId: option.hostId, label: option.label };
       this.remoteSaved = {
-        hostId: option.hostId,
         catalog: undefined,
         result: undefined,
         windows: [],
@@ -7087,12 +7586,12 @@ export class SidebarController {
     if (catalog === undefined) {
       this.emit({
         type: "saved-remote-list", pickerId, requestId, revision,
-        hostId: state.hostId, hostRunId, query, offset: 0, count,
+        hostId: option.hostId, hostRunId, query, offset: 0, count,
       });
     } else {
       this.emit({
         type: "saved-remote-search", pickerId, requestId, revision,
-        hostId: state.hostId, hostRunId, catalogId: catalog.catalogId, query, offset: 0, count,
+        hostId: option.hostId, hostRunId, catalogId: catalog.catalogId, query, offset: 0, count,
       });
     }
   }
@@ -7151,7 +7650,7 @@ export class SidebarController {
     while (state.windowReads.length > REMOTE_SAVED_MAX_WINDOWS) state.windowReads.shift();
     this.emit({
       type: "saved-remote-window", pickerId, requestId, revision,
-      hostId: state.hostId, hostRunId: catalog.hostRunId,
+      hostId: option.hostId, hostRunId: catalog.hostRunId,
       catalogId: catalog.catalogId, resultId: result.resultId, offset, count,
     });
   }
@@ -7239,7 +7738,7 @@ export class SidebarController {
       || presentation.viewEpoch !== this.savedViewEpoch
       || presentation.pickerId !== this.savedPickerId
       || presentation.revision !== this.savedQueryRevision
-      || presentation.hostId !== state.hostId) return false;
+      || presentation.hostId !== this.savedHost.hostId) return false;
     const option = this.currentSavedHostOption();
     if (!this.remoteSavedHostUsable(option) || option.hostRunId !== presentation.hostRunId
       || (option.deleteExposed === true) !== presentation.deleteExposed) return false;
@@ -7301,7 +7800,8 @@ export class SidebarController {
   private remoteSavedOperationOwned(operation: RemoteSavedOperation): boolean {
     const state = this.remoteSaved;
     if (operation.viewEpoch !== this.savedViewEpoch) return false;
-    if (state === undefined || this.savedHost.kind !== "remote" || state.hostId !== operation.hostId) return false;
+    if (state === undefined || this.savedHost.kind !== "remote"
+      || this.savedHost.hostId !== operation.hostId) return false;
     if (this.savedPickerId !== operation.pickerId || this.savedQueryRevision !== operation.revision) return false;
     if (state.catalog === undefined || state.result === undefined
       || state.catalog.hostRunId !== operation.hostRunId || state.catalog.catalogId !== operation.catalogId
@@ -7674,6 +8174,17 @@ export class SidebarController {
   }
 
   /**
+   * Forget both drawn New/Edit form candidates. Every internal render path that
+   * retires the drawn New form also retires the drawn REMOTE Edit form: neither
+   * is on screen there, so neither may submit from an unwritten frame. Local
+   * Edit has no candidate and is unaffected.
+   */
+  private invalidateFormPanePresentations(): void {
+    this.invalidateCreateFormPresentation();
+    this.invalidateEditFormPresentation();
+  }
+
+  /**
    * Capture one completely drawn New form. The candidate is kept across
    * identical redraws so an ordinary repaint never revokes the receipt it
    * already earned; any change of generation, host identity, owner run, drawn
@@ -7729,6 +8240,117 @@ export class SidebarController {
     if (this.workspaceDraft !== submission.workspace) return false;
     const field = this.formField;
     return field !== undefined && field.getValue() === submission.workspace;
+  }
+
+  /**
+   * The REMOTE Edit-form frame this renderer last drew completely: the exact
+   * owner target, the observed native tuple it was opened on, the replacement
+   * draft it displayed, and the pane geometry. Main captures this beside the
+   * composed frame and keeps it only while the writer reports THAT frame
+   * written, so a queued, held, clipped, too-small, covered, or since-changed
+   * frame authorizes nothing. Local Edit has no candidate and needs no receipt.
+   */
+  captureEditFormPresentation(): SidebarEditFormPresentation | undefined {
+    const candidate = this.editFormCandidate;
+    if (candidate === undefined) return undefined;
+    return Object.freeze({
+      formGeneration: candidate.formGeneration,
+      renderToken: candidate.token,
+      hostId: candidate.hostId,
+      hostRunId: candidate.hostRunId,
+      rowId: candidate.rowId,
+      nativeSessionId: candidate.nativeSessionId,
+      nativeSessionEpoch: candidate.nativeSessionEpoch,
+      name: candidate.name,
+      cols: candidate.cols,
+      rows: candidate.rows,
+    });
+  }
+
+  /** True while this token is still the renderer's current complete Edit form. */
+  isEditFormRenderCurrent(renderToken: number): boolean {
+    return this.editFormCandidate?.token === renderToken;
+  }
+
+  /** Main's actual-writer receipt for the exact REMOTE Edit candidate it read. */
+  settleEditFormRender(renderToken: number): boolean {
+    const candidate = this.editFormCandidate;
+    if (candidate === undefined || candidate.token !== renderToken) return false;
+    candidate.written = true;
+    return true;
+  }
+
+  /** Forget the drawn REMOTE Edit form (a covering pane, a resize, or a dismissal). */
+  invalidateEditFormPresentation(): void {
+    this.editFormCandidate = undefined;
+  }
+
+  /**
+   * Capture one completely drawn REMOTE Edit form. The candidate is kept across
+   * identical redraws so an ordinary repaint never revokes the receipt it already
+   * earned; any change of generation, target, owner run, native tuple, drawn
+   * reference name, drawn draft, or pane geometry mints a new token that starts
+   * unwritten.
+   */
+  private captureEditFormCandidate(name: string, cols: number, rows: number): void {
+    const target = this.editTarget;
+    if (target === undefined || target.kind !== "remote") return;
+    const previous = this.editFormCandidate;
+    if (previous !== undefined && previous.formGeneration === this.formGeneration
+      && previous.hostId === target.hostId && previous.hostRunId === target.hostRunId
+      && previous.rowId === target.rowId && previous.nativeSessionId === target.nativeSession.sessionId
+      && previous.nativeSessionEpoch === target.nativeSession.epoch && previous.name === name
+      && previous.cols === cols && previous.rows === rows) return;
+    this.editFormCandidate = {
+      token: this.editFormTokenSequence++,
+      formGeneration: this.formGeneration,
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      rowId: target.rowId,
+      nativeSessionId: target.nativeSession.sessionId,
+      nativeSessionEpoch: target.nativeSession.epoch,
+      name,
+      cols,
+      rows,
+      written: false,
+    };
+  }
+
+  /**
+   * The caller's last-instant proof for one frozen remote rename: the immutable
+   * action Main is holding still matches THIS open Edit form — same request id
+   * still owning it, same form generation, same frozen target/native tuple, same
+   * drawn name draft — and the owner is still connected, rename-supporting, and
+   * still reporting that exact run, row, and native tuple. Nothing is re-derived
+   * from a later roster index, label, or selection, and this sidebar keeps no
+   * second copy of the submitted values.
+   */
+  renameOnPeerStillCurrent(submission: {
+    readonly requestId: number;
+    readonly formGeneration: number;
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+    readonly nativeSessionId: string;
+    readonly nativeSessionEpoch: number;
+    readonly name: string;
+  }): boolean {
+    if (!this._visible || this._focus !== "form") return false;
+    if (this.formKind !== "edit") return false;
+    if (this.pendingRename?.requestId !== submission.requestId) return false;
+    if (this.formGeneration !== submission.formGeneration) return false;
+    const target = this.editTarget;
+    if (target === undefined || target.kind !== "remote") return false;
+    if (target.hostId !== submission.hostId || target.hostRunId !== submission.hostRunId) return false;
+    if (target.rowId !== submission.rowId) return false;
+    if (target.nativeSession.sessionId !== submission.nativeSessionId
+      || target.nativeSession.epoch !== submission.nativeSessionEpoch) return false;
+    if (this.editDraft !== submission.name) return false;
+    const field = this.formField;
+    if (field === undefined || field.getValue() !== submission.name) return false;
+    const selected = this.currentEntry()?.remote;
+    return selected?.hostId === target.hostId && selected.hostRunId === target.hostRunId
+      && selected.row.id === target.rowId && this.remoteEditRowStillProjected(target);
   }
 
   private openHostShortcutForm(): void {
@@ -8036,7 +8658,7 @@ export class SidebarController {
     this.formKind = undefined;
     this.formError = undefined;
     this.formHostFocused = false;
-    this.invalidateCreateFormPresentation();
+    this.invalidateFormPanePresentations();
     if (this._focus !== "form") return; // the request no longer owns the pane
     this._focus = "main";
     this.emit({
@@ -8061,6 +8683,10 @@ export class SidebarController {
       this.createFormField(name);
       return;
     }
+    if (this.editTarget.kind === "remote") {
+      this.submitRenameOnPeer(name);
+      return;
+    }
     const requestId = this.nextRequestId++;
     this.pendingRename = { requestId };
     this.editDraft = name;
@@ -8069,6 +8695,57 @@ export class SidebarController {
       type: "rename", requestId, id: this.editTarget.id,
       expectedSessionId: this.editTarget.nativeSession.sessionId,
       expectedSessionEpoch: this.editTarget.nativeSession.epoch, name,
+    });
+  }
+
+  /**
+   * One deliberate REMOTE rename of the OWNER's session name. Nothing is sent
+   * unless the live projection still names this exact row on this exact owner
+   * run with this same native tuple and a rename-supporting connected owner, and
+   * unless the form this renderer drew completely is the one the writer reported
+   * written with this same draft. A too-small, covered, queued, held, stale, or
+   * since-changed frame sends nothing, and a refusal never substitutes another
+   * row, run, destination, or a local rename.
+   */
+  private submitRenameOnPeer(name: string): void {
+    const target = this.editTarget;
+    if (target === undefined || target.kind !== "remote") return;
+    const selected = this.currentEntry()?.remote;
+    if (selected?.hostId !== target.hostId || selected.hostRunId !== target.hostRunId
+      || selected.row.id !== target.rowId || !this.remoteEditRowStillProjected(target)) {
+      this.formError = REMOTE_EDIT_CHANGED_NOTICE;
+      this.createFormField(name);
+      return;
+    }
+    const drawn = this.editFormCandidate;
+    if (drawn === undefined || !drawn.written
+      || drawn.formGeneration !== this.formGeneration
+      || drawn.hostId !== target.hostId
+      || drawn.hostRunId !== target.hostRunId
+      || drawn.rowId !== target.rowId
+      || drawn.nativeSessionId !== target.nativeSession.sessionId
+      || drawn.nativeSessionEpoch !== target.nativeSession.epoch
+      || drawn.name !== name) {
+      // The exact displayed form is the only thing that may submit.
+      this.formError = REMOTE_EDIT_UNWRITTEN_NOTICE;
+      this.createFormField(name);
+      return;
+    }
+    const requestId = this.nextRequestId++;
+    this.pendingRename = { requestId };
+    this.editDraft = name;
+    this.formError = undefined;
+    this.emit({
+      type: "rename-remote",
+      requestId,
+      formGeneration: drawn.formGeneration,
+      renderToken: drawn.token,
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      rowId: target.rowId,
+      nativeSessionId: target.nativeSession.sessionId,
+      nativeSessionEpoch: target.nativeSession.epoch,
+      name,
     });
   }
 
@@ -8105,7 +8782,7 @@ export class SidebarController {
     this.pendingShortcutSave = undefined;
     this.peerFieldTarget = undefined;
     this.formHostFocused = false;
-    this.invalidateCreateFormPresentation();
+    this.invalidateFormPanePresentations();
     this.disposeFormField();
     this.formKind = undefined;
     this.editTarget = undefined;
@@ -10096,6 +10773,25 @@ export class SidebarController {
     );
   }
 
+  /**
+   * Whether the `e edit name` hint applies to the current highlight. Local rows
+   * and every non-remote highlight keep their existing behavior; a REMOTE
+   * highlight shows the hint only when a rename could actually be requested for
+   * that drawn card (current observation, exact owner run, connected owner that
+   * reports rename support, and an observed native tuple). An ineligible card
+   * shows no affordance it cannot honor.
+   */
+  private editHintAppliesToHighlight(): boolean {
+    const entry = this.currentEntry();
+    if (entry === undefined || entry.kind !== "remote") return true;
+    const remote = entry.remote;
+    if (remote === undefined) return false;
+    if (remote.rosterState !== "current") return false;
+    if (typeof remote.hostRunId !== "string" || remote.hostRunId.length === 0) return false;
+    if (remote.row.nativeSession === null) return false;
+    return this.remoteRenameHost(remote.hostId, remote.hostRunId) !== undefined;
+  }
+
   // --- Rendering. ---
 
   private renderTooSmall(cols: number, rows: number): { lines: string[] } {
@@ -10127,7 +10823,11 @@ export class SidebarController {
     const ordinaryFooter = (withMoveKey: boolean) => [
       `${this.toggleLabel} toggle`,
       "enter open",
-      ...(this._focus === "sidebar" ? ["e edit name"] : []),
+      // The edit hint appears only for a highlight a name edit can actually act
+      // on: a local row, or a remote card whose owner is connected, currently
+      // observed on its exact run, and reports rename support with an observed
+      // native tuple. An ineligible card shows no affordance it cannot honour.
+      ...(this._focus === "sidebar" && this.editHintAppliesToHighlight() ? ["e edit name"] : []),
       ...(this._focus === "sidebar"
         ? ["d stop/remove"]
         : []),
@@ -10211,7 +10911,7 @@ export class SidebarController {
     }
     const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
     lines.push(...alertLines);
-    const top = this.scrollWindow(selectedIndex, listRows, rosterEntries);
+    const top = this.scrollWindow(selectedIndex, listRows, rosterEntries, cols, rows);
     const displayed = new Map<string, number>();
     const regions = new Map<string, DisplayedRosterRegion>();
     let y = 0;
@@ -10256,10 +10956,11 @@ export class SidebarController {
       regions,
       cols,
       rows,
+      listRows,
       focus: this._focus,
       selectedKey: this.selectedEntryKey,
+      selectedIndex,
       listStart: 1 + alertLines.length,
-      listRows,
       listTop: top,
     };
     for (const noticeLine of noticeLines) {
@@ -10285,10 +10986,12 @@ export class SidebarController {
       regions: new Map(),
       cols,
       rows,
+      // Nothing was showable, so no entry-row window exists at this geometry.
+      listRows: 0,
       focus: this._focus,
       selectedKey: undefined,
+      selectedIndex: -1,
       listStart: 0,
-      listRows: 0,
       listTop: 0,
     };
     const alert = this.renderPeerAlert(cols, rows);
@@ -10299,11 +11002,17 @@ export class SidebarController {
    * Variable-height scroll: keeps the complete highlighted entry inside the
    * list window, moves the top only when needed, and pulls the window back
    * up when the whole tail fits (e.g. after a card collapses).
+   *
+   * `listTop` is the roster's ONE viewport position (an entry index), and this
+   * method is the only place that normalizes it, so no second scroll position
+   * or mirror field exists to keep in sync.
    */
   private scrollWindow(
     selectedIndex: number,
     listRows: number,
-    entries: readonly SidebarEntry[] = this.entries,
+    entries: readonly SidebarEntry[],
+    cols: number,
+    rows: number,
   ): number {
     const heights = entries.map((entry) => this.entryHeight(entry));
     const maxTop = Math.max(0, entries.length - 1);
@@ -10316,15 +11025,76 @@ export class SidebarController {
       this.listTop = top;
       return top;
     }
-    if (selectedIndex >= 0) {
-      if (selectedIndex < top) {
-        top = selectedIndex;
+    const selectedKey = selectedIndex >= 0 ? entries[selectedIndex]?.key : undefined;
+    const shown = this.displayedRoster;
+    // A wheel notch over the drawn roster moves this viewport away from the
+    // highlighted entry on purpose (#439). The selection-following rules below
+    // therefore re-engage only when something OTHER than that deliberate
+    // scroll changed the drawn layout: a different highlighted entry (every
+    // keyboard step), a changed roster projection (a reorder can move the
+    // highlighted entry to a place the retained window would not draw), a pane
+    // size or available list height the previous roster render did not draw, or
+    // a different rendered height for the highlighted card. Nothing else may
+    // silently undo an operator's scroll.
+    // A move preview (#477) is the one projection change the committed-order
+    // signature cannot see, because it never touches the committed order. The
+    // index the retained render recorded for the highlighted entry IN ITS OWN
+    // PROJECTION does tell them apart: a keyboard step or a drag preview moves
+    // that card to a different index than that render had it at, so the window
+    // follows it and the card being moved, with its insertion marker, is never
+    // left off-screen — including after a wheel scroll had moved the window past
+    // it. A wheel notch moves only the window, never the card, so it stays
+    // untouched.
+    const drawnIndex = shown === undefined ? undefined
+      : this.drawnIndexOfKey(shown, selectedKey);
+    const previewMovedSelection = drawnIndex !== undefined
+      ? drawnIndex !== selectedIndex
+      // The retained map drew neither the committed order nor the projection
+      // this render draws, so it is behind the live preview: re-follow rather
+      // than leave an in-progress move invisible.
+      : this.sessionMove !== undefined;
+    const followsSelection = previewMovedSelection
+      || shown === undefined
+      || shown.selectedKey !== selectedKey
+      || shown.signature !== this.rosterSignature()
+      || shown.cols !== cols
+      || shown.rows !== rows
+      || shown.listRows !== listRows
+      || (selectedKey !== undefined
+        && shown.selectedKey === selectedKey
+        && shown.heights.get(selectedKey) !== undefined
+        && shown.heights.get(selectedKey) !== heights[selectedIndex]);
+    if (followsSelection && selectedIndex >= 0) {
+      // While the KEYBOARD move mode previews a move, the window keeps the card
+      // being moved AND the destination card its insertion marker sits on
+      // drawable WHEN BOTH FIT, or the operator could commit a move whose
+      // preview they never saw. The two cards are adjacent in the previewed
+      // projection, so the window budgets from the earlier to the later of them;
+      // when their combined height does not fit, the COMPLETE moving card wins
+      // instead. A pointer drag owns its own viewport anchor rather than this
+      // rule (the early return above and its anchor re-proof), so a drag is
+      // never fought here.
+      const move = this.sessionMove;
+      const targetIndex = move?.via === "keyboard" && move.targetKey !== undefined
+        ? entries.findIndex((entry) => entry.key === move.targetKey)
+        : -1;
+      let followIndex = targetIndex >= 0 ? Math.min(selectedIndex, targetIndex) : selectedIndex;
+      let followEnd = targetIndex >= 0 ? Math.max(selectedIndex, targetIndex) : selectedIndex;
+      const pairHeight = heights
+        .slice(followIndex, followEnd + 1)
+        .reduce((sum, height) => sum + height, 0);
+      if (targetIndex >= 0 && pairHeight > listRows) {
+        followIndex = selectedIndex;
+        followEnd = selectedIndex;
+      }
+      if (followIndex < top) {
+        top = followIndex;
       }
       let used = 0;
-      for (let index = top; index <= selectedIndex; index += 1) {
+      for (let index = top; index <= followEnd; index += 1) {
         used += heights[index] ?? 1;
       }
-      while (used > listRows && top < selectedIndex) {
+      while (used > listRows && top < followIndex) {
         used -= heights[top] ?? 1;
         top += 1;
       }
@@ -10509,9 +11279,19 @@ export class SidebarController {
   ): { lines: string[]; cursor?: { column: number; row: number } } {
     const editing = this.formKind === "edit";
     // Only the New form carries the single Host line; Edit keeps its exact
-    // existing layout and budget.
+    // existing layout and row budget at every geometry. A REMOTE Edit names the
+    // owner whose session it renames INSIDE that same existing header row
+    // (bounded to the pane), so no row is added anywhere and the local Edit
+    // header stays byte-identical.
     const newForm = this.formKind === "new";
-    const header = editing ? " Edit native session name " : " New session ";
+    const remoteEditTarget = editing && this.editTarget !== undefined && this.editTarget.kind === "remote"
+      ? this.editTarget
+      : undefined;
+    const header = editing
+      ? remoteEditTarget === undefined
+        ? " Edit native session name "
+        : truncateToWidth(` Edit native session name - ${remoteEditTarget.hostLabel} `, cols, "...", true)
+      : " New session ";
     const hints = editing
       ? [`${this.formHints.submit} save`, `${this.formHints.cancel} cancel`, `${this.formHints.clear} clear`, `${this.formHints.externalEditor} external editor`]
       : [`${this.formHints.submit} create`, `${this.formHints.cancel} cancel`, `${this.formHints.complete} complete`, `${this.formHints.clear} clear`, `${this.formHints.externalEditor} external editor`];
@@ -10603,6 +11383,13 @@ export class SidebarController {
       this.captureCreateFormCandidate(this.formField.getValue(), cols, rows);
     } else {
       this.createFormCandidate = undefined;
+    }
+    // The written-submit candidate exists only for a REMOTE Edit target: a local
+    // rename keeps its exact previous path and adds no writer boundary.
+    if (remoteEditTarget !== undefined) {
+      this.captureEditFormCandidate(this.formField.getValue(), cols, rows);
+    } else {
+      this.editFormCandidate = undefined;
     }
 
     const fieldCursor = {
@@ -10707,7 +11494,12 @@ export class SidebarController {
     // Only a complete remote render below may re-establish a picker frame.
     const previousCandidate = this.savedPickerCandidate;
     this.savedPickerCandidate = undefined;
-    const remote = this.savedHost.kind === "remote" ? this.remoteSaved : undefined;
+    // One Host choice for the whole frame: `renderSavedQueryLine` renders the
+    // native query field, which can reenter and change the live choice, so this
+    // frame's remote state AND its canonical host identity come from this one
+    // captured read and are never re-read from the live property afterwards.
+    const chosenHost = this.savedHost;
+    const remote = chosenHost.kind === "remote" ? this.remoteSaved : undefined;
     const remoteOption = remote === undefined ? undefined : this.currentSavedHostOption();
     // The Host line is part of this picker only when a remote choice exists;
     // otherwise every row below is exactly the existing Local layout.
@@ -10784,8 +11576,10 @@ export class SidebarController {
     }
     lines.push(queryLine.line);
     let y = 0;
-    if (remote !== undefined) {
-      y = this.renderRemoteSavedRows(remote, remoteOption, lines, listRows, cols, rows, previousCandidate);
+    if (remote !== undefined && chosenHost.kind === "remote") {
+      // `chosenHost` is the captured choice above, so `remote !== undefined`
+      // already implies the `kind` test; it only re-narrows the captured value.
+      y = this.renderRemoteSavedRows(remote, chosenHost.hostId, remoteOption, lines, listRows, cols, rows, previousCandidate);
     } else if (this.pendingSavedList !== undefined) {
       lines.push(wrapRow(" Loading saved conversations... ", cols));
       y += 1;
@@ -10854,9 +11648,12 @@ export class SidebarController {
    * when the owner's FULL total is zero. A complete remote list with a result
    * records the frame candidate (kept across identical redraws, so an ordinary
    * repaint never revokes an earned writer receipt). Returns the rows used.
+   * `hostId` is the picker's canonical Host identity captured with this frame,
+   * never a live re-read of the current choice.
    */
   private renderRemoteSavedRows(
     remote: RemoteSavedState,
+    hostId: string,
     option: SavedHostOption | undefined,
     lines: string[],
     listRows: number,
@@ -10907,7 +11704,7 @@ export class SidebarController {
           index === selected ? SGR_SELECTION_BLUE : undefined));
       } else {
         const identity: RemoteSavedRowIdentity = Object.freeze({
-          hostId: remote.hostId,
+          hostId,
           hostRunId: catalog.hostRunId,
           catalogId: catalog.catalogId,
           resultId: result.resultId,
@@ -10925,7 +11722,7 @@ export class SidebarController {
       const deleteExposed = option.deleteExposed === true;
       const selectedEntryId = this.remoteSavedRowAt(selected)?.entryId;
       const identity = JSON.stringify([
-        this.savedViewEpoch, this.savedPickerId, this.savedQueryRevision, remote.hostId, catalog.hostRunId,
+        this.savedViewEpoch, this.savedPickerId, this.savedQueryRevision, hostId, catalog.hostRunId,
         catalog.catalogId, result.resultId, result.total, selected, selectedEntryId ?? null,
         deleteExposed, cols, rows, drawn.map((row) => [row.paneRow, row.index, row.entryId]),
       ]);
@@ -10941,7 +11738,7 @@ export class SidebarController {
             viewEpoch: this.savedViewEpoch,
             pickerId: this.savedPickerId,
             revision: this.savedQueryRevision,
-            hostId: remote.hostId,
+            hostId,
             hostRunId: catalog.hostRunId,
             catalogId: catalog.catalogId,
             resultId: result.resultId,

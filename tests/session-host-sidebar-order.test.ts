@@ -836,6 +836,166 @@ test("edge dragging scrolls an overflowing list so an offscreen card becomes rea
   assert.equal(idle.presentation().tickSessionPointerEdge(), false);
 });
 
+test("a keyboard move step re-follows its source after a wheel notch moved it off-screen", () => {
+  const harness = pointerHarness({ items: ["a", "b", "c", "d", "e"].map((id) => makeItem({ id })) });
+  harness.controller.select("a");
+  const cols = 40;
+  const rows = 26;
+  let view = harness.view(cols, rows);
+  const rowA = titleRow(view, "label-a");
+  assert.ok(rowA >= 0, "the source card starts drawn");
+  // Move mode on the first card: it is marked before any destination exists.
+  harness.send(MOVE);
+  view = harness.view(cols, rows);
+  assert.ok(view.some((line) => line.startsWith(">>")), "the card being moved is marked");
+  // One wheel notch moves the single viewport past it, and the honest interim
+  // state is that the moving card is off-screen.
+  assert.equal(harness.presentation().scrollRosterAt(0, rowA + 2, cols, rows, 1), true,
+    "the notch scrolled the drawn window");
+  view = harness.view(cols, rows);
+  assert.equal(titleRow(view, "label-a"), -1, "the wheel moved the moving card off-screen");
+  assert.ok(!view.some((line) => line.startsWith(">>")), "an off-screen moving card draws no marker");
+
+  // One keyboard step re-engages the follow rule: the card being moved AND the
+  // destination its marker sits on return to the drawn window, and nothing was
+  // committed, activated, or re-selected on the way.
+  harness.send(DOWN);
+  view = harness.view(cols, rows);
+  assert.notEqual(titleRow(view, "label-a"), -1,
+    "the step brought the moving card back into the drawn window");
+  assert.ok(view.some((line) => line.startsWith(">>")), "the returned card is still marked as the one being moved");
+  assert.ok(view.some((line) => /(?:\^ |v )agent /u.test(line)),
+    "the destination card and its insertion marker came back with it");
+  assert.deepEqual(harness.focusedActions(), [], "the wheel and the step emitted no action");
+  assert.equal(harness.controller.selectedId, "a", "the wheel and the step moved no highlight");
+});
+
+test("a keyboard move down across the BOTTOM edge keeps the complete moving card and its marker drawn", () => {
+  const harness = pointerHarness({ items: ["a", "b", "c", "d", "e"].map((id) => makeItem({ id })) });
+  const cols = 40;
+  const rows = 21; // three 5-row cards fit in this window, a fourth does not
+  harness.controller.select("a");
+  harness.view(cols, rows); // pins the window at the first card
+  harness.controller.select("c");
+  let view = harness.view(cols, rows);
+  assert.notEqual(titleRow(view, "label-c"), -1, "the source card is the last card the window draws");
+  assert.equal(titleRow(view, "label-d"), -1, "its destination starts off-screen below");
+
+  harness.send(MOVE);
+  harness.send(DOWN);
+  view = harness.view(cols, rows);
+  assert.notEqual(titleRow(view, "label-c"), -1, "the step kept the moving card inside the drawn window");
+  assert.notEqual(titleRow(view, "label-d"), -1, "and drew the destination card its marker sits on");
+  const marked = view.findIndex((line) => line.trim().startsWith(">>"));
+  assert.ok(marked >= 1, "the moving card is marked");
+  assert.ok(/^ {2}background /u.test(view[marked + 1] ?? ""),
+    "the moving card stays COMPLETE rather than clipped at the window edge");
+  assert.ok(view.some((line) => /(?:\^ |v )agent /u.test(line)), "the destination shows its insertion marker");
+  assert.deepEqual(harness.focusedActions(), [], "a preview emits nothing at all");
+  assert.equal(harness.controller.selectedId, "c", "the highlight stayed on the moving card");
+});
+
+test("a window that fits only one card keeps the COMPLETE moving card when the pair cannot fit", () => {
+  const harness = pointerHarness({ items: ["a", "b", "c"].map((id) => makeItem({ id })) });
+  harness.controller.select("a");
+  const cols = 40;
+  const rows = 10; // one 5-row card fits; a source/destination pair does not
+  let view = harness.view(cols, rows);
+  assert.notEqual(titleRow(view, "label-a"), -1, "the window draws the highlighted card");
+  assert.equal(titleRow(view, "label-b"), -1, "and only that one card");
+
+  harness.send(MOVE);
+  harness.send(DOWN);
+  view = harness.view(cols, rows);
+  assert.notEqual(titleRow(view, "label-a"), -1, "the moving card stayed drawn");
+  const marked = view.findIndex((line) => line.trim().startsWith(">>"));
+  assert.ok(marked >= 1, "it is still marked as the card being moved");
+  assert.ok(/^ {2}background /u.test(view[marked + 1] ?? ""),
+    "and it is drawn COMPLETE: the window keeps the moving card, not the pair");
+  assert.equal(titleRow(view, "label-b"), -1, "the destination gives way when both cannot fit");
+  assert.deepEqual(harness.focusedActions(), [], "the preview emitted nothing");
+
+  harness.send(ENTER);
+  assert.deepEqual(harness.focusedActions(), [{
+    type: "reorder-session",
+    source: { kind: "local", id: "a" },
+    target: { kind: "local", id: "b" },
+    placement: "after",
+  }], "the preview the operator could see commits exactly once");
+});
+
+test("further wheel notches during a move preview keep scrolling; a step back re-follows the returning card", () => {
+  const harness = pointerHarness({ items: ["a", "b", "c", "d", "e"].map((id) => makeItem({ id })) });
+  const cols = 40;
+  const rows = 21;
+  harness.controller.select("a");
+  let view = harness.view(cols, rows); // pins the window at the first card
+  harness.send(MOVE);
+  harness.send(DOWN); // the preview is B,A,C,D,E: the moving card sits at projected index 1
+  view = harness.view(cols, rows);
+  assert.notEqual(titleRow(view, "label-a"), -1, "the previewed card is drawn");
+  const rowA = titleRow(view, "label-a");
+  const presentation = harness.presentation();
+
+  assert.equal(presentation.scrollRosterAt(0, rowA + 2, cols, rows, 1), true, "the first notch scrolls");
+  view = harness.view(cols, rows);
+  assert.notEqual(titleRow(view, "label-c"), -1, "the notch brought later rows into view");
+  assert.equal(presentation.scrollRosterAt(0, rowA + 2, cols, rows, 1), true, "a second notch is accepted");
+  view = harness.view(cols, rows);
+  assert.equal(titleRow(view, "label-a"), -1,
+    "the further notch kept scrolling instead of snapping the window back to a card whose projected index never changed");
+  assert.notEqual(titleRow(view, "label-e"), -1, "and the last session row is now drawn");
+
+  // One step back returns the card to the index the retained render recorded it
+  // at BEFORE the preview moved it, which is exactly what re-engages following.
+  harness.send(UP);
+  view = harness.view(cols, rows);
+  assert.notEqual(titleRow(view, "label-a"), -1,
+    "the step back re-followed the card returning to its original index");
+  const marked = view.findIndex((line) => line.trim().startsWith(">>"));
+  assert.ok(marked >= 1, "the returning card is marked as the one being moved");
+  assert.ok(view.some((line) => /(?:\^ |v )agent /u.test(line)), "with its destination marker beside it");
+  assert.deepEqual(harness.focusedActions(), [], "no notch or step emitted an action");
+  assert.equal(harness.controller.selectedId, "a", "no gesture moved the highlight");
+});
+
+test("a wheel notch over a live drag preview scrolls the window that written preview drew", () => {
+  const harness = pointerHarness({ items: ["a", "b", "c", "d"].map((id) => makeItem({ id })) });
+  harness.controller.select("a");
+  const cols = 40;
+  const rows = 21;
+  const titles = ["label-a", "label-b", "label-c", "label-d"];
+  let view = harness.view(cols, rows);
+  assert.equal(titleRow(view, "label-d"), -1, "the tail card starts offscreen");
+  const pressed = harness.presentation();
+  assert.equal(pressed.beginSessionPointerAt(0, titleRow(view, "label-a"), cols, rows), true);
+  // A live preview: this written window now draws the previewed order while the
+  // committed order stays untouched.
+  assert.equal(pressed.updateSessionPointerAt(0, titleRow(view, "label-b") + 4, cols, rows), true);
+  view = harness.view(cols, rows);
+  assert.deepEqual(visibleTitles(harness, titles, cols, rows), ["label-b", "label-a", "label-c"],
+    "the previewed order is what this written window draws");
+  const selectedBefore = harness.controller.selectedId;
+
+  // The wheel applies to THAT preview geometry: one notch reveals the preview's
+  // next entry, keeps whole cards on screen, and ends nothing.
+  const previewed = harness.presentation();
+  assert.equal(previewed.scrollRosterAt(0, titleRow(view, "label-b") + 4, cols, rows, 1), true,
+    "a notch over the drawn preview scrolls that window");
+  const after = harness.view(cols, rows);
+  const revealed = titles.filter((title) => titleRow(after, title) >= 0);
+  assert.notDeepEqual(revealed, ["label-b", "label-a", "label-c"], "the previewed window moved");
+  assert.ok(revealed.includes("label-d"), "the notch revealed the preview's offscreen tail card");
+  assert.ok(revealed.length >= 2, "the previewed window still draws whole cards, never a blank page");
+  assert.deepEqual(harness.focusedActions(), [], "the preview and the wheel emitted no action");
+  assert.equal(harness.controller.selectedId, selectedBefore, "the wheel moved no highlight");
+  assert.equal(harness.controller.sessionPointerActive, true, "the wheel did not end the held drag");
+  // The wheel stays usable: a previewed notch never left a window with no drawn
+  // entry behind, which is what would disable every later notch.
+  assert.equal(harness.presentation().scrollRosterAt(0, titleRow(after, "label-a") + 1, cols, rows, -1), true,
+    "a following notch still scrolls the same single viewport");
+});
+
 test("mixed-height overflow drops survive a preview redraw", () => {
   const harness = makeHarness({
     items: ["a", "c", "d"].map((id) => makeItem({ id })),

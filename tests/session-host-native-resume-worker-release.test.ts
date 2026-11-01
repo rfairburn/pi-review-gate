@@ -21,15 +21,30 @@
  * unreadable file into worker success; the pre-change notification-only shape is
  * exercised with the same helper, file, predicate, and deadline, so the
  * regression is demonstrated rather than assumed.
+ *
+ * The other half of the retained failure was on the publishing side: the test
+ * created the final release pathname with `flag: "wx"` and only then wrote bytes,
+ * so the worker's unchanged strict reader could parse an empty or truncated
+ * record. The publication controls below reproduce that old create-before-write
+ * gap with the actual reader, and then publish with the repository's existing
+ * durable exclusive writer (`atomicWriteExclusive`) under its real staged file,
+ * real fsync, and real atomic commit, using its own hook seam to observe the
+ * boundary deterministically instead of racing wall-clock time. The reader, its
+ * predicate, and its deadline are the same objects in both halves, which is what
+ * makes the before/after comparison meaningful.
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import test, { type TestContext } from "node:test";
 
+import { atomicWriteExclusive } from "../src/execution/durable-write";
+
 const WORKER_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-native-resume-task-worker.cjs");
 const RELEASE_NAMES = ["worker-release.json", "stopped-recoverable-release.json"] as const;
+/** The exact release record the fixture worker's strict reader accepts. */
+const RELEASE_BODY = '{"release":true}\n';
 
 type WatchListener = (event: string, filename: string | null) => void;
 type ErrorListener = (error: unknown) => void;
@@ -202,8 +217,20 @@ function enableMockTimers(t: TestContext): void {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
 }
 
-function writeRelease(path: string, contents = '{"release":true}\n'): void {
+function writeRelease(path: string, contents = RELEASE_BODY): void {
   writeFileSync(path, contents, { flag: "wx", mode: 0o600 });
+}
+
+/**
+ * What the publishing side of the fixture can observe at the atomic commit
+ * boundary, captured inside the real writer's own hook seam.
+ */
+interface PublicationBoundary {
+  finalExists: boolean;
+  readerState: Settled;
+  stagedListing: string[];
+  stagedBytes: number;
+  stagedMode: number;
 }
 
 test("the fixture worker module exports the actual release helper without running its entrypoint", () => {
@@ -414,6 +441,154 @@ test("a release read error fails closed instead of resolving or faking a missing
   assert.equal(watcher.closeCount, 1);
   assert.deepEqual([...timers.liveTimeouts], []);
   assert.deepEqual([...timers.liveIntervals], []);
+});
+
+test("the old create-before-write publication left an empty final record the actual strict reader rejects", async (t) => {
+  enableMockTimers(t);
+  const timers = auditTimers(t);
+  const directory = ownedReleaseDirectory(t);
+  const release = join(directory, "worker-release.json");
+  const watcher = controlledWatch();
+
+  const tracked = track(fixtureWorker.waitForRelease(release, { watch: watcher.watch }));
+  await flushMicrotasks();
+  assert.equal(tracked.state, SETTLED.pending, "an absent release file stays pending");
+
+  // The shape the fixture used before this fix: `flag: "wx"` makes the final
+  // pathname visible before a single byte is written. This is the retained
+  // recovery attempt's `Unexpected end of JSON input`, reproduced without a race.
+  writeFileSync(release, "", { flag: "wx", mode: 0o600 });
+  t.mock.timers.tick(fixtureWorker.RELEASE_RECHECK_INTERVAL_MS);
+  await flushMicrotasks();
+  assert.match(rejectedMessage(tracked), /Unexpected end of JSON input/u,
+    "the unchanged strict reader fails closed on the empty file the old shape exposed");
+  assert.equal(watcher.closeCount, 1);
+  assert.deepEqual([...timers.liveTimeouts], []);
+  assert.deepEqual([...timers.liveIntervals], []);
+
+  // A partially written body is a different byte count with the same fail-closed
+  // outcome, so the control is not an empty-file artifact.
+  const partialDirectory = ownedReleaseDirectory(t);
+  const partial = join(partialDirectory, "worker-release.json");
+  const partialWatcher = controlledWatch();
+  const partialTracked = track(fixtureWorker.waitForRelease(partial, { watch: partialWatcher.watch }));
+  await flushMicrotasks();
+  writeFileSync(partial, '{"release":tr', { flag: "wx", mode: 0o600 });
+  t.mock.timers.tick(fixtureWorker.RELEASE_RECHECK_INTERVAL_MS);
+  await flushMicrotasks();
+  assert.match(rejectedMessage(partialTracked), /Unexpected end of JSON input/u,
+    "an incomplete release body is rejected rather than retried into a release");
+  assert.equal(partialWatcher.closeCount, 1);
+  assert.deepEqual([...timers.liveTimeouts], []);
+  assert.deepEqual([...timers.liveIntervals], []);
+});
+
+test("the durable exclusive publisher stages the complete record before the final release name exists", async (t) => {
+  enableMockTimers(t);
+  const timers = auditTimers(t);
+  const directory = ownedReleaseDirectory(t);
+  const release = join(directory, "worker-release.json");
+  const staged = `${release}.tmp.controlled-publication`;
+  const watcher = controlledWatch();
+
+  const tracked = track(fixtureWorker.waitForRelease(release, { watch: watcher.watch }));
+  await flushMicrotasks();
+  assert.equal(tracked.state, SETTLED.pending, "an absent release file stays pending");
+
+  const boundary: PublicationBoundary = {
+    finalExists: true,
+    readerState: SETTLED.resolved,
+    stagedListing: [],
+    stagedBytes: -1,
+    stagedMode: -1,
+  };
+  const published = atomicWriteExclusive(release, RELEASE_BODY, {
+    tempSuffixForTesting: "controlled-publication",
+    hooks: {
+      beforeRename: () => {
+        // Everything a reader could see while the record is still staged.
+        boundary.finalExists = existsSync(release);
+        boundary.stagedListing = readdirSync(directory);
+        boundary.readerState = tracked.state;
+        const stagedStats = lstatSync(staged);
+        boundary.stagedBytes = stagedStats.size;
+        boundary.stagedMode = stagedStats.mode & 0o777;
+        assert.throws(() => readFileSync(release, "utf8"),
+          (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT",
+        "a strict reader during preparation still finds no final release record");
+      },
+    },
+  });
+  await published;
+
+  assert.equal(boundary.finalExists, false, "the final release name is absent while the complete body is staged");
+  assert.deepEqual(boundary.stagedListing, ["worker-release.json.tmp.controlled-publication"],
+    "preparation stages the whole record in one owned private file inside the fixture's own state directory");
+  assert.equal(boundary.readerState, SETTLED.pending,
+    "the actual strict reader had nothing to read while the record was staged");
+  assert.equal(boundary.stagedBytes, Buffer.byteLength(RELEASE_BODY),
+    "the staged record already holds every byte before the commit");
+  assert.equal(boundary.stagedMode, 0o600, "preparation keeps the owner-only staged mode");
+  assert.equal(tracked.state, SETTLED.pending, "the commit itself does not settle the wait ahead of its bounded reread");
+
+  t.mock.timers.tick(fixtureWorker.RELEASE_RECHECK_INTERVAL_MS);
+  await flushMicrotasks();
+  assert.equal(tracked.state, SETTLED.resolved,
+    "after the atomic commit the unchanged strict reader accepts the complete record");
+  assert.equal(readFileSync(release, "utf8"), RELEASE_BODY,
+    "the committed record is exactly the existing release JSON, with no partial prefix");
+  assert.deepEqual(readdirSync(directory), ["worker-release.json"],
+    "publication removes only its own staged name and leaves no partial record behind");
+  assert.equal(lstatSync(release).mode & 0o777, 0o600,
+    "the published release keeps the owner-only mode the fixture already required");
+  assert.equal(watcher.closeCount, 1);
+  assert.deepEqual([...timers.liveTimeouts], []);
+  assert.deepEqual([...timers.liveIntervals], []);
+});
+
+test("release publication stays exclusive: an existing final record is never overwritten or adopted", async (t) => {
+  enableMockTimers(t);
+  const timers = auditTimers(t);
+  const directory = ownedReleaseDirectory(t);
+  const release = join(directory, "worker-release.json");
+  writeRelease(release, '{"release":false}\n');
+  const existingMode = lstatSync(release).mode & 0o777;
+
+  await assert.rejects(
+    () => atomicWriteExclusive(release, RELEASE_BODY, { tempSuffixForTesting: "controlled-collision" }),
+    (error: unknown) => (error as NodeJS.ErrnoException).code === "EEXIST",
+    "a release pathname that already exists is somebody else's claim");
+  assert.equal(readFileSync(release, "utf8"), '{"release":false}\n', "the pre-existing record's bytes are untouched");
+  assert.equal(lstatSync(release).mode & 0o777, existingMode, "the pre-existing record's mode is untouched");
+  assert.deepEqual(readdirSync(directory), ["worker-release.json"],
+    "a refused publication unlinks only the staged file it created");
+
+  const watcher = controlledWatch();
+  const tracked = track(fixtureWorker.waitForRelease(release, { watch: watcher.watch }));
+  await flushMicrotasks();
+  assert.equal(tracked.state, SETTLED.rejected, "the retained non-release record still fails the strict reader");
+  assert.match(rejectedMessage(tracked), /release record was malformed/u,
+    "a refused publication never fabricates the release the reader is waiting for");
+  assert.equal(watcher.closeCount, 1);
+  assert.deepEqual([...timers.liveTimeouts], []);
+  assert.deepEqual([...timers.liveIntervals], []);
+});
+
+test("release publication refuses a symlinked final name instead of following or adopting it", async (t) => {
+  const directory = ownedReleaseDirectory(t);
+  const retained = join(directory, "retained-record.json");
+  writeRelease(retained, '{"release":false}\n');
+  const release = join(directory, "worker-release.json");
+  symlinkSync(basename(retained), release);
+
+  await assert.rejects(
+    () => atomicWriteExclusive(release, RELEASE_BODY, { tempSuffixForTesting: "controlled-symlink" }),
+    (error: unknown) => (error as NodeJS.ErrnoException).code === "EEXIST",
+    "a symlink at the release pathname is refused, not followed");
+  assert.equal(lstatSync(release).isSymbolicLink(), true, "the existing symlink stays exactly where it was");
+  assert.equal(readFileSync(retained, "utf8"), '{"release":false}\n', "nothing is written through the symlink");
+  assert.deepEqual(readdirSync(directory).sort(), ["retained-record.json", "worker-release.json"],
+    "the refused publication leaves no staged file behind");
 });
 
 test("watcher installation and runtime watcher errors fail closed even when a valid release exists", async (t) => {

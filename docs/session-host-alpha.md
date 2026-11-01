@@ -1443,6 +1443,17 @@ gesture (see
 confirmations, and the narrow sidebar overlay are not
 native Main click targets. Once Main already has focus, mouse input keeps its existing
 native behavior.
+A mouse wheel (or the equivalent terminal wheel report) inside the left session list
+scrolls that list's own window: later entries come into view downward and earlier
+entries upward whenever the roster is longer than the visible page. The host handles
+that gesture and never forwards it to a child, so scrolling the list never scrolls the
+hosted conversation beside it; it activates no row, leaves the highlighted entry,
+keyboard focus, sidebar visibility, and the active Main owner unchanged, and a list that
+already fits one page does not move. Arrow keys keep their existing behavior before and
+after wheeling, including moving the highlight to an entry that is off-screen and
+bringing it into view. No wheel preference, acceleration, smooth-scrolling mode, or
+rows-per-notch setting is added, and hosted-conversation and popup scrolling are
+unchanged.
 While a host UI occupies the right-hand pane beside the visible roster, the roster stays
 clickable. A single left click on a *different* left row first closes that right-hand UI
 through its own cancellation route — the same route its keyboard cancel uses, so an
@@ -1531,7 +1542,24 @@ id/epoch. A stale or unavailable tuple is rejected, and a failed rename leaves t
 session name unconfirmed. Escape in the Edit form cancels only that form in the same local
 way and returns to the visible roster; a held Escape repeat does not bubble into the
 roster hide, but a fresh roster Escape still hides. Editing never activates the
-row, routes input to it, pauses or stops its child, or changes the active input owner. Both forms show the effective native
+row, routes input to it, pauses or stops its child, or changes the active input owner.
+
+The same `e` interaction is available on an authorized remote session row when its
+owner supports remote renaming and its current native identity is observed. It shows
+the owner's current name for reference and uses the same separate **New name** field
+and submit/cancel keys. The request names that exact destination, owner run, row, and
+native session id/epoch. Only the owning host invokes and verifies its normal native
+name operation; the sidebar and other current roster observers receive the result
+through authoritative metadata, never a viewer-local alias or optimistic name update.
+Unsupported, stale, disconnected, revoked, or replaced targets cannot fall back to a
+local row. An unconfirmed result stays uncertain and is never automatically replayed;
+verify the owner's current name before deliberately trying again. Cancelling the form
+before submission changes no name. Abandoning a submitted form does not roll back owner
+work, and its late reply cannot take over another form or change selection or focus.
+Renaming does not recreate, resume, restart, or move the session or change its workspace,
+conversation identity, or active work.
+
+Both forms show the effective native
 keybindings; the external-editor action temporarily hands the real terminal to the
 shared native Pi agent directory's `settings.json` `externalEditor` command when it is a
 nonempty string, otherwise to `VISUAL`, then `EDITOR`, then Pi's native platform
@@ -1759,9 +1787,14 @@ establish that the current order will restore after a restart.
 **What stays unchanged.** Existing selection, active-owner, and expansion persistence keep
 their current rules, and there is no order-reset control, no sort, group, or pin feature,
 no way to move a session between hosts, no new session-card type, and no change to an
-owner's authority over its own roster. Conversation wheel/trackpad scrolling (#332) and
-native rename behavior remain separate work, and this is not a sidebar redesign. The
-platform and physical-input limitations above are unchanged: this interaction adds no
+owner's authority over its own roster. The left list's own mouse-wheel scrolling and
+remote session name editing keep working on a reordered list exactly as described under
+[Focus, display, and status](#focus-display-and-status): one wheel notch reveals entries
+of the order the list now draws without moving the highlight or activating a card, and a
+name edit still names the exact owner row, owner run, and native identity its editor
+opened on after that card moves. Conversation wheel/trackpad scrolling (#332) remains
+separate work, and this is not a sidebar redesign. The platform and physical-input
+limitations above are unchanged: this interaction adds no
 Windows, native-mobile, or browser input certification.
 
 ## Terminal and input limits

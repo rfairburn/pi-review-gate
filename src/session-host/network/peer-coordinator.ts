@@ -79,6 +79,13 @@
  * selects and focuses nothing. The owner's own Main provider is the only thing
  * that can start a child, and only from the owner's exact current run.
  *
+ * The one owner-rename controller (see `peer-rename.ts`) rides that same lane and
+ * names one row's EXACT observed native conversation tuple (id plus epoch) in the
+ * owner's exact current run, under the same verified pin and destination epoch. It
+ * keeps no name of its own: there is no second name store, no optimistic caption,
+ * and no alias — a confirmed rename becomes visible only through the owner's next
+ * complete authoritative roster snapshot, exactly like every other roster fact.
+ *
  * Native input and text copies for that selected stream exist only with explicit
  * `nativeIo` callbacks (the production Main supplies them by default). Without
  * them this coordinator is exactly the previous display-only one: no native
@@ -191,6 +198,15 @@ import {
 	type PeerCoordinatorWithCreate,
 } from "./peer-create";
 import {
+	isOwnerRenameTupleStillCurrent,
+	type OwnerRenameHandler,
+	type PeerCoordinatorWithRename,
+	type PeerRenameController,
+	type PeerRenameOptions,
+	type PeerRenameResult,
+	type PeerRenameTarget,
+} from "./peer-rename";
+import {
 	isOwnerSavedIdentifier,
 	isOwnerSavedQuery,
 	isOwnerSavedScalar,
@@ -242,9 +258,11 @@ import {
 	type PeerTransportBounds,
 	type PeerTransportErrorCode,
 } from "./protocol";
+import { isValidNativeSessionId, isValidRenameName } from "../protocol";
 import {
 	isRosterBridgeIdentifier,
 	ROSTER_BRIDGE_CREATE_CAPABILITY,
+	ROSTER_BRIDGE_RENAME_CAPABILITY,
 	ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
 	ROSTER_BRIDGE_SAVED_CAPABILITY,
 } from "./roster-bridge-protocol";
@@ -452,6 +470,19 @@ export interface PeerCoordinatorOptions {
 	 * today.
 	 */
 	readonly createOwnedSession?: OwnerCreateHandler;
+	/**
+	 * The host's ONE owner-side rename provider, supplied by Main, which already owns
+	 * the only manager, the only verified native-name seam, and the only roster.
+	 *
+	 * The owner bridge offers the optional rename capability only when this provider
+	 * is present AND the peer offered it, and every request is reauthorized against the
+	 * current TLS-proved peer key and current directional receiving grant before it is
+	 * reached. The coordinator never wraps it and never renames anything itself: Main's
+	 * own verified rename operation owns the write, and a host that supplies nothing
+	 * (or an old peer that never negotiated the capability) behaves exactly as it does
+	 * today. This option grants no requester anything and stores no name here.
+	 */
+	readonly renameOwnedSession?: OwnerRenameHandler;
 	/**
 	 * OWNER side: the host's real Saved catalog view factory, supplied by Main.
 	 *
@@ -771,6 +802,30 @@ function normalizeCreateTarget(value: unknown): PeerCreateTarget | null {
 	if (!isRosterBridgeIdentifier(hostRunId)) return null;
 	if (!isOwnerCreateWorkspace(workspace)) return null;
 	return Object.freeze({ hostId, hostRunId, workspace });
+}
+
+/**
+ * Validate and copy one rename request. The destination handle is a local action
+ * handle that never reaches the wire; the owner run and row must be carryable as
+ * opaque protocol identifiers; the native conversation id and epoch must satisfy
+ * the SAME canonical native rules the roster row boundary and the lane codec
+ * apply; and the name must be a canonical native rename name. Every field is read
+ * exactly once, so a getter cannot hand one value to validation and another to the
+ * transport. A request this contract cannot represent is refused rather than
+ * repaired, trimmed, normalized, or retargeted to a sibling row or a newer tuple.
+ */
+function normalizeRenameTarget(value: unknown): PeerRenameTarget | null {
+	if (!isRecord(value)) return null;
+	const { hostId, hostRunId, rowId, expectedSessionId, expectedSessionEpoch, name } = value;
+	if (typeof hostId !== "string" || hostId.length === 0) return null;
+	if (!isRosterBridgeIdentifier(hostRunId)) return null;
+	if (!isRosterBridgeIdentifier(rowId)) return null;
+	if (!isValidNativeSessionId(expectedSessionId)) return null;
+	if (typeof expectedSessionEpoch !== "number"
+		|| !Number.isSafeInteger(expectedSessionEpoch)
+		|| expectedSessionEpoch < 1) return null;
+	if (!isValidRenameName(name)) return null;
+	return Object.freeze({ hostId, hostRunId, rowId, expectedSessionId, expectedSessionEpoch, name });
 }
 
 /** The five requester Saved operations, matching the controller's methods. */
@@ -1213,6 +1268,7 @@ class OwnedPeerCoordinator implements
 	PeerCoordinatorWithContent,
 	PeerCoordinatorWithClose,
 	PeerCoordinatorWithCreate,
+	PeerCoordinatorWithRename,
 	PeerCoordinatorWithSaved,
 	PeerCoordinatorWithHistoryPolicy,
 	PeerCoordinatorWithStorageRepair {
@@ -1390,6 +1446,16 @@ class OwnedPeerCoordinator implements
 			this.#createSession(target, options),
 	};
 	/**
+	 * The ONE owner-routed rename controller: a property of this coordinator rather
+	 * than a second manager, needing no selection, open form, controller lease, or
+	 * on-demand connection. The caller's own written-editor/name proof is REQUIRED for
+	 * every request, and this coordinator holds no copy of any name.
+	 */
+	readonly #ownerRenameController: PeerRenameController = {
+		renameSession: (target: PeerRenameTarget, options: PeerRenameOptions): Promise<PeerRenameResult> =>
+			this.#renameSession(target, options),
+	};
+	/**
 	 * The ONE requester-side Saved controller: a property of this coordinator rather
 	 * than a second manager, needing no selection, row, native tuple, focus, lease,
 	 * or on-demand connection. The caller's own proof is REQUIRED for every request.
@@ -1488,6 +1554,18 @@ class OwnedPeerCoordinator implements
 	 */
 	get ownerCreate(): PeerCreateController {
 		return this.#ownerCreateController;
+	}
+
+	/**
+	 * The one owner-routed Rename controller. It exists from construction and needs
+	 * nothing selected, displayed, or open: a request addresses one already connected
+	 * destination by its own saved handle plus the exact owner run, row, and native
+	 * conversation tuple its LAST observation named, and the new name the caller's own
+	 * written editor holds. This coordinator keeps no name, no caption, and no
+	 * per-destination rename state of its own.
+	 */
+	get ownerRename(): PeerRenameController {
+		return this.#ownerRenameController;
 	}
 
 	/**
@@ -1686,6 +1764,12 @@ class OwnedPeerCoordinator implements
 				...(this.#options.createOwnedSession === undefined
 					? {}
 					: { createOwnedSession: this.#options.createOwnedSession }),
+				// The rename provider is handed over exactly like Close and Create: never
+				// wrapped, never called here, and passed only when the caller really supplied
+				// one, so an owner that holds no rename seam never acknowledges the capability.
+				...(this.#options.renameOwnedSession === undefined
+					? {}
+					: { renameOwnedSession: this.#options.renameOwnedSession }),
 				// The owner Saved pair exists only with the caller's REAL view factory:
 				// the factory itself (never wrapped or called here; the bridge creates one
 				// view per binding lazily after an authorized request) plus this
@@ -2917,8 +3001,14 @@ class OwnedPeerCoordinator implements
 				// remote row's placement across owners. It grants nothing, routes
 				// nothing, and changes no row identity; an owner that does not
 				// acknowledge the offer sends the unchanged pre-#477 rows.
+				// Rename is offered independently on this same lane because this
+				// implementation knows the exchange and holds the controller; that
+				// owner still acknowledges it only when it really holds a rename
+				// provider, so an owner without one keeps its exact previous
+				// capability set. Each optional lane is offered once.
 				capabilities: [
 					ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
+					ROSTER_BRIDGE_RENAME_CAPABILITY,
 					...(this.#savedViewer
 						? [ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]
 						: [ROSTER_BRIDGE_CREATE_CAPABILITY]),
@@ -3220,6 +3310,177 @@ class OwnedPeerCoordinator implements
 	): boolean {
 		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) return false;
 		return isOwnerCreateRunStillCurrent(runtime.roster.hostRunId, hostRunId);
+	}
+
+	// ------------------------------------------------------------ owner rename
+
+	/**
+	 * Send one owner-routed rename of ONE exact native conversation tuple through the
+	 * destination's EXISTING connected metadata viewer, and never throw.
+	 *
+	 * No selection, open form, published stream, controller lease, or on-demand
+	 * connection is involved: the request names one local saved destination, the exact
+	 * owner run and row of this side's LAST COMPLETE CURRENT roster observation, that
+	 * row's observed native conversation id and epoch, and the name the caller's own
+	 * written editor holds. A stale or `never` observation, an absent row, a row with
+	 * no native conversation, a different id, or a moved epoch is refused rather than
+	 * quietly retargeted to a newer tuple or a sibling row, and nothing is ever
+	 * renamed, replayed, cancelled, retried, or invented locally here.
+	 *
+	 * Every borrowed fact is captured BEFORE any callout and revalidated at admission,
+	 * again inside the raw viewer's ordered write boundary, and again after the
+	 * operation completes: the destination runtime, its metadata viewer and channel,
+	 * the borrowed client, the destination epoch, the remembered pin equal to the key
+	 * that channel really proved, this side's current identity equal to the key that
+	 * client proves, and the current run/row/native tuple. The caller's REQUIRED
+	 * written-editor proof is combined with those independent facts, which are then
+	 * re-proved AFTER that arbitrary callback returns, so a reentrant proof can never
+	 * authorize a rename on its own. A completed result whose fences no longer hold is
+	 * reported `unknown`, never a success and never a fresh attempt.
+	 */
+	async #renameSession(target: PeerRenameTarget, options: PeerRenameOptions): Promise<PeerRenameResult> {
+		let invoked = false;
+		try {
+			return await this.#renameSessionFenced(target, options, () => {
+				invoked = true;
+			});
+		} catch {
+			// A hostile input or an unavailable raw API never becomes a rejection, and a
+			// fault after invocation is never a false claim that nothing was submitted.
+			return invoked ? { kind: "unknown" } : { kind: "not-sent", reason: "not-ready" };
+		}
+	}
+
+	async #renameSessionFenced(
+		target: PeerRenameTarget,
+		options: PeerRenameOptions,
+		markInvoked: () => void,
+	): Promise<PeerRenameResult> {
+		if (this.#closed || this.#tearingDown) return { kind: "not-sent", reason: "not-ready" };
+		const request = normalizeRenameTarget(target);
+		if (request === null) return { kind: "not-sent", reason: "invalid-request" };
+		// The caller's last-instant proof is REQUIRED, not optional, exactly as for
+		// Create: the name comes from the caller's own written editor, and this
+		// coordinator holds no written-name authority of its own to substitute for it.
+		let proofValue: unknown;
+		try {
+			proofValue = isRecord(options) ? options.stillCurrent : undefined;
+		} catch {
+			proofValue = undefined;
+		}
+		if (typeof proofValue !== "function") return { kind: "not-sent", reason: "invalid-request" };
+		const callerProof = proofValue as () => unknown;
+		const callerHolds = (): boolean => {
+			try {
+				return callerProof() === true;
+			} catch {
+				// An unavailable caller proof is no proof at all.
+				return false;
+			}
+		};
+		const runtime = this.#runtime.get(request.hostId);
+		if (runtime === undefined) return { kind: "not-sent", reason: "target-unavailable" };
+		const viewer = runtime.viewer;
+		const metadata = runtime.channel;
+		const client = runtime.client;
+		const destinationEpoch = runtime.epoch;
+		if (
+			runtime.state !== "connected"
+			|| viewer === null
+			|| metadata === null
+			|| client === null
+		) return { kind: "not-sent", reason: "target-unavailable" };
+		// Admission: every independent fact, then the caller's proof, then the same
+		// facts re-proved AFTER that arbitrary callback returns.
+		if (!this.#renameFenceHolds(runtime, viewer, metadata, client, destinationEpoch, request)) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		// The owner never acknowledged rename support for this channel: no frame exists
+		// to send, and no local rename is attempted in its place.
+		let supported = false;
+		try {
+			supported = viewer.supportsRename === true;
+		} catch {
+			supported = false;
+		}
+		if (!supported) return { kind: "not-sent", reason: "capability-unsupported" };
+		if (!callerHolds()) return { kind: "not-sent", reason: "target-unavailable" };
+		if (!this.#renameFenceHolds(runtime, viewer, metadata, client, destinationEpoch, request)) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		markInvoked();
+		const result = await viewer.renameSession(
+			{
+				hostRunId: request.hostRunId,
+				rowId: request.rowId,
+				expectedSessionId: request.expectedSessionId,
+				expectedSessionEpoch: request.expectedSessionEpoch,
+				name: request.name,
+			},
+			{
+				// The last-instant half of the SAME fence, evaluated synchronously by the
+				// raw viewer immediately before its queued write calls `channel.send`: the
+				// caller's proof, then this side's independent facts re-proved after it, so
+				// a request whose destination, pin, identity, run, row, or native tuple moved
+				// while it waited in the send queue is never submitted at all.
+				stillCurrent: () => {
+					if (!callerHolds()) return false;
+					return this.#renameFenceHolds(runtime, viewer, metadata, client, destinationEpoch, request);
+				},
+			},
+		);
+		// A positively-not-sent answer stays true regardless of any later change.
+		if (result.kind === "not-sent") return result;
+		if (!this.#renameFenceHolds(runtime, viewer, metadata, client, destinationEpoch, request)) {
+			// The request may already have been submitted, so nothing here can claim it
+			// never happened; an answer from a replaced destination, run, row, or native
+			// tuple is not this request's and is never reported as this rename's success.
+			return { kind: "unknown" };
+		}
+		return result;
+	}
+
+	/**
+	 * True only while THIS side's current observation of one destination still names
+	 * the exact owner run, row, and native conversation tuple one rename was built
+	 * for. A `never` or stale observation, an absent row, no native conversation, a
+	 * different id, or a moved epoch is never a match. This is a pure read, so it can
+	 * be repeated at admission, inside the raw write boundary, and after completion.
+	 */
+	#renameRosterCurrent(
+		runtime: DestinationRuntime,
+		request: Pick<
+			PeerRenameTarget,
+			"hostRunId" | "rowId" | "expectedSessionId" | "expectedSessionEpoch"
+		>,
+	): boolean {
+		const roster = runtime.roster;
+		if (roster.state !== "current" || roster.rows === null) return false;
+		if (roster.hostRunId !== request.hostRunId) return false;
+		const row = roster.rows.find((candidate) => candidate.id === request.rowId);
+		return isOwnerRenameTupleStillCurrent(row?.nativeSession, request);
+	}
+
+	/**
+	 * The rename fence: every fact one protected owner request borrowed (runtime
+	 * identity, viewer, metadata channel, borrowed client, destination epoch, pin,
+	 * this side's identity) AND this side still observing the exact requested run,
+	 * row, and native conversation tuple in a complete current roster observation.
+	 */
+	#renameFenceHolds(
+		runtime: DestinationRuntime,
+		viewer: RosterBridgeViewer,
+		metadata: PeerByteChannel,
+		client: PeerClient,
+		destinationEpoch: number,
+		request: Pick<
+			PeerRenameTarget,
+			"hostRunId" | "rowId" | "expectedSessionId" | "expectedSessionEpoch"
+		>,
+	): boolean {
+		if (this.#runtime.get(runtime.id) !== runtime) return false;
+		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) return false;
+		return this.#renameRosterCurrent(runtime, request);
 	}
 
 	// ------------------------------------------------- owner Saved (requester side)
@@ -5227,7 +5488,29 @@ class OwnedPeerCoordinator implements
 			// Only with the explicit requester opt-in; otherwise the DTO is exactly the
 			// legacy one and the Saved picker never offers this destination.
 			...(this.#savedViewer ? { saved: this.#savedHostFacts(runtime, pin) } : {}),
+			// Read live from the ONE current metadata viewer: no stored mirror, cached
+			// capability list, or per-destination rename state exists here.
+			renameSupported: this.#renameHostSupport(runtime),
 		});
+	}
+
+	/**
+	 * Descriptive rename capability for one destination; never authority and never a
+	 * name. True only while this destination is connected over a live metadata viewer
+	 * whose owner acknowledged the optional rename capability, with a live channel and
+	 * borrowed client. It deliberately does NOT require a current roster row or native
+	 * tuple: capability description and per-request fencing are separate facts, and a
+	 * destination that cannot currently be renamed is still honestly described.
+	 */
+	#renameHostSupport(runtime: DestinationRuntime | undefined): boolean {
+		if (runtime === undefined || this.#closed || this.#tearingDown) return false;
+		if (runtime.state !== "connected" || runtime.viewer === null || runtime.channel === null) return false;
+		if (runtime.client === null) return false;
+		try {
+			return runtime.viewer.supportsRename === true;
+		} catch {
+			return false;
+		}
 	}
 
 	/**
@@ -5416,6 +5699,11 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
 		// cannot honour.
 		throw new TypeError("peer coordinator create provider is invalid");
 	}
+	if (options.renameOwnedSession !== undefined && typeof options.renameOwnedSession !== "function") {
+		// No implicit rename provider: a non-callable value would otherwise look like
+		// owner rename support this host cannot honour. It is never called here.
+		throw new TypeError("peer coordinator rename provider is invalid");
+	}
 	if (options.savedCatalogViewFactory !== undefined && typeof options.savedCatalogViewFactory !== "function") {
 		// No implicit Saved provider: a non-callable value would otherwise look like
 		// owner Saved support this host cannot honour. It is never called here.
@@ -5498,12 +5786,23 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
  * opt-in makes it REQUEST it through {@link PeerCoordinatorWithSaved.ownerSaved}
  * and describe it in each destination DTO. Omitting both keeps every byte and
  * behavior of the previous coordinator.
+ *
+ * An optional `renameOwnedSession` makes this host ANSWER the optional owner rename
+ * exchange on the existing metadata lane: the capability is acknowledged only for a
+ * peer that offered it AND only while this host really holds that provider, and the
+ * provider is handed to the bridge unwrapped and is never called here. The one
+ * {@link PeerCoordinatorWithRename.ownerRename} controller routes a request naming
+ * one exact observed native conversation tuple over the destination's existing
+ * connected viewer, and each destination DTO describes the live negotiated support.
+ * Omitting the option leaves owner-side rename unsupported; requester negotiation
+ * remains independent and still requires the remote owner's acknowledged support.
  */
 export function createPeerCoordinator(
 	options: PeerCoordinatorOptions,
 ): PeerCoordinatorWithContent
 	& PeerCoordinatorWithClose
 	& PeerCoordinatorWithCreate
+	& PeerCoordinatorWithRename
 	& PeerCoordinatorWithSaved
 	& PeerCoordinatorWithHistoryPolicy
 	& PeerCoordinatorWithStorageRepair {

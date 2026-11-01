@@ -16,7 +16,9 @@
  * - a negotiated transfer carries the owner's durable slot through packing,
  *   encoding, and decoding unchanged;
  * - the runtime host/run/row tuple that selection, input, and actions route by
- *   is identical either way.
+ *   is identical either way;
+ * - the slot lane coexists with the owner rename lane (#512) on ONE channel and
+ *   ONE negotiated capability set, without duplicating either contract.
  */
 
 import assert from "node:assert/strict";
@@ -29,6 +31,7 @@ import type {
   OwningHostInventoryWatch,
 } from "../src/session-host/owning-host-service";
 import type { PeerByteChannel, PeerChannelClose } from "../src/session-host/network/channel";
+import type { OwnerRenameHandler, OwnerRenameRequest } from "../src/session-host/network/peer-rename";
 import {
   attachRosterBridgeViewer,
   type RosterBridgeViewer,
@@ -42,6 +45,7 @@ import {
   DEFAULT_ROSTER_BRIDGE_BOUNDS,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
+  ROSTER_BRIDGE_RENAME_CAPABILITY,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
   ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
   ROSTER_BRIDGE_SERVICE,
@@ -214,10 +218,15 @@ interface Harness {
   stop(): Promise<void>;
 }
 
-function harness(source: RosterBridgeInventorySource, viewerCapabilities: readonly string[]): Harness {
+function harness(
+  source: RosterBridgeInventorySource,
+  viewerCapabilities: readonly string[],
+  provider: { readonly renameOwnedSession?: OwnerRenameHandler } = {},
+): Harness {
   const host = createRosterBridgeHost({
     inventory: source,
     authorizePeer: () => true,
+    ...provider,
   });
   const ownerSide = new Loopback("owner", "owner-key");
   const viewerSide = new Loopback("viewer", "viewer-key");
@@ -407,4 +416,57 @@ test("packing, encoding, and decoding preserve one durable slot", () => {
   assert.equal(pages.length, 1);
   const decoded = pages[0]?.type === "snapshot_page" ? pages[0].rows : [];
   assert.deepEqual(decoded.map((row) => [row.id, row.rosterSlotId]), [["row-1", "slot-a"], ["row-2", "slot-b"]]);
+});
+
+test("the slot lane and the owner rename lane negotiate on one channel without duplicating either", async () => {
+  const requests: OwnerRenameRequest[] = [];
+  const rows = [ownerRow("row-1", "slot-a"), ownerRow("row-2")];
+  const h = harness(
+    fixedSource(rows),
+    [ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY, ROSTER_BRIDGE_RENAME_CAPABILITY],
+    {
+      renameOwnedSession: async (request) => {
+        requests.push(request);
+        return { kind: "renamed" };
+      },
+    },
+  );
+  try {
+    await h.viewer.hello;
+    // ONE negotiated capability set on the existing lane, each optional lane
+    // named once: no second catalogue, no mirror of the rename or slot state.
+    assert.deepEqual(h.viewer.capabilities, [
+      ROSTER_BRIDGE_REQUIRED_CAPABILITY,
+      ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
+      ROSTER_BRIDGE_RENAME_CAPABILITY,
+    ]);
+    assert.equal(h.viewer.supportsRename, true, "the rename lane negotiated on the same channel");
+    const projection = await h.viewer.subscribe();
+    assert.deepEqual(slotPairs(projection.rows), ["row-1=slot-a", "row-2=<absent>"],
+      "the slot metadata rides the same snapshot the rename lane is bound to");
+    assert.deepEqual(await h.viewer.renameSession({
+      hostRunId: OWNER_RUN,
+      rowId: "row-1",
+      expectedSessionId: "conversation-row-1",
+      expectedSessionEpoch: 2,
+      name: "Renamed row one",
+    }), { kind: "owner-result", facts: { kind: "renamed" } });
+    assert.deepEqual(requests, [{
+      hostRunId: OWNER_RUN,
+      rowId: "row-1",
+      expectedSessionId: "conversation-row-1",
+      expectedSessionEpoch: 2,
+      name: "Renamed row one",
+    }], "rename still names the exact run, row, and observed native tuple");
+    // Neither lane changed the other's data: the runtime tuple and the durable
+    // slot placement the owner published are exactly what they were before the
+    // rename, and no rename reply wrote a name or a slot locally.
+    assert.deepEqual(slotPairs(h.viewer.projection.rows), ["row-1=slot-a", "row-2=<absent>"]);
+    assert.deepEqual(h.viewer.projection.rows.map((row) => row.id), ["row-1", "row-2"]);
+    const frameTypes = h.ownerSide.frames().map((frame) => frame.type);
+    assert.ok(frameTypes.includes("snapshot_begin") && frameTypes.includes("rename_result"),
+      "one channel carried the slot-bearing snapshot and the rename result");
+  } finally {
+    await h.stop();
+  }
 });

@@ -97,6 +97,7 @@ import {
   type OwnerCreateHandler,
   type OwnerCreateRequest,
 } from "./peer-create";
+import { isOwnerRenameFacts, type OwnerRenameFacts, type OwnerRenameHandler, type OwnerRenameRequest } from "./peer-rename";
 import {
   isOwnerSavedCatalogView,
   isOwnerSavedDeleteFacts,
@@ -116,6 +117,7 @@ import { isRemoteSessionMetadataError, toRemoteSessionMetadata, type RemoteSessi
 import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
+  ROSTER_BRIDGE_RENAME_CAPABILITY,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
@@ -132,6 +134,7 @@ import {
   type RosterBridgeBounds,
   type RosterBridgeCloseRequestFrame,
   type RosterBridgeCreateRequestFrame,
+  type RosterBridgeRenameRequestFrame,
   type RosterBridgeErrorCode,
   type RosterBridgeFrame,
   type RosterBridgeHelloFrame,
@@ -175,6 +178,7 @@ export type RosterBridgeOwnerDiagnosticCode =
   | "create_accepted"
   | "create_refused"
   | "create_reply_dropped"
+  | "rename_reply_dropped"
   | "saved_accepted"
   | "saved_refused"
   | "saved_reply_dropped"
@@ -214,6 +218,8 @@ export interface RosterBridgeHostOptions {
    * handed a minimal re-proof for its own last-instant check.
    */
   readonly createOwnedSession?: OwnerCreateHandler;
+  /** Optional verified native rename provider; absence never acknowledges support. */
+  readonly renameOwnedSession?: OwnerRenameHandler;
   /**
    * The owner's Saved catalog view factory, supplied by Main together with
    * {@link RosterBridgeHostOptions.remoteHistoryDeleteExposed}. Supplying exactly
@@ -355,6 +361,9 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    */
   #inflightCreate: { readonly requestId: string; readonly hostRunId: string } | null = null;
   #createSequence = 0;
+  /** One operation and one anti-replay admission high-water, never a queue. */
+  #inflightRename: { readonly requestId: string } | null = null;
+  #renameSequence = 0;
   /** The validated Saved provider pair, or null when this host has none. */
   readonly #saved: SavedProviders | null;
   /**
@@ -497,6 +506,9 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       case "create_request":
         this.#onCreateRequest(frame);
         return;
+      case "rename_request":
+        this.#onRenameRequest(frame);
+        return;
       case "saved_list_request":
       case "saved_search_request":
       case "saved_window_request":
@@ -543,6 +555,9 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       }
       if (capability === ROSTER_BRIDGE_CREATE_CAPABILITY) {
         return typeof this.#options.createOwnedSession === "function";
+      }
+      if (capability === ROSTER_BRIDGE_RENAME_CAPABILITY) {
+        return typeof this.#options.renameOwnedSession === "function";
       }
       if (capability === ROSTER_BRIDGE_SAVED_CAPABILITY) {
         // Implementation support only: a real view factory AND a live policy
@@ -948,6 +963,67 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     }
     void written.catch(() => {
       this.#diagnostic(droppedDiagnostic);
+    });
+  }
+
+  // ------------------------------------------------------------------- rename
+
+  #renameStillAuthorized(hostRunId: string): boolean {
+    const current = (): boolean => this.#state === "subscribed" && !this.#fenced
+      && this.#subscriptionRun === hostRunId;
+    if (!current() || !this.#authorized()) return false;
+    return current(); // Re-prove lifecycle/run after the authorizer callout.
+  }
+
+  #onRenameRequest(frame: RosterBridgeRenameRequestFrame): void {
+    if (this.#state === "finished") return;
+    const handler = this.#options.renameOwnedSession;
+    if (handler === undefined || !this.#capabilities.includes(ROSTER_BRIDGE_RENAME_CAPABILITY)) {
+      this.#violation();
+      return;
+    }
+    if (!this.#renameStillAuthorized(frame.hostRunId)) return;
+    const reply = (facts: OwnerRenameFacts): void => {
+      if (this.#renameStillAuthorized(frame.hostRunId)) {
+        this.#writeResult({ type: "rename_result", requestId: frame.requestId, outcome: facts }, "rename_reply_dropped");
+      } else {
+        this.#diagnostic("rename_reply_dropped");
+      }
+    };
+    // A replay of the pending correlation must not settle that accepted work
+    // with a fabricated no-op refusal. Its original result remains the answer.
+    if (this.#inflightRename?.requestId === frame.requestId) return;
+    if (frame.sequence <= this.#renameSequence) {
+      reply({ kind: "refused" });
+      return;
+    }
+    this.#renameSequence = frame.sequence;
+    if (this.#inflightRename !== null) {
+      reply({ kind: "busy" });
+      return;
+    }
+    const inflight = { requestId: frame.requestId };
+    this.#inflightRename = inflight;
+    const request: OwnerRenameRequest = Object.freeze({
+      hostRunId: frame.hostRunId, rowId: frame.rowId,
+      expectedSessionId: frame.expectedSessionId,
+      expectedSessionEpoch: frame.expectedSessionEpoch, name: frame.name,
+    });
+    const stillAuthorized = (): boolean => this.#renameStillAuthorized(frame.hostRunId);
+    // Owner work survives a lost channel. Only delivery belongs to this binding.
+    void Promise.resolve().then(async () => {
+      let facts: OwnerRenameFacts = { kind: "unknown" };
+      try {
+        if (stillAuthorized()) {
+          const result = await handler(request, stillAuthorized);
+          if (isOwnerRenameFacts(result)) facts = result;
+        }
+      } catch { /* An invoked failure cannot prove a no-op. */ }
+      if (this.#inflightRename !== inflight) return;
+      this.#inflightRename = null;
+      reply(facts);
+    }).catch(() => {
+      if (this.#inflightRename === inflight) this.#inflightRename = null;
     });
   }
 
@@ -1884,6 +1960,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       // reason: an accepted create keeps running under Main's launch lifecycle, and
       // its result is dropped rather than claimed after this binding is gone.
       this.#inflightCreate = null;
+      this.#inflightRename = null;
       // Saved bookkeeping is network-delivery bookkeeping too: a pending resume or
       // delete keeps running under the owner's lifecycle and its result is dropped.
       this.#savedOp = null;
@@ -2003,6 +2080,9 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
   if (typeof options.authorizePeer !== "function") {
     // No implicit policy: without an explicit authorizer no metadata is written.
     throw new TypeError("roster metadata host requires an explicit peer authorizer");
+  }
+  if (options.renameOwnedSession !== undefined && typeof options.renameOwnedSession !== "function") {
+    throw new TypeError("roster metadata host requires a callable rename provider");
   }
   // The Saved pair is all-or-nothing: a view without a live delete policy (or the
   // reverse) is a partial configuration and is refused rather than defaulted.

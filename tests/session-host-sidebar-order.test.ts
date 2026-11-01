@@ -1033,6 +1033,79 @@ test("mixed-height overflow drops survive a preview redraw", () => {
   }]);
 });
 
+test("an edge step never lands the one window on a card too tall to draw, in either direction", () => {
+  // The renderer draws only COMPLETE cards, so a window landed on a card taller
+  // than the list rows would draw nothing at all. The wheel refuses that
+  // destination (#439); a pointer edge step is the same mover and must refuse it
+  // in both directions instead of leaving a blank pane the drag cannot escape.
+  const harness = makeHarness({
+    items: [makeItem({ id: "a" }), makeItem({ id: "c" })],
+    hosts: [makeHost({
+      id: "host1", hostRunId: "run-1", rows: [makeRemoteRow({ id: "b" })],
+    })],
+    order: [
+      { kind: "local", id: "a" },
+      { kind: "remote", hostId: "host1", hostRunId: "run-1", rowId: "b" },
+      { kind: "local", id: "c" },
+    ],
+  });
+  harness.controller.select("a");
+  const cols = 40;
+  // A five-row list window: the selected 5-row local card fits completely, the
+  // 6-row remote card below it does not.
+  const rows = 10;
+  let view = harness.view(cols, rows);
+  const edgeRow = view.findIndex((line) => line.includes("toggle")) - 1;
+  assert.equal(edgeRow, 5, "the list window is exactly five rows");
+  const rowA = titleRow(view, "label-a");
+  assert.ok(rowA > 0, "the selected local card is drawn whole");
+  assert.equal(titleRow(view, "label-b"), -1, "the taller remote card starts off-screen");
+  assert.equal(titleRow(view, "label-c"), -1, "and so does the card after it");
+  harness.baseline = harness.actions.length;
+
+  const start = harness.presentation();
+  assert.equal(start.beginSessionPointerAt(0, rowA, cols, rows), true, "the card press is captured");
+  assert.equal(start.updateSessionPointerAt(0, edgeRow, cols, rows), true,
+    "the bottom-edge motion stays host-owned");
+  view = harness.view(cols, rows);
+  assert.notEqual(titleRow(view, "label-a"), -1,
+    "the refused step kept the usable window instead of landing on the too-tall card");
+  assert.equal(titleRow(view, "label-b"), -1,
+    "the too-tall card was never scrolled to the top of the window");
+  assert.equal(harness.controller.sessionPointerActive, true, "the drag stays alive over a refused step");
+  assert.deepEqual(harness.focusedActions(), [], "a refused step emits nothing");
+  assert.equal(harness.presentation().finishSessionPointerAt(0, edgeRow, cols, rows), false,
+    "the blank remainder under a clipped non-final card is still not an end drop");
+  assert.deepEqual(harness.focusedActions(), [], "and that release commits nothing");
+  assert.equal(harness.controller.sessionPointerActive, false, "and ends the interaction");
+
+  // Normal navigation and the one viewport are unharmed: selecting the last card
+  // moves the SAME window and draws it whole.
+  harness.controller.select("c");
+  view = harness.view(cols, rows);
+  const rowC = titleRow(view, "label-c");
+  assert.ok(rowC > 0, "selection still moves the one window to the last card");
+
+  // The reverse direction under the same constraint: the top edge cannot land
+  // the window back on the too-tall card.
+  const atTail = harness.presentation();
+  assert.equal(atTail.beginSessionPointerAt(0, rowC, cols, rows), true);
+  assert.equal(atTail.updateSessionPointerAt(0, 1, cols, rows), true, "the top-edge motion stays host-owned");
+  view = harness.view(cols, rows);
+  assert.notEqual(titleRow(view, "label-c"), -1, "the refused upward step kept the drawn card");
+  assert.equal(titleRow(view, "label-b"), -1, "and never landed the window on the too-tall card");
+
+  // The wheel is bounded by the same rule, so it refuses the same destination
+  // and leaves the usable window drawn rather than blanking the pane.
+  assert.equal(harness.presentation().scrollRosterAt(0, rowC + 1, cols, rows, -1), false,
+    "the wheel refuses the same unusable destination");
+  assert.notEqual(titleRow(harness.view(cols, rows), "label-c"), -1,
+    "and the single viewport stays usable");
+  harness.controller.cancelSessionPointer();
+  assert.equal(harness.controller.sessionPointerActive, false, "cleanup retires the interaction");
+  assert.deepEqual(harness.focusedActions(), [], "and nothing was ever emitted");
+});
+
 test("stationary edge ticks advance only from a captured written presentation", () => {
   const harness = pointerHarness({ items: ["a", "b", "c", "d"].map((id) => makeItem({ id })) });
   harness.controller.select("a");

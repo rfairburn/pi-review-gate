@@ -1197,6 +1197,107 @@ test("a roundtrip resize revokes session-pointer authority until a post-resize f
   }
 });
 
+test("a canceled capture's release is fenced exactly once and leaves no held button behind", async () => {
+  let closed = false;
+  const persisted: string[] = [];
+  const { harness, output, lastFrame } = realWriterHarness({ persisted });
+  try {
+    const manager = await startLocalRows(harness, 2, lastFrame);
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    const screen = await emittedScreen(output, harness);
+    const rowA = screenRowOf(screen, "Native native-1");
+    const rowB = screenRowOf(screen, "Native native-2");
+    assert.ok(rowA > 0 && rowB > 0, "both cards are drawn on the written screen");
+    const saved = persistedSequence(persisted.at(-1));
+    const savesBefore = persisted.length;
+    const selectionBefore = harness.sidebar?.selectedId;
+
+    press(harness, rowA);
+    assert.equal(harness.sidebar?.sessionPointerActive, true, "the card press is captured");
+    assert.deepEqual(enabledTrackingModes(harness.terminal.writes), ["1002"],
+      "the held gesture raises drag reporting");
+
+    // A reflow abandons the gesture. The pressed button stays owned ONCE, as the
+    // retired state of that one button, and the temporary reporting comes down.
+    harness.terminal.setSize(60, 30);
+    await nextTurn();
+    assert.equal(harness.sidebar?.sessionPointerActive, false, "the reflow abandons the held press");
+    assert.deepEqual(enabledTrackingModes(harness.terminal.writes), ["1000"],
+      "and the drag reporting comes back down");
+
+    // The motion and the physical release of that abandoned press are consumed:
+    // no activation, no reorder, and nothing reaches a session.
+    const writesBefore = manager.writes.length;
+    moveTo(harness, rowA + 1);
+    releaseAt(harness, rowA);
+    await nextTurn();
+    assert.equal(harness.sidebar?.selectedId, selectionBefore, "the fenced release activates nothing");
+    assert.equal(persisted.length, savesBefore, "and it commits no reorder");
+    assert.equal(manager.writes.length, writesBefore, "and no packet reached a session");
+
+    // And nothing of that press is held any more. With Main owning the native
+    // pane and the displayed owner asking for its own reporting, a SECOND release
+    // of the same button has no press behind it, so it keeps its ordinary native
+    // route: a retired fence that outlived its release would swallow it here.
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    if (harness.sidebar?.visible !== false) {
+      harness.terminal.emitInput(ALT_LEFT);
+      await nextTurn();
+    }
+    assert.equal(harness.sidebar?.visible, false, "the roster is hidden, so nothing covers the native pane");
+    const surface = manager.surface("native-2");
+    assert.ok(surface, "the displayed owner has its own observed surface");
+    surface.modes = { ...surface.modes, mouseTracking: "drag", mouseEncoding: "sgr" };
+    manager.notify("child-enables-reporting");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "main", "Main owns the native viewport");
+    assert.deepEqual(enabledTrackingModes(harness.terminal.writes), ["1002"],
+      "the child's own drag reporting is what is on now");
+
+    const nativeWritesBefore = manager.writes.length;
+    emitMouse(harness.terminal, 45, 5, 0, "m");
+    await nextTurn();
+    assert.ok(manager.writes.length > nativeWritesBefore,
+      "an extra release of the abandoned button is not swallowed by a stale fence");
+
+    // The native press/motion/release sequence reaches its owner intact.
+    const sequenceBefore = manager.writes.length;
+    emitMouse(harness.terminal, 45, 5);
+    emitMouse(harness.terminal, 45, 6, DRAG_MOTION);
+    emitMouse(harness.terminal, 45, 6, 0, "m");
+    await nextTurn();
+    assert.equal(manager.writes.length, sequenceBefore + 3,
+      "the owner's own press, motion, and release all arrive");
+
+    // A fresh host capture afterwards is a new generation, not a resumption of
+    // the abandoned one: it holds, previews, and commits exactly one reorder.
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar?.visible, true, "the roster is drawn again");
+    const again = await emittedScreen(output, harness);
+    const freshA = screenRowOf(again, "Native native-1");
+    const freshB = screenRowOf(again, "Native native-2");
+    assert.ok(freshA > 0 && freshB > 0, "both cards are drawn after the roster returns");
+    press(harness, freshA);
+    assert.equal(harness.sidebar?.sessionPointerActive, true, "the next press is captured anew");
+    moveTo(harness, freshA + 1);
+    moveTo(harness, freshB + 4);
+    await nextTurn();
+    assert.equal(harness.sidebar?.sessionMoveActive, true, "and previews its move");
+    releaseAt(harness, freshB + 4);
+    await nextTurn();
+    assert.equal(persisted.length, savesBefore + 1, "and its release commits exactly one reorder");
+    assert.deepEqual(persistedSequence(persisted.at(-1)), movedSequence(saved, saved[0]!, saved[1]!, "after"),
+      "which is the dragged card after the other");
+    closed = true;
+    assert.equal(await closeWithSignal(harness), 0);
+  } finally {
+    await ensureShutdown(harness, closed);
+  }
+});
+
 test("a release after a hide during capture never reaches a child that enabled reporting meanwhile", async () => {
   let closed = false;
   const { harness, lastFrame } = realWriterHarness();

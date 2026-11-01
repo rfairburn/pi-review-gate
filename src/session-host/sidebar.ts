@@ -5239,6 +5239,33 @@ export class SidebarController {
   }
 
   /**
+   * The whole-card window bounds this projection can be drawn inside: the total
+   * entry height, and the largest `listTop` whose COMPLETE tail still fits the
+   * available rows (the topmost window the renderer's own tail rule lands on).
+   * The wheel notch (#439) and a session-drag edge step (#477) clamp with these
+   * same values, because the renderer draws only whole entries and stops at the
+   * first one that does not fit: a window outside this bound would be drawn
+   * empty, and (with no drawn region) would disable every later mover until
+   * something else rescued the pane.
+   */
+  private rosterUsableTopBound(
+    entries: readonly SidebarEntry[],
+    listRows: number,
+  ): { totalHeight: number; lastTop: number } {
+    let totalHeight = 0;
+    for (const entry of entries) totalHeight += this.entryHeight(entry);
+    let lastTop = 0;
+    let tail = 0;
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const height = this.entryHeight(entries[index]);
+      if (tail + height > listRows) break;
+      tail += height;
+      lastTop = index;
+    }
+    return { totalHeight, lastTop };
+  }
+
+  /**
    * One entry of edge scrolling for a session drag, so a position that is
    * currently offscreen becomes reachable. Only a map that still describes the
    * window the controller draws may move it, so a held, refused, or superseded
@@ -5246,6 +5273,16 @@ export class SidebarController {
    * motion-driven; a stationary hold is Main's scheduling decision through the
    * captured presentation's `tickSessionPointerEdge`, because this module owns
    * no timer.
+   *
+   * The step moves the SAME single viewport the wheel moves and is bounded by
+   * the SAME whole-card rule (#439): it may only land on an entry index inside
+   * the usable window bound, and the entry it lands on must fit the available
+   * rows completely, in BOTH directions. Without that bound a step onto a card
+   * taller than the list window (a 6-row remote card under a 5-row window) draws
+   * no entry at all, which leaves the pane blank, strands the drag over no card
+   * and no end position, and survives the release. A refused step keeps the
+   * usable window that is actually on screen; `listTop` stays the one viewport
+   * position.
    */
   private scrollRosterForPointerEdge(shown: DisplayedRoster, row: number): boolean {
     const current = this.displayedRoster;
@@ -5259,24 +5296,30 @@ export class SidebarController {
       return false;
     }
     if (shown.listRows < 1) return false;
-    const maxTop = Math.max(0, this.previewRosterEntries().length - 1);
+    const entries = this.previewRosterEntries();
+    const bound = this.rosterUsableTopBound(entries, shown.listRows);
+    // A list whose every entry already fits the available rows has nothing
+    // off-screen to reveal, exactly as in the wheel path.
+    if (bound.totalHeight <= shown.listRows) return false;
     // The very last row of the list window (usually the blank remainder under a
     // clipped card) scrolls the window down; the very first row scrolls it up.
     // Every interior row stays a drop target, so edge scrolling cannot steal a
     // deliberate drop on a drawn card.
-    if (row >= shown.listStart + shown.listRows - 1 && shown.listTop < maxTop) {
-      this.sessionPointerScroll = true;
-      this.listTop = shown.listTop + 1;
-      this.onInvalidate?.();
-      return true;
+    const down = row >= shown.listStart + shown.listRows - 1;
+    if (!down && row > shown.listStart) return false;
+    const next = down
+      ? Math.min(shown.listTop + 1, bound.lastTop)
+      : shown.listTop - 1;
+    const nextEntry = entries[next];
+    if (next < 0 || next === shown.listTop
+      || nextEntry === undefined
+      || this.entryHeight(nextEntry) > shown.listRows) {
+      return false;
     }
-    if (row <= shown.listStart && shown.listTop > 0) {
-      this.sessionPointerScroll = true;
-      this.listTop = shown.listTop - 1;
-      this.onInvalidate?.();
-      return true;
-    }
-    return false;
+    this.sessionPointerScroll = true;
+    this.listTop = next;
+    this.onInvalidate?.();
+    return true;
   }
 
   /** Drops an unfinished pointer preview only; the interaction itself is untouched. */
@@ -5324,25 +5367,15 @@ export class SidebarController {
     // the drawn preview would not fit, and the renderer (whole cards only) would
     // then draw an empty window and refuse every later notch.
     const entries = this.previewRosterEntries();
-    let total = 0;
-    for (const entry of entries) total += this.entryHeight(entry);
-    if (total <= shown.listRows) return false;
-    // The largest entry index the render's own tail rule can land on: the
-    // topmost window whose complete tail still fits the available rows.
-    let lastTop = 0;
-    let tail = 0;
-    for (let index = entries.length - 1; index >= 0; index -= 1) {
-      const height = this.entryHeight(entries[index]);
-      if (tail + height > shown.listRows) break;
-      tail += height;
-      lastTop = index;
-    }
-    const next = Math.min(Math.max(this.listTop + direction, 0), lastTop);
+    const bound = this.rosterUsableTopBound(entries, shown.listRows);
+    if (bound.totalHeight <= shown.listRows) return false;
+    const next = Math.min(Math.max(this.listTop + direction, 0), bound.lastTop);
     if (next === this.listTop) return false;
     // The renderer stops at the first entry that does not fit, so a destination
     // entry taller than the available list rows would draw nothing at all. Stay
     // on the current usable window instead of blanking it.
-    if (this.entryHeight(entries[next]) > shown.listRows) return false;
+    const nextEntry = entries[next];
+    if (nextEntry === undefined || this.entryHeight(nextEntry) > shown.listRows) return false;
     this.listTop = next;
     return true;
   }

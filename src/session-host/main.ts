@@ -974,6 +974,13 @@ function mouseTrackingNumber(tracking: TerminalInputModes["mouseTracking"]): num
           : undefined;
 }
 
+/**
+ * The ONE terminal-ownership state Main holds for a pressed mouse button. The
+ * three states are mutually exclusive per button, which is what makes
+ * `mouseButtonOwnership` the only held-button authority (see its declaration).
+ */
+type MouseButtonOwnership = "host" | "session" | "retired-session";
+
 function mouseButtonId(mouse: ParsedMouseInput): number | undefined {
   if (mouse.wheel) return undefined;
   const id = mouse.button & 3;
@@ -1538,29 +1545,51 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let passiveInputListener: ((data: string | Buffer) => void) | undefined;
   let mouseTrackingMode: number | undefined;
   let mouseSgrEnabled = false;
-  // Buttons pressed over a host pane remain host-owned through drag/motion and
-  // release, even if the pointer crosses into Main after activation.
-  const hostMouseButtons = new Set<number>();
   /**
-   * One host-owned session-card pointer gesture (#477): a left press the Sidebar
-   * accepted against the roster the written frame actually drew. Main holds only
-   * which button the terminal must keep fencing; the pending press, the transient
-   * source/target, the preview, and the list window stay in the Sidebar, so this
-   * is never a second copy of the order.
+   * Main's ONE held-button authority: a button id in this map names a press Main
+   * owns, in exactly one state.
+   * - "host": a press over a host pane (or a host Main-pane focus click) stays
+   *   host-owned through drag/motion and release, even if the pointer crosses
+   *   into Main after activation.
+   * - "session": the one host-owned session-card pointer gesture (#477), a left
+   *   press the Sidebar accepted against the roster the written frame actually
+   *   drew. Main holds only that the terminal must keep fencing this button;
+   *   the pending press, the transient source/target, the preview, and the list
+   *   window stay in the Sidebar, so this is never a second copy of the order.
+   * - "retired-session": a captured session gesture Main abandoned (hide or
+   *   coverage, a reflow, TTY handoff, a Sidebar membership/lifecycle
+   *   retirement, or maps that stopped authorizing pointer input). The physical
+   *   release of such a press must never reach a local or remote child without
+   *   its press, so the fence outlives the gesture until that matching release,
+   *   a replacement press of that button, or terminal teardown.
+   * Because a button has exactly one state, a release consumes one entry and no
+   * consumer has to keep overlapping holders synchronized. Only the three
+   * terminal button ids can ever be present, so the derived reads below scan a
+   * bounded map rather than maintaining a second session-button mirror.
    */
-  let sessionPointerGesture: { readonly button: number } | undefined;
-  /** Main's ONE edge-hold timer for that drag; it is re-armed only by written frames. */
+  const mouseButtonOwnership = new Map<number, MouseButtonOwnership>();
+  /** Main's ONE edge-hold timer for a captured session drag; re-armed only by written frames. */
   let sessionPointerEdgeTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** The button of Main's one live session-card gesture, derived from the store. */
+  function sessionPointerHeldButton(): number | undefined {
+    for (const [button, owner] of mouseButtonOwnership) {
+      if (owner === "session") return button;
+    }
+    return undefined;
+  }
+
   /**
-   * Buttons whose captured session gesture Main abandoned (hide or coverage, a
-   * reflow, TTY handoff, a Sidebar membership/lifecycle retirement, or maps that
-   * stopped authorizing pointer input). The physical release of such a press must
-   * never reach a local or remote child without its press, so the fence outlives
-   * the gesture until its matching release, a replacement press of that button,
-   * or terminal teardown — independent of the ordinary host-pane fence set, which
-   * the mouse-mode rules may discard when no host pane is visible.
+   * Drops only ordinary host-pane press bookkeeping. A retired session fence is
+   * deliberately NOT part of it: the mouse-mode rules may discard a host-pane
+   * press they can never see the release of, while a captured session press
+   * keeps fencing its button until that release arrives.
    */
-  const retiredSessionPointerButtons = new Set<number>();
+  function clearHostButtonOwnership(): void {
+    for (const [button, owner] of [...mouseButtonOwnership]) {
+      if (owner === "host") mouseButtonOwnership.delete(button);
+    }
+  }
   /**
    * Session-pointer authority is fenced by a geometry generation, the same way
    * the remote form/input receipts are: any outer reflow — including one that
@@ -2405,7 +2434,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     } else if (desiredTracking === undefined || desiredTracking === 9) {
       // With no host pane and no release-capable native mode, a retained
       // press cannot receive its matching release; discard that stale owner.
-      hostMouseButtons.clear();
+      // A retired session fence stays: it outlives the mode rules so that
+      // release still cannot reach a child.
+      clearHostButtonOwnership();
     }
     // A remote-enabled Main displaying a selected remote owner must capture the
     // pointer for THAT owner's own retained reporting mode: a drag/any gesture,
@@ -2434,7 +2465,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // and remote native choices so a child's stronger drag/any request is never
     // downgraded. Releasing or cancelling the gesture returns to the reporting
     // these same rules ask for; nothing here changes wheel behaviour.
-    if (sessionPointerGesture !== undefined && desiredTracking !== undefined) {
+    if (desiredTracking !== undefined && sessionPointerHeldButton() !== undefined) {
       if (desiredTracking < 1002) desiredTracking = 1002;
       useSgr = true;
     }
@@ -2874,7 +2905,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             // A stationary edge hold advances only from a frame that really
             // reached the sink: this is the only re-arm after a scroll, so a
             // held, refused, or superseded candidate never moves the window.
-            if (sessionPointerGesture !== undefined) scheduleSessionPointerEdgeStep();
+            if (sessionPointerHeldButton() !== undefined) scheduleSessionPointerEdgeStep();
           }
           // The Sidebar owns the membership/run baseline that retires an
           // unfinished press or drag; Main follows it on this frame boundary to
@@ -4112,7 +4143,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // confirmation, a narrow overlay form — abandons an in-flight session
       // gesture: nothing is committed or activated, and the ordinary mouse
       // reporting returns to what the existing rules ask for.
-      if (sessionPointerGesture !== undefined && (next.sidebar === undefined || !sidebar.visible)) {
+      if (sessionPointerHeldButton() !== undefined && (next.sidebar === undefined || !sidebar.visible)) {
         cancelSessionPointerGesture();
       }
       layout = next;
@@ -4259,7 +4290,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * and a step that cannot scroll leaves no timer behind.
    */
   function scheduleSessionPointerEdgeStep(): void {
-    if (sessionPointerGesture === undefined || sessionPointerEdgeTimer !== undefined) return;
+    if (sessionPointerHeldButton() === undefined || sessionPointerEdgeTimer !== undefined) return;
     if (shutdownRequested || externalEditorActive || !terminal || !terminalStarted) return;
     const timer = setTimeout(() => {
       if (sessionPointerEdgeTimer !== timer) return;
@@ -4274,7 +4305,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   /** One edge step, taken only against the presentation the writer reported written. */
   function stepSessionPointerEdge(): void {
-    if (sessionPointerGesture === undefined || shutdownRequested || externalEditorActive) return;
+    if (sessionPointerHeldButton() === undefined || shutdownRequested || externalEditorActive) return;
     const shown = displayedMousePresentation;
     if (shown === undefined || sidebar === undefined || !sidebar.sessionPointerActive) return;
     if (!sessionPointerMapsAreCurrent(shown)) {
@@ -4298,11 +4329,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    */
   function retireSessionPointerGesture(): void {
     clearSessionPointerEdgeTimer();
-    if (sessionPointerGesture === undefined) return;
-    // The gesture is over but the press was host-owned: keep fencing its button so
-    // the physical release cannot reach a child without its press.
-    retiredSessionPointerButtons.add(sessionPointerGesture.button);
-    sessionPointerGesture = undefined;
+    const button = sessionPointerHeldButton();
+    if (button === undefined) return;
+    // The gesture is over but the press was host-owned: that button's ONE state
+    // moves from the live gesture to the retired fence, so the physical release
+    // cannot reach a child without its press.
+    mouseButtonOwnership.set(button, "retired-session");
     syncOuterMouseModes();
   }
 
@@ -4313,10 +4345,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * and the transient preview the Sidebar holds is dropped there, not here.
    */
   function cancelSessionPointerGesture(): void {
-    if (sessionPointerGesture === undefined) return;
+    const button = sessionPointerHeldButton();
+    if (button === undefined) return;
     clearSessionPointerEdgeTimer();
-    retiredSessionPointerButtons.add(sessionPointerGesture.button);
-    sessionPointerGesture = undefined;
+    mouseButtonOwnership.set(button, "retired-session");
     sidebar?.cancelSessionPointer();
     syncOuterMouseModes();
   }
@@ -4329,11 +4361,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * the roster already committed.
    */
   function reconcileSessionPointerGesture(): void {
-    if (sessionPointerGesture === undefined) return;
+    const button = sessionPointerHeldButton();
+    if (button === undefined) return;
     if (sidebar?.sessionPointerActive === true) return;
     clearSessionPointerEdgeTimer();
-    retiredSessionPointerButtons.add(sessionPointerGesture.button);
-    sessionPointerGesture = undefined;
+    mouseButtonOwnership.set(button, "retired-session");
     syncOuterMouseModes();
   }
 
@@ -4365,10 +4397,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    */
   function routeSessionPointerMotion(mouse: ParsedMouseInput): void {
     clearSessionPointerEdgeTimer();
-    const gesture = sessionPointerGesture;
     const shown = displayedMousePresentation;
     const pane = shown?.layout.sidebar;
-    if (gesture === undefined || shown === undefined || pane === undefined
+    if (sessionPointerHeldButton() === undefined || shown === undefined || pane === undefined
       || !sessionPointerMapsAreCurrent(shown)) {
       // No usable written map (a Saved listing, a reflow, or an invalidation
       // revoked it mid-drag): abandon the Sidebar interaction too, restore the
@@ -4397,9 +4428,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    */
   function routeSessionPointerRelease(mouse: ParsedMouseInput): void {
     clearSessionPointerEdgeTimer();
-    const gesture = sessionPointerGesture;
-    sessionPointerGesture = undefined;
-    if (gesture !== undefined) hostMouseButtons.delete(gesture.button);
+    const gesture = sessionPointerHeldButton();
+    // The release is the end of that button's ownership: one entry is removed,
+    // so no fence can outlive the release it was waiting for.
+    if (gesture !== undefined) mouseButtonOwnership.delete(gesture);
     const shown = displayedMousePresentation;
     const pane = shown?.layout.sidebar;
     if (gesture === undefined) return;
@@ -4434,37 +4466,37 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // A replacement press of a button whose captured gesture Main already
     // abandoned ends that stale fence; the new press belongs to whichever route
     // takes it below.
-    if (isMouseButtonPress(mouse) && buttonId !== undefined) retiredSessionPointerButtons.delete(buttonId);
+    if (isMouseButtonPress(mouse) && buttonId !== undefined
+      && mouseButtonOwnership.get(buttonId) === "retired-session") {
+      mouseButtonOwnership.delete(buttonId);
+    }
     // A session-card press Main is holding owns its button's motion and release
     // for the whole gesture, wherever the pointer travelled: no fragment of it
     // reaches a local or remote session, and no release of it re-activates a card.
-    if (sessionPointerGesture !== undefined) {
+    const heldGestureButton = sessionPointerHeldButton();
+    if (heldGestureButton !== undefined) {
       // A wheel report is never this gesture's release: wheel packets carry no
       // button id, so only a real button release (or a legacy X10 release that
       // names no button) may end the held card gesture. Wheel input keeps its
       // existing route and the left-button fence stays held.
       const ambiguousButtonRelease = buttonId === undefined && mouse.release && !mouse.wheel;
-      if (buttonId === sessionPointerGesture.button || ambiguousButtonRelease) {
+      if (buttonId === heldGestureButton || ambiguousButtonRelease) {
         if (mouse.release) routeSessionPointerRelease(mouse);
         else if (mouse.motion) routeSessionPointerMotion(mouse);
         return;
       }
     }
     if (mouse.release) {
-      if (buttonId !== undefined
-        && (hostMouseButtons.delete(buttonId) || retiredSessionPointerButtons.delete(buttonId))) return;
+      if (buttonId !== undefined && mouseButtonOwnership.delete(buttonId)) return;
       // Legacy X10 release reports button 3 without identifying which button
       // ended; the host can only own this ambiguous release if it owns a press.
       // A wheel report is not that release, so it never drops a host fence.
-      if (buttonId === undefined && !mouse.wheel
-        && (hostMouseButtons.size > 0 || retiredSessionPointerButtons.size > 0)) {
-        hostMouseButtons.clear();
-        retiredSessionPointerButtons.clear();
+      if (buttonId === undefined && !mouse.wheel && mouseButtonOwnership.size > 0) {
+        mouseButtonOwnership.clear();
         return;
       }
     }
-    if (mouse.motion && buttonId !== undefined
-      && (hostMouseButtons.has(buttonId) || retiredSessionPointerButtons.has(buttonId))) return;
+    if (mouse.motion && buttonId !== undefined && mouseButtonOwnership.has(buttonId)) return;
 
     const formPane = hitLayout.form !== undefined && containsHostPoint(hitLayout.form, mouse.x, mouse.y)
       ? hitLayout.form
@@ -4474,7 +4506,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       : undefined;
     const pane = formPane ?? sidebarPane;
     if (pane !== undefined) {
-      if (isMouseButtonPress(mouse) && buttonId !== undefined) hostMouseButtons.add(buttonId);
+      if (isMouseButtonPress(mouse) && buttonId !== undefined) mouseButtonOwnership.set(buttonId, "host");
       if (mouse.wheel) {
         // A wheel report inside a visible host pane is host-owned and never
         // reaches the child, so scrolling the sidebar can never scroll Main as
@@ -4527,7 +4559,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // unchanged press-activation path below. A session card beside an open
         // right-hand form, picker, or Network review holds the press exactly like
         // a bare roster, so that UI is still cancelled at RELEASE, never on press.
-        sessionPointerGesture = { button: buttonId };
+        // The pressed button's ONE ownership entry moves from the ordinary
+        // host-pane state to the live session gesture.
+        mouseButtonOwnership.set(buttonId, "session");
         // A deliberate pointer gesture invalidates a pending automatic activation
         // like any other human action, even when no focus or selection snapshot
         // visibly moved.
@@ -4590,7 +4624,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     if (isLeftMousePress(mouse) && buttonId !== undefined
       && canFocusMainFromNativeClick(mouse, presentation)) {
       const focused = sidebar.focusMainFromNativeClick();
-      hostMouseButtons.add(buttonId);
+      mouseButtonOwnership.set(buttonId, "host");
       if (focused) {
         deliberateActionGeneration += 1;
         reconcileLayout(false);
@@ -4696,9 +4730,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     createFormEpoch += 1;
     remoteSavedEpoch += 1;
     remoteSavedPickerFrame = undefined;
-    hostMouseButtons.clear(); // no terminal gesture ownership survives a tty handoff
-    retiredSessionPointerButtons.clear();
+    // No ordinary host-pane ownership survives a TTY handoff. The abandoned
+    // session press keeps its retired fence — its own state in the one store —
+    // so its release still cannot reach a child without its press.
     cancelSessionPointerGesture();
+    clearHostButtonOwnership();
     const controller = new AbortController();
     externalEditorAbort = controller;
     let terminalPaused = false;
@@ -7641,14 +7677,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // advance through its next native-launch checkpoint.
     shutdownPromise = Promise.resolve();
     shutdownRequested = true;
-    hostMouseButtons.clear();
-    retiredSessionPointerButtons.clear();
+    // Teardown ends every held-button state at once: no ordinary host-pane
+    // press, live session gesture, or retired session fence survives this run.
+    mouseButtonOwnership.clear();
     // An in-flight session-card gesture never survives teardown: its ONE timer is
     // cleared and no reorder, activation, or preview is committed on the way out.
     // Shutdown disables whatever tracking mode this host last owned, including a
     // drag's temporary drag-reporting upgrade.
     clearSessionPointerEdgeTimer();
-    sessionPointerGesture = undefined;
     savedCatalog = undefined;
     savedCatalogPickerId = undefined;
     savedCatalogRequestId = undefined;

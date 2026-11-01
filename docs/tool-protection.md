@@ -531,8 +531,10 @@ The package ships an inert tester for the existing policy fixtures. It builds th
 auditor prompt as the gate, asks the saved Pi auditor once per selected case and level,
 prints the raw reply, reason, and duration, and compares the parsed verdict with the fixed
 expected value. It never executes a proposal, reads a proposal target, registers a tool,
-starts an agent loop, writes a saved auditor session, or changes settings, `models.json`,
-authentication, or fixture data. A test verdict is an auditor-test result, never actual
+starts an agent loop, or changes settings, `models.json`, authentication, or fixture data.
+It honors **Save auditor sessions**: when enabled, each invoked case/level gets one fresh
+normal Pi auditor session containing the actual request, terminal reply and usage. Off
+writes nothing. A save failure is reported without changing the verdict or exit status. A test verdict is an auditor-test result, never actual
 tool admission; the live Protection level and scope do not filter the cases.
 
 ```sh

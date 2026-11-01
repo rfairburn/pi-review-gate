@@ -6,8 +6,8 @@
  * proposal per selected case/level to the saved Pi auditor through the shared
  * runner, parses the reply with the shared decision parser, and compares it with
  * fixed fixture expectations. It never executes a proposal, reads a proposal
- * target, registers a tool, starts an agent loop, writes a session, or changes the
- * saved configuration or fixture data.
+ * target, registers a tool, starts an agent loop, or changes saved configuration
+ * or fixture data. Saved auditor records honor the existing retention setting.
  *
  * The test level and scope are independent of the live gate, including when the
  * saved Protection level is Off or its scope covers a different set of tool names.
@@ -24,6 +24,7 @@ import { effectiveToolProtectionSettings } from "./config";
 import { buildProtectionContext } from "./context";
 import { parseProtectionDecision } from "./decision";
 import { TOOL_PROTECTION_POLICY_VERSION } from "./policy";
+import { writeAuditorSessionRecord, type HostAuditorSessionManagerConstructor } from "./session-record";
 import {
   protectionAuditorCacheKey,
   runProtectionAuditor,
@@ -66,8 +67,9 @@ and works while the saved level is Off. Pi-backed auditors only; an
 external auditor is refused before any program is launched.
 
 Each selected case and level runs once, sequentially. There is no retry, fallback,
-cache, replay, tool execution, proposal-target read, agent loop, or auditor-session
-retention. A setup or transport error is reported separately from a policy FAIL.
+verdict cache, replay, tool execution, proposal-target read, or agent loop.
+Save auditor sessions is honored: one fresh record per invoked case/level when enabled.
+A setup or transport error is reported separately from a policy FAIL.
 Requests may incur provider charges. Human output includes the raw reply; --json keeps
 it in each result's raw field.
 Exit: 0 all match; 1 verdict mismatch; 2 setup/transport/format error; 130 interrupted.
@@ -103,6 +105,8 @@ interface TestResultRecord {
    * reported `cacheRead: 0` is a real zero rather than an unavailable count.
    */
   usage?: Record<string, unknown>;
+  /** A recording failure never changes the test verdict or exit status. */
+  sessionWarning?: string;
 }
 
 interface TestReport {
@@ -501,9 +505,9 @@ export async function runToolProtectionTestCli(
         if (!built.ok) {
           record.error = `${built.category}: ${built.message}`;
         } else {
-          // The retention sink is read only for the terminal message's own
-          // usage counts; the tester keeps no audit record and never reads a
-          // reasoning payload or a saved session.
+          // Capture actual transport data for usage and optional write-only
+          // retention. No saved session is ever read or reused as input.
+          let observation: ProtectionAuditorObservation | undefined;
           let terminalUsage: Record<string, unknown> | undefined;
           const result = await runProtectionAuditor({
             selection,
@@ -516,7 +520,7 @@ export async function runToolProtectionTestCli(
             cacheKey: protectionAuditorCacheKey(testerCacheScope, selection.model, level),
             modelRegistry: registry,
             signal: controller.signal,
-            observe: (observation) => { terminalUsage = terminalUsageOf(observation); },
+            observe: (value) => { observation = value; terminalUsage = terminalUsageOf(value); },
           });
           if (terminalUsage !== undefined) record.usage = terminalUsage;
           record.durationMs = result.durationMs;
@@ -534,6 +538,34 @@ export async function runToolProtectionTestCli(
             } catch (error) {
               record.kind = "malformed";
               record.error = errorMessage(error);
+            }
+          }
+          if (settings.retainAuditorSessions) {
+            const saved = await writeAuditorSessionRecord({
+              identity: {
+                invocationId: testCase.proposedCall.invocationId,
+                toolName: testCase.proposedCall.toolName,
+                role: "auditor-test-only",
+                taskId: testCase.id,
+                cwd: testCase.proposedCall.cwd ?? process.cwd(),
+                level,
+                policyVersion: TOOL_PROTECTION_POLICY_VERSION,
+                auditor: { source: "pi", label: selection.model },
+                durationMs: result.durationMs,
+              },
+              prompt: built.prompt,
+              observation,
+              outcome: record.kind === "decision"
+                ? { status: "decision", decision: record.actual, ...(record.reason === undefined ? {} : { reason: record.reason }) }
+                : { status: controller.signal.aborted ? "cancelled" : result.timedOut ? "timeout" : record.kind === "malformed" ? "malformed" : "transport-error", error: record.error },
+            }, {
+              loadSessionManager: async () => typeof sdk.SessionManager === "function"
+                ? sdk.SessionManager as unknown as HostAuditorSessionManagerConstructor
+                : undefined,
+            });
+            if (saved.warning !== undefined) {
+              record.sessionWarning = saved.warning;
+              if (!options.json) write(`  ${saved.warning}`);
             }
           }
         }

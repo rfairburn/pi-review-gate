@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -772,6 +772,81 @@ test("repeat tester runs reuse one stable cache identity per profile and record 
     const human = invoke(guard, ["--case", "1", "--level", "dangerous", "--config", config, "--pi-package", sdk], env);
     assert.equal(human.status, 0, human.stderr);
     assert.doesNotMatch(human.stdout, /usage|cacheRead|cacheWrite/i, "human output gains no usage diagnostics");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tester honors saved auditor-session retention without changing verdicts or usage", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-review-tool-test-retention-"));
+  try {
+    const env = isolatedEnv(root);
+    const seen = join(root, "requests.jsonl");
+    const fixture = TOOL_PROTECTION_TEST_CASES[0]!;
+    const expected = { [fixture.id]: { [`${fixture.proposedCall.invocationId}:dangerous`]: fixture.expected.dangerous } };
+    const sdk = writeFakeSdk(root, expected, seen);
+    const entry = join(sdk, "dist", "index.js");
+    writeFileSync(entry, readFileSync(entry, "utf8") + `
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+export class SessionManager {
+  static create(cwd) {
+    if (process.env.SESSION_RECORD_FAIL === "1") throw new Error("scripted recording failure");
+    const dir = path.join(process.env.PI_CODING_AGENT_DIR, "sessions");
+    fs.mkdirSync(dir, { recursive: true });
+    const id = randomUUID();
+    const file = path.join(dir, id + ".jsonl");
+    const append = value => fs.appendFileSync(file, JSON.stringify(value) + "\\n");
+    append({ type: "session", id, cwd });
+    return {
+      appendSessionInfo: name => append({ type: "session_info", name }),
+      appendThinkingLevelChange: thinkingLevel => append({ type: "thinking_level_change", thinkingLevel }),
+      appendMessage: message => append({ type: "message", message }),
+      appendCustomMessageEntry: (customType, content, display, details) => append({ type: "custom_message", customType, content, display, details }),
+      appendCustomEntry: (customType, data) => append({ type: "custom", customType, data }),
+      getSessionFile: () => file,
+    };
+  }
+}
+`);
+    const config = join(root, "review-gate.json");
+    const settings = { level: "off", auditor: { source: "pi", model: "tester/fake", thinkingLevel: "off" }, retainAuditorSessions: true };
+    writeFileSync(config, JSON.stringify({ toolProtection: settings }));
+    const guard = writeGuard(root);
+    const args = ["--case", "1", "--level", "dangerous", "--json", "--config", config, "--pi-package", sdk];
+    const run = (extra: NodeJS.ProcessEnv = {}) => invoke(guard, args, env, { SCRIPT_CACHE_HIT: "1", ...extra });
+    for (let index = 0; index < 2; index += 1) {
+      const result = run();
+      assert.equal(result.status, 0, result.stderr);
+      const record = JSON.parse(result.stdout).results[0];
+      assert.equal(record.match, true);
+      assert.equal(record.usage.cacheRead, 512);
+      assert.equal(record.sessionWarning, undefined);
+    }
+    const sessions = join(env.PI_CODING_AGENT_DIR!, "sessions");
+    const files = readdirSync(sessions);
+    assert.equal(files.length, 2, "a repeated fixture gets a fresh session, not an appended history");
+    for (const file of files) {
+      const entries = readFileSync(join(sessions, file), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const messages = entries.filter(entry => entry.type === "message").map(entry => entry.message);
+      assert.deepEqual(messages.map(message => message.role), ["system", "user", "assistant"]);
+      assert.match(messages[0].content, /TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST/);
+      assert.match(messages[1].content, /PROPOSED TOOL CALL/);
+      assert.equal(messages[2].usage.cacheRead, 512, "session usage is available to normal usage readers");
+      assert.ok(entries.some(entry => entry.type === "custom" && entry.data?.status === "decision"));
+    }
+    const calls = readFileSync(seen, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(calls[0].sessionId, calls[1].sessionId, "fresh recording never changes cache identity");
+    const failure = run({ SESSION_RECORD_FAIL: "1" });
+    assert.equal(failure.status, 0, failure.stderr);
+    assert.equal(JSON.parse(failure.stdout).results[0].match, true);
+    assert.match(JSON.parse(failure.stdout).results[0].sessionWarning, /scripted recording failure/);
+    settings.retainAuditorSessions = false;
+    writeFileSync(config, JSON.stringify({ toolProtection: settings }));
+    const off = run();
+    assert.equal(off.status, 0, off.stderr);
+    assert.equal(JSON.parse(off.stdout).results[0].sessionWarning, undefined);
+    assert.equal(readdirSync(sessions).length, 2, "Off writes nothing");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

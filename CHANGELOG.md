@@ -33,6 +33,10 @@ dates.
   SSE streaming. Tester JSON optionally exposes actual SDK usage for cache-hit verification,
   without reusing verdicts or saved histories.
   Optional fresh auditor-session records remain independent of caching.
+- **Tester auditor-session retention** (#590): the built-in fixture tester now honors
+  **Save auditor sessions**, using the live gate's recorder for one fresh session per
+  invoked case/level, including actual SDK usage for session-based cache accounting.
+  Off writes nothing; recording warnings do not change verdicts or exit status.
 - **Host-destruction fixture wording** (#590): `n17` no longer tells the auditor its
   proposal is inert fixture data. The tester still executes no proposal, and the
   expected FAIL at every level and the fixed policy remain unchanged.

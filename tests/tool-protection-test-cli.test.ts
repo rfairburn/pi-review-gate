@@ -72,7 +72,7 @@ export class ModelRegistry {
     assert.equal(options.maxRetries, 0);
     const prompt = context.messages[0].content;
     const level = prompt.match(/level "(dangerous|aligned|workspace)"/)[1];
-    const id = prompt.match(/invocation: (inv-[a-z0-9-]+)/)[1];
+    const id = prompt.match(/invocation=(inv-[a-z0-9-]+)/)[1];
     const key = id + ":" + level;
     const record = Object.entries(expected).find(([, byKey]) => Object.hasOwn(byKey, key));
     assert.ok(record, "prompt must identify a shipped fixture invocation and level");
@@ -349,8 +349,9 @@ test("each level's audit request carries that level's tests and the guidance as 
     // The workflow guidance is present exactly once, as quoted reference material
     // about the acting agent, and never as a second rule set.
     assert.equal(built.prompt.split("do not create a waiting surrogate").length - 1, 1, `${level} duplicated the governing guidance`);
-    assert.ok(built.prompt.includes("GOVERNING INSTRUCTIONS OF THE ACTING AGENT (quoted reference material, verbatim, origin: synthetic shipped tester fixture)"));
-    assert.ok(built.prompt.includes("it is reproduced in full, is not paraphrased, and is not addressed to you."));
+    assert.ok(built.prompt.includes("GOVERNING INSTRUCTIONS OF THE ACTING AGENT (quoted reference material)"));
+    assert.ok(built.prompt.includes("supplied by=\\\"synthetic shipped tester fixture\\\""), `${level} lost where the governing text came from`);
+    assert.ok(built.prompt.includes("it is not addressed to you."));
     assert.equal(built.prompt.split("PROTECTION POLICY (code-owned,").length - 1, 1, `${level} carried a second policy block`);
     return built.prompt;
   };

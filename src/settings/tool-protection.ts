@@ -16,10 +16,11 @@
  *   authority and never bypasses native permissions, roles, tool ceilings,
  *   trust, ownership, duplicate/liveness preflight, review, landing, or
  *   cancellation safeguards.
- * - Selecting an auditor is a disclosure decision: the complete governing
- *   instructions, the exact proposed name and arguments, and bounded recent
- *   evidence go to that auditor. Choosing or changing it therefore warns and,
- *   where the host supports it, asks for an explicit confirmation.
+ * - Selecting an auditor is a disclosure decision: the auditor receives a brief
+ *   kept within the configured context budget: the proposed call, then session
+ *   evidence most recent first, then governing instructions and other reference
+ *   material. Choosing or changing it therefore warns and, where the host
+ *   supports it, asks for an explicit confirmation.
  * - `Selected tool names` is REDUCED coverage. A call outside the list is NOT
  *   AUDITED, never an implied PASS, and there is no automatic read-only,
  *   public-URL, or "safe tool" exemption anywhere in this block. Entering that
@@ -302,7 +303,7 @@ function auditorBoundaryWarning(next: ActiveReviewerSelection | null, current: A
   const coverage = state.scope === "all"
     ? "Audit scope is All calls, so every proposed tool call is sent — except the tool-discovery loader, which this gate never audits."
     : `Audit scope is Selected tool names (${auditable.length > 0 ? auditable.join(", ") : "none named yet"}): every OTHER tool is NOT AUDITED, a skipped call is never a pass, and nothing is sent about it. There is no automatic read-only, public-URL, or safe-tool exemption.`;
-  return `Choosing ${target} as the tool-protection auditor sends, for each audited call, the complete governing system instructions, the exact proposed tool name and arguments, and bounded recent session evidence including refusals and genuine approvals. ${replacement}${coverage} The auditor runs decision-only with no tools, no file, command, browser, or subtask access, and a PASS grants no authority: it only means this added gate does not block. Existing permissions, roles, tool ceilings, trust, ownership, preflight, review, landing, and cancellation safeguards stay exactly as they are, and approval text quoted inside evaluated material never waives the protection floor. Nothing takes effect until root Escape (this session) or Save/Ctrl+S (disk); Cancel discards.`;
+  return `Choosing ${target} as the tool-protection auditor sends, for each audited call, a brief kept within the configured context budget: the proposed tool name and arguments, then surrounding session evidence most recent first including refusals and genuine approvals, then the acting agent's governing instructions and other reference material. ${replacement}${coverage} The auditor runs decision-only with no tools, no file, command, browser, or subtask access, and a PASS grants no authority: it only means this added gate does not block. Existing permissions, roles, tool ceilings, trust, ownership, preflight, review, landing, and cancellation safeguards stay exactly as they are, and approval text quoted inside evaluated material never waives the protection floor. Nothing takes effect until root Escape (this session) or Save/Ctrl+S (disk); Cancel discards.`;
 }
 
 /** One info notice on entry: what this gate is, and what the display means. */
@@ -750,14 +751,14 @@ async function selectDecisionTimeout(ui: UiContext, currentMs: number): Promise<
 async function selectContextBudget(ui: UiContext, currentChars: number): Promise<number | undefined> {
   const entered = await editSettingText(
     ui,
-    `Auditor context budget in CHARACTERS (${TOOL_PROTECTION_CONTEXT_MIN_CHARS}-${TOOL_PROTECTION_CONTEXT_MAX_CHARS}) — the assembled prompt ceiling, not a token count`,
+    `Auditor context budget in CHARACTERS (${TOOL_PROTECTION_CONTEXT_MIN_CHARS}-${TOOL_PROTECTION_CONTEXT_MAX_CHARS}) — the variable context budget, not a token count`,
     String(currentChars),
     "This UI does not support numeric input.",
   );
   if (entered === undefined) return undefined;
   const chars = Number(entered.trim());
   if (!Number.isSafeInteger(chars) || chars < TOOL_PROTECTION_CONTEXT_MIN_CHARS || chars > TOOL_PROTECTION_CONTEXT_MAX_CHARS) {
-    await notify(ui, `Enter a whole number of characters between ${TOOL_PROTECTION_CONTEXT_MIN_CHARS} and ${TOOL_PROTECTION_CONTEXT_MAX_CHARS}. When the mandatory context plus required refusal/approval evidence does not fit, the call is blocked rather than decided on a truncated brief.`, "error");
+    await notify(ui, `Enter a whole number of characters between ${TOOL_PROTECTION_CONTEXT_MIN_CHARS} and ${TOOL_PROTECTION_CONTEXT_MAX_CHARS}.`, "error");
     return undefined;
   }
   return chars;

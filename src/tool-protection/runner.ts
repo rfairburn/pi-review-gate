@@ -102,7 +102,22 @@ interface ProtectionAuditorEnvelope {
   version: typeof PROTECTION_AUDITOR_PROTOCOL;
   prompt: string;
   input: unknown;
-  cwd: string;
+}
+
+/**
+ * The exact text written to the auditor's stdin. The envelope carries the
+ * generated request text and the bounded host metadata only: the working
+ * directory is set on the child process itself, and repeating it here would
+ * transmit host text that the context budget never accounted for.
+ */
+export function serializeProtectionAuditorEnvelope(prompt: string, input: unknown): string {
+  const envelope: ProtectionAuditorEnvelope = {
+    version: PROTECTION_AUDITOR_PROTOCOL,
+    prompt,
+    // JSON has no undefined value; keep the field present for a stable wire shape.
+    input: input === undefined ? null : input,
+  };
+  return JSON.stringify(envelope);
 }
 
 /** Structural subset of the installed Pi `Model`/`ModelRegistry` contract. */
@@ -641,19 +656,12 @@ async function runBinaryDecision(
   dependencies: ProtectionAuditorDependencies,
   startedAt: number,
 ): Promise<RouteOutcome> {
-  const envelope: ProtectionAuditorEnvelope = {
-    version: PROTECTION_AUDITOR_PROTOCOL,
-    prompt: request.prompt,
-    // JSON has no undefined value; keep the field present for a stable wire shape.
-    input: request.input === undefined ? null : request.input,
-    cwd: request.cwd,
-  };
   const merged = mergedRole(agent, role);
   return await runProcessDecision({
     command: agent.command ?? "",
     args: merged.args,
     cwd: request.cwd,
-    prompt: JSON.stringify(envelope),
+    prompt: serializeProtectionAuditorEnvelope(request.prompt, request.input),
     timeoutMs: request.timeoutMs,
     env: reviewerEnv({
       ...process.env,

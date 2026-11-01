@@ -389,7 +389,33 @@ test("generic-cli auditor sends the versioned request on stdin and returns raw d
   assert.equal(envelope.version, PROTECTION_AUDITOR_PROTOCOL);
   assert.equal(envelope.prompt, request().prompt);
   assert.deepEqual(envelope.input, request().input);
-  assert.equal(envelope.cwd, process.cwd());
+  assert.ok(!Object.hasOwn(envelope, "cwd"), "the envelope does not repeat the working directory as transmitted text");
+  assert.equal(launch.cwd, process.cwd(), "the auditor process still runs in the requested working directory");
+});
+
+test("a long working directory reaches the process but is never transmitted as text (#590)", async () => {
+  let launch: ProcessLaunchInput | undefined;
+  const dependencies: ProtectionAuditorDependencies = {
+    runPromptProcess: (async (input: ProcessLaunchInput) => {
+      launch = input;
+      return processResult({ stdout: '{"decision":"PASS"}' });
+    }) as unknown as typeof import("../src/adapters/process").runPromptProcess,
+  };
+  const longCwd = `/synthetic/${"d".repeat(3_000)}`;
+  const config = configWith({
+    classifier: { adapter: "generic-cli", command: "/synthetic/classifier", review: { args: [], timeoutMs: 5_000 } },
+  });
+  const result = await runProtectionAuditor(
+    request({ selection: { source: "external", id: "classifier" }, config, cwd: longCwd }),
+    dependencies,
+  );
+  assert.equal(result.error, undefined);
+  assert.ok(launch);
+  assert.equal(launch.cwd, longCwd, "the subprocess still runs in the requested working directory");
+  assert.ok(!launch.prompt.includes("d".repeat(200)), "the long working directory is not part of the transmitted request");
+  const envelope = JSON.parse(launch.prompt) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(envelope).sort(), ["input", "prompt", "version"],
+    "the envelope shape is the accounted-for version, prompt, and bounded metadata");
 });
 
 test("run-as-binary auditor with an execution role uses execution settings and inherits shared settings", async () => {
@@ -734,7 +760,6 @@ test("external-binary observation reports the real stdin, stdout and host facts 
     version: PROTECTION_AUDITOR_PROTOCOL,
     prompt: request().prompt,
     input: request().input,
-    cwd: request().cwd,
   });
   assert.equal(external.outputText, '{"decision":"FAIL","reason":"nope"}\n');
   assert.equal(external.truncated, false);

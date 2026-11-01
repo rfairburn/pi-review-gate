@@ -234,7 +234,7 @@ test("enabling a level and choosing an external auditor persists the canonical b
         // No confirm dialog on this host: the same disclosure arrives as a
         // warning instead of being skipped.
         assert.ok(notices.some((notice) => notice.type === "warning"
-          && notice.message.includes("exact proposed tool name and arguments")
+          && notice.message.includes("the proposed tool name and arguments")
           && notice.message.includes("Audit scope is All calls")), JSON.stringify(notices));
         return back(title, options);
       },
@@ -308,6 +308,8 @@ test("the shared enable/auditor disclosure keeps the take-effect rules and state
   });
   /** Wording that would state an intended or aspirational audit-completion time. */
   const goalPhrasing = /2\s*[–-]\s*3\s*second|decision goal|aspirational|benchmark|performance target/i;
+  /** Wording that would claim every original input reaches the auditor whole. */
+  const completenessClaim = /\bcomplete\b|\bin full\b|\bverbatim\b/i;
   const takeEffect = "Nothing takes effect until root Escape (this session) or Save/Ctrl+S (disk); Cancel discards.";
   try {
     // Interactive host: the level-enable dialog and the auditor-change dialog
@@ -329,6 +331,8 @@ test("the shared enable/auditor disclosure keeps the take-effect rules and state
     assert.deepEqual(dialogs.map((entry) => entry.title), ["Enable tool protection?", "Send audited tool calls to this auditor?"], JSON.stringify(withConfirm.confirmations));
     for (const dialog of dialogs) {
       assert.ok(!goalPhrasing.test(dialog.message), `${dialog.title}: ${dialog.message}`);
+      assert.ok(!completenessClaim.test(dialog.message), `${dialog.title}: ${dialog.message}`);
+      assert.match(dialog.message, /a brief kept within the configured context budget: the proposed tool name and arguments, then surrounding session evidence most recent first including refusals and genuine approvals, then the acting agent's governing instructions and other reference material\./);
       assert.ok(dialog.message.includes(takeEffect), `${dialog.title}: ${dialog.message}`);
       assert.ok(dialog.message.includes("decision-only with no tools"), `${dialog.title}: ${dialog.message}`);
     }
@@ -354,6 +358,8 @@ test("the shared enable/auditor disclosure keeps the take-effect rules and state
     assert.equal(warnings.length, 2, JSON.stringify(withoutConfirm.notices.map((notice) => notice.message)));
     for (const notice of warnings) {
       assert.ok(!goalPhrasing.test(notice.message), notice.message);
+      assert.ok(!completenessClaim.test(notice.message), notice.message);
+      assert.match(notice.message, /a brief kept within the configured context budget: the proposed tool name and arguments, then surrounding session evidence most recent first including refusals and genuine approvals, then the acting agent's governing instructions and other reference material\./);
       assert.ok(notice.message.includes(takeEffect), notice.message);
       assert.ok(notice.message.includes("decision-only with no tools"), notice.message);
     }
@@ -453,6 +459,8 @@ test("timeout and context budget validate with explicit units and persist as mil
       pick("Decision timeout"),
       pick("Context budget"),
       pick("Context budget"),
+      pick("Context budget"),
+      pick("Context budget"),
       back,
       back,
       save,
@@ -463,6 +471,8 @@ test("timeout and context budget validate with explicit units and persist as mil
         () => "2.5",
         () => "abc",
         () => "64000",
+        () => "999",
+        () => "1000",
       ],
     });
     await registered.handler("", context);
@@ -470,19 +480,35 @@ test("timeout and context budget validate with explicit units and persist as mil
       "Decision timeout in SECONDS (1-120 seconds) — stored in milliseconds",
       "Decision timeout in SECONDS (1-120 seconds) — stored in milliseconds",
       "Decision timeout in SECONDS (1-120 seconds) — stored in milliseconds",
-      "Auditor context budget in CHARACTERS (4000-2000000) — the assembled prompt ceiling, not a token count",
-      "Auditor context budget in CHARACTERS (4000-2000000) — the assembled prompt ceiling, not a token count",
+      "Auditor context budget in CHARACTERS (1000-2000000) — the variable context budget, not a token count",
+      "Auditor context budget in CHARACTERS (1000-2000000) — the variable context budget, not a token count",
+      "Auditor context budget in CHARACTERS (1000-2000000) — the variable context budget, not a token count",
+      "Auditor context budget in CHARACTERS (1000-2000000) — the variable context budget, not a token count",
     ]);
-    assert.deepEqual(editors.map((editor) => editor.prefill), ["10", "10", "10", "128000", "128000"]);
-    // Exactly the three malformed entries were refused; the two accepted ones
-    // replaced the stored defaults without any extra complaint.
-    assert.equal(notices.filter((notice) => notice.type === "error").length, 3, JSON.stringify(notices));
+    assert.deepEqual(editors.map((editor) => editor.prefill), ["10", "10", "10", "128000", "128000", "64000", "64000"]);
+    // Exactly the four malformed entries were refused; the accepted ones
+    // replaced the stored values without any extra complaint.
+    assert.equal(notices.filter((notice) => notice.type === "error").length, 4, JSON.stringify(notices));
+    assert.equal(
+      notices.filter((notice) => notice.type === "error").some((notice) => notice.message.includes("between 1000 and 2000000")),
+      true,
+      JSON.stringify(notices),
+    );
+    // The budget control no longer promises that an oversized brief is refused
+    // rather than sent curated (#590): the notice states only the accepted range.
+    assert.equal(
+      notices.some((notice) => /blocked rather than|does not fit|truncated brief/i.test(notice.message)),
+      false,
+      JSON.stringify(notices),
+    );
     const saved = JSON.parse(await readFile(configPath, "utf8"));
     // 2.5 seconds is accepted as whole milliseconds; the rejected entries left
-    // the stored defaults in place until the accepted value replaced them.
+    // the previous value in place until an accepted value replaced it, and the
+    // lower selectable bound 1000 persists while 999 stays refused (#590).
     assert.equal(saved.toolProtection.timeoutMs, 2_500);
-    assert.equal(saved.toolProtection.maxContextChars, 64_000);
+    assert.equal(saved.toolProtection.maxContextChars, 1_000);
     assert.equal(config.toolProtection?.timeoutMs, 2_500);
+    assert.equal(config.toolProtection?.maxContextChars, 1_000);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -805,7 +831,7 @@ test("root Escape applies the staged block for the session and a later Cancel ke
     assert.equal(config.toolProtection?.level, "dangerous", "Escape applies the staged level live");
     assert.deepEqual(config.toolProtection?.auditor, { source: "external", id: "claude-auditor" });
     assert.equal(await readFile(configPath, "utf8"), original, "Escape never writes the file");
-    assert.ok(first.notices.some((notice) => notice.type === "warning" && notice.message.includes("exact proposed tool name and arguments")), JSON.stringify(first.notices));
+    assert.ok(first.notices.some((notice) => notice.type === "warning" && notice.message.includes("the proposed tool name and arguments")), JSON.stringify(first.notices));
 
     // Reopen and Cancel: the previously applied session choices survive a
     // cancel of nothing, and the file still never changed.

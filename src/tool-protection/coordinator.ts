@@ -102,7 +102,6 @@ import {
   type AuditDisplayTheme,
 } from "./display";
 import { parseProtectionDecision } from "./decision";
-import { TOOL_PROTECTION_POLICY_VERSION } from "./policy";
 import {
   runProtectionAuditor,
   type ProtectionAuditorObservation,
@@ -888,6 +887,13 @@ export class ToolProtectionCoordinator {
         proposedCall,
         evidence: evidence.items,
         maxContextChars: settings.maxContextChars,
+        // Only the external envelope carries metadata beside the request text,
+        // and that payload is paid for out of the same context budget. The
+        // in-process Pi route carries the request text alone, so it reserves
+        // nothing.
+        ...(settings.auditor.source === "external"
+          ? { wire: { argumentFingerprint: fingerprint } }
+          : {}),
       });
       if (!built.ok) {
         this.noteGateRefusalEvidence(event.toolName, event.callId, built.message, false);
@@ -916,7 +922,7 @@ export class ToolProtectionCoordinator {
           selection: settings.auditor,
           config: this.auditorRuntimeConfig(state),
           prompt: built.prompt,
-          input: auditorWireInput(settings, proposedCall, built.includedEvidenceIds, built.omittedEvidence.map((item) => item.id)),
+          input: built.wireInput,
           cwd: proposedCall.cwd,
           timeoutMs: settings.timeoutMs,
           ...(signal ? { signal } : {}),
@@ -1532,9 +1538,7 @@ export class ToolProtectionCoordinator {
       if (!text) return;
       this.pushEvidence({
         origin: "tool-result",
-        text: text.length <= MAX_RETAINED_EVIDENCE_TEXT
-          ? text
-          : `[Host omission: the ${extractToolName(args) || "tool"} result exceeded the retained evidence budget; its contents were not supplied.]`,
+        text,
         ...(typeof event.toolCallId === "string" ? { invocationId: event.toolCallId } : {}),
       });
     } catch {
@@ -1563,7 +1567,7 @@ export class ToolProtectionCoordinator {
     if (!record) {
       if (fillsSlot) {
         this.missingCausalEvidence.set(origin,
-          `the ${origin === "user" ? "genuine user message" : "assistant inability message"} required as causal evidence exceeded the ${MAX_RETAINED_EVIDENCE_TEXT}-character retention bound and could not be reproduced in full.`);
+          `the ${origin === "user" ? "genuine user message" : "assistant inability message"} required as causal evidence could not be retained for this session.`);
       }
       return;
     }
@@ -1578,18 +1582,29 @@ export class ToolProtectionCoordinator {
     }
   }
 
-  private pushEvidence(item: Omit<ProtectionEvidence, "id">): ProtectionEvidence | undefined {
+  private pushEvidence(item: Omit<ProtectionEvidence, "id">): ProtectionEvidence {
     const id = `tp-${++this.evidenceSequence}`;
-    // Live user/assistant evidence is included whole or not at all, so a
-    // partial quote is never presented as a complete statement. A gate record
-    // is this module's own diagnostic and is kept (explicitly marked truncated
-    // when huge) so a causal refusal chain cannot be silently lost.
+    // Oversized supplied text is retained as its leading bound and marked
+    // partial rather than dropped (#590): an oversized genuine approval or
+    // inability message is still the causal evidence a later proposal needs, and
+    // the auditor receives it inside the configured context budget instead of
+    // the call being refused for its size. The marker keeps a retained prefix
+    // from ever reading as a complete statement. A gate record is this module's
+    // own diagnostic and keeps its existing note.
     let text = item.text;
+    let partial: true | undefined;
     if (text.length > MAX_RETAINED_EVIDENCE_TEXT) {
-      if (item.origin !== "gate") return undefined;
-      text = `${text.slice(0, MAX_RETAINED_EVIDENCE_TEXT)}\n[gate record truncated to the evidence budget]`;
+      text = boundedLeadingText(text, MAX_RETAINED_EVIDENCE_TEXT);
+      partial = true;
+      if (item.origin === "gate") text = `${text}\n[gate record truncated to the evidence budget]`;
     }
-    const record: ProtectionEvidence = { ...item, text, id, createdAt: this.now() };
+    const record: ProtectionEvidence = {
+      ...item,
+      text,
+      id,
+      createdAt: this.now(),
+      ...(partial === undefined ? {} : { partial }),
+    };
     this.recent.push(record);
     while (this.recent.length > this.maxRecentEvidence) {
       this.recent.shift();
@@ -1651,7 +1666,14 @@ export class ToolProtectionCoordinator {
       && !retainedCausal.some((item) => item.id === record.id));
     const liveTexts = new Set([...live, ...retainedCausal, ...retainedInputs].map((item) => item.text));
     const branch = collectBranchEvidence(ctx, liveTexts);
-    const combined = [...branch, ...[...retainedInputs, ...live, ...retainedCausal].sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))];
+    // One merged list in host chronology, oldest first. Recency in the bounded
+    // context is global, so a cached live record cannot outrank newer branch
+    // content and newer branch content cannot be pushed behind an older live
+    // record by source grouping; provenance stays on each record (#590).
+    // Duplicates are already excluded above by identity and by text, and equal
+    // or unknown times keep the order the host supplied them in.
+    const combined = [...branch, ...retainedInputs, ...live, ...retainedCausal]
+      .sort((a, b) => compareCreatedAt(a, b));
     const chain = this.chain;
     if (!chain || chain.toolName !== toolName) return { items: combined, consumedChain: false };
     const causal = new Set([chain.refusalId, chain.assistantId, chain.userId].filter((id): id is string => Boolean(id)));
@@ -1966,6 +1988,21 @@ function findAssistantMessage(args: unknown[]): { content?: unknown } | undefine
 }
 
 /**
+ * The leading `limit` code units of one retained text, never split in the middle
+ * of a non-BMP character: a lone surrogate would be quoted back as an escape the
+ * host never sent.
+ */
+function boundedLeadingText(text: string, limit: number): string {
+  let cut = limit;
+  if (cut > 0 && cut < text.length) {
+    const previous = text.charCodeAt(cut - 1);
+    const next = text.charCodeAt(cut);
+    if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) cut -= 1;
+  }
+  return text.slice(0, cut);
+}
+
+/**
  * Read the active in-memory branch (never a saved session file). Restored or
  * projection-derived text is labelled `unknown` because the branch does not
  * preserve the live input source; hidden thinking is never included.
@@ -1989,9 +2026,18 @@ function collectBranchEvidence(ctx: unknown, exclude: Set<string>): ProtectionEv
     const entry = entries[index];
     if (!isRecord(entry)) continue;
     if (entry.type === "compaction" || entry.type === "branch_summary") {
-      const summary = typeof entry.summary === "string" ? entry.summary.trim() : "";
-      if (!summary || summary.length > MAX_BRANCH_MESSAGE_CHARS || exclude.has(summary)) continue;
-      collected.unshift({ id: `branch-summary-${index}`, origin: "summary", text: summary });
+      const rawSummary = typeof entry.summary === "string" ? entry.summary.trim() : "";
+      if (!rawSummary || exclude.has(rawSummary)) continue;
+      // An oversized summary is kept as its leading portion and marked, instead
+      // of disappearing while older material fills the budget (#590).
+      const summary = boundedLeadingText(rawSummary, MAX_BRANCH_MESSAGE_CHARS);
+      collected.unshift({
+        id: `branch-summary-${index}`,
+        origin: "summary",
+        text: summary,
+        ...(summary.length < rawSummary.length ? { partial: true } : {}),
+        ...entryCreatedAt(entry),
+      });
       continue;
     }
     if (entry.type !== "message" || !isRecord(entry.message)) continue;
@@ -2006,18 +2052,52 @@ function collectBranchEvidence(ctx: unknown, exclude: Set<string>): ProtectionEv
           .map((item) => item.text as string)
           .join("")
         : "";
-    const trimmed = text.trim();
-    if (!trimmed || trimmed.length > MAX_BRANCH_MESSAGE_CHARS || exclude.has(trimmed)) continue;
+    const raw = text.trim();
+    if (!raw || exclude.has(raw)) continue;
     // A branch user message may have arrived from an extension or RPC path and
-    // is never treated as authenticated approval.
+    // is never treated as authenticated approval. An oversized message is kept
+    // as its leading portion and marked, so the newest session content still
+    // reaches the audit inside the retention bound (#590).
+    const trimmed = boundedLeadingText(raw, MAX_BRANCH_MESSAGE_CHARS);
     collected.unshift({
       id: `branch-${index}`,
       origin: message.role === "user" ? "unknown" : message.role === "toolResult" ? "tool-result" : "assistant",
       text: trimmed,
+      ...(trimmed.length < raw.length ? { partial: true } : {}),
+      ...entryCreatedAt(entry),
     });
   }
   return collected;
 }
+
+/**
+ * The recorded time of one session entry as `{ createdAt }`, for host
+ * chronology. Branch entries carry their own timestamp; an entry without one
+ * stays undated and sorts oldest, which keeps it from outranking content whose
+ * time is known.
+ */
+function entryCreatedAt(entry: Record<string, unknown>): { createdAt?: number } {
+  const value = entry.timestamp ?? entry.createdAt;
+  if (typeof value === "number" && Number.isFinite(value)) return { createdAt: value };
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) return { createdAt: parsed };
+  }
+  return {};
+}
+
+/**
+ * Host chronology for merged evidence. A record with no recorded time sorts
+ * oldest, so known times always win the ordering; equal times keep the order the
+ * host supplied, which is how the session recorded them.
+ */
+function compareCreatedAt(a: ProtectionEvidence, b: ProtectionEvidence): number {
+  const left = typeof a.createdAt === "number" && Number.isFinite(a.createdAt) ? a.createdAt : UNDATED_CREATED_AT;
+  const right = typeof b.createdAt === "number" && Number.isFinite(b.createdAt) ? b.createdAt : UNDATED_CREATED_AT;
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+const UNDATED_CREATED_AT = Number.MIN_SAFE_INTEGER;
 
 function toolResultEvidenceText(message: Record<string, unknown>): string {
   const text = Array.isArray(message.content)
@@ -2305,32 +2385,6 @@ function stripRecordedBlocks(
   }
   if (stripped === 0) return { view: result, stripped: 0 };
   return { view: { ...result, content }, stripped };
-}
-
-function auditorWireInput(
-  settings: EffectiveToolProtectionSettings,
-  proposedCall: {
-    invocationId: string;
-    toolName: string;
-    args: unknown;
-    cwd: string;
-    role: string;
-    taskId?: string;
-    lineage?: string[];
-  },
-  includedEvidenceIds: readonly string[],
-  omittedEvidenceIds: readonly string[],
-): unknown {
-  return {
-    version: "pi-tool-protection-input-v1",
-    policyVersion: TOOL_PROTECTION_POLICY_VERSION,
-    level: settings.level,
-    invocation: proposedCall,
-    context: {
-      includedEvidenceIds: [...includedEvidenceIds],
-      omittedEvidenceIds: [...omittedEvidenceIds],
-    },
-  };
 }
 
 function errorMessage(error: unknown): string {

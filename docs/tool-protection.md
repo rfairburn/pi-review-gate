@@ -108,7 +108,7 @@ The audit's output is presentation, not authority, and the gate is quiet about t
 it does not stop.
 
 - A `FAIL`, an audit error (timeout, malformed decision, unavailable auditor, context
-  capacity, an invalidated pending decision, an unsupported acting executor), and a
+  missing mandatory context, an invalidated pending decision, an unsupported acting executor), and a
   nested refusal are reported to you and to the acting model at either
   `toolProtection.debug` value. A native tool error that follows a `PASS` stays a native
   tool error; this gate never restates it as an audit `FAIL`.
@@ -184,7 +184,7 @@ malformed-block recovery are owned by
 A present block must state `level`; every non-Off level requires `auditor`;
 `scope: "selected"` requires at least one exact `toolNames` entry. `timeoutMs` is a whole
 number from 1000 to 120000 (default 10000), and `maxContextChars` is a whole number from
-4000 to 2000000 UTF-16 code units (default 128000). Explicit writes are validated
+1000 to 2000000 UTF-16 code units (default 128000). Explicit writes are validated
 strictly; unknown keys inside the block are ignored.
 
 A malformed stored block does not become an implicit Off. Startup reports a warning and
@@ -246,27 +246,48 @@ conversation, so you can browse it later.
 
 ## What the auditor receives
 
-The prompt is built by code, not by another model. These parts are mandatory and are
-reproduced in full:
+The request is built by code, not by another model. The code-owned decision instruction
+and policy for the enabled level, the evidence-provenance note, and the output contract
+are fixed: every request carries them unchanged, and they are **not** charged against
+`maxContextChars`. What that budget bounds is the curated **variable context** beside
+them — the proposal, the session evidence, and the quoted governing instructions,
+counted in the code units the transport actually carries for them, including the
+structural framing and JSON escaping the gate adds around them. When the auditor is an
+external program, the bounded host identity metadata that travels beside the request
+text is paid for out of the same budget, so the request text and that metadata together
+never exceed `maxContextChars`. The
+text actually sent is the fixed instruction overhead plus at most `maxContextChars` of
+variable context, so a request is larger than the configured budget by that overhead;
+the budget is never quietly raised, and it is a character count, not a token count.
 
-- the complete governing instructions of the acting agent, verbatim, quoted as
-  reference material about that agent rather than as instructions to the auditor;
-- the exact proposal: invocation identity, tool name, complete JSON arguments, working
-  directory, acting role, task identity, and nested lineage;
-- the code-owned decision instruction and policy for the enabled level, and the
-  output contract.
+The variable context is selected deterministically, in this order:
 
-Recent session evidence is selected deterministically within `maxContextChars`. Genuine
-current-session user input and the gate's own causal refusal records come first, then
-acting-model text, then lower-trust tool and repository material. Items are included
-whole or not at all, rendered oldest first with provenance labels, and omissions are
-disclosed to the auditor. Hidden model reasoning is excluded by construction. No whole
-transcript, project resources, or prior session history is loaded automatically.
+1. the proposal itself: the tool name and the leading submitted arguments, ahead of
+   invocation identity, working directory, acting role, task identity, and nested
+   lineage;
+2. surrounding session evidence, globally newest first, regardless of its origin or of
+   whether the host marked it causal — branch content and live session input are merged
+   by their recorded time before selection, so a cached record cannot outrank newer
+   session content, and the message immediately before a proposal is kept ahead of older
+   material;
+3. the proposal's own invocation identity facts, in the room the proposal and the session
+   evidence left;
+4. everything else previously supplied to the acting call, including the quoted
+   governing instructions of the acting agent, only in the room that is left.
 
-If the governing instructions, the exact call, or the mandatory causal refusal/approval
-evidence cannot fit the budget, the result is an explicit capacity failure and the call
-does not run. Nothing is truncated, summarized by another model, or audited under a
-smaller substitute.
+When its framing fits, a record that cannot fit whole contributes its leading portion
+and carries `"partial":true` in its own JSON. Lower-priority sections, including the
+governing reference at small budgets, may be omitted entirely rather than displacing
+the proposal or newer session evidence. Session records render newest-first, matching selection order; the
+section labels that reverse chronology explicitly. Nothing is
+summarized by a second model. Hidden model reasoning is excluded by construction, and no
+whole transcript, project resources, or prior session history is loaded automatically.
+
+Oversized input is not a reason to block a call: an oversized proposal, an oversized
+governing prompt, or an oversized session reaches the configured auditor with the
+largest useful bounded context, and the returned `PASS`/`FAIL` decides. Only absent or
+unusable mandatory input — no governing text supplied, or a proposal whose arguments
+cannot be reproduced at all — stops the call as a missing-context failure.
 
 The quoted governing instructions are evidence about the acting agent, not rules addressed
 to the auditor. The prompt says the auditor is not their addressee, that it enforces only
@@ -317,9 +338,9 @@ binds nothing, a worker-scoped prohibition binds the worker it names but is not 
 to a caller outside its scope, and a complaint about earlier blocking is not a ban. Returning the content the requesting user
 asked for is not a disclosure merely because the material carries customer or diagnostic
 context. An evidence item the host omitted because it did not fit the context budget, and
-the completeness disclosure that names it, prove nothing in either direction: they are
+a record carried only in part, prove nothing in either direction: they are
 never a refusal ground and never a reason to hedge, while a timeout, a malformed decision,
-or an over-budget mandatory context stays a fail-closed runtime failure rather than a
+or missing mandatory context stays a fail-closed runtime failure rather than a
 policy `FAIL`. This changes only what the auditor is asked about. The acting agent must
 still obey its governing instructions and the user's restrictions, and no permission,
 ceiling, trust, ownership, preflight, review, landing, or cancellation guard is relaxed by
@@ -350,10 +371,40 @@ The auditor process receives one JSON envelope on stdin and
 {
   "version": "pi-tool-protection-json-v1",
   "prompt": "complete generated audit request",
-  "input": { "model-neutral structured context": "..." },
-  "cwd": "/path/reported/for/the/proposed/call"
+  "input": {
+    "version": "pi-tool-protection-input-v2",
+    "policyVersion": "rules-11",
+    "level": "aligned",
+    "invocation": {
+      "invocationId": "call-id",
+      "toolName": "bash",
+      "argumentFingerprint": "64-hex-character-identity"
+    },
+    "context": {
+      "maxContextChars": 128000,
+      "evidenceIncluded": 3,
+      "evidenceOmitted": 1
+    }
+  }
 }
 ```
+
+The auditor process is started in the working directory reported for the proposed
+call; it is not repeated inside the envelope, because that text would travel outside
+the accounted context budget.
+
+`prompt` is the one authoritative copy of the audited context. The `input` object is
+model-neutral host metadata: bounded identity for the exact proposal — the invocation id,
+tool name, and the same argument fingerprint the gate binds its own decision to — and the
+recorded evidence selection counts. Each value is a bounded leading portion, the whole
+object is capped at a share of `maxContextChars`, and its actual serialized cost — with
+the envelope framing it shares with the request text — is subtracted from that same
+budget before anything is selected, so the transmitted variable data never exceeds
+`maxContextChars` and no capacity is left idle. The identity fields are dropped when even
+the bounded values cannot fit their share. It
+never carries a second copy of the submitted arguments, the working directory, or the
+governing instructions, so an oversized proposal cannot reach an auditor unbounded through
+a side field, and a saved audit record does not duplicate what it already saved.
 
 It writes exactly one decision object to stdout and nothing else:
 
@@ -385,8 +436,8 @@ never retried, replayed, routed to a fallback, or answered from a cache.
 ## Failure, cancellation, and approvals
 
 - A timeout, malformed decision, unavailable auditor, or context-capacity failure stops
-  the proposed call. There is no automatic retry, replay, fallback auditor, or cached
-  decision.
+  missing mandatory context stops the proposed call. There is no automatic retry, replay,
+  fallback auditor, or cached decision. Size alone is not one of these failures.
 - Cancellation or a policy, level, or auditor change invalidates a pending audit. A late
   PASS cannot revive it.
 - A `FAIL` is a gate refusal, not a tool execution failure. It does not create an
@@ -565,9 +616,13 @@ Do not use `scripts/pi-review-gate.sh` for this test: the launcher re-resolves
   `tool_search` runs. Expect it to work with no auditor call; with **Debug audit output**
   On the result carries the `NOT AUDITED — discovery loader` line, which is never a pass.
   Expect a native refusal to stay refused.
-- **Budget and timeout.** Set `maxContextChars` to `4000` and run a harmless call. If the
-  mandatory context exceeds that budget, expect an explicit capacity diagnostic and no
-  execution, with nothing silently truncated; a small call can fit and pass. For a
+- **Budget and timeout.** Set `maxContextChars` to `1000` and run a harmless call. Expect
+  the call to reach the auditor rather than a size refusal: the budget decides how much
+  of the proposal, session evidence, and quoted governing instructions is sent, the
+  proposal's leading operation data is kept first, and a record that does not fit is sent
+  as its leading portion and marked `"partial":true`. The fixed policy, decision,
+  provenance, and output instructions are sent in addition to that budget, so a small
+  budget trims what the auditor sees instead of stopping the call. For a
   deterministic timeout, use the inert fake auditor below with `FAKE_AUDITOR_DELAY_MS`
   longer than `timeoutMs` (for example 5000 with `timeoutMs: 1000`); a fast auditor that
   finishes within the deadline is a valid PASS, not a failure. Restore the defaults

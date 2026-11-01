@@ -38,6 +38,7 @@ import {
   TOOL_PROTECTION_BOOTSTRAP_ENV,
   type ToolProtectionLaunchPin,
 } from "../src/tool-protection/coordinator";
+import { PROTECTION_AUDITOR_PROTOCOL, serializeProtectionAuditorEnvelope } from "../src/tool-protection/runner";
 import type {
   ProtectionAuditorPiModelRegistry,
   ProtectionAuditorRequest,
@@ -307,11 +308,11 @@ test("a PASS holds admission until a current decision exists and leaves the nati
   assert.equal(request.modelRegistry, fakeRegistry, "live host model registry is supplied in-process");
   assert.equal(request.timeoutMs, 5_000);
   assert.match(request.prompt, /GOVERNING: complete the bounded synthetic task\./);
-  assert.match(request.prompt, /invocation: call-pass/);
-  assert.match(request.prompt, /tool: read/);
-  assert.match(request.prompt, /"path": "fixture\.txt"/);
-  assert.match(request.prompt, /working directory: \/work/);
-  assert.match(request.prompt, /acting role: primary/);
+  assert.match(request.prompt, /tool=read/);
+  assert.match(request.prompt, /invocation=call-pass/);
+  assert.match(request.prompt, /\\"path\\":\\"fixture\.txt\\"/);
+  assert.match(request.prompt, /working directory=\\"\/work\\"/);
+  assert.match(request.prompt, /acting role=\\"primary\\"/);
 
   const emitted = await host.emit("tool_result", event);
   assert.deepEqual(emitted, [], "a PASS adds nothing to the acting model's tool result in either debug mode");
@@ -389,7 +390,8 @@ test("a dangerous-level PASS on a waiting control admits the call and audits wit
   assert.ok(prompt.includes("Generic framework, host, skill, or worker workflow guidance"));
   assert.ok(!prompt.includes("- A1 "), "the dangerous audit borrowed the alignment test");
   assert.ok(!prompt.includes("- F5 "), "the dangerous audit borrowed the governing-prohibition floor test");
-  assert.ok(prompt.includes("GOVERNING INSTRUCTIONS OF THE ACTING AGENT (quoted reference material, verbatim, origin: Pi ctx.getSystemPrompt())"));
+  assert.ok(prompt.includes("GOVERNING INSTRUCTIONS OF THE ACTING AGENT (quoted reference material)"));
+  assert.ok(prompt.includes("supplied by=\\\"Pi ctx.getSystemPrompt()\\\""), "the audit request records where the governing text came from");
   assert.ok(prompt.includes("GOVERNING: complete the bounded synthetic task."), "the acting instructions still travel as evidence");
   assert.ok(prompt.includes("Enforce only the tests printed in the policy block; they say where a prohibition in this quoted text binds."));
   assert.deepEqual(await host.emit("tool_result", resultEvent("call-watch-pass", "SubtasksWatch", { input: { executionId: "exec-report-window", after: "10m" } })), [], "a PASS adds no model-visible audit text");
@@ -577,17 +579,21 @@ test("discovery never waits on the auditor, the context budget, or a configurati
   assert.equal(noAuditor.calls.length, 0);
   assert.equal((await noAuditor.coordinator.admitToolCall(callArgs("call-bash-noauditor", "bash", { command: "echo hi" })))?.block, true);
 
-  // A context budget too small for a fair audit blocks protected calls; the
-  // loader assembles no context, so it is unaffected.
+  // The smallest selectable context budget curates a smaller audit; it is not a
+  // capacity refusal, and the loader assembles no context at all.
   const tiny = coordinatorHarness({
-    config: enabledConfig({ maxContextChars: 4_000 }),
+    config: enabledConfig({ maxContextChars: 1_000 }),
     discoveryLoaderOwned: () => true,
   });
   assert.equal(await tiny.coordinator.admitToolCall(callArgs("call-loader-tiny", "tool_search", { query: "BrowserClick" })), undefined);
   assert.equal(tiny.calls.length, 0);
-  const capacity = await tiny.coordinator.admitToolCall(callArgs("call-bash-tiny", "bash", { command: "echo hi" }));
-  assert.equal(capacity?.block, true);
-  assert.match(capacity!.reason, /could not build a fair audit|maxContextChars/);
+  const tinyCall = await tiny.coordinator.admitToolCall(callArgs("call-bash-tiny", "bash", { command: "echo hi" }));
+  assert.equal(tinyCall, undefined, "a small context budget is not a reason to refuse the call");
+  assert.equal(tiny.calls.length, 1, "the call reached the configured auditor");
+  const tinyPrompt = tiny.calls[0]!.prompt;
+  const tinyVariable = tinyPrompt.slice(tinyPrompt.indexOf("\n\nPROPOSED TOOL CALL"), tinyPrompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+  assert.ok(tinyVariable.length <= 1_000, `the sent variable context was ${tinyVariable.length} characters at a 1000 budget`);
+  assert.ok(tinyPrompt.length > 1_000, "the unchanged fixed instruction blocks sit outside that budget");
 
   // Off still records nothing at all: the exemption is not a way to annotate a
   // session whose gate is Off.
@@ -758,8 +764,8 @@ test("nested decisions are correlated to the root, aggregated outward and never 
   const nestedBlocked = await coordinator.admitToolCall(callArgs("root-call/2", "write", { path: "a" }, hostContext(), "root-call"));
   assert.equal(nestedBlocked?.block, true);
   assert.equal(calls.length, 3, "each mediated child gets its own decision");
-  assert.match(calls[1]!.prompt, /nested lineage \(outermost first\): root-call/);
-  assert.match(calls[2]!.prompt, /tool: write/);
+  assert.match(calls[1]!.prompt, /nested lineage \(outermost first\)=\\"root-call/);
+  assert.match(calls[2]!.prompt, /tool=write/);
 
   // A nested result is programmatic input to its caller and is left untouched.
   assert.deepEqual(await host.emit("tool_result", resultEvent("root-call/1", "read", { structuredContent: { a: 1 } }, "root-call")), []);
@@ -2302,32 +2308,337 @@ test("a pinned executor with no parent definition refuses rather than resolving 
   assert.equal(auditor.calls.length, 0, "the ambient definition is never used");
 });
 
-test("an oversized causal approval blocks with an explicit capacity diagnostic, then recovers on a retained approval", async () => {
+test("oversized causal evidence is retained bounded and still reaches the audit (#590)", async () => {
   const host = fakeHost();
   const { coordinator, calls } = coordinatorHarness({
+    config: enabledConfig({ maxContextChars: 4_000 }),
     results: [
       { output: '{"decision":"FAIL","reason":"authorization is unclear"}' },
-      { output: '{"decision":"PASS","reason":"approval is now established"}' },
+      { output: '{"decision":"PASS","reason":"the bounded causal chain is enough"}' },
     ],
   });
   coordinator.registerHooks(host.pi);
   const ctx = hostContext();
   await host.emit("input", { text: "please run the synthetic check", source: "interactive" }, ctx);
-  assert.equal((await coordinator.admitToolCall(callArgs("oversize-a", "bash", { command: "echo hi" })))?.block, true);
-  await host.emit("message_end", { message: { role: "assistant", content: "I cannot proceed; the gate refused the call." } }, ctx);
+  assert.equal((await coordinator.admitToolCall(callArgs("big-causal-a", "bash", { command: "echo hi" })))?.block, true);
 
-  const oversized = `Approved to use, try again. ${"x".repeat(210_000)}`;
-  await host.emit("input", { text: oversized, source: "interactive" }, ctx);
-  const blocked = await coordinator.admitToolCall(callArgs("oversize-b", "bash", { command: "echo hi" }));
-  assert.equal(blocked?.block, true);
-  assert.match(blocked!.reason, /required causal evidence unavailable/);
-  assert.match(blocked!.reason, /retention bound/);
-  assert.equal(calls.length, 1, "no audit proceeds without the required causal record");
+  // The assistant inability record is larger than the retention bound and far
+  // larger than the context budget. It is retained as its leading portion and
+  // marked partial rather than dropped, so the call is audited instead of
+  // refused for the size of its evidence.
+  await host.emit("message_end", {
+    message: { role: "assistant", content: `INABILITY-HEAD I cannot proceed; the gate refused the call. ${"a".repeat(210_000)} INABILITY-TAIL` },
+  }, ctx);
+  await host.emit("input", { text: "APPROVAL-HEAD Approved to use, try again", source: "interactive" }, ctx);
 
-  await host.emit("input", { text: "Approved to use, try again", source: "interactive" }, ctx);
-  assert.equal(await coordinator.admitToolCall(callArgs("oversize-c", "bash", { command: "echo hi" })), undefined);
-  assert.equal(calls.length, 2);
+  assert.equal(await coordinator.admitToolCall(callArgs("big-causal-b", "bash", { command: "echo hi" })), undefined,
+    "an oversized causal record is audited, not refused for its size");
+  assert.equal(calls.length, 2, "no missing-causal-evidence refusal");
+  const prompt = calls[1]!.prompt;
+  assert.ok(prompt.includes("INABILITY-HEAD I cannot proceed; the gate refused the call."), "the leading inability text reached the auditor");
+  assert.ok(prompt.includes("APPROVAL-HEAD Approved to use, try again"), "the newest approval reached the auditor");
+  assert.ok(!prompt.includes("INABILITY-TAIL"), "the oversized tail was bounded, not smuggled through");
+  assert.ok(prompt.includes("a".repeat(1_000)), "the retained leading portion of the oversized record is what was sent");
+  assert.ok(prompt.includes("\"partial\":true"), "the bounded record says so structurally");
+  assert.ok((prompt.match(/causal=yes/g) ?? []).length >= 2, "the retained chain is still marked causal");
+  // The variable context the runner was actually handed respects the budget,
+  // while the unchanged fixed blocks sit outside it.
+  const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+  assert.ok(variable.length <= 4_000, `the sent variable context was ${variable.length} characters at a 4000 budget`);
+  assert.ok(prompt.length > 4_000, "the fixed instruction blocks are additional to that budget");
 });
+
+test("branch and live evidence compete by recency, not by source (#590)", async () => {
+  const { coordinator, calls } = coordinatorHarness({
+    config: enabledConfig({ maxContextChars: 1_000 }),
+    results: [{ output: '{"decision":"PASS"}' }],
+  });
+  const host = fakeHost();
+  coordinator.registerHooks(host.pi);
+  // The live record was captured at the harness clock (1_000). The branch entry
+  // below it carries a later timestamp, so it is the newer session content even
+  // though it arrives through a different source. Selection is global: the newer
+  // content is quoted whole and the older cached record only gets leftover room.
+  const ctx = hostContext({
+    sessionManager: {
+      buildContextEntries: () => [
+        { type: "message", timestamp: 900, message: { role: "user", content: `OLDEST-BRANCH ${"b".repeat(5_000)}` } },
+        { type: "message", timestamp: 5_000, message: { role: "user", content: "NEWEST-BRANCH export the approved report" } },
+      ],
+    },
+  });
+  await host.emit("input", { text: `LIVE-RECORD ${"l".repeat(5_000)}`, source: "interactive" }, ctx);
+  assert.equal(await coordinator.admitToolCall(callArgs("recency-global", "bash", { command: "echo hi" }, ctx)), undefined);
+  assert.equal(calls.length, 1);
+  const prompt = calls[0]!.prompt;
+  assert.ok(prompt.includes("NEWEST-BRANCH export the approved report"),
+    "the newest session content reached the auditor regardless of which source carried it");
+  const liveLine = prompt.split("\n").find((line) => line.includes("LIVE-RECORD"));
+  if (liveLine !== undefined) {
+    assert.ok(liveLine.includes('"partial":true'),
+      "the older record kept only leftover capacity and says so structurally");
+    assert.ok(prompt.indexOf("NEWEST-BRANCH") < prompt.indexOf("LIVE-RECORD"),
+      "the newest message precedes any bounded portion of the older live record");
+  }
+  assert.ok(!prompt.includes("l".repeat(2_000)), "the older live record did not take the budget from newer content");
+  assert.ok(!prompt.includes("OLDEST-BRANCH"), "the oldest record lost the recency contest outright");
+});
+
+test("an oversized newest branch message contributes its leading portion instead of vanishing (#590)", async () => {
+  for (const [maxContextChars, usefulPrefix] of [[1_000, 60], [4_000, 500]] as const) {
+    const { coordinator, calls } = coordinatorHarness({
+      config: enabledConfig({ maxContextChars }),
+      results: [{ output: '{"decision":"PASS"}' }],
+    });
+    const host = fakeHost();
+    coordinator.registerHooks(host.pi);
+    const ctx = hostContext({
+      sessionManager: {
+        buildContextEntries: () => [
+          { type: "message", timestamp: 1, message: { role: "user", content: "OLDER-BRANCH older note" } },
+          { type: "message", timestamp: 2, message: { role: "user", content: "MIDDLE-BRANCH another note" } },
+          { type: "message", timestamp: 3, message: { role: "assistant", content: `NEWEST-BRANCH-HEAD ${"x".repeat(9_000)} NEWEST-BRANCH-TAIL` } },
+        ],
+      },
+    });
+    assert.equal(await coordinator.admitToolCall(callArgs(`branch-oversize-${maxContextChars}`, "bash", {}, ctx)), undefined);
+    assert.equal(calls.length, 1);
+    const prompt = calls[0]!.prompt;
+    assert.ok(prompt.includes("NEWEST-BRANCH-HEAD"), `the newest oversized branch message disappeared at a ${maxContextChars} budget`);
+    assert.ok(prompt.includes("x".repeat(usefulPrefix)), "a useful leading portion of it was sent, not an empty shell");
+    assert.ok(!prompt.includes("NEWEST-BRANCH-TAIL"), "the oversized tail stayed bounded");
+    const branchLine = prompt.split("\n").find((line) => line.includes("NEWEST-BRANCH-HEAD"));
+    assert.ok(branchLine !== undefined && branchLine.includes('"partial":true'),
+      "the branch record says structurally that it is a leading portion");
+    if (maxContextChars === 1_000) {
+      assert.ok(!prompt.includes("OLDER-BRANCH") && !prompt.includes("MIDDLE-BRANCH"),
+        "older records did not take the capacity the newest record was quoted from");
+    }
+    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} at a ${maxContextChars} budget`);
+  }
+});
+
+test("an oversized branch summary is carried as a bounded portion the same way (#590)", async () => {
+  const { coordinator, calls } = coordinatorHarness({
+    config: enabledConfig({ maxContextChars: 4_000 }),
+    results: [{ output: '{"decision":"PASS"}' }],
+  });
+  const host = fakeHost();
+  coordinator.registerHooks(host.pi);
+  const ctx = hostContext({
+    sessionManager: {
+      buildContextEntries: () => [
+        { type: "message", timestamp: 1, message: { role: "user", content: "OLDER-BRANCH older note" } },
+        { type: "branch_summary", timestamp: 2, summary: `SUMMARY-HEAD ${"s".repeat(9_000)} SUMMARY-TAIL` },
+      ],
+    },
+  });
+  assert.equal(await coordinator.admitToolCall(callArgs("branch-summary-oversize", "bash", {}, ctx)), undefined);
+  assert.equal(calls.length, 1);
+  const prompt = calls[0]!.prompt;
+  assert.ok(prompt.includes("SUMMARY-HEAD"), "the oversized branch summary reached the audit as a leading portion");
+  assert.ok(prompt.includes("s".repeat(500)), "the carried portion is useful");
+  assert.ok(!prompt.includes("SUMMARY-TAIL"), "the oversized summary tail stayed bounded");
+  const summaryLine = prompt.split("\n").find((line) => line.includes("SUMMARY-HEAD"));
+  assert.ok(summaryLine !== undefined && summaryLine.includes('origin=summary'), "the summary keeps its provenance label");
+  assert.ok(summaryLine !== undefined && summaryLine.includes('"partial":true'), "and says it is a leading portion");
+});
+
+test("the real auditor seam receives a bounded context for an oversized proposal (#590)", async () => {
+  for (const maxContextChars of [1_000, 4_000]) {
+    const { coordinator, calls } = coordinatorHarness({
+      config: enabledConfig({ maxContextChars }),
+      results: [{ output: '{"decision":"PASS"}' }],
+    });
+    const host = fakeHost();
+    coordinator.registerHooks(host.pi);
+    const ctx = hostContext({ getSystemPrompt: () => `GOV-HEAD ${"g".repeat(60_000)} GOV-TAIL` });
+    const input = { command: "SEND-FIRST-TOKEN do the approved export", payload: "p".repeat(60_000), last: "SEND-LAST-TOKEN" };
+    assert.equal(await coordinator.admitToolCall(callArgs(`send-${maxContextChars}`, "bash", input, ctx)), undefined,
+      "an oversized proposal reaches the configured auditor instead of a capacity refusal");
+    assert.equal(calls.length, 1, "one audit, and its verdict decides the call");
+    const prompt = calls[0]!.prompt;
+    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    assert.ok(variable.length <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
+    assert.ok(prompt.length > maxContextChars, "the unchanged fixed instruction blocks are additional to the context budget");
+    assert.ok(prompt.includes("SEND-FIRST-TOKEN"), "the leading submitted operation data is what the budget protects");
+    assert.ok(prompt.indexOf("tool=bash") < prompt.indexOf("SEND-FIRST-TOKEN"));
+    assert.ok(!prompt.includes("SEND-LAST-TOKEN"), "the oversized argument tail did not leak through");
+    assert.ok(!prompt.includes("GOV-TAIL"), "the oversized governing copy did not leak through");
+    assert.ok(!prompt.includes("g".repeat(2_000)), "no long run of the oversized governing copy survived");
+  }
+});
+
+test("a FAIL from the bounded context still blocks, and a real refusal is not softened by clipping (#590)", async () => {
+  const { coordinator, calls } = coordinatorHarness({
+    config: enabledConfig({ maxContextChars: 1_000 }),
+    results: [{ output: '{"decision":"FAIL","reason":"synthetic refusal from bounded context"}' }],
+  });
+  const host = fakeHost();
+  coordinator.registerHooks(host.pi);
+  const ctx = hostContext({ getSystemPrompt: () => `GOV-HEAD ${"g".repeat(60_000)}` });
+  const blocked = await coordinator.admitToolCall(callArgs("send-fail", "bash", { command: "SEND-FAIL-TOKEN", payload: "p".repeat(60_000) }, ctx));
+  assert.equal(blocked?.block, true);
+  assert.match(blocked!.reason, /^Tool protection: FAIL — synthetic refusal from bounded context/);
+  assert.equal(calls.length, 1);
+});
+
+test("the real serialized external envelope stays inside the context budget (#590)", async () => {
+  const script = "let body='';process.stdin.on('data',(chunk)=>{body+=chunk;});process.stdin.on('end',()=>process.stdout.write(JSON.stringify({decision:'PASS'})));";
+  const base = externalAuditorConfig(script);
+  // Escape-heavy arguments and oversized invocation metadata: the accounting has
+  // to hold for the bytes the process actually receives, not for a parsed
+  // substring of a field.
+  const args = {
+    command: `WIRE-FIRST-TOKEN do the approved "export"\nsecond line \\backslash \u{1F600}`,
+    payload: "p".repeat(60_000),
+    last: "WIRE-LAST-TOKEN",
+  };
+  for (const maxContextChars of [1_000, 4_000]) {
+    const config = {
+      ...base,
+      toolProtection: { ...base.toolProtection!, maxContextChars, retainAuditorSessions: true },
+    } as ReviewGateConfig;
+    const drafts: AuditorRecordOpenDraft[] = [];
+    const coordinator = createToolProtectionCoordinator({
+      config: () => config,
+      cwd: () => process.cwd(),
+      role: "primary",
+      openAuditorRecord: async (draft) => {
+        drafts.push(draft);
+        return { complete: () => ({ saved: "full" as const }) };
+      },
+    });
+    const host = fakeHost();
+    coordinator.registerHooks(host.pi);
+    const ctx = hostContext({
+      cwd: `${process.cwd()}/${"d".repeat(3_000)}`,
+      getSystemPrompt: () => `GOV-HEAD ${"g".repeat(60_000)} GOV-TAIL`,
+    });
+    const callId = "wire-real-audit";
+    assert.equal(await coordinator.admitToolCall(
+      callArgs(callId, "bash", args, ctx, `${"r".repeat(1_000)}/${"c".repeat(1_000)}`),
+    ), undefined, `an oversized proposal reached no real auditor at a ${maxContextChars} budget`);
+    assert.equal(drafts.length, 1, "the opted-in record describes the invocation that actually ran");
+    const observation = drafts[0]!.observation;
+    assert.equal(observation?.transport, "external-binary");
+    const requestText = observation?.external?.requestText ?? "";
+    assert.ok(requestText.length > 0, "the record reports the exact bytes handed to the program's stdin");
+    const envelope = JSON.parse(requestText) as {
+      version: string;
+      prompt: string;
+      input: { invocation?: Record<string, unknown>; context: Record<string, unknown> };
+    };
+    assert.equal(envelope.version, PROTECTION_AUDITOR_PROTOCOL);
+    const variable = envelope.prompt.slice(
+      envelope.prompt.indexOf("\n\nPROPOSED TOOL CALL"),
+      envelope.prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"),
+    );
+    assert.ok(variable.length > 0, "the envelope lost its variable context");
+    // What this request contributes to the bytes on stdin: the request text is
+    // itself carried as a JSON string, and the side payload is serialized beside
+    // it. Both are paid for out of the one budget.
+    // Everything the process receives that is not one of the unchanged fixed
+    // instruction blocks: envelope framing, the escaped variable context, and the
+    // serialized side metadata together.
+    const fixedText = envelope.prompt.replace(variable, "");
+    const completeVariableContribution = requestText.length - (JSON.stringify(fixedText).length - 2);
+    assert.ok(completeVariableContribution <= maxContextChars,
+      `the complete serialized variable contribution was ${completeVariableContribution} at ${maxContextChars}`);
+    assert.ok(completeVariableContribution >= maxContextChars - 64, "the budget is used rather than left empty");
+    assert.ok(!Object.hasOwn(envelope, "cwd"), "the envelope transmits no unaccounted working-directory text");
+    assert.ok(envelope.prompt.includes("WIRE-FIRST-TOKEN"), "the leading arguments reached the auditor");
+    assert.ok(!envelope.prompt.includes("WIRE-LAST-TOKEN"), "the oversized arguments were bounded, not duplicated into a side field");
+    assert.ok(!envelope.prompt.includes("GOV-TAIL"));
+    assert.ok(!requestText.includes("p".repeat(maxContextChars)), "no oversized payload reached the process through any field");
+    assert.ok(!requestText.includes("r".repeat(200)), "an oversized lineage did not ride along unaccounted");
+    assert.ok(!requestText.includes("d".repeat(200)), "an oversized working directory did not ride along unaccounted");
+    // The side field is bounded host metadata: no arguments, no governing copy.
+    assert.ok(!JSON.stringify(envelope.input).includes("WIRE-FIRST-TOKEN"));
+    assert.ok(!JSON.stringify(envelope.input).includes("GOV-HEAD"));
+    assert.deepEqual(Object.keys(envelope.input).sort(), ["context", "invocation", "level", "policyVersion", "version"]);
+    assert.equal(envelope.input.invocation?.toolName, "bash");
+    assert.equal(envelope.input.invocation?.invocationId, callId, "the carried invocation id is the bounded host identity");
+    if (envelope.input.invocation?.argumentFingerprint === undefined) {
+      assert.ok(serializeProtectionAuditorEnvelope("", envelope.input).length <= Math.floor(maxContextChars / 3),
+        "optional identity fields were dropped rather than pushing the side payload past its ceiling");
+    } else {
+      assert.equal(envelope.input.invocation.argumentFingerprint, toolCallFingerprint("bash", args),
+        "the bounded identity is the one the gate binds its decision to");
+    }
+    assert.ok(!Object.hasOwn(envelope.input.invocation ?? {}, "args"), "the envelope carries no second copy of the submitted arguments");
+  }
+});
+
+function externalRecordHarness(maxContextChars: number) {
+  const script = "let body='';process.stdin.on('data',(chunk)=>{body+=chunk;});process.stdin.on('end',()=>process.stdout.write(JSON.stringify({decision:'PASS'})));";
+  const base = externalAuditorConfig(script);
+  const config = {
+    ...base,
+    toolProtection: { ...base.toolProtection!, maxContextChars, retainAuditorSessions: true },
+  } as ReviewGateConfig;
+  const drafts: AuditorRecordOpenDraft[] = [];
+  const coordinator = createToolProtectionCoordinator({
+    config: () => config,
+    cwd: () => process.cwd(),
+    role: "primary",
+    openAuditorRecord: async (draft) => {
+      drafts.push(draft);
+      return { complete: () => ({ saved: "full" as const }) };
+    },
+  });
+  return { coordinator, drafts };
+}
+
+/** The bytes the external auditor process received, minus only the fixed blocks. */
+function externalContribution(drafts: AuditorRecordOpenDraft[]): { prompt: string; contribution: number } {
+  const requestText = drafts[0]!.observation?.external?.requestText ?? "";
+  assert.ok(requestText.length > 0, "the record reports the exact bytes handed to the program's stdin");
+  const envelope = JSON.parse(requestText) as { prompt: string };
+  const prompt = envelope.prompt;
+  const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+  assert.ok(variable.length > 0, "the envelope lost its variable context");
+  const fixedText = prompt.replace(variable, "");
+  return { prompt, contribution: requestText.length - (JSON.stringify(fixedText).length - 2) };
+}
+
+test("an external audit at the default budget keeps a 100,000-character proposal whole (#590)", async () => {
+  const { coordinator, drafts } = externalRecordHarness(128_000);
+  const host = fakeHost();
+  coordinator.registerHooks(host.pi);
+  const ctx = hostContext({ cwd: process.cwd(), getSystemPrompt: () => `GOV-HEAD ${"g".repeat(20_000)} GOV-TAIL` });
+  await host.emit("input", { text: "NEWEST-USER approved to run the export", source: "interactive" }, ctx);
+  const args = { command: "WHOLE-FIRST-TOKEN approved export", blob: "w".repeat(99_000), last: "WHOLE-LAST-TOKEN" };
+  assert.equal(await coordinator.admitToolCall(callArgs("wire-whole", "bash", args, ctx)), undefined);
+  assert.equal(drafts.length, 1);
+  const { prompt, contribution } = externalContribution(drafts);
+  assert.ok(contribution <= 128_000, `the transmitted variable data was ${contribution} at a 128000 budget`);
+  const callLine = prompt.split("\n").find((line) => line.startsWith("{") && line.includes("tool=bash"))!;
+  const record = JSON.parse(callLine) as { text: string; partial?: boolean };
+  assert.ok(record.text.includes("WHOLE-LAST-TOKEN"), "a proposal that fits the budget reaches the auditor whole");
+  assert.notEqual(record.partial, true, "a proposal that fits the budget is not clipped by the metadata reservation");
+  assert.ok(prompt.includes("NEWEST-USER approved to run the export"), "the newest session message still fits");
+});
+
+test("an external audit at a small budget keeps a short call and the newest message (#590)", async () => {
+  for (const maxContextChars of [1_000, 4_000]) {
+    const { coordinator, drafts } = externalRecordHarness(maxContextChars);
+    const host = fakeHost();
+    coordinator.registerHooks(host.pi);
+    const ctx = hostContext({ cwd: process.cwd(), getSystemPrompt: () => `GOV-HEAD ${"g".repeat(20_000)} GOV-TAIL` });
+    const token = `NEWEST-USER-${maxContextChars} approved to run the export`;
+    await host.emit("input", { text: token, source: "interactive" }, ctx);
+    assert.equal(await coordinator.admitToolCall(callArgs(`wire-small-${maxContextChars}`, "bash", { command: "echo hi" }, ctx)), undefined);
+    assert.equal(drafts.length, 1);
+    const { prompt, contribution } = externalContribution(drafts);
+    assert.ok(contribution <= maxContextChars, `the transmitted variable data was ${contribution} at a ${maxContextChars} budget`);
+    assert.ok(prompt.includes("tool=bash"), "the proposed operation is present");
+    assert.ok(prompt.includes(token), `the newest session message was not evicted at a ${maxContextChars} budget`);
+    assert.ok(!prompt.includes("GOV-TAIL"), "the oversized governing copy stayed bounded");
+  }
+});
+
 
 test("causal refusal and approval survive ordinary history eviction", async () => {
   const host = fakeHost();
@@ -2475,101 +2786,6 @@ test("nested retention loss is disclosed and an earlier refusal stays visible", 
   assert.deepEqual(quietRows, [], "debug Off adds no rows for the passing nested calls");
 });
 
-test("an unrecovered assistant causal slot keeps blocking after a retained user approval", async () => {
-  const host = fakeHost();
-  const { coordinator, calls } = coordinatorHarness({
-    results: [
-      { output: '{"decision":"FAIL","reason":"authorization is unclear"}' },
-      { output: '{"decision":"PASS","reason":"both causal records are retained"}' },
-    ],
-  });
-  coordinator.registerHooks(host.pi);
-  const ctx = hostContext();
-  await host.emit("input", { text: "please run the synthetic check", source: "interactive" }, ctx);
-  assert.equal((await coordinator.admitToolCall(callArgs("slot-a1", "bash", { command: "echo hi" })))?.block, true);
-
-  // The assistant inability record cannot be retained; the user slot is later
-  // filled by a normal retained approval.
-  await host.emit("message_end", { message: { role: "assistant", content: `I cannot proceed. ${"a".repeat(210_000)}` } }, ctx);
-  await host.emit("input", { text: "Approved to use, try again", source: "interactive" }, ctx);
-
-  const blocked = await coordinator.admitToolCall(callArgs("slot-a2", "bash", { command: "echo hi" }));
-  assert.equal(blocked?.block, true);
-  assert.match(blocked!.reason, /required causal evidence unavailable/);
-  assert.match(blocked!.reason, /assistant inability message/);
-  assert.doesNotMatch(blocked!.reason, /genuine user message/);
-  assert.equal(calls.length, 1, "the retained approval must not clear the missing assistant slot");
-
-  // Recovering the assistant slot now permits a fresh audit.
-  await host.emit("message_end", { message: { role: "assistant", content: "I cannot proceed; the gate refused the call." } }, ctx);
-  assert.equal(await coordinator.admitToolCall(callArgs("slot-a3", "bash", { command: "echo hi" })), undefined);
-  assert.equal(calls.length, 2);
-});
-
-test("an unrecovered user causal slot keeps blocking after a retained assistant inability", async () => {
-  const host = fakeHost();
-  const { coordinator, calls } = coordinatorHarness({
-    results: [
-      { output: '{"decision":"FAIL","reason":"authorization is unclear"}' },
-      { output: '{"decision":"PASS","reason":"both causal records are retained"}' },
-    ],
-  });
-  coordinator.registerHooks(host.pi);
-  const ctx = hostContext();
-  await host.emit("input", { text: "please run the synthetic check", source: "interactive" }, ctx);
-  assert.equal((await coordinator.admitToolCall(callArgs("slot-b1", "bash", { command: "echo hi" })))?.block, true);
-
-  // Reverse ordering: the approval is oversized, then a retained inability.
-  await host.emit("input", { text: `Approved to use, try again. ${"u".repeat(210_000)}`, source: "interactive" }, ctx);
-  await host.emit("message_end", { message: { role: "assistant", content: "I cannot proceed; the gate refused the call." } }, ctx);
-
-  const blocked = await coordinator.admitToolCall(callArgs("slot-b2", "bash", { command: "echo hi" }));
-  assert.equal(blocked?.block, true);
-  assert.match(blocked!.reason, /required causal evidence unavailable/);
-  assert.match(blocked!.reason, /genuine user message/);
-  assert.doesNotMatch(blocked!.reason, /assistant inability message/);
-  assert.equal(calls.length, 1, "the retained inability must not clear the missing user slot");
-
-  await host.emit("input", { text: "Approved to use, try again", source: "interactive" }, ctx);
-  assert.equal(await coordinator.admitToolCall(callArgs("slot-b3", "bash", { command: "echo hi" })), undefined);
-  assert.equal(calls.length, 2);
-});
-
-test("simultaneous causal-slot loss blocks until every missing slot is individually recovered", async () => {
-  const host = fakeHost();
-  const { coordinator, calls } = coordinatorHarness({
-    results: [
-      { output: '{"decision":"FAIL","reason":"authorization is unclear"}' },
-      { output: '{"decision":"PASS","reason":"both causal records are retained"}' },
-    ],
-  });
-  coordinator.registerHooks(host.pi);
-  const ctx = hostContext();
-  await host.emit("input", { text: "please run the synthetic check", source: "interactive" }, ctx);
-  assert.equal((await coordinator.admitToolCall(callArgs("slot-c1", "bash", { command: "echo hi" })))?.block, true);
-
-  await host.emit("message_end", { message: { role: "assistant", content: `I cannot proceed. ${"a".repeat(210_000)}` } }, ctx);
-  await host.emit("input", { text: `Approved to use, try again. ${"u".repeat(210_000)}`, source: "interactive" }, ctx);
-
-  const both = await coordinator.admitToolCall(callArgs("slot-c2", "bash", { command: "echo hi" }));
-  assert.equal(both?.block, true);
-  assert.match(both!.reason, /assistant inability message/);
-  assert.match(both!.reason, /genuine user message/);
-  assert.equal(calls.length, 1);
-
-  // Recovering one slot at a time never clears the other.
-  await host.emit("message_end", { message: { role: "assistant", content: "I cannot proceed; the gate refused the call." } }, ctx);
-  const userStillMissing = await coordinator.admitToolCall(callArgs("slot-c3", "bash", { command: "echo hi" }));
-  assert.equal(userStillMissing?.block, true);
-  assert.match(userStillMissing!.reason, /genuine user message/);
-  assert.doesNotMatch(userStillMissing!.reason, /assistant inability message/);
-  assert.equal(calls.length, 1);
-
-  await host.emit("input", { text: "Approved to use, try again", source: "interactive" }, ctx);
-  assert.equal(await coordinator.admitToolCall(callArgs("slot-c4", "bash", { command: "echo hi" })), undefined);
-  assert.equal(calls.length, 2);
-});
-
 test("a changed proposal or governing prompt during the audit cannot consume the old PASS", async () => {
   for (const mode of ["mutated", "replaced", "system"] as const) {
     let release!: () => void;
@@ -2614,6 +2830,31 @@ test("captured tool results supply URL provenance as untrusted evidence without 
   assert.ok(calls[0]!.prompt.includes(source));
   assert.match(calls[0]!.prompt, /"metadata":"origin=tool-result \|/);
   assert.doesNotMatch(calls[0]!.prompt, /HIDDEN-REASONING-MUST-NOT-BE-SENT/);
+});
+
+test("an oversized live tool result contributes its prefix instead of an omission notice (#590)", async () => {
+  for (const maxContextChars of [1_000, 4_000]) {
+    const host = fakeHost();
+    const { coordinator, calls } = coordinatorHarness({ config: enabledConfig({ maxContextChars }) });
+    coordinator.registerHooks(host.pi);
+    await host.emit("tool_result", resultEvent("large-result", "read", {
+      content: [
+        { type: "text", text: `TOOL-RESULT-HEAD ${"r".repeat(250_000)} TOOL-RESULT-TAIL` },
+        { type: "thinking", thinking: "HIDDEN-REASONING-MUST-NOT-BE-SENT" },
+      ],
+    }));
+    assert.equal(await coordinator.admitToolCall(callArgs(`next-${maxContextChars}`, "read", { path: "fixture" })), undefined);
+    const prompt = calls[0]!.prompt;
+    const line = prompt.split("\n").find((value) => value.startsWith("{") && value.includes("TOOL-RESULT-HEAD"));
+    assert.ok(line, `the leading tool evidence is retained at ${maxContextChars}`);
+    const record = JSON.parse(line) as { metadata: string; text: string; partial?: boolean };
+    assert.match(record.metadata, /^origin=tool-result \|/);
+    assert.ok(record.text.startsWith("Native read result (call large-result):\nTOOL-RESULT-HEAD "));
+    assert.equal(record.partial, true);
+    assert.doesNotMatch(prompt, /TOOL-RESULT-TAIL|Host omission|HIDDEN-REASONING-MUST-NOT-BE-SENT/);
+    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars);
+  }
 });
 
 test("active-branch tool results remain lower-trust evidence after restore", async () => {
@@ -4077,8 +4318,11 @@ test("a reload past the row bound recovers every older refusal and save warning 
         // The refusals and the admitted calls are decided by name, so the
         // scripted queue cannot run out and repeat the wrong verdict.
         (request: ProtectionAuditorRequest) => {
-          const invocation = (request.input as { invocation?: { invocationId?: string } } | undefined)?.invocation;
-          const callId = invocation?.invocationId ?? "";
+          // The envelope side field carries only bounded host identity, so this
+          // scripted auditor reads the invocation id out of the proposal record
+          // in the request text it was actually sent.
+          const match = /invocation=([A-Za-z0-9-]+)/.exec(request.prompt);
+          const callId = match?.[1] ?? "";
           const admitted = callId.startsWith("wide-pass-") || callId === "wide-warn-0";
           return Promise.resolve({
             durationMs: 1,
@@ -4292,7 +4536,9 @@ function sequencedAuditorConfig(
     "const envelope=JSON.parse(body);",
     "const invocation=(envelope.input&&envelope.input.invocation)||{};",
     "toolName=String(invocation.toolName||'');",
-    "key=toolName+'::'+JSON.stringify(invocation.args===undefined?null:invocation.args);",
+    // The envelope carries the bounded proposal identity, not a second copy of
+    // the arguments: the fingerprint is what ties a reply to one exact proposal.
+    "key=toolName+'::'+String(invocation.argumentFingerprint||'');",
     "}catch{}",
     "const file=process.env.SYNTHETIC_AUDIT_STATE;",
     "let counts={};",
@@ -4347,7 +4593,10 @@ async function auditedAttempts(stateFile: string, toolName: string, args: Record
   } catch {
     counts = {};
   }
-  return counts[`${toolName}::${JSON.stringify(args)}`] ?? 0;
+  // The inert auditor keys its attempt counter on the bounded proposal identity
+  // the envelope carries, which is the same fingerprint the gate binds its own
+  // decision to — never a second copy of the arguments.
+  return counts[`${toolName}::${toolCallFingerprint(toolName, args) ?? ""}`] ?? 0;
 }
 
 /**

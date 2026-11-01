@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.247]
+
+### Fixed
+
+- **Bounded auditor context** (#590): the character budget selects leading proposed-call
+  content first, then session evidence newest-first, then governing/reference material,
+  including useful portions of large records instead of refusing solely because input
+  is oversized. The minimum is 1,000 UTF-16 code units; the default remains 128,000.
+  Unchanged fixed auditor instructions are outside the context budget. Verdicts and
+  existing authorization safeguards remain in force, with no added truncation notices.
+
 ## [0.1.0-dev.246]
 
 ### Added

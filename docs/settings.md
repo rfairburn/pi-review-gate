@@ -458,8 +458,9 @@ effect.
   values invokes no provider and launches no auditor; a saved selection is not a
   connection test.
 - Enabling a non-Off level or changing the auditor warns that the selected boundary
-  will receive the exact proposed tool arguments, the governing system instructions for
-  the acting call, and the selected session evidence.
+  receives context within the configured budget: proposed tool name and arguments
+  first, then session evidence newest-first, then governing instructions and other
+  reference material. Fixed auditor instructions are separate from that budget.
 - An external auditor reference that no longer resolves is preserved and reported as
   unavailable; the menu does not silently rewrite it to Off or choose another auditor.
 - Under a non-Off level, unsupported external acting executors are refused before they

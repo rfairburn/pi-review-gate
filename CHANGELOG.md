@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.243]
+## [0.1.0-dev.245]
 
 ### Changed
 
@@ -30,6 +30,33 @@ dates.
   Main keeps its local Saved cases and the shared local Saved fixture family, and the
   native Saved and other focused Saved tiers are untouched. Test organization only;
   production behavior, private fields, APIs, and policy are unchanged.
+
+## [0.1.0-dev.244]
+
+### Fixed
+
+- **Disabled scheduled research entries save with an unusable worker pin** (#576): a
+  settings Save of an Off research task that still pins a worker resource that was
+  removed or is no longer research-capable now persists the entry and its pin, matching
+  the existing load, menu, and scheduler policy that a disabled entry never dispatches.
+  Enabled entries — including entries with no stored `enabled` field, which default to
+  on — keep their strict missing-resource and research-capability refusals, and the
+  independent task-local reviewer check still validates selected external reviewers on
+  disabled entries. No auto-disable, re-enable, migration, fallback, or role/permission
+  behavior changes.
+
+## [0.1.0-dev.243]
+
+### Fixed
+
+- **Review-policy prompts reject unsafe integers** (#577): both **Automatic
+  correction attempts** and **Concrete guidance after** use the same
+  non-negative safe-integer boundary that strict configuration normalization
+  already applies. Entries such as `1e20` or `9007199254740992` are refused with
+  the existing notice and leave the previously staged value unchanged, while
+  `0`, ordinary safe integers, and `Number.MAX_SAFE_INTEGER` are accepted.
+  Cancellation, blank/whitespace input, existing number grammar, defaults,
+  fallback/persistence behavior, and other numeric prompts are unchanged.
 
 ## [0.1.0-dev.242]
 

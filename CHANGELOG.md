@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.239]
+## [0.1.0-dev.240]
 
 ### Changed
 
@@ -33,6 +33,20 @@ dates.
   receipts, delete/resume authorization, cancellation behavior, and stale-reply
   handling are unchanged. No public API, protocol, configuration, default,
   permission, fallback, retry, or retention change.
+
+## [0.1.0-dev.239]
+
+### Tests
+
+- **Native Vim entry drains queued terminal bytes before reading its cursor** (#581): the
+  external-editor acceptance fixture now awaits the real surface's existing parse
+  barrier after the Ctrl+G statusline wait and before its first frame/cursor-entry
+  pair, so matching editor text can no longer be read while Vim's cursor-show/CUP
+  suffix is still queued. A deterministic control against the actual
+  `TerminalSurface` keeps that matching-text/old-hidden-cursor state observable before
+  the same flush and requires the exact visible editor cursor afterward. All existing
+  save, cancel, failure, Unicode, prefill, no-model/tool, and process/TTY restoration
+  assertions are unchanged; production and general harness behavior are unchanged.
 
 ## [0.1.0-dev.238]
 

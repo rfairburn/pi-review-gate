@@ -1,8 +1,8 @@
 # Tool protection
 
 Tool protection is an optional pre-execution decision gate for native Pi tool calls.
-One configured auditor receives the exact proposed call plus a bounded, code-selected
-context before the call can take effect, and answers `PASS` or `FAIL`. `FAIL`, a
+One configured auditor receives a bounded, code-selected representation of the proposed
+call and surrounding context before the call can take effect, and answers `PASS` or `FAIL`. `FAIL`, a
 timeout, a malformed answer, an unavailable auditor, cancellation, or an invalidated
 decision stops the proposed call under the existing fail-closed admission path.
 
@@ -208,9 +208,9 @@ conversation, so you can browse it later.
 - Off records nothing at all: no session SDK load, no session directory, no file. Calls
   outside the audit scope, calls refused before the auditor was consulted, and the
   never-audited `tool_search` loader produce no records, because no auditor ran.
-- A record keeps what really happened, and only that. For the Pi route: the route
-  instruction, the one generated prompt byte-for-byte, the effective reasoning request, the
-  resolved model, and the terminal assistant message the host returned. For an external
+- A record keeps what really happened, and only that. For the Pi route: the actual
+  system/user request text byte-for-byte, the effective reasoning request, the resolved
+  model, and the terminal assistant message the host returned. For an external
   binary: the JSON envelope the gate supplied on its stdin and its captured stdout, both
   labelled as host process input and program output, with the exit status, timeout/abort
   state, and process settlement. The record says plainly when the host never confirmed that
@@ -270,8 +270,8 @@ The variable context is selected deterministically, in this order:
    by their recorded time before selection, so a cached record cannot outrank newer
    session content, and the message immediately before a proposal is kept ahead of older
    material;
-3. the proposal's own invocation identity facts, in the room the proposal and the session
-   evidence left;
+3. invocation and record identity facts, in the room the proposal and all selected
+   session-message content left;
 4. everything else previously supplied to the acting call, including the quoted
    governing instructions of the acting agent, only in the room that is left.
 
@@ -279,8 +279,13 @@ When its framing fits, a record that cannot fit whole contributes its leading po
 and carries `"partial":true` in its own JSON. Lower-priority sections, including the
 governing reference at small budgets, may be omitted entirely rather than displacing
 the proposal or newer session evidence. Session records render newest-first, matching selection order; the
-section labels that reverse chronology explicitly. Nothing is
-summarized by a second model. Hidden model reasoning is excluded by construction, and no
+section labels that reverse chronology explicitly. Selection priority is separate from
+render order: all unchanged auditor instructions lead, followed by the selected governing
+reference, selected newest-first session evidence, and the proposed call last. Pi receives
+the code-owned fixed instructions in its native system prompt and all variable quoted
+data in one user message; quoted governing instructions are never promoted to system
+instructions. External binaries still receive the complete canonical prompt. This keeps
+shared leading material stable without changing which data gets the budget. Nothing is summarized by a second model. Hidden model reasoning is excluded by construction, and no
 whole transcript, project resources, or prior session history is loaded automatically.
 
 Oversized input is not a reason to block a call: an oversized proposal, an oversized
@@ -352,7 +357,7 @@ One existing reviewer selection is reused; there is no second auditor catalog.
 
 | Selection | Current behavior |
 | --- | --- |
-| `{"source":"pi","model":"provider/model","thinkingLevel":"low"}` | In-process through the host's live model registry. The model must resolve exactly; there is no fuzzy match, auth-based preference, provider fallback, or CLI fallback. The request has no tools, no session history, and no project resources, and one attempt is made with no runner retry, cache, or fallback. Reasoning uses the selected `thinkingLevel`; when omitted it follows the existing reviewer default (`high`). A tool-call attempt is discarded and fails closed. |
+| `{"source":"pi","model":"provider/model","thinkingLevel":"low"}` | In-process through the host's live model registry. The model must resolve exactly; there is no fuzzy match, auth-based preference, provider fallback, or CLI fallback. The request has no tools, no session history, and no project resources, and one attempt is made with no runner retry, verdict cache, or fallback. Reasoning uses the selected `thinkingLevel`; when omitted it follows the existing reviewer default (`high`). A tool-call attempt is discarded and fails closed. |
 | `{"source":"external","id":"agent-id"}` with `generic-cli` or `run-as-binary` | Reuses the configured command, arguments, and environment with the versioned stdin/stdout decision protocol below. The external implementation is trusted code, not an OS sandbox. |
 | External `claude-cli` or `codex-cli` | Selectable but currently fails closed before launch with an explicit unsupported-capability message: neither route has a proven safe, no-tool, single-attempt launch contract. Use the provider through the Pi route where its model is available. This page makes no claim that the CLI routes work. |
 
@@ -361,6 +366,39 @@ becoming Off or PASS. A malformed protection block is reported at startup, not s
 read as Off. External definitions contribute their command, arguments, and environment:
 the `execution` role is used when present, otherwise `review`, and the gate's
 `timeoutMs` bounds the decision rather than the role timeout.
+
+### Provider prompt caching
+
+Prompt caching reuses provider-side computation, never a decision. Every proposal still
+sends its own self-contained request and needs a fresh verdict. The stable-prefix layout
+applies to every selected auditor model, not a particular model name.
+
+For Pi auditors, a namespaced hash of the native acting-session id, model, level, and
+policy revision supplies the SDK's supported `sessionId` option. A session file is not
+required, and no saved history is read. If the host supplies no session id, auditing
+continues without a key. The fixture tester instead derives its scope from the resolved
+saved-configuration path, so repeat runs over that configuration and level share a key.
+Raw session ids and configuration paths are not sent as the key.
+
+The installed SDK maps that option to its supported cache/routing controls. Every Pi
+audit requests the SDK's native SSE transport for a self-contained one-shot request,
+without pooled continuation of an earlier response. This gate adds no retention/TTL
+flags or custom provider headers.
+
+Every Pi auditor uses the same native system/user separation. Pi's own adapters handle
+provider payloads and cache boundaries; this gate uses no provider-specific payload hook,
+cache-marker rewriting, or custom provider JSON. Native cache-retention settings remain
+Pi's responsibility. Saving an audit never turns the request into an ongoing conversation.
+
+No model-name or provider-specific setup is required by this gate. Cache availability,
+minimum cacheable prefix length, construction, expiry, eviction, and billing remain
+properties of the selected backend, handled through Pi. A stable system prompt or
+cache key alone proves neither a hit nor savings; verify the reported usage.
+
+**Save auditor sessions** still controls separate fresh records, not cache identity or
+request history; **Debug audit output** still controls presentation only. Neither is
+required for caching. See [Testing tool protection](#testing-tool-protection) for actual
+usage verification without changing models or settings.
 
 ### External decision protocol
 
@@ -516,6 +554,21 @@ Resolution otherwise uses normal Node package resolution (including Pi's import-
 package exports), the `pi` entry on `PATH`, or the current managed Pi install; the tester
 never provisions or updates Pi.
 
+A run's JSON results optionally include `usage`: the terminal assistant message's native
+Pi SDK usage object, unchanged. No usage is invented when the terminal message or its
+usage is unavailable; a reported `cacheRead: 0` means no reported cached read, not a
+positive cache hit. SDK cost values are catalog estimates, not verified provider bills.
+Human-readable output and exit codes are unchanged.
+
+To verify provider caching, deliberately repeat a selected fixture with `--json`, the
+same saved configuration and level, and inspect each result's `usage.cacheRead`. A
+positive count is actual reported cache use, unlike a cache key or a mocked test. Compare
+it with `usage.input` and `usage.cacheWrite`: the cached share of input is
+`cacheRead / (input + cacheRead + cacheWrite)`. A tiny positive count does not establish
+that the whole fixed prefix was cached. Each repeat is a fresh charged request, not an
+automatic warmup or a cached verdict. Provider cache construction can take time, and a
+second request with a different suffix need not hit yet.
+
 Requirements and caveats:
 
 - **Saved model and default reasoning.** The tester uses the auditor model and
@@ -524,7 +577,7 @@ Requirements and caveats:
   reviewer default (`high`) applies. It does not substitute an ordinary reviewer, use a
   live session-only selection, read conversation history, or rewrite your saved choices.
 - **Pi-backed auditors only.** An external auditor is refused before any program is
-  launched. There is no fallback, retry, cache, or replay.
+  launched. There is no fallback, retry, verdict cache, or replay.
 - **Explicit runs only.** `--case` and `--level` are both required to run; both accept
   `all`. Each selected case/level is requested once, sequentially. Requests can incur
   provider charges, so run them deliberately.

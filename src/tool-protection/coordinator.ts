@@ -103,6 +103,7 @@ import {
 } from "./display";
 import { parseProtectionDecision } from "./decision";
 import {
+  protectionAuditorCacheKey,
   runProtectionAuditor,
   type ProtectionAuditorObservation,
   type ProtectionAuditorPiModelRegistry,
@@ -128,6 +129,9 @@ import { expansionHint, nativeImageDisclosure, visibleLineWidth, wrapAnsiAwareRo
 /** Private one-shot transport for the parent-pinned delegated Pi executor gate. */
 export const TOOL_PROTECTION_BOOTSTRAP_ENV = "PI_REVIEW_GATE_TOOL_PROTECTION";
 const TOOL_PROTECTION_BOOTSTRAP_VERSION = 1;
+
+/** Namespace for the acting conversation's auditor cache scope (#590). */
+const ACTING_SESSION_CACHE_SCOPE_PREFIX = "pi-tool-protection:acting-session:";
 
 /** Bounds that keep admission state and evidence small; not policy budgets. */
 const MAX_RECENT_EVIDENCE = 12;
@@ -925,6 +929,24 @@ export class ToolProtectionCoordinator {
       // audit touches no session storage at all.
       let observation: ProtectionAuditorObservation | undefined;
       const signal = event.signal ?? readContextSignal(ctx);
+      // Stable prompt-cache identity for one acting conversation's Pi audits
+      // (#590). The scope is the host's own acting-session id under a
+      // protection-specific namespace — never an invocation id, task id, or an
+      // audit record's saved session — so repeat audits in one conversation
+      // share one identity while a different conversation, model, level, or
+      // policy revision does not. The key is hashed from that id, so the raw
+      // session id is not what reaches a provider. A session file is not required.
+      // A host without an acting-session id, and every external auditor,
+      // simply gets no key: the
+      // audit, its guards, and its refusals stay exactly as they were.
+      const actingSessionId = readActingSessionId(ctx);
+      const auditorCacheKey = settings.auditor.source === "pi" && actingSessionId !== undefined
+        ? protectionAuditorCacheKey(
+          `${ACTING_SESSION_CACHE_SCOPE_PREFIX}${actingSessionId}`,
+          settings.auditor.model,
+          settings.level as Exclude<ProtectionLevel, "off">,
+        )
+        : undefined;
       try {
         result = await (this.options.runAuditor ?? runProtectionAuditor)({
           ...(settings.retainAuditorSessions
@@ -933,9 +955,16 @@ export class ToolProtectionCoordinator {
           selection: settings.auditor,
           config: this.auditorRuntimeConfig(state),
           prompt: built.prompt,
+          // The builder's own reported fixed-instruction length is the single
+          // authoritative boundary: the Pi route puts exactly that unchanged
+          // code-owned prefix in system text and the rest in one user message,
+          // and an external transport ignores it and receives `built.prompt`
+          // whole. The coordinator never recomputes or resizes it.
+          fixedInstructionChars: built.fixedChars,
           input: built.wireInput,
           cwd: proposedCall.cwd,
           timeoutMs: settings.timeoutMs,
+          ...(auditorCacheKey === undefined ? {} : { cacheKey: auditorCacheKey }),
           ...(signal ? { signal } : {}),
           ...(readModelRegistry(ctx) ? { modelRegistry: readModelRegistry(ctx)! } : {}),
         });
@@ -1979,6 +2008,19 @@ function readToolCall(args: unknown[]): ToolCallShape | undefined {
     ...(ctx !== undefined ? { ctx } : {}),
     ...(signal ? { signal } : {}),
   };
+}
+
+/** Native cache scope only; no saved-session lookup or persistence requirement. */
+function readActingSessionId(ctx: unknown): string | undefined {
+  if (!isRecord(ctx) || !isRecord(ctx.sessionManager)) return undefined;
+  const manager = ctx.sessionManager;
+  if (typeof manager.getSessionId !== "function") return undefined;
+  try {
+    const sessionId = (manager.getSessionId as () => unknown)();
+    return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function readContextSignal(ctx: unknown): AbortSignal | undefined {

@@ -25,7 +25,9 @@ import { buildProtectionContext } from "./context";
 import { parseProtectionDecision } from "./decision";
 import { TOOL_PROTECTION_POLICY_VERSION } from "./policy";
 import {
+  protectionAuditorCacheKey,
   runProtectionAuditor,
+  type ProtectionAuditorObservation,
   type ProtectionAuditorPiModelRegistry,
 } from "./runner";
 import {
@@ -94,6 +96,13 @@ interface TestResultRecord {
   durationMs?: number;
   error?: string;
   match?: boolean;
+  /**
+   * The terminal message's own usage object, kept exactly as the installed SDK
+   * reported it (#590): one representation, no normalized copy, no invented
+   * zeros. Absent when the reply never arrived or reported no usage, so a
+   * reported `cacheRead: 0` is a real zero rather than an unavailable count.
+   */
+  usage?: Record<string, unknown>;
 }
 
 interface TestReport {
@@ -136,6 +145,13 @@ type OutputWriter = (line: string) => void;
 
 const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const MAX_PACKAGE_ROOT_DEPTH = 16;
+/**
+ * Namespace for the tester's auditor cache scope (#590). It is derived from
+ * the already-resolved saved-configuration path plus the saved model and test
+ * level, so repeat tester runs over the same profile reuse one stable identity
+ * without a persisted session, a fork, a config write, or a new option.
+ */
+const TESTER_CACHE_SCOPE_PREFIX = "pi-tool-protection-tester:";
 
 // tsc rewrites `await import(x)` in CommonJS output to require(x), which cannot
 // load Pi's ESM entry on every supported Node version. Keep a native dynamic
@@ -463,6 +479,7 @@ export async function runToolProtectionTestCli(
   const controller = new AbortController();
   const stop = (): void => controller.abort();
   process.once("SIGINT", stop);
+  const testerCacheScope = `${TESTER_CACHE_SCOPE_PREFIX}${loaded.path ?? "unsaved-configuration"}`;
   try {
     for (const testCase of testCases) {
       for (const level of levels) {
@@ -484,16 +501,24 @@ export async function runToolProtectionTestCli(
         if (!built.ok) {
           record.error = `${built.category}: ${built.message}`;
         } else {
+          // The retention sink is read only for the terminal message's own
+          // usage counts; the tester keeps no audit record and never reads a
+          // reasoning payload or a saved session.
+          let terminalUsage: Record<string, unknown> | undefined;
           const result = await runProtectionAuditor({
             selection,
             config: loaded.config,
             prompt: built.prompt,
+            fixedInstructionChars: built.fixedChars,
             input: undefined,
             cwd: testCase.proposedCall.cwd,
             timeoutMs: settings.timeoutMs,
+            cacheKey: protectionAuditorCacheKey(testerCacheScope, selection.model, level),
             modelRegistry: registry,
             signal: controller.signal,
+            observe: (observation) => { terminalUsage = terminalUsageOf(observation); },
           });
+          if (terminalUsage !== undefined) record.usage = terminalUsage;
           record.durationMs = result.durationMs;
           if (result.error !== undefined) {
             record.kind = "auditor_error";
@@ -546,6 +571,17 @@ export async function runToolProtectionTestCli(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The usage object the terminal provider message actually carried, passed
+ * through untouched. A stream that produced no terminal message, or one that
+ * reported no usage, yields nothing rather than a zeroed stand-in.
+ */
+function terminalUsageOf(observation: ProtectionAuditorObservation | undefined): Record<string, unknown> | undefined {
+  const assistant = observation?.pi?.assistant;
+  if (!isRecord(assistant) || !isRecord(assistant.usage)) return undefined;
+  return assistant.usage;
 }
 
 if (require.main === module) {

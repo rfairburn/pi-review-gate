@@ -7,11 +7,11 @@
  * quoted governing instructions, together with the structural framing and JSON
  * escaping this module adds around them. The code-owned decision instruction,
  * policy, provenance and output blocks are unchanged at every assembly, are
- * always present, and are never charged against that budget. The text actually
- * sent to an auditor is therefore the fixed instruction overhead plus at most
- * `maxContextChars` of curated variable data; the configured budget is never
- * silently raised, and total evaluation input is larger than the budget by that
- * fixed overhead.
+ * always present, are printed ahead of any variable data, and are never charged
+ * against that budget. The text actually sent to an auditor is therefore the
+ * fixed instruction overhead plus at most `maxContextChars` of curated variable
+ * data; the configured budget is never silently raised, and total evaluation
+ * input is larger than the budget by that fixed overhead.
  *
  * A budget is not a reason to refuse a call. An oversized proposal, oversized
  * governing text, or an oversized session reaches the configured auditor with
@@ -26,16 +26,30 @@
  *     prompt;
  *  2. surrounding session evidence, globally newest first regardless of origin
  *     or causal flag, so the message immediately before a proposal is retained
- *     ahead of older material;
+ *     ahead of older material, and with each record's own id, causal marking,
+ *     invocation reference, and capture clock allocated only after the quoted
+ *     text of every selected record;
  *  3. everything else previously supplied to the acting call, including the
  *     quoted governing instructions, only in the room that remains.
  * A record that does not fit whole contributes its leading portion and is
  * marked structurally (`"partial":true`), so capacity is never wasted by
  * skipping a high-priority record whole and older, less relevant data never
  * takes the place of a newer one. Session records render newest-first, in the
- * same order used for selection. Nothing is summarized by a second model, and no
- * per-item clipping commentary is added to the request: the framing above is
- * neutral structure, and no request claims a record is complete when it is not.
+ * same order used for selection.
+ *
+ * The rendered layout is not the selection order, and that is deliberate: every
+ * unchanged code-owned block is printed first, then the selected governing
+ * reference, then the selected session evidence, and the proposed call last.
+ * The fixed blocks are the unconditional shared prefix: at one level they are
+ * the same bytes at every assembly, whatever the proposal. The prefix reaches
+ * further only under a stronger condition — two assemblies that select the same
+ * governing reference and the same session records, with the same amount of
+ * each quoted, share those bytes too and first differ where the call is
+ * rendered. A different proposal can change what the budget selects, so a
+ * shared retained session does not by itself promise a deeper shared prefix.
+ * Nothing is summarized by a second model, and no per-item clipping commentary
+ * is added to the request: the framing above is neutral structure, and no
+ * request claims a record is complete when it is not.
  *
  * Every variable record is one JSON object on one line: `metadata` is the
  * host-recorded classification and `text` is quoted data. JSON quoting is what
@@ -74,7 +88,12 @@ export const PROTECTION_EVIDENCE_ORIGINS = [
 export type ProtectionEvidenceOrigin = (typeof PROTECTION_EVIDENCE_ORIGINS)[number];
 
 export interface ProtectionEvidence {
-  /** Stable host-supplied identity, echoed in the request so selection is auditable. */
+  /**
+   * Stable host-supplied identity for the record. It is carried as an optional
+   * lower-priority fact, after the quoted session text of every selected record
+   * (#590), so a record's bookkeeping can never take the capacity that carries
+   * another record's message.
+   */
   id: string;
   origin: ProtectionEvidenceOrigin;
   /** Quoted as supplied data; only the leading portion is carried when it cannot fit. */
@@ -352,18 +371,18 @@ export function buildProtectionContext(input: ProtectionContextInput): Protectio
   );
   const wireReservation = wireInput === undefined ? 0 : serializeProtectionAuditorEnvelope("", wireInput).length;
 
-  // Fixed blocks: unchanged at every assembly, outside the context budget. The
-  // instruction block is level-aware: `dangerous` applies the two harms plus an
-  // applicable explicit prohibition from a genuine current-session user message,
-  // but not general governing-instruction conformance (#542, corrected by #545).
-  // Fail-closed mechanics live in code, not in this text, and are identical at
-  // every level.
+  // Fixed blocks: unchanged at every assembly, outside the context budget, and
+  // all of them printed before any variable data. The instruction block is
+  // level-aware: `dangerous` applies the two harms plus an applicable explicit
+  // prohibition from a genuine current-session user message, but not general
+  // governing-instruction conformance (#542, corrected by #545). Fail-closed
+  // mechanics live in code, not in this text, and are identical at every level.
+  // No invocation id, count, or timestamp is rendered ahead of this prefix, so it
+  // is the stable leading material of the request.
   const fixed = [
     `TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST (policy version ${TOOL_PROTECTION_POLICY_VERSION})`,
     renderProtectionDecisionInstruction(input.level),
     renderProtectionPolicy(input.level),
-  ];
-  const fixedTail = [
     `EVIDENCE PROVENANCE\n${renderProtectionProvenanceNote()}`,
     `OUTPUT CONTRACT\n${renderProtectionOutputContract()}`,
   ];
@@ -372,12 +391,17 @@ export function buildProtectionContext(input: ProtectionContextInput): Protectio
   // the higher-priority sections left. The proposal's invocation identity is
   // deliberately held out of the leading step: the priority puts the tool name and
   // the leading submitted arguments ahead of invocation ids, working directory,
-  // role, and lineage, and the quoted governing reference is the last material
-  // filled, so those facts take the room the proposal and session messages left.
+  // role, and lineage. Session records are filled the same way: their quoted text
+  // is selected first across the whole section, and each record's id, causal
+  // marking, invocation reference, and capture clock are attached afterwards from
+  // the room that leaves, never ahead of another record's message. The quoted
+  // governing reference is the last material filled, so the invocation and record
+  // identity facts take the room the proposal and all selected session-message
+  // content left.
   let room = maxContextChars - wireReservation;
   const callFill = fillSection(CALL_SECTION_HEADER, [{ ...renderedCall.record, identity: undefined }], undefined, room, false);
   room -= callFill.used;
-  const evidenceFill = fillSection(EVIDENCE_SECTION_HEADER, evidence.map(evidenceRecord), undefined, room, true);
+  const evidenceFill = fillSection(EVIDENCE_SECTION_HEADER, evidence.map(evidenceRecord), undefined, room, true, true);
   room -= evidenceFill.used;
   let callBlock = callFill.block;
   if (callFill.lines.length === 1 && room > 0) {
@@ -397,7 +421,16 @@ export function buildProtectionContext(input: ProtectionContextInput): Protectio
   };
   const governingFill = fillSection(GOVERNING_SECTION_HEADER, [governingRecord], GOVERNING_SECTION_FRAMING, room, false);
   room -= governingFill.used;
-  const blocks = [callBlock, evidenceFill.block, governingFill.block].filter((block) => block.length > 0);
+  // Cache-friendly render order: the fixed blocks and any identical selected
+  // reference and session lead, and the section that every assembly re-renders —
+  // the proposed call — is rendered last, after which nothing else is printed.
+  // The unconditional shared prefix is the fixed blocks; a deeper shared prefix
+  // additionally requires the same selected reference and session records with
+  // the same quoted portions, which a differently sized proposal can change.
+  // This is a layout choice only: the fill order above still puts the proposed
+  // call first in the budget and the governing reference last, and no
+  // instruction is added after the call.
+  const blocks = [governingFill.block, evidenceFill.block, callBlock].filter((block) => block.length > 0);
 
   const includedEvidenceIds = evidenceFill.included.map((index) => evidence[index]!.id);
   const includedIndexes = new Set(evidenceFill.included);
@@ -419,7 +452,7 @@ export function buildProtectionContext(input: ProtectionContextInput): Protectio
   // to the request, so `fixedChars` is the same at every budget.
   const variableChars = variableBlock.length > 0 ? escapedUnits(`\n\n${variableBlock}`) : 0;
   const variableTextChars = variableBlock.length > 0 ? variableBlock.length + 2 : 0;
-  const prompt = [...fixed, ...(variableBlock.length > 0 ? [variableBlock] : []), ...fixedTail].join("\n\n");
+  const prompt = [...fixed, ...(variableBlock.length > 0 ? [variableBlock] : [])].join("\n\n");
   return {
     ok: true,
     prompt,
@@ -492,10 +525,12 @@ interface VariableRecord {
   /** The submitted data or quoted session text itself. */
   text: string;
   /**
-   * Optional host facts about the record (invocation id, working directory,
-   * role, lineage). They are lower priority than `text`: they are included only
-   * with the room the data leaves, and are dropped whole rather than displacing
-   * the operation or its arguments.
+   * Optional host facts about the record (for a proposal: invocation id,
+   * working directory, role, lineage; for session evidence: record id, causal
+   * marking, the invocation a gate record names, capture clock). They are lower
+   * priority than `text`: they are included only with the room the data of the
+   * selected records leaves, and are dropped whole rather than displacing the
+   * operation, its arguments, or another record's quoted message.
    */
   identity?: string;
   /** The text is already only a leading portion of what the host was given. */
@@ -541,16 +576,27 @@ function partitionEvidence(
   return { evidence: items, requiredIds, omissions };
 }
 
+/**
+ * One session record. Origin and its trust wording are mandatory: a quoted
+ * message without its provenance would be indistinguishable from another
+ * origin's text. The record's own bookkeeping — id, the causal marking, the
+ * invocation a gate record refers to, and the capture clock — is carried as
+ * optional identity facts, allocated only after the quoted text of every
+ * selected record, so the framing of one record can never be the reason an
+ * adjacent message is missing from the request (#590).
+ */
 function evidenceRecord(item: ProtectionEvidence): VariableRecord {
   const metadata = [
     `origin=${item.origin}`,
     `trust=${ORIGIN_TRUST[item.origin]}`,
+  ].join(" | ");
+  const identity = [
     `id=${fact(item.id)}`,
     ...(item.causal === true ? ["causal=yes (host-established link to this proposal)"] : []),
     ...(item.invocationId ? [`invocation=${fact(item.invocationId)}`] : []),
     ...(item.createdAt !== undefined ? [`at=${item.createdAt}`] : []),
   ].join(" | ");
-  return { metadata, text: item.text, ...(item.partial === true ? { partial: true } : {}) };
+  return { metadata, text: item.text, identity, ...(item.partial === true ? { partial: true } : {}) };
 }
 
 /**
@@ -584,7 +630,12 @@ function fact(value: string): string {
  * first loses its identity facts, then contributes the longest leading portion
  * of its data that does fit and is marked `"partial":true`, after which filling
  * stops because the capacity is used up rather than left to older, less
- * relevant material. A section with no room for any record is not opened at all.
+ * relevant material. With `identityLast` that priority is applied across the
+ * whole section instead of inside one record: every selected record is filled
+ * from its quoted data first, and only the room that leaves is then spent on
+ * those records' identity facts, in selection order, so one record's
+ * bookkeeping can never be quoted ahead of an older record's message text. A
+ * section with no room for any record is not opened at all.
  */
 function fillSection(
   header: string,
@@ -592,6 +643,7 @@ function fillSection(
   trailing: string | undefined,
   room: number,
   newestFirst: boolean,
+  identityLast = false,
 ): { block: string; used: number; included: number[]; lines: Array<{ index: number; line: string }> } {
   const empty = { block: "", used: 0, included: [] as number[], lines: [] as Array<{ index: number; line: string }> };
   if (records.length === 0 || room <= 0) return empty;
@@ -602,7 +654,7 @@ function fillSection(
       + (trailing === undefined ? 0 : escapedUnits("\n") + escapedUnits(trailing));
   if (room <= overhead) return empty;
   let left = room - overhead;
-  const chosen: Array<{ index: number; line: string }> = [];
+  const chosen: Array<{ index: number; line: string; record: VariableRecord; dataChars: number; whole: boolean }> = [];
   const order = records.map((_, index) => index);
   if (newestFirst) order.reverse();
   for (const index of order) {
@@ -612,12 +664,30 @@ function fillSection(
     // cannot leave its separator charged.
     const gap = chosen.length > 0 ? escapedUnits("\n") : 0;
     if (left < gap) break;
-    const fitted = fitRecord(record, left - gap);
+    const fitted = fitRecord(identityLast ? { ...record, identity: undefined } : record, left - gap);
     // Keep any nonempty leading portion; never spend capacity on an empty shell.
     if (fitted === undefined || (!fitted.whole && fitted.dataChars === 0)) break;
     left -= gap + fitted.chars;
-    chosen.push({ index, line: fitted.line });
+    chosen.push({ index, line: fitted.line, record, dataChars: fitted.dataChars, whole: fitted.whole });
     if (!fitted.whole) break;
+  }
+  // The identity facts of the selected records come last, globally: a newer
+  // record's id, causal marking, invocation reference, or capture clock is
+  // attached only once the quoted text of every record this budget could carry
+  // is already quoted, and a fact block that no longer fits is dropped rather
+  // than shortening a quote or evicting an older record.
+  if (identityLast) {
+    for (const item of chosen) {
+      if (item.record.identity === undefined || left <= 0) break;
+      const kept = item.record.text.slice(0, safeCut(item.record.text, item.dataChars));
+      const withIdentity = renderRecord(item.record, kept, item.record.partial === true || !item.whole, item.record.identity);
+      // The cost of attaching the facts is what the rendered line grows by, so
+      // the section's accounting stays exact.
+      const delta = escapedUnits(withIdentity) - escapedUnits(item.line);
+      if (delta > left) continue;
+      left -= delta;
+      item.line = withIdentity;
+    }
   }
   if (chosen.length === 0) return empty;
   const body = [header, ...chosen.map((item) => item.line), ...(trailing === undefined ? [] : [trailing])];
@@ -638,9 +708,12 @@ function fillSection(
  * arbitrary embedded text and keeps a bounded portion well-formed instead of
  * leaving it to look like a complete record. Field order is the priority order:
  * the proposed operation or the record's origin and trust, then the quoted data,
- * then the optional host facts about the invocation, so what is being proposed
- * is what the budget protects first and no bookkeeping field can be an
- * indivisible prerequisite for the operation itself.
+ * then the structural marker qualifying that data, then the optional host facts
+ * about the invocation or about the record itself, so what is being proposed is
+ * what the budget protects first, no bookkeeping field can be an indivisible
+ * prerequisite for the operation or for another record's quoted message, and a
+ * record that goes from whole to bounded keeps the bytes ahead of its quoted
+ * data identical.
  */
 function renderRecord(
   record: VariableRecord,
@@ -650,8 +723,8 @@ function renderRecord(
 ): string {
   return JSON.stringify({
     metadata: record.metadata,
-    ...(partial ? { partial: true } : {}),
     text,
+    ...(partial ? { partial: true } : {}),
     ...(identity === undefined ? {} : { identity }),
   });
 }

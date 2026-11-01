@@ -38,7 +38,7 @@ import {
   TOOL_PROTECTION_BOOTSTRAP_ENV,
   type ToolProtectionLaunchPin,
 } from "../src/tool-protection/coordinator";
-import { PROTECTION_AUDITOR_PROTOCOL, serializeProtectionAuditorEnvelope } from "../src/tool-protection/runner";
+import { protectionAuditorCacheKey, PROTECTION_AUDITOR_PROTOCOL, serializeProtectionAuditorEnvelope } from "../src/tool-protection/runner";
 import type {
   ProtectionAuditorPiModelRegistry,
   ProtectionAuditorRequest,
@@ -172,11 +172,15 @@ function auditorQueue(results: Scripted[]) {
     // Mirror the real runner's contract: an installed retention observer is
     // called once with what the transport carried, and only a reply that
     // actually exists is reported as a terminal message.
+    const boundary = request.fixedInstructionChars ?? 0;
     request.observe?.({
       transport: "pi-in-process",
       pi: {
-        systemPrompt: "Synthetic decision-only route instruction.",
-        prompt: request.prompt,
+        // The real runner reports the request as it was actually split: the route
+        // instruction plus the unchanged fixed prefix in system text, and the
+        // prompt from the supplied boundary onward as the one user message.
+        systemPrompt: ["Synthetic decision-only route instruction.", ...(boundary > 0 ? [request.prompt.slice(0, boundary)] : [])].join("\n\n"),
+        prompt: request.prompt.slice(boundary),
         thinkingLevel: "high",
         model: { provider: "synthetic", id: "model" },
         ...(result.output === undefined ? {} : { assistant: { role: "assistant", content: [{ type: "text", text: result.output }] } }),
@@ -264,6 +268,106 @@ function firstText(value: unknown): string {
 }
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/**
+ * The variable context exactly as the runner placed it in the sent request: the
+ * suffix starting at the earliest actually rendered variable section header. The
+ * unchanged fixed blocks are all printed ahead of it and the proposed call is
+ * rendered last, so this suffix is the quantity the context budget bounds.
+ * Quoted variable data is JSON-escaped, so audited text cannot print one of
+ * these headers ahead of the real one.
+ */
+function sentVariable(prompt: string): string {
+  const starts = [
+    "\n\nGOVERNING INSTRUCTIONS OF THE ACTING AGENT",
+    "\n\nRECENT SESSION EVIDENCE",
+    "\n\nPROPOSED TOOL CALL",
+  ].map((marker) => prompt.indexOf(marker)).filter((position) => position >= 0);
+  assert.ok(starts.length > 0, "the request lost its variable context");
+  return prompt.slice(Math.min(...starts));
+}
+
+/**
+ * The proposal's own record line: the one variable record whose mandatory
+ * metadata names the proposed operation. Evidence records carry their own
+ * `invocation=` facts about other calls, so a first-match search of the whole
+ * request would read an evidence record's id instead of the proposal's.
+ */
+function proposalRecordLine(prompt: string): string {
+  const line = sentVariable(prompt).split("\n").find((value) => value.startsWith('{"metadata":"tool='));
+  assert.ok(line, "the request lost its proposed-call record");
+  return line;
+}
+
+test("auditor cache identity follows the native conversation without requiring saved sessions", async () => {
+  const { coordinator, calls } = coordinatorHarness();
+  let sessionId = "acting-conversation-a";
+  const ctx = hostContext({ sessionManager: {
+    getSessionId: () => sessionId,
+    getSessionFile: () => { throw new Error("cache identity must not look up a saved session"); },
+  } });
+  for (let index = 0; index < 2; index += 1) {
+    assert.equal(await coordinator.admitToolCall(callArgs(`cache-${index}`, "read", { path: `fixture-${index}.txt` }, ctx)), undefined);
+  }
+  assert.equal(calls.length, 2, "each proposal still requires a fresh auditor invocation");
+  assert.equal(calls[0]!.cacheKey, protectionAuditorCacheKey(
+    "pi-tool-protection:acting-session:acting-conversation-a", "synthetic/model", "aligned",
+  ));
+  assert.equal(calls[1]!.cacheKey, calls[0]!.cacheKey, "invocation changes do not rotate the key");
+  assert.notEqual(calls[1]!.prompt, calls[0]!.prompt, "the next audit receives its own proposal");
+  assert.equal(calls[0]!.observe, undefined, "caching does not enable auditor-session recording");
+  sessionId = "acting-conversation-b";
+  assert.equal(await coordinator.admitToolCall(callArgs("cache-other", "read", { path: "other.txt" }, ctx)), undefined);
+  assert.notEqual(calls[2]!.cacheKey, calls[0]!.cacheKey, "the host conversation controls cache scope");
+});
+
+test("an unavailable native session identity does not stop an audit or invent a cache scope", async () => {
+  for (const manager of [
+    {},
+    { getSessionId: () => undefined },
+    { getSessionId: () => { throw new Error("identity unavailable"); } },
+  ]) {
+    const { coordinator, calls } = coordinatorHarness();
+    assert.equal(await coordinator.admitToolCall(callArgs("cache-absent", "read", { path: "fixture.txt" }, hostContext({ sessionManager: manager }))), undefined);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.cacheKey, undefined);
+  }
+});
+
+test("the coordinator hands the auditor the assembled request's own fixed-instruction boundary", async () => {
+  const { coordinator, calls } = coordinatorHarness();
+  for (const id of ["split-0", "split-1"]) {
+    assert.equal(await coordinator.admitToolCall(callArgs(id, "read", { path: `SPLIT-PATH-${id}.txt` }, hostContext())), undefined);
+  }
+  assert.equal(calls.length, 2, "each proposal is its own audit");
+  const boundaries: number[] = [];
+  for (const [index, call] of calls.entries()) {
+    const invocation = `SPLIT-PATH-split-${index}`;
+    const boundary = call.fixedInstructionChars;
+    assert.equal(typeof boundary, "number", "the auditor request carries the caller's boundary");
+    assert.ok(
+      Number.isInteger(boundary) && (boundary ?? 0) > 0 && (boundary ?? 0) < call.prompt.length,
+      `the boundary is a usable prefix length inside the sent prompt (${boundary} of ${call.prompt.length})`,
+    );
+    boundaries.push(boundary!);
+    const fixedPrefix = call.prompt.slice(0, boundary);
+    const variableSuffix = call.prompt.slice(boundary!);
+    // The prefix is exactly the unchanged code-owned blocks: it opens the request,
+    // carries each fixed block, and stops where the variable context begins.
+    assert.ok(fixedPrefix.startsWith("TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST"), "the fixed blocks are the supplied prefix");
+    for (const marker of ["EVIDENCE PROVENANCE", "OUTPUT CONTRACT"]) {
+      assert.ok(fixedPrefix.includes(marker), `${marker} is missing from the supplied prefix`);
+      assert.ok(!variableSuffix.includes(marker), `${marker} leaked into the variable suffix`);
+    }
+    assert.ok(variableSuffix.startsWith("\n\nGOVERNING INSTRUCTIONS OF THE ACTING AGENT"), "the suffix starts at the first variable section");
+    assert.ok(variableSuffix.includes("\n\nPROPOSED TOOL CALL"), "the proposal stays in the variable suffix");
+    assert.ok(variableSuffix.includes(invocation), "this call's own proposal travels in the user-role suffix");
+    assert.ok(!fixedPrefix.includes(invocation), "quoted variable data is not part of the fixed prefix");
+    assert.equal(fixedPrefix.length + variableSuffix.length, call.prompt.length, "prefix and suffix are the whole generated request");
+  }
+  assert.equal(boundaries[0], boundaries[1], "one level supplies one authoritative boundary, whatever the proposal");
+  assert.notEqual(calls[0]!.prompt, calls[1]!.prompt, "the variable context still differs per audit");
+});
 
 test("off leaves native authority and results unchanged with no audit or annotation", async () => {
   const host = fakeHost();
@@ -591,7 +695,7 @@ test("discovery never waits on the auditor, the context budget, or a configurati
   assert.equal(tinyCall, undefined, "a small context budget is not a reason to refuse the call");
   assert.equal(tiny.calls.length, 1, "the call reached the configured auditor");
   const tinyPrompt = tiny.calls[0]!.prompt;
-  const tinyVariable = tinyPrompt.slice(tinyPrompt.indexOf("\n\nPROPOSED TOOL CALL"), tinyPrompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+  const tinyVariable = sentVariable(tinyPrompt);
   assert.ok(tinyVariable.length <= 1_000, `the sent variable context was ${tinyVariable.length} characters at a 1000 budget`);
   assert.ok(tinyPrompt.length > 1_000, "the unchanged fixed instruction blocks sit outside that budget");
 
@@ -2340,10 +2444,13 @@ test("oversized causal evidence is retained bounded and still reaches the audit 
   assert.ok(!prompt.includes("INABILITY-TAIL"), "the oversized tail was bounded, not smuggled through");
   assert.ok(prompt.includes("a".repeat(1_000)), "the retained leading portion of the oversized record is what was sent");
   assert.ok(prompt.includes("\"partial\":true"), "the bounded record says so structurally");
-  assert.ok((prompt.match(/causal=yes/g) ?? []).length >= 2, "the retained chain is still marked causal");
+  // The retained records keep their mandatory provenance; their record ids and
+  // causal markings are optional facts, and this budget spent that capacity on
+  // the quoted text instead (#590).
+  assert.ok((prompt.match(/"metadata":"origin=/g) ?? []).length >= 2, "both retained records keep their origin and trust labels");
   // The variable context the runner was actually handed respects the budget,
   // while the unchanged fixed blocks sit outside it.
-  const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+  const variable = sentVariable(prompt);
   assert.ok(variable.length <= 4_000, `the sent variable context was ${variable.length} characters at a 4000 budget`);
   assert.ok(prompt.length > 4_000, "the fixed instruction blocks are additional to that budget");
 });
@@ -2414,7 +2521,7 @@ test("an oversized newest branch message contributes its leading portion instead
       assert.ok(!prompt.includes("OLDER-BRANCH") && !prompt.includes("MIDDLE-BRANCH"),
         "older records did not take the capacity the newest record was quoted from");
     }
-    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    const variable = sentVariable(prompt);
     assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} at a ${maxContextChars} budget`);
   }
 });
@@ -2478,7 +2585,7 @@ test("an oversized live input and the branch's identical copy stay one user-orig
       "the one record is the live record with its user provenance, not the branch's unknown-origin copy");
     assert.ok(records[0]!.includes('"partial":true'), "and it says structurally that only its leading portion is carried");
     assert.ok(!prompt.includes("OVERSIZE-TAIL"), "the oversized tail stayed bounded");
-    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    const variable = sentVariable(prompt);
     assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
     assert.ok(prompt.length > maxContextChars, "the unchanged fixed instruction blocks are additional to that budget");
   }
@@ -2510,12 +2617,12 @@ test("a branch message sharing an oversized prefix but differing later is never 
     const prompt = calls[0]!.prompt;
     const records = prompt.split("\n").filter((line) => line.includes("LOOKALIKE-HEAD"));
     assert.equal(records.length, 1, `the budget carried ${records.length} copies of the lookalike prefix at a ${maxContextChars} budget`);
-    assert.ok(records[0]!.includes('"metadata":"origin=unknown |') && records[0]!.includes("id=branch-0"),
+    assert.ok(records[0]!.includes('"metadata":"origin=unknown |'),
       "the distinct branch message stays its own unknown-origin record instead of being deduped into the live user record");
     assert.ok(records[0]!.includes('"partial":true'), "and it is marked as a leading portion, never a complete statement");
     assert.ok(!prompt.includes('"metadata":"origin=user |'),
       "no user-labelled record carries the distinct branch text");
-    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    const variable = sentVariable(prompt);
     assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
   }
 });
@@ -2549,7 +2656,7 @@ test("an oversized original with boundary whitespace and its identical branch co
     assert.ok(records[0]!.includes('"metadata":"origin=user |'),
       "the one record keeps the live user provenance instead of the branch's unknown-origin copy");
     assert.ok(records[0]!.includes('"partial":true'), "and it says structurally that only its leading portion is carried");
-    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    const variable = sentVariable(prompt);
     assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
   }
 });
@@ -2579,11 +2686,11 @@ test("oversized originals differing only in boundary whitespace are never merged
     const prompt = calls[0]!.prompt;
     const records = prompt.split("\n").filter((line) => line.includes("WSLOOKALIKE-HEAD"));
     assert.equal(records.length, 1, `the budget carried ${records.length} records for the boundary-whitespace lookalike at a ${maxContextChars} budget`);
-    assert.ok(records[0]!.includes('"metadata":"origin=unknown |') && records[0]!.includes("id=branch-0"),
+    assert.ok(records[0]!.includes('"metadata":"origin=unknown |'),
       "the distinct branch message stays its own unknown-origin record instead of being merged into the live user record");
     assert.ok(!prompt.includes('"metadata":"origin=user |'),
       "no user-labelled record carries the distinct branch text");
-    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    const variable = sentVariable(prompt);
     assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
   }
 });
@@ -2629,7 +2736,7 @@ test("equal capture clocks rank live evidence by capture sequence, not by retent
       `the newest input is the first quoted record at a ${maxContextChars} budget, not an older retained causal record`);
     const approvalLine = prompt.split("\n").find((line) => line.includes("APPROVAL-ONE"));
     if (approvalLine !== undefined) {
-      assert.ok(approvalLine.includes("causal=yes"), "a retained causal record keeps its host-established marking");
+      assert.ok(approvalLine.includes('"metadata":"origin=user |'), "a retained causal record keeps its mandatory provenance while its optional record facts yield to quoted text");
       assert.ok(prompt.indexOf("NEWEST-INPUT") < prompt.indexOf("APPROVAL-ONE"),
         "an older retained causal approval never outranks the newest input in the rendered chronology");
     }
@@ -2639,7 +2746,7 @@ test("equal capture clocks rank live evidence by capture sequence, not by retent
         "the oversized older causal record is quoted after the newest input, not ahead of it");
     }
     assert.ok(prompt.startsWith("TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST"), "the unchanged fixed policy block still opens the request");
-    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    const variable = sentVariable(prompt);
     assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
     assert.ok(prompt.length > maxContextChars, "the fixed instruction blocks are additional to that budget");
   }
@@ -2659,7 +2766,7 @@ test("the real auditor seam receives a bounded context for an oversized proposal
       "an oversized proposal reaches the configured auditor instead of a capacity refusal");
     assert.equal(calls.length, 1, "one audit, and its verdict decides the call");
     const prompt = calls[0]!.prompt;
-    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    const variable = sentVariable(prompt);
     assert.ok(variable.length <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
     assert.ok(prompt.length > maxContextChars, "the unchanged fixed instruction blocks are additional to the context budget");
     assert.ok(prompt.includes("SEND-FIRST-TOKEN"), "the leading submitted operation data is what the budget protects");
@@ -2731,10 +2838,7 @@ test("the real serialized external envelope stays inside the context budget (#59
       input: { invocation?: Record<string, unknown>; context: Record<string, unknown> };
     };
     assert.equal(envelope.version, PROTECTION_AUDITOR_PROTOCOL);
-    const variable = envelope.prompt.slice(
-      envelope.prompt.indexOf("\n\nPROPOSED TOOL CALL"),
-      envelope.prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"),
-    );
+    const variable = sentVariable(envelope.prompt);
     assert.ok(variable.length > 0, "the envelope lost its variable context");
     // What this request contributes to the bytes on stdin: the request text is
     // itself carried as a JSON string, and the side payload is serialized beside
@@ -2797,7 +2901,7 @@ function externalContribution(drafts: AuditorRecordOpenDraft[]): { prompt: strin
   assert.ok(requestText.length > 0, "the record reports the exact bytes handed to the program's stdin");
   const envelope = JSON.parse(requestText) as { prompt: string };
   const prompt = envelope.prompt;
-  const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+  const variable = sentVariable(prompt);
   assert.ok(variable.length > 0, "the envelope lost its variable context");
   const fixedText = prompt.replace(variable, "");
   return { prompt, contribution: requestText.length - (JSON.stringify(fixedText).length - 2) };
@@ -3052,7 +3156,7 @@ test("an oversized live tool result contributes its prefix instead of an omissio
     assert.ok(record.text.startsWith("Native read result (call large-result):\nTOOL-RESULT-HEAD "));
     assert.equal(record.partial, true);
     assert.doesNotMatch(prompt, /TOOL-RESULT-TAIL|Host omission|HIDDEN-REASONING-MUST-NOT-BE-SENT/);
-    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    const variable = sentVariable(prompt);
     assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars);
   }
 });
@@ -3363,7 +3467,15 @@ test("retention On records one complete record per actual invocation and leaves 
   assert.equal(pass!.prompt, calls[0]!.prompt, "the record keeps the exact generated auditor prompt");
   assert.deepEqual(pass!.outcome, { status: "decision", decision: "PASS", reason: "synthetic read is authorized" });
   assert.equal(pass!.observation?.transport, "pi-in-process");
-  assert.equal(pass!.observation?.pi?.prompt, calls[0]!.prompt);
+  assert.equal(
+    pass!.observation?.pi?.prompt,
+    calls[0]!.prompt.slice(calls[0]!.fixedInstructionChars ?? 0),
+    "the retained user text is the actual one user message, not the whole prompt",
+  );
+  assert.ok(
+    (pass!.observation?.pi?.systemPrompt ?? "").includes(calls[0]!.prompt.slice(0, calls[0]!.fixedInstructionChars ?? 0)),
+    "the retained system text carries the unchanged fixed prefix",
+  );
   assert.deepEqual(pass!.observation?.pi?.assistant, {
     role: "assistant",
     content: [{ type: "text", text: '{"decision":"PASS","reason":"synthetic read is authorized"}' }],
@@ -4520,8 +4632,9 @@ test("a reload past the row bound recovers every older refusal and save warning 
         (request: ProtectionAuditorRequest) => {
           // The envelope side field carries only bounded host identity, so this
           // scripted auditor reads the invocation id out of the proposal record
-          // in the request text it was actually sent.
-          const match = /invocation=([A-Za-z0-9-]+)/.exec(request.prompt);
+          // in the request text it was actually sent: the proposal's own record,
+          // never an evidence record naming some other invocation.
+          const match = /invocation=([A-Za-z0-9-]+)/.exec(proposalRecordLine(request.prompt));
           const callId = match?.[1] ?? "";
           const admitted = callId.startsWith("wide-pass-") || callId === "wide-warn-0";
           return Promise.resolve({

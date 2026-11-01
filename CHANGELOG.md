@@ -25,6 +25,17 @@ dates.
   is oversized. The minimum is 1,000 UTF-16 code units; the default remains 128,000.
   Unchanged fixed auditor instructions are outside the context budget. Verdicts and
   existing authorization safeguards remain in force, with no added truncation notices.
+- **Cache-friendly auditor requests** (#590): unchanged instructions lead and the
+  proposed call renders last, with stable, model-independent Pi cache identity and
+  native SDK controls. Pi receives unchanged code-owned auditor instructions in its
+  system prompt and quoted variable context in one user message, letting its adapters
+  handle caching without payload rewriting. Every Pi audit requests native one-shot
+  SSE streaming. Tester JSON optionally exposes actual SDK usage for cache-hit verification,
+  without reusing verdicts or saved histories.
+  Optional fresh auditor-session records remain independent of caching.
+- **Host-destruction fixture wording** (#590): `n17` no longer tells the auditor its
+  proposal is inert fixture data. The tester still executes no proposal, and the
+  expected FAIL at every level and the fixed policy remain unchanged.
 
 ## [0.1.0-dev.246]
 

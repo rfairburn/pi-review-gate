@@ -36,6 +36,7 @@ function writeFakeSdk(
   expected: Record<string, Record<string, string>>,
   seen: string,
   relativeDir = "sdk",
+  modelSpec = { id: "fake", provider: "tester", api: "openai-completions" },
 ): string {
   const sdk = join(root, relativeDir);
   mkdirSync(join(sdk, "dist"), { recursive: true });
@@ -51,7 +52,7 @@ function writeFakeSdk(
 import fs from "node:fs";
 import assert from "node:assert/strict";
 const expected = ${JSON.stringify(expected)};
-const model = { id: "fake", provider: "tester" };
+const model = ${JSON.stringify(modelSpec)};
 export class ModelRuntime {
   static async create(options) {
     assert.equal(options.refreshOnCreate, false);
@@ -62,7 +63,7 @@ export class ModelRuntime {
 export class ModelRegistry {
   constructor(runtime) { this.runtime = runtime; }
   getAll() { return [model]; }
-  find(provider, id) { return provider === "tester" && id === "fake" ? model : undefined; }
+  find(provider, id) { return provider === model.provider && id === model.id ? model : undefined; }
   getError() { return undefined; }
   async *streamSimple(selected, context, options) {
     assert.equal(selected, model);
@@ -71,7 +72,17 @@ export class ModelRegistry {
     assert.equal(options.toolChoice, "none");
     assert.equal(options.maxRetries, 0);
     const prompt = context.messages[0].content;
-    const level = prompt.match(/level "(dangerous|aligned|workspace)"/)[1];
+    assert.match(context.systemPrompt, /TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST/);
+    assert.match(context.systemPrompt, /EVIDENCE PROVENANCE/);
+    assert.match(context.systemPrompt, /OUTPUT CONTRACT/);
+    assert.doesNotMatch(prompt, /TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST/);
+    // The variable context — the quoted governing reference, session evidence,
+    // and the proposed call — stays in the one user message for every provider.
+    assert.match(prompt, /PROPOSED TOOL CALL/);
+    assert.doesNotMatch(context.systemPrompt, /PROPOSED TOOL CALL|GOVERNING INSTRUCTIONS OF THE ACTING AGENT|RECENT SESSION EVIDENCE/);
+    assert.equal(options.transport, "sse", "the one-shot transport safeguard is requested for every provider");
+    assert.equal(Object.hasOwn(options, "onPayload"), false, "no provider-specific payload rewriting");
+    const level = context.systemPrompt.match(/level "(dangerous|aligned|workspace)"/)[1];
     const id = prompt.match(/invocation=(inv-[a-z0-9-]+)/)[1];
     const key = id + ":" + level;
     const record = Object.entries(expected).find(([, byKey]) => Object.hasOwn(byKey, key));
@@ -82,6 +93,8 @@ export class ModelRegistry {
     fs.appendFileSync(${JSON.stringify(seen)}, JSON.stringify({
       case: caseId, level, toolChoice: options.toolChoice, maxRetries: options.maxRetries,
       reasoning: options.reasoning,
+      sessionId: options.sessionId ?? null,
+      transport: options.transport ?? null,
     }) + "\\n");
     const mode = process.env.TEST_RESPONSE;
     if (mode === "error") {
@@ -96,11 +109,22 @@ export class ModelRegistry {
           : expectedVerdict,
         reason: "scripted fixture response",
       });
+    // One provider-shaped usage report per request, scripted by the fixture:
+    // SCRIPT_CACHE_HIT selects the counts a provider that reported a cached
+    // prefix would carry, and the default is a run that reported none. These
+    // are scripted counts, never a claim about a live provider's cache.
+    const reportedHit = process.env.SCRIPT_CACHE_HIT === "1";
+    const cacheRead = reportedHit ? 512 : 0;
+    const cacheWrite = reportedHit ? 0 : 7;
     yield {
       type: "done",
       message: {
-        role: "assistant", provider: "tester", model: "fake", stopReason: "stop",
+        role: "assistant", provider: model.provider, model: model.id, api: model.api, stopReason: "stop",
         content: [{ type: "text", text }],
+        usage: {
+          input: 120, output: 9, cacheRead, cacheWrite, totalTokens: 129 + cacheRead + cacheWrite,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
       },
     };
   }
@@ -648,6 +672,106 @@ test("saved-config and auditor failures are reported truthfully, and external au
     assert.equal(result.status, 2);
     assert.match(result.stderr, /Pi-backed auditors only/);
     assert.doesNotMatch(result.stderr, /PROPOSAL_EXECUTION_FORBIDDEN/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Stable auditor cache identity and reported usage in the tester (#590).
+ *
+ * Scripted-provider fixtures only: the identity is what the tester asks the SDK
+ * to use, never proof that any provider hit its cache, and the usage counts are
+ * the scripted terminal message's own. No live provider is contacted, no warm-up
+ * or second-pass request is required, and nothing is persisted.
+ */
+test("repeat tester runs reuse one stable cache identity per profile and record the terminal usage as reported", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-review-tool-test-cache-"));
+  try {
+    const guard = writeGuard(root);
+    const env = isolatedEnv(root);
+    const seen = join(root, "requests.jsonl");
+    const testCase = TOOL_PROTECTION_TEST_CASES[0]!;
+    const invocation = testCase.proposedCall.invocationId;
+    const expected = {
+      [testCase.id]: {
+        [`${invocation}:dangerous`]: testCase.expected.dangerous,
+        [`${invocation}:aligned`]: testCase.expected.aligned,
+      },
+    };
+    // A completions-style profile: the SDK's own adapter decides what a session
+    // id means for this provider, and the runner asks every provider for the same
+    // published transport option without inspecting the model.
+    const sdk = writeFakeSdk(root, expected, seen, "sdk", {
+      id: "deepseek-chat",
+      provider: "deepseek",
+      api: "openai-completions",
+    });
+    const config = join(root, "profile-a.json");
+    writeFileSync(config, JSON.stringify({
+      enabled: false,
+      toolProtection: { level: "off", auditor: { source: "pi", model: "deepseek/deepseek-chat", thinkingLevel: "off" } },
+    }));
+    const configCopy = join(root, "profile-b.json");
+    writeFileSync(configCopy, readFileSync(config, "utf8"));
+    const configBefore = readFileSync(config, "utf8");
+    const runDangerous = ["--case", "1", "--level", "dangerous", "--json", "--config", config, "--pi-package", sdk];
+
+    const first = invoke(guard, runDangerous, env);
+    assert.equal(first.status, 0, first.stderr);
+    const second = invoke(guard, runDangerous, env, { SCRIPT_CACHE_HIT: "1" });
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(second.status, 0, second.stderr);
+    const otherLevel = invoke(guard, ["--case", "1", "--level", "aligned", "--json", "--config", config, "--pi-package", sdk], env);
+    assert.equal(otherLevel.status, 0, otherLevel.stderr);
+    const otherProfile = invoke(guard, ["--case", "1", "--level", "dangerous", "--json", "--config", configCopy, "--pi-package", sdk], env);
+    assert.equal(otherProfile.status, 0, otherProfile.stderr);
+
+    const requests = readFileSync(seen, "utf8").trim().split("\n").map((line) => JSON.parse(line) as {
+      level: string;
+      toolChoice: string;
+      maxRetries: number;
+      sessionId: string | null;
+      transport: string | null;
+    });
+    assert.equal(requests.length, 4);
+    assert.ok(requests.every((item) => typeof item.sessionId === "string" && /^[0-9a-f]{64}$/.test(item.sessionId)),
+      `each request must carry a derived identity: ${JSON.stringify(requests)}`);
+    assert.equal(requests[1]!.sessionId, requests[0]!.sessionId, "the same saved profile, model, and level reuse one identity across runs");
+    assert.notEqual(requests[2]!.sessionId, requests[0]!.sessionId, "a different protection level is a different identity");
+    assert.notEqual(requests[3]!.sessionId, requests[0]!.sessionId, "a different saved configuration is a different identity");
+    assert.ok(requests.every((item) => item.transport === "sse"), "every provider receives the same one-shot transport option: ${JSON.stringify(requests.map((item) => item.transport))}");
+    assert.ok(requests.every((item) => item.toolChoice === "none" && item.maxRetries === 0), "the auditor controls are unchanged");
+
+    const firstRecord = JSON.parse(first.stdout).results[0];
+    const secondRecord = JSON.parse(second.stdout).results[0];
+    // The counts are the terminal message's own: a real zero stays a zero, and
+    // the tester does not invent a normalized second copy.
+    assert.deepEqual(firstRecord.usage, {
+      input: 120,
+      output: 9,
+      cacheRead: 0,
+      cacheWrite: 7,
+      totalTokens: 136,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    });
+    assert.equal(secondRecord.usage.cacheRead, 512, "a reported cached read is recorded as the provider reported it");
+    assert.equal(secondRecord.usage.cacheWrite, 0, "a reported zero cache write stays a zero");
+    assert.deepEqual(Object.keys(firstRecord).sort(), [
+      "actual", "case", "durationMs", "expected", "kind", "level", "match", "raw", "reason", "usage",
+    ], "one usage representation per result, with no raw or normalized mirror");
+    assert.equal(JSON.parse(first.stdout).usage, undefined, "no duplicate report-level usage");
+    assert.equal(readFileSync(config, "utf8"), configBefore, "the saved configuration is not rewritten");
+
+    const errored = invoke(guard, runDangerous, env, { TEST_RESPONSE: "error" });
+    assert.equal(errored.status, 2, errored.stderr);
+    const erroredRecord = JSON.parse(errored.stdout).results[0];
+    assert.equal(erroredRecord.kind, "auditor_error");
+    assert.equal("usage" in erroredRecord, false, "a reply that never arrived records no usage rather than zeros");
+
+    const human = invoke(guard, ["--case", "1", "--level", "dangerous", "--config", config, "--pi-package", sdk], env);
+    assert.equal(human.status, 0, human.stderr);
+    assert.doesNotMatch(human.stdout, /usage|cacheRead|cacheWrite/i, "human output gains no usage diagnostics");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

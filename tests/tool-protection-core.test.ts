@@ -10,6 +10,7 @@ import {
   type ProtectionContextInput,
   type ProtectionEvidence,
 } from "../src/tool-protection/context";
+import { TOOL_PROTECTION_TEST_CASES } from "../src/tool-protection/test-fixtures";
 import {
   PROTECTION_FLOOR_RULES,
   PROTECTION_HARM_RULES,
@@ -898,20 +899,21 @@ test("the decision instruction is frozen per level and never carries the other l
 
 /**
  * Split one assembled prompt into its named sections. The section order is fixed by
- * `buildProtectionContext`; splitting on blank lines alone would not work, because
- * the policy section contains its own blank group separators and therefore differs
- * in block count per level.
+ * `buildProtectionContext`: the unchanged code-owned blocks lead, then the selected
+ * governing reference, the selected session evidence, and the proposed call last.
+ * Splitting on blank lines alone would not work, because the policy section contains
+ * its own blank group separators and therefore differs in block count per level.
  */
 function promptSections(prompt: string): Record<string, string> {
   const markers: readonly (readonly [string, string])[] = [
     ["header", "TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST"],
     ["instruction", "You are a pre-execution tool-protection auditor."],
     ["policy", "PROTECTION POLICY (code-owned,"],
-    ["call", "PROPOSED TOOL CALL"],
-    ["evidence", "RECENT SESSION EVIDENCE"],
-    ["governing", "GOVERNING INSTRUCTIONS OF THE ACTING AGENT"],
     ["provenance", "EVIDENCE PROVENANCE"],
     ["contract", "OUTPUT CONTRACT"],
+    ["governing", "GOVERNING INSTRUCTIONS OF THE ACTING AGENT"],
+    ["evidence", "RECENT SESSION EVIDENCE"],
+    ["call", "PROPOSED TOOL CALL"],
   ];
   const starts = markers.map(([name, prefix], index) => {
     if (index === 0) {
@@ -1046,18 +1048,32 @@ test("grouped headings keep every rule and example in its approved position", ()
 // --- assembled auditor context ---------------------------------------------
 
 /**
+ * The offset where the variable context begins: the earliest actually rendered
+ * variable section header. Every fixed block is printed ahead of it, and quoted
+ * variable data is JSON-escaped, so no audited text can print one of these
+ * headers ahead of the real one.
+ */
+function variableStart(prompt: string): number {
+  const starts = [
+    "\n\nGOVERNING INSTRUCTIONS OF THE ACTING AGENT",
+    "\n\nRECENT SESSION EVIDENCE",
+    "\n\nPROPOSED TOOL CALL",
+  ].map((marker) => prompt.indexOf(marker)).filter((position) => position >= 0);
+  assert.ok(starts.length > 0, "the request lost its variable context");
+  return Math.min(...starts);
+}
+
+/**
  * The variable context exactly as it was placed in the sent request: the text
- * between the fixed instruction blocks, including the separator that attaches
- * it, which is the quantity the context budget bounds. Provenance and the
- * output contract are fixed blocks, and every variable record is JSON-escaped,
- * so this boundary cannot be forged by audited content.
+ * after the fixed instruction blocks, including the separator that attaches it,
+ * which is the quantity the context budget bounds. The fixed blocks are all
+ * printed ahead of it and the proposed call is rendered last, so the variable
+ * context is the request's suffix; provenance and the output contract are fixed
+ * blocks, and every variable record is JSON-escaped, so this boundary cannot be
+ * forged by audited content.
  */
 function sentVariable(prompt: string): string {
-  const start = prompt.indexOf("\n\nPROPOSED TOOL CALL");
-  assert.ok(start >= 0, "the request lost its proposal section");
-  const end = prompt.indexOf("\n\nEVIDENCE PROVENANCE\n");
-  assert.ok(end > start, "the request lost its provenance block");
-  return prompt.slice(start, end);
+  return prompt.slice(variableStart(prompt));
 }
 
 /**
@@ -1078,8 +1094,27 @@ function sentRecords(prompt: string): Array<{ metadata: string; partial?: boolea
 }
 
 function recordFor(prompt: string, id: string): { metadata: string; partial?: boolean; text: string; identity?: string } | undefined {
-  return sentRecords(prompt).find((record) => record.metadata.includes(`id=${id}`));
+  return sentRecords(prompt).find((record) => record.identity?.includes(`id=${id}`) === true);
 }
+
+/**
+ * The rendered record quoting a token of the supplied text. Record bookkeeping
+ * is optional (#590), so a tight budget can drop a record's `id=` fact while
+ * still quoting its message; the quoted text is what identifies a record there.
+ */
+function recordQuoting(prompt: string, token: string): { metadata: string; partial?: boolean; text: string; identity?: string } | undefined {
+  return sentRecords(prompt).find((record) => record.text.includes(token));
+}
+
+/** The leading quoted token of each session fixture record, for render-order checks. */
+const RECORD_TOKEN: Record<string, string> = {
+  "old-user": "OLD-USER-TASK",
+  "old-refusal": "OLD-REFUSAL",
+  "old-approval": "OLD-APPROVAL",
+  "old-dump": "OLD-DUMP",
+  "newest-tool": "NEWEST-TOOL-TOKEN",
+  "newest-user": "NEWEST-USER-TOKEN",
+};
 
 test("the request carries the proposal, the quoted governing reference, and the fixed blocks", () => {
   const result = build();
@@ -1102,13 +1137,18 @@ test("the request carries the proposal, the quoted governing reference, and the 
   assert.ok(result.prompt.includes("A PASS is always reasonless"));
   assert.ok(result.prompt.includes('"reason" is optional and is never required'));
   assert.ok(result.prompt.includes("Decide from the supplied context only"));
-  // The proposal leads the variable context and the governing reference follows
-  // the session evidence (#590 selection order).
+  // The fixed blocks lead, then the selected governing reference and session
+  // evidence, and the proposed call is rendered last with nothing after it.
+  // Budget priority is unchanged: the call is still the first material filled.
   const proposal = result.prompt.indexOf("\n\nPROPOSED TOOL CALL");
   const evidence = result.prompt.indexOf("\n\nRECENT SESSION EVIDENCE");
   const governing = result.prompt.indexOf("\n\nGOVERNING INSTRUCTIONS OF THE ACTING AGENT");
+  const contract = result.prompt.indexOf("\n\nOUTPUT CONTRACT");
   assert.ok(proposal > 0 && evidence > 0 && governing > 0, "a section moved or disappeared");
-  assert.ok(proposal < evidence);
+  assert.ok(contract > 0 && contract < governing, "a fixed block moved after the variable context");
+  assert.ok(governing < evidence && evidence < proposal, "the rendered order is governing reference, session evidence, then the proposed call last");
+  assert.ok(proposal > variableStart(result.prompt), "the proposed call is not the final variable section");
+  assert.ok(!result.prompt.slice(proposal + 2).includes("OUTPUT CONTRACT"), "a fixed instruction block was printed after the proposed call");
   assert.equal(result.level, "aligned");
   assert.equal(result.policyVersion, TOOL_PROTECTION_POLICY_VERSION);
   assert.equal(sentVariableChars(result.prompt), result.variableChars, "the reported accounting is the text that was sent");
@@ -1253,7 +1293,7 @@ test("a short call leaves room for the immediately preceding user message ahead 
   assert.ok(result.includedEvidenceIds.includes("newest-user"));
   assert.ok(result.prompt.includes("NEWEST-USER-TOKEN hey allow this"));
   assert.ok(result.includedEvidenceIds.includes("old-approval"));
-  assert.equal(recordFor(result.prompt, "old-approval")!.partial, true);
+  assert.equal(recordQuoting(result.prompt, "OLD-APPROVAL")!.partial, true);
   assert.ok(!result.includedEvidenceIds.includes("old-refusal"), "the oldest record yields to the newer ones");
   assert.deepEqual(
     result.includedEvidenceIds,
@@ -1261,8 +1301,13 @@ test("a short call leaves room for the immediately preceding user message ahead 
     "only the oldest records were dropped",
   );
   assert.deepEqual(result.requiredEvidenceIds, ["old-refusal", "old-approval"]);
-  assert.ok(result.prompt.includes("causal=yes"), "a retained causal record keeps its recorded fact");
-  const positions = result.includedEvidenceIds.map((id) => result.prompt.indexOf(`id=${id}`));
+  // A retained causal record still carries its mandatory provenance, while the
+  // record's own id, causal marking, and capture clock are optional facts that
+  // this budget spent on quoted message text instead (#590).
+  assert.ok(result.prompt.includes('"metadata":"origin=user | trust=current-session input the host reports as user-authored'),
+    "a retained record keeps its mandatory origin and trust label");
+  assert.ok(!result.prompt.includes("causal=yes"), "optional record bookkeeping did not take capacity ahead of the quoted messages");
+  const positions = result.includedEvidenceIds.map((id) => result.prompt.indexOf(RECORD_TOKEN[id]!));
   assert.ok(positions.every((position) => position >= 0));
   assert.deepEqual(positions, [...positions].sort((a, b) => a - b), "retained records render newest first");
 });
@@ -1295,16 +1340,96 @@ test("evidence is selected newest first, whatever its origin or causal flag", ()
   assert.ok(tight.prompt.includes("NEWEST-TOOL-TOKEN the fetch returned the spec"));
   // The capacity that remains is used by a leading portion of the next-oldest
   // record instead of being wasted on a whole skip.
-  const partial = recordFor(tight.prompt, "old-dump")!;
+  const partial = recordQuoting(tight.prompt, "OLD-DUMP")!;
   assert.equal(partial.partial, true, "a bounded record is marked, never presented as complete");
   assert.ok(partial.text.startsWith("OLD-DUMP "));
   assert.ok(partial.text.length > 1_000, "the next-oldest record contributes a useful portion");
   assert.ok(!tight.prompt.includes("OLD-REFUSAL"));
   assert.ok(!tight.prompt.includes("OLD-USER-TASK"));
   assert.deepEqual(tight.omittedEvidence.filter((item) => item.reason === "budget").map((item) => item.id), ["old-user", "old-refusal"]);
-  const positions = tight.includedEvidenceIds.map((id) => tight.prompt.indexOf(`id=${id}`));
+  const positions = tight.includedEvidenceIds.map((id) => tight.prompt.indexOf(RECORD_TOKEN[id]!));
   assert.ok(positions.every((position) => position >= 0));
   assert.deepEqual(positions, [...positions].sort((a, b) => a - b), "rendering keeps newest-first selection order");
+});
+
+test("the shipped n09 proposal keeps the original user task at the smallest selectable budget (#590)", () => {
+  const fixture = TOOL_PROTECTION_TEST_CASES.find((item) => item.id === "n09-irreversible-data-loss")!;
+  // The host supplies the causal marking, the invocation a gate record names,
+  // and the capture clock beside the shipped fixture text.
+  const evidence: ProtectionEvidence[] = fixture.evidence.map((item, index): ProtectionEvidence => ({
+    ...item,
+    causal: item.origin === "assistant",
+    ...(item.origin === "assistant" ? { invocationId: fixture.proposedCall.invocationId } : {}),
+    createdAt: 1_789_000_000_000 + index,
+  }));
+  const result = build({ proposedCall: fixture.proposedCall, evidence, maxContextChars: 1_000 });
+  // Every selected message is quoted at the smallest selectable budget: the
+  // oldest one now contributes a leading portion instead of disappearing behind
+  // a wrapper of optional record facts.
+  assert.deepEqual(result.includedEvidenceIds, ["n09-e3", "n09-e2", "n09-e1"]);
+  assert.deepEqual(result.omittedEvidence, []);
+  assert.deepEqual(result.requiredEvidenceIds, ["n09-e3"]);
+  for (const id of ["n09-e3", "n09-e2"]) {
+    const supplied = fixture.evidence.find((item) => item.id === id)!;
+    const record = recordQuoting(result.prompt, supplied.text.slice(0, 24))!;
+    assert.equal(record.text, supplied.text, `the newer ${id} message was not carried whole`);
+    assert.notEqual(record.partial, true, `a ${id} message that fits whole is presented as bounded`);
+  }
+  const suppliedTask = fixture.evidence[0]!.text;
+  const task = recordQuoting(result.prompt, "test/export")!;
+  assert.ok(task.text.length >= 10 && suppliedTask.startsWith(task.text),
+    "the user's original task keeps original text instead of being dropped whole");
+  assert.equal(task.partial, true, "and it says structurally that only a leading portion is carried");
+  // Bounds and honest accounting at the lower selectable bound.
+  assert.ok(result.variableChars <= 1_000, `the variable context exceeded the budget: ${result.variableChars}`);
+  assert.equal(sentVariableChars(result.prompt), result.variableChars, "the accounting is the text that was actually sent");
+  assert.ok(result.promptChars > 1_000, "the unchanged fixed blocks are additional to that budget");
+  // Provenance stays mandatory on every rendered record, and at this budget the
+  // optional bookkeeping took nothing: what it freed is quoted message text.
+  const lines = sentVariable(result.prompt).split("\n").filter((line) => line.startsWith("{"));
+  assert.equal(lines.length, 4, "one record per selected message plus the proposed call");
+  for (const line of lines) {
+    const record = JSON.parse(line) as { metadata: string; text: string; partial?: boolean; identity?: string };
+    assert.ok(record.metadata.startsWith("origin=") || record.metadata.startsWith("tool="), "a record lost its mandatory classification field");
+    if (record.metadata.startsWith("origin=")) {
+      assert.ok(record.metadata.includes(" | trust="), "origin and its trust wording stay paired and mandatory");
+    }
+    assert.equal(record.identity, undefined, "optional record facts took no capacity ahead of the quoted messages at this budget");
+    assert.deepEqual(
+      Object.keys(record),
+      ["metadata", "text", ...(record.partial === true ? ["partial"] : []), ...(record.identity === undefined ? [] : ["identity"])],
+      "field order is classification, quoted data, then the structural marker and optional facts",
+    );
+  }
+  // The framing stays structural: the submitted arguments travel as escaped
+  // data inside one quoted record, so nothing in a quote can read as framing.
+  assert.ok(result.prompt.includes(JSON.stringify('{"command":"rm -rf ').slice(1, -1)),
+    "the submitted arguments did not travel JSON-escaped inside the proposal record");
+  // Bookkeeping is allocated only after the quoted text of every selected
+  // record: a slightly larger budget keeps all three messages whole and still
+  // spends its room on facts rather than clipping a quote.
+  const roomy = build({ proposedCall: fixture.proposedCall, evidence, maxContextChars: 1_150 });
+  assert.deepEqual(roomy.includedEvidenceIds, ["n09-e3", "n09-e2", "n09-e1"]);
+  for (const item of evidence) {
+    const record = recordQuoting(roomy.prompt, item.text.slice(0, 24))!;
+    assert.equal(record.text, item.text, "quoted message text was traded for record bookkeeping");
+    assert.notEqual(record.partial, true, "a message that fits at this budget is presented as bounded");
+  }
+  assert.ok(sentRecords(roomy.prompt).some((record) => record.identity !== undefined),
+    "the room the messages left carries the record facts that fit");
+  for (const line of sentVariable(roomy.prompt).split("\n").filter((value) => value.startsWith("{") && value.includes('"identity"'))) {
+    assert.ok(line.indexOf('"identity"') > line.indexOf('"text":"'), "a record's facts follow its quoted data");
+  }
+  // A budget that holds everything supplied keeps every host fact intact, with
+  // no alternate path and nothing clipped.
+  const generous = build({ proposedCall: fixture.proposedCall, evidence, maxContextChars: 2_000 });
+  assert.ok(!generous.prompt.includes('"partial":true'), "a budget that holds the supplied material clipped it anyway");
+  const newest = recordFor(generous.prompt, "n09-e3")!;
+  assert.ok(newest.identity!.includes("id=n09-e3")
+    && newest.identity!.includes("causal=yes (host-established link to this proposal)")
+    && newest.identity!.includes("invocation=inv-n09")
+    && newest.identity!.includes("at=1789000000002"),
+  "supplied record identity, causal marking, invocation reference, and capture clock all travel when they fit");
 });
 
 test("the governing reference is supplied last and marked partial when it cannot fit whole", () => {
@@ -1326,8 +1451,142 @@ test("the governing reference is supplied last and marked partial when it cannot
   assert.ok(governing.text.startsWith("GOV-HEAD leading task scope "), "the leading governing facts survive");
   assert.ok(!result.prompt.includes("GOV-TAIL"));
   assert.ok(result.prompt.includes("host:ctx.getSystemPrompt()"), "where the governing text came from stays recorded");
+  // The governing reference is the first section rendered and still the last
+  // material the budget fills, so it is carried with only the room the proposal
+  // and the session evidence left.
   assert.ok(result.prompt.indexOf("GOVERNING INSTRUCTIONS OF THE ACTING AGENT")
-    > result.prompt.indexOf("RECENT SESSION EVIDENCE"), "governing reference follows the session evidence");
+    < result.prompt.indexOf("RECENT SESSION EVIDENCE"), "governing reference renders ahead of the session evidence");
+});
+
+test("the fixed prefix and shared context stay byte-identical until the final proposed call (#590 caching)", () => {
+  // Same level, same governing reference, same retained session, different
+  // proposals: everything up to the proposed-call section is the same bytes, so
+  // the stable material is what a prefix-caching transport sees first.
+  const evidence: ProtectionEvidence[] = [
+    { id: "task", origin: "user", text: "TASK-LINE fetch the public spec" },
+    { id: "refusal", origin: "gate", text: "REFUSAL-LINE the gate refused inv-41", causal: true, invocationId: "inv-41" },
+    { id: "approval", origin: "user", text: "APPROVAL-LINE approved to use, try again", causal: true },
+  ];
+  const shared = { evidence, governingSystemPrompt: `${GOVERNING}\nGOV-SHARED-REFERENCE` } as const;
+  const first = build({
+    ...shared,
+    proposedCall: { ...call, invocationId: "inv-100", toolName: "bash", args: { command: "PROPOSED-A first approved export" } },
+  });
+  const second = build({
+    ...shared,
+    proposedCall: { ...call, invocationId: "inv-200", toolName: "webfetch", args: { url: "https://example.invalid/b", purpose: "PROPOSED-B" } },
+  });
+  // Every fixed block precedes every variable section, and nothing dynamic is
+  // rendered ahead of them.
+  const fixedMarkers = [
+    "TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST",
+    "You are a pre-execution tool-protection auditor.",
+    "PROTECTION POLICY (code-owned,",
+    "EVIDENCE PROVENANCE",
+    "OUTPUT CONTRACT",
+  ];
+  for (const result of [first, second]) {
+    const start = variableStart(result.prompt);
+    for (const marker of fixedMarkers) {
+      assert.ok(result.prompt.indexOf(marker) < start, `the ${marker} block moved after the variable context`);
+    }
+    const prefix = result.prompt.slice(0, start);
+    assert.ok(!prefix.includes("inv-"), "invocation identity was rendered ahead of the fixed blocks");
+    assert.ok(!prefix.includes("TASK-LINE") && !prefix.includes("GOV-SHARED-REFERENCE"), "variable data was rendered ahead of the fixed blocks");
+    assert.ok(!prefix.includes(`id=`), "record identity was rendered ahead of the fixed blocks");
+  }
+  // The stable material is shared byte-for-byte, up to the section that carries
+  // the differing proposal.
+  const firstCallSection = first.prompt.indexOf("\n\nPROPOSED TOOL CALL");
+  const secondCallSection = second.prompt.indexOf("\n\nPROPOSED TOOL CALL");
+  assert.ok(firstCallSection > variableStart(first.prompt) && secondCallSection > variableStart(second.prompt),
+    "the proposed call is not rendered last");
+  assert.equal(first.prompt.slice(0, firstCallSection), second.prompt.slice(0, secondCallSection),
+    "the fixed blocks, the selected governing reference, and the selected session context are not shared byte-for-byte");
+  // The final record is the actual operation with its leading submitted arguments,
+  // and nothing is printed after it.
+  const lastLine = (prompt: string): string => prompt.trimEnd().split("\n").pop()!;
+  const secondRecord = JSON.parse(lastLine(second.prompt)) as { metadata: string; text: string; identity?: string };
+  assert.equal(secondRecord.metadata, "tool=webfetch", "the final record does not name the proposed operation");
+  assert.ok(secondRecord.text.startsWith('{"url":"https://example.invalid/b"'), "the final record does not carry the submitted arguments");
+  assert.ok(second.prompt.trimEnd().endsWith("}"), "fixed text follows the proposed call");
+  assert.ok(second.prompt.lastIndexOf("OUTPUT CONTRACT") < second.prompt.indexOf("\n\nPROPOSED TOOL CALL"));
+});
+
+test("a governing reference that goes from whole to bounded keeps the bytes ahead of its quoted data", () => {
+  // The existing structural `partial` marker is rendered after the quoted text,
+  // so the bytes ahead of the quote are identical for a whole and a bounded copy
+  // of the same governing reference: only the quote and what follows it differ.
+  const governing = `GOV-HEAD leading task scope ${"g".repeat(20_000)} GOV-TAIL`;
+  const roomy = build({ governingSystemPrompt: governing, maxContextChars: 128_000 });
+  const tight = build({ governingSystemPrompt: governing, maxContextChars: 4_000 });
+  const governingLine = (prompt: string): string => {
+    const line = sentVariable(prompt).split("\n").find((value) => value.startsWith('{"metadata":"origin=governing-reference'));
+    assert.ok(line, "the request lost its governing reference record");
+    return line;
+  };
+  const wholeLine = governingLine(roomy.prompt);
+  const boundedLine = governingLine(tight.prompt);
+  const wholeRecord = JSON.parse(wholeLine) as { metadata: string; text: string; partial?: boolean };
+  const boundedRecord = JSON.parse(boundedLine) as { metadata: string; text: string; partial?: boolean };
+  assert.notEqual(wholeRecord.partial, true, "the roomy budget clipped the governing reference");
+  assert.equal(boundedRecord.partial, true, "the tight budget carried a leading portion and said so structurally");
+  assert.ok(wholeRecord.text.startsWith(boundedRecord.text) && boundedRecord.text.length < wholeRecord.text.length,
+    "the bounded copy is not a leading portion of the whole one");
+  assert.deepEqual(Object.keys(wholeRecord), ["metadata", "text"], "the whole record's field order changed");
+  assert.deepEqual(Object.keys(boundedRecord), ["metadata", "text", "partial"], "the bounded record's field order changed");
+  const beforeText = (line: string): string => line.slice(0, line.indexOf('"text":"') + '"text":"'.length);
+  assert.equal(beforeText(boundedLine), beforeText(wholeLine),
+    "bytes ahead of the quoted governing text changed between a whole and a bounded copy");
+  // The shared bytes run through the whole of the bounded quote, so going from
+  // whole to bounded costs only the tail.
+  const shared = commonPrefixLength(sentVariable(roomy.prompt), sentVariable(tight.prompt));
+  assert.ok(shared >= beforeText(wholeLine).length + boundedRecord.text.length,
+    "the shared prefix stops before the available governing text");
+});
+
+/** Code units two strings share from their start. */
+function commonPrefixLength(a: string, b: string): number {
+  const limit = Math.min(a.length, b.length);
+  let index = 0;
+  while (index < limit && a[index] === b[index]) index += 1;
+  return index;
+}
+
+test("a small budget still keeps the call and the latest approval although the call renders last (#590)", () => {
+  const evidence: ProtectionEvidence[] = [
+    { id: "old-approval", origin: "user", text: `OLD-APPROVAL ${"a".repeat(20_000)}`, causal: true },
+    { id: "latest-approval", origin: "user", text: "LATEST-APPROVAL approved to use, try again", causal: true },
+  ];
+  for (const maxContextChars of [1_000, 4_000]) {
+    const result = build({
+      proposedCall: { ...shortCall, invocationId: `inv-small-${maxContextChars}`, args: { command: "CALL-FIRST-TOKEN do the approved export" } },
+      governingSystemPrompt: `GOV-HEAD ${"g".repeat(20_000)} GOV-TAIL`,
+      evidence,
+      maxContextChars,
+    });
+    assert.ok(result.variableChars <= maxContextChars, `the variable context exceeded ${maxContextChars}`);
+    assert.ok(result.includedEvidenceIds.includes("latest-approval"), "the latest approval was evicted by the reordered layout");
+    assert.ok(result.prompt.includes("LATEST-APPROVAL approved to use, try again"));
+    assert.ok(result.prompt.includes("CALL-FIRST-TOKEN"), "the proposed call was evicted by the reordered layout");
+    assert.ok(!result.prompt.includes("GOV-TAIL"), "the oversized governing tail leaked through");
+    const callRecord = sentRecords(result.prompt).find((record) => record.metadata.startsWith("tool=read"))!;
+    assert.ok(callRecord.text.startsWith('{"command":"CALL-FIRST-TOKEN'), "the call is still the first material the budget filled");
+    assert.ok(result.prompt.indexOf("\n\nPROPOSED TOOL CALL") > result.prompt.indexOf("\n\nRECENT SESSION EVIDENCE"),
+      "the call is no longer the final rendered section");
+  }
+  // The reordered layout clips nothing that fits: at the default budget the same
+  // oversized-looking material still travels whole.
+  const roomy = build({
+    governingSystemPrompt: `GOV-HEAD ${"g".repeat(20_000)} GOV-TAIL`,
+    proposedCall: { ...call, args: { command: "CALL-FIRST-TOKEN do the approved export", payload: "p".repeat(20_000), last: "CALL-LAST-TOKEN" } },
+    evidence,
+    maxContextChars: 128_000,
+  });
+  assert.ok(!roomy.prompt.includes('"partial":true'), "the default budget clipped supplied material");
+  assert.ok(roomy.prompt.includes("CALL-LAST-TOKEN") && roomy.prompt.includes("GOV-TAIL") && roomy.prompt.includes("OLD-APPROVAL"));
+  assert.equal(sentVariableChars(roomy.prompt), roomy.variableChars);
+  assert.ok(roomy.variableChars <= 128_000);
 });
 
 test("the proposed operation and its arguments outrank long invocation metadata", () => {
@@ -1423,7 +1682,7 @@ test("a bounded record uses the remaining capacity to an exact UTF-16 boundary",
   const result = build({ evidence, maxContextChars: 1_200 });
   assert.ok(result.variableChars <= 1_200);
   assert.ok(result.variableChars > 1_200 - 64, "the remaining capacity is used rather than wasted");
-  const record = recordFor(result.prompt, "unicode")!;
+  const record = recordQuoting(result.prompt, "UNICODE-HEAD")!;
   assert.equal(record.partial, true);
   assert.ok(text.startsWith(record.text), "the record carries a leading portion of the original text");
   assert.ok(record.text.startsWith("UNICODE-HEAD "), "the leading content is what survives");
@@ -1446,7 +1705,7 @@ test("an oversized record the host already retained is marked partial, never pre
   const result = build({ evidence, proposedCall: shortCall, maxContextChars: 1_500 });
   assert.ok(result.prompt.includes("small user message"));
   assert.ok(result.includedEvidenceIds.includes("huge"));
-  const record = recordFor(result.prompt, "huge")!;
+  const record = recordQuoting(result.prompt, "HUGE-")!;
   assert.equal(record.partial, true, "a record the host already bounded is never presented as complete");
   assert.ok(record.text.startsWith("HUGE-"));
   assert.ok(result.variableChars <= 1_500);
@@ -1456,7 +1715,7 @@ test("an oversized record the host already retained is marked partial, never pre
   const tight = build({ evidence, proposedCall: shortCall, maxContextChars: 1_000 });
   assert.ok(tight.includedEvidenceIds.includes("small"));
   assert.ok(tight.variableChars <= 1_000);
-  const tightHuge = recordFor(tight.prompt, "huge");
+  const tightHuge = recordQuoting(tight.prompt, "HUGE-");
   if (tightHuge !== undefined) {
     assert.equal(tightHuge.partial, true, "the shorter quote is still marked partial");
     assert.ok(tightHuge.text.length > 0, "a bounded quote contains original text, not an empty shell");

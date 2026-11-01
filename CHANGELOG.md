@@ -15,6 +15,27 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.242]
+
+### Changed
+
+- **Background-count lifecycle records publish atomically** (#580): the native
+  background-count job fixture now writes each complete `ready.json` and
+  `closed.json` record onto a private preparation leaf in its own preparation
+  directory — established by the test outside the confined service directory —
+  and only then exposes the final pathname through one synchronous exclusive
+  hard link, revalidating the admitted directory identities and the preparation
+  leaf's identity, type, permissions, size, and bytes immediately before that
+  link. A reader can no longer observe a created-but-unwritten leaf, a replaced
+  or truncated preparation never exposes a final record, and a replacement
+  directory at an admitted pathname never receives one.
+  Readiness is still published only after real binding and completion only after
+  the original listener's successful close; existing files and symlinks are never
+  adopted or overwritten, and only a preparation leaf the publisher positively
+  owns is removed. Added deterministic publication, pre-commit preparation
+  revalidation, no-clobber, and retired create-before-write controls. Test
+  fixture only; production behavior is unchanged.
+
 ## [0.1.0-dev.241]
 
 ### Changed

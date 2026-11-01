@@ -1008,10 +1008,10 @@ interface RemoteSavedReadIntent {
 /**
  * The selected remote host's picker state. Only the CURRENT owner result is
  * kept, as at most `REMOTE_SAVED_MAX_WINDOWS` bounded windows: nothing
- * accumulates a whole catalog, a history, or another host's rows.
+ * accumulates a whole catalog, a history, or another host's rows. Host identity
+ * is never copied here: it stays the picker's one canonical `savedHost` choice.
  */
 interface RemoteSavedState {
-  readonly hostId: string;
   /** Owner run the bound catalog (and any outstanding result read) belongs to. */
   catalog: { readonly hostRunId: string; readonly catalogId: string } | undefined;
   result: {
@@ -3342,13 +3342,17 @@ export class SidebarController {
   savedRemoteContext(): SidebarRemoteSavedContext | undefined {
     const state = this.remoteSaved;
     const pickerId = this.savedPickerId;
-    if (state === undefined || pickerId === undefined || !this.remoteSavedPickerOpen()) return undefined;
+    const chosen = this.savedHost;
+    // The `kind` test only re-narrows the canonical choice for the compiler:
+    // `remoteSavedPickerOpen()` already means a remote choice owns the pane.
+    if (state === undefined || pickerId === undefined || chosen.kind !== "remote"
+      || !this.remoteSavedPickerOpen()) return undefined;
     const option = this.currentSavedHostOption();
     return Object.freeze({
       pickerId,
       revision: this.savedQueryRevision,
       query: this.savedQuery,
-      hostId: state.hostId,
+      hostId: chosen.hostId,
       hostRunId: option?.hostRunId ?? null,
       catalogId: state.catalog?.catalogId,
       resultId: state.result?.resultId,
@@ -6542,7 +6546,6 @@ export class SidebarController {
     } else {
       this.savedHost = { kind: "remote", hostId: option.hostId, label: option.label };
       this.remoteSaved = {
-        hostId: option.hostId,
         catalog: undefined,
         result: undefined,
         windows: [],
@@ -6678,12 +6681,12 @@ export class SidebarController {
     if (catalog === undefined) {
       this.emit({
         type: "saved-remote-list", pickerId, requestId, revision,
-        hostId: state.hostId, hostRunId, query, offset: 0, count,
+        hostId: option.hostId, hostRunId, query, offset: 0, count,
       });
     } else {
       this.emit({
         type: "saved-remote-search", pickerId, requestId, revision,
-        hostId: state.hostId, hostRunId, catalogId: catalog.catalogId, query, offset: 0, count,
+        hostId: option.hostId, hostRunId, catalogId: catalog.catalogId, query, offset: 0, count,
       });
     }
   }
@@ -6742,7 +6745,7 @@ export class SidebarController {
     while (state.windowReads.length > REMOTE_SAVED_MAX_WINDOWS) state.windowReads.shift();
     this.emit({
       type: "saved-remote-window", pickerId, requestId, revision,
-      hostId: state.hostId, hostRunId: catalog.hostRunId,
+      hostId: option.hostId, hostRunId: catalog.hostRunId,
       catalogId: catalog.catalogId, resultId: result.resultId, offset, count,
     });
   }
@@ -6830,7 +6833,7 @@ export class SidebarController {
       || presentation.viewEpoch !== this.savedViewEpoch
       || presentation.pickerId !== this.savedPickerId
       || presentation.revision !== this.savedQueryRevision
-      || presentation.hostId !== state.hostId) return false;
+      || presentation.hostId !== this.savedHost.hostId) return false;
     const option = this.currentSavedHostOption();
     if (!this.remoteSavedHostUsable(option) || option.hostRunId !== presentation.hostRunId
       || (option.deleteExposed === true) !== presentation.deleteExposed) return false;
@@ -6892,7 +6895,8 @@ export class SidebarController {
   private remoteSavedOperationOwned(operation: RemoteSavedOperation): boolean {
     const state = this.remoteSaved;
     if (operation.viewEpoch !== this.savedViewEpoch) return false;
-    if (state === undefined || this.savedHost.kind !== "remote" || state.hostId !== operation.hostId) return false;
+    if (state === undefined || this.savedHost.kind !== "remote"
+      || this.savedHost.hostId !== operation.hostId) return false;
     if (this.savedPickerId !== operation.pickerId || this.savedQueryRevision !== operation.revision) return false;
     if (state.catalog === undefined || state.result === undefined
       || state.catalog.hostRunId !== operation.hostRunId || state.catalog.catalogId !== operation.catalogId
@@ -10284,7 +10288,12 @@ export class SidebarController {
     // Only a complete remote render below may re-establish a picker frame.
     const previousCandidate = this.savedPickerCandidate;
     this.savedPickerCandidate = undefined;
-    const remote = this.savedHost.kind === "remote" ? this.remoteSaved : undefined;
+    // One Host choice for the whole frame: `renderSavedQueryLine` renders the
+    // native query field, which can reenter and change the live choice, so this
+    // frame's remote state AND its canonical host identity come from this one
+    // captured read and are never re-read from the live property afterwards.
+    const chosenHost = this.savedHost;
+    const remote = chosenHost.kind === "remote" ? this.remoteSaved : undefined;
     const remoteOption = remote === undefined ? undefined : this.currentSavedHostOption();
     // The Host line is part of this picker only when a remote choice exists;
     // otherwise every row below is exactly the existing Local layout.
@@ -10361,8 +10370,10 @@ export class SidebarController {
     }
     lines.push(queryLine.line);
     let y = 0;
-    if (remote !== undefined) {
-      y = this.renderRemoteSavedRows(remote, remoteOption, lines, listRows, cols, rows, previousCandidate);
+    if (remote !== undefined && chosenHost.kind === "remote") {
+      // `chosenHost` is the captured choice above, so `remote !== undefined`
+      // already implies the `kind` test; it only re-narrows the captured value.
+      y = this.renderRemoteSavedRows(remote, chosenHost.hostId, remoteOption, lines, listRows, cols, rows, previousCandidate);
     } else if (this.pendingSavedList !== undefined) {
       lines.push(wrapRow(" Loading saved conversations... ", cols));
       y += 1;
@@ -10431,9 +10442,12 @@ export class SidebarController {
    * when the owner's FULL total is zero. A complete remote list with a result
    * records the frame candidate (kept across identical redraws, so an ordinary
    * repaint never revokes an earned writer receipt). Returns the rows used.
+   * `hostId` is the picker's canonical Host identity captured with this frame,
+   * never a live re-read of the current choice.
    */
   private renderRemoteSavedRows(
     remote: RemoteSavedState,
+    hostId: string,
     option: SavedHostOption | undefined,
     lines: string[],
     listRows: number,
@@ -10484,7 +10498,7 @@ export class SidebarController {
           index === selected ? SGR_SELECTION_BLUE : undefined));
       } else {
         const identity: RemoteSavedRowIdentity = Object.freeze({
-          hostId: remote.hostId,
+          hostId,
           hostRunId: catalog.hostRunId,
           catalogId: catalog.catalogId,
           resultId: result.resultId,
@@ -10502,7 +10516,7 @@ export class SidebarController {
       const deleteExposed = option.deleteExposed === true;
       const selectedEntryId = this.remoteSavedRowAt(selected)?.entryId;
       const identity = JSON.stringify([
-        this.savedViewEpoch, this.savedPickerId, this.savedQueryRevision, remote.hostId, catalog.hostRunId,
+        this.savedViewEpoch, this.savedPickerId, this.savedQueryRevision, hostId, catalog.hostRunId,
         catalog.catalogId, result.resultId, result.total, selected, selectedEntryId ?? null,
         deleteExposed, cols, rows, drawn.map((row) => [row.paneRow, row.index, row.entryId]),
       ]);
@@ -10518,7 +10532,7 @@ export class SidebarController {
             viewEpoch: this.savedViewEpoch,
             pickerId: this.savedPickerId,
             revision: this.savedQueryRevision,
-            hostId: remote.hostId,
+            hostId,
             hostRunId: catalog.hostRunId,
             catalogId: catalog.catalogId,
             resultId: result.resultId,

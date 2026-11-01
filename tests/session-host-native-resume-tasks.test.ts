@@ -45,7 +45,7 @@ import { readGroup } from "../src/execution/background-group-store";
 import { atomicWriteExclusive } from "../src/execution/durable-write";
 import { operationOwnershipStatus, operationRecordPath, readOperationRecord } from "../src/execution/operation-record";
 import { SessionStateStore } from "../src/session-state";
-import { rosterStorePath } from "../src/session-host/roster-store";
+import { ROSTER_STORE_VERSION, rosterStorePath } from "../src/session-host/roster-store";
 import {
   ChangeSignal,
   EVENT_TIMEOUT_MS,
@@ -231,7 +231,7 @@ async function waitForPersistedSavedRoster(
     await signal.waitForRecheck(() => {
       if (!existsSync(path)) return false;
       const roster = readPersistedRoster(path);
-      return roster.version === 1 && roster.activeSlotId !== undefined
+      return roster.version === ROSTER_STORE_VERSION && roster.activeSlotId !== undefined
         && roster.entries?.some((entry) => entry.slotId === roster.activeSlotId
           && entry.sessionId === expected.sessionId && entry.workspace === expected.workspace
           && entry.name === expected.name && entry.persistence === "saved") === true;

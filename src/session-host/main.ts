@@ -90,6 +90,7 @@ import type {
   PeerSavedUiSearchIntent,
   PeerSavedUiWindowIntent,
   PeerUiCommand,
+  PeerUiHost,
   PeerUiSnapshot,
 } from "./peer-ui-protocol";
 import { isValidNativeSessionId } from "./protocol";
@@ -127,14 +128,22 @@ import {
 import {
   MAX_ROSTER_ENTRIES,
   ROSTER_STORE_VERSION,
+  isLocalRosterEntry,
   isValidRosterName,
+  isValidRosterRemoteHostId,
+  isValidRosterRemoteOwnerId,
   isValidRosterWorkspace,
   openHostState as openProductionHostState,
   type HostStateHandle,
   type HostStateOpenResult,
-  type RosterEntry,
   type StoredRoster,
+  type StoredRosterEntry,
 } from "./roster-store";
+import {
+  PresentationRoster,
+  type PresentationIdentity,
+  type RemotePresentationIdentity,
+} from "./presentation-roster";
 import {
   isSavedSessionCatalog,
   listSavedSessions,
@@ -203,6 +212,19 @@ const LOCAL_VIEW_DETACHED_MESSAGE = "No session is displayed. Every session keep
 const NO_LOCAL_VIEW_MESSAGE = "No session is displayed already; press enter on a row to display it";
 const ROSTER_SAVE_FAILURE_MESSAGE = "The session roster could not be saved; these rows will not be restored after a restart";
 const ROSTER_OVERFLOW_MESSAGE = "The session roster is larger than this host can save; the saved roster was left unchanged";
+/**
+ * Fixed notice for one reorder this host could not revalidate. A refused move
+ * changes nothing: the roster keeps the order it had, every card stays live, and
+ * nothing is saved, selected, stopped, removed, or retargeted.
+ */
+const ROSTER_REORDER_REFUSED_MESSAGE = "Session order change refused; the roster order is unchanged";
+/**
+ * Delay of one stationary edge-hold step of a session-card drag (#477). Main
+ * owns the ONE timer; every step is bound to the presentation the frame writer
+ * actually wrote, the Sidebar performs the scroll, and a step that cannot scroll
+ * stops rather than spinning.
+ */
+const SESSION_POINTER_EDGE_STEP_MS = 120;
 const ROSTER_OWNERSHIP_MESSAGE = "Session host ownership was not confirmed released; a later host will refuse to start until it is resolved.";
 const ROSTER_RETAINED_MESSAGE = "Session host ownership is retained because shutdown did not settle.";
 /** Fixed, bounded display status while a deliberately selected remote viewport is awaited. */
@@ -862,6 +884,35 @@ interface MainDependencies {
  * fields stay optional: a row that never reported native metadata, or a
  * conversation that could not be restarted, is still a remembered slot.
  */
+/**
+ * One remote card's CURRENT runtime placement binding (#477): the presentation
+ * identity this host remembers for it, plus the exact owner run and row id of
+ * the card that carries it right now. It is derived from the current peer UI
+ * snapshot on every read, never stored, and never a second roster: the runtime
+ * pair stays the selection, input, and action target, and the identity is only
+ * a position.
+ */
+type RemotePlacementBinding = {
+  readonly identity: RemotePresentationIdentity;
+  readonly hostRunId: string | null;
+  readonly rowId: string;
+};
+
+/** One projected remote roster row, typed through the peer UI DTO boundary. */
+type RemoteRosterRow = NonNullable<PeerUiHost["roster"]["rows"]>[number];
+
+/** Collision-free key of one presentation identity (never persisted). */
+function presentationIdentityKeyOf(identity: PresentationIdentity): string {
+  return identity.kind === "local"
+    ? JSON.stringify(["local", identity.slotId])
+    : JSON.stringify(["remote", identity.hostId, identity.owner.kind, identity.owner.id]);
+}
+
+/** Collision-free key of one remote runtime card identity (never persisted). */
+function remoteRuntimeKeyOf(hostId: string, hostRunId: string | null, rowId: string): string {
+  return JSON.stringify(["remote", hostId, hostRunId, rowId]);
+}
+
 interface RosterRecord {
   readonly slotId: string;
   rowId?: string;
@@ -922,6 +973,13 @@ function mouseTrackingNumber(tracking: TerminalInputModes["mouseTracking"]): num
         : tracking === "any" ? 1003
           : undefined;
 }
+
+/**
+ * The ONE terminal-ownership state Main holds for a pressed mouse button. The
+ * three states are mutually exclusive per button, which is what makes
+ * `mouseButtonOwnership` the only held-button authority (see its declaration).
+ */
+type MouseButtonOwnership = "host" | "session" | "retired-session";
 
 function mouseButtonId(mouse: ParsedMouseInput): number | undefined {
   if (mouse.wheel) return undefined;
@@ -1371,7 +1429,22 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   // create/remove/rename/activate) and never by Quit or teardown, so a normal
   // host shutdown stops owned children without forgetting the roster.
   let hostState: HostStateHandle | undefined;
-  const rosterRecords = new Map<string, RosterRecord>();
+  /**
+   * The ONE canonical presentation sequence (#477): every remembered local slot
+   * AND every remembered remote card, in one insertion-ordered model whose
+   * iteration order IS the sidebar order. Local records are held by reference
+   * exactly as before; a remote entry holds durable presentation identity only,
+   * never a remote roster DTO, status, run, subscription, or action target.
+   * Every displayed, persisted, and sidebar-order view is DERIVED from this
+   * model plus the current local rows and current peer UI snapshot on the read
+   * itself: there is no ordered `Map` of records, no parallel key array, and no
+   * order mirror anywhere else in this host.
+   */
+  const roster = new PresentationRoster<RosterRecord>();
+  /**
+   * This run's manager row id -> remembered LOCAL slot binding. It is a runtime
+   * row binding ONLY, never an order store: the order lives in {@link roster}.
+   */
   const rowSlots = new Map<string, string>();
   // Set for exactly the synchronous stretch of one `manager.create(...)` call
   // that continues an existing slot (startup restore or exited-row restart),
@@ -1472,9 +1545,61 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let passiveInputListener: ((data: string | Buffer) => void) | undefined;
   let mouseTrackingMode: number | undefined;
   let mouseSgrEnabled = false;
-  // Buttons pressed over a host pane remain host-owned through drag/motion and
-  // release, even if the pointer crosses into Main after activation.
-  const hostMouseButtons = new Set<number>();
+  /**
+   * Main's ONE held-button authority: a button id in this map names a press Main
+   * owns, in exactly one state.
+   * - "host": a press over a host pane (or a host Main-pane focus click) stays
+   *   host-owned through drag/motion and release, even if the pointer crosses
+   *   into Main after activation.
+   * - "session": the one host-owned session-card pointer gesture (#477), a left
+   *   press the Sidebar accepted against the roster the written frame actually
+   *   drew. Main holds only that the terminal must keep fencing this button;
+   *   the pending press, the transient source/target, the preview, and the list
+   *   window stay in the Sidebar, so this is never a second copy of the order.
+   * - "retired-session": a captured session gesture Main abandoned (hide or
+   *   coverage, a reflow, TTY handoff, a Sidebar membership/lifecycle
+   *   retirement, or maps that stopped authorizing pointer input). The physical
+   *   release of such a press must never reach a local or remote child without
+   *   its press, so the fence outlives the gesture until that matching release,
+   *   a replacement press of that button, or terminal teardown.
+   * Because a button has exactly one state, a release consumes one entry and no
+   * consumer has to keep overlapping holders synchronized. Only the three
+   * terminal button ids can ever be present, so the derived reads below scan a
+   * bounded map rather than maintaining a second session-button mirror.
+   */
+  const mouseButtonOwnership = new Map<number, MouseButtonOwnership>();
+  /** Main's ONE edge-hold timer for a captured session drag; re-armed only by written frames. */
+  let sessionPointerEdgeTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** The button of Main's one live session-card gesture, derived from the store. */
+  function sessionPointerHeldButton(): number | undefined {
+    for (const [button, owner] of mouseButtonOwnership) {
+      if (owner === "session") return button;
+    }
+    return undefined;
+  }
+
+  /**
+   * Drops only ordinary host-pane press bookkeeping. A retired session fence is
+   * deliberately NOT part of it: the mouse-mode rules may discard a host-pane
+   * press they can never see the release of, while a captured session press
+   * keeps fencing its button until that release arrives.
+   */
+  function clearHostButtonOwnership(): void {
+    for (const [button, owner] of [...mouseButtonOwnership]) {
+      if (owner === "host") mouseButtonOwnership.delete(button);
+    }
+  }
+  /**
+   * Session-pointer authority is fenced by a geometry generation, the same way
+   * the remote form/input receipts are: any outer reflow — including one that
+   * returns to the previous size before anything is repainted — revokes it until
+   * a frame SUBMITTED after that reflow is actually written. Authorization
+   * equality alone cannot prove that, because a roundtrip reflow composes a
+   * candidate whose panes match the last written frame.
+   */
+  let pointerGeometryGeneration = 0;
+  let pointerMapsWrittenGeneration = 0;
   let forcedCount = 0;
   let remainingCount = 0;
   let shutdownPromise: Promise<void> | undefined;
@@ -1562,6 +1687,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   const hostService = dependencies.createOwningHostService({
     createManager: dependencies.createManager,
     teardownRequested: () => shutdownRequested,
+    // Narrow read-only view of THIS host's existing roster authority for the
+    // inventory projection (#477): the durable slot this host holds (or will
+    // hold) for that row, derived from the SAME deterministic rule
+    // `adoptRosterViews` applies to that same row, so the FIRST negotiated
+    // observation already carries the slot this host adopts and persists. No
+    // slot state is copied, mirrored, cached, or guessed here: the accessor
+    // reads the binding and the canonical roster this host already owns, and it
+    // is only ever asked about a row the manager itself just listed. This is
+    // presentation metadata only: row selection, input, and sidebar actions keep
+    // using the manager row id.
+    rosterSlotIdFor: (rowId) => durableSlotForRow(rowId),
   });
   let finishRun!: (status: number) => void;
   const runFinished = new Promise<number>((resolve) => { finishRun = resolve; });
@@ -2006,14 +2142,34 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function updatePeerUi(snapshot: PeerUiSnapshot): void {
     if (shutdownRequested) return;
+    const previousSnapshot = peerUiSnapshot;
+    // The order view and the placement bindings the sidebar reads during that
+    // rebuild resolve against the snapshot being projected. A sidebar that
+    // refuses the snapshot leaves this host's observed network display exactly as
+    // it was, exactly as before.
+    peerUiSnapshot = snapshot;
     try {
       sidebar?.setPeerUiSnapshot(snapshot);
     } catch {
+      peerUiSnapshot = previousSnapshot;
       sidebar?.showError("Network display is unavailable; local sessions are unchanged");
       scheduleRedraw();
       return;
     }
-    peerUiSnapshot = snapshot;
+    // The canonical mixed order claims a remote identity only once the sidebar
+    // ACCEPTED the snapshot that first showed it. A refused rebuild must not
+    // consume that first observation: the same snapshot accepted later still
+    // remembers the new position and publishes it once. The visible order is
+    // unchanged either way, because the sidebar's own order projection already
+    // places an identity the canonical sequence does not name yet in the
+    // snapshot's source order, after the ordered cards and before the actions.
+    const rememberedNewPosition = observeRemotePresentationIdentities(snapshot);
+    // A first-observed remote position is a roster change exactly like a local
+    // row create or a committed reorder: it is published once through the same
+    // honest persistence path (bounded notice on failure, the previously
+    // published document untouched, and no claim that an order was saved when
+    // the write was refused). An unchanged observation writes nothing.
+    if (rememberedNewPosition) persistRoster();
     // A reminder this host can positively see no longer applies is dropped here;
     // nothing is opened, retried, or confirmed by this reconciliation.
     reconcileRemoteCloseMarkers(snapshot);
@@ -2278,7 +2434,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     } else if (desiredTracking === undefined || desiredTracking === 9) {
       // With no host pane and no release-capable native mode, a retained
       // press cannot receive its matching release; discard that stale owner.
-      hostMouseButtons.clear();
+      // A retired session fence stays: it outlives the mode rules so that
+      // release still cannot reach a child.
+      clearHostButtonOwnership();
     }
     // A remote-enabled Main displaying a selected remote owner must capture the
     // pointer for THAT owner's own retained reporting mode: a drag/any gesture,
@@ -2299,6 +2457,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           useSgr = true;
         }
       }
+    }
+
+    // A captured session-card press needs MOTION for the drag to exist (#477).
+    // For the lifetime of that one gesture the host pane's press-only capture is
+    // raised to drag reporting with cell SGR encoding, applied AFTER the local
+    // and remote native choices so a child's stronger drag/any request is never
+    // downgraded. Releasing or cancelling the gesture returns to the reporting
+    // these same rules ask for; nothing here changes wheel behaviour.
+    if (desiredTracking !== undefined && sessionPointerHeldButton() !== undefined) {
+      if (desiredTracking < 1002) desiredTracking = 1002;
+      useSgr = true;
     }
 
     if (mouseTrackingMode !== desiredTracking) {
@@ -2720,6 +2889,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           }
         }
         remoteSavedPickerFrame = nextSavedPickerFrame;
+        const pointerGenerationAtSubmit = pointerGeometryGeneration;
         writer.submit(composed, cols, rows, (disposition: SessionHostFrameDisposition) => {
           // Retain what ACTUALLY completed writing, even when a newer identical
           // candidate is already queued: discarding the only real write would
@@ -2729,7 +2899,18 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           // stale or reflowed write never authorizes anything.
           if (disposition === "written") {
             displayedMousePresentation = mousePresentation;
+            // Session-pointer authority crosses the same written boundary: only a
+            // frame submitted after the last reflow can authorize a card gesture.
+            pointerMapsWrittenGeneration = pointerGenerationAtSubmit;
+            // A stationary edge hold advances only from a frame that really
+            // reached the sink: this is the only re-arm after a scroll, so a
+            // held, refused, or superseded candidate never moves the window.
+            if (sessionPointerHeldButton() !== undefined) scheduleSessionPointerEdgeStep();
           }
+          // The Sidebar owns the membership/run baseline that retires an
+          // unfinished press or drag; Main follows it on this frame boundary to
+          // restore the ordinary mouse reporting and stop any edge hold.
+          reconcileSessionPointerGesture();
           if (peerFrame !== undefined && peerConsentConfirmationFrame === peerFrame
             && isCurrentPeerConsentFrame(peerFrame)
             && (disposition === "written" || (disposition === "unchanged" && peerFrame.settled))) {
@@ -2823,6 +3004,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   function invalidateMouseAuthorization(): void {
     displayedMousePresentation = undefined;
     latestMousePresentation = undefined;
+    // A held session-card gesture is authorized by exactly those maps, so it
+    // cannot outlive them: abandon it here rather than leave the Sidebar holding
+    // a press and the outer terminal in temporary drag reporting until the next
+    // motion or release happens to arrive. The pressed button stays fenced.
+    cancelSessionPointerGesture();
     writer?.invalidate?.();
   }
 
@@ -2887,21 +3073,41 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   /**
+   * The ONE deterministic durable-slot rule of this host, applied to a row the
+   * manager currently lists: the slot already bound to that row while its
+   * remembered record still exists, else the slot reserved for an in-flight
+   * `manager.create(...)` that continues an existing slot (startup restore or an
+   * exited-row restart), else the row's own id — which is exactly the new slot
+   * this host mints for that row. The read-only inventory accessor and the
+   * adoption path below share this one rule, so the first negotiated
+   * observation of a new row already carries the slot this host adopts and
+   * persists for it. Nothing is guessed by label, workspace path, or
+   * conversation, and no slot state is copied or cached to get there.
+   */
+  function durableSlotForRow(rowId: string): string {
+    const reserved = rowSlots.get(rowId) ?? adoptingSlot;
+    if (reserved !== undefined && roster.getLocal(reserved) !== undefined) return reserved;
+    return rowId;
+  }
+
+  /**
    * Adopt every current manager row into its remembered slot and refresh that
    * slot's last-observed CURRENT conversation identity from the LATEST row in
    * manager order. A slot whose current row left the roster was deliberately
    * removed and is forgotten; a slot with no row stays remembered and renders
-   * as a bounded error row at its own remembered position.
+   * as a bounded error row at its own remembered position. Only LOCAL entries of
+   * the canonical sequence are touched here: a remembered remote card is never
+   * adopted, dropped, or reordered by local manager activity.
    */
   function adoptRosterViews(currentViews: NativeInstanceView[]): void {
     const byRow = new Map(currentViews.map((view) => [view.id, view]));
     const assigned = new Map<string, NativeInstanceView>();
     for (const view of currentViews) {
-      const slotId = rowSlots.get(view.id) ?? adoptingSlot;
-      const record = slotId === undefined ? undefined : rosterRecords.get(slotId);
+      const slotId = durableSlotForRow(view.id);
+      const record = roster.getLocal(slotId);
       if (record === undefined) {
         const created: RosterRecord = { slotId: view.id };
-        rosterRecords.set(created.slotId, created);
+        roster.setLocal(created);
         rowSlots.set(view.id, created.slotId);
         assigned.set(created.slotId, view);
       } else {
@@ -2910,7 +3116,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       }
     }
     for (const [slotId, view] of assigned) {
-      const record = rosterRecords.get(slotId);
+      const record = roster.getLocal(slotId);
       if (record === undefined) continue;
       record.rowId = view.id;
       record.unavailableReason = undefined;
@@ -2925,9 +3131,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         else delete record.name;
       }
     }
-    for (const [slotId, record] of [...rosterRecords]) {
+    for (const record of [...roster.localRecords()]) {
       if (record.rowId === undefined || byRow.has(record.rowId)) continue;
-      rosterRecords.delete(slotId);
+      roster.deleteLocal(record.slotId);
     }
     // Row mappings only exist for current rows; a replaced or removed row's
     // mapping is dropped so a stale id can never claim a slot again.
@@ -2946,7 +3152,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const byRow = new Map(views.map((view) => [view.id, view]));
     const emitted = new Set<string>();
     const items: SidebarItem[] = [];
-    for (const record of rosterRecords.values()) {
+    for (const record of roster.localRecords()) {
       const view = record.rowId === undefined ? undefined : byRow.get(record.rowId);
       if (view !== undefined) {
         if (emitted.has(view.id)) continue;
@@ -2964,19 +3170,231 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     return items;
   }
 
+  /** The exact owner run of one host's last complete roster observation. */
+  function observedRosterRunId(host: PeerUiHost): string | null {
+    const value = host.roster.hostRunId;
+    return typeof value === "string" && value.length > 0 ? value : null;
+  }
+
   /**
-   * The persisted projection of the in-memory roster: every remembered slot, in
-   * its stable remembered order, with whatever identity it actually observed.
-   * A slot with no authenticated conversation id or no known workspace is still
-   * persisted (it can only ever restore as an unavailable error entry), and a
-   * display-only name outside the native bound is dropped rather than making the
-   * whole roster unpublishable. Undefined when the roster exceeds the publishable
-   * bound, in which case the published roster is left exactly as it was.
+   * The presentation identity one currently projected remote row carries.
+   *
+   * A row whose owner negotiated the roster-slot capability names the owner's
+   * already-durable slot, which is exactly why it keeps its position across the
+   * owner's absence, reconnect, and restart. An older owner names no slot, so
+   * the identity is a JSON tuple naming BOTH the exact observed owner run and
+   * the row id: a row id reused on a new owner run is a DIFFERENT identity and
+   * is appended as a new card, never aliased onto the old one. The host part is
+   * this viewer's own saved-destination handle. Nothing is matched by label,
+   * workspace path, or conversation, and an identity outside the store's bounds
+   * is not remembered at all rather than guessed into a position.
+   */
+  function remoteIdentityForRemoteRow(
+    hostId: string,
+    hostRunId: string | null,
+    row: RemoteRosterRow,
+  ): RemotePresentationIdentity | undefined {
+    if (!isValidRosterRemoteHostId(hostId)) return undefined;
+    const durableSlot = row.rosterSlotId;
+    if (durableSlot !== undefined) {
+      if (!isValidRosterRemoteOwnerId(durableSlot)) return undefined;
+      return { kind: "remote", hostId, owner: { kind: "slot", id: durableSlot } };
+    }
+    if (typeof row.id !== "string" || row.id.length === 0) return undefined;
+    // `null` and the string "null" render differently in JSON, so the tuple is
+    // injective over (owner run or none) x row id.
+    const legacyRuntimeId = JSON.stringify([hostRunId, row.id]);
+    if (!isValidRosterRemoteOwnerId(legacyRuntimeId)) return undefined;
+    return { kind: "remote", hostId, owner: { kind: "runtime", id: legacyRuntimeId } };
+  }
+
+  /**
+   * First observation of every remote card the given snapshot shows, in arrival
+   * (source) order, called only AFTER the sidebar accepted that same snapshot, so
+   * a rebuild the sidebar refused never spends the first observation of an
+   * identity the next accepted snapshot still shows. A previously observed
+   * identity is never re-appended, moved, or reordered by a matching return, and
+   * a card this snapshot does not show keeps its remembered position: nothing
+   * here invents a placeholder, removes a stale identity, expires anything, or
+   * copies any remote session fact into this host's roster. Returns whether any
+   * NEW position entered the canonical sequence, which is a roster change like
+   * any other and is therefore published through the existing persistence path.
+   */
+  function observeRemotePresentationIdentities(snapshot: PeerUiSnapshot | undefined): boolean {
+    let rememberedAny = false;
+    for (const host of snapshot?.hosts ?? []) {
+      const rows = host.roster.rows;
+      // `null` means no complete observation: not an empty roster, and no
+      // evidence about any identity this host already remembers.
+      if (rows === null) continue;
+      const hostRunId = observedRosterRunId(host);
+      for (const row of rows) {
+        const identity = remoteIdentityForRemoteRow(host.id, hostRunId, row);
+        if (identity !== undefined && roster.rememberRemote(identity)) rememberedAny = true;
+      }
+    }
+    return rememberedAny;
+  }
+
+  /**
+   * Every unambiguous mapping between a remembered remote presentation identity
+   * and the exact runtime card carrying it right now, derived from the CURRENT
+   * snapshot on this read and never stored. Two visible rows of one owner that
+   * name the same durable slot are ambiguous: neither one is guessed, converted
+   * to the other, or used to retarget a move, so that identity simply has no
+   * runtime binding while both live cards keep behaving exactly as before.
+   */
+  function remotePlacementBindings(): {
+    readonly byIdentity: Map<string, RemotePlacementBinding>;
+    readonly byRuntime: Map<string, RemotePlacementBinding>;
+  } {
+    const byIdentity = new Map<string, RemotePlacementBinding>();
+    const ambiguous = new Set<string>();
+    for (const host of peerUiSnapshot?.hosts ?? []) {
+      const rows = host.roster.rows;
+      if (rows === null) continue;
+      const hostRunId = observedRosterRunId(host);
+      for (const row of rows) {
+        const identity = remoteIdentityForRemoteRow(host.id, hostRunId, row);
+        if (identity === undefined) continue;
+        const identityKey = presentationIdentityKeyOf(identity);
+        if (ambiguous.has(identityKey)) continue;
+        if (byIdentity.has(identityKey)) {
+          // A duplicate durable slot: refuse the placement binding entirely
+          // rather than pick one of the two rows.
+          byIdentity.delete(identityKey);
+          ambiguous.add(identityKey);
+          continue;
+        }
+        byIdentity.set(identityKey, { identity, hostRunId, rowId: row.id });
+      }
+    }
+    const byRuntime = new Map<string, RemotePlacementBinding>();
+    for (const binding of byIdentity.values()) {
+      byRuntime.set(remoteRuntimeKeyOf(binding.identity.hostId, binding.hostRunId, binding.rowId), binding);
+    }
+    return { byIdentity, byRuntime };
+  }
+
+  /**
+   * The sidebar's read-only view of the ONE canonical order: only the runtime
+   * identities this host actually holds right now, in canonical sequence. A
+   * remembered local slot contributes its current manager row, or the bounded
+   * unavailable row it actually draws; a slot still awaiting its restore attempt
+   * draws nothing and is named by nothing. A remembered remote identity
+   * contributes its current exact runtime card, or nothing while that card is
+   * absent. This derives on every call from the canonical model plus the current
+   * local rows and current snapshot: no second runtime-order map exists.
+   */
+  function currentSessionOrderView(): SidebarMainOwnerKey[] {
+    const bindings = remotePlacementBindings().byIdentity;
+    const keys: SidebarMainOwnerKey[] = [];
+    for (const entry of roster.entries()) {
+      if (entry.kind === "remote") {
+        const binding = bindings.get(presentationIdentityKeyOf(entry.identity));
+        if (binding === undefined) continue;
+        keys.push({
+          kind: "remote",
+          hostId: binding.identity.hostId,
+          hostRunId: binding.hostRunId,
+          rowId: binding.rowId,
+        });
+        continue;
+      }
+      const record = entry.record;
+      if (record.rowId !== undefined) {
+        if (views.some((view) => view.id === record.rowId)) keys.push({ kind: "local", id: record.rowId });
+        continue;
+      }
+      if (record.unavailableReason !== undefined) keys.push({ kind: "local", id: rosterErrorItemId(record.slotId) });
+    }
+    return keys;
+  }
+
+  /**
+   * The canonical presentation identity one CURRENT runtime sidebar card names,
+   * revalidated against this host's own facts: a current local row (or the
+   * bounded unavailable row this host actually draws), or a remote card of the
+   * exact current owner run and row that has an unambiguous placement binding.
+   * No source index, label, or stale identity is ever accepted, and a card this
+   * host cannot map refuses rather than retargets.
+   */
+  function presentationIdentityForRuntimeOwner(owner: SidebarMainOwnerKey): PresentationIdentity | undefined {
+    if (owner.kind === "local") {
+      const unavailableSlot = slotIdFromRosterErrorItemId(owner.id);
+      if (unavailableSlot !== undefined) {
+        const record = roster.getLocal(unavailableSlot);
+        return record !== undefined && record.rowId === undefined
+          ? { kind: "local", slotId: unavailableSlot }
+          : undefined;
+      }
+      if (!views.some((view) => view.id === owner.id) || removedExitedIds.has(owner.id)) return undefined;
+      const slotId = durableSlotForRow(owner.id);
+      return roster.getLocal(slotId) !== undefined ? { kind: "local", slotId } : undefined;
+    }
+    const binding = remotePlacementBindings().byRuntime.get(remoteRuntimeKeyOf(owner.hostId, owner.hostRunId, owner.rowId));
+    return binding === undefined ? undefined : binding.identity;
+  }
+
+  /**
+   * One committed left-roster reorder (#477): revalidate both sides against the
+   * exact CURRENT local or remote runtime identity, map them to presentation
+   * identities of the ONE canonical sequence, move, then refresh and save once.
+   *
+   * A reorder is a placement change only. It never selects, activates, stops,
+   * removes, creates, renames, quits, or reconnects anything, never writes the
+   * owner's roster, and never touches the runtime host/run/row pair that input
+   * and actions keep using. A cancelled preview never reaches this path, and a
+   * refused one leaves both the in-memory and the published order untouched.
+   */
+  function applySessionReorder(
+    source: SidebarMainOwnerKey,
+    target: SidebarMainOwnerKey,
+    placement: "before" | "after",
+  ): void {
+    const sourceIdentity = presentationIdentityForRuntimeOwner(source);
+    const targetIdentity = presentationIdentityForRuntimeOwner(target);
+    if (sourceIdentity === undefined || targetIdentity === undefined) {
+      sidebar?.showError(ROSTER_REORDER_REFUSED_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    if (!roster.move(sourceIdentity, targetIdentity, placement)) {
+      sidebar?.showError(ROSTER_REORDER_REFUSED_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    // One refresh, one save: the sidebar re-derives its cards from the canonical
+    // view, and the persisted projection is the canonical sequence itself.
+    syncRosterAndSchedule();
+  }
+
+  /**
+   * The persisted projection of the canonical sequence: EVERY entry of the one
+   * mixed order, in that order. A local entry keeps exactly its existing payload
+   * shape; a remote entry contributes its durable presentation identity and
+   * nothing else. A local slot with no authenticated conversation id or no known
+   * workspace is still persisted (it can only ever restore as an unavailable
+   * error entry), and a display-only name outside the native bound is dropped
+   * rather than making the whole roster unpublishable. Undefined when the local
+   * roster exceeds the publishable bound, in which case the published roster is
+   * left exactly as it was.
    */
   function buildRosterProjection(): StoredRoster | undefined {
-    const entries: RosterEntry[] = [];
-    for (const record of rosterRecords.values()) {
-      if (entries.length >= MAX_ROSTER_ENTRIES) return undefined;
+    const entries: StoredRosterEntry[] = [];
+    let localEntries = 0;
+    for (const entry of roster.entries()) {
+      if (entry.kind === "remote") {
+        entries.push({
+          kind: "remote",
+          hostId: entry.identity.hostId,
+          owner: { kind: entry.identity.owner.kind, id: entry.identity.owner.id },
+        });
+        continue;
+      }
+      if (localEntries >= MAX_ROSTER_ENTRIES) return undefined;
+      localEntries += 1;
+      const record = entry.record;
       entries.push({
         slotId: record.slotId,
         ...(record.sessionId !== undefined && isValidNativeSessionId(record.sessionId)
@@ -2988,7 +3406,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
     const localId = localActiveId();
     const activeSlotId = localId !== undefined ? rowSlots.get(localId) : rememberedActiveSlot;
-    const active = activeSlotId !== undefined && entries.some((entry) => entry.slotId === activeSlotId)
+    const active = activeSlotId !== undefined && entries.some((entry) => isLocalRosterEntry(entry) && entry.slotId === activeSlotId)
       ? { activeSlotId }
       : {};
     return { version: ROSTER_STORE_VERSION, entries, ...active };
@@ -3032,12 +3450,20 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     lastPersistedRoster = serialized;
   }
 
-  /** Seed the remembered slots from the persisted roster observed at open. */
+  /**
+   * Seed the canonical sequence from the persisted roster observed at open:
+   * local records and remote presentation identities in the document's own
+   * order, which IS the remembered mixed order.
+   */
   function initializeRosterRecords(stored: StoredRoster | undefined): void {
     if (stored !== undefined) {
       for (const entry of stored.entries) {
-        if (rosterRecords.has(entry.slotId)) continue;
-        rosterRecords.set(entry.slotId, {
+        if (entry.kind === "remote") {
+          roster.rememberRemote({ kind: "remote", hostId: entry.hostId, owner: { kind: entry.owner.kind, id: entry.owner.id } });
+          continue;
+        }
+        if (roster.getLocal(entry.slotId) !== undefined) continue;
+        roster.setLocal({
           slotId: entry.slotId,
           ...(entry.sessionId !== undefined ? { sessionId: entry.sessionId } : {}),
           ...(entry.workspace !== undefined ? { workspace: entry.workspace } : {}),
@@ -3058,13 +3484,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * through its own manager-owned path.
    */
   function removeRosterEntry(slotId: string): void {
-    const record = rosterRecords.get(slotId);
+    const record = roster.getLocal(slotId);
     if (record === undefined || record.rowId !== undefined) {
       sidebar?.showError(REMOVE_REFUSED_MESSAGE);
       scheduleRedraw();
       return;
     }
-    rosterRecords.delete(slotId);
+    roster.deleteLocal(slotId);
     if (rememberedActiveSlot === slotId) rememberedActiveSlot = undefined;
     syncRosterAndSchedule();
     reconcileLayout(true);
@@ -3085,7 +3511,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const stored = handle?.roster;
     if (handle === undefined || activeManager === undefined || activeSidebar === undefined) return;
     if (handle.problem !== undefined) return; // surfaced truthfully by persistRoster
-    if (stored === undefined || stored.entries.length === 0) return;
+    // Restoration is this host's LOCAL authority: a remembered remote card holds
+    // a position in the same order but is never started, adopted, or revalidated
+    // here, so it takes no part in this pass.
+    const remembered = stored === undefined ? [] : stored.entries.filter(isLocalRosterEntry);
+    if (remembered.length === 0) return;
     // Automatic activation is fenced by the deliberate-action generation, not by
     // the current content target alone: a user who activates and then clears/removes a
     // row during a slow restore must not have the remembered sibling activated
@@ -3115,7 +3545,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // each branded admission BEFORE any row is created: a later listing, a
     // catalog revision bump, or a concurrent user action can never invalidate an
     // admission half-way through restoration.
-    const decisions = stored.entries.map((entry) => {
+    const decisions = remembered.map((entry) => {
       let createOptions: CreateInstanceOptions | undefined;
       let reason = "This conversation is unavailable";
       const entrySessionId = entry.sessionId;
@@ -3152,7 +3582,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     });
     for (const decision of decisions) {
       if (shutdownRequested || manager !== activeManager) return;
-      const record = rosterRecords.get(decision.entry.slotId);
+      const record = roster.getLocal(decision.entry.slotId);
       if (record === undefined) continue;
       if (decision.createOptions === undefined) {
         record.rowId = undefined;
@@ -3172,7 +3602,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       try {
         await created;
       } catch {
-        const live = rosterRecords.get(decision.entry.slotId);
+        const live = roster.getLocal(decision.entry.slotId);
         if (live !== undefined && live.rowId === undefined) {
           live.unavailableReason = "This conversation could not be started; it was not replaced";
         }
@@ -3183,8 +3613,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // and only while no deliberate user action occurred since restoration began,
     // so a slow restore can never override a user's own focus or action.
     if (deliberateActionGeneration === generationAtStart) {
-      const activeSlot = stored.activeSlotId;
-      const activeRecord = activeSlot === undefined ? undefined : rosterRecords.get(activeSlot);
+      const activeSlot = stored?.activeSlotId;
+      const activeRecord = activeSlot === undefined ? undefined : roster.getLocal(activeSlot);
       if (activeRecord?.rowId !== undefined) {
         contentTarget = { kind: "local", id: activeRecord.rowId };
         rememberedActiveSlot = activeRecord.slotId;
@@ -3709,6 +4139,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       const cols = clampDimension(terminal.columns, 80);
       const rows = clampDimension(terminal.rows, 24);
       const next = currentHostLayout(cols, rows);
+      // A pane change that stops drawing the roster — hide, a replacing
+      // confirmation, a narrow overlay form — abandons an in-flight session
+      // gesture: nothing is committed or activated, and the ordinary mouse
+      // reporting returns to what the existing rules ask for.
+      if (sessionPointerHeldButton() !== undefined && (next.sidebar === undefined || !sidebar.visible)) {
+        cancelSessionPointerGesture();
+      }
       layout = next;
       noteRemoteSavedLayout(next);
       const changed = next.native.cols !== lastNativeCols || next.native.rows !== lastNativeRows;
@@ -3839,6 +4276,186 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
   }
 
+  /** Stops Main's ONE edge-hold timer without touching the Sidebar's own state. */
+  function clearSessionPointerEdgeTimer(): void {
+    if (sessionPointerEdgeTimer === undefined) return;
+    clearTimeout(sessionPointerEdgeTimer);
+    sessionPointerEdgeTimer = undefined;
+  }
+
+  /**
+   * Arms one stationary edge-hold step for the drag in flight. It is scheduled
+   * only from routed motion and from a frame the writer actually wrote, so a
+   * held, refused, queued, or superseded frame never advances the list window,
+   * and a step that cannot scroll leaves no timer behind.
+   */
+  function scheduleSessionPointerEdgeStep(): void {
+    if (sessionPointerHeldButton() === undefined || sessionPointerEdgeTimer !== undefined) return;
+    if (shutdownRequested || externalEditorActive || !terminal || !terminalStarted) return;
+    const timer = setTimeout(() => {
+      if (sessionPointerEdgeTimer !== timer) return;
+      sessionPointerEdgeTimer = undefined;
+      stepSessionPointerEdge();
+    }, SESSION_POINTER_EDGE_STEP_MS);
+    sessionPointerEdgeTimer = timer;
+    // A pending hold never keeps the process alive on its own; shutdown, resize,
+    // hide, and handoff all retire the gesture explicitly.
+    timer.unref?.();
+  }
+
+  /** One edge step, taken only against the presentation the writer reported written. */
+  function stepSessionPointerEdge(): void {
+    if (sessionPointerHeldButton() === undefined || shutdownRequested || externalEditorActive) return;
+    const shown = displayedMousePresentation;
+    if (shown === undefined || sidebar === undefined || !sidebar.sessionPointerActive) return;
+    if (!sessionPointerMapsAreCurrent(shown)) {
+      cancelSessionPointerGesture();
+      return;
+    }
+    if (shown.layout.sidebar === undefined) return;
+    if (shown.sidebar.tickSessionPointerEdge()) {
+      // The Sidebar scrolled its window and asked for a redraw. The next step
+      // waits for that scrolled frame to become the written one, which re-arms
+      // this timer from the writer's own settlement.
+      scheduleRedraw();
+    }
+  }
+
+  /**
+   * Retires Main's record of the gesture and returns the outer capture to the
+   * reporting the existing native/host rules ask for. The pressed button stays
+   * host-owned, so a release of a gesture Main already retired is still consumed
+   * rather than forwarded to a local or remote session.
+   */
+  function retireSessionPointerGesture(): void {
+    clearSessionPointerEdgeTimer();
+    const button = sessionPointerHeldButton();
+    if (button === undefined) return;
+    // The gesture is over but the press was host-owned: that button's ONE state
+    // moves from the live gesture to the retired fence, so the physical release
+    // cannot reach a child without its press.
+    mouseButtonOwnership.set(button, "retired-session");
+    syncOuterMouseModes();
+  }
+
+  /**
+   * Abandons an unfinished gesture for a lifecycle change (resize including a
+   * reflow that returns to the same size, hide or coverage, TTY handoff,
+   * shutdown, membership change). Nothing is committed, activated, or emitted,
+   * and the transient preview the Sidebar holds is dropped there, not here.
+   */
+  function cancelSessionPointerGesture(): void {
+    const button = sessionPointerHeldButton();
+    if (button === undefined) return;
+    clearSessionPointerEdgeTimer();
+    mouseButtonOwnership.set(button, "retired-session");
+    sidebar?.cancelSessionPointer();
+    syncOuterMouseModes();
+  }
+
+  /**
+   * The Sidebar retires an unfinished press or drag when the roster's session
+   * membership or an owner run changes; a status, name, or activity update does
+   * not. Main follows that decision on the frame boundary: it keeps fencing the
+   * pressed button, restores the ordinary mouse reporting, and keeps the order
+   * the roster already committed.
+   */
+  function reconcileSessionPointerGesture(): void {
+    const button = sessionPointerHeldButton();
+    if (button === undefined) return;
+    if (sidebar?.sessionPointerActive === true) return;
+    clearSessionPointerEdgeTimer();
+    mouseButtonOwnership.set(button, "retired-session");
+    syncOuterMouseModes();
+  }
+
+  /**
+   * True only while the WRITTEN presentation may authorize session-pointer
+   * input: it exists, carries a written receipt from the current geometry
+   * generation, and its roster pane still matches the layout this host currently
+   * holds. Every session-pointer call (begin, update, finish, and an edge tick)
+   * is validated against it, so a revoked or reflowed map never moves the order
+   * or the list window. A newer UNWRITTEN candidate is deliberately not part of
+   * this test: a held, refused, or superseded frame must not retarget a drop that
+   * the operator can still see on screen.
+   */
+  function sessionPointerMapsAreCurrent(presentation: MouseFramePresentation | undefined): boolean {
+    if (presentation === undefined) return false;
+    if (pointerMapsWrittenGeneration !== pointerGeometryGeneration) return false;
+    const shown = presentation.layout.sidebar;
+    const current = layout?.sidebar;
+    if (shown === undefined || current === undefined) return false;
+    return shown.column === current.column && shown.row === current.row
+      && shown.cols === current.cols && shown.rows === current.rows;
+  }
+
+  /**
+   * One motion packet of the held session gesture. It always goes to the Sidebar
+   * method of the presentation this host actually WROTE, with that frame's own
+   * pane geometry: a map that no longer describes the drawn roster keeps the
+   * drag alive and retargets nothing, and every packet stays host-owned.
+   */
+  function routeSessionPointerMotion(mouse: ParsedMouseInput): void {
+    clearSessionPointerEdgeTimer();
+    const shown = displayedMousePresentation;
+    const pane = shown?.layout.sidebar;
+    if (sessionPointerHeldButton() === undefined || shown === undefined || pane === undefined
+      || !sessionPointerMapsAreCurrent(shown)) {
+      // No usable written map (a Saved listing, a reflow, or an invalidation
+      // revoked it mid-drag): abandon the Sidebar interaction too, restore the
+      // ordinary mouse reporting, and keep fencing the pressed button.
+      cancelSessionPointerGesture();
+      return;
+    }
+    if (!shown.sidebar.updateSessionPointerAt(
+      mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows,
+    )) {
+      // The Sidebar holds no pending press for this gesture (its own membership
+      // or lifecycle rule retired it). Consume the packet; never fall back to
+      // activation for a gesture the pointer interaction already owns.
+      retireSessionPointerGesture();
+      return;
+    }
+    scheduleSessionPointerEdgeStep();
+  }
+
+  /**
+   * One release of the held session gesture: exactly once, against the written
+   * frame's own maps. A release over the pressed card with no motion performs
+   * that card's ordinary activation; a release over the previewed destination
+   * commits one reorder through the existing action route; every other release
+   * cancels. Main never re-derives a target and never re-activates a card.
+   */
+  function routeSessionPointerRelease(mouse: ParsedMouseInput): void {
+    clearSessionPointerEdgeTimer();
+    const gesture = sessionPointerHeldButton();
+    // The release is the end of that button's ownership: one entry is removed,
+    // so no fence can outlive the release it was waiting for.
+    if (gesture !== undefined) mouseButtonOwnership.delete(gesture);
+    const shown = displayedMousePresentation;
+    const pane = shown?.layout.sidebar;
+    if (gesture === undefined) return;
+    if (shown === undefined || pane === undefined || !sessionPointerMapsAreCurrent(shown)) {
+      // Cleanup runs even with no written map: the Sidebar drops its unfinished
+      // press and preview, the temporary drag reporting comes back down, and this
+      // release is consumed rather than forwarded or turned into an activation.
+      sidebar?.cancelSessionPointer();
+      syncOuterMouseModes();
+      scheduleRedraw();
+      return;
+    }
+    const previousFocus = sidebar?.focus;
+    const previousSelection = sidebar?.selectedId;
+    const previousVisibility = sidebar?.visible;
+    shown.sidebar.finishSessionPointerAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows);
+    if (sidebar !== undefined && (sidebar.focus !== previousFocus || sidebar.selectedId !== previousSelection
+      || sidebar.visible !== previousVisibility)) {
+      deliberateActionGeneration += 1;
+    }
+    reconcileLayout(false);
+    scheduleRedraw();
+  }
+
   function handleMouseInput(data: string, mouse: ParsedMouseInput): void {
     if (shutdownRequested || externalEditorActive || !sidebar || !layout) return;
     const presentation = displayedMousePresentation;
@@ -3846,16 +4463,40 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const hitMapPending = presentation === undefined || latestMousePresentation === undefined
       || !sameMouseAuthorization(presentation, latestMousePresentation);
     const buttonId = mouseButtonId(mouse);
-    if (mouse.release) {
-      if (buttonId !== undefined && hostMouseButtons.delete(buttonId)) return;
-      // Legacy X10 release reports button 3 without identifying which button
-      // ended; the host can only own this ambiguous release if it owns a press.
-      if (buttonId === undefined && hostMouseButtons.size > 0) {
-        hostMouseButtons.clear();
+    // A replacement press of a button whose captured gesture Main already
+    // abandoned ends that stale fence; the new press belongs to whichever route
+    // takes it below.
+    if (isMouseButtonPress(mouse) && buttonId !== undefined
+      && mouseButtonOwnership.get(buttonId) === "retired-session") {
+      mouseButtonOwnership.delete(buttonId);
+    }
+    // A session-card press Main is holding owns its button's motion and release
+    // for the whole gesture, wherever the pointer travelled: no fragment of it
+    // reaches a local or remote session, and no release of it re-activates a card.
+    const heldGestureButton = sessionPointerHeldButton();
+    if (heldGestureButton !== undefined) {
+      // A wheel report is never this gesture's release: wheel packets carry no
+      // button id, so only a real button release (or a legacy X10 release that
+      // names no button) may end the held card gesture. Wheel input keeps its
+      // existing route and the left-button fence stays held.
+      const ambiguousButtonRelease = buttonId === undefined && mouse.release && !mouse.wheel;
+      if (buttonId === heldGestureButton || ambiguousButtonRelease) {
+        if (mouse.release) routeSessionPointerRelease(mouse);
+        else if (mouse.motion) routeSessionPointerMotion(mouse);
         return;
       }
     }
-    if (mouse.motion && buttonId !== undefined && hostMouseButtons.has(buttonId)) return;
+    if (mouse.release) {
+      if (buttonId !== undefined && mouseButtonOwnership.delete(buttonId)) return;
+      // Legacy X10 release reports button 3 without identifying which button
+      // ended; the host can only own this ambiguous release if it owns a press.
+      // A wheel report is not that release, so it never drops a host fence.
+      if (buttonId === undefined && !mouse.wheel && mouseButtonOwnership.size > 0) {
+        mouseButtonOwnership.clear();
+        return;
+      }
+    }
+    if (mouse.motion && buttonId !== undefined && mouseButtonOwnership.has(buttonId)) return;
 
     const formPane = hitLayout.form !== undefined && containsHostPoint(hitLayout.form, mouse.x, mouse.y)
       ? hitLayout.form
@@ -3865,7 +4506,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       : undefined;
     const pane = formPane ?? sidebarPane;
     if (pane !== undefined) {
-      if (isMouseButtonPress(mouse) && buttonId !== undefined) hostMouseButtons.add(buttonId);
+      if (isMouseButtonPress(mouse) && buttonId !== undefined) mouseButtonOwnership.set(buttonId, "host");
       if (mouse.wheel) {
         // A wheel report inside a visible host pane is host-owned and never
         // reaches the child, so scrolling the sidebar can never scroll Main as
@@ -3873,7 +4514,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // it activates no row, moves no highlight, and changes no focus,
         // visibility, or Main content owner, and it is fenced to the roster the
         // current written frame actually drew at this geometry. The form slot
-        // keeps its existing consumed-no-op behavior.
+        // keeps its existing consumed-no-op behavior. A wheel report is never a
+        // session-card gesture: it carries no button id, so it neither starts,
+        // moves, nor ends a held press, and it scrolls the window the written
+        // frame drew even while a drag preview is on screen.
         const direction = wheelNotchDirection(mouse);
         if (formPane === undefined && presentation !== undefined && direction !== undefined
           && presentation.sidebar.scrollRosterAt(
@@ -3885,6 +4529,47 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           )) {
           scheduleRedraw();
         }
+        return;
+      }
+      // The roster's own draw-derived maps own this gesture only where the
+      // written frame actually drew the roster: not the form slot, and not a
+      // narrow overlay whose form replaced the roster.
+      const rosterOwnsPointer = formPane === undefined
+        && !(hitLayout.sidebarOverlay && presentation?.focus === "form");
+      // A left press over the roster needs the WRITTEN roster maps for either
+      // route: the held session-card gesture or the ordinary press-time row
+      // activation. Maps revoked by an invalidation, or written before a reflow
+      // that has not been repainted yet, authorize neither, so this press is
+      // consumed (it stays host-owned above) instead of falling through to the
+      // activation path. A valid press over an action row, diagnostic row, or
+      // session card is untouched: those maps are current.
+      if (isLeftMousePress(mouse) && rosterOwnsPointer && !sessionPointerMapsAreCurrent(presentation)) return;
+      if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending && rosterOwnsPointer
+        && hitLayout.sidebar !== undefined && buttonId !== undefined
+        && sessionPointerMapsAreCurrent(presentation)
+        && presentation.sidebar.beginSessionPointerAt(
+          mouse.x - hitLayout.sidebar.column, mouse.y - hitLayout.sidebar.row,
+          hitLayout.sidebar.cols, hitLayout.sidebar.rows,
+        )) {
+        // A session-card press is HELD here, never activated: the Sidebar decided
+        // whether this coordinate is a completely drawn session card of the
+        // roster this written frame drew. A host action or diagnostic row, a
+        // blank or clipped row, a too-small pane, a hidden or replaced roster, and
+        // a map that no longer matches this projection all refuse and keep the
+        // unchanged press-activation path below. A session card beside an open
+        // right-hand form, picker, or Network review holds the press exactly like
+        // a bare roster, so that UI is still cancelled at RELEASE, never on press.
+        // The pressed button's ONE ownership entry moves from the ordinary
+        // host-pane state to the live session gesture.
+        mouseButtonOwnership.set(buttonId, "session");
+        // A deliberate pointer gesture invalidates a pending automatic activation
+        // like any other human action, even when no focus or selection snapshot
+        // visibly moved.
+        deliberateActionGeneration += 1;
+        // Press-only capture reports no motion, so the drag needs the outer
+        // terminal to report it for the lifetime of this one gesture. The upgrade
+        // never downgrades a child's or remote owner's stronger request.
+        syncOuterMouseModes();
         return;
       }
       if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending) {
@@ -3939,7 +4624,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     if (isLeftMousePress(mouse) && buttonId !== undefined
       && canFocusMainFromNativeClick(mouse, presentation)) {
       const focused = sidebar.focusMainFromNativeClick();
-      hostMouseButtons.add(buttonId);
+      mouseButtonOwnership.set(buttonId, "host");
       if (focused) {
         deliberateActionGeneration += 1;
         reconcileLayout(false);
@@ -3994,6 +4679,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   function handleTerminalResize(): void {
+    // A reflow — including one that returns to the previous size before anything
+    // is repainted — retires the in-flight session gesture with its written maps.
+    cancelSessionPointerGesture();
     invalidatePeerConsentDisplay();
     invalidatePeerRepairDisplay();
     invalidateSavedDeleteConfirmationDisplay();
@@ -4017,6 +4705,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // (even one that returns to the same size) retires them for good.
     remoteSavedEpoch += 1;
     remoteSavedPickerFrame = undefined;
+    // A session-card gesture is geometry-bound the same way: a reflow (even a
+    // roundtrip to the same size) revokes pointer authority until a post-reflow
+    // frame is actually written, because the reflow's candidate can stay
+    // authorization-equal to the last written frame.
+    pointerGeometryGeneration += 1;
     // A real outer resize can reflow the physical screen and then return to
     // the same final geometry before the next coalesced redraw (for example
     // 80 -> 40 -> 80). Invalidate the known baseline before recomputing so the
@@ -4037,7 +4730,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     createFormEpoch += 1;
     remoteSavedEpoch += 1;
     remoteSavedPickerFrame = undefined;
-    hostMouseButtons.clear(); // no terminal gesture ownership survives a tty handoff
+    // No ordinary host-pane ownership survives a TTY handoff. The abandoned
+    // session press keeps its retired fence — its own state in the one store —
+    // so its release still cannot reach a child without its press.
+    cancelSessionPointerGesture();
+    clearHostButtonOwnership();
     const controller = new AbortController();
     externalEditorAbort = controller;
     let terminalPaused = false;
@@ -4609,7 +5306,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const replacementId = options?.replacementId;
     const oldSlot = rowSlots.get(id);
     const replacementSlot = replacementId === undefined ? undefined : rowSlots.get(replacementId);
-    const replacementRecord = replacementSlot === undefined ? undefined : rosterRecords.get(replacementSlot);
+    const replacementRecord = replacementSlot === undefined ? undefined : roster.getLocal(replacementSlot);
     const wasSyncing = rosterSyncInProgress;
     if (replacing) sidebar.noteRowReplacement(id);
     let removed: boolean;
@@ -4639,16 +5336,19 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       return "retained";
     }
     removedExitedIds.add(id);
+    let slotTransferred = false;
     if (replacing && replacementId !== undefined && oldSlot !== undefined
       && replacementSlot !== undefined && replacementSlot !== oldSlot
-      && replacementRecord !== undefined && rosterRecords.has(oldSlot)) {
-      // Updating an existing Map key preserves its original remembered position;
-      // the replacement's own appended slot is dropped at the same moment.
-      rosterRecords.set(oldSlot, { ...replacementRecord, slotId: oldSlot, rowId: replacementId });
-      rosterRecords.delete(replacementSlot);
+      && replacementRecord !== undefined && roster.getLocal(oldSlot) !== undefined) {
+      // Updating an existing canonical entry keeps its original remembered
+      // position; the replacement's own appended slot is dropped at the same
+      // moment, and no remote entry moves.
+      roster.setLocal({ ...replacementRecord, slotId: oldSlot, rowId: replacementId });
+      roster.deleteLocal(replacementSlot);
       rowSlots.delete(id);
       rowSlots.set(replacementId, oldSlot);
       if (rememberedActiveSlot === replacementSlot) rememberedActiveSlot = oldSlot;
+      slotTransferred = true;
     }
     if (contentTarget?.kind === "local" && contentTarget.id === id) {
       contentTarget = undefined;
@@ -4656,6 +5356,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
     // Authoritatively settled removal never activates a sibling or loses its owner.
     syncRosterAndSchedule();
+    if (slotTransferred) {
+      // The transferred slot is a fact of THIS host's roster authority, not of
+      // the manager, and the manager change that already published the rows
+      // happened before the transfer. Ask the owning-host service for one more
+      // guarded observation so a live inventory watcher never keeps the
+      // replacement's temporary slot. No slot state is copied or cached here;
+      // the service re-reads the same authority through the same accessor.
+      hostService.notifyRosterAuthorityChange();
+    }
     reconcileLayout(true);
     return "removed";
   }
@@ -6612,6 +7321,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         selectRemoteContent(action.hostId, action.hostRunId, action.rowId);
         return;
       }
+      case "reorder-session": {
+        // One committed left-roster reorder: the sidebar's transient preview is
+        // committed HERE and nowhere else.
+        applySessionReorder(action.source, action.target, action.placement);
+        return;
+      }
       case "detach-view": {
         // Explicit "display nothing" (#474): this sidebar stops displaying,
         // feeding, and sizing one session. Owned processes and their work,
@@ -6962,7 +7677,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // advance through its next native-launch checkpoint.
     shutdownPromise = Promise.resolve();
     shutdownRequested = true;
-    hostMouseButtons.clear();
+    // Teardown ends every held-button state at once: no ordinary host-pane
+    // press, live session gesture, or retired session fence survives this run.
+    mouseButtonOwnership.clear();
+    // An in-flight session-card gesture never survives teardown: its ONE timer is
+    // cleared and no reorder, activation, or preview is committed on the way out.
+    // Shutdown disables whatever tracking mode this host last owned, including a
+    // drag's temporary drag-reporting upgrade.
+    clearSessionPointerEdgeTimer();
     savedCatalog = undefined;
     savedCatalogPickerId = undefined;
     savedCatalogRequestId = undefined;
@@ -7405,6 +8127,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       },
       initialVisible: true,
       onAction: handleSidebarAction,
+      // The sidebar's read-only view of this host's ONE canonical mixed order
+      // (#477): the current runtime identities of the cards it is drawing, in
+      // the sequence the canonical roster holds. The sidebar stores nothing from
+      // it and owns no order of its own; a committed move comes back to Main as
+      // one reorder action and is revalidated here.
+      getSessionOrder: currentSessionOrderView,
       onInvalidate: () => {
         invalidateSavedDeleteConfirmationDisplay();
         invalidateRemoteCloseConfirmationDisplay();

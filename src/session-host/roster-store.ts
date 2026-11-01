@@ -37,12 +37,14 @@ import { MAX_NATIVE_SESSION_NAME_LENGTH, isValidNativeSessionId } from "./protoc
  *
  * Two files live in that private directory:
  *
- * - `roster.json` — the bounded ordered roster: for each remembered sidebar
- *   slot, the last observed CURRENT authenticated native conversation id, its
- *   explicit workspace, and optional display name/persistence evidence, plus
- *   the remembered active slot. Publication is a same-directory exclusive temp
- *   file (mode 0600) plus fsync and an atomic rename; a reader observes either
- *   the previous committed roster or the new one.
+ * - `roster.json` — the bounded ordered roster: ONE ordered entry sequence that
+ *   mixes, for each remembered sidebar slot, the last observed CURRENT
+ *   authenticated native conversation id, its explicit workspace, and optional
+ *   display name/persistence evidence, with each remembered REMOTE card's
+ *   durable presentation identity (#477), plus the remembered active local slot.
+ *   Publication is a same-directory exclusive temp file (mode 0600) plus fsync
+ *   and an atomic rename; a reader observes either the previous committed roster
+ *   or the new one.
  * - `host-ownership.json` — the exclusive ownership record of the one host
  *   that may own this agent directory at a time.
  *
@@ -59,8 +61,33 @@ import { MAX_NATIVE_SESSION_NAME_LENGTH, isValidNativeSessionId } from "./protoc
  *   record, and only when the caller has settled its owned children.
  */
 
-/** Version of the persisted roster schema; unknown versions are refused. */
-export const ROSTER_STORE_VERSION = 1;
+/**
+ * Version of the persisted roster schema this host publishes; any other version
+ * except the one legacy version below is refused.
+ *
+ * Version 2 keeps ONE ordered `entries` array that mixes the two kinds of
+ * sidebar placement entry a host actually draws:
+ *
+ * - a remembered LOCAL slot, whose payload shape is exactly the version-1
+ *   `RosterEntry` shape (no identity wrapper around it), and
+ * - a remote presentation identity (#477): the owner-side durable slot, or the
+ *   legacy owner-run-plus-row tuple, plus the local saved-destination handle.
+ *   A remote entry carries presentation identity ONLY — no remote status, no
+ *   roster DTO, no runtime action or input target.
+ *
+ * Ordered membership is the whole point: the array order IS the sidebar order.
+ * There is deliberately no second ordered key list, no per-kind array, and no
+ * retained version-1 array beside the version-2 one.
+ */
+export const ROSTER_STORE_VERSION = 2;
+
+/**
+ * The single-host local-only roster document version (#331). It is READ only to
+ * normalize one existing document into the sole current representation, in the
+ * same order with the same local records and the same remembered active slot.
+ * It is never written again, and no host keeps both representations at once.
+ */
+export const ROSTER_STORE_LEGACY_VERSION = 1;
 
 /** Private session-host state directory name inside the Pi agent directory. */
 export const HOST_STATE_DIRNAME = "session-host";
@@ -92,7 +119,11 @@ const COORDINATION_UNREMOVABLE_DEADLINE_MS = 120_000;
 /** Bounded canonical record: `<pid>\n<owner identity>\n`. */
 const MAX_COORDINATION_BYTES = 192;
 
-/** Upper bound for remembered roster entries; larger rosters are never published. */
+/**
+ * Upper bound for remembered LOCAL roster slots; a larger set is never
+ * published. Remote placement entries carry presentation identity only and are
+ * bounded by the shared document byte bound instead.
+ */
 export const MAX_ROSTER_ENTRIES = 64;
 
 /** Upper bound for the whole published roster document. */
@@ -117,6 +148,13 @@ export type RosterPersistence = "saved" | "unsaved" | "unknown";
  * explicitly removed.
  */
 export interface RosterEntry {
+  /**
+   * Union discriminator. A local entry needs no wrapper around its identity, so
+   * the canonical persisted local payload is exactly the version-1 shape and
+   * carries NO `kind`; the property is optional purely so a producer or consumer
+   * can discriminate the ordered union by kind.
+   */
+  readonly kind?: "local";
   /** Stable slot key; survives native /new and /resume conversation changes. */
   readonly slotId: string;
   /** Last observed CURRENT authenticated native conversation id, when observed. */
@@ -129,10 +167,42 @@ export interface RosterEntry {
   readonly persistence?: RosterPersistence;
 }
 
+/**
+ * Owner side of one persisted remote presentation identity (#477). `slot` is
+ * the owner's durable roster slot for that row; `runtime` is a legacy owner-side
+ * runtime identity that names BOTH the observed owner run and the row id, so a
+ * row id reused on a new owner run is a different identity and never aliases the
+ * old card. Nothing here is an address: the owner's own runtime row stays the
+ * selection, input, and action target.
+ */
+export type StoredRosterOwnerKind = "slot" | "runtime";
+
+/** One owner-side remote identity component. */
+export interface StoredRosterOwner {
+  readonly kind: StoredRosterOwnerKind;
+  readonly id: string;
+}
+
+/**
+ * One remote placement entry in the ordered roster: durable presentation
+ * identity ONLY, so a remembered remote card keeps its position across the
+ * owner's absence, reconnect, and restart without this host caching anything
+ * about the remote session itself.
+ */
+export interface RemoteRosterEntry {
+  readonly kind: "remote";
+  /** This viewer's local saved-destination handle for the owning host. */
+  readonly hostId: string;
+  readonly owner: StoredRosterOwner;
+}
+
+/** One entry of the single ordered roster sequence, local or remote. */
+export type StoredRosterEntry = RosterEntry | RemoteRosterEntry;
+
 /** The whole persisted roster document. */
 export interface StoredRoster {
   readonly version: typeof ROSTER_STORE_VERSION;
-  readonly entries: readonly RosterEntry[];
+  readonly entries: readonly StoredRosterEntry[];
   /** Remembered active slot; never a manager row id from another host run. */
   readonly activeSlotId?: string;
 }
@@ -168,26 +238,114 @@ function isPersistence(value: unknown): value is RosterPersistence {
 }
 
 /**
+ * Bound for the saved-destination handle of one remote placement entry. The
+ * handle is the same bounded local destination id the peer destination store
+ * already admits, and the roster slot bound above is the same 128-character
+ * bound the owner-side roster uses.
+ */
+const MAX_ROSTER_REMOTE_HOST_ID_CHARS = MAX_SLOT_ID_CHARS;
+/**
+ * Bounds of the two parts a legacy runtime tuple can name, taken from the
+ * existing remote boundaries rather than invented here: a display row id is
+ * bounded at 256 UTF-8 bytes (and therefore at most 256 UTF-16 code units) with
+ * control characters refused outright, and an owner run id is a roster-bridge
+ * identifier bounded at 64 bytes. With control characters impossible, JSON
+ * escaping at most doubles each part (every `"` or `\` becomes two characters),
+ * and the tuple itself adds only `[`, `]`, `,`, and two quote pairs.
+ */
+const MAX_ROSTER_LEGACY_ROW_ID_CHARS = 256;
+const MAX_ROSTER_LEGACY_RUN_ID_CHARS = 64;
+/**
+ * Bound for one remote identity's owner component, derived from those bounds:
+ * a durable owner-side roster slot is bounded at 128 characters by the remote
+ * roster boundary, and a legacy `[owner run, row id]` JSON tuple is at most
+ * `2 * (256 + 64) + 6` escaped characters. Every protocol-valid identity of
+ * either shape fits; anything larger is not one and is refused, while the
+ * shared whole-document byte cap still bounds how many such identities a
+ * roster can carry.
+ */
+const MAX_ROSTER_REMOTE_OWNER_ID_CHARS = 2 * (MAX_ROSTER_LEGACY_ROW_ID_CHARS + MAX_ROSTER_LEGACY_RUN_ID_CHARS) + 6;
+
+/** A publishable remote destination handle. */
+export function isValidRosterRemoteHostId(value: unknown): value is string {
+  return isBoundedText(value, MAX_ROSTER_REMOTE_HOST_ID_CHARS);
+}
+
+/** A publishable remote owner-side identity component. */
+export function isValidRosterRemoteOwnerId(value: unknown): value is string {
+  return isBoundedText(value, MAX_ROSTER_REMOTE_OWNER_ID_CHARS);
+}
+
+/** True for one local entry of the ordered union. */
+export function isLocalRosterEntry(entry: StoredRosterEntry): entry is RosterEntry {
+  return entry.kind !== "remote";
+}
+
+/** Collision-safe identity of one remote placement entry, for duplicate detection. */
+function remoteIdentityKeyOf(hostId: string, owner: StoredRosterOwner): string {
+  return JSON.stringify(["remote", hostId, owner.kind, owner.id]);
+}
+
+/**
+ * Validate one version-2 remote placement entry. A malformed, unbounded,
+ * unknown-kind, or duplicated identity refuses the WHOLE document: a guessed
+ * remote placement is never restored, and the untouched document stays on disk.
+ */
+function parseRemoteRosterEntry(entry: Record<string, unknown>): RemoteRosterEntry | undefined {
+  if (!isValidRosterRemoteHostId(entry.hostId)) return undefined;
+  const ownerValue = entry.owner;
+  if (typeof ownerValue !== "object" || ownerValue === null || Array.isArray(ownerValue)) return undefined;
+  const owner = ownerValue as Record<string, unknown>;
+  if (owner.kind !== "slot" && owner.kind !== "runtime") return undefined;
+  if (!isValidRosterRemoteOwnerId(owner.id)) return undefined;
+  return { kind: "remote", hostId: entry.hostId, owner: { kind: owner.kind, id: owner.id } };
+}
+
+/**
  * Validate one persisted roster document. Any unknown version, malformed
- * entry, duplicate slot, oversized value, or missing active slot refuses the
- * whole document: a partially understood roster is never trusted or rewritten.
+ * entry, duplicate local slot, duplicate remote presentation identity, or
+ * oversized value refuses the whole document: a partially understood roster is
+ * never trusted or rewritten. The version-1 document is accepted ONLY to be
+ * normalized once into this single current representation, preserving its
+ * local order, records, and remembered active slot; it is never re-published in
+ * the legacy shape. The 64-entry allowance is the LOCAL remembered-slot bound
+ * and is independent of how many remote placement references the same document
+ * carries; the whole document stays under the shared byte bound.
  */
 export function parseStoredRoster(value: unknown): StoredRoster | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  if (record.version !== ROSTER_STORE_VERSION) return undefined;
-  if (!Array.isArray(record.entries) || record.entries.length > MAX_ROSTER_ENTRIES) return undefined;
-  const entries: RosterEntry[] = [];
+  const legacy = record.version === ROSTER_STORE_LEGACY_VERSION;
+  if (record.version !== ROSTER_STORE_VERSION && !legacy) return undefined;
+  if (!Array.isArray(record.entries)) return undefined;
+  const entries: StoredRosterEntry[] = [];
+  let localEntries = 0;
   const seen = new Set<string>();
+  const seenRemote = new Set<string>();
   for (const raw of record.entries) {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
     const entry = raw as Record<string, unknown>;
+    if (entry.kind === "remote") {
+      // A version-1 document never carried a remote placement entry; one here is
+      // a malformed document, not a legacy roster to normalize.
+      if (legacy) return undefined;
+      const remote = parseRemoteRosterEntry(entry);
+      if (remote === undefined) return undefined;
+      const identityKey = remoteIdentityKeyOf(remote.hostId, remote.owner);
+      if (seenRemote.has(identityKey)) return undefined;
+      seenRemote.add(identityKey);
+      entries.push(remote);
+      continue;
+    }
+    if (entry.kind !== undefined && entry.kind !== "local") return undefined;
     if (!isBoundedText(entry.slotId, MAX_SLOT_ID_CHARS) || seen.has(entry.slotId)) return undefined;
+    if (localEntries >= MAX_ROSTER_ENTRIES) return undefined;
     if (entry.sessionId !== undefined && !isValidNativeSessionId(entry.sessionId)) return undefined;
     if (entry.workspace !== undefined && !isValidRosterWorkspace(entry.workspace)) return undefined;
     if (entry.name !== undefined && !isValidRosterName(entry.name)) return undefined;
     if (entry.persistence !== undefined && !isPersistence(entry.persistence)) return undefined;
     seen.add(entry.slotId);
+    localEntries += 1;
     entries.push({
       slotId: entry.slotId,
       ...(entry.sessionId !== undefined ? { sessionId: entry.sessionId } : {}),
@@ -196,6 +354,8 @@ export function parseStoredRoster(value: unknown): StoredRoster | undefined {
       ...(entry.persistence !== undefined ? { persistence: entry.persistence } : {}),
     });
   }
+  // The remembered active entry is a LOCAL slot; a remote card never owns this
+  // host's content pane, so the bound and the membership check stay local.
   if (record.activeSlotId !== undefined) {
     if (!isBoundedText(record.activeSlotId, MAX_SLOT_ID_CHARS) || !seen.has(record.activeSlotId)) return undefined;
   }

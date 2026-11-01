@@ -76,7 +76,12 @@ import {
  *
  * The inventory snapshot and watch (#478) are a read-only observation of that
  * same manager: a snapshot is one copied read of `list()`, and a watch observes
- * changes through the manager's existing change hook. This module holds no rows
+ * changes through the manager's existing change hook. The one exception is a
+ * host-signalled re-observation (#477): when the HOST's own roster-slot
+ * authority settles after the manager change that published the rows, the host
+ * asks for one more guarded capture so a watcher never keeps metadata an earlier
+ * capture carried. That path reuses the same single listing and delivery code and
+ * adds no cache, timer, polling, or stored slot state. This module holds no rows
  * of its own, keeps no shadow inventory between reads, adds no polling, no
  * repeating timer, no second listing path, and no network behavior, and never
  * starts, stops, writes, or resizes anything. The only deferred work it performs
@@ -319,8 +324,18 @@ export interface ExitedResumeTarget {
 export interface OwningHostInventorySnapshot {
   readonly hostRunId: string;
   readonly revision: number;
-  readonly rows: readonly NativeInstanceView[];
+  readonly rows: readonly OwningHostInventoryRow[];
 }
+
+/**
+ * One copied inventory row: the manager's own row facts, plus that row's
+ * durable roster slot when the host's roster authority has one for it and the
+ * host supplied the read-only slot accessor (#477). The slot is presentation
+ * metadata captured with the row, not stored slot state, and it never becomes
+ * an identity: the row's own `id` inside this run stays the only selection,
+ * input, and action target.
+ */
+export type OwningHostInventoryRow = NativeInstanceView & { readonly rosterSlotId?: string };
 
 /**
  * One live inventory watch. `snapshot` is the state captured when the watch was
@@ -492,16 +507,47 @@ const MAX_INVENTORY_DELIVERY_ROUNDS = 8;
 const MAX_CONTENT_CAPTURE_ATTEMPTS = 3;
 
 /**
+ * One live read of the host's existing roster authority for one row. Every
+ * unusable answer — no accessor, a throw, a non-string, an empty string — is
+ * honest absence, so a metadata read can never make an inventory unreadable and
+ * can never invent a slot.
+ */
+function readRosterSlotId(
+  rowId: string,
+  rosterSlotIdFor: ((rowId: string) => string | undefined) | undefined,
+): string | undefined {
+  if (rosterSlotIdFor === undefined) return undefined;
+  try {
+    const value = rosterSlotIdFor(rowId);
+    return typeof value === "string" && value.length > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Copy one manager listing into immutable snapshot rows. The manager's own
  * listing is already copied and frozen; copying again here keeps a snapshot
  * immune to a later in-place mutation of whatever the manager handed back,
  * without retaining anything after the snapshot is released.
+ *
+ * Each copied row additionally carries the host's roster slot for that row id
+ * when the host's read-only accessor answers with one (#477). That value is
+ * read live, once per row, from the host's existing authority: this module owns
+ * no slot state, and a row whose slot cannot be read simply carries none.
  */
-function copyInventoryRows(rows: readonly NativeInstanceView[]): readonly NativeInstanceView[] {
-  return Object.freeze(rows.map((row) => Object.freeze({
-    ...row,
-    activity: Array.isArray(row.activity) ? Object.freeze([...row.activity]) : row.activity,
-  })));
+function copyInventoryRows(
+  rows: readonly NativeInstanceView[],
+  rosterSlotIdFor: ((rowId: string) => string | undefined) | undefined,
+): readonly OwningHostInventoryRow[] {
+  return Object.freeze(rows.map((row) => {
+    const rosterSlotId = readRosterSlotId(row.id, rosterSlotIdFor);
+    return Object.freeze({
+      ...row,
+      activity: Array.isArray(row.activity) ? Object.freeze([...row.activity]) : row.activity,
+      ...(rosterSlotId === undefined ? {} : { rosterSlotId }),
+    });
+  }));
 }
 
 /** Writable mirror of one readonly frame fact, used only while copying it. */
@@ -590,6 +636,17 @@ export interface OwningHostServiceDependencies {
    * module has no lifecycle state of its own to fall out of sync with Main.
    */
   readonly teardownRequested: () => boolean;
+  /**
+   * Narrow read-only view of the host's EXISTING roster-slot authority for one
+   * manager row id (#477). The host owns every slot; this service keeps no slot
+   * map, mirror, cache, or second roster, and never mutates anything. It asks
+   * this accessor once per row of one capture, at capture time, and treats a
+   * missing answer, a non-string, an empty string, or a throw as honest absence
+   * — never as a guess from a label, path, or conversation. Absent (the default)
+   * means no inventory row ever carries slot metadata, which is exactly the
+   * pre-#477 behaviour.
+   */
+  readonly rosterSlotIdFor?: (rowId: string) => string | undefined;
 }
 
 export interface OwningHostService {
@@ -637,6 +694,24 @@ export interface OwningHostService {
    * Throws only on a non-callable listener, which is a programmer error.
    */
   watchInventory(listener: OwningHostInventoryListener): OwningHostInventoryWatch | undefined;
+  /**
+   * Re-observe the inventory once and deliver it to the live inventory watches
+   * (#477). This exists for one narrow reason: a roster-slot transfer is a fact
+   * of the HOST's own roster authority, not of the manager, so it can settle
+   * AFTER the manager change that already published the rows. Without one
+   * coherent re-observation a watcher would keep the metadata an earlier capture
+   * carried until some unrelated manager change happened to correct it.
+   *
+   * The caller signals this only when its own roster authority actually changed.
+   * The service reads the one manager again through the SAME guarded capture and
+   * delivery path a manager change uses — no cache, no second listing path, no
+   * timer, no polling, and no stored slot state — and issues a strictly newer
+   * revision for this run. With no live watch it captures nothing and consumes
+   * no revision. It starts, stops, writes, and resizes nothing, and returns the
+   * delivered snapshot, or undefined when nothing could be observed (no manager,
+   * teardown started, or another capture's listing in flight).
+   */
+  notifyRosterAuthorityChange(): OwningHostInventorySnapshot | undefined;
   /**
    * Install one live content watch over the one manager that owns `sessionId`.
    * The returned watch carries the snapshot captured at installation, and the
@@ -937,6 +1012,22 @@ class LocalOwningHostService implements OwningHostService {
         watch.active = false;
         if (this.#inventoryWatches.get(watch.id) === watch) this.#inventoryWatches.delete(watch.id);
       },
+    });
+  }
+
+  notifyRosterAuthorityChange(): OwningHostInventorySnapshot | undefined {
+    // With no live watch there is nothing to keep coherent, and — exactly as in
+    // the manager-change path — no listing is taken and no revision is issued.
+    if (this.#inventoryWatches.size === 0) return undefined;
+    // One guarded capture and delivery over the one manager, on the same path a
+    // manager change uses: a change landing inside it is retained for a newer
+    // capture instead of overtaking this one, and a watcher is never handed an
+    // older observation after a newer one.
+    return this.#withInventoryGuard((): OwningHostInventorySnapshot | undefined => {
+      const snapshot = this.#captureInventory();
+      if (snapshot === undefined) return undefined;
+      this.#notifyInventory(snapshot);
+      return snapshot;
     });
   }
 
@@ -1425,9 +1516,9 @@ class LocalOwningHostService implements OwningHostService {
   #captureInventoryOnce(): OwningHostInventorySnapshot | undefined {
     const manager = this.#manager;
     if (manager === undefined || this.dependencies.teardownRequested()) return undefined;
-    let rows: readonly NativeInstanceView[];
+    let rows: readonly OwningHostInventoryRow[];
     try {
-      rows = copyInventoryRows(manager.list());
+      rows = copyInventoryRows(manager.list(), this.dependencies.rosterSlotIdFor);
     } catch {
       // An unreadable listing is an unavailable inventory, never an empty one.
       return undefined;

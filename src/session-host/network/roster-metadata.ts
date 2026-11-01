@@ -22,6 +22,14 @@
  * claims row authority only. Unknown and absent observations stay `null`:
  * they are never coerced to zero, `false`, or idle.
  *
+ * One row field is owner-side presentation metadata rather than an observation:
+ * the optional `rosterSlotId`, the owner's already-durable sidebar roster slot
+ * for that row (#477). It is carried only when the peer negotiated the
+ * roster-slot capability, it is bounded opaque text, and it is never an
+ * identity, an address, or authority: the row's own `id` inside the owner's run
+ * stays the only selection, input, and action target. Nothing here matches a
+ * row by label, workspace path, or conversation.
+ *
  * Error text is the one redaction boundary here. It is stripped of terminal
  * control sequences, locally redacted for recognizable credentials, passed
  * through the shared `redactSensitiveText` helper (whose global behavior is
@@ -51,6 +59,13 @@ export const MAX_REMOTE_LABEL_CHARS = MAX_NATIVE_SESSION_NAME_LENGTH;
 export const MAX_REMOTE_LABEL_BYTES = MAX_NATIVE_SESSION_NAME_LENGTH * 4;
 /** Stable row ids are opaque and bounded; they are data, never a path. */
 export const MAX_REMOTE_ROW_ID_BYTES = 256;
+/**
+ * The owner's durable roster slot id is opaque bounded text (#477). These
+ * bounds stand on their own here; the owner's own roster persistence keeps its
+ * independent slot rule.
+ */
+export const MAX_REMOTE_ROSTER_SLOT_ID_CHARS = 128;
+export const MAX_REMOTE_ROSTER_SLOT_ID_BYTES = MAX_REMOTE_ROSTER_SLOT_ID_CHARS * 4;
 /** Exact owner-side workspace path bytes; oversized paths are unrepresentable. */
 export const MAX_REMOTE_WORKSPACE_BYTES = MAX_SESSION_SPAWN_WORKSPACE_BYTES;
 /** Generic activity follows the local status bound. */
@@ -84,6 +99,14 @@ export interface RemoteNativeSession {
  */
 export interface RemoteSessionMetadata {
   readonly id: string;
+  /**
+   * The owner's durable sidebar roster slot for this row (#477), present only
+   * when the owner has one for that row AND the peer negotiated the roster-slot
+   * capability. Placement metadata only: it never replaces `id` (within the
+   * owner's run) as the selection, input, or action identity, and it is never
+   * matched against a label, path, or conversation.
+   */
+  readonly rosterSlotId?: string;
   readonly label: string;
   /** Exact owner-side workspace path; never resolved, rewritten, or redacted. */
   readonly workspace: string;
@@ -107,6 +130,16 @@ export interface RemoteSessionMetadata {
   readonly exitCode?: number;
   /** Bounded, terminal-safe, redacted diagnostic text; absent when none. */
   readonly error?: string;
+}
+
+/** Owner-side projection options for one roster row. */
+export interface RemoteSessionMetadataProjectionOptions {
+  /**
+   * Carry the owner's durable roster slot for this row (#477). The owner sets
+   * this only for a peer that negotiated the roster-slot capability; absent or
+   * false keeps the legacy row shape.
+   */
+  readonly rosterSlotId?: boolean;
 }
 
 export type RemoteSessionMetadataErrorCode = "ROSTER_ROW_INVALID" | "ROSTER_ROW_TOO_LARGE";
@@ -182,6 +215,22 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 /** Reads only own data properties, so inherited observations are never facts. */
 function ownField(record: Record<string, unknown>, key: string): unknown {
   return Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+}
+
+/**
+ * Bounded opaque validation for the optional roster-slot metadata (#477).
+ * Absent or null is honest absence; a slot is a non-empty display-safe string
+ * inside the owner's slot bound. No shape is imposed beyond that: a slot id is
+ * opaque, and an out-of-bound slot is refused rather than truncated into a
+ * different slot.
+ */
+function readRosterSlotId(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || value.length === 0) invalidRow();
+  if (codePointCount(value) > MAX_REMOTE_ROSTER_SLOT_ID_CHARS) oversizedRow();
+  if (Buffer.byteLength(value, "utf8") > MAX_REMOTE_ROSTER_SLOT_ID_BYTES) oversizedRow();
+  if (UNSAFE_TEXT_RE.test(value)) invalidRow();
+  return value;
 }
 
 function readLifecycle(value: unknown): InstanceLifecycle {
@@ -449,6 +498,7 @@ function readError(value: unknown): string | undefined {
 
 const ALLOWED_ROW_KEYS: ReadonlySet<string> = new Set([
   "id",
+  "rosterSlotId",
   "label",
   "workspace",
   "lifecycle",
@@ -479,13 +529,24 @@ const REQUIRED_ROW_KEYS: readonly string[] = [
  * Reads the allowlisted fields from a row-shaped record. Additional owner
  * fields are ignored here (the projection deliberately accepts the full local
  * view); {@link parseRemoteSessionMetadata} additionally rejects them.
+ *
+ * `allowRosterSlotId` decides only whether the optional owner roster slot may
+ * be carried (#477). A projection that was not given the capability emits the
+ * legacy row shape; the strict decoder accepts the field so a negotiated
+ * transfer round-trips.
  */
-function buildRow(row: object, rejectUnknownNativeKeys: boolean): RemoteSessionMetadata {
+function buildRow(
+  row: object,
+  rejectUnknownNativeKeys: boolean,
+  allowRosterSlotId: boolean,
+): RemoteSessionMetadata {
   const record = row as Record<string, unknown>;
   const exitCode = readExitCode(ownField(record, "exitCode"));
   const error = readError(ownField(record, "error"));
+  const rosterSlotId = allowRosterSlotId ? readRosterSlotId(ownField(record, "rosterSlotId")) : undefined;
   return {
     id: requiredText(ownField(record, "id"), MAX_REMOTE_ROW_ID_BYTES),
+    ...(rosterSlotId === undefined ? {} : { rosterSlotId }),
     label: requiredText(ownField(record, "label"), MAX_REMOTE_LABEL_BYTES, MAX_REMOTE_LABEL_CHARS),
     workspace: requiredExactText(ownField(record, "workspace"), MAX_REMOTE_WORKSPACE_BYTES),
     lifecycle: readLifecycle(ownField(record, "lifecycle")),
@@ -510,10 +571,18 @@ function buildRow(row: object, rejectUnknownNativeKeys: boolean): RemoteSessionM
  * hidden/extra properties are never spread. Malformed or oversized owner rows
  * throw a fixed-code error rather than being silently truncated into a
  * different identity, workspace, or target.
+ *
+ * The owner's roster slot is carried only when the caller says the peer
+ * negotiated it. An unrequested projection is exactly the pre-#477 row, so a
+ * peer that never acknowledged the capability can never be handed an unknown
+ * field by this boundary.
  */
-export function toRemoteSessionMetadata(view: NativeInstanceView): RemoteSessionMetadata {
+export function toRemoteSessionMetadata(
+  view: NativeInstanceView,
+  options?: RemoteSessionMetadataProjectionOptions,
+): RemoteSessionMetadata {
   try {
-    return buildRow(view, false);
+    return buildRow(view, false, options?.rosterSlotId === true);
   } catch (error) {
     if (error instanceof RemoteSessionMetadataError) throw error;
     // A hostile/odd property read must not leak raw exception detail.
@@ -537,7 +606,7 @@ export function parseRemoteSessionMetadata(value: unknown): RemoteSessionMetadat
     for (const key of REQUIRED_ROW_KEYS) {
       if (!Object.prototype.hasOwnProperty.call(record, key)) return null;
     }
-    return buildRow(record, true);
+    return buildRow(record, true, true);
   } catch {
     return null;
   }

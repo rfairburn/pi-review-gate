@@ -15,6 +15,28 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.246]
+
+### Added
+
+- **Host-independent sidebar session-card order** (#477): local session cards and remote
+  cards from any number of paired destinations can be interleaved in an order you choose,
+  and that mixed order is remembered per viewer across viewer restarts. Left-drag shows a
+  visible insertion marker, commits on release inside the session-list area, cancels on
+  release outside it, and edge-drags an overflowing list; a plain session-card click now
+  activates on release over the same card and a drag activates neither card. `M`/`m`
+  enters keyboard move mode with non-wrapping Up/Down, Enter committing without
+  activation, and Escape restoring the pre-move position. Only session cards — exited
+  rows and the bounded error placeholders included — reorder; action entries and the
+  Terminal diagnostics entry keep their place, and newly observed sessions append in
+  first-observed order. Absent remote rows keep their remembered positions across
+  absence, reconnect, and restart, and a matching returning row reclaims its position.
+  Owners that do not yet publish the optional read-only roster slot metadata stay
+  reorderable by host-qualified runtime row identity. Session identities, actions, input
+  routing, ongoing work, lifecycle, and each owner's authority over its own roster are
+  unchanged. The roster writes one version-2 mixed sequence and accepts valid version-1
+  local rosters; older hosts refuse version 2 without overwriting it.
+
 ## [0.1.0-dev.245]
 
 ### Changed

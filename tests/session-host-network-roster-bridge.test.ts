@@ -47,6 +47,7 @@ import {
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_RENAME_CAPABILITY,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
+  ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
   ROSTER_BRIDGE_SAVED_CAPABILITY,
   ROSTER_BRIDGE_SERVICE,
   RosterBridgeProtocolError,
@@ -2189,7 +2190,8 @@ function refusedFrame(frame: unknown): boolean {
 test("Close is an optional capability with fixed framing and no version or metadata meaning", () => {
   assert.deepEqual([...ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES],
     [ROSTER_BRIDGE_CLOSE_CAPABILITY, ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY,
-      ROSTER_BRIDGE_RENAME_CAPABILITY]);
+      ROSTER_BRIDGE_RENAME_CAPABILITY,
+      ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY]);
   const decision = negotiateRosterBridgeHello(helloFrame([ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_CLOSE_CAPABILITY]));
   assert.equal(decision.ok, true);
   assert.deepEqual(decision.ok ? decision.capabilities : null, [ROSTER_BRIDGE_CLOSE_CAPABILITY]);

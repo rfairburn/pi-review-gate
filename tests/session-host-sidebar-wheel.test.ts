@@ -23,7 +23,10 @@
  * - boundaries, terminal resize, and roster-content changes cannot leave an
  *   invalid offset, a partial card, or an unreachable entry, and a pane too
  *   short for the earlier card refuses that notch without blanking its still
- *   usable window or disabling later wheel reports.
+ *   usable window or disabling later wheel reports;
+ * - a committed session-card reorder (#477) keeps the SAME single viewport: the
+ *   next notch still reveals the rows the reordered list actually wrote, and a
+ *   keyboard step recovers a highlight that the scroll left off-screen.
  *
  * These are synthetic SGR/X10 wheel reports delivered through the terminal
  * input callback. They are input-protocol evidence, not physical-device
@@ -55,6 +58,7 @@ import {
 
 const DOWN = "\x1b[B";
 const UP = "\x1b[A";
+const ENTER = "\r";
 const ESC = "\x1b";
 const ALT_LEFT = `${ESC}[1;3D`;
 /** One SGR wheel report (the #439 input): button 64 up, 65 down, 1-based cells. */
@@ -186,6 +190,18 @@ function rosterRowOf(harness: Harness, text: string): number {
 }
 
 /**
+ * One deliberate session-card click. A session card activates on RELEASE over
+ * that same card (#477), so the gesture is a press plus its matching release on
+ * the identical row; a host action row keeps its unchanged press-time behavior.
+ */
+function clickCard(harness: Harness, title: string): void {
+  const row = rosterRowOf(harness, title);
+  assert.ok(row > 0, `the written pane drew the "${title}" card`);
+  emitMouse(harness.terminal, 1, row);
+  emitMouse(harness.terminal, 1, row, 0, "m");
+}
+
+/**
  * Move the left highlight to the first card with the EXISTING keyboard path, so
  * each case starts from a known window (the render follows the highlight).
  */
@@ -235,7 +251,7 @@ test("the wheel scrolls the list without activating, re-highlighting, refocusing
   await highlightFirstCard(harness);
   // Deliberate activation of one drawn row: the owner, focus, and highlight
   // that the scroll must leave untouched.
-  emitMouse(harness.terminal, 1, rosterRowOf(harness, "Session 2"));
+  clickCard(harness, "Session 2");
   await nextTurn();
   assert.equal(harness.sidebar?.focus, "main", "the click activated Main as before");
   assert.equal(harness.sidebar?.selectedId, "native-2");
@@ -266,7 +282,7 @@ test("region control: a roster wheel never reaches the child, a Main-pane wheel 
   const manager = managerOf(harness);
   await seedRoster(harness, 6);
   await highlightFirstCard(harness);
-  emitMouse(harness.terminal, 1, rosterRowOf(harness, "Session 1"));
+  clickCard(harness, "Session 1");
   await nextTurn();
   assert.equal(harness.sidebar?.focus, "main");
   const writes = manager.writes.length;
@@ -395,7 +411,7 @@ test("resize and roster-content changes keep the viewport valid and every entry 
   await ready(harness);
   await seedRoster(harness, 6);
   await highlightFirstCard(harness);
-  emitMouse(harness.terminal, 1, rosterRowOf(harness, "Session 1"));
+  clickCard(harness, "Session 1");
   await nextTurn();
   emitWheel(harness.terminal, ROSTER_POINT.column, ROSTER_POINT.row, "down");
   emitWheel(harness.terminal, ROSTER_POINT.column, ROSTER_POINT.row, "down");
@@ -431,7 +447,7 @@ test("a short pane refuses a notch whose next entry cannot fit and stays wheel-u
   const harness = createHarness();
   await ready(harness);
   await seedRoster(harness, 1);
-  emitMouse(harness.terminal, 1, rosterRowOf(harness, "Session 1"));
+  clickCard(harness, "Session 1");
   await nextTurn();
   assert.equal(harness.sidebar?.activeMainOwnerID, "native-1", "the drawn card is the observed Main owner");
 
@@ -619,5 +635,174 @@ test("wheel over a form slot, a hidden sidebar, or a horizontal notch never scro
   emitMotionWheel(harness.terminal, ROSTER_POINT.column, ROSTER_POINT.row, "down");
   await nextTurn();
   assert.notEqual(latestFrameText(harness), shown, "a motion-flagged wheel notch still scrolls");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+/** Every card title (local or remote) the pane actually drew, in visible order. */
+function drawnTitles(harness: Harness): string[] {
+  return rosterRows(harness)
+    .map((line) => line.trimEnd())
+    .filter((line) => /^(?:Session \d+|Remote \w+)$/u.test(line));
+}
+
+/** The card title carrying the left highlight, or undefined when it is not drawn. */
+function highlightedTitle(harness: Harness): string | undefined {
+  const rows = rosterRows(harness);
+  const row = rows.findIndex((line) => line.startsWith("> "));
+  if (row < 0) return undefined;
+  for (let back = 1; back <= 4; back += 1) {
+    const candidate = rows[row - back]?.trimEnd();
+    if (candidate !== undefined && /^(?:Session \d+|Remote \w+)$/u.test(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+async function moveToHeadPage(harness: Harness): Promise<void> {
+  for (let notch = 0; notch < 8; notch += 1) {
+    emitWheel(harness.terminal, ROSTER_POINT.column, ROSTER_POINT.row, "up");
+    await nextTurn();
+  }
+}
+
+async function highlightDrawn(harness: Harness, title: string): Promise<void> {
+  for (let step = 0; step < 14; step += 1) {
+    if (highlightedTitle(harness) === title) return;
+    harness.terminal.emitInput(DOWN);
+    await nextTurn();
+  }
+  assert.fail(`the keyboard path never highlighted the drawn card "${title}"`);
+}
+
+/** The title of the card marked as the one being moved, or undefined if not drawn. */
+function markedCardTitle(harness: Harness): string | undefined {
+  const rows = rosterRows(harness);
+  const row = rows.findIndex((line) => line.startsWith(">>"));
+  if (row < 1) return undefined;
+  return rows[row - 1]?.trimEnd();
+}
+
+test("a keyboard move step re-follows its source after a wheel scroll moved it off-screen", async () => {
+  const harness = createHarness();
+  await ready(harness);
+  const manager = managerOf(harness);
+  await seedRoster(harness, 6);
+  await highlightFirstCard(harness);
+  if (harness.sidebar?.focus === "main") harness.terminal.emitInput(ALT_LEFT);
+  await nextTurn();
+  harness.terminal.emitInput("m"); // move mode: the source is marked, nothing previewed yet
+  await nextTurn();
+  assert.equal(markedCardTitle(harness), "Session 1", "the card being moved is marked while still drawn");
+  for (let notch = 0; notch < 3; notch += 1) {
+    emitWheel(harness.terminal, ROSTER_POINT.column, ROSTER_POINT.row, "down");
+    await nextTurn();
+  }
+  assert.ok(!drawnTitles(harness).includes("Session 1"), "the wheel moved the moving card off-screen");
+  assert.equal(markedCardTitle(harness), undefined, "an off-screen moving card draws no marker");
+  const selected = harness.sidebar?.selectedId;
+  const owner = harness.sidebar?.activeMainOwnerKey;
+  const writes = manager.writes.length;
+
+  harness.terminal.emitInput(DOWN); // one keyboard step of the in-progress move
+  await nextTurn();
+  assert.ok(drawnTitles(harness).includes("Session 1"),
+    "the step brought the moving card back into the written window");
+  assert.equal(markedCardTitle(harness), "Session 1", "the returned card is still marked as the one being moved");
+  const markedRows = rosterRows(harness);
+  const markedRow = markedRows.findIndex((line) => line.startsWith(">>"));
+  assert.ok(/^ {2}background /u.test(markedRows[markedRow + 1] ?? ""),
+    "the returned card is drawn COMPLETE, not clipped at the window edge");
+  assert.ok(markedRows.some((line) => /^(?:\^ |v )agent /u.test(line)),
+    "the destination card and its insertion marker came back with it");
+  assert.equal(harness.sidebar?.selectedId, selected, "the wheel and the step moved no highlight");
+  assert.deepEqual(harness.sidebar?.activeMainOwnerKey, owner, "neither gesture changed Main's content owner");
+  assert.equal(manager.writes.length, writes, "no wheel notch or move step reached a child");
+
+  // Enter commits the move the operator can now see, activating nothing.
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+  assert.equal(markedCardTitle(harness), undefined, "the committed move leaves no card marked");
+  assert.equal(harness.sidebar?.selectedId, selected, "committing did not move the highlight");
+  assert.deepEqual(harness.sidebar?.activeMainOwnerKey, owner, "committing activated nothing");
+  assert.equal(manager.writes.length, writes, "committing the move wrote nothing to a child");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("a committed reorder keeps one viewport: the next notch reveals the reordered rows the pane wrote", async (t) => {
+  const { harness, peer } = await peerMainHarness(t);
+  const manager = managerOf(harness);
+  seedSession(harness, 1);
+  seedSession(harness, 2);
+  manager.notify();
+  await nextTurn();
+  const rows: readonly RemoteSessionMetadata[] = ["alpha", "beta", "gamma", "delta"].map((name) => ({
+    id: `row-${name}`,
+    label: `Remote ${name}`,
+    workspace: `/remote/ws/${name}`,
+    lifecycle: "alive",
+    hasLiveProcess: true,
+    busy: null,
+    pendingInput: null,
+    inputSurface: false,
+    activity: [],
+    nativeSession: null,
+    backgroundTasks: null,
+    backgroundShells: null,
+    activeTasks: null,
+    activeShells: null,
+  }));
+  peer.publish({
+    hosts: [{
+      id: "h1", label: "host-one", host: "10.0.0.5", port: 8443, state: "connected",
+      fingerprint: null, message: null, reconnectSuppressed: false, previouslyConnected: true,
+      roster: { state: "current", rows, hostRunId: "run-1" },
+    }],
+  });
+  await nextTurn();
+  await moveToHeadPage(harness);
+  const head = drawnTitles(harness);
+  assert.ok(head.length >= 3 && head.length < 6, `the mixed roster really overflows the page: ${JSON.stringify(head)}`);
+
+  // The existing keyboard move mode, on the existing roster focus rules.
+  if (harness.sidebar?.focus === "main") harness.terminal.emitInput(ALT_LEFT);
+  await nextTurn();
+  await highlightDrawn(harness, head[1]);
+  harness.terminal.emitInput("m");
+  await nextTurn();
+  harness.terminal.emitInput(UP);
+  await nextTurn();
+  harness.terminal.emitInput(ENTER); // commits the move, activates nothing
+  await nextTurn();
+  const reordered = drawnTitles(harness);
+  assert.deepEqual(reordered.slice(0, 2), [head[1], head[0]],
+    "the committed reorder is what the written frame now draws");
+
+  const commands = peer.commands.length;
+  const writes = manager.writes.length;
+  const selected = harness.sidebar?.selectedId;
+  const owner = harness.sidebar?.activeMainOwnerKey;
+
+  emitWheel(harness.terminal, ROSTER_POINT.column, ROSTER_POINT.row, "down");
+  await nextTurn();
+  const revealed = drawnTitles(harness);
+  assert.equal(revealed[0], reordered[1],
+    "one notch down reveals the next entry of the REORDERED list, not the pre-reorder one");
+  assert.ok(revealed.some((title) => !reordered.includes(title)),
+    "the notch revealed a reordered row that was off-screen");
+  assert.equal(harness.sidebar?.selectedId, selected, "the reorder and the wheel moved no highlight");
+  assert.deepEqual(harness.sidebar?.activeMainOwnerKey, owner, "neither gesture changed Main's content owner");
+
+  // A keyboard step re-engages the follow rule and brings the highlighted card
+  // back into the drawn window after the scroll moved it off-screen.
+  let recovered = highlightedTitle(harness);
+  for (let step = 0; step < 10 && recovered === undefined; step += 1) {
+    harness.terminal.emitInput(DOWN);
+    await nextTurn();
+    recovered = highlightedTitle(harness);
+  }
+  assert.notEqual(recovered, undefined, "a keyboard step recovers the off-screen highlight into the drawn window");
+  assert.ok(recovered !== undefined && drawnTitles(harness).includes(recovered),
+    "the recovered highlight names an actually drawn card");
+  assert.equal(manager.writes.length, writes, "no reorder, wheel, or keyboard step wrote to a child");
+  assert.equal(peer.commands.length, commands, "the gestures asked any owner for nothing");
   assert.equal(await closeWithSignal(harness), 0);
 });

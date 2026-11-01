@@ -4,8 +4,9 @@ import test from "node:test";
 import type { PeerRenameController, PeerRenameOptions, PeerRenameResult, PeerRenameTarget } from "../src/session-host/network/peer-rename";
 import type { PeerUiHost } from "../src/session-host/peer-ui-protocol";
 import { remotePeerHost, remoteRosterRow } from "./helpers/session-host-main-remote";
+import { sidebarPaneLines } from "./helpers/session-host-native-roster-witness";
 import {
-  ALT_LEFT, ENTER, FakePeerCoordinator, closeWithSignal, fillForm, nextTurn, peerMainHarness,
+  ALT_LEFT, ENTER, emitMouse, FakePeerCoordinator, closeWithSignal, fillForm, nextTurn, peerMainHarness,
   plain, selectedRosterHostLine, type Harness,
 } from "./helpers/session-host-main-harness";
 
@@ -239,4 +240,87 @@ test("a settled remote refusal or uncertainty preserves the draft but requires a
   assert.equal(harness.sidebar!.focus, "sidebar");
   assert.ok(peer.requests.every((request) => request.name === "Retry draft"));
   assert.equal(harness.manager!.renameCalls.length, 0);
+});
+
+const UP_KEY = "\x1b[A";
+const MOVE_KEY = "m";
+const DRAG_MOTION = 32;
+
+/** The written frame's left-roster pane rows, scoped to the sidebar columns. */
+function paneLines(harness: Harness): string[] {
+  return sidebarPaneLines(plain(harness.writer.frames.at(-1)?.frame));
+}
+
+/** Absolute frame row of the sidebar pane's line that contains `text`. */
+function frameRowOf(harness: Harness, text: string): number {
+  return paneLines(harness).findIndex((line) => line.includes(text));
+}
+
+/** The written roster's owner-host lines, in visible order (label only). */
+function hostLineOrder(harness: Harness): string[] {
+  return paneLines(harness)
+    .map((line) => /^\s*host (?:\[stale\] )?(owner-[ab])\s*$/u.exec(line)?.[1] ?? "")
+    .filter((label) => label !== "");
+}
+
+test("a reorder never retargets a remote Edit: the frozen owner tuple, the draft, and the written receipt survive the move", async (t) => {
+  const peer = new RenamePeer();
+  const { harness } = await peerMainHarness(t, undefined, {}, peer);
+  t.after(async () => { assert.equal(await closeWithSignal(harness), 0); });
+  // Both owners expose the SAME opaque row id and the same native tuple, so a
+  // target re-derived from a drawn position could name the wrong owner. Only
+  // the frozen identity of the card the Edit form opened on may decide.
+  peer.publish({ hosts: [host("owner-a"), host("owner-b")] });
+  await nextTurn();
+
+  // 1. A committed keyboard reorder moves owner-b's card ahead of owner-a's.
+  if (harness.sidebar!.focus === "main") harness.terminal.emitInput(ALT_LEFT);
+  await nextTurn();
+  await highlight(harness, "owner-b");
+  harness.terminal.emitInput(MOVE_KEY);
+  await nextTurn();
+  harness.terminal.emitInput(UP_KEY);
+  await nextTurn();
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+  assert.deepEqual(hostLineOrder(harness), ["owner-b", "owner-a"],
+    "the reorder moved the card in the written frame");
+  await open(harness, "owner-a");
+  harness.terminal.emitInput("After reorder");
+  await nextTurn();
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+  assert.deepEqual(peer.requests, [{
+    hostId: "owner-a", hostRunId: "run-owner-a", rowId: "native-1",
+    expectedSessionId: "conversation-native-1", expectedSessionEpoch: 1, name: "After reorder",
+  }], "the rename still names the owner its form opened on, not the card that took its drawn position");
+
+  // 2. A pointer drag on the still-drawn left roster while the Edit form owns
+  //    the right-hand pane keeps that form, its draft, and its frozen target.
+  const sentBefore = peer.requests.length;
+  await open(harness, "owner-a");
+  harness.terminal.emitInput("Draft kept");
+  await nextTurn();
+  assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Draft kept"), "the drawn form holds its draft");
+  const sourceRow = frameRowOf(harness, "owner-a");
+  const targetRow = frameRowOf(harness, "owner-b");
+  assert.ok(sourceRow > 0 && targetRow > 0, `both owner cards are drawn: ${JSON.stringify(hostLineOrder(harness))}`);
+  emitMouse(harness.terminal, 1, sourceRow);
+  emitMouse(harness.terminal, 1, sourceRow + 1, DRAG_MOTION);
+  emitMouse(harness.terminal, 1, targetRow, DRAG_MOTION);
+  await nextTurn();
+  emitMouse(harness.terminal, 1, targetRow, 0, "m");
+  await nextTurn();
+  assert.deepEqual(hostLineOrder(harness), ["owner-a", "owner-b"],
+    "the drag reordered the cards while the form stayed open");
+  assert.equal(harness.sidebar!.focus, "form", "a roster drag never closed the open Edit form");
+  assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Draft kept"), "the reordered frame still draws the same draft");
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+  assert.equal(peer.requests.length, sentBefore + 1, "the reordered form submits exactly one deliberate rename");
+  assert.deepEqual(peer.requests.at(-1), {
+    hostId: "owner-a", hostRunId: "run-owner-a", rowId: "native-1",
+    expectedSessionId: "conversation-native-1", expectedSessionEpoch: 1, name: "Draft kept",
+  }, "the frozen target and native tuple survived the move");
+  assert.equal(harness.manager!.renameCalls.length, 0, "no local rename was ever attempted");
 });

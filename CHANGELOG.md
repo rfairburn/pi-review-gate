@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.244]
+
+### Fixed
+
+- **Disabled scheduled research entries save with an unusable worker pin** (#576): a
+  settings Save of an Off research task that still pins a worker resource that was
+  removed or is no longer research-capable now persists the entry and its pin, matching
+  the existing load, menu, and scheduler policy that a disabled entry never dispatches.
+  Enabled entries — including entries with no stored `enabled` field, which default to
+  on — keep their strict missing-resource and research-capability refusals, and the
+  independent task-local reviewer check still validates selected external reviewers on
+  disabled entries. No auto-disable, re-enable, migration, fallback, or role/permission
+  behavior changes.
+
 ## [0.1.0-dev.243]
 
 ### Fixed

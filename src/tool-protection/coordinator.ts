@@ -588,6 +588,17 @@ export class ToolProtectionCoordinator {
   private recent: ProtectionEvidence[] = [];
   private evidenceSequence = 0;
   /**
+   * The exact identity of the ORIGINAL text of a record this coordinator had to
+   * clip, held beside the record and never inside it (#590). A retained leading
+   * bound cannot identify the message it came from, so this bounded digest is
+   * what lets the active branch's full copy of that same oversized message be
+   * recognised as the duplicate it is, instead of reaching the audit as a
+   * second, later, `unknown`-origin record. In-memory bookkeeping only: it is
+   * never transmitted, never part of a record, and a WeakMap entry disappears
+   * with the record it describes.
+   */
+  private readonly evidenceOriginalDigests = new WeakMap<ProtectionEvidence, string>();
+  /**
    * The latest live ingress inputs, retained separately from `recent` so
    * tool-result traffic cannot evict the task under audit. Live ingress only —
    * assistant text and tool results stay in the ordinary ring — and it reuses
@@ -1593,7 +1604,12 @@ export class ToolProtectionCoordinator {
     // own diagnostic and keeps its existing note.
     let text = item.text;
     let partial: true | undefined;
+    let originalDigest: string | undefined;
     if (text.length > MAX_RETAINED_EVIDENCE_TEXT) {
+      // Take the exact identity of the original before clipping: the retained
+      // bound alone cannot tell this record's text from another text that starts
+      // the same way (#590).
+      originalDigest = evidenceTextDigest(text);
       text = boundedLeadingText(text, MAX_RETAINED_EVIDENCE_TEXT);
       partial = true;
       if (item.origin === "gate") text = `${text}\n[gate record truncated to the evidence budget]`;
@@ -1605,6 +1621,7 @@ export class ToolProtectionCoordinator {
       createdAt: this.now(),
       ...(partial === undefined ? {} : { partial }),
     };
+    if (originalDigest !== undefined) this.evidenceOriginalDigests.set(record, originalDigest);
     this.recent.push(record);
     while (this.recent.length > this.maxRecentEvidence) {
       this.recent.shift();
@@ -1664,14 +1681,29 @@ export class ToolProtectionCoordinator {
     // live `user` or `extension` provenance.
     const retainedInputs = this.retainedLiveInputs.filter((record) => !live.some((item) => item.id === record.id)
       && !retainedCausal.some((item) => item.id === record.id));
-    const liveTexts = new Set([...live, ...retainedCausal, ...retainedInputs].map((item) => item.text));
-    const branch = collectBranchEvidence(ctx, liveTexts);
+    const captured = [...live, ...retainedCausal, ...retainedInputs];
+    // Duplicate identity is always original-to-original. A record the retention
+    // bound clipped contributes only the digest taken before clipping, never its
+    // retained prefix: that keeps the branch's full copy of an oversized message
+    // from arriving as a second, later, `unknown`-origin record, and keeps a
+    // truncated prefix from ever matching a different message that merely starts
+    // the same way (#590).
+    const liveTexts = new Set<string>();
+    const liveOriginals = new Set<string>();
+    for (const item of captured) {
+      const digest = this.evidenceOriginalDigests.get(item);
+      if (digest !== undefined) liveOriginals.add(digest);
+      else if (item.partial !== true) liveTexts.add(item.text);
+    }
+    const branch = collectBranchEvidence(ctx, liveTexts, liveOriginals);
     // One merged list in host chronology, oldest first. Recency in the bounded
     // context is global, so a cached live record cannot outrank newer branch
     // content and newer branch content cannot be pushed behind an older live
     // record by source grouping; provenance stays on each record (#590).
-    // Duplicates are already excluded above by identity and by text, and equal
-    // or unknown times keep the order the host supplied them in.
+    // Duplicates are already excluded above by identity and by original text, and
+    // equal recorded times fall back to this coordinator's capture sequence, so
+    // which retention container happens to hold a record never decides recency.
+    // Branch content without a capture sequence keeps the order the host supplied.
     const combined = [...branch, ...retainedInputs, ...live, ...retainedCausal]
       .sort((a, b) => compareCreatedAt(a, b));
     const chain = this.chain;
@@ -1687,7 +1719,7 @@ export class ToolProtectionCoordinator {
   }
 
   private seedBranchEvidence(ctx: unknown): void {
-    const branch = collectBranchEvidence(ctx, new Set());
+    const branch = collectBranchEvidence(ctx, new Set(), new Set());
     this.recent = branch.slice(-this.maxRecentEvidence);
     // `retainedLiveInputs` deliberately stays empty after a reset: branch text
     // cannot prove live ingress provenance, so a restored message is never
@@ -1988,6 +2020,17 @@ function findAssistantMessage(args: unknown[]): { content?: unknown } | undefine
 }
 
 /**
+ * The exact identity of one supplied text as a fixed-size digest of its UTF-16
+ * code units. `utf16le` is deliberate: it encodes the code units the host
+ * supplied as they are, so two different raw strings — including ones holding
+ * unpaired surrogates — cannot collapse into the same bytes the way a UTF-8
+ * encoding with replacement characters would.
+ */
+function evidenceTextDigest(text: string): string {
+  return createHash("sha256").update(text, "utf16le").digest("hex");
+}
+
+/**
  * The leading `limit` code units of one retained text, never split in the middle
  * of a non-BMP character: a lone surrogate would be quoted back as an escape the
  * host never sent.
@@ -2007,7 +2050,11 @@ function boundedLeadingText(text: string, limit: number): string {
  * projection-derived text is labelled `unknown` because the branch does not
  * preserve the live input source; hidden thinking is never included.
  */
-function collectBranchEvidence(ctx: unknown, exclude: Set<string>): ProtectionEvidence[] {
+function collectBranchEvidence(
+  ctx: unknown,
+  exclude: ReadonlySet<string>,
+  excludeOriginals: ReadonlySet<string>,
+): ProtectionEvidence[] {
   if (!isRecord(ctx) || !isRecord(ctx.sessionManager)) return [];
   const manager = ctx.sessionManager;
   let entries: unknown;
@@ -2026,8 +2073,9 @@ function collectBranchEvidence(ctx: unknown, exclude: Set<string>): ProtectionEv
     const entry = entries[index];
     if (!isRecord(entry)) continue;
     if (entry.type === "compaction" || entry.type === "branch_summary") {
-      const rawSummary = typeof entry.summary === "string" ? entry.summary.trim() : "";
-      if (!rawSummary || exclude.has(rawSummary)) continue;
+      const extractedSummary = typeof entry.summary === "string" ? entry.summary : "";
+      const rawSummary = extractedSummary.trim();
+      if (!rawSummary || excludedBranchText(extractedSummary, rawSummary, exclude, excludeOriginals)) continue;
       // An oversized summary is kept as its leading portion and marked, instead
       // of disappearing while older material fills the budget (#590).
       const summary = boundedLeadingText(rawSummary, MAX_BRANCH_MESSAGE_CHARS);
@@ -2053,7 +2101,7 @@ function collectBranchEvidence(ctx: unknown, exclude: Set<string>): ProtectionEv
           .join("")
         : "";
     const raw = text.trim();
-    if (!raw || exclude.has(raw)) continue;
+    if (!raw || excludedBranchText(text, raw, exclude, excludeOriginals)) continue;
     // A branch user message may have arrived from an extension or RPC path and
     // is never treated as authenticated approval. An oversized message is kept
     // as its leading portion and marked, so the newest session content still
@@ -2068,6 +2116,32 @@ function collectBranchEvidence(ctx: unknown, exclude: Set<string>): ProtectionEv
     });
   }
   return collected;
+}
+
+/**
+ * Does this branch entry duplicate a record this session already captured?
+ * Captured records keep their text bounded, so an oversized message is matched
+ * by the identity taken before clipping rather than by its retained prefix: a
+ * prefix match would let the branch's full copy of the same message through as
+ * a second record, and would merge two different messages that start the same
+ * way (#590).
+ *
+ * The two comparisons use their own input deliberately. The exact-text
+ * comparison stays on the presentation-trimmed text it has always used, while
+ * the original-digest comparison uses the extracted text exactly as the entry
+ * supplied it: captured digests are taken from untrimmed originals, so digesting
+ * trimmed branch text would both miss the identical copy of a message that ends
+ * in a newline and merge two originals that differ only in boundary whitespace.
+ * Neither input is normalized (#590).
+ */
+function excludedBranchText(
+  extracted: string,
+  trimmed: string,
+  exclude: ReadonlySet<string>,
+  excludeOriginals: ReadonlySet<string>,
+): boolean {
+  if (exclude.has(trimmed)) return true;
+  return excludeOriginals.size > 0 && excludeOriginals.has(evidenceTextDigest(extracted));
 }
 
 /**
@@ -2088,13 +2162,33 @@ function entryCreatedAt(entry: Record<string, unknown>): { createdAt?: number } 
 
 /**
  * Host chronology for merged evidence. A record with no recorded time sorts
- * oldest, so known times always win the ordering; equal times keep the order the
- * host supplied, which is how the session recorded them.
+ * oldest, so known times always win the ordering. For equal times, records this
+ * coordinator captured are ordered by the capture sequence their id carries:
+ * which retention container happens to hold a record must not decide recency, or
+ * a causal record kept outside the ordinary ring outranks a newer input captured
+ * in the same millisecond (#590). Branch and summary records carry no capture
+ * sequence and keep the order the host supplied them in.
  */
 function compareCreatedAt(a: ProtectionEvidence, b: ProtectionEvidence): number {
   const left = typeof a.createdAt === "number" && Number.isFinite(a.createdAt) ? a.createdAt : UNDATED_CREATED_AT;
   const right = typeof b.createdAt === "number" && Number.isFinite(b.createdAt) ? b.createdAt : UNDATED_CREATED_AT;
-  return left < right ? -1 : left > right ? 1 : 0;
+  if (left !== right) return left < right ? -1 : left > right ? 1 : 0;
+  const leftSequence = captureSequenceOf(a);
+  const rightSequence = captureSequenceOf(b);
+  if (leftSequence === undefined || rightSequence === undefined) return 0;
+  return leftSequence < rightSequence ? -1 : leftSequence > rightSequence ? 1 : 0;
+}
+
+/**
+ * The capture sequence one record was recorded with, read from the id that
+ * capture assigned it (`tp-<sequence>`). This is the coordinator's existing
+ * evidence sequence, not a second counter kept alongside it.
+ */
+function captureSequenceOf(item: ProtectionEvidence): number | undefined {
+  const match = /^tp-(\d+)$/.exec(item.id);
+  if (match === null) return undefined;
+  const value = Number(match[1]);
+  return Number.isSafeInteger(value) ? value : undefined;
 }
 
 const UNDATED_CREATED_AT = Number.MIN_SAFE_INTEGER;

@@ -2445,6 +2445,206 @@ test("an oversized branch summary is carried as a bounded portion the same way (
   assert.ok(summaryLine !== undefined && summaryLine.includes('"partial":true'), "and says it is a leading portion");
 });
 
+test("an oversized live input and the branch's identical copy stay one user-origin record (#590)", async () => {
+  for (const maxContextChars of [1_000, 4_000]) {
+    const { coordinator, calls } = coordinatorHarness({
+      config: enabledConfig({ maxContextChars }),
+      results: [{ output: '{"decision":"PASS"}' }],
+    });
+    const host = fakeHost();
+    coordinator.registerHooks(host.pi);
+    // A genuine interactive instruction beyond the retention bound: the live
+    // record keeps only its leading bound. The active branch carries the
+    // identical full copy with a slightly later timestamp. Duplicate identity
+    // taken from the retained prefix would miss that copy, and the auditor would
+    // receive the same message twice — the second time labelled `unknown` and
+    // ranked newer, so it is the copy that wins the budget (#590).
+    const original = `OVERSIZE-HEAD approved to run the export ${"u".repeat(205_000)} OVERSIZE-TAIL`;
+    const ctx = hostContext({
+      sessionManager: {
+        buildContextEntries: () => [
+          { type: "message", timestamp: 5_000, message: { role: "user", content: original } },
+        ],
+      },
+    });
+    await host.emit("input", { text: original, source: "interactive" }, ctx);
+    assert.equal(await coordinator.admitToolCall(callArgs(`oversize-duplicate-${maxContextChars}`, "bash", { command: "echo hi" }, ctx)), undefined,
+      "the oversized instruction is audited rather than refused for its size");
+    assert.equal(calls.length, 1, "one audit, and the scripted verdict decides the call");
+    const prompt = calls[0]!.prompt;
+    const records = prompt.split("\n").filter((line) => line.includes("OVERSIZE-HEAD"));
+    assert.equal(records.length, 1, `the same oversized message reached the auditor ${records.length} times at a ${maxContextChars} budget`);
+    assert.ok(records[0]!.includes('"metadata":"origin=user |'),
+      "the one record is the live record with its user provenance, not the branch's unknown-origin copy");
+    assert.ok(records[0]!.includes('"partial":true'), "and it says structurally that only its leading portion is carried");
+    assert.ok(!prompt.includes("OVERSIZE-TAIL"), "the oversized tail stayed bounded");
+    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
+    assert.ok(prompt.length > maxContextChars, "the unchanged fixed instruction blocks are additional to that budget");
+  }
+});
+
+test("a branch message sharing an oversized prefix but differing later is never merged with the live record (#590)", async () => {
+  for (const maxContextChars of [1_000, 4_000]) {
+    const { coordinator, calls } = coordinatorHarness({
+      config: enabledConfig({ maxContextChars }),
+      results: [{ output: '{"decision":"PASS"}' }],
+    });
+    const host = fakeHost();
+    coordinator.registerHooks(host.pi);
+    // Two different messages whose first 205_000 code units are identical. The
+    // live record's retained prefix is the same as the branch message's, so a
+    // prefix comparison would silently drop the branch message as a duplicate.
+    // Its own record and its own `unknown` provenance have to survive (#590).
+    const shared = `LOOKALIKE-HEAD approved to run the export ${"u".repeat(205_000)}`;
+    const ctx = hostContext({
+      sessionManager: {
+        buildContextEntries: () => [
+          { type: "message", timestamp: 5_000, message: { role: "user", content: `${shared} BRANCH-ONLY-TAIL` } },
+        ],
+      },
+    });
+    await host.emit("input", { text: `${shared} LIVE-ONLY-TAIL`, source: "interactive" }, ctx);
+    assert.equal(await coordinator.admitToolCall(callArgs(`oversize-lookalike-${maxContextChars}`, "bash", { command: "echo hi" }, ctx)), undefined);
+    assert.equal(calls.length, 1);
+    const prompt = calls[0]!.prompt;
+    const records = prompt.split("\n").filter((line) => line.includes("LOOKALIKE-HEAD"));
+    assert.equal(records.length, 1, `the budget carried ${records.length} copies of the lookalike prefix at a ${maxContextChars} budget`);
+    assert.ok(records[0]!.includes('"metadata":"origin=unknown |') && records[0]!.includes("id=branch-0"),
+      "the distinct branch message stays its own unknown-origin record instead of being deduped into the live user record");
+    assert.ok(records[0]!.includes('"partial":true'), "and it is marked as a leading portion, never a complete statement");
+    assert.ok(!prompt.includes('"metadata":"origin=user |'),
+      "no user-labelled record carries the distinct branch text");
+    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
+  }
+});
+
+test("an oversized original with boundary whitespace and its identical branch copy stay one record (#590)", async () => {
+  for (const maxContextChars of [1_000, 4_000]) {
+    const { coordinator, calls } = coordinatorHarness({
+      config: enabledConfig({ maxContextChars }),
+      results: [{ output: '{"decision":"PASS"}' }],
+    });
+    const host = fakeHost();
+    coordinator.registerHooks(host.pi);
+    // The captured original keeps the trailing newline the host delivered, and
+    // the branch carries that same original. Digesting the presentation-trimmed
+    // branch text instead of the extracted text would miss it, so the later
+    // unknown-origin copy would again displace the user record (#590).
+    const original = `NEWWIDTH-HEAD approved to run the export ${"u".repeat(205_000)} NEWWIDTH-TAIL\n`;
+    const ctx = hostContext({
+      sessionManager: {
+        buildContextEntries: () => [
+          { type: "message", timestamp: 5_000, message: { role: "user", content: original } },
+        ],
+      },
+    });
+    await host.emit("input", { text: original, source: "interactive" }, ctx);
+    assert.equal(await coordinator.admitToolCall(callArgs(`oversize-boundary-same-${maxContextChars}`, "bash", { command: "echo hi" }, ctx)), undefined);
+    assert.equal(calls.length, 1);
+    const prompt = calls[0]!.prompt;
+    const records = prompt.split("\n").filter((line) => line.includes("NEWWIDTH-HEAD"));
+    assert.equal(records.length, 1, `the same oversized original reached the auditor ${records.length} times at a ${maxContextChars} budget`);
+    assert.ok(records[0]!.includes('"metadata":"origin=user |'),
+      "the one record keeps the live user provenance instead of the branch's unknown-origin copy");
+    assert.ok(records[0]!.includes('"partial":true'), "and it says structurally that only its leading portion is carried");
+    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
+  }
+});
+
+test("oversized originals differing only in boundary whitespace are never merged (#590)", async () => {
+  for (const maxContextChars of [1_000, 4_000]) {
+    const { coordinator, calls } = coordinatorHarness({
+      config: enabledConfig({ maxContextChars }),
+      results: [{ output: '{"decision":"PASS"}' }],
+    });
+    const host = fakeHost();
+    coordinator.registerHooks(host.pi);
+    // Two different originals that differ only by the newline the branch entry
+    // carries. Trimming before digesting would collapse them into the live
+    // record and present branch content under user provenance (#590).
+    const shared = `WSLOOKALIKE-HEAD approved to run the export ${"u".repeat(205_000)} WSLOOKALIKE-TAIL`;
+    const ctx = hostContext({
+      sessionManager: {
+        buildContextEntries: () => [
+          { type: "message", timestamp: 5_000, message: { role: "user", content: `${shared}\n` } },
+        ],
+      },
+    });
+    await host.emit("input", { text: shared, source: "interactive" }, ctx);
+    assert.equal(await coordinator.admitToolCall(callArgs(`oversize-boundary-different-${maxContextChars}`, "bash", { command: "echo hi" }, ctx)), undefined);
+    assert.equal(calls.length, 1);
+    const prompt = calls[0]!.prompt;
+    const records = prompt.split("\n").filter((line) => line.includes("WSLOOKALIKE-HEAD"));
+    assert.equal(records.length, 1, `the budget carried ${records.length} records for the boundary-whitespace lookalike at a ${maxContextChars} budget`);
+    assert.ok(records[0]!.includes('"metadata":"origin=unknown |') && records[0]!.includes("id=branch-0"),
+      "the distinct branch message stays its own unknown-origin record instead of being merged into the live user record");
+    assert.ok(!prompt.includes('"metadata":"origin=user |'),
+      "no user-labelled record carries the distinct branch text");
+    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
+  }
+});
+
+test("equal capture clocks rank live evidence by capture sequence, not by retention container (#590)", async () => {
+  for (const maxContextChars of [1_000, 4_000]) {
+    const { coordinator, calls } = coordinatorHarness({
+      config: enabledConfig({ maxContextChars }),
+      results: [
+        { output: '{"decision":"FAIL","reason":"synthetic: authorization is unclear"}' },
+        { output: '{"decision":"PASS","reason":"synthetic: the newest instruction authorizes the retry"}' },
+      ],
+    });
+    const host = fakeHost();
+    coordinator.registerHooks(host.pi);
+    const ctx = hostContext();
+    await host.emit("input", { text: "TASK-ONE start the synthetic export", source: "interactive" }, ctx);
+    assert.equal((await coordinator.admitToolCall(callArgs("equal-clock-a", "bash", { command: "echo one" }, ctx)))?.block, true,
+      "the first proposal is refused, which starts the causal chain");
+    // The oversized inability report and the approval that follows it fill the
+    // chain, and every event below is captured in the same harness millisecond.
+    await host.emit("message_end", {
+      message: { role: "assistant", content: `INABILITY-HEAD ${"a".repeat(205_000)} INABILITY-TAIL` },
+    }, ctx);
+    await host.emit("input", { text: "APPROVAL-ONE approved to retry the export", source: "interactive" }, ctx);
+    // Enough tool results to push the whole chain out of the mixed ring, so the
+    // chain survives only in the causal retention container.
+    for (let index = 0; index < 20; index += 1) {
+      await host.emit("tool_result", resultEvent(`equal-clock-result-${index}`, "bash"));
+    }
+    await host.emit("input", { text: "NEWEST-INPUT proceed with the approved export", source: "interactive" }, ctx);
+    assert.equal(await coordinator.admitToolCall(callArgs("equal-clock-b", "bash", { command: "echo two" }, ctx)), undefined,
+      "the retry is audited on the real seam instead of refused for the size of its evidence");
+    assert.equal(calls.length, 2, "the retry reached the configured auditor, whose verdict decides it");
+    const prompt = calls[1]!.prompt;
+    const evidenceStart = prompt.indexOf("RECENT SESSION EVIDENCE (newest first)");
+    assert.ok(evidenceStart >= 0, "the evidence section is rendered with its header");
+    // The header is two lines, so the line after it is the first quoted record.
+    const firstRecord = prompt.slice(evidenceStart).split("\n")[2] ?? "";
+    assert.ok(prompt.includes("NEWEST-INPUT proceed with the approved export"),
+      `the newest input reached the audit at a ${maxContextChars} budget`);
+    assert.ok(firstRecord.includes("NEWEST-INPUT proceed with the approved export"),
+      `the newest input is the first quoted record at a ${maxContextChars} budget, not an older retained causal record`);
+    const approvalLine = prompt.split("\n").find((line) => line.includes("APPROVAL-ONE"));
+    if (approvalLine !== undefined) {
+      assert.ok(approvalLine.includes("causal=yes"), "a retained causal record keeps its host-established marking");
+      assert.ok(prompt.indexOf("NEWEST-INPUT") < prompt.indexOf("APPROVAL-ONE"),
+        "an older retained causal approval never outranks the newest input in the rendered chronology");
+    }
+    const inabilityLine = prompt.split("\n").find((line) => line.includes("INABILITY-HEAD"));
+    if (inabilityLine !== undefined) {
+      assert.ok(prompt.indexOf("NEWEST-INPUT") < prompt.indexOf("INABILITY-HEAD"),
+        "the oversized older causal record is quoted after the newest input, not ahead of it");
+    }
+    assert.ok(prompt.startsWith("TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST"), "the unchanged fixed policy block still opens the request");
+    const variable = prompt.slice(prompt.indexOf("\n\nPROPOSED TOOL CALL"), prompt.indexOf("\n\nEVIDENCE PROVENANCE\n"));
+    assert.ok(JSON.stringify(variable).length - 2 <= maxContextChars, `the sent variable context was ${variable.length} characters at a ${maxContextChars} budget`);
+    assert.ok(prompt.length > maxContextChars, "the fixed instruction blocks are additional to that budget");
+  }
+});
+
 test("the real auditor seam receives a bounded context for an oversized proposal (#590)", async () => {
   for (const maxContextChars of [1_000, 4_000]) {
     const { coordinator, calls } = coordinatorHarness({

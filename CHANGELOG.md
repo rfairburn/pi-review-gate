@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.242]
+## [0.1.0-dev.244]
 
 ### Added
 
@@ -36,6 +36,40 @@ dates.
   routing, ongoing work, lifecycle, and each owner's authority over its own roster are
   unchanged. The roster writes one version-2 mixed sequence and accepts valid version-1
   local rosters; older hosts refuse version 2 without overwriting it.
+
+## [0.1.0-dev.243]
+
+### Fixed
+
+- **Review-policy prompts reject unsafe integers** (#577): both **Automatic
+  correction attempts** and **Concrete guidance after** use the same
+  non-negative safe-integer boundary that strict configuration normalization
+  already applies. Entries such as `1e20` or `9007199254740992` are refused with
+  the existing notice and leave the previously staged value unchanged, while
+  `0`, ordinary safe integers, and `Number.MAX_SAFE_INTEGER` are accepted.
+  Cancellation, blank/whitespace input, existing number grammar, defaults,
+  fallback/persistence behavior, and other numeric prompts are unchanged.
+
+## [0.1.0-dev.242]
+
+### Changed
+
+- **Background-count lifecycle records publish atomically** (#580): the native
+  background-count job fixture now writes each complete `ready.json` and
+  `closed.json` record onto a private preparation leaf in its own preparation
+  directory — established by the test outside the confined service directory —
+  and only then exposes the final pathname through one synchronous exclusive
+  hard link, revalidating the admitted directory identities and the preparation
+  leaf's identity, type, permissions, size, and bytes immediately before that
+  link. A reader can no longer observe a created-but-unwritten leaf, a replaced
+  or truncated preparation never exposes a final record, and a replacement
+  directory at an admitted pathname never receives one.
+  Readiness is still published only after real binding and completion only after
+  the original listener's successful close; existing files and symlinks are never
+  adopted or overwritten, and only a preparation leaf the publisher positively
+  owns is removed. Added deterministic publication, pre-commit preparation
+  revalidation, no-clobber, and retired create-before-write controls. Test
+  fixture only; production behavior is unchanged.
 
 ## [0.1.0-dev.241]
 

@@ -107,10 +107,13 @@ import {
   type PeerSavedResult,
   type PeerSavedSendOptions,
 } from "./peer-saved";
+import type { OwnerRenameRequest, PeerRenameOptions, PeerRenameResult } from "./peer-rename";
+import { isOwnerRenameTupleStillCurrent } from "./peer-rename";
 import type { RemoteSessionMetadata } from "./roster-metadata";
 import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
+  ROSTER_BRIDGE_RENAME_CAPABILITY,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
@@ -125,6 +128,8 @@ import {
   type RosterBridgeBounds,
   type RosterBridgeCloseResultFrame,
   type RosterBridgeCreateResultFrame,
+  type RosterBridgeRenameRequestFrame,
+  type RosterBridgeRenameResultFrame,
   type RosterBridgeErrorCode,
   type RosterBridgeFrame,
   type RosterBridgeSavedDeleteResultFrame,
@@ -289,6 +294,8 @@ export interface RosterBridgeViewer {
   readonly supportsClose: boolean;
   /** True only when this owner acknowledged the optional create capability. */
   readonly supportsCreate: boolean;
+  readonly supportsRename: boolean;
+  renameSession(request: OwnerRenameRequest, options?: PeerRenameOptions): Promise<PeerRenameResult>;
   /** Resolves on `hello_ack`; rejects on refusal, protocol failure, or channel loss. */
   readonly hello: Promise<void>;
   /** Subscribes and resolves with that subscription's first complete snapshot. */
@@ -373,6 +380,13 @@ interface PendingCreate {
   readonly hostRunId: string;
   readonly sequence: number;
   readonly settle: (result: PeerCreateResult) => void;
+  timer: NodeJS.Timeout | null;
+}
+
+interface PendingRename {
+  readonly frame: RosterBridgeRenameRequestFrame;
+  readonly deadlineAt: number;
+  readonly settle: (result: PeerRenameResult) => void;
   timer: NodeJS.Timeout | null;
 }
 
@@ -582,6 +596,8 @@ class ViewerBinding implements RosterBridgeViewer {
    * channel even after a failed or timed-out attempt. A new channel starts at 0.
    */
   #createSequence = 0;
+  #pendingRename: PendingRename | null = null;
+  #renameSequence = 0;
   /** The ONE outstanding Saved operation on this channel, if any. */
   #pendingSaved: PendingSaved | null = null;
   /**
@@ -696,6 +712,10 @@ class ViewerBinding implements RosterBridgeViewer {
 
   get supportsCreate(): boolean {
     return this.#capabilities.includes(ROSTER_BRIDGE_CREATE_CAPABILITY);
+  }
+
+  get supportsRename(): boolean {
+    return this.#capabilities.includes(ROSTER_BRIDGE_RENAME_CAPABILITY);
   }
 
   get hello(): Promise<void> {
@@ -1004,6 +1024,73 @@ class ViewerBinding implements RosterBridgeViewer {
   #settleAllCreates(): void {
     const pending = this.#pendingCreate;
     if (pending !== null) this.#settleCreate(pending, { kind: "unknown" });
+  }
+
+  // ----------------------------------------------------------------- rename
+
+  #renameTargetCurrent(request: OwnerRenameRequest): boolean {
+    if (this.#stopRequested || this.#state !== "subscribed" || this.#projection.state !== "current"
+      || this.#projection.hostRunId !== request.hostRunId) return false;
+    const row = this.#projection.rows.find((candidate) => candidate.id === request.rowId);
+    return isOwnerRenameTupleStillCurrent(row?.nativeSession, request);
+  }
+
+  renameSession(request: OwnerRenameRequest, options: PeerRenameOptions = {}): Promise<PeerRenameResult> {
+    if (this.#controlRefusalReason() !== null) return Promise.resolve({ kind: "not-sent", reason: "not-ready" });
+    if (!this.supportsRename) return Promise.resolve({ kind: "not-sent", reason: "capability-unsupported" });
+    if (this.#pendingRename !== null) return Promise.resolve({ kind: "not-sent", reason: "busy" });
+    if (this.#renameSequence >= Number.MAX_SAFE_INTEGER) return Promise.resolve({ kind: "not-sent", reason: "limit" });
+    let frame: RosterBridgeRenameRequestFrame;
+    try {
+      frame = Object.freeze({ ...request, type: "rename_request", requestId: randomUUID(), sequence: this.#renameSequence + 1 });
+      // The wire owns all identifier/native/name validation; no parallel rules.
+      encodeRosterBridgeFrame(frame, this.#bounds);
+      if (!this.#renameTargetCurrent(frame)) return Promise.resolve({ kind: "not-sent", reason: "target-unavailable" });
+    } catch { return Promise.resolve({ kind: "not-sent", reason: "invalid-request" }); }
+    this.#renameSequence = frame.sequence;
+    const outcome = deferred<PeerRenameResult>();
+    const pending: PendingRename = {
+      frame, deadlineAt: Date.now() + this.#bounds.renameResultTimeoutMs,
+      settle: (result) => outcome.resolve(result), timer: null,
+    };
+    this.#pendingRename = pending;
+    pending.timer = this.#arm(null, this.#bounds.renameResultTimeoutMs, () => this.#settleRename(pending, { kind: "unknown" }));
+    const gate: ViewerSendGate = () => {
+      if (this.#pendingRename !== pending || Date.now() >= pending.deadlineAt) return { allow: false, reason: "not-ready" };
+      try {
+        if (options.stillCurrent !== undefined && options.stillCurrent() !== true) {
+          return { allow: false, reason: "target-unavailable" };
+        }
+      } catch { return { allow: false, reason: "target-unavailable" }; }
+      // Re-prove after the caller's arbitrary synchronous callback.
+      return this.#pendingRename === pending && Date.now() < pending.deadlineAt && this.#renameTargetCurrent(frame)
+        ? { allow: true } : { allow: false, reason: "target-unavailable" };
+    };
+    void this.#queueSend(frame, gate).then((written) => {
+      if (!written.ok) this.#settleRename(pending, written.sent
+        ? { kind: "unknown" } : { kind: "not-sent", reason: written.reason });
+    });
+    return outcome.promise;
+  }
+
+  #onRenameResult(frame: RosterBridgeRenameResultFrame): void {
+    const pending = this.#pendingRename;
+    if (pending === null || pending.frame.requestId !== frame.requestId) return;
+    const result: PeerRenameResult = Date.now() < pending.deadlineAt && this.#renameTargetCurrent(pending.frame)
+      ? { kind: "owner-result", facts: frame.outcome } : { kind: "unknown" };
+    this.#settleRename(pending, result);
+  }
+
+  #settleRename(pending: PendingRename, result: PeerRenameResult): void {
+    if (this.#pendingRename !== pending) return;
+    this.#pendingRename = null;
+    if (pending.timer !== null) clearTimeout(pending.timer);
+    pending.timer = null;
+    pending.settle(result);
+  }
+
+  #settleAllRenames(): void {
+    if (this.#pendingRename !== null) this.#settleRename(this.#pendingRename, { kind: "unknown" });
   }
 
   // ------------------------------------------------------------------ saved
@@ -1495,6 +1582,7 @@ class ViewerBinding implements RosterBridgeViewer {
     // stopped viewer cannot observe an owner's answer, and nothing is replayed.
     this.#settleAllCloses();
     this.#settleAllCreates();
+    this.#settleAllRenames();
     this.#settleAllSaved();
     this.#setSavedPolicy(undefined);
     const wasAwaitingAck = this.#state === "awaiting_ack";
@@ -1710,6 +1798,10 @@ class ViewerBinding implements RosterBridgeViewer {
         return;
       case "create_result":
         this.#onCreateResult(frame);
+        return;
+      case "rename_result":
+        if (!this.supportsRename) this.#protocolFailure();
+        else this.#onRenameResult(frame);
         return;
       case "saved_window_result":
       case "saved_window_begin":
@@ -1945,6 +2037,7 @@ class ViewerBinding implements RosterBridgeViewer {
     // established, and nothing is replayed or guessed at.
     this.#settleAllCloses();
     this.#settleAllCreates();
+    this.#settleAllRenames();
     this.#settleAllSaved();
     this.#setSavedPolicy(undefined);
     this.#transfer = null;
@@ -2182,6 +2275,7 @@ class ViewerBinding implements RosterBridgeViewer {
     // Nor may a close: a detached viewer observes no owner answer.
     this.#settleAllCloses();
     this.#settleAllCreates();
+    this.#settleAllRenames();
     this.#settleAllSaved();
     this.#setSavedPolicy(undefined);
     this.#detachHandler();

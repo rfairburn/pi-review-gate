@@ -63,6 +63,19 @@
  * refused whole. `saved_policy` describes the owner's live delete exposure and is
  * never authority. Nothing here adds a listener, manager, grant, queue, replay
  * cache, history, or persisted state.
+ *
+ * The optional owner RENAME exchange (`rename_request` / `rename_result`) rides
+ * that same lane under the same rules and only when both sides acknowledged
+ * {@link ROSTER_BRIDGE_RENAME_CAPABILITY}. One request names this owner's exact
+ * run, exactly one row of that run, that row's exact native conversation id and
+ * epoch, one canonical new name, and the channel's monotonic attempt number; the
+ * reply carries one fixed fact set and never a name. Nothing in either frame is a
+ * workspace, path, saved-session file, native current file, agent directory,
+ * alias, host, endpoint, selection, viewer, or display fact, and no frame here
+ * writes or mirrors a name: an accepted rename becomes visible to viewers only
+ * through the owner's next complete authoritative roster snapshot. It adds no
+ * listener, manager, grant, queue, replay cache, name store, or persisted state,
+ * and the roster snapshot codec and packer are untouched by it.
  */
 
 import { isRecord } from "../../record-guard";
@@ -72,6 +85,8 @@ import {
   isOwnerCreateWorkspace,
   type OwnerCreateFacts,
 } from "./peer-create";
+import { isOwnerRenameFacts, type OwnerRenameFacts, type OwnerRenameRequest } from "./peer-rename";
+import { isValidNativeSessionId, isValidRenameName } from "../protocol";
 import {
   OWNER_SAVED_ENTRY_KEYS,
   isOwnerSavedDeleteFacts,
@@ -121,6 +136,16 @@ export const ROSTER_BRIDGE_CREATE_CAPABILITY = "roster-create-v1";
  */
 export const ROSTER_BRIDGE_SAVED_CAPABILITY = "roster-saved-v1";
 /**
+ * Optional capability for the owner rename exchange. It states that this owner
+ * really holds a rename provider AND that its own manager exposes the existing
+ * verified rename seam; it is protocol support only, never authority and never a
+ * name store. Every request is still reauthorized, run-, row-, and tuple-checked,
+ * and re-proved by that owner immediately before it mutates anything. It is known
+ * here but is never offered by default, so nothing about the existing lane
+ * activates by this declaration alone.
+ */
+export const ROSTER_BRIDGE_RENAME_CAPABILITY = "roster-rename-v1";
+/**
  * Optional capabilities this implementation knows. An identifier offered by a
  * peer is recorded only when it appears here and is otherwise ignored; an
  * acknowledgement additionally narrows to what the owner can really honour.
@@ -129,6 +154,7 @@ export const ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Obje
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
   ROSTER_BRIDGE_SAVED_CAPABILITY,
+  ROSTER_BRIDGE_RENAME_CAPABILITY,
 ]);
 
 /** One metadata subscription per channel; not configurable. */
@@ -181,6 +207,14 @@ export interface RosterBridgeBounds {
    * never bounds the owner's own operation.
    */
   readonly createResultTimeoutMs: number;
+  /**
+   * How long a requester waits for one `rename_result` after the rename frame was
+   * handed to the transport. Exceeding it is `unknown`, never a retry, a cancel,
+   * or a replay: the native name may already have changed. It reuses the same
+   * patience class as Close and Create because it bounds this side's patience with
+   * one owner-answered request, and it never bounds the owner's own rename.
+   */
+  readonly renameResultTimeoutMs: number;
 }
 
 export const DEFAULT_ROSTER_BRIDGE_BOUNDS: RosterBridgeBounds = Object.freeze({
@@ -199,6 +233,7 @@ export const DEFAULT_ROSTER_BRIDGE_BOUNDS: RosterBridgeBounds = Object.freeze({
   stopAckTimeoutMs: 2_000,
   closeResultTimeoutMs: 15_000,
   createResultTimeoutMs: 15_000,
+  renameResultTimeoutMs: 15_000,
 });
 
 const BOUND_KEYS = Object.keys(DEFAULT_ROSTER_BRIDGE_BOUNDS) as ReadonlyArray<keyof RosterBridgeBounds>;
@@ -417,6 +452,36 @@ export interface RosterBridgeCreateResultFrame {
 }
 
 /**
+ * One owner-routed rename of exactly one row of one run, fenced to that row's
+ * native conversation tuple. Every identifier is opaque and bounded, the native
+ * session id and the name are validated by the canonical native validators (the
+ * same rules the local rename route and the roster row boundary apply), the epoch
+ * is a positive safe integer, and `sequence` is this channel's strictly
+ * increasing attempt number. Nothing else is expressible: no workspace, path,
+ * saved-session file, native current file, agent directory, alias, host,
+ * endpoint, selection, viewer, payload, or error can ride along, and no frame
+ * here carries or mirrors a previous name.
+ */
+export interface RosterBridgeRenameRequestFrame extends OwnerRenameRequest {
+  readonly type: "rename_request";
+  /** This requester's fresh, unpredictable correlation id. */
+  readonly requestId: string;
+  /** Strictly increasing, positive per-channel attempt number. */
+  readonly sequence: number;
+}
+
+/**
+ * One fixed owner answer for exactly one request id. The fact set is closed and
+ * never carries a name, an id, an epoch, or any owner text: a renamed row becomes
+ * visible through the next complete authoritative roster snapshot only.
+ */
+export interface RosterBridgeRenameResultFrame {
+  readonly type: "rename_result";
+  readonly requestId: string;
+  readonly outcome: OwnerRenameFacts;
+}
+
+/**
  * Fresh Saved catalog listing request. `query` is exact well-formed Unicode and
  * is bounded only by this frame fitting the lane; `count` is 1..maxSnapshotRows;
  * `sequence` is the channel's shared strictly increasing Saved attempt number.
@@ -581,6 +646,8 @@ export type RosterBridgeFrame =
   | RosterBridgeCloseResultFrame
   | RosterBridgeCreateRequestFrame
   | RosterBridgeCreateResultFrame
+  | RosterBridgeRenameRequestFrame
+  | RosterBridgeRenameResultFrame
   | RosterBridgeSavedFrame
   | RosterBridgeErrorFrame;
 
@@ -597,6 +664,10 @@ const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze(
   close_result: new Set(["type", "requestId", "outcome"]),
   create_request: new Set(["type", "requestId", "hostRunId", "workspace", "sequence"]),
   create_result: new Set(["type", "requestId", "outcome"]),
+  rename_request: new Set([
+    "type", "requestId", "hostRunId", "rowId", "expectedSessionId", "expectedSessionEpoch", "name", "sequence",
+  ]),
+  rename_result: new Set(["type", "requestId", "outcome"]),
   saved_list_request: new Set(["type", "requestId", "hostRunId", "query", "offset", "count", "sequence"]),
   saved_search_request: new Set(["type", "requestId", "hostRunId", "catalogId", "query", "offset", "count", "sequence"]),
   saved_window_request: new Set(["type", "requestId", "hostRunId", "catalogId", "resultId", "offset", "count", "sequence"]),
@@ -628,6 +699,10 @@ const REQUIRED_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.free
   close_result: new Set(["requestId", "outcome"]),
   create_request: new Set(["requestId", "hostRunId", "workspace", "sequence"]),
   create_result: new Set(["requestId", "outcome"]),
+  rename_request: new Set([
+    "requestId", "hostRunId", "rowId", "expectedSessionId", "expectedSessionEpoch", "name", "sequence",
+  ]),
+  rename_result: new Set(["requestId", "outcome"]),
   saved_list_request: new Set(["requestId", "hostRunId", "query", "offset", "count", "sequence"]),
   saved_search_request: new Set(["requestId", "hostRunId", "catalogId", "query", "offset", "count", "sequence"]),
   saved_window_request: new Set(["requestId", "hostRunId", "catalogId", "resultId", "offset", "count", "sequence"]),
@@ -721,6 +796,34 @@ function readCapabilities(value: unknown, bounds: RosterBridgeBounds): readonly 
  */
 function readWorkspace(value: unknown): string {
   if (!isOwnerCreateWorkspace(value)) fail("bad_frame");
+  return value;
+}
+
+/**
+ * A canonical native conversation id. The native rule — not the lane's
+ * identifier character class — is authoritative here, because the roster row
+ * boundary already accepts exactly that shape and a rename must never address a
+ * conversation the requester never observed. The native bound already caps the
+ * value, and nothing is normalized or re-encoded.
+ */
+function readNativeSessionId(value: unknown): string {
+  if (!isValidNativeSessionId(value)) fail("bad_frame");
+  return value;
+}
+
+/** A native session epoch: a positive safe integer, never 0, negative, or fractional. */
+function readNativeSessionEpoch(value: unknown): number {
+  return readInteger(value, 1, Number.MAX_SAFE_INTEGER);
+}
+
+/**
+ * A canonical native rename name: the same rule the local rename field and the
+ * manager's rename seam apply, so this lane can never carry a name the owner's own
+ * stored-name verification would refuse. Nothing is trimmed, normalized, or
+ * truncated here, and no previous name is ever expressible.
+ */
+function readRenameName(value: unknown): string {
+  if (!isValidRenameName(value)) fail("bad_frame");
   return value;
 }
 
@@ -1118,6 +1221,25 @@ function validateFrame(frame: RosterBridgeFrame, bounds: RosterBridgeBounds): Ro
       }
       return frame;
     }
+    case "rename_request": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      readIdentifier(frame.hostRunId, bounds.maxIdentifierBytes);
+      readIdentifier(frame.rowId, bounds.maxIdentifierBytes);
+      readNativeSessionId(frame.expectedSessionId);
+      readNativeSessionEpoch(frame.expectedSessionEpoch);
+      readRenameName(frame.name);
+      // The anti-replay scalar must be a positive safe integer; the per-channel
+      // high-water comparison itself belongs to the two endpoints.
+      if (!Number.isSafeInteger(frame.sequence) || frame.sequence < 1) fail("invalid_frame");
+      return frame;
+    }
+    case "rename_result": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      // The fact boundary is closed: exactly one fixed kind, never a name, an id,
+      // an epoch, or owner text.
+      if (!isOwnerRenameFacts(frame.outcome)) fail("invalid_frame");
+      return frame;
+    }
     case "saved_list_request":
     case "saved_search_request":
     case "saved_window_request":
@@ -1283,6 +1405,29 @@ function buildFrame(record: Record<string, unknown>, bounds: RosterBridgeBounds)
             rowId: readIdentifier(outcome.rowId, bounds.maxIdentifierBytes),
           })
           : Object.freeze({ kind: outcome.kind }),
+      });
+    }
+    case "rename_request": {
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        hostRunId: readIdentifier(ownField(record, "hostRunId"), bounds.maxIdentifierBytes),
+        rowId: readIdentifier(ownField(record, "rowId"), bounds.maxIdentifierBytes),
+        expectedSessionId: readNativeSessionId(ownField(record, "expectedSessionId")),
+        expectedSessionEpoch: readNativeSessionEpoch(ownField(record, "expectedSessionEpoch")),
+        name: readRenameName(ownField(record, "name")),
+        sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
+      });
+    }
+    case "rename_result": {
+      const outcome = ownField(record, "outcome");
+      // The fact boundary is closed: one fixed kind and nothing else. A reported
+      // name, native tuple, path, or owner text cannot ride along.
+      if (!isOwnerRenameFacts(outcome)) fail("bad_frame");
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        outcome: Object.freeze({ kind: outcome.kind }),
       });
     }
     case "saved_list_request":

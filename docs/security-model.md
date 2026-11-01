@@ -112,7 +112,7 @@ private Windows ACL guarantee.
 
 The optional `pi-review-sessions` host can expose a **Network** sidebar for explicit
 pairing, remote session rows, one deliberately selected row's native viewport with
-native input and copy, owner-routed Close and Create, and one chosen owner's saved
+native input and copy, owner-routed Close, Create, and Rename, and one chosen owner's saved
 conversations. Every operation is performed by the owning host on its own children and
 files. Ordinary Pi sessions and the standalone review-gate launchers are unchanged
 and start no peer listener or client. This optional surface carries no readiness
@@ -200,7 +200,7 @@ claims a remote receipt or remote work outcome.
 
 The roster lane is a projection of the owner's roster. By itself it grants no control.
 Control exists only through the separately negotiated native I/O bridge and the
-owner-routed Close, Create, and Saved operations described below, each re-authorized
+owner-routed Close, Create, Rename, and Saved operations described below, each re-authorized
 and performed by the owner. Roster rows carry bounded display facts, including the exact
 owner-side workspace path, and never the native current-file guard, agent/account
 directories, configuration, providers, credentials, prompts, transcripts, question
@@ -283,6 +283,19 @@ confirmation-required result arms only the next deliberate Close, never an autom
 dialog, retry or confirmed request. These reminders are not authorization and are not
 silently evicted for another still-valid target.
 See [Owner Close transport](session-host-alpha.md#owner-close-transport-foundation).
+
+The optional owner Rename capability (`roster-rename-v1`) uses that same roster
+channel, exact TLS-proved peer key, remembered pin, and current directional receiving
+grant. It grants no new permission kind and needs no native input/copy setting or
+content-stream selection. The request binds the exact destination, owner run, row, and
+observed native session id/epoch; the owner uses its existing native rename operation
+and verifies the result. Only authoritative inventory metadata updates displayed names;
+there is no requester alias or duplicate name store. The requesting sidebar's written
+row and edit interaction fence its intent, while replaced identities, capability loss,
+or unavailable authorization refuse rather than retarget or fall back locally. A
+possibly submitted rename with no confirmed result remains uncertain and is never
+replayed automatically. Losing the form or channel does not cancel or roll back
+owner work already admitted, and late replies cannot acquire another form's focus.
 
 The optional owner Saved capability (`roster-saved-v1`) also rides the existing roster
 channel under the same key, pin, and grant checks; acknowledging it grants nothing. It

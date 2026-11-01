@@ -487,6 +487,37 @@ passing test result. They are not a whole production Main run with a real owner 
 provider, two-machine operation, Windows, or operator acceptance, and they do not imply
 full-suite or CI success.
 
+### Remote session name editing (#512)
+
+After `npm run build:test`, the focused rename checks are:
+
+```sh
+node --test dist-test/tests/session-host-network-peer-rename.test.js \
+  dist-test/tests/session-host-network-roster-bridge.test.js \
+  dist-test/tests/session-host-network-peer-coordinator-rename.test.js \
+  dist-test/tests/session-host-owner-rename-contract.test.js \
+  dist-test/tests/session-host-remote-rename-ui.test.js \
+  dist-test/tests/session-host-remote-rename-integration.test.js
+node --test --test-name-pattern='rename|native names' \
+  dist-test/tests/session-host-instances.test.js \
+  dist-test/tests/session-host-broker.test.js \
+  dist-test/tests/session-host-reporter.test.js \
+  dist-test/tests/session-host-main.test.js
+```
+
+The codec cases are pure; the roster-bridge controls use in-memory channels. The
+Main UI controls use a scripted coordinator and actual writer-receipt callbacks.
+The integrated case drives production Main/sidebar keys through real loopback TLS,
+pairing, directional grants, coordinators, and both roster bridges into the owner's
+Main rename provider, then asserts owner names and authoritative rendered metadata
+on the initiator and another observer. Its session managers and PTYs are synthetic;
+the POSIX storage policy checks owned fixture UID/modes, not native platform ACLs.
+The existing manager/broker/reporter regressions separately cover the normal native
+rename seam and its identity and verification checks. These are synthetic protocol/UI
+and IPC controls, not a real native-child end-to-end rename, cross-machine operation,
+Windows UI, physical-terminal, or operator certification. Test presence alone does not
+establish a passing run, full-suite/CI success, or release approval.
+
 ### Network storage permission repair (#494)
 
 After `npm run build:test`, the focused files are:

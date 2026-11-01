@@ -58,6 +58,8 @@ export interface PeerUiHost {
 	 * shown as an honest unsupported choice that is likewise never asked anything.
 	 */
 	readonly saved?: PeerUiHostSaved;
+	/** Current negotiated owner rename support; descriptive only, never authority. */
+	readonly renameSupported?: boolean;
 }
 
 export interface PeerUiTrustedPeer {

@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.237]
+## [0.1.0-dev.243]
 
 ### Changed
 
@@ -30,6 +30,104 @@ dates.
   Main keeps its local Saved cases and the shared local Saved fixture family, and the
   native Saved and other focused Saved tiers are untouched. Test organization only;
   production behavior, private fields, APIs, and policy are unchanged.
+
+## [0.1.0-dev.242]
+
+### Changed
+
+- **Background-count lifecycle records publish atomically** (#580): the native
+  background-count job fixture now writes each complete `ready.json` and
+  `closed.json` record onto a private preparation leaf in its own preparation
+  directory — established by the test outside the confined service directory —
+  and only then exposes the final pathname through one synchronous exclusive
+  hard link, revalidating the admitted directory identities and the preparation
+  leaf's identity, type, permissions, size, and bytes immediately before that
+  link. A reader can no longer observe a created-but-unwritten leaf, a replaced
+  or truncated preparation never exposes a final record, and a replacement
+  directory at an admitted pathname never receives one.
+  Readiness is still published only after real binding and completion only after
+  the original listener's successful close; existing files and symlinks are never
+  adopted or overwritten, and only a preparation leaf the publisher positively
+  owns is removed. Added deterministic publication, pre-commit preparation
+  revalidation, no-clobber, and retired create-before-write controls. Test
+  fixture only; production behavior is unchanged.
+
+## [0.1.0-dev.241]
+
+### Changed
+
+- **Atomic native-resume release publication** (#579): the native automatic-resume
+  fixture now publishes every test-owned worker release record with the existing
+  durable exclusive writer, so the complete `{ "release": true }` JSON is staged and
+  fsynced in an owned private temp file inside the fixture's own state directory
+  before the final release pathname exists. A worker can no longer parse an empty or
+  truncated release record, and an existing release file or symlink is refused rather
+  than overwritten or adopted. Added deterministic controls for the old
+  create-before-write failure, the commit boundary, and publication exclusivity.
+  Test fixture only; the fixture worker's strict release reader, retry budget,
+  absolute deadline, watcher handling, and production behavior are unchanged.
+
+## [0.1.0-dev.240]
+
+### Changed
+
+- **One canonical Saved-picker Host identity** (#573): the sidebar's remote Saved
+  picker state no longer stores its own copy of the chosen Host. Its request,
+  context, render, and ownership reads now take identity from the picker's single
+  canonical `savedHost` choice, captured at the same synchronous operation or
+  render boundary as the picker state it belongs to, so a reentrant render can
+  never pair a captured frame with a later Host choice. Frozen remote
+  operations, actual-written frame presentations, and owner delete-exposure
+  policy facts keep their own historical identity snapshots, and the New form's
+  separate Host selection is untouched. Maintenance consolidation of redundant
+  internal state — no observed defect or security change; existing request
+  payloads, current-run and view-epoch fences, render tokens and earned writer
+  receipts, delete/resume authorization, cancellation behavior, and stale-reply
+  handling are unchanged. No public API, protocol, configuration, default,
+  permission, fallback, retry, or retention change.
+
+## [0.1.0-dev.239]
+
+### Tests
+
+- **Native Vim entry drains queued terminal bytes before reading its cursor** (#581): the
+  external-editor acceptance fixture now awaits the real surface's existing parse
+  barrier after the Ctrl+G statusline wait and before its first frame/cursor-entry
+  pair, so matching editor text can no longer be read while Vim's cursor-show/CUP
+  suffix is still queued. A deterministic control against the actual
+  `TerminalSurface` keeps that matching-text/old-hidden-cursor state observable before
+  the same flush and requires the exact visible editor cursor afterward. All existing
+  save, cancel, failure, Unicode, prefill, no-model/tool, and process/TTY restoration
+  assertions are unchanged; production and general harness behavior are unchanged.
+
+## [0.1.0-dev.238]
+
+### Added
+
+- **Remote session name editing** (#512): E on an authorized networked-session row
+  uses the existing name editor and asks the exact owning host to apply and verify
+  its normal native rename. Authoritative roster metadata updates current observers;
+  no local alias, optimistic name, session restart, or workspace change is introduced.
+  Owner run, row, native identity, capability, and authorization fences preserve
+  local rename behavior and keep stale or unconfirmed results from retargeting work.
+
+## [0.1.0-dev.237]
+
+### Added
+
+- **Left session list wheel scrolling** (#439): a mouse-wheel notch inside the
+  session host's left session list now scrolls that list's own visible window —
+  later entries come into view on the way down, earlier entries on the way up —
+  whenever the roster is longer than the visible page. The gesture is host-owned:
+  it activates no row, moves no highlight, takes no keyboard focus, never changes
+  the observed Main content owner, and never scrolls the hosted conversation
+  beside the list. Arrow-key navigation keeps its existing behavior before and
+  after wheeling, including moving the highlight to entries that are off-screen
+  and bringing them into view, and one-page lists, boundary pages, terminal
+  resizes, and roster changes stay valid and usable. No new preference,
+  shortcut, acceleration model, smooth-scrolling mode, or rows-per-notch value
+  is introduced or promised; hosted-conversation and popup scrolling are
+  unchanged.
 
 ## [0.1.0-dev.236]
 

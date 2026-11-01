@@ -17,15 +17,29 @@
  * read from the rendered native card, and the exact job handle is read from
  * the model's own ShellStart toolResult — never guessed as `job1`/latest.
  *
- * Evidence retention: this scenario performs NO filesystem deletion. The job
- * creates bounded readiness and listener-completion leaves (pid/port/status
- * JSON, 0600) exclusively inside the confined service directory and retains both; the test
+ * Evidence retention: this scenario performs NO filesystem deletion of retained
+ * evidence. The job publishes bounded readiness and listener-completion leaves
+ * (pid/port/status JSON, 0600) exclusively inside the confined service
+ * directory and retains both; the test
  * inspects it through a bounded readonly descriptor whose observations are
  * dev/ino-identity-checked at every step (missing leaves, symlinks, swaps at
  * open or after the read, growth, in-place content changes, over-limit sizes,
  * and malformed records fail closed) and asserts the retained leaf is the same
  * byte-identical file after the normal stop. The owned scratch root is preserved
  * on success and failure alike — no cleanup entry point is called here.
+ * Each record is published atomically: its complete bytes land first on a
+ * private preparation leaf in the job's own preparation directory, which this
+ * test establishes under the same scratch root but OUTSIDE the exact final
+ * record directory, and the final pathname only then appears through one
+ * synchronous exclusive hard link, so no reader can observe a created-but
+ * unwritten leaf. The only file removed anywhere in this scenario is one of
+ * those private preparation leaves, and only while the publisher positively owns
+ * it: no final leaf, retained byte, or inode is ever removed or recreated, and
+ * an uncertain preparation leaf is retained instead. Preparation-cleanup
+ * witnesses are taken only after synchronization points that prove the live
+ * publisher returned from its synchronous publication block (the real loopback
+ * answer for readiness, the public ShellList `done` settlement for completion),
+ * never by racing the producer right after a leaf pathname appeared.
  * Retention is not completion evidence. A distinct closed record is emitted
  * after the original listener closes successfully; no adopted service kernel
  * exit/code claim is made. Shell settlement additionally requires the row's
@@ -87,6 +101,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
   appendFileSync,
+  chmodSync,
   closeSync,
   constants,
   existsSync,
@@ -104,6 +119,7 @@ import {
   truncateSync,
   watch as fsWatch,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { connect, type Socket } from "node:net";
@@ -198,6 +214,26 @@ interface ReadinessRecord {
   readonly status: string;
 }
 
+/** What one atomic exclusive publication reports about the record it committed. */
+interface PublishedRecord {
+  readonly path: string;
+  readonly prepPath: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly size: bigint;
+  readonly prepRemoved: boolean;
+  readonly prepRetainedReason?: string;
+}
+
+interface PublishOptions {
+  readonly serviceDir: string;
+  readonly prepDir: string;
+  readonly leafName: string;
+  readonly text: string;
+  /** Deterministic mid-publication witness; the live service never passes one. */
+  readonly afterPrepare?: (observed: { readonly prepPath: string; readonly leafPath: string }) => void;
+}
+
 interface JobFixtureModule {
   readonly readinessLeafName: string;
   readonly completionLeafName: string;
@@ -205,6 +241,8 @@ interface JobFixtureModule {
   readonly parseReadinessRecord: (text: string, expectedStatus?: "ready" | "closed") => ReadinessRecord;
   readonly validateAncestors: (dirPath: string) => boolean;
   readonly validateServiceDir: (serviceDir: string) => string;
+  readonly validatePrepDir: (prepDir: string, serviceDir: string) => string;
+  readonly publishRecordExclusive: (options: PublishOptions) => PublishedRecord;
 }
 
 const fixtureRequire = createRequire(join(process.cwd(), "package.json"));
@@ -566,6 +604,58 @@ function inspectServiceDir(dirPath: string, expectedNames = [jobFixtureModule.re
   }
 }
 
+/**
+ * Exact directory-entry names of one fixture directory, for the
+ * no-intermediate-name publication witness. Read-only: this never removes or
+ * creates anything.
+ */
+function listLeafNames(dirPath: string): string[] {
+  const handle = opendirSync(dirPath);
+  try {
+    const names: string[] = [];
+    for (;;) {
+      const entry = handle.readSync();
+      if (entry === null) break;
+      names.push(entry.name);
+    }
+    return names.sort();
+  } finally {
+    handle.close();
+  }
+}
+
+/** The single retained preparation leaf name for one lifecycle leaf. */
+function prepPathOf(prepDir: string, leafName: string): string {
+  const names = listLeafNames(prepDir).filter((name) => name.startsWith(leafName));
+  assert.equal(names.length, 1, "exactly one retained preparation leaf is expected here");
+  return join(prepDir, names[0]);
+}
+
+/**
+ * Witness for the publisher's private preparation directory: once a record is
+ * committed it keeps no leftover preparation leaf, and nothing in it is a
+ * symlink. This witness never deletes anything itself — an uncertain
+ * preparation leaf would be retained by the publisher and is reported here
+ * rather than removed.
+ */
+function assertNoPrepLeaves(dirPath: string): void {
+  const handle = opendirSync(dirPath);
+  try {
+    let entries = 0;
+    for (;;) {
+      const entry = handle.readSync();
+      if (entry === null) break;
+      assert.ok(entries < MAX_SERVICE_DIR_ENTRIES, "the private preparation directory stays within its file bound");
+      const stats = lstatSync(join(dirPath, entry.name), { bigint: true });
+      assert.ok(!stats.isSymbolicLink(), `the preparation entry ${entry.name} is not a symlink`);
+      entries += 1;
+    }
+    assert.equal(entries, 0, "the private preparation directory retains no leftover preparation leaves");
+  } finally {
+    handle.close();
+  }
+}
+
 /** One bounded loopback client connection to the owned job service. */
 function connectOnce(port: number, timeoutMs: number): Promise<{ pid: number; port: number; served: number }> {
   return new Promise((resolve, reject) => {
@@ -722,8 +812,13 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
   // The one service leg is a short directory inside the owned scratch root's
   // confined temporary leg. The job binds a 127.0.0.1 loopback TCP listener
   // (no filesystem socket leaf) and creates its single readiness leaf here.
+  // Its private preparation directory is a sibling this test establishes: the
+  // complete record bytes land there first, so the final record directory never
+  // sees an intermediate name and never holds an unwritten leaf.
   const serviceDir = join(scratch, "tmp", "bg-service");
   mkdirSync(serviceDir, { recursive: true, mode: 0o700 });
+  const prepDir = join(scratch, "tmp", "bg-service-prep");
+  mkdirSync(prepDir, { recursive: true, mode: 0o700 });
   const readyPath = join(serviceDir, jobFixtureModule.readinessLeafName);
   const completionPath = join(serviceDir, jobFixtureModule.completionLeafName);
   assert.equal(existsSync(readyPath), false, "the owned job's readiness leaf does not pre-exist");
@@ -732,6 +827,11 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
     "the confined service directory stays under the owned scratch root");
   assert.doesNotThrow(() => jobFixtureModule.validateServiceDir(serviceDir),
     "the fixture's own path-safety contract admits the confined service directory");
+  assert.ok(realpathSync(prepDir).startsWith(`${scratch}${sep}`),
+    "the private preparation directory stays under the same owned scratch root");
+  assert.doesNotThrow(() => jobFixtureModule.validatePrepDir(prepDir, serviceDir),
+    "the fixture's own preparation contract admits the caller-established private directory");
+  assert.deepEqual(listLeafNames(prepDir), [], "the private preparation directory starts empty");
 
   // The model's ShellStart command is a plain documented platform-shell command:
   // the trusted canonical regular nonsymlink Node executable plus the canonical
@@ -767,6 +867,7 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
   startEnv.PRG_FIXTURE_STATE_DIR = stateDir;
   startEnv.PRG_FIXTURE_JOURNAL_SHELL_STATUS = "1";
   startEnv.PRG_BG_COUNT_JOB_SERVICE_DIR = serviceDir;
+  startEnv.PRG_BG_COUNT_JOB_PREP_DIR = prepDir;
   assert.deepEqual(Object.keys(startEnv).filter((name) => /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD)/i.test(name)), [],
     "the synthetic native child environment contains no external credentials");
 
@@ -935,6 +1036,13 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
       "the listener really served from the pid its own readiness leaf published");
     assert.equal(answer.port, readiness.port,
       "the listener really served on the port its own readiness leaf published");
+    // Preparation cleanup is asserted only after a synchronization point that
+    // proves the publisher returned from its synchronous publication block: the
+    // real listener answered this client connection, which it can only do after
+    // publication (and its own preparation cleanup) completed. Never race the
+    // live producer by reading the preparation directory right after the leaf
+    // pathname appeared.
+    assertNoPrepLeaves(prepDir);
 
     await waitForSettled(beforeStart, "the first scripted ShellStart turn settles with the job still live");
     await driver.waitFrame((text) => activatedRowFrame(text)
@@ -1016,6 +1124,11 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
       "the real native child dispatched the public ShellList tool call that corroborated the exact job");
     assert.equal(cardCounts(driver.currentText(), ROW_LABEL)?.shells, 0,
       "the row's known zero shell count is unchanged after the corroborating ShellList");
+    // Completion-side preparation cleanup is asserted only after the public
+    // ShellList `done` settlement for the exact job, which the extension
+    // reports only once that job's own settlement finished: the publisher has
+    // returned by then, so this witness never races the live producer.
+    assertNoPrepLeaves(prepDir);
 
     // The opted-in journal is metadata-only: no request preview field and no
     // submitted prompt text may appear anywhere in it.
@@ -1158,12 +1271,513 @@ test("the background-count job fixture retains its evidence and exposes bounded 
     assert.throws(() => parse(bad), /readiness record/u, `readiness record rejected: ${bad}`);
   }
 
-  // The tracked fixture performs no filesystem deletion anywhere: the
-  // readiness/state evidence is retained by construction.
+  // The tracked fixture never removes lifecycle evidence: the readiness and
+  // completion leaves it publishes are retained by construction. Its single
+  // removal call site targets only a preparation leaf that it positively owns,
+  // and no recursive or blanket removal exists anywhere.
   const source = readFileSync(JOB_FIXTURE, "utf8");
-  for (const forbidden of ["unlinkSync", "rmSync", "rmdirSync", "fs.rm(", "fs.unlink("]) {
+  for (const forbidden of ["rmSync", "rmdirSync", "fs.rm(", "fs.unlink(", "fs.rmdir(",
+    "unlinkSync(readyPath", "unlinkSync(completionPath", "unlinkSync(leafPath"]) {
     assert.equal(source.includes(forbidden), false, `the job fixture contains no ${forbidden} deletion call`);
   }
+  assert.equal((source.match(/unlinkSync\(/g) ?? []).length, 1,
+    "the fixture has exactly one removal call site");
+  assert.equal(source.includes("fs.unlinkSync(prepPath)"), true,
+    "that single removal call targets only the fixture's own preparation leaf path");
+
+  // Both lifecycle leaves go through the atomic exclusive publication seam, and
+  // neither is ever written straight to its final pathname (the create-before-
+  // write order this change removes).
+  for (const leafConstant of ["READINESS_LEAF_NAME", "COMPLETION_LEAF_NAME"]) {
+    assert.ok(source.includes(`leafName: ${leafConstant}`),
+      `the live service publishes its ${leafConstant} leaf through the atomic exclusive seam`);
+  }
+  assert.equal(/writeFileSync\((?:readyPath|completionPath)/u.test(source), false,
+    "the live service never creates a lifecycle leaf before its bytes land");
+});
+
+test("a created-before-written lifecycle leaf is refused by the strict reader, proving the retired publication gap", () => {
+  assertOriginalEnvironmentAdmissible(process.env); // guard before any fixture mutation
+  const tmpParent = realpathSync(tmpdir()); // canonical parent (macOS /var is a symlink)
+  jobFixtureModule.validateAncestors(tmpParent);
+  const root = mkdtempSync(join(tmpParent, "prg-bg-count-legacy-publish-"));
+  const dir = join(root, "legacy-publish");
+  mkdirSync(dir, { mode: 0o700 });
+  const leaf = join(dir, jobFixtureModule.readinessLeafName);
+  const text = jobFixtureModule.buildReadinessRecord(4242, 31337);
+
+  // The retired publication order, reproduced deterministically (no timing, no
+  // repeat, no polling): the exclusive write creates the final pathname first,
+  // so a reader admitted at that instant sees a zero-byte leaf and the actual
+  // fixture parser refuses it.
+  const fd = openSync(leaf, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  assert.deepEqual(listLeafNames(dir), [jobFixtureModule.readinessLeafName],
+    "the retired order exposed the final pathname before any byte landed");
+  assert.throws(() => inspectReadinessLeaf(leaf), /readiness record is not bounded JSON/u,
+    "a created-but-unwritten leaf is never a complete record");
+  assert.equal(lstatSync(leaf, { bigint: true }).size, 0n, "the admitted leaf really was empty at that instant");
+  writeSync(fd, text);
+  closeSync(fd);
+  assert.deepEqual(inspectReadinessLeaf(leaf).record, { pid: 4242, port: 31337, status: "ready" },
+    "the same pathname only becomes parsable once its bytes land");
+});
+
+test("the fixture publishes each lifecycle leaf only after its complete bytes land outside the record directory", () => {
+  assertOriginalEnvironmentAdmissible(process.env); // guard before any fixture mutation
+  const tmpParent = realpathSync(tmpdir()); // canonical parent (macOS /var is a symlink)
+  jobFixtureModule.validateAncestors(tmpParent);
+  const root = mkdtempSync(join(tmpParent, "prg-bg-count-publish-"));
+  const serviceDir = join(root, "bg-service");
+  const prepDir = join(root, "bg-service-prep");
+  mkdirSync(serviceDir, { mode: 0o700 });
+  mkdirSync(prepDir, { mode: 0o700 });
+  const readyPath = join(serviceDir, jobFixtureModule.readinessLeafName);
+  const text = jobFixtureModule.buildReadinessRecord(4242, 31337);
+
+  // The mid-publication witness runs inside the actual producer: only the
+  // private preparation leaf exists, the final pathname is still absent, and the
+  // final record directory holds no intermediate name at all.
+  let mid: { leafVisible: boolean; serviceNames: string[]; prepNames: string[] } | undefined;
+  const published = jobFixtureModule.publishRecordExclusive({
+    serviceDir,
+    prepDir,
+    leafName: jobFixtureModule.readinessLeafName,
+    text,
+    afterPrepare: () => {
+      mid = {
+        leafVisible: existsSync(readyPath),
+        serviceNames: listLeafNames(serviceDir),
+        prepNames: listLeafNames(prepDir),
+      };
+      assert.throws(() => inspectReadinessLeaf(readyPath), /no such file/u,
+        "no final leaf is visible while the record is still being prepared");
+    },
+  });
+  assert.ok(mid, "the actual producer ran the mid-publication witness");
+  assert.equal(mid.leafVisible, false, "the final pathname never appears before its bytes are complete");
+  assert.deepEqual(mid.serviceNames, [], "no intermediate name ever appears in the final record directory");
+  assert.equal(mid.prepNames.length, 1, "preparation happens on one private leaf outside the record directory");
+  assert.ok(mid.prepNames[0].startsWith(jobFixtureModule.readinessLeafName),
+    "the private preparation leaf is identifiable as preparation for that lifecycle leaf");
+
+  // The committed final leaf is the prepared inode carrying the exact complete
+  // record, with its owner-only mode intact.
+  const inspected = inspectReadinessLeaf(readyPath);
+  assert.deepEqual(inspected.record, { pid: 4242, port: 31337, status: "ready" });
+  assert.equal(inspected.bytes.toString("utf8"), text, "the published bytes are exactly the bounded record");
+  assert.equal(inspected.ino, published.ino, "the final leaf is the prepared inode, never a copy");
+  assert.equal(inspected.dev, published.dev, "the final leaf stays on the prepared device");
+  const committed = lstatSync(readyPath, { bigint: true });
+  assert.equal(Number(committed.mode & 0o777n), 0o600, "the published leaf keeps its owner-only mode");
+  assert.equal(committed.size, BigInt(Buffer.byteLength(text, "utf8")), "the published leaf is the complete record");
+  assert.equal(published.prepRemoved, true, "the publisher removes only its own positively owned preparation leaf");
+  assert.equal(published.prepRetainedReason, undefined, "a positively owned preparation leaf needs no retention reason");
+  assertNoPrepLeaves(prepDir);
+  assert.deepEqual(listLeafNames(prepDir), [], "the private preparation directory keeps no leftover leaves");
+  inspectServiceDir(serviceDir);
+
+  // The completion record is published the same way, and the final record
+  // directory still admits exactly the two lifecycle leaves and nothing else.
+  const closedText = '{"pid":4242,"port":31337,"status":"closed"}\n';
+  const closedPublished = jobFixtureModule.publishRecordExclusive({
+    serviceDir,
+    prepDir,
+    leafName: jobFixtureModule.completionLeafName,
+    text: closedText,
+  });
+  const completed = inspectReadinessLeaf(join(serviceDir, jobFixtureModule.completionLeafName), "closed");
+  assert.deepEqual(completed.record, { pid: 4242, port: 31337, status: "closed" });
+  assert.equal(closedPublished.prepRemoved, true, "completion preparation is also cleaned up by its owner");
+  assert.equal(Number(lstatSync(join(serviceDir, jobFixtureModule.completionLeafName), { bigint: true }).mode & 0o777n), 0o600,
+    "the completion leaf is owner-only too");
+  assertNoPrepLeaves(prepDir);
+  inspectServiceDir(serviceDir, [jobFixtureModule.readinessLeafName, jobFixtureModule.completionLeafName]);
+  assert.deepEqual(listLeafNames(serviceDir),
+    [jobFixtureModule.readinessLeafName, jobFixtureModule.completionLeafName].sort(),
+    "the final record directory holds exactly the two committed lifecycle leaves");
+
+  // The retained readiness leaf is untouched by the later completion commit.
+  const retained = inspectReadinessLeaf(readyPath);
+  assert.deepEqual(retained.bytes, inspected.bytes, "a later commit never rewrites the retained readiness leaf");
+  assert.equal(retained.ino, inspected.ino, "a later commit never recreates the retained readiness leaf");
+});
+
+test("publication refuses existing targets, keeps evidence intact, and only ever removes its own preparation", () => {
+  assertOriginalEnvironmentAdmissible(process.env); // guard before any fixture mutation
+  const tmpParent = realpathSync(tmpdir()); // canonical parent (macOS /var is a symlink)
+  jobFixtureModule.validateAncestors(tmpParent);
+  const root = mkdtempSync(join(tmpParent, "prg-bg-count-noclobber-"));
+  const text = jobFixtureModule.buildReadinessRecord(4242, 31337);
+  const pair = (name: string): { serviceDir: string; prepDir: string } => {
+    const serviceDir = join(root, `svc-${name}`);
+    const prepDir = join(root, `prep-${name}`);
+    mkdirSync(serviceDir, { mode: 0o700 });
+    mkdirSync(prepDir, { mode: 0o700 });
+    return { serviceDir, prepDir };
+  };
+
+  // An existing regular leaf is refused and stays byte-, inode-, and mode-identical.
+  const kept = pair("existing");
+  const existing = join(kept.serviceDir, jobFixtureModule.readinessLeafName);
+  writeFileSync(existing, "keepme\n", { flag: "wx", mode: 0o600 });
+  const existingBefore = lstatSync(existing, { bigint: true });
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: kept.serviceDir, prepDir: kept.prepDir, leafName: jobFixtureModule.readinessLeafName, text,
+  }), /pre-existing lifecycle leaf/u, "an existing lifecycle leaf is never adopted or overwritten");
+  const existingAfter = lstatSync(existing, { bigint: true });
+  assert.equal(readFileSync(existing, "utf8"), "keepme\n", "the existing leaf keeps its exact bytes");
+  assert.equal(existingAfter.ino, existingBefore.ino, "the existing leaf keeps its inode (no replacement)");
+  assert.equal(existingAfter.size, existingBefore.size, "the existing leaf keeps its size");
+  assert.equal(Number(existingAfter.mode & 0o777n), Number(existingBefore.mode & 0o777n), "the existing leaf keeps its mode");
+  assertNoPrepLeaves(kept.prepDir);
+  inspectServiceDir(kept.serviceDir);
+
+  // A dangling symlink at the final name is refused, never followed, replaced,
+  // or had its missing target created.
+  const linked = pair("symlink");
+  const danglingTarget = join(linked.serviceDir, "never-created-target");
+  symlinkSync(danglingTarget, join(linked.serviceDir, jobFixtureModule.completionLeafName));
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: linked.serviceDir, prepDir: linked.prepDir, leafName: jobFixtureModule.completionLeafName, text,
+  }), /pre-existing lifecycle leaf/u, "a symlinked lifecycle leaf is never adopted or overwritten");
+  assert.ok(lstatSync(join(linked.serviceDir, jobFixtureModule.completionLeafName), { bigint: true }).isSymbolicLink(),
+    "the symlink stays a symlink: publication never replaces it");
+  assert.equal(existsSync(danglingTarget), false, "publication never creates a symlink target to justify the link");
+  assertNoPrepLeaves(linked.prepDir);
+
+  // A pathname that appears between preparation and commit still fails the
+  // exclusive link; the interloper keeps its bytes and the publisher gives back
+  // only its own preparation leaf.
+  const raced = pair("race");
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: raced.serviceDir,
+    prepDir: raced.prepDir,
+    leafName: jobFixtureModule.readinessLeafName,
+    text,
+    afterPrepare: ({ leafPath }) => writeFileSync(leafPath, "interloper\n", { flag: "wx", mode: 0o600 }),
+  }), /already exists; no overwrite performed/u, "the exclusive link never overwrites a pathname created in between");
+  assert.equal(readFileSync(join(raced.serviceDir, jobFixtureModule.readinessLeafName), "utf8"), "interloper\n",
+    "the commit-time existing leaf is not overwritten");
+  assertNoPrepLeaves(raced.prepDir);
+
+  // Uncertain ownership is retained, not deleted: a preparation leaf that no
+  // longer identifies the publisher's own inode stays exactly as found, and the
+  // pre-commit revalidation refuses before the existing interloper is reached.
+  const uncertain = pair("uncertain");
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: uncertain.serviceDir,
+    prepDir: uncertain.prepDir,
+    leafName: jobFixtureModule.readinessLeafName,
+    text,
+    afterPrepare: ({ prepPath, leafPath }) => {
+      writeFileSync(leafPath, "interloper\n", { flag: "wx", mode: 0o600 });
+      renameSync(prepPath, join(uncertain.prepDir, "moved-away-prep"));
+      writeFileSync(prepPath, "not-mine\n", { flag: "wx", mode: 0o600 });
+    },
+  }), /no longer identifies the prepared inode/u, "a replaced preparation leaf is refused before any commit");
+  assert.equal(readFileSync(join(uncertain.prepDir, "moved-away-prep"), "utf8"), text,
+    "the moved-away preparation leaf keeps its exact bytes as evidence");
+  assert.equal(readFileSync(prepPathOf(uncertain.prepDir, jobFixtureModule.readinessLeafName), "utf8"), "not-mine\n",
+    "a preparation leaf the publisher no longer owns is retained, never deleted");
+  assert.equal(readFileSync(join(uncertain.serviceDir, jobFixtureModule.readinessLeafName), "utf8"), "interloper\n",
+    "the retained final leaf is untouched");
+
+  // Preparation outside the record directory is a hard contract, refused before
+  // anything at all is created inside the final record directory.
+  const confined = pair("confined");
+  const inner = join(confined.serviceDir, "prep-inside");
+  assert.throws(() => jobFixtureModule.validatePrepDir(inner, confined.serviceDir),
+    /outside the confined service directory/u);
+  assert.throws(() => jobFixtureModule.validatePrepDir(confined.serviceDir, confined.serviceDir),
+    /outside the confined service directory/u);
+  assert.throws(() => jobFixtureModule.validatePrepDir("relative-prep", confined.serviceDir), /absolute/u);
+  assert.throws(() => jobFixtureModule.validatePrepDir(join(root, "missing-prep"), confined.serviceDir), /not inspectable/u);
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: confined.serviceDir, prepDir: inner, leafName: jobFixtureModule.readinessLeafName, text,
+  }), /outside the confined service directory/u, "publication never prepares inside the final record directory");
+  assert.deepEqual(listLeafNames(confined.serviceDir), [], "the refused publication created nothing in the record directory");
+  assertNoPrepLeaves(confined.prepDir);
+});
+
+test("the preparation contract refuses every nested name inside the record directory, including '..'-prefixed names", () => {
+  assertOriginalEnvironmentAdmissible(process.env); // guard before any fixture mutation
+  const tmpParent = realpathSync(tmpdir()); // canonical parent (macOS /var is a symlink)
+  jobFixtureModule.validateAncestors(tmpParent);
+  // Deliberately short witness names: each path below stays inside the fixture's
+  // own 120-byte bound, so every case exercises containment rather than the bound.
+  const root = mkdtempSync(join(tmpParent, "prg-bg-count-confine-"));
+  const serviceDir = join(root, "svc");
+  mkdirSync(serviceDir, { mode: 0o700 });
+  const outsidePrep = join(root, "..prep-outside");
+  mkdirSync(outsidePrep, { mode: 0o700 });
+  mkdirSync(join(root, "prep-sibling"), { mode: 0o700 });
+  const text = jobFixtureModule.buildReadinessRecord(4242, 31337);
+
+  // Containment is decided on path structure, never on a name shape: an ordinary
+  // nested name, the record directory itself, and any nested basename that merely
+  // starts with dots (including `..preparation`) all sit INSIDE the final record
+  // directory and are refused.
+  for (const insideName of ["prep-inside", "..preparation", "...", join("..preparation", "deeper")]) {
+    assert.throws(() => jobFixtureModule.validatePrepDir(join(serviceDir, insideName), serviceDir),
+      /outside the confined service directory/u, `the nested preparation name ${insideName} stays inside the record directory`);
+  }
+  assert.throws(() => jobFixtureModule.validatePrepDir(serviceDir, serviceDir),
+    /outside the confined service directory/u, "the record directory itself is never a private preparation directory");
+
+  // Only an exact `..` pathname escapes: the parent of the record directory and
+  // an outside sibling — even one whose own basename starts with `..` — stay
+  // admitted, so the refusal adds no naming restriction of its own.
+  assert.doesNotThrow(() => jobFixtureModule.validatePrepDir(join(serviceDir, ".."), serviceDir),
+    "the exact parent of the record directory stays outside it");
+  assert.doesNotThrow(() => jobFixtureModule.validatePrepDir(join(root, "prep-sibling"), serviceDir),
+    "an ordinary outside sibling stays admitted");
+  assert.doesNotThrow(() => jobFixtureModule.validatePrepDir(outsidePrep, serviceDir),
+    "an outside '..'-prefixed sibling stays admitted");
+
+  // The actual producer refuses a '..'-prefixed preparation name inside the
+  // record directory before creating anything there.
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir, prepDir: join(serviceDir, "..preparation"), leafName: jobFixtureModule.readinessLeafName, text,
+  }), /outside the confined service directory/u,
+  "publication never prepares in a '..'-prefixed name inside the record directory");
+  assert.deepEqual(listLeafNames(serviceDir), [], "the refused '..'-prefixed preparation created nothing in the record directory");
+
+  // The same producer still publishes normally through an outside '..'-prefixed
+  // preparation directory and cleans up only its own leaf there.
+  const published = jobFixtureModule.publishRecordExclusive({
+    serviceDir, prepDir: outsidePrep, leafName: jobFixtureModule.readinessLeafName, text,
+  });
+  assert.equal(published.prepRemoved, true, "publication through an outside '..'-prefixed preparation directory removes its own leaf");
+  assert.equal(readFileSync(join(serviceDir, jobFixtureModule.readinessLeafName), "utf8"), text,
+    "the committed leaf carries the exact complete record");
+  assert.deepEqual(listLeafNames(serviceDir), [jobFixtureModule.readinessLeafName],
+    "the final record directory holds exactly the committed lifecycle leaf");
+  assertNoPrepLeaves(outsidePrep);
+  inspectServiceDir(serviceDir);
+});
+
+test("pre-commit preparation revalidation refuses publication without exposing any final record", () => {
+  assertOriginalEnvironmentAdmissible(process.env); // guard before any fixture mutation
+  const tmpParent = realpathSync(tmpdir()); // canonical parent (macOS /var is a symlink)
+  jobFixtureModule.validateAncestors(tmpParent);
+  const root = mkdtempSync(join(tmpParent, "prg-bg-count-prevalid-"));
+  const text = jobFixtureModule.buildReadinessRecord(4242, 31337);
+  const pair = (name: string): { serviceDir: string; prepDir: string } => {
+    const serviceDir = join(root, `svc-${name}`);
+    const prepDir = join(root, `prep-${name}`);
+    mkdirSync(serviceDir, { mode: 0o700 });
+    mkdirSync(prepDir, { mode: 0o700 });
+    return { serviceDir, prepDir };
+  };
+  // Every refused case must leave the final record directory completely empty:
+  // no created-but-unwritten, foreign, or truncated leaf may ever appear there.
+  const refusedWithoutFinalRecord = (serviceDir: string, why: string): void => {
+    assert.equal(existsSync(join(serviceDir, jobFixtureModule.readinessLeafName)), false,
+      `${why}: no final record is exposed`);
+    assert.deepEqual(listLeafNames(serviceDir), [], `${why}: the final record directory stays empty`);
+  };
+
+  // The preparation pathname is replaced by a foreign file while the final name
+  // stays absent: the saved inode never links, and the foreign file is retained.
+  const swapped = pair("swap");
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: swapped.serviceDir,
+    prepDir: swapped.prepDir,
+    leafName: jobFixtureModule.readinessLeafName,
+    text,
+    afterPrepare: ({ prepPath }) => {
+      renameSync(prepPath, join(swapped.prepDir, "moved-away-prep"));
+      writeFileSync(prepPath, "not-mine\n", { flag: "wx", mode: 0o600 });
+    },
+  }), /no longer identifies the prepared inode/u, "a replaced preparation pathname never commits a foreign inode");
+  refusedWithoutFinalRecord(swapped.serviceDir, "replaced preparation");
+  assert.equal(readFileSync(prepPathOf(swapped.prepDir, jobFixtureModule.readinessLeafName), "utf8"), "not-mine\n",
+    "the foreign leaf sitting at the preparation pathname is retained, never deleted");
+  assert.equal(readFileSync(join(swapped.prepDir, "moved-away-prep"), "utf8"), text,
+    "the publisher's own moved-away preparation keeps its bytes as evidence");
+
+  // A symlink at the preparation pathname is refused on type before any link,
+  // without following it or creating its missing target.
+  const linkedPrep = pair("symlink");
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: linkedPrep.serviceDir,
+    prepDir: linkedPrep.prepDir,
+    leafName: jobFixtureModule.readinessLeafName,
+    text,
+    afterPrepare: ({ prepPath }) => {
+      renameSync(prepPath, join(linkedPrep.prepDir, "moved-away-prep"));
+      symlinkSync(join(linkedPrep.prepDir, "never-created-target"), prepPath);
+    },
+  }), /no longer identifies a regular nonsymlink file/u, "a symlinked preparation pathname never commits anything");
+  refusedWithoutFinalRecord(linkedPrep.serviceDir, "symlinked preparation");
+  assert.ok(lstatSync(prepPathOf(linkedPrep.prepDir, jobFixtureModule.readinessLeafName), { bigint: true }).isSymbolicLink(),
+    "the foreign symlink at the preparation pathname is retained, never followed or deleted");
+  assert.equal(existsSync(join(linkedPrep.prepDir, "never-created-target")), false,
+    "the dangling symlink target is never created");
+
+  // The prepared inode is truncated after its descriptor was verified: the
+  // incomplete record is refused before the final pathname can appear.
+  const truncated = pair("truncate");
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: truncated.serviceDir,
+    prepDir: truncated.prepDir,
+    leafName: jobFixtureModule.readinessLeafName,
+    text,
+    afterPrepare: ({ prepPath }) => truncateSync(prepPath, 3),
+  }), /no longer carries the complete record/u, "a truncated preparation never exposes an incomplete final record");
+  refusedWithoutFinalRecord(truncated.serviceDir, "truncated preparation");
+  assertNoPrepLeaves(truncated.prepDir);
+
+  // The preparation mode is loosened after verification.
+  const loosened = pair("mode");
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: loosened.serviceDir,
+    prepDir: loosened.prepDir,
+    leafName: jobFixtureModule.readinessLeafName,
+    text,
+    afterPrepare: ({ prepPath }) => chmodSync(prepPath, 0o644),
+  }), /no longer owner-only/u, "a loosened preparation mode is refused before the commit");
+  refusedWithoutFinalRecord(loosened.serviceDir, "loosened preparation mode");
+  assertNoPrepLeaves(loosened.prepDir);
+
+  // A same-size content rewrite of the prepared inode is caught by the byte
+  // comparison, not excused as an unchanged size.
+  const rewritten = pair("bytes");
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: rewritten.serviceDir,
+    prepDir: rewritten.prepDir,
+    leafName: jobFixtureModule.readinessLeafName,
+    text,
+    afterPrepare: ({ prepPath }) => {
+      const prepFd = openSync(prepPath, constants.O_WRONLY);
+      try {
+        writeSync(prepFd, Buffer.from(" ".repeat(Buffer.byteLength(text, "utf8")), "utf8"));
+      } finally {
+        closeSync(prepFd);
+      }
+    },
+  }), /bytes are not the published record/u, "a same-size content rewrite is refused before the commit");
+  refusedWithoutFinalRecord(rewritten.serviceDir, "rewritten preparation bytes");
+  assertNoPrepLeaves(rewritten.prepDir);
+
+  // A replacement real directory at the admitted service-directory pathname is
+  // refused by the saved ancestor identities: publication never lands in a
+  // directory this publisher was never admitted to.
+  const swappedDir = pair("directory-swap");
+  const retainedDir = join(root, "retained-service");
+  const admittedDirBefore = lstatSync(swappedDir.serviceDir, { bigint: true });
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: swappedDir.serviceDir,
+    prepDir: swappedDir.prepDir,
+    leafName: jobFixtureModule.readinessLeafName,
+    text,
+    afterPrepare: () => {
+      renameSync(swappedDir.serviceDir, retainedDir);
+      mkdirSync(swappedDir.serviceDir, { mode: 0o700 });
+    },
+  }), /publication directory ancestor changed/u, "a replacement real directory is refused before publication");
+  refusedWithoutFinalRecord(swappedDir.serviceDir, "replaced service directory");
+  assert.deepEqual(listLeafNames(retainedDir), [], "the original directory remains untouched");
+  const admittedDirAfter = lstatSync(retainedDir, { bigint: true });
+  assert.equal(admittedDirAfter.ino, admittedDirBefore.ino, "the admitted directory keeps its identity and is never written into");
+  assertNoPrepLeaves(swappedDir.prepDir);
+
+  // A replacement real directory at the admitted preparation-directory pathname
+  // is refused the same way; the publisher never follows the moved-away
+  // directory to delete its own leaf, and the record directory stays empty.
+  const swappedPrep = pair("prep-directory-swap");
+  const retainedPrepDir = join(root, "retained-prep");
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: swappedPrep.serviceDir,
+    prepDir: swappedPrep.prepDir,
+    leafName: jobFixtureModule.readinessLeafName,
+    text,
+    afterPrepare: () => {
+      renameSync(swappedPrep.prepDir, retainedPrepDir);
+      mkdirSync(swappedPrep.prepDir, { mode: 0o700 });
+    },
+  }), /publication directory ancestor changed/u, "a replacement preparation directory is refused before publication");
+  refusedWithoutFinalRecord(swappedPrep.serviceDir, "replaced preparation directory");
+  assert.equal(listLeafNames(retainedPrepDir).length, 1,
+    "the moved-away preparation directory keeps exactly its own preparation leaf");
+  assert.equal(readFileSync(prepPathOf(retainedPrepDir, jobFixtureModule.readinessLeafName), "utf8"), text,
+    "the moved-away preparation leaf keeps its exact bytes as evidence");
+  assertNoPrepLeaves(swappedPrep.prepDir);
+
+  // A clean preparation still commits afterwards: the revalidation is not a
+  // blanket refusal, and the record directory ends with exactly the one leaf.
+  const clean = pair("clean");
+  const committed = jobFixtureModule.publishRecordExclusive({
+    serviceDir: clean.serviceDir, prepDir: clean.prepDir, leafName: jobFixtureModule.readinessLeafName, text,
+  });
+  assert.equal(committed.prepRemoved, true, "a clean preparation commits and cleans up its own leaf");
+  assert.deepEqual(listLeafNames(clean.serviceDir), [jobFixtureModule.readinessLeafName],
+    "the committed leaf is the only entry in the final record directory");
+  assert.equal(readFileSync(join(clean.serviceDir, jobFixtureModule.readinessLeafName), "utf8"), text,
+    "the committed leaf carries the exact complete record");
+  assertNoPrepLeaves(clean.prepDir);
+});
+
+test("a throwing preparation seam removes only its own preparation and preserves its own error", () => {
+  assertOriginalEnvironmentAdmissible(process.env); // guard before any fixture mutation
+  const tmpParent = realpathSync(tmpdir()); // canonical parent (macOS /var is a symlink)
+  jobFixtureModule.validateAncestors(tmpParent);
+  const root = mkdtempSync(join(tmpParent, "prg-bg-count-hook-throw-"));
+  const text = jobFixtureModule.buildReadinessRecord(4242, 31337);
+  const pair = (name: string): { serviceDir: string; prepDir: string } => {
+    const serviceDir = join(root, `svc-${name}`);
+    const prepDir = join(root, `prep-${name}`);
+    mkdirSync(serviceDir, { mode: 0o700 });
+    mkdirSync(prepDir, { mode: 0o700 });
+    return { serviceDir, prepDir };
+  };
+
+  // A seam that throws while the preparation leaf is still the publisher's own:
+  // the seam's exact error object propagates unchanged, no final record appears,
+  // and the publisher gives back the preparation leaf it positively owns.
+  const ownThrow = pair("own");
+  const ownFailure = new Error("the preparation seam failed");
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: ownThrow.serviceDir,
+    prepDir: ownThrow.prepDir,
+    leafName: jobFixtureModule.readinessLeafName,
+    text,
+    afterPrepare: ({ prepPath, leafPath }) => {
+      assert.equal(existsSync(leafPath), false, "the final pathname is still absent while the seam runs");
+      assert.equal(readFileSync(prepPath, "utf8"), text, "the seam sees the publisher's own complete preparation leaf");
+      throw ownFailure;
+    },
+  }), (error: unknown) => error === ownFailure, "the seam's own error propagates unchanged");
+  assert.equal(existsSync(join(ownThrow.serviceDir, jobFixtureModule.readinessLeafName)), false,
+    "a throwing seam never exposes a final record");
+  assert.deepEqual(listLeafNames(ownThrow.serviceDir), [], "the final record directory stays empty");
+  assert.deepEqual(listLeafNames(ownThrow.prepDir), [],
+    "the publisher removes the preparation leaf it still positively owns");
+  assertNoPrepLeaves(ownThrow.prepDir);
+
+  // A seam that substitutes unknown data at the preparation pathname and then
+  // throws: the substituted data is retained rather than deleted, the moved-away
+  // preparation keeps its bytes as evidence, and the final record stays absent.
+  const unknownThrow = pair("unknown");
+  const unknownFailure = new Error("the preparation seam failed after substitution");
+  assert.throws(() => jobFixtureModule.publishRecordExclusive({
+    serviceDir: unknownThrow.serviceDir,
+    prepDir: unknownThrow.prepDir,
+    leafName: jobFixtureModule.readinessLeafName,
+    text,
+    afterPrepare: ({ prepPath }) => {
+      renameSync(prepPath, join(unknownThrow.prepDir, "moved-away-prep"));
+      writeFileSync(prepPath, "not-mine\n", { flag: "wx", mode: 0o600 });
+      throw unknownFailure;
+    },
+  }), (error: unknown) => error === unknownFailure, "the substitution seam's own error propagates unchanged");
+  assert.equal(readFileSync(prepPathOf(unknownThrow.prepDir, jobFixtureModule.readinessLeafName), "utf8"), "not-mine\n",
+    "unknown data substituted at the preparation pathname is retained, never deleted");
+  assert.equal(readFileSync(join(unknownThrow.prepDir, "moved-away-prep"), "utf8"), text,
+    "the publisher's own moved-away preparation keeps its exact bytes as evidence");
+  assert.equal(existsSync(join(unknownThrow.serviceDir, jobFixtureModule.readinessLeafName)), false,
+    "a throwing substitution seam never exposes a final record");
+  assert.deepEqual(listLeafNames(unknownThrow.serviceDir), [], "the final record directory stays empty");
 });
 
 test("active provider journal observations admit only byte-stable same-inode append growth", () => {
